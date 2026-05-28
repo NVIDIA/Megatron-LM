@@ -10,7 +10,9 @@ layout/l2norm/g-beta work, then delegates depthwise conv gradients to the
 ``causal_conv1d`` backend.
 
 Unsupported cases are rejected at the Python entry point: CPU tensors,
-conv bias, packed sequences, and ``use_qk_l2norm=False``.
+conv bias, and ``use_qk_l2norm=False``. Packed THD sequences use separate
+QK/V causal-conv kernels so the dense BSHD kernels stay free of packed
+metadata and runtime branches.
 """
 
 from typing import Optional, Tuple
@@ -221,6 +223,160 @@ def _conv_silu_project_kernel(
     # Write the same data to ``REPEAT`` adjacent value heads. ``REPEAT == 1``
     # is the no-repeat case (V branch is handled by a separate kernel that
     # always has REPEAT == 1, but using the same code here is convenient).
+    for r in tl.static_range(REPEAT):
+        v_head = head_id * REPEAT + r
+        write_ptr = (
+            out_ptr
+            + group_id * out_group_dim_stride
+            + batch_id * out_b_stride
+            + s_offs[:, None] * out_s_stride
+            + v_head * out_h_stride
+            + chan_off[None, :]
+        )
+        tl.store(write_ptr, out_typed, mask=s_mask[:, None])
+
+
+@triton.jit
+def _thd_seq_bounds(cu_seqlens_ptr, token_offsets, total_tokens, num_packed_seqs):
+    """Return lane-wise packed sequence bounds for flattened THD tokens."""
+
+    safe_tokens = tl.minimum(token_offsets, total_tokens - 1)
+    seq_start = token_offsets * 0
+    seq_end = token_offsets * 0 + total_tokens
+
+    seq_id = 0
+    while seq_id < num_packed_seqs:
+        start = tl.load(cu_seqlens_ptr + seq_id)
+        end = tl.load(cu_seqlens_ptr + seq_id + 1)
+        in_seq = (safe_tokens >= start) & (safe_tokens < end)
+        seq_start = tl.where(in_seq, start, seq_start)
+        seq_end = tl.where(in_seq, end, seq_end)
+        seq_id += 1
+
+    return seq_start, seq_end
+
+
+@triton.autotune(
+    configs=_conv_autotune_configs(),
+    key=["seq_len", "HEAD_DIM", "K_W", "APPLY_L2", "REPEAT", "NUM_GROUPS"],
+)
+@triton.jit
+def _conv_silu_project_thd_kernel(
+    qkvzba_ptr,
+    weight_ptr,
+    bias_ptr,
+    out_ptr,
+    silu_save_ptr,
+    cu_seqlens_ptr,
+    seq_len,
+    num_packed_seqs,
+    num_in_heads,
+    in_channel_offset,
+    in_group_stride,
+    silu_save_chan_offset,
+    silu_save_group_stride,
+    qkvzba_s_stride,
+    qkvzba_b_stride,
+    qkvzba_c_stride,
+    weight_c_stride,
+    weight_w_stride,
+    bias_stride,
+    out_group_dim_stride,
+    out_b_stride,
+    out_s_stride,
+    out_h_stride,
+    silu_save_b_stride,
+    silu_save_c_stride,
+    silu_save_s_stride,
+    eps,
+    HEAD_DIM: tl.constexpr,
+    K_W: tl.constexpr,
+    REPEAT: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    APPLY_L2: tl.constexpr,
+    SAVE_SILU: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+):
+    """THD depthwise conv1d + silu + optional l2norm/repeat.
+
+    This is intentionally separate from ``_conv_silu_project_kernel`` so
+    packed sequence boundary metadata never enters the dense BSHD hot path.
+    Only the causal-conv loads use ``cu_seqlens``; the following per-token
+    transforms and stores are identical to the dense path.
+    """
+
+    pid_bgh = tl.program_id(0)
+    pid_s = tl.program_id(1)
+
+    heads_per_batch = num_in_heads * NUM_GROUPS
+    batch_id = pid_bgh // heads_per_batch
+    local_bgh = pid_bgh - batch_id * heads_per_batch
+    group_id = local_bgh // num_in_heads
+    head_id = local_bgh - group_id * num_in_heads
+
+    chan_off = tl.arange(0, HEAD_DIM)
+    group_channel_offset = in_channel_offset + group_id * in_group_stride
+    chan = group_channel_offset + head_id * HEAD_DIM + chan_off
+
+    if HAS_BIAS:
+        bias = tl.load(bias_ptr + chan * bias_stride).to(tl.float32)
+    else:
+        bias = tl.zeros([HEAD_DIM], dtype=tl.float32)
+
+    s_offs = pid_s * BLOCK_S + tl.arange(0, BLOCK_S)
+    s_mask = s_offs < seq_len
+    seq_start, seq_end = _thd_seq_bounds(cu_seqlens_ptr, s_offs, seq_len, num_packed_seqs)
+
+    acc = tl.zeros([BLOCK_S, HEAD_DIM], dtype=tl.float32)
+    for i in tl.static_range(K_W):
+        x_s = s_offs - (K_W - 1) + i
+        x_mask = s_mask & (x_s >= seq_start) & (x_s < seq_end)
+        safe_x_s = tl.minimum(tl.maximum(x_s, 0), seq_len - 1)
+        x_ptr = (
+            qkvzba_ptr
+            + safe_x_s[:, None] * qkvzba_s_stride
+            + batch_id * qkvzba_b_stride
+            + chan[None, :] * qkvzba_c_stride
+        )
+        x_val = tl.load(x_ptr, mask=x_mask[:, None], other=0.0).to(tl.float32)
+        w_tap = tl.load(
+            weight_ptr + chan * weight_c_stride + i * weight_w_stride
+        ).to(tl.float32)
+        acc += w_tap[None, :] * x_val
+
+    acc += bias[None, :]
+    acc = acc.to(out_ptr.dtype.element_ty).to(tl.float32)
+    silu_out = acc * tl.sigmoid(acc)
+
+    if APPLY_L2:
+        silu_out = silu_out.to(out_ptr.dtype.element_ty).to(tl.float32)
+        if SAVE_SILU:
+            silu_save_chan = (
+                silu_save_chan_offset
+                + group_id * silu_save_group_stride
+                + head_id * HEAD_DIM
+                + chan_off
+            )
+            silu_save_ptrs = (
+                silu_save_ptr
+                + batch_id * silu_save_b_stride
+                + silu_save_chan[None, :] * silu_save_c_stride
+                + s_offs[:, None] * silu_save_s_stride
+            )
+            tl.store(
+                silu_save_ptrs,
+                silu_out.to(silu_save_ptr.dtype.element_ty),
+                mask=s_mask[:, None],
+            )
+        norm_sq = tl.sum(silu_out * silu_out, axis=1)
+        rstd = 1.0 / tl.sqrt(norm_sq + eps)
+        out = silu_out * rstd[:, None]
+    else:
+        out = silu_out
+
+    out_typed = out.to(out_ptr.dtype.element_ty)
+
     for r in tl.static_range(REPEAT):
         v_head = head_id * REPEAT + r
         write_ptr = (
@@ -1317,6 +1473,36 @@ def _wait_for_streams(
         dst_stream.wait_stream(stream)
 
 
+def _resolve_packed_seq_idx(
+    cu_seqlens: Optional[Tensor],
+    seq_idx: Optional[Tensor],
+    total_tokens: int,
+) -> Optional[Tensor]:
+    """Return the token-level sequence-id buffer for causal-conv backward."""
+
+    if cu_seqlens is None:
+        assert seq_idx is None, "seq_idx requires cu_seqlens for packed THD mode."
+        return None
+
+    if seq_idx is None:
+        seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        seq_idx = torch.repeat_interleave(
+            torch.arange(seq_lengths.numel(), device=cu_seqlens.device, dtype=torch.int32),
+            seq_lengths,
+        )
+        seq_idx = seq_idx.unsqueeze(0)
+    elif seq_idx.dim() == 1:
+        seq_idx = seq_idx.unsqueeze(0)
+
+    assert seq_idx.is_cuda, f"Packed seq_idx must be CUDA, got {seq_idx.device}."
+    assert seq_idx.dtype == torch.int32, f"Packed seq_idx must be int32, got {seq_idx.dtype}."
+    assert seq_idx.shape == (1, total_tokens), (
+        "Packed seq_idx must have shape [1, total_tokens], "
+        f"got {seq_idx.shape=} and {total_tokens=}."
+    )
+    return seq_idx.contiguous()
+
+
 def _triton_pre_gated_delta_rule_forward(
     qkvzba: Tensor,
     conv1d_weight: Tensor,
@@ -1327,6 +1513,7 @@ def _triton_pre_gated_delta_rule_forward(
     num_value_heads: int,
     key_head_dim: int,
     value_head_dim: int,
+    cu_seqlens: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Triton-backed forward for the pre-gated-delta-rule front-end.
 
@@ -1337,6 +1524,16 @@ def _triton_pre_gated_delta_rule_forward(
     """
 
     seq_len, batch, total_channels = qkvzba.shape
+    is_packed_thd = cu_seqlens is not None
+    if is_packed_thd:
+        assert batch == 1, (
+            "Packed THD fused_pre_gated_delta_rule expects batch dimension 1; "
+            f"got {batch=}."
+        )
+        num_packed_seqs = cu_seqlens.shape[0] - 1
+    else:
+        num_packed_seqs = 0
+
     qk_channels = num_key_heads * key_head_dim
     v_channels = num_value_heads * value_head_dim
     repeat_factor = num_value_heads // num_key_heads
@@ -1414,80 +1611,156 @@ def _triton_pre_gated_delta_rule_forward(
         triton.cdiv(seq_len, meta["BLOCK_S"]),
     )
     with torch.cuda.stream(qk_stream):
-        _conv_silu_project_kernel[qk_grid](
-            qkvzba,
-            weight_2d,
-            bias_tensor,
-            qk_out,
-            silu_qk_save,
-            seq_len,
-            num_key_heads,
-            0,  # QK starts at channel 0; group 1 starts at +qk_channels.
-            qk_channels,
-            0,  # silu_save_chan_offset
-            qk_channels,
-            qkvzba.stride(0),
-            qkvzba.stride(1),
-            qkvzba.stride(2),
-            weight_2d.stride(0),
-            weight_2d.stride(1),
-            bias_stride,
-            qk_out.stride(0),
-            qk_out.stride(1),
-            qk_out.stride(2),
-            qk_out.stride(3),
-            silu_save_b_stride,
-            silu_save_c_stride,
-            silu_save_s_stride,
-            _L2NORM_EPS,
-            HEAD_DIM=key_head_dim,
-            K_W=k_w,
-            REPEAT=repeat_factor,
-            NUM_GROUPS=2,
-            HAS_BIAS=False,
-            SAVE_SILU=True,
-            APPLY_L2=True,
-        )
+        if is_packed_thd:
+            _conv_silu_project_thd_kernel[qk_grid](
+                qkvzba,
+                weight_2d,
+                bias_tensor,
+                qk_out,
+                silu_qk_save,
+                cu_seqlens,
+                seq_len,
+                num_packed_seqs,
+                num_key_heads,
+                0,  # QK starts at channel 0; group 1 starts at +qk_channels.
+                qk_channels,
+                0,  # silu_save_chan_offset
+                qk_channels,
+                qkvzba.stride(0),
+                qkvzba.stride(1),
+                qkvzba.stride(2),
+                weight_2d.stride(0),
+                weight_2d.stride(1),
+                bias_stride,
+                qk_out.stride(0),
+                qk_out.stride(1),
+                qk_out.stride(2),
+                qk_out.stride(3),
+                silu_save_b_stride,
+                silu_save_c_stride,
+                silu_save_s_stride,
+                _L2NORM_EPS,
+                HEAD_DIM=key_head_dim,
+                K_W=k_w,
+                REPEAT=repeat_factor,
+                NUM_GROUPS=2,
+                HAS_BIAS=False,
+                SAVE_SILU=True,
+                APPLY_L2=True,
+            )
+        else:
+            _conv_silu_project_kernel[qk_grid](
+                qkvzba,
+                weight_2d,
+                bias_tensor,
+                qk_out,
+                silu_qk_save,
+                seq_len,
+                num_key_heads,
+                0,  # QK starts at channel 0; group 1 starts at +qk_channels.
+                qk_channels,
+                0,  # silu_save_chan_offset
+                qk_channels,
+                qkvzba.stride(0),
+                qkvzba.stride(1),
+                qkvzba.stride(2),
+                weight_2d.stride(0),
+                weight_2d.stride(1),
+                bias_stride,
+                qk_out.stride(0),
+                qk_out.stride(1),
+                qk_out.stride(2),
+                qk_out.stride(3),
+                silu_save_b_stride,
+                silu_save_c_stride,
+                silu_save_s_stride,
+                _L2NORM_EPS,
+                HEAD_DIM=key_head_dim,
+                K_W=k_w,
+                REPEAT=repeat_factor,
+                NUM_GROUPS=2,
+                HAS_BIAS=False,
+                SAVE_SILU=True,
+                APPLY_L2=True,
+            )
 
     # --- V conv + silu (no l2norm, no repeat) ---
     v_channel_offset = 2 * qk_channels
     z_channel_offset = 2 * qk_channels + v_channels
     v_grid = lambda meta: (batch * num_value_heads, triton.cdiv(seq_len, meta["BLOCK_S"]))
     with torch.cuda.stream(v_stream):
-        _conv_silu_project_kernel[v_grid](
-            qkvzba,
-            weight_2d,
-            bias_tensor,
-            value,
-            qkvzba,  # silu_save unused (SAVE_SILU=False)
-            seq_len,
-            num_value_heads,
-            v_channel_offset,
-            0,  # in_group_stride unused for NUM_GROUPS=1
-            0,  # silu_save_chan_offset unused
-            0,  # silu_save_group_stride unused
-            qkvzba.stride(0),
-            qkvzba.stride(1),
-            qkvzba.stride(2),
-            weight_2d.stride(0),
-            weight_2d.stride(1),
-            bias_stride,
-            0,  # out_group_dim_stride unused for NUM_GROUPS=1
-            value.stride(0),
-            value.stride(1),
-            value.stride(2),
-            0,  # silu_save strides unused
-            0,
-            0,
-            _L2NORM_EPS,
-            HEAD_DIM=value_head_dim,
-            K_W=k_w,
-            REPEAT=1,
-            NUM_GROUPS=1,
-            HAS_BIAS=False,
-            SAVE_SILU=False,
-            APPLY_L2=False,
-        )
+        if is_packed_thd:
+            _conv_silu_project_thd_kernel[v_grid](
+                qkvzba,
+                weight_2d,
+                bias_tensor,
+                value,
+                qkvzba,  # silu_save unused (SAVE_SILU=False)
+                cu_seqlens,
+                seq_len,
+                num_packed_seqs,
+                num_value_heads,
+                v_channel_offset,
+                0,  # in_group_stride unused for NUM_GROUPS=1
+                0,  # silu_save_chan_offset unused
+                0,  # silu_save_group_stride unused
+                qkvzba.stride(0),
+                qkvzba.stride(1),
+                qkvzba.stride(2),
+                weight_2d.stride(0),
+                weight_2d.stride(1),
+                bias_stride,
+                0,  # out_group_dim_stride unused for NUM_GROUPS=1
+                value.stride(0),
+                value.stride(1),
+                value.stride(2),
+                0,  # silu_save strides unused
+                0,
+                0,
+                _L2NORM_EPS,
+                HEAD_DIM=value_head_dim,
+                K_W=k_w,
+                REPEAT=1,
+                NUM_GROUPS=1,
+                HAS_BIAS=False,
+                SAVE_SILU=False,
+                APPLY_L2=False,
+            )
+        else:
+            _conv_silu_project_kernel[v_grid](
+                qkvzba,
+                weight_2d,
+                bias_tensor,
+                value,
+                qkvzba,  # silu_save unused (SAVE_SILU=False)
+                seq_len,
+                num_value_heads,
+                v_channel_offset,
+                0,  # in_group_stride unused for NUM_GROUPS=1
+                0,  # silu_save_chan_offset unused
+                0,  # silu_save_group_stride unused
+                qkvzba.stride(0),
+                qkvzba.stride(1),
+                qkvzba.stride(2),
+                weight_2d.stride(0),
+                weight_2d.stride(1),
+                bias_stride,
+                0,  # out_group_dim_stride unused for NUM_GROUPS=1
+                value.stride(0),
+                value.stride(1),
+                value.stride(2),
+                0,  # silu_save strides unused
+                0,
+                0,
+                _L2NORM_EPS,
+                HEAD_DIM=value_head_dim,
+                K_W=k_w,
+                REPEAT=1,
+                NUM_GROUPS=1,
+                HAS_BIAS=False,
+                SAVE_SILU=False,
+                APPLY_L2=False,
+            )
 
     # --- Z copy ---
     BLOCK_Z_S = _LAYOUT_BLOCK_S
@@ -1564,6 +1837,7 @@ def _triton_pre_gated_delta_rule_backward(
     num_value_heads: int,
     key_head_dim: int,
     value_head_dim: int,
+    seq_idx: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     """Triton-backed backward for the pre-gated-delta-rule front-end.
 
@@ -1688,7 +1962,7 @@ def _triton_pre_gated_delta_rule_backward(
         weight_2d,
         None,              # no bias
         d_silu_conv,
-        None,              # seq_idx
+        seq_idx,
         None,              # initial_states
         None,              # dfinal_states
         d_x_conv_view,     # dx pre-allocated into d_qkvzba's conv slice
@@ -1722,6 +1996,8 @@ class _FusedPreGatedDeltaRuleFunction(torch.autograd.Function):
         conv1d_weight,
         A_log,
         dt_bias,
+        cu_seqlens,
+        seq_idx,
         num_key_heads,
         num_value_heads,
         key_head_dim,
@@ -1741,14 +2017,23 @@ class _FusedPreGatedDeltaRuleFunction(torch.autograd.Function):
                 num_value_heads=num_value_heads,
                 key_head_dim=key_head_dim,
                 value_head_dim=value_head_dim,
+                cu_seqlens=cu_seqlens,
             )
         )
-        ctx.save_for_backward(qkvzba, conv1d_weight, A_log, dt_bias, silu_qk_save)
+        ctx.has_seq_idx = seq_idx is not None
+        if ctx.has_seq_idx:
+            ctx.save_for_backward(qkvzba, conv1d_weight, A_log, dt_bias, silu_qk_save, seq_idx)
+        else:
+            ctx.save_for_backward(qkvzba, conv1d_weight, A_log, dt_bias, silu_qk_save)
         return query, key, value, gate, beta, g
 
     @staticmethod
     def backward(ctx, dq, dk, dv, dgate, dbeta, dg):
-        qkvzba, conv1d_weight, A_log, dt_bias, silu_qk_save = ctx.saved_tensors
+        if ctx.has_seq_idx:
+            qkvzba, conv1d_weight, A_log, dt_bias, silu_qk_save, seq_idx = ctx.saved_tensors
+        else:
+            qkvzba, conv1d_weight, A_log, dt_bias, silu_qk_save = ctx.saved_tensors
+            seq_idx = None
         d_qkvzba, d_weight, d_A_log, d_dt_bias = _triton_pre_gated_delta_rule_backward(
             qkvzba,
             conv1d_weight,
@@ -1765,15 +2050,19 @@ class _FusedPreGatedDeltaRuleFunction(torch.autograd.Function):
             num_value_heads=ctx.num_value_heads,
             key_head_dim=ctx.key_head_dim,
             value_head_dim=ctx.value_head_dim,
+            seq_idx=seq_idx,
         )
         # Match forward inputs: (qkvzba, conv1d_weight, A_log, dt_bias,
-        # num_key_heads, num_value_heads, key_head_dim, value_head_dim).
+        # cu_seqlens, seq_idx, num_key_heads, num_value_heads,
+        # key_head_dim, value_head_dim).
         # Non-tensor args get None.
         return (
             d_qkvzba,
             d_weight,
             d_A_log,
             d_dt_bias,
+            None,
+            None,
             None,
             None,
             None,
@@ -1794,6 +2083,7 @@ def fused_pre_gated_delta_rule(
     value_head_dim: int,
     use_qk_l2norm: bool = True,
     cu_seqlens: Optional[Tensor] = None,
+    seq_idx: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Fused pre-gated-delta-rule entry point.
 
@@ -1809,7 +2099,10 @@ def fused_pre_gated_delta_rule(
             multiple of ``num_key_heads``.
         use_qk_l2norm: Must be ``True``; the fused backward closes over the
             l2norm path.
-        cu_seqlens: Must be ``None``; packed sequence is not supported.
+        cu_seqlens: Optional packed THD cumulative sequence lengths. When set,
+            ``qkvzba`` must have ``batch == 1`` and ``cu_seqlens[-1] == seq_len``.
+        seq_idx: Optional precomputed token-to-sequence map with shape
+            ``[1, seq_len]``. Used by causal-conv backward in packed THD mode.
 
     Returns:
         ``(query, key, value, gate, beta, g)`` matching the unfused
@@ -1819,10 +2112,6 @@ def fused_pre_gated_delta_rule(
     assert qkvzba.is_cuda, (
         "fused_pre_gated_delta_rule requires CUDA inputs; "
         f"got qkvzba.device={qkvzba.device}."
-    )
-    assert cu_seqlens is None, (
-        "Packed sequence (cu_seqlens != None) is not supported by "
-        "fused_pre_gated_delta_rule."
     )
     assert conv1d_bias is None, (
         "Conv bias is not supported by fused_pre_gated_delta_rule "
@@ -1835,12 +2124,51 @@ def fused_pre_gated_delta_rule(
     assert num_value_heads % num_key_heads == 0, (
         f"{num_value_heads=} must be a multiple of {num_key_heads=}."
     )
+    if cu_seqlens is not None:
+        assert cu_seqlens.is_cuda, (
+            "Packed fused_pre_gated_delta_rule requires CUDA cu_seqlens; "
+            f"got cu_seqlens.device={cu_seqlens.device}."
+        )
+        assert cu_seqlens.dtype == torch.int32, (
+            "Packed fused_pre_gated_delta_rule requires int32 cu_seqlens; "
+            f"got {cu_seqlens.dtype=}."
+        )
+        assert cu_seqlens.dim() == 1, (
+            "Packed fused_pre_gated_delta_rule expects 1-D cu_seqlens; "
+            f"got {cu_seqlens.shape=}."
+        )
+        assert qkvzba.shape[1] == 1, (
+            "Packed THD fused_pre_gated_delta_rule expects batch dimension 1; "
+            f"got qkvzba.shape={qkvzba.shape}."
+        )
+        assert cu_seqlens.shape[0] >= 2, (
+            "Packed fused_pre_gated_delta_rule requires at least one packed sequence; "
+            f"got {cu_seqlens.shape=}."
+        )
+        assert cu_seqlens[0].item() == 0, (
+            "Packed fused_pre_gated_delta_rule requires cu_seqlens[0] == 0, "
+            f"got {cu_seqlens[0].item()}."
+        )
+        assert torch.all(cu_seqlens[1:] >= cu_seqlens[:-1]).item(), (
+            "Packed fused_pre_gated_delta_rule requires monotonically non-decreasing "
+            f"cu_seqlens, got {cu_seqlens}."
+        )
+        assert cu_seqlens[-1].item() == qkvzba.shape[0], (
+            "Packed fused_pre_gated_delta_rule requires cu_seqlens[-1] to match "
+            f"seq_len, got {cu_seqlens[-1].item()} vs {qkvzba.shape[0]}."
+        )
+        cu_seqlens = cu_seqlens.contiguous()
+        seq_idx = _resolve_packed_seq_idx(cu_seqlens, seq_idx, qkvzba.shape[0])
+    else:
+        assert seq_idx is None, "seq_idx requires cu_seqlens for packed THD mode."
 
     return _FusedPreGatedDeltaRuleFunction.apply(
         qkvzba,
         conv1d_weight,
         A_log,
         dt_bias,
+        cu_seqlens,
+        seq_idx,
         num_key_heads,
         num_value_heads,
         key_head_dim,
