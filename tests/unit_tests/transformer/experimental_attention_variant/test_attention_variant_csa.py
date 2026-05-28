@@ -905,27 +905,19 @@ class TestApplyRope:
         torch.manual_seed(0)
         model_parallel_cuda_manual_seed(0)
         cls = request.cls
-        cls.pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=['tp', 'cp'],
-        )
+        cls.pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
         # head_dim 32 = nope 24 + pos 8
         cls.config = _make_mla_config(v_head_dim=32, qk_pos_emb_head_dim=8)
         yield
         Utils.destroy_model_parallel()
 
     def _make_rotary(self, kind: str):
-        from megatron.core.models.common.embeddings import (
-            RotaryEmbedding,
-            YarnRotaryEmbedding,
-        )
+        from megatron.core.models.common.embeddings import RotaryEmbedding, YarnRotaryEmbedding
 
         pos_dim = self.config.qk_pos_emb_head_dim
         if kind == 'rope':
             return RotaryEmbedding(
-                pos_dim,
-                rotary_percent=1.0,
-                rotary_base=10000,
-                cp_group=self.pg_collection.cp,
+                pos_dim, rotary_percent=1.0, rotary_base=10000, cp_group=self.pg_collection.cp
             )
         if kind == 'yarn':
             return YarnRotaryEmbedding(
@@ -976,8 +968,13 @@ class TestApplyRope:
         # ``fused_mla_rope_inplace`` mutates the input — give it a copy so
         # the nope-dim equality check below still has the original.
         out = _apply_rope(
-            x.clone(), nope, pos, rotary, cfg,
-            rotary_seq_len=seq, ratio=ratio,
+            x.clone(),
+            nope,
+            pos,
+            rotary,
+            cfg,
+            rotary_seq_len=seq,
+            ratio=ratio,
             cp_group=self.pg_collection.cp,
         )
 
@@ -985,14 +982,14 @@ class TestApplyRope:
         assert out.dtype == x.dtype
         assert not torch.isnan(out).any()
         # The leading nope_dim slice is the identity portion of RoPE.
-        assert torch.equal(out[..., :nope], x[..., :nope]), (
-            "RoPE must not touch the first nope_dim components"
-        )
+        assert torch.equal(
+            out[..., :nope], x[..., :nope]
+        ), "RoPE must not touch the first nope_dim components"
         # Trailing pos_dim should rotate at non-zero positions.
         pe_changed = (out[..., nope:] != x[..., nope:]).any(dim=-1).flatten()
-        assert pe_changed[1:].any(), (
-            "RoPE should rotate the trailing pos_dim components for seq > 0"
-        )
+        assert pe_changed[
+            1:
+        ].any(), "RoPE should rotate the trailing pos_dim components for seq > 0"
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("rotary_kind", ['rope', 'yarn'])
@@ -1012,12 +1009,24 @@ class TestApplyRope:
         x_4d = x_3d.unsqueeze(-2)
 
         out_3d = _apply_rope(
-            x_3d, nope, pos, rotary, cfg,
-            rotary_seq_len=seq, ratio=1, cp_group=self.pg_collection.cp,
+            x_3d,
+            nope,
+            pos,
+            rotary,
+            cfg,
+            rotary_seq_len=seq,
+            ratio=1,
+            cp_group=self.pg_collection.cp,
         )
         out_4d = _apply_rope(
-            x_4d, nope, pos, rotary, cfg,
-            rotary_seq_len=seq, ratio=1, cp_group=self.pg_collection.cp,
+            x_4d,
+            nope,
+            pos,
+            rotary,
+            cfg,
+            rotary_seq_len=seq,
+            ratio=1,
+            cp_group=self.pg_collection.cp,
         )
 
         assert out_3d.shape == x_3d.shape
@@ -1039,21 +1048,31 @@ class TestApplyRope:
         seq, batch, heads, ratio = 4, 1, 2, 4
         cfg = self._config_with(apply_rope_fusion=False)
 
-        x_comp = torch.randn(
-            seq, batch, heads, head_dim, dtype=torch.bfloat16, device='cuda',
-        )
+        x_comp = torch.randn(seq, batch, heads, head_dim, dtype=torch.bfloat16, device='cuda')
         out_comp = _apply_rope(
-            x_comp.clone(), nope, pos, rotary, cfg,
-            rotary_seq_len=seq, ratio=ratio, cp_group=self.pg_collection.cp,
+            x_comp.clone(),
+            nope,
+            pos,
+            rotary,
+            cfg,
+            rotary_seq_len=seq,
+            ratio=ratio,
+            cp_group=self.pg_collection.cp,
         )
 
         x_full = torch.zeros(
-            seq * ratio, batch, heads, head_dim, dtype=torch.bfloat16, device='cuda',
+            seq * ratio, batch, heads, head_dim, dtype=torch.bfloat16, device='cuda'
         )
         x_full[::ratio][:seq] = x_comp
         out_full = _apply_rope(
-            x_full, nope, pos, rotary, cfg,
-            rotary_seq_len=seq * ratio, ratio=1, cp_group=self.pg_collection.cp,
+            x_full,
+            nope,
+            pos,
+            rotary,
+            cfg,
+            rotary_seq_len=seq * ratio,
+            ratio=1,
+            cp_group=self.pg_collection.cp,
         )
         out_ref = out_full[::ratio][:seq]
 
@@ -1061,4 +1080,3 @@ class TestApplyRope:
             f"ratio={ratio} stride mismatch: "
             f"max abs diff = {(out_comp - out_ref).abs().max().item():.3e}"
         )
-

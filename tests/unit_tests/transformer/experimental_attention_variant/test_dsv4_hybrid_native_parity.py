@@ -169,18 +169,17 @@ def _precompute_freqs_cis(
     """
     freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim))
     if original_seq_len > 0:
+
         def _correction_dim(num_rotations):
-            return (
-                dim * math.log(original_seq_len / (num_rotations * 2 * math.pi))
-            ) / (2 * math.log(base))
+            return (dim * math.log(original_seq_len / (num_rotations * 2 * math.pi))) / (
+                2 * math.log(base)
+            )
 
         low = max(int(math.floor(_correction_dim(beta_fast))), 0)
         high = min(int(math.ceil(_correction_dim(beta_slow))), dim - 1)
         if low == high:
             high += 1  # avoid div-by-zero in the ramp
-        ramp = (
-            torch.arange(dim // 2, dtype=torch.float32, device=device) - low
-        ) / (high - low)
+        ramp = (torch.arange(dim // 2, dtype=torch.float32, device=device) - low) / (high - low)
         smooth = 1.0 - torch.clamp(ramp, 0.0, 1.0)
         freqs = freqs / factor * (1.0 - smooth) + freqs * smooth
 
@@ -483,7 +482,10 @@ class NativeCompressor(nn.Module):
         pos_dim = self.qk_pos_emb_head_dim
         content, rotary = torch.split(kv, [self.head_dim - pos_dim, pos_dim], dim=-1)
         freqs_cis = _precompute_freqs_cis(
-            pos_dim, n_compressed * ratio, device=x.device, base=self.rope_base,
+            pos_dim,
+            n_compressed * ratio,
+            device=x.device,
+            base=self.rope_base,
             **self._rope_yarn_kwargs,
         )
         freqs_cis = freqs_cis[: n_compressed * ratio : ratio][:n_compressed]
@@ -531,8 +533,7 @@ class NativeCSAIndexer(nn.Module):
         pos_dim = self.qk_pos_emb_head_dim
         q_content, q_rotary = torch.split(q, [self.index_head_dim - pos_dim, pos_dim], dim=-1)
         freqs_cis = _precompute_freqs_cis(
-            pos_dim, sq, device=x.device, base=self.rope_base,
-            **self._rope_yarn_kwargs,
+            pos_dim, sq, device=x.device, base=self.rope_base, **self._rope_yarn_kwargs
         )
         q_rotary = _apply_rotary_emb(q_rotary, freqs_cis)
         q = _native_hadamard_transform(torch.cat([q_content, q_rotary], dim=-1))
@@ -719,8 +720,7 @@ class NativeDSv4HybridAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         sq, batch_size, _ = hidden_states.size()
         freqs_cis = _precompute_freqs_cis(
-            self.pos_dim, sq, hidden_states.device, self.rope_base,
-            **self._rope_yarn_kwargs,
+            self.pos_dim, sq, hidden_states.device, self.rope_base, **self._rope_yarn_kwargs
         )
 
         qr = self.q_layernorm(self.linear_q_down_proj(hidden_states))

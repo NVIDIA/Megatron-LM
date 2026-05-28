@@ -213,20 +213,11 @@ class RotaryEmbedding(nn.Module):
         self.packed_seq_cached = packed_seq
 
         emb = self.forward(seq_len, offset, packed_seq=packed_seq, cp_group=cp_group)
-        self.register_buffer(
-            "cos_cached", emb.cos().to(dtype).contiguous(), persistent=False
-        )
-        self.register_buffer(
-            "sin_cached", emb.sin().to(dtype).contiguous(), persistent=False
-        )
+        self.register_buffer("cos_cached", emb.cos().to(dtype).contiguous(), persistent=False)
+        self.register_buffer("sin_cached", emb.sin().to(dtype).contiguous(), persistent=False)
 
     def get_cached_cos_sin(
-        self,
-        seq_len,
-        offset=0,
-        dtype=torch.get_default_dtype(),
-        packed_seq=False,
-        cp_group=None,
+        self, seq_len, offset=0, dtype=torch.get_default_dtype(), packed_seq=False, cp_group=None
     ):
         """Get cached cos and sin values.
 

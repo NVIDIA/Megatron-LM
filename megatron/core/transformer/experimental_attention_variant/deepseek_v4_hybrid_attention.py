@@ -116,9 +116,7 @@ class DSv4HybridAttention(Attention):
             compress_ratio = self.config.csa_compress_ratios[layer_number - 1]
         use_compressed_yarn = compress_ratio > 1
         rope_base = (
-            self.config.csa_compress_rotary_base
-            if use_compressed_yarn
-            else self.config.rotary_base
+            self.config.csa_compress_rotary_base if use_compressed_yarn else self.config.rotary_base
         )
         self._dsv4_compress_ratio = compress_ratio
         self._dsv4_rope_base = rope_base
