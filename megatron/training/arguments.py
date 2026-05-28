@@ -37,7 +37,7 @@ from megatron.training.utils import (
 )
 from megatron.core.msc_utils import MultiStorageClientFeature
 
-from megatron.training.argument_utils import ArgumentGroupFactory
+from megatron.training.argument_utils import ArgumentGroupFactory, core_transformer_config_from_args  # noqa: F401 # pylint: disable=unused-import
 
 
 def add_megatron_arguments(parser: argparse.ArgumentParser):
@@ -1616,6 +1616,24 @@ def validate_args(args, defaults={}):
     if not args.async_save:
         args.async_strategy = "mcore"
 
+    # Offline Distillation checks
+    if args.logits_save_dir is not None:
+        if args.async_strategy != "mcore":
+            warn_rank_0(
+                '--logits-save-dir requires async_strategy="mcore". Overriding async_strategy to "mcore".'
+            )
+            args.async_strategy = "mcore"
+        if args.use_distributed_optimizer:
+            warn_rank_0(
+                '--logits-save-dir incompatible with use_distributed_optimizer. Disabling use_distributed_optimizer.'
+            )
+            args.use_distributed_optimizer = False
+        if args.overlap_param_gather:
+            warn_rank_0(
+                '--logits-save-dir incompatible with overlap_param_gather. Disabling overlap_param_gather.'
+            )
+            args.overlap_param_gather = False
+
     if args.override_ckpt_iteration is not None:
         assert not args.finetune, "Cannot override checkpoint iteration together with finetune flag."
 
@@ -1626,8 +1644,6 @@ def validate_args(args, defaults={}):
         assert (
             args.cuda_graph_impl == "none"
         ), "Pipeline-parallel microbatched inference is incompatible with CUDA graphs"
-
-
 
     # MoE upcycling check
     if args.moe_use_upcycling:

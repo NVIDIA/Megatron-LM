@@ -904,11 +904,11 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
 def _async_delete_checkpoint_impl(save_path, iteration_to_delete, log_progress=False, lower_priority=False,
                                   cpu_priority=None, io_priority=None):
     """Module-level function for async checkpoint deletion.
-    
+
     This function can be pickled and executed by the async worker process.
     Note: This is only called from rank 0, so we use regular print() instead of print_rank_0()
     since torch.distributed won't be initialized in the async worker process.
-    
+
     Args:
         save_path (str): Path to the checkpoints directory
         iteration_to_delete (int): Iteration number of checkpoint to delete

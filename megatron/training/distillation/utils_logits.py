@@ -34,10 +34,10 @@ logger = logging.getLogger(__name__)
 
 MSC_PREFIX = "msc://"
 
-# Matches batched tar filenames (``cp{C}_dp{D}__{B}.tar``).  Named groups:
+# Matches batched tar filenames (``cp{C}_dp{D}__{I}.tar``).  Named groups:
 #   cp   – CP rank
 #   dp   – DP rank
-#   iter – trailing iteration number *B*
+#   iter – trailing iteration number *I*
 BATCHED_TAR_RE = re.compile(
     r"^cp(?P<cp>\d+)_dp(?P<dp>\d+)__(?P<iter>\d+)\.tar$"
 )
@@ -381,12 +381,12 @@ def detect_saved_dp_size(
     return max(dp_ranks_found) + 1
 
 
+# NOTE: This function is for interactive debugging purposes
 def load_log_probs_from_tar(
     tar_path: str,
     iteration: int,
 ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     """Load one iteration from a specific batched tar shard."""
-    # NOTE: This function is for interactive debugging purposes
     for entry in iter_logprobs_tar_entries(tar_path, start_iteration=iteration):
         if entry.iteration == iteration:
             return decode_logprobs_payload(entry.data)

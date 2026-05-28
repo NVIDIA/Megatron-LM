@@ -680,9 +680,7 @@ class AsyncCallsQueue:
         async_request = async_request.freeze()
         async_caller.schedule_async_call(
             async_request._replace(
-                call_idx=self.call_idx,
-                finalize_fns=[],
-                finalize_dependencies=None,
+                call_idx=self.call_idx, finalize_fns=[], finalize_dependencies=None
             )
         )
         self.async_calls.append(_ActiveAsyncRequest(self.call_idx, async_caller, async_request))
@@ -703,9 +701,7 @@ class AsyncCallsQueue:
         local_done = all(dependency.done() for dependency in dependencies)
         if not no_dist and torch.distributed.is_initialized():
             done = torch.tensor(
-                [int(local_done)],
-                dtype=torch.int,
-                device=torch.cuda.current_device(),
+                [int(local_done)], dtype=torch.int, device=torch.cuda.current_device()
             )
             torch.distributed.all_reduce(done, op=torch.distributed.ReduceOp.MIN)
             dependencies_done = bool(done.item())

@@ -1958,7 +1958,7 @@ def setup_model_and_optimizer(
     model = get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
 
-    if args.logits_save_top_k:
+    if args.logits_save_dir is not None:
         from megatron.training.distillation import LogitsSaverHooks
 
         logits_saver = LogitsSaverHooks(
