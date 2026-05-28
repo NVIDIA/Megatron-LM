@@ -1548,11 +1548,10 @@ def _skip_if_real_kernels_unavailable(*, sm_min: int = 9, need_flash_mla: bool =
     if sm_major < sm_min:
         pytest.skip(f"requires SM{sm_min}+, found SM{sm_major}")
     cudnn = pytest.importorskip("cudnn")
-    cudnn_frontend = pytest.importorskip("cudnn_frontend")
     from packaging.version import Version
 
-    if Version(cudnn_frontend.__version__) < Version("1.24.0"):
-        pytest.skip(f"requires cudnn_frontend>=1.24.0, found {cudnn_frontend.__version__}")
+    if Version(cudnn.__version__) < Version("1.24.0"):
+        pytest.skip(f"requires cudnn>=1.24.0, found {cudnn.__version__}")
     if not hasattr(cudnn, 'DSA'):
         pytest.skip("cudnn.DSA namespace not available")
     if need_flash_mla:
@@ -2243,7 +2242,8 @@ class TestRealKernelFusedIndexerSparseAttn:
         d=512,
         skv=640,
         n_comp=512,
-        idx_nh=32,
+        # cudnn DSA (dense_)indexer_backward kernels require heads >= 64.
+        idx_nh=64,
         idx_hd=128,
         indexer_topk=512,
         ratio=4,
@@ -2329,7 +2329,7 @@ class TestRealKernelFusedIndexerSparseAttn:
         q_idx_bshd_bf, k_idx_bsd_bf, _, w_bsh_scaled_bf = _sbhd_to_bshd_indexer_inputs(
             q_indexer, k_indexer, weights, s['indexer_softmax_scale']
         )
-        topk_indices_cmp, _ = _indexer_topk_bshd(
+        topk_indices_cmp, _, _ = _indexer_topk_bshd(
             q_idx_bshd_bf, k_idx_bsd_bf, w_bsh_scaled_bf, effective_topk, s['ratio']
         )
         compress_topk_idxs = torch.where(topk_indices_cmp >= 0, topk_indices_cmp + kv_offset, -1)
@@ -2353,18 +2353,14 @@ class TestRealKernelFusedIndexerSparseAttn:
         attn_score_ref = torch.exp(qk_attn - lse_indexer_bsqh.unsqueeze(-1)).sum(dim=2)
         attn_l1norm_ref = attn_score_ref.sum(dim=-1)
 
-        # Indexer path: ReLU(QK_indexer) * W head-summed. The fused path
-        # calls ``_compute_dense_indexer_score`` with ``w_bsh_scaled`` (already
-        # multiplied by ``indexer_softmax_scale``) AND passes
-        # ``indexer_softmax_scale`` again as the kernel's ``sm_scale``,
-        # double-applying the factor (apparent bug in
-        # ``fused_indexer_sparse_attn`` at ``dsa_kernels.py:800-807``). Mirror
-        # that here so the reference matches the fused-path output; revisit
-        # if the upstream pre-scale + kernel-scale duplication is fixed.
+        # Indexer path: ReLU(QK_indexer) * W head-summed, scaled by
+        # ``indexer_softmax_scale`` once. The fused path applies the scale
+        # via pre-scaled ``w_bsh_scaled`` only (not again inside the
+        # kernel), giving ``score = sum_h(relu(QK) * w_raw) * sm_scale``.
         qk_idx = torch.einsum('bqhd,bkd->bqhk', q_idx_bshd, k_idx_bsd)
-        idx_score_ref = (torch.relu(qk_idx) * w_bsh.unsqueeze(-1)).sum(dim=2) * (
-            s['indexer_softmax_scale'] ** 2
-        )
+        idx_score_ref = (torch.relu(qk_idx) * w_bsh.unsqueeze(-1)).sum(dim=2) * s[
+            'indexer_softmax_scale'
+        ]
         idx_lse_ref = torch.logsumexp(idx_score_ref, dim=-1)
 
         loss_ref = _kl_loss_from_dense_scores(
@@ -2374,6 +2370,195 @@ class TestRealKernelFusedIndexerSparseAttn:
             f"actual = {indexer_loss.item():.6f}, ref = {loss_ref.item():.6f}, "
             f"abs diff = {(indexer_loss - loss_ref).abs().item():.3e}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Real-kernel dense-indexer backward parity (kernel vs autograd)
+# ---------------------------------------------------------------------------
+
+
+class TestRealKernelDenseIndexerBackward:
+    """End-to-end gradient parity for cuDNN ``dense_indexer_backward_wrapper``.
+
+    The kernel-level dense forward (``dense_attn_score_recompute_wrapper`` /
+    ``dense_indexer_score_recompute_wrapper``) is covered by
+    :class:`TestRealKernelKLLossDense` (forward value only), and the
+    fused-path dense forward by
+    :class:`TestRealKernelFusedIndexerSparseAttn` (forward loss scalar only).
+    Nothing else in this file exercises the dense backward kernel against
+    autograd at real-kernel scale — the only other coverage is the
+    mock-based plumbing tests in :class:`TestDenseFusedIndexerSparseAttn`.
+
+    This class runs the real fused dense-loss path (``sparse_loss=False``),
+    calls ``.backward()`` on the indexer loss to obtain kernel-emitted
+    gradients for ``q_indexer`` / ``k_indexer`` / ``weights``, then compares
+    each against PyTorch autograd through the matching analytical
+    ``_kl_loss_from_dense_scores`` formulation. ``attn_score`` /
+    ``attn_l1norm`` / ``lse_indexer`` are captured from the kernel and
+    treated as constants on the reference side (the attention-side
+    backward is a separate kernel, out of scope here).
+
+    Mirrors the gradient parity check done by
+    ``test_dsv4_hybrid_native_parity::test_dsv4_hybrid_attention_matches_native_reference``
+    but at the indexer-tensor level — so the same kernel discrepancy is
+    reproducible without spinning up the full DSv4 hybrid layer.
+    """
+
+    SHAPES = TestRealKernelFusedIndexerSparseAttn.SHAPES
+
+    def test_real_dense_backward_grad_matches_autograd(self, reset_lazy_kernel_state):
+        _skip_if_real_kernels_unavailable(sm_min=10, need_flash_mla=True)
+        s = self.SHAPES
+        torch.manual_seed(0)
+        dev = 'cuda'
+        loss_coeff = 0.5
+
+        # Shared, non-grad context tensors.
+        query = torch.randn(s['sq'], s['b'], s['np_'], s['d'], dtype=torch.bfloat16, device=dev)
+        kv_full = torch.randn(s['skv'], s['b'], s['d'], dtype=torch.bfloat16, device=dev)
+        attn_sink = torch.zeros(s['np_'], dtype=torch.float32, device=dev)
+        torch.manual_seed(1)
+        win_idxs = torch.randint(
+            0, s['sq'], (s['b'], s['sq'], s['win_topk']), dtype=torch.int32, device=dev
+        )
+        q_idx_init = torch.randn(
+            s['sq'], s['b'], s['idx_nh'], s['idx_hd'], dtype=torch.bfloat16, device=dev
+        )
+        k_idx_init = torch.randn(s['n_comp'], s['b'], s['idx_hd'], dtype=torch.bfloat16, device=dev)
+        w_init = torch.randn(s['sq'], s['b'], s['idx_nh'], dtype=torch.bfloat16, device=dev)
+        kv_offset = s['skv'] - s['n_comp']
+
+        # ---- Actual: real fused path; capture kernel-emitted indexer grads.
+        q_idx_real = q_idx_init.detach().clone().requires_grad_(True)
+        k_idx_real = k_idx_init.detach().clone().requires_grad_(True)
+        w_real = w_init.detach().clone().requires_grad_(True)
+        _, indexer_loss = fused_indexer_sparse_attn(
+            query,
+            kv_full,
+            attn_sink,
+            win_idxs,
+            q_idx_real,
+            k_idx_real,
+            w_real,
+            indexer_topk=s['indexer_topk'],
+            ratio=s['ratio'],
+            softmax_scale=s['softmax_scale'],
+            indexer_softmax_scale=s['indexer_softmax_scale'],
+            loss_coeff=loss_coeff,
+            sparse_loss=False,
+            kv_offset=kv_offset,
+        )
+        indexer_loss.backward()
+        dq_kernel = q_idx_real.grad.detach().clone()
+        dk_kernel = k_idx_real.grad.detach().clone()
+        dw_kernel = w_real.grad.detach().clone()
+
+        # ---- Reference: capture the kernel's attn-side / lse_indexer (treated
+        # as constants) and run autograd through the analytical dense KL.
+        from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
+            _compute_dense_attn_score,
+            _dsa_fwd_flash_mla,
+            _indexer_topk_bshd,
+            _kl_loss_from_dense_scores,
+            _sbhd_to_bshd_indexer_inputs,
+        )
+
+        effective_topk = min(s['indexer_topk'], s['n_comp'])
+        with torch.no_grad():
+            q_idx_bshd_bf, k_idx_bsd_bf, _, w_bsh_scaled_bf = _sbhd_to_bshd_indexer_inputs(
+                q_idx_init, k_idx_init, w_init, s['indexer_softmax_scale']
+            )
+            topk_indices_cmp, _, _ = _indexer_topk_bshd(
+                q_idx_bshd_bf, k_idx_bsd_bf, w_bsh_scaled_bf, effective_topk, s['ratio']
+            )
+            compress_topk_idxs = torch.where(
+                topk_indices_cmp >= 0, topk_indices_cmp + kv_offset, -1
+            )
+            combined_local = torch.cat([compress_topk_idxs, win_idxs], dim=-1)
+            global_idxs = local_to_global_flat(combined_local, s['b'], s['skv'])
+            q_flat = query.reshape(s['sq'] * s['b'], s['np_'], s['d'])
+            kv_flat = kv_full.reshape(s['skv'] * s['b'], s['d'])
+            _, _, lse_indexer = _dsa_fwd_flash_mla(
+                q_flat,
+                kv_flat,
+                global_idxs,
+                s['softmax_scale'],
+                attn_sink=attn_sink,
+                topk_length=None,
+                indexer_topk=effective_topk,
+            )
+            lse_indexer_bsqh = lse_indexer.reshape(s['sq'], s['b'], s['np_']).permute(1, 0, 2)
+
+            q_attn_bshd = query.permute(1, 0, 2, 3).contiguous()
+            k_attn_bsd = kv_full[kv_offset:].permute(1, 0, 2).contiguous()
+            attn_score_const, attn_l1norm_const = _compute_dense_attn_score(
+                q_attn_bshd,
+                k_attn_bsd.unsqueeze(2),
+                lse_indexer_bsqh,
+                qhead_per_kv_head=s['np_'],
+                softmax_scale=s['softmax_scale'],
+                ratio=s['ratio'],
+            )
+
+        # Autograd reference: same dense-KL formula, but index_score /
+        # index_lse depend on q_idx_ref / k_idx_ref / w_ref so autograd can
+        # propagate gradients back to them.
+        #
+        # Stop-gradient alignment: the reference uses the kernel's actual
+        # bf16-emitted ``indexer_scores`` as the forward value (so the
+        # loss numerics match exactly), but routes the chain rule through
+        # the analytical fp32 score. Without this, fp32-analytical vs
+        # bf16-kernel forward scores drift ~0.4% and contaminate the
+        # backward comparison with a forward-side artifact (~0.7% cosine
+        # gap) that has nothing to do with the backward kernel itself.
+        with torch.no_grad():
+            q_idx_bshd_k, k_idx_bsd_k, _, w_bsh_scaled_k = _sbhd_to_bshd_indexer_inputs(
+                q_idx_init, k_idx_init, w_init, s['indexer_softmax_scale']
+            )
+            _, _, kernel_indexer_scores = _indexer_topk_bshd(
+                q_idx_bshd_k, k_idx_bsd_k, w_bsh_scaled_k, effective_topk, s['ratio']
+            )
+
+        q_idx_ref = q_idx_init.detach().clone().requires_grad_(True)
+        k_idx_ref = k_idx_init.detach().clone().requires_grad_(True)
+        w_ref = w_init.detach().clone().requires_grad_(True)
+        q_idx_bshd_ref = q_idx_ref.permute(1, 0, 2, 3).contiguous().float()
+        k_idx_bsd_ref = k_idx_ref.permute(1, 0, 2).contiguous().float()
+        w_bsh_ref = w_ref.permute(1, 0, 2).contiguous().float()
+        qk_idx = torch.einsum('bqhd,bkd->bqhk', q_idx_bshd_ref, k_idx_bsd_ref)
+        idx_score_analytical = (torch.relu(qk_idx) * w_bsh_ref.unsqueeze(-1)).sum(dim=2) * s[
+            'indexer_softmax_scale'
+        ]
+        idx_score_aligned = (
+            idx_score_analytical + (kernel_indexer_scores - idx_score_analytical).detach()
+        )
+        idx_lse_aligned = torch.logsumexp(idx_score_aligned, dim=-1)
+        loss_ref = _kl_loss_from_dense_scores(
+            attn_score_const.detach(),
+            attn_l1norm_const.detach(),
+            idx_score_aligned,
+            idx_lse_aligned,
+            loss_coeff,
+        )
+        loss_ref.backward()
+
+        def cosine(a, b):
+            return torch.nn.functional.cosine_similarity(
+                a.flatten().double().unsqueeze(0), b.flatten().double().unsqueeze(0)
+            ).item()
+
+        # eps=5e-4 covers the residual bf16↔autograd precision noise on
+        # d_q (~2.6e-4 observed at this scale); d_k and d_weights agree
+        # to within ~1e-5 / exact respectively. Tighten if the kernel's
+        # dense backward improves or if d_q noise drops.
+        eps = 5e-4
+        for name, dk_grad, dr_grad in [
+            ('d q_indexer', dq_kernel, q_idx_ref.grad),
+            ('d k_indexer', dk_kernel, k_idx_ref.grad),
+            ('d weights', dw_kernel, w_ref.grad),
+        ]:
+            cs = cosine(dk_grad, dr_grad)
+            assert cs > 1 - eps, f"{name}: cosine_sim={cs:.10f}, eps={eps}"
 
 
 # ---------------------------------------------------------------------------
