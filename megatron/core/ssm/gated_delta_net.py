@@ -310,9 +310,6 @@ class GatedDeltaNet(MegatronModule):
             assert (
                 self.cp_size == 1
             ), "Fused pre_gated_delta_rule does not support context parallelism yet."
-            assert (
-                packed_seq_params is None
-            ), "Fused pre_gated_delta_rule does not support packed sequence yet."
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             assert batch == 1, "Packed sequence expects batch dimension to be 1"
@@ -390,8 +387,13 @@ class GatedDeltaNet(MegatronModule):
 
         if self.use_fused_pre_gated_delta_rule:
             nvtx_range_push(suffix="fused_pre_gated_delta_rule")
+            seq_idx = (
+                packed_seq_params.seq_idx
+                if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+                else None
+            )
             query, key, value, gate, beta, g = self._fused_pre_gated_delta_rule(
-                qkvzba, cu_seqlens_q=cu_seqlens_q
+                qkvzba, cu_seqlens_q=cu_seqlens_q, seq_idx=seq_idx
             )
             nvtx_range_pop(suffix="fused_pre_gated_delta_rule")
         else:
@@ -537,7 +539,7 @@ class GatedDeltaNet(MegatronModule):
 
         return query, key, value, gate, beta, g
 
-    def _fused_pre_gated_delta_rule(self, qkvzba, cu_seqlens_q=None):
+    def _fused_pre_gated_delta_rule(self, qkvzba, cu_seqlens_q=None, seq_idx=None):
         """Call the placeholder fused pre-GDR wrapper."""
 
         assert self.cp_size == 1, "Fused pre_gated_delta_rule does not support CP yet."
@@ -553,6 +555,7 @@ class GatedDeltaNet(MegatronModule):
             value_head_dim=self.value_head_dim,
             use_qk_l2norm=self.use_qk_l2norm,
             cu_seqlens=cu_seqlens_q,
+            seq_idx=seq_idx,
         )
 
     @jit_fuser
