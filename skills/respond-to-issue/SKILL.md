@@ -1,9 +1,10 @@
 ---
 name: respond-to-issue
 description: Research and draft a response to a GitHub issue or question from an external contributor.
+license: Apache-2.0
 when_to_use: User shares a GitHub issue URL or asks to respond to a community question; 'respond to this issue', 'draft a reply', 'answer this GitHub question'.
 user_invocable: true
-argument: "<github-issue-url-or-number>"
+argument: "GitHub issue URL or number"
 ---
 
 # Respond to GitHub Issue

@@ -1,6 +1,7 @@
 ---
 name: update-golden-values
 description: Refresh golden values from a GitHub Actions workflow run (failing-only or all jobs), score the change with average normalized relative differences, and produce a PR-ready summary. Use when the user asks to update goldens for a CI run, refresh golden values from a workflow ID, or generate a golden-value diff summary for a PR description.
+license: Apache-2.0
 when_to_use: User provides a GitHub Actions workflow run ID and asks to refresh golden values; user asks to update goldens for "failing tests only" or "all tests"; user asks for a per-metric relative-difference summary of the golden-value diff; user wants a PR description blurb after running download_golden_values.py.
 ---
 

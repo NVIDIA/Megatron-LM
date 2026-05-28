@@ -1,9 +1,10 @@
 ---
 name: split-pr
 description: Split a PR into multiple PRs to reduce the number of required CODEOWNERS reviewer groups.
+license: Apache-2.0
 when_to_use: User asks to split a PR, reduce reviewer groups, or break up a large PR; 'too many CODEOWNERS', 'split this PR', 'break up PR', 'reduce reviewers needed'.
 user_invocable: true
-argument: "<pr-url-or-number>"
+argument: "PR URL or number"
 ---
 
 # Split PR by CODEOWNERS Groups

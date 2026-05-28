@@ -1,6 +1,7 @@
 ---
 name: nightly-sync
 description: Domain knowledge for the nightly main-to-dev sync workflow. Covers merge strategy, CI architecture, failure investigation, and known issues.
+license: Apache-2.0
 when_to_use: Working on the nightly sync PR; investigating a nightly sync failure; resolving merge conflicts between main and dev; 'nightly sync failed', 'main-to-dev merge', 'sync bot'.
 ---
 
@@ -9,6 +10,10 @@ when_to_use: Working on the nightly sync PR; investigating a nightly sync failur
 This skill is read by the automated sync bot during the nightly-sync-main-to-dev
 workflow. It contains all domain knowledge for merging main into dev, resolving
 conflicts, iterating on CI, and shipping the PR.
+
+Detailed shell templates and historical regression examples live in
+[detailed procedures](references/detailed-procedures.md). Read that reference
+when running pre-push invariant checks or the Phase 3 CI polling loop.
 
 ---
 
@@ -234,123 +239,11 @@ Run on ALL changed Python files (relative to `origin/dev`), in this order:
 
 ### Pre-push invariant checks
 
-Before every `git push` in this workflow (the initial push in Phase 1
-AND every fix-push in Phase 3), run these bash checks. If any fails,
-fix the condition and re-check before pushing:
-
-```bash
-MERGE_COMMIT=$(git rev-list --min-parents=2 --max-count=1 HEAD || true)
-if [ -n "$MERGE_COMMIT" ]; then
-  DEV_REF="${MERGE_COMMIT}^1"
-  MAIN_REF="${MERGE_COMMIT}^2"
-else
-  DEV_REF="origin/dev"
-  MAIN_REF="origin/main"
-fi
-
-# 1. CODEOWNERS must be identical to dev's.
-if ! git diff --quiet "$DEV_REF" HEAD -- .github/CODEOWNERS; then
-  echo "ABORT: .github/CODEOWNERS differs from dev. Restore with:"
-  echo "  git checkout $DEV_REF -- .github/CODEOWNERS"
-  exit 1
-fi
-
-# 2. Dependency-management triple must be identical to dev's.
-for f in pyproject.toml uv.lock docker/Dockerfile.ci.dev; do
-  if ! git diff --quiet "$DEV_REF" HEAD -- "$f"; then
-    # pyproject.toml is allowed to differ ONLY for git source reconciliation
-    # (new [tool.uv.sources] entries from main). If you intentionally edited
-    # it for that reason, bypass this check by re-running with $f skipped.
-    echo "WARNING: $f differs from dev"
-  fi
-done
-
-# 3. Dev-feature preservation audit.
-#
-# The most common sync regression is silently dropping a dev-only feature
-# that main does not have yet. Pattern:
-#   T0: a feature lands on dev
-#   T1 > T0: the same feature lands on main (possibly reformatted)
-#   The sync runs between T0 and T1. Blindly resolving a conflict in
-#   main's favour drops dev's addition wherever main happened to touch a
-#   nearby line for an unrelated reason.
-#
-# For each file the sync touched (modulo skill-sanctioned overrides and
-# the dependency triple), find every line that satisfies ALL of:
-#   line is on origin/dev        (dev had it)
-#   line is NOT on origin/main   (main never owned it)
-#   line is NOT in the merged tree  (the merge dropped it)
-# Filter out whitespace-only lines and bracket-only lines (they
-# frequently differ for cosmetic reasons).
-#
-# Files in the "Files to Override from Main" list (training.py,
-# initialize.py, utils.py, data_samplers.py, layer_wise_optimizer.py)
-# are exempt by skill convention — main may legitimately win there.
-# CODEOWNERS and the dep triple are checked above; skip them here.
-
-INTENTIONAL_OVERRIDE_REGEX='^(megatron/training/training\.py|megatron/training/initialize\.py|megatron/training/utils\.py|megatron/training/datasets/data_samplers\.py|megatron/core/optimizer/layer_wise_optimizer\.py)$'
-SKIP_REGEX='^(pyproject\.toml|uv\.lock|docker/Dockerfile\.ci\.dev|\.github/CODEOWNERS)$'
-
-VIOLATIONS=0
-for f in $(git diff --name-only "$DEV_REF"..HEAD \
-            -- '*.py' '*.md' '*.yaml' '*.yml' '*.toml' \
-               '*.sh' '*.cpp' '*.cu' '*.h' \
-            | sort -u); do
-  [[ "$f" =~ $SKIP_REGEX ]] && continue
-  [[ "$f" =~ $INTENTIONAL_OVERRIDE_REGEX ]] && continue
-  git cat-file -e "HEAD:$f" 2>/dev/null || continue
-
-  missing=$(comm -23 \
-              <(git show "$DEV_REF:$f"  2>/dev/null | sort -u) \
-              <(git show "$MAIN_REF:$f" 2>/dev/null | sort -u) \
-            | comm -23 - <(git show "HEAD:$f" 2>/dev/null | sort -u) \
-            | grep -E '[[:alnum:]_]' \
-            || true)
-
-  if [ -n "$missing" ]; then
-    echo "=== $f ==="
-    printf '%s\n' "$missing"
-    VIOLATIONS=$((VIOLATIONS + $(printf '%s\n' "$missing" | grep -c .)))
-  fi
-done
-
-if [ "$VIOLATIONS" -gt 0 ]; then
-  echo "ABORT: $VIOLATIONS dev-only line(s) dropped by the merge. For each:"
-  echo "  (a) MAIN INTENTIONALLY REMOVED — find the specific commit in"
-  echo "      'git log origin/main -- <file>' that removed it; document the"
-  echo "      SHA in the PR body, then the drop is acceptable."
-  echo "  (b) MERGE ACCIDENT — main never explicitly touched that line."
-  echo "      RESTORE the dev line (Edit/Write to put it back)."
-  echo "Default to (b); only declare (a) with a specific main commit as evidence."
-  exit 1
-fi
-```
-
-The CODEOWNERS check and the dev-feature preservation audit are HARD
-aborts — never push if either fails. The dep-triple check is a warning
-because git-source reconciliation can produce legitimate diffs there.
-
-Recent regressions the dev-feature audit would have flagged (all
-"merge accident" type from #4659 and #4716):
-
-- `transformer_layer.py` lost `_forward_mlp_router(input_ids=None)`
-- `token_dispatcher.py` lost the
-  `num_sms_preprocessing_api=...` kwarg on the `_HybridEPManager` call
-- `moe_layer.py` lost `self._maybe_record_overload_factor(...)`
-- `gpt_dynamic_inference_with_coordinator.py` lost
-  `from megatron.training.arguments import parse_and_validate_args`
-- `datasets/readme.md` lost the dev-only "Packing Scheduler" section
-- PR #4882 / PR #4318 dropped the `TEFusedDenseMLP` implementation and
-  `gpt_layer_specs.py` selection while leaving the config flag and unit test
-- `data_samplers.py` / `utils.py` / `training.py` kept main's
-  `args.hybrid_context_parallel` instead of dev's
-  `args.dynamic_context_parallel` (counts as a MERGE ACCIDENT — dev's
-  reference is present, main's is the deprecated alias that's False
-  when callers pass `--dynamic-context-parallel`). These files are on
-  the override list so the audit treats them as "advisory", but you
-  should still rename `args.hybrid_context_parallel` →
-  `args.dynamic_context_parallel` on every reference after taking
-  main's version of these files.
+Before every `git push` in this workflow, run the invariant script in
+[detailed procedures](references/detailed-procedures.md#pre-push-invariant-checks).
+The CODEOWNERS check and dev-feature preservation audit are hard aborts; never
+push if either fails. The dependency-triple check is a warning because git-source
+reconciliation can produce legitimate diffs.
 
 ### Commit and Push
 
@@ -440,131 +333,16 @@ tool call that blocks inline until the wait is resolved.
 
 ### The Fix-Then-Retrigger Loop
 
-Two nested loops. Do NOT conflate them:
+Use two nested loops: an outer sequence of tool calls and one inner blocking
+Bash poll per CI iteration. The source of truth is
+`gh pr view <PR_NUMBER> --repo $REPO --json statusCheckRollup`, because it
+includes external contexts such as GitLab CI and `copy-pr-bot`.
 
-- The **outer loop** is YOUR sequence of tool calls (each iteration: one
-  `/ok to test`, one blocking poll, maybe one fix-and-push). It is NOT a
-  Bash loop. It advances because you make new tool calls.
-- The **inner loop** is a single blocking Bash tool call using
-  `while true; do ... sleep 120; done`. It runs during one iteration of
-  the outer loop and ends when CI reaches a terminal state for that
-  iteration.
-
-The outer loop terminates ONLY when Phase 4's gate is satisfied.
-
-**Source of truth:** `gh pr view <PR_NUMBER> --repo $REPO --json statusCheckRollup`.
-This lists every required check, including external status contexts
-(GitLab CI, `copy-pr-bot`, etc.) that `gh api .../actions/runs/.../jobs`
-does NOT show.
-
-**Outer-loop iteration (each iteration is a few tool calls):**
-
-1. `latest_sha=$(git rev-parse HEAD)` (one Bash call).
-2. Post `/ok to test $latest_sha` on the PR:
-   `gh pr comment <PR_NUMBER> --repo $REPO --body "/ok to test $latest_sha"`
-3. ONE blocking Bash tool call. This is the inner loop. Copy this
-   template verbatim, only changing `REPO` and `PR`:
-
-   ```bash
-   REPO='NVIDIA/Megatron-LM'
-   PR='<PR_NUMBER>'
-   # Names matched case-insensitively, anchored to the START of the name.
-   EXEMPT='copy-pr-bot|is-not-external-contributor|greptile|coderabbit|codeowners|.*review|.*approval|codecov|coverage|build-docs|doc-build|readthedocs|sphinx'
-   # Sentinel check that tells us CI has fully run. Update this if the
-   # aggregate gate job is renamed.
-   SENTINEL='Nemo_CICD_Test'
-
-   while true; do
-     # Normalize both CheckRun (.status / .conclusion) and StatusContext
-     # (.state) entries into the same {name, status, conclusion} shape.
-     rollup=$(gh pr view "$PR" --repo "$REPO" --json statusCheckRollup --jq '
-       .statusCheckRollup[] | [
-         (.name // .context // "?"),
-         (if .__typename == "StatusContext" then
-            (if (.state == "PENDING" or .state == "EXPECTED") then "IN_PROGRESS"
-             else "COMPLETED" end)
-          else (.status // "UNKNOWN") end),
-         (if .__typename == "StatusContext" then
-            (if .state == "SUCCESS" then "SUCCESS"
-             elif (.state == "FAILURE" or .state == "ERROR") then "FAILURE"
-             else "NEUTRAL" end)
-          else (.conclusion // "UNKNOWN") end)
-       ] | @tsv')
-
-     # Sentinel: do NOT declare green until the CI aggregate gate has
-     # reached a terminal state. Before /ok to test triggers the run,
-     # the sentinel is absent; while CI is running, it's IN_PROGRESS.
-     sentinel_line=$(printf '%s\n' "$rollup" | awk -F'\t' -v s="$SENTINEL" '$1 == s')
-     sentinel_status=$(printf '%s\n' "$sentinel_line" | awk -F'\t' 'NR==1 {print $2}')
-     if [ "$sentinel_status" != "COMPLETED" ]; then
-       echo "=== $(date -u) waiting for $SENTINEL (status: ${sentinel_status:-absent}) ==="
-       sleep 120
-       continue
-     fi
-
-     # Classify non-exempt checks (exempt list applied to the NAME only).
-     non_exempt=$(printf '%s\n' "$rollup" | awk -F'\t' -v p="^($EXEMPT)" 'tolower($1) !~ tolower(p)')
-     failed=$(printf '%s\n' "$non_exempt" | awk -F'\t' '$2 == "COMPLETED" && $3 !~ /^(SUCCESS|SKIPPED|NEUTRAL)$/')
-     pending=$(printf '%s\n' "$non_exempt" | awk -F'\t' '$2 != "COMPLETED"')
-
-     if [ -n "$failed" ]; then
-       echo "=== NON-EXEMPT FAILURES ==="
-       printf '%s\n' "$failed"
-       echo "RESULT=FAILURE"
-       exit 0
-     fi
-     if [ -n "$pending" ]; then
-       # Sentinel is COMPLETED but a non-exempt check is still pending —
-       # rare but possible. Keep waiting; do NOT ship.
-       echo "=== $(date -u) sentinel done but non-exempt checks still pending ==="
-       printf '%s\n' "$pending"
-       sleep 120
-       continue
-     fi
-
-     echo "=== ALL NON-EXEMPT CHECKS COMPLETED GREEN ==="
-     printf '%s\n' "$non_exempt"
-     echo "RESULT=GREEN"
-     exit 0
-   done
-   ```
-
-   This Bash call blocks for as long as CI takes (minutes to hours). Do
-   NOT split it into many short polls interleaved with other tool calls
-   — that wastes `--max-turns` and creates windows where you could lose
-   track of the loop state.
-
-4. Read the tool output:
-   - If `RESULT=FAILURE`: diagnose via
-     `gh api repos/$REPO/actions/jobs/<JOB_ID>/logs` (or the
-     external-context equivalent) and fix the code. The Phase 1
-     commit is immutable; fixes accumulate in a single rolling fix
-     commit on top of it:
-     ```bash
-     git add -A
-     if git rev-parse --verify HEAD^2 >/dev/null 2>&1; then
-       # HEAD has two parents → still the Phase 1 merge commit.
-       # First failure of this run: create the fix commit.
-       git commit -m "fix: post-CI corrections"
-       git push origin "$BRANCH"
-     else
-       # HEAD is the existing fix commit → amend it.
-       git commit --amend --no-edit
-       git push --force-with-lease origin "$BRANCH"
-     fi
-     ```
-     `--force-with-lease` (not `--force`): if a human pushed onto the
-     branch since the bot last fetched, the lease aborts the push
-     instead of clobbering them — fetch and decide what to do.
-     Start a new outer-loop iteration at step 1 with the new HEAD SHA.
-   - If `RESULT=GREEN`: outer loop is done. Proceed to Phase 4.
-
-**Why not wait-for-run-to-register first?** `gh pr comment` with
-`/ok to test <sha>` is handled by `copy-pr-bot`, which takes a few
-seconds to trigger the CI run. The `statusCheckRollup` poll in step 3
-will initially show checks in `PENDING` / `QUEUED`; that's fine — the
-inner loop treats those as "keep waiting" and will see them advance as
-CI progresses. No separate registration poll needed.
+For each iteration, get the current SHA, post `/ok to test <sha>`, then run the
+blocking polling template in
+[detailed procedures](references/detailed-procedures.md#ci-polling-template).
+If it reports `RESULT=FAILURE`, fix the code and update the single rolling fix
+commit. If it reports `RESULT=GREEN`, proceed to Phase 4.
 
 ### Anti-Patterns (what went wrong on run 24800621116)
 
