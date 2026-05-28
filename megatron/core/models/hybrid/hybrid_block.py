@@ -363,11 +363,7 @@ class HybridStack(MegatronModule):
         # no longer calls `learned_output_contract` there (MTP owns that), so these
         # params would be orphaned and break DDP's per-param grad-ready accounting
         # with a `len(per_param_grad_ready_counts) != len(params)` AssertionError.
-        if (
-            self.config.enable_hyper_connections
-            and self.post_process
-            and not self.is_mtp_layer
-        ):
+        if self.config.enable_hyper_connections and self.post_process and not self.is_mtp_layer:
             hc_mult = self.config.num_residual_streams
             hc_dim = self.config.hidden_size * hc_mult
             self.hc_head_fn = nn.Parameter(torch.randn(hc_mult, hc_dim))
@@ -495,11 +491,7 @@ class HybridStack(MegatronModule):
         # decoder hands in already-multi-stream hidden_states via mhc_multistream
         # (see multi_token_prediction.py _concat_embeddings), so expanding again would
         # produce [s, b, n*(n*h)] instead of [s, b, n*h] and break HC mapping_proj.
-        if (
-            self.config.enable_hyper_connections
-            and self.pre_process
-            and not self.is_mtp_layer
-        ):
+        if self.config.enable_hyper_connections and self.pre_process and not self.is_mtp_layer:
             hidden_states = HyperConnectionModule.input_expand(
                 hidden_states, self.config.num_residual_streams
             )
@@ -626,11 +618,7 @@ class HybridStack(MegatronModule):
         # MTP's own `_postprocess` calls learned_output_contract + final_layernorm
         # itself, so doing it here would double-collapse and break the multi-stream
         # contract expected by the surrounding MTP code.
-        if (
-            self.config.enable_hyper_connections
-            and self.post_process
-            and not self.is_mtp_layer
-        ):
+        if self.config.enable_hyper_connections and self.post_process and not self.is_mtp_layer:
             hidden_states = learned_output_contract(
                 hidden_states,
                 self.hc_head_fn,
