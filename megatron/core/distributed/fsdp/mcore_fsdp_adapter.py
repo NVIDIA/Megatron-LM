@@ -94,8 +94,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
 
     @staticmethod
     def _fine_grained_recurse_module_types(
-        config: TransformerConfig,
-        ddp_config: DistributedDataParallelConfig,
+        config: TransformerConfig, ddp_config: DistributedDataParallelConfig
     ) -> Tuple[Type[nn.Module], ...]:
         """Container module classes that need ``parameters(recurse=True)`` for fine-grained hooks."""
         if (
