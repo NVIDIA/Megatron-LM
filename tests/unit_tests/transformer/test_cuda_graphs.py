@@ -806,6 +806,292 @@ class TestParallelHybridBlockCudagraphs:
             del parallel_mamba_block.layers[_].cudagraph_manager.cudagraph_runners[0].fwd_graph
 
 
+class TestPadCuSeqlensForCudaGraph:
+    """Unit tests for the pure-Python ``pad_cu_seqlens_for_cuda_graph`` helper.
+
+    Verifies the contract used by the packed-sequence cudagraph wire-in: padding
+    repeats the final cumulative value so phantom segments are zero-length, and
+    returns None on overflow so the caller can fall back to eager.
+    """
+
+    def test_short_input_pads_with_repeated_last_value(self):
+        from megatron.core.packed_seq_params import pad_cu_seqlens_for_cuda_graph
+
+        cu_seqlens = torch.tensor([0, 5, 12, 19], dtype=torch.int32)
+        padded = pad_cu_seqlens_for_cuda_graph(cu_seqlens, target_num_seqs=6)
+        assert padded is not None
+        assert padded.shape == (7,)
+        assert padded.dtype == cu_seqlens.dtype
+        assert padded[:4].tolist() == [0, 5, 12, 19]
+        assert padded[4:].tolist() == [19, 19, 19]
+
+    def test_exact_fit_returns_input_unchanged(self):
+        from megatron.core.packed_seq_params import pad_cu_seqlens_for_cuda_graph
+
+        cu_seqlens = torch.tensor([0, 4, 9, 16], dtype=torch.int32)
+        padded = pad_cu_seqlens_for_cuda_graph(cu_seqlens, target_num_seqs=3)
+        assert padded is not None
+        assert padded.shape == (4,)
+        assert padded.tolist() == [0, 4, 9, 16]
+
+    def test_overflow_returns_none(self):
+        from megatron.core.packed_seq_params import pad_cu_seqlens_for_cuda_graph
+
+        cu_seqlens = torch.tensor([0, 3, 7, 11, 16, 22], dtype=torch.int32)
+        # 5 real documents > target_num_seqs=3 -> overflow
+        assert pad_cu_seqlens_for_cuda_graph(cu_seqlens, target_num_seqs=3) is None
+
+    def test_seq_idx_is_correct_under_padding(self):
+        """``PackedSeqParams.__post_init__`` builds ``seq_idx`` from the padded
+        cu_seqlens. Trailing repeated entries describe zero-length phantom segments
+        and contribute nothing. The tokens beyond ``cu_seqlens_padded[-1]`` (up to
+        ``total_tokens``) are accounted as one additional sequence whose index is
+        the position of the appended total-tokens sentinel — which under padding
+        is larger than under the unpadded form."""
+        from megatron.core.packed_seq_params import PackedSeqParams, pad_cu_seqlens_for_cuda_graph
+
+        cu_seqlens = torch.tensor([0, 5, 7, 11], dtype=torch.int32)
+        padded = pad_cu_seqlens_for_cuda_graph(cu_seqlens, target_num_seqs=8)
+        # padded == [0, 5, 7, 11, 11, 11, 11, 11, 11]  (length 9)
+        params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=padded,
+            cu_seqlens_kv=padded,
+            cu_seqlens_q_padded=padded,
+            cu_seqlens_kv_padded=padded,
+            max_seqlen_q=5,
+            max_seqlen_kv=5,
+            total_tokens=16,
+        )
+        # cu_seqlens_with_max = [0,5,7,11,11,11,11,11,11,16]
+        # seq_lengths = [5,2,4,0,0,0,0,0,5]
+        # seq_idx = [0]*5 + [1]*2 + [2]*4 + [3..7]*0 + [8]*5
+        assert params.seq_idx is not None
+        assert params.seq_idx.shape == (1, 16)
+        assert params.seq_idx.dtype == torch.int32
+        assert params.seq_idx[0].tolist() == ([0] * 5 + [1] * 2 + [2] * 4 + [8] * 5)
+
+
+class TestParallelTransformerBlockCudagraphsPackedSeq:
+    """End-to-end test of MCore-local cudagraph capture under packed-sequence
+    (THD / variable-length) training. Mirrors ``TestParallelTransformerBlockCudagraphs``
+    but feeds ``packed_seq_params`` and sets ``cuda_graph_max_packed_seqs``.
+
+    Verifies:
+      * the cudagraph captures with stable cu_seqlens shape (under-cap case);
+      * ``disable_cuda_graphs_this_step`` correctly bypasses capture (overflow case)
+        and still produces a valid forward output.
+    """
+
+    def setup_method(self, method):
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        # TP=1, PP=1 to keep the bypass test safe: under PP > 1 a recording-phase
+        # bypass desynchronizes the per-microbatch runner store.
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        model_parallel_cuda_manual_seed(123)
+
+        CudaGraphManager.global_mempool = None
+
+        self.transformer_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            cuda_graph_impl="local",
+            cuda_graph_max_packed_seqs=8,
+        )
+        self.parallel_transformer_block = TransformerBlock(
+            self.transformer_config, get_gpt_layer_with_transformer_engine_spec()
+        )
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+        _CudagraphGlobalRecord.cudagraph_created = False
+        _CudagraphGlobalRecord.cudagraph_record = []
+        CudaGraphManager.global_mempool = None
+
+    @staticmethod
+    def _make_packed_seq_params(sequence_length, max_packed_seqs):
+        """Build a PackedSeqParams with 4 real docs, padded to ``max_packed_seqs``."""
+        from megatron.core.packed_seq_params import PackedSeqParams, pad_cu_seqlens_for_cuda_graph
+
+        cu_seqlens = torch.tensor([0, 6, 14, 22, sequence_length], dtype=torch.int32, device="cuda")
+        padded = pad_cu_seqlens_for_cuda_graph(cu_seqlens, max_packed_seqs)
+        return PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=padded,
+            cu_seqlens_kv=padded,
+            cu_seqlens_q_padded=padded,
+            cu_seqlens_kv_padded=padded,
+            max_seqlen_q=sequence_length,
+            max_seqlen_kv=sequence_length,
+            total_tokens=sequence_length,
+        )
+
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("1.5.0")),
+        reason="use_te_rng_tracker requires TransformerEngine version >= 1.5",
+    )
+    def test_gpu_cudagraph_packed_seq_undercap(self):
+        block = self.parallel_transformer_block
+        block.cuda()
+
+        sequence_length = 32
+        # THD layout: [total_tokens, batch_size=1, hidden]
+        hidden_states = torch.ones(
+            (sequence_length, 1, self.transformer_config.hidden_size), device="cuda"
+        )
+        packed_seq_params = self._make_packed_seq_params(
+            sequence_length, self.transformer_config.cuda_graph_max_packed_seqs
+        )
+
+        # First call records the graph; subsequent calls replay.
+        out = block(
+            hidden_states=hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
+        )
+        assert out.shape == hidden_states.shape
+
+        for layer in block.layers:
+            assert hasattr(layer, "cudagraph_manager")
+            assert len(layer.cudagraph_manager.cudagraph_runners) == 1
+            # Drop the captured graph so the test fixture does not retain the
+            # mempool past teardown.
+            del layer.cudagraph_manager.cudagraph_runners[0].fwd_graph
+
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("1.5.0")),
+        reason="use_te_rng_tracker requires TransformerEngine version >= 1.5",
+    )
+    def test_overflow_bypass_runs_eagerly(self):
+        from megatron.core.transformer.cuda_graphs import disable_cuda_graphs_this_step
+
+        block = self.parallel_transformer_block
+        block.cuda()
+
+        sequence_length = 32
+        hidden_states = torch.ones(
+            (sequence_length, 1, self.transformer_config.hidden_size), device="cuda"
+        )
+
+        # 10 real docs > cap of 8 -> the padding helper would return None.
+        # Construct PackedSeqParams directly (skipping the helper) to simulate the
+        # overflow path inside forward_step, which falls back to eager via
+        # ``disable_cuda_graphs_this_step``.
+        from megatron.core.packed_seq_params import PackedSeqParams
+
+        cu_seqlens = torch.tensor(
+            [0, 3, 6, 9, 12, 15, 18, 21, 24, 27, sequence_length], dtype=torch.int32, device="cuda"
+        )
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens,
+            cu_seqlens_kv_padded=cu_seqlens,
+            max_seqlen_q=sequence_length,
+            max_seqlen_kv=sequence_length,
+            total_tokens=sequence_length,
+        )
+
+        with disable_cuda_graphs_this_step():
+            out = block(
+                hidden_states=hidden_states,
+                attention_mask=None,
+                packed_seq_params=packed_seq_params,
+            )
+        assert out.shape == hidden_states.shape
+
+        # No cudagraph runner should have been created in the bypassed step.
+        for layer in block.layers:
+            assert hasattr(layer, "cudagraph_manager")
+            assert len(layer.cudagraph_manager.cudagraph_runners) == 0
+
+
+class TestParallelHybridBlockCudagraphsPackedSeq:
+    """End-to-end test of MCore-local cudagraph capture under packed-sequence
+    training for a hybrid Mamba-Transformer stack. Mirrors
+    ``TestParallelHybridBlockCudagraphs`` but feeds ``packed_seq_params``.
+    """
+
+    def setup_method(self, method):
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        model_parallel_cuda_manual_seed(123)
+
+        CudaGraphManager.global_mempool = None
+
+        def get_pg_collection():
+            return ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'pp', 'cp'])
+
+        layer_type_list = validate_segment_layers("M-M*-")
+        transformer_config = TransformerConfig(
+            hidden_size=256,
+            num_layers=len(layer_type_list),
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            cuda_graph_impl="local",
+            cuda_graph_max_packed_seqs=8,
+        )
+        self.transformer_config = transformer_config
+        self.mamba_block = HybridStack(
+            transformer_config,
+            hybrid_stack_spec.submodules,
+            layer_type_list=layer_type_list,
+            pp_layer_offset=0,
+            pg_collection=get_pg_collection(),
+        )
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+        _CudagraphGlobalRecord.cudagraph_created = False
+        _CudagraphGlobalRecord.cudagraph_record = []
+        CudaGraphManager.global_mempool = None
+
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("1.5.0")),
+        reason="use_te_rng_tracker requires TransformerEngine version >= 1.5",
+    )
+    def test_gpu_cudagraph_packed_seq_undercap(self):
+        from megatron.core.packed_seq_params import PackedSeqParams, pad_cu_seqlens_for_cuda_graph
+
+        block = self.mamba_block
+        block.cuda()
+
+        sequence_length = 32
+        hidden_states = torch.ones(
+            (sequence_length, 1, self.transformer_config.hidden_size), device="cuda"
+        )
+
+        cu_seqlens = torch.tensor([0, 6, 14, 22, sequence_length], dtype=torch.int32, device="cuda")
+        padded = pad_cu_seqlens_for_cuda_graph(
+            cu_seqlens, self.transformer_config.cuda_graph_max_packed_seqs
+        )
+        packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=padded,
+            cu_seqlens_kv=padded,
+            cu_seqlens_q_padded=padded,
+            cu_seqlens_kv_padded=padded,
+            max_seqlen_q=sequence_length,
+            max_seqlen_kv=sequence_length,
+            total_tokens=sequence_length,
+        )
+
+        out = block(
+            hidden_states=hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
+        )
+        assert out.shape == hidden_states.shape
+
+        for layer in block.layers:
+            assert hasattr(layer, "cudagraph_manager")
+            assert len(layer.cudagraph_manager.cudagraph_runners) == 1
+            del layer.cudagraph_manager.cudagraph_runners[0].fwd_graph
+
+
 # Global storage for comparing unique buffer counts across different num_microbatches,
 # keyed by (pp_size, vpp_size)
 _unique_buffer_counts = {}

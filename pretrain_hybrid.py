@@ -17,6 +17,7 @@ if rank != 0:
     warnings.filterwarnings("ignore", category=UserWarning)
     warnings.filterwarnings("ignore", category=FutureWarning)
 
+import contextlib
 from functools import partial
 from typing import Any, List, Optional, Tuple
 
@@ -28,7 +29,8 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
 from megatron.core.models.hybrid.hybrid_model import HybridModel
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, pad_cu_seqlens_for_cuda_graph
+from megatron.core.transformer.cuda_graphs import disable_cuda_graphs_this_step
 from megatron.core.parallel_state import (
     get_context_parallel_group,
     get_hybrid_data_context_parallel_groups,
@@ -175,6 +177,8 @@ def forward_step(data_iterator, model: HybridModel):
         data_iterator : Input data iterator
         model (HybridModel): The Hybrid Model
     """
+    args = get_args()
+    config = core_transformer_config_from_args(args)
     timers = get_timers()
 
     # Get the batch.
@@ -198,6 +202,7 @@ def forward_step(data_iterator, model: HybridModel):
         ) = get_batch(data_iterator, vp_stage)
 
     packed_seq_params = None
+    cuda_graph_bypass = False
     if cu_seqlens is not None:
         # cu_seqlens / cu_seqlens_padded carry the dataloader's batch dim (1, n).
         # PackedSeqParams (and TE attention) expect 1-D, so squeeze before use.
@@ -208,6 +213,20 @@ def forward_step(data_iterator, model: HybridModel):
         # attention only computes work for real tokens within each chunk.
         update_seqlen_stats_from_cu_seqlens(cu_seqlens)
         cu_seqlens_for_params = cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens
+        total_tokens = int(cu_seqlens_for_params[-1].item())
+
+        # Pad cu_seqlens to a fixed shape for CUDA-graph capture. See pretrain_gpt.py
+        # for the rationale; falls back to eager forward when N_docs exceeds the cap.
+        if config.cuda_graph_impl == "local" and config.cuda_graph_max_packed_seqs > 0:
+            max_seqs = config.cuda_graph_max_packed_seqs
+            padded_for_params = pad_cu_seqlens_for_cuda_graph(cu_seqlens_for_params, max_seqs)
+            if padded_for_params is None:
+                cuda_graph_bypass = True
+            else:
+                cu_seqlens_for_params = padded_for_params
+                if cu_seqlens_padded is not None:
+                    cu_seqlens_padded = pad_cu_seqlens_for_cuda_graph(cu_seqlens_padded, max_seqs)
+
         packed_seq_params = PackedSeqParams(
             qkv_format="thd",
             cu_seqlens_q=cu_seqlens_for_params,
@@ -218,12 +237,13 @@ def forward_step(data_iterator, model: HybridModel):
             max_seqlen_kv=int(max_seqlen.item()),
             local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
             cp_group=hybrid_cp_group,
-            total_tokens=int(cu_seqlens_for_params[-1].item()),
+            total_tokens=total_tokens,
         )
 
     timers('batch-generator').stop()
 
-    with stimer:
+    cuda_graph_ctx = disable_cuda_graphs_this_step() if cuda_graph_bypass else contextlib.nullcontext()
+    with stimer, cuda_graph_ctx:
         output_tensor = model(
             tokens,
             position_ids,

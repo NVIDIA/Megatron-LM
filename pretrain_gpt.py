@@ -18,6 +18,7 @@ if rank != 0:
     warnings.filterwarnings("ignore", category=UserWarning)
     warnings.filterwarnings("ignore", category=FutureWarning)
 
+import contextlib
 from functools import partial
 from typing import Any, List, Optional, Tuple
 
@@ -29,7 +30,8 @@ from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegat
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, pad_cu_seqlens_for_cuda_graph
+from megatron.core.transformer.cuda_graphs import disable_cuda_graphs_this_step
 from megatron.core.parallel_state import (
     get_context_parallel_group,
     get_hybrid_data_context_parallel_groups,
@@ -204,6 +206,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         ) = get_batch(data_iterator, vp_stage)
 
     packed_seq_params = None
+    cuda_graph_bypass = False
     if cu_seqlens is not None:
         # cu_seqlens / cu_seqlens_padded carry the dataloader's batch dim (1, n).
         # PackedSeqParams (and TE attention) expect 1-D, so squeeze before use.
@@ -214,6 +217,23 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         # attention only computes work for real tokens within each chunk.
         update_seqlen_stats_from_cu_seqlens(cu_seqlens)
         cu_seqlens_for_params = cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens # TODO(asolergi-nv): Currently there is a bug forcing cu_seqlens to be cu_seqlens_padded
+
+        # Pad cu_seqlens to a fixed shape for CUDA-graph capture. Required for
+        # cuda_graph_impl="local" because the captured graph's input tensor shapes
+        # must be stable across replays. Falls back to eager forward when the actual
+        # number of documents exceeds the cap.
+        if config.cuda_graph_impl == "local" and config.cuda_graph_max_packed_seqs > 0:
+            max_seqs = config.cuda_graph_max_packed_seqs
+            padded_for_params = pad_cu_seqlens_for_cuda_graph(cu_seqlens_for_params, max_seqs)
+            if padded_for_params is None:
+                cuda_graph_bypass = True
+            else:
+                cu_seqlens_for_params = padded_for_params
+                if cu_seqlens_padded is not None:
+                    # Already-padded variant from the dataloader (CP / sequence-padding):
+                    # extend it to the same fixed length so the two tensors agree.
+                    cu_seqlens_padded = pad_cu_seqlens_for_cuda_graph(cu_seqlens_padded, max_seqs)
+
         packed_seq_params = PackedSeqParams(
             qkv_format="thd",
             cu_seqlens_q=cu_seqlens_for_params,
@@ -228,7 +248,8 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
 
     timers('batch-generator').stop()
 
-    with stimer:
+    cuda_graph_ctx = disable_cuda_graphs_this_step() if cuda_graph_bypass else contextlib.nullcontext()
+    with stimer, cuda_graph_ctx:
         if return_schedule_plan:
             assert args.overlap_moe_expert_parallel_comm, \
                 "overlap_moe_expert_parallel_comm must be enabled to return the schedule plan"

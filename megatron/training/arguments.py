@@ -1827,6 +1827,15 @@ def _add_inference_args(parser):
     group.add_argument('--cuda-graph-scope', nargs='+', type=_parse_cuda_graph_modules_arg,
                        default=None, dest='cuda_graph_scope_deprecated',
                        help=argparse.SUPPRESS)  # hidden; use --cuda-graph-modules instead
+    group.add_argument('--cuda-graph-max-packed-seqs', nargs='?', type=int, const=50, default=0,
+                       help='Maximum number of packed sequences per microbatch supported by '
+                       'CUDA graph capture for packed-sequence (THD / variable-length) training. '
+                       'When > 0, cu_seqlens tensors are padded to this many entries before being '
+                       'placed on PackedSeqParams so the cudagraph input signature is stable across '
+                       'steps. Microbatches that contain more documents than this fall back to an '
+                       'eager (non-graphed) forward pass for that step. Passing the flag without a '
+                       'value enables the feature with a default cap of 50. Defaults to 0 '
+                       '(feature off). Only applies when --cuda-graph-impl=local.')
     group.add_argument('--cuda-graph-modules', nargs='+', type=_parse_cuda_graph_modules_arg, default=[],
                        help='Selects training capture coverage within per-layer CUDA graphs '
                        '(local and transformer_engine implementations). '
@@ -2060,6 +2069,7 @@ def _add_network_size_args(parser):
         "moe_token_dropping",
         "cuda_graph_use_single_mempool",
         "cuda_graph_retain_backward_graph",
+        "cuda_graph_max_packed_seqs",
         "disable_parameter_transpose_cache",
         "inference_sampling_seed",
         "use_inference_optimized_layers",

@@ -1,9 +1,49 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 import torch.distributed as dist
 from torch import Tensor
+
+
+def pad_cu_seqlens_for_cuda_graph(cu_seqlens: Tensor, target_num_seqs: int) -> Optional[Tensor]:
+    """Pad a cu_seqlens tensor to a fixed shape for CUDA graph capture.
+
+    CUDA graphs require input tensor shapes to be stable across replays. Packed-sequence
+    training produces a variable number of documents per microbatch, so ``cu_seqlens``
+    (length = num_docs + 1) changes shape from step to step. This helper pads the tensor
+    to ``target_num_seqs + 1`` entries by repeating the final cumulative value, matching
+    the pattern used by ``megatron/rl/sequence_packing_utils.py``. The trailing
+    repeated entries describe zero-length phantom segments which are handled correctly
+    by ``PackedSeqParams.__post_init__`` (the seq_lengths diff has trailing zeros, which
+    its existing ``clamp(min=0)`` accepts).
+
+    Args:
+        cu_seqlens: 1-D int32 cumulative sequence-length tensor of shape ``(K + 1,)``
+            where ``K`` is the number of real documents.
+        target_num_seqs: Target document capacity (the value of
+            ``--cuda-graph-max-packed-seqs``).
+
+    Returns:
+        A new 1-D tensor of length ``target_num_seqs + 1`` on the same device and dtype
+        when ``K <= target_num_seqs``; ``None`` when ``K > target_num_seqs`` so the
+        caller can fall back to an eager (non-graphed) forward pass.
+    """
+    assert cu_seqlens.dim() == 1, f"cu_seqlens must be 1-D, got shape {cu_seqlens.shape}"
+    current_len = cu_seqlens.shape[0]
+    target_len = target_num_seqs + 1
+    if current_len > target_len:
+        return None
+    if current_len == target_len:
+        return cu_seqlens
+    # Build the padded tensor without a GPU->CPU sync: copy the real values, then
+    # broadcast-assign the final element into the tail. Both operations stay on
+    # the device that cu_seqlens lives on.
+    out = torch.empty((target_len,), dtype=cu_seqlens.dtype, device=cu_seqlens.device)
+    out[:current_len] = cu_seqlens
+    out[current_len:] = cu_seqlens[-1]
+    return out
 
 
 @dataclass
