@@ -321,6 +321,23 @@ def forward_step_calc_loss(
         else:
             MTPLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
 
+    # Set the loss scale for the DSA indexer loss.
+    if hasattr(config, 'dsa_indexer_loss_coeff') and config.dsa_indexer_loss_coeff is not None:
+        from megatron.core.transformer.experimental_attention_variant.dsa import (
+            DSAIndexerLossAutoScaler,
+        )
+
+        device = get_tensor_device(output_tensor)
+        loss_scale = (
+            config.grad_scale_func(torch.ones(1, device=device))
+            if config.grad_scale_func is not None
+            else torch.ones(1, device=device)
+        )
+        if config.calculate_per_token_loss:
+            DSAIndexerLossAutoScaler.set_loss_scale(loss_scale)
+        else:
+            DSAIndexerLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
+
     return output_tensor, num_tokens
 
 

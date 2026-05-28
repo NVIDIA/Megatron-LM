@@ -716,9 +716,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
         # Injected by __call__ for cuda graph keying; not a real forward arg.
         kwargs.pop("dynamic_inference_decode_only", None)
-        assert (
-            not self.config.enable_hyper_connections
-        ), "Please use HyperConnectionTransformerLayer instead"
+        called_from_hybrid_mhc_wrapper = kwargs.pop("_called_from_hybrid_mhc_wrapper", False)
+        if self.config.enable_hyper_connections and not called_from_hybrid_mhc_wrapper:
+            raise RuntimeError(
+                "TransformerLayer.forward() must not be called directly when "
+                "enable_hyper_connections=True. Use HyperConnectionTransformerLayer "
+                "for transformer-only stacks; HyperConnectionHybridLayer drives the "
+                "wrapped TransformerLayer through this path automatically for hybrid "
+                "stacks."
+            )
         hidden_states, context = self._forward_attention(*args, **kwargs)
         output = self._forward_mlp(
             hidden_states,
@@ -1604,6 +1610,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
     def forward(self, *args, **kwargs):
         """Forward pass with MHC recompute manager support."""
         kwargs.pop("dynamic_inference_decode_only", None)
+        kwargs.pop("_called_from_hybrid_mhc_wrapper", None)
 
         mhc_recompute_manager = getattr(self, '_mhc_recompute_manager', None)
 
