@@ -444,8 +444,6 @@ class ShardedObject(ShardedBase):
     def empty_from_key(cls, key: str, replica_id: ReplicaId = 0) -> 'ShardedObject':
         """Instantiates a ShardedObject from key.
 
-        # TODO: explain.
-
         Args:
             key: ShardedObject key
             replica_id: indicates local object replication wrt.
