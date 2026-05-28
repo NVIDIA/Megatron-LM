@@ -135,51 +135,6 @@ if not HAVE_TE_CAST_MASTER_WEIGHTS_TO_FP8:
                 that_.copy_(this_)
 
 
-def sync_replicated_buffer_from_shard(
-    model_weight_buffer,
-    main_weight_buffer,
-    data_parallel_group: torch.distributed.ProcessGroup,
-    transpose_weight_buffer=None,
-) -> None:
-    """Refresh replicated compute-weight buffers from this rank's updated shards."""
-    if model_weight_buffer is None or model_weight_buffer.is_distributed:
-        return
-
-    def shard_to_replicated(replicated_buffer, shard_buffer) -> None:
-        if replicated_buffer is None:
-            return
-        assert shard_buffer is not None
-
-        if replicated_buffer.dtype != shard_buffer.dtype:
-            replicated_shard_meta = replicated_buffer.buffer_index.shard_meta
-            shard_meta = shard_buffer.buffer_index.shard_meta
-            replicated_buffer.data[
-                replicated_shard_meta.local_data_index : replicated_shard_meta.local_data_index
-                + replicated_shard_meta.size
-            ].copy_(
-                shard_buffer.data[
-                    shard_meta.local_data_index : shard_meta.local_data_index + shard_meta.size
-                ]
-            )
-            shard_buffer = replicated_buffer
-
-        shard_meta = shard_buffer.buffer_index.shard_meta
-        shard = shard_buffer.data[
-            shard_meta.local_data_index : shard_meta.local_data_index + shard_meta.size
-        ]
-        torch.distributed.all_gather_into_tensor(
-            output_tensor=replicated_buffer.data,
-            input_tensor=shard,
-            group=data_parallel_group,
-        )
-
-    if is_fp8_param(model_weight_buffer.params[0]):
-        shard_to_replicated(model_weight_buffer, model_weight_buffer)
-        shard_to_replicated(transpose_weight_buffer, transpose_weight_buffer)
-    else:
-        shard_to_replicated(model_weight_buffer, main_weight_buffer)
-
-
 @dataclass(frozen=True)
 class FullyShardFP8Policy:
     """FP8 recipe settings owned by the v2 ``fully_shard`` path."""
@@ -450,6 +405,18 @@ class FullyShardMixedPrecisionPolicy:
                 )
             if model_weight_buffer.is_distributed == main_weight_buffer.is_distributed:
                 model_weight_buffer.data.copy_(main_weight_buffer.data)
+            else:
+                model_shard_meta = model_weight_buffer.buffer_index.shard_meta
+                main_shard_meta = main_weight_buffer.buffer_index.shard_meta
+                model_weight_buffer.data[
+                    model_shard_meta.local_data_index : model_shard_meta.local_data_index
+                    + model_shard_meta.size
+                ].copy_(
+                    main_weight_buffer.data[
+                        main_shard_meta.local_data_index : main_shard_meta.local_data_index
+                        + main_shard_meta.size
+                    ]
+                )
             return
 
         fp8_params = []

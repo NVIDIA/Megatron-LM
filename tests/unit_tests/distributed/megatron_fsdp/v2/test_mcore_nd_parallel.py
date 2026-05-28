@@ -81,8 +81,8 @@ class TestMegatronFSDPE2E:
                         or param_group.model_weight_buffer.is_distributed
                     ):
                         continue
-                    if param_group._needs_replicated_weight_buffer_refresh:
-                        param_group.unshard(async_op=False, bwd_pass=False)
+                    if param_group._needs_inplace_weight_unshard:
+                        param_group.unshard(bwd_pass=False)
 
                     for buffer_name, buffer in (
                         ("model_weight_buffer", param_group.model_weight_buffer),

@@ -102,7 +102,7 @@ class _FSDPRootContext:
     # ------------------------------------------------------------------
     # Reduce-scatter (gradient sync) tracking
     # ------------------------------------------------------------------
-    reduce_scatter_grad_buckets: Dict[
+    reduce_grad_buckets: Dict[
         int, List[Tuple[torch.cuda.Event, "ParameterGroup"]]
     ] = field(default_factory=dict)
     """
@@ -171,7 +171,7 @@ class FSDPModule(nn.Module):
     methods for managing parameter sharding state:
     - unshard(): All-gather parameters before forward
     - reshard(): Release unsharded buffer after forward
-    - reduce_scatter_grad(): Reduce-scatter gradients after backward
+    - reduce_grad(): Reduce gradients after backward
     """
 
     def _init_named_param_groups(
@@ -320,7 +320,7 @@ class FSDPModule(nn.Module):
 
         # Safety check: no child FSDPModule must be in an active state.
         # - unshard_done_events[id(child)] non-None → unsharded, not yet resharded
-        # - reduce_scatter_grad_buckets[id(child)] non-empty → reduce-scatter in flight
+        # - reduce_grad_buckets[id(child)] non-empty → reduce-scatter in flight
         # Re-initializing _fsdp_root_context while a child is in either state
         # would overwrite its shared state mid-pass.
         for child_module in forward_order:
@@ -337,7 +337,7 @@ class FSDPModule(nn.Module):
                     "is still unsharded. All children must be resharded before "
                     "re-initializing FSDP state."
                 )
-            if ctx.reduce_scatter_grad_buckets.get(id(child_module)):
+            if ctx.reduce_grad_buckets.get(id(child_module)):
                 raise RuntimeError(
                     "_init_fsdp_state cannot be called while a child FSDPModule "
                     "has pending reduce-scatter operations. All children must have "
@@ -352,7 +352,7 @@ class FSDPModule(nn.Module):
                 torch.cuda.Stream() if enable_async_reduce_grad else torch.cuda.current_stream()
             ),
             forward_order=forward_order,
-            reduce_scatter_grad_buckets={id(module): [] for module in forward_order},
+            reduce_grad_buckets={id(module): [] for module in forward_order},
             unshard_done_events={id(module): None for module in forward_order},
             enable_unshard_prefetch=enable_unshard_prefetch,
             enable_async_reduce_grad=enable_async_reduce_grad,
@@ -451,7 +451,7 @@ class FSDPModule(nn.Module):
         ctx.unshard_done_events[id(self)] = None  # Clear unshard event for this module
         torch.cuda.nvtx.range_pop()
 
-    def _wait_for_previous_async_reduce_scatter_grad(self):
+    def _wait_for_previous_async_reduce_grad(self):
         """Release older async reduce buffers in backward order."""
         ctx = self._fsdp_root_context
         if not ctx.enable_async_reduce_grad:
@@ -460,7 +460,7 @@ class FSDPModule(nn.Module):
         backward_order = list(reversed(ctx.forward_order))
         for i, module in enumerate(backward_order):
             if i - 2 >= 0:
-                buckets = ctx.reduce_scatter_grad_buckets[id(backward_order[i - 2])]
+                buckets = ctx.reduce_grad_buckets[id(backward_order[i - 2])]
                 while len(buckets) > 0:
                     event, param_group = buckets.pop()
                     event.wait()
@@ -468,34 +468,25 @@ class FSDPModule(nn.Module):
             if module is self:
                 break
 
-    def reduce_scatter_grad(
-        self,
-        async_op: bool = False,
-        allowed_sharding_strategies: Optional[Tuple[str, ...]] = None,
-    ):
+    def reduce_grad(self, async_op: bool = False):
         """
-        Reduce-scatter gradients across data-parallel ranks.
+        Reduce gradients across data-parallel ranks.
 
         This is called post-backward to:
         1. Copy gradients to main gradient buffer
-        2. Perform reduce-scatter
+        2. Perform gradient reduction
         3. Install reduced gradients to distributed parameters
         """
-        torch.cuda.nvtx.range_push("MFSDP reduce_scatter_grad")
+        torch.cuda.nvtx.range_push("MFSDP reduce_grad")
         ctx = self._fsdp_root_context
         stream = ctx.rs_stream if async_op else torch.cuda.current_stream()
 
         # Handle pending reduce events before this module to release buffers promptly.
-        self._wait_for_previous_async_reduce_scatter_grad()
+        self._wait_for_previous_async_reduce_grad()
 
         # Perform reduction for this module
         for param_names, param_group in self._named_param_groups:
             if not param_group.requires_grad:
-                continue
-            if (
-                allowed_sharding_strategies is not None
-                and param_group.sharding_strategy not in allowed_sharding_strategies
-            ):
                 continue
 
             # NaN check before reduction
@@ -532,11 +523,11 @@ class FSDPModule(nn.Module):
                 # Switch to rs_stream for the reduce-scatter kernel
                 stream.wait_stream(torch.cuda.current_stream())
                 with torch.cuda.stream(stream):
-                    param_group.reduce_scatter_grad()
+                    param_group.reduce_grad()
             else:
                 # ---- Non-overlapped path ----
                 # Reduce gradients immediately and release grad buffer
-                param_group.reduce_scatter_grad()
+                param_group.reduce_grad()
                 param_group.release_grad_buffer()
 
             # Install reduced gradients to distributed parameters
@@ -559,7 +550,7 @@ class FSDPModule(nn.Module):
 
             if async_op:
                 event = stream.record_event()
-                ctx.reduce_scatter_grad_buckets[id(self)].append((event, param_group))
+                ctx.reduce_grad_buckets[id(self)].append((event, param_group))
 
             # NaN check after reduction
             if getattr(self, "_enable_nan_checks", False):
@@ -584,9 +575,7 @@ class FSDPModule(nn.Module):
             ):
                 # ZeRO-1 keeps gradients replicated during backward and performs
                 # exactly one reduce-scatter at the iteration grad-sync boundary.
-                child.reduce_scatter_grad(
-                    async_op=False, allowed_sharding_strategies=("optim",)
-                )
+                child.reduce_grad(async_op=False)
             for param_group in child._fsdp_param_groups:
                 for param, dist_grad in zip(param_group.params, param_group.dist_grads):
                     if param.requires_grad:

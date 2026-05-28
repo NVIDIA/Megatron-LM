@@ -317,6 +317,7 @@ class DataParallelBuffer:
         self.alloc_key = (param_group_id, buffer_role)
         self.mp_policy = mp_policy
         self.is_distributed = is_distributed
+        self.sharding_strategy = sharding_strategy
         self.gradient_scaling_factor = gradient_scaling_factor
 
         dp_rank = torch.distributed.get_rank(dp_group)
@@ -472,47 +473,58 @@ class DataParallelBuffer:
 
     @torch.no_grad()
     def unshard(
-        self, async_op: bool = True
-    ) -> Tuple[torch.Tensor, Optional[torch.distributed.Work]]:
+        self,
+        inplace: bool = False,
+        bind_params: bool = True,
+    ) -> torch.Tensor:
         """All-gather the full buffer from all shards and bind parameter storage.
 
         For non-distributed buffers self.data is already full, so
-        (self.data, None) is returned directly.
+        self.data is returned directly. With ``inplace=True``, this rank's
+        virtual shard is all-gathered into self.data instead.
         """
-        work = None
-        if self.is_distributed:
-            bucket = self.allocator.allocate(
-                key=self.alloc_key,
-                size=self.buffer_index.bucket_meta.size,
-                dtype=self.dtype,
-                device=self.device,
-            )
-            self._unsharded_buffer = bucket.data
+        assert self.data is not None
 
+        shard_buffer = None
+        if inplace:
+            assert not self.is_distributed, "inplace unshard requires a replicated buffer"
+            full_buffer = self.data
             sm = self.buffer_index.shard_meta
-            shard = self.data[sm.local_data_index : sm.local_data_index + sm.size]
-
-            work = torch.distributed.all_gather_into_tensor(
-                output_tensor=self._unsharded_buffer,
-                input_tensor=shard,
-                group=self.dp_group,
-                async_op=async_op,
-            )
-            if self._unsharded_buffer.is_cuda:
-                # The temporary bucket may be released from another stream before this
-                # collective finishes; record the producer stream for allocator safety.
-                self._unsharded_buffer.record_stream(torch.cuda.current_stream())
+            shard_buffer = self.data[sm.local_data_index : sm.local_data_index + sm.size]
+        elif self.is_distributed:
+            if self._unsharded_buffer is None:
+                bucket = self.allocator.allocate(
+                    key=self.alloc_key,
+                    size=self.buffer_index.bucket_meta.size,
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+                self._unsharded_buffer = bucket.data
+                sm = self.buffer_index.shard_meta
+                shard_buffer = self.data[sm.local_data_index : sm.local_data_index + sm.size]
             full_buffer = self._unsharded_buffer
         else:
             full_buffer = self.data
 
-        for p in self.params:
-            item_id = self.param_idx[p]
-            offset, size = self.buffer_index._get_item_offset(item_id)
-            param_data = full_buffer[offset : offset + size].view(p.shape)
-            self.mp_policy.bind_unsharded_param(p, param_data, self.buffer_role)
+        if shard_buffer is not None:
+            torch.distributed.all_gather_into_tensor(
+                output_tensor=full_buffer,
+                input_tensor=shard_buffer,
+                group=self.dp_group,
+            )
+            if full_buffer.is_cuda:
+                # Temporary all-gather buckets may be released from another stream before
+                # the collective finishes; record the producer stream for allocator safety.
+                full_buffer.record_stream(torch.cuda.current_stream())
 
-        return (full_buffer, work)
+        if bind_params:
+            for p in self.params:
+                item_id = self.param_idx[p]
+                offset, size = self.buffer_index._get_item_offset(item_id)
+                param_data = full_buffer[offset : offset + size].view(p.shape)
+                self.mp_policy.bind_unsharded_param(p, param_data, self.buffer_role)
+
+        return full_buffer
 
     @torch.no_grad()
     def reshard(self) -> None:
@@ -537,13 +549,14 @@ class DataParallelBuffer:
         return self._unsharded_buffer
 
     @torch.no_grad()
-    def reduce_scatter_grad(self, grad_comm_dtype: Optional[torch.dtype] = None):
-        """Reduce-scatter gradients into the optimizer-facing local shard.
+    def reduce_grad(self, grad_comm_dtype: Optional[torch.dtype] = None):
+        """Reduce gradients into the optimizer-facing local shard.
 
         For distributed buffers, this reduce-scatters a temporary full gradient
         and accumulates the result into the persistent local shard. For
         replicated buffers, this reduce-scatters the full accumulation buffer
         once into this rank's virtual shard for ZeRO-1 optimizer consumption.
+        For no-shard buffers, this all-reduces the full gradient buffer.
         If grad_comm_dtype differs from self.dtype, communicate with a temporary
         casted tensor and cast the reduced result back before accumulation.
         """
@@ -561,6 +574,17 @@ class DataParallelBuffer:
 
         sm = self.buffer_index.shard_meta
         local_grad_shard = self.data[sm.local_data_index : sm.local_data_index + sm.size]
+
+        if not self.is_distributed and self.sharding_strategy == "no_shard":
+            comm_input = (
+                self.data if grad_comm_dtype == self.dtype else self.data.to(grad_comm_dtype)
+            )
+            if prescale:
+                comm_input.mul_(self.gradient_scaling_factor)
+            torch.distributed.all_reduce(comm_input, group=self.dp_group, op=op)
+            if grad_comm_dtype != self.dtype:
+                self.data.copy_(comm_input.to(self.dtype))
+            return
 
         if self.is_distributed:
             # ZeRO-2/3 (optim_grads/optim_grads_params): ``self.data`` is the

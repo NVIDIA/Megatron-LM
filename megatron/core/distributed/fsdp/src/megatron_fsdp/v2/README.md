@@ -40,7 +40,7 @@ Mixin class added to wrapped modules. Methods:
 |--------|-------------|---------|
 | `unshard()` | Pre-forward | All-gather params from sharded buffer |
 | `reshard()` | Post-forward, post-backward | Release unsharded buffer |
-| `reduce_scatter_grad()` | Post-backward / grad sync | Reduce-scatter gradients into optimizer-facing shards |
+| `reduce_grad()` | Post-backward / grad sync | Reduce-scatter gradients into optimizer-facing shards |
 
 ### DataParallelBuffer
 
@@ -48,7 +48,7 @@ Flat buffer managing (a shard of) parameter/gradient data:
 
 - `unshard()` — all-gather to full tensor
 - `reshard()` — free temporary buffer
-- `reduce_scatter_grad()` — reduce-scatter gradients into optimizer-facing shards
+- `reduce_grad()` — reduce-scatter gradients into optimizer-facing shards
 - Uses `BufferIndex` to track parameter layout within the buffer
 
 ### ParameterGroup
