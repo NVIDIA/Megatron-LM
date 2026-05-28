@@ -1431,12 +1431,14 @@ class TELMHeadColumnParallelLinear(TEColumnParallelLinear):
         )
 
     def get_extra_state(self):
-        # Match ColumnParallelLinear.get_extra_state (returns None) so the LM
-        # head state dict stays compatible across the bf16 / MXFP8 swap.
+        """Return None to match ``ColumnParallelLinear``'s no-extra-state shim.
+
+        Keeps the LM-head state dict compatible across the bf16 / MXFP8 swap.
+        """
         return None
 
     def set_extra_state(self, state):
-        # Match ColumnParallelLinear.set_extra_state (ignored).
+        """No-op to match ``ColumnParallelLinear.set_extra_state`` (ignored)."""
         return
 
     def forward(
