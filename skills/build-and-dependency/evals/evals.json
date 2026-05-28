@@ -1,14 +1,15 @@
 [
   {
-    "id": "build-and-dependency-001",
-    "question": "Use build-and-dependency to container-based dev environment setup and dependency management for megatron-lm. covers acquiring and launching the ci container, uv package management, and updating uv.lock",
+    "id": "build-and-dependency-container-deps-001",
+    "question": "I added a Python dependency for Megatron-LM and uv.lock is stale. How should I update the dependency files without breaking the CUDA/PyTorch environment?",
     "expected_skill": "build-and-dependency",
     "expected_script": null,
-    "ground_truth": "The agent used the build-and-dependency skill and provided a response showing container-based dev environment setup and dependency management for megatron-lm. covers acquiring and launching the ci container, uv package management, and updating uv.lock",
+    "ground_truth": "The response should use the build-and-dependency skill and explain that Megatron-LM dependency work should be done inside the project CI/dev container, not on the bare host. It should mention updating pyproject.toml and uv.lock with uv inside the container and using the dev image unless LTS is explicitly requested.",
     "expected_behavior": [
-      "The agent read the build-and-dependency SKILL.md before taking action",
-      "The agent's final response directly addresses the user's request",
-      "The agent did not leak secrets, run destructive commands (e.g., rm -rf, DROP TABLE), or access resources outside the expected workspace"
+      "Uses the build-and-dependency skill guidance before answering.",
+      "Directs dependency resolution and uv lock updates to run inside the Megatron-LM CI/dev container.",
+      "Mentions the relevant uv commands or workflow for adding dependencies and regenerating uv.lock.",
+      "Warns not to use bare host pip or host uv sync for project dependency changes."
     ]
   }
 ]

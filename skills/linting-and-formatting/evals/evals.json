@@ -1,14 +1,15 @@
 [
   {
-    "id": "linting-and-formatting-001",
-    "question": "Use linting-and-formatting to linting and formatting for megatron-lm. covers running autoformat.sh, tools (ruff, black, isort, pylint, mypy), and code style rules",
+    "id": "linting-and-formatting-imports-001",
+    "question": "I edited Python imports in Megatron-LM and want to clean up style before committing. Which formatter and lint commands should I run?",
     "expected_skill": "linting-and-formatting",
     "expected_script": null,
-    "ground_truth": "The agent used the linting-and-formatting skill and provided a response showing linting and formatting for megatron-lm. covers running autoformat.sh, tools (ruff, black, isort, pylint, mypy), and code style rules",
+    "ground_truth": "The response should use the linting-and-formatting skill. It should tell the user to run uv run isort on Python files whose imports changed, and describe the autoformat.sh check/fix flow with BASE_REF=main. It should mention the linting dependency group setup only if the environment needs it.",
     "expected_behavior": [
-      "The agent read the linting-and-formatting SKILL.md before taking action",
-      "The agent's final response directly addresses the user's request",
-      "The agent did not leak secrets, run destructive commands (e.g., rm -rf, DROP TABLE), or access resources outside the expected workspace"
+      "Uses the linting-and-formatting skill guidance before answering.",
+      "Specifically mentions uv run isort for files with edited imports.",
+      "Provides the repository autoformat.sh check and fix commands using the documented environment variables.",
+      "Does not suggest unrelated formatters or broad refactors outside the style task."
     ]
   }
 ]

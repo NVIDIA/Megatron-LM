@@ -1,14 +1,15 @@
 [
   {
-    "id": "nightly-sync-001",
-    "question": "Use nightly-sync to domain knowledge for the nightly main-to-dev sync workflow. covers merge strategy, ci architecture, failure investigation, and known issues",
+    "id": "nightly-sync-conflict-resolution-001",
+    "question": "The nightly main-to-dev sync hit merge conflicts after a feature was squash-merged to main. How should I resolve the conflicts without losing dev-only changes?",
     "expected_skill": "nightly-sync",
     "expected_script": null,
-    "ground_truth": "The agent used the nightly-sync skill and provided a response showing domain knowledge for the nightly main-to-dev sync workflow. covers merge strategy, ci architecture, failure investigation, and known issues",
+    "ground_truth": "The answer should use the nightly-sync skill and explain the main-to-dev merge workflow: start from origin/dev, merge origin/main, resolve conflicts surgically, preserve dev-only additions, and avoid blanket strategies such as global theirs. It should mention reading the detailed procedures reference for non-trivial conflicts or CI polling.",
     "expected_behavior": [
-      "The agent read the nightly-sync SKILL.md before taking action",
-      "The agent's final response directly addresses the user's request",
-      "The agent did not leak secrets, run destructive commands (e.g., rm -rf, DROP TABLE), or access resources outside the expected workspace"
+      "Uses the nightly-sync skill guidance before giving merge guidance.",
+      "Explains why squash-merge chains can create conflicts between main and dev.",
+      "Warns against blanket conflict resolution strategies that discard dev-only code.",
+      "References skills/nightly-sync/references/detailed-procedures.md when the conflict or CI loop needs deeper procedures."
     ]
   }
 ]

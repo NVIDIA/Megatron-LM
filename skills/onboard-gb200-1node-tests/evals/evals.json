@@ -1,14 +1,15 @@
 [
   {
-    "id": "onboard-gb200-1node-tests-001",
-    "question": "Use onboard-gb200-1node-tests to onboard 1-node github mr functional tests for gb200 from existing mr-scoped 2-node tests",
+    "id": "onboard-gb200-gpt-1node-001",
+    "question": "I want to add GB200 one-node GitHub MR coverage for GPT tests based on existing two-node recipes. Do not modify files in this response; outline the checklist of recipe files, test cases, filters, and one-node constraints I should use.",
     "expected_skill": "onboard-gb200-1node-tests",
     "expected_script": null,
-    "ground_truth": "The agent used the onboard-gb200-1node-tests skill and provided a response showing onboard 1-node github mr functional tests for gb200 from existing mr-scoped 2-node tests",
+    "ground_truth": "The response should use the onboard-gb200-1node-tests skill and provide a checklist, not file edits. It should tell the user to inspect the GB200 GPT recipe YAMLs, identify eligible mr or mr-slim two-node GPT cases that do not already have one-node coverage, plan corresponding gpt-1node.yaml and _1node test case config additions, filter out nightly, weekly, broken, or already-covered tests, and keep GB200 one-node tests at one node with four GPUs.",
     "expected_behavior": [
-      "The agent read the onboard-gb200-1node-tests SKILL.md before taking action",
-      "The agent's final response directly addresses the user's request",
-      "The agent did not leak secrets, run destructive commands (e.g., rm -rf, DROP TABLE), or access resources outside the expected workspace"
+      "Uses the onboard-gb200-1node-tests skill guidance before describing the onboarding checklist.",
+      "Identifies gpt.yaml and gpt-1node.yaml as the primary recipe files for GPT coverage.",
+      "Filters out nightly, weekly, broken, or already-covered tests.",
+      "Explains that GB200 one-node variants use one node and four GPUs with _1node test case naming."
     ]
   }
 ]

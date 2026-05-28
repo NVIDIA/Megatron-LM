@@ -1,14 +1,15 @@
 [
   {
-    "id": "run-on-slurm-001",
-    "question": "Use run-on-slurm to how to launch distributed megatron-lm training jobs on a slurm cluster. covers a minimal sbatch skeleton, environment-variable setup for torch.distributed.run, cuda_device_max_connections rules across hardware and parallelism modes, container conventions, monitoring, and per-rank failure diagnosis",
+    "id": "run-on-slurm-minimal-sbatch-001",
+    "question": "Write a minimal SLURM launch skeleton for Megatron-LM on two nodes with eight GPUs per node, and explain the distributed environment variables I need to set.",
     "expected_skill": "run-on-slurm",
     "expected_script": null,
-    "ground_truth": "The agent used the run-on-slurm skill and provided a response showing how to launch distributed megatron-lm training jobs on a slurm cluster. covers a minimal sbatch skeleton, environment-variable setup for torch.distributed.run, cuda_device_max_connections rules across hardware and parallelism modes, container conventions, monitoring, and per-rank failure diagnosis",
+    "ground_truth": "The answer should use the run-on-slurm skill. It should include an sbatch skeleton with nodes, ntasks per node, GPUs per node, logs, working directory, MASTER_ADDR, MASTER_PORT, NNODES, GPUS_PER_NODE, and WORLD_SIZE. It should explain CUDA_DEVICE_MAX_CONNECTIONS only needs to be set for configurations that require it, and mention the shared worktree and environment or container assumptions.",
     "expected_behavior": [
-      "The agent read the run-on-slurm SKILL.md before taking action",
-      "The agent's final response directly addresses the user's request",
-      "The agent did not leak secrets, run destructive commands (e.g., rm -rf, DROP TABLE), or access resources outside the expected workspace"
+      "Uses the run-on-slurm skill guidance before writing the launch skeleton.",
+      "Includes the core SBATCH fields and torch.distributed environment variables.",
+      "Computes WORLD_SIZE from nodes and GPUs per node.",
+      "Does not tell users to set CUDA_DEVICE_MAX_CONNECTIONS unconditionally."
     ]
   }
 ]

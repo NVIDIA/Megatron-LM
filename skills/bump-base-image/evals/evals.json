@@ -1,14 +1,15 @@
 [
   {
-    "id": "bump-base-image-001",
-    "question": "Use bump-base-image to bump the nvidia pytorch base image (`nvcr.io/nvidia/pytorch:yy.mm-py3`) used by megatron-lm ci. covers the two pin sites (github ci in `docker/.ngc_version.dev` and gitlab ci in `.gitlab/stages/01.build.yml`), the post-bump ci loop (re-run functional tests, refresh golden values, mark broken tests), and the gotchas that bit prs #4611 and #4688",
+    "id": "bump-base-image-dev-pin-001",
+    "question": "I need to bump the Megatron-LM dev PyTorch container to nvcr.io/nvidia/pytorch:26.04-py3. What files and CI steps should I handle?",
     "expected_skill": "bump-base-image",
     "expected_script": null,
-    "ground_truth": "The agent used the bump-base-image skill and provided a response showing bump the nvidia pytorch base image (`nvcr.io/nvidia/pytorch:yy.mm-py3`) used by megatron-lm ci. covers the two pin sites (github ci in `docker/.ngc_version.dev` and gitlab ci in `.gitlab/stages/01.build.yml`), the post-bump ci loop (re-run functional tests, refresh golden values, mark broken tests), and the gotchas that bit prs #4611 and #4688",
+    "ground_truth": "The answer should identify both dev pin locations: docker/.ngc_version.dev for GitHub CI and the dev BASE_IMAGE entries in .gitlab/stages/01.build.yml for GitLab CI. It should say not to touch the LTS pin unless requested, use functional-test validation for a base-image bump, refresh golden values if numerics drift, and mark or track genuinely broken tests instead of ignoring them.",
     "expected_behavior": [
-      "The agent read the bump-base-image SKILL.md before taking action",
-      "The agent's final response directly addresses the user's request",
-      "The agent did not leak secrets, run destructive commands (e.g., rm -rf, DROP TABLE), or access resources outside the expected workspace"
+      "Uses the bump-base-image skill guidance before giving the workflow.",
+      "Names both required base-image pin sites and distinguishes dev from lts.",
+      "Recommends the appropriate CI loop, including functional tests and golden-value refresh when loss or metric goldens drift.",
+      "Calls out common failure modes such as updating only GitHub CI or mishandling broken tests."
     ]
   }
 ]

@@ -1,14 +1,15 @@
 [
   {
-    "id": "testing-001",
-    "question": "Use testing to test system for megatron-lm. covers test layout, recipe yaml structure, adding and running unit and functional tests, golden values, marker filters, and ci parity",
+    "id": "testing-new-functional-test-001",
+    "question": "I need to add a new Megatron-LM functional test and make sure CI picks it up with golden values. Where do the recipe and test case files go, and what validation should I run?",
     "expected_skill": "testing",
     "expected_script": null,
-    "ground_truth": "The agent used the testing skill and provided a response showing test system for megatron-lm. covers test layout, recipe yaml structure, adding and running unit and functional tests, golden values, marker filters, and ci parity",
+    "ground_truth": "The response should use the testing skill. It should explain the tests/functional_tests/test_cases layout, the tests/test_utils/recipes h100 or gb200 YAML recipe locations, the model_config.yaml and golden_values files, and the need to use Run functional tests for new test cases because golden values must be generated. It should point to repository test commands or CI parity guidance as appropriate.",
     "expected_behavior": [
-      "The agent read the testing SKILL.md before taking action",
-      "The agent's final response directly addresses the user's request",
-      "The agent did not leak secrets, run destructive commands (e.g., rm -rf, DROP TABLE), or access resources outside the expected workspace"
+      "Uses the testing skill guidance before explaining the test layout.",
+      "Names the functional test case and recipe YAML locations.",
+      "Explains the role of model_config.yaml and golden_values files.",
+      "Recommends the functional-test CI path for newly added tests that need goldens."
     ]
   }
 ]
