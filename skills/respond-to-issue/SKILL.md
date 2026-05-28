@@ -64,4 +64,3 @@ Format the draft as a quoted markdown block so it's easy to copy.
 - If you're unsure about the answer, say so clearly in your draft and flag the uncertainty for the maintainer.
 - If the issue is outside the scope of what you can determine from the code, tell the maintainer what you found and what remains unclear.
 - Check whether similar issues exist that might be relevant: `gh issue list --repo NVIDIA/Megatron-LM --search "<keywords>" --limit 5`.
-<!-- End of skill. -->

@@ -62,4 +62,3 @@ For each new PR:
 - Prefer a single clean commit per split PR over replaying the original commit history.
 - If a file is hard to categorize (e.g., it touches two groups), ask the user which PR it should go in.
 - If the current GitHub user is not the author of the original PR, each new PR's description must explicitly credit the original author (e.g., "Original changes by @<author> in #<number>").
-<!-- End of skill. -->

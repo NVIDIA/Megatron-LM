@@ -491,4 +491,3 @@ comment should include:
 - **Push directly to NVIDIA/Megatron-LM** (not a fork). The bot uses a PAT
   with write access. CLAUDE.md says "never push directly" but that rule is
   for human contributors — the sync bot is an exception.
-<!-- End of skill. -->

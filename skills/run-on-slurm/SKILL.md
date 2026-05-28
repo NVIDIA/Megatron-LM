@@ -113,4 +113,3 @@ Classify quickly:
 - Writing logs to a node-local path that disappears at job exit. Always write to the shared filesystem.
 - Setting `CUDA_DEVICE_MAX_CONNECTIONS=1` blindly. The right value depends on hardware and parallelism mode (see the dedicated section above). Setting it to `1` with FSDP causes a different problem; on Blackwell it has no effect; on pre-Blackwell with TP>1 or CP>1 (non-FSDP) the code asserts, it does not deadlock.
 - Running bare `torchrun` instead of `uv run python -m torch.distributed.run`. Bare `torchrun` may dispatch through a python interpreter that does not see venv packages, depending on how the venv is set up.
-<!-- End of skill. -->

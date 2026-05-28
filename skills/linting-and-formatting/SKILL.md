@@ -56,4 +56,3 @@ This installs `ruff`, `black`, `isort`, `pylint` — the same tools used by
 - **Naming**: follow Python conventions — `snake_case` for functions and variables, `PascalCase` for classes.
 - **Line length**: 119 characters (configured in `pyproject.toml`).
 - **No bare `except`**: always catch specific exception types.
-<!-- End of skill. -->

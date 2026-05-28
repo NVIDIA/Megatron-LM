@@ -149,4 +149,3 @@ All three lines should show `nvcr.io/nvidia/pytorch:<YY.MM>-py3`. If they don't,
 - [update-golden-values](../update-golden-values/SKILL.md) — call this as soon as the first post-bump CI run finishes and you have a workflow run ID with failing golden checks. Produces the per-metric relative-difference summary you paste into the PR description.
 - [build-and-dependency](../build-and-dependency/SKILL.md) — for verifying the new image builds locally before opening the PR (`docker build --target main --build-arg FROM_IMAGE_NAME=$(cat docker/.ngc_version.dev) ...`).
 - [cicd](../cicd/SKILL.md) — for the PR scope-label semantics (`Run functional tests`, `complexity::*`) and the `copy-pr-bot` flow.
-<!-- End of skill. -->
