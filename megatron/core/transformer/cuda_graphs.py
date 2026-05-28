@@ -766,15 +766,23 @@ class _CudagraphReplayNode(torch.autograd.Function):
         # main_stream stays unblocked so the next runner can start in
         # parallel.
         if runner.gtp_remat and runner.finalized_during_bwd_capture:
-            gtp_rs_stream = get_rs_stream(
-                GTPChain.GRAPHED.value, parallel_state.get_generalized_tensor_parallel_remat_group()
-            )
-            gtp_rs_stream.wait_event(runner.bwd_phase2_completion_event)
-            with torch.cuda.stream(gtp_rs_stream):
-                for param in runner.finalized_during_bwd_capture:
-                    hook = getattr(param, '_grad_accum_hook', None)
-                    if hook is not None:
-                        hook()
+            # Partition by (chain, group): dense vs EGTP use different NCCL
+            # comms / rs_streams. Fire each hook on the rs_stream that ran
+            # its captured wgrad-RS so FIFO orders DDP-RS after that write.
+            dense_group = parallel_state.get_generalized_tensor_parallel_remat_group()
+            expert_group = parallel_state.get_expert_generalized_tensor_parallel_remat_group()
+            params_by_group = defaultdict(list)
+            for param in runner.finalized_during_bwd_capture:
+                is_expert = not getattr(param, 'allreduce', True)
+                params_by_group[expert_group if is_expert else dense_group].append(param)
+            for group, params in params_by_group.items():
+                gtp_rs_stream = get_rs_stream(GTPChain.GRAPHED.value, group)
+                gtp_rs_stream.wait_event(runner.bwd_phase2_completion_event)
+                with torch.cuda.stream(gtp_rs_stream):
+                    for param in params:
+                        hook = getattr(param, '_grad_accum_hook', None)
+                        if hook is not None:
+                            hook()
 
         # Replaying the next bwd graph destroys the data held in static_grad_inputs, so clone
         # wgrads as autograd may launch the next graph before wgrads are accumulated
@@ -875,11 +883,14 @@ class _CudaGraphRunner(torch.nn.Module):
                 self.stream = torch.cuda.Stream()
                 self.fwd_completion_event = torch.cuda.Event(external=True, interprocess=True)
                 self.bwd_completion_event = torch.cuda.Event(external=True, interprocess=True)
-                # GRAPHED chain only hits dense modules (mamba/attn/moe_router),
-                # all sharded across PARAMETER_SHARDING_GROUP. Materialize that
-                # (chain, group) stream pair now so it is registered as a
-                # captured side stream before the first forward.
-                from megatron.core.parallel_state import get_generalized_tensor_parallel_remat_group
+                # Register (chain, group) side streams before the first forward.
+                # Dense for mamba/attn/shared_experts; expert (below) for routed
+                # experts captured when "moe" is in cuda_graph_modules.
+                from megatron.core.parallel_state import (
+                    get_expert_generalized_tensor_parallel_remat_group,
+                    get_expert_generalized_tensor_parallel_remat_world_size,
+                    get_generalized_tensor_parallel_remat_group,
+                )
 
                 gtp_group = get_generalized_tensor_parallel_remat_group()
                 graphed_ag = get_ag_stream(GTPChain.GRAPHED.value, gtp_group)
@@ -887,6 +898,15 @@ class _CudaGraphRunner(torch.nn.Module):
                 self._register_side_stream(self.fwd_side_streams, graphed_ag)
                 self._register_side_stream(self.bwd_side_streams, graphed_ag)
                 self._register_side_stream(self.bwd_side_streams, graphed_rs)
+                # EGTP streams: required so _wait/_sync_side_streams drain EGTP
+                # NCCL into runner_stream before bwd_completion_event fires.
+                if get_expert_generalized_tensor_parallel_remat_world_size() > 1:
+                    egtp_group = get_expert_generalized_tensor_parallel_remat_group()
+                    egtp_graphed_ag = get_ag_stream(GTPChain.GRAPHED.value, egtp_group)
+                    egtp_graphed_rs = get_rs_stream(GTPChain.GRAPHED.value, egtp_group)
+                    self._register_side_stream(self.fwd_side_streams, egtp_graphed_ag)
+                    self._register_side_stream(self.bwd_side_streams, egtp_graphed_ag)
+                    self._register_side_stream(self.bwd_side_streams, egtp_graphed_rs)
                 # Bridges Phase 1 (AG drain on ag_stream) into runner_stream
                 # so bwd_completion_event records past NCCL_AG completion.
                 self.bwd_ag_fence_event = torch.cuda.Event()
@@ -1330,15 +1350,24 @@ class _CudaGraphRunner(torch.nn.Module):
             #             consumer's cascade; for within-graph tails both
             #             happen here (see wait_async_comms).
             if self.gtp_remat:
-                # Phase 1: drain AG; fence runner_stream past ag_stream so
-                # bwd_completion_event records AFTER NCCL_AG completion.
+                # Phase 1: drain AG; fence runner_stream past dense + EGTP AG
+                # so bwd_completion_event records AFTER NCCL_AG completion.
                 wait_async_comms(GTPChain.GRAPHED.value, skip_rs=True)
-                from megatron.core.parallel_state import get_generalized_tensor_parallel_remat_group
+                from megatron.core.parallel_state import (
+                    get_expert_generalized_tensor_parallel_remat_group,
+                    get_expert_generalized_tensor_parallel_remat_world_size,
+                    get_generalized_tensor_parallel_remat_group,
+                )
 
                 gtp_group = get_generalized_tensor_parallel_remat_group()
                 graphed_ag = get_ag_stream(GTPChain.GRAPHED.value, gtp_group)
                 self.bwd_ag_fence_event.record(graphed_ag)
                 torch.cuda.current_stream().wait_event(self.bwd_ag_fence_event)
+                if get_expert_generalized_tensor_parallel_remat_world_size() > 1:
+                    egtp_group = get_expert_generalized_tensor_parallel_remat_group()
+                    egtp_graphed_ag = get_ag_stream(GTPChain.GRAPHED.value, egtp_group)
+                    self.bwd_ag_fence_event.record(egtp_graphed_ag)
+                    torch.cuda.current_stream().wait_event(self.bwd_ag_fence_event)
 
                 # Record completion AFTER AG drain + fence but BEFORE RS drain,
                 # so main_stream can trigger the next runner while RS is still

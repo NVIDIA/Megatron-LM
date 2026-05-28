@@ -772,6 +772,8 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                             # Create a copy
                             main_param = param.detach().clone().float()
                             main_param.is_gtp = getattr(param, 'is_gtp', False)
+                            # Mirror expert-tag for GTP-aware dedup (egtp_rank vs gtp_rank).
+                            main_param.allreduce = getattr(param, 'allreduce', True)
                             # Copy tensor model parallel attributes.
                             tensor_parallel.copy_tensor_model_parallel_attributes(main_param, param)
                             if hasattr(param, 'shared'):
