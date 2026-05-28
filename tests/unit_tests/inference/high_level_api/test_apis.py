@@ -18,10 +18,16 @@ from megatron.core.inference.apis.llm import MegatronLLM
 @pytest.fixture
 def mock_pipeline(monkeypatch):
     """Stub out the engine pipeline so the constructor runs without torch/megatron."""
+    from megatron.core import parallel_state
+
     monkeypatch.setattr(base_mod, "DynamicInferenceContext", MagicMock())
     monkeypatch.setattr(base_mod, "GPTInferenceWrapper", MagicMock())
     monkeypatch.setattr(base_mod, "TextGenerationController", MagicMock())
     monkeypatch.setattr(base_mod, "DynamicInferenceEngine", MagicMock())
+    # Bypass the EP-group initialization assert when no distributed setup
+    # is in scope. Individual tests can override (e.g.,
+    # ``test_ep_gt_1_requires_use_coordinator``).
+    monkeypatch.setattr(parallel_state, "get_expert_model_parallel_world_size", lambda: 1)
 
 
 @pytest.fixture
