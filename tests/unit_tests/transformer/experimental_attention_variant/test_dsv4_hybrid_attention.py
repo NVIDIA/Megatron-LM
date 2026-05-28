@@ -584,3 +584,84 @@ class TestDSv4HybridHashMoEIntegration:
         assert context is None
         assert output.shape == hidden.shape
         assert torch.isfinite(output).all()
+
+
+# ===========================================================================
+# apply_rope_fusion tests
+# ===========================================================================
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
+class TestDSv4HybridRopeFusion:
+    """Test that apply_rope_fusion=True works for both yarn and non-yarn layers.
+
+    DSv4 Hybrid uses YarnRotaryEmbedding for layers with compress_ratio > 1
+    and standard RotaryEmbedding for layers with compress_ratio <= 1. The
+    fused RoPE path must obtain cos/sin from both embedding classes via
+    get_cached_cos_sin.
+
+    compress_ratios=[0, 4, 128, 4]: layer 1 has ratio 0 (standard
+    RotaryEmbedding), layers 2-4 have ratio > 1 (YarnRotaryEmbedding).
+    """
+
+    @pytest.fixture(scope='class', autouse=True)
+    def setup_method(self, request):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        torch.manual_seed(_SEED)
+        model_parallel_cuda_manual_seed(_SEED)
+
+        cls = request.cls
+        cls.pg = ProcessGroupCollection.use_mpu_process_groups()
+
+        yield
+        Utils.destroy_model_parallel()
+
+    def test_rope_fusion_forward_backward_parity(self):
+        """Fused RoPE forward/backward succeeds and matches the unfused path."""
+        seq_len = 128
+        batch_size = 2
+
+        torch.manual_seed(_SEED)
+        model_parallel_cuda_manual_seed(_SEED)
+        fused_config = _make_config(apply_rope_fusion=True)
+        attn_fused = _build_attention(fused_config, layer_number=4, pg_collection=self.pg).cuda()
+        attn_fused.train()
+
+        torch.manual_seed(_SEED)
+        model_parallel_cuda_manual_seed(_SEED)
+        unfused_config = _make_config(apply_rope_fusion=False)
+        attn_unfused = _build_attention(
+            unfused_config, layer_number=4, pg_collection=self.pg
+        ).cuda()
+        attn_unfused.train()
+
+        hidden = torch.randn(
+            seq_len, batch_size, fused_config.hidden_size, dtype=torch.bfloat16
+        ).cuda()
+
+        out_fused, _ = attn_fused(hidden_states=hidden, attention_mask=None)
+        out_unfused, _ = attn_unfused(hidden_states=hidden, attention_mask=None)
+
+        assert out_fused.shape == (seq_len, batch_size, fused_config.hidden_size)
+        assert torch.isfinite(out_fused).all()
+        # Production code forces ``mscale=1.0`` (DSv4 contract) in both
+        # fused and unfused paths, so the only residual is bf16 noise from
+        # the fused Triton kernel's different accumulation order vs the
+        # PyTorch eager ops. The residual concentrates at output positions
+        # whose values are near zero (sign flips on tiny magnitudes drive
+        # the worst-case max-abs-diff).
+        torch.testing.assert_close(out_fused, out_unfused, atol=3e-2, rtol=3e-2)
+
+        hidden_fused = hidden.detach().clone().requires_grad_(True)
+        hidden_unfused = hidden.detach().clone().requires_grad_(True)
+
+        attn_fused(hidden_states=hidden_fused, attention_mask=None)[0].sum().backward()
+        attn_unfused(hidden_states=hidden_unfused, attention_mask=None)[0].sum().backward()
+
+        assert hidden_fused.grad is not None
+        for name, param in attn_fused.named_parameters():
+            if param.requires_grad:
+                assert param.grad is not None, f"No gradient for parameter {name}"

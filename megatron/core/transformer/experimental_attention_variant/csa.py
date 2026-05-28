@@ -109,27 +109,37 @@ def _apply_rope(
         total_seq_len = rotary_seq_len
     else:
         total_seq_len = rotary_seq_len * ratio
+    # DSv4 reference (DS-Inf) RoPE is pure rotation (norm-preserving). Yarn's
+    # concentration factor (mscale) is NOT part of the DSv4 model contract --
+    # the model relies on Q/KV RMS-norm + unit-magnitude rotation. Force 1.0
+    # regardless of which rotary class is in use.
     mscale = 1.0
     rotary_pos_cos = None
     rotary_pos_sin = None
-    if config.rope_type == "rope":
-        rotary_pos_emb = rotary_pos_emb_module(total_seq_len, packed_seq=False)
-        mscale = 1.0
+    if config.apply_rope_fusion:
+        # ``mscale=1.0`` keeps the cached cos/sin free of yarn's
+        # concentration factor so the fused kernel sees the same
+        # rotation as the unfused split-rotate path (DSv4 "pure
+        # rotation" contract).
+        rotary_pos_cos, rotary_pos_sin = rotary_pos_emb_module.get_cached_cos_sin(
+            total_seq_len, dtype=x.dtype, packed_seq=False, mscale=mscale
+        )
+        rotary_pos_emb = None
+        assert (
+            fused_mla_rope_inplace is not None
+        ), "Fused MLA RoPE apply is not imported successfully"
     else:
-        if config.apply_rope_fusion:
-            rotary_pos_cos, rotary_pos_sin = rotary_pos_emb_module.get_cached_cos_sin(
-                total_seq_len, dtype=x.dtype, packed_seq=False
-            )
-            rotary_pos_emb = None
-            assert (
-                fused_mla_rope_inplace is not None
-            ), "Fused MLA RoPE apply is not imported successfully"
+        # ``DSv4HybridAttention`` instantiates ``YarnRotaryEmbedding``
+        # whenever ``compress_ratio > 1`` (regardless of ``config.rope_type``);
+        # its ``forward`` returns ``(emb, mscale)``. Base ``RotaryEmbedding``
+        # returns a single tensor. Unpack either form uniformly; the
+        # caller-side ``mscale=1.0`` keeps the yarn concentration factor
+        # out of the rotation.
+        result = rotary_pos_emb_module(total_seq_len, packed_seq=False)
+        if isinstance(result, tuple):
+            rotary_pos_emb = result[0]
         else:
-            rotary_pos_emb, mscale = rotary_pos_emb_module(total_seq_len, packed_seq=False)
-            # DSv4 reference (DS-Inf) RoPE is pure rotation (norm-preserving). Yarn's
-            # concentration factor (mscale) is NOT part of the DSv4 model contract --
-            # the model relies on Q/KV RMS-norm + unit-magnitude rotation. Force 1.0.
-            mscale = 1.0
+            rotary_pos_emb = result
     if rotary_pos_emb is not None and ratio > 1:
         rotary_pos_emb = rotary_pos_emb[:total_seq_len:ratio][:rotary_seq_len]
     if rotary_pos_cos is not None and ratio > 1:
