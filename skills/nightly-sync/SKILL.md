@@ -28,7 +28,7 @@ conflicts, iterating on CI, and shipping the PR.
 ### Preserving Dev-Only Additions
 
 Do NOT blanket-override all shared files with main's version. Dev has features
-not YET in main (new classes, new modules, new tests). The merge preserves both
+not yet in main (new classes, new modules, new tests). The merge preserves both
 sides' non-conflicting additions — only intervene where there is an actual
 conflict.
 
@@ -713,3 +713,4 @@ comment should include:
 - **Push directly to NVIDIA/Megatron-LM** (not a fork). The bot uses a PAT
   with write access. CLAUDE.md says "never push directly" but that rule is
   for human contributors — the sync bot is an exception.
+<!-- End of skill. -->

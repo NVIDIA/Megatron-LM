@@ -147,3 +147,4 @@ products:
 - [ ] Created/updated recipe YAML with `nodes: 1, gpus: 4`
 - [ ] Assigned `mr-github` scope (+ `mr-github-slim` for 1–2 representative tests per recipe)
 - [ ] Verified no `mr-github-slim` overload (slim suite should stay small)
+<!-- End of skill. -->

@@ -185,3 +185,4 @@ user can review or share it.
 - Keep the error snippet concise (≤30 lines). Truncate long tracebacks and note that the full log is available via the job URL.
 - Do not guess the root cause — quote the actual log output verbatim.
 - If the job is still in progress or the logs are unavailable, say so and ask the user to retry once the run completes.
+<!-- End of skill. -->
