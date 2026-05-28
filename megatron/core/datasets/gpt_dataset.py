@@ -101,6 +101,12 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
         assert self.reset_attention_mask is not None
         assert self.eod_mask_loss is not None
 
+        if self.varlen_bshd_validation:
+            assert not self.dynamic_context_parallel, (
+                "--varlen-bshd-validation is incompatible with "
+                "--dynamic-context-parallel (BSHD mode is not packed)."
+            )
+
         self.token_dtype_code = (
             None
             if self.tokenizer.vocab_size is None

@@ -43,7 +43,6 @@ Limitations (raise a clear ``ValueError`` instead of silently mishandling):
   * For HF Hub repos, only ``split="train"`` is loaded.
 """
 
-import json
 import os
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -60,6 +59,7 @@ from megatron.training.datasets.sft_dataset import (
     SFTDataset,
     SFTLowLevelDataset,
 )
+from megatron.training.datasets.utils import load_json_arg
 
 # Field-name synonyms (probed in order; first non-empty wins).
 _INSTRUCTION_FIELDS: Tuple[str, ...] = (
@@ -482,7 +482,7 @@ class MockVarlenDataset(MockSFTDataset):
                 "lognormal_sigma": 1.1,
             }
         else:
-            mock_config = json.loads(config.varlen_mock_dataset_config_json)
+            mock_config = load_json_arg(config.varlen_mock_dataset_config_json)
         return MockSFTLowLevelDataset(**mock_config)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:

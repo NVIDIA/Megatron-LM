@@ -105,13 +105,12 @@ def build_pretraining_data_loader(dataset, consumed_samples):
             DistributedSignalHandler(args.exit_signal).__enter__()
 
     maybe_worker_init_fn = worker_init_fn if args.num_workers > 0 else None
-    # Torch dataloader.
-    # All packing-scheduler paths (dynamic_cp + dp_balanced + future schedulers)
-    # consume variable-length per-sample tensors that the default stack-based
-    # collate_fn cannot batch. Use an identity collate so the scheduler sees
-    # a list of dicts and can pack them itself.
+    # Identity collate for VarlenDataset and packing-scheduler paths;
+    # they emit one variable-length dict per sample, not stack-able by
+    # the default collate.
     if (
-        args.dynamic_context_parallel
+        args.use_varlen_dataset
+        or args.dynamic_context_parallel
         or args.sequence_packing_scheduler is not None
         or getattr(args, "use_vanilla_collate_fn", False)
     ):

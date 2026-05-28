@@ -1,8 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
-import atexit, json
+import atexit
 from collections import Counter
-import json
 import math
 from typing import Any, Dict, Optional, List, Union
 
@@ -14,6 +13,7 @@ from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.indexed_dataset import IndexedDataset
 from megatron.core.datasets.megatron_dataset import LowLevelDataset, MegatronDataset
 from megatron.core.datasets.utils import Split
+from megatron.training.datasets.utils import load_json_arg
 
 IGNORE_INDEX = -100
 
@@ -335,7 +335,7 @@ class MockSFTDataset(SFTDataset):
                     "lognormal_sigma": 1.1,
                 }
         else:
-            mock_config = json.loads(config.sft_mock_dataset_config_json)
+            mock_config = load_json_arg(config.sft_mock_dataset_config_json)
         return MockSFTLowLevelDataset(**mock_config)
 
     def __len__(self) -> int:

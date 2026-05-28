@@ -1702,13 +1702,10 @@ def validate_args(args, defaults={}):
             "select the packed-sequence dataset family. Pick one."
         )
         if args.varlen_bshd_validation:
-            # BSHD reference mode: each sample is right-padded to
-            # sequence_length and shipped through the default non-packed
-            # pipeline. No scheduler / dynamic-cp involved.
-            assert not args.dynamic_context_parallel, (
-                "--varlen-bshd-validation is incompatible with "
-                "--dynamic-context-parallel (BSHD mode is not packed)."
-            )
+            # ``--dynamic-context-parallel`` ⊥ ``--varlen-bshd-validation`` is
+            # checked in ``GPTDatasetConfig.__post_init__``; only the
+            # scheduler check stays here, since ``sequence_packing_scheduler``
+            # is a training-framework flag not stored on the dataset config.
             assert args.sequence_packing_scheduler is None, (
                 "--varlen-bshd-validation does not use a sequence packing "
                 "scheduler; drop --sequence-packing-scheduler."
@@ -4873,7 +4870,15 @@ def _add_sft_args(parser):
         '--sft-mock-dataset-config-json',
         type=str,
         default=None,
-        help='This config provides the necessary information for the mock dataset. You can either specify a CSV file that contains sequence lengths, where each line stores the length of a sequence, for example: {"mode":"file","path":"/path/to/file"}. Alternatively, you can specify a distribution (currently only supporting lognormal distribution) along with the required parameters, for example, {"mode":"distribution","type":"lognormal","min_seq_len":1024,"max_seq_len":2048,"mean_seq_len":1536,"lognormal_sigma":1.1}, where sigma controls the variability of the lognormal distribution. '
+        help='This config provides the necessary information for the mock dataset. '
+        'Accepts either an inline JSON literal or a path to a JSON file containing '
+        'the same schema. You can either specify a CSV file that contains sequence lengths, '
+        'where each line stores the length of a sequence, for example: '
+        '{"mode":"file","path":"/path/to/file"}. Alternatively, you can specify a distribution '
+        '(currently only supporting lognormal distribution) along with the required parameters, '
+        'for example, {"mode":"distribution","type":"lognormal","min_seq_len":1024,'
+        '"max_seq_len":2048,"mean_seq_len":1536,"lognormal_sigma":1.1}, where sigma controls '
+        'the variability of the lognormal distribution. '
         'If not specified and --mock-data is set, defaults to a lognormal distribution with '
         'min_seq_len=seq_length//2, max_seq_len=seq_length, mean_seq_len=seq_length*3//4, lognormal_sigma=1.1.',
     )
@@ -4909,8 +4914,9 @@ def _add_varlen_dataset_args(parser):
         '--varlen-mock-dataset-config-json',
         type=str,
         default=None,
-        help='Mock-dataset config JSON for --use-varlen-dataset --mock-data. '
-        'Same schema as --sft-mock-dataset-config-json: either '
+        help='Mock-dataset config for --use-varlen-dataset --mock-data. '
+        'Accepts either an inline JSON literal or a path to a JSON file containing '
+        'the same schema as --sft-mock-dataset-config-json: either '
         '{"mode":"file","path":"/path/to/lengths.csv"}, '
         '{"mode":"distribution","type":"lognormal","min_seq_len":1024,'
         '"max_seq_len":2048,"mean_seq_len":1536,"lognormal_sigma":1.1}, or '
