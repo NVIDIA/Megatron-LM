@@ -297,7 +297,9 @@ def _make_controller_with_rows(pending_ids, current_ids, current_graph_count=Non
     controller = object.__new__(TextGenerationController)
     pending_graph_count = None if pending_ids is None else len(pending_ids)
     if current_graph_count is None:
-        current_graph_count = pending_graph_count if pending_graph_count is not None else len(current_ids)
+        current_graph_count = (
+            pending_graph_count if pending_graph_count is not None else len(current_ids)
+        )
     controller._async_pending_forward_view = (
         None
         if pending_ids is None
@@ -358,9 +360,7 @@ def test_pending_async_forward_rows_reuse_map_or_discard(
 @pytest.mark.internal
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="row mapping returns CUDA tensors")
 def test_pending_async_forward_rows_discard_when_graph_shape_changes():
-    controller = _make_controller_with_rows(
-        [10, 11, 12], [12, 10, 11], current_graph_count=4
-    )
+    controller = _make_controller_with_rows([10, 11, 12], [12, 10, 11], current_graph_count=4)
 
     assert controller._pending_async_forward_row_status() == (False, False)
     assert controller._resolve_pending_async_forward_view() is None
@@ -1212,7 +1212,9 @@ def test_decode_full_logits_sampling_kernel_uses_contiguous_rows_after_async_pre
     captures = {}
 
     class _Sampling:
-        def sample_kernel(self, logits, n, context, gather_indices=None, eager=True, cache_key=None):
+        def sample_kernel(
+            self, logits, n, context, gather_indices=None, eager=True, cache_key=None
+        ):
             captures["logits"] = logits
             captures["n"] = n
             captures["gather_indices"] = gather_indices

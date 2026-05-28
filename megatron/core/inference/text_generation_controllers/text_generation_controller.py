@@ -1652,9 +1652,7 @@ class TextGenerationController:
         """Return whether the pending forward used the graph shape current rows expect."""
         context = self.inference_wrapped_model.inference_context
         current_graph_request_count = (
-            context.padded_active_request_count
-            if context.using_cuda_graph_this_step()
-            else None
+            context.padded_active_request_count if context.using_cuda_graph_this_step() else None
         )
         return pending_view.cuda_graph_request_count == current_graph_request_count
 
@@ -1811,10 +1809,7 @@ class TextGenerationController:
         """Return the per-active-request logits consumed by sampling."""
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
-        if (
-            not context.config.materialize_only_last_token_logits
-            and context.is_decode_only()
-        ):
+        if not context.config.materialize_only_last_token_logits and context.is_decode_only():
             required_token_logits = self._all_logits_cuda.squeeze(0)
             if row_indices is None:
                 return required_token_logits[:active_request_count, :]
