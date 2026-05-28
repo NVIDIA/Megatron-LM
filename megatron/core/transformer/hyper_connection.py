@@ -69,9 +69,12 @@ def native_h_aggregate(x: Tensor, h_pre: Tensor) -> Tensor:
 def native_h_post_bda(
     h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
 ) -> Tensor:
-    """Native H_res @ residual + H_post * (x [+ bias])."""
+    """Native H_res.T @ residual + H_post * (x [+ bias])."""
     s, b, n, C = original_residual.shape
-    h_res_batched = h_res.view(s * b, n, n)
+    dtype = original_residual.dtype
+    h_res = h_res.to(dtype)
+    h_post = h_post.to(dtype)
+    h_res_batched = h_res.transpose(-1, -2).contiguous().view(s * b, n, n)
     residual_batched = original_residual.view(s * b, n, C)
     mixed = torch.bmm(h_res_batched, residual_batched).view(s, b, n, C)
     x_expanded = h_post.unsqueeze(-1) * x.unsqueeze(2)
@@ -372,7 +375,7 @@ class HyperConnectionModule(MegatronModule):
         """
         Apply H_res to residual using H_res weights.
 
-        Computes: H_res @ residual
+        Computes: H_res.T @ residual
 
         Args:
             h_res: [s, b, n, n] - residual mixing matrix
@@ -383,7 +386,8 @@ class HyperConnectionModule(MegatronModule):
         C = self.hidden_size
 
         # Reshape for bmm: [s, b, n, n] -> [s*b, n, n]
-        h_res_batched = h_res.view(s * b, n, n)
+        h_res = h_res.to(residual.dtype)
+        h_res_batched = h_res.transpose(-1, -2).contiguous().view(s * b, n, n)
         # [s, b, n*C] -> [s, b, n, C] -> [s*b, n, C]
         residual_batched = residual.view(s, b, n, C).view(s * b, n, C)
 

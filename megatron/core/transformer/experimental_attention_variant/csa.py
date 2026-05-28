@@ -390,7 +390,8 @@ class Compressor(MegatronModule):
             kv = self._overlap_transform(kv, fill_value=0)
             score = self._overlap_transform(score, fill_value=float("-inf"))
 
-        kv = (kv * torch.softmax(score, dim=1)).sum(dim=1)  # [n_compressed, b, head_dim]
+        weights = torch.softmax(score, dim=1, dtype=torch.float32).to(kv.dtype)
+        kv = (kv * weights).sum(dim=1)  # [n_compressed, b, head_dim]
 
         kv = self.norm(kv.to(x.dtype))
 
