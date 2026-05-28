@@ -222,6 +222,7 @@ class GatedDeltaNet(MegatronModule):
             eps=self.config.layernorm_epsilon,
         )
         self.recompute_norm_out = False
+        self.norm_out_checkpoint = None
         if self.config.recompute_granularity == "selective":
             self.recompute_norm_out = "gdn_norm_out" in self.config.recompute_modules
 

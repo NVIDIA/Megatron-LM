@@ -202,6 +202,7 @@ class TestGatedDeltaNet:
         assert base_gdn.recompute_norm_out is False
         base_output, base_grads, base_input_grad = run(base_gdn, hidden_states)
         hidden_states.grad = None
+        assert base_gdn.norm_out_checkpoint is None
         del base_gdn
         torch.cuda.empty_cache()
 
@@ -211,6 +212,7 @@ class TestGatedDeltaNet:
         rec_gdn = build_gdn(rec_config)
         assert rec_gdn.recompute_norm_out is True
         rec_output, rec_grads, rec_input_grad = run(rec_gdn, hidden_states)
+        assert rec_gdn.norm_out_checkpoint is not None
 
         rank = torch.distributed.get_rank()
         assert torch.equal(rec_output, base_output), f"Output not identical ({rank=})"
