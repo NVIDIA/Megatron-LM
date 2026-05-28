@@ -32,7 +32,6 @@ except ImportError:
 
 try:
     from megatron.core.fusions.fused_mrope import (
-        can_launch_fused_mrope,
         can_launch_fused_mrope_thd,
         fused_apply_mrope,
         fused_apply_mrope_thd,
@@ -42,7 +41,6 @@ try:
         mrope_freqs_to_rotary_emb,
     )
 except ImportError:
-    can_launch_fused_mrope = None
     can_launch_fused_mrope_thd = None
     fused_apply_mrope = None
     fused_apply_mrope_thd = None
@@ -64,7 +62,6 @@ __all__ = [
     'apply_rotary_pos_emb_with_cos_sin',
     'fused_apply_rotary_pos_emb',
     'fused_apply_rotary_pos_emb_thd',
-    'can_launch_fused_mrope',
     'can_launch_fused_mrope_thd',
     'fused_apply_mrope',
     'fused_apply_mrope_thd',
@@ -90,11 +87,7 @@ def _is_raw_mrope_freqs(t: Tensor, freqs: Tensor, config: TransformerConfig) -> 
 
 
 def _is_raw_mrope_freqs_thd(
-    t: Tensor,
-    freqs: Tensor,
-    cu_seqlens: Tensor,
-    config: TransformerConfig,
-    cp_size: int,
+    t: Tensor, freqs: Tensor, cu_seqlens: Tensor, config: TransformerConfig, cp_size: int
 ) -> bool:
     """Return whether freqs is raw mRoPE for THD layout, or fail on raw-like bad shapes."""
     if config.mrope_section is None or freqs.dim() != 4 or freqs.shape[0] != 3:
@@ -110,6 +103,11 @@ def _is_raw_mrope_freqs_thd(
         raise ValueError(
             "raw mRoPE THD freqs must have singleton batch dimension with shape "
             f"[3, 1, total_seqlen, rotary_dim / 2], got {tuple(freqs.shape)}"
+        )
+    if cp_size > 1 and freqs.shape[2] % cp_size != 0:
+        raise ValueError(
+            "raw mRoPE THD freqs sequence length must be divisible by context parallel size, "
+            f"got freqs.shape[2]={freqs.shape[2]}, cp_size={cp_size}"
         )
     expected_total_seqlen = t.shape[0] * cp_size
     if freqs.shape[2] != expected_total_seqlen:
@@ -295,20 +293,21 @@ def _get_thd_freqs_on_this_cp_rank(
            compatibility.
     """
     if cp_size > 1:
-        cp_seg = x.size(0) // 2
+        first_cp_seg = (x.size(0) + 1) // 2
+        second_cp_seg = x.size(0) // 2
         full_seqlen = cp_size * x.size(0)
         # Apply offset to both forward and backward segments for context parallelism
-        # offset=0: traditional behavior, freqs[0:cp_seg] and freqs[...]
-        # offset>0: exact mapping, freqs[offset+0:offset+cp_seg] and freqs[offset+...]
+        # offset=0: traditional behavior, freqs[0:first_cp_seg] and freqs[...]
+        # offset>0: exact mapping, freqs[offset+0:offset+first_cp_seg] and freqs[offset+...]
         return torch.cat(
             [
-                freqs[offset + cp_rank * cp_seg : offset + (cp_rank + 1) * cp_seg],
+                freqs[offset + cp_rank * first_cp_seg : offset + (cp_rank + 1) * first_cp_seg],
                 freqs[
                     offset
                     + full_seqlen
-                    - (cp_rank + 1) * cp_seg : offset
+                    - (cp_rank + 1) * second_cp_seg : offset
                     + full_seqlen
-                    - cp_rank * cp_seg
+                    - cp_rank * second_cp_seg
                 ],
             ]
         )
@@ -324,25 +323,43 @@ def _get_thd_raw_mrope_freqs_on_this_cp_rank(
 ) -> Tensor:
     """Get raw mRoPE frequency slices for this CP rank in THD layout."""
     if cp_size > 1:
-        cp_seg = x.size(0) // 2
+        first_cp_seg = (x.size(0) + 1) // 2
+        second_cp_seg = x.size(0) // 2
         full_seqlen = cp_size * x.size(0)
         return torch.cat(
             [
-                freqs[:, :, offset + cp_rank * cp_seg : offset + (cp_rank + 1) * cp_seg],
+                freqs[
+                    :, :, offset + cp_rank * first_cp_seg : offset + (cp_rank + 1) * first_cp_seg
+                ],
                 freqs[
                     :,
                     :,
                     offset
                     + full_seqlen
-                    - (cp_rank + 1) * cp_seg : offset
+                    - (cp_rank + 1) * second_cp_seg : offset
                     + full_seqlen
-                    - cp_rank * cp_seg,
+                    - cp_rank * second_cp_seg,
                 ],
             ],
             dim=2,
         )
     else:
         return freqs[:, :, offset : offset + x.size(0)]
+
+
+def _get_thd_cp_splits(cu_seqlens: Tensor, cp_size: int) -> tuple[list[int], list[int]]:
+    """Return global sequence offsets and per-rank sequence lengths for THD CP fallback."""
+    cu_seqlens_list = cu_seqlens.tolist()
+    local_seqlens = []
+    for seq_start, seq_end in zip(cu_seqlens_list[:-1], cu_seqlens_list[1:]):
+        seq_len = seq_end - seq_start
+        if cp_size > 1 and seq_len % cp_size != 0:
+            raise ValueError(
+                "THD sequence lengths must be divisible by context parallel size, "
+                f"got sequence length {seq_len}, cp_size={cp_size}"
+            )
+        local_seqlens.append(seq_len // cp_size)
+    return cu_seqlens_list, local_seqlens
 
 
 def _pack_thd_raw_mrope_freqs(
@@ -355,10 +372,10 @@ def _pack_thd_raw_mrope_freqs(
     """Pack raw mRoPE freqs into the same local token order as THD tensor ``t``."""
     cp_size = cp_group.size()
     cp_rank = cp_group.rank()
-    seqlens = ((cu_seqlens[1:] - cu_seqlens[:-1]) // cp_size).tolist()
+    cu_seqlens_list, seqlens = _get_thd_cp_splits(cu_seqlens, cp_size)
     sequence_splits = torch.split(t, seqlens)
     if total_seqlen is None:
-        total_seqlen = int(cu_seqlens[-1].item())
+        total_seqlen = cu_seqlens_list[-1]
         assert freqs.size(2) == total_seqlen, (
             f"raw mRoPE THD freqs sequence length {freqs.size(2)} must match "
             f"cu_seqlens[-1] = {total_seqlen}"
@@ -366,11 +383,9 @@ def _pack_thd_raw_mrope_freqs(
 
     freq_slices = []
     for i, x in enumerate(sequence_splits):
-        seq_start_offset = int(cu_seqlens[i].item())
+        seq_start_offset = cu_seqlens_list[i]
         freq_slices.append(
-            _get_thd_raw_mrope_freqs_on_this_cp_rank(
-                cp_rank, cp_size, x, freqs, seq_start_offset
-            )
+            _get_thd_raw_mrope_freqs_on_this_cp_rank(cp_rank, cp_size, x, freqs, seq_start_offset)
         )
 
     packed_freqs = torch.cat(freq_slices, dim=2)
@@ -416,7 +431,7 @@ def _apply_rotary_pos_emb_thd(
         raise ValueError("cp_group must be provided for THD format RoPE")
     cp_size = cp_group.size()
     cp_rank = cp_group.rank()
-    seqlens = ((cu_seqlens[1:] - cu_seqlens[:-1]) // cp_size).tolist()
+    cu_seqlens_list, seqlens = _get_thd_cp_splits(cu_seqlens, cp_size)
 
     # Handle two different frequency tensor formats:
     # 1. If freqs.size(0) == cu_seqlens[-1]: freqs contains all positions across all sequences
@@ -430,7 +445,7 @@ def _apply_rotary_pos_emb_thd(
         freq_slices = []
         for i, x in enumerate(sequence_splits):
             # cu_seqlens[i] is the starting offset of this sequence in the original batch
-            seq_start_offset = cu_seqlens[i].item()
+            seq_start_offset = cu_seqlens_list[i]
             freq_slices.append(
                 _get_thd_freqs_on_this_cp_rank(cp_rank, cp_size, x, freqs, seq_start_offset)
             )
@@ -498,23 +513,18 @@ def apply_rotary_pos_emb(
             force_unfused_mrope = False
             if is_raw_mrope_freqs:
                 unavailable_reason = None
-                if (
-                    get_fused_mrope_unavailable_reason is not None
+                can_try_fused_mrope = (
+                    fused_apply_mrope is not None
+                    and get_fused_mrope_unavailable_reason is not None
                     and not mla_rotary_interleaved
                     and not inverse
                     and mscale == 1.0
-                ):
+                )
+                if can_try_fused_mrope:
                     unavailable_reason = get_fused_mrope_unavailable_reason(
                         t, freqs, config.rotary_interleaved
                     )
-                use_fused_mrope = (
-                    fused_apply_mrope is not None
-                    and can_launch_fused_mrope is not None
-                    and can_launch_fused_mrope(t, freqs, config.rotary_interleaved)
-                    and mscale == 1.0
-                    and not mla_rotary_interleaved
-                    and not inverse
-                )
+                use_fused_mrope = can_try_fused_mrope and unavailable_reason is None
                 if use_fused_mrope:
                     return fused_apply_mrope(
                         t,

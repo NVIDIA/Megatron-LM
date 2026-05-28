@@ -43,9 +43,7 @@ def _expected_interleaved_mrope_section(half_rotary_dim: int) -> tuple[int, int,
 
 
 def _validate_mrope_section(
-    mrope_section: List[int],
-    half_rotary_dim: int,
-    interleaved_mrope: bool,
+    mrope_section: List[int], half_rotary_dim: int, interleaved_mrope: bool
 ) -> tuple[int, int, int]:
     assert len(mrope_section) == 3, f"mrope_section must have length 3, got {mrope_section}"
 
@@ -67,10 +65,7 @@ def _validate_mrope_section(
 
 
 def _validate_mrope_inputs(
-    t: torch.Tensor,
-    freqs: torch.Tensor,
-    mrope_section: List[int],
-    interleaved_mrope: bool,
+    t: torch.Tensor, freqs: torch.Tensor, mrope_section: List[int], interleaved_mrope: bool
 ) -> tuple[int, int, int, int, int, int, int, int]:
     assert t.dim() == 4, f"t must have shape [seq, batch, heads, head_dim], got {t.shape}"
     assert freqs.dim() == 4, (
@@ -84,9 +79,7 @@ def _validate_mrope_inputs(
         freq_batch == batch and freq_seq == seq
     ), f"freqs shape {tuple(freqs.shape)} is incompatible with t shape {tuple(t.shape)}"
 
-    sec_t, sec_h, sec_w = _validate_mrope_section(
-        mrope_section, half_rotary_dim, interleaved_mrope
-    )
+    sec_t, sec_h, sec_w = _validate_mrope_section(mrope_section, half_rotary_dim, interleaved_mrope)
 
     rotary_dim = half_rotary_dim * 2
     assert (
@@ -116,14 +109,16 @@ def _validate_mrope_thd_inputs(
     assert freq_batch == 1, (
         "raw mRoPE THD freqs must have singleton batch dimension, " f"got {freqs.shape}"
     )
+    assert cp_size == 1 or freq_seq % cp_size == 0, (
+        "raw mRoPE THD freqs sequence length must be divisible by context parallel size, "
+        f"got freqs.shape[2]={freq_seq}, cp_size={cp_size}"
+    )
     assert freq_seq == tokens * cp_size, (
         "raw mRoPE THD freqs sequence length must match local tokens times cp_size, "
         f"got freqs.shape[2]={freq_seq}, tokens={tokens}, cp_size={cp_size}"
     )
 
-    sec_t, sec_h, sec_w = _validate_mrope_section(
-        mrope_section, half_rotary_dim, interleaved_mrope
-    )
+    sec_t, sec_h, sec_w = _validate_mrope_section(mrope_section, half_rotary_dim, interleaved_mrope)
     rotary_dim = half_rotary_dim * 2
     assert (
         rotary_dim <= head_dim
@@ -190,7 +185,9 @@ def get_fused_mrope_thd_unavailable_reason(
     if t is None or cu_seqlens is None or freqs is None:
         return None
     if t.dim() != 3:
-        return f"THD fused mRoPE expects t with shape [tokens, heads, head_dim], got {tuple(t.shape)}"
+        return (
+            f"THD fused mRoPE expects t with shape [tokens, heads, head_dim], got {tuple(t.shape)}"
+        )
     if freqs.dim() != 4:
         return (
             "raw mRoPE THD freqs must have shape [3, 1, total_seqlen, rotary_dim / 2], "
@@ -217,6 +214,11 @@ def get_fused_mrope_thd_unavailable_reason(
         return (
             "raw mRoPE THD freqs must have shape [3, 1, total_seqlen, rotary_dim / 2], "
             f"got {tuple(freqs.shape)}"
+        )
+    if cp_size > 1 and freqs.shape[2] % cp_size != 0:
+        return (
+            "raw mRoPE THD freqs sequence length must be divisible by context parallel size, "
+            f"got freqs.shape[2]={freqs.shape[2]}, cp_size={cp_size}"
         )
     if freqs.shape[2] != t.shape[0] * cp_size:
         return (
@@ -295,9 +297,7 @@ def mrope_freqs_to_rotary_emb(
     assert len(mrope_section) == 3, f"mrope_section must have length 3, got {mrope_section}"
 
     half_rotary_dim = freqs.size(-1)
-    sec_t, sec_h, sec_w = _validate_mrope_section(
-        mrope_section, half_rotary_dim, interleaved_mrope
-    )
+    sec_t, sec_h, sec_w = _validate_mrope_section(mrope_section, half_rotary_dim, interleaved_mrope)
 
     if interleaved_mrope:
         freqs_out = freqs[0].clone()
@@ -451,6 +451,7 @@ def _fused_mrope_thd_kernel(
     o_s_token,
     o_s_head,
     o_s_dim,
+    NUM_SEQS,
     HEAD_DIM: tl.constexpr,
     HALF_ROTARY_DIM: tl.constexpr,
     PASS_DIM: tl.constexpr,
@@ -463,7 +464,6 @@ def _fused_mrope_thd_kernel(
     CP_SIZE: tl.constexpr,
     CP_RANK: tl.constexpr,
     FP32_COMPUTE: tl.constexpr,
-    NUM_SEQS: tl.constexpr,
     BLOCK_HALF: tl.constexpr,
     BLOCK_PASS: tl.constexpr,
 ):
@@ -471,7 +471,8 @@ def _fused_mrope_thd_kernel(
     head_idx = tl.program_id(1)
 
     freq_seq_idx = token_idx
-    for seq_i in tl.static_range(0, NUM_SEQS):
+    seq_i = 0
+    while seq_i < NUM_SEQS:
         global_start = tl.load(CU_SEQLENS + seq_i * cu_s_idx)
         global_end = tl.load(CU_SEQLENS + (seq_i + 1) * cu_s_idx)
         local_start = global_start // CP_SIZE
@@ -481,16 +482,18 @@ def _fused_mrope_thd_kernel(
 
         if CP_SIZE > 1:
             local_seq_len = local_end - local_start
-            cp_seg = local_seq_len // 2
-            first_freq_idx = global_start + CP_RANK * cp_seg + local_offset
+            first_cp_seg = (local_seq_len + 1) // 2
+            second_cp_seg = local_seq_len // 2
+            first_freq_idx = global_start + CP_RANK * first_cp_seg + local_offset
             second_freq_idx = (
-                global_end - (CP_RANK + 1) * cp_seg + (local_offset - cp_seg)
+                global_end - (CP_RANK + 1) * second_cp_seg + (local_offset - first_cp_seg)
             )
-            seq_freq_idx = tl.where(local_offset < cp_seg, first_freq_idx, second_freq_idx)
+            seq_freq_idx = tl.where(local_offset < first_cp_seg, first_freq_idx, second_freq_idx)
         else:
             seq_freq_idx = global_start + local_offset
 
         freq_seq_idx = tl.where(in_seq, seq_freq_idx, freq_seq_idx)
+        seq_i += 1
 
     k = tl.arange(0, BLOCK_HALF)
     mask = k < HALF_ROTARY_DIM
@@ -674,6 +677,7 @@ def _launch_fused_mrope_thd(
         out.stride(0),
         out.stride(1),
         out.stride(2),
+        num_seqs,
         HEAD_DIM=head_dim,
         HALF_ROTARY_DIM=half_rotary_dim,
         PASS_DIM=pass_dim,
@@ -686,7 +690,6 @@ def _launch_fused_mrope_thd(
         CP_SIZE=cp_size,
         CP_RANK=cp_rank,
         FP32_COMPUTE=fp32_compute,
-        NUM_SEQS=num_seqs,
         BLOCK_HALF=block_half,
         BLOCK_PASS=block_pass,
         num_warps=4,
@@ -851,10 +854,12 @@ def fused_apply_mrope_thd(
 
 
 def is_fused_mrope_available() -> bool:
-    """Return whether the Triton mRoPE fusion is importable.
+    """Return whether the Triton mRoPE fusion can be used on this host.
 
     This does not check tensor device, dtype, stride, or CUDA capability. Use
     ``can_launch_fused_mrope`` or ``get_fused_mrope_unavailable_reason`` with
     tensors before dispatching to the fused kernel.
     """
+    if not torch.cuda.is_available():
+        return False
     return can_launch_fused_mrope()

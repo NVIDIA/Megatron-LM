@@ -8,7 +8,6 @@ import torch
 
 import megatron.core.models.common.embeddings.rope_utils as rope_utils
 from megatron.core import parallel_state
-from megatron.core.fusions import fused_mrope
 from megatron.core.fusions.fused_mrope import (
     fused_apply_mrope,
     fused_apply_mrope_thd,
@@ -47,6 +46,14 @@ class FakeDynamicInferenceContext:
 
     def is_static_batching(self):
         return False
+
+
+class FakeStaticInferenceContext:
+    def is_dynamic_batching(self):
+        return False
+
+    def is_static_batching(self):
+        return True
 
 
 @pytest.fixture(autouse=True)
@@ -131,9 +138,7 @@ def _make_thd_inputs(
     freqs = torch.randn(
         3, 1, total_seq, rotary_dim // 2, dtype=torch.float32, device="cuda", generator=generator
     )
-    cu_seqlens = torch.tensor(
-        [0, padded_seq_lens[0], total_seq], dtype=torch.int32, device="cuda"
-    )
+    cu_seqlens = torch.tensor([0, padded_seq_lens[0], total_seq], dtype=torch.int32, device="cuda")
     return t, freqs, cu_seqlens, mrope_section
 
 
@@ -159,10 +164,36 @@ def _fallback_warnings(recorded_warnings):
     ]
 
 
-@pytest.mark.parametrize("use_packed_seq", [False, True])
-def test_gpt_mrope_eval_requests_raw_freqs_when_fusion_available(monkeypatch, use_packed_seq):
-    monkeypatch.setattr(fused_mrope, "is_fused_mrope_available", lambda: True)
+def _thd_cp_freq_indices(cu_seqlens_cpu, cp_size, cp_rank):
+    indices = []
+    for global_start, global_end in zip(cu_seqlens_cpu[:-1], cu_seqlens_cpu[1:]):
+        local_seq_len = (global_end - global_start) // cp_size
+        first_cp_seg = (local_seq_len + 1) // 2
+        second_cp_seg = local_seq_len // 2
+        indices.extend(
+            range(
+                global_start + cp_rank * first_cp_seg, global_start + (cp_rank + 1) * first_cp_seg
+            )
+        )
+        indices.extend(
+            range(global_end - (cp_rank + 1) * second_cp_seg, global_end - cp_rank * second_cp_seg)
+        )
+    return indices
 
+
+def _assert_thd_cp_freq_index_coverage(cu_seqlens_cpu, cp_size):
+    expected = []
+    actual = []
+    for global_start, global_end in zip(cu_seqlens_cpu[:-1], cu_seqlens_cpu[1:]):
+        expected.extend(range(global_start, global_end))
+    for cp_rank in range(cp_size):
+        actual.extend(_thd_cp_freq_indices(cu_seqlens_cpu, cp_size, cp_rank))
+    assert sorted(actual) == expected
+    assert len(set(actual)) == len(actual)
+
+
+@pytest.mark.parametrize("use_packed_seq", [False, True])
+def test_gpt_mrope_eval_requests_raw_freqs_when_fusion_available(use_packed_seq):
     captured_kwargs = {}
 
     def fake_rotary_pos_emb(*args, **kwargs):
@@ -183,6 +214,7 @@ def test_gpt_mrope_eval_requests_raw_freqs_when_fusion_available(monkeypatch, us
         ),
         rotary_pos_emb=fake_rotary_pos_emb,
         mrope_section=[2, 3, 3],
+        _fused_mrope_available=True,
     )
     packed_seq_params = (
         SimpleNamespace(qkv_format="thd", cp_group=FakeCPGroup()) if use_packed_seq else None
@@ -201,9 +233,43 @@ def test_gpt_mrope_eval_requests_raw_freqs_when_fusion_available(monkeypatch, us
     assert captured_kwargs["packed_seq"] is use_packed_seq
 
 
-def test_gpt_mrope_dynamic_inference_keeps_materialized_freqs(monkeypatch):
-    monkeypatch.setattr(fused_mrope, "is_fused_mrope_available", lambda: True)
+def test_gpt_mrope_eval_keeps_materialized_freqs_with_fused_single_qkv_rope():
+    captured_kwargs = {}
 
+    def fake_rotary_pos_emb(*args, **kwargs):
+        captured_kwargs.update(kwargs)
+        return "materialized-mrope-freqs"
+
+    model = SimpleNamespace(
+        training=False,
+        pre_process=False,
+        mtp_process=False,
+        position_embedding_type="mrope",
+        config=SimpleNamespace(
+            multi_latent_attention=False,
+            flash_decode=False,
+            apply_rope_fusion=True,
+            rotary_interleaved=False,
+            cuda_graph_impl=None,
+            fused_single_qkv_rope=True,
+        ),
+        rotary_pos_emb=fake_rotary_pos_emb,
+        mrope_section=[2, 3, 3],
+        _fused_mrope_available=True,
+    )
+
+    output = GPTModel._preprocess(
+        model,
+        input_ids=torch.zeros(1, 4, dtype=torch.long),
+        position_ids=torch.zeros(3, 1, 4, dtype=torch.long),
+        decoder_input=torch.zeros(4, 1, 12),
+    )
+
+    assert output[1] == "materialized-mrope-freqs"
+    assert captured_kwargs["return_raw_freqs"] is False
+
+
+def test_gpt_mrope_dynamic_inference_keeps_materialized_freqs():
     captured_kwargs = {}
 
     def fake_rotary_pos_emb(*args, **kwargs):
@@ -224,6 +290,7 @@ def test_gpt_mrope_dynamic_inference_keeps_materialized_freqs(monkeypatch):
         ),
         rotary_pos_emb=fake_rotary_pos_emb,
         mrope_section=[2, 3, 3],
+        _fused_mrope_available=True,
     )
 
     output = GPTModel._preprocess(
@@ -236,6 +303,59 @@ def test_gpt_mrope_dynamic_inference_keeps_materialized_freqs(monkeypatch):
 
     assert output[1] == "materialized-mrope-freqs"
     assert captured_kwargs["return_raw_freqs"] is False
+
+
+def test_gpt_mrope_static_inference_keeps_materialized_freqs():
+    captured_kwargs = {}
+
+    def fake_rotary_pos_emb(*args, **kwargs):
+        captured_kwargs.update(kwargs)
+        return "materialized-mrope-freqs"
+
+    model = SimpleNamespace(
+        training=False,
+        pre_process=False,
+        mtp_process=False,
+        position_embedding_type="mrope",
+        config=SimpleNamespace(
+            multi_latent_attention=False,
+            flash_decode=False,
+            apply_rope_fusion=True,
+            rotary_interleaved=False,
+            cuda_graph_impl=None,
+        ),
+        rotary_pos_emb=fake_rotary_pos_emb,
+        mrope_section=[2, 3, 3],
+        _fused_mrope_available=True,
+    )
+
+    output = GPTModel._preprocess(
+        model,
+        input_ids=torch.zeros(1, 4, dtype=torch.long),
+        position_ids=torch.zeros(3, 1, 4, dtype=torch.long),
+        decoder_input=torch.zeros(4, 1, 12),
+        inference_context=FakeStaticInferenceContext(),
+    )
+
+    assert output[1] == "materialized-mrope-freqs"
+    assert captured_kwargs["return_raw_freqs"] is False
+
+
+def test_is_fused_mrope_available_requires_cuda(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    assert not is_fused_mrope_available()
+
+
+def test_transformer_config_rejects_fused_mrope_without_cuda_or_te(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(rope_utils, "fused_apply_rotary_pos_emb", None)
+    monkeypatch.setattr(rope_utils, "fused_apply_rotary_pos_emb_thd", None)
+
+    with pytest.raises(ValueError, match="apply_rope_fusion is not available"):
+        TransformerConfig(
+            num_attention_heads=1, num_layers=1, apply_rope_fusion=True, mrope_section=[1, 1, 1]
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -306,9 +426,7 @@ def test_apply_rotary_pos_emb_bshd_eval_uses_triton_without_te(interleaved_mrope
         ({"inverse": True}, "inverse RoPE is not supported by Triton fused mRoPE"),
     ],
 )
-def test_apply_rotary_pos_emb_raw_mrope_fallbacks_match_unfused(
-    fallback_kwargs, warning_match
-):
+def test_apply_rotary_pos_emb_raw_mrope_fallbacks_match_unfused(fallback_kwargs, warning_match):
     t, freqs, mrope_section = _make_inputs()
     config = TransformerConfig(
         num_attention_heads=t.shape[2],
@@ -326,7 +444,9 @@ def test_apply_rotary_pos_emb_raw_mrope_fallbacks_match_unfused(
 
     with warnings.catch_warnings(record=True) as repeated_warnings:
         warnings.simplefilter("always")
-        out_again = apply_rotary_pos_emb(t, freqs, config, cp_group=FakeCPGroup(), **fallback_kwargs)
+        out_again = apply_rotary_pos_emb(
+            t, freqs, config, cp_group=FakeCPGroup(), **fallback_kwargs
+        )
     assert not repeated_warnings
     torch.testing.assert_close(ref.float(), out_again.float(), **_dtype_tols(t.dtype))
 
@@ -397,17 +517,23 @@ def test_raw_mrope_cpu_falls_back_to_unfused():
     t = torch.randn(8, 1, 3, 20, dtype=torch.float32)
     freqs = torch.randn(3, 1, 8, 8, dtype=torch.float32)
     mrope_section = [2, 3, 3]
-    config = TransformerConfig(
-        num_attention_heads=t.shape[2],
-        num_layers=1,
+    config = SimpleNamespace(
         apply_rope_fusion=True,
         mrope_section=mrope_section,
+        mrope_interleaved=False,
+        rotary_interleaved=False,
     )
 
-    assert "CUDA tensors" in get_fused_mrope_unavailable_reason(t, freqs)
-    with pytest.warns(UserWarning, match="CUDA tensors.*Using unfused implementation"):
+    unavailable_reason = get_fused_mrope_unavailable_reason(t, freqs)
+    assert unavailable_reason is not None
+    with pytest.warns(
+        UserWarning, match="(CUDA tensors|Triton is not available).*Using unfused implementation"
+    ):
         out = apply_rotary_pos_emb(t, freqs, config, cp_group=FakeCPGroup())
-    assert _ROPE_FUSION_FALLBACK_WARNINGS == {"triton-mrope-unavailable-device"}
+    assert _ROPE_FUSION_FALLBACK_WARNINGS in (
+        {"triton-mrope-unavailable-device"},
+        {"triton-mrope-unavailable-import"},
+    )
 
     emb = mrope_freqs_to_rotary_emb(freqs, mrope_section, rotary_interleaved=False)
     ref = _apply_rotary_pos_emb_bshd(t, emb, rotary_interleaved=False)
@@ -479,6 +605,32 @@ def test_raw_mrope_unsupported_freq_dtype_warning_key_is_dtype():
     torch.testing.assert_close(ref.float(), out.float(), **_dtype_tols(t.dtype))
 
 
+def test_apply_rotary_pos_emb_raw_mrope_checks_triton_availability_once(monkeypatch):
+    t = torch.randn(4, 1, 2, 8, dtype=torch.float32)
+    freqs = torch.randn(3, 1, 4, 4, dtype=torch.float32)
+    config = SimpleNamespace(
+        apply_rope_fusion=True,
+        mrope_section=[1, 1, 2],
+        mrope_interleaved=False,
+        rotary_interleaved=False,
+    )
+
+    calls = 0
+
+    def fake_unavailable_reason(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return None
+
+    monkeypatch.setattr(rope_utils, "get_fused_mrope_unavailable_reason", fake_unavailable_reason)
+    monkeypatch.setattr(rope_utils, "fused_apply_mrope", lambda *args, **kwargs: t + 1)
+
+    out = apply_rotary_pos_emb(t, freqs, config, cp_group=FakeCPGroup())
+
+    assert calls == 1
+    torch.testing.assert_close(out, t + 1)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("layout", ["bshd", "thd"])
 def test_materialized_mrope_falls_back_without_te_fused_rope(monkeypatch, layout):
@@ -546,9 +698,7 @@ def test_materialized_thd_mrope_option_fallbacks_do_not_call_te(
     assert warning_text in str(fallback_warnings[0].message)
     assert _ROPE_FUSION_FALLBACK_WARNINGS == {expected_warning_key}
 
-    ref = _apply_rotary_pos_emb_thd(
-        t, cu_seqlens, emb, cp_group=FakeCPGroup(), **fallback_kwargs
-    )
+    ref = _apply_rotary_pos_emb_thd(t, cu_seqlens, emb, cp_group=FakeCPGroup(), **fallback_kwargs)
     torch.testing.assert_close(ref.float(), out.float(), **_dtype_tols(t.dtype))
 
 
@@ -607,9 +757,7 @@ def test_fused_mrope_thd_matches_unfused_forward_backward(
 @pytest.mark.skipif(not is_fused_mrope_available(), reason="Triton fused mRoPE not available")
 @pytest.mark.parametrize("interleaved_mrope", [False, True])
 def test_apply_rotary_pos_emb_thd_eval_uses_triton_without_te(interleaved_mrope, monkeypatch):
-    t, freqs, cu_seqlens, mrope_section = _make_thd_inputs(
-        interleaved_mrope=interleaved_mrope
-    )
+    t, freqs, cu_seqlens, mrope_section = _make_thd_inputs(interleaved_mrope=interleaved_mrope)
     config = _make_mrope_config(t.shape[1], mrope_section, interleaved_mrope)
 
     emb = mrope_freqs_to_rotary_emb(
@@ -729,6 +877,90 @@ def test_thd_raw_mrope_rejects_sequence_length_mismatch():
         apply_rotary_pos_emb(t, bad_freqs, config, cu_seqlens, cp_group=FakeCPGroup())
 
 
+def test_thd_raw_mrope_rejects_global_sequence_length_not_divisible_by_cp():
+    t = torch.randn(2, 3, 20, dtype=torch.float32)
+    freqs = torch.randn(3, 1, 5, 8, dtype=torch.float32)
+    cu_seqlens = torch.tensor([0, 5], dtype=torch.int32)
+    config = SimpleNamespace(
+        apply_rope_fusion=True,
+        mrope_section=[2, 3, 3],
+        mrope_interleaved=False,
+        rotary_interleaved=False,
+    )
+
+    with pytest.raises(ValueError, match="divisible by context parallel size"):
+        apply_rotary_pos_emb(t, freqs, config, cu_seqlens, cp_group=FakeCPGroup(size=2))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not is_fused_mrope_available(), reason="Triton fused mRoPE not available")
+def test_thd_raw_mrope_unavailable_reason_rejects_global_sequence_length_not_divisible_by_cp():
+    t = torch.randn(3, 3, 20, dtype=torch.bfloat16, device="cuda")
+    freqs = torch.randn(3, 1, 5, 8, dtype=torch.float32, device="cuda")
+    cu_seqlens = torch.tensor([0, 5], dtype=torch.int32, device="cuda")
+
+    assert "divisible by context parallel size" in get_fused_mrope_thd_unavailable_reason(
+        t, cu_seqlens, freqs, cp_size=2, cp_rank=0
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not is_fused_mrope_available(), reason="Triton fused mRoPE not available")
+@pytest.mark.parametrize("cp_rank", [0, 1])
+def test_thd_raw_mrope_cp_odd_local_sequence_lengths_match_manual_reference(cp_rank):
+    cp_size = 2
+    t_ref, freqs, cu_seqlens, mrope_section = _make_thd_inputs(
+        requires_grad=True, cp_size=cp_size, padded_seq_lens=(10, 14)
+    )
+    t_fused = t_ref.detach().clone().requires_grad_(True)
+    config = _make_mrope_config(t_ref.shape[1], mrope_section)
+    emb = mrope_freqs_to_rotary_emb(freqs, mrope_section, rotary_interleaved=False)
+
+    cu_seqlens_cpu = cu_seqlens.cpu().tolist()
+    _assert_thd_cp_freq_index_coverage(cu_seqlens_cpu, cp_size)
+    packed_freqs = emb[_thd_cp_freq_indices(cu_seqlens_cpu, cp_size, cp_rank)]
+
+    ref = _apply_rotary_pos_emb_bshd(t_ref.unsqueeze(1), packed_freqs).squeeze(1)
+    out = apply_rotary_pos_emb(
+        t_fused, freqs, config, cu_seqlens, cp_group=FakeCPGroup(size=cp_size, rank=cp_rank)
+    )
+
+    tols = _dtype_tols(t_ref.dtype)
+    torch.testing.assert_close(ref.float(), out.float(), **tols)
+
+    grad = torch.randn_like(ref)
+    ref.backward(grad)
+    out.backward(grad)
+    torch.testing.assert_close(t_ref.grad.float(), t_fused.grad.float(), **tols)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not is_fused_mrope_available(), reason="Triton fused mRoPE not available")
+@pytest.mark.parametrize("cp_rank", [0, 1])
+def test_thd_raw_mrope_fallback_supports_odd_local_sequence_lengths(cp_rank):
+    cp_size = 2
+    t, freqs, cu_seqlens, mrope_section = _make_thd_inputs(
+        cp_size=cp_size, padded_seq_lens=(10, 14)
+    )
+    config = _make_mrope_config(t.shape[1], mrope_section)
+    emb = mrope_freqs_to_rotary_emb(freqs, mrope_section, rotary_interleaved=False)
+    cu_seqlens_cpu = cu_seqlens.cpu().tolist()
+    packed_freqs = emb[_thd_cp_freq_indices(cu_seqlens_cpu, cp_size, cp_rank)]
+
+    with pytest.warns(UserWarning, match="mscale=1.25.*Using unfused implementation"):
+        out = apply_rotary_pos_emb(
+            t,
+            freqs,
+            config,
+            cu_seqlens,
+            mscale=1.25,
+            cp_group=FakeCPGroup(size=cp_size, rank=cp_rank),
+        )
+
+    ref = _apply_rotary_pos_emb_bshd(t.unsqueeze(1), packed_freqs, mscale=1.25).squeeze(1)
+    torch.testing.assert_close(ref.float(), out.float(), **_dtype_tols(t.dtype))
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.skipif(not is_fused_mrope_available(), reason="Triton fused mRoPE not available")
 def test_thd_raw_mrope_rejects_batch_dimension_greater_than_one():
@@ -760,11 +992,21 @@ def test_fused_mrope_thd_public_api_matches_unfused():
 
     ref = _apply_rotary_pos_emb_thd(t, cu_seqlens, emb, cp_group=FakeCPGroup())
     assert (
-        get_fused_mrope_thd_unavailable_reason(
-            t, cu_seqlens, freqs, cp_size=1, cp_rank=0
-        )
-        is None
+        get_fused_mrope_thd_unavailable_reason(t, cu_seqlens, freqs, cp_size=1, cp_rank=0) is None
     )
+    out = fused_apply_mrope_thd(t, cu_seqlens, freqs, mrope_section)
+
+    torch.testing.assert_close(ref.float(), out.float(), **_dtype_tols(t.dtype))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not is_fused_mrope_available(), reason="Triton fused mRoPE not available")
+@pytest.mark.parametrize("padded_seq_lens", [(28,), (8, 10, 10)])
+def test_fused_mrope_thd_matches_unfused_for_different_sequence_counts(padded_seq_lens):
+    t, freqs, cu_seqlens, mrope_section = _make_thd_inputs(padded_seq_lens=padded_seq_lens)
+    emb = mrope_freqs_to_rotary_emb(freqs, mrope_section, rotary_interleaved=False)
+
+    ref = _apply_rotary_pos_emb_thd(t, cu_seqlens, emb, cp_group=FakeCPGroup())
     out = fused_apply_mrope_thd(t, cu_seqlens, freqs, mrope_section)
 
     torch.testing.assert_close(ref.float(), out.float(), **_dtype_tols(t.dtype))
@@ -777,12 +1019,10 @@ def test_fused_mrope_thd_fp32_compute_matches_explicit_cast_forward_backward():
     t_fused = t_ref.detach().clone().requires_grad_(True)
     emb = mrope_freqs_to_rotary_emb(freqs, mrope_section, rotary_interleaved=False)
 
-    ref = _apply_rotary_pos_emb_thd(
-        t_ref.float(), cu_seqlens, emb, cp_group=FakeCPGroup()
-    ).to(t_ref.dtype)
-    out = fused_apply_mrope_thd(
-        t_fused, cu_seqlens, freqs, mrope_section, fp32_compute=True
+    ref = _apply_rotary_pos_emb_thd(t_ref.float(), cu_seqlens, emb, cp_group=FakeCPGroup()).to(
+        t_ref.dtype
     )
+    out = fused_apply_mrope_thd(t_fused, cu_seqlens, freqs, mrope_section, fp32_compute=True)
 
     torch.testing.assert_close(ref.float(), out.float(), **_dtype_tols(t_ref.dtype))
 
@@ -810,9 +1050,7 @@ def test_mrope_packed_seq_keeps_global_freqs_with_context_parallel(return_raw_fr
     cp_group = FakeCPGroup2()
     position_ids = _make_position_ids(seq, batch)
     rope = MultimodalRotaryEmbedding(
-        head_dim,
-        rotary_percent=rotary_dim / head_dim,
-        cp_group=cp_group,
+        head_dim, rotary_percent=rotary_dim / head_dim, cp_group=cp_group
     )
 
     unpacked_freqs = rope(
@@ -857,18 +1095,10 @@ def test_raw_mrope_fusion_matches_unfused_with_context_parallel(interleaved_mrop
             cp_group=cp_group,
             interleaved_mrope=interleaved_mrope,
         )
-        raw_freqs = rope(
-            position_ids,
-            mrope_section,
-            cp_group=cp_group,
-            return_raw_freqs=True,
-        )
+        raw_freqs = rope(position_ids, mrope_section, cp_group=cp_group, return_raw_freqs=True)
         materialized_emb = rope(position_ids, mrope_section, cp_group=cp_group)
         raw_freqs_emb = mrope_freqs_to_rotary_emb(
-            raw_freqs,
-            mrope_section,
-            interleaved_mrope=interleaved_mrope,
-            rotary_interleaved=False,
+            raw_freqs, mrope_section, interleaved_mrope=interleaved_mrope, rotary_interleaved=False
         )
         torch.testing.assert_close(raw_freqs_emb, materialized_emb)
 
@@ -913,7 +1143,9 @@ def test_raw_mrope_fusion_matches_unfused_with_context_parallel(interleaved_mrop
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.skipif(not is_fused_mrope_available(), reason="Triton fused mRoPE not available")
-@pytest.mark.skipif(Utils.world_size < 2, reason="THD CP test requires at least 2 distributed ranks")
+@pytest.mark.skipif(
+    Utils.world_size < 2, reason="THD CP test requires at least 2 distributed ranks"
+)
 @pytest.mark.parametrize("interleaved_mrope", [False, True])
 def test_raw_mrope_thd_fusion_matches_unfused_with_context_parallel(interleaved_mrope):
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=2)
@@ -940,11 +1172,7 @@ def test_raw_mrope_thd_fusion_matches_unfused_with_context_parallel(interleaved_
             interleaved_mrope=interleaved_mrope,
         )
         freqs = rope(
-            position_ids,
-            mrope_section,
-            cp_group=cp_group,
-            return_raw_freqs=True,
-            packed_seq=True,
+            position_ids, mrope_section, cp_group=cp_group, return_raw_freqs=True, packed_seq=True
         )
         emb = rope(position_ids, mrope_section, cp_group=cp_group, packed_seq=True)
 

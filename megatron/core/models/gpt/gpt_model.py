@@ -147,6 +147,7 @@ class GPTModel(LanguageModule):
         self.mtp_process = mtp_block_spec is not None and mtp_on_this_rank(
             self.config, ignore_virtual=False, vp_stage=vp_stage
         )
+        self._fused_mrope_available = False
 
         self.fuse_linear_cross_entropy = (
             self.config.cross_entropy_loss_fusion
@@ -209,6 +210,13 @@ class GPTModel(LanguageModule):
             assert (
                 self.mrope_section is not None
             ), "mrope require mrope_section setting, but we got None from TransformerConfig"
+            if self.config.apply_rope_fusion and not self.config.rotary_interleaved:
+                try:
+                    from megatron.core.fusions.fused_mrope import is_fused_mrope_available
+
+                    self._fused_mrope_available = is_fused_mrope_available()
+                except ImportError:
+                    self._fused_mrope_available = False
 
         # Cache for RoPE tensors which do not change between iterations.
         self.rotary_pos_emb_cache = {}
@@ -407,17 +415,14 @@ class GPTModel(LanguageModule):
                 use_raw_mrope_freqs = (
                     self.config.apply_rope_fusion and not self.config.rotary_interleaved
                 )
-                # Dynamic inference indexes rotary_pos_emb as seq-major materialized embeddings.
+                if getattr(self.config, "fused_single_qkv_rope", False):
+                    use_raw_mrope_freqs = False
+                # Inference indexes rotary_pos_emb as seq-major materialized embeddings.
                 # Raw mRoPE freqs are axis-major and are only safe for the normal decoder path.
-                if in_inference_mode and inference_context.is_dynamic_batching():
+                if in_inference_mode:
                     use_raw_mrope_freqs = False
                 if use_raw_mrope_freqs:
-                    try:
-                        from megatron.core.fusions.fused_mrope import is_fused_mrope_available
-
-                        use_fused_mrope = is_fused_mrope_available()
-                    except ImportError:
-                        use_fused_mrope = False
+                    use_fused_mrope = self._fused_mrope_available
                 rotary_pos_emb = self.rotary_pos_emb(
                     position_ids,
                     self.mrope_section,
