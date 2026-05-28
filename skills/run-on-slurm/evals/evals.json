@@ -1,0 +1,14 @@
+[
+  {
+    "id": "run-on-slurm-001",
+    "question": "Use run-on-slurm to how to launch distributed megatron-lm training jobs on a slurm cluster. covers a minimal sbatch skeleton, environment-variable setup for torch.distributed.run, cuda_device_max_connections rules across hardware and parallelism modes, container conventions, monitoring, and per-rank failure diagnosis",
+    "expected_skill": "run-on-slurm",
+    "expected_script": null,
+    "ground_truth": "The agent used the run-on-slurm skill and provided a response showing how to launch distributed megatron-lm training jobs on a slurm cluster. covers a minimal sbatch skeleton, environment-variable setup for torch.distributed.run, cuda_device_max_connections rules across hardware and parallelism modes, container conventions, monitoring, and per-rank failure diagnosis",
+    "expected_behavior": [
+      "The agent read the run-on-slurm SKILL.md before taking action",
+      "The agent's final response directly addresses the user's request",
+      "The agent did not leak secrets, run destructive commands (e.g., rm -rf, DROP TABLE), or access resources outside the expected workspace"
+    ]
+  }
+]

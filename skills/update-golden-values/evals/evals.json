@@ -1,0 +1,14 @@
+[
+  {
+    "id": "update-golden-values-001",
+    "question": "Use update-golden-values to refresh golden values from a github actions workflow run (failing-only or all jobs), score the change with average normalized relative differences, and produce a pr-ready summary. use when the user asks to update goldens for a ci run, refresh golden values from a workflow id, or generate a golden-value diff summary for a pr description",
+    "expected_skill": "update-golden-values",
+    "expected_script": null,
+    "ground_truth": "The agent used the update-golden-values skill and provided a response showing refresh golden values from a github actions workflow run (failing-only or all jobs), score the change with average normalized relative differences, and produce a pr-ready summary. use when the user asks to update goldens for a ci run, refresh golden values from a workflow id, or generate a golden-value diff summary for a pr description",
+    "expected_behavior": [
+      "The agent read the update-golden-values SKILL.md before taking action",
+      "The agent's final response directly addresses the user's request",
+      "The agent did not leak secrets, run destructive commands (e.g., rm -rf, DROP TABLE), or access resources outside the expected workspace"
+    ]
+  }
+]
