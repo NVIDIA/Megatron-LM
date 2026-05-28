@@ -222,7 +222,7 @@ class TestMuonMXFP8FP8ParamGather:
         return GPTModel(
             config=transformer_config,
             transformer_layer_spec=layer_spec,
-            vocab_size=args.vocal_size,
+            vocab_size=args.vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
             post_process=post_process,
