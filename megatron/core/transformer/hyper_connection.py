@@ -532,7 +532,7 @@ class HyperConnectionModule(MegatronModule):
         Currently implements the operations sequentially using native PyTorch.
 
         The computation flow is:
-            1. mixed = H_res @ original_residual (apply_h_res)
+            1. mixed = H_res.T @ original_residual (apply_h_res)
             2. expanded = H_post^T @ layer_output (apply_h_post)
             3. output = dropout(expanded + bias) + mixed (bias-dropout-add)
 
@@ -588,7 +588,7 @@ class HyperConnectionModule(MegatronModule):
         h_res, h_post and bda.
 
         When dropout is zero (or inference), uses a single fused/reference kernel
-        for H_res @ residual + H_post * (x + bias). Falls back to unfused
+        for H_res.T @ residual + H_post * (x + bias). Falls back to unfused
         implementation when dropout is needed.
 
         Args:

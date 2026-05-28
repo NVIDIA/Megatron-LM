@@ -82,7 +82,10 @@ def _ref_h_post_bda(
     h_res: Tensor, orig_res: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
 ) -> Tensor:
     s, b, n, C = orig_res.shape
-    mixed = torch.bmm(h_res.view(s * b, n, n), orig_res.view(s * b, n, C)).view(s, b, n, C)
+    mixed = torch.bmm(
+        h_res.transpose(-1, -2).contiguous().view(s * b, n, n),
+        orig_res.view(s * b, n, C),
+    ).view(s, b, n, C)
     x_exp = h_post.unsqueeze(-1) * x.unsqueeze(2)
     out = x_exp + mixed
     if bias is not None:
