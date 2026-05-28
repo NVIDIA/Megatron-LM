@@ -1061,7 +1061,11 @@ class _HybridEPManager(_DispatchManager):
         self._original_num_tokens = num_tokens
 
         padded_num_tokens = num_tokens
-        if self.config.sequence_packing_scheduler is not None:
+        equalize_thd_token_counts = (
+            self.config.sequence_packing_scheduler is not None
+            or self.config.moe_hybridep_pad_variable_tokens
+        )
+        if equalize_thd_token_counts:
             # Use the actual tp_ep max so all ranks in the MoE communication
             # group pass the same token count to HybridEP.
             max_num_tokens_across_ep = torch.tensor(
@@ -1076,7 +1080,7 @@ class _HybridEPManager(_DispatchManager):
 
         routing_map = routing_map.reshape(num_tokens, self.num_experts)
         probs = probs.reshape(num_tokens, self.num_experts)
-        if self.config.sequence_packing_scheduler is not None and padded_num_tokens > num_tokens:
+        if equalize_thd_token_counts and padded_num_tokens > num_tokens:
             pad_rows = padded_num_tokens - num_tokens
             routing_map = torch.cat(
                 [routing_map, routing_map.new_zeros((pad_rows, self.num_experts))], dim=0
