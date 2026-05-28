@@ -115,10 +115,6 @@ class SharedExpertMLP(MLP):
 
         config.ffn_hidden_size = config.moe_shared_expert_intermediate_size
         # TODO(Hepteract): pass pg_collection to MLP after refactoring MLP
-        if config.experimental_attention_variant == "dsv4_hybrid":
-            # HF DeepSeek-V4 applies swiglu_limit only to routed experts;
-            # shared experts use the plain MLP SwiGLU path.
-            config.activation_func_clamp_value = None
         super().__init__(config=config, submodules=submodules, tp_group=pg_collection.tp)
 
         self.use_shared_expert_gate = gate
