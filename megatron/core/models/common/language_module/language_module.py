@@ -428,6 +428,7 @@ class LanguageModule(MegatronModule):
                 first_stage_word_emb_key,
                 tp_group=self.tp_group,
                 dp_cp_group=metadata['dp_cp_group'],
+                use_dtensor_format=metadata.get("use_dtensor_format", False),
             )
         if self.share_embeddings_and_output_weights:
             self.tie_embeddings_and_output_weights_state_dict(
