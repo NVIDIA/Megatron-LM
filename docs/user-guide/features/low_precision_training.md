@@ -36,14 +36,20 @@ throughput, memory, and stability.
 
 ## Hardware and Recipe Compatibility
 
-| Recipe (`--fp8-recipe` / `--fp4-recipe`) | Format flag | Required architecture | Minimum TE | Typical use |
+| Recipe (`--fp8-recipe` / `--fp4-recipe`) | Format flag | Required architecture | Transformer Engine | Typical use |
 | --- | --- | --- | --- | --- |
-| `delayed` (default) | `--fp8-format {e4m3,hybrid}` | Hopper, Ada, Blackwell | 1.0 | Stable baseline FP8, supports CPU offload |
-| `tensorwise` | `--fp8-format {e4m3,hybrid}` | Hopper, Ada, Blackwell | 1.11 | Current-scaling FP8, no amax history |
-| `mxfp8` | `--fp8-format e4m3` | Blackwell | 2.0 | Block-scaled E4M3, fastest on B200/GB200 |
-| `blockwise` | `--fp8-format {e4m3,hybrid}` | Hopper, Blackwell | 2.0 | 1×128 / 128×128 block scaling (DeepSeek-style) |
-| `nvfp4` | `--fp4-format e2m1` | Blackwell | 2.7.0.dev0 | NVFP4 block-scaling for max throughput / memory |
-| `custom` | `--fp8-format` or `--fp4-format` | n/a | n/a | User-supplied quantizer via `--fp8-quantizer-factory` / `--fp4-quantizer-factory` |
+| `delayed` (default) | `--fp8-format {e4m3,hybrid}` | Hopper, Ada, Blackwell | Broadly available; see TE release notes | Stable baseline FP8, supports CPU offload |
+| `tensorwise` | `--fp8-format {e4m3,hybrid}` | Hopper, Ada, Blackwell | See TE release notes | Current-scaling FP8, no amax history |
+| `mxfp8` | `--fp8-format e4m3` | Blackwell | See TE release notes | Block-scaled E4M3, optimized for B200/GB200 |
+| `blockwise` | `--fp8-format {e4m3,hybrid}` | Hopper, Blackwell | See TE release notes | 1×128 / 128×128 block scaling (DeepSeek-style) |
+| `nvfp4` | `--fp4-format e2m1` | Blackwell | ≥ `2.7.0.dev0` (enforced at startup) | NVFP4 block-scaling for additional memory / bandwidth savings |
+| `custom` | `--fp8-format` or `--fp4-format` | depends on quantizer | depends on quantizer | User-supplied quantizer via `--fp8-quantizer-factory` / `--fp4-quantizer-factory` |
+
+Only the NVFP4 minimum (`Transformer Engine >= 2.7.0.dev0`) is enforced by
+Megatron at startup (see [`arguments.py`](../../../megatron/training/arguments.py)).
+For the other recipes, refer to the
+[Transformer Engine release notes](https://docs.nvidia.com/deeplearning/transformer-engine/release-notes/index.html)
+for the exact version that introduced each recipe on your target hardware.
 
 `--fp8-format` and `--fp4-format` are mutually exclusive; you can only enable
 one of FP8 or FP4 per run.
@@ -126,7 +132,7 @@ offloading.
 When to use:
 
 - Blackwell hardware (B200, GB200).
-- You want the best raw throughput on Blackwell for both dense and MoE models.
+- You want strong throughput on Blackwell for both dense and MoE models.
 
 See [examples/gptoss/02_train.sh](../../../examples/gptoss/02_train.sh) for a
 worked end-to-end example.
