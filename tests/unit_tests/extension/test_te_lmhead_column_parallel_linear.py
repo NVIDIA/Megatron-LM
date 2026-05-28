@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Unit tests for megatron/core/transformer/mxfp8_output_proj.py."""
+"""Unit tests for TELMHeadColumnParallelLinear and is_mxfp8_output_proj_active."""
 
 from types import SimpleNamespace
 
@@ -8,14 +8,11 @@ import pytest
 import torch
 
 from megatron.core import tensor_parallel
-from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.extensions.transformer_engine import HAVE_TE, TELMHeadColumnParallelLinear
+from megatron.core.fp8_utils import is_mxfp8_output_proj_active
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.mxfp8_output_proj import (
-    TELinearCrossEntropyModule,
-    is_te_mxfp8_output_proj_active,
-)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -23,41 +20,41 @@ _IS_BLACKWELL = torch.cuda.is_available() and (torch.cuda.get_device_properties(
 
 
 def _fake_config(*, fp8_output_proj=True, fp8=True, fp8_recipe="mxfp8"):
-    """SimpleNamespace stub of TransformerConfig used by is_te_mxfp8_output_proj_active."""
+    """SimpleNamespace stub of TransformerConfig used by is_mxfp8_output_proj_active."""
     return SimpleNamespace(fp8_output_proj=fp8_output_proj, fp8=fp8, fp8_recipe=fp8_recipe)
 
 
-class TestIsTEMxfp8OutputProjActive:
+class TestIsMxfp8OutputProjActive:
     """Pure-Python tests for the gating helper."""
 
     def test_returns_true_for_complete_mxfp8_config(self):
         if not HAVE_TE:
             pytest.skip("TE not installed; helper always returns False")
-        assert is_te_mxfp8_output_proj_active(_fake_config()) is True
+        assert is_mxfp8_output_proj_active(_fake_config()) is True
 
     def test_returns_false_when_flag_off(self):
-        assert is_te_mxfp8_output_proj_active(_fake_config(fp8_output_proj=False)) is False
+        assert is_mxfp8_output_proj_active(_fake_config(fp8_output_proj=False)) is False
 
     def test_returns_false_when_fp8_off(self):
-        assert is_te_mxfp8_output_proj_active(_fake_config(fp8=False)) is False
+        assert is_mxfp8_output_proj_active(_fake_config(fp8=False)) is False
 
     def test_returns_false_for_non_mxfp8_recipe(self):
-        assert is_te_mxfp8_output_proj_active(_fake_config(fp8_recipe="tensorwise")) is False
-        assert is_te_mxfp8_output_proj_active(_fake_config(fp8_recipe="delayed")) is False
-        assert is_te_mxfp8_output_proj_active(_fake_config(fp8_recipe="blockwise")) is False
+        assert is_mxfp8_output_proj_active(_fake_config(fp8_recipe="tensorwise")) is False
+        assert is_mxfp8_output_proj_active(_fake_config(fp8_recipe="delayed")) is False
+        assert is_mxfp8_output_proj_active(_fake_config(fp8_recipe="blockwise")) is False
 
     def test_accepts_enum_style_recipe(self):
         if not HAVE_TE:
             pytest.skip("TE not installed; helper always returns False")
         enum_like = SimpleNamespace(value="mxfp8")
-        assert is_te_mxfp8_output_proj_active(_fake_config(fp8_recipe=enum_like)) is True
+        assert is_mxfp8_output_proj_active(_fake_config(fp8_recipe=enum_like)) is True
 
     def test_returns_false_when_attributes_missing(self):
-        assert is_te_mxfp8_output_proj_active(SimpleNamespace()) is False
+        assert is_mxfp8_output_proj_active(SimpleNamespace()) is False
 
 
 @pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine not installed")
-class TestTELinearCrossEntropyModuleRejections:
+class TestTELMHeadColumnParallelLinearRejections:
     """Constructor validation checks.
 
     Each invalid kwarg triggers a raise before super().__init__() runs, so these
@@ -73,27 +70,27 @@ class TestTELinearCrossEntropyModuleRejections:
 
     def test_rejects_inactive_config(self):
         with pytest.raises(RuntimeError, match="fp8_output_proj=True"):
-            TELinearCrossEntropyModule(**self._kwargs(config=_fake_config(fp8=False)))
+            TELMHeadColumnParallelLinear(**self._kwargs(config=_fake_config(fp8=False)))
 
     def test_rejects_keep_master_weight_for_test(self):
         with pytest.raises(ValueError, match="keep_master_weight_for_test"):
-            TELinearCrossEntropyModule(**self._kwargs(keep_master_weight_for_test=True))
+            TELMHeadColumnParallelLinear(**self._kwargs(keep_master_weight_for_test=True))
 
     def test_rejects_skip_weight_param_allocation(self):
         with pytest.raises(ValueError, match="skip_weight_param_allocation"):
-            TELinearCrossEntropyModule(**self._kwargs(skip_weight_param_allocation=True))
+            TELMHeadColumnParallelLinear(**self._kwargs(skip_weight_param_allocation=True))
 
     def test_rejects_embedding_activation_buffer(self):
         with pytest.raises(ValueError, match="defer_embedding_wgrad_compute"):
-            TELinearCrossEntropyModule(**self._kwargs(embedding_activation_buffer=[]))
+            TELMHeadColumnParallelLinear(**self._kwargs(embedding_activation_buffer=[]))
 
     def test_rejects_grad_output_buffer(self):
         with pytest.raises(ValueError, match="defer_embedding_wgrad_compute"):
-            TELinearCrossEntropyModule(**self._kwargs(grad_output_buffer=[]))
+            TELMHeadColumnParallelLinear(**self._kwargs(grad_output_buffer=[]))
 
     def test_rejects_disable_grad_reduce(self):
         with pytest.raises(ValueError, match="disable_grad_reduce"):
-            TELinearCrossEntropyModule(**self._kwargs(disable_grad_reduce=True))
+            TELMHeadColumnParallelLinear(**self._kwargs(disable_grad_reduce=True))
 
 
 class TestGPTModelOutputLayerSelection:
@@ -119,14 +116,14 @@ class TestGPTModelOutputLayerSelection:
             max_sequence_length=4,
         )
         assert isinstance(model.output_layer, tensor_parallel.ColumnParallelLinear)
-        assert not isinstance(model.output_layer, TELinearCrossEntropyModule)
+        assert not isinstance(model.output_layer, TELMHeadColumnParallelLinear)
 
     @pytest.mark.internal
     @pytest.mark.skipif(
         not _IS_BLACKWELL, reason="MXFP8 output projection requires Blackwell (SM >= 10)"
     )
     def test_mxfp8_active_uses_te_lm_head(self):
-        """With fp8_output_proj=True under mxfp8, the LM head is TELinearCrossEntropyModule."""
+        """With fp8_output_proj=True under mxfp8, the LM head is TELMHeadColumnParallelLinear."""
         config = TransformerConfig(
             num_layers=2,
             hidden_size=128,
@@ -144,4 +141,4 @@ class TestGPTModelOutputLayerSelection:
             vocab_size=128,
             max_sequence_length=8,
         )
-        assert isinstance(model.output_layer, TELinearCrossEntropyModule)
+        assert isinstance(model.output_layer, TELMHeadColumnParallelLinear)

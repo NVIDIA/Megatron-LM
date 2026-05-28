@@ -9,6 +9,8 @@ from torch import Tensor
 from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.extensions.transformer_engine import TELMHeadColumnParallelLinear
+from megatron.core.fp8_utils import is_mxfp8_output_proj_active
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings import YarnRotaryEmbedding
@@ -31,10 +33,6 @@ from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
     mtp_on_this_rank,
     process_mtp_loss,
-)
-from megatron.core.transformer.mxfp8_output_proj import (
-    TELinearCrossEntropyModule,
-    is_te_mxfp8_output_proj_active,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
@@ -253,8 +251,8 @@ class GPTModel(LanguageModule):
                 self.grad_output_buffer = None
 
             output_layer_cls = (
-                TELinearCrossEntropyModule
-                if is_te_mxfp8_output_proj_active(config)
+                TELMHeadColumnParallelLinear
+                if is_mxfp8_output_proj_active(config)
                 else tensor_parallel.ColumnParallelLinear
             )
             self.output_layer = output_layer_cls(
