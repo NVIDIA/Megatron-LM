@@ -39,8 +39,7 @@ def pad_cu_seqlens_for_cuda_graph(cu_seqlens: Tensor, target_num_seqs: int) -> O
         return cu_seqlens
 
     # Build the padded tensor without a GPU -> CPU sync: copy the real values, then
-    # broadcast-assign the final element into the tail. Both operations stay on
-    # the device that cu_seqlens lives on.
+    # broadcast-assign the final element into the tail.
     out = torch.empty((target_len,), dtype=cu_seqlens.dtype, device=cu_seqlens.device)
     out[:current_len] = cu_seqlens
     out[current_len:] = cu_seqlens[-1]

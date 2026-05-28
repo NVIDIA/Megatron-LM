@@ -120,9 +120,7 @@ _CUDA_GRAPH_SKIPPED = False
 
 
 def is_cuda_graph_skipped():
-    """Query whether CUDA graph dispatch is currently bypassed for the calling step.
-
-    Used by MegatronModule.__call__ to fall through to an eager forward pass when the caller has
+    """Used by MegatronModule.__call__ to fall through to an eager forward pass when the caller has
     wrapped a microbatch in disable_cuda_graphs_this_step. This enables the packed-sequence overflow
     fallback: when a microbatch contains more documents than `cuda_graph_max_packed_seqs`, that step
     bypasses graph replay so cu_seqlens shape mismatches do not crash capture.

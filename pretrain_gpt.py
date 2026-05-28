@@ -219,10 +219,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         update_seqlen_stats_from_cu_seqlens(cu_seqlens)
         cu_seqlens_for_params = cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens # TODO(asolergi-nv): Currently there is a bug forcing cu_seqlens to be cu_seqlens_padded
 
-        # Pad cu_seqlens to a fixed shape for CUDA-graph capture. Required for
-        # cuda_graph_impl="local" because the captured graph's input tensor shapes
-        # must be stable across replays. Falls back to eager forward when the actual
-        # number of documents exceeds the cap.
+        # Pad cu_seqlens to a fixed shape for CUDA-graph capture.
         if config.cuda_graph_impl == "local" and config.cuda_graph_max_packed_seqs > 0:
             max_seqs = config.cuda_graph_max_packed_seqs
             padded_for_params = pad_cu_seqlens_for_cuda_graph(cu_seqlens_for_params, max_seqs)

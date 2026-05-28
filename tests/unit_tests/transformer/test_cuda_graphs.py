@@ -807,11 +807,10 @@ class TestParallelHybridBlockCudagraphs:
 
 
 class TestPadCuSeqlensForCudaGraph:
-    """Unit tests for the pure-Python ``pad_cu_seqlens_for_cuda_graph`` helper.
+    """Unit tests for the `pad_cu_seqlens_for_cuda_graph` helper.
 
-    Verifies the contract used by the packed-sequence cudagraph wire-in: padding
-    repeats the final cumulative value so phantom segments are zero-length, and
-    returns None on overflow so the caller can fall back to eager.
+    Verifies that padding repeats the final cumulative value so phantom segments are zero-length,
+    and returns None on overflow so the caller can fall back to eager.
     """
 
     def test_short_input_pads_with_repeated_last_value(self):
@@ -842,12 +841,11 @@ class TestPadCuSeqlensForCudaGraph:
         assert pad_cu_seqlens_for_cuda_graph(cu_seqlens, target_num_seqs=3) is None
 
     def test_seq_idx_is_correct_under_padding(self):
-        """``PackedSeqParams.__post_init__`` builds ``seq_idx`` from the padded
-        cu_seqlens. Trailing repeated entries describe zero-length phantom segments
-        and contribute nothing. The tokens beyond ``cu_seqlens_padded[-1]`` (up to
-        ``total_tokens``) are accounted as one additional sequence whose index is
-        the position of the appended total-tokens sentinel — which under padding
-        is larger than under the unpadded form."""
+        """PackedSeqParams.__post_init__ builds seq_idx from the padded cu_seqlens.
+        Trailing repeated entries indicate zero-length segments which should not be used in the
+        attention computation. The tokens beyond `cu_seqlens_padded[-1]` (up to `total_tokens`) are
+        accounted as one additional sequence whose index is the position of the appended
+        total-tokens sentinel."""
         from megatron.core.packed_seq_params import PackedSeqParams, pad_cu_seqlens_for_cuda_graph
 
         cu_seqlens = torch.tensor([0, 5, 7, 11], dtype=torch.int32)
@@ -874,13 +872,13 @@ class TestPadCuSeqlensForCudaGraph:
 
 class TestParallelTransformerBlockCudagraphsPackedSeq:
     """End-to-end test of MCore-local cudagraph capture under packed-sequence
-    (THD / variable-length) training. Mirrors ``TestParallelTransformerBlockCudagraphs``
-    but feeds ``packed_seq_params`` and sets ``cuda_graph_max_packed_seqs``.
+    (THD / variable-length) training. Mirrors `TestParallelTransformerBlockCudagraphs`
+    but feeds `packed_seq_params` and sets `cuda_graph_max_packed_seqs`.
 
-    Verifies:
-      * the cudagraph captures with stable cu_seqlens shape (under-cap case);
-      * ``disable_cuda_graphs_this_step`` correctly bypasses capture (overflow case)
-        and still produces a valid forward output.
+    Checks:
+      * the cudagraph captures with stable cu_seqlens shape (under-cap case)
+      * `disable_cuda_graphs_this_step` correctly bypasses capture in the overflow case and still
+    produces a valid forward output.
     """
 
     def setup_method(self, method):
@@ -914,7 +912,7 @@ class TestParallelTransformerBlockCudagraphsPackedSeq:
 
     @staticmethod
     def _make_packed_seq_params(sequence_length, max_packed_seqs):
-        """Build a PackedSeqParams with 4 real docs, padded to ``max_packed_seqs``."""
+        """Build a PackedSeqParams with 4 real documents, padded to `max_packed_seqs`."""
         from megatron.core.packed_seq_params import PackedSeqParams, pad_cu_seqlens_for_cuda_graph
 
         cu_seqlens = torch.tensor([0, 6, 14, 22, sequence_length], dtype=torch.int32, device="cuda")

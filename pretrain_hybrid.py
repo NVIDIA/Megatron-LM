@@ -215,8 +215,7 @@ def forward_step(data_iterator, model: HybridModel):
         cu_seqlens_for_params = cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens
         total_tokens = int(cu_seqlens_for_params[-1].item())
 
-        # Pad cu_seqlens to a fixed shape for CUDA-graph capture. See pretrain_gpt.py
-        # for the rationale; falls back to eager forward when N_docs exceeds the cap.
+        # Pad cu_seqlens to a fixed shape for CUDA-graph capture.
         if config.cuda_graph_impl == "local" and config.cuda_graph_max_packed_seqs > 0:
             max_seqs = config.cuda_graph_max_packed_seqs
             padded_for_params = pad_cu_seqlens_for_cuda_graph(cu_seqlens_for_params, max_seqs)
