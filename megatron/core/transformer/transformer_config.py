@@ -746,6 +746,12 @@ class TransformerConfig(ModelParallelConfig):
     If negative, generates bias once per layer and reuses it (abs value is std).
     This is an experimental feature for benchmarking purposes."""
 
+    use_grouped_gemm_for_dense_mlp: bool = False
+    """Use GroupedLinear(num_groups=1) for dense MLP to trigger the
+    ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8 fusion on SM100+ with MXFP8 recipe.
+    Requires ``use_te_op_fuser=True`` and SwiGLU activation.
+    """
+
     moe_grouped_gemm: bool = False
     """When there are multiple experts per rank, compress multiple local (potentially small) gemms
     in a single kernel launch to improve the utilization and performance by leveraging the Grouped
@@ -2420,11 +2426,6 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.mtp_num_layers is None or self.mtp_num_layers == 1
             ), 'MTP layernum only supports 1 when enabling overlap_moe_expert_parallel_comm.'
-            if self.mtp_num_layers == 1:
-                assert self.pipeline_model_parallel_size > 1, (
-                    'Pipeline model parallel size must be larger than 1 '
-                    'when enabling overlap_moe_expert_parallel_comm with MTP layer.'
-                )
 
             if self.cuda_graph_impl != "none":
                 if self.cuda_graph_impl == "transformer_engine":
