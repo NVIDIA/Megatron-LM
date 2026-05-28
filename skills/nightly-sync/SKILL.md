@@ -28,7 +28,7 @@ conflicts, iterating on CI, and shipping the PR.
 ### Preserving Dev-Only Additions
 
 Do NOT blanket-override all shared files with main's version. Dev has features
-not yet in main (new classes, new modules, new tests). The merge preserves both
+not YET in main (new classes, new modules, new tests). The merge preserves both
 sides' non-conflicting additions — only intervene where there is an actual
 conflict.
 
