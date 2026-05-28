@@ -180,8 +180,10 @@ class TextGenerationController:
         self._async_pending_forward_request_ids = None
         self._dummy_context_h2d_done_event = None
         self._async_step_barrier_reason = None
+        self._async_admission_barrier_requested = False
         self._async_logprob_requests_seen = False
         self._async_discarded_forward_count = 0
+        self._async_add_deferral_count = 0
         self._async_finish_boundary_count = 0
         self._async_mtp_finish_boundary_count = 0
         self._async_pause_boundary_count = 0
@@ -1492,6 +1494,11 @@ class TextGenerationController:
         """Attach the EP async protocol used by coordinator-driven EP decoding."""
         self._ep_async_protocol = protocol
 
+    def request_async_admission_barrier(self) -> None:
+        """Stop chaining async forwards once so waiting requests can be admitted."""
+        self._async_add_deferral_count += 1
+        self._async_admission_barrier_requested = True
+
     def set_async_step_barrier(self, reason: str) -> None:
         """Prevent async launches for the current engine step."""
         assert reason
@@ -1626,10 +1633,6 @@ class TextGenerationController:
             self._async_pending_cuda_graph_request_count = None
             self._async_pending_forward_request_ids = None
             self._async_discarded_forward_count += 1
-
-    def discard_pending_async_forward(self) -> None:
-        """Discard a speculative async forward that cannot be reused safely."""
-        self._discard_pending_async_forward()
 
     def _decide_ep_step_begin(self, *, has_real_work: bool) -> EPStepBeginDecision:
         """Synchronize pending async state at the beginning of an EP work step."""
@@ -1959,6 +1962,10 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
         if active_request_count <= 0:
             return "no active requests"
+        if self._async_admission_barrier_requested:
+            self._async_admission_barrier_requested = False
+            return "waiting request admission deferred"
+
         tokens_per_request = self.num_speculative_tokens + 1
         if (
             context.padded_batch_dimensions.token_count

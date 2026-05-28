@@ -1571,8 +1571,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 if req.kv_cache_epoch is None:
                     req.kv_cache_epoch = [(0, self._generation_epoch)]
 
-    def _discard_pending_async_forward_for_waiting_admission(self) -> bool:
-        """Discard a pending async forward when a waiting request can enter now."""
+    def _defer_waiting_request_admission_for_async(self) -> bool:
+        """Return whether waiting requests must wait for pending async reconciliation."""
         if not self.waiting_request_ids:
             return False
         if not self.controller.has_pending_async_forward():
@@ -1583,7 +1583,7 @@ class DynamicInferenceEngine(AbstractEngine):
         )
         if not (request_can_be_added and request_tokens_can_be_added and kv_cache_available):
             return False
-        self.controller.discard_pending_async_forward()
+        self.controller.request_async_admission_barrier()
         return True
 
     def schedule_non_chunked_prefill(self):
@@ -1785,11 +1785,10 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             raise EngineSuspendedError(self.context.step_count)
 
-        # Preserve ordinary admission timing.  If a speculative decode forward is
-        # pending, it was built for the old active set and cannot include the new
-        # request, so discard it and run a normal step with the admitted request.
-        self._discard_pending_async_forward_for_waiting_admission()
-        self.schedule_waiting_requests()
+        # Do not admit new requests while a speculative decode forward is pending:
+        # the GPU context for that forward was built from the previous active set.
+        if not self._defer_waiting_request_admission_for_async():
+            self.schedule_waiting_requests()
 
         # The print block (async_bookkeep) and metrics block both fire on this
         # condition after step_count is incremented. Predict it up-front so we

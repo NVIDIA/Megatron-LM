@@ -1,6 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from collections import deque
 from types import SimpleNamespace
 
 import pytest
@@ -10,7 +9,6 @@ from megatron.core import utils as core_utils
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
-from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.ep_async_protocol import (
     EPAsyncHandoffDecision,
     EPAsyncPhase,
@@ -454,6 +452,7 @@ def _make_async_gate_controller(active_request_count=2):
     controller.num_speculative_tokens = 0
     controller._num_mtp_depths = 0
     controller._sampling_backend = "torch"
+    controller._async_admission_barrier_requested = False
     context = SimpleNamespace(
         total_request_count=active_request_count,
         paused_request_count=0,
@@ -484,6 +483,7 @@ def _make_async_gate_controller(active_request_count=2):
         ("prefill", "not decode-only"),
         ("eager_step", "not using cuda graph"),
         ("empty", "no active requests"),
+        ("admission_barrier", "waiting request admission deferred"),
         ("stride_mismatch", "cuda graph shape does not match decode stride"),
     ],
 )
@@ -518,49 +518,16 @@ def test_async_scheduling_disabled_reason_matrix(case, expected):
     elif case == "empty":
         context.total_request_count = 0
         context.padded_batch_dimensions = InferenceBatchDimensions(0, 0, 0)
+    elif case == "admission_barrier":
+        controller._async_admission_barrier_requested = True
     elif case == "stride_mismatch":
         controller.num_speculative_tokens = 1
         controller._num_mtp_depths = 1
         allow_mtp = True
 
     assert controller._async_scheduling_disabled_reason(allow_mtp=allow_mtp) == expected
-
-
-@pytest.mark.internal
-@pytest.mark.parametrize(
-    ("waiting_ids", "has_pending", "availability", "expected_discard"),
-    [
-        ([], True, (True, True, True), False),
-        ([7], False, (True, True, True), False),
-        ([7], True, (False, True, True), False),
-        ([7], True, (True, False, True), False),
-        ([7], True, (True, True, False), False),
-        ([7], True, (True, True, True), True),
-    ],
-)
-def test_waiting_request_admission_discards_reusable_async_forward(
-    waiting_ids, has_pending, availability, expected_discard
-):
-    engine = object.__new__(DynamicInferenceEngine)
-    discard_calls = []
-    checked_requests = []
-    request = SimpleNamespace(request_id=7)
-
-    engine.waiting_request_ids = deque(waiting_ids)
-    engine.get_request = lambda request_id: request
-    engine.context = SimpleNamespace(
-        check_availability=lambda req: checked_requests.append(req) or availability
-    )
-    engine.controller = SimpleNamespace(
-        has_pending_async_forward=lambda: has_pending,
-        discard_pending_async_forward=lambda: discard_calls.append("discard"),
-    )
-
-    discarded = engine._discard_pending_async_forward_for_waiting_admission()
-
-    assert discarded is expected_discard
-    assert discard_calls == (["discard"] if expected_discard else [])
-    assert checked_requests == ([request] if waiting_ids and has_pending else [])
+    if case == "admission_barrier":
+        assert not controller._async_admission_barrier_requested
 
 
 @pytest.mark.internal
