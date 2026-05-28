@@ -411,8 +411,8 @@ class MoELayerConfig(LayerConfig):
     router_score_function: str = "softmax"
     """``"softmax"`` or ``"sigmoid"``."""
 
-    router_load_balancing_type: str = "aux_loss"
-    """``"aux_loss"`` / ``"seq_aux_loss"`` / ``"global_aux_loss"`` / ``"sinkhorn"`` / ``"none"``."""
+    router_load_balancing_type: str | list[str] = "aux_loss"
+    """Load balancing type or ordered list of types for multi-loss MoE routing."""
 
     router_topk_scaling_factor: float | None = None
     """Optional scaling factor applied to top-k logits."""
@@ -423,8 +423,8 @@ class MoELayerConfig(LayerConfig):
     router_dtype: str | None = None
     """Router compute dtype name; ``None`` → input dtype."""
 
-    aux_loss_coeff: float = 0.0
-    """Auxiliary load-balancing loss coefficient (``moe_aux_loss_coeff``)."""
+    aux_loss_coeff: float | list[float] = 0.0
+    """Auxiliary load-balancing loss coefficient or per-loss coefficient list."""
 
     shared_expert_intermediate_size: int | None = None
     """If set, enables shared experts at this size."""

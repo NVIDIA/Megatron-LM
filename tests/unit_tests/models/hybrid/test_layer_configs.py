@@ -217,6 +217,19 @@ class TestLayerConfigToTransformerConfig:
         assert tc.num_moe_experts == 8
         assert tc.moe_router_topk == 2
 
+    def test_moe_layer_config_accepts_multi_loss_router_fields(self):
+        common = _make_common()
+        layer = MoELayerConfig(
+            common_config=common,
+            num_experts=8,
+            top_k=2,
+            router_load_balancing_type=["aux_loss", "seq_aux_loss"],
+            aux_loss_coeff=[0.1, 0.2],
+        )
+        tc = layer.to_transformer_config(num_layers=4)
+        assert tc.moe_router_load_balancing_type == ["aux_loss", "seq_aux_loss"]
+        assert tc.moe_aux_loss_coeff == [0.1, 0.2]
+
     def test_none_layer_field_does_not_clobber_common_ffn_hidden_size(self):
         common = _make_common(ffn_hidden_size=3072)
         layer = MLPLayerConfig(common_config=common)
