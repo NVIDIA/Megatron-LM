@@ -711,7 +711,18 @@ jobs:
           container-image: ${{ env.container-registry }}/megatron-lm:${{ needs.configure.outputs.sha }}
           sha: ${{ needs.configure.outputs.sha }}
 
-  cicd-parse-integration-tests-h100:
+  # Single source of truth for "should integration tests run?".
+  # Encodes two independent gates:
+  #   (A) Approval gate — `cicd-wait-in-queue` must have succeeded
+  #       (PR-push env approval), OR we're in a regime where it skips by
+  #       design: merge_group, ci_workload (schedule / workflow_dispatch),
+  #       or an explicit force_run_all override.
+  #   (B) Unit-test gate — unit tests must have succeeded on PR push and
+  #       merge_group; scheduled / force-run workflows bypass this for
+  #       full nightly coverage.
+  # Downstream integration jobs consume `outputs.should_run` instead of
+  # duplicating this logic four times.
+  cicd-integration-gate:
     runs-on: ubuntu-latest
     needs:
       - pre-flight
@@ -725,13 +736,53 @@ jobs:
       && needs.cicd-wait-in-queue.result != 'cancelled'
       && needs.cicd-container-build.result != 'cancelled'
       && needs.cicd-unit-tests-latest.result != 'cancelled'
-      && (
-        success()
-        || needs.pre-flight.outputs.is_ci_workload == 'true'
-        || needs.pre-flight.outputs.force_run_all == 'true'
-        || (needs.pre-flight.outputs.is_merge_group == 'true' && !failure())
-      )
       && !cancelled()
+    outputs:
+      should_run: ${{ steps.gate.outputs.should_run }}
+    steps:
+      - id: gate
+        env:
+          WAIT_RESULT: ${{ needs.cicd-wait-in-queue.result }}
+          UNIT_RESULT: ${{ needs.cicd-unit-tests-latest.result }}
+          IS_MERGE_GROUP: ${{ needs.pre-flight.outputs.is_merge_group }}
+          IS_CI_WORKLOAD: ${{ needs.pre-flight.outputs.is_ci_workload }}
+          FORCE_RUN_ALL: ${{ needs.pre-flight.outputs.force_run_all }}
+        shell: bash
+        run: |
+          # (A) Approval gate
+          approval=false
+          if [ "$WAIT_RESULT" = "success" ] \
+             || [ "$IS_MERGE_GROUP" = "true" ] \
+             || [ "$IS_CI_WORKLOAD" = "true" ] \
+             || [ "$FORCE_RUN_ALL" = "true" ]; then
+            approval=true
+          fi
+          # (B) Unit-test gate
+          unit=false
+          if [ "$UNIT_RESULT" = "success" ] \
+             || [ "$IS_CI_WORKLOAD" = "true" ] \
+             || [ "$FORCE_RUN_ALL" = "true" ]; then
+            unit=true
+          fi
+          if [ "$approval" = "true" ] && [ "$unit" = "true" ]; then
+            should_run=true
+          else
+            should_run=false
+          fi
+          echo "should_run=$should_run" >> "$GITHUB_OUTPUT"
+          echo "approval=$approval unit=$unit -> should_run=$should_run"
+          echo "  (wait-in-queue=$WAIT_RESULT, unit-tests=$UNIT_RESULT,"
+          echo "   is_merge_group=$IS_MERGE_GROUP, is_ci_workload=$IS_CI_WORKLOAD,"
+          echo "   force_run_all=$FORCE_RUN_ALL)"
+
+  cicd-parse-integration-tests-h100:
+    runs-on: ubuntu-latest
+    needs:
+      - configure
+      - cicd-integration-gate
+    if: |
+      !cancelled()
+      && needs.cicd-integration-gate.outputs.should_run == 'true'
     outputs:
       integration-tests-h100: ${{ steps.main.outputs.integration-tests-h100 }}
     steps:
@@ -784,11 +835,9 @@ jobs:
         include: ${{ fromJson(needs.cicd-parse-integration-tests-h100.outputs.integration-tests-h100) }}
     needs:
       - is-not-external-contributor
-      - pre-flight
       - configure
-      - cicd-wait-in-queue
+      - cicd-integration-gate
       - cicd-parse-integration-tests-h100
-      - cicd-unit-tests-latest
     runs-on: ${{ needs.is-not-external-contributor.outputs.selected_runner }}
     name: "${{ matrix.model }}/${{ matrix.test_case }} - latest"
     env:
@@ -796,19 +845,9 @@ jobs:
       PIP_NO_PYTHON_VERSION_WARNING: 1
       PIP_ROOT_USER_ACTION: ignore
     if: |
-      needs.is-not-external-contributor.result != 'cancelled'
-      && needs.pre-flight.result != 'cancelled'
-      && needs.configure.result != 'cancelled'
-      && needs.cicd-wait-in-queue.result != 'cancelled'
-      && needs.cicd-parse-integration-tests-h100.result != 'cancelled'
-      && needs.cicd-unit-tests-latest.result != 'cancelled'
-      && (
-        success()
-        || needs.pre-flight.outputs.is_ci_workload == 'true'
-        || needs.pre-flight.outputs.force_run_all == 'true'
-        || (needs.pre-flight.outputs.is_merge_group == 'true' && !failure())
-      )
-      && !cancelled()
+      !cancelled()
+      && needs.cicd-integration-gate.outputs.should_run == 'true'
+      && needs.cicd-parse-integration-tests-h100.result == 'success'
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -834,26 +873,13 @@ jobs:
     runs-on: ubuntu-latest
     needs:
       - is-not-external-contributor
-      - pre-flight
       - configure
-      - cicd-wait-in-queue
-      - cicd-container-build
-      - cicd-unit-tests-latest
+      - cicd-integration-gate
     if: |
-      needs.is-not-external-contributor.outputs.is_maintainer == 'true'
+      !cancelled()
+      && needs.cicd-integration-gate.outputs.should_run == 'true'
+      && needs.is-not-external-contributor.outputs.is_maintainer == 'true'
       && vars.ENABLE_GB200_TESTING == 'true'
-      && needs.pre-flight.result != 'cancelled'
-      && needs.configure.result != 'cancelled'
-      && needs.cicd-wait-in-queue.result != 'cancelled'
-      && needs.cicd-container-build.result != 'cancelled'
-      && needs.cicd-unit-tests-latest.result != 'cancelled'
-      && (
-        success()
-        || needs.pre-flight.outputs.is_ci_workload == 'true'
-        || needs.pre-flight.outputs.force_run_all == 'true'
-        || (needs.pre-flight.outputs.is_merge_group == 'true' && !failure())
-      )
-      && !cancelled()
     outputs:
       integration-tests-gb200: ${{ steps.main.outputs.integration-tests-gb200 }}
     steps:
@@ -906,11 +932,9 @@ jobs:
         include: ${{ fromJson(needs.cicd-parse-integration-tests-gb200.outputs.integration-tests-gb200) }}
     needs:
       - is-not-external-contributor
-      - pre-flight
       - configure
-      - cicd-wait-in-queue
+      - cicd-integration-gate
       - cicd-parse-integration-tests-gb200
-      - cicd-unit-tests-latest
     runs-on: ${{ needs.is-not-external-contributor.outputs.selected_runner_gb200 }}
     name: "${{ matrix.model }}/${{ matrix.test_case }} - latest"
     env:
@@ -918,21 +942,11 @@ jobs:
       PIP_NO_PYTHON_VERSION_WARNING: 1
       PIP_ROOT_USER_ACTION: ignore
     if: |
-      needs.is-not-external-contributor.outputs.is_maintainer == 'true'
+      !cancelled()
+      && needs.cicd-integration-gate.outputs.should_run == 'true'
+      && needs.cicd-parse-integration-tests-gb200.result == 'success'
+      && needs.is-not-external-contributor.outputs.is_maintainer == 'true'
       && vars.ENABLE_GB200_TESTING == 'true'
-      && needs.is-not-external-contributor.result != 'cancelled'
-      && needs.pre-flight.result != 'cancelled'
-      && needs.configure.result != 'cancelled'
-      && needs.cicd-wait-in-queue.result != 'cancelled'
-      && needs.cicd-parse-integration-tests-gb200.result != 'cancelled'
-      && needs.cicd-unit-tests-latest.result != 'cancelled'
-      && (
-        success()
-        || needs.pre-flight.outputs.is_ci_workload == 'true'
-        || needs.pre-flight.outputs.force_run_all == 'true'
-        || (needs.pre-flight.outputs.is_merge_group == 'true' && !failure())
-      )
-      && !cancelled()
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -987,6 +1001,8 @@ jobs:
           DOCS_ONLY: ${{ needs.pre-flight.outputs.docs_only }}
           IS_DEPLOYMENT: ${{ needs.pre-flight.outputs.is_deployment_workflow }}
           IS_MAINTAINER: ${{ needs.is-not-external-contributor.outputs.is_maintainer }}
+          IS_CI_WORKLOAD: ${{ needs.pre-flight.outputs.is_ci_workload }}
+          FORCE_RUN_ALL: ${{ needs.pre-flight.outputs.force_run_all }}
           ENABLE_GB200_TESTING: ${{ vars.ENABLE_GB200_TESTING }}
           UNIT_RESULT: ${{ needs.cicd-unit-tests-latest.result }}
           H100_RESULT: ${{ needs.cicd-integration-tests-latest-h100.result }}
@@ -1000,14 +1016,26 @@ jobs:
 
           FAILED=false
 
-          # Unit tests must always succeed (never skipped or cancelled)
+          # Unit tests are required on PR-push and merge_group, but scheduled
+          # / force-run workflows still want integration to run (and be
+          # judged) even when unit tests failed — for full nightly coverage.
+          FORCE_INTEGRATION=false
+          if [ "$IS_CI_WORKLOAD" == "true" ] || [ "$FORCE_RUN_ALL" == "true" ]; then
+            FORCE_INTEGRATION=true
+          fi
+
           if [ "$UNIT_RESULT" != "success" ]; then
             echo "❌ cicd-unit-tests-latest: $UNIT_RESULT"
             FAILED=true
+            # On PR-push / merge_group, integration was skipped by design —
+            # don't double-fail on H100/GB200 below.
+            if [ "$FORCE_INTEGRATION" != "true" ]; then
+              H100_RESULT=skipped-by-unit-failure
+              GB200_RESULT=skipped-by-unit-failure
+            fi
           fi
 
-          # H100 integration tests must always succeed
-          if [ "$H100_RESULT" != "success" ]; then
+          if [ "$H100_RESULT" != "success" ] && [ "$H100_RESULT" != "skipped-by-unit-failure" ]; then
             echo "❌ cicd-integration-tests-latest-h100: $H100_RESULT"
             FAILED=true
           fi
