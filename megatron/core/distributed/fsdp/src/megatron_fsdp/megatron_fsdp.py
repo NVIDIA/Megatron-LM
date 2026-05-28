@@ -18,7 +18,7 @@ import logging
 from contextlib import contextmanager
 from enum import Enum, auto
 from functools import partial
-from typing import Any, Dict, List, Optional, Tuple, Type
+from typing import Any, Dict, List, Literal, Optional, Tuple, Type
 
 import torch
 import torch.nn as nn
@@ -563,14 +563,14 @@ class MegatronFSDP(torch.nn.Module):
         fsdp_unit_modules = self.fsdp_unit_modules
 
         def _param_list_for_submodule_unshard(
-            module: nn.Module, *, for_backward: bool
+            module: nn.Module, pass_direction: Literal["forward", "backward"]
         ) -> List[nn.Parameter]:
             """Build the parameter list for fine-grained or FSDP-unit unshard hooks."""
             if isinstance(module, tuple(fsdp_unit_modules)):
                 return list(module.parameters())
             fine_grained_enabled = (
                 self.enable_fine_grained_param_gather_backward_hook
-                if for_backward
+                if pass_direction == "backward"
                 else self.enable_fine_grained_param_gather_hook
             )
             if (
@@ -775,7 +775,7 @@ class MegatronFSDP(torch.nn.Module):
             else:
                 module._training_state = TrainingState.FORWARD
 
-            param_list = _param_list_for_submodule_unshard(module, for_backward=False)
+            param_list = _param_list_for_submodule_unshard(module, "forward")
 
             # All-gather the parameters before the forward pass.
             self.all_gather_and_wait_parameters_ready(
@@ -891,7 +891,7 @@ class MegatronFSDP(torch.nn.Module):
             for sub_module in module.modules():
                 sub_module._training_state = TrainingState.PRE_BACKWARD
 
-            param_list = _param_list_for_submodule_unshard(module, for_backward=True)
+            param_list = _param_list_for_submodule_unshard(module, "backward")
 
             # All-gather / unshard the module parameters before the backward pass.
             self.all_gather_and_wait_parameters_ready(
