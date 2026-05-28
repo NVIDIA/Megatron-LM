@@ -1469,6 +1469,8 @@ class TextGenerationController:
         # last-token positions. Row-mapped reuse remaps those gather indices.
         if context.config.materialize_only_last_token_logits:
             gather_indices = row_indices
+        elif row_indices is not None and context.is_decode_only():
+            gather_indices = row_indices
         else:
             gather_indices = context.gpu_view.active_request_last_token_idxs
             if row_indices is not None:
@@ -1750,6 +1752,12 @@ class TextGenerationController:
         """Return the per-active-request logits consumed by sampling."""
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
+        if (
+            row_indices is not None
+            and not context.config.materialize_only_last_token_logits
+            and context.is_decode_only()
+        ):
+            return self._all_logits_cuda.squeeze(0).index_select(0, row_indices)
         if context.config.materialize_only_last_token_logits:
             required_token_logits = self._all_logits_cuda.squeeze(0)
             if row_indices is None:
@@ -2099,20 +2107,25 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
         # This code cannot be reached when we are using speculative decode.
         assert self.num_speculative_tokens == 0
-        logits_seq_len = (
-            active_request_count
-            if context.config.materialize_only_last_token_logits
-            else context.padded_active_token_count
-        )
-        logits = self._all_logits_cuda[:, :logits_seq_len, :]
-        if row_indices is not None:
-            assert context.config.materialize_only_last_token_logits
-            logits = logits.index_select(1, row_indices)
+        if row_indices is not None and not context.config.materialize_only_last_token_logits:
+            assert context.is_decode_only()
+            logits = self._all_logits_cuda.index_select(1, row_indices)
+            only_last_token_logits = True
+        else:
+            logits_seq_len = (
+                active_request_count
+                if context.config.materialize_only_last_token_logits
+                else context.padded_active_token_count
+            )
+            logits = self._all_logits_cuda[:, :logits_seq_len, :]
+            only_last_token_logits = context.config.materialize_only_last_token_logits
+            if row_indices is not None:
+                logits = logits.index_select(1, row_indices)
 
         return context.calculate_log_probs(
             logits,
             self._sampled_tokens_cuda[:active_request_count],
-            only_last_token_logits=context.config.materialize_only_last_token_logits,
+            only_last_token_logits=only_last_token_logits,
         )
 
     def _dynamic_step_calculate_log_probs_speculative(
@@ -2773,6 +2786,16 @@ class TextGenerationController:
                 pending_forward_row_mapped = (
                     pending_forward_row_mapped or ep_step_begin_decision.row_mapped_forward
                 )
+                if (
+                    pending_forward_reused
+                    and pending_forward_row_mapped
+                    and not context.config.materialize_only_last_token_logits
+                    and not context.is_decode_only()
+                ):
+                    pending_forward_reused = False
+                    pending_forward_row_indices = None
+                    pending_forward_row_mapped = False
+                    self._async_discarded_forward_count += 1
                 context.release_deferred_async_kv_blocks()
                 if pending_forward_reused and self.num_speculative_tokens > 0:
                     input_ids, _ = context.current_input_and_position_ids()

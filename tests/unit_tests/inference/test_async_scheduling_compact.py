@@ -1130,6 +1130,68 @@ def test_row_mapped_mtp_sampling_uses_pending_forward_logits(materialize_only_la
 
 
 @pytest.mark.internal
+def test_row_mapped_full_logits_sampling_uses_pending_decode_rows():
+    controller = object.__new__(TextGenerationController)
+    source_logits = torch.arange(4 * 5, dtype=torch.float32).view(1, 4, 5)
+
+    def _fail_last_token_logits(_logits):
+        pytest.fail("row-mapped decode reuse should gather pending rows before last_token_logits")
+
+    context = SimpleNamespace(
+        total_request_count=2,
+        paused_request_count=0,
+        padded_active_token_count=4,
+        config=SimpleNamespace(materialize_only_last_token_logits=False),
+        is_decode_only=lambda: True,
+        last_token_logits=_fail_last_token_logits,
+    )
+    controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
+    controller._all_logits_cuda = source_logits
+
+    result = controller._dynamic_step_required_token_logits(row_indices=torch.tensor([2, 0]))
+
+    assert torch.equal(result, source_logits.squeeze(0).index_select(0, torch.tensor([2, 0])))
+
+
+@pytest.mark.internal
+def test_row_mapped_full_logits_logprobs_use_gathered_decode_rows_as_last_logits():
+    controller = object.__new__(TextGenerationController)
+    source_logits = torch.arange(4 * 5, dtype=torch.float32).view(1, 4, 5)
+    sampled_tokens = torch.tensor([4, 1], dtype=torch.long)
+    captures = {}
+
+    def _calculate_log_probs(logits, new_tokens, only_last_token_logits=False):
+        captures["logits"] = logits.detach().clone()
+        captures["new_tokens"] = new_tokens.detach().clone()
+        captures["only_last_token_logits"] = only_last_token_logits
+        return [[-1.0], [-2.0]], logits.squeeze(0)
+
+    context = SimpleNamespace(
+        total_request_count=2,
+        paused_request_count=0,
+        padded_active_token_count=2,
+        config=SimpleNamespace(materialize_only_last_token_logits=False),
+        is_decode_only=lambda: True,
+        calculate_log_probs=_calculate_log_probs,
+    )
+    controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
+    controller._all_logits_cuda = source_logits
+    controller._sampled_tokens_cuda = sampled_tokens
+    controller.num_speculative_tokens = 0
+
+    log_probs, log_probs_tensor = controller._dynamic_step_calculate_log_probs(
+        row_indices=torch.tensor([3, 1])
+    )
+
+    expected_logits = source_logits.index_select(1, torch.tensor([3, 1]))
+    assert log_probs == [[-1.0], [-2.0]]
+    assert torch.equal(log_probs_tensor, expected_logits.squeeze(0))
+    assert torch.equal(captures["logits"], expected_logits)
+    assert torch.equal(captures["new_tokens"], sampled_tokens)
+    assert captures["only_last_token_logits"]
+
+
+@pytest.mark.internal
 def test_inference_config_async_scheduling_flags_are_opt_in():
     default_config = InferenceConfig()
     enabled_config = InferenceConfig(enable_async_scheduling=True, logging_step_interval=0)
