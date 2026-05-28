@@ -59,7 +59,6 @@ def _skip_mxfp8_in_copy_main_to_model(inner_opt: 'Float16OptimizerWithFloat16Par
     to ``param_buffer`` via :func:`modify_underlying_storage` and the inner
     copy lands the update in the right place.
     """
-    original_get_pairs = inner_opt._get_model_and_main_params_data_float16
     # Local import to avoid hoisting the helper to a wider scope.
     from ..fp8_utils import is_mxfp8tensor
     from .optimizer import _multi_tensor_copy_this_to_that
@@ -882,30 +881,52 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             quantizer.set_usage(rowwise=True, columnwise=True)
 
     def start_param_sync_for_bucket_group_subset(self) -> None:
-        """Trigger ``start_param_sync`` on LayerWise-managed bucket groups only.
+        """Trigger ``start_param_sync`` only on LayerWise-managed buckets.
 
         Walks each model chunk's dense + expert-parallel bucket groups and
-        skips any group not managed by LayerWise, so a sibling
-        :class:`DistributedOptimizer`'s own ``start_param_sync`` call does not
-        double-sync the same buckets. Uses
-        :meth:`DistributedDataParallel._start_bucket_group_param_sync` so FP8
-        post-all-gather processing (and MXFP8 copy) still runs.
+        filters **per-bucket** so a sibling :class:`DistributedOptimizer`'s own
+        ``start_param_sync`` call does not double-sync any bucket. Mixed
+        bucket groups can occur in ``partition_buckets`` Case 3 (FP8 present,
+        ``reduce_scatter_with_fp32_accumulation=False``), which appends
+        non-FP8 DistOpt-managed bf16 buckets (biases, layernorms) into the
+        last FP8 bucket group; checking only ``buckets[0]`` and dispatching
+        AG on the whole group would AG those DistOpt-managed bf16 buckets a
+        second time. Mirrors the per-bucket filter applied to
+        :meth:`DistributedOptimizer.start_param_sync_for_bucket_group_subset`.
+        Uses :meth:`DistributedDataParallel._start_bucket_group_param_sync`
+        so FP8 post-all-gather processing (and MXFP8 copy) still runs.
 
-        Before dispatching each LayerWise-managed bucket group's AG, force the
-        bucket's MXFP8 param quantizers to ``rowwise=True, columnwise=True``
-        so the post-AG ``param.data.copy_(bf16)`` refreshes both orientations
-        (see :py:meth:`_ensure_mxfp8_quantizer_dual_usage`).
+        Before dispatching each LayerWise-managed bucket group's AG, force
+        the bucket's MXFP8 param quantizers to ``rowwise=True,
+        columnwise=True`` so the post-AG ``param.data.copy_(bf16)`` refreshes
+        both orientations (see
+        :py:meth:`_ensure_mxfp8_quantizer_dual_usage`).
         """
         for model_chunk in self.model_chunks:
             for bucket_group in (
                 model_chunk.bucket_groups + model_chunk.expert_parallel_bucket_groups
             ):
-                if bucket_group.buckets and _bucket_is_managed_by_layer_wise_optimizer(
-                    bucket_group.buckets[0]
-                ):
-                    for bucket in bucket_group.buckets:
-                        self._ensure_mxfp8_quantizer_dual_usage(bucket)
+                if not bucket_group.buckets:
+                    continue
+                lw_buckets = [
+                    bucket
+                    for bucket in bucket_group.buckets
+                    if _bucket_is_managed_by_layer_wise_optimizer(bucket)
+                ]
+                if not lw_buckets:
+                    continue
+                for bucket in lw_buckets:
+                    self._ensure_mxfp8_quantizer_dual_usage(bucket)
+                if len(lw_buckets) == len(bucket_group.buckets):
                     model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=False)
+                else:
+                    lw_bucket_group = type(bucket_group)(
+                        lw_buckets,
+                        bucket_group.ddp_config,
+                        bucket_group.intra_distributed_optimizer_instance_group,
+                        bucket_group.intra_distributed_optimizer_instance_size,
+                    )
+                    model_chunk._start_bucket_group_param_sync(lw_bucket_group, force_sync=False)
 
     @torch.no_grad()
     def _write_owned_mxfp8_masters_to_param_buffer(self) -> None:
