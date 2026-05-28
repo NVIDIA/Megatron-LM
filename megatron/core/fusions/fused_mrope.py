@@ -109,10 +109,6 @@ def _validate_mrope_thd_inputs(
     assert freq_batch == 1, (
         "raw mRoPE THD freqs must have singleton batch dimension, " f"got {freqs.shape}"
     )
-    assert cp_size == 1 or freq_seq % cp_size == 0, (
-        "raw mRoPE THD freqs sequence length must be divisible by context parallel size, "
-        f"got freqs.shape[2]={freq_seq}, cp_size={cp_size}"
-    )
     assert freq_seq == tokens * cp_size, (
         "raw mRoPE THD freqs sequence length must match local tokens times cp_size, "
         f"got freqs.shape[2]={freq_seq}, tokens={tokens}, cp_size={cp_size}"
@@ -220,6 +216,15 @@ def get_fused_mrope_thd_unavailable_reason(
             "raw mRoPE THD freqs sequence length must be divisible by context parallel size, "
             f"got freqs.shape[2]={freqs.shape[2]}, cp_size={cp_size}"
         )
+    # Per-sequence divisibility is validated at the THD packing boundary by
+    # rope_utils._get_thd_cp_splits(). Keep this reminder here because a future
+    # direct fused-kernel path would need the same check before launch, but doing
+    # it here would require a cu_seqlens GPU->CPU sync on the hot availability path:
+    #
+    # cu_seqlens_list = cu_seqlens.tolist()
+    # for seq_start, seq_end in zip(cu_seqlens_list[:-1], cu_seqlens_list[1:]):
+    #     if cp_size > 1 and (seq_end - seq_start) % cp_size != 0:
+    #         return "THD sequence lengths must be divisible by context parallel size"
     if freqs.shape[2] != t.shape[0] * cp_size:
         return (
             "raw mRoPE THD freqs sequence length must match local tokens times cp_size, "

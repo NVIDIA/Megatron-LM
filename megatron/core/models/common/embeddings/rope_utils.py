@@ -434,11 +434,11 @@ def _apply_rotary_pos_emb_thd(
     cu_seqlens_list, seqlens = _get_thd_cp_splits(cu_seqlens, cp_size)
 
     # Handle two different frequency tensor formats:
-    # 1. If freqs.size(0) == cu_seqlens[-1]: freqs contains all positions across all sequences
+    # 1. If freqs.size(0) == cu_seqlens_list[-1]: freqs contains all positions across all sequences
     #    -> Use offset-based mapping for exact positional correspondence
     # 2. Otherwise: freqs contains only max sequence length positions
     #    -> Use traditional mapping without offsets (map first :seqlen part)
-    if freqs.dim() >= 1 and freqs.size(0) == cu_seqlens[-1]:
+    if freqs.dim() >= 1 and freqs.size(0) == cu_seqlens_list[-1]:
         # CASE 1: Exact mapping with offsets
         # Build packed freqs in one pass, then apply once to the whole packed tensor
         sequence_splits = torch.split(t, seqlens)

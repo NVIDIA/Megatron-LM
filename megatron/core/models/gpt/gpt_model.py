@@ -415,7 +415,7 @@ class GPTModel(LanguageModule):
                 use_raw_mrope_freqs = (
                     self.config.apply_rope_fusion and not self.config.rotary_interleaved
                 )
-                if getattr(self.config, "fused_single_qkv_rope", False):
+                if self.config.fused_single_qkv_rope:
                     use_raw_mrope_freqs = False
                 # Inference indexes rotary_pos_emb as seq-major materialized embeddings.
                 # Raw mRoPE freqs are axis-major and are only safe for the normal decoder path.
