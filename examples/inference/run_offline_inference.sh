@@ -19,8 +19,6 @@
 #     bash run_offline_inference.sh --hf-token hf_xxx --checkpoint /path/to/ckpt
 #   sync + coordinator:
 #     bash run_offline_inference.sh --hf-token hf_xxx --checkpoint /path/to/ckpt --use-coordinator
-#   async + direct:
-#     bash run_offline_inference.sh --hf-token hf_xxx --checkpoint /path/to/ckpt --mode async
 #   async + coordinator:
 #     bash run_offline_inference.sh --hf-token hf_xxx --checkpoint /path/to/ckpt --mode async --use-coordinator
 

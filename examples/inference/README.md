@@ -19,7 +19,7 @@ the API surface and mental model see
 The two top-level Python entrypoints cover all common workflows:
 
 - **`offline_inference.py`** — batched offline generation. Supports the
-  4 mode combinations (sync/async × direct/coordinator) via CLI flags.
+  3 mode combinations (sync+direct, sync+coordinator, async+coordinator) via CLI flags.
   Replaces the `gpt_dynamic_inference.py` and
   `gpt_dynamic_inference_with_coordinator.py` paths.
 - **`launch_inference_server.py`** — OpenAI-compatible HTTP server using
@@ -40,7 +40,7 @@ throughput summary. Optional JSON dump for regression testing via
 The shell wrapper `run_offline_inference.sh` packages the typical Qwen
 2.5-1.5B configuration. Required CLI args: `--hf-token`, `--checkpoint`.
 Optional: `--mode sync|async` (default `sync`), `--use-coordinator` (default
-off, i.e. direct mode), `--nproc <n>` (default `8`).
+off, i.e. direct mode), `--nproc <n>` (default `8`). Currently async + direct is not supported.
 
 ```bash
 # sync + direct (defaults)
@@ -50,10 +50,6 @@ bash examples/inference/run_offline_inference.sh \
 # sync + coordinator
 bash examples/inference/run_offline_inference.sh \
     --hf-token <HF_TOKEN> --checkpoint /path/to/qwen-1.5b --use-coordinator
-
-# async + direct
-bash examples/inference/run_offline_inference.sh \
-    --hf-token <HF_TOKEN> --checkpoint /path/to/qwen-1.5b --mode async
 
 # async + coordinator
 bash examples/inference/run_offline_inference.sh \
