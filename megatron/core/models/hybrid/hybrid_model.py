@@ -481,7 +481,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         # assert attention_mask is None, "The attention mask is ignored and should be set to None"
 
         # Run decoder.
-        hidden_states = self.decoder(
+        decoder_output = self.decoder(
             hidden_states=decoder_input,
             attention_mask=attention_mask,
             inference_context=inference_context,
@@ -489,6 +489,13 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             packed_seq_params=packed_seq_params,
             padding_mask=padding_mask,
         )
+        # When mHC + MTP, the decoder returns (contracted, pre-contract multi-stream).
+        # MTP's mHC branch needs the multi-stream tensor for `_concat_embeddings`.
+        if isinstance(decoder_output, tuple):
+            hidden_states, mhc_multistream = decoder_output
+        else:
+            hidden_states = decoder_output
+            mhc_multistream = None
 
         output_weight = None
         if self.share_embeddings_and_output_weights:
@@ -509,6 +516,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 input_ids=input_ids,
                 position_ids=position_ids,
                 hidden_states=hidden_states,
+                mhc_multistream=mhc_multistream,
                 attention_mask=attention_mask,
                 inference_params=inference_params,
                 rotary_pos_emb=rotary_pos_emb,

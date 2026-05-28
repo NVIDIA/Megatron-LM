@@ -16,7 +16,7 @@ if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import CheckpointManager
 
 
-@torch.compile
+# @torch.compile  # disabled 2026-05-27 — Dynamo shape mismatch on hybrid_dev mHC path
 def _sinkhorn_iterations(input_logits: Tensor, num_iterations: int, eps: float) -> Tensor:
     row_max = input_logits.max(dim=-1, keepdim=True).values
     M = torch.exp(input_logits - row_max)
@@ -59,13 +59,13 @@ def native_sinkhorn(input_logits: Tensor, num_iterations: int, eps: float = 1e-6
     return SinkhornKnopp.apply(input_logits, num_iterations, eps)
 
 
-@torch.compile
+# @torch.compile  # disabled 2026-05-27 — Dynamo shape mismatch on hybrid_dev mHC path
 def native_h_aggregate(x: Tensor, h_pre: Tensor) -> Tensor:
     """Native n-stream weighted aggregation: out = sum_j(h_pre_j * x_j)."""
     return (x * h_pre.unsqueeze(-1)).sum(dim=2)
 
 
-@torch.compile
+# @torch.compile  # disabled 2026-05-27 — Dynamo shape mismatch on hybrid_dev mHC path
 def native_h_post_bda(
     h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
 ) -> Tensor:
@@ -81,7 +81,7 @@ def native_h_post_bda(
     return x_expanded + mixed
 
 
-@torch.compile
+# @torch.compile  # disabled 2026-05-27 — Dynamo shape mismatch on hybrid_dev mHC path
 def native_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tuple[Tensor, Tensor]:
     """Native fused projection + RMS normalization."""
     proj = torch.matmul(x, weight.t())
@@ -92,7 +92,7 @@ def native_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tuple[Tenso
     return proj, r
 
 
-@torch.compile
+# @torch.compile  # disabled 2026-05-27 — Dynamo shape mismatch on hybrid_dev mHC path
 def learned_output_contract(
     hidden_states: Tensor, head_fn: Tensor, base: Tensor, scale: Tensor, n: int, eps: float
 ) -> Tensor:
@@ -211,7 +211,7 @@ class HyperConnectionModule(MegatronModule):
         proj, r = self._proj_rms_op(x_2d, self.mapping_proj.weight, self.norm_eps)
         return proj.view(s, b, -1), r.view(s, b, 1)
 
-    @torch.compile
+    # @torch.compile  # disabled 2026-05-27 — Dynamo shape mismatch on hybrid_dev mHC path
     def _compute_h(self, proj: Tensor, r: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Compute h from projected hidden states and scaling factors.
@@ -268,7 +268,7 @@ class HyperConnectionModule(MegatronModule):
 
         return h_pre, h_post, h_res
 
-    @torch.compile
+    # @torch.compile  # disabled 2026-05-27 — Dynamo shape mismatch on hybrid_dev mHC path
     def _apply_h_post(self, x: Tensor, h_post: Tensor) -> Tensor:
         """
         Core implementation of H_post application to a single tensor.
@@ -367,7 +367,7 @@ class HyperConnectionModule(MegatronModule):
         x_streams = x.view(s, b, self.n, C)
         return self._h_aggregate_op(x_streams, h_pre)
 
-    @torch.compile
+    # @torch.compile  # disabled 2026-05-27 — Dynamo shape mismatch on hybrid_dev mHC path
     def apply_h_res(self, h_res: Tensor, residual: Tensor) -> Tensor:
         """
         Apply H_res to residual using H_res weights.

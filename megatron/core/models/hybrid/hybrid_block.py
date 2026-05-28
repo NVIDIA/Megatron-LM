@@ -359,7 +359,15 @@ class HybridStack(MegatronModule):
                 eps=self.config.layernorm_epsilon,
             )
 
-        if self.config.enable_hyper_connections and self.post_process:
+        # Skip hc_head_* params inside the nested MTP HybridStack — `forward()`
+        # no longer calls `learned_output_contract` there (MTP owns that), so these
+        # params would be orphaned and break DDP's per-param grad-ready accounting
+        # with a `len(per_param_grad_ready_counts) != len(params)` AssertionError.
+        if (
+            self.config.enable_hyper_connections
+            and self.post_process
+            and not self.is_mtp_layer
+        ):
             hc_mult = self.config.num_residual_streams
             hc_dim = self.config.hidden_size * hc_mult
             self.hc_head_fn = nn.Parameter(torch.randn(hc_mult, hc_dim))
@@ -483,7 +491,15 @@ class HybridStack(MegatronModule):
         if isinstance(hidden_states, WrappedTensor):
             hidden_states = hidden_states.unwrap()
 
-        if self.config.enable_hyper_connections and self.pre_process:
+        # Skip input_expand inside MTP nested HybridStack: when mHC + MTP, the outer
+        # decoder hands in already-multi-stream hidden_states via mhc_multistream
+        # (see multi_token_prediction.py _concat_embeddings), so expanding again would
+        # produce [s, b, n*(n*h)] instead of [s, b, n*h] and break HC mapping_proj.
+        if (
+            self.config.enable_hyper_connections
+            and self.pre_process
+            and not self.is_mtp_layer
+        ):
             hidden_states = HyperConnectionModule.input_expand(
                 hidden_states, self.config.num_residual_streams
             )
@@ -591,7 +607,30 @@ class HybridStack(MegatronModule):
                     is_last_in_recompute_block=mhc_is_last_in_recompute_block[l_no],
                 )
 
-        if self.config.enable_hyper_connections and self.post_process:
+        # When mHC + MTP, save the pre-contraction multi-stream tensor for MTP input.
+        # MTP's _concat_embeddings mHC branch expects [s, b, n*h] (multi-stream), while
+        # the contracted hidden_states is [s, b, h]. Mirrors transformer_block.py:948-988.
+        # Only the OUTER decoder stack does this; nested MTP stacks (is_mtp_layer=True)
+        # must keep returning a single Tensor so MTP's _postprocess receives the right
+        # type for learned_output_contract.
+        mhc_multistream = None
+        if (
+            self.config.enable_hyper_connections
+            and self.post_process
+            and self.config.mtp_num_layers is not None
+            and not self.is_mtp_layer
+        ):
+            mhc_multistream = hidden_states
+
+        # Nested MTP HybridStacks (is_mtp_layer=True) must NOT contract streams —
+        # MTP's own `_postprocess` calls learned_output_contract + final_layernorm
+        # itself, so doing it here would double-collapse and break the multi-stream
+        # contract expected by the surrounding MTP code.
+        if (
+            self.config.enable_hyper_connections
+            and self.post_process
+            and not self.is_mtp_layer
+        ):
             hidden_states = learned_output_contract(
                 hidden_states,
                 self.hc_head_fn,
@@ -611,6 +650,8 @@ class HybridStack(MegatronModule):
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
 
+        if mhc_multistream is not None:
+            return hidden_states, mhc_multistream
         return hidden_states
 
     def sharded_state_dict(

@@ -1757,12 +1757,20 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 tp_group_for_te = None
 
             if is_te_min_version("2.14.0"):
-                extra_kwargs["single_grouped_weight"] = getattr(
-                    config, "moe_single_grouped_weight", False
-                )
-                extra_kwargs["single_grouped_bias"] = getattr(
-                    config, "moe_single_grouped_bias", False
-                )
+                # nemo_26.04 ships TE 2.14.0+71bbefbf whose GroupedLinear.__init__ does NOT
+                # yet accept single_grouped_{weight,bias}, even though the version string
+                # passes is_te_min_version("2.14.0"). Introspect the signature instead of
+                # version-gating, mirroring the patch in dsv4_fused_attn / main_megatron.
+                import inspect as _inspect
+                _gl_params = _inspect.signature(te.pytorch.GroupedLinear.__init__).parameters
+                if "single_grouped_weight" in _gl_params:
+                    extra_kwargs["single_grouped_weight"] = getattr(
+                        config, "moe_single_grouped_weight", False
+                    )
+                if "single_grouped_bias" in _gl_params:
+                    extra_kwargs["single_grouped_bias"] = getattr(
+                        config, "moe_single_grouped_bias", False
+                    )
 
             super().__init__(
                 num_gemms=num_gemms,

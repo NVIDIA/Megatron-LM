@@ -73,8 +73,21 @@ class DSAIndexerLossLoggingHelper:
             return
 
         tracker = DSAIndexerLossLoggingHelper.tracker
+        # Tracker must be at least max(num_layers, layer_number) so hybrid MTP layers
+        # (whose layer_number can exceed config.num_layers + config.mtp_num_layers when
+        # each MTP depth contains multiple hybrid layers) don't index out of bounds.
+        # Grow lazily; with PP=1 every rank takes the same path, so sizes stay consistent.
+        needed = max(num_layers, layer_number)
         if "values" not in tracker:
-            tracker["values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
+            tracker["values"] = torch.zeros(needed, device=torch.cuda.current_device())
+        elif tracker["values"].shape[0] < needed:
+            grown = torch.zeros(
+                needed,
+                device=tracker["values"].device,
+                dtype=tracker["values"].dtype,
+            )
+            grown[: tracker["values"].shape[0]] = tracker["values"]
+            tracker["values"] = grown
         tracker["values"][layer_number - 1] += loss.detach()
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
@@ -1235,10 +1248,18 @@ class DSAttention(MegatronModule):
             )
             # Save indexer loss for logging
             if indexer_loss_coeff > 0:
+                # On HybridModel, each MTP depth can contain multiple hybrid layers
+                # (e.g. `/MD-E` is 4 layers per depth), so `num_layers + mtp_num_layers`
+                # is an undercount when mtp_num_layers is depth, not layer count. Take
+                # the max with self.layer_number so the tracker grows to cover the
+                # largest layer index seen on this rank.
                 DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                     loss=indexer_loss,
                     layer_number=self.layer_number,
-                    num_layers=self.config.num_layers + (self.config.mtp_num_layers or 0),
+                    num_layers=max(
+                        self.layer_number,
+                        self.config.num_layers + (self.config.mtp_num_layers or 0),
+                    ),
                 )
 
             # ===================================
