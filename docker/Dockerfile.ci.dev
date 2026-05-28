@@ -35,6 +35,7 @@ COPY README.md pyproject.toml uv.lock /workspace/
 COPY megatron/core/__init__.py /workspace/megatron/core/
 COPY megatron/core/package_info.py /workspace/megatron/core/
 ARG IMAGE_TYPE=dev
+ENV IMAGE_TYPE=${IMAGE_TYPE}
 ENV NVTE_BUILD_NUM_PHILOX_ROUNDS=3
 RUN --mount=type=cache,target=/root/.cache/uv \
     bash -ex <<"EOF"
@@ -68,6 +69,10 @@ ENV RDMA_CORE_HOME=/opt/rdma-core/build
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64/:$LD_LIBRARY_PATH
 COPY docker/patches/deepep.patch /workspace/deepep.patch
 RUN bash -ex <<"EOF"
+    if [ "$IMAGE_TYPE" = "lts" ]; then
+        echo "[DeepEP] skipping install for IMAGE_TYPE=lts"
+        exit 0
+    fi
     apt-get update
     apt-get install -y --allow-change-held-packages rdma-core libibverbs-dev
     apt-get clean
