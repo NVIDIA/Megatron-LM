@@ -1411,7 +1411,7 @@ class TestFsdpNonUnitBucketPreservation:
         out.sum().backward()
         # Mirrors what the pipeline schedule does after backward: finalize_model_grads
         # calls fsdp_model.finish_grad_sync(), which calls synchronize_param_gather()
-        # (because overlap_param_gather=True), which calls AllGatherPipeline.reset() -
+        # (because overlap_param_gather=True), which calls AllGatherPipeline.reset() —
         # the buggy entry point that frees non-unit buckets.
         finalize_model_grads([fsdp_model])
         fsdp_model(x)
