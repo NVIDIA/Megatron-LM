@@ -2,28 +2,29 @@
 
 """Sample Generate GPT."""
 import functools
+import logging
 import os
 import sys
 import warnings
+
 import datasets
-import logging
 import torch.distributed as dist
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../")))
 
+import modelopt.torch.quantization as mtq
 import torch
 from diskcache import Cache
+from modelopt.torch.utils.plugins import megatron_generate
+from utils import get_hf_tokenizer
 
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
-from megatron.post_training.generate import simple_generate
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.post_training.utils import report_current_memory_info
 from megatron.training import get_args, get_model, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
-from utils import get_hf_tokenizer
 from megatron.training.utils import print_rank_0, unwrap_model
-import modelopt.torch.quantization as mtq
 from model_provider import model_provider
 
 logger = logging.getLogger(__name__)
@@ -206,7 +207,7 @@ if __name__ == "__main__":
             else:
                 tokens = tokenizer(prompt, return_tensors="pt")
                 with torch.no_grad():
-                    generated_ids = simple_generate(
+                    generated_ids = megatron_generate(
                         unwrapped_model, tokens.input_ids.cuda(), osl=2, disable_tqdm=disable_tqdm
                     )
                 predict = tokenizer.batch_decode(generated_ids)[0].strip()
