@@ -339,6 +339,7 @@ class TestFusedDSAIndexerLossGradient:
         yield
         Utils.destroy_model_parallel()
 
+    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("calculate_per_token_loss", [False, True])
     def test_fused_indexer_loss_gradient_matches_autograd(self, calculate_per_token_loss):

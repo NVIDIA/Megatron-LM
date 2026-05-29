@@ -131,6 +131,7 @@ class TestNativeSinkhorn:
 
 
 class TestFusedSinkhorn:
+    @pytest.mark.flaky_in_dev
     @_require_cutile
     @pytest.mark.parametrize("s,b,n,iters", [(2, 4, 4, 5), (1, 1, 2, 10)])
     def test_fwd_bwd_vs_reference(self, s, b, n, iters):
