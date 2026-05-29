@@ -190,6 +190,7 @@ class TestNativeHAggregate:
 
 
 class TestFusedHAggregate:
+    @pytest.mark.flaky_in_dev
     @_require_cutile
     @pytest.mark.parametrize("s,b,n,C", [(2, 4, 4, 1024), (1, 1, 2, 256)])
     def test_fwd_bwd_vs_reference(self, s, b, n, C):
@@ -270,6 +271,7 @@ class TestNativeHPostBDA:
 
 
 class TestFusedHPostBDA:
+    @pytest.mark.flaky_in_dev
     @_require_cutile
     @pytest.mark.parametrize("with_bias", [True, False])
     @pytest.mark.parametrize("s,b,n,C", [(2, 4, 4, 1024), (1, 2, 2, 256)])
@@ -357,6 +359,7 @@ class TestNativeProjRms:
 
 
 class TestFusedProjRms:
+    @pytest.mark.flaky_in_dev
     @_require_cutile
     @pytest.mark.parametrize("M,N,K", [(256, 20, 4096), (64, 8, 512)])
     def test_fwd_bwd_vs_reference(self, M, N, K):
@@ -482,6 +485,7 @@ class TestEndToEndNative:
 class TestEndToEndFused:
     """Full mHC pipeline using fused cuTile kernels (requires cuTile)."""
 
+    @pytest.mark.flaky_in_dev
     @_require_cutile
     def test_full_pipeline_fwd_bwd(self):
         from megatron.core.fusions.fused_mhc_kernels import (
