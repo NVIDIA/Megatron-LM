@@ -35,6 +35,7 @@ COPY README.md pyproject.toml uv.lock /workspace/
 COPY megatron/core/__init__.py /workspace/megatron/core/
 COPY megatron/core/package_info.py /workspace/megatron/core/
 ARG IMAGE_TYPE=dev
+ENV IMAGE_TYPE=${IMAGE_TYPE}
 ENV NVTE_BUILD_NUM_PHILOX_ROUNDS=3
 RUN --mount=type=cache,target=/root/.cache/uv \
     bash -ex <<"EOF"
@@ -61,20 +62,44 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 EOF
 
 # Install DeepEP
+ARG DEEPEP_COMMIT=17cfb817bccec3a9c247013360cc550c2bac441e
+ENV DEEPEP_COMMIT=$DEEPEP_COMMIT
+ENV HYBRID_EP_MULTINODE=1
+ENV RDMA_CORE_HOME=/opt/rdma-core/build
+ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64/:$LD_LIBRARY_PATH
 COPY docker/patches/deepep.patch /workspace/deepep.patch
 RUN bash -ex <<"EOF"
+    if [ "$IMAGE_TYPE" = "lts" ]; then
+        echo "[DeepEP] skipping install for IMAGE_TYPE=lts"
+        exit 0
+    fi
+    apt-get update
+    apt-get install -y --allow-change-held-packages rdma-core libibverbs-dev
+    apt-get clean
+    ARCH_LIB=$(dpkg-architecture -qDEB_HOST_MULTIARCH)
+    test -f /usr/lib/${ARCH_LIB}/libmlx5.so || ln -sf /usr/lib/${ARCH_LIB}/libmlx5.so.1 /usr/lib/${ARCH_LIB}/libmlx5.so
+    mkdir -p ${RDMA_CORE_HOME}
+    ln -sfn /usr/include ${RDMA_CORE_HOME}/include
+    ln -sfn /usr/lib/${ARCH_LIB} ${RDMA_CORE_HOME}/lib
+
     cd /workspace
     uv pip install nvidia-nvshmem-cu13==3.4.5
     pushd /opt/venv/lib/python3.12/site-packages/nvidia/nvshmem/lib/
-        ln -s libnvshmem_host.so.3 libnvshmem_host.so
+        ln -sf libnvshmem_host.so.3 libnvshmem_host.so
     popd
 
-    git clone --branch hybrid-ep https://github.com/deepseek-ai/DeepEP.git
+    git clone https://github.com/deepseek-ai/DeepEP.git
     pushd DeepEP
-        git checkout 34152ae28f80bcc3ee38d7a12cb2ad87cfd4ea72
+        git fetch origin $DEEPEP_COMMIT
+        git checkout FETCH_HEAD
         patch -p1 < /workspace/deepep.patch
+        apt-get update
+        apt-get install -y --no-install-recommends libnvidia-ml-dev
+        TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" uv pip install --no-build-isolation -v .
+        apt-get purge -y libnvidia-ml-dev
+        apt-get autoremove -y
+        rm -rf /var/lib/apt/lists/*
     popd
-    TORCH_CUDA_ARCH_LIST="9.0 10.0 12.0" uv pip install --no-build-isolation -v DeepEP/.
     rm -rf DeepEP
 EOF
 
@@ -97,7 +122,7 @@ RUN --mount=type=secret,id=JET_INDEX_URLS \
     JET_INDEX_URLS=$(cat /run/secrets/JET_INDEX_URLS)
     LOGGER_INDEX_URL=$(cat /run/secrets/LOGGER_INDEX_URL)
     uv pip install --no-cache-dir --upgrade $LOGGER_INDEX_URL "one-logger"
-    uv pip install --no-cache-dir --upgrade "setuptools<80.0.0,>=77.0.0"
+    uv pip install --no-cache-dir --upgrade "setuptools>=80"
     uv pip install --no-cache-dir --upgrade $JET_INDEX_URLS "jet-client~=4.0" 
 EOF
 ###
