@@ -18,9 +18,9 @@ Risk: Review before execution as proposals could introduce incorrect or misleadi
 Mitigation: Review and scan skill before deployment. <br>
 
 ## Reference(s): <br>
-- [Megatron-LM CI/CD Workflow](.github/workflows/cicd-main.yml) <br>
-- [Trigger Internal CI Documentation](tools/trigger_internal_ci.md) <br>
-- [Megatron-LM Contributing Guide](docs/developer/contribute.md) <br>
+- [Megatron-LM CI/CD Workflow](../../.github/workflows/cicd-main.yml) <br>
+- [Trigger Internal CI Documentation](../../tools/trigger_internal_ci.md) <br>
+- [Megatron-LM Contributing Guide](../../docs/developer/contribute.md) <br>
 
 
 ## Skill Output: <br>
