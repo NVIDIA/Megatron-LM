@@ -457,8 +457,7 @@ class TEGroupedMLP(MegatronModule):
                     )
                 else:
                     op = te.pytorch.ops.ScaledClampedQGeGLU(
-                        glu_interleave_size=glu_interleave,
-                        limit=clamp,
+                        glu_interleave_size=glu_interleave, limit=clamp
                     )
             else:
                 if (
@@ -470,9 +469,7 @@ class TEGroupedMLP(MegatronModule):
                         activation_recompute_in_mlp=activation_recompute_in_mlp,
                     )
                 else:
-                    op = te.pytorch.ops.ScaledClampedQGeGLU(
-                        glu_interleave_size=glu_interleave
-                    )
+                    op = te.pytorch.ops.ScaledClampedQGeGLU(glu_interleave_size=glu_interleave)
         elif (
             self.config.activation_func == squared_relu
             and self.config.use_fused_weighted_squared_relu
