@@ -1,12 +1,13 @@
 ## Description: <br>
-Container-based dev environment setup and dependency management for Megatron-LM, covering CI container acquisition and launch, uv package management, and uv.lock maintenance. <br>
+Container-based dev environment setup and dependency management for Megatron-LM. Covers acquiring and launching the CI container, uv package management, and updating uv.lock. <br>
 
 This skill is ready for commercial/non-commercial use. <br>
 
-## Owner: NVIDIA <br>
+## Owner
+NVIDIA <br>
 
 ### License/Terms of Use: <br>
-Apache-2.0 <br>
+Apache 2.0 <br>
 ## Use Case: <br>
 Developers and engineers setting up containerized development environments for Megatron-LM, managing Python dependencies with uv, and resolving build or dependency issues. <br>
 
@@ -18,9 +19,10 @@ Risk: Review before execution as proposals could introduce incorrect or misleadi
 Mitigation: Review and scan skill before deployment. <br>
 
 ## Reference(s): <br>
-- [Pyxis (NVIDIA container plugin for Slurm)](https://github.com/NVIDIA/pyxis) <br>
-- [enroot (NVIDIA container utility)](https://github.com/NVIDIA/enroot) <br>
-- [Megatron-LM Installation Guide](https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/install.html) <br>
+- [Megatron-LM Repository](https://github.com/NVIDIA/Megatron-LM) <br>
+- [Megatron Core Developer Guide](https://docs.nvidia.com/megatron-core/developer-guide/latest/index.html) <br>
+- [NVIDIA Pyxis](https://github.com/NVIDIA/pyxis) <br>
+- [NVIDIA Enroot](https://github.com/NVIDIA/enroot) <br>
 
 
 ## Skill Output: <br>
@@ -29,8 +31,21 @@ Mitigation: Review and scan skill before deployment. <br>
 **Output Parameters:** [1D] <br>
 **Other Properties Related to Output:** [None] <br>
 
+## Evaluation Tasks: <br>
+NVSkills-Eval 3-Tier Evaluation with external profile. <br>
+
+## Evaluation Metrics Used: <br>
+Reported benchmark dimensions: <br>
+- Security: Checks whether skill-assisted execution avoids unsafe behavior such as secret leakage, destructive commands, or unauthorized access. <br>
+- Correctness: Checks whether the agent follows the expected workflow and produces the correct final output. <br>
+- Discoverability: Checks whether the agent loads the skill when relevant and avoids using it when irrelevant. <br>
+- Effectiveness: Checks whether the agent performs measurably better with the skill than without it. <br>
+- Efficiency: Checks whether the agent uses fewer tokens and avoids redundant work. <br>
+
+
+
 ## Skill Version(s): <br>
-core_v0.15.0rc7 (source: git tag) <br>
+1325db3b5 (source: git SHA, committed 2026-05-29) <br>
 
 ## Ethical Considerations: <br>
 NVIDIA believes Trustworthy AI is a shared responsibility and we have established policies and practices to enable development for a wide array of AI applications. When downloaded or used in accordance with our terms of service, developers should work with their internal team to ensure this skill meets requirements for the relevant industry and use case and addresses unforeseen product misuse. <br>

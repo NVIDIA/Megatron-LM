@@ -1,14 +1,14 @@
 # Evaluation Report
 
-Evaluation of the `mcore-bump-base-image` skill before publication to the NVCARPS ecosystem.
+Evaluation of the `mcore-bump-base-image` skill before publication through NVSkills-Eval.
 
-This benchmark summarizes NV-BASE validation and Tier 3 live agent evaluation results for the skill. The goal is to document whether the skill is safe, discoverable, effective, and useful for agents before it is published for broader workflow use.
+This benchmark summarizes 3-Tier Evaluation from NVSkills-Eval results for the skill. The goal is to document whether the skill is safe, discoverable, effective, and useful for agents before it is published for broader workflow use.
 
 ## Evaluation Summary
 
 - Skill: `mcore-bump-base-image`
 - Evaluation date: 2026-05-29
-- NV-BASE profile: `internal`
+- NVSkills-Eval profile: `external`
 - Overall verdict: FAIL
 - Tier 3 live agent evaluation: not available in this report
 
@@ -40,7 +40,7 @@ Tier 3 dimension rollup was not available in this report.
 
 ## Tier 1: Static Validation Summary
 
-Tier 1 validation reported findings. NV-BASE ran 9 checks and found 9 total findings.
+Tier 1 validation reported findings. NVSkills-Eval ran 9 checks and found 8 total findings.
 
 Top findings:
 
@@ -52,8 +52,13 @@ Top findings:
 
 ## Tier 2: Deduplication Summary
 
-This tier was not run or did not produce findings in this report.
+Tier 2 validation passed. NVSkills-Eval ran 2 checks and found 0 total findings.
+
+Notable observations:
+
+- Context Deduplication: Collected 1 file(s)
+- Inter-Skill Deduplication: Parsed skill 'mcore-bump-base-image': 329 char description
 
 ## Publication Recommendation
 
-The skill should be reviewed before NVCARPS publication. Skill owners should address the findings above and rerun NV-BASE to refresh this benchmark.
+The skill should be reviewed before NVSkills-Eval publication. Skill owners should address the findings above and rerun NVSkills-Eval to refresh this benchmark.

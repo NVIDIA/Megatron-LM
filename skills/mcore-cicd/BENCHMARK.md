@@ -1,15 +1,15 @@
 # Evaluation Report
 
-Evaluation of the `mcore-cicd` skill before publication to the NVCARPS ecosystem.
+Evaluation of the `mcore-cicd` skill before publication through NVSkills-Eval.
 
-This benchmark summarizes NV-BASE validation and Tier 3 live agent evaluation results for the skill. The goal is to document whether the skill is safe, discoverable, effective, and useful for agents before it is published for broader workflow use.
+This benchmark summarizes 3-Tier Evaluation from NVSkills-Eval results for the skill. The goal is to document whether the skill is safe, discoverable, effective, and useful for agents before it is published for broader workflow use.
 
 ## Evaluation Summary
 
 - Skill: `mcore-cicd`
 - Evaluation date: 2026-05-29
-- NV-BASE profile: `internal`
-- Overall verdict: PASS
+- NVSkills-Eval profile: `external`
+- Overall verdict: FAIL
 - Tier 3 live agent evaluation: not available in this report
 
 ## Agents Used
@@ -40,7 +40,7 @@ Tier 3 dimension rollup was not available in this report.
 
 ## Tier 1: Static Validation Summary
 
-Tier 1 validation passed with observations. NV-BASE ran 9 checks and found 10 total findings.
+Tier 1 validation passed with observations. NVSkills-Eval ran 9 checks and found 9 total findings.
 
 Top findings:
 
@@ -52,8 +52,14 @@ Top findings:
 
 ## Tier 2: Deduplication Summary
 
-This tier was not run or did not produce findings in this report.
+Tier 2 validation reported findings. NVSkills-Eval ran 2 checks and found 1 total findings.
+
+Top findings:
+
+- HIGH DUPLICATE/duplicate: Duplicate content found within SKILL.md:
+  "## Answer-First CI Facts" in SKILL.md (lines 5-25)
+  vs "## Triggering Internal CI" in SKILL.md (lines 89-105) (`SKILL.md:5`)
 
 ## Publication Recommendation
 
-The skill is suitable to proceed toward NVCARPS publication based on this benchmark. Skill owners should keep this file with the skill and refresh it when the evaluation dataset, skill behavior, or target agents materially change.
+The skill should be reviewed before NVSkills-Eval publication. Skill owners should address the findings above and rerun NVSkills-Eval to refresh this benchmark.
