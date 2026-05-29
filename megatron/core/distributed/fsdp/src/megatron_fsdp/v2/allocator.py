@@ -163,7 +163,8 @@ class TracePoolAllocator(BucketAllocator):
        in ``_slot_map``.
 
     After coloring, slots are laid out contiguously and a single
-    ``torch.empty`` per ``(dtype, device)`` group is allocated.
+    ``torch.empty`` per ``(dtype, device)`` group is allocated. If the
+    trace is empty, planning is a no-op and later cursor resets also no-op.
 
     **Phase 3 — Optimized** (after ``plan()``)
 
@@ -297,7 +298,9 @@ class TracePoolAllocator(BucketAllocator):
             Multiply by ``element_size(dtype)`` for bytes.
         """
         assert self._phase == "trace", "plan() can only be called in trace phase"
-        assert len(self._trace) > 0, "empty trace — nothing to plan"
+        if len(self._trace) == 0:
+            self._phase = "optimized"
+            return 0
 
         # ---- step 1: build intervals from alloc/free pairs ----
         alloc_stack: Dict[AllocatorKey, List[int]] = {}  # key -> [alloc_seq, ...]
@@ -318,7 +321,9 @@ class TracePoolAllocator(BucketAllocator):
                             )
                         )
 
-        assert len(intervals) > 0, "no paired alloc/free intervals found in trace"
+        if len(intervals) == 0:
+            self._phase = "optimized"
+            return 0
 
         # ---- step 2 & 3: color and allocate ----
         return self._assign_pool(intervals)

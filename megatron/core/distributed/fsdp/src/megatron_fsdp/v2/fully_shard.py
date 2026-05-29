@@ -57,6 +57,7 @@ def fully_shard(
     enable_async_reduce_grad: bool = True,
     gradient_scaling_factor: Optional[float] = None,
     enable_trace_pool: bool = False,
+    sharding_strategy: str = "optim_grads_params",
 ) -> nn.Module:
     """
     Wrap a module with FSDP sharding semantics.
@@ -82,9 +83,12 @@ def fully_shard(
     new_cls = type(f"FSDP{cls.__name__}", (FSDPModule, cls), {})
     module.__class__ = new_cls
 
-    bucket_allocator = (
-        TracePoolAllocator() if enable_trace_pool else StorageFreeingBucketAllocator()
+    use_trace_pool = enable_trace_pool and sharding_strategy in (
+        "optim",
+        "optim_grads",
+        "optim_grads_params",
     )
+    bucket_allocator = TracePoolAllocator() if use_trace_pool else StorageFreeingBucketAllocator()
 
     module._init_named_param_groups(
         mesh,
@@ -92,6 +96,7 @@ def fully_shard(
         mp_policy=mp_policy,
         bucket_allocator=bucket_allocator,
         gradient_scaling_factor=gradient_scaling_factor,
+        sharding_strategy=sharding_strategy,
     )
     module._init_fsdp_state(
         enable_unshard_prefetch=enable_unshard_prefetch,

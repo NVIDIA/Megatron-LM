@@ -12,14 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# FIXME: The following sharding strategies are not yet supported in FSDP v2:
-#   - no_shard
-#   - optim
-#   - optim_grads
-# Currently only optim_grads_params is fully implemented and tested.
-# We will add support for these strategies in a follow-up change.
-# When using ParameterGroup directly or via fully_shard(), passing an unsupported
-# sharding_strategy will raise NotImplementedError. See README.md for details.
+# FSDP v2 currently supports ZeRO-1/2/3 strategies (`optim`,
+# `optim_grads`, and `optim_grads_params`). `no_shard` is not implemented in
+# this path yet.
 
 from ..uneven_dtensor import (
     gather_and_compute_chunk_metadata,

@@ -148,7 +148,11 @@ def _register_backward_hook(module: FSDPModule):
         ctx.backward_done_modules.add(id(module))
         ctx._advance_backward_module()
         module.reshard()
-        module.reduce_grad(async_op=ctx.enable_async_reduce_grad)
+        if any(
+            param_group.sharding_strategy in ("optim_grads", "optim_grads_params")
+            for param_group in module._fsdp_param_groups
+        ):
+            module.reduce_grad(async_op=ctx.enable_async_reduce_grad)
         module.post_backward_issued = True
 
     @torch.compiler.disable
@@ -225,7 +229,11 @@ def _register_post_backward_final_callback(state: _FSDPState, module: nn.Module)
             if getattr(module, "post_backward_issued", False):
                 continue
             module.reshard()
-            module.reduce_grad(async_op=ctx.enable_async_reduce_grad)
+            if any(
+                param_group.sharding_strategy in ("optim_grads", "optim_grads_params")
+                for param_group in module._fsdp_param_groups
+            ):
+                module.reduce_grad(async_op=ctx.enable_async_reduce_grad)
         for buckets in ctx.reduce_grad_buckets.values():
             while len(buckets) > 0:
                 event, param_group = buckets.pop()

@@ -40,7 +40,7 @@ Mixin class added to wrapped modules. Methods:
 |--------|-------------|---------|
 | `unshard()` | Pre-forward | All-gather params from sharded buffer |
 | `reshard()` | Post-forward, post-backward | Release unsharded buffer |
-| `reduce_grad()` | Post-backward | All-reduce or reduce-scatter gradients |
+| `reduce_grad()` | Post-backward / grad sync | Reduce-scatter gradients into optimizer-facing shards |
 
 ### DataParallelBuffer
 
@@ -48,15 +48,15 @@ Flat buffer managing (a shard of) parameter/gradient data:
 
 - `unshard()` — all-gather to full tensor
 - `reshard()` — free temporary buffer
-- `reduce_grad()` — all-reduce or reduce-scatter gradients
+- `reduce_grad()` — reduce-scatter gradients into optimizer-facing shards
 - Uses `BufferIndex` to track parameter layout within the buffer
 
 ### ParameterGroup
 
 Groups parameters sharing the same (device, dtype, requires_grad):
 
-- `model_weight_buffer` — stores sharded model weights
-- `main_weight_buffer` — optional high-precision copy
+- `model_weight_buffer` — stores compute weights; replicated for ZeRO-1/2 and sharded for ZeRO-3
+- `main_weight_buffer` — optional high-precision optimizer copy; sharded when optimizer state is sharded
 - `main_grad_buffer` — accumulates gradients before reduce
 - `dist_params` — DTensor views into the buffer
 
@@ -75,13 +75,11 @@ See the parent directory `..` for `uneven_dtensor.py` which provides:
 | Strategy | Shard Weights | Shard Gradients | Status | Notes |
 |----------|---------------|-----------------|--------|-------|
 | `optim_grads_params` | Yes | Yes | **Supported** | Like ZeRO-3: full parameter/gradient/optimizer sharding |
+| `optim` | No | No | **Supported** | Like ZeRO-1: shard optimizer states only |
+| `optim_grads` | No | Yes | **Supported** | Like ZeRO-2: shard optimizer states + gradients |
 | `no_shard` | No | No | **Not yet supported** | Like DDP: no sharding |
-| `optim` | No | No | **Not yet supported** | Like ZeRO-1: shard optimizer states only |
-| `optim_grads` | No | Yes | **Not yet supported** | Like ZeRO-2: shard optimizer states + gradients |
 
-> **FIXME:** `no_shard`, `optim`, and `optim_grads` sharding strategies are not yet supported in v2.
-> Currently only `optim_grads_params` is fully implemented and tested.
-> These strategies will be added in a follow-up change.
+> **FIXME:** `no_shard` is not yet supported in v2.
 
 ## Integration with Megatron
 
@@ -96,7 +94,7 @@ See the parent directory `..` for `uneven_dtensor.py` which provides:
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 
 # In your config:
-ddp_config.data_parallel_sharding_strategy = "optim_grads_params"
+ddp_config.data_parallel_sharding_strategy = "optim_grads_params"  # or "optim", "optim_grads"
 ddp_config.use_fully_shard_api = True
 
 # During model setup:

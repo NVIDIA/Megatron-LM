@@ -102,9 +102,9 @@ class _FSDPRootContext:
     # ------------------------------------------------------------------
     # Reduce-scatter (gradient sync) tracking
     # ------------------------------------------------------------------
-    reduce_grad_buckets: Dict[int, List[Tuple[torch.cuda.Event, "ParameterGroup"]]] = field(
-        default_factory=dict
-    )
+    reduce_grad_buckets: Dict[
+        int, List[Tuple[torch.cuda.Event, "ParameterGroup"]]
+    ] = field(default_factory=dict)
     """
     Maps module_id -> list of (event, parameter_group) tuples.
 
@@ -171,7 +171,7 @@ class FSDPModule(nn.Module):
     methods for managing parameter sharding state:
     - unshard(): All-gather parameters before forward
     - reshard(): Release unsharded buffer after forward
-    - reduce_grad(): Reduce-scatter gradients after backward
+    - reduce_grad(): Reduce gradients after backward
     """
 
     def _init_named_param_groups(
@@ -181,6 +181,7 @@ class FSDPModule(nn.Module):
         mp_policy: FullyShardMixedPrecisionPolicy,
         bucket_allocator: BucketAllocator,
         gradient_scaling_factor: Optional[float] = None,
+        sharding_strategy: str = "optim_grads_params",
     ):
         """
         Initialize parameter groups and build param name mapping.
@@ -212,6 +213,7 @@ class FSDPModule(nn.Module):
             ignored_params=ignored_params,
             allocator=bucket_allocator,
             gradient_scaling_factor=gradient_scaling_factor,
+            sharding_strategy=sharding_strategy,
         )
         setattr(self, "_fsdp_param_groups", fsdp_param_groups)
 
@@ -480,7 +482,7 @@ class FSDPModule(nn.Module):
 
         This is called post-backward to:
         1. Copy gradients to main gradient buffer
-        2. Perform all-reduce or reduce-scatter
+        2. Perform gradient reduction
         3. Install reduced gradients to distributed parameters
         """
         torch.cuda.nvtx.range_push("MFSDP reduce_grad")
@@ -514,10 +516,11 @@ class FSDPModule(nn.Module):
                         del param.grad
                 elif param.grad is None:
                     main_grad = param.get_main_grad()
-                    if hasattr(param, "main_grad") and param.main_grad is not None:
-                        if param.main_grad.data_ptr() != main_grad.data_ptr():
-                            main_grad.copy_(param.main_grad.detach())
-                    else:
+                    param_main_grad = getattr(param, "main_grad", None)
+                    if (
+                        param_main_grad is None
+                        or param_main_grad.data_ptr() != main_grad.data_ptr()
+                    ):
                         main_grad.zero_()
                 else:
                     main_grad = param.get_main_grad()
@@ -537,22 +540,26 @@ class FSDPModule(nn.Module):
                 param_group.release_grad_buffer()
 
             # Install reduced gradients to distributed parameters
-            for name, param, dist_param, dist_grad in zip(
-                param_names, param_group.params, param_group.dist_params, param_group.dist_grads
-            ):
-                if not param.requires_grad:
-                    continue
-                if param_group.mp_policy.use_decoupled_grad:
-                    setattr(dist_param, "decoupled_grad", dist_grad)
-                    if dist_param.grad is not None:
-                        del dist_param.grad
-                else:
-                    if dist_grad is not None:
-                        with torch.cuda.stream(stream):
-                            dist_grad = dist_grad.to(dist_param.dtype)
-                    setattr(dist_param, "grad", dist_grad)
-                    if hasattr(dist_param, "decoupled_grad"):
-                        dist_param.decoupled_grad = None
+            with torch.cuda.stream(stream):
+                for name, param, dist_param, dist_grad in zip(
+                    param_names,
+                    param_group.params,
+                    param_group.dist_params,
+                    param_group.dist_grads,
+                ):
+                    if not param.requires_grad:
+                        continue
+                    if param_group.mp_policy.use_decoupled_grad:
+                        setattr(dist_param, "decoupled_grad", dist_grad)
+                        if dist_param.grad is not None:
+                            del dist_param.grad
+                    else:
+                        assert (
+                            dist_grad is None or dist_param.dtype == dist_grad.dtype
+                        ), f"{name} Dist param dtype {dist_param.dtype} does not match dist grad dtype {dist_grad.dtype}"
+                        setattr(dist_param, "grad", dist_grad)
+                        if hasattr(dist_param, "decoupled_grad"):
+                            dist_param.decoupled_grad = None
 
             if async_op:
                 event = stream.record_event()
@@ -567,6 +574,29 @@ class FSDPModule(nn.Module):
                         ).any(), f"NaN in dist grad for parameter {name}"
 
         torch.cuda.nvtx.range_pop()
+
+    @torch.no_grad()
+    def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
+        """Finish optimizer-facing gradient synchronization for this iteration."""
+        ctx = self._fsdp_root_context
+        for _, child in self.named_modules():
+            if not isinstance(child, FSDPModule):
+                continue
+            if any(
+                param_group.sharding_strategy == "optim"
+                for param_group in child._fsdp_param_groups
+            ):
+                # ZeRO-1 keeps gradients replicated during backward and performs
+                # exactly one reduce-scatter at the iteration grad-sync boundary.
+                child.reduce_grad(async_op=False)
+            for param_group in child._fsdp_param_groups:
+                for param, dist_grad in zip(param_group.params, param_group.dist_grads):
+                    if param.requires_grad:
+                        # v1 replaces module params with optimizer-facing distributed
+                        # params after grad sync. v2 keeps compute params in the module,
+                        # so mirror the reduced grad for shared finalizers.
+                        param.main_grad = dist_grad
+        torch.cuda.current_stream().wait_stream(ctx.rs_stream)
 
     @torch.no_grad()
     def _scale_gradients(self, scaling_factor: float):
@@ -792,6 +822,7 @@ def _get_module_fsdp_param_groups(
     mesh: Optional[DeviceMesh] = None,
     ignored_params: Optional[set[nn.Parameter]] = None,
     gradient_scaling_factor: Optional[float] = None,
+    sharding_strategy: str = "optim_grads_params",
 ) -> List[ParameterGroup]:
     """
     Group module parameters by (device, dtype, requires_grad) and create ParameterGroups.
@@ -824,6 +855,7 @@ def _get_module_fsdp_param_groups(
                 mp_policy=mp_policy,
                 gradient_scaling_factor=gradient_scaling_factor,
                 allocator=allocator,
+                sharding_strategy=sharding_strategy,
             )
         )
 

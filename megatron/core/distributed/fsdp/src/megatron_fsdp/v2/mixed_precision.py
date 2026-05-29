@@ -517,6 +517,10 @@ class FullyShardMixedPrecisionPolicy:
 
         assert model_weight_buffer is not None, "main weights require a model-weight buffer"
 
+        dirty_replicated_buffer = (
+            main_weight_buffer.is_distributed and not model_weight_buffer.is_distributed
+        )
+
         if self.is_nvfp4_param(params[0]):
             quantize_main_weights_to_nvfp4(
                 params, param_idx, data_parallel_group, model_weight_buffer, main_weight_buffer
@@ -524,7 +528,27 @@ class FullyShardMixedPrecisionPolicy:
             return
 
         if not self.is_fp8_param(params[0]):
-            model_weight_buffer.data.copy_(main_weight_buffer.data)
+            if model_weight_buffer.is_distributed and not main_weight_buffer.is_distributed:
+                raise RuntimeError(
+                    "Unsupported FSDP main/model weight buffer layout: "
+                    "model weights are sharded but main weights are replicated."
+                )
+            if model_weight_buffer.is_distributed == main_weight_buffer.is_distributed:
+                model_weight_buffer.data.copy_(main_weight_buffer.data)
+            else:
+                model_shard_meta = model_weight_buffer.buffer_index.shard_meta
+                main_shard_meta = main_weight_buffer.buffer_index.shard_meta
+                model_weight_buffer.data[
+                    model_shard_meta.local_data_index : model_shard_meta.local_data_index
+                    + model_shard_meta.size
+                ].copy_(
+                    main_weight_buffer.data[
+                        main_shard_meta.local_data_index : main_shard_meta.local_data_index
+                        + main_shard_meta.size
+                    ]
+                )
+            if dirty_replicated_buffer:
+                model_weight_buffer._dirty = True
             return
 
         fp8_params = []
@@ -554,6 +578,10 @@ class FullyShardMixedPrecisionPolicy:
         quantize_main_weights_to_fp8(
             fp8_params, main_params, start_offsets, data_parallel_group, model_param_shards
         )
+        if dirty_replicated_buffer:
+            model_weight_buffer._dirty = True
+            if transpose_weight_buffer is not None:
+                transpose_weight_buffer._dirty = True
 
 
 def is_fp8_param(tensor: torch.Tensor) -> bool:
