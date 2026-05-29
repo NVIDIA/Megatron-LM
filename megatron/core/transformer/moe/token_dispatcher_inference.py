@@ -245,6 +245,12 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
         CG path: standard ReduceScatter (equal token counts guaranteed).
         Non-CG path: expand compact output to padded layout, ReduceScatter, truncate.
 
+        BIK path: under batch_invariant_mode the InferenceGroupedMLP has
+        already AllGather'd raw contribs across EP and run a global
+        `deterministic_index_add`, so `hidden_states` already contains the
+        FULL per-token sum (identical on all ranks). ReduceScatter would
+        multiply it by ep_size, so we slice instead.
+
         Args:
             hidden_states: [total_tokens, hidden_dim] expert outputs.
 
@@ -253,6 +259,19 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
         """
         if self.ep_size == 1:
             return hidden_states.to(torch.bfloat16)
+
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            is_batch_invariant_mode_enabled,
+        )
+        if is_batch_invariant_mode_enabled():
+            # hidden_states is the full sum [total_tokens, H]; slice this
+            # rank's tokens (positions [rank * local, (rank+1) * local)).
+            total_tokens = hidden_states.shape[0]
+            local_tokens = total_tokens // self.ep_size
+            rank = get_pg_rank(self.ep_group)
+            return hidden_states[rank * local_tokens : (rank + 1) * local_tokens].to(
+                torch.bfloat16
+            )
 
         if not self.__class__._use_allgather_v:
             # CG path: equal token counts, standard reduce-scatter.
@@ -563,6 +582,18 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         """
         if self.ep_size == 1:
             return hidden_states.to(torch.bfloat16)
+
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            is_batch_invariant_mode_enabled,
+        )
+        if is_batch_invariant_mode_enabled():
+            # See NCCLAllGatherDispatcher.token_combine BIK note.
+            # hidden_states already holds the full per-token sum globally.
+            local_tokens = hidden_states.shape[0] // self.ep_size
+            rank = get_pg_rank(self.ep_group)
+            return hidden_states[rank * local_tokens : (rank + 1) * local_tokens].to(
+                torch.bfloat16
+            )
 
         rsv = self.__class__._symm_rsv
 

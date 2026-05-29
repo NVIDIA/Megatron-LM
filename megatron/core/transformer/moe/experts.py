@@ -292,6 +292,36 @@ class TEGroupedMLP(MegatronModule):
                 self.num_local_experts, align_size=align_size
             )
 
+        # When batch-invariant mode is on, redirect per-expert weight tensors to
+        # views into a single contiguous [E, N, K] buffer. This (a) avoids paying
+        # a stack-copy on every forward when our patched general_grouped_gemm
+        # needs a [E, N, K] tensor, and (b) makes training weight storage byte-
+        # identical to InferenceGroupedMLP._build_concatenated_weights, which is
+        # what gives bitwise train==inference parity for RL.
+        if self.config.batch_invariant_mode:
+            self._build_contiguous_weight_buffers()
+
+    @torch.no_grad()
+    def _build_contiguous_weight_buffers(self):
+        """Stack per-expert weights into contiguous [E, N, K] buffers and redirect
+        each weight{i}.data to a view into it. Idempotent.
+        """
+        for linear, buf_name in (
+            (self.linear_fc1, '_bik_fc1_weight'),
+            (self.linear_fc2, '_bik_fc2_weight'),
+        ):
+            if getattr(self, buf_name, None) is not None:
+                continue
+            per_expert = [getattr(linear, f'weight{i}') for i in range(self.num_local_experts)]
+            w0 = per_expert[0]
+            stacked = torch.empty(
+                self.num_local_experts, *w0.shape, device=w0.device, dtype=w0.dtype
+            )
+            for i, w in enumerate(per_expert):
+                stacked[i].copy_(w.data)
+                w.data = stacked[i]
+            self.register_buffer(buf_name, stacked, persistent=False)
+
     @staticmethod
     def _apply_bias(intermediate_parallel, bias_parallel, tokens_per_expert, permuted_probs):
         if bias_parallel is None:
@@ -910,6 +940,19 @@ class InferenceGroupedMLP(TEGroupedMLP):
         self.inference_grouped_gemm_backend = config.inference_grouped_gemm_backend
         self._nvls_dispatcher = config.inference_moe_token_dispatcher_type == 'nvls'
 
+        # BIK only instruments the TORCH backend (mcore_fused_moe → bf16
+        # grouped GEMM → grouped_gemm_batch_invariant). FlashInfer and vLLM
+        # backends use their own Triton/atomic_add combine kernels that we
+        # do not intercept.
+        if getattr(config, "batch_invariant_mode", False):
+            assert (
+                self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH
+            ), (
+                f"batch_invariant_mode requires "
+                f"--inference-grouped-gemm-backend=torch (BIK is only wired into "
+                f"the TORCH backend); got {self.inference_grouped_gemm_backend}."
+            )
+
     def _resolve_flashinfer_activation_type(self):
         """Map megatron activation config to FlashInfer ActivationType."""
         assert (
@@ -1047,8 +1090,40 @@ class InferenceGroupedMLP(TEGroupedMLP):
         return output, None
 
     def _mcore_fused_moe_forward(self, hidden_states, probs, routing_map):
-        """Torch grouped_mm fused MoE forward via mcore_fused_moe."""
+        """Torch grouped_mm fused MoE forward via mcore_fused_moe.
+
+        BIK + EP > 1 path: skip mcore_fused_moe's internal unpermute, AllGather
+        raw per-contribution expert outputs across EP, and run a single
+        global `deterministic_index_add` on each rank. This makes the
+        topk reduction order identical to training's local unpermute
+        (which sums all K contribs in sorted-index order). The combine
+        ReduceScatter then turns into a slice (handled in the dispatcher).
+        """
         local_expert_start = self.ep_group.rank() * self.num_local_experts
+        ep_size = self.ep_group.size()
+        bik_global_unpermute = (
+            getattr(self.config, "batch_invariant_mode", False) and ep_size > 1
+        )
+
+        if bik_global_unpermute:
+            fc2_output, permuted_probs, permutation_map, n_used = mcore_fused_moe(
+                hidden_states,
+                probs,
+                self._fc1_weight,
+                self._fc2_weight,
+                activation_type=self._mcore_activation_type,
+                num_local_experts=self.num_local_experts,
+                local_expert_start=local_expert_start,
+                valid_tokens=InferenceAllGatherDispatcherBase._valid_tokens(),
+                routing_map=routing_map,
+                disable_fused_quant_kernels=self.config.inference_moe_disable_fused_quant_kernels,
+                return_pre_unpermute=True,
+            )
+            output = self._bik_global_unpermute(
+                fc2_output, permuted_probs, permutation_map, n_used, hidden_states
+            )
+            return output, None
+
         output = mcore_fused_moe(
             hidden_states,
             probs,
@@ -1063,6 +1138,135 @@ class InferenceGroupedMLP(TEGroupedMLP):
             out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
         )
         return output, None
+
+    def _bik_global_unpermute(
+        self, fc2_output, permuted_probs, permutation_map, n_used, hidden_states
+    ):
+        """AllToAll-padded cross-EP deterministic unpermute (BIK + EP > 1).
+
+        Each rank's contribs (fc2_output * permuted_probs in fp32) are routed
+        directly to the rank that owns their destination token: one fixed-shape
+        AllToAll-single instead of broadcast. Each rank then runs a *local*
+        deterministic_index_add over the received contribs, producing the same
+        result training would.
+
+        Versus AllGather + global unpermute:
+          * Bandwidth: each contrib travels exactly once instead of ep_size
+            times → ~ep_size× less data crosses the network.
+          * Memory: send/recv buffers are O(N_local) per rank instead of
+            O(ep_size · N_local) → ~ep_size/2× smaller.
+
+        Per-token K-contrib sum order matches training because:
+          1. stable argsort by dest_rank groups same-dest contribs in their
+             original (expert-sorted) order within each src→dest bucket;
+          2. AllToAll-single packs receive buffer in source-rank-major order;
+          3. deterministic_index_add sorts by (token_id, position) — same
+             secondary key (source-rank major) the training combine produces.
+
+        CG-compat: all shapes are static (bincount uses minlength=ep_size+1;
+        AllToAll-single uses equal chunks per rank).
+        """
+        import torch.distributed as dist
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            deterministic_index_add,
+        )
+
+        ep_size = self.ep_group.size()
+        rank = self.ep_group.rank()
+        max_tokens = hidden_states.shape[0]
+        H = hidden_states.shape[-1]
+        N_local = fc2_output.shape[0]
+        local_tokens = max_tokens // ep_size
+        device = fc2_output.device
+
+        # Per-destination bucket size: in balanced routing each src→dest pair
+        # carries at most N_local/ep_size contribs. Slack for per-expert
+        # alignment padding (16-aligned blocks).
+        max_per_dest = (N_local + ep_size - 1) // ep_size + self.num_local_experts * 32
+
+        # fp32 weighted contribution (matches training accumulator dtype).
+        weighted = (fc2_output.to(torch.float32) *
+                    permuted_probs.to(torch.float32).unsqueeze(-1))
+
+        # dest_rank[i] = home rank of contrib i's destination token; ep_size = drop.
+        perm_long = permutation_map.to(torch.long)
+        dest_rank = torch.where(
+            perm_long < 0,
+            torch.full_like(perm_long, ep_size),
+            perm_long // local_tokens,
+        )
+        pos_idx = torch.arange(N_local, device=device, dtype=torch.long)
+        # Rows past n_used are alignment padding — mark them as drop too.
+        dest_rank = torch.where(
+            pos_idx < n_used.to(torch.long),
+            dest_rank,
+            torch.full_like(dest_rank, ep_size),
+        )
+        local_token_id = torch.where(
+            perm_long < 0,
+            torch.zeros_like(perm_long),
+            perm_long % local_tokens,
+        ).to(torch.float32)
+
+        # Stable sort by dest_rank groups same-dest contribs while preserving
+        # their original (expert-sorted) order — this is the secondary sort
+        # key that lets us match training bitwise.
+        sort_idx = torch.argsort(dest_rank, stable=True)
+        sorted_dest = dest_rank[sort_idx]
+        sorted_weighted = weighted[sort_idx]
+        sorted_local_id = local_token_id[sort_idx]
+
+        # Position within bucket: sorted-order index minus its bucket's start.
+        counts = torch.bincount(dest_rank, minlength=ep_size + 1)
+        offsets = torch.cat([
+            torch.zeros(1, device=device, dtype=counts.dtype),
+            counts.cumsum(0)[:-1],
+        ])
+        position_in_bucket = pos_idx - offsets[sorted_dest]
+
+        # Any contrib that would exceed max_per_dest is redirected to the
+        # ep_size (drop) bucket and dropped by the AllToAll send slice.
+        in_bounds = position_in_bucket < max_per_dest
+        safe_dest = torch.where(in_bounds, sorted_dest,
+                                torch.full_like(sorted_dest, ep_size))
+        safe_pos = position_in_bucket.clamp(max=max_per_dest - 1)
+
+        # Pack contribs into [ep_size+1, max_per_dest, H+1]. Last column carries
+        # the destination's local_token_id; -1 marks an empty slot.
+        send_buf = torch.zeros(
+            ep_size + 1, max_per_dest, H + 1, device=device, dtype=torch.float32,
+        )
+        send_buf[..., H] = -1.0
+        send_buf[safe_dest, safe_pos, :H] = sorted_weighted
+        send_buf[safe_dest, safe_pos, H] = sorted_local_id
+
+        # AllToAll-single: send only the ep_size real buckets (drop slot is skipped).
+        send_for_a2a = send_buf[:ep_size].contiguous()
+        recv_buf = torch.empty_like(send_for_a2a)
+        dist.all_to_all_single(recv_buf, send_for_a2a, group=self.ep_group)
+
+        # Flatten source-rank-major so the secondary sort matches training.
+        recv_flat = recv_buf.reshape(-1, H + 1)
+        recv_weighted = recv_flat[:, :H]
+        recv_local_id_fp = recv_flat[:, H]
+        valid_mask = recv_local_id_fp >= 0.0
+        recv_local_id = torch.where(
+            valid_mask, recv_local_id_fp, torch.zeros_like(recv_local_id_fp),
+        ).to(torch.int64)
+
+        # Local deterministic_index_add over received contribs.
+        local_out = torch.zeros(local_tokens, H, device=device, dtype=torch.float32)
+        deterministic_index_add(
+            local_out, recv_local_id, recv_weighted, valid_mask=valid_mask,
+        )
+
+        # Return as [max_tokens, H] so the dispatcher's slice extracts our part.
+        # Non-local positions are uninitialized but ignored by the slice.
+        full = torch.empty(max_tokens, H, device=device, dtype=hidden_states.dtype)
+        full[rank * local_tokens : (rank + 1) * local_tokens] = local_out.to(
+            hidden_states.dtype
+        )
+        return full
 
     def _vllm_forward(self, hidden_states, probs, routing_map):
         """vLLM Triton fused MoE kernel forward (BF16, CUDA-graph safe)."""

@@ -19,6 +19,10 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    deterministic_index_add,
+    is_batch_invariant_mode_enabled,
+)
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.router_replay import RouterReplay
@@ -514,14 +518,13 @@ def unpermute(
     output_tokens = torch.zeros(
         restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
     )
-    if torch.are_deterministic_algorithms_enabled():
-        # Use index_add which is deterministic when deterministic algorithms are enabled
-        # and is CUDA graph compatible
-        output_tokens = torch.zeros(
-            restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
-        )
-        # index_add is deterministic when torch.use_deterministic_algorithms(True) is set
-        # and is CUDA graph compatible unlike scatter_add
+    # AllToAll (training) and AllGather (inference) feed identical topk
+    # contributions in different orders. `scatter_add_` uses atomic adds and
+    # diverges in the low bits across orders; `deterministic_index_add` does
+    # an order-invariant sort + cumsum combine.
+    if is_batch_invariant_mode_enabled():
+        deterministic_index_add(output_tokens, sorted_indices, permuted_tokens)
+    elif torch.are_deterministic_algorithms_enabled():
         output_tokens.index_add_(0, sorted_indices, permuted_tokens)
     else:
         # Scatter add the permuted_input back to the original positions

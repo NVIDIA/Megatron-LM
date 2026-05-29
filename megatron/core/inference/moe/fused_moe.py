@@ -20,6 +20,10 @@ from megatron.core.inference.moe.permute import (
     unpermute_tokens,
 )
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    grouped_gemm_batch_invariant,
+    is_batch_invariant_mode_enabled,
+)
 
 try:
     from torch.nn.functional import grouped_mm
@@ -47,8 +51,18 @@ class ActivationType(Enum):
 def _bf16_grouped_mm(
     x_bf16: torch.Tensor, weight: torch.Tensor, offs: torch.Tensor
 ) -> torch.Tensor:
-    """BF16 grouped GEMM using torch.nn.functional.grouped_mm."""
+    """BF16 grouped GEMM.
+
+    In batch-invariant mode, routes to the DeepGEMM-backed kernel shared with
+    the training path, so RL rollout==train log-probs match bitwise. Otherwise
+    uses torch.nn.functional.grouped_mm.
+    """
     assert x_bf16.dtype == torch.bfloat16, f"Expected bf16 input, got {x_bf16.dtype}"
+    if is_batch_invariant_mode_enabled():
+        # weight is [E, N, K], which is the layout DeepGEMM's NT call expects directly.
+        return grouped_gemm_batch_invariant(
+            x_bf16, weight, offs=offs.to(torch.int32), m_total=x_bf16.shape[0]
+        )
     return grouped_mm(x_bf16, weight.transpose(1, 2), offs=offs)
 
 
@@ -91,6 +105,7 @@ def mcore_fused_moe(
     routing_map: torch.Tensor,
     disable_fused_quant_kernels: bool = False,
     out: torch.Tensor = None,
+    return_pre_unpermute: bool = False,
 ) -> torch.Tensor:
     """Fused MoE: permute -> pad -> FC1 -> activation -> FC2 -> unpad -> unpermute.
 
@@ -130,6 +145,19 @@ def mcore_fused_moe(
     use_mxfp8 = isinstance(fc1_weight, MXFP8Tensor)
     # Fused quant kernels only apply to MXFP8 path
     use_fused_quant = use_mxfp8 and not disable_fused_quant_kernels
+
+    if is_batch_invariant_mode_enabled():
+        # BIK intercepts the bf16 grouped GEMM path (`_bf16_grouped_mm` →
+        # `grouped_gemm_batch_invariant`). The MXFP8 path uses
+        # `scaled_grouped_mm` and is not BIK-instrumented.
+        assert not use_mxfp8, (
+            "batch_invariant_mode requires the bf16 grouped GEMM path; got "
+            "MXFP8 weights. Disable mxfp8 or batch_invariant_mode."
+        )
+        assert HAVE_GROUPED_MM, (
+            "batch_invariant_mode requires torch.nn.functional.grouped_mm "
+            "(PyTorch 2.10+). Upgrade torch or disable batch_invariant_mode."
+        )
 
     if use_mxfp8:
         assert (
@@ -190,6 +218,11 @@ def mcore_fused_moe(
     fc2_output = mm_fn(activation_out, fc2_weight, offs)
 
     # --- Post-processing: unpermute ---
+    if return_pre_unpermute:
+        # Caller wants to do the unpermute itself (e.g. EP > 1 BIK path
+        # needs to AllGather raw contribs across EP and run a single global
+        # deterministic_index_add to match training's reduction tree).
+        return fc2_output, permuted_probs, permutation_map, n_used
     return unpermute_tokens(
         fc2_output, permuted_probs, permutation_map, max_tokens, n_used, valid_tokens, out=out
     )
