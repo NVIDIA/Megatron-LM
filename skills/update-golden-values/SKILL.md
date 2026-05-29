@@ -53,6 +53,12 @@ Reuse `/tmp/gv_venv` if it already exists. The comparison script only depends on
 
 If the working tree already has prior golden-value modifications you want to discard before re-downloading:
 
+**Warning:** this step discards tracked edits under `tests/functional_tests/test_cases/`
+and permanently deletes untracked files in that tree. Before running it, inspect
+`git status --short tests/functional_tests/test_cases/` and confirm there is no
+work the user wants to keep. Prefer stashing or moving work aside when in doubt;
+untracked files removed by the `rm -f` loop cannot be recovered from git.
+
 ```bash
 git checkout -- tests/functional_tests/test_cases/
 git ls-files --others --exclude-standard tests/functional_tests/test_cases/ \

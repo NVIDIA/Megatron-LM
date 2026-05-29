@@ -1,0 +1,16 @@
+[
+  {
+    "id": "create-issue-skill-specific-001",
+    "question": "Do not fetch GitHub or create an issue. From the Megatron-LM create-issue skill, answer in at most 8 bullets: what exact data should be extracted from a GitHub Actions run/job URL, which gh commands does the skill use to find failed jobs and grep logs, how is the triggering PR/test author resolved, and what fields belong in the issue body?",
+    "expected_skill": "create-issue",
+    "expected_script": null,
+    "ground_truth": "The response should use the create-issue skill and state that job URLs have /actions/runs/<run_id>/job/<job_id> while run URLs have /actions/runs/<run_id>, so extract run_id and optional job_id. For run-only input, use gh run view <run_id> --repo NVIDIA/Megatron-LM --json jobs --jq '[.jobs[] | select(.conclusion == \"failure\") | {id: .databaseId, name: .name, url: .url}]'. For logs, use gh api repos/NVIDIA/Megatron-LM/actions/jobs/<job_id>/logs piped to grep -E '(FAILED|ERROR|\\bError\\b|assert|Traceback|Exception|##\\[error\\])' and head -200, and use gh run view --job <job_id> --repo NVIDIA/Megatron-LM --json name --jq .name for the job name. Resolve the triggering PR from headBranch pull-request/<number>, then gh pr view for number/title/url. Resolve the test author from gh pr view baseRefName and gh api commits?path=<test-file-path>&sha=<base-branch>&per_page=1, falling back to PR commits. Issue body should include Describe the bug, Failing run table with PR/run/job links, Error snippet under 30 lines, Steps/Code to reproduce, Additional context, and should tag @NVIDIA/mcore-oncall. It should check duplicate issues before creating and not create anything because the prompt forbids it.",
+    "expected_behavior": [
+      "Uses the create-issue skill guidance before answering.",
+      "Names the run/job URL patterns and run_id/job_id extraction.",
+      "Provides the skill's failed-job listing and log-grep gh commands.",
+      "Explains triggering PR and test-author resolution using headBranch, baseRefName, commits, and PR commits fallback.",
+      "Lists the issue template fields and duplicate-check requirement without creating an issue."
+    ]
+  }
+]

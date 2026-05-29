@@ -1,0 +1,16 @@
+[
+  {
+    "id": "run-on-slurm-skill-specific-001",
+    "question": "Do not run commands. From the Megatron-LM run-on-slurm skill, answer in at most 8 bullets: what exact distributed variables and torch.distributed.run flags belong in the minimal sbatch skeleton, and what are the skill's CUDA_DEVICE_MAX_CONNECTIONS rules for Hopper/Ampere, Blackwell, FSDP, and overlap_moe_expert_parallel_comm?",
+    "expected_skill": "run-on-slurm",
+    "expected_script": null,
+    "ground_truth": "The response should use the run-on-slurm skill and include the minimal skeleton details: shared worktree, #SBATCH --nodes, --ntasks-per-node=1, --gpus-per-node, log output, cd to the worktree, MASTER_ADDR from scontrol show hostnames $SLURM_JOB_NODELIST | head -n1, MASTER_PORT, NNODES=$SLURM_NNODES, GPUS_PER_NODE, WORLD_SIZE=$((NNODES * GPUS_PER_NODE)), and srun uv run python -m torch.distributed.run with --nnodes $NNODES, --nproc-per-node $GPUS_PER_NODE, --rdzv-backend c10d, --rdzv-endpoint $MASTER_ADDR:$MASTER_PORT, and the training script. It should state that all nodes must see the same shared filesystem path, and bare torchrun should be avoided in favor of uv run python -m torch.distributed.run. CUDA_DEVICE_MAX_CONNECTIONS rules: Blackwell/GB200 does not need special handling; pre-Blackwell Hopper/Ampere with TP>1 or CP>1 and non-FSDP sets it to 1; Torch-FSDP2 or Megatron-FSDP must not set it to 1 and should leave it unset or greater than 1; overlap_moe_expert_parallel_comm sets it to 32.",
+    "expected_behavior": [
+      "Uses the run-on-slurm skill guidance before answering.",
+      "Names MASTER_ADDR, MASTER_PORT, NNODES, GPUS_PER_NODE, WORLD_SIZE, and the torch.distributed.run rendezvous flags.",
+      "Mentions the shared worktree requirement and uv run python -m torch.distributed.run.",
+      "Gives the four CUDA_DEVICE_MAX_CONNECTIONS rules for Blackwell, Hopper/Ampere non-FSDP, FSDP, and overlap_moe_expert_parallel_comm.",
+      "Avoids recommending CUDA_DEVICE_MAX_CONNECTIONS=1 unconditionally."
+    ]
+  }
+]

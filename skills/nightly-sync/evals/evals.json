@@ -1,0 +1,16 @@
+[
+  {
+    "id": "nightly-sync-skill-specific-001",
+    "question": "Do not run commands. From the Megatron-LM nightly-sync skill, answer in at most 8 bullets: during a main-to-dev sync conflict, which files must not be taken from main, which file must the sync bot never modify, which files may be explicitly taken from main, and what invariant checks or labels are required before CI/PR progression?",
+    "expected_skill": "nightly-sync",
+    "expected_script": null,
+    "ground_truth": "The response should use the nightly-sync skill and state that the sync branch starts from origin/dev and merges origin/main with conflicts resolved surgically, never with global -X theirs. It should say not to take main's pyproject.toml, uv.lock, or docker/Dockerfile.ci.dev because they are a coupled dev dependency/container triple, and never manually edit uv.lock. It should say .github/CODEOWNERS must never be modified by the sync bot and should be restored from origin/dev and verified with git diff origin/dev -- .github/CODEOWNERS. It should mention files that may be explicitly taken from main when appropriate: megatron/training/training.py, initialize.py, utils.py, datasets/data_samplers.py, and megatron/core/optimizer/layer_wise_optimizer.py. It should mention preserving dev-only additions, checking git source reconciliation in pyproject.toml, running the invariant script before push, creating the PR as draft, and adding Run functional tests and Run MBridge tests labels.",
+    "expected_behavior": [
+      "Uses the nightly-sync skill guidance before answering.",
+      "Warns against global -X theirs and emphasizes preserving dev-only changes.",
+      "Names pyproject.toml, uv.lock, docker/Dockerfile.ci.dev, and .github/CODEOWNERS special handling.",
+      "Names at least three files the skill allows taking from main.",
+      "Mentions invariant checks, draft PR creation, and Run functional tests plus Run MBridge tests labels."
+    ]
+  }
+]

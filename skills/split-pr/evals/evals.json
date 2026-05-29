@@ -1,0 +1,16 @@
+[
+  {
+    "id": "split-pr-skill-specific-001",
+    "question": "Do not run commands or create branches. From the Megatron-LM split-pr skill, answer in at most 8 bullets: what exact analysis commands and CODEOWNERS steps happen first, what optimization goal drives the split, how are dependencies and tests handled, and what constraints apply when executing the split after approval?",
+    "expected_skill": "split-pr",
+    "expected_script": null,
+    "ground_truth": "The response should use the split-pr skill and include: fetch PR details with gh pr view <number> --repo NVIDIA/Megatron-LM --json title,body,headRefName,author and gh pr diff <number> --repo NVIDIA/Megatron-LM --stat, and determine the current GitHub user with gh api user --jq .login. Parse .github/CODEOWNERS, map changed files to owner groups, build a table by CODEOWNERS group, and count distinct reviewer groups. The optimization goal is minimizing CODEOWNERS reviewer groups per resulting PR. Cluster files by identical owner groups; the largest cluster becomes the first PR; dependencies such as symbols renamed in PR A used by PR B must be noted; each PR must be independently mergeable, using backward-compatible aliases/re-exports if needed. Tests should stay with the production code they test. It must wait for user approval before execution. After approval, create draft PRs from appropriate bases, extract changes with git diff upstream/main..<source-branch> -- <file paths> | git apply, stage/commit/push to the user's fork, and create draft PRs. Never push directly upstream; if the original PR must be narrowed, confirm before force-pushing; credit the original author if the current GitHub user is not the author.",
+    "expected_behavior": [
+      "Uses the split-pr skill guidance before answering.",
+      "Names the gh pr view, gh pr diff --stat, and gh api user commands.",
+      "Explains CODEOWNERS mapping and the reviewer-group minimization objective.",
+      "States tests travel with production code and dependent PRs must remain independently mergeable.",
+      "States execution waits for user approval and creates draft PRs on the user's fork, not upstream."
+    ]
+  }
+]

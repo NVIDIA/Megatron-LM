@@ -1,0 +1,16 @@
+[
+  {
+    "id": "respond-to-issue-skill-specific-001",
+    "question": "Do not fetch GitHub or post anything. From the Megatron-LM respond-to-issue skill, answer in at most 8 bullets: what exact research steps should happen before drafting a maintainer reply, what verification is required before citing details, when should similar issues or PRs be searched, and how should the final draft be presented to the maintainer?",
+    "expected_skill": "respond-to-issue",
+    "expected_script": null,
+    "ground_truth": "The response should use the respond-to-issue skill and state that the issue should be fetched with gh issue view <number> --repo NVIDIA/Megatron-LM --json title,body,comments,labels,state, then title/body/comments/labels/state should be read and the issue classified as bug, feature request, question, or discussion. It should say to search/read relevant code, read directly referenced files/functions, check git log --oneline -20 -- <relevant-files>, use git log -S \"<symbol>\" --oneline for symbol history, and check related PRs with gh pr list --repo NVIDIA/Megatron-LM --search \"<keywords>\" --limit 5. Before citing, verify commit hashes with git show <hash> --stat, re-read file paths and line numbers, and grep thoroughly before claiming code is unused or missing. It should also search similar issues with gh issue list --repo NVIDIA/Megatron-LM --search \"<keywords>\" --limit 5. The draft should be technically grounded, respectful, direct, concise, note uncertainty, suggest follow-up actions or PR creation for actionable gaps, and be shown to the maintainer as a quoted markdown block without posting automatically.",
+    "expected_behavior": [
+      "Uses the respond-to-issue skill guidance before answering.",
+      "Names gh issue view fields and issue classification.",
+      "Lists codebase research commands including git log --oneline -20 and git log -S.",
+      "Explains verification before citing commits, paths, line numbers, or unused/missing code.",
+      "States that the draft is presented to the maintainer in a quoted markdown block and never posted automatically."
+    ]
+  }
+]

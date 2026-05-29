@@ -1,0 +1,16 @@
+[
+  {
+    "id": "onboard-gb200-skill-specific-001",
+    "question": "Do not modify files or run commands. From the onboard-gb200-1node-tests skill, answer in at most 8 bullets: what exact recipe files and test-case paths are involved, how do I find eligible 2-node tests, what filters exclude tests, what are the GB200 one-node GPU constraints, and how should TP/PP/EP be adapted?",
+    "expected_skill": "onboard-gb200-1node-tests",
+    "expected_script": null,
+    "ground_truth": "The response should use the onboard-gb200-1node-tests skill and state that GB200 functional recipes live under tests/test_utils/recipes/gb200/ with gpt.yaml and moe.yaml for 2-node nodes:2,gpus:4 tests, moe-1node.yaml as existing one-node MoE, and gpt-1node.yaml as the GPT one-node file to create if absent. Test configs live at tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml and one-node variants use tests/functional_tests/test_cases/{model}/{test_case}_1node/model_config.yaml. Eligible candidates are products entries in gpt.yaml/moe.yaml with scope mr or mr-slim, excluding tests already covered in *-1node.yaml and excluding nightly, weekly, and mr-broken scopes. A GB200 node has four GPUs, so one-node variants are nodes:1,gpus:4, and the world size rule is TP x PP x DP with DP >= EP. Adaptation rules: TP x PP <= 4 is a trivial copy; TP x PP = 8 reduces PP by half; EP > 4 reduces EP to 4; if both EP > 4 and TP x PP > 4 reduce both; ETP cases must satisfy EP x ETP <= TP x DP_new. Recipe entries use mr-github, and only one or two representative tests per recipe should also get mr-github-slim.",
+    "expected_behavior": [
+      "Uses the onboard-gb200-1node-tests skill guidance before answering.",
+      "Names the gb200 recipe files and _1node model_config.yaml path convention.",
+      "Filters eligible candidates by mr/mr-slim scope and excludes nightly, weekly, mr-broken, and already-covered tests.",
+      "States nodes:1 and gpus:4 for GB200 one-node variants.",
+      "Explains the TP/PP/EP/ETP adaptation rules from the skill."
+    ]
+  }
+]
