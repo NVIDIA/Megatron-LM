@@ -148,6 +148,11 @@ class DynamicEngineTestConfig:
     num_speculative_tokens: int = 0
     position_embedding_type: str = "learned_absolute"
     sampling_backend: str = 'torch'
+    enable_async_scheduling: bool = False
+    termination_id: Optional[int] = None
+    temperature: float = 1.0
+    top_k: int = 0
+    top_p: float = 0.0
 
     def __post_init__(self):
 
@@ -229,13 +234,19 @@ class DynamicInferenceEngineTestBase:
                     )
 
             # Sampling params.
+            termination_id = (
+                test_config.termination_id
+                if test_config.termination_id is not None
+                else (-1 if test_config.use_fixed_output_lengths else test_config.vocab_size - 1)
+            )
             sampling_params = SamplingParams(
                 num_tokens_to_generate=num_tokens_to_generate,
-                termination_id=(
-                    -1 if test_config.use_fixed_output_lengths else test_config.vocab_size - 1
-                ),
+                termination_id=termination_id,
                 return_log_probs=test_config.return_log_probs,
                 skip_prompt_log_probs=test_config.skip_prompt_log_probs,
+                temperature=test_config.temperature,
+                top_k=test_config.top_k,
+                top_p=test_config.top_p,
             )
             if not hasattr(sampling_params, "num_tokens_total"):
                 # Remove this if statement branch in megatron-core 0.16
@@ -297,6 +308,7 @@ class DynamicInferenceEngineTestBase:
                 track_generated_token_events=test_config.track_generated_token_events,
                 num_speculative_tokens=test_config.num_speculative_tokens,
                 sampling_backend=test_config.sampling_backend,
+                enable_async_scheduling=test_config.enable_async_scheduling,
             ),
         )
 
@@ -849,6 +861,42 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         env.engine._add_request(request)
         assert request.status == Status.FAILED
         assert list(env.engine.waiting_request_ids) == []
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_async_scheduling_hybrid_mamba_decode_matches_serial_long_staggered(self) -> None:
+        """Hybrid/Mamba async decode must match serial tokens across a longer staggered run."""
+        skip_if_mamba_sequence_packing_not_available("hybrid")
+        common_kwargs = dict(
+            num_requests=8,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=32,
+            num_gap_steps=1,
+            model_provider="hybrid",
+            num_speculative_tokens=0,
+            num_cuda_graphs=1,
+            force_build_cuda_graphs=True,
+            use_cuda_graphs_for_non_decode_steps=False,
+            context_max_requests=8,
+            termination_id=-1,
+            top_k=1,
+        )
+
+        serial_env = self._run_test(enable_async_scheduling=False, **common_kwargs)
+        serial_tokens = [request.generated_tokens for request in serial_env.requests]
+
+        delete_cuda_graphs()
+
+        async_env = self._run_test(enable_async_scheduling=True, **common_kwargs)
+        async_tokens = [request.generated_tokens for request in async_env.requests]
+        controller = async_env.engine.controller
+
+        assert controller._async_forward_launch_count > 0, controller._async_disable_reason
+        assert async_tokens == serial_tokens
 
     @pytest.mark.internal
     @pytest.mark.skipif(
