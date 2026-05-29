@@ -456,7 +456,7 @@ class ShardedObject(ShardedBase):
             # TODO: implement explicit validation
             try:
                 return cls.empty_from_unique_key(key, replica_id)
-            except (TypeError, AssertionError):
+            except (TypeError, AssertionError, ValueError):
                 pass
         return cls(key, None, (1,), (0,), replica_id)
 
