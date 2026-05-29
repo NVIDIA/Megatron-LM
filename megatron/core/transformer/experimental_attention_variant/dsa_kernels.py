@@ -79,7 +79,7 @@ def _dsa_fwd_flash_mla(
     kv: Tensor,
     topk_idxs: Tensor,
     softmax_scale: float,
-    d_v: int = 512,
+    d_v: Optional[int] = None,
     attn_sink: Optional[Tensor] = None,
     topk_length: Optional[Tensor] = None,
     indexer_topk: int = 0,
@@ -89,13 +89,19 @@ def _dsa_fwd_flash_mla(
     Accepts flat (unbatched) tensors with global indices; pads ``TopK`` to
     the GPU-specific alignment; returns ``(out, lse, lse_indexer)``.
     """
-    assert not (
-        indexer_topk > 0 and topk_length is not None
-    ), "indexer_topk > 0 requires non-compact mode (topk_length must be None)"
     _ensure_flash_mla()
 
     _total_S_q, _H, _D = q.shape
     TopK = topk_idxs.shape[-1]
+    # FlashMLA's partial-indexer mode is only needed when the attended set has
+    # non-indexer entries (CSA window tokens). Plain V3.2 DSA attends only the
+    # indexer-selected set, so lse_indexer is identical to lse. Disabling
+    # partial-indexer mode in that case allows the compact topk_length path.
+    requested_indexer_topk = indexer_topk
+    kernel_indexer_topk = 0 if indexer_topk >= TopK else indexer_topk
+    assert not (kernel_indexer_topk > 0 and topk_length is not None), (
+        "partial indexer_topk > 0 requires non-compact mode (topk_length must be None)"
+    )
     topk_align = _get_topk_alignment()
     TopK_padded = (TopK + topk_align - 1) // topk_align * topk_align
     if TopK_padded != TopK:
@@ -105,27 +111,29 @@ def _dsa_fwd_flash_mla(
     kv_3d = kv.unsqueeze(1)  # (total_S_kv, 1, D)  h_kv=1
     indices = topk_idxs.unsqueeze(1)  # (total_S_q, 1, TopK_padded) h_kv=1
 
+    d_v_arg = kv.shape[-1] if d_v is None else d_v
+
     with torch.cuda.nvtx.range("flash_mla_sparse_fwd"):
         res = _flash_mla_sparse_fwd(
             q,
             kv_3d,
             indices,
             softmax_scale,
-            d_v=d_v,
+            d_v=d_v_arg,
             attn_sink=attn_sink,
             topk_length=topk_length,
-            indexer_topk=indexer_topk,
+            indexer_topk=kernel_indexer_topk,
         )
-        if indexer_topk > 0:
+        if kernel_indexer_topk > 0:
             out, _max_logits, lse, lse_indexer = res
         else:
             out, _max_logits, lse = res
             lse_indexer = None
 
-    if indexer_topk > 0:
+    if requested_indexer_topk > 0:
         # When indexer_topk == total TopK, lse_indexer should equal lse but
         # the kernel may not snapshot correctly; fall back to lse.
-        if indexer_topk >= TopK:
+        if requested_indexer_topk >= TopK:
             return out, lse, lse.clone()
         return out, lse, lse_indexer
     return out, lse, None
@@ -253,6 +261,7 @@ class SparseAttnFunc(torch.autograd.Function):
         topk_length: Optional[Tensor],  # (total_sq,) int32 or None
         softmax_scale: float,
         indexer_topk: int,
+        d_v: Optional[int],
     ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
         """Run FlashMLA sparse-attention forward and save tensors for backward."""
         out, lse, lse_indexer = _dsa_fwd_flash_mla(
@@ -260,6 +269,7 @@ class SparseAttnFunc(torch.autograd.Function):
             kv,
             topk_idxs,
             softmax_scale,
+            d_v=d_v,
             attn_sink=attn_sink,
             topk_length=topk_length,
             indexer_topk=indexer_topk,
@@ -289,7 +299,7 @@ class SparseAttnFunc(torch.autograd.Function):
             topk_length=ctx.topk_length,
         )
         dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
-        return dq, dkv, d_sink, None, None, None, None
+        return dq, dkv, d_sink, None, None, None, None, None
 
 
 def dsa_sparse_attn(
@@ -300,6 +310,7 @@ def dsa_sparse_attn(
     softmax_scale: float,
     topk_length: Optional[Tensor] = None,
     indexer_topk: int = 0,
+    d_v: Optional[int] = None,
 ) -> Tensor:
     """Sparse attention (Path A / Path C step 2).
 
@@ -325,7 +336,7 @@ def dsa_sparse_attn(
     kv_flat = kv.reshape(skv * b, d)
 
     out_flat, _lse, _lse_indexer = SparseAttnFunc.apply(
-        q_flat, kv_flat, attn_sink, topk_idxs, topk_length, softmax_scale, indexer_topk
+        q_flat, kv_flat, attn_sink, topk_idxs, topk_length, softmax_scale, indexer_topk, d_v
     )
 
     d_v = out_flat.shape[-1]
@@ -338,7 +349,12 @@ def dsa_sparse_attn(
 
 
 def _indexer_topk_bshd(
-    q_bshd: Tensor, k_bsd: Tensor, w_bsh: Tensor, topk: int, ratio: int = 4
+    q_bshd: Tensor,
+    k_bsd: Tensor,
+    w_bsh: Tensor,
+    topk: int,
+    ratio: int = 4,
+    indexer_softmax_scale: float = 1.0,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """BSHD-layout core for :func:`indexer_topk`.
 
@@ -350,17 +366,18 @@ def _indexer_topk_bshd(
     Args:
         q_bshd: ``(b, sq, idx_nh, idx_hd)`` bf16, C-contiguous.
         k_bsd:  ``(b, sk, idx_hd)`` bf16, C-contiguous.
-        w_bsh:  ``(b, sq, idx_nh)`` bf16, C-contiguous, **already
-            ``indexer_softmax_scale``-scaled** by the caller.
+        w_bsh:  ``(b, sq, idx_nh)`` bf16, C-contiguous raw weights.
         topk:   number of top-K indices to return per query.
         ratio:  compression ratio for the kernel's causal mask.
+        indexer_softmax_scale: scale applied inside the cuDNN kernel after
+            ``ReLU(QK) * W`` and before head reduction.
 
     Returns:
         ``(topk_indices, topk_length, scores)`` where:
 
         * ``topk_indices``: ``(b, sq, topk)`` int32, invalid slots ``-1``.
         * ``topk_length``:  ``(b, sq)`` int32, per-row valid count.
-        * ``scores``: ``(b, sq, sk)`` fp32, raw scores from
+        * ``scores``: ``(b, sq, sk)`` fp32, scaled scores from
           :attr:`cudnn.DSA.indexer_forward_wrapper` with ``-inf`` on
           causally-masked positions.
     """
@@ -372,9 +389,9 @@ def _indexer_topk_bshd(
 
     k_bshd = k_bsd.unsqueeze(2)  # (b, sk, 1, idx_hd)
 
-    scores = _DSA.indexer_forward_wrapper(q_bshd, k_bshd, w_bsh, ratio=ratio)[
-        "scores"
-    ]  # (b, sq, sk) fp32, -inf on masked positions
+    scores = _DSA.indexer_forward_wrapper(
+        q_bshd, k_bshd, w_bsh, ratio=ratio, sm_scale=indexer_softmax_scale
+    )["scores"]  # (b, sq, sk) fp32, -inf on masked positions
 
     # Top-K selection via the TRT-LLM CuTe-DSL radix kernel.
     n_rows = b * sq
@@ -398,29 +415,18 @@ def _indexer_topk_bshd(
 
 
 def _sbhd_to_bshd_indexer_inputs(
-    q_indexer: Tensor, k_indexer: Tensor, weights: Tensor, indexer_softmax_scale: float
-) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-    """Permute the indexer inputs SBHD→BSHD once, returning both the raw
-    BSHD weights and (when needed) a separate scaled copy.
+    q_indexer: Tensor, k_indexer: Tensor, weights: Tensor
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Permute the indexer inputs SBHD→BSHD once, preserving raw weights.
 
-    The ``relu(c·x) = c·relu(x)`` trick lets us push the indexer softmax
-    scale onto ``W`` (``(B, S_q, H)``, small) instead of the score tensor
-    (``(B, S_q, S_k)``, big). The raw ``w_bsh`` is preserved for the
-    backward GEMM path, which takes ``sm_scale`` directly. When
-    ``indexer_softmax_scale == 1.0`` the two views alias each other.
-
-    Returns ``(q_bshd, k_bsd, w_bsh, w_bsh_scaled)``.
+    ``indexer_softmax_scale`` must be passed to cuDNN as ``sm_scale`` so it is
+    applied to the fp32 score after multiplying by raw ``W`` instead of being
+    rounded into bf16 weights on the host.
     """
     q_bshd = q_indexer.permute(1, 0, 2, 3).contiguous()
     k_bsd = k_indexer.permute(1, 0, 2).contiguous()
     w_bsh = weights.permute(1, 0, 2).contiguous()
-
-    if indexer_softmax_scale != 1.0:
-        w_bsh_scaled = (w_bsh.float() * indexer_softmax_scale).to(w_bsh.dtype)
-    else:
-        w_bsh_scaled = w_bsh
-
-    return q_bshd, k_bsd, w_bsh, w_bsh_scaled
+    return q_bshd, k_bsd, w_bsh
 
 
 def indexer_topk(
@@ -443,20 +449,18 @@ def indexer_topk(
         topk: number of top-K indices to select.
         ratio: compression ratio for the causal mask.
         indexer_softmax_scale: scale applied to the indexer ``Q @ K^T``
-            scores (typically ``idx_hd ** -0.5``). Applied internally via
-            the weights-scaling trick (``relu(c·x) = c·relu(x)`` for
-            ``c > 0``) so the caller passes raw weights. Default ``1.0``
-            means weights are treated as already-scaled.
+            scores (typically ``idx_hd ** -0.5``). Applied inside cuDNN as
+            ``sm_scale`` after ``ReLU(QK) * W`` and before head reduction.
 
     Returns:
         topk_indices: ``(b, sq, topk)`` int32 — local per-batch indices into
             ``k_indexer``; invalid positions are ``-1``.
         topk_length:  ``(b, sq)`` int32 — per-query valid count.
     """
-    q_bshd, k_bsd, _w_bsh_raw, w_bsh_scaled = _sbhd_to_bshd_indexer_inputs(
-        q_indexer, k_indexer, weights, indexer_softmax_scale
+    q_bshd, k_bsd, w_bsh = _sbhd_to_bshd_indexer_inputs(q_indexer, k_indexer, weights)
+    topk_indices, topk_length, _ = _indexer_topk_bshd(
+        q_bshd, k_bsd, w_bsh, topk, ratio, indexer_softmax_scale
     )
-    topk_indices, topk_length, _ = _indexer_topk_bshd(q_bshd, k_bsd, w_bsh_scaled, topk, ratio)
     return topk_indices, topk_length
 
 
@@ -474,10 +478,13 @@ def _compute_indexer_predict(
     weights_bsh: Tensor,
     topk_indices: Tensor,
     qhead_per_kv_head: int,
+    indexer_softmax_scale: float = 1.0,
 ) -> Tensor:
     """Compute ``predict`` distribution (softmax over top-K of indexer scores).
 
-    Wraps :attr:`cudnn.DSA.sparse_indexer_score_recompute_wrapper`.
+    Uses cuDNN's architecture-specific sparse indexer score recompute interface
+    directly so ``indexer_softmax_scale`` is passed as ``sm_scale`` instead of
+    being folded into the bf16 ``weights_bsh`` tensor.
 
     Args:
         q_indexer_bshd: ``(B, S_q, H_q, D)`` bf16.
@@ -485,19 +492,56 @@ def _compute_indexer_predict(
         weights_bsh:    ``(B, S_q, H_q)`` bf16.
         topk_indices:   ``(B, S_q, topk)`` int32.
         qhead_per_kv_head: ``H_q`` (MQA).
+        indexer_softmax_scale: scale applied inside the cuDNN kernel after
+            ``ReLU(QK) * W`` and before head reduction.
 
     Returns:
         predict: ``(B, S_q, topk)`` fp32, softmax over the top-K axis.
     """
     _ensure_dsa_namespace()
-    result = _DSA.sparse_indexer_score_recompute_wrapper(
-        q_indexer_bshd,
-        k_indexer_bsd,
-        weights_bsh,
-        topk_indices,
-        qhead_per_kv_head=qhead_per_kv_head,
-    )
-    return result["predict"]
+    # The cuDNN DSA package currently exposes two layers for this kernel:
+    #
+    # * ``DSA.sparse_indexer_score_recompute_wrapper``: high-level wrapper,
+    #   but it does not accept ``sm_scale``.
+    # * ``_interface_sm90/sm100.sparse_indexer_score_recompute``: fixed
+    #   architecture-specific entry points that do accept ``sm_scale``.
+    #
+    # We intentionally call the lower-level fixed interfaces instead of using
+    # a try/fallback wrapper path. ``indexer_softmax_scale`` must not be
+    # pre-multiplied into ``weights_bsh`` because those weights are bf16; doing
+    # so changes rounding. If these cuDNN interfaces change, the fused kernel
+    # tests should fail directly instead of silently switching semantics.
+    # TODO: Switch back to ``DSA.sparse_indexer_score_recompute_wrapper`` once
+    # it exposes/fixes the indexer softmax scale path.
+    major = torch.cuda.get_device_capability()[0]
+    if major == 9:
+        from cudnn.deepseek_sparse_attention.score_recompute import _interface_sm90
+
+        return _interface_sm90.sparse_indexer_score_recompute(
+            q_indexer_bshd,
+            k_indexer_bsd,
+            weights_bsh,
+            topk_indices,
+            sm_scale=indexer_softmax_scale,
+            topk_indices_global=False,
+        )
+    elif major == 10:
+        from cudnn.deepseek_sparse_attention.score_recompute import _interface_sm100
+
+        return _interface_sm100.sparse_indexer_score_recompute(
+            q_indexer_bshd,
+            k_indexer_bsd,
+            weights_bsh,
+            topk_indices,
+            qhead_per_kv_head=qhead_per_kv_head,
+            sm_scale=indexer_softmax_scale,
+            topk_indices_global=False,
+        )
+    else:
+        raise RuntimeError(
+            "DSA sparse indexer score recompute supports only SM90 and SM100, "
+            f"got compute capability major={major}."
+        )
 
 
 def _compute_attn_target(
@@ -573,7 +617,7 @@ def _compute_dense_indexer_score(
     ``(out, denom)`` where
 
     * ``out``    : ``(B, S_q, S_k)`` fp32, the raw head-reduced score
-      ``S[b,q,k] = indexer_softmax_scale * sum_h ReLU(Q_h · K_k^T) · W_{b,q,h}``
+      ``S[b,q,k] = sum_h ReLU(Q_h · K_k^T) · W_{b,q,h} · indexer_softmax_scale``
       with the kernel's ``ratio``-causal mask applied to invalid columns.
     * ``denom``  : ``(B, S_q)`` fp32, the LSE denom of ``out`` along
       ``S_k`` — i.e. ``predict = exp(out - denom[..., None])`` is the
@@ -659,11 +703,14 @@ def _kl_loss_from_dense_scores(
 
     target = attn_score / safe_l1.unsqueeze(-1)
     target_clamped = target.clamp(min=eps)
-    log_predict = index_score - safe_lse.unsqueeze(-1)
+    position_valid = torch.isfinite(index_score)
+    log_predict = torch.where(
+        position_valid, index_score - safe_lse.unsqueeze(-1), torch.zeros_like(index_score)
+    )
 
-    kl_per_row = (target_clamped * (torch.log(target_clamped) - log_predict)).sum(
-        dim=-1
-    )  # (B, S_q)
+    contributions = target_clamped * (torch.log(target_clamped) - log_predict)
+    contributions = torch.where(position_valid, contributions, torch.zeros_like(contributions))
+    kl_per_row = contributions.sum(dim=-1)  # (B, S_q)
     kl_per_row = torch.where(row_valid, kl_per_row, torch.zeros_like(kl_per_row))
     loss = kl_per_row.sum() if calculate_per_token_loss else kl_per_row.mean()
     return loss_coeff * loss
@@ -709,6 +756,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         sparse_loss: bool,
         kv_offset: int,
         calculate_per_token_loss: bool,
+        d_v: Optional[int],
     ) -> Tuple[Tensor, Tensor]:
         """Fused forward: indexer scoring, sparse attention, KL loss, and indexer backward."""
         _ensure_dsa_namespace()
@@ -721,19 +769,30 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         effective_topk = min(indexer_topk, n_comp)
 
         # ---- 1. Permute indexer inputs SBHD->BSHD ONCE. -------------------
-        q_idx_bshd, k_idx_bsd, w_bsh, w_bsh_scaled = _sbhd_to_bshd_indexer_inputs(
-            q_indexer, k_indexer, weights, indexer_softmax_scale
+        q_idx_bshd, k_idx_bsd, w_bsh = _sbhd_to_bshd_indexer_inputs(
+            q_indexer, k_indexer, weights
         )
 
         # ---- 2. Indexer scoring + top-K (with scores retained). -------------
-        topk_indices_cmp, _, indexer_scores = _indexer_topk_bshd(
-            q_idx_bshd, k_idx_bsd, w_bsh_scaled, effective_topk, ratio
+        topk_indices_cmp, topk_length_cmp, indexer_scores = _indexer_topk_bshd(
+            q_idx_bshd, k_idx_bsd, w_bsh, effective_topk, ratio, indexer_softmax_scale
         )  # topk_indices_cmp: (b, sq, effective_topk) int32; indexer_scores: (b, sq, n_comp) fp32
 
         # ---- 3. Combine indices (indexer first, then window). --------------
-        compress_topk_idxs = torch.where(topk_indices_cmp >= 0, topk_indices_cmp + kv_offset, -1)
-        combined_local = torch.cat([compress_topk_idxs, window_idxs], dim=-1)
-        global_idxs = local_to_global_flat(combined_local, b, skv)
+        plain_indexer_only = window_idxs.numel() == 0 and kv_offset == 0
+        if plain_indexer_only:
+            if b == 1:
+                global_idxs = topk_indices_cmp.reshape(sq * b, effective_topk)
+            else:
+                global_idxs = local_to_global_flat(topk_indices_cmp, b, skv)
+            topk_length_flat = topk_length_cmp.permute(1, 0).reshape(-1)
+        else:
+            compress_topk_idxs = torch.where(
+                topk_indices_cmp >= 0, topk_indices_cmp + kv_offset, -1
+            )
+            combined_local = torch.cat([compress_topk_idxs, window_idxs], dim=-1)
+            global_idxs = local_to_global_flat(combined_local, b, skv)
+            topk_length_flat = None
 
         # ---- 4. FlashMLA forward (non-compact, indexer_topk > 0). ---------
         q_flat = query.reshape(sq * b, np_, d)
@@ -743,8 +802,9 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             kv_flat,
             global_idxs,
             softmax_scale,
+            d_v=d_v,
             attn_sink=attn_sink,
-            topk_length=None,
+            topk_length=topk_length_flat,
             indexer_topk=effective_topk,
         )
 
@@ -868,6 +928,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             precomputed_grad_weights,
         )
         ctx.softmax_scale = softmax_scale
+        ctx.topk_length = topk_length_flat
         ctx.sq = sq
         ctx.b = b
         ctx.np_ = np_
@@ -910,7 +971,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             attn_sink,
             global_idxs,
             softmax_scale=ctx.softmax_scale,
-            topk_length=None,
+            topk_length=ctx.topk_length,
         )
         grad_query = attn_bwd["dq"].reshape(sq, b, np_, d)
         grad_kv_full = attn_bwd["dkv"].reshape(skv, b, d)
@@ -940,6 +1001,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )
 
 
@@ -959,6 +1021,7 @@ def fused_indexer_sparse_attn(
     sparse_loss: bool = False,
     kv_offset: int = 0,
     calculate_per_token_loss: bool = False,
+    d_v: Optional[int] = None,
 ) -> Tuple[Tensor, Tensor]:
     """Path B (training): fused indexer (+KL loss) + sparse attention.
 
@@ -991,6 +1054,8 @@ def fused_indexer_sparse_attn(
         kv_offset:    start of compressed region within ``kv_full``.
         calculate_per_token_loss: if True, report raw local KL sum and
             compensate the cuDNN backward wrappers' local averaging.
+        d_v:          number of value channels returned by FlashMLA; ``None`` uses
+                      FlashMLA's default for the input head dimension.
 
     Returns:
         ``(output, indexer_loss)`` where ``output`` is ``(sq, b, np * d_v)``
@@ -1012,6 +1077,7 @@ def fused_indexer_sparse_attn(
         sparse_loss,
         kv_offset,
         calculate_per_token_loss,
+        d_v,
     )
 
 

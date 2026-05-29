@@ -447,11 +447,9 @@ class NativeCSAIndexer(nn.Module):
         self, x: torch.Tensor, qr: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         q, k, weights = self.forward_before_topk(x, qr)
-        weights_scaled = weights.float() * self.softmax_scale
-        if self.apply_dsa_kernel_fusion:
-            weights_scaled = weights_scaled.to(weights.dtype).float()
         scores = torch.einsum("sbhd,tbd->sbht", q.float(), k.float())
-        scores = torch.relu(scores) * weights_scaled.unsqueeze(-1)
+        scores = torch.relu(scores) * weights.float().unsqueeze(-1)
+        scores = scores * self.softmax_scale
         scores = scores.sum(dim=2).transpose(0, 1)
 
         sq = x.size(0)

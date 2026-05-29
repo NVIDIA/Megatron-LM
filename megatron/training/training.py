@@ -589,6 +589,53 @@ def num_floating_point_operations(args, batch_size):
                     * fma_expansion_factor
                     * (q_term + kv_term + o_term)
                 )
+            elif args.experimental_attention_variant == "dsa":
+                ## V3.2 DSA
+                if args.q_lora_rank is None:
+                    q_term = (
+                        args.hidden_size
+                        * args.num_attention_heads
+                        * (args.qk_head_dim + args.qk_pos_emb_head_dim)
+                    )
+                else:
+                    q_term = args.q_lora_rank * (
+                        args.hidden_size
+                        + args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim)
+                        + 1
+                    )
+                dsa_topk = min(int(args.dsa_indexer_topk), int(args.seq_length))
+                compact_attended_tokens = (
+                    dsa_topk * (dsa_topk + 1) / 2 + (args.seq_length - dsa_topk) * dsa_topk
+                )
+                dense_causal_attended_tokens = args.seq_length * args.seq_length / 2
+                attended_tokens_per_token = (
+                    min(compact_attended_tokens, dense_causal_attended_tokens)
+                    / max(args.seq_length, 1)
+                )
+                # V3.2 DSA runs on AbsorbedMLA tensors.
+                standard_self_attn_term = (
+                    forward_backward_expansion_factor
+                    * fma_expansion_factor
+                    * (
+                        ## q lora + rope + q norm
+                        q_term
+                        ## kv lora + rope + kv norm
+                        + args.kv_lora_rank
+                        * (
+                            args.hidden_size
+                            + args.num_attention_heads * (args.qk_head_dim + args.v_head_dim)
+                            + 1
+                        )
+                        + args.hidden_size * args.qk_pos_emb_head_dim
+                        ## o proj
+                        + (args.num_attention_heads * args.v_head_dim) * args.hidden_size
+                        ## core attn
+                        + attended_tokens_per_token
+                        * args.num_attention_heads
+                        * (args.kv_lora_rank + args.qk_pos_emb_head_dim)
+                        + attended_tokens_per_token * args.num_attention_heads * args.kv_lora_rank
+                    )
+                )
             else:
                 ## MLA
                 if args.q_lora_rank is None:

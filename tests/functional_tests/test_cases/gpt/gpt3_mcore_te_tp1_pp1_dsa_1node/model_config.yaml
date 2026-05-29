@@ -14,11 +14,13 @@ MODEL_ARGS:
   --qk-head-dim: 16
   --qk-pos-emb-head-dim: 8
   --v-head-dim: 16
+  --disable-bias-linear: true
   --experimental-attention-variant: dsa
   --dsa-indexer-n-heads: 64
   --dsa-indexer-head-dim: 128
   --dsa-indexer-topk: 2048
   --dsa-indexer-loss-coeff: 0.01
+  --dsa-indexer-use-sparse-loss: true
   --attention-backend: fused
   --log-params-norm: true
   --log-num-zeros-in-grad: true
@@ -50,9 +52,8 @@ MODEL_ARGS:
   --eval-interval: 1000
   --eval-iters: 10
   --transformer-impl: transformer_engine
-  --tensor-model-parallel-size: 2
-  --pipeline-model-parallel-size: 2
-  --sequence-parallel: true
+  --tensor-model-parallel-size: 1
+  --pipeline-model-parallel-size: 1
   --untie-embeddings-and-output-weights: true
   --deterministic-mode: true
   --no-gradient-accumulation-fusion: true

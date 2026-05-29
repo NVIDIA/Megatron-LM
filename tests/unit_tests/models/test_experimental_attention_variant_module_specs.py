@@ -322,12 +322,14 @@ class TestGetDsaModuleSpec:
         with pytest.raises(AssertionError, match="qk_l2_norm is not supported"):
             get_dsa_module_spec_for_backend(cfg, backend=_make_backend())
 
-    def test_returns_mla_self_attention_spec(self):
-        """Verify the returned attention module is MLA self-attention with causal mask."""
-        from megatron.core.transformer.multi_latent_attention import MLASelfAttention
+    def test_returns_absorbed_mla_self_attention_spec(self):
+        """Verify the returned attention module is absorbed MLA with causal mask."""
+        from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
+            AbsorbedMLASelfAttention,
+        )
 
         spec = self._call()
-        assert spec.module is MLASelfAttention
+        assert spec.module is AbsorbedMLASelfAttention
         assert spec.params == {"attn_mask_type": AttnMaskType.causal}
         assert spec.metainfo == {"fuse_input_layernorm": False}
 
@@ -377,9 +379,8 @@ class TestGetDsaModuleSpec:
         spec = self._call(cfg=cfg, backend=backend)
         assert spec.submodules.q_layernorm is IdentityOp
         assert spec.submodules.kv_layernorm is IdentityOp
-        # backend.layer_norm is still called for the indexer k_norm (for_qk=True at line 94),
-        # but NOT for the outer qk_norm (line 105-107 takes the else branch).
-        # Exactly one for_qk=True call should exist (from the indexer, not from qk_norm).
+        # backend.layer_norm is still called for the indexer k_norm (for_qk=True),
+        # but not for the outer qk_norm.
         qk_calls = [c for c in backend.layer_norm.call_args_list if c.kwargs.get("for_qk")]
         assert (
             len(qk_calls) == 1
@@ -395,10 +396,11 @@ class TestGetDsaModuleSpec:
         assert subs.linear_q_down_proj == _FakeLinear
         assert subs.linear_q_up_proj == _FakeColumnParallelLinear
         assert subs.linear_kv_down_proj == _FakeLinear
-        assert subs.linear_kv_up_proj == _FakeColumnParallelLinear
+        assert subs.linear_k_up_proj == _FakeColumnParallelLinear
+        assert subs.linear_v_up_proj == _FakeColumnParallelLinear
         assert subs.linear_proj == _FakeRowParallelLinear
-        # column_parallel_linear() is called exactly 3 times (q_proj, q_up_proj, kv_up_proj)
-        assert backend.column_parallel_linear.call_count == 3
+        # column_parallel_linear() is called for q_proj, q_up_proj, k_up_proj, and v_up_proj.
+        assert backend.column_parallel_linear.call_count == 4
         assert backend.row_parallel_linear.call_count == 1
 
 

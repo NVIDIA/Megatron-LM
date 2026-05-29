@@ -31,12 +31,12 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAttention,
     DSAttentionSubmodules,
 )
+from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
+    AbsorbedMLASelfAttention,
+    AbsorbedMLASelfAttentionSubmodules,
+)
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
-from megatron.core.transformer.multi_latent_attention import (
-    MLASelfAttention,
-    MLASelfAttentionSubmodules,
-)
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
     MultiTokenPredictionBlockSubmodules,
@@ -134,14 +134,15 @@ hybrid_stack_spec = ModuleSpec(
             submodules=TransformerLayerSubmodules(
                 input_layernorm=TENorm,
                 self_attention=ModuleSpec(
-                    module=MLASelfAttention,
+                    module=AbsorbedMLASelfAttention,
                     params={"attn_mask_type": AttnMaskType.causal},
-                    submodules=MLASelfAttentionSubmodules(
+                    submodules=AbsorbedMLASelfAttentionSubmodules(
                         linear_q_proj=TEColumnParallelLinear,
                         linear_q_down_proj=TELinear,
                         linear_q_up_proj=TEColumnParallelLinear,
                         linear_kv_down_proj=TELinear,
-                        linear_kv_up_proj=TEColumnParallelLinear,
+                        linear_k_up_proj=TEColumnParallelLinear,
+                        linear_v_up_proj=TEColumnParallelLinear,
                         core_attention=ModuleSpec(
                             module=DSAttention,
                             submodules=DSAttentionSubmodules(
@@ -229,14 +230,15 @@ hybrid_inference_stack_spec = ModuleSpec(
             submodules=TransformerLayerSubmodules(
                 input_layernorm=TENorm,
                 self_attention=ModuleSpec(
-                    module=MLASelfAttention,
+                    module=AbsorbedMLASelfAttention,
                     params={"attn_mask_type": AttnMaskType.causal},
-                    submodules=MLASelfAttentionSubmodules(
+                    submodules=AbsorbedMLASelfAttentionSubmodules(
                         linear_q_proj=TEColumnParallelLinear,
                         linear_q_down_proj=TELinear,
                         linear_q_up_proj=TEColumnParallelLinear,
                         linear_kv_down_proj=TELinear,
-                        linear_kv_up_proj=TEColumnParallelLinear,
+                        linear_k_up_proj=TEColumnParallelLinear,
+                        linear_v_up_proj=TEColumnParallelLinear,
                         core_attention=ModuleSpec(
                             module=DSAttention,
                             submodules=DSAttentionSubmodules(

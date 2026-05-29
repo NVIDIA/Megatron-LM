@@ -659,8 +659,8 @@ class TestIndexerTopk:
               and the SBHD-flat (b*sq, sk) scores; indexer_top_k kwargs.
         * (b) topk > sk clamping: kernel call uses ``sk`` keys, trailing
               ``[sk:]`` slots are -1, ``topk_length == sk``.
-        * (c) ``indexer_softmax_scale`` pre-scales the weights via the
-              ``relu(c·x) = c·relu(x)`` trick before reaching the kernel.
+        * (c) ``indexer_softmax_scale`` is passed to cuDNN as ``sm_scale``
+              while weights remain raw bf16 values.
         """
 
         # ---- (a) basic call ----------------------------------------------
@@ -676,12 +676,13 @@ class TestIndexerTopk:
         scores = torch.randn(b, sq, sk, dtype=torch.float32, device='cuda')
         captured = {}
 
-        def fake_indexer_forward(q_bshd, k_bshd, w_bsh, ratio):
+        def fake_indexer_forward(q_bshd, k_bshd, w_bsh, ratio, sm_scale=1.0):
             captured['indexer_forward'] = {
                 'q_shape': q_bshd.shape,
                 'k_shape': k_bshd.shape,
                 'w_shape': w_bsh.shape,
                 'ratio': ratio,
+                'sm_scale': sm_scale,
             }
             return {'scores': scores}
 
@@ -728,6 +729,7 @@ class TestIndexerTopk:
             idx_nh,
         ), "(a) indexer_forward w_shape"
         assert captured['indexer_forward']['ratio'] == ratio, "(a) ratio kwarg"
+        assert captured['indexer_forward']['sm_scale'] == 1.0, "(a) default sm_scale kwarg"
         assert captured['filtered_topk']['scores_shape'] == (
             b * sq,
             sk,
@@ -758,7 +760,7 @@ class TestIndexerTopk:
         assert torch.all(topk_indices2[..., sk2:] == -1), "(b) trailing slots not -1"
         assert torch.all(topk_length2 == sk2), "(b) topk_length should equal sk"
 
-        # ---- (c) indexer_softmax_scale pre-scales weights ---------------
+        # ---- (c) indexer_softmax_scale is passed as sm_scale -------------
         dk._DSA = None
         sq3, b3, idx_nh3, idx_hd3 = 2, 1, 2, 32
         sk3 = 4
@@ -768,8 +770,9 @@ class TestIndexerTopk:
         w3 = torch.full((sq3, b3, idx_nh3), 8.0, dtype=torch.bfloat16, device='cuda')
         captured_w = {}
 
-        def fake_indexer_forward_c(q_bshd, k_bshd, w_bsh, ratio):
+        def fake_indexer_forward_c(q_bshd, k_bshd, w_bsh, ratio, sm_scale=1.0):
             captured_w['w'] = w_bsh.detach().clone()
+            captured_w['sm_scale'] = sm_scale
             return {'scores': torch.zeros(b3, sq3, sk3, dtype=torch.float32, device='cuda')}
 
         fake_dsa_c = MagicMock()
@@ -780,12 +783,11 @@ class TestIndexerTopk:
         dk._DSA = fake_dsa_c
 
         indexer_topk(q3, k3, w3, topk=sk3, ratio=4, indexer_softmax_scale=scale)
-        expected_w = (
-            (w3.float() * scale).to(torch.bfloat16).permute(1, 0, 2).reshape(b3, sq3, idx_nh3)
-        )
+        expected_w = w3.permute(1, 0, 2).reshape(b3, sq3, idx_nh3)
         assert torch.allclose(
             captured_w['w'].float(), expected_w.float(), atol=1e-2, rtol=1e-2
-        ), "(c) weights were not pre-scaled by indexer_softmax_scale"
+        ), "(c) weights should remain raw when indexer_softmax_scale is used"
+        assert captured_w['sm_scale'] == scale, "(c) indexer_softmax_scale not passed as sm_scale"
 
 
 # ---------------------------------------------------------------------------
@@ -900,7 +902,7 @@ def _install_full_dsa_mock(
 
     fake_dsa = MagicMock(name='_DSA_full_stub')
 
-    def fake_indexer_forward(q_bshd, k_bshd, w_bsh, ratio):
+    def fake_indexer_forward(q_bshd, k_bshd, w_bsh, ratio, sm_scale=1.0):
         return {'scores': torch.zeros(b, sq, n_comp, dtype=torch.float32, device=q_bshd.device)}
 
     fake_dsa.indexer_forward_wrapper.side_effect = fake_indexer_forward
@@ -1013,7 +1015,7 @@ def _install_full_dsa_mock_dense(
 
     fake_dsa = MagicMock(name='_DSA_full_dense_stub')
 
-    def fake_indexer_forward(q_bshd, k_bshd, w_bsh, ratio):
+    def fake_indexer_forward(q_bshd, k_bshd, w_bsh, ratio, sm_scale=1.0):
         return {'scores': torch.zeros(b, sq, n_comp, dtype=torch.float32, device=q_bshd.device)}
 
     fake_dsa.indexer_forward_wrapper.side_effect = fake_indexer_forward
@@ -1850,15 +1852,17 @@ class TestRealKernelScoreHelpers:
         from megatron.core.transformer.experimental_attention_variant import dsa_kernels as _dk
 
         if case == 'sparse_indexer_predict':
-            # The kernel takes sm_scale=1.0; scale is applied via weights
-            # pre-multiplication (relu(c·x)·W trick). Reference mirrors that.
             scale = s['indexer_softmax_scale']
-            w_scaled = (x['w'].float() * scale).to(x['w'].dtype)
             out = _dk._compute_indexer_predict(
-                x['q_idx'], x['k_idx'], w_scaled, x['topk'], qhead_per_kv_head=s['idx_nh']
+                x['q_idx'],
+                x['k_idx'],
+                x['w'],
+                x['topk'],
+                qhead_per_kv_head=s['idx_nh'],
+                indexer_softmax_scale=scale,
             )
             ref = _ref_indexer_predict_sparse(
-                x['q_idx'].float(), x['k_idx'].float(), w_scaled.float(), x['topk'], sm_scale=1.0
+                x['q_idx'].float(), x['k_idx'].float(), x['w'].float(), x['topk'], sm_scale=scale
             )
             # Softmax outputs in [0, 1]; bf16 element-wise noise can break
             # absolute tolerance, so compare directions via cosine similarity.
@@ -2243,7 +2247,7 @@ class TestRealKernelFusedIndexerSparseAttn:
         d=512,
         skv=640,
         n_comp=512,
-        idx_nh=32,
+        idx_nh=64,
         idx_hd=128,
         indexer_topk=512,
         ratio=4,
@@ -2326,11 +2330,16 @@ class TestRealKernelFusedIndexerSparseAttn:
         # Run indexer + FlashMLA to capture the same ``lse_indexer`` the fused
         # path consumes internally.
         effective_topk = min(s['indexer_topk'], s['n_comp'])
-        q_idx_bshd_bf, k_idx_bsd_bf, _, w_bsh_scaled_bf = _sbhd_to_bshd_indexer_inputs(
-            q_indexer, k_indexer, weights, s['indexer_softmax_scale']
+        q_idx_bshd_bf, k_idx_bsd_bf, w_bsh_bf = _sbhd_to_bshd_indexer_inputs(
+            q_indexer, k_indexer, weights
         )
-        topk_indices_cmp, _ = _indexer_topk_bshd(
-            q_idx_bshd_bf, k_idx_bsd_bf, w_bsh_scaled_bf, effective_topk, s['ratio']
+        topk_indices_cmp, _, _ = _indexer_topk_bshd(
+            q_idx_bshd_bf,
+            k_idx_bsd_bf,
+            w_bsh_bf,
+            effective_topk,
+            s['ratio'],
+            s['indexer_softmax_scale'],
         )
         compress_topk_idxs = torch.where(topk_indices_cmp >= 0, topk_indices_cmp + kv_offset, -1)
         combined_local = torch.cat([compress_topk_idxs, win_idxs], dim=-1)
@@ -2353,18 +2362,12 @@ class TestRealKernelFusedIndexerSparseAttn:
         attn_score_ref = torch.exp(qk_attn - lse_indexer_bsqh.unsqueeze(-1)).sum(dim=2)
         attn_l1norm_ref = attn_score_ref.sum(dim=-1)
 
-        # Indexer path: ReLU(QK_indexer) * W head-summed. The fused path
-        # calls ``_compute_dense_indexer_score`` with ``w_bsh_scaled`` (already
-        # multiplied by ``indexer_softmax_scale``) AND passes
-        # ``indexer_softmax_scale`` again as the kernel's ``sm_scale``,
-        # double-applying the factor (apparent bug in
-        # ``fused_indexer_sparse_attn`` at ``dsa_kernels.py:800-807``). Mirror
-        # that here so the reference matches the fused-path output; revisit
-        # if the upstream pre-scale + kernel-scale duplication is fixed.
+        # Indexer path: ReLU(QK_indexer) * W head-summed, then one fp32
+        # ``indexer_softmax_scale``. Do not pre-scale bf16 weights.
         qk_idx = torch.einsum('bqhd,bkd->bqhk', q_idx_bshd, k_idx_bsd)
-        idx_score_ref = (torch.relu(qk_idx) * w_bsh.unsqueeze(-1)).sum(dim=2) * (
-            s['indexer_softmax_scale'] ** 2
-        )
+        idx_score_ref = (
+            torch.relu(qk_idx) * w_bsh.unsqueeze(-1)
+        ).sum(dim=2) * s['indexer_softmax_scale']
         idx_lse_ref = torch.logsumexp(idx_score_ref, dim=-1)
 
         loss_ref = _kl_loss_from_dense_scores(

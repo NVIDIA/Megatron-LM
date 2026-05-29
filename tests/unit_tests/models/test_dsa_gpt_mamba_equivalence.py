@@ -97,6 +97,8 @@ _MOE_MAMBA_PATTERN = "D-D-DEDE"  # 2 dense (D-) + 2 MoE (DE)
 
 def _make_dsa_config(num_layers: int, tp: int = 1, pp: int = 1) -> MLATransformerConfig:
     """Return a small DeepSeek-V3.2 proxy MLATransformerConfig."""
+    if tp != 1:
+        assert False, "Tensor parallelism is not supported for DSA."
     return MLATransformerConfig(
         num_layers=num_layers,
         hidden_size=256,
@@ -117,6 +119,7 @@ def _make_dsa_config(num_layers: int, tp: int = 1, pp: int = 1) -> MLATransforme
         use_cpu_initialization=True,
         rope_type='rope',
         experimental_attention_variant="dsa",
+        attention_backend="unfused",
         hidden_dropout=0.0,
         attention_dropout=0.0,
         tensor_model_parallel_size=tp,
@@ -130,6 +133,8 @@ def _make_dsa_moe_config(num_layers: int, tp: int = 1, pp: int = 1) -> MLATransf
     Mirrors the DeepSeek-V3 pattern: first 2 GPT layers are dense, last 2 are MoE.
     ``moe_layer_freq=[0, 0, 1, 1]`` controls which GPT layers become MoE layers.
     """
+    if tp != 1:
+        assert False, "Tensor parallelism is not supported for DSA."
     return MLATransformerConfig(
         num_layers=num_layers,
         hidden_size=256,
@@ -150,12 +155,11 @@ def _make_dsa_moe_config(num_layers: int, tp: int = 1, pp: int = 1) -> MLATransf
         use_cpu_initialization=True,
         rope_type='rope',
         experimental_attention_variant="dsa",
+        attention_backend="unfused",
         hidden_dropout=0.0,
         attention_dropout=0.0,
         tensor_model_parallel_size=tp,
-        # Enable sequence parallelism when TP is used, otherwise we
-        # error out due to use of MoE.
-        sequence_parallel=tp > 1,
+        sequence_parallel=False,
         pipeline_model_parallel_size=pp,
         # MoE fields
         num_moe_experts=4,
@@ -378,7 +382,7 @@ _GOLDEN_BASE = Path(__file__).parent.parent.parent / ("functional_tests/test_cas
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("tp,pp", [(1, 1), (2, 1), (1, 2)])
+@pytest.mark.parametrize("tp,pp", [(1, 1), (1, 2)])
 class TestDSAGPTMambaEquivalence:
     """Verify logprob equivalence between GPTModel+DSA and HybridModel+DSA.
 
@@ -518,7 +522,7 @@ class TestDSAGPTMambaEquivalence:
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("tp,pp", [(1, 1), (2, 1), (1, 2)])
+@pytest.mark.parametrize("tp,pp", [(1, 1), (1, 2)])
 class TestDSAMoEGPTMambaEquivalence:
     """Verify logprob equivalence between GPTModel+DSA+MoE and HybridModel+DSA+MoE.
 

@@ -16,9 +16,8 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossAutoScaler,
     DSAIndexerLossLoggingHelper,
-    FusedDSAIndexerLoss,
-    fused_qk_topk_naive,
     rotate_activation,
+    unfused_dsa_indexer_loss_and_topk,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
     build_flat_topk_idxs,
@@ -535,7 +534,14 @@ class CSAIndexer(MegatronModule):
         q, k, weights = self.forward_before_topk(x, qr, packed_seq_params)
         nvtx_range_push("indexer_qk_topk")
         effective_topk = min(self.index_topk, k.size(0))
-        index_scores, topk_indices = fused_qk_topk_naive(q, k, weights, effective_topk, mask)
+        index_scores = torch.einsum('sbhd,tbd->sbht', q.float(), k.float())
+        index_scores = torch.relu(index_scores)
+        index_scores = index_scores * weights.unsqueeze(-1)
+        index_scores = index_scores * self.softmax_scale
+        index_scores = index_scores.sum(dim=2).transpose(0, 1)
+        if mask is not None:
+            index_scores = index_scores + mask
+        topk_indices = index_scores.topk(effective_topk, dim=-1)[1]
         nvtx_range_pop("indexer_qk_topk")
         nvtx_range_pop("indexer")
         return index_scores, topk_indices
@@ -707,24 +713,20 @@ class CompressedSparseAttention(MegatronModule):
                     )
                     indexer_loss_coeff = getattr(self.config, 'dsa_indexer_loss_coeff', 0.0)
                     key_for_loss = compressed_kv.unsqueeze(2).expand(-1, -1, np, -1)
-                    # ``FusedDSAIndexerLoss`` does not accept a separate
-                    # indexer_softmax_scale; apply it here via the
-                    # weights-scaling trick so the effective weights match
-                    # the pre-scale-split behaviour.
-                    weights_for_unfused = weights_indexer.float() * self.indexer.softmax_scale
-                    topk_indices_compressed, indexer_loss = FusedDSAIndexerLoss.apply(
+                    topk_indices_compressed, indexer_loss = unfused_dsa_indexer_loss_and_topk(
                         q_indexer,
-                        weights_for_unfused,
                         k_indexer,
+                        weights_indexer,
+                        self.indexer.softmax_scale,
                         query.detach(),
                         key_for_loss.detach(),
                         self.softmax_scale,
                         min(self.indexer.index_topk, n_compressed),
                         indexer_loss_coeff,
-                        causal_mask,
                         getattr(self.config, "dsa_indexer_use_sparse_loss", True),
                         self.indexer.pg_collection,
-                        self.config.calculate_per_token_loss,
+                        calculate_per_token_loss=self.config.calculate_per_token_loss,
+                        mask=causal_mask,
                     )
                     if indexer_loss_coeff > 0:
                         DSAIndexerLossLoggingHelper.save_loss_to_tracker(

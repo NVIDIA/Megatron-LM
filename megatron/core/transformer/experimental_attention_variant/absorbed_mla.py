@@ -37,7 +37,7 @@ from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
-from megatron.core.utils import deprecate_inference_params, get_pg_size
+from megatron.core.utils import deprecate_inference_params, get_pg_size, is_te_min_version
 
 try:
     from megatron.core.fusions.fused_mla_yarn_rope_apply import (
@@ -99,6 +99,8 @@ class AbsorbedMLASelfAttention(Attention):
         attn_mask_type=AttnMaskType.padding,
         cp_comm_type: Optional[str] = None,
         pg_collection: ProcessGroupCollection = None,
+        pp_layer_offset: Optional[int] = None,
+        is_mtp_layer: bool = False,
     ):
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -109,7 +111,10 @@ class AbsorbedMLASelfAttention(Attention):
             layer_number=layer_number,
             attn_mask_type=attn_mask_type,
             attention_type="self",
+            cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
+            pp_layer_offset=pp_layer_offset,
+            is_mtp_layer=is_mtp_layer,
         )
 
         assert not config.add_bias_linear, "add_bias_linear is not supported for AbsorbedMLA"
@@ -641,9 +646,9 @@ class AbsorbedMLASelfAttention(Attention):
         q_absorbed,
         k_compressed,
         v_compressed,
+        attention_mask,
         hidden_states,
         q_compressed,
-        attention_mask,
         rotary_pos_emb=None,
         attn_mask_type=None,
         attention_bias=None,
@@ -655,9 +660,9 @@ class AbsorbedMLASelfAttention(Attention):
             q_absorbed = inputs[0]
             k_compressed = inputs[1]
             v_compressed = inputs[2]
-            hidden_states = inputs[3]
-            q_compressed = inputs[4]
-            attention_mask = inputs[5]
+            attention_mask = inputs[3]
+            hidden_states = inputs[4]
+            q_compressed = inputs[5]
             attn_mask_type = inputs[7]
             attention_bias = inputs[8]
             packed_seq_params = inputs[9]
@@ -666,9 +671,9 @@ class AbsorbedMLASelfAttention(Attention):
                 q_absorbed,
                 k_compressed,
                 v_compressed,
-                hidden_states,
-                q_compressed,
                 attention_mask,
+                x=hidden_states,
+                qr=q_compressed,
                 attn_mask_type=attn_mask_type,
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
@@ -678,22 +683,22 @@ class AbsorbedMLASelfAttention(Attention):
         if attn_mask_type is None:
             attn_mask_type = self.attn_mask_type
         attn_mask_type = torch.tensor([attn_mask_type.value], dtype=torch.int)
-        hidden_states = tensor_parallel.checkpoint(
+        core_attn_out = tensor_parallel.checkpoint(
             custom_forward,
             False,
             q_absorbed,
             k_compressed,
             v_compressed,
+            attention_mask,
             hidden_states,
             q_compressed,
-            attention_mask,
             rotary_pos_emb,
             attn_mask_type,
             attention_bias,
             packed_seq_params,
         )
 
-        return hidden_states
+        return core_attn_out
 
     def forward(
         self,
@@ -744,9 +749,9 @@ class AbsorbedMLASelfAttention(Attention):
                 q_absorbed,
                 kv_compressed,
                 None,
+                attention_mask,
                 hidden_states,
                 q_compressed,
-                attention_mask,
                 packed_seq_params=packed_seq_params,
             )
         else:
@@ -754,9 +759,9 @@ class AbsorbedMLASelfAttention(Attention):
                 q_absorbed,
                 kv_compressed,
                 None,
-                hidden_states,
-                q_compressed,
                 attention_mask,
+                x=hidden_states,
+                qr=q_compressed,
                 packed_seq_params=packed_seq_params,
                 attn_mask_type=self.attn_mask_type,
             )

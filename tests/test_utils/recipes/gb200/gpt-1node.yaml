@@ -74,6 +74,11 @@ products:
       - environment: [dev]
         scope: [mr-github]
         platforms: [dgx_gb200]
+  - test_case: [gpt3_mcore_te_tp1_pp1_dsa_1node]
+    products:
+      - environment: [dev]
+        scope: [mr-github]
+        platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_reruns_persistent_1_1node]
     products:
       - environment: [dev]
