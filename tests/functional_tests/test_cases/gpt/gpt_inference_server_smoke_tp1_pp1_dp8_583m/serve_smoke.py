@@ -38,7 +38,9 @@ def build_server_cmd(checkpoint_dir: str, tokenizer_model: str) -> list[str]:
     is reused here.
     """
     return [
-        "torchrun",
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
         "--nproc-per-node=8",
         "-m",
         "examples.inference.launch_inference_server",
@@ -118,6 +120,12 @@ def cleaned_env() -> dict:
     ):
         env.pop(v, None)
     env["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
+    # ``--deterministic-mode`` (in build_server_cmd) requires NCCL_ALGO to be
+    # one of the allow-listed values; legacy inference test_cases set these
+    # via model_config.yaml's ENV_VARS block.
+    env["NCCL_ALGO"] = "Ring"
+    env["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"
+    env["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
     return env
 
 
