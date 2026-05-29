@@ -40,15 +40,15 @@ Tier 3 dimension rollup was not available in this report.
 
 ## Tier 1: Static Validation Summary
 
-Tier 1 validation reported findings. NV-BASE ran 9 checks and found 12 total findings.
+Tier 1 validation reported findings. NV-BASE ran 9 checks and found 9 total findings.
 
 Top findings:
 
-- HIGH SCHEMA/author_missing: Author not specified in metadata (`skills/mcore-bump-base-image/SKILL.md`)
-- MEDIUM QUALITY/quality_correctness: SKILL_SPEC recommended field missing: 'metadata.author' (`skills/mcore-bump-base-image/SKILL.md`)
 - MEDIUM QUALITY/quality_correctness: SKILL_SPEC recommended field missing: 'metadata.tags' (`skills/mcore-bump-base-image/SKILL.md`)
 - MEDIUM SCHEMA/body_recommended_section: Missing recommended section: '## Instructions' (`skills/mcore-bump-base-image/SKILL.md`)
 - MEDIUM SCHEMA/body_recommended_section: Missing recommended section: '## Examples' (`skills/mcore-bump-base-image/SKILL.md`)
+- LOW QUALITY/quality_discoverability: Description very long (329 chars, recommend 50-150) (`skills/mcore-bump-base-image/SKILL.md`)
+- LOW QUALITY/quality_discoverability: No '## Purpose' section (`skills/mcore-bump-base-image/SKILL.md`)
 
 ## Tier 2: Deduplication Summary
 

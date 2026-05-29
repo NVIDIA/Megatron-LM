@@ -3,6 +3,8 @@ name: mcore-cicd
 description: CI/CD reference for Megatron-LM. Covers CI pipeline structure, PR scope labels, triggering internal GitLab CI (which force-pushes the current branch to a pull-request/BRANCH ref — always dry-run and verify the destination first; never run against shared or protected branches), and CI failure investigation.
 license: Apache-2.0
 when_to_use: Investigating a CI failure; understanding the pipeline structure; which CI label to attach; triggering internal GitLab CI; 'CI is red', 'how do I trigger CI', 'PR labels', 'where are the logs', 'pull-request branch'.
+metadata:
+  author: Philip Petrakian <ppetrakian@nvidia.com>
 ---
 
 # CI/CD Guide

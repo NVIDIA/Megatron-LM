@@ -9,7 +9,7 @@ This benchmark summarizes NV-BASE validation and Tier 3 live agent evaluation re
 - Skill: `mcore-cicd`
 - Evaluation date: 2026-05-29
 - NV-BASE profile: `internal`
-- Overall verdict: FAIL
+- Overall verdict: PASS
 - Tier 3 live agent evaluation: not available in this report
 
 ## Agents Used
@@ -40,15 +40,15 @@ Tier 3 dimension rollup was not available in this report.
 
 ## Tier 1: Static Validation Summary
 
-Tier 1 validation reported findings. NV-BASE ran 9 checks and found 13 total findings.
+Tier 1 validation passed with observations. NV-BASE ran 9 checks and found 10 total findings.
 
 Top findings:
 
-- HIGH SCHEMA/author_missing: Author not specified in metadata (`skills/mcore-cicd/SKILL.md`)
-- MEDIUM QUALITY/quality_correctness: SKILL_SPEC recommended field missing: 'metadata.author' (`skills/mcore-cicd/SKILL.md`)
 - MEDIUM QUALITY/quality_correctness: SKILL_SPEC recommended field missing: 'metadata.tags' (`skills/mcore-cicd/SKILL.md`)
 - MEDIUM SCHEMA/body_recommended_section: Missing recommended section: '## Instructions' (`skills/mcore-cicd/SKILL.md`)
 - MEDIUM SCHEMA/body_recommended_section: Missing recommended section: '## Examples' (`skills/mcore-cicd/SKILL.md`)
+- LOW QUALITY/quality_discoverability: Description very long (307 chars, recommend 50-150) (`skills/mcore-cicd/SKILL.md`)
+- LOW QUALITY/quality_discoverability: No '## Purpose' section (`skills/mcore-cicd/SKILL.md`)
 
 ## Tier 2: Deduplication Summary
 
@@ -56,4 +56,4 @@ This tier was not run or did not produce findings in this report.
 
 ## Publication Recommendation
 
-The skill should be reviewed before NVCARPS publication. Skill owners should address the findings above and rerun NV-BASE to refresh this benchmark.
+The skill is suitable to proceed toward NVCARPS publication based on this benchmark. Skill owners should keep this file with the skill and refresh it when the evaluation dataset, skill behavior, or target agents materially change.

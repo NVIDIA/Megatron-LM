@@ -5,6 +5,8 @@ license: Apache-2.0
 when_to_use: User asks to split a PR, reduce reviewer groups, or break up a large PR; 'too many CODEOWNERS', 'split this PR', 'break up PR', 'reduce reviewers needed'.
 user_invocable: true
 argument: "PR URL or number"
+metadata:
+  author: Philip Petrakian <ppetrakian@nvidia.com>
 ---
 
 # Split PR by CODEOWNERS Groups

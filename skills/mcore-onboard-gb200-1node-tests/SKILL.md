@@ -5,6 +5,8 @@ license: Apache-2.0
 when_to_use: Adding GB200 github-mr tests; creating single-node variants of existing tests; expanding CI coverage for GB200; 'add GB200 MR tests', 'onboard GB200 1-node', 'create single-node variant'.
 user_invocable: true
 argument: "[model-yaml]  # optional: gpt, moe, or both (default: both)"
+metadata:
+  author: Philip Petrakian <ppetrakian@nvidia.com>
 ---
 
 # Onboard GB200 1-Node GitHub MR Tests
