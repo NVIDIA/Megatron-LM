@@ -360,7 +360,8 @@ def _mamba_state_selective_copy_kernel(
     DST_PTR,
     # Per-request index arrays
     PREFILL_STATUS_PTR,  # [N] 0=decode, 1=prefill
-    STATE_IDX_PTR,  # [N] maps request → mamba state slot
+    STATE_IDX_PTR,  # [N] maps request -> intermediate-state slot
+    DST_STATE_IDX_PTR,  # [N] maps request -> destination current-state slot
     ACCEPTED_PTR,  # [N] accepted token index per request
     # Strides (in elements)
     src_stride_layer,
@@ -372,6 +373,7 @@ def _mamba_state_selective_copy_kernel(
     STATE_SIZE,
     # Compile-time
     BLOCK_SIZE: tl.constexpr,
+    HAS_DST_STATE_IDX: tl.constexpr,
 ):
     """Copy intermediate Mamba state to current state for decode requests.
 
@@ -392,6 +394,10 @@ def _mamba_state_selective_copy_kernel(
         return
 
     state_idx = tl.load(STATE_IDX_PTR + pid_req).to(tl.int64)
+    if HAS_DST_STATE_IDX:
+        dst_state_idx = tl.load(DST_STATE_IDX_PTR + pid_req).to(tl.int64)
+    else:
+        dst_state_idx = state_idx
     accepted = tl.load(ACCEPTED_PTR + pid_req).to(tl.int64)
 
     chunk_start = pid_chunk * BLOCK_SIZE
@@ -404,14 +410,20 @@ def _mamba_state_selective_copy_kernel(
         + state_idx * src_stride_slot
         + accepted * src_stride_spec
     )
-    dst_base = pid_layer.to(tl.int64) * dst_stride_layer + state_idx * dst_stride_slot
+    dst_base = pid_layer.to(tl.int64) * dst_stride_layer + dst_state_idx * dst_stride_slot
 
     data = tl.load(SRC_PTR + src_base + elem_offsets, mask=mask)
     tl.store(DST_PTR + dst_base + elem_offsets, data, mask=mask)
 
 
 def mamba_state_selective_copy(
-    intermediate_states, current_states, prefill_status, state_idx, accepted_counts, num_layers
+    intermediate_states,
+    current_states,
+    prefill_status,
+    state_idx,
+    accepted_counts,
+    num_layers,
+    destination_state_idx=None,
 ):
     """Copy accepted intermediate Mamba states to current states in-place.
 
@@ -423,9 +435,10 @@ def mamba_state_selective_copy(
         intermediate_states: `(L, M, S+1, *state_shape)` — intermediate buffer.
         current_states: `(L, M, *state_shape)` — current state buffer (updated in-place).
         prefill_status: `(N,)` int tensor — 0 for decode, 1 for prefill.
-        state_idx: `(N,)` int tensor — mamba state slot index per request.
+        state_idx: `(N,)` int tensor — intermediate-state slot index per request.
         accepted_counts: `(N,)` int tensor — accepted token index per request.
         num_layers: number of Mamba layers (first dim of the state tensors).
+        destination_state_idx: optional `(N,)` int tensor — current-state destination slot per request.
     """
     N = prefill_status.shape[0]
     if N == 0:
@@ -439,12 +452,16 @@ def mamba_state_selective_copy(
     BLOCK_SIZE = 1024
     num_chunks = triton.cdiv(state_size, BLOCK_SIZE)
     grid = (N, num_layers, num_chunks)
+    has_destination_state_idx = destination_state_idx is not None
+    if destination_state_idx is None:
+        destination_state_idx = state_idx
 
     _mamba_state_selective_copy_kernel[grid](
         intermediate_states,
         current_states,
         prefill_status,
         state_idx,
+        destination_state_idx,
         accepted_counts,
         src_stride_layer=intermediate_states.stride(0),
         src_stride_slot=intermediate_states.stride(1),
@@ -453,4 +470,5 @@ def mamba_state_selective_copy(
         dst_stride_slot=current_states.stride(1),
         STATE_SIZE=state_size,
         BLOCK_SIZE=BLOCK_SIZE,
+        HAS_DST_STATE_IDX=has_destination_state_idx,
     )

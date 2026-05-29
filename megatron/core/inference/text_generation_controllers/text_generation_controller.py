@@ -991,14 +991,18 @@ class TextGenerationController:
             # don't need to re-upload prefill_status for the Mamba kernels.
             prefill_status_gpu = context.gpu_view.request_in_prefill_status[:active_request_count]
             accepted_counts_gpu = self._accepted_token_counts_per_request[:active_request_count]
-            mamba_state_idx = context.mamba_metadata.request_to_mamba_state_idx[
-                active_request_slice
-            ].to(cuda_device, non_blocking=True)
+            mamba_state_idx = context._mamba_base_indices(active_request_slice).to(
+                cuda_device, non_blocking=True
+            )
+            mamba_destination_state_idx = context._mamba_flat_indices(active_request_slice).to(
+                cuda_device, non_blocking=True
+            )
             mamba_state_selective_copy(
                 intermediate_states=context.mamba_intermediate_conv_states,
                 current_states=context.mamba_conv_states,
                 prefill_status=prefill_status_gpu,
                 state_idx=mamba_state_idx,
+                destination_state_idx=mamba_destination_state_idx,
                 accepted_counts=accepted_counts_gpu,
                 num_layers=context.num_mamba_layers,
             )
@@ -1007,6 +1011,7 @@ class TextGenerationController:
                 current_states=context.mamba_ssm_states,
                 prefill_status=prefill_status_gpu,
                 state_idx=mamba_state_idx,
+                destination_state_idx=mamba_destination_state_idx,
                 accepted_counts=accepted_counts_gpu,
                 num_layers=context.num_mamba_layers,
             )
@@ -2857,6 +2862,8 @@ class TextGenerationController:
                     pending_forward_row_indices = None
                     pending_forward_row_mapped = False
                     self._async_discarded_forward_count += 1
+                if pending_forward_reused and context.is_hybrid_model:
+                    context.accept_async_mamba_state(pending_forward_view.current_request_ids)
                 context.release_deferred_async_kv_blocks()
                 if pending_forward_reused and self.num_speculative_tokens > 0:
                     input_ids, _ = context.current_input_and_position_ids()

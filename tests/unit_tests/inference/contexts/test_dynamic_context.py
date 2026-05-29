@@ -77,6 +77,7 @@ class TestDynamicContext:
         num_speculative_tokens=0,
         enable_chunked_prefill: bool = False,
         max_requests: int = None,
+        enable_async_scheduling: bool = False,
     ):
         if is_hybrid_model:
             if layer_type_list is None:
@@ -117,6 +118,7 @@ class TestDynamicContext:
                 unified_memory_level=0,  # unit tests currently broken with UVM
                 enable_chunked_prefill=enable_chunked_prefill,
                 max_requests=max_requests,
+                enable_async_scheduling=enable_async_scheduling,
             ),
         )
         return dynamic_context
@@ -370,6 +372,48 @@ class TestDynamicContext:
         assert torch.all(dynamic_context.request_to_kv_block_ids == -1)
         if is_hybrid_model:
             assert torch.all(dynamic_context.mamba_metadata.request_to_mamba_state_idx == -1)
+            assert torch.all(dynamic_context.mamba_metadata.request_to_mamba_state_bank == 0)
+
+    @pytest.mark.internal
+    @rounder_override(4)
+    def test_async_mamba_state_banks_read_candidate_and_accept(self):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=64,
+            buffer_size_gb=0.03,
+            block_size_tokens=16,
+            max_tokens=None,
+            is_hybrid_model=True,
+            enable_async_scheduling=True,
+        )
+        dynamic_context.paused_request_count = 1
+        dynamic_context.total_request_count = 4
+        dynamic_context.request_ids[:4] = torch.tensor([99, 10, 11, 12], dtype=torch.int64)
+        dynamic_context.mamba_metadata.request_to_mamba_state_idx[:4] = torch.tensor(
+            [9, 2, 4, 5], dtype=torch.int32
+        )
+        dynamic_context.mamba_metadata.request_to_mamba_state_bank[:4] = torch.tensor(
+            [0, 0, 1, 0], dtype=torch.int32
+        )
+
+        active_slice = slice(1, 4)
+        assert dynamic_context.mamba_state_bank_count == 2
+        assert dynamic_context._mamba_flat_indices(active_slice).tolist() == [4, 9, 10]
+        assert dynamic_context._mamba_flat_indices(
+            active_slice, use_candidate_bank=True
+        ).tolist() == [5, 8, 11]
+
+        dynamic_context.accept_async_mamba_state(torch.tensor([11, 99, 777], dtype=torch.int64))
+
+        assert dynamic_context.mamba_metadata.request_to_mamba_state_bank[:4].tolist() == [
+            0,
+            0,
+            0,
+            0,
+        ]
 
     @pytest.mark.internal
     @rounder_override(64)

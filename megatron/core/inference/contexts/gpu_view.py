@@ -59,9 +59,10 @@ class ContextGPUView:
         mha_cu_kv_seq_lengths_bytes = (max_bs + 1) * 4
         mha_block_table_bytes = max_bs * max_kv_blocks * 4
 
-        # Mamba section: 9 int32 fields, only present for hybrid models.
-        #   mamba_batch_indices_decode    int32 (max_bs,)
-        #   mamba_batch_indices_prefill   int32 (max_bs,)
+        # Mamba section: 10 int32 fields, only present for hybrid models.
+        #   mamba_batch_indices_decode       int32 (max_bs,)
+        #   mamba_batch_indices_decode_write int32 (max_bs,)
+        #   mamba_batch_indices_prefill      int32 (max_bs,)
         #   mamba_seq_idx                 int32 (1, max_tokens)
         #   mamba_cu_seqlens              int32 (max_bs + 1,)
         #   mamba_cu_chunk_seqlens        int32 (max_mamba_chunks + 1,)
@@ -71,6 +72,7 @@ class ContextGPUView:
         #   mamba_conv_seq_start          int32 (max_tokens,)
         if max_mamba_chunks > 0:
             mamba_batch_indices_decode_bytes = max_bs * 4
+            mamba_batch_indices_decode_write_bytes = max_bs * 4
             mamba_batch_indices_prefill_bytes = max_bs * 4
             mamba_seq_idx_bytes = max_tokens * 4
             mamba_cu_seqlens_bytes = (max_bs + 1) * 4
@@ -81,6 +83,7 @@ class ContextGPUView:
             mamba_conv_seq_start_bytes = max_tokens * 4
         else:
             mamba_batch_indices_decode_bytes = 0
+            mamba_batch_indices_decode_write_bytes = 0
             mamba_batch_indices_prefill_bytes = 0
             mamba_seq_idx_bytes = 0
             mamba_cu_seqlens_bytes = 0
@@ -100,6 +103,7 @@ class ContextGPUView:
             + mha_cu_kv_seq_lengths_bytes
             + mha_block_table_bytes
             + mamba_batch_indices_decode_bytes
+            + mamba_batch_indices_decode_write_bytes
             + mamba_batch_indices_prefill_bytes
             + mamba_seq_idx_bytes
             + mamba_cu_seqlens_bytes
@@ -184,6 +188,10 @@ class ContextGPUView:
                 off : off + mamba_batch_indices_decode_bytes
             ].view(torch.int32)
             off += mamba_batch_indices_decode_bytes
+            self.mamba_batch_indices_decode_write = self._buf[
+                off : off + mamba_batch_indices_decode_write_bytes
+            ].view(torch.int32)
+            off += mamba_batch_indices_decode_write_bytes
             self.mamba_batch_indices_prefill = self._buf[
                 off : off + mamba_batch_indices_prefill_bytes
             ].view(torch.int32)
@@ -216,6 +224,7 @@ class ContextGPUView:
             off += mamba_conv_seq_start_bytes
         else:
             self.mamba_batch_indices_decode = None
+            self.mamba_batch_indices_decode_write = None
             self.mamba_batch_indices_prefill = None
             self.mamba_seq_idx = None
             self.mamba_cu_seqlens = None

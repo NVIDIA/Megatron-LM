@@ -317,7 +317,6 @@ def _make_controller_with_rows(pending_ids, current_ids, current_graph_count=Non
             total_request_count=len(current_ids),
             padded_active_request_count=current_graph_count,
             using_cuda_graph_this_step=lambda: True,
-            restore_async_mamba_state_snapshot=lambda: None,
         )
     )
     return controller
@@ -785,12 +784,9 @@ def test_wait_for_dummy_context_h2d_synchronizes_once():
 
 @pytest.mark.internal
 def test_pending_async_forward_cleanup_releases_only_when_needed():
-    context = SimpleNamespace(release_count=0, restore_count=0)
+    context = SimpleNamespace(release_count=0)
     context.release_deferred_async_kv_blocks = lambda: setattr(
         context, "release_count", context.release_count + 1
-    )
-    context.restore_async_mamba_state_snapshot = lambda: setattr(
-        context, "restore_count", context.restore_count + 1
     )
     controller = object.__new__(TextGenerationController)
     controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
@@ -803,13 +799,11 @@ def test_pending_async_forward_cleanup_releases_only_when_needed():
 
     controller._discard_pending_async_forward()
     assert context.release_count == 0
-    assert context.restore_count == 0
     assert controller._async_discarded_forward_count == 0
 
     controller._async_pending_forward = True
     controller._discard_pending_async_forward()
     assert context.release_count == 1
-    assert context.restore_count == 1
     assert not controller._async_pending_forward
     assert controller._async_pending_cuda_graph_request_count is None
     assert controller._async_pending_forward_view is None
@@ -817,20 +811,19 @@ def test_pending_async_forward_cleanup_releases_only_when_needed():
 
 
 @pytest.mark.internal
-def test_pending_async_forward_row_discard_restores_mamba_snapshot():
+def test_pending_async_forward_row_discard_releases_without_accepting_mamba_bank():
     controller = _make_controller_with_rows([10, 11], [10, 12])
     context = controller.inference_wrapped_model.inference_context
     context.release_deferred_async_kv_blocks = lambda: None
-    context.restore_count = 0
-    context.restore_async_mamba_state_snapshot = lambda: setattr(
-        context, "restore_count", context.restore_count + 1
+    context.accept_async_mamba_state = lambda _request_ids: pytest.fail(
+        "discarded forwards must not commit candidate Mamba banks"
     )
     controller._async_pending_forward = True
     controller._async_pending_cuda_graph_request_count = 2
 
     assert controller._resolve_pending_async_forward_view() is None
 
-    assert context.restore_count == 1
+    assert controller._async_discarded_forward_count == 1
 
 
 @pytest.mark.internal

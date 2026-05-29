@@ -74,6 +74,7 @@ def _selective_scan_update_kernel(
     z_ptr,
     out_ptr,
     state_batch_indices_ptr,
+    state_batch_write_indices_ptr,
     int_state_ptr,
     # Matrix dimensions
     batch,
@@ -131,7 +132,9 @@ def _selective_scan_update_kernel(
     HAS_D: tl.constexpr,
     HAS_Z: tl.constexpr,
     HAS_STATE_BATCH_INDICES: tl.constexpr,
+    HAS_STATE_BATCH_WRITE_INDICES: tl.constexpr,
     HAS_INT_STATE: tl.constexpr,
+    STATE_BANK_COUNT: tl.constexpr,
     BLOCK_SIZE_DSTATE: tl.constexpr,
 ):
     pid_m = tl.program_id(axis=0)
@@ -148,17 +151,30 @@ def _selective_scan_update_kernel(
     if HAS_STATE_BATCH_INDICES:
         state_batch_indices_ptr += pid_b
         state_batch_idx = tl.load(state_batch_indices_ptr)
+        if HAS_STATE_BATCH_WRITE_INDICES:
+            state_batch_write_indices_ptr += pid_b
+            state_batch_write_idx = tl.load(state_batch_write_indices_ptr)
+        else:
+            state_batch_write_idx = state_batch_idx
         # Skip padding tokens (e.g. from graph capture or inactive slots)
-        if state_batch_idx < 0:
+        if state_batch_idx < 0 or state_batch_write_idx < 0:
             for s in range(seq_len):
                 out_s_ptrs = out_ptrs + s * stride_out_seq
                 tl.store(out_s_ptrs, 0.0, mask=offs_m < dim)
             return
         state_ptr += state_batch_idx * stride_state_batch + pid_h * stride_state_head
+        state_write_ptr = (
+            state_ptr
+            + (state_batch_write_idx - state_batch_idx) * stride_state_batch
+        )
         if HAS_INT_STATE:
-            int_state_ptr += state_batch_idx * stride_int_batch + pid_h * stride_int_head
+            int_state_ptr += (
+                (state_batch_idx // STATE_BANK_COUNT) * stride_int_batch
+                + pid_h * stride_int_head
+            )
     else:
         state_ptr += pid_b * stride_state_batch + pid_h * stride_state_head
+        state_write_ptr = state_ptr
         if HAS_INT_STATE:
             int_state_ptr += pid_b * stride_int_batch + pid_h * stride_int_head
 
@@ -176,6 +192,9 @@ def _selective_scan_update_kernel(
 
     # Constant offsets (A, D, and bias do not have a sequence dimension)
     state_ptrs = state_ptr + (
+        offs_m[:, None] * stride_state_dim + offs_n[None, :] * stride_state_dstate
+    )
+    state_write_ptrs = state_write_ptr + (
         offs_m[:, None] * stride_state_dim + offs_n[None, :] * stride_state_dstate
     )
     if HAS_INT_STATE:
@@ -279,7 +298,7 @@ def _selective_scan_update_kernel(
         tl.store(out_s_ptrs, out, mask=offs_m < dim)
 
     # After processing all sequence steps, persist the final state back to HBM
-    tl.store(state_ptrs, state, mask=(offs_m[:, None] < dim) & (offs_n[None, :] < dstate))
+    tl.store(state_write_ptrs, state, mask=(offs_m[:, None] < dim) & (offs_n[None, :] < dstate))
 
 
 def selective_state_update(
@@ -294,7 +313,9 @@ def selective_state_update(
     dt_bias=None,
     dt_softplus=False,
     state_batch_indices=None,
+    state_batch_write_indices=None,
     intermediate_ssm_states=None,
+    state_bank_count: int = 1,
 ):
     """
     Argument:
@@ -308,8 +329,11 @@ def selective_state_update(
         D: (dim,) or (nheads, dim)
         z: Matches x
         dt_bias: (dim,) or (nheads, dim)
+        state_batch_indices: Optional read-state slot index for each batch row.
+        state_batch_write_indices: Optional write-state slot index for each batch row.
         intermediate_ssm_states: Optional buffer of shape (batch, seqlen, nheads, dim, dstate)
                                  or (batch, seqlen, dim, dstate)
+        state_bank_count: Number of flattened state banks per logical request slot.
     Return:
         out: shape matches x
     """
@@ -378,6 +402,9 @@ def selective_state_update(
     z_strides = (
         (z.stride(0), z.stride(1), z.stride(2), z.stride(3)) if z is not None else (0, 0, 0, 0)
     )
+    has_state_batch_write_indices = state_batch_write_indices is not None
+    if state_batch_write_indices is None:
+        state_batch_write_indices = state_batch_indices
 
     is_blackwell = torch.cuda.get_device_capability(x.device)[0] >= 10
 
@@ -417,6 +444,7 @@ def selective_state_update(
             z,
             out,
             state_batch_indices,
+            state_batch_write_indices,
             intermediate_ssm_states,
             batch,
             seq_len,
@@ -461,6 +489,8 @@ def selective_state_update(
             dt_softplus,
             tie_hdim,
             BLOCK_SIZE_M,
+            HAS_STATE_BATCH_WRITE_INDICES=has_state_batch_write_indices,
+            STATE_BANK_COUNT=state_bank_count,
             num_warps=num_warps,
         )
 
