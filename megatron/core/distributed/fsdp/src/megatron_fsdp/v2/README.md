@@ -1,21 +1,25 @@
-# Megatron FSDP2 (fully_shard_v2)
+# Megatron FSDP v2
 
-This directory contains the **fully_shard_v2** implementation — a PyTorch FSDP2-compatible API layer for Megatron Core.
+This directory contains the **Megatron FSDP v2** implementation — a PyTorch FSDP2-compatible API layer for Megatron Core.
 
 ## Architecture
 
 ```
 v2/
 ├── README.md                    # This file
-├── __init__.py                  # Public exports
-├── fully_shard.py               # Public fully_shard() API
-├── fsdp_module.py               # FSDPModule runtime state and methods
+├── __init__.py                  # Public exports (FSDPModule, fully_shard, mixed precision policies)
+├── fully_shard.py               # Public fully_shard() API entry point
+├── fsdp_module.py               # FSDPModule runtime state (unshard/reshard/reduce_grad)
 ├── hooks.py                     # Forward/backward hook registration
 ├── param_group.py               # ParameterGroup — groups params with shared buffers
 ├── dp_buffer.py                 # DataParallelBuffer — flat buffer management
-├── allocator.py                 # BucketAllocator implementations
-├── utils.py                     # Internal utility functions
-└── design.md                    # Detailed design documentation (overlap, memory, sync)
+├── allocator.py                 # BucketAllocator (Temporary, StorageFreeing, TracePool)
+├── mixed_precision.py           # MixedPrecisionPolicy, FP8Policy, NVFP4Policy
+├── utils.py                     # Internal utilities (mesh init, backward Function)
+├── design.md                    # Overlap, memory, and synchronization design
+├── nvfp4_design.md              # NVFP4 primary-weights design
+├── mcore_fsdp_checkpoint_design.md  # Checkpoint save/load and format conversion design
+└── tp_support_design.md         # Tensor Parallelism support plan (future)
 ```
 
 For the broader `megatron_fsdp` package layout, see the parent directory.
@@ -31,6 +35,23 @@ Wraps a module with FSDP sharding semantics:
 3. Creates `ParameterGroup` for each group with dedicated buffers
 4. Registers forward/backward hooks for unshard/reshard/reduce
 5. Replaces module parameters with `DTensor` representations
+
+### FullyShardMixedPrecisionPolicy
+
+Controls parameter/gradient dtypes and communication precision:
+
+| Policy | `main_params_dtype` | `main_grads_dtype` | Notes |
+|--------|---------------------|---------------------|-------|
+| `FullyShardMixedPrecisionPolicy` | `None` or `fp32` | `None` | Base policy (bf16 param, fp32 reduce) |
+| `FullyShardFP8Policy` | varies | varies | MXFP8 mixed precision |
+| `FullyShardNVFP4Policy` | `fp4` | `fp32` | NVFP4 primary weights |
+
+```python
+from megatron_fsdp.v2 import fully_shard, FullyShardFP8Policy
+
+mp_policy = FullyShardFP8Policy()
+fully_shard(model, mp_policy=mp_policy)
+```
 
 ### FSDPModule
 
@@ -79,33 +100,96 @@ See the parent directory `..` for `uneven_dtensor.py` which provides:
 | `optim` | No | No | **Not yet supported** | Like ZeRO-1: shard optimizer states only |
 | `optim_grads` | No | Yes | **Not yet supported** | Like ZeRO-2: shard optimizer states + gradients |
 
-> **FIXME:** `no_shard`, `optim`, and `optim_grads` sharding strategies are not yet supported in v2.
-> Currently only `optim_grads_params` is fully implemented and tested.
-> These strategies will be added in a follow-up change.
+## Known Limitations
+
+### Parallelism
+
+- **Tensor Parallelism (TP):** Not supported. v2 currently operates on a 1D
+  DP-only DeviceMesh. Parameters that are already partitioned by TP layers
+  (e.g., `ColumnParallelLinear`, `RowParallelLinear`) are not correctly handled.
+  See [tp_support_design.md](tp_support_design.md) for the planned design.
+- **Hybrid Sharding (HSDP):** Not supported. v2 does not yet support an outer
+  DP dimension for hybrid (inter-node + intra-node) sharding.
+- **Context Parallelism (CP):** Not supported.
+- **Expert Parallelism (EP):** Not supported in v2's param group logic. MoE
+  expert parameters are not currently handled via EP submeshes.
+
+### Sharding Strategies
+
+Only `optim_grads_params` (ZeRO-3 equivalent) is implemented. `no_shard`
+(DDP-like), `optim` (ZeRO-1), and `optim_grads` (ZeRO-2) are planned but
+not yet available.
+
+### `fully_shard()` API Parameters
+
+The following parameters are accepted in the function signature but are **not
+yet implemented** (marked `TODO`):
+
+- `reshard_after_forward` — no-op
+- `shard_placement_fn` — no-op; all params use `Shard(0)` on the DP dimension
+- `offload_policy` — no-op; CPU offloading is not supported
+
+### Hardware & Platform
+
+- **GPU only.** CUDA devices only. CPU, XPU, and ROCm are not tested or supported.
+- **NVFP4** (`mixed_precision.py`): The non-distributed quantization path is
+  not implemented (`FIXME` at `mixed_precision.py:686`). Distributed NVFP4
+  (reduce-scatter + quantize) is functional.
+
+### Checkpointing
+
+- **Async checkpoint:** Not supported for the v2 path.
+- **`dp_reshardable` checkpoints:** Loading from `dp_reshardable` format is
+  not supported. Re-save checkpoints with `--ckpt-fully-parallel-save` first.
 
 ## Integration with Megatron
 
-`FullyShardedDataParallel` in `mcore_fsdp_adapter.py` supports two code paths:
+There are two ways to use Megatron FSDP v2:
 
-1. **Legacy path** (`use_fully_shard_api=False`): Uses `MegatronFSDP` from the original megatron_fsdp module
-2. **fully_shard path** (`use_fully_shard_api=True`): Uses PyTorch or Megatron's `fully_shard_v2`
+### Option A: Through Megatron Core (MCore)
 
-### Using fully_shard_v2
+Set `--use-megatron-fsdp-v2` in your training arguments. The adapter
+(`mcore_fsdp_adapter.py`) will automatically route to the v2 `fully_shard`
+path for model sharding.
+
+```bash
+python pretrain_gpt.py \
+    --use-megatron-fsdp-v2 \
+    --use-megatron-fsdp \
+    ...
+```
+
+This is the recommended path for Megatron-LM training workflows.
+
+### Option B: Standalone (without Megatron-LM)
+
+Import `fully_shard` directly from the `megatron_fsdp.v2` package:
 
 ```python
-from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron_fsdp.v2 import FSDPModule, fully_shard
 
-# In your config:
-ddp_config.data_parallel_sharding_strategy = "optim_grads_params"
-ddp_config.use_fully_shard_api = True
-
-# During model setup:
-model = FullyShardedDataParallel(
-    config=transformer_config,
-    ddp_config=ddp_config,
-    module=model,
-)
+model = MyModel().cuda()
+fully_shard(model)
 ```
+
+### Installation
+
+**Pre-release (current):** v2 has not been released as a standalone package yet.
+Clone and install via `PYTHONPATH`:
+
+```bash
+git clone -b mfsdp_refactor https://github.com/shjwudp/Megatron-LM.git
+export PYTHONPATH=$PWD/Megatron-LM/megatron/core/distributed/fsdp/src:$PYTHONPATH
+```
+
+**After release** (once `megatron-fsdp` is published to PyPI):
+
+```bash
+pip install megatron-fsdp
+```
+
+The standalone import (`from megatron_fsdp.v2 import fully_shard`) will work
+without any Megatron-LM dependency once the package is released.
 
 ## Toy Example
 
@@ -113,11 +197,17 @@ See `examples/megatron_fsdp/fsdp_toy.py` for a standalone example showing:
 
 - Basic model wrapping with `fully_shard()`
 - Training loop with gradient accumulation
+- Activation checkpointing (`--activation-checkpoint`)
 - Distributed checkpointing with `torch.distributed.checkpoint`
 
 ```bash
 torchrun --nproc_per_node=2 examples/megatron_fsdp/fsdp_toy.py \
     --model-dim 512 --n-layers 2 --batch-size 4
+
+# With activation checkpointing and Megatron-FSDP
+torchrun --nproc_per_node=2 examples/megatron_fsdp/fsdp_toy.py \
+    --model-dim 512 --n-layers 2 --batch-size 4 \
+    --use-megatron-fsdp --activation-checkpoint
 ```
 
 ## Gotchas / Pitfalls
@@ -128,6 +218,24 @@ torchrun --nproc_per_node=2 examples/megatron_fsdp/fsdp_toy.py \
 ## Unit Tests
 
 ```bash
-# Run FSDP2 API tests
-pytest -xvs tests/unit_tests/distributed/megatron_fsdp/test_mcore_fsdp_fully_shard_v2_api.py
+# Run all v2 unit tests (requires 2 GPUs)
+torchrun --nproc_per_node=2 -m pytest \
+    tests/unit_tests/distributed/megatron_fsdp/v2/ -v -x
+
+# Run specific test files
+torchrun --nproc_per_node=2 -m pytest \
+    tests/unit_tests/distributed/megatron_fsdp/v2/test_fully_shard.py -v
+
+torchrun --nproc_per_node=2 -m pytest \
+    tests/unit_tests/distributed/megatron_fsdp/v2/test_mcore_checkpoint.py -v
+
+# Single-GPU tests
+pytest tests/unit_tests/distributed/megatron_fsdp/v2/ -v \
+    -k "test_double_shard_rejected or test_no_params_module or test_get_state_dict_strict"
 ```
+
+## Acknowledgements
+
+This work was designed and implemented by **Jianbin Chang**\*, **Tong Liu**\*, **Cory Ye** and **Jingyue Wu**.
+
+**\*** Primary code developers.
