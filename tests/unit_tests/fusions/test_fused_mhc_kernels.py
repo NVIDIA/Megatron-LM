@@ -83,8 +83,7 @@ def _ref_h_post_bda(
 ) -> Tensor:
     s, b, n, C = orig_res.shape
     mixed = torch.bmm(
-        h_res.transpose(-1, -2).contiguous().view(s * b, n, n),
-        orig_res.view(s * b, n, C),
+        h_res.transpose(-1, -2).contiguous().view(s * b, n, n), orig_res.view(s * b, n, C)
     ).view(s, b, n, C)
     x_exp = h_post.unsqueeze(-1) * x.unsqueeze(2)
     out = x_exp + mixed
