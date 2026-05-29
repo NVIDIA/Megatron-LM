@@ -53,7 +53,8 @@ try:
         preprocess_state_dict_for_uneven_dtensor,
     )
     from megatron.core.distributed.fsdp.checkpoint import (
-        _apply_mcore_postprocess
+        _apply_mcore_postprocess,
+        _load_torch_dist_into_megatron_fsdp_v2,
     )
     from megatron.core.transformer.fsdp_dtensor_checkpoint import (
         handle_experts_in_state_dict,

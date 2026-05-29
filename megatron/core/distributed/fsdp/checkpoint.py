@@ -1177,7 +1177,7 @@ def _canonicalize_td_key(td_key, *, strip_model_prefix=True):
     return key
 
 
-def load_torch_dist_into_fsdp_v2(args, checkpoint_name, v2_state_dict, strict=True):
+def _load_torch_dist_into_megatron_fsdp_v2(args, checkpoint_name, v2_state_dict, strict=True):
     """Load a torch_dist checkpoint into a Megatron FSDP v2 skeleton via DCP.
 
     This is the entry point for online checkpoint conversion from
