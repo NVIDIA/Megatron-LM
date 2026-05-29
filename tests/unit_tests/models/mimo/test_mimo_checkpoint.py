@@ -4,7 +4,7 @@
 
 Run with 8 GPUs:
     uv run python -m torch.distributed.run --nproc-per-node=8 \
-        -m pytest tests/unit_tests/models/test_mimo_checkpoint.py -v -s
+        -m pytest tests/unit_tests/models/mimo/test_mimo_checkpoint.py -v -s
 """
 
 import os
@@ -20,7 +20,7 @@ from megatron.core.dist_checkpointing import load, save
 from megatron.core.dist_checkpointing.validation import StrictHandling
 from megatron.core.models.mimo.optimizer import get_mimo_optimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
-from tests.unit_tests.models.test_mimo_1f1b_schedule import (
+from tests.unit_tests.models.mimo.test_mimo_1f1b_schedule import (
     create_all_embedding_groups,
     create_hypercomm_grid,
     destroy_all_grids,
