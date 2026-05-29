@@ -17,6 +17,12 @@ from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import init_method_normal, scaled_init_method_normal
 from tests.unit_tests.test_utilities import Utils
 
+_SIMILARITY_EPS = 1e-3
+# Fused dense-loss path: the cuDNN dense indexer backward consumes raw scores plus
+# L1-norm/LSE separately, so its indexer param-grad parity has the same precision
+# floor as the DSv4 fused dense-loss parity test.
+_FUSED_DENSE_INDEXER_GRAD_SIMILARITY_EPS = 3e-3
+
 
 def _mock_rotate_activation(x: torch.Tensor) -> torch.Tensor:
     return x
@@ -383,19 +389,25 @@ def _tensor_sim(a, b):
     return (2.0 * (a * b).sum() / denom).item() if denom else 1.0
 
 
-def _assert_similarity(a: torch.Tensor, b: torch.Tensor, eps: float = 1e-3):
+def _assert_similarity(
+    a: torch.Tensor, b: torch.Tensor, eps: float = _SIMILARITY_EPS, label: str = ""
+):
     assert torch.isfinite(a).all()
     assert torch.isfinite(b).all()
     c = _cosine_sim(a, b)
     t = _tensor_sim(a, b)
-    assert c > 1 - eps, f"cosine_sim={c:.6f}"
-    assert t > 1 - eps, f"tensor_sim={t:.6f}"
+    prefix = f"{label}: " if label else ""
+    assert c > 1 - eps, f"{prefix}cosine_sim={c:.6f}"
+    assert t > 1 - eps, f"{prefix}tensor_sim={t:.6f}"
 
 
 @pytest.mark.parametrize("seqlen", [1024, 2048, 4096])
 @pytest.mark.parametrize("attention_backend", [AttnBackend.unfused, AttnBackend.auto])
 @pytest.mark.parametrize("calculate_per_token_loss", [False, True])
-def test_absorbed_mla_dsa(seqlen: int, attention_backend, calculate_per_token_loss: bool):
+@pytest.mark.parametrize("use_sparse_loss", [False, True], ids=["dense_loss", "sparse_loss"])
+def test_absorbed_mla_dsa(
+    seqlen: int, attention_backend, calculate_per_token_loss: bool, use_sparse_loss: bool
+):
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
     try:
         model_parallel_cuda_manual_seed(1234)
@@ -403,6 +415,7 @@ def test_absorbed_mla_dsa(seqlen: int, attention_backend, calculate_per_token_lo
         torch.cuda.manual_seed(1234)
 
         config = _make_config(
+            use_sparse_loss=use_sparse_loss,
             calculate_per_token_loss=calculate_per_token_loss,
         )
         object.__setattr__(config, "attention_backend", attention_backend)
@@ -485,10 +498,16 @@ def test_absorbed_mla_dsa(seqlen: int, attention_backend, calculate_per_token_lo
         finally:
             dsa_module.rotate_activation = original_rotate_activation
 
+        is_fused_dense = attention_backend != AttnBackend.unfused and not use_sparse_loss
         for baseline_name, baseline_param in baseline.named_parameters():
             real_param = real_params[name_mapping[baseline_name]]
             assert baseline_param.grad is not None
             assert real_param.grad is not None
-            _assert_similarity(real_param.grad, baseline_param.grad)
+            eps = (
+                _FUSED_DENSE_INDEXER_GRAD_SIMILARITY_EPS
+                if is_fused_dense and baseline_name.startswith("indexer.")
+                else _SIMILARITY_EPS
+            )
+            _assert_similarity(real_param.grad, baseline_param.grad, eps=eps, label=baseline_name)
     finally:
         Utils.destroy_model_parallel()
