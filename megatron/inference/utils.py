@@ -60,15 +60,25 @@ def get_model_for_inference() -> MegatronModule:
     # Build model.
     model = _get_model(partial(model_provider, model_builder), wrap_with_ddp=False)
 
-    # Load checkpoint.
-    assert args.load is not None
-    args.exit_on_missing_checkpoint = True
-    load_checkpoint(
-        ddp_model=model,
-        optimizer=None,
-        opt_param_scheduler=None,
-        strict=not args.inference_ckpt_non_strict,
-    )
+    # Load checkpoint. When ``--load`` is not provided, the model is left at
+    # its random initialization -- useful for self-contained functional tests
+    # that don't depend on a pre-saved checkpoint (e.g. the small MLA dynamic
+    # inference test, which exercises the engine code paths rather than
+    # specific learned weights).
+    if args.load is not None:
+        args.exit_on_missing_checkpoint = True
+        load_checkpoint(
+            ddp_model=model,
+            optimizer=None,
+            opt_param_scheduler=None,
+            strict=not args.inference_ckpt_non_strict,
+        )
+    else:
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            "No --load path provided; running inference with random-init weights.",
+        )
 
     # No virtual PP.
     assert len(model) == 1, "Above condition should have caught this"

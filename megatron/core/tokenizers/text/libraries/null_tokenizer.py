@@ -72,6 +72,16 @@ class NullTokenizer:
         raise NotImplementedError
 
     @property
+    def bos(self):
+        """Returns bos token (no real bos in the null tokenizer)."""
+        return -1
+
+    @property
+    def bos_id(self):
+        """Returns bos id (no real bos in the null tokenizer)."""
+        return -1
+
+    @property
     def cls(self):
         """Returns cls token."""
         return -1
