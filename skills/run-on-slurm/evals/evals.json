@@ -1,0 +1,13 @@
+[
+  {
+    "id": "run-on-slurm-skill-specific-001",
+    "question": "I am writing a Megatron-LM sbatch script for multi-node training on a pre-Blackwell (Hopper/Ampere) cluster with tensor-model-parallel-size 4 and pipeline-model-parallel-size 2 (no FSDP, no overlap_moe_expert_parallel_comm). From the run-on-slurm skill, what value should `CUDA_DEVICE_MAX_CONNECTIONS` be set to? Reply with a single bash export line.",
+    "expected_skill": "run-on-slurm",
+    "expected_script": null,
+    "ground_truth": "export CUDA_DEVICE_MAX_CONNECTIONS=1",
+    "expected_behavior": [
+      "Names CUDA_DEVICE_MAX_CONNECTIONS",
+      "Sets the value to 1 for pre-Blackwell Hopper/Ampere with TP>1 and no FSDP"
+    ]
+  }
+]
