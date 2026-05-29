@@ -3166,7 +3166,8 @@ def _add_mla_args(parser):
     group.add_argument('--mscale-all-dim', type=float, default=0.0,
                        help="Mscale all dimensions for YaRN RoPE in multi-latent attention.")
     group.add_argument('--cache-mla-latents', action='store_true', default=False,
-                       help="If set caches the mla down projected latents with mla flash decode.")
+                       help="Cache the low-dimensional MLA latents (compressed KV) instead of "
+                            "full K/V in the dynamic inference backend. Requires FlashInfer.")
     group.add_argument(
         '--mla-down-proj-fusion',
         action='store_true',

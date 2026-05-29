@@ -8,14 +8,6 @@ from typing import TYPE_CHECKING, NoReturn, Optional, Union
 import torch
 import torch.nn.functional as F
 
-try:
-    from einops import rearrange
-
-    HAVE_EINOPS = True
-except ImportError:
-    HAVE_EINOPS = False
-
-
 from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.extensions.transformer_engine import HAVE_TE
@@ -401,40 +393,40 @@ class MultiLatentAttention(Attention):
                         **extra_kwargs,
                     )
             elif self.cache_mla_latents:
-                value, need_v_pad, orig_v_dim, padded_v_dim = _prepare_mla_core_attention_value(
-                    self, query, value, packed_seq_params
+                # FlashInfer MLA path. ``query`` is the always-absorbed
+                # [q_nope, q_pe] concatenation produced by
+                # qkv_up_proj_and_rope_apply_for_cached_latent_kv; split it
+                # back out and dispatch to inference_context.mla_paged_attention.
+                kv_lora_rank = self.config.kv_lora_rank
+                # query: [s, b=1, num_heads, kv_lora_rank + qk_pos_emb_head_dim]
+                # → [total_tokens, num_heads, kv_lora_rank] / [..., qk_pos_emb_head_dim]
+                q_squeezed = query.squeeze(1)
+                q_nope = q_squeezed[..., :kv_lora_rank].contiguous()
+                q_pe = q_squeezed[..., kv_lora_rank:].contiguous()
+                pp_layer_offset = self._get_pp_layer_offset_for_inference()
+                core_attn_out = inference_context.mla_paged_attention(
+                    self.layer_number - pp_layer_offset, q_nope, q_pe, self.softmax_scale
                 )
-                # Dynamic batching attention kernel.
-                q, k, v = (query, key, value)
-                cu_query_lengths, max_seqlen_q = inference_context.cu_query_lengths()
-                cu_kv_lengths, kv_lengths, max_seqlen_k = inference_context.cu_kv_lengths()
-
-                core_attn_out = self.flash_decode_and_prefill(
-                    q,
-                    k,
-                    v,
-                    max_seqlen_q,
-                    max_seqlen_k,
-                    cu_query_lengths,
-                    cu_kv_lengths,
-                    kv_lengths,
-                    block_table,
-                )
-                # Only rearrange if not in absorption mode (Flash MLA handles format correctly)
-                if not inference_context.is_decode_only():
-                    core_attn_out = rearrange(core_attn_out, 's b h d -> s b (h d)')
-                needs_output_trim = need_v_pad
+                # FlashInfer returns [total_tokens, num_heads, kv_lora_rank].
+                # Reshape back to [s, b=1, h, kv_lora_rank] so the downstream
+                # up_v_weight einsum sees the same layout it did before.
+                core_attn_out = core_attn_out.unsqueeze(1)
             if self.offload_core_attention and self.training:
                 core_attn_out = off_interface.group_commit(
                     core_attn_out, name="core_attn", forced_released_tensors=[query, key, value]
                 )
 
-        # We are doing absorption with cache mla latents and decode mode.
-        if self.cache_mla_latents and inference_context.is_decode_only():
-            # core_attn_out = self.self.up_v_layer(core_attn_out)
+        # Map FlashInfer's latent-space output back to v_head_dim. This was
+        # previously gated on is_decode_only() because the prefill path used
+        # a separate non-absorbed kernel; now that the dynamic path always
+        # runs through FlashInfer's absorbed MLA, the einsum is unconditional.
+        if (
+            self.cache_mla_latents
+            and inference_context is not None
+            and not inference_context.is_static_batching()
+        ):
             core_attn_out = torch.einsum("sbhc,hdc->sbhd", core_attn_out, self.up_v_weight)
             core_attn_out = core_attn_out.contiguous()
-
             # Flatten back: [seq, batch, num_heads * v_head_dim]
             core_attn_out = core_attn_out.view(core_attn_out.size(0), core_attn_out.size(1), -1)
 
@@ -810,17 +802,14 @@ class MLASelfAttention(MultiLatentAttention):
             k_pos_emb_squeezed = k_pos_emb.squeeze(1)
             kv_cached = torch.cat([kv_compressed, k_pos_emb_squeezed], dim=-1)
 
-            # Flag for whether to use absorption. We only use absorption
-            # when caching the latents and in decode-only mode
-            use_absorption = (
-                self.config.cache_mla_latents
-                and inference_context
-                and inference_context.is_decode_only()
-            )
-            # Compute query components. Multiply by up k if absorbing
+            # With FlashInfer's BatchMLAPagedAttentionWrapper, absorption is
+            # applied unconditionally on the cache_mla_latents path: the
+            # wrapper runs both decode and (incremental) prefill in the
+            # compressed-KV / kv_lora_rank space, so q_no_pe must be
+            # pre-multiplied by up_k_weight before being passed in.
             q_content = (
                 torch.einsum("sbhd,hdk->sbhk", q_no_pe, self.up_k_weight)
-                if use_absorption
+                if self.config.cache_mla_latents
                 else q_no_pe
             )
             # Query: content + original positional (latent_dim + pos_dim)
