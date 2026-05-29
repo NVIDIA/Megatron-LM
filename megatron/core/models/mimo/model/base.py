@@ -434,7 +434,34 @@ class MimoModel(MegatronModule):
     def _attach_modality_split_sizes(
         self, output: torch.Tensor, input_ids: Optional[torch.Tensor], encoder_name: str
     ) -> None:
-        """Annotate flat modality outputs with per-sample split sizes for bridge fan-out."""
+        """Annotate flat modality outputs with per-sample split sizes for bridge fan-out.
+
+        Fan-out only (encoder DP <= LM DP): the encoder rank's local ``input_ids``
+        describe the samples it will send out. In fan-out the bridge splits this
+        local batch into N pieces for N LM peers on the sender side, consuming
+        ``_mimo_bridge_split_sizes``. The equal-DP case is one-to-one and the
+        metadata is a no-op.
+
+        TODO(mimo): fan-in (encoder DP > LM DP) is not supported. Multiple
+        encoder ranks contribute slices to a single LM peer, and the
+        receiver-side ``torch.cat`` path in BridgeCommunicator has no metadata
+        channel today, so per-sample boundaries are lost on the LM rank. Lift
+        this restriction by routing per-sample sizes through the bridge
+        alongside the activations and adding a sample-aligned concat path.
+        """
+        if self.role.mode is ModuleLayout.NON_COLOCATED:
+            grid_map = self.mimo_config.module_to_grid_map
+            encoder_grid = grid_map[encoder_name]
+            language_grid = grid_map[MIMO_LANGUAGE_MODULE_KEY]
+            encoder_dp = encoder_grid.shape[encoder_grid.dim_names.index("dp")]
+            language_dp = language_grid.shape[language_grid.dim_names.index("dp")]
+            assert encoder_dp <= language_dp, (
+                f"Bridge fan-out split metadata only supports encoder DP <= LM DP "
+                f"(got encoder='{encoder_name}' DP={encoder_dp}, LM DP={language_dp}). "
+                f"Fan-in (encoder DP > LM DP) is not supported yet — see TODO in "
+                f"_attach_modality_split_sizes."
+            )
+
         token_id = self.special_token_ids.get(encoder_name)
         if token_id is None or input_ids is None or output.ndim != 2 or input_ids.size(0) <= 1:
             return

@@ -731,8 +731,13 @@ class TestMimoModelFanoutHelpers:
 
     @staticmethod
     def _stub_model(special_token_ids):
+        from types import SimpleNamespace
+
         model = MimoModel.__new__(MimoModel)
         model.special_token_ids = special_token_ids
+        # COLOCATED skips the fan-out DP assertion path; this fixture targets
+        # the metadata-tagging logic only.
+        model.role = SimpleNamespace(mode=ModuleLayout.COLOCATED)
         return model
 
     def test_attach_modality_split_sizes_tags_output_with_per_sample_counts(self):
