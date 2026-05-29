@@ -9,6 +9,19 @@ when_to_use: Adding or running a unit or functional test; understanding the test
 
 ---
 
+## Answer-First Testing Facts
+
+For questions about disabling tests without deleting them:
+
+- Functional recipe entries stay in YAML; disable by suffixing scope with
+  `-broken`, for example `scope: [mr-github]` -> `scope: [mr-github-broken]`.
+- Unit-test skips use pytest markers instead: `@pytest.mark.flaky_in_dev` skips
+  in the default dev environment, and `@pytest.mark.flaky` skips in LTS.
+- Do not delete the test case or recipe entry when the goal is discoverability
+  and easy re-enable.
+
+---
+
 ## Test Layout
 
 ```text

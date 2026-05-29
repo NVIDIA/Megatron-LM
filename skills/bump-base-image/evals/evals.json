@@ -1,7 +1,7 @@
 [
   {
     "id": "bump-base-image-dev-pin-sync-001",
-    "question": "I changed `docker/.ngc_version.dev` to `nvcr.io/nvidia/pytorch:26.04-py3` for a Megatron-LM dev container bump. Before review, what other CI pin must I update, which rows should I leave alone, and what command would you use to confirm the dev pins match? Do not edit files or run commands.",
+    "question": "I changed `docker/.ngc_version.dev` to `nvcr.io/nvidia/pytorch:26.04-py3` for a Megatron-LM dev container bump. Answer in at most 5 bullets: what other CI pin must I update, which rows should I leave alone, and what command would you use to confirm the dev pins match? You may read the relevant skill, but do not edit files.",
     "expected_skill": "bump-base-image",
     "expected_script": null,
     "ground_truth": "The response should use the bump-base-image skill and say that GitLab CI has a separate hardcoded pin: update both `IMAGE_TYPE: dev` `BASE_IMAGE` rows in `.gitlab/stages/01.build.yml`, one for `PLATFORM: amd64` and one for `PLATFORM: arm64`, to `nvcr.io/nvidia/pytorch:26.04-py3`. It should say to leave `docker/.ngc_version.lts` and all `IMAGE_TYPE: lts` rows alone because this is a dev-only bump. It should provide the sync-check pattern from the skill: read `docker/.ngc_version.dev` and use `rg -n '^\\s*BASE_IMAGE: nvcr\\.io/nvidia/pytorch:' .gitlab/stages/01.build.yml | rg -B1 'IMAGE_TYPE: dev' | rg 'BASE_IMAGE'` or the equivalent `rg ... -A2 -B1` check to confirm the two dev rows match the dev file. It should not discuss refreshing golden values unless the user asks about post-bump CI failures.",

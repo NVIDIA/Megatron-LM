@@ -7,6 +7,25 @@ when_to_use: Submitting a SLURM job; writing or debugging an sbatch script; conf
 
 # Run Megatron-LM on SLURM
 
+## Answer-First Constants
+
+For text-only SLURM setup questions, answer with these constants before the
+full script:
+
+- Submit from a shared worktree path visible to every node; `cd` there in the
+  script before launching training.
+- Use one `srun` task per node and launch workers with
+  `uv run python -m torch.distributed.run`, not bare `torchrun`.
+- Set `MASTER_ADDR` from
+  `scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n1`, set `MASTER_PORT`,
+  `NNODES=${SLURM_NNODES}`, `GPUS_PER_NODE=<GPUS_PER_NODE>`, and
+  `WORLD_SIZE=$((NNODES * GPUS_PER_NODE))`.
+- Pass `--nnodes`, `--nproc-per-node`, `--node-rank`, `--master-addr`, and
+  `--master-port` to `torch.distributed.run`.
+- `CUDA_DEVICE_MAX_CONNECTIONS`: pre-Blackwell Hopper/Ampere with TP>1 or CP>1
+  and non-FSDP uses `1`; Blackwell/GB200 does not need it; Torch-FSDP2 or
+  Megatron-FSDP must not use `1`; `overlap_moe_expert_parallel_comm` uses `32`.
+
 ## Prerequisites
 
 - A SLURM cluster login with submission rights to a GPU partition.

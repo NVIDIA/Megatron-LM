@@ -9,6 +9,19 @@ when_to_use: User wants to upgrade the PyTorch container (e.g. "bump base image 
 
 End-to-end workflow for moving Megatron-LM's CI to a newer `nvcr.io/nvidia/pytorch:<YY.MM>-py3` container. The most common failure mode is forgetting that **GitHub CI and GitLab CI have separate pins** — a bump that only touches the former lands green, then breaks GitLab CI on `main` and forces an immediate follow-up PR. Always update both in the same PR.
 
+## Answer-First Pattern: dev Pin Sync
+
+For a dev-only base-image bump, lead with the synchronization rule:
+
+- `docker/.ngc_version.dev` is only the GitHub/local Dockerfile pin.
+- GitLab CI has separate hardcoded `BASE_IMAGE` rows in
+  `.gitlab/stages/01.build.yml`; update both `IMAGE_TYPE: dev` rows, one
+  `PLATFORM: amd64` and one `PLATFORM: arm64`.
+- Leave `docker/.ngc_version.lts` and all `IMAGE_TYPE: lts` rows unchanged
+  unless the user explicitly asks for an LTS bump.
+- Verify before review with `cat docker/.ngc_version.dev` plus
+  `rg -n '^\s*BASE_IMAGE: nvcr\.io/nvidia/pytorch:' .gitlab/stages/01.build.yml | rg -B1 'IMAGE_TYPE: dev' | rg 'BASE_IMAGE'`.
+
 ## Inputs to gather from the user
 
 1. **Target tag**, e.g. `26.04-py3`. NVIDIA NGC PyTorch containers are released as `nvcr.io/nvidia/pytorch:YY.MM-py3`.

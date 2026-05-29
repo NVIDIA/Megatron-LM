@@ -9,6 +9,23 @@ when_to_use: Investigating a CI failure; understanding the pipeline structure; w
 
 ---
 
+## Answer-First CI Facts
+
+For PR-label or trigger questions, lead with the exact values:
+
+- No label: `scope=mr-github-slim`, `n_repeat=5`, `lightweight=false`.
+- `Run tests`: `scope=mr-github`, `n_repeat=1`, `lightweight=true`.
+- `Run functional tests`: `scope=mr-github`, `n_repeat=5`, `lightweight=false`.
+- `container::lts` only switches the container image path to LTS and combines
+  with any scope label.
+- `Run MBridge tests` additionally triggers the MBridge L1 suite.
+- Safe internal-CI preflight: `python tools/trigger_internal_ci.py --gitlab-origin gitlab --dry-run`.
+  The script force-pushes the current branch to `pull-request/<branch>`, so use
+  only your own PR branch and verify the dry-run destination before optional
+  `--functional-test-*` flags.
+
+---
+
 ## CI Pipeline Structure
 
 The main workflow is `.github/workflows/cicd-main.yml`. It triggers on pushes

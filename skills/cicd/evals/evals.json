@@ -1,7 +1,7 @@
 [
   {
     "id": "cicd-skill-specific-001",
-    "question": "Do not run commands. From the Megatron-LM cicd skill, answer in at most 7 bullets: give the exact PR label decision tree values for no label, Run tests, Run functional tests, container::lts, and Run MBridge tests, then give the safe internal-CI dry-run command and the force-push warning.",
+    "question": "I need to choose Megatron-LM PR labels and safely dry-run internal CI. Answer in at most 7 bullets: give the exact decision-tree values for no label, Run tests, Run functional tests, container::lts, and Run MBridge tests, then give the safe dry-run command and force-push warning. You may read the relevant skill, but do not trigger CI.",
     "expected_skill": "cicd",
     "expected_script": null,
     "ground_truth": "The response should use the cicd skill and state: no label uses scope mr-github-slim, n_repeat 5, lightweight false; Run tests uses scope mr-github, n_repeat 1, lightweight true; Run functional tests uses scope mr-github, n_repeat 5, lightweight false; container::lts switches to the LTS base image and combines with any scope label; Run MBridge tests also triggers MBridge L1. It should give python tools/trigger_internal_ci.py --gitlab-origin gitlab --dry-run and warn that the script force-pushes the current branch to pull-request/<branch>, so only target your own pull-request branch and never shared/protected branches. It should say optional --functional-test-* flags come after the dry-run destination is verified.",
