@@ -703,14 +703,17 @@ def _kl_loss_from_dense_scores(
 
     target = attn_score / safe_l1.unsqueeze(-1)
     target_clamped = target.clamp(min=eps)
+    # Per-position validity: the indexer-score kernel emits -inf at
+    # ratio-masked positions; those contribute 0 to KL by the
+    # ``0 · log(0/p) = 0`` convention. Without this gate, the eps-clamp
+    # on target makes the term ``eps · (log eps - (-inf)) = +inf``.
     position_valid = torch.isfinite(index_score)
-    log_predict = torch.where(
-        position_valid, index_score - safe_lse.unsqueeze(-1), torch.zeros_like(index_score)
-    )
+    safe_index_score = torch.where(position_valid, index_score, torch.zeros_like(index_score))
+    log_predict = safe_index_score - safe_lse.unsqueeze(-1)
 
-    contributions = target_clamped * (torch.log(target_clamped) - log_predict)
-    contributions = torch.where(position_valid, contributions, torch.zeros_like(contributions))
-    kl_per_row = contributions.sum(dim=-1)  # (B, S_q)
+    kl_terms = target_clamped * (torch.log(target_clamped) - log_predict)
+    kl_terms = torch.where(position_valid, kl_terms, torch.zeros_like(kl_terms))
+    kl_per_row = kl_terms.sum(dim=-1)  # (B, S_q)
     kl_per_row = torch.where(row_valid, kl_per_row, torch.zeros_like(kl_per_row))
     loss = kl_per_row.sum() if calculate_per_token_loss else kl_per_row.mean()
     return loss_coeff * loss

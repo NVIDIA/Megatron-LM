@@ -85,6 +85,42 @@ This directory contains self-contained MoE training recipes. Each YAML file incl
       <td>1/2048/4096</td>
       <td>router/preprocess CG; HybridEP; EP overlap</td>
     </tr>
+    <tr>
+      <td rowspan="5">Qwen3-30B-A3B</td>
+      <td><a href="qwen3_30b/h100/fp8_32GPU_TP1PP1EP8.yaml">H100 FP8</a></td>
+      <td>32</td>
+      <td>1/1/8/1/1</td>
+      <td>1/256/4096</td>
+      <td>FP8 blockwise; router/preprocess CG</td>
+    </tr>
+    <tr>
+      <td><a href="qwen3_30b/h100/bf16_32GPU_TP1PP1EP8.yaml">H100 BF16</a></td>
+      <td>32</td>
+      <td>1/1/8/1/1</td>
+      <td>1/256/4096</td>
+      <td>BF16 baseline</td>
+    </tr>
+    <tr>
+      <td><a href="qwen3_30b/gb200/bf16_16GPU_TP1PP1EP16.yaml">GB200 BF16</a></td>
+      <td>16</td>
+      <td>1/1/16/1/1</td>
+      <td>4/512/4096</td>
+      <td>BF16 baseline</td>
+    </tr>
+    <tr>
+      <td><a href="qwen3_30b/gb200/mxfp8_16GPU_TP1PP1EP16_partial_cg.yaml">GB200 MXFP8 partial CG</a></td>
+      <td>16</td>
+      <td>1/1/16/1/1</td>
+      <td>4/512/4096</td>
+      <td>MXFP8; partial CG</td>
+    </tr>
+    <tr>
+      <td><a href="qwen3_30b/gb200/mxfp8_16GPU_TP1PP1EP16_paged_stash.yaml">GB200 MXFP8 paged stash</a></td>
+      <td>16</td>
+      <td>1/1/16/1/1</td>
+      <td>4/512/4096</td>
+      <td>MXFP8; paged stash; full CG</td>
+    </tr>
   </tbody>
 </table>
 

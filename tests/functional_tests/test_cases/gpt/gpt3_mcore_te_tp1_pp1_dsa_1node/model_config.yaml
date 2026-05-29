@@ -21,7 +21,6 @@ MODEL_ARGS:
   --dsa-indexer-topk: 2048
   --dsa-indexer-loss-coeff: 0.01
   --dsa-indexer-use-sparse-loss: true
-  --attention-backend: fused
   --log-params-norm: true
   --log-num-zeros-in-grad: true
   --log-validation-ppl-to-tensorboard: true
