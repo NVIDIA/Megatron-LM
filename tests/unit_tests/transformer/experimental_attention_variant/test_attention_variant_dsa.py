@@ -25,6 +25,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     _compute_index_scores,
     compute_dsa_indexer_loss,
     fused_qk_topk_naive,
+    fused_qk_topk_naive_thd,
     rotate_activation,
 )
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention
@@ -1731,3 +1732,423 @@ class TestDSAModuleSpecDispatch:
         config = self._make_dsa_config(qk_l2_norm=True)
         with pytest.raises(AssertionError, match="qk_l2_norm is not supported"):
             get_dsa_module_spec_for_backend(config, backend=None)
+
+
+# ===========================================================================
+# THD: FusedDSAIndexerLoss
+# ===========================================================================
+
+
+class TestFusedDSAIndexerLossThd:
+    """``FusedDSAIndexerLoss`` THD branch — per-segment loop that delegates
+    each segment to the SBHD naive helpers with ``b=1`` and aggregates
+    via row-weighted-mean.
+
+    For a single-segment THD batch (``cu_seqlens_q = [0, sq]``) the THD
+    invocation must produce numerically equivalent loss + gradients as
+    the SBHD invocation with ``b=1`` on the same data — the only
+    difference is the (B=1) per-segment slicing/concat glue.
+    """
+
+    @pytest.fixture(scope='class', autouse=True)
+    def setup_method(self, request):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        request.cls.pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=['tp']
+        )
+        yield
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize('sparse_loss', [False, True], ids=['dense_loss', 'sparse_loss'])
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_thd_single_segment_matches_sbhd_b1(self, sparse_loss):
+        """B=1 THD invocation should match the equivalent SBHD-b=1 call
+        (loss + gradients) for both sparse and dense KL loss variants.
+        """
+        torch.manual_seed(0)
+        sq = 32
+        n_compressed = sq // 4  # ratio=4 → compressed K len per segment
+        ratio = 4
+        num_heads = 4
+        head_dim = 64
+        idx_nh, idx_hd = 4, 32
+        topk = 4
+        softmax_scale = head_dim**-0.5
+        loss_coeff = 0.5
+
+        # ---- Common inputs (SBHD-shape with b=1) -----------------------
+        def _rand(*shape, dtype=torch.float32):
+            return torch.randn(*shape, dtype=dtype, device='cuda')
+
+        q_sbhd = _rand(sq, 1, idx_nh, idx_hd).requires_grad_(True)
+        w_sbhd = _rand(sq, 1, idx_nh).requires_grad_(True)
+        k_sbhd = _rand(n_compressed, 1, idx_hd).requires_grad_(True)
+        query_sbhd = _rand(sq, 1, num_heads, head_dim, dtype=torch.bfloat16)
+        key_sbhd = _rand(n_compressed, 1, num_heads, head_dim, dtype=torch.bfloat16)
+
+        # SBHD per-batch causal mask: (1, sq, n_compressed).
+        cols = torch.arange(n_compressed, device='cuda').unsqueeze(0).expand(sq, -1)
+        positions = torch.arange(1, sq + 1, device='cuda').unsqueeze(1)
+        mask_sbhd = torch.where(cols >= positions // ratio, float('-inf'), 0.0).unsqueeze(0)
+
+        # ---- SBHD reference --------------------------------------------
+        topk_indices_sbhd, loss_sbhd = FusedDSAIndexerLoss.apply(
+            q_sbhd,
+            w_sbhd,
+            k_sbhd,
+            query_sbhd,
+            key_sbhd,
+            softmax_scale,
+            topk,
+            loss_coeff,
+            mask_sbhd,
+            sparse_loss,
+            self.pg_collection,
+            False,  # calculate_per_token_loss
+        )
+        loss_sbhd.backward()
+        grad_q_sbhd = q_sbhd.grad.clone()
+        grad_w_sbhd = w_sbhd.grad.clone()
+        grad_k_sbhd = k_sbhd.grad.clone()
+
+        # ---- THD equivalent (B=1, total_q=sq) --------------------------
+        q_thd = q_sbhd.detach().squeeze(1).clone().requires_grad_(True)
+        w_thd = w_sbhd.detach().squeeze(1).clone().requires_grad_(True)
+        k_thd = k_sbhd.detach().squeeze(1).clone().requires_grad_(True)
+        query_thd = query_sbhd.squeeze(1)
+        key_thd = key_sbhd.squeeze(1)
+
+        cu_seqlens_q = torch.tensor([0, sq], dtype=torch.int32, device='cuda')
+        cu_seqlens_comp = torch.tensor([0, n_compressed], dtype=torch.int32, device='cuda')
+
+        topk_indices_thd, loss_thd = FusedDSAIndexerLoss.apply(
+            q_thd,
+            w_thd,
+            k_thd,
+            query_thd,
+            key_thd,
+            softmax_scale,
+            topk,
+            loss_coeff,
+            None,  # mask: built per-segment internally for THD
+            sparse_loss,
+            self.pg_collection,
+            False,  # calculate_per_token_loss
+            cu_seqlens_q,
+            cu_seqlens_comp,
+            ratio,
+        )
+        loss_thd.backward()
+        grad_q_thd = q_thd.grad
+        grad_w_thd = w_thd.grad
+        grad_k_thd = k_thd.grad
+
+        tag = f"[sparse={sparse_loss}]"
+
+        # Loss + grads must match the SBHD-b=1 reference (same math,
+        # same data; only the slicing-and-concat glue differs).
+        assert torch.allclose(loss_thd, loss_sbhd, rtol=1e-5, atol=1e-5), (
+            f"{tag} loss mismatch: thd={loss_thd.item()}, " f"sbhd={loss_sbhd.item()}"
+        )
+        # topk_indices_thd is (total_q, topk); SBHD is (1, sq, topk).
+        assert torch.equal(
+            topk_indices_thd, topk_indices_sbhd.squeeze(0).int()
+        ), f"{tag} topk mismatch"
+        assert torch.allclose(
+            grad_q_thd, grad_q_sbhd.squeeze(1), rtol=1e-5, atol=1e-5
+        ), f"{tag} grad_q mismatch"
+        assert torch.allclose(
+            grad_w_thd, grad_w_sbhd.squeeze(1), rtol=1e-5, atol=1e-5
+        ), f"{tag} grad_w mismatch"
+        assert torch.allclose(
+            grad_k_thd, grad_k_sbhd.squeeze(1), rtol=1e-5, atol=1e-5
+        ), f"{tag} grad_k mismatch"
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_thd_missing_kwarg_raises(self):
+        """THD mode requires both ``cu_seqlens_compressed_idx`` and
+        ``ratio``; supplying ``cu_seqlens_q`` alone raises ``ValueError``.
+        """
+        sq, n_compressed = 8, 2
+        idx_nh, idx_hd = 4, 32
+        num_heads, head_dim = 4, 64
+        q = torch.zeros(sq, idx_nh, idx_hd, dtype=torch.float32, device='cuda')
+        w = torch.zeros(sq, idx_nh, dtype=torch.float32, device='cuda')
+        k = torch.zeros(n_compressed, idx_hd, dtype=torch.float32, device='cuda')
+        query = torch.zeros(sq, num_heads, head_dim, dtype=torch.bfloat16, device='cuda')
+        key = torch.zeros(n_compressed, num_heads, head_dim, dtype=torch.bfloat16, device='cuda')
+        cu_q = torch.tensor([0, sq], dtype=torch.int32, device='cuda')
+        with pytest.raises(ValueError, match="THD mode requires"):
+            FusedDSAIndexerLoss.apply(
+                q,
+                w,
+                k,
+                query,
+                key,
+                head_dim**-0.5,
+                2,
+                1.0,
+                None,
+                False,
+                self.pg_collection,
+                False,  # calculate_per_token_loss
+                cu_q,  # cu_seqlens_q supplied
+                None,  # cu_seqlens_compressed_idx MISSING
+                None,  # ratio MISSING
+            )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_thd_multiseg_zero_compressed_segment_row_mean_normalization(self):
+        """THD aggregated loss should be row-mean over ``total_q`` even when
+        some segments have ``seqlen_compressed == 0``.
+
+        Build a two-segment THD batch where segment 0 has no compressed keys
+        (sq=2, ratio=4 -> 0 compressed) and segment 1 has compressed keys
+        (sq=8 -> 2 compressed). Compare THD loss to an SBHD per-segment
+        reference aggregated as ``sum(loss_b * sq_b) / total_q``.
+        """
+        torch.manual_seed(7)
+        seg_q_lens = [2, 8]
+        seg_comp_lens = [0, 2]
+        total_q = sum(seg_q_lens)
+        total_comp = sum(seg_comp_lens)
+        ratio = 4
+        idx_nh, idx_hd = 4, 32
+        num_heads, head_dim = 4, 64
+        topk = 2
+        softmax_scale = head_dim**-0.5
+        loss_coeff = 0.5
+        dev = 'cuda'
+
+        # THD inputs
+        q_thd = torch.randn(total_q, idx_nh, idx_hd, dtype=torch.float32, device=dev)
+        w_thd = torch.randn(total_q, idx_nh, dtype=torch.float32, device=dev)
+        k_thd = torch.randn(total_comp, idx_hd, dtype=torch.float32, device=dev)
+        query_thd = torch.randn(total_q, num_heads, head_dim, dtype=torch.bfloat16, device=dev)
+        key_thd = torch.randn(total_comp, num_heads, head_dim, dtype=torch.bfloat16, device=dev)
+
+        cu_seqlens_q = torch.tensor([0, 2, 10], dtype=torch.int32, device=dev)
+        cu_seqlens_comp = torch.tensor([0, 0, 2], dtype=torch.int32, device=dev)
+
+        _, loss_thd = FusedDSAIndexerLoss.apply(
+            q_thd,
+            w_thd,
+            k_thd,
+            query_thd,
+            key_thd,
+            softmax_scale,
+            topk,
+            loss_coeff,
+            None,
+            False,
+            self.pg_collection,
+            False,  # calculate_per_token_loss
+            cu_seqlens_q,
+            cu_seqlens_comp,
+            ratio,
+        )
+
+        # SBHD per-segment reference: segment 0 contributes zero because it has
+        # no compressed keys; segment 1 contributes normally.
+        weighted_losses = []
+        for b, (sq_b, sk_b) in enumerate(zip(seg_q_lens, seg_comp_lens)):
+            if sk_b == 0:
+                continue
+            q_start = int(cu_seqlens_q[b].item())
+            q_end = int(cu_seqlens_q[b + 1].item())
+            k_start = int(cu_seqlens_comp[b].item())
+            k_end = int(cu_seqlens_comp[b + 1].item())
+
+            q_b = q_thd[q_start:q_end].unsqueeze(1)
+            w_b = w_thd[q_start:q_end].unsqueeze(1)
+            k_b = k_thd[k_start:k_end].unsqueeze(1)
+            query_b = query_thd[q_start:q_end].unsqueeze(1)
+            key_b = key_thd[k_start:k_end].unsqueeze(1)
+
+            cols = torch.arange(sk_b, device=dev).unsqueeze(0).expand(sq_b, -1)
+            positions = torch.arange(1, sq_b + 1, device=dev).unsqueeze(1)
+            mask_b = torch.where(cols >= positions // ratio, float('-inf'), 0.0).unsqueeze(0)
+
+            _, loss_b = FusedDSAIndexerLoss.apply(
+                q_b,
+                w_b,
+                k_b,
+                query_b,
+                key_b,
+                softmax_scale,
+                topk,
+                loss_coeff,
+                mask_b,
+                False,
+                self.pg_collection,
+                False,  # calculate_per_token_loss
+            )
+            weighted_losses.append(loss_b * sq_b)
+
+        expected_loss = torch.stack(weighted_losses).sum() / float(total_q)
+        assert torch.allclose(loss_thd, expected_loss, rtol=1e-5, atol=1e-5), (
+            f"THD loss should be row-mean over total_q={total_q}: "
+            f"thd={loss_thd.item()}, expected={expected_loss.item()}"
+        )
+
+
+# ===========================================================================
+# THD: fused_qk_topk_naive_thd (force_unfused_dsa + indexer + inference path)
+# ===========================================================================
+
+
+class TestFusedQkTopkNaiveThd:
+    """``fused_qk_topk_naive_thd`` — per-segment naive PyTorch QK + top-K
+    used by the THD ``force_unfused_dsa + indexer + inference`` path
+    (i.e., the THD branch of :meth:`CSAIndexer.forward`).
+
+    Coverage:
+      * B=1 single-segment THD matches SBHD-b=1 ``fused_qk_topk_naive``
+        ranking (same scores → same top-K positions among valid rows).
+      * Output shape + dtype contract.
+      * ``-1`` sentinel marking on invalid tail positions (rows whose
+        causal-valid count is < topk).
+      * Multi-segment dispatch isolates per-segment KV scopes (segment
+        ``b``'s top-K can only reference KV positions in
+        ``[0, seqlen_kv[b])``).
+    """
+
+    def _build_causal_mask(self, sq, sk, ratio, device):
+        """SBHD-shape ``(1, sq, sk)`` causal mask (mirrors
+        ``_build_causal_mask_seg`` for the reference path)."""
+        cols = torch.arange(sk, device=device).unsqueeze(0).expand(sq, -1)
+        positions = torch.arange(1, sq + 1, device=device).unsqueeze(1)
+        return torch.where(cols >= positions // ratio, float('-inf'), 0.0).unsqueeze(0)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_single_segment_matches_sbhd(self):
+        """B=1 single-segment THD top-K should match the SBHD-b=1
+        reference among valid rows (rows whose causal-valid count is
+        smaller than ``topk`` get ``-1`` sentinels in THD where SBHD
+        returns garbage tail; we compare only the valid prefix).
+        """
+        torch.manual_seed(0)
+        sq, n_compressed = 32, 8
+        idx_nh, idx_hd = 4, 32
+        topk = 4
+        ratio = 4
+        dev = 'cuda'
+
+        q_thd = torch.randn(sq, idx_nh, idx_hd, dtype=torch.float32, device=dev)
+        k_thd = torch.randn(n_compressed, idx_hd, dtype=torch.float32, device=dev)
+        w_thd = torch.randn(sq, idx_nh, dtype=torch.float32, device=dev)
+
+        cu_q = torch.tensor([0, sq], dtype=torch.int32, device=dev)
+        cu_kv = torch.tensor([0, n_compressed], dtype=torch.int32, device=dev)
+
+        _, topk_thd = fused_qk_topk_naive_thd(q_thd, k_thd, w_thd, topk, cu_q, cu_kv, ratio)
+
+        # SBHD reference: same data with b=1 + caller-supplied mask.
+        q_sbhd = q_thd.unsqueeze(1)
+        k_sbhd = k_thd.unsqueeze(1)
+        w_sbhd = w_thd.unsqueeze(1)
+        mask_sbhd = self._build_causal_mask(sq, n_compressed, ratio, dev)
+        _, topk_sbhd = fused_qk_topk_naive(q_sbhd, k_sbhd, w_sbhd, topk, mask_sbhd)
+        topk_sbhd = topk_sbhd.squeeze(0)  # (sq, topk)
+
+        # Per-row: compare only the leading ``n_valid`` slots; THD marks
+        # the rest as -1, SBHD's tail is undefined (masked -inf
+        # positions, ties may break differently).
+        for row in range(sq):
+            n_valid = min((row + 1) // ratio, n_compressed, topk)
+            assert torch.equal(
+                topk_thd[row, :n_valid].cpu(), topk_sbhd[row, :n_valid].cpu()
+            ), f"row {row}: top-K mismatch among valid slots"
+            assert (
+                topk_thd[row, n_valid:] == -1
+            ).all(), f"row {row}: THD must mark invalid tail as -1"
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_shape_and_dtype(self):
+        """Returns ``(None, (total_q, topk) int64)``."""
+        torch.manual_seed(0)
+        sq_a, sq_b = 8, 4
+        kv_a, kv_b = 2, 1
+        idx_nh, idx_hd = 2, 16
+        topk = 3
+        ratio = 4
+        dev = 'cuda'
+
+        q = torch.randn(sq_a + sq_b, idx_nh, idx_hd, dtype=torch.float32, device=dev)
+        k = torch.randn(kv_a + kv_b, idx_hd, dtype=torch.float32, device=dev)
+        w = torch.randn(sq_a + sq_b, idx_nh, dtype=torch.float32, device=dev)
+        cu_q = torch.tensor([0, sq_a, sq_a + sq_b], dtype=torch.int32, device=dev)
+        cu_kv = torch.tensor([0, kv_a, kv_a + kv_b], dtype=torch.int32, device=dev)
+
+        scores, topk_idxs = fused_qk_topk_naive_thd(q, k, w, topk, cu_q, cu_kv, ratio)
+        assert scores is None
+        assert topk_idxs.shape == (sq_a + sq_b, topk)
+        assert topk_idxs.dtype == torch.int64
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_per_segment_kv_scope(self):
+        """Segment ``b``'s top-K LOCAL ids must live in
+        ``[0, seqlen_kv[b])`` (per-segment scope) — they are NOT
+        flat-global ids into the concatenated K tensor.
+        """
+        torch.manual_seed(0)
+        sq_a, sq_b = 16, 12
+        kv_a, kv_b = 4, 3
+        idx_nh, idx_hd = 2, 16
+        topk = 2
+        ratio = 4
+        dev = 'cuda'
+
+        q = torch.randn(sq_a + sq_b, idx_nh, idx_hd, dtype=torch.float32, device=dev)
+        k = torch.randn(kv_a + kv_b, idx_hd, dtype=torch.float32, device=dev)
+        w = torch.randn(sq_a + sq_b, idx_nh, dtype=torch.float32, device=dev)
+        cu_q = torch.tensor([0, sq_a, sq_a + sq_b], dtype=torch.int32, device=dev)
+        cu_kv = torch.tensor([0, kv_a, kv_a + kv_b], dtype=torch.int32, device=dev)
+
+        _, topk_idxs = fused_qk_topk_naive_thd(q, k, w, topk, cu_q, cu_kv, ratio)
+
+        # Segment 0 rows: valid ids must be in [0, kv_a).
+        seg0 = topk_idxs[:sq_a]
+        seg0_valid = seg0[seg0 >= 0]
+        assert (seg0_valid < kv_a).all(), (
+            f"segment 0 has out-of-range ids: max = {seg0_valid.max().item()}, "
+            f"expected < {kv_a}"
+        )
+        # Segment 1 rows: valid ids must be in [0, kv_b).
+        seg1 = topk_idxs[sq_a:]
+        seg1_valid = seg1[seg1 >= 0]
+        assert (seg1_valid < kv_b).all(), (
+            f"segment 1 has out-of-range ids: max = {seg1_valid.max().item()}, "
+            f"expected < {kv_b}"
+        )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_invalid_tail_marked_minus_one(self):
+        """Early rows where ``(pos+1)//ratio < topk`` should have ``-1``
+        sentinels in the tail of their top-K row.
+        """
+        torch.manual_seed(0)
+        sq, n_compressed = 8, 4
+        idx_nh, idx_hd = 2, 16
+        topk = 4
+        ratio = 4
+        dev = 'cuda'
+
+        q = torch.randn(sq, idx_nh, idx_hd, dtype=torch.float32, device=dev)
+        k = torch.randn(n_compressed, idx_hd, dtype=torch.float32, device=dev)
+        w = torch.randn(sq, idx_nh, dtype=torch.float32, device=dev)
+        cu_q = torch.tensor([0, sq], dtype=torch.int32, device=dev)
+        cu_kv = torch.tensor([0, n_compressed], dtype=torch.int32, device=dev)
+
+        _, topk_idxs = fused_qk_topk_naive_thd(q, k, w, topk, cu_q, cu_kv, ratio)
+
+        # Causal-valid count per row: min((pos+1)//ratio, n_compressed, topk).
+        for row in range(sq):
+            n_valid = min((row + 1) // ratio, n_compressed, topk)
+            row_idxs = topk_idxs[row]
+            assert (
+                row_idxs[:n_valid] >= 0
+            ).all() or n_valid == 0, f"row {row}: leading {n_valid} should be valid ids"
+            assert (row_idxs[n_valid:] == -1).all(), f"row {row}: tail beyond {n_valid} must be -1"

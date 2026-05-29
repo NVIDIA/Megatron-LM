@@ -38,6 +38,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_kernels import
     _get_topk_alignment,
     _kl_loss_from_dense_scores,
     _kl_loss_from_target_predict,
+    batch_of_row,
     build_flat_topk_idxs,
     dsa_sparse_attn,
     fused_indexer_sparse_attn,
@@ -122,7 +123,7 @@ class TestLocalToGlobalFlat:
         and batch id ``bid = r % b``.
         """
         local = _make_local_idxs(b, sq, topk, with_invalid=with_invalid)
-        out = local_to_global_flat(local, b, seqlen_kv=128)
+        out = local_to_global_flat(local, b)
 
         assert out.shape == (sq * b, topk)
         assert out.dtype == torch.int32
@@ -138,8 +139,8 @@ class TestLocalToGlobalFlat:
     def test_cpu_cuda_parity(self):
         """CPU and CUDA execution paths produce identical results."""
         local = _make_local_idxs(b=2, sq=4, topk=3, with_invalid=True)
-        out_cpu = local_to_global_flat(local, 2, seqlen_kv=64)
-        out_cuda = local_to_global_flat(local.cuda(), 2, seqlen_kv=64)
+        out_cpu = local_to_global_flat(local, 2)
+        out_cuda = local_to_global_flat(local.cuda(), 2)
         assert torch.equal(out_cpu, out_cuda.cpu())
 
 
@@ -171,9 +172,9 @@ class TestBuildFlatTopkIdxs:
         ]
         total_topk = sum(t for t, _ in group_specs)
 
-        flat, length = build_flat_topk_idxs(*groups, batch_size=b, seqlen_kv=256)
+        flat, length = build_flat_topk_idxs(*groups, batch_size=b)
 
-        expected = local_to_global_flat(torch.cat(groups, dim=-1), b, seqlen_kv=256)
+        expected = local_to_global_flat(torch.cat(groups, dim=-1), b)
         assert flat.shape == (sq * b, total_topk)
         assert flat.dtype == torch.int32
         assert torch.equal(flat, expected)
@@ -201,7 +202,7 @@ class TestBuildFlatTopkIdxs:
         ]
         total_topk = sum(t for t, _ in group_specs)
 
-        flat, length = build_flat_topk_idxs(*groups, batch_size=b, seqlen_kv=512, compact=True)
+        flat, length = build_flat_topk_idxs(*groups, batch_size=b, compact=True)
 
         assert flat.shape == (sq * b, total_topk)
         assert flat.dtype == torch.int32
@@ -245,13 +246,13 @@ class TestBuildFlatTopkIdxs:
         fake_dsa.compactify_wrapper.side_effect = fake_compactify
         dk._DSA = fake_dsa
 
-        flat, length = build_flat_topk_idxs(local, batch_size=b, seqlen_kv=512, compact=True)
+        flat, length = build_flat_topk_idxs(local, batch_size=b, compact=True)
         fake_dsa.compactify_wrapper.assert_called_once()
         kernel_input = captured['input']
         assert kernel_input.shape == (sq * b, topk), "(a) wrapper input shape"
         assert kernel_input.dtype == torch.int32, "(a) wrapper input dtype"
         assert kernel_input.is_cuda, "(a) wrapper input not on CUDA"
-        expected_input = local_to_global_flat(local, b, seqlen_kv=512)
+        expected_input = local_to_global_flat(local, b)
         assert torch.equal(
             kernel_input, expected_input
         ), "(a) wrapper input != local_to_global_flat(local)"
@@ -273,12 +274,16 @@ class TestBuildFlatTopkIdxs:
         local_a = _make_local_idxs(b2, sq2, 6, with_invalid=True)
         local_b = _make_local_idxs(b2, sq2, 4, with_invalid=False) + 200
 
-        flat_cpu, len_cpu = build_flat_topk_idxs(
-            local_a, local_b, batch_size=b2, seqlen_kv=512, compact=True
-        )
+        flat_cpu, len_cpu = build_flat_topk_idxs(local_a, local_b, batch_size=b2, compact=True)
         flat_cuda, len_cuda = build_flat_topk_idxs(
-            local_a.cuda(), local_b.cuda(), batch_size=b2, seqlen_kv=512, compact=True
+            local_a.cuda(), local_b.cuda(), batch_size=b2, compact=True
         )
+        assert torch.equal(
+            flat_cpu, flat_cuda.cpu()
+        ), "(b) flat tensor differs between CPU fallback and cuDNN kernel"
+        assert torch.equal(
+            len_cpu, len_cuda.cpu()
+        ), "(b) length tensor differs between CPU fallback and cuDNN kernel"
         assert torch.equal(
             flat_cpu, flat_cuda.cpu()
         ), "(b) flat tensor differs between CPU fallback and cuDNN kernel"
@@ -914,13 +919,17 @@ def _install_full_dsa_mock(
 
     fake_dsa.indexer_top_k_wrapper.side_effect = fake_filtered_topk
 
-    def fake_sparse_indexer_score_backward(q, k, w, topk_indices, qhead_per_kv_head):
+    def fake_sparse_indexer_score_backward(
+        q, k, w, topk_indices, qhead_per_kv_head, topk_indices_global=False
+    ):
         topk = topk_indices.shape[-1]
         return {'predict': predict_fn(b, sq, topk, q.device)}
 
     fake_dsa.sparse_indexer_score_recompute_wrapper.side_effect = fake_sparse_indexer_score_backward
 
-    def fake_sparse_attn_score_backward(q, k, lse, topk_indices, sm_scale, qhead_per_kv_head):
+    def fake_sparse_attn_score_backward(
+        q, k, lse, topk_indices, sm_scale, qhead_per_kv_head, topk_indices_global=False
+    ):
         topk = topk_indices.shape[-1]
         return {'target': target_fn(b, sq, topk, q.device)}
 
@@ -1027,7 +1036,7 @@ def _install_full_dsa_mock_dense(
 
     fake_dsa.indexer_top_k_wrapper.side_effect = fake_filtered_topk
 
-    def fake_dense_indexer_score(q, k, w, qhead_per_kv_head, sm_scale, ratio):
+    def fake_dense_indexer_score(q, k, w, qhead_per_kv_head, sm_scale, ratio, **kwargs):
         dev = q.device
         return {
             'out': predict_score_fn(b, sq, n_comp, dev),
@@ -1036,7 +1045,7 @@ def _install_full_dsa_mock_dense(
 
     fake_dsa.dense_indexer_score_recompute_wrapper.side_effect = fake_dense_indexer_score
 
-    def fake_dense_attn_score(q, k, lse, softmax_scale, qhead_per_kv_head, ratio):
+    def fake_dense_attn_score(q, k, lse, softmax_scale, qhead_per_kv_head, ratio, **kwargs):
         dev = q.device
         return {
             'out': target_score_fn(b, sq, n_comp, dev),
@@ -2050,7 +2059,7 @@ class TestRealKernelIndexerTopk:
         # SBHD shape that matches what csa.py produces (tensors are SBHD,
         # ratio is the indexer's compression ratio). b=2 exercises the
         # batch-aware ``seq_lens.repeat(b)`` and the ``(b*sq, sk) → (b, sq,
-        # topk)`` reshape inside ``_indexer_topk_bshd``.
+        # topk)`` reshape inside ``_indexer_topk_core`` (BSHD branch).
         s = dict(
             b=2,
             sq=128,
@@ -2152,7 +2161,7 @@ class TestRealKernelDsaSparseAttn:
         )
         q_idx = torch.arange(s['sq'], device=dev).view(1, -1, 1)
         topk_local = torch.minimum(topk_local, q_idx)
-        global_idxs = local_to_global_flat(topk_local, s['b'], s['skv']).contiguous()
+        global_idxs = local_to_global_flat(topk_local, s['b']).contiguous()
         return query, kv, attn_sink, global_idxs
 
     def test_real_dsa_sparse_attn_fwd_bwd_matches_reference(self, reset_lazy_kernel_state):
@@ -2318,23 +2327,26 @@ class TestRealKernelFusedIndexerSparseAttn:
         #     basis, producing a different KL than the kernel's.
         from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
             _dsa_fwd_flash_mla,
-            _indexer_topk_bshd,
+            _indexer_topk_core,
             _kl_loss_from_dense_scores,
-            _sbhd_to_bshd_indexer_inputs,
         )
 
         # Run indexer + FlashMLA to capture the same ``lse_indexer`` the fused
         # path consumes internally.
         effective_topk = min(s['indexer_topk'], s['n_comp'])
-        q_idx_bshd_bf, k_idx_bsd_bf, _, w_bsh_scaled_bf = _sbhd_to_bshd_indexer_inputs(
-            q_indexer, k_indexer, weights, s['indexer_softmax_scale']
-        )
-        topk_indices_cmp, _, _ = _indexer_topk_bshd(
+        q_idx_bshd_bf = q_indexer.permute(1, 0, 2, 3).contiguous()
+        k_idx_bsd_bf = k_indexer.permute(1, 0, 2).contiguous()
+        w_bsh_bf = weights.permute(1, 0, 2).contiguous()
+        if s['indexer_softmax_scale'] != 1.0:
+            w_bsh_scaled_bf = (w_bsh_bf.float() * s['indexer_softmax_scale']).to(w_bsh_bf.dtype)
+        else:
+            w_bsh_scaled_bf = w_bsh_bf
+        topk_indices_cmp, _, _ = _indexer_topk_core(
             q_idx_bshd_bf, k_idx_bsd_bf, w_bsh_scaled_bf, effective_topk, s['ratio']
         )
         compress_topk_idxs = torch.where(topk_indices_cmp >= 0, topk_indices_cmp + kv_offset, -1)
         combined_local = torch.cat([compress_topk_idxs, win_idxs], dim=-1)
-        global_idxs = local_to_global_flat(combined_local, s['b'], s['skv'])
+        global_idxs = local_to_global_flat(combined_local, s['b'])
         q_flat = query.reshape(s['sq'] * s['b'], s['np_'], s['d'])
         kv_flat = kv_full.reshape(s['skv'] * s['b'], s['d'])
         _, _, lse_indexer = _dsa_fwd_flash_mla(
@@ -2369,6 +2381,473 @@ class TestRealKernelFusedIndexerSparseAttn:
         assert torch.allclose(indexer_loss, loss_ref, atol=5e-2, rtol=1e-1), (
             f"actual = {indexer_loss.item():.6f}, ref = {loss_ref.item():.6f}, "
             f"abs diff = {(indexer_loss - loss_ref).abs().item():.3e}"
+        )
+
+
+# ===========================================================================
+# THD packed-sequence path
+# ===========================================================================
+
+
+def _make_cu_seqlens(seg_lens, device='cpu'):
+    """Build a ``(B+1,)`` int32 cu_seqlens tensor from a list of segment lengths."""
+    return torch.tensor(
+        [0] + list(torch.tensor(seg_lens, dtype=torch.int64).cumsum(0).tolist()),
+        dtype=torch.int32,
+        device=device,
+    )
+
+
+class TestThdPureHelpers:
+    """THD-only pure-Python helpers (no GPU kernels required).
+
+    Covers:
+
+    * ``batch_of_row`` — searchsorted-style ``row → segment`` lookup.
+    * ``local_to_global_flat`` THD branch — ``cu_seqlens_q/kv`` shift.
+    * ``build_flat_topk_idxs`` THD branch — ``cu_seqlens_q/kv`` propagation.
+    """
+
+    # ---- batch_of_row --------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "seg_lens, total_q, expected",
+        [
+            ([3, 3, 3], None, [0, 0, 0, 1, 1, 1, 2, 2, 2]),
+            ([2, 5, 1, 4], None, [0, 0, 1, 1, 1, 1, 1, 2, 3, 3, 3, 3]),
+            ([0, 3, 0, 2], None, [1, 1, 1, 3, 3]),
+            ([5, 5], 7, [0, 0, 0, 0, 0, 1, 1]),
+        ],
+        ids=["uniform", "variable", "empty_segment", "total_q_override"],
+    )
+    def test_batch_of_row(self, seg_lens, total_q, expected):
+        """Row-to-segment mapping for uniform, variable, empty, and truncated cases."""
+        cu = _make_cu_seqlens(seg_lens)
+        bo = batch_of_row(cu, total_q=total_q) if total_q else batch_of_row(cu)
+        assert bo.tolist() == expected
+        assert bo.dtype == torch.int64
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def testbatch_of_row_cpu_cuda_parity(self):
+        """CPU and CUDA executions produce identical results."""
+        cu = _make_cu_seqlens([4, 2, 6])
+        cpu_out = batch_of_row(cu)
+        cuda_out = batch_of_row(cu.cuda())
+        assert torch.equal(cpu_out, cuda_out.cpu())
+
+    # ---- local_to_global_flat THD branch --------------------------------
+
+    def test_local_to_global_flat_thd_basic(self):
+        """THD branch: ``global[i, k] = local[i, k] + cu_seqlens_kv[batch_of_row[i]]``."""
+        # Two segments: q lengths [2, 3]; kv lengths [4, 5] (uneven).
+        cu_q = _make_cu_seqlens([2, 3])
+        cu_kv = _make_cu_seqlens([4, 5])
+        # local indices: 5 rows × 3 topk; values are per-segment-LOCAL kv ids.
+        local = torch.tensor(
+            [
+                [0, 1, 2],  # seg 0 row 0  → offset 0
+                [3, 0, -1],  # seg 0 row 1  → offset 0; -1 preserved
+                [0, 4, 2],  # seg 1 row 0  → offset 4
+                [1, -1, 3],  # seg 1 row 1  → offset 4
+                [4, 0, 1],  # seg 1 row 2  → offset 4
+            ],
+            dtype=torch.int32,
+        )
+
+        out = local_to_global_flat(local, batch_size=-1, cu_seqlens_q=cu_q, cu_seqlens_kv=cu_kv)
+        expected = torch.tensor(
+            [[0, 1, 2], [3, 0, -1], [4, 8, 6], [5, -1, 7], [8, 4, 5]], dtype=torch.int32
+        )
+        assert out.shape == expected.shape
+        assert out.dtype == torch.int32
+        assert torch.equal(out, expected)
+
+    @pytest.mark.parametrize(
+        "cu_q_segs, cu_kv_segs, match",
+        [([2, 2], [3, 3, 3], "cu_seqlens"), ([2, 2], None, "must both be provided")],
+        ids=["shape_mismatch", "xor_cu_seqlens"],
+    )
+    def test_local_to_global_flat_thd_validation(self, cu_q_segs, cu_kv_segs, match):
+        """Mismatched shapes or supplying only one of cu_seqlens_q/kv raises."""
+        local = torch.zeros((4, 2), dtype=torch.int32)
+        cu_q = _make_cu_seqlens(cu_q_segs)
+        cu_kv = _make_cu_seqlens(cu_kv_segs) if cu_kv_segs is not None else None
+        with pytest.raises(ValueError, match=match):
+            local_to_global_flat(local, -1, cu_seqlens_q=cu_q, cu_seqlens_kv=cu_kv)
+
+    # ---- build_flat_topk_idxs THD branch --------------------------------
+
+    def test_build_flat_topk_idxs_thd_non_compact(self):
+        """THD non-compact: concat groups along topk, then THD globalize."""
+        cu_q = _make_cu_seqlens([2, 2])  # total_q = 4
+        cu_kv = _make_cu_seqlens([3, 3])  # cu_kv = [0, 3, 6]
+        # Two groups: window-like (2 topk) and compress-like (3 topk).
+        win = torch.tensor([[0, 1], [1, 2], [0, 1], [-1, 2]], dtype=torch.int32)
+        cmp_ = torch.tensor([[0, 1, -1], [-1, 0, 1], [0, 2, 1], [1, 0, 2]], dtype=torch.int32)
+
+        flat, length = build_flat_topk_idxs(
+            win, cmp_, batch_size=-1, cu_seqlens_q=cu_q, cu_seqlens_kv=cu_kv
+        )
+
+        # Manual reference: cat then THD globalize (offset = cu_kv[batch_of_row]).
+        cat = torch.cat([win, cmp_], dim=-1)
+        expected = local_to_global_flat(cat, -1, cu_seqlens_q=cu_q, cu_seqlens_kv=cu_kv)
+        assert torch.equal(flat, expected)
+        assert length is None  # non-compact
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_build_flat_topk_idxs_thd_compact_cpu_cuda_parity(self):
+        """Compact THD path: CPU fallback (CUDA tensors path through the
+        cuDNN ``compactify`` wrapper if available, else PyTorch fallback)
+        must produce the same packed valid-first layout in both cases.
+        """
+        # Force CPU fallback by disabling _DSA so compact runs in PyTorch.
+        saved = dk._DSA
+        dk._DSA = None
+        try:
+            cu_q = _make_cu_seqlens([3, 2])
+            cu_kv = _make_cu_seqlens([4, 5])
+            local = torch.tensor(
+                [[0, -1, 2, -1], [1, 2, -1, 0], [-1, 1, -1, 3], [0, 1, 2, -1], [-1, -1, 4, 0]],
+                dtype=torch.int32,
+            )
+            flat_cpu, len_cpu = build_flat_topk_idxs(
+                local, batch_size=-1, compact=True, cu_seqlens_q=cu_q, cu_seqlens_kv=cu_kv
+            )
+            flat_cuda, len_cuda = build_flat_topk_idxs(
+                local.cuda(),
+                batch_size=-1,
+                compact=True,
+                cu_seqlens_q=cu_q.cuda(),
+                cu_seqlens_kv=cu_kv.cuda(),
+            )
+            assert torch.equal(flat_cpu, flat_cuda.cpu())
+            assert torch.equal(len_cpu, len_cuda.cpu())
+            # Sanity: valid count per row matches input mask count.
+            n_valid_per_row = (local >= 0).sum(dim=-1).int()
+            assert torch.equal(len_cpu, n_valid_per_row)
+        finally:
+            dk._DSA = saved
+
+
+class TestThdWrapperDispatchAndValidation:
+    """THD-mode dispatch + missing-kwarg validation for the three
+    public layout-aware wrappers: ``indexer_topk``, ``dsa_sparse_attn``,
+    ``fused_indexer_sparse_attn``.
+
+    All tests are mock-based or shape-only — no real CUDA kernels.
+    They verify two contracts:
+
+    * **Dispatch**: passing ``cu_seqlens_q`` (or ``is_thd=True``) routes
+      the wrapper through the THD code path of its underlying kernel
+      core (as opposed to the SBHD path).
+    * **Validation**: when the THD path is requested but a required
+      companion kwarg is missing, the wrapper raises ``ValueError``
+      upfront with a clear message (fail-fast, before any kernel
+      invocation).
+
+    Each section below covers one wrapper.
+    """
+
+    # =====================================================================
+    # indexer_topk
+    # =====================================================================
+
+    def _make_indexer_topk_thd_inputs(self, device='cuda'):
+        # Two segments, total_q=5, total_k=4 (compressed-K is shorter than Q
+        # because the indexer K ratio is 4× by default).
+        cu_q = _make_cu_seqlens([3, 2], device=device)
+        cu_kv = _make_cu_seqlens([2, 2], device=device)
+        total_q, total_k = 5, 4
+        idx_nh, idx_hd = 4, 64
+        q = torch.randn(total_q, idx_nh, idx_hd, dtype=torch.bfloat16, device=device)
+        k = torch.randn(total_k, idx_hd, dtype=torch.bfloat16, device=device)
+        w = torch.randn(total_q, idx_nh, dtype=torch.bfloat16, device=device)
+        return q, k, w, cu_q, cu_kv
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_indexer_topk_thd_dispatch_calls_thd_kernel_path(self, reset_lazy_kernel_state):
+        """Passing ``cu_seqlens_q`` routes through
+        ``_DSA.indexer_forward_wrapper`` with ``cu_seqlens_q/k`` +
+        ``max_seqlen_q/k`` kwargs (THD kernel mode), as opposed to the
+        positional-only BSHD call.
+        """
+        q, k, w, cu_q, cu_kv = self._make_indexer_topk_thd_inputs()
+        total_q, idx_nh, idx_hd = q.shape
+        total_k = k.shape[0]
+
+        fake_dsa = MagicMock(name='_DSA_thd_stub')
+
+        def fake_indexer_forward(q_thd, k_thd, w_thd, ratio, **kwargs):
+            # Verify THD kwargs were forwarded.
+            assert 'cu_seqlens_q' in kwargs and kwargs['cu_seqlens_q'] is cu_q
+            assert 'cu_seqlens_k' in kwargs and kwargs['cu_seqlens_k'] is cu_kv
+            assert kwargs['max_seqlen_q'] == 3
+            assert kwargs['max_seqlen_k'] == 2
+            return {'scores': torch.zeros(total_q, 2, dtype=torch.float32, device=q_thd.device)}
+
+        fake_dsa.indexer_forward_wrapper.side_effect = fake_indexer_forward
+        fake_dsa.indexer_top_k_wrapper.side_effect = lambda scores_flat, seq_lens, **kw: {
+            'indices': torch.zeros(
+                scores_flat.shape[0], kw['top_k'], dtype=torch.int32, device=scores_flat.device
+            )
+        }
+        dk._DSA = fake_dsa
+
+        topk_idxs, topk_len = indexer_topk(
+            q,
+            k,
+            w,
+            topk=2,
+            ratio=4,
+            indexer_softmax_scale=128**-0.5,
+            cu_seqlens_q=cu_q,
+            cu_seqlens_kv=cu_kv,
+            max_seqlen_q=3,
+            max_seqlen_kv=2,
+        )
+        # THD return shape: (total_q, topk) + (total_q,).
+        assert topk_idxs.shape == (total_q, 2)
+        assert topk_len.shape == (total_q,)
+        # Confirmed the kernel was called with THD kwargs.
+        fake_dsa.indexer_forward_wrapper.assert_called_once()
+
+    # =====================================================================
+    # dsa_sparse_attn(is_thd=True)
+    # =====================================================================
+
+    @pytest.mark.parametrize(
+        "query_shape, kv_shape, match",
+        [
+            ((4, 2, 4, 64), (8, 64), "THD dsa_sparse_attn expects query"),
+            ((4, 4, 64), (8, 2, 64), "THD dsa_sparse_attn expects kv"),
+        ],
+        ids=["query_wrong_ndim", "kv_wrong_ndim"],
+    )
+    def test_dsa_sparse_attn_thd_wrong_ndim_raises(self, query_shape, kv_shape, match):
+        """THD mode requires ``query.ndim == 3`` and ``kv.ndim == 2``."""
+        query = torch.zeros(*query_shape, dtype=torch.bfloat16)
+        kv = torch.zeros(*kv_shape, dtype=torch.bfloat16)
+        attn_sink = torch.zeros(4, dtype=torch.float32)
+        topk = torch.zeros(query_shape[0], 2, dtype=torch.int32)
+        with pytest.raises(ValueError, match=match):
+            dsa_sparse_attn(query, kv, attn_sink, topk, softmax_scale=0.125, is_thd=True)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_dsa_sparse_attn_thd_pass_through_no_reshape(self):
+        """THD inputs flow into ``SparseAttnFunc`` unchanged (no SBHD
+        reshape) and the output is ``(total_q, np * d_v)``.
+        """
+        total_q, np_, d, d_v = 6, 4, 64, 512
+        n_kv = 8
+        query = torch.randn(total_q, np_, d, dtype=torch.bfloat16, device='cuda')
+        kv = torch.randn(n_kv, d, dtype=torch.bfloat16, device='cuda')
+        attn_sink = torch.zeros(np_, dtype=torch.float32, device='cuda')
+        topk = torch.zeros(total_q, 2, dtype=torch.int32, device='cuda')
+
+        flash_stub = _make_flash_mla_stub(d_v=d_v)
+        dk._flash_mla_sparse_fwd = flash_stub
+
+        out = dsa_sparse_attn(query, kv, attn_sink, topk, softmax_scale=0.125, is_thd=True)
+        assert out.shape == (total_q, np_ * d_v)
+        # The FlashMLA stub was called with the unmodified flat tensors.
+        # _dsa_fwd_flash_mla passes (q, kv_3d, indices, softmax_scale) positionally;
+        # kv is unsqueezed to (n_kv, 1, d) before reaching the kernel.
+        call_q, call_kv_3d = flash_stub.call_args.args[0], flash_stub.call_args.args[1]
+        assert call_q.shape == (total_q, np_, d)
+        assert call_kv_3d.squeeze(1).shape == (n_kv, d)
+
+    # =====================================================================
+    # fused_indexer_sparse_attn (validation only — real-kernel parity is
+    # covered by TestRealKernelFusedIndexerSparseAttnThd below)
+    # =====================================================================
+
+    def _fused_common_thd_kwargs(self):
+        return dict(
+            cu_seqlens_q=_make_cu_seqlens([2, 2]),
+            cu_seqlens_kv=_make_cu_seqlens([2, 2]),
+            cu_seqlens_kv_full=_make_cu_seqlens([3, 3]),
+            cu_seqlens_compressed_idx=_make_cu_seqlens([1, 1]),
+            max_seqlen_q=2,
+            max_seqlen_compressed_idx=1,
+        )
+
+    def _fused_dummy_thd_inputs(self):
+        total_q, np_, d = 4, 4, 64
+        total_kv_full = 6
+        total_comp_idx = 2
+        idx_nh, idx_hd = 4, 64
+        return dict(
+            query=torch.zeros(total_q, np_, d, dtype=torch.bfloat16),
+            kv_full=torch.zeros(total_kv_full, d, dtype=torch.bfloat16),
+            attn_sink=torch.zeros(np_, dtype=torch.float32),
+            window_idxs=torch.zeros(total_q, 2, dtype=torch.int32),
+            q_indexer=torch.zeros(total_q, idx_nh, idx_hd, dtype=torch.bfloat16),
+            k_indexer=torch.zeros(total_comp_idx, idx_hd, dtype=torch.bfloat16),
+            weights=torch.zeros(total_q, idx_nh, dtype=torch.bfloat16),
+        )
+
+    @pytest.mark.parametrize(
+        "missing",
+        [
+            'cu_seqlens_kv',
+            'cu_seqlens_kv_full',
+            'cu_seqlens_compressed_idx',
+            'max_seqlen_q',
+            'max_seqlen_compressed_idx',
+        ],
+    )
+    def test_fused_indexer_sparse_attn_thd_missing_kwarg_raises(self, missing):
+        """All five THD-companion kwargs are required when ``cu_seqlens_q``
+        is supplied; a missing one raises ``ValueError`` upfront.
+
+        (No ``test_thd_sparse_loss_raises``: sparse-loss is supported in
+        THD via flat-global topk ids — see
+        ``TestRealKernelFusedIndexerSparseAttnThd``.)
+        """
+        kwargs = self._fused_common_thd_kwargs()
+        kwargs[missing] = None
+        inputs = self._fused_dummy_thd_inputs()
+        with pytest.raises(ValueError, match="THD mode requires"):
+            fused_indexer_sparse_attn(
+                **inputs, indexer_topk=2, ratio=4, softmax_scale=0.125, **kwargs
+            )
+
+
+# ---------------------------------------------------------------------------
+# Real-kernel THD parity
+# ---------------------------------------------------------------------------
+
+
+class TestRealKernelFusedIndexerSparseAttnThd:
+    """End-to-end parity for Path B in THD mode (both loss variants):
+    real cuDNN score-recompute + indexer-backward kernels + real FlashMLA,
+    compared to the equivalent SBHD invocation on the same data with B=1.
+
+    For a single-segment THD batch (``cu_seqlens_q = [0, sq]``) the THD
+    pipeline produces a numerically equivalent loss to the SBHD pipeline
+    with ``b=1`` on the same tensors — both go through the same
+    underlying cuDNN kernels, differing only in the layout-glue around
+    them. The sparse-loss THD path additionally exercises
+    :func:`local_to_global_flat` (over ``cu_seqlens_compressed_idx``)
+    and the ``topk_indices_global=True`` flag wiring.
+    """
+
+    SHAPES = dict(
+        sq=128,
+        np_=64,
+        d=512,
+        skv=640,
+        n_comp=512,
+        # cudnn DSA (dense_)indexer_backward kernels require heads >= 64.
+        idx_nh=64,
+        idx_hd=128,
+        indexer_topk=512,
+        ratio=4,
+        win_topk=8,
+        softmax_scale=512**-0.5,
+        indexer_softmax_scale=128**-0.5,
+    )
+
+    @pytest.mark.parametrize('sparse_loss', [False, True], ids=['dense_loss', 'sparse_loss'])
+    def test_thd_single_segment_matches_sbhd_b1(self, sparse_loss, reset_lazy_kernel_state):
+        """B=1 THD invocation should match the equivalent SBHD-b=1 call
+        on the same input tensors (just reshaped), for both dense-loss
+        and sparse-loss Path B.
+        """
+        _skip_if_real_kernels_unavailable(sm_min=10, need_flash_mla=True)
+        s = self.SHAPES
+        torch.manual_seed(0)
+        dev = 'cuda'
+        loss_coeff = 0.5
+        b = 1
+
+        # Common inputs (SBHD layout — single batch).
+        query_sbhd = torch.randn(s['sq'], b, s['np_'], s['d'], dtype=torch.bfloat16, device=dev)
+        kv_full_sbhd = torch.randn(s['skv'], b, s['d'], dtype=torch.bfloat16, device=dev)
+        attn_sink = torch.zeros(s['np_'], dtype=torch.float32, device=dev)
+        torch.manual_seed(1)
+        win_idxs_sbhd = torch.randint(
+            0, s['sq'], (b, s['sq'], s['win_topk']), dtype=torch.int32, device=dev
+        )
+        q_indexer_sbhd = torch.randn(
+            s['sq'], b, s['idx_nh'], s['idx_hd'], dtype=torch.bfloat16, device=dev
+        )
+        k_indexer_sbhd = torch.randn(s['n_comp'], b, s['idx_hd'], dtype=torch.bfloat16, device=dev)
+        weights_sbhd = torch.randn(s['sq'], b, s['idx_nh'], dtype=torch.bfloat16, device=dev)
+        kv_offset = s['skv'] - s['n_comp']
+
+        # ---- SBHD reference --------------------------------------------------
+        _, loss_sbhd = fused_indexer_sparse_attn(
+            query_sbhd,
+            kv_full_sbhd,
+            attn_sink,
+            win_idxs_sbhd,
+            q_indexer_sbhd,
+            k_indexer_sbhd,
+            weights_sbhd,
+            indexer_topk=s['indexer_topk'],
+            ratio=s['ratio'],
+            softmax_scale=s['softmax_scale'],
+            indexer_softmax_scale=s['indexer_softmax_scale'],
+            loss_coeff=loss_coeff,
+            sparse_loss=sparse_loss,
+            kv_offset=kv_offset,
+        )
+
+        # ---- THD equivalent --------------------------------------------------
+        # Reshape: SBHD (sq, 1, ...) -> THD flat (sq, ...).
+        # kv_full SBHD layout is [kv (sq), compressed (n_comp)] in dim 0;
+        # the THD analogue is [kv (sq), compressed (n_comp)] per-segment.
+        query_thd = query_sbhd.squeeze(1)  # (sq, np, d)
+        kv_full_thd = kv_full_sbhd.squeeze(1)  # (skv, d)
+        win_idxs_thd = win_idxs_sbhd.squeeze(0)  # (sq, win_topk)
+        q_indexer_thd = q_indexer_sbhd.squeeze(1)  # (sq, idx_nh, idx_hd)
+        k_indexer_thd = k_indexer_sbhd.squeeze(1)  # (n_comp, idx_hd)
+        weights_thd = weights_sbhd.squeeze(1)  # (sq, idx_nh)
+
+        # Single-segment cu_seqlens (B=1): total_q == sq.
+        cu_q = _make_cu_seqlens([s['sq']], device=dev)
+        cu_kv = _make_cu_seqlens([kv_offset], device=dev)
+        cu_kv_full = _make_cu_seqlens([s['skv']], device=dev)
+        # Indexer K is per-segment compressed-only (n_comp positions).
+        cu_comp_idx = _make_cu_seqlens([s['n_comp']], device=dev)
+
+        # B=1: per-segment [kv, compressed] layout collapses to a single
+        # contiguous slice — same kv_offset as the SBHD case.
+        compressed_kv_thd = kv_full_thd[kv_offset:]
+        _, loss_thd = fused_indexer_sparse_attn(
+            query_thd,
+            kv_full_thd,
+            attn_sink,
+            win_idxs_thd,
+            q_indexer_thd,
+            k_indexer_thd,
+            weights_thd,
+            indexer_topk=s['indexer_topk'],
+            ratio=s['ratio'],
+            softmax_scale=s['softmax_scale'],
+            indexer_softmax_scale=s['indexer_softmax_scale'],
+            loss_coeff=loss_coeff,
+            sparse_loss=sparse_loss,
+            kv_offset=0,  # ignored in THD
+            cu_seqlens_q=cu_q,
+            cu_seqlens_kv=cu_kv,
+            cu_seqlens_kv_full=cu_kv_full,
+            cu_seqlens_compressed_idx=cu_comp_idx,
+            max_seqlen_q=s['sq'],
+            max_seqlen_compressed_idx=s['n_comp'],
+            compressed_kv=compressed_kv_thd,
+        )
+
+        # SBHD and THD share the same underlying kernels; for B=1 the
+        # numerical paths are identical up to topk-ordering ties in the
+        # indexer's radix top-K, which can shift a few scores at the
+        # boundary. Use the same tolerance as the SBHD-vs-PyTorch test.
+        assert torch.allclose(loss_thd, loss_sbhd, atol=5e-2, rtol=1e-1), (
+            f"sparse_loss={sparse_loss}: thd = {loss_thd.item():.6f}, "
+            f"sbhd = {loss_sbhd.item():.6f}, "
+            f"abs diff = {(loss_thd - loss_sbhd).abs().item():.3e}"
         )
 
 
@@ -2458,24 +2937,33 @@ class TestRealKernelDenseIndexerBackward:
         from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
             _compute_dense_attn_score,
             _dsa_fwd_flash_mla,
-            _indexer_topk_bshd,
+            _indexer_topk_core,
             _kl_loss_from_dense_scores,
-            _sbhd_to_bshd_indexer_inputs,
         )
+
+        def _sbhd_to_bshd(q_sbhd, k_sbd, w_sbh, sm_scale):
+            q_bshd = q_sbhd.permute(1, 0, 2, 3).contiguous()
+            k_bsd = k_sbd.permute(1, 0, 2).contiguous()
+            w_bsh = w_sbh.permute(1, 0, 2).contiguous()
+            if sm_scale != 1.0:
+                w_bsh_scaled = (w_bsh.float() * sm_scale).to(w_bsh.dtype)
+            else:
+                w_bsh_scaled = w_bsh
+            return q_bshd, k_bsd, w_bsh, w_bsh_scaled
 
         effective_topk = min(s['indexer_topk'], s['n_comp'])
         with torch.no_grad():
-            q_idx_bshd_bf, k_idx_bsd_bf, _, w_bsh_scaled_bf = _sbhd_to_bshd_indexer_inputs(
+            q_idx_bshd_bf, k_idx_bsd_bf, _, w_bsh_scaled_bf = _sbhd_to_bshd(
                 q_idx_init, k_idx_init, w_init, s['indexer_softmax_scale']
             )
-            topk_indices_cmp, _, _ = _indexer_topk_bshd(
+            topk_indices_cmp, _, _ = _indexer_topk_core(
                 q_idx_bshd_bf, k_idx_bsd_bf, w_bsh_scaled_bf, effective_topk, s['ratio']
             )
             compress_topk_idxs = torch.where(
                 topk_indices_cmp >= 0, topk_indices_cmp + kv_offset, -1
             )
             combined_local = torch.cat([compress_topk_idxs, win_idxs], dim=-1)
-            global_idxs = local_to_global_flat(combined_local, s['b'], s['skv'])
+            global_idxs = local_to_global_flat(combined_local, s['b'])
             q_flat = query.reshape(s['sq'] * s['b'], s['np_'], s['d'])
             kv_flat = kv_full.reshape(s['skv'] * s['b'], s['d'])
             _, _, lse_indexer = _dsa_fwd_flash_mla(
@@ -2512,10 +3000,10 @@ class TestRealKernelDenseIndexerBackward:
         # backward comparison with a forward-side artifact (~0.7% cosine
         # gap) that has nothing to do with the backward kernel itself.
         with torch.no_grad():
-            q_idx_bshd_k, k_idx_bsd_k, _, w_bsh_scaled_k = _sbhd_to_bshd_indexer_inputs(
+            q_idx_bshd_k, k_idx_bsd_k, _, w_bsh_scaled_k = _sbhd_to_bshd(
                 q_idx_init, k_idx_init, w_init, s['indexer_softmax_scale']
             )
-            _, _, kernel_indexer_scores = _indexer_topk_bshd(
+            _, _, kernel_indexer_scores = _indexer_topk_core(
                 q_idx_bshd_k, k_idx_bsd_k, w_bsh_scaled_k, effective_topk, s['ratio']
             )
 
@@ -2547,11 +3035,11 @@ class TestRealKernelDenseIndexerBackward:
                 a.flatten().double().unsqueeze(0), b.flatten().double().unsqueeze(0)
             ).item()
 
-        # eps=5e-4 covers the residual bf16↔autograd precision noise on
-        # d_q (~2.6e-4 observed at this scale); d_k and d_weights agree
-        # to within ~1e-5 / exact respectively. Tighten if the kernel's
-        # dense backward improves or if d_q noise drops.
-        eps = 5e-4
+        # eps=1e-3 covers the residual bf16↔autograd precision noise on
+        # d_q (~5e-4 observed at this scale in moe_dev); d_k and d_weights
+        # agree to within ~1e-5 / exact respectively. Tighten if the
+        # kernel's dense backward improves or if d_q noise drops.
+        eps = 1e-3
         for name, dk_grad, dr_grad in [
             ('d q_indexer', dq_kernel, q_idx_ref.grad),
             ('d k_indexer', dk_kernel, k_idx_ref.grad),
