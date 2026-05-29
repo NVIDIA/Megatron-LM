@@ -1,12 +1,26 @@
 ---
 name: bump-base-image
-description: Bump the NVIDIA PyTorch base image (`nvcr.io/nvidia/pytorch:<YY.MM>-py3`) used by Megatron-LM CI. Covers the two pin sites (GitHub CI in `docker/.ngc_version.dev` and GitLab CI in `.gitlab/stages/01.build.yml`), the post-bump CI loop (re-run functional tests, refresh golden values, mark broken tests), and the gotchas that bit PRs #4611 and #4688.
+description: Bump the NVIDIA PyTorch base image (`nvcr.io/nvidia/pytorch:YY.MM-py3`) used by Megatron-LM CI. Covers the two pin sites (GitHub CI in `docker/.ngc_version.dev` and GitLab CI in `.gitlab/stages/01.build.yml`), the post-bump CI loop (re-run functional tests, refresh golden values, mark broken tests), and the gotchas that bit PRs #4611 and #4688.
+license: Apache-2.0
 when_to_use: User wants to upgrade the PyTorch container (e.g. "bump base image to 26.04"); CI is failing after a previous bump because the GitLab pin was missed; functional tests are failing with `lm loss` / `num-zeros` / `iteration-time` drift right after a container bump; a functional test hangs, times out, or OOMs after a bump; the user mentions `.ngc_version.dev`, `nvcr.io/nvidia/pytorch`, "container base image", or "Update Docker image version".
 ---
 
 # Bump the PyTorch base image
 
 End-to-end workflow for moving Megatron-LM's CI to a newer `nvcr.io/nvidia/pytorch:<YY.MM>-py3` container. The most common failure mode is forgetting that **GitHub CI and GitLab CI have separate pins** — a bump that only touches the former lands green, then breaks GitLab CI on `main` and forces an immediate follow-up PR. Always update both in the same PR.
+
+## Answer-First Pattern: dev Pin Sync
+
+For a dev-only base-image bump, lead with the synchronization rule:
+
+- `docker/.ngc_version.dev` is only the GitHub/local Dockerfile pin.
+- GitLab CI has separate hardcoded `BASE_IMAGE` rows in
+  `.gitlab/stages/01.build.yml`; update both `IMAGE_TYPE: dev` rows, one
+  `PLATFORM: amd64` and one `PLATFORM: arm64`.
+- Leave `docker/.ngc_version.lts` and all `IMAGE_TYPE: lts` rows unchanged
+  unless the user explicitly asks for an LTS bump.
+- Verify before review with `cat docker/.ngc_version.dev` plus
+  `rg -n '^\s*BASE_IMAGE: nvcr\.io/nvidia/pytorch:' .gitlab/stages/01.build.yml | rg -B1 'IMAGE_TYPE: dev' | rg 'BASE_IMAGE'`.
 
 ## Inputs to gather from the user
 

@@ -1,0 +1,13 @@
+[
+  {
+    "id": "update-golden-values-skill-specific-001",
+    "question": "I want to refresh golden values from a failed GitHub Actions workflow run with ID 12345 for only the failing jobs. From the update-golden-values skill, what single python command should I run to download the goldens? Reply with one bash code block containing the command and nothing else.",
+    "expected_skill": "update-golden-values",
+    "expected_script": "tests/test_utils/python_scripts/download_golden_values.py",
+    "ground_truth": "python tests/test_utils/python_scripts/download_golden_values.py --source github --pipeline-id 12345 --only-failing",
+    "expected_behavior": [
+      "Names tests/test_utils/python_scripts/download_golden_values.py",
+      "Includes --source github, --pipeline-id 12345, and --only-failing flags"
+    ]
+  }
+]
