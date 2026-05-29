@@ -1,13 +1,13 @@
 [
   {
     "id": "create-issue-skill-specific-001",
-    "question": "Before creating a new GitHub issue for a failing CI test in the Megatron-LM repo, what gh command should you run to check for an existing duplicate issue? Answer with one gh command using --state open and --search on the failed test filename.",
+    "question": "I'm filing a GitHub issue for a failing Megatron-LM CI test using the create-issue skill workflow. According to the skill: (a) what is the exact `gh issue list` command to check whether an open duplicate already exists for the failed test (include every flag the skill prescribes: --repo, --state, --search, --json, --limit), and (b) what is the exact issue title format the skill prescribes (use `<failed-test-node-id>` as a placeholder for the pytest node ID)? Reply with exactly these two lines and nothing else:\nDuplicate check: <full gh command>\nTitle: <title text>",
     "expected_skill": "create-issue",
     "expected_script": null,
-    "ground_truth": "gh issue list --repo NVIDIA/Megatron-LM --state open --search \"<failed-test-filename>\" --json number,title,url --limit 10",
+    "ground_truth": "Duplicate check: gh issue list --repo NVIDIA/Megatron-LM --state open --search \"<failed-test-filename>\" --json number,title,url --limit 10\nTitle: 🐛 CI failure: <failed-test-node-id>",
     "expected_behavior": [
-      "Uses gh issue list with --state open and --search on the test filename",
-      "Targets the NVIDIA/Megatron-LM repository"
+      "Names the gh issue list command with --repo NVIDIA/Megatron-LM --state open --search \"<failed-test-filename>\" --json number,title,url --limit 10 (all five flags)",
+      "Names the 🐛 CI failure: <failed-test-node-id> title format"
     ]
   }
 ]

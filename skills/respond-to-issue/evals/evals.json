@@ -1,16 +1,13 @@
 [
   {
-    "id": "respond-to-issue-unused-code-verification-001",
-    "question": "I am preparing a maintainer reply to a Megatron-LM GitHub issue that asks whether a named function is unused and should be removed. Give me a concise pre-draft checklist: what exact research and verification steps prevent falsely claiming the code is unused, and how should the final draft be presented? You may read the relevant skill, but do not execute commands or post anything.",
+    "id": "respond-to-issue-skill-specific-001",
+    "question": "I'm helping a Megatron-LM maintainer reply to a GitHub issue that claims a particular symbol is unused. According to the respond-to-issue skill: (a) what is the exact `git log` command (with the flag) the skill prescribes for tracing when a named symbol was added or removed in history, and (b) what does the skill say the maintainer must do with the drafted response before it gets posted to GitHub? Reply with exactly these two lines and nothing else. Use plain text — no backticks, no quotes, no markdown formatting:\nSymbol-history command: <full git command>\nPosting policy: <one-line rule>",
     "expected_skill": "respond-to-issue",
     "expected_script": null,
-    "ground_truth": "The response should use the respond-to-issue skill. It should first fetch/read the issue context with `gh issue view <number> --repo NVIDIA/Megatron-LM --json title,body,comments,labels,state` and classify whether it is a bug, feature request, question, or discussion. For an unused-code claim, it should search and read relevant source files, read any directly referenced files/functions, run a thorough grep for references before saying the function is unused or missing, inspect recent file history with `git log --oneline -20 -- <relevant-files>`, and trace symbol history with `git log -S \"<symbol>\" --oneline`. It should search related PRs with `gh pr list --repo NVIDIA/Megatron-LM --search \"<keywords>\" --limit 5` and similar issues with `gh issue list --repo NVIDIA/Megatron-LM --search \"<keywords>\" --limit 5`. Before citing details, it should verify commit hashes with `git show <hash> --stat` and re-read file paths and line numbers. The final draft should be technically grounded, respectful, concise, explicit about uncertainty, suggest a PR or follow-up if removal is actionable, and be shown to the maintainer as a quoted markdown block without posting automatically.",
+    "ground_truth": "Symbol-history command: git log -S \"<symbol>\" --oneline\nPosting policy: Never post the draft automatically; show it to the maintainer for explicit approval before posting.",
     "expected_behavior": [
-      "Uses the respond-to-issue skill guidance before answering.",
-      "Names gh issue view fields and issue classification.",
-      "Requires thorough grep plus git log --oneline -20 and git log -S before claiming code is unused.",
-      "Explains verification before citing commits, paths, line numbers, or unused/missing code.",
-      "States that the draft is presented to the maintainer in a quoted markdown block and never posted automatically."
+      "Names git log -S \"<symbol>\" --oneline (with the -S flag) as the symbol-history command",
+      "Names the never-post-without-explicit-approval rule (the draft must be shown to the maintainer first)"
     ]
   }
 ]

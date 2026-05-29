@@ -1,13 +1,13 @@
 [
   {
     "id": "linting-and-formatting-skill-specific-001",
-    "question": "I want to check the formatting of a Megatron-LM branch without actually rewriting any files. From the linting-and-formatting skill, what single bash command runs autoformat.sh in check-only mode? Answer with one bash command and nothing else.",
+    "question": "I'm preparing a PR to Megatron-LM. According to the linting-and-formatting skill: (a) what is the exact bash command that runs autoformat.sh in check-only mode (without rewriting files), and (b) what is the configured maximum line length in characters (from the skill's Code Style Rules section)? Reply with exactly these two lines and nothing else:\nCheck command: <full bash command>\nLine length: <number>",
     "expected_skill": "linting-and-formatting",
     "expected_script": "tools/autoformat.sh",
-    "ground_truth": "BASE_REF=main CHECK_ONLY=true SKIP_DOCS=false bash tools/autoformat.sh",
+    "ground_truth": "Check command: BASE_REF=main CHECK_ONLY=true SKIP_DOCS=false bash tools/autoformat.sh\nLine length: 119",
     "expected_behavior": [
-      "Invokes tools/autoformat.sh",
-      "Sets CHECK_ONLY=true to avoid rewriting files"
+      "Names the autoformat.sh check command with BASE_REF=main, CHECK_ONLY=true, and SKIP_DOCS=false env vars",
+      "Names the 119-character line length rule (not 80, not 100, not 120)"
     ]
   }
 ]
