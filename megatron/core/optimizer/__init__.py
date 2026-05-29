@@ -725,7 +725,72 @@ def check_config_overrides_consistency(
 def _tag_muon_split_qkv_parameters(
     config: OptimizerConfig, model_chunks: list[MegatronModule]
 ) -> None:
-    """Tag standard QKV and MLA up-projection weights with Muon split metadata."""
+    """Tag standard QKV and MLA up-projection weights with Muon split metadata.
+
+    Note that MLA down-projection weights aren't split with the current implementation.
+
+    The applied tags are:
+
+    - `is_qkv` (bool): whether the layer is a fused/packed collection of standard Multi-Head
+      Attention Q, K, and V projections. The layer contains a single weight, which includes all of
+      the Q, K, and V projections.
+    - `qkv_split_shapes` (tuple[int, ...] | None): per-group row counts for the projection slices
+      packed in this weight, if applicable. The gradients for the tagged parameter will be split
+      along the row dimension. The splits will be orthogonalized independently.
+
+      For example, without an Attention output gate, we have the following for the fused/packed
+      standard Multi-Head Attention QKV projection when not using tensor model parallelism:
+
+      ```
+      # Remember that PyTorch uses transposed weights.
+      linear_qkv.weight.shape == (
+          (
+              num_attention_heads * kv_channels  # <- Qs
+              + kv_channels * num_query_groups  # <- Ks
+              + kv_channels * num_query_groups  # <- Vs
+          ),
+          hidden_size,
+      )
+
+      linear_qkv.qkv_split_shapes = (
+          num_attention_heads // num_query_groups * kv_channels,  # <- Q
+          kv_channels,  # <- K
+          kv_channels,  # <- V
+      )
+      ```
+
+      In the optimizer step, we transform the gradient like the following:
+      ```
+      # The initial shape is like `linear_qkv.weight.shape` before.
+      linear_qkv.grad.shape == linear_qkv.weight.shape
+
+      qs_grad, ks_grad, vs_grad = muon_split_grads(linear_qkv.grad, linear_qkv.qkv_split_shapes)
+
+      qs_grad.shape == (
+          num_query_groups,
+          num_attention_heads // num_query_groups * kv_channels,
+          hidden_size,
+      )
+      ks_grad.shape == vs_grad.shape == (
+          num_query_groups,
+          kv_channels,
+          hidden_size,
+      )
+
+      # Contract first two dimensions.
+      qs_grad = qs_grad.reshape(num_attention_heads * kv_channels, hidden_size)
+      qs_grad = orthogonalize(qs_grad)
+
+      ks_grad = ks_grad.reshape(num_query_groups * kv_channels, hidden_size)
+      ks_grad = orthogonalize(ks_grad)
+
+      vs_grad = vs_grad.reshape(num_query_groups * kv_channels, hidden_size)
+      vs_grad = orthogonalize(vs_grad)
+
+      result_grad = muon_concat_grads(qs_grad, ks_grad, vs_grad)
+      result_grad.shape == linear_qkv.grad.shape
+      ```
+    """
     split_qkv = getattr(config, 'muon_split_qkv', True)
 
     def _is_muon_split_metadata_managed_param(
