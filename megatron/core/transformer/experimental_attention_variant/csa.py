@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
 from dataclasses import dataclass
@@ -733,7 +733,7 @@ class CompressedSparseAttention(MegatronModule):
                         self.softmax_scale,
                         min(self.indexer.index_topk, n_compressed),
                         indexer_loss_coeff,
-                        getattr(self.config, "dsa_indexer_use_sparse_loss", True),
+                        getattr(self.config, "dsa_indexer_use_sparse_loss", False),
                         self.indexer.pg_collection,
                         calculate_per_token_loss=self.config.calculate_per_token_loss,
                         mask=causal_mask,
@@ -890,7 +890,7 @@ class CompressedSparseAttention(MegatronModule):
             self.softmax_scale,
             self.indexer.softmax_scale,
             indexer_loss_coeff,
-            sparse_loss=getattr(self.config, "dsa_indexer_use_sparse_loss", True),
+            sparse_loss=getattr(self.config, "dsa_indexer_use_sparse_loss", False),
             kv_offset=offset,
             calculate_per_token_loss=self.config.calculate_per_token_loss,
         )

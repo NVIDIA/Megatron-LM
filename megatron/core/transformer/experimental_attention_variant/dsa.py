@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """DeepSeek Sparse Attention implementation.
 
@@ -492,9 +492,9 @@ class DSAIndexer(MegatronModule):
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
         self.pg_collection = pg_collection
         if getattr(self.config, "tensor_model_parallel_size", 1) != 1:
-            assert False, "Tensor parallelism is not supported for DSAIndexer."
+            raise ValueError("Tensor parallelism is not supported for DSAIndexer.")
         if self.pg_collection.tp.size() > 1:
-            assert False, "Tensor parallelism is not supported for DSAIndexer."
+            raise ValueError("Tensor parallelism is not supported for DSAIndexer.")
 
         # Initialize Position Embedding.
         if self.config.rope_type == 'rope':
@@ -612,7 +612,7 @@ class DSAIndexer(MegatronModule):
         # Gather inputs if sp is enabled
         # =========================================
         if self.config.sequence_parallel and self.pg_collection.tp.size() > 1:
-            assert False, "Tensor parallelism is not supported for DSAIndexer."
+            raise ValueError("Tensor parallelism is not supported for DSAIndexer.")
 
         # =========================================
         # Get sequence length and batch size
@@ -709,6 +709,7 @@ class DSAttention(MegatronModule):
         self.v_channels = v_channels
         self.pg_collection = pg_collection
         self.force_unfused_dsa = getattr(config, 'force_unfused_dsa', False)
+        self.apply_dsa_kernel_fusion = getattr(config, 'apply_dsa_kernel_fusion', False)
 
     def forward(
         self,
@@ -751,10 +752,14 @@ class DSAttention(MegatronModule):
         assert key.size(-1) >= d_v, "DSAttention key must contain the value channels."
 
         backend = getattr(self.config, "attention_backend", None)
-        indexer_sparse_loss = getattr(self.config, "dsa_indexer_use_sparse_loss", True)
-        use_unfused = (
-            self.force_unfused_dsa or backend == AttnBackend.unfused or backend == "unfused"
+        indexer_sparse_loss = getattr(self.config, "dsa_indexer_use_sparse_loss", False)
+        use_fused = (
+            self.apply_dsa_kernel_fusion
+            and not self.force_unfused_dsa
+            and backend != AttnBackend.unfused
+            and backend != "unfused"
         )
+        use_unfused = not use_fused
         if not use_unfused:
             assert (
                 attn_mask_type == AttnMaskType.causal
@@ -805,21 +810,39 @@ class DSAttention(MegatronModule):
                     mask, float('-inf')
                 )
 
-            topk_indices, indexer_loss = unfused_dsa_indexer_loss_and_topk(
-                index_q,
-                index_k,
-                index_weights,
-                self.indexer.softmax_scale,
-                query.detach(),
-                key.detach(),
-                self.softmax_scale,
-                effective_topk,
-                indexer_loss_coeff,
-                indexer_sparse_loss,
-                self.indexer.pg_collection,
-                calculate_per_token_loss=self.config.calculate_per_token_loss,
-                mask=float_mask,
-            )
+            if self.training and torch.is_grad_enabled() and indexer_loss_coeff > 0:
+                topk_indices, indexer_loss = unfused_dsa_indexer_loss_and_topk(
+                    index_q,
+                    index_k,
+                    index_weights,
+                    self.indexer.softmax_scale,
+                    query.detach(),
+                    key.detach(),
+                    self.softmax_scale,
+                    effective_topk,
+                    indexer_loss_coeff,
+                    indexer_sparse_loss,
+                    self.indexer.pg_collection,
+                    calculate_per_token_loss=self.config.calculate_per_token_loss,
+                    mask=float_mask,
+                )
+            else:
+                index_scores = torch.einsum('sbhd,tbd->sbht', index_q.float(), index_k.float())
+                index_scores = torch.relu(index_scores)
+                index_scores = index_scores * index_weights.unsqueeze(-1)
+                index_scores = index_scores * self.indexer.softmax_scale
+                index_scores = index_scores.sum(dim=2).transpose(0, 1)
+                if float_mask.dim() == 3:
+                    index_scores = index_scores + float_mask
+                else:
+                    index_scores = index_scores + float_mask.view(1, sq, skv)
+                topk_indices = index_scores.topk(effective_topk, dim=-1)[1]
+                if self.training and torch.is_grad_enabled():
+                    indexer_loss = (
+                        index_q.float().sum() + index_k.float().sum() + index_weights.float().sum()
+                    ) * 0.0
+                else:
+                    indexer_loss = torch.zeros((), dtype=torch.float32, device=query.device)
             output = unfused_dsa_fn(query, key, topk_indices, self.softmax_scale, d_v)
 
         if indexer_loss_coeff > 0:

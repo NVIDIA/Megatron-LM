@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """
 DSA kernel wrappers for Megatron's DSv4 sparse attention.
@@ -519,6 +519,7 @@ def _compute_indexer_predict(
     if major == 9:
         from cudnn.deepseek_sparse_attention.score_recompute import _interface_sm90
 
+        # SM90's cuDNN entry point does not expose qhead_per_kv_head; SM100 adds it.
         return _interface_sm90.sparse_indexer_score_recompute(
             q_indexer_bshd,
             k_indexer_bsd,

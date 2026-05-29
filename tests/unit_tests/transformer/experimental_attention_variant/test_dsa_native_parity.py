@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import math
 
@@ -31,7 +31,9 @@ def _mock_rotate_activation(x: torch.Tensor) -> torch.Tensor:
 
 
 def _make_config(
-    use_sparse_loss: bool = True, calculate_per_token_loss: bool = False
+    use_sparse_loss: bool = True,
+    calculate_per_token_loss: bool = False,
+    apply_dsa_kernel_fusion: bool = False,
 ) -> MLATransformerConfig:
     return MLATransformerConfig(
         multi_latent_attention=True,
@@ -92,6 +94,7 @@ def _make_config(
         tp_comm_overlap=False,
         softmax_scale=None,
         attention_backend=AttnBackend.unfused,
+        apply_dsa_kernel_fusion=apply_dsa_kernel_fusion,
     )
 
 
@@ -420,7 +423,9 @@ def test_absorbed_mla_dsa(
         torch.cuda.manual_seed(1234)
 
         config = _make_config(
-            use_sparse_loss=use_sparse_loss, calculate_per_token_loss=calculate_per_token_loss
+            use_sparse_loss=use_sparse_loss,
+            calculate_per_token_loss=calculate_per_token_loss,
+            apply_dsa_kernel_fusion=attention_backend != AttnBackend.unfused,
         )
         object.__setattr__(config, "attention_backend", attention_backend)
         backend = TESpecProvider()
