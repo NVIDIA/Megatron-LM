@@ -1,6 +1,8 @@
 # Megatron FSDP v2
 
-This directory contains the **Megatron FSDP v2** implementation — a PyTorch FSDP2-compatible API layer for Megatron Core.
+> ⚠️ Prototype Implementation — Not Yet Production Ready
+
+Megatron FSDP v2 (M-FSDP2) inherits the performance of Megatron FSDP v1 and supports API drop-in replacement for FSDP2.
 
 ## Architecture
 
@@ -36,20 +38,20 @@ Wraps a module with FSDP sharding semantics:
 4. Registers forward/backward hooks for unshard/reshard/reduce
 5. Replaces module parameters with `DTensor` representations
 
-### FullyShardMixedPrecisionPolicy
+### MixedPrecisionPolicy
 
-Controls parameter/gradient dtypes and communication precision:
+Controls parameter/gradient dtypes and communication precision. Available policies:
 
-| Policy | `main_params_dtype` | `main_grads_dtype` | Notes |
-|--------|---------------------|---------------------|-------|
-| `FullyShardMixedPrecisionPolicy` | `None` or `fp32` | `None` | Base policy (bf16 param, fp32 reduce) |
-| `FullyShardFP8Policy` | varies | varies | MXFP8 mixed precision |
-| `FullyShardNVFP4Policy` | `fp4` | `fp32` | NVFP4 primary weights |
+| Policy | Notes |
+|--------|-------|
+| `MixedPrecisionPolicy` | Base policy (bf16 param, fp32 main weight & main grad) |
+| `FullyShardFP8Policy` | MXFP8 rowwise/colwise quantized weights |
+| `FullyShardNVFP4Policy` | NVFP4 primary weights |
 
 ```python
-from megatron_fsdp.v2 import fully_shard, FullyShardFP8Policy
+from megatron_fsdp.v2 import fully_shard, MixedPrecisionPolicy
 
-mp_policy = FullyShardFP8Policy()
+mp_policy = MixedPrecisionPolicy(main_params_dtype=torch.float32)
 fully_shard(model, mp_policy=mp_policy)
 ```
 
@@ -61,7 +63,7 @@ Mixin class added to wrapped modules. Methods:
 |--------|-------------|---------|
 | `unshard()` | Pre-forward | All-gather params from sharded buffer |
 | `reshard()` | Post-forward, post-backward | Release unsharded buffer |
-| `reduce_grad()` | Post-backward | All-reduce or reduce-scatter gradients |
+| `reduce_grad()` | Post-backward / grad sync | Reduce-scatter gradients into optimizer-facing shards |
 
 ### DataParallelBuffer
 
@@ -69,15 +71,15 @@ Flat buffer managing (a shard of) parameter/gradient data:
 
 - `unshard()` — all-gather to full tensor
 - `reshard()` — free temporary buffer
-- `reduce_grad()` — all-reduce or reduce-scatter gradients
+- `reduce_grad()` — reduce-scatter gradients into optimizer-facing shards
 - Uses `BufferIndex` to track parameter layout within the buffer
 
 ### ParameterGroup
 
 Groups parameters sharing the same (device, dtype, requires_grad):
 
-- `model_weight_buffer` — stores sharded model weights
-- `main_weight_buffer` — optional high-precision copy
+- `model_weight_buffer` — stores compute weights; replicated for ZeRO-1/2 and sharded for ZeRO-3
+- `main_weight_buffer` — optional high-precision optimizer copy; sharded when optimizer state is sharded
 - `main_grad_buffer` — accumulates gradients before reduce
 - `dist_params` — DTensor views into the buffer
 
@@ -110,7 +112,6 @@ See the parent directory `..` for `uneven_dtensor.py` which provides:
   See [tp_support_design.md](tp_support_design.md) for the planned design.
 - **Hybrid Sharding (HSDP):** Not supported. v2 does not yet support an outer
   DP dimension for hybrid (inter-node + intra-node) sharding.
-- **Context Parallelism (CP):** Not supported.
 - **Expert Parallelism (EP):** Not supported in v2's param group logic. MoE
   expert parameters are not currently handled via EP submeshes.
 
@@ -219,6 +220,7 @@ torchrun --nproc_per_node=2 examples/megatron_fsdp/fsdp_toy.py \
 
 ```bash
 # Run all v2 unit tests (requires 2 GPUs)
+TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 \
 torchrun --nproc_per_node=2 -m pytest \
     tests/unit_tests/distributed/megatron_fsdp/v2/ -v -x
 
@@ -226,6 +228,7 @@ torchrun --nproc_per_node=2 -m pytest \
 torchrun --nproc_per_node=2 -m pytest \
     tests/unit_tests/distributed/megatron_fsdp/v2/test_fully_shard.py -v
 
+TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1 \
 torchrun --nproc_per_node=2 -m pytest \
     tests/unit_tests/distributed/megatron_fsdp/v2/test_mcore_checkpoint.py -v
 
@@ -233,9 +236,3 @@ torchrun --nproc_per_node=2 -m pytest \
 pytest tests/unit_tests/distributed/megatron_fsdp/v2/ -v \
     -k "test_double_shard_rejected or test_no_params_module or test_get_state_dict_strict"
 ```
-
-## Acknowledgements
-
-This work was designed and implemented by **Jianbin Chang**\*, **Tong Liu**\*, **Cory Ye** and **Jingyue Wu**.
-
-**\*** Primary code developers.
