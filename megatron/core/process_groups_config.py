@@ -326,7 +326,7 @@ class ProcessGroupCollection:
             )
             expt_dp_group = parallel_state.get_expert_data_parallel_group()
             intra_expt_dp_group = parallel_state.get_expert_data_parallel_group(
-                partial_expert_data_parallel=True, with_gtp=True
+                partial_expert_data_parallel=True
             )
             intra_expt_dp_with_egtp_group = parallel_state.get_expert_data_parallel_group(
                 with_gtp=True, partial_expert_data_parallel=True
@@ -339,22 +339,12 @@ class ProcessGroupCollection:
                 intra_dp_cp_group_gloo = parallel_state.get_data_parallel_group_gloo(
                     with_context_parallel=True, partial_data_parallel=True
                 )
-                intra_dp_cp_with_gtp_group_gloo = parallel_state.get_data_parallel_group_gloo(
-                    with_context_parallel=True, with_gtp=True, partial_data_parallel=True
-                )
                 intra_expt_dp_group_gloo = parallel_state.get_expert_data_parallel_group_gloo(
                     partial_expert_data_parallel=True
                 )
-                intra_expt_dp_with_egtp_group_gloo = (
-                    parallel_state.get_expert_data_parallel_group_gloo(
-                        with_gtp=True, partial_expert_data_parallel=True
-                    )
-                )
             else:
                 intra_dp_cp_group_gloo = None
-                intra_dp_cp_with_gtp_group_gloo = None
                 intra_expt_dp_group_gloo = None
-                intra_expt_dp_with_egtp_group_gloo = None
 
             # Model communication groups
             mp_group = parallel_state.get_model_parallel_group()
@@ -492,9 +482,7 @@ class ProcessGroupCollection:
                     "provided. Please set use_gloo_process_groups to False."
                 )
             intra_dp_cp_group_gloo = None
-            intra_dp_cp_with_gtp_group_gloo = None
             intra_expt_dp_group_gloo = None
-            intra_expt_dp_with_egtp_group_gloo = None
 
         return {
             'dp_group': dp_group,
@@ -511,8 +499,6 @@ class ProcessGroupCollection:
             'inter_dist_opt_group': inter_dist_opt_group,
             'intra_dist_opt_group': intra_dist_opt_group,
             'intra_dp_cp_group_gloo': intra_dp_cp_group_gloo,
-            'intra_dp_cp_with_gtp_group_gloo': intra_dp_cp_with_gtp_group_gloo,
-            'intra_expt_dp_with_egtp_group_gloo': intra_expt_dp_with_egtp_group_gloo,
             'intra_expt_dp_group_gloo': intra_expt_dp_group_gloo,
         }
 

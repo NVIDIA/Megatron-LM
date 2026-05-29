@@ -190,14 +190,19 @@ class DistributedDataParallel(_BaseDataParallel):
 
         # When a full_param_layout is provided, verify that the grouping is consistent
         # with the layout (same buffer keys, same params per key, same param_indices).
-        # Skip strict equality if GTP carved params out — the caller-supplied layout
-        # was computed without that carve-out, so a literal == would always fail.
-        if full_param_layout is not None and not gtp_params:
-            assert set(buffer_groups.keys()) == set(full_param_layout.layouts.keys()), (
-                f"Buffer keys from param grouping {set(buffer_groups.keys())} do not match "
-                f"full_param_layout keys {set(full_param_layout.layouts.keys())}"
-            )
+        # (E)GTP shares a BufferKey with non-GTP params of the same dtype, so keys that
+        # also appear in the gtp/egtp groups diverge from the caller's (non-carved)
+        # layout — skip those, and skip the exact key-set check when any carve-out ran.
+        if full_param_layout is not None:
+            carved_keys = set(gtp_buffer_groups.keys()) | set(egtp_buffer_groups.keys())
+            if not carved_keys:
+                assert set(buffer_groups.keys()) == set(full_param_layout.layouts.keys()), (
+                    f"Buffer keys from param grouping {set(buffer_groups.keys())} do not match "
+                    f"full_param_layout keys {set(full_param_layout.layouts.keys())}"
+                )
             for buffer_key, (params, param_indices) in buffer_groups.items():
+                if buffer_key in carved_keys:
+                    continue
                 layout = full_param_layout.layouts[buffer_key]
                 assert set(params) == set(
                     layout.param_index_map.keys()

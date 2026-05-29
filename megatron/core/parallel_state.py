@@ -75,7 +75,6 @@ _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP = None
 # of true expert-weight replicas. Mirrors _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP
 # on the dense side.
 _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP = None
-_INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_GLOO = None
 # Parallel state values changed on the fly
 _MPU_EXPERT_MODEL_PARALLEL_WORLD_SIZE = None
 _MPU_EXPERT_MODEL_PARALLEL_RANK = None
@@ -146,7 +145,6 @@ _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO = None
 # Partial Data parallel group information with context parallel combined and GTP peers
 # excluded. Reaches only true weight-replica ranks within one distributed-optimizer instance.
 _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP = None
-_INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_GLOO = None
 
 # combined parallel group of TP and CP
 _TENSOR_AND_CONTEXT_PARALLEL_GROUP = None
@@ -1027,7 +1025,6 @@ def initialize_model_parallel(
     global _DATA_PARALLEL_GROUP_WITH_GTP
     global _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP
     global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP
-    global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_GLOO
     if gtp_remat_size > 1:
         # Build rank→gtp_rank mapping.
         rank_to_gtp_rank = {}
@@ -1083,35 +1080,17 @@ def initialize_model_parallel(
                             pg_options=get_nccl_options("intra_dp_cp_gtp", nccl_comm_cfgs),
                             group_desc="INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP",
                         )
-                        if create_gloo_process_groups:
-                            intra_group_gloo = create_group(
-                                chunk,
-                                timeout=timeout,
-                                backend="gloo",
-                                group_desc=(
-                                    "INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_GLOO"
-                                ),
-                            )
-                        else:
-                            intra_group_gloo = None
                         if rank in chunk:
                             _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP = intra_group
-                            _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_GLOO = (
-                                intra_group_gloo
-                            )
         if num_distributed_optimizer_instances == 1:
             _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP = (
                 _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP
             )
-            _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_GLOO = None
     else:
         _DATA_PARALLEL_GROUP_WITH_GTP = _DATA_PARALLEL_GROUP
         _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP = _DATA_PARALLEL_GROUP_WITH_CP
         _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP = (
             _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP
-        )
-        _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_GLOO = (
-            _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_GLOO
         )
 
     # Build the context-parallel groups.
@@ -1529,7 +1508,6 @@ def initialize_model_parallel(
     # Build expert DP group with expert generalized tensor parallel accounted for.
     global _EXPERT_DATA_PARALLEL_GROUP_WITH_GTP
     global _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP
-    global _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_GLOO
     if expert_gtp_remat_size > 1:
         # Build rank→expert_gtp_rank mapping.
         rank_to_expert_gtp_rank = {}
@@ -1567,34 +1545,16 @@ def initialize_model_parallel(
                             pg_options=get_nccl_options("intra_ep_dp_gtp", nccl_comm_cfgs),
                             group_desc="INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP",
                         )
-                        if create_gloo_process_groups:
-                            intra_group_gloo = create_group(
-                                chunk,
-                                timeout=timeout,
-                                backend="gloo",
-                                group_desc=(
-                                    "INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_GLOO"
-                                ),
-                            )
-                        else:
-                            intra_group_gloo = None
                         if rank in chunk:
                             _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP = intra_group
-                            _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_GLOO = (
-                                intra_group_gloo
-                            )
         if num_distributed_optimizer_instances == 1:
             _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP = (
                 _EXPERT_DATA_PARALLEL_GROUP_WITH_GTP
             )
-            _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_GLOO = None
     else:
         _EXPERT_DATA_PARALLEL_GROUP_WITH_GTP = _EXPERT_DATA_PARALLEL_GROUP
         _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP = (
             _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
-        )
-        _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_GLOO = (
-            _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO
         )
 
     ### End of expert related parallel groups initialization
@@ -1835,21 +1795,7 @@ def get_data_parallel_group_gloo(
     with_context_parallel=False, with_gtp=False, partial_data_parallel=False
 ):
     """Get the Gloo data-parallel group the caller rank belongs to."""
-    if with_gtp:
-        assert with_context_parallel, "Gloo with_gtp variants only exist with CP"
-        if partial_data_parallel:
-            assert _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_GLOO is not None, (
-                "Intra partial data parallel group with context parallel and "
-                "generalized tensor parallel (gloo) is not initialized"
-            )
-            return _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_GLOO
-        # Full (non-partial) Gloo variant of with_gtp is not built; callers needing
-        # cross-instance Gloo over the GTP-excluded set can use the non-GTP variant
-        # since broadcasts are init-time only.
-        assert (
-            _DATA_PARALLEL_GROUP_WITH_CP_GLOO is not None
-        ), "data parallel group-gloo with context parallel combined is not initialized"
-        return _DATA_PARALLEL_GROUP_WITH_CP_GLOO
+    assert not with_gtp, "GTP does not support Gloo data-parallel groups"
     if with_context_parallel:
         if partial_data_parallel:
             assert (
@@ -2424,15 +2370,7 @@ def get_expert_data_parallel_group(
 
 def get_expert_data_parallel_group_gloo(with_gtp=False, partial_expert_data_parallel=False):
     """Get expert data parallel group-gloo."""
-    if with_gtp:
-        assert (
-            partial_expert_data_parallel
-        ), "Gloo with_gtp variant is only built for the partial (per-distopt-instance) group"
-        assert _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_GLOO is not None, (
-            "Intra partial expert data parallel group with generalized tensor parallel "
-            "(gloo) is not initialized"
-        )
-        return _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_GLOO
+    assert not with_gtp, "EGTP does not support Gloo expert-data-parallel groups"
     if partial_expert_data_parallel:
         assert (
             _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_GLOO is not None
@@ -2555,9 +2493,6 @@ def destroy_model_parallel():
     global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP
     _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP = None
 
-    global _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_GLOO
-    _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP_GLOO = None
-
     global _CONTEXT_PARALLEL_GROUP
     _CONTEXT_PARALLEL_GROUP = None
 
@@ -2662,9 +2597,6 @@ def destroy_model_parallel():
 
     global _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP
     _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP = None
-
-    global _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_GLOO
-    _INTRA_PARTIAL_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP_GLOO = None
 
     global _EXPERT_DATA_PARALLEL_GROUP_GLOO
     if (
