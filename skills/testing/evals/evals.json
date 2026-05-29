@@ -1,16 +1,13 @@
 [
   {
-    "id": "testing-disable-without-deleting-001",
-    "question": "A Megatron-LM functional recipe entry is flaky in the standard dev CI path, but I want to keep it discoverable and easy to re-enable. Answer in at most 5 bullets: the entry currently has `scope: [mr-github]`; what exact YAML change should I make, and how is this different from marking a unit test flaky in dev or LTS? You may read the relevant skill, but do not edit files.",
+    "id": "testing-skill-specific-001",
+    "question": "A Megatron-LM functional recipe entry is flaky in dev CI but should remain discoverable. According to the testing skill, what is the exact scope value to use instead of `mr-github` to disable the entry without deleting it? Reply with just the new scope value.",
     "expected_skill": "testing",
     "expected_script": null,
-    "ground_truth": "The response should use the testing skill and say not to delete the recipe entry. For a functional recipe entry, disable it by suffixing the scope with -broken, so `scope: [mr-github]` becomes `scope: [mr-github-broken]`. It should explain that this preserves the entry for later re-enable and keeps the test discoverable. It should distinguish this recipe-scope mechanism from unit-test markers: use `@pytest.mark.flaky_in_dev` to skip a unit test in the dev environment and `@pytest.mark.flaky` to skip a unit test in the LTS environment. It should avoid suggesting unrelated workflow changes, deleting test cases, or editing golden values.",
+    "ground_truth": "mr-github-broken",
     "expected_behavior": [
-      "Uses the testing skill guidance before answering.",
-      "Changes `scope: [mr-github]` to `scope: [mr-github-broken]` for the functional recipe entry.",
-      "Explains that the recipe entry should stay in place for discoverability and easy re-enable.",
-      "Distinguishes recipe `-broken` scopes from unit-test markers `@pytest.mark.flaky_in_dev` and `@pytest.mark.flaky`.",
-      "Does not recommend deleting the test case, removing the recipe entry, or changing golden values."
+      "Names mr-github-broken as the replacement scope",
+      "Keeps the recipe entry in place rather than deleting it"
     ]
   }
 ]

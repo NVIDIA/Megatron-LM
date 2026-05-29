@@ -1,16 +1,13 @@
 [
   {
     "id": "update-golden-values-skill-specific-001",
-    "question": "Do not download artifacts, edit files, or run commands. From the update-golden-values skill, answer in at most 8 bullets: what exact scripts and flags are used for an only-failing GitHub refresh, what safety check is required before resetting existing goldens, how is the relative-diff CSV interpreted, and what PR-summary fields must be reported?",
+    "question": "I want to refresh golden values from a failed GitHub Actions workflow run with ID 12345 for only the failing jobs. From the update-golden-values skill, what single python command should I run to download the goldens? Reply with one bash code block containing the command and nothing else.",
     "expected_skill": "update-golden-values",
-    "expected_script": null,
-    "ground_truth": "The response should use the update-golden-values skill and include: the download script tests/test_utils/python_scripts/download_golden_values.py and comparison script tests/test_utils/python_scripts/compare_golden_values_kl.py, noting the _kl suffix is legacy and the script reports avg_rel_diff. Source should be github, and only-failing scope uses --only-failing with --pipeline-id <WORKFLOW_RUN_ID>. The download script needs GITHUB_TOKEN, which may be derived from gh auth token but must not be exported into a long-lived shell or committed. Before any reset, inspect existing golden-value edits; if discarding them, use git checkout -- tests/functional_tests/test_cases/ and remove untracked files under that tree only after warning that untracked deletions cannot be recovered from git. The comparison CSV has file, metric, n_steps, avg_rel_diff where avg_rel_diff = mean((old - new) / old), signed positive meaning new is smaller than old and negative meaning new is larger. Sort/filter by absolute avg_rel_diff but preserve sign. PR summary should state whether it is only-failing or all, the workflow run ID, the download command with --only-failing when used, number of updated golden-value files, comparison coverage in files x metrics and total rows, per-metric headline numbers for lm loss, num-zeros, iteration-time, mem-allocated-bytes, mem-max-allocated-bytes, distribution buckets of |avg_rel_diff|, and any notes about run-to-run noise thresholds.",
+    "expected_script": "tests/test_utils/python_scripts/download_golden_values.py",
+    "ground_truth": "python tests/test_utils/python_scripts/download_golden_values.py --source github --pipeline-id 12345 --only-failing",
     "expected_behavior": [
-      "Uses the update-golden-values skill guidance before answering.",
-      "Names download_golden_values.py and compare_golden_values_kl.py and explains the legacy _kl suffix.",
-      "Uses --source github, --pipeline-id, and --only-failing for failed-job-only refreshes.",
-      "Warns before resetting tracked or deleting untracked golden-value files and protects credentials.",
-      "Explains avg_rel_diff sign, absolute-value ranking, and the required PR summary sections."
+      "Names tests/test_utils/python_scripts/download_golden_values.py",
+      "Includes --source github, --pipeline-id 12345, and --only-failing flags"
     ]
   }
 ]

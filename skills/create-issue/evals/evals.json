@@ -1,16 +1,13 @@
 [
   {
-    "id": "create-issue-run-url-triage-001",
-    "question": "I only have a Megatron-LM GitHub Actions run URL, not a job URL, and I want to prepare a bug issue for the failed CI test. What exact IDs and `gh` commands should I use to find the failed job, pull a concise error snippet, resolve the triggering PR and test author, and what must I check before creating the issue? Do not fetch GitHub or create an issue.",
+    "id": "create-issue-skill-specific-001",
+    "question": "Before creating a new GitHub issue for a failing CI test in the Megatron-LM repo, what gh command should you run to check for an existing duplicate issue? Answer with one gh command using --state open and --search on the failed test filename.",
     "expected_skill": "create-issue",
     "expected_script": null,
-    "ground_truth": "The response should use the create-issue skill and state that a run URL has `/actions/runs/<run_id>` and a job URL would additionally have `/job/<job_id>`, so extract `run_id` and discover `job_id` from the run. For run-only input, use `gh run view <run_id> --repo NVIDIA/Megatron-LM --json jobs --jq '[.jobs[] | select(.conclusion == \"failure\") | {id: .databaseId, name: .name, url: .url}]'`. For logs, use `gh api repos/NVIDIA/Megatron-LM/actions/jobs/<job_id>/logs 2>&1 | grep -E '(FAILED|ERROR|\\bError\\b|assert|Traceback|Exception|##\\[error\\])' | head -200`, and get the job name with `gh run view --job <job_id> --repo NVIDIA/Megatron-LM --json name --jq .name`. Resolve the triggering PR from `gh run view <run_id> --repo NVIDIA/Megatron-LM --json headBranch --jq .headBranch`, extracting `pull-request/<number>`, then `gh pr view <pr_number> --repo NVIDIA/Megatron-LM --json number,title,url`. Resolve the test author by reading the PR base with `gh pr view <pr_number> --repo NVIDIA/Megatron-LM --json baseRefName --jq .baseRefName`, then querying `gh api \"repos/NVIDIA/Megatron-LM/commits?path=<test-file-path>&sha=<base-branch>&per_page=1\" --jq '.[0] | {login: .author.login, name: .commit.author.name, sha: .sha}'`, falling back to `gh api \"repos/NVIDIA/Megatron-LM/pulls/<pr_number>/commits\"` if the file was introduced by the PR. Before creating, search duplicates with `gh issue list --repo NVIDIA/Megatron-LM --state open --search \"<failed-test-filename>\" --json number,title,url --limit 10`; if a duplicate exists, report it instead of creating a new issue. It should not create anything because the prompt forbids it.",
+    "ground_truth": "gh issue list --repo NVIDIA/Megatron-LM --state open --search \"<failed-test-filename>\" --json number,title,url --limit 10",
     "expected_behavior": [
-      "Uses the create-issue skill guidance before answering.",
-      "Names the run/job URL patterns and run_id/job_id extraction.",
-      "Provides the skill's failed-job listing and log-grep gh commands.",
-      "Explains triggering PR and test-author resolution using headBranch, baseRefName, commits, and PR commits fallback.",
-      "States the duplicate-check requirement and does not create an issue."
+      "Uses gh issue list with --state open and --search on the test filename",
+      "Targets the NVIDIA/Megatron-LM repository"
     ]
   }
 ]

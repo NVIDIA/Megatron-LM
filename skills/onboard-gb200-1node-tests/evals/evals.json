@@ -1,16 +1,13 @@
 [
   {
-    "id": "onboard-gb200-pp-etp-adaptation-001",
-    "question": "I am creating a one-node GB200 MR variant of an existing two-node Megatron-LM test whose config uses `--tensor-model-parallel-size 4`, `--pipeline-model-parallel-size 2`, `--expert-model-parallel-size 2`, and `--expert-tensor-parallel-size 2`. What exact parallelism changes, recipe shape, and path naming should I use? Do not modify files or run commands.",
+    "id": "onboard-gb200-1node-tests-skill-specific-001",
+    "question": "When onboarding a one-node GB200 MR functional test variant from an existing two-node test, how many GPUs does the recipe entry use? Reply with the exact YAML keys and values for `nodes`, `gpus`, and `platforms` in three lines.",
     "expected_skill": "onboard-gb200-1node-tests",
     "expected_script": null,
-    "ground_truth": "The response should use the onboard-gb200-1node-tests skill. It should compute that the original two-node GB200 test has 8 GPUs total and `TP x PP = 4 x 2 = 8`, so the one-node four-GPU variant must reduce PP by half: `--pipeline-model-parallel-size 2` becomes `--pipeline-model-parallel-size 1`. TP remains 4, EP remains 2 because EP is not greater than 4, and ETP remains 2 because after the PP reduction `DP_new = 4 / (TP x PP_new) = 4 / (4 x 1) = 1`, so `EP x ETP = 2 x 2 = 4 <= TP x DP_new = 4`. It should say not to change global batch size; let gradient accumulation absorb the reduced DP. It should name the one-node config path `tests/functional_tests/test_cases/{model}/{test_case}_1node/model_config.yaml`. It should say the recipe entry belongs in `tests/test_utils/recipes/gb200/gpt-1node.yaml` for GPT or `moe-1node.yaml` for MoE, with `nodes: 1`, `gpus: 4`, `platforms: dgx_gb200`, and `scope: [mr-github]` unless this is one of the one or two representative slim tests that also get `mr-github-slim`.",
+    "ground_truth": "nodes: 1\ngpus: 4\nplatforms: dgx_gb200",
     "expected_behavior": [
-      "Uses the onboard-gb200-1node-tests skill guidance before answering.",
-      "Reduces pipeline parallelism from 2 to 1 because TP x PP is 8 on the original two-node case.",
-      "Keeps TP, EP, and ETP unchanged and verifies EP x ETP <= TP x DP_new.",
-      "States nodes:1 and gpus:4 for GB200 one-node variants.",
-      "Names the `_1node/model_config.yaml` path convention and the gpt-1node.yaml or moe-1node.yaml recipe destination."
+      "States nodes: 1 and gpus: 4 for a one-node GB200 test",
+      "Names platforms: dgx_gb200"
     ]
   }
 ]

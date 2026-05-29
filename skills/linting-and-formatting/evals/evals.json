@@ -1,16 +1,13 @@
 [
   {
     "id": "linting-and-formatting-skill-specific-001",
-    "question": "Do not run commands. From the Megatron-LM linting-and-formatting skill, answer in at most 6 bullets: give the exact check-mode and fix-mode autoformat.sh commands, the import-ordering command required after editing imports, the linting dependency-group install command, and three concrete style rules from the skill.",
+    "question": "I want to check the formatting of a Megatron-LM branch without actually rewriting any files. From the linting-and-formatting skill, what single bash command runs autoformat.sh in check-only mode? Answer with one bash command and nothing else.",
     "expected_skill": "linting-and-formatting",
-    "expected_script": null,
-    "ground_truth": "The response should use the linting-and-formatting skill and include: BASE_REF=main CHECK_ONLY=true SKIP_DOCS=false bash tools/autoformat.sh for check mode; BASE_REF=main CHECK_ONLY=false bash tools/autoformat.sh for fix mode; uv run isort <file1>.py <file2>.py after editing imports; uv sync --locked --only-group linting inside the container to install ruff, black, isort, and pylint; tools invoked by autoformat include black, isort, pylint, ruff, and mypy; style rules include X | None instead of Optional[X], Google-style docstrings on public classes/functions, 119-character line length, and no bare except.",
+    "expected_script": "tools/autoformat.sh",
+    "ground_truth": "BASE_REF=main CHECK_ONLY=true SKIP_DOCS=false bash tools/autoformat.sh",
     "expected_behavior": [
-      "Uses the linting-and-formatting skill guidance before answering.",
-      "Gives the exact autoformat.sh check-mode and fix-mode commands.",
-      "Mentions uv run isort for edited import files.",
-      "Mentions uv sync --locked --only-group linting inside the container.",
-      "Includes concrete style rules from the skill rather than generic Python style advice."
+      "Invokes tools/autoformat.sh",
+      "Sets CHECK_ONLY=true to avoid rewriting files"
     ]
   }
 ]
