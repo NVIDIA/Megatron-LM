@@ -324,6 +324,9 @@ def _get_param_groups(
 
     # Map (pg_overrides, is_expert_parallel) to params.
     params_map = {}
+    # Track which ParamKey canonical names matched into each group, so groups
+    # can be labeled with a stable name for checkpoint reload identification.
+    matched_keys_map: Dict[Tuple, set] = {}
 
     for model_chunk in model_chunks:
         for name, param in model_chunk.named_parameters():
@@ -333,10 +336,12 @@ def _get_param_groups(
             uses_default_config = False
             # Get optimizer config overrides for this parameter.
             param_overrides_list: list[ParamGroupOverride] = []
+            matched_keys_this_param: list[str] = []
             if config_overrides is not None:
                 for param_key, param_override in config_overrides.items():
                     if param_key.matches(param, name):
                         param_overrides_list.append(param_override)
+                        matched_keys_this_param.append(param_key.canonical_name())
 
             if param_overrides_list:
                 param_override: ParamGroupOverride | None = combine_param_group_overrides(
@@ -354,7 +359,9 @@ def _get_param_groups(
             key = (param_override_tuple, is_expert_parallel)
             if key not in params_map:
                 params_map[key] = []
+                matched_keys_map[key] = set()
             params_map[key].append(param)
+            matched_keys_map[key].update(matched_keys_this_param)
 
     # Distributed checkpoint requires all ranks to have the same param groups,
     # so we need to align the param groups across ranks, otherwise we may have
@@ -366,6 +373,17 @@ def _get_param_groups(
         for key in keys:
             if key not in params_key:
                 params_key.append(key)
+
+    # All-gather matched-key sets per group so ranks that don't hold a given
+    # group still agree on its canonical name (PP/EP shards can each see only
+    # a subset of params).
+    gathered_matched_keys = [None for _ in range(torch.distributed.get_world_size())]
+    torch.distributed.all_gather_object(gathered_matched_keys, matched_keys_map)
+    for remote_map in gathered_matched_keys:
+        if remote_map is None:
+            continue
+        for k, names in remote_map.items():
+            matched_keys_map.setdefault(k, set()).update(names)
     # Need to pick one of the param_override_tuples to use for the param group.
     param_groups = []
     # Sort keys, None first.
@@ -400,10 +418,15 @@ def _get_param_groups(
         assert (
             "params" not in param_override
         ), "'params' should not be in param_override, this is a protected key"
+
+        matched_names = sorted(matched_keys_map.get(key, set()))
+        param_group_name = "+".join(matched_names) if matched_names else "__default__"
+
         param_group = {
             'params': params,
             'is_expert_parallel': is_expert_parallel,
             'default_config': uses_default_lr_schedule,
+            'param_group_name': param_group_name,
             **default_config,
             **param_override,  # keep **param_override last so that users can override other fields.
         }

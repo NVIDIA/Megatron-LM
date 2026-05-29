@@ -94,7 +94,7 @@ def _multi_tensor_copy_this_to_that(
             that_.copy_(this_)
 
 
-param_group_identifier_keys = ('wd_mult', 'lr_mult', 'is_expert_parallel', 'is_decoupled_lr')
+param_group_identifier_keys = ('param_group_name', 'is_expert_parallel')
 
 
 class MegatronOptimizer(ABC):
@@ -412,8 +412,8 @@ class MegatronOptimizer(ABC):
         current_groups: List[Dict], state_dict_groups: List[Dict]
     ) -> List[Dict]:
         """Filter and reorder state_dict parameter groups to match current optimizer groups.
-        Keys used for matching align with those from _get_param_groups:
-        (wd_mult, lr_mult, is_expert_parallel, is_decoupled_lr)
+        Keys used for matching align with those from _get_param_groups: see
+        ``param_group_identifier_keys``.
 
         Args:
             current_groups (List[Dict]): Parameter groups from the current optimizer instance.
@@ -427,20 +427,14 @@ class MegatronOptimizer(ABC):
         """
         # Define groups order that is needed in the current optimizer (coming from runtime)
         needed_groups = [
-            # NeMo may have different key for required fields, e.g., "wd_mult" to "pre_wd_mult"
-            tuple(g[key] if key in g else g[f"pre_{key}"] for key in param_group_identifier_keys)
-            for g in current_groups
+            tuple(g[key] for key in param_group_identifier_keys) for g in current_groups
         ]
 
         # Keep state_dict param group order since groups are LocalNonpersistentObject
         # and their order is determined at runtime, not from the checkpoint.
         params_in_state_dict_order = [g['params'] for g in state_dict_groups]
         loaded_groups_map = {
-            tuple(
-                # NeMo may have different key for required fields, e.g., "wd_mult" to "pre_wd_mult"
-                group[key] if key in group else group[f"pre_{key}"]
-                for key in param_group_identifier_keys
-            ): group
+            tuple(group[key] for key in param_group_identifier_keys): group
             for group in state_dict_groups
         }
 

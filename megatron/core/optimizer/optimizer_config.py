@@ -86,6 +86,44 @@ class ParamKey:
       positive match by their name.
     """
 
+    def canonical_name(self) -> str:
+        """Stable, deterministic identifier for this ParamKey.
+
+        Derived from the hashable fields (name/attr/predicate.name/with_name_predicate.name)
+        so two ParamKeys with the same matching semantics produce the same string. Used to
+        label param groups so checkpoint reload can match groups by identity rather than by
+        numeric override values that may change between training stages.
+        """
+
+        def _as_tuple(value):
+            if isinstance(value, tuple):
+                return value
+            if not value:
+                return ()
+            return (value,)
+
+        parts: list[str] = []
+
+        names = _as_tuple(self.name)
+        if names:
+            parts.append("name=" + ",".join(sorted(names)))
+
+        attrs = _as_tuple(self.attr)
+        if attrs:
+            parts.append("attr=" + ",".join(sorted(attrs)))
+
+        preds = _as_tuple(self.predicate)
+        pred_names = sorted(p.name for p in preds)
+        if pred_names:
+            parts.append("pred=" + ",".join(pred_names))
+
+        wnps = _as_tuple(self.with_name_predicate)
+        wnp_names = sorted(p.name for p in wnps)
+        if wnp_names:
+            parts.append("wpred=" + ",".join(wnp_names))
+
+        return ";".join(parts) if parts else "__unnamed__"
+
     def matches(self, param: torch.nn.Parameter, param_name: str) -> bool:
         """Returns true if passed-in parameter (with name) matches `param_key`.
 
