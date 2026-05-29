@@ -104,12 +104,10 @@ class StudentLogitsCapture:
         self._logits: Optional[torch.Tensor] = None
         self._hook_handles: List[Any] = []
 
-    def attach_hooks(self, model_chunks: List[torch.nn.Module]) -> None:
-        """Attach forward hooks to the model chunks' output layers."""
-        for model_chunk in model_chunks:
-            if hasattr(model_chunk, 'output_layer'):
-                handle = model_chunk.output_layer.register_forward_hook(self._capture_logits)
-                self._hook_handles.append(handle)
+    def attach_hooks(self, model: LanguageModule) -> None:
+        """Attach forward hooks to the model's output layer."""
+        handle = model.output_layer.register_forward_hook(self._capture_logits)
+        self._hook_handles.append(handle)
 
         global _ACTIVE_STUDENT_LOGITS_CAPTURE
         _ACTIVE_STUDENT_LOGITS_CAPTURE = self
@@ -122,6 +120,7 @@ class StudentLogitsCapture:
     ) -> None:
         if not module.training:
             return
+        # NOTE: Assumes main head runs after MTP layers, overwriting this value prior to pop().
         self._logits = output[0] if isinstance(output, tuple) else output
 
     def pop(self) -> torch.Tensor:

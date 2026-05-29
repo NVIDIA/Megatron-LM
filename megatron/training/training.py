@@ -1969,13 +1969,13 @@ def setup_model_and_optimizer(
             flush_interval=args.logits_save_flush_interval,
             save_dtype=args.logits_save_dtype,
         )
-        logits_saver.attach_hooks(unwrapped_model)
+        logits_saver.attach_hooks(unwrapped_model[-1])
 
     if args.logits_load_dir is not None:
         from megatron.training.distillation import StudentLogitsCapture
 
         student_logits_capture = StudentLogitsCapture()
-        student_logits_capture.attach_hooks(unwrapped_model)
+        student_logits_capture.attach_hooks(unwrapped_model[-1])
 
     one_logger and one_logger.log_metrics({"app_build_optimzer_start_time": one_logger_utils.get_timestamp_in_ms()})
     if skip_optimizer:

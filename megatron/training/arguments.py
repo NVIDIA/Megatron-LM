@@ -1616,21 +1616,24 @@ def validate_args(args, defaults={}):
     if not args.async_save:
         args.async_strategy = "mcore"
 
-    # Offline Distillation checks
     if args.logits_save_dir is not None:
+        assert args.logits_save_top_k is not None, '--logits-save-top-k is required when --logits-save-dir is set.'
+
         if args.async_strategy != "mcore":
             warn_rank_0(
                 '--logits-save-dir requires async_strategy="mcore". Overriding async_strategy to "mcore".'
             )
             args.async_strategy = "mcore"
+
+    if args.freeze_all_layers:
         if args.use_distributed_optimizer:
             warn_rank_0(
-                '--logits-save-dir incompatible with use_distributed_optimizer. Disabling use_distributed_optimizer.'
+                '--freeze-all-layers incompatible with use_distributed_optimizer. Disabling use_distributed_optimizer.'
             )
             args.use_distributed_optimizer = False
         if args.overlap_param_gather:
             warn_rank_0(
-                '--logits-save-dir incompatible with overlap_param_gather. Disabling overlap_param_gather.'
+                '--freeze-all-layers incompatible with overlap_param_gather. Disabling overlap_param_gather.'
             )
             args.overlap_param_gather = False
 

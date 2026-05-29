@@ -40,6 +40,7 @@ import torch.distributed as dist
 import zstandard
 
 from megatron.core import parallel_state
+from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.training import get_args, get_tensorboard_writer
 from megatron.training.utils import print_rank_0
@@ -253,25 +254,24 @@ class LogitsSaverHooks:
         else:
             self._curr_mtp_passes += 1
 
-    def attach_hooks(self, model_chunks: List[torch.nn.Module]) -> None:
+    def attach_hooks(self, model: LanguageModule) -> None:
         """Attach logits-saving hooks and skip expensive LM loss computation.
 
         Args:
-            model_chunks: Unwrapped model chunks to instrument.
+            model: Model to instrument.
         """
-        fwd_handle = model_chunks[0].output_layer.register_forward_hook(self._forward_hook)
-        self._hook_handles.extend([fwd_handle])
-        for model_chunk in model_chunks:
-            self._override_language_model_loss(model_chunk)
+        fwd_handle = model.output_layer.register_forward_hook(self._forward_hook)
+        self._hook_handles.append(fwd_handle)
+        self._override_language_model_loss(model)
 
-    def _override_language_model_loss(self, model_chunk: torch.nn.Module) -> None:
+    def _override_language_model_loss(self, model: LanguageModule) -> None:
         """Replace LM loss with a zero-valued tensor that preserves gradient edges."""
         def _compute_zero_language_model_loss(_self, _labels, logits):
             return (logits * 0).sum(dim=-1).transpose(0, 1).contiguous()
 
-        original_loss = model_chunk.compute_language_model_loss
-        self._loss_overrides.append((model_chunk, original_loss))
-        model_chunk.compute_language_model_loss = MethodType(_compute_zero_language_model_loss, model_chunk)
+        original_loss = model.compute_language_model_loss
+        self._loss_overrides.append((model, original_loss))
+        model.compute_language_model_loss = MethodType(_compute_zero_language_model_loss, model)
 
     def remove_hooks(self) -> None:
         """Remove all registered hooks."""
