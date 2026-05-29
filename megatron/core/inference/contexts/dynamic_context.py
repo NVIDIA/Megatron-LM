@@ -843,19 +843,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
             self.mamba_metadata.bind_gpu_buffers(self.gpu_view)
             self.mamba_conv_states = torch.empty(
-                (
-                    self.num_mamba_layers,
-                    self.max_requests * self.mamba_state_bank_count,
-                )
+                (self.num_mamba_layers, self.max_requests * self.mamba_state_bank_count)
                 + self.mamba_conv_states_shape,
                 dtype=self.mamba_conv_states_dtype,
                 device=torch.cuda.current_device(),
             )
             self.mamba_ssm_states = torch.empty(
-                (
-                    self.num_mamba_layers,
-                    self.max_requests * self.mamba_state_bank_count,
-                )
+                (self.num_mamba_layers, self.max_requests * self.mamba_state_bank_count)
                 + self.mamba_ssm_states_shape,
                 dtype=self.mamba_ssm_states_dtype,
                 device=torch.cuda.current_device(),
@@ -2508,9 +2502,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             device = self.mamba_conv_states.device
             base_indices = torch.tensor(self._pending_mamba_zeros, dtype=torch.long, device=device)
             if self.mamba_state_bank_count > 1:
-                banks = torch.arange(
-                    self.mamba_state_bank_count, dtype=torch.long, device=device
-                )
+                banks = torch.arange(self.mamba_state_bank_count, dtype=torch.long, device=device)
                 indices = (base_indices[:, None] * self.mamba_state_bank_count + banks).flatten()
             else:
                 indices = base_indices

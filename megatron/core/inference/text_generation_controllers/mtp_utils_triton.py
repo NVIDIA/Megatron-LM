@@ -438,7 +438,8 @@ def mamba_state_selective_copy(
         state_idx: `(N,)` int tensor — intermediate-state slot index per request.
         accepted_counts: `(N,)` int tensor — accepted token index per request.
         num_layers: number of Mamba layers (first dim of the state tensors).
-        destination_state_idx: optional `(N,)` int tensor — current-state destination slot per request.
+        destination_state_idx: optional `(N,)` int tensor — current-state
+            destination slot per request.
     """
     N = prefill_status.shape[0]
     if N == 0:

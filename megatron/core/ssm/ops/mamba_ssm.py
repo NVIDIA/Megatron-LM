@@ -163,15 +163,11 @@ def _selective_scan_update_kernel(
                 tl.store(out_s_ptrs, 0.0, mask=offs_m < dim)
             return
         state_ptr += state_batch_idx * stride_state_batch + pid_h * stride_state_head
-        state_write_ptr = (
-            state_ptr
-            + (state_batch_write_idx - state_batch_idx) * stride_state_batch
-        )
+        state_write_ptr = state_ptr + (state_batch_write_idx - state_batch_idx) * stride_state_batch
         if HAS_INT_STATE:
             int_state_ptr += (
-                (state_batch_idx // STATE_BANK_COUNT) * stride_int_batch
-                + pid_h * stride_int_head
-            )
+                state_batch_idx // STATE_BANK_COUNT
+            ) * stride_int_batch + pid_h * stride_int_head
     else:
         state_ptr += pid_b * stride_state_batch + pid_h * stride_state_head
         state_write_ptr = state_ptr

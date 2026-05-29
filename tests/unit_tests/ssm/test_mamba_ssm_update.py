@@ -30,9 +30,7 @@ class TestSelectiveStateUpdate:
         C = torch.randn(batch, seq_len, dstate, device="cuda", dtype=torch.float32)
         read_indices = torch.tensor([0, 2], device="cuda", dtype=torch.int64)
         write_indices = torch.tensor([1, 3], device="cuda", dtype=torch.int64)
-        intermediate = torch.zeros(
-            batch, seq_len, dim, dstate, device="cuda", dtype=torch.float32
-        )
+        intermediate = torch.zeros(batch, seq_len, dim, dstate, device="cuda", dtype=torch.float32)
 
         state_triton = state.clone()
         result = selective_state_update(

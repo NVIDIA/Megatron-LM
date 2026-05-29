@@ -337,6 +337,8 @@ class TestCausalConv1dUpdate:
         )
 
         torch.testing.assert_close(result, expected, atol=1e-5, rtol=1e-5)
-        torch.testing.assert_close(conv_state_triton[read_indices.long()], conv_state[read_indices.long()])
+        torch.testing.assert_close(
+            conv_state_triton[read_indices.long()], conv_state[read_indices.long()]
+        )
         torch.testing.assert_close(conv_state_triton[write_indices.long()], conv_state_ref)
         torch.testing.assert_close(int_states[:, -1], conv_state_ref)

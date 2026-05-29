@@ -188,9 +188,7 @@ def causal_conv1d_update_kernel(
                 i += 1
 
         # Store the new token at the end of the linear state buffer
-        tl.store(
-            conv_state_write_ptrs + (state_len - 1) * conv_state_l_stride, x_val, mask=mask
-        )
+        tl.store(conv_state_write_ptrs + (state_len - 1) * conv_state_l_stride, x_val, mask=mask)
 
         # Write out to the intermediate state buffer if requested. Reuse the
         # register values from the shift above (and x_val for the new tail

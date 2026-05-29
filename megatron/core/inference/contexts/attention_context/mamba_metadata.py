@@ -234,9 +234,7 @@ class MambaMetadata:
             )
             if padded_decode_count > real_decode_count:
                 self._batch_indices_decode_buffer[real_decode_count:padded_decode_count] = -1
-                self._batch_indices_decode_write_buffer[
-                    real_decode_count:padded_decode_count
-                ] = -1
+                self._batch_indices_decode_write_buffer[real_decode_count:padded_decode_count] = -1
             self.batch_indices_decode = self._batch_indices_decode_buffer[:padded_decode_count]
             self.batch_indices_decode_write = self._batch_indices_decode_write_buffer[
                 :padded_decode_count
@@ -555,9 +553,9 @@ class MambaMetadata:
             ]
             if active_mamba_write_indices is None:
                 active_mamba_write_indices = active_mamba_indices
-            bufs['batch_indices_decode_write'][:real_decode_count] = (
-                active_mamba_write_indices[:real_decode_count]
-            )
+            bufs['batch_indices_decode_write'][:real_decode_count] = active_mamba_write_indices[
+                :real_decode_count
+            ]
             if padded_decode_count > real_decode_count:
                 bufs['batch_indices_decode'][real_decode_count:padded_decode_count] = -1
                 bufs['batch_indices_decode_write'][real_decode_count:padded_decode_count] = -1
