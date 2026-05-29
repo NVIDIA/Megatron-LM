@@ -1,16 +1,13 @@
 [
   {
     "id": "build-and-dependency-skill-specific-001",
-    "question": "A local Megatron-LM Docker build reaches the `jet` stage and asks for an internal secret. Answer in at most 7 bullets: what build target should I use instead, what are the exact dev-vs-lts dependency rules, where does the container venv live, and which uv commands are used for dev/test, linting, LTS installs, and dependency edits? You may read the relevant skill, but do not edit files.",
+    "question": "According to the Megatron-LM build-and-dependency skill: (a) does `uv add` plus `uv lock` run inside the CI container or on the bare host (the skill is emphatic), and (b) what is the absolute filesystem path of the uv-managed Python venv inside the container that is already on PATH? Provide both answers clearly labeled.",
     "expected_skill": "build-and-dependency",
     "expected_script": null,
-    "ground_truth": "The response should use the build-and-dependency skill and include skill-specific details: dependency work and uv operations happen inside the container, not on the bare host; the venv is at /opt/venv inside the container; dev uses docker/.ngc_version.dev and the dev group and is the default unless container::lts is requested; lts uses docker/.ngc_version.lts and the lts group and excludes bleeding-edge extras such as ModelOpt; dev/test install is uv sync --locked --group dev --group test; linting install is uv sync --locked --only-group linting; LTS install is uv sync --locked --group lts --group test; adding dependencies uses uv add <package> then uv lock inside the container; Dockerfile.ci.dev has a jet stage requiring an internal secret, so local builds should use --target main to stop at the public stage.",
+    "ground_truth": "uv add plus uv lock must run inside the Megatron-LM CI container, not on the bare host. The uv-managed Python venv inside the container lives at /opt/venv (already on PATH).",
     "expected_behavior": [
-      "Uses the build-and-dependency skill guidance before answering.",
-      "Names the /opt/venv container venv and says uv operations run inside the container.",
-      "Distinguishes dev from lts using docker/.ngc_version.dev, docker/.ngc_version.lts, the container::lts label, and the dev/lts groups.",
-      "Gives the exact uv sync commands for dev/test, linting, and LTS installs.",
-      "Mentions uv add followed by uv lock for dependency changes and warns about Dockerfile.ci.dev's jet stage requiring --target main."
+      "States that uv add + uv lock must run inside the container (not on the bare host)",
+      "Names /opt/venv as the absolute path of the in-container uv-managed venv"
     ]
   }
 ]
