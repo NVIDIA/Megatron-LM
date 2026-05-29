@@ -17,6 +17,7 @@ import os
 import sys
 from pathlib import Path
 from typing import Tuple
+import warnings
 
 import torch
 import torch.distributed as dist
@@ -91,7 +92,6 @@ def build_fsdp_model(
         except ImportError:
             from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import get_state_dict
             from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import FSDPModule, fully_shard
-        sys.modules["get_state_dict"] = get_state_dict
     else:
         from torch.distributed.fsdp import FSDPModule, fully_shard
 
@@ -134,6 +134,13 @@ class AppState(Stateful):
         self.optimizer = optimizer
 
     def state_dict(self):
+        try:
+            from megatron_fsdp.uneven_dtensor import get_state_dict
+        except ImportError:
+            from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import get_state_dict
+        except ImportError:
+            warnings.warn("Could not import get_state_dict from megatron_fsdp.uneven_dtensor.")
+
         # this line automatically manages FSDP FQN's, as well as sets the default state dict type to FSDP.SHARDED_STATE_DICT
         model_state_dict, optimizer_state_dict = get_state_dict(self.model, self.optimizer)
         return {

@@ -63,11 +63,11 @@ class MixedDtypeLayer(nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.linear1 = nn.Linear(16, 32, bias=False)  # bf16, shape [512, 256]
-        self.linear2 = nn.Linear(32, 16, bias=True)  # bf16, shape [256, 512] + bias [256]
-        self.norm = nn.LayerNorm(16)  # bf16, weight [256] + bias [256]
-        self.quant_proj = nn.Linear(16, 8, bias=False)  # uint8, shape [128, 256]
-        self.quant_gate = nn.Linear(16, 4, bias=False)  # uint8, shape [64, 256]
+        self.linear1 = nn.Linear(16, 32, bias=False)  # bf16, shape [16, 32]
+        self.linear2 = nn.Linear(32, 16, bias=True)  # bf16, shape [32, 16] + bias [16]
+        self.norm = nn.LayerNorm(16)  # bf16, weight [16] + bias [16]
+        self.quant_proj = nn.Linear(16, 8, bias=False)  # uint8, shape [16, 8]
+        self.quant_gate = nn.Linear(16, 4, bias=False)  # uint8, shape [16, 4]
 
 
 # ------------------------------------------------------------------ #
@@ -246,15 +246,7 @@ def test_unshard_reshard(strategy):
         wbuf.reshard()
         if w_dist:
             assert wbuf._unsharded_buffer is None
-        torch.set_printoptions(
-            threshold=float("inf"),  # never switch to summarised view
-            edgeitems=None,          # show all edge items
-            linewidth=200            # optional, for wide tensors
-        )
-        assert torch.equal(wbuf.data, shard_before), (
-            f"wbuf.data={wbuf.data}\n"
-            f"shard_before={shard_before}\n"
-        )
+        assert torch.equal(wbuf.data, shard_before)
 
     torch.distributed.barrier()
 
