@@ -207,6 +207,18 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
+  - test_case: [tests/unit_tests/determinism/correctness/**/*.py]
+    products:
+      # tag: [latest] only — this directory is new in this PR, so legacy
+      # CI refs (/opt/megatron-lm-legacy/) don't have the path yet.
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  # determinism/perf is in its own dedicated recipe (determinism-perf.yaml) —
+  # the perf bucket wraps pytest in nsys for per-NVTX-range attribution and
+  # can't share the generic ``run_ci_test.sh`` invocation used here.
   - test_case: [tests/unit_tests/**/*.py]
     products:
       - environment: [lts, dev]
