@@ -1,16 +1,13 @@
 [
   {
-    "id": "split-pr-tests-and-dependencies-001",
-    "question": "I am planning a Megatron-LM PR split to reduce CODEOWNERS reviewers. Answer in at most 6 bullets: if one proposed split puts implementation files in one PR and their tests in another, and a later PR depends on symbols renamed by the first, what should I do with the tests and dependency, and what constraints apply before and during execution? You may read the relevant skill, but do not create branches.",
+    "id": "split-pr-skill-specific-001",
+    "question": "I'm using the split-pr skill on a Megatron-LM PR. According to the skill: (a) what is the EXACT bash one-liner the skill prescribes for extracting file-scoped changes from the source branch onto a new branch (the form is `git diff ... -- <file paths> | ...`), and (b) when each resulting split PR is pushed, must it go to the user's fork or directly to upstream NVIDIA/Megatron-LM? Reply with exactly these two lines and nothing else. Use plain text — no backticks, no quotes, no markdown formatting:\nExtraction command: <full bash command>\nPush target: <fork or upstream>",
     "expected_skill": "split-pr",
     "expected_script": null,
-    "ground_truth": "The response should use the split-pr skill and reject splitting tests away from the implementation they validate. Tests should travel with the production code they test, even if that means the PR keeps the relevant CODEOWNERS group. The optimization goal remains minimizing CODEOWNERS reviewer groups per resulting PR, but not at the cost of broken or unreviewable PRs. Dependencies must be called out explicitly: if PR B uses symbols renamed in PR A, PR B depends on PR A, and each PR still needs to be independently mergeable to main. Use backward-compatible aliases, re-exports, or deprecation shims in the first PR when needed so later PRs do not break imports. It must wait for user approval before execution. During execution, create draft PRs from the appropriate base branches, extract file-scoped changes with `git diff upstream/main..<source-branch> -- <file paths> | git apply`, stage and commit cleanly, push to the user's fork only, never directly upstream, and create draft PRs. If the original PR must be narrowed, confirm before force-pushing, and credit the original author if the current GitHub user is not the author.",
+    "ground_truth": "Extraction command: git diff upstream/main..<source-branch> -- <file paths> | git apply\nPush target: fork",
     "expected_behavior": [
-      "Uses the split-pr skill guidance before answering.",
-      "Rejects putting tests in a separate PR from the production code they validate.",
-      "States the reviewer-group minimization objective without sacrificing independently mergeable PRs.",
-      "Explains dependency handling with explicit PR ordering and backward-compatible aliases or re-exports.",
-      "States execution waits for user approval and creates draft PRs on the user's fork, not upstream."
+      "Names git diff upstream/main..<source-branch> -- <file paths> | git apply as the extraction one-liner (uses git diff + git apply, not cherry-pick or checkout)",
+      "Names the user's fork as the push target (not upstream NVIDIA/Megatron-LM directly)"
     ]
   }
 ]
