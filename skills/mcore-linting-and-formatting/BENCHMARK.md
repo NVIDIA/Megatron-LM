@@ -1,12 +1,12 @@
 # Evaluation Report
 
-Evaluation of the `testing` skill before publication to the NVCARPS ecosystem.
+Evaluation of the `mcore-linting-and-formatting` skill before publication to the NVCARPS ecosystem.
 
 This benchmark summarizes NV-BASE validation and Tier 3 live agent evaluation results for the skill. The goal is to document whether the skill is safe, discoverable, effective, and useful for agents before it is published for broader workflow use.
 
 ## Evaluation Summary
 
-- Skill: `testing`
+- Skill: `mcore-linting-and-formatting`
 - Evaluation date: 2026-05-29
 - NV-BASE profile: `internal`
 - Overall verdict: FAIL
@@ -40,15 +40,15 @@ Tier 3 dimension rollup was not available in this report.
 
 ## Tier 1: Static Validation Summary
 
-Tier 1 validation reported findings. NV-BASE ran 9 checks and found 11 total findings.
+Tier 1 validation reported findings. NV-BASE ran 9 checks and found 12 total findings.
 
 Top findings:
 
-- HIGH SCHEMA/author_missing: Author not specified in metadata (`skills/testing/SKILL.md`)
-- MEDIUM QUALITY/quality_correctness: SKILL_SPEC recommended field missing: 'metadata.author' (`skills/testing/SKILL.md`)
-- MEDIUM QUALITY/quality_correctness: SKILL_SPEC recommended field missing: 'metadata.tags' (`skills/testing/SKILL.md`)
-- MEDIUM SCHEMA/body_recommended_section: Missing recommended section: '## Instructions' (`skills/testing/SKILL.md`)
-- MEDIUM SCHEMA/body_recommended_section: Missing recommended section: '## Examples' (`skills/testing/SKILL.md`)
+- HIGH SCHEMA/author_missing: Author not specified in metadata (`skills/mcore-linting-and-formatting/SKILL.md`)
+- MEDIUM QUALITY/quality_correctness: SKILL_SPEC recommended field missing: 'metadata.author' (`skills/mcore-linting-and-formatting/SKILL.md`)
+- MEDIUM QUALITY/quality_correctness: SKILL_SPEC recommended field missing: 'metadata.tags' (`skills/mcore-linting-and-formatting/SKILL.md`)
+- MEDIUM QUALITY/quality_discoverability: Description uses first/second person (`skills/mcore-linting-and-formatting/SKILL.md`)
+- MEDIUM SCHEMA/body_recommended_section: Missing recommended section: '## Instructions' (`skills/mcore-linting-and-formatting/SKILL.md`)
 
 ## Tier 2: Deduplication Summary
 

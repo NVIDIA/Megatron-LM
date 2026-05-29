@@ -1,12 +1,12 @@
 # Evaluation Report
 
-Evaluation of the `run-on-slurm` skill before publication to the NVCARPS ecosystem.
+Evaluation of the `mcore-onboard-gb200-1node-tests` skill before publication to the NVCARPS ecosystem.
 
 This benchmark summarizes NV-BASE validation and Tier 3 live agent evaluation results for the skill. The goal is to document whether the skill is safe, discoverable, effective, and useful for agents before it is published for broader workflow use.
 
 ## Evaluation Summary
 
-- Skill: `run-on-slurm`
+- Skill: `mcore-onboard-gb200-1node-tests`
 - Evaluation date: 2026-05-29
 - NV-BASE profile: `internal`
 - Overall verdict: FAIL
@@ -44,11 +44,11 @@ Tier 1 validation reported findings. NV-BASE ran 9 checks and found 11 total fin
 
 Top findings:
 
-- HIGH SCHEMA/author_missing: Author not specified in metadata (`skills/run-on-slurm/SKILL.md`)
-- MEDIUM QUALITY/quality_correctness: SKILL_SPEC recommended field missing: 'metadata.author' (`skills/run-on-slurm/SKILL.md`)
-- MEDIUM QUALITY/quality_correctness: SKILL_SPEC recommended field missing: 'metadata.tags' (`skills/run-on-slurm/SKILL.md`)
-- MEDIUM SCHEMA/body_recommended_section: Missing recommended section: '## Instructions' (`skills/run-on-slurm/SKILL.md`)
-- MEDIUM SCHEMA/body_recommended_section: Missing recommended section: '## Examples' (`skills/run-on-slurm/SKILL.md`)
+- HIGH SCHEMA/author_missing: Author not specified in metadata (`skills/mcore-onboard-gb200-1node-tests/SKILL.md`)
+- MEDIUM QUALITY/quality_correctness: SKILL_SPEC recommended field missing: 'metadata.author' (`skills/mcore-onboard-gb200-1node-tests/SKILL.md`)
+- MEDIUM QUALITY/quality_correctness: SKILL_SPEC recommended field missing: 'metadata.tags' (`skills/mcore-onboard-gb200-1node-tests/SKILL.md`)
+- MEDIUM SCHEMA/body_recommended_section: Missing recommended section: '## Instructions' (`skills/mcore-onboard-gb200-1node-tests/SKILL.md`)
+- MEDIUM SCHEMA/body_recommended_section: Missing recommended section: '## Examples' (`skills/mcore-onboard-gb200-1node-tests/SKILL.md`)
 
 ## Tier 2: Deduplication Summary
 

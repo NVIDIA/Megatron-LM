@@ -1,5 +1,5 @@
 ---
-name: run-on-slurm
+name: mcore-run-on-slurm
 description: How to launch distributed Megatron-LM training jobs on a SLURM cluster. Covers a minimal sbatch skeleton, environment-variable setup for torch.distributed.run, CUDA_DEVICE_MAX_CONNECTIONS rules across hardware and parallelism modes, container conventions, monitoring, and per-rank failure diagnosis.
 license: Apache-2.0
 when_to_use: Submitting a SLURM job; writing or debugging an sbatch script; configuring multi-node distributed training; setting MASTER_ADDR / MASTER_PORT / WORLD_SIZE; diagnosing a SLURM job failure; 'how do I run on the cluster', 'sbatch', 'multi-node training'.

@@ -1,12 +1,12 @@
 # Evaluation Report
 
-Evaluation of the `bump-base-image` skill before publication to the NVCARPS ecosystem.
+Evaluation of the `mcore-testing` skill before publication to the NVCARPS ecosystem.
 
 This benchmark summarizes NV-BASE validation and Tier 3 live agent evaluation results for the skill. The goal is to document whether the skill is safe, discoverable, effective, and useful for agents before it is published for broader workflow use.
 
 ## Evaluation Summary
 
-- Skill: `bump-base-image`
+- Skill: `mcore-testing`
 - Evaluation date: 2026-05-29
 - NV-BASE profile: `internal`
 - Overall verdict: FAIL
@@ -40,15 +40,15 @@ Tier 3 dimension rollup was not available in this report.
 
 ## Tier 1: Static Validation Summary
 
-Tier 1 validation reported findings. NV-BASE ran 9 checks and found 12 total findings.
+Tier 1 validation reported findings. NV-BASE ran 9 checks and found 11 total findings.
 
 Top findings:
 
-- HIGH SCHEMA/author_missing: Author not specified in metadata (`skills/bump-base-image/SKILL.md`)
-- MEDIUM QUALITY/quality_correctness: SKILL_SPEC recommended field missing: 'metadata.author' (`skills/bump-base-image/SKILL.md`)
-- MEDIUM QUALITY/quality_correctness: SKILL_SPEC recommended field missing: 'metadata.tags' (`skills/bump-base-image/SKILL.md`)
-- MEDIUM SCHEMA/body_recommended_section: Missing recommended section: '## Instructions' (`skills/bump-base-image/SKILL.md`)
-- MEDIUM SCHEMA/body_recommended_section: Missing recommended section: '## Examples' (`skills/bump-base-image/SKILL.md`)
+- HIGH SCHEMA/author_missing: Author not specified in metadata (`skills/mcore-testing/SKILL.md`)
+- MEDIUM QUALITY/quality_correctness: SKILL_SPEC recommended field missing: 'metadata.author' (`skills/mcore-testing/SKILL.md`)
+- MEDIUM QUALITY/quality_correctness: SKILL_SPEC recommended field missing: 'metadata.tags' (`skills/mcore-testing/SKILL.md`)
+- MEDIUM SCHEMA/body_recommended_section: Missing recommended section: '## Instructions' (`skills/mcore-testing/SKILL.md`)
+- MEDIUM SCHEMA/body_recommended_section: Missing recommended section: '## Examples' (`skills/mcore-testing/SKILL.md`)
 
 ## Tier 2: Deduplication Summary
 
