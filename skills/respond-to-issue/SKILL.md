@@ -1,31 +1,14 @@
 ---
 name: respond-to-issue
 description: Research and draft a response to a GitHub issue or question from an external contributor.
-license: Apache-2.0
 when_to_use: User shares a GitHub issue URL or asks to respond to a community question; 'respond to this issue', 'draft a reply', 'answer this GitHub question'.
 user_invocable: true
-argument: "GitHub issue URL or number"
+argument: "<github-issue-url-or-number>"
 ---
 
 # Respond to GitHub Issue
 
 Help a maintainer draft a high-quality response to a GitHub issue from an external contributor.
-
-## Answer-First Pattern: Unused-Code Claims
-
-When asked how to answer an issue claiming code is unused, give the maintainer a
-checklist rather than guessing:
-
-- Read the issue with `gh issue view <number> --repo NVIDIA/Megatron-LM --json title,body,comments,labels,state`.
-- Classify the issue, then search/read the referenced files or symbols.
-- Before saying code is unused or missing, run a thorough reference search,
-  inspect recent file history with `git log --oneline -20 -- <relevant-files>`,
-  and trace symbol history with `git log -S "<symbol>" --oneline`.
-- Search related PRs and issues with `gh pr list --repo NVIDIA/Megatron-LM --search "<keywords>" --limit 5`
-  and `gh issue list --repo NVIDIA/Megatron-LM --search "<keywords>" --limit 5`.
-- Re-read cited lines and verify cited commits with `git show <hash> --stat`.
-- Present the maintainer draft as a quoted markdown block; never post it without
-  explicit approval.
 
 ## Workflow
 
