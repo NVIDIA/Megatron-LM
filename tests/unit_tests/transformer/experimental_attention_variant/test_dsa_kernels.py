@@ -2365,9 +2365,9 @@ class TestRealKernelFusedIndexerSparseAttn:
         # Indexer path: ReLU(QK_indexer) * W head-summed, then one fp32
         # ``indexer_softmax_scale``. Do not pre-scale bf16 weights.
         qk_idx = torch.einsum('bqhd,bkd->bqhk', q_idx_bshd, k_idx_bsd)
-        idx_score_ref = (
-            torch.relu(qk_idx) * w_bsh.unsqueeze(-1)
-        ).sum(dim=2) * s['indexer_softmax_scale']
+        idx_score_ref = (torch.relu(qk_idx) * w_bsh.unsqueeze(-1)).sum(dim=2) * s[
+            'indexer_softmax_scale'
+        ]
         idx_lse_ref = torch.logsumexp(idx_score_ref, dim=-1)
 
         loss_ref = _kl_loss_from_dense_scores(

@@ -42,9 +42,7 @@ def patch_te_mxfp8_view_backward_if_needed(config) -> bool:
     def backward(ctx, grad):
         if isinstance(grad, mxfp8_cls):
             new_data = (
-                grad._rowwise_data.reshape(*ctx.shape)
-                if grad._rowwise_data is not None
-                else None
+                grad._rowwise_data.reshape(*ctx.shape) if grad._rowwise_data is not None else None
             )
             new_columnwise_data = (
                 grad._columnwise_data.reshape(*ctx.shape)

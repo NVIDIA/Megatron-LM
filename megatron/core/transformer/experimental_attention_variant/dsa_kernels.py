@@ -99,9 +99,9 @@ def _dsa_fwd_flash_mla(
     # partial-indexer mode in that case allows the compact topk_length path.
     requested_indexer_topk = indexer_topk
     kernel_indexer_topk = 0 if indexer_topk >= TopK else indexer_topk
-    assert not (kernel_indexer_topk > 0 and topk_length is not None), (
-        "partial indexer_topk > 0 requires non-compact mode (topk_length must be None)"
-    )
+    assert not (
+        kernel_indexer_topk > 0 and topk_length is not None
+    ), "partial indexer_topk > 0 requires non-compact mode (topk_length must be None)"
     topk_align = _get_topk_alignment()
     TopK_padded = (TopK + topk_align - 1) // topk_align * topk_align
     if TopK_padded != TopK:
@@ -391,7 +391,9 @@ def _indexer_topk_bshd(
 
     scores = _DSA.indexer_forward_wrapper(
         q_bshd, k_bshd, w_bsh, ratio=ratio, sm_scale=indexer_softmax_scale
-    )["scores"]  # (b, sq, sk) fp32, -inf on masked positions
+    )[
+        "scores"
+    ]  # (b, sq, sk) fp32, -inf on masked positions
 
     # Top-K selection via the TRT-LLM CuTe-DSL radix kernel.
     n_rows = b * sq
@@ -772,9 +774,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         effective_topk = min(indexer_topk, n_comp)
 
         # ---- 1. Permute indexer inputs SBHD->BSHD ONCE. -------------------
-        q_idx_bshd, k_idx_bsd, w_bsh = _sbhd_to_bshd_indexer_inputs(
-            q_indexer, k_indexer, weights
-        )
+        q_idx_bshd, k_idx_bsd, w_bsh = _sbhd_to_bshd_indexer_inputs(q_indexer, k_indexer, weights)
 
         # ---- 2. Indexer scoring + top-K (with scores retained). -------------
         topk_indices_cmp, topk_length_cmp, indexer_scores = _indexer_topk_bshd(

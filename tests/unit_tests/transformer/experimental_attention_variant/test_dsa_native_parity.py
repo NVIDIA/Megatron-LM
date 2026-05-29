@@ -1,3 +1,5 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
 import math
 
 import pytest
@@ -415,8 +417,7 @@ def test_absorbed_mla_dsa(
         torch.cuda.manual_seed(1234)
 
         config = _make_config(
-            use_sparse_loss=use_sparse_loss,
-            calculate_per_token_loss=calculate_per_token_loss,
+            use_sparse_loss=use_sparse_loss, calculate_per_token_loss=calculate_per_token_loss
         )
         object.__setattr__(config, "attention_backend", attention_backend)
         backend = TESpecProvider()

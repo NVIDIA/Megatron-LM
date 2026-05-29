@@ -327,9 +327,7 @@ def unfused_dsa_indexer_loss_and_topk(
     topk_indices = index_scores.topk(topk_k, dim=-1)[1]
 
     if key.size(-2) == 1:
-        attention_scores = torch.einsum(
-            'sbhd,tbd->bhst', query.float(), key.squeeze(-2).float()
-        )
+        attention_scores = torch.einsum('sbhd,tbd->bhst', query.float(), key.squeeze(-2).float())
     else:
         assert key.size(-2) == np, "Attention key must be MQA or match query heads."
         attention_scores = torch.einsum('sbhd,tbhd->bhst', query.float(), key.float())
@@ -755,9 +753,7 @@ class DSAttention(MegatronModule):
         backend = getattr(self.config, "attention_backend", None)
         indexer_sparse_loss = getattr(self.config, "dsa_indexer_use_sparse_loss", True)
         use_unfused = (
-            self.force_unfused_dsa
-            or backend == AttnBackend.unfused
-            or backend == "unfused"
+            self.force_unfused_dsa or backend == AttnBackend.unfused or backend == "unfused"
         )
         if not use_unfused:
             assert (
@@ -773,9 +769,7 @@ class DSAttention(MegatronModule):
 
         if not use_unfused:
             kv = key.squeeze(-2)
-            attn_sink = torch.full(
-                (np,), float("-inf"), dtype=torch.float32, device=query.device
-            )
+            attn_sink = torch.full((np,), float("-inf"), dtype=torch.float32, device=query.device)
             window_idxs = torch.empty((b, sq, 0), dtype=torch.int32, device=query.device)
             output, indexer_loss = fused_indexer_sparse_attn(
                 query,
@@ -797,7 +791,9 @@ class DSAttention(MegatronModule):
             )
         else:
             if attn_mask_type is not None:
-                assert attn_mask_type == AttnMaskType.causal, 'Only causal mask is supported for now'
+                assert (
+                    attn_mask_type == AttnMaskType.causal
+                ), 'Only causal mask is supported for now'
                 float_mask = torch.triu(
                     torch.full((sq, skv), float('-inf'), dtype=torch.float32, device=x.device),
                     diagonal=1,

@@ -11,10 +11,7 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
 )
-from megatron.core.transformer.experimental_attention_variant.dsa import (
-    DSAIndexer,
-    DSAttention,
-)
+from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexer, DSAttention
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
