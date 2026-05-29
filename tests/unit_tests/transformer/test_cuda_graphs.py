@@ -1527,6 +1527,49 @@ class TestInlineCaptureManager:
         ), f"Expected 0 warmup steps (manager override), got {runner.num_warmup_steps}"
 
 
+class TestSkipFp8WeightUpdateTensor:
+    """Regression test for the TE 2.15 ``set_skip_fp8_weight_update_tensor`` removal."""
+
+    @staticmethod
+    def _read_skip_tensor():
+        from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+        getter = getattr(FP8GlobalStateManager, "get_skip_fp8_weight_update_tensor", None)
+        if getter is not None:
+            return getter()
+        return FP8GlobalStateManager.quantization_state.skip_fp8_weight_update_tensor
+
+    @staticmethod
+    def _reset_skip_tensor():
+        from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+        if "skip_fp8_weight_update_tensor" in vars(FP8GlobalStateManager):
+            FP8GlobalStateManager.skip_fp8_weight_update_tensor = None
+        qstate = getattr(FP8GlobalStateManager, "quantization_state", None)
+        if qstate is not None and hasattr(qstate, "skip_fp8_weight_update_tensor"):
+            qstate.skip_fp8_weight_update_tensor = None
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_sets_value_in_place(self):
+        """Helper writes the right value and reuses the same storage across calls."""
+        from megatron.core.transformer.cuda_graphs import _set_skip_fp8_weight_update_tensor
+
+        self._reset_skip_tensor()
+        try:
+            _set_skip_fp8_weight_update_tensor(True)
+            t = self._read_skip_tensor()
+            assert t.shape == (1,) and t.dtype == torch.float32 and t.is_cuda
+            assert t.item() == 1.0
+
+            # data_ptr must stay stable so captured cudagraphs read the same address.
+            ptr = t.data_ptr()
+            _set_skip_fp8_weight_update_tensor(False)
+            assert self._read_skip_tensor().data_ptr() == ptr
+            assert self._read_skip_tensor().item() == 0.0
+        finally:
+            self._reset_skip_tensor()
+
+
 if __name__ == "__main__":
 
     test = TestParallelTransformerBlockCudagraphs()
