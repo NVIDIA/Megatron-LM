@@ -423,7 +423,7 @@ class MimoModel(MegatronModule):
                     raise RuntimeError(
                         f"{encoder_name} inputs are missing, but matching special tokens exist"
                     )
-                output = self._empty_encoder_output(submodule, input_ids)
+                output = self._empty_encoder_output(encoder_name)
 
             if output is not None:
                 self._attach_modality_split_sizes(output, input_ids, encoder_name)
@@ -476,9 +476,7 @@ class MimoModel(MegatronModule):
             return False
         return bool((input_ids == self.special_token_ids[encoder_name]).any().item())
 
-    def _empty_encoder_output(
-        self, submodule: torch.nn.Module, input_ids: Optional[torch.Tensor]
-    ) -> torch.Tensor:
+    def _empty_encoder_output(self, encoder_name: str) -> torch.Tensor:
         """Return the bridge payload for text-only non-colocated batches."""
         language_config = self.mimo_config.language_model_spec.params['config']
         hidden_size = getattr(language_config, 'hidden_size', None)
@@ -487,20 +485,13 @@ class MimoModel(MegatronModule):
                 "Language model config must define hidden_size for empty modality output"
             )
 
-        ref_tensor = next(submodule.parameters(), None)
-        if ref_tensor is None:
-            ref_tensor = next(submodule.buffers(), None)
-        if ref_tensor is not None:
-            device = ref_tensor.device
-        elif input_ids is not None:
-            device = input_ids.device
-        else:
-            device = torch.device("cuda", torch.cuda.current_device())
-        dtype = ref_tensor.dtype if ref_tensor is not None else self.config.params_dtype
-        if dtype is None:
-            dtype = torch.float32
-
-        return torch.empty((0, hidden_size), device=device, dtype=dtype, requires_grad=True)
+        encoder_config = self.mimo_config.modality_submodules_spec[encoder_name].params['config']
+        return torch.empty(
+            (0, hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=encoder_config.params_dtype,
+            requires_grad=True,
+        )
 
     def _forward_language_module(
         self,
