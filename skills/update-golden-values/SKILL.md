@@ -1,6 +1,7 @@
 ---
 name: update-golden-values
 description: Refresh golden values from a GitHub Actions workflow run (failing-only or all jobs), score the change with average normalized relative differences, and produce a PR-ready summary. Use when the user asks to update goldens for a CI run, refresh golden values from a workflow ID, or generate a golden-value diff summary for a PR description.
+license: Apache-2.0
 when_to_use: User provides a GitHub Actions workflow run ID and asks to refresh golden values; user asks to update goldens for "failing tests only" or "all tests"; user asks for a per-metric relative-difference summary of the golden-value diff; user wants a PR description blurb after running download_golden_values.py.
 ---
 
@@ -51,6 +52,12 @@ Reuse `/tmp/gv_venv` if it already exists. The comparison script only depends on
 ### Step 2 — Reset prior edits (only if user re-runs)
 
 If the working tree already has prior golden-value modifications you want to discard before re-downloading:
+
+**Warning:** this step discards tracked edits under `tests/functional_tests/test_cases/`
+and permanently deletes untracked files in that tree. Before running it, inspect
+`git status --short tests/functional_tests/test_cases/` and confirm there is no
+work the user wants to keep. Prefer stashing or moving work aside when in doubt;
+untracked files removed by the `rm -f` loop cannot be recovered from git.
 
 ```bash
 git checkout -- tests/functional_tests/test_cases/
