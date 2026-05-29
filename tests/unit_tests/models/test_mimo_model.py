@@ -5,6 +5,7 @@ WORLD_SIZE=1 LOCAL_RANK=0 python -m pytest tests/unit_tests/models/test_mimo_mod
 '''
 
 import math
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -731,8 +732,6 @@ class TestMimoModelFanoutHelpers:
 
     @staticmethod
     def _stub_model(special_token_ids):
-        from types import SimpleNamespace
-
         model = MimoModel.__new__(MimoModel)
         model.special_token_ids = special_token_ids
         # COLOCATED skips the fan-out DP assertion path; this fixture targets
@@ -774,3 +773,68 @@ class TestMimoModelFanoutHelpers:
         assert model._has_encoder_tokens(torch.tensor([[1, 2]]), "images") is False
         assert model._has_encoder_tokens(None, "images") is False
         assert model._has_encoder_tokens(torch.tensor([[1]]), "unknown") is False
+
+    @staticmethod
+    def _stub_language_config(hidden_size=8):
+        return SimpleNamespace(
+            language_model_spec=SimpleNamespace(
+                params={'config': SimpleNamespace(hidden_size=hidden_size)}
+            )
+        )
+
+    def test_set_input_tensor_unwraps_outer_list_and_forwards_to_language_model(self):
+        lm = MagicMock()
+        model = MimoModel.__new__(MimoModel)
+        model.language_model = lm
+        tensor = torch.zeros(2, 4)
+
+        model.set_input_tensor([tensor])
+
+        assert torch.equal(model.input_tensors, tensor)
+        lm.set_input_tensor.assert_called_once_with(tensor)
+
+    def test_set_input_tensor_dict_unwraps_single_element_value_lists(self):
+        model = MimoModel.__new__(MimoModel)
+        model.language_model = None
+        t_lang = torch.zeros(2, 4)
+        t_vision = torch.zeros(3, 4)
+
+        model.set_input_tensor({"language": [t_lang], "vision": t_vision})
+
+        assert torch.equal(model.input_tensors["language"], t_lang)
+        assert torch.equal(model.input_tensors["vision"], t_vision)
+
+    def test_empty_encoder_output_uses_submodule_param_dtype_and_device(self):
+        submodule = torch.nn.Linear(4, 8).to(torch.float16)
+        model = MimoModel.__new__(MimoModel)
+        model.mimo_config = self._stub_language_config(hidden_size=8)
+
+        output = model._empty_encoder_output(submodule, input_ids=None)
+
+        assert output.shape == (0, 8)
+        assert output.dtype is torch.float16
+        assert output.device == next(submodule.parameters()).device
+        assert output.requires_grad
+
+    def test_empty_encoder_output_falls_back_to_buffer_when_no_params(self):
+        class BufferOnly(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.register_buffer("scale", torch.zeros(1, dtype=torch.bfloat16))
+
+        model = MimoModel.__new__(MimoModel)
+        model.mimo_config = self._stub_language_config(hidden_size=4)
+
+        output = model._empty_encoder_output(BufferOnly(), input_ids=torch.zeros(1, 2))
+
+        assert output.shape == (0, 4)
+        assert output.dtype is torch.bfloat16
+
+    def test_empty_encoder_output_raises_when_hidden_size_missing(self):
+        model = MimoModel.__new__(MimoModel)
+        model.mimo_config = SimpleNamespace(
+            language_model_spec=SimpleNamespace(params={'config': SimpleNamespace()})
+        )
+
+        with pytest.raises(ValueError, match="hidden_size"):
+            model._empty_encoder_output(torch.nn.Linear(4, 4), input_ids=None)
