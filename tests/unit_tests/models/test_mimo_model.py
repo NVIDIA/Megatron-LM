@@ -724,3 +724,48 @@ class TestMimoModelNonColocated:
         assert captured['input_ids'] is None
         assert captured['decoder_input'] is None
         torch.testing.assert_close(captured['position_ids'], position_ids)
+
+
+class TestMimoModelFanoutHelpers:
+    """CPU-only coverage for bridge-fanout helper methods on ``MimoModel``."""
+
+    @staticmethod
+    def _stub_model(special_token_ids):
+        model = MimoModel.__new__(MimoModel)
+        model.special_token_ids = special_token_ids
+        return model
+
+    def test_attach_modality_split_sizes_tags_output_with_per_sample_counts(self):
+        model = self._stub_model({"images": 50257})
+        input_ids = torch.tensor([[50257, 50257, 1, 2], [50257, 1, 2, 3]])
+        output = torch.zeros(3, 8)
+
+        model._attach_modality_split_sizes(output, input_ids, "images")
+
+        assert output._mimo_bridge_split_sizes == [2, 1]
+
+    def test_attach_modality_split_sizes_skips_when_total_mismatches(self):
+        model = self._stub_model({"images": 50257})
+        input_ids = torch.tensor([[50257, 1], [1, 1]])
+        output = torch.zeros(5, 8)
+
+        model._attach_modality_split_sizes(output, input_ids, "images")
+
+        assert not hasattr(output, "_mimo_bridge_split_sizes")
+
+    def test_attach_modality_split_sizes_skips_for_single_sample_batch(self):
+        model = self._stub_model({"images": 50257})
+        input_ids = torch.tensor([[50257, 50257, 1]])
+        output = torch.zeros(2, 8)
+
+        model._attach_modality_split_sizes(output, input_ids, "images")
+
+        assert not hasattr(output, "_mimo_bridge_split_sizes")
+
+    def test_has_encoder_tokens_detects_presence_and_absence(self):
+        model = self._stub_model({"images": 50257, "audio": 50258})
+
+        assert model._has_encoder_tokens(torch.tensor([[50257, 1]]), "images") is True
+        assert model._has_encoder_tokens(torch.tensor([[1, 2]]), "images") is False
+        assert model._has_encoder_tokens(None, "images") is False
+        assert model._has_encoder_tokens(torch.tensor([[1]]), "unknown") is False
