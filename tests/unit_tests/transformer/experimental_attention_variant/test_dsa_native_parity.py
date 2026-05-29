@@ -410,6 +410,9 @@ def _assert_similarity(
 def test_absorbed_mla_dsa(
     seqlen: int, attention_backend, calculate_per_token_loss: bool, use_sparse_loss: bool
 ):
+    if attention_backend != AttnBackend.unfused and torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("DSA fused indexer path requires SM100+")
+
     Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
     try:
         model_parallel_cuda_manual_seed(1234)
