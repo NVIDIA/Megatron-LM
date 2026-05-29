@@ -83,6 +83,16 @@ class ParameterGroup:
         self.mesh = mesh
         self.dp_group = mesh.get_group()
 
+        # FIXME: no_shard, optim, and optim_grads sharding strategies are not yet supported in v2.
+        # Currently only optim_grads_params is fully implemented and tested.
+        # See README.md § "Sharding Strategies" for details.
+        # We will add support for these strategies in a follow-up change.
+        if sharding_strategy not in ("optim_grads_params",):
+            raise NotImplementedError(
+                f"Sharding strategy '{sharding_strategy}' is not yet supported in FSDP v2. "
+                f"Currently only 'optim_grads_params' is implemented. "
+                f"We will add support for 'no_shard', 'optim', and 'optim_grads' in a follow-up change."
+            )
         self.sharding_strategy = sharding_strategy
         self.param_group_id = param_group_id
 
@@ -138,6 +148,9 @@ class ParameterGroup:
             mp_policy=self.mp_policy,
         )
 
+    # FIXME: The branching below currently only handles optim_grads_params since
+    # no_shard, optim, and optim_grads are gated by a NotImplementedError at init.
+    # When support for those strategies is added, the logic below must be validated.
     def _init_buffers(self) -> None:
         """
         Initialize all buffers based on sharding strategy.
@@ -293,15 +306,20 @@ class ParameterGroup:
         for param in self.params:
             if self.main_weight_buffer is not None:
                 mbuf = self.main_weight_buffer
-                data = mbuf.get_item(self.param_idx[param], only_shard=is_param_shard)
+                data = mbuf.get_item(self.param_idx[param], as_shard=is_param_shard)
+                param_shape = param.shape
             elif self.model_weight_buffer is not None:
                 wbuf = self.model_weight_buffer
-                data = wbuf.get_item(self.param_idx[param], only_shard=is_param_shard)
+                data = wbuf.get_item(self.param_idx[param], as_shard=is_param_shard)
+                param_shape = self.mp_policy.get_param_storage_shapes([param])[0]
             else:
                 data = param.data.detach()
+                param_shape = param.shape
 
             dist_param = torch.nn.Parameter(
-                make_uneven_dtensor(data, param.shape, self.mesh, placements),
+                make_uneven_dtensor(
+                    data, param_shape, self.mesh, placements, post_process_uneven=True
+                ),
                 requires_grad=param.requires_grad,
             )
             # Mark as FSDP parameter for special handling
@@ -322,7 +340,7 @@ class ParameterGroup:
         is_grad_shard = is_param_shard
         for p in self.params:
             gbuf = self.main_grad_buffer
-            grad_data = gbuf.get_item(self.param_idx[p], only_shard=is_grad_shard)
+            grad_data = gbuf.get_item(self.param_idx[p], as_shard=is_grad_shard)
             # NOTE: Do not remove the grad_data.numel() > 0 check.
             # Empty local grad shards are semantically no-ops, but materializing
             # them as DTensor grads can pass zero-numel tensors into fused

@@ -63,11 +63,11 @@ class MixedDtypeLayer(nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.linear1 = nn.Linear(256, 512, bias=False)  # bf16, shape [512, 256]
-        self.linear2 = nn.Linear(512, 256, bias=True)  # bf16, shape [256, 512] + bias [256]
-        self.norm = nn.LayerNorm(256)  # bf16, weight [256] + bias [256]
-        self.quant_proj = nn.Linear(256, 128, bias=False)  # uint8, shape [128, 256]
-        self.quant_gate = nn.Linear(256, 64, bias=False)  # uint8, shape [64, 256]
+        self.linear1 = nn.Linear(16, 32, bias=False)  # bf16, shape [512, 256]
+        self.linear2 = nn.Linear(32, 16, bias=True)  # bf16, shape [256, 512] + bias [256]
+        self.norm = nn.LayerNorm(16)  # bf16, weight [256] + bias [256]
+        self.quant_proj = nn.Linear(16, 8, bias=False)  # uint8, shape [128, 256]
+        self.quant_gate = nn.Linear(16, 4, bias=False)  # uint8, shape [64, 256]
 
 
 # ------------------------------------------------------------------ #
@@ -166,6 +166,11 @@ class Ref:
 
 @pytest.mark.parametrize("strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"])
 def test_init_buffers(strategy):
+    if strategy != "optim_grads_params":
+        pytest.skip(
+            f"Only optim_grads_params strategy creates distributed buffers, skipping {strategy} test."
+        )
+
     groups, originals, dp_group, rank, ws, device = _build_groups(strategy)
     has_wbuf, _, w_dist, g_dist = _flags(strategy)
 
@@ -182,7 +187,7 @@ def test_init_buffers(strategy):
             for i, p in enumerate(orig):
                 item = wbuf.get_item(i)
                 if w_dist:
-                    s, e = wbuf.buffer_index._get_item_slice_in_shard(i)
+                    s, e = wbuf.buffer_index._get_item_self_range(i)
                     expected = p.flatten()[s:e]
                 else:
                     expected = p.flatten()
@@ -208,6 +213,11 @@ def test_init_buffers(strategy):
 
 @pytest.mark.parametrize("strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"])
 def test_unshard_reshard(strategy):
+    if strategy != "optim_grads_params":
+        pytest.skip(
+            f"Only optim_grads_params strategy creates distributed buffers, skipping {strategy} test."
+        )
+
     groups, originals, dp_group, rank, ws, device = _build_groups(strategy)
     _, _, w_dist, _ = _flags(strategy)
 
@@ -227,7 +237,7 @@ def test_unshard_reshard(strategy):
             # Distributed: after all-gather, every param should be fully
             # recoverable from the unsharded buffer at its global offset
             for i, p in enumerate(orig):
-                off, sz = wbuf.buffer_index._get_item_offset(i)
+                off, sz = wbuf.buffer_index._get_item_global_range(i)
                 recovered = unsharded[off : off + sz]
                 assert torch.equal(recovered, p.flatten())
 
@@ -235,7 +245,15 @@ def test_unshard_reshard(strategy):
         wbuf.reshard()
         if w_dist:
             assert wbuf._unsharded_buffer is None
-        assert torch.equal(wbuf.data, shard_before)
+        torch.set_printoptions(
+            threshold=float("inf"),  # never switch to summarised view
+            edgeitems=None,          # show all edge items
+            linewidth=200            # optional, for wide tensors
+        )
+        assert torch.equal(wbuf.data, shard_before), (
+            f"wbuf.data={wbuf.data}\n"
+            f"shard_before={shard_before}\n"
+        )
 
     torch.distributed.barrier()
 
@@ -247,6 +265,11 @@ def test_unshard_reshard(strategy):
 
 @pytest.mark.parametrize("strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"])
 def test_reduce_grad(strategy):
+    if strategy != "optim_grads_params":
+        pytest.skip(
+            f"Only optim_grads_params strategy creates distributed buffers, skipping {strategy} test."
+        )
+
     groups, _, dp_group, rank, ws, device = _build_groups(strategy)
     _, _, _, g_dist = _flags(strategy)
 

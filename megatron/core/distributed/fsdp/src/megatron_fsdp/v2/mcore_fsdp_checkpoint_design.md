@@ -56,7 +56,7 @@ format for both paths. It uses DCP directly, storing each parameter as a `DTenso
 | `fsdp_dtensor_checkpoint.py` | `megatron/core/transformer/` | SWiGLU split, GDN split, expert key remapping, FP8 cleanup |
 | `distrib_optimizer.py` | `megatron/core/optimizer/` | `state_dict()`, `load_state_dict()`, `sharded_state_dict()`, `sharded_param_state_fsdp_dtensor()` |
 | `checkpointing.py` | `megatron/training/` | High-level save/load orchestration, `_build_megatron_fsdp_v2_state_dict`, `preprocess_fsdp_dtensor_state_dict()` |
-| `checkpoint.py` | `megatron/core/distributed/fsdp/` | `MegatronFSDPStateful`, `_apply_mcore_postprocess`, `_split_fused_params_v2` (SwiGLU+GDN), `_build_dtensor_optim_sd`, `_preprocess_and_verify_v2_state_dict`, `_build_torch_dist_to_v2_map`, `_load_expert_params_from_torch_dist`, `load_torch_dist_into_fsdp_v2` |
+| `checkpoint.py` | `megatron/core/distributed/fsdp/` | `MegatronFSDPStateful`, `_apply_mcore_postprocess`, `_split_fused_params_v2` (SwiGLU+GDN), `_build_dtensor_optim_sd`, `_preprocess_and_verify_v2_state_dict`, `_build_torch_dist_to_v2_map`, `load_torch_dist_into_fsdp_v2` |
 | `mcore_fsdp_adapter.py` | `megatron/core/distributed/fsdp/` | Routes to v1 `MegatronFSDP` or Megatron FSDP v2 `fully_shard` |
 
 ### 3.1.1 `checkpoint.py` Functions (Megatron FSDP v2)
@@ -84,7 +84,7 @@ format for both paths. It uses DCP directly, storing each parameter as a `DTenso
 | `_model_has_module_prefix(model)` | Detect whether model's ``named_parameters()`` keys already carry ``module.`` prefix. |
 | `normalize_torch_dist_key(key)` | Normalize a torch_dist checkpoint key to v2 canonical form. Maps ``transformer_layer`` → ``mtp_model_layer``. |
 | `reverse_normalize_torch_dist_key(key)` | Reverse the v2 canonical key back to torch_dist naming (``mtp_model_layer`` → ``transformer_layer``). Used when constructing DCP load paths that must match torch_dist storage paths. |
-| `_load_expert_params_from_torch_dist(checkpoint_name, v2_state_dict, v2_optim_state, mapped_sd, metadata, optim_matched)` | Load MoE expert params from torch_dist flattened format (``experts.experts.linear_fc1.weight``, shape ``(N, H, W)``) into individual v2 DTensors (``local_experts.0.linear_fc1.weight``, shape ``(H, W)``). DCP loads the full flattened tensor; ``__create_chunk_list__`` metadata is used to copy each rank's DP-shard chunk with correct local offsets. Returns loaded model keys via ``mapped_sd`` and matched optimizer param names via ``optim_matched`` set. |
+
 
 ### 3.2 Current Save Flow
 
@@ -666,24 +666,43 @@ hi-precision parameter copies) under ``optimizer.state.*``.
 After loading, hi-precision model copies are merged back into the `model` subtree
 so the model state dict is complete.
 
-#### Phase 4 — Expert Parameter Split
+#### Phase 4 — Load Fused Layer / Expert Params by Slicing
 
-Torch_dist stores MoE expert weights as a single flattened tensor per fc_type
-(e.g., ``experts.experts.linear_fc1.weight``, shape ``(num_global_experts, H, W)``,
-EP-sharded).  FSDP v2 stores each local expert as an individual DTensor
-(``local_experts.0.linear_fc1.weight``, shape ``(H, W)``).  DCP cannot split one
-tensor into many, so ``_load_expert_params_from_torch_dist`` in `checkpoint.py`
-handles this:
+Torch_dist stores multi-layer and multi-expert tensors as a single fused tensor (e.g.,
+``decoder.layers.self_attention.linear_qkv.weight`` of shape ``(num_layers, H, 3*W)``).
+FSDP v2 stores each layer as an individual DTensor
+(``decoder.layers.0.self_attention.linear_qkv.weight`` of shape ``(H, 3*W)``).
+DCP cannot split one tensor into many, so Phase 4 handles this in `load_torch_dist_into_fsdp_v2`.
 
-1. Groups unmatched v2 expert DTensors by (base layer, fc_type).
-2. Constructs the torch_dist key using `reverse_normalize_torch_dist_key` to
-   convert v2 naming (``mtp_model_layer``) back to torch_dist naming
-   (``transformer_layer``).
-3. Creates a temporary buffer with shape ``(num_total_experts, H, W)`` — matching
-   the global shape from torch_dist metadata — and loads it via `dcp.load`.
-4. For each local expert, maps the local index to a global row
-   (``ep_rank * num_local + local_idx``) and uses ``__create_chunk_list__``
-   metadata to extract the DP-shard slice.
+Three tensor formats are supported:
+
+1. **Regular fused** — shape ``(num_layers, ...)`` → sliced per layer index.
+2. **GroupedMLP experts** — shape ``(num_layers, num_experts, ...)`` → sliced per
+   ``(layer_idx, expert_idx)``.
+3. **SequentialMLP experts** — shape ``(num_global_experts, ...)`` → sliced per global
+   expert index (EP-aware, mapped to local expert via
+   ``ep_rank * num_local + local_expert_idx``).
+
+To avoid OOM when loading a large fused tensor (e.g., GroupedMLP with many layers and
+experts), the fused buffer is created as a **Shard(0) DTensor** across the DP device
+mesh:
+
+```python
+device_mesh = example_val.device_mesh
+flat = torch.distributed.tensor.empty(
+    fused_shape, dtype=example_val.dtype,
+    device_mesh=device_mesh, placements=[Shard(0)],
+)
+dcp.load(state_dict={td_key: flat}, ...)
+flat = redistribute_uneven_dtensor_to_replicated(flat).to_local()
+```
+
+- ``torch.distributed.tensor.empty(..., placements=[Shard(0)])`` distributes memory
+  across DP ranks so no single rank allocates the full fused tensor.
+- ``redistribute_uneven_dtensor_to_replicated`` gathers shards into a full local
+  tensor for per-layer/per-expert slicing.
+- After slicing, ``__create_chunk_list__`` metadata is used to copy each rank's
+  DP-shard chunk with correct local offsets into the destination v2 DTensor.
 
 #### Phase 5 — Strictness Verification
 
@@ -703,7 +722,7 @@ Located in `megatron/core/distributed/fsdp/checkpoint.py`:
 | `reverse_normalize_torch_dist_key` | v2 → torch_dist | ``mtp_model_layer`` → ``transformer_layer`` |
 
 These are used both in `_load_torch_dist_into_megatron_fsdp_v2` (for matching DCP
-keys) and in `_load_expert_params_from_torch_dist` (for constructing storage paths
+keys) and in Phase 4 of `load_torch_dist_into_fsdp_v2` (for constructing storage paths
 that match the torch_dist checkpoint).
 
 ### 7.4 Strictness Checks

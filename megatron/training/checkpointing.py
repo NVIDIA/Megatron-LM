@@ -989,11 +989,10 @@ def maybe_save_dataloader_state(train_iterator, iteration, dataloader_save_path)
 def _is_megatron_fsdp_v2(model):
     """Check if model uses Megatron FSDP v2 (use_megatron_fsdp_v2 flag)."""
     from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import FSDPModule
-    m = model[0] if isinstance(model, (list, tuple)) else model
-    if isinstance(m, FSDPModule):
-        return True
-    if hasattr(m, 'module') and isinstance(m.module, FSDPModule):
-        return True
+    first_model = model[0] if isinstance(model, (list, tuple)) else model
+    for m in first_model.modules():
+        if isinstance(m, FSDPModule):
+            return True
 
     return False
 
@@ -1033,6 +1032,9 @@ def generate_state_dict(
             )
         else:   # torch, torch_dcp, fsdp_dtensor
             model_sd = model[i].state_dict_for_save_checkpoint()
+            if args.use_megatron_fsdp_v2 and args.ckpt_format == "fsdp_dtensor":
+                from megatron.core.distributed.fsdp.checkpoint import _propagate_chunk_metadata_to_state_dict
+                _propagate_chunk_metadata_to_state_dict(model[i], model_sd)
 
         state_dict[key] = model_sd
 
@@ -1768,6 +1770,16 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                     raise RuntimeError(f"{mismatch_msg}: not supported for DistributedOptimizer with sharding type"
                                        f" {sharded_sd_metadata['distrib_optim_sharding_type']}."
                                        f" Please use `--ckpt-fully-parallel-save` flag during checkpoint saving.")
+
+                if (
+                    args.use_megatron_fsdp_v2
+                    and sharded_sd_metadata['distrib_optim_sharding_type'] == 'dp_reshardable'
+                ):
+                    raise RuntimeError(
+                        "Megatron FSDP v2 does not support checkpoint conversion from "
+                        "distrib_optim_sharding_type=dp_reshardable. "
+                        "Please re-save the checkpoint with --dist-ckpt-optim-fully-reshardable."
+                    )
 
                 # Check if fully parallel load is compatible with sharding type
                 if args.ckpt_fully_parallel_load and sharded_sd_metadata['distrib_optim_sharding_type'] == 'dp_zero_gather_scatter':

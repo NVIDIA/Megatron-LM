@@ -242,13 +242,14 @@ class FSDPModule(nn.Module):
             gbuf = p._gbuf
             item_id = p._item_id
 
-            gbuf_data = gbuf.fetch_unsharded_buffer()
+            gbuf_data = gbuf.fetch_buffer()
             assert gbuf_data is not None
             assert gbuf_data.numel() > 0
 
             # Get offset and size from buffer index
-            offset, size = gbuf.buffer_index._get_item_offset(item_id)
-            grad_data = gbuf_data[offset : offset + size].view(p.shape)
+            offset, size = gbuf.buffer_index._get_item_global_range(item_id)
+            param_shape = gbuf.buffer_index.item_index_map[item_id].shape
+            grad_data = gbuf_data[offset : offset + size].view(param_shape)
 
             return grad_data
 
@@ -316,7 +317,10 @@ class FSDPModule(nn.Module):
         (mid-forward or mid-backward) will corrupt their state.  The safety
         check below enforces that constraint.
         """
-        forward_order = [child for child in self.modules() if isinstance(child, FSDPModule)]
+        named_forward_modules = [
+            (name, child) for name, child in self.named_modules() if isinstance(child, FSDPModule)
+        ]
+        forward_order = [child for name, child in named_forward_modules]
 
         # Safety check: no child FSDPModule must be in an active state.
         # - unshard_done_events[id(child)] non-None → unsharded, not yet resharded
@@ -362,14 +366,18 @@ class FSDPModule(nn.Module):
         setattr(self, "_fsdp_state", _FSDPState())
         setattr(self, "_fsdp_root_context", root_context)
 
-        for module in forward_order:
+        module_idx = 0
+        for name, module in named_forward_modules:
             for param_group in module._fsdp_param_groups:
                 param_group.set_allocator(root_context.bucket_allocator)
 
-        for child in self.modules():
-            if child is not self and isinstance(child, FSDPModule):
-                child._fsdp_state._is_root = False
-                setattr(child, "_fsdp_root_context", root_context)
+            if module is not self:
+                module._fsdp_state._is_root = False
+                setattr(module, "_fsdp_root_context", root_context)
+
+            setattr(module, "_fsdp_module_idx", module_idx)
+            setattr(module, "_fsdp_module_name", name)
+            module_idx += 1
 
     def unshard(self, async_op: bool = False, bwd_pass: bool = False):
         """
@@ -627,7 +635,7 @@ class FSDPModule(nn.Module):
 
     def _copy_main_weights_to_model_weights(self):
         """Copy main weight buffer to model weight buffer."""
-        for _, child in self.named_modules():
+        for child in self.modules():
             if not isinstance(child, FSDPModule):
                 continue
             for param_group in child._fsdp_param_groups:
@@ -723,7 +731,8 @@ class FSDPModule(nn.Module):
             if not isinstance(child, FSDPModule):
                 continue
             for param_names, param_group in child._named_param_groups:
-                numel = sum(param.numel() for param in param_group.params)
+                param_shapes = [p.shape for p in param_group.params]
+                numel = sum(s.numel() for s in param_shapes)
                 total_model_elems += numel
                 dp_size = torch.distributed.get_world_size(param_group.dp_group)
 
@@ -758,7 +767,9 @@ class FSDPModule(nn.Module):
                     f"comm={_mb(group_comm)} pad={_mb(group_pad)} "
                     f"{' '.join(buffer_entries)}"
                 )
-                for param_name, param in zip(param_names, param_group.params):
+                for param_name, param, param_shape in zip(
+                    param_names, param_group.params, param_shapes
+                ):
                     dist_idx = param_group.param_idx.get(param)
                     offset_info = ""
                     if param_group.model_weight_buffer is not None and dist_idx is not None:
@@ -769,7 +780,7 @@ class FSDPModule(nn.Module):
                         )
                         if item_index is not None:
                             offset_info = f" @{item_index.global_data_index:,}+{item_index.size:,}"
-                    lines.append(f"    {param_name:50s} {str(tuple(param.shape)):24s}{offset_info}")
+                    lines.append(f"    {param_name:50s} {str(tuple(param_shape)):24s}{offset_info}")
                 group_idx += 1
 
         lines.append(
@@ -798,7 +809,7 @@ class FSDPModule(nn.Module):
                 for param_group in child._fsdp_param_groups:
                     for param in param_group.params:
                         wbuf = param_group.model_weight_buffer
-                        param_data = wbuf.get_item(param_group.param_idx[param], only_shard=False)
+                        param_data = wbuf.get_item(param_group.param_idx[param], as_shard=False)
                         assert not torch.isnan(
                             param_data
                         ).any(), "NaN detected in model weight buffer"

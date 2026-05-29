@@ -72,12 +72,16 @@ See the parent directory `..` for `uneven_dtensor.py` which provides:
 
 ## Sharding Strategies
 
-| Strategy | Shard Weights | Shard Gradients | Notes |
-|----------|---------------|-----------------|-------|
-| `no_shard` | No | No | Like DDP: no sharding |
-| `optim` | No | No | Like ZeRO-1: shard optimizer states only |
-| `optim_grads` | No | Yes | Like ZeRO-2: shard optimizer states + gradients |
-| `optim_grads_params` | Yes | Yes | Like ZeRO-3: full parameter/gradient/optimizer sharding |
+| Strategy | Shard Weights | Shard Gradients | Status | Notes |
+|----------|---------------|-----------------|--------|-------|
+| `optim_grads_params` | Yes | Yes | **Supported** | Like ZeRO-3: full parameter/gradient/optimizer sharding |
+| `no_shard` | No | No | **Not yet supported** | Like DDP: no sharding |
+| `optim` | No | No | **Not yet supported** | Like ZeRO-1: shard optimizer states only |
+| `optim_grads` | No | Yes | **Not yet supported** | Like ZeRO-2: shard optimizer states + gradients |
+
+> **FIXME:** `no_shard`, `optim`, and `optim_grads` sharding strategies are not yet supported in v2.
+> Currently only `optim_grads_params` is fully implemented and tested.
+> These strategies will be added in a follow-up change.
 
 ## Integration with Megatron
 
