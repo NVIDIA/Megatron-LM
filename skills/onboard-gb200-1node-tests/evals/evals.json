@@ -1,16 +1,16 @@
 [
   {
-    "id": "onboard-gb200-skill-specific-001",
-    "question": "Do not modify files or run commands. From the onboard-gb200-1node-tests skill, answer in at most 8 bullets: what exact recipe files and test-case paths are involved, how do I find eligible 2-node tests, what filters exclude tests, what are the GB200 one-node GPU constraints, and how should TP/PP/EP be adapted?",
+    "id": "onboard-gb200-pp-etp-adaptation-001",
+    "question": "I am creating a one-node GB200 MR variant of an existing two-node Megatron-LM test whose config uses `--tensor-model-parallel-size 4`, `--pipeline-model-parallel-size 2`, `--expert-model-parallel-size 2`, and `--expert-tensor-parallel-size 2`. What exact parallelism changes, recipe shape, and path naming should I use? Do not modify files or run commands.",
     "expected_skill": "onboard-gb200-1node-tests",
     "expected_script": null,
-    "ground_truth": "The response should use the onboard-gb200-1node-tests skill and state that GB200 functional recipes live under tests/test_utils/recipes/gb200/ with gpt.yaml and moe.yaml for 2-node nodes:2,gpus:4 tests, moe-1node.yaml as existing one-node MoE, and gpt-1node.yaml as the GPT one-node file to create if absent. Test configs live at tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml and one-node variants use tests/functional_tests/test_cases/{model}/{test_case}_1node/model_config.yaml. Eligible candidates are products entries in gpt.yaml/moe.yaml with scope mr or mr-slim, excluding tests already covered in *-1node.yaml and excluding nightly, weekly, and mr-broken scopes. A GB200 node has four GPUs, so one-node variants are nodes:1,gpus:4, and the world size rule is TP x PP x DP with DP >= EP. Adaptation rules: TP x PP <= 4 is a trivial copy; TP x PP = 8 reduces PP by half; EP > 4 reduces EP to 4; if both EP > 4 and TP x PP > 4 reduce both; ETP cases must satisfy EP x ETP <= TP x DP_new. Recipe entries use mr-github, and only one or two representative tests per recipe should also get mr-github-slim.",
+    "ground_truth": "The response should use the onboard-gb200-1node-tests skill. It should compute that the original two-node GB200 test has 8 GPUs total and `TP x PP = 4 x 2 = 8`, so the one-node four-GPU variant must reduce PP by half: `--pipeline-model-parallel-size 2` becomes `--pipeline-model-parallel-size 1`. TP remains 4, EP remains 2 because EP is not greater than 4, and ETP remains 2 because after the PP reduction `DP_new = 4 / (TP x PP_new) = 4 / (4 x 1) = 1`, so `EP x ETP = 2 x 2 = 4 <= TP x DP_new = 4`. It should say not to change global batch size; let gradient accumulation absorb the reduced DP. It should name the one-node config path `tests/functional_tests/test_cases/{model}/{test_case}_1node/model_config.yaml`. It should say the recipe entry belongs in `tests/test_utils/recipes/gb200/gpt-1node.yaml` for GPT or `moe-1node.yaml` for MoE, with `nodes: 1`, `gpus: 4`, `platforms: dgx_gb200`, and `scope: [mr-github]` unless this is one of the one or two representative slim tests that also get `mr-github-slim`.",
     "expected_behavior": [
       "Uses the onboard-gb200-1node-tests skill guidance before answering.",
-      "Names the gb200 recipe files and _1node model_config.yaml path convention.",
-      "Filters eligible candidates by mr/mr-slim scope and excludes nightly, weekly, mr-broken, and already-covered tests.",
+      "Reduces pipeline parallelism from 2 to 1 because TP x PP is 8 on the original two-node case.",
+      "Keeps TP, EP, and ETP unchanged and verifies EP x ETP <= TP x DP_new.",
       "States nodes:1 and gpus:4 for GB200 one-node variants.",
-      "Explains the TP/PP/EP/ETP adaptation rules from the skill."
+      "Names the `_1node/model_config.yaml` path convention and the gpt-1node.yaml or moe-1node.yaml recipe destination."
     ]
   }
 ]

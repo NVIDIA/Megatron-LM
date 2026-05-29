@@ -1,15 +1,15 @@
 [
   {
-    "id": "split-pr-skill-specific-001",
-    "question": "Do not run commands or create branches. From the Megatron-LM split-pr skill, answer in at most 8 bullets: what exact analysis commands and CODEOWNERS steps happen first, what optimization goal drives the split, how are dependencies and tests handled, and what constraints apply when executing the split after approval?",
+    "id": "split-pr-tests-and-dependencies-001",
+    "question": "I am splitting a Megatron-LM PR to reduce CODEOWNERS reviewers. One proposed split puts implementation files in one PR and their tests in a separate PR, and another later PR depends on symbols renamed by the first. What should I do with the tests and dependency, and what constraints apply before and during execution? Do not run commands or create branches.",
     "expected_skill": "split-pr",
     "expected_script": null,
-    "ground_truth": "The response should use the split-pr skill and include: fetch PR details with gh pr view <number> --repo NVIDIA/Megatron-LM --json title,body,headRefName,author and gh pr diff <number> --repo NVIDIA/Megatron-LM --stat, and determine the current GitHub user with gh api user --jq .login. Parse .github/CODEOWNERS, map changed files to owner groups, build a table by CODEOWNERS group, and count distinct reviewer groups. The optimization goal is minimizing CODEOWNERS reviewer groups per resulting PR. Cluster files by identical owner groups; the largest cluster becomes the first PR; dependencies such as symbols renamed in PR A used by PR B must be noted; each PR must be independently mergeable, using backward-compatible aliases/re-exports if needed. Tests should stay with the production code they test. It must wait for user approval before execution. After approval, create draft PRs from appropriate bases, extract changes with git diff upstream/main..<source-branch> -- <file paths> | git apply, stage/commit/push to the user's fork, and create draft PRs. Never push directly upstream; if the original PR must be narrowed, confirm before force-pushing; credit the original author if the current GitHub user is not the author.",
+    "ground_truth": "The response should use the split-pr skill and reject splitting tests away from the implementation they validate. Tests should travel with the production code they test, even if that means the PR keeps the relevant CODEOWNERS group. The optimization goal remains minimizing CODEOWNERS reviewer groups per resulting PR, but not at the cost of broken or unreviewable PRs. Dependencies must be called out explicitly: if PR B uses symbols renamed in PR A, PR B depends on PR A, and each PR still needs to be independently mergeable to main. Use backward-compatible aliases, re-exports, or deprecation shims in the first PR when needed so later PRs do not break imports. It must wait for user approval before execution. During execution, create draft PRs from the appropriate base branches, extract file-scoped changes with `git diff upstream/main..<source-branch> -- <file paths> | git apply`, stage and commit cleanly, push to the user's fork only, never directly upstream, and create draft PRs. If the original PR must be narrowed, confirm before force-pushing, and credit the original author if the current GitHub user is not the author.",
     "expected_behavior": [
       "Uses the split-pr skill guidance before answering.",
-      "Names the gh pr view, gh pr diff --stat, and gh api user commands.",
-      "Explains CODEOWNERS mapping and the reviewer-group minimization objective.",
-      "States tests travel with production code and dependent PRs must remain independently mergeable.",
+      "Rejects putting tests in a separate PR from the production code they validate.",
+      "States the reviewer-group minimization objective without sacrificing independently mergeable PRs.",
+      "Explains dependency handling with explicit PR ordering and backward-compatible aliases or re-exports.",
       "States execution waits for user approval and creates draft PRs on the user's fork, not upstream."
     ]
   }

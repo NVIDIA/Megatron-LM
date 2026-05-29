@@ -1,16 +1,16 @@
 [
   {
-    "id": "testing-skill-specific-001",
-    "question": "Do not run commands. From the Megatron-LM testing skill, answer in at most 8 bullets: describe the exact functional test directory layout, recipe YAML structure and placeholders, how to disable a test without deleting it, how unit tests are launched locally, and what CI/golden workflow is required for a new functional test.",
+    "id": "testing-disable-without-deleting-001",
+    "question": "A Megatron-LM functional recipe entry is flaky in the standard dev CI path, but I want to keep it discoverable and easy to re-enable. The entry currently has `scope: [mr-github]`. What exact YAML change should I make, and how is this different from marking a unit test flaky in dev or LTS? Do not run commands.",
     "expected_skill": "testing",
     "expected_script": null,
-    "ground_truth": "The response should use the testing skill and state that functional test cases live under tests/functional_tests/test_cases/<model>/<test_name>/ with model_config.yaml and golden_values_{env}_{platform}.json. Recipes live in tests/test_utils/recipes/h100/ and gb200/ and are parsed by tests/test_utils/python_scripts/recipe_parser.py; product blocks expand into workload specs with fields such as scope, environment, platform, n_repeat, time_limit, and script, with placeholders {assets_dir}, {artifacts_dir}, {test_case}, {environment}, {platforms}, and {n_repeat}. To disable a test without deleting it, suffix the recipe scope with -broken, such as mr-broken. Unit tests launch through uv run python -m torch.distributed.run --nproc-per-node 8 -m pytest -q, and CI parity uses tests/unit_tests/run_ci_test.sh. For a new functional test, add tests/functional_tests/test_cases/<model>/<test_name>/model_config.yaml with MODEL_ARGS, ENV_VARS, and TEST_TYPE, add a recipe under h100/ or gb200/, push the PR, add the Run functional tests label, download golden values after a successful run using tests/test_utils/python_scripts/download_golden_values.py, and commit the generated goldens.",
+    "ground_truth": "The response should use the testing skill and say not to delete the recipe entry. For a functional recipe entry, disable it by suffixing the scope with -broken, so `scope: [mr-github]` becomes `scope: [mr-github-broken]`. It should explain that this preserves the entry for later re-enable and keeps the test discoverable. It should distinguish this recipe-scope mechanism from unit-test markers: use `@pytest.mark.flaky_in_dev` to skip a unit test in the dev environment and `@pytest.mark.flaky` to skip a unit test in the LTS environment. It should avoid suggesting unrelated workflow changes, deleting test cases, or editing golden values.",
     "expected_behavior": [
       "Uses the testing skill guidance before answering.",
-      "Names test_cases/<model>/<test_name>/model_config.yaml and golden_values_{env}_{platform}.json.",
-      "Names recipe_parser.py, recipe locations, required recipe fields, and placeholders.",
-      "Explains -broken recipe scopes instead of deleting tests.",
-      "Includes torch.distributed.run unit-test launch and Run functional tests plus download_golden_values.py for new functional tests."
+      "Changes `scope: [mr-github]` to `scope: [mr-github-broken]` for the functional recipe entry.",
+      "Explains that the recipe entry should stay in place for discoverability and easy re-enable.",
+      "Distinguishes recipe `-broken` scopes from unit-test markers `@pytest.mark.flaky_in_dev` and `@pytest.mark.flaky`.",
+      "Does not recommend deleting the test case, removing the recipe entry, or changing golden values."
     ]
   }
 ]

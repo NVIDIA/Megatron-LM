@@ -1,16 +1,16 @@
 [
   {
-    "id": "bump-base-image-skill-specific-001",
-    "question": "Do not edit files or run commands. From the Megatron-LM bump-base-image skill, answer in at most 7 bullets: for a dev bump to nvcr.io/nvidia/pytorch:26.04-py3, which exact pin sites are touched, which LTS locations are skipped, what sync-check command pattern confirms the pins, and how should golden drift versus real broken tests be handled?",
+    "id": "bump-base-image-dev-pin-sync-001",
+    "question": "I changed `docker/.ngc_version.dev` to `nvcr.io/nvidia/pytorch:26.04-py3` for a Megatron-LM dev container bump. Before review, what other CI pin must I update, which rows should I leave alone, and what command would you use to confirm the dev pins match? Do not edit files or run commands.",
     "expected_skill": "bump-base-image",
     "expected_script": null,
-    "ground_truth": "The response should use the bump-base-image skill and identify docker/.ngc_version.dev plus both IMAGE_TYPE: dev BASE_IMAGE rows in .gitlab/stages/01.build.yml for amd64 and arm64. It should explicitly skip docker/.ngc_version.lts and IMAGE_TYPE: lts rows unless the user asked for an LTS bump. It should mention the sync check using cat docker/.ngc_version.dev and rg '^\\s*BASE_IMAGE: nvcr\\.io/nvidia/pytorch:' .gitlab/stages/01.build.yml -A2 -B1. It should say functional tests are the post-bump validation path, golden drift in lm loss, num-zeros, iteration-time, and mem-* is expected and should be refreshed with the update-golden-values skill using --source github, --pipeline-id, and --only-failing. Real broken tests should be tracked with an issue and moved to -broken scopes such as mr-broken or mr-github-broken instead of deleting the recipe entry.",
+    "ground_truth": "The response should use the bump-base-image skill and say that GitLab CI has a separate hardcoded pin: update both `IMAGE_TYPE: dev` `BASE_IMAGE` rows in `.gitlab/stages/01.build.yml`, one for `PLATFORM: amd64` and one for `PLATFORM: arm64`, to `nvcr.io/nvidia/pytorch:26.04-py3`. It should say to leave `docker/.ngc_version.lts` and all `IMAGE_TYPE: lts` rows alone because this is a dev-only bump. It should provide the sync-check pattern from the skill: read `docker/.ngc_version.dev` and use `rg -n '^\\s*BASE_IMAGE: nvcr\\.io/nvidia/pytorch:' .gitlab/stages/01.build.yml | rg -B1 'IMAGE_TYPE: dev' | rg 'BASE_IMAGE'` or the equivalent `rg ... -A2 -B1` check to confirm the two dev rows match the dev file. It should not discuss refreshing golden values unless the user asks about post-bump CI failures.",
     "expected_behavior": [
       "Uses the bump-base-image skill guidance before answering.",
       "Names docker/.ngc_version.dev and the two dev BASE_IMAGE rows in .gitlab/stages/01.build.yml.",
       "Says to skip docker/.ngc_version.lts and IMAGE_TYPE: lts rows unless explicitly bumping LTS.",
       "Includes the rg-based sync-check pattern for BASE_IMAGE rows.",
-      "Separates expected golden-value drift from real regressions that should be marked with -broken recipe scopes and issue links."
+      "Keeps the answer focused on pin synchronization rather than unrelated golden-value refresh work."
     ]
   }
 ]
