@@ -232,7 +232,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
 
     def _get_muon_split_shapes(self, p: torch.Tensor) -> tuple[int, ...] | None:
         """Return per-parameter Muon split shapes, if this parameter should be split."""
-        split_shapes = getattr(p, "qkv_split_shapes", None)
+        split_shapes: tuple[int, ...] | None = getattr(p, "qkv_split_shapes", None)
         if split_shapes is None:
             if self.is_qkv_fn is None or not self.is_qkv_fn(p):
                 return None
@@ -243,7 +243,6 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
                     "set."
                 )
 
-        split_shapes = tuple(int(shape) for shape in split_shapes)
         if not split_shapes or any(shape <= 0 for shape in split_shapes):
             raise ValueError(f"Muon split shapes must be positive integers, got {split_shapes}.")
         return split_shapes
