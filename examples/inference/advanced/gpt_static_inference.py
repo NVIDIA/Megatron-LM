@@ -29,7 +29,7 @@ import asyncio
 import json
 from typing import List
 
-from examples.inference.gpt.utils import build_requests
+from examples.inference.utils import build_requests
 from megatron.inference.utils import add_inference_args, get_model_for_inference
 from megatron.training import get_args, get_tokenizer, print_rank_0
 from megatron.training.initialize import initialize_megatron
