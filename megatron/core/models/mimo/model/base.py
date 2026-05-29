@@ -417,10 +417,7 @@ class MimoModel(MegatronModule):
             submodule = self.modality_submodules[encoder_name]
             encoder_inputs = modality_inputs.get(encoder_name) if modality_inputs else None
             hidden_states = input_tensors.get(encoder_name) if input_tensors else None
-            output = submodule.forward(
-                encoder_inputs=encoder_inputs,
-                hidden_states=hidden_states,
-            )
+            output = submodule.forward(encoder_inputs=encoder_inputs, hidden_states=hidden_states)
             if output is None and encoder_inputs is None and hidden_states is None:
                 if self._has_encoder_tokens(input_ids, encoder_name):
                     raise RuntimeError(
