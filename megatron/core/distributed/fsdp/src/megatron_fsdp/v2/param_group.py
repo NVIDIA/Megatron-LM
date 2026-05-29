@@ -83,16 +83,12 @@ class ParameterGroup:
         self.mesh = mesh
         self.dp_group = mesh.get_group()
 
-        # FIXME: no_shard, optim, and optim_grads sharding strategies are not yet supported in v2.
-        # Currently only optim_grads_params is fully implemented and tested.
-        # See README.md § "Sharding Strategies" for details.
-        # We will add support for these strategies in a follow-up change.
-        if sharding_strategy not in ("optim_grads_params",):
+        if sharding_strategy == "no_shard":
             raise NotImplementedError(
-                f"Sharding strategy '{sharding_strategy}' is not yet supported in FSDP v2. "
-                f"Currently only 'optim_grads_params' is implemented. "
-                f"We will add support for 'no_shard', 'optim', and 'optim_grads' in a follow-up change."
+                "Sharding strategy 'no_shard' is not yet supported in FSDP v2."
             )
+        if sharding_strategy not in ("optim", "optim_grads", "optim_grads_params"):
+            raise ValueError(f"Unsupported sharding strategy: {sharding_strategy}")
         self.sharding_strategy = sharding_strategy
         self.param_group_id = param_group_id
 
@@ -148,9 +144,6 @@ class ParameterGroup:
             mp_policy=self.mp_policy,
         )
 
-    # FIXME: The branching below currently only handles optim_grads_params since
-    # no_shard, optim, and optim_grads are gated by a NotImplementedError at init.
-    # When support for those strategies is added, the logic below must be validated.
     def _init_buffers(self) -> None:
         """
         Initialize all buffers based on sharding strategy.
