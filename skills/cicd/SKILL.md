@@ -74,40 +74,18 @@ The CI pipeline reads PR labels to decide test scope, n_repeat, and container im
 
 ## Triggering Internal CI
 
-Use `tools/trigger_internal_ci.py` to push the current branch to the internal
-GitLab remote and trigger a pipeline — without touching the GitLab UI.
-Full setup and usage details: @tools/trigger_internal_ci.md.
-
-**Prerequisites** (one-time):
+Use `tools/trigger_internal_ci.py` after the internal GitLab remote and
+`GITLAB_TOKEN` are configured; see @tools/trigger_internal_ci.md for setup
+details. First run a dry run and verify the destination ref:
 
 ```bash
-# 1. Add the internal GitLab remote
-git remote add gitlab git@<gitlab-hostname>:ADLR/Megatron-LM.git
-
-# 2. Create a personal access token with 'api' scope on your GitLab profile,
-#    then store it:
-export GITLAB_TOKEN=glpat-<your-token>
+python tools/trigger_internal_ci.py --gitlab-origin gitlab --dry-run
 ```
 
-**Usage:**
-
-**Warning:** `tools/trigger_internal_ci.py` force-pushes the current branch to
-the target remote ref, overwriting any existing history at
-`pull-request/<branch>`. Run with `--dry-run` first, verify the destination, and
-only target your own pull-request branch. Do not use this flow for shared or
-protected branches.
-
-```bash
-python tools/trigger_internal_ci.py \
-  --gitlab-origin gitlab \
-  [--functional-test-scope mr] \
-  [--functional-test-repeat 5] \
-  [--functional-test-cases all] \
-  [--dry-run]
-```
-
-The script force-pushes the current branch as `pull-request/<branch>` and
-prints the resulting pipeline URL.
+The script force-pushes the current branch to `pull-request/<branch>` before
+triggering the pipeline. Only target your own pull-request branch, never a shared
+or protected branch. Add optional `--functional-test-*` flags only after the
+dry-run output matches the intended destination.
 
 ---
 
