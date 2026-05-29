@@ -1,10 +1,9 @@
 ---
 name: split-pr
 description: Split a PR into multiple PRs to reduce the number of required CODEOWNERS reviewer groups.
-license: Apache-2.0
 when_to_use: User asks to split a PR, reduce reviewer groups, or break up a large PR; 'too many CODEOWNERS', 'split this PR', 'break up PR', 'reduce reviewers needed'.
 user_invocable: true
-argument: "PR URL or number"
+argument: "<pr-url-or-number>"
 ---
 
 # Split PR by CODEOWNERS Groups
@@ -14,22 +13,6 @@ the fewest possible CODEOWNERS reviewer groups. The goal is to reduce review
 burden: a PR that only touches `megatron/core/` needs only the core reviewers,
 while a PR that also touches `examples/`, `tools/`, and `megatron/training/`
 pulls in many additional groups.
-
-## Answer-First Constraints
-
-For split-planning questions, lead with these constraints before the full
-workflow:
-
-- Minimize CODEOWNERS reviewer groups per PR, but each resulting PR must still
-  be independently mergeable and reviewable.
-- Tests travel with the production code they validate; do not split tests into a
-  separate PR just to reduce reviewer groups.
-- If PR B depends on symbols renamed in PR A, call out the dependency and put
-  backward-compatible aliases, re-exports, or shims in PR A when needed.
-- Wait for user approval before execution.
-- Execution creates draft PRs from the right base, applies file-scoped diffs
-  with `git diff upstream/main..<source-branch> -- <paths> | git apply`, pushes
-  to the user's fork, and never pushes directly to upstream.
 
 ## Workflow
 

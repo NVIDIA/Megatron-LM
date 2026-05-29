@@ -1,10 +1,9 @@
 ---
 name: create-issue
 description: Investigate a failing GitHub Actions run or job and create a GitHub issue for the failure.
-license: Apache-2.0
 when_to_use: User shares a GitHub Actions URL and wants to file a bug report; 'create an issue for this failure', 'file a bug for this CI run', 'triage this GitHub Actions failure'.
 user_invocable: true
-argument: "GitHub Actions run or job URL"
+argument: "<github-actions-run-or-job-url>"
 ---
 
 # Triage CI Failure into a GitHub Issue

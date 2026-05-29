@@ -1,7 +1,6 @@
 ---
 name: build-and-dependency
 description: Container-based dev environment setup and dependency management for Megatron-LM. Covers acquiring and launching the CI container, uv package management, and updating uv.lock.
-license: Apache-2.0
 when_to_use: Adding, removing, or updating a dependency; editing pyproject.toml or uv.lock; uv.lock merge conflict; setting up a dev environment; pulling or building the CI container; container build errors; uv errors; 'how do I install', 'uv sync fails', 'ModuleNotFoundError'.
 ---
 
@@ -10,24 +9,6 @@ when_to_use: Adding, removing, or updating a dependency; editing pyproject.toml 
 The core principle: **build and develop inside containers** — the CI container
 ships the correct CUDA toolkit, PyTorch build, and pre-compiled native extensions
 (TransformerEngine, DeepEP, …) that cannot be reproduced on a bare host.
-
-## Answer-First Constants
-
-For text-only dependency or container questions, give these repo-specific facts
-up front before the longer workflow:
-
-- Run dependency work inside the Megatron-LM CI container, not on the host.
-- The container venv is `/opt/venv`, already on `PATH`.
-- Default `dev` uses `docker/.ngc_version.dev` and the `dev` uv group; `lts`
-  uses `docker/.ngc_version.lts` and the `lts` uv group. The `container::lts`
-  PR label selects the LTS path; otherwise CI uses `dev`.
-- Install commands inside the container: `uv sync --locked --group dev --group test`,
-  `uv sync --locked --only-group linting`, or
-  `uv sync --locked --group lts --group test`.
-- Dependency edits use `uv add <package>` followed by `uv lock`, both inside
-  the container.
-- `docker/Dockerfile.ci.dev` has `main` and `jet` stages. The `jet` stage needs
-  an internal secret; local/public builds should pass `--target main`.
 
 ---
 
