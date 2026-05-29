@@ -4,7 +4,7 @@ import logging
 import warnings
 from collections import defaultdict
 from dataclasses import astuple
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 from torch.optim import SGD as CPUSGD
@@ -728,14 +728,16 @@ def _tag_muon_split_qkv_parameters(
     """Tag standard QKV and MLA up-projection weights with Muon split metadata."""
     split_qkv = getattr(config, 'muon_split_qkv', True)
 
-    def _is_muon_split_metadata_managed_param(name: str, is_mla: bool) -> bool:
+    def _is_muon_split_metadata_managed_param(
+        name: str, attn_variant: Literal["mha", "mla"]
+    ) -> bool:
         """Return whether the parameter with the given name should be managed by Muon split tags.
 
         E.g., standard QKV or MLA projection weights.
         """
         if 'linear_qkv.weight' in name:
             return True
-        if not is_mla:
+        if attn_variant != "mla":
             return False
         return any(
             f'{projection}.weight' in name
@@ -751,11 +753,11 @@ def _tag_muon_split_qkv_parameters(
 
     for model_chunk in model_chunks:
         model_cfg = get_model_config(model_chunk)
-        is_mla = getattr(model_cfg, 'multi_latent_attention', False)
+        attn_variant = "mla" if getattr(model_cfg, 'multi_latent_attention', False) else "mha"
         standard_qkv_split_shapes = None
         mla_q_split_shapes = None
         mla_kv_split_shapes = None
-        if is_mla:
+        if attn_variant == "mla":
             mla_q_split_shapes = (model_cfg.qk_head_dim, model_cfg.qk_pos_emb_head_dim)
             mla_kv_split_shapes = (model_cfg.qk_head_dim, model_cfg.v_head_dim)
 
@@ -763,7 +765,7 @@ def _tag_muon_split_qkv_parameters(
             if not param.requires_grad:
                 continue
 
-            is_managed_param = _is_muon_split_metadata_managed_param(name, is_mla)
+            is_managed_param = _is_muon_split_metadata_managed_param(name, attn_variant)
             if is_managed_param:
                 # Remove existing Muon split tags from a parameter.
                 for attr in ("is_qkv", "qkv_split_shapes"):
