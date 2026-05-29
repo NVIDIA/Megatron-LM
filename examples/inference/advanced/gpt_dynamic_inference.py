@@ -19,7 +19,7 @@ sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
 )
 
-from examples.inference.gpt.utils import (
+from examples.inference.utils import (
     Request,
     build_dynamic_engine_setup_prefix,
     build_requests,
