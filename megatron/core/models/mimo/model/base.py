@@ -379,7 +379,7 @@ class MimoModel(MegatronModule):
 
         if self.role.mode == ModuleLayout.NON_COLOCATED:
             if self.role.has_modality_modules:
-                return self._forward_encoders(modality_inputs, input_tensors), loss_mask
+                return self._forward_encoders(input_ids, modality_inputs, input_tensors), loss_mask
 
             if self.role.has_language_module:
                 return (
@@ -395,6 +395,7 @@ class MimoModel(MegatronModule):
 
     def _forward_encoders(
         self,
+        input_ids: Optional[torch.Tensor],
         modality_inputs: Optional[Dict[str, Dict[str, Any]]],
         input_tensors: Optional[Dict[str, torch.Tensor]],
     ) -> Dict[str, torch.Tensor]:
@@ -414,15 +415,68 @@ class MimoModel(MegatronModule):
                 continue
 
             submodule = self.modality_submodules[encoder_name]
+            encoder_inputs = modality_inputs.get(encoder_name) if modality_inputs else None
+            hidden_states = input_tensors.get(encoder_name) if input_tensors else None
             output = submodule.forward(
-                encoder_inputs=modality_inputs.get(encoder_name) if modality_inputs else None,
-                hidden_states=input_tensors.get(encoder_name) if input_tensors else None,
+                encoder_inputs=encoder_inputs,
+                hidden_states=hidden_states,
             )
+            if output is None and encoder_inputs is None and hidden_states is None:
+                if self._has_encoder_tokens(input_ids, encoder_name):
+                    raise RuntimeError(
+                        f"{encoder_name} inputs are missing, but matching special tokens exist"
+                    )
+                output = self._empty_encoder_output(submodule, input_ids)
 
             if output is not None:
+                self._attach_modality_split_sizes(output, input_ids, encoder_name)
                 outputs[encoder_name] = output
 
         return outputs
+
+    def _attach_modality_split_sizes(
+        self, output: torch.Tensor, input_ids: Optional[torch.Tensor], encoder_name: str
+    ) -> None:
+        """Annotate flat modality outputs with per-sample split sizes for bridge fan-out."""
+        token_id = self.special_token_ids.get(encoder_name)
+        if token_id is None or input_ids is None or output.ndim != 2 or input_ids.size(0) <= 1:
+            return
+
+        split_sizes = (input_ids == token_id).sum(dim=1).to(torch.long).tolist()
+        if sum(split_sizes) == output.size(0):
+            output._mimo_bridge_split_sizes = split_sizes
+
+    def _has_encoder_tokens(self, input_ids: Optional[torch.Tensor], encoder_name: str) -> bool:
+        """Return whether the batch contains tokens for an encoder module."""
+        if input_ids is None or encoder_name not in self.special_token_ids:
+            return False
+        return bool((input_ids == self.special_token_ids[encoder_name]).any().item())
+
+    def _empty_encoder_output(
+        self, submodule: torch.nn.Module, input_ids: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        """Return the bridge payload for text-only non-colocated batches."""
+        language_config = self.mimo_config.language_model_spec.params['config']
+        hidden_size = getattr(language_config, 'hidden_size', None)
+        if hidden_size is None:
+            raise ValueError(
+                "Language model config must define hidden_size for empty modality output"
+            )
+
+        ref_tensor = next(submodule.parameters(), None)
+        if ref_tensor is None:
+            ref_tensor = next(submodule.buffers(), None)
+        if ref_tensor is not None:
+            device = ref_tensor.device
+        elif input_ids is not None:
+            device = input_ids.device
+        else:
+            device = torch.device("cuda", torch.cuda.current_device())
+        dtype = ref_tensor.dtype if ref_tensor is not None else self.config.params_dtype
+        if dtype is None:
+            dtype = torch.float32
+
+        return torch.empty((0, hidden_size), device=device, dtype=dtype, requires_grad=True)
 
     def _forward_language_module(
         self,
