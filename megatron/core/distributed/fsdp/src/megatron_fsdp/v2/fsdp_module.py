@@ -508,10 +508,11 @@ class FSDPModule(nn.Module):
                         del param.grad
                 elif param.grad is None:
                     main_grad = param.get_main_grad()
-                    if hasattr(param, "main_grad") and param.main_grad is not None:
-                        if param.main_grad.data_ptr() != main_grad.data_ptr():
-                            main_grad.copy_(param.main_grad.detach())
-                    else:
+                    param_main_grad = getattr(param, "main_grad", None)
+                    if (
+                        param_main_grad is None
+                        or param_main_grad.data_ptr() != main_grad.data_ptr()
+                    ):
                         main_grad.zero_()
                 else:
                     main_grad = param.get_main_grad()
@@ -531,22 +532,26 @@ class FSDPModule(nn.Module):
                 param_group.release_grad_buffer()
 
             # Install reduced gradients to distributed parameters
-            for name, param, dist_param, dist_grad in zip(
-                param_names, param_group.params, param_group.dist_params, param_group.dist_grads
-            ):
-                if not param.requires_grad:
-                    continue
-                if param_group.mp_policy.use_decoupled_grad:
-                    setattr(dist_param, "decoupled_grad", dist_grad)
-                    if dist_param.grad is not None:
-                        del dist_param.grad
-                else:
-                    assert (
-                        dist_grad is None or dist_param.dtype == dist_grad.dtype
-                    ), f"{name} Dist param dtype {dist_param.dtype} does not match dist grad dtype {dist_grad.dtype}"
-                    setattr(dist_param, "grad", dist_grad)
-                    if hasattr(dist_param, "decoupled_grad"):
-                        dist_param.decoupled_grad = None
+            with torch.cuda.stream(stream):
+                for name, param, dist_param, dist_grad in zip(
+                    param_names,
+                    param_group.params,
+                    param_group.dist_params,
+                    param_group.dist_grads,
+                ):
+                    if not param.requires_grad:
+                        continue
+                    if param_group.mp_policy.use_decoupled_grad:
+                        setattr(dist_param, "decoupled_grad", dist_grad)
+                        if dist_param.grad is not None:
+                            del dist_param.grad
+                    else:
+                        assert (
+                            dist_grad is None or dist_param.dtype == dist_grad.dtype
+                        ), f"{name} Dist param dtype {dist_param.dtype} does not match dist grad dtype {dist_grad.dtype}"
+                        setattr(dist_param, "grad", dist_grad)
+                        if hasattr(dist_param, "decoupled_grad"):
+                            dist_param.decoupled_grad = None
 
             if async_op:
                 event = stream.record_event()
