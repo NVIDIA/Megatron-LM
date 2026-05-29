@@ -113,6 +113,119 @@ def _iter_fp16_opts(
             yield opt
 
 
+class TestAdamOffloadConfig:
+    """Verify Adam fallback offloading behavior in the legacy LayerWise path.
+
+    In the legacy LayerWise path (use_distributed_optimizer=False), Adam params
+    feed INTO LayerWise as a child — LayerWise handles offloading, so Adam's own
+    HybridDeviceOptimizer must be disabled (optimizer_cpu_offload=False on the
+    fallback config).  This prevents creating a HybridDeviceOptimizer for Adam
+    and avoids double-offloading.
+
+    In the separate DistributedOptimizer path (use_distributed_optimizer=True),
+    Adam's DistOpt is a sibling of LayerWise — it manages its own offloading.
+    That path requires full DDP setup and is validated via integration tests.
+    """
+
+    def setup_method(self, method) -> None:
+        pass
+
+    def teardown_method(self, method) -> None:
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize('tp,pp', [(2, 2)])
+    def test_legacy_path_adam_not_hybrid_device_optimizer(self, tp: int, pp: int) -> None:
+        """In legacy path, Adam child is NOT a HybridDeviceOptimizer."""
+        if tp * pp > torch.cuda.device_count():
+            pytest.skip("Not enough GPUs")
+
+        from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
+
+        Utils.initialize_model_parallel(tp, pp)
+        model = _create_model(seed=1, tp=tp, pp=pp, bf16_params=True)
+
+        config = OptimizerConfig(
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            use_distributed_optimizer=False,
+            use_layer_wise_distributed_optimizer=True,
+            optimizer='muon',
+            lr=0.0,
+            optimizer_cpu_offload=True,
+        )
+        optimizer = get_megatron_optimizer(config, [model])
+        assert isinstance(optimizer, LayerWiseDistributedOptimizer)
+
+        # In the legacy path, Adam params go inside LayerWise. The fallback config
+        # has optimizer_cpu_offload=False, so no HybridDeviceOptimizer is created.
+        # LayerWise handles offloading for all children uniformly.
+        for opt in optimizer.chained_optimizers:
+            if isinstance(opt, Float16OptimizerWithFloat16Params):
+                inner_opt = opt.optimizer
+            else:
+                inner_opt = opt
+            assert not isinstance(inner_opt, HybridDeviceOptimizer), (
+                f"In legacy LayerWise path, Adam should NOT use "
+                f"HybridDeviceOptimizer (LayerWise manages offloading). "
+                f"Got {type(inner_opt).__name__}"
+            )
+
+    @pytest.mark.parametrize('tp,pp', [(2, 2)])
+    def test_legacy_path_layerwise_manages_adam_offload(self, tp: int, pp: int) -> None:
+        """LayerWise offload/reload cycle covers Adam params in legacy path."""
+        if tp * pp > torch.cuda.device_count():
+            pytest.skip("Not enough GPUs")
+
+        Utils.initialize_model_parallel(tp, pp)
+        model = _create_model(seed=1, tp=tp, pp=pp, bf16_params=True)
+
+        config = OptimizerConfig(
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            use_distributed_optimizer=False,
+            use_layer_wise_distributed_optimizer=True,
+            optimizer='muon',
+            lr=0.0,
+            optimizer_cpu_offload=True,
+        )
+        optimizer = get_megatron_optimizer(config, [model])
+        assert isinstance(optimizer, LayerWiseDistributedOptimizer)
+        assert optimizer._cpu_offload
+
+        # After init, LayerWise offloads ALL children's fp32 master weights —
+        # including Adam-managed params (biases, layernorms, embeddings).
+        # Init state so optimizer.state has tensors.
+        for opt in optimizer.chained_optimizers:
+            init_fn = getattr(opt, 'init_state_fn', None)
+            if init_fn is None:
+                continue
+            if hasattr(opt, 'optimizer'):
+                init_fn(opt.optimizer)
+            else:
+                init_fn(opt)
+        optimizer.offload_optimizer_states()
+
+        # Verify ALL fp32_from_float16_groups params across all children are on CPU.
+        found_any = False
+        for opt in _iter_fp16_opts(optimizer):
+            for group in opt.fp32_from_float16_groups:
+                for param in group:
+                    found_any = True
+                    assert not param.data.is_cuda, (
+                        "LayerWise should offload ALL children's master weights"
+                    )
+        assert found_any, "Expected at least some fp32 master weights to verify"
+
+        # Reload and verify they're back on GPU.
+        optimizer.reload_optimizer_states()
+        for opt in _iter_fp16_opts(optimizer):
+            for group in opt.fp32_from_float16_groups:
+                for param in group:
+                    assert param.data.is_cuda, "After reload, all should be on GPU"
+
+        optimizer.offload_optimizer_states()
+
+
 class TestMuonCPUOffload:
     """Tests for Muon CPU offloading in LayerWiseDistributedOptimizer.
 
