@@ -334,30 +334,34 @@ class TopKRouter(Router):
     ):
         """Apply the sequence-level auxiliary loss for the given scores and routing map.
 
-        To calculate the sequence-level aux loss, we reshape the batch_size dimension to
-        experts dimension. The resulted loss by switch_load_balancing_loss_func is equal
-        to the sum of aux loss for each sequence in the batch. And then we divide the aux
-        loss by the batch size to get averaged aux loss.
+        Computes the load-balancing aux loss separately for each sequence in the batch and
+        averages across the batch dimension. Each sequence's loss is computed via
+        ``switch_load_balancing_loss_func`` on a ``(seq_length, num_experts)`` slice. The
+        earlier implementation collapsed the batch dim into the expert dim via
+        ``reshape(seq_length, bsz * num_experts)``, which violates TE >= 2.16's
+        ``fused_moe_aux_loss`` kernel contract that asserts
+        ``probs.shape[-1] == num_experts`` in the launcher.
         """
         seq_aux_loss_coeff = self.get_aux_loss_coeff("seq_aux_loss")
         if seq_aux_loss_coeff == 0:
             return probs
 
-        scores_for_aux_loss = scores_for_aux_loss.reshape(seq_length, -1)
-        routing_map = routing_map.reshape(seq_length, -1)
+        scores_per_seq = scores_for_aux_loss.reshape(bsz, seq_length, -1)
+        routing_per_seq = routing_map.reshape(bsz, seq_length, -1)
 
-        global_tokens_per_expert, local_num_tokens, total_num_tokens = (
-            get_tokens_per_expert_and_token_count(
-                routing_map=routing_map,
-                reduce_group=self.tp_cp_group,
-                with_padding_mask=with_padding_mask,
-                topk=self.topk * bsz,
+        aux_loss = scores_for_aux_loss.new_zeros(())
+        local_num_tokens_sum = 0
+        for b in range(bsz):
+            global_tokens_per_expert, local_num_tokens, total_num_tokens = (
+                get_tokens_per_expert_and_token_count(
+                    routing_map=routing_per_seq[b],
+                    reduce_group=self.tp_cp_group,
+                    with_padding_mask=with_padding_mask,
+                    topk=self.topk,
+                )
             )
-        )
-
-        aux_loss = (
-            switch_load_balancing_loss_func(
-                probs=scores_for_aux_loss,
+            aux_loss = aux_loss + switch_load_balancing_loss_func(
+                probs=scores_per_seq[b],
                 tokens_per_expert=global_tokens_per_expert,
                 total_num_tokens=total_num_tokens,
                 topk=self.topk,
@@ -365,8 +369,8 @@ class TopKRouter(Router):
                 moe_aux_loss_coeff=seq_aux_loss_coeff,
                 fused=self.config.moe_router_fusion,
             )
-            / bsz
-        )
+            local_num_tokens_sum = local_num_tokens_sum + local_num_tokens
+        aux_loss = aux_loss / bsz
 
         probs = self.attach_and_log_load_balancing_loss(
             probs,
@@ -374,7 +378,7 @@ class TopKRouter(Router):
             aux_loss,
             "seq_load_balancing_loss",
             self.tp_cp_group,
-            valid_token_count=local_num_tokens,
+            valid_token_count=local_num_tokens_sum,
         )
         return probs
 
