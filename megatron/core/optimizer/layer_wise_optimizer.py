@@ -764,6 +764,19 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=False)
 
     @torch.no_grad()
+    def prepare_grads(self) -> bool:
+        """Reload offloaded states before gradient preprocessing.
+
+        ``ChainedOptimizer.step()`` calls ``prepare_grads()`` before
+        ``step_with_ready_grads()``.  The child optimizers'
+        ``_copy_model_grads_to_main_grads`` assigns CUDA gradients to the fp32
+        master params — which requires those params to be on GPU already.
+        """
+        if self._cpu_offload:
+            self.reload_optimizer_states()
+        return super().prepare_grads()
+
+    @torch.no_grad()
     def step_with_ready_grads(self) -> bool:
         """Step then all-gather LayerWise-managed param buffers.
 
@@ -772,8 +785,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         which calls ``step_with_ready_grads`` directly on each child and bypasses
         ``step``.
 
-        When CPU offloading is enabled, orchestrates the full cycle:
-        reload states to GPU -> optimizer step -> param sync -> offload states to CPU.
+        When CPU offloading is enabled and this method is called directly
+        (without a preceding ``prepare_grads``), reload states first.
+        ``reload_optimizer_states`` is idempotent (skips already-CUDA tensors).
         """
         if self._cpu_offload:
             self.reload_optimizer_states()

@@ -28,13 +28,15 @@ from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 
 
-def _create_model(seed: int, tp: int, pp: int) -> GPTModel:
+def _create_model(seed: int, tp: int, pp: int, bf16_params: bool = True) -> GPTModel:
     """Create a small GPT model for testing.
 
     Args:
         seed: Random seed for reproducibility.
         tp: Tensor parallel size (already initialized via Utils).
         pp: Pipeline parallel size (already initialized via Utils).
+        bf16_params: If True, model params are bf16 (exercises float16_groups path).
+            If False, params are fp32 (exercises fp32_from_fp32_groups path).
 
     Returns:
         A GPTModel instance on the current CUDA device.
@@ -45,7 +47,7 @@ def _create_model(seed: int, tp: int, pp: int) -> GPTModel:
         num_layers=6,
         hidden_size=16,
         num_attention_heads=8,
-        use_cpu_initialization=True,
+        use_cpu_initialization=not bf16_params,
         pipeline_dtype=torch.bfloat16,
         bf16=True,
     )
@@ -58,7 +60,10 @@ def _create_model(seed: int, tp: int, pp: int) -> GPTModel:
         pre_process=parallel_state.is_pipeline_first_stage(),
         post_process=parallel_state.is_pipeline_last_stage(),
     )
-    model.cuda(torch.cuda.current_device())
+    if bf16_params:
+        model.bfloat16().cuda(torch.cuda.current_device())
+    else:
+        model.cuda(torch.cuda.current_device())
     return model
 
 
@@ -125,6 +130,7 @@ class TestMuonCPUOffload:
 
     @pytest.mark.parametrize('tp,pp', [(2, 2), (1, 4), (4, 1)])
     def test_states_on_cpu(self, tp: int, pp: int) -> None:
+        print(f"test_states_on_cpu: tp={tp}, pp={pp}")
         """After init with cpu_offload=True, fp32 master weights and state are on CPU."""
         if tp * pp > torch.cuda.device_count():
             pytest.skip("Not enough GPUs")
@@ -152,6 +158,7 @@ class TestMuonCPUOffload:
     @pytest.mark.parametrize('tp,pp', [(2, 2), (1, 4), (4, 1)])
     def test_roundtrip_correctness(self, tp: int, pp: int) -> None:
         """Offload -> reload preserves fp32 master weight values exactly."""
+        print(f"test_roundtrip_correctness: tp={tp}, pp={pp}")
         if tp * pp > torch.cuda.device_count():
             pytest.skip("Not enough GPUs")
 
@@ -186,22 +193,41 @@ class TestMuonCPUOffload:
                     assert not param.data.is_cuda, "After offload, param should be on CPU"
 
     @pytest.mark.parametrize('tp,pp', [(2, 2), (1, 4), (4, 1)])
-    def test_step_runs(self, tp: int, pp: int) -> None:
-        """A full optimizer.step() succeeds with CPU offloading."""
+    @pytest.mark.parametrize('bf16_params', [True, False])
+    def test_step_runs(self, tp: int, pp: int, bf16_params: bool) -> None:
+        """A full optimizer.step() succeeds with CPU offloading.
+
+        Verifies the full prepare_grads → step_with_ready_grads cycle works
+        when states start on CPU.  Sets main_grad on the params tracked by
+        Float16OptimizerWithFloat16Params.float16_groups to exercise the
+        _copy_model_grads_to_main_grads path that assigns CUDA grads to
+        the fp32 master params (which are on CPU before reload).
+
+        When bf16_params=True, model params are bf16 and the float16_groups →
+        fp32_from_float16_groups path is exercised (the device mismatch path).
+        When bf16_params=False, params are fp32 and fp32_from_fp32_groups is used.
+        """
         if tp * pp > torch.cuda.device_count():
             pytest.skip("Not enough GPUs")
 
         Utils.initialize_model_parallel(tp, pp)
-        model = _create_model(seed=2, tp=tp, pp=pp)
+        model = _create_model(seed=2, tp=tp, pp=pp, bf16_params=bf16_params)
         optimizer = _create_optimizer(model, cpu_offload=True)
 
         assert isinstance(optimizer, LayerWiseDistributedOptimizer)
 
-        for param in model.parameters():
-            if param.requires_grad:
-                g = torch.randn_like(param.data)
-                param.grad = g
-                param.main_grad = g
+        # Set main_grad on all params tracked by the sub-optimizers so that
+        # _copy_model_grads_to_main_grads is exercised during prepare_grads().
+        for opt in optimizer.chained_optimizers:
+            if getattr(opt, 'is_stub_optimizer', False):
+                continue
+            if isinstance(opt, Float16OptimizerWithFloat16Params):
+                for group in opt.float16_groups:
+                    for model_param in group:
+                        model_param.main_grad = torch.randn_like(model_param.data)
+                for group in opt.fp32_from_fp32_groups:
+                    for model_param in group:
+                        model_param.main_grad = torch.randn_like(model_param.data)
 
         update_successful, grad_norm, num_zeros = optimizer.step()
         assert isinstance(update_successful, bool)
@@ -215,21 +241,23 @@ class TestMuonCPUOffload:
 
     @pytest.mark.parametrize('tp,pp', [(2, 2), (4, 1)])
     @pytest.mark.parametrize('n_steps', [3, 5])
-    def test_numerical_equivalence(self, tp: int, pp: int, n_steps: int) -> None:
+    @pytest.mark.parametrize('bf16_params', [True, False])
+    def test_numerical_equivalence(
+        self, tp: int, pp: int, n_steps: int, bf16_params: bool
+    ) -> None:
         """Offloaded and non-offloaded optimizers produce bit-identical results.
 
         Runs both an offloaded and a non-offloaded optimizer for ``n_steps``
         with identical random gradients, then verifies that fp32 master weights
-        and optimizer state tensors match exactly. This ensures the offload/reload
-        cycle introduces zero numerical drift.
+        and optimizer state tensors match exactly.
         """
         if tp * pp > torch.cuda.device_count():
             pytest.skip("Not enough GPUs")
 
         Utils.initialize_model_parallel(tp, pp)
 
-        model_off = _create_model(seed=42, tp=tp, pp=pp)
-        model_ref = _create_model(seed=42, tp=tp, pp=pp)
+        model_off = _create_model(seed=42, tp=tp, pp=pp, bf16_params=bf16_params)
+        model_ref = _create_model(seed=42, tp=tp, pp=pp, bf16_params=bf16_params)
 
         opt_off = _create_optimizer(model_off, cpu_offload=True)
         opt_ref = _create_optimizer(model_ref, cpu_offload=False)
@@ -242,14 +270,24 @@ class TestMuonCPUOffload:
         for step_i in range(n_steps):
             torch.manual_seed(1000 + step_i + rank)
 
-            for p_off, p_ref in zip(model_off.parameters(), model_ref.parameters()):
-                if not p_off.requires_grad:
-                    continue
-                g = torch.randn_like(p_off.data)
-                p_off.grad = g.clone()
-                p_off.main_grad = p_off.grad
-                p_ref.grad = g.clone()
-                p_ref.main_grad = p_ref.grad
+            # Set main_grad on all tracked params (same path as DDP grad buffers).
+            for fp16_opt_off, fp16_opt_ref in zip(
+                _iter_fp16_opts(opt_off), _iter_fp16_opts(opt_ref)
+            ):
+                for grp_off, grp_ref in zip(
+                    fp16_opt_off.float16_groups, fp16_opt_ref.float16_groups
+                ):
+                    for p_off, p_ref in zip(grp_off, grp_ref):
+                        g = torch.randn_like(p_off.data)
+                        p_off.main_grad = g.clone()
+                        p_ref.main_grad = g.clone()
+                for grp_off, grp_ref in zip(
+                    fp16_opt_off.fp32_from_fp32_groups, fp16_opt_ref.fp32_from_fp32_groups
+                ):
+                    for p_off, p_ref in zip(grp_off, grp_ref):
+                        g = torch.randn_like(p_off.data)
+                        p_off.main_grad = g.clone()
+                        p_ref.main_grad = g.clone()
 
             opt_off.step()
             opt_ref.step()
@@ -280,3 +318,66 @@ class TestMuonCPUOffload:
                     )
 
         opt_off.offload_optimizer_states()
+
+    @pytest.mark.parametrize('tp,pp', [(2, 2), (4, 1)])
+    @pytest.mark.parametrize('bf16_params', [True, False])
+    def test_prepare_grads_reloads_before_grad_copy(
+        self, tp: int, pp: int, bf16_params: bool
+    ) -> None:
+        """prepare_grads() must reload states to GPU before gradient assignment.
+
+        This directly tests the fix for the reviewer-identified bug where
+        _copy_model_grads_to_main_grads assigns a CUDA grad tensor to the
+        fp32 main_param — which requires main_param.data to be on GPU (since
+        nn.Parameter forbids cross-device .data/.grad).
+
+        With bf16_params=True, the float16_groups → fp32_from_float16_groups
+        path is exercised — this is the path that would RuntimeError without
+        the prepare_grads() fix.
+        """
+        if tp * pp > torch.cuda.device_count():
+            pytest.skip("Not enough GPUs")
+
+        Utils.initialize_model_parallel(tp, pp)
+        model = _create_model(seed=7, tp=tp, pp=pp, bf16_params=bf16_params)
+        optimizer = _create_optimizer(model, cpu_offload=True)
+
+        assert isinstance(optimizer, LayerWiseDistributedOptimizer)
+
+        # Verify states start on CPU after construction.
+        for opt in _iter_fp16_opts(optimizer):
+            for group in opt.fp32_from_float16_groups:
+                for param in group:
+                    assert not param.data.is_cuda
+
+        # Set main_grad (CUDA tensors) on all tracked params — this is what DDP does.
+        for opt in _iter_fp16_opts(optimizer):
+            for group in opt.float16_groups:
+                for model_param in group:
+                    model_param.main_grad = torch.randn_like(model_param.data)
+            for group in opt.fp32_from_fp32_groups:
+                for model_param in group:
+                    model_param.main_grad = torch.randn_like(model_param.data)
+
+        # Call prepare_grads() — should reload states and then copy grads.
+        # Without the fix, this raises RuntimeError (cross-device grad assignment).
+        result = optimizer.prepare_grads()
+        assert isinstance(result, bool)
+
+        # After prepare_grads, fp32 master params should be on GPU with grads set.
+        for opt in _iter_fp16_opts(optimizer):
+            for group in opt.fp32_from_float16_groups:
+                for param in group:
+                    assert param.data.is_cuda, (
+                        "After prepare_grads, fp32 master weight must be on GPU"
+                    )
+
+        # Now step_with_ready_grads should work and offload back.
+        optimizer.step_with_ready_grads()
+
+        for opt in _iter_fp16_opts(optimizer):
+            for group in opt.fp32_from_float16_groups:
+                for param in group:
+                    assert not param.data.is_cuda, (
+                        "After step_with_ready_grads, fp32 master weight must be on CPU"
+                    )

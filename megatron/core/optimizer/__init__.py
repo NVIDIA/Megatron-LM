@@ -891,12 +891,9 @@ def _get_megatron_emerging_optimizer(
                         "the legacy LayerWise ping-pong path for MoE models."
                     )
                 fallback_config.use_distributed_optimizer = True
-                # Disable per-optimizer CPU offload (HybridDeviceOptimizer) for the
-                # Adam fallback when LayerWiseDistributedOptimizer is active.
-                # CPU offloading is handled uniformly by LayerWiseDistributedOptimizer
-                # for all sub-optimizers (Muon + Adam), preventing double-offloading.
-                if use_layer_wise:
-                    fallback_config.optimizer_cpu_offload = False
+                # The separate DistributedOptimizer manages its own CPU offloading
+                # (via HybridDeviceOptimizer) independently of LayerWise — do NOT
+                # disable optimizer_cpu_offload here.
                 result = _get_megatron_optimizer_based_on_param_groups(
                     config=fallback_config,
                     model_chunks=model_chunks,
