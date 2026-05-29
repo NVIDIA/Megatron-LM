@@ -487,6 +487,25 @@ jobs:
           cd megatron-bridge
           git push origin --delete ${{ env.MBRIDGE_BRANCH_NAME }}
 
+  cicd-mbridge-testing-notify:
+    runs-on: ubuntu-latest
+    needs: [cicd-mbridge-testing]
+    # Notify on both success and failure of the MBridge downstream tests.
+    # Skipped/cancelled runs are intentionally not announced.
+    if: |
+      always()
+      && (needs.cicd-mbridge-testing.result == 'success' || needs.cicd-mbridge-testing.result == 'failure')
+    steps:
+      - name: Send Slack alert
+        uses: NVIDIA-NeMo/FW-CI-templates/.github/actions/send-slack-alert@main
+        with:
+          webhook: ${{ secrets.SLACK_WH_MLM_MB_ALERTS }}
+          message: |
+            ${{ needs.cicd-mbridge-testing.result == 'success' && ':white_check_mark: *MBridge downstream tests passed*' || ':rotating_light: *MBridge downstream tests failed*' }}
+            • Trigger: `${{ github.event_name }}` on `${{ github.ref_name }}`
+            • Run: <https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}|workflow run #${{ github.run_id }}>
+            ${{ needs.cicd-mbridge-testing.result == 'failure' && format('cc <!subteam^{0}>', secrets.SLACK_NEMO_MB_CODEOWNERS_GROUP_ID) || '' }}
+
   cicd-compute-build-matrix:
     runs-on: ubuntu-latest
     needs: [is-not-external-contributor]
