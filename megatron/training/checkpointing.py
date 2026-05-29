@@ -1028,7 +1028,8 @@ def generate_state_dict(
                 kwargs = {"metadata": metadata}
 
             if args.dist_ckpt_use_dtensor_format:
-                kwargs = {**kwargs, "metadata": {**kwargs["metadata"], "singleton_local_shards": True, "use_dtensor_format": True}}
+                base_metadata = kwargs.get("metadata", {})
+                kwargs = {**kwargs, "metadata": {**base_metadata, "singleton_local_shards": True, "use_dtensor_format": True}}
                 
             model_sd = model[i].sharded_state_dict(**kwargs)
         else:   # torch, torch_dcp, fsdp_dtensor
