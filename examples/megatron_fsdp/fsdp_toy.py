@@ -36,8 +36,14 @@ class ToyBlock(nn.Module):
         super().__init__()
         self.linear1 = nn.Linear(dim, dim)
         self.linear2 = nn.Linear(dim, dim)
+        self._use_activation_checkpointing = False
 
     def forward(self, x):
+        if self._use_activation_checkpointing:
+            return torch.utils.checkpoint.checkpoint(self._forward_impl, x, use_reentrant=False)
+        return self._forward_impl(x)
+
+    def _forward_impl(self, x):
         return self.linear2(torch.relu(self.linear1(x)))
 
 
@@ -51,6 +57,10 @@ class ToyModel(nn.Module):
         for layer in self.layers:
             x = layer(x)
         return self.out(x)
+
+    def enable_activation_checkpointing(self):
+        for layer in self.layers:
+            layer._use_activation_checkpointing = True
 
 
 # -----------------------
@@ -72,16 +82,24 @@ def build_fsdp_model(
     dim: int,
     n_layers: int,
     use_megatron_fsdp: bool,
+    use_activation_checkpointing: bool = False,
 ) -> Tuple["FSDPModule", torch.distributed.device_mesh.DeviceMesh]:
     if use_megatron_fsdp:
-        from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import get_state_dict
-        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import FSDPModule, fully_shard
+        try:
+            from megatron_fsdp.uneven_dtensor import get_state_dict
+            from megatron_fsdp.v2 import FSDPModule, fully_shard
+        except ImportError:
+            from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import get_state_dict
+            from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import FSDPModule, fully_shard
         sys.modules["get_state_dict"] = get_state_dict
     else:
         from torch.distributed.fsdp import FSDPModule, fully_shard
 
     mesh = init_distributed()
     model = ToyModel(dim=dim, n_layers=n_layers).to("cuda")
+
+    if use_activation_checkpointing:
+        model.enable_activation_checkpointing()
 
     # Example: per-layer sharding
     for layer in model.layers:
@@ -233,6 +251,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ckpt-interval", type=int, default=20)
     parser.add_argument("--log-interval", type=int, default=5)
     parser.add_argument("--use-megatron-fsdp", action="store_true", help="Use Megatron-FSDP instead of PyTorch FSDP2")
+    parser.add_argument("--activation-checkpoint", action="store_true", help="Enable activation checkpointing on transformer layers")
     return parser.parse_args()
 
 
@@ -243,6 +262,7 @@ def main() -> None:
         dim=args.model_dim,
         n_layers=args.n_layers,
         use_megatron_fsdp=args.use_megatron_fsdp,
+        use_activation_checkpointing=args.activation_checkpoint,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 

@@ -626,7 +626,211 @@ class TestLifecycle:
 
 
 # ------------------------------------------------------------------ #
-#  8. Safety — double-shard rejection
+#  8. Activation checkpointing
+# ------------------------------------------------------------------ #
+
+
+class MLPWithCheckpointing(nn.Module):
+    """A multi-layer MLP that supports activation checkpointing on its blocks."""
+
+    def __init__(self, hidden=64, num_layers=3):
+        super().__init__()
+        self.layers = nn.ModuleList(
+            [nn.Sequential(nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, hidden))
+             for _ in range(num_layers)]
+        )
+        self._use_activation_checkpointing = False
+
+    def forward(self, x):
+        for layer in self.layers:
+            if self._use_activation_checkpointing:
+                x = torch.utils.checkpoint.checkpoint(layer, x, use_reentrant=False)
+            else:
+                x = layer(x)
+        return x
+
+    def enable_activation_checkpointing(self):
+        self._use_activation_checkpointing = True
+
+
+class LargePerLayerModel(nn.Module):
+    """Multi-layer model with individually wrapped FSDP layers and optional
+    activation checkpointing support."""
+
+    def __init__(self, hidden=256, num_layers=4):
+        super().__init__()
+        self.layers = nn.ModuleList([
+            nn.Sequential(nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, hidden))
+            for _ in range(num_layers)
+        ])
+
+    def forward(self, x):
+        for layer in self.layers:
+            x = layer(x)
+        return x
+
+
+class TestActivationCheckpointing:
+    def test_activation_checkpointing_forward_backward(self):
+        """Forward + backward with activation checkpointing should produce finite loss."""
+        torch.manual_seed(42)
+        device = _device()
+        model = MLPWithCheckpointing(hidden=64, num_layers=4).to(device)
+        model.enable_activation_checkpointing()
+
+        for layer in model.layers:
+            fully_shard(layer)
+        fully_shard(model)
+        _assert_dtensor_params(model)
+
+        x = torch.randn(2, 64, device=device, requires_grad=True)
+        out = model(x)
+        loss = out.sum()
+        loss.backward()
+
+        assert not torch.isnan(torch.tensor(loss.item())), "Loss is NaN"
+        assert not torch.isinf(torch.tensor(loss.item())), "Loss is Inf"
+
+    def test_activation_checkpointing_multi_step(self):
+        """Multiple forward+backward steps with activation checkpointing should be stable."""
+        torch.manual_seed(42)
+        device = _device()
+        model = MLPWithCheckpointing(hidden=64, num_layers=4).to(device)
+        model.enable_activation_checkpointing()
+
+        for layer in model.layers:
+            fully_shard(layer)
+        fully_shard(model)
+
+        losses = []
+        for step in range(4):
+            torch.manual_seed(step)
+            x = torch.randn(2, 64, device=device, requires_grad=True)
+            out = model(x)
+            loss = out.sum()
+            loss.backward()
+            losses.append(loss.item())
+
+        for i, loss_val in enumerate(losses):
+            assert not torch.isnan(torch.tensor(loss_val)), f"Loss at step {i} is NaN"
+            assert not torch.isinf(torch.tensor(loss_val)), f"Loss at step {i} is Inf"
+
+    def test_activation_checkpointing_with_overlap(self):
+        """Activation checkpointing should work with unshard_prefetch and async_reduce_grad."""
+        torch.manual_seed(42)
+        device = _device()
+        model = MLPWithCheckpointing(hidden=128, num_layers=4).to(device)
+        model.enable_activation_checkpointing()
+
+        for layer in model.layers:
+            fully_shard(
+                layer,
+                enable_unshard_prefetch=True,
+                enable_async_reduce_grad=True,
+            )
+        fully_shard(model, enable_unshard_prefetch=True, enable_async_reduce_grad=True)
+
+        x = torch.randn(2, 128, device=device, requires_grad=True)
+        out = model(x)
+        loss = out.sum()
+        loss.backward()
+
+        assert not torch.isnan(torch.tensor(loss.item()))
+
+    def test_activation_checkpointing_nested_fsdp(self):
+        """Activation checkpointing with nested FSDP (expert-in-layer) should work."""
+        torch.manual_seed(42)
+        device = _device()
+
+        class NestedCheckpointModel(nn.Module):
+            def __init__(self, hidden=64):
+                super().__init__()
+                self.attn = nn.Linear(hidden, hidden)
+                self.experts = nn.Sequential(
+                    nn.Linear(hidden, hidden), nn.ReLU(), nn.Linear(hidden, hidden)
+                )
+                self.norm = nn.LayerNorm(hidden)
+
+            def forward(self, x):
+                h = self.attn(x)
+                if self._use_activation_checkpointing:
+                    h = torch.utils.checkpoint.checkpoint(self.experts, h, use_reentrant=False)
+                else:
+                    h = self.experts(h)
+                return self.norm(h + x)
+
+        model = NestedCheckpointModel(hidden=64).to(device)
+        model._use_activation_checkpointing = True
+        model.experts = fully_shard(model.experts)
+        model = fully_shard(model)
+
+        x = torch.randn(2, 64, device=device, requires_grad=True)
+        out = model(x)
+        loss = out.sum()
+        loss.backward()
+
+        assert not torch.isnan(torch.tensor(loss.item()))
+
+    def test_activation_checkpointing_disabled_vs_enabled_same_loss(self):
+        """With same inputs and no parameter updates, checkpointed and non-checkpointed
+        forward should produce the same output (checkpoint recompute is numerically transparent)."""
+        torch.manual_seed(42)
+        device = _device()
+
+        model = MLPWithCheckpointing(hidden=64, num_layers=3).to(device)
+
+        for layer in model.layers:
+            fully_shard(layer)
+        fully_shard(model)
+
+        x = torch.randn(2, 64, device=device, requires_grad=True)
+
+        # Forward without activation checkpointing
+        model._use_activation_checkpointing = False
+        out_no_ckpt = model(x)
+
+        # Forward with activation checkpointing
+        torch.manual_seed(42)
+        x2 = torch.randn(2, 64, device=device, requires_grad=True)
+        model._use_activation_checkpointing = True
+        out_ckpt = model(x2)
+
+        assert torch.allclose(
+            out_no_ckpt, out_ckpt, atol=1e-5
+        ), "Checkpointing changed forward output (same inputs)"
+
+    def test_activation_checkpointing_per_layer_shard_with_ckpt(self):
+        """Per-layer FSDP with activation checkpointing on each layer — full training step."""
+        torch.manual_seed(42)
+        device = _device()
+        model = LargePerLayerModel(hidden=256, num_layers=6).to(device)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+
+        for layer in model.layers:
+            fully_shard(layer)
+
+        fully_shard(model)
+
+        # Use checkpoint on every other layer to test mixed use
+        def ckpt_forward(x):
+            for i, layer in enumerate(model.layers):
+                if i % 2 == 0:
+                    x = torch.utils.checkpoint.checkpoint(layer, x, use_reentrant=False)
+                else:
+                    x = layer(x)
+            return x
+
+        x = torch.randn(4, 256, device=device, requires_grad=True)
+        out = ckpt_forward(x)
+        loss = out.sum()
+        loss.backward()
+        optimizer.step()
+
+        assert not torch.isnan(torch.tensor(loss.item()))
+
+
+# ------------------------------------------------------------------ #
+#  9. Safety — double-shard rejection
 # ------------------------------------------------------------------ #
 
 
@@ -648,7 +852,7 @@ class TestSafety:
 
 
 # ------------------------------------------------------------------ #
-#  9. Checkpoint — get_state_dict and preprocess_state_dict_for_uneven_dtensor
+# 10. Checkpoint — get_state_dict and preprocess_state_dict_for_uneven_dtensor
 # ------------------------------------------------------------------ #
 
 

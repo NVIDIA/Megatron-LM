@@ -297,6 +297,9 @@ class FSDPModule(nn.Module):
                         f"Module {name} contains meta parameters but cannot reset them"
                     )
 
+            # Move materialized parameters to the same target device (e.g., GPU)
+            m.to(materialization_device)
+
         if mesh is not None and mesh.size() > 1:
             dp_group = mesh.get_group()
             src_rank = torch.distributed.get_global_rank(dp_group, 0)
