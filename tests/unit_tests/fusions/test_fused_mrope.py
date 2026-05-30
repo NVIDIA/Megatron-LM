@@ -117,13 +117,15 @@ def _make_thd_inputs(
     interleaved_mrope=False,
     cp_size=1,
     padded_seq_lens=(12, 16),
+    head_dim=20,
+    rotary_dim=16,
+    mrope_section=None,
 ):
     total_seq = sum(padded_seq_lens)
     local_seq = total_seq // cp_size
     heads = 3
-    head_dim = 20
-    rotary_dim = 16
-    mrope_section = [3, 3, 2] if interleaved_mrope else [2, 3, 3]
+    if mrope_section is None:
+        mrope_section = [3, 3, 2] if interleaved_mrope else [2, 3, 3]
 
     generator = torch.Generator(device="cuda").manual_seed(5678)
     t = torch.randn(
@@ -1197,3 +1199,113 @@ def test_raw_mrope_thd_fusion_matches_unfused_with_context_parallel(interleaved_
         torch.testing.assert_close(t_ref.grad.float(), t_fused.grad.float(), **tols)
     finally:
         Utils.destroy_model_parallel()
+
+
+# ---------------------------------------------------------------------------
+# Real Qwen3.5-VL deployment shapes.
+#
+# The parametrized tests above use head_dim=16/20 with rotary_dim=16 (~80% of
+# channels rotated). The real Qwen3.5-VL config is head_dim=256 with
+# rotary_percent=0.25 -> rotary_dim=64 (only 25% rotated, 75% pass-through) and
+# mrope_section=[11,11,10] (interleaved). Exercise those exact shapes so a kernel
+# regression in the large-pass-through / large-section regime is caught.
+# ---------------------------------------------------------------------------
+
+# (head_dim, rotary_dim, mrope_section, interleaved_mrope)
+_REAL_BSHD_SHAPES = [
+    (256, 64, [11, 11, 10], True),    # Qwen3.5-VL LLM decoder (75% pass-through)
+    (256, 64, [10, 11, 11], False),   # same, section (non-interleaved) layout
+    (256, 256, [43, 43, 42], True),   # full rotary (no pass-through)
+]
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not is_fused_mrope_available(), reason="Triton fused mRoPE not available")
+@pytest.mark.parametrize("head_dim,rotary_dim,mrope_section,interleaved_mrope", _REAL_BSHD_SHAPES)
+def test_fused_mrope_matches_unfused_real_shapes(
+    head_dim, rotary_dim, mrope_section, interleaved_mrope
+):
+    t_ref, freqs, mrope_section = _make_inputs(
+        requires_grad=True,
+        head_dim=head_dim,
+        rotary_dim=rotary_dim,
+        mrope_section=mrope_section,
+        interleaved_mrope=interleaved_mrope,
+    )
+    t_fused = t_ref.detach().clone().requires_grad_(True)
+
+    emb = mrope_freqs_to_rotary_emb(
+        freqs, mrope_section, interleaved_mrope=interleaved_mrope, rotary_interleaved=False
+    )
+    ref = _apply_rotary_pos_emb_bshd(t_ref, emb, rotary_interleaved=False)
+    out = fused_apply_mrope(
+        t_fused, freqs, mrope_section, interleaved_mrope=interleaved_mrope, rotary_interleaved=False
+    )
+
+    tols = _dtype_tols(t_ref.dtype)
+    torch.testing.assert_close(ref.float(), out.float(), **tols)
+
+    grad = torch.randn_like(ref)
+    ref.backward(grad)
+    out.backward(grad)
+    torch.testing.assert_close(t_ref.grad.float(), t_fused.grad.float(), **tols)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not is_fused_mrope_available(), reason="Triton fused mRoPE not available")
+@pytest.mark.parametrize("interleaved_mrope", [False, True])
+def test_fused_mrope_thd_matches_unfused_real_shapes(interleaved_mrope):
+    # Real Qwen3.5-VL head_dim=256, rotary_dim=64 in THD packed layout.
+    section = [11, 11, 10] if interleaved_mrope else [10, 11, 11]
+    t_ref, freqs, cu_seqlens, mrope_section = _make_thd_inputs(
+        requires_grad=True,
+        interleaved_mrope=interleaved_mrope,
+        head_dim=256,
+        rotary_dim=64,
+        mrope_section=section,
+    )
+    t_fused = t_ref.detach().clone().requires_grad_(True)
+    cp_group = FakeCPGroup(size=1, rank=0)
+
+    emb = mrope_freqs_to_rotary_emb(
+        freqs, mrope_section, interleaved_mrope=interleaved_mrope, rotary_interleaved=False
+    )
+    ref = _apply_rotary_pos_emb_thd(t_ref, cu_seqlens, emb, cp_group=cp_group)
+    out = fused_apply_mrope_thd(
+        t_fused, cu_seqlens, freqs, mrope_section,
+        interleaved_mrope=interleaved_mrope, rotary_interleaved=False, cp_size=1, cp_rank=0,
+    )
+
+    tols = _dtype_tols(t_ref.dtype)
+    torch.testing.assert_close(ref.float(), out.float(), **tols)
+
+    grad = torch.randn_like(ref)
+    ref.backward(grad)
+    out.backward(grad)
+    torch.testing.assert_close(t_ref.grad.float(), t_fused.grad.float(), **tols)
+
+
+def test_thd_unavailable_reason_rejects_non_cp_divisible_subsequence():
+    # Per-sequence CP divisibility: total length is divisible by cp_size but an
+    # individual packed sub-sequence is not. The fused THD launch path
+    # (apply_rotary_pos_emb -> fused_apply_mrope_thd) must reject this so it falls
+    # back to the unfused path (which splits per-sequence correctly), instead of
+    # silently computing wrong CP token indices.
+    cp_size = 2
+    # sub-sequence lengths 10 and 14 -> both even (OK); 9 and 15 -> total 24 even
+    # but each odd (must be rejected).
+    cu_seqlens = torch.tensor([0, 9, 24], dtype=torch.int32, device="cuda")
+    local_tokens = 24 // cp_size
+    t = torch.randn(local_tokens, 3, 20, dtype=torch.bfloat16, device="cuda")
+    freqs = torch.randn(3, 1, 24, 8, dtype=torch.float32, device="cuda")
+    reason = get_fused_mrope_thd_unavailable_reason(
+        t, cu_seqlens, freqs, rotary_interleaved=False, cp_size=cp_size, cp_rank=0
+    )
+    assert reason is not None and "sub-sequence" in reason, reason
+
+    # Control: all sub-sequences divisible by cp_size -> launchable (reason None).
+    cu_ok = torch.tensor([0, 10, 24], dtype=torch.int32, device="cuda")
+    reason_ok = get_fused_mrope_thd_unavailable_reason(
+        t, cu_ok, freqs, rotary_interleaved=False, cp_size=cp_size, cp_rank=0
+    )
+    assert reason_ok is None, reason_ok
