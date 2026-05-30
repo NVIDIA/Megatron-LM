@@ -12,8 +12,16 @@
 #   TP, EP, PP: parallelism sizes
 #   MBS, GBS: micro/global batch sizes
 #   NUM_LAYERS, NUM_EXPERTS: override for proxy testing
+#   MTP_NUM_LAYERS: number of MTP layers (default: 1, set 0 to disable)
+#   LINEAR_ATTENTION_FREQ: every Nth decoder layer uses standard attention (default: 4; set 1 to force all standard attention)
+#   DATASET_PROVIDER: cord_v2 (default) or mock
+#   TOKENIZER_TYPE: HuggingFaceTokenizer (default) or NullTokenizer
+#   NO_ROPE_FUSION: set to 1 to pass --no-rope-fusion for baseline profiling
+#   SAVE_CHECKPOINTS: set to 0 to skip checkpoint saves in short profiling runs
 #   LAUNCHER: torchrun (default) or python
+#   TORCHRUN_PYTHON: Python executable for LAUNCHER=torchrun (default: python)
 #   PROFILE: set to 1 to enable Nsight Systems profiling (default: 0)
+#   NVTX_RANGES: set to 1 to emit Megatron custom NVTX ranges when PROFILE=1 (default: 1)
 #   PROFILE_STEP_START/PROFILE_STEP_END: profiled iteration window (default: 4-5)
 
 # example script: 
@@ -34,10 +42,13 @@ else
     NUM_NODES=${NNODES:-1}
 fi
 PROFILE=${PROFILE:-0}
+NVTX_RANGES=${NVTX_RANGES:-1}
 PROFILE_STEP_START=${PROFILE_STEP_START:-4}
 PROFILE_STEP_END=${PROFILE_STEP_END:-5}
 PROFILE_RANKS=${PROFILE_RANKS:-0}
 LAUNCHER=${LAUNCHER:-torchrun}
+TORCHRUN_PYTHON=${TORCHRUN_PYTHON:-python}
+NO_ROPE_FUSION=${NO_ROPE_FUSION:-0}
 
 MODEL_VARIANT=${MODEL_VARIANT:-proxy}
 VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-}
@@ -45,6 +56,8 @@ VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-}
 # Batch sizes
 MBS=${MBS:-2}
 GBS=${GBS:-16}
+MTP_NUM_LAYERS=${MTP_NUM_LAYERS:-1}
+LINEAR_ATTENTION_FREQ=${LINEAR_ATTENTION_FREQ:-4}
 
 # Parallelism
 TP=${TP:-1}
@@ -186,6 +199,9 @@ USE_PACKED_SEQUENCE=${USE_PACKED_SEQUENCE:-0}
 if [ "$USE_PACKED_SEQUENCE" -eq 1 ]; then
     EXP_NAME+="_thd"
 fi
+if [ "$NO_ROPE_FUSION" -eq 1 ]; then
+    EXP_NAME+="_no_rope_fusion"
+fi
 
 MEGATRON_LM_PATH="${MEGATRON_LM_PATH:-$(cd "$(dirname "$0")/../../.." && pwd)}"
 ROOT_DIR="${ROOT_DIR:-${MEGATRON_LM_PATH}/local/}"
@@ -241,13 +257,17 @@ TRAINING_ARGS=(
     --enable-experimental
     --manual-gc
     --manual-gc-interval 50
-    --mtp-num-layers 1
-    --mtp-loss-scaling-factor 0.1
     --sft
     --use-flash-attn
     # --attention-backend flash
     --calculate-per-token-loss
 )
+if [ "$MTP_NUM_LAYERS" -gt 0 ]; then
+    TRAINING_ARGS+=(
+        --mtp-num-layers "$MTP_NUM_LAYERS"
+        --mtp-loss-scaling-factor 0.1
+    )
+fi
 
 PROFILE_ARGS=()
 NSYS_CMD=()
@@ -258,6 +278,9 @@ if [ "$PROFILE" = "1" ]; then
         --profile-step-end "$PROFILE_STEP_END"
         --profile-ranks "$PROFILE_RANKS"
     )
+    if [ "$NVTX_RANGES" -eq 1 ]; then
+        PROFILE_ARGS+=( --nvtx-ranges )
+    fi
 
     NSYS_OUTPUT_DIR="${CHECKPOINT_STORE_PATH}/nsys"
     mkdir -p "$NSYS_OUTPUT_DIR"
@@ -274,12 +297,11 @@ if [ "$PROFILE" = "1" ]; then
 fi
 
 # --- Logging & Checkpointing ---
+SAVE_CHECKPOINTS=${SAVE_CHECKPOINTS:-1}
 SAVE_INTERVAL=${SAVE_INTERVAL:-500}
 EVAL_AND_LOGGING_ARGS=(
     --log-interval 1
-    --save-interval "$SAVE_INTERVAL"
     --eval-interval 500
-    --save "$CHECKPOINT_STORE_PATH"
     --eval-iters 10
     --tensorboard-dir "$TENSORBOARD_LOGS_PATH"
     --wandb-project "$WANDB_PROJECT"
@@ -289,27 +311,44 @@ EVAL_AND_LOGGING_ARGS=(
     --log-timers-to-tensorboard
     --log-params-norm
 )
+if [ "$SAVE_CHECKPOINTS" -eq 1 ]; then
+    EVAL_AND_LOGGING_ARGS+=(
+        --save-interval "$SAVE_INTERVAL"
+        --save "$CHECKPOINT_STORE_PATH"
+    )
+fi
 
 # --- Tokenizer ---
 TOKENIZER_MODEL=${TOKENIZER_MODEL:-Qwen/Qwen3.5-397B-A17B}
+TOKENIZER_TYPE=${TOKENIZER_TYPE:-HuggingFaceTokenizer}
+VOCAB_SIZE=${VOCAB_SIZE:-248320}
 TOKENIZER_ARGS=(
-    --tokenizer-type HuggingFaceTokenizer
-    --tokenizer-model "$TOKENIZER_MODEL"
+    --tokenizer-type "$TOKENIZER_TYPE"
 )
+if [ "$TOKENIZER_TYPE" = "NullTokenizer" ]; then
+    TOKENIZER_ARGS+=( --vocab-size "$VOCAB_SIZE" )
+else
+    TOKENIZER_ARGS+=( --tokenizer-model "$TOKENIZER_MODEL" )
+fi
 
 # --- Multimodal-specific ---
+DATASET_PROVIDER=${DATASET_PROVIDER:-cord_v2}
+HF_PROCESSOR_PATH=${HF_PROCESSOR_PATH-Qwen/Qwen3.5-397B-A17B}
+IMAGE_SEQ_LENGTH=${IMAGE_SEQ_LENGTH:-256}
 MULTIMODAL_ARGS=(
     --model-arch qwen35_vl
     --model-variant "$MODEL_VARIANT"
-    --dataset-provider cord_v2
-    --hf-processor-path Qwen/Qwen3.5-397B-A17B
+    --dataset-provider "$DATASET_PROVIDER"
     --use-vanilla-collate-fn
     --image-token-id 248056
     --image-size 224
     --total-seq-length "$SEQ_LEN"
-    --image-seq-length 256
+    --image-seq-length "$IMAGE_SEQ_LENGTH"
     --vision-num-layers "$VISION_NUM_LAYERS"
 )
+if [ -n "$HF_PROCESSOR_PATH" ]; then
+    MULTIMODAL_ARGS+=( --hf-processor-path "$HF_PROCESSOR_PATH" )
+fi
 
 if [ "$USE_PACKED_SEQUENCE" -eq 1 ]; then
     MULTIMODAL_ARGS+=( --use-packed-sequence )
@@ -341,7 +380,7 @@ GPT_MODEL_ARGS=(
     --attention-dropout 0.0
     --hidden-dropout 0.0
     --experimental-attention-variant gated_delta_net
-    --linear-attention-freq 4
+    --linear-attention-freq "$LINEAR_ATTENTION_FREQ"
     --linear-conv-kernel-dim 4
     --linear-key-head-dim 128
     --linear-value-head-dim 128
@@ -350,6 +389,9 @@ GPT_MODEL_ARGS=(
     --make-vocab-size-divisible-by 485
     --moe-router-force-load-balancing
 )
+if [ "$NO_ROPE_FUSION" -eq 1 ]; then
+    GPT_MODEL_ARGS+=( --no-rope-fusion )
+fi
 
 # --- Tied / untied embeddings ---
 # 0.8B, 2B, 4B use tied embeddings; all other variants untie them.
@@ -457,9 +499,18 @@ echo "  GPUs per node: $GPUS_PER_NODE"
 echo "  Num nodes:     $NUM_NODES"
 echo "  TP=$TP  EP=$EP  PP=$PP  CP=$CP"
 echo "  MBS=$MBS  GBS=$GBS"
+echo "  MTP layers:    $MTP_NUM_LAYERS"
+echo "  Linear attn freq: $LINEAR_ATTENTION_FREQ"
 echo "  Launcher:      $LAUNCHER"
+if [ "$LAUNCHER" = "torchrun" ]; then
+    echo "  Torchrun py:   $TORCHRUN_PYTHON"
+fi
 echo "  FSDP:          $USE_FSDP"
 echo "  PROFILE:       $PROFILE"
+echo "  RoPE fusion:   $([ "$NO_ROPE_FUSION" -eq 1 ] && echo off || echo on)"
+echo "  Dataset:       $DATASET_PROVIDER"
+echo "  Tokenizer:     $TOKENIZER_TYPE"
+echo "  Checkpoints:   $([ "$SAVE_CHECKPOINTS" -eq 1 ] && echo on || echo off)"
 if [ -n "$CKPT_LOAD" ]; then
     echo "  CKPT_LOAD:     $CKPT_LOAD"
     echo "  CKPT_FORMAT:   ${CKPT_FORMAT:-auto}"
@@ -468,13 +519,18 @@ fi
 if [ "$PROFILE" = "1" ]; then
     echo "  Profile steps: ${PROFILE_STEP_START}-${PROFILE_STEP_END}"
     echo "  Profile ranks: $PROFILE_RANKS"
+    echo "  NVTX ranges:   $([ "$NVTX_RANGES" -eq 1 ] && echo on || echo off)"
 fi
 echo "================================================================"
 
 if [ "$LAUNCHER" = "python" ]; then
     LAUNCH_CMD=( python $MEGATRON_LM_PATH/examples/multimodal_dev/pretrain_multimodal.py )
 elif [ "$LAUNCHER" = "torchrun" ]; then
-    LAUNCH_CMD=( torchrun "${DISTRIBUTED_ARGS[@]}" $MEGATRON_LM_PATH/examples/multimodal_dev/pretrain_multimodal.py )
+    LAUNCH_CMD=(
+        "$TORCHRUN_PYTHON" -m torch.distributed.run
+        "${DISTRIBUTED_ARGS[@]}"
+        $MEGATRON_LM_PATH/examples/multimodal_dev/pretrain_multimodal.py
+    )
 else
     echo "Unsupported LAUNCHER=$LAUNCHER (expected torchrun or python)" >&2
     exit 1
