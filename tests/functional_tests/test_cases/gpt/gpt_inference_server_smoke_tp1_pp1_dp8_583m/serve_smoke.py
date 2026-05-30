@@ -31,16 +31,23 @@ SERVER_HOST = "0.0.0.0"
 SERVER_PORT = 5000
 
 
-def build_server_cmd(checkpoint_dir: str, tokenizer_model: str) -> list[str]:
+def build_server_cmd(
+    checkpoint_dir: str, tokenizer_model: str, server_log_dir: str = None
+) -> list[str]:
     """Build the torchrun command for ``launch_inference_server.py`` (Mistral 0.5B,
     TP=1 DP=8). Mirrors gpt_dynamic_inference_tp1_pp1_dp8_583m_logitsmatch_zmq's
     model_config.yaml so the same checkpoint that legacy dp8 inference tests use
     is reused here.
     """
+    # ``--tee "3"`` writes per-rank stdout+stderr files under ``--log-dir`` (which
+    # the JET harness expects at ``logs/*/*/attempt_0/*/std*.log``) while still
+    # echoing to this driver's captured stdout so the readiness watcher works.
+    log_args = ["--log-dir", server_log_dir, "--tee", "3"] if server_log_dir else []
     return [
         sys.executable,
         "-m",
         "torch.distributed.run",
+        *log_args,
         "--nproc-per-node=8",
         "-m",
         "examples.inference.launch_inference_server",
@@ -146,9 +153,15 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint-dir", required=True)
     parser.add_argument("--tokenizer-model", required=True)
+    parser.add_argument(
+        "--server-log-dir",
+        default=None,
+        help="torchrun --log-dir for the spawned server; CI passes the JET assets "
+        "dir so per-rank logs land where the harness expects them.",
+    )
     args = parser.parse_args()
 
-    cmd = build_server_cmd(args.checkpoint_dir, args.tokenizer_model)
+    cmd = build_server_cmd(args.checkpoint_dir, args.tokenizer_model, args.server_log_dir)
     print(f"[smoke] spawning server: {' '.join(cmd)}", flush=True)
 
     proc = subprocess.Popen(

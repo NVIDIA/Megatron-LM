@@ -38,7 +38,8 @@ spec:
     python \
       tests/functional_tests/test_cases/gpt/gpt_inference_server_smoke_tp1_pp1_dp8_583m/serve_smoke.py \
       --checkpoint-dir /mnt/artifacts/model/mcore_mistral/nemo_minitron-0.5b/v1 \
-      --tokenizer-model /mnt/artifacts/model/mcore_mistral/nemo_minitron-0.5b/v1/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json
+      --tokenizer-model /mnt/artifacts/model/mcore_mistral/nemo_minitron-0.5b/v1/multiMixV8.gpt4o_nc_sd.500000.128k.vocab.json \
+      --server-log-dir {assets_dir}/logs/1
 
 products:
   - test_case: [gpt_inference_server_smoke_tp1_pp1_dp8_583m]
