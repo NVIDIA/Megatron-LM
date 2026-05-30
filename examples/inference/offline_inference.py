@@ -42,6 +42,7 @@ from examples.inference.utils import (
     print_unique_prompts_and_outputs,
 )
 from megatron.core.inference.apis import MegatronAsyncLLM, MegatronLLM
+from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.utils import configure_nvtx_profiling
 from megatron.inference.utils import (
@@ -253,10 +254,21 @@ def main():
     tokenizer = build_tokenizer(args)
     torch.cuda.reset_peak_memory_stats()
 
+    sampling_params = SamplingParams(
+        temperature=args.temperature,
+        top_k=args.top_k,
+        top_p=args.top_p,
+        skip_prompt_log_probs=args.skip_prompt_log_probs,
+        return_log_probs=args.return_log_probs,
+        num_tokens_to_generate=args.num_tokens_to_generate,
+        termination_id=args.termination_id if args.termination_id is not None else tokenizer.eod,
+        top_n_logprobs=args.top_n_logprobs,
+        stop_words=args.stop_words,
+    )
+
     model = get_model_for_inference()
     inference_config = get_inference_config_from_model_and_args(model, args)
-    requests = build_requests(args, tokenizer, sampling_params=None)
-    sampling_params = requests[0].sampling_params
+    requests = build_requests(args, tokenizer, sampling_params)
 
     max_gen_length = sampling_params.num_tokens_to_generate
     max_context_length = max(len(r.prompt_tokens) for r in requests)
