@@ -133,6 +133,7 @@ def launch_and_wait_for_completion(
                             "environments": {
                                 cluster: {
                                     "variables": {
+                                        "PYTHONUNBUFFERED": "1",
                                         "RUN_NAME": run_name or "",
                                         "ENABLE_LIGHTWEIGHT_MODE": str(
                                             enable_lightweight_mode
