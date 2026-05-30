@@ -757,6 +757,16 @@ class TestMimoModelFanoutHelpers:
 
         assert not hasattr(output, "_mimo_bridge_split_sizes")
 
+    def test_attach_modality_split_sizes_skips_when_token_counts_uniform(self):
+        model = self._stub_model({"images": 50257})
+        # Two samples, two image tokens each — uniform per-sample counts.
+        input_ids = torch.tensor([[50257, 50257, 1, 2], [50257, 50257, 3, 4]])
+        output = torch.zeros(4, 8)
+
+        model._attach_modality_split_sizes(output, input_ids, "images")
+
+        assert not hasattr(output, "_mimo_bridge_split_sizes")
+
     def test_attach_modality_split_sizes_skips_for_single_sample_batch(self):
         model = self._stub_model({"images": 50257})
         input_ids = torch.tensor([[50257, 50257, 1]])

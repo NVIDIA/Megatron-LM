@@ -436,19 +436,28 @@ class MimoModel(MegatronModule):
     ) -> None:
         """Annotate flat modality outputs with per-sample split sizes for bridge fan-out.
 
-        Fan-out only (encoder DP <= LM DP): the encoder rank's local ``input_ids``
-        describe the samples it will send out. In fan-out the bridge splits this
-        local batch into N pieces for N LM peers on the sender side, consuming
-        ``_mimo_bridge_split_sizes``. The equal-DP case is one-to-one and the
-        metadata is a no-op.
+        Only attaches when per-sample token counts are non-uniform. Uniform counts
+        give equal splits, which the bridge's ``torch.tensor_split`` fallback
+        already produces, so the metadata would be a no-op.
 
-        TODO(mimo): fan-in (encoder DP > LM DP) is not supported. Multiple
-        encoder ranks contribute slices to a single LM peer, and the
-        receiver-side ``torch.cat`` path in BridgeCommunicator has no metadata
-        channel today, so per-sample boundaries are lost on the LM rank. Lift
-        this restriction by routing per-sample sizes through the bridge
+        TODO(mimo): non-uniform per-sample counts in fan-in (encoder DP > LM DP)
+        are not supported. Multiple encoder ranks contribute slices to a single
+        LM peer, and the receiver-side ``torch.cat`` path in BridgeCommunicator
+        has no metadata channel today, so per-sample boundaries are lost on the
+        LM rank. Lift this by routing per-sample sizes through the bridge
         alongside the activations and adding a sample-aligned concat path.
         """
+        token_id = self.special_token_ids.get(encoder_name)
+        if token_id is None or input_ids is None or output.ndim != 2 or input_ids.size(0) <= 1:
+            return
+
+        split_sizes = (input_ids == token_id).sum(dim=1).to(torch.long).tolist()
+        if sum(split_sizes) != output.size(0):
+            return
+        if len(set(split_sizes)) <= 1:
+            # Uniform counts — tensor_split fallback gives the same result.
+            return
+
         if self.role.mode is ModuleLayout.NON_COLOCATED:
             grid_map = self.mimo_config.module_to_grid_map
             encoder_grid = grid_map[encoder_name]
@@ -456,19 +465,14 @@ class MimoModel(MegatronModule):
             encoder_dp = encoder_grid.shape[encoder_grid.dim_names.index("dp")]
             language_dp = language_grid.shape[language_grid.dim_names.index("dp")]
             assert encoder_dp <= language_dp, (
-                f"Bridge fan-out split metadata only supports encoder DP <= LM DP "
-                f"(got encoder='{encoder_name}' DP={encoder_dp}, LM DP={language_dp}). "
-                f"Fan-in (encoder DP > LM DP) is not supported yet — see TODO in "
+                f"Bridge fan-out split metadata with non-uniform per-sample sizes "
+                f"requires encoder DP <= LM DP (got encoder='{encoder_name}' "
+                f"DP={encoder_dp}, LM DP={language_dp}). Fan-in with variable "
+                f"modality token counts is not supported yet — see TODO in "
                 f"_attach_modality_split_sizes."
             )
 
-        token_id = self.special_token_ids.get(encoder_name)
-        if token_id is None or input_ids is None or output.ndim != 2 or input_ids.size(0) <= 1:
-            return
-
-        split_sizes = (input_ids == token_id).sum(dim=1).to(torch.long).tolist()
-        if sum(split_sizes) == output.size(0):
-            output._mimo_bridge_split_sizes = split_sizes
+        output._mimo_bridge_split_sizes = split_sizes
 
     def _has_encoder_tokens(self, input_ids: Optional[torch.Tensor], encoder_name: str) -> bool:
         """Return whether the batch contains tokens for an encoder module."""
