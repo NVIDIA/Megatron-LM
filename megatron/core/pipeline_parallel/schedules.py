@@ -24,7 +24,7 @@ from megatron.core.process_groups_config import (
     ProcessGroupCollection,
 )
 from megatron.core.transformer.cuda_graphs import create_cudagraphs, set_current_microbatch
-from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.moe.paged_stash import paged_stash_reset
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 from megatron.core.utils import (
     drain_embedding_wgrad_compute,
@@ -623,6 +623,9 @@ def forward_backward_no_pipelining(
         pg_collection.dp_cp = parallel_state.get_data_parallel_group(
             with_context_parallel=True, partial_data_parallel=False
         )
+        pg_collection.tp_dp_cp = parallel_state.get_tensor_and_data_parallel_group(
+            with_context_parallel=True
+        )
 
     elif pg_collection is not None:
         assert hasattr(pg_collection, 'tp'), "pg_collection must have tp"
@@ -643,6 +646,9 @@ def forward_backward_no_pipelining(
     config = get_model_config(model)
     if config.timers is not None:
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
+
+    if getattr(config, "moe_paged_stash", False):
+        paged_stash_reset(enabled=not forward_only, config=config)
 
     no_sync_func = config.no_sync_func
     if no_sync_func is None:
@@ -708,6 +714,13 @@ def forward_backward_no_pipelining(
                 total_num_tokens += num_tokens
                 if not forward_only:
                     backward_step(input_tensor, output_tensor, output_tensor_grad, config)
+                    # Release the autograd graph head before the next forward_step.
+                    # Without this, the previous microbatch's output_tensor stays
+                    # live until the next iteration rebinds the variable, deferring
+                    # autograd-node teardown onto the next forward's dispatch path
+                    # and triggering PyTorch's "AccumulateGrad node's stream does
+                    # not match" warning. See issue #4124.
+                    del output_tensor
         # Run computation for last microbatch out of context handler (want to
         # synchronize gradients).
         output_tensor, num_tokens = forward_step(
@@ -730,6 +743,7 @@ def forward_backward_no_pipelining(
 
         if not forward_only:
             backward_step(input_tensor, output_tensor, output_tensor_grad, config)
+            del output_tensor
 
     if config.finalize_model_grads_func is not None and not forward_only:
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
@@ -756,11 +770,7 @@ def forward_backward_no_pipelining(
     if config.timers is not None:
         config.timers('forward-backward').stop()
 
-    if (
-        hasattr(config, 'cuda_graph_impl')
-        and config.cuda_graph_impl == "local"
-        and CudaGraphScope.full_iteration not in config.cuda_graph_scope
-    ):
+    if hasattr(config, 'cuda_graph_impl') and config.cuda_graph_impl == "local":
         create_cudagraphs()
 
     return forward_data_store
@@ -943,6 +953,9 @@ def forward_backward_pipelining_with_interleaving(
         pg_collection.dp_cp = parallel_state.get_data_parallel_group(
             with_context_parallel=True, partial_data_parallel=False
         )
+        pg_collection.tp_dp_cp = parallel_state.get_tensor_and_data_parallel_group(
+            with_context_parallel=True
+        )
 
     elif p2p_communicator is not None and pg_collection is not None:
         model_type = get_model_type(model[0])
@@ -966,6 +979,9 @@ def forward_backward_pipelining_with_interleaving(
     assert (
         adjust_tensor_shapes_fn is None
     ), "adjust_tensor_shapes_fn is not supported for interleaved pipeline parallelism"
+
+    if getattr(config, "moe_paged_stash", False):
+        paged_stash_reset(enabled=not forward_only, config=config)
 
     if config.overlap_p2p_comm and config.batch_p2p_comm:
         raise ValueError("Can not use both overlap_p2p_comm and batch_p2p_comm")
@@ -1989,11 +2005,7 @@ def forward_backward_pipelining_with_interleaving(
     if config.timers is not None:
         config.timers('forward-backward').stop()
 
-    if (
-        hasattr(config, 'cuda_graph_impl')
-        and config.cuda_graph_impl == "local"
-        and CudaGraphScope.full_iteration not in config.cuda_graph_scope
-    ):
+    if hasattr(config, 'cuda_graph_impl') and config.cuda_graph_impl == "local":
         create_cudagraphs()
     nvtx_range_pop(suffix="misc")
 
@@ -2100,6 +2112,9 @@ def forward_backward_pipelining_without_interleaving(
         pg_collection.dp_cp = parallel_state.get_data_parallel_group(
             with_context_parallel=True, partial_data_parallel=False
         )
+        pg_collection.tp_dp_cp = parallel_state.get_tensor_and_data_parallel_group(
+            with_context_parallel=True
+        )
 
     elif p2p_communicator is not None and pg_collection is not None:
         assert hasattr(p2p_communicator, 'config'), "p2p_communicator must have a config"
@@ -2140,6 +2155,9 @@ def forward_backward_pipelining_without_interleaving(
 
     if config.timers is not None:
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
+
+    if getattr(config, "moe_paged_stash", False):
+        paged_stash_reset(enabled=not forward_only, config=config)
 
     # Disable async grad reductions
     no_sync_func = config.no_sync_func
@@ -2393,11 +2411,7 @@ def forward_backward_pipelining_without_interleaving(
     if config.timers is not None:
         config.timers('forward-backward').stop()
 
-    if (
-        hasattr(config, 'cuda_graph_impl')
-        and config.cuda_graph_impl == "local"
-        and CudaGraphScope.full_iteration not in config.cuda_graph_scope
-    ):
+    if hasattr(config, 'cuda_graph_impl') and config.cuda_graph_impl == "local":
         create_cudagraphs()
 
     return forward_data_store

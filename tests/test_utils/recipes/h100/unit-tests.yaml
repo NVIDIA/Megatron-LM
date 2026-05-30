@@ -10,6 +10,7 @@ spec:
   gpus: 8
   platforms: dgx_h100
   script_setup: |
+    set -euo pipefail
     unset https_proxy
     echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
 
@@ -30,6 +31,7 @@ spec:
       --repo $MCORE_REPO
 
   script: |-
+    set -euo pipefail
     ls
 
     TAG={tag}
@@ -42,7 +44,6 @@ spec:
     else
         TEST_PATH="/opt/megatron-lm-legacy/"
     fi
-
 
     bash $TEST_PATH/tests/unit_tests/run_ci_test.sh \
       --tag $TAG \

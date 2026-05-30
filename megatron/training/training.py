@@ -5,6 +5,7 @@ import argparse
 import time
 
 from megatron.training.config.container import PretrainConfigContainer
+
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
 
@@ -34,10 +35,8 @@ def set_startup_timestamps(program_start=None, main_entry=None):
         _STARTUP_TIMESTAMPS['main_entry'] = main_entry
 
 
-from collections import defaultdict
 import copy
 import dataclasses
-from datetime import datetime, timedelta
 import functools
 import gc
 import inspect
@@ -45,14 +44,21 @@ import logging
 import math
 import os
 import sys
+from collections import defaultdict
 from contextlib import nullcontext
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Optional, Dict
+from typing import Any, Dict, Optional, Tuple
 
 import torch.distributed
 
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.optimizer.layer_wise_optimizer import (
+    LayerWiseDistributedOptimizer,
+    tag_params_for_buffer_routing,
+)
 from megatron.core.optimizer_param_scheduler import get_canonical_lr_for_logging
+
 from .log_handler import CustomHandler
 
 # Make default logging level INFO, but filter out all log messages not from MCore.
@@ -68,6 +74,7 @@ try:
     has_rl_utils = True
 except ImportError:
     has_rl_utils = False
+
 
 # Canonical list of RL timer names to include in timers_to_log.
 # When the profiling branch is merged, this will be imported from rl_profiling
@@ -119,57 +126,62 @@ RL_LOGGABLE_TIMER_NAMES = [
 ]
 
 try:
-    from modelopt.torch.distill.plugins.megatron import (
-        get_tensor_shapes_adjust_fn_for_distillation,
-    )
+    from modelopt.torch.distill.plugins.megatron import get_tensor_shapes_adjust_fn_for_distillation
 
     has_nvidia_modelopt = True
 except ImportError:
     has_nvidia_modelopt = False
 
-try:
-    from nvidia_resiliency_ext.inprocess import CallWrapper
-except ImportError:
-    CallWrapper = type(None)
-
-
-from megatron.core import mpu, tensor_parallel
+from megatron.core import mpu, nccl_allocator, tensor_parallel
+from megatron.core.distributed import DistributedDataParallel as DDP
+from megatron.core.distributed import (
+    DistributedDataParallelConfig,
+    TorchFullyShardedDataParallelConfig,
+)
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
+    FullyShardedDataParallel as megatron_FSDP,
+)
+from megatron.core.fp8_utils import correct_amax_history_if_needed
+from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     is_linear_attention_variant,
 )
-from megatron.core.utils import (
-    check_param_hashes_across_dp_replicas,
-    configure_nvtx_profiling,
-    get_attr_wrapped_model,
-    get_model_config,
-    get_pg_size,
-    get_pg_rank,
-    StragglerDetector,
-)
-from megatron.core.fp8_utils import correct_amax_history_if_needed
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.optimizer import get_mup_config_overrides, get_standard_config_overrides
+from megatron.core.optimizer.optimizer import param_group_identifier_keys
+from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
+from megatron.core.optimizer.qk_clip import clip_qk
 from megatron.core.pipeline_parallel.utils import (
     is_pp_first_stage,
     is_pp_last_stage,
     is_vp_first_stage,
     is_vp_last_stage,
 )
-from megatron.core.optimizer import get_mup_config_overrides, get_standard_config_overrides
-from megatron.training.checkpointing import load_checkpoint
-from megatron.training.checkpointing import save_checkpoint, save_grads
-from megatron.training.checkpointing import checkpoint_exists
-from megatron.training.checkpointing import get_loaded_iteration
-from megatron.core.full_cuda_graph import FullCudaGraphWrapper
-from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
-from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.module import Float16Module
+from megatron.core.transformer.moe.paged_stash import PagedStashRunner
 from megatron.core.distributed import DistributedDataParallelConfig, TorchFullyShardedDataParallelConfig
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
 
 from megatron.core.optimizer.qk_clip import clip_qk
+from megatron.core.utils import (
+    StragglerDetector,
+    check_param_hashes_across_dp_replicas,
+    configure_nvtx_profiling,
+    get_attr_wrapped_model,
+    get_model_config,
+    get_pg_rank,
+    get_pg_size,
+)
+from megatron.training.checkpointing import (
+    checkpoint_exists,
+    get_loaded_iteration,
+    load_checkpoint,
+    save_checkpoint,
+    save_grads,
+)
 
 try:
     from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
@@ -178,39 +190,41 @@ try:
 except ImportError:
     HAVE_FSDP2 = False
 
+from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
-from megatron.core.optimizer import (
-    get_megatron_optimizer,
-    OptimizerConfig,
-    ParamKey,
-)
-from megatron.core.rerun_state_machine import (
-    get_rerun_state_machine,
-    destroy_rerun_state_machine,
-    RerunDataIterator,
-    RerunMode,
-)
-from megatron.training.initialize import initialize_megatron
-from megatron.training.initialize import write_args_to_tensorboard
-from megatron.training.initialize import set_jit_fusion_options
-from megatron.training.utils import get_batch_on_this_cp_rank, get_batch_on_this_tp_rank, is_hybrid_model
-from megatron.training.datasets.data_samplers import build_pretraining_data_loader
-from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
-from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
-from megatron.core.transformer.moe import upcycling_utils
-from megatron.core.transformer.moe.moe_utils import track_moe_metrics, clear_aux_losses_tracker
-from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
-from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
-from megatron.core.parallel_state import (
-    destroy_global_memory_buffer,
-    destroy_model_parallel,
-    update_pg_timeout,
-    create_all_gather_groups,
-)
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.inference.unified_memory import create_unified_mempool
+from megatron.core.optimizer import OptimizerConfig, ParamKey, get_megatron_optimizer
+from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
+from megatron.core.parallel_state import (
+    create_all_gather_groups,
+    destroy_global_memory_buffer,
+    destroy_model_parallel,
+    get_context_parallel_group,
+    get_hybrid_data_context_parallel_groups,
+    update_pg_timeout,
+)
+from megatron.core.rerun_state_machine import (
+    RerunDataIterator,
+    RerunMode,
+    destroy_rerun_state_machine,
+    get_rerun_state_machine,
+)
 from megatron.core.resharding.refit import swap_model_weights
+from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
+from megatron.core.transformer.moe import upcycling_utils
+from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
+from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
+from megatron.core.utils import get_batch_on_this_cp_rank, get_batch_on_this_tp_rank, unwrap_model
+from megatron.training.config import FaultInjectorConfig
+from megatron.training.datasets.data_samplers import build_pretraining_data_loader
+from megatron.training.initialize import (
+    initialize_megatron,
+    set_jit_fusion_options,
+    write_args_to_tensorboard,
+)
+from megatron.training.utils import is_hybrid_model
 
 try:
     from torch_memory_saver import torch_memory_saver
@@ -219,53 +233,50 @@ try:
 except ImportError:
     HAVE_TORCH_MEMORY_SAVER = False
 
-from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
     get_current_global_batch_size,
     get_current_running_global_batch_size,
     get_num_microbatches,
-    update_num_microbatches
+    update_num_microbatches,
 )
+from megatron.core.pipeline_parallel import get_forward_backward_func
 
+from . import ft_integration, one_logger_utils
+from .activation_logging import (
+    disable_activation_logging,
+    disable_tokens_per_expert_logging,
+    enable_activation_logging,
+    enable_tokens_per_expert_logging,
+    save_activations,
+    save_tokens_per_expert,
+)
 from .async_utils import maybe_finalize_async_save
+from .dgrad_logging import disable_dgrad_logging, enable_dgrad_logging, save_dgrads
+from .global_vars import (
+    destroy_global_vars,
+    get_args,
+    get_energy_monitor,
+    get_one_logger,
+    get_signal_handler,
+    get_tensorboard_writer,
+    get_timers,
+    get_tokenizer,
+    get_wandb_writer,
+)
 from .utils import (
     append_to_progress_log,
     calc_params_l2_norm,
     check_adlr_autoresume_termination,
-    logical_and_across_model_parallel_group,
-    reduce_max_stat_across_model_parallel_group,
     is_last_rank,
+    logical_and_across_model_parallel_group,
     print_rank_0,
     print_rank_last,
+    reduce_max_stat_across_model_parallel_group,
     report_memory,
-    unwrap_model,
-    update_use_dist_ckpt,
     to_empty_if_meta_device,
+    update_use_dist_ckpt,
 )
-from .global_vars import (
-    destroy_global_vars,
-    get_args,
-    get_signal_handler,
-    get_timers,
-    get_tensorboard_writer,
-    get_wandb_writer,
-    get_one_logger,
-    get_tokenizer,
-    get_energy_monitor,
-)
-from . import one_logger_utils
-from .activation_logging import (
-    enable_activation_logging,
-    disable_activation_logging,
-    save_activations,
-    enable_tokens_per_expert_logging,
-    disable_tokens_per_expert_logging,
-    save_tokens_per_expert,
-)
-from .dgrad_logging import enable_dgrad_logging, disable_dgrad_logging, save_dgrads
-
-from . import ft_integration
 
 stimer = StragglerDetector()
 
@@ -291,45 +302,196 @@ def print_datetime(string, override_timestamp=None):
         time_str = datetime.fromtimestamp(override_timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')
     print_rank_0(f'[{string}] datetime: {time_str} ')
 
-def num_floating_point_operations(args, batch_size):
-    def mlp_layer_flops(batch_size, seq_len, hidden_size, expansion=4.0, swiglu=False):
+# Per-iteration packed-sequence (THD) accumulator. The tensor holds TWO stats,
+# both computed from the REAL ``cu_seqlens`` (i.e. unpadded sub-sequence lengths
+# -- ``cu_seqlens_padded`` is intentionally ignored so that neither the
+# per-chunk CP alignment padding nor any end-of-sequence padding is counted as
+# useful work):
+#   index 0 -> ``sum_i(L_i)``   (total real tokens; used for token-linear FLOPs:
+#                               projections, MLP, MoE, MTP, logits)
+#   index 1 -> ``sum_i(L_i**2)`` (used for core-attention FLOPs)
+# Lives on GPU as fp64 so per-micro-batch updates run as fused kernels with
+# no host sync; the only host sync happens once at ``consume`` time after a
+# single 2-element all-reduce. ``_seqlen_stats_active`` flips to ``True`` the
+# first time an update lands this iteration and is the gate that decides
+# whether ``consume_*`` issues a collective at all -- unpacked BSHD runs
+# never call ``update_*`` so the flag stays ``False`` and no collective fires.
+_seqlen_stats_in_iteration: Optional[torch.Tensor] = None
+_seqlen_stats_active: bool = False
+
+
+def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
+    """Add ``sum(L_i)`` and ``sum(L_i ** 2)`` from one micro-batch's REAL ``cu_seqlens``.
+
+    Args:
+        cu_seqlens: 1-D ``int32`` tensor of cumulative REAL (unpadded) sequence
+            lengths (``[0, L_1, L_1 + L_2, ...]``). Pass the unpadded
+            ``cu_seqlens`` rather than ``cu_seqlens_padded`` so the FLOPs
+            metric reports useful work only, not work on CP-alignment or
+            end-of-sequence padding tokens.
+
+    Every rank in the same data-parallel group sees the same ``cu_seqlens`` (it is
+    broadcast across TP/CP/PP). The per-micro-batch reduction stays on device --
+    no ``.item()`` -- so this is a fused kernel launch with no host sync. The
+    ``_seqlen_stats_active`` flag is set so that ``consume_*`` knows to issue
+    the all-reduce; BSHD callers that never invoke this function leave the
+    flag at ``False`` and pay zero collective cost.
+    """
+    global _seqlen_stats_in_iteration, _seqlen_stats_active
+    if cu_seqlens is None or cu_seqlens.numel() < 2:
+        return
+    # Pin the accumulator to the current CUDA device when available so the
+    # eventual all-reduce can use NCCL even if a caller passed a CPU tensor
+    # (e.g. unit tests). Production always supplies a CUDA tensor.
+    if _seqlen_stats_in_iteration is None:
+        device = (
+            torch.device(f'cuda:{torch.cuda.current_device()}')
+            if torch.cuda.is_available()
+            else cu_seqlens.device
+        )
+        _seqlen_stats_in_iteration = torch.zeros(2, dtype=torch.float64, device=device)
+    seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]).to(
+        device=_seqlen_stats_in_iteration.device, dtype=torch.float64
+    )
+    _seqlen_stats_in_iteration[0] += seqlens.sum()
+    _seqlen_stats_in_iteration[1] += (seqlens * seqlens).sum()
+    _seqlen_stats_active = True
+
+
+def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float]]:
+    """Read, reset and globally reduce the per-iteration packed-sequence stats.
+
+    Returns:
+        ``(total_real_tokens, seqlen_squared_sum)`` summed across the whole
+        global batch (all DP ranks combined) for packed (THD) iterations.
+        Both are ``None`` if no update happened this iteration -- the BSHD
+        path -- so the caller forwards them straight to
+        ``num_floating_point_operations`` and takes its closed-form
+        ``batch_size * seq_length`` / ``batch_size * seq_length ** 2`` defaults
+        without paying for a collective.
+
+        ``sum(L_i)`` and ``sum(L_i ** 2)`` are mathematically independent (you
+        cannot derive one from the other), so both must be tracked. Computing
+        them in tandem costs essentially nothing: the per-micro-batch updates
+        fuse onto one device tensor and consume issues a single 2-element
+        all-reduce.
+
+    Sync cost: exactly ONE all-reduce of a 2-element ``float64`` tensor and ONE
+    host sync (``tolist()``). Skipped entirely when the flag is ``False``.
+
+    All ranks within one DP group accumulated identical values (``cu_seqlens`` is
+    replicated across TP/CP/PP); the world all-reduce therefore overcounts by a
+    factor of ``TP * CP * PP``, which we divide out.
+    """
+    global _seqlen_stats_in_iteration, _seqlen_stats_active
+    if not _seqlen_stats_active:
+        # BSHD path: never allocated the tensor; tell the caller to use the
+        # closed-form defaults.
+        return None, None
+    t = _seqlen_stats_in_iteration
+    if torch.distributed.is_initialized() and mpu.model_parallel_is_initialized():
+        torch.distributed.all_reduce(t)
+        tp_size = max(mpu.get_tensor_model_parallel_world_size(), 1)
+        cp_size = max(mpu.get_context_parallel_world_size(), 1)
+        pp_size = max(mpu.get_pipeline_model_parallel_world_size(), 1)
+        dedup = tp_size * cp_size * pp_size
+    else:
+        # No model-parallel state -> treat as a single rank, no reduction.
+        # This is the standalone unit-test path; production always initializes mpu.
+        dedup = 1
+    # Single host sync drains both stats at once.
+    total_real_tokens, seqlen_squared_sum = t.tolist()
+    # Reset for the next iteration. Keep the tensor allocated so subsequent
+    # iterations reuse it without reallocating.
+    t.zero_()
+    _seqlen_stats_active = False
+    return total_real_tokens / dedup, seqlen_squared_sum / dedup
+
+
+def num_floating_point_operations(
+    args,
+    batch_size,
+    seqlen_squared_sum_in_batch=None,
+    total_real_tokens_in_batch=None,
+):
+    """Compute the number of floating-point operations for one global batch.
+
+    Args:
+        args: Megatron args (provides hidden size, num layers, seq length, ...).
+        batch_size: Global batch size (samples per iteration). Only used to
+            compute the default token counts for the BSHD path -- with THD
+            both ``total_real_tokens_in_batch`` and ``seqlen_squared_sum_in_batch``
+            are passed in explicitly and ``batch_size`` is irrelevant.
+        seqlen_squared_sum_in_batch: ``sum_i(L_i ** 2)`` across all REAL
+            (unpadded) sub-sequences in the global batch. Drives the
+            core-attention L^2 FLOPs. For BSHD this equals
+            ``batch_size * args.seq_length ** 2`` (the default when ``None``).
+            For THD it is the actual ragged sum and is strictly less than the
+            BSHD value, reflecting per-chunk causal masking AND the fact that
+            padding tokens do not contribute to attention scores.
+        total_real_tokens_in_batch: ``sum_i(L_i)``, the TOTAL REAL (unpadded)
+            token count across the global batch. Drives all token-linear FLOPs
+            (QKV+output projections, MLP, MoE, MTP norms/projs, logits). For
+            BSHD this equals ``batch_size * args.seq_length`` (the default when
+            ``None``). For THD it equals the real token count -- strictly less
+            than ``batch_size * args.seq_length`` whenever the dataloader added
+            CP-alignment padding or end-of-sequence padding, so neither kind of
+            padding shows up in the reported FLOPs.
+    """
+    # Defaults: BSHD layout assumption (full causal mask, every sample length =
+    # seq_length, no padding). For BSHD ``total_real_tokens = batch * s`` and
+    # ``seqlen_squared_sum = batch * s^2`` recover the original closed-form.
+    if seqlen_squared_sum_in_batch is None:
+        seqlen_squared_sum_in_batch = batch_size * args.seq_length * args.seq_length
+    if total_real_tokens_in_batch is None:
+        total_real_tokens_in_batch = batch_size * args.seq_length
+
+    def mlp_layer_flops(total_tokens, hidden_size, expansion=4.0, swiglu=False):
         """Calculate FLOPs for an MLP layer."""
         scale_factor = 3.0 / 2.0 if swiglu else 1.0
-        return 4 * expansion * scale_factor * batch_size * seq_len * hidden_size**2
+        return 4 * expansion * scale_factor * total_tokens * hidden_size**2
 
-    def moe_layer_flops(batch_size, seq_len, hidden_size, moe_ffn_hidden_size,
+    def moe_layer_flops(total_tokens, hidden_size, moe_ffn_hidden_size,
                         shared_expert_ffn_hidden_size, num_experts_routed_to,
                         moe_latent_size=None, swiglu=False):
         """Calculate FLOPs for an MoE layer."""
         scale_factor = 3.0 / 2.0 if swiglu else 1.0
         if moe_latent_size is None:
-            routed_flops = (4 * batch_size * seq_len * hidden_size *
+            routed_flops = (4 * total_tokens * hidden_size *
                             moe_ffn_hidden_size * num_experts_routed_to * scale_factor)
         else:
             # Routed experts run on moe_latent_size.
-            routed_flops = (4 * batch_size * seq_len * moe_latent_size *
+            routed_flops = (4 * total_tokens * moe_latent_size *
                             moe_ffn_hidden_size * num_experts_routed_to * scale_factor)
             # Up proj and down proj.
-            routed_flops += (4 * batch_size * seq_len * hidden_size * moe_latent_size)
-        shared_flops = 4 * batch_size * seq_len * hidden_size * shared_expert_ffn_hidden_size * scale_factor
+            routed_flops += (4 * total_tokens * hidden_size * moe_latent_size)
+        shared_flops = 4 * total_tokens * hidden_size * shared_expert_ffn_hidden_size * scale_factor
         return routed_flops + shared_flops
 
     def attn_layer_flops(
-        batch_size, seq_len, hidden_size, num_heads, gqa=True, gqa_groups=8, kv_channels=None
+        total_tokens, seqlen_squared_sum, hidden_size, num_heads, gqa=True,
+        gqa_groups=8, kv_channels=None,
     ):
-        """Calculate FLOPs for an attention layer."""
+        """Calculate FLOPs for an attention layer.
+
+        Two parts:
+          - Token-linear (QKV + output projections): scales with ``total_tokens``
+            (= ``sum_i(L_i)``). Padding tokens are excluded by passing the real
+            (unpadded) token count.
+          - Core attention (``QK^T`` and ``softmax(QK^T) V``): scales with
+            ``seqlen_squared_sum`` (= ``sum_i(L_i ** 2)``).
+        """
         p = (kv_channels * num_heads / hidden_size) if kv_channels else 1
         g = gqa_groups if gqa else num_heads
+        # 4 * total_tokens * h * p * (h + h*(g/n)): QKV + output projections (fwd*3, with FMA*2).
+        # 2 * sum(L^2) * h * p: core attention (causal mask -> /2 cancels with FMA *2).
         return (
-            4
-            * batch_size
-            * seq_len
-            * hidden_size
-            * p
-            * (hidden_size + (hidden_size * (g / num_heads)) + (seq_len / 2))
+            4 * total_tokens * hidden_size * p
+            * (hidden_size + hidden_size * (g / num_heads))
+            + 2 * seqlen_squared_sum * hidden_size * p
         )
 
-    def mamba_layer_flops(batch_size, seq_len, hidden_size, state_dim=16,
+    def mamba_layer_flops(total_tokens, hidden_size, state_dim=16,
                           head_dim=64, num_groups=1, num_heads=128):
         """Calculate FLOPs for a Mamba layer."""
         # Note (rwaleffe): flops estimate for scan should be updated based on new SSD kernels,
@@ -342,16 +504,15 @@ def num_floating_point_operations(args, batch_size):
         return (
             (
                 2
-                * batch_size
-                * seq_len
+                * total_tokens
                 * hidden_size
                 * (2 * d_in + 2 * num_groups * state_dim + nheads)
             )  # in_proj
-            + (7 * batch_size * seq_len * d_in * state_dim)  # scan
-            + (2 * batch_size * seq_len * d_in * hidden_size)  # out_proj
+            + (7 * total_tokens * d_in * state_dim)  # scan
+            + (2 * total_tokens * d_in * hidden_size)  # out_proj
         )
 
-    def gdn_layer_flops(batch_size, seq_len, hidden_size,
+    def gdn_layer_flops(total_tokens, hidden_size,
                         qk_head_dim=128, v_head_dim=128,
                         num_qk_heads=16, num_v_heads=32,
                         conv_kernel_dim=4):
@@ -359,7 +520,7 @@ def num_floating_point_operations(args, batch_size):
         qk_dim = qk_head_dim * num_qk_heads
         v_dim = v_head_dim * num_v_heads
         return (
-            2 * batch_size * seq_len * (
+            2 * total_tokens * (
                 # in_proj: hidden_size -> (2*qk_dim + 2*v_dim + 2*num_v_heads)
                 hidden_size * (2 * qk_dim + 2 * v_dim + 2 * num_v_heads)
                 # conv1d
@@ -371,7 +532,7 @@ def num_floating_point_operations(args, batch_size):
             )
         )
 
-    def hybrid_flops(batch_size, seq_len, hidden_size,
+    def hybrid_flops(total_tokens, seqlen_squared_sum, hidden_size,
                      num_attn_layers, num_mamba_layers, num_mlp_layers, num_moe_layers,
                      num_gdn_layers=0,
                      mamba_state_dim=128, mamba_head_dim=64,
@@ -387,21 +548,22 @@ def num_floating_point_operations(args, batch_size):
                      vocab_size=256000, mtp_num_layers=0):
         """Calculate total FLOPs for the hybrid model."""
         flops_fwd = (
-                num_attn_layers * attn_layer_flops(batch_size, seq_len, hidden_size,
-                                                   num_attn_heads, gqa, gqa_groups, kv_channels) +
-                num_mlp_layers * mlp_layer_flops(batch_size, seq_len, hidden_size,
+                num_attn_layers * attn_layer_flops(total_tokens, seqlen_squared_sum,
+                                                   hidden_size, num_attn_heads, gqa,
+                                                   gqa_groups, kv_channels) +
+                num_mlp_layers * mlp_layer_flops(total_tokens, hidden_size,
                                                  mlp_expansion, swiglu) +
-                num_mamba_layers * mamba_layer_flops(batch_size, seq_len, hidden_size,
+                num_mamba_layers * mamba_layer_flops(total_tokens, hidden_size,
                                                      mamba_state_dim, mamba_head_dim,
                                                      mamba_num_groups, mamba_num_heads) +
-                num_moe_layers * moe_layer_flops(batch_size, seq_len, hidden_size, moe_ffn_hidden_size,
+                num_moe_layers * moe_layer_flops(total_tokens, hidden_size, moe_ffn_hidden_size,
                                                  shared_expert_ffn_hidden_size, num_experts_routed_to,
                                                  moe_latent_size, swiglu) +
-                num_gdn_layers * gdn_layer_flops(batch_size, seq_len, hidden_size,
+                num_gdn_layers * gdn_layer_flops(total_tokens, hidden_size,
                                                   gdn_qk_head_dim, gdn_v_head_dim,
                                                   gdn_num_qk_heads, gdn_num_v_heads,
                                                   gdn_conv_kernel_dim) +
-                (2 * batch_size * seq_len * hidden_size * vocab_size * (1 + mtp_num_layers))  # logits computation
+                (2 * total_tokens * hidden_size * vocab_size * (1 + mtp_num_layers))  # logits computation
         )
         return flops_fwd * 3
 
@@ -468,6 +630,13 @@ def num_floating_point_operations(args, batch_size):
         # - 2x (SwiGLU disabled): h->ffn_h GEMM and ffn_h->h GEMM are stacked.
         ffn_expansion_factor = 3 if args.swiglu else 2
 
+        # self_attn is split into a token-linear part (projections, multiplied by
+        # ``batch_size * args.seq_length`` like all other token-linear work) and a
+        # core-attention part (``QK^T`` and ``softmax(QK^T) V``) whose compute scales
+        # with ``sum_i(L_i ** 2)`` instead of ``batch * seq^2``. With unpacked BSHD the
+        # two are equal, so the BSHD result is unchanged. With THD/packed sequences
+        # ``seqlen_squared_sum_in_batch`` is strictly smaller, reflecting the per-chunk
+        # causal mask of packed attention.
         if args.multi_latent_attention:
             assert not args.group_query_attention
             '''
@@ -496,6 +665,7 @@ def num_floating_point_operations(args, batch_size):
                     + args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim)
                     + 1
                 )
+            # Token-linear part of MLA self-attention (lora projs, kv proj, RoPE, output proj).
             standard_self_attn_term = (
                 forward_backward_expansion_factor
                 * fma_expansion_factor
@@ -512,11 +682,18 @@ def num_floating_point_operations(args, batch_size):
                     + args.hidden_size * args.qk_pos_emb_head_dim
                     ## o proj
                     + (args.num_attention_heads * args.v_head_dim) * args.hidden_size
-                    ## core attn
-                    + args.seq_length
-                    * (args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim))
-                    / 2  # causal mask (only half of the mask is non-zero)
-                    + args.seq_length * args.num_attention_heads * args.v_head_dim / 2
+                )
+            )
+            # Core-attention (L^2) part: ``QK^T`` and ``(softmax(QK^T)) V``. The
+            # ``/2`` accounts for the causal mask and the ``*2`` cancels it via FMA.
+            standard_self_attn_core_term = (
+                forward_backward_expansion_factor
+                * fma_expansion_factor
+                * (
+                    args.num_attention_heads
+                    * (args.qk_head_dim + args.qk_pos_emb_head_dim)
+                    / 2
+                    + args.num_attention_heads * args.v_head_dim / 2
                 )
             )
 
@@ -526,6 +703,7 @@ def num_floating_point_operations(args, batch_size):
             key_projection_size = args.kv_channels * args.num_query_groups
             value_projection_size = args.kv_channels * args.num_query_groups
             gate_projection_size = query_projection_size if args.attention_output_gate else 0
+            # Token-linear part of self-attention (QKV projection + output projection).
             standard_self_attn_term = (
                 forward_backward_expansion_factor
                 * fma_expansion_factor
@@ -538,15 +716,18 @@ def num_floating_point_operations(args, batch_size):
                         + value_projection_size
                         + gate_projection_size
                     )
-                    ## core attention
-                    + query_projection_size
-                    * args.seq_length
-                    / 2  # causal mask (only half of the mask is non-zero)
-                    * 2  # QK^T and (QK^T)V
                     ## out proj
                     + query_projection_size
                     * args.hidden_size
                 )
+            )
+            # Core-attention (L^2) part: ``QK^T`` and ``(softmax(QK^T)) V``.
+            standard_self_attn_core_term = (
+                forward_backward_expansion_factor
+                * fma_expansion_factor
+                * query_projection_size
+                / 2  # causal mask (only half of the mask is non-zero)
+                * 2  # QK^T and (QK^T)V
             )
 
         if is_linear_attention_variant(args.experimental_attention_variant):
@@ -616,14 +797,19 @@ def num_floating_point_operations(args, batch_size):
             linear_self_attn_term = 0
             num_standard_attention_layers = num_layers
 
+        # Token-linear self-attention work (projections + linear-attention variants).
+        # Linear attention has no L^2 term, so it stays entirely token-linear.
         self_attn_term = (
             linear_self_attn_term * num_linear_attention_layers
             + standard_self_attn_term * num_standard_attention_layers
         )
+        # Core attention (L^2) FLOPs per standard-attention layer.
+        self_attn_core_term = standard_self_attn_core_term * num_standard_attention_layers
 
+        # Token-linear FLOPs scale with the real (unpadded) token count.
+        # For BSHD this falls back to ``batch_size * seq_length`` (no padding).
         total_floating_point_operations = (
-            batch_size
-            * args.seq_length
+            total_real_tokens_in_batch
             * (
                 # MLP
                 forward_backward_expansion_factor
@@ -653,7 +839,7 @@ def num_floating_point_operations(args, batch_size):
                     + (shared_expert_ffn_hidden_size * ffn_expansion_factor)
                     * num_moe_layers
                 )
-                # Self Attention
+                # Self Attention (token-linear part).
                 + self_attn_term
                 # MTP norms and proj
                 + forward_backward_expansion_factor
@@ -672,6 +858,11 @@ def num_floating_point_operations(args, batch_size):
                 * args.padded_vocab_size
                 * (mtp_num_layers + 1)  # MTP + final logit
             )
+            # Self Attention (core L^2 part). For BSHD the default
+            # ``seqlen_squared_sum_in_batch = batch_size * seq_length^2`` recovers the
+            # original ``batch * seq^2 * Q_proj`` term; for THD this uses the actual
+            # ragged ``sum(L_i^2)`` and so undercounts the BSHD figure correctly.
+            + seqlen_squared_sum_in_batch * self_attn_core_term
         )
         return total_floating_point_operations
 
@@ -680,7 +871,10 @@ def num_floating_point_operations(args, batch_size):
         # Calculate the number of each type of layer.
         from operator import itemgetter
 
-        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, get_hybrid_layer_counts
+        from megatron.core.models.hybrid.hybrid_layer_allocation import (
+            Symbols,
+            get_hybrid_layer_counts,
+        )
         num_mamba_layers, num_gdn_layers, num_attn_layers, num_mlp_layers, num_moe_layers = (
             itemgetter(Symbols.MAMBA, Symbols.GDN, Symbols.ATTENTION, Symbols.MLP, Symbols.MOE)(
                 get_hybrid_layer_counts(args.hybrid_layer_pattern)
@@ -692,8 +886,8 @@ def num_floating_point_operations(args, batch_size):
             mtp_num_layers = 0
         # Compute hybrid model FLOPs.
         return hybrid_flops(
-            batch_size=batch_size,
-            seq_len=args.seq_length,
+            total_tokens=total_real_tokens_in_batch,
+            seqlen_squared_sum=seqlen_squared_sum_in_batch,
             hidden_size=args.hidden_size,
             num_attn_layers=num_attn_layers,
             num_mamba_layers=num_mamba_layers,
@@ -843,7 +1037,7 @@ def pretrain(
     get_position_embedding_ranks=None,
     non_loss_data_func=None,
     store=None,
-    inprocess_call_wrapper: Optional[CallWrapper] = None,
+    inprocess_call_wrapper: Optional[Any] = None,
 ):
     """Main training program.
 
@@ -915,14 +1109,12 @@ def pretrain(
     timers = get_timers()
 
     if args.fine_grained_activation_offloading:
-        from megatron.core.pipeline_parallel.utils import (
-            set_ideal_affinity_for_current_gpu
-        )
+        from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
         set_ideal_affinity_for_current_gpu()
 
 
     if cfg_container.logger.log_progress:
-        append_to_progress_log("Starting job")
+        append_to_progress_log(args.save, "Starting job")
 
     # Set pytorch JIT layer fusion options and warmup JIT functions.
     set_jit_fusion_options()
@@ -1007,8 +1199,8 @@ def pretrain(
                 LocalCheckpointManager,
             )
             from nvidia_resiliency_ext.checkpointing.local.replication.group_utils import (
-                parse_group_sequence,
                 GroupWrapper,
+                parse_group_sequence,
             )
             from nvidia_resiliency_ext.checkpointing.local.replication.strategies import (
                 CliqueReplicationStrategy,
@@ -1314,6 +1506,119 @@ def update_train_iters(args):
     print_rank_0(f'setting training iterations to {args.train_iters}')
 
 
+def wrap_model_chunks_with_ddp(
+    model_chunks,
+    config,
+    ddp_config,
+    *,
+    use_layer_wise_distributed_optimizer=False,
+    use_layer_wise_param_layout=True,
+    DP=DDP,
+    pg_collection=None,
+    bucket_sizes=None,
+    disable_bucketing_per_chunk=None,
+):
+    """Wrap each model chunk in DDP, pre-computing per-chunk param layouts as needed.
+
+    Centralises the DDP-wrapping wiring shared between :func:`get_model` and
+    unit tests.
+
+    For ``use_layer_wise_distributed_optimizer=True`` and ``use_layer_wise_param_layout=True``:
+    forces ``ddp_config.use_distributed_optimizer=True`` (mutated in place; needed
+    for reduce-scatter), and computes per-chunk shard-aligned layouts via
+    :meth:`LayerWiseDistributedOptimizer.compute_full_param_layout`. With
+    ``use_layer_wise_param_layout=False``, no layout is supplied and LayerWise falls back
+    to its legacy ``allgather_params`` sync path.
+
+    For non-layerwise with ``ddp_config.use_distributed_optimizer=True``:
+    computes per-chunk byte-level layouts via
+    :meth:`DistributedOptimizer.compute_full_param_layout`.
+
+    Otherwise: no layouts are computed.
+
+    Layouts are only computed when ``DP is DDP`` (i.e. the standard
+    ``DistributedDataParallel``); FSDP variants don't accept
+    ``full_param_layout``.
+
+    Args:
+        model_chunks: List of model chunks to wrap (un-DDP-wrapped).
+        config: :class:`TransformerConfig`.
+        ddp_config: :class:`DistributedDataParallelConfig`. Mutated in place when
+            ``use_layer_wise_distributed_optimizer=True`` and ``use_layer_wise_param_layout=True``.
+        use_layer_wise_distributed_optimizer: Whether the layerwise wiring runs.
+        use_layer_wise_param_layout: When ``use_layer_wise_distributed_optimizer=True``,
+            controls whether to compute and supply a shard-aligned param layout
+            to DDP. ``False`` keeps LayerWise on its legacy sync path.
+        DP: The DDP class to construct (``DistributedDataParallel`` or an FSDP
+            variant).
+        pg_collection: Optional :class:`ProcessGroupCollection`. Forwarded to
+            FSDP-style DPs only.
+        bucket_sizes: Optional per-chunk bucket size override; defaults to
+            ``[ddp_config.bucket_size] * len(model_chunks)``.
+        disable_bucketing_per_chunk: Optional per-chunk disable_bucketing flag;
+            defaults to ``[False] * len(model_chunks)``.
+
+    Returns:
+        List of DDP-wrapped chunks.
+    """
+    n = len(model_chunks)
+    if bucket_sizes is None:
+        bucket_sizes = [ddp_config.bucket_size] * n
+    if disable_bucketing_per_chunk is None:
+        disable_bucketing_per_chunk = [False] * n
+
+    # Compute per-chunk layouts (DDP only).
+    per_chunk_layouts = [None] * n
+    if DP is DDP:
+        if use_layer_wise_distributed_optimizer and use_layer_wise_param_layout:
+            ddp_config.use_distributed_optimizer = True
+            compute_layout = LayerWiseDistributedOptimizer.compute_full_param_layout
+            # Tag params so DDP buffer grouping routes LayerWise-managed matrices
+            # (Muon's Newton-Schulz domain) to a shard-aligned buffer and routes
+            # everything else (embeddings, biases, layernorm) to a separate
+            # DistOpt-style buffer.
+            tag_params_for_buffer_routing(model_chunks)
+        elif not use_layer_wise_distributed_optimizer and ddp_config.use_distributed_optimizer:
+            compute_layout = DistributedOptimizer.compute_full_param_layout
+        else:
+            compute_layout = None
+        if compute_layout is not None:
+            data_parallel_world_size = mpu.get_data_parallel_world_size(
+                with_context_parallel=True
+            )
+            expert_data_parallel_world_size = mpu.get_expert_data_parallel_world_size()
+            for i, (chunk, bucket_size) in enumerate(zip(model_chunks, bucket_sizes)):
+                all_params = [p for p in chunk.parameters() if p.requires_grad]
+                per_chunk_layouts[i] = compute_layout(
+                    all_params,
+                    bucket_size,
+                    data_parallel_world_size,
+                    ddp_config,
+                    expert_data_parallel_world_size=expert_data_parallel_world_size,
+                )
+
+    # Wrap each chunk.
+    wrapped = []
+    for chunk, layout, disable_bucketing in zip(
+        model_chunks, per_chunk_layouts, disable_bucketing_per_chunk
+    ):
+        chunk_kwargs = {}
+        if pg_collection is not None and DP is not DDP:
+            chunk_kwargs["pg_collection"] = pg_collection
+        if layout is not None:
+            chunk_kwargs["full_param_layout"] = layout
+        wrapped.append(
+            DP(
+                config=config,
+                ddp_config=ddp_config,
+                module=chunk,
+                disable_bucketing=disable_bucketing,
+                **chunk_kwargs,
+            )
+        )
+    return wrapped
+
+
 def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, config=None, pg_collection=None):
     """Build the model."""
     args = get_args()
@@ -1336,6 +1641,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     if has_nvidia_modelopt:
         from megatron.post_training.checkpointing import has_modelopt_state
+
         # [ModelOpt]: Check if the checkpoint is a ModelOpt checkpoint and
         # set a flag to use our model provider if so.
         if args.load is not None and has_modelopt_state(args.load):
@@ -1453,22 +1759,10 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
         config = get_model_config(model[0])
 
-        if getattr(args, "use_torch_fsdp2", False):
-            reshard_after_forward = getattr(args, "torch_fsdp2_reshard_after_forward", True)
-            ddp_config = TorchFullyShardedDataParallelConfig(reshard_after_forward=reshard_after_forward)
-        else:
-            if args.ddp_num_buckets is not None:
-                assert args.ddp_bucket_size is None, \
-                    "Cannot specify both --ddp-num-buckets and --ddp-bucket-size"
-                assert args.ddp_num_buckets > 0, \
-                    "--ddp-num-buckets must be greater than 0"
-                bucket_size = num_parameters // args.ddp_num_buckets
-            else:
-                bucket_size = args.ddp_bucket_size
-
-            # Initialize DDPConfig.
-            ddp_config = get_megatron_ddp_config(args)
-            ddp_config.bucket_size = bucket_size
+        ddp_config = get_megatron_ddp_config(args)
+        if not getattr(args, "use_torch_fsdp2", False):
+            if ddp_config.num_buckets is not None:
+                ddp_config.bucket_size = num_parameters // ddp_config.num_buckets
 
             # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
             # If bucket_size is not provided as an input, use sane default.
@@ -1483,6 +1777,19 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             if not ddp_config.overlap_grad_reduce:
                 ddp_config.bucket_size = None
 
+        # Compute per-chunk bucket sizes / disable_bucketing flags. Bucketing is
+        # disabled for non-first chunks, when overlap_param_gather_with_optimizer_step
+        # is on, or for non-zero pipeline-parallel ranks.
+        pp_rank = mpu.get_pipeline_model_parallel_rank()
+        per_chunk_disable_bucketing = [
+            (chunk_idx > 0) or args.overlap_param_gather_with_optimizer_step
+            for chunk_idx in range(len(model))
+        ]
+        per_chunk_bucket_sizes = [
+            None if (disable or pp_rank > 0) else ddp_config.bucket_size
+            for disable in per_chunk_disable_bucketing
+        ]
+
         # Setup stream for ddp initialization. The side-stream may be necessary for cuda graph
         #  capture support with DDP, but we sync it with the current stream to avoid races.
         ddp_stream = torch.cuda.Stream()
@@ -1490,53 +1797,21 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         ddp_stream.wait_stream(torch.cuda.current_stream())
         # Make ddp_stream start after whatever the default stream already queued
         with torch.cuda.stream(ddp_stream):
-            # Megatron-FSDP reads dtypes from ddp_config; pass pg_collection for AG/RS overlap.
-            dp_init_kwargs = {}
-            if args.use_megatron_fsdp:
-                dp_init_kwargs["pg_collection"] = pg_collection
-
-            wrapped_model = []
-            for model_chunk_idx, model_chunk in enumerate(model):
-                chunk_kwargs = dict(dp_init_kwargs)
-                disable_bucketing = (
-                    (model_chunk_idx > 0)
-                    or args.overlap_param_gather_with_optimizer_step
-                )
-
-                # Pre-compute parameter layouts for the distributed optimizer.
-                # Only pass to DDP; FSDP variants don't accept full_param_layout.
-                if args.use_distributed_optimizer and DP is DDP:
-                    all_params = [
-                        p for p in model_chunk.parameters() if p.requires_grad
-                    ]
-                    pp_rank = mpu.get_pipeline_model_parallel_rank()
-                    effective_bucket_size = (
-                        None
-                        if disable_bucketing or pp_rank > 0
-                        else ddp_config.bucket_size
-                    )
-                    chunk_kwargs["full_param_layout"] = (
-                        DistributedOptimizer.compute_full_param_layout(
-                            all_params,
-                            effective_bucket_size,
-                            mpu.get_data_parallel_world_size(with_context_parallel=True),
-                            ddp_config,
-                            expert_data_parallel_world_size=(
-                                mpu.get_expert_data_parallel_world_size()
-                            ),
-                        )
-                    )
-
-                wrapped_model.append(
-                    DP(
-                        config=config,
-                        ddp_config=ddp_config,
-                        module=model_chunk,
-                        disable_bucketing=disable_bucketing,
-                        **chunk_kwargs,
-                    )
-                )
-            model = wrapped_model
+            model = wrap_model_chunks_with_ddp(
+                model,
+                config,
+                ddp_config,
+                use_layer_wise_distributed_optimizer=getattr(
+                    args, 'use_layer_wise_distributed_optimizer', False
+                ),
+                use_layer_wise_param_layout=getattr(
+                    args, 'use_layer_wise_param_layout', True
+                ),
+                DP=DP,
+                pg_collection=pg_collection if args.use_megatron_fsdp else None,
+                bucket_sizes=per_chunk_bucket_sizes,
+                disable_bucketing_per_chunk=per_chunk_disable_bucketing,
+            )
         # End of setup_stream
         # Critical: ensure side-stream work completes before touching params on default stream
         torch.cuda.current_stream().wait_stream(ddp_stream)
@@ -1623,25 +1898,41 @@ def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
 def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallelConfig:
     """Return an MCore DDPConfig from the argparse arguments."""
 
-    kwargs = {}
-    for f in dataclasses.fields(DistributedDataParallelConfig):
-        if hasattr(args, f.name):
-            kwargs[f.name] = getattr(args, f.name)
-    kwargs["grad_reduce_in_fp32"] = args.accumulate_allreduce_grads_in_fp32
-    kwargs["check_for_nan_in_grad"] = args.check_for_nan_in_loss_and_grad
-    kwargs["check_for_large_grads"] = args.check_for_large_grads
-    kwargs["pad_buckets_for_high_nccl_busbw"] = args.ddp_pad_buckets_for_high_nccl_busbw
-    kwargs["reduce_scatter_with_fp32_accumulation"] = args.ddp_reduce_scatter_with_fp32_accumulation
-    kwargs["param_name_patterns_for_fp32_local_accumulation"] = \
-        tuple(args.ddp_param_name_patterns_for_fp32_local_accumulation)
-    kwargs["average_in_collective"] = args.ddp_average_in_collective
-    # Megatron-FSDP arguments.
-    kwargs["megatron_fsdp_main_params_dtype"] = args.megatron_fsdp_main_params_dtype
-    kwargs["megatron_fsdp_main_grads_dtype"] = args.megatron_fsdp_main_grads_dtype
-    kwargs["megatron_fsdp_grad_comm_dtype"] = args.megatron_fsdp_grad_comm_dtype
-    kwargs["megatron_fsdp_use_decoupled_grad"] = args.use_precision_aware_optimizer
+    if getattr(args, "use_torch_fsdp2", False):
+        reshard_after_forward = getattr(args, "torch_fsdp2_reshard_after_forward", True)
+        return TorchFullyShardedDataParallelConfig(reshard_after_forward=reshard_after_forward)
+    else:
+        kwargs = {}
+        for f in dataclasses.fields(DistributedDataParallelConfig):
+            if hasattr(args, f.name):
+                kwargs[f.name] = getattr(args, f.name)
+        kwargs["grad_reduce_in_fp32"] = args.accumulate_allreduce_grads_in_fp32
+        kwargs["check_for_nan_in_grad"] = args.check_for_nan_in_loss_and_grad
+        kwargs["check_for_large_grads"] = args.check_for_large_grads
+        kwargs["num_buckets"] = args.ddp_num_buckets
+        kwargs["bucket_size"] = args.ddp_bucket_size
+        kwargs["pad_buckets_for_high_nccl_busbw"] = args.ddp_pad_buckets_for_high_nccl_busbw
+        kwargs["reduce_scatter_with_fp32_accumulation"] = args.ddp_reduce_scatter_with_fp32_accumulation
+        kwargs["param_name_patterns_for_fp32_local_accumulation"] = \
+            tuple(args.ddp_param_name_patterns_for_fp32_local_accumulation)
+        kwargs["average_in_collective"] = args.ddp_average_in_collective
+        # Megatron-FSDP arguments.
+        kwargs["megatron_fsdp_main_params_dtype"] = args.megatron_fsdp_main_params_dtype
+        kwargs["megatron_fsdp_main_grads_dtype"] = args.megatron_fsdp_main_grads_dtype
+        kwargs["megatron_fsdp_grad_comm_dtype"] = args.megatron_fsdp_grad_comm_dtype
+        kwargs["megatron_fsdp_use_decoupled_grad"] = args.use_precision_aware_optimizer
+        if args.use_megatron_fsdp and args.cuda_graph_impl != "none":
+            # Run Megatron-FSDP in CUDA graph-safe mode. Avoids some graph-unsafe host-side
+            # operations (such as pointer dereferencing) that can break CUDA graph replay.
+            kwargs["megatron_fsdp_cuda_graph_mode"] = True
+            if args.cuda_graph_impl == "full_iteration":
+                # When using full-iteration CUDA graphs, Megatron-FSDP should not AG parameters
+                # during start_param_sync(), which is called during the DistOpt.step(). This
+                # causes an error when we wait() on a CUDA kernel launched in a stream beyond
+                # the scope of the full-iter / FWD-BWD CUDA graph capture.
+                kwargs["fsdp_all_gather_in_start_param_sync"] = False
 
-    return DistributedDataParallelConfig(**kwargs)
+        return DistributedDataParallelConfig(**kwargs)
 
 
 def setup_model_and_optimizer(
@@ -1823,13 +2114,49 @@ def setup_model_and_optimizer(
 
 def dummy_train_step(data_iterator):
     """Single dummy training step."""
+    args = get_args()
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+    is_sft = getattr(args, 'sft', False)
+    is_hybrid_cp = args.hybrid_context_parallel
+
+    BATCH_KEYS = [
+        "tokens", "labels", "loss_mask", "position_ids", "attention_mask",
+        "cu_seqlens", "cu_seqlens_padded", "max_seqlen", "local_cp_size",
+        "hybrid_cp_group",
+    ]
+
     num_microbatches = get_num_microbatches()
     rerun_state_machine = get_rerun_state_machine()
     while rerun_state_machine.should_run_forward_backward(data_iterator):
         for _ in range(num_microbatches):
             # Re-use methods used in get_batch() from pretrain_{gpt, mamba}.py.
-            batch = get_batch_on_this_tp_rank(data_iterator)
-            batch = get_batch_on_this_cp_rank(batch)
+            batch = {}
+            if tp_rank == 0:
+                batch = next(data_iterator)
+                for key in BATCH_KEYS:
+                    batch[key] = batch[key].cuda(non_blocking=True) if key in batch and batch[key] is not None else None
+            batch = get_batch_on_this_tp_rank(
+                batch,
+                broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(),
+                broadcast_group=mpu.get_tensor_model_parallel_group(),
+                is_sft=is_sft,
+                is_hybrid_cp=is_hybrid_cp,
+                create_attention_mask_in_dataloader=args.create_attention_mask_in_dataloader,
+                cp_size=args.context_parallel_size,
+                tp_rank=tp_rank,
+                micro_batch_size=args.micro_batch_size,
+                seq_length=args.seq_length,
+                mtp_on_this_rank=False,
+                pipeline_model_parallel_size=args.pipeline_model_parallel_size,
+                is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
+                is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
+            )
+            batch = get_batch_on_this_cp_rank(
+                batch,
+                is_hybrid_cp=is_hybrid_cp,
+                cp_group=get_context_parallel_group(),
+                hybrid_cp_group_func=get_hybrid_data_context_parallel_groups,
+            )
 
 
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None):
@@ -1876,10 +2203,16 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         # 1. The first iteration's params are already in param.data (from init or checkpoint).
         # 2. Without forward_pre_hook, finish_param_sync() won't be called to zero the grad buffer,
         #    so the main grads will be polluted by the main params.
+        #
+        # Exception: when a full-iteration CUDA graph has been captured, the all-gather
+        # and subsequent param_data zero are baked into the graph and replay
+        # unconditionally. We must populate param_data so the replayed AG gathers
+        # correct weights, even when forward pre-hooks are disabled.
         if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
             # Check if forward_pre_hook is enabled by checking if hooks are registered.
             forward_pre_hook_enabled = len(model[0].remove_forward_pre_hook_handles) > 0
-            if forward_pre_hook_enabled:
+            full_cg_captured = FullCudaGraphWrapper.cuda_graph.get("training") is not None
+            if forward_pre_hook_enabled or full_cg_captured:
                 for optim_instance in optimizer.chained_optimizers:
                     if isinstance(optim_instance, DistributedOptimizer):
                         optim_instance._copy_main_params_to_param_buffer()
@@ -2039,6 +2372,8 @@ def training_log(
     max_attention_logit,
     pg_collection=None,
     is_first_iteration=False,
+    seqlen_squared_sum_in_batch: float | None = None,
+    total_real_tokens_in_batch: float | None = None,
 ):
     """Log training information such as losses, timing, ...."""
     args = get_args()
@@ -2200,8 +2535,8 @@ def training_log(
             writer.add_scalar('max_attention_logit', max_attention_logit, iteration)
             if wandb_writer:
                 wandb_writer.log({'max_attention_logit': max_attention_logit}, iteration)
-
     # Log MoE metrics.
+    moe_log_string = ""
     if args.num_experts is not None:
         moe_loss_scale = 1 / get_num_microbatches()
         track_names = []
@@ -2217,19 +2552,19 @@ def training_log(
         if is_hybrid_model(args):
             from operator import itemgetter
 
-            from megatron.core.models.hybrid.hybrid_layer_allocation import (
-                Symbols, get_hybrid_layer_counts,
+            from megatron.core.ssm.mamba_hybrid_layer_allocation import (
+                Symbols,
+                get_hybrid_layer_counts,
             )
             layers = itemgetter(Symbols.MOE)(get_hybrid_layer_counts(args.hybrid_layer_pattern))
         else:
             layers = args.num_layers
 
-        track_moe_metrics(
+        moe_log_string = get_moe_metrics_tracker().report(
             loss_scale=moe_loss_scale,
             iteration=iteration,
             writer=writer,
             wandb_writer=wandb_writer,
-            total_loss_dict=total_loss_dict,
             per_layer_logging=args.moe_per_layer_logging,
             force_initialize=True,
             track_names=track_names,
@@ -2237,6 +2572,7 @@ def training_log(
             moe_layer_freq=args.moe_layer_freq,
             mtp_num_layers=args.mtp_num_layers,
             pg_collection=pg_collection,
+            total_loss_dict=total_loss_dict,
         )
 
     # Log MTP metrics.
@@ -2269,7 +2605,12 @@ def training_log(
         elapsed_time = timers('interval-time').elapsed(barrier=True, reset=should_reset)
         elapsed_time_per_iteration = elapsed_time / total_iterations
 
-        throughput = num_floating_point_operations(args, batch_size) / (
+        throughput = num_floating_point_operations(
+            args,
+            batch_size,
+            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+            total_real_tokens_in_batch=total_real_tokens_in_batch,
+        ) / (
             elapsed_time_per_iteration * 10**12 * args.world_size
         )
 
@@ -2324,6 +2665,8 @@ def training_log(
                     log_string += ' {}: {:.6E} |'.format(key, avg)
                 if should_reset:
                     total_loss_dict[key] = torch.tensor([0.0], dtype=torch.float, device='cuda')
+        if args.num_experts is not None and moe_log_string:
+            log_string += moe_log_string
         log_string += f' loss scale: {loss_scale:.1f} |'
         if grad_norm is not None:
             log_string += f' grad norm: {grad_norm:.3f} |'
@@ -2397,6 +2740,7 @@ def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point
     tokens_so_far = args.consumed_train_samples * args.seq_length
     saved_ckpt_prefix = 'Saving async checkpoint' if args.async_save else 'Saved checkpoint'
     append_to_progress_log(
+        args.save,
         f"{saved_ckpt_prefix}\tIteration: {iteration}\t"
         f"Job throughput: {job_throughput:.1f} TFLOP/s/GPU\t"
         f"Cumulative throughput: {cumulative_throughput:.1f} TFLOP/s/GPU\t"
@@ -2513,6 +2857,22 @@ def save_checkpoint_and_time(
     timers('interval-time', log_level=0).start(barrier=True)
 
 
+def _run_gpu_sniff_test(tag):
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.training.gpu_sniff_test import run_gpu_sniff_test
+
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+        required_pgs=['ep', 'dp', 'tp'],
+    )
+    print_datetime(f'running GPU sniff test ({tag})')
+    timers = get_timers()
+    timers('gpu-sniff-test', log_level=0).start(barrier=True)
+    run_gpu_sniff_test(tag, pg_collection=pg_collection)
+    timers('gpu-sniff-test').stop(barrier=True)
+    timers.log(['gpu-sniff-test'])
+    print_datetime(f'finished GPU sniff test ({tag})')
+
+
 def post_training_step_callbacks(
     model,
     optimizer,
@@ -2573,6 +2933,13 @@ def post_training_step_callbacks(
             torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStop())
             if nsys_nvtx_context is not None:
                 nsys_nvtx_context.__exit__(None, None, None)
+
+    # GPU sniff test.
+    if (
+        args.gpu_sniff_test_interval is not None
+        and iteration % args.gpu_sniff_test_interval == 0
+    ):
+        _run_gpu_sniff_test(f'iteration {iteration:7d}')
 
     # Manual garbage collection.
     if args.manual_gc:
@@ -2711,6 +3078,28 @@ def train(
     """Training function: run train_step desired number of times, run validation, checkpoint."""
     args = get_args()
     timers = get_timers()
+    fault_injector_kwargs = {}
+    for f in dataclasses.fields(FaultInjectorConfig):
+        if hasattr(args, f.name):
+            fault_injector_kwargs[f.name] = getattr(args, f.name)
+    fault_injector_config = FaultInjectorConfig(**fault_injector_kwargs)
+
+    _maybe_raise_workload_exception = None
+    if (
+        fault_injector_config.fault_injector_ranks is not None
+        or fault_injector_config.fault_injector_num_ranks is not None
+    ):
+        from megatron.core.fault_injector import (
+            maybe_raise_workload_exception as _maybe_raise_workload_exception,
+        )
+        from megatron.core.fault_injector import (
+            setup_fault_injection,
+            should_setup_fault_injection_at_iteration,
+            should_setup_fault_injection_at_start,
+        )
+
+        if should_setup_fault_injection_at_start(fault_injector_config):
+            setup_fault_injection(fault_injector_config)
 
     if args.perform_rl_step:
         assert has_rl_utils, "RL cannot run without the megatron.rl package"
@@ -2763,8 +3152,9 @@ def train(
         print_rank_0("> Reinitializing microbatch calculator for GRPO training...")
         from megatron.core.num_microbatches_calculator import (
             destroy_num_microbatches_calculator,
-            init_num_microbatches_calculator
+            init_num_microbatches_calculator,
         )
+
         # First destroy the existing calculator
         destroy_num_microbatches_calculator()
         # Then initialize with the correct perform_rl_step=True context
@@ -2787,8 +3177,9 @@ def train(
 
     if args.run_workload_inspector_server:
         try:
-            from workload_inspector.utils.webserver import run_server
             import threading
+
+            from workload_inspector.utils.webserver import run_server
 
             threading.Thread(
                 target=run_server, daemon=True, args=(torch.distributed.get_rank(),)
@@ -2859,6 +3250,11 @@ def train(
 
     timers('interval-time', log_level=0).start(barrier=True)
     print_datetime('before the start of training step')
+
+    # GPU sniff test at start of training.
+    if args.gpu_sniff_test_interval is not None:
+        _run_gpu_sniff_test('before training')
+
     report_memory_flag = True
     pre_hook_enabled = False
     should_exit = False
@@ -2894,10 +3290,28 @@ def train(
     eval_iterations = 0
     # Wrap forward_backward_func for Full iteration CUDA graph
     forward_backward_func = get_forward_backward_func()
-    if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
-        forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
+    if args.cuda_graph_impl == "full_iteration":
+        forward_backward_func = FullCudaGraphWrapper(
+            forward_backward_func,
+            cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
+            use_single_mempool=config.cuda_graph_use_single_mempool,
+        )
+    # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
+    if args.moe_expert_rank_capacity_factor is not None:
+        copy_main_params = args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather
+        forward_backward_func = PagedStashRunner(
+            config,
+            copy_main_params,
+            model,
+            optimizer,
+            forward_backward_func,
+        )
     if args.optimizer_cuda_graph:
-        optimizer.step = OptimizerCudaGraphWrapper(optimizer.step, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
+        optimizer.step = OptimizerCudaGraphWrapper(
+            optimizer.step,
+            cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
+            use_single_mempool=config.cuda_graph_use_single_mempool,
+        )
 
     def get_e2e_base_metrics():
         """Get base metrics values for one-logger to calculate E2E tracking metrics."""
@@ -3119,6 +3533,15 @@ def train(
                 forward_step_func, train_data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=iteration
             )
             ft_integration.on_training_step_end()
+            if _maybe_raise_workload_exception is not None and iteration != start_iteration:
+                _maybe_raise_workload_exception()
+            # Fault delay timing can start at the end of iteration N. Self-firing faults
+            # (signals, GIL, GPU) may then manifest in iteration N or N+1 depending on the
+            # configured delay; workload-exception faults manifest on a later poll.
+            if _maybe_raise_workload_exception is not None and should_setup_fault_injection_at_iteration(
+                fault_injector_config, iteration
+            ):
+                setup_fault_injection(fault_injector_config)
         if should_checkpoint:
             save_checkpoint_and_time(
                 iteration,
@@ -3203,7 +3626,20 @@ def train(
         else:
             assert num_skipped_samples_in_batch == 0
         args.skipped_train_samples += num_skipped_samples_in_batch
-        num_floating_point_operations_in_batch = num_floating_point_operations(args, batch_size)
+        # Drain the per-iteration packed-sequence stats so the FLOPs computation
+        # reflects THD per-chunk causal attention AND excludes padding tokens
+        # from token-linear work. Returns ``(None, None)`` for unpacked BSHD
+        # runs (no collective issued), letting ``num_floating_point_operations``
+        # fall back to its closed-form defaults.
+        total_real_tokens_in_batch, seqlen_squared_sum_in_batch = (
+            consume_seqlen_stats_in_iteration()
+        )
+        num_floating_point_operations_in_batch = num_floating_point_operations(
+            args,
+            batch_size,
+            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+            total_real_tokens_in_batch=total_real_tokens_in_batch,
+        )
         num_floating_point_operations_so_far += num_floating_point_operations_in_batch
         num_floating_point_operations_since_last_log_event += num_floating_point_operations_in_batch
 
@@ -3234,6 +3670,8 @@ def train(
             max_attention_logit,
             pg_collection=model_pg_collection,
             is_first_iteration=is_first_iteration,
+            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+            total_real_tokens_in_batch=total_real_tokens_in_batch,
         )
         is_first_iteration = False
 
@@ -3243,6 +3681,14 @@ def train(
             if args.log_energy:
                 energy_monitor.pause()
             timers('interval-time').stop()
+            if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
+                # disable_forward_pre_hook(param_sync=True) below force-syncs params for eval.
+                # Copy the main params to param buffer before the forced AllGather.
+                for model_chunk in model:
+                    model_chunk.zero_grad_buffer()
+                for optim_instance in optimizer.chained_optimizers:
+                    if isinstance(optim_instance, DistributedOptimizer):
+                        optim_instance._copy_main_params_to_param_buffer()
             if should_disable_forward_pre_hook(args):
                 disable_forward_pre_hook(model)
                 pre_hook_enabled = False
@@ -3294,7 +3740,7 @@ def train(
             if args.log_energy:
                 energy_monitor.resume()
             if args.num_experts is not None:
-                clear_aux_losses_tracker()
+                get_moe_metrics_tracker().clear()
 
         # Miscellaneous post-training-step functions (e.g., FT heartbeats, GC).
         # Some of these only happen at specific iterations. Capture updated FLOPs accumulator
@@ -3355,6 +3801,16 @@ def train(
 
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
     if should_exit:
+        # Deregister NCCL user-buffer memory pools before exit.
+        # Without this, ProcessGroupNCCL's destructor calls abort() which uses
+        # ncclCommDeregister on handles created by ncclCommWindowRegister,
+        # causing "NCCL WARN Deregister: Could not find handle" and a crash.
+        torch.distributed.barrier()
+        for model_module in model:
+            if isinstance(model_module, DDP):
+                for buf in model_module.buffers + model_module.expert_parallel_buffers:
+                    if getattr(buf, 'nccl_mem_pool', None) is not None:
+                        nccl_allocator.deregister_mem_pool(buf.nccl_mem_pool, buf.data_parallel_group)
         wandb_writer = get_wandb_writer()
         if wandb_writer:
             wandb_writer.finish()
@@ -3399,8 +3855,22 @@ def evaluate(
     eval_micro_batch_size = args.eval_micro_batch_size
     eval_num_microbatches = eval_batch_size // (eval_micro_batch_size * args.data_parallel_size)
     forward_backward_func = get_forward_backward_func()
-    if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
-        forward_backward_func = FullCudaGraphWrapper(forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps)
+    if args.cuda_graph_impl == "full_iteration":
+        forward_backward_func = FullCudaGraphWrapper(
+            forward_backward_func,
+            cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
+            use_single_mempool=config.cuda_graph_use_single_mempool,
+        )
+    # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
+    if args.moe_expert_rank_capacity_factor is not None:
+        copy_main_params = args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather
+        forward_backward_func = PagedStashRunner(
+            config,
+            copy_main_params,
+            model,
+            None,
+            forward_backward_func,
+        )
 
     if has_nvidia_modelopt:
         # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors
@@ -3572,10 +4042,20 @@ def evaluate_and_print_results(
     else:
         eval_iters = args.eval_iters
 
+    if args.validation_set_names:
+        assert args.multiple_validation_sets, \
+            "--validation-set-names requires --multiple-validation-sets"
+        assert len(args.validation_set_names) == len(data_iterators), \
+            f"Number of --validation-set-names ({len(args.validation_set_names)}) must match " \
+            f"the number of validation datasets ({len(data_iterators)})"
+
     for index, (iterator, iterations) in enumerate(zip(data_iterators, eval_iters)):
         suffix = ""
         if args.multiple_validation_sets:
-            suffix = f"-{index}"
+            if args.validation_set_names:
+                suffix = f"-{args.validation_set_names[index]}"
+            else:
+                suffix = f"-{index}"
         total_loss_dict, collected_non_loss_data, timelimit = evaluate(
             forward_step_func,
             iterator,
@@ -3869,6 +4349,9 @@ def should_disable_forward_pre_hook(args):
     return (
         not args.use_megatron_fsdp
         and has_optimizer
-        and (args.use_distributed_optimizer or args.use_layer_wise_distributed_optimizer)
+        and (
+            args.use_distributed_optimizer
+            or getattr(args, 'use_layer_wise_distributed_optimizer', False)
+        )
         and args.overlap_param_gather
     )
