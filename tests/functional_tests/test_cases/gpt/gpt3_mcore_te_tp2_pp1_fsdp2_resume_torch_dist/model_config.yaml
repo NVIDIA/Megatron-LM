@@ -43,7 +43,6 @@ MODEL_ARGS:
   --untie-embeddings-and-output-weights: true
   --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
-  --no-async-tensor-model-parallel-allreduce: true
   --attention-softmax-in-fp32: true
   --use-checkpoint-opt_param-scheduler: true
   --use-mcore-models: true

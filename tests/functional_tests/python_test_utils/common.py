@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import enum
 import glob
 import json
@@ -207,6 +208,18 @@ def pipeline(
                 ]
 
                 if metric_name == "iteration-time":
+                    max_golden_step = max(golden_value.values.keys()) if golden_value.values else 0
+                    steady_window = range(5, 21) if max_golden_step <= 25 else range(30, 46)
+                    actual_value_list = [
+                        value
+                        for value_step, value in actual_values[metric_name].values.items()
+                        if value_step in golden_value.values.keys() and value_step in steady_window
+                    ]
+                    golden_value_list = [
+                        value
+                        for value_step, value in golden_value.values.items()
+                        if value_step in steady_window
+                    ]
                     actual_value_list = [
                         np.median([np.inf if type(v) is str else v for v in actual_value_list])
                     ]
@@ -215,7 +228,9 @@ def pipeline(
                     ]
                     total_steps_evaluated = 1
                 else:
-                    total_steps_evaluated = golden_value.end_step / golden_value.step_interval + 1
+                    total_steps_evaluated = (
+                        golden_value.end_step - golden_value.start_step
+                    ) / golden_value.step_interval + 1
 
                     actual_value_list = [np.inf if type(v) is str else v for v in actual_value_list]
                     golden_value_list = [np.inf if type(v) is str else v for v in golden_value_list]
@@ -226,8 +241,16 @@ def pipeline(
                 # Tolerance check
                 is_close = np.isclose(actual, golden, rtol=test.rtol, atol=test.atol)
 
-                num_failing_steps_allowed = min(max(total_steps_evaluated // 100, 1), 50)
-                passing = np.mean(is_close) >= (num_failing_steps_allowed / total_steps_evaluated)
+                if (
+                    test.type_of_test_result == TypeOfTestResult.DETERMINISTIC
+                    or total_steps_evaluated == 1
+                ):
+                    passing = bool(np.all(is_close))
+                else:
+                    num_failing_steps_allowed = min(max(total_steps_evaluated // 100, 1), 50)
+                    passing = np.mean(is_close) >= 1 - (
+                        num_failing_steps_allowed / total_steps_evaluated
+                    )
 
                 if not passing:
                     logger.info(

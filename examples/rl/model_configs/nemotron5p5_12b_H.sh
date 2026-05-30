@@ -76,7 +76,7 @@ MODEL_OPTIONS="\
   --disable-gloo-process-groups \
   --mamba-head-dim 80 \
   --hybrid-layer-pattern M-M-M-M*-M-M-M-M*-M-M-M-M*-M-M-M-M*-M-M-M-M*-M-M-M-M*-M-M-M-M- \
-  --spec megatron.core.models.mamba.mamba_layer_specs mamba_stack_spec \
+  --spec megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec \
   --tiktoken-pattern v2 \
   --distributed-timeout-minutes 10 \
   --use-mcore-models \

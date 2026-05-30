@@ -5,6 +5,7 @@ from typing import Dict, List, Optional, Union
 
 from megatron.core.tokenizers.base_tokenizer import MegatronTokenizerBase
 from megatron.core.tokenizers.text.libraries.abstract_tokenizer import MegatronTokenizerTextAbstract
+from megatron.core.utils import accepts_parameter
 
 TOKENIZER_MAPPING_LIBRARIES = OrderedDict(
     [
@@ -45,10 +46,10 @@ class MegatronTokenizerText(MegatronTokenizerBase):
 
         if config_template is not None:
             self.chat_template = config_template
-        elif tokenizer_template is not None:
-            self.chat_template = tokenizer_template
-        else:
+        elif kwargs_template is not None:
             self.chat_template = kwargs_template
+        else:
+            self.chat_template = tokenizer_template
 
     def _restore_model(self, **kwargs) -> MegatronTokenizerTextAbstract:
         """Returns tokenizer library object."""
@@ -75,17 +76,23 @@ class MegatronTokenizerText(MegatronTokenizerBase):
 
         return self._tokenizer.text_to_ids(text)
 
-    def detokenize(self, ids: List[int]) -> str:
+    def detokenize(self, ids: List[int], skip_special_tokens: Optional[bool] = None) -> str:
         """
         Text detokenization.
 
         Args:
-            ids (list): text to be tokenized.
+            ids (list): token IDs to be detokenized.
+            skip_special_tokens (bool): Whether to strip special tokens
+                (e.g. <|im_end|>) from the output. Defaults to True.
 
         Returns:
             text: detokenized text.
         """
 
+        if skip_special_tokens is not None and accepts_parameter(
+            self._tokenizer.ids_to_text, "remove_special_tokens"
+        ):
+            return self._tokenizer.ids_to_text(ids, remove_special_tokens=skip_special_tokens)
         return self._tokenizer.ids_to_text(ids)
 
     def apply_chat_template(

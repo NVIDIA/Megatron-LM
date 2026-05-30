@@ -2,18 +2,22 @@
 
 """ Strategies base interfaces. """
 
+import logging
 from abc import ABC, abstractmethod
-from collections import defaultdict
 from enum import Enum
 from pathlib import Path
-from typing import Any, DefaultDict, Union
+from typing import Union
 
-from ..mapping import CheckpointingException, ShardedStateDict
-from .async_utils import AsyncCallsQueue, AsyncRequest
+from ..mapping import ShardedStateDict
+from .async_utils import AsyncRequest
+from .torch import TorchDistLoadShardedStrategy, TorchDistSaveShardedStrategy
+
+logger = logging.getLogger(__name__)
 
 
 class StrategyAction(Enum):
-    """Specifies save vs load action."""
+    """Specifies save vs load and sharded vs common action.
+    To be removed in future releases."""
 
     LOAD_COMMON = 'load_common'
     LOAD_SHARDED = 'load_sharded'
@@ -21,52 +25,33 @@ class StrategyAction(Enum):
     SAVE_SHARDED = 'save_sharded'
 
 
-default_strategies: DefaultDict[str, dict[tuple, Any]] = defaultdict(dict)
-
-async_calls = AsyncCallsQueue()
-
-
 def get_default_strategy(action: StrategyAction, backend: str, version: int):
     """Retrieves a default strategy for a given action, backend and version."""
-    error_hint: str = ""
-    try:
-        error_hint = ' Please use PyTorch version >=2.1'
-        from .torch import register_default_torch_strategies
 
-        register_default_torch_strategies()
-    except ImportError as e:
-        raise CheckpointingException(
-            f'Cannot import a default strategy for: {(action.value, backend, version)}. '
-            f'Error: {e}. Hint: {error_hint}'
-        ) from e
-    try:
-        return default_strategies[action.value][(backend, version)]
-    except KeyError as e:
-        raise CheckpointingException(
-            f'Cannot find a default strategy for: {(action.value, backend, version)}'
-        ) from e
-
-
-def register_default_strategy(
-    action: StrategyAction,
-    backend: str,
-    version: int,
-    strategy: Union['SaveStrategyBase', 'LoadStrategyBase'],
-):
-    """Adds a given strategy to the registry of default strategies.
-
-    Args:
-        action (StrategyAction): specifies save/load and sharded
-        backend (str): backend that the strategy becomes a default for
-        version (int): version that the strategy becomes a default for
-        strategy (SaveStrategyBase, LoadStrategyBase): strategy to register
-    """
-    default_strategies[action.value][(backend, version)] = strategy
+    logger.warning(
+        'megatron.core.dist_checkpointing.strategies.base.get_default_strategy'
+        ' is deprecated and will be removed in the future releases. Please use'
+        ' TorchDistLoadShardedStrategy() and TorchDistSaveShardedStrategy()'
+        ' to get the default load and save sharded strategies.'
+    )
+    if backend != 'torch_dist':
+        logger.warning(f'{backend} is not supported. `torch_dist` backend will be used.')
+    if action == StrategyAction.LOAD_SHARDED:
+        return TorchDistLoadShardedStrategy()
+    else:
+        assert action == StrategyAction.SAVE_SHARDED, f'{action} is not supported'
+        return TorchDistSaveShardedStrategy()
 
 
 class LoadStrategyBase(ABC):
     """Base class for a load strategy. Requires implementing checks for compatibility with a
     given checkpoint version."""
+
+    def __init__(self):
+        logger.warning(
+            "LoadStrategyBase & LoadShardedStrategy are deprecated "
+            "and will be removed in future releases."
+        )
 
     @abstractmethod
     def check_backend_compatibility(self, loaded_backend):
@@ -89,6 +74,10 @@ class SaveStrategyBase(ABC):
     version of the saved format."""
 
     def __init__(self, backend: str, version: int):
+        logger.warning(
+            "SaveStrategyBase & SaveShardedStrategy are deprecated "
+            "and will be removed in future releases."
+        )
         self.backend = backend
         self.version = version
 
@@ -102,7 +91,7 @@ class SaveStrategyBase(ABC):
 
 
 class LoadShardedStrategy(LoadStrategyBase):
-    """Load strategy for sharded tensors"""
+    """Base class for load strategies to be removed in future releases."""
 
     @abstractmethod
     def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Union[str, Path]):
@@ -145,7 +134,7 @@ class LoadShardedStrategy(LoadStrategyBase):
 
 
 class SaveShardedStrategy(SaveStrategyBase):
-    """Save strategy for sharded tensors"""
+    """Base class for save strategies to be removed in future releases."""
 
     @abstractmethod
     def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Union[str, Path]):
@@ -154,7 +143,7 @@ class SaveShardedStrategy(SaveStrategyBase):
 
 
 class AsyncSaveShardedStrategy(SaveShardedStrategy):
-    """Save strategy suitable for async save."""
+    """Save strategy suitable for async save. To be removed in future releases."""
 
     @abstractmethod
     def async_save(
@@ -174,6 +163,9 @@ class AsyncSaveShardedStrategy(SaveShardedStrategy):
 
     def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Union[str, Path]):
         """Each async strategy can be trivially used as a sync strategy."""
+        logger.warning(
+            "AsyncSaveShardedStrategy is deprecated and will be removed in future releases."
+        )
         async_request = self.async_save(sharded_state_dict, checkpoint_dir)
         async_request.execute_sync()
         del async_request
