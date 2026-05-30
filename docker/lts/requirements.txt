@@ -12,7 +12,7 @@ einops==0.8.2                          # was: einops~=0.8
 tensorstore==0.1.84                    # was: tensorstore~=0.1,!=0.1.46,!=0.1.72
 multi-storage-client==0.49.0           # was: multi-storage-client~=0.27
 opentelemetry-api==1.33.1              # was: opentelemetry-api~=1.33.1
-megatron-energon[av_decode]==6.0.1     # was: megatron-energon[av_decode]~=6.0
+megatron-energon[av_decode]==7.3.2     # was: megatron-energon[av_decode]~=6.0.1
 av==17.0.1
 flashinfer-python==0.6.11.post3        # was: flashinfer-python>=0.5.0,<0.7.0
 wget==3.2
