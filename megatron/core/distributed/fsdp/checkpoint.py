@@ -285,7 +285,7 @@ def _split_fused_params_v2(
         optimizer_state_dict: Optional optimizer state dict (a copy is returned).
         detector(key, dtensor, model) -> ``(sizes, names, dim)`` or ``None``.
         key_fmt(key, sub_name) -> new_key.
-        tag: Log tag (e.g. ``"SwiGLU v2"``).
+        tag: Log tag (e.g. ``"SwiGLU"``).
         state_keys: Optimizer state keys to split (default: ``exp_avg``, ``exp_avg_sq``).
 
     Returns:
@@ -395,7 +395,7 @@ def handle_swiglu_in_state_dict_v2(
         optimizer_state_dict,
         detector,
         lambda k, s: f"{k}_{s}",
-        "SwiGLU v2",
+        "SwiGLU",
     )
 
 

@@ -162,6 +162,10 @@ class _FSDPRootContext:
 
         raise AssertionError("Current module not found in forward module order")
 
+    def get_root_module(self):
+        """Return the root FSDP module associated with this context."""
+        return self.forward_order[0] if self.forward_order else None
+
 
 class FSDPModule(nn.Module):
     """
@@ -816,6 +820,13 @@ class FSDPModule(nn.Module):
                         assert not torch.isnan(
                             param_data
                         ).any(), "NaN detected in model weight buffer"
+
+    def get_root_module(self):
+        """Return the root FSDP module associated with this module."""
+        return self._fsdp_root_context.get_root_module()
+
+    def _sync_module_states_after_load(self):
+        self._copy_main_weights_to_model_weights()
 
 
 def _get_module_fsdp_param_groups(
