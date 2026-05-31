@@ -2223,6 +2223,14 @@ def load_checkpoint(
                 load_return = module.load_state_dict(state_dict, strict=False)
                 print(f"load_return: {load_return}")
 
+        # Megatron FSDP v2 checkpoints require an extra step to sync module states after loading.
+        if _is_megatron_fsdp_v2(module):
+            from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import FSDPModule
+            for m in module.modules():
+                if isinstance(m, FSDPModule):
+                    root_module = m.get_root_module()
+                    root_module._sync_module_states_after_load()
+
     # Model.
     if not skip_load_to_model_and_opt:
         if len(ddp_model) == 1:

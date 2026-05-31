@@ -395,8 +395,7 @@ def split_dtensor(
     Split a DTensor into smaller DTensors along a specified dimension.
 
     This function handles uneven sharding correctly by computing chunk metadata
-    for every output DTensor without extra collective operations.  A single call
-    to ``gather_and_compute_chunk_metadata`` is made upfront; all subsequent
+    for every output DTensor without extra collective operations.  All subsequent
     per-split metadata is derived locally from that result using pure integer
     arithmetic.
 
@@ -491,10 +490,10 @@ def split_dtensor(
             split_points.append(split_points[-1] + size)
 
     # One collective call — result reused for all splits below.
-    if not hasattr(dtensor._local_tensor, "__create_chunk_list__"):
-        chunk_meta = gather_and_compute_chunk_metadata(dtensor)
-    else:
-        chunk_meta = dtensor.__create_chunk_list__()[0]
+    assert hasattr(dtensor._local_tensor, "__create_chunk_list__"), (
+        "DTensor local tensor is missing chunk metadata."
+    )
+    chunk_meta = dtensor._local_tensor.__create_chunk_list__()[0]
     chunk_slice = slice(chunk_meta.offsets[dim], chunk_meta.offsets[dim] + chunk_meta.sizes[dim])
     local_offset = chunk_meta.offsets[dim]
     local_tensor = dtensor.to_local()

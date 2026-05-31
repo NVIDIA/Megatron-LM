@@ -134,8 +134,6 @@ See the parent directory `..` for `uneven_dtensor.py` which provides:
   See [tp_support_design.md](tp_support_design.md) for the planned design.
 - **Hybrid Sharding (HSDP):** Not supported. v2 does not yet support an outer
   DP dimension for hybrid (inter-node + intra-node) sharding.
-- **Expert Parallelism (EP):** Not supported in v2's param group logic. MoE
-  expert parameters are not currently handled via EP submeshes.
 
 ### Sharding Strategies
 
