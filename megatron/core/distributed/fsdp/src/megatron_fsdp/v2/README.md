@@ -40,18 +40,40 @@ Wraps a module with FSDP sharding semantics:
 
 ### MixedPrecisionPolicy
 
-Controls parameter/gradient dtypes and communication precision. Available policies:
+Controls parameter/gradient dtypes and communication precision.
 
 | Policy | Notes |
 |--------|-------|
-| `MixedPrecisionPolicy` | Base policy (bf16 param, fp32 main weight & main grad) |
+| `MixedPrecisionPolicy` | Base policy; all fields default to ``None`` |
 | `FullyShardFP8Policy` | MXFP8 rowwise/colwise quantized weights |
 | `FullyShardNVFP4Policy` | NVFP4 primary weights |
+
+**Key fields:**
+
+| Field | Default | Purpose |
+|-------|---------|---------|
+| `main_params_dtype` | ``None`` | Dtype for optimizer main-weight buffer. ``None`` = no separate buffer, optimizer mutates model weights directly. Set to ``torch.float32`` for quantized models (FP8/NVFP4) so the optimizer works on high-precision copies. |
+| `main_grads_dtype` | ``None`` | Dtype for optimizer main-grad buffer. When ``None`` and ``use_decoupled_grad=False``, aligns with ``main_params_dtype``. Otherwise falls back to ``param.dtype``. |
+| `grad_comm_dtype` | ``None`` | Dtype for gradient reduce-scatter communication. ``None`` = use ``main_grads_dtype``. |
+| `use_decoupled_grad` | ``False`` | When ``False``, ``main_grads_dtype`` is inferred from ``main_params_dtype`` so the optimizer operates in a consistent precision context. |
 
 ```python
 from megatron_fsdp.v2 import fully_shard, MixedPrecisionPolicy
 
+# No separate main buffer — optimizer mutates model params directly
+mp_policy = MixedPrecisionPolicy()
+fully_shard(model, mp_policy=mp_policy)
+
+# fp32 optimizer precision for bf16 model
 mp_policy = MixedPrecisionPolicy(main_params_dtype=torch.float32)
+fully_shard(model, mp_policy=mp_policy)
+
+# FP8 mixed precision — fp32 main weights auto-created by adapter
+from megatron_fsdp.v2 import FullyShardFP8Policy
+mp_policy = MixedPrecisionPolicy(
+    main_params_dtype=torch.float32,
+    fp8=FullyShardFP8Policy(enabled=True)
+)
 fully_shard(model, mp_policy=mp_policy)
 ```
 

@@ -31,7 +31,7 @@ import torch.nn as nn
 
 sys.path.insert(0, str(Path(__file__).parents[2]))
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
-    FullyShardMixedPrecisionPolicy,
+    MixedPrecisionPolicy,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.param_group import ParameterGroup
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.utils import ParamGroupIdx
@@ -108,7 +108,7 @@ def _build_groups(strategy):
         pg = ParameterGroup(
             params=params,
             param_group_id=ParamGroupIdx(0, gid),
-            mp_policy=FullyShardMixedPrecisionPolicy(),
+            mp_policy=MixedPrecisionPolicy(),
             mesh=None,
             sharding_strategy=strategy,
         )
@@ -228,12 +228,11 @@ def test_unshard_reshard(strategy):
             continue
 
         shard_before = wbuf.data.clone()
-        unsharded, work = wbuf.unshard(async_op=False)
+        unsharded = wbuf.unshard()
 
         if not w_dist:
             # Non-distributed: unshard returns self.data directly, no comm
             assert unsharded is wbuf.data
-            assert work is None
         else:
             # Distributed: after all-gather, every param should be fully
             # recoverable from the unsharded buffer at its global offset
@@ -272,29 +271,31 @@ def test_reduce_grad(strategy):
             # uint8 group has requires_grad=False, so no grad buffer
             continue
 
-        if not g_dist:
-            # Non-distributed: each rank fills with (rank+1), then all-reduce
-            # should produce sum across all ranks
+        if strategy == "no_shard":
+            # No-shard: each rank fills with (rank+1), then all-reduce should
+            # produce the sum across all ranks.
             gbuf.data.fill_(float(rank + 1))
             ref = torch.full_like(gbuf.data, float(rank + 1))
             Ref.all_reduce(ref, dp_group)
             gbuf.reduce_grad()
             assert torch.equal(gbuf.data, ref)
         else:
-            # Distributed: fill a full-size temp buffer with (rank+1),
-            # reduce-scatter it, compare against PyTorch ref
+            # ZeRO-1/2/3: reduce-scatter a full gradient buffer and compare
+            # this rank's optimizer-facing shard against the PyTorch reference.
             full_size = gbuf.buffer_index.bucket_meta.size
             full = torch.full((full_size,), float(rank + 1), dtype=gbuf.dtype, device=device)
 
-            # Pre-populate the allocator so reduce_grad sees the data
-            bucket = gbuf.allocator.allocate(
-                key=gbuf.alloc_key, size=full_size, dtype=gbuf.dtype, device=device
-            )
-            bucket.data.copy_(full)
-
             ref_shard = Ref.reduce_scatter(full.clone(), dp_group)
 
-            gbuf.data.zero_()
+            if g_dist:
+                # Pre-populate the allocator so reduce_grad sees the full temp buffer.
+                bucket = gbuf.allocator.allocate(
+                    key=gbuf.alloc_key, size=full_size, dtype=gbuf.dtype, device=device
+                )
+                bucket.data.copy_(full)
+                gbuf.data.zero_()
+            else:
+                gbuf.data.copy_(full)
             gbuf.reduce_grad()
 
             # Only compare the shard region of self.data
