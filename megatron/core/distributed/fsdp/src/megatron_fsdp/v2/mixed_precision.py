@@ -176,7 +176,7 @@ class FullyShardNVFP4Policy:
 
 
 @dataclass(frozen=True)
-class FullyShardMixedPrecisionPolicy:
+class MixedPrecisionPolicy:
     """Mixed precision policy owned by the v2 ``fully_shard`` path."""
 
     main_params_dtype: Optional[torch.dtype] = None
@@ -403,22 +403,39 @@ class FullyShardMixedPrecisionPolicy:
         return HAVE_TE_MXFP8 and isinstance(tensor, MXFP8Tensor)
 
     def main_params_dtype_for_param(self, tensor: torch.Tensor) -> Optional[torch.dtype]:
-        """Return the main-parameter dtype for a parameter group."""
-        if self.is_fp8_param(tensor) and self.main_params_dtype is None:
-            return torch.float32
-        if self.is_nvfp4_param(tensor) and self.main_params_dtype is None:
-            return torch.float32
+        """Return the dtype for the optimizer main-weight buffer.
+
+        Returns ``self.main_params_dtype`` unchanged.  When this is ``None``
+        no ``main_weight_buffer`` is allocated — the optimizer mutates the
+        model-weight buffer directly.  Set to ``torch.float32`` when the
+        model uses quantized weights (FP8 / NVFP4) so the optimizer works on
+        high-precision copies.
+        """
         return self.main_params_dtype
 
     def main_grads_dtype_for_param(self, tensor: torch.Tensor) -> torch.dtype:
         """Return the main-gradient dtype for a parameter group.
 
-        Defaults to float32 for stable gradient accumulation (avoids
-        precision loss in reduce-scatter and optimizer steps).
+        Resolution order (first match wins):
+        1. Explicit ``main_grads_dtype`` in the policy — user override wins.
+        2. When ``use_decoupled_grad`` is *disabled*, the optimizer's main-grad
+           buffer should match the main-param buffer dtype (the optimizer
+           writes gradients into the same context as the main params).
+        3. Default — fall back to the parameter's own dtype.
+
+        Only the first condition triggers an independent main-grad buffer
+        creation with a different dtype than the main params.  Conditions 2
+        and 3 re-use the dtype already chosen for the main-weight buffer.
         """
         if self.main_grads_dtype is not None:
             return self.main_grads_dtype
-        return torch.float32
+
+        if not self.use_decoupled_grad:
+            main_param_dtype = self.main_params_dtype_for_param(tensor)
+            if main_param_dtype is not None:
+                return main_param_dtype
+
+        return tensor.dtype
 
     def get_high_precision_value(self, tensor: torch.Tensor) -> torch.Tensor:
         """Return a high-precision value for initializing optimizer main weights."""
@@ -435,7 +452,17 @@ class FullyShardMixedPrecisionPolicy:
         return tensor.dequantize()
 
     def post_unshard(self, params: List[torch.Tensor], bwd_pass: bool = False) -> None:
-        """Run post-unshard mixed precision processing for a parameter group."""
+        """Run post-unshard processing for quantized parameters.
+
+        After FSDP all-gathers the raw quantized data into the model-weight
+        buffer, Transformer Engine needs recipe-specific state rebuilt:
+
+        - **FP8:** rebinds rowwise/columnwise data pointers so TE's forward
+          and backward kernels find the correct quantized payloads.
+        - **NVFP4:** on backward pass only, calls TE's post-all-gather
+          handler to restore the rowwise/colwise scale factors needed by
+          the bwd kernel.
+        """
         fp8_params = [param for param in params if self.is_fp8_param(param)]
         nvfp4_params = [param for param in params if self.is_nvfp4_param(param)]
 
@@ -486,7 +513,16 @@ class FullyShardMixedPrecisionPolicy:
                     post_all_gather_processing(valid_nvfp4)
 
     def post_reshard(self, params: List[torch.Tensor]) -> None:
-        """Run post-reshard mixed precision processing for a parameter group."""
+        """Run post-reshard cleanup for quantized parameters.
+
+        After FSDP releases the all-gathered buffer, TE's temporary views
+        into the unsharded data become invalid:
+
+        - **FP8:** drops transpose/cache views unless ``keep_transpose_cache``
+          is set (for fine-grained recompute scenarios where the backward
+          kernel may request transpose data inside the forward call stack).
+        - **NVFP4:** skips — NVFP4 teardown is handled separately.
+        """
         if self.fp8.keep_transpose_cache:
             return
         for param in params:
@@ -517,6 +553,10 @@ class FullyShardMixedPrecisionPolicy:
 
         assert model_weight_buffer is not None, "main weights require a model-weight buffer"
 
+        dirty_replicated_buffer = (
+            main_weight_buffer.is_distributed and not model_weight_buffer.is_distributed
+        )
+
         if self.is_nvfp4_param(params[0]):
             quantize_main_weights_to_nvfp4(
                 params, param_idx, data_parallel_group, model_weight_buffer, main_weight_buffer
@@ -524,7 +564,27 @@ class FullyShardMixedPrecisionPolicy:
             return
 
         if not self.is_fp8_param(params[0]):
-            model_weight_buffer.data.copy_(main_weight_buffer.data)
+            if model_weight_buffer.is_distributed and not main_weight_buffer.is_distributed:
+                raise RuntimeError(
+                    "Unsupported FSDP main/model weight buffer layout: "
+                    "model weights are sharded but main weights are replicated."
+                )
+            if model_weight_buffer.is_distributed == main_weight_buffer.is_distributed:
+                model_weight_buffer.data.copy_(main_weight_buffer.data)
+            else:
+                model_shard_meta = model_weight_buffer.buffer_index.shard_meta
+                main_shard_meta = main_weight_buffer.buffer_index.shard_meta
+                model_weight_buffer.data[
+                    model_shard_meta.local_data_index : model_shard_meta.local_data_index
+                    + model_shard_meta.size
+                ].copy_(
+                    main_weight_buffer.data[
+                        main_shard_meta.local_data_index : main_shard_meta.local_data_index
+                        + main_shard_meta.size
+                    ]
+                )
+            if dirty_replicated_buffer:
+                model_weight_buffer._dirty = True
             return
 
         fp8_params = []
@@ -554,6 +614,10 @@ class FullyShardMixedPrecisionPolicy:
         quantize_main_weights_to_fp8(
             fp8_params, main_params, start_offsets, data_parallel_group, model_param_shards
         )
+        if dirty_replicated_buffer:
+            model_weight_buffer._dirty = True
+            if transpose_weight_buffer is not None:
+                transpose_weight_buffer._dirty = True
 
 
 def is_fp8_param(tensor: torch.Tensor) -> bool:

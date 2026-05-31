@@ -35,7 +35,7 @@ from .hooks import (
     _register_forward_hook,
     _register_forward_pre_hook,
 )
-from .mixed_precision import FullyShardMixedPrecisionPolicy
+from .mixed_precision import MixedPrecisionPolicy
 from .utils import _init_default_fully_shard_mesh
 
 __all__ = ["FSDPModule", "fully_shard"]
@@ -49,7 +49,7 @@ def fully_shard(
     shard_placement_fn: Optional[
         Callable[[nn.Parameter], Optional[Shard]]
     ] = None,  # TODO: implement
-    mp_policy: Optional[FullyShardMixedPrecisionPolicy] = None,
+    mp_policy: Optional[MixedPrecisionPolicy] = None,
     offload_policy: Optional["OffloadPolicy"] = None,  # TODO: implement
     ignored_params: Optional[set[nn.Parameter]] = None,
     # --- Megatron-FSDP specific options ---
@@ -57,6 +57,7 @@ def fully_shard(
     enable_async_reduce_grad: bool = True,
     gradient_scaling_factor: Optional[float] = None,
     enable_trace_pool: bool = False,
+    sharding_strategy: str = "optim_grads_params",
 ) -> nn.Module:
     """
     Wrap a module with FSDP sharding semantics.
@@ -76,15 +77,18 @@ def fully_shard(
     mesh = mesh or _init_default_fully_shard_mesh()
 
     if mp_policy is None:
-        mp_policy = FullyShardMixedPrecisionPolicy()
+        mp_policy = MixedPrecisionPolicy()
 
     cls = module.__class__
     new_cls = type(f"FSDP{cls.__name__}", (FSDPModule, cls), {})
     module.__class__ = new_cls
 
-    bucket_allocator = (
-        TracePoolAllocator() if enable_trace_pool else StorageFreeingBucketAllocator()
+    use_trace_pool = enable_trace_pool and sharding_strategy in (
+        "optim",
+        "optim_grads",
+        "optim_grads_params",
     )
+    bucket_allocator = TracePoolAllocator() if use_trace_pool else StorageFreeingBucketAllocator()
 
     module._init_named_param_groups(
         mesh,
@@ -92,6 +96,7 @@ def fully_shard(
         mp_policy=mp_policy,
         bucket_allocator=bucket_allocator,
         gradient_scaling_factor=gradient_scaling_factor,
+        sharding_strategy=sharding_strategy,
     )
     module._init_fsdp_state(
         enable_unshard_prefetch=enable_unshard_prefetch,

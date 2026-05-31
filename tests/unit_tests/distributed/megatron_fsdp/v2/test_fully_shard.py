@@ -54,7 +54,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fsdp_module import FSDPModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fully_shard import fully_shard
 from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
-    FullyShardMixedPrecisionPolicy,
+    MixedPrecisionPolicy,
 )
 
 # ------------------------------------------------------------------ #
@@ -459,7 +459,7 @@ class TestMixedPrecision:
     def test_main_params_fp32(self):
         """With fp32 main params, main_weight_buffer should be created."""
         torch.manual_seed(42)
-        mp_policy = FullyShardMixedPrecisionPolicy(main_params_dtype=torch.float32)
+        mp_policy = MixedPrecisionPolicy(main_params_dtype=torch.float32)
         model = SimpleMLP(64).to(_device()).bfloat16()
         fully_shard(model, mp_policy=mp_policy)
 
@@ -473,7 +473,7 @@ class TestMixedPrecision:
     def test_main_params_none(self):
         """With no main_params_dtype, no main_weight_buffer should be created."""
         torch.manual_seed(42)
-        mp_policy = FullyShardMixedPrecisionPolicy(main_params_dtype=None)
+        mp_policy = MixedPrecisionPolicy(main_params_dtype=None)
         model = SimpleMLP(64).to(_device())
         fully_shard(model, mp_policy=mp_policy)
 
@@ -485,8 +485,8 @@ class TestMixedPrecision:
     def test_fp32_grad_reduce(self):
         """grad_reduce_in_fp32=True should use fp32 gradient communication."""
         torch.manual_seed(42)
-        mp_policy = FullyShardMixedPrecisionPolicy(
-            main_grads_dtype=torch.float32, grad_comm_dtype=torch.float32
+        mp_policy = MixedPrecisionPolicy(
+            grad_comm_dtype=torch.float32
         )
         model = SimpleMLP(64).to(_device()).bfloat16()
         fully_shard(model, mp_policy=mp_policy)

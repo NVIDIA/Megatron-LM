@@ -20,6 +20,10 @@ from tests.unit_tests.distributed.megatron_fsdp.utils import (
 )
 from tests.unit_tests.test_utilities import Utils
 
+STRICT_LOSS_ATOL = 5e-3
+STRICT_PARAM_ATOL = 5e-3
+STRICT_PARAM_RTOL = 1e-3
+
 
 @pytest.fixture(scope="class")
 def ref_cache():
@@ -31,6 +35,77 @@ def ref_cache():
 
 
 class TestMegatronFSDPE2E:
+
+    @staticmethod
+    def _normalize_param_name(name):
+        while name.startswith("module."):
+            name = name[len("module.") :]
+        return name
+
+    @staticmethod
+    def _materialize_param_tensor(param):
+        from torch.distributed.tensor import DTensor
+
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+            uneven_dtensor_to_full_tensor,
+        )
+        from megatron.core.fp8_utils import dequantize_fp8_tensor, is_float8tensor
+
+        tensor = param.detach()
+        if isinstance(tensor, DTensor):
+            tensor = uneven_dtensor_to_full_tensor(tensor)
+        elif is_float8tensor(tensor):
+            tensor = dequantize_fp8_tensor(tensor)
+        return tensor.detach().float().cpu()
+
+    @staticmethod
+    def _capture_named_params(model_chunks):
+        # All ranks must enter DTensor gather collectives, but only rank 0
+        # keeps CPU copies for comparison.
+        snapshots = {}
+        for chunk_idx, model_chunk in enumerate(model_chunks):
+            for name, param in model_chunk.named_parameters():
+                tensor = TestMegatronFSDPE2E._materialize_param_tensor(param)
+                if torch.distributed.get_rank() == 0:
+                    key = f"{chunk_idx}.{TestMegatronFSDPE2E._normalize_param_name(name)}"
+                    snapshots[key] = tensor
+        return snapshots
+
+    @staticmethod
+    def _assert_replicated_weight_buffers_match(model_chunks):
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.fsdp_module import FSDPModule
+
+        for model_chunk in model_chunks:
+            for _, module in model_chunk.named_modules():
+                if not isinstance(module, FSDPModule):
+                    continue
+                for param_group in module._fsdp_param_groups:
+                    if (
+                        param_group.model_weight_buffer is None
+                        or param_group.model_weight_buffer.is_distributed
+                    ):
+                        continue
+                    param_group.unshard(bwd_pass=False)
+                    if param_group.transpose_weight_buffer is not None:
+                        param_group.unshard(bwd_pass=True)
+
+                    for buffer_name, buffer in (
+                        ("model_weight_buffer", param_group.model_weight_buffer),
+                        ("transpose_weight_buffer", param_group.transpose_weight_buffer),
+                    ):
+                        if buffer is None or buffer.is_distributed:
+                            continue
+                        gathered = [
+                            torch.empty_like(buffer.data)
+                            for _ in range(torch.distributed.get_world_size(param_group.dp_group))
+                        ]
+                        torch.distributed.all_gather(gathered, buffer.data, group=param_group.dp_group)
+                        for group_rank, replica in enumerate(gathered):
+                            assert torch.equal(buffer.data, replica), (
+                                f"Replicated {buffer_name} mismatch for "
+                                f"param_group={param_group.param_group_id}, "
+                                f"group_rank={group_rank}"
+                            )
 
     @staticmethod
     def _training_loop(seed=42, **kwargs):
@@ -82,6 +157,11 @@ class TestMegatronFSDPE2E:
         EP = kwargs.pop("EP", 1)
         ETP = kwargs.pop("ETP", 1)
         OUTER_DP = kwargs.pop("OUTER_DP", 1)
+        capture_param_snapshots = kwargs.pop("capture_param_snapshots", False)
+        verify_replicated_weight_buffers = kwargs.pop(
+            "verify_replicated_weight_buffers", False
+        )
+        return_dict = kwargs.pop("return_dict", capture_param_snapshots)
 
         # Initialize model parallel groups
         Utils.initialize_model_parallel(
@@ -128,6 +208,7 @@ class TestMegatronFSDPE2E:
         )
 
         outputs = []
+        param_snapshots = []
 
         # Training loop
         for _ in range(NUM_TRAINING_STEPS):
@@ -140,12 +221,23 @@ class TestMegatronFSDPE2E:
                 num_micro_batches=GLOBAL_BATCH_SIZE // MICRO_BATCH_SIZE // DP_GROUP.size(),
             )
             optim.step()
+            if verify_replicated_weight_buffers:
+                TestMegatronFSDPE2E._assert_replicated_weight_buffers_match(model_chunks)
 
             # Collect loss
             outputs.append(output[-1])
+            if capture_param_snapshots:
+                param_snapshots.append(
+                    TestMegatronFSDPE2E._capture_named_params(model_chunks)
+                )
 
         Utils.destroy_model_parallel()
 
+        if return_dict:
+            result = {"outputs": outputs}
+            if capture_param_snapshots:
+                result["param_snapshots"] = param_snapshots
+            return result
         return outputs
 
     @pytest.mark.skipif(
@@ -263,6 +355,245 @@ class TestMegatronFSDPE2E:
                         f", outputs = {outputs}, reference_outputs = {reference_outputs}"
                     ),
                 )
+
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.4.0"), reason="Test needs to be updated for torch >= 2.4.0"
+    )
+    @pytest.mark.parametrize(
+        "case",
+        [
+            pytest.param(
+                dict(
+                    strategy="optim",
+                    precision_configs=dict(bf16=True),
+                    reference_kind="distopt",
+                    capture_param_snapshots=True,
+                ),
+                id="bf16-optim",
+            ),
+            pytest.param(
+                dict(
+                    strategy="optim_grads",
+                    precision_configs=dict(bf16=True),
+                    reference_kind="distopt",
+                    capture_param_snapshots=True,
+                ),
+                id="bf16-optim_grads",
+            ),
+            pytest.param(
+                dict(
+                    strategy="optim_grads_params",
+                    precision_configs=dict(bf16=True),
+                    reference_kind="distopt",
+                    capture_param_snapshots=True,
+                ),
+                id="bf16-optim_grads_params",
+            ),
+            pytest.param(
+                dict(
+                    strategy="optim_grads_params",
+                    precision_configs=dict(
+                        bf16=True,
+                        fp8="e4m3",
+                        fp8_param_gather=True,
+                        fp8_recipe="mxfp8",
+                        main_grads_dtype="fp32",
+                        main_params_dtype="fp32",
+                        exp_avg_dtype="bf16",
+                        exp_avg_sq_dtype="bf16",
+                        moe_grouped_gemm=True,
+                        use_precision_aware_optimizer=True,
+                    ),
+                    reference_kind="fsdp_v1",
+                    capture_param_snapshots=False,
+                ),
+                id="mxfp8_param_gather-optim_grads_params",
+            ),
+        ],
+    )
+    def test_strict_iter_equivalence_zero_strategies(self, ref_cache, case):
+        strategy = case["strategy"]
+        precision_configs = case["precision_configs"]
+        if precision_configs.get("fp8_recipe") == "mxfp8" and (
+            not torch.cuda.is_available()
+            or torch.cuda.get_device_capability()[0] < 10
+            or not HAVE_TE_MXFP8TENSOR
+        ):
+            pytest.skip("Requires PyTorch & CUDA device with TE MXFP8Tensor support")
+        if Utils.world_size < 2:
+            pytest.skip("Requires at least 2 distributed ranks for ZeRO sharding")
+
+        common_configs = dict(
+            data_parallel_sharding_strategy=strategy,
+            train_iters=3,
+            seq_length=64,
+            micro_batch_size=1,
+            global_batch_size=8,
+            # Keep strict iter-equivalence on the ordinary model-init path.  The
+            # FSDP v1/v2 meta-init paths materialize nested FSDP units in a
+            # different order, so they can legitimately start from different
+            # random initial weights even with the same seed.
+            init_model_with_meta_device=False,
+            gradient_accumulation_fusion=False,
+            overlap_param_gather=False,
+            overlap_grad_reduce=False,
+            verify_replicated_weight_buffers=strategy in ("optim", "optim_grads"),
+            **precision_configs,
+        )
+        reference_kind = case["reference_kind"]
+        capture_param_snapshots = case["capture_param_snapshots"]
+        ref_cache_key = (
+            "strict_iter_equivalence",
+            reference_kind,
+            strategy,
+            capture_param_snapshots,
+            tuple(sorted((key, repr(value)) for key, value in common_configs.items())),
+        )
+
+        if ref_cache_key not in ref_cache:
+            reference_configs = copy.deepcopy(common_configs)
+            if reference_kind == "fsdp_v1":
+                reference_configs["use_megatron_fsdp_v2"] = False
+                ref_cache[ref_cache_key] = TestMegatronFSDPE2E._training_loop(
+                    use_megatron_fsdp=True,
+                    ckpt_format="fsdp_dtensor",
+                    capture_param_snapshots=capture_param_snapshots,
+                    return_dict=True,
+                    **reference_configs,
+                )
+            else:
+                ref_cache[ref_cache_key] = TestMegatronFSDPE2E._training_loop(
+                    use_distributed_optimizer=True,
+                    capture_param_snapshots=capture_param_snapshots,
+                    return_dict=True,
+                    **reference_configs,
+                )
+
+        fsdp_configs = copy.deepcopy(common_configs)
+        fsdp_configs["use_megatron_fsdp_v2"] = True
+        actual = TestMegatronFSDPE2E._training_loop(
+            use_megatron_fsdp=True,
+            ckpt_format="fsdp_dtensor",
+            capture_param_snapshots=capture_param_snapshots,
+            return_dict=True,
+            **fsdp_configs,
+        )
+        reference = ref_cache[ref_cache_key]
+
+        if torch.distributed.get_rank() != 0:
+            return
+
+        assert len(actual["outputs"]) == len(reference["outputs"])
+        for step, (output, ref_output) in enumerate(
+            zip(actual["outputs"], reference["outputs"])
+        ):
+            loss = output["lm loss"]
+            ref_loss = ref_output["lm loss"]
+            assert_close(
+                loss,
+                ref_loss,
+                atol=STRICT_LOSS_ATOL,
+                rtol=0,
+                msg=(
+                    f"Loss mismatch at step {step}, strategy={strategy}, "
+                    f"actual={loss.detach().item()}, reference={ref_loss.detach().item()}, "
+                    f"compare={compare_losses(loss.detach().item(), ref_loss.detach().item())}"
+                ),
+            )
+
+        if not capture_param_snapshots:
+            return
+
+        assert len(actual["param_snapshots"]) == len(reference["param_snapshots"])
+        for step, (params, ref_params) in enumerate(
+            zip(actual["param_snapshots"], reference["param_snapshots"])
+        ):
+            missing = sorted(set(ref_params) ^ set(params))
+            assert not missing, (
+                f"Parameter key mismatch at step {step}, strategy={strategy}: {missing[:20]}"
+            )
+            for name in sorted(ref_params):
+                assert_close(
+                    params[name],
+                    ref_params[name],
+                    atol=STRICT_PARAM_ATOL,
+                    rtol=STRICT_PARAM_RTOL,
+                    msg=(
+                        f"Parameter mismatch at step {step}, strategy={strategy}, "
+                        f"name={name}, actual_shape={tuple(params[name].shape)}, "
+                        f"reference_shape={tuple(ref_params[name].shape)}"
+                    ),
+                )
+
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.4.0"), reason="Test needs to be updated for torch >= 2.4.0"
+    )
+    @pytest.mark.parametrize(
+        "strategy,precision_configs",
+        [
+            pytest.param(
+                strategy,
+                dict(
+                    bf16=True,
+                    fp8="e4m3",
+                    fp8_param_gather=True,
+                    fp8_recipe="mxfp8",
+                    main_grads_dtype="fp32",
+                    main_params_dtype="fp32",
+                    exp_avg_dtype="bf16",
+                    exp_avg_sq_dtype="bf16",
+                    moe_grouped_gemm=True,
+                    use_precision_aware_optimizer=True,
+                ),
+                id=f"mxfp8_param_gather-{strategy}",
+            )
+            for strategy in ("optim", "optim_grads")
+        ],
+    )
+    def test_zero_strategy_non_equivalent_precision_paths_run(
+        self, strategy, precision_configs
+    ):
+        """Exercise valid ZeRO paths that intentionally lack a strict reference.
+
+        MXFP8 ZeRO-1/2 refreshes replicated quantized compute buffers after
+        sharded optimizer updates; v1 and v2 do not provide a strict multi-step
+        golden comparison for that replicated-weight quantization path.
+        """
+        if precision_configs.get("fp8_recipe") == "mxfp8" and (
+            not torch.cuda.is_available()
+            or torch.cuda.get_device_capability()[0] < 10
+            or not HAVE_TE_MXFP8TENSOR
+        ):
+            pytest.skip("Requires PyTorch & CUDA device with TE MXFP8Tensor support")
+        if Utils.world_size < 2:
+            pytest.skip("Requires at least 2 distributed ranks for ZeRO sharding")
+
+        outputs = TestMegatronFSDPE2E._training_loop(
+            use_megatron_fsdp=True,
+            use_megatron_fsdp_v2=True,
+            ckpt_format="fsdp_dtensor",
+            data_parallel_sharding_strategy=strategy,
+            train_iters=3,
+            seq_length=64,
+            micro_batch_size=1,
+            global_batch_size=8,
+            init_model_with_meta_device=False,
+            gradient_accumulation_fusion=False,
+            overlap_param_gather=False,
+            overlap_grad_reduce=False,
+            **precision_configs,
+        )
+
+        if torch.distributed.get_rank() != 0:
+            return
+
+        assert len(outputs) == 3
+        for step, output in enumerate(outputs):
+            loss = output["lm loss"]
+            assert torch.isfinite(loss), (
+                f"Non-finite loss at step {step}, strategy={strategy}, "
+                f"precision={precision_configs}"
+            )
 
 
 def compare_losses(loss_a: float, loss_b: float, reference: str = "b"):

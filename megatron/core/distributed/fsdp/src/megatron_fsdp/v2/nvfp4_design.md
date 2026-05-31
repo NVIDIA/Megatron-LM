@@ -22,7 +22,7 @@ FSDP path, following the same patterns used for FP8 support.
 
 ### 2.2 What already works (FSDP v2 FP8 path)
 
-- `FullyShardMixedPrecisionPolicy` (in `v2/mixed_precision.py`) handles
+- `MixedPrecisionPolicy` (in `v2/mixed_precision.py`) handles
   FP8 / MXFP8 detection, buffer dtype, raw-data extraction, post-unshard
   processing, post-reshard cache invalidation, and main→model quantization.
 - `ParameterGroup` creates 3–4 `DataParallelBuffer` instances:
@@ -69,7 +69,7 @@ different byte offsets appropriate for that buffer's dtype/shape.
 
 ### 4.2 Policy-driven shape transform
 
-The `FullyShardMixedPrecisionPolicy` already owns dtype and raw-data decisions.
+The `MixedPrecisionPolicy` already owns dtype and raw-data decisions.
 We extend it with an `nvfp4` sub-policy (analogous to `fp8`) that:
 
 - Returns `torch.uint8` from `model_weight_buffer_dtype()`.
@@ -108,11 +108,11 @@ class FullyShardNVFP4Policy:
     recipe: Optional[str] = None
 ```
 
-**Extend `FullyShardMixedPrecisionPolicy`** with `nvfp4` field:
+**Extend `MixedPrecisionPolicy`** with `nvfp4` field:
 
 ```python
 @dataclass(frozen=True)
-class FullyShardMixedPrecisionPolicy:
+class MixedPrecisionPolicy:
     ...
     fp4_param_gather: bool = False
     fp4_recipe: Optional[str] = None
@@ -227,7 +227,7 @@ Already has `fp4_param_gather: bool = False` at line 75. No change needed.
 **`_init_with_fully_shard()`** — pass FP4 configuration into the policy:
 
 ```python
-fully_shard_mp_policy = FullyShardMixedPrecisionPolicy(
+fully_shard_mp_policy = MixedPrecisionPolicy(
     ...
     nvfp4=FullyShardNVFP4Policy(
         enabled=ddp_config.fp4_param_gather,
