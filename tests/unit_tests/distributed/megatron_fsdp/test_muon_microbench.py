@@ -3,8 +3,10 @@
 
 Replays just `FSDPTensorParallelMuon.step()` against fake DTensors
 reconstructed from a captured per-rank dump of a real 2-node / 8-rank
-training run. The dump JSON files live next to this test file; the
-dump's `world_size` must match the launch world size.
+training run. The dump JSON files live next to this test file and only
+record parameter sharding (global shape, per-rank local shape,
+placements, mesh layout). The optimizer is constructed by this test with
+hardcoded hyperparameters typical for Muon training.
 
 Launch:
     cd Megatron-LM
@@ -12,7 +14,6 @@ Launch:
         tests/unit_tests/distributed/megatron_fsdp/test_muon_microbench.py -v -s
 """
 
-import inspect
 import json
 import os
 import pathlib
@@ -35,33 +36,6 @@ from megatron.core.optimizer.emerging_optimizers import (
     HAVE_EMERGING_OPTIMIZERS,
     FSDPTensorParallelMuon,
 )
-
-
-# When MUON_BENCH_DISABLE_USE_SYRK=1, simulate an unpatched EO `main` where
-# `newton_schulz_tp` does not accept `use_syrk`: strip the kwarg before
-# dispatching. Lets us validate the bench against EO origin/main without
-# requiring the (still-unmerged) EO patch that adds `use_syrk` to the TP path.
-if os.environ.get("MUON_BENCH_DISABLE_USE_SYRK", "0") == "1":
-    import emerging_optimizers.orthogonalized_optimizers.muon_utils as _eo_mu
-    import megatron.core.optimizer.emerging_optimizers as _mcore_eo
-
-    _eo_orig_ns_tp = _eo_mu.newton_schulz_tp
-
-    # Kwargs added by the (still-unmerged) EO `newton_schulz_tp` patch.
-    _PATCH_ONLY_NS_TP_KWARGS = (
-        "use_syrk",
-        "distributed_gram_recurrence",
-        "distributed_gram_refresh_interval",
-    )
-
-    def _eo_ns_tp_no_syrk(*args, **kwargs):
-        for k in _PATCH_ONLY_NS_TP_KWARGS:
-            kwargs.pop(k, None)
-        return _eo_orig_ns_tp(*args, **kwargs)
-
-    # Patch both the EO module and Megatron's rebound name (`from ... import`).
-    _eo_mu.newton_schulz_tp = _eo_ns_tp_no_syrk
-    _mcore_eo.newton_schulz_tp = _eo_ns_tp_no_syrk
 
 
 SPEC_DIR = pathlib.Path(__file__).parent
@@ -162,11 +136,11 @@ def _make_dtensor_from_spec(p_spec: dict, mesh, device):
     """Build a DTensor matching the recorded global shape + per-rank local shape.
 
     The dump captures the M-FSDP-specific layout where `_local_tensor` can
-    reflect a TP-shard view while the placements declare additional
-    sharding handled at gather time. We honor whatever the spec recorded:
-    allocate the recorded `local_shape`, pass the recorded `placements`,
-    and let `update_uneven_dtensor_chunk_metadata` install the chunk-list
-    bookkeeping M-FSDP relies on.
+    reflect a TP-shard view while the placements declare additional sharding
+    handled at gather time. We honor whatever the spec recorded: allocate the
+    recorded `local_shape`, pass the recorded `placements`, and let
+    `update_uneven_dtensor_chunk_metadata` install the chunk-list bookkeeping
+    M-FSDP relies on.
     """
     dtype = _parse_dtype(p_spec["dtype"])
     local_shape = tuple(p_spec["local_shape"])
@@ -188,25 +162,14 @@ def _make_dtensor_from_spec(p_spec: dict, mesh, device):
     return dt
 
 
-def _attach_metadata(dt: torch.Tensor, p_spec: dict) -> None:
-    """Copy the per-param attrs the optimizer reads."""
-    if p_spec.get("partition_dim") is not None:
-        dt.partition_dim = p_spec["partition_dim"]
-    if p_spec.get("tensor_model_parallel") is not None:
-        dt.tensor_model_parallel = p_spec["tensor_model_parallel"]
-    if p_spec.get("is_qkv"):
-        dt.is_qkv = True
-    if p_spec.get("name"):
-        dt.megatron_fsdp_param_name = p_spec["name"]
-
-
 # ---------- Mesh + process groups ----------
 
 
 def _build_mesh(spec: dict):
-    p0 = spec["groups"][0]["params"][0]
     return init_device_mesh(
-        "cuda", tuple(p0["mesh_shape"]), mesh_dim_names=tuple(p0["mesh_dim_names"])
+        "cuda",
+        tuple(spec["mesh_shape"]),
+        mesh_dim_names=tuple(spec["mesh_dim_names"]),
     )
 
 
@@ -221,72 +184,59 @@ def _build_pg_collection(mesh):
     return pgc
 
 
-# ---------- Optimizer construction ----------
-
-
-def _build_optimizer(spec: dict, param_groups, pg_collection, dp_group, override_lr):
-    opt_cfg = dict(spec["optimizer"])
-    # Reduce reliance on patches: if requested, disable use_syrk so we don't
-    # depend on Emerging-Optimizers patches that add `use_syrk` to
-    # `newton_schulz_tp`. Set MUON_BENCH_DISABLE_USE_SYRK=1 to test EO origin/main.
-    if os.environ.get("MUON_BENCH_DISABLE_USE_SYRK", "0") == "1":
-        opt_cfg["use_syrk"] = False
-    sig = inspect.signature(FSDPTensorParallelMuon.__init__)
-    accepted = set(sig.parameters)
-    kwargs = {k: v for k, v in opt_cfg.items() if k in accepted}
-    # Per-group hyperparameters; override lr (dump captures warmup-step-0 lr=0).
-    for g in param_groups:
-        g["lr"] = override_lr
-    return FSDPTensorParallelMuon(
-        params=param_groups, dp_group=dp_group, pg_collection=pg_collection, **kwargs
-    )
+# ---------- Param + optimizer construction ----------
 
 
 def _build_params_and_grads(spec: dict, mesh, device):
-    """Build DTensor params + grads from the loaded spec, grouped as in the dump."""
-    param_groups = []
-    for g_spec in spec["groups"]:
-        ps = []
-        for p_spec in g_spec["params"]:
-            p = _make_dtensor_from_spec(p_spec, mesh, device)
-            _attach_metadata(p, p_spec)
-            # Random gradient matching the param's DTensor layout.
-            grad_local = torch.randn_like(p._local_tensor, dtype=torch.float32).to(
-                dtype=p.dtype
-            )
-            placements = [_parse_placement(s) for s in p_spec["placements"]]
-            global_stride = torch.empty(
-                tuple(p_spec["global_shape"]), dtype=p.dtype, device=device
-            ).stride()
-            grad = DTensor.from_local(
-                local_tensor=grad_local,
-                device_mesh=mesh,
-                placements=placements,
-                shape=torch.Size(tuple(p_spec["global_shape"])),
-                stride=global_stride,
-                run_check=False,
-            )
-            update_uneven_dtensor_chunk_metadata(grad)
-            p.grad = grad
-            ps.append(p)
-        param_groups.append(
-            {
-                "params": ps,
-                "lr": float(g_spec.get("lr", 0.0)),
-                "momentum": float(g_spec.get("momentum", 0.9)),
-                "weight_decay": float(g_spec.get("weight_decay", 0.0)),
-            }
+    """Build DTensor params + random grads from the slim spec."""
+    params = []
+    for p_spec in spec["params"]:
+        p = _make_dtensor_from_spec(p_spec, mesh, device)
+        # Random gradient matching the param's DTensor layout.
+        grad_local = torch.randn_like(p._local_tensor, dtype=torch.float32).to(dtype=p.dtype)
+        placements = [_parse_placement(s) for s in p_spec["placements"]]
+        global_stride = torch.empty(
+            tuple(p_spec["global_shape"]), dtype=p.dtype, device=device
+        ).stride()
+        grad = DTensor.from_local(
+            local_tensor=grad_local,
+            device_mesh=mesh,
+            placements=placements,
+            shape=torch.Size(tuple(p_spec["global_shape"])),
+            stride=global_stride,
+            run_check=False,
         )
-    return param_groups
+        update_uneven_dtensor_chunk_metadata(grad)
+        p.grad = grad
+        params.append(p)
+    # Single param group; bench picks the hyperparameters.
+    return [{"params": params}]
 
 
-# ---------- Tests ----------
+def _build_optimizer(param_groups, pg_collection, dp_group):
+    """Construct a `FSDPTensorParallelMuon` with typical Muon hyperparameters.
 
-
-def _check_spec_world_size(spec, world_size):
-    assert spec["world_size"] == world_size, (
-        f"spec world_size={spec['world_size']} != launch world_size={world_size}"
+    The JSON fixtures only describe parameter sharding; the choice of
+    optimizer hyperparameters is the bench's concern. These values are
+    representative for Muon training.
+    """
+    return FSDPTensorParallelMuon(
+        params=param_groups,
+        dp_group=dp_group,
+        pg_collection=pg_collection,
+        lr=8e-4,
+        momentum=0.9,
+        weight_decay=0.1,
+        num_ns_steps=5,
+        coefficient_type="quintic",
+        scale_mode="spectral",
+        extra_scale_factor=0.2,
+        tp_mode="blockwise",
+        split_qkv=False,
     )
+
+
+# ---------- Test ----------
 
 
 def test_muon_step_smoke(distributed_setup):
@@ -300,23 +250,20 @@ def test_muon_step_smoke(distributed_setup):
     device = distributed_setup["device"]
 
     spec = _load_spec(rank)
-    _check_spec_world_size(spec, world_size)
+    assert spec["world_size"] == world_size, (
+        f"spec world_size={spec['world_size']} != launch world_size={world_size}"
+    )
 
     mesh = _build_mesh(spec)
     pg = _build_pg_collection(mesh)
-    # For both 2-node ZeRO-3 and 32-node HSDP, the inner FSDP all-gather group
-    # is `dp_cp`. Outer HSDP (`outer_fsdp_dp`) replication is handled by the
-    # optimizer internally via the mesh.
     dp_group = mesh.get_group("dp_cp")
 
     param_groups = _build_params_and_grads(spec, mesh, device)
-    optimizer = _build_optimizer(
-        spec, param_groups, pg_collection=pg, dp_group=dp_group, override_lr=8e-4
-    )
+    optimizer = _build_optimizer(param_groups, pg_collection=pg, dp_group=dp_group)
 
     # Spot-check: first param's local shape on this rank matches the spec.
     first_param = param_groups[0]["params"][0]
-    first_spec = spec["groups"][0]["params"][0]
+    first_spec = spec["params"][0]
     assert tuple(first_param._local_tensor.shape) == tuple(first_spec["local_shape"])
 
     warmup = 60
