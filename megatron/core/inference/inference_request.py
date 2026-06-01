@@ -381,6 +381,9 @@ class DynamicInferenceRequest(InferenceRequest):
     # Computed field - not passed by caller
     precomputed_block_hashes: List[int] = field(default_factory=list)
 
+    # Set by the context on prefix-cache hit; accumulates across chunked-prefill rounds.
+    prefix_blocks_matched: int = 0
+
     def __post_init__(self):
         self.sampling_params = copy.deepcopy(self.sampling_params)
         if self.prompt_tokens is not None:

@@ -2735,6 +2735,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         if num_matched_blocks > 0:
             self.prefix_cache_hits += 1
             self.prefix_cache_blocks_matched += num_matched_blocks
+            # Accumulate across chunked-prefill rounds.
+            req.prefix_blocks_matched += num_matched_blocks
 
         # Slice tokens to skip matched prefix
         this_round_tokens = req.remaining_prompt_tokens[prefix_skip_tokens:prefill_chunk_length]
@@ -3798,4 +3800,43 @@ class DynamicInferenceContext(BaseInferenceContext):
             'active_token_count': int(self.active_token_count),
             'total_request_count': int(total_request_count),
             'max_requests': int(self.max_requests),
+        }
+
+    def get_mamba_state_utilization_stats(self) -> dict:
+        """Compute Mamba SSM/conv state buffer utilization for the current step.
+
+        Hybrid (attention + Mamba) models allocate per-request Mamba state slots
+        independently of the KV block buffer. KV cache utilization alone is
+        therefore misleading on these models; this helper exposes the parallel
+        Mamba-side numbers so capacity studies and disaggregated-inference
+        analyses can see when the Mamba buffer becomes the bottleneck.
+
+        Returns:
+            An empty dict on non-hybrid models. Otherwise:
+                num_mamba_layers (int): Number of Mamba layers.
+                mamba_slots_total (int): Total allocated request slots.
+                mamba_slots_used (int): Slots in use by active+paused requests.
+                mamba_utilization (float): used / total in [0, 1].
+                mamba_bytes_per_slot (int): Bytes of state per request slot.
+                mamba_bytes_used (int): mamba_bytes_per_slot * slots_used.
+                mamba_bytes_total (int): mamba_bytes_per_slot * slots_total.
+        """
+        if not getattr(self, "is_hybrid_model", False) or self.num_mamba_layers == 0:
+            return {}
+
+        conv_bytes = math.prod(self.mamba_conv_states_shape) * self.mamba_conv_states_dtype.itemsize
+        ssm_bytes = math.prod(self.mamba_ssm_states_shape) * self.mamba_ssm_states_dtype.itemsize
+        bytes_per_slot = int(self.num_mamba_layers * (conv_bytes + ssm_bytes))
+
+        slots_total = int(self.max_requests)
+        slots_used = int(self.total_request_count)
+        utilization = float(slots_used) / float(slots_total) if slots_total > 0 else 0.0
+        return {
+            'num_mamba_layers': int(self.num_mamba_layers),
+            'mamba_slots_total': slots_total,
+            'mamba_slots_used': slots_used,
+            'mamba_utilization': utilization,
+            'mamba_bytes_per_slot': bytes_per_slot,
+            'mamba_bytes_used': bytes_per_slot * slots_used,
+            'mamba_bytes_total': bytes_per_slot * slots_total,
         }
