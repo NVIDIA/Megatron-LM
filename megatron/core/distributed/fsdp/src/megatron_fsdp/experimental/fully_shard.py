@@ -16,6 +16,7 @@
 
 import dataclasses
 from collections.abc import Callable, Iterable
+from typing import cast
 
 import torch
 import torch.distributed as dist
@@ -176,20 +177,18 @@ class ParameterGroup:
         # ---------------------------------------------------------------------
         sharded_parameters: list[nn.Parameter] = []
         unsharded_parameters: list[nn.Parameter] = []
-        grad_dtype = self.main_grad.local_buffer.dtype if self.requires_grad else None
+        main_grad_dtype = self.main_grad.local_buffer.dtype if self.main_grad is not None else None
         for index, parameter in enumerate(parameters.values()):
             parameter.data = self._unsharded_model_weight.get_tensor(index)
             parameter.grad = None
-            if grad_dtype:
-                parameter.grad_dtype = grad_dtype
             setattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, self)
             unsharded_parameters.append(parameter)
 
             sharded_parameter = nn.Parameter(
                 self.main_weight.get_dtensor(index), requires_grad=parameter.requires_grad
             )
-            if grad_dtype:
-                sharded_parameter.grad_dtype = grad_dtype
+            if main_grad_dtype:
+                sharded_parameter.grad_dtype = main_grad_dtype
             setattr(sharded_parameter, _CONTAINING_PARAMETER_GROUP_ATTR, self)
             sharded_parameters.append(sharded_parameter)
         self.sharded_parameters = tuple(sharded_parameters)
@@ -260,11 +259,6 @@ class ParameterGroup:
         for name, parameter in zip(self.parameter_names, self.unsharded_parameters, strict=True):
             if parameter.grad is None:
                 raise RuntimeError(f"Missing gradient for FSDP parameter {name!r}.")
-            assert parameter.grad.dtype == self.main_grad.local_buffer.dtype, (
-                "FSDP unsharded parameter grad dtype should be guaranteed by grad_dtype: "
-                f"parameter {name!r} has grad dtype {parameter.grad.dtype}, "
-                f"expected main_grad dtype {self.main_grad.local_buffer.dtype}."
-            )
             grads.append(parameter.grad)
 
         partial_grad = DBuffer.distribute_tensors(
@@ -274,11 +268,21 @@ class ParameterGroup:
         # zero_grad(set_to_none=True) clears sharded parameter grads, so the next
         # backward can reduce directly into main_grad. zero_grad(set_to_none=False)
         # leaves sharded grads installed, so this backward accumulates into main_grad.
-        if has_grad(self.sharded_parameters):
-            reduced_grad = partial_grad.redistribute(self.main_grad.placements)
-            self.main_grad.local_buffer.add_(reduced_grad.local_buffer)
-        else:
+        has_sharded_grads = has_grad(self.sharded_parameters)
+        can_reduce_into_main_grad = (
+            not has_sharded_grads
+            and partial_grad.local_buffer.dtype == self.main_grad.local_buffer.dtype
+        )
+        if can_reduce_into_main_grad:
             partial_grad.redistribute(self.main_grad.placements, out=self.main_grad)
+        else:
+            reduced_grad = partial_grad.redistribute(self.main_grad.placements)
+            if has_sharded_grads:
+                self.main_grad.local_buffer.add_(reduced_grad.local_buffer)
+            else:
+                self.main_grad.local_buffer.copy_(reduced_grad.local_buffer)
+
+        if not has_sharded_grads:
             for index, parameter in enumerate(self.sharded_parameters):
                 parameter.grad = self.main_grad.get_dtensor(index)
 
@@ -316,9 +320,10 @@ class FsdpModule:
         self._register_hooks()
 
     def _register_hooks(self) -> None:
-        self.register_forward_pre_hook(lambda _module, _args: self.pre_forward())
-        self.register_forward_hook(lambda _module, _args, _output: self.post_forward())
-        self.register_full_backward_pre_hook(lambda _module, _grad_output: self.pre_backward())
+        module = cast(nn.Module, self)
+        module.register_forward_pre_hook(lambda _module, _args: self.pre_forward())
+        module.register_forward_hook(lambda _module, _args, _output: self.post_forward())
+        module.register_full_backward_pre_hook(lambda _module, _grad_output: self.pre_backward())
         # Gradient reduction is parameter-completion based: once every owned
         # Parameter has accumulated its grad, this FSDP unit can reduce and
         # reshard. Module full-backward hooks can fire before that when module
@@ -399,11 +404,12 @@ def fully_shard(
 
 def _axis_index(mesh: DeviceMesh, axis: MeshAxis) -> int:
     if isinstance(axis, int):
-        if axis < 0:
-            axis += mesh.ndim
-        if axis < 0 or axis >= mesh.ndim:
+        axis_index = axis
+        if axis_index < 0:
+            axis_index += mesh.ndim
+        if axis_index < 0 or axis_index >= mesh.ndim:
             raise ValueError(f"Mesh axis {axis} is out of bounds for mesh ndim {mesh.ndim}.")
-        return axis
+        return axis_index
 
     dim_names = mesh.mesh_dim_names
     if dim_names is None or axis not in dim_names:
