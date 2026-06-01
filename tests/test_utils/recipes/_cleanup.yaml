@@ -17,15 +17,34 @@ spec:
 
     THRESHOLD_DAYS=14
 
-    # CLEANUP_PATHS is the newline-separated list of GC roots. For each
-    # path, the recipe lists direct children older than THRESHOLD_DAYS.
+    # CLEANUP_PATHS: newline-separated scan roots. The recipe descends each
+    # root and lists files older than THRESHOLD_DAYS, then a second pass
+    # for empty directories.
+    # CLEANUP_PROTECT: newline-separated subtrees to prune (skip entirely)
+    # during traversal.
     if [[ -z "${{CLEANUP_PATHS:-}}" ]]; then
         echo "CLEANUP_PATHS env var not set; nothing to do."
         exit 0
     fi
 
-    echo "[DRY-RUN] Pruning entries older than $THRESHOLD_DAYS days under:"
+    PRUNE_ARGS=()
+    if [[ -n "${{CLEANUP_PROTECT:-}}" ]]; then
+        while IFS= read -r protect; do
+            [[ -z "$protect" ]] && continue
+            if [[ ${{#PRUNE_ARGS[@]}} -gt 0 ]]; then
+                PRUNE_ARGS+=( -o )
+            fi
+            PRUNE_ARGS+=( -path "$protect" )
+        done <<<"$CLEANUP_PROTECT"
+    fi
+
+    echo "[DRY-RUN] Scan roots:"
     printf '%s\n' "$CLEANUP_PATHS" | sed 's/^/  - /'
+    if [[ ${{#PRUNE_ARGS[@]}} -gt 0 ]]; then
+        echo "[DRY-RUN] Pruned subtrees:"
+        printf '%s\n' "$CLEANUP_PROTECT" | sed 's/^/  - /'
+    fi
+    echo "[DRY-RUN] Threshold: $THRESHOLD_DAYS days"
 
     while IFS= read -r path; do
         [[ -z "$path" ]] && continue
@@ -33,10 +52,18 @@ spec:
             echo "Skipping unsafe or missing path: $path"
             continue
         fi
-        echo "--- Would delete (files older than $THRESHOLD_DAYS days) from $path ---"
-        find "$path" -mindepth 1 -type f -mtime +$THRESHOLD_DAYS -print 2>/dev/null || true
-        echo "--- Would also prune (empty directories, post-file-sweep) from $path ---"
-        find "$path" -mindepth 1 -depth -type d -empty -print 2>/dev/null || true
+        echo "--- Would delete (files older than $THRESHOLD_DAYS days) under $path ---"
+        if [[ ${{#PRUNE_ARGS[@]}} -gt 0 ]]; then
+            find "$path" -mindepth 1 \( "${{PRUNE_ARGS[@]}}" \) -prune -o -type f -mtime +$THRESHOLD_DAYS -print 2>/dev/null || true
+        else
+            find "$path" -mindepth 1 -type f -mtime +$THRESHOLD_DAYS -print 2>/dev/null || true
+        fi
+        echo "--- Would also prune (empty directories, post-file-sweep) under $path ---"
+        if [[ ${{#PRUNE_ARGS[@]}} -gt 0 ]]; then
+            find "$path" -mindepth 1 \( "${{PRUNE_ARGS[@]}}" \) -prune -o -depth -type d -empty -print 2>/dev/null || true
+        else
+            find "$path" -mindepth 1 -depth -type d -empty -print 2>/dev/null || true
+        fi
         echo "--- (dry-run: no deletion) ---"
     done <<<"$CLEANUP_PATHS"
 
