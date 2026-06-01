@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import weakref
 from contextlib import nullcontext
@@ -228,6 +228,7 @@ class PostProcessNode(ScheduleNode):
             sequence_len_offset=self.chunk_state.sequence_len_offset,
             runtime_gather_output=self.chunk_state.runtime_gather_output,
             extra_block_kwargs=self.chunk_state.extra_block_kwargs,
+            return_logits=self.chunk_state.return_logits,
         )
 
         # For now, 1f1b only supports fp16 module

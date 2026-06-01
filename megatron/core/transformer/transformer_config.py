@@ -81,6 +81,10 @@ class TransformerConfig(ModelParallelConfig):
     which serves as an additional training objective.
     """
 
+    mtp_isolated_loss: bool = False
+    """If True, MTP loss only updates MTP module parameters. The MTP loss graph is
+    detached from the main decoder, shared embeddings, and output layer weights."""
+
     mtp_use_repeated_layer: bool = False
     """Use a single MTP layer repeatedly instead of multiple separate layers."""
 

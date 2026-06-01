@@ -1,4 +1,4 @@
-# Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 from typing import Literal, Optional
@@ -403,12 +403,15 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         loss_mask: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask: Optional[Tensor] = None,
+        return_logits: bool = False,
     ) -> Tensor:
         """Forward function of the Hybrid model. This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
         processing layer (optional).
 
         It either returns the Loss values if labels are given or the final hidden units
+        unless `return_logits` is True. In that case, labels still drive MTP auxiliary
+        loss, while the main LM head returns logits for an external loss.
         """
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
@@ -572,7 +575,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             )
             self.output_layer.sequence_parallel = True
 
-        if labels is None:
+        if return_logits or labels is None:
+            # `return_logits` only controls the main LM output. Labels, when present,
+            # have already been consumed by MTP auxiliary loss above.
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 

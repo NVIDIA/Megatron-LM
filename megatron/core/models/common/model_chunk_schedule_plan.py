@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from contextlib import nullcontext
 from typing import Optional
@@ -325,6 +325,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         runtime_gather_output: Optional[bool] = None,
         loss_mask: Optional[Tensor] = None,
         padding_mask=None,
+        return_logits: bool = False,
     ):
         """Initialize the schedule plan of all Transformer layers' sub-modules.
 
@@ -342,6 +343,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             extra_block_kwargs: Additional keyword arguments for blocks.
             runtime_gather_output: Whether to gather output at runtime.
             loss_mask (torch.Tensor): Used to mask out some portions of the loss
+            return_logits (bool): Return logits instead of main LM loss when labels
+                are provided. MTP auxiliary loss still consumes labels.
 
         Returns:
             The model chunk schedule plan.
@@ -365,6 +368,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         self._model_chunk_state.loss_mask = loss_mask
         self._model_chunk_state.packed_seq_params = packed_seq_params
         self._model_chunk_state.padding_mask = padding_mask
+        self._model_chunk_state.return_logits = return_logits
         self._model_chunk_state.extra_block_kwargs = extra_block_kwargs
         self._model_chunk_state.runtime_gather_output = runtime_gather_output
         self._model_chunk_state.model = model
