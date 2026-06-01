@@ -53,7 +53,12 @@ from torch.distributed.checkpoint.planner import (
 )
 
 from megatron.core import dist_checkpointing
-from megatron.core.dist_checkpointing.core import maybe_load_config
+from megatron.core._rank_utils import safe_get_rank
+from megatron.core.dist_checkpointing.core import (
+    check_is_distributed_checkpoint,
+    maybe_load_config,
+)
+from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.dist_checkpointing.mapping import (
     ShardedBase,
     ShardedObject,
@@ -417,7 +422,7 @@ class _WeightedMergeDirectOutputSavePlanner(SavePlanner):
 
 
 def is_rank_0() -> bool:
-    return not dist.is_available() or not dist.is_initialized() or dist.get_rank() == 0
+    return safe_get_rank() == 0
 
 
 def print_rank_0(*args: Any, **kwargs: Any) -> None:
@@ -735,7 +740,7 @@ def resolve_checkpoint_dir(path: Union[str, Path]) -> Path:
     """Resolve direct, release, or latest-marker checkpoint paths."""
 
     checkpoint = Path(path)
-    if (checkpoint / "metadata.json").exists():
+    if check_is_distributed_checkpoint(str(checkpoint)):
         return checkpoint
 
     if (checkpoint / LATEST_CHECKPOINTED_ITERATION).exists():
@@ -744,7 +749,7 @@ def resolve_checkpoint_dir(path: Union[str, Path]) -> Path:
             resolved = checkpoint / "release"
         else:
             resolved = checkpoint / iteration_dir_name(latest)
-        if not (resolved / "metadata.json").exists():
+        if not check_is_distributed_checkpoint(str(resolved)):
             raise WeightedMergeError(
                 f"{checkpoint} points to {resolved}, but that is not a distributed checkpoint."
             )
@@ -777,7 +782,7 @@ def write_latest_checkpointed_iteration(checkpoint_dir: Union[str, Path], iterat
     """Write Megatron's latest-checkpoint marker for an iteration checkpoint."""
 
     checkpoint_dir = Path(checkpoint_dir)
-    if not (checkpoint_dir / "metadata.json").exists():
+    if not check_is_distributed_checkpoint(str(checkpoint_dir)):
         raise WeightedMergeError(
             f"Refusing to write {LATEST_CHECKPOINTED_ITERATION} because {checkpoint_dir} "
             "does not contain distributed checkpoint metadata."
@@ -972,7 +977,7 @@ def _path_label(path: tuple[Union[str, int], ...], leaf: Any = None) -> str:
 
 
 def _is_sharded_leaf(value: Any) -> bool:
-    return hasattr(value, "data") and hasattr(value, "replica_id")
+    return isinstance(value, ShardedBase)
 
 
 def _is_extra_state(path: tuple[Union[str, int], ...], leaf: Any) -> bool:
@@ -1010,7 +1015,7 @@ def _assign_leaf_data(leaf: Any, value: Any) -> None:
 def _move_sharded_leaf_tensors_to_cpu(sharded_state_dict: ShardedStateDict) -> ShardedStateDict:
     """Replace sharded tensor leaf buffers with CPU buffers of the same shape and dtype."""
 
-    for _, leaf in _flatten_items(sharded_state_dict):
+    for leaf in nested_values(sharded_state_dict):
         tensor = _as_tensor(leaf)
         if tensor is None:
             continue
@@ -1230,7 +1235,7 @@ def _reject_existing_atomic_overwrite(
 
 
 def _require_publishable_checkpoint_dir(checkpoint_dir: Path) -> None:
-    if not (checkpoint_dir / "metadata.json").exists():
+    if not check_is_distributed_checkpoint(str(checkpoint_dir)):
         raise WeightedMergeError(
             f"Refusing to publish {checkpoint_dir} because distributed checkpoint metadata is missing."
         )
