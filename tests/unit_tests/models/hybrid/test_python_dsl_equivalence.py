@@ -25,6 +25,7 @@ from megatron.core.models.hybrid import (
     CommonLayerConfig,
     CrossEntropyLayerConfig,
     EmbeddingLayerConfig,
+    HybridModelConfig,
     MambaLayerConfig,
     MLPLayerConfig,
 )
@@ -32,7 +33,6 @@ from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from megatron.training.models.hybrid import HybridModelConfig
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -66,7 +66,10 @@ def _loss() -> CrossEntropyLayerConfig:
 
 
 def _build_model_from_recipe(recipe: HybridModelConfig) -> HybridModel:
-    return HybridModel.from_recipe(recipe)
+    # Phase 2: call the new TC-free constructor directly. ``from_recipe``
+    # is now a thin alias; the equivalence between the two paths is
+    # asserted in test_recipe_constructor.py.
+    return HybridModel(config=recipe)
 
 
 @pytest.mark.internal
