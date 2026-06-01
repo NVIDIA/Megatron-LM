@@ -18,11 +18,15 @@ class Symbols:
     GDN = 'G'
     ATTENTION = "*"
     DS_ATTENTION = "D"
+    CSA = "C"  # DSv4 Compressed Sparse Attention (compress_ratio=4)
+    HCA = "H"  # DSv4 Heavily Compressed Attention (compress_ratio=128)
     MLP = "-"
     MOE = 'E'
     PIPE = '|'
     MTP_SEPARATOR = "/"
-    VALID_LAYERS = {MAMBA, GDN, ATTENTION, DS_ATTENTION, MLP, MOE}
+    VALID_LAYERS = {MAMBA, GDN, ATTENTION, DS_ATTENTION, CSA, HCA, MLP, MOE}
+    # MLA-based attention layers (incompatible with standard '*' attention in one model).
+    MLA_ATTENTION = {DS_ATTENTION, CSA, HCA}
 
     @classmethod
     def name_sorted_valid_layer_symbols(cls) -> list[str]:
@@ -292,9 +296,10 @@ def _validate_pattern(pattern: str, pattern_name: str, allow_pipe: bool = False)
                 f"Valid symbols are: {valid_chars}"
             )
 
-    # Disallow Attention + MLA/DSA hybridity.
-    if Symbols.ATTENTION in pattern and Symbols.DS_ATTENTION in pattern:
-        raise ValueError("Not supported to have both Attention and MLA/DSA in one model")
+    # Disallow standard Attention ('*') mixed with any MLA-based attention (D/C/H).
+    # MLA variants (DSA / CSA / HCA) may freely coexist with each other.
+    if Symbols.ATTENTION in pattern and any(s in pattern for s in Symbols.MLA_ATTENTION):
+        raise ValueError("Not supported to have both Attention and MLA/DSA/CSA/HCA in one model")
 
 
 def validate_segment_layers(segment: str) -> List[str]:
@@ -320,9 +325,9 @@ def validate_segment_layers(segment: str) -> List[str]:
                 f"one of {Symbols.VALID_LAYERS}"
             )
 
-    # Disallow Attention + MLA/DSA hybridity.
-    if Symbols.ATTENTION in segment and Symbols.DS_ATTENTION in segment:
-        raise ValueError("Not supported to have both Attention and MLA/DSA in one model")
+    # Disallow standard Attention ('*') mixed with any MLA-based attention (D/C/H).
+    if Symbols.ATTENTION in segment and any(s in segment for s in Symbols.MLA_ATTENTION):
+        raise ValueError("Not supported to have both Attention and MLA/DSA/CSA/HCA in one model")
 
     return layer_type_list
 
