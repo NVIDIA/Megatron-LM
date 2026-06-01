@@ -13,7 +13,7 @@ Megatron Core and Megatron-LM are open-source tools that are typically used toge
 
 ## Megatron Core
 
-NVIDIA Megatron Core is a library of essential building blocks for highly efficient large-scale generative AI training. It can be used to train models with high throughput at scale across thousands of GPUs. It provides an extensive set of tools for multimodal and speech AI. It expands Megatron-LM's capabilities.
+NVIDIA Megatron Core is a library of essential building blocks for highly efficient large-scale generative AI training. It can be used to train models with high throughput at scale across thousands of GPUs. It provides an extensive set of tools for multimodal and speech AI.
 
 Megatron-Core contains GPU-optimized techniques featuring advanced parallelism strategies, optimizations like FP8 training, and support for the latest LLM, MoE, and multimodal architectures. It abstracts these techniques into composable and modular APIs.
 

@@ -15,7 +15,7 @@ This guide walks you through running your first training jobs with Megatron Core
 
 - **Python**: 3.10 or later
 - **CUDA**: 12.0 or later
-- **GPU**: NVIDIA GPU with Tensor Core support (A100, H100, etc.)
+- **GPU**: NVIDIA GPU with Tensor Core support (A100, H100, and similar)
 - **NCCL**: 2.18 or later (installed automatically with PyTorch)
 
 ## Minimal Training Example
@@ -62,8 +62,8 @@ python tools/preprocess_data.py \
 ### Key Arguments
 
 - `--input`: Path to input JSON/JSONL file
-- `--output-prefix`: Prefix for output binary files (.bin and .idx)
-- `--tokenizer-type`: Tokenizer type (e.g., `HuggingFaceTokenizer`, `GPT2BPETokenizer`, `SentencePieceTokenizer`, `Llama2Tokenizer`)
+- `--output-prefix`: Prefix for output binary files (.bin and .idx). The .bin file contains the tokenized data in binary format, and the .idx file contains the index for efficient random access.
+- `--tokenizer-type`: Tokenizer type (for example, `HuggingFaceTokenizer`, `GPT2BPETokenizer`, `SentencePieceTokenizer`, `Llama2Tokenizer`)
 - `--tokenizer-model`: Path to tokenizer model file (for `SentencePieceTokenizer`/`Llama2Tokenizer`, this is a `.model` file; for `HuggingFaceTokenizer`, this is the tokenizer directory path)
 - `--workers`: Number of parallel workers for processing
 - `--append-eod`: Add end-of-document token

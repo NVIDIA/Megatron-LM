@@ -19,7 +19,7 @@ When contributing it is important to ensure that changes are in line with the pr
 
 Please do file any bugs you find, keeping the following in mind:
 
-- If filing a bug, i.e. you have found something that doesn't work as expected, use the BUG template.
+- If filing a bug, that is, you have found something that doesn't work as expected, use the BUG template.
 - If you've found a regression in speed or accuracy use the REGRESSION template.
 - If you are requesting a new feature or modification of an existing feature use the ENHANCEMENT template.
 - If opening an issue to ask a question no template is needed but please make your question as clear and concise as possible.
@@ -33,7 +33,7 @@ Please do file any bugs you find, keeping the following in mind:
 ### Do
 
 - Format new code in a style that is consistent with the file being changed. Megatron-LM doesn't (yet) have a style guide or enforced formatting.
-- Split your changes into separate, atomic commits i.e. A commit per feature or fix.
+- Split your changes into separate, atomic commits, that is, a commit per feature or fix.
 - Make sure your commits are rebased on the main branch.
 - Write the commit message subject line in the imperative mood ("Change the default argument for X", not "Changed the default argument for X").
 - Write your commit messages in proper English, with care and punctuation.
