@@ -16,7 +16,6 @@ from torch.distributed.tensor import DTensor
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Flat,
-    FsdpModule,
     Placements,
     fully_shard,
 )
@@ -135,22 +134,10 @@ def _mb(num_bytes: int) -> str:
 
 
 @pytest.mark.distributed
-def test_fully_shard_train_step_matches_baseline(setup: DistributedSetup):
-    """A minimal per-module FSDP train step should match single-rank SGD."""
+def test_fully_shard_losses_match_baseline(setup: DistributedSetup):
+    """Minimal per-module FSDP training should match single-rank SGD."""
     if setup.world_size < 2:
         pytest.skip("This test requires at least 2 ranks.")
-
-    def full_named_parameters(module: nn.Module) -> dict[str, torch.Tensor]:
-        result = {}
-        for module_name, child in module.named_modules():
-            if not isinstance(child, FsdpModule):
-                continue
-            prefix = f"{module_name}." if module_name else ""
-            for group in child.parameter_groups():
-                full_weight = group.main_weight.allgather(0)
-                for index, name in enumerate(group.parameter_names):
-                    result[f"{prefix}{name}"] = full_weight.get_tensor(index).detach().clone()
-        return result
 
     mesh = init_device_mesh(setup.device.type, (setup.world_size,))
     torch.manual_seed(1234)
@@ -160,24 +147,31 @@ def test_fully_shard_train_step_matches_baseline(setup: DistributedSetup):
 
     fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
     fully_shard(model.fc2, mesh=mesh, placements=_flat_placements())
+    baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
 
     x = torch.randn(3, 8, device=setup.device)
     target = torch.randn(3, 4, device=setup.device)
 
-    baseline_loss = torch.nn.functional.mse_loss(baseline(x), target)
-    baseline_loss.backward()
-    with torch.no_grad():
-        for parameter in baseline.parameters():
-            parameter.add_(parameter.grad, alpha=-0.05)
+    for step in range(5):
+        baseline_optimizer.zero_grad()
+        optimizer.zero_grad()
 
-    loss = torch.nn.functional.mse_loss(model(x), target)
-    loss.backward()
-    optimizer.step()
+        baseline_loss = torch.nn.functional.mse_loss(baseline(x), target)
+        loss = torch.nn.functional.mse_loss(model(x), target)
+        logger.info(
+            "FSDP train parity: rank=%s, step=%s, baseline_loss=%s, sharded_loss=%s",
+            setup.rank,
+            step,
+            baseline_loss.item(),
+            loss.item(),
+        )
+        torch.testing.assert_close(loss, baseline_loss, msg=f"Loss mismatch at step {step}.")
 
-    full_params = full_named_parameters(model)
-    for name, expected in baseline.named_parameters():
-        torch.testing.assert_close(full_params[name], expected, rtol=1e-5, atol=1e-6)
+        baseline_loss.backward()
+        loss.backward()
+        baseline_optimizer.step()
+        optimizer.step()
 
 
 @pytest.mark.distributed
