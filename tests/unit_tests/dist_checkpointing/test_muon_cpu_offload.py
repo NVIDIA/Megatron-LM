@@ -502,8 +502,10 @@ class TestSeparateDistOptPath:
 
     In this path, LayerWise only owns Muon params, and Adam's DistributedOptimizer
     is a sibling that manages its own CPU offloading via HybridDeviceOptimizer.
-    This test class requires DDP-wrapped models (via get_model) to trigger the
-    use_separate_distributed_optimizer codepath.
+
+    These tests use get_model (DDP wrapping) to trigger the new codepath.
+    optimizer_offload_fraction=1.0 ensures all Adam params are physically
+    offloaded to CPU, allowing behavioral (not just structural) assertions.
     """
 
     def setup_method(self, method) -> None:
@@ -517,6 +519,8 @@ class TestSeparateDistOptPath:
 
         Uses get_model (DDP wrapping) so model_chunks[0].ddp_config exists with
         use_distributed_optimizer=True, which triggers the new path.
+        optimizer_offload_fraction=1.0 so HybridDeviceOptimizer offloads all
+        Adam params to CPU (not just structurally present).
         """
         from tests.unit_tests.dist_checkpointing.utils import (
             init_basic_mock_args,
@@ -552,6 +556,7 @@ class TestSeparateDistOptPath:
             optimizer='muon',
             lr=0.0,
             optimizer_cpu_offload=True,
+            optimizer_offload_fraction=1.0,
         )
         optimizer = get_megatron_optimizer(config, model)
         return model, optimizer
@@ -592,6 +597,60 @@ class TestSeparateDistOptPath:
             "Expected Adam's DistributedOptimizer to use HybridDeviceOptimizer "
             "for CPU offloading in the use_separate_distributed_optimizer=True path"
         )
+
+    @pytest.mark.parametrize('tp,pp', [(2, 2)])
+    def test_new_path_adam_params_physically_on_cpu(self, tp: int, pp: int) -> None:
+        """Adam params are physically offloaded to CPU by HybridDeviceOptimizer.
+
+        With optimizer_offload_fraction=1.0, all Adam params managed by
+        HybridDeviceOptimizer should have CPU copies. This is a behavioral
+        assertion (not just structural) that the offloading actually happens.
+        """
+        if tp * pp > torch.cuda.device_count():
+            pytest.skip("Not enough GPUs")
+
+        from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
+        from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+
+        _, optimizer = self._setup_hybrid_optimizer(tp, pp)
+        assert isinstance(optimizer, ChainedOptimizer)
+
+        # Find Adam's DistOpt with HybridDeviceOptimizer
+        hybrid_opt = None
+        for child in optimizer.chained_optimizers:
+            if isinstance(child, DistributedOptimizer):
+                if isinstance(child.optimizer, HybridDeviceOptimizer):
+                    hybrid_opt = child.optimizer
+                    break
+
+        assert hybrid_opt is not None, "HybridDeviceOptimizer not found"
+
+        # With offload_fraction=1.0, all params should be routed to CPU optimizers.
+        # gpu_params_map_cpu_copy maps GPU param → CPU copy for offloaded params.
+        assert len(hybrid_opt.gpu_params_map_cpu_copy) > 0, (
+            "With offload_fraction=1.0, HybridDeviceOptimizer should have "
+            "offloaded params (gpu_params_map_cpu_copy is empty)"
+        )
+
+        # Verify the CPU copies are actually on CPU
+        for gpu_param, cpu_copy in hybrid_opt.gpu_params_map_cpu_copy.items():
+            assert not cpu_copy.is_cuda, (
+                f"CPU copy of offloaded Adam param should be on CPU, got {cpu_copy.device}"
+            )
+            assert gpu_param.is_cuda, (
+                f"Original Adam param should remain on GPU, got {gpu_param.device}"
+            )
+
+        # Verify CPU optimizers exist and have params
+        assert len(hybrid_opt.cpu_optimizers) > 0, (
+            "With offload_fraction=1.0, there should be CPU optimizer(s)"
+        )
+        cpu_param_count = sum(
+            sum(1 for _ in group['params'])
+            for opt in hybrid_opt.cpu_optimizers
+            for group in opt.param_groups
+        )
+        assert cpu_param_count > 0, "CPU optimizers should have params assigned"
 
     @pytest.mark.parametrize('tp,pp', [(2, 2)])
     def test_new_path_layerwise_only_offloads_muon_params(self, tp: int, pp: int) -> None:
