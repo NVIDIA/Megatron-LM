@@ -747,32 +747,6 @@ class Compressor(MegatronModule):
         new_tensor[:, :ratio] = prev_data
         return new_tensor
 
-    def _gated_pool_one_segment(
-        self, kv_chunk: torch.Tensor, score_chunk: torch.Tensor
-    ) -> torch.Tensor:
-        """Gated weighted pool over one length-``cutoff`` chunk (already
-        cutoff to a multiple of ``ratio``).
-
-        Inputs are post-projection ``(cutoff, b_dim, coff * head_dim)`` tensors.
-        Returns ``(cutoff // ratio, b_dim, head_dim)`` post-pool, pre-norm.
-        """
-        ratio = self.compress_ratio
-        cutoff, b_dim, _ = kv_chunk.shape
-        n_compressed = cutoff // ratio
-
-        # (n_compressed, ratio, b_dim, coff * head_dim)
-        kv_chunk = kv_chunk.view(n_compressed, ratio, b_dim, -1)
-        score_chunk = score_chunk.view(n_compressed, ratio, b_dim, -1)
-        # APE: (ratio, coff * head_dim) -> (1, ratio, 1, coff * head_dim)
-        score_chunk = score_chunk + self.ape.view(1, ratio, 1, -1)
-
-        if self.overlap:
-            kv_chunk = self._overlap_transform(kv_chunk, fill_value=0)
-            score_chunk = self._overlap_transform(score_chunk, fill_value=float("-inf"))
-
-        # (n_compressed, b_dim, head_dim)
-        return (kv_chunk * torch.softmax(score_chunk, dim=1)).sum(dim=1)
-
     def _forward_sbhd(self, x: torch.Tensor) -> Optional[torch.Tensor]:
         """SBHD path. ``x`` is ``(sq, b, hidden_size)``; returns
         ``(sq // ratio, b, head_dim)`` or ``None`` when ``sq < ratio``.
@@ -792,7 +766,15 @@ class Compressor(MegatronModule):
             score = score[:cutoff]
         n_compressed = cutoff // ratio
 
-        kv = self._gated_pool_one_segment(kv, score)  # (n_compressed, b, head_dim)
+        _, b_dim, _ = kv.shape
+        kv = kv.view(n_compressed, ratio, b_dim, -1)
+        score = score.view(n_compressed, ratio, b_dim, -1)
+        score = score + self.ape.view(1, ratio, 1, -1)
+        if self.overlap:
+            kv = self._overlap_transform(kv, fill_value=0)
+            score = self._overlap_transform(score, fill_value=float("-inf"))
+        weights = torch.softmax(score, dim=1, dtype=torch.float32).to(kv.dtype)
+        kv = (kv * weights).sum(dim=1)  # [n_compressed, b, head_dim]
         kv = self.norm(kv.to(x.dtype))
         kv = _apply_rope(
             kv,
@@ -886,7 +868,8 @@ class Compressor(MegatronModule):
 
         # Batched softmax + weighted sum — single kernel for all entries.
         # (total_comp, [2*]ratio, 1, [coff*]d)  →  (total_comp, 1, head_dim)
-        compressed_thd = (kv_grouped * torch.softmax(score_grouped, dim=1)).sum(dim=1)
+        weights = torch.softmax(score_grouped, dim=1, dtype=torch.float32).to(kv_grouped.dtype)
+        compressed_thd = (kv_grouped * weights).sum(dim=1)
 
         compressed_thd = self.norm(compressed_thd.to(dtype))
 
