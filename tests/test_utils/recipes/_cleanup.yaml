@@ -17,52 +17,26 @@ spec:
 
     THRESHOLD_DAYS=14
 
-    # CLEANUP_PATHS holds the paths to PROTECT (never delete). The recipe
-    # scans the parent directory of each protected path and lists entries
-    # older than THRESHOLD_DAYS that are *not* protected.
+    # CLEANUP_PATHS is the newline-separated list of GC roots. For each
+    # path, the recipe lists direct children older than THRESHOLD_DAYS.
     if [[ -z "${{CLEANUP_PATHS:-}}" ]]; then
         echo "CLEANUP_PATHS env var not set; nothing to do."
         exit 0
     fi
 
-    PROTECT_PATHS=()
-    while IFS= read -r p; do
-        [[ -z "$p" ]] && continue
-        PROTECT_PATHS+=("$p")
-    done <<<"$CLEANUP_PATHS"
+    echo "[DRY-RUN] Pruning entries older than $THRESHOLD_DAYS days under:"
+    printf '%s\n' "$CLEANUP_PATHS" | sed 's/^/  - /'
 
-    declare -A SEEN_PARENTS
-    PARENTS=()
-    for p in "${{PROTECT_PATHS[@]}}"; do
-        parent=$(dirname "$p")
-        if [[ -z "${{SEEN_PARENTS[$parent]:-}}" ]]; then
-            SEEN_PARENTS[$parent]=1
-            PARENTS+=("$parent")
-        fi
-    done
-
-    echo "[DRY-RUN] Protect (never delete): ${{PROTECT_PATHS[*]}}"
-    echo "[DRY-RUN] Scanning parents: ${{PARENTS[*]}}"
-    echo "[DRY-RUN] Threshold: $THRESHOLD_DAYS days"
-
-    for parent in "${{PARENTS[@]}}"; do
-        if [[ "$parent" == "/" || ! -d "$parent" ]]; then
-            echo "Skipping unsafe or missing parent: $parent"
+    while IFS= read -r path; do
+        [[ -z "$path" ]] && continue
+        if [[ "$path" == "/" || ! -d "$path" ]]; then
+            echo "Skipping unsafe or missing path: $path"
             continue
         fi
-
-        find_args=( "$parent" -mindepth 1 -maxdepth 1 -mtime +$THRESHOLD_DAYS )
-        for p in "${{PROTECT_PATHS[@]}}"; do
-            if [[ "$(dirname "$p")" == "$parent" ]]; then
-                find_args+=( ! -name "$(basename "$p")" )
-            fi
-        done
-        find_args+=( -print )
-
-        echo "--- Would delete from $parent (excluding protected entries) ---"
-        find "${{find_args[@]}}" 2>/dev/null || true
+        echo "--- Would delete from $path ---"
+        find "$path" -mindepth 1 -maxdepth 1 -mtime +$THRESHOLD_DAYS -print 2>/dev/null || true
         echo "--- (dry-run: no deletion) ---"
-    done
+    done <<<"$CLEANUP_PATHS"
 
     echo "Dry-run complete; no files removed."
 
