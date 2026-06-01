@@ -532,6 +532,13 @@ def backward_step_multimodule(
     In multi-module pipelines, tensors are organized as dictionaries with
     module names as keys. Each module's backward pass is performed independently.
     """
+
+    def _unwrap_single_tensor_list(tensor):
+        if isinstance(tensor, list):
+            assert len(tensor) == 1, "expected a single tensor for multimodule backward"
+            return tensor[0]
+        return tensor
+
     # Retain gradients on all input tensors.
     for module_name, tensor in input_tensor.items():
         if isinstance(tensor, list):
@@ -550,13 +557,14 @@ def backward_step_multimodule(
 
     # Apply grad scaling if needed (for last stage only).
     for module_name in output_tensor.keys():
-        if output_tensor_grad[module_name] is None and config.grad_scale_func is not None:
+        output_tensor_grad_module = _unwrap_single_tensor_list(output_tensor_grad[module_name])
+        if output_tensor_grad_module is None and config.grad_scale_func is not None:
             output_tensor[module_name] = config.grad_scale_func(output_tensor[module_name])
 
     # Perform backward pass for each module.
     for module_name in output_tensor.keys():
-        output_tensor_module = output_tensor[module_name]
-        output_tensor_grad_module = output_tensor_grad[module_name]
+        output_tensor_module = _unwrap_single_tensor_list(output_tensor[module_name])
+        output_tensor_grad_module = _unwrap_single_tensor_list(output_tensor_grad[module_name])
 
         # In multi-modal models like VLM, some batches may not have images.
         # In such cases, skip backward while preserving zero gradients.
