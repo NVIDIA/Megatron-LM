@@ -350,7 +350,7 @@ class BridgeCommunicator:
             num_sends = len(rank_info.send_to_ranks)
             if num_sends > 0:
                 tensor_splits = self._split_tensor_at_batch_dim(tensor_to_send, num_sends)
-                self._communicate_shapes(tensor_to_send_next=tensor_splits[0])
+                self._communicate_shapes(tensor_to_send_next=tensor_splits)
                 for dest_rank, tensor_split in zip(rank_info.send_to_ranks, tensor_splits):
                     logging.debug(
                         f"[Bridge Comunicator] [send_forward] Rank {self.current_rank} "
@@ -480,7 +480,7 @@ class BridgeCommunicator:
             # Send gradients back to source ranks
             num_receives = len(rank_info.recv_from_ranks)
             tensor_splits = self._split_tensor_at_batch_dim(grad_tensor, num_receives)
-            self._communicate_shapes(tensor_to_send_prev=tensor_splits[0])
+            self._communicate_shapes(tensor_to_send_prev=tensor_splits)
             if num_receives > 0:
                 for src_rank, tensor_split in zip(rank_info.recv_from_ranks, tensor_splits):
                     # Send the gradient split back to the source rank
@@ -618,7 +618,7 @@ class BridgeCommunicator:
             activation_splits = self._split_tensor_at_batch_dim(input_tensor, num_sends)
             # Communicate shapes for both directions (send forward, receive backward)
             recv_forward_shapes, recv_grad_shapes = self._communicate_shapes(
-                tensor_to_send_next=activation_splits[0], recv_next=True
+                tensor_to_send_next=activation_splits, recv_next=True
             )
             logging.debug(
                 f"[Bridge Communicator] [send_forward_recv_backward] Rank {self.current_rank} "
@@ -737,7 +737,7 @@ class BridgeCommunicator:
             gradient_splits = self._split_tensor_at_batch_dim(grad_tensor, num_receives)
             # Communicate shapes for both directions (send backward, receive forward)
             recv_forward_shapes, recv_grad_shapes = self._communicate_shapes(
-                tensor_to_send_prev=gradient_splits[0], recv_prev=True
+                tensor_to_send_prev=gradient_splits, recv_prev=True
             )
             logging.debug(
                 f"[Bridge Communicator] [send_backward_recv_backward] Rank {self.current_rank} "
@@ -848,8 +848,10 @@ class BridgeCommunicator:
         when dealing with variable sequence lengths or dynamic shapes.
 
         Args:
-            tensor_to_send_next: The tensor to send to the next rank (None if not sending)
-            tensor_to_send_prev: The tensor to send to the previous rank (None if not sending)
+            tensor_to_send_next: Tensor shape source for next ranks. Pass a single tensor when
+                every peer receives the same shape, or a list with one tensor per peer.
+            tensor_to_send_prev: Tensor shape source for previous ranks. Pass a single tensor when
+                every peer receives the same shape, or a list with one tensor per peer.
             recv_next: Whether to receive from the next rank (None if not receiving)
             recv_prev: Whether to receive from the previous rank (None if not receiving)
 
@@ -876,12 +878,14 @@ class BridgeCommunicator:
         if rank_info.role == CommRole.SENDER:
             # Prepare send operations for forward shapes
             if tensor_to_send_next is not None:
-                send_shape = tensor_to_send_next.shape
-                send_shape_tensor = torch.tensor(
-                    send_shape, device=torch.cuda.current_device(), dtype=torch.int64
+                tensors_to_send = self._as_per_peer_tensors(
+                    tensor_to_send_next, len(rank_info.send_to_ranks)
                 )
                 # Add send operations for each destination
-                for dest_rank in rank_info.send_to_ranks:
+                for dest_rank, tensor in zip(rank_info.send_to_ranks, tensors_to_send):
+                    send_shape_tensor = torch.tensor(
+                        tensor.shape, device=torch.cuda.current_device(), dtype=torch.int64
+                    )
                     ops.append(
                         torch.distributed.P2POp(
                             torch.distributed.isend, send_shape_tensor, dest_rank
@@ -918,12 +922,14 @@ class BridgeCommunicator:
             # If we need to send gradient shapes back, prepare send operations
             if tensor_to_send_prev is not None:
 
-                grad_shape = tensor_to_send_prev.shape
-                grad_shape_tensor = torch.tensor(
-                    grad_shape, device=torch.cuda.current_device(), dtype=torch.int64
+                tensors_to_send = self._as_per_peer_tensors(
+                    tensor_to_send_prev, len(rank_info.recv_from_ranks)
                 )
 
-                for src_rank in rank_info.recv_from_ranks:
+                for src_rank, tensor in zip(rank_info.recv_from_ranks, tensors_to_send):
+                    grad_shape_tensor = torch.tensor(
+                        tensor.shape, device=torch.cuda.current_device(), dtype=torch.int64
+                    )
                     ops.append(
                         torch.distributed.P2POp(
                             torch.distributed.isend, grad_shape_tensor, src_rank
@@ -947,6 +953,17 @@ class BridgeCommunicator:
 
         return recv_forward_shapes, recv_grad_shapes
 
+    @staticmethod
+    def _as_per_peer_tensors(tensors, expected_count: int) -> List[torch.Tensor]:
+        """Return one tensor per peer from either a shared tensor or a per-peer tensor list."""
+        if isinstance(tensors, torch.Tensor):
+            return [tensors for _ in range(expected_count)]
+        if len(tensors) != expected_count:
+            raise ValueError(
+                f"expected {expected_count} tensors for shape communication, got {len(tensors)}"
+            )
+        return list(tensors)
+
     def _split_tensor_at_batch_dim(
         self, aggregated_tensor: torch.Tensor, num_splits: int
     ) -> List[torch.Tensor]:
@@ -961,6 +978,34 @@ class BridgeCommunicator:
         """
         if num_splits <= 0:
             raise ValueError(f"num_splits must be positive, got {num_splits}")
+
+        split_sizes = getattr(aggregated_tensor, "_mimo_bridge_split_sizes", None)
+        if split_sizes is not None:
+            if num_splits == 1:
+                return [aggregated_tensor.contiguous()]
+            split_sizes = [int(size) for size in split_sizes]
+            if len(split_sizes) > num_splits and len(split_sizes) % num_splits == 0:
+                # Encoder metadata is per input sample; fan-out sends need one size per peer.
+                samples_per_split = len(split_sizes) // num_splits
+                split_sizes = [
+                    sum(split_sizes[i : i + samples_per_split])
+                    for i in range(0, len(split_sizes), samples_per_split)
+                ]
+            if len(split_sizes) != num_splits:
+                raise ValueError(
+                    f"bridge split metadata has {len(split_sizes)} entries, "
+                    f"but communication requires {num_splits} splits"
+                )
+            batch_dim_size = int(aggregated_tensor.shape[self._batch_dim])
+            if sum(split_sizes) != batch_dim_size:
+                raise ValueError(
+                    f"bridge split metadata sums to {sum(split_sizes)}, "
+                    f"but tensor batch dimension is {batch_dim_size}"
+                )
+            return [
+                split.contiguous()
+                for split in torch.split(aggregated_tensor, split_sizes, dim=self._batch_dim)
+            ]
 
         splits = torch.tensor_split(aggregated_tensor, num_splits, dim=self._batch_dim)
         # PyTorch p2p requires the tensors to be contiguous
