@@ -21,6 +21,7 @@ import gc
 import inspect
 import logging
 import math
+import os
 import traceback
 import warnings
 from collections import defaultdict, namedtuple
@@ -57,6 +58,22 @@ from .utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _env_flag(name: str) -> bool:
+    return os.environ.get(name, "").lower() in ("1", "true", "yes", "on")
+
+
+def _same_tensor_view(a: Optional[torch.Tensor], b: torch.Tensor) -> bool:
+    if a is None:
+        return False
+    return (
+        a.data_ptr() == b.data_ptr()
+        and a.dtype == b.dtype
+        and a.shape == b.shape
+        and a.stride() == b.stride()
+        and a.storage_offset() == b.storage_offset()
+    )
 
 
 try:
@@ -924,6 +941,8 @@ class DataParallelBuffer:
 
         # Count all parameters in this buffer and store their enumerated index.
         self.param_idx = {p: i for i, p in enumerate(self.params)}
+        self.cache_param_bucket_views = _env_flag("MCORE_FSDP_CACHE_PARAM_BUCKET_VIEWS")
+        self._param_bucket_view_cache = {}
 
     def init_data(self, data: torch.Tensor):
         """Allocate a buffer Tensor to persistently store the data for this
@@ -970,15 +989,49 @@ class DataParallelBuffer:
 
         # Need to set parameter data after resize model weight buffer data-storage.
         if set_param_data:
-            for p in self.params:
-                item_id = self.param_idx[p]
-                p = to_local_if_dtensor(p)
-                data = self.get_item_from_bucket(bucket, item_id).view(p.shape)
-                if is_float8tensor(p):
-                    fp8_set_raw_data(p, data, self.is_transpose_buffer)
-                else:
-                    p.data = data
+            self.set_param_data_from_bucket(bucket)
         return bucket
+
+    def _bucket_view_cache_key(self, bucket: Bucket):
+        return (
+            bucket.data.data_ptr(),
+            bucket.data.numel(),
+            bucket.data.dtype,
+            str(bucket.data.device),
+            self.is_transpose_buffer,
+        )
+
+    def _build_param_bucket_view_entries(self, bucket: Bucket):
+        entries = []
+        for p in self.params:
+            item_id = self.param_idx[p]
+            p = to_local_if_dtensor(p)
+            data = self.get_item_from_bucket(bucket, item_id).view(p.shape)
+            entries.append((p, data, is_float8tensor(p)))
+        return entries
+
+    def set_param_data_from_bucket(self, bucket: Bucket) -> None:
+        """Attach module parameter tensors to their views in an all-gather bucket."""
+        entries = None
+        if self.cache_param_bucket_views:
+            cache_key = self._bucket_view_cache_key(bucket)
+            entries = self._param_bucket_view_cache.get(cache_key)
+            if entries is None:
+                entries = self._build_param_bucket_view_entries(bucket)
+                self._param_bucket_view_cache[cache_key] = entries
+        else:
+            entries = self._build_param_bucket_view_entries(bucket)
+
+        for p, data, is_fp8 in entries:
+            if is_fp8:
+                old_data = fp8_get_raw_data(p, self.is_transpose_buffer)
+                if self.cache_param_bucket_views and _same_tensor_view(old_data, data):
+                    continue
+                fp8_set_raw_data(p, data, self.is_transpose_buffer)
+            else:
+                if self.cache_param_bucket_views and _same_tensor_view(p.data, data):
+                    continue
+                p.data = data
 
     def allocate_bucket_storage(
         self,
@@ -3887,6 +3940,8 @@ class AllGatherPipeline:
         for i in range(self.buffer.num_buckets):
             for bwd in [False, True]:
                 self.bucket_can_be_released[self.get_bucket_key(i, bwd)] = False
+        self.defer_param_bucket_view_setup = _env_flag("MCORE_FSDP_DEFER_PARAM_VIEW_SETUP")
+        self.deferred_param_bucket_views = {}
 
         # Map each bucket to the bucket group it belongs to by enumerated ID.
         # Made to collect a subset of buckets in the same bucket group.
@@ -4148,6 +4203,10 @@ class AllGatherPipeline:
                         # into an allocated bucket containing unsharded weights.
                         self.async_bucket_gather(bucket_id, bwd)
 
+            if self.defer_param_bucket_view_setup:
+                for bucket_id in buckets:
+                    self.set_deferred_param_bucket_views(bucket_id, bwd)
+
             # Replace the parameter all-gather event with coalescing event.
             for bucket_id in buckets:
                 bucket_key = self.get_bucket_key(bucket_id, bwd)
@@ -4244,6 +4303,15 @@ class AllGatherPipeline:
                 self.release_bucket(bucket_id, is_transpose_weight)
                 self.bucket_can_be_released[bucket_key] = False
 
+    def set_deferred_param_bucket_views(self, bucket_id: int, bwd: bool) -> None:
+        """Attach parameter views after the all-gather has been enqueued."""
+        bucket_key = self.get_bucket_key(bucket_id, bwd)
+        pending = self.deferred_param_bucket_views.pop(bucket_key, None)
+        if pending is None:
+            return
+        wbuf, bucket = pending
+        wbuf.set_param_data_from_bucket(bucket)
+
     def get_fsdp_buffer(self, bucket_id: int, bwd=False) -> DataParallelBuffer:
         """
         Get the FSDP / DP-Shard buffer with the given bucket ID.
@@ -4282,7 +4350,9 @@ class AllGatherPipeline:
         self.recycle_unused_buckets()
 
         # Allocate an empty bucket to store the module weights.
-        bucket = wbuf.fetch_bucket(set_param_data=True)
+        bucket = wbuf.fetch_bucket(set_param_data=not self.defer_param_bucket_view_setup)
+        if self.defer_param_bucket_view_setup:
+            self.deferred_param_bucket_views[bucket_key] = (wbuf, bucket)
 
         # All-gather the module weights in each buffer shard into the allocated bucket.
         # Now each rank will have a copy of this FSDP unit module's weights.
