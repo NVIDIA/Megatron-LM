@@ -79,6 +79,8 @@ try:
 except ImportError:
     HAVE_DTENSOR = False
 
+from megatron.core.perfetto_trace import trace_region
+
 from megatron.core.msc_utils import MultiStorageClientFeature
 
 MSC_PREFIX = "msc://"
@@ -964,15 +966,18 @@ class TorchDistLoadShardedStrategy:
         }
 
         orig_sharded_state_dict = sharded_state_dict
-        # MCore state dict to PyT Distributed compatible
-        (sharded_state_dict, flat_mapping, rename_mapping) = (
-            _replace_state_dict_keys_with_sharded_keys(sharded_state_dict)
-        )
-        pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, True)
-        # Load PyT Distributed format
-        fsr = _get_filesystem_reader(
-            checkpoint_dir, cache_metadata=self.cache_metadata, async_strategy=async_strategy
-        )
+        with trace_region("_replace_state_dict_keys_with_sharded_keys"):
+            # MCore state dict to PyT Distributed compatible
+            (sharded_state_dict, flat_mapping, rename_mapping) = (
+                _replace_state_dict_keys_with_sharded_keys(sharded_state_dict)
+            )
+        with trace_region("mcore_to_pyt_state_dict"):
+            pyt_state_dict = mcore_to_pyt_state_dict(sharded_state_dict, True)
+        with trace_region("_get_filesystem_reader"):    
+            # Load PyT Distributed format
+            fsr = _get_filesystem_reader(
+                checkpoint_dir, cache_metadata=self.cache_metadata, async_strategy=async_strategy
+            )
         # Local-replica redirection: if this checkpoint was saved with the
         # local-replica mode, every replica that *this* rank holds was
         # written under a `__shadow_<rank>__<fqn>` FQN pointing at the
@@ -990,26 +995,28 @@ class TorchDistLoadShardedStrategy:
             shadow_renames = redirect_pyt_state_dict_to_shadows(
                 pyt_state_dict, metadata, torch.distributed.get_rank()
             )
-        checkpoint.load(
-            pyt_state_dict,
-            fsr,
-            planner=MCoreLoadPlanner(
-                shapes_validation_sharded_tensors=flexible_shape_sharded_tensors,
-                allow_shape_mismatch_sharded_tensors=allow_shape_mismatch_sharded_tensors,
-                flatten_state_dict=False,
-                flatten_sharded_tensors=False,
-            ),
-            no_dist=True,
-        )
+        with trace_region("checkpoint.load"):
+            checkpoint.load(
+                pyt_state_dict,
+                fsr,
+                planner=MCoreLoadPlanner(
+                    shapes_validation_sharded_tensors=flexible_shape_sharded_tensors,
+                    allow_shape_mismatch_sharded_tensors=allow_shape_mismatch_sharded_tensors,
+                    flatten_state_dict=False,
+                    flatten_sharded_tensors=False,
+                ),
+                no_dist=True,
+            )
         # Reverse the shadow rename so downstream code (unwrap, key-restore)
         # sees the original FQNs the user-facing state dict expects.
         if shadow_renames:
             restore_pyt_state_dict_from_shadows(pyt_state_dict, shadow_renames)
 
         if self.cache_metadata:
-            self.cached_global_metadata = (
-                fsr.read_metadata()
-            )  # no storage interaction thanks to caching
+            with trace_region("read_metadata"):
+                self.cached_global_metadata = (
+                    fsr.read_metadata()
+                )  # no storage interaction thanks to caching
 
         pyt_state_dict = cast(
             Dict[str, Union[TorchShardedTensor, List[io.BytesIO]]], pyt_state_dict

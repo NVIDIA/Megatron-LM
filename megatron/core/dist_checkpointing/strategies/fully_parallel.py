@@ -41,6 +41,7 @@ from megatron.core.dist_checkpointing.validation import (
     determine_global_metadata,
     validate_sharding_integrity,
 )
+from megatron.core.perfetto_trace import trace_region
 
 logger = logging.getLogger(__name__)
 
@@ -297,14 +298,15 @@ class FullyParallelLoadStrategyWrapper:
         if get_pg_size(self.parallelization_group) <= 1:
             return self.base_strategy.load(sharded_state_dict, checkpoint_dir, async_strategy)
 
-        # Step 1 and 2: exchange load metadata and distribute the load
-        with debug_time("self.apply_loading_parallelization", logger):
-            precomputed_distribution: ShardDistribution | None = self.apply_loading_parallelization(
-                sharded_state_dict
-            )
-            assert (
-                precomputed_distribution is not None
-            ), 'Expecting non-trivial distribution for non-trivial parallelization group'
+        with trace_region("apply_loading_parallelization"):
+            # Step 1 and 2: exchange load metadata and distribute the load
+            with debug_time("self.apply_loading_parallelization", logger):
+                precomputed_distribution: ShardDistribution | None = self.apply_loading_parallelization(
+                    sharded_state_dict
+                )
+                assert (
+                    precomputed_distribution is not None
+                ), 'Expecting non-trivial distribution for non-trivial parallelization group'
 
         # Step 3: load part of the checkpoint.
         # Load only sharded objects first. ShardedTensors will be loaded separately
@@ -320,27 +322,28 @@ class FullyParallelLoadStrategyWrapper:
         assert (
             len(sharded_state_dict) == 0
         ), "sharded_state_dict is not empty after deferring tensors and objects"
-        with debug_time("base_load_ShardedObjects", logger):
-            # Load sharded objects first
-            loaded_objects = self.base_strategy.load(
-                to_load_objects, checkpoint_dir, async_strategy
-            )
+        with trace_region("base_load_ShardedObjects"):
+            with debug_time("base_load_ShardedObjects", logger):
+                # Load sharded objects first
+                loaded_objects = self.base_strategy.load(
+                    to_load_objects, checkpoint_dir, async_strategy
+                )
+        with trace_region("base_load_ShardedTensors"):
+            with debug_time("base_load_ShardedTensors", logger):
+                # Load sharded tensors separately
+                loaded_tensors = self.base_strategy.load(to_load_shards, checkpoint_dir, async_strategy)
+        with trace_region("exchange_loaded_tensors"):
+            with debug_time("self.exchange_loaded_tensors", logger):
 
-        with debug_time("base_load_ShardedTensors", logger):
-            # Load sharded tensors separately
-            loaded_tensors = self.base_strategy.load(to_load_shards, checkpoint_dir, async_strategy)
-
-        with debug_time("self.exchange_loaded_tensors", logger):
-
-            # Step 4: exchange data between ranks
-            logger.debug(f'Applying parallel load with algo {self.exchange_algo}')
-            all_loaded_tensors = exchange_by_distribution(
-                loaded_tensors,
-                unloaded_shards,
-                precomputed_distribution,
-                self.parallelization_group,
-                self.exchange_algo,
-            )
+                # Step 4: exchange data between ranks
+                logger.debug(f'Applying parallel load with algo {self.exchange_algo}')
+                all_loaded_tensors = exchange_by_distribution(
+                    loaded_tensors,
+                    unloaded_shards,
+                    precomputed_distribution,
+                    self.parallelization_group,
+                    self.exchange_algo,
+                )
             if not set(unloaded_shards.keys()).issubset(all_loaded_tensors.keys()):
                 missing_shards = set(unloaded_shards.keys()) - all_loaded_tensors.keys()
                 raise CheckpointingException(
