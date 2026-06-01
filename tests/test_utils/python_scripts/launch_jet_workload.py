@@ -153,6 +153,7 @@ def launch_and_wait_for_completion(
                                         "TRANSFORMERS_OFFLINE": "1",
                                         "CLUSTER": cluster,
                                         "RUN_ID": str(uuid.uuid4()),
+                                        "CLEANUP_PATHS": os.getenv("CLEANUP_PATHS") or "",
                                     }
                                 }
                             }

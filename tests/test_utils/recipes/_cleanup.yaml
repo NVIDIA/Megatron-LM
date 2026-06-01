@@ -16,17 +16,17 @@ spec:
     set -euo pipefail
 
     THRESHOLD_DAYS=14
-    CLEANUP_PATHS=(
-        /lustre/fsw/coreai_dlalgo_mcore/release-testing
-        /lustre/fsw/coreai_dlalgo_mcore/mcore_ci
-    )
+
+    if [[ -z "${{CLEANUP_PATHS:-}}" ]]; then
+        echo "CLEANUP_PATHS env var not set; nothing to do."
+        exit 0
+    fi
 
     echo "[DRY-RUN] Entries older than $THRESHOLD_DAYS days under:"
-    for path in "${{CLEANUP_PATHS[@]}}"; do
-        echo "  - $path"
-    done
+    printf '%s\n' "$CLEANUP_PATHS" | sed 's/^/  - /'
 
-    for path in "${{CLEANUP_PATHS[@]}}"; do
+    while IFS= read -r path; do
+        [[ -z "$path" ]] && continue
         if [[ ! -d "$path" ]]; then
             echo "Skipping (not a directory on this cluster): $path"
             continue
@@ -34,7 +34,7 @@ spec:
         echo "--- Would delete from $path ---"
         find "$path" -mindepth 1 -maxdepth 1 -mtime +$THRESHOLD_DAYS -print 2>/dev/null || true
         echo "--- (dry-run: no deletion) ---"
-    done
+    done <<<"$CLEANUP_PATHS"
 
     echo "Dry-run complete; no files removed."
 
