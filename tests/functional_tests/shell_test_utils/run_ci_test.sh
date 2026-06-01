@@ -335,6 +335,25 @@ for i in $(seq 1 $N_REPEAT); do
         echo $((TRAIN_ITERS / 2)) >$CHECKPOINT_SAVE_PATH/latest_checkpointed_iteration.txt
     fi
 
+    # Release tests span multiple SLURM windows via checkpoint resume.
+    # Only compare against golden values once training has reached the
+    # configured exit interval; otherwise a partial-trajectory window
+    # would false-positive-fail the goldens check and block the
+    # orchestration's resumable retrigger.
+    if [[ "$TEST_TYPE" == "release" ]]; then
+        TRACKER_FILE="$CHECKPOINT_SAVE_PATH/latest_checkpointed_iteration.txt"
+        LATEST_ITER=0
+        if [[ -f "$TRACKER_FILE" ]]; then
+            LATEST_ITER=$(tr -d '[:space:]' <"$TRACKER_FILE" 2>/dev/null || echo 0)
+            [[ "$LATEST_ITER" =~ ^[0-9]+$ ]] || LATEST_ITER=0
+        fi
+        if (( LATEST_ITER < TRAIN_ITERS )); then
+            echo "Release intermediate window: latest checkpointed iter $LATEST_ITER < $TRAIN_ITERS; skipping golden-value comparison so the orchestration can resume."
+            continue
+        fi
+        echo "Release run reached iter $LATEST_ITER >= $TRAIN_ITERS; running golden-value comparison."
+    fi
+
     if [[ ${RECORD_CHECKPOINTS} == "true" ]]; then
         echo "Skipping Pytest during checkpoint recording."
         SKIP_PYTEST=1
