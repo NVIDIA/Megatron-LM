@@ -51,7 +51,13 @@ def default_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
     """Determine the most appropriate layer specification based on availability."""
     transformer_cfg = config.transformer
     use_te = transformer_cfg.transformer_impl == "transformer_engine"
-    if config.restore_modelopt_state:
+    if transformer_cfg.transformer_impl == "inference_optimized":
+        return get_gpt_layer_with_inference_spec(
+            transformer_cfg.qk_layernorm,
+            transformer_cfg.multi_latent_attention,
+            qk_l2_norm=transformer_cfg.qk_l2_norm,
+        )
+    elif config.restore_modelopt_state:
         ## Layer specification for quantization with ModelOpt. ##
 
         # arbitrary attention mask is used for speculative decoding training
@@ -100,12 +106,6 @@ def default_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
             kitchen_attention_backend=config.transformer.kitchen_attention_backend,
             mla_down_proj_fusion=getattr(config.transformer, "mla_down_proj_fusion", False),
             **kwargs,
-        )
-    elif transformer_cfg.transformer_impl == "inference_optimized":
-        return get_gpt_layer_with_inference_spec(
-            transformer_cfg.qk_layernorm,
-            transformer_cfg.multi_latent_attention,
-            qk_l2_norm=transformer_cfg.qk_l2_norm,
         )
     else:
         return get_gpt_layer_local_spec(
