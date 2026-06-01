@@ -320,6 +320,16 @@ class MambaSlotAllocator:
         self.ssm_states[layer_idx, slot].copy_(ssm_state)
         self.conv_states[layer_idx, slot].copy_(conv_state)
 
+    def _live_mamba_indices(self, request_indices: list, device: torch.device) -> Tensor:
+        """Return flattened live Mamba-state rows for the given context request indices."""
+        req_tensor_cpu = torch.tensor(request_indices, dtype=torch.int64)
+        base_indices = self.context.mamba_metadata.request_to_mamba_state_idx[req_tensor_cpu]
+        state_bank_count = getattr(self.context, "mamba_state_bank_count", 1)
+        if state_bank_count > 1:
+            bank_indices = self.context.mamba_metadata.request_to_mamba_state_bank[req_tensor_cpu]
+            base_indices = base_indices * state_bank_count + bank_indices
+        return base_indices.to(device=device, dtype=torch.int64)
+
     def store_from_live_batch(self, slots: list, request_indices: list) -> None:
         """Copy all layers from live per-request buffers to cache slots.
 
@@ -331,12 +341,7 @@ class MambaSlotAllocator:
             return
         device = self.conv_states.device
         slot_tensor = torch.tensor(slots, dtype=torch.int64, device=device)
-        # Lookup mamba indices from CPU bookkeeping, then move to GPU for state copy.
-        req_tensor_cpu = torch.tensor(request_indices, dtype=torch.int64)
-        mamba_indices = self.context.mamba_metadata.request_to_mamba_state_idx[
-            req_tensor_cpu
-        ].tolist()
-        mamba_idx_tensor = torch.tensor(mamba_indices, dtype=torch.int64, device=device)
+        mamba_idx_tensor = self._live_mamba_indices(request_indices, device)
         # Fancy-indexed copy (2 kernel launches instead of 2E)
         self.conv_states[:, slot_tensor] = self.context.mamba_conv_states[:, mamba_idx_tensor]
         self.ssm_states[:, slot_tensor] = self.context.mamba_ssm_states[:, mamba_idx_tensor]
@@ -354,7 +359,7 @@ class MambaSlotAllocator:
         slot = self.block_to_slot[block_id].item()
         if slot < 0:
             return False
-        mamba_idx = self.context.mamba_metadata.request_to_mamba_state_idx[request_idx].item()
+        mamba_idx = self._live_mamba_indices([request_idx], self.conv_states.device)[0].item()
         self.context.mamba_conv_states[:, mamba_idx].copy_(self.conv_states[:, slot])
         self.context.mamba_ssm_states[:, mamba_idx].copy_(self.ssm_states[:, slot])
         return True

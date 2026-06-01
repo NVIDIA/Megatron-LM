@@ -1581,7 +1581,17 @@ class DynamicInferenceEngine(AbstractEngine):
         request_can_be_added, request_tokens_can_be_added, kv_cache_available = (
             self.context.check_availability(req)
         )
-        if not (request_can_be_added and request_tokens_can_be_added and kv_cache_available):
+        can_partially_add_chunk = (
+            self.enable_chunked_prefill
+            and self.context.active_token_count < self.context.max_tokens
+            and (
+                request_can_be_added
+                or self.context.chunked_prefill_request_id == req.request_id
+            )
+        )
+        can_fully_add = kv_cache_available and request_can_be_added and request_tokens_can_be_added
+        can_chunk_add = kv_cache_available and can_partially_add_chunk
+        if not (can_fully_add or can_chunk_add):
             return False
         self.controller.request_async_admission_barrier()
         return True

@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from collections import deque
 from types import SimpleNamespace
 
 import pytest
@@ -9,6 +10,8 @@ from megatron.core import utils as core_utils
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+from megatron.core.inference.contexts.mamba_slot_allocator import MambaSlotAllocator
+from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.ep_async_protocol import (
     EPAsyncHandoffDecision,
     EPAsyncPhase,
@@ -1199,6 +1202,36 @@ def test_row_mapped_full_logits_sampling_uses_pending_decode_rows():
 
 
 @pytest.mark.internal
+def test_row_mapped_greedy_sampling_writes_tokens_in_current_request_order():
+    controller = object.__new__(TextGenerationController)
+    source_logits = torch.tensor(
+        [[[0.0, 20.0, 0.0, 0.0], [0.0, 0.0, 30.0, 0.0], [0.0, 0.0, 0.0, 40.0]]]
+    )
+    next_input_ids = torch.empty(2, dtype=torch.long)
+    context = SimpleNamespace(
+        total_request_count=2,
+        paused_request_count=0,
+        config=SimpleNamespace(materialize_only_last_token_logits=False),
+        is_decode_only=lambda: True,
+        gpu_view=SimpleNamespace(token_to_input_ids=next_input_ids),
+        active_request_metadata={
+            "top_k": torch.tensor([1, 1], dtype=torch.int32),
+            "top_p": torch.tensor([0.0, 0.0], dtype=torch.float32),
+        },
+    )
+    controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
+    controller._all_logits_cuda = source_logits
+    controller._async_sample_values_cuda = torch.empty(2)
+    controller._sampled_tokens_cuda = torch.empty(2, dtype=torch.long)
+    controller.num_speculative_tokens = 0
+
+    controller._dynamic_step_sample_logits_greedy_to_next_input_ids(row_indices=torch.tensor([2, 0]))
+
+    assert controller._sampled_tokens_cuda.tolist() == [3, 1]
+    assert next_input_ids.tolist() == [3, 1]
+
+
+@pytest.mark.internal
 def test_decode_full_logits_sampling_uses_current_rows_after_async_prepare_without_row_map():
     controller = object.__new__(TextGenerationController)
     source_logits = torch.arange(4 * 5, dtype=torch.float32).view(1, 4, 5)
@@ -1298,6 +1331,74 @@ def test_row_mapped_full_logits_logprobs_use_gathered_decode_rows_as_last_logits
     assert torch.equal(captures["logits"], expected_logits)
     assert torch.equal(captures["new_tokens"], sampled_tokens)
     assert captures["only_last_token_logits"]
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize(
+    ("availability", "active_token_count", "chunked_request_id", "expected_defer"),
+    [
+        ((True, True, True), 2, -1, True),
+        ((True, False, True), 2, -1, True),
+        ((False, False, True), 2, 123, True),
+        ((True, True, False), 2, -1, False),
+        ((False, False, False), 2, -1, False),
+        ((True, False, True), 4, -1, False),
+    ],
+)
+def test_pending_async_forward_defers_waiting_request_admission_that_can_mutate_context(
+    availability, active_token_count, chunked_request_id, expected_defer
+):
+    engine = object.__new__(DynamicInferenceEngine)
+    engine.waiting_request_ids = deque([123])
+    engine.enable_chunked_prefill = True
+    engine.controller = SimpleNamespace(
+        barrier_count=0,
+        has_pending_async_forward=lambda: True,
+        request_async_admission_barrier=lambda: setattr(
+            engine.controller, "barrier_count", engine.controller.barrier_count + 1
+        ),
+    )
+    engine.context = SimpleNamespace(
+        active_token_count=active_token_count,
+        max_tokens=4,
+        chunked_prefill_request_id=chunked_request_id,
+        check_availability=lambda _req: availability,
+    )
+    engine.get_request = lambda request_id: SimpleNamespace(request_id=request_id)
+
+    assert engine._defer_waiting_request_admission_for_async() is expected_defer
+    assert engine.controller.barrier_count == int(expected_defer)
+
+
+@pytest.mark.internal
+def test_mamba_prefix_cache_uses_current_live_bank_for_store_and_restore():
+    allocator = object.__new__(MambaSlotAllocator)
+    allocator.block_to_slot = torch.tensor([0], dtype=torch.int64)
+    allocator.conv_states = torch.zeros((1, 1, 1), dtype=torch.float32)
+    allocator.ssm_states = torch.zeros((1, 1, 1), dtype=torch.float32)
+    allocator.context = SimpleNamespace(
+        mamba_state_bank_count=2,
+        mamba_metadata=SimpleNamespace(
+            request_to_mamba_state_idx=torch.tensor([1], dtype=torch.int64),
+            request_to_mamba_state_bank=torch.tensor([1], dtype=torch.int64),
+        ),
+        mamba_conv_states=torch.tensor([[[10.0]], [[11.0]], [[12.0]], [[13.0]]]).transpose(0, 1),
+        mamba_ssm_states=torch.tensor([[[20.0]], [[21.0]], [[22.0]], [[23.0]]]).transpose(0, 1),
+    )
+
+    allocator.store_from_live_batch(slots=[0], request_indices=[0])
+
+    assert allocator.conv_states[:, 0].item() == 13.0
+    assert allocator.ssm_states[:, 0].item() == 23.0
+
+    allocator.conv_states[:, 0] = 31.0
+    allocator.ssm_states[:, 0] = 41.0
+    allocator.restore_to_live(request_idx=0, block_id=0)
+
+    assert allocator.context.mamba_conv_states[:, 3].item() == 31.0
+    assert allocator.context.mamba_ssm_states[:, 3].item() == 41.0
+    assert allocator.context.mamba_conv_states[:, 1].item() == 11.0
+    assert allocator.context.mamba_ssm_states[:, 1].item() == 21.0
 
 
 @pytest.mark.internal
