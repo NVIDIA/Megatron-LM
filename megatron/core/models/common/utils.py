@@ -7,8 +7,7 @@ were imported by ``core/models/common/model_chunk_schedule_plan.py`` and the
 hybrid schedule plan via that path. They are model-agnostic in practice — the
 ``Pre/PostProcessNode`` classes call the model's ``_preprocess`` /
 ``_postprocess`` methods and don't otherwise care which model implements
-them — so they live here and the GPT module re-exports them for backward
-compatibility with existing imports.
+them — so they live here now.
 """
 
 import weakref

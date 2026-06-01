@@ -153,10 +153,11 @@ def build_layer_callables(layer):
     ``num_local_experts`` after the call — the build function already knows
     the layer type. ``num_local_experts`` is ``None`` for dense layers.
     """
-    from megatron.core.models.hybrid.fine_grained_callables import build_hybrid_stack_callables
     from megatron.core.models.hybrid.hybrid_block import HybridStack
 
     if isinstance(layer, HybridStack):
+        from megatron.core.models.hybrid.fine_grained_callables import build_hybrid_stack_callables
+
         return build_hybrid_stack_callables(layer)
     if isinstance(layer, MultiTokenPredictionLayer):
         return build_mtp_layer_callables(layer)
