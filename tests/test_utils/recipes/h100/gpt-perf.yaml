@@ -41,5 +41,5 @@ products:
   - test_case: [gpt_16b_perf]
     products:
       - environment: [dev]
-        scope: [L1]
+        scope: [L2]
         platforms: [dgx_h100]

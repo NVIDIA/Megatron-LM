@@ -3,7 +3,7 @@ import copy
 import itertools
 import logging
 import pathlib
-from typing import List, Optional
+from typing import List, Optional, Set
 
 import click
 import yaml
@@ -20,34 +20,41 @@ ALLOWED_CADENCE_VALUES = set(DEFAULT_CADENCE) | {"weekly"}
 # trigger, a default cadence. The tier acts purely as a suite/cost label;
 # cadence remains the trigger axis.
 #
-# Both GitHub-side (`mr-github`, `mr-github-slim`) and GitLab-side (`mr`,
-# `mr-slim`) legacy scope names are aliased onto the unified L-tier vocabulary
-# so a single recipe row tagged `scope: [L1]` is matched by both GitHub's
-# `--scope L1` filter and GitLab's `--scope mr` filter (the latter via this
-# alias). `unit-tests` is left as a pass-through value so the GitLab unit-test
-# stage continues to match `scope: [unit-tests]` verbatim. `*-broken`,
-# `deprecated`, and `flaky` are not aliased — they exist solely as
-# documentation markers on disabled tests.
+# Both GitHub-side (`mr-github`, `mr-github-slim`) and GitLab-side (`mr`) legacy
+# scope names are aliased onto the unified L-tier vocabulary so a single recipe
+# row tagged `scope: [L1]` is matched by GitHub's `--scope L1` filter (legacy
+# `mr-github`). GitLab's broader `mr` suite maps to `L2` via this alias.
+# GitLab-only `mr-slim` is intentionally not aliased so it does not bleed into
+# the GitHub L0 matrix (L0 is `mr-github-slim` only).
 LEGACY_SCOPE_ALIASES = {
-    "mr-slim": ("L0", None),
     "mr-github-slim": ("L0", None),
-    "mr": ("L1", None),
     "mr-github": ("L1", None),
-    "nightly": ("L2", ["nightly"]),
-    "weekly": ("L3", ["weekly"]),
+    "mr": ("L2", None),
+    "nightly": ("L3", ["nightly"]),
+    "weekly": ("L4", ["weekly"]),
 }
 
 
 def _resolve_scope_alias(scope_value: str) -> str:
     """Resolve a legacy scope value to its L-tier alias (or return it unchanged).
 
-    Applied both to recipe rows when flattening and to the `--scope` filter
-    input, so callers can pass either the legacy name (e.g. `nightly`) or the
-    new L-tier name (e.g. `L2`) and hit the same recipe rows.
+    Applied when flattening recipe rows. For `--scope` filters, use
+    `_resolve_scope_filter` so comma-separated values (e.g. `L1,L2`) work.
     """
     if scope_value in LEGACY_SCOPE_ALIASES:
         return LEGACY_SCOPE_ALIASES[scope_value][0]
     return scope_value
+
+
+def _resolve_scope_filter(scope: str) -> Set[str]:
+    """Resolve a `--scope` filter to the set of L-tier names to match.
+
+    Supports comma-separated tiers, e.g. ``--scope L1,L2`` for the full GitLab
+    MR suite (GitHub L1 + GitLab-only L2 rows). Each token is legacy-aliased.
+    """
+    if "," not in scope:
+        return {_resolve_scope_alias(scope)}
+    return {_resolve_scope_alias(part.strip()) for part in scope.split(",") if part.strip()}
 
 
 def _apply_scope_alias(scope_value: str, explicit_cadence: Optional[List[str]]) -> tuple:
@@ -218,18 +225,17 @@ def filter_by_test_case(workload_manifests: List[dotdict], test_case: str) -> Op
 
 
 def filter_by_scope(workload_manifests: List[dotdict], scope: str) -> List[dotdict]:
-    """Returns all workload with matching scope.
+    """Returns all workloads whose scope is in the resolved filter tier set.
 
-    The filter input is run through the same legacy-scope alias as recipe
-    rows, so callers passing the legacy name (e.g. `--scope nightly`,
-    `--scope mr-github`) match recipes that have already been rewritten to
-    the new L-tier vocabulary (e.g. `scope: [L2]`, `scope: [L1]`).
+    The filter input is legacy-aliased per token. Pass comma-separated tiers for a
+    union, e.g. ``--scope L1,L2`` (full GitLab MR) or legacy names such as
+    ``--scope mr-github``.
     """
-    resolved_scope = _resolve_scope_alias(scope)
+    resolved_scopes = _resolve_scope_filter(scope)
     workload_manifests = list(
         workload_manifest
         for workload_manifest in workload_manifests
-        if workload_manifest.spec["scope"] == resolved_scope
+        if workload_manifest.spec["scope"] in resolved_scopes
     )
 
     if len(workload_manifests) == 0:

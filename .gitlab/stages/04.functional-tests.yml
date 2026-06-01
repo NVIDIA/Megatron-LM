@@ -66,20 +66,28 @@ functional:configure:
         RELEASE_ARGS=()
       fi
     - |
-      # NOTE: $FUNCTIONAL_TEST_SCOPE is supplied by external scheduled-pipeline
-      # configurations and uses the GitLab-side legacy values: `mr`, `mr-slim`,
-      # `nightly`, `weekly`, `unit-tests`, `release`.
+      # NOTE: $FUNCTIONAL_TEST_SCOPE is supplied by workflow rules, scheduled
+      # pipelines, or manual dispatch. Legacy GitLab values (`mr-slim`, `mr`,
+      # `nightly`, `weekly`) and L-tier names (`L0`–`L4`) are accepted; comma-
+      # separated tiers union, e.g. `L1,L2` for the full MR functional suite.
       #
-      # Recipes have been rewritten to the unified L-tier vocabulary
-      # (`L0`/`L1`/`L2`/`L3`); the parser's LEGACY_SCOPE_ALIASES map
-      # (tests/test_utils/python_scripts/recipe_parser.py) transparently
-      # resolves these legacy values:
-      #   - `mr-slim` -> `L0`, `mr` -> `L1`
-      #   - `nightly` -> `L2`, `weekly` -> `L3`
-      # `unit-tests` and `release` are not aliased and continue to match recipe
-      # rows tagged with the same string verbatim.
-      ARGS=(
-        "--scope $FUNCTIONAL_TEST_SCOPE"
+      # Recipe rows use the L-tier vocabulary; LEGACY_SCOPE_ALIASES in
+      # tests/test_utils/python_scripts/recipe_parser.py resolves filter input:
+      #   - `mr-github-slim` -> `L0`
+      #   - `mr-github` -> `L1`; `mr` alone -> `L2`
+      #   - full MR suite: `L1,L2` (GitHub L1 + GitLab-only L2 rows on H100/A100)
+      #   - `nightly` -> `L3`; `weekly` -> `L4`
+      # `unit-tests` and `release` are not aliased and match recipe rows verbatim.
+      #
+      # When the workflow passes `L1,L2` (full MR), GB200 keeps the legacy GitLab
+      # `mr` footprint (`L2` only) rather than unioning L1 rows that were never in
+      # the old GB200 MR matrix.
+      SCOPE_A100_H100="$FUNCTIONAL_TEST_SCOPE"
+      SCOPE_GB200="$FUNCTIONAL_TEST_SCOPE"
+      if [[ "$FUNCTIONAL_TEST_SCOPE" == "L1,L2" ]]; then
+        SCOPE_GB200="L2"
+      fi
+      COMMON_ARGS=(
         "--n-repeat $FUNCTIONAL_TEST_REPEAT"
         "--time-limit $FUNCTIONAL_TEST_TIME_LIMIT"
         "--test-cases $FUNCTIONAL_TEST_CASES"
@@ -93,7 +101,8 @@ functional:configure:
     - |
       export PYTHONPATH=$(pwd)
       python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
-        ${ARGS[@]} \
+        ${COMMON_ARGS[@]} \
+        --scope "$SCOPE_A100_H100" \
         --environment dev \
         --platform dgx_a100 \
         --cluster $A100_CLUSTER \
@@ -102,7 +111,8 @@ functional:configure:
     - |
       export PYTHONPATH=$(pwd)
       python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
-        ${ARGS[@]} \
+        ${COMMON_ARGS[@]} \
+        --scope "$SCOPE_A100_H100" \
         --environment dev \
         --platform dgx_h100 \
         --cluster $H100_CLUSTER \
@@ -111,7 +121,8 @@ functional:configure:
     - |
       export PYTHONPATH=$(pwd)
       python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
-        ${ARGS[@]} \
+        ${COMMON_ARGS[@]} \
+        --scope "$SCOPE_A100_H100" \
         --environment lts \
         --platform dgx_a100 \
         --cluster $A100_CLUSTER \
@@ -120,7 +131,8 @@ functional:configure:
     - |
       export PYTHONPATH=$(pwd)
       python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
-        ${ARGS[@]} \
+        ${COMMON_ARGS[@]} \
+        --scope "$SCOPE_A100_H100" \
         --environment lts \
         --platform dgx_h100 \
         --cluster $H100_CLUSTER \
@@ -129,7 +141,8 @@ functional:configure:
     - |
       export PYTHONPATH=$(pwd)
       python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
-        ${ARGS[@]} \
+        ${COMMON_ARGS[@]} \
+        --scope "$SCOPE_GB200" \
         --environment dev \
         --platform dgx_gb200 \
         --cluster $GB200_CLUSTER \
@@ -138,7 +151,8 @@ functional:configure:
     - |
       export PYTHONPATH=$(pwd)
       python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
-        ${ARGS[@]} \
+        ${COMMON_ARGS[@]} \
+        --scope "$SCOPE_GB200" \
         --environment lts \
         --platform dgx_gb200 \
         --cluster $GB200_CLUSTER \

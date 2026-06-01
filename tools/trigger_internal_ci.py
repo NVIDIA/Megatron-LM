@@ -122,8 +122,8 @@ def main():
     )
     parser.add_argument(
         "--functional-test-scope",
-        default="mr",
-        help="FUNCTIONAL_TEST_SCOPE pipeline variable (default: mr)",
+        default="L1,L2",
+        help="FUNCTIONAL_TEST_SCOPE pipeline variable (default: L1,L2)",
     )
     parser.add_argument(
         "--functional-test-repeat",

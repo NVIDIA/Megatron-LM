@@ -60,27 +60,27 @@ products:
   - test_case: [gpt_dynamic_inference_tp8_pp1_dp1_583m_logitsmatch_zmq]
     products:
       - environment: [dev]
-        scope: [L1]
+        scope: [L2]
         platforms: [dgx_h100]
   - test_case: [gpt_dynamic_inference_tp1_pp8_dp1_583m_logitsmatch_zmq]
     products:
       - environment: [dev]
-        scope: [L1]
+        scope: [L2]
         platforms: [dgx_h100]
   - test_case: [gpt_dynamic_inference_tp1_pp1_dp8_583m_logitsmatch_zmq]
     products:
       - environment: [dev]
-        scope: [L1]
+        scope: [L2]
         platforms: [dgx_h100]
   - test_case: [gpt_dynamic_inference_tp2_pp2_dp2_583m_logitsmatch_zmq]
     products:
       - environment: [dev]
-        scope: [L1]
+        scope: [L2]
         platforms: [dgx_h100]
   - test_case: [gpt_dynamic_inference_tp1_pp1_dp8_583m_prefix_caching_longest_prefix_zmq]
     products:
       - environment: [dev]
-        scope: [L1]
+        scope: [L2]
         platforms: [dgx_h100]
   - test_case: [gpt_dynamic_inference_tp1_pp1_dp8_583m_prefix_caching_round_robin_zmq]
     products:
