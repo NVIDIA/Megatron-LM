@@ -418,12 +418,13 @@ def gpt_config_from_args(args: Namespace, config: TransformerConfig | None=None)
     kwargs["seq_length"] = args.max_position_embeddings
     kwargs["share_embeddings_and_output_weights"] = not args.untie_embeddings_and_output_weights
 
+    # GPTModelConfig supports either automatically padding vocab size or using exact provided
+    # vocab size via "should_pad_vocab" to support loading third-party checkpoints. Here,
+    # that is just mapped to settings in args appropriately.
     if args.padded_vocab_size is not None:
         kwargs["vocab_size"] = args.padded_vocab_size
         kwargs["should_pad_vocab"] = False
     else:
-        # Megatron-Bridge uses an explicit setting "should_pad_vocab" so that 
-        # when converting model configs from HF, we can set a vocab size and disable padding. 
         assert args.vocab_size is not None, "Either --padded-vocab-size or --vocab-size must be specified."
         kwargs["vocab_size"] = args.vocab_size
         kwargs["should_pad_vocab"] = True
@@ -460,12 +461,13 @@ def hybrid_config_from_args(args: Namespace, config: TransformerConfig | None=No
     kwargs["seq_length"] = args.max_position_embeddings
     kwargs["share_embeddings_and_output_weights"] = not args.untie_embeddings_and_output_weights
 
+    # HybridModelConfig supports either automatically padding vocab size or using exact provided
+    # vocab size via "should_pad_vocab" to support loading third-party checkpoints. Here,
+    # that is just mapped to settings in args appropriately.
     if args.padded_vocab_size is not None:
         kwargs["vocab_size"] = args.padded_vocab_size
         kwargs["should_pad_vocab"] = False
     else:
-        # Megatron-Bridge uses an explicit setting "should_pad_vocab" so that 
-        # when converting model configs from HF, we can set a vocab size and disable padding. 
         assert args.vocab_size is not None, "Either --padded-vocab-size or --vocab-size must be specified."
         kwargs["vocab_size"] = args.vocab_size
         kwargs["should_pad_vocab"] = True
