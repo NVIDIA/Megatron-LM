@@ -700,7 +700,6 @@ def test_direct_dcp_streaming_rejects_existing_output_overwrite_for_crash_safety
                 output_root,
                 lambda: _template(),
                 output_iteration=30,
-                execution_mode="direct-dcp-streaming",
                 streaming_chunk_bytes=16,
                 overwrite_output=True,
             )
@@ -896,9 +895,7 @@ def test_merge_sharded_checkpoints_round_trip(tmp_path_dist_ckpt, process_group)
         assert result.memory_estimate.accumulator_bytes == 24
         assert result.memory_estimate.output_tensor_bytes == 24
         assert result.memory_estimate.projected_cpu_peak_bytes == 52
-        assert result.memory_estimate.projected_gpu_peak_bytes == 0
         assert result.max_host_peak_bytes >= result.host_peak_bytes
-        assert result.max_gpu_peak_bytes >= result.gpu_peak_bytes
         assert result.world_size >= 1
         assert (output_root / "latest_checkpointed_iteration.txt").read_text().strip() == "30"
 
@@ -913,7 +910,7 @@ def test_merge_sharded_checkpoints_round_trip(tmp_path_dist_ckpt, process_group)
         common_state = dist_checkpointing.load_common_state_dict(str(result.output_dir))
         provenance = common_state["weighted_merge_provenance"]
         assert provenance["weights"] == [0.25, 0.75]
-        assert provenance["implementation_mode"] == "cpu-resident"
+        assert provenance["implementation_mode"] == "direct-dcp-streaming"
         assert provenance["extra_state_source_index"] == 0
         assert provenance["optimizer_merged"] is False
         assert provenance["rng_merged"] is False
@@ -963,31 +960,6 @@ def test_merge_without_output_iteration_preserves_common_metadata(
         assert loaded["args"].hidden_size == 2
 
 
-def test_cpu_resident_mode_uses_cpu_buffers_for_meta_template(tmp_path_dist_ckpt, process_group):
-    with (
-        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_cpu_a") as ckpt_a,
-        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_cpu_b") as ckpt_b,
-        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_cpu_out") as output_root,
-    ):
-        _write_checkpoint(ckpt_a, 1.0, extra_value=111.0, iteration=1)
-        _write_checkpoint(ckpt_b, 3.0, extra_value=999.0, iteration=2)
-
-        result = merge_sharded_checkpoints(
-            [ckpt_a, ckpt_b],
-            [0.5, 0.5],
-            output_root / "merged",
-            lambda: _template(device="meta"),
-            execution_mode="cpu-resident",
-            verify_load=True,
-        )
-
-        loaded = _load_checkpoint(result.output_dir)
-        assert result.implementation_mode == "cpu-resident"
-        assert result.verified_load
-        assert torch.allclose(loaded["model"]["weight"], torch.full((2, 2), 2.0))
-        assert torch.equal(loaded["model"]["decoder.layers.0._extra_state"], torch.tensor([111.0]))
-
-
 def test_direct_dcp_streaming_mode_round_trip_without_file_backed_staging(
     tmp_path_dist_ckpt, process_group, monkeypatch
 ):
@@ -1023,7 +995,6 @@ def test_direct_dcp_streaming_mode_round_trip_without_file_backed_staging(
             output_root,
             lambda: _template(shape=shape),
             output_iteration=30,
-            execution_mode="direct-dcp-streaming",
             streaming_chunk_bytes=16,
             verify_load=True,
         )
@@ -1085,7 +1056,6 @@ def test_direct_dcp_streaming_bfloat16_save_dtype_and_chunk_metadata(
             output_root / "merged",
             lambda: _template(dtype=torch.float16, shape=shape),
             save_dtype="bfloat16",
-            execution_mode="direct-dcp-streaming",
             streaming_chunk_bytes=16,
             verify_load=True,
         )
@@ -1141,7 +1111,6 @@ def test_direct_dcp_streaming_verify_load_checks_hidden_temp_before_publication(
             output_root,
             lambda: _template(),
             output_iteration=30,
-            execution_mode="direct-dcp-streaming",
             streaming_chunk_bytes=16,
             verify_load=True,
         )
@@ -1189,7 +1158,6 @@ def test_direct_dcp_streaming_verify_load_failure_blocks_publication(
                 output_root,
                 lambda: _template(),
                 output_iteration=30,
-                execution_mode="direct-dcp-streaming",
                 streaming_chunk_bytes=16,
                 verify_load=True,
             )
@@ -1215,7 +1183,7 @@ def test_direct_dcp_streaming_rejects_no_atomic_output(
 
         with pytest.raises(
             WeightedMergeError,
-            match="direct-dcp-streaming requires atomic output publication",
+            match="requires atomic output publication",
         ):
             merge_sharded_checkpoints(
                 [ckpt_a, ckpt_b],
@@ -1223,7 +1191,6 @@ def test_direct_dcp_streaming_rejects_no_atomic_output(
                 output_root,
                 lambda: _template(),
                 output_iteration=30,
-                execution_mode="direct-dcp-streaming",
                 atomic_output=False,
                 streaming_chunk_bytes=16,
             )
@@ -1260,7 +1227,6 @@ def test_direct_dcp_streaming_planner_failure_does_not_publish_final_output(
                 output_root,
                 lambda: _template(),
                 output_iteration=30,
-                execution_mode="direct-dcp-streaming",
                 streaming_chunk_bytes=16,
             )
 
@@ -1304,7 +1270,6 @@ def test_direct_dcp_streaming_sidecar_failure_after_dcp_save_does_not_publish_fi
                 output_root,
                 lambda: _template(),
                 output_iteration=30,
-                execution_mode="direct-dcp-streaming",
                 streaming_chunk_bytes=16,
             )
 
@@ -1353,7 +1318,6 @@ def test_direct_dcp_streaming_latest_marker_failure_is_after_publication(
                 output_root,
                 lambda: _template(),
                 output_iteration=30,
-                execution_mode="direct-dcp-streaming",
                 streaming_chunk_bytes=16,
                 verify_load=True,
             )
@@ -1392,32 +1356,13 @@ def test_direct_dcp_streaming_two_rank_product_round_trip_public_metadata(
             output_root,
             lambda: _template(),
             output_iteration=30,
-            execution_mode="direct-dcp-streaming",
             streaming_chunk_bytes=16,
             verify_load=True,
         )
-        cpu_resident = merge_sharded_checkpoints(
-            [ckpt_a, ckpt_b],
-            [0.25, 0.75],
-            output_root / "cpu_resident",
-            lambda: _template(),
-            execution_mode="cpu-resident",
-            verify_load=True,
-        )
-
         direct_loaded = _load_checkpoint(direct.output_dir)
-        cpu_resident_loaded = _load_checkpoint(cpu_resident.output_dir)
         assert direct.implementation_mode == "direct-dcp-streaming"
         assert direct.world_size == 2
         assert direct.verified_load
-        assert torch.equal(
-            direct_loaded["model"]["weight"], cpu_resident_loaded["model"]["weight"]
-        )
-        assert torch.equal(direct_loaded["model"]["bias"], cpu_resident_loaded["model"]["bias"])
-        assert torch.equal(
-            direct_loaded["model"]["decoder.layers.0._extra_state"],
-            cpu_resident_loaded["model"]["decoder.layers.0._extra_state"],
-        )
         expected_rank_weight = 4.0 + (1.75 * rank)
         assert torch.equal(
             direct_loaded["model"]["weight"], torch.full((2, 2), expected_rank_weight)
@@ -1431,18 +1376,11 @@ def test_direct_dcp_streaming_two_rank_product_round_trip_public_metadata(
         )
 
         direct_public = _full_public_dcp_state(direct.output_dir)
-        cpu_resident_public = _full_public_dcp_state(cpu_resident.output_dir)
         expected_public_weight = torch.cat(
             [torch.full((2, 2), 4.0), torch.full((2, 2), 5.75)], dim=0
         )
         expected_public_bias = torch.tensor([5.0, 5.0, 6.75, 6.75])
         expected_public_extra = torch.tensor([111.0, 112.0])
-        assert torch.equal(direct_public["model.weight"], cpu_resident_public["model.weight"])
-        assert torch.equal(direct_public["model.bias"], cpu_resident_public["model.bias"])
-        assert torch.equal(
-            direct_public["model.decoder.layers.0._extra_state"],
-            cpu_resident_public["model.decoder.layers.0._extra_state"],
-        )
         assert torch.equal(direct_public["model.weight"], expected_public_weight)
         assert torch.equal(direct_public["model.bias"], expected_public_bias)
         assert torch.equal(
@@ -1483,7 +1421,6 @@ def test_direct_dcp_streaming_supports_sharded_tensor_factory_components(
             [0.25, 0.75],
             output_root / "merged",
             lambda: _factory_template(),
-            execution_mode="direct-dcp-streaming",
             streaming_chunk_bytes=16,
             verify_load=True,
         )
@@ -1530,7 +1467,6 @@ def test_direct_dcp_streaming_supports_prepended_axis_tensors(
             [0.25, 0.75],
             output_root / "merged",
             lambda: _prepended_axis_template(),
-            execution_mode="direct-dcp-streaming",
             streaming_chunk_bytes=16,
             verify_load=True,
         )
@@ -1556,7 +1492,6 @@ def test_direct_dcp_streaming_copies_object_extra_state(tmp_path_dist_ckpt, proc
             [0.25, 0.75],
             output_root / "merged",
             lambda: _object_extra_template(),
-            execution_mode="direct-dcp-streaming",
             streaming_chunk_bytes=16,
         )
         loaded = dist_checkpointing.load(_object_extra_template(), str(result.output_dir))
@@ -1598,7 +1533,6 @@ def test_direct_dcp_streaming_copies_byte_extra_state_for_tensor_like_object_tem
             [0.25, 0.75],
             output_root / "merged",
             lambda: _tensor_like_object_extra_template(),
-            execution_mode="direct-dcp-streaming",
             streaming_chunk_bytes=16,
             extra_state_source_index=1,
             verify_load=True,
@@ -1647,7 +1581,6 @@ def test_direct_dcp_streaming_two_rank_copies_rank_local_object_extra_state(
             [0.25, 0.75],
             output_root / "merged",
             lambda: _rank_local_object_extra_template(),
-            execution_mode="direct-dcp-streaming",
             streaming_chunk_bytes=16,
             extra_state_source_index=1,
             verify_load=True,
@@ -2038,14 +1971,6 @@ def test_merge_rejects_argument_validation_errors(tmp_path_dist_ckpt, process_gr
             merge_sharded_checkpoints(
                 [ckpt_a], [1.0], output_root, lambda: _template(), save_dtype="fp8"
             )
-        with pytest.raises(WeightedMergeError, match="Unsupported execution mode"):
-            merge_sharded_checkpoints(
-                [ckpt_a],
-                [1.0],
-                output_root,
-                lambda: _template(),
-                execution_mode="baseline",
-            )
         with pytest.raises(WeightedMergeError, match="preflight_only"):
             merge_sharded_checkpoints(
                 [ckpt_a],
@@ -2187,7 +2112,7 @@ def test_merge_negative_manual_weights_round_trip(tmp_path_dist_ckpt, process_gr
         assert common_state["weighted_merge_provenance"]["weights"] == [1.5, -0.5]
 
 
-def test_cli_argparse_surface_merges_cpu_resident_checkpoint(tmp_path_dist_ckpt, process_group):
+def test_cli_argparse_surface_merges_checkpoint(tmp_path_dist_ckpt, process_group):
     with (
         TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_cli_a") as ckpt_a,
         TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_cli_b") as ckpt_b,
@@ -2209,13 +2134,10 @@ def test_cli_argparse_surface_merges_cpu_resident_checkpoint(tmp_path_dist_ckpt,
                 str(output_root),
                 "--output-iteration",
                 "30",
-                "--merge-execution-mode",
-                "cpu-resident",
                 "--verify-load",
             ]
         )
 
-        assert args.merge_execution_mode == "cpu-resident"
         assert args.verify_load is True
         assert args.merge_save_dtype == "same"
 
@@ -2232,11 +2154,10 @@ def test_cli_argparse_surface_merges_cpu_resident_checkpoint(tmp_path_dist_ckpt,
             output_iteration=args.output_iteration,
             verify_load=args.verify_load,
             extra_state_source_index=args.extra_state_source_index,
-            execution_mode=args.merge_execution_mode,
         )
 
         assert result.output_dir == output_root / "iter_0000030"
-        assert result.implementation_mode == "cpu-resident"
+        assert result.implementation_mode == "direct-dcp-streaming"
         assert result.verified_load
         loaded = _load_checkpoint(result.output_dir)
         assert torch.allclose(loaded["model"]["weight"], torch.full((2, 2), 4.0))
