@@ -1433,9 +1433,14 @@ class TransformerConfig(ModelParallelConfig):
             assert self.multi_latent_attention, "DSv4 Hybrid requires multi_latent_attention."
             assert self.csa_compress_ratios is not None, "csa_compress_ratios must be set"
             mtp_layers = self.mtp_num_layers or 0
+            # Minimum length is num_layers + mtp_num_layers (the GPT path uses exactly this,
+            # where mtp_num_layers == #MTP transformer layers). On HybridModel an MTP "depth"
+            # can expand to MULTIPLE hybrid layers, so mtp_num_layers (= depth count) undercounts
+            # the real MTP layers and csa_compress_ratios must be at least long enough to index
+            # every MTP attention layer (num_layers + layer_number - 1). Hence ">=", not "==".
             expected_len = self.num_layers + mtp_layers
-            assert len(self.csa_compress_ratios) == expected_len, (
-                f"csa_compress_ratios length ({len(self.csa_compress_ratios)}) must equal "
+            assert len(self.csa_compress_ratios) >= expected_len, (
+                f"csa_compress_ratios length ({len(self.csa_compress_ratios)}) must be at least "
                 f"num_layers + mtp_num_layers ({self.num_layers} + {mtp_layers} = {expected_len})"
             )
             assert all(

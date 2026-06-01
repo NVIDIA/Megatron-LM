@@ -113,15 +113,33 @@ class DSAIndexerLossLoggingHelper:
                 tracker on ranks where no indexer layer ran.
         """
         tracker = DSAIndexerLossLoggingHelper.tracker
+        pp_group = parallel_state.get_pipeline_model_parallel_group()
+
+        # Agree on a consistent tracker size across the PP group BEFORE the collective.
+        # Ranks owning indexer layers may have grown the tracker via save_loss_to_tracker
+        # (e.g. an MTP layer whose layer_number exceeds num_layers), while ranks without any
+        # indexer layer have only a num_layers-sized (or absent) tracker. all_reduce requires
+        # identical shapes on every rank, so reduce-MAX the local size first, then pad to it
+        # (otherwise PP>1 hangs / errors on mismatched sizes).
+        local_size = tracker["values"].shape[0] if "values" in tracker else (num_layers or 0)
+        size_t = torch.tensor(
+            [local_size], device=torch.cuda.current_device(), dtype=torch.long
+        )
+        torch.distributed.all_reduce(size_t, op=torch.distributed.ReduceOp.MAX, group=pp_group)
+        size = int(size_t.item())
+        if size == 0:
+            return
         if "values" not in tracker:
-            if num_layers is None:
-                return
-            tracker["values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
+            tracker["values"] = torch.zeros(size, device=torch.cuda.current_device())
+        elif tracker["values"].shape[0] < size:
+            grown = torch.zeros(
+                size, device=tracker["values"].device, dtype=tracker["values"].dtype
+            )
+            grown[: tracker["values"].shape[0]] = tracker["values"]
+            tracker["values"] = grown
         values = tracker["values"]
 
-        torch.distributed.all_reduce(
-            values, group=parallel_state.get_pipeline_model_parallel_group()
-        )
+        torch.distributed.all_reduce(values, group=pp_group)
         # Reduce indexer losses across ranks.
         if tracker.get('reduce_group') is not None:
             torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
