@@ -1618,12 +1618,10 @@ def validate_args(args, defaults={}):
 
     if args.logits_save_dir is not None:
         assert args.logits_save_top_k is not None, '--logits-save-top-k is required when --logits-save-dir is set.'
-
-        if args.async_strategy != "mcore":
-            warn_rank_0(
-                '--logits-save-dir requires async_strategy="mcore". Overriding async_strategy to "mcore".'
-            )
-            args.async_strategy = "mcore"
+        assert args.async_save, (
+            '--logits-save-dir requires --async-save (and --use-persistent-ckpt-worker). '
+            'Logits are flushed as an async request in the checkpoint queue.'
+        )
 
     if args.freeze_all_layers:
         if args.use_distributed_optimizer:
@@ -3400,11 +3398,6 @@ def _add_logits_distillation_args(parser):
                             'cumulative mass. Default: 1.')
     group.add_argument('--logits-save-dir', type=str, default=None,
                        help='Directory to save logits.')
-    group.add_argument('--logits-save-flush-interval', type=int, default=1,
-                       help='Number of iterations to buffer in memory before '
-                            'flushing as a single tar archive. 1 (default) '
-                            'writes one tar per CP-DP rank per iteration. '
-                            'Higher values batch multiple iterations into each tar.')
     group.add_argument('--logits-save-dtype', type=str, default='fp16',
                        choices=['fp16', 'bf16', 'fp32'],
                        help='Dtype for on-disk top-K log-probabilities.')

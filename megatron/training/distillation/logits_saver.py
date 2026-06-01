@@ -24,13 +24,11 @@ Index storage optimization:
 - To reconstruct: global_index = (bit_17 << 16) | low_16_bits
 """
 
-import concurrent.futures
 import io
 import json
 import logging
 import os
 import tarfile
-import threading
 from collections import OrderedDict
 from types import MethodType
 from typing import Any, Dict, List, Optional, Tuple
@@ -41,6 +39,7 @@ import zstandard
 
 from megatron.core import parallel_state
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.training import get_args, get_tensorboard_writer
 from megatron.training.utils import print_rank_0
@@ -104,11 +103,9 @@ class LogitsSaverHooks:
     Indices are stored efficiently: uint16 for lower 16 bits + separate high bit tensor.
     CP and DP ranks are stored in the tar filename for flexibility with multi-digit values.
 
-    Iteration data is accumulated in memory and flushed as a tar archive every
-    *flush_interval* iterations via a background thread, reducing inode usage
-    and avoiding blocking the training loop.  A ``flush_interval`` of 1 writes
-    one tar per iteration.  Call :meth:`flush` at checkpoint / shutdown to write
-    any remaining buffered data.
+    Iteration data is accumulated in memory and flushed as a tar archive at
+    checkpoint time via the async checkpoint queue.  Call :meth:`flush` at
+    shutdown to write any remaining buffered data synchronously.
 
     Args:
         save_dir: Directory to save log-prob files
@@ -120,8 +117,6 @@ class LogitsSaverHooks:
             sentinel and ``-1`` index sentinel.
         min_k: Minimum number of entries kept per token when top-P masking
             is active, regardless of cumulative mass.  Defaults to 1.
-        flush_interval: Number of iterations to batch before writing a single
-            tar archive.  1 (default) writes one tar per iteration.
         save_dtype: String name of the dtype for top-K log-probabilities on
             disk.  One of ``'fp16'``, ``'bf16'``, or ``'fp32'``.
     """
@@ -139,12 +134,10 @@ class LogitsSaverHooks:
         *,
         p: Optional[float] = None,
         min_k: int = 1,
-        flush_interval: int = 1,
         save_dtype: str = 'fp16',
     ):
         assert k > 0, "Number of top log-probabilities to save must be positive"
         assert save_dir is not None, "Save directory must be provided"
-        assert flush_interval >= 1, "flush_interval must be >= 1"
         if save_dtype not in self._DTYPE_MAP:
             raise ValueError(
                 f"save_dtype must be one of {list(self._DTYPE_MAP)}, got '{save_dtype}'"
@@ -164,7 +157,6 @@ class LogitsSaverHooks:
         self.k = k
         self.p = p
         self.min_k = min_k
-        self.flush_interval = flush_interval
 
         # Parallel state info
         self.tp_rank = parallel_state.get_tensor_model_parallel_rank()
@@ -191,7 +183,6 @@ class LogitsSaverHooks:
                 "p": self.p,
                 "min_k": self.min_k,
                 "save_dtype": save_dtype,
-                "flush_interval": self.flush_interval,
             },
         }
         self._meta_bytes: bytes = json.dumps(
@@ -203,13 +194,8 @@ class LogitsSaverHooks:
         self._hook_handles: List[Any] = []
         self._loss_overrides: List[Tuple[torch.nn.Module, Any]] = []
 
-        # Batched tar state.
+        # Batched tar state — accumulates until checkpoint time.
         self._pending_writes: OrderedDict[int, bytes] = OrderedDict()
-        self._flush_executor: Optional[concurrent.futures.ThreadPoolExecutor] = (
-            concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        )
-        self._flush_futures: List[concurrent.futures.Future] = []
-        self._flush_lock = threading.Lock()
 
         # Top-P logging: per-microbatch kept counts (populated by _apply_topp_truncation)
         self._topp_kept_counts: List[float] = []
@@ -304,7 +290,7 @@ class LogitsSaverHooks:
             all_indices_low.append(indices_low.cpu())
             all_high_bits.append(high_bit.cpu())
 
-        self._write_to_disk(all_values, all_indices_low, all_high_bits)
+        self._buffer_iteration(all_values, all_indices_low, all_high_bits)
 
         if self._topp_kept_counts:
             # Log the average number of top-P kept tokens per microbatch to tensorboard
@@ -513,23 +499,19 @@ class LogitsSaverHooks:
 
         return values, indices
 
-    def _write_to_disk(
+    def _buffer_iteration(
         self,
         values_list: List[torch.Tensor],
         indices_low_list: List[torch.Tensor],
         bit_17_list: List[torch.Tensor],
     ) -> None:
-        """Write all microbatch data to disk in a single I/O call.
+        """Serialize microbatch data and buffer for async flush at checkpoint time.
 
         File format: serialized dict with:
         - values: list of tensors of log-probabilities (one per microbatch)
           in ``self._save_dtype`` (default ``torch.float16``)
         - indices_low: list of uint16 tensors (lower 16 bits of vocab indices)
         - bit_17: list of bool tensors (17th bit, same shape as indices_low)
-
-        The serialised bytes are buffered in memory and flushed as a tar
-        archive every *flush_interval* iterations.  A ``flush_interval`` of 1
-        writes a single-iteration tar.
         """
         # Serialize all tensors together
         buffer = io.BytesIO()
@@ -539,58 +521,49 @@ class LogitsSaverHooks:
             'bit_17': bit_17_list,
         }, buffer)
         data = buffer.getvalue()
-
         iteration = get_current_iteration()
-
         self._pending_writes[iteration] = data
-        if (iteration + 1) % self.flush_interval == 0:
-            self._flush_pending()
 
     # ------------------------------------------------------------------
-    #  Batched-tar flush helpers
+    #  Flush helpers
     # ------------------------------------------------------------------
 
-    def _flush_pending(self) -> Optional[concurrent.futures.Future]:
-        """Flush buffered iteration data as a single tar archive (async)."""
-        with self._flush_lock:
-            if not self._pending_writes:
-                if self._flush_futures:
-                    return self._flush_futures[-1]
-                future = concurrent.futures.Future()
-                future.set_result(None)
-                return future
+    def take_pending_data(self) -> Tuple[str, "OrderedDict[int, bytes]", bytes, bool]:
+        """Take ownership of buffered data for async flush at checkpoint time.
 
-            # Wait for any prior background flush to finish before handing off
-            # new data, bounding peak memory to one batch of pending writes.
-            for future in self._flush_futures:
-                future.result()
-            self._flush_futures.clear()
+        Returns:
+            Tuple of (tar_path, writes, meta_bytes, msc_enabled).  If there is
+            no pending data (e.g. non-TP-rank-0), ``writes`` will be an empty
+            OrderedDict and ``tar_path`` will be an empty string.
+        """
+        # NOTE: We need to re-enabled MSC in the async saving process, so we pass this flag.
+        msc_enabled = MultiStorageClientFeature.is_enabled()
 
-            # Take ownership of the current pending buffer
-            writes = self._pending_writes
-            self._pending_writes = OrderedDict()
+        if not self._pending_writes:
+            return ("", OrderedDict(), self._meta_bytes, msc_enabled)
 
-            last_iter = max(writes.keys())
-            tar_filename = batched_tar_filename(
-                self.cp_rank, self.dp_rank, last_iter,
-            )
-            tar_path = os.path.join(self.save_dir, tar_filename)
+        writes = self._pending_writes
+        self._pending_writes = OrderedDict()
 
-            future = self._flush_executor.submit(
-                LogitsSaverHooks._write_batched_tar, tar_path, writes, self._meta_bytes,
-            )
-            self._flush_futures.append(future)
-
-        print_rank_0(f"Flushing {len(writes)} logit iterations to disk")
-        return future
+        last_iter = max(writes.keys())
+        tar_filename = batched_tar_filename(
+            self.cp_rank, self.dp_rank, last_iter,
+        )
+        tar_path = os.path.join(self.save_dir, tar_filename)
+        print_rank_0(f"Handing off {len(writes)} logit iterations for async flush")
+        return (tar_path, writes, self._meta_bytes, msc_enabled)
 
     @staticmethod
     def _write_batched_tar(
         tar_path: str,
         writes: "OrderedDict[int, bytes]",
         meta_bytes: bytes,
+        msc_enabled: bool = False,
     ) -> None:
-        """Write a tar archive containing multiple iterations (runs in background thread).
+        """Write a tar archive containing multiple iterations.
+
+        Called in the async checkpoint background process.  Early-returns
+        when there is nothing to write (non-TP-rank-0 ranks).
 
         The dataset-identity metadata is written as the **first** member
         (named :data:`META_TAR_MEMBER`) so the student-side tar reader
@@ -600,9 +573,16 @@ class LogitsSaverHooks:
         Each subsequent member is named ``{iteration}.pt.zst`` so that
         the student-side tar reader can stream iterations by member name.
         """
+        if not writes:
+            return
+        if msc_enabled:
+            # NOTE: MSC is not enabled in the async saving process by default.
+            MultiStorageClientFeature.enable()
+
         storage_makedirs(os.path.dirname(tar_path), exist_ok=True)
         write_path = tar_path if is_remote_storage_path(tar_path) else f"{tar_path}.tmp"
         compressor = zstandard.ZstdCompressor(level=3)
+
         with open_logit_file(write_path, "wb") as stream:
             with tarfile.open(fileobj=stream, mode="w") as tar:
                 info = tarfile.TarInfo(name=META_TAR_MEMBER)
@@ -618,29 +598,7 @@ class LogitsSaverHooks:
         if write_path != tar_path:
             storage_move(write_path, tar_path)
 
-    def _wait_for_pending_flushes(self) -> None:
-        """Block until all background flush futures have completed."""
-        with self._flush_lock:
-            for future in self._flush_futures:
-                future.result()
-            self._flush_futures.clear()
-
-    def begin_flush(self) -> Optional[concurrent.futures.Future]:
-        """Hand off buffered data and return a future for checkpoint finalization."""
-        return self._flush_pending()
-
-    def finish_flush(self) -> None:
-        """Block until all background flush work has completed."""
-        self._wait_for_pending_flushes()
-
     def flush(self) -> None:
-        """Flush any remaining buffered data to disk."""
-        self.begin_flush()
-        self.finish_flush()
-
-    def shutdown(self) -> None:
-        """Flush remaining data and shut down the background executor."""
-        self.flush()
-        if self._flush_executor is not None:
-            self._flush_executor.shutdown(wait=True)
-            self._flush_executor = None
+        """Synchronously flush any remaining buffered data to disk."""
+        tar_path, writes, meta_bytes, _ = self.take_pending_data()
+        self._write_batched_tar(tar_path, writes, meta_bytes)

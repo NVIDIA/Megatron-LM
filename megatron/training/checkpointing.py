@@ -524,14 +524,6 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     # Monitor for the checkpointing timeout (no-op if FT is not enabled)
     ft_integration.on_checkpointing_start()
 
-    # Start draining buffered logits now so the sidecar write can overlap with
-    # async checkpoint I/O. Async checkpoints wait on the returned dependency.
-    from megatron.training.distillation import get_logits_saver
-    logits_saver = get_logits_saver()
-    logits_flush_future = None
-    if logits_saver is not None:
-        logits_flush_future = logits_saver.begin_flush()
-
     # Only rank zero of the data parallel writes to the disk.
     model = unwrap_model(model)
 
@@ -781,15 +773,6 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 ensure_directory_exists(checkpoint_name)
                 torch.save(state_dict, checkpoint_name)
 
-    if logits_saver is not None:
-        if args.async_save and logits_flush_future is not None:
-            assert async_save_request is not None
-            async_save_request = async_save_request.with_finalize_dependencies(
-                [logits_flush_future]
-            )
-        elif not args.async_save:
-            logits_saver.finish_flush()
-
     start_misc = time()
     if ckpt_type != CheckpointType.LOCAL:
         if not args.async_save:
@@ -887,7 +870,26 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             wandb_finalize_fn()
 
     if args.async_save:
+        # Schedule logits flush AFTER the checkpoint request so the persistent
+        # worker processes checkpoint preload first (unblocking the main
+        # thread), then writes logits in the background.  Finalize_fns are
+        # moved from the checkpoint request to the logits request so that
+        # "success" callbacks only fire after both writes are confirmed.
+        from megatron.training.distillation import get_logits_saver
+
+        logits_saver = get_logits_saver()
+        if logits_saver is not None:
+            async_request_cls = get_async_strategy(args.async_strategy)[1]["AsyncRequest"]
+            async_logits_request = async_request_cls(
+                async_fn=logits_saver._write_batched_tar,
+                async_fn_args=logits_saver.take_pending_data(),
+                finalize_fns=async_save_request.finalize_fns.copy(),
+            )
+            async_save_request.finalize_fns.clear()
+
         schedule_async_save(async_save_request)
+        if logits_saver is not None:
+            schedule_async_save(async_logits_request)
         print_rank_0(f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] scheduled "
                      f"an async checkpoint save at iteration {iteration:7d} to {save_dir}")
 
