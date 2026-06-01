@@ -18,7 +18,10 @@ from megatron.core import tensor_parallel
 from megatron.core.activations import squared_relu
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
-from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.extensions.transformer_engine import (
+    HAVE_TE,
+    fused_grouped_mlp_activation_offload_supported,
+)
 from megatron.core.fusions.fused_bias_geglu import quick_gelu, weighted_bias_quick_geglu_impl
 from megatron.core.fusions.fused_bias_swiglu import weighted_bias_swiglu_impl
 from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_relu_impl
@@ -329,6 +332,10 @@ class TEGroupedMLP(MegatronModule):
         # Check for unsupported features
         if self.tp_group.size() > 1:
             return False  # Tensor parallelism is not supported
+        if (
+            getattr(self, "offload_expert_fc1", False) or getattr(self, "offload_moe_act", False)
+        ) and not fused_grouped_mlp_activation_offload_supported():
+            return False  # TE fused grouped MLP offload markers require TE >= 2.17.
         if self.config.moe_apply_probs_on_input:
             return False  # Pre-multiplying probs is not supported
 
@@ -413,7 +420,7 @@ class TEGroupedMLP(MegatronModule):
             single_grouped_bias=fc1_single_grouped_bias,
             delay_wgrad_compute=fc1_delay_wgrad_compute,
         )
-        op.fine_grained_activation_offloading = self.offload_expert_fc1
+        op.fine_grained_activation_offloading = getattr(self, "offload_expert_fc1", False)
 
         # Copy the weights from GroupedLinear module to GroupedLinear op.
         if fc1_single_grouped_weight:
@@ -488,7 +495,7 @@ class TEGroupedMLP(MegatronModule):
                 "_make_fused_ops expected SwiGLU, quick_gelu, or weighted squared_relu; "
                 "call _is_fused_impl_supported() before constructing fused ops."
             )
-        op.fine_grained_activation_offloading = self.offload_moe_act
+        op.fine_grained_activation_offloading = getattr(self, "offload_moe_act", False)
         ops.append(op)
 
         # FC2
@@ -603,21 +610,18 @@ class TEGroupedMLP(MegatronModule):
             )
         else:
             stash_context = nullcontext()
-        fine_grained_activation_offloading = self.offload_expert_fc1 or self.offload_moe_act
+        offload_expert_fc1 = getattr(self, "offload_expert_fc1", False)
+        offload_moe_act = getattr(self, "offload_moe_act", False)
+        fine_grained_activation_offloading = offload_expert_fc1 or offload_moe_act
         offload_name = "_".join(
             name
-            for name, enabled in (
-                ("expert_fc1", self.offload_expert_fc1),
-                ("moe_act", self.offload_moe_act),
-            )
+            for name, enabled in (("expert_fc1", offload_expert_fc1), ("moe_act", offload_moe_act))
             if enabled
         )
         with off_interface(
             fine_grained_activation_offloading, permuted_local_hidden_states, offload_name
         ) as permuted_local_hidden_states:
-            forced_released_tensors = (
-                [permuted_local_hidden_states] if self.offload_expert_fc1 else []
-            )
+            forced_released_tensors = [permuted_local_hidden_states] if offload_expert_fc1 else []
             with stash_context:
                 # Call fused impl
                 output = ops(

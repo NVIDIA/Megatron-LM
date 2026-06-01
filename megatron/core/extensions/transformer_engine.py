@@ -86,6 +86,11 @@ except ImportError:
 _TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
 
 
+def fused_grouped_mlp_activation_offload_supported() -> bool:
+    """Return whether TE fused grouped MLP supports selective activation offload markers."""
+    return HAVE_TE and is_te_min_version("2.17")
+
+
 class TransformerEngineConfigType(enum.Enum):
     """Configuration object types in config dictionary"""
 
