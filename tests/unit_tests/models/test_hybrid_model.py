@@ -69,12 +69,17 @@ def test_hybrid_model_with_custom_process_groups(tmp_path, tp_size, cp_size, pp_
         if not torch.distributed.is_initialized():
             torch.distributed.init_process_group(backend='nccl')
 
-        # Create HyperCommGrid with dimensions tp, cp, pp (reversed from device mesh order)
-        grid = HyperCommGrid([tp_size, cp_size, pp_size], ["tp", "cp", "pp"])
+        dp_size = 1
+
+        # Create HyperCommGrid with dimensions tp, cp, pp, dp.
+        grid = HyperCommGrid(
+            [tp_size, cp_size, pp_size, dp_size], ["tp", "cp", "pp", "dp"]
+        )
 
         pp_group = grid.create_pg("pp")
         cp_group = grid.create_pg("cp")
         tp_group = grid.create_pg("tp")
+        dp_cp_group = grid.create_pg(["cp", "dp"])
         embd_group_ranks = parallel_state.default_embedding_ranks(
             torch.distributed.get_process_group_ranks(pp_group)
         )
@@ -86,7 +91,7 @@ def test_hybrid_model_with_custom_process_groups(tmp_path, tp_size, cp_size, pp_
         from megatron.core.process_groups_config import ProcessGroupCollection
 
         pg_collection = ProcessGroupCollection(
-            tp=tp_group, cp=cp_group, pp=pp_group, embd=embd_group, dp_cp=cp_group
+            tp=tp_group, cp=cp_group, pp=pp_group, embd=embd_group, dp_cp=dp_cp_group
         )
 
         # Build pattern with '|' pipeline stage separators: 2 layers per PP stage
