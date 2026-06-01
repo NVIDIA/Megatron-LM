@@ -70,6 +70,8 @@ class DSv4HybridAttention(Attention):
         cp_comm_type: Optional[str] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         is_mtp_layer: bool = False,
+        pp_layer_offset: Optional[int] = None,
+        compress_ratio: Optional[int] = None,
     ) -> None:
 
         super().__init__(
@@ -80,6 +82,7 @@ class DSv4HybridAttention(Attention):
             attn_mask_type=attn_mask_type,
             pg_collection=pg_collection,
             is_mtp_layer=is_mtp_layer,
+            pp_layer_offset=pp_layer_offset,
         )
         self.config: MLATransformerConfig
 
@@ -109,11 +112,15 @@ class DSv4HybridAttention(Attention):
 
         self.softmax_scale = None
 
-        if is_mtp_layer:
-            layer_idx = self.config.num_layers + layer_number - 1
-            compress_ratio = self.config.csa_compress_ratios[layer_idx]
-        else:
-            compress_ratio = self.config.csa_compress_ratios[layer_number - 1]
+        # Per-layer compress ratio. When set explicitly (e.g. hybrid 'C'/'H' layer symbols
+        # pass compress_ratio=4/128 via the spec), use it directly; otherwise fall back to the
+        # per-(global)-layer csa_compress_ratios array (GPT-parity / array-driven path).
+        if compress_ratio is None:
+            if is_mtp_layer:
+                layer_idx = self.config.num_layers + layer_number - 1
+                compress_ratio = self.config.csa_compress_ratios[layer_idx]
+            else:
+                compress_ratio = self.config.csa_compress_ratios[layer_number - 1]
         use_compressed_yarn = compress_ratio > 1
         rope_base = (
             self.config.csa_compress_rotary_base if use_compressed_yarn else self.config.rotary_base
@@ -403,6 +410,8 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         cp_comm_type: Optional[str] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         is_mtp_layer: bool = False,
+        pp_layer_offset: Optional[int] = None,
+        compress_ratio: Optional[int] = None,
     ):
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -416,6 +425,8 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
             is_mtp_layer=is_mtp_layer,
+            pp_layer_offset=pp_layer_offset,
+            compress_ratio=compress_ratio,
         )
 
         q_down_proj_kwargs = {}

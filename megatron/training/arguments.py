@@ -2098,7 +2098,10 @@ def core_transformer_config_from_args(args, config_class=None):
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
         if Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
-            kw_args['experimental_attention_variant'] = 'dsa'
+            # 'D' layers default to DSv3 'dsa', but respect an explicitly requested variant
+            # (e.g. 'dsv4_hybrid') so the hybrid 'D' layer can run DSv4 CompressedSparseAttention.
+            if getattr(args, 'experimental_attention_variant', None) is None:
+                kw_args['experimental_attention_variant'] = 'dsa'
 
     kw_args['inference_sampling_seed'] = args.seed
 
