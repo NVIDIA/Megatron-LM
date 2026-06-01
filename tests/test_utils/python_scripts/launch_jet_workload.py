@@ -226,6 +226,7 @@ def launch_and_wait_for_completion(
                                         "TRANSFORMERS_OFFLINE": "1",
                                         "CLUSTER": cluster,
                                         "RUN_ID": str(uuid.uuid4()),
+                                        "CLEANUP_PATHS": os.getenv("CLEANUP_PATHS") or "",
                                     }
                                 }
                             }
@@ -570,7 +571,7 @@ def main(
             ["\n".join(log_lines) for log_lines in allranks_logs.values()]
         )
         concat_mainrank_log = "\n".join(mainrank_log)
-        if concat_allranks_logs.strip() == "":
+        if concat_allranks_logs.strip() == "" and concat_mainrank_log.strip() == "":
             logger.error("No logs found. Try again.")
             n_attempts += 1
             continue
