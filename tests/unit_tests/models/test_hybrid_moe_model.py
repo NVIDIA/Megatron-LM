@@ -124,6 +124,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "gated_linear_unit": False,
     "glu_linear_offset": 0.0,
     "grad_scale_func": None,
+    "mtp_grad_scale_func": None,
     "grad_sync_func": None,
     "gradient_accumulation_fusion": True,
     "hetereogenous_dist_checkpoint": False,
