@@ -47,7 +47,6 @@ For NVIDIA GPU Cloud (NGC) container setup and all installation options, review 
 
 - **[Your First Training Run](https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/quickstart.html)** - End-to-end training examples with data preparation
 - **[Parallelism Strategies](https://docs.nvidia.com/megatron-core/developer-guide/latest/user-guide/parallelism-guide.html)** - Scale training across GPUs with TP, PP, DP, EP, and CP
-- **[Contribution Guide](https://docs.nvidia.com/megatron-core/developer-guide/latest/developer/contribute.html)** - How to contribute to Megatron Core
 
 # Latest News
 
@@ -81,10 +80,10 @@ Megatron-LM/
 │   │   ├── optimizer/           # Optimizers
 │   │   ├── datasets/            # Dataset loaders
 │   │   ├── inference/           # Inference engines and server
-│   │   └── export/              # Model export (example: TensorRT-LLM)
+│   │   └── export/              # Model export (for example, TensorRT-LLM)
 │   ├── training/                # Training scripts
 │   ├── legacy/                  # Legacy components
-│   ├── post_training/           # Post-training (quantization, distillation, pruning, etc.)
+│   ├── post_training/           # Post-training (quantization, distillation, pruning, and more)
 │   └── rl/                      # Reinforcement learning (including RLHF)
 ├── examples/                    # Ready-to-use training examples
 ├── tools/                       # Utility tools
