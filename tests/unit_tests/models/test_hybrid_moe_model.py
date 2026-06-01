@@ -16,6 +16,7 @@ from megatron.core.num_microbatches_calculator import destroy_num_microbatches_c
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.moe.moe_logging import destroy_moe_metrics_tracker
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
     destroy_global_vars,
@@ -76,6 +77,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "deallocate_pipeline_outputs": True,
     "defer_embedding_wgrad_compute": False,
     "delay_wgrad_compute": False,
+    "use_grouped_gemm_for_dense_mlp": False,
     "overlap_dispatch_backward_with_experts_wgrad": False,
     "deterministic_mode": False,
     "disable_bf16_reduced_precision_matmul": False,
@@ -112,6 +114,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "fp8_interval": 1,
     "fp8_margin": 0,
     "fp8_multi_head_attention": False,
+    "fp8_output_proj": False,
     "fp8_param": False,
     "fp8_quantizer_factory": None,
     "fp8_recipe": "delayed",
@@ -508,6 +511,7 @@ class TestHybridMoEModel:
     def setup_method(self, method):
 
         os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
+        destroy_moe_metrics_tracker()
         args = self.create_test_args()
         set_args(args)
 

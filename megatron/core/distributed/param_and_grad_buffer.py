@@ -200,6 +200,12 @@ class _ParamAndGradBucketGroup:
                 self.params.add(param)
 
         self.next_param_gather_bucket_group = None
+        # Set in DistributedDataParallel.__init__ when reduce_scatter_with_fp32_accumulation is on:
+        # points to the bucket group whose grad-reduce was dispatched immediately before mine in
+        # the backward pass. start_grad_sync drains this predecessor before dispatching its own
+        # collective, so the predecessor's intermediate all-to-all buffer is freed before the new
+        # one is allocated.
+        self.previous_grad_reduce_bucket_group = None
 
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             self.inter_distributed_optimizer_instance_group = None
@@ -246,6 +252,10 @@ class _ParamAndGradBucketGroup:
         self.param_gather_handle = None
         self.param_gather_dispatched = False
         self.grad_reduce_handle = None
+        # Per-iteration flag: True once finish_grad_sync has run this step. Lets a successor
+        # bucket group early-drain its predecessor without the end-of-step finalize loop
+        # double-waiting. Reset by `reset()`.
+        self.grad_reduce_finished = False
 
         # Each time a local shard is created from bucket.param_data or bucket.grad_data, it
         # introduces some CPU overheads. We use these two lists to cache the created local
@@ -266,6 +276,39 @@ class _ParamAndGradBucketGroup:
             self.is_first_batch = False
         self.per_param_grad_ready_counts = {}
         self.is_last_microbatch = True
+        self.grad_reduce_finished = False
+
+    def _post_param_sync(self):
+        """Run post-processing after param all-gather completes."""
+        if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
+            for bucket in self.buckets:
+                is_bf16_weight_bucket = False
+                for param in bucket.params:
+                    # Skip copying since bf16 weights in the mxfp8 model
+                    # are already mapped to param.data.
+                    if not is_float8tensor(param):
+                        is_bf16_weight_bucket = True
+                        break
+                    param_start, param_end = bucket.param_to_index[param]
+                    param_slice = bucket.param_data.view(-1)[param_start:param_end]
+                    param.data.copy_(param_slice.view(param.data.shape))
+                if is_bf16_weight_bucket:
+                    continue
+                # All-gathered params are not needed after being copied to param.data.
+                # Zero out the param buffer (shared with grad buffer) for gradient accumulation.
+                # We cannot zero out the entire grad buffer because one grad buffer may
+                # correspond to multiple param buffers. If we zero out the entire grad buffer,
+                # it would clear the data of those param buffers that have not yet completed AG.
+                bucket.param_data.zero_()
+            return
+
+        quantized_params = []
+        for bucket in self.buckets:
+            for param in bucket.params:
+                if is_float8tensor(param) or is_nvfp4tensor(param):
+                    quantized_params.append(param)
+        if len(quantized_params) > 0:
+            post_all_gather_processing(quantized_params)
 
     def check_grads(self, check_for_nan_or_inf, check_for_large):
         """
@@ -325,6 +368,7 @@ class _ParamAndGradBucketGroup:
             if self.param_gather_handle is not None:
                 self.param_gather_handle.wait()
                 self.param_gather_handle = None
+                self._post_param_sync()
                 return
         else:
             assert self.param_gather_handle is None
@@ -344,6 +388,8 @@ class _ParamAndGradBucketGroup:
             dp_size = self.intra_distributed_optimizer_instance_size
             if dp_size == 1:
                 # Single-rank group (e.g., expt_dp_size == 1): no all-gather needed.
+                if force_sync and self.ddp_config.overlap_param_gather:
+                    self._post_param_sync()
                 self.param_gather_dispatched = True
                 return
             local_rank = self.intra_distributed_optimizer_instance_rank
@@ -441,6 +487,8 @@ class _ParamAndGradBucketGroup:
                 # (async_op=False) is used, `cm` is not None. Manually set to None for
                 # consistency with prior code.
                 self.param_gather_handle = None
+        if force_sync and self.ddp_config.overlap_param_gather:
+            self._post_param_sync()
         self.param_gather_dispatched = True
 
     def finish_param_sync(self, skip_next_bucket_dispatch: bool = False):
@@ -480,30 +528,7 @@ class _ParamAndGradBucketGroup:
                 else:
                     self.next_param_gather_bucket_group.start_param_sync()
 
-            # For the mxfp8_param with "reuse_grad_buf_for_mxfp8_param_ag=True",
-            # we need to copy the param_data from the shared_param/grad_buffer to param.data
-            # after the param all-gather.
-            if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
-                for bucket in self.buckets:
-                    is_bf16_weight_bucket = False
-                    for param in bucket.params:
-                        # Skip copying since bf16 weights in the mxfp8 model
-                        # are already mapped to param.data.
-                        if not is_float8tensor(param):
-                            is_bf16_weight_bucket = True
-                            break
-                        param_start, param_end = bucket.param_to_index[param]
-                        param_slice = bucket.param_data.view(-1)[param_start:param_end]
-                        param.data.copy_(param_slice.view(param.data.shape))
-                    if is_bf16_weight_bucket:
-                        continue
-                    # All-gathered params are not needed after being copied to param.data.
-                    # Zero out the param buffer (shared with grad buffer) for gradient accumulation.
-                    # We cannot zero out the entire grad buffer because one grad buffer may
-                    # correspond to multiple param buffers. If we zero out the entire grad buffer,
-                    # it would clear the data of those param buffers that have not yet completed AG.
-                    bucket.param_data.zero_()
-            elif not self.ddp_config.use_distributed_optimizer:
+            if not self.ddp_config.use_distributed_optimizer:
                 for bucket in self.buckets:
                     if bucket.layerwise_gather_list is None:
                         continue
@@ -526,14 +551,7 @@ class _ParamAndGradBucketGroup:
                     # (a view into grad_data) would start from the result of the
                     # latest parameter all-gather instead of zero.
                     bucket.grad_data.zero_()
-            else:
-                fp8_params = []
-                for bucket in self.buckets:
-                    for param in bucket.params:
-                        if is_float8tensor(param):
-                            fp8_params.append(param)
-                if len(fp8_params) > 0:
-                    post_all_gather_processing(fp8_params)
+            self._post_param_sync()
 
     def start_grad_sync(self, force_all_reduce: Optional[bool] = False):
         """
@@ -548,6 +566,23 @@ class _ParamAndGradBucketGroup:
             # Make this start_grad_sync call a no-op if in first batch and collective has
             # already been dispatched.
             return
+
+        # Drain the predecessor bucket group's reduce-scatter before allocating ours. Only
+        # linked under reduce_scatter_with_fp32_accumulation, which holds an intermediate
+        # all-to-all output tensor pinned until .wait() runs. We only drain when the
+        # predecessor has actually been dispatched this iteration (grad_reduce_handle set):
+        # backward param ordering does not always match bucket linkage order (e.g. NVFP4
+        # bucket layouts), so the predecessor may not have fired yet when we arrive here.
+        # In that case the predecessor will dispatch and drain on its own once its params
+        # become ready. The end-of-step finalize loop still catches any bucket that
+        # neither a successor nor itself drained.
+        if (
+            self.previous_grad_reduce_bucket_group is not None
+            and self.previous_grad_reduce_bucket_group.grad_reduce_handle is not None
+        ):
+            self.previous_grad_reduce_bucket_group.finish_grad_sync(
+                force_all_reduce=force_all_reduce
+            )
 
         assert (
             self.grad_reduce_handle is None
@@ -694,12 +729,22 @@ class _ParamAndGradBucketGroup:
         When ddp_config.overlap_grad_reduce is set to True, waits for asynchronous
         communication call to complete. When ddp_config.overlap_grad_reduce is set to False,
         makes synchronous call.
+
+        When ddp_config.overlap_grad_reduce is set to True, this method is idempotent
+        within an iteration: a second call is a no-op. This lets a successor bucket
+        group early-drain its predecessor at dispatch time (see
+        `previous_grad_reduce_bucket_group`) while still allowing the end-of-step
+        finalize loop to call this on every bucket without double-waiting. The
+        non-overlap path preserves its original per-call dispatch+wait behaviour
+        because it has no predecessor draining.
         """
         self.param_gather_dispatched = False
         # If overlap_grad_reduce is False, start (and finish) synchronous communication call here.
         if not self.ddp_config.overlap_grad_reduce:
             self.start_grad_sync(force_all_reduce=force_all_reduce)
             self._copy_back_extra_main_grads()
+            return
+        if self.grad_reduce_finished:
             return
         # If first batch, start asynchronous communication here. register_grad_ready() launches
         # asynchronous communication only once self.golden_per_param_grad_ready_counts is
@@ -711,6 +756,7 @@ class _ParamAndGradBucketGroup:
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             torch.cuda.current_stream().wait_stream(self.communication_stream)
             self._copy_back_extra_main_grads()
+            self.grad_reduce_finished = True
             return
         assert self.grad_reduce_handle is not None, (
             f"Communication call has not been issued for this bucket "
@@ -720,6 +766,7 @@ class _ParamAndGradBucketGroup:
         self.grad_reduce_handle.wait()
         self.grad_reduce_handle = None
         self._copy_back_extra_main_grads()
+        self.grad_reduce_finished = True
 
     def free_overlap_buffers(self):
         """Free GPU buffers used by overlap param gather.

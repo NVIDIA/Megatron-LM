@@ -563,6 +563,11 @@ class TransformerConfig(ModelParallelConfig):
     """When set to False, override FP8 config options and do the wgrad computation
     in higher precision."""
 
+    fp8_output_proj: bool = False
+    """If True, run the LM-head output projection with a TE ColumnParallelLinear
+    under the MXFP8 autocast context. Only active when fp8=True and
+    fp8_recipe='mxfp8'."""
+
     fp8_dot_product_attention: bool = False
     """When set to True, use the FP8 implementation of Dot Product Attention."""
 
@@ -745,6 +750,12 @@ class TransformerConfig(ModelParallelConfig):
     If positive, generates new random bias each forward pass.
     If negative, generates bias once per layer and reuses it (abs value is std).
     This is an experimental feature for benchmarking purposes."""
+
+    use_grouped_gemm_for_dense_mlp: bool = False
+    """Use GroupedLinear(num_groups=1) for dense MLP to trigger the
+    ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8 fusion on SM100+ with MXFP8 recipe.
+    Requires ``use_te_op_fuser=True`` and SwiGLU activation.
+    """
 
     moe_grouped_gemm: bool = False
     """When there are multiple experts per rank, compress multiple local (potentially small) gemms
@@ -1285,6 +1296,14 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.fp8_param and not self.fp8:
             raise ValueError("fp8_param must be used together with fp8 mode.")
+
+        if self.fp8_output_proj:
+            if not self.fp8:
+                raise ValueError("fp8_output_proj must be used together with fp8 mode.")
+            if self.fp8_recipe != Fp8Recipe.mxfp8:
+                raise ValueError(
+                    f"fp8_output_proj requires fp8_recipe='mxfp8', got " f"'{self.fp8_recipe}'."
+                )
 
         # FP4 validation
         if self.fp4_param and not self.fp4:
@@ -2420,11 +2439,6 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.mtp_num_layers is None or self.mtp_num_layers == 1
             ), 'MTP layernum only supports 1 when enabling overlap_moe_expert_parallel_comm.'
-            if self.mtp_num_layers == 1:
-                assert self.pipeline_model_parallel_size > 1, (
-                    'Pipeline model parallel size must be larger than 1 '
-                    'when enabling overlap_moe_expert_parallel_comm with MTP layer.'
-                )
 
             if self.cuda_graph_impl != "none":
                 if self.cuda_graph_impl == "transformer_engine":
