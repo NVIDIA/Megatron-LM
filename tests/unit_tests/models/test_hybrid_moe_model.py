@@ -114,6 +114,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "fp8_interval": 1,
     "fp8_margin": 0,
     "fp8_multi_head_attention": False,
+    "fp8_output_proj": False,
     "fp8_param": False,
     "fp8_quantizer_factory": None,
     "fp8_recipe": "delayed",
