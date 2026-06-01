@@ -736,11 +736,29 @@ def _read_latest_checkpointed_iteration(path: Path) -> Union[int, str]:
         ) from exc
 
 
+def _is_distributed_checkpoint(checkpoint_dir: Union[str, Path]) -> bool:
+    """check_is_distributed_checkpoint, but fail-closed on a malformed metadata.json.
+
+    Public ``check_is_distributed_checkpoint`` parses ``metadata.json`` and would
+    raise a raw ``json``/``TypeError`` for a present-but-corrupt config; convert
+    that to a ``WeightedMergeError`` so callers keep their fail-closed messaging,
+    while a missing ``metadata.json`` still returns ``False``.
+    """
+
+    try:
+        return check_is_distributed_checkpoint(str(checkpoint_dir))
+    except Exception as exc:
+        raise WeightedMergeError(
+            f"{checkpoint_dir} contains a metadata.json that is not a valid "
+            f"distributed checkpoint config: {exc}"
+        ) from exc
+
+
 def resolve_checkpoint_dir(path: Union[str, Path]) -> Path:
     """Resolve direct, release, or latest-marker checkpoint paths."""
 
     checkpoint = Path(path)
-    if check_is_distributed_checkpoint(str(checkpoint)):
+    if _is_distributed_checkpoint(checkpoint):
         return checkpoint
 
     if (checkpoint / LATEST_CHECKPOINTED_ITERATION).exists():
@@ -749,7 +767,7 @@ def resolve_checkpoint_dir(path: Union[str, Path]) -> Path:
             resolved = checkpoint / "release"
         else:
             resolved = checkpoint / iteration_dir_name(latest)
-        if not check_is_distributed_checkpoint(str(resolved)):
+        if not _is_distributed_checkpoint(resolved):
             raise WeightedMergeError(
                 f"{checkpoint} points to {resolved}, but that is not a distributed checkpoint."
             )
@@ -782,7 +800,7 @@ def write_latest_checkpointed_iteration(checkpoint_dir: Union[str, Path], iterat
     """Write Megatron's latest-checkpoint marker for an iteration checkpoint."""
 
     checkpoint_dir = Path(checkpoint_dir)
-    if not check_is_distributed_checkpoint(str(checkpoint_dir)):
+    if not _is_distributed_checkpoint(checkpoint_dir):
         raise WeightedMergeError(
             f"Refusing to write {LATEST_CHECKPOINTED_ITERATION} because {checkpoint_dir} "
             "does not contain distributed checkpoint metadata."
@@ -1235,7 +1253,7 @@ def _reject_existing_atomic_overwrite(
 
 
 def _require_publishable_checkpoint_dir(checkpoint_dir: Path) -> None:
-    if not check_is_distributed_checkpoint(str(checkpoint_dir)):
+    if not _is_distributed_checkpoint(checkpoint_dir):
         raise WeightedMergeError(
             f"Refusing to publish {checkpoint_dir} because distributed checkpoint metadata is missing."
         )
