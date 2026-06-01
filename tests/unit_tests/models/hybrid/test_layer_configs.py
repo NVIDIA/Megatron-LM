@@ -109,10 +109,7 @@ class TestCommonLayerConfig:
         assert tc.params_dtype == torch.bfloat16
 
     def test_params_dtype_can_explicitly_differ_from_mixed_precision_dtype(self):
-        common = _make_common(
-            mixed_precision_dtype=torch.bfloat16,
-            params_dtype=torch.float32,
-        )
+        common = _make_common(mixed_precision_dtype=torch.bfloat16, params_dtype=torch.float32)
         layer = MambaLayerConfig(common_config=common, head_dim=64, state_size=128, num_groups=8)
         tc = layer.to_transformer_config(num_layers=4)
         assert tc.bf16 is True

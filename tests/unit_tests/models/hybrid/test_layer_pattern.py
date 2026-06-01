@@ -152,10 +152,7 @@ class TestCommonLayerConfig:
         """An explicit ``params_dtype`` from the recipe author wins over the
         auto-derive. Useful when a recipe wants bf16 mixed precision but
         keeps params in fp32 (e.g. for fp32 master-weight workflows)."""
-        common = _make_common(
-            mixed_precision_dtype=torch.bfloat16,
-            params_dtype=torch.float16,
-        )
+        common = _make_common(mixed_precision_dtype=torch.bfloat16, params_dtype=torch.float16)
         layer = MambaLayerConfig(common_config=common, head_dim=64, state_size=128, num_groups=8)
         tc = layer.to_transformer_config(num_layers=4)
         assert tc.params_dtype == torch.float16

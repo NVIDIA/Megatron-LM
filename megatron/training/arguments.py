@@ -15,7 +15,6 @@ import torch
 from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
     get_deprecated_cuda_graph_modules_migration,
@@ -24,11 +23,16 @@ from megatron.core.transformer.cuda_graph_config import (
     validate_deprecated_cuda_graph_modules_migration_inputs,
 )
 from megatron.core.transformer.enums import AttnBackend, CudaGraphModule, InferenceCudaGraphScope
+from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.utils import (
     get_torch_version,
     is_flashinfer_min_version,
     is_te_min_version,
     is_torch_min_version,
+)
+from megatron.training.argument_utils import (  # noqa: F401 # pylint: disable=unused-import
+    ArgumentGroupFactory,
+    core_transformer_config_from_args,
 )
 from megatron.training.global_vars import set_global_variables
 from megatron.training.utils import (
@@ -38,7 +42,6 @@ from megatron.training.utils import (
     warn_rank_0,
 )
 
-from megatron.training.argument_utils import ArgumentGroupFactory, core_transformer_config_from_args  # noqa: F401 # pylint: disable=unused-import
 
 def add_megatron_arguments(parser: argparse.ArgumentParser):
     """"Add Megatron-LM arguments to the given parser."""
