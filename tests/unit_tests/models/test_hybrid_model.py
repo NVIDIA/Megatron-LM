@@ -48,6 +48,95 @@ def test_hybrid_logging_process_groups_are_paired():
         _hybrid_logging_pg_kwargs(SimpleNamespace(tp=None, dp_cp=dp_cp_group))
 
 
+@pytest.mark.skipif(
+    not is_torch_min_version("2.4.0"),
+    reason="torch.distributed.init_device_mesh requires torch >= 2.4.0",
+)
+@pytest.mark.parametrize("tp_size,cp_size,pp_size", [(2, 1, 4), (1, 1, 8), (8, 1, 1)])
+def test_hybrid_model_with_custom_process_groups(tmp_path, tp_size, cp_size, pp_size):
+    """Test HybridModel with custom process groups."""
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=tp_size,
+        context_parallel_size=cp_size,
+        pipeline_model_parallel_size=pp_size,
+    )
+
+    try:
+        # Create device mesh for custom process groups
+        assert torch.distributed.get_world_size() == 8, "Test requires 8 GPUs"
+
+        # Initialize torch.distributed if not already initialized
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend='nccl')
+
+        # Create HyperCommGrid with dimensions tp, cp, pp (reversed from device mesh order)
+        grid = HyperCommGrid([tp_size, cp_size, pp_size], ["tp", "cp", "pp"])
+
+        pp_group = grid.create_pg("pp")
+        cp_group = grid.create_pg("cp")
+        tp_group = grid.create_pg("tp")
+        embd_group_ranks = parallel_state.default_embedding_ranks(
+            torch.distributed.get_process_group_ranks(pp_group)
+        )
+        embd_group = torch.distributed.new_group(
+            ranks=embd_group_ranks, timeout=timedelta(minutes=30)
+        )
+
+        # Create model with custom process groups
+        from megatron.core.process_groups_config import ProcessGroupCollection
+
+        pg_collection = ProcessGroupCollection(
+            tp=tp_group, cp=cp_group, pp=pp_group, embd=embd_group, dp_cp=cp_group
+        )
+
+        # Build pattern with '|' pipeline stage separators: 2 layers per PP stage
+        hybrid_layer_pattern = "|".join(["*-"] * pp_size)
+
+        # Configure model with appropriate sizes for parallelism
+        model_config = TransformerConfig(
+            num_layers=2 * pp_size,  # Scale layers with PP size
+            hidden_size=256 * tp_size,
+            num_attention_heads=4 * tp_size,  # Scale heads with TP size
+            use_cpu_initialization=True,
+            tensor_model_parallel_size=tp_size,
+            context_parallel_size=cp_size,
+            pipeline_model_parallel_size=pp_size,
+            pipeline_dtype=torch.bfloat16,
+        )
+
+        model = HybridModel(
+            config=model_config,
+            hybrid_stack_spec=hybrid_stack_spec,
+            vocab_size=128,
+            max_sequence_length=4,
+            hybrid_layer_pattern=hybrid_layer_pattern,
+            pg_collection=pg_collection,
+        )
+
+        # Basic forward test
+        micro_batch_size = 2
+        sequence_length = model.max_sequence_length
+
+        model.cuda()
+
+        data = list(range(sequence_length))
+        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
+        attention_mask = torch.ones(
+            (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
+        ).cuda()
+
+        logits = model.forward(
+            input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
+        )
+
+        assert logits.shape[0] == micro_batch_size
+        assert logits.shape[1] == sequence_length
+        assert logits.shape[2] == divide(model.vocab_size, tp_size)
+    finally:
+        Utils.destroy_model_parallel()
+
+
 class TestHybridModel:
 
     def setup_method(self, method):
@@ -227,92 +316,6 @@ class TestHybridModel:
         model = self.model
         for expected, layer in enumerate(model.decoder.layers, start=1):
             assert expected == layer.layer_number, "layer numbers are incorrect"
-
-    @pytest.mark.skipif(
-        not is_torch_min_version("2.4.0"),
-        reason="torch.distributed.init_device_mesh requires torch >= 2.4.0",
-    )
-    @pytest.mark.parametrize("tp_size,cp_size,pp_size", [(2, 1, 4), (1, 1, 8), (8, 1, 1)])
-    def test_with_custom_process_groups(self, tmp_path, tp_size, cp_size, pp_size):
-        """Test HybridModel with custom process groups."""
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=tp_size,
-            context_parallel_size=cp_size,
-            pipeline_model_parallel_size=pp_size,
-        )
-
-        # Create device mesh for custom process groups
-        assert torch.distributed.get_world_size() == 8, "Test requires 8 GPUs"
-
-        # Initialize torch.distributed if not already initialized
-        if not torch.distributed.is_initialized():
-            torch.distributed.init_process_group(backend='nccl')
-
-        # Create HyperCommGrid with dimensions tp, cp, pp (reversed from device mesh order)
-        grid = HyperCommGrid([tp_size, cp_size, pp_size], ["tp", "cp", "pp"])
-
-        pp_group = grid.create_pg("pp")
-        cp_group = grid.create_pg("cp")
-        tp_group = grid.create_pg("tp")
-        embd_group_ranks = parallel_state.default_embedding_ranks(
-            torch.distributed.get_process_group_ranks(pp_group)
-        )
-        embd_group = torch.distributed.new_group(
-            ranks=embd_group_ranks, timeout=timedelta(minutes=30)
-        )
-
-        # Create model with custom process groups
-        from megatron.core.process_groups_config import ProcessGroupCollection
-
-        pg_collection = ProcessGroupCollection(
-            tp=tp_group, cp=cp_group, pp=pp_group, embd=embd_group
-        )
-
-        # Build pattern with '|' pipeline stage separators: 3 layers per PP stage
-        hybrid_layer_pattern = "|".join(["M*-"] * pp_size)
-
-        # Configure model with appropriate sizes for parallelism
-        model_config = TransformerConfig(
-            num_layers=3 * pp_size,  # Scale layers with PP size
-            hidden_size=256 * tp_size,
-            num_attention_heads=4 * tp_size,  # Scale heads with TP size
-            use_cpu_initialization=True,
-            tensor_model_parallel_size=tp_size,
-            context_parallel_size=cp_size,
-            pipeline_model_parallel_size=pp_size,
-            pipeline_dtype=torch.bfloat16,
-        )
-
-        model = HybridModel(
-            config=model_config,
-            hybrid_stack_spec=hybrid_stack_spec,
-            vocab_size=128,
-            max_sequence_length=4,
-            hybrid_layer_pattern=hybrid_layer_pattern,
-            pg_collection=pg_collection,
-        )
-
-        # Basic forward test
-        micro_batch_size = 2
-        sequence_length = model.max_sequence_length
-
-        model.cuda()
-
-        data = list(range(sequence_length))
-        input_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
-        position_ids = torch.tensor(data, dtype=torch.int64).repeat((micro_batch_size, 1)).cuda()
-        attention_mask = torch.ones(
-            (micro_batch_size, 1, sequence_length, sequence_length), dtype=bool
-        ).cuda()
-
-        logits = model.forward(
-            input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask
-        )
-
-        assert logits.shape[0] == micro_batch_size
-        assert logits.shape[1] == sequence_length
-        assert logits.shape[2] == divide(model.vocab_size, tp_size)
-
 
 class TestHybridQKLayernorm:
 
