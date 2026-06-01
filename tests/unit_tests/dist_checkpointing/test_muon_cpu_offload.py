@@ -11,7 +11,9 @@ These tests require multi-GPU execution (via torchrun or pytest with distributed
 launcher) since LayerWiseDistributedOptimizer shards parameters across DP ranks.
 """
 
+from functools import partial
 from typing import Generator
+from unittest import mock
 
 import pytest
 import torch
@@ -22,7 +24,7 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transfor
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.optimizer import get_megatron_optimizer
 from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
-from megatron.core.optimizer.optimizer import Float16OptimizerWithFloat16Params
+from megatron.core.optimizer.optimizer import ChainedOptimizer, Float16OptimizerWithFloat16Params
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
@@ -122,9 +124,8 @@ class TestAdamOffloadConfig:
     fallback config).  This prevents creating a HybridDeviceOptimizer for Adam
     and avoids double-offloading.
 
-    In the separate DistributedOptimizer path (use_distributed_optimizer=True),
-    Adam's DistOpt is a sibling of LayerWise — it manages its own offloading.
-    That path requires full DDP setup and is validated via integration tests.
+    The separate DistributedOptimizer path (use_distributed_optimizer=True) is
+    tested in TestSeparateDistOptPath, which requires full DDP setup.
     """
 
     def setup_method(self, method) -> None:
@@ -494,3 +495,163 @@ class TestMuonCPUOffload:
                     assert not param.data.is_cuda, (
                         "After step_with_ready_grads, fp32 master weight must be on CPU"
                     )
+
+
+class TestSeparateDistOptPath:
+    """Verify Adam offloading in the use_separate_distributed_optimizer=True path.
+
+    In this path, LayerWise only owns Muon params, and Adam's DistributedOptimizer
+    is a sibling that manages its own CPU offloading via HybridDeviceOptimizer.
+    This test class requires DDP-wrapped models (via get_model) to trigger the
+    use_separate_distributed_optimizer codepath.
+    """
+
+    def setup_method(self, method) -> None:
+        pass
+
+    def teardown_method(self, method) -> None:
+        Utils.destroy_model_parallel()
+
+    def _setup_hybrid_optimizer(self, tp: int, pp: int):
+        """Create optimizer via the use_separate_distributed_optimizer=True path.
+
+        Uses get_model (DDP wrapping) so model_chunks[0].ddp_config exists with
+        use_distributed_optimizer=True, which triggers the new path.
+        """
+        from tests.unit_tests.dist_checkpointing.utils import (
+            init_basic_mock_args,
+            initialize_gpt_model,
+        )
+        from megatron.training.arguments import parse_args
+        from megatron.training.training import get_model
+
+        Utils.initialize_model_parallel(tp, pp)
+
+        mock_args = parse_args(ignore_unknown_args=True)
+        with mock.patch('megatron.training.training.get_args', new=lambda: mock_args):
+            init_basic_mock_args(mock_args, tp, pp, bf16=True)
+            mock_args.use_distributed_optimizer = True
+            mock_args.use_layer_wise_distributed_optimizer = True
+            mock_args.optimizer = 'muon'
+            model = get_model(
+                partial(
+                    initialize_gpt_model,
+                    seed=2,
+                    tensor_model_parallel_size=tp,
+                    pipeline_model_parallel_size=pp,
+                    pipeline_dtype=torch.bfloat16,
+                    bf16=True,
+                )
+            )
+
+        config = OptimizerConfig(
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            use_distributed_optimizer=True,
+            use_layer_wise_distributed_optimizer=True,
+            optimizer='muon',
+            lr=0.0,
+            optimizer_cpu_offload=True,
+        )
+        optimizer = get_megatron_optimizer(config, model)
+        return model, optimizer
+
+    @pytest.mark.parametrize('tp,pp', [(2, 2)])
+    def test_new_path_adam_uses_hybrid_device_optimizer(self, tp: int, pp: int) -> None:
+        """In new path, Adam's DistOpt wraps a HybridDeviceOptimizer."""
+        if tp * pp > torch.cuda.device_count():
+            pytest.skip("Not enough GPUs")
+
+        from megatron.core.optimizer.cpu_offloading.hybrid_optimizer import HybridDeviceOptimizer
+        from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+
+        _, optimizer = self._setup_hybrid_optimizer(tp, pp)
+
+        # New path returns ChainedOptimizer([LayerWise, DistributedOptimizer])
+        assert isinstance(optimizer, ChainedOptimizer)
+
+        found_layer_wise = False
+        found_dist_opt_with_hybrid = False
+        for child in optimizer.chained_optimizers:
+            if isinstance(child, LayerWiseDistributedOptimizer):
+                found_layer_wise = True
+                # LayerWise should NOT contain HybridDeviceOptimizer children
+                for sub_opt in child.chained_optimizers:
+                    if isinstance(sub_opt, Float16OptimizerWithFloat16Params):
+                        assert not isinstance(sub_opt.optimizer, HybridDeviceOptimizer), (
+                            "In new path, LayerWise children should NOT use "
+                            "HybridDeviceOptimizer (LayerWise only owns Muon params)"
+                        )
+            elif isinstance(child, DistributedOptimizer):
+                # Adam's DistOpt should use HybridDeviceOptimizer for CPU offload
+                if isinstance(child.optimizer, HybridDeviceOptimizer):
+                    found_dist_opt_with_hybrid = True
+
+        assert found_layer_wise, "Expected a LayerWiseDistributedOptimizer in the chain"
+        assert found_dist_opt_with_hybrid, (
+            "Expected Adam's DistributedOptimizer to use HybridDeviceOptimizer "
+            "for CPU offloading in the use_separate_distributed_optimizer=True path"
+        )
+
+    @pytest.mark.parametrize('tp,pp', [(2, 2)])
+    def test_new_path_layerwise_only_offloads_muon_params(self, tp: int, pp: int) -> None:
+        """In new path, LayerWise offload/reload only touches Muon params."""
+        if tp * pp > torch.cuda.device_count():
+            pytest.skip("Not enough GPUs")
+
+        from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+
+        _, optimizer = self._setup_hybrid_optimizer(tp, pp)
+        assert isinstance(optimizer, ChainedOptimizer)
+
+        # Find LayerWise and DistOpt children
+        layer_wise = None
+        dist_opt = None
+        for child in optimizer.chained_optimizers:
+            if isinstance(child, LayerWiseDistributedOptimizer):
+                layer_wise = child
+            elif isinstance(child, DistributedOptimizer):
+                dist_opt = child
+
+        assert layer_wise is not None
+        assert dist_opt is not None
+
+        # Init states for LayerWise children
+        for opt in layer_wise.chained_optimizers:
+            init_fn = getattr(opt, 'init_state_fn', None)
+            if init_fn is None:
+                continue
+            if hasattr(opt, 'optimizer'):
+                init_fn(opt.optimizer)
+            else:
+                init_fn(opt)
+
+        # Offload LayerWise states
+        layer_wise.offload_optimizer_states()
+
+        # LayerWise's children (Muon) should now be on CPU
+        found_muon_on_cpu = False
+        for opt in layer_wise.chained_optimizers:
+            if getattr(opt, 'is_stub_optimizer', False):
+                continue
+            if isinstance(opt, Float16OptimizerWithFloat16Params):
+                for group in opt.fp32_from_float16_groups:
+                    for param in group:
+                        found_muon_on_cpu = True
+                        assert not param.data.is_cuda, (
+                            "After LayerWise offload, Muon master weights should be on CPU"
+                        )
+
+        assert found_muon_on_cpu, "Expected Muon master weights in LayerWise"
+
+        # Reload and verify back on GPU
+        layer_wise.reload_optimizer_states()
+        for opt in layer_wise.chained_optimizers:
+            if getattr(opt, 'is_stub_optimizer', False):
+                continue
+            if isinstance(opt, Float16OptimizerWithFloat16Params):
+                for group in opt.fp32_from_float16_groups:
+                    for param in group:
+                        assert param.data.is_cuda, (
+                            "After LayerWise reload, Muon master weights should be on GPU"
+                        )
