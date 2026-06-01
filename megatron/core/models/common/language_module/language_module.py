@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import logging
 import os
 from typing import Optional, Tuple
@@ -22,7 +22,7 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_last_stage,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.multi_token_prediction import tie_word_embeddings_state_dict
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -159,8 +159,8 @@ class LanguageModule(MegatronModule):
                     labels = torch.as_strided(labels, labels.size(), (labels.size()[1], 1))
                     # Use is_cg_capturable=True for full iteration CUDA graphs to avoid torch.equal checks
                     is_cg_capturable = (
-                        hasattr(self.config, 'cuda_graph_scope')
-                        and CudaGraphScope.full_iteration in self.config.cuda_graph_scope
+                        hasattr(self.config, 'cuda_graph_impl')
+                        and self.config.cuda_graph_impl == "full_iteration"
                     )
                     if is_cg_capturable and not is_te_min_version("2.7.0"):
                         from megatron.core.utils import get_te_version
@@ -169,7 +169,7 @@ class LanguageModule(MegatronModule):
                         raise AssertionError(
                             f"CUDA graph compatible cross entropy requires TransformerEngine >= 2.7.0, "
                             f"but found version {current_version}. Please upgrade TransformerEngine "
-                            f"or set cuda_graph_scope to a value other than 'full_iteration'."
+                            f"or set cuda_graph_impl to a value other than 'full_iteration'."
                         )
 
                     loss = te_parallel_cross_entropy(
@@ -202,7 +202,12 @@ class LanguageModule(MegatronModule):
 
         # Mark embedding and output layer for decoupled_lr and other features.
         # This is the original Megatron attribute used by decoupled_lr, Muon, FSDP, etc.
-        if self.pre_process and hasattr(self, 'embedding'):
+        # Include MTP-stage embedding too: it is a duplicated copy of the pre_process
+        # embedding (kept in sync via cross-stage all-reduce). Without this tag, the
+        # LayerWise distributed optimizer routes it to its Muon-managed buffer and
+        # `_emit_bucket(shared_embedding=True)` replicates the (vocab x hidden) tensor
+        # across all dp_size shards, blowing up the chunk's buffer by ~8x.
+        if (self.pre_process or getattr(self, 'mtp_process', False)) and hasattr(self, 'embedding'):
             self.embedding.word_embeddings.weight.is_embedding_or_output_parameter = True
         if (
             self.post_process
