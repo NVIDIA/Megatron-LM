@@ -1263,7 +1263,12 @@ class GTPShardedParam(torch.nn.Parameter):
         else:
             # Sync reduce-scatter — reached as the natural chain-head case, recycle immediately
             wgrads, _ = self._reduce_scatter(wgrads, async_op=False, nvtx_label=nvtx_label)
-            torch._foreach_add_([p.main_grad for p in weights], wgrads)
+            nvtx_range_push(f"{nvtx_label}.gtp_wgrad_accum")
+            if len(weights) == 1:
+                weights[0].main_grad.add_(wgrads[0])
+            else:
+                torch._foreach_add_([p.main_grad for p in weights], wgrads)
+            nvtx_range_pop(f"{nvtx_label}.gtp_wgrad_accum")
             result = [self._handle_megatron_grad_accum(p) for p in weights]
 
             if poolable:
@@ -1283,7 +1288,13 @@ class GTPShardedParam(torch.nn.Parameter):
                 cache = get_global_GTP_cache()
                 next_weights = self.next_w._weights
                 wgrads = [cache.get(w._rs_ticket) for w in next_weights]
-                torch._foreach_add_([w.main_grad for w in next_weights], wgrads)
+                nvtx_range_push(f"{self.next_w._debug_name}.gtp_wgrad_accum_deferred")
+                # Only batch with _foreach_add_ when finalizing multiple (routed) weights.
+                if len(next_weights) == 1:
+                    next_weights[0].main_grad.add_(wgrads[0])
+                else:
+                    torch._foreach_add_([w.main_grad for w in next_weights], wgrads)
+                nvtx_range_pop(f"{self.next_w._debug_name}.gtp_wgrad_accum_deferred")
                 for w in next_weights:
                     self._handle_megatron_grad_accum(w)
                     cache.release(w._rs_ticket)
