@@ -187,11 +187,7 @@ def _cutile_supports_current_device() -> bool:
 
     try:
         result = subprocess.run(
-            [tileiras, "--gpu-name", arch],
-            capture_output=True,
-            check=False,
-            text=True,
-            timeout=10,
+            [tileiras, "--gpu-name", arch], capture_output=True, check=False, text=True, timeout=10
         )
     except (OSError, subprocess.SubprocessError) as exc:
         _CUTILE_DEVICE_SUPPORT_ERROR = str(exc)
