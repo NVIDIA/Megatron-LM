@@ -102,6 +102,7 @@ def _raise_mhc_backend_validation_error() -> None:
     if _MHC_BACKEND_VALIDATION_ERROR is not None:
         raise _MHC_BACKEND_VALIDATION_ERROR
 
+
 if _MHC_FORCED_BACKEND == "native":
     _TRITON_AVAILABLE = False
     _CUTILE_AVAILABLE = False
