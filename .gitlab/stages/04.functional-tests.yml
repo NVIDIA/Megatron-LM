@@ -222,7 +222,7 @@ functional:configure:
           exit 1
           ;;
       esac
-    - CLEANUP_CLUSTER="cpu_${GPU_CLUSTER}"
+    - CLEANUP_CLUSTER="cpu_${GPU_CLUSTER#dgx*_}"
     - echo "Cleanup target = $CLEANUP_CLUSTER (CPU partition of $GPU_CLUSTER)"
     - export PYTHONPATH=$(pwd)
     - export RO_API_TOKEN=${PAT}
