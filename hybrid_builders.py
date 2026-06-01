@@ -27,7 +27,7 @@ def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, 
     _pattern = getattr(args, "hybrid_layer_pattern", None) or ""
     _uses_dsv4_attn = (
         getattr(args, "experimental_attention_variant", None) == "dsv4_hybrid"
-        or any(sym in _pattern for sym in ("D", "C", "H"))
+        or any(sym in _pattern for sym in ("C", "H"))
     )
     if _uses_dsv4_attn:
         derived = config.v_head_dim - config.qk_pos_emb_head_dim

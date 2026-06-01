@@ -498,7 +498,7 @@ class HybridStack(MegatronModule):
             rotary_pos_emb (Tensor, optional): the rotary positional embeddings.
                 Defaults to None.
         Returns:
-            Tensor: the output tensor.
+            hidden_states | (hidden_states, mhc_multistream) (Tensor | Tuple[Tensor, Tensor]): the output tensor or tuple.
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
