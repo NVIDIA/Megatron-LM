@@ -177,10 +177,10 @@ def get_hybrid_layer_counts(pattern: str) -> Dict[str, int]:
 
     Examples:
         >>> get_hybrid_layer_counts("M*M*")
-        {'*': 2, 'G': 0, 'D': 0, 'M': 2, '-': 0, 'E': 0}
+        {'*': 2, 'C': 0, 'G': 0, 'D': 0, 'H': 0, 'M': 2, '-': 0, 'E': 0}
 
         >>> get_hybrid_layer_counts("M-M-|M-M*-/MM/MM")
-        {'*': 1, 'G': 0, 'D': 0, 'M': 8, '-': 4, 'E': 0}
+        {'*': 1, 'C': 0, 'G': 0, 'D': 0, 'H': 0, 'M': 8, '-': 4, 'E': 0}
     """
     parsed = parse_hybrid_pattern(pattern)
     counts = {symbol: 0 for symbol in Symbols.name_sorted_valid_layer_symbols()}
