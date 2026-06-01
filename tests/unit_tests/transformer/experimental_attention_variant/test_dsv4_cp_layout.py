@@ -4,25 +4,38 @@ import pytest
 import torch
 
 from megatron.core.transformer.experimental_attention_variant.csa_cp_utils import (
-    _build_compressor_prep_compact,
-    _contiguous_cp_range,
-    _final_design_flat_idxs,
-    _final_design_flat_idxs_for_indexer_loss,
-    _pack_design_kv_full,
+    build_compressor_prep_compact,
+    contiguous_cp_partition,
     exchange_left_boundary_tensor,
+    build_cp_flat_idxs,
+    build_cp_flat_idxs_for_indexer_loss,
+    pack_cp_kv_full,
 )
 
 
-def test_contiguous_cp_range_requires_even_total_capacity():
-    cu_seqlens = torch.tensor([0, 7], dtype=torch.int32)
+def test_contiguous_cp_partition_requires_padded_total_divisible_by_cp_size():
+    """Validate the fixed-size padded contiguous CP partition contract.
 
-    assert _contiguous_cp_range(cu_seqlens, cp_size=1, cp_rank=0) == (0, 7)
+    Expected: a single CP rank owns the full padded range, while a padded token
+    count that is not divisible by cp_size raises before the fallback builds
+    local layouts. A failure here means CP could silently proceed with uneven
+    rank padded-token ranges.
+    """
+    cu_seqlens_padded = torch.tensor([0, 7], dtype=torch.int32)
+
+    assert contiguous_cp_partition(cu_seqlens_padded, cp_size=1, cp_rank=0) == (0, 7)
 
     with pytest.raises(RuntimeError, match="padded_total_tokens % cp_size"):
-        _contiguous_cp_range(cu_seqlens, cp_size=2, cp_rank=0)
+        contiguous_cp_partition(cu_seqlens_padded, cp_size=2, cp_rank=0)
 
 
 def test_boundary_exchange_single_rank_returns_zero_boundary_and_zero_grad():
+    """Validate the no-CP boundary exchange contract.
+
+    Expected: with cp_group=None, the fixed left boundary is zero-filled and its
+    backward path contributes no gradient to the local tensor. A failure here
+    means the fallback could invent boundary tokens or bogus local gradients.
+    """
     local = torch.arange(12, dtype=torch.float32).reshape(4, 3).requires_grad_(True)
 
     boundary = exchange_left_boundary_tensor(local, d_window=2, cp_group=None)
@@ -33,6 +46,13 @@ def test_boundary_exchange_single_rank_returns_zero_boundary_and_zero_grad():
 
 
 def test_compressor_prep_compact_uses_only_complete_boundary_groups():
+    """Validate compressor-prep compacting across a sequence boundary.
+
+    Expected: for ratio=128, only the complete visible group [320, 448) is
+    compacted; the partial boundary group [192, 320) is skipped and unused
+    fixed capacity remains padded. A failure here means compressor prep may read
+    outside the legal boundary window or emit wrong compressed metadata.
+    """
     cu_seqlens = torch.tensor([0, 192, 512], dtype=torch.int32)
     global_start = 384
     l_local = 128
@@ -46,7 +66,7 @@ def test_compressor_prep_compact_uses_only_complete_boundary_groups():
     boundary_positions = torch.arange(global_start - d_window, global_start, dtype=torch.float32)
     boundary_hidden = boundary_positions[:, None].repeat(1, hidden_size)
 
-    hidden_compact, cu_compact, seq_ids, comp_ids, valid, c_cap = _build_compressor_prep_compact(
+    hidden_compact, cu_compact, seq_ids, comp_ids, valid, c_cap = build_compressor_prep_compact(
         hidden_local,
         boundary_hidden,
         cu_seqlens,
@@ -70,6 +90,13 @@ def test_compressor_prep_compact_uses_only_complete_boundary_groups():
 
 
 def test_kv_full_pack_keeps_per_sequence_window_then_compressed_layout():
+    """Validate the post-all-gather KV full packing order.
+
+    Expected: each active sequence writes its local/boundary window first, then
+    valid compressed entries, while invalid compressed entries are skipped and
+    tail capacity stays zero. A failure here means final lowered indices could
+    point at the wrong KV rows.
+    """
     cu_seqlens = torch.tensor([0, 4, 8], dtype=torch.int32)
     global_start = 3
     l_local = 3
@@ -82,7 +109,7 @@ def test_kv_full_pack_keeps_per_sequence_window_then_compressed_layout():
     comp_ids_rank_major = torch.tensor([0, 0, 1], dtype=torch.int32)
     valid_rank_major = torch.tensor([True, True, False])
 
-    kv_full, window_map, compressed_map = _pack_design_kv_full(
+    kv_full, window_map, compressed_map = pack_cp_kv_full(
         kv_local,
         boundary_kv,
         compressed_rank_major,
@@ -102,12 +129,19 @@ def test_kv_full_pack_keeps_per_sequence_window_then_compressed_layout():
     assert torch.equal(kv_full[7:], torch.zeros_like(kv_full[7:]))
 
 
-def test_final_design_flat_idxs_respect_sequence_local_compressed_ids():
+def test_build_cp_flat_idxs_respect_sequence_local_compressed_ids():
+    """Validate final idx lowering for the normal sparse-attention path.
+
+    Expected: window ids and visible compressed ids lower to kv_full flat ids in
+    the same sequence only, and topk_length counts valid entries per row. A
+    failure here means sparse attention could attend across sequence boundaries
+    or use an incorrect compact length.
+    """
     cu_seqlens = torch.tensor([0, 4, 8], dtype=torch.int32)
     window_map = {1: 0, 2: 1, 3: 2, 4: 4, 5: 5}
     compressed_map = {(0, 0): 3, (1, 0): 6}
 
-    topk_idxs, topk_length = _final_design_flat_idxs(
+    topk_idxs, topk_length = build_cp_flat_idxs(
         cu_seqlens,
         global_start=3,
         l_local=3,
@@ -131,14 +165,21 @@ def test_final_design_flat_idxs_respect_sequence_local_compressed_ids():
     assert torch.equal(topk_length, torch.tensor([3, 1, 3], dtype=torch.int32))
 
 
-def test_final_design_flat_idxs_for_indexer_loss_preserves_rank_major_ids():
+def test_build_cp_flat_idxs_for_indexer_loss_preserves_rank_major_ids():
+    """Validate final idx lowering for the sparse indexer-loss path.
+
+    Expected: compressed top-k columns are lowered before window columns, and
+    the rank-major compressed ids stay aligned with the selected compressed
+    entries. A failure here means the fused sparse-loss kernel could compare
+    indexer scores against the wrong compressed KV entries.
+    """
     cu_seqlens = torch.tensor([0, 4, 8], dtype=torch.int32)
     window_map = {1: 0, 2: 1, 3: 2, 4: 4, 5: 5}
     compressed_map = {(0, 0): 3, (1, 0): 6}
     logical_ids = torch.tensor([[0, -1], [-1, -1], [0, -1]], dtype=torch.int32)
     rank_major_ids = torch.tensor([[5, -1], [-1, -1], [7, -1]], dtype=torch.int32)
 
-    topk_idxs, lowered_rank_major_ids = _final_design_flat_idxs_for_indexer_loss(
+    topk_idxs, lowered_rank_major_ids = build_cp_flat_idxs_for_indexer_loss(
         cu_seqlens,
         global_start=3,
         l_local=3,

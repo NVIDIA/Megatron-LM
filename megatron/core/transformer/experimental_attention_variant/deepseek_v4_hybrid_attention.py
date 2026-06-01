@@ -351,14 +351,14 @@ class DSv4HybridAttention(Attention):
             inference_context is None and inference_params is None
         ), "Inference is not supported for DSv4HybridAttention."
 
-        use_thd_cp_design = (
+        use_thd_cp = (
             packed_seq_params is not None
             and packed_seq_params.qkv_format == 'thd'
             and self.pg_collection.cp.size() > 1
         )
         boundary_hidden = None
         boundary_key = None
-        if use_thd_cp_design:
+        if use_thd_cp:
             d_window = self._dsv4_cp_boundary_window()
             _cp_debug_trace(f"boundary hidden exchange start D={d_window}")
             boundary_hidden = exchange_left_boundary_tensor(
@@ -378,9 +378,9 @@ class DSv4HybridAttention(Attention):
             packed_seq_params,
             inference_context=inference_context,
         )
-        if use_thd_cp_design:
+        if use_thd_cp:
             _cp_debug_trace("local qkv projection done")
-        if use_thd_cp_design:
+        if use_thd_cp:
             _cp_debug_trace("boundary key projection start")
             boundary_key = self._build_boundary_key_from_hidden(boundary_hidden, packed_seq_params)
             _cp_debug_trace("boundary key projection done")
@@ -398,7 +398,7 @@ class DSv4HybridAttention(Attention):
             self.offload_core_attention and self.training, query, "core_attn"
         )
         with core_attn_manager as query:
-            if use_thd_cp_design:
+            if use_thd_cp:
                 _cp_debug_trace("core attention start")
             core_attn_out = self.core_attention(
                 query,
@@ -411,7 +411,7 @@ class DSv4HybridAttention(Attention):
                 boundary_hidden=boundary_hidden,
                 boundary_key=boundary_key,
             )
-            if use_thd_cp_design:
+            if use_thd_cp:
                 _cp_debug_trace("core attention done")
         core_attn_out = core_attn_manager.group_offload(
             core_attn_out, forced_released_tensors=[query, key, value]

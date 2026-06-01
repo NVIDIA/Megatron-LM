@@ -24,20 +24,20 @@ class _SingleRankCPGroup:
 _SINGLE_RANK_CP_GROUP = _SingleRankCPGroup()
 
 
-def _cp_debug_trace(message: str) -> None:
+def cp_debug_trace(message: str) -> None:
     if not os.environ.get("DSV4_CP_DEBUG_TRACE"):
         return
     rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else "?"
     print(f"[dsv4-cp rank={rank}] {message}", flush=True)
 
 
-def _cp_group_size(cp_group: Optional[torch.distributed.ProcessGroup]) -> int:
+def cp_group_size(cp_group: Optional[torch.distributed.ProcessGroup]) -> int:
     if cp_group is None:
         return 1
     return cp_group.size()
 
 
-def _cp_group_rank(cp_group: Optional[torch.distributed.ProcessGroup]) -> int:
+def cp_group_rank(cp_group: Optional[torch.distributed.ProcessGroup]) -> int:
     if cp_group is None:
         return 0
     return cp_group.rank()
@@ -55,8 +55,8 @@ class _LeftBoundaryExchange(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, tensor: torch.Tensor, d_window: int, cp_group: torch.distributed.ProcessGroup):
-        cp_size = _cp_group_size(cp_group)
-        cp_rank = _cp_group_rank(cp_group)
+        cp_size = cp_group_size(cp_group)
+        cp_rank = cp_group_rank(cp_group)
         ctx.cp_group = cp_group
         ctx.d_window = d_window
         ctx.input_shape = tensor.shape
@@ -71,7 +71,7 @@ class _LeftBoundaryExchange(torch.autograd.Function):
 
         send = tensor[-d_window:].contiguous()
         recv = tensor.new_zeros(send.shape)
-        _cp_debug_trace(f"boundary forward start D={d_window} local={tensor.shape[0]}")
+        cp_debug_trace(f"boundary forward start D={d_window} local={tensor.shape[0]}")
         ops = []
         if cp_rank > 0:
             ops.append(dist.P2POp(dist.irecv, recv, _group_peer(cp_group, cp_rank - 1), cp_group))
@@ -80,14 +80,14 @@ class _LeftBoundaryExchange(torch.autograd.Function):
         if ops:
             for req in dist.batch_isend_irecv(ops):
                 req.wait()
-        _cp_debug_trace("boundary forward done")
+        cp_debug_trace("boundary forward done")
         return recv
 
     @staticmethod
     def backward(ctx, grad_boundary: torch.Tensor):
         cp_group = ctx.cp_group
-        cp_size = _cp_group_size(cp_group)
-        cp_rank = _cp_group_rank(cp_group)
+        cp_size = cp_group_size(cp_group)
+        cp_rank = cp_group_rank(cp_group)
         d_window = ctx.d_window
 
         grad_input = grad_boundary.new_zeros(ctx.input_shape)
@@ -96,7 +96,7 @@ class _LeftBoundaryExchange(torch.autograd.Function):
 
         send = grad_boundary.contiguous()
         recv = grad_boundary.new_zeros(send.shape)
-        _cp_debug_trace(f"boundary backward start D={d_window}")
+        cp_debug_trace(f"boundary backward start D={d_window}")
         ops = []
         if cp_rank + 1 < cp_size:
             ops.append(dist.P2POp(dist.irecv, recv, _group_peer(cp_group, cp_rank + 1), cp_group))
@@ -107,7 +107,7 @@ class _LeftBoundaryExchange(torch.autograd.Function):
                 req.wait()
         if cp_rank + 1 < cp_size:
             grad_input[-d_window:] += recv
-        _cp_debug_trace("boundary backward done")
+        cp_debug_trace("boundary backward done")
         return grad_input, None, None
 
 
@@ -118,11 +118,27 @@ def exchange_left_boundary_tensor(
     return _LeftBoundaryExchange.apply(tensor, d_window, cp_group)
 
 
-def _contiguous_cp_range(cu_seqlens: torch.Tensor, cp_size: int, cp_rank: int) -> Tuple[int, int]:
-    padded_total = int(cu_seqlens[-1].item())
+def contiguous_cp_partition(
+    cu_seqlens_padded: torch.Tensor, cp_size: int, cp_rank: int
+) -> Tuple[int, int]:
+    """Return the global padded-token partition assigned to a contiguous CP rank.
+
+    Args:
+        cu_seqlens_padded: Global padded THD cumulative sequence lengths. The
+            last entry is the padded total token count that MCore partitions
+            evenly across CP ranks.
+        cp_size: Number of context-parallel ranks.
+        cp_rank: Context-parallel rank whose contiguous partition is requested.
+
+    Returns:
+        A ``(global_start, l_local)`` tuple. ``global_start`` is the first
+        global padded token owned by ``cp_rank`` and ``l_local`` is the fixed
+        local padded token count per CP rank.
+    """
+    padded_total = int(cu_seqlens_padded[-1].item())
     if padded_total % cp_size != 0:
         raise RuntimeError(
-            "DSv4 THD CP design path requires padded_total_tokens % cp_size == 0: "
+            "DSv4 THD CP path requires padded_total_tokens % cp_size == 0: "
             f"total={padded_total}, cp_size={cp_size}"
         )
     l_local = padded_total // cp_size
@@ -184,7 +200,7 @@ def _build_compressor_metadata_for_range(
     return seq_ids_t, comp_ids_t, valid_t
 
 
-def _build_rank_major_compressed_metadata(
+def build_rank_major_compressed_metadata(
     cu_seqlens: torch.Tensor,
     cp_size: int,
     l_local: int,
@@ -212,7 +228,7 @@ def _build_rank_major_compressed_metadata(
     return torch.cat(seq_parts), torch.cat(comp_parts), torch.cat(valid_parts)
 
 
-def _build_compressor_prep_compact(
+def build_compressor_prep_compact(
     hidden_local: torch.Tensor,
     boundary_hidden: torch.Tensor,
     cu_seqlens: torch.Tensor,
@@ -295,20 +311,20 @@ def _build_compressor_prep_compact(
     return hidden_compact, cu_compact, seq_ids_t, comp_ids_t, valid_t, c_cap
 
 
-def _all_gather_fixed_cp_tensor(
+def all_gather_fixed_cp_tensor(
     tensor: torch.Tensor, cp_group: torch.distributed.ProcessGroup
 ) -> torch.Tensor:
     return torch.cat(differentiable_all_gather(tensor.contiguous(), group=cp_group), dim=0)
 
 
-def _zero_module_parameter_dependency(module: nn.Module, like: torch.Tensor) -> torch.Tensor:
+def zero_module_parameter_dependency(module: nn.Module, like: torch.Tensor) -> torch.Tensor:
     token = like.new_tensor(0.0)
     for param in module.parameters():
         token = token + param.sum().to(dtype=like.dtype) * like.new_tensor(0.0)
     return token
 
 
-def _pack_design_kv_full(
+def pack_cp_kv_full(
     kv_local: torch.Tensor,
     boundary_kv: torch.Tensor,
     compressed_rank_major: torch.Tensor,
@@ -322,7 +338,7 @@ def _pack_design_kv_full(
 ) -> Tuple[torch.Tensor, Dict[int, int], Dict[Tuple[int, int], int]]:
     """PyTorch stand-in for the post-all-gather KV full pack kernel.
 
-    The design kernel has a static output contract: valid per-sequence window
+    This CP fallback has a static output contract: valid per-sequence window
     and compressed entries are packed at the front, and unused capacity is kept
     as final tail padding. This stand-in mirrors that flat-id contract while
     still using Python metadata construction.
@@ -379,7 +395,7 @@ def _pack_design_kv_full(
     return kv_full, window_map, compressed_map
 
 
-def _final_design_flat_idxs(
+def build_cp_flat_idxs(
     cu_seqlens: torch.Tensor,
     global_start: int,
     l_local: int,
@@ -440,7 +456,7 @@ def _final_design_flat_idxs(
     return out, topk_length
 
 
-def _final_design_flat_idxs_for_indexer_loss(
+def build_cp_flat_idxs_for_indexer_loss(
     cu_seqlens: torch.Tensor,
     global_start: int,
     l_local: int,

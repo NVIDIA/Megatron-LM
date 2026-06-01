@@ -1439,8 +1439,8 @@ class TransformerConfig(ModelParallelConfig):
                 f"num_layers + mtp_num_layers ({self.num_layers} + {mtp_layers} = {expected_len})"
             )
             assert all(
-                ratio in [0, 1, 4, 128] for ratio in self.csa_compress_ratios
-            ), "csa_compress_ratios must be 0, 1, 4, or 128"
+                ratio in [0, 4, 128] for ratio in self.csa_compress_ratios
+            ), "csa_compress_ratios must be 0, 4, or 128"
             assert (
                 self.tensor_model_parallel_size == 1
             ), "DSv4 Hybrid Attention only supports TP size 1."
