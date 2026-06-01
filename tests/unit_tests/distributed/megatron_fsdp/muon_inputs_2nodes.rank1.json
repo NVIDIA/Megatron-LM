@@ -1,0 +1,3658 @@
+{
+  "world_size": 8,
+  "rank": 1,
+  "optimizer": {
+    "class": "FSDPTensorParallelMuon",
+    "num_ns_steps": 5,
+    "coefficient_type": "quintic",
+    "scale_mode": "spectral",
+    "extra_scale_factor": 0.2,
+    "use_syrk": true,
+    "tp_mode": "blockwise",
+    "split_qkv": true,
+    "qkv_split_shapes": [
+      1024,
+      128,
+      128
+    ],
+    "nesterov": false,
+    "fp32_matmul_prec": "medium",
+    "fsdp_padded_all_gather": true,
+    "fsdp_padded_all_gather_pad_factor": 1.25,
+    "fsdp_batched_all_gather": true,
+    "fsdp_flat_batched_all_gather": false,
+    "fsdp_reuse_gather_scratch": true,
+    "fsdp_batch_max_gather_bytes": 1073741824,
+    "fsdp_padded_all_gather_zero_pad": true,
+    "fsdp_fast_reconstruct": true,
+    "fsdp_boundary_gather_dtype": "bf16",
+    "fsdp_distributed_ns": true,
+    "fsdp_distributed_ns_min_numel": 100000000,
+    "fsdp_distributed_ns_small_col_dim": 0,
+    "fsdp_distributed_ns_single_all_reduce": false,
+    "fsdp_distributed_ns_gram_refresh_interval": 1,
+    "fsdp_distributed_ns_exclude_qkv": false,
+    "fsdp_defer_distributed_ns_under_gather": false,
+    "fsdp_overlap_comm_compute": true,
+    "fsdp_overlap_defer_boundary_batch_size": 1,
+    "fsdp_batched_newton_schulz": true,
+    "fsdp_batched_newton_schulz_max_numel": 100663296,
+    "fsdp_batched_newton_schulz_max_batch_bytes": 2147483648,
+    "fsdp_batched_distributed_newton_schulz_max_batch_bytes": 4294967296
+  },
+  "groups": [
+    {
+      "lr": 0.0,
+      "momentum": 0.9,
+      "weight_decay": 0.1,
+      "params": [
+        {
+          "name": "module.decoder.layers.0.mixer.in_proj.weight",
+          "global_shape": [
+            35072,
+            8192
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp",
+            "tp"
+          ],
+          "mesh_shape": [
+            4,
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)",
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            6432,
+            8192
+          ],
+          "local_offsets": null,
+          "partition_dim": 0,
+          "tensor_model_parallel": true,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            6432,
+            8192
+          ]
+        },
+        {
+          "name": "module.decoder.layers.0.mixer.out_proj.weight",
+          "global_shape": [
+            8192,
+            16384
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp",
+            "tp"
+          ],
+          "mesh_shape": [
+            4,
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)",
+            "Shard(dim=1)"
+          ],
+          "local_shape": [
+            0,
+            8192
+          ],
+          "local_offsets": null,
+          "partition_dim": 1,
+          "tensor_model_parallel": true,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            8192
+          ]
+        },
+        {
+          "name": "module.decoder.layers.1.mlp.router.weight",
+          "global_shape": [
+            32,
+            8192
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            4
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            9,
+            8192
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            9,
+            8192
+          ]
+        },
+        {
+          "name": "module.decoder.layers.1.mlp.fc1_latent_proj.weight",
+          "global_shape": [
+            4096,
+            8192
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp",
+            "tp"
+          ],
+          "mesh_shape": [
+            4,
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)",
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            8192
+          ],
+          "local_offsets": null,
+          "partition_dim": 0,
+          "tensor_model_parallel": true,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            8192
+          ]
+        },
+        {
+          "name": "module.decoder.layers.1.mlp.fc2_latent_proj.weight",
+          "global_shape": [
+            16384,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp",
+            "tp"
+          ],
+          "mesh_shape": [
+            4,
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)",
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": 0,
+          "tensor_model_parallel": true,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.1.mlp.experts.linear_fc1.weight0",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.1.mlp.experts.linear_fc1.weight1",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.1.mlp.experts.linear_fc1.weight2",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.1.mlp.experts.linear_fc1.weight3",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.1.mlp.experts.linear_fc1.weight4",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.1.mlp.experts.linear_fc1.weight5",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.1.mlp.experts.linear_fc1.weight6",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.1.mlp.experts.linear_fc1.weight7",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.1.mlp.experts.linear_fc2.weight0",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.1.mlp.experts.linear_fc2.weight1",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.1.mlp.experts.linear_fc2.weight2",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.1.mlp.experts.linear_fc2.weight3",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.1.mlp.experts.linear_fc2.weight4",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.1.mlp.experts.linear_fc2.weight5",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.1.mlp.experts.linear_fc2.weight6",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.1.mlp.experts.linear_fc2.weight7",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.1.mlp.shared_experts.linear_fc1.weight",
+          "global_shape": [
+            10240,
+            8192
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp",
+            "tp"
+          ],
+          "mesh_shape": [
+            4,
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)",
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            1535,
+            8192
+          ],
+          "local_offsets": null,
+          "partition_dim": 0,
+          "tensor_model_parallel": true,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            1535,
+            8192
+          ]
+        },
+        {
+          "name": "module.decoder.layers.1.mlp.shared_experts.linear_fc2.weight",
+          "global_shape": [
+            8192,
+            10240
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp",
+            "tp"
+          ],
+          "mesh_shape": [
+            4,
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)",
+            "Shard(dim=1)"
+          ],
+          "local_shape": [
+            0,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": 1,
+          "tensor_model_parallel": true,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.2.mixer.in_proj.weight",
+          "global_shape": [
+            35072,
+            8192
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp",
+            "tp"
+          ],
+          "mesh_shape": [
+            4,
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)",
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            6432,
+            8192
+          ],
+          "local_offsets": null,
+          "partition_dim": 0,
+          "tensor_model_parallel": true,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            6432,
+            8192
+          ]
+        },
+        {
+          "name": "module.decoder.layers.2.mixer.out_proj.weight",
+          "global_shape": [
+            8192,
+            16384
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp",
+            "tp"
+          ],
+          "mesh_shape": [
+            4,
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)",
+            "Shard(dim=1)"
+          ],
+          "local_shape": [
+            0,
+            8192
+          ],
+          "local_offsets": null,
+          "partition_dim": 1,
+          "tensor_model_parallel": true,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            8192
+          ]
+        },
+        {
+          "name": "module.decoder.layers.3.mlp.router.weight",
+          "global_shape": [
+            32,
+            8192
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            4
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            9,
+            8192
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            9,
+            8192
+          ]
+        },
+        {
+          "name": "module.decoder.layers.3.mlp.fc1_latent_proj.weight",
+          "global_shape": [
+            4096,
+            8192
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp",
+            "tp"
+          ],
+          "mesh_shape": [
+            4,
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)",
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            8192
+          ],
+          "local_offsets": null,
+          "partition_dim": 0,
+          "tensor_model_parallel": true,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            8192
+          ]
+        },
+        {
+          "name": "module.decoder.layers.3.mlp.fc2_latent_proj.weight",
+          "global_shape": [
+            16384,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp",
+            "tp"
+          ],
+          "mesh_shape": [
+            4,
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)",
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": 0,
+          "tensor_model_parallel": true,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.3.mlp.experts.linear_fc1.weight0",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.3.mlp.experts.linear_fc1.weight1",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.3.mlp.experts.linear_fc1.weight2",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.3.mlp.experts.linear_fc1.weight3",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.3.mlp.experts.linear_fc1.weight4",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.3.mlp.experts.linear_fc1.weight5",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.3.mlp.experts.linear_fc1.weight6",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.3.mlp.experts.linear_fc1.weight7",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.3.mlp.experts.linear_fc2.weight0",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.3.mlp.experts.linear_fc2.weight1",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.3.mlp.experts.linear_fc2.weight2",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.3.mlp.experts.linear_fc2.weight3",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.3.mlp.experts.linear_fc2.weight4",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.3.mlp.experts.linear_fc2.weight5",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.3.mlp.experts.linear_fc2.weight6",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.3.mlp.experts.linear_fc2.weight7",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.3.mlp.shared_experts.linear_fc1.weight",
+          "global_shape": [
+            10240,
+            8192
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp",
+            "tp"
+          ],
+          "mesh_shape": [
+            4,
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)",
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            1535,
+            8192
+          ],
+          "local_offsets": null,
+          "partition_dim": 0,
+          "tensor_model_parallel": true,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            1535,
+            8192
+          ]
+        },
+        {
+          "name": "module.decoder.layers.3.mlp.shared_experts.linear_fc2.weight",
+          "global_shape": [
+            8192,
+            10240
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp",
+            "tp"
+          ],
+          "mesh_shape": [
+            4,
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)",
+            "Shard(dim=1)"
+          ],
+          "local_shape": [
+            0,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": 1,
+          "tensor_model_parallel": true,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.4.mixer.in_proj.weight",
+          "global_shape": [
+            35072,
+            8192
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp",
+            "tp"
+          ],
+          "mesh_shape": [
+            4,
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)",
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            6432,
+            8192
+          ],
+          "local_offsets": null,
+          "partition_dim": 0,
+          "tensor_model_parallel": true,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            6432,
+            8192
+          ]
+        },
+        {
+          "name": "module.decoder.layers.4.mixer.out_proj.weight",
+          "global_shape": [
+            8192,
+            16384
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp",
+            "tp"
+          ],
+          "mesh_shape": [
+            4,
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)",
+            "Shard(dim=1)"
+          ],
+          "local_shape": [
+            0,
+            8192
+          ],
+          "local_offsets": null,
+          "partition_dim": 1,
+          "tensor_model_parallel": true,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            8192
+          ]
+        },
+        {
+          "name": "module.decoder.layers.5.mlp.router.weight",
+          "global_shape": [
+            32,
+            8192
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            4
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            9,
+            8192
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            9,
+            8192
+          ]
+        },
+        {
+          "name": "module.decoder.layers.5.mlp.fc1_latent_proj.weight",
+          "global_shape": [
+            4096,
+            8192
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp",
+            "tp"
+          ],
+          "mesh_shape": [
+            4,
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)",
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            8192
+          ],
+          "local_offsets": null,
+          "partition_dim": 0,
+          "tensor_model_parallel": true,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            8192
+          ]
+        },
+        {
+          "name": "module.decoder.layers.5.mlp.fc2_latent_proj.weight",
+          "global_shape": [
+            16384,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp",
+            "tp"
+          ],
+          "mesh_shape": [
+            4,
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)",
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": 0,
+          "tensor_model_parallel": true,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.5.mlp.experts.linear_fc1.weight0",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.5.mlp.experts.linear_fc1.weight1",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.5.mlp.experts.linear_fc1.weight2",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.5.mlp.experts.linear_fc1.weight3",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.5.mlp.experts.linear_fc1.weight4",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.5.mlp.experts.linear_fc1.weight5",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.5.mlp.experts.linear_fc1.weight6",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.5.mlp.experts.linear_fc1.weight7",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.5.mlp.experts.linear_fc2.weight0",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.5.mlp.experts.linear_fc2.weight1",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.5.mlp.experts.linear_fc2.weight2",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.5.mlp.experts.linear_fc2.weight3",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.5.mlp.experts.linear_fc2.weight4",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.5.mlp.experts.linear_fc2.weight5",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.5.mlp.experts.linear_fc2.weight6",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.5.mlp.experts.linear_fc2.weight7",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.5.mlp.shared_experts.linear_fc1.weight",
+          "global_shape": [
+            10240,
+            8192
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp",
+            "tp"
+          ],
+          "mesh_shape": [
+            4,
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)",
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            1535,
+            8192
+          ],
+          "local_offsets": null,
+          "partition_dim": 0,
+          "tensor_model_parallel": true,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            1535,
+            8192
+          ]
+        },
+        {
+          "name": "module.decoder.layers.5.mlp.shared_experts.linear_fc2.weight",
+          "global_shape": [
+            8192,
+            10240
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp",
+            "tp"
+          ],
+          "mesh_shape": [
+            4,
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)",
+            "Shard(dim=1)"
+          ],
+          "local_shape": [
+            0,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": 1,
+          "tensor_model_parallel": true,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.6.mixer.in_proj.weight",
+          "global_shape": [
+            35072,
+            8192
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp",
+            "tp"
+          ],
+          "mesh_shape": [
+            4,
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)",
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            6432,
+            8192
+          ],
+          "local_offsets": null,
+          "partition_dim": 0,
+          "tensor_model_parallel": true,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            6432,
+            8192
+          ]
+        },
+        {
+          "name": "module.decoder.layers.6.mixer.out_proj.weight",
+          "global_shape": [
+            8192,
+            16384
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp",
+            "tp"
+          ],
+          "mesh_shape": [
+            4,
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)",
+            "Shard(dim=1)"
+          ],
+          "local_shape": [
+            0,
+            8192
+          ],
+          "local_offsets": null,
+          "partition_dim": 1,
+          "tensor_model_parallel": true,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            8192
+          ]
+        },
+        {
+          "name": "module.decoder.layers.7.mlp.router.weight",
+          "global_shape": [
+            32,
+            8192
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            4
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            9,
+            8192
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            9,
+            8192
+          ]
+        },
+        {
+          "name": "module.decoder.layers.7.mlp.fc1_latent_proj.weight",
+          "global_shape": [
+            4096,
+            8192
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp",
+            "tp"
+          ],
+          "mesh_shape": [
+            4,
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)",
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            8192
+          ],
+          "local_offsets": null,
+          "partition_dim": 0,
+          "tensor_model_parallel": true,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            8192
+          ]
+        },
+        {
+          "name": "module.decoder.layers.7.mlp.fc2_latent_proj.weight",
+          "global_shape": [
+            16384,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp",
+            "tp"
+          ],
+          "mesh_shape": [
+            4,
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)",
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": 0,
+          "tensor_model_parallel": true,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.7.mlp.experts.linear_fc1.weight0",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.7.mlp.experts.linear_fc1.weight1",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.7.mlp.experts.linear_fc1.weight2",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.7.mlp.experts.linear_fc1.weight3",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.7.mlp.experts.linear_fc1.weight4",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.7.mlp.experts.linear_fc1.weight5",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.7.mlp.experts.linear_fc1.weight6",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.7.mlp.experts.linear_fc1.weight7",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.7.mlp.experts.linear_fc2.weight0",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.7.mlp.experts.linear_fc2.weight1",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.7.mlp.experts.linear_fc2.weight2",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.7.mlp.experts.linear_fc2.weight3",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.7.mlp.experts.linear_fc2.weight4",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.7.mlp.experts.linear_fc2.weight5",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.7.mlp.experts.linear_fc2.weight6",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.7.mlp.experts.linear_fc2.weight7",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.7.mlp.shared_experts.linear_fc1.weight",
+          "global_shape": [
+            10240,
+            8192
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp",
+            "tp"
+          ],
+          "mesh_shape": [
+            4,
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)",
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            1535,
+            8192
+          ],
+          "local_offsets": null,
+          "partition_dim": 0,
+          "tensor_model_parallel": true,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            1535,
+            8192
+          ]
+        },
+        {
+          "name": "module.decoder.layers.7.mlp.shared_experts.linear_fc2.weight",
+          "global_shape": [
+            8192,
+            10240
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp",
+            "tp"
+          ],
+          "mesh_shape": [
+            4,
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)",
+            "Shard(dim=1)"
+          ],
+          "local_shape": [
+            0,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": 1,
+          "tensor_model_parallel": true,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.8.mixer.in_proj.weight",
+          "global_shape": [
+            35072,
+            8192
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp",
+            "tp"
+          ],
+          "mesh_shape": [
+            4,
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)",
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            6432,
+            8192
+          ],
+          "local_offsets": null,
+          "partition_dim": 0,
+          "tensor_model_parallel": true,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            6432,
+            8192
+          ]
+        },
+        {
+          "name": "module.decoder.layers.8.mixer.out_proj.weight",
+          "global_shape": [
+            8192,
+            16384
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp",
+            "tp"
+          ],
+          "mesh_shape": [
+            4,
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)",
+            "Shard(dim=1)"
+          ],
+          "local_shape": [
+            0,
+            8192
+          ],
+          "local_offsets": null,
+          "partition_dim": 1,
+          "tensor_model_parallel": true,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            8192
+          ]
+        },
+        {
+          "name": "module.decoder.layers.9.self_attention.linear_proj.weight",
+          "global_shape": [
+            8192,
+            8192
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp",
+            "tp"
+          ],
+          "mesh_shape": [
+            4,
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)",
+            "Shard(dim=1)"
+          ],
+          "local_shape": [
+            0,
+            4096
+          ],
+          "local_offsets": null,
+          "partition_dim": 1,
+          "tensor_model_parallel": true,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            4096
+          ]
+        },
+        {
+          "name": "module.decoder.layers.9.self_attention.linear_qkv.weight",
+          "global_shape": [
+            10240,
+            8192
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp",
+            "tp"
+          ],
+          "mesh_shape": [
+            4,
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)",
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2304,
+            8192
+          ],
+          "local_offsets": null,
+          "partition_dim": 0,
+          "tensor_model_parallel": true,
+          "is_qkv": true,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2304,
+            8192
+          ]
+        },
+        {
+          "name": "module.decoder.layers.10.mlp.router.weight",
+          "global_shape": [
+            32,
+            8192
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            4
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            9,
+            8192
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            9,
+            8192
+          ]
+        },
+        {
+          "name": "module.decoder.layers.10.mlp.fc1_latent_proj.weight",
+          "global_shape": [
+            4096,
+            8192
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp",
+            "tp"
+          ],
+          "mesh_shape": [
+            4,
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)",
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            8192
+          ],
+          "local_offsets": null,
+          "partition_dim": 0,
+          "tensor_model_parallel": true,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            8192
+          ]
+        },
+        {
+          "name": "module.decoder.layers.10.mlp.fc2_latent_proj.weight",
+          "global_shape": [
+            16384,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp",
+            "tp"
+          ],
+          "mesh_shape": [
+            4,
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)",
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": 0,
+          "tensor_model_parallel": true,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.10.mlp.experts.linear_fc1.weight0",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.10.mlp.experts.linear_fc1.weight1",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.10.mlp.experts.linear_fc1.weight2",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.10.mlp.experts.linear_fc1.weight3",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.10.mlp.experts.linear_fc1.weight4",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.10.mlp.experts.linear_fc1.weight5",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.10.mlp.experts.linear_fc1.weight6",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.10.mlp.experts.linear_fc1.weight7",
+          "global_shape": [
+            5120,
+            2048
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            0,
+            2048
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            2048
+          ]
+        },
+        {
+          "name": "module.decoder.layers.10.mlp.experts.linear_fc2.weight0",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.10.mlp.experts.linear_fc2.weight1",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.10.mlp.experts.linear_fc2.weight2",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.10.mlp.experts.linear_fc2.weight3",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.10.mlp.experts.linear_fc2.weight4",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.10.mlp.experts.linear_fc2.weight5",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.10.mlp.experts.linear_fc2.weight6",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.10.mlp.experts.linear_fc2.weight7",
+          "global_shape": [
+            2048,
+            5120
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp"
+          ],
+          "mesh_shape": [
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            2048,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": null,
+          "tensor_model_parallel": null,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            2048,
+            5120
+          ]
+        },
+        {
+          "name": "module.decoder.layers.10.mlp.shared_experts.linear_fc1.weight",
+          "global_shape": [
+            10240,
+            8192
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp",
+            "tp"
+          ],
+          "mesh_shape": [
+            4,
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)",
+            "Shard(dim=0)"
+          ],
+          "local_shape": [
+            1535,
+            8192
+          ],
+          "local_offsets": null,
+          "partition_dim": 0,
+          "tensor_model_parallel": true,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            1535,
+            8192
+          ]
+        },
+        {
+          "name": "module.decoder.layers.10.mlp.shared_experts.linear_fc2.weight",
+          "global_shape": [
+            8192,
+            10240
+          ],
+          "dtype": "torch.float32",
+          "mesh_dim_names": [
+            "dp_cp",
+            "tp"
+          ],
+          "mesh_shape": [
+            4,
+            2
+          ],
+          "placements": [
+            "Shard(dim=0)",
+            "Shard(dim=1)"
+          ],
+          "local_shape": [
+            0,
+            5120
+          ],
+          "local_offsets": null,
+          "partition_dim": 1,
+          "tensor_model_parallel": true,
+          "is_qkv": false,
+          "momentum_dtype": "torch.float32",
+          "momentum_local_shape": [
+            0,
+            5120
+          ]
+        }
+      ]
+    }
+  ]
+}
