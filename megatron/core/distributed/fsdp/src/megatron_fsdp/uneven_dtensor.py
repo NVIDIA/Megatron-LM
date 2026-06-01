@@ -293,7 +293,8 @@ def uneven_dtensor_to_full_tensor(dtensor: DTensor) -> torch.Tensor:
     if not isinstance(dtensor, DTensor):
         raise TypeError(f"Input must be a DTensor, got {type(dtensor).__name__}.")
 
-    # Ensure chunk metadata is available for uneven shards
+    # Ensure chunk metadata is available for uneven shards. If the metadata exists,
+    # skip the all-gather collectives required to produce the metadata.
     if not hasattr(dtensor._local_tensor, "__create_chunk_list__"):
         update_uneven_dtensor_chunk_metadata(dtensor)
 
@@ -357,13 +358,57 @@ def uneven_dtensor_to_full_tensor(dtensor: DTensor) -> torch.Tensor:
         buffer_offset += chunk_numel
 
     # Reconstruct the full tensor by placing chunks at their correct offsets
-    full_tensor = torch.zeros(dtensor.shape, dtype=dtensor.dtype, device=dtensor.device)
+    full_tensor = torch.empty(dtensor.shape, dtype=dtensor.dtype, device=dtensor.device)
+    assigned_numel = 0
     for chunk_info, local_chunk in zip(local_chunks_info, all_local_chunks):
         offset = chunk_info["offset"]
         slices = tuple(slice(o, o + s) for o, s in zip(offset, local_chunk.shape))
         full_tensor[slices] = local_chunk
+        assigned_numel += local_chunk.numel()
+
+    _assert_chunks_cover_full_tensor(dtensor.shape, local_chunks_info, assigned_numel)
 
     return full_tensor
+
+
+def _assert_chunks_cover_full_tensor(full_shape, chunks_info, assigned_numel: int) -> None:
+    """Check that chunk metadata covers every index of the reconstructed tensor."""
+    full_numel = torch.Size(full_shape).numel()
+    assert assigned_numel == full_numel, (
+        "Uneven DTensor gather did not assign the full tensor: "
+        f"assigned {assigned_numel} of {full_numel} elements."
+    )
+
+    full_shape = torch.Size(full_shape)
+    varying_dims = [
+        dim
+        for dim in range(len(full_shape))
+        if any(
+            chunk_info["offset"][dim] != 0 or chunk_info["shape"][dim] != full_shape[dim]
+            for chunk_info in chunks_info
+        )
+    ]
+    if len(varying_dims) != 1:
+        return
+
+    shard_dim = varying_dims[0]
+    cursor = 0
+    for start, stop in sorted(
+        (
+            chunk_info["offset"][shard_dim],
+            chunk_info["offset"][shard_dim] + chunk_info["shape"][shard_dim],
+        )
+        for chunk_info in chunks_info
+    ):
+        assert start == cursor, (
+            "Uneven DTensor gather chunk metadata does not cover the full tensor: "
+            f"expected next offset {cursor}, got interval ({start}, {stop})."
+        )
+        cursor = stop
+    assert cursor == full_shape[shard_dim], (
+        "Uneven DTensor gather chunk metadata does not cover the full tensor: "
+        f"covered shard dimension until {cursor}, expected {full_shape[shard_dim]}."
+    )
 
 
 def redistribute_uneven_dtensor_to_replicated(dtensor: DTensor) -> DTensor:

@@ -2862,3 +2862,69 @@ def deprecate_inference_params(inference_context, inference_params):
         )
         return inference_params
     return inference_context
+
+
+# ---------- Backported from muon-m-fsdp branch for FSDPTensorParallelMuon ----------
+
+from megatron.core._rank_utils import log_single_rank  # noqa: E402
+
+try:
+    from torch.distributed.tensor.placement_types import _StridedShard
+except ImportError:  # pragma: no cover
+    _StridedShard = None  # type: ignore[assignment]
+
+
+def is_same_process_group(
+    group: "torch.distributed.ProcessGroup | None",
+    other: "torch.distributed.ProcessGroup | None",
+) -> bool:
+    """Returns whether two process groups contain the same ranks."""
+    if group is other:
+        return True
+    if group is None or other is None:
+        return False
+    try:
+        return torch.distributed.get_process_group_ranks(
+            group
+        ) == torch.distributed.get_process_group_ranks(other)
+    except (RuntimeError, ValueError):
+        return False
+
+
+def contains_process_group(
+    groups: "list[torch.distributed.ProcessGroup]",
+    group: "torch.distributed.ProcessGroup | None",
+) -> bool:
+    """Returns whether `groups` already contains a process group with `group`'s ranks."""
+    return any(is_same_process_group(group, existing) for existing in groups)
+
+
+def append_unique_process_group(
+    groups: "list[torch.distributed.ProcessGroup]",
+    group: "torch.distributed.ProcessGroup | None",
+) -> None:
+    """Appends `group` to `groups` if an equivalent process group is not already present."""
+    if group is None:
+        return
+    if not contains_process_group(groups, group):
+        groups.append(group)
+
+
+def get_dtensor_data_parallel_shard_groups(tensor):
+    """Return DTensor shard groups that should contribute to global grad stats."""
+    if not HAVE_DTENSOR or not isinstance(tensor, DTensor):
+        return []
+    shard_placement_types = (Shard,) if _StridedShard is None else (Shard, _StridedShard)
+    mesh = tensor.device_mesh
+    mesh_dim_names = getattr(mesh, "mesh_dim_names", None)
+    groups = []
+    for mesh_dim, placement in enumerate(tensor.placements):
+        if not isinstance(placement, shard_placement_types):
+            continue
+        mesh_dim_name = None
+        if mesh_dim_names is not None and mesh_dim < len(mesh_dim_names):
+            mesh_dim_name = mesh_dim_names[mesh_dim]
+        if mesh_dim_name == "tp":
+            continue
+        append_unique_process_group(groups, mesh.get_group(mesh_dim))
+    return groups
