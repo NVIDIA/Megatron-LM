@@ -122,9 +122,7 @@ class DSAIndexerLossLoggingHelper:
         # identical shapes on every rank, so reduce-MAX the local size first, then pad to it
         # (otherwise PP>1 hangs / errors on mismatched sizes).
         local_size = tracker["values"].shape[0] if "values" in tracker else (num_layers or 0)
-        size_t = torch.tensor(
-            [local_size], device=torch.cuda.current_device(), dtype=torch.long
-        )
+        size_t = torch.tensor([local_size], device=torch.cuda.current_device(), dtype=torch.long)
         torch.distributed.all_reduce(size_t, op=torch.distributed.ReduceOp.MAX, group=pp_group)
         size = int(size_t.item())
         if size == 0:
