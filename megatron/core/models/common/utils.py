@@ -179,7 +179,9 @@ class PostProcessNode(ScheduleNode):
     def forward_impl(self, hidden_states):
         """Run model postprocessing for the chunk's final hidden states."""
         empty_decoder = len(self.model.decoder.layers) == 0
-        layer_norm = self.model.decoder.final_layernorm
+        layer_norm = getattr(self.model.decoder, "final_norm", None) or getattr(
+            self.model.decoder, "final_layernorm", None
+        )
         if not self.model.config.mtp_num_layers and empty_decoder and layer_norm:
             hidden_states = layer_norm(hidden_states)
             hidden_states = make_viewless_tensor(
