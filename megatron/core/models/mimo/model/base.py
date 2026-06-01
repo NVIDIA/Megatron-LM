@@ -298,9 +298,14 @@ class MimoModel(MegatronModule):
         batch_idx, seq_idx = text_mask.nonzero(as_tuple=True)
         input_ids_text = input_ids[batch_idx, seq_idx].unsqueeze(0)
 
-        position_ids_text = (
-            position_ids[batch_idx, seq_idx].unsqueeze(0) if position_ids is not None else None
-        )
+        if position_ids is None:
+            position_ids_text = None
+        elif position_ids.dim() == 3:
+            # Multimodal RoPE can carry [rope_dim, batch, seq] ids. Text
+            # embedding lookup only needs a single absolute position channel.
+            position_ids_text = position_ids[0, batch_idx, seq_idx].unsqueeze(0)
+        else:
+            position_ids_text = position_ids[batch_idx, seq_idx].unsqueeze(0)
 
         text_embeddings = (
             unwrap_model(self.language_model)
@@ -464,8 +469,11 @@ class MimoModel(MegatronModule):
             )
 
             lm_output = self.language_model(
+                # decoder_input replaces the embedding lookup, so input_ids is
+                # unused here; position_ids is still consumed by mRoPE in models
+                # such as Qwen3-VL.
                 input_ids=None,
-                position_ids=None,
+                position_ids=position_ids,
                 decoder_input=combined_embeddings,
                 labels=labels,
                 attention_mask=attention_mask,
@@ -481,8 +489,10 @@ class MimoModel(MegatronModule):
                     underlying_lm.set_input_tensor(hidden_states)
 
             lm_output = self.language_model(
+                # Hidden states arrive via set_input_tensor; position_ids is
+                # still consumed by mRoPE on non-first PP stages.
                 input_ids=None,
-                position_ids=None,
+                position_ids=position_ids,
                 decoder_input=None,
                 labels=labels,
                 attention_mask=attention_mask,
@@ -618,8 +628,11 @@ class MimoModel(MegatronModule):
 
         # 5. Forward pass through language model
         lm_output = self.language_model(
+            # decoder_input replaces the embedding lookup, so input_ids is
+            # unused here; position_ids is still consumed by mRoPE in models
+            # such as Qwen3-VL.
             input_ids=None,
-            position_ids=None,
+            position_ids=position_ids,
             decoder_input=combined_embeddings,
             labels=labels,
             attention_mask=None,
