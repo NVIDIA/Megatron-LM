@@ -32,7 +32,7 @@ def _env_flag(name: str) -> bool:
     return os.getenv(name, "0").lower() in ("1", "true", "yes", "on")
 
 
-def _forced_backend() -> str:
+def _forced_backend() -> Tuple[str, Optional[Exception]]:
     value = os.getenv("MHC_FORCE_BACKEND", "auto").strip().lower()
     value = value.replace("-", "_").replace("+", "_")
     aliases = {
@@ -51,8 +51,10 @@ def _forced_backend() -> str:
     }
     if value not in aliases:
         valid = ", ".join(sorted(aliases))
-        raise ValueError(f"Unsupported MHC_FORCE_BACKEND={value!r}; expected one of: {valid}")
-    return aliases[value]
+        return "auto", ValueError(
+            f"Unsupported MHC_FORCE_BACKEND={value!r}; expected one of: {valid}"
+        )
+    return aliases[value], None
 
 
 # ---------------------------------------------------------------------------
@@ -87,7 +89,18 @@ except ImportError:
     pass
 
 
-_MHC_FORCED_BACKEND = _forced_backend()
+_MHC_FORCED_BACKEND, _MHC_BACKEND_VALIDATION_ERROR = _forced_backend()
+
+
+def _record_mhc_backend_validation_error(error: Exception) -> None:
+    global _MHC_BACKEND_VALIDATION_ERROR
+    if _MHC_BACKEND_VALIDATION_ERROR is None:
+        _MHC_BACKEND_VALIDATION_ERROR = error
+
+
+def _raise_mhc_backend_validation_error() -> None:
+    if _MHC_BACKEND_VALIDATION_ERROR is not None:
+        raise _MHC_BACKEND_VALIDATION_ERROR
 
 if _MHC_FORCED_BACKEND == "native":
     _TRITON_AVAILABLE = False
@@ -95,22 +108,30 @@ if _MHC_FORCED_BACKEND == "native":
     _CUTILE_EXPERIMENTAL_AVAILABLE = False
 elif _MHC_FORCED_BACKEND == "triton":
     if not _TRITON_AVAILABLE:
-        raise RuntimeError("MHC_FORCE_BACKEND=triton was requested, but Triton is not available")
+        _record_mhc_backend_validation_error(
+            RuntimeError("MHC_FORCE_BACKEND=triton was requested, but Triton is not available")
+        )
     _CUTILE_AVAILABLE = False
     _CUTILE_EXPERIMENTAL_AVAILABLE = False
 elif _MHC_FORCED_BACKEND == "cutile":
     if not _CUTILE_AVAILABLE:
-        raise RuntimeError("MHC_FORCE_BACKEND=cutile was requested, but cuTile is not available")
+        _record_mhc_backend_validation_error(
+            RuntimeError("MHC_FORCE_BACKEND=cutile was requested, but cuTile is not available")
+        )
     _TRITON_AVAILABLE = False
 
 if _env_flag("MHC_DISABLE_TRITON"):
     if _MHC_FORCED_BACKEND == "triton":
-        raise ValueError("MHC_FORCE_BACKEND=triton conflicts with MHC_DISABLE_TRITON=1")
+        _record_mhc_backend_validation_error(
+            ValueError("MHC_FORCE_BACKEND=triton conflicts with MHC_DISABLE_TRITON=1")
+        )
     _TRITON_AVAILABLE = False
 
 if _env_flag("MHC_DISABLE_CUTILE"):
     if _MHC_FORCED_BACKEND == "cutile":
-        raise ValueError("MHC_FORCE_BACKEND=cutile conflicts with MHC_DISABLE_CUTILE=1")
+        _record_mhc_backend_validation_error(
+            ValueError("MHC_FORCE_BACKEND=cutile conflicts with MHC_DISABLE_CUTILE=1")
+        )
     _CUTILE_AVAILABLE = False
     _CUTILE_EXPERIMENTAL_AVAILABLE = False
 
@@ -958,16 +979,6 @@ if _CUTILE_AVAILABLE:
             gh_acc += ct.sum(go_expanded * x_tile, axis=2)
         ct.store(gh, index=(pid, 0), tile=gh_acc.astype(gh.dtype))
 
-    def _h_agg_autotune_configs(sb, C):
-        """Generate autotune search space for h_aggregate kernels."""
-        for tile_m in (1, 2, 4, 8):
-            for tile_c in (32, 64, 128, 256, 512, 1024):
-                if tile_m <= sb and tile_c <= C:
-                    yield {"TILE_M": tile_m, "TILE_C": tile_c}
-
-    _h_agg_fwd_best_cfg: dict = {}
-    _h_agg_bwd_best_cfg: dict = {}
-
     def _cutile_h_aggregate_fwd(x: Tensor, h_pre: Tensor) -> Tensor:
         s, b, n, C = x.shape
         sb = s * b
@@ -976,14 +987,8 @@ if _CUTILE_AVAILABLE:
         x_flat = x.view(sb, n, C)
         h_flat = h_pre.view(sb, n)
 
-        cache_key = (sb, n, C)
-        cached = _h_agg_fwd_best_cfg.get(cache_key)
-
         # Autotune disabled — causes cudaErrorLaunchFailure during training.
-        if cached is not None:
-            tm, tc = cached
-        else:
-            tm, tc = math.gcd(sb, 4), math.gcd(C, 1024)
+        tm, tc = math.gcd(sb, 4), math.gcd(C, 1024)
         ct.launch(
             stream, (math.ceil(sb / tm),), _ct_h_agg_fwd_kernel, (x_flat, h_flat, out, n, tm, tc)
         )
@@ -1002,14 +1007,8 @@ if _CUTILE_AVAILABLE:
         x_flat = x.view(sb, n, C)
         h_flat = h_pre.view(sb, n)
 
-        cache_key = (sb, n, C)
-        cached = _h_agg_bwd_best_cfg.get(cache_key)
-
         # Autotune disabled — causes cudaErrorLaunchFailure during training.
-        if cached is not None:
-            tm, tc = cached
-        else:
-            tm, tc = math.gcd(sb, 4), math.gcd(C, 1024)
+        tm, tc = math.gcd(sb, 4), math.gcd(C, 1024)
         ct.launch(
             stream,
             (math.ceil(sb / tm),),
@@ -2875,15 +2874,23 @@ def _select_triton_cutile_native(triton_impl) -> str:
     return "native"
 
 
-def _mhc_backend_selection() -> str:
-    """Return a concise description of the selected mHC fused backends."""
+def _mhc_backend_status() -> Tuple[str, bool]:
+    """Return backend description and whether every backend is native."""
     sinkhorn = _select_triton_cutile_native(_get_triton_sinkhorn())
     h_aggregate_fwd = _select_triton_cutile_native(_get_triton_h_aggregate_fwd())
     h_aggregate_bwd = "cutile" if _CUTILE_AVAILABLE else "native"
     h_post_bda_fwd = _select_triton_cutile_native(_get_triton_h_post_bda_fwd())
     h_post_bda_bwd = _select_triton_cutile_native(_get_triton_h_post_bda_bwd())
     proj_rms = "cutile" if _CUTILE_AVAILABLE else "native"
-    return (
+    selected = (
+        sinkhorn,
+        h_aggregate_fwd,
+        h_aggregate_bwd,
+        h_post_bda_fwd,
+        h_post_bda_bwd,
+        proj_rms,
+    )
+    message = (
         f"MHC_FORCE_BACKEND={_MHC_FORCED_BACKEND}; "
         f"sinkhorn={sinkhorn}; "
         f"h_aggregate=fwd:{h_aggregate_fwd},bwd:{h_aggregate_bwd}; "
@@ -2891,16 +2898,27 @@ def _mhc_backend_selection() -> str:
         f"proj_rms={proj_rms}; "
         f"proj_rms_compute_h={proj_rms}"
     )
+    return message, all(backend == "native" for backend in selected)
+
+
+def _mhc_backend_selection() -> str:
+    """Return a concise description of the selected mHC fused backends."""
+    message, _ = _mhc_backend_status()
+    return message
 
 
 def log_fused_mhc_backend_once() -> None:
     """Log the fused mHC backend selection once per process."""
+    _raise_mhc_backend_validation_error()
     global _BACKEND_INFO_LOGGED
     if _BACKEND_INFO_LOGGED:
         return
     _BACKEND_INFO_LOGGED = True
+    backend_selection, all_native = _mhc_backend_status()
     log_single_rank(
-        logger, logging.INFO, f"[mHC] fused backend selection: {_mhc_backend_selection()}"
+        logger,
+        logging.WARNING if all_native else logging.INFO,
+        f"[mHC] fused backend selection: {backend_selection}",
     )
 
 
@@ -2940,6 +2958,7 @@ def _torch_h_aggregate_bwd(grad_output: Tensor, x: Tensor, h_pre: Tensor) -> Tup
     return grad_x.to(dtype=x.dtype), grad_h.to(dtype=h_pre.dtype)
 
 
+@torch.compile
 def _torch_h_post_bda_bwd(
     grad_output: Tensor,
     h_res: Tensor,
@@ -3199,6 +3218,7 @@ class FusedHPostBDA(torch.autograd.Function):
 
 def fused_sinkhorn(input_logits: Tensor, num_iterations: int, eps: float = 1e-6) -> Tensor:
     """Project logits to a doubly stochastic matrix using Triton, cuTile, then torch."""
+    _raise_mhc_backend_validation_error()
     triton_sinkhorn = _get_triton_sinkhorn()
     if triton_sinkhorn is not None:
         return triton_sinkhorn(input_logits, num_iterations, eps)
@@ -3209,6 +3229,7 @@ def fused_sinkhorn(input_logits: Tensor, num_iterations: int, eps: float = 1e-6)
 
 def fused_h_aggregate(x: Tensor, h_pre: Tensor) -> Tensor:
     """Weighted n-stream to 1-stream aggregation using Triton/cuTile/torch."""
+    _raise_mhc_backend_validation_error()
     if _TRITON_AVAILABLE or _CUTILE_AVAILABLE:
         return FusedHAggregate.apply(x, h_pre)
     return native_h_aggregate(x, h_pre)
@@ -3218,6 +3239,7 @@ def fused_h_post_bda(
     h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
 ) -> Tensor:
     """Fused H_res.T @ residual + H_post * (x + bias)."""
+    _raise_mhc_backend_validation_error()
     if _TRITON_AVAILABLE or _CUTILE_AVAILABLE:
         return FusedHPostBDA.apply(h_res, original_residual, h_post, x, bias)
     return native_h_post_bda(h_res, original_residual, h_post, x, bias)
@@ -3225,6 +3247,7 @@ def fused_h_post_bda(
 
 def fused_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tuple[Tensor, Tensor]:
     """Projection + RMS normalization using cuTile, then torch."""
+    _raise_mhc_backend_validation_error()
     if _CUTILE_AVAILABLE:
         return CutileProjRms.apply(x, weight, eps)
     return native_proj_rms(x, weight, eps)
@@ -3241,6 +3264,7 @@ def fused_proj_rms_compute_h(
     eps: float = 1e-6,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     """Projection + RMS norm + compute_h split outputs using cuTile, then torch."""
+    _raise_mhc_backend_validation_error()
     if _CUTILE_AVAILABLE:
         return CutileProjRmsComputeH.apply(
             x, weight, alpha_pre, alpha_post, alpha_res, bias, n, eps
