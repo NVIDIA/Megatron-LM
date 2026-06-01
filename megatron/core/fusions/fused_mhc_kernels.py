@@ -17,6 +17,8 @@ Four fused operations:
 import logging
 import math
 import os
+import shutil
+import subprocess
 from typing import Optional, Tuple
 
 import torch
@@ -62,6 +64,8 @@ def _forced_backend() -> Tuple[str, Optional[Exception]]:
 # ---------------------------------------------------------------------------
 _CUTILE_AVAILABLE = False
 _CUTILE_EXPERIMENTAL_AVAILABLE = False
+_CUTILE_DEVICE_SUPPORT_CACHE: Optional[bool] = None
+_CUTILE_DEVICE_SUPPORT_ERROR: Optional[str] = None
 try:
     import cuda.tile as ct
 
@@ -101,6 +105,11 @@ def _record_mhc_backend_validation_error(error: Exception) -> None:
 def _raise_mhc_backend_validation_error() -> None:
     if _MHC_BACKEND_VALIDATION_ERROR is not None:
         raise _MHC_BACKEND_VALIDATION_ERROR
+    if _MHC_FORCED_BACKEND == "cutile" and not is_cutile_available():
+        raise RuntimeError(
+            "MHC_FORCE_BACKEND=cutile was requested, but cuTile does not support "
+            f"the current device: {_CUTILE_DEVICE_SUPPORT_ERROR}"
+        )
 
 
 if _MHC_FORCED_BACKEND == "native":
@@ -139,7 +148,64 @@ if _env_flag("MHC_DISABLE_CUTILE"):
 
 def is_cutile_available() -> bool:
     """Return True if cuTile fused kernels are enabled."""
-    return _CUTILE_AVAILABLE
+    return _CUTILE_AVAILABLE and _cutile_supports_current_device()
+
+
+def _get_tileiras_path() -> Optional[str]:
+    """Return the tileiras compiler path if it can be found."""
+    tileiras = shutil.which("tileiras")
+    if tileiras is not None:
+        return tileiras
+
+    cuda_home = os.getenv("CUDA_HOME") or os.getenv("CUDA_PATH") or "/usr/local/cuda"
+    candidate = os.path.join(cuda_home, "bin", "tileiras")
+    if os.path.exists(candidate):
+        return candidate
+    return None
+
+
+def _cutile_supports_current_device() -> bool:
+    """Return whether cuTile can compile for the current CUDA device."""
+    global _CUTILE_DEVICE_SUPPORT_CACHE, _CUTILE_DEVICE_SUPPORT_ERROR
+
+    if not _CUTILE_AVAILABLE:
+        return False
+    if _CUTILE_DEVICE_SUPPORT_CACHE is not None:
+        return _CUTILE_DEVICE_SUPPORT_CACHE
+
+    if not torch.cuda.is_available():
+        _CUTILE_DEVICE_SUPPORT_CACHE = True
+        return True
+
+    major, minor = torch.cuda.get_device_capability()
+    arch = f"sm_{major}{minor}"
+    tileiras = _get_tileiras_path()
+    if tileiras is None:
+        _CUTILE_DEVICE_SUPPORT_ERROR = "tileiras compiler was not found"
+        _CUTILE_DEVICE_SUPPORT_CACHE = False
+        return False
+
+    try:
+        result = subprocess.run(
+            [tileiras, "--gpu-name", arch],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        _CUTILE_DEVICE_SUPPORT_ERROR = str(exc)
+        _CUTILE_DEVICE_SUPPORT_CACHE = False
+        return False
+
+    output = f"{result.stdout}\n{result.stderr}"
+    if "Cannot find option named" in output and arch in output:
+        _CUTILE_DEVICE_SUPPORT_ERROR = output.strip().splitlines()[0]
+        _CUTILE_DEVICE_SUPPORT_CACHE = False
+        return False
+
+    _CUTILE_DEVICE_SUPPORT_CACHE = True
+    return True
 
 
 def is_triton_available() -> bool:
@@ -2870,7 +2936,7 @@ _BACKEND_INFO_LOGGED = False
 def _select_triton_cutile_native(triton_impl) -> str:
     if triton_impl is not None:
         return "triton"
-    if _CUTILE_AVAILABLE:
+    if is_cutile_available():
         return "cutile"
     return "native"
 
@@ -2879,10 +2945,10 @@ def _mhc_backend_status() -> Tuple[str, bool]:
     """Return backend description and whether every backend is native."""
     sinkhorn = _select_triton_cutile_native(_get_triton_sinkhorn())
     h_aggregate_fwd = _select_triton_cutile_native(_get_triton_h_aggregate_fwd())
-    h_aggregate_bwd = "cutile" if _CUTILE_AVAILABLE else "native"
+    h_aggregate_bwd = "cutile" if is_cutile_available() else "native"
     h_post_bda_fwd = _select_triton_cutile_native(_get_triton_h_post_bda_fwd())
     h_post_bda_bwd = _select_triton_cutile_native(_get_triton_h_post_bda_bwd())
-    proj_rms = "cutile" if _CUTILE_AVAILABLE else "native"
+    proj_rms = "cutile" if is_cutile_available() else "native"
     selected = (
         sinkhorn,
         h_aggregate_fwd,
@@ -3156,7 +3222,7 @@ class FusedHAggregate(torch.autograd.Function):
         triton_fwd = _get_triton_h_aggregate_fwd()
         if triton_fwd is not None:
             output = triton_fwd(x, h_pre)
-        elif _CUTILE_AVAILABLE:
+        elif is_cutile_available():
             output = _cutile_h_aggregate_fwd(x, h_pre)
         else:
             output = native_h_aggregate(x, h_pre)
@@ -3167,7 +3233,7 @@ class FusedHAggregate(torch.autograd.Function):
     def backward(ctx, grad_output):
         """Run h_aggregate backward using the best available backend."""
         x, h_pre = ctx.saved_tensors
-        if _CUTILE_AVAILABLE:
+        if is_cutile_available():
             return _cutile_h_aggregate_bwd(grad_output, x, h_pre)
         return _torch_h_aggregate_bwd(grad_output, x, h_pre)
 
@@ -3188,7 +3254,7 @@ class FusedHPostBDA(torch.autograd.Function):
         triton_fwd = _get_triton_h_post_bda_fwd()
         if triton_fwd is not None:
             output = triton_fwd(h_res, original_residual, h_post, x, bias)
-        elif _CUTILE_AVAILABLE:
+        elif is_cutile_available():
             output = _cutile_h_post_bda_fwd(h_res, original_residual, h_post, x, bias)
         else:
             output = native_h_post_bda(h_res, original_residual, h_post, x, bias)
@@ -3212,7 +3278,7 @@ class FusedHPostBDA(torch.autograd.Function):
         triton_bwd = _get_triton_h_post_bda_bwd()
         if triton_bwd is not None:
             return triton_bwd(grad_output, h_res, orig_res, h_post, x, bias)
-        if _CUTILE_AVAILABLE:
+        if is_cutile_available():
             return _cutile_h_post_bda_bwd(grad_output, h_res, orig_res, h_post, x, bias)
         return _torch_h_post_bda_bwd(grad_output, h_res, orig_res, h_post, x, bias)
 
@@ -3223,7 +3289,7 @@ def fused_sinkhorn(input_logits: Tensor, num_iterations: int, eps: float = 1e-6)
     triton_sinkhorn = _get_triton_sinkhorn()
     if triton_sinkhorn is not None:
         return triton_sinkhorn(input_logits, num_iterations, eps)
-    if _CUTILE_AVAILABLE:
+    if is_cutile_available():
         return CutileSinkhornKnopp.apply(input_logits, num_iterations, eps)
     return native_sinkhorn(input_logits, num_iterations, eps)
 
@@ -3231,7 +3297,7 @@ def fused_sinkhorn(input_logits: Tensor, num_iterations: int, eps: float = 1e-6)
 def fused_h_aggregate(x: Tensor, h_pre: Tensor) -> Tensor:
     """Weighted n-stream to 1-stream aggregation using Triton/cuTile/torch."""
     _raise_mhc_backend_validation_error()
-    if _TRITON_AVAILABLE or _CUTILE_AVAILABLE:
+    if _TRITON_AVAILABLE or is_cutile_available():
         return FusedHAggregate.apply(x, h_pre)
     return native_h_aggregate(x, h_pre)
 
@@ -3241,7 +3307,7 @@ def fused_h_post_bda(
 ) -> Tensor:
     """Fused H_res.T @ residual + H_post * (x + bias)."""
     _raise_mhc_backend_validation_error()
-    if _TRITON_AVAILABLE or _CUTILE_AVAILABLE:
+    if _TRITON_AVAILABLE or is_cutile_available():
         return FusedHPostBDA.apply(h_res, original_residual, h_post, x, bias)
     return native_h_post_bda(h_res, original_residual, h_post, x, bias)
 
@@ -3249,7 +3315,7 @@ def fused_h_post_bda(
 def fused_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tuple[Tensor, Tensor]:
     """Projection + RMS normalization using cuTile, then torch."""
     _raise_mhc_backend_validation_error()
-    if _CUTILE_AVAILABLE:
+    if is_cutile_available():
         return CutileProjRms.apply(x, weight, eps)
     return native_proj_rms(x, weight, eps)
 
@@ -3266,7 +3332,7 @@ def fused_proj_rms_compute_h(
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     """Projection + RMS norm + compute_h split outputs using cuTile, then torch."""
     _raise_mhc_backend_validation_error()
-    if _CUTILE_AVAILABLE:
+    if is_cutile_available():
         return CutileProjRmsComputeH.apply(
             x, weight, alpha_pre, alpha_post, alpha_res, bias, n, eps
         )

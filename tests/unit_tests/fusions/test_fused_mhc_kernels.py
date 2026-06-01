@@ -23,7 +23,9 @@ from megatron.core.transformer.hyper_connection import (
     native_sinkhorn,
 )
 
-_require_cutile = pytest.mark.skipif(not is_cutile_available(), reason="cuTile not installed")
+_require_cutile = pytest.mark.skipif(
+    not is_cutile_available(), reason="cuTile unavailable for current device"
+)
 _require_triton = pytest.mark.skipif(not is_triton_available(), reason="Triton not installed")
 
 
