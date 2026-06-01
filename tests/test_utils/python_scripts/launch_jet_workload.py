@@ -488,7 +488,7 @@ def main(
             ["\n".join(log_lines) for log_lines in allranks_logs.values()]
         )
         concat_mainrank_log = "\n".join(mainrank_log)
-        if concat_allranks_logs.strip() == "":
+        if concat_allranks_logs.strip() == "" and concat_mainrank_log.strip() == "":
             logger.error("No logs found. Try again.")
             n_attempts += 1
             continue
