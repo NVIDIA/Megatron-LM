@@ -17,34 +17,19 @@ spec:
 
     THRESHOLD_DAYS=28
 
-    # CLEANUP_PATHS: newline-separated scan roots. The recipe descends each
-    # root, deletes files older than THRESHOLD_DAYS, then sweeps empty
-    # directories.
-    # CLEANUP_PROTECT: newline-separated subtrees to prune (skip entirely)
-    # during traversal.
+    # CLEANUP_PATHS: newline-separated base directories. For each base dir,
+    # the recipe deletes immediate child directories whose names match
+    # `weekly-*` or `release-*` and whose mtime is older than
+    # THRESHOLD_DAYS. The pattern match is the safety boundary — nothing
+    # outside those two name prefixes is touched.
     if [[ -z "${{CLEANUP_PATHS:-}}" ]]; then
         echo "CLEANUP_PATHS env var not set; nothing to do."
         exit 0
     fi
 
-    # Use `! -path X ! -path X/*` filters rather than `-prune`: `-delete`
-    # implies `-depth`, and `-depth` makes `-prune` a silent no-op. With
-    # negative-path matching, find still descends into the protected
-    # subtree but never matches any entry inside it.
-    SKIP_ARGS=()
-    if [[ -n "${{CLEANUP_PROTECT:-}}" ]]; then
-        while IFS= read -r protect; do
-            [[ -z "$protect" ]] && continue
-            SKIP_ARGS+=( ! -path "$protect" ! -path "$protect/*" )
-        done <<<"$CLEANUP_PROTECT"
-    fi
-
-    echo "Scan roots:"
+    echo "Base dirs (top-level only):"
     printf '%s\n' "$CLEANUP_PATHS" | sed 's/^/  - /'
-    if [[ -n "${{CLEANUP_PROTECT:-}}" ]]; then
-        echo "Protected subtrees (skipped):"
-        printf '%s\n' "$CLEANUP_PROTECT" | sed 's/^/  - /'
-    fi
+    echo "Match patterns: weekly-* release-*"
     echo "Threshold: $THRESHOLD_DAYS days"
 
     while IFS= read -r path; do
@@ -53,10 +38,11 @@ spec:
             echo "Skipping unsafe or missing path: $path"
             continue
         fi
-        echo "--- Deleting files older than $THRESHOLD_DAYS days under $path ---"
-        find "$path" -mindepth 1 "${{SKIP_ARGS[@]}}" -type f -mtime +$THRESHOLD_DAYS -print -delete 2>/dev/null || true
-        echo "--- Pruning empty directories under $path ---"
-        find "$path" -mindepth 1 "${{SKIP_ARGS[@]}}" -type d -empty -print -delete 2>/dev/null || true
+        echo "--- Deleting weekly-*/release-* dirs older than $THRESHOLD_DAYS days under $path ---"
+        find "$path" -mindepth 1 -maxdepth 1 -type d \
+            \( -name 'weekly-*' -o -name 'release-*' \) \
+            -mtime +$THRESHOLD_DAYS -print0 \
+          | xargs -0 -r rm -rf
     done <<<"$CLEANUP_PATHS"
 
     echo "Cleanup complete."
