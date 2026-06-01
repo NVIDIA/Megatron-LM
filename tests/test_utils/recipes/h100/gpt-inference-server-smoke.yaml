@@ -45,5 +45,5 @@ products:
   - test_case: [gpt_inference_server_smoke_tp1_pp1_dp8_583m]
     products:
       - environment: [dev]
-        scope: [mr]
+        scope: [L1]
         platforms: [dgx_h100]
