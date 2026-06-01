@@ -796,10 +796,11 @@ class TransformerConfig(ModelParallelConfig):
     moe_enable_deepep: bool = False
     """[Experimental] Enable DeepEP for efficient token dispatching and combine in MoE models."""
 
-    moe_flex_dispatcher_backend: Literal['deepep', 'hybridep'] = "deepep"
+    moe_flex_dispatcher_backend: Literal['deepep', 'hybridep', 'ncclep'] = "deepep"
     """[Experimental] The backend to use for flex token dispatcher. The default is "deepep".
-    Options are "deepep" and "hybridep". Currently only "hybridep" backend supports 
-    the MNNVL case."""
+    Options are "deepep", "hybridep", and "ncclep". Currently only "hybridep" backend supports
+    the MNNVL case. "ncclep" uses NVIDIA NCCL Expert Parallelism via TransformerEngine's
+    transformer_engine.pytorch.ep API."""
 
     moe_permute_fusion_into_hybridep: bool = False
     """Fuse token rearrangement ops during token dispatching for HybridEP."""
@@ -865,6 +866,10 @@ class TransformerConfig(ModelParallelConfig):
     moe_hybridep_num_sms_preprocessing: int = 108
     """Number of SMs to use for HybridEP preprocessing (metadata scan kernel)."""
 
+    moe_ncclep_num_sms: int = 0
+    """Number of SMs to use for NCCL EP (the max_num_sms passed to TransformerEngine's
+    ep_bootstrap). 0 lets TransformerEngine/NCCL choose the default."""
+
     moe_mlp_glu_interleave_size: Optional[int] = None
     """When set, GLU activations in the MoE grouped MLP layer will use a
     block interleaved format. Instead of interpreting the input tensor
@@ -874,9 +879,11 @@ class TransformerConfig(ModelParallelConfig):
     advanced fused kernels."""
 
     moe_expert_rank_capacity_factor: Optional[float] = None
-    """moe_expert_rank_capacity_factor (float): The capacity factor for each expert rank. Tokens 
-    exceeding this budget will be dropped. None means no token will be dropped. 
-    The default is None."""
+    """moe_expert_rank_capacity_factor (float): The capacity factor for each expert rank, i.e. the
+    per-rank token budget. None means no token will be dropped. The default is None.
+    With the 'hybridep' backend, tokens exceeding this budget are dropped. With the 'ncclep'
+    backend, exceeding the budget is a hard error (TransformerEngine/NCCL traps) — set it
+    generously."""
 
     ##################
     # Context Parallel
@@ -1457,6 +1464,18 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_pad_expert_input_to_capacity"
                 )
 
+        if self.moe_flex_dispatcher_backend == "ncclep":
+            if self.moe_token_dispatcher_type != "flex":
+                raise ValueError(
+                    "moe_flex_dispatcher_backend='ncclep' requires "
+                    "moe_token_dispatcher_type='flex'."
+                )
+            if self.fp8 or self.fp4:
+                # TODO(ncclep, fp8): low-precision dispatch/combine not yet supported.
+                raise ValueError(
+                    "moe_flex_dispatcher_backend='ncclep' does not yet support FP8/FP4."
+                )
+
         if self.moe_shared_expert_intermediate_size is not None:
             if self.moe_shared_expert_intermediate_size <= 0:
                 raise ValueError(
@@ -1513,15 +1532,18 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.moe_expert_rank_capacity_factor is not None:
-            if not self.use_transformer_engine_op_fuser:
-                raise ValueError(
-                    "moe_expert_rank_capacity_factor requires use_transformer_engine_op_fuser to "
-                    "be enabled."
-                )
-            if self.moe_flex_dispatcher_backend != "hybridep":
+            if self.moe_flex_dispatcher_backend not in ("hybridep", "ncclep"):
                 raise ValueError(
                     "moe_expert_rank_capacity_factor requires moe_flex_dispatcher_backend to be "
-                    "'hybridep'."
+                    "'hybridep' or 'ncclep'."
+                )
+            if (
+                self.moe_flex_dispatcher_backend == "hybridep"
+                and not self.use_transformer_engine_op_fuser
+            ):
+                raise ValueError(
+                    "moe_expert_rank_capacity_factor with the 'hybridep' backend requires "
+                    "use_transformer_engine_op_fuser to be enabled."
                 )
 
         if self.cpu_offloading and (
