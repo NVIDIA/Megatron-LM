@@ -1290,7 +1290,7 @@ class MegatronFSDP(torch.nn.Module):
         """
         Synchronize parameter all-gather operations for all model parameters.
         """
-        self.all_gather_pipeline.reset()
+        self.all_gather_pipeline.reset(preserve_non_fsdp_units=True)
         self._replace_param_with_distributed_if_needed()
 
     def synchronize_gradient_reduce(self):
