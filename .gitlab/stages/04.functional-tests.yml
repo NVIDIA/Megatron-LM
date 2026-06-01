@@ -209,19 +209,21 @@ functional:configure:
     - |
       case "$CLEANUP_PLATFORM" in
         dgx_a100)
-          CLEANUP_CLUSTER=$([[ "$CLUSTER_A100" != "" ]] && echo "$CLUSTER_A100" || echo "$DEFAULT_A100_CLUSTER")
+          GPU_CLUSTER=$([[ "$CLUSTER_A100" != "" ]] && echo "$CLUSTER_A100" || echo "$DEFAULT_A100_CLUSTER")
           ;;
         dgx_h100)
-          CLEANUP_CLUSTER=$([[ "$CLUSTER_H100" != "" ]] && echo "$CLUSTER_H100" || echo "$DEFAULT_H100_CLUSTER")
+          GPU_CLUSTER=$([[ "$CLUSTER_H100" != "" ]] && echo "$CLUSTER_H100" || echo "$DEFAULT_H100_CLUSTER")
           ;;
         dgx_gb200)
-          CLEANUP_CLUSTER=$([[ "$CLUSTER_GB200" != "" ]] && echo "$CLUSTER_GB200" || echo "$DEFAULT_GB200_CLUSTER")
+          GPU_CLUSTER=$([[ "$CLUSTER_GB200" != "" ]] && echo "$CLUSTER_GB200" || echo "$DEFAULT_GB200_CLUSTER")
           ;;
         *)
           echo "Unknown CLEANUP_PLATFORM: $CLEANUP_PLATFORM"
           exit 1
           ;;
       esac
+    - CLEANUP_CLUSTER="cpu_${GPU_CLUSTER}"
+    - echo "Cleanup target = $CLEANUP_CLUSTER (CPU partition of $GPU_CLUSTER)"
     - export PYTHONPATH=$(pwd)
     - export RO_API_TOKEN=${PAT}
     - |
