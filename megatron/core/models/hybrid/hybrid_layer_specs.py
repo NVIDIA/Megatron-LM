@@ -354,16 +354,14 @@ def hybrid_dsv4_stack_spec(config):
         return ModuleSpec(
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
-                input_layernorm=TENorm,
-                self_attention=attn,
-                self_attn_bda=get_bias_dropout_add,
+                input_layernorm=TENorm, self_attention=attn, self_attn_bda=get_bias_dropout_add
             ),
         )
 
     submodules = dataclasses.replace(
         hybrid_stack_spec.submodules,
-        dsa_layer=_wrap_dsv4_layer(),            # 'D': array-driven (or window) DSv4 attention
-        csa_layer=_wrap_dsv4_layer(compress_ratio=4),    # 'C': CSA
+        dsa_layer=_wrap_dsv4_layer(),  # 'D': array-driven (or window) DSv4 attention
+        csa_layer=_wrap_dsv4_layer(compress_ratio=4),  # 'C': CSA
         hca_layer=_wrap_dsv4_layer(compress_ratio=128),  # 'H': HCA
     )
     return ModuleSpec(module=HybridStack, submodules=submodules)
