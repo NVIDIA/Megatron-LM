@@ -16,16 +16,19 @@ spec:
     set -euo pipefail
 
     THRESHOLD_DAYS=14
-    ASSETS_PARENT=$(dirname "{assets_dir}")
-    ARTIFACTS_PARENT=$(dirname "{artifacts_dir}")
+    CLEANUP_PATHS=(
+        /lustre/fsw/coreai_dlalgo_mcore/release-testing
+        /lustre/fsw/coreai_dlalgo_mcore/mcore_ci
+    )
 
     echo "[DRY-RUN] Entries older than $THRESHOLD_DAYS days under:"
-    echo "  - $ASSETS_PARENT"
-    echo "  - $ARTIFACTS_PARENT"
+    for path in "${{CLEANUP_PATHS[@]}}"; do
+        echo "  - $path"
+    done
 
-    for path in "$ASSETS_PARENT" "$ARTIFACTS_PARENT"; do
-        if [[ -z "$path" || "$path" == "/" || ! -d "$path" ]]; then
-            echo "Skipping invalid path: '$path'"
+    for path in "${{CLEANUP_PATHS[@]}}"; do
+        if [[ ! -d "$path" ]]; then
+            echo "Skipping (not a directory on this cluster): $path"
             continue
         fi
         echo "--- Would delete from $path ---"
