@@ -119,11 +119,7 @@ def test_assign_reviewer_requests_oncall_when_needed(oncall_manager, monkeypatch
     assert fake_requests.posts == [
         {
             "url": "https://api.github.com/repos/NVIDIA/Megatron-LM/pulls/123/requested_reviewers",
-            "headers": {
-                "Authorization": "token token",
-                "Accept": "application/vnd.github.v3+json",
-            },
+            "headers": {"Authorization": "token token", "Accept": "application/vnd.github.v3+json"},
             "json": {"team_reviewers": ["mcore-oncall"]},
         }
     ]
-
