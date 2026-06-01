@@ -370,8 +370,8 @@ class TransformerConfig(ModelParallelConfig):
     linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
 
-    use_fused_pre_gated_delta_rule: bool = False
-    """Use the placeholder fused pre-gated-delta-rule path in GatedDeltaNet."""
+    pre_gated_delta_rule_impl: Literal["unfused", "fused_streamed", "fused_mega"] = "unfused"
+    """Pre-gated-delta-rule implementation for GatedDeltaNet."""
 
     ####################
     # initialization
@@ -1392,6 +1392,21 @@ class TransformerConfig(ModelParallelConfig):
             )
             self.experimental_attention_variant = self.linear_attention_type
             self.linear_attention_type = None
+
+        valid_pre_gdr_impls = ("unfused", "fused_streamed", "fused_mega")
+        if self.pre_gated_delta_rule_impl not in valid_pre_gdr_impls:
+            raise ValueError(
+                "pre_gated_delta_rule_impl must be one of "
+                f"{valid_pre_gdr_impls}, got {self.pre_gated_delta_rule_impl!r}."
+            )
+        if (
+            self.pre_gated_delta_rule_impl != "unfused"
+            and self.experimental_attention_variant != "gated_delta_net"
+        ):
+            raise ValueError(
+                "pre_gated_delta_rule_impl can select a fused path only when "
+                "experimental_attention_variant='gated_delta_net'."
+            )
 
         if self.experimental_attention_variant in ["gated_delta_net"]:
             assert (

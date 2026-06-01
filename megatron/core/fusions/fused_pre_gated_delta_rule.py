@@ -2070,7 +2070,7 @@ class _FusedPreGatedDeltaRuleFunction(torch.autograd.Function):
         )
 
 
-def fused_pre_gated_delta_rule(
+def fused_streamed_pre_gated_delta_rule(
     qkvzba: Tensor,
     conv1d_weight: Tensor,
     conv1d_bias: Optional[Tensor],
@@ -2085,7 +2085,7 @@ def fused_pre_gated_delta_rule(
     cu_seqlens: Optional[Tensor] = None,
     seq_idx: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-    """Fused pre-gated-delta-rule entry point.
+    """Streamed fused pre-gated-delta-rule entry point.
 
     Args:
         qkvzba: ``[seq_len, batch, in_proj_dim]`` projection output. Must be
@@ -2174,3 +2174,6 @@ def fused_pre_gated_delta_rule(
         key_head_dim,
         value_head_dim,
     )
+
+
+fused_pre_gated_delta_rule = fused_streamed_pre_gated_delta_rule
