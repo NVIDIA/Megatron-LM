@@ -613,13 +613,19 @@ class TEGroupedMLP(MegatronModule):
         offload_expert_fc1 = getattr(self, "offload_expert_fc1", False)
         offload_moe_act = getattr(self, "offload_moe_act", False)
         fine_grained_activation_offloading = offload_expert_fc1 or offload_moe_act
-        offload_name = "_".join(
-            name
-            for name, enabled in (("expert_fc1", offload_expert_fc1), ("moe_act", offload_moe_act))
-            if enabled
-        )
+        if offload_expert_fc1 and offload_moe_act:
+            offload_name = "grouped_mlp"
+        elif offload_expert_fc1:
+            offload_name = "expert_fc1"
+        elif offload_moe_act:
+            offload_name = "moe_act"
+        else:
+            offload_name = ""
         with off_interface(
-            fine_grained_activation_offloading, permuted_local_hidden_states, offload_name
+            fine_grained_activation_offloading,
+            permuted_local_hidden_states,
+            offload_name,
+            use_cpu_pool=False,
         ) as permuted_local_hidden_states:
             forced_released_tensors = [permuted_local_hidden_states] if offload_expert_fc1 else []
             with stash_context:

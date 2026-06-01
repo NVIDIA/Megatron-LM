@@ -150,11 +150,32 @@ def test_make_fused_ops_reuses_grouped_linear_weights_on_meta_device(monkeypatch
     assert hasattr(ops, "forward_pre_hook")
 
 
-def test_fused_forward_caches_ops_and_forwards_expected_arguments():
+def test_fused_forward_caches_ops_and_forwards_expected_arguments(monkeypatch):
     class FakeFusedOps:
         def __call__(self, hidden_states, fc1_tokens, probs, fc2_tokens):
             self.args = (hidden_states, fc1_tokens, probs, fc2_tokens)
             return hidden_states + 1
+
+    class FakeOffloadInterface:
+        enter_calls = []
+        commit_calls = []
+
+        def __init__(self, offload, tensor, name, use_cpu_pool=None):
+            self.tensor = tensor
+            self.enter_calls.append((offload, tensor, name, use_cpu_pool))
+
+        def __enter__(self):
+            return self.tensor
+
+        def __exit__(self, *args):
+            return None
+
+        @staticmethod
+        def group_commit(tensor, name, forced_released_tensors=None, delay_offload=False):
+            FakeOffloadInterface.commit_calls.append(
+                (tensor, name, forced_released_tensors, delay_offload)
+            )
+            return tensor
 
     module = TEGroupedMLP.__new__(TEGroupedMLP)
     # `_fused_forward` calls `skip_routed_expert_padding(config)` (added by PR 4071), which
@@ -171,9 +192,13 @@ def test_fused_forward_caches_ops_and_forwards_expected_arguments():
     module._fused_ops = None
     fused_ops = FakeFusedOps()
     module._make_fused_ops = lambda: fused_ops
+    module.offload_expert_fc1 = True
+    module.offload_moe_act = True
+    module.activation_recompute = False
     hidden_states = torch.zeros(2, 4)
     tokens_per_expert = torch.tensor([1, 1])
     probs = torch.ones(2)
+    monkeypatch.setattr(experts_module, "off_interface", FakeOffloadInterface)
 
     output = module._fused_forward(hidden_states, tokens_per_expert, probs)
 
@@ -183,6 +208,21 @@ def test_fused_forward_caches_ops_and_forwards_expected_arguments():
     assert fused_ops.args[1] is tokens_per_expert
     assert fused_ops.args[2] is probs
     assert fused_ops.args[3] is tokens_per_expert
+    assert len(FakeOffloadInterface.enter_calls) == 1
+    offload, tensor, name, use_cpu_pool = FakeOffloadInterface.enter_calls[0]
+    assert offload is True
+    assert tensor is hidden_states
+    assert name == "grouped_mlp"
+    assert use_cpu_pool is False
+    assert len(FakeOffloadInterface.commit_calls) == 1
+    committed_tensor, name, forced_released_tensors, delay_offload = (
+        FakeOffloadInterface.commit_calls[0]
+    )
+    assert committed_tensor is output
+    assert name == "grouped_mlp"
+    assert len(forced_released_tensors) == 1
+    assert forced_released_tensors[0] is hidden_states
+    assert delay_offload is False
 
 
 def test_apply_bias_returns_input_unchanged_when_bias_is_none():

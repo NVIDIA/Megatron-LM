@@ -334,7 +334,7 @@ class OffloadTensorGroup:
     A group of tensors to be offloaded together.
     """
 
-    def __init__(self, name):
+    def __init__(self, name, use_cpu_pool: Optional[bool] = None):
         self._name = name
         self._tensors = {}
         self._offload_event = torch.cuda.Event()
@@ -342,13 +342,11 @@ class OffloadTensorGroup:
         self.offload = True
         self.total_offload_bytes = 0
         self.total_tensor_count = 0
-        # Using memory pool is for the compatibility with cuda graph.
-        # Shapes of tensors for expert_fc1 and moe_act are not known in advance,
-        # so we do not use CPU pool for them.
-        if name in ("expert_fc1", "moe_act", "expert_fc1_moe_act"):
-            self.use_cpu_pool = False
-        else:
-            self.use_cpu_pool = True
+        # Using memory pool is for the compatibility with cuda graph. Shapes of tensors for
+        # expert_fc1 and moe_act are not known in advance, so do not use CPU pool for them.
+        if use_cpu_pool is None:
+            use_cpu_pool = name not in ("expert_fc1", "moe_act")
+        self.use_cpu_pool = use_cpu_pool
 
     def push_tensor(self, tag, tensor):
         """Push a tensor to the group."""
@@ -1060,7 +1058,7 @@ class ChunkOffloadHandler:
                     self._reloading_group.remove(reloading_group)
                     break
 
-    def on_group_start_forward(self, name):
+    def on_group_start_forward(self, name, use_cpu_pool: Optional[bool] = None):
         """
         Called at the start of a layer group's forward pass.
         Increments group index and prepares for offloading.
@@ -1070,7 +1068,7 @@ class ChunkOffloadHandler:
         debug_rank(f"--on_group_start_forward {name}")
         self._offloaded_group_index = self._offloaded_group_index + 1
         if self.is_warmup:
-            self.offload_groups.append(OffloadTensorGroup(name))
+            self.offload_groups.append(OffloadTensorGroup(name, use_cpu_pool=use_cpu_pool))
             self._max_group_size = max(self._max_group_size, self._offloaded_group_index)
             debug_rank(f"max group size {self._max_group_size}")
         else:
@@ -1194,12 +1192,12 @@ class FineGrainedOffloadingGroupStartFunction(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, tensor, cpu_offload_handler, name):
+    def forward(ctx, tensor, cpu_offload_handler, name, use_cpu_pool):
         # pylint: disable=missing-function-docstring
         ctx.cpu_offload_handler = cpu_offload_handler
         debug_rank("FineGrainedOffloadingGroupStartFunction forward")
 
-        cpu_offload_handler.on_group_start_forward(name)
+        cpu_offload_handler.on_group_start_forward(name, use_cpu_pool=use_cpu_pool)
         # return the identical tensor
         return tensor
 
@@ -1212,12 +1210,14 @@ class FineGrainedOffloadingGroupStartFunction(torch.autograd.Function):
         return grad_output, None, None, None
 
 
-def fine_grained_offloading_group_start(tensor, name=None):
+def fine_grained_offloading_group_start(tensor, name=None, use_cpu_pool: Optional[bool] = None):
     """Mark the start of a layer group and prepare for offload/reload."""
     cur_forward_chunk = PipelineOffloadManager.get_instance().pop_forward_chunk(name=name)
     if cur_forward_chunk is None:
         return tensor
-    return FineGrainedOffloadingGroupStartFunction.apply(tensor, cur_forward_chunk, name)
+    return FineGrainedOffloadingGroupStartFunction.apply(
+        tensor, cur_forward_chunk, name, use_cpu_pool
+    )
 
 
 def fine_grained_offloading_forward_record(event: torch.cuda.Event) -> None:
@@ -1256,15 +1256,20 @@ def fine_grained_offloading_backward_record(tensor, event: torch.cuda.Event) -> 
 class FineGrainedActivationOffloadingInterface:
     """Interface for fine-grained activation offloading."""
 
-    def __init__(self, offload: bool, tensor: torch.Tensor, name: str):
+    def __init__(
+        self, offload: bool, tensor: torch.Tensor, name: str, use_cpu_pool: Optional[bool] = None
+    ):
         self.offload = offload
         self.tensor = tensor
         self.name = name
+        self.use_cpu_pool = use_cpu_pool
 
     def __enter__(self):
         """Enter context manager to enable activation offloading hooks."""
         if self.offload:
-            self.tensor = fine_grained_offloading_group_start(self.tensor, self.name)
+            self.tensor = fine_grained_offloading_group_start(
+                self.tensor, self.name, self.use_cpu_pool
+            )
             PipelineOffloadManager.get_instance().__enter__()
         return self.tensor
 
