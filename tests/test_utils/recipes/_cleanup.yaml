@@ -19,7 +19,7 @@ spec:
     ASSETS_PARENT=$(dirname "{assets_dir}")
     ARTIFACTS_PARENT=$(dirname "{artifacts_dir}")
 
-    echo "Removing entries older than $THRESHOLD_DAYS days under:"
+    echo "[DRY-RUN] Entries older than $THRESHOLD_DAYS days under:"
     echo "  - $ASSETS_PARENT"
     echo "  - $ARTIFACTS_PARENT"
 
@@ -28,14 +28,12 @@ spec:
             echo "Skipping invalid path: '$path'"
             continue
         fi
-        echo "--- Candidates in $path ---"
+        echo "--- Would delete from $path ---"
         find "$path" -mindepth 1 -maxdepth 1 -mtime +$THRESHOLD_DAYS -print 2>/dev/null || true
-        echo "--- Deleting ---"
-        find "$path" -mindepth 1 -maxdepth 1 -mtime +$THRESHOLD_DAYS -print0 2>/dev/null \
-            | xargs -0 -r rm -rf 2>/dev/null || true
+        echo "--- (dry-run: no deletion) ---"
     done
 
-    echo "Cleanup complete."
+    echo "Dry-run complete; no files removed."
 
 products:
   - test_case: [cleanup_old_artifacts]
