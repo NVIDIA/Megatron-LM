@@ -53,13 +53,7 @@ LOGPROBS_TAR_MEMBER_RE = re.compile(
     rf"^(?P<iter>\d+){re.escape(LOGPROBS_TAR_MEMBER_SUFFIX)}$"
 )
 
-_MSC_OPEN_KWARGS = {
-    "attributes",
-    "check_source_version",
-    "disable_read_cache",
-    "memory_load_limit",
-    "prefetch_file",
-}
+# Cache to not have to re-run the glob operation for the same pattern, which is expensive for MSC.
 _STORAGE_GLOB_CACHE: dict[str, List[str]] = {}
 
 
@@ -119,7 +113,7 @@ def storage_glob(pattern: str) -> List[str]:
     return glob.glob(pattern)
 
 
-def storage_glob_rank0(pattern: str, cached: bool = False) -> List[str]:
+def _storage_glob_rank0(pattern: str, cached: bool = False) -> List[str]:
     """Run ``storage_glob`` on rank 0 and broadcast the result."""
     if cached:
         if (paths := _STORAGE_GLOB_CACHE.get(pattern)) is not None:
@@ -137,22 +131,16 @@ def storage_glob_rank0(pattern: str, cached: bool = False) -> List[str]:
     return paths
 
 
-def storage_glob_from_listing(
-    root: str,
-    name_pattern: str,
-    listing: Optional[Sequence[str]] = None,
-    cached: bool = True,
-) -> List[str]:
-    """Glob under *root*, or filter a precomputed listing by basename."""
-    if listing is None:
-        if not is_remote_storage_path(root):
-            return storage_glob(os.path.join(root, name_pattern))
-        if get_worker_info() is not None:
-            raise RuntimeError(
-                "Remote cached-logits shard listing must run in the main "
-                "training process, not a DataLoader worker."
-            )
-        listing = storage_glob_rank0(os.path.join(root, "*.tar"), cached=cached)
+def storage_glob_with_caching(root: str, name_pattern: str, cached: bool = True) -> List[str]:
+    """Glob under *root* and filter the result by basename."""
+    if not is_remote_storage_path(root):
+        return storage_glob(os.path.join(root, name_pattern))
+    if get_worker_info() is not None:
+        raise RuntimeError(
+            "Remote cached-logits shard listing must run in the main "
+            "training process, not a DataLoader worker."
+        )
+    listing = _storage_glob_rank0(os.path.join(root, "*.tar"), cached=cached)
 
     return [
         str(path)
@@ -266,7 +254,14 @@ def open_logit_file(path: str, mode: str = "rb", **kwargs):
     if msc is not None:
         return msc.open(path, mode, **kwargs)
 
-    local_kwargs = {k: v for k, v in kwargs.items() if k not in _MSC_OPEN_KWARGS}
+    msc_open_kwargs = {
+        "attributes",
+        "check_source_version",
+        "disable_read_cache",
+        "memory_load_limit",
+        "prefetch_file",
+    }
+    local_kwargs = {k: v for k, v in kwargs.items() if k not in msc_open_kwargs}
     return open(path, mode, **local_kwargs)
 
 
@@ -353,9 +348,7 @@ def iter_logprobs_tar_entries(
         )
 
 
-def decode_logprobs_payload(
-    data: bytes,
-) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+def decode_logprobs_payload(data: bytes) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     """Decode one zstd-compressed cached-logits payload."""
     data = zstandard.ZstdDecompressor().decompress(data)
     tensors = torch.load(io.BytesIO(data), weights_only=True)
@@ -366,13 +359,10 @@ def decode_logprobs_payload(
     return tensors["values"], indices_list
 
 
-def detect_saved_dp_size(
-    logprobs_dir: str,
-    tar_paths: Optional[Sequence[str]] = None,
-) -> Optional[int]:
+def detect_saved_dp_size(logprobs_dir: str) -> Optional[int]:
     """Scan *logprobs_dir* for batched tars and return the saved DP world size."""
     dp_ranks_found: set[int] = set()
-    for path in storage_glob_from_listing(logprobs_dir, "*.tar", tar_paths):
+    for path in storage_glob_with_caching(logprobs_dir, "*.tar"):
         fname = storage_basename(path)
         if match := BATCHED_TAR_RE.match(fname):
             dp_ranks_found.add(int(match.group("dp")))
@@ -458,9 +448,7 @@ class TarShardPrefetcher:
         for url in urls:
             self.wait(url)
 
-    def iter_prefetched(
-        self, groups: Iterable[Sequence[str]]
-    ) -> Iterator[Tuple[str, ...]]:
+    def iter_prefetched(self, groups: Iterable[Sequence[str]]) -> Iterator[Tuple[str, ...]]:
         """Yield URL groups, waiting only when a prefetched group is not ready."""
         group_list = [tuple(group) for group in groups]
         if not self.enabled:

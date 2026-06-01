@@ -59,7 +59,7 @@ Usage example
 import concurrent.futures
 import logging
 from collections import deque
-from typing import Any, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Iterator, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -81,7 +81,7 @@ from megatron.training.distillation.utils_logits import (
   iter_logprobs_tar_entries,
   is_remote_storage_path,
   storage_basename,
-  storage_glob_from_listing,
+  storage_glob_with_caching,
   sorted_batched_tars,
 )
 
@@ -146,7 +146,6 @@ def _compute_dp_remapping(
     logprobs_dir: str,
     dp_rank: int,
     dp_size: int,
-    tar_paths: Optional[Sequence[str]] = None,
 ) -> Tuple[List[int], int, int, int]:
     """Compute the DP rank remapping when loading data saved with a different DP size.
 
@@ -181,7 +180,7 @@ def _compute_dp_remapping(
         - *dp_size_saved* is the DP world size used when the data was
           written.
     """
-    dp_size_saved = detect_saved_dp_size(logprobs_dir, tar_paths)
+    dp_size_saved = detect_saved_dp_size(logprobs_dir)
 
     if dp_size_saved is None:
         return [dp_rank], 0, 1, dp_size
@@ -249,13 +248,11 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
         decode_threads: int = 1,
         decode_lookahead: Optional[int] = None,
         msc_prefetch_depth: int = 2,
-        tar_paths: Optional[Sequence[str]] = None,
     ):
         self.logprobs_dir = logprobs_dir
         self.cp_rank = cp_rank
         self.dp_rank = dp_rank
         self.start_iteration = start_iteration
-        self._tar_paths = list(tar_paths) if tar_paths is not None else None
 
         self._remote_logprobs = is_remote_storage_path(logprobs_dir)
         self._msc_prefetch_depth = max(0, msc_prefetch_depth)
@@ -281,7 +278,7 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
 
         # DP remapping: detect saved DP size and compute mapping
         self._source_dp_ranks, self._sub_rank, self._dp_ratio, dp_size_saved = (
-            _compute_dp_remapping(logprobs_dir, dp_rank, dp_size, self._tar_paths)
+            _compute_dp_remapping(logprobs_dir, dp_rank, dp_size)
         )
         if len(self._source_dp_ranks) > 1:
             print_rank_0(
@@ -305,11 +302,7 @@ class TeacherTarDataset(torch.utils.data.IterableDataset):
         """
         prefix = batched_tar_prefix(self.cp_rank, dp_rank)
         all_urls = sorted_batched_tars(
-            storage_glob_from_listing(
-                self.logprobs_dir,
-                f"{prefix}*.tar",
-                cached=False,
-            )
+            storage_glob_with_caching(self.logprobs_dir, f"{prefix}*.tar", cached=False)
         )
         new_urls = []
         for url in all_urls:
@@ -672,10 +665,6 @@ class CachedLogitsKDLoss:
         self.dp_rank = parallel_state.get_data_parallel_rank()
         self.dp_size = parallel_state.get_data_parallel_world_size()
 
-        # Startup-only snapshot used for DP remapping. Runtime shard discovery
-        # refreshes separately so concurrent writers can publish new tar files.
-        self._tar_paths = storage_glob_from_listing(self.logprobs_dir, "*.tar")
-
         # ---- DataLoader (lazy-initialised on first call) ----
         self._dataloader_iter: Optional[Iterator] = None
 
@@ -701,7 +690,6 @@ class CachedLogitsKDLoss:
             start_iteration=start_iteration,
             decode_threads=self._decode_threads,
             msc_prefetch_depth=self._msc_prefetch_depth,
-            tar_paths=self._tar_paths,
         )
         # Remote shard discovery uses rank-0 collectives, so it must run in the
         # main training process rather than a DataLoader worker.

@@ -3393,8 +3393,7 @@ def _add_logits_distillation_args(parser):
                        help='Top-P (nucleus) threshold applied after top-K '
                             'selection when saving logits. Only the smallest '
                             'set of entries whose cumulative probability mass '
-                            'reaches this threshold is kept; the rest are '
-                            'masked with sentinels. Must be in (0, 1].')
+                            'reaches this threshold is kept. Must be in (0, 1].')
     group.add_argument('--logits-save-top-p-min-k', type=int, default=1,
                        help='Minimum number of entries kept per token when '
                             'top-P masking is active, regardless of '
@@ -3414,20 +3413,20 @@ def _add_logits_distillation_args(parser):
     group.add_argument('--logits-load-decode-threads', type=int, default=4,
                        help='Number of decode threads for cached-logits zstd '
                             'decompression and torch.load processing.')
-    group.add_argument('--logits-load-prefetch-factor', type=int, default=4,
+    group.add_argument('--logits-load-prefetch-factor', type=int, default=3,
                        help='PyTorch DataLoader prefetch factor for decoded '
-                            'cached-logits iterations.')
+                            'cached-logits iterations. (Non-MSC only)')
     group.add_argument('--logits-load-msc-prefetch-depth', type=int, default=2,
                        help='For MSC/object-storage logits tar shards, number '
                             'of whole tar shards to prefetch into the MSC '
                             'cache ahead of sequential tar consumption.')
-    group.add_argument('--logits-load-kd-loss-alpha', type=float, default=0.65,
-                       help='KD loss alpha for loading logits.')
+    group.add_argument('--logits-load-kd-loss-alpha', type=float, default=1.0,
+                       help='KD loss alpha for loading logits. Total loss is calculated as '
+                            'alpha * kd_loss + (1 - alpha) * lm_loss.')
     group.add_argument('--logits-load-ignore-errors', action='store_true',
                        default=False,
-                       help='When set, KD loss errors are logged as warnings '
-                            'and training falls back to LM-only loss instead '
-                            'of crashing.')
+                       help='When set, KD loss errors are logged as warnings and '
+                            'training falls back to LM-only loss instead of crashing.')
     return parser
 
 
