@@ -798,9 +798,7 @@ class TestMimoModelFanoutHelpers:
         return SimpleNamespace(
             language_model_spec=SimpleNamespace(params={'config': language_config}),
             modality_submodules_spec={
-                "images": SimpleNamespace(
-                    params={} if modality_params is None else modality_params
-                )
+                "images": SimpleNamespace(params={} if modality_params is None else modality_params)
             },
         )
 
@@ -830,9 +828,7 @@ class TestMimoModelFanoutHelpers:
         monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
         model = MimoModel.__new__(MimoModel)
         model.mimo_config = self._stub_mimo_config(
-            hidden_size=8,
-            language_dtype=torch.bfloat16,
-            modality_params={},
+            hidden_size=8, language_dtype=torch.bfloat16, modality_params={}
         )
 
         output = model._empty_encoder_output("images")
@@ -846,9 +842,7 @@ class TestMimoModelFanoutHelpers:
         monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
         model = MimoModel.__new__(MimoModel)
         model.mimo_config = self._stub_mimo_config(
-            hidden_size=8,
-            include_language_dtype=False,
-            modality_params={},
+            hidden_size=8, include_language_dtype=False, modality_params={}
         )
 
         output = model._empty_encoder_output("images")
