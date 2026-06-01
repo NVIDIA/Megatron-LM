@@ -1,0 +1,45 @@
+type: basic
+format_version: 1
+maintainers: [mcore]
+loggers: [stdout]
+spec:
+  name: '{test_case}_{platforms}'
+  model: cleanup
+  build: mcore-pyt-{environment}
+  nodes: 1
+  gpus: 0
+  n_repeat: 1
+  platforms: dgx_h100
+  script_setup: |
+    echo "Cleanup workload — no setup required."
+  script: |-
+    set -euo pipefail
+
+    THRESHOLD_DAYS=14
+    ASSETS_PARENT=$(dirname "{assets_dir}")
+    ARTIFACTS_PARENT=$(dirname "{artifacts_dir}")
+
+    echo "Removing entries older than $THRESHOLD_DAYS days under:"
+    echo "  - $ASSETS_PARENT"
+    echo "  - $ARTIFACTS_PARENT"
+
+    for path in "$ASSETS_PARENT" "$ARTIFACTS_PARENT"; do
+        if [[ -z "$path" || "$path" == "/" || ! -d "$path" ]]; then
+            echo "Skipping invalid path: '$path'"
+            continue
+        fi
+        echo "--- Candidates in $path ---"
+        find "$path" -mindepth 1 -maxdepth 1 -mtime +$THRESHOLD_DAYS -print 2>/dev/null || true
+        echo "--- Deleting ---"
+        find "$path" -mindepth 1 -maxdepth 1 -mtime +$THRESHOLD_DAYS -print0 2>/dev/null \
+            | xargs -0 -r rm -rf 2>/dev/null || true
+    done
+
+    echo "Cleanup complete."
+
+products:
+  - test_case: [cleanup_old_artifacts]
+    products:
+      - environment: [dev]
+        scope: [cleanup]
+        platforms: [dgx_a100, dgx_h100, dgx_gb200]
