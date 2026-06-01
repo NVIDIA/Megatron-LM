@@ -20,18 +20,35 @@ ALLOWED_CADENCE_VALUES = set(DEFAULT_CADENCE) | {"weekly"}
 # trigger, a default cadence. The tier acts purely as a suite/cost label;
 # cadence remains the trigger axis.
 #
-# Both GitHub-side (`mr-github`, `mr-github-slim`) and GitLab-side (`mr`) legacy
-# scope names are aliased onto the unified L-tier vocabulary so a single recipe
-# row tagged `scope: [L1]` is matched by GitHub's `--scope L1` filter (legacy
-# `mr-github`). GitLab's broader `mr` suite maps to `L2` via this alias.
-# GitLab-only `mr-slim` is intentionally not aliased so it does not bleed into
-# the GitHub L0 matrix (L0 is `mr-github-slim` only).
+# All legacy `scope` names (both GitHub-side `mr-github*` and GitLab-side
+# `mr*`) are aliased onto the unified L-tier vocabulary so legacy callers and
+# scheduled pipelines keep working: a `--scope mr-github` filter and a recipe
+# row tagged `scope: [L1]` match the same tier. At the recipe-row level a
+# literal `mr` tag means a GitLab-only extra and resolves to the single tier
+# `L2`; as a *filter*, `mr` is the whole MR suite `{L1, L2}` — see
+# `SCOPE_FILTER_SUITES` below. The slim PR sets (`mr-slim`, `mr-github-slim`)
+# both map to `L0`.
 LEGACY_SCOPE_ALIASES = {
+    "mr-slim": ("L0", None),
     "mr-github-slim": ("L0", None),
     "mr-github": ("L1", None),
     "mr": ("L2", None),
     "nightly": ("L3", ["nightly"]),
     "weekly": ("L4", ["weekly"]),
+}
+
+# Filter-only aliases: a single `--scope` token that expands to a *set* of
+# tiers. Unlike `LEGACY_SCOPE_ALIASES` (which maps a recipe-row tag to one
+# tier), these describe named *suites* spanning multiple tiers.
+#
+# `mr` is the GitLab Merge-Request functional suite, which is the union of the
+# GitHub PR tier (`L1`) and the GitLab-only extras tier (`L2`) — equivalent to
+# passing `--scope L1,L2`. This keeps external/scheduled pipelines that still
+# pass the bare `mr` string running the full MR footprint rather than the L2
+# slice alone. (On GB200 the GitLab stage narrows this back to `L2` to preserve
+# the historical GB200 MR matrix; see .gitlab/stages/04.functional-tests.yml.)
+SCOPE_FILTER_SUITES = {
+    "mr": {"L1", "L2"},
 }
 
 
@@ -50,11 +67,20 @@ def _resolve_scope_filter(scope: str) -> Set[str]:
     """Resolve a `--scope` filter to the set of L-tier names to match.
 
     Supports comma-separated tiers, e.g. ``--scope L1,L2`` for the full GitLab
-    MR suite (GitHub L1 + GitLab-only L2 rows). Each token is legacy-aliased.
+    MR suite (GitHub L1 + GitLab-only L2 rows). Each token is first checked
+    against the multi-tier suite aliases (`SCOPE_FILTER_SUITES`, e.g. ``mr`` ->
+    {L1, L2}), then legacy-aliased to a single tier.
     """
-    if "," not in scope:
-        return {_resolve_scope_alias(scope)}
-    return {_resolve_scope_alias(part.strip()) for part in scope.split(",") if part.strip()}
+    tiers: Set[str] = set()
+    for part in scope.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if part in SCOPE_FILTER_SUITES:
+            tiers |= SCOPE_FILTER_SUITES[part]
+        else:
+            tiers.add(_resolve_scope_alias(part))
+    return tiers
 
 
 def _apply_scope_alias(scope_value: str, explicit_cadence: Optional[List[str]]) -> tuple:

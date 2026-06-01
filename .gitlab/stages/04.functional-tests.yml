@@ -71,20 +71,21 @@ functional:configure:
       # `nightly`, `weekly`) and L-tier names (`L0`–`L4`) are accepted; comma-
       # separated tiers union, e.g. `L1,L2` for the full MR functional suite.
       #
-      # Recipe rows use the L-tier vocabulary; LEGACY_SCOPE_ALIASES in
-      # tests/test_utils/python_scripts/recipe_parser.py resolves filter input:
+      # Recipe rows use the L-tier vocabulary; recipe_parser.py resolves filter
+      # input (tests/test_utils/python_scripts/recipe_parser.py):
       #   - `mr-github-slim` -> `L0`
-      #   - `mr-github` -> `L1`; `mr` alone -> `L2`
-      #   - full MR suite: `L1,L2` (GitHub L1 + GitLab-only L2 rows on H100/A100)
+      #   - `mr-github` -> `L1`
+      #   - `mr` -> the full MR suite `{L1, L2}` (== `L1,L2`); a literal `mr`
+      #     recipe-row tag still resolves to the single tier `L2`.
       #   - `nightly` -> `L3`; `weekly` -> `L4`
       # `unit-tests` and `release` are not aliased and match recipe rows verbatim.
       #
-      # When the workflow passes `L1,L2` (full MR), GB200 keeps the legacy GitLab
+      # For the full MR suite (`mr` or `L1,L2`), GB200 keeps the legacy GitLab
       # `mr` footprint (`L2` only) rather than unioning L1 rows that were never in
       # the old GB200 MR matrix.
       SCOPE_A100_H100="$FUNCTIONAL_TEST_SCOPE"
       SCOPE_GB200="$FUNCTIONAL_TEST_SCOPE"
-      if [[ "$FUNCTIONAL_TEST_SCOPE" == "L1,L2" ]]; then
+      if [[ "$FUNCTIONAL_TEST_SCOPE" == "L1,L2" || "$FUNCTIONAL_TEST_SCOPE" == "mr" ]]; then
         SCOPE_GB200="L2"
       fi
       COMMON_ARGS=(
