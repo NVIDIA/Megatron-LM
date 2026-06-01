@@ -1406,6 +1406,217 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         )
 
 
+class PrecomputedIndexerSparseAttnFunc(torch.autograd.Function):
+    """Path B variant for CP-aware, precomputed indexer top-k.
+
+    The caller owns CP-aware top-k selection. Sparse attention and
+    indexer-loss backward still use FlashMLA / cuDNN DSA wrappers.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        query: Tensor,
+        kv_full: Tensor,
+        attn_sink: Tensor,
+        topk_idxs: Tensor,
+        q_indexer: Tensor,
+        k_indexer: Tensor,
+        weights: Tensor,
+        indexer_topk_idxs: Tensor,
+        compressed_kv: Tensor,
+        softmax_scale: float,
+        indexer_softmax_scale: float,
+        loss_coeff: float,
+        calculate_per_token_loss: bool,
+        global_query_rows: int,
+    ) -> Tuple[Tensor, Tensor]:
+        _ensure_dsa_namespace()
+
+        total_q, np_, d = query.shape
+        idx_nh, idx_hd = q_indexer.shape[1], q_indexer.shape[2]
+        total_comp = k_indexer.shape[0]
+        indexer_topk = indexer_topk_idxs.shape[-1]
+
+        out_flat, lse, lse_indexer = _dsa_fwd_flash_mla(
+            query,
+            kv_full,
+            topk_idxs,
+            softmax_scale,
+            attn_sink=attn_sink,
+            topk_length=None,
+            indexer_topk=indexer_topk,
+        )
+        if lse_indexer is None:
+            raise RuntimeError("Precomputed indexer sparse attention requires lse_indexer.")
+
+        if indexer_softmax_scale != 1.0:
+            weights_scaled = (weights.float() * indexer_softmax_scale).to(weights.dtype)
+        else:
+            weights_scaled = weights
+        predict = _compute_indexer_predict(
+            q_indexer,
+            k_indexer,
+            weights_scaled,
+            indexer_topk_idxs,
+            qhead_per_kv_head=idx_nh,
+            topk_indices_global=True,
+        )
+        target = _compute_attn_target(
+            query.detach(),
+            compressed_kv.detach(),
+            lse_indexer.detach(),
+            indexer_topk_idxs,
+            softmax_scale,
+            qhead_per_kv_head=np_,
+            topk_indices_global=True,
+        )
+
+        raw_local_loss = _kl_loss_from_target_predict(
+            target,
+            predict,
+            indexer_topk_idxs,
+            loss_coeff,
+            calculate_per_token_loss=True,
+        )
+        if calculate_per_token_loss:
+            indexer_loss = raw_local_loss
+            bwd_loss_coeff = loss_coeff * total_q
+        else:
+            if global_query_rows <= 0:
+                raise RuntimeError(
+                    f"global_query_rows must be positive, got {global_query_rows}."
+                )
+            indexer_loss = raw_local_loss / float(global_query_rows)
+            bwd_loss_coeff = loss_coeff * float(total_q) / float(global_query_rows)
+
+        unit_grad_loss = torch.ones((), device=query.device, dtype=torch.float32)
+        if loss_coeff > 0:
+            ig = _DSA.indexer_backward_wrapper(
+                q_indexer.view(1, total_q, idx_nh, idx_hd),
+                weights.view(1, total_q, idx_nh),
+                k_indexer.view(1, total_comp, idx_hd),
+                target.view(1, total_q, indexer_topk),
+                predict.view(1, total_q, indexer_topk),
+                indexer_topk_idxs.view(1, total_q, indexer_topk),
+                sm_scale=indexer_softmax_scale,
+                loss_coeff=bwd_loss_coeff,
+                grad_loss=unit_grad_loss,
+                block_I=128,
+            )
+            precomputed_grad_q_indexer = ig["d_index_q"].view(total_q, idx_nh, idx_hd)
+            precomputed_grad_k_indexer = ig["d_index_k"].view(total_comp, idx_hd)
+            precomputed_grad_weights = ig["d_weights"].view(total_q, idx_nh)
+        else:
+            precomputed_grad_q_indexer = torch.zeros_like(q_indexer)
+            precomputed_grad_k_indexer = torch.zeros_like(k_indexer)
+            precomputed_grad_weights = torch.zeros_like(weights)
+
+        ctx.save_for_backward(
+            query,
+            kv_full,
+            attn_sink,
+            topk_idxs,
+            out_flat,
+            lse,
+            precomputed_grad_q_indexer,
+            precomputed_grad_k_indexer,
+            precomputed_grad_weights,
+        )
+        ctx.softmax_scale = softmax_scale
+        ctx.np_ = np_
+        ctx.total_q = total_q
+
+        return out_flat.reshape(total_q, np_ * out_flat.shape[-1]), indexer_loss
+
+    @staticmethod
+    def backward(ctx, grad_output, grad_loss):
+        _ensure_dsa_namespace()
+        (
+            query,
+            kv_full,
+            attn_sink,
+            topk_idxs,
+            out_flat,
+            lse,
+            precomputed_grad_q_indexer,
+            precomputed_grad_k_indexer,
+            precomputed_grad_weights,
+        ) = ctx.saved_tensors
+
+        d_v = out_flat.shape[-1]
+        dO_flat = grad_output.reshape(ctx.total_q, ctx.np_, d_v)
+        attn_bwd = _DSA.sparse_attention_backward_wrapper(
+            query,
+            kv_full,
+            out_flat,
+            dO_flat,
+            lse,
+            attn_sink,
+            topk_idxs,
+            softmax_scale=ctx.softmax_scale,
+            topk_length=None,
+        )
+        grad_query = attn_bwd["dq"]
+        grad_kv_full = attn_bwd["dkv"]
+        d_sink = attn_bwd["d_sink"]
+
+        grad_q_indexer = precomputed_grad_q_indexer * grad_loss
+        grad_k_indexer = precomputed_grad_k_indexer * grad_loss
+        grad_weights = precomputed_grad_weights * grad_loss
+
+        return (
+            grad_query,
+            grad_kv_full,
+            d_sink,
+            None,
+            grad_q_indexer,
+            grad_k_indexer,
+            grad_weights,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
+def fused_precomputed_indexer_sparse_attn(
+    query: Tensor,
+    kv_full: Tensor,
+    attn_sink: Tensor,
+    topk_idxs: Tensor,
+    q_indexer: Tensor,
+    k_indexer: Tensor,
+    weights: Tensor,
+    indexer_topk_idxs: Tensor,
+    compressed_kv: Tensor,
+    softmax_scale: float,
+    indexer_softmax_scale: float,
+    loss_coeff: float,
+    calculate_per_token_loss: bool,
+    global_query_rows: int,
+) -> Tuple[Tensor, Tensor]:
+    return PrecomputedIndexerSparseAttnFunc.apply(
+        query,
+        kv_full,
+        attn_sink,
+        topk_idxs,
+        q_indexer,
+        k_indexer,
+        weights,
+        indexer_topk_idxs,
+        compressed_kv,
+        softmax_scale,
+        indexer_softmax_scale,
+        loss_coeff,
+        calculate_per_token_loss,
+        global_query_rows,
+    )
+
+
 def fused_indexer_sparse_attn(
     query: Tensor,
     kv_full: Tensor,
@@ -1552,4 +1763,5 @@ __all__ = [
     "dsa_sparse_attn",
     "indexer_topk",
     "fused_indexer_sparse_attn",
+    "fused_precomputed_indexer_sparse_attn",
 ]

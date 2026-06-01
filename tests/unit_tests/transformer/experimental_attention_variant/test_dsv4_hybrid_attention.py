@@ -1,9 +1,11 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+import os
 from unittest.mock import patch
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 import megatron.core.parallel_state as parallel_state
@@ -23,6 +25,13 @@ except ImportError:
     _hadamard_transform = None
 
 _SEED = 42
+
+
+def _cp_debug_trace(message: str) -> None:
+    if not os.environ.get("DSV4_CP_DEBUG_TRACE"):
+        return
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else "?"
+    print(f"[dsv4-cp-test rank={rank}] {message}", flush=True)
 
 
 def _mock_hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
@@ -74,7 +83,7 @@ def _make_config(
 ):
     """Create an MLATransformerConfig for DSv4 hybrid attention tests."""
     if csa_compress_ratios is None:
-        csa_compress_ratios = [0, 4, 128, 4]
+        csa_compress_ratios = [1, 4, 128, 4]
     return MLATransformerConfig(
         num_layers=num_layers,
         hidden_size=hidden_size,
@@ -183,7 +192,7 @@ class TestDSv4HybridAttentionConstructor:
         torch.manual_seed(_SEED)
         model_parallel_cuda_manual_seed(_SEED)
 
-        ratios = [0, 4, 128, 4]
+        ratios = [1, 4, 128, 4]
         config = _make_config(csa_compress_ratios=ratios)
         pg = ProcessGroupCollection.use_mpu_process_groups()
         attn = _build_attention(config, layer_number=layer_number, pg_collection=pg)
@@ -601,7 +610,7 @@ class TestDSv4HybridRopeFusion:
     fused RoPE path must obtain cos/sin from both embedding classes via
     get_cached_cos_sin.
 
-    compress_ratios=[0, 4, 128, 4]: layer 1 has ratio 0 (standard
+    compress_ratios=[1, 4, 128, 4]: layer 1 has ratio 1 (standard
     RotaryEmbedding), layers 2-4 have ratio > 1 (YarnRotaryEmbedding).
     """
 
@@ -684,6 +693,15 @@ class TestDSv4HybridRopeFusion:
 from megatron.core.packed_seq_params import PackedSeqParams  # noqa: E402
 
 
+class _SingleRankCPGroup:
+
+    def rank(self):
+        return 0
+
+    def size(self):
+        return 1
+
+
 def _make_thd_packed_seq_params(seg_lens, device='cuda'):
     """Build ``PackedSeqParams(qkv_format='thd', ...)`` for self-attention
     (``cu_seqlens_q == cu_seqlens_kv``) from a list of per-segment lengths.
@@ -705,11 +723,43 @@ def _make_thd_packed_seq_params(seg_lens, device='cuda'):
     )
 
 
+def _copy_module_parameters(src, dst):
+    src_params = dict(src.named_parameters())
+    for name, param in dst.named_parameters():
+        assert name in src_params
+        param.data.copy_(src_params[name].data)
+    return src_params
+
+
+def _restore_cp_partitioned_tensor(local, partition_indices, total_tokens, cp_group):
+    cp_size = cp_group.size()
+    gathered = [torch.empty_like(local) for _ in range(cp_size)]
+    dist.all_gather(gathered, local.contiguous(), group=cp_group)
+    out = local.new_empty((total_tokens,) + tuple(local.shape[1:]))
+    for rank, part in enumerate(gathered):
+        out.index_copy_(0, partition_indices[rank].to(torch.long), part)
+    return out
+
+
+def _make_contiguous_cp_partition_indices(total_tokens, cp_size, device='cuda'):
+    assert total_tokens % cp_size == 0
+    local_tokens = total_tokens // cp_size
+    return tuple(
+        torch.arange(
+            rank * local_tokens,
+            (rank + 1) * local_tokens,
+            device=device,
+            dtype=torch.long,
+        )
+        for rank in range(cp_size)
+    )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
 class TestDSv4HybridAttentionThd:
     """End-to-end THD forward/backward of :class:`DSv4HybridSelfAttention`
-    across all configured ``compress_ratio`` values (0/4/128).
+    across all configured ``compress_ratio`` values (1/4/128).
 
     Each test runs a multi-segment THD batch through the full
     ``attn(hidden_states, packed_seq_params=...)`` pipeline and verifies:
@@ -735,8 +785,8 @@ class TestDSv4HybridAttentionThd:
         model_parallel_cuda_manual_seed(_SEED)
 
         cls = request.cls
-        # ``csa_compress_ratios=[0, 4, 128, 4]`` → layer_number ∈ {1,2,3,4}
-        # cover all three CSA ratios (0 = window-only; 4 = full
+        # ``csa_compress_ratios=[1, 4, 128, 4]`` → layer_number ∈ {1,2,3,4}
+        # cover all three CSA ratios (1 = window-only; 4 = full
         # indexer+compressed; 128 = compressor-only, no indexer).
         cls.config = _make_config(dsa_indexer_loss_coeff=1.0)
         cls.pg = ProcessGroupCollection.use_mpu_process_groups()
@@ -748,7 +798,7 @@ class TestDSv4HybridAttentionThd:
         "layer_number",
         [1, 2, 3, 4],
         ids=[
-            "ratio_0_window_only",  # layer 1 → ratio=0
+            "ratio_1_window_only",  # layer 1 -> ratio=1
             "ratio_4_with_indexer",  # layer 2 → ratio=4
             "ratio_128_compressor_only",  # layer 3 → ratio=128
             "ratio_4_with_indexer_alt",  # layer 4 → ratio=4
@@ -789,8 +839,8 @@ class TestDSv4HybridAttentionThd:
 
     @pytest.mark.parametrize(
         "layer_number",
-        [1, 2],  # ratio=0 (window-only) and ratio=4 (full indexer pipeline)
-        ids=["ratio_0_window_only", "ratio_4_with_indexer"],
+        [1, 2],  # ratio=1 (window-only) and ratio=4 (full indexer pipeline)
+        ids=["ratio_1_window_only", "ratio_4_with_indexer"],
     )
     def test_thd_backward_gradient_flow(self, layer_number):
         """THD backward produces grads on ``hidden_states`` and every
@@ -828,10 +878,10 @@ class TestDSv4HybridAttentionThd:
         identical hidden states (sanity check that the DSv4Hybrid
         THD-vs-SBHD glue doesn't silently change the math).
 
-        Uses ``layer_number=1`` (ratio=0, window-only) for determinism —
+        Uses ``layer_number=1`` (ratio=1, window-only) for determinism -
         no indexer top-K tie-breaking nondeterminism.
         """
-        layer_number = 1  # ratio=0 → window-only path, no cuDNN topk
+        layer_number = 1  # ratio=1 -> window-only path, no cuDNN topk
         sq = 128
 
         torch.manual_seed(_SEED)
@@ -856,4 +906,407 @@ class TestDSv4HybridAttentionThd:
         assert torch.allclose(out_sbhd.float(), out_thd.float(), atol=5e-2, rtol=5e-2), (
             f"B=1 SBHD/THD parity failed: max abs diff = "
             f"{(out_sbhd.float() - out_thd.float()).abs().max().item():.4e}"
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
+class TestDSv4HybridAttentionThdCpDesign:
+    """Static THD CP design path should match full-sequence THD reference math."""
+
+    @pytest.fixture(scope='class', autouse=True)
+    def setup_method(self, request):
+        cp_size = int(os.environ.get("DSV4_CP_TEST_CP_SIZE", "2"))
+        if Utils.world_size < cp_size:
+            pytest.skip(f"THD CP design path test requires at least {cp_size} distributed ranks")
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=cp_size,
+        )
+        torch.manual_seed(_SEED)
+        model_parallel_cuda_manual_seed(_SEED)
+
+        cls = request.cls
+        cls.cp_size = cp_size
+        cls.cp_rank = parallel_state.get_context_parallel_rank()
+        cls.pg = ProcessGroupCollection.use_mpu_process_groups()
+        cls.config_cp = _make_config(
+            hidden_size=1024,
+            num_attention_heads=64,
+            v_head_dim=512,
+            qk_pos_emb_head_dim=64,
+            q_lora_rank=256,
+            o_groups=8,
+            o_lora_rank=128,
+            csa_compress_ratios=[1, 4, 128, 4],
+            csa_window_size=128,
+            dsa_indexer_n_heads=64,
+            dsa_indexer_head_dim=128,
+            dsa_indexer_topk=512,
+            dsa_indexer_loss_coeff=0.0,
+            context_parallel_size=cp_size,
+            apply_dsa_kernel_fusion=True,
+        )
+        cls.config_ref = _make_config(
+            hidden_size=1024,
+            num_attention_heads=64,
+            v_head_dim=512,
+            qk_pos_emb_head_dim=64,
+            q_lora_rank=256,
+            o_groups=8,
+            o_lora_rank=128,
+            csa_compress_ratios=[1, 4, 128, 4],
+            csa_window_size=128,
+            dsa_indexer_n_heads=64,
+            dsa_indexer_head_dim=128,
+            dsa_indexer_topk=512,
+            dsa_indexer_loss_coeff=0.0,
+            context_parallel_size=1,
+            apply_dsa_kernel_fusion=True,
+        )
+        cls.ref_pg = ProcessGroupCollection.use_mpu_process_groups()
+        cls.ref_pg.cp = _SingleRankCPGroup()
+
+        yield
+        Utils.destroy_model_parallel()
+
+    def test_left_boundary_exchange_forward_backward(self):
+        from megatron.core.transformer.experimental_attention_variant.csa import (
+            exchange_left_boundary_tensor,
+        )
+
+        d_window = 2
+        local_len = 4
+        width = 3
+        values = torch.arange(
+            self.cp_rank * 100,
+            self.cp_rank * 100 + local_len * width,
+            device='cuda',
+            dtype=torch.float32,
+        ).reshape(local_len, width)
+        local = values.detach().clone().requires_grad_(True)
+
+        boundary = exchange_left_boundary_tensor(local, d_window, self.pg.cp)
+        if self.cp_rank == 0:
+            expected_boundary = torch.zeros_like(boundary)
+        else:
+            expected_boundary = torch.arange(
+                (self.cp_rank - 1) * 100 + (local_len - d_window) * width,
+                (self.cp_rank - 1) * 100 + local_len * width,
+                device='cuda',
+                dtype=torch.float32,
+            ).reshape(d_window, width)
+        assert torch.equal(boundary, expected_boundary)
+
+        boundary.sum().backward()
+        expected_grad = torch.zeros_like(local)
+        if self.cp_rank + 1 < self.cp_size:
+            expected_grad[-d_window:] = 1
+        assert torch.equal(local.grad, expected_grad)
+
+    @pytest.mark.parametrize(
+        "layer_number",
+        [1, 2, 3],
+        ids=["ratio_1_window_only", "ratio_4_indexer", "ratio_128_compressor"],
+    )
+    @pytest.mark.parametrize(
+        "seg_lens",
+        ([512], [192, 320]),
+        ids=["single_sequence", "sequence_boundary_inside_cp_rank"],
+    )
+    def test_thd_cp_design_matches_full_reference_forward_backward(self, layer_number, seg_lens):
+        _cp_debug_trace(f"test start layer={layer_number} seg_lens={seg_lens}")
+        total_tokens = sum(seg_lens)
+        packed = _make_thd_packed_seq_params(seg_lens)
+        partition_indices = _make_contiguous_cp_partition_indices(total_tokens, self.cp_size)
+        local_idx = partition_indices[self.cp_rank]
+
+        torch.manual_seed(_SEED + layer_number)
+        model_parallel_cuda_manual_seed(_SEED + layer_number)
+        cp_attn = _build_attention(
+            self.config_cp, layer_number=layer_number, pg_collection=self.pg
+        ).cuda()
+        ref_attn = _build_attention(
+            self.config_ref, layer_number=layer_number, pg_collection=self.ref_pg
+        ).cuda()
+        _copy_module_parameters(cp_attn, ref_attn)
+        # CP design path currently implements the no-indexer-loss Path C semantics:
+        # CP-aware indexer/top-k selects indices, then fused sparse attention owns
+        # the differentiable attention work. Match that reference path here.
+        cp_attn.eval()
+        ref_attn.eval()
+
+        full_hidden = torch.randn(
+            total_tokens, 1, self.config_cp.hidden_size, dtype=torch.bfloat16, device='cuda'
+        )
+        local_hidden = full_hidden.index_select(0, local_idx).detach().clone().requires_grad_(True)
+        ref_hidden = full_hidden.detach().clone().requires_grad_(True)
+
+        _cp_debug_trace("cp forward start")
+        local_out, _ = cp_attn(
+            hidden_states=local_hidden, attention_mask=None, packed_seq_params=packed
+        )
+        _cp_debug_trace("cp forward done")
+        _cp_debug_trace("reference forward start")
+        ref_out, _ = ref_attn(
+            hidden_states=ref_hidden, attention_mask=None, packed_seq_params=packed
+        )
+        _cp_debug_trace("reference forward done")
+        _cp_debug_trace("restore output start")
+        gathered_out = _restore_cp_partitioned_tensor(
+            local_out.detach(), partition_indices, total_tokens, self.pg.cp
+        )
+        _cp_debug_trace("restore output done")
+
+        assert torch.allclose(gathered_out.float(), ref_out.detach().float(), atol=8e-2, rtol=8e-2)
+
+        grad = torch.randn_like(ref_out)
+        _cp_debug_trace("cp backward start")
+        local_out.backward(grad.index_select(0, local_idx))
+        _cp_debug_trace("cp backward done")
+        _cp_debug_trace("reference backward start")
+        ref_out.backward(grad)
+        _cp_debug_trace("reference backward done")
+        _cp_debug_trace("restore grad start")
+        gathered_hidden_grad = _restore_cp_partitioned_tensor(
+            local_hidden.grad.detach(), partition_indices, total_tokens, self.pg.cp
+        )
+        _cp_debug_trace("restore grad done")
+        assert torch.allclose(
+            gathered_hidden_grad.float(), ref_hidden.grad.float(), atol=1e-1, rtol=1e-1
+        )
+
+        ref_params = dict(ref_attn.named_parameters())
+        param_grad_tol = 2e-1 if self.config_cp.apply_rope_fusion else 1e-1
+        for name, param in cp_attn.named_parameters():
+            ref_grad = ref_params[name].grad
+            if param.grad is None and ref_grad is None:
+                continue
+            if param.grad is None:
+                assert torch.count_nonzero(ref_grad) == 0, f"missing CP grad for {name}"
+                continue
+            if ref_grad is None:
+                assert torch.count_nonzero(param.grad) == 0, f"missing reference grad for {name}"
+                continue
+            grad_sum = param.grad.detach().clone()
+            _cp_debug_trace(f"param grad all_reduce start {name}")
+            dist.all_reduce(grad_sum, group=self.pg.cp)
+            _cp_debug_trace(f"param grad all_reduce done {name}")
+            assert torch.allclose(
+                grad_sum.float(), ref_grad.float(), atol=param_grad_tol, rtol=param_grad_tol
+            ), name
+
+    def test_thd_cp_design_ratio4_sparse_indexer_loss_matches_full_reference_backward(self):
+        """CP Path B keeps CP-aware top-k and matches fused sparse-loss reference grads."""
+        seqlen = 2048
+        packed = _make_thd_packed_seq_params([seqlen])
+        partition_indices = _make_contiguous_cp_partition_indices(seqlen, self.cp_size)
+        local_idx = partition_indices[self.cp_rank]
+
+        torch.manual_seed(_SEED + 200)
+        model_parallel_cuda_manual_seed(_SEED + 200)
+        config_cp = _make_config(
+            hidden_size=1024,
+            num_attention_heads=64,
+            v_head_dim=512,
+            qk_pos_emb_head_dim=64,
+            q_lora_rank=256,
+            o_groups=8,
+            o_lora_rank=128,
+            csa_compress_ratios=[1, 4, 128, 4],
+            csa_window_size=128,
+            dsa_indexer_n_heads=64,
+            dsa_indexer_head_dim=128,
+            dsa_indexer_topk=512,
+            dsa_indexer_loss_coeff=1.0,
+            dsa_indexer_use_sparse_loss=True,
+            context_parallel_size=self.cp_size,
+            apply_dsa_kernel_fusion=True,
+        )
+        config_ref = _make_config(
+            hidden_size=1024,
+            num_attention_heads=64,
+            v_head_dim=512,
+            qk_pos_emb_head_dim=64,
+            q_lora_rank=256,
+            o_groups=8,
+            o_lora_rank=128,
+            csa_compress_ratios=[1, 4, 128, 4],
+            csa_window_size=128,
+            dsa_indexer_n_heads=64,
+            dsa_indexer_head_dim=128,
+            dsa_indexer_topk=512,
+            dsa_indexer_loss_coeff=1.0,
+            dsa_indexer_use_sparse_loss=True,
+            context_parallel_size=1,
+            apply_dsa_kernel_fusion=True,
+        )
+        cp_attn = _build_attention(config_cp, layer_number=2, pg_collection=self.pg).cuda()
+        ref_attn = _build_attention(
+            config_ref, layer_number=2, pg_collection=self.ref_pg
+        ).cuda()
+        _copy_module_parameters(cp_attn, ref_attn)
+        cp_attn.train()
+        ref_attn.train()
+
+        full_hidden = torch.randn(
+            seqlen, 1, config_cp.hidden_size, dtype=torch.bfloat16, device='cuda'
+        )
+        local_hidden = full_hidden.index_select(0, local_idx).detach().clone().requires_grad_(True)
+        ref_hidden = full_hidden.detach().clone().requires_grad_(True)
+
+        local_out, _ = cp_attn(
+            hidden_states=local_hidden, attention_mask=None, packed_seq_params=packed
+        )
+        ref_out, _ = ref_attn(
+            hidden_states=ref_hidden, attention_mask=None, packed_seq_params=packed
+        )
+        gathered_out = _restore_cp_partitioned_tensor(
+            local_out.detach(), partition_indices, seqlen, self.pg.cp
+        )
+        assert torch.allclose(gathered_out.float(), ref_out.detach().float(), atol=8e-2, rtol=8e-2)
+
+        grad = torch.randn_like(ref_out)
+        local_out.backward(grad.index_select(0, local_idx))
+        ref_out.backward(grad)
+
+        assert local_hidden.grad is not None
+        assert not torch.isnan(local_hidden.grad).any()
+        gathered_hidden_grad = _restore_cp_partitioned_tensor(
+            local_hidden.grad.detach(), partition_indices, seqlen, self.pg.cp
+        )
+        assert torch.allclose(
+            gathered_hidden_grad.float(), ref_hidden.grad.float(), atol=1e-1, rtol=1e-1
+        )
+
+        ref_params = dict(ref_attn.named_parameters())
+        for name, param in cp_attn.named_parameters():
+            ref_grad = ref_params[name].grad
+            if param.grad is None and ref_grad is None:
+                continue
+            assert param.grad is not None, f"missing CP grad for {name}"
+            assert ref_grad is not None, f"missing reference grad for {name}"
+            assert not torch.isnan(param.grad).any(), f"NaN CP grad for {name}"
+            grad_sum = param.grad.detach().clone()
+            dist.all_reduce(grad_sum, group=self.pg.cp)
+            assert torch.allclose(grad_sum.float(), ref_grad.float(), atol=2e-1, rtol=2e-1), name
+
+    def test_thd_cp_design_ratio4_dense_indexer_loss_requires_kernel_update(self):
+        """Dense indexer loss is not silently replaced by a PyTorch CP fallback."""
+        seqlen = 128 * self.cp_size
+        packed = _make_thd_packed_seq_params([seqlen])
+        partition_indices = _make_contiguous_cp_partition_indices(seqlen, self.cp_size)
+        local_idx = partition_indices[self.cp_rank]
+
+        torch.manual_seed(_SEED + 250)
+        model_parallel_cuda_manual_seed(_SEED + 250)
+        config_cp = _make_config(
+            hidden_size=1024,
+            num_attention_heads=64,
+            v_head_dim=512,
+            qk_pos_emb_head_dim=64,
+            q_lora_rank=256,
+            o_groups=8,
+            o_lora_rank=128,
+            csa_compress_ratios=[1, 4, 128, 4],
+            csa_window_size=128,
+            dsa_indexer_n_heads=64,
+            dsa_indexer_head_dim=128,
+            dsa_indexer_topk=512,
+            dsa_indexer_loss_coeff=1.0,
+            dsa_indexer_use_sparse_loss=False,
+            context_parallel_size=self.cp_size,
+            apply_dsa_kernel_fusion=True,
+        )
+        cp_attn = _build_attention(config_cp, layer_number=2, pg_collection=self.pg).cuda()
+        cp_attn.train()
+
+        full_hidden = torch.randn(
+            seqlen, 1, config_cp.hidden_size, dtype=torch.bfloat16, device='cuda'
+        )
+        local_hidden = full_hidden.index_select(0, local_idx).detach().clone().requires_grad_(True)
+
+        with pytest.raises(RuntimeError, match="CP-aware dense score kernel"):
+            cp_attn(hidden_states=local_hidden, attention_mask=None, packed_seq_params=packed)
+
+    def test_thd_cp_design_apply_rope_fusion_forward_hidden_grad_parity(self):
+        """Explicit-position CP RoPE can use fused MLA RoPE without changing local semantics."""
+        seg_lens = [128 * self.cp_size]
+        total_tokens = sum(seg_lens)
+        packed = _make_thd_packed_seq_params(seg_lens)
+        partition_indices = _make_contiguous_cp_partition_indices(total_tokens, self.cp_size)
+        local_idx = partition_indices[self.cp_rank]
+
+        torch.manual_seed(_SEED + 300)
+        model_parallel_cuda_manual_seed(_SEED + 300)
+        config_cp = _make_config(
+            hidden_size=1024,
+            num_attention_heads=64,
+            v_head_dim=512,
+            qk_pos_emb_head_dim=64,
+            q_lora_rank=256,
+            o_groups=8,
+            o_lora_rank=128,
+            csa_compress_ratios=[1, 4, 128, 4],
+            csa_window_size=128,
+            dsa_indexer_n_heads=64,
+            dsa_indexer_head_dim=128,
+            dsa_indexer_topk=512,
+            dsa_indexer_loss_coeff=0.0,
+            context_parallel_size=self.cp_size,
+            apply_dsa_kernel_fusion=True,
+            apply_rope_fusion=True,
+        )
+        config_ref = _make_config(
+            hidden_size=1024,
+            num_attention_heads=64,
+            v_head_dim=512,
+            qk_pos_emb_head_dim=64,
+            q_lora_rank=256,
+            o_groups=8,
+            o_lora_rank=128,
+            csa_compress_ratios=[1, 4, 128, 4],
+            csa_window_size=128,
+            dsa_indexer_n_heads=64,
+            dsa_indexer_head_dim=128,
+            dsa_indexer_topk=512,
+            dsa_indexer_loss_coeff=0.0,
+            context_parallel_size=1,
+            apply_dsa_kernel_fusion=True,
+            apply_rope_fusion=True,
+        )
+        cp_attn = _build_attention(config_cp, layer_number=1, pg_collection=self.pg).cuda()
+        ref_attn = _build_attention(
+            config_ref, layer_number=1, pg_collection=self.ref_pg
+        ).cuda()
+        _copy_module_parameters(cp_attn, ref_attn)
+        cp_attn.eval()
+        ref_attn.eval()
+
+        full_hidden = torch.randn(
+            total_tokens, 1, config_cp.hidden_size, dtype=torch.bfloat16, device='cuda'
+        )
+        local_hidden = full_hidden.index_select(0, local_idx).detach().clone().requires_grad_(True)
+        ref_hidden = full_hidden.detach().clone().requires_grad_(True)
+
+        local_out, _ = cp_attn(
+            hidden_states=local_hidden, attention_mask=None, packed_seq_params=packed
+        )
+        ref_out, _ = ref_attn(
+            hidden_states=ref_hidden, attention_mask=None, packed_seq_params=packed
+        )
+        gathered_out = _restore_cp_partitioned_tensor(
+            local_out.detach(), partition_indices, total_tokens, self.pg.cp
+        )
+        assert torch.allclose(gathered_out.float(), ref_out.detach().float(), atol=8e-2, rtol=8e-2)
+
+        grad = torch.randn_like(ref_out)
+        local_out.backward(grad.index_select(0, local_idx))
+        ref_out.backward(grad)
+        gathered_hidden_grad = _restore_cp_partitioned_tensor(
+            local_hidden.grad.detach(), partition_indices, total_tokens, self.pg.cp
+        )
+        assert torch.allclose(
+            gathered_hidden_grad.float(), ref_hidden.grad.float(), atol=1e-1, rtol=1e-1
         )
