@@ -33,8 +33,10 @@ spec:
             echo "Skipping unsafe or missing path: $path"
             continue
         fi
-        echo "--- Would delete from $path ---"
+        echo "--- Would delete (files older than $THRESHOLD_DAYS days) from $path ---"
         find "$path" -mindepth 1 -type f -mtime +$THRESHOLD_DAYS -print 2>/dev/null || true
+        echo "--- Would also prune (empty directories, post-file-sweep) from $path ---"
+        find "$path" -mindepth 1 -depth -type d -empty -print 2>/dev/null || true
         echo "--- (dry-run: no deletion) ---"
     done <<<"$CLEANUP_PATHS"
 
