@@ -29,7 +29,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_kernels import
     fused_precomputed_indexer_sparse_attn,
     indexer_topk,
 )
-from megatron.core.transformer.experimental_attention_variant.dsv4_cp import (
+from megatron.core.transformer.experimental_attention_variant.csa_cp_utils import (
     _SINGLE_RANK_CP_GROUP,
     _all_gather_fixed_cp_tensor,
     _build_compressor_prep_compact,

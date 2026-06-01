@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from megatron.core.transformer.experimental_attention_variant.dsv4_cp import (
+from megatron.core.transformer.experimental_attention_variant.csa_cp_utils import (
     _build_compressor_prep_compact,
     _contiguous_cp_range,
     _final_design_flat_idxs,
