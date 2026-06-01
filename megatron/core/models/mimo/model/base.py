@@ -489,11 +489,11 @@ class MimoModel(MegatronModule):
                 "Language model config must define hidden_size for empty modality output"
             )
 
-        encoder_config = self.mimo_config.modality_submodules_spec[encoder_name].params['config']
+        output_dtype = getattr(language_config, 'params_dtype', None) or torch.float32
         return torch.empty(
             (0, hidden_size),
             device=torch.cuda.current_device(),
-            dtype=encoder_config.params_dtype,
+            dtype=output_dtype,
             requires_grad=True,
         )
 

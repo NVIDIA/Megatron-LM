@@ -785,14 +785,21 @@ class TestMimoModelFanoutHelpers:
         assert model._has_encoder_tokens(torch.tensor([[1]]), "unknown") is False
 
     @staticmethod
-    def _stub_mimo_config(*, hidden_size=8, encoder_dtype=torch.float16):
+    def _stub_mimo_config(
+        *,
+        hidden_size=8,
+        language_dtype=torch.float32,
+        include_language_dtype=True,
+        modality_params=None,
+    ):
+        language_config = SimpleNamespace(hidden_size=hidden_size)
+        if include_language_dtype:
+            language_config.params_dtype = language_dtype
         return SimpleNamespace(
-            language_model_spec=SimpleNamespace(
-                params={'config': SimpleNamespace(hidden_size=hidden_size)}
-            ),
+            language_model_spec=SimpleNamespace(params={'config': language_config}),
             modality_submodules_spec={
                 "images": SimpleNamespace(
-                    params={'config': SimpleNamespace(params_dtype=encoder_dtype)}
+                    params={} if modality_params is None else modality_params
                 )
             },
         )
@@ -819,15 +826,47 @@ class TestMimoModelFanoutHelpers:
         assert torch.equal(model.input_tensors["language"], t_lang)
         assert torch.equal(model.input_tensors["vision"], t_vision)
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for current_device")
-    def test_empty_encoder_output_uses_encoder_config_dtype_and_current_device(self):
+    def test_empty_encoder_output_uses_language_dtype_without_modality_config(self, monkeypatch):
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
         model = MimoModel.__new__(MimoModel)
-        model.mimo_config = self._stub_mimo_config(hidden_size=8, encoder_dtype=torch.bfloat16)
+        model.mimo_config = self._stub_mimo_config(
+            hidden_size=8,
+            language_dtype=torch.bfloat16,
+            modality_params={},
+        )
 
         output = model._empty_encoder_output("images")
 
         assert output.shape == (0, 8)
-        assert output.dtype is torch.bfloat16
+        assert output.dtype == torch.bfloat16
+        assert output.device.type == "cpu"
+        assert output.requires_grad
+
+    def test_empty_encoder_output_defaults_to_float32_without_language_dtype(self, monkeypatch):
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
+        model = MimoModel.__new__(MimoModel)
+        model.mimo_config = self._stub_mimo_config(
+            hidden_size=8,
+            include_language_dtype=False,
+            modality_params={},
+        )
+
+        output = model._empty_encoder_output("images")
+
+        assert output.shape == (0, 8)
+        assert output.dtype == torch.float32
+        assert output.device.type == "cpu"
+        assert output.requires_grad
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for current_device")
+    def test_empty_encoder_output_uses_current_cuda_device(self):
+        model = MimoModel.__new__(MimoModel)
+        model.mimo_config = self._stub_mimo_config(hidden_size=8, language_dtype=torch.bfloat16)
+
+        output = model._empty_encoder_output("images")
+
+        assert output.shape == (0, 8)
+        assert output.dtype == torch.bfloat16
         assert output.device.type == "cuda"
         assert output.requires_grad
 
