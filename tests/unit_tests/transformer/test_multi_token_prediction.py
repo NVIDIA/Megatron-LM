@@ -172,66 +172,6 @@ class TestMultiTokenPredictionLayer:
 
 
 class TestProcessMTPLoss:
-    def test_return_logits_keeps_labels_for_mtp_loss(self):
-        """Labels should still drive MTP auxiliary loss when main LM returns logits."""
-
-        loss_call_count = 0
-
-        def compute_language_model_loss(labels, logits):
-            nonlocal loss_call_count
-            loss_call_count += 1
-            logits = logits.transpose(0, 1).contiguous()
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)), labels.reshape(-1), reduction='none'
-            )
-            return loss.view_as(labels)
-
-        torch.manual_seed(_SEED)
-        seq_length = 4
-        micro_batch_size = 2
-        hidden_size = 8
-        vocab_size = 16
-        labels = torch.randint(vocab_size, (micro_batch_size, seq_length))
-        loss_mask = torch.ones_like(labels, dtype=torch.float32)
-        hidden_states = torch.randn(seq_length * 2, micro_batch_size, hidden_size)
-
-        config = TransformerConfig(
-            num_layers=1,
-            hidden_size=hidden_size,
-            num_attention_heads=1,
-            mtp_num_layers=1,
-            mtp_loss_scaling_factor=1.0,
-        )
-        model = SimpleNamespace(
-            training=False,
-            post_process=True,
-            config=config,
-            share_embeddings_and_output_weights=False,
-            output_layer=_TestOutputLayer(hidden_size, vocab_size),
-            pg_collection=SimpleNamespace(cp=None),
-            fuse_linear_cross_entropy=False,
-            compute_language_model_loss=compute_language_model_loss,
-            _scale_logits=lambda logits: logits,
-        )
-
-        logits = GPTModel._postprocess(
-            model,
-            hidden_states=hidden_states,
-            input_ids=torch.arange(seq_length).repeat(micro_batch_size, 1),
-            position_ids=torch.arange(seq_length).repeat(micro_batch_size, 1),
-            labels=labels,
-            rotary_pos_emb=None,
-            rotary_pos_cos=None,
-            rotary_pos_sin=None,
-            mtp_in_postprocess=False,
-            loss_mask=loss_mask,
-            runtime_gather_output=False,
-            return_logits=True,
-        )
-
-        assert loss_call_count == 1
-        assert logits.shape == (micro_batch_size, seq_length, vocab_size)
-
     def test_isolated_loss_detaches_encoder_hidden_states(self):
         """MTP isolated loss should not update the main decoder hidden states."""
 

@@ -1,4 +1,4 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from collections import OrderedDict
 from typing import Dict, Literal, Optional
@@ -503,7 +503,6 @@ class GPTModel(LanguageModule):
         inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
-        return_logits: bool = False,
     ) -> Tensor:
         """Forward function of the GPT Model This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -517,9 +516,6 @@ class GPTModel(LanguageModule):
             padding_mask (Tensor, optional): Padding mask for MoE routing.
                 Shape [bsz, seq_length]. True = padding (exclude), False = valid (include).
                 Only used for MoE layers to exclude padding tokens from routing computations.
-            return_logits (bool): If True, return logits even when `labels` are provided.
-                This lets online RL pass sampled labels for MTP auxiliary loss while
-                computing the main RL loss externally from logits.
         """
         if self.config.fine_grained_activation_offloading:
             self.preprocess_for_fine_grained_offloading()
@@ -595,7 +591,6 @@ class GPTModel(LanguageModule):
             extra_block_kwargs=extra_block_kwargs,
             inference_context=inference_context,
             mhc_multistream=mhc_multistream,
-            return_logits=return_logits,
         )
 
     def _postprocess(
@@ -618,7 +613,6 @@ class GPTModel(LanguageModule):
         extra_block_kwargs=None,
         inference_context=None,
         mhc_multistream=None,
-        return_logits=False,
     ):
         """Postprocesses decoder hidden states to generate logits or compute loss.
 
@@ -705,8 +699,7 @@ class GPTModel(LanguageModule):
                 reshaped = hidden_states.squeeze(1).unsqueeze(0)
                 hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
 
-        should_return_logits = return_logits or labels is None
-        if has_config_logger_enabled(self.config) or should_return_logits:
+        if has_config_logger_enabled(self.config) or labels is None:
             logits, _ = self.output_layer(
                 hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
             )
@@ -737,9 +730,7 @@ class GPTModel(LanguageModule):
             )
             log_config_to_disk(self.config, payload, prefix='input_and_logits')
 
-        if should_return_logits:
-            # `return_logits` only changes the main LM output contract. MTP auxiliary
-            # loss above still consumes `labels`/`loss_mask` when they are provided.
+        if labels is None:
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 
@@ -772,7 +763,6 @@ class GPTModel(LanguageModule):
         inference_params: Optional[BaseInferenceContext] = None,
         loss_mask: Optional[Tensor] = None,
         padding_mask: Optional[Tensor] = None,
-        return_logits: bool = False,
     ):
         """Builds a computation schedule plan for the model.
 
@@ -799,8 +789,6 @@ class GPTModel(LanguageModule):
                 Parameters for inference. Defaults to None.
             loss_mask (Optional[Tensor], optional): Loss mask. Defaults to None.
             padding_mask (Optional[Tensor], optional): Padding mask. Defaults to None.
-            return_logits (bool, optional): Return logits instead of main LM loss when labels
-                are provided. MTP auxiliary loss still uses labels. Defaults to False.
 
         Returns:
             TransformerModelChunkSchedulePlan: The model chunk schedule plan.
@@ -825,7 +813,6 @@ class GPTModel(LanguageModule):
             runtime_gather_output,
             loss_mask,
             padding_mask,
-            return_logits,
         )
 
     def sharded_state_dict(
