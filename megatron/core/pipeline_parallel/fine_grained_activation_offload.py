@@ -1172,6 +1172,9 @@ class ChunkOffloadHandler:
             and len(self._groups_to_reload) > 0
             and self._groups_to_reload[-1] is current_group
         ):
+            # The matching commit node already consumed this group's saved tensors.
+            # If activation_offload_fraction kept it on GPU, the queued slot is a
+            # no-op and should not delay preloading the next backward group.
             assert not self._group_has_offloaded_tensor(current_group), (
                 f"Group {current_group._name} still has offloaded tensors queued after "
                 "its backward pass."
