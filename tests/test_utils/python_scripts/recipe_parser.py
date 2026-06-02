@@ -47,10 +47,7 @@ LEGACY_SCOPE_ALIASES = {
 # pass the bare `mr` string running the full MR footprint rather than the L2
 # slice alone. (On GB200 the GitLab stage narrows this back to `L2` to preserve
 # the historical GB200 MR matrix; see .gitlab/stages/04.functional-tests.yml.)
-SCOPE_FILTER_SUITES = {
-    "mr": {"L1", "L2"},
-}
-
+SCOPE_FILTER_SUITES = {"mr": {"L1", "L2"}}
 
 def _resolve_scope_alias(scope_value: str) -> str:
     """Resolve a legacy scope value to its L-tier alias (or return it unchanged).
