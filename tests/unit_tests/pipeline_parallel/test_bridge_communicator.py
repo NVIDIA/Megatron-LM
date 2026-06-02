@@ -193,6 +193,82 @@ def get_transformer_block_and_grid(
     return block, grid
 
 
+class TestBridgeCommunicatorSplitMetadata:
+    """CPU-only checks for packed modality split metadata."""
+
+    @staticmethod
+    def _bridge():
+        bridge = BridgeCommunicator.__new__(BridgeCommunicator)
+        bridge.tensor_ndim = 2
+        bridge.dim_mapping = {'b': 0}
+        return bridge
+
+    def test_split_tensor_aggregates_per_sample_metadata_by_peer(self):
+        tensor = torch.arange(6).reshape(6, 1)
+        tensor._mimo_bridge_split_sizes = [0, 3, 1, 2]
+
+        splits = self._bridge()._split_tensor_at_batch_dim(tensor, num_splits=2)
+
+        assert [split.shape[0] for split in splits] == [3, 3]
+        torch.testing.assert_close(splits[0], tensor[:3])
+        torch.testing.assert_close(splits[1], tensor[3:])
+
+    def test_split_tensor_keeps_per_peer_metadata(self):
+        tensor = torch.arange(6).reshape(6, 1)
+        tensor._mimo_bridge_split_sizes = [1, 3, 2]
+
+        splits = self._bridge()._split_tensor_at_batch_dim(tensor, num_splits=3)
+
+        assert [split.shape[0] for split in splits] == [1, 3, 2]
+        torch.testing.assert_close(splits[0], tensor[:1])
+        torch.testing.assert_close(splits[1], tensor[1:4])
+        torch.testing.assert_close(splits[2], tensor[4:])
+
+    def test_split_tensor_rejects_non_divisible_sample_metadata(self):
+        tensor = torch.arange(6).reshape(6, 1)
+        tensor._mimo_bridge_split_sizes = [1, 2, 3]
+
+        with pytest.raises(ValueError, match="bridge split metadata has 3 entries"):
+            self._bridge()._split_tensor_at_batch_dim(tensor, num_splits=2)
+
+    def test_split_tensor_rejects_metadata_sum_mismatch(self):
+        tensor = torch.arange(6).reshape(6, 1)
+        tensor._mimo_bridge_split_sizes = [2, 2]
+
+        with pytest.raises(ValueError, match="bridge split metadata sums to 4"):
+            self._bridge()._split_tensor_at_batch_dim(tensor, num_splits=2)
+
+    def test_split_tensor_short_circuits_metadata_for_single_split(self):
+        tensor = torch.arange(6).reshape(6, 1)
+        tensor._mimo_bridge_split_sizes = [1, 5]
+
+        splits = self._bridge()._split_tensor_at_batch_dim(tensor, num_splits=1)
+
+        assert len(splits) == 1
+        torch.testing.assert_close(splits[0], tensor)
+
+    def test_as_per_peer_tensors_broadcasts_single_tensor(self):
+        tensor = torch.zeros(2, 1)
+
+        peers = BridgeCommunicator._as_per_peer_tensors(tensor, expected_count=3)
+
+        assert len(peers) == 3
+        assert all(peer is tensor for peer in peers)
+
+    def test_as_per_peer_tensors_passes_through_list(self):
+        tensors = [torch.zeros(2, 1), torch.zeros(3, 1)]
+
+        peers = BridgeCommunicator._as_per_peer_tensors(tensors, expected_count=2)
+
+        assert peers == tensors
+
+    def test_as_per_peer_tensors_rejects_count_mismatch(self):
+        tensors = [torch.zeros(2, 1), torch.zeros(3, 1)]
+
+        with pytest.raises(ValueError, match="expected 3 tensors for shape communication, got 2"):
+            BridgeCommunicator._as_per_peer_tensors(tensors, expected_count=3)
+
+
 class TestBridgeCommunicator:
 
     @classmethod
