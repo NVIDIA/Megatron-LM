@@ -12,6 +12,9 @@ from megatron.core.extensions.transformer_engine_spec_provider import TESpecProv
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.experimental_attention_variant import (
+    absorbed_mla as absorbed_mla_module,
+)
 from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
     AbsorbedMLASelfAttention,
     AbsorbedMLASelfAttentionSubmodules,
@@ -193,8 +196,7 @@ def get_absorbed_mla_submodules(
         linear_q_down_proj=linear_q_down_proj,
         linear_q_up_proj=backend.column_parallel_linear(),
         linear_kv_down_proj=linear_kv_down_proj,
-        linear_k_up_proj=backend.column_parallel_linear(),
-        linear_v_up_proj=backend.column_parallel_linear(),
+        linear_kv_up_proj=backend.column_parallel_linear(),
         core_attention=MockCoreAttention,
         linear_proj=backend.row_parallel_linear(),
         q_layernorm=qk_norm,
@@ -225,6 +227,53 @@ def get_mla_submodules(
         q_layernorm=qk_norm,
         kv_layernorm=qk_norm,
     )
+
+
+def test_checkpointed_attention_forward_captures_metadata(monkeypatch):
+    """Optional metadata should stay in the closure instead of checkpoint tensor args."""
+
+    packed_seq_params = PackedSeqParams(qkv_format='thd')
+    checkpoint_args = None
+
+    def fake_checkpoint(run_function, distribute_saved_activations, *args):
+        nonlocal checkpoint_args
+        del distribute_saved_activations
+        checkpoint_args = args
+        assert all(torch.is_tensor(arg) for arg in args)
+        return run_function(*args)
+
+    class CoreAttention(torch.nn.Module):
+        def forward(self, query, key, value, attention_mask, **kwargs):
+            del query, key, value, attention_mask
+            assert kwargs["packed_seq_params"] is packed_seq_params
+            assert kwargs["position_ids"] is None
+            return kwargs["x"]
+
+    dummy_attention = type(
+        "DummyAttention",
+        (),
+        {"attn_mask_type": AttnMaskType.causal, "core_attention": CoreAttention()},
+    )()
+
+    monkeypatch.setattr(absorbed_mla_module.tensor_parallel, "checkpoint", fake_checkpoint)
+
+    hidden_states = torch.randn(4, 1, 8)
+    output = AbsorbedMLASelfAttention._checkpointed_attention_forward(
+        dummy_attention,
+        q_absorbed=torch.randn(4, 1, 2, 8),
+        k_compressed=torch.randn(4, 1, 1, 8),
+        hidden_states=hidden_states,
+        q_compressed=torch.randn(4, 1, 8),
+        attention_mask=torch.empty(1),
+        up_v_weight=torch.randn(2, 4, 4),
+        position_ids=None,
+        packed_seq_params=packed_seq_params,
+    )
+
+    assert checkpoint_args is not None
+    assert all(arg is not packed_seq_params for arg in checkpoint_args)
+    assert all(arg is not None for arg in checkpoint_args)
+    assert output is hidden_states
 
 
 @pytest.mark.parametrize("tp_cp", [[1, 1], [2, 1], [1, 2], [2, 2]])
@@ -350,50 +399,17 @@ def test_functionality(tp_cp: List[int], qkv_format: str, down_proj_use_column_p
     absorbed_grads = dict(absorbed_mla.named_parameters())
     standard_grads = dict(standard_mla.named_parameters())
 
-    # Map parameter names between absorbed and standard MLA
-    # Most parameters have the same name, except for K/V up proj
     for name, param in standard_grads.items():
-        if 'linear_kv_up_proj' in name:
-            # Special handling: combine k and v up proj grads from absorbed_mla
-            k_name = name.replace('linear_kv_up_proj', 'linear_k_up_proj')
-            v_name = name.replace('linear_kv_up_proj', 'linear_v_up_proj')
+        absorbed_grad = absorbed_grads[name].grad
+        standard_grad = param.grad
 
-            k_grad = absorbed_grads[k_name].grad
-            v_grad = absorbed_grads[v_name].grad
+        absorbed_grad_flat = absorbed_grad.flatten().float()
+        standard_grad_flat = standard_grad.flatten().float()
 
-            # Combine k and v grads (interleaved by head)
-            # k_grad: [n * qk_head_dim, kv_lora_rank]
-            # v_grad: [n * v_head_dim, kv_lora_rank]
-            # combined: [n * (qk_head_dim + v_head_dim), kv_lora_rank]
-            n_heads = absorbed_mla.num_attention_heads_per_partition
-            qk_head_dim = absorbed_mla.config.qk_head_dim
-            v_head_dim = absorbed_mla.config.v_head_dim
-            kv_lora_rank = absorbed_mla.config.kv_lora_rank
-
-            k_grad_3d = k_grad.view(n_heads, qk_head_dim, kv_lora_rank)
-            v_grad_3d = v_grad.view(n_heads, v_head_dim, kv_lora_rank)
-            combined_grad_3d = torch.cat([k_grad_3d, v_grad_3d], dim=1)
-            combined_grad = combined_grad_3d.view(-1, kv_lora_rank)
-
-            absorbed_grad_flat = combined_grad.flatten().float()
-            standard_grad_flat = param.grad.flatten().float()
-
-            cos_sim = torch.nn.functional.cosine_similarity(
-                absorbed_grad_flat.unsqueeze(0), standard_grad_flat.unsqueeze(0)
-            ).item()
-            assert cos_sim > 0.9999, f"name: {name}, cosine similarity = {cos_sim} < 0.9999"
-            assert _calculate_tensor_similarity(combined_grad, param.grad) > 0.9999
-        else:
-            absorbed_grad = absorbed_grads[name].grad
-            standard_grad = param.grad
-
-            absorbed_grad_flat = absorbed_grad.flatten().float()
-            standard_grad_flat = standard_grad.flatten().float()
-
-            cos_sim = torch.nn.functional.cosine_similarity(
-                absorbed_grad_flat.unsqueeze(0), standard_grad_flat.unsqueeze(0)
-            ).item()
-            assert cos_sim > 0.9999, f"name: {name}, cosine similarity = {cos_sim} < 0.9999"
-            assert _calculate_tensor_similarity(absorbed_grad, standard_grad) > 0.9999
+        cos_sim = torch.nn.functional.cosine_similarity(
+            absorbed_grad_flat.unsqueeze(0), standard_grad_flat.unsqueeze(0)
+        ).item()
+        assert cos_sim > 0.9999, f"name: {name}, cosine similarity = {cos_sim} < 0.9999"
+        assert _calculate_tensor_similarity(absorbed_grad, standard_grad) > 0.9999
 
     Utils.destroy_model_parallel()
