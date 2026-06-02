@@ -5,6 +5,7 @@ WORLD_SIZE=1 LOCAL_RANK=0 python -m pytest tests/unit_tests/models/test_mimo_mod
 '''
 
 import math
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -220,6 +221,30 @@ class TestMimoModel:
         )
         assert text_embeddings.shape == (self.batch_size * self.seq_len, self.hidden_size)
 
+    def test_get_text_embeddings_handles_3d_position_ids(self):
+        """3D mRoPE position_ids ``[rope_dim, B, S]`` must produce the same text
+        embeddings as the 2D ``[B, S]`` baseline.
+
+        Multimodal RoPE (e.g. Qwen3-VL) carries multiple positional channels.
+        ``get_text_embeddings`` should slice the first channel for the absolute
+        text-position lookup; otherwise the indexed positions correspond to
+        the wrong axis and the language model receives garbage text embeddings.
+        ``eval()`` disables embedding dropout so the two calls are
+        bit-comparable.
+        """
+        mimo_model = self._make_avlm().eval()
+        input_ids = self._make_input_ids()
+        position_ids_2d = self._make_position_ids()
+        # Build [rope_dim=3, B, S] by tiling the 2D ids along a new leading
+        # axis. Only channel 0 is consumed by the text lookup, so the result
+        # must match the 2D baseline exactly.
+        position_ids_3d = position_ids_2d.unsqueeze(0).expand(3, -1, -1).contiguous()
+
+        emb_2d = mimo_model.get_text_embeddings(input_ids, position_ids_2d, self.special_token_ids)
+        emb_3d = mimo_model.get_text_embeddings(input_ids, position_ids_3d, self.special_token_ids)
+        assert emb_3d.shape == emb_2d.shape
+        torch.testing.assert_close(emb_3d, emb_2d)
+
     def test_forward_text_only(self):
         """Test forward pass with only text input."""
         mimo_model = self._make_vlm()
@@ -230,6 +255,43 @@ class TestMimoModel:
             input_ids=input_ids, position_ids=position_ids, modality_inputs=None
         )
         assert outputs.shape == (self.batch_size, self.seq_len, self.vocab_size)
+
+    def test_forward_threads_position_ids_to_language_model(self):
+        """``MimoModel.forward`` must thread ``position_ids`` through to
+        ``self.language_model`` so multimodal RoPE can compute its rotary
+        embeddings.
+
+        Multimodal RoPE (e.g. Qwen3-VL) consumes ``position_ids`` even when
+        the language model receives a pre-combined ``decoder_input`` (which
+        replaces the embedding lookup). ``input_ids`` is therefore unused on
+        this path and must not be forwarded — its shape would not match the
+        expanded ``decoder_input`` sequence.
+        """
+        mimo_model = self._make_vlm()
+        input_ids = self._make_input_ids()
+        position_ids = self._make_position_ids()
+
+        captured = {}
+
+        def capture_lm_forward(*args, **kwargs):
+            captured['input_ids'] = kwargs.get('input_ids')
+            captured['position_ids'] = kwargs.get('position_ids')
+            captured['decoder_input'] = kwargs.get('decoder_input')
+            return torch.zeros(self.batch_size, self.seq_len, self.vocab_size, device=self.device)
+
+        with patch.object(mimo_model.language_model, 'forward', side_effect=capture_lm_forward):
+            mimo_model(input_ids=input_ids, position_ids=position_ids, modality_inputs=None)
+
+        assert (
+            captured['decoder_input'] is not None
+        ), "MimoModel.forward must pass a pre-combined decoder_input to the language model"
+        assert (
+            captured['input_ids'] is None
+        ), "MimoModel.forward must not forward input_ids when decoder_input is pre-combined"
+        assert (
+            captured['position_ids'] is not None
+        ), "MimoModel.forward must pass position_ids to the language model (got None)"
+        torch.testing.assert_close(captured['position_ids'], position_ids)
 
     def test_forward_with_image_modality(self):
         """Test forward pass with text and image input."""
@@ -622,3 +684,191 @@ class TestMimoModelNonColocated:
         outputs, _ = model(input_ids=input_ids, position_ids=position_ids, modality_inputs=None)
         assert isinstance(outputs, torch.Tensor)
         assert outputs.shape == (self.batch_size, self.seq_len, self.vocab_size)
+
+    def test_forward_language_module_non_first_stage_drops_input_ids(self):
+        """Non-first PP stage in ``_forward_language_module`` must call the LM
+        with ``input_ids=None`` (hidden states arrive via ``set_input_tensor``)
+        while still threading ``position_ids`` through for mRoPE.
+        """
+        model = MimoModel(self._make_config(encoder_in_grid=False, language_in_grid=True))
+        model = model.to(self.device)
+
+        input_ids = torch.randint(
+            0, self.vocab_size, (self.batch_size, self.seq_len), device=self.device
+        )
+        position_ids = (
+            torch.arange(self.seq_len, device=self.device).unsqueeze(0).expand(self.batch_size, -1)
+        )
+        hidden_states = torch.randn(
+            self.seq_len, self.batch_size, self.hidden_size, device=self.device
+        )
+
+        captured = {}
+
+        def capture_lm_forward(*args, **kwargs):
+            captured.update(kwargs)
+            return torch.zeros(self.batch_size, self.seq_len, self.vocab_size, device=self.device)
+
+        with (
+            patch.object(model.role, 'is_first_stage', return_value=False),
+            patch.object(model.role, 'is_last_stage', return_value=True),
+            patch.object(model.language_model, 'forward', side_effect=capture_lm_forward),
+        ):
+            model._forward_language_module(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                attention_mask=None,
+                labels=None,
+                input_tensors={MIMO_LANGUAGE_MODULE_KEY: hidden_states},
+            )
+
+        assert captured['input_ids'] is None
+        assert captured['decoder_input'] is None
+        torch.testing.assert_close(captured['position_ids'], position_ids)
+
+
+class TestMimoModelFanoutHelpers:
+    """CPU-only coverage for bridge-fanout helper methods on ``MimoModel``."""
+
+    @staticmethod
+    def _stub_model(special_token_ids):
+        model = MimoModel.__new__(MimoModel)
+        model.special_token_ids = special_token_ids
+        # COLOCATED skips the fan-out DP assertion path; this fixture targets
+        # the metadata-tagging logic only.
+        model.role = SimpleNamespace(mode=ModuleLayout.COLOCATED)
+        return model
+
+    def test_attach_modality_split_sizes_tags_output_with_per_sample_counts(self):
+        model = self._stub_model({"images": 50257})
+        input_ids = torch.tensor([[50257, 50257, 1, 2], [50257, 1, 2, 3]])
+        output = torch.zeros(3, 8)
+
+        model._attach_modality_split_sizes(output, input_ids, "images")
+
+        assert output._mimo_bridge_split_sizes == [2, 1]
+
+    def test_attach_modality_split_sizes_skips_when_total_mismatches(self):
+        model = self._stub_model({"images": 50257})
+        input_ids = torch.tensor([[50257, 1], [1, 1]])
+        output = torch.zeros(5, 8)
+
+        model._attach_modality_split_sizes(output, input_ids, "images")
+
+        assert not hasattr(output, "_mimo_bridge_split_sizes")
+
+    def test_attach_modality_split_sizes_skips_when_token_counts_uniform(self):
+        model = self._stub_model({"images": 50257})
+        # Two samples, two image tokens each — uniform per-sample counts.
+        input_ids = torch.tensor([[50257, 50257, 1, 2], [50257, 50257, 3, 4]])
+        output = torch.zeros(4, 8)
+
+        model._attach_modality_split_sizes(output, input_ids, "images")
+
+        assert not hasattr(output, "_mimo_bridge_split_sizes")
+
+    def test_attach_modality_split_sizes_skips_for_single_sample_batch(self):
+        model = self._stub_model({"images": 50257})
+        input_ids = torch.tensor([[50257, 50257, 1]])
+        output = torch.zeros(2, 8)
+
+        model._attach_modality_split_sizes(output, input_ids, "images")
+
+        assert not hasattr(output, "_mimo_bridge_split_sizes")
+
+    def test_has_encoder_tokens_detects_presence_and_absence(self):
+        model = self._stub_model({"images": 50257, "audio": 50258})
+
+        assert model._has_encoder_tokens(torch.tensor([[50257, 1]]), "images") is True
+        assert model._has_encoder_tokens(torch.tensor([[1, 2]]), "images") is False
+        assert model._has_encoder_tokens(None, "images") is False
+        assert model._has_encoder_tokens(torch.tensor([[1]]), "unknown") is False
+
+    @staticmethod
+    def _stub_mimo_config(
+        *,
+        hidden_size=8,
+        language_dtype=torch.float32,
+        include_language_dtype=True,
+        modality_params=None,
+    ):
+        language_config = SimpleNamespace(hidden_size=hidden_size)
+        if include_language_dtype:
+            language_config.params_dtype = language_dtype
+        return SimpleNamespace(
+            language_model_spec=SimpleNamespace(params={'config': language_config}),
+            modality_submodules_spec={
+                "images": SimpleNamespace(params={} if modality_params is None else modality_params)
+            },
+        )
+
+    def test_set_input_tensor_unwraps_outer_list_and_forwards_to_language_model(self):
+        lm = MagicMock()
+        model = MimoModel.__new__(MimoModel)
+        model.language_model = lm
+        tensor = torch.zeros(2, 4)
+
+        model.set_input_tensor([tensor])
+
+        assert torch.equal(model.input_tensors, tensor)
+        lm.set_input_tensor.assert_called_once_with(tensor)
+
+    def test_set_input_tensor_dict_unwraps_single_element_value_lists(self):
+        model = MimoModel.__new__(MimoModel)
+        model.language_model = None
+        t_lang = torch.zeros(2, 4)
+        t_vision = torch.zeros(3, 4)
+
+        model.set_input_tensor({"language": [t_lang], "vision": t_vision})
+
+        assert torch.equal(model.input_tensors["language"], t_lang)
+        assert torch.equal(model.input_tensors["vision"], t_vision)
+
+    def test_empty_encoder_output_uses_language_dtype_without_modality_config(self, monkeypatch):
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
+        model = MimoModel.__new__(MimoModel)
+        model.mimo_config = self._stub_mimo_config(
+            hidden_size=8, language_dtype=torch.bfloat16, modality_params={}
+        )
+
+        output = model._empty_encoder_output("images")
+
+        assert output.shape == (0, 8)
+        assert output.dtype == torch.bfloat16
+        assert output.device.type == "cpu"
+        assert output.requires_grad
+
+    def test_empty_encoder_output_defaults_to_float32_without_language_dtype(self, monkeypatch):
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
+        model = MimoModel.__new__(MimoModel)
+        model.mimo_config = self._stub_mimo_config(
+            hidden_size=8, include_language_dtype=False, modality_params={}
+        )
+
+        output = model._empty_encoder_output("images")
+
+        assert output.shape == (0, 8)
+        assert output.dtype == torch.float32
+        assert output.device.type == "cpu"
+        assert output.requires_grad
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for current_device")
+    def test_empty_encoder_output_uses_current_cuda_device(self):
+        model = MimoModel.__new__(MimoModel)
+        model.mimo_config = self._stub_mimo_config(hidden_size=8, language_dtype=torch.bfloat16)
+
+        output = model._empty_encoder_output("images")
+
+        assert output.shape == (0, 8)
+        assert output.dtype == torch.bfloat16
+        assert output.device.type == "cuda"
+        assert output.requires_grad
+
+    def test_empty_encoder_output_raises_when_hidden_size_missing(self):
+        model = MimoModel.__new__(MimoModel)
+        model.mimo_config = SimpleNamespace(
+            language_model_spec=SimpleNamespace(params={'config': SimpleNamespace()})
+        )
+
+        with pytest.raises(ValueError, match="hidden_size"):
+            model._empty_encoder_output("images")
