@@ -1150,8 +1150,8 @@ if _CUTILE_AVAILABLE:
         go_tile = ct.load(
             go, index=(pid, 0, ct_idx), shape=(TILE_SIZE, N, TILE_C), padding_mode=PAD_ZERO
         )
-        g_x_tile = ct.full((TILE_SIZE, 1, TILE_C), 0, dtype=hp.dtype)
-        g_orig_tile = ct.full((TILE_SIZE, N, TILE_C), 0, dtype=hp.dtype)
+        g_x_tile = ct.full((TILE_SIZE, 1, TILE_C), 0, dtype=ct.float32)
+        g_orig_tile = ct.full((TILE_SIZE, N, TILE_C), 0, dtype=ct.float32)
         for j in range(N):
             hp_j = ct.extract(hp_tile, (0, j), shape=(TILE_SIZE, 1))
             hp_j_exp = ct.expand_dims(hp_j, axis=2)  # [TS, 1, 1]
