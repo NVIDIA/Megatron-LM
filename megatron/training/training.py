@@ -1747,6 +1747,9 @@ def get_model(
                     model_chunk_idx > 0
                 ) or args.overlap_param_gather_with_optimizer_step
 
+                if DP is DDP and getattr(args, 'disable_grad_buffers_cpu_backup', False):
+                    chunk_kwargs["disable_grad_buffers_cpu_backup"] = True
+
                 # Pre-compute parameter layouts for the distributed optimizer.
                 # Only pass to DDP; FSDP variants don't accept full_param_layout.
                 if args.use_distributed_optimizer and DP is DDP:
