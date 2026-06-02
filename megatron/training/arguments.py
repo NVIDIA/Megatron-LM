@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron arguments."""
 
@@ -2020,6 +2020,19 @@ def validate_args(args, defaults={}):
 
     # Validate simulate-result-dir when simulate-global-step is enabled
     if args.simulate_global_step:
+        assert args.cuda_graph_impl == "none", (
+            "VPP simulation does not support CUDA graph capture/replay yet. "
+            "Disable --cuda-graph-impl when using --simulate-global-step."
+        )
+        assert not args.cuda_graph_modules, (
+            "VPP simulation does not support --cuda-graph-modules yet. "
+            "Disable CUDA graph module capture when using --simulate-global-step."
+        )
+        assert not args.optimizer_cuda_graph, (
+            "VPP simulation does not support --optimizer-cuda-graph because simulation "
+            "does not execute optimizer steps."
+        )
+
         # Validate skip-execute and load-result-dir dependencies
         if args.skip_execute:
             assert args.load_result_dir is not None, \
@@ -2029,6 +2042,14 @@ def validate_args(args, defaults={}):
         else:
             assert args.simulate_result_dir is not None, \
                 "When --simulate-global-step is enabled (without --skip-execute), --simulate-result-dir must be provided."
+            assert args.simulation_warmup_times >= 0, \
+                "--simulation-warmup-times must be non-negative."
+            assert args.simulation_measure_times > 0, \
+                "--simulation-measure-times must be positive."
+            assert args.simulation_measure_skip_times >= 0, \
+                "--simulation-measure-skip-times must be non-negative."
+            assert args.simulation_measure_times > args.simulation_measure_skip_times, \
+                "--simulation-measure-times must be greater than --simulation-measure-skip-times."
 
         # Auto-disable incompatible options in simulation mode
         if args.overlap_grad_reduce:
@@ -4913,5 +4934,11 @@ def _add_simulation_args(parser):
     group.add_argument('--load-result-dir', type=str, required=False, default=None,
                        help='Directory path to load previously saved simulation results. '
                        'Used with --skip-execute to reanalyze existing results without re-execution.')
+    group.add_argument('--simulation-warmup-times', type=int, required=False, default=15,
+                       help='Number of warmup iterations for each executed simulation task.')
+    group.add_argument('--simulation-measure-times', type=int, required=False, default=10,
+                       help='Number of measured iterations for each executed simulation task.')
+    group.add_argument('--simulation-measure-skip-times', type=int, required=False, default=5,
+                       help='Number of measured simulation iterations to skip when averaging.')
 
     return parser

@@ -23,6 +23,7 @@ dist_optimizer
 optimizer_cpu_offload
 paged_stash
 pipeline_parallel_layout
+vpp_simulation
 tokenizers
 megatron_energon
 megatron_rl

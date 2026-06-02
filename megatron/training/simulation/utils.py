@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Utility functions for VPP training simulation."""
 
@@ -40,6 +40,8 @@ class SimulationArgsOverride:
         # Store original values
         self.original_pp_size = None
         self.original_pp_layout = None
+        self.original_vpp_size = None
+        self.original_data_parallel_size = None
 
     def __enter__(self):
         """Override pipeline parallelism arguments for simulation initialization."""
@@ -56,6 +58,8 @@ class SimulationArgsOverride:
 
         # Save original user-defined values
         self.original_pp_size = self.parsed_args.pipeline_model_parallel_size
+        self.original_vpp_size = self.parsed_args.virtual_pipeline_model_parallel_size
+        self.original_data_parallel_size = self.parsed_args.data_parallel_size
         self.original_pp_layout = PipelineParallelLayerLayout.from_str(
             layout=self.parsed_args.pipeline_model_parallel_layout,
             pipeline_model_parallel_size=self.parsed_args.pipeline_model_parallel_size
@@ -67,13 +71,15 @@ class SimulationArgsOverride:
         log_single_rank(logger, logging.DEBUG, f"  - original_pp_layout: {self.original_pp_layout}")
 
         # Override with simulation values to enable initialization with fewer GPUs
-        # Set PP=1 to allow network initialization with only EP GPUs
+        # Set PP=1 and disable VPP to allow network initialization with only EP GPUs.
         self.parsed_args.pipeline_model_parallel_size = 1
         self.parsed_args.pipeline_model_parallel_layout = None
+        self.parsed_args.virtual_pipeline_model_parallel_size = None
 
         log_single_rank(logger, logging.DEBUG, f"[DEBUG] After override for simulation:")
         log_single_rank(logger, logging.DEBUG, f"  - pipeline_model_parallel_size: {self.parsed_args.pipeline_model_parallel_size}")
         log_single_rank(logger, logging.DEBUG, f"  - pipeline_model_parallel_layout: {self.parsed_args.pipeline_model_parallel_layout}")
+        log_single_rank(logger, logging.DEBUG, f"  - virtual_pipeline_model_parallel_size: {self.parsed_args.virtual_pipeline_model_parallel_size}")
 
         return self
 
@@ -99,10 +105,13 @@ class SimulationArgsOverride:
 
         args.pipeline_model_parallel_size = self.original_pp_size
         args.pipeline_model_parallel_layout = self.original_pp_layout
+        args.virtual_pipeline_model_parallel_size = self.original_vpp_size
+        args.data_parallel_size = self.original_data_parallel_size * self.original_pp_size
 
         log_single_rank(logger, logging.DEBUG, f"[DEBUG] After restoration:")
         log_single_rank(logger, logging.DEBUG, f"  - args.pipeline_model_parallel_size: {args.pipeline_model_parallel_size}")
         log_single_rank(logger, logging.DEBUG, f"  - args.pipeline_model_parallel_layout: {args.pipeline_model_parallel_layout}")
+        log_single_rank(logger, logging.DEBUG, f"  - args.data_parallel_size: {args.data_parallel_size}")
 
         # Recalculate virtual_pipeline_model_parallel_size from restored layout
         # This is necessary because during __enter__(), layout was set to None,
@@ -144,6 +153,23 @@ class SimulationArgsOverride:
         log_single_rank(logger, logging.DEBUG, f"[DEBUG] After updating parallel_state global variable:")
         log_single_rank(logger, logging.DEBUG, f"  - parallel_state._VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE: {parallel_state._VIRTUAL_PIPELINE_MODEL_PARALLEL_WORLD_SIZE}")
         log_single_rank(logger, logging.DEBUG, f"  - get_virtual_pipeline_model_parallel_world_size(): {parallel_state.get_virtual_pipeline_model_parallel_world_size()}")
+
+        from megatron.core.num_microbatches_calculator import reconfigure_num_microbatches_calculator
+
+        reconfigure_num_microbatches_calculator(
+            rank=args.rank,
+            global_batch_size=args.global_batch_size,
+            micro_batch_size=args.micro_batch_size,
+            data_parallel_size=args.data_parallel_size,
+            decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
+            step_batch_size_schedule=args.step_batch_size_schedule,
+            seq_length=args.seq_length,
+        )
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f"Simulation restored virtual data_parallel_size={args.data_parallel_size}",
+        )
 
         # prepare for data build
         args.iteration = 0

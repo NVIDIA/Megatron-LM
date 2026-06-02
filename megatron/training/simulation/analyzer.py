@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Analysis tools for VPP Training Simulation
 
@@ -214,11 +214,18 @@ def display_gbs_statistics(pp_finished_task_queue_dict: Dict, pipeline_parallel_
     global_batch_size = getattr(args, 'global_batch_size')
     flops = num_floating_point_operations(args, global_batch_size)
 
-    # VTrainer world size = args.world_size * pipeline_parallel_size
-    # because we're simulating PP ranks on a single GPU
+    # VTrainer world size = args.world_size * pipeline_parallel_size because
+    # each executor rank samples every virtual PP rank sequentially. The GBS
+    # time below is reconstructed for the full virtual pipeline, so the primary
+    # per-GPU throughput must be normalized by the virtual/full trainer size.
+    # The executor-normalized value is only a sampling diagnostic.
+    executor_world_size = args.world_size
     vtrainer_world_size = args.world_size * pipeline_parallel_size
 
     throughput = flops / (total_gbs_time_seconds * 10**12 * vtrainer_world_size)
+    executor_normalized_throughput = (
+        flops / (total_gbs_time_seconds * 10**12 * executor_world_size)
+    )
 
     # Count task types
     forward_tasks = [task for task in all_finished_tasks if task.task_type == task_type_enum.FORWARD]
@@ -234,8 +241,8 @@ def display_gbs_statistics(pp_finished_task_queue_dict: Dict, pipeline_parallel_
     output_lines.append("GBS Execution Statistics")
     output_lines.append("=" * 80)
     output_lines.append(f"Configuration:")
+    output_lines.append(f"  Executor World Size: {executor_world_size}")
     output_lines.append(f"  VTrainer World Size: {vtrainer_world_size}")
-    output_lines.append(f"  World Size: {args.world_size}")
     output_lines.append(f"  Pipeline Parallel Size: {pipeline_parallel_size}")
     output_lines.append(f"  Num Microbatches: {num_microbatches}")
     output_lines.append(f"  Num Model Chunks: {num_model_chunks}")
@@ -253,6 +260,10 @@ def display_gbs_statistics(pp_finished_task_queue_dict: Dict, pipeline_parallel_
     flops_as_tera = flops / 10**12
     output_lines.append(f"  FLOPs for one GBS: {flops_as_tera:.3f} TFLOPs")
     output_lines.append(f"  Throughput: {throughput:.3f} TFLOPS per GPU")
+    output_lines.append(
+        f"  Executor-normalized sampled throughput: "
+        f"{executor_normalized_throughput:.3f} TFLOPS per executor GPU"
+    )
 
     # Calculate tokens per day per GPU
     seq_length = getattr(args, 'seq_length')

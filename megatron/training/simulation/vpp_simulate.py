@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """VPP Training Simulation for Performance Profiling"""
 import itertools
@@ -23,6 +23,7 @@ from megatron.core.pipeline_parallel.schedules import forward_step
 from megatron.training.simulation.model_executor import (
     create_model,
     clear_model_mem,
+    clear_model_grad_state,
     prepare_input_tensor,
     execute_forward_with_timing,
     execute_backward_with_timing,
@@ -161,6 +162,81 @@ class VppSimulator(object):
         for i, (mb_id, mc_id) in enumerate(self.schedule_table[:10]):
             log_single_rank(logger, logging.DEBUG, f"  virtual_mb_id {i}: (microbatch_id={mb_id}, model_chunk_id={mc_id})")
         log_single_rank(logger, logging.DEBUG, "="*80 + "\n")
+
+    def _clear_grad_state_on_model_chunk_switch(self, pp_rank: int, vpp_rank: int):
+        """Clear model gradient state when simulator execution moves to another VPP chunk."""
+        if self.current_model is None:
+            return
+
+        if self.current_model_vpp_rank is None:
+            self.current_model_vpp_rank = vpp_rank
+            return
+
+        if self.current_model_vpp_rank == vpp_rank:
+            return
+
+        log_single_rank(
+            logger,
+            logging.DEBUG,
+            "Clearing model grad state on model chunk switch: "
+            f"pp_rank={pp_rank}, old_vpp_rank={self.current_model_vpp_rank}, "
+            f"new_vpp_rank={vpp_rank}",
+        )
+        clear_model_grad_state(self.current_model)
+        self.current_model_vpp_rank = vpp_rank
+
+    def _record_static_memory(self, pp_rank: int, model):
+        """Record static model memory once for a simulated PP rank."""
+        if pp_rank in self.pp_static_memory_dict:
+            return
+
+        params_bytes = 0
+        grads_bytes = 0
+
+        def _add_buffer_memory(buffer):
+            nonlocal params_bytes, grads_bytes
+            param_data = getattr(buffer, 'param_data', None)
+            grad_data = getattr(buffer, 'grad_data', None)
+            if param_data is not None:
+                params_bytes += param_data.numel() * param_data.element_size()
+            if grad_data is not None:
+                grads_bytes += grad_data.numel() * grad_data.element_size()
+
+        def _record_chunk(chunk):
+            nonlocal params_bytes, grads_bytes
+            used_ddp_buffers = False
+            for attr_name in ('buffers', 'expert_parallel_buffers'):
+                buffers = getattr(chunk, attr_name, None)
+                if callable(buffers):
+                    buffers = None
+                for buffer in buffers or []:
+                    _add_buffer_memory(buffer)
+                    used_ddp_buffers = True
+
+            if not used_ddp_buffers:
+                for param in chunk.parameters():
+                    params_bytes += param.numel() * param.element_size()
+                    if param.grad is not None:
+                        grads_bytes += param.grad.numel() * param.grad.element_size()
+
+        if isinstance(model, list):
+            for model_chunk in model:
+                _record_chunk(model_chunk)
+        else:
+            _record_chunk(model)
+
+        self.pp_static_memory_dict[pp_rank] = {
+            'params_memory_gb': params_bytes / (1024 ** 3),
+            'grads_memory_gb': grads_bytes / (1024 ** 3),
+        }
+
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f"Collected static memory for pp_rank={pp_rank}: "
+            f"params={self.pp_static_memory_dict[pp_rank]['params_memory_gb']:.2f}GB, "
+            f"grads={self.pp_static_memory_dict[pp_rank]['grads_memory_gb']:.2f}GB",
+        )
 
     def _create_task_dependencies(self):
         for pp_rank in range(self.pipeline_parallel_size):
@@ -367,6 +443,27 @@ class VppSimulator(object):
                 for pp_rank in range(self.pipeline_parallel_size - 1, -1, -1):
                     yield (pp_rank, model_chunk_id, micro_batch_id)
 
+    def _get_moe_layer_pattern(self):
+        args = get_args()
+        moe_layer_freq = getattr(args, 'moe_layer_freq', None)
+        total_layers = getattr(args, 'num_layers', 0)
+
+        if isinstance(moe_layer_freq, int):
+            if moe_layer_freq <= 0:
+                raise ValueError(f"Invalid moe_layer_freq: {moe_layer_freq}")
+            return [
+                1 if (layer_idx % moe_layer_freq == 0) else 0
+                for layer_idx in range(total_layers)
+            ]
+        if isinstance(moe_layer_freq, list):
+            if len(moe_layer_freq) != total_layers:
+                raise ValueError(
+                    f"Invalid length of moe_layer_freq: {len(moe_layer_freq)}, "
+                    f"expected {total_layers}"
+                )
+            return moe_layer_freq
+        raise ValueError(f"Invalid moe_layer_freq: {type(moe_layer_freq)}, {moe_layer_freq}")
+
     def _get_moe_pattern_for_chunk(self, pp_rank, vpp_rank, base_layout):
         """
         Determine MoE/Dense pattern for decoder layers in the current chunk
@@ -389,20 +486,19 @@ class VppSimulator(object):
         if num_decoder_layers == 0:
             return []
 
-        # Get MoE frequency configuration
-        moe_layer_freq = getattr(args, 'moe_layer_freq', None)
-        total_layers = getattr(args, 'num_layers', 0)
-
-        assert isinstance(moe_layer_freq, list)
+        moe_layer_pattern = self._get_moe_layer_pattern()
 
         pattern = []
         for i in range(num_decoder_layers):
             global_layer_idx = layer_offset + i
-            if global_layer_idx < len(moe_layer_freq):
-                is_moe = moe_layer_freq[global_layer_idx] == 1
+            if global_layer_idx < len(moe_layer_pattern):
+                is_moe = moe_layer_pattern[global_layer_idx] == 1
                 pattern.append('moe' if is_moe else 'dense')
             else:
-                raise ValueError(f"Global layer index {global_layer_idx} out of range for moe_layer_freq at pp_rank {pp_rank}, vpp_rank {vpp_rank}")
+                raise ValueError(
+                    f"Global layer index {global_layer_idx} out of range for "
+                    f"moe_layer_freq at pp_rank {pp_rank}, vpp_rank {vpp_rank}"
+                )
 
         return pattern
 
@@ -888,6 +984,7 @@ class VppSimulator(object):
             self.current_model = create_model(pp_rank, self.model_provider)
             self.current_model_pp_rank = pp_rank
             self.current_model_vpp_rank = vpp_rank
+            self._record_static_memory(pp_rank, self.current_model)
 
         else:
             if global_rank == 0:
@@ -901,6 +998,8 @@ class VppSimulator(object):
             task.duration = 0.0
             task.finished = False  # Not actually executed
             return task
+
+        self._clear_grad_state_on_model_chunk_switch(pp_rank, vpp_rank)
 
         # Prepare input tensor
         input_tensor = prepare_input_tensor(
@@ -920,8 +1019,9 @@ class VppSimulator(object):
             forward_step_func=self.forward_step_func,
             args=args,
             microbatch_id=microbatch_id,
-            warmup_times=15,
-            measure_times=10,
+            warmup_times=args.simulation_warmup_times,
+            measure_times=args.simulation_measure_times,
+            measure_skip_times=args.simulation_measure_skip_times,
         )
 
         # Cache output tensor for downstream stages
@@ -982,10 +1082,13 @@ class VppSimulator(object):
             self.current_model = create_model(pp_rank, self.model_provider)
             self.current_model_pp_rank = pp_rank
             self.current_model_vpp_rank = vpp_rank
+            self._record_static_memory(pp_rank, self.current_model)
             # Note: Static memory is already collected in forward task, no need to recalculate here
         else:
             if global_rank == 0:
                 log_single_rank(logger, logging.INFO, f"Reusing existing model for pp_rank={pp_rank}, vpp_rank={vpp_rank}")
+
+        self._clear_grad_state_on_model_chunk_switch(pp_rank, vpp_rank)
 
         # Prepare input tensor from forward pass output
         input_tensor = prepare_input_tensor(
@@ -1012,8 +1115,9 @@ class VppSimulator(object):
             microbatch_id=microbatch_id,
             num_model_chunks=self.num_model_chunks,
             task_input_tensor_grad_dict=self.task_input_tensor_grad_dict,
-            warmup_times=15,
-            measure_times=10,
+            warmup_times=args.simulation_warmup_times,
+            measure_times=args.simulation_measure_times,
+            measure_skip_times=args.simulation_measure_skip_times,
         )
 
         # Cache input gradient tensor for upstream stages

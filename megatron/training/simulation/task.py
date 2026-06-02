@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 from typing import Any, Dict, List, Optional, Callable, Type
 from dataclasses import dataclass, asdict
 from enum import Enum

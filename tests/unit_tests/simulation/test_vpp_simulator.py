@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """
 Unit tests for VppSimulator.run_global_step functionality.
@@ -8,24 +8,23 @@ training under different configurations, using mocked execution functions to avo
 actual GPU computation.
 """
 
-import os
 import json
-import pytest
-import torch
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
-from megatron.training.simulation.vpp_simulate import VppSimulator
-from megatron.training.simulation.task import TaskType
-from megatron.training.global_vars import set_args
+import pytest
+import torch
+
 from megatron.core.num_microbatches_calculator import (
+    destroy_num_microbatches_calculator,
     init_num_microbatches_calculator,
-    destroy_num_microbatches_calculator
 )
-from megatron.core.transformer.pipeline_parallel_layer_layout import (
-    PipelineParallelLayerLayout
-)
+from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training.global_vars import set_args
+from megatron.training.simulation.task import TaskType
+from megatron.training.simulation.vpp_simulate import VppSimulator
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -37,8 +36,7 @@ class TestVppSimulatorBasic:
         """Setup and teardown for each test"""
         # Setup: Initialize minimal parallel environment
         Utils.initialize_model_parallel(
-            tensor_model_parallel_size=1,
-            pipeline_model_parallel_size=1
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
         )
         yield
         # Teardown: Clean up
@@ -115,6 +113,7 @@ class TestVppSimulatorBasic:
     @pytest.fixture
     def simple_model_provider(self):
         """Simple model provider returning minimal test model"""
+
         def provider(pre_process=True, post_process=True, **kwargs):
             """
             Model provider function for testing
@@ -127,8 +126,10 @@ class TestVppSimulatorBasic:
 
             Returns a list of models (VPP format)
             """
+
             class SimpleTestModel(torch.nn.Module):
                 """Minimal model for testing"""
+
                 def __init__(self, config):
                     super().__init__()
                     self.config = config  # Required by Megatron
@@ -142,10 +143,7 @@ class TestVppSimulatorBasic:
             config = kwargs.get('config', None)
             if config is None:
                 config = TransformerConfig(
-                    num_layers=4,
-                    hidden_size=64,
-                    num_attention_heads=4,
-                    use_cpu_initialization=True
+                    num_layers=4, hidden_size=64, num_attention_heads=4, use_cpu_initialization=True
                 )
 
             # Return single model object (get_model will wrap in list if needed for VPP)
@@ -156,6 +154,7 @@ class TestVppSimulatorBasic:
     @pytest.fixture
     def mock_data_iterator(self, mock_args):
         """Mock data iterator"""
+
         class MockDataIterator:
             def __init__(self, args):
                 self.args = args
@@ -167,7 +166,7 @@ class TestVppSimulatorBasic:
                     'tokens': torch.randint(0, 1000, (batch_size, seq_length)),
                     'labels': torch.randint(0, 1000, (batch_size, seq_length)),
                     'loss_mask': torch.ones(batch_size, seq_length),
-                    'attention_mask': torch.ones(batch_size, 1, seq_length, seq_length)
+                    'attention_mask': torch.ones(batch_size, 1, seq_length, seq_length),
                 }
 
             def __iter__(self):
@@ -178,6 +177,7 @@ class TestVppSimulatorBasic:
     @pytest.fixture
     def forward_step_func(self):
         """Simplified forward step function"""
+
         def forward_step(data_iterator, model, num_microbatches, input_tensor, **kwargs):
             """
             Simplified forward step for testing
@@ -237,11 +237,11 @@ class TestVppSimulatorBasic:
         # vpp_simulate.py imports: from model_executor import execute_forward_with_timing, execute_backward_with_timing
         monkeypatch.setattr(
             'megatron.training.simulation.vpp_simulate.execute_forward_with_timing',
-            fake_execute_forward
+            fake_execute_forward,
         )
         monkeypatch.setattr(
             'megatron.training.simulation.vpp_simulate.execute_backward_with_timing',
-            fake_execute_backward
+            fake_execute_backward,
         )
 
     @pytest.fixture
@@ -290,8 +290,7 @@ class TestVppSimulatorBasic:
         # vpp_simulate.py imports: from model_executor import create_model
         # So we need to patch vpp_simulate.create_model, not model_executor.create_model
         monkeypatch.setattr(
-            'megatron.training.simulation.vpp_simulate.create_model',
-            fake_create_model
+            'megatron.training.simulation.vpp_simulate.create_model', fake_create_model
         )
 
     @pytest.fixture
@@ -310,16 +309,19 @@ class TestVppSimulatorBasic:
         # Patch the analyze_global_batch method on VppSimulator class
         monkeypatch.setattr(
             'megatron.training.simulation.vpp_simulate.VppSimulator.analyze_global_batch',
-            fake_analyze_global_batch
+            fake_analyze_global_batch,
         )
 
-    @pytest.mark.parametrize("pp_size,vpp_size,num_microbatches", [
-        (1, None, 4),   # No Pipeline
-        (2, None, 4),   # 2-stage Pipeline
-        (4, None, 8),   # 4-stage Pipeline
-        (2, 2, 8),      # PP=2, VPP=2
-        (4, 2, 8),      # PP=4, VPP=2
-    ])
+    @pytest.mark.parametrize(
+        "pp_size,vpp_size,num_microbatches",
+        [
+            (1, None, 4),  # No Pipeline
+            (2, None, 4),  # 2-stage Pipeline
+            (4, None, 8),  # 4-stage Pipeline
+            (2, 2, 8),  # PP=2, VPP=2
+            (4, 2, 8),  # PP=4, VPP=2
+        ],
+    )
     def test_run_global_step_completes(
         self,
         pp_size,
@@ -332,7 +334,7 @@ class TestVppSimulatorBasic:
         mock_execute_functions,
         mock_model_creation,
         mock_performance_analysis,
-        monkeypatch
+        monkeypatch,
     ):
         """Test that run_global_step completes successfully under different PP/VPP configs"""
 
@@ -422,14 +424,14 @@ class TestVppSimulatorBasic:
                 layout_str = "|".join(stage_parts)
 
         mock_args.pipeline_model_parallel_layout = PipelineParallelLayerLayout(
-            layout=layout_str,
-            pipeline_model_parallel_size=pp_size
+            layout=layout_str, pipeline_model_parallel_size=pp_size
         )
 
         # 2. Mock parallel_state to return correct VPP size
         # VppSimulator uses parallel_state.get_virtual_pipeline_model_parallel_world_size()
         # to determine num_model_chunks, but in single-process test environment it returns None
         from megatron.core import parallel_state
+
         original_get_vpp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size
 
         def mock_get_vpp_size():
@@ -437,7 +439,7 @@ class TestVppSimulatorBasic:
 
         monkeypatch.setattr(
             'megatron.core.parallel_state.get_virtual_pipeline_model_parallel_world_size',
-            mock_get_vpp_size
+            mock_get_vpp_size,
         )
 
         # 3. Set global args and initialize num_microbatches_calculator
@@ -449,15 +451,11 @@ class TestVppSimulatorBasic:
             rampup_batch_size=None,
             global_batch_size=mock_args.global_batch_size,
             micro_batch_size=mock_args.micro_batch_size,
-            data_parallel_size=mock_args.data_parallel_size
+            data_parallel_size=mock_args.data_parallel_size,
         )
 
         # 4. Create VppSimulator
-        simulator = VppSimulator(
-            mock_data_iterator,
-            simple_model_provider,
-            forward_step_func
-        )
+        simulator = VppSimulator(mock_data_iterator, simple_model_provider, forward_step_func)
 
         # 5. Execute run_global_step
         simulator.run_global_step()
@@ -465,15 +463,16 @@ class TestVppSimulatorBasic:
         # 6. Verify: Task count is correct
         num_model_chunks = vpp_size if vpp_size else 1
         expected_task_count = pp_size * num_microbatches * num_model_chunks * 2
-        assert simulator.task_num_count == expected_task_count, \
-            f"Expected {expected_task_count} tasks, got {simulator.task_num_count}"
+        assert (
+            simulator.task_num_count == expected_task_count
+        ), f"Expected {expected_task_count} tasks, got {simulator.task_num_count}"
 
         # 7. Verify: All tasks are finished
         for task_key, task in simulator.pp_mbid_mcid_fb_task_dict.items():
-            assert task.finished, \
-                f"Task {task.task_id} not finished"
-            assert task.duration is not None and task.duration > 0, \
-                f"Task {task.task_id} has invalid duration: {task.duration}"
+            assert task.finished, f"Task {task.task_id} not finished"
+            assert (
+                task.duration is not None and task.duration > 0
+            ), f"Task {task.task_id} has invalid duration: {task.duration}"
 
         # 8. Verify: Result files created (only rank 0)
         if torch.distributed.is_initialized() and torch.distributed.get_rank() == 0:
@@ -483,13 +482,12 @@ class TestVppSimulatorBasic:
                 'pp_task_orders.json',
                 'static_memory_info.json',
                 'all_pp_vpp_layout.json',
-                'task_durations.json'
+                'task_durations.json',
             ]
 
             for filename in required_files:
                 filepath = result_dir / filename
-                assert filepath.exists(), \
-                    f"Expected result file not found: {filename}"
+                assert filepath.exists(), f"Expected result file not found: {filename}"
         elif not torch.distributed.is_initialized():
             # Single-process mode - should still create files
             result_dir = Path(mock_args.simulate_result_dir)
@@ -498,10 +496,9 @@ class TestVppSimulatorBasic:
                 'pp_task_orders.json',
                 'static_memory_info.json',
                 'all_pp_vpp_layout.json',
-                'task_durations.json'
+                'task_durations.json',
             ]
 
             for filename in required_files:
                 filepath = result_dir / filename
-                assert filepath.exists(), \
-                    f"Expected result file not found: {filename}"
+                assert filepath.exists(), f"Expected result file not found: {filename}"

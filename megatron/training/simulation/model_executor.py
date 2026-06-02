@@ -1,18 +1,20 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Model Executor Utilities for VPP Training Simulation"""
 
 import logging
+import gc
 import os
 import time
 import torch
 import torch.distributed
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from functools import partial
 
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core import parallel_state
+from megatron.core.rerun_state_machine import RerunMode, get_rerun_state_machine
 from megatron.core.utils import get_model_config, get_attr_wrapped_model, log_single_rank
 from megatron.training.global_vars import get_args
 from megatron.core.pipeline_parallel.schedules import forward_step
@@ -20,6 +22,98 @@ from megatron.training.utils import print_rank_0
 from megatron.training.simulation.utils import MockPipelineProcessGroup
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _maybe_profile_simulation_task(
+    args,
+    *,
+    task_type,
+    pp_rank,
+    vpp_rank,
+    microbatch_id,
+    measure_index,
+):
+    """Optionally export a PyTorch chrome trace for one sampled simulator task."""
+    if os.getenv("MCORE_SIM_TRACE", "0") != "1":
+        yield
+        return
+
+    global_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    target_rank = int(os.getenv("MCORE_SIM_TRACE_RANK", "0"))
+    target_pp = int(os.getenv("MCORE_SIM_TRACE_PP", "0"))
+    target_vpp = int(os.getenv("MCORE_SIM_TRACE_VPP", "0"))
+    target_microbatch = int(os.getenv("MCORE_SIM_TRACE_MICROBATCH", "0"))
+    target_measure_index = int(os.getenv("MCORE_SIM_TRACE_MEASURE_INDEX", "0"))
+    target_types = {
+        item.strip()
+        for item in os.getenv("MCORE_SIM_TRACE_TYPES", "forward,backward").split(",")
+        if item.strip()
+    }
+
+    should_profile = (
+        global_rank == target_rank
+        and pp_rank == target_pp
+        and vpp_rank == target_vpp
+        and microbatch_id == target_microbatch
+        and measure_index == target_measure_index
+        and task_type in target_types
+    )
+    if not should_profile:
+        yield
+        return
+
+    trace_dir = os.getenv(
+        "MCORE_SIM_TRACE_DIR",
+        os.path.join(args.simulate_result_dir, "torch_profile"),
+    )
+    os.makedirs(trace_dir, exist_ok=True)
+    trace_path = os.path.join(
+        trace_dir,
+        (
+            f"rank-{global_rank}-pp-{pp_rank}-vpp-{vpp_rank}-mb-{microbatch_id}-"
+            f"{task_type}-measure-{measure_index}.json"
+        ),
+    )
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    if torch.cuda.is_available():
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
+
+    with torch.profiler.profile(
+        activities=activities,
+        record_shapes=True,
+        with_stack=False,
+    ) as profiler:
+        yield
+        profiler.step()
+
+    profiler.export_chrome_trace(trace_path)
+    print_rank_0(f"[SIM_TRACE] exported {task_type} trace to {trace_path}")
+
+
+@contextmanager
+def _simulation_forward_backward_state():
+    """Enter the rerun state expected by loss/gradient validation helpers.
+
+    Simulation times individual forward/backward tasks directly instead of using
+    Megatron's full forward_backward_func wrapper. Validation hooks in loss and
+    grad code still expect the rerun state machine to be inside a
+    forward-backward pass, so provide that state while disabling rerun/replay
+    behavior that is not meaningful for sampled simulator tasks.
+    """
+    rerun_state_machine = get_rerun_state_machine()
+    original_mode = rerun_state_machine.get_mode()
+    rerun_state_machine.set_mode(RerunMode.DISABLED)
+    entered = rerun_state_machine.should_run_forward_backward(None)
+    if not entered:
+        rerun_state_machine.set_mode(original_mode)
+        raise RuntimeError("Unable to enter rerun state for simulation task execution")
+
+    try:
+        yield
+    finally:
+        rerun_state_machine.should_run_forward_backward(None)
+        rerun_state_machine.set_mode(original_mode)
 
 
 def get_pg_collection_for_simulation(pp_rank: int, pp_size: int):
@@ -132,6 +226,63 @@ def clear_model_mem(model):
     gc.collect()
 
 
+def clear_model_grad_state(model):
+    """Clear model gradient state at simulator model-chunk boundaries."""
+    model_chunks = model if isinstance(model, list) else [model]
+
+    for model_chunk in model_chunks:
+        if hasattr(model_chunk, "zero_grad_buffer"):
+            model_chunk.zero_grad_buffer()
+        if hasattr(model_chunk, "zero_grad"):
+            try:
+                model_chunk.zero_grad(set_to_none=False)
+            except TypeError:
+                model_chunk.zero_grad()
+
+        for param in model_chunk.parameters():
+            if param.grad is not None:
+                param.grad.zero_()
+            if hasattr(param, "grad_added_to_main_grad"):
+                param.grad_added_to_main_grad = False
+
+
+def _release_timing_iteration(model, input_tensor):
+    """Release per-repeat autograd state before the next simulator timing repeat."""
+    _clear_tensor_grad(input_tensor)
+    gc.collect()
+
+
+def _clear_tensor_grad(tensor_or_tensors):
+    """Drop retained input gradients from tensors reused across timing repeats."""
+    if tensor_or_tensors is None:
+        return
+    if isinstance(tensor_or_tensors, torch.Tensor):
+        tensor_or_tensors.grad = None
+        return
+    if isinstance(tensor_or_tensors, dict):
+        for tensor in tensor_or_tensors.values():
+            _clear_tensor_grad(tensor)
+        return
+    if isinstance(tensor_or_tensors, (list, tuple)):
+        for tensor in tensor_or_tensors:
+            _clear_tensor_grad(tensor)
+
+
+def _detach_tensor_tree(tensor_or_tensors):
+    """Detach tensors while preserving container structure."""
+    if tensor_or_tensors is None:
+        return None
+    if isinstance(tensor_or_tensors, torch.Tensor):
+        return tensor_or_tensors.detach()
+    if isinstance(tensor_or_tensors, dict):
+        return {key: _detach_tensor_tree(value) for key, value in tensor_or_tensors.items()}
+    if isinstance(tensor_or_tensors, tuple):
+        return tuple(_detach_tensor_tree(tensor) for tensor in tensor_or_tensors)
+    if isinstance(tensor_or_tensors, list):
+        return [_detach_tensor_tree(tensor) for tensor in tensor_or_tensors]
+    return tensor_or_tensors
+
+
 def prepare_input_tensor(pp_rank, vpp_rank, microbatch_id, task_output_tensor_dict):
     """Prepare input tensor for forward pass
 
@@ -168,7 +319,8 @@ def execute_forward_with_timing(
     args,
     microbatch_id,
     warmup_times=15,
-    measure_times=10
+    measure_times=10,
+    measure_skip_times=5,
 ):
     """Execute forward pass with timing measurement
 
@@ -182,6 +334,7 @@ def execute_forward_with_timing(
         microbatch_id: microbatch id
         warmup_times: number of warmup iterations (default 15)
         measure_times: number of measurement iterations (default 10)
+        measure_skip_times: number of measurement iterations to skip in average (default 5)
 
     Returns:
         output_tensor: output tensor from forward pass
@@ -207,58 +360,76 @@ def execute_forward_with_timing(
 
     # Warmup phase with profiling
     for i in range(warmup_times):
-        output_tensor, num_tokens = forward_step(
-            forward_step_func,
-            data_iterator,
-            model[vpp_rank],
-            num_microbatches,
-            input_tensor,
-            forward_data_store,
-            config,
-            cp_group_size,
-            collect_non_loss_data=collect_non_loss_data,
-            checkpoint_activations_microbatch=checkpoint_activations_microbatch,
-            is_first_microbatch=False,
-            current_microbatch=microbatch_id,
-            vp_stage=vpp_rank,
-            is_last_stage=is_last_stage,
-        )
+        _clear_tensor_grad(input_tensor)
+        with _simulation_forward_backward_state():
+            output_tensor, num_tokens = forward_step(
+                forward_step_func,
+                data_iterator,
+                model[vpp_rank],
+                num_microbatches,
+                input_tensor,
+                forward_data_store,
+                config,
+                cp_group_size,
+                collect_non_loss_data=collect_non_loss_data,
+                checkpoint_activations_microbatch=checkpoint_activations_microbatch,
+                is_first_microbatch=False,
+                current_microbatch=microbatch_id,
+                vp_stage=vpp_rank,
+                is_last_stage=is_last_stage,
+            )
         torch.cuda.synchronize()
         torch.distributed.barrier()
         forward_data_store = []
+        del output_tensor
+        _release_timing_iteration(model, input_tensor)
+        torch.distributed.barrier()
 
-    # Measurement phase - measure time with CUDA events
+    # Measurement phase - measure only the sampled forward task. Cleanup stays
+    # outside the timed region and a barrier before timing prevents prior
+    # cleanup skew from being charged to the next collective.
     total_forward_time = 0
-    measure_skip_times = 5  # Skip first few measurements
-
+    measured_output_tensor = None
     for i in range(measure_times):
-        forward_start = torch.cuda.Event(enable_timing=True)
-        forward_end = torch.cuda.Event(enable_timing=True)
-
-        forward_start.record()
-        output_tensor, num_tokens = forward_step(
-            forward_step_func,
-            data_iterator,
-            model[vpp_rank],
-            num_microbatches,
-            input_tensor,
-            forward_data_store,
-            config,
-            cp_group_size,
-            collect_non_loss_data=collect_non_loss_data,
-            checkpoint_activations_microbatch=checkpoint_activations_microbatch,
-            is_first_microbatch=False,
-            current_microbatch=microbatch_id,
-            vp_stage=vpp_rank,
-            is_last_stage=is_last_stage,
-        )
-        forward_end.record()
+        _clear_tensor_grad(input_tensor)
+        torch.distributed.barrier()
+        with _simulation_forward_backward_state():
+            torch.cuda.synchronize()
+            forward_start = time.perf_counter()
+            with _maybe_profile_simulation_task(
+                args,
+                task_type="forward",
+                pp_rank=pp_rank,
+                vpp_rank=vpp_rank,
+                microbatch_id=microbatch_id,
+                measure_index=i,
+            ):
+                output_tensor, num_tokens = forward_step(
+                    forward_step_func,
+                    data_iterator,
+                    model[vpp_rank],
+                    num_microbatches,
+                    input_tensor,
+                    forward_data_store,
+                    config,
+                    cp_group_size,
+                    collect_non_loss_data=collect_non_loss_data,
+                    checkpoint_activations_microbatch=checkpoint_activations_microbatch,
+                    is_first_microbatch=False,
+                    current_microbatch=microbatch_id,
+                    vp_stage=vpp_rank,
+                    is_last_stage=is_last_stage,
+                )
+            torch.cuda.synchronize()
+            forward_time = (time.perf_counter() - forward_start) * 1000.0
         forward_data_store = []
 
-        torch.cuda.synchronize()
         torch.distributed.barrier()
-
-        forward_time = forward_start.elapsed_time(forward_end)
+        if i == measure_times - 1:
+            measured_output_tensor = _detach_tensor_tree(output_tensor)
+        del output_tensor
+        _release_timing_iteration(model, input_tensor)
+        torch.distributed.barrier()
         if i >= measure_skip_times:
             total_forward_time += forward_time
 
@@ -267,7 +438,7 @@ def execute_forward_with_timing(
     measured_iterations = measure_times - measure_skip_times
     avg_forward_time = total_forward_time / measured_iterations
 
-    return output_tensor, avg_forward_time
+    return measured_output_tensor, avg_forward_time
 
 
 def prepare_output_grad_tensor(pp_rank, vpp_rank, microbatch_id, task_input_tensor_grad_dict, num_model_chunks, forward_output_tensor=None):
@@ -328,7 +499,8 @@ def execute_backward_with_timing(
     num_model_chunks,
     task_input_tensor_grad_dict,
     warmup_times=15,
-    measure_times=10
+    measure_times=10,
+    measure_skip_times=5,
 ):
     """Execute backward pass with timing measurement
 
@@ -344,13 +516,13 @@ def execute_backward_with_timing(
         task_input_tensor_grad_dict: dictionary storing task input gradient tensors
         warmup_times: number of warmup iterations (default 15)
         measure_times: number of measurement iterations (default 10)
+        measure_skip_times: number of measurement iterations to skip in average (default 5)
 
     Returns:
         input_tensor_grad: input gradient tensor for upstream stage
         avg_backward_time: average backward time in milliseconds
     """
     from megatron.core.pipeline_parallel.schedules import backward_step
-    from megatron.core.utils import get_model_type
 
     # Get ranks for profiling
     pp_rank = parallel_state.get_pipeline_model_parallel_rank()
@@ -365,7 +537,6 @@ def execute_backward_with_timing(
     collect_non_loss_data = False
     config = get_model_config(model[0])
     checkpoint_activations_microbatch = None
-    model_type = get_model_type(model[0])
     cp_group_size = parallel_state.get_context_parallel_world_size()
 
     # Determine if this is the last pipeline stage (both PP and VPP)
@@ -378,87 +549,99 @@ def execute_backward_with_timing(
 
     # Warmup phase with profiling
     for i in range(warmup_times):
-        # Forward pass to build autograd graph
-        output_tensor, num_tokens = forward_step(
-            forward_step_func,
-            data_iterator,
-            model[vpp_rank],
-            num_microbatches,
-            input_tensor,
-            forward_data_store,
-            config,
-            cp_group_size,
-            collect_non_loss_data=collect_non_loss_data,
-            checkpoint_activations_microbatch=checkpoint_activations_microbatch,
-            is_first_microbatch=False,
-            current_microbatch=microbatch_id,
-            vp_stage=vpp_rank,
-            is_last_stage=is_last_stage,
-        )
-        forward_data_store = []
+        _clear_tensor_grad(input_tensor)
+        with _simulation_forward_backward_state():
+            # Forward pass to build autograd graph
+            output_tensor, num_tokens = forward_step(
+                forward_step_func,
+                data_iterator,
+                model[vpp_rank],
+                num_microbatches,
+                input_tensor,
+                forward_data_store,
+                config,
+                cp_group_size,
+                collect_non_loss_data=collect_non_loss_data,
+                checkpoint_activations_microbatch=checkpoint_activations_microbatch,
+                is_first_microbatch=False,
+                current_microbatch=microbatch_id,
+                vp_stage=vpp_rank,
+                is_last_stage=is_last_stage,
+            )
+            forward_data_store = []
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+
+            # Prepare output gradient tensor (with mock gradient generation if needed)
+            output_tensor_grad = prepare_output_grad_tensor(
+                pp_rank, vpp_rank, microbatch_id, task_input_tensor_grad_dict, num_model_chunks,
+                forward_output_tensor=output_tensor
+            )
+
+            # Backward pass
+            input_tensor_grad = backward_step(input_tensor, output_tensor, output_tensor_grad, config)
         torch.cuda.synchronize()
         torch.distributed.barrier()
-
-        # Prepare output gradient tensor (with mock gradient generation if needed)
-        output_tensor_grad = prepare_output_grad_tensor(
-            pp_rank, vpp_rank, microbatch_id, task_input_tensor_grad_dict, num_model_chunks,
-            forward_output_tensor=output_tensor
-        )
-
-
-        # Backward pass
-        input_tensor_grad = backward_step(
-            input_tensor, output_tensor, output_tensor_grad, model_type, config
-        )
-        torch.cuda.synchronize()
+        del output_tensor, output_tensor_grad, input_tensor_grad
+        _release_timing_iteration(model, input_tensor)
         torch.distributed.barrier()
 
-    # Measurement phase - measure backward time with CUDA events
+    # Measurement phase - measure only the sampled backward task. The setup
+    # forward and cleanup are excluded from the timed region.
     total_backward_time = 0
-    measure_skip_times = 5  # Skip first few measurements
-
+    measured_input_tensor_grad = None
     for i in range(measure_times):
-        backward_start = torch.cuda.Event(enable_timing=True)
-        backward_end = torch.cuda.Event(enable_timing=True)
+        _clear_tensor_grad(input_tensor)
+        with _simulation_forward_backward_state():
+            # Forward pass (not measured)
+            output_tensor, num_tokens = forward_step(
+                forward_step_func,
+                data_iterator,
+                model[vpp_rank],
+                num_microbatches,
+                input_tensor,
+                forward_data_store,
+                config,
+                cp_group_size,
+                collect_non_loss_data=collect_non_loss_data,
+                checkpoint_activations_microbatch=checkpoint_activations_microbatch,
+                is_first_microbatch=False,
+                current_microbatch=microbatch_id,
+                vp_stage=vpp_rank,
+                is_last_stage=is_last_stage,
+            )
+            forward_data_store = []
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
 
-        # Forward pass (not measured)
-        output_tensor, num_tokens = forward_step(
-            forward_step_func,
-            data_iterator,
-            model[vpp_rank],
-            num_microbatches,
-            input_tensor,
-            forward_data_store,
-            config,
-            cp_group_size,
-            collect_non_loss_data=collect_non_loss_data,
-            checkpoint_activations_microbatch=checkpoint_activations_microbatch,
-            is_first_microbatch=False,
-            current_microbatch=microbatch_id,
-            vp_stage=vpp_rank,
-            is_last_stage=is_last_stage,
-        )
-        forward_data_store = []
-        torch.cuda.synchronize()
+            # Prepare output gradient tensor (with mock gradient generation if needed)
+            output_tensor_grad = prepare_output_grad_tensor(
+                pp_rank, vpp_rank, microbatch_id, task_input_tensor_grad_dict, num_model_chunks,
+                forward_output_tensor=output_tensor
+            )
+
+            # Backward pass (measured)
+            torch.distributed.barrier()
+            torch.cuda.synchronize()
+            backward_start = time.perf_counter()
+            with _maybe_profile_simulation_task(
+                args,
+                task_type="backward",
+                pp_rank=pp_rank,
+                vpp_rank=vpp_rank,
+                microbatch_id=microbatch_id,
+                measure_index=i,
+            ):
+                input_tensor_grad = backward_step(input_tensor, output_tensor, output_tensor_grad, config)
+            torch.cuda.synchronize()
+            backward_time = (time.perf_counter() - backward_start) * 1000.0
+
         torch.distributed.barrier()
-
-        # Prepare output gradient tensor (with mock gradient generation if needed)
-        output_tensor_grad = prepare_output_grad_tensor(
-            pp_rank, vpp_rank, microbatch_id, task_input_tensor_grad_dict, num_model_chunks,
-            forward_output_tensor=output_tensor
-        )
-
-        # Backward pass (measured)
-        backward_start.record()
-        input_tensor_grad = backward_step(
-            input_tensor, output_tensor, output_tensor_grad, model_type, config
-        )
-        backward_end.record()
-
-        torch.cuda.synchronize()
+        if i == measure_times - 1:
+            measured_input_tensor_grad = _detach_tensor_tree(input_tensor_grad)
+        del output_tensor, output_tensor_grad, input_tensor_grad
+        _release_timing_iteration(model, input_tensor)
         torch.distributed.barrier()
-
-        backward_time = backward_start.elapsed_time(backward_end)
         if i >= measure_skip_times:
             total_backward_time += backward_time
 
@@ -470,4 +653,4 @@ def execute_backward_with_timing(
     measured_iterations = measure_times - measure_skip_times
     avg_backward_time = total_backward_time / measured_iterations
 
-    return input_tensor_grad, avg_backward_time
+    return measured_input_tensor_grad, avg_backward_time
