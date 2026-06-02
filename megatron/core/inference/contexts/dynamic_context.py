@@ -5,6 +5,7 @@ import math
 import operator
 import warnings
 from contextlib import nullcontext
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch  # type: ignore
@@ -210,6 +211,28 @@ class ContextErrorFactory:
         error = ContextOverflowError(**{k: v for k, v in obj.items() if k != "type"})
         error.__class__ = error_cls  # todo (@lmcafee): better/safer alternative?
         return error
+
+
+@dataclass
+class AsyncDecodeLifecyclePlan:
+    """Planned post-bookkeeping layout for a speculative decode forward."""
+
+    request_ids: Tensor
+    source_request_idxs: Tensor
+    query_lengths: Tensor
+    kv_length_offsets: Tensor
+    request_to_kv_block_ids: Tensor
+    token_to_pos_ids: Tensor
+    token_to_request_idx: Tensor
+    token_to_position_in_request: Tensor
+    token_to_local_position_within_kv_block: Tensor
+    token_to_block_idx: Tensor
+    reserved_request_ids: Tensor
+    reserved_block_ids: Tensor
+    reserved_block_columns: Tensor
+    finished_request_ids: Tensor
+    active_request_count: int
+    active_token_count: int
 
 
 def get_mem_size_str(n_bytes: int) -> str:
@@ -2438,6 +2461,200 @@ class DynamicInferenceContext(BaseInferenceContext):
         blocks = blocks.to(dtype=torch.int32, device='cpu')
         self._async_deferred_kv_blocks_to_release = torch.cat(
             (self._async_deferred_kv_blocks_to_release, blocks)
+        )
+
+    def _build_async_decode_lifecycle_plan(
+        self, *, reserve_blocks: bool = False
+    ) -> Optional[AsyncDecodeLifecyclePlan]:
+        """Plan the next decode-only layout without mutating live request rows."""
+        n_active = self.total_request_count - self.paused_request_count
+        if n_active <= 0 or self.num_prefill_requests != 0:
+            return None
+        if self.get_index_of_chunked_prefill_request(safe=True) != -1:
+            return None
+        if self._async_reserved_kv_block_count != 0:
+            return None
+
+        tokens_per_request = self.num_speculative_tokens + 1
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+        active_request_idxs = torch.arange(
+            self.paused_request_count, self.total_request_count, dtype=torch.long, device='cpu'
+        )
+        predicted_kv_offsets = (
+            self.request_kv_length_offsets[active_slice] + self.request_query_lengths[active_slice]
+        )
+        active_requests_mask = (
+            predicted_kv_offsets < self.request_output_lengths[active_slice]
+        ).to(torch.uint8)
+        active_request_count = int((active_requests_mask == 1).sum().item())
+        finished_request_count = n_active - active_request_count
+        if active_request_count == 0:
+            return None
+
+        row_order = torch.arange(self.total_request_count, dtype=torch.long, device='cpu')
+        finished_request_ids = self.request_ids[active_request_idxs[active_requests_mask == 0]]
+
+        if finished_request_count > 0 and active_request_count > 0:
+            finished_idxs_on_left = (
+                torch.nonzero(active_requests_mask[:active_request_count] == 0, as_tuple=True)[0]
+                + self.paused_request_count
+            )
+            active_idxs_on_right = (
+                torch.nonzero(active_requests_mask[active_request_count:], as_tuple=True)[0]
+                + active_request_count
+                + self.paused_request_count
+            )
+            if finished_idxs_on_left.numel() > 0:
+                row_order[finished_idxs_on_left] = row_order[active_idxs_on_right]
+
+        total_request_count = active_request_count + self.paused_request_count
+        paused_request_count = self.paused_request_count
+
+        active_source_idxs = row_order[paused_request_count:total_request_count]
+        if active_source_idxs.numel() == 0:
+            return None
+
+        num_tokens_in_last_block = self.request_last_kv_block_offset[active_source_idxs]
+        active_requests_requiring_new_block = (
+            num_tokens_in_last_block >= self.block_size_tokens - 1 - self.num_speculative_tokens
+        ).byte()
+
+        max_allowed_active = min(
+            self.max_requests, self.max_tokens // (self.num_speculative_tokens + 1)
+        )
+        if active_request_count > max_allowed_active:
+            active_requests_requiring_new_block[max_allowed_active:] = 1
+
+        boundary_count = int((active_requests_requiring_new_block == 1).sum().item())
+        if boundary_count > 0 and boundary_count != active_request_count:
+            active_request_idxs_on_left = (
+                torch.nonzero(
+                    active_requests_requiring_new_block[:boundary_count] == 0, as_tuple=True
+                )[0]
+                + paused_request_count
+            )
+            paused_request_idxs_on_right = (
+                torch.nonzero(
+                    active_requests_requiring_new_block[boundary_count:] == 1, as_tuple=True
+                )[0]
+                + boundary_count
+                + paused_request_count
+            )
+            dst_idxs = torch.cat((active_request_idxs_on_left, paused_request_idxs_on_right))
+            src_idxs = torch.cat((paused_request_idxs_on_right, active_request_idxs_on_left))
+            if dst_idxs.numel() > 0:
+                row_order[dst_idxs] = row_order[src_idxs]
+
+        paused_request_count += boundary_count
+        active_request_count -= boundary_count
+
+        resume_request_count = 0
+        if paused_request_count > 0:
+            planned_active_source_idxs = row_order[paused_request_count:total_request_count]
+            active_block_used = int(
+                self.request_kv_block_counts[planned_active_source_idxs].sum().item()
+            )
+            active_block_count_avail = self.kv_block_allocator.active_count - active_block_used
+
+            paused_source_idxs = row_order[:paused_request_count]
+            paused_block_counts = self.request_kv_block_counts[paused_source_idxs].flip(dims=[0])
+            paused_offsets = self.request_last_kv_block_offset[paused_source_idxs]
+            paused_needs_new_block = (
+                paused_offsets >= self.block_size_tokens - 1 - self.num_speculative_tokens
+            ).to(paused_block_counts.dtype)
+            paused_needs_new_block = paused_needs_new_block.flip(dims=[0])
+            paused_block_counts = paused_block_counts + paused_needs_new_block
+            paused_block_counts_cumsum = paused_block_counts.cumsum(dim=0)
+            resume_request_count = min(
+                int(torch.nonzero(paused_block_counts_cumsum <= active_block_count_avail).numel()),
+                int(self.kv_block_allocator.total_avail),
+            )
+            allowed_to_resume = max(0, max_allowed_active - active_request_count)
+            resume_request_count = min(resume_request_count, allowed_to_resume)
+
+        resume_start = paused_request_count - resume_request_count
+        resume_end = paused_request_count
+        planned_paused_request_count = resume_start
+        planned_active_request_count = active_request_count + resume_request_count
+        planned_active_source_idxs = row_order[resume_start:total_request_count]
+        if planned_active_request_count <= 0 or planned_active_source_idxs.numel() == 0:
+            return None
+
+        request_to_kv_block_ids_view = self.request_to_kv_block_ids[planned_active_source_idxs].clone()
+        reserved_request_ids = torch.empty((0,), dtype=self.request_ids.dtype, device='cpu')
+        reserved_block_ids = torch.empty((0,), dtype=torch.int32, device='cpu')
+        reserved_block_columns = torch.empty((0,), dtype=torch.int32, device='cpu')
+        if resume_request_count > 0:
+            resumed_source_idxs = row_order[resume_start:resume_end]
+            resumed_offsets = self.request_last_kv_block_offset[resumed_source_idxs]
+            resumed_needs_new_block = (
+                resumed_offsets >= self.block_size_tokens - 1 - self.num_speculative_tokens
+            )
+            num_new_blocks = int(resumed_needs_new_block.sum().item())
+            if num_new_blocks > 0:
+                if num_new_blocks > self.kv_block_allocator.total_avail:
+                    return None
+                if reserve_blocks:
+                    block_ids = self.kv_block_allocator.allocate_memory_blocks(num_new_blocks)
+                    if block_ids is None or block_ids.numel() != num_new_blocks:
+                        return None
+                else:
+                    alloc_start = self.kv_block_allocator.total_avail - num_new_blocks
+                    alloc_end = self.kv_block_allocator.total_avail
+                    block_ids = self.kv_block_allocator.block_bag[alloc_start:alloc_end]
+                relative_rows = torch.nonzero(resumed_needs_new_block, as_tuple=True)[0]
+                source_rows = resumed_source_idxs[relative_rows]
+                block_columns = self.request_kv_block_counts[source_rows].to(torch.long)
+                plan_rows = relative_rows.to(torch.long)
+                request_to_kv_block_ids_view[plan_rows, block_columns] = block_ids
+                reserved_request_ids = self.request_ids[source_rows].clone()
+                reserved_block_ids = block_ids.to(dtype=torch.int32).clone()
+                reserved_block_columns = block_columns.to(dtype=torch.int32).clone()
+
+        query_lengths = torch.full(
+            (planned_active_request_count,),
+            tokens_per_request,
+            dtype=self.request_query_lengths.dtype,
+            device='cpu',
+        )
+        kv_length_offsets = (
+            self.request_kv_length_offsets[planned_active_source_idxs]
+            + self.request_query_lengths[planned_active_source_idxs]
+        )
+        token_positions = kv_length_offsets.repeat_interleave(tokens_per_request) + torch.arange(
+            tokens_per_request, device='cpu'
+        ).repeat(planned_active_request_count)
+        token_block_columns = torch.div(
+            token_positions, self.block_size_tokens, rounding_mode="floor"
+        ).to(torch.long)
+        token_request_rows = torch.arange(
+            planned_active_request_count, dtype=torch.long, device='cpu'
+        ).repeat_interleave(tokens_per_request)
+        token_block_idxs = request_to_kv_block_ids_view[token_request_rows, token_block_columns]
+        token_request_idxs = torch.arange(
+            planned_paused_request_count,
+            planned_paused_request_count + planned_active_request_count,
+            dtype=torch.int32,
+            device='cpu',
+        ).repeat_interleave(tokens_per_request)
+
+        return AsyncDecodeLifecyclePlan(
+            request_ids=self.request_ids[planned_active_source_idxs].clone(),
+            source_request_idxs=planned_active_source_idxs.clone(),
+            query_lengths=query_lengths,
+            kv_length_offsets=kv_length_offsets,
+            request_to_kv_block_ids=request_to_kv_block_ids_view,
+            token_to_pos_ids=token_positions,
+            token_to_request_idx=token_request_idxs,
+            token_to_position_in_request=token_positions.clone(),
+            token_to_local_position_within_kv_block=token_positions % self.block_size_tokens,
+            token_to_block_idx=token_block_idxs,
+            reserved_request_ids=reserved_request_ids,
+            reserved_block_ids=reserved_block_ids,
+            reserved_block_columns=reserved_block_columns,
+            finished_request_ids=finished_request_ids.clone(),
+            active_request_count=planned_active_request_count,
+            active_token_count=planned_active_request_count * tokens_per_request,
         )
 
     def _adopt_or_defer_async_reserved_kv_blocks(self, active_requests_mask: Tensor) -> Tensor:

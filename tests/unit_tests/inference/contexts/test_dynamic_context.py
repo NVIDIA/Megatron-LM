@@ -696,6 +696,70 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
+    @pytest.mark.parametrize(
+        ("last_offsets", "output_lengths", "expected_request_ids"),
+        [
+            ([1, 2, 0], [32, 32, 32], [10, 11, 12]),
+            ([15, 0, 15], [32, 32, 32], [10, 12, 11]),
+            ([1, 2, 0], [32, 5, 32], [10, 12]),
+        ],
+    )
+    def test_async_lifecycle_plan_matches_update_requests_layout(
+        self, last_offsets, output_lengths, expected_request_ids
+    ):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=128,
+            buffer_size_gb=0.02,
+            block_size_tokens=16,
+            max_tokens=1_000_000,
+            num_cuda_graphs=1,
+            enable_async_scheduling=True,
+        )
+        requests = [
+            DynamicInferenceRequest(
+                request_id=request_id,
+                prompt_tokens=torch.arange(0, 1, device='cpu'),
+                sampling_params=SamplingParams(num_tokens_to_generate=31),
+            )
+            for request_id in [10, 11, 12]
+        ]
+        dynamic_context.add_dummy_requests_parallel(requests, count_as_prefill=False)
+        dynamic_context.active_token_count = 3
+        dynamic_context.num_prefill_requests = 0
+        dynamic_context.request_query_lengths[:3] = 1
+        dynamic_context.request_kv_length_offsets[:3] = torch.tensor([4, 4, 4], dtype=torch.int32)
+        dynamic_context.request_output_lengths[:3] = torch.tensor(output_lengths, dtype=torch.int32)
+        dynamic_context.request_last_kv_block_offset[:3] = torch.tensor(
+            last_offsets, dtype=torch.int32
+        )
+
+        total_avail_before = dynamic_context.kv_block_allocator.total_avail
+        plan = dynamic_context._build_async_decode_lifecycle_plan()
+
+        assert dynamic_context.kv_block_allocator.total_avail == total_avail_before
+        assert plan is not None
+        assert plan.request_ids.tolist() == expected_request_ids
+
+        active_mask = (
+            dynamic_context.request_kv_length_offsets[:3]
+            + dynamic_context.request_query_lengths[:3]
+            < dynamic_context.request_output_lengths[:3]
+        ).to(torch.uint8)
+        dynamic_context.update_requests(
+            active_mask, torch.tensor([101, 102, 103], dtype=torch.int64)
+        )
+
+        actual_active_ids = dynamic_context.request_ids[
+            dynamic_context.paused_request_count : dynamic_context.total_request_count
+        ].tolist()
+        assert actual_active_ids == expected_request_ids
+
+    @pytest.mark.internal
+    @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_update_request(self, is_hybrid_model: bool):
 
