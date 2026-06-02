@@ -115,15 +115,15 @@ class TransformerLayerSchedulePlan:
             pre_dispatch_computation, moe_dispatch, mlp, moe_combine,
             and mtp_post_process.
         """
-        from megatron.core.models.common.fine_grained_callables import build_layer_callables
+        from megatron.core.models.common.fine_grained_callables import (
+            build_layer_callables,
+            get_layer_moe_metadata,
+        )
         from megatron.core.models.common.utils import TransformerLayerNode
         from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
 
-        # The dispatcher returns is_moe / num_local_experts directly since it
-        # already knows the layer type (saves a separate isinstance dance here).
-        fwd_callables, bwd_dw_callable_map, is_moe, num_local_experts = build_layer_callables(
-            self.layer
-        )
+        fwd_callables, bwd_dw_callable_map = build_layer_callables(self.layer)
+        is_moe, num_local_experts = get_layer_moe_metadata(self.layer)
 
         is_mtp = isinstance(self.layer, MultiTokenPredictionLayer)
 
