@@ -204,6 +204,9 @@ class ParameterGroup:
     def reshard_parameters(self) -> None:
         """Install sharded DTensor parameters on the owning modules."""
         self._switch_to_sharded_parameters()
+
+    def release_unsharded_storage(self) -> None:
+        """Release this group's full-parameter storage."""
         self._unsharded_model_weight.release_storage()
 
     def reduce_gradients(self) -> None:

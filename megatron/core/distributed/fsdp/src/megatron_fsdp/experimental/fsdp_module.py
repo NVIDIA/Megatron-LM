@@ -14,6 +14,8 @@
 
 """Module mixin for the minimal Megatron-FSDP path."""
 
+import dataclasses
+from collections import deque
 from collections.abc import Callable
 from typing import cast
 
@@ -26,17 +28,93 @@ from .parameter_group import ParameterGroup, contained_in_parameter_group
 from .placement import MeshAxis, Placements
 
 
+@dataclasses.dataclass(frozen=True)
+class DelayedRelease:
+    """A module whose unsharded storage can be released after its consumer event."""
+
+    consumer_event: torch.cuda.Event | None
+    module: "FsdpModule"
+
+
+class FsdpContext:
+    """Runtime stream and release scheduler shared by one FSDP subtree."""
+
+    communication_stream: torch.cuda.Stream
+    delayed_releases: deque[DelayedRelease]
+    release_delay: int
+
+    def __init__(self, device: torch.device, release_delay: int = 2) -> None:
+        """Create rank-local stream state for a root FSDP subtree.
+
+        Args:
+            device: Device on which this context schedules communication.
+            release_delay: Number of unsharded module storages retained while
+                normal pre-unshard draining proceeds.
+        """
+        if release_delay < 1:
+            raise ValueError(f"release_delay must be at least 1, got {release_delay}.")
+        if device.type != "cuda":
+            raise ValueError(f"FSDP stream scheduling requires a CUDA device, got {device}.")
+
+        self.device = device
+        self.release_delay = release_delay
+        self.delayed_releases = deque()
+        self._fsdp_modules: set["FsdpModule"] = set()
+        with torch.cuda.device(self.device):
+            self.communication_stream = torch.cuda.Stream()
+
+    def add_module(self, module: "FsdpModule") -> None:
+        """Track a module using this context."""
+        self._fsdp_modules.add(module)
+
+    def remove_module(self, module: "FsdpModule") -> None:
+        """Stop tracking a module previously using this context."""
+        self._fsdp_modules.discard(module)
+
+    def is_root_module(self, module: "FsdpModule") -> bool:
+        """Return whether ``module`` is the outermost FSDP unit in this context."""
+        for candidate in tuple(self._fsdp_modules):
+            if candidate is module:
+                continue
+            if _contains_module(cast(nn.Module, candidate), cast(nn.Module, module)):
+                return False
+        return True
+
+    def enqueue_release(self, module: "FsdpModule") -> None:
+        """Queue a module's unsharded storage for delayed release."""
+        consumer_event = torch.cuda.current_stream(self.device).record_event()
+        self.delayed_releases.append(DelayedRelease(consumer_event=consumer_event, module=module))
+
+    def drain_delayed_releases(self, target_length: int) -> None:
+        """Release queued module storages FIFO until the queue reaches ``target_length``."""
+        if target_length < 0:
+            raise ValueError(f"target_length must be non-negative, got {target_length}.")
+
+        while len(self.delayed_releases) > target_length:
+            delayed_release = self.delayed_releases.popleft()
+            with torch.cuda.stream(self.communication_stream):
+                if delayed_release.consumer_event is not None:
+                    self.communication_stream.wait_event(delayed_release.consumer_event)
+                delayed_release.module.release_unsharded_storage()
+
+
 class FsdpModule:
     """Mixin attached to modules managed by the minimal FSDP path."""
 
     _parameter_groups: tuple[ParameterGroup, ...]
+    _fsdp_context: FsdpContext
     _ready_grad_parameters: set[nn.Parameter]
     num_training_parameters: int
 
     def __init__(
-        self, mesh: DeviceMesh, placements: Placements, mixed_precision_policy: MixedPrecisionPolicy
+        self,
+        mesh: DeviceMesh,
+        placements: Placements,
+        mixed_precision_policy: MixedPrecisionPolicy,
+        fsdp_context: FsdpContext,
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module."""
+        self._assign_fsdp_context(fsdp_context)
         owned_parameters = _materialize_and_collect_owned_parameters(self, _mesh_device(mesh))
         axis_indices = tuple(_axis_index(mesh, axis) for axis in placements.dp_axes)
         assert axis_indices == tuple(
@@ -58,6 +136,15 @@ class FsdpModule:
             len(group.sharded_parameters) for group in self._parameter_groups if group.requires_grad
         )
         self._register_hooks()
+
+    def _assign_fsdp_context(self, fsdp_context: FsdpContext) -> None:
+        old_context = getattr(self, "_fsdp_context", None)
+        if old_context is fsdp_context:
+            return
+        if old_context is not None:
+            old_context.remove_module(self)
+        self._fsdp_context = fsdp_context
+        self._fsdp_context.add_module(self)
 
     def _register_hooks(self) -> None:
         module = cast(nn.Module, self)
@@ -85,26 +172,62 @@ class FsdpModule:
     def pre_forward(self) -> None:
         """Prepare full parameters for forward compute."""
         self._ready_grad_parameters.clear()
+        self._unshard_on_communication_stream(
+            wait_for_current_stream=self._fsdp_context.is_root_module(self)
+        )
+
+    def _unshard_on_communication_stream(self, *, wait_for_current_stream: bool) -> None:
+        """Run this module's all-gather on the shared communication stream."""
+        context = self._fsdp_context
+        context.drain_delayed_releases(target_length=context.release_delay - 1)
+
+        current_stream = torch.cuda.current_stream(context.device)
+        if wait_for_current_stream:
+            context.communication_stream.wait_stream(current_stream)
+
+        with torch.cuda.stream(context.communication_stream):
+            self._unshard_parameter_groups()
+            ready_event = context.communication_stream.record_event()
+        current_stream.wait_event(ready_event)
+
+    def _unshard_parameter_groups(self) -> None:
         for group in self._parameter_groups:
             group.unshard_parameters()
 
     def post_forward(self) -> None:
         """Return parameters to their sharded resting state after forward compute."""
+        self._reshard_parameter_groups()
+        self._fsdp_context.enqueue_release(self)
+        if self._fsdp_context.is_root_module(self):
+            self._fsdp_context.drain_delayed_releases(target_length=0)
+
+    def _reshard_parameter_groups(self) -> None:
         for group in self._parameter_groups:
             group.reshard_parameters()
 
     def pre_backward(self) -> None:
         """Prepare full parameters for backward compute."""
-        for group in self._parameter_groups:
-            group.unshard_parameters()
+        self._unshard_on_communication_stream(wait_for_current_stream=False)
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""
+        context = self._fsdp_context
+        self._reduce_gradient_groups()
+        self._reshard_parameter_groups()
+        context.enqueue_release(self)
+        if context.is_root_module(self):
+            context.drain_delayed_releases(target_length=0)
+        self._ready_grad_parameters.clear()
+
+    def _reduce_gradient_groups(self) -> None:
         for group in self._parameter_groups:
             if group.requires_grad:
                 group.reduce_gradients()
-            group.reshard_parameters()
-        self._ready_grad_parameters.clear()
+
+    def release_unsharded_storage(self) -> None:
+        """Release unsharded storage owned by this FSDP unit."""
+        for group in self._parameter_groups:
+            group.release_unsharded_storage()
 
     def parameter_groups(self) -> tuple[ParameterGroup, ...]:
         """Return parameter groups owned by this FSDP unit."""
@@ -186,3 +309,7 @@ def _group_parameters(parameters: dict[str, nn.Parameter]) -> list[dict[str, nn.
         key = (parameter.dtype, parameter.requires_grad)
         grouped.setdefault(key, {})[name] = parameter
     return [grouped[key] for key in grouped]
+
+
+def _contains_module(parent: nn.Module, child: nn.Module) -> bool:
+    return any(module is child for module in parent.modules())
