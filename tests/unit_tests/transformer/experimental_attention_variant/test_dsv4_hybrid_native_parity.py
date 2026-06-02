@@ -2,7 +2,6 @@
 
 import gc
 import math
-from unittest.mock import patch
 
 import pytest
 import torch
@@ -21,14 +20,6 @@ from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import init_method_normal, scaled_init_method_normal
 from tests.unit_tests.test_utilities import Utils
-
-try:
-    from fast_hadamard_transform import hadamard_transform as _hadamard_transform
-
-    HAVE_HADAMARD = True
-except ImportError:
-    HAVE_HADAMARD = False
-    _hadamard_transform = None
 
 _SEED = 1234
 # Fused-path eps: in this test ``apply_rope_fusion`` is coupled to
@@ -258,23 +249,6 @@ def _native_hadamard_transform(x: torch.Tensor) -> torch.Tensor:
         y = torch.cat((a + b, a - b), dim=-1)
         h *= 2
     return (y.reshape(shape) * (n**-0.5)).to(dtype)
-
-
-def _mock_hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
-    n = x.size(-1)
-    return (_native_hadamard_transform(x) * (scale / (n**-0.5))).to(x.dtype)
-
-
-@pytest.fixture(autouse=True)
-def patch_hadamard_if_needed():
-    if HAVE_HADAMARD:
-        yield
-    else:
-        with patch(
-            'megatron.core.transformer.experimental_attention_variant.dsa.hadamard_transform',
-            _mock_hadamard_transform,
-        ):
-            yield
 
 
 def _get_window_topk_idxs(
