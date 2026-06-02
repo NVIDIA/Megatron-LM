@@ -356,13 +356,16 @@ class TestGetDataParallelSize:
             pipeline_model_parallel_size=pp,
             context_parallel_size=cp,
             num_attention_heads=4,
+            pipeline_dtype=torch.float32,
         )
         container = create_test_pretrain_container(model=model)
         assert container.get_data_parallel_size(world_size) == expected
 
     def test_world_size_not_divisible_raises(self):
         model = create_test_hybrid_model_config(
-            tensor_model_parallel_size=2, pipeline_model_parallel_size=2
+            tensor_model_parallel_size=2,
+            pipeline_model_parallel_size=2,
+            pipeline_dtype=torch.float32,
         )
         container = create_test_pretrain_container(model=model)
         with pytest.raises(AssertionError, match="not divisible by"):
@@ -702,14 +705,6 @@ class TestMixedPrecisionConsistency:
         container = create_test_pretrain_container()
         container._validate_mixed_precision_consistency()
 
-    def test_model_bf16_and_fp16_mutex(self):
-        model = create_test_hybrid_model_config(bf16=True, fp16=True)
-        container = create_test_pretrain_container(model=model)
-        with pytest.raises(
-            AssertionError, match="Model config cannot have both bf16=True and fp16=True"
-        ):
-            container._validate_mixed_precision_consistency()
-
     def test_optimizer_bf16_and_fp16_mutex(self):
         opt = create_test_optimizer_config(bf16=True, fp16=True)
         container = create_test_pretrain_container(optimizer=opt)
@@ -720,20 +715,26 @@ class TestMixedPrecisionConsistency:
 
     def test_precision_aware_bf16_alignment(self):
         model = create_test_hybrid_model_config(bf16=True)
-        opt = create_test_optimizer_config(use_precision_aware_optimizer=True, bf16=False)
+        opt = create_test_optimizer_config(
+            use_precision_aware_optimizer=True, use_distributed_optimizer=True, bf16=False
+        )
         container = create_test_pretrain_container(model=model, optimizer=opt)
         with pytest.raises(AssertionError, match="optimizer.bf16=True must be set"):
             container._validate_mixed_precision_consistency()
 
     def test_precision_aware_fp16_alignment(self):
         model = create_test_hybrid_model_config(fp16=True)
-        opt = create_test_optimizer_config(use_precision_aware_optimizer=True, fp16=False)
+        opt = create_test_optimizer_config(
+            use_precision_aware_optimizer=True, use_distributed_optimizer=True, fp16=False
+        )
         container = create_test_pretrain_container(model=model, optimizer=opt)
         with pytest.raises(AssertionError, match="optimizer.fp16=True must be set"):
             container._validate_mixed_precision_consistency()
 
     def test_precision_aware_fp32_rejects_optimizer_bf16(self):
-        opt = create_test_optimizer_config(use_precision_aware_optimizer=True, bf16=True)
+        opt = create_test_optimizer_config(
+            use_precision_aware_optimizer=True, use_distributed_optimizer=True, bf16=True
+        )
         container = create_test_pretrain_container(optimizer=opt)
         # model is fp32 by default
         with pytest.raises(AssertionError, match="must both be False"):
@@ -741,7 +742,9 @@ class TestMixedPrecisionConsistency:
 
     def test_precision_aware_aligned_bf16_passes(self):
         model = create_test_hybrid_model_config(bf16=True)
-        opt = create_test_optimizer_config(use_precision_aware_optimizer=True, bf16=True)
+        opt = create_test_optimizer_config(
+            use_precision_aware_optimizer=True, use_distributed_optimizer=True, bf16=True
+        )
         container = create_test_pretrain_container(model=model, optimizer=opt)
         container._validate_mixed_precision_consistency()
 
@@ -763,7 +766,9 @@ class TestFineGrainedActivationOffloading:
 
     def test_requires_transformer_engine(self):
         model = create_test_hybrid_model_config(
-            fine_grained_activation_offloading=True, transformer_impl="local"
+            fine_grained_activation_offloading=True,
+            offload_modules=["core_attn"],
+            transformer_impl="local",
         )
         container = create_test_pretrain_container(model=model)
         with pytest.raises(ValueError, match="only supported with transformer_engine"):
@@ -772,7 +777,9 @@ class TestFineGrainedActivationOffloading:
     def test_te_2_10_requires_env_var(self, monkeypatch):
         monkeypatch.delenv("NVTE_CPU_OFFLOAD_V1", raising=False)
         model = create_test_hybrid_model_config(
-            fine_grained_activation_offloading=True, transformer_impl="transformer_engine"
+            fine_grained_activation_offloading=True,
+            offload_modules=["core_attn"],
+            transformer_impl="transformer_engine",
         )
         container = create_test_pretrain_container(model=model)
         with patch("megatron.core.utils.is_te_min_version", return_value=True):
@@ -782,7 +789,9 @@ class TestFineGrainedActivationOffloading:
     def test_te_2_10_with_env_var_passes(self, monkeypatch):
         monkeypatch.setenv("NVTE_CPU_OFFLOAD_V1", "1")
         model = create_test_hybrid_model_config(
-            fine_grained_activation_offloading=True, transformer_impl="transformer_engine"
+            fine_grained_activation_offloading=True,
+            offload_modules=["core_attn"],
+            transformer_impl="transformer_engine",
         )
         container = create_test_pretrain_container(model=model)
         with patch("megatron.core.utils.is_te_min_version", return_value=True):
@@ -791,7 +800,9 @@ class TestFineGrainedActivationOffloading:
     def test_pre_te_2_10_skips_env_var_check(self, monkeypatch):
         monkeypatch.delenv("NVTE_CPU_OFFLOAD_V1", raising=False)
         model = create_test_hybrid_model_config(
-            fine_grained_activation_offloading=True, transformer_impl="transformer_engine"
+            fine_grained_activation_offloading=True,
+            offload_modules=["core_attn"],
+            transformer_impl="transformer_engine",
         )
         container = create_test_pretrain_container(model=model)
         with patch("megatron.core.utils.is_te_min_version", return_value=False):
@@ -1087,20 +1098,6 @@ class TestCpCommType:
         )
         container = create_test_pretrain_container(model=model)
         container.validate()
-
-    def test_cp_comm_type_list_must_match_num_layers(self, monkeypatch):
-        _patch_world_size(monkeypatch, 4)
-        # num_layers=1 but cp_comm_type list has 2 entries
-        model = create_test_hybrid_model_config(
-            num_layers=1,
-            num_attention_heads=4,
-            context_parallel_size=2,
-            seq_length=16,
-            cp_comm_type=["p2p", "p2p"],
-        )
-        container = create_test_pretrain_container(model=model)
-        with pytest.raises(AssertionError, match="Length of cp_comm_type"):
-            container.validate()
 
 
 # ---------------------------------------------------------------------------

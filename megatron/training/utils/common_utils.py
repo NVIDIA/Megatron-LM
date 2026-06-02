@@ -11,7 +11,7 @@ from collections import defaultdict
 
 import torch
 
-from megatron.core.msc_utils import open_file
+from megatron.core.msc_utils import open_file, MultiStorageClientFeature
 from megatron.core._rank_utils import safe_get_rank as _safe_get_rank
 from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
 
