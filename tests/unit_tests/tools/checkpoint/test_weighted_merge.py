@@ -737,13 +737,68 @@ def test_metadata_same_layout_balanced_work_retiles_single_chunk_tensors(
             ((4, 0), (1, 2)),
         ]
         assert result.balanced_work is True
+        assert result.balance_mode == "virtual"
         assert result.target_chunk_bytes == 16
         assert result.plan_tensor_chunks_by_rank == (5,)
 
         common_state = dist_checkpointing.load_common_state_dict(str(result.output_dir))
         provenance = common_state["weighted_merge_provenance"]
         assert provenance["balanced_work"] is True
+        assert provenance["balance_mode"] == "virtual"
         assert provenance["target_chunk_bytes"] == 16
+
+
+def test_metadata_same_layout_source_balanced_work_preserves_source_chunks(
+    tmp_path_dist_ckpt, process_group
+):
+    if _world_size() != 1:
+        pytest.skip("source-balanced chunk metadata coverage uses single-rank fixture metadata")
+
+    shape = (5, 2)
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_source_balanced_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_source_balanced_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_source_balanced_out") as output_root,
+    ):
+        _write_checkpoint(ckpt_a, 1.0, extra_value=111.0, iteration=1, shape=shape)
+        _write_checkpoint(ckpt_b, 5.0, extra_value=999.0, iteration=2, shape=shape)
+
+        result = merge_same_layout_dcp_metadata_checkpoints(
+            [ckpt_a, ckpt_b],
+            [0.25, 0.75],
+            output_root,
+            output_iteration=30,
+            extra_state_source_index=1,
+            balanced_work=True,
+            balance_mode="source",
+            target_chunk_bytes=16,
+        )
+
+        loaded = _load_checkpoint(result.output_dir, shape=shape)
+        assert torch.equal(loaded["model"]["weight"], torch.full(shape, 4.0))
+        assert torch.equal(loaded["model"]["bias"], torch.full((2,), 5.0))
+
+        source_metadata = torch_dcp.FileSystemReader(ckpt_a).read_metadata()
+        output_metadata = torch_dcp.FileSystemReader(result.output_dir).read_metadata()
+        source_weight_chunks = [
+            (tuple(chunk.offsets), tuple(chunk.sizes))
+            for chunk in source_metadata.state_dict_metadata["model.weight"].chunks
+        ]
+        output_weight_chunks = [
+            (tuple(chunk.offsets), tuple(chunk.sizes))
+            for chunk in output_metadata.state_dict_metadata["model.weight"].chunks
+        ]
+
+        assert output_weight_chunks == source_weight_chunks
+        assert result.balanced_work is True
+        assert result.balance_mode == "source"
+        assert result.target_chunk_bytes is None
+
+        common_state = dist_checkpointing.load_common_state_dict(str(result.output_dir))
+        provenance = common_state["weighted_merge_provenance"]
+        assert provenance["balanced_work"] is True
+        assert provenance["balance_mode"] == "source"
+        assert provenance["target_chunk_bytes"] is None
 
 
 def test_metadata_same_layout_generated_gpt_round_trip_cpu_without_model_builder_path(
