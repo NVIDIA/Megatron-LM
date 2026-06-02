@@ -325,6 +325,7 @@ class ShardedTensor(ShardedBase):
         from torch.distributed.tensor import DTensor
 
         assert self.dtensor_ckpt_device_mesh is not None
+        assert self.dtensor_ckpt_placements is not None
         return DTensor.from_local(
             self.data, self.dtensor_ckpt_device_mesh, self.dtensor_ckpt_placements, run_check=False
         )
