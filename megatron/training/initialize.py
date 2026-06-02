@@ -186,11 +186,11 @@ def torch_dist_init(
         print_rank_0("> setting random seeds to {} ...".format(rng_config.seed))
         _set_random_seed(
             rng_config.seed,
-            pg_collection,
             rng_config.data_parallel_random_init,
             rng_config.te_rng_tracker,
             rng_config.inference_rng_tracker,
             use_cudagraphable_rng=(model_config.cuda_graph_impl != "none"),
+            pg_collection=pg_collection,
         )
 
         if model_config.num_moe_experts is not None:
@@ -714,16 +714,18 @@ def _init_autoresume():
 
 def _set_random_seed(
     seed_: int,
-    pg_collection: ProcessGroupCollection,
     data_parallel_random_init: bool = False,
     te_rng_tracker: bool = False,
     inference_rng_tracker: bool = False,
     use_cudagraphable_rng: bool = False,
+    pg_collection: ProcessGroupCollection | None = None,
 ):
     """Set random seed for reproducibility."""
     assert seed_ is not None and seed_ > 0, f"Seed ({seed_}) should be a positive integer."
 
     current_rank = torch.distributed.get_rank()
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     # Ensure that different pipeline MP stages get different seeds.
     pp_rank = torch.distributed.get_group_rank(pg_collection.pp, current_rank)
