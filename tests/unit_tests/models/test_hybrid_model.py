@@ -73,9 +73,7 @@ def test_hybrid_model_with_custom_process_groups(tmp_path, tp_size, cp_size, pp_
         dp_size = 1
 
         # Create HyperCommGrid with dimensions tp, cp, pp, dp.
-        grid = HyperCommGrid(
-            [tp_size, cp_size, pp_size, dp_size], ["tp", "cp", "pp", "dp"]
-        )
+        grid = HyperCommGrid([tp_size, cp_size, pp_size, dp_size], ["tp", "cp", "pp", "dp"])
 
         pp_group = grid.create_pg("pp")
         cp_group = grid.create_pg("cp")
@@ -327,6 +325,7 @@ class TestHybridModel:
         model = self.model
         for expected, layer in enumerate(model.decoder.layers, start=1):
             assert expected == layer.layer_number, "layer numbers are incorrect"
+
 
 class TestHybridQKLayernorm:
 
