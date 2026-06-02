@@ -346,15 +346,6 @@ class PretrainConfigContainer(ConfigContainerBase):
         self._validate_mixed_precision_consistency()
         self._validate_fine_grained_activation_offloading()
 
-        # CUDA graph scope validation: check_for_nan_in_loss must be disabled with full_iteration graph
-        if self.model.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in self.model.cuda_graph_scope:
-            assert not self.rerun_state_machine.check_for_nan_in_loss, (
-                "check_for_nan_in_loss must be disabled when using full_iteration CUDA graph. "
-                "Set rerun_state_machine.check_for_nan_in_loss=False."
-            )
-        if self.model.cuda_graph_impl == "none":
-            self.model.cuda_graph_scope = []
-
         # ModelOpt/Quantization checks
         if getattr(self.model, "restore_modelopt_state", False):
             assert not self.model.gradient_accumulation_fusion, (

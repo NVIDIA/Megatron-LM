@@ -799,32 +799,6 @@ class TestFineGrainedActivationOffloading:
 
 
 # ---------------------------------------------------------------------------
-# CUDA graph + check_for_nan_in_loss interplay
-# ---------------------------------------------------------------------------
-
-
-class TestCudaGraphScope:
-    def test_full_iteration_blocks_nan_check(self, monkeypatch):
-        _patch_world_size(monkeypatch, 1)
-        model = create_test_hybrid_model_config(
-            cuda_graph_impl="local", cuda_graph_scope=[CudaGraphScope.full_iteration]
-        )
-        rerun = RerunStateMachineConfig(check_for_nan_in_loss=True)
-        container = create_test_pretrain_container(model=model, rerun_state_machine=rerun)
-        with pytest.raises(AssertionError, match="check_for_nan_in_loss must be disabled"):
-            container.validate()
-
-    def test_cuda_graph_none_clears_scope(self, monkeypatch):
-        _patch_world_size(monkeypatch, 1)
-        model = create_test_hybrid_model_config(
-            cuda_graph_impl="none", cuda_graph_scope=[CudaGraphScope.attn]
-        )
-        container = create_test_pretrain_container(model=model)
-        container.validate()
-        assert container.model.cuda_graph_scope == []
-
-
-# ---------------------------------------------------------------------------
 # ModelOpt / quantization
 # ---------------------------------------------------------------------------
 
