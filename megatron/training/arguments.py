@@ -18,7 +18,14 @@ from megatron.core.dist_checkpointing.validation import StrictHandling
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
-from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
+from megatron.core.transformer.cuda_graph_config import (
+    ALLOWED_INFERENCE_SCOPES,
+    get_deprecated_cuda_graph_modules_migration,
+    normalize_cuda_graph_modules,
+    normalize_inference_cuda_graph_scope,
+    validate_deprecated_cuda_graph_modules_migration_inputs,
+)
+from megatron.core.transformer.enums import AttnBackend, CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.heterogeneous.heterogeneous_config import (
     HeterogeneousTransformerConfig,
     MLPConfig,
@@ -45,7 +52,7 @@ from megatron.core.quantization.utils import (
     load_quantization_recipe,
 )
 
-from megatron.training.argument_utils import ArgumentGroupFactory
+from megatron.training.argument_utils import ArgumentGroupFactory, core_transformer_config_from_args
 
 def add_megatron_arguments(parser: argparse.ArgumentParser):
     """"Add Megatron-LM arguments to the given parser."""
@@ -147,11 +154,27 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
 
-    # Args to disable MSC
-    if not args.enable_msc:
+    # Args to enable MSC (opt-in: disabled by default)
+    if args.disable_msc_deprecated:
+        warn_rank_0(
+            '--disable-msc is deprecated and will be removed in a future release. '
+            'MSC is now disabled by default; pass --enable-msc to opt in.'
+        )
+        # Preserve legacy semantics: --disable-msc forces MSC off, even if
+        # --enable-msc was also passed.
+        args.enable_msc = False
+
+    if args.enable_msc:
+        MultiStorageClientFeature.enable()
+        if not MultiStorageClientFeature.is_enabled():
+            raise RuntimeError(
+                "--enable-msc was passed but the multistorageclient package is not "
+                "installed. Install it with `pip install multi-storage-client`."
+            )
+        warn_rank_0('The MSC feature is enabled.')
+    else:
         MultiStorageClientFeature.disable()
         assert MultiStorageClientFeature.is_enabled() is False
-        warn_rank_0('The MSC feature is disabled.')
 
     return args
 
@@ -238,6 +261,55 @@ def _eval_pattern(pattern):
         raise ValueError(f"Invalid pattern: {pattern}")
 
     return eval(pattern)
+
+
+def _parse_cuda_graph_modules_arg(scope):
+    """Parse CUDA graph module CLI values while preserving deprecated spellings for migration."""
+    if scope in {"full", "full_iteration", "full_iteration_inference"}:
+        return scope
+    return CudaGraphModule[scope]
+
+
+def _normalize_cuda_graph_modules_args(args):
+    """Normalize cuda_graph_modules to enums and apply deprecated scope migrations."""
+    normalized_scopes, deprecated_scopes, used_full_scope = normalize_cuda_graph_modules(
+        args.cuda_graph_modules
+    )
+    validate_deprecated_cuda_graph_modules_migration_inputs(
+        deprecated_scopes,
+        args.cuda_graph_impl,
+        args.inference_cuda_graph_scope,
+    )
+    if used_full_scope:
+        warn_rank_0('full scope is deprecated. Use empty cuda_graph_modules to capture the whole layer.')
+
+    for scope, attr, value in deprecated_scopes:
+        migration = get_deprecated_cuda_graph_modules_migration(
+            scope, attr, value, args.cuda_graph_impl
+        )
+        if migration is None:
+            warn_rank_0(
+                f"--cuda-graph-modules '{scope}' is deprecated and has no effect when "
+                "--cuda-graph-impl=none. Use --cuda-graph-impl=local with "
+                "--inference-cuda-graph-scope=block to enable inference CUDA graphs."
+            )
+            continue
+        migration_attr, migration_value = migration
+        warn_rank_0(
+            f"--cuda-graph-modules '{scope}' is deprecated. "
+            f"Setting --{migration_attr.replace('_', '-')}={migration_value} instead."
+        )
+        setattr(args, migration_attr, migration_value)
+
+    args.cuda_graph_modules = normalized_scopes
+
+
+def _normalize_inference_cuda_graph_scope_arg(args):
+    """Normalize inference_cuda_graph_scope and apply the impl-derived default."""
+    args.inference_cuda_graph_scope = normalize_inference_cuda_graph_scope(
+        args.inference_cuda_graph_scope, args.cuda_graph_impl
+    )
+
 
 def no_rope_freq_type(x):
     """ Controls which layers to skip performing Rotary Position Embedding.
@@ -555,6 +627,29 @@ def validate_args(args, defaults={}):
             )
             args.cuda_graph_impl = "transformer_engine"
             del args.external_cuda_graph
+
+    if getattr(args, 'cuda_graph_scope_deprecated', None) is not None:
+        assert not args.cuda_graph_modules, (
+            "--cuda-graph-scope and --cuda-graph-modules cannot be used together."
+        )
+        warn_rank_0(
+            '--cuda-graph-scope is deprecated, use --cuda-graph-modules instead.'
+        )
+        args.cuda_graph_modules = args.cuda_graph_scope_deprecated
+    del args.cuda_graph_scope_deprecated
+
+    # Normalize cuda_graph_modules and inference_cuda_graph_scope early so that
+    # all subsequent validation sees fully-typed enum values.
+    _normalize_cuda_graph_modules_args(args)
+    _normalize_inference_cuda_graph_scope_arg(args)
+    assert (
+        args.inference_cuda_graph_scope
+        in ALLOWED_INFERENCE_SCOPES[args.cuda_graph_impl]
+    ), (
+        "Invalid inference CUDA graph scope "
+        f"{args.inference_cuda_graph_scope.name!r} for "
+        f"--cuda-graph-impl={args.cuda_graph_impl!r}."
+    )
 
     # Set input defaults.
     for key in defaults:
@@ -1047,11 +1142,17 @@ def validate_args(args, defaults={}):
         assert args.ckpt_format == "fsdp_dtensor", \
             "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
     
-    if args.nccl_ub and args.use_megatron_fsdp:
-        # In Megatron-LM, required implementation for manual registration is already provided.
-        # So we enable the manual registration by default when nccl-ub and use_megatron_fsdp is set.
-        args.fsdp_manual_registration = True
-        warn_rank_0('FSDP manual registration is enabled by default when nccl-ub is enabled')
+        if args.nccl_ub:
+            # In Megatron-LM, required implementation for manual registration is already provided.
+            # So we enable the manual registration by default when nccl-ub and use_megatron_fsdp is set.
+            args.fsdp_manual_registration = True
+            warn_rank_0('FSDP manual registration is enabled by default when --nccl-ub is enabled!')
+
+        if args.init_model_with_meta_device and args.data_parallel_sharding_strategy == "no_shard":
+            raise ValueError(
+                "Meta device initialization (init_model_with_meta_device=True) is not "
+                "supported or necessary for the 'no_shard' / 0 sharding strategy."
+            )
 
     if args.fsdp_manual_registration:
         assert args.use_megatron_fsdp, "FSDP manual registration is only supported with Megatron FSDP."
@@ -1082,17 +1183,17 @@ def validate_args(args, defaults={}):
         elif not args.accumulate_allreduce_grads_in_fp32 and args.main_grads_dtype == torch.float32:
             args.accumulate_allreduce_grads_in_fp32 = True
             print_rank_0('accumulate and all-reduce gradients in fp32 for bfloat16 data type.')
-    if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration in args.cuda_graph_scope:
+    if args.cuda_graph_impl == "full_iteration":
         assert not args.check_for_nan_in_loss_and_grad, \
-        "--no-check-for-nan-in-loss-and-grad should be set with --cuda-graph-scope=full_iteration for training. Note: If you are trying to use full_iteration CUDA graphs for inference, please use --cuda-graph-scope full_iteration_inference instead"
-    
-    if args.cuda_graph_impl == "local" and CudaGraphScope.full_iteration_inference in args.cuda_graph_scope:
+        "--no-check-for-nan-in-loss-and-grad should be set with --cuda-graph-impl=full_iteration for training."
+
+    if args.inference_cuda_graph_scope == InferenceCudaGraphScope.block:
         if args.fp8 is not None:
             assert args.transformer_impl == "inference_optimized", \
-                "fp8 with full_iteration_inference CUDA graphs is only supported with " \
+                "fp8 with --inference-cuda-graph-scope=block is only supported with " \
                 "--transformer-impl=inference_optimized"
             assert args.fp8_recipe == "mxfp8", \
-                "Only --fp8-recipe=mxfp8 is supported with full_iteration_inference CUDA graphs"
+                "Only --fp8-recipe=mxfp8 is supported with --inference-cuda-graph-scope=block"
 
     if args.cuda_graph_impl == 'local':
         assert args.inference_dynamic_batching_num_cuda_graphs > 0 or args.inference_dynamic_batching_num_cuda_graphs == -1, \
@@ -1586,8 +1687,8 @@ def validate_args(args, defaults={}):
             assert is_te_min_version("2.8.0"), (
                 "overlap_grad_reduce is only supported with TE >= 2.8.0 when enabling delay_wgrad_compute"
             )
-            wgrad_in_graph_scope = CudaGraphScope.attn in args.cuda_graph_scope or (
-                CudaGraphScope.moe_router in args.cuda_graph_scope
+            wgrad_in_graph_scope = CudaGraphModule.attn in args.cuda_graph_modules or (
+                CudaGraphModule.moe_router in args.cuda_graph_modules
                 and args.moe_shared_expert_intermediate_size is not None
                 and not args.moe_shared_expert_overlap
             )
@@ -1600,7 +1701,7 @@ def validate_args(args, defaults={}):
                     'to be enabled. This is because the default gradient accumulation does not '
                     'use static memory addresses, which breaks CUDA graph requirements.'
                 )
-                if CudaGraphScope.attn in args.cuda_graph_scope:
+                if CudaGraphModule.attn in args.cuda_graph_modules:
                     assert (
                         not args.add_bias_linear and not args.add_qkv_bias
                     ), "CUDA graph with delay_wgrad_compute doesn't support attn bias for now."
@@ -1645,15 +1746,9 @@ def validate_args(args, defaults={}):
                 "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
                 "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
             )
-    if args.cuda_graph_scope == "full" or (
-        isinstance(args.cuda_graph_scope, list) and "full" in args.cuda_graph_scope
-    ):
-        if isinstance(args.cuda_graph_scope, list):
-            assert args.cuda_graph_scope == ["full"], "full scope cannot be used with other scopes."
-        args.cuda_graph_scope = []
-        warn_rank_0(
-            'full scope is deprecated. Use empty cuda_graph_scope to capture the whole layer.'
-        )
+    assert not (
+        args.cuda_graph_impl == "full_iteration" and args.cuda_graph_modules
+    ), '--cuda-graph-modules must be empty when --cuda-graph-impl=full_iteration.'
     
     if args.multi_latent_attention:
         assert not args.group_query_attention, "Group query attention is mutually exclusive with multi latent attention."
@@ -1688,98 +1783,6 @@ def _print_args(title, args):
 
 def _check_arg_is_not_none(args, arg):
     assert getattr(args, arg) is not None, '{} argument is None'.format(arg)
-
-
-def core_transformer_config_from_args(args, config_class=None):
-
-    # Config class.
-    config_class = config_class or TransformerConfig
-
-    if args.multi_latent_attention:
-        config_class = MLATransformerConfig
-
-    if args.heterogeneous_layers_config_path is not None:
-        assert not args.multi_latent_attention, "Multi latent attention with heterogeneous layers is not supported."
-        config_class = HeterogeneousTransformerConfig
-
-    # Translate args to core transformer configuration
-    kw_args = {}
-    for f in dataclasses.fields(config_class):
-        if hasattr(args, f.name):
-            kw_args[f.name] = getattr(args, f.name)
-    kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
-    kw_args['deallocate_pipeline_outputs'] = True
-    kw_args['pipeline_dtype'] = args.params_dtype
-    kw_args['batch_p2p_comm'] = not args.overlap_p2p_comm
-    kw_args['num_moe_experts'] = args.num_experts
-    kw_args['rotary_interleaved'] = args.rotary_interleaved
-    kw_args['num_layers_in_first_pipeline_stage']= args.decoder_first_pipeline_num_layers
-    kw_args['num_layers_in_last_pipeline_stage']= args.decoder_last_pipeline_num_layers
-    kw_args['fp8_param'] = args.fp8_param_gather
-    kw_args['fp4_param'] = args.fp4_param_gather
-    if args.swiglu:
-        kw_args['activation_func'] = F.silu
-        kw_args['gated_linear_unit'] = True
-        kw_args['bias_activation_fusion'] = args.bias_swiglu_fusion
-    else:
-        kw_args['bias_activation_fusion'] = args.bias_gelu_fusion
-    if args.squared_relu:
-        assert not args.swiglu
-        kw_args['activation_func'] = squared_relu
-    elif args.quick_geglu:
-        assert not args.swiglu
-        kw_args['gated_linear_unit'] = True
-        kw_args['activation_func'] = quick_gelu
-    if args.init_method_xavier_uniform:
-        kw_args['init_method'] = torch.nn.init.xavier_uniform_
-        kw_args['scaled_init_method'] = torch.nn.init.xavier_uniform_
-    if args.group_query_attention:
-        kw_args['num_query_groups'] = args.num_query_groups
-    else:
-        kw_args['num_query_groups'] = None
-    kw_args['config_logger_dir'] = args.config_logger_dir
-    if args.rope_type is None:
-        # Pop 'rope_type' to let the config class use the default value.
-        kw_args.pop('rope_type', None)
-    else:
-        assert (args.multi_latent_attention or args.rope_type == 'rope'), (
-            f'Common attention only support rope_type="rope", but got {args.rope_type}.'
-        )
-
-    if len(args.cp_comm_type) == 1:
-        kw_args['cp_comm_type'] = args.cp_comm_type[0]
-    if args.hybrid_layer_pattern is not None:
-        kw_args['is_hybrid_model'] = True
-        from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
-        if Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
-            kw_args['experimental_attention_variant'] = 'dsa'
-
-    kw_args['inference_sampling_seed'] = args.seed
-
-    # handle quantization config
-    # NOTE: Kitchen arguments are only added to the namespace when
-    # Kitchen library is available.
-    if hasattr(args, "kitchen_config_file") and args.kitchen_config_file is not None:
-        kw_args['use_kitchen'] = True
-        kw_args['quant_recipe'] = load_quantization_recipe(args.kitchen_config_file)
-    elif hasattr(args, 'kitchen_recipe_number') and args.kitchen_recipe_number is not None:
-        kw_args['use_kitchen'] = True
-        kw_args['quant_recipe'] = kitchen_quantization_recipe_config(args.kitchen_recipe_number)
-
-    kw_args['moe_latent_size'] = args.moe_latent_size
-
-    if args.te_precision_config_file:
-        assert not 'quant_recipe' in kw_args, "Quantization recipe already configured."
-        # TODO(kwyss): Prohibit fp8_params or fp4_params with this flexibility
-        kw_args['quant_recipe'] = load_quantization_recipe(args.te_precision_config_file)
-
-    if hasattr(args, "use_kitchen_attention"):
-        kw_args['use_kitchen_attention'] = args.use_kitchen_attention
-    if hasattr(args, "kitchen_attention_backend"):
-        kw_args['kitchen_attention_backend'] = args.kitchen_attention_backend
-
-    # Return config.
-    return config_class(**kw_args)
 
 
 def _add_transformer_engine_args(parser):
@@ -1821,9 +1824,13 @@ def _add_inference_args(parser):
                        choices=["megatron", "huggingface"],
                        help='Select either Megatron or Huggingface as the '
                        'Bert embedder.')
-    group.add_argument('--cuda-graph-scope', nargs='+', type=lambda scope: CudaGraphScope[scope] if scope != "full" else scope, default=[],
-                       help='Determines the CUDA graphs capturing scope. '
-                       'choices: "attn", "mlp", "moe", "moe_router", "moe_preprocess", "mamba", "full_iteration". '
+    group.add_argument('--cuda-graph-scope', nargs='+', type=_parse_cuda_graph_modules_arg,
+                       default=None, dest='cuda_graph_scope_deprecated',
+                       help=argparse.SUPPRESS)  # hidden; use --cuda-graph-modules instead
+    group.add_argument('--cuda-graph-modules', nargs='+', type=_parse_cuda_graph_modules_arg, default=[],
+                       help='Selects training capture coverage within per-layer CUDA graphs '
+                       '(local and transformer_engine implementations). '
+                       'Valid values are "attn", "mlp", "moe", "moe_router", "moe_preprocess", and "mamba": '
                        '"attn": captures operations in TransformerLayer._forward_attention(). '
                        '"mlp": captures operations in TransformerLayer._forward_mlp() for a dense layer. '
                        '"moe": captures operations in TransformerLayer._forward_mlp() for a MoE layer. '
@@ -1831,11 +1838,12 @@ def _add_inference_args(parser):
                        'including the shared experts if they are not overlapped with EP comm. '
                        '"moe_preprocess": captures operations in MoELayer.preprocess(). Must be used together with "moe_router". '
                        '"mamba": captures the mamba layer. '
-                       '"full_iteration": captures a whole training iteration. '
-                       '"full_iteration_inference": captures a whole inference iteration. '
-                       'full_iteration and full_iteration_inference scopes are only supported with --cuda-graph-impl=local, other scopes are only supported with --cuda-graph-impl=transformer_engine. '
-                       'If not specified, the default scope is to capture the whole Transformer layer. '
-                       'For backward compatibility, we still allow passing "full" to specify capturing the whole layer, and convert it to an empty list.')
+                       'An empty list means capturing the whole Transformer layer. '
+                       'This field is meaningless when --cuda-graph-impl=full_iteration and must be empty. '
+                       'Backward compatibility: "full" is deprecated but kept for backward compatibility; '
+                       'it is transformed to an empty list in validate_args. The deprecated values '
+                       '"full_iteration" and "full_iteration_inference" are also accepted and migrated '
+                       'to the new API in validate_args.')
     group.add_argument('--use-legacy-static-engine', action='store_true', default=False,
                        help='Use legacy static engine. (Current static engine uses dynamic engine under the hood)',
                        dest='use_legacy_static_engine')
@@ -1999,6 +2007,7 @@ def _add_network_size_args(parser):
         "timers",
         "finalize_model_grads_func",
         "grad_scale_func",
+        "mtp_grad_scale_func",
         "no_sync_func",
         "grad_sync_func",
         "param_sync_func",
@@ -2017,7 +2026,8 @@ def _add_network_size_args(parser):
         "moe_router_load_balancing_type",
         "moe_aux_loss_coeff",
         "cp_comm_type",
-        "cuda_graph_scope",
+        "cuda_graph_modules",
+        "cuda_graph_scope",  # deprecated alias; handled manually by --cuda-graph-scope flag
         # no CLI argument exists for these
         "virtual_pipeline_model_parallel_size",
         "params_dtype",
@@ -2762,6 +2772,17 @@ def _add_distributed_args(parser):
                        dest='align_param_gather')
     group.add_argument('--use-distributed-optimizer', action='store_true',
                        help='Use distributed optimizer.')
+    group.add_argument('--no-use-layer-wise-param-layout',
+                       action='store_false',
+                       dest='use_layer_wise_param_layout',
+                       help='Opt out of the precomputed LayerWise param layout. When set, '
+                       'falls back to the legacy LayerWise ping-pong path: all params '
+                       '(including non-Muon embeddings, biases, layernorm) live in a single '
+                       'LayerWise buffer and the optimizer uses the allgather_params() codepath. '
+                       'The default (precomputed layout) routes non-Muon params through a '
+                       'separate DistributedOptimizer with byte-level sharding, which is faster '
+                       'and uses less padding but produces different bf16 reduction ordering '
+                       'and so will not match legacy-path loss curves bit-for-bit.')
     group.add_argument('--use-nccl-ub', action='store_true', dest='nccl_ub',
                        help='Use the userbuffer registration for DP/FSDP communication buffers.'
                        'This option will reduce GPU SM usage for the DP/FSDP communication,'
@@ -3271,24 +3292,45 @@ def _add_experimental_args(parser):
     group.add_argument('--megatron-fsdp-main-params-dtype', default='fp32', choices=['fp32', 'bf16', 'fp16', 'auto'],
                        help="Data type for the main weight buffer utilized for distributed optimization "
                             "and quantization with Megatron-FSDP. If 'auto', then the native model parameter "
-                            "data-type will be used for the main weight data-type.")
+                            "data-type will be used for the main weight data-type. Replaces --main-params-dtype.")
     group.add_argument('--megatron-fsdp-main-grads-dtype', default='auto', choices=['fp32', 'bf16', 'fp16', 'auto'],
                        help="Data type for the main gradient buffer utilized for distributed optimization "
                             "with Megatron-FSDP. If 'auto', then the native model gradient data-type will "
-                            "be used for the main gradient / accumulation data-type.")
+                            "be used for the main gradient / accumulation data-type. Replaces --main-grads-dtype.")
     group.add_argument("--megatron-fsdp-grad-comm-dtype", default='auto', choices=['fp32', 'fp16', 'bf16', 'auto'],
                         help="When using Megatron-FSDP, this controls the data-type used when communicating "
                              "model gradients during FSDP. If 'auto', then the main gradient data-type will "
                              "be used for the gradient communication / reduction data-type. When using NCCL "
                              "v2.27+, reduction is always computed in FP32 if using NCCL Symmetric kernels.")
-    
+    group.add_argument(
+            '--megatron-fsdp-enable-fine-grained-param-gather',
+            action='store_true',
+            default=False,
+            dest='megatron_fsdp_enable_fine_grained_param_gather',
+            help=(
+                'If set, enables fine-grained parameter gathering for Megatron-FSDP. '
+                'This allows greater overlap between parameter all-gather operations and '
+                'forward computation, at the cost of additional communication calls. '
+                'For MXFP8, this helps save memory during fine-grained activation '
+                'recomputation, because MXFP8 forward and backward passes use different '
+                'parameter representations (rowwise data for forward, colwise data for '
+                'backward). Only the rowwise parameters of modules involved in '
+                'recomputation will be unsharded.'
+            ),
+        )
+
     return parser
 
 
 def _add_msc_args(parser):
     group = parser.add_argument_group(title="msc")
-    group.add_argument('--disable-msc', default=True, action='store_false', dest='enable_msc',
-                       help='Disable the usage of Multi-Storage Client (MSC) in Megatron Core.')
+    group.add_argument('--enable-msc', default=False, action='store_true', dest='enable_msc',
+                       help='Enable the usage of Multi-Storage Client (MSC) in Megatron Core. '
+                            'Disabled by default; pass this flag to opt in.')
+    group.add_argument('--disable-msc', default=False, action='store_true',
+                       dest='disable_msc_deprecated',
+                       help='[DEPRECATED] MSC is disabled by default; this flag is a no-op '
+                            'and will be removed in a future release.')
     return parser
 
 def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):

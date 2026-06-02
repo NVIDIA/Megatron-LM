@@ -139,9 +139,12 @@ def run_checkpoint_test(
         # Save model
         save(model_a.sharded_state_dict(), model_ckpt)
 
-        # Save optimizer (needs fresh model sharded_state_dict since save() consumes tensor refs)
+        # Save optimizer (needs fresh model sharded_state_dict since save() consumes tensor refs).
+        # validate_access_integrity=True is the regression guard for the _get_replica_id fix:
+        # without including TP rank in replica_id, every TP rank at (pp=0, dp=0) would emit
+        # the same `_mimo_*` ShardedObject as a main replica, producing duplicate-key errors.
         optim_sd_a = optimizer_a.sharded_state_dict(model_a.sharded_state_dict(), is_loading=False)
-        save(optim_sd_a, optim_ckpt, validate_access_integrity=False)
+        save(optim_sd_a, optim_ckpt, validate_access_integrity=True)
 
         dist.barrier()
 
@@ -271,3 +274,98 @@ class TestMimoCheckpoint:
             hidden_size=256,
             num_layers=2,
         )
+
+
+class TestOptimizerCheckpointHelpers:
+    """CPU-only coverage for the dist-checkpoint extract/restore helpers."""
+
+    @staticmethod
+    def _extract_param_state_sharding_type(*args, **kwargs):
+        from megatron.core.models.mimo.optimizer import _extract_param_state_sharding_type
+
+        return _extract_param_state_sharding_type(*args, **kwargs)
+
+    @staticmethod
+    def _restore_param_state_sharding_type(*args, **kwargs):
+        from megatron.core.models.mimo.optimizer import _restore_param_state_sharding_type
+
+        return _restore_param_state_sharding_type(*args, **kwargs)
+
+    @staticmethod
+    def _extract_param_groups(*args, **kwargs):
+        from megatron.core.models.mimo.optimizer import _extract_param_groups
+
+        return _extract_param_groups(*args, **kwargs)
+
+    @staticmethod
+    def _restore_param_groups(*args, **kwargs):
+        from megatron.core.models.mimo.optimizer import _restore_param_groups
+
+        return _restore_param_groups(*args, **kwargs)
+
+    def test_extract_param_state_sharding_type_wraps_value_into_sharded_object(self):
+        from megatron.core.dist_checkpointing.mapping import ShardedObject
+
+        sub_sd = {'param_state_sharding_type': 'fully_sharded_bucket_space'}
+
+        self._extract_param_state_sharding_type(sub_sd, 'images', '.1', replica_id=(0, 0, 0))
+
+        assert 'param_state_sharding_type' not in sub_sd
+        wrapped = sub_sd['_mimo_param_state_sharding_type.1']
+        assert isinstance(wrapped, ShardedObject)
+        assert wrapped.key == 'optimizer.mimo.images.1.param_state_sharding_type'
+        assert wrapped.data == 'fully_sharded_bucket_space'
+        assert wrapped.replica_id == (0, 0, 0)
+
+    def test_extract_param_state_sharding_type_noop_when_missing(self):
+        sub_sd = {'unrelated': 1}
+
+        self._extract_param_state_sharding_type(sub_sd, 'images', '', replica_id=0)
+
+        assert sub_sd == {'unrelated': 1}
+
+    def test_restore_param_state_sharding_type_renames_suffixed_key(self):
+        sub_sd = {'_mimo_param_state_sharding_type.0': 'fully_sharded_bucket_space'}
+
+        self._restore_param_state_sharding_type(sub_sd)
+
+        assert sub_sd == {'param_state_sharding_type': 'fully_sharded_bucket_space'}
+
+    def test_restore_param_state_sharding_type_noop_when_missing(self):
+        sub_sd = {'unrelated': 1}
+
+        self._restore_param_state_sharding_type(sub_sd)
+
+        assert sub_sd == {'unrelated': 1}
+
+    def test_extract_param_groups_deletes_empty_optimizer_dict(self):
+        sub_sd = {'optimizer': {'param_groups': [{'lr': 0.1, 'params': [0]}]}}
+
+        self._extract_param_groups(sub_sd, 'images', '', replica_id=0)
+
+        assert 'optimizer' not in sub_sd
+        assert '_mimo_param_groups' in sub_sd
+
+    def test_extract_param_groups_keeps_optimizer_when_other_keys_remain(self):
+        sub_sd = {
+            'optimizer': {'param_groups': [{'lr': 0.1, 'params': [0]}], 'state': {0: {'step': 5}}}
+        }
+
+        self._extract_param_groups(sub_sd, 'images', '', replica_id=0)
+
+        assert sub_sd['optimizer'] == {'state': {0: {'step': 5}}}
+        assert '_mimo_param_groups' in sub_sd
+
+    def test_restore_param_groups_recreates_missing_optimizer_wrapper(self):
+        from unittest.mock import MagicMock
+
+        inner_optimizer = MagicMock()
+        inner_optimizer.optimizer.state_dict.return_value = {
+            'param_groups': [{'lr': 0.1, 'params': [42, 43]}]
+        }
+        sub_sd = {'_mimo_param_groups': [{'lr': 0.1, 'params': []}]}
+
+        self._restore_param_groups(sub_sd, inner_optimizer, 'images')
+
+        assert sub_sd['optimizer']['param_groups'][0]['params'] == [42, 43]
+        assert '_mimo_param_groups' not in sub_sd

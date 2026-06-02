@@ -97,6 +97,14 @@ def resolve_cluster_config(cluster: str) -> str:
         return "draco-oci-ord"
     if cluster == "dgxh100_coreweave":
         return "coreweave"
+    if cluster == "cpu_eos":
+        return "eos-cpu"
+    if cluster == "cpu_coreweave":
+        return "coreweave-cpu"
+    if cluster == "cpu_dracooci":
+        return "draco-oci-iad-cpu"
+    if cluster == "cpu_oci-hsg":
+        return "oci-hsg-cpu"
     if cluster == "ghci":
         return "ghci"
     raise ValueError(f"Unknown cluster {cluster} provided.")
@@ -394,7 +402,8 @@ def load_workloads(
         workloads = filter_by_test_cases(workload_manifests=workloads, test_cases=test_cases)
 
     if workloads and test_case:
-        workloads = [filter_by_test_case(workload_manifests=workloads, test_case=test_case)]
+        match = filter_by_test_case(workload_manifests=workloads, test_case=test_case)
+        workloads = [match] if match is not None else []
 
     if not workloads:
         return []
