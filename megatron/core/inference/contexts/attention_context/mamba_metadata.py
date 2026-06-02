@@ -762,6 +762,21 @@ class MambaMetadata:
 
         return mamba_idx
 
+    def free_slot_ids(self, mamba_indices_to_free: torch.Tensor) -> None:
+        """Return concrete Mamba state slots to the free pool.
+
+        Args:
+            mamba_indices_to_free (Tensor): A 1D tensor of Mamba state indices.
+        """
+        mamba_indices_to_free = mamba_indices_to_free[mamba_indices_to_free != -1]
+        num_to_free = len(mamba_indices_to_free)
+
+        if num_to_free > 0:
+            start_idx = self.mamba_state_free_slot_count
+            end_idx = start_idx + num_to_free
+            self.mamba_state_free_slots[start_idx:end_idx] = mamba_indices_to_free
+            self.mamba_state_free_slot_count = end_idx
+
     def free_slots(self, request_indices: torch.Tensor) -> None:
         """
         Frees the Mamba state slots associated with the given request indices.
@@ -771,17 +786,7 @@ class MambaMetadata:
         """
         # Get the Mamba state indices for finished requests
         mamba_indices_to_free = self.request_to_mamba_state_idx[request_indices]
-
-        # Filter out any invalid indices (e.g., -1)
-        mamba_indices_to_free = mamba_indices_to_free[mamba_indices_to_free != -1]
-        num_to_free = len(mamba_indices_to_free)
-
-        if num_to_free > 0:
-            # Add the freed indices back to the free slot pool
-            start_idx = self.mamba_state_free_slot_count
-            end_idx = start_idx + num_to_free
-            self.mamba_state_free_slots[start_idx:end_idx] = mamba_indices_to_free
-            self.mamba_state_free_slot_count = end_idx
+        self.free_slot_ids(mamba_indices_to_free)
 
         # Invalidate the Mamba state index for the finished requests
         self.request_to_mamba_state_idx[request_indices] = -1

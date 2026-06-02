@@ -992,9 +992,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._async_deferred_kv_blocks_to_release = torch.empty(
             (0,), dtype=torch.int32, device='cpu'
         )
+        self._async_deferred_mamba_slots_to_free = torch.empty(
+            (0,), dtype=torch.int32, device='cpu'
+        )
         self._async_forward_in_flight = False
         self._async_reserved_kv_block_adoption_count = 0
         self._async_deferred_kv_block_release_count = 0
+        self._async_deferred_mamba_slot_release_count = 0
         self._async_prepared_request_count = 0
         self._async_prepared_request_ids = torch.empty(
             (self.max_requests,), dtype=torch.int32, device='cpu'
@@ -1916,6 +1920,14 @@ class DynamicInferenceContext(BaseInferenceContext):
     def reset_mamba_state(self) -> None:
         """Reset state used within Mamba layers."""
         if self.is_hybrid_model:
+            if getattr(self, "_async_forward_in_flight", False):
+                self._append_deferred_async_mamba_slots(
+                    self.mamba_metadata.request_to_mamba_state_idx
+                )
+                self.mamba_metadata.request_to_mamba_state_idx.fill_(-1)
+                self.mamba_metadata.request_to_mamba_state_bank.zero_()
+                self.mamba_metadata.reset_varlen_metadata()
+                return
             self.mamba_metadata.reset()
 
     def add_dummy_requests_parallel(
@@ -2531,17 +2543,18 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._async_forward_in_flight = True
 
     def release_deferred_async_kv_blocks(self) -> None:
-        """Release async-reserved blocks after their speculative forward retires."""
+        """Release async-reserved resources after their speculative forward retires."""
         self._async_forward_in_flight = False
         if self._async_deferred_kv_blocks_to_release.numel() == 0:
+            self._release_deferred_async_mamba_slots()
             return
-        self._async_deferred_kv_block_release_count += int(
-            self._async_deferred_kv_blocks_to_release.numel()
-        )
+        kv_block_count = int(self._async_deferred_kv_blocks_to_release.numel())
+        self._async_deferred_kv_block_release_count += kv_block_count
         self.kv_block_allocator.release_memory_blocks(self._async_deferred_kv_blocks_to_release)
         self._async_deferred_kv_blocks_to_release = torch.empty(
             (0,), dtype=torch.int32, device='cpu'
         )
+        self._release_deferred_async_mamba_slots()
 
     def _append_deferred_async_kv_blocks(self, blocks: Tensor) -> None:
         """Defer releasing blocks that may still be used by an in-flight forward."""
@@ -2551,6 +2564,45 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._async_deferred_kv_blocks_to_release = torch.cat(
             (self._async_deferred_kv_blocks_to_release, blocks)
         )
+
+    def _append_deferred_async_mamba_slots(self, slots: Tensor) -> None:
+        """Defer freeing Mamba slots that an in-flight forward may still write."""
+        if slots.numel() == 0:
+            return
+        slots = slots[slots != -1].to(dtype=torch.int32, device='cpu')
+        if slots.numel() == 0:
+            return
+        self._async_deferred_mamba_slots_to_free = torch.cat(
+            (self._async_deferred_mamba_slots_to_free, slots)
+        )
+
+    def _release_deferred_async_mamba_slots(self) -> None:
+        """Return deferred Mamba slots to the free pool after async forward retirement."""
+        if (
+            not self.is_hybrid_model
+            or self._async_deferred_mamba_slots_to_free.numel() == 0
+        ):
+            return
+        slots = self._async_deferred_mamba_slots_to_free
+        self._async_deferred_mamba_slot_release_count += int(slots.numel())
+        self.mamba_metadata.free_slot_ids(slots)
+        self._async_deferred_mamba_slots_to_free = torch.empty(
+            (0,), dtype=torch.int32, device='cpu'
+        )
+
+    def _free_mamba_slots_for_request_indexes(self, request_indexes: Tensor) -> None:
+        """Free request-owned Mamba slots now or defer them past an async forward."""
+        if not self.is_hybrid_model:
+            return
+        if self._async_forward_in_flight:
+            mamba_indices_to_free = self.mamba_metadata.request_to_mamba_state_idx[
+                request_indexes
+            ]
+            self._append_deferred_async_mamba_slots(mamba_indices_to_free)
+            self.mamba_metadata.request_to_mamba_state_idx[request_indexes] = -1
+            self.mamba_metadata.request_to_mamba_state_bank[request_indexes] = 0
+        else:
+            self.mamba_metadata.free_slots(request_indexes)
 
     def _build_async_decode_lifecycle_plan(
         self, *, reserve_blocks: bool = False
@@ -3826,8 +3878,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_to_kv_block_ids[request_indexes] = -1
 
         # Free Mamba slots.
-        if self.is_hybrid_model:
-            self.mamba_metadata.free_slots(request_indexes)
+        self._free_mamba_slots_for_request_indexes(request_indexes)
 
         # Clear intermediate offset entries for released requests (CPU writes).
         if self.mamba_slot_allocator is not None:

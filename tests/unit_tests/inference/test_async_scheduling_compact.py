@@ -1010,6 +1010,27 @@ class _ReleaseRecordingAllocator:
         self.released.append(blocks.clone())
 
 
+class _MambaMetadataWithFreeRecording:
+    def __init__(self, slots, banks):
+        self.request_to_mamba_state_idx = torch.tensor(slots, dtype=torch.int32)
+        self.request_to_mamba_state_bank = torch.tensor(banks, dtype=torch.int32)
+        self.freed_slots = []
+        self.reset_called = False
+        self.reset_varlen_count = 0
+
+    def free_slot_ids(self, slots):
+        self.freed_slots.append(slots.clone())
+
+    def free_slots(self, _request_indexes):
+        raise AssertionError("async cleanup must defer slot free by concrete slot id")
+
+    def reset(self):
+        self.reset_called = True
+
+    def reset_varlen_metadata(self):
+        self.reset_varlen_count += 1
+
+
 @pytest.mark.internal
 def test_async_pending_resources_are_quarantined_until_forward_retires():
     context = object.__new__(DynamicInferenceContext)
@@ -1021,7 +1042,9 @@ def test_async_pending_resources_are_quarantined_until_forward_retires():
     context.kv_block_allocator = _ReleaseRecordingAllocator()
     context._async_forward_in_flight = True
     context._async_deferred_kv_blocks_to_release = torch.empty(0, dtype=torch.int32)
+    context._async_deferred_mamba_slots_to_free = torch.empty(0, dtype=torch.int32)
     context._async_deferred_kv_block_release_count = 0
+    context._async_deferred_mamba_slot_release_count = 0
 
     context.release_memory_blocks_from_request_indexes(torch.tensor([0], dtype=torch.long))
 
@@ -1035,6 +1058,65 @@ def test_async_pending_resources_are_quarantined_until_forward_retires():
     assert not context._async_forward_in_flight
     assert context._async_deferred_kv_blocks_to_release.numel() == 0
     assert context._async_deferred_kv_block_release_count == 2
+
+
+@pytest.mark.internal
+def test_async_pending_forward_defers_mamba_slot_free_until_forward_retires():
+    context = object.__new__(DynamicInferenceContext)
+    context.request_to_kv_block_ids = torch.tensor(
+        [[10, 11, -1], [12, -1, -1]], dtype=torch.int32
+    )
+    context.is_hybrid_model = True
+    context.mamba_metadata = _MambaMetadataWithFreeRecording(slots=[3, 5], banks=[0, 1])
+    context.mamba_slot_allocator = None
+    context.kv_block_allocator = _ReleaseRecordingAllocator()
+    context._async_forward_in_flight = True
+    context._async_deferred_kv_blocks_to_release = torch.empty(0, dtype=torch.int32)
+    context._async_deferred_mamba_slots_to_free = torch.empty(0, dtype=torch.int32)
+    context._async_deferred_kv_block_release_count = 0
+    context._async_deferred_mamba_slot_release_count = 0
+
+    context.release_memory_blocks_from_request_indexes(torch.tensor([0], dtype=torch.long))
+
+    assert context.kv_block_allocator.released == []
+    assert context.mamba_metadata.freed_slots == []
+    assert context._async_deferred_kv_blocks_to_release.tolist() == [10, 11]
+    assert context._async_deferred_mamba_slots_to_free.tolist() == [3]
+    assert context.mamba_metadata.request_to_mamba_state_idx.tolist() == [-1, 5]
+    assert context.mamba_metadata.request_to_mamba_state_bank.tolist() == [0, 1]
+
+    context.release_deferred_async_kv_blocks()
+
+    assert [blocks.tolist() for blocks in context.kv_block_allocator.released] == [[10, 11]]
+    assert [slots.tolist() for slots in context.mamba_metadata.freed_slots] == [[3]]
+    assert context._async_deferred_mamba_slots_to_free.numel() == 0
+    assert context._async_deferred_mamba_slot_release_count == 1
+    assert not context._async_forward_in_flight
+
+
+@pytest.mark.internal
+def test_async_mamba_reset_defers_allocated_slots_while_forward_is_in_flight():
+    context = object.__new__(DynamicInferenceContext)
+    context.is_hybrid_model = True
+    context.mamba_metadata = _MambaMetadataWithFreeRecording(slots=[2, -1, 4], banks=[0, 0, 1])
+    context._async_forward_in_flight = True
+    context._async_deferred_kv_blocks_to_release = torch.empty(0, dtype=torch.int32)
+    context._async_deferred_mamba_slots_to_free = torch.empty(0, dtype=torch.int32)
+    context._async_deferred_mamba_slot_release_count = 0
+
+    context.reset_mamba_state()
+
+    assert not context.mamba_metadata.reset_called
+    assert context.mamba_metadata.reset_varlen_count == 1
+    assert context._async_deferred_mamba_slots_to_free.tolist() == [2, 4]
+    assert context.mamba_metadata.request_to_mamba_state_idx.tolist() == [-1, -1, -1]
+    assert context.mamba_metadata.request_to_mamba_state_bank.tolist() == [0, 0, 0]
+
+    context.release_deferred_async_kv_blocks()
+
+    assert [slots.tolist() for slots in context.mamba_metadata.freed_slots] == [[2, 4]]
+    assert context._async_deferred_mamba_slots_to_free.numel() == 0
+    assert context._async_deferred_mamba_slot_release_count == 2
 
 
 @pytest.mark.internal
