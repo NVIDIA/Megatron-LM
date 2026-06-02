@@ -24,6 +24,18 @@ from modelopt.torch.export import import_mcore_gpt_from_hf
 from modelopt.torch.utils.dataset_utils import get_dataset_dataloader
 from modelopt.torch.utils.plugins import megatron_generate, megatron_prefill
 
+# modelopt 0.45+ exposes a shared Megatron calibration forward loop. Fall back to the
+# legacy local-JSONL + HF-dataset calibration path on 0.44 so this script works on both
+# releases.
+try:
+    from modelopt.torch.utils.plugins.megatron_calibration import (
+        get_megatron_calibration_forward_loop,
+    )
+
+    _HAS_SHARED_CALIB = True
+except ImportError:
+    _HAS_SHARED_CALIB = False
+
 try:
     import modelopt.torch.quantization.plugins.psx_formats as mtq_psx
 except ImportError:
@@ -39,7 +51,8 @@ except ImportError:
 
 from utils import get_hf_tokenizer
 
-from megatron.core.utils import get_batch_on_this_cp_rank
+from megatron.core.parallel_state import get_context_parallel_group
+from megatron.core.utils import get_batch_on_this_cp_rank, unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
@@ -47,7 +60,7 @@ from megatron.post_training.utils import print_distributed_quant_summary, report
 from megatron.training import get_args, get_model, initialize_megatron
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import save_checkpoint
-from megatron.training.utils import print_rank_0, unwrap_model
+from megatron.training.utils import print_rank_0
 from model_provider import model_provider
 
 warnings.filterwarnings("ignore")
@@ -78,7 +91,10 @@ def add_text_generate_ptq_args(parser):
     """Add additional arguments for ModelOpt text generation PTQ."""
     group = parser.add_argument_group(title="ModelOpt text generation ptq")
     group.add_argument(
-        "--calib-size", type=int, default=512, help="Number of samples to use for ptq calibration."
+        "--calib-size",
+        type=int,
+        default=1024,
+        help="Number of samples to use for ptq calibration.",
     )
     group.add_argument(
         "--calib-dataset-path-or-name",
@@ -89,7 +105,7 @@ def add_text_generate_ptq_args(parser):
     group.add_argument(
         "--calib-max-sequence-length",
         type=int,
-        default=512,
+        default=4096,
         help="Maximum sequence length for calibration.",
     )
     group.add_argument(
@@ -354,18 +370,32 @@ if __name__ == "__main__":
             if all_references[idx] is not None:
                 assert all_references[idx] == generated_texts[0], all_references[idx]
 
-    def _dataset_forward_loop_func(model):
-        dataloader = get_calib_dataloader(
-            dataset_path_or_name=args.calib_dataset_path_or_name,
-            tokenizer=tokenizer,
-            calib_size=args.calib_size,
-            max_sequence_length=args.calib_max_sequence_length,
-            use_random_offset=args.calib_use_random_offset,
+    if _HAS_SHARED_CALIB:
+        _dataset_forward_loop_func = get_megatron_calibration_forward_loop(
+            tokenizer,
+            dataset_name=args.calib_dataset_path_or_name,
+            num_samples=args.calib_size,
+            seq_length=args.calib_max_sequence_length,
             batch_size=args.calib_batch_size,
+            # pack=True uses Megatron pretraining-style global-stream document packing
+            # Leave to False for backward compatibility
+            pack=False,
         )
-        for sample in tqdm(dataloader, disable=torch.distributed.get_rank()):
-            sample = get_batch_on_this_cp_rank(sample)
-            megatron_prefill(model, sample["input_ids"], skip_return_logits=True)
+    else:
+        def _dataset_forward_loop_func(model):
+            dataloader = get_calib_dataloader(
+                dataset_path_or_name=args.calib_dataset_path_or_name,
+                tokenizer=tokenizer,
+                calib_size=args.calib_size,
+                max_sequence_length=args.calib_max_sequence_length,
+                use_random_offset=args.calib_use_random_offset,
+                batch_size=args.calib_batch_size,
+            )
+            for sample in tqdm(dataloader, disable=torch.distributed.get_rank()):
+                sample = get_batch_on_this_cp_rank(
+                    sample, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+                )
+                megatron_prefill(model, sample["input_ids"], skip_return_logits=True)
 
     unwrapped_model = unwrap_model(model)[0]
 

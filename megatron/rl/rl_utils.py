@@ -89,9 +89,8 @@ from megatron.training.utils import (
     get_ltor_masks_and_position_ids,
     get_nvtx_range,
     print_rank_0,
-    unwrap_model,
 )
-from megatron.core.utils import get_pg_rank, get_pg_size, get_attr_wrapped_model
+from megatron.core.utils import get_pg_rank, get_pg_size, get_attr_wrapped_model, unwrap_model
 from megatron.core.process_groups_config import ProcessGroupCollection
 from wandb import wandb_run
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
@@ -1513,7 +1512,9 @@ def prepare_data_for_update(
             forward_backward_func = get_forward_backward_func()
             if args.cuda_graph_impl == "full_iteration":
                 forward_backward_func = FullCudaGraphWrapper(
-                    forward_backward_func, cuda_graph_warmup_steps=args.cuda_graph_warmup_steps
+                    forward_backward_func,
+                    cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
+                    use_single_mempool=args.cuda_graph_use_single_mempool,
                 )
 
             dtype = (

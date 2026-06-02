@@ -23,6 +23,7 @@ from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import InferenceCudaGraphScope, ModelType
 from megatron.core.transformer.module import GraphableMegatronModule
+from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_handler
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
     mtp_on_this_rank,
@@ -37,6 +38,18 @@ from megatron.core.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _hybrid_logging_pg_kwargs(pg_collection: ProcessGroupCollection) -> dict:
+    tp_group = getattr(pg_collection, 'tp', None)
+    dp_cp_group = getattr(pg_collection, 'dp_cp', None)
+    if (tp_group is None) != (dp_cp_group is None):
+        raise ValueError(
+            "pg_collection.tp and pg_collection.dp_cp must both be set or both be unset."
+        )
+    if tp_group is None:
+        return {}
+    return {'tp_group': tp_group, 'dp_cp_group': dp_cp_group}
 
 
 class HybridModel(LanguageModule, GraphableMegatronModule):
@@ -187,12 +200,15 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         self.mtp_pattern = parsed.mtp_pattern
         self.mtp_num_depths = parsed.mtp_num_depths
 
+        logging_pg_kwargs = _hybrid_logging_pg_kwargs(self.pg_collection)
+
         layer_type_list, layer_offset = select_pipeline_segment(
             parsed.main_pattern or '',
             self.pg_collection.pp,
             vp_stage,
             first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
             last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
+            **logging_pg_kwargs,
         )
 
         # Determine if MTP is needed (based on pattern parsing)
@@ -203,7 +219,12 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             # to split the hybrid layer pattern into pipeline stages before parsing the pattern for
             # the current pipeline stage. This could also enable MTP standalone (MTP in a pipeline
             # stage separate from loss) to be supported in the hybrid model.
-            and mtp_on_this_rank(self.config, ignore_virtual=False, vp_stage=self.vp_stage)
+            and mtp_on_this_rank(
+                layout=self.config.pipeline_model_parallel_layout,
+                mtp_num_layers=self.config.mtp_num_layers,
+                ignore_virtual=False,
+                vp_stage=self.vp_stage,
+            )
         )
 
         # megatron core pipelining currently depends on model type
@@ -260,6 +281,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             post_process=self.post_process,
             dtype=config.params_dtype,
             pg_collection=self.pg_collection,
+            name="decoder",
         )
 
         # MTP block - uses mtp_block_spec from hybrid_stack_spec.submodules
@@ -279,6 +301,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 mtp_layer_pattern=self.mtp_pattern,
                 mtp_num_depths=self.mtp_num_depths,
                 hybrid_submodules=hybrid_submodules,
+                name="mtp",
             )
             self._setup_mtp_cuda_graphs()
 
@@ -331,6 +354,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             vp_size=self.config.virtual_pipeline_model_parallel_size,
             vp_stage=self.vp_stage,
             min_offloaded_tensor_size=self.config.min_offloaded_tensor_size,
+            max_inflight_offloads=self.config.fine_grained_offloading_max_inflight_offloads,
         )
         if self.disable_param_offloading:
             for param in self.decoder.parameters():
@@ -342,6 +366,12 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 for param in self.output_layer.parameters():
                     off_interface.mark_not_offloadable(param)
             self.disable_param_offloading = False
+
+    def preprocess_for_paged_stash(self):
+        """Preprocess for paged stash."""
+        return paged_stash_init_chunk_handler(
+            vp_size=self.config.virtual_pipeline_model_parallel_size, vp_stage=self.vp_stage
+        )
 
     def _should_call_local_cudagraph(self, *args, **kwargs):
         """
@@ -405,6 +435,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         if self.config.fine_grained_activation_offloading:
             self.preprocess_for_fine_grained_offloading()
+
+        if self.config.moe_paged_stash:
+            self.preprocess_for_paged_stash()
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
