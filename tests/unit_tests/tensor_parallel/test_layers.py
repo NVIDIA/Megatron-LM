@@ -63,16 +63,7 @@ def test_LinearWithFrozenWeight_3d_input_matches_torch_linear():
     expected = torch.nn.functional.linear(expected_input, weight, bias)
     expected.sum().backward()
 
-    actual = linear_with_frozen_weight(
-        input_data,
-        weight,
-        bias,
-        False,
-        False,
-        False,
-        None,
-        None,
-    )
+    actual = linear_with_frozen_weight(input_data, weight, bias, False, False, False, None, None)
     actual.sum().backward()
 
     assert torch.allclose(actual, expected)
