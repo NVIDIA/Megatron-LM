@@ -28,19 +28,4 @@ skill keyword — infer it from the artifact you read.
 
 ### Code Quality
 
-- Megatron-LM linting is driven by `tools/autoformat.sh`, not the
-  Megatron-Bridge pre-commit workflow. Before pushing Python changes under
-  `megatron/core` or `tests`, run the CI-equivalent check:
-  `BASE_REF=main CHECK_ONLY=true SKIP_DOCS=false bash tools/autoformat.sh`.
-  This script requires Git 2.31.0 or newer.
-- To apply the same formatting locally, run
-  `BASE_REF=main CHECK_ONLY=false bash tools/autoformat.sh`.
-- For a narrow changed-file pass, use the same tool settings as CI:
-  `uv run black --skip-magic-trailing-comma --skip-string-normalization <files>`,
-  `uv run isort <files>`, `uv run pylint <files>`, and
-  `uv run ruff check <files>`.
-- Black uses `line_length = 100` from `pyproject.toml` and
-  `--skip-magic-trailing-comma`; do not rely on trailing commas to preserve
-  multiline formatting.
-- After editing imports in any Python files, always run `uv run isort` on
-  those files to fix import order before committing.
+- After editing imports in any Python files, always run `uv run isort` on those files to fix import order before committing.
