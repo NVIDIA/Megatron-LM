@@ -31,14 +31,11 @@ def build_mtp_layer_callables(layer):
 
     Wraps the inner ``layer.mtp_model_layer``'s callables with MTP-specific
     pre-process (chunk and concat embeddings) and post-process (gather across
-    depths) steps. The inner layer is built by ``build_layer_callables`` so
-    that ``mtp_model_layer`` can be a TransformerLayer (today's case) or a
-    HybridStack (when an MTP depth uses the hybrid layout).
+    depths) steps.
     """
 
-    forward_funcs, backward_dw, is_moe, num_local_experts = build_layer_callables(
-        layer.mtp_model_layer
-    )
+    forward_funcs, backward_dw = build_layer_callables(layer.mtp_model_layer)
+    is_moe, _ = get_layer_moe_metadata(layer.mtp_model_layer)
     (pre_dispatch_forward, dispatch_forward, mlp_forward, combine_forward, _) = forward_funcs
     assert is_moe, "MTP layer in a2a overlap only supports MoE layer for now."
 
@@ -142,29 +139,31 @@ def build_mtp_layer_callables(layer):
     else:
         backward_dw["pre_dispatch_computation"] = [pre_dispatch_bwd, layer.eh_proj]
 
-    return forward_funcs, backward_dw, is_moe, num_local_experts
+    return forward_funcs, backward_dw
+
+
+def get_layer_moe_metadata(layer):
+    """Return ``(is_moe, num_local_experts)`` for schedule-node construction."""
+
+    if isinstance(layer, MultiTokenPredictionLayer):
+        return get_layer_moe_metadata(layer.mtp_model_layer)
+    if isinstance(layer, TransformerLayer):
+        is_moe = isinstance(layer.mlp, MoELayer)
+        num_local_experts = layer.mlp.num_local_experts if is_moe else None
+        return is_moe, num_local_experts
+
+    raise ValueError(f"Unsupported layer type: {type(layer)}")
 
 
 def build_layer_callables(layer):
     """Dispatch to the appropriate layer-callable builder.
 
-    Returns ``(forward_funcs, backward_dw, is_moe, num_local_experts)`` so the
-    schedule plan does not need to re-derive ``is_moe`` /
-    ``num_local_experts`` after the call — the build function already knows
-    the layer type. ``num_local_experts`` is ``None`` for dense layers.
+    Returns ``(forward_funcs, backward_dw)``.
     """
-    from megatron.core.models.hybrid.hybrid_block import HybridStack
 
-    if isinstance(layer, HybridStack):
-        from megatron.core.models.hybrid.fine_grained_callables import build_hybrid_stack_callables
-
-        return build_hybrid_stack_callables(layer)
     if isinstance(layer, MultiTokenPredictionLayer):
         return build_mtp_layer_callables(layer)
     if isinstance(layer, TransformerLayer):
-        forward_funcs, backward_dw = build_transformer_layer_callables(layer)
-        is_moe = isinstance(layer.mlp, MoELayer)
-        num_local_experts = layer.mlp.num_local_experts if is_moe else None
-        return forward_funcs, backward_dw, is_moe, num_local_experts
+        return build_transformer_layer_callables(layer)
 
     raise ValueError(f"Unsupported layer type: {type(layer)}")
