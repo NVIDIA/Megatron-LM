@@ -26,6 +26,56 @@ DELTA = 20  # MiB
 CUDA_GRAPH_DELTA = 200  # MiB — Considering some CG overhead
 
 
+class _FakeCudaStream:
+    def wait_stream(self, stream):
+        pass
+
+
+class _FakeOffloadGroup:
+    def __init__(self, name, *, offloaded):
+        self._name = name
+        self._tensors = {"tensor": (object(),) if offloaded else torch.empty(0)}
+        self.recorded_reload = False
+
+    def push_tensor(self, tag, tensor):
+        self._tensors[tag] = tensor
+
+    def wait_offload_event(self, stream):
+        pass
+
+    def record_reload_event(self, stream):
+        self.recorded_reload = True
+
+
+def test_group_start_backward_consumes_current_noop_slot_before_reloading_next(
+    monkeypatch,
+):
+    """No-op reload slots should preserve cadence without delaying the next reload."""
+    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+        ChunkOffloadHandler,
+    )
+
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: _FakeCudaStream())
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+
+    handler = ChunkOffloadHandler.__new__(ChunkOffloadHandler)
+    handler.do_offload = True
+    handler.h2d_stream = _FakeCudaStream()
+    handler._reloading_group = []
+    handler.reload = lambda state: torch.empty(0)
+
+    next_group = _FakeOffloadGroup("next", offloaded=True)
+    current_group = _FakeOffloadGroup("current", offloaded=False)
+    handler._groups_to_reload = [next_group, current_group]
+
+    handler.on_group_start_backward(current_group)
+
+    assert current_group not in handler._groups_to_reload
+    assert next_group not in handler._groups_to_reload
+    assert handler._reloading_group == [next_group]
+    assert next_group.recorded_reload
+
+
 def _reset_cuda_memory() -> None:
     gc.collect()
     if torch.cuda.is_available():
