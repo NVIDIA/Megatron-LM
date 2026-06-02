@@ -1599,10 +1599,15 @@ class TextGenerationController:
         self, cuda_graph_request_count: Optional[int]
     ) -> None:
         """Remember the request-row order that a speculative forward is computing."""
+        context = self.inference_wrapped_model.inference_context
+        pending_request_ids = context.async_prepared_request_ids_cpu()
+        if pending_request_ids is None:
+            pending_request_ids = self._active_request_ids_cpu()
         self._async_pending_forward_view = _AsyncPendingForwardView(
-            pending_request_ids=self._active_request_ids_cpu(),
+            pending_request_ids=pending_request_ids,
             cuda_graph_request_count=cuda_graph_request_count,
         )
+        context.clear_async_prepared_decode_plan()
 
     def _pending_async_forward_matches_current_rows(self) -> bool:
         """Return whether a pending speculative forward still has current row order."""
@@ -1877,6 +1882,13 @@ class TextGenerationController:
     ) -> None:
         """Write sampled decode tokens into the next-step GPU input-id buffer."""
         context = self.inference_wrapped_model.inference_context
+        if context.copy_async_prepared_decode_input_ids_from_samples(
+            self._sampled_tokens_cuda,
+            self._sampled_mtp_tokens_cuda,
+            num_speculative_tokens=self.num_speculative_tokens,
+        ):
+            return
+
         active_request_count = (
             context.total_request_count - context.paused_request_count
             if active_request_count is None
@@ -1958,6 +1970,7 @@ class TextGenerationController:
             has_real_work=True, can_launch_async_handoff=True
         )
         if not handoff_decision.launch_async_forward:
+            context.discard_async_prepared_decode_plan()
             self._async_disable_reason = "ep async handoff skipped"
             self._record_async_disable_reason(self._async_disable_reason)
             return False
@@ -1992,6 +2005,8 @@ class TextGenerationController:
         if handoff_decision.launch_async_forward:
             return True
 
+        context = self.inference_wrapped_model.inference_context
+        context.discard_async_prepared_decode_plan()
         self._async_disable_reason = "ep async handoff skipped"
         self._record_async_disable_reason(self._async_disable_reason)
         return False

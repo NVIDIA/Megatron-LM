@@ -371,6 +371,20 @@ def test_pending_async_forward_rows_discard_when_graph_shape_changes():
 
 
 @pytest.mark.internal
+def test_record_pending_forward_uses_prepared_request_order():
+    controller = _make_controller_with_rows(None, [10, 11, 12])
+    context = controller.inference_wrapped_model.inference_context
+    cleared = []
+    context.async_prepared_request_ids_cpu = lambda: torch.tensor([10, 12, 11], dtype=torch.int32)
+    context.clear_async_prepared_decode_plan = lambda: cleared.append(True)
+
+    controller._record_async_pending_forward_requests(cuda_graph_request_count=3)
+
+    assert controller._async_pending_forward_view.pending_request_ids.tolist() == [10, 12, 11]
+    assert cleared == [True]
+
+
+@pytest.mark.internal
 def test_controller_handoff_decision_is_cached_and_skip_can_be_forced():
     class _Protocol:
         enabled = True

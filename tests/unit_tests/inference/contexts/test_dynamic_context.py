@@ -760,6 +760,54 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
+    def test_prepare_async_decode_next_step_uses_planned_layout(self):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=128,
+            buffer_size_gb=0.02,
+            block_size_tokens=16,
+            max_tokens=1_000_000,
+            num_cuda_graphs=1,
+            enable_async_scheduling=True,
+        )
+        requests = [
+            DynamicInferenceRequest(
+                request_id=request_id,
+                prompt_tokens=torch.arange(0, 1, device='cpu'),
+                sampling_params=SamplingParams(top_k=top_k, num_tokens_to_generate=31),
+            )
+            for request_id, top_k in [(10, 1), (11, 2), (12, 3)]
+        ]
+        dynamic_context.add_dummy_requests_parallel(requests, count_as_prefill=False)
+        dynamic_context.active_token_count = 3
+        dynamic_context.num_prefill_requests = 0
+        dynamic_context.request_query_lengths[:3] = 1
+        dynamic_context.request_kv_length_offsets[:3] = torch.tensor([4, 4, 4], dtype=torch.int32)
+        dynamic_context.request_output_lengths[:3] = torch.tensor([32, 32, 32], dtype=torch.int32)
+        dynamic_context.request_last_kv_block_offset[:3] = torch.tensor(
+            [15, 0, 15], dtype=torch.int32
+        )
+
+        assert dynamic_context.prepare_async_decode_next_step()
+
+        assert dynamic_context.async_prepared_request_ids_cpu().tolist() == [10, 12, 11]
+        assert dynamic_context.active_request_metadata["top_k"][:3].tolist() == [1, 3, 2]
+        assert dynamic_context.token_to_request_idx[:3].tolist() == [0, 1, 2]
+        assert dynamic_context._async_reserved_kv_block_request_ids[:2].tolist() == [10, 12]
+
+        sampled_tokens = torch.tensor([100, 101, 102], dtype=torch.int64, device='cuda')
+        assert dynamic_context.copy_async_prepared_decode_input_ids_from_samples(
+            sampled_tokens, None, num_speculative_tokens=0
+        )
+        assert dynamic_context.gpu_view.token_to_input_ids[:3].cpu().tolist() == [100, 102, 101]
+
+        dynamic_context.discard_async_prepared_decode_plan()
+
+    @pytest.mark.internal
+    @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_update_request(self, is_hybrid_model: bool):
 
