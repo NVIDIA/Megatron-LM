@@ -304,7 +304,10 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     config = core_transformer_config_from_args(args)
     if parallel_state.get_tensor_model_parallel_rank() != 0:
         return False
-    elif is_packed_sequence:
+    elif is_packed_sequence and (
+        args.virtual_pipeline_model_parallel_size is None
+        or args.sequence_packing_scheduler is None
+    ):
         return True
     return is_first_or_last_pipeline_stage(vp_stage) or mtp_on_this_rank(
         config, ignore_virtual=False, vp_stage=vp_stage
