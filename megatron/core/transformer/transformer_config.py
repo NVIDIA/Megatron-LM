@@ -1081,7 +1081,11 @@ class TransformerConfig(ModelParallelConfig):
     H_aggregate, H_post_bda, ProjRms) with fused/autograd implementations for
     better performance on supported GPUs.  Backend selection is internal and
     op-specific: Triton for Sinkhorn and H_post_bda backward when available,
-    cuTile for the remaining fused kernels when available, then torch fallback.
+    cuTile for the remaining fused kernels when available, then native torch
+    fallback. If every mHC operation uses the native torch fallback,
+    use_fused_mhc remains enabled and a rank-0 warning is emitted. The all-native
+    fallback is functionally equivalent, but may not provide fused backend
+    performance benefits.
     """
 
     mhc_recompute_layer_num: Optional[int] = None

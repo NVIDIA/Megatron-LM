@@ -19,12 +19,13 @@ import math
 import os
 import shutil
 import subprocess
+import warnings
 from typing import Optional, Tuple
 
 import torch
 from torch import Tensor
 
-from megatron.core._rank_utils import log_single_rank
+from megatron.core._rank_utils import log_single_rank, safe_get_rank
 
 logger = logging.getLogger(__name__)
 LOG2E = math.log2(math.e)
@@ -2983,6 +2984,14 @@ def log_fused_mhc_backend_once() -> None:
         logging.WARNING if all_native else logging.INFO,
         f"[mHC] fused backend selection: {backend_selection}",
     )
+    if all_native and safe_get_rank() == 0:
+        warnings.warn(
+            "[mHC] No accelerated mHC backend is available; falling back to native torch "
+            "implementations. The fallback is functionally equivalent, but may not provide "
+            "the performance benefits of fused mHC backends.",
+            UserWarning,
+            stacklevel=2,
+        )
 
 
 def fused_add_3(a: Tensor, b: Tensor, c: Tensor) -> Tensor:
@@ -3053,6 +3062,7 @@ def _torch_h_post_bda_bwd(
     )
 
 
+@torch.compile
 def _torch_proj_rms_compute_h(
     x: Tensor,
     weight: Tensor,
