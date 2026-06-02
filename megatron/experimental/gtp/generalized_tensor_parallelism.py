@@ -1306,6 +1306,15 @@ class GTPShardedParam(torch.nn.Parameter):
         assert self.is_routed_expert and self.weight_list is not None
         return self.wgrad_reduce_scatter(wgrad_list, nvtx_label=nvtx_label)
 
+    def get_data_tensors(self):
+        """Expose self as the lone data tensor for TE's offload-marking interface.
+
+        TE's ``mark_activation_offload`` treats any non-plain tensor as a storage
+        wrapper and calls ``get_data_tensors()`` on it; a sharded param has no inner
+        buffers, so it is its own data tensor.
+        """
+        return (self,)
+
     def __torch_function__(self, func, types, args=(), kwargs=None):
         """Subclass-preserving dispatch for ``detach`` (other ops fall through)."""
         del types  # required by protocol, unused here
