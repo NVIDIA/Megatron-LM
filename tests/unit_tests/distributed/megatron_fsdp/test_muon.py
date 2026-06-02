@@ -40,8 +40,7 @@ from megatron.core.optimizer.emerging_optimizers import (
 )
 
 
-SPEC_DIR = pathlib.Path(__file__).parent
-SPEC_PREFIX = "muon_inputs_2nodes"  # 2 nodes × 4 GPUs, 2D mesh (dp_cp=4, tp=2)
+SPEC_DIR = pathlib.Path(__file__).parent / "muon_inputs_fsdp4_tp2"
 EXPECTED_WORLD_SIZE = 8
 WORLD_SIZE = int(os.getenv("WORLD_SIZE", "1"))
 
@@ -92,7 +91,7 @@ def distributed_setup():
 
 
 def _load_spec(rank: int) -> dict:
-    return json.loads((SPEC_DIR / f"{SPEC_PREFIX}.rank{rank}.json").read_text())
+    return json.loads((SPEC_DIR / f"rank{rank}.json").read_text())
 
 
 _DTYPE_MAP = {
