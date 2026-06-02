@@ -14,8 +14,7 @@ def _ids(values):
 class TestPrefixCacheBlockState:
     @pytest.mark.internal
     @pytest.mark.parametrize(
-        "policy",
-        [PrefixCachingEvictionPolicy.LRU, PrefixCachingEvictionPolicy.REF_ZERO],
+        "policy", [PrefixCachingEvictionPolicy.LRU, PrefixCachingEvictionPolicy.REF_ZERO]
     )
     def test_allocate_stamp_match_release_lifecycle(self, policy):
         """End-to-end lifecycle: allocate -> stamp hashes -> prefix-match -> release.
@@ -160,7 +159,9 @@ class TestPrefixCacheBlockState:
         - `try_lru_evict_for_pool` returns None unconditionally.
         - `find_lru_evictable` asserts under REF_ZERO.
         """
-        s = PrefixCacheBlockState(total_count=4, eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO)
+        s = PrefixCacheBlockState(
+            total_count=4, eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO
+        )
         assert s.is_lru is False
         assert s.block_timestamps is None
 
