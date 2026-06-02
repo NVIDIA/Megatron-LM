@@ -111,7 +111,7 @@ def initialize_megatron(
         train_config.rampup_batch_size,
         train_config.global_batch_size,
         train_config.micro_batch_size,
-        cfg.data_parallel_size,
+        cfg.get_data_parallel_size(safe_get_world_size()),
         train_config.decrease_batch_size_if_needed,
     )
 
