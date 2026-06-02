@@ -1,17 +1,23 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-"""Muon optimizer microbenchmark.
+"""Muon optimizer correctness + microbenchmark tests.
 
-Replays just `FSDPTensorParallelMuon.step()` against fake DTensors
+Replays `FSDPTensorParallelMuon.step()` against fake DTensors
 reconstructed from a captured per-rank dump of a real 2-node / 8-rank
 training run. The dump JSON files live next to this test file and only
 record parameter sharding (global shape, per-rank local shape,
-placements, mesh layout). The optimizer is constructed by this test with
+placements, mesh layout). The optimizer is constructed here with
 hardcoded hyperparameters typical for Muon training.
+
+Two tests:
+  * `test_muon_step` — pytest-benchmark perf measurement of one step.
+  * `test_muon_step_numerics` — runs the step twice from the same state
+    with fresh optimizer instances, asserts bit-deterministic outputs
+    and no NaN/Inf in any local tensor.
 
 Launch:
     cd Megatron-LM
     torchrun --nproc_per_node=8 --standalone -m pytest \
-        tests/unit_tests/distributed/megatron_fsdp/test_muon_microbench.py -v -s
+        tests/unit_tests/distributed/megatron_fsdp/test_muon.py -v -s
 """
 
 import json
@@ -263,10 +269,6 @@ def test_muon_step(distributed_setup, benchmark):
     dist.barrier()
 
 
-@pytest.mark.skipif(
-    os.environ.get("MUON_BENCH_NUMERICS", "0") != "1",
-    reason="Numerics check is opt-in; set MUON_BENCH_NUMERICS=1 to enable.",
-)
 def test_muon_step_numerics(distributed_setup):
     """Verify `FSDPTensorParallelMuon.step()` is bit-deterministic.
 
