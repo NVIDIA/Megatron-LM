@@ -482,7 +482,7 @@ class HybridStack(MegatronModule):
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask=None,
-    ):
+    ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
         """
         Forward function of the HybridStack class.
 
@@ -498,7 +498,11 @@ class HybridStack(MegatronModule):
             rotary_pos_emb (Tensor, optional): the rotary positional embeddings.
                 Defaults to None.
         Returns:
-            hidden_states | (hidden_states, mhc_multistream) (Tensor | Tuple[Tensor, Tensor]): the output tensor or tuple.
+            Tensor in the common case. A 2-tuple ``(hidden_states, mhc_multistream)`` ONLY when
+            ``enable_hyper_connections and post_process and mtp_num_layers > 0 and not
+            is_mtp_layer`` — the extra element is the pre-contraction multi-stream tensor that
+            MTP's ``_concat_embeddings`` consumes. Callers (e.g. ``HybridModel.forward``) must
+            handle both; pipeline send/recv only ever transfers the contracted ``hidden_states``.
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
@@ -629,20 +633,16 @@ class HybridStack(MegatronModule):
         # Only the OUTER decoder stack does this; nested MTP stacks (is_mtp_layer=True)
         # must keep returning a single Tensor so MTP's _postprocess receives the right
         # type for learned_output_contract.
+        # On the final stage of a (non-MTP) stack with mHC active, capture the pre-contraction
+        # multi-stream tensor for MTP's `_concat_embeddings` (only meaningful when MTP layers
+        # exist, i.e. mtp_num_layers > 0), THEN contract the streams. Combining capture and
+        # contraction avoids repeating the condition. Nested MTP HybridStacks (is_mtp_layer=True)
+        # must NOT contract here — MTP's own `_postprocess` calls learned_output_contract +
+        # final_layernorm itself, so doing it here would double-collapse the multi-stream tensor.
         mhc_multistream = None
-        if (
-            self.config.enable_hyper_connections
-            and self.post_process
-            and self.config.mtp_num_layers is not None
-            and not self.is_mtp_layer
-        ):
-            mhc_multistream = hidden_states
-
-        # Nested MTP HybridStacks (is_mtp_layer=True) must NOT contract streams —
-        # MTP's own `_postprocess` calls learned_output_contract + final_layernorm
-        # itself, so doing it here would double-collapse and break the multi-stream
-        # contract expected by the surrounding MTP code.
         if self.config.enable_hyper_connections and self.post_process and not self.is_mtp_layer:
+            if (self.config.mtp_num_layers or 0) > 0:
+                mhc_multistream = hidden_states
             hidden_states = learned_output_contract(
                 hidden_states,
                 self.hc_head_fn,
