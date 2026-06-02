@@ -1127,6 +1127,7 @@ class TestMegatronFSDPE2E:
             ckpt_format="fsdp_dtensor",
             use_precision_aware_optimizer=True,
             cuda_graph_impl="full_iteration",
+            use_te_rng_tracker=True,
             check_for_nan_in_loss_and_grad=False,
             eval_iters=0,
             eval_interval=8,
