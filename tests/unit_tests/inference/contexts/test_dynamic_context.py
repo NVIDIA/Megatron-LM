@@ -818,6 +818,56 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
+    def test_prepare_async_decode_matches_graph_shape_from_planned_layout(self, monkeypatch):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=128,
+            buffer_size_gb=0.02,
+            block_size_tokens=16,
+            max_tokens=1_000_000,
+            num_cuda_graphs=1,
+            enable_async_scheduling=True,
+        )
+        requests = [
+            DynamicInferenceRequest(
+                request_id=request_id,
+                prompt_tokens=torch.arange(0, 1, device='cpu'),
+                sampling_params=SamplingParams(num_tokens_to_generate=31),
+            )
+            for request_id in [10, 11, 12]
+        ]
+        dynamic_context.add_dummy_requests_parallel(requests, count_as_prefill=False)
+        dynamic_context.active_token_count = 3
+        dynamic_context.num_prefill_requests = 0
+        dynamic_context.request_query_lengths[:3] = 1
+        dynamic_context.request_kv_length_offsets[:3] = torch.tensor([4, 4, 4], dtype=torch.int32)
+        dynamic_context.request_output_lengths[:3] = torch.tensor([32, 5, 32], dtype=torch.int32)
+        dynamic_context.request_last_kv_block_offset[:3] = torch.tensor(
+            [1, 2, 0], dtype=torch.int32
+        )
+
+        matched_dimensions = []
+        original_match = dynamic_context._match_cuda_graph_batch_dimensions
+
+        def _record_match(batch_dimensions, *, strict):
+            matched_dimensions.append(batch_dimensions)
+            return original_match(batch_dimensions, strict=strict)
+
+        monkeypatch.setattr(dynamic_context, "_match_cuda_graph_batch_dimensions", _record_match)
+
+        assert dynamic_context.prepare_async_decode_next_step()
+
+        assert dynamic_context.async_prepared_request_ids_cpu().tolist() == [10, 12]
+        assert len(matched_dimensions) == 1
+        assert matched_dimensions[0].token_count == 2
+        assert matched_dimensions[0].prefill_req_count == 0
+        assert matched_dimensions[0].decode_req_count == 2
+
+    @pytest.mark.internal
+    @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_update_request(self, is_hybrid_model: bool):
 

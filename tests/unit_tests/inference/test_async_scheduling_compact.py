@@ -508,6 +508,7 @@ def _make_async_gate_controller(active_request_count=2):
         ),
         is_decode_only=lambda: True,
         using_cuda_graph_this_step=lambda: True,
+        discard_async_prepared_decode_plan=lambda: None,
     )
     controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
     return controller, context
@@ -1135,8 +1136,11 @@ def test_async_reserved_kv_blocks_are_adopted_or_deferred_then_released():
     context._async_reserved_kv_block_ids = torch.tensor([100, 101, 102], dtype=torch.int32)
     context._async_reserved_kv_block_columns = torch.tensor([1, 1, 1], dtype=torch.int32)
     context._async_deferred_kv_blocks_to_release = torch.empty(0, dtype=torch.int32)
+    context._async_deferred_mamba_slots_to_free = torch.empty(0, dtype=torch.int32)
     context._async_reserved_kv_block_adoption_count = 0
     context._async_deferred_kv_block_release_count = 0
+    context._async_deferred_mamba_slot_release_count = 0
+    context.is_hybrid_model = False
     context.kv_block_allocator = _ReleaseRecordingAllocator()
 
     consumed = context._consume_async_reserved_kv_blocks(
@@ -1341,6 +1345,7 @@ def test_row_mapped_greedy_sampling_writes_tokens_in_current_request_order():
         paused_request_count=0,
         config=SimpleNamespace(materialize_only_last_token_logits=False),
         is_decode_only=lambda: True,
+        copy_async_prepared_decode_input_ids_from_samples=lambda *_args, **_kwargs: False,
         gpu_view=SimpleNamespace(token_to_input_ids=next_input_ids),
         active_request_metadata={
             "top_k": torch.tensor([1, 1], dtype=torch.int32),
@@ -1351,6 +1356,7 @@ def test_row_mapped_greedy_sampling_writes_tokens_in_current_request_order():
     controller._all_logits_cuda = source_logits
     controller._async_sample_values_cuda = torch.empty(2)
     controller._sampled_tokens_cuda = torch.empty(2, dtype=torch.long)
+    controller._sampled_mtp_tokens_cuda = None
     controller.num_speculative_tokens = 0
 
     controller._dynamic_step_sample_logits_greedy_to_next_input_ids(row_indices=torch.tensor([2, 0]))
@@ -1463,25 +1469,26 @@ def test_row_mapped_full_logits_logprobs_use_gathered_decode_rows_as_last_logits
 
 @pytest.mark.internal
 @pytest.mark.parametrize(
-    ("availability", "active_token_count", "chunked_request_id", "expected_defer"),
+    ("has_pending", "availability", "active_token_count", "chunked_request_id", "expected_defer"),
     [
-        ((True, True, True), 2, -1, True),
-        ((True, False, True), 2, -1, True),
-        ((False, False, True), 2, 123, True),
-        ((True, True, False), 2, -1, False),
-        ((False, False, False), 2, -1, False),
-        ((True, False, True), 4, -1, False),
+        (False, (True, True, True), 2, -1, False),
+        (True, (True, True, True), 2, -1, True),
+        (True, (True, False, True), 2, -1, True),
+        (True, (False, False, True), 2, 123, True),
+        (True, (True, True, False), 2, -1, False),
+        (True, (False, False, False), 2, -1, False),
+        (True, (True, False, True), 4, -1, False),
     ],
 )
 def test_pending_async_forward_defers_waiting_request_admission_that_can_mutate_context(
-    availability, active_token_count, chunked_request_id, expected_defer
+    has_pending, availability, active_token_count, chunked_request_id, expected_defer
 ):
     engine = object.__new__(DynamicInferenceEngine)
     engine.waiting_request_ids = deque([123])
     engine.enable_chunked_prefill = True
     engine.controller = SimpleNamespace(
         barrier_count=0,
-        has_pending_async_forward=lambda: True,
+        has_pending_async_forward=lambda: has_pending,
         request_async_admission_barrier=lambda: setattr(
             engine.controller, "barrier_count", engine.controller.barrier_count + 1
         ),
