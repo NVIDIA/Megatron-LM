@@ -2,11 +2,14 @@
 
 """Weighted averaging utility for Megatron distributed checkpoints.
 
-This tool is intentionally kept under ``tools/checkpoint``. It builds a model
-only to obtain the sharded-state template, then streams each input checkpoint
-through Megatron's distributed checkpointing APIs. Floating model tensors are
+This tool is intentionally kept under ``tools/checkpoint``. It derives the merge
+structure entirely from each source checkpoint's public DCP metadata (FQN,
+global shape, dtype, chunk layout, byte/object ``_extra_state``): no Megatron
+model or sharded-state template is ever constructed. Floating model tensors are
 accumulated in fp32 on CPU; Transformer Engine ``_extra_state`` entries are
-copied from one source checkpoint instead of averaged.
+copied from one source checkpoint instead of averaged. Because no model is
+built, it imports no CUDA-only kernels and runs CPU-only for every model family
+(GPT/Mamba/hybrid/TE).
 """
 
 import argparse
@@ -22,9 +25,7 @@ import subprocess
 import sys
 import time
 import uuid
-from contextlib import nullcontext
 from dataclasses import dataclass, replace
-from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, Union
 
@@ -42,6 +43,7 @@ from torch.distributed.checkpoint.metadata import (
     ChunkStorageMetadata,
     MetadataIndex,
     TensorProperties,
+    TensorStorageMetadata,
 )
 from torch.distributed.checkpoint.planner import (
     SavePlan,
@@ -54,39 +56,40 @@ from torch.distributed.checkpoint.planner import (
 from megatron.core import dist_checkpointing
 from megatron.core._rank_utils import safe_get_rank
 from megatron.core.dist_checkpointing.core import maybe_load_config
-from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.dist_checkpointing.mapping import (
-    ShardedBase,
     ShardedObject,
     ShardedStateDict,
     ShardedTensor,
-    ShardedTensorFactory,
-    is_main_replica,
 )
-from megatron.core.dist_checkpointing.serialization import load_sharded_metadata
-from megatron.core.dist_checkpointing.state_dict_utils import load_preprocess
 from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistLoadShardedStrategy,
-    TorchDistSaveShardedStrategy,
 )
 from megatron.core.dist_checkpointing.utils import (
-    extract_sharded_base,
     force_all_tensors_to_non_fp8,
 )
 from megatron.core.dist_checkpointing.validation import (
     StrictHandling,
-    determine_global_metadata,
-    parse_strict_flag,
-    validate_integrity_and_strict_load,
 )
 
 ITERATION_RE = re.compile(r"^iter_(\d+)$")
 LATEST_CHECKPOINTED_ITERATION = "latest_checkpointed_iteration.txt"
 SAVE_DTYPE_MAP = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}
 VALID_MODIFIERS = ("reverse", "scramble")
-SUPPORTED_INPUT_BACKENDS = ("torch_dist",)
 BYTE_ACCOUNTING_MODES = ("none", "rank0", "all")
 RESOURCE_LOG_MODES = ("none", "rank0", "all")
+
+# The sole merge path derives the merge structure from public DCP metadata only
+# (no model/template construction, no CUDA kernels), so it merges any model
+# family on a GPU-less CPU node.
+METADATA_SAME_LAYOUT_MODE = "dcp-metadata-same-layout"
+
+METADATA_SAME_LAYOUT_MODEL_PREFIXES = ("model.", "model0.", "model1.")
+METADATA_SAME_LAYOUT_UNPREFIXED_MODEL_ROOTS = (
+    "decoder.",
+    "embedding.",
+    "output_layer.",
+    "mtp.",
+)
 
 
 class WeightedMergeError(ValueError):
@@ -139,29 +142,9 @@ class MergeResult:
     max_host_peak_rank: int = 0
     world_size: int = 1
     rank: int = 0
-    implementation_mode: str = "direct-dcp-streaming"
+    implementation_mode: str = METADATA_SAME_LAYOUT_MODE
     memory_estimate: MergeMemoryEstimate = MergeMemoryEstimate()
     preflight_only: bool = False
-
-
-@dataclass(frozen=True)
-class _StreamingFactoryComponentPlan:
-    component_path: tuple[Union[str, int], ...]
-    component_leaf: Any
-    source_dtype: torch.dtype
-    source_shape: tuple[int, ...]
-
-
-@dataclass(frozen=True)
-class _StreamingTensorPlan:
-    path: tuple[Union[str, int], ...]
-    tensor_index: int
-    template_leaf: Any
-    template_shape: tuple[int, ...]
-    target_dtype: torch.dtype
-    source_dtype: Optional[torch.dtype] = None
-    source_shape: Optional[tuple[int, ...]] = None
-    factory_components: Optional[list[_StreamingFactoryComponentPlan]] = None
 
 
 @dataclass(frozen=True)
@@ -190,11 +173,16 @@ class _DcpMetadataByteSpec:
 
 
 @dataclass(frozen=True)
-class _DcpMetadataByteCandidate:
-    fqn: str
-    path: tuple[Union[str, int], ...]
-    template_leaf: ShardedObject
-    is_main_replica: bool
+class _DcpMetadataTensorLayout:
+    global_shape: tuple[int, ...]
+    dtype: torch.dtype
+    chunks: tuple[tuple[tuple[int, ...], tuple[int, ...]], ...]
+
+
+@dataclass(frozen=True)
+class _DcpMetadataSnapshot:
+    tensor_metadata: dict[str, TensorStorageMetadata]
+    byte_extra_state_keys: tuple[str, ...]
 
 
 class _WeightedMergeDirectOutputSavePlanner(SavePlanner):
@@ -815,20 +803,6 @@ def _host_peak_memory_bytes() -> int:
     return int(peak_rss) * 1024
 
 
-def _host_current_memory_bytes() -> int:
-    status_path = Path("/proc/self/status")
-    try:
-        with status_path.open("r", encoding="utf-8") as handle:
-            for line in handle:
-                if line.startswith("VmRSS:"):
-                    parts = line.split()
-                    if len(parts) >= 2:
-                        return int(parts[1]) * 1024
-    except OSError:
-        pass
-    return _host_peak_memory_bytes()
-
-
 def _distributed_memory_peaks(host_peak_bytes: int) -> tuple[int, int, int, int]:
     """Return local rank/world size plus max host peak across ranks."""
 
@@ -854,41 +828,6 @@ def _distributed_memory_peaks(host_peak_bytes: int) -> tuple[int, int, int, int]
         int(host_record["rank"]),
         int(host_record["host_peak_bytes"]),
     )
-
-
-def _should_log_resources(resource_log: str) -> bool:
-    if resource_log == "none":
-        return False
-    if resource_log == "rank0":
-        return is_rank_0()
-    return True
-
-
-def _log_resource_checkpoint(
-    label: str, *, start_time: Optional[float] = None, resource_log: str = "none"
-) -> None:
-    if not _should_log_resources(resource_log):
-        return
-    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
-    elapsed = time.perf_counter() - start_time if start_time is not None else None
-    elapsed_text = f", elapsed={elapsed:.2f}s" if elapsed is not None else ""
-    print(
-        f"Resource checkpoint rank={rank}: {label}{elapsed_text}, "
-        f"host_current={_format_bytes(_host_current_memory_bytes())}, "
-        f"host_peak={_format_bytes(_host_peak_memory_bytes())}",
-        flush=True,
-    )
-
-
-def _flatten_items(value: Any, prefix: tuple[Union[str, int], ...] = ()):
-    if isinstance(value, dict):
-        for key, item in value.items():
-            yield from _flatten_items(item, prefix + (key,))
-    elif isinstance(value, list):
-        for index, item in enumerate(value):
-            yield from _flatten_items(item, prefix + (index,))
-    else:
-        yield prefix, value
 
 
 def _get_path(root: Any, path: tuple[Union[str, int], ...]) -> Any:
@@ -947,10 +886,6 @@ def _path_label(path: tuple[Union[str, int], ...], leaf: Any = None) -> str:
     return ".".join(str(part) for part in path)
 
 
-def _is_sharded_leaf(value: Any) -> bool:
-    return isinstance(value, ShardedBase)
-
-
 def _is_extra_state(path: tuple[Union[str, int], ...], leaf: Any) -> bool:
     label = _path_label(path, leaf)
     return (
@@ -983,26 +918,6 @@ def _assign_leaf_data(leaf: Any, value: Any) -> None:
         raise WeightedMergeError(f"Cannot assign merged value to non-sharded leaf {leaf!r}.")
 
 
-def _move_sharded_leaf_tensors_to_cpu(sharded_state_dict: ShardedStateDict) -> ShardedStateDict:
-    """Replace sharded tensor leaf buffers with CPU buffers of the same shape and dtype."""
-
-    for leaf in nested_values(sharded_state_dict):
-        tensor = _as_tensor(leaf)
-        if tensor is None:
-            continue
-        if tensor.device.type == "cpu":
-            continue
-        _assign_leaf_data(leaf, torch.empty_like(tensor, device="cpu"))
-    return sharded_state_dict
-
-
-def _cpu_state_dict_template(
-    sharded_state_dict_factory: Callable[[], ShardedStateDict],
-) -> ShardedStateDict:
-    sharded_state_dict = sharded_state_dict_factory()
-    return _move_sharded_leaf_tensors_to_cpu(sharded_state_dict)
-
-
 def _broadcast_rank0_value(value: Any) -> Any:
     if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() == 1:
         return value
@@ -1033,90 +948,6 @@ def _direct_dcp_save_uses_no_dist() -> bool:
     """Return whether direct DCP output should bypass distributed save orchestration."""
 
     return not dist.is_available() or not dist.is_initialized() or dist.get_world_size() == 1
-
-
-def _select_direct_dcp_byte_specs(
-    byte_candidates: list[_DcpMetadataByteCandidate],
-) -> list[_DcpMetadataByteSpec]:
-    """Elect one DCP writer for each byte/object _extra_state unique key."""
-
-    if not dist.is_available() or not dist.is_initialized() or dist.get_world_size() == 1:
-        return [
-            _DcpMetadataByteSpec(
-                fqn=candidate.fqn,
-                path=candidate.path,
-                template_leaf=candidate.template_leaf,
-            )
-            for candidate in byte_candidates
-        ]
-
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    local_records = [
-        (candidate.fqn, rank, candidate.is_main_replica) for candidate in byte_candidates
-    ]
-    gathered_records: list[list[tuple[str, int, bool]]] = [[] for _ in range(world_size)]
-    dist.all_gather_object(gathered_records, local_records)
-
-    writer_rank_by_fqn: dict[str, int] = {}
-    writer_priority_by_fqn: dict[str, tuple[int, int]] = {}
-    for records in gathered_records:
-        for fqn, candidate_rank, candidate_is_main_replica in records:
-            priority = (0 if candidate_is_main_replica else 1, int(candidate_rank))
-            if fqn not in writer_priority_by_fqn or priority < writer_priority_by_fqn[fqn]:
-                writer_priority_by_fqn[fqn] = priority
-                writer_rank_by_fqn[fqn] = int(candidate_rank)
-
-    selected_fqns = {
-        fqn for fqn, writer_rank in writer_rank_by_fqn.items() if writer_rank == rank
-    }
-    byte_specs: list[_DcpMetadataByteSpec] = []
-    seen_fqns: set[str] = set()
-    for candidate in byte_candidates:
-        if candidate.fqn not in selected_fqns or candidate.fqn in seen_fqns:
-            continue
-        seen_fqns.add(candidate.fqn)
-        byte_specs.append(
-            _DcpMetadataByteSpec(
-                fqn=candidate.fqn,
-                path=candidate.path,
-                template_leaf=candidate.template_leaf,
-            )
-        )
-    return byte_specs
-
-
-def _read_public_dcp_byte_metadata(checkpoint_dir: Path) -> dict[str, BytesStorageMetadata]:
-    try:
-        metadata = FileSystemReader(checkpoint_dir).read_metadata()
-    except (Exception, CheckpointException) as exc:
-        raise WeightedMergeError(
-            f"Could not read public DCP byte metadata from {checkpoint_dir}: "
-            f"{type(exc).__name__}: {exc}"
-        ) from exc
-
-    return {
-        str(fqn): metadata_entry
-        for fqn, metadata_entry in metadata.state_dict_metadata.items()
-        if isinstance(metadata_entry, BytesStorageMetadata)
-    }
-
-
-def _direct_dcp_byte_candidate_from_sharded_object(
-    *,
-    template_leaf: ShardedObject,
-    path: tuple[Union[str, int], ...],
-    source_byte_metadata: dict[str, BytesStorageMetadata],
-) -> Optional[_DcpMetadataByteCandidate]:
-    fqn = str(template_leaf.unique_key)
-    if fqn not in source_byte_metadata:
-        return None
-    return _DcpMetadataByteCandidate(
-        fqn=fqn,
-        path=path,
-        template_leaf=template_leaf.without_data(),
-        is_main_replica=is_main_replica(template_leaf.replica_id),
-    )
 
 
 def _git_revision() -> Optional[str]:
@@ -1152,6 +983,7 @@ def _add_merge_provenance(
     extra_state_source_index: int,
     strict: StrictHandling,
     merge_style: Optional[str],
+    execution_mode: str = METADATA_SAME_LAYOUT_MODE,
 ) -> None:
     common_state["weighted_merge_provenance"] = {
         "format_version": 1,
@@ -1164,7 +996,7 @@ def _add_merge_provenance(
         "output_dtype": save_dtype,
         "extra_state_source_index": extra_state_source_index,
         "extra_state_source_path": str(input_dirs[extra_state_source_index]),
-        "implementation_mode": "direct-dcp-streaming",
+        "implementation_mode": execution_mode,
         "strict": strict.value,
         "code_revision": _git_revision(),
         "optimizer_merged": False,
@@ -1280,93 +1112,6 @@ def _publish_temporary_output_dir(
     _run_rank0_filesystem_op(f"Publishing merged checkpoint to {output_dir}", publish)
 
 
-def _verify_checkpoint_load(
-    *,
-    checkpoint_dir: Path,
-    sharded_state_dict_factory: Callable[[], ShardedStateDict],
-    validate_access_integrity: bool,
-    strict: StrictHandling,
-) -> float:
-    verify_start = time.perf_counter()
-    verification_state_dict = _cpu_state_dict_template(sharded_state_dict_factory)
-    dist_checkpointing.load(
-        verification_state_dict,
-        str(checkpoint_dir),
-        validate_access_integrity=validate_access_integrity,
-        strict=strict,
-    )
-    if dist.is_initialized():
-        dist.barrier()
-    return time.perf_counter() - verify_start
-
-
-def _classify_template(
-    sharded_state_dict: ShardedStateDict,
-) -> tuple[list[tuple[Union[str, int], ...]], list[tuple[Union[str, int], ...]]]:
-    merge_paths: list[tuple[Union[str, int], ...]] = []
-    extra_paths: list[tuple[Union[str, int], ...]] = []
-
-    for path, leaf in _flatten_items(sharded_state_dict):
-        if not _is_sharded_leaf(leaf):
-            continue
-        if _is_extra_state(path, leaf):
-            extra_paths.append(path)
-            continue
-        tensor = _as_tensor(leaf)
-        if tensor is None:
-            raise WeightedMergeError(
-                f"Template entry '{_path_label(path, leaf)}' has no tensor data to merge."
-            )
-        merge_paths.append(path)
-
-    if not merge_paths:
-        raise WeightedMergeError("No mergeable tensor entries found in the sharded state dict.")
-    return merge_paths, extra_paths
-
-
-def _sharded_keys_by_path(
-    sharded_state_dict: ShardedStateDict,
-) -> dict[tuple[Union[str, int], ...], str]:
-    keys: dict[tuple[Union[str, int], ...], str] = {}
-    for path, leaf in _flatten_items(sharded_state_dict):
-        key = getattr(leaf, "key", None)
-        if key is not None:
-            keys[path] = key
-    return keys
-
-
-def _dtype_size(dtype: torch.dtype) -> int:
-    return torch.empty((), dtype=dtype).element_size()
-
-
-def _tensor_numel(shape: Iterable[int]) -> int:
-    numel = 1
-    for dim in shape:
-        numel *= int(dim)
-    return int(numel)
-
-
-def _chunk_ranges_for_local_shape(
-    local_shape: Iterable[int], chunk_bytes: int
-) -> list[tuple[int, int, int]]:
-    shape = tuple(int(dim) for dim in local_shape)
-    if chunk_bytes < 1:
-        raise WeightedMergeError(f"streaming_chunk_bytes must be positive, got {chunk_bytes}.")
-    if not shape:
-        return [(-1, 0, 1)]
-    if _tensor_numel(shape) == 0:
-        return [(0, 0, 0)]
-
-    chunk_dim = max(range(len(shape)), key=lambda index: shape[index])
-    chunk_axis = shape[chunk_dim]
-    elements_per_step = max(_tensor_numel(shape) // max(chunk_axis, 1), 1)
-    max_chunk_len = max(chunk_bytes // (elements_per_step * _dtype_size(torch.float32)), 1)
-    return [
-        (chunk_dim, start, min(max_chunk_len, chunk_axis - start))
-        for start in range(0, chunk_axis, max_chunk_len)
-    ]
-
-
 def _streaming_chunk_leaf(
     leaf: Any,
     *,
@@ -1399,118 +1144,6 @@ def _streaming_chunk_leaf(
         prepend_axis_num=0,
         axis_fragmentations=None,
     )
-
-
-def _estimate_whole_shard_memory(
-    sharded_state_dict: ShardedStateDict,
-    merge_paths: list[tuple[Union[str, int], ...]],
-    extra_paths: list[tuple[Union[str, int], ...]],
-    *,
-    save_dtype: str,
-    streaming_chunk_bytes: int = 128 * 1024 * 1024,
-) -> MergeMemoryEstimate:
-    """Estimate tensor residency for this rank's whole-shard merge work."""
-
-    loaded_checkpoint_bytes = 0
-    accumulator_bytes = 0
-    output_tensor_bytes = 0
-    extra_state_tensor_bytes = 0
-    max_streaming_loaded_chunk_bytes = 0
-    max_streaming_accumulator_bytes = 0
-    template_devices: set[str] = set()
-
-    target_dtype = SAVE_DTYPE_MAP.get(save_dtype)
-    for path in merge_paths:
-        tensor = _as_tensor(_get_path(sharded_state_dict, path))
-        if tensor is None:
-            continue
-        template_devices.add(tensor.device.type)
-        local_numel = tensor.numel()
-        loaded_checkpoint_bytes += local_numel * tensor.element_size()
-        accumulator_bytes += local_numel * _dtype_size(torch.float32)
-        output_dtype = target_dtype if target_dtype is not None else tensor.dtype
-        output_tensor_bytes += local_numel * _dtype_size(output_dtype)
-        for chunk_dim, _, chunk_length in _chunk_ranges_for_local_shape(
-            tensor.shape, streaming_chunk_bytes
-        ):
-            chunk_shape = list(tensor.shape)
-            if chunk_dim >= 0:
-                chunk_shape[chunk_dim] = chunk_length
-            chunk_numel = _tensor_numel(chunk_shape)
-            max_streaming_loaded_chunk_bytes = max(
-                max_streaming_loaded_chunk_bytes,
-                chunk_numel * tensor.element_size(),
-            )
-            max_streaming_accumulator_bytes = max(
-                max_streaming_accumulator_bytes,
-                chunk_numel * _dtype_size(torch.float32),
-            )
-
-    for path in extra_paths:
-        tensor = _as_tensor(_get_path(sharded_state_dict, path))
-        if tensor is None:
-            continue
-        template_devices.add(tensor.device.type)
-        extra_state_tensor_bytes += tensor.numel() * tensor.element_size()
-
-    load_bytes_on_cpu = min(
-        loaded_checkpoint_bytes,
-        max(streaming_chunk_bytes, max_streaming_loaded_chunk_bytes),
-    )
-    group_accumulator_bytes = min(
-        accumulator_bytes,
-        max(streaming_chunk_bytes, max_streaming_accumulator_bytes),
-    )
-    save_output_chunk_bytes = min(output_tensor_bytes, max(streaming_chunk_bytes, 1))
-    projected_cpu_peak_bytes = (
-        group_accumulator_bytes
-        + load_bytes_on_cpu
-        + save_output_chunk_bytes
-        + extra_state_tensor_bytes
-    )
-
-    return MergeMemoryEstimate(
-        mergeable_tensors=len(merge_paths),
-        extra_state_entries=len(extra_paths),
-        loaded_checkpoint_bytes=loaded_checkpoint_bytes,
-        accumulator_bytes=accumulator_bytes,
-        output_tensor_bytes=output_tensor_bytes,
-        extra_state_tensor_bytes=extra_state_tensor_bytes,
-        projected_cpu_peak_bytes=projected_cpu_peak_bytes,
-        template_devices=tuple(sorted(template_devices)),
-    )
-
-
-def _log_memory_estimate(memory_estimate: MergeMemoryEstimate) -> None:
-    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
-    print(
-        f"Preflight memory estimate rank={rank}: "
-        f"mergeable_tensors={memory_estimate.mergeable_tensors}, "
-        f"extra_state_entries={memory_estimate.extra_state_entries}, "
-        f"loaded_shard={_format_bytes(memory_estimate.loaded_checkpoint_bytes)}, "
-        f"fp32_accumulator={_format_bytes(memory_estimate.accumulator_bytes)}, "
-        f"output_shard={_format_bytes(memory_estimate.output_tensor_bytes)}, "
-        f"extra_state_tensors={_format_bytes(memory_estimate.extra_state_tensor_bytes)}, "
-        f"projected_cpu_peak={_format_bytes(memory_estimate.projected_cpu_peak_bytes)}, "
-        f"template_devices={','.join(memory_estimate.template_devices) or 'none'}; "
-        "projected_cpu_peak excludes model construction and DCP planner overhead",
-        flush=True,
-    )
-
-
-def _enforce_projected_cpu_memory_guard(
-    memory_estimate: MergeMemoryEstimate, max_projected_cpu_bytes: Optional[int]
-) -> None:
-    if max_projected_cpu_bytes is None:
-        return
-    if memory_estimate.projected_cpu_peak_bytes > max_projected_cpu_bytes:
-        raise WeightedMergeError(
-            "Projected CPU peak memory "
-            f"{_format_bytes(memory_estimate.projected_cpu_peak_bytes)} exceeds "
-            f"--merge-max-projected-cpu-bytes={_format_bytes(max_projected_cpu_bytes)}. "
-            "Use a larger merge-time model-parallel size, a bounded streaming mode, "
-            "or raise the guard only after confirming node memory capacity."
-        )
 
 
 def _prepare_common_state(
@@ -1555,612 +1188,347 @@ def _load_tensor_path_group_fast(
     return {path: _get_path(loaded, path) for path, _ in path_leaves}
 
 
-def _streaming_validation_state_dict(initial_template: ShardedStateDict) -> ShardedStateDict:
-    validation_state_dict, _, _ = load_preprocess(initial_template)
-    force_all_tensors_to_non_fp8(validation_state_dict)
-    sharded_state_dict, _ = extract_sharded_base(validation_state_dict)
-    return sharded_state_dict
-
-
-def _validate_streaming_load_contract(
-    *,
-    initial_template: ShardedStateDict,
-    resolved_input_dirs: list[Path],
-    load_strategies: dict[Path, TorchDistLoadShardedStrategy],
-    strict: StrictHandling,
-    validate_access_integrity: bool,
-) -> None:
-    """Run DCP strict/access checks once before streaming bypasses load()."""
-
-    needs_checkpoint_mismatch_check = StrictHandling.requires_explicit_ckpt_mismatch_check(strict)
-    needs_global_metadata = validate_access_integrity or StrictHandling.requires_global_app_metadata(
-        strict
+def _metadata_same_layout_is_model_key(
+    fqn: str, model_key_prefixes: tuple[str, ...]
+) -> bool:
+    return any(fqn.startswith(prefix) for prefix in model_key_prefixes) or any(
+        fqn.startswith(root) for root in METADATA_SAME_LAYOUT_UNPREFIXED_MODEL_ROOTS
     )
-    if not needs_checkpoint_mismatch_check and not needs_global_metadata:
-        return
-
-    validation_state_dict = _streaming_validation_state_dict(initial_template)
-    local_metadata = global_metadata = None
-    if needs_global_metadata:
-        local_metadata, global_metadata = determine_global_metadata(validation_state_dict)
-
-    if validate_access_integrity:
-        validate_integrity_and_strict_load(
-            validation_state_dict,
-            StrictHandling.ASSUME_OK_UNEXPECTED,
-            True,
-            local_metadata,
-            global_metadata,
-            None,
-        )
-
-    if not needs_checkpoint_mismatch_check:
-        return
-
-    for checkpoint_dir in resolved_input_dirs:
-        checkpoint_metadata = load_sharded_metadata(
-            str(checkpoint_dir), load_strategies[checkpoint_dir]
-        )
-        try:
-            validate_integrity_and_strict_load(
-                validation_state_dict,
-                strict,
-                False,
-                local_metadata,
-                global_metadata,
-                checkpoint_metadata,
-            )
-        except Exception as exc:
-            raise WeightedMergeError(
-                f"Checkpoint {checkpoint_dir} failed strict validation for "
-                f"direct-dcp streaming: {exc}"
-            ) from exc
 
 
-def _direct_dcp_global_offsets(
-    leaf: Any, *, chunk_dim: int, chunk_start: int
-) -> torch.Size:
-    prepended_axis_num = int(getattr(leaf, "prepend_axis_num", 0) or 0)
-    global_offset = list(getattr(leaf, "global_offset", ()))
-    if not global_offset:
-        tensor = _as_tensor(leaf)
-        if tensor is None:
-            raise WeightedMergeError(f"Cannot infer DCP offsets for non-tensor leaf {leaf!r}.")
-        global_offset = [0 for _ in range(prepended_axis_num + tensor.ndim)]
-    if chunk_dim >= 0:
-        offset_index = prepended_axis_num + chunk_dim
-        if offset_index >= len(global_offset):
-            raise WeightedMergeError(
-                f"Cannot map chunk dimension {chunk_dim} for '{getattr(leaf, 'key', leaf)!r}' "
-                f"with prepend_axis_num={prepended_axis_num} and global_offset={global_offset}."
-            )
-        global_offset[offset_index] += chunk_start
-    return torch.Size(global_offset)
+def _metadata_same_layout_is_extra_state_key(fqn: str) -> bool:
+    return (
+        fqn == "_extra_state"
+        or fqn.endswith("._extra_state")
+        or fqn.startswith("_extra_state/")
+        or "._extra_state/" in fqn
+        or "._extra_state." in fqn
+    )
 
 
-def _direct_dcp_chunk_sizes(chunk_shape: Iterable[int]) -> torch.Size:
-    return torch.Size(tuple(int(dim) for dim in chunk_shape))
+def _metadata_same_layout_path(fqn: str) -> tuple[Union[str, int], ...]:
+    return tuple(fqn.split("."))
 
 
-def _direct_dcp_leaf_chunk_sizes(leaf: Any, chunk_shape: Iterable[int]) -> torch.Size:
-    prepended_axis_num = int(getattr(leaf, "prepend_axis_num", 0) or 0)
-    return _direct_dcp_chunk_sizes((1,) * prepended_axis_num + tuple(chunk_shape))
-
-
-def _validate_direct_dcp_leaf(
-    leaf: Any, path: tuple[Union[str, int], ...], *, label_prefix: str = "direct-dcp-streaming"
-) -> None:
-    if getattr(leaf, "flattened_range", None) is not None:
+def _metadata_same_layout_tensor_dtype(
+    fqn: str, metadata_entry: TensorStorageMetadata
+) -> torch.dtype:
+    dtype = getattr(getattr(metadata_entry, "properties", None), "dtype", None)
+    if not isinstance(dtype, torch.dtype):
         raise WeightedMergeError(
-            f"{label_prefix} does not yet support flattened-range tensors; "
-            f"'{_path_label(path, leaf)}' uses flattened_range."
+            f"DCP metadata for '{fqn}' does not expose a torch dtype."
         )
-    sharded_key = getattr(leaf, "key", None)
-    if not sharded_key:
+    return dtype
+
+
+def _metadata_same_layout_tensor_layout(
+    fqn: str, metadata_entry: TensorStorageMetadata
+) -> _DcpMetadataTensorLayout:
+    chunks = tuple(
+        (
+            tuple(int(offset) for offset in chunk.offsets),
+            tuple(int(size) for size in chunk.sizes),
+        )
+        for chunk in getattr(metadata_entry, "chunks", ()) or ()
+    )
+    if not chunks:
+        raise WeightedMergeError(f"DCP metadata for '{fqn}' has no tensor chunks.")
+    return _DcpMetadataTensorLayout(
+        global_shape=tuple(int(dim) for dim in metadata_entry.size),
+        dtype=_metadata_same_layout_tensor_dtype(fqn, metadata_entry),
+        chunks=chunks,
+    )
+
+
+def _read_public_dcp_metadata(
+    checkpoint_dir: Path, *, model_key_prefixes: tuple[str, ...]
+) -> _DcpMetadataSnapshot:
+    try:
+        metadata = FileSystemReader(checkpoint_dir).read_metadata()
+    except (Exception, CheckpointException) as exc:
         raise WeightedMergeError(
-            f"{label_prefix} requires a sharded key for '{_path_label(path, leaf)}'."
+            f"Could not read public DCP metadata from {checkpoint_dir}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+    tensor_metadata: dict[str, TensorStorageMetadata] = {}
+    non_tensor_model_keys: list[str] = []
+    byte_extra_state_keys: list[str] = []
+    non_model_byte_keys: list[str] = []
+    for fqn, metadata_entry in metadata.state_dict_metadata.items():
+        fqn = str(fqn)
+        if isinstance(metadata_entry, TensorStorageMetadata):
+            tensor_metadata[fqn] = metadata_entry
+        elif _metadata_same_layout_is_model_key(fqn, model_key_prefixes):
+            if isinstance(metadata_entry, BytesStorageMetadata) and (
+                _metadata_same_layout_is_extra_state_key(fqn)
+            ):
+                byte_extra_state_keys.append(fqn)
+            else:
+                non_tensor_model_keys.append(fqn)
+        elif isinstance(metadata_entry, BytesStorageMetadata):
+            non_model_byte_keys.append(fqn)
+
+    if non_model_byte_keys:
+        sample = ", ".join(sorted(non_model_byte_keys)[:5])
+        raise WeightedMergeError(
+            "metadata-same-layout refuses byte/object DCP entries outside model roots "
+            f"in {checkpoint_dir}: {sample}. Allowed prefixes are {model_key_prefixes}; "
+            f"allowed unprefixed roots are {METADATA_SAME_LAYOUT_UNPREFIXED_MODEL_ROOTS}."
         )
+    if non_tensor_model_keys:
+        sample = ", ".join(sorted(non_tensor_model_keys)[:5])
+        raise WeightedMergeError(
+            "metadata-same-layout currently supports tensor DCP entries only; "
+            f"found non-tensor model metadata in {checkpoint_dir}: {sample}."
+        )
+    return _DcpMetadataSnapshot(
+        tensor_metadata=tensor_metadata,
+        byte_extra_state_keys=tuple(sorted(byte_extra_state_keys)),
+    )
 
 
-def _validate_direct_dcp_plan(plan: _StreamingTensorPlan) -> None:
-    if plan.factory_components is not None:
-        for component_plan in plan.factory_components:
-            _validate_direct_dcp_leaf(
-                component_plan.component_leaf,
-                plan.path + component_plan.component_path,
-                label_prefix="direct-dcp-streaming factory component",
-            )
-        return
-    _validate_direct_dcp_leaf(plan.template_leaf, plan.path)
-
-
-def _build_direct_dcp_write_specs(
+def _metadata_same_layout_model_keys(
+    tensor_metadata: dict[str, TensorStorageMetadata],
     *,
-    tensor_plans: list[_StreamingTensorPlan],
-    extra_paths: list[tuple[Union[str, int], ...]],
-    initial_template: ShardedStateDict,
-    tensor_metadata_by_checkpoint: list[dict[str, Any]],
-    byte_metadata_by_checkpoint: list[dict[str, BytesStorageMetadata]],
-    extra_state_source_index: int,
-    streaming_chunk_bytes: int,
-) -> tuple[list[_DirectDcpWriteSpec], list[_DcpMetadataByteSpec], int]:
-    write_specs: list[_DirectDcpWriteSpec] = []
-    byte_candidates: list[_DcpMetadataByteCandidate] = []
-    merge_chunk_count = 0
+    checkpoint_dir: Path,
+    model_key_prefixes: tuple[str, ...],
+) -> tuple[str, ...]:
+    unsupported = sorted(
+        fqn
+        for fqn in tensor_metadata
+        if not _metadata_same_layout_is_model_key(fqn, model_key_prefixes)
+    )
+    if unsupported:
+        sample = ", ".join(unsupported[:5])
+        raise WeightedMergeError(
+            "metadata-same-layout refuses to infer merge policy for non-model "
+            f"DCP tensor keys in {checkpoint_dir}: {sample}. "
+            f"Allowed prefixes are {model_key_prefixes}; allowed unprefixed roots are "
+            f"{METADATA_SAME_LAYOUT_UNPREFIXED_MODEL_ROOTS}."
+        )
+    model_keys = tuple(sorted(tensor_metadata))
+    if not model_keys:
+        raise WeightedMergeError(
+            f"metadata-same-layout found no model tensor keys in {checkpoint_dir}."
+        )
+    return model_keys
 
-    def append_tensor_specs(
-        *,
-        path: tuple[Union[str, int], ...],
-        load_path: tuple[Union[str, int], ...],
-        template_leaf: Any,
-        sharded_key: str,
-        global_shape: tuple[int, ...],
-        local_shape: tuple[int, ...],
-        target_dtype: torch.dtype,
-        source_dtype: torch.dtype,
-        source_shape: tuple[int, ...],
-    ) -> None:
-        nonlocal merge_chunk_count
-        for chunk_dim, chunk_start, chunk_length in _chunk_ranges_for_local_shape(
-            local_shape, streaming_chunk_bytes
+
+def _validate_metadata_same_layout(
+    *,
+    tensor_metadata_by_checkpoint: list[dict[str, TensorStorageMetadata]],
+    byte_extra_state_keys_by_checkpoint: list[tuple[str, ...]],
+    resolved_input_dirs: list[Path],
+    model_key_prefixes: tuple[str, ...],
+    save_dtype: str,
+) -> tuple[tuple[str, ...], tuple[str, ...], dict[str, _DcpMetadataTensorLayout]]:
+    first_keys = _metadata_same_layout_model_keys(
+        tensor_metadata_by_checkpoint[0],
+        checkpoint_dir=resolved_input_dirs[0],
+        model_key_prefixes=model_key_prefixes,
+    )
+    expected_key_set = set(first_keys)
+    for checkpoint_dir, tensor_metadata in zip(
+        resolved_input_dirs[1:], tensor_metadata_by_checkpoint[1:]
+    ):
+        model_keys = _metadata_same_layout_model_keys(
+            tensor_metadata,
+            checkpoint_dir=checkpoint_dir,
+            model_key_prefixes=model_key_prefixes,
+        )
+        key_set = set(model_keys)
+        if key_set != expected_key_set:
+            missing = sorted(expected_key_set - key_set)
+            unexpected = sorted(key_set - expected_key_set)
+            raise WeightedMergeError(
+                "metadata-same-layout requires identical model tensor key sets; "
+                f"{checkpoint_dir} is missing {missing[:5]} and has unexpected "
+                f"{unexpected[:5]}."
+            )
+
+    first_byte_keys = byte_extra_state_keys_by_checkpoint[0]
+    expected_byte_key_set = set(first_byte_keys)
+    for checkpoint_dir, byte_extra_state_keys in zip(
+        resolved_input_dirs[1:], byte_extra_state_keys_by_checkpoint[1:]
+    ):
+        byte_key_set = set(byte_extra_state_keys)
+        if byte_key_set != expected_byte_key_set:
+            missing = sorted(expected_byte_key_set - byte_key_set)
+            unexpected = sorted(byte_key_set - expected_byte_key_set)
+            raise WeightedMergeError(
+                "metadata-same-layout requires identical byte/object _extra_state key sets; "
+                f"{checkpoint_dir} is missing {missing[:5]} and has unexpected "
+                f"{unexpected[:5]}."
+            )
+
+    first_layouts = {
+        fqn: _metadata_same_layout_tensor_layout(
+            fqn, tensor_metadata_by_checkpoint[0][fqn]
+        )
+        for fqn in first_keys
+    }
+    for fqn in first_keys:
+        expected = first_layouts[fqn]
+        for checkpoint_dir, tensor_metadata in zip(
+            resolved_input_dirs[1:], tensor_metadata_by_checkpoint[1:]
         ):
-            if chunk_length == 0:
+            actual = _metadata_same_layout_tensor_layout(fqn, tensor_metadata[fqn])
+            if actual.global_shape != expected.global_shape:
+                raise WeightedMergeError(
+                    f"Shape mismatch for '{fqn}' in metadata-same-layout: "
+                    f"expected {expected.global_shape}, got {actual.global_shape} "
+                    f"in {checkpoint_dir}."
+                )
+            if actual.chunks != expected.chunks:
+                raise WeightedMergeError(
+                    f"Chunk layout mismatch for '{fqn}' in metadata-same-layout "
+                    f"for {checkpoint_dir}."
+                )
+            if save_dtype == "same" and actual.dtype != expected.dtype:
+                raise WeightedMergeError(
+                    f"Dtype mismatch for '{fqn}' with --merge-save-dtype=same: "
+                    f"expected {expected.dtype}, got {actual.dtype} in {checkpoint_dir}."
+                )
+
+    for fqn in first_keys:
+        if _is_extra_state(_metadata_same_layout_path(fqn), None):
+            continue
+        for checkpoint_dir, tensor_metadata in zip(
+            resolved_input_dirs, tensor_metadata_by_checkpoint
+        ):
+            dtype = _metadata_same_layout_tensor_dtype(fqn, tensor_metadata[fqn])
+            if not torch.empty((), dtype=dtype).is_floating_point():
+                raise WeightedMergeError(
+                    f"Checkpoint {checkpoint_dir} key '{fqn}' has non-floating dtype "
+                    f"{dtype}; weighted averaging is only supported for floating tensors."
+                )
+
+    return first_keys, first_byte_keys, first_layouts
+
+
+def _metadata_same_layout_chunk_leaf(
+    *,
+    fqn: str,
+    dtype: torch.dtype,
+    global_shape: tuple[int, ...],
+    global_offsets: tuple[int, ...],
+    chunk_shape: tuple[int, ...],
+) -> ShardedTensor:
+    return ShardedTensor(
+        key=fqn,
+        data=torch.empty(chunk_shape, dtype=dtype, device="cpu"),
+        dtype=dtype,
+        local_shape=chunk_shape,
+        global_shape=global_shape,
+        global_offset=global_offsets,
+        axis_fragmentations=None,
+        replica_id=0,
+    )
+
+
+def _build_metadata_same_layout_write_specs(
+    *,
+    selected_keys: tuple[str, ...],
+    byte_extra_state_keys: tuple[str, ...],
+    first_layouts: dict[str, _DcpMetadataTensorLayout],
+    save_dtype: str,
+) -> tuple[list[_DirectDcpWriteSpec], list[_DcpMetadataByteSpec], int, int]:
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+    world_size = (
+        dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+    )
+    target_dtype_override = SAVE_DTYPE_MAP.get(save_dtype)
+    write_specs: list[_DirectDcpWriteSpec] = []
+    byte_specs: list[_DcpMetadataByteSpec] = []
+    merge_keys = 0
+    extra_state_keys = 0
+
+    for fqn in selected_keys:
+        layout = first_layouts[fqn]
+        path = _metadata_same_layout_path(fqn)
+        is_extra_state = _is_extra_state(path, None)
+        if is_extra_state:
+            extra_state_keys += 1
+            target_dtype = layout.dtype
+        else:
+            merge_keys += 1
+            target_dtype = (
+                target_dtype_override if target_dtype_override is not None else layout.dtype
+            )
+        for chunk_index, (global_offsets, chunk_shape) in enumerate(layout.chunks):
+            if chunk_index % world_size != rank:
                 continue
-            chunk_shape = list(local_shape)
-            if chunk_dim >= 0:
-                chunk_shape[chunk_dim] = chunk_length
-            chunk_shape_tuple = tuple(int(dim) for dim in chunk_shape)
+            template_leaf = _metadata_same_layout_chunk_leaf(
+                fqn=fqn,
+                dtype=layout.dtype,
+                global_shape=layout.global_shape,
+                global_offsets=global_offsets,
+                chunk_shape=chunk_shape,
+            )
             write_specs.append(
                 _DirectDcpWriteSpec(
                     path=path,
-                    load_path=load_path,
+                    load_path=path,
                     template_leaf=template_leaf,
-                    sharded_key=sharded_key,
-                    global_shape=tuple(int(dim) for dim in global_shape),
-                    global_offsets=tuple(
-                        int(offset)
-                        for offset in _direct_dcp_global_offsets(
-                            template_leaf,
-                            chunk_dim=chunk_dim,
-                            chunk_start=chunk_start,
-                        )
-                    ),
-                    chunk_shape=tuple(
-                        int(size)
-                        for size in _direct_dcp_leaf_chunk_sizes(
-                            template_leaf, chunk_shape_tuple
-                        )
-                    ),
+                    sharded_key=fqn,
+                    global_shape=layout.global_shape,
+                    global_offsets=global_offsets,
+                    chunk_shape=chunk_shape,
                     target_dtype=target_dtype,
-                    chunk_dim=chunk_dim,
-                    chunk_start=chunk_start,
-                    chunk_length=chunk_length,
-                    source_dtype=source_dtype,
-                    source_shape=source_shape,
+                    chunk_dim=-1,
+                    chunk_start=0,
+                    chunk_length=1,
+                    source_dtype=layout.dtype,
+                    source_shape=layout.global_shape,
+                    is_extra_state=is_extra_state,
                 )
             )
-            merge_chunk_count += 1
 
-    for plan in tensor_plans:
-        _validate_direct_dcp_plan(plan)
-        if plan.factory_components is not None:
-            for component_index, component_plan in enumerate(plan.factory_components):
-                component_tensor = _as_tensor(component_plan.component_leaf)
-                if component_tensor is None:
-                    raise WeightedMergeError(
-                        "direct-dcp-streaming factory component "
-                        f"'{_path_label(plan.path + component_plan.component_path, component_plan.component_leaf)}' "
-                        "does not expose tensor data."
-                    )
-                append_tensor_specs(
-                    path=plan.path + component_plan.component_path,
-                    load_path=_streaming_factory_component_load_path(
-                        plan.path, component_index
-                    ),
-                    template_leaf=component_plan.component_leaf,
-                    sharded_key=str(getattr(component_plan.component_leaf, "key")),
-                    global_shape=component_plan.source_shape,
-                    local_shape=tuple(int(dim) for dim in component_tensor.shape),
-                    target_dtype=plan.target_dtype,
-                    source_dtype=component_plan.source_dtype,
-                    source_shape=component_plan.source_shape,
-                )
+    for byte_index, fqn in enumerate(byte_extra_state_keys):
+        extra_state_keys += 1
+        if byte_index % world_size != rank:
             continue
-        if plan.source_dtype is None or plan.source_shape is None:
-            raise WeightedMergeError(
-                f"Direct DCP tensor plan for '{_path_label(plan.path, plan.template_leaf)}' "
-                "is missing source metadata."
-            )
-        sharded_key = str(getattr(plan.template_leaf, "key"))
-        append_tensor_specs(
-            path=plan.path,
-            load_path=plan.path,
-            template_leaf=plan.template_leaf,
-            sharded_key=sharded_key,
-            global_shape=plan.source_shape,
-            local_shape=plan.template_shape,
-            target_dtype=plan.target_dtype,
-            source_dtype=plan.source_dtype,
-            source_shape=plan.source_shape,
-        )
-
-    extra_metadata = tensor_metadata_by_checkpoint[extra_state_source_index]
-    extra_byte_metadata = byte_metadata_by_checkpoint[extra_state_source_index]
-    for path in extra_paths:
-        template_leaf = _get_path(initial_template, path)
-        sharded_key = getattr(template_leaf, "key", None)
-        if not sharded_key:
-            raise WeightedMergeError(
-                f"direct-dcp-streaming requires a sharded key for _extra_state "
-                f"'{_path_label(path, template_leaf)}'."
-            )
-        template_tensor = _as_tensor(template_leaf)
-        if isinstance(template_leaf, ShardedObject) and sharded_key not in extra_metadata:
-            byte_candidate = _direct_dcp_byte_candidate_from_sharded_object(
+        template_leaf = ShardedObject.empty_from_unique_key(fqn)
+        byte_specs.append(
+            _DcpMetadataByteSpec(
+                fqn=fqn,
+                path=(fqn,),
                 template_leaf=template_leaf,
-                path=path,
-                source_byte_metadata=extra_byte_metadata,
-            )
-            if byte_candidate is None:
-                raise WeightedMergeError(
-                    f"Checkpoint {extra_state_source_index} is missing byte/object metadata for "
-                    f"_extra_state '{_path_label(path, template_leaf)}'."
-                )
-            byte_candidates.append(byte_candidate)
-            continue
-        if template_tensor is None:
-            if isinstance(template_leaf, ShardedObject):
-                byte_candidates.append(
-                    _DcpMetadataByteCandidate(
-                        fqn=str(getattr(template_leaf, "unique_key", sharded_key)),
-                        path=path,
-                        template_leaf=template_leaf,
-                        is_main_replica=is_main_replica(template_leaf.replica_id),
-                    )
-                )
-                continue
-            raise WeightedMergeError(
-                "direct-dcp-streaming currently supports tensor or ShardedObject "
-                f"_extra_state leaves only; '{_path_label(path, template_leaf)}' is "
-                f"{type(template_leaf).__name__}."
-            )
-        if sharded_key not in extra_metadata:
-            raise WeightedMergeError(
-                f"Checkpoint {extra_state_source_index} is missing tensor metadata for "
-                f"_extra_state '{_path_label(path, template_leaf)}'."
-            )
-        metadata_entry = extra_metadata[sharded_key]
-        metadata_shape = tuple(int(dim) for dim in metadata_entry.global_shape)
-        expected_shape = _global_shape_tuple(template_leaf)
-        if expected_shape is not None and metadata_shape != expected_shape:
-            raise WeightedMergeError(
-                f"Shape mismatch for _extra_state '{_path_label(path, template_leaf)}': "
-                f"template expects global shape {expected_shape}, but checkpoint metadata "
-                f"has {metadata_shape}."
-            )
-        chunk_shape = tuple(int(dim) for dim in template_tensor.shape)
-        write_specs.append(
-            _DirectDcpWriteSpec(
-                path=path,
-                load_path=path,
-                template_leaf=template_leaf,
-                sharded_key=str(sharded_key),
-                global_shape=metadata_shape,
-                global_offsets=tuple(
-                    int(offset)
-                    for offset in _direct_dcp_global_offsets(
-                        template_leaf,
-                        chunk_dim=-1,
-                        chunk_start=0,
-                    )
-                ),
-                chunk_shape=chunk_shape,
-                target_dtype=metadata_entry.dtype,
-                chunk_dim=-1,
-                chunk_start=0,
-                chunk_length=1,
-                source_dtype=metadata_entry.dtype,
-                source_shape=metadata_shape,
-                is_extra_state=True,
             )
         )
 
-    byte_specs = _select_direct_dcp_byte_specs(byte_candidates)
-    return write_specs, byte_specs, merge_chunk_count
-
-
-def _merge_direct_dcp_streaming(
-    *,
-    resolved_input_dirs: list[Path],
-    weights: list[float],
-    output_dir: Path,
-    initial_template: ShardedStateDict,
-    merge_paths: list[tuple[Union[str, int], ...]],
-    extra_paths: list[tuple[Union[str, int], ...]],
-    common_state: dict[str, Any],
-    save_dtype: str,
-    extra_state_source_index: int,
-    strict: StrictHandling,
-    validate_access_integrity: bool,
-    byte_accounting: str,
-    streaming_chunk_bytes: int,
-) -> tuple[float, float, float, int]:
-    """Stream merged chunks directly into PyTorch DCP storage and metadata."""
-
-    from megatron.core.dist_checkpointing.core import CheckpointingConfig, save_config
-    from megatron.core.dist_checkpointing.strategies.common import save_common
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    streaming_load_strategies = {
-        checkpoint_dir: TorchDistLoadShardedStrategy(cache_metadata=True)
-        for checkpoint_dir in resolved_input_dirs
-    }
-    _validate_streaming_load_contract(
-        initial_template=initial_template,
-        resolved_input_dirs=resolved_input_dirs,
-        load_strategies=streaming_load_strategies,
-        strict=strict,
-        validate_access_integrity=validate_access_integrity,
-    )
-
-    tensor_metadata_by_checkpoint = []
-    byte_metadata_by_checkpoint = []
-    bytes_read = 0
-    for checkpoint_dir in resolved_input_dirs:
-        tensor_metadata_by_checkpoint.append(
-            dist_checkpointing.load_tensors_metadata(
-                str(checkpoint_dir), streaming_load_strategies[checkpoint_dir]
-            )
-        )
-        byte_metadata_by_checkpoint.append(_read_public_dcp_byte_metadata(checkpoint_dir))
-        bytes_read += _directory_size_for_accounting(checkpoint_dir, byte_accounting)
-
-    target_dtype_override = SAVE_DTYPE_MAP.get(save_dtype)
-    tensor_plans = [
-        _build_streaming_tensor_plan(
-            initial_template=initial_template,
-            path=path,
-            tensor_index=tensor_index,
-            tensor_metadata_by_checkpoint=tensor_metadata_by_checkpoint,
-            resolved_input_dirs=resolved_input_dirs,
-            save_dtype=save_dtype,
-            target_dtype_override=target_dtype_override,
-        )
-        for tensor_index, path in enumerate(merge_paths)
-    ]
-    write_specs, byte_specs, tensor_chunk_count = _build_direct_dcp_write_specs(
-        tensor_plans=tensor_plans,
-        extra_paths=extra_paths,
-        initial_template=initial_template,
-        tensor_metadata_by_checkpoint=tensor_metadata_by_checkpoint,
-        byte_metadata_by_checkpoint=byte_metadata_by_checkpoint,
-        extra_state_source_index=extra_state_source_index,
-        streaming_chunk_bytes=streaming_chunk_bytes,
-    )
-
-    planner = _WeightedMergeDirectOutputSavePlanner(
-        write_specs=write_specs,
-        byte_specs=byte_specs,
-        resolved_input_dirs=resolved_input_dirs,
-        weights=weights,
-        load_strategies=streaming_load_strategies,
-        extra_state_source_index=extra_state_source_index,
-    )
-    writer = FileSystemWriter(
-        output_dir,
-        single_file_per_rank=True,
-        sync_files=True,
-        thread_count=1,
-        per_thread_copy_ahead=0,
-    )
-    no_dist = _direct_dcp_save_uses_no_dist()
-    dcp_save_start = time.perf_counter()
-    try:
-        torch_dcp.save({}, storage_writer=writer, planner=planner, no_dist=no_dist)
-    except (Exception, CheckpointException) as exc:
-        rank_suffix = (
-            f" on rank {dist.get_rank()}"
-            if dist.is_available() and dist.is_initialized()
-            else ""
-        )
+    if merge_keys == 0:
         raise WeightedMergeError(
-            f"Direct DCP streaming save failed{rank_suffix}: {type(exc).__name__}: {exc}"
-        ) from exc
-    dcp_save_wall_time = time.perf_counter() - dcp_save_start
-    if dist.is_available() and dist.is_initialized():
-        dist.barrier()
-
-    sidecar_start = time.perf_counter()
-
-    def write_sidecars() -> None:
-        save_common(common_state, str(output_dir))
-        save_config(CheckpointingConfig("torch_dist", 1), str(output_dir))
-
-    _run_rank0_filesystem_op("Writing Megatron checkpoint sidecars", write_sidecars)
-    if dist.is_available() and dist.is_initialized():
-        dist.barrier()
-    sidecar_time = time.perf_counter() - sidecar_start
-
-    load_time = planner.load_time
-    accumulation_time = planner.accumulation_time
-    save_time = max(0.0, dcp_save_wall_time - load_time - accumulation_time) + sidecar_time
-    print_rank_0(
-        "Direct DCP streaming wrote "
-        f"{len(tensor_plans)} tensors as {tensor_chunk_count} chunks with "
-        f"{len(byte_specs)} local byte-object extra states, "
-        f"chunk_budget={_format_bytes(streaming_chunk_bytes)}, "
-        f"max_resolved_output={_format_bytes(planner.max_resolved_output_tensor_bytes)}. "
-        "Output writing uses public DCP FileSystemWriter; source read volume follows "
-        "source checkpoint storage-record size, not the requested chunk size.",
-        flush=True,
-    )
-    return load_time, accumulation_time, save_time, bytes_read
-
-
-def _streaming_source_metadata(
-    *,
-    leaf: Any,
-    label: str,
-    tensor_metadata_by_checkpoint: list[dict[str, Any]],
-    resolved_input_dirs: list[Path],
-    save_dtype: str,
-) -> tuple[torch.dtype, tuple[int, ...]]:
-    sharded_key = getattr(leaf, "key", None)
-    if sharded_key is None:
-        raise WeightedMergeError(f"Template key '{label}' does not expose a sharded key.")
-
-    source_dtype: Optional[torch.dtype] = None
-    source_shape: Optional[tuple[int, ...]] = None
-    for checkpoint_dir, tensor_metadata in zip(resolved_input_dirs, tensor_metadata_by_checkpoint):
-        if sharded_key not in tensor_metadata:
-            raise WeightedMergeError(
-                f"Checkpoint {checkpoint_dir} is missing tensor metadata for '{label}' "
-                f"(sharded key '{sharded_key}')."
-            )
-        metadata_entry = tensor_metadata[sharded_key]
-        metadata_shape = tuple(metadata_entry.global_shape)
-        if source_shape is None:
-            source_shape = metadata_shape
-            source_dtype = metadata_entry.dtype
-            continue
-        if metadata_shape != source_shape:
-            raise WeightedMergeError(
-                f"Shape mismatch for '{label}': expected {source_shape}, "
-                f"got {metadata_shape} in {checkpoint_dir}."
-            )
-        if save_dtype == "same" and metadata_entry.dtype != source_dtype:
-            raise WeightedMergeError(
-                f"Dtype mismatch for '{label}' with --merge-save-dtype=same: "
-                f"expected {source_dtype}, got {metadata_entry.dtype} in {checkpoint_dir}."
-            )
-
-    assert source_dtype is not None
-    assert source_shape is not None
-    expected_shape = _global_shape_tuple(leaf)
-    if expected_shape is not None and source_shape != expected_shape:
-        raise WeightedMergeError(
-            f"Shape mismatch for '{label}': template expects global shape "
-            f"{expected_shape}, but checkpoint metadata has {source_shape}."
+            "metadata-same-layout found no mergeable non-_extra_state model tensors."
         )
-    return source_dtype, source_shape
+    return write_specs, byte_specs, merge_keys, extra_state_keys
 
 
-def _global_shape_tuple(leaf: Any) -> Optional[tuple[int, ...]]:
-    global_shape = getattr(leaf, "global_shape", None)
-    if global_shape is None:
-        return None
-    return tuple(int(dim) for dim in global_shape)
-
-
-def _streaming_factory_component_load_path(
-    factory_path: tuple[Union[str, int], ...],
-    component_index: int,
-) -> tuple[Union[str, int], ...]:
-    return (
-        factory_path
-        + ("__streaming_factory_components__", f"component_{component_index:06d}")
-    )
-
-
-def _build_streaming_tensor_plan(
-    *,
-    initial_template: ShardedStateDict,
-    path: tuple[Union[str, int], ...],
-    tensor_index: int,
-    tensor_metadata_by_checkpoint: list[dict[str, Any]],
-    resolved_input_dirs: list[Path],
-    save_dtype: str,
-    target_dtype_override: Optional[torch.dtype],
-) -> _StreamingTensorPlan:
-    template_leaf = _get_path(initial_template, path)
-    template_tensor = _as_tensor(template_leaf)
-    if template_tensor is None:
-        raise WeightedMergeError(f"Template key '{_path_label(path)}' is not a tensor.")
-    if not template_tensor.is_floating_point():
-        raise WeightedMergeError(
-            f"Template key '{_path_label(path)}' has non-floating dtype "
-            f"{template_tensor.dtype}; weighted averaging is only supported for floating tensors."
-        )
-
-    template_shape = tuple(int(dim) for dim in template_tensor.shape)
-    template_dtype = template_tensor.dtype
-    if isinstance(template_leaf, ShardedTensorFactory):
-        template_components = list(_flatten_items(template_leaf.build()))
-        component_plans: list[_StreamingFactoryComponentPlan] = []
-        target_dtype = target_dtype_override if target_dtype_override is not None else template_dtype
-        for component_path, component_leaf in template_components:
-            source_dtype, source_shape = _streaming_source_metadata(
-                leaf=component_leaf,
-                label=_path_label(path + component_path, component_leaf),
-                tensor_metadata_by_checkpoint=tensor_metadata_by_checkpoint,
-                resolved_input_dirs=resolved_input_dirs,
-                save_dtype=save_dtype,
-            )
-            component_plans.append(
-                _StreamingFactoryComponentPlan(
-                    component_path=component_path,
-                    component_leaf=component_leaf,
-                    source_dtype=source_dtype,
-                    source_shape=source_shape,
-                )
-            )
-        if target_dtype is None:
-            raise WeightedMergeError(
-                f"Factory '{_path_label(path, template_leaf)}' produced no tensor components."
-            )
-        return _StreamingTensorPlan(
-            path=path,
-            tensor_index=tensor_index,
-            template_leaf=template_leaf,
-            template_shape=template_shape,
-            target_dtype=target_dtype,
-            factory_components=component_plans,
-        )
-
-    source_dtype, source_shape = _streaming_source_metadata(
-        leaf=template_leaf,
-        label=_path_label(path, template_leaf),
-        tensor_metadata_by_checkpoint=tensor_metadata_by_checkpoint,
-        resolved_input_dirs=resolved_input_dirs,
-        save_dtype=save_dtype,
-    )
-    target_dtype = target_dtype_override if target_dtype_override is not None else template_dtype
-    return _StreamingTensorPlan(
-        path=path,
-        tensor_index=tensor_index,
-        template_leaf=template_leaf,
-        template_shape=template_shape,
-        target_dtype=target_dtype,
-        source_dtype=source_dtype,
-        source_shape=source_shape,
-    )
-
-
-def merge_sharded_checkpoints(
+def merge_same_layout_dcp_metadata_checkpoints(
     input_paths: list[Union[str, Path]],
     weights: list[float],
     output_root: Union[str, Path],
-    sharded_state_dict_factory: Callable[[], ShardedStateDict],
     *,
     normalize: bool = False,
     save_dtype: str = "same",
     output_iteration: Optional[int] = None,
     write_latest: bool = True,
     extra_state_source_index: int = 0,
-    strict: Union[str, StrictHandling] = StrictHandling.RAISE_UNEXPECTED,
-    validate_access_integrity: bool = True,
-    model_init_time: float = 0.0,
-    verify_load: bool = False,
     byte_accounting: str = "rank0",
     overwrite_output: bool = False,
     atomic_output: bool = True,
-    streaming_chunk_bytes: int = 128 * 1024 * 1024,
     merge_style: Optional[str] = None,
-    resource_log: str = "none",
-    max_projected_cpu_bytes: Optional[int] = None,
-    preflight_only: bool = False,
+    model_key_prefixes: tuple[str, ...] = METADATA_SAME_LAYOUT_MODEL_PREFIXES,
 ) -> MergeResult:
-    """Merge distributed checkpoints using a caller-provided sharded template."""
+    """Merge same-layout torch_dist checkpoints using public DCP metadata only.
+
+    This path never builds a Megatron model or sharded-state template: it reads
+    each source checkpoint's public DCP metadata (FQN, global shape, dtype, chunk
+    layout, byte/object ``_extra_state``) and derives the merge structure from it.
+    Because no model is constructed, it imports no CUDA-only kernels and runs
+    CPU-only for every model family (GPT/Mamba/hybrid/TE).
+    """
 
     total_start = time.perf_counter()
     discovery_start = time.perf_counter()
@@ -2174,37 +1542,22 @@ def merge_sharded_checkpoints(
         raise WeightedMergeError(
             f"Unsupported save dtype '{save_dtype}'. Use same, float32, float16, or bfloat16."
         )
-    if not atomic_output:
-        raise WeightedMergeError(
-            "Weighted merge requires atomic output publication; "
-            "--no-atomic-merge-output is not supported because direct "
-            "DCP writes could otherwise expose a partial final checkpoint."
-        )
     if byte_accounting not in BYTE_ACCOUNTING_MODES:
         raise WeightedMergeError(
             f"Unsupported byte accounting mode '{byte_accounting}'. "
             f"Use one of: {', '.join(BYTE_ACCOUNTING_MODES)}."
         )
-    if resource_log not in RESOURCE_LOG_MODES:
-        raise WeightedMergeError(
-            f"Unsupported resource log mode '{resource_log}'. "
-            f"Use one of: {', '.join(RESOURCE_LOG_MODES)}."
-        )
-    if max_projected_cpu_bytes is not None and max_projected_cpu_bytes < 1:
-        raise WeightedMergeError(
-            f"max_projected_cpu_bytes must be positive, got {max_projected_cpu_bytes}."
-        )
-    if preflight_only and verify_load:
-        raise WeightedMergeError("preflight_only cannot be combined with verify_load.")
     if extra_state_source_index < 0 or extra_state_source_index >= len(input_paths):
         raise WeightedMergeError(
             f"extra_state_source_index {extra_state_source_index} is out of range."
         )
-    strict = parse_strict_flag(strict)
-    if StrictHandling.requires_returning_mismatch_keys(strict):
+    if not model_key_prefixes:
+        raise WeightedMergeError("model_key_prefixes must contain at least one prefix.")
+    if not atomic_output:
         raise WeightedMergeError(
-            f"strict={strict.value} is not supported by weighted merge because it changes "
-            "dist_checkpointing.load() return type."
+            "Weighted merge requires atomic output publication; "
+            "--no-atomic-merge-output is not supported because public "
+            "DCP writes could otherwise expose a partial final checkpoint."
         )
 
     resolved_input_dirs = [resolve_checkpoint_dir(path) for path in input_paths]
@@ -2216,51 +1569,12 @@ def merge_sharded_checkpoints(
                 f"Checkpoint format mismatch: expected {first_format}, "
                 f"got {checkpoint_format} in {checkpoint_dir}."
             )
-    if first_format not in SUPPORTED_INPUT_BACKENDS:
+    if first_format != "torch_dist":
         raise WeightedMergeError(
-            f"Unsupported checkpoint format '{first_format}'. Weighted merge currently supports "
-            f"{', '.join(SUPPORTED_INPUT_BACKENDS)}; run fsdp_dtensor as an explicit compatibility "
-            "experiment before claiming support."
+            "metadata-same-layout currently supports torch_dist checkpoints only; "
+            f"got {first_format}."
         )
-    _log_resource_checkpoint(
-        "before initial template extraction",
-        start_time=total_start,
-        resource_log=resource_log,
-    )
-    template_start = time.perf_counter()
-    initial_template = _cpu_state_dict_template(sharded_state_dict_factory)
-    _log_resource_checkpoint(
-        "after initial template extraction",
-        start_time=template_start,
-        resource_log=resource_log,
-    )
-    classify_start = time.perf_counter()
-    merge_paths, extra_paths = _classify_template(initial_template)
-    _log_resource_checkpoint(
-        f"after template classification mergeable={len(merge_paths)} extra_state={len(extra_paths)}",
-        start_time=classify_start,
-        resource_log=resource_log,
-    )
-    key_index_start = time.perf_counter()
-    sharded_keys = _sharded_keys_by_path(initial_template)
-    _log_resource_checkpoint(
-        f"after sharded-key indexing keys={len(sharded_keys)}",
-        start_time=key_index_start,
-        resource_log=resource_log,
-    )
-    estimate_start = time.perf_counter()
-    memory_estimate = _estimate_whole_shard_memory(
-        initial_template,
-        merge_paths,
-        extra_paths,
-        save_dtype=save_dtype,
-        streaming_chunk_bytes=streaming_chunk_bytes,
-    )
-    _log_resource_checkpoint(
-        "after memory estimate",
-        start_time=estimate_start,
-        resource_log=resource_log,
-    )
+
     weights = normalize_weights(weights) if normalize else validate_weights(weights)
     output_dir = output_checkpoint_dir(output_root, output_iteration)
     _reject_existing_atomic_overwrite(
@@ -2271,54 +1585,63 @@ def merge_sharded_checkpoints(
             f"Output directory already exists: {output_dir}. "
             "Use --overwrite-merge-output to replace it."
         )
+
+    metadata_snapshots = [
+        _read_public_dcp_metadata(
+            checkpoint_dir, model_key_prefixes=model_key_prefixes
+        )
+        for checkpoint_dir in resolved_input_dirs
+    ]
+    tensor_metadata_by_checkpoint = [
+        snapshot.tensor_metadata for snapshot in metadata_snapshots
+    ]
+    byte_extra_state_keys_by_checkpoint = [
+        snapshot.byte_extra_state_keys for snapshot in metadata_snapshots
+    ]
+    selected_keys, byte_extra_state_keys, first_layouts = _validate_metadata_same_layout(
+        tensor_metadata_by_checkpoint=tensor_metadata_by_checkpoint,
+        byte_extra_state_keys_by_checkpoint=byte_extra_state_keys_by_checkpoint,
+        resolved_input_dirs=resolved_input_dirs,
+        model_key_prefixes=model_key_prefixes,
+        save_dtype=save_dtype,
+    )
+    write_specs, byte_specs, averaged_tensors, copied_extra_states = (
+        _build_metadata_same_layout_write_specs(
+            selected_keys=selected_keys,
+            byte_extra_state_keys=byte_extra_state_keys,
+            first_layouts=first_layouts,
+            save_dtype=save_dtype,
+        )
+    )
+    memory_estimate = MergeMemoryEstimate(
+        mergeable_tensors=averaged_tensors,
+        extra_state_entries=copied_extra_states,
+        template_devices=("cpu",),
+    )
     discovery_time = time.perf_counter() - discovery_start
 
-    action = "Preflighting merge of" if preflight_only else "Merging"
     print_rank_0(
-        f"{action} {len(resolved_input_dirs)} checkpoints into {output_dir} "
-        f"with weights {weights}",
+        f"Merging {len(resolved_input_dirs)} same-layout metadata checkpoints into "
+        f"{output_dir} with weights {weights}",
         flush=True,
     )
-    _log_memory_estimate(memory_estimate)
-    _enforce_projected_cpu_memory_guard(memory_estimate, max_projected_cpu_bytes)
-    if preflight_only:
-        host_peak_bytes = _host_peak_memory_bytes()
-        (
-            rank,
-            world_size,
-            max_host_peak_rank,
-            max_host_peak_bytes,
-        ) = _distributed_memory_peaks(host_peak_bytes)
-        timings = MergeTimings(
-            discovery=discovery_time,
-            model_init=model_init_time,
-            total=time.perf_counter() - total_start,
-        )
-        return MergeResult(
-            output_dir=output_dir,
-            input_dirs=tuple(resolved_input_dirs),
-            weights=tuple(weights),
-            timings=timings,
-            averaged_tensors=len(merge_paths),
-            copied_extra_states=len(extra_paths),
-            backend=first_format,
-            host_peak_bytes=host_peak_bytes,
-            max_host_peak_bytes=max_host_peak_bytes,
-            max_host_peak_rank=max_host_peak_rank,
-            world_size=world_size,
-            rank=rank,
-            memory_estimate=memory_estimate,
-            preflight_only=True,
-        )
 
     temporary_output_dir = (
         _prepare_temporary_output_dir(output_dir, overwrite_output)
         if atomic_output
         else output_dir
     )
+    if overwrite_output and not atomic_output and output_dir.exists():
+        _run_rank0_filesystem_op(
+            f"Removing existing output directory {output_dir}",
+            lambda: shutil.rmtree(output_dir),
+        )
+        if dist.is_initialized():
+            dist.barrier()
 
     base_common_state = dist_checkpointing.load_common_state_dict(str(resolved_input_dirs[0]))
     common_state = _prepare_common_state(base_common_state, output_iteration)
+    strict = StrictHandling.ASSUME_OK_UNEXPECTED
     _add_merge_provenance(
         common_state,
         input_dirs=resolved_input_dirs,
@@ -2329,43 +1652,65 @@ def merge_sharded_checkpoints(
         extra_state_source_index=extra_state_source_index,
         strict=strict,
         merge_style=merge_style,
+        execution_mode=METADATA_SAME_LAYOUT_MODE,
     )
 
-    # Direct-DCP streaming is the sole execution path: source chunks are loaded,
-    # accumulated in fp32 on CPU, and written directly to the output checkpoint.
-    (
-        load_time,
-        accumulation_time,
-        direct_dcp_save_time,
-        bytes_read,
-    ) = _merge_direct_dcp_streaming(
+    from megatron.core.dist_checkpointing.core import CheckpointingConfig, save_config
+    from megatron.core.dist_checkpointing.strategies.common import save_common
+
+    load_strategies = {
+        checkpoint_dir: TorchDistLoadShardedStrategy(cache_metadata=True)
+        for checkpoint_dir in resolved_input_dirs
+    }
+    planner = _WeightedMergeDirectOutputSavePlanner(
+        write_specs=write_specs,
+        byte_specs=byte_specs,
         resolved_input_dirs=resolved_input_dirs,
         weights=weights,
-        output_dir=temporary_output_dir,
-        initial_template=initial_template,
-        merge_paths=merge_paths,
-        extra_paths=extra_paths,
-        common_state=common_state,
-        save_dtype=save_dtype,
+        load_strategies=load_strategies,
         extra_state_source_index=extra_state_source_index,
-        strict=strict,
-        validate_access_integrity=validate_access_integrity,
-        byte_accounting=byte_accounting,
-        streaming_chunk_bytes=streaming_chunk_bytes,
+    )
+    writer = FileSystemWriter(
+        temporary_output_dir,
+        single_file_per_rank=True,
+        sync_files=True,
+        thread_count=1,
+        per_thread_copy_ahead=0,
     )
 
-    verification_time = 0.0
-    if verify_load:
-        verification_time = _verify_checkpoint_load(
-            checkpoint_dir=temporary_output_dir,
-            sharded_state_dict_factory=sharded_state_dict_factory,
-            validate_access_integrity=validate_access_integrity,
-            strict=strict,
-        )
-
     save_start = time.perf_counter()
-    if dist.is_initialized():
+    bytes_read = sum(
+        _directory_size_for_accounting(checkpoint_dir, byte_accounting)
+        for checkpoint_dir in resolved_input_dirs
+    )
+    try:
+        torch_dcp.save(
+            {},
+            storage_writer=writer,
+            planner=planner,
+            no_dist=_direct_dcp_save_uses_no_dist(),
+        )
+    except (Exception, CheckpointException) as exc:
+        rank_suffix = (
+            f" on rank {dist.get_rank()}"
+            if dist.is_available() and dist.is_initialized()
+            else ""
+        )
+        raise WeightedMergeError(
+            f"Metadata same-layout DCP save failed{rank_suffix}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    if dist.is_available() and dist.is_initialized():
         dist.barrier()
+
+    def write_sidecars() -> None:
+        save_common(common_state, str(temporary_output_dir))
+        save_config(CheckpointingConfig("torch_dist", 1), str(temporary_output_dir))
+
+    _run_rank0_filesystem_op("Writing metadata same-layout checkpoint sidecars", write_sidecars)
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
     if atomic_output:
         _publish_temporary_output_dir(
             temporary_output_dir, output_dir, overwrite_output=overwrite_output
@@ -2379,9 +1724,9 @@ def merge_sharded_checkpoints(
         )
     if dist.is_initialized():
         dist.barrier()
-    save_time = time.perf_counter() - save_start + direct_dcp_save_time
-    bytes_written = _directory_size_for_accounting(output_dir, byte_accounting)
 
+    save_time = time.perf_counter() - save_start
+    bytes_written = _directory_size_for_accounting(output_dir, byte_accounting)
     host_peak_bytes = _host_peak_memory_bytes()
     (
         rank,
@@ -2389,14 +1734,11 @@ def merge_sharded_checkpoints(
         max_host_peak_rank,
         max_host_peak_bytes,
     ) = _distributed_memory_peaks(host_peak_bytes)
-
     timings = MergeTimings(
         discovery=discovery_time,
-        model_init=model_init_time,
-        load=load_time,
-        accumulation=accumulation_time,
+        load=planner.load_time,
+        accumulation=planner.accumulation_time,
         save=save_time,
-        verification=verification_time,
         total=time.perf_counter() - total_start,
     )
     return MergeResult(
@@ -2404,57 +1746,20 @@ def merge_sharded_checkpoints(
         input_dirs=tuple(resolved_input_dirs),
         weights=tuple(weights),
         timings=timings,
-        averaged_tensors=len(merge_paths),
-        copied_extra_states=len(extra_paths),
+        averaged_tensors=averaged_tensors,
+        copied_extra_states=copied_extra_states,
         bytes_read=bytes_read,
         bytes_written=bytes_written,
         backend=first_format,
-        verified_load=verify_load,
         host_peak_bytes=host_peak_bytes,
         max_host_peak_bytes=max_host_peak_bytes,
         max_host_peak_rank=max_host_peak_rank,
         world_size=world_size,
         rank=rank,
+        implementation_mode=METADATA_SAME_LAYOUT_MODE,
         memory_estimate=memory_estimate,
         preflight_only=False,
     )
-
-
-def _determine_checkpoint_for_args(
-    merge_inputs: list[str], start_checkpoint: Optional[int], end_checkpoint: Optional[int]
-) -> tuple[Path, Optional[int]]:
-    if not merge_inputs:
-        raise WeightedMergeError("--merge-inputs is required.")
-
-    first_input = merge_inputs[0]
-    if ":" in first_input:
-        path = resolve_checkpoint_dir(first_input.rsplit(":", 1)[0])
-        match = ITERATION_RE.match(path.name)
-        if match:
-            return path.parent, int(match.group(1))
-        if path.name == "release":
-            return path.parent, None
-        return path, None
-
-    checkpoint_root = Path(first_input)
-    if (
-        end_checkpoint is not None
-        and (checkpoint_root / iteration_dir_name(end_checkpoint)).is_dir()
-    ):
-        return checkpoint_root, end_checkpoint
-    if (
-        start_checkpoint is not None
-        and (checkpoint_root / iteration_dir_name(start_checkpoint)).is_dir()
-    ):
-        return checkpoint_root, start_checkpoint
-    if (checkpoint_root / LATEST_CHECKPOINTED_ITERATION).exists():
-        latest = _read_latest_checkpointed_iteration(checkpoint_root)
-        return checkpoint_root, None if latest == "release" else int(latest)
-
-    iterations = discover_checkpoint_iterations(checkpoint_root)
-    if not iterations:
-        raise WeightedMergeError(f"No iter_* checkpoint directories found under {checkpoint_root}.")
-    return checkpoint_root, iterations[0]
 
 
 def add_merge_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -2523,14 +1828,6 @@ def add_merge_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         ),
     )
     group.add_argument(
-        "--merge-streaming-chunk-bytes",
-        type=int,
-        default=128 * 1024 * 1024,
-        help=(
-            "Approximate fp32 accumulator budget per tensor chunk for direct-dcp-streaming."
-        ),
-    )
-    group.add_argument(
         "--merge-byte-accounting",
         choices=BYTE_ACCOUNTING_MODES,
         default="rank0",
@@ -2546,23 +1843,6 @@ def add_merge_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help=(
             "Emit resource checkpoints around expensive setup phases. 'rank0' keeps logs "
             "compact; 'all' reports every distributed rank for memory diagnostics."
-        ),
-    )
-    group.add_argument(
-        "--merge-max-projected-cpu-bytes",
-        type=int,
-        default=None,
-        help=(
-            "Optional preflight guard. If set, fail before loading checkpoint tensors "
-            "when the projected per-rank CPU peak exceeds this byte limit."
-        ),
-    )
-    group.add_argument(
-        "--merge-preflight-only",
-        action="store_true",
-        help=(
-            "Build the merge template, print memory estimates, enforce preflight "
-            "guards, and exit without loading, saving, verifying, or writing output."
         ),
     )
     group.add_argument(
@@ -2585,17 +1865,6 @@ def add_merge_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help="Input checkpoint index whose Transformer Engine _extra_state values are copied.",
     )
     group.add_argument(
-        "--model-builder",
-        choices=("gpt", "hybrid", "mamba"),
-        default="gpt",
-        help="Model builder used to instantiate the sharded-state template.",
-    )
-    group.add_argument(
-        "--verify-load",
-        action="store_true",
-        help="Reload the merged checkpoint with the same sharded-state template after save.",
-    )
-    group.add_argument(
         "--strict",
         choices=tuple(
             flag.value
@@ -2607,11 +1876,6 @@ def add_merge_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "Distributed-checkpoint strictness. The default requires requested model keys "
             "to exist while tolerating extra checkpoint shards such as optimizer state."
         ),
-    )
-    group.add_argument(
-        "--allow-data-parallel-merge",
-        action="store_true",
-        help="Permit data-parallel merge-time world sizes above one. This is experimental.",
     )
     return parser
 
@@ -2658,87 +1922,68 @@ def _resolve_cli_inputs_and_weights(
     return input_paths, weights, output_iteration, merge_style
 
 
-def _build_model_state_dict_factory(
-    model_builder_type: str,
-    resource_log: str = "none",
-) -> Callable[[], ShardedStateDict]:
-    from gpt_builders import gpt_builder
-    from hybrid_builders import hybrid_builder
-    from megatron.training import get_args, get_model
-    from model_provider import model_provider
-
-    args = get_args()
-    apply_hybrid_layer_pattern_compat(args, model_builder_type)
-    load_context = nullcontext()
-    if getattr(args, "fp8", None):
-        from transformer_engine.pytorch.fp8 import fp8_model_init
-
-        load_context = fp8_model_init()
-
-    builder = hybrid_builder if model_builder_type in ("hybrid", "mamba") else gpt_builder
-    # CPU-only tool: build the template on CPU. Two upstream CUDA calls must be
-    # avoided to run on a GPU-less node, and only this exact flag combination
-    # avoids BOTH: use_cpu_initialization=True makes core's parallel layers build
-    # weights on CPU (the else-branch hardcodes device=torch.cuda.current_device()),
-    # and use_torch_fsdp2=True together with use_cpu_initialization makes
-    # get_model skip its unconditional model_module.cuda(...). (meta-device init
-    # avoids the get_model call but NOT the layer's current_device() call.)
-    original_template_flags = {
-        "init_model_with_meta_device": getattr(args, "init_model_with_meta_device", False),
-        "use_cpu_initialization": getattr(args, "use_cpu_initialization", False),
-        "use_torch_fsdp2": getattr(args, "use_torch_fsdp2", False),
-    }
-    args.init_model_with_meta_device = False
-    args.use_cpu_initialization = True
-    args.use_torch_fsdp2 = True
-
-    model_start = time.perf_counter()
-    _log_resource_checkpoint(
-        "before get_model (meta template)",
-        start_time=model_start,
-        resource_log=resource_log,
-    )
-    try:
-        with load_context:
-            models = get_model(partial(model_provider, builder), wrap_with_ddp=False)
-    finally:
-        for key, value in original_template_flags.items():
-            setattr(args, key, value)
-    _log_resource_checkpoint(
-        "after get_model (cpu template)",
-        start_time=model_start,
-        resource_log=resource_log,
-    )
-
-    for model in models:
-        model.eval()
-
-    factory_call_count = 0
-
-    def state_dict_factory() -> ShardedStateDict:
-        nonlocal factory_call_count
-        factory_call_count += 1
-        factory_start = time.perf_counter()
-        _log_resource_checkpoint(
-            f"before sharded_state_dict factory_call={factory_call_count}",
-            start_time=factory_start,
-            resource_log=resource_log,
+def _parse_metadata_same_layout_args(
+    argv: Optional[list[str]] = None,
+) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Merge strict same-layout torch_dist checkpoints using public DCP "
+            "metadata without Megatron model/template initialization."
         )
-        if len(models) == 1:
-            state_dict = {"model": models[0].sharded_state_dict(prefix="")}
-        else:
-            state_dict = {
-                f"model{index}": model.sharded_state_dict(prefix="")
-                for index, model in enumerate(models)
-            }
-        _log_resource_checkpoint(
-            f"after sharded_state_dict factory_call={factory_call_count}",
-            start_time=factory_start,
-            resource_log=resource_log,
-        )
-        return state_dict
+    )
+    add_merge_args(parser)
+    parser.add_argument(
+        "--ckpt-format",
+        choices=("torch_dist",),
+        default="torch_dist",
+        help=argparse.SUPPRESS,
+    )
+    args = parser.parse_args(argv)
+    _validate_metadata_same_layout_cli_args(args)
+    return args
 
-    return state_dict_factory
+
+def _validate_metadata_same_layout_cli_args(args: argparse.Namespace) -> None:
+    if args.merge_window_btoks is not None:
+        raise WeightedMergeError(
+            "--merge-window-btoks is not supported; the metadata-driven merge never "
+            "builds a model and cannot read seq_length/global_batch_size to derive a "
+            "token window. Use explicit PATH:WEIGHT inputs or start/end checkpoint "
+            "selection."
+        )
+    if args.no_atomic_merge_output:
+        raise WeightedMergeError(
+            "Weighted merge requires atomic output publication; "
+            "--no-atomic-merge-output is not supported."
+        )
+
+    unsupported_non_defaults = [
+        (args.merge_resource_log != "none", "--merge-resource-log"),
+        (args.strict != StrictHandling.RAISE_UNEXPECTED.value, "--strict"),
+    ]
+    unsupported = [flag for is_set, flag in unsupported_non_defaults if is_set]
+    if unsupported:
+        raise WeightedMergeError(
+            "The metadata-driven merge does not use these options: "
+            f"{', '.join(unsupported)}."
+        )
+
+
+def _run_metadata_same_layout_cli(args: argparse.Namespace) -> MergeResult:
+    input_paths, weights, output_iteration, merge_style = _resolve_cli_inputs_and_weights(args)
+    return merge_same_layout_dcp_metadata_checkpoints(
+        input_paths,
+        weights,
+        args.merge_output,
+        normalize=args.normalize,
+        save_dtype=args.merge_save_dtype,
+        output_iteration=output_iteration,
+        extra_state_source_index=args.extra_state_source_index,
+        byte_accounting=args.merge_byte_accounting,
+        overwrite_output=args.overwrite_merge_output,
+        atomic_output=not args.no_atomic_merge_output,
+        merge_style=merge_style,
+    )
 
 
 def _format_bytes(num_bytes: int) -> str:
@@ -2754,68 +1999,6 @@ def _format_bandwidth(num_bytes: int, seconds: float) -> str:
     if seconds <= 0:
         return "n/a"
     return f"{_format_bytes(int(num_bytes / seconds))}/s"
-
-
-def apply_hybrid_layer_pattern_compat(args: argparse.Namespace, model_builder_type: str) -> None:
-    """Translate legacy hybrid checkpoint args before building the model template."""
-
-    if (
-        model_builder_type in ("hybrid", "mamba")
-        and getattr(args, "hybrid_layer_pattern", None) is None
-        and getattr(args, "hybrid_override_pattern", None) is not None
-    ):
-        args.hybrid_layer_pattern = args.hybrid_override_pattern
-
-
-def parse_and_validate_merge_args(args_defaults: dict[str, Any]) -> argparse.Namespace:
-    """Parse Megatron args for merge without constructing a tokenizer."""
-
-    from megatron.training.arguments import parse_args, validate_args
-    from megatron.training.global_vars import set_global_variables
-
-    args = parse_args(extra_args_provider=add_merge_args)
-
-    if args.use_checkpoint_args or args_defaults.get("use_checkpoint_args", False):
-        from megatron.training.checkpointing import load_args_from_checkpoint
-
-        assert args.load is not None or args.pretrained_checkpoint is not None, (
-            "--use-checkpoint-args requires --load or --pretrained-checkpoint argument"
-        )
-        assert args.non_persistent_ckpt_type != "local", (
-            "--use-checkpoint-args is not supported with --non_persistent_ckpt_type=local. "
-            "Two-stage checkpoint loading is not implemented, and all arguments must be defined "
-            "before initializing LocalCheckpointManager."
-        )
-        load_args_from_checkpoint(args, load_arg="pretrained_checkpoint")
-        load_args_from_checkpoint(args)
-
-    if args.yaml_cfg is not None:
-        from megatron.training.yaml_arguments import validate_yaml
-
-        args = validate_yaml(args, args_defaults)
-    else:
-        validate_args(args, args_defaults)
-
-    set_global_variables(args, build_tokenizer=False)
-    return args
-
-
-def _data_parallel_size_from_args(args: argparse.Namespace) -> int:
-    data_parallel_size = getattr(args, "data_parallel_size", None)
-    if data_parallel_size is not None:
-        return int(data_parallel_size)
-    tensor_model_parallel_size = int(getattr(args, "tensor_model_parallel_size", 1) or 1)
-    pipeline_model_parallel_size = int(getattr(args, "pipeline_model_parallel_size", 1) or 1)
-    context_parallel_size = int(getattr(args, "context_parallel_size", 1) or 1)
-    expert_model_parallel_size = int(getattr(args, "expert_model_parallel_size", 1) or 1)
-    model_parallel_size = (
-        tensor_model_parallel_size
-        * pipeline_model_parallel_size
-        * context_parallel_size
-        * expert_model_parallel_size
-    )
-    world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
-    return max(world_size // max(model_parallel_size, 1), 1)
 
 
 def _print_merge_result(result: MergeResult) -> None:
@@ -2873,98 +2056,11 @@ def main() -> None:
     sys.stdout = os.fdopen(sys.stdout.fileno(), "w", buffering=1)
     sys.stderr = os.fdopen(sys.stderr.fileno(), "w", buffering=1)
 
-    pre_parser = argparse.ArgumentParser(add_help=False)
-    pre_parser.add_argument("--merge-inputs", nargs="+")
-    pre_parser.add_argument("--start-checkpoint", type=int)
-    pre_parser.add_argument("--end-checkpoint", type=int)
-    pre_args, _ = pre_parser.parse_known_args()
-
-    help_requested = any(arg in ("-h", "--help") for arg in sys.argv[1:])
-    if pre_args.merge_inputs and not help_requested:
-        checkpoint_root, checkpoint_iteration = _determine_checkpoint_for_args(
-            pre_args.merge_inputs, pre_args.start_checkpoint, pre_args.end_checkpoint
-        )
-        if "--load" not in sys.argv:
-            sys.argv.extend(["--load", str(checkpoint_root)])
-        if checkpoint_iteration is not None and "--ckpt-step" not in sys.argv:
-            sys.argv.extend(["--ckpt-step", str(checkpoint_iteration)])
-        if "--use-checkpoint-args" not in sys.argv:
-            sys.argv.append("--use-checkpoint-args")
-
-    from megatron.training import get_args
-    from megatron.training.initialize import initialize_megatron
-
-    # CPU-only bootstrap (this tool is CPU-only by design: the merge is
-    # I/O-bound, so GPUs give no benefit). Always run with the gloo backend, let
-    # initialize_megatron skip its CUDA assertion, and initialize model-parallel
-    # state ourselves (core only does so when device_count > 0). This runs
-    # unconditionally, including on GPU nodes.
-    if "--distributed-backend" not in sys.argv:
-        sys.argv.extend(["--distributed-backend", "gloo"])
-
-    parse_and_validate_merge_args(
-        args_defaults={
-            "exit_on_missing_checkpoint": False,
-            "no_load_optim": True,
-            "no_load_rng": True,
-        },
-    )
-    # We skip core's MPU init (it is gated on device_count > 0 and, when
-    # skipped, core's _set_random_seed still asserts the PP group exists). Use
-    # skip_mpu_initialization so initialize_megatron returns before that seed
-    # step, then create the gloo PG + model-parallel groups ourselves before
-    # building the template.
-    initialize_megatron(allow_no_cuda=True, skip_mpu_initialization=True)
-    args = get_args()
-    from megatron.core import parallel_state as _ps
-
-    ensure_process_group()
-    if not _ps.model_parallel_is_initialized():
-        _ps.initialize_model_parallel(
-            tensor_model_parallel_size=args.tensor_model_parallel_size,
-            pipeline_model_parallel_size=args.pipeline_model_parallel_size,
-            expert_model_parallel_size=getattr(args, "expert_model_parallel_size", 1),
-        )
-    data_parallel_size = _data_parallel_size_from_args(args)
-    if data_parallel_size != 1 and not args.allow_data_parallel_merge:
-        raise WeightedMergeError(
-            "Weighted merge currently requires data-parallel size 1 by default. "
-            f"Got data_parallel_size={data_parallel_size}; pass --allow-data-parallel-merge "
-            "only after validating replica read/write behavior for this run."
-        )
-    print_rank_0(f"Merge data_parallel_size={data_parallel_size}", flush=True)
-
-    model_init_start = time.perf_counter()
-    state_dict_factory = _build_model_state_dict_factory(
-        args.model_builder, args.merge_resource_log
-    )
-    model_init_time = time.perf_counter() - model_init_start
-    input_paths, weights, output_iteration, merge_style = _resolve_cli_inputs_and_weights(
-        args,
-        seq_length=getattr(args, "seq_length", None),
-        global_batch_size=getattr(args, "global_batch_size", None),
-    )
-    result = merge_sharded_checkpoints(
-        input_paths,
-        weights,
-        args.merge_output,
-        state_dict_factory,
-        normalize=args.normalize,
-        save_dtype=args.merge_save_dtype,
-        output_iteration=output_iteration,
-        model_init_time=model_init_time,
-        verify_load=args.verify_load,
-        strict=args.strict,
-        extra_state_source_index=args.extra_state_source_index,
-        byte_accounting=args.merge_byte_accounting,
-        overwrite_output=args.overwrite_merge_output,
-        atomic_output=not args.no_atomic_merge_output,
-        streaming_chunk_bytes=args.merge_streaming_chunk_bytes,
-        merge_style=merge_style,
-        resource_log=args.merge_resource_log,
-        max_projected_cpu_bytes=args.merge_max_projected_cpu_bytes,
-        preflight_only=args.merge_preflight_only,
-    )
+    # The sole merge path derives the merge from public DCP metadata only. It
+    # never bootstraps Megatron or its model-parallel state and constructs no
+    # model, so it runs CPU-only for every model family (GPT/Mamba/hybrid/TE).
+    args = _parse_metadata_same_layout_args()
+    result = _run_metadata_same_layout_cli(args)
     _print_merge_result(result)
 
 
