@@ -53,6 +53,9 @@ LOGPROBS_TAR_MEMBER_RE = re.compile(
     rf"^(?P<iter>\d+){re.escape(LOGPROBS_TAR_MEMBER_SUFFIX)}$"
 )
 
+CACHED_LOGITS_LOGPROB_SENTINEL = -1e3
+CACHED_LOGITS_INDEX_SENTINEL = -1
+
 # Cache to not have to re-run the glob operation for the same pattern, which is expensive for MSC.
 _STORAGE_GLOB_CACHE: dict[str, List[str]] = {}
 

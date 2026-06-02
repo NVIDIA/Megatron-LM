@@ -11,11 +11,9 @@ Design highlights
 -----------------
 * **Sparse KL** – each rank uses only the teacher top-K positions that fall in
   its local vocab shard, avoiding a full-vocab-sized dense teacher tensor.
-* **TP-aware custom autograd** – a ``torch.autograd.Function`` computes the
-  TP-aware student softmax in the forward pass (two all-reduces) and
-  provides an **analytical backward** that requires **no TP communication**:
-  ``∂L/∂z_j = (1/N) · (p_S(j)·C − p_T(j))`` where *C* is the total teacher
-  probability mass in the top-K.
+* **TP-aware student normalisation** – the student log-probabilities are
+  normalised across tensor-parallel vocab shards before gathering the sparse
+  teacher top-K positions.
 * **Custom tar streaming + DataLoader** – a :class:`torch.utils.data.DataLoader`
   with ``pin_memory=True`` streams batched tar shards so that disk I/O overlaps
   with GPU compute, and the CPU→GPU copy can be issued with
@@ -71,6 +69,7 @@ from megatron.core.models.common.language_module.language_module import Language
 from megatron.training.utils import print_rank_0
 from megatron.training.distillation.utils_logits import (
   BATCHED_TAR_RE,
+  CACHED_LOGITS_LOGPROB_SENTINEL,
   LogprobsTarEntry,
   TarShardPrefetcher,
   batched_tar_prefix,
@@ -575,7 +574,11 @@ def topk_kl_div(
     # ---- Gather student log-probs at teacher's top-K positions (local shard only) ----
     local_vocab_size = student_logits.size(-1)
     offset = local_vocab_size * tp_rank
-    mask = (teacher_topk_indices >= offset) & (teacher_topk_indices < offset + local_vocab_size)
+    mask = (
+        (teacher_topk_indices >= offset)
+        & (teacher_topk_indices < offset + local_vocab_size)
+        & (teacher_topk_logprobs != CACHED_LOGITS_LOGPROB_SENTINEL)
+    )
     # Clamp out-of-range indices to avoid index errors; their contributions are zeroed by the mask
     teacher_local_indices = (teacher_topk_indices - offset).clamp(0, local_vocab_size - 1)
     # In TP > 1, may contain duplicate values due to clamping above, so they are masked downstream

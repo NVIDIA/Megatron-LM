@@ -2482,7 +2482,7 @@ def training_log(
     # learning rate will be None on ranks without trainable params, so we must gather across mp ranks
     learning_rate: float | None = reduce_max_stat_across_model_parallel_group(learning_rate)
     if learning_rate is None and args.freeze_all_layers:
-        learning_rate = -1.0  # hack to appease logging logic
+        learning_rate = 0.0
     # Tensorboard values.
     if writer and (iteration % args.tensorboard_log_interval == 0):
         if wandb_writer:

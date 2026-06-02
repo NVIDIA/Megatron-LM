@@ -44,6 +44,8 @@ from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.training import get_args, get_tensorboard_writer
 from megatron.training.utils import print_rank_0
 from megatron.training.distillation.utils_logits import (
+    CACHED_LOGITS_INDEX_SENTINEL,
+    CACHED_LOGITS_LOGPROB_SENTINEL,
     LOGPROBS_TAR_MEMBER_SUFFIX,
     META_TAR_MEMBER,
     batched_tar_filename,
@@ -93,12 +95,10 @@ class LogitsSaverHooks:
     selection.  The K dimension is truncated to the maximum per-token nucleus
     size (reducing the amount of data written to disk), and tokens whose
     nucleus is smaller than that maximum have their trailing entries masked
-    with ``-1e4`` value / ``-1`` index sentinels.  These sentinels are
-    compatible with :func:`topk_kl_div` in ``cached_logits_loss.py``: the
-    ``-1`` index falls outside every TP rank's vocab range so the entry is
-    excluded from the KL sum, and ``exp(-1e4) = 0`` so masked teacher
-    probability is effectively zero.  At least ``min_k`` entries are always
-    kept per token.
+    with cached-logit value/index sentinels.  These sentinels are
+    compatible with :func:`topk_kl_div` in ``cached_logits_loss.py`` because
+    the value sentinel makes the masked teacher probability effectively zero.
+    At least ``min_k`` entries are always kept per token.
 
     Indices are stored efficiently: uint16 for lower 16 bits + separate high bit tensor.
     CP and DP ranks are stored in the tar filename for flexibility with multi-digit values.
@@ -113,8 +113,8 @@ class LogitsSaverHooks:
         p: Optional top-P (nucleus) threshold applied after global top-K
             selection.  When set, only the smallest set of leading entries
             per token whose cumulative probability mass reaches ``p`` is
-            kept; remaining entries are masked with a ``-1e4`` value
-            sentinel and ``-1`` index sentinel.
+            kept; remaining entries are masked with cached-logit value/index
+            sentinels.
         min_k: Minimum number of entries kept per token when top-P masking
             is active, regardless of cumulative mass.  Defaults to 1.
         save_dtype: String name of the dtype for top-K log-probabilities on
@@ -455,11 +455,9 @@ class LogitsSaverHooks:
         dimension is truncated to the *maximum* kept count across all
         tokens in the microbatch.  Tokens whose individual nucleus is
         smaller than that maximum have their trailing entries masked with
-        ``-1e4`` value / ``-1`` index sentinels.  These sentinels are
-        compatible with :func:`topk_kl_div`: the ``-1`` index falls
-        outside every TP rank's vocab range so the entry is excluded from
-        the KL sum, and ``exp(-1e4) = 0`` so masked teacher probability
-        is effectively zero.
+        cached-logit value/index sentinels.  These sentinels are compatible
+        with :func:`topk_kl_div` because the value sentinel makes masked
+        teacher probability effectively zero.
 
         Args:
             values: Top-K log-prob values, sorted descending along the
@@ -494,8 +492,10 @@ class LogitsSaverHooks:
         keep_mask = keep_mask[..., :max_kept]
 
         # Mask out-of-nucleus entries
-        values = torch.where(keep_mask, values, -1e4)
-        indices = torch.where(keep_mask, indices, -1)
+        values = torch.where(keep_mask, values, CACHED_LOGITS_LOGPROB_SENTINEL)
+        indices = torch.where(keep_mask, indices, CACHED_LOGITS_INDEX_SENTINEL)
+        # The index sentinel does not survive pack_indices()/unpack_indices();
+        # topk_kl_div() also masks by the value sentinel to compensate.
 
         return values, indices
 
