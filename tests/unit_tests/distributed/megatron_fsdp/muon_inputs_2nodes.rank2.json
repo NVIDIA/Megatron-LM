@@ -1380,7 +1380,8 @@
       "local_shape": [
         2304,
         8192
-      ]
+      ],
+      "is_qkv": true
     },
     {
       "global_shape": [
