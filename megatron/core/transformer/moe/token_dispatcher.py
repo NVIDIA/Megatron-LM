@@ -1482,7 +1482,6 @@ class _NCCLEPManager(_DispatchManager):
         # Convert the multihot routing map to (topk weights, topk indices), like DeepEP.
         self.token_probs, self.token_indices = torch.topk(probs, self.router_topk, dim=-1)
         self.num_local_tokens = num_tokens
-        self._ensure_context()
 
     def _ensure_context(self):
         """Bootstrap NCCL EP and create the per-layer context on first use (static shapes)."""
@@ -1496,8 +1495,7 @@ class _NCCLEPManager(_DispatchManager):
                 f"The 'ncclep' backend requires an even local token count, got "
                 f"{max_tokens_per_rank} (seq_len/TP * micro_batch_size)."
             )
-        # recv_tokens are packed contiguously by actual count 
-        # (no per-expert padding) with alignment == 0
+        # recv_tokens are packed contiguously by actual count with alignment == 0
         budget = int(max_tokens_per_rank * self.router_topk * self.rank_capacity_factor)
         self._recv_capacity = max(budget, max_tokens_per_rank)
 
@@ -1524,6 +1522,10 @@ class _NCCLEPManager(_DispatchManager):
         async_finish: bool = True,
         allocate_on_comm_stream: bool = True,
     ) -> torch.Tensor:
+        # Lazily bootstrap + create the context here (eager)
+        # Note: this needs to stay out of the torch.compile region because TE's ep_bootstrap does
+        # opaque ProcessGroup._get_backend()._comm_ptr() access that dynamo cannot trace.
+        self._ensure_context()
         # TE requires int64 indices and float32 weights.
         # token_indices/token_probs: [num_local_tokens, router_topk]
         topk_idx = self.token_indices.to(torch.int64)
