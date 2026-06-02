@@ -42,6 +42,9 @@ def is_flaky_failure(concat_allranks_logs: str) -> bool:
         or "free(): corrupted unsorted chunks" in concat_allranks_logs
         or "Segfault encountered" in concat_allranks_logs
         or "The following metrics failed" in concat_allranks_logs
+        or "removal of container" in concat_allranks_logs
+        or "is already in progress" in concat_allranks_logs
+        or "Error deleting container" in concat_allranks_logs
     )
 
 
