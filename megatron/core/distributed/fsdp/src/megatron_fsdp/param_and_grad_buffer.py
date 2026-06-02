@@ -4040,6 +4040,7 @@ class AllGatherPipeline:
         async_param_gather: bool = True,
         outer_fsdp_group_param_gather: bool = False,
         bwd: bool = False,
+        include_current: bool = True,
     ):
         """All-gather the params. If prefetch is enabled, prefetch next buckets
         in the order of `prefetch_order`.
@@ -4056,16 +4057,22 @@ class AllGatherPipeline:
             bwd (bool, optional):
                 Whether to all-gather column-wise parameters instead of row-wise parameters
                 for the backward pass for formats that require a transpose buffer like MXFP8.
+            include_current (bool, optional):
+                Whether to all-gather the buckets that contain ``params``. If False,
+                only the prefetch buckets adjacent to the current buckets are issued.
         """
         if len(params) == 0:
             return
 
-        ag_buckets = [self.buffer.param_to_param_group[item] for item in params]
-        ag_buckets = list(sorted(set(ag_buckets)))  # Sort in order of unique bucket ID.
+        current_ag_buckets = [self.buffer.param_to_param_group[item] for item in params]
+        current_ag_buckets = list(
+            sorted(set(current_ag_buckets))
+        )  # Sort in order of unique bucket ID.
+        ag_buckets = list(current_ag_buckets)
         parameter_groups = self.buffer.parameter_groups
         if self.buffer.ddp_config.fsdp_double_buffer:
             double_buf_units = set()
-            for bucket_id in ag_buckets:
+            for bucket_id in current_ag_buckets:
                 fsdp_unit_id = parameter_groups[bucket_id].fsdp_unit_id
                 if fsdp_unit_id in self.buffer.double_buf_units:
                     double_buf_units.add(fsdp_unit_id)
@@ -4074,10 +4081,6 @@ class AllGatherPipeline:
                     f"{double_buf_units} FSDP units were requested, "
                     "but double buffers can support no more than 2 FSDP units."
                 )
-
-        # Do not release the buckets that are being all-gathered.
-        for bucket_id in ag_buckets:
-            self.bucket_can_be_released[self.get_bucket_key(bucket_id, bwd)] = False
 
         # If prefetch is enabled, we will add prefetch buckets to ag_buckets.
         if prefetch:
@@ -4148,6 +4151,12 @@ class AllGatherPipeline:
                 ag_buckets = list(sorted(set(ag_buckets)))
                 bucket_id = next_bucket_id(ag_buckets)
 
+        if not include_current:
+            current_ag_bucket_set = set(current_ag_buckets)
+            ag_buckets = [
+                bucket_id for bucket_id in ag_buckets if bucket_id not in current_ag_bucket_set
+            ]
+
         # Only all-gather on buckets that have not been allocated yet.
         ag_buckets = [
             bucket_id
@@ -4156,6 +4165,10 @@ class AllGatherPipeline:
         ]
         if len(ag_buckets) == 0:
             return
+
+        # Do not release the buckets that are being all-gathered.
+        for bucket_id in ag_buckets:
+            self.bucket_can_be_released[self.get_bucket_key(bucket_id, bwd)] = False
 
         # Divide buckets into aggregate groups. We need to reconstruct the bucket groups
         # because the all-gather parameter groups may be a subset of the buckets.

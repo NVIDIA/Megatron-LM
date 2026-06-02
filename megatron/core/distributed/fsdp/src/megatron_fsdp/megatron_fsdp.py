@@ -15,6 +15,7 @@
 import functools
 import importlib
 import logging
+import os
 from contextlib import contextmanager
 from enum import Enum, auto
 from functools import partial
@@ -272,6 +273,9 @@ class MegatronFSDP(torch.nn.Module):
         self.enable_fine_grained_param_gather_backward_hook = (
             enable_fine_grained_param_gather_backward_hook
         )
+        self.prefetch_recompute_forward_weights = os.environ.get(
+            "MCORE_FSDP_PREFETCH_RECOMPUTE_FORWARD_WEIGHTS", "0"
+        ).lower() in ("1", "true", "yes", "on")
         self.report_nan_in_param_grad = report_nan_in_param_grad
 
         # FSDPDistributedIndex stores the process groups and meshes used by Megatron-FSDP.
@@ -878,9 +882,45 @@ class MegatronFSDP(torch.nn.Module):
                 param_list = list(module.parameters(recurse=False))
 
             # All-gather / unshard the module parameters before the backward pass.
-            self.all_gather_and_wait_parameters_ready(
-                param_list, prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER, bwd=True
-            )
+            if self.prefetch_recompute_forward_weights:
+                self.all_gather_and_wait_parameters_ready(
+                    param_list,
+                    prefetch=False,
+                    prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER,
+                    bwd=True,
+                )
+
+                outer_fsdp_group_param_gather = (
+                    self.dist_index.use_hybrid_fsdp
+                    and self.ddp_config.outer_dp_sharding_strategy != "no_shard"
+                    and (self.microbatch_count == 0 or self.model_auto_sync)
+                )
+                # During full activation recomputation, the next backward layer
+                # first reruns its forward path, so row-wise weights are more
+                # urgent than the column-wise transpose buffers used later in
+                # the same layer's backward path.
+                self.all_gather_pipeline.all_gather_params(
+                    params=param_list,
+                    prefetch=True,
+                    prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER,
+                    suggested_AG_prefetch_size=self.suggested_AG_prefetch_size,
+                    outer_fsdp_group_param_gather=outer_fsdp_group_param_gather,
+                    bwd=False,
+                    include_current=False,
+                )
+                self.all_gather_pipeline.all_gather_params(
+                    params=param_list,
+                    prefetch=True,
+                    prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER,
+                    suggested_AG_prefetch_size=self.suggested_AG_prefetch_size,
+                    outer_fsdp_group_param_gather=outer_fsdp_group_param_gather,
+                    bwd=True,
+                    include_current=False,
+                )
+            else:
+                self.all_gather_and_wait_parameters_ready(
+                    param_list, prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER, bwd=True
+                )
 
         self._root_pre_backward_hook_issued = False
 
