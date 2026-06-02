@@ -226,7 +226,7 @@ def _build_optimizer(param_groups, dp_group):
     )
 
 
-# ---------- Test ----------
+# ---------- Tests ----------
 
 
 def test_muon_step(distributed_setup, benchmark):
@@ -261,3 +261,75 @@ def test_muon_step(distributed_setup, benchmark):
 
     benchmark.pedantic(_one_step, rounds=5, warmup_rounds=3, iterations=1)
     dist.barrier()
+
+
+@pytest.mark.skipif(
+    os.environ.get("MUON_BENCH_NUMERICS", "0") != "1",
+    reason="Numerics check is opt-in; set MUON_BENCH_NUMERICS=1 to enable.",
+)
+def test_muon_step_numerics(distributed_setup):
+    """Verify `FSDPTensorParallelMuon.step()` is bit-deterministic.
+
+    Runs one step from the same initial params + grads twice with two
+    fresh optimizer instances and compares the resulting `_local_tensor`
+    on every rank. Catches non-determinism from random kernel launches,
+    autotuner re-selections, NCCL collective non-associativity, and
+    similar bugs that any correctness-affecting regression would touch.
+    Asserts every value is finite (no NaN/Inf) as a basic sanity check.
+    """
+    rank = distributed_setup["rank"]
+    world_size = distributed_setup["world_size"]
+    device = distributed_setup["device"]
+
+    spec = _load_spec(rank)
+    assert spec["world_size"] == world_size, (
+        f"spec world_size={spec['world_size']} != launch world_size={world_size}"
+    )
+
+    mesh = _build_mesh(spec)
+    dp_group = mesh.get_group("dp_cp")
+
+    param_groups = _build_params_and_grads(spec, mesh, device)
+    init = [p._local_tensor.clone() for p in param_groups[0]["params"]]
+    grad_snapshots = [p.grad._local_tensor.clone() for p in param_groups[0]["params"]]
+
+    def _run_one_step():
+        optimizer = _build_optimizer(param_groups, dp_group=dp_group)
+        optimizer.step()
+        torch.cuda.synchronize()
+        return [p._local_tensor.clone() for p in param_groups[0]["params"]]
+
+    after_a = _run_one_step()
+
+    # Reset to the initial state and replay.
+    for p, p0, g0 in zip(param_groups[0]["params"], init, grad_snapshots):
+        p._local_tensor.copy_(p0)
+        p.grad._local_tensor.copy_(g0)
+
+    after_b = _run_one_step()
+    dist.barrier()
+
+    # Determinism + finiteness.
+    nonfinite = []
+    drifts = []
+    for i, (a, b) in enumerate(zip(after_a, after_b)):
+        if a.numel() == 0:
+            continue
+        if not torch.isfinite(a).all() or not torch.isfinite(b).all():
+            nonfinite.append(i)
+            continue
+        if not torch.equal(a, b):
+            drifts.append((i, (a.float() - b.float()).abs().max().item()))
+
+    if rank == 0:
+        n_checked = sum(1 for p in param_groups[0]["params"] if p._local_tensor.numel() > 0)
+        print(
+            f"\n[muon-microbench numerics] params_checked={n_checked} "
+            f"nonfinite={len(nonfinite)} drifts={len(drifts)}"
+        )
+
+    assert not nonfinite, f"rank{rank}: {len(nonfinite)} params contain NaN/Inf after step"
+    assert not drifts, (
+        f"rank{rank}: optimizer.step() is not bit-deterministic on "
+        f"{len(drifts)} params; worst max_abs_diff = {max(d[1] for d in drifts):.2e}"
+    )
