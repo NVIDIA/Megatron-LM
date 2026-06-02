@@ -2128,6 +2128,18 @@ def core_transformer_config_from_args(args, config_class=None):
                 _ratios += [_ratio_map.get(c, 0) for c in _mtp_sec.replace(Symbols.PIPE, '')]
             kw_args['csa_compress_ratios'] = _ratios
             args.csa_compress_ratios = _ratios
+        # Exact length check (the pattern is known here, so the precise per-layer count is too):
+        # one ratio per main layer + one per MTP layer of every MTP depth. This catches a
+        # mis-sized user-provided --csa-compress-ratios with a clear error. (transformer_config
+        # keeps a >= backstop because it does not have the pattern to recompute this exactly.)
+        if _variant == 'dsv4_hybrid' and getattr(args, 'csa_compress_ratios', None) is not None:
+            _secs = _pat.split(Symbols.MTP_SEPARATOR)
+            _exact_len = sum(len(s.replace(Symbols.PIPE, '')) for s in _secs)
+            assert len(args.csa_compress_ratios) == _exact_len, (
+                f"csa_compress_ratios length ({len(args.csa_compress_ratios)}) must equal the "
+                f"number of layers in the hybrid pattern (main + every MTP-depth layer) "
+                f"= {_exact_len} for pattern '{_pat}'."
+            )
 
     kw_args['inference_sampling_seed'] = args.seed
 

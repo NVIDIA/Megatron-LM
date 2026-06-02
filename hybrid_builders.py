@@ -47,9 +47,14 @@ def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, 
         # --csa-compress-ratios is always respected.
         if config.csa_compress_ratios is None:
             ratio_map = {"C": 4, "H": 128}
-            main = _pattern.split("/")[0].replace("|", "")
-            ratios = [ratio_map.get(c, 0) for c in main]
-            ratios += [0] * (config.mtp_num_layers or 0)
+            # One entry per ACTUAL layer: main layers, then every MTP layer of every MTP depth
+            # (a depth can hold multiple hybrid layers, e.g. "/MD-E"), mirroring the arguments.py
+            # derivation. Padding by mtp_num_layers (depth count) would be too short and an MTP
+            # attention that isn't first would IndexError at num_layers + layer_number - 1.
+            sections = _pattern.split("/")
+            ratios = [ratio_map.get(c, 0) for c in sections[0].replace("|", "")]
+            for mtp_sec in sections[1:]:
+                ratios += [ratio_map.get(c, 0) for c in mtp_sec.replace("|", "")]
             config.csa_compress_ratios = ratios
             print_rank_0(
                 f"[hybrid dsv4] derived csa_compress_ratios from pattern symbols: {ratios}"

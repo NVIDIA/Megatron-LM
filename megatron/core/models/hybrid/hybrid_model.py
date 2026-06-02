@@ -489,8 +489,12 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             packed_seq_params=packed_seq_params,
             padding_mask=padding_mask,
         )
-        # When mHC + MTP, the decoder returns (contracted, pre-contract multi-stream).
-        # MTP's mHC branch needs the multi-stream tensor for `_concat_embeddings`.
+        # HybridStack.forward returns a single Tensor in the common case, but a 2-tuple
+        # (hidden_states, mhc_multistream) in exactly one case: enable_hyper_connections and
+        # post_process and mtp_num_layers > 0 and not is_mtp_layer — where MTP's mHC branch
+        # needs the pre-contraction multi-stream tensor for `_concat_embeddings`. Any other
+        # tuple return would be misinterpreted here, so keep that contract in sync with
+        # HybridStack.forward (see hybrid_block.py).
         if isinstance(decoder_output, tuple):
             hidden_states, mhc_multistream = decoder_output
         else:

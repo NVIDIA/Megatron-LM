@@ -121,10 +121,23 @@ class DSAIndexerLossLoggingHelper:
         # indexer layer have only a num_layers-sized (or absent) tracker. all_reduce requires
         # identical shapes on every rank, so reduce-MAX the local size first, then pad to it
         # (otherwise PP>1 hangs / errors on mismatched sizes).
-        local_size = tracker["values"].shape[0] if "values" in tracker else (num_layers or 0)
-        size_t = torch.tensor([local_size], device=torch.cuda.current_device(), dtype=torch.long)
-        torch.distributed.all_reduce(size_t, op=torch.distributed.ReduceOp.MAX, group=pp_group)
-        size = int(size_t.item())
+        # The agreed size (max over the PP group) is constant across iterations (num_layers and
+        # the layer numbering don't change), so compute it once and cache it. This avoids a
+        # per-iteration CPU-GPU sync (.item()); the size-negotiation all_reduce + .item() runs
+        # only on the first call. Every PP rank caches on the same (first) call, so later steps
+        # all skip it consistently.
+        if tracker.get("agreed_size") is not None:
+            size = tracker["agreed_size"]
+        else:
+            local_size = tracker["values"].shape[0] if "values" in tracker else (num_layers or 0)
+            size_t = torch.tensor(
+                [local_size], device=torch.cuda.current_device(), dtype=torch.long
+            )
+            torch.distributed.all_reduce(
+                size_t, op=torch.distributed.ReduceOp.MAX, group=pp_group
+            )
+            size = int(size_t.item())
+            tracker["agreed_size"] = size
         if size == 0:
             return
         if "values" not in tracker:
