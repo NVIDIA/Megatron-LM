@@ -4,10 +4,6 @@ import gc
 import os
 from unittest.mock import patch
 
-# Large DSv4-shape CP parity tests can otherwise leave fragmented CUDA blocks
-# between parametrized cases.
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
 import pytest
 import torch
 import torch.distributed as dist
@@ -21,8 +17,6 @@ from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from tests.unit_tests.transformer.experimental_attention_variant.test_dsv4_hybrid_native_parity import (
     _DSV4_VARIANTS,
-    _cosine_sim,
-    _tensor_sim,
 )
 from tests.unit_tests.test_utilities import Utils
 
@@ -37,13 +31,25 @@ except ImportError:
 _SEED = 42
 _DSV4_CP_PARITY_EPS = 1e-3
 _DSV4_CP_TEST_VARIANT = "flash"
-# Total 4096 tokens: longer than the old THD CP cases, divisible by CP2/CP4,
-# and intentionally crosses CP4 chunk boundaries at non-sequence boundaries.
+# Total 4096 tokens: divisible by CP2/CP4 and intentionally crosses CP4 chunk
+# boundaries at non-sequence boundaries.
 _DSV4_CP_RAGGED_SEG_LENS = (1, 127, 1000, 23, 129, 900, 55, 257, 800, 95, 509, 200)
 # FlashMLA sparse indexer loss only accepts indexer_topk in {0, 512, 1024, 2048}.
 # Keep the same total length/ragged extremes, with one 2048-token segment so
 # ratio=4 produces the DSv4 flash top-k width expected by that fused path.
 _DSV4_CP_SPARSE_LOSS_SEG_LENS = (1, 127, 1920, 2048)
+
+
+def _cosine_sim(a: torch.Tensor, b: torch.Tensor) -> float:
+    return F.cosine_similarity(
+        a.flatten().double().unsqueeze(0), b.flatten().double().unsqueeze(0)
+    ).item()
+
+
+def _tensor_sim(a: torch.Tensor, b: torch.Tensor) -> float:
+    a, b = a.double(), b.double()
+    denom = (a * a + b * b).sum()
+    return (2.0 * (a * b).sum() / denom).item() if denom else 1.0
 
 
 def _mock_hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
