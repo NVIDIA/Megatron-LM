@@ -420,7 +420,7 @@ class TEGroupedMLP(MegatronModule):
             single_grouped_bias=fc1_single_grouped_bias,
             delay_wgrad_compute=fc1_delay_wgrad_compute,
         )
-        op.no_offload_expert_fc1 = not getattr(self, "offload_expert_fc1", False)
+        op.no_offload_activation = not getattr(self, "offload_expert_fc1", False)
 
         # Copy the weights from GroupedLinear module to GroupedLinear op.
         if fc1_single_grouped_weight:
@@ -495,7 +495,7 @@ class TEGroupedMLP(MegatronModule):
                 "_make_fused_ops expected SwiGLU, quick_gelu, or weighted squared_relu; "
                 "call _is_fused_impl_supported() before constructing fused ops."
             )
-        op.no_offload_moe_act = not getattr(self, "offload_moe_act", False)
+        op.no_offload_activation = not getattr(self, "offload_moe_act", False)
         ops.append(op)
 
         # FC2

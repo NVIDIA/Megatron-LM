@@ -705,15 +705,15 @@ def test_make_fused_ops_attaches_single_grouped_bias_for_fc1(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "offload_expert_fc1, offload_moe_act, expected_no_offload_expert_fc1, expected_no_offload_moe_act",
+    "offload_expert_fc1, offload_moe_act, expected_fc1_no_offload, expected_act_no_offload",
     [(True, True, False, False), (True, False, False, True), (False, True, True, False)],
 )
 def test_make_fused_ops_sets_fine_grained_offload_opt_out_attrs(
     monkeypatch,
     offload_expert_fc1,
     offload_moe_act,
-    expected_no_offload_expert_fc1,
-    expected_no_offload_moe_act,
+    expected_fc1_no_offload,
+    expected_act_no_offload,
 ):
     fake_te, FakeGroupedLinear = _make_fake_te_namespace()
     monkeypatch.setattr(experts_module, "te", fake_te)
@@ -746,10 +746,9 @@ def test_make_fused_ops_sets_fine_grained_offload_opt_out_attrs(
 
     ops = module._make_fused_ops()
 
-    assert ops[0].no_offload_expert_fc1 is expected_no_offload_expert_fc1
-    assert ops[1].no_offload_moe_act is expected_no_offload_moe_act
-    assert not hasattr(ops[2], "no_offload_expert_fc1")
-    assert not hasattr(ops[2], "no_offload_moe_act")
+    assert ops[0].no_offload_activation is expected_fc1_no_offload
+    assert ops[1].no_offload_activation is expected_act_no_offload
+    assert not hasattr(ops[2], "no_offload_activation")
 
 
 def test_backward_dw_dispatches_fused_children_in_fc2_then_fc1_order():
