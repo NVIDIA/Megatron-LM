@@ -18,10 +18,14 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.fused_a2a import (
+    NcclEpContext,
+    ensure_nccl_ep_bootstrapped,
     fused_combine,
     fused_dispatch,
     hybrid_ep_combine,
     hybrid_ep_dispatch,
+    nccl_ep_combine,
+    nccl_ep_dispatch,
     set_deepep_num_sms,
 )
 from megatron.core.transformer.moe.moe_utils import (
@@ -1392,6 +1396,196 @@ class _DeepepManager(_DispatchManager):
         return hidden_states
 
 
+class _NCCLEPManager(_DispatchManager):
+    """A manager class to handle dispatch/combine for MoE models using the NCCL Expert
+    Parallelism backend, via TransformerEngine's transformer_engine.pytorch.ep API
+    (wrapped in fused_a2a.py).
+
+    The workflow mirrors the other flex backends:
+    (1) setup_metadata(): reconstruct topk indices/probs from the routing map (like DeepEP).
+    (2) dispatch(): TE ep_dispatch permutes tokens to expert-major layout and performs the
+        all-to-all in one step, returning a packed receive buffer + per-expert counts.
+    (3) get_permuted_hidden_states_by_experts(): the receive buffer is already expert-major,
+        so this only narrows it to the valid (sum of per-expert counts) rows for the experts.
+    (4) get_restored_hidden_states_by_experts(): re-expand the expert output back into the
+        static receive-capacity buffer that TE ep_combine writes from.
+    (5) combine(): TE ep_combine scatters expert outputs back to the original tokens.
+
+    The TE NCCL EP context (EpHandle + EpBuffer) and the process-wide bootstrap are created
+    lazily on the first dispatch, when the local token count is known.
+    """
+
+    def __init__(
+        self,
+        group: torch.distributed.ProcessGroup,
+        num_local_experts: int,
+        router_topk: int,
+        num_experts: int,
+        config: TransformerConfig,
+    ):
+        """
+        Initialize the NCCL EP dispatcher.
+
+        Args:
+            group (torch.distributed.ProcessGroup): The process group to use for communication.
+                This should be the TPxEP group.
+            num_local_experts (int): The number of local experts.
+            router_topk (int): The number of experts each token selects (TP-folded).
+            num_experts (int): The total number of experts in the group (TP-folded).
+            config (TransformerConfig): The configuration for the transformer model.
+        """
+        self.group = group
+        self.num_local_experts = num_local_experts
+        self.router_topk = router_topk
+        self.num_experts = num_experts
+        self.config = config
+        self.hidden_dim = config.hidden_size
+        # Per-expert packing alignment for the receive buffer (grouped-GEMM tile); 0 for bf16.
+        self.alignment = get_align_size_for_quantization(config)
+        self.rank_capacity_factor = config.moe_expert_rank_capacity_factor
+
+        if nccl_ep_dispatch is None:
+            raise ImportError(
+                "TransformerEngine NCCL EP is unavailable. The 'ncclep' backend requires a "
+                "TransformerEngine build with NCCL EP support (NVTE_BUILD_WITH_NCCL_EP=1)."
+            )
+        if self.rank_capacity_factor is None:
+            raise ValueError(
+                "The 'ncclep' backend requires moe_expert_rank_capacity_factor to be set: it "
+                "sizes the per-rank receive buffer. Exceeding the budget hard-traps, so set it "
+                "generously."
+            )
+        # bf16-only for now: a nonzero grouped-GEMM alignment (FP8/FP4 quantization or the TE op
+        # fuser) would make recv_tokens per-expert-padded, which is not supported yet.
+        # TODO(ncclep) support FP8/FP4.
+        if self.alignment != 0:
+            raise ValueError(
+                f"The 'ncclep' backend does not support a nonzero grouped-GEMM alignment (got "
+                f"{self.alignment}); FP8/FP4 and use_transformer_engine_op_fuser are not supported "
+                "yet."
+            )
+
+        # Created lazily on the first setup_metadata (sizing needs the local token count).
+        self._context: Optional[NcclEpContext] = None
+        self._recv_capacity: Optional[int] = None
+
+        # Metadata
+        self.token_probs: Optional[torch.Tensor] = None
+        self.token_indices: Optional[torch.Tensor] = None
+        self.dispatched_probs: Optional[torch.Tensor] = None
+        self.tokens_per_expert: Optional[torch.Tensor] = None
+        self.num_local_tokens: Optional[int] = None
+
+    def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
+        num_tokens = routing_map.shape[0]
+        probs = probs.reshape(num_tokens, self.num_experts)
+        # Convert the multihot routing map to (topk weights, topk indices), like DeepEP.
+        self.token_probs, self.token_indices = torch.topk(probs, self.router_topk, dim=-1)
+        self.num_local_tokens = num_tokens
+        self._ensure_context()
+
+    def _ensure_context(self):
+        """Bootstrap NCCL EP and create the per-layer context on first use (static shapes)."""
+        if self._context is not None:
+            return
+        max_tokens_per_rank = self.num_local_tokens
+        # NCCL EP requires an even number of dispatched tokens per rank
+        # nccl/contrib/nccl_ep/device/hybridep_adapter.cu:547 (nccl_ep::hybridep::dispatch_impl);
+        if max_tokens_per_rank % 2 != 0:
+            raise ValueError(
+                f"The 'ncclep' backend requires an even local token count, got "
+                f"{max_tokens_per_rank} (seq_len/TP * micro_batch_size)."
+            )
+        # recv_tokens are packed contiguously by actual count 
+        # (no per-expert padding) with alignment == 0
+        budget = int(max_tokens_per_rank * self.router_topk * self.rank_capacity_factor)
+        self._recv_capacity = max(budget, max_tokens_per_rank)
+
+        ensure_nccl_ep_bootstrapped(
+            self.group,
+            num_experts=self.num_experts,
+            max_tokens_per_rank=max_tokens_per_rank,
+            recv_capacity_per_rank=self._recv_capacity,
+            hidden_dim=self.hidden_dim,
+            num_sms=self.config.moe_ncclep_num_sms,
+        )
+        self._context = NcclEpContext(
+            top_k=self.router_topk,
+            max_tokens_per_rank=max_tokens_per_rank,
+            recv_capacity_per_rank=self._recv_capacity,
+            hidden_dim=self.hidden_dim,
+            num_local_experts=self.num_local_experts,
+            alignment=self.alignment,
+        )
+
+    def dispatch(
+        self,
+        hidden_states: torch.Tensor,
+        async_finish: bool = True,
+        allocate_on_comm_stream: bool = True,
+    ) -> torch.Tensor:
+        # TE requires int64 indices and float32 weights.
+        # token_indices/token_probs: [num_local_tokens, router_topk]
+        topk_idx = self.token_indices.to(torch.int64)
+        topk_weights = self.token_probs.float()
+        # hidden_states: [num_local_tokens, H] -> recv_tokens: [recv_capacity_per_rank, H]
+        #   tokens_per_expert: [num_local_experts]
+        #   dispatched_probs: [recv_capacity_per_rank]
+        recv_tokens, tokens_per_expert, dispatched_probs = nccl_ep_dispatch(
+            self._context, hidden_states, topk_idx, topk_weights
+        )
+        # Per-expert counts, [num_local_experts] (alignment-padded; == actual when alignment==0).
+        self.tokens_per_expert = tokens_per_expert.to(torch.int64)
+        self.dispatched_probs = dispatched_probs
+        return recv_tokens
+
+    def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # The receive buffer is already expert-major; narrow it to the valid (packed) rows so the
+        # experts run only on real tokens (vs. the whole recv_capacity buffer, ~rank_capacity_factor
+        # more GEMM rows). TODO(ncclep, host-sync): the .item() is a D2H sync and the resulting
+        # narrow/re-expand are dynamic-shaped — both block CUDA-graph capture. The capturable path
+        # keeps the static [recv_capacity, H] buffer end to end (feed it straight to a grouped GEMM
+        # that takes device counts), trading slack-row compute for static shapes.
+        num_valid = int(self.tokens_per_expert.sum().item())  # sum(counts) = Σ
+        permuted_hidden = hidden_states[:num_valid]  # [recv_capacity_per_rank, H] -> [Σ, H]
+        permuted_probs = self.dispatched_probs[:num_valid]  # [recv_capacity_per_rank] -> [Σ]
+        return permuted_hidden, permuted_probs
+
+    def get_number_of_tokens_per_expert(self) -> torch.Tensor:
+        '''
+        Get the number of tokens per expert.
+        '''
+        return self.tokens_per_expert
+
+    def get_restored_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Re-expand the expert output [sum(counts), H] back into the static receive-capacity
+        # buffer [recv_capacity, H] that TE ep_combine reads from. Rows beyond the valid region
+        # map to no token and are ignored by combine.
+        num_valid = hidden_states.shape[0]
+        pad_rows = self._recv_capacity - num_valid
+        if pad_rows > 0:
+            hidden_states = torch.cat(
+                [hidden_states, hidden_states.new_zeros(pad_rows, hidden_states.shape[-1])], dim=0
+            )
+        return hidden_states
+
+    def combine(
+        self,
+        hidden_states: torch.Tensor,
+        async_finish: bool = True,
+        allocate_on_comm_stream: bool = True,
+    ) -> torch.Tensor:
+        # Routing weights were applied in the expert MLP (recv_topk_weights=None).
+        # hidden_states: [recv_capacity_per_rank, H] -> [num_local_tokens, H]
+        hidden_states = nccl_ep_combine(
+            self._context, hidden_states, num_local_tokens=self.num_local_tokens
+        )
+        # Release per-iteration metadata.
+        self.dispatched_probs = None
+        self.tokens_per_expert = None
+        return hidden_states
+
+
 class MoEFlexTokenDispatcher(MoETokenDispatcher):
     """A flexible token dispatcher that abstracts the underlying tensor and expert
     parallelism. It uses a single communication group over all TP and EP ranks,
@@ -1436,11 +1630,20 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
                 config=self.config,
             )
             self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.routing_map']
+        elif self.config.moe_flex_dispatcher_backend == "ncclep":
+            assert self.tp_size * self.ep_size > 1, "NCCL EP dispatcher requires TPxEP > 1"
+            self._comm_manager = _NCCLEPManager(
+                group=self.tp_ep_group,
+                num_local_experts=self.num_local_experts,
+                router_topk=self.tp_size * self.config.moe_router_topk,
+                num_experts=self.tp_size * self.config.num_moe_experts,
+                config=self.config,
+            )
+            self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.token_indices']
         else:
             raise ValueError(
                 f"Invalid backend: {self.config.moe_flex_dispatcher_backend}"
-                "Please set --moe-flex-dispatcher-backend=deepep or "
-                "--moe-flex-dispatcher-backend=hybridep"
+                "Please set --moe-flex-dispatcher-backend to deepep, hybridep, or ncclep"
             )
 
     def _initialize_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor) -> torch.Tensor:
