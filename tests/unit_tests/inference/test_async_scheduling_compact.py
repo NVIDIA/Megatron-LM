@@ -803,7 +803,7 @@ def test_wait_for_dummy_context_h2d_synchronizes_once():
 @pytest.mark.internal
 def test_pending_async_forward_cleanup_releases_only_when_needed():
     context = SimpleNamespace(release_count=0)
-    context.release_deferred_async_kv_blocks = lambda: setattr(
+    context.release_deferred_async_resources = lambda: setattr(
         context, "release_count", context.release_count + 1
     )
     controller = object.__new__(TextGenerationController)
@@ -832,7 +832,7 @@ def test_pending_async_forward_cleanup_releases_only_when_needed():
 def test_pending_async_forward_row_discard_releases_without_accepting_mamba_bank():
     controller = _make_controller_with_rows([10, 11], [10, 12])
     context = controller.inference_wrapped_model.inference_context
-    context.release_deferred_async_kv_blocks = lambda: None
+    context.release_deferred_async_resources = lambda: None
     context.accept_async_mamba_state = lambda _request_ids: pytest.fail(
         "discarded forwards must not commit candidate Mamba banks"
     )
@@ -1053,7 +1053,7 @@ def test_async_pending_resources_are_quarantined_until_forward_retires():
     assert context._async_deferred_kv_blocks_to_release.tolist() == [10, 11]
     assert context.request_to_kv_block_ids.tolist() == [[-1, -1, -1], [12, -1, -1]]
 
-    context.release_deferred_async_kv_blocks()
+    context.release_deferred_async_resources()
 
     assert [blocks.tolist() for blocks in context.kv_block_allocator.released] == [[10, 11]]
     assert not context._async_forward_in_flight
@@ -1086,7 +1086,7 @@ def test_async_pending_forward_defers_mamba_slot_free_until_forward_retires():
     assert context.mamba_metadata.request_to_mamba_state_idx.tolist() == [-1, 5]
     assert context.mamba_metadata.request_to_mamba_state_bank.tolist() == [0, 1]
 
-    context.release_deferred_async_kv_blocks()
+    context.release_deferred_async_resources()
 
     assert [blocks.tolist() for blocks in context.kv_block_allocator.released] == [[10, 11]]
     assert [slots.tolist() for slots in context.mamba_metadata.freed_slots] == [[3]]
@@ -1113,7 +1113,7 @@ def test_async_mamba_reset_defers_allocated_slots_while_forward_is_in_flight():
     assert context.mamba_metadata.request_to_mamba_state_idx.tolist() == [-1, -1, -1]
     assert context.mamba_metadata.request_to_mamba_state_bank.tolist() == [0, 0, 0]
 
-    context.release_deferred_async_kv_blocks()
+    context.release_deferred_async_resources()
 
     assert [slots.tolist() for slots in context.mamba_metadata.freed_slots] == [[2, 4]]
     assert context._async_deferred_mamba_slots_to_free.numel() == 0
@@ -1161,7 +1161,7 @@ def test_async_reserved_kv_blocks_are_adopted_or_deferred_then_released():
     assert context._async_reserved_kv_block_request_ids.tolist() == [-1, -1, -1]
     assert context._async_deferred_kv_blocks_to_release.tolist() == [101, 102]
 
-    context.release_deferred_async_kv_blocks()
+    context.release_deferred_async_resources()
 
     assert [blocks.tolist() for blocks in context.kv_block_allocator.released] == [[101, 102]]
     assert context._async_deferred_kv_blocks_to_release.numel() == 0

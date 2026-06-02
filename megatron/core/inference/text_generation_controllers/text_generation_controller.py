@@ -1714,7 +1714,7 @@ class TextGenerationController:
         """Discard a pending async forward and release resources reserved for it."""
         context = self.inference_wrapped_model.inference_context
         if self._async_pending_forward:
-            context.release_deferred_async_kv_blocks()
+            context.release_deferred_async_resources()
             self._async_pending_forward = False
             self._async_pending_cuda_graph_request_count = None
             self._async_pending_forward_view = None
@@ -2879,7 +2879,7 @@ class TextGenerationController:
                     self._async_discarded_forward_count += 1
                 if pending_forward_reused and context.is_hybrid_model:
                     context.accept_async_mamba_state(pending_forward_view.current_request_ids)
-                context.release_deferred_async_kv_blocks()
+                context.release_deferred_async_resources()
                 if pending_forward_reused and self.num_speculative_tokens > 0:
                     input_ids, _ = context.current_input_and_position_ids()
             if not pending_forward_reused:
@@ -3078,7 +3078,7 @@ class TextGenerationController:
                 )
                 if self._async_pending_forward and next_active_request_count == 0:
                     torch.cuda.current_stream().synchronize()
-                    context.release_deferred_async_kv_blocks()
+                    context.release_deferred_async_resources()
                     self._async_pending_forward = False
                     self._async_pending_cuda_graph_request_count = None
                     self._async_pending_forward_view = None

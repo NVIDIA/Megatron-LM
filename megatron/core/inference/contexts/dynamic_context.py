@@ -2542,7 +2542,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Mark that a speculative forward may still be using old resources."""
         self._async_forward_in_flight = True
 
-    def release_deferred_async_kv_blocks(self) -> None:
+    def release_deferred_async_resources(self) -> None:
         """Release async-reserved resources after their speculative forward retires."""
         self._async_forward_in_flight = False
         if self._async_deferred_kv_blocks_to_release.numel() == 0:
@@ -2555,6 +2555,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             (0,), dtype=torch.int32, device='cpu'
         )
         self._release_deferred_async_mamba_slots()
+
+    def release_deferred_async_kv_blocks(self) -> None:
+        """Compatibility wrapper for callers that only deferred KV blocks before P14."""
+        self.release_deferred_async_resources()
 
     def _append_deferred_async_kv_blocks(self, blocks: Tensor) -> None:
         """Defer releasing blocks that may still be used by an in-flight forward."""
