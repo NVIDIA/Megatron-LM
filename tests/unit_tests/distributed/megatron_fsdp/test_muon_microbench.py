@@ -18,16 +18,12 @@ import json
 import os
 import pathlib
 import re
-import time
-from types import SimpleNamespace
-
 import pytest
 import torch
 import torch.distributed as dist
 from packaging.version import Version
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import DTensor, Replicate, Shard
-from torch.distributed.tensor.placement_types import _StridedShard
+from torch.distributed.tensor import DTensor, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
     update_uneven_dtensor_chunk_metadata,
@@ -66,22 +62,19 @@ pytestmark = [
 
 @pytest.fixture(scope="module")
 def distributed_setup():
-    """Set up torch.distributed and CUDA device for torchrun + pytest."""
+    """Pin the CUDA device. `init_device_mesh` lazy-inits the default
+    process group on first use from torchrun's RANK/WORLD_SIZE env vars."""
     if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
         pytest.skip("Not running under torchrun. Use torchrun to run this test file.")
-
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    local_rank = int(os.environ.get("LOCAL_RANK", rank))
 
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for the Muon microbenchmark.")
 
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
+    local_rank = int(os.environ.get("LOCAL_RANK", rank))
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
-
-    if not dist.is_initialized():
-        dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
 
     yield {"rank": rank, "world_size": world_size, "device": device}
 
@@ -112,21 +105,28 @@ def _parse_dtype(s: str) -> torch.dtype:
     return _DTYPE_MAP[s]
 
 
-_PLACEMENT_RE = re.compile(
-    r"(Shard|_StridedShard|Replicate)\((?:dim=)?(-?\d+)?(?:,\s*split_factor=(\d+))?\)?"
-)
+_PLACEMENT_RE = re.compile(r"Shard\(dim=(-?\d+)\)")
 
 
 def _parse_placement(s: str):
-    m = _PLACEMENT_RE.search(s)
+    m = _PLACEMENT_RE.fullmatch(s)
     if not m:
         raise ValueError(f"cannot parse placement: {s!r}")
-    kind, dim, split = m.group(1), m.group(2), m.group(3)
-    if kind == "Replicate":
-        return Replicate()
-    if kind == "_StridedShard":
-        return _StridedShard(int(dim), split_factor=int(split))
-    return Shard(int(dim))
+    return Shard(int(m.group(1)))
+
+
+def _contiguous_stride(shape):
+    """Row-major contiguous strides for a tensor of ``shape`` — no allocation.
+
+    `DTensor.from_local(..., shape=global_shape)` requires `stride` whenever
+    `shape` is given (PyTorch enforces "pass both or neither").
+    """
+    stride = []
+    running = 1
+    for s in reversed(shape):
+        stride.append(running)
+        running *= s
+    return tuple(reversed(stride))
 
 
 # ---------- DTensor construction ----------
@@ -149,13 +149,12 @@ def _make_dtensor_from_spec(p_spec: dict, mesh, device):
 
     # fp32 randn → cast to target dtype so we get sensible values for bf16/fp16 too.
     local = torch.randn(local_shape, dtype=torch.float32, device=device).to(dtype=dtype)
-    global_stride = torch.empty(global_shape, dtype=dtype, device=device).stride()
     dt = DTensor.from_local(
         local_tensor=local,
         device_mesh=mesh,
         placements=placements,
         shape=torch.Size(global_shape),
-        stride=global_stride,
+        stride=_contiguous_stride(global_shape),
         run_check=False,
     )
     update_uneven_dtensor_chunk_metadata(dt)
@@ -173,17 +172,6 @@ def _build_mesh(spec: dict):
     )
 
 
-def _build_pg_collection(mesh):
-    """Minimal stand-in for `ProcessGroupCollection` — exposes dim-named groups."""
-    pgc = SimpleNamespace()
-    for name in mesh.mesh_dim_names or ():
-        try:
-            setattr(pgc, name, mesh.get_group(name))
-        except Exception:  # pragma: no cover — defensive
-            pass
-    return pgc
-
-
 # ---------- Param + optimizer construction ----------
 
 
@@ -192,18 +180,18 @@ def _build_params_and_grads(spec: dict, mesh, device):
     params = []
     for p_spec in spec["params"]:
         p = _make_dtensor_from_spec(p_spec, mesh, device)
+        if p_spec.get("is_qkv"):
+            p.is_qkv = True
         # Random gradient matching the param's DTensor layout.
         grad_local = torch.randn_like(p._local_tensor, dtype=torch.float32).to(dtype=p.dtype)
         placements = [_parse_placement(s) for s in p_spec["placements"]]
-        global_stride = torch.empty(
-            tuple(p_spec["global_shape"]), dtype=p.dtype, device=device
-        ).stride()
+        global_shape = tuple(p_spec["global_shape"])
         grad = DTensor.from_local(
             local_tensor=grad_local,
             device_mesh=mesh,
             placements=placements,
-            shape=torch.Size(tuple(p_spec["global_shape"])),
-            stride=global_stride,
+            shape=torch.Size(global_shape),
+            stride=_contiguous_stride(global_shape),
             run_check=False,
         )
         update_uneven_dtensor_chunk_metadata(grad)
@@ -213,7 +201,7 @@ def _build_params_and_grads(spec: dict, mesh, device):
     return [{"params": params}]
 
 
-def _build_optimizer(param_groups, pg_collection, dp_group):
+def _build_optimizer(param_groups, dp_group):
     """Construct a `FSDPTensorParallelMuon` with typical Muon hyperparameters.
 
     The JSON fixtures only describe parameter sharding; the choice of
@@ -223,7 +211,7 @@ def _build_optimizer(param_groups, pg_collection, dp_group):
     return FSDPTensorParallelMuon(
         params=param_groups,
         dp_group=dp_group,
-        pg_collection=pg_collection,
+        pg_collection=None,
         lr=8e-4,
         momentum=0.9,
         weight_decay=0.1,
@@ -232,18 +220,20 @@ def _build_optimizer(param_groups, pg_collection, dp_group):
         scale_mode="spectral",
         extra_scale_factor=0.2,
         tp_mode="blockwise",
-        split_qkv=False,
+        split_qkv=True,
+        qkv_split_shapes=[1024, 128, 128],
+        is_qkv_fn=lambda p: getattr(p, "is_qkv", False),
     )
 
 
 # ---------- Test ----------
 
 
-def test_muon_step_smoke(distributed_setup):
-    """Build the full optimizer state and run a few `step()` calls.
+def test_muon_step(distributed_setup, benchmark):
+    """Build the full optimizer state and benchmark `step()`.
 
-    Confirms the dump can be replayed end-to-end (parameter reconstruction,
-    optimizer construction, optimizer step) at world_size=8 without errors.
+    pytest-benchmark's `pedantic` mode runs the step a fixed number of times
+    (deterministic across ranks) and reports min/median/max/mean/stddev.
     """
     rank = distributed_setup["rank"]
     world_size = distributed_setup["world_size"]
@@ -255,48 +245,19 @@ def test_muon_step_smoke(distributed_setup):
     )
 
     mesh = _build_mesh(spec)
-    pg = _build_pg_collection(mesh)
     dp_group = mesh.get_group("dp_cp")
 
     param_groups = _build_params_and_grads(spec, mesh, device)
-    optimizer = _build_optimizer(param_groups, pg_collection=pg, dp_group=dp_group)
+    optimizer = _build_optimizer(param_groups, dp_group=dp_group)
 
     # Spot-check: first param's local shape on this rank matches the spec.
     first_param = param_groups[0]["params"][0]
     first_spec = spec["params"][0]
     assert tuple(first_param._local_tensor.shape) == tuple(first_spec["local_shape"])
 
-    warmup = 60
-    iters = 20
-    for _ in range(warmup):
+    def _one_step():
         optimizer.step()
-    torch.cuda.synchronize()
-    dist.barrier()
+        torch.cuda.synchronize()
 
-    nsys_on = os.environ.get("MUON_BENCH_NSYS", "0") == "1"
-    times_ms = []
-    if nsys_on:
-        torch.cuda.cudart().cudaProfilerStart()
-        with torch.autograd.profiler.emit_nvtx(record_shapes=False):
-            for _ in range(iters):
-                t0 = time.perf_counter()
-                optimizer.step()
-                torch.cuda.synchronize()
-                times_ms.append((time.perf_counter() - t0) * 1000.0)
-        torch.cuda.cudart().cudaProfilerStop()
-    else:
-        for _ in range(iters):
-            t0 = time.perf_counter()
-            optimizer.step()
-            torch.cuda.synchronize()
-            times_ms.append((time.perf_counter() - t0) * 1000.0)
+    benchmark.pedantic(_one_step, rounds=5, warmup_rounds=3, iterations=1)
     dist.barrier()
-
-    if rank == 0:
-        times_sorted = sorted(times_ms)
-        p50 = times_sorted[len(times_sorted) // 2]
-        print(
-            f"\n[muon-microbench] params={sum(len(g['params']) for g in param_groups)} "
-            f"iters={iters} "
-            f"min={min(times_ms):.2f}ms p50={p50:.2f}ms max={max(times_ms):.2f}ms"
-        )
