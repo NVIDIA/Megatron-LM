@@ -3,7 +3,7 @@
 '''
 WORLD_SIZE=1 LOCAL_RANK=0 python -m torch.distributed.run \
     --nproc_per_node=1 -m pytest \
-    tests/unit_tests/models/test_mimo_partition.py -v
+    tests/unit_tests/models/mimo/test_mimo_partition.py -v
 '''
 
 from unittest.mock import MagicMock, patch

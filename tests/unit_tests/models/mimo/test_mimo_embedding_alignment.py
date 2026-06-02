@@ -1,7 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 '''
-WORLD_SIZE=1 LOCAL_RANK=0 python -m pytest tests/unit_tests/models/test_mimo_embedding_alignment.py
+WORLD_SIZE=1 LOCAL_RANK=0 python -m pytest tests/unit_tests/models/mimo/test_mimo_embedding_alignment.py
 '''
 
 from unittest.mock import MagicMock
