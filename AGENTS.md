@@ -29,3 +29,22 @@ skill keyword — infer it from the artifact you read.
 ### Code Quality
 
 - After editing imports in any Python files, always run `uv run isort` on those files to fix import order before committing.
+
+### Megatron Core Process Groups
+
+- In `megatron/core` production code, avoid adding new direct reads of global
+  process groups from `parallel_state` (for example,
+  `parallel_state.get_tensor_model_parallel_group()` or directly imported
+  `get_*_group()` helpers). Prefer accepting a `ProcessGroupCollection` or an
+  explicit `torch.distributed.ProcessGroup` from the caller and passing that
+  through.
+- Allowed compatibility points include `megatron/core/parallel_state.py`,
+  `megatron/core/process_groups_config.py`, initialization/bootstrap code that
+  materializes a `ProcessGroupCollection` from MPU globals, tests, docs, and
+  migration fallbacks with an explicit comment.
+- This guidance targets Megatron Core library code. Do not apply it to
+  `megatron/training` or other training-loop code unless the PR explicitly
+  opts into that migration.
+- In reviews, flag new direct `parallel_state.get_*_group()` usage in
+  `megatron/core` unless it is one of the compatibility points above. This is
+  advisory guidance, not a CI gate.
