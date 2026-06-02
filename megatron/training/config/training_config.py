@@ -649,7 +649,7 @@ class CheckpointConfig:
         from megatron.training.utils import has_nvrx_checkpointing_async_support
 
         if self.pretrained_checkpoint is not None:
-            from megatron.training.utils import file_exists
+            from megatron.training.utils.common_utils import file_exists
 
             assert file_exists(self.pretrained_checkpoint), (
                 f"Pretrained checkpoint {self.pretrained_checkpoint} does not exist"
