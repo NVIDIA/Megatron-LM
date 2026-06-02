@@ -77,6 +77,7 @@ SAVE_DTYPE_MAP = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32
 VALID_MODIFIERS = ("reverse", "scramble")
 BYTE_ACCOUNTING_MODES = ("none", "rank0", "all")
 RESOURCE_LOG_MODES = ("none", "rank0", "all")
+DEFAULT_BALANCED_WORK_TARGET_CHUNK_MIB = 512
 
 # The sole merge path derives the merge structure from public DCP metadata only
 # (no model/template construction, no CUDA kernels), so it merges any model
@@ -145,6 +146,10 @@ class MergeResult:
     implementation_mode: str = METADATA_SAME_LAYOUT_MODE
     memory_estimate: MergeMemoryEstimate = MergeMemoryEstimate()
     preflight_only: bool = False
+    balanced_work: bool = False
+    target_chunk_bytes: Optional[int] = None
+    plan_tensor_bytes_by_rank: tuple[int, ...] = ()
+    plan_tensor_chunks_by_rank: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -183,6 +188,16 @@ class _DcpMetadataTensorLayout:
 class _DcpMetadataSnapshot:
     tensor_metadata: dict[str, TensorStorageMetadata]
     byte_extra_state_keys: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _MetadataSameLayoutWorkPlan:
+    write_specs: list[_DirectDcpWriteSpec]
+    byte_specs: list[_DcpMetadataByteSpec]
+    merge_keys: int
+    extra_state_keys: int
+    tensor_bytes_by_rank: tuple[int, ...]
+    tensor_chunks_by_rank: tuple[int, ...]
 
 
 class _WeightedMergeDirectOutputSavePlanner(SavePlanner):
@@ -984,6 +999,8 @@ def _add_merge_provenance(
     strict: StrictHandling,
     merge_style: Optional[str],
     execution_mode: str = METADATA_SAME_LAYOUT_MODE,
+    balanced_work: bool = False,
+    target_chunk_bytes: Optional[int] = None,
 ) -> None:
     common_state["weighted_merge_provenance"] = {
         "format_version": 1,
@@ -997,6 +1014,8 @@ def _add_merge_provenance(
         "extra_state_source_index": extra_state_source_index,
         "extra_state_source_path": str(input_dirs[extra_state_source_index]),
         "implementation_mode": execution_mode,
+        "balanced_work": bool(balanced_work),
+        "target_chunk_bytes": target_chunk_bytes,
         "strict": strict.value,
         "code_revision": _git_revision(),
         "optimizer_merged": False,
@@ -1012,9 +1031,13 @@ def _prepare_temporary_output_dir(output_dir: Path, overwrite_output: bool) -> P
         )
     temporary_name = _broadcast_rank0_value(f".{output_dir.name}.tmp-{uuid.uuid4().hex}")
     temporary_dir = output_dir.parent / temporary_name
-    if temporary_dir.exists():
-        raise WeightedMergeError(f"Temporary output directory already exists: {temporary_dir}.")
-    temporary_dir.parent.mkdir(parents=True, exist_ok=True)
+
+    def prepare_parent() -> None:
+        if temporary_dir.exists():
+            raise WeightedMergeError(f"Temporary output directory already exists: {temporary_dir}.")
+        temporary_dir.parent.mkdir(parents=True, exist_ok=True)
+
+    _run_rank0_filesystem_op("Preparing atomic merge output directory", prepare_parent)
     return temporary_dir
 
 
@@ -1322,6 +1345,7 @@ def _validate_metadata_same_layout(
     resolved_input_dirs: list[Path],
     model_key_prefixes: tuple[str, ...],
     save_dtype: str,
+    require_matching_chunks: bool = True,
 ) -> tuple[tuple[str, ...], tuple[str, ...], dict[str, _DcpMetadataTensorLayout]]:
     first_keys = _metadata_same_layout_model_keys(
         tensor_metadata_by_checkpoint[0],
@@ -1380,7 +1404,7 @@ def _validate_metadata_same_layout(
                     f"expected {expected.global_shape}, got {actual.global_shape} "
                     f"in {checkpoint_dir}."
                 )
-            if actual.chunks != expected.chunks:
+            if require_matching_chunks and actual.chunks != expected.chunks:
                 raise WeightedMergeError(
                     f"Chunk layout mismatch for '{fqn}' in metadata-same-layout "
                     f"for {checkpoint_dir}."
@@ -1427,22 +1451,115 @@ def _metadata_same_layout_chunk_leaf(
     )
 
 
+def _dtype_nbytes(dtype: torch.dtype) -> int:
+    return torch.empty((), dtype=dtype).element_size()
+
+
+def _shape_numel(shape: Iterable[int]) -> int:
+    numel = 1
+    for dim in shape:
+        numel *= int(dim)
+    return numel
+
+
+def _estimate_merge_work_bytes(
+    shape: Iterable[int],
+    *,
+    source_dtype: torch.dtype,
+    target_dtype: torch.dtype,
+    input_count: int,
+) -> int:
+    numel = _shape_numel(shape)
+    source_bytes = numel * _dtype_nbytes(source_dtype) * input_count
+    accumulator_bytes = numel * _dtype_nbytes(torch.float32)
+    output_bytes = numel * _dtype_nbytes(target_dtype)
+    return source_bytes + accumulator_bytes + output_bytes
+
+
+def _virtual_tensor_tiles(
+    *,
+    global_shape: tuple[int, ...],
+    dtype: torch.dtype,
+    target_chunk_bytes: int,
+) -> tuple[tuple[tuple[int, ...], tuple[int, ...]], ...]:
+    if target_chunk_bytes <= 0:
+        raise WeightedMergeError(
+            f"Balanced work target chunk size must be positive, got {target_chunk_bytes}."
+        )
+    if not global_shape:
+        return (((), ()),)
+
+    dtype_bytes = _dtype_nbytes(dtype)
+    split_dim = max(range(len(global_shape)), key=lambda dim: int(global_shape[dim]))
+    other_numel = 1
+    for dim, size in enumerate(global_shape):
+        if dim != split_dim:
+            other_numel *= int(size)
+    row_bytes = max(1, other_numel * dtype_bytes)
+    tile_length = max(1, min(int(global_shape[split_dim]), target_chunk_bytes // row_bytes))
+
+    tiles: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
+    start = 0
+    while start < int(global_shape[split_dim]):
+        length = min(tile_length, int(global_shape[split_dim]) - start)
+        offsets = [0 for _ in global_shape]
+        chunk_shape = list(global_shape)
+        offsets[split_dim] = start
+        chunk_shape[split_dim] = length
+        tiles.append((tuple(offsets), tuple(chunk_shape)))
+        start += length
+    return tuple(tiles)
+
+
+def _rank_balanced_assignments(
+    candidates: list[tuple[int, int, _DirectDcpWriteSpec]],
+    *,
+    world_size: int,
+) -> tuple[list[list[_DirectDcpWriteSpec]], tuple[int, ...], tuple[int, ...]]:
+    assigned_specs: list[list[_DirectDcpWriteSpec]] = [[] for _ in range(world_size)]
+    rank_bytes = [0 for _ in range(world_size)]
+    rank_chunks = [0 for _ in range(world_size)]
+    for cost_bytes, _stable_index, spec in sorted(
+        candidates,
+        key=lambda item: (
+            item[0],
+            item[2].sharded_key,
+            item[2].global_offsets,
+            item[2].chunk_shape,
+            item[1],
+        ),
+        reverse=True,
+    ):
+        target_rank = min(range(world_size), key=lambda idx: (rank_bytes[idx], rank_chunks[idx], idx))
+        assigned_specs[target_rank].append(spec)
+        rank_bytes[target_rank] += int(cost_bytes)
+        rank_chunks[target_rank] += 1
+    return assigned_specs, tuple(rank_bytes), tuple(rank_chunks)
+
+
 def _build_metadata_same_layout_write_specs(
     *,
     selected_keys: tuple[str, ...],
     byte_extra_state_keys: tuple[str, ...],
     first_layouts: dict[str, _DcpMetadataTensorLayout],
     save_dtype: str,
-) -> tuple[list[_DirectDcpWriteSpec], list[_DcpMetadataByteSpec], int, int]:
+    input_count: int,
+    balanced_work: bool = False,
+    target_chunk_bytes: Optional[int] = None,
+) -> _MetadataSameLayoutWorkPlan:
     rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
     world_size = (
         dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
     )
     target_dtype_override = SAVE_DTYPE_MAP.get(save_dtype)
-    write_specs: list[_DirectDcpWriteSpec] = []
+    local_write_specs: list[_DirectDcpWriteSpec] = []
     byte_specs: list[_DcpMetadataByteSpec] = []
+    candidate_specs: list[tuple[int, int, _DirectDcpWriteSpec]] = []
+    rank_tensor_bytes = [0 for _ in range(world_size)]
+    rank_tensor_chunks = [0 for _ in range(world_size)]
     merge_keys = 0
     extra_state_keys = 0
+    stable_index = 0
 
     for fqn in selected_keys:
         layout = first_layouts[fqn]
@@ -1456,9 +1573,16 @@ def _build_metadata_same_layout_write_specs(
             target_dtype = (
                 target_dtype_override if target_dtype_override is not None else layout.dtype
             )
-        for chunk_index, (global_offsets, chunk_shape) in enumerate(layout.chunks):
-            if chunk_index % world_size != rank:
-                continue
+        chunks = (
+            _virtual_tensor_tiles(
+                global_shape=layout.global_shape,
+                dtype=target_dtype,
+                target_chunk_bytes=int(target_chunk_bytes),
+            )
+            if balanced_work and target_chunk_bytes is not None
+            else layout.chunks
+        )
+        for chunk_index, (global_offsets, chunk_shape) in enumerate(chunks):
             template_leaf = _metadata_same_layout_chunk_leaf(
                 fqn=fqn,
                 dtype=layout.dtype,
@@ -1466,7 +1590,7 @@ def _build_metadata_same_layout_write_specs(
                 global_offsets=global_offsets,
                 chunk_shape=chunk_shape,
             )
-            write_specs.append(
+            spec = (
                 _DirectDcpWriteSpec(
                     path=path,
                     load_path=path,
@@ -1484,6 +1608,32 @@ def _build_metadata_same_layout_write_specs(
                     is_extra_state=is_extra_state,
                 )
             )
+            cost_bytes = _estimate_merge_work_bytes(
+                chunk_shape,
+                source_dtype=layout.dtype,
+                target_dtype=target_dtype,
+                input_count=input_count,
+            )
+            if balanced_work:
+                candidate_specs.append((cost_bytes, stable_index, spec))
+            elif chunk_index % world_size == rank:
+                local_write_specs.append(spec)
+                rank_tensor_bytes[rank] += cost_bytes
+                rank_tensor_chunks[rank] += 1
+            else:
+                assigned_rank = chunk_index % world_size
+                rank_tensor_bytes[assigned_rank] += cost_bytes
+                rank_tensor_chunks[assigned_rank] += 1
+            stable_index += 1
+
+    if balanced_work:
+        assigned_specs, assigned_bytes, assigned_chunks = _rank_balanced_assignments(
+            candidate_specs,
+            world_size=world_size,
+        )
+        local_write_specs = assigned_specs[rank]
+        rank_tensor_bytes = list(assigned_bytes)
+        rank_tensor_chunks = list(assigned_chunks)
 
     for byte_index, fqn in enumerate(byte_extra_state_keys):
         extra_state_keys += 1
@@ -1502,7 +1652,14 @@ def _build_metadata_same_layout_write_specs(
         raise WeightedMergeError(
             "metadata-same-layout found no mergeable non-_extra_state model tensors."
         )
-    return write_specs, byte_specs, merge_keys, extra_state_keys
+    return _MetadataSameLayoutWorkPlan(
+        write_specs=local_write_specs,
+        byte_specs=byte_specs,
+        merge_keys=merge_keys,
+        extra_state_keys=extra_state_keys,
+        tensor_bytes_by_rank=tuple(rank_tensor_bytes),
+        tensor_chunks_by_rank=tuple(rank_tensor_chunks),
+    )
 
 
 def merge_same_layout_dcp_metadata_checkpoints(
@@ -1520,6 +1677,8 @@ def merge_same_layout_dcp_metadata_checkpoints(
     atomic_output: bool = True,
     merge_style: Optional[str] = None,
     model_key_prefixes: tuple[str, ...] = METADATA_SAME_LAYOUT_MODEL_PREFIXES,
+    balanced_work: bool = False,
+    target_chunk_bytes: Optional[int] = None,
 ) -> MergeResult:
     """Merge same-layout torch_dist checkpoints using public DCP metadata only.
 
@@ -1553,6 +1712,12 @@ def merge_same_layout_dcp_metadata_checkpoints(
         )
     if not model_key_prefixes:
         raise WeightedMergeError("model_key_prefixes must contain at least one prefix.")
+    if balanced_work and target_chunk_bytes is None:
+        target_chunk_bytes = DEFAULT_BALANCED_WORK_TARGET_CHUNK_MIB * 1024 * 1024
+    if target_chunk_bytes is not None and target_chunk_bytes <= 0:
+        raise WeightedMergeError(
+            f"Balanced work target chunk size must be positive, got {target_chunk_bytes}."
+        )
     if not atomic_output:
         raise WeightedMergeError(
             "Weighted merge requires atomic output publication; "
@@ -1604,18 +1769,20 @@ def merge_same_layout_dcp_metadata_checkpoints(
         resolved_input_dirs=resolved_input_dirs,
         model_key_prefixes=model_key_prefixes,
         save_dtype=save_dtype,
+        require_matching_chunks=not balanced_work,
     )
-    write_specs, byte_specs, averaged_tensors, copied_extra_states = (
-        _build_metadata_same_layout_write_specs(
-            selected_keys=selected_keys,
-            byte_extra_state_keys=byte_extra_state_keys,
-            first_layouts=first_layouts,
-            save_dtype=save_dtype,
-        )
+    work_plan = _build_metadata_same_layout_write_specs(
+        selected_keys=selected_keys,
+        byte_extra_state_keys=byte_extra_state_keys,
+        first_layouts=first_layouts,
+        save_dtype=save_dtype,
+        input_count=len(resolved_input_dirs),
+        balanced_work=balanced_work,
+        target_chunk_bytes=target_chunk_bytes,
     )
     memory_estimate = MergeMemoryEstimate(
-        mergeable_tensors=averaged_tensors,
-        extra_state_entries=copied_extra_states,
+        mergeable_tensors=work_plan.merge_keys,
+        extra_state_entries=work_plan.extra_state_keys,
         template_devices=("cpu",),
     )
     discovery_time = time.perf_counter() - discovery_start
@@ -1625,6 +1792,14 @@ def merge_same_layout_dcp_metadata_checkpoints(
         f"{output_dir} with weights {weights}",
         flush=True,
     )
+    if balanced_work:
+        print_rank_0(
+            "Balanced work plan: "
+            f"target_chunk_bytes={target_chunk_bytes}, "
+            f"tensor_bytes_by_rank={list(work_plan.tensor_bytes_by_rank)}, "
+            f"tensor_chunks_by_rank={list(work_plan.tensor_chunks_by_rank)}",
+            flush=True,
+        )
 
     temporary_output_dir = (
         _prepare_temporary_output_dir(output_dir, overwrite_output)
@@ -1653,6 +1828,8 @@ def merge_same_layout_dcp_metadata_checkpoints(
         strict=strict,
         merge_style=merge_style,
         execution_mode=METADATA_SAME_LAYOUT_MODE,
+        balanced_work=balanced_work,
+        target_chunk_bytes=target_chunk_bytes,
     )
 
     from megatron.core.dist_checkpointing.core import CheckpointingConfig, save_config
@@ -1663,8 +1840,8 @@ def merge_same_layout_dcp_metadata_checkpoints(
         for checkpoint_dir in resolved_input_dirs
     }
     planner = _WeightedMergeDirectOutputSavePlanner(
-        write_specs=write_specs,
-        byte_specs=byte_specs,
+        write_specs=work_plan.write_specs,
+        byte_specs=work_plan.byte_specs,
         resolved_input_dirs=resolved_input_dirs,
         weights=weights,
         load_strategies=load_strategies,
@@ -1746,8 +1923,8 @@ def merge_same_layout_dcp_metadata_checkpoints(
         input_dirs=tuple(resolved_input_dirs),
         weights=tuple(weights),
         timings=timings,
-        averaged_tensors=averaged_tensors,
-        copied_extra_states=copied_extra_states,
+        averaged_tensors=work_plan.merge_keys,
+        copied_extra_states=work_plan.extra_state_keys,
         bytes_read=bytes_read,
         bytes_written=bytes_written,
         backend=first_format,
@@ -1759,6 +1936,10 @@ def merge_same_layout_dcp_metadata_checkpoints(
         implementation_mode=METADATA_SAME_LAYOUT_MODE,
         memory_estimate=memory_estimate,
         preflight_only=False,
+        balanced_work=balanced_work,
+        target_chunk_bytes=target_chunk_bytes,
+        plan_tensor_bytes_by_rank=work_plan.tensor_bytes_by_rank,
+        plan_tensor_chunks_by_rank=work_plan.tensor_chunks_by_rank,
     )
 
 
@@ -1816,6 +1997,23 @@ def add_merge_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help=(
             "Saved dtype for averaged tensors. 'same' preserves the loaded/template dtype "
             "and requires compatible input dtypes."
+        ),
+    )
+    group.add_argument(
+        "--merge-balanced-work",
+        action="store_true",
+        help=(
+            "Prototype: ignore source DCP chunk boundaries for scheduling, create "
+            "balanced virtual tensor tiles, and bin-pack them across distributed ranks."
+        ),
+    )
+    group.add_argument(
+        "--merge-target-chunk-mib",
+        type=int,
+        default=DEFAULT_BALANCED_WORK_TARGET_CHUNK_MIB,
+        help=(
+            "Prototype virtual tile target, in MiB, used with --merge-balanced-work. "
+            f"Default: {DEFAULT_BALANCED_WORK_TARGET_CHUNK_MIB}."
         ),
     )
     group.add_argument(
@@ -1956,6 +2154,14 @@ def _validate_metadata_same_layout_cli_args(args: argparse.Namespace) -> None:
             "Weighted merge requires atomic output publication; "
             "--no-atomic-merge-output is not supported."
         )
+    if args.merge_target_chunk_mib <= 0:
+        raise WeightedMergeError("--merge-target-chunk-mib must be positive.")
+    if args.merge_target_chunk_mib != DEFAULT_BALANCED_WORK_TARGET_CHUNK_MIB and (
+        not args.merge_balanced_work
+    ):
+        raise WeightedMergeError(
+            "--merge-target-chunk-mib only applies when --merge-balanced-work is set."
+        )
 
     unsupported_non_defaults = [
         (args.merge_resource_log != "none", "--merge-resource-log"),
@@ -1983,6 +2189,10 @@ def _run_metadata_same_layout_cli(args: argparse.Namespace) -> MergeResult:
         overwrite_output=args.overwrite_merge_output,
         atomic_output=not args.no_atomic_merge_output,
         merge_style=merge_style,
+        balanced_work=args.merge_balanced_work,
+        target_chunk_bytes=(
+            args.merge_target_chunk_mib * 1024 * 1024 if args.merge_balanced_work else None
+        ),
     )
 
 
@@ -1999,6 +2209,10 @@ def _format_bandwidth(num_bytes: int, seconds: float) -> str:
     if seconds <= 0:
         return "n/a"
     return f"{_format_bytes(int(num_bytes / seconds))}/s"
+
+
+def _format_rank_bytes(values: tuple[int, ...]) -> str:
+    return "[" + ", ".join(_format_bytes(value) for value in values) + "]"
 
 
 def _print_merge_result(result: MergeResult) -> None:
@@ -2040,6 +2254,24 @@ def _print_merge_result(result: MergeResult) -> None:
         f"({_format_bandwidth(result.bytes_written, result.timings.save)})",
         flush=True,
     )
+    if result.plan_tensor_bytes_by_rank:
+        max_plan_bytes = max(result.plan_tensor_bytes_by_rank)
+        min_plan_bytes = min(result.plan_tensor_bytes_by_rank)
+        spread = max_plan_bytes / max(1, min_plan_bytes)
+        target_chunk = (
+            _format_bytes(result.target_chunk_bytes)
+            if result.target_chunk_bytes is not None
+            else "source-layout"
+        )
+        print_rank_0(
+            "Planned tensor work: "
+            f"balanced={result.balanced_work}, "
+            f"target_chunk={target_chunk}, "
+            f"bytes_by_rank={_format_rank_bytes(result.plan_tensor_bytes_by_rank)}, "
+            f"chunks_by_rank={list(result.plan_tensor_chunks_by_rank)}, "
+            f"max_min_ratio={spread:.3f}",
+            flush=True,
+        )
     print(
         f"Memory rank={result.rank}: host_peak={_format_bytes(result.host_peak_bytes)}",
         flush=True,
