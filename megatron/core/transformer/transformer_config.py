@@ -41,12 +41,78 @@ from ..utils import (
 
 logger = logging.getLogger(__name__)
 
+_VALID_DSA_KERNEL_BACKENDS = ("none", "tilelang", "cudnn")
+
 try:
     from packaging.version import Version as PkgVersion
 
     HAVE_PACKAGING = True
 except ImportError:
     HAVE_PACKAGING = False
+
+
+def _missing_tilelang_dsa_kernel_dependencies() -> List[str]:
+    """Return missing TileLang DSA kernel dependencies."""
+    try:
+        from megatron.core.transformer.experimental_attention_variant.ops import tilelang_dsa
+    except (ImportError, OSError):
+        return ["TileLang DSA kernels"]
+
+    missing = []
+    if tilelang_dsa.lighting_indexer is None:
+        missing.append("TileLang DSA indexer")
+    if tilelang_dsa.SparseMLA is None:
+        missing.append("TileLang SparseMLA")
+    return missing
+
+
+def _missing_cudnn_dsa_kernel_dependencies() -> List[str]:
+    """Return missing cuDNN DSA kernel dependencies."""
+    missing = []
+    try:
+        from flash_mla import flash_mla_sparse_fwd  # noqa: F401
+    except ImportError:
+        missing.append("flash_mla")
+
+    try:
+        from cudnn import DSA  # noqa: F401
+    except ImportError:
+        missing.append("cudnn-frontend DSA (nvidia-cudnn-frontend[cutedsl])")
+    return missing
+
+
+def _validate_dsa_kernel_backend_dependencies(dsa_kernel_backend: str) -> None:
+    """Validate optional fused DSA kernel backend dependencies."""
+    if dsa_kernel_backend not in _VALID_DSA_KERNEL_BACKENDS:
+        raise ValueError(
+            "dsa_kernel_backend must be one of: " f"{', '.join(_VALID_DSA_KERNEL_BACKENDS)}."
+        )
+    if dsa_kernel_backend == "none":
+        return
+    if not torch.cuda.is_available():
+        raise ValueError(
+            f"dsa_kernel_backend={dsa_kernel_backend} requires a CUDA device, "
+            "but none is available."
+        )
+    sm = torch.cuda.get_device_capability()
+    if sm[0] < 10:
+        raise ValueError(
+            f"dsa_kernel_backend={dsa_kernel_backend} requires SM100+ (Blackwell or later), "
+            f"but current device has compute capability {sm[0]}.{sm[1]}."
+        )
+
+    missing = []
+    if dsa_kernel_backend == "tilelang":
+        missing = _missing_tilelang_dsa_kernel_dependencies()
+    elif dsa_kernel_backend == "cudnn":
+        missing = _missing_cudnn_dsa_kernel_dependencies()
+
+    if missing:
+        raise ValueError(
+            f"dsa_kernel_backend={dsa_kernel_backend} requires fused DSA kernels, "
+            f"but the following packages are not available: {', '.join(missing)}. "
+            "Install them or set dsa_kernel_backend=none to use the PyTorch fallback."
+        )
 
 
 @dataclass
@@ -283,6 +349,9 @@ class TransformerConfig(ModelParallelConfig):
     experimental_attention_variant: Optional[Literal['gated_delta_net', 'dsa']] = None
     """Type of attention variant to use. Currently support gated_delta_net and dsa."""
 
+    experimental_attention_variant_loss_scale_func: Optional[Callable[[torch.Tensor], None]] = None
+    """Optional hook for experimental attention variants to receive the main loss scale."""
+
     ####################
     # DSA
     ####################
@@ -301,6 +370,26 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_use_sparse_loss: bool = False
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
+
+    dsa_kernel_backend: Literal["none", "tilelang", "cudnn"] = "none"
+    """Optional fused DSA kernel backend.
+    ``none`` disables fused DSA kernels. Explicit ``tilelang`` or ``cudnn`` enables only that
+    backend. Unsupported DSA layouts continue to use the PyTorch fallback."""
+
+    dsa_indexer_rope_interleaved: bool = False
+    """Whether DSA indexer RoPE should use MLA-style interleaving."""
+
+    dsa_indexer_rotate_activation: bool = True
+    """Whether DSA indexer should apply Hadamard rotate_activation to q/k before scoring."""
+
+    dsa_indexer_scoring_relu: bool = True
+    """Whether DSA indexer should apply ReLU to q@k^T scores before weighting."""
+
+    dsa_indexer_k_norm_epsilon: Optional[float] = None
+    """Optional epsilon override for the DSA indexer key LayerNorm."""
+
+    dsa_indexer_k_norm_fp32: bool = False
+    """Whether DSA indexer key LayerNorm should run on fp32 inputs."""
 
     ####################
     # linear attention
@@ -1260,7 +1349,7 @@ class TransformerConfig(ModelParallelConfig):
                 f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
             )
         elif self.experimental_attention_variant == "dsa":
-            pass
+            _validate_dsa_kernel_backend_dependencies(self.dsa_kernel_backend)
 
         if self.fp8:
             # cannot support first last layer bf16 with delayed scaling
@@ -2557,10 +2646,21 @@ class TransformerConfig(ModelParallelConfig):
             assert not self.use_kitchen
 
         if self.experimental_attention_variant == "dsa":
-            assert (
-                self.context_parallel_size == 1
-            ), "Currently context parallelism is not supported by DSAttention!"
             assert not self.apply_rope_fusion, "RoPE fusion is not supported for DSAttention"
+            if self.context_parallel_size > 1:
+                cp_comm_types = (
+                    self.cp_comm_type
+                    if isinstance(self.cp_comm_type, list)
+                    else [self.cp_comm_type]
+                )
+                assert all(
+                    cp_comm_type is not None
+                    and cp_comm_type.replace("_", "").lower() == "allgather"
+                    for cp_comm_type in cp_comm_types
+                ), (
+                    "DSAttention context parallelism currently supports "
+                    "cp_comm_type=allgather only."
+                )
 
         if self.inference_fuse_tp_communication:
             assert self.transformer_impl == "inference_optimized", (

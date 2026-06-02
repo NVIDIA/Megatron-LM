@@ -226,26 +226,48 @@ def get_tensor_device(tensor: Union[torch.Tensor, Dict[str, torch.Tensor]]):
     return tensor.device
 
 
-def _get_mtp_loss_scale(config, device: torch.device) -> torch.Tensor:
-    """Get the MTP loss scale on the output tensor device."""
+def _normalize_loss_scale(loss_scale, device: torch.device, scale_func_name: str) -> torch.Tensor:
+    """Normalize loss scale outputs to a size-1 tensor on the output tensor device."""
+    loss_scale = torch.as_tensor(loss_scale, device=device)
+    if loss_scale.numel() != 1:
+        raise ValueError(
+            f"{scale_func_name} must return a scalar or size-1 tensor for loss scaling, "
+            f"but returned a tensor with {loss_scale.numel()} elements."
+        )
+    return loss_scale
 
-    def _normalize_loss_scale(loss_scale, scale_func_name: str) -> torch.Tensor:
-        loss_scale = torch.as_tensor(loss_scale, device=device)
-        if loss_scale.numel() != 1:
-            raise ValueError(
-                f"{scale_func_name} must return a scalar or size-1 tensor for MTP loss scaling, "
-                f"but returned a tensor with {loss_scale.numel()} elements."
-            )
-        return loss_scale
 
-    mtp_grad_scale_func = getattr(config, 'mtp_grad_scale_func', None)
-    if mtp_grad_scale_func is not None:
-        return _normalize_loss_scale(mtp_grad_scale_func(), "mtp_grad_scale_func")
+def _compute_loss_scale(config, device: torch.device) -> torch.Tensor:
+    """Calculate the loss scale from grad_scale_func or default to 1."""
     if config.grad_scale_func is not None:
         return _normalize_loss_scale(
-            config.grad_scale_func(torch.ones(1, device=device)), "grad_scale_func"
+            config.grad_scale_func(torch.ones(1, device=device)), device, "grad_scale_func"
         )
     return torch.ones(1, device=device)
+
+
+def _get_mtp_loss_scale(config, device: torch.device) -> torch.Tensor:
+    """Get the MTP loss scale on the output tensor device."""
+    mtp_grad_scale_func = getattr(config, 'mtp_grad_scale_func', None)
+    if mtp_grad_scale_func is not None:
+        return _normalize_loss_scale(mtp_grad_scale_func(), device, "mtp_grad_scale_func")
+    return _compute_loss_scale(config, device)
+
+
+def _get_experimental_attention_variant_loss_scale_func(config):
+    """Get the loss scale hook for experimental attention variants."""
+    loss_scale_func = getattr(config, 'experimental_attention_variant_loss_scale_func', None)
+    if loss_scale_func is not None:
+        return loss_scale_func
+
+    if getattr(config, 'experimental_attention_variant', None) == 'dsa':
+        from megatron.core.transformer.experimental_attention_variant.dsa import (
+            DSAIndexerLossAutoScaler,
+        )
+
+        return DSAIndexerLossAutoScaler.set_loss_scale
+
+    return None
 
 
 def forward_step_calc_loss(
@@ -262,9 +284,6 @@ def forward_step_calc_loss(
 ):
     """Calculate the loss and number of tokens for forward_step()"""
 
-    from megatron.core.transformer.experimental_attention_variant.dsa import (
-        DSAIndexerLossAutoScaler,
-    )
     from megatron.core.transformer.multi_token_prediction import MTPLossAutoScaler
 
     model_vp_stage = getattr(model, "vp_stage", None)
@@ -315,13 +334,8 @@ def forward_step_calc_loss(
     # Since we use a trick to do backward on the auxiliary loss, we need to set the scale
     # explicitly.
     if hasattr(config, 'num_moe_experts') and config.num_moe_experts is not None:
-        # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
         device = get_tensor_device(output_tensor)
-        loss_scale = (
-            config.grad_scale_func(torch.ones(1, device=device))
-            if config.grad_scale_func is not None
-            else torch.ones(1, device=device)
-        )
+        loss_scale = _compute_loss_scale(config, device)
         # Set the loss scale
         if config.calculate_per_token_loss:
             MoEAuxLossAutoScaler.set_loss_scale(loss_scale)
@@ -341,17 +355,20 @@ def forward_step_calc_loss(
         else:
             MTPLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
 
-    # Set the loss scale for DSA (Dynamic Sparse Attention) indexer loss.
-    if getattr(config, 'experimental_attention_variant', None) == 'dsa':
-        loss_scale = (
-            config.grad_scale_func(torch.ones(1, device=output_tensor.device))
-            if config.grad_scale_func is not None
-            else torch.ones(1, device=output_tensor.device)
-        )
+    # Set the loss scale for any experimental attention-variant auxiliary loss.
+    experimental_attention_variant_loss_scale_func = (
+        _get_experimental_attention_variant_loss_scale_func(config)
+    )
+    if experimental_attention_variant_loss_scale_func is not None:
+        device = get_tensor_device(output_tensor)
+        loss_scale = _compute_loss_scale(config, device)
         if config.calculate_per_token_loss:
-            DSAIndexerLossAutoScaler.set_loss_scale(loss_scale)
+            experimental_attention_variant_loss_scale_func(loss_scale)
         else:
-            DSAIndexerLossAutoScaler.set_loss_scale(loss_scale / num_microbatches)
+            cp_size_for_scaling = cp_group_size if cp_group_size is not None else 1
+            experimental_attention_variant_loss_scale_func(
+                loss_scale * cp_size_for_scaling / num_microbatches
+            )
 
     return output_tensor, num_tokens
 
