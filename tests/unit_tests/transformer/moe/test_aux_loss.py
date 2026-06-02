@@ -178,6 +178,62 @@ class TestSeqAuxLoss:
         container.aux_loss_test(self.input, self.baseline_grad, "seq_load_balancing_loss")
 
 
+class TestPerTokenAuxLoss:
+    """Regression test for the aux_loss TP/CP scaling fix under
+    --calculate-per-token-loss. Computes a baseline aux-loss input
+    gradient at (tp=1, cp=1) and asserts that each parametrized
+    (tp, ep, cp) config produces a matching gradient on each rank's
+    local input slice. Without the fix, the per-rank scale on aux_loss
+    would shrink with tp_cp_size and the assertion would fail at any
+    config with tp_size > 1 or cp_size > 1.
+    """
+
+    def setup_method(self, method):
+        baseline_container = AuxlossTestContainer(
+            tp_size=1,
+            ep_size=1,
+            pp_size=1,
+            cp_size=1,
+            num_moe_experts=8,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="aux_loss",
+            moe_token_dispatcher_type="alltoall",
+            moe_aux_loss_coeff=0.1,
+            calculate_per_token_loss=True,
+        )
+        moe_layer = baseline_container.moe_layer
+        self.input = torch.randn((32, 8, moe_layer.config.hidden_size)).cuda()
+        self.input.requires_grad = True
+        probs, indices = apply_module(moe_layer.router)(self.input)
+        probs.sum().mul_(0).backward()
+        self.baseline_grad = self.input.grad
+        self.input.grad = None
+        clear_aux_losses_tracker()
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize(
+        "tp_size,ep_size,cp_size", [(8, 1, 1), (4, 2, 1), (1, 1, 8), (2, 1, 4), (2, 2, 2)]
+    )
+    def test_per_token_aux_loss_invariant_to_tp_cp(self, tp_size, ep_size, cp_size):
+        container = AuxlossTestContainer(
+            tp_size=tp_size,
+            ep_size=ep_size,
+            pp_size=1,
+            cp_size=cp_size,
+            num_moe_experts=8,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="aux_loss",
+            moe_token_dispatcher_type="alltoall",
+            moe_aux_loss_coeff=0.1,
+            calculate_per_token_loss=True,
+        )
+        container.aux_loss_test(self.input, self.baseline_grad, "load_balancing_loss")
+
+
 class TestRouterAuxLoss:
     def setup_method(self, method):
         Utils.initialize_model_parallel(1, 1)
