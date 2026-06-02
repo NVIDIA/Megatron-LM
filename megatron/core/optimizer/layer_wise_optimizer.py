@@ -39,7 +39,7 @@ def _skip_mxfp8_in_copy_main_to_model(inner_opt: 'Float16OptimizerWithFloat16Par
 
     With ``reuse_grad_buf_for_mxfp8_param_ag=True`` at the outer LayerWise level,
     the bf16 ``param_buffer`` is written by
-    :py:meth:`LayerWiseDistributedOptimizer._write_owned_mxfp8_masters_to_param_buffer`
+    :py:meth:`LayerWiseDistributedOptimizer._copy_main_params_to_param_buffer`
     and the MXFP8 storage is then refreshed by the post-AG
     ``param.data.copy_(bf16_slice)`` step inside
     ``_ParamAndGradBucketGroup._post_param_sync``. The inner's default
@@ -490,7 +490,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             # ``_copy_main_params_to_param_buffer`` (a DistributedOptimizer-only
             # method) and raise ``AttributeError`` here. We take responsibility
             # for the bf16 ⇒ param_buffer write for owned MXFP8 model params in
-            # :py:meth:`_write_owned_mxfp8_masters_to_param_buffer` below.
+            # :py:meth:`_copy_main_params_to_param_buffer` below.
             inner_config = copy.copy(config)
             inner_config.reuse_grad_buf_for_mxfp8_param_ag = False
             for i in range(len(optimizers)):
@@ -542,7 +542,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # restores that equality without changing inner-step behavior (only
         # the inner Float16Optimizer needs the flag flipped; LayerWise itself
         # behaves correctly under the outer config and our own writes to the
-        # param buffer in :py:meth:`_write_owned_mxfp8_masters_to_param_buffer`
+        # param buffer in :py:meth:`_copy_main_params_to_param_buffer`
         # are gated on the outer config's ``reuse_grad_buf_for_mxfp8_param_ag``).
         self.config = config
 
@@ -849,37 +849,6 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8,
         )
 
-    def _ensure_mxfp8_quantizer_dual_usage(self, bucket) -> None:
-        """Force every MXFP8 param's bound quantizer to ``rowwise=True, columnwise=True``.
-
-        The post-AG ``param.data.copy_(param_buffer_slice)`` triggered by
-        :meth:`_ParamAndGradBucketGroup._post_param_sync` routes through
-        ``QuantizedTensor.__torch_dispatch__`` ⇒ ``dst.quantize_(src)`` ⇒
-        ``MXFP8Quantizer.update_quantized`` ⇒ ``tex.quantize(src, quantizer, dst)``.
-        ``tex.quantize`` picks the kernel based on ``quantizer.rowwise_usage`` /
-        ``quantizer.columnwise_usage``: both ``True`` selects the x2 kernel that
-        produces rowwise + columnwise data + scales in a single pass, anything
-        else updates only the requested orientation.
-
-        TE Linear sets the weight quantizer to ``rowwise=True, columnwise=True``
-        at module construction time when ``torch.is_grad_enabled()`` (see
-        ``base.py:1467``), and bwd briefly toggles it for grad GEMMs, so for
-        most paths the quantizer happens to be configured correctly when the
-        optimizer step runs. Re-asserting it here makes the post-AG MXFP8
-        refresh deterministic for muon's LayerWise path regardless of what TE
-        toggled during the previous fwd/bwd. Without this, a stale
-        ``columnwise_data`` survives across iterations and the next bwd's
-        dgrad GEMM uses out-of-date weights, producing a loss-curve
-        divergence vs the ``fp8_param_gather=False`` baseline.
-        """
-        for param in bucket.params:
-            if not is_mxfp8tensor(param):
-                continue
-            quantizer = getattr(param, '_quantizer', None)
-            if quantizer is None:
-                continue
-            quantizer.set_usage(rowwise=True, columnwise=True)
-
     def start_param_sync_for_bucket_group_subset(self) -> None:
         """Trigger ``start_param_sync`` only on LayerWise-managed buckets.
 
@@ -895,12 +864,6 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         :meth:`DistributedOptimizer.start_param_sync_for_bucket_group_subset`.
         Uses :meth:`DistributedDataParallel._start_bucket_group_param_sync`
         so FP8 post-all-gather processing (and MXFP8 copy) still runs.
-
-        Before dispatching each LayerWise-managed bucket group's AG, force
-        the bucket's MXFP8 param quantizers to ``rowwise=True,
-        columnwise=True`` so the post-AG ``param.data.copy_(bf16)`` refreshes
-        both orientations (see
-        :py:meth:`_ensure_mxfp8_quantizer_dual_usage`).
         """
         for model_chunk in self.model_chunks:
             for bucket_group in (
@@ -915,8 +878,6 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 ]
                 if not lw_buckets:
                     continue
-                for bucket in lw_buckets:
-                    self._ensure_mxfp8_quantizer_dual_usage(bucket)
                 if len(lw_buckets) == len(bucket_group.buckets):
                     model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=False)
                 else:
@@ -929,21 +890,30 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                     model_chunk._start_bucket_group_param_sync(lw_bucket_group, force_sync=False)
 
     @torch.no_grad()
-    def _write_owned_mxfp8_masters_to_param_buffer(self) -> None:
-        """For each owned MXFP8 model param, write its fp32 master cast to bf16
-        directly into the corresponding slice of DDP's bf16 param buffer.
+    def _copy_main_params_to_param_buffer(self) -> None:
+        """Write each owned MXFP8 fp32 master, cast to bf16, into DDP's bf16
+        param buffer.
 
-        Mirrors :meth:`DistributedOptimizer._copy_main_params_to_param_buffer`
-        for the LayerWise + ``use_buffer_param_sync`` case. With
-        ``reuse_grad_buf_for_mxfp8_param_ag=True`` the bf16 ``param_buffer`` is
-        kept separate from each MXFP8 model param's ``_rowwise_data`` /
+        Duck-typed twin of
+        :meth:`DistributedOptimizer._copy_main_params_to_param_buffer` so the
+        ``train_step`` post-``zero_grad_buffer`` loop can treat both optimizers
+        uniformly (``isinstance(opt, (DistributedOptimizer,
+        LayerWiseDistributedOptimizer))``) and call this method polymorphically.
+
+        With ``reuse_grad_buf_for_mxfp8_param_ag=True`` the bf16 ``param_buffer``
+        is kept separate from each MXFP8 model param's ``_rowwise_data`` /
         ``_columnwise_data`` storage; the inner
         ``Float16OptimizerWithFloat16Params._copy_main_params_to_model_params``
         refreshes the MXFP8 storage via TE's ``QuantizedTensor`` dispatch but
         leaves ``param_buffer`` stale. ``DistributedDataParallel.start_param_sync``
         all-gathers ``param_buffer`` and then quantizes back to MXFP8 in-place on
         every rank, so the buffer must hold the freshly updated bf16 master cast
-        before AG dispatches.
+        before the AG dispatches. Because the staging buffer is aliased onto the
+        grad buffer, ``zero_grad_buffer()`` zeroes it at the start of every
+        iteration, so ``train_step`` re-stages here (after the zero, before the
+        deferred forward-pre-hook AG); the in-step call from
+        :meth:`step_with_ready_grads` keeps the non-overlap and first-iteration
+        paths correct.
 
         Walks each model chunk's dense + expert-parallel buffers and writes only
         for params that are (a) owned by this rank on the LayerWise side, (b)
@@ -1011,19 +981,27 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # forward pre-hooks after step returns, so the buffer is correct by
         # then; in non-overlap mode the ``start_param_sync_for_bucket_group_subset``
         # call below dispatches synchronously and sees the correct buffer.
-        self._write_owned_mxfp8_masters_to_param_buffer()
+        self._copy_main_params_to_param_buffer()
 
         # All-gather updated params. If overlap_param_gather is True, the all-gather
         # is deferred to the forward pre-hooks via DDP bucket infrastructure.
+        #
+        # NOTE for the MXFP8 + ``reuse_grad_buf_for_mxfp8_param_ag`` + overlap case:
+        # the ``_copy_main_params_to_param_buffer`` above writes into the
+        # bf16 staging buffer that is aliased onto the grad buffer, which the next
+        # iteration's ``zero_grad_buffer()`` zeroes BEFORE the deferred forward
+        # pre-hook AG runs. The masters are therefore re-staged post-zero from
+        # ``train_step`` via :meth:`_copy_main_params_to_param_buffer` (the same
+        # call ``train_step`` makes for the standard ``DistributedOptimizer``);
+        # the write above is harmless but only authoritative for the first
+        # iteration (before the forward pre-hook is enabled).
         if not self.overlap_param_gather:
             if self.use_buffer_param_sync:
                 # Model params are views into the DDP param buffer
-                # (ddp_config.use_distributed_optimizer=True). The optimizer step
-                # already copied updated fp32 main params → bf16 model params (=
-                # buffer views), so the buffer is up-to-date. Trigger the standard
-                # buffer all-gather, but only for LayerWise-managed bucket groups
-                # so a sibling DistributedOptimizer's own ``start_param_sync`` call
-                # is not duplicated for the same buckets.
+                # (ddp_config.use_distributed_optimizer=True). Trigger the buffer
+                # all-gather, but only for LayerWise-managed bucket groups so a
+                # sibling DistributedOptimizer's own ``start_param_sync`` is not
+                # duplicated for the same buckets.
                 self.start_param_sync_for_bucket_group_subset()
             else:
                 self.allgather_params()

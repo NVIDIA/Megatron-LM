@@ -2214,7 +2214,14 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             full_cg_captured = FullCudaGraphWrapper.cuda_graph.get("training") is not None
             if forward_pre_hook_enabled or full_cg_captured:
                 for optim_instance in optimizer.chained_optimizers:
-                    if isinstance(optim_instance, DistributedOptimizer):
+                    # Both the standard DistributedOptimizer and the LayerWise
+                    # (muon) optimizer keep their MXFP8 masters in a staging
+                    # buffer aliased onto the grad buffer that zero_grad_buffer()
+                    # just zeroed; re-stage them so the deferred forward pre-hook
+                    # all-gather ships fresh weights instead of the zeroed buffer.
+                    if isinstance(
+                        optim_instance, (DistributedOptimizer, LayerWiseDistributedOptimizer)
+                    ):
                         optim_instance._copy_main_params_to_param_buffer()
 
         # Forward pass.
