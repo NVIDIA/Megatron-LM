@@ -3037,6 +3037,7 @@ class TextGenerationController:
                     self._record_async_pending_forward_requests(
                         self._async_pending_cuda_graph_request_count
                     )
+                    context.mark_async_forward_in_flight()
                     range_pop()
 
             if deferred_mtp_blocks_to_release is not None:

@@ -992,6 +992,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._async_deferred_kv_blocks_to_release = torch.empty(
             (0,), dtype=torch.int32, device='cpu'
         )
+        self._async_forward_in_flight = False
         self._async_reserved_kv_block_adoption_count = 0
         self._async_deferred_kv_block_release_count = 0
         self._async_prepared_request_count = 0
@@ -2525,8 +2526,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             self._async_reserved_kv_block_columns[:count] = -1
         self._async_reserved_kv_block_count = 0
 
+    def mark_async_forward_in_flight(self) -> None:
+        """Mark that a speculative forward may still be using old resources."""
+        self._async_forward_in_flight = True
+
     def release_deferred_async_kv_blocks(self) -> None:
         """Release async-reserved blocks after their speculative forward retires."""
+        self._async_forward_in_flight = False
         if self._async_deferred_kv_blocks_to_release.numel() == 0:
             return
         self._async_deferred_kv_block_release_count += int(
@@ -2906,46 +2912,45 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         return True
 
-    def _adopt_or_defer_async_reserved_kv_blocks(self, active_requests_mask: Tensor) -> Tensor:
-        """Adopt reserved next-step blocks for continuing requests.
-
-        Finished requests may have used their reserved block only in a speculative
-        forward, so those blocks are released later after the forward retires.
-        """
+    def _consume_async_reserved_kv_blocks(
+        self, request_ids: Tensor, block_columns: Tensor
+    ) -> Tensor:
+        """Return reserved blocks for resumed requests, or -1 where none is reserved."""
+        reserved_block_ids = torch.full(
+            (request_ids.numel(),), -1, dtype=torch.int32, device='cpu'
+        )
         count = self._async_reserved_kv_block_count
-        adopted_request_ids = []
+        if count == 0 or request_ids.numel() == 0:
+            return reserved_block_ids
+
+        for request_idx, (request_id_tensor, block_column_tensor) in enumerate(
+            zip(request_ids.tolist(), block_columns.tolist())
+        ):
+            request_id = int(request_id_tensor)
+            block_column = int(block_column_tensor)
+            for slot in range(count):
+                if int(self._async_reserved_kv_block_request_ids[slot]) != request_id:
+                    continue
+                if int(self._async_reserved_kv_block_columns[slot]) != block_column:
+                    continue
+                reserved_block_ids[request_idx] = self._async_reserved_kv_block_ids[slot]
+                self._async_reserved_kv_block_request_ids[slot] = -1
+                self._async_reserved_kv_block_ids[slot] = -1
+                self._async_reserved_kv_block_columns[slot] = -1
+                self._async_reserved_kv_block_adoption_count += 1
+                break
+        return reserved_block_ids
+
+    def _defer_remaining_async_reserved_kv_blocks(self) -> None:
+        """Quarantine reserved blocks that actual CPU bookkeeping did not consume."""
+        count = self._async_reserved_kv_block_count
         if count == 0:
-            return torch.empty((0,), dtype=self.request_ids.dtype, device='cpu')
-
-        active_slice = slice(self.paused_request_count, self.total_request_count)
-        request_row_by_id = {
-            int(request_id): row
-            for row, request_id in enumerate(self.request_ids[active_slice].tolist())
-        }
-        deferred_blocks = []
-        for slot in range(count):
-            request_id = int(self._async_reserved_kv_block_request_ids[slot])
-            block_id = int(self._async_reserved_kv_block_ids[slot])
-            block_column = int(self._async_reserved_kv_block_columns[slot])
-            row = request_row_by_id.get(request_id)
-            if row is None or active_requests_mask[row].item() == 0:
-                deferred_blocks.append(block_id)
-                continue
-
-            request_idx = self.paused_request_count + row
-            if self.request_kv_block_counts[request_idx].item() <= block_column:
-                self.request_to_kv_block_ids[request_idx, block_column] = block_id
-                self.request_kv_block_counts[request_idx] = block_column + 1
-            self.request_last_kv_block_id[request_idx] = block_id
-            adopted_request_ids.append(request_id)
-            self._async_reserved_kv_block_adoption_count += 1
-
-        if deferred_blocks:
-            self._append_deferred_async_kv_blocks(
-                torch.tensor(deferred_blocks, dtype=torch.int32, device='cpu')
-            )
+            return
+        remaining_blocks = self._async_reserved_kv_block_ids[:count]
+        remaining_blocks = remaining_blocks[remaining_blocks != -1]
+        if remaining_blocks.numel() > 0:
+            self._append_deferred_async_kv_blocks(remaining_blocks)
         self._clear_async_reserved_kv_blocks()
-        return torch.tensor(adopted_request_ids, dtype=self.request_ids.dtype, device='cpu')
 
     def _execute_pending_mamba_ops(self) -> None:
         """Execute Mamba GPU operations deferred from add_request() / update_requests().
@@ -3808,7 +3813,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         kv_blocks_assigned = self.request_to_kv_block_ids[request_indexes]
         non_zero_values_in_kv_memory = kv_blocks_assigned[kv_blocks_assigned != -1]
-        self.kv_block_allocator.release_memory_blocks(non_zero_values_in_kv_memory)
+        if self._async_forward_in_flight:
+            self._append_deferred_async_kv_blocks(non_zero_values_in_kv_memory)
+        else:
+            self.kv_block_allocator.release_memory_blocks(non_zero_values_in_kv_memory)
 
         # Reset the KV blocks for finished requests.
         # Note: do not use fill_() (or add_() and similar inplace ops) here.
@@ -3891,13 +3899,20 @@ class DynamicInferenceContext(BaseInferenceContext):
             num_new_blocks = needs_new_block.sum().item()
 
             if num_new_blocks > 0:
-                assert num_new_blocks <= self.kv_block_allocator.total_avail
-                block_ids = self.kv_block_allocator.allocate_memory_blocks(num_new_blocks)
-
                 # Apply updates only to the requests that required a new block
                 relative_row_idx = torch.nonzero(needs_new_block).squeeze(1)
                 row_idx = resume_start + relative_row_idx
                 col_idx = self.request_kv_block_counts[row_idx]
+                request_ids = self.request_ids[row_idx]
+                block_ids = self._consume_async_reserved_kv_blocks(request_ids, col_idx)
+                missing_reserved_mask = block_ids == -1
+                missing_reserved_count = int(missing_reserved_mask.sum().item())
+                if missing_reserved_count > 0:
+                    assert missing_reserved_count <= self.kv_block_allocator.total_avail
+                    allocated_block_ids = self.kv_block_allocator.allocate_memory_blocks(
+                        missing_reserved_count
+                    )
+                    block_ids[missing_reserved_mask] = allocated_block_ids
 
                 self.request_to_kv_block_ids[row_idx, col_idx] = block_ids
                 self.request_kv_block_counts[row_idx] += 1
@@ -4099,10 +4114,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             # We must keep it active so that the next iteration will add a new chunk to it.
             active_requests_mask[-1] = 1
 
-        async_reserved_adopted_request_ids = self._adopt_or_defer_async_reserved_kv_blocks(
-            active_requests_mask
-        )
-
         active_request_count = (active_requests_mask == 1).sum().item()
         finished_request_count = (active_requests_mask == 0).sum().item()
         assert (
@@ -4136,6 +4147,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             # Reset Mamba state.
             self.reset_mamba_state()
+            self._defer_remaining_async_reserved_kv_blocks()
             return
 
         # 3. Concatenate the paused tokens to the active tokens if present.
@@ -4197,13 +4209,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             active_requests_requiring_new_block = (
                 num_tokens_in_last_block >= self.block_size_tokens - 1 - self.num_speculative_tokens
             ).byte()
-            if async_reserved_adopted_request_ids.numel() > 0:
-                active_request_ids = self.request_ids[
-                    self.paused_request_count : (active_request_count + self.paused_request_count)
-                ]
-                active_requests_requiring_new_block[
-                    torch.isin(active_request_ids, async_reserved_adopted_request_ids)
-                ] = 0
 
             # Find the id in request_ids that is the chunked_prefill_request_id. Only one request should be chunked.
             if (
@@ -4493,6 +4498,8 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             # Convert back to 1d tensor
             self.token_to_block_idx[: self.active_token_count] = block_idx.flatten()
+
+        self._defer_remaining_async_reserved_kv_blocks()
 
         return {
             "newly_paused_request_ids": newly_paused_request_ids,

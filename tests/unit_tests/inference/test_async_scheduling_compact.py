@@ -1011,6 +1011,33 @@ class _ReleaseRecordingAllocator:
 
 
 @pytest.mark.internal
+def test_async_pending_resources_are_quarantined_until_forward_retires():
+    context = object.__new__(DynamicInferenceContext)
+    context.request_to_kv_block_ids = torch.tensor(
+        [[10, 11, -1], [12, -1, -1]], dtype=torch.int32
+    )
+    context.is_hybrid_model = False
+    context.mamba_slot_allocator = None
+    context.kv_block_allocator = _ReleaseRecordingAllocator()
+    context._async_forward_in_flight = True
+    context._async_deferred_kv_blocks_to_release = torch.empty(0, dtype=torch.int32)
+    context._async_deferred_kv_block_release_count = 0
+
+    context.release_memory_blocks_from_request_indexes(torch.tensor([0], dtype=torch.long))
+
+    assert context.kv_block_allocator.released == []
+    assert context._async_deferred_kv_blocks_to_release.tolist() == [10, 11]
+    assert context.request_to_kv_block_ids.tolist() == [[-1, -1, -1], [12, -1, -1]]
+
+    context.release_deferred_async_kv_blocks()
+
+    assert [blocks.tolist() for blocks in context.kv_block_allocator.released] == [[10, 11]]
+    assert not context._async_forward_in_flight
+    assert context._async_deferred_kv_blocks_to_release.numel() == 0
+    assert context._async_deferred_kv_block_release_count == 2
+
+
+@pytest.mark.internal
 def test_async_reserved_kv_blocks_are_adopted_or_deferred_then_released():
     context = object.__new__(DynamicInferenceContext)
     context.paused_request_count = 0
@@ -1030,18 +1057,23 @@ def test_async_reserved_kv_blocks_are_adopted_or_deferred_then_released():
     context._async_deferred_kv_block_release_count = 0
     context.kv_block_allocator = _ReleaseRecordingAllocator()
 
-    adopted = context._adopt_or_defer_async_reserved_kv_blocks(
-        torch.tensor([1, 0, 1], dtype=torch.uint8)
+    consumed = context._consume_async_reserved_kv_blocks(
+        torch.tensor([10], dtype=torch.int32), torch.tensor([1], dtype=torch.int32)
     )
 
-    assert adopted.tolist() == [10]
-    assert context.request_to_kv_block_ids.tolist() == [[1, 100, -1], [2, -1, -1], [3, -1, -1]]
-    assert context.request_kv_block_counts.tolist() == [2, 1, 1]
-    assert context.request_last_kv_block_id.tolist() == [100, 2, 3]
+    assert consumed.tolist() == [100]
+    assert context.request_to_kv_block_ids.tolist() == [[1, -1, -1], [2, -1, -1], [3, -1, -1]]
+    assert context.request_kv_block_counts.tolist() == [1, 1, 1]
+    assert context.request_last_kv_block_id.tolist() == [1, 2, 3]
+    assert context._async_reserved_kv_block_count == 3
+    assert context._async_reserved_kv_block_ids.tolist() == [-1, 101, 102]
+    assert context._async_reserved_kv_block_adoption_count == 1
+
+    context._defer_remaining_async_reserved_kv_blocks()
+
     assert context._async_reserved_kv_block_count == 0
     assert context._async_reserved_kv_block_request_ids.tolist() == [-1, -1, -1]
     assert context._async_deferred_kv_blocks_to_release.tolist() == [101, 102]
-    assert context._async_reserved_kv_block_adoption_count == 1
 
     context.release_deferred_async_kv_blocks()
 

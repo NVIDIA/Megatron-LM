@@ -804,7 +804,17 @@ class TestDynamicContext:
         )
         assert dynamic_context.gpu_view.token_to_input_ids[:3].cpu().tolist() == [100, 102, 101]
 
-        dynamic_context.discard_async_prepared_decode_plan()
+        dynamic_context.update_requests(
+            torch.ones(3, dtype=torch.uint8), torch.tensor([100, 101, 102], dtype=torch.int64)
+        )
+
+        actual_active_ids = dynamic_context.request_ids[
+            dynamic_context.paused_request_count : dynamic_context.total_request_count
+        ].tolist()
+        assert actual_active_ids == [10, 12, 11]
+        assert dynamic_context._async_reserved_kv_block_count == 0
+        assert dynamic_context._async_reserved_kv_block_adoption_count == 2
+        assert dynamic_context._async_deferred_kv_blocks_to_release.numel() == 0
 
     @pytest.mark.internal
     @rounder_override(64)
