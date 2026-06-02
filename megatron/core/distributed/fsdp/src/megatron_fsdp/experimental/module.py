@@ -24,7 +24,8 @@ from torch import nn
 from torch.distributed import DeviceMesh
 
 from ..mixed_precision import MixedPrecisionPolicy
-from .parameter_group import FsdpParameterGroup, contained_in_parameter_group
+from .dbuffer import DBuffer
+from .parameter_group import FsdpParameterGroup, PendingReduction, contained_in_parameter_group
 from .placement import MeshAxis, Placements
 
 
@@ -36,11 +37,21 @@ class DelayedRelease:
     module: "FsdpModule"
 
 
+@dataclasses.dataclass(frozen=True)
+class PreparedReduction:
+    """A packed partial gradient waiting for a reduce-scatter launch point."""
+
+    group: FsdpParameterGroup
+    partial_grad: DBuffer
+
+
 class FsdpContext:
     """Runtime state, stream, and release scheduler shared by one FSDP subtree."""
 
-    allgather_stream: torch.cuda.Stream
+    communication_stream: torch.cuda.Stream
     delayed_releases: deque[DelayedRelease]
+    prepared_reductions: deque[PreparedReduction]
+    pending_reductions: deque[PendingReduction]
     # HFSDP/HSDP need explicit last-microbatch state. First-microbatch state is
     # unnecessary because it can be detected when ``model_weight``, after syncing
     # from ``main_weight``, has placements different from ``Placements.optimizer``.
@@ -57,12 +68,15 @@ class FsdpContext:
         self.root_module = root_module
         self.is_last_microbatch = True
         self.delayed_releases = deque()
+        self.prepared_reductions = deque()
+        self.pending_reductions = deque()
+        self._post_backward_callback_queued = False
         with torch.cuda.device(device):
-            self.allgather_stream = torch.cuda.Stream()
+            self.communication_stream = torch.cuda.Stream()
 
     def enqueue_release(self, module: "FsdpModule") -> None:
         """Queue a module's unsharded storage for delayed release."""
-        consumer_event = torch.cuda.current_stream(self.allgather_stream.device).record_event()
+        consumer_event = torch.cuda.current_stream(self.communication_stream.device).record_event()
         self.delayed_releases.append(DelayedRelease(consumer_event=consumer_event, module=module))
 
     def drain_delayed_releases(self, target_length: int) -> None:
@@ -72,10 +86,64 @@ class FsdpContext:
 
         while len(self.delayed_releases) > target_length:
             delayed_release = self.delayed_releases.popleft()
-            with torch.cuda.stream(self.allgather_stream):
+            with torch.cuda.stream(self.communication_stream):
                 if delayed_release.consumer_event is not None:
-                    self.allgather_stream.wait_event(delayed_release.consumer_event)
+                    self.communication_stream.wait_event(delayed_release.consumer_event)
                 delayed_release.module.release_unsharded_storage()
+
+    def enqueue_pending_reduction(self, pending_reduction: PendingReduction) -> None:
+        """Retain a scheduled reduction's temporary buffers until finalization."""
+        self.pending_reductions.append(pending_reduction)
+
+    def enqueue_prepared_reduction(self, prepared_reduction: PreparedReduction) -> None:
+        """Queue a packed partial gradient for a later reduce-scatter launch."""
+        self.prepared_reductions.append(prepared_reduction)
+
+    def launch_prepared_reductions(self) -> None:
+        """Launch queued reduce-scatters after work already ordered on the current stream."""
+        if not self.prepared_reductions:
+            return
+
+        current_stream = torch.cuda.current_stream(self.communication_stream.device)
+        self.communication_stream.wait_stream(current_stream)
+        with torch.cuda.stream(self.communication_stream):
+            while self.prepared_reductions:
+                prepared_reduction = self.prepared_reductions.popleft()
+                self.enqueue_pending_reduction(
+                    prepared_reduction.group.reduce_partial_gradients(
+                        prepared_reduction.partial_grad
+                    )
+                )
+
+    def queue_post_backward_callback(self) -> None:
+        """Queue a final callback to order default-stream consumers after reduction."""
+        if self._post_backward_callback_queued:
+            return
+
+        self._post_backward_callback_queued = True
+        try:
+            torch.autograd.Variable._execution_engine.queue_callback(
+                self.finalize_pending_reductions
+            )
+        except RuntimeError as error:
+            self._post_backward_callback_queued = False
+            if str(error) != "Final callbacks can only be installed during backward pass.":
+                raise
+            self.finalize_pending_reductions()
+
+    def finalize_pending_reductions(self) -> None:
+        """Wait for scheduled reductions and release their temporary buffers."""
+        try:
+            self.launch_prepared_reductions()
+            if not self.pending_reductions:
+                return
+
+            current_stream = torch.cuda.current_stream(self.communication_stream.device)
+            current_stream.wait_stream(self.communication_stream)
+            with torch.cuda.stream(self.communication_stream):
+                self.pending_reductions.clear()
+        finally:
+            self._post_backward_callback_queued = False
 
 
 class FsdpModule:
@@ -206,25 +274,27 @@ class FsdpModule:
         torch.cuda.nvtx.range_push(self._nvtx_label("forward"))
         self._ready_grad_parameters.clear()
         if self.is_root():
-            allgather_stream = self.context.allgather_stream
-            allgather_stream.wait_stream(torch.cuda.current_stream(allgather_stream.device))
+            communication_stream = self.context.communication_stream
+            communication_stream.wait_stream(
+                torch.cuda.current_stream(communication_stream.device)
+            )
         self._unshard_parameter_groups(sync_model_weight=True)
 
     def _unshard_parameter_groups(self, *, sync_model_weight: bool) -> None:
         """Materialize full parameters for this FSDP unit."""
         self.context.drain_delayed_releases(target_length=1)
 
-        allgather_stream = self.context.allgather_stream
-        current_stream = torch.cuda.current_stream(allgather_stream.device)
+        communication_stream = self.context.communication_stream
+        current_stream = torch.cuda.current_stream(communication_stream.device)
 
-        with torch.cuda.stream(allgather_stream):
+        with torch.cuda.stream(communication_stream):
             for group in self._parameter_groups:
                 if sync_model_weight:
                     # TODO: After NVIDIA/Megatron-LM#5411 lands, move this sync to the
                     # optimizer post-step hook instead of running it every microbatch.
                     group.sync_model_weight_from_main_weight()
                 group.unshard_parameters()
-        current_stream.wait_stream(allgather_stream)
+        current_stream.wait_stream(communication_stream)
 
     def post_forward(self) -> None:
         """Return parameters to their sharded resting state after forward compute."""
@@ -242,18 +312,37 @@ class FsdpModule:
         """Prepare full parameters for backward compute."""
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
         self._unshard_parameter_groups(sync_model_weight=False)
+        self.context.launch_prepared_reductions()
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""
-        for group in self._parameter_groups:
-            if group.requires_grad:
-                group.reduce_gradients()
+        self._reduce_gradient_groups()
         self._reshard_parameter_groups()
         self.context.enqueue_release(self)
         if self.is_root():
             self.context.drain_delayed_releases(target_length=0)
         self._ready_grad_parameters.clear()
         torch.cuda.nvtx.range_pop()
+
+    def _reduce_gradient_groups(self) -> None:
+        context = self.context
+        current_stream = torch.cuda.current_stream(context.communication_stream.device)
+        scheduled_reduction = False
+        for group in self._parameter_groups:
+            if group.requires_grad:
+                with torch.cuda.stream(context.communication_stream):
+                    partial_grad = group.allocate_partial_grad_buffer()
+
+                current_stream.wait_stream(context.communication_stream)
+                group.copy_gradients_to_partial_buffer(partial_grad)
+
+                context.enqueue_prepared_reduction(
+                    PreparedReduction(group=group, partial_grad=partial_grad)
+                )
+                scheduled_reduction = True
+
+        if scheduled_reduction:
+            context.queue_post_backward_callback()
 
     def release_unsharded_storage(self) -> None:
         """Release unsharded storage owned by this FSDP unit."""
