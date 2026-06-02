@@ -15,6 +15,7 @@ spec:
   platforms: dgx_gb200
   time_limit: 3600
   script_setup: |
+    set -euo pipefail
     unset https_proxy
     echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
 
@@ -27,6 +28,7 @@ spec:
     git checkout $MCORE_MR_COMMIT
     git rev-parse HEAD
   script: |-
+    set -euo pipefail
     cd /opt/megatron-lm
 
     ARGUMENTS=(
