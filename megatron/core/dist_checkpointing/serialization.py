@@ -166,7 +166,7 @@ def load(
         return common_state_dict
 
 
-def load_common_state_dict(checkpoint_dir: Union[str, Path]) -> StateDict:
+def load_common_state_dict(checkpoint_dir: str) -> StateDict:
     """Load common (non-sharded) objects state dict from the checkpoint.
 
     Args:
@@ -175,15 +175,7 @@ def load_common_state_dict(checkpoint_dir: Union[str, Path]) -> StateDict:
     Returns:
         StateDict: state dict with non-sharded objects from the checkpoint
     """
-    if isinstance(checkpoint_dir, Path):
-        checkpoint_dir = str(checkpoint_dir)
-        log_single_rank(
-            logger,
-            logging.WARNING,
-            "DEPRECATED: Passing 'checkpoint_dir' as a Path object in "
-            "load_common_state_dict will no longer be supported in a future release. "
-            "Please pass it as a string instead.",
-        )
+
     verify_checkpoint(str(checkpoint_dir))
     return load_common(checkpoint_dir)
 
@@ -423,27 +415,3 @@ def save(
     if verify_integrity:
         async_request.finalize_fns.append(integrity_finalize_fn)
     return async_request
-
-
-def get_default_save_sharded_strategy(
-    backend: str = 'torch_dist', version: int = 1
-) -> TorchDistSaveShardedStrategy:
-    """Get default save sharded strategy."""
-    logger.warning(
-        'megatron.core.dist_checkpointing.serialization.get_default_save_sharded_strategy '
-        'is deprecated and will be removed in the future releases. Please, use '
-        'megatron.core.dist_checkpointing.strategies.torch.TorchDistSaveShardedStrategy '
-        'to get the default save sharded strategy.'
-    )
-    return TorchDistSaveShardedStrategy()
-
-
-def get_default_load_sharded_strategy(checkpoint_dir: str) -> TorchDistLoadShardedStrategy:
-    """Get default load sharded strategy."""
-    logger.warning(
-        'megatron.core.dist_checkpointing.serialization.get_default_load_sharded_strategy '
-        'is deprecated and will be removed in the future releases. Please, use '
-        'megatron.core.dist_checkpointing.strategies.torch.TorchDistLoadShardedStrategy '
-        'to get the default load sharded strategy.'
-    )
-    return TorchDistLoadShardedStrategy()
