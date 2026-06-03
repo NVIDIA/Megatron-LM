@@ -2547,6 +2547,7 @@ def _add_network_size_args(parser):
         "moe_layer_freq",
         "linear_attention_freq",
         "csa_compress_ratios",
+        "csa_block_sizes",
         "moe_router_load_balancing_type",
         "moe_aux_loss_coeff",
         "cp_comm_type",
@@ -4648,6 +4649,16 @@ def _add_experimental_attention_variant_args(parser):
         'Each value is the compression ratio for the corresponding '
         'transformer layer (valid values: 0, 4, 128). '
         'The list length must equal num_layers.',
+    )
+    group.add_argument(
+        '--csa-block-sizes',
+        type=compress_ratios_type,
+        default=None,
+        help='Per-layer block sizes for the compressed/top-k selection path of compressed '
+        'sparse attention. Same Python-list-expression format as --csa-compress-ratios and '
+        'the same length. A value of 0 forces that layer to SLIDING-WINDOW-ONLY (no compressor '
+        'and no top-k indexer; attends only within --csa-window-size). When omitted, every '
+        'layer follows the --csa-compress-ratios behavior.',
     )
     group.add_argument(
         '--no-dsa-kernel-fusion',
