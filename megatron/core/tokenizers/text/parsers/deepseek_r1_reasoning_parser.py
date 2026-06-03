@@ -12,6 +12,7 @@ class DeepSeekR1ReasoningParser(BaseParser):
         Only extracts the first set of think tags.
         If an initial <think> tag is not present but a </think> tag is,
         it will infer a <think> tag at the beginning of the text.
+        Any <think> appearing after the first </think> is treated as ordinary content.
 
         Args:
             text (str): The text to parse.
@@ -22,12 +23,13 @@ class DeepSeekR1ReasoningParser(BaseParser):
         """
 
         if "</think>" in text:
-            if "<think>" in text:
+            # Split on </think> first: everything before the first </think> is reasoning.
+            reasoning_content, remaining_text = text.split("</think>", maxsplit=1)
+            if "<think>" in reasoning_content:
                 # Strip the <think> prefix (it might not be present if it was part of the prompt)
-                pre_text, text = text.split("<think>", maxsplit=1)
+                pre_text, reasoning_content = reasoning_content.split("<think>", maxsplit=1)
             else:
                 pre_text = ""
-            reasoning_content, remaining_text = text.split("</think>", maxsplit=1)
             return pre_text + remaining_text, {'reasoning': reasoning_content}
         else:
             return text, {}
