@@ -833,6 +833,7 @@ if _TRITON_AVAILABLE:
             g_bias,
         )
 
+
 _TRITON_IMPLS = (
     {
         "sinkhorn": triton_fused_sinkhorn,
@@ -841,12 +842,7 @@ _TRITON_IMPLS = (
         "h_post_bda_bwd": _triton_h_post_bda_bwd,
     }
     if _TRITON_AVAILABLE
-    else {
-        "sinkhorn": None,
-        "h_aggregate_fwd": None,
-        "h_post_bda_fwd": None,
-        "h_post_bda_bwd": None,
-    }
+    else {"sinkhorn": None, "h_aggregate_fwd": None, "h_post_bda_fwd": None, "h_post_bda_bwd": None}
 )
 
 
@@ -1879,12 +1875,8 @@ if _CUTILE_AVAILABLE:
                     ),
                 )
 
-                proj = (
-                    proj.view(best.SPLIT_K, M, N).to(torch.float32).sum(dim=0).to(dtype=x.dtype)
-                )
-                norm = (
-                    norm.view(best.SPLIT_K, M, 1).to(torch.float32).sum(dim=0).to(dtype=x.dtype)
-                )
+                proj = proj.view(best.SPLIT_K, M, N).to(torch.float32).sum(dim=0).to(dtype=x.dtype)
+                norm = norm.view(best.SPLIT_K, M, 1).to(torch.float32).sum(dim=0).to(dtype=x.dtype)
         norm = torch.sqrt(norm)
         r = 1.0 / (norm / math.sqrt(K) + eps)
         return proj, norm, r
@@ -3291,17 +3283,7 @@ if _CUTILE_AVAILABLE:
                 )
             )
 
-            return (
-                grad_x,
-                grad_weight,
-                grad_ap,
-                grad_apo,
-                grad_ar,
-                grad_bias,
-                None,
-                None,
-                None,
-            )
+            return (grad_x, grad_weight, grad_ap, grad_apo, grad_ar, grad_bias, None, None, None)
 
 
 class FusedHAggregate(torch.autograd.Function):
