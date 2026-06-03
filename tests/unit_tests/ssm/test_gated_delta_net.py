@@ -17,6 +17,7 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
     get_transformer_block_with_experimental_attention_variant_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -44,6 +45,49 @@ try:
     HAVE_FLA = True
 except ImportError:
     HAVE_FLA = False
+
+
+def _make_gdn_config(**overrides):
+    config_kwargs = {
+        "hidden_size": 128,
+        "linear_conv_kernel_dim": 2,
+        "linear_key_head_dim": 32,
+        "linear_value_head_dim": 32,
+        "linear_num_key_heads": 4,
+        "linear_num_value_heads": 8,
+        "num_layers": 1,
+        "normalization": "RMSNorm",
+        "use_cpu_initialization": True,
+        "layernorm_zero_centered_gamma": True,
+        "num_attention_heads": 8,
+        "activation_func": F.silu,
+        "bf16": True,
+        "experimental_attention_variant": "gated_delta_net",
+        "linear_attention_freq": [1],
+        "transformer_impl": "transformer_engine",
+    }
+    config_kwargs.update(overrides)
+    return TransformerConfig(**config_kwargs)
+
+
+@pytest.mark.parametrize("pre_gated_delta_rule_impl", ["unfused", "fused_streamed", "fused_mega"])
+def test_pre_gated_delta_rule_impl_accepts_gdn_modes(pre_gated_delta_rule_impl):
+    config = _make_gdn_config(pre_gated_delta_rule_impl=pre_gated_delta_rule_impl)
+    assert config.pre_gated_delta_rule_impl == pre_gated_delta_rule_impl
+
+
+def test_pre_gated_delta_rule_impl_rejects_invalid_value():
+    with pytest.raises(ValueError, match="pre_gated_delta_rule_impl must be one of"):
+        _make_gdn_config(pre_gated_delta_rule_impl="fused")
+
+
+def test_pre_gated_delta_rule_impl_requires_gdn_variant():
+    with pytest.raises(ValueError, match="experimental_attention_variant='gated_delta_net'"):
+        _make_gdn_config(
+            experimental_attention_variant=None,
+            linear_attention_freq=None,
+            pre_gated_delta_rule_impl="fused_streamed",
+        )
 
 
 @pytest.mark.parametrize(
@@ -473,6 +517,462 @@ class TestGatedDeltaNet:
         actual_mismatch_params = make_test_packed_seq_params(cu_seqlens=[0, 32, 64, 96, 129])
         with pytest.raises(ValueError, match="does not match"):
             self.gdn(hidden_states_thd, None, packed_seq_params=actual_mismatch_params)
+
+
+@pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
+@pytest.mark.internal
+class TestFusedPreGatedDeltaRule:
+
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_method(self):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            context_parallel_size=1,
+        )
+        model_parallel_cuda_manual_seed(123)
+
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        cp_group = parallel_state.get_context_parallel_group()
+        self.pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
+
+        self.unfused_gdn = self._build_gdn(pre_gated_delta_rule_impl="unfused")
+        self.fused_gdn = self._build_gdn(pre_gated_delta_rule_impl="fused_streamed")
+        self.fused_gdn.load_state_dict(self.unfused_gdn.state_dict())
+
+    def teardown_method(self):
+        Utils.destroy_model_parallel()
+
+    def _build_gdn(
+        self,
+        pre_gated_delta_rule_impl: str,
+        *,
+        deterministic_mode: bool = True,
+        conv_kernel_dim: int = 2,
+    ):
+        transformer_config = TransformerConfig(
+            hidden_size=256,
+            linear_conv_kernel_dim=conv_kernel_dim,
+            linear_key_head_dim=64,
+            linear_value_head_dim=64,
+            linear_num_key_heads=4,
+            linear_num_value_heads=8,
+            num_layers=1,
+            normalization="RMSNorm",
+            use_cpu_initialization=True,
+            layernorm_zero_centered_gamma=True,
+            num_attention_heads=8,
+            activation_func=F.silu,
+            bf16=True,
+            tensor_model_parallel_size=1,
+            context_parallel_size=1,
+            experimental_attention_variant="gated_delta_net",
+            linear_attention_freq=[1],
+            transformer_impl="transformer_engine",
+            deterministic_mode=deterministic_mode,
+            pre_gated_delta_rule_impl=pre_gated_delta_rule_impl,
+        )
+        gdn_submodules = get_experimental_attention_variant_module_spec(
+            config=transformer_config
+        ).submodules
+        gdn = GatedDeltaNet(
+            transformer_config,
+            submodules=gdn_submodules,
+            layer_number=1,
+            bias=False,
+            conv_bias=False,
+            conv_init=1.0,
+            use_qk_l2norm=True,
+            A_init_range=(1, 16),
+            pg_collection=self.pg_collection,
+        )
+        return gdn.cuda().bfloat16()
+
+    def _packed_pre_gated_delta_rule_reference(self, gdn, qkvzba, cu_seqlens):
+        """Run the dense torch reference independently on each packed sequence."""
+
+        segment_outputs = [[] for _ in range(6)]
+        for start, end in zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist()):
+            outputs = gdn.pre_gated_delta_rule(qkvzba[start:end], batch=1, seq_len=end - start)
+            for output_list, output in zip(segment_outputs, outputs):
+                output_list.append(output)
+        return tuple(torch.cat(outputs, dim=1) for outputs in segment_outputs)
+
+    def _assert_pre_gated_delta_rule_outputs_close(
+        self,
+        fused_outputs,
+        unfused_outputs,
+        *,
+        atol: float,
+        rtol: float,
+        output_tolerances=None,
+    ):
+        """Compare named pre-GDR outputs with optional per-output tolerances."""
+
+        output_names = ("query", "key", "value", "gate", "beta", "g")
+        output_tolerances = output_tolerances or {}
+        for name, fused, unfused in zip(output_names, fused_outputs, unfused_outputs):
+            output_atol, output_rtol = output_tolerances.get(name, (atol, rtol))
+            torch.testing.assert_close(
+                fused,
+                unfused,
+                atol=output_atol,
+                rtol=output_rtol,
+                msg=lambda msg, output_name=name: f"{output_name} mismatch: {msg}",
+            )
+
+    def test_fused_and_unfused_forward_match(self):
+        hidden_states = torch.randn(
+            (32, 2, self.unfused_gdn.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+
+        with torch.no_grad():
+            unfused_output, unfused_bias = self.unfused_gdn(hidden_states, None)
+            fused_output, fused_bias = self.fused_gdn(hidden_states, None)
+
+        torch.testing.assert_close(fused_output, unfused_output, atol=1e-3, rtol=1e-3)
+        assert fused_bias == unfused_bias
+
+    @pytest.mark.parametrize("pre_gated_delta_rule_impl", ["fused_streamed", "fused_mega"])
+    def test_fused_and_unfused_forward_thd_match(self, pre_gated_delta_rule_impl):
+        unfused_gdn = self._build_gdn(
+            pre_gated_delta_rule_impl="unfused",
+            deterministic_mode=False,
+            conv_kernel_dim=4,
+        )
+        fused_gdn = self._build_gdn(
+            pre_gated_delta_rule_impl=pre_gated_delta_rule_impl,
+            deterministic_mode=False,
+            conv_kernel_dim=4,
+        )
+        fused_gdn.load_state_dict(unfused_gdn.state_dict())
+
+        hidden_states = torch.randn(
+            (32, 1, unfused_gdn.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+        cu_seqlens = torch.tensor([0, 1, 4, 11, 32], device=torch.cuda.current_device(), dtype=torch.int32)
+        packed_seq_params = PackedSeqParams(
+            qkv_format='thd',
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=21,
+            max_seqlen_kv=21,
+            total_tokens=hidden_states.shape[0],
+        )
+        assert packed_seq_params.seq_idx is not None
+
+        with torch.no_grad():
+            unfused_output, unfused_bias = unfused_gdn(
+                hidden_states, None, packed_seq_params=packed_seq_params
+            )
+            fused_output, fused_bias = fused_gdn(
+                hidden_states, None, packed_seq_params=packed_seq_params
+            )
+
+        torch.testing.assert_close(fused_output, unfused_output, atol=2e-3, rtol=2e-3)
+        assert fused_bias == unfused_bias
+
+    def test_fused_and_unfused_forward_thd_padding_match(self):
+        unfused_gdn = self._build_gdn(
+            pre_gated_delta_rule_impl="unfused",
+            deterministic_mode=False,
+            conv_kernel_dim=4,
+        )
+        fused_gdn = self._build_gdn(
+            pre_gated_delta_rule_impl="fused_streamed",
+            deterministic_mode=False,
+            conv_kernel_dim=4,
+        )
+        fused_gdn.load_state_dict(unfused_gdn.state_dict())
+
+        hidden_states = torch.randn(
+            (12, 1, unfused_gdn.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+        cu_seqlens = torch.tensor([0, 1, 4, 9], device=torch.cuda.current_device(), dtype=torch.int32)
+        cu_seqlens_padded = torch.tensor(
+            [0, 2, 6, 12], device=torch.cuda.current_device(), dtype=torch.int32
+        )
+        packed_seq_params = PackedSeqParams(
+            qkv_format='thd',
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            cu_seqlens_q_padded=cu_seqlens_padded,
+            cu_seqlens_kv_padded=cu_seqlens_padded,
+            max_seqlen_q=6,
+            max_seqlen_kv=6,
+            total_tokens=hidden_states.shape[0],
+        )
+        assert packed_seq_params.seq_idx is not None
+
+        with torch.no_grad():
+            unfused_output, unfused_bias = unfused_gdn(
+                hidden_states, None, packed_seq_params=packed_seq_params
+            )
+            fused_output, fused_bias = fused_gdn(
+                hidden_states, None, packed_seq_params=packed_seq_params
+            )
+
+        torch.testing.assert_close(fused_output, unfused_output, atol=2e-3, rtol=2e-3)
+        assert fused_bias == unfused_bias
+
+    def test_fused_and_unfused_pre_gated_delta_rule_match(self):
+        batch = 2
+        seq_len = 32
+        hidden_states = torch.randn(
+            (seq_len, batch, self.unfused_gdn.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+
+        with torch.no_grad():
+            qkvzba, _ = self.unfused_gdn.in_proj(hidden_states)
+            unfused_outputs = self.unfused_gdn.pre_gated_delta_rule(qkvzba, batch, seq_len)
+            fused_outputs = self.fused_gdn._fused_streamed_pre_gated_delta_rule(qkvzba)
+
+        self._assert_pre_gated_delta_rule_outputs_close(
+            fused_outputs,
+            unfused_outputs,
+            atol=1e-3,
+            rtol=1e-3,
+            # g uses Triton exp/log softplus in the fused path and torch softplus
+            # in the reference path, so its direct intermediate parity needs a
+            # slightly looser relative tolerance than the layout/conv outputs.
+            output_tolerances={"g": (1e-3, 3e-3)},
+        )
+
+    def test_fused_and_unfused_packed_pre_gated_delta_rule_forward_match(self):
+        reference_gdn = self._build_gdn(
+            pre_gated_delta_rule_impl="unfused",
+            deterministic_mode=True,
+            conv_kernel_dim=4,
+        )
+        fused_gdn = self._build_gdn(
+            pre_gated_delta_rule_impl="fused_streamed",
+            deterministic_mode=False,
+            conv_kernel_dim=4,
+        )
+        fused_gdn.load_state_dict(reference_gdn.state_dict())
+
+        batch = 1
+        cu_seqlens = torch.tensor([0, 1, 4, 6, 11], device=torch.cuda.current_device(), dtype=torch.int32)
+        seq_len = cu_seqlens[-1].item()
+        qkvzba = torch.randn(
+            (seq_len, batch, reference_gdn.in_proj_dim),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+
+        with torch.no_grad():
+            unfused_outputs = self._packed_pre_gated_delta_rule_reference(
+                reference_gdn, qkvzba, cu_seqlens
+            )
+            fused_outputs = fused_gdn._fused_streamed_pre_gated_delta_rule(
+                qkvzba, cu_seqlens_q=cu_seqlens
+            )
+
+        self._assert_pre_gated_delta_rule_outputs_close(
+            fused_outputs, unfused_outputs, atol=2e-3, rtol=2e-3
+        )
+
+    def test_fused_and_unfused_packed_pre_gated_delta_rule_backward_match(self):
+        reference_gdn = self._build_gdn(
+            pre_gated_delta_rule_impl="unfused",
+            deterministic_mode=True,
+            conv_kernel_dim=4,
+        )
+        fused_gdn = self._build_gdn(
+            pre_gated_delta_rule_impl="fused_streamed",
+            deterministic_mode=False,
+            conv_kernel_dim=4,
+        )
+        fused_gdn.load_state_dict(reference_gdn.state_dict())
+
+        batch = 1
+        cu_seqlens = torch.tensor([0, 1, 4, 6, 11], device=torch.cuda.current_device(), dtype=torch.int32)
+        seq_len = cu_seqlens[-1].item()
+        qkvzba = torch.randn(
+            (seq_len, batch, reference_gdn.in_proj_dim),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+        qkvzba_unfused = qkvzba.detach().clone().requires_grad_(True)
+        qkvzba_fused = qkvzba.detach().clone().requires_grad_(True)
+
+        reference_gdn.zero_grad(set_to_none=True)
+        fused_gdn.zero_grad(set_to_none=True)
+
+        unfused_outputs = self._packed_pre_gated_delta_rule_reference(
+            reference_gdn, qkvzba_unfused, cu_seqlens
+        )
+        fused_outputs = fused_gdn._fused_streamed_pre_gated_delta_rule(
+            qkvzba_fused, cu_seqlens_q=cu_seqlens
+        )
+        grad_outputs = [torch.randn_like(output.float()) for output in unfused_outputs]
+
+        unfused_loss = sum(
+            (output.float() * grad).sum() for output, grad in zip(unfused_outputs, grad_outputs)
+        )
+        fused_loss = sum(
+            (output.float() * grad).sum() for output, grad in zip(fused_outputs, grad_outputs)
+        )
+        unfused_loss.backward()
+        fused_loss.backward()
+
+        torch.testing.assert_close(qkvzba_fused.grad, qkvzba_unfused.grad, atol=3e-2, rtol=3e-2)
+        torch.testing.assert_close(
+            fused_gdn.conv1d.weight.grad,
+            reference_gdn.conv1d.weight.grad,
+            atol=3e-2,
+            rtol=3e-2,
+        )
+        torch.testing.assert_close(fused_gdn.A_log.grad, reference_gdn.A_log.grad, atol=3e-2, rtol=3e-2)
+        torch.testing.assert_close(
+            fused_gdn.dt_bias.grad, reference_gdn.dt_bias.grad, atol=3e-2, rtol=3e-2
+        )
+
+    def test_fused_packed_conv_forward_boundary_isolation(self):
+        from megatron.core.fusions.fused_pre_gated_delta_rule import (
+            fused_streamed_pre_gated_delta_rule,
+        )
+
+        seq_len = 5
+        boundary = 3
+        num_key_heads = 1
+        # Keep qkvzba.stride(0) aligned for causal_conv1d's channel-last
+        # backward guard; the boundary condition under test is independent
+        # of the value-head repeat factor.
+        num_value_heads = 4
+        key_head_dim = 32
+        value_head_dim = 32
+        conv_width = 4
+        qk_channels = num_key_heads * key_head_dim
+        v_channels = num_value_heads * value_head_dim
+        v_offset = 2 * qk_channels
+        k_offset = qk_channels
+        total_channels = 2 * qk_channels + 2 * v_channels + 2 * num_value_heads
+        device = torch.cuda.current_device()
+
+        qkvzba = torch.zeros((seq_len, 1, total_channels), device=device, dtype=torch.bfloat16)
+        qkvzba[boundary - 1, 0, :qk_channels] = 10.0
+        qkvzba[boundary - 1, 0, k_offset : k_offset + qk_channels] = 10.0
+        qkvzba[boundary - 1, 0, v_offset : v_offset + v_channels] = 10.0
+        conv_weight = torch.zeros((2 * qk_channels + v_channels, 1, conv_width), device=device)
+        conv_weight[:qk_channels, 0, conv_width - 2] = 1.0
+        conv_weight[k_offset : k_offset + qk_channels, 0, conv_width - 2] = 1.0
+        conv_weight[v_offset : v_offset + v_channels, 0, conv_width - 2] = 1.0
+        A_log = torch.zeros((num_value_heads,), device=device, dtype=torch.bfloat16)
+        dt_bias = torch.zeros((num_value_heads,), device=device, dtype=torch.bfloat16)
+        cu_seqlens = torch.tensor([0, boundary, seq_len], device=device, dtype=torch.int32)
+
+        query, key, value, _, _, _ = fused_streamed_pre_gated_delta_rule(
+            qkvzba,
+            conv_weight.to(torch.bfloat16),
+            None,
+            A_log,
+            dt_bias,
+            num_key_heads=num_key_heads,
+            num_value_heads=num_value_heads,
+            key_head_dim=key_head_dim,
+            value_head_dim=value_head_dim,
+            cu_seqlens=cu_seqlens,
+        )
+
+        torch.testing.assert_close(
+            query[0, boundary],
+            torch.zeros_like(query[0, boundary]),
+            atol=0.0,
+            rtol=0.0,
+        )
+        torch.testing.assert_close(
+            key[0, boundary],
+            torch.zeros_like(key[0, boundary]),
+            atol=0.0,
+            rtol=0.0,
+        )
+        torch.testing.assert_close(
+            value[0, boundary],
+            torch.zeros_like(value[0, boundary]),
+            atol=0.0,
+            rtol=0.0,
+        )
+
+    def test_fused_packed_conv_backward_boundary_isolation(self):
+        from megatron.core.fusions.fused_pre_gated_delta_rule import (
+            fused_streamed_pre_gated_delta_rule,
+        )
+
+        seq_len = 5
+        boundary = 3
+        num_key_heads = 1
+        # Keep qkvzba.stride(0) aligned for causal_conv1d's channel-last
+        # backward guard; the boundary condition under test is independent
+        # of the value-head repeat factor.
+        num_value_heads = 4
+        key_head_dim = 32
+        value_head_dim = 32
+        conv_width = 4
+        qk_channels = num_key_heads * key_head_dim
+        v_channels = num_value_heads * value_head_dim
+        v_offset = 2 * qk_channels
+        k_offset = qk_channels
+        total_channels = 2 * qk_channels + 2 * v_channels + 2 * num_value_heads
+        device = torch.cuda.current_device()
+
+        qkvzba = torch.zeros(
+            (seq_len, 1, total_channels), device=device, dtype=torch.bfloat16, requires_grad=True
+        )
+        conv_weight = torch.zeros(
+            (2 * qk_channels + v_channels, 1, conv_width),
+            device=device,
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        with torch.no_grad():
+            conv_weight[:qk_channels, 0, conv_width - 2] = 1.0
+            conv_weight[k_offset : k_offset + qk_channels, 0, conv_width - 2] = 1.0
+            conv_weight[v_offset : v_offset + v_channels, 0, conv_width - 2] = 1.0
+        A_log = torch.zeros((num_value_heads,), device=device, dtype=torch.bfloat16, requires_grad=True)
+        dt_bias = torch.zeros(
+            (num_value_heads,), device=device, dtype=torch.bfloat16, requires_grad=True
+        )
+        cu_seqlens = torch.tensor([0, boundary, seq_len], device=device, dtype=torch.int32)
+
+        query, key, value, gate, beta, g = fused_streamed_pre_gated_delta_rule(
+            qkvzba,
+            conv_weight,
+            None,
+            A_log,
+            dt_bias,
+            num_key_heads=num_key_heads,
+            num_value_heads=num_value_heads,
+            key_head_dim=key_head_dim,
+            value_head_dim=value_head_dim,
+            cu_seqlens=cu_seqlens,
+        )
+
+        loss = (
+            query[0, boundary].float().sum()
+            + key[0, boundary].float().sum()
+            + value[0, boundary].float().sum()
+        )
+        loss = loss + 0.0 * (
+            gate.float().sum()
+            + beta.float().sum()
+            + g.float().sum()
+        )
+        loss.backward()
+        leaked_q_grad = qkvzba.grad[boundary - 1, 0, :qk_channels]
+        leaked_k_grad = qkvzba.grad[boundary - 1, 0, k_offset : k_offset + qk_channels]
+        leaked_grad = qkvzba.grad[boundary - 1, 0, v_offset : v_offset + v_channels]
+        torch.testing.assert_close(leaked_q_grad, torch.zeros_like(leaked_q_grad), atol=0.0, rtol=0.0)
+        torch.testing.assert_close(leaked_k_grad, torch.zeros_like(leaked_k_grad), atol=0.0, rtol=0.0)
+        torch.testing.assert_close(leaked_grad, torch.zeros_like(leaked_grad), atol=0.0, rtol=0.0)
 
 
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")

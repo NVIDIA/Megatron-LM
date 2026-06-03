@@ -18,6 +18,12 @@ from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
 from megatron.core.fp8_utils import get_fp8_align_size
+from megatron.core.fusions.fused_mega_pre_gated_delta_rule import (
+    fused_mega_pre_gated_delta_rule,
+)
+from megatron.core.fusions.fused_pre_gated_delta_rule import (
+    fused_streamed_pre_gated_delta_rule,
+)
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
@@ -132,6 +138,11 @@ class GatedDeltaNet(MegatronModule):
         self.cp_size = self.pg_collection.cp.size()
         self.tp_size = self.pg_collection.tp.size()
         self.sp_size = self.tp_size if config.sequence_parallel else 1
+        self.pre_gated_delta_rule_impl = config.pre_gated_delta_rule_impl
+        if self.pre_gated_delta_rule_impl != "unfused":
+            assert (
+                self.cp_size == 1
+            ), "Fused pre_gated_delta_rule does not support context parallelism yet."
 
         # Attributes from config
         self.config = config
@@ -522,6 +533,49 @@ class GatedDeltaNet(MegatronModule):
                 ],
             )
 
+        # Fused pre-gated-delta-rule path: a single fused kernel replaces the conv1d ->
+        # _prepare_qkv -> g/beta block below. The fused wrappers consume the post-CP-a2a
+        # qkvzba (s b x) directly and return (query, key, value, gate, beta, g); reorder to the
+        # (query, key, value, g, beta, gate) layout this method returns.
+        if self.pre_gated_delta_rule_impl != "unfused":
+            seq_idx = (
+                packed_seq_params.seq_idx
+                if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd'
+                else None
+            )
+            if self.pre_gated_delta_rule_impl == "fused_streamed":
+                nvtx_range_push(suffix="fused_streamed_pre_gated_delta_rule")
+                query, key, value, gate, beta, g = self._fused_streamed_pre_gated_delta_rule(
+                    qkvzba, cu_seqlens_q=cu_seqlens_q, seq_idx=seq_idx
+                )
+                nvtx_range_pop(suffix="fused_streamed_pre_gated_delta_rule")
+            else:
+                assert self.pre_gated_delta_rule_impl == "fused_mega"
+                nvtx_range_push(suffix="fused_mega_pre_gated_delta_rule")
+                query, key, value, gate, beta, g = self._fused_mega_pre_gated_delta_rule(
+                    qkvzba, cu_seqlens_q=cu_seqlens_q, seq_idx=seq_idx
+                )
+                nvtx_range_pop(suffix="fused_mega_pre_gated_delta_rule")
+            return query, key, value, g, beta, gate
+
+        # Unfused path: conv1d -> _prepare_qkv -> g/beta on the post-CP-a2a qkvzba.
+        query, key, value, gate, beta, g = self.pre_gated_delta_rule(
+            qkvzba, batch, seq_len, cu_seqlens_q=cu_seqlens_q, cp_group=cp_group, cp_size=cp_size
+        )
+        return query, key, value, g, beta, gate
+
+    def pre_gated_delta_rule(
+        self, qkvzba, batch, seq_len, cu_seqlens_q=None, *, cp_group, cp_size
+    ):
+        """Unfused pre-gated-delta-rule on the post-CP-a2a qkvzba.
+
+        Runs the split -> conv1d -> _prepare_qkv -> g/beta block (the reference path that the
+        fused wrappers replace). Returns (query, key, value, gate, beta, g).
+
+        ``cp_group``/``cp_size`` are the dynamic context-parallel group/size resolved by the
+        caller (see ``resolve_cp_group``), threaded in so this method stays free of global
+        process-group reads.
+        """
         # Transpose: s b x --> b s x
         # From sbhd to bshd format
         qkvzba = qkvzba.transpose(0, 1)
@@ -615,7 +669,45 @@ class GatedDeltaNet(MegatronModule):
         g, beta = self._compute_g_and_beta(A_log_local_cp, dt_bias_local_cp, alpha, beta)
         nvtx_range_pop(suffix="g_and_beta")
 
-        return query, key, value, g, beta, gate
+        return query, key, value, gate, beta, g
+
+    def _fused_streamed_pre_gated_delta_rule(self, qkvzba, cu_seqlens_q=None, seq_idx=None):
+        """Call the streamed fused pre-GDR wrapper. Returns (query, key, value, gate, beta, g)."""
+
+        assert self.cp_size == 1, "Fused pre_gated_delta_rule does not support CP yet."
+        return fused_streamed_pre_gated_delta_rule(
+            qkvzba,
+            self.conv1d.weight,
+            self.conv1d.bias if self.conv_bias else None,
+            self.A_log,
+            self.dt_bias,
+            num_key_heads=self.qk_dim_local_tp // self.key_head_dim,
+            num_value_heads=self.v_dim_local_tp // self.value_head_dim,
+            key_head_dim=self.key_head_dim,
+            value_head_dim=self.value_head_dim,
+            use_qk_l2norm=self.use_qk_l2norm,
+            cu_seqlens=cu_seqlens_q,
+            seq_idx=seq_idx,
+        )
+
+    def _fused_mega_pre_gated_delta_rule(self, qkvzba, cu_seqlens_q=None, seq_idx=None):
+        """Call the mega fused pre-GDR wrapper. Returns (query, key, value, gate, beta, g)."""
+
+        assert self.cp_size == 1, "Fused pre_gated_delta_rule does not support CP yet."
+        return fused_mega_pre_gated_delta_rule(
+            qkvzba,
+            self.conv1d.weight,
+            self.conv1d.bias if self.conv_bias else None,
+            self.A_log,
+            self.dt_bias,
+            num_key_heads=self.qk_dim_local_tp // self.key_head_dim,
+            num_value_heads=self.v_dim_local_tp // self.value_head_dim,
+            key_head_dim=self.key_head_dim,
+            value_head_dim=self.value_head_dim,
+            use_qk_l2norm=self.use_qk_l2norm,
+            cu_seqlens=cu_seqlens_q,
+            seq_idx=seq_idx,
+        )
 
     @jit_fuser
     def _apply_gated_norm(self, x, gate):
