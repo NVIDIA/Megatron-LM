@@ -49,6 +49,7 @@ LEGACY_SCOPE_ALIASES = {
 # the historical GB200 MR matrix; see .gitlab/stages/04.functional-tests.yml.)
 SCOPE_FILTER_SUITES = {"mr": {"L1", "L2"}}
 
+
 def _resolve_scope_alias(scope_value: str) -> str:
     """Resolve a legacy scope value to its L-tier alias (or return it unchanged).
 
