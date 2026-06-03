@@ -480,16 +480,36 @@ class TopKRouter(Router):
             needs_dp_avg=needs_dp_avg,
         )
         if self.calculate_per_token_loss:
-            # Scale the aux_loss by the number of tokens.
-            # The expected final scaling for aux_loss gradients is 1/(num_micro_batches * dp_size).
-            # After commit 02648000, Megatron started using the number of total tokens to scale
-            # gradients under the argument of calculate_per_token_loss,
-            # which scales both the main_loss gradient and aux_loss gradient by
-            # 1/(num_local_tokens * dp_size * num_micro_batches) in finalize_model_grads function.
-            # To correct this scaling, we need to scale the aux_loss by num_local_tokens here.
+            # Target final scaling on aux_loss gradients: 1 / (num_micro_batches * dp_size),
+            # matching the !calculate_per_token_loss path.
+            #
+            # --calculate-per-token-loss already divides every parameter gradient by
+            # total_global_tokens (the global non-padded token count summed in
+            # finalize_model_grads). The router's `num_local_tokens` (= activation.shape[0])
+            # is sequence-parallel sharded — the router weight is marked
+            # `sequence_parallel=True` in Router.reset_parameters (see
+            # `setattr(self.weight, 'sequence_parallel', ...)` above), so each TP rank
+            # computes a partial gradient on the router weight from its local sequence
+            # shard, and `_allreduce_non_tensor_model_parallel_grads` SUMS those partial
+            # gradients across the TP group. Re-expressing total_global_tokens in terms of the
+            # router's `num_local_tokens`:
+            #     total_global_tokens
+            #         = num_micro_batches * dp_cp_size * loss_func_local_tokens
+            #         = num_micro_batches * dp_cp_size * tp_size * num_local_tokens
+            #         = num_micro_batches * dp_size * (num_local_tokens * tp_cp_group.size())
+            # (using loss_func_local_tokens = tp_size * num_local_tokens, then regrouping
+            # dp_cp_size * tp_size as dp_size * tp_cp_group.size()).
+            #
+            # So pre-multiplying aux_loss by num_local_tokens * tp_cp_group.size() cancels
+            # that same factor in total_global_tokens above, leaving 1 / (num_micro_batches *
+            # dp_size) as the effective scaling on the aux_loss gradient — the target.
             # Use valid_token_count (excluding padding) if provided, otherwise use total tokens.
-            num_tokens = valid_token_count if valid_token_count is not None else activation.shape[0]
-            activation = MoEAuxLossAutoScaler.apply(activation, aux_loss * num_tokens)
+            num_local_tokens = (
+                valid_token_count if valid_token_count is not None else activation.shape[0]
+            )
+            activation = MoEAuxLossAutoScaler.apply(
+                activation, aux_loss * num_local_tokens * self.tp_cp_group.size()
+            )
         else:
             activation = MoEAuxLossAutoScaler.apply(activation, aux_loss)
         return activation
@@ -512,16 +532,24 @@ class TopKRouter(Router):
             moe_z_loss_coeff = self.config.moe_z_loss_coeff / self.tp_cp_group.size()
             z_loss = z_loss_func(logits, moe_z_loss_coeff, padding_mask=padding_mask)
             if self.calculate_per_token_loss:
-                # The expected final scaling for z_loss gradients is
-                # 1/(num_micro_batches * dp_size).
-                # After commit 02648000, Megatron started using the number of total tokens
-                # to scale gradients under the argument of calculate_per_token_loss,
-                # which scales both the main_loss gradient and z_loss gradient by
-                # 1/(num_local_tokens * dp_size * num_micro_batches) in finalize_model_grads().
-                # To correct this scaling, we need to scale the z_loss by num_local_tokens here.
+                # Same derivation as in attach_and_log_load_balancing_loss:
+                #   - Target final scaling on z_loss gradients: 1 / (num_micro_batches * dp_size).
+                #   - In terms of the router's `num_local_tokens`, the total_global_tokens
+                #     divisor that finalize_model_grads applies factors as
+                #         num_micro_batches * dp_size * (num_local_tokens * tp_cp_group.size()).
+                #   - Pre-multiplying z_loss by num_local_tokens * tp_cp_group.size() cancels
+                #     that same factor in total_global_tokens, leaving
+                #     1 / (num_micro_batches * dp_size) as the effective scaling — the target.
+                # The /tp_cp_group.size() on moe_z_loss_coeff above is a separate forward-side
+                # correction: z_loss is computed independently on each TP+CP rank's local
+                # logits and must be averaged across TP+CP rather than summed.
                 # Count valid tokens: sum of inverted mask (False -> True = valid)
-                num_tokens = (~padding_mask).sum() if padding_mask is not None else logits.shape[0]
-                logits = MoEAuxLossAutoScaler.apply(logits, z_loss * num_tokens)
+                num_local_tokens = (
+                    (~padding_mask).sum() if padding_mask is not None else logits.shape[0]
+                )
+                logits = MoEAuxLossAutoScaler.apply(
+                    logits, z_loss * num_local_tokens * self.tp_cp_group.size()
+                )
             else:
                 logits = MoEAuxLossAutoScaler.apply(logits, z_loss)
 
