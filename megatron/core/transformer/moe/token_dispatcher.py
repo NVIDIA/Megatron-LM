@@ -490,6 +490,10 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.cudagraph_attrs.append('shared_experts.gate_score')
         self.cudagraph_attrs.append('shared_experts.cached_fc1_input')
 
+    def _local_expert_chunk_sort_is_identity(self) -> bool:
+        """Return true when permutation 2 would only copy already grouped local chunks."""
+        return self.tp_size == 1 and self.ep_size == 1
+
     def preprocess(self, routing_map: torch.Tensor) -> torch.Tensor:
         """
         Preprocesses the token routing map for All-to-All communication and token permutation.
@@ -745,7 +749,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
             "before_permutation_2", self.tokens_per_expert
         )
-        if self.num_local_experts > 1:
+        if self.num_local_experts > 1 and not self._local_expert_chunk_sort_is_identity():
             if self.drop_and_pad:
                 global_input_tokens = (
                     global_input_tokens.view(
@@ -791,7 +795,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         parallel dimension.
         """
         # Unpermutation 2: Unsort tokens by local expert.
-        if self.num_local_experts > 1:
+        if self.num_local_experts > 1 and not self._local_expert_chunk_sort_is_identity():
             if self.drop_and_pad:
                 hidden_states = (
                     hidden_states.view(
