@@ -35,11 +35,11 @@ def test_vocab_parallel_cross_entropy_uses_explicit_tp_group(monkeypatch):
 
     vocab_parallel_logits = torch.tensor([[1.0, 2.0, 3.0], [0.5, -0.5, 1.0]])
     target = torch.tensor([2, 0])
+    expected_output = torch.nn.functional.cross_entropy(
+        vocab_parallel_logits.clone(), target, reduction="none"
+    )
 
     output = vocab_parallel_cross_entropy(vocab_parallel_logits, target, tp_group=tp_group)
-    expected_output = torch.nn.functional.cross_entropy(
-        vocab_parallel_logits, target, reduction="none"
-    )
 
     torch.testing.assert_close(output, expected_output)
     assert all_reduce_groups == [tp_group, tp_group, tp_group]
