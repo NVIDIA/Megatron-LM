@@ -1225,11 +1225,16 @@ def validate_args(args, defaults={}):
                 "regular DDP/distributed optimizer path until Megatron-FSDP supports TE "
                 "GroupedTensor param buffers."
             )
-        # Optimizer compatibility check.
-        assert args.optimizer in (
-            'sgd',
-            'adam',
-        ), f"Megatron-FSDP does not support the {args.optimizer} optimizer yet."
+
+        # Optimizer compatibility check. Megatron-FSDP supports sgd/adam, plus the
+        # single-root distributed Muon (FullyShardV2Muon) on the v2 path only
+        # (the v2 ParameterGroup sets the dist_param back-references it needs).
+        assert args.optimizer in ('sgd', 'adam') or (
+            args.optimizer == 'muon' and getattr(args, 'use_megatron_fsdp_v2', False)
+        ), (
+            f"Megatron-FSDP does not support the {args.optimizer} optimizer "
+            "(muon requires --use-megatron-fsdp-v2)."
+        )
 
         if (
             args.data_parallel_sharding_strategy in ["optim_grads_params", "optim_grads"]
@@ -1848,7 +1853,12 @@ def validate_args(args, defaults={}):
 
     # emerging optimizer check
     args.use_layer_wise_distributed_optimizer = False
-    if args.optimizer not in ('sgd', 'adam'):
+    # Megatron-FSDP handles emerging optimizers (e.g. muon) through its own
+    # optimizer factory (FullyShardV2Muon), NOT the LayerWiseDistributedOptimizer
+    # path below — so skip this whole block when Megatron-FSDP is enabled (it
+    # would otherwise disable use_distributed_optimizer and reject FSDP / the
+    # fsdp_dtensor ckpt format). muon+FSDP is gated to v2 by the assert above.
+    if args.optimizer not in ('sgd', 'adam') and not args.use_megatron_fsdp:
         if args.optimizer == 'dist_muon':
             warn_rank_0(
                 "optimizer='dist_muon' is deprecated. "
