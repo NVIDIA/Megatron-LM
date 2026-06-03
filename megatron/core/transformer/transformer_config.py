@@ -1,7 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
-import math
 import warnings
 from dataclasses import dataclass, field
 from typing import Callable, List, Literal, Optional, Tuple, Union
@@ -11,6 +10,11 @@ import torch.nn.functional as F
 
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
+from megatron.core.parameterization import (
+    build_model_scaling_policy,
+    build_scaling_context,
+    sync_legacy_mup_fields,
+)
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
@@ -30,14 +34,7 @@ from megatron.core.transformer.pipeline_parallel_layer_layout import PipelinePar
 from .._rank_utils import log_single_rank
 from ..fusions.fused_bias_geglu import quick_gelu
 from ..model_parallel_config import ModelParallelConfig
-from ..utils import (
-    get_te_version,
-    init_method_normal,
-    is_te_min_version,
-    is_torch_min_version,
-    mup_scaled_init_method_normal,
-    scaled_init_method_normal,
-)
+from ..utils import get_te_version, init_method_normal, is_te_min_version, is_torch_min_version
 
 logger = logging.getLogger(__name__)
 
@@ -365,25 +362,42 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # MuP (Maximal Update Parameterization)
     ####################
+    scaling_recipe: Optional[Literal['none', 'mup']] = None
+    """
+    Canonical scaling recipe. ``none`` preserves standard parameterization, and ``mup``
+    enables width MuP. If unset, legacy ``use_mup`` selects ``mup`` for backward
+    compatibility.
+    """
+
+    scaling_base_hidden_size: Optional[int] = None
+    """
+    Canonical base hidden size for width scaling. For MuP, the width multiplier is
+    derived as hidden_size / scaling_base_hidden_size.
+    """
+
+    scaling_base_head_dim: Optional[float] = None
+    """
+    Canonical base attention head dimension for MuP attention scaling. This aliases the
+    deprecated mup_base_head_dim field.
+    """
+
     use_mup: bool = False
     """
-    Enable Maximal Update Parameterization (MuP) for hyperparameter transfer across
-    model widths. When enabled, learning rates and initialization are scaled according
-    to the width multiplier to ensure consistent training dynamics.
+    Deprecated alias for scaling_recipe='mup'. Kept for checkpoint and script
+    compatibility.
     """
 
     mup_width_mult: float = 1.0
     """
-    Width multiplier for MuP scaling, computed as hidden_size / mup_base_hidden_size.
-    This value is automatically computed in __post_init__ when use_mup is enabled.
+    Deprecated derived MuP width multiplier. The canonical value is computed as
+    hidden_size / scaling_base_hidden_size. If this legacy input is non-default, it
+    must match the derived value.
     """
 
     mup_base_hidden_size: Optional[int] = None
     """
-    Base hidden size for MuP width scaling. This is the reference width from which
-    scaling factors are computed. Defaults to hidden_size if not specified (base model
-    case where width_mult=1.0). Set this to your base/proxy model's hidden size when
-    scaling up.
+    Deprecated alias for scaling_base_hidden_size. Set scaling_recipe='mup' and
+    scaling_base_hidden_size for new configs.
     """
 
     mup_embedding_mult: float = 1.0
@@ -394,15 +408,15 @@ class TransformerConfig(ModelParallelConfig):
 
     mup_output_mult: float = 1.0
     """
-    Multiplier for output logits before softmax. When MuP is enabled and this is left
-    at 1.0, it is auto-set to 1/mup_width_mult to keep output variance stable across
-    widths. Override to customize output scaling.
+    Multiplier for output logits before softmax. When scaling_recipe='mup' and this is
+    left at 1.0, it is auto-set to 1/mup_width_mult to keep output variance stable
+    across widths. Override to customize output scaling.
     Default: 1.0.
     """
 
     mup_base_head_dim: Optional[float] = None
     """
-    Base head dimension for MuP attention scaling. When set,
+    Deprecated alias for scaling_base_head_dim. When set,
     softmax_scale = sqrt(mup_base_head_dim) / (kv_channels ** mup_attn_scale_power).
     Set to base model's d_head (e.g., 64) to match standard 1/sqrt(d_head) scaling
     at the base width, ensuring non-MuP compatibility for that specific value.
@@ -412,7 +426,8 @@ class TransformerConfig(ModelParallelConfig):
     """
     Power for attention scaling: softmax_scale = 1 / (kv_channels ** mup_attn_scale_power).
     0.5 = standard attention (1/sqrt(d_head)), 1.0 = MuP attention (1/d_head).
-    Default: 1.0 (MuP scaling when use_mup is True). Set to 0.5 for standard scaling.
+    Default: 1.0 (MuP scaling when scaling_recipe='mup'). Set to 0.5 for standard
+    scaling.
     """
 
     ####################
@@ -1969,27 +1984,11 @@ class TransformerConfig(ModelParallelConfig):
         if self.multi_latent_attention and self.rotary_interleaved:
             raise ValueError("rotary_interleaved does not work with multi_latent_attention.")
 
+        scaling_context = build_scaling_context(self)
+        sync_legacy_mup_fields(self, scaling_context)
+
         # MuP (Maximal Update Parameterization) configuration
-        if self.use_mup:
-            # Default base_hidden_size to hidden_size (base model case, width_mult=1.0)
-            if self.mup_base_hidden_size is None:
-                self.mup_base_hidden_size = self.hidden_size
-            assert self.mup_base_hidden_size > 0, "--mup-base-hidden-size must be positive."
-            # Compute width multiplier
-            self.mup_width_mult = self.hidden_size / self.mup_base_hidden_size
-
-            # MuP attention scaling: 1/d_head instead of 1/sqrt(d_head).
-            if self.softmax_scale is None:
-                base_head_scale = (
-                    1.0 if self.mup_base_head_dim is None else self.mup_base_head_dim**0.5
-                )
-                self.softmax_scale = base_head_scale / (self.kv_channels**self.mup_attn_scale_power)
-
-            # MuP output scaling: scale logits by 1/width_mult to keep outputs O(1).
-            # Only auto-set if user hasn't explicitly configured it.
-            if self.mup_output_mult == 1.0 and self.mup_width_mult != 1.0:
-                self.mup_output_mult = 1.0 / self.mup_width_mult
-
+        if scaling_context.uses_width_mup:
             overridden_init_methods = []
             if self.init_method is not None:
                 overridden_init_methods.append("init_method")
@@ -1999,11 +1998,16 @@ class TransformerConfig(ModelParallelConfig):
                 overridden_init_methods_text = " and ".join(overridden_init_methods)
                 verb = "is" if len(overridden_init_methods) == 1 else "are"
                 warnings.warn(
-                    "use_mup is enabled, but custom "
+                    "scaling recipe 'mup' is enabled, but custom "
                     + overridden_init_methods_text
                     + f" {verb} set. This may break MuP initialization assumptions.",
                     UserWarning,
                 )
+
+        model_scaling_policy = build_model_scaling_policy(self)
+        self.softmax_scale = model_scaling_policy.resolve_attention_softmax_scale(
+            softmax_scale=self.softmax_scale, kv_channels=self.kv_channels
+        )
 
         # Set the embedding init method.
         # NOTE: This block must run AFTER the MuP block above but BEFORE the init_method
@@ -2028,29 +2032,18 @@ class TransformerConfig(ModelParallelConfig):
                 self.embedding_init_method = self.init_method
 
         if self.init_method is None:
-            if self.use_mup:
-                # MuP: scale std by 1/sqrt(width_mult).
-                self.init_method = init_method_normal(
-                    self.init_method_std / math.sqrt(self.mup_width_mult)
-                )
-            else:
-                self.init_method = init_method_normal(self.init_method_std)
+            self.init_method = model_scaling_policy.build_hidden_init_method(
+                init_method_std=self.init_method_std
+            )
 
         if self.output_layer_init_method is None:
-            if self.use_mup:
-                # MuP: depth and width scaling for output layers.
-                self.output_layer_init_method = mup_scaled_init_method_normal(
-                    self.init_method_std,
-                    self.num_layers,
-                    self.mup_width_mult,
-                    multiplier=2.0 if not self.is_hybrid_model else 1.0,
+            self.output_layer_init_method = (
+                model_scaling_policy.build_default_output_layer_init_method(
+                    init_method_std=self.init_method_std,
+                    num_layers=self.num_layers,
+                    is_hybrid_model=self.is_hybrid_model,
                 )
-            else:
-                self.output_layer_init_method = scaled_init_method_normal(
-                    self.init_method_std,
-                    self.num_layers,
-                    multiplier=2.0 if not self.is_hybrid_model else 1.0,
-                )
+            )
 
         if self.num_moe_experts is not None and self.add_bias_linear:
             assert (

@@ -49,6 +49,7 @@ get-started/quickstart
 
 user-guide/data-preparation
 user-guide/training-examples
+user-guide/scaling-recipes
 user-guide/parallelism-guide
 ```
 

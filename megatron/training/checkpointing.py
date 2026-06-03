@@ -38,6 +38,10 @@ from megatron.core.dist_checkpointing.strategies.torch import (
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer
+from megatron.core.parameterization import (
+    build_scaling_context,
+    sync_legacy_mup_fields,
+)
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import get_pg_rank, get_pg_size, unwrap_model
 
@@ -174,6 +178,39 @@ def check_checkpoint_args(checkpoint_args):
     if get_checkpoint_version() >= 3.0 and not args.use_dist_ckpt:
         _compare('tensor_model_parallel_size')
         _compare('pipeline_model_parallel_size')
+
+    checkpoint_scaling_context = build_scaling_context(checkpoint_args)
+    args_scaling_context = build_scaling_context(args)
+    assert checkpoint_scaling_context == args_scaling_context, (
+        f"Scaling recipe from checkpoint ({checkpoint_scaling_context}) is not equal to "
+        f"the input argument value ({args_scaling_context})."
+    )
+
+
+_CHECKPOINT_SCALING_ARG_DEFAULTS = {
+    'scaling_recipe': 'none',
+    'scaling_base_hidden_size': None,
+    'scaling_base_head_dim': None,
+    'use_mup': False,
+    'mup_width_mult': 1.0,
+    '_mup_width_mult_explicit': False,
+    'mup_base_hidden_size': None,
+    'mup_embedding_mult': 1.0,
+    'mup_output_mult': 1.0,
+    'mup_base_head_dim': None,
+    'mup_attn_scale_power': 1.0,
+}
+
+
+def _sync_checkpoint_scaling_args(checkpoint_args):
+    """Populate canonical scaling fields on checkpoint args before force-copying them."""
+
+    sync_legacy_mup_fields(
+        checkpoint_args, build_scaling_context(checkpoint_args)
+    )
+    for arg_name, default_value in _CHECKPOINT_SCALING_ARG_DEFAULTS.items():
+        if not hasattr(checkpoint_args, arg_name):
+            setattr(checkpoint_args, arg_name, default_value)
 
 
 def isfile(filename) -> bool:
@@ -1502,7 +1539,9 @@ def load_args_from_checkpoint(
         if hasattr(checkpoint_args, 'num_layers'):
             setattr(checkpoint_args, 'num_layers', None)
 
-    def _set_arg(arg_name, old_arg_name=None, force=False):
+    _sync_checkpoint_scaling_args(checkpoint_args)
+
+    def _set_arg(arg_name, old_arg_name=None, force=False, allow_none=False):
         if not force and getattr(args, arg_name, None) is not None:
             return
 
@@ -1511,7 +1550,7 @@ def load_args_from_checkpoint(
         else:
             checkpoint_value = getattr(checkpoint_args, arg_name, None)
 
-        if checkpoint_value is not None:
+        if checkpoint_value is not None or allow_none:
             print_rank_0(f"Setting {arg_name} to {checkpoint_value} from checkpoint")
             setattr(args, arg_name, checkpoint_value)
         else:
@@ -1543,6 +1582,24 @@ def load_args_from_checkpoint(
     _set_arg('apply_query_key_layer_scaling', force=True)
     _set_arg('attention_dropout', force=True)
     _set_arg('hidden_dropout', force=True)
+    _set_arg('scaling_recipe', force=True)
+    _set_arg('scaling_base_hidden_size', force=True, allow_none=True)
+    _set_arg('scaling_base_head_dim', force=True, allow_none=True)
+    _set_arg('use_mup', force=True)
+    setattr(args, '_use_mup_explicit', False)
+    _set_arg('mup_width_mult', force=True)
+    setattr(
+        args,
+        '_mup_width_mult_explicit',
+        getattr(checkpoint_args, '_mup_width_mult_explicit', False),
+    )
+    _set_arg('mup_base_hidden_size', force=True, allow_none=True)
+    setattr(args, '_mup_base_hidden_size_explicit', False)
+    _set_arg('mup_embedding_mult', force=True)
+    _set_arg('mup_output_mult', force=True)
+    _set_arg('mup_base_head_dim', force=True, allow_none=True)
+    setattr(args, '_mup_base_head_dim_explicit', False)
+    _set_arg('mup_attn_scale_power', force=True)
 
     # Legacy MTP pattern for old checkpoints
     _set_arg('mtp_hybrid_override_pattern', force=True)
