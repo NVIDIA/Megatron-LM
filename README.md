@@ -112,7 +112,7 @@ The codebase efficiently trains models from 2B to 462B parameters across thousan
 - **Superlinear scaling**: MFU increases from 41% to 47–48% with model size.
 - **End-to-end measurement**: Throughputs include all operations (data loading, optimizer steps, communication, and logging).
 - **Production ready**: Full training pipeline with checkpointing and fault tolerance.
-- *Note: These results do not reflect training to convergence.*
+- *Note: Performance results measured without training to convergence*
 
 ## Weak Scaling Results
 
