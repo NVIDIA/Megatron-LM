@@ -23,6 +23,7 @@ from megatron.core.fusions.fused_bias_geglu import (
 )
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
+from megatron.core.parameterization import build_model_scaling_policy
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -170,6 +171,7 @@ class MLP(MegatronModule):
         is_expert: bool = False,
         input_size: Optional[int] = None,
         ffn_hidden_size: Optional[int] = None,
+        apply_block_output_init_scaling: bool = False,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,
     ):
@@ -233,13 +235,26 @@ class MLP(MegatronModule):
         else:
             self.activation_func = self.config.activation_func
 
+        model_scaling_policy = build_model_scaling_policy(self.config)
+        fc2_init_method = not_none(self.config.output_layer_init_method)
+        if apply_block_output_init_scaling and not is_expert:
+            fc2_init_method = model_scaling_policy.dense_block_output_init_method(
+                default_init_method=not_none(self.config.output_layer_init_method),
+                init_method_std=self.config.init_method_std,
+                num_layers=self.config.num_layers,
+                is_hybrid_model=self.config.is_hybrid_model,
+                output_layer_init_method_is_user_provided=getattr(
+                    self.config, '_parameterization_output_layer_init_method_user_provided', False
+                ),
+                apply_depth_hook=True,
+            )
         self.linear_fc2 = submodules.linear_fc2(
             not_none(self.config.ffn_hidden_size),
             not_none(
                 self.config.hidden_size if not use_latent_size else self.config.moe_latent_size
             ),
             config=self.config,
-            init_method=not_none(self.config.output_layer_init_method),
+            init_method=fc2_init_method,
             bias=self.config.add_bias_linear,
             input_is_parallel=True,
             skip_bias_add=True,
@@ -385,6 +400,7 @@ class MLP(MegatronModule):
         input_size: int | None = None,
         ffn_hidden_size: int | None = None,
         name: str | None = None,
+        apply_block_output_init_scaling: bool = False,
     ) -> MLP:
         """Helper function to build an MLP as a TransformerLayer's mlp submodule."""
         del is_mtp_layer
@@ -399,6 +415,7 @@ class MLP(MegatronModule):
             input_size=input_size,
             ffn_hidden_size=ffn_hidden_size,
             name=name,
+            apply_block_output_init_scaling=apply_block_output_init_scaling,
         )
 
 
