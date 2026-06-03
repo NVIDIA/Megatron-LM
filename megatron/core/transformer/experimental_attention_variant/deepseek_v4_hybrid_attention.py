@@ -115,20 +115,12 @@ class DSv4HybridAttention(Attention):
         # Per-layer compress ratio. When set explicitly (e.g. hybrid 'C'/'H' layer symbols
         # pass compress_ratio=4/128 via the spec), use it directly; otherwise fall back to the
         # per-(global)-layer csa_compress_ratios array (GPT-parity / array-driven path).
-        _ratio_idx = (
-            self.config.num_layers + layer_number - 1 if is_mtp_layer else layer_number - 1
-        )
+        _ratio_idx = self.config.num_layers + layer_number - 1 if is_mtp_layer else layer_number - 1
         if compress_ratio is None:
             compress_ratio = self.config.csa_compress_ratios[_ratio_idx]
-        # Per-layer block size (optional). block_size == 0 makes the CSA/HCA core run
-        # sliding-window-only (no compressor / no top-k indexer). Indexed like compress_ratio;
-        # None (csa_block_sizes unset) preserves the existing behavior.
-        block_sizes = getattr(self.config, "csa_block_sizes", None)
-        block_size = block_sizes[_ratio_idx] if block_sizes is not None else None
-        # block_size == 0 => sliding-window-only: no compressor / no top-k AND standard (non-YARN)
-        # rope, so the layer is equivalent to a compress_ratio==0 layer regardless of its ratio.
-        window_only = block_size == 0
-        use_compressed_yarn = compress_ratio > 1 and not window_only
+        # compress_ratio == 0 is a sliding-window-only layer (the 'W' symbol): no compressor /
+        # no top-k indexer (see CompressedSparseAttention) AND standard (non-YARN) rope.
+        use_compressed_yarn = compress_ratio > 1
         rope_base = (
             self.config.csa_compress_rotary_base if use_compressed_yarn else self.config.rotary_base
         )
@@ -158,7 +150,6 @@ class DSv4HybridAttention(Attention):
         core_attn_extra_kwargs = {
             "rotary_pos_emb": self.rotary_pos_emb,
             "compress_ratio": compress_ratio,
-            "block_size": block_size,
             "is_mtp_layer": is_mtp_layer,
         }
         self.core_attention = build_module(

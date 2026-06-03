@@ -571,14 +571,9 @@ class CompressedSparseAttention(MegatronModule):
     provides compressor and indexer submodule specs; this ``__init__`` inspects
     ``config.csa_compress_ratios[layer_idx]`` and conditionally builds them:
 
-    * ``ratio == 0``:  window-only (compressor and indexer NOT built)
+    * ``ratio == 0``:  window-only (compressor and indexer NOT built) — the 'W' layer symbol
     * ``ratio == 4``:  window + 4x compressed + learned Indexer (both built)
     * ``ratio == 128``: window + 128x compressed, attend to all (compressor built only)
-
-    Additionally, a per-layer ``block_size`` (from ``config.csa_block_sizes``) of ``0`` forces
-    SLIDING-WINDOW-ONLY regardless of ``ratio``: neither the compressor nor the indexer is
-    built, so the layer attends only within ``csa_window_size``. ``block_size`` None / != 0
-    leaves the ratio-driven behavior above unchanged.
     """
 
     def __init__(
@@ -596,7 +591,6 @@ class CompressedSparseAttention(MegatronModule):
         pg_collection: Optional[ProcessGroupCollection] = None,
         rotary_pos_emb: nn.Module = None,
         compress_ratio: int = 0,
-        block_size: Optional[int] = None,
         is_mtp_layer: bool = False,
     ):
         super().__init__(config=config)
@@ -609,12 +603,6 @@ class CompressedSparseAttention(MegatronModule):
         if is_mtp_layer:
             self.layer_number = self.layer_number + self.config.num_layers
         self.compress_ratio = compress_ratio
-        # Per-layer block size for the compressed/top-k selection path. block_size == 0 forces
-        # this layer to SLIDING-WINDOW-ONLY: neither the compressor (coarse compressed KV) nor
-        # the top-k indexer is built, so the layer attends only within csa_window_size. None (or
-        # any value != 0) preserves the existing compress_ratio-driven behavior.
-        self.block_size = block_size
-        self.window_only = block_size == 0
         self.window_size = config.csa_window_size
         self.v_head_dim = config.v_head_dim
 
@@ -629,8 +617,8 @@ class CompressedSparseAttention(MegatronModule):
         # Learnable attention sink per head
         self.attn_sink = nn.Parameter(torch.zeros(self.n_local_heads, dtype=torch.float32))
 
-        # Conditionally build Compressor (ratio > 1). Skipped when window_only (block_size == 0).
-        if self.compress_ratio > 1 and not self.window_only and submodules.compressor is not None:
+        # Conditionally build Compressor (ratio > 1). ratio == 0 is window-only ('W'): not built.
+        if self.compress_ratio > 1 and submodules.compressor is not None:
             self.compressor = build_module(
                 submodules.compressor,
                 config=config,
@@ -643,10 +631,9 @@ class CompressedSparseAttention(MegatronModule):
         else:
             self.compressor = None
 
-        # Conditionally build Indexer (ratio == 4). Skipped when window_only (block_size == 0).
+        # Conditionally build Indexer (ratio == 4). ratio == 0 is window-only ('W'): not built.
         if (
             self.compress_ratio == 4
-            and not self.window_only
             and not config.csa_dense_mode
             and submodules.indexer is not None
         ):
