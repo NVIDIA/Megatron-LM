@@ -597,8 +597,3 @@ class LogitsSaverHooks:
                     tar.addfile(info, io.BytesIO(data))
         if write_path != tar_path:
             storage_move(write_path, tar_path)
-
-    def flush(self) -> None:
-        """Synchronously flush any remaining buffered data to disk."""
-        tar_path, writes, meta_bytes, _ = self.take_pending_data()
-        self._write_batched_tar(tar_path, writes, meta_bytes)

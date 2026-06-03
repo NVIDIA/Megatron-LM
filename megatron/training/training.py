@@ -1398,12 +1398,6 @@ def pretrain(
 
         print_datetime('after training is done')
 
-        # Flush any remaining buffered logits data before final checkpoint.
-        from megatron.training.distillation import get_logits_saver
-
-        if (logits_saver := get_logits_saver()) is not None:
-            logits_saver.flush()
-
         if not cfg_container.validation.skip_train and cfg_container.checkpoint.save and iteration != 0 and iteration % cfg_container.checkpoint.save_interval != 0:
             save_checkpoint_and_time(
                 iteration,
