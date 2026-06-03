@@ -80,6 +80,9 @@ except ImportError:
     HAVE_DTENSOR = False
 
 from megatron.core.perfetto_trace import trace_region
+from megatron.core.dist_checkpointing.strategies.torch_dcp_load_trace import (
+    apply_torch_dcp_load_trace_patch,
+)
 
 from megatron.core.msc_utils import MultiStorageClientFeature
 
@@ -995,6 +998,9 @@ class TorchDistLoadShardedStrategy:
             shadow_renames = redirect_pyt_state_dict_to_shadows(
                 pyt_state_dict, metadata, torch.distributed.get_rank()
             )
+        # Break the checkpoint.load black box into per-phase Perfetto regions
+        # (read_metadata / planning / read_data). No-op unless CKPT_PERFETTO_TRACE=1.
+        apply_torch_dcp_load_trace_patch()
         with trace_region("checkpoint.load"):
             checkpoint.load(
                 pyt_state_dict,
