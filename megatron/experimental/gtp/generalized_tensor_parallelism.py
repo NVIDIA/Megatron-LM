@@ -53,55 +53,65 @@ class GTPChain(str, Enum):
     """Prefetch chain identifier for an GTPShardedParam.
 
     GRAPHED   — fwd/bwd captured by a CUDA graph (MLM _CudaGraphRunner).
-    UNGRAPHED — fwd/bwd runs eagerly; includes embedding/output_layer and
-                routed grouped experts always, plus router/shared_experts
-                when their scope tag is not in cuda_graph_modules.
+    UNGRAPHED — fwd/bwd runs eagerly.
 
-    Chains never cross-link (prev_w/next_w stay within one chain). CG
-    disabled → single UNGRAPHED chain; full-iteration graph → single GRAPHED.
+    Chains never cross-link (prev_w/next_w stay within one chain). See
+    _classify_param_chain for the GRAPHED/UNGRAPHED rule.
     """
 
     GRAPHED = "GTP_graphed"
     UNGRAPHED = "GTP_ungraphed"
 
 
-# Module-level cuda_graph_modules, set by the integrator at init via set_cuda_graph_modules().
-# None or empty → CG is disabled; every GTP param classifies as UNGRAPHED.
-# Value is a set of scope tags; e.g. {"mamba","attn","moe_router"}.
-_CUDA_GRAPH_MODULES: Optional[set] = None
-# Whether shared_experts are run with overlap (cannot be captured). When True,
-# shared_experts stay UNGRAPHED regardless of moe_router scope inclusion, matching
-# the transformer_layer.py guard that excludes them from the captured submodules.
-_MOE_SHARED_EXPERT_OVERLAP: bool = False
+# Active cuda_graph config, set by the integrator via set_cuda_graph_modules() before
+# classify_gtp_chains(); consumed by _classify_param_chain.
+_CUDA_GRAPH_MODULES: Optional[set] = None  # scope tags, e.g. {"mamba","attn","moe_router"}
+_MOE_SHARED_EXPERT_OVERLAP: bool = False  # overlapped shared_experts can't be captured -> UNGRAPHED
+_FULL_ITERATION: bool = False  # whole step in one graph -> every param GRAPHED
+# Empty cuda_graph_modules under per-layer CG = "graph every layer" == all tags present.
+_ALL_LAYER_SCOPE_TAGS = frozenset({"mamba", "attn", "moe", "moe_router"})
 
 
-def set_cuda_graph_modules(scope, moe_shared_expert_overlap: bool = False):
-    """Record the active cuda_graph_modules for GTP chain classification.
+def set_cuda_graph_modules(
+    scope, moe_shared_expert_overlap: bool = False, cuda_graph_impl: str = "none"
+):
+    """Record the active cuda_graph config for GTP chain classification.
 
-    Called by MLM at init, BEFORE classify_gtp_chains(). ``scope`` may be
-    None, an empty iterable (CG disabled), or an iterable of scope tags.
+    Called by MLM at init, before classify_gtp_chains(). ``cuda_graph_impl``
+    disambiguates the empty-``scope`` cases:
+      - "none"           -> CG disabled; all params UNGRAPHED.
+      - "full_iteration" -> whole step in one graph; all params GRAPHED.
+      - "local"/"transformer_engine" + empty scope -> graph every layer.
     """
-    global _CUDA_GRAPH_MODULES, _MOE_SHARED_EXPERT_OVERLAP
-    _CUDA_GRAPH_MODULES = set(scope) if scope else None
+    global _CUDA_GRAPH_MODULES, _MOE_SHARED_EXPERT_OVERLAP, _FULL_ITERATION
     _MOE_SHARED_EXPERT_OVERLAP = bool(moe_shared_expert_overlap)
+    _FULL_ITERATION = cuda_graph_impl == "full_iteration"
+    if _FULL_ITERATION:
+        _CUDA_GRAPH_MODULES = None  # scope unused
+    elif cuda_graph_impl != "none" and not scope:
+        _CUDA_GRAPH_MODULES = set(_ALL_LAYER_SCOPE_TAGS)  # graph every layer
+    else:
+        _CUDA_GRAPH_MODULES = set(scope) if scope else None
 
 
 def _classify_param_chain(param_name: str) -> "GTPChain":
-    """Classify an GTPShardedParam by name + active cuda_graph_modules.
+    """Map a GTPShardedParam name + active cuda_graph config to its chain.
 
-    embedding / output_layer are always UNGRAPHED. Other kinds (mamba mixer,
-    self/cross_attention, shared_experts, routed experts) are GRAPHED iff
-    their scope tag is present in cuda_graph_modules; otherwise UNGRAPHED.
+    Full-iteration -> GRAPHED. Otherwise embedding/output_layer are UNGRAPHED, and
+    each layer kind (mixer, attention, shared/routed experts) is GRAPHED iff its
+    scope tag is in cuda_graph_modules.
     """
     n = param_name
 
-    # Always ungraphed — embedding and output_layer live outside any CG runner.
+    if _FULL_ITERATION:
+        return GTPChain.GRAPHED
+
+    # embedding/output_layer live outside any per-layer CG runner.
     if "embedding" in n or "output_layer" in n:
         return GTPChain.UNGRAPHED
 
     scope = _CUDA_GRAPH_MODULES
-    if not scope:
-        # CG disabled: every GTP param goes to the single UNGRAPHED chain.
+    if not scope:  # CG disabled
         return GTPChain.UNGRAPHED
 
     if ".mlp.shared_experts." in n:

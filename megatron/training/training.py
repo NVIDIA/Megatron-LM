@@ -1730,7 +1730,13 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         _raw_modules = getattr(args, 'cuda_graph_modules', None) or []
         _cg_modules = {getattr(s, 'name', str(s)) for s in _raw_modules} if _raw_modules else None
         _mse_overlap = getattr(args, 'moe_shared_expert_overlap', False)
-        set_cuda_graph_modules(_cg_modules, moe_shared_expert_overlap=_mse_overlap)
+        # cuda_graph_impl lets the classifier tell "CG disabled" from "full-iteration /
+        # graph-every-layer" — both have empty cuda_graph_modules.
+        set_cuda_graph_modules(
+            _cg_modules,
+            moe_shared_expert_overlap=_mse_overlap,
+            cuda_graph_impl=getattr(args, 'cuda_graph_impl', 'none'),
+        )
         for model_module in model:
             tag_gtp_params_with_names(model_module)
             classify_gtp_chains(model_module)
