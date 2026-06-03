@@ -24,30 +24,18 @@ from tools.checkpoint import weighted_merge as weighted_merge_module
 from tools.checkpoint.weighted_merge import (
     WeightedMergeError,
     checkpoint_coefficients,
-    derive_start_iteration_from_token_window,
-    ensure_process_group,
-    filter_checkpoints_by_interval,
-    get_valid_styles,
-    iteration_dir_name,
     merge_same_layout_dcp_metadata_checkpoints,
-    normalize_weights,
-    output_checkpoint_dir,
-    parse_weighted_inputs,
-    resolve_checkpoint_dir,
-    select_checkpoints_in_window,
-    validate_min_checkpoints,
-    validate_weights,
-    write_latest_checkpointed_iteration,
 )
 
 
 @pytest.fixture
 def process_group():
     already_initialized = dist.is_available() and dist.is_initialized()
-    ensure_process_group()
+    weighted_merge_module._ensure_process_group()
     yield
     if not already_initialized and dist.is_available() and dist.is_initialized():
-        dist.destroy_process_group()
+        if dist.get_world_size() == 1:
+            dist.destroy_process_group()
 
 
 @pytest.fixture(autouse=True)
@@ -392,6 +380,17 @@ def _dcp_metadata_summary(path):
     }
 
 
+def _fake_tensor_metadata(*, shape=(2, 2), dtype=torch.float32, chunks=(((0, 0), (2, 2)),)):
+    return SimpleNamespace(
+        size=shape,
+        properties=SimpleNamespace(dtype=dtype),
+        chunks=[
+            SimpleNamespace(offsets=offsets, sizes=sizes)
+            for offsets, sizes in chunks
+        ],
+    )
+
+
 def _bytesio_state(value):
     data = io.BytesIO()
     torch.save({"value": value}, data)
@@ -461,6 +460,14 @@ def _multi_chunk_template(value=0.0, *, dtype=torch.float32):
                 replica_id=0,
             )
         },
+        "model2": {
+            "weight": ShardedTensor.from_rank_offsets(
+                "model2.weight",
+                torch.full((2, 2), value + 2, dtype=dtype),
+                *rank_offsets,
+                replica_id=0,
+            )
+        },
     }
 
 
@@ -499,7 +506,7 @@ def test_minus_sqrt_matches_discrete_difference():
     assert abs(sum(coeffs.values()) - 1.0) < 1e-12
 
 
-@pytest.mark.parametrize("style", get_valid_styles())
+@pytest.mark.parametrize("style", weighted_merge_module._get_valid_styles())
 @pytest.mark.parametrize("n_checkpoints", [1, 2, 5])
 def test_supported_coefficients_are_deterministic_and_normalized(style, n_checkpoints):
     checkpoints = list(range(n_checkpoints))
@@ -524,7 +531,9 @@ def test_modifiers_are_deterministic():
 
 
 def test_parse_weighted_inputs_uses_last_colon_for_weight():
-    paths, weights = parse_weighted_inputs(["/tmp/with:colon/iter_0000010:0.75"])
+    paths, weights = weighted_merge_module._parse_weighted_inputs(
+        ["/tmp/with:colon/iter_0000010:0.75"]
+    )
     assert str(paths[0]) == "/tmp/with:colon/iter_0000010"
     assert weights == [0.75]
 
@@ -546,68 +555,55 @@ def test_manual_weight_policy_warnings():
 
 def test_invalid_pure_inputs_raise(tmp_path):
     with pytest.raises(WeightedMergeError, match="PATH:WEIGHT"):
-        parse_weighted_inputs([str(tmp_path / "iter_0000010")])
+        weighted_merge_module._parse_weighted_inputs([str(tmp_path / "iter_0000010")])
     with pytest.raises(WeightedMergeError, match="Invalid weight"):
-        parse_weighted_inputs([f"{tmp_path / 'iter_0000010'}:not-a-float"])
+        weighted_merge_module._parse_weighted_inputs(
+            [f"{tmp_path / 'iter_0000010'}:not-a-float"]
+        )
     with pytest.raises(WeightedMergeError, match="Unknown coefficient schedule"):
         checkpoint_coefficients([1, 2], "unknown")
     with pytest.raises(WeightedMergeError, match="Unknown coefficient modifier"):
         checkpoint_coefficients([1, 2], "linear__unknown")
     with pytest.raises(WeightedMergeError, match="Weight sum"):
-        normalize_weights([1.0, -1.0])
+        weighted_merge_module._normalize_weights([1.0, -1.0])
     with pytest.raises(WeightedMergeError, match="finite"):
-        normalize_weights([1.0, float("nan")])
+        weighted_merge_module._normalize_weights([1.0, float("nan")])
     with pytest.raises(WeightedMergeError, match="finite"):
-        validate_weights([1.0, float("inf")])
+        weighted_merge_module._validate_weights([1.0, float("inf")])
     with pytest.raises(WeightedMergeError, match="min_checkpoints"):
-        validate_min_checkpoints(2, 0)
+        weighted_merge_module._validate_min_checkpoints(2, 0)
     with pytest.raises(WeightedMergeError, match="at least 3"):
-        validate_min_checkpoints(2, 3)
+        weighted_merge_module._validate_min_checkpoints(2, 3)
     with pytest.raises(WeightedMergeError, match="does not match requested iteration"):
-        output_checkpoint_dir(tmp_path / "iter_0000001", 2)
+        weighted_merge_module._output_checkpoint_dir(tmp_path / "iter_0000001", 2)
     with pytest.raises(WeightedMergeError, match="not a distributed checkpoint"):
-        resolve_checkpoint_dir(tmp_path)
+        weighted_merge_module._resolve_checkpoint_dir(tmp_path)
 
 
 def test_select_checkpoints_preserves_target_and_applies_interval(tmp_path):
     for iteration in [100, 150, 210, 260, 300]:
-        (tmp_path / iteration_dir_name(iteration)).mkdir()
+        (tmp_path / weighted_merge_module._iteration_dir_name(iteration)).mkdir()
 
-    selected = select_checkpoints_in_window(
+    selected = weighted_merge_module._select_checkpoints_in_window(
         tmp_path, start_iteration=100, end_iteration=300, min_iteration_interval=100
     )
 
     assert selected == [150, 300]
-
-
-def test_token_window_selection_uses_ceil_and_requires_target(tmp_path):
-    for iteration in [0, 10, 20, 30]:
-        (tmp_path / iteration_dir_name(iteration)).mkdir()
-
-    start = derive_start_iteration_from_token_window(
-        end_iteration=30, token_window_btok=1, seq_length=128, global_batch_size=1_000_000
-    )
-    selected = select_checkpoints_in_window(
-        tmp_path,
-        start_iteration=None,
-        end_iteration=30,
-        token_window_btok=1,
-        seq_length=128,
-        global_batch_size=1_000_000,
-    )
-
-    assert start == 22
-    assert selected == [30]
     with pytest.raises(WeightedMergeError, match="Target iteration"):
-        select_checkpoints_in_window(tmp_path, start_iteration=0, end_iteration=40)
-    with pytest.raises(WeightedMergeError, match="requires seq_length and global_batch_size"):
-        select_checkpoints_in_window(
-            tmp_path, start_iteration=None, end_iteration=30, token_window_btok=1
+        weighted_merge_module._select_checkpoints_in_window(
+            tmp_path, start_iteration=0, end_iteration=40
+        )
+    with pytest.raises(WeightedMergeError, match="start_iteration is required"):
+        weighted_merge_module._select_checkpoints_in_window(
+            tmp_path, start_iteration=None, end_iteration=300
         )
 
 
 def test_filter_checkpoints_by_interval_keeps_last_checkpoint():
-    assert filter_checkpoints_by_interval([100, 180, 240, 300], 100) == [180, 300]
+    assert weighted_merge_module._filter_checkpoints_by_interval([100, 180, 240, 300], 100) == [
+        180,
+        300,
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -689,6 +685,48 @@ def test_metadata_same_layout_merge_round_trip_without_model_builder_path(
         assert provenance["extra_state_source_index"] == 1
 
 
+def test_metadata_same_layout_factory_checkpoint_round_trip(
+    tmp_path_dist_ckpt, process_group
+):
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_factory_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_factory_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_factory_out") as output_root,
+    ):
+        _write_factory_checkpoint(ckpt_a, 1.0, iteration=1)
+        _write_factory_checkpoint(ckpt_b, 5.0, iteration=2)
+
+        result = merge_same_layout_dcp_metadata_checkpoints(
+            [ckpt_a, ckpt_b],
+            [0.25, 0.75],
+            output_root,
+            output_iteration=32,
+        )
+
+        loaded = dist_checkpointing.load(_factory_template(), str(result.output_dir))
+        assert torch.equal(loaded["model"]["weight"], torch.full((4, 2), 4.0))
+        assert result.averaged_tensors == 2
+        assert result.copied_extra_states == 0
+
+        source_metadata = torch_dcp.FileSystemReader(ckpt_a).read_metadata()
+        output_metadata = torch_dcp.FileSystemReader(result.output_dir).read_metadata()
+        assert set(output_metadata.state_dict_metadata) == set(source_metadata.state_dict_metadata)
+        assert {
+            "model.factory_weight.left",
+            "model.factory_weight.right",
+        }.issubset(output_metadata.state_dict_metadata)
+        for fqn, source_tensor_metadata in source_metadata.state_dict_metadata.items():
+            source_chunks = [
+                (tuple(chunk.offsets), tuple(chunk.sizes))
+                for chunk in source_tensor_metadata.chunks
+            ]
+            output_chunks = [
+                (tuple(chunk.offsets), tuple(chunk.sizes))
+                for chunk in output_metadata.state_dict_metadata[fqn].chunks
+            ]
+            assert output_chunks == source_chunks
+
+
 def test_metadata_same_layout_balance_rank_work_preserves_source_chunks(
     tmp_path_dist_ckpt, process_group
 ):
@@ -736,6 +774,38 @@ def test_metadata_same_layout_balance_rank_work_preserves_source_chunks(
         assert provenance["balance_rank_work"] is True
 
 
+def test_metadata_same_layout_balanced_work_plan_reports_multi_rank_stats(monkeypatch):
+    monkeypatch.setattr(weighted_merge_module.dist, "is_available", lambda: True)
+    monkeypatch.setattr(weighted_merge_module.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(weighted_merge_module.dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(weighted_merge_module.dist, "get_world_size", lambda: 2)
+
+    selected_keys = tuple(f"model.singleton_{index}" for index in range(4))
+    first_layouts = {
+        fqn: weighted_merge_module._DcpMetadataTensorLayout(
+            global_shape=(2, 2),
+            dtype=torch.float32,
+            chunks=(((0, 0), (2, 2)),),
+        )
+        for fqn in selected_keys
+    }
+
+    work_plan = weighted_merge_module._build_metadata_same_layout_write_specs(
+        selected_keys=selected_keys,
+        byte_extra_state_keys=(),
+        first_layouts=first_layouts,
+        save_dtype="same",
+        input_count=2,
+        balance_rank_work=True,
+    )
+
+    assert work_plan.merge_keys == 4
+    assert work_plan.extra_state_keys == 0
+    assert work_plan.tensor_chunks_by_rank == (2, 2)
+    assert work_plan.tensor_bytes_by_rank[0] == work_plan.tensor_bytes_by_rank[1] > 0
+    assert len(work_plan.write_specs) == 2
+
+
 def test_metadata_same_layout_generated_gpt_round_trip_cpu_without_model_builder_path(
     tmp_path_dist_ckpt, process_group, monkeypatch
 ):
@@ -770,7 +840,8 @@ def test_metadata_same_layout_generated_gpt_round_trip_cpu_without_model_builder
             assert result.implementation_mode == weighted_merge_module.METADATA_SAME_LAYOUT_MODE
             assert result.averaged_tensors >= 15
             assert result.copied_extra_states == 0
-            assert result.memory_estimate.template_devices == ("cpu",)
+            assert result.memory_estimate.mergeable_tensors == result.averaged_tensors
+            assert result.memory_estimate.extra_state_entries == result.copied_extra_states
 
             output_metadata = torch_dcp.FileSystemReader(result.output_dir).read_metadata()
             tensor_state = {
@@ -841,7 +912,8 @@ def test_metadata_same_layout_generated_moe_gpt_round_trip_cpu_without_model_bui
             # All in-root byte/object _extra_state entries are copied from the
             # selected source (the metadata path does no object-entry filtering).
             assert result.copied_extra_states == 7
-            assert result.memory_estimate.template_devices == ("cpu",)
+            assert result.memory_estimate.mergeable_tensors == result.averaged_tensors
+            assert result.memory_estimate.extra_state_entries == result.copied_extra_states
 
             output_metadata = torch_dcp.FileSystemReader(result.output_dir).read_metadata()
             object_metadata_keys = [
@@ -1108,7 +1180,7 @@ def test_metadata_same_layout_cli_dispatch_skips_megatron_parser(tmp_path, monke
             implementation_mode=weighted_merge_module.METADATA_SAME_LAYOUT_MODE,
         )
 
-    monkeypatch.setattr(weighted_merge_module, "ensure_process_group", fail_megatron_path)
+    monkeypatch.setattr(weighted_merge_module, "_ensure_process_group", fail_megatron_path)
     monkeypatch.setattr(
         weighted_merge_module,
         "merge_same_layout_dcp_metadata_checkpoints",
@@ -1142,64 +1214,66 @@ def test_metadata_same_layout_cli_dispatch_skips_megatron_parser(tmp_path, monke
     assert calls["kwargs"]["balance_rank_work"] is True
 
 
-def test_metadata_same_layout_cli_rejects_unsupported_template_options(tmp_path):
-    base_args = [
-        "--merge-inputs",
-        f"{tmp_path / 'iter_0000001'}:1.0",
-        "--merge-output",
-        str(tmp_path / "merged"),
+def test_metadata_same_layout_cli_range_dispatch_selects_paths_and_weights(tmp_path, monkeypatch):
+    checkpoint_root = tmp_path / "checkpoints"
+    output_root = tmp_path / "merged"
+    for iteration in [10, 20, 30]:
+        (checkpoint_root / weighted_merge_module._iteration_dir_name(iteration)).mkdir(
+            parents=True
+        )
+    calls = {}
+
+    def fake_merge(input_paths, weights, output_root_arg, **kwargs):
+        calls["input_paths"] = input_paths
+        calls["weights"] = weights
+        calls["output_root"] = output_root_arg
+        calls["kwargs"] = kwargs
+        return weighted_merge_module.MergeResult(
+            output_dir=Path(output_root_arg) / "iter_0000030",
+            input_dirs=tuple(Path(path) for path in input_paths),
+            weights=tuple(weights),
+            timings=weighted_merge_module.MergeTimings(),
+            averaged_tensors=2,
+            copied_extra_states=1,
+            implementation_mode=weighted_merge_module.METADATA_SAME_LAYOUT_MODE,
+        )
+
+    monkeypatch.setattr(
+        weighted_merge_module,
+        "merge_same_layout_dcp_metadata_checkpoints",
+        fake_merge,
+    )
+
+    args = weighted_merge_module._parse_metadata_same_layout_args(
+        [
+            "--merge-inputs",
+            str(checkpoint_root),
+            "--start-checkpoint",
+            "10",
+            "--end-checkpoint",
+            "30",
+            "--merge-style",
+            "minus-sqrt",
+            "--merge-output",
+            str(output_root),
+        ]
+    )
+    result = weighted_merge_module._run_metadata_same_layout_cli(args)
+
+    selected_iterations = [10, 20, 30]
+    expected_paths = [
+        checkpoint_root / weighted_merge_module._iteration_dir_name(iteration)
+        for iteration in selected_iterations
     ]
-    with pytest.raises(WeightedMergeError, match="--merge-window-btoks is not supported"):
-        weighted_merge_module._parse_metadata_same_layout_args(
-            base_args + ["--end-checkpoint", "2", "--merge-window-btoks", "1"]
-        )
-    with pytest.raises(WeightedMergeError, match="--no-atomic-merge-output"):
-        weighted_merge_module._parse_metadata_same_layout_args(
-            base_args + ["--no-atomic-merge-output"]
-        )
-
-
-def test_metadata_same_layout_rejects_no_atomic_output(tmp_path_dist_ckpt, process_group):
-    with pytest.raises(WeightedMergeError, match="requires atomic output publication"):
-        merge_same_layout_dcp_metadata_checkpoints(
-            [tmp_path_dist_ckpt / "missing"],
-            [1.0],
-            tmp_path_dist_ckpt / "merged",
-            atomic_output=False,
-        )
-
-
-def test_metadata_same_layout_rejects_existing_output_overwrite_for_crash_safety(
-    tmp_path_dist_ckpt, process_group
-):
-    with (
-        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_metadata_overwrite_reject_a") as ckpt_a,
-        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_metadata_overwrite_reject_b") as ckpt_b,
-        TempNamedDir(
-            tmp_path_dist_ckpt / "weighted_merge_metadata_overwrite_reject_out"
-        ) as output_root,
-    ):
-        _write_checkpoint(ckpt_a, 1.0, iteration=1)
-        _write_checkpoint(ckpt_b, 5.0, iteration=2)
-        final_dir = output_root / "iter_0000030"
-        final_dir.mkdir()
-        _write_checkpoint(final_dir, 9.0, iteration=29)
-        write_latest_checkpointed_iteration(final_dir, 29)
-
-        with pytest.raises(WeightedMergeError, match="crash-atomic"):
-            merge_same_layout_dcp_metadata_checkpoints(
-                [ckpt_a, ckpt_b],
-                [0.25, 0.75],
-                output_root,
-                output_iteration=30,
-                overwrite_output=True,
-            )
-
-        restored = _load_checkpoint(final_dir)
-        torch.testing.assert_close(restored["model"]["weight"], torch.full((2, 2), 9.0))
-        assert (output_root / "latest_checkpointed_iteration.txt").read_text().strip() == "29"
-        assert not list(output_root.glob(".iter_0000030.old-*"))
-        assert not list(output_root.glob(".iter_0000030.tmp-*"))
+    expected_weights = list(
+        checkpoint_coefficients(selected_iterations, "minus-sqrt").values()
+    )
+    assert result.implementation_mode == weighted_merge_module.METADATA_SAME_LAYOUT_MODE
+    assert calls["input_paths"] == expected_paths
+    assert calls["weights"] == pytest.approx(expected_weights)
+    assert calls["output_root"] == str(output_root)
+    assert calls["kwargs"]["output_iteration"] == 30
+    assert calls["kwargs"]["merge_style"] == "minus-sqrt"
 
 
 def test_metadata_same_layout_rejects_mismatched_metadata(
@@ -1221,6 +1295,59 @@ def test_metadata_same_layout_rejects_mismatched_metadata(
             )
 
         assert not (output_root / "merged").exists()
+
+
+def test_metadata_same_layout_rejects_chunk_layout_mismatch():
+    with pytest.raises(WeightedMergeError, match="Chunk layout mismatch"):
+        weighted_merge_module._validate_metadata_same_layout(
+            tensor_metadata_by_checkpoint=[
+                {"model.weight": _fake_tensor_metadata(chunks=(((0, 0), (2, 2)),))},
+                {
+                    "model.weight": _fake_tensor_metadata(
+                        chunks=(((0, 0), (1, 2)), ((1, 0), (1, 2)))
+                    )
+                },
+            ],
+            byte_extra_state_keys_by_checkpoint=[(), ()],
+            resolved_input_dirs=[Path("checkpoint_a"), Path("checkpoint_b")],
+            model_key_prefixes=weighted_merge_module.METADATA_SAME_LAYOUT_MODEL_PREFIXES,
+            require_matching_chunks=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "sidecar_target",
+    [
+        "megatron.core.dist_checkpointing.strategies.common.save_common",
+        "megatron.core.dist_checkpointing.core.save_config",
+    ],
+)
+def test_metadata_same_layout_sidecar_failure_does_not_publish_output_or_latest(
+    tmp_path_dist_ckpt, process_group, monkeypatch, sidecar_target
+):
+    with (
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_sidecar_fail_a") as ckpt_a,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_sidecar_fail_b") as ckpt_b,
+        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_sidecar_fail_out") as output_root,
+    ):
+        _write_checkpoint(ckpt_a, 1.0, iteration=1)
+        _write_checkpoint(ckpt_b, 5.0, iteration=2)
+
+        def fail_sidecar(*_args, **_kwargs):
+            raise RuntimeError("sidecar boom")
+
+        monkeypatch.setattr(sidecar_target, fail_sidecar)
+
+        with pytest.raises((RuntimeError, WeightedMergeError), match="sidecar boom"):
+            merge_same_layout_dcp_metadata_checkpoints(
+                [ckpt_a, ckpt_b],
+                [0.25, 0.75],
+                output_root,
+                output_iteration=55,
+            )
+
+        assert not (output_root / "iter_0000055").exists()
+        assert not (output_root / "latest_checkpointed_iteration.txt").exists()
 
 
 def test_metadata_same_layout_two_rank_product_round_trip_public_metadata(
@@ -1267,7 +1394,8 @@ def test_metadata_same_layout_two_rank_product_round_trip_public_metadata(
         assert result.world_size == 2
         assert result.averaged_tensors == 2
         assert result.copied_extra_states == 1
-        assert result.memory_estimate.template_devices == ("cpu",)
+        assert result.memory_estimate.mergeable_tensors == result.averaged_tensors
+        assert result.memory_estimate.extra_state_entries == result.copied_extra_states
 
         expected_rank_weight = 4.0 + (1.75 * rank)
         assert torch.equal(loaded["model"]["weight"], torch.full((2, 2), expected_rank_weight))
@@ -1433,7 +1561,9 @@ def test_merge_rejects_existing_output_directory_by_default(tmp_path_dist_ckpt, 
             merge_same_layout_dcp_metadata_checkpoints([ckpt_a], [1.0], output_dir)
 
 
-def test_merge_supports_multiple_model_chunks(tmp_path_dist_ckpt, process_group):
+def test_merge_supports_numbered_model_roots_model0_model1_model2(
+    tmp_path_dist_ckpt, process_group
+):
     with (
         TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_multi_a") as ckpt_a,
         TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_multi_b") as ckpt_b,
@@ -1449,8 +1579,10 @@ def test_merge_supports_multiple_model_chunks(tmp_path_dist_ckpt, process_group)
         )
         loaded = dist_checkpointing.load(_multi_chunk_template(), str(result.output_dir))
 
+        assert result.averaged_tensors == 3
         assert torch.allclose(loaded["model0"]["weight"], torch.full((2, 2), 4.0))
         assert torch.allclose(loaded["model1"]["weight"], torch.full((2, 2), 5.0))
+        assert torch.allclose(loaded["model2"]["weight"], torch.full((2, 2), 6.0))
 
 
 def test_merge_save_dtype_policy(tmp_path_dist_ckpt, process_group):
@@ -1514,7 +1646,10 @@ def test_merge_accumulates_fp16_inputs_in_fp32(tmp_path_dist_ckpt, process_group
         assert torch.allclose(loaded["model"]["weight"], torch.full((2, 2), 2048.5))
 
 
-def test_merge_rejects_dtype_mismatch_with_same_policy(tmp_path_dist_ckpt, process_group):
+@pytest.mark.parametrize("save_dtype", ["same", "float32", "bfloat16", "float16"])
+def test_merge_rejects_dtype_mismatch_for_all_save_dtype_policies(
+    tmp_path_dist_ckpt, process_group, save_dtype
+):
     with (
         TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_dtype_mismatch_a") as ckpt_a,
         TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_dtype_mismatch_b") as ckpt_b,
@@ -1528,7 +1663,7 @@ def test_merge_rejects_dtype_mismatch_with_same_policy(tmp_path_dist_ckpt, proce
                 [ckpt_a, ckpt_b],
                 [0.5, 0.5],
                 output_root / "merged",
-                save_dtype="same",
+                save_dtype=save_dtype,
             )
 
 
