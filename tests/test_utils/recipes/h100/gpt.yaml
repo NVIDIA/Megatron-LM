@@ -65,11 +65,11 @@ products:
   - test_case: [gpt3_mcore_tp1_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather]
     products:
       - environment: [dev]
-        scope: [L4]
+        scope: [L3]
         cadence: [nightly]
         platforms: [dgx_h100]
       - environment: [lts]
-        scope: [L4]
+        scope: [L3]
         cadence: [nightly]
   - test_case: [gpt3_mcore_tp1_pp2]
     products:
@@ -124,7 +124,7 @@ products:
   - test_case: [gpt3_mcore_te_tp1_pp1_dist_optimizer_no_mmap_bin_files]
     products:
       - environment: [dev]
-        scope: [L3]
+        scope: [L1, L2]
         platforms: [dgx_h100]
       - environment: [lts]
         scope: [L3]
@@ -132,7 +132,7 @@ products:
   - test_case: [gpt3_mcore_te_tp1_pp1_dist_optimizer_fim_dataset]
     products:
       - environment: [dev]
-        scope: [L3]
+        scope: [L1, L2]
         platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp1_pp1_resume_torch_dist_dist_optimizer]
     products:
@@ -145,7 +145,7 @@ products:
   - test_case: [gpt3_mcore_te_tp1_pp1_resume_torch_dist_uniform_full_recompute]
     products:
       - environment: [dev]
-        scope: [L3]
+        scope: [L1, L2]
         platforms: [dgx_h100]
       - environment: [lts]
         scope: [L3]
@@ -159,7 +159,7 @@ products:
   - test_case: [gpt3_mcore_te_tp1_pp2_resume_torch_dist_rope_embeddings]
     products:
       - environment: [dev]
-        scope: [L3]
+        scope: [L1, L2]
         platforms: [dgx_h100]
       # - environment: [lts]
       #   scope: [nightly] # outdated TE: #501
@@ -524,7 +524,7 @@ products:
   - test_case: [gpt3_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_param_gather_overlap_optimizer]
     products:
       - environment: [lts]
-        scope: [L2]
+        scope: [L3]
         cadence: [nightly]
       - environment: [dev]
         scope: [L1, L0]
@@ -535,12 +535,12 @@ products:
         scope: [L1]
         platforms: [dgx_h100]
       - environment: [lts]
-        scope: [L2]
+        scope: [L3]
         cadence: [nightly]
   - test_case: [gpt3_mcore_te_tp4_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather]
     products:
       - environment: [lts]
-        scope: [L2]
+        scope: [L3]
         cadence: [nightly]
       - environment: [dev]
         scope: [L1, L0]
@@ -551,18 +551,18 @@ products:
         scope: [L1]
         platforms: [dgx_h100]
       - environment: [lts]
-        scope: [L2]
+        scope: [L3]
         cadence: [nightly]
   - test_case: [gpt3_weekly_mcore_tp2_pp2_current_scaling_native_fp8_tp_pp_sp_tp_overlap]
     products:
       - environment: [dev]
-        scope: [L3]
+        scope: [L4]
         cadence: [weekly]
         platforms: [dgx_h100]
   - test_case: [gpt3_weekly_mcore_tp4_cp2_current_scaling_native_fp8_tp_sp_cp_tp_overlap]
     products:
       - environment: [dev]
-        scope: [L3]
+        scope: [L4]
         cadence: [weekly]
         platforms: [dgx_h100]
   # - test_case: [gpt3_mcore_tp2_pp2_resume_torch_dist_uninstall_te]

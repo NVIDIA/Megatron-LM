@@ -73,13 +73,13 @@ products:
   - test_case: [gpt3_mcore_tp1_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather]
     products:
       - environment: [dev]
-        scope: [L4]
+        scope: [L3]
         cadence: [nightly]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_tp1_pp2]
     products:
       - environment: [dev]
-        scope: [L4]
+        scope: [L3]
         cadence: [nightly]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_tp1_pp2_resume_torch_dist]
@@ -129,7 +129,7 @@ products:
   - test_case: [gpt3_mcore_te_tp1_pp1_resume_torch_dist_dist_optimizer]
     products:
       - environment: [dev]
-        scope: [L3]
+        scope: [L2]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp1_pp1_resume_torch_dist_uniform_full_recompute]
     products:
@@ -305,7 +305,7 @@ products:
   - test_case: [gpt3_mcore_te_tp2_pp1_gdn]
     products:
       - environment: [dev]
-        scope: [L3]
+        scope: [L2]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp2_pp2_mla]
     products:
@@ -395,7 +395,7 @@ products:
   - test_case: [gpt3_mcore_te_tp4_pp1_dist_optimizer_overlap_grad_reduce_param_gather]
     products:
       - environment: [dev]
-        scope: [L2]
+        scope: [L3]
         cadence: [nightly]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp4_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather]
@@ -406,18 +406,18 @@ products:
   - test_case: [gpt3_mcore_te_tp4_pp2_resume_torch_dist_reshard_8x1xNone]
     products:
       - environment: [dev]
-        scope: [L2]
+        scope: [L3]
         cadence: [nightly]
         platforms: [dgx_gb200]
   - test_case: [gpt3_weekly_mcore_tp2_pp2_current_scaling_native_fp8_tp_pp_sp_tp_overlap]
     products:
       - environment: [dev]
-        scope: [L3]
+        scope: [L4]
         cadence: [weekly]
         platforms: [dgx_gb200]
   - test_case: [gpt3_weekly_mcore_tp4_cp2_current_scaling_native_fp8_tp_sp_cp_tp_overlap]
     products:
       - environment: [dev]
-        scope: [L3]
+        scope: [L4]
         cadence: [weekly]
         platforms: [dgx_gb200]
