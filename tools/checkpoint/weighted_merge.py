@@ -95,7 +95,6 @@ METADATA_SAME_LAYOUT_UNPREFIXED_MODEL_ROOTS = (
 __all__ = (
     "WeightedMergeError",
     "MergeTimings",
-    "MergeMemoryEstimate",
     "MergeResult",
     "checkpoint_coefficients",
     "merge_same_layout_dcp_metadata_checkpoints",
@@ -119,14 +118,6 @@ class MergeTimings:
 
 
 @dataclass(frozen=True)
-class MergeMemoryEstimate:
-    """Merge inventory summary for the metadata-driven merge path."""
-
-    mergeable_tensors: int = 0
-    extra_state_entries: int = 0
-
-
-@dataclass(frozen=True)
 class MergeResult:
     """Result metadata returned after a successful merge."""
 
@@ -145,7 +136,6 @@ class MergeResult:
     world_size: int = 1
     rank: int = 0
     implementation_mode: str = METADATA_SAME_LAYOUT_MODE
-    memory_estimate: MergeMemoryEstimate = MergeMemoryEstimate()
     balance_rank_work: bool = False
     plan_tensor_bytes_by_rank: tuple[int, ...] = ()
     plan_tensor_chunks_by_rank: tuple[int, ...] = ()
@@ -214,8 +204,6 @@ class _WeightedMergeDirectOutputSavePlanner(SavePlanner):
         self.extra_state_source_index = extra_state_source_index
         self.load_time = 0.0
         self.accumulation_time = 0.0
-        self.resolved_tensor_count = 0
-        self.max_resolved_output_tensor_bytes = 0
         self._write_spec_by_index = {
             (spec.sharded_key, spec.global_offsets, spec.chunk_shape): spec
             for spec in write_specs
@@ -274,11 +262,6 @@ class _WeightedMergeDirectOutputSavePlanner(SavePlanner):
             output = self._resolve_extra_state(spec)
         else:
             output = self._resolve_merged_chunk(spec)
-        self.resolved_tensor_count += 1
-        self.max_resolved_output_tensor_bytes = max(
-            self.max_resolved_output_tensor_bytes,
-            int(output.numel() * output.element_size()),
-        )
         return output
 
     @staticmethod
@@ -920,10 +903,7 @@ def _multi_path_state_dict(
     return state_dict
 
 
-def _path_label(path: tuple[str | int, ...], leaf: Any = None) -> str:
-    key = getattr(leaf, "key", None)
-    if key:
-        return str(key)
+def _path_label(path: tuple[str | int, ...]) -> str:
     return ".".join(str(part) for part in path)
 
 
@@ -1641,10 +1621,6 @@ def merge_same_layout_dcp_metadata_checkpoints(
         input_count=len(resolved_input_dirs),
         balance_rank_work=balance_rank_work,
     )
-    memory_estimate = MergeMemoryEstimate(
-        mergeable_tensors=work_plan.merge_keys,
-        extra_state_entries=work_plan.extra_state_keys,
-    )
     discovery_time = time.perf_counter() - discovery_start
 
     _print_rank_0(
@@ -1783,7 +1759,6 @@ def merge_same_layout_dcp_metadata_checkpoints(
         world_size=world_size,
         rank=rank,
         implementation_mode=METADATA_SAME_LAYOUT_MODE,
-        memory_estimate=memory_estimate,
         balance_rank_work=balance_rank_work,
         plan_tensor_bytes_by_rank=work_plan.tensor_bytes_by_rank,
         plan_tensor_chunks_by_rank=work_plan.tensor_chunks_by_rank,
