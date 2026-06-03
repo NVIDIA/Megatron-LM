@@ -24,7 +24,12 @@ from ..distributed.param_and_grad_buffer import _ParamAndGradBuffer
 from ..transformer.module import MegatronModule
 from ..utils import get_model_config, get_pg_rank, get_pg_size, is_te_min_version, log_single_rank
 from .distrib_optimizer import DistributedOptimizer
-from .emerging_optimizers import _EMERGING_OPTIMIZERS, _create_emerging_optimizer
+from .emerging_optimizers import (
+    _EMERGING_OPTIMIZERS,
+    HAVE_EMERGING_OPTIMIZERS,
+    _create_emerging_optimizer,
+    _get_qkv_split_shapes,
+)
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer, is_managed_by_layer_wise_optimizer
 from .optimizer import (
@@ -68,19 +73,6 @@ except ImportError:
         from torch.optim import AdamW as Adam
 
         USING_PYTORCH_OPTIMIZER = True
-
-try:
-    from importlib.metadata import PackageNotFoundError
-    from importlib.metadata import version as _pkg_version
-
-    _eo_ver = tuple(int(x) for x in _pkg_version('emerging-optimizers').split('.')[:2])
-except (ImportError, PackageNotFoundError):
-    _eo_ver = (0, 0)
-
-HAVE_EMERGING_OPTIMIZERS = _eo_ver >= (0, 2)
-
-if HAVE_EMERGING_OPTIMIZERS:
-    from emerging_optimizers.scalar_optimizers import Lion
 
 
 logger = logging.getLogger(__name__)
@@ -772,6 +764,7 @@ def _get_megatron_emerging_optimizer(
 
     # Tag parameters with optimizer-specific attributes (expert_tp, is_qkv).
     for model_chunk in model_chunks:
+        qkv_split_shapes = None
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
@@ -779,7 +772,18 @@ def _get_megatron_emerging_optimizer(
                 param.expert_tp = True
             # TODO(deyuf): support MLA
             if 'linear_qkv.weight' in name and len(param.shape) == 2:
-                param.is_qkv = True
+                if qkv_split_shapes is None:
+                    qkv_split_shapes = _get_qkv_split_shapes(model_chunk.config)
+                if param.shape[0] % sum(qkv_split_shapes) == 0:
+                    param.is_qkv = True
+                    param.qkv_split_shapes = qkv_split_shapes
+                else:
+                    log_single_rank(
+                        logger,
+                        logging.DEBUG,
+                        f"Emerging optimizer QKV split skipped for {name}: "
+                        f"shape={tuple(param.shape)}, split_shapes={qkv_split_shapes}",
+                    )
 
     # Apply optimizer-specific default param overrides (e.g. muon: non-linear -> adam).
     config_overrides.update(_EMERGING_OPTIMIZERS[eopt_name].default_param_overrides)
