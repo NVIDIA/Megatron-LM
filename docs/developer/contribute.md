@@ -34,7 +34,7 @@ File any bugs you find, keeping the following in mind:
 
 - Format new code in a style that is consistent with the file being changed. Megatron-LM doesn't (yet) have a style guide or enforced formatting.
 - Split your changes into separate, atomic commits, that is, a commit per feature or fix.
-- Make sure your commits are rebased on the `master` branch.
+- Make sure your commits are rebased on the `main` branch.
 - Write the commit message subject line in the imperative mood ("Change the default argument for X", not "Changed the default argument for X").
 - Write your commit messages in proper English, with care and punctuation.
 - Check the spelling of your code, comments, and commit messages.
