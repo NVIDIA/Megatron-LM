@@ -374,6 +374,8 @@ class LinearWithFrozenWeight(torch.autograd.Function):
         """Backward with frozen weight."""
         (weight,) = ctx.saved_tensors
         if grad_output.dim() > 2:
+            # Work around PyTorch matmul not folding some size-1 leading dims to mm.
+            # Remove this once https://github.com/pytorch/pytorch/issues/186148 is fixed.
             grad_output_2d = grad_output.reshape(-1, grad_output.size(-1))
             grad_input = grad_output_2d.matmul(weight)
             grad_input = grad_input.reshape(*grad_output.shape[:-1], weight.size(1))
