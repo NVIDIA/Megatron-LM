@@ -175,8 +175,9 @@ def _cutile_supports_current_device() -> bool:
         return _CUTILE_DEVICE_SUPPORT_CACHE
 
     if not torch.cuda.is_available():
-        _CUTILE_DEVICE_SUPPORT_CACHE = True
-        return True
+        _CUTILE_DEVICE_SUPPORT_ERROR = "CUDA is not available"
+        _CUTILE_DEVICE_SUPPORT_CACHE = False
+        return False
 
     major, minor = torch.cuda.get_device_capability()
     arch = f"sm_{major}{minor}"
@@ -339,7 +340,7 @@ if _TRITON_AVAILABLE:
         tl.store(grad_inp_ptr + mat_ptrs, grad.to(grad_inp_ptr.dtype.element_ty))
 
     def _triton_sinkhorn_fwd(
-        input_logits: Tensor, num_iterations: int, eps: float = 1e-8
+        input_logits: Tensor, num_iterations: int, eps: float = 1e-6
     ) -> Tuple[Tensor, Tensor]:
         original_shape = input_logits.shape
         hc = original_shape[-1]
@@ -352,7 +353,7 @@ if _TRITON_AVAILABLE:
         return out.view(original_shape), M_init.view(original_shape)
 
     def _triton_sinkhorn_bwd(
-        grad_output: Tensor, M_init: Tensor, num_iterations: int, eps: float = 1e-8
+        grad_output: Tensor, M_init: Tensor, num_iterations: int, eps: float = 1e-6
     ) -> Tensor:
         original_shape = grad_output.shape
         hc = original_shape[-1]
@@ -744,6 +745,7 @@ if _TRITON_AVAILABLE:
             mask=mask_s[:, None],
         )
 
+        # N is expected to stay small for mHC, so this simple extraction is acceptable.
         nn_offs = tl.arange(0, N * N)
         for i in tl.static_range(N):
             for j in tl.static_range(N):
@@ -830,6 +832,22 @@ if _TRITON_AVAILABLE:
             g_x.view(s, b, C),
             g_bias,
         )
+
+_TRITON_IMPLS = (
+    {
+        "sinkhorn": triton_fused_sinkhorn,
+        "h_aggregate_fwd": _triton_h_aggregate_fwd,
+        "h_post_bda_fwd": _triton_h_post_bda_fwd,
+        "h_post_bda_bwd": _triton_h_post_bda_bwd,
+    }
+    if _TRITON_AVAILABLE
+    else {
+        "sinkhorn": None,
+        "h_aggregate_fwd": None,
+        "h_post_bda_fwd": None,
+        "h_post_bda_bwd": None,
+    }
+)
 
 
 # ============================================================================
@@ -928,7 +946,7 @@ if _CUTILE_AVAILABLE:
     _sinkhorn_bwd_best_cfg: dict = {}
 
     def _cutile_sinkhorn_fwd(
-        input_logits: Tensor, num_iterations: int, eps: float = 1e-8
+        input_logits: Tensor, num_iterations: int, eps: float = 1e-6
     ) -> Tuple[Tensor, Tensor]:
         original_shape = input_logits.shape
         hc = original_shape[-1]
@@ -975,7 +993,7 @@ if _CUTILE_AVAILABLE:
         return out.view(original_shape), M_init.view(original_shape)
 
     def _cutile_sinkhorn_bwd(
-        grad_output: Tensor, M_init: Tensor, num_iterations: int, eps: float = 1e-8
+        grad_output: Tensor, M_init: Tensor, num_iterations: int, eps: float = 1e-6
     ) -> Tensor:
         original_shape = grad_output.shape
         hc = original_shape[-1]
@@ -1778,8 +1796,8 @@ if _CUTILE_AVAILABLE:
                 _ct_proj_rms_fwd_kernel,
                 (x, weight, proj, norm, r, M, N, K, eps, tm, tn, tk, split_k),
             )
-            proj = proj.view(split_k, M, N).sum(dim=0).to(dtype=x.dtype)
-            norm = norm.view(split_k, M, 1).sum(dim=0).to(dtype=x.dtype)
+            proj = proj.view(split_k, M, N).to(torch.float32).sum(dim=0).to(dtype=x.dtype)
+            norm = norm.view(split_k, M, 1).to(torch.float32).sum(dim=0).to(dtype=x.dtype)
         else:
             # Autotune on first call for this shape.
             from types import SimpleNamespace
@@ -1799,8 +1817,8 @@ if _CUTILE_AVAILABLE:
                     _ct_proj_rms_fwd_kernel,
                     (x, weight, proj, norm, r, M, N, K, eps, tm, tn, tk, split_k),
                 )
-                proj = proj.view(split_k, M, N).sum(dim=0)
-                norm = norm.view(split_k, M, 1).sum(dim=0)
+                proj = proj.view(split_k, M, N).to(torch.float32).sum(dim=0).to(dtype=x.dtype)
+                norm = norm.view(split_k, M, 1).to(torch.float32).sum(dim=0).to(dtype=x.dtype)
             else:
                 mx_split_k = max(cfg.SPLIT_K for cfg in configs)
                 proj = torch.empty(mx_split_k * M, N, dtype=x.dtype, device=dev)
@@ -1861,8 +1879,12 @@ if _CUTILE_AVAILABLE:
                     ),
                 )
 
-                proj = proj.view(best.SPLIT_K, M, N).sum(dim=0)
-                norm = norm.view(best.SPLIT_K, M, 1).sum(dim=0)
+                proj = (
+                    proj.view(best.SPLIT_K, M, N).to(torch.float32).sum(dim=0).to(dtype=x.dtype)
+                )
+                norm = (
+                    norm.view(best.SPLIT_K, M, 1).to(torch.float32).sum(dim=0).to(dtype=x.dtype)
+                )
         norm = torch.sqrt(norm)
         r = 1.0 / (norm / math.sqrt(K) + eps)
         return proj, norm, r
@@ -3043,25 +3065,25 @@ def fused_add_3(a: Tensor, b: Tensor, c: Tensor) -> Tensor:
 def _get_triton_sinkhorn():
     if not _TRITON_AVAILABLE:
         return None
-    return globals().get("triton_fused_sinkhorn")
+    return _TRITON_IMPLS["sinkhorn"]
 
 
 def _get_triton_h_aggregate_fwd():
     if not _TRITON_AVAILABLE:
         return None
-    return globals().get("_triton_h_aggregate_fwd")
+    return _TRITON_IMPLS["h_aggregate_fwd"]
 
 
 def _get_triton_h_post_bda_fwd():
     if not _TRITON_AVAILABLE:
         return None
-    return globals().get("_triton_h_post_bda_fwd")
+    return _TRITON_IMPLS["h_post_bda_fwd"]
 
 
 def _get_triton_h_post_bda_bwd():
     if not _TRITON_AVAILABLE:
         return None
-    return globals().get("_triton_h_post_bda_bwd")
+    return _TRITON_IMPLS["h_post_bda_bwd"]
 
 
 def _torch_h_aggregate_bwd(grad_output: Tensor, x: Tensor, h_pre: Tensor) -> Tuple[Tensor, Tensor]:

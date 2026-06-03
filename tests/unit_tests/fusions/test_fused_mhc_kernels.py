@@ -15,6 +15,7 @@ import pytest
 import torch
 from torch import Tensor
 
+import megatron.core.fusions.fused_mhc_kernels as mhc_kernels
 from megatron.core.fusions.fused_mhc_kernels import is_cutile_available, is_triton_available
 from megatron.core.transformer.hyper_connection import (
     native_h_aggregate,
@@ -30,7 +31,9 @@ _require_triton = pytest.mark.skipif(not is_triton_available(), reason="Triton n
 
 
 @pytest.fixture(autouse=True)
-def _skip_without_cuda():
+def _skip_without_cuda(request):
+    if request.node.get_closest_marker("no_cuda_required"):
+        return
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
 
@@ -69,6 +72,18 @@ def _info():
     else:
         backend = "native"
     print(f"\n  [backend: {backend}]")
+
+
+@pytest.mark.no_cuda_required
+def test_cutile_unavailable_without_cuda(monkeypatch):
+    monkeypatch.setattr(mhc_kernels, "_CUTILE_AVAILABLE", True)
+    monkeypatch.setattr(mhc_kernels, "_CUTILE_DEVICE_SUPPORT_CACHE", None)
+    monkeypatch.setattr(mhc_kernels, "_CUTILE_DEVICE_SUPPORT_ERROR", None)
+    monkeypatch.setattr(mhc_kernels.torch.cuda, "is_available", lambda: False)
+
+    assert not mhc_kernels.is_cutile_available()
+    assert mhc_kernels._CUTILE_DEVICE_SUPPORT_CACHE is False
+    assert mhc_kernels._CUTILE_DEVICE_SUPPORT_ERROR == "CUDA is not available"
 
 
 # ============================================================================
