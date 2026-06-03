@@ -146,7 +146,11 @@ from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     is_linear_attention_variant,
 )
-from megatron.core.optimizer import get_mup_config_overrides, get_standard_config_overrides
+from megatron.core.optimizer import (
+    get_mup_config_overrides,
+    get_scaling_config_overrides,
+    get_standard_config_overrides,
+)
 from megatron.core.optimizer.optimizer import param_group_identifier_keys
 from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
 from megatron.core.optimizer.qk_clip import clip_qk
@@ -157,13 +161,14 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_last_stage,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.parameterization import allow_scaling_policy_eval, build_training_scaling_policy
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe.paged_stash import PagedStashRunner
 from megatron.core.distributed import DistributedDataParallelConfig, TorchFullyShardedDataParallelConfig
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
-from megatron.core.optimizer.optimizer import param_group_identifier_keys
+from megatron.core.optimizer.optimizer import get_param_group_identifier_sort_key
 
 from megatron.core.optimizer.qk_clip import clip_qk
 from megatron.core.utils import (
@@ -1009,7 +1014,7 @@ def preprocess_common_state_dict(common_state_dict):
             if "param_groups" not in inner_optimizer:
                 return
             param_groups = inner_optimizer["param_groups"]
-            key_fn = lambda pg: [pg[key] for key in param_group_identifier_keys]
+            key_fn = get_param_group_identifier_sort_key
             param_groups.sort(key=key_fn)
             inner_optimizer["param_groups"] = param_groups
 
@@ -1963,18 +1968,18 @@ def setup_model_and_optimizer(
     else:
         config, config_overrides = get_megatron_optimizer_config(args)
         config.timers = timers
-        if getattr(args, "use_mup", False):
-            model_config_source = (
-                unwrapped_model[0] if isinstance(unwrapped_model, list) else unwrapped_model
+        model_config_source = unwrapped_model[0] if isinstance(unwrapped_model, list) else unwrapped_model
+        model_config = get_model_config(model_config_source)
+        scaling_policy = build_training_scaling_policy(model_config, optimizer_type=config.optimizer)
+        if scaling_policy.enabled:
+            config_overrides = get_standard_config_overrides(
+                config=config, scaling_policy=scaling_policy
             )
-            model_config = get_model_config(model_config_source)
-            mup_overrides = get_mup_config_overrides(
-                config=config,
-                mup_width_mult=model_config.mup_width_mult,
-                optimizer_type=config.optimizer,
+            scaling_overrides = get_scaling_config_overrides(
+                config=config, scaling_policy=scaling_policy
             )
-            if mup_overrides:
-                config_overrides = {**(config_overrides or {}), **mup_overrides}
+            if scaling_overrides:
+                config_overrides = {**(config_overrides or {}), **scaling_overrides}
 
         optimizer = get_megatron_optimizer(
             config,
@@ -3823,6 +3828,10 @@ def train(
     return iteration, num_floating_point_operations_so_far
 
 
+def _should_allow_scaling_policy_eval(args):
+    return getattr(args, 'scaling_recipe', None) == 'depth_mup'
+
+
 def evaluate(
     forward_step_func,
     data_iterator,
@@ -3886,7 +3895,7 @@ def evaluate(
     if eval_iters is None:
         eval_iters = args.eval_iters
 
-    with torch.no_grad():
+    with allow_scaling_policy_eval(_should_allow_scaling_policy_eval(args)), torch.no_grad():
         iteration = 0
         if verbose:
             print_rank_0(f'Evaluating on {eval_iters * eval_batch_size} samples')

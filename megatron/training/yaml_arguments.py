@@ -16,8 +16,14 @@ from types import SimpleNamespace
 
 import torch.nn.functional as F
 
+from megatron.core.parameterization import build_scaling_context, sync_legacy_mup_fields
 from megatron.core.transformer import TransformerConfig, MLATransformerConfig
 from megatron.core.utils import get_torch_version, is_torch_min_version
+from megatron.training.arguments import (
+    validate_depth_mup_optimizer_support,
+    validate_muon_scalar_optimizer_support,
+    warn_deprecated_mup_aliases,
+)
 
 # Taken from https://stackoverflow.com/questions/65414773/parse-environment-variable-from-yaml-with-pyyaml
 # Allows for yaml to use environment variables
@@ -37,6 +43,24 @@ str_dtype_to_torch = {
     "float16" : torch.float16,
     "bfloat16" : torch.bfloat16
 }
+
+DEFAULTABLE_SCALING_FIELDS = {
+    'scaling_recipe',
+    'scaling_base_hidden_size',
+    'scaling_base_num_layers',
+    'scaling_base_head_dim',
+    'scaling_residual_branch_depth_power',
+    'scaling_hidden_lr_depth_power',
+    'scaling_block_out_proj_init_depth_power',
+    'use_mup',
+    'mup_width_mult',
+    'mup_base_hidden_size',
+    'mup_embedding_mult',
+    'mup_output_mult',
+    'mup_base_head_dim',
+    'mup_attn_scale_power',
+}
+
 
 def validate_yaml(args, defaults={}):
     
@@ -246,6 +270,13 @@ def validate_yaml(args, defaults={}):
         assert args.language_model.hidden_size % args.language_model.num_attention_heads == 0
         args.language_model.kv_channels = args.language_model.hidden_size // args.language_model.num_attention_heads
 
+    if getattr(args.language_model, 'mup_width_mult', 1.0) != 1.0:
+        args.language_model._mup_width_mult_explicit = True
+    warn_deprecated_mup_aliases(args.language_model)
+    sync_legacy_mup_fields(
+        args.language_model, build_scaling_context(args.language_model)
+    )
+
     #TODO: Implement arguments for encoder-decoder
     if args.seq_length is not None:
         assert args.encoder_seq_length is None
@@ -344,6 +375,10 @@ def validate_yaml(args, defaults={}):
     #TODO: Added as much of the global initialization requires the model parallel arguments
     args = SimpleNamespace(**args.__dict__, **args.model_parallel.__dict__)
     args = SimpleNamespace(**args.__dict__, **args.language_model.__dict__)
+    validate_depth_mup_optimizer_support(args)
+    validate_muon_scalar_optimizer_support(args)
+    warn_deprecated_mup_aliases(args)
+    sync_legacy_mup_fields(args, build_scaling_context(args))
     # For GPT Layer spec in pretrain_gpt
     args.num_experts = args.language_model.num_moe_experts
 
@@ -380,6 +415,13 @@ def core_config_from_args(args, dataclass=TransformerConfig):
     for f in dataclasses.fields(dataclass):
         if hasattr(args, f.name):
             kw_args[f.name] = getattr(args, f.name)
+        elif f.name in DEFAULTABLE_SCALING_FIELDS:
+            if f.default is not dataclasses.MISSING:
+                kw_args[f.name] = f.default
+            elif f.default_factory is not dataclasses.MISSING:
+                kw_args[f.name] = f.default_factory()
+            else:
+                raise Exception(f"Missing argument {f.name} for {str(dataclass)} config")
         else:
             raise Exception(f"Missing argument {f.name} for {str(dataclass)} config")
     return kw_args
@@ -438,4 +480,3 @@ def load_yaml(yaml_path):
             getattr(config_namespace, "global_batch_size", None) is not None
         )
         return config_namespace
-

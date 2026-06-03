@@ -17,6 +17,10 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.parameterization import (
+    build_model_scaling_policy,
+    is_scaling_policy_eval_allowed,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope, LayerType
@@ -41,6 +45,19 @@ if TYPE_CHECKING:
     from megatron.core.inference.contexts import BaseInferenceContext
 
 logger = logging.getLogger(__name__)
+
+
+def _get_mlp_builder_module(mlp_builder: Any, te_fused_mlp_cls: Optional[type] = None):
+    """Return the MLP module class hidden behind ModuleSpec or classmethod partial builders."""
+    if isinstance(mlp_builder, ModuleSpec):
+        return mlp_builder.module
+    if isinstance(mlp_builder, functools.partial):
+        owner = getattr(mlp_builder.func, "__self__", None)
+        if owner is MLP:
+            return MLP
+        if te_fused_mlp_cls is not None and owner is te_fused_mlp_cls:
+            return te_fused_mlp_cls
+    return None
 
 
 def get_transformer_layer_offset(
@@ -312,6 +329,20 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         Args:
             name (str | None): module instance name passed top-down from its paranet module
         """
+        cross_attention_spec = submodules.cross_attention
+        uses_cross_attention = not (
+            cross_attention_spec is IdentityOp
+            or (
+                isinstance(cross_attention_spec, ModuleSpec)
+                and cross_attention_spec.module is IdentityOp
+            )
+        )
+        if config.scaling_recipe == 'depth_mup' and uses_cross_attention:
+            raise NotImplementedError(
+                "scaling_recipe='depth_mup' currently supports dense GPT-style residual "
+                "self-attention-only Transformer blocks. Cross-attention is out of scope for v1."
+            )
+
         self.submodules_config = submodules
         super().__init__(config=config, vp_stage=vp_stage)
 
@@ -335,6 +366,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             )
         self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
         self.is_mtp_layer = is_mtp_layer
+        self.model_scaling_policy = build_model_scaling_policy(config)
 
         # [Module 1: Input Layernorm] Optional Layernorm on the input data
         # TODO: add pytorch only layernorm
@@ -403,8 +435,22 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # MLP expects tp_group but MoELayer expects pg_collection to be passed in.
         # We can change MLP to accept pg_collection but it makes the logic implicit
         # The conditional below is to make the logic explicit
-        # if submodules.mlp is not a ModuleSpec,we dont have to handle passing additional kwargs
-        if isinstance(submodules.mlp, ModuleSpec) and submodules.mlp.module in (MLP, TEFusedMLP):
+        # Dense GPT specs usually pass partial(MLP.as_mlp_submodule, ...), while some tests
+        # and extensions still use ModuleSpec. Both forms need the same depth-MuP handling.
+        additional_mlp_kwargs = {}
+        mlp_module = _get_mlp_builder_module(submodules.mlp, TEFusedMLP)
+        if mlp_module is MLP:
+            additional_mlp_kwargs["apply_block_output_init_scaling"] = True
+        elif (
+            TEFusedMLP is not None
+            and mlp_module is TEFusedMLP
+            and self.model_scaling_policy.dense_block_out_proj_init_multiplier != 1.0
+        ):
+            raise NotImplementedError(
+                "Dense block output-projection init scaling is not implemented for "
+                "TEFusedMLP. Use unfused MLP or disable the depth init hook."
+            )
+        if isinstance(submodules.mlp, ModuleSpec) and mlp_module in (MLP, TEFusedMLP):
             submodules.mlp = functools.partial(
                 submodules.mlp.module.as_mlp_submodule,
                 submodules=submodules.mlp.submodules,
@@ -422,6 +468,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             pg_collection=pg_collection,
             is_mtp_layer=self.is_mtp_layer,
             name=(name + ".mlp") if name is not None else None,
+            **additional_mlp_kwargs,
         )
         if hasattr(self.mlp, 'set_layer_number'):
             self.mlp.set_layer_number(self.layer_number)
@@ -673,6 +720,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="self_attn_bda")
+        attention_output_with_bias = self._scale_dense_residual_branch_output(
+            attention_output_with_bias,
+            branch_name="self attention",
+            using_fused_tp_inference_kernel=using_fused_tp_inference_kernel,
+        )
         if using_fused_tp_inference_kernel:
             # In inference optimized transformer layer, there is no bias and dropout
             # The remaining residual add is already handled inside the
@@ -744,6 +796,34 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             padding_mask=kwargs.get("padding_mask", None),
         )
         return output, context
+
+    def _scale_dense_residual_branch_output(
+        self,
+        output_with_bias: tuple[Tensor, Tensor | None],
+        *,
+        branch_name: str,
+        using_fused_tp_inference_kernel: bool,
+        apply_depth_hook: bool = True,
+    ) -> tuple[Tensor, Tensor | None]:
+        if not apply_depth_hook:
+            return output_with_bias
+        if self.model_scaling_policy.context.is_depth_mup and not getattr(self, 'training', True):
+            if using_fused_tp_inference_kernel:
+                raise NotImplementedError(
+                    f"Residual-branch scaling is not supported with fused TP inference for {branch_name}."
+                )
+            if not is_scaling_policy_eval_allowed():
+                raise NotImplementedError(
+                    f"Residual-branch scaling is not supported during inference for {branch_name}. "
+                    "Validation loss must run inside Megatron's scaling-policy eval context."
+                )
+        if self.model_scaling_policy.residual_branch_multiplier == 1.0:
+            return output_with_bias
+        if using_fused_tp_inference_kernel:
+            raise NotImplementedError(
+                f"Residual-branch scaling is not supported with fused TP inference for {branch_name}."
+            )
+        return self.model_scaling_policy.scale_residual_branch_output(output_with_bias)
 
     def _forward_pre_mlp_layernorm(self, hidden_states: Tensor):
         from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
@@ -922,6 +1002,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="mlp_bda")
+        mlp_output_with_bias = self._scale_dense_residual_branch_output(
+            mlp_output_with_bias,
+            branch_name="mlp",
+            using_fused_tp_inference_kernel=using_fused_tp_inference_kernel,
+            apply_depth_hook=not self.is_moe_layer,
+        )
         if using_fused_tp_inference_kernel:
             # In inference optimized transformer layer, there is no bias and dropout
             # The remaining residual add is already handled inside the
