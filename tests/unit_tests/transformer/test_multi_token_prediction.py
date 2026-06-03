@@ -25,6 +25,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.multi_token_prediction import (
     MTPLossLoggingHelper,
     MultiTokenPredictionBlock,
+    process_mtp_loss,
     roll_tensor,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -674,6 +675,112 @@ class TestMultiTokenPrediction:
 
         for name, param in gpt_model[0].named_parameters():
             assert param.main_grad is not None, f"Gradient missing for {name}"
+
+    def test_roll_tensor_none_input(self):
+        """Test that roll_tensor returns (None, None) when given None input."""
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+        result, sum_val = roll_tensor(None, shifts=-1, dims=-1)
+        assert result is None
+        assert sum_val is None
+        Utils.destroy_model_parallel()
+
+    def test_roll_tensor_shifts_left_and_zeroes_last(self):
+        """Test that roll_tensor(-1) shifts left and zeroes the last position.
+
+        This is the primitive used to derive MTP labels from input_ids when labels
+        are not provided (RL training): label[i] = input_id[i+1], last position zeroed.
+        The end-to-end derivation is covered by process_mtp_loss (see input_ids path).
+        """
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+        # Simulate input_ids [batch=2, seq=5]
+        input_ids = torch.tensor(
+            [[10, 20, 30, 40, 50], [60, 70, 80, 90, 100]], dtype=torch.int64
+        ).cuda()
+        rolled, _ = roll_tensor(input_ids, shifts=-1, dims=-1)
+
+        # Expected: each row shifted left by 1, last element zeroed.
+        expected = torch.tensor(
+            [[20, 30, 40, 50, 0], [70, 80, 90, 100, 0]], dtype=torch.int64
+        ).cuda()
+        assert torch.equal(rolled, expected)
+        Utils.destroy_model_parallel()
+
+    def test_process_mtp_loss_skips_when_no_labels_and_no_input_ids(self):
+        """When labels and input_ids are both None, MTP loss is skipped (early return)."""
+        config = TransformerConfig(
+            hidden_size=8, num_layers=2, num_attention_heads=2, mtp_num_layers=1
+        )
+        hidden_states = torch.ones(2, 1, 4)
+        called = {'value': False}
+
+        def output_layer(hidden, weight=None, runtime_gather_output=None):
+            return hidden.clone(), None
+
+        def compute_language_model_loss(mtp_labels, mtp_logits):
+            called['value'] = True
+            return torch.ones_like(mtp_labels, dtype=mtp_logits.dtype)
+
+        out = process_mtp_loss(
+            hidden_states=hidden_states,
+            labels=None,
+            loss_mask=None,
+            output_layer=output_layer,
+            output_weight=None,
+            runtime_gather_output=None,
+            is_training=False,
+            compute_language_model_loss=compute_language_model_loss,
+            config=config,
+            cp_group=None,
+            packed_seq_params=None,
+            input_ids=None,
+        )
+
+        # First chunk is returned unchanged and the loss is never computed.
+        assert not called['value']
+        assert torch.equal(out, torch.chunk(hidden_states, 2, dim=0)[0])
+
+    def test_process_mtp_loss_derives_labels_from_input_ids(self):
+        """When labels is None (RL), labels are derived from input_ids by rolling left.
+
+        process_mtp_loss rolls once to build the SFT-format labels (label[i] =
+        input_id[i+1]) and once more per MTP layer, so MTP head 0 targets input_id[i+2].
+        The loss_mask is rolled in lockstep so the fabricated trailing label is masked.
+        """
+        config = TransformerConfig(
+            hidden_size=8, num_layers=2, num_attention_heads=2, mtp_num_layers=1
+        )
+        # hidden_states is chunked into (1 + mtp_num_layers) along dim 0.
+        hidden_states = torch.ones(2, 1, 5)
+        input_ids = torch.tensor([[10, 20, 30, 40, 50]], dtype=torch.long)
+        seen = {'labels': None, 'masked_loss': None}
+
+        def output_layer(hidden, weight=None, runtime_gather_output=None):
+            return hidden.clone(), None
+
+        def compute_language_model_loss(mtp_labels, mtp_logits):
+            seen['labels'] = mtp_labels.clone()
+            # Per-position loss of 1.0 so loss_mask * loss exposes the active mask.
+            return torch.ones_like(mtp_labels, dtype=torch.float32)
+
+        process_mtp_loss(
+            hidden_states=hidden_states,
+            labels=None,
+            loss_mask=None,
+            output_layer=output_layer,
+            output_weight=None,
+            runtime_gather_output=None,
+            is_training=False,
+            compute_language_model_loss=compute_language_model_loss,
+            config=config,
+            cp_group=None,
+            packed_seq_params=None,
+            input_ids=input_ids,
+        )
+
+        # input_ids rolled twice (once to SFT format, once in the MTP layer loop):
+        # [10,20,30,40,50] -> [20,30,40,50,0] -> [30,40,50,0,0].
+        assert seen['labels'] is not None, "loss should be computed in RL mode"
+        assert torch.equal(seen['labels'], torch.tensor([[30, 40, 50, 0, 0]], dtype=torch.long))
 
     @pytest.mark.parametrize("cp", [1, 2])
     def test_roll_tensor_with_packed_sequences(self, cp):

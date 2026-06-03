@@ -546,6 +546,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             if in_inference_mode or is_spec_decode:
                 self._decoder_hidden_states_cache = hidden_states
             else:
+                # For RL (labels is None), process_mtp_loss derives labels from
+                # input_ids to match the SFT label format.
                 hidden_states = process_mtp_loss(
                     hidden_states=hidden_states,
                     labels=labels,
@@ -559,6 +561,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     cp_group=self.pg_collection.cp,
                     packed_seq_params=packed_seq_params,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
+                    input_ids=input_ids,
                 )
         sequence_parallel_override = False
         if (
