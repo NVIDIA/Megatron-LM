@@ -1693,11 +1693,6 @@ def merge_same_layout_dcp_metadata_checkpoints(
     _reject_existing_atomic_overwrite(
         output_dir, overwrite_output=overwrite_output, atomic_output=atomic_output
     )
-    if not atomic_output and output_dir.exists() and not overwrite_output:
-        raise WeightedMergeError(
-            f"Output directory already exists: {output_dir}. "
-            "Use --overwrite-merge-output to replace it."
-        )
 
     metadata_snapshots = [
         _read_public_dcp_metadata(
@@ -1747,18 +1742,7 @@ def merge_same_layout_dcp_metadata_checkpoints(
             flush=True,
         )
 
-    temporary_output_dir = (
-        _prepare_temporary_output_dir(output_dir, overwrite_output)
-        if atomic_output
-        else output_dir
-    )
-    if overwrite_output and not atomic_output and output_dir.exists():
-        _run_rank0_filesystem_op(
-            f"Removing existing output directory {output_dir}",
-            lambda: shutil.rmtree(output_dir),
-        )
-        if dist.is_initialized():
-            dist.barrier()
+    temporary_output_dir = _prepare_temporary_output_dir(output_dir, overwrite_output)
 
     base_common_state = dist_checkpointing.load_common_state_dict(str(resolved_input_dirs[0]))
     common_state = _prepare_common_state(base_common_state, output_iteration)
@@ -1800,11 +1784,11 @@ def merge_same_layout_dcp_metadata_checkpoints(
         per_thread_copy_ahead=0,
     )
 
-    save_start = time.perf_counter()
     bytes_read = sum(
         _directory_size_for_accounting(checkpoint_dir, byte_accounting)
         for checkpoint_dir in resolved_input_dirs
     )
+    save_start = time.perf_counter()
     try:
         torch_dcp.save(
             {},
@@ -1833,12 +1817,11 @@ def merge_same_layout_dcp_metadata_checkpoints(
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
 
-    if atomic_output:
-        _publish_temporary_output_dir(
-            temporary_output_dir, output_dir, overwrite_output=overwrite_output
-        )
-        if dist.is_initialized():
-            dist.barrier()
+    _publish_temporary_output_dir(
+        temporary_output_dir, output_dir, overwrite_output=overwrite_output
+    )
+    if dist.is_initialized():
+        dist.barrier()
     if output_iteration is not None and write_latest:
         _run_rank0_filesystem_op(
             f"Writing {LATEST_CHECKPOINTED_ITERATION}",
@@ -2122,11 +2105,11 @@ def _run_metadata_same_layout_cli(args: argparse.Namespace) -> MergeResult:
 
 def _format_bytes(num_bytes: int) -> str:
     value = float(num_bytes)
-    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
-        if value < 1024 or unit == "TiB":
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if value < 1024:
             return f"{value:.2f} {unit}"
         value /= 1024
-    return f"{num_bytes} B"
+    return f"{value:.2f} TiB"
 
 
 def _format_bandwidth(num_bytes: int, seconds: float) -> str:
