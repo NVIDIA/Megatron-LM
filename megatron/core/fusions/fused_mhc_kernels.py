@@ -1766,7 +1766,7 @@ if _CUTILE_AVAILABLE:
     _proj_rms_fwd_best_cfg: dict = {}
 
     def _cutile_proj_rms_fwd(
-        x: Tensor, weight: Tensor, eps: float = 1e-8
+        x: Tensor, weight: Tensor, eps: float = 1e-6
     ) -> Tuple[Tensor, Tensor, Tensor]:
         M, K = x.shape
         N = weight.shape[0]
@@ -2183,7 +2183,7 @@ if _CUTILE_AVAILABLE:
         x: Tensor,
         weight: Tensor,
         norm: Tensor,
-        eps: float = 1e-8,
+        eps: float = 1e-6,
     ) -> Tuple[Tensor, Tensor]:
         M, K = x.shape
         N = weight.shape[0]
