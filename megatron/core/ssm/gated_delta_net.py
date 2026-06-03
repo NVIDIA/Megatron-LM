@@ -139,24 +139,6 @@ class GatedDeltaNet(MegatronModule):
         self.qk_dim_local_tp = self.qk_dim // self.tp_size
         self.v_dim_local_tp = self.v_dim // self.tp_size
 
-        if self.cp_size > 1:
-            head_perm = _build_head_perm_for_split_sections(
-                [
-                    self.qk_dim_local_tp,
-                    self.qk_dim_local_tp,
-                    self.v_dim_local_tp,
-                    self.v_dim_local_tp,
-                    self.num_value_heads // self.tp_size,
-                    self.num_value_heads // self.tp_size,
-                ],
-                self.cp_size,
-                torch.cuda.current_device(),
-            )
-        else:
-            head_perm = None
-        # Registered as a non-persistent buffer to exclude it from state_dict
-        self.register_buffer("_thd_head_perm", head_perm, persistent=False)
-
         # Input projection (hidden_states -> q, k, v, gate, beta, alpha)
         # TODO: for now, output gate is forced for GDN.
         # We may remove this restriction in the future.
@@ -367,7 +349,19 @@ class GatedDeltaNet(MegatronModule):
         # CP All to All: CP to HP
         if self.cp_size > 1:
             # # Pre-permute head dim so a single unsectioned a2a is equivalent to per-section a2a.
-            qkvzba = qkvzba.index_select(-1, self._thd_head_perm)
+            head_perm = _build_head_perm_for_split_sections(
+                [
+                    self.qk_dim_local_tp,
+                    self.qk_dim_local_tp,
+                    self.v_dim_local_tp,
+                    self.v_dim_local_tp,
+                    self.num_value_heads // self.tp_size,
+                    self.num_value_heads // self.tp_size,
+                ],
+                self.pg_collection.cp.size(),
+                torch.cuda.current_device(),
+            )
+            qkvzba = qkvzba.index_select(-1, head_perm)
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
             qkvzba = tensor_a2a_cp2hp(
                 qkvzba,
