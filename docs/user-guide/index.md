@@ -22,6 +22,5 @@ msc_integration
 data-preparation
 training-examples
 parallelism-guide
-checkpoint-merge
 features/index
 ```
