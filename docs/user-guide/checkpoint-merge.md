@@ -55,7 +55,10 @@ rank than the others. Pass `--merge-balance-rank-work` to greedily bin-pack
 source DCP chunks across ranks. This preserves the original DCP chunk boundaries
 and source storage locality while avoiding rank-0 singleton-chunk skew. It does
 not add a chunk-size tuning parameter; the merge still writes the same logical
-checkpoint layout, only with a more even rank assignment during the save.
+checkpoint layout, only with a more even rank assignment during the save. Leave
+it off for source layouts that are already evenly assigned across ranks: in that
+case it cannot improve the planned byte balance and may be neutral or slower due
+to changed read/write ordering.
 
 When no process group is initialized, or the world size is one, the output is
 saved through public DCP with `no_dist=True`; with a world size greater than one
@@ -337,6 +340,8 @@ The same metadata-driven path is callable from Python. It initializes a gloo
 process group from `RANK`, `WORLD_SIZE`, `MASTER_ADDR`, and `MASTER_PORT` if one
 is not already active; in a plain single-process script it runs as rank 0 with
 world size 1.
+Pass `balance_rank_work=True` for the same source-chunk rank balancing exposed by
+the CLI's `--merge-balance-rank-work` flag.
 
 ```python
 from tools.checkpoint.weighted_merge import (
