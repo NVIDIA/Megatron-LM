@@ -1,10 +1,11 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 '''
-WORLD_SIZE=1 LOCAL_RANK=0 python -m pytest tests/unit_tests/models/test_mimo_model.py
+WORLD_SIZE=1 LOCAL_RANK=0 python -m pytest tests/unit_tests/models/mimo/test_mimo_model.py
 '''
 
 import math
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -724,3 +725,150 @@ class TestMimoModelNonColocated:
         assert captured['input_ids'] is None
         assert captured['decoder_input'] is None
         torch.testing.assert_close(captured['position_ids'], position_ids)
+
+
+class TestMimoModelFanoutHelpers:
+    """CPU-only coverage for bridge-fanout helper methods on ``MimoModel``."""
+
+    @staticmethod
+    def _stub_model(special_token_ids):
+        model = MimoModel.__new__(MimoModel)
+        model.special_token_ids = special_token_ids
+        # COLOCATED skips the fan-out DP assertion path; this fixture targets
+        # the metadata-tagging logic only.
+        model.role = SimpleNamespace(mode=ModuleLayout.COLOCATED)
+        return model
+
+    def test_attach_modality_split_sizes_tags_output_with_per_sample_counts(self):
+        model = self._stub_model({"images": 50257})
+        input_ids = torch.tensor([[50257, 50257, 1, 2], [50257, 1, 2, 3]])
+        output = torch.zeros(3, 8)
+
+        model._attach_modality_split_sizes(output, input_ids, "images")
+
+        assert output._mimo_bridge_split_sizes == [2, 1]
+
+    def test_attach_modality_split_sizes_skips_when_total_mismatches(self):
+        model = self._stub_model({"images": 50257})
+        input_ids = torch.tensor([[50257, 1], [1, 1]])
+        output = torch.zeros(5, 8)
+
+        model._attach_modality_split_sizes(output, input_ids, "images")
+
+        assert not hasattr(output, "_mimo_bridge_split_sizes")
+
+    def test_attach_modality_split_sizes_skips_when_token_counts_uniform(self):
+        model = self._stub_model({"images": 50257})
+        # Two samples, two image tokens each — uniform per-sample counts.
+        input_ids = torch.tensor([[50257, 50257, 1, 2], [50257, 50257, 3, 4]])
+        output = torch.zeros(4, 8)
+
+        model._attach_modality_split_sizes(output, input_ids, "images")
+
+        assert not hasattr(output, "_mimo_bridge_split_sizes")
+
+    def test_attach_modality_split_sizes_skips_for_single_sample_batch(self):
+        model = self._stub_model({"images": 50257})
+        input_ids = torch.tensor([[50257, 50257, 1]])
+        output = torch.zeros(2, 8)
+
+        model._attach_modality_split_sizes(output, input_ids, "images")
+
+        assert not hasattr(output, "_mimo_bridge_split_sizes")
+
+    def test_has_encoder_tokens_detects_presence_and_absence(self):
+        model = self._stub_model({"images": 50257, "audio": 50258})
+
+        assert model._has_encoder_tokens(torch.tensor([[50257, 1]]), "images") is True
+        assert model._has_encoder_tokens(torch.tensor([[1, 2]]), "images") is False
+        assert model._has_encoder_tokens(None, "images") is False
+        assert model._has_encoder_tokens(torch.tensor([[1]]), "unknown") is False
+
+    @staticmethod
+    def _stub_mimo_config(
+        *,
+        hidden_size=8,
+        language_dtype=torch.float32,
+        include_language_dtype=True,
+        modality_params=None,
+    ):
+        language_config = SimpleNamespace(hidden_size=hidden_size)
+        if include_language_dtype:
+            language_config.params_dtype = language_dtype
+        return SimpleNamespace(
+            language_model_spec=SimpleNamespace(params={'config': language_config}),
+            modality_submodules_spec={
+                "images": SimpleNamespace(params={} if modality_params is None else modality_params)
+            },
+        )
+
+    def test_set_input_tensor_unwraps_outer_list_and_forwards_to_language_model(self):
+        lm = MagicMock()
+        model = MimoModel.__new__(MimoModel)
+        model.language_model = lm
+        tensor = torch.zeros(2, 4)
+
+        model.set_input_tensor([tensor])
+
+        assert torch.equal(model.input_tensors, tensor)
+        lm.set_input_tensor.assert_called_once_with(tensor)
+
+    def test_set_input_tensor_dict_unwraps_single_element_value_lists(self):
+        model = MimoModel.__new__(MimoModel)
+        model.language_model = None
+        t_lang = torch.zeros(2, 4)
+        t_vision = torch.zeros(3, 4)
+
+        model.set_input_tensor({"language": [t_lang], "vision": t_vision})
+
+        assert torch.equal(model.input_tensors["language"], t_lang)
+        assert torch.equal(model.input_tensors["vision"], t_vision)
+
+    def test_empty_encoder_output_uses_language_dtype_without_modality_config(self, monkeypatch):
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
+        model = MimoModel.__new__(MimoModel)
+        model.mimo_config = self._stub_mimo_config(
+            hidden_size=8, language_dtype=torch.bfloat16, modality_params={}
+        )
+
+        output = model._empty_encoder_output("images")
+
+        assert output.shape == (0, 8)
+        assert output.dtype == torch.bfloat16
+        assert output.device.type == "cpu"
+        assert output.requires_grad
+
+    def test_empty_encoder_output_defaults_to_float32_without_language_dtype(self, monkeypatch):
+        monkeypatch.setattr(torch.cuda, "current_device", lambda: torch.device("cpu"))
+        model = MimoModel.__new__(MimoModel)
+        model.mimo_config = self._stub_mimo_config(
+            hidden_size=8, include_language_dtype=False, modality_params={}
+        )
+
+        output = model._empty_encoder_output("images")
+
+        assert output.shape == (0, 8)
+        assert output.dtype == torch.float32
+        assert output.device.type == "cpu"
+        assert output.requires_grad
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA for current_device")
+    def test_empty_encoder_output_uses_current_cuda_device(self):
+        model = MimoModel.__new__(MimoModel)
+        model.mimo_config = self._stub_mimo_config(hidden_size=8, language_dtype=torch.bfloat16)
+
+        output = model._empty_encoder_output("images")
+
+        assert output.shape == (0, 8)
+        assert output.dtype == torch.bfloat16
+        assert output.device.type == "cuda"
+        assert output.requires_grad
+
+    def test_empty_encoder_output_raises_when_hidden_size_missing(self):
+        model = MimoModel.__new__(MimoModel)
+        model.mimo_config = SimpleNamespace(
+            language_model_spec=SimpleNamespace(params={'config': SimpleNamespace()})
+        )
+
+        with pytest.raises(ValueError, match="hidden_size"):
+            model._empty_encoder_output("images")
