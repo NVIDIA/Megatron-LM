@@ -343,9 +343,11 @@ def hybrid_dsv4_stack_spec(config):
 
     def _wrap_dsv4_layer(compress_ratio=None):
         # Wrap the DSv4 attention in a hybrid TransformerLayer. When compress_ratio is given
-        # (the 'C'/'H' layer symbols), bake it into the attention params so the layer uses a
-        # fixed CSA(4)/HCA(128) ratio regardless of csa_compress_ratios; otherwise the layer
-        # reads its ratio from config.csa_compress_ratios (array-driven 'D' / GPT-parity path).
+        # (the 'C'/'H'/'W' layer symbols), bake it into the attention params so the layer uses a
+        # fixed CSA(4)/HCA(128)/window-only(0) ratio regardless of csa_compress_ratios; otherwise
+        # the layer reads its ratio from config.csa_compress_ratios (array-driven 'D' / GPT-parity
+        # path). compress_ratio=0 builds neither the compressor nor the top-k indexer, so the
+        # 'W' layer reuses the entire CSA/HCA code path as pure sliding-window attention.
         attn = dsv4_attention
         if compress_ratio is not None:
             attn = dataclasses.replace(
@@ -363,5 +365,6 @@ def hybrid_dsv4_stack_spec(config):
         dsa_layer=_wrap_dsv4_layer(),  # 'D': array-driven (or window) DSv4 attention
         csa_layer=_wrap_dsv4_layer(compress_ratio=4),  # 'C': CSA
         hca_layer=_wrap_dsv4_layer(compress_ratio=128),  # 'H': HCA
+        window_layer=_wrap_dsv4_layer(compress_ratio=0),  # 'W': sliding-window-only
     )
     return ModuleSpec(module=HybridStack, submodules=submodules)

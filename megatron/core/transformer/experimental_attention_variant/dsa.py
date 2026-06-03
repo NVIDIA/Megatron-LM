@@ -133,9 +133,7 @@ class DSAIndexerLossLoggingHelper:
             size_t = torch.tensor(
                 [local_size], device=torch.cuda.current_device(), dtype=torch.long
             )
-            torch.distributed.all_reduce(
-                size_t, op=torch.distributed.ReduceOp.MAX, group=pp_group
-            )
+            torch.distributed.all_reduce(size_t, op=torch.distributed.ReduceOp.MAX, group=pp_group)
             size = int(size_t.item())
             tracker["agreed_size"] = size
         if size == 0:

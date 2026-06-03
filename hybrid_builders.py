@@ -23,11 +23,11 @@ def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, 
     # GPT path). The hybrid config can reach here without that derivation applied, which breaks
     # the MLA up-proj / fused-rope contract (q head dim must equal qk_head_dim + qk_pos_emb_head
     # _dim == v_head_dim). Apply it for any DSv4 MLA attention: experimental_attention_variant
-    # == dsv4_hybrid, OR the layer pattern uses a DSv4 attention symbol (D/C/H). Idempotent.
+    # == dsv4_hybrid, OR the layer pattern uses a DSv4 attention symbol (D/C/H/W). Idempotent.
     _pattern = getattr(args, "hybrid_layer_pattern", None) or ""
     _uses_dsv4_attn = (
         getattr(args, "experimental_attention_variant", None) == "dsv4_hybrid"
-        or any(sym in _pattern for sym in ("C", "H"))
+        or any(sym in _pattern for sym in ("C", "H", "W"))
     )
     if _uses_dsv4_attn:
         derived = config.v_head_dim - config.qk_pos_emb_head_dim
@@ -39,10 +39,10 @@ def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, 
             )
             config.qk_head_dim = derived
             config.kv_lora_rank = derived
-        # 'C'/'H' layers carry their compress ratio via the spec, but array-driven 'D' layers
+        # 'C'/'H'/'W' layers carry their compress ratio via the spec, but array-driven 'D' layers
         # AND the indexer-loss logger (which counts ratio==4 layers) read
         # config.csa_compress_ratios. When not given explicitly, derive it from the pattern
-        # symbols (C->4, H->128, D/other->0) so the array is consistent with the symbols and
+        # symbols (C->4, H->128, W/D/other->0) so the array is consistent with the symbols and
         # the indexer loss is normalized correctly; pad MTP depths with 0. An explicit
         # --csa-compress-ratios is always respected.
         if config.csa_compress_ratios is None:

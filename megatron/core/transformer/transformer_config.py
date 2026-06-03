@@ -328,14 +328,8 @@ class TransformerConfig(ModelParallelConfig):
     """Sliding window size for compressed sparse attention."""
 
     csa_compress_ratios: Optional[List[int]] = None
-    """Per-layer compress ratios, e.g. [0, 0, 4, 128, 4, 128, ...]."""
-
-    csa_block_sizes: Optional[List[int]] = None
-    """Per-layer block sizes for the compressed/top-k selection path of compressed sparse
-    attention. A value of 0 forces that layer to SLIDING-WINDOW-ONLY (no compressor and no
-    top-k indexer are built; the layer attends only within csa_window_size). When None (the
-    default) every layer follows the csa_compress_ratios-driven behavior. If provided it must
-    have the same length as csa_compress_ratios."""
+    """Per-layer compress ratios, e.g. [0, 0, 4, 128, 4, 128, ...]. A value of 0 is a
+    sliding-window-only layer (no compressor / no top-k indexer; the 'W' hybrid layer symbol)."""
 
     csa_compress_rotary_base: float = 40000.0
     """RoPE base for compressed KV positions in compressed sparse attention."""
@@ -1453,14 +1447,6 @@ class TransformerConfig(ModelParallelConfig):
             assert all(
                 ratio in [0, 4, 128] for ratio in self.csa_compress_ratios
             ), "csa_compress_ratios must be 0, 4, or 128"
-            if self.csa_block_sizes is not None:
-                assert len(self.csa_block_sizes) == len(self.csa_compress_ratios), (
-                    f"csa_block_sizes length ({len(self.csa_block_sizes)}) must equal "
-                    f"csa_compress_ratios length ({len(self.csa_compress_ratios)})"
-                )
-                assert all(
-                    bs is not None and bs >= 0 for bs in self.csa_block_sizes
-                ), "csa_block_sizes entries must be >= 0 (0 = sliding-window-only)"
             assert (
                 self.tensor_model_parallel_size == 1
             ), "DSv4 Hybrid Attention only supports TP size 1."

@@ -2098,22 +2098,24 @@ def core_transformer_config_from_args(args, config_class=None):
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
         _pat = args.hybrid_layer_pattern
-        _has_csa_hca = (Symbols.CSA in _pat) or (Symbols.HCA in _pat)
+        _has_dsv4_csa = (
+            (Symbols.CSA in _pat) or (Symbols.HCA in _pat) or (Symbols.WINDOW in _pat)
+        )
         _has_dsa = Symbols.DS_ATTENTION in _pat
         if getattr(args, 'experimental_attention_variant', None) is None:
-            # 'C'/'H' run the DSv4 CompressedSparseAttention (CSA/HCA), which requires the full
-            # dsv4_hybrid contract (MLA, TP==1, no qk_clip, qk_head_dim/kv_lora_rank derivation).
-            # Set the variant so transformer_config runs that validation+derivation rather than
-            # silently skipping it. 'D' alone stays legacy DSv3 'dsa'. An explicit
-            # --experimental-attention-variant is always respected.
-            if _has_csa_hca:
+            # 'C'/'H'/'W' run the DSv4 CompressedSparseAttention (CSA/HCA/window-only), which
+            # requires the full dsv4_hybrid contract (MLA, TP==1, no qk_clip,
+            # qk_head_dim/kv_lora_rank derivation). Set the variant so transformer_config runs
+            # that validation+derivation rather than silently skipping it. 'D' alone stays legacy
+            # DSv3 'dsa'. An explicit --experimental-attention-variant is always respected.
+            if _has_dsv4_csa:
                 kw_args['experimental_attention_variant'] = 'dsv4_hybrid'
             elif _has_dsa:
                 kw_args['experimental_attention_variant'] = 'dsa'
         # When the dsv4_hybrid variant is active (set above or explicitly) and the user did not
         # provide --csa-compress-ratios, derive it from the pattern symbols (C->4, H->128,
-        # others->0; MTP slots 0) so the length-checked dsv4_hybrid validation passes and the
-        # per-layer ratios match the C/H symbols. C/H layers also take their ratio via the spec.
+        # W/D/others->0; MTP slots 0) so the length-checked dsv4_hybrid validation passes and the
+        # per-layer ratios match the symbols. C/H/W layers also take their ratio via the spec.
         _variant = kw_args.get('experimental_attention_variant',
                                getattr(args, 'experimental_attention_variant', None))
         if _variant == 'dsv4_hybrid' and getattr(args, 'csa_compress_ratios', None) is None:
@@ -2547,7 +2549,6 @@ def _add_network_size_args(parser):
         "moe_layer_freq",
         "linear_attention_freq",
         "csa_compress_ratios",
-        "csa_block_sizes",
         "moe_router_load_balancing_type",
         "moe_aux_loss_coeff",
         "cp_comm_type",
@@ -4647,18 +4648,9 @@ def _add_experimental_attention_variant_args(parser):
         'Accepts a string containing a Python list expression, e.g.: '
         '"[0,0,4,128,4,128]" or "([0]+[4,128]*2)*3". '
         'Each value is the compression ratio for the corresponding '
-        'transformer layer (valid values: 0, 4, 128). '
+        'transformer layer (valid values: 0, 4, 128; 0 = sliding-window-only, the "W" '
+        'hybrid layer symbol). '
         'The list length must equal num_layers.',
-    )
-    group.add_argument(
-        '--csa-block-sizes',
-        type=compress_ratios_type,
-        default=None,
-        help='Per-layer block sizes for the compressed/top-k selection path of compressed '
-        'sparse attention. Same Python-list-expression format as --csa-compress-ratios and '
-        'the same length. A value of 0 forces that layer to SLIDING-WINDOW-ONLY (no compressor '
-        'and no top-k indexer; attends only within --csa-window-size). When omitted, every '
-        'layer follows the --csa-compress-ratios behavior.',
     )
     group.add_argument(
         '--no-dsa-kernel-fusion',
