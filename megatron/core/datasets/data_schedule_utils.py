@@ -869,6 +869,211 @@ def next_hdp_group(
     return micro_batches, leftovers, exec_times, sample_ids_per_gpu
 
 
+def next_hdp_group_v2(
+    sample_seqlens: List[Tuple[int, int]],
+    total_gpus: int,
+    max_seq_len_per_rank: int,
+    min_cp_size: int = 1,
+    delta: float = 0.05,
+) -> Tuple[List[List[int]], List[Tuple[int, int]], List[float], List[List[int]]]:
+    """Form one DCP microbatch with the V2 packing-aware scheduler.
+
+    V2 differs from the default DCP scheduler in two ways:
+    1. Short sequences may use a larger CP group than their minimum required
+       CP size when that lowers the critical-path rank workload.
+    2. Candidate placements are bounded by ``tall * max_seq_len_per_rank``,
+       the per-rank workload upper bound for packing sequences no longer than
+       the local tallest sequence in the microbatch.
+
+    The scheduler keeps the V1 invariant that each returned microbatch has no
+    empty DPxCP rank after the fill step.
+    """
+    if not sample_seqlens:
+        return (
+            [[] for _ in range(total_gpus)],
+            [],
+            [0.0 for _ in range(total_gpus)],
+            [[] for _ in range(total_gpus)],
+        )
+
+    def cp_min_fn(seq_len: int) -> int:
+        return dcp_gpus_needed(seq_len, max_seq_len_per_rank, min_cp_size)
+
+    def workload(seq_len: int, cp_size: int) -> float:
+        return (seq_len * seq_len) / cp_size
+
+    sample_seqlens = sorted(sample_seqlens, key=lambda x: x[1], reverse=True)
+    local_tall = sample_seqlens[0][1]
+    cap = float(local_tall) * float(max_seq_len_per_rank) * (1.0 + delta)
+
+    micro_batches: List[List[int]] = [[] for _ in range(total_gpus)]
+    exec_times: List[float] = [0.0 for _ in range(total_gpus)]
+    sample_ids_per_gpu: List[List[int]] = [[] for _ in range(total_gpus)]
+    packing_sequence_len = {}
+
+    gpu_group_id: List[Optional[int]] = [None] * total_gpus
+    group_members = {}
+    group_size = {}
+    next_gid = 0
+
+    sample_id, seq_len = sample_seqlens[0]
+    cp_size = cp_min_fn(seq_len)
+    assert cp_size <= total_gpus, (
+        f"Sequence length {seq_len} requires CP size {cp_size}, "
+        f"but only {total_gpus} DPxCP ranks are available."
+    )
+    group_id = next_gid
+    next_gid += 1
+    members = list(range(cp_size))
+    group_members[group_id] = members
+    group_size[group_id] = cp_size
+    packing_sequence_len[group_id] = seq_len / cp_size
+    per_gpu_cost = workload(seq_len, cp_size)
+    for rank in members:
+        gpu_group_id[rank] = group_id
+        micro_batches[rank].append(seq_len)
+        exec_times[rank] += per_gpu_cost
+        sample_ids_per_gpu[rank].append(sample_id)
+
+    leftovers: List[Tuple[int, int]] = []
+    for sample_id, seq_len in sample_seqlens[1:]:
+        min_needed = cp_min_fn(seq_len)
+        best = None
+
+        cp_size = min_needed
+        while cp_size <= total_gpus:
+            per_gpu_cost = workload(seq_len, cp_size)
+
+            for group_id, size in list(group_size.items()):
+                if size != cp_size:
+                    continue
+                if (
+                    packing_sequence_len.get(group_id, 0) + seq_len / cp_size
+                    > max_seq_len_per_rank
+                ):
+                    continue
+                members = group_members[group_id]
+                member_set = set(members)
+                projected_max = max(
+                    time + per_gpu_cost if rank in member_set else time
+                    for rank, time in enumerate(exec_times)
+                )
+                if projected_max <= cap and (best is None or projected_max < best[0]):
+                    best = (projected_max, cp_size, "add", group_id, None)
+
+            free_ranks = [rank for rank, group_id in enumerate(gpu_group_id) if group_id is None]
+            if len(free_ranks) >= cp_size:
+                chosen_members = sorted(free_ranks, key=lambda rank: exec_times[rank])[:cp_size]
+                chosen_set = set(chosen_members)
+                projected_max = max(
+                    time + per_gpu_cost if rank in chosen_set else time
+                    for rank, time in enumerate(exec_times)
+                )
+                if projected_max <= cap and (best is None or projected_max < best[0]):
+                    best = (projected_max, cp_size, "new", None, chosen_members)
+
+            cp_size *= 2
+
+        if best is None:
+            leftovers.append((sample_id, seq_len))
+            continue
+
+        _, selected_cp_size, action, group_id, chosen_members = best
+        per_gpu_cost = workload(seq_len, selected_cp_size)
+        if action == "add":
+            members = group_members[group_id]
+            packing_sequence_len[group_id] += seq_len / selected_cp_size
+            for rank in members:
+                micro_batches[rank].append(seq_len)
+                exec_times[rank] += per_gpu_cost
+                sample_ids_per_gpu[rank].append(sample_id)
+        else:
+            group_id = next_gid
+            next_gid += 1
+            group_members[group_id] = chosen_members
+            group_size[group_id] = selected_cp_size
+            packing_sequence_len[group_id] = seq_len / selected_cp_size
+            for rank in chosen_members:
+                gpu_group_id[rank] = group_id
+                micro_batches[rank].append(seq_len)
+                exec_times[rank] += per_gpu_cost
+                sample_ids_per_gpu[rank].append(sample_id)
+
+    def fill_empty_gpus_once() -> bool:
+        nonlocal micro_batches, exec_times, sample_ids_per_gpu
+
+        empty_ranks = [rank for rank, micro_batch in enumerate(micro_batches) if not micro_batch]
+        if not empty_ranks:
+            return False
+
+        existing_group_sizes = set(group_size.values())
+        if not existing_group_sizes:
+            return False
+        min_group_size = min(existing_group_sizes)
+        next_power = min(min_group_size * 2, total_gpus)
+
+        for group_id, size in list(group_size.items()):
+            if size != min_group_size:
+                continue
+
+            members = group_members[group_id]
+            needed_count = next_power - min_group_size
+            group_start_rank = members[0]
+            group_end_rank = members[-1]
+            empty_rank = empty_ranks[0]
+            if group_end_rank + 1 > empty_rank or group_end_rank + needed_count >= total_gpus:
+                continue
+
+            work_to_push = micro_batches[group_end_rank + 1 : empty_rank]
+            exec_times_to_push = exec_times[group_end_rank + 1 : empty_rank]
+            sample_ids_to_push = sample_ids_per_gpu[group_end_rank + 1 : empty_rank]
+
+            new_micro_batches: List[List[int]] = [[] for _ in range(total_gpus)]
+            new_exec_times: List[float] = [0.0 for _ in range(total_gpus)]
+            new_sample_ids_per_gpu: List[List[int]] = [[] for _ in range(total_gpus)]
+
+            for rank in range(group_start_rank):
+                new_micro_batches[rank] = micro_batches[rank]
+                new_exec_times[rank] = exec_times[rank]
+                new_sample_ids_per_gpu[rank] = sample_ids_per_gpu[rank]
+
+            for rank in range(group_start_rank, group_end_rank + needed_count + 1):
+                new_micro_batches[rank] = micro_batches[group_end_rank]
+                new_exec_times[rank] = sum(
+                    workload(length, next_power) for length in micro_batches[group_end_rank]
+                )
+                new_sample_ids_per_gpu[rank] = sample_ids_per_gpu[group_end_rank]
+
+            for idx, work in enumerate(work_to_push):
+                target_rank = group_end_rank + needed_count + 1 + idx
+                new_micro_batches[target_rank] = work
+                new_exec_times[target_rank] = exec_times_to_push[idx]
+                new_sample_ids_per_gpu[target_rank] = sample_ids_to_push[idx]
+
+            group_size[group_id] = next_power
+            group_members[group_id] = list(range(group_start_rank, group_end_rank + needed_count + 1))
+            for other_group_id in list(group_size.keys()):
+                if other_group_id == group_id:
+                    continue
+                if min(group_members[other_group_id]) > group_end_rank:
+                    group_members[other_group_id] = [
+                        rank + needed_count for rank in group_members[other_group_id]
+                    ]
+
+            micro_batches = new_micro_batches
+            exec_times = new_exec_times
+            sample_ids_per_gpu = new_sample_ids_per_gpu
+            return True
+
+        return False
+
+    while any(not micro_batch for micro_batch in micro_batches):
+        if not fill_empty_gpus_once():
+            break
+
+    return micro_batches, leftovers, exec_times, sample_ids_per_gpu
+
+
 def align_sample_id_groups(sample_id_groups: List, microbatch_group_size_per_vp_stage: int) -> List:
     """Align len(sample_id_groups) to microbatch_group_size_per_vp_stage when VPP is enabled.
 

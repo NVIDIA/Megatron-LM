@@ -9,9 +9,11 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.datasets.data_schedule import (
+    DefaultDynamicCPScheduler,
     get_batch_on_this_rank_for_sequence_packing,
     wrap_data_iterator,
 )
+from megatron.core.datasets.data_schedule_utils import next_hdp_group_v2
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.training.global_vars import unset_global_variables
 from tests.unit_tests.test_utilities import Utils
@@ -108,6 +110,33 @@ class MockVariableLengthSequencePackingDataIterator:
             )
 
         return batch
+
+
+def test_next_hdp_group_v2_can_use_larger_cp_group_for_short_sequences():
+    micro_batches, leftovers, exec_times, sample_ids = next_hdp_group_v2(
+        [(0, 6144), (1, 2048)],
+        total_gpus=2,
+        max_seq_len_per_rank=4096,
+    )
+
+    assert leftovers == []
+    assert micro_batches == [[6144, 2048], [6144, 2048]]
+    assert sample_ids == [[0, 1], [0, 1]]
+    assert exec_times[0] == exec_times[1]
+
+
+def test_default_dynamic_cp_scheduler_uses_v2_when_enabled():
+    scheduler = DefaultDynamicCPScheduler(
+        max_seqlen_per_dp_cp_rank=4096,
+        cp_size=2,
+        dp_size=1,
+        microbatch_group_size_per_vp_stage=None,
+        use_v2=True,
+    )
+
+    sample_id_groups = scheduler.get_groups_and_subsamples([(0, 6144), (1, 2048)])
+
+    assert sample_id_groups == [[[0, 1], [0, 1]]]
 
 
 def _gather_tensor_from_tp_group(tensor):

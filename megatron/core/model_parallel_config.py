@@ -87,6 +87,15 @@ class ModelParallelConfig:
     default_dynamic_cp: Dynamic-CP scheduler for packed sequence balancing.
     """
 
+    dcp_scheduler_v2: bool = False
+    """If true, use the V2 scheduler when ``sequence_packing_scheduler`` is ``default_dynamic_cp``.
+    V2 allows short sequences to use larger CP groups when this reduces the critical-path rank
+    workload, using a packing-aware workload cap for each microbatch.
+    """
+
+    dcp_v2_delta: float = 0.05
+    """Slack tolerance for the V2 dynamic CP scheduler workload cap."""
+
     expert_model_parallel_size: int = 1
     """Distributes Moe Experts across sub data parallel dimension."""
 
