@@ -43,9 +43,7 @@ def _vanilla_attention_with_lse(q, k, v, softmax_scale):
     # recent S_q keys plus all preceding ones).
     s_q = qh.size(-2)
     s_k = kh.size(-2)
-    causal = torch.tril(
-        torch.ones(s_q, s_k, device=q.device, dtype=torch.bool), diagonal=s_k - s_q
-    )
+    causal = torch.tril(torch.ones(s_q, s_k, device=q.device, dtype=torch.bool), diagonal=s_k - s_q)
     scores = scores.masked_fill(~causal, float("-inf"))
 
     lse = torch.logsumexp(scores, dim=-1)  # (B, H, S_q)
@@ -63,16 +61,14 @@ def _sink_attention_reference(q, k, v, softmax_scale, softmax_offset):
 
     s_q = qh.size(-2)
     s_k = kh.size(-2)
-    causal = torch.tril(
-        torch.ones(s_q, s_k, device=q.device, dtype=torch.bool), diagonal=s_k - s_q
-    )
+    causal = torch.tril(torch.ones(s_q, s_k, device=q.device, dtype=torch.bool), diagonal=s_k - s_q)
     scores = scores.masked_fill(~causal, float("-inf"))
 
     # Append per-head sink logit, softmax, drop the extra slot — mirrors
     # SoftmaxOne in megatron/core/fusions/fused_softmax.py.
-    sink = softmax_offset.reshape(1, -1, 1, 1).expand(
-        scores.size(0), -1, scores.size(2), 1
-    ).to(scores)
+    sink = (
+        softmax_offset.reshape(1, -1, 1, 1).expand(scores.size(0), -1, scores.size(2), 1).to(scores)
+    )
     qk = torch.cat([scores, sink], dim=-1)
     probs = torch.softmax(qk, dim=-1)[..., :-1]
     out = torch.matmul(probs, vh)
@@ -92,7 +88,7 @@ class TestSinkSoftmaxCorrection:
     def test_bshd_correction_matches_sink_softmax(self, dtype, offset_kind):
         """``_apply_sink_softmax_correction_bshd`` must match SoftmaxOne semantics."""
         b, s_q, s_k, h, d = 2, 4, 8, 3, 16
-        softmax_scale = d ** -0.5
+        softmax_scale = d**-0.5
 
         q = torch.randn(b, s_q, h, d, device=self.device, dtype=dtype)
         k = torch.randn(b, s_k, h, d, device=self.device, dtype=dtype)
@@ -113,9 +109,7 @@ class TestSinkSoftmaxCorrection:
         )
 
         # Reference: full recompute with SoftmaxOne semantics.
-        out_ref = _sink_attention_reference(q, k, v, softmax_scale, softmax_offset).to(
-            dtype
-        )
+        out_ref = _sink_attention_reference(q, k, v, softmax_scale, softmax_offset).to(dtype)
 
         rtol = 1e-2 if dtype == torch.bfloat16 else 1e-5
         atol = 1e-2 if dtype == torch.bfloat16 else 1e-5
@@ -132,7 +126,7 @@ class TestSinkSoftmaxCorrection:
         give identical numerical results — we can reuse the (B,S,H,D) reference.
         """
         s_q, s_k, h, d = 6, 6, 4, 8  # square so causal mask is trivial diag
-        softmax_scale = d ** -0.5
+        softmax_scale = d**-0.5
         dtype = torch.float32
 
         q = torch.randn(1, s_q, h, d, device=self.device, dtype=dtype)
@@ -156,9 +150,9 @@ class TestSinkSoftmaxCorrection:
 
         out_ref = _sink_attention_reference(q, k, v, softmax_scale, softmax_offset)
 
-        assert torch.allclose(out_corrected, out_ref, rtol=1e-5, atol=1e-5), (
-            "Varlen sink-corrected output diverges from reference."
-        )
+        assert torch.allclose(
+            out_corrected, out_ref, rtol=1e-5, atol=1e-5
+        ), "Varlen sink-corrected output diverges from reference."
 
     def test_off_by_one_with_zero_logit_equals_plus_one_denominator(self):
         """With ``softmax_offset == 0``, the sink contributes ``exp(0) == 1`` to
@@ -180,10 +174,7 @@ class TestSinkSoftmaxCorrection:
         # Scale factor: sigmoid(log(s) - 0) = s / (s + 1).
         expected_scale = s / (s + 1.0)
         torch.testing.assert_close(
-            out_corrected,
-            out_vanilla * expected_scale,
-            rtol=1e-6,
-            atol=1e-6,
+            out_corrected, out_vanilla * expected_scale, rtol=1e-6, atol=1e-6
         )
 
     def test_nan_lse_rows_unmodified(self):
@@ -198,16 +189,12 @@ class TestSinkSoftmaxCorrection:
         dtype = torch.float32
 
         out_vanilla = torch.tensor(
-            [[[[1.0, 2.0]], [[3.0, 4.0]], [[5.0, 6.0]]]],
-            device=self.device,
-            dtype=dtype,
+            [[[[1.0, 2.0]], [[3.0, 4.0]], [[5.0, 6.0]]]], device=self.device, dtype=dtype
         )
         # Row 0: finite lse=0     -> sigmoid(0)  = 0.5    -> scale by 0.5
         # Row 1: lse=-inf         -> sigmoid(-inf) = 0    -> zero the row
         # Row 2: lse=NaN          -> NaN          (guard) -> keep row unchanged
-        lse = torch.tensor(
-            [[[0.0, float("-inf"), float("nan")]]], device=self.device
-        )
+        lse = torch.tensor([[[0.0, float("-inf"), float("nan")]]], device=self.device)
         softmax_offset = torch.zeros(h, device=self.device, dtype=dtype)
 
         out_corrected = Attention._apply_sink_softmax_correction_bshd(
