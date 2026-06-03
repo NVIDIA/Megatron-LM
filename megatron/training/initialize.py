@@ -106,15 +106,6 @@ def initialize_megatron(
     if cfg.profiling is not None and cfg.profiling.nvtx_ranges:
         configure_nvtx_profiling(enabled=True)
 
-    init_num_microbatches_calculator(
-        safe_get_rank(),
-        train_config.rampup_batch_size,
-        train_config.global_batch_size,
-        train_config.micro_batch_size,
-        cfg.get_data_parallel_size(safe_get_world_size()),
-        train_config.decrease_batch_size_if_needed,
-    )
-
     # init rerun global state
     init_rerun_state(rerun_state_machine_config)
 
