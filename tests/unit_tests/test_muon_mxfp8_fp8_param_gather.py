@@ -32,6 +32,7 @@ from megatron.core.enums import ModelType
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import is_te_min_version
@@ -235,7 +236,7 @@ class TestMuonMXFP8FP8ParamGather:
             vp_stage=config_kwargs.get("vp_stage"),
         )
 
-    def _create_args(self, fp8_param_gather, fp8_recipe="mxfp8"):
+    def _create_args(self, fp8_param_gather, fp8_recipe="mxfp8", overlap_param_gather=False):
         destroy_global_vars()
         destroy_num_microbatches_calculator()
         sys.argv = ['test_muon_mxfp8_fp8_param_gather.py']
@@ -274,11 +275,16 @@ class TestMuonMXFP8FP8ParamGather:
         args.exp_avg_dtype = 'fp32'
         args.exp_avg_sq_dtype = 'fp32'
         args.use_distributed_optimizer = True
-        # Disable AG / RS overlap so the timing is deterministic and the test
-        # exercises the synchronous post-AG quantize path (see
-        # ``_post_param_sync`` in ``param_and_grad_buffer.py``).
-        args.overlap_param_gather = False
-        args.overlap_grad_reduce = False
+        # ``overlap_param_gather=False`` exercises the synchronous post-AG
+        # quantize path (``start_param_sync_for_bucket_group_subset`` called from
+        # ``step_with_ready_grads``); ``True`` exercises the deferred forward
+        # pre-hook all-gather path (the more important / production path), where
+        # the bf16 staging buffer is re-staged post-``zero_grad_buffer`` in
+        # ``_run_steps`` exactly as ``train_step`` does. ``--overlap-param-gather``
+        # requires ``--overlap-grad-reduce`` (see ``arguments.py``), so the two
+        # are co-enabled.
+        args.overlap_param_gather = overlap_param_gather
+        args.overlap_grad_reduce = overlap_param_gather
         # FP8 + fp8_param_gather config. Only ``mxfp8`` is wired through the
         # LayerWise bf16-staging + post-AG quantize round-trip; other recipes
         # are blocked by ``arguments.py`` and the parametrized test skips
@@ -306,8 +312,14 @@ class TestMuonMXFP8FP8ParamGather:
         loss_mask = torch.ones(self.seq_length).repeat((self.micro_batch_size, 1)).cuda()
         return input_ids, labels, position_ids, attention_mask, loss_mask
 
-    def _build_model_and_optimizer(self, fp8_param_gather, fp8_recipe="mxfp8"):
-        args = self._create_args(fp8_param_gather=fp8_param_gather, fp8_recipe=fp8_recipe)
+    def _build_model_and_optimizer(
+        self, fp8_param_gather, fp8_recipe="mxfp8", overlap_param_gather=False
+    ):
+        args = self._create_args(
+            fp8_param_gather=fp8_param_gather,
+            fp8_recipe=fp8_recipe,
+            overlap_param_gather=overlap_param_gather,
+        )
         set_args(args)
         torch.manual_seed(_SEED)
 
@@ -334,6 +346,22 @@ class TestMuonMXFP8FP8ParamGather:
         for _ in range(num_steps):
             gpt_model[0].zero_grad_buffer()
             optimizer.zero_grad()
+
+            # Mirror ``train_step``: with ``reuse_grad_buf_for_mxfp8_param_ag`` the
+            # bf16 staging buffer is aliased onto the grad buffer that
+            # ``zero_grad_buffer()`` just zeroed, so re-stage the masters before
+            # the deferred forward-pre-hook all-gather (registered by DDP when
+            # ``overlap_param_gather=True``) ships them — otherwise the AG would
+            # gather a zeroed buffer and the muon-managed weights would freeze.
+            # No-op when overlap is off (the in-step ``step_with_ready_grads``
+            # write + synchronous AG cover that path).
+            if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
+                for optim_instance in optimizer.chained_optimizers:
+                    if isinstance(
+                        optim_instance, (DistributedOptimizer, LayerWiseDistributedOptimizer)
+                    ):
+                        optim_instance._copy_main_params_to_param_buffer()
+
             gpt_model[0].set_is_first_microbatch()
             output = gpt_model[0].forward(
                 input_ids=input_ids,
@@ -365,6 +393,7 @@ class TestMuonMXFP8FP8ParamGather:
 
         return losses, outputs, grads_per_step, masters_per_step, params_per_step
 
+    @pytest.mark.parametrize("overlap_param_gather", [False, True])
     @pytest.mark.parametrize("fp8_recipe", ["mxfp8", "blockwise"])
     @pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
     @pytest.mark.skipif(
@@ -374,10 +403,18 @@ class TestMuonMXFP8FP8ParamGather:
     @pytest.mark.skipif(
         not is_te_min_version("2.3.0.dev0"), reason="TE 2.3.0.dev0 is required for MXFP8"
     )
-    def test_on_vs_off_bitwise_identical(self, fp8_recipe):
+    def test_on_vs_off_bitwise_identical(self, fp8_recipe, overlap_param_gather):
         """fp8_param_gather=ON must produce bitwise-identical loss, forward
         output, per-parameter gradient, and per-parameter fp32 master vs
         fp8_param_gather=OFF for muon + mxfp8 over multiple training steps.
+
+        Run for both ``overlap_param_gather`` settings: ``False`` exercises the
+        synchronous post-AG quantize path, ``True`` the deferred forward
+        pre-hook all-gather path. The overlap=True case is the regression guard
+        for the frozen-loss bug — the bf16 staging buffer is aliased onto the
+        grad buffer that ``zero_grad_buffer()`` zeroes each iteration, so without
+        the post-zero re-stage the deferred AG would ship zeros and the
+        muon-managed weights would never update.
 
         Only mxfp8 is wired up for the LayerWise FP8 param-gather path;
         other recipes (e.g. blockwise) are blocked by ``arguments.py`` and
@@ -392,11 +429,15 @@ class TestMuonMXFP8FP8ParamGather:
 
         with deterministic_mode():
             off_args, off_model, off_optimizer = self._build_model_and_optimizer(
-                fp8_param_gather=False, fp8_recipe=fp8_recipe
+                fp8_param_gather=False,
+                fp8_recipe=fp8_recipe,
+                overlap_param_gather=overlap_param_gather,
             )
             initial_state = _snapshot_initial_state(off_model[0], off_optimizer)
             on_args, on_model, on_optimizer = self._build_model_and_optimizer(
-                fp8_param_gather=True, fp8_recipe=fp8_recipe
+                fp8_param_gather=True,
+                fp8_recipe=fp8_recipe,
+                overlap_param_gather=overlap_param_gather,
             )
             _restore_initial_state(on_model[0], on_optimizer, initial_state)
 
