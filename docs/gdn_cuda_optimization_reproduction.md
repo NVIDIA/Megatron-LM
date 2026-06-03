@@ -8,26 +8,94 @@ gated-delta-rule calls through that package without modifying FLA source.
 ## Install
 
 Use a GPU container that already has `mcore_gdn_opt` and its CUDA extensions
-installed, or install the package from the internal repository before running
-Megatron-LM:
+installed, or build + install the package from the internal repository before
+running Megatron-LM.
+
+> **Use commit `12605c5` or later.** Earlier kernel commits produce wrong or
+> NaN gradients — see [Kernel version history](#kernel-version-history-dhu-backward)
+> below. `12605c5` is the first commit that is both numerically correct and
+> NaN-free at training scale.
 
 ```bash
-pip install -e . --user --no-build-isolation
-
 git clone https://gitlab-master.nvidia.com/bhsueh/mcore_gdn_opt.git
 cd mcore_gdn_opt
-git checkout 3a371f53eeec24cc1d9da4a01584f3ec9f8f44e5
+git checkout 12605c515bdbc1f239df991a9cea570f7e79d234
+
+# IMPORTANT: use the PINNED submodule commits. Do NOT use
+# `git submodule update --remote` — it tracks the branch tip of
+# `gated_delta_rule_bwd` and pulls an OLDER, buggy DHU kernel.
 git submodule update --init --recursive
+
+# The nested `gated_delta_rule_bwd/third_party/cutlass` submodule is sometimes
+# left unpopulated; point it at the top-level cutlass so the SM100 DHU kernel
+# can build.
+if [ ! -e third_party/gated_delta_rule_bwd/third_party/cutlass/include ]; then
+  rm -rf third_party/gated_delta_rule_bwd/third_party/cutlass
+  ln -s "$PWD/third_party/cutlass" third_party/gated_delta_rule_bwd/third_party/cutlass
+fi
 export CUTLASS_PATH="${PWD}/third_party/cutlass"
 
-python -m pip install -e third_party/gated_delta_rule_bwd --no-build-isolation
-python -m pip install -e chunk_bwd_kernel_dqkwg --no-build-isolation
-python -m pip install -e chunk_gated_delta_rule_fwd --no-build-isolation
-python -m pip install -e . --no-build-isolation
+# FLA must come from the pinned submodule (the wrapper imports
+# `fla.ops.gated_delta_rule.chunk_fwd`, present only in that FLA commit).
+python -m pip install --no-build-isolation --no-deps \
+  third_party/gated_delta_rule_bwd/third_party/fla
+
+# Build + install the CUDA extensions (editable) and the package.
+python -m pip install -e third_party/gated_delta_rule_bwd --no-build-isolation   # chunk_delta_h_bwd_sm100 (fwd_h / wy_bwd / dhu)
+python -m pip install -e chunk_bwd_kernel_dqkwg       --no-build-isolation        # dqkwg
+python -m pip install -e chunk_gated_delta_rule_fwd   --no-build-isolation        # fwd_h (forward state recompute)
+python -m pip install -e chunk_delta_fused_fwd_bwd    --no-build-isolation        # fused dv_dhu (bundled since 5661cfa)
+python -m pip install -e .                            --no-build-isolation
 ```
 
 Do not use `PYTHONPATH` or ad-hoc `sys.modules` injection for these tests. The
 package and CUDA extensions should be installed in editable mode.
+
+### Building portable wheels (install into a fixed container without rebuilding)
+
+The CUDA compile is slow (~30–40 min). Build wheels once, then force-reinstall
+them into a running container (the wheels are pinned to e.g. py3.12 / torch2.12 /
+SM100a aarch64):
+
+```bash
+for d in third_party/gated_delta_rule_bwd chunk_bwd_kernel_dqkwg \
+         chunk_gated_delta_rule_fwd chunk_delta_fused_fwd_bwd .; do
+  python -m pip wheel --no-build-isolation --no-deps -w ./wheels "./$d"
+done
+pip install --no-deps --force-reinstall ./wheels/*.whl
+```
+
+`--force-reinstall` cleanly replaces the image's editable installs with the wheel
+`.so` (verified: the imported `.so` becomes byte-identical to the wheel's).
+
+> **Fused `dv_dhu` (DV_DHU=1) install caveat.** The compiled
+> `chunk_delta_fused_fwd_bwd_cuda` extension installs as a *top-level* module, but
+> its wrapper `chunk_delta_fused_fwd_bwd/__init__.py` imports it as a *submodule*
+> (`from . import chunk_delta_fused_fwd_bwd_cuda`), so a plain wheel install fails
+> with `ImportError: chunk_delta_fused_fwd_bwd_cuda extension not found`. Until the
+> packaging is fixed, copy the `.so` into the package dir after installing:
+> ```bash
+> SO=$(python -c "import chunk_delta_fused_fwd_bwd_cuda as m; print(m.__file__)")
+> PKG=$(python -c "import chunk_delta_fused_fwd_bwd, os; print(os.path.dirname(chunk_delta_fused_fwd_bwd.__file__))")
+> cp "$SO" "$PKG/"
+> ```
+> The standalone `dhu` path (`DV_DHU=0, ENABLE_DHU=1`) and the editable `-e` install
+> do not need this.
+
+### Kernel version history (DHU backward)
+
+| `mcore_gdn_opt` | submodule `gated_delta_rule_bwd` | status |
+|---|---|---|
+| `3a371f5` | `949c959` | backward grads wrong (DHU dk/dv ~1.4×, WY dβ ~4.6×) |
+| `297386a` | `f2351d3` | accuracy fixed, but DHU decay-reciprocal **underflow → NaN** on real inputs |
+| `5661cfa` | `2e6d892` | still NaN: the standalone cute DHU kernel emits NaN under very-negative `g` |
+| **`12605c5`** | — | **FIXED** — finite and numerically matches FLA; training-safe |
+
+Validation of `12605c5`: Qwen3.5-VL 397B proxy, 8×GB200, 20 steps, `DV_DHU=0`
+(so the standalone cute `chunk_gated_delta_rule_bwd_dhu_cute` kernel is the one
+running). grad norm finite for all steps (0 NaN iterations); loss / grad-norm
+track the Triton(FLA) baseline to ~4 decimals (iter1 `13.24028` / `15.12`,
+iter20 `0.073` / `0.506`).
 
 ## Runtime Flags
 
