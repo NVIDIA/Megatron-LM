@@ -23,10 +23,14 @@ This repository contains two components: **Megatron-LM** and **Megatron Core**.
 
 ## Getting Started
 
-**Install from PyPI:**
+**Install from PyPI** (requires Python 3.10+):
 
 ```bash
+# Using uv (https://github.com/astral-sh/uv)
 uv pip install megatron-core
+
+# Or using standard pip
+pip install megatron-core
 ```
 
 **Or clone and install from source:**
@@ -34,16 +38,15 @@ uv pip install megatron-core
 ```bash
 git clone https://github.com/NVIDIA/Megatron-LM.git
 cd Megatron-LM
-uv pip install -e .
+uv pip install -e .  # or: pip install -e .
 ```
 
-> **Note:** Building from source can use a lot of memory. If the build runs out of memory, limit parallel compilation jobs by setting `MAX_JOBS` (e.g. `MAX_JOBS=4 uv pip install -e .`).
+> **Note:** Building from source can use a lot of memory. If the build runs out of memory, limit parallel compilation jobs by setting `MAX_JOBS` (for example, `MAX_JOBS=4 uv pip install -e .`).
 
 For NGC container setup and all installation options, see the **[Installation Guide](https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/install.html)**.
 
 - **[Your First Training Run](https://docs.nvidia.com/megatron-core/developer-guide/latest/get-started/quickstart.html)** - End-to-end training examples with data preparation
 - **[Parallelism Strategies](https://docs.nvidia.com/megatron-core/developer-guide/latest/user-guide/parallelism-guide.html)** - Scale training across GPUs with TP, PP, DP, EP, and CP
-- **[Contribution Guide](https://docs.nvidia.com/megatron-core/developer-guide/latest/developer/contribute.html)** - How to contribute to Megatron Core
 
 # Latest News
 
@@ -51,8 +54,6 @@ For NGC container setup and all installation options, see the **[Installation Gu
 - **[2026/01]** **[Dynamic Context Parallelism](https://developer.nvidia.com/blog/speeding-up-variable-length-training-with-dynamic-context-parallelism-and-nvidia-megatron-core/)** - Up to 1.48x speedup for variable-length sequence training with adaptive CP sizing.
 - **[2025/12]** **Megatron Core development has moved to GitHub!** All development and CI now happens in the open. We welcome community contributions.
 - **[2025/10]** **[Megatron Dev Branch](https://github.com/NVIDIA/Megatron-LM/tree/dev)** - early access branch with experimental features.
-- **[2025/10]** **[Megatron Bridge](https://github.com/NVIDIA-NeMo/Megatron-Bridge)** - Bidirectional converter for interoperability between Hugging Face and Megatron checkpoints, featuring production-ready recipes for popular models.
-- **[2025/08]** **[MoE Q3-Q4 2025 Roadmap](https://github.com/NVIDIA/Megatron-LM/issues/1729)** - Comprehensive roadmap for MoE features including DeepSeek-V3, Qwen3, advanced parallelism strategies, FP8 optimizations, and Blackwell performance enhancements.
 - **[2025/08]** **[GPT-OSS Model](https://github.com/NVIDIA/Megatron-LM/issues/1739)** - Advanced features including YaRN RoPE scaling, attention sinks, and custom activation functions are being integrated into Megatron Core.
 - **[2025/06]** **[Megatron MoE Model Zoo](https://github.com/yanring/Megatron-MoE-ModelZoo)** - Best practices and optimized configurations for training DeepSeek-V3, Mixtral, and Qwen3 MoE models with performance benchmarking and checkpoint conversion tools.
 - **[2025/05]** Megatron Core v0.11.0 brings new capabilities for multi-data center LLM training ([blog](https://developer.nvidia.com/blog/turbocharge-llm-training-across-long-haul-data-center-networks-with-nvidia-nemo-framework/)).
@@ -61,7 +62,7 @@ For NGC container setup and all installation options, see the **[Installation Gu
 <summary>Previous News</summary>
 
 - **[2024/07]** Megatron Core v0.7 improves scalability and training resiliency and adds support for multimodal training ([blog](https://developer.nvidia.com/blog/train-generative-ai-models-more-efficiently-with-new-nvidia-Megatron-Core-functionalities/)).
-- **[2024/06]** Megatron Core added supports for Mamba-based models. Check out our paper [An Empirical Study of Mamba-based Language Models](https://arxiv.org/pdf/2406.07887) and [code example](https://github.com/NVIDIA/Megatron-LM/tree/ssm/examples/mamba).
+- **[2024/06]** Megatron Core added supports for Mamba-based models. Check out our paper [An Empirical Study of Mamba-based Language Models](https://arxiv.org/pdf/2406.07887) and [code example](https://github.com/NVIDIA/Megatron-LM/tree/main/examples/mamba).
 - **[2024/01 Announcement]** NVIDIA has released the core capabilities in **Megatron-LM** into [**Megatron Core**](https://github.com/NVIDIA/Megatron-LM/tree/main/megatron/core) in this repository. Megatron Core expands upon Megatron-LM's GPU-optimized techniques with more cutting-edge innovations on system-level optimizations, featuring composable and modular APIs.
 
 </details>
@@ -80,11 +81,11 @@ Megatron-LM/
 │   │   ├── optimizer/           # Optimizers
 │   │   ├── datasets/            # Dataset loaders
 │   │   ├── inference/           # Inference engines and server
-│   │   └── export/              # Model export (e.g. TensorRT-LLM)
+│   │   └── export/              # Model export (for example, TensorRT-LLM)
 │   ├── training/                # Training scripts
 │   ├── legacy/                  # Legacy components
-│   ├── post_training/           # Post-training (quantization, distillation, pruning, etc.)
-│   └── rl/                      # Reinforcement learning (RLHF, etc.)
+│   ├── post_training/           # Post-training (quantization, distillation, pruning, and more)
+│   └── rl/                      # Reinforcement learning (RLHF and more)
 ├── examples/                    # Ready-to-use training examples
 ├── tools/                       # Utility tools
 ├── tests/                       # Comprehensive test suite
