@@ -634,6 +634,14 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             # as a gradient hook of expert_output
             layer.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(expert_output)
 
+        # Trigger the shared-expert recompute from expert_output too (output freed in
+        # submodule_combine_forward). Registering on the same tensor AFTER the pre_mlp_norm
+        # recompute orders it after pre_mlp_layernorm_output is restored and before the attn node's
+        # shared-expert backward.
+        shared_experts_checkpoint = getattr(layer.mlp, "shared_experts_checkpoint", None)
+        if shared_experts_checkpoint is not None:
+            shared_experts_checkpoint.register_recompute_hook(expert_output)
+
         return expert_output
 
     def submodule_combine_forward(node: ScheduleNode, output: torch.Tensor):
@@ -683,6 +691,13 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         if not node.is_mtp and final_layernorm and node.is_last_layer:
             output = final_layernorm(output)
             output = make_viewless_tensor(inp=output, requires_grad=True, keep_graph=True)
+
+        # postprocess() has consumed the shared-expert output; free its storage now (the recompute
+        # hook was registered on expert_output in submodule_moe_forward).
+        shared_experts_checkpoint = getattr(layer.mlp, "shared_experts_checkpoint", None)
+        if shared_experts_checkpoint is not None:
+            shared_experts_checkpoint.discard_output()
+            layer.mlp.shared_experts_checkpoint = None
         return output
 
     @copy_signature(layer._forward_mlp, handle_first_dst_param='preserve')

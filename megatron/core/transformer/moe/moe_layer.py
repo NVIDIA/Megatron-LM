@@ -243,6 +243,18 @@ class MoELayer(BaseMoELayer):
             config.recompute_granularity == 'selective'
             and "shared_experts" in config.recompute_modules
         )
+        # Discard the shared-expert OUTPUT (CheckpointWithoutOutput) instead of a standard
+        # checkpoint that keeps it. The recompute is wired up where ordering is correct (after any
+        # pre_mlp_layernorm recompute) by the caller: the fine-grained callables for A2A overlap,
+        # or TransformerLayer._forward_post_mlp otherwise. Disabled under MoE cudagraph partial
+        # capture, where the output is a graph output and must keep its storage.
+        self.shared_experts_recompute_discard_output = (
+            self.shared_experts_recompute
+            and not bool(getattr(config, "cuda_graph_modules", None))
+        )
+        # The active CheckpointWithoutOutput, handed to the caller that frees the output and
+        # registers the recompute hook (None when not using discard-output recompute).
+        self.shared_experts_checkpoint = None
 
         self.tp_group = pg_collection.tp
         self.tp_ep_group = pg_collection.tp_ep
@@ -530,7 +542,19 @@ class MoELayer(BaseMoELayer):
         shared_expert_output = None
         if self.use_shared_expert and not self.shared_expert_overlap:
             # Compute the shared expert separately when not overlapped with communication.
-            if self.shared_experts_recompute:
+            if self.shared_experts_recompute_discard_output and self.training:
+                # Recompute-with-discarded-output: run the shared expert under no_grad, then free
+                # its output in postprocess() and regenerate it (with its backward graph) from a
+                # grad hook. CheckpointWithoutOutput handles fp8/fp4 internally via its fp8 flag.
+                self.shared_experts_checkpoint = tensor_parallel.CheckpointWithoutOutput(
+                    fp8=(self.config.fp8 or self.config.fp4)
+                )
+                shared_expert_output = self.shared_experts_checkpoint.checkpoint(
+                    apply_module(self.shared_experts), hidden_states
+                )
+            elif self.shared_experts_recompute:
+                # Standard checkpoint fallback (e.g. MoE cudagraph partial capture or eval): keep
+                # the output, recompute only the intermediates.
                 if self.config.fp8 or self.config.fp4:
                     shared_expert_output = te_checkpoint(
                         apply_module(self.shared_experts),
