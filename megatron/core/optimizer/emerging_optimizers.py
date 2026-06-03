@@ -11,7 +11,7 @@ To add a new emerging optimizer:
 import inspect
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Literal, Optional, get_args
+from typing import Any, Callable, Dict, Literal, Optional, get_args
 
 import torch
 from torch.optim.optimizer import ParamsT
@@ -130,13 +130,19 @@ def _is_nonlinear_or_embedding(param):
     return getattr(param, 'is_embedding_or_output_parameter', False) or len(param.shape) != 2
 
 
-def _get_qkv_split_shapes(model_cfg) -> List[int]:
+def _get_qkv_split_shapes(model_cfg) -> list[int]:
     """Compute QKV split shapes from model config."""
-    return [
-        model_cfg.num_attention_heads // model_cfg.num_query_groups * model_cfg.kv_channels,
-        model_cfg.kv_channels,
-        model_cfg.kv_channels,
-    ]
+    query_projection_size = (
+        model_cfg.num_attention_heads // model_cfg.num_query_groups * model_cfg.kv_channels
+    )
+    if getattr(model_cfg, 'attention_output_gate', False):
+        return [
+            query_projection_size,
+            query_projection_size,
+            model_cfg.kv_channels,
+            model_cfg.kv_channels,
+        ]
+    return [query_projection_size, model_cfg.kv_channels, model_cfg.kv_channels]
 
 
 # ===========================================================================
@@ -164,7 +170,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         use_decoupled_weight_decay: bool = True,
         split_qkv: bool = False,
         is_qkv_fn: Callable[[torch.Tensor], bool] | None = None,
-        qkv_split_shapes: tuple[int, int, int] | None = None,
+        qkv_split_shapes: list[int] | None = None,
         fp32_matmul_prec: str = "medium",
         coefficient_type: str = "quintic",
         num_ns_steps: int = 5,
@@ -224,6 +230,57 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             scaled_orthogonalize_fn=scaled_orthogonalize_fn,
         )
 
+    def _get_muon_split_shapes(self, p: torch.Tensor) -> tuple[int, ...] | None:
+        """Return per-parameter Muon split shapes, if this parameter should be split."""
+        split_shapes: tuple[int, ...] | None = getattr(p, "qkv_split_shapes", None)
+        if split_shapes is None:
+            if self.is_qkv_fn is None or not self.is_qkv_fn(p):
+                return None
+            split_shapes = self.qkv_split_shapes
+            if split_shapes is None:
+                raise ValueError(
+                    "Muon QKV split was requested for a parameter, but `qkv_split_shapes` is not "
+                    "set."
+                )
+
+        if not split_shapes or any(shape <= 0 for shape in split_shapes):
+            raise ValueError(f"Muon split shapes must be positive integers, got {split_shapes}.")
+        return split_shapes
+
+    def _orthogonalize_split_grad(
+        self,
+        grad: torch.Tensor,
+        split_shapes: tuple[int, ...],
+        tp_group: torch.distributed.ProcessGroup | None,
+        partition_dim: int | None,
+    ) -> torch.Tensor:
+        """Orthogonalize a fused projection gradient by splitting its row layout first."""
+        grad_shape = grad.shape
+        split_size = sum(split_shapes)
+        if grad_shape[0] % split_size != 0:
+            raise ValueError(
+                f"Muon split parameter has incompatible grad shape `{tuple(grad_shape)}` "
+                f"for split shapes `{split_shapes}`: `grad.shape[0]` must be divisible by "
+                f"`sum(split_shapes)={split_size}`."
+            )
+
+        log_single_rank(
+            logger,
+            logging.DEBUG,
+            f'muon split grad shape `{grad_shape}`, split shapes `{split_shapes}`',
+        )
+        num_groups = grad_shape[0] // split_size
+        split_grads = torch.split(grad.view(num_groups, split_size, -1), split_shapes, dim=1)
+        split_grads = [g.reshape(-1, grad_shape[-1]) for g in split_grads]
+
+        split_grads = [
+            self.scaled_orthogonalize_fn(g, tp_group, partition_dim).view(
+                num_groups, -1, grad_shape[-1]
+            )
+            for g in split_grads
+        ]
+        return torch.cat(split_grads, dim=1).view(grad_shape)
+
     def orthogonalize(self, p: torch.Tensor, grad: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Orthogonalize the momentum.
 
@@ -249,28 +306,9 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         if partition_dim == -1:
             partition_dim = None
 
-        if self.split_qkv and self.is_qkv_fn(p):  # type: ignore[misc]
-            grad_shape = grad.shape
-            log_single_rank(
-                logger,
-                logging.DEBUG,
-                f'qkv split grad shape {grad_shape}, ' f'split shapes {self.qkv_split_shapes}',
-            )
-            num_query_groups = grad_shape[0] // sum(self.qkv_split_shapes)
-            qkv_grads = torch.split(
-                grad.view(num_query_groups, sum(self.qkv_split_shapes), -1),
-                self.qkv_split_shapes,
-                dim=1,
-            )
-            qkv_grads = [g.reshape(-1, grad_shape[-1]) for g in qkv_grads]
-
-            qkv_grads = [
-                self.scaled_orthogonalize_fn(g, tp_group, partition_dim).view(
-                    num_query_groups, -1, grad_shape[-1]
-                )
-                for g in qkv_grads
-            ]
-            grad = torch.cat(qkv_grads, dim=1).view(grad_shape)
+        split_shapes = self._get_muon_split_shapes(p) if self.split_qkv else None
+        if split_shapes is not None:
+            grad = self._orthogonalize_split_grad(grad, split_shapes, tp_group, partition_dim)
         else:
             grad = self.scaled_orthogonalize_fn(grad, tp_group, partition_dim)
         return grad
@@ -317,7 +355,7 @@ class TensorParallelAdaptiveMuon(TensorParallelMuon, AdaptiveMuon):
         use_decoupled_weight_decay: bool = True,
         split_qkv: bool = False,
         is_qkv_fn: Callable[[torch.Tensor], bool] | None = None,
-        qkv_split_shapes: tuple[int, int, int] | None = None,
+        qkv_split_shapes: list[int] | None = None,
         fp32_matmul_prec: str = "medium",
         coefficient_type: str = "quintic",
         num_ns_steps: int = 5,

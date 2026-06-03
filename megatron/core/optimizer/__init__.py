@@ -4,7 +4,7 @@ import logging
 import warnings
 from collections import defaultdict
 from dataclasses import astuple
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 from torch.optim import SGD as CPUSGD
@@ -65,6 +65,7 @@ from .emerging_optimizers import (
     _EMERGING_OPTIMIZERS,
     HAVE_EMERGING_OPTIMIZERS,
     _create_emerging_optimizer,
+    _get_qkv_split_shapes,
 )
 from .grad_scaler import ConstantGradScaler, DynamicGradScaler
 from .layer_wise_optimizer import LayerWiseDistributedOptimizer, is_managed_by_layer_wise_optimizer
@@ -721,6 +722,136 @@ def check_config_overrides_consistency(
     return True
 
 
+def _tag_muon_split_qkv_parameters(
+    config: OptimizerConfig, model_chunks: list[MegatronModule]
+) -> None:
+    """Tag standard QKV and MLA up-projection weights with Muon split metadata.
+
+    Note that MLA down-projection weights aren't split with the current implementation.
+
+    The applied tags are:
+
+    - `is_qkv` (bool): whether the layer is a fused/packed collection of standard Multi-Head
+      Attention Q, K, and V projections. The layer contains a single weight, which includes all of
+      the Q, K, and V projections.
+    - `qkv_split_shapes` (tuple[int, ...] | None): per-group row counts for the projection slices
+      packed in this weight, if applicable. The gradients for the tagged parameter will be split
+      along the row dimension. The splits will be orthogonalized independently.
+
+      For example, without an Attention output gate, we have the following for the fused/packed
+      standard Multi-Head Attention QKV projection when not using tensor model parallelism:
+
+      ```
+      # Remember that PyTorch uses transposed weights.
+      linear_qkv.weight.shape == (
+          (
+              num_attention_heads * kv_channels  # <- Qs
+              + kv_channels * num_query_groups  # <- Ks
+              + kv_channels * num_query_groups  # <- Vs
+          ),
+          hidden_size,
+      )
+
+      linear_qkv.qkv_split_shapes = (
+          num_attention_heads // num_query_groups * kv_channels,  # <- Q
+          kv_channels,  # <- K
+          kv_channels,  # <- V
+      )
+      ```
+
+      In the optimizer step, we transform the gradient like the following:
+      ```
+      # The initial shape is like `linear_qkv.weight.shape` before.
+      linear_qkv.grad.shape == linear_qkv.weight.shape
+
+      qs_grad, ks_grad, vs_grad = muon_split_grads(linear_qkv.grad, linear_qkv.qkv_split_shapes)
+
+      qs_grad.shape == (
+          num_query_groups,
+          num_attention_heads // num_query_groups * kv_channels,
+          hidden_size,
+      )
+      ks_grad.shape == vs_grad.shape == (
+          num_query_groups,
+          kv_channels,
+          hidden_size,
+      )
+
+      # Contract first two dimensions.
+      qs_grad = qs_grad.reshape(num_attention_heads * kv_channels, hidden_size)
+      qs_grad = orthogonalize(qs_grad)
+
+      ks_grad = ks_grad.reshape(num_query_groups * kv_channels, hidden_size)
+      ks_grad = orthogonalize(ks_grad)
+
+      vs_grad = vs_grad.reshape(num_query_groups * kv_channels, hidden_size)
+      vs_grad = orthogonalize(vs_grad)
+
+      result_grad = muon_concat_grads(qs_grad, ks_grad, vs_grad)
+      result_grad.shape == linear_qkv.grad.shape
+      ```
+    """
+    split_qkv = getattr(config, 'muon_split_qkv', True)
+
+    def _is_muon_split_metadata_managed_param(
+        name: str, attn_variant: Literal["mha", "mla"]
+    ) -> bool:
+        """Return whether the parameter with the given name should be managed by Muon split tags.
+
+        E.g., standard QKV or MLA projection weights.
+        """
+        if 'linear_qkv.weight' in name:
+            return True
+        if attn_variant != "mla":
+            return False
+        return any(
+            f'{projection}.weight' in name
+            for projection in (
+                'linear_q_proj',
+                'linear_q_up_proj',
+                'linear_kv_up_proj',
+                'linear_q_down_proj',
+                'linear_kv_down_proj',
+                'linear_qkv_down_proj',
+            )
+        )
+
+    for model_chunk in model_chunks:
+        model_cfg = get_model_config(model_chunk)
+        attn_variant = "mla" if getattr(model_cfg, 'multi_latent_attention', False) else "mha"
+        standard_qkv_split_shapes = None
+        mla_q_split_shapes = None
+        mla_kv_split_shapes = None
+        if attn_variant == "mla":
+            mla_q_split_shapes = (model_cfg.qk_head_dim, model_cfg.qk_pos_emb_head_dim)
+            mla_kv_split_shapes = (model_cfg.qk_head_dim, model_cfg.v_head_dim)
+
+        for name, param in model_chunk.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            is_managed_param = _is_muon_split_metadata_managed_param(name, attn_variant)
+            if is_managed_param:
+                # Remove existing Muon split tags from a parameter.
+                for attr in ("is_qkv", "qkv_split_shapes"):
+                    if hasattr(param, attr):
+                        delattr(param, attr)
+            if not is_managed_param or not split_qkv or len(param.shape) != 2:
+                continue
+
+            if 'linear_qkv.weight' in name:
+                if standard_qkv_split_shapes is None:
+                    standard_qkv_split_shapes = tuple(_get_qkv_split_shapes(model_cfg))
+                param.qkv_split_shapes = standard_qkv_split_shapes
+                param.is_qkv = True
+            elif mla_q_split_shapes is not None and (
+                'linear_q_up_proj.weight' in name or 'linear_q_proj.weight' in name
+            ):
+                param.qkv_split_shapes = mla_q_split_shapes
+            elif mla_kv_split_shapes is not None and 'linear_kv_up_proj.weight' in name:
+                param.qkv_split_shapes = mla_kv_split_shapes
+
+
 def _get_megatron_emerging_optimizer(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
@@ -773,16 +904,15 @@ def _get_megatron_emerging_optimizer(
 
     log_single_rank(logger, logging.INFO, f'Setting up emerging optimizer with config {config}')
 
-    # Tag parameters with optimizer-specific attributes (expert_tp, is_qkv).
+    # Tag parameters with optimizer-specific attributes.
     for model_chunk in model_chunks:
         for name, param in model_chunk.named_parameters():
             if not param.requires_grad:
                 continue
             if 'experts' in name and 'shared' not in name:
                 param.expert_tp = True
-            # TODO(deyuf): support MLA
-            if 'linear_qkv.weight' in name and len(param.shape) == 2:
-                param.is_qkv = True
+    if eopt_name in ('muon', 'adaptive_muon'):
+        _tag_muon_split_qkv_parameters(config, model_chunks)
 
     # Apply optimizer-specific default param overrides (e.g. muon: non-linear -> adam).
     config_overrides.update(_EMERGING_OPTIMIZERS[eopt_name].default_param_overrides)

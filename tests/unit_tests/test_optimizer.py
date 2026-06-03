@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -19,12 +20,14 @@ from megatron.core.optimizer import (
     ParamKey,
     ParamPredicate,
     _get_param_groups,
+    _tag_muon_split_qkv_parameters,
     check_config_overrides_consistency,
     get_megatron_optimizer,
     get_standard_config_overrides,
 )
 from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.layers import copy_tensor_model_parallel_attributes
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import is_te_min_version, is_torch_min_version
 from tests.unit_tests.test_utilities import Utils
@@ -67,6 +70,125 @@ class Net(nn.Module):
         x = F.relu(self.fc2(x))
         x = self.fc3(x)
         return x
+
+
+def _test_muon_split_model_config(multi_latent_attention=False):
+    return SimpleNamespace(
+        num_attention_heads=8,
+        num_query_groups=2,
+        kv_channels=16,
+        multi_latent_attention=multi_latent_attention,
+        qk_head_dim=32,
+        qk_pos_emb_head_dim=8,
+        v_head_dim=24,
+    )
+
+
+class MuonSplitTaggingModel(nn.Module):
+    def __init__(self, config, include_standard_qkv=True, include_mla=True):
+        super().__init__()
+        self.config = config
+        self.self_attention = nn.Module()
+        hidden_size = 4
+
+        if include_standard_qkv:
+            qkv_split_shapes = (
+                config.num_attention_heads // config.num_query_groups * config.kv_channels,
+                config.kv_channels,
+                config.kv_channels,
+            )
+            qkv_size = config.num_query_groups * sum(qkv_split_shapes)
+            self.self_attention.linear_qkv = nn.Linear(hidden_size, qkv_size, bias=False)
+
+        if include_mla:
+            q_out = config.num_attention_heads * (config.qk_head_dim + config.qk_pos_emb_head_dim)
+            kv_out = config.num_attention_heads * (config.qk_head_dim + config.v_head_dim)
+            self.self_attention.linear_q_proj = nn.Linear(hidden_size, q_out, bias=False)
+            self.self_attention.linear_q_up_proj = nn.Linear(hidden_size, q_out, bias=False)
+            self.self_attention.linear_kv_up_proj = nn.Linear(hidden_size, kv_out, bias=False)
+            self.self_attention.linear_q_down_proj = nn.Linear(hidden_size, hidden_size, bias=False)
+            self.self_attention.linear_kv_down_proj = nn.Linear(
+                hidden_size, hidden_size, bias=False
+            )
+            self.self_attention.linear_qkv_down_proj = nn.Linear(
+                hidden_size, hidden_size, bias=False
+            )
+
+
+def test_tag_muon_split_qkv_parameters_tags_standard_qkv():
+    model = MuonSplitTaggingModel(
+        _test_muon_split_model_config(multi_latent_attention=False),
+        include_standard_qkv=True,
+        include_mla=False,
+    )
+    config = OptimizerConfig(optimizer='muon', muon_split_qkv=True)
+
+    _tag_muon_split_qkv_parameters(config, [model])
+
+    params = dict(model.named_parameters())
+    qkv_weight = params['self_attention.linear_qkv.weight']
+    assert qkv_weight.is_qkv
+    assert qkv_weight.qkv_split_shapes == (64, 16, 16)
+
+
+def test_tag_muon_split_qkv_parameters_tags_mla_up_projections():
+    model = MuonSplitTaggingModel(
+        _test_muon_split_model_config(multi_latent_attention=True),
+        include_standard_qkv=False,
+        include_mla=True,
+    )
+    config = OptimizerConfig(optimizer='muon', muon_split_qkv=True)
+
+    _tag_muon_split_qkv_parameters(config, [model])
+
+    params = dict(model.named_parameters())
+    assert params['self_attention.linear_q_proj.weight'].qkv_split_shapes == (32, 8)
+    assert params['self_attention.linear_q_up_proj.weight'].qkv_split_shapes == (32, 8)
+    assert params['self_attention.linear_kv_up_proj.weight'].qkv_split_shapes == (32, 24)
+
+
+def test_tag_muon_split_qkv_parameters_skips_mla_down_projections():
+    model = MuonSplitTaggingModel(
+        _test_muon_split_model_config(multi_latent_attention=True),
+        include_standard_qkv=False,
+        include_mla=True,
+    )
+    config = OptimizerConfig(optimizer='muon', muon_split_qkv=True)
+
+    _tag_muon_split_qkv_parameters(config, [model])
+
+    params = dict(model.named_parameters())
+    assert not hasattr(params['self_attention.linear_q_down_proj.weight'], 'qkv_split_shapes')
+    assert not hasattr(params['self_attention.linear_kv_down_proj.weight'], 'qkv_split_shapes')
+    assert not hasattr(params['self_attention.linear_qkv_down_proj.weight'], 'qkv_split_shapes')
+
+
+def test_tag_muon_split_qkv_parameters_respects_muon_no_split_qkv():
+    model = MuonSplitTaggingModel(
+        _test_muon_split_model_config(multi_latent_attention=True),
+        include_standard_qkv=True,
+        include_mla=True,
+    )
+    for param in model.parameters():
+        param.is_qkv = True
+        param.qkv_split_shapes = (1,)
+    config = OptimizerConfig(optimizer='muon', muon_split_qkv=False)
+
+    _tag_muon_split_qkv_parameters(config, [model])
+
+    for param in model.parameters():
+        assert not hasattr(param, 'is_qkv')
+        assert not hasattr(param, 'qkv_split_shapes')
+
+
+def test_muon_split_metadata_copied_to_bf16_main_param_clone():
+    model_param = torch.nn.Parameter(torch.zeros(4, 4))
+    model_param.qkv_split_shapes = (32, 24)
+    main_param = model_param.detach().clone().float()
+
+    copy_tensor_model_parallel_attributes(main_param, model_param)
+
+    assert main_param.qkv_split_shapes == (32, 24)
 
 
 @patch('torch.distributed.get_world_size', return_value=1)
