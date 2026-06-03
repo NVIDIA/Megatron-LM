@@ -124,6 +124,10 @@ class ModelParallelConfig:
     moe_grad_scale_func: Optional[Callable] = None
     """If using loss scaling for MoE auxiliary losses, this function should return the
        scale tensor for MoE aux loss. If None, falls back to grad_scale_func.
+    mtp_grad_scale_func: Optional[Callable] = None
+    """If using loss scaling for MTP (Multi-Token Prediction), this function should return the
+       scalar or size-1 scale value for MTP loss. The value is converted to the output tensor
+       device. If None, falls back to grad_scale_func with torch.ones(1).
     """
 
     no_sync_func: Optional[Callable] = None

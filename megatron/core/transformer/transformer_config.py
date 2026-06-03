@@ -563,6 +563,11 @@ class TransformerConfig(ModelParallelConfig):
     """When set to False, override FP8 config options and do the wgrad computation
     in higher precision."""
 
+    fp8_output_proj: bool = False
+    """If True, run the LM-head output projection with a TE ColumnParallelLinear
+    under the MXFP8 autocast context. Only active when fp8=True and
+    fp8_recipe='mxfp8'."""
+
     fp8_dot_product_attention: bool = False
     """When set to True, use the FP8 implementation of Dot Product Attention."""
 
@@ -746,6 +751,12 @@ class TransformerConfig(ModelParallelConfig):
     If negative, generates bias once per layer and reuses it (abs value is std).
     This is an experimental feature for benchmarking purposes."""
 
+    use_grouped_gemm_for_dense_mlp: bool = False
+    """Use GroupedLinear(num_groups=1) for dense MLP to trigger the
+    ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8 fusion on SM100+ with MXFP8 recipe.
+    Requires ``use_te_op_fuser=True`` and SwiGLU activation.
+    """
+
     moe_grouped_gemm: bool = False
     """When there are multiple experts per rank, compress multiple local (potentially small) gemms
     in a single kernel launch to improve the utilization and performance by leveraging the Grouped
@@ -859,9 +870,13 @@ class TransformerConfig(ModelParallelConfig):
     block interleaved format. Instead of interpreting the input tensor
     as a concatenation of gates and linear units, it will be
     interpreted as alternating blocks of gates and linear units.
-
     This data format is experimental and primarily intended to enable
     advanced fused kernels."""
+
+    moe_expert_rank_capacity_factor: Optional[float] = None
+    """moe_expert_rank_capacity_factor (float): The capacity factor for each expert rank. Tokens 
+    exceeding this budget will be dropped. None means no token will be dropped. 
+    The default is None."""
 
     ##################
     # Context Parallel
@@ -1122,6 +1137,24 @@ class TransformerConfig(ModelParallelConfig):
     min_offloaded_tensor_size: int = 1024 * 1024
     """The minimum size of the tensor to be offloaded."""
 
+    moe_paged_stash: bool = False
+    """If True, enable paged stash for all routed-expert activations needed for backward"""
+
+    moe_paged_stash_page_size: int = 64
+    """Number of tokens per page for paged stash memory management."""
+
+    moe_paged_stash_buffer_size_factor_cuda: float = 1.10
+    """Scale factor for paged stash CUDA buffer allocation.
+
+    Sign selects sizing: positive = avg-based, negative = actual-max. Magnitude is headroom
+    (e.g. 1.10 = 10%)."""
+
+    moe_paged_stash_buffer_size_factor_cpu: float = 0.0
+    """Scale factor for paged stash host buffer. 0 disables host buffer.
+
+    Same sign convention as moe_paged_stash_buffer_size_factor_cuda: positive = avg-based,
+    negative = actual-max; scale = abs(factor)."""
+
     fine_grained_offloading_max_inflight_offloads: Optional[int] = None
     """Per fine-grained offloading group name, max number of inflight offloads for that name not
     yet joined on the main stream (wait_event on D2H). The same cap applies to every name (e.g.,
@@ -1263,6 +1296,14 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.fp8_param and not self.fp8:
             raise ValueError("fp8_param must be used together with fp8 mode.")
+
+        if self.fp8_output_proj:
+            if not self.fp8:
+                raise ValueError("fp8_output_proj must be used together with fp8 mode.")
+            if self.fp8_recipe != Fp8Recipe.mxfp8:
+                raise ValueError(
+                    f"fp8_output_proj requires fp8_recipe='mxfp8', got " f"'{self.fp8_recipe}'."
+                )
 
         # FP4 validation
         if self.fp4_param and not self.fp4:
@@ -1471,6 +1512,18 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_expert_capacity_factor must be set to use moe_pad_expert_input_to_capacity"
                 )
 
+        if self.moe_expert_rank_capacity_factor is not None:
+            if not self.use_transformer_engine_op_fuser:
+                raise ValueError(
+                    "moe_expert_rank_capacity_factor requires use_transformer_engine_op_fuser to "
+                    "be enabled."
+                )
+            if self.moe_flex_dispatcher_backend != "hybridep":
+                raise ValueError(
+                    "moe_expert_rank_capacity_factor requires moe_flex_dispatcher_backend to be "
+                    "'hybridep'."
+                )
+
         if self.cpu_offloading and (
             self.cpu_offloading_num_layers < 0 or self.cpu_offloading_num_layers >= self.num_layers
         ):
@@ -1626,6 +1679,21 @@ class TransformerConfig(ModelParallelConfig):
                     "attn_proj cannot be set to offload_modules alone without core_attn "
                     "because the input of attn_proj is the output of core_attn, "
                     "which is needed in core_attn.backward()."
+                )
+        if self.moe_paged_stash:
+            if self.cpu_offloading:
+                raise ValueError("moe_paged_stash cannot be enabled with cpu_offloading.")
+            if self.moe_expert_rank_capacity_factor is None:
+                raise ValueError(
+                    "moe_paged_stash requires moe_expert_rank_capacity_factor to be set; "
+                    "there is no need to use paged stashing without it."
+                )
+            moe_offload_conflict = {"expert_fc1", "moe_act"} & set(self.offload_modules)
+            if moe_offload_conflict:
+                raise ValueError(
+                    "When moe_paged_stash is enabled, offload_modules must not include "
+                    f"expert_fc1 or moe_act (paged stash covers those activations). "
+                    f"Remove: {moe_offload_conflict}"
                 )
 
         if (
@@ -2371,21 +2439,16 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.mtp_num_layers is None or self.mtp_num_layers == 1
             ), 'MTP layernum only supports 1 when enabling overlap_moe_expert_parallel_comm.'
-            if self.mtp_num_layers == 1:
-                assert self.pipeline_model_parallel_size > 1, (
-                    'Pipeline model parallel size must be larger than 1 '
-                    'when enabling overlap_moe_expert_parallel_comm with MTP layer.'
-                )
 
             if self.cuda_graph_impl != "none":
-                assert (
-                    self.cuda_graph_impl == "transformer_engine"
-                    and CudaGraphModule.moe not in self.cuda_graph_modules
-                    and CudaGraphModule.mlp not in self.cuda_graph_modules
-                ), (
-                    'CUDA graph scope on moe and mlp is not '
-                    'supported with overlap_moe_expert_parallel_comm'
-                )
+                if self.cuda_graph_impl == "transformer_engine":
+                    assert (
+                        CudaGraphModule.moe not in self.cuda_graph_modules
+                        and CudaGraphModule.mlp not in self.cuda_graph_modules
+                    ), (
+                        'CUDA graph scope on moe and mlp is not '
+                        'supported with overlap_moe_expert_parallel_comm'
+                    )
 
         # Check delay_wgrad_compute compatibility
         if self.delay_wgrad_compute:

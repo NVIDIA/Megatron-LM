@@ -150,7 +150,7 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
     from different sequences.
 
     Args:
-        tensor (Tensor): The input tensor to roll.
+        tensor (Tensor): The input tensor to roll. If None, returns (None, None).
         shifts (int): The shift of the tensor (typically -1 for MTP).
         dims (int): The dimension to roll (typically -1 for sequence dimension).
         cp_group (ProcessGroup): The context parallelism process group. If None or size=1,
@@ -160,6 +160,9 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
     Returns:
         tuple: (rolled_tensor, sum_of_rolled_tensor)
     """
+    if tensor is None:
+        return None, None
+
     # Handle packed sequences cases
     if packed_seq_params is not None:
         return _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group)
@@ -631,6 +634,7 @@ def process_mtp_loss(
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     packed_seq_params: Optional[PackedSeqParams] = None,
     scale_logits_fn: Optional[Callable[[Tensor], Tensor]] = None,
+    input_ids: Optional[Tensor] = None,
 ) -> Tensor:
     """Process Multi-Token Prediction (MTP) loss computation.
 
@@ -651,6 +655,10 @@ def process_mtp_loss(
         packed_seq_params (Optional[PackedSeqParams]): Packed sequence parameters.
         scale_logits_fn (Optional[Callable[[Tensor], Tensor]]): Optional function to
             scale logits before loss computation (e.g., MuP output scaling).
+        input_ids (Optional[Tensor]): Input token IDs. Used to derive labels when
+            ``labels`` is None (e.g. RL training), by rolling left to match the SFT
+            label convention (``label[i] = input_id[i + 1]``). Ignored when ``labels``
+            is provided.
 
     Returns:
         Tensor: Updated hidden states after MTP loss processing (first chunk only).
@@ -658,12 +666,27 @@ def process_mtp_loss(
     hidden_states_list = torch.chunk(hidden_states, 1 + config.mtp_num_layers, dim=0)
     hidden_states = hidden_states_list[0]
 
+    # When labels are not provided (e.g. RL training), derive them from input_ids by
+    # rolling left so that label[i] = input_id[i + 1], matching the SFT label format.
+    derived_labels_from_input_ids = False
     if labels is None:
-        return hidden_states
+        if input_ids is None:
+            return hidden_states
+        labels, _ = roll_tensor(
+            input_ids, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
+        )
+        derived_labels_from_input_ids = True
 
     mtp_labels = labels.clone()
     if loss_mask is None:
         loss_mask = torch.ones_like(mtp_labels)
+    if derived_labels_from_input_ids:
+        # input_ids has no real token beyond the sequence window, so the last rolled-in
+        # label is fabricated (zeroed). Roll loss_mask in lockstep with the
+        # input_ids -> labels shift so that boundary position is masked.
+        loss_mask, _ = roll_tensor(
+            loss_mask, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
+        )
 
     # Store the original number of tokens before rolling for proper normalization
     # when calculate_per_token_loss is enabled. This ensures MTP gradients are
@@ -687,9 +710,10 @@ def process_mtp_loss(
         mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
         mtp_loss = loss_mask * mtp_loss
         if is_training:
+            # Safe divide without sync: mask numerator when num_tokens==0, divide by clamp(min=1)
             mtp_loss_for_log = (
-                torch.sum(mtp_loss) / num_tokens if num_tokens > 0 else mtp_loss.new_tensor(0.0)
-            )
+                torch.sum(mtp_loss) * (num_tokens > 0).to(mtp_loss.dtype)
+            ) / num_tokens.clamp(min=1)
             MTPLossLoggingHelper.save_loss_to_tracker(
                 mtp_loss_for_log,
                 mtp_layer_number,
@@ -749,7 +773,12 @@ class MultiTokenPredictionLayer(MegatronModule):
         mtp_layer_pattern: Optional[str] = None,
         hybrid_submodules: Optional[HybridStackSubmodules] = None,
         mamba_submodules: Optional[HybridStackSubmodules] = None,
+        name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         super().__init__(config=config)
         if mamba_submodules is not None:
             if hybrid_submodules is not None:
@@ -828,6 +857,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             is_expert=False,
             tp_comm_buffer_name="mtp_eh_proj",
             tp_group=pg_collection.tp if pg_collection is not None else None,
+            name=(name + ".eh_proj") if name is not None else None,
         )
 
         # Build inner layers: two possible paths
@@ -847,6 +877,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 post_process=True,  # MTP layer is self-contained
                 pg_collection=pg_collection,
                 is_mtp_layer=True,
+                name=(name + ".mtp_model_layer") if name is not None else None,
             )
         elif self.config.mtp_num_layers is not None:
             # GPT path: Uses the transformer block spec for MTP layer
@@ -860,6 +891,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 layer_number=self.layer_number,
                 is_mtp_layer=True,
                 pg_collection=pg_collection,
+                name=(name + ".mtp_model_layer") if name is not None else None,
             )
 
         self.final_layernorm = self.submodules.layer_norm(
@@ -1086,6 +1118,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         hidden_states: Tensor,
         decoder_input: Tensor,
         attention_mask: Optional[Tensor] = None,
+        padding_mask: Optional[Tensor] = None,
         context: Optional[Tensor] = None,
         context_mask: Optional[Tensor] = None,
         rotary_pos_emb: Optional[Tensor] = None,
@@ -1121,6 +1154,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             hidden_states,
             decoder_input,
             attention_mask,
+            padding_mask,
             context,
             context_mask,
             rotary_pos_emb,
@@ -1132,6 +1166,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 hidden_states=hidden_states,
                 decoder_input=decoder_input,
                 attention_mask=attention_mask,
+                padding_mask=padding_mask,
                 context=context,
                 context_mask=context_mask,
                 rotary_pos_emb=rotary_pos_emb,
@@ -1178,6 +1213,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                     hidden_states,
                     decoder_input,
                     attention_mask,
+                    padding_mask,
                     context,
                     context_mask,
                     rotary_pos_emb,
@@ -1197,6 +1233,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                     hidden_states,
                     decoder_input,
                     attention_mask,
+                    padding_mask,
                     context,
                     context_mask,
                     rotary_pos_emb,
@@ -1223,6 +1260,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 hidden_states=hidden_states,
                 decoder_input=decoder_input,
                 attention_mask=attention_mask,
+                padding_mask=padding_mask,
                 context=context,
                 context_mask=context_mask,
                 rotary_pos_emb=rotary_pos_emb,
@@ -1432,7 +1470,12 @@ class MultiTokenPredictionBlock(MegatronModule):
         mtp_num_depths: int = 0,
         hybrid_submodules: Optional["HybridStackSubmodules"] = None,
         mamba_submodules: Optional["HybridStackSubmodules"] = None,
+        name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         super().__init__(config=config)
         if mamba_submodules is not None:
             if hybrid_submodules is not None:
@@ -1453,6 +1496,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         self.mtp_num_depths = mtp_num_depths
         self.hybrid_submodules = hybrid_submodules
         self.mtp_use_repeated_layer = self.config.mtp_use_repeated_layer
+        self.name = name
 
         vp_size = config.virtual_pipeline_model_parallel_size
         assert is_vp_last_stage(vp_stage=vp_stage, vp_size=vp_size), (
@@ -1495,6 +1539,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                     vp_stage=self.vp_stage,
                     pg_collection=pg_collection,
                     mtp_layer_pattern=self.mtp_layer_pattern,
+                    name=(self.name + f".layers.{layer_number}") if self.name is not None else None,
                 )
             return module
 
@@ -1512,6 +1557,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                     pg_collection=pg_collection,
                     mtp_layer_pattern=mtp_layer_pattern,
                     hybrid_submodules=hybrid_submodules,
+                    name=(self.name + f".layers.{layer_number}") if self.name is not None else None,
                 )
             return module
 
