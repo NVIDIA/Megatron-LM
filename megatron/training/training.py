@@ -573,7 +573,7 @@ def num_floating_point_operations(args, batch_size):
                 ## for in the dsv4_hybrid branch below.
                 q_term = args.q_lora_rank * (
                     args.hidden_size
-                    + args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim)
+                    + args.num_attention_heads * args.v_head_dim
                     + 1  # q norm
                 )
                 kv_term = args.hidden_size * args.v_head_dim + args.v_head_dim  # kv proj + kv norm
