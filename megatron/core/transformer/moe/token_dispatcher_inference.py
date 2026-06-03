@@ -40,6 +40,7 @@ from megatron.core.tensor_parallel import (
     gather_from_sequence_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
 )
+from megatron.core.transformer.moe.inference_routing_mask_kernel import mask_routing_padding
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.moe.token_dispatcher import MoEAllGatherTokenDispatcher
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -301,6 +302,12 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
     _step_metadata: Optional[torch.Tensor] = None  # [3] int32
     _per_rank_worst_case_token_count: int = 2048  # round_up_tokens(max_tokens) // tp_size
 
+    # [1] int32 view onto context.gpu_view.real_token_count. Fixed GPU address;
+    # written each step by the context's transfer_bookkeeping_to_gpu(). Holds the
+    # real (unpadded) local token count so the dispatcher can mask routing for
+    # CUDA-graph padding tokens. Wired once by the context after gpu_view init.
+    _real_token_count_tensor: Optional[torch.Tensor] = None
+
     # ── Class-level symmetric buffer handles (allocated once at model init) ───────
     # Dtypes: hidden=bf16, routing=int64, probs=fp32, rsv=fp32.
     _symm_agv_hidden: Optional[dict] = None  # {"tensor": ..., "handle": ...}
@@ -313,6 +320,16 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         """Return the RSV symmetric buffer tensor so mcore_fused_moe can write
         unpermute output directly into it, avoiding a copy before RSV."""
         return cls._symm_rsv["tensor"] if cls._symm_rsv is not None else None
+
+    @classmethod
+    def set_real_token_count_tensor(cls, tensor: torch.Tensor) -> None:
+        """Bind the context's GPU real-token-count tensor on the dispatcher class.
+
+        Called once by DynamicInferenceContext after gpu_view is initialised.
+        The tensor is a fixed-address int32[1] view whose value is refreshed
+        each step by transfer_bookkeeping_to_gpu().
+        """
+        cls._real_token_count_tensor = tensor
 
     @classmethod
     def _rank_token_offset(cls) -> torch.Tensor:
@@ -331,6 +348,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         cls._symm_agv_probs = None
         cls._symm_rsv = None
         cls._symm_metadata = None
+        cls._real_token_count_tensor = None
 
     @classmethod
     def allocate_buffers(
@@ -454,6 +472,10 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             runs_metadata_sync=runs_metadata_sync,
         )
         self.topk = config.moe_router_topk
+        # Rank inside pg_collection.tp — the *standard* TP group that SP shards
+        # the routing map along. Base class self.tp_rank is the expt_tp rank,
+        # which is not what we want for the SP padding offset.
+        self.sp_rank = get_pg_rank(pg_collection.tp)
         # Set in dispatch_preprocess; consumed by token_dispatch and token_combine.
         self._local_tokens: int = 0
         # When shared_expert_overlap is enabled, the shared expert forward is launched
@@ -509,6 +531,15 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
 
         if self._runs_metadata_sync:
             self.update_metadata(hidden_states.shape[0])
+
+        # Mask out CUDA-graph padding rows of the local routing map so the AGV
+        # propagates -1 into agv_r for those slots; padding tokens then route
+        # to no expert. _real_token_count_tensor is wired by the context and
+        # holds the *global* unpadded token count, so we pass self.sp_rank to
+        # shift local rows into the global frame for the comparison.
+        mask_routing_padding(
+            self.routing_map, self.__class__._real_token_count_tensor, self.sp_rank
+        )
 
         agv_h = self.__class__._symm_agv_hidden
         agv_r = self.__class__._symm_agv_routing
