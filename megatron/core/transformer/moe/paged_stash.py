@@ -11,6 +11,7 @@ import triton.language as tl
 from megatron.core._rank_utils import log_single_rank
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
 from megatron.core.utils import get_attr_wrapped_model
 
 logger = logging.getLogger(__name__)
@@ -1362,7 +1363,13 @@ class PagedStashRunner:
         if self.copy_main_params:
 
             def _try_copy_main_params(opt):
-                if isinstance(opt, DistributedOptimizer) and hasattr(
+                if isinstance(opt, LayerWiseDistributedOptimizer):
+                    # The LayerWise (muon) optimizer also stages its MXFP8 masters in
+                    # the buffer aliased onto the grad buffer zeroed above; its
+                    # _copy_main_params_to_param_buffer self-guards on
+                    # use_buffer_param_sync + reuse_grad_buf_for_mxfp8_param_ag.
+                    opt._copy_main_params_to_param_buffer()
+                elif isinstance(opt, DistributedOptimizer) and hasattr(
                     opt, 'shard_fp32_from_float16_groups'
                 ):
                     opt._copy_main_params_to_param_buffer()

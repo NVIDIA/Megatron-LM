@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron distributed optimizer."""
 
@@ -2982,15 +2982,22 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         copy_group_params(self.model_fp32_groups, self.shard_fp32_groups)
 
     def start_param_sync_for_bucket_group_subset(self) -> None:
-        """Trigger ``start_param_sync`` on DistOpt-managed bucket groups only.
+        """Trigger ``start_param_sync`` only on DistOpt-managed buckets.
 
-        Walks each model chunk's DDP bucket groups and skips those tagged
-        ``is_managed_by_layer_wise_optimizer=True`` (so a sibling
-        :class:`LayerWiseDistributedOptimizer` does not double-sync the same
-        buckets). When no LayerWise tagging is present every bucket group is
-        included — matching the previous ``model_chunk.start_param_sync()``
-        behaviour. Uses :meth:`DistributedDataParallel._start_bucket_group_param_sync`
-        so FP8 post-all-gather processing (and MXFP8 copy) still runs.
+        Filters DDP bucket groups **per-bucket** so a sibling
+        :class:`LayerWiseDistributedOptimizer` (e.g. the Muon LayerWise
+        optimizer) does not double-sync any bucket. When no LayerWise tagging
+        is present every bucket group is included — matching the previous
+        ``model_chunk.start_param_sync()`` behaviour. Mixed-ownership bucket
+        groups (some buckets DistOpt-managed, some LayerWise-managed) can
+        appear in ``param_and_grad_buffer.partition_buckets`` Case 3 (FP8
+        present, ``reduce_scatter_with_fp32_accumulation=False``), which
+        appends non-FP8 DistOpt-managed bf16 buckets (biases, layernorms)
+        into the last FP8 bucket group. For those groups we synthesize a
+        bucket group that contains only the DistOpt buckets so the
+        LayerWise side's all-gather and ours stay disjoint. Uses
+        :meth:`DistributedDataParallel._start_bucket_group_param_sync` so
+        FP8 post-all-gather processing (and MXFP8 copy) still runs.
         """
         # Deferred import: layer_wise_optimizer's compute_full_param_layout
         # lazily imports DistributedOptimizer, so importing the helper at
@@ -3003,11 +3010,43 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             ):
                 if not bucket_group.buckets:
                     continue
-                if _bucket_is_managed_by_layer_wise_optimizer(
-                    bucket_group.buckets[0], default_for_untagged=False
-                ):
+                # Restrict to buckets *not* claimed by LayerWise — those will
+                # be all-gathered by ``LayerWiseDistributedOptimizer.
+                # start_param_sync_for_bucket_group_subset`` instead.
+                distopt_buckets = [
+                    bucket
+                    for bucket in bucket_group.buckets
+                    if not _bucket_is_managed_by_layer_wise_optimizer(
+                        bucket, default_for_untagged=False
+                    )
+                ]
+                if not distopt_buckets:
+                    # Entire group is LayerWise-owned; LayerWise will sync it.
                     continue
-                model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=False)
+
+                if len(distopt_buckets) == len(bucket_group.buckets):
+                    # Pure DistOpt group — dispatch the original bucket
+                    # group as-is so all per-bucket-group state on the DDP
+                    # side (handles, gather lists, etc.) is reused.
+                    model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=False)
+                else:
+                    # Mixed group (Case 3 above): build a thin transient
+                    # bucket group containing only the DistOpt buckets and
+                    # dispatch that. The synthesized group reuses the
+                    # parent's ddp_config / DP process group / DP world
+                    # size so the AG collective lands on the same comm.
+                    # The LayerWise side will independently sync the
+                    # LayerWise-tagged buckets from the same parent group
+                    # via its mirror of this routine.
+                    distopt_bucket_group = type(bucket_group)(
+                        distopt_buckets,
+                        bucket_group.ddp_config,
+                        bucket_group.intra_distributed_optimizer_instance_group,
+                        bucket_group.intra_distributed_optimizer_instance_size,
+                    )
+                    model_chunk._start_bucket_group_param_sync(
+                        distopt_bucket_group, force_sync=False
+                    )
 
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:

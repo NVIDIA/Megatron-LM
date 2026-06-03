@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron optimizer."""
 
@@ -1311,7 +1311,13 @@ class ChainedOptimizer(MegatronOptimizer):
         deferred_bucket_groups = []
         deferred_bucket_group_ids = set()
 
-        for optimizer in self.chained_optimizers:
+        def iter_distributed_optimizers(optimizer):
+            if isinstance(optimizer, DistributedOptimizer):
+                yield optimizer
+            for child in getattr(optimizer, 'chained_optimizers', []):
+                yield from iter_distributed_optimizers(child)
+
+        for optimizer in iter_distributed_optimizers(self):
             if not isinstance(optimizer, DistributedOptimizer):
                 continue
 
@@ -1322,23 +1328,48 @@ class ChainedOptimizer(MegatronOptimizer):
                 ):
                     if not bucket_group.buckets:
                         continue
-                    if _bucket_is_managed_by_layer_wise_optimizer(
-                        bucket_group.buckets[0], default_for_untagged=False
-                    ):
-                        continue
 
                     bucket_group_id = id(bucket_group)
                     if bucket_group_id in deferred_bucket_group_ids:
                         continue
 
+                    distopt_buckets = [
+                        bucket
+                        for bucket in bucket_group.buckets
+                        if not _bucket_is_managed_by_layer_wise_optimizer(
+                            bucket, default_for_untagged=False
+                        )
+                    ]
+                    if not distopt_buckets:
+                        continue
+
                     deferred_bucket_group_ids.add(bucket_group_id)
-                    deferred_bucket_groups.append((model_chunk, bucket_group))
+                    if len(distopt_buckets) == len(bucket_group.buckets):
+                        deferred_bucket_groups.append((model_chunk, bucket_group))
+                    else:
+                        deferred_bucket_groups.append(
+                            (
+                                model_chunk,
+                                type(bucket_group)(
+                                    distopt_buckets,
+                                    bucket_group.ddp_config,
+                                    bucket_group.intra_distributed_optimizer_instance_group,
+                                    bucket_group.intra_distributed_optimizer_instance_size,
+                                ),
+                            )
+                        )
 
         return deferred_bucket_groups
 
     def _disable_deferred_mxfp8_param_sync(self) -> None:
         """Disable deferred DistOpt param sync."""
-        for optimizer in self.chained_optimizers:
+
+        def iter_optimizers(optimizer):
+            yield optimizer
+            for child in getattr(optimizer, 'chained_optimizers', []):
+                yield from iter_optimizers(child)
+
+        for optimizer in iter_optimizers(self):
             if hasattr(optimizer, '_defer_param_sync'):
                 optimizer._defer_param_sync = False
 
