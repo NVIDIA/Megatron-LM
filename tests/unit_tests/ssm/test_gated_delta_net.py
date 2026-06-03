@@ -570,9 +570,7 @@ class TestFusedThdAllToAll:
         cp_size = cp_group.size()
         t_global = int(cu_seqlens[-1].item())
         if split_sections is not None and cp_size > 1:
-            head_perm = _build_head_perm_for_split_sections(
-                list(split_sections), cp_size, local_t.device
-            )
+            head_perm = _build_head_perm_for_split_sections(split_sections, cp_size, local_t.device)
             local_t = local_t.index_select(-1, head_perm)
         naive = tensor_a2a_cp2hp(
             local_t,
@@ -608,7 +606,7 @@ class TestFusedThdAllToAll:
             (0, 16, 48, 80),  # 3 unequal sequences
         ],
     )
-    @pytest.mark.parametrize("split_sections", [(8, 8, 4, 4, 4, 4)])
+    @pytest.mark.parametrize("split_sections", [(8, 8, 4, 16, 32, 4)])
     def test_cp2hp_batched_matches_per_seq(self, cu_seqlens, split_sections):
         cu = torch.tensor(cu_seqlens, dtype=torch.long, device=torch.cuda.current_device())
         if (torch.diff(cu) % self.cp_size != 0).any():
@@ -616,9 +614,7 @@ class TestFusedThdAllToAll:
 
         T_global = cu_seqlens[-1]
         T_local = T_global // self.cp_size
-        hidden = 32
-        if split_sections is not None:
-            assert sum(split_sections) == hidden, (split_sections, hidden)
+        hidden = sum(split_sections)
         torch.manual_seed(42)
         local_t = (
             torch.rand(T_local, 1, hidden, device=torch.cuda.current_device())
@@ -626,11 +622,9 @@ class TestFusedThdAllToAll:
             .contiguous()
         )
 
-        out_ref = self._per_seq_a2a_cp2hp(
-            local_t, cu, self.cp_group, split_sections=list(split_sections)
-        )
+        out_ref = self._per_seq_a2a_cp2hp(local_t, cu, self.cp_group, split_sections=split_sections)
         out_fused = self._batched_a2a_cp2hp(
-            local_t, cu, self.cp_group, split_sections=list(split_sections)
+            local_t, cu, self.cp_group, split_sections=split_sections
         )
 
         rank = torch.distributed.get_rank()

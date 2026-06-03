@@ -7,6 +7,7 @@
 
 import logging
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from typing import List, Optional, Tuple, Union
 
 import torch
@@ -350,14 +351,14 @@ class GatedDeltaNet(MegatronModule):
         if self.cp_size > 1:
             # # Pre-permute head dim so a single unsectioned a2a is equivalent to per-section a2a.
             head_perm = _build_head_perm_for_split_sections(
-                [
+                (
                     self.qk_dim_local_tp,
                     self.qk_dim_local_tp,
                     self.v_dim_local_tp,
                     self.v_dim_local_tp,
                     self.num_value_heads // self.tp_size,
                     self.num_value_heads // self.tp_size,
-                ],
+                ),
                 self.pg_collection.cp.size(),
                 torch.cuda.current_device(),
             )
@@ -754,8 +755,9 @@ def _build_thd_cp_a2a_perm(
     return idx, inv
 
 
+@lru_cache(maxsize=8)
 def _build_head_perm_for_split_sections(
-    split_sections: List[int], cp_size: int, device: torch.device
+    split_sections: Tuple[int], cp_size: int, device: torch.device
 ) -> torch.Tensor:
     assert all(
         s % cp_size == 0 for s in split_sections
