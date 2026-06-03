@@ -378,7 +378,6 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
         Utils.destroy_model_parallel()
 
 
-@pytest.mark.flaky_in_dev
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
 def test_gpt_fine_grained_activation_offload_fraction_correctness_and_memory():
     """
