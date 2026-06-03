@@ -3691,10 +3691,16 @@ def train(
             if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
                 # disable_forward_pre_hook(param_sync=True) below force-syncs params for eval.
                 # Copy the main params to param buffer before the forced AllGather.
+                # Both the standard DistributedOptimizer and the LayerWise (muon)
+                # optimizer stage their MXFP8 masters in the buffer aliased onto the
+                # grad buffer that zero_grad_buffer() just zeroed; re-stage both so the
+                # forced eval all-gather ships fresh weights instead of the zeroed buffer.
                 for model_chunk in model:
                     model_chunk.zero_grad_buffer()
                 for optim_instance in optimizer.chained_optimizers:
-                    if isinstance(optim_instance, DistributedOptimizer):
+                    if isinstance(
+                        optim_instance, (DistributedOptimizer, LayerWiseDistributedOptimizer)
+                    ):
                         optim_instance._copy_main_params_to_param_buffer()
             if should_disable_forward_pre_hook(args):
                 disable_forward_pre_hook(model)
