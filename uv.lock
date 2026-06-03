@@ -41,7 +41,7 @@ version = "1.0.0+9edee0c"
 [[manifest.dependency-metadata]]
 name = "transformer-engine"
 version = "2.15.0+42b84005"
-requires-dist = ["pydantic", "importlib-metadata>=1.0", "packaging", "torch>=2.1", "einops", "onnxscript", "onnx", "nvdlfw-inspect"]
+requires-dist = ["pydantic<2.14", "importlib-metadata>=1.0", "packaging", "torch>=2.1", "einops", "onnxscript", "onnx", "nvdlfw-inspect"]
 
 [[package]]
 name = "absl-py"
