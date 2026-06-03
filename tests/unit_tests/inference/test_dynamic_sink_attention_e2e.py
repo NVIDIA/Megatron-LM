@@ -28,8 +28,8 @@ What this exercises that the math-only unit tests in
 import pytest
 import torch
 
+from megatron.core.inference.inference_request import Status
 from megatron.core.utils import is_fa_min_version
-from tests.unit_tests.test_utilities import Utils
 
 # Reuse the existing dynamic-engine test infrastructure. Only the
 # *teardown* in that file is hazardous (the SIGABRT in delete_cuda_graphs);
@@ -39,12 +39,11 @@ from tests.unit_tests.inference.engines.test_dynamic_engine import (
     DynamicInferenceEngineTestBase,
     set_rounder,
 )
-from megatron.core.inference.inference_request import Status
+from tests.unit_tests.test_utilities import Utils
 
 
 @pytest.mark.skipif(
-    not is_fa_min_version("2.7.3"),
-    reason="dynamic batching requires flash-attn >= 2.7.3",
+    not is_fa_min_version("2.7.3"), reason="dynamic batching requires flash-attn >= 2.7.3"
 )
 class TestDynamicEngineSinkAttention(DynamicInferenceEngineTestBase):
     """End-to-end dynamic-engine runs with sink (off-by-one / learnable)
