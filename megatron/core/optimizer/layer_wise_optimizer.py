@@ -849,9 +849,14 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         from CPU pinned memory to the current CUDA device. A ``torch.cuda.synchronize()``
         at exit ensures all H2D transfers complete before the optimizer step proceeds.
 
+        This method is idempotent: if all tensors are already on GPU (e.g. when called
+        a second time from ``step_with_ready_grads`` after ``prepare_grads`` already
+        reloaded), no synchronization barrier is issued.
+
         Called at the start of each optimizer step so that the Newton-Schulz iterations
         (Muon) or Adam updates can operate on GPU tensors.
         """
+        any_moved = False
         for opt in self.chained_optimizers:
             if getattr(opt, 'is_stub_optimizer', False):
                 continue
@@ -861,11 +866,14 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 for param in group:
                     if not param.data.is_cuda:
                         param.data = param.data.to('cuda')
+                        any_moved = True
             for state_vals in opt.optimizer.state.values():
                 for key, val in state_vals.items():
                     if isinstance(val, torch.Tensor) and not val.is_cuda:
                         state_vals[key] = val.to('cuda')
-        torch.cuda.synchronize()
+                        any_moved = True
+        if any_moved:
+            torch.cuda.synchronize()
 
     # TODO(deyuf): need to improve dist checkpointing design to properly handle this
     # fp32_from_fp16_params is list, each sub list could be empty if group is empty

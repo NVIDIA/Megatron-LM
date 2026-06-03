@@ -675,3 +675,150 @@ class TestLayerWiseOptimizer:
                 check_equal(optim_param_state_A, optim_param_state_B)
 
         Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize('tp', [1, 2])
+    @pytest.mark.parametrize('pp', [1, 2])
+    @pytest.mark.parametrize('bf16', [True])
+    def test_layer_wise_optimizer_save_load_cpu_offload(
+        self, tmp_path_dist_ckpt, tp, pp, bf16
+    ):
+        """Test save/load of LayerWiseDistributedOptimizer with cpu_offload=True.
+
+        Runs an optimizer step to produce non-trivial post-update momentum
+        states, then saves a checkpoint with states offloaded to CPU. Loads
+        into a fresh optimizer, verifies states are correctly placed on CPU,
+        confirms a subsequent step succeeds after load, and checks checkpoint
+        A == B equivalence.
+        """
+        if tp * pp > 8:
+            pytest.skip(f"TP*PP > 8 is larger than world size")
+
+        Utils.initialize_model_parallel(tp, pp)
+
+        with TempNamedDir(
+            tmp_path_dist_ckpt / 'test_layer_wise_cpu_offload_A', sync=True
+        ) as ckpt_dir_A:
+            with TempNamedDir(
+                tmp_path_dist_ckpt / 'test_layer_wise_cpu_offload_B', sync=True
+            ) as ckpt_dir_B:
+                from megatron.core.optimizer.optimizer import Float16OptimizerWithFloat16Params
+
+                # Create model and optimizer A with cpu_offload
+                model_A, optimizer_A = setup_model_and_optimizer(
+                    seed=2,
+                    tp=tp,
+                    pp=pp,
+                    bf16=bf16,
+                    dist_opt=False,
+                    initialize_fn=initialize_gpt_model,
+                    optimizer='dist_muon',
+                )
+                assert isinstance(optimizer_A, LayerWiseDistributedOptimizer)
+                optimizer_A._cpu_offload = True
+
+                # Run a step to produce non-trivial optimizer state (momentum)
+                for opt in optimizer_A.chained_optimizers:
+                    if getattr(opt, 'is_stub_optimizer', False):
+                        continue
+                    if isinstance(opt, Float16OptimizerWithFloat16Params):
+                        for group in opt.float16_groups:
+                            for p in group:
+                                p.main_grad = torch.randn_like(p.data)
+                        for group in opt.fp32_from_fp32_groups:
+                            for p in group:
+                                p.main_grad = torch.randn_like(p.data)
+                optimizer_A.step()
+
+                # After step, states should be on CPU (offloaded by step)
+                for opt in optimizer_A.chained_optimizers:
+                    if getattr(opt, 'is_stub_optimizer', False):
+                        continue
+                    if isinstance(opt, Float16OptimizerWithFloat16Params):
+                        for group in opt.fp32_from_float16_groups:
+                            for param in group:
+                                assert not param.data.is_cuda
+
+                # Reload to GPU for saving
+                optimizer_A.reload_optimizer_states()
+
+                # Save checkpoint A
+                model_sharded_sd_A = model_A[0].sharded_state_dict()
+                optim_sd_A = optimizer_A.sharded_state_dict(model_sharded_sd_A)
+                save(optim_sd_A, ckpt_dir_A)
+
+                # Offload again after save
+                optimizer_A.offload_optimizer_states()
+
+                # Create model and optimizer B with different seed
+                model_B, optimizer_B = setup_model_and_optimizer(
+                    seed=3,
+                    tp=tp,
+                    pp=pp,
+                    bf16=bf16,
+                    dist_opt=False,
+                    initialize_fn=initialize_gpt_model,
+                    optimizer='dist_muon',
+                )
+                assert isinstance(optimizer_B, LayerWiseDistributedOptimizer)
+                optimizer_B._cpu_offload = True
+
+                # Load checkpoint A into optimizer B
+                model_sharded_sd_B = model_B[0].sharded_state_dict()
+                load_sharded_sd = optimizer_B.sharded_state_dict(
+                    model_sharded_sd_B, is_loading=True
+                )
+                state_dict = load(load_sharded_sd, ckpt_dir_A)
+                optimizer_B.load_state_dict(state_dict)
+
+                # Offload after load — key test: load_state_dict + offload works
+                optimizer_B.offload_optimizer_states()
+                for opt in optimizer_B.chained_optimizers:
+                    if getattr(opt, 'is_stub_optimizer', False):
+                        continue
+                    if isinstance(opt, Float16OptimizerWithFloat16Params):
+                        for group in opt.fp32_from_float16_groups:
+                            for param in group:
+                                assert not param.data.is_cuda, (
+                                    "After load + offload, master weights must be on CPU"
+                                )
+
+                # Reload and save as checkpoint B (before any extra step)
+                optimizer_B.reload_optimizer_states()
+                optim_sd_B = optimizer_B.sharded_state_dict(model_sharded_sd_B)
+                save(optim_sd_B, ckpt_dir_B)
+
+                # Run a step after load to verify training can continue
+                for opt in optimizer_B.chained_optimizers:
+                    if getattr(opt, 'is_stub_optimizer', False):
+                        continue
+                    if isinstance(opt, Float16OptimizerWithFloat16Params):
+                        for group in opt.float16_groups:
+                            for p in group:
+                                p.main_grad = torch.randn_like(p.data)
+                        for group in opt.fp32_from_fp32_groups:
+                            for p in group:
+                                p.main_grad = torch.randn_like(p.data)
+                update_successful, _, _ = optimizer_B.step()
+                assert update_successful, "Step after checkpoint load should succeed"
+
+                # After post-load step, states should be offloaded to CPU
+                for opt in optimizer_B.chained_optimizers:
+                    if getattr(opt, 'is_stub_optimizer', False):
+                        continue
+                    if isinstance(opt, Float16OptimizerWithFloat16Params):
+                        for group in opt.fp32_from_float16_groups:
+                            for param in group:
+                                assert not param.data.is_cuda, (
+                                    "After post-load step, states must be on CPU"
+                                )
+
+                Utils.destroy_model_parallel()
+
+                # Compare checkpoints A==B (same state, different paths)
+                Utils.initialize_model_parallel(1, 1)
+                from megatron.core.dist_checkpointing import load_plain_tensors
+
+                plain_sd_A = load_plain_tensors(ckpt_dir_A)
+                plain_sd_B = load_plain_tensors(ckpt_dir_B)
+
+                check_equal(plain_sd_A, plain_sd_B)
