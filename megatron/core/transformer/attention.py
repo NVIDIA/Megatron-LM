@@ -61,9 +61,7 @@ except ImportError:
     rearrange = None
 
 try:
-    from flash_attn_3.flash_attn_interface import (
-        _flash_attn_forward,
-    )
+    from flash_attn_3.flash_attn_interface import _flash_attn_forward
     from flash_attn_3.flash_attn_interface import (
         flash_attn_with_kvcache as flash_attn3_with_kvcache,
     )
@@ -74,9 +72,7 @@ except ImportError as e:
 
 if not HAVE_FA3:
     try:
-        from flashattn_hopper.flash_attn_interface import (
-            _flash_attn_forward,
-        )
+        from flashattn_hopper.flash_attn_interface import _flash_attn_forward
         from flashattn_hopper.flash_attn_interface import (
             flash_attn_with_kvcache as flash_attn3_with_kvcache,
         )
@@ -837,9 +833,7 @@ class Attention(MegatronModule, ABC):
         """
         # (H, T) -> (T, H, 1)
         lse_aligned = lse.transpose(0, 1).unsqueeze(-1).to(torch.float32)
-        sink = softmax_offset.reshape(1, -1, 1).to(
-            device=output.device, dtype=torch.float32
-        )
+        sink = softmax_offset.reshape(1, -1, 1).to(device=output.device, dtype=torch.float32)
         scale = torch.sigmoid(lse_aligned - sink)
         # Preserve rows where LSE is non-finite (no attended keys).
         scale = torch.where(torch.isfinite(scale), scale, torch.ones_like(scale))
@@ -861,9 +855,7 @@ class Attention(MegatronModule, ABC):
         """
         # (B, H, S) -> (B, S, H, 1)
         lse_aligned = lse.permute(0, 2, 1).unsqueeze(-1).to(torch.float32)
-        sink = softmax_offset.reshape(1, 1, -1, 1).to(
-            device=output.device, dtype=torch.float32
-        )
+        sink = softmax_offset.reshape(1, 1, -1, 1).to(device=output.device, dtype=torch.float32)
         scale = torch.sigmoid(lse_aligned - sink)
         scale = torch.where(torch.isfinite(scale), scale, torch.ones_like(scale))
         return (output.to(torch.float32) * scale).to(output.dtype)
