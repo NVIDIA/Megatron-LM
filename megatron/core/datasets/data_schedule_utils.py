@@ -254,7 +254,7 @@ def create_data_iterator(
             for i in range(vpp_size):
                 if vpp_needs_data is not None and vpp_needs_data[i]:
                     # Give each data-carrying VPP stage its own shallow-copied
-                    # sample dicts. 
+                    # sample dicts.
                     samples_copy = [dict(sample) for sample in new_samples]
                     new_data_iterator.append(RerunDataIterator(iter(samples_copy)))
                 else:
