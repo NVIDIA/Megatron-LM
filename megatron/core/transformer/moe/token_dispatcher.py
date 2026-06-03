@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
+import os
 from abc import ABC, abstractmethod
 from typing import List, Optional, Tuple
 
@@ -1440,9 +1441,29 @@ class _NCCLEPManager(_DispatchManager):
         self.num_experts = num_experts
         self.config = config
         self.hidden_dim = config.hidden_size
-        # Per-expert packing alignment for the receive buffer (grouped-GEMM tile); 0 for bf16.
+        # Per-expert packing alignment for the receive buffer (grouped-GEMM tile)
         self.alignment = get_align_size_for_quantization(config)
         self.rank_capacity_factor = config.moe_expert_rank_capacity_factor
+        self.static_shape = config.moe_ncclep_static_shape
+        self.skip_capacity_pad = config.moe_ncclep_skip_capacity_pad
+        if self.skip_capacity_pad:
+            if not self.static_shape:
+                raise ValueError(
+                    "moe_ncclep_skip_capacity_pad=True requires moe_ncclep_static_shape=True (it "
+                    "only applies to the full static receive buffer)."
+                )
+            # CUTEDSL grouped-GEMM is required to process when tokens per expert sum <= budget
+            if torch.cuda.get_device_capability()[0] < 10:
+                raise ValueError(
+                    "moe_ncclep_skip_capacity_pad=True requires an sm100+ (Blackwell or later) GPU "
+                    "with a CuTe DSL grouped GEMM; leave it False on older GPUs."
+                )
+            if int(os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")) <= 0:
+                raise ValueError(
+                    "moe_ncclep_skip_capacity_pad=True requires the CuTe DSL grouped GEMM; set "
+                    "NVTE_CUTEDSL_FUSED_GROUPED_MLP=1 (the expert grouped GEMM must consume ragged "
+                    "per-expert counts on device)."
+                )
 
         if nccl_ep_dispatch is None:
             raise ImportError(
@@ -1455,14 +1476,11 @@ class _NCCLEPManager(_DispatchManager):
                 "sizes the per-rank receive buffer. Exceeding the budget hard-traps, so set it "
                 "generously."
             )
-        # bf16-only for now: a nonzero grouped-GEMM alignment (FP8/FP4 quantization or the TE op
-        # fuser) would make recv_tokens per-expert-padded, which is not supported yet.
         # TODO(ncclep) support FP8/FP4.
-        if self.alignment != 0:
+        if config.fp8 or config.fp4:
             raise ValueError(
-                f"The 'ncclep' backend does not support a nonzero grouped-GEMM alignment (got "
-                f"{self.alignment}); FP8/FP4 and use_transformer_engine_op_fuser are not supported "
-                "yet."
+                "The 'ncclep' backend does not support FP8/FP4 yet; the EP dispatch/combine "
+                "payload is bf16-only."
             )
 
         # Created lazily on the first setup_metadata (sizing needs the local token count).
@@ -1495,9 +1513,13 @@ class _NCCLEPManager(_DispatchManager):
                 f"The 'ncclep' backend requires an even local token count, got "
                 f"{max_tokens_per_rank} (seq_len/TP * micro_batch_size)."
             )
-        # recv_tokens are packed contiguously by actual count with alignment == 0
         budget = int(max_tokens_per_rank * self.router_topk * self.rank_capacity_factor)
-        self._recv_capacity = max(budget, max_tokens_per_rank)
+        if self.alignment != 0:
+            budget += -budget % self.alignment
+            self._recv_capacity = budget + self.num_local_experts * self.alignment
+        else:
+            self._recv_capacity = budget
+        self._recv_capacity = max(self._recv_capacity, max_tokens_per_rank)
 
         ensure_nccl_ep_bootstrapped(
             self.group,
@@ -1522,7 +1544,6 @@ class _NCCLEPManager(_DispatchManager):
         async_finish: bool = True,
         allocate_on_comm_stream: bool = True,
     ) -> torch.Tensor:
-        # Lazily bootstrap + create the context here (eager)
         # Note: this needs to stay out of the torch.compile region because TE's ep_bootstrap does
         # opaque ProcessGroup._get_backend()._comm_ptr() access that dynamo cannot trace.
         self._ensure_context()
@@ -1536,18 +1557,18 @@ class _NCCLEPManager(_DispatchManager):
         recv_tokens, tokens_per_expert, dispatched_probs = nccl_ep_dispatch(
             self._context, hidden_states, topk_idx, topk_weights
         )
-        # Per-expert counts, [num_local_experts] (alignment-padded; == actual when alignment==0).
         self.tokens_per_expert = tokens_per_expert.to(torch.int64)
+        if self.static_shape and not self.skip_capacity_pad:
+            # Absorb the slack into the last expert so sum(counts) == recv_capacity
+            # This does not break cuda graph
+            self.tokens_per_expert[-1] += self._recv_capacity - self.tokens_per_expert.sum()
         self.dispatched_probs = dispatched_probs
         return recv_tokens
 
     def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # The receive buffer is already expert-major; narrow it to the valid (packed) rows so the
-        # experts run only on real tokens (vs. the whole recv_capacity buffer, ~rank_capacity_factor
-        # more GEMM rows). TODO(ncclep, host-sync): the .item() is a D2H sync and the resulting
-        # narrow/re-expand are dynamic-shaped — both block CUDA-graph capture. The capturable path
-        # keeps the static [recv_capacity, H] buffer end to end (feed it straight to a grouped GEMM
-        # that takes device counts), trading slack-row compute for static shapes.
+        if self.static_shape:
+            return hidden_states, self.dispatched_probs
+        # narrow to the sum(counts) valid (alignment-padded) rows the experts consume.
         num_valid = int(self.tokens_per_expert.sum().item())  # sum(counts) = Σ
         permuted_hidden = hidden_states[:num_valid]  # [recv_capacity_per_rank, H] -> [Σ, H]
         permuted_probs = self.dispatched_probs[:num_valid]  # [recv_capacity_per_rank] -> [Σ]
@@ -1560,9 +1581,10 @@ class _NCCLEPManager(_DispatchManager):
         return self.tokens_per_expert
 
     def get_restored_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # Re-expand the expert output [sum(counts), H] back into the static receive-capacity
-        # buffer [recv_capacity, H] that TE ep_combine reads from. Rows beyond the valid region
-        # map to no token and are ignored by combine.
+        # TE ep_combine reads from the static [recv_capacity, H] buffer. static_shape=False path the
+        # experts ran on the narrowed [Σ, H] slice, so re-expand back to recv_capacity; in
+        # static_shape mode the output is already recv_capacity rows (no-op). Rows beyond the valid
+        # region map to no token and combine ignores them.
         num_valid = hidden_states.shape[0]
         pad_rows = self._recv_capacity - num_valid
         if pad_rows > 0:
