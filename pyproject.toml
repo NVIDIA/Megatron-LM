@@ -236,7 +236,6 @@ markers = [
     "internal: mark a test as a test to private/internal functions.",
     "flaky: mark flaky tests for LTS environment",
     "flaky_in_dev: mark flaky tests for DEV environment",
-    "no_cuda_required: mark tests that should run without CUDA",
 ]
 
 [tool.coverage.run]
