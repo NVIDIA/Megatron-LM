@@ -24,6 +24,7 @@ from megatron.core.process_groups_config import (
     ProcessGroupCollection,
 )
 from megatron.core.transformer.cuda_graphs import create_cudagraphs, set_current_microbatch
+from megatron.core.transformer.moe.paged_stash import paged_stash_reset
 from megatron.core.transformer.moe.router import MoEAuxLossAutoScaler
 from megatron.core.utils import (
     drain_embedding_wgrad_compute,
@@ -225,6 +226,28 @@ def get_tensor_device(tensor: Union[torch.Tensor, Dict[str, torch.Tensor]]):
     return tensor.device
 
 
+def _get_mtp_loss_scale(config, device: torch.device) -> torch.Tensor:
+    """Get the MTP loss scale on the output tensor device."""
+
+    def _normalize_loss_scale(loss_scale, scale_func_name: str) -> torch.Tensor:
+        loss_scale = torch.as_tensor(loss_scale, device=device)
+        if loss_scale.numel() != 1:
+            raise ValueError(
+                f"{scale_func_name} must return a scalar or size-1 tensor for MTP loss scaling, "
+                f"but returned a tensor with {loss_scale.numel()} elements."
+            )
+        return loss_scale
+
+    mtp_grad_scale_func = getattr(config, 'mtp_grad_scale_func', None)
+    if mtp_grad_scale_func is not None:
+        return _normalize_loss_scale(mtp_grad_scale_func(), "mtp_grad_scale_func")
+    if config.grad_scale_func is not None:
+        return _normalize_loss_scale(
+            config.grad_scale_func(torch.ones(1, device=device)), "grad_scale_func"
+        )
+    return torch.ones(1, device=device)
+
+
 def forward_step_calc_loss(
     model,
     output_tensor,
@@ -305,13 +328,10 @@ def forward_step_calc_loss(
 
     # Set the loss scale for Multi-Token Prediction (MTP) loss.
     if hasattr(config, 'mtp_num_layers') and config.mtp_num_layers is not None:
-        # Calculate the loss scale based on the grad_scale_func if available, else default to 1.
+        # Calculate the loss scale based on mtp_grad_scale_func if available,
+        # else fall back to grad_scale_func, else default to 1.
         device = get_tensor_device(output_tensor)
-        loss_scale = (
-            config.grad_scale_func(torch.ones(1, device=device))
-            if config.grad_scale_func is not None
-            else torch.ones(1, device=device)
-        )
+        loss_scale = _get_mtp_loss_scale(config, device)
         # Set the loss scale
         if config.calculate_per_token_loss:
             MTPLossAutoScaler.set_loss_scale(loss_scale)
@@ -531,6 +551,13 @@ def backward_step_multimodule(
     In multi-module pipelines, tensors are organized as dictionaries with
     module names as keys. Each module's backward pass is performed independently.
     """
+
+    def _unwrap_single_tensor_list(tensor):
+        if isinstance(tensor, list):
+            assert len(tensor) == 1, "expected a single tensor for multimodule backward"
+            return tensor[0]
+        return tensor
+
     # Retain gradients on all input tensors.
     for module_name, tensor in input_tensor.items():
         if isinstance(tensor, list):
@@ -549,13 +576,14 @@ def backward_step_multimodule(
 
     # Apply grad scaling if needed (for last stage only).
     for module_name in output_tensor.keys():
-        if output_tensor_grad[module_name] is None and config.grad_scale_func is not None:
+        output_tensor_grad_module = _unwrap_single_tensor_list(output_tensor_grad[module_name])
+        if output_tensor_grad_module is None and config.grad_scale_func is not None:
             output_tensor[module_name] = config.grad_scale_func(output_tensor[module_name])
 
     # Perform backward pass for each module.
     for module_name in output_tensor.keys():
-        output_tensor_module = output_tensor[module_name]
-        output_tensor_grad_module = output_tensor_grad[module_name]
+        output_tensor_module = _unwrap_single_tensor_list(output_tensor[module_name])
+        output_tensor_grad_module = _unwrap_single_tensor_list(output_tensor_grad[module_name])
 
         # In multi-modal models like VLM, some batches may not have images.
         # In such cases, skip backward while preserving zero gradients.
@@ -646,6 +674,9 @@ def forward_backward_no_pipelining(
     if config.timers is not None:
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
 
+    if getattr(config, "moe_paged_stash", False):
+        paged_stash_reset(enabled=not forward_only, config=config)
+
     no_sync_func = config.no_sync_func
     if no_sync_func is None:
         no_sync_func = contextlib.nullcontext
@@ -710,6 +741,13 @@ def forward_backward_no_pipelining(
                 total_num_tokens += num_tokens
                 if not forward_only:
                     backward_step(input_tensor, output_tensor, output_tensor_grad, config)
+                    # Release the autograd graph head before the next forward_step.
+                    # Without this, the previous microbatch's output_tensor stays
+                    # live until the next iteration rebinds the variable, deferring
+                    # autograd-node teardown onto the next forward's dispatch path
+                    # and triggering PyTorch's "AccumulateGrad node's stream does
+                    # not match" warning. See issue #4124.
+                    del output_tensor
         # Run computation for last microbatch out of context handler (want to
         # synchronize gradients).
         output_tensor, num_tokens = forward_step(
@@ -732,6 +770,7 @@ def forward_backward_no_pipelining(
 
         if not forward_only:
             backward_step(input_tensor, output_tensor, output_tensor_grad, config)
+            del output_tensor
 
     if config.finalize_model_grads_func is not None and not forward_only:
         # Finalize model grads (perform full grad all-reduce / reduce-scatter for
@@ -967,6 +1006,9 @@ def forward_backward_pipelining_with_interleaving(
     assert (
         adjust_tensor_shapes_fn is None
     ), "adjust_tensor_shapes_fn is not supported for interleaved pipeline parallelism"
+
+    if getattr(config, "moe_paged_stash", False):
+        paged_stash_reset(enabled=not forward_only, config=config)
 
     if config.overlap_p2p_comm and config.batch_p2p_comm:
         raise ValueError("Can not use both overlap_p2p_comm and batch_p2p_comm")
@@ -2140,6 +2182,9 @@ def forward_backward_pipelining_without_interleaving(
 
     if config.timers is not None:
         config.timers('forward-backward', log_level=1).start(barrier=config.barrier_with_L1_time)
+
+    if getattr(config, "moe_paged_stash", False):
+        paged_stash_reset(enabled=not forward_only, config=config)
 
     # Disable async grad reductions
     no_sync_func = config.no_sync_func
