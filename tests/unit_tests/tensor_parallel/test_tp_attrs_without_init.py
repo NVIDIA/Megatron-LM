@@ -7,6 +7,7 @@ from megatron.core.tensor_parallel.layers import (
     ColumnParallelLinear,
     RowParallelLinear,
     VocabParallelEmbedding,
+    copy_tensor_model_parallel_attributes,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -87,3 +88,15 @@ class TestTPAttributesWithoutInitialization:
         assert hasattr(w, "tensor_model_parallel") and w.tensor_model_parallel is True
         assert hasattr(w, "partition_dim") and w.partition_dim == 1
         assert hasattr(w, "partition_stride") and w.partition_stride == 1
+
+
+def test_copy_tensor_model_parallel_attributes_preserves_qkv_split_shapes():
+    source = torch.empty(4, 4)
+    destination = torch.empty_like(source)
+    source.is_qkv = True
+    source.qkv_split_shapes = [256, 64, 64]
+
+    copy_tensor_model_parallel_attributes(destination, source)
+
+    assert destination.is_qkv is True
+    assert destination.qkv_split_shapes == source.qkv_split_shapes
