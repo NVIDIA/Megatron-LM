@@ -35,6 +35,9 @@ from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistSaveShardedStrategy,
     get_async_strategy,
 )
+from megatron.core.dist_checkpointing.strategies.torch_dcp_load_trace import (
+    apply_torch_dcp_load_trace_patch,
+)
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer
@@ -1425,24 +1428,33 @@ def _load_base_checkpoint(
         raw_optimizer_state_dict = state_dict["optimizer"].copy() if "optimizer" in state_dict else None
         raw_model_state_dict = state_dict["model"].copy() if "model" in state_dict else None
         model = state_dict.pop("_model")
-        state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
+        with trace_region("preprocess_fsdp_dtensor_state_dict"):
+            state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
 
         ckpt_type = CheckpointType.FSDP_DTENSOR
-        fs_storage_reader = torch.distributed.checkpoint.FileSystemReader(checkpoint_name)
+        with trace_region("FileSystemReader"):
+            fs_storage_reader = torch.distributed.checkpoint.FileSystemReader(checkpoint_name)
         allow_partial_load = not getattr(args, 'strict_fsdp_dtensor_load', False)
         if allow_partial_load:
-            state_dict_metadata = fs_storage_reader.read_metadata().state_dict_metadata
-            rank = torch.distributed.get_rank()
-            import time as _time
-            _time.sleep(rank * 0.001)  # Make that logs of different ranks do not overlap
-            print_diff_in_state_dicts(state_dict_metadata, state_dict)
+            with trace_region("read_metadata_and_diff"):
+                state_dict_metadata = fs_storage_reader.read_metadata().state_dict_metadata
+                rank = torch.distributed.get_rank()
+                import time as _time
+                _time.sleep(rank * 0.001)  # Make that logs of different ranks do not overlap
+                print_diff_in_state_dicts(state_dict_metadata, state_dict)
 
         planner = default_planner.DefaultLoadPlanner(allow_partial_load=allow_partial_load)
-        torch.distributed.checkpoint.load_state_dict(
-            state_dict=state_dict,
-            storage_reader=fs_storage_reader,
-            planner=planner,
-        )
+        # Break the torch.distributed.checkpoint.load_state_dict black box into
+        # per-phase Perfetto regions (read_metadata / planning / read_data) by
+        # instrumenting the DCP storage-reader and planner methods that the
+        # underlying _load_state_dict drives. No-op unless CKPT_PERFETTO_TRACE=1.
+        apply_torch_dcp_load_trace_patch()
+        with trace_region("load_state_dict"):
+            torch.distributed.checkpoint.load_state_dict(
+                state_dict=state_dict,
+                storage_reader=fs_storage_reader,
+                planner=planner,
+            )
 
         if raw_optimizer_state_dict is not None:
             state_dict["optimizer"] = raw_optimizer_state_dict
@@ -1822,7 +1834,8 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
     elif args.ckpt_format == "fsdp_dtensor":
         reader = FileSystemReader(get_load_checkpoint_path_by_args(args))
         try:
-            state_dict_metadata = reader.read_metadata().state_dict_metadata
+            with trace_region("read_metadata"):
+                state_dict_metadata = reader.read_metadata().state_dict_metadata
         except FileNotFoundError:
             state_dict_metadata = {}
 
@@ -1843,16 +1856,17 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
 
         optim_sd_kwargs = dict(metadata=_build_sharded_state_dict_metadata(args), is_loading=True)
 
-        state_dict = generate_state_dict(
-            args,
-            model=model,
-            optimizer=gen_sd_optim,
-            opt_param_scheduler=gen_sd_opt_param_scheduler,
-            rng_state=gen_sd_rng_state,
-            optim_sd_kwargs=optim_sd_kwargs,
-            rerun_state=gen_sd_rerun_state,
-            iteration=1,
-        )
+        with trace_region("generate_state_dict"):
+            state_dict = generate_state_dict(
+                args,
+                model=model,
+                optimizer=gen_sd_optim,
+                opt_param_scheduler=gen_sd_opt_param_scheduler,
+                rng_state=gen_sd_rng_state,
+                optim_sd_kwargs=optim_sd_kwargs,
+                rerun_state=gen_sd_rerun_state,
+                iteration=1,
+            )
         state_dict["_model"] = model
         load_kwargs["sharded_state_dict"] = state_dict
     with trace_region("_load_base_checkpoint"):
