@@ -250,7 +250,7 @@ def get_language_model_spec(
         pipeline_dtype=pipeline_dtype,
         bf16=bf16,
         cross_entropy_loss_fusion=True,
-        cross_entropy_fusion_impl='te',
+        cross_entropy_fusion_impl='native',
         calculate_per_token_loss=per_token_loss,
         **extra_kwargs,
     )
