@@ -1754,6 +1754,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             DP = torch_FSDP
         elif args.use_megatron_fsdp:
             DP = megatron_FSDP
+            if args.overlap_moe_expert_parallel_comm and is_hybrid_model(args):
+                from megatron.core.models.hybrid.hybrid_block import HybridStack
+                DP = functools.partial(megatron_FSDP, fsdp_unit_modules=[HybridStack])
         else:
             DP = DDP
 
@@ -2550,13 +2553,24 @@ def training_log(
             track_names.append("z_loss")
 
         if is_hybrid_model(args):
-            from operator import itemgetter
-
-            from megatron.core.ssm.mamba_hybrid_layer_allocation import (
+            from megatron.core.models.hybrid.hybrid_layer_allocation import (
                 Symbols,
-                get_hybrid_layer_counts,
+                flatten_layer_type_list,
+                parse_hybrid_pattern,
+                validate_segment_layers,
             )
-            layers = itemgetter(Symbols.MOE)(get_hybrid_layer_counts(args.hybrid_layer_pattern))
+
+            # Pass only MAIN-pattern MoE count (excluding MTP) to track_moe_metrics:
+            # the function adds mtp_num_layers internally to derive the divisor.
+            # ``get_hybrid_layer_counts`` already aggregates MTP, which would
+            # double-count and inflate the denominator.
+            parsed = parse_hybrid_pattern(args.hybrid_layer_pattern)
+            layers = 0
+            if parsed.main_pattern:
+                for segment in parsed.main_pattern.split(Symbols.PIPE):
+                    for char in flatten_layer_type_list(validate_segment_layers(segment)):
+                        if char == Symbols.MOE:
+                            layers += 1
         else:
             layers = args.num_layers
 
