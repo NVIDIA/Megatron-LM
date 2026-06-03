@@ -196,6 +196,19 @@ _TE_GROUPED_MLP_OP_FUSER_SKIP_REASON = (
 )
 
 
+def _is_mxfp8_supported() -> bool:
+    """MXFP8 quantization in TE requires compute capability >= 10.0 (Blackwell)."""
+    if not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_capability()[0] >= 10
+
+
+_MXFP8_SKIP_REASON = (
+    "MXFP8 (tests configure fp8_recipe='mxfp8') requires compute capability >= 10.0 (Blackwell)"
+)
+
+
+@pytest.mark.skipif(not _is_mxfp8_supported(), reason=_MXFP8_SKIP_REASON)
 @pytest.mark.skipif(
     not _te_grouped_mlp_op_fuser_environment_supported(),
     reason=_TE_GROUPED_MLP_OP_FUSER_SKIP_REASON,
@@ -285,6 +298,7 @@ class TestPagedStashing:
             ), f"tokens_per_expert != ref: max diff = {(tpe_f - ref_f).abs().max().item()}"
 
 
+@pytest.mark.skipif(not _is_mxfp8_supported(), reason=_MXFP8_SKIP_REASON)
 @pytest.mark.skipif(
     not _te_grouped_mlp_op_fuser_environment_supported(),
     reason=_TE_GROUPED_MLP_OP_FUSER_SKIP_REASON,
