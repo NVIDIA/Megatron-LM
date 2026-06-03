@@ -128,7 +128,8 @@ This test strong scales the standard GPT-3 model (slightly more than 175 billion
 
 # Roadmaps
 
-Review the **[MoE Roadmap](https://github.com/NVIDIA/Megatron-LM/issues/1729)** for DeepSeek-V3, Qwen3, advanced parallelism, FP8 optimizations, and Blackwell enhancements.
+- **[2026 Q2 Roadmap](https://github.com/NVIDIA/Megatron-LM/issues/4997)**
+- **[2026 Q2 MoE-Specific Roadmap](https://github.com/NVIDIA/Megatron-LM/issues/4815)** [`dev` branch first developments]
 
 # Resources
 
