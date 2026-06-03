@@ -15,7 +15,6 @@ from typing import Callable, Dict, Optional, Set, Tuple, Union
 import torch
 
 from megatron.core.msc_utils import MultiStorageClientFeature
-from megatron.core.utils import log_single_rank
 
 from . import ShardedTensor
 from .core import CheckpointingConfig, save_config
