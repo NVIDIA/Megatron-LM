@@ -5,6 +5,8 @@ import logging
 import math
 from typing import TYPE_CHECKING, Any, Optional, TypedDict
 
+import torch
+
 from megatron.core.utils import log_single_rank
 
 if TYPE_CHECKING:
@@ -14,7 +16,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class ParamGroupOverride(TypedDict):
+class ParamGroupOverride(TypedDict, total=False):
     """Override values for a parameter group. These values may be optimizer-state/scheduler related.
 
     These are the values you see later in param_group.get(...) calls in the
@@ -23,7 +25,7 @@ class ParamGroupOverride(TypedDict):
 
     Example:
         >>> param_group_override = ParamGroupOverride(min_lr=1e-4, wd_mult=0.1)
-        >>> param_group_override == ParamGroupOverride(newvar=3) # this is ok too
+        >>> param_group_override == ParamGroupOverride(optimizer='muon')  # per-param optimizer
 
     """
 
@@ -32,6 +34,7 @@ class ParamGroupOverride(TypedDict):
     start_wd: float
     end_wd: float
     wd_mult: float
+    optimizer: str
 
 
 def get_canonical_lr_for_logging(param_groups: list[dict]) -> float | None:
@@ -290,7 +293,10 @@ class OptimizerParamScheduler:
         # This is important for logging under model parallelism that may leave
         # some ranks with empty default_config parameter groups.
         for param_group in self.optimizer.param_groups:
-            param_group['lr'] = self.get_lr(param_group)
+            if isinstance(param_group.get('lr'), torch.Tensor):
+                param_group['lr'].fill_(self.get_lr(param_group))
+            else:
+                param_group['lr'] = self.get_lr(param_group)
             param_group['weight_decay'] = self.get_wd(param_group) * param_group.get('wd_mult', 1.0)
 
     def state_dict(self) -> dict:

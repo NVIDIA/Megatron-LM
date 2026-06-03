@@ -1,12 +1,15 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 from __future__ import annotations
 
-import logging
+import re
 from dataclasses import dataclass
-from typing import Mapping, Optional
+from typing import TYPE_CHECKING, Mapping, Optional
 
 import torch
 import torch.distributed as dist
+
+if TYPE_CHECKING:
+    from .transforms import ReshardTransform
 
 # -----------------------------------------------------------------------------
 # Dataclasses used by the planner
@@ -100,6 +103,11 @@ class ReshardPlan:
 
     send_ops: list[TransferOp]
     recv_ops: list[TransferOp]
+    transform: Optional["ReshardTransform"] = None
+    # Cache of canonical persistent-buffer dtypes keyed by raw module path.
+    # Populated by _harmonize_buffer_dtypes on first call; reused thereafter to
+    # skip the all_gather_object + named_modules() walks on the hot path.
+    buffer_dtypes: Optional[dict[str, torch.dtype]] = None
 
     def __str__(self):
         return f"ReshardPlan(sends={len(self.send_ops)}, recvs={len(self.recv_ops)})"
@@ -120,17 +128,15 @@ def _get_rank_in_group(global_rank: int, group_ranks: list[int]) -> int:
         )
 
 
+_EXPERT_PARAM_RE = re.compile(r"^(weight|bias)(\d+)$")
+
+
 def _detect_expert_index_from_param_name(param_name: str) -> Optional[int]:
     """Extract expert index from parameter name for TEGroupedMLP per-expert tensors."""
     for part in param_name.split('.'):
-        if (
-            part.startswith('weight')
-            and len(part) > len('weight')
-            and part[len('weight') :].isdigit()
-        ):
-            return int(part[len('weight') :])
-        if part.startswith('bias') and len(part) > len('bias') and part[len('bias') :].isdigit():
-            return int(part[len('bias') :])
+        m = _EXPERT_PARAM_RE.match(part)
+        if m is not None:
+            return int(m.group(2))
     return None
 
 
@@ -168,15 +174,10 @@ def assign_ep_resolved_name_inplace(
     meta.global_expert_index = global_idx
 
     # Replace trailing integer in "weightK"/"biasK" with global_idx
-    parts = base.split('.')
     new_parts = []
-    for p in parts:
-        if p.startswith('weight') and len(p) > len('weight') and p[len('weight') :].isdigit():
-            new_parts.append('weight' + str(global_idx))
-        elif p.startswith('bias') and len(p) > len('bias') and p[len('bias') :].isdigit():
-            new_parts.append('bias' + str(global_idx))
-        else:
-            new_parts.append(p)
+    for p in base.split('.'):
+        m = _EXPERT_PARAM_RE.match(p)
+        new_parts.append(f"{m.group(1)}{global_idx}" if m else p)
     meta.resolved_name = '.'.join(new_parts)
 
 
@@ -196,6 +197,63 @@ def assign_resolved_name_inplace(
     if layer_module_prefix_map:
         name = _resolve_global_layer_number_in_name(name, layer_module_prefix_map)
     assign_ep_resolved_name_inplace(meta, base_name=name)
+
+
+def named_persistent_buffers(module: torch.nn.Module):
+    """Yield ``(full_name, parent_module, buf_name, tensor)`` for every
+    persistent buffer in ``module``.  Skips ``_non_persistent_buffers_set``.
+
+    Persistent buffers (those saved in ``state_dict``) carry training state that
+    must travel with the weights during refit/resharding — e.g. the MoE
+    router's ``expert_bias``, which is updated each step by aux-loss-free load
+    balancing.  Non-persistent buffers are excluded since they hold ephemeral
+    state (e.g. accumulators reset at the next train step).
+    """
+    for module_prefix, sub_module in module.named_modules():
+        non_persistent = sub_module._non_persistent_buffers_set
+        for buf_name, buf in sub_module._buffers.items():
+            if buf is None or buf_name in non_persistent:
+                continue
+            full_name = f"{module_prefix}.{buf_name}" if module_prefix else buf_name
+            yield full_name, sub_module, buf_name, buf
+
+
+def named_refit_tensors(module: torch.nn.Module):
+    """Yield ``(name, tensor)`` pairs for every parameter and persistent buffer.
+
+    Used by the refit planner and executor to enumerate which tensors should
+    travel during resharding.  Persistent buffers are included alongside
+    parameters because they may carry training state (see
+    ``named_persistent_buffers``).
+    """
+    yield from module.named_parameters(recurse=True)
+    for full_name, _sub, _buf_name, buf in named_persistent_buffers(module):
+        yield full_name, buf
+
+
+_REFIT_TENSOR_CACHE_ATTR = "_refit_tensor_cache"
+
+
+def get_refit_tensor_dict(module: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """Return the cached ``{name: tensor}`` dict for ``module``, building it if needed.
+
+    Walking ``named_modules()`` is hundreds of ms for multi-B-parameter models,
+    and the parameter/persistent-buffer set is stable across refits — so we
+    cache the dict on the module itself.  ``invalidate_refit_tensor_cache``
+    must be called whenever a persistent buffer is replaced (e.g. by
+    ``_harmonize_buffer_dtypes``) so the cache picks up the new tensor.
+    """
+    cached = getattr(module, _REFIT_TENSOR_CACHE_ATTR, None)
+    if cached is None:
+        cached = dict(named_refit_tensors(module))
+        setattr(module, _REFIT_TENSOR_CACHE_ATTR, cached)
+    return cached
+
+
+def invalidate_refit_tensor_cache(module: torch.nn.Module) -> None:
+    """Drop the cached refit tensor dict so the next call rebuilds it."""
+    if hasattr(module, _REFIT_TENSOR_CACHE_ATTR):
+        delattr(module, _REFIT_TENSOR_CACHE_ATTR)
 
 
 def _build_layer_module_prefix_map(module: torch.nn.Module) -> dict[str, str]:
@@ -381,137 +439,116 @@ def extract_param_metadata(
     return meta
 
 
-def select_src_metadata_balanced(
+def _filter_by_ep_local_rank(
     src_meta_list: list[ParameterMetadata], dst_metadata: ParameterMetadata, dst_rank: int
-) -> ParameterMetadata:
-    """Choose a representative source `ParameterMetadata` for a destination rank.
+) -> list[ParameterMetadata]:
+    """In non-collocated mode with matching EP size, restrict candidates to the
+    source rank holding the same global experts as ``dst_rank``.
 
-    The selected metadata provides topology information (TP/EP/DP group ranks) that the
-    LCM transfer planner uses to compute actual source ranks and slices. This function
-    doesn't perform transfers itself - it just picks which source configuration to use
-    as reference for planning.
+    When EP sizes differ (resharding), expert matching is handled via
+    ``resolved_name`` and no filter is applied here.
 
-    Two scenarios for EP-sharded parameters:
-    1. Non-collocated mode (same EP size, different rank numbering):
-       - Filter by matching EP local rank to pair ranks with same expert position
-       - Example: src ranks [0-63] and dst ranks [64-127] both with EP=8
-       - Dst EP local 0 should use src EP local 0 as reference (same experts)
-
-    2. Resharding mode (different EP sizes):
-       - Skip EP local rank filtering (sizes don't correspond)
-       - Example: EP=8→EP=16 means dst EP local 8 has no matching src EP local
-       - Expert matching handled by resolved_name; LCM handles TP dimension changes
-
-    Finally, balances across data-parallel (DP) groups to distribute load:
-      - Groups src_meta_list by DP group
-      - Selects source DP group via round-robin: dst_rank % num_src_dp_groups
-      - Ensures even distribution of transfer load across source DP replicas
+    Why size check matters:
+      - Same size (EP=8→EP=8): local ranks 0-7 exist in both src and dst →
+        filter ensures dst EP local 0 uses src EP local 0 (same global experts).
+      - Different size (EP=8→EP=16): dst EP local 8 has no corresponding src
+        EP local → skip filter; expert reassignment is handled by resolved_name
+        matching, and the LCM/TP planner handles any TP dimension changes.
     """
-    if not src_meta_list:
-        raise ValueError("src_meta_list must be non-empty")
-
-    # ============================================================================
-    # EXPERT PARALLELISM (EP) LOCAL RANK FILTERING
-    # ============================================================================
-    # Purpose: In non-collocated mode with same EP size, ensure destination ranks
-    # use source metadata from ranks with the same EP local position (same experts).
-    #
-    # Why size check matters:
-    #   - Same size (EP=8→EP=8): Local ranks 0-7 exist in both src and dst
-    #     → Filter ensures dst EP local 0 uses src EP local 0 (same global experts)
-    #   - Different size (EP=8→EP=16): Local ranks 0-15 in dst, only 0-7 in src
-    #     → Dst EP local 8 has no corresponding src EP local rank
-    #     → Skip filter; expert reassignment handled by resolved_name matching
-    #
-    # Expert routing: When EP size changes, each expert parameter is matched via
-    # resolved_name (which includes global expert index). The LCM/TP planner
-    # handles any TP dimension changes, and DP round-robin distributes load.
-    # ============================================================================
     dst_ep_group = dst_metadata.expert_parallel_group_ranks
-    if dst_ep_group is not None:
-        dst_ep_local = dst_ep_group.index(dst_rank)
-        # Check if EP sizes match between source and destination
-        src_ep_size = (
-            len(src_meta_list[0].expert_parallel_group_ranks)
-            if src_meta_list[0].expert_parallel_group_ranks
-            else None
+    if dst_ep_group is None:
+        return src_meta_list
+
+    dst_ep_local = dst_ep_group.index(dst_rank)
+    src_ep_size = (
+        len(src_meta_list[0].expert_parallel_group_ranks)
+        if src_meta_list[0].expert_parallel_group_ranks
+        else None
+    )
+    # EP resharding (sizes differ) — skip filter; keep all source candidates.
+    if src_ep_size != len(dst_ep_group):
+        return src_meta_list
+
+    matching = [
+        m
+        for m in src_meta_list
+        if m.expert_parallel_group_ranks
+        and m.expert_parallel_group_ranks.index(m.owner_rank) == dst_ep_local
+    ]
+    if not matching:
+        # Sizes match but no local rank match — configuration bug.
+        available = [
+            (
+                m.owner_rank,
+                (
+                    m.expert_parallel_group_ranks.index(m.owner_rank)
+                    if m.expert_parallel_group_ranks
+                    else None
+                ),
+            )
+            for m in src_meta_list
+        ]
+        raise ValueError(
+            f"No source metadata with EP local rank {dst_ep_local}"
+            f" found for dst rank {dst_rank}. Available: {available}"
         )
-        dst_ep_size = len(dst_ep_group)
+    return matching
 
-        # Only filter by EP local rank when sizes match (non-collocated, not resharding)
-        if src_ep_size == dst_ep_size:
-            matching_ep = [
-                m
-                for m in src_meta_list
-                if m.expert_parallel_group_ranks
-                and m.expert_parallel_group_ranks.index(m.owner_rank) == dst_ep_local
-            ]
-            if not matching_ep:
-                # This indicates a configuration bug: sizes match but no local rank match
-                def _ep_local(m):
-                    return (
-                        m.expert_parallel_group_ranks.index(m.owner_rank)
-                        if m.expert_parallel_group_ranks
-                        else None
-                    )
 
-                available = [(m.owner_rank, _ep_local(m)) for m in src_meta_list]
-                raise ValueError(
-                    f"No source metadata with EP local rank {dst_ep_local}"
-                    f" found for dst rank {dst_rank}. Available: {available}"
-                )
-            src_meta_list = matching_ep
-        # else: EP resharding mode (sizes differ) - skip filter, keep all source candidates
+def _round_robin_dp(src_meta_list: list[ParameterMetadata], dst_rank: int) -> ParameterMetadata:
+    """Round-robin across source DP groups so transfer load spreads evenly.
 
-    # ============================================================================
-    # LOCAL COPY OPTIMIZATION (COLLOCATED MODE)
-    # ============================================================================
-    # In collocated mode, prefer local copies when available. If dst_rank appears
-    # in the source metadata list (after TP/EP filtering), use it directly to
-    # avoid unnecessary data transfers.
-    #
-    # A local copy is essentially free
-    # (tensor.copy_() on same GPU), while any remote transfer incurs significant
-    # overhead even within the same node.
-    # ============================================================================
-    local_meta = [m for m in src_meta_list if m.owner_rank == dst_rank]
-    if local_meta:
-        # Found local metadata - use it for a free local copy
-        return local_meta[0]
-
-    # ============================================================================
-    # DATA PARALLELISM (DP) LOAD BALANCING
-    # ============================================================================
-    # After TP/EP filtering (if applicable), balance transfer load across source
-    # data-parallel replicas. Each DP group holds a complete copy of the model,
-    # so we can read from any DP group - choosing via round-robin spreads load.
-    #
-    # Load distribution: dst_rank % num_src_dp_groups ensures even distribution
-    # even when destination has different DP configuration than source.
-    # ============================================================================
+    Each DP group holds a complete copy of the model, so we can read from any
+    DP group; choosing via ``dst_rank % num_src_dp_groups`` ensures even
+    distribution even when destination has different DP configuration.  E.g.
+    with 4 src DP groups and 128 dst ranks, each src DP group is selected by
+    32 dst ranks (128/4=32).  Within the chosen DP group we further cycle
+    across available metadata entries to balance load across TP groups in the
+    DP replica.
+    """
     grouped_by_dp: dict[tuple[int, ...], list[ParameterMetadata]] = {}
     for meta in src_meta_list:
         dp_group = tuple(meta.data_parallel_group_ranks or [])
         grouped_by_dp.setdefault(dp_group, []).append(meta)
 
-    # Fast path: only one DP group present; no balancing necessary
+    # Fast path: only one DP group present; no balancing necessary.
     if len(grouped_by_dp) == 1:
         return src_meta_list[0]
 
-    # Round-robin selection across source DP groups based on destination global rank
+    # Round-robin selection across source DP groups based on destination global rank.
     # This ensures even distribution: if we have 4 src DP groups and 128 dst ranks,
-    # each src DP group will be selected by 32 dst ranks (128 / 4 = 32)
+    # each src DP group will be selected by 32 dst ranks (128 / 4 = 32).
     sorted_dp_groups = sorted(grouped_by_dp.keys())
     chosen_group = sorted_dp_groups[dst_rank % len(sorted_dp_groups)]
-
     # Within the chosen DP group, distribute across available metadata entries
     # to balance load across all TP groups in the DP replica.
     # Example: With 4 TP groups in a DP group, dst_ranks will cycle through all 4
     # instead of always using the first one, better distributing transfer load.
     group_metadata = grouped_by_dp[chosen_group]
     within_group_idx = (dst_rank // len(sorted_dp_groups)) % len(group_metadata)
-    selected = group_metadata[within_group_idx]
-    return selected
+    return group_metadata[within_group_idx]
 
 
-logger = logging.getLogger(__name__)
+def select_src_metadata_balanced(
+    src_meta_list: list[ParameterMetadata], dst_metadata: ParameterMetadata, dst_rank: int
+) -> ParameterMetadata:
+    """Choose a representative source `ParameterMetadata` for a destination rank.
+
+    The selected metadata supplies topology (TP/EP/DP group ranks) to the LCM
+    planner.  Selection prefers a local copy when ``dst_rank`` itself owns a
+    source replica, then round-robins across source DP groups to balance load.
+    A local copy is essentially free (``tensor.copy_()`` on same GPU), while
+    any remote transfer incurs significant overhead even within the same node.
+    """
+    if not src_meta_list:
+        raise ValueError("src_meta_list must be non-empty")
+
+    candidates = _filter_by_ep_local_rank(src_meta_list, dst_metadata, dst_rank)
+
+    # Local copy optimization (collocated mode): if dst_rank owns a source
+    # replica after EP filtering, use it directly to skip the network entirely.
+    for meta in candidates:
+        if meta.owner_rank == dst_rank:
+            return meta
+
+    return _round_robin_dp(candidates, dst_rank)

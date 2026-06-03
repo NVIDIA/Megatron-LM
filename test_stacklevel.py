@@ -33,7 +33,7 @@ class TestStackLevel(unittest.TestCase):
         # only module-level import fallbacks should remain without stacklevel
         for m in missing:
             self.assertIn(
-                m.split("/")[-1].split(":")[0],
+                pathlib.Path(m.rsplit(":", 1)[0]).name,
                 ["__init__.py", "clip_grads.py", "optimizer.py", "hyper_comm_grid.py"],
                 f"Missing stacklevel in {m}",
             )

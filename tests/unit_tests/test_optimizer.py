@@ -106,10 +106,10 @@ def test_get_param_groups_no_overrides(mock_get_world_size):
 def test_get_param_groups_default_overrides(mock_get_world_size):
     """Test that the default overrides are applied to the parameter groups."""
     net = Net()
-    # NOTE: to get legacy default overrides, supply None.
     opt_config = OptimizerConfig(optimizer='adam', lr=0.01)
-    check_config_overrides_consistency(opt_config, None)
-    param_groups = _get_param_groups([net], opt_config, None)
+    config_overrides = get_standard_config_overrides(opt_config)
+    check_config_overrides_consistency(opt_config, config_overrides)
+    param_groups = _get_param_groups([net], opt_config, config_overrides)
     assert len(param_groups) == 2
     pg0, pg1 = param_groups
     wd_mults = {pg0['wd_mult'], pg1['wd_mult']}
@@ -361,6 +361,47 @@ def test_chained_optimizer_get_parameters():
 
     assert len(result) == len(all_params)
     assert result == opt1.params + opt2.params + opt3.params
+
+
+def test_chained_optimizer_reports_unsuccessful_when_grad_norm_skipped():
+    """Test ChainedOptimizer reports skipped large-gradient updates as unsuccessful."""
+
+    class MockOptimizer:
+        """Mock that mimics the ChainedOptimizer step interface."""
+
+        def __init__(self, param, config):
+            self.config = config
+            self.param = param
+            self.param_groups = [{"params": [param]}]
+            self.step_called = False
+            self.is_stub_optimizer = False
+
+        def prepare_grads(self):
+            return False
+
+        def get_grad_norm(self):
+            return 2.0
+
+        def get_parameters(self):
+            return [self.param]
+
+        def step_with_ready_grads(self):
+            self.step_called = True
+            return True
+
+    config = OptimizerConfig(clip_grad=0.0, grad_norm_skip_threshold=1.0)
+    param = torch.nn.Parameter(torch.ones(2, 2, device='cuda'))
+    param.grad = torch.ones_like(param)
+    optimizer = MockOptimizer(param, config)
+    chained_optimizer = ChainedOptimizer([optimizer])
+
+    update_successful, grad_norm, num_zeros_in_grad = chained_optimizer.step()
+
+    assert update_successful is False
+    assert grad_norm == 2.0
+    assert num_zeros_in_grad is None
+    assert optimizer.step_called is False
+    torch.testing.assert_close(param.grad, torch.ones_like(param.grad))
 
 
 def test_precision_aware_fused_adam():

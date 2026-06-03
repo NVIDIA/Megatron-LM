@@ -99,7 +99,7 @@ if not skip_autodoc:
 html_theme = "nvidia_sphinx_theme"
 html_theme_options = {
     "switcher": {
-        "json_url": "versions1.json",
+        "json_url": "../versions1.json",
         "version_match": release,
     },
     "icon_links": [
@@ -109,7 +109,7 @@ html_theme_options = {
             "icon": "fa-brands fa-github",
         }
     ],
-    "public_docs_features": True
+    "public_docs_features": os.environ.get("SKIP_PUBLIC_DOCS_FEATURES", "false").lower() != "true",
 }
 html_extra_path = ["project.json", "versions1.json"]
 
@@ -117,4 +117,17 @@ html_extra_path = ["project.json", "versions1.json"]
 linkcheck_ignore = [
     ".*github\\.com.*",
     ".*githubusercontent\\.com.*",
+    "http://localhost.*",
+]
+
+# PyTorch docs use a JS-rendered frontend; anchor IDs are injected at runtime
+# and are not present in the static HTML that linkcheck fetches.
+linkcheck_anchors_ignore_for_url = [
+    r"https://docs\.pytorch\.org/.*",
+]
+
+# PyTorch docs anchor IDs change between stable versions; verify the page
+# loads but skip anchor validation to avoid spurious failures on redirects.
+linkcheck_anchors_ignore_for_url = [
+    "https://docs.pytorch.org/.*",
 ]

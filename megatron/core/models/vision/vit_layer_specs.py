@@ -1,4 +1,5 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+from functools import partial
 
 from megatron.core.extensions.transformer_engine import (
     TEDotProductAttention,
@@ -69,7 +70,7 @@ def get_vit_layer_with_local_spec() -> ModuleSpec:
             input_layernorm=LNImpl,
             self_attention=ModuleSpec(
                 module=SelfAttention,
-                params={"attn_mask_type": AttnMaskType.causal},
+                params={"attn_mask_type": AttnMaskType.no_mask},
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=ColumnParallelLinear,
                     core_attention=DotProductAttention,
@@ -85,10 +86,10 @@ def get_vit_layer_with_local_spec() -> ModuleSpec:
 
 
 # Helper function to get module spec for MLP/MoE
-def _get_mlp_module_spec(use_te: bool = True) -> ModuleSpec:
+def _get_mlp_module_spec(use_te: bool = True):
     # Dense MLP w/ or w/o TE modules.
-    return ModuleSpec(
-        module=MLP,
+    return partial(
+        MLP.as_mlp_submodule,
         submodules=MLPSubmodules(
             linear_fc1=TELayerNormColumnParallelLinear if use_te else ColumnParallelLinear,
             linear_fc2=TERowParallelLinear if use_te else RowParallelLinear,
