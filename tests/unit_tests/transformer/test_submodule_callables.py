@@ -128,13 +128,7 @@ def test_mtp_pre_dispatch_applies_hybrid_empty_decoder_final_norm(monkeypatch):
         mtp_model_layer = object()
 
         def _get_embeddings(
-            self,
-            input_ids,
-            position_ids,
-            embedding,
-            hidden_states,
-            packed_seq_params,
-            padding_mask,
+            self, input_ids, position_ids, embedding, hidden_states, packed_seq_params, padding_mask
         ):
             return input_ids, position_ids, padding_mask, None, hidden_states
 
