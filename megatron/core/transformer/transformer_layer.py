@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
 import functools
@@ -19,7 +19,12 @@ from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
-from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope, LayerType
+from megatron.core.transformer.enums import (
+    AttnMaskType,
+    CudaGraphModule,
+    InferenceCudaGraphScope,
+    LayerType,
+)
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.module import GraphableMegatronModule
@@ -1049,13 +1054,29 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             not self.config.cuda_graph_modules
             or CudaGraphModule.attn in self.config.cuda_graph_modules
         ):
-            slen_per_cp = seq_length // self.config.context_parallel_size
-            static_inputs["attention_mask"] = (
-                ~(torch.tril(torch.ones((slen_per_cp, seq_length))).bool())
-                .to(torch.cuda.current_device())
-                .reshape(1, 1, slen_per_cp, seq_length)
-                .tile(micro_batch_size, 1, 1, 1)
-            )
+            if not self.config.create_attention_mask_in_dataloader:
+                if self.self_attention.attn_mask_type not in (
+                    AttnMaskType.causal,
+                    AttnMaskType.no_mask,
+                    AttnMaskType.causal_bottom_right,
+                ):
+                    log_single_rank(
+                        logger,
+                        logging.WARNING,
+                        "TE CUDA graph capture is omitting attention_mask because "
+                        "create_attention_mask_in_dataloader is False, but "
+                        f"attn_mask_type={self.self_attention.attn_mask_type.name} may require "
+                        "an explicit mask. Ensure this is intended for the current workload.",
+                    )
+            else:
+                slen_per_cp = seq_length // self.config.context_parallel_size
+                static_inputs["attention_mask"] = (
+                    ~(torch.tril(torch.ones((slen_per_cp, seq_length))).bool())
+                    .to(torch.cuda.current_device())
+                    .reshape(1, 1, slen_per_cp, seq_length)
+                    .tile(micro_batch_size, 1, 1, 1)
+                )
+
         return static_inputs
 
     def _get_submodules_under_cudagraphs(self):
@@ -1300,11 +1321,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 'attention_mask' in cudagraph_kwargs and cudagraph_kwargs['attention_mask'] is None
             ):
                 # The attention_mask can be None when there is no padding to the input sequence.
-                # However, an attention_mask Tensor must be passed into cudagraph for replay, so
-                # we create an equivalent zero Tensor as the attention_mask.
-                cudagraph_kwargs["attention_mask"] = get_zero_attention_mask(
-                    hidden_states.size(0), hidden_states.size(1)
-                )
+                # If the dataloader never creates masks, the TE CUDA graph was captured without
+                # this kwarg. Preserve that signature instead of allocating a synthetic
+                # [local_seq, global_seq] zero mask.
+                if not self.config.create_attention_mask_in_dataloader:
+                    cudagraph_kwargs.pop("attention_mask")
+                else:
+                    # The graph was captured with an attention_mask tensor, so replay needs a
+                    # tensor input with the same semantic value as no padding.
+                    cudagraph_kwargs["attention_mask"] = get_zero_attention_mask(
+                        hidden_states.size(0), hidden_states.size(1)
+                    )
         except ImportError:
             raise RuntimeError("CUDAGraph requires TransformerEngine, but not installed")
         return tuple(cudagraph_args), cudagraph_kwargs
