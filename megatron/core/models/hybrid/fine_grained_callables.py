@@ -233,9 +233,7 @@ def _run_moe_combine(layer, node: ScheduleNode, output: Tensor):
         output = off_interface.group_commit(
             output, name="mlp_norm", forced_released_tensors=[residual]
         )
-    output = make_viewless_tensor(
-        inp=output, requires_grad=output.requires_grad, keep_graph=True
-    )
+    output = make_viewless_tensor(inp=output, requires_grad=output.requires_grad, keep_graph=True)
 
     node.layer_state.residual.record_stream(torch.cuda.current_stream())
     if shared_expert_output is not None:
