@@ -453,11 +453,13 @@ class MoELayer(BaseMoELayer):
         This method preprocesses the hidden states and routing probabilities for the token
         dispatcher.
         """
-        # Latent-MoE + NVLS-inference shared-expert overlap: launch the shared
-        # expert on its side stream BEFORE fc1_latent_proj so it sees the full
-        # hidden_states. The corresponding join+add runs in postprocess after
-        # fc2_latent_proj. Skipped on the training / NCCL paths.
-        if (
+        # Latent MoE dispatchers see latent-dim tensors, while shared experts must
+        # use full hidden states. Keep only the full-hidden pre-comm here; the
+        # shared-expert fc1/fc2 launches stay in the dispatcher so they still overlap
+        # token dispatch/combine communication.
+        if self._uses_latent_shared_expert_dispatch_overlap():
+            self.shared_experts.pre_forward_comm(hidden_states)
+        elif (
             self.config.moe_latent_size
             and self.shared_expert_overlap
             and isinstance(self.token_dispatcher, NVLSAllGatherVDispatcher)
@@ -466,18 +468,6 @@ class MoELayer(BaseMoELayer):
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
                 self._latent_shared_expert_output = apply_module(self.shared_experts)(hidden_states)
-        elif self.config.moe_latent_size:
-            if self.shared_expert_overlap:
-                if self.training:
-                    raise AssertionError(
-                        "Shared expert overlap with MoE latent projections is not supported "
-                        "during training. Disable moe_shared_expert_overlap."
-                    )
-                raise AssertionError(
-                    "Shared expert overlap with MoE latent projections requires the NVLS "
-                    "inference dispatcher. Either disable moe_shared_expert_overlap or set "
-                    "inference_moe_token_dispatcher_type='nvls'."
-                )
         # Project the hidden_states from hidden dimension down to latent dimension.
         if self.config.moe_latent_size:
             hidden_states, _ = self.fc1_latent_proj(hidden_states)
@@ -485,6 +475,17 @@ class MoELayer(BaseMoELayer):
             hidden_states, routing_map, probs
         )
         return hidden_states, probs
+
+    def _uses_latent_shared_expert_dispatch_overlap(self) -> bool:
+        """Whether latent shared experts are still scheduled inside dispatcher overlap windows."""
+        return (
+            self.config.moe_latent_size is not None
+            and self.shared_expert_overlap
+            and self.use_shared_expert
+            and isinstance(
+                self.token_dispatcher, (MoEAlltoAllTokenDispatcher, MoEFlexTokenDispatcher)
+            )
+        )
 
     def dispatch(self, hidden_states: torch.Tensor, probs: torch.Tensor):
         """Dispatches tokens to assigned expert ranks via communication.
@@ -586,6 +587,10 @@ class MoELayer(BaseMoELayer):
             torch.cuda.current_stream().wait_stream(SharedExpertMLP.stream)
             output = output + self._latent_shared_expert_output
             self._latent_shared_expert_output = None
+        elif self._uses_latent_shared_expert_dispatch_overlap():
+            # Dispatcher has already launched fc2/post-comm during token combine.
+            # Join and add only after routed expert output is projected back to hidden dim.
+            output = output + self.shared_experts.get_output()
         return output
 
     def router_and_preprocess(self, hidden_states: torch.Tensor):
