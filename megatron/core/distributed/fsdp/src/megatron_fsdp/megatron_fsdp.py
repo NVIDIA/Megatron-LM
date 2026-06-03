@@ -601,6 +601,8 @@ class MegatronFSDP(torch.nn.Module):
             # Sharded Gradient Buffer
             gbuf = group.hfsdp_helper_gbuf if group.hfsdp_helper_gbuf else group.main_grad_buffer
             if gbuf.is_data_distributed:
+                # If TransformerEngine gradient accumulation is fused, then param.get_main_grad()
+                # already holds the wgrad and param.grad_added_to_main_grad=True.
                 if not param.grad_added_to_main_grad:
                     # Get `main_grad` will allocate bucket, check that the currently
                     # used main_grad buffer does not exceed the scope of two FSDP Unit
@@ -617,7 +619,6 @@ class MegatronFSDP(torch.nn.Module):
                         param.main_grad.copy_(to_local_if_dtensor(param.grad))
                         del param.grad
                     else:
-                        # Prepare for fused wgrad accumulation.
                         param.main_grad.zero_()
             # Unsharded Gradient Buffer
             else:
@@ -1242,6 +1243,9 @@ class MegatronFSDP(torch.nn.Module):
         """
         self._replace_param_with_raw_if_needed()
 
+        if self.data_parallel_sharding_strategy == "no_shard":
+            return
+
         if not force_sync and self.ddp_config.overlap_param_gather:
             # All-gather the first bucket before the forward pass.
             if self.ddp_config.fsdp_all_gather_in_start_param_sync:
@@ -1286,7 +1290,7 @@ class MegatronFSDP(torch.nn.Module):
         """
         Synchronize parameter all-gather operations for all model parameters.
         """
-        self.all_gather_pipeline.reset()
+        self.all_gather_pipeline.reset(preserve_non_fsdp_units=True)
         self._replace_param_with_distributed_if_needed()
 
     def synchronize_gradient_reduce(self):

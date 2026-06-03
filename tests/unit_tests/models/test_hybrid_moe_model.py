@@ -16,6 +16,7 @@ from megatron.core.num_microbatches_calculator import destroy_num_microbatches_c
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.moe.moe_logging import destroy_moe_metrics_tracker
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
     destroy_global_vars,
@@ -70,12 +71,13 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "cuda_graph_impl": "none",
     "cuda_graph_retain_backward_graph": False,
     "cuda_graph_modules": [],
-    "cuda_graph_use_single_mempool": False,
+    "cuda_graph_use_single_mempool": True,
     "cuda_graph_scope": None,
     "cuda_graph_warmup_steps": 3,
     "deallocate_pipeline_outputs": True,
     "defer_embedding_wgrad_compute": False,
     "delay_wgrad_compute": False,
+    "use_grouped_gemm_for_dense_mlp": False,
     "overlap_dispatch_backward_with_experts_wgrad": False,
     "deterministic_mode": False,
     "disable_bf16_reduced_precision_matmul": False,
@@ -112,6 +114,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "fp8_interval": 1,
     "fp8_margin": 0,
     "fp8_multi_head_attention": False,
+    "fp8_output_proj": False,
     "fp8_param": False,
     "fp8_quantizer_factory": None,
     "fp8_recipe": "delayed",
@@ -121,6 +124,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "gated_linear_unit": False,
     "glu_linear_offset": 0.0,
     "grad_scale_func": None,
+    "mtp_grad_scale_func": None,
     "grad_sync_func": None,
     "gradient_accumulation_fusion": True,
     "hetereogenous_dist_checkpoint": False,
@@ -161,6 +165,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_deepep_num_sms": 20,
     "moe_enable_deepep": False,
     "moe_expert_capacity_factor": None,
+    "moe_expert_rank_capacity_factor": None,
     "moe_ffn_hidden_size": 1856,
     "moe_flex_dispatcher_backend": "deepep",
     "moe_grouped_gemm": True,
@@ -174,6 +179,10 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_layer_recompute": False,
     "moe_pad_expert_input_to_capacity": False,
     "moe_pad_experts_for_cuda_graph_inference": False,
+    "moe_paged_stash": False,
+    "moe_paged_stash_buffer_size_factor_cpu": 0.0,
+    "moe_paged_stash_buffer_size_factor_cuda": 1.1,
+    "moe_paged_stash_page_size": 64,
     "moe_per_layer_logging": False,
     "moe_permute_fusion": False,
     "moe_permute_fusion_into_hybridep": False,
@@ -289,6 +298,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "fine_grained_activation_offloading": False,
     "min_offloaded_tensor_size": 1024 * 1024,
     "offload_modules": [],
+    "fine_grained_offloading_max_inflight_offloads": None,
     "hybrid_context_parallel": False,
     "max_seqlen_per_dp_cp_rank": None,
     "inference_cuda_graph_scope": {
@@ -502,6 +512,7 @@ class TestHybridMoEModel:
     def setup_method(self, method):
 
         os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
+        destroy_moe_metrics_tracker()
         args = self.create_test_args()
         set_args(args)
 
