@@ -79,9 +79,14 @@ def _info():
 def _ref_sinkhorn(logits: Tensor, num_iters: int, eps: float = 1e-6) -> Tensor:
     row_max = logits.max(dim=-1, keepdim=True).values
     M = torch.exp(logits - row_max)
-    for _ in range(num_iters):
-        M = M / M.sum(dim=-1, keepdim=True).clamp(min=eps)
-        M = M / M.sum(dim=-2, keepdim=True).clamp(min=eps)
+    if num_iters == 0:
+        return M
+
+    M = M / M.sum(dim=-1, keepdim=True) + eps
+    M = M / (M.sum(dim=-2, keepdim=True) + eps)
+    for _ in range(num_iters - 1):
+        M = M / (M.sum(dim=-1, keepdim=True) + eps)
+        M = M / (M.sum(dim=-2, keepdim=True) + eps)
     return M
 
 
@@ -129,6 +134,7 @@ def _ref_proj_rms_compute_h(
     bias: Tensor,
     n: int,
     eps: float = 1e-6,
+    compute_h_eps: float = 1e-6,
 ):
     """Reference: fused proj_rms + compute_h."""
     proj = torch.matmul(x, weight.t())
@@ -138,8 +144,8 @@ def _ref_proj_rms_compute_h(
     N = proj.shape[-1]
     alpha = torch.cat([alpha_pre.expand(n), alpha_post.expand(n), alpha_res.expand(N - 2 * n)])
     h = proj * alpha.unsqueeze(0) / (r + eps) + bias.unsqueeze(0)
-    h_pre = h[..., :n].sigmoid()
-    h_post = h[..., n : 2 * n].sigmoid() * 2
+    h_pre = h[..., :n].sigmoid() + compute_h_eps
+    h_post = (h[..., n : 2 * n].sigmoid() + compute_h_eps) * 2
     h_res = h[..., 2 * n :]
     return h_pre, h_post, h_res, r
 

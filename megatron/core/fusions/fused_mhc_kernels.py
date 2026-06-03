@@ -244,11 +244,16 @@ if _TRITON_AVAILABLE:
         M = tl.exp2((logits - row_max[:, None]) * TLOG2E)
         tl.store(M_init_ptr + mat_ptrs, M.to(M_init_ptr.dtype.element_ty))
 
-        for _ in range(NUM_ITERS):
+        if NUM_ITERS > 0:
             row_sum = tl.sum(M, axis=1)
-            M = M / (row_sum[:, None] + eps)
+            M = M / row_sum[:, None] + eps
             col_sum = tl.sum(M, axis=0)
             M = M / (col_sum[None, :] + eps)
+            for _ in range(NUM_ITERS - 1):
+                row_sum = tl.sum(M, axis=1)
+                M = M / (row_sum[:, None] + eps)
+                col_sum = tl.sum(M, axis=0)
+                M = M / (col_sum[None, :] + eps)
 
         tl.store(out_ptr + mat_ptrs, M.to(out_ptr.dtype.element_ty))
 
@@ -287,7 +292,10 @@ if _TRITON_AVAILABLE:
 
             row_sum = tl.sum(M, axis=1)
             tl.store(ws_rs_ptr + (v_ws_base + t) * HC + offs_r, row_sum)
-            M = M / (row_sum[:, None] + eps)
+            if t == 0:
+                M = M / row_sum[:, None] + eps
+            else:
+                M = M / (row_sum[:, None] + eps)
 
             ws_off = M_ws_base + (2 * t + 1) * HC * HC
             tl.store(ws_M_ptr + ws_off + offs_r[:, None] * HC + offs_c[None, :], M)
@@ -315,8 +323,12 @@ if _TRITON_AVAILABLE:
             ).to(tl.float32)
 
             row_s = tl.load(ws_rs_ptr + (v_ws_base + t) * HC + offs_r).to(tl.float32)
-            grad = grad / (row_s[:, None] + eps)
-            row_corr = tl.sum(grad * M, axis=1)
+            if t == 0:
+                grad = grad / row_s[:, None]
+                row_corr = tl.sum(grad * (M - eps), axis=1)
+            else:
+                grad = grad / (row_s[:, None] + eps)
+                row_corr = tl.sum(grad * M, axis=1)
             grad = grad - row_corr[:, None]
             M = tl.load(
                 ws_M_ptr + M_ws_base + (2 * t) * HC * HC + offs_r[:, None] * HC + offs_c[None, :]
@@ -364,7 +376,7 @@ if _TRITON_AVAILABLE:
         def forward(ctx, input_logits: Tensor, num_iterations: int, eps: float = 1e-6):
             """Run Triton Sinkhorn forward and save initial matrix for backward."""
             out, M_init = _triton_sinkhorn_fwd(input_logits, num_iterations, eps)
-            ctx.save_for_backward(M_init)
+            ctx.save_for_backward(input_logits if num_iterations == 0 else M_init)
             ctx.num_iterations = num_iterations
             ctx.eps = eps
             return out
@@ -372,7 +384,15 @@ if _TRITON_AVAILABLE:
         @staticmethod
         def backward(ctx, grad_output: Tensor):
             """Run Triton Sinkhorn backward."""
-            (M_init,) = ctx.saved_tensors
+            (saved,) = ctx.saved_tensors
+            if ctx.num_iterations == 0:
+                with torch.enable_grad():
+                    logits = saved.detach().requires_grad_(True)
+                    row_max = logits.max(dim=-1, keepdim=True).values
+                    M = torch.exp(logits - row_max)
+                    M.backward(grad_output)
+                return logits.grad, None, None
+            M_init = saved
             grad_input = _triton_sinkhorn_bwd(grad_output, M_init, ctx.num_iterations, ctx.eps)
             return grad_input, None, None
 
@@ -835,11 +855,16 @@ if _CUTILE_AVAILABLE:
             index=(pid, 0, 0),
             tile=ct.reshape(M.astype(M_init_out.dtype), (TILE_SIZE, HC, HC)),
         )
-        for _ in range(NUM_ITERS):
+        if NUM_ITERS > 0:
             row_sum = ct.sum(M, axis=2, keepdims=True)
-            M = M / (row_sum + eps)
+            M = M / row_sum + eps
             col_sum = ct.sum(M, axis=1, keepdims=True)
             M = M / (col_sum + eps)
+            for _ in range(NUM_ITERS - 1):
+                row_sum = ct.sum(M, axis=2, keepdims=True)
+                M = M / (row_sum + eps)
+                col_sum = ct.sum(M, axis=1, keepdims=True)
+                M = M / (col_sum + eps)
         ct.store(out, index=(pid, 0, 0), tile=ct.reshape(M.astype(out.dtype), (TILE_SIZE, HC, HC)))
 
     @ct.kernel
@@ -864,7 +889,10 @@ if _CUTILE_AVAILABLE:
             ct.store(ws_M, index=(M_base + 2 * t, 0, 0), tile=M)
             row_sum = ct.sum(M, axis=2, keepdims=True)
             ct.store(ws_rs, index=(v_base + t, 0, 0), tile=row_sum)
-            M = M / (row_sum + eps)
+            if t == 0:
+                M = M / row_sum + eps
+            else:
+                M = M / (row_sum + eps)
             ct.store(ws_M, index=(M_base + 2 * t + 1, 0, 0), tile=M)
             col_sum = ct.sum(M, axis=1, keepdims=True)
             ct.store(ws_cs, index=(v_base + t, 0, 0), tile=col_sum)
@@ -879,8 +907,12 @@ if _CUTILE_AVAILABLE:
             grad = grad - col_corr
             M = ct.load(ws_M, index=(M_base + 2 * t + 1, 0, 0), shape=(TILE_SIZE, HC, HC))
             row_s = ct.load(ws_rs, index=(v_base + t, 0, 0), shape=(TILE_SIZE, HC, 1))
-            grad = grad / (row_s + eps)
-            row_corr = ct.sum(grad * M, axis=2, keepdims=True)
+            if t == 0:
+                grad = grad / row_s
+                row_corr = ct.sum(grad * (M - eps), axis=2, keepdims=True)
+            else:
+                grad = grad / (row_s + eps)
+                row_corr = ct.sum(grad * M, axis=2, keepdims=True)
             grad = grad - row_corr
             M = ct.load(ws_M, index=(M_base + 2 * t, 0, 0), shape=(TILE_SIZE, HC, HC))
         grad = grad * M
@@ -1469,6 +1501,7 @@ if _CUTILE_AVAILABLE:
         K: int,
         n: ConstInt,
         eps: float,
+        compute_h_eps: float,
         TILE_SIZE_M: ConstInt,
         TILE_SIZE_N: ConstInt,
         SPLIT_K: ConstInt,
@@ -1526,8 +1559,8 @@ if _CUTILE_AVAILABLE:
 
         h_pre_linear = pre_accum * alpha_pre * inv_r_eps + bias_pre
         h_post_linear = post_accum * alpha_post * inv_r_eps + bias_post
-        h_pre = _ct_sigmoid(h_pre_linear)
-        h_post = _ct_sigmoid(h_post_linear) * 2.0
+        h_pre = _ct_sigmoid(h_pre_linear) + compute_h_eps
+        h_post = (_ct_sigmoid(h_post_linear) + compute_h_eps) * 2.0
 
         ct.store(H_PRE, index=(bid_m, 0), tile=h_pre.astype(H_PRE.dtype))
         ct.store(H_POST, index=(bid_m, 0), tile=h_post.astype(H_POST.dtype))
@@ -1872,6 +1905,7 @@ if _CUTILE_AVAILABLE:
         N: int,
         K: int,
         eps: float,
+        compute_h_eps: float,
         _proj_tile_m: int,
         tile_n: int,
         split_k: int,
@@ -1918,6 +1952,7 @@ if _CUTILE_AVAILABLE:
                 K,
                 n,
                 eps,
+                compute_h_eps,
                 tm,
                 tile_n,
                 split_k,
@@ -1956,6 +1991,7 @@ if _CUTILE_AVAILABLE:
         alpha_res: Tensor,
         n: int,
         eps: float,
+        compute_h_eps: float,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Fused proj_rms + compute_h forward.
 
@@ -2101,6 +2137,7 @@ if _CUTILE_AVAILABLE:
             N,
             K,
             eps,
+            compute_h_eps,
             tm,
             TILE_N,
             split_k,
@@ -2235,6 +2272,7 @@ if _CUTILE_AVAILABLE:
         N: int,
         n: ConstInt,
         eps: float,
+        compute_h_eps: float,
         TILE_SIZE_M: ConstInt,
         TILE_SIZE_N: ConstInt,
         HAS_GRAD_H_PRE: ConstInt,
@@ -2278,7 +2316,8 @@ if _CUTILE_AVAILABLE:
             PROJ, index=(tile_m_id, 0), shape=(TILE_SIZE_M, n), padding_mode=PAD_ZERO
         )
         proj_pre = ct.astype(proj_pre, ct.float32)
-        grad_h_pre = gy_pre * h_pre * (1.0 - h_pre)
+        sigmoid_pre = h_pre - compute_h_eps
+        grad_h_pre = gy_pre * sigmoid_pre * (1.0 - sigmoid_pre)
         grad_proj_pre = grad_h_pre * alpha_pre * inv_r_eps
         grad_r_from_h += ct.sum(
             grad_h_pre * proj_pre * alpha_pre * (-inv_r_eps * inv_r_eps), axis=1, keepdims=True
@@ -2301,8 +2340,8 @@ if _CUTILE_AVAILABLE:
             PROJ, index=(tile_m_id, 1), shape=(TILE_SIZE_M, n), padding_mode=PAD_ZERO
         )
         proj_post = ct.astype(proj_post, ct.float32)
-        half_h_post = h_post * 0.5
-        grad_h_post = gy_post * half_h_post * (1.0 - half_h_post) * 2.0
+        sigmoid_post = h_post * 0.5 - compute_h_eps
+        grad_h_post = gy_post * sigmoid_post * (1.0 - sigmoid_post) * 2.0
         grad_proj_post = grad_h_post * alpha_post * inv_r_eps
         grad_r_from_h += ct.sum(
             grad_h_post * proj_post * alpha_post * (-inv_r_eps * inv_r_eps), axis=1, keepdims=True
@@ -2674,6 +2713,7 @@ if _CUTILE_AVAILABLE:
         bias: Tensor,
         n: int,
         eps: float,
+        compute_h_eps: float,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         """Fused compute_h + proj_rms backward.
 
@@ -2733,6 +2773,7 @@ if _CUTILE_AVAILABLE:
                 N,
                 n,
                 eps,
+                compute_h_eps,
                 tile_m_precomp,
                 TILE_N,
                 int(has_grad_h_pre),
@@ -3072,6 +3113,7 @@ def _torch_proj_rms_compute_h(
     bias: Tensor,
     n: int,
     eps: float,
+    compute_h_eps: float = 1e-6,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     proj = torch.matmul(x, weight.t())
     r = x.norm(dim=-1, keepdim=True) / math.sqrt(x.shape[-1])
@@ -3080,8 +3122,8 @@ def _torch_proj_rms_compute_h(
         dim=-1,
     )
     h = proj * alpha.unsqueeze(0) / (r + eps) + bias.unsqueeze(0)
-    h_pre = h[..., :n].sigmoid()
-    h_post = h[..., n : 2 * n].sigmoid() * 2
+    h_pre = h[..., :n].sigmoid() + compute_h_eps
+    h_post = (h[..., n : 2 * n].sigmoid() + compute_h_eps) * 2
     h_res = h[..., 2 * n :]
     return h_pre, h_post, h_res, r
 
@@ -3095,7 +3137,7 @@ if _CUTILE_AVAILABLE:
         def forward(ctx, input_logits: Tensor, num_iterations: int, eps: float = 1e-6):
             """Run cuTile Sinkhorn forward and save initial matrix for backward."""
             output, M_init = _cutile_sinkhorn_fwd(input_logits, num_iterations, eps)
-            ctx.save_for_backward(M_init)
+            ctx.save_for_backward(input_logits if num_iterations == 0 else M_init)
             ctx.num_iterations = num_iterations
             ctx.eps = eps
             return output
@@ -3103,7 +3145,15 @@ if _CUTILE_AVAILABLE:
         @staticmethod
         def backward(ctx, grad_output):
             """Run cuTile Sinkhorn backward."""
-            (M_init,) = ctx.saved_tensors
+            (saved,) = ctx.saved_tensors
+            if ctx.num_iterations == 0:
+                with torch.enable_grad():
+                    logits = saved.detach().requires_grad_(True)
+                    row_max = logits.max(dim=-1, keepdim=True).values
+                    M = torch.exp(logits - row_max)
+                    M.backward(grad_output)
+                return logits.grad, None, None
+            M_init = saved
             grad_input = _cutile_sinkhorn_bwd(grad_output, M_init, ctx.num_iterations, ctx.eps)
             return grad_input, None, None
 
@@ -3155,10 +3205,11 @@ if _CUTILE_AVAILABLE:
             bias: Tensor,
             n: int,
             eps: float = 1e-6,
+            compute_h_eps: float = 1e-6,
         ):
             """Run fused cuTile projection, RMS normalization, and compute_h forward."""
             h_pre, h_post, h_res, r, proj_reduced = _cutile_proj_rms_compute_h_fwd(
-                x, weight, bias, alpha_pre, alpha_post, alpha_res, n, eps
+                x, weight, bias, alpha_pre, alpha_post, alpha_res, n, eps, compute_h_eps
             )
             ctx.save_for_backward(
                 x,
@@ -3175,6 +3226,7 @@ if _CUTILE_AVAILABLE:
             )
             ctx.n = n
             ctx.eps = eps
+            ctx.compute_h_eps = compute_h_eps
             return h_pre, h_post, h_res, r
 
         @staticmethod
@@ -3213,10 +3265,21 @@ if _CUTILE_AVAILABLE:
                     bias_param,
                     ctx.n,
                     ctx.eps,
+                    ctx.compute_h_eps,
                 )
             )
 
-            return grad_x, grad_weight, grad_ap, grad_apo, grad_ar, grad_bias, None, None
+            return (
+                grad_x,
+                grad_weight,
+                grad_ap,
+                grad_apo,
+                grad_ar,
+                grad_bias,
+                None,
+                None,
+                None,
+            )
 
 
 class FusedHAggregate(torch.autograd.Function):
@@ -3335,11 +3398,14 @@ def fused_proj_rms_compute_h(
     bias: Tensor,
     n: int,
     eps: float = 1e-6,
+    compute_h_eps: float = 1e-6,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     """Projection + RMS norm + compute_h split outputs using cuTile, then torch."""
     _raise_mhc_backend_validation_error()
     if is_cutile_available():
         return CutileProjRmsComputeH.apply(
-            x, weight, alpha_pre, alpha_post, alpha_res, bias, n, eps
+            x, weight, alpha_pre, alpha_post, alpha_res, bias, n, eps, compute_h_eps
         )
-    return _torch_proj_rms_compute_h(x, weight, alpha_pre, alpha_post, alpha_res, bias, n, eps)
+    return _torch_proj_rms_compute_h(
+        x, weight, alpha_pre, alpha_post, alpha_res, bias, n, eps, compute_h_eps
+    )

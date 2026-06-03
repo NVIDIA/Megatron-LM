@@ -15,14 +15,22 @@ from megatron.core.utils import nvtx_decorator
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import CheckpointManager
 
+_MHC_SINKHORN_EPS = 1e-6
+_MHC_COMPUTE_H_EPS = 1e-6
+
 
 @torch.compile
 def _sinkhorn_iterations(input_logits: Tensor, num_iterations: int, eps: float) -> Tensor:
     row_max = input_logits.max(dim=-1, keepdim=True).values
     M = torch.exp(input_logits - row_max)
-    for _ in range(num_iterations):
-        M = M / M.sum(dim=-1, keepdim=True).clamp(min=eps)
-        M = M / M.sum(dim=-2, keepdim=True).clamp(min=eps)
+    if num_iterations == 0:
+        return M
+
+    M = M / M.sum(dim=-1, keepdim=True) + eps
+    M = M / (M.sum(dim=-2, keepdim=True) + eps)
+    for _ in range(num_iterations - 1):
+        M = M / (M.sum(dim=-1, keepdim=True) + eps)
+        M = M / (M.sum(dim=-2, keepdim=True) + eps)
     return M
 
 
@@ -174,6 +182,8 @@ class HyperConnectionModule(MegatronModule):
         self.n = config.num_residual_streams
         self.hidden_size = config.hidden_size
         self.sinkhorn_iterations = config.mhc_sinkhorn_iterations
+        self.sinkhorn_eps = _MHC_SINKHORN_EPS
+        self.compute_h_eps = _MHC_COMPUTE_H_EPS
 
         # Projection weights for dynamic mappings
         # Input: [s, b, n*C] -> Output: n^2 + 2n values per token
@@ -277,10 +287,10 @@ class HyperConnectionModule(MegatronModule):
         )
         h = r * proj * alpha_ + self.bias
         # H_pre = σ(α_pre * (θ_pre @ x̃) + b_pre)
-        h_pre = h[..., : self.n].sigmoid()  # [s, b, n]
+        h_pre = h[..., : self.n].sigmoid() + self.compute_h_eps  # [s, b, n]
 
-        # H_post = 2σ(α_post * (θ_post @ x̃) + b_post)
-        h_post = h[..., self.n : 2 * self.n].sigmoid() * 2  # [s, b, n]
+        # H_post = 2(σ(α_post * (θ_post @ x̃) + b_post) + eps)
+        h_post = (h[..., self.n : 2 * self.n].sigmoid() + self.compute_h_eps) * 2
         h_res = h[..., 2 * self.n :]
         return h_pre, h_post, h_res
 
@@ -314,6 +324,7 @@ class HyperConnectionModule(MegatronModule):
                     self.bias,
                     self.n,
                     self.norm_eps,
+                    self.compute_h_eps,
                 )
             h_pre = h_pre.view(s, b, self.n)
             h_post = h_post.view(s, b, self.n)
@@ -326,7 +337,9 @@ class HyperConnectionModule(MegatronModule):
                 h_pre, h_post, h_res = self._compute_h(proj, r)
             h_res = h_res.view(s, b, self.n, self.n)
 
-        h_res = self._sinkhorn_op(h_res, self.sinkhorn_iterations, self.norm_eps)  # [s, b, n, n]
+        h_res = self._sinkhorn_op(
+            h_res, self.sinkhorn_iterations, self.sinkhorn_eps
+        )  # [s, b, n, n]
 
         return h_pre, h_post, h_res
 
