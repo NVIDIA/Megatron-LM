@@ -51,18 +51,11 @@ invocation; launching multiple ranks reshards the read/write work through DCP. T
 merge arithmetic is independent of merge-time world size.
 
 Large checkpoints can have source DCP chunk layouts that assign more work to one
-rank than the others. Pass `--merge-balanced-work` to greedily bin-pack planned
-tensor work across ranks:
-
-- `--merge-balance-mode source` preserves the original DCP chunk boundaries and
-  balances those source chunks across ranks. This is the recommended mode for
-  production-sized same-layout checkpoints because it keeps DCP reads aligned
-  with the source storage layout while avoiding rank-0 singleton-chunk skew.
-- `--merge-balance-mode virtual` ignores source chunk boundaries and creates
-  logical tensor tiles sized by `--merge-target-chunk-mib` before bin-packing
-  them. This mode is source-chunk-size independent, but it can produce less
-  efficient source reads when virtual tiles do not align with the original DCP
-  storage chunks.
+rank than the others. Pass `--merge-balance-rank-work` to greedily bin-pack
+source DCP chunks across ranks. This preserves the original DCP chunk boundaries
+and source storage locality while avoiding rank-0 singleton-chunk skew. It does
+not add a chunk-size tuning parameter; the merge still writes the same logical
+checkpoint layout, only with a more even rank assignment during the save.
 
 When no process group is initialized, or the world size is one, the output is
 saved through public DCP with `no_dist=True`; with a world size greater than one
@@ -305,8 +298,7 @@ torchrun --nproc_per_node 8 tools/checkpoint/weighted_merge.py \
     /checkpoints/run_a/iter_0004000:0.5 \
     /checkpoints/run_a/iter_0005000:0.5 \
   --merge-output /checkpoints/merged/balanced \
-  --merge-balanced-work \
-  --merge-balance-mode source
+  --merge-balance-rank-work
 ```
 
 Slurm multi-node CPU merge. Each task is one gloo rank/reader; no GPU allocation

@@ -77,8 +77,6 @@ SAVE_DTYPE_MAP = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32
 VALID_MODIFIERS = ("reverse", "scramble")
 BYTE_ACCOUNTING_MODES = ("none", "rank0", "all")
 RESOURCE_LOG_MODES = ("none", "rank0", "all")
-BALANCED_WORK_MODES = ("virtual", "source")
-DEFAULT_BALANCED_WORK_TARGET_CHUNK_MIB = 512
 
 # The sole merge path derives the merge structure from public DCP metadata only
 # (no model/template construction, no CUDA kernels), so it merges any model
@@ -147,9 +145,7 @@ class MergeResult:
     implementation_mode: str = METADATA_SAME_LAYOUT_MODE
     memory_estimate: MergeMemoryEstimate = MergeMemoryEstimate()
     preflight_only: bool = False
-    balanced_work: bool = False
-    balance_mode: str = "source-layout"
-    target_chunk_bytes: Optional[int] = None
+    balance_rank_work: bool = False
     plan_tensor_bytes_by_rank: tuple[int, ...] = ()
     plan_tensor_chunks_by_rank: tuple[int, ...] = ()
 
@@ -1005,9 +1001,7 @@ def _add_merge_provenance(
     strict: StrictHandling,
     merge_style: Optional[str],
     execution_mode: str = METADATA_SAME_LAYOUT_MODE,
-    balanced_work: bool = False,
-    balance_mode: str = "source-layout",
-    target_chunk_bytes: Optional[int] = None,
+    balance_rank_work: bool = False,
 ) -> None:
     common_state["weighted_merge_provenance"] = {
         "format_version": 1,
@@ -1021,9 +1015,7 @@ def _add_merge_provenance(
         "extra_state_source_index": extra_state_source_index,
         "extra_state_source_path": str(input_dirs[extra_state_source_index]),
         "implementation_mode": execution_mode,
-        "balanced_work": bool(balanced_work),
-        "balance_mode": balance_mode,
-        "target_chunk_bytes": target_chunk_bytes,
+        "balance_rank_work": bool(balance_rank_work),
         "strict": strict.value,
         "code_revision": _git_revision(),
         "optimizer_merged": False,
@@ -1484,41 +1476,6 @@ def _estimate_merge_work_bytes(
     return source_bytes + accumulator_bytes + output_bytes
 
 
-def _virtual_tensor_tiles(
-    *,
-    global_shape: tuple[int, ...],
-    dtype: torch.dtype,
-    target_chunk_bytes: int,
-) -> tuple[tuple[tuple[int, ...], tuple[int, ...]], ...]:
-    if target_chunk_bytes <= 0:
-        raise WeightedMergeError(
-            f"Balanced work target chunk size must be positive, got {target_chunk_bytes}."
-        )
-    if not global_shape:
-        return (((), ()),)
-
-    dtype_bytes = _dtype_nbytes(dtype)
-    split_dim = max(range(len(global_shape)), key=lambda dim: int(global_shape[dim]))
-    other_numel = 1
-    for dim, size in enumerate(global_shape):
-        if dim != split_dim:
-            other_numel *= int(size)
-    row_bytes = max(1, other_numel * dtype_bytes)
-    tile_length = max(1, min(int(global_shape[split_dim]), target_chunk_bytes // row_bytes))
-
-    tiles: list[tuple[tuple[int, ...], tuple[int, ...]]] = []
-    start = 0
-    while start < int(global_shape[split_dim]):
-        length = min(tile_length, int(global_shape[split_dim]) - start)
-        offsets = [0 for _ in global_shape]
-        chunk_shape = list(global_shape)
-        offsets[split_dim] = start
-        chunk_shape[split_dim] = length
-        tiles.append((tuple(offsets), tuple(chunk_shape)))
-        start += length
-    return tuple(tiles)
-
-
 def _rank_balanced_assignments(
     candidates: list[tuple[int, int, _DirectDcpWriteSpec]],
     *,
@@ -1552,9 +1509,7 @@ def _build_metadata_same_layout_write_specs(
     first_layouts: dict[str, _DcpMetadataTensorLayout],
     save_dtype: str,
     input_count: int,
-    balanced_work: bool = False,
-    balance_mode: str = "virtual",
-    target_chunk_bytes: Optional[int] = None,
+    balance_rank_work: bool = False,
 ) -> _MetadataSameLayoutWorkPlan:
     rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
     world_size = (
@@ -1582,21 +1537,7 @@ def _build_metadata_same_layout_write_specs(
             target_dtype = (
                 target_dtype_override if target_dtype_override is not None else layout.dtype
             )
-        use_virtual_tiles = (
-            balanced_work
-            and balance_mode == "virtual"
-            and target_chunk_bytes is not None
-        )
-        chunks = (
-            _virtual_tensor_tiles(
-                global_shape=layout.global_shape,
-                dtype=target_dtype,
-                target_chunk_bytes=int(target_chunk_bytes),
-            )
-            if use_virtual_tiles
-            else layout.chunks
-        )
-        for chunk_index, (global_offsets, chunk_shape) in enumerate(chunks):
+        for chunk_index, (global_offsets, chunk_shape) in enumerate(layout.chunks):
             template_leaf = _metadata_same_layout_chunk_leaf(
                 fqn=fqn,
                 dtype=layout.dtype,
@@ -1628,7 +1569,7 @@ def _build_metadata_same_layout_write_specs(
                 target_dtype=target_dtype,
                 input_count=input_count,
             )
-            if balanced_work:
+            if balance_rank_work:
                 candidate_specs.append((cost_bytes, stable_index, spec))
             elif chunk_index % world_size == rank:
                 local_write_specs.append(spec)
@@ -1640,7 +1581,7 @@ def _build_metadata_same_layout_write_specs(
                 rank_tensor_chunks[assigned_rank] += 1
             stable_index += 1
 
-    if balanced_work:
+    if balance_rank_work:
         assigned_specs, assigned_bytes, assigned_chunks = _rank_balanced_assignments(
             candidate_specs,
             world_size=world_size,
@@ -1691,9 +1632,7 @@ def merge_same_layout_dcp_metadata_checkpoints(
     atomic_output: bool = True,
     merge_style: Optional[str] = None,
     model_key_prefixes: tuple[str, ...] = METADATA_SAME_LAYOUT_MODEL_PREFIXES,
-    balanced_work: bool = False,
-    balance_mode: str = "virtual",
-    target_chunk_bytes: Optional[int] = None,
+    balance_rank_work: bool = False,
 ) -> MergeResult:
     """Merge same-layout torch_dist checkpoints using public DCP metadata only.
 
@@ -1727,20 +1666,6 @@ def merge_same_layout_dcp_metadata_checkpoints(
         )
     if not model_key_prefixes:
         raise WeightedMergeError("model_key_prefixes must contain at least one prefix.")
-    if balance_mode not in BALANCED_WORK_MODES:
-        raise WeightedMergeError(
-            f"Unsupported balance mode '{balance_mode}'. "
-            f"Use one of: {', '.join(BALANCED_WORK_MODES)}."
-        )
-    effective_balance_mode = balance_mode if balanced_work else "source-layout"
-    if balanced_work and balance_mode == "virtual" and target_chunk_bytes is None:
-        target_chunk_bytes = DEFAULT_BALANCED_WORK_TARGET_CHUNK_MIB * 1024 * 1024
-    if not balanced_work or balance_mode != "virtual":
-        target_chunk_bytes = None
-    if target_chunk_bytes is not None and target_chunk_bytes <= 0:
-        raise WeightedMergeError(
-            f"Balanced work target chunk size must be positive, got {target_chunk_bytes}."
-        )
     if not atomic_output:
         raise WeightedMergeError(
             "Weighted merge requires atomic output publication; "
@@ -1792,7 +1717,7 @@ def merge_same_layout_dcp_metadata_checkpoints(
         resolved_input_dirs=resolved_input_dirs,
         model_key_prefixes=model_key_prefixes,
         save_dtype=save_dtype,
-        require_matching_chunks=not (balanced_work and balance_mode == "virtual"),
+        require_matching_chunks=True,
     )
     work_plan = _build_metadata_same_layout_write_specs(
         selected_keys=selected_keys,
@@ -1800,9 +1725,7 @@ def merge_same_layout_dcp_metadata_checkpoints(
         first_layouts=first_layouts,
         save_dtype=save_dtype,
         input_count=len(resolved_input_dirs),
-        balanced_work=balanced_work,
-        balance_mode=balance_mode,
-        target_chunk_bytes=target_chunk_bytes,
+        balance_rank_work=balance_rank_work,
     )
     memory_estimate = MergeMemoryEstimate(
         mergeable_tensors=work_plan.merge_keys,
@@ -1816,11 +1739,9 @@ def merge_same_layout_dcp_metadata_checkpoints(
         f"{output_dir} with weights {weights}",
         flush=True,
     )
-    if balanced_work:
+    if balance_rank_work:
         print_rank_0(
-            "Balanced work plan: "
-            f"mode={balance_mode}, "
-            f"target_chunk_bytes={target_chunk_bytes}, "
+            "Rank-work balanced plan: "
             f"tensor_bytes_by_rank={list(work_plan.tensor_bytes_by_rank)}, "
             f"tensor_chunks_by_rank={list(work_plan.tensor_chunks_by_rank)}",
             flush=True,
@@ -1853,9 +1774,7 @@ def merge_same_layout_dcp_metadata_checkpoints(
         strict=strict,
         merge_style=merge_style,
         execution_mode=METADATA_SAME_LAYOUT_MODE,
-        balanced_work=balanced_work,
-        balance_mode=effective_balance_mode,
-        target_chunk_bytes=target_chunk_bytes,
+        balance_rank_work=balance_rank_work,
     )
 
     from megatron.core.dist_checkpointing.core import CheckpointingConfig, save_config
@@ -1962,9 +1881,7 @@ def merge_same_layout_dcp_metadata_checkpoints(
         implementation_mode=METADATA_SAME_LAYOUT_MODE,
         memory_estimate=memory_estimate,
         preflight_only=False,
-        balanced_work=balanced_work,
-        balance_mode=effective_balance_mode,
-        target_chunk_bytes=target_chunk_bytes,
+        balance_rank_work=balance_rank_work,
         plan_tensor_bytes_by_rank=work_plan.tensor_bytes_by_rank,
         plan_tensor_chunks_by_rank=work_plan.tensor_chunks_by_rank,
     )
@@ -2027,31 +1944,11 @@ def add_merge_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         ),
     )
     group.add_argument(
-        "--merge-balanced-work",
+        "--merge-balance-rank-work",
         action="store_true",
         help=(
-            "Prototype: greedily bin-pack merge work across distributed ranks. "
-            "Use --merge-balance-mode to choose source chunk or virtual tile granularity."
-        ),
-    )
-    group.add_argument(
-        "--merge-balance-mode",
-        choices=BALANCED_WORK_MODES,
-        default="virtual",
-        help=(
-            "Granularity for --merge-balanced-work. 'source' preserves original DCP "
-            "chunks and balances them across ranks; 'virtual' ignores source chunks "
-            "and creates logical tiles. Default: virtual."
-        ),
-    )
-    group.add_argument(
-        "--merge-target-chunk-mib",
-        type=int,
-        default=DEFAULT_BALANCED_WORK_TARGET_CHUNK_MIB,
-        help=(
-            "Prototype virtual tile target, in MiB, used with "
-            "--merge-balanced-work --merge-balance-mode=virtual. "
-            f"Default: {DEFAULT_BALANCED_WORK_TARGET_CHUNK_MIB}."
+            "Greedily bin-pack source DCP chunks across distributed ranks to reduce "
+            "per-rank merge work skew while preserving the source checkpoint chunk layout."
         ),
     )
     group.add_argument(
@@ -2192,15 +2089,6 @@ def _validate_metadata_same_layout_cli_args(args: argparse.Namespace) -> None:
             "Weighted merge requires atomic output publication; "
             "--no-atomic-merge-output is not supported."
         )
-    if args.merge_target_chunk_mib <= 0:
-        raise WeightedMergeError("--merge-target-chunk-mib must be positive.")
-    if args.merge_target_chunk_mib != DEFAULT_BALANCED_WORK_TARGET_CHUNK_MIB and (
-        not args.merge_balanced_work or args.merge_balance_mode != "virtual"
-    ):
-        raise WeightedMergeError(
-            "--merge-target-chunk-mib only applies with "
-            "--merge-balanced-work --merge-balance-mode=virtual."
-        )
 
     unsupported_non_defaults = [
         (args.merge_resource_log != "none", "--merge-resource-log"),
@@ -2228,13 +2116,7 @@ def _run_metadata_same_layout_cli(args: argparse.Namespace) -> MergeResult:
         overwrite_output=args.overwrite_merge_output,
         atomic_output=not args.no_atomic_merge_output,
         merge_style=merge_style,
-        balanced_work=args.merge_balanced_work,
-        balance_mode=args.merge_balance_mode,
-        target_chunk_bytes=(
-            args.merge_target_chunk_mib * 1024 * 1024
-            if args.merge_balanced_work and args.merge_balance_mode == "virtual"
-            else None
-        ),
+        balance_rank_work=args.merge_balance_rank_work,
     )
 
 
@@ -2300,16 +2182,9 @@ def _print_merge_result(result: MergeResult) -> None:
         max_plan_bytes = max(result.plan_tensor_bytes_by_rank)
         min_plan_bytes = min(result.plan_tensor_bytes_by_rank)
         spread = max_plan_bytes / max(1, min_plan_bytes)
-        target_chunk = (
-            _format_bytes(result.target_chunk_bytes)
-            if result.target_chunk_bytes is not None
-            else "source-layout"
-        )
         print_rank_0(
             "Planned tensor work: "
-            f"balanced={result.balanced_work}, "
-            f"balance_mode={result.balance_mode}, "
-            f"target_chunk={target_chunk}, "
+            f"balance_rank_work={result.balance_rank_work}, "
             f"bytes_by_rank={_format_rank_bytes(result.plan_tensor_bytes_by_rank)}, "
             f"chunks_by_rank={list(result.plan_tensor_chunks_by_rank)}, "
             f"max_min_ratio={spread:.3f}",
