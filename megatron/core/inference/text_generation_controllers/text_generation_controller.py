@@ -79,6 +79,12 @@ class _AsyncPendingForwardView:
     cuda_graph_request_count: Optional[int]
     current_request_ids: Optional[Tensor] = None
     row_indices: Optional[Tensor] = None
+    row_indices_cpu: Optional[Tensor] = None
+    planned_request_query_lengths: Optional[Tensor] = None
+    planned_request_kv_length_offsets: Optional[Tensor] = None
+    planned_token_to_pos_ids: Optional[Tensor] = None
+    planned_token_to_block_idx: Optional[Tensor] = None
+    planned_token_to_local_position_within_kv_block: Optional[Tensor] = None
 
     @property
     def row_mapped(self) -> bool:
@@ -205,6 +211,7 @@ class TextGenerationController:
         self._async_mtp_finish_boundary_count = 0
         self._async_pause_boundary_count = 0
         self._async_evict_boundary_count = 0
+        self._async_prepare_deferred_until_after_sampling = False
         self._async_sample_slot_count = 2
         self._async_current_sample_slot = 0
         self._request_sampling_rngs: Dict[int, torch.Generator] = {}
@@ -1603,9 +1610,12 @@ class TextGenerationController:
         pending_request_ids = context.async_prepared_request_ids_cpu()
         if pending_request_ids is None:
             pending_request_ids = self._active_request_ids_cpu()
+        request_count = int(pending_request_ids.numel())
+        planned_layout = self._capture_pending_forward_layout(request_count)
         self._async_pending_forward_view = _AsyncPendingForwardView(
             pending_request_ids=pending_request_ids,
             cuda_graph_request_count=cuda_graph_request_count,
+            **planned_layout,
         )
         context.clear_async_prepared_decode_plan()
 
@@ -1615,6 +1625,114 @@ class TextGenerationController:
         if pending_view is None:
             return True
         return torch.equal(pending_view.pending_request_ids, self._active_request_ids_cpu())
+
+    def _capture_pending_forward_layout(self, request_count: int) -> Dict[str, Optional[Tensor]]:
+        """Snapshot the CPU-visible layout used by the prepared async forward."""
+        context = self.inference_wrapped_model.inference_context
+        tokens_per_request = self.num_speculative_tokens + 1
+        token_count = request_count * tokens_per_request
+
+        def _clone_optional(name: str, count: int) -> Optional[Tensor]:
+            value = getattr(context, name, None)
+            if value is None:
+                return None
+            return value[:count].clone()
+
+        layout = {
+            "planned_request_query_lengths": _clone_optional(
+                "_staging_request_query_lengths", request_count
+            ),
+            "planned_request_kv_length_offsets": _clone_optional(
+                "_staging_request_kv_length_offsets", request_count
+            ),
+            "planned_token_to_pos_ids": None,
+            "planned_token_to_block_idx": None,
+            "planned_token_to_local_position_within_kv_block": None,
+        }
+        if token_count <= 0:
+            return layout
+
+        for field in (
+            "token_to_pos_ids",
+            "token_to_block_idx",
+            "token_to_local_position_within_kv_block",
+        ):
+            value = getattr(context, field, None)
+            if value is None:
+                continue
+            layout[f"planned_{field}"] = value[:token_count].view(
+                request_count, tokens_per_request
+            ).clone()
+        return layout
+
+    def _pending_forward_layout_matches_current(
+        self, pending_view: _AsyncPendingForwardView
+    ) -> bool:
+        """Return whether the prepared async layout matches reconciled CPU state."""
+        planned_fields = (
+            pending_view.planned_request_query_lengths,
+            pending_view.planned_request_kv_length_offsets,
+            pending_view.planned_token_to_pos_ids,
+            pending_view.planned_token_to_block_idx,
+            pending_view.planned_token_to_local_position_within_kv_block,
+        )
+        if all(field is None for field in planned_fields):
+            return True
+
+        context = self.inference_wrapped_model.inference_context
+        current_request_ids = (
+            pending_view.current_request_ids
+            if pending_view.current_request_ids is not None
+            else self._active_request_ids_cpu()
+        )
+        request_count = int(current_request_ids.numel())
+        if request_count == 0 or int(pending_view.pending_request_ids.numel()) != request_count:
+            return False
+
+        row_indices = pending_view.row_indices_cpu
+        if row_indices is None:
+            row_indices = torch.arange(request_count, dtype=torch.long, device='cpu')
+        else:
+            row_indices = row_indices.to(dtype=torch.long, device='cpu')
+
+        active_slice = slice(context.paused_request_count, context.total_request_count)
+        if pending_view.planned_request_query_lengths is not None:
+            current_query_lengths = context.request_query_lengths[active_slice][:request_count]
+            planned_query_lengths = pending_view.planned_request_query_lengths.index_select(
+                0, row_indices
+            )
+            if not torch.equal(current_query_lengths, planned_query_lengths):
+                return False
+
+        if pending_view.planned_request_kv_length_offsets is not None:
+            current_kv_offsets = context.request_kv_length_offsets[active_slice][:request_count]
+            planned_kv_offsets = pending_view.planned_request_kv_length_offsets.index_select(
+                0, row_indices
+            )
+            if not torch.equal(current_kv_offsets, planned_kv_offsets):
+                return False
+
+        tokens_per_request = self.num_speculative_tokens + 1
+        token_count = request_count * tokens_per_request
+        if context.active_token_count != token_count:
+            return False
+
+        for field in (
+            "token_to_pos_ids",
+            "token_to_block_idx",
+            "token_to_local_position_within_kv_block",
+        ):
+            planned = getattr(pending_view, f"planned_{field}")
+            if planned is None:
+                continue
+            current = getattr(context, field)[:token_count].view(
+                request_count, tokens_per_request
+            )
+            planned_in_current_order = planned.index_select(0, row_indices)
+            if not torch.equal(current, planned_in_current_order):
+                return False
+
+        return True
 
     def _map_pending_forward_to_current_rows(
         self, pending_view: _AsyncPendingForwardView
@@ -1628,10 +1746,22 @@ class TextGenerationController:
 
         pending_request_ids = pending_view.pending_request_ids
         if torch.equal(pending_request_ids, current_request_ids):
-            return _AsyncPendingForwardView(
+            current_view = _AsyncPendingForwardView(
                 pending_request_ids=pending_request_ids,
                 cuda_graph_request_count=pending_view.cuda_graph_request_count,
                 current_request_ids=current_request_ids,
+                planned_request_query_lengths=pending_view.planned_request_query_lengths,
+                planned_request_kv_length_offsets=pending_view.planned_request_kv_length_offsets,
+                planned_token_to_pos_ids=pending_view.planned_token_to_pos_ids,
+                planned_token_to_block_idx=pending_view.planned_token_to_block_idx,
+                planned_token_to_local_position_within_kv_block=(
+                    pending_view.planned_token_to_local_position_within_kv_block
+                ),
+            )
+            return (
+                current_view
+                if self._pending_forward_layout_matches_current(current_view)
+                else None
             )
         if pending_request_ids.numel() != current_request_ids.numel():
             return None
@@ -1646,14 +1776,26 @@ class TextGenerationController:
                 return None
             mapped_rows.append(row)
 
+        row_indices_cpu = torch.tensor(mapped_rows, dtype=torch.long, device='cpu')
         row_indices = torch.tensor(
             mapped_rows, dtype=torch.long, device=torch.cuda.current_device()
         )
-        return _AsyncPendingForwardView(
+        current_view = _AsyncPendingForwardView(
             pending_request_ids=pending_request_ids,
             cuda_graph_request_count=pending_view.cuda_graph_request_count,
             current_request_ids=current_request_ids,
             row_indices=row_indices,
+            row_indices_cpu=row_indices_cpu,
+            planned_request_query_lengths=pending_view.planned_request_query_lengths,
+            planned_request_kv_length_offsets=pending_view.planned_request_kv_length_offsets,
+            planned_token_to_pos_ids=pending_view.planned_token_to_pos_ids,
+            planned_token_to_block_idx=pending_view.planned_token_to_block_idx,
+            planned_token_to_local_position_within_kv_block=(
+                pending_view.planned_token_to_local_position_within_kv_block
+            ),
+        )
+        return (
+            current_view if self._pending_forward_layout_matches_current(current_view) else None
         )
 
     def _pending_forward_graph_shape_matches_current(
@@ -1672,23 +1814,10 @@ class TextGenerationController:
         if pending_view is None:
             return True, False
 
-        current_request_ids = self._active_request_ids_cpu()
-        if current_request_ids.numel() == 0:
+        current_view = self._map_pending_forward_to_current_rows(pending_view)
+        if current_view is None:
             return False, False
-        if not self._pending_forward_graph_shape_matches_current(pending_view):
-            return False, False
-        if torch.equal(pending_view.pending_request_ids, current_request_ids):
-            return True, False
-        if pending_view.pending_request_ids.numel() != current_request_ids.numel():
-            return False, False
-
-        pending_request_ids = pending_view.pending_request_ids.tolist()
-        pending_request_id_set = set(int(request_id) for request_id in pending_request_ids)
-        for request_id in current_request_ids.tolist():
-            if int(request_id) not in pending_request_id_set:
-                return False, False
-
-        return True, True
+        return True, current_view.row_mapped
 
     def _resolve_pending_async_forward_view(self) -> Optional[_AsyncPendingForwardView]:
         """Resolve the pending speculative forward's row layout for current consumers.
@@ -1949,33 +2078,18 @@ class TextGenerationController:
         )
 
     def _try_prepare_async_decode_before_sampling(self) -> bool:
-        """Prepare next-step metadata before sampling and reserve the async handoff."""
-        context = self.inference_wrapped_model.inference_context
+        """Defer async preparation until current-step sampling has consumed logits."""
         self._async_disable_reason = self._async_scheduling_disabled_reason()
         self._record_async_eligibility_result(self._async_disable_reason)
         if self._async_disable_reason is not None:
             self._decide_ep_async_handoff(has_real_work=True, can_launch_async_handoff=False)
             return False
 
-        range_push("async_prepare_next_step")
-        async_next_prepared = context.prepare_async_decode_next_step()
-        range_pop()
-        if not async_next_prepared:
-            self._async_disable_reason = "failed to prepare next-step metadata"
-            self._record_async_disable_reason(self._async_disable_reason)
-            self._decide_ep_async_handoff(has_real_work=True, can_launch_async_handoff=False)
-            return False
-
-        handoff_decision = self._decide_ep_async_handoff(
-            has_real_work=True, can_launch_async_handoff=True
+        self._async_prepare_deferred_until_after_sampling = True
+        self._record_async_disable_reason(
+            "next-step metadata prepared after sampling to preserve current logits"
         )
-        if not handoff_decision.launch_async_forward:
-            context.discard_async_prepared_decode_plan()
-            self._async_disable_reason = "ep async handoff skipped"
-            self._record_async_disable_reason(self._async_disable_reason)
-            return False
-
-        return True
+        return False
 
     def _try_prepare_async_decode_after_sampling(self) -> bool:
         """Prepare next-step metadata for an async forward launched after sampling."""
@@ -2846,6 +2960,7 @@ class TextGenerationController:
         pending_forward_view = None
         pending_forward_row_indices = None
         pending_forward_row_mapped = False
+        self._async_prepare_deferred_until_after_sampling = False
         ep_step_begin_decision = self._decide_ep_step_begin(has_real_work=True)
         if ep_step_begin_decision.discard_pending_forward:
             self._discard_pending_async_forward()
@@ -2944,10 +3059,10 @@ class TextGenerationController:
             if async_next_prepared:
                 self._dynamic_step_sample_logits_to_next_input_ids()
             elif pending_forward_reused and self.num_speculative_tokens == 0:
-                self._dynamic_step_sample_logits_to_next_input_ids(
-                    row_indices=pending_forward_row_indices
-                )
+                self._dynamic_step_sample_logits(row_indices=pending_forward_row_indices)
                 async_next_prepared = self._try_prepare_async_decode_after_sampling()
+                if async_next_prepared:
+                    self._copy_sampled_decode_tokens_to_next_input_ids(active_request_count)
             elif self.num_speculative_tokens > 0:
                 if pending_forward_reused:
                     self._dynamic_step_sample_bookkeeping()
@@ -2984,6 +3099,12 @@ class TextGenerationController:
                     context.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
             else:
                 self._dynamic_step_sample_logits()
+                if self._async_prepare_deferred_until_after_sampling:
+                    async_next_prepared = self._try_prepare_async_decode_after_sampling()
+                    if async_next_prepared:
+                        self._copy_sampled_decode_tokens_to_next_input_ids(
+                            active_request_count
+                        )
 
             log_probs = None
             top_n_logprobs = None
