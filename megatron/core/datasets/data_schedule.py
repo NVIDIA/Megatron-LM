@@ -178,13 +178,16 @@ class DpBalancedScheduler(BasePackingScheduler):
         Steps:
             1. Fetch batches and gather global sequence lengths
             2. Check required sample keys
-            3. Schedule samples into groups
-            4. Reroute samples to DCP ranks
-            5. Build packed microbatches
-            6. Calculate FLOPs info
-            7. Broadcast to PP group (for middle PP stages)
-            8. Broadcast to TP group (for non-TP-0 ranks)
+            3. Strip data fields not needed by this PP stage
+            4. Schedule samples into groups
+            5. Reroute samples to DCP ranks
+            6. Build packed microbatches
+            7. Calculate FLOPs info
+            8. Broadcast scalars to TP group (for non-TP-0 ranks)
             9. Handle VPP if enabled
+
+        Note: There is no PP-group broadcast. In packed-sequence mode
+        is_dataset_built_on_rank returns True for every PP stage on TP rank 0
 
         Args:
             data_iterator: The data iterator.

@@ -253,7 +253,10 @@ def create_data_iterator(
             new_data_iterator = []
             for i in range(vpp_size):
                 if vpp_needs_data is not None and vpp_needs_data[i]:
-                    new_data_iterator.append(RerunDataIterator(iter(new_samples)))
+                    # Give each data-carrying VPP stage its own shallow-copied
+                    # sample dicts. 
+                    samples_copy = [dict(sample) for sample in new_samples]
+                    new_data_iterator.append(RerunDataIterator(iter(samples_copy)))
                 else:
                     # Create independent metadata dicts to avoid shared-reference mutation
                     metadata = [
