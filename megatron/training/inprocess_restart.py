@@ -23,9 +23,14 @@ from . import arguments
 
 
 def destroy_state():
-    from . import training
+    from . import training, ft_integration
     training.destroy_global_state()
     rerun_state_machine.destroy_rerun_state_machine()
+    # In-process restart re-runs pretrain(), which calls ft_integration.setup()
+    # again. Without resetting the FT rank-monitor client global here, that
+    # setup() asserts 'rank monitor client is already initialized' on every
+    # restart -> restart loop. shutdown() is a no-op if FT was never enabled.
+    ft_integration.shutdown()
 
 def inprocess_restart(train, args):
     if inprocess is None:
