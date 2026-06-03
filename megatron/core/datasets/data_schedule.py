@@ -564,8 +564,12 @@ def get_batch_on_this_rank_for_sequence_packing(
 
     if is_first_or_last_stage or mtp_on_this_rank:
         if is_tp_rank_0:
-            # Use whichever data field is available (first stage has tokens, last has labels)
-            _data_field = batch.get('tokens') or batch.get('labels')
+            # Use whichever data field is available (first stage has tokens, last has labels).
+            # Avoid `tokens or labels`: PyTorch tensors raise on truthiness when they have
+            # more than one element ("Boolean value of Tensor ... is ambiguous").
+            _data_field = batch.get('tokens')
+            if _data_field is None:
+                _data_field = batch.get('labels')
             total_tokens = torch.tensor(_data_field.size(0), dtype=torch.int32, device=dev)
         else:
             total_tokens = torch.empty(1, dtype=torch.int32, device=dev)
