@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 from types import SimpleNamespace
 
 import numpy as np
@@ -63,8 +65,7 @@ def test_language_module_unfused_loss_passes_tp_group(monkeypatch):
     )
 
     module = SimpleNamespace(
-        config=SimpleNamespace(cross_entropy_loss_fusion=False),
-        tp_group=tp_group,
+        config=SimpleNamespace(cross_entropy_loss_fusion=False), tp_group=tp_group
     )
     labels = torch.tensor([[0, 1, 2], [2, 1, 0]])
     logits = torch.randn(3, 2, 4)

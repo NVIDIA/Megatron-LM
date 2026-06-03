@@ -127,9 +127,7 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         vocab_parallel_logits, logits_max = VocabParallelCrossEntropy.calculate_logits_max(
             vocab_parallel_logits
         )
-        torch.distributed.all_reduce(
-            logits_max, op=torch.distributed.ReduceOp.MAX, group=tp_group
-        )
+        torch.distributed.all_reduce(logits_max, op=torch.distributed.ReduceOp.MAX, group=tp_group)
 
         # Get the partition's vocab indices
         get_vocab_range = VocabUtility.vocab_range_from_per_partition_vocab_size
@@ -146,15 +144,11 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
 
         # All reduce is needed to get the chunks from other GPUs.
         torch.distributed.all_reduce(
-            predicted_logits,
-            op=torch.distributed.ReduceOp.SUM,
-            group=tp_group,
+            predicted_logits, op=torch.distributed.ReduceOp.SUM, group=tp_group
         )
 
         torch.distributed.all_reduce(
-            sum_exp_logits,
-            op=torch.distributed.ReduceOp.SUM,
-            group=tp_group,
+            sum_exp_logits, op=torch.distributed.ReduceOp.SUM, group=tp_group
         )
 
         exp_logits, loss = VocabParallelCrossEntropy.calculate_cross_entropy_loss(
@@ -236,4 +230,6 @@ def vocab_parallel_cross_entropy(
 
         tp_group: the tensor parallel group over which to all reduce
     """
-    return _VocabParallelCrossEntropy.apply(vocab_parallel_logits, target, label_smoothing, tp_group)
+    return _VocabParallelCrossEntropy.apply(
+        vocab_parallel_logits, target, label_smoothing, tp_group
+    )

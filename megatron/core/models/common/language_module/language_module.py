@@ -180,7 +180,9 @@ class LanguageModule(MegatronModule):
             elif self.config.cross_entropy_fusion_impl == 'native':
                 loss = fused_vocab_parallel_cross_entropy(logits, labels, self.pg_collection.tp)
         else:
-            loss = tensor_parallel.vocab_parallel_cross_entropy(logits, labels, tp_group=self.tp_group)
+            loss = tensor_parallel.vocab_parallel_cross_entropy(
+                logits, labels, tp_group=self.tp_group
+            )
 
         # [s b] => [b, s]
         loss = loss.transpose(0, 1).contiguous()
