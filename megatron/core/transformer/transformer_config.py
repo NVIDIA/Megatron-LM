@@ -870,6 +870,21 @@ class TransformerConfig(ModelParallelConfig):
     """Number of SMs to use for NCCL EP (the max_num_sms passed to TransformerEngine's
     ep_bootstrap). 0 lets TransformerEngine/NCCL choose the default."""
 
+    moe_ncclep_static_shape: bool = False
+    """For the 'ncclep' flex dispatcher: feed the experts the full fixed-size receive buffer
+    instead of narrowing to the (data-dependent) number of received tokens. This removes the D2H
+    sync + dynamic shapes from the dispatch at the cost of wasted GEMM on the unused (slack) rows,
+    which combine ignores. Required for CUDA-graph capture of the MoE A2A; harmless (just slower)
+    in eager mode. Defaults to False (narrow to the received tokens)."""
+
+    moe_ncclep_skip_capacity_pad: bool = False
+    """For the 'ncclep' flex dispatcher, only when moe_ncclep_static_shape is True: skip padding the
+    per-expert token counts up to the receive capacity (the last-expert reconciliation). With it off
+    , the last expert's count is padded so sum(counts) == recv_capacity, which works with
+    the standard (torch.split) grouped-GEMM path on any GPU. With it on, the experts receive the
+    actual per-expert counts (sum < recv_capacity) over the full static buffer, avoiding the wasted
+    slack GEMM -- but this requires CuTe DSL GEMM that consumes ragged per-expert counts"""
+
     moe_mlp_glu_interleave_size: Optional[int] = None
     """When set, GLU activations in the MoE grouped MLP layer will use a
     block interleaved format. Instead of interpreting the input tensor
