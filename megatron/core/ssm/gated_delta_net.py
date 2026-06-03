@@ -29,6 +29,7 @@ from megatron.core.ssm.mamba_context_parallel import (
     _undo_attention_load_balancing,
 )
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
+from megatron.core.tensor_parallel.random import CheckpointManager
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
@@ -221,8 +222,14 @@ class GatedDeltaNet(MegatronModule):
             eps=self.config.layernorm_epsilon,
         )
         self.recompute_norm_out = False
+        self.recompute_qkv = False
         if self.config.recompute_granularity == "selective":
             self.recompute_norm_out = "gdn_norm_out" in self.config.recompute_modules
+            # gdn_qkv: recompute the whole QKV proj+prep block as a discard-output checkpoint.
+            self.recompute_qkv = "gdn_qkv" in self.config.recompute_modules
+
+        # Per-forward CheckpointManager for the GDN discard-output recompute (gdn_qkv/gdn_norm_out).
+        self.gdn_recompute_manager = None
 
         self.out_proj = build_module(
             submodules.out_proj,
@@ -336,6 +343,109 @@ class GatedDeltaNet(MegatronModule):
             cu_seqlens_q = None
             cu_seqlens_kv = None
 
+        # gdn_qkv (QKV proj+prep) and gdn_norm_out (gated norm) are discard-output checkpoints; the
+        # QKV output `gate` feeds the gated-norm block, so when both are on the CheckpointManager
+        # replays them in forward order (qkv -> norm_out) from one grad hook on `out`.
+        recompute_qkv = self.recompute_qkv and self.training
+        recompute_norm_out = self.recompute_norm_out and self.training
+        self.gdn_recompute_manager = (
+            CheckpointManager() if (recompute_qkv or recompute_norm_out) else None
+        )
+
+        # QKV projection + prep block (in_proj -> CP a2a -> conv1d -> _prepare_qkv -> g/beta).
+        def _qkv_proj_and_prepare(hidden_states):
+            return self._compute_qkv_for_gated_delta_rule(
+                hidden_states, batch, seq_len, cu_seqlens_q, packed_seq_params
+            )
+
+        if recompute_qkv:
+            # Discard the QKV outputs now; regenerate them in backward. Synchronous recompute
+            # (no async reload), so it is safe with the fla/compiled gated_delta_rule backward.
+            query, key, value, g, beta, gate = tensor_parallel.CheckpointWithoutOutput(
+                fp8=(self.config.fp8 or self.config.fp4),
+                ckpt_manager=self.gdn_recompute_manager,
+            ).checkpoint(_qkv_proj_and_prepare, hidden_states)
+        else:
+            query, key, value, g, beta, gate = _qkv_proj_and_prepare(hidden_states)
+
+        # seq_len was reassigned to the post-CP-a2a sequence length inside the block; recover it
+        # from a produced tensor so the downstream gated-norm reshape uses the correct value.
+        seq_len = value.shape[1]
+
+        nvtx_range_push(suffix="gated_delta_rule")
+        core_attn_out, last_recurrent_state = self.gated_delta_rule(
+            query,
+            key,
+            value,
+            g=g,
+            beta=beta,
+            initial_state=None,
+            output_final_state=False,
+            use_qk_l2norm_in_kernel=False,
+            cu_seqlens=cu_seqlens_q,
+        )
+        nvtx_range_pop(suffix="gated_delta_rule")
+
+        def _gated_norm_and_a2a(core_attn_out: torch.Tensor, gate: torch.Tensor):
+            # RMSNorm
+            nvtx_range_push(suffix="gated_norm")
+            norm_out_hp = self._apply_gated_norm(core_attn_out, gate)
+            nvtx_range_pop(suffix="gated_norm")
+
+            # Transpose: b s x --> s b x
+            # From bshd back to sbhd format
+            norm_out_hp = norm_out_hp.reshape(batch, seq_len, -1)
+            norm_out_hp = norm_out_hp.transpose(0, 1).contiguous()
+
+            # CP all to all: HP to CP
+            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+                unpacked_norm_out = _unpack_sequence(norm_out_hp, cu_seqlens_q, dim=0)
+                outputs = []
+                for norm_out_i in unpacked_norm_out:
+                    norm_out_i = tensor_a2a_hp2cp(
+                        norm_out_i, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
+                    )
+                    outputs.append(norm_out_i)
+                norm_out = torch.cat(outputs, dim=0)
+            else:
+                norm_out = tensor_a2a_hp2cp(
+                    norm_out_hp, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
+                )
+
+            return norm_out
+
+        if recompute_norm_out:
+            norm_out = tensor_parallel.CheckpointWithoutOutput(
+                ckpt_manager=self.gdn_recompute_manager
+            ).checkpoint(_gated_norm_and_a2a, core_attn_out, gate)
+        else:
+            norm_out = _gated_norm_and_a2a(core_attn_out, gate)
+
+        # Output projection
+        nvtx_range_push(suffix="out_proj")
+        out, out_bias = self.out_proj(norm_out)
+        nvtx_range_pop(suffix="out_proj")
+
+        # Discard the checkpointed outputs (now consumed) and register the unified recompute hook on
+        # `out` — its grad is computed first in backward, before the backwards that need them.
+        if self.gdn_recompute_manager is not None:
+            self.gdn_recompute_manager.discard_all_outputs_and_register_unified_recompute(out)
+            self.gdn_recompute_manager = None
+
+        return out, out_bias
+
+    def _compute_qkv_for_gated_delta_rule(
+        self, hidden_states, batch, seq_len, cu_seqlens_q, packed_seq_params
+    ):
+        """QKV projection + preparation block for the gated delta rule.
+
+        Runs in_proj, CP all-to-all, conv1d, _prepare_qkv and g/beta, producing the tensors consumed
+        by ``self.gated_delta_rule`` plus the ``gate`` for the gated norm. Extracted so it can be
+        checkpointed when ``recompute_modules`` contains ``"gdn_qkv"``.
+
+        Returns:
+            Tuple of (query, key, value, g, beta, gate).
+        """
         # Input projection
         nvtx_range_push(suffix="in_proj")
         qkvzba, _ = self.in_proj(hidden_states)
@@ -463,63 +573,7 @@ class GatedDeltaNet(MegatronModule):
         g, beta = self._compute_g_and_beta(A_log_local_cp, dt_bias_local_cp, alpha, beta)
         nvtx_range_pop(suffix="g_and_beta")
 
-        nvtx_range_push(suffix="gated_delta_rule")
-        core_attn_out, last_recurrent_state = self.gated_delta_rule(
-            query,
-            key,
-            value,
-            g=g,
-            beta=beta,
-            initial_state=None,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=False,
-            cu_seqlens=cu_seqlens_q,
-        )
-        nvtx_range_pop(suffix="gated_delta_rule")
-
-        def _gated_norm_and_a2a(core_attn_out: torch.Tensor, gate: torch.Tensor):
-            # RMSNorm
-            nvtx_range_push(suffix="gated_norm")
-            norm_out_hp = self._apply_gated_norm(core_attn_out, gate)
-            nvtx_range_pop(suffix="gated_norm")
-
-            # Transpose: b s x --> s b x
-            # From bshd back to sbhd format
-            norm_out_hp = norm_out_hp.reshape(batch, seq_len, -1)
-            norm_out_hp = norm_out_hp.transpose(0, 1).contiguous()
-
-            # CP all to all: HP to CP
-            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-                unpacked_norm_out = _unpack_sequence(norm_out_hp, cu_seqlens_q, dim=0)
-                outputs = []
-                for norm_out_i in unpacked_norm_out:
-                    norm_out_i = tensor_a2a_hp2cp(
-                        norm_out_i, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
-                    )
-                    outputs.append(norm_out_i)
-                norm_out = torch.cat(outputs, dim=0)
-            else:
-                norm_out = tensor_a2a_hp2cp(
-                    norm_out_hp, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
-                )
-
-            return norm_out
-
-        if self.recompute_norm_out:
-            self.norm_out_checkpoint = tensor_parallel.CheckpointWithoutOutput()
-            norm_out = self.norm_out_checkpoint.checkpoint(_gated_norm_and_a2a, core_attn_out, gate)
-        else:
-            norm_out = _gated_norm_and_a2a(core_attn_out, gate)
-
-        # Output projection
-        nvtx_range_push(suffix="out_proj")
-        out, out_bias = self.out_proj(norm_out)
-        nvtx_range_pop(suffix="out_proj")
-
-        if self.recompute_norm_out:
-            self.norm_out_checkpoint.discard_output_and_register_recompute(out)
-
-        return out, out_bias
+        return query, key, value, g, beta, gate
 
     @jit_fuser
     def _apply_gated_norm(self, x, gate):
