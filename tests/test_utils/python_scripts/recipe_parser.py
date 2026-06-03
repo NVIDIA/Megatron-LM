@@ -127,6 +127,14 @@ def resolve_cluster_config(cluster: str) -> str:
         return "draco-oci-ord"
     if cluster == "dgxh100_coreweave":
         return "coreweave"
+    if cluster == "cpu_eos":
+        return "eos-cpu"
+    if cluster == "cpu_coreweave":
+        return "coreweave-cpu"
+    if cluster == "cpu_dracooci":
+        return "draco-oci-iad-cpu"
+    if cluster == "cpu_oci-hsg":
+        return "oci-hsg-cpu"
     if cluster == "ghci":
         return "ghci"
     raise ValueError(f"Unknown cluster {cluster} provided.")
