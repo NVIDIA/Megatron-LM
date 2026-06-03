@@ -689,70 +689,11 @@ def test_metadata_same_layout_merge_round_trip_without_model_builder_path(
         assert provenance["extra_state_source_index"] == 1
 
 
-def test_metadata_same_layout_balanced_work_retiles_single_chunk_tensors(
+def test_metadata_same_layout_balance_rank_work_preserves_source_chunks(
     tmp_path_dist_ckpt, process_group
 ):
     if _world_size() != 1:
-        pytest.skip("balanced virtual tiling coverage uses single-rank fixture metadata")
-
-    shape = (5, 2)
-    with (
-        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_balanced_a") as ckpt_a,
-        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_balanced_b") as ckpt_b,
-        TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_balanced_out") as output_root,
-    ):
-        _write_checkpoint(ckpt_a, 1.0, extra_value=111.0, iteration=1, shape=shape)
-        _write_checkpoint(ckpt_b, 5.0, extra_value=999.0, iteration=2, shape=shape)
-
-        result = merge_same_layout_dcp_metadata_checkpoints(
-            [ckpt_a, ckpt_b],
-            [0.25, 0.75],
-            output_root,
-            output_iteration=30,
-            extra_state_source_index=1,
-            balanced_work=True,
-            target_chunk_bytes=16,
-        )
-
-        loaded = _load_checkpoint(result.output_dir, shape=shape)
-        assert torch.equal(loaded["model"]["weight"], torch.full(shape, 4.0))
-        assert torch.equal(loaded["model"]["bias"], torch.full((2,), 5.0))
-        assert torch.equal(loaded["model"]["decoder.layers.0._extra_state"], torch.tensor([999.0]))
-
-        source_metadata = torch_dcp.FileSystemReader(ckpt_a).read_metadata()
-        output_metadata = torch_dcp.FileSystemReader(result.output_dir).read_metadata()
-        source_weight_chunks = [
-            (tuple(chunk.offsets), tuple(chunk.sizes))
-            for chunk in source_metadata.state_dict_metadata["model.weight"].chunks
-        ]
-        output_weight_chunks = sorted(
-            (tuple(chunk.offsets), tuple(chunk.sizes))
-            for chunk in output_metadata.state_dict_metadata["model.weight"].chunks
-        )
-
-        assert source_weight_chunks == [((0, 0), shape)]
-        assert output_weight_chunks == [
-            ((0, 0), (2, 2)),
-            ((2, 0), (2, 2)),
-            ((4, 0), (1, 2)),
-        ]
-        assert result.balanced_work is True
-        assert result.balance_mode == "virtual"
-        assert result.target_chunk_bytes == 16
-        assert result.plan_tensor_chunks_by_rank == (5,)
-
-        common_state = dist_checkpointing.load_common_state_dict(str(result.output_dir))
-        provenance = common_state["weighted_merge_provenance"]
-        assert provenance["balanced_work"] is True
-        assert provenance["balance_mode"] == "virtual"
-        assert provenance["target_chunk_bytes"] == 16
-
-
-def test_metadata_same_layout_source_balanced_work_preserves_source_chunks(
-    tmp_path_dist_ckpt, process_group
-):
-    if _world_size() != 1:
-        pytest.skip("source-balanced chunk metadata coverage uses single-rank fixture metadata")
+        pytest.skip("rank-work balance chunk metadata coverage uses single-rank fixture metadata")
 
     shape = (5, 2)
     with (
@@ -769,9 +710,7 @@ def test_metadata_same_layout_source_balanced_work_preserves_source_chunks(
             output_root,
             output_iteration=30,
             extra_state_source_index=1,
-            balanced_work=True,
-            balance_mode="source",
-            target_chunk_bytes=16,
+            balance_rank_work=True,
         )
 
         loaded = _load_checkpoint(result.output_dir, shape=shape)
@@ -790,15 +729,11 @@ def test_metadata_same_layout_source_balanced_work_preserves_source_chunks(
         ]
 
         assert output_weight_chunks == source_weight_chunks
-        assert result.balanced_work is True
-        assert result.balance_mode == "source"
-        assert result.target_chunk_bytes is None
+        assert result.balance_rank_work is True
 
         common_state = dist_checkpointing.load_common_state_dict(str(result.output_dir))
         provenance = common_state["weighted_merge_provenance"]
-        assert provenance["balanced_work"] is True
-        assert provenance["balance_mode"] == "source"
-        assert provenance["target_chunk_bytes"] is None
+        assert provenance["balance_rank_work"] is True
 
 
 def test_metadata_same_layout_generated_gpt_round_trip_cpu_without_model_builder_path(
@@ -1191,6 +1126,7 @@ def test_metadata_same_layout_cli_dispatch_skips_megatron_parser(tmp_path, monke
             "30",
             "--extra-state-source-index",
             "1",
+            "--merge-balance-rank-work",
             "--ckpt-format",
             "torch_dist",
         ]
@@ -1203,6 +1139,7 @@ def test_metadata_same_layout_cli_dispatch_skips_megatron_parser(tmp_path, monke
     assert calls["output_root"] == str(output_root)
     assert calls["kwargs"]["output_iteration"] == 30
     assert calls["kwargs"]["extra_state_source_index"] == 1
+    assert calls["kwargs"]["balance_rank_work"] is True
 
 
 def test_metadata_same_layout_cli_rejects_unsupported_template_options(tmp_path):
