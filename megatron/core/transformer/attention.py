@@ -36,6 +36,7 @@ from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tens
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.torch_norm import L2Norm, LayerNormBuilder
+from megatron.core.transformer.utils import is_layer_window_attention
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     deprecate_inference_params,
@@ -775,6 +776,7 @@ class Attention(MegatronModule, ABC):
         seqlens_k,
         block_table,
         softmax_scale,
+        window_size: Tuple[int, int] = (-1, -1),
     ):
         """
         Wrapper for calling the FA3 _flash_attn_forward function.
@@ -809,9 +811,9 @@ class Attention(MegatronModule, ABC):
             "causal": True,
             "attention_chunk": 0,
             "softcap": 0.0,
-            "window_size": (-1, -1),
-            "window_size_left": -1,
-            "window_size_right": -1,
+            "window_size": window_size,
+            "window_size_left": window_size[0],
+            "window_size_right": window_size[1],
             "rotary_interleaved": True,
             "scheduler_metadata": None,
             "num_splits": 0 if not self.batch_invariant_mode else 1,
@@ -865,6 +867,18 @@ class Attention(MegatronModule, ABC):
         assert not self.training
         assert block_table is not None
 
+        # Resolve sliding-window-attention size for this layer.
+        # `config.window_size` is a (left, right) tuple, where -1 means infinite
+        # window in that direction (i.e. full attention). When SWA is not active
+        # for this layer (either globally disabled, or the layer is a "full
+        # attention" layer per `window_attn_skip_freq`), fall back to (-1, -1).
+        if is_layer_window_attention(
+            self.config.window_size, self.config.window_attn_skip_freq, self.layer_number
+        ):
+            window_size = self.config.window_size
+        else:
+            window_size = (-1, -1)
+
         # Flash attn kernel.
         if not is_decode_only:
             q = q.squeeze(1)
@@ -884,6 +898,7 @@ class Attention(MegatronModule, ABC):
                     page_table=block_table,
                     softmax_scale=softmax_scale,
                     causal=True,
+                    window_size=window_size,
                     num_splits=1,
                 )
             elif HAVE_FA3:
@@ -899,6 +914,7 @@ class Attention(MegatronModule, ABC):
                     seqlens_k,
                     block_table,
                     softmax_scale,
+                    window_size=window_size,
                 )
             else:
                 assert (
@@ -914,6 +930,7 @@ class Attention(MegatronModule, ABC):
                     max_seqlen_k,
                     softmax_scale=softmax_scale,
                     causal=True,
+                    window_size=window_size,
                     block_table=block_table,
                 )
             output_total = output_total.unsqueeze(1)
@@ -929,6 +946,11 @@ class Attention(MegatronModule, ABC):
             # The `softmax_scale` attribute check is to find out whether this is an MLA layer or
             # standard Attention.
             if isinstance(self.config, MLATransformerConfig) and hasattr(self, "softmax_scale"):
+                # FlashMLA does not currently support sliding window attention.
+                assert window_size == (-1, -1), (
+                    "FlashMLA decode kernel does not support sliding window attention. "
+                    "Set config.window_size = None or use a non-MLA attention layer."
+                )
                 softmax_scale = self.softmax_scale
 
                 num_heads_k = 1  # Only a single head for MLA Flash
@@ -974,6 +996,7 @@ class Attention(MegatronModule, ABC):
                         page_table=block_table,
                         softmax_scale=softmax_scale,
                         causal=True,
+                        window_size=window_size,
                         num_splits=1,
                     )
                     # Reshape back to (B, S, H, D)
@@ -987,6 +1010,7 @@ class Attention(MegatronModule, ABC):
                         "v_cache": v,
                         "cache_seqlens": seqlens_k,
                         "causal": True,
+                        "window_size": window_size,
                         "page_table" if HAVE_FA3 else "block_table": block_table,
                         "num_splits": 0 if not self.batch_invariant_mode else 1,
                     }
