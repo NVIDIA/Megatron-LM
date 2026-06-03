@@ -534,16 +534,15 @@ def _indexer_topk_core(
         sk = int(max_seqlen_kv)
         total_q = q.shape[0]
 
-        # Per-row valid KV length: for token ``i`` in batch ``b``,
-        #   pos_in_seq = i - cu_seqlens_q[b]
-        #   valid = min((pos_in_seq + 1) // ratio, seqlen_kv[b])
+        # The indexer kernel has already applied the causal mask using
+        # cu_seqlens_q/cu_seqlens_k.  In CP, Q and K sequence lengths can
+        # differ for a split sequence piece, which represents a trapezoid
+        # causal mask.  Let top-k scan the whole visible K segment and filter
+        # the kernel-masked ``-inf`` entries after selection.
         row_idx = torch.arange(total_q, device=device, dtype=torch.int32)
         row_batch_ids = batch_of_row(cu_seqlens_q, total_q=total_q)
-        pos_in_seq = row_idx - cu_seqlens_q[row_batch_ids]
         seqlen_kv_per_row = (cu_seqlens_kv[1:] - cu_seqlens_kv[:-1])[row_batch_ids]
-        seq_lens = (
-            ((pos_in_seq + 1) // ratio).clamp(max=seqlen_kv_per_row).to(torch.int32).contiguous()
-        )
+        seq_lens = seqlen_kv_per_row.to(torch.int32).contiguous()
     else:
         # Kernel wants k as 4-D ``(b, sk, h_kv, idx_hd)``.
         scores = _DSA.indexer_forward_wrapper(q, k.unsqueeze(2), w, ratio=ratio)[
@@ -570,6 +569,14 @@ def _indexer_topk_core(
     if topk_k < topk:
         pad = torch.full((total_q, topk - topk_k), -1, dtype=torch.int32, device=device)
         topk_indices = torch.cat([topk_indices, pad], dim=-1)
+
+    if is_thd:
+        safe_topk = topk_indices.clamp(min=0).to(torch.long)
+        selected_scores = torch.gather(scores_flat, dim=-1, index=safe_topk)
+        selected_valid = (topk_indices >= 0) & torch.isfinite(selected_scores)
+        topk_indices = torch.where(
+            selected_valid, topk_indices, torch.full_like(topk_indices, -1)
+        )
 
     topk_length = (topk_indices >= 0).sum(dim=-1).int()  # (total_q,)
 
@@ -1051,14 +1058,12 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         else:
             w_indexer_scaled = w_indexer
 
-        effective_topk = min(indexer_topk, n_comp)
-
         # ---- 2. Indexer scoring + top-K (with scores retained). ---------------
         topk_indices_cmp, _, indexer_scores = _indexer_topk_core(
             q_indexer_flat,
             k_indexer_flat,
             w_indexer_scaled,
-            effective_topk,
+            indexer_topk,
             ratio,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_kv=cu_seqlens_compressed_idx,
@@ -1109,7 +1114,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             softmax_scale,
             attn_sink=attn_sink,
             topk_length=None,
-            indexer_topk=effective_topk,
+            indexer_topk=indexer_topk,
         )
 
         # ---- 5. Derive predict from indexer_scores, compute target. ----------

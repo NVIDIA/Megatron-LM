@@ -5,10 +5,11 @@ import torch
 
 from megatron.core.transformer.experimental_attention_variant.csa_cp_utils import (
     build_compressor_prep_compact,
-    contiguous_cp_partition,
-    exchange_left_boundary_tensor,
     build_cp_flat_idxs,
     build_cp_flat_idxs_for_indexer_loss,
+    build_cp_indexer_topk_inputs,
+    contiguous_cp_partition,
+    exchange_left_boundary_tensor,
     pack_cp_kv_full,
 )
 
@@ -17,7 +18,7 @@ def test_contiguous_cp_partition_requires_padded_total_divisible_by_cp_size():
     """Validate the fixed-size padded contiguous CP partition contract.
 
     Expected: a single CP rank owns the full padded range, while a padded token
-    count that is not divisible by cp_size raises before the fallback builds
+    count that is not divisible by cp_size raises before CP layout construction builds
     local layouts. A failure here means CP could silently proceed with uneven
     rank padded-token ranges.
     """
@@ -34,7 +35,7 @@ def test_boundary_exchange_single_rank_returns_zero_boundary_and_zero_grad():
 
     Expected: with cp_group=None, the fixed left boundary is zero-filled and its
     backward path contributes no gradient to the local tensor. A failure here
-    means the fallback could invent boundary tokens or bogus local gradients.
+    means the CP path could invent boundary tokens or bogus local gradients.
     """
     local = torch.arange(12, dtype=torch.float32).reshape(4, 3).requires_grad_(True)
 
@@ -127,6 +128,51 @@ def test_kv_full_pack_keeps_per_sequence_window_then_compressed_layout():
     expected_prefix = torch.tensor([101.0, 102.0, 103.0, 900.0, 104.0, 105.0, 901.0])
     assert torch.equal(kv_full[:7].squeeze(-1), expected_prefix)
     assert torch.equal(kv_full[7:], torch.zeros_like(kv_full[7:]))
+
+
+def test_build_cp_indexer_topk_inputs_uses_local_trapezoid_cu_seqlens():
+    """Validate CP-local indexer top-k input construction for a split sequence.
+
+    Expected: the helper keeps only this rank's Q rows but builds a longer
+    compressed-KV prefix for the same sequence, producing different Q/KV
+    cu_seqlens. A failure here means the THD top-k kernel cannot receive the
+    local trapezoid mask shape needed after CP partitioning.
+    """
+    ratio = 4
+    cu_seqlens_q = torch.tensor([0, 32], dtype=torch.int32)
+    cu_seqlens_compressed = torch.tensor([0, 8], dtype=torch.int32)
+    q_indexer_local = torch.arange(16, dtype=torch.float32).reshape(8, 1, 2)
+    weights_indexer_local = torch.arange(8, dtype=torch.float32).reshape(8, 1)
+    k_indexer_seq_major = torch.arange(16, dtype=torch.float32).reshape(8, 2)
+
+    (
+        q_topk,
+        k_topk,
+        weights_topk,
+        cu_q_topk,
+        cu_k_topk,
+        max_q,
+        max_k,
+        local_row_ids,
+    ) = build_cp_indexer_topk_inputs(
+        q_indexer_local,
+        weights_indexer_local,
+        k_indexer_seq_major,
+        cu_seqlens_q,
+        cu_seqlens_compressed,
+        global_start=16,
+        l_local=8,
+        ratio=ratio,
+    )
+
+    assert torch.equal(q_topk, q_indexer_local)
+    assert torch.equal(weights_topk, weights_indexer_local)
+    assert torch.equal(k_topk, k_indexer_seq_major[:6])
+    assert torch.equal(cu_q_topk, torch.tensor([0, 8], dtype=torch.int32))
+    assert torch.equal(cu_k_topk, torch.tensor([0, 6], dtype=torch.int32))
+    assert max_q == 8
+    assert max_k == 6
+    assert torch.equal(local_row_ids, torch.arange(8, dtype=torch.long))
 
 
 def test_build_cp_flat_idxs_respect_sequence_local_compressed_ids():
