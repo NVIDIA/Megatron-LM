@@ -352,21 +352,27 @@ class FullyParallelLoadStrategyWrapper:
 
             with debug_time("torch.cuda.synchronize", logger):
                 torch.cuda.synchronize()
-
-        all_loaded_objects = exchange_loaded_objects_gather_object(loaded_objects)
+        
+        with trace_region("exchange_loaded_objects"):
+            all_loaded_objects = exchange_loaded_objects_gather_object(loaded_objects)
 
         if not set(unloaded_objects.keys()).issubset(all_loaded_objects.keys()):
             missing_object_shards = set(unloaded_objects.keys()) - all_loaded_objects.keys()
             raise CheckpointingException(
                 f'Missing object shards after fully parallel loading: {missing_object_shards}'
             )
-        torch.cuda.synchronize()
+        with trace_region("torch.cuda.synchronize"):
+            torch.cuda.synchronize()
 
-        self.fill_in_deferred_sharded_tensors(sharded_tensors, all_loaded_tensors)
-        self.fill_in_deferred_sharded_objects(sharded_objects, all_loaded_objects)
+        with trace_region("fill_in_deferred_sharded_tensors"):
+            self.fill_in_deferred_sharded_tensors(sharded_tensors, all_loaded_tensors)
+        
+        with trace_region("fill_in_deferred_sharded_objects"):
+            self.fill_in_deferred_sharded_objects(sharded_objects, all_loaded_objects)
 
-        merge(loaded_state_dict, sharded_objects)
-        merge(loaded_state_dict, sharded_tensors)
+        with trace_region("merge"):
+            merge(loaded_state_dict, sharded_objects)
+            merge(loaded_state_dict, sharded_tensors)
         if hasattr(self.base_strategy, "cached_global_metadata"):
             self.cached_global_metadata = self.base_strategy.cached_global_metadata
         return loaded_state_dict
