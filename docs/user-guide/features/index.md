@@ -20,6 +20,7 @@ moe
 context_parallel
 megatron_fsdp
 dist_optimizer
+checkpoint-merge
 optimizer_cpu_offload
 paged_stash
 pipeline_parallel_layout
