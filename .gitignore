@@ -1,4 +1,5 @@
-__pycache__
+__pycache__/
+*.pyc
 *.so
 build
 .coverage_*
@@ -16,6 +17,7 @@ onelogger.err
 runs/
 /test_cases/
 **/dist/
+AGENTS.md
 
 # Sphinx documentation
 docs/_build
