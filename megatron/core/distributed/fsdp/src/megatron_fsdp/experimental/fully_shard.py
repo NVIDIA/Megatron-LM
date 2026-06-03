@@ -14,15 +14,14 @@
 
 """Minimal Megatron-FSDP fully_shard entrypoint."""
 
-from collections.abc import Iterable
-
-import torch
 from torch import nn
 from torch.distributed import DeviceMesh
 
 from ..mixed_precision import MixedPrecisionPolicy
-from .fsdp_module import DelayedRelease, FsdpContext, FsdpModule, _mesh_device
+from .fsdp_module import DelayedRelease, FsdpContext, FsdpModule
 from .placement import Placements
+
+__all__ = ["DelayedRelease", "FsdpContext", "FsdpModule", "fully_shard"]
 
 
 def fully_shard(
@@ -44,43 +43,16 @@ def fully_shard(
         raise ValueError("This module is already managed by FSDP.")
 
     mixed_precision_policy = mixed_precision_policy or MixedPrecisionPolicy()
-    descendant_fsdp_modules = tuple(_iter_descendant_fsdp_modules(module))
-    fsdp_context = _select_fsdp_context(descendant_fsdp_modules, _mesh_device(mesh))
-
     original_cls = module.__class__
     _attach_mixin(module)
     try:
         assert isinstance(module, FsdpModule)
         FsdpModule.__init__(
-            module,
-            mesh=mesh,
-            placements=placements,
-            mixed_precision_policy=mixed_precision_policy,
-            fsdp_context=fsdp_context,
+            module, mesh=mesh, placements=placements, mixed_precision_policy=mixed_precision_policy
         )
     except Exception:
-        if isinstance(module, FsdpModule):
-            module._fsdp_context.remove_module(module)
         module.__class__ = original_cls
         raise
-    for descendant_module in descendant_fsdp_modules:
-        descendant_module._assign_fsdp_context(fsdp_context)
-
-
-def _iter_descendant_fsdp_modules(module: nn.Module) -> Iterable[FsdpModule]:
-    for child_module in module.modules():
-        if child_module is module:
-            continue
-        if isinstance(child_module, FsdpModule):
-            yield child_module
-
-
-def _select_fsdp_context(
-    descendant_fsdp_modules: tuple[FsdpModule, ...], device: torch.device
-) -> FsdpContext:
-    for descendant_module in descendant_fsdp_modules:
-        return descendant_module._fsdp_context
-    return FsdpContext(device=device)
 
 
 def _attach_mixin(module: nn.Module) -> None:

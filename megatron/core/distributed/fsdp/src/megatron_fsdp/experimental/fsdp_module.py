@@ -102,7 +102,7 @@ class FsdpModule:
     """Mixin attached to modules managed by the minimal FSDP path."""
 
     _parameter_groups: tuple[ParameterGroup, ...]
-    _fsdp_context: FsdpContext
+    _context: FsdpContext | None
     _ready_grad_parameters: set[nn.Parameter]
     num_training_parameters: int
 
@@ -111,10 +111,9 @@ class FsdpModule:
         mesh: DeviceMesh,
         placements: Placements,
         mixed_precision_policy: MixedPrecisionPolicy,
-        fsdp_context: FsdpContext,
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module."""
-        self._assign_fsdp_context(fsdp_context)
+        self._context = None
         owned_parameters = _materialize_and_collect_owned_parameters(self, _mesh_device(mesh))
         axis_indices = tuple(_axis_index(mesh, axis) for axis in placements.dp_axes)
         assert axis_indices == tuple(
@@ -137,14 +136,39 @@ class FsdpModule:
         )
         self._register_hooks()
 
-    def _assign_fsdp_context(self, fsdp_context: FsdpContext) -> None:
-        old_context = getattr(self, "_fsdp_context", None)
+    def _assign_context(self, fsdp_context: FsdpContext) -> None:
+        old_context = getattr(self, "_context", None)
         if old_context is fsdp_context:
             return
         if old_context is not None:
             old_context.remove_module(self)
-        self._fsdp_context = fsdp_context
-        self._fsdp_context.add_module(self)
+        self._context = fsdp_context
+        self._context.add_module(self)
+
+    def _lazy_init_context(self) -> None:
+        """Initialize the shared runtime context for this FSDP root subtree."""
+        if self._context is not None:
+            return
+
+        fsdp_context = FsdpContext(device=self._parameter_groups[0].main_weight.local_buffer.device)
+        for submodule in cast(nn.Module, self).modules():
+            if not isinstance(submodule, FsdpModule):
+                continue
+            if submodule._context is not None:
+                raise RuntimeError(
+                    "FSDP context is already initialized for a descendant module. "
+                    "Run forward through the root FSDP module first."
+                )
+            submodule._assign_context(fsdp_context)
+
+    def _require_context(self) -> FsdpContext:
+        """Return the initialized context, or fail if runtime hooks are out of order."""
+        if self._context is None:
+            raise RuntimeError(
+                "FSDP context has not been initialized. "
+                "Run forward through the root FSDP module first."
+            )
+        return self._context
 
     def _register_hooks(self) -> None:
         module = cast(nn.Module, self)
@@ -171,14 +195,14 @@ class FsdpModule:
 
     def pre_forward(self) -> None:
         """Prepare full parameters for forward compute."""
+        self._lazy_init_context()
+        context = self._require_context()
         self._ready_grad_parameters.clear()
-        self._unshard_on_communication_stream(
-            wait_for_current_stream=self._fsdp_context.is_root_module(self)
-        )
+        self._unshard_on_communication_stream(wait_for_current_stream=context.is_root_module(self))
 
     def _unshard_on_communication_stream(self, *, wait_for_current_stream: bool) -> None:
         """Run this module's all-gather on the shared communication stream."""
-        context = self._fsdp_context
+        context = self._require_context()
         context.drain_delayed_releases(target_length=context.release_delay - 1)
 
         current_stream = torch.cuda.current_stream(context.device)
@@ -196,10 +220,11 @@ class FsdpModule:
 
     def post_forward(self) -> None:
         """Return parameters to their sharded resting state after forward compute."""
+        context = self._require_context()
         self._reshard_parameter_groups()
-        self._fsdp_context.enqueue_release(self)
-        if self._fsdp_context.is_root_module(self):
-            self._fsdp_context.drain_delayed_releases(target_length=0)
+        context.enqueue_release(self)
+        if context.is_root_module(self):
+            context.drain_delayed_releases(target_length=0)
 
     def _reshard_parameter_groups(self) -> None:
         for group in self._parameter_groups:
@@ -211,7 +236,7 @@ class FsdpModule:
 
     def post_backward(self) -> None:
         """Reduce gradients and return parameters to their sharded resting state."""
-        context = self._fsdp_context
+        context = self._require_context()
         self._reduce_gradient_groups()
         self._reshard_parameter_groups()
         context.enqueue_release(self)

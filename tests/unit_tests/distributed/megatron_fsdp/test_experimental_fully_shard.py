@@ -192,6 +192,13 @@ def _fully_shard_children_then_parent(
     for layer in model.layers:
         fully_shard(layer, mesh=mesh, placements=placements)
     fully_shard(model, mesh=mesh, placements=placements)
+    model._lazy_init_context()
+
+
+def _require_context(module: FsdpModule) -> FsdpContext:
+    context = module._context
+    assert context is not None
+    return context
 
 
 def _run_training_iteration(model: MultiChildModel, x: torch.Tensor) -> torch.Tensor:
@@ -275,7 +282,7 @@ def test_nested_fully_shard_excludes_child_owned_parameters(setup: DistributedSe
 
 @pytest.mark.distributed
 def test_child_then_parent_share_one_context(setup: DistributedSetup):
-    """A parent FSDP unit should reuse the child context for its subtree."""
+    """A parent FSDP unit should lazily create one context for its subtree."""
     if setup.world_size < 2:
         pytest.skip("This test requires at least 2 ranks.")
 
@@ -283,18 +290,22 @@ def test_child_then_parent_share_one_context(setup: DistributedSetup):
     model = NestedModel().to(setup.device)
 
     fully_shard(model.inner, mesh=mesh, placements=_flat_placements())
-    child_context = model.inner._fsdp_context
+    assert model.inner._context is None
     fully_shard(model, mesh=mesh, placements=_flat_placements())
+    assert model._context is None
+    assert model.inner._context is None
 
-    assert model._fsdp_context is child_context
-    assert model.inner._fsdp_context is child_context
-    assert model._fsdp_context.is_root_module(model)
-    assert not model._fsdp_context.is_root_module(model.inner)
+    model._lazy_init_context()
+    context = _require_context(model)
+
+    assert model.inner._context is context
+    assert context.is_root_module(model)
+    assert not context.is_root_module(model.inner)
 
 
 @pytest.mark.distributed
 def test_two_child_subtrees_then_parent_collapse_to_one_context(setup: DistributedSetup):
-    """Sharding a parent should reconcile multiple child contexts into one."""
+    """Sharding a parent should lazily assign one context across child subtrees."""
     if setup.world_size < 2:
         pytest.skip("This test requires at least 2 ranks.")
 
@@ -303,15 +314,16 @@ def test_two_child_subtrees_then_parent_collapse_to_one_context(setup: Distribut
 
     fully_shard(model.layers[0], mesh=mesh, placements=_flat_placements())
     fully_shard(model.layers[1], mesh=mesh, placements=_flat_placements())
-    first_context = model.layers[0]._fsdp_context
 
-    assert model.layers[0]._fsdp_context is not model.layers[1]._fsdp_context
+    assert model.layers[0]._context is None
+    assert model.layers[1]._context is None
 
     fully_shard(model, mesh=mesh, placements=_flat_placements())
+    model._lazy_init_context()
+    context = _require_context(model)
 
-    assert model._fsdp_context is first_context
-    assert model.layers[0]._fsdp_context is first_context
-    assert model.layers[1]._fsdp_context is first_context
+    assert model.layers[0]._context is context
+    assert model.layers[1]._context is context
 
 
 @pytest.mark.distributed
@@ -326,9 +338,17 @@ def test_sibling_roots_without_parent_keep_separate_contexts(setup: DistributedS
     fully_shard(model.layers[0], mesh=mesh, placements=_flat_placements())
     fully_shard(model.layers[1], mesh=mesh, placements=_flat_placements())
 
-    assert model.layers[0]._fsdp_context is not model.layers[1]._fsdp_context
-    assert model.layers[0]._fsdp_context.is_root_module(model.layers[0])
-    assert model.layers[1]._fsdp_context.is_root_module(model.layers[1])
+    assert model.layers[0]._context is None
+    assert model.layers[1]._context is None
+
+    model.layers[0]._lazy_init_context()
+    model.layers[1]._lazy_init_context()
+    first_context = _require_context(model.layers[0])
+    second_context = _require_context(model.layers[1])
+
+    assert first_context is not second_context
+    assert first_context.is_root_module(model.layers[0])
+    assert second_context.is_root_module(model.layers[1])
 
 
 @pytest.mark.distributed
@@ -340,7 +360,7 @@ def test_only_parent_is_root_in_shared_context(setup: DistributedSetup):
     mesh = init_device_mesh(setup.device.type, (setup.world_size,))
     model = MultiChildModel(dim=4, num_children=1).to(setup.device)
     _fully_shard_children_then_parent(model, mesh, _flat_placements())
-    context = model._fsdp_context
+    context = _require_context(model)
 
     assert context.is_root_module(model)
     assert not context.is_root_module(model.layers[0])
@@ -355,7 +375,7 @@ def test_normal_pre_unshard_drain_retains_release_delay_minus_one(setup: Distrib
     mesh = init_device_mesh(setup.device.type, (setup.world_size,))
     model = MultiChildModel(dim=8, num_children=3).to(setup.device)
     _fully_shard_children_then_parent(model, mesh, _flat_placements())
-    context = model._fsdp_context
+    context = _require_context(model)
 
     model.layers[0].pre_forward()
     first_storage_nbytes = _unsharded_storage_nbytes(model.layers[0])
@@ -388,7 +408,7 @@ def test_root_post_forward_drains_delayed_releases_to_zero(setup: DistributedSet
     mesh = init_device_mesh(setup.device.type, (setup.world_size,))
     model = MultiChildModel(dim=8, num_children=2).to(setup.device)
     _fully_shard_children_then_parent(model, mesh, _flat_placements())
-    context = model._fsdp_context
+    context = _require_context(model)
 
     for layer in model.layers:
         layer.pre_forward()
@@ -412,7 +432,7 @@ def test_root_post_backward_drains_delayed_releases_to_zero(setup: DistributedSe
     mesh = init_device_mesh(setup.device.type, (setup.world_size,))
     model = MultiChildModel(dim=8, num_children=1).to(setup.device)
     _fully_shard_children_then_parent(model, mesh, _flat_placements())
-    context = model._fsdp_context
+    context = _require_context(model)
     layer = model.layers[0]
 
     layer.pre_backward()
@@ -480,15 +500,17 @@ def test_fully_sharded_root_with_child_units_overlaps_all_gather_and_compute(
     for layer in model.layers:
         fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
     fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
-    context = model._fsdp_context
-    assert context.is_root_module(model)
-    assert all(layer._fsdp_context is context for layer in model.layers)
-    assert all(not context.is_root_module(layer) for layer in model.layers)
+    assert model._context is None
+    assert all(layer._context is None for layer in model.layers)
 
     x = torch.randn(4096, dim, device=setup.device, dtype=dtype, requires_grad=True)
 
     _run_training_iteration(model, x)
     torch.cuda.synchronize(setup.device)
+    context = _require_context(model)
+    assert context.is_root_module(model)
+    assert all(layer._context is context for layer in model.layers)
+    assert all(not context.is_root_module(layer) for layer in model.layers)
 
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], acc_events=True) as prof:
         _run_training_iteration(model, x)
