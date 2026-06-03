@@ -856,6 +856,129 @@ def _get_megatron_emerging_optimizer(
     return ChainedOptimizer(results)
 
 
+def _build_megatron_fsdp_v2_muon_optimizer(
+    config: OptimizerConfig,
+    model_chunks: List[MegatronModule],
+    all_dense_model_chunks: List,
+    config_overrides: Dict,
+    mp_group,
+    dp_cp_group,
+    dp_cp_group_gloo,
+    data_parallel_group_idx,
+    intra_dist_opt_group,
+    distributed_optimizer_instance_id,
+    pg_collection,
+) -> MegatronOptimizer:
+    """Build Muon (2D matrices) + Adam (rest) for Megatron-FSDP v2.
+
+    EXPERIMENTAL / UNVALIDATED (Phase 3). Routes 2D matrix params to the
+    single-root :class:`FullyShardV2Muon` and every other param to the standard
+    FSDP Adam, combined via :class:`ChainedOptimizer`. Called only from
+    ``get_megatron_optimizer`` when ``optimizer='muon'`` + ``use_megatron_fsdp``,
+    so no other optimizer path is affected. The Muon/Adam split reuses the same
+    ``_is_nonlinear_or_embedding`` config override as the non-FSDP emerging path.
+
+    Needs validation on a GPU node (grad-clip semantics for Muon, momentum
+    checkpointing, and passing full FSDP buffers to an Adam built over only the
+    non-matrix param subset).
+    """
+    from .fully_shard_v2_muon import FullyShardV2Muon, FullyShardV2MuonOptimizer
+
+    # Tag params and route non-linear/embedding params to Adam (same mechanism
+    # as the non-FSDP emerging path in _get_megatron_emerging_optimizer).
+    # _default_param_overrides_factory is defined regardless of whether the
+    # emerging_optimizers package is installed (FullyShardV2Muon has a built-in
+    # Newton-Schulz fallback), so we don't index _EMERGING_OPTIMIZERS here.
+    from .emerging_optimizers import _default_param_overrides_factory
+
+    for model_chunk in model_chunks:
+        for name, param in model_chunk.named_parameters():
+            if not param.requires_grad:
+                continue
+            if 'experts' in name and 'shared' not in name:
+                param.expert_tp = True
+            if 'linear_qkv.weight' in name and len(param.shape) == 2:
+                param.is_qkv = True
+    config_overrides.update(_default_param_overrides_factory())
+
+    muon_kwargs = dict(
+        lr=config.lr,
+        momentum=getattr(config, 'muon_momentum', 0.95),
+        nesterov=getattr(config, 'muon_nesterov', False),
+        weight_decay=config.weight_decay,
+        num_ns_steps=getattr(config, 'muon_num_ns_steps', 5),
+        coefficient_type=getattr(config, 'muon_coefficient_type', 'quintic'),
+        scale_mode=getattr(config, 'muon_scale_mode', 'spectral'),
+        extra_scale_factor=getattr(config, 'muon_extra_scale_factor', 1.0),
+        fp32_matmul_prec=getattr(config, 'muon_fp32_matmul_prec', 'medium'),
+        # TODO(phase3): wire pg_collection/tp_mode for tensor-parallel NS (Phase 2).
+        pg_collection=None,
+    )
+
+    adam_config = copy.copy(config)
+    adam_config.optimizer = 'adam'
+
+    optimizers: List[MegatronOptimizer] = []
+    model_chunk_offset = 0
+    for chunk_list in all_dense_model_chunks:
+        # --- Adam for the non-matrix params (standard FSDP path) ---
+        adam_groups, buffers = _get_param_groups_and_buffers(
+            chunk_list,
+            model_chunk_offset=model_chunk_offset,
+            config=adam_config,
+            config_overrides=config_overrides,
+            filter_fn=lambda g: g.get('optimizer') == 'adam',
+            buffer_name='buffers',
+        )
+        if adam_groups:
+            adam_part = _get_megatron_optimizer_based_on_param_groups(
+                config=adam_config,
+                model_chunks=chunk_list,
+                param_groups=adam_groups,
+                per_model_buffers=buffers,
+                model_parallel_group=mp_group,
+                data_parallel_group=dp_cp_group,
+                data_parallel_group_gloo=dp_cp_group_gloo,
+                data_parallel_group_idx=data_parallel_group_idx,
+                intra_dist_opt_group=intra_dist_opt_group,
+                distributed_optimizer_instance_id=distributed_optimizer_instance_id,
+                pg_collection=pg_collection,
+            )
+            if (
+                not USING_PYTORCH_OPTIMIZER
+                and config.use_precision_aware_optimizer
+                and getattr(adam_part.optimizer, "master_weights", None) is not None
+            ):
+                setattr(adam_part.optimizer, "master_weights", False)
+            # ChainedOptimizer asserts sub-optimizers share one config object.
+            adam_part.config = config
+            optimizers.append(adam_part)
+
+        # --- Muon for the 2D matrix params (single-root FSDP v2) ---
+        # Symmetric with Adam: pass the muon bucket of optimizer-facing params
+        # (dist_params). FullyShardV2Muon resolves each back to its FSDP
+        # ParameterGroup via the dist_param back-references.
+        muon_groups, _ = _get_param_groups_and_buffers(
+            chunk_list,
+            model_chunk_offset=model_chunk_offset,
+            config=config,
+            config_overrides=config_overrides,
+            filter_fn=lambda g: g.get('optimizer') != 'adam',
+            buffer_name='buffers',
+        )
+        if muon_groups:
+            muon = FullyShardV2Muon(muon_groups, **muon_kwargs)
+            optimizers.append(
+                FullyShardV2MuonOptimizer(muon, config, model_chunks=chunk_list)
+            )
+
+        model_chunk_offset += 1
+
+    if len(optimizers) == 1:
+        return optimizers[0]
+    return ChainedOptimizer(optimizers)
+
+
 def get_megatron_optimizer(
     config: OptimizerConfig,
     model_chunks: List[MegatronModule],
@@ -895,7 +1018,12 @@ def get_megatron_optimizer(
 
     # TODO: the standard and emerging optimizer paths handle pg_collection differently;
     # unify them so both use a single pg_collection-based flow.
-    if config.optimizer not in ('adam', 'sgd'):
+    # Megatron-FSDP routes emerging optimizers (e.g. Muon) through its own branch
+    # below (it needs the FSDP process groups); only the non-FSDP case is handled here.
+    use_megatron_fsdp = getattr(
+        getattr(model_chunks[0], 'ddp_config', None), 'use_megatron_fsdp', False
+    )
+    if config.optimizer not in ('adam', 'sgd') and not use_megatron_fsdp:
         return _get_megatron_emerging_optimizer(
             config=config,
             model_chunks=model_chunks,
@@ -939,6 +1067,22 @@ def get_megatron_optimizer(
     model_chunk_offset = 0
     ddp_config = model_chunks[0].ddp_config  # Use the first model chunk's DDP config
     if ddp_config.use_megatron_fsdp:
+        # Emerging optimizers (e.g. Muon): route matrices -> FullyShardV2Muon and
+        # the rest -> Adam, here where the FSDP process groups are in scope.
+        if config.optimizer not in ('adam', 'sgd'):
+            return _build_megatron_fsdp_v2_muon_optimizer(
+                config=config,
+                model_chunks=model_chunks,
+                all_dense_model_chunks=all_dense_model_chunks,
+                config_overrides=config_overrides,
+                mp_group=mp_group,
+                dp_cp_group=dp_cp_group,
+                dp_cp_group_gloo=intra_dp_cp_group_gloo,
+                data_parallel_group_idx=model_parallel_rank,
+                intra_dist_opt_group=intra_dist_opt_group,
+                distributed_optimizer_instance_id=distributed_optimizer_instance_id,
+                pg_collection=pg_collection,
+            )
         # For no_shard, gradients are replicated across DP ranks after all-reduce, so grad stats
         # should only be reduced over TP/PP (model_parallel_group) to avoid inflating the norm.
         effective_intra_dist_opt_group = (

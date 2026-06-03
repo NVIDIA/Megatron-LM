@@ -61,6 +61,79 @@ class BufferIndex:
         self.shard_meta = self._build_shard_meta(
             self.bucket_meta, is_distributed, dp_world_size, dp_rank
         )
+        self.item_root_ranks = self._build_item_root_ranks()
+
+    def _build_item_root_ranks(self) -> Dict[int, int]:
+        """Assign each item a root rank, greedily balancing Newton-Schulz load.
+
+        Only 2D matrices run NS (on their root rank), and that cost dominates the
+        single-root Muon step. NS flops scale ~ ``numel * min(dim)`` per matrix
+        (constant #steps dropped). We use Longest-Processing-Time greedy: assign
+        items heaviest-first to the currently least-loaded *holder* rank.
+
+        Properties:
+          * Items with a single holder (not split across a shard boundary) are
+            forced onto their owner -> zero gather/scatter, comm unchanged.
+          * Only split items have a real choice; among holders we pick the
+            least-loaded, tie-broken toward the largest holder so an indifferent
+            balance still minimises the gather/scatter volume (old behaviour).
+          * Non-2D items get cost 0 (their root is never used by Muon).
+
+        Must be deterministic and identical on every rank (gather/scatter must
+        agree on the root): inputs (param_shapes, shard_size, dp_world_size) are
+        rank-independent, and the sort/min tie-breaks are fully ordered by item_id.
+        """
+        shard_size = self.bucket_meta.size // self.dp_world_size
+        load = [0] * self.dp_world_size
+        root_ranks: Dict[int, int] = {}
+        split_items = []
+
+        # Pass 1: a param living entirely on one rank is rooted there -- no choice,
+        # zero gather/scatter. Account its NS cost first so the split params in
+        # pass 2 balance on top of the complete fixed (non-split) load per rank.
+        for item_id, idx in self.item_index_map.items():
+            item_start = idx.global_data_index
+            item_end = item_start + idx.size
+            overlaps = [
+                max(0, min(item_end, (r + 1) * shard_size) - max(item_start, r * shard_size))
+                for r in range(self.dp_world_size)
+            ]
+            holders = [r for r, o in enumerate(overlaps) if o > 0]
+            ns_cost = idx.size * min(idx.shape) if len(idx.shape) == 2 else 0
+            if len(holders) == 1:
+                root_ranks[item_id] = holders[0]
+                load[holders[0]] += ns_cost
+            else:
+                split_items.append((ns_cost, item_id, holders, overlaps))
+
+        # Pass 2: only split params have a choice. LPT (heaviest first; ties by
+        # item_id for cross-rank determinism) -> assign each to its least-loaded
+        # holder (ties -> largest holder = min gather/scatter volume -> lowest rank).
+        for ns_cost, item_id, holders, overlaps in sorted(split_items, key=lambda e: (-e[0], e[1])):
+            best = min(holders, key=lambda r: (load[r], -overlaps[r], r))
+            root_ranks[item_id] = best
+            load[best] += ns_cost
+
+        # TODO(muon-debug): temporary one-time dump of the NS root assignment so we
+        # can see whether split-param roots actually land on different ranks. Drop
+        # once the load-balance behaviour is confirmed.
+        if self.dp_rank == 0:
+            twod = [iid for iid, idx in self.item_index_map.items() if len(idx.shape) == 2]
+            if twod:
+                roots_per_rank = [0] * self.dp_world_size
+                for iid in twod:
+                    roots_per_rank[root_ranks[iid]] += 1
+                split_dump = [
+                    (iid, tuple(self.item_index_map[iid].shape), holders, root_ranks[iid])
+                    for _, iid, holders, _ in sorted(split_items, key=lambda e: (-e[0], e[1]))
+                ]
+                logger.warning(
+                    "[muon-root] pg=%s ws=%d: %d 2D items (%d split). "
+                    "NS-load/rank=%s 2D-roots/rank=%s | split(item,shape,holders,root)=%s",
+                    self.param_group_id, self.dp_world_size, len(twod), len(split_items),
+                    load, roots_per_rank, split_dump,
+                )
+        return root_ranks
 
     # ------------------------------------------------------------------ #
     #  Layout construction (global, rank-independent)
@@ -204,6 +277,7 @@ class BufferIndex:
             size=_pad_if_needed(data_index),
             items=list(item_index_map.values()),
         )
+
         return item_index_map, bucket_meta
 
     # ------------------------------------------------------------------ #
