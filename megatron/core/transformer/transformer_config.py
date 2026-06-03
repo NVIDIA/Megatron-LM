@@ -1763,6 +1763,7 @@ class TransformerConfig(ModelParallelConfig):
                     "shared_experts",
                     "mhc",
                     "gdn_norm_out",
+                    "gdn_qkv",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
@@ -1787,6 +1788,15 @@ class TransformerConfig(ModelParallelConfig):
             ):
                 raise ValueError(
                     "gdn_norm_out in recompute_modules is only supported with "
+                    "experimental_attention_variant='gated_delta_net'."
+                )
+
+            if (
+                "gdn_qkv" in self.recompute_modules
+                and self.experimental_attention_variant != "gated_delta_net"
+            ):
+                raise ValueError(
+                    "gdn_qkv in recompute_modules is only supported with "
                     "experimental_attention_variant='gated_delta_net'."
                 )
 
