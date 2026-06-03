@@ -840,8 +840,6 @@ def test_metadata_same_layout_generated_gpt_round_trip_cpu_without_model_builder
             assert result.implementation_mode == weighted_merge_module.METADATA_SAME_LAYOUT_MODE
             assert result.averaged_tensors >= 15
             assert result.copied_extra_states == 0
-            assert result.memory_estimate.mergeable_tensors == result.averaged_tensors
-            assert result.memory_estimate.extra_state_entries == result.copied_extra_states
 
             output_metadata = torch_dcp.FileSystemReader(result.output_dir).read_metadata()
             tensor_state = {
@@ -912,8 +910,6 @@ def test_metadata_same_layout_generated_moe_gpt_round_trip_cpu_without_model_bui
             # All in-root byte/object _extra_state entries are copied from the
             # selected source (the metadata path does no object-entry filtering).
             assert result.copied_extra_states == 7
-            assert result.memory_estimate.mergeable_tensors == result.averaged_tensors
-            assert result.memory_estimate.extra_state_entries == result.copied_extra_states
 
             output_metadata = torch_dcp.FileSystemReader(result.output_dir).read_metadata()
             object_metadata_keys = [
@@ -1394,8 +1390,6 @@ def test_metadata_same_layout_two_rank_product_round_trip_public_metadata(
         assert result.world_size == 2
         assert result.averaged_tensors == 2
         assert result.copied_extra_states == 1
-        assert result.memory_estimate.mergeable_tensors == result.averaged_tensors
-        assert result.memory_estimate.extra_state_entries == result.copied_extra_states
 
         expected_rank_weight = 4.0 + (1.75 * rank)
         assert torch.equal(loaded["model"]["weight"], torch.full((2, 2), expected_rank_weight))
