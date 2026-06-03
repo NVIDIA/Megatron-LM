@@ -202,7 +202,10 @@ requires-dist = []
 name = "transformer-engine"
 version = "2.15.0+42b84005"
 requires-dist = [
-    "pydantic",
+    # Cap below 2.14: pydantic 2.14 breaks langchain_core's module-level
+    # RunnablePassthrough() instantiation, which is imported transitively in
+    # downstream consumers (e.g. Megatron-Bridge via nvidia-resiliency-ext).
+    "pydantic<2.14",
     "importlib-metadata>=1.0",
     "packaging",
     "torch>=2.1",
