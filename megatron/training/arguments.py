@@ -1462,6 +1462,20 @@ def validate_args(args, defaults={}):
                 "force setting NCCL_PROTO=Simple might introduce bad perf."
             )
 
+        assert args.ckpt_format in ('torch', 'torch_dist'), (
+            f"GTP supports only --ckpt-format 'torch' (legacy) or 'torch_dist', got "
+            f"'{args.ckpt_format}'."
+        )
+        assert not (
+            getattr(args, 'dist_ckpt_optim_fully_reshardable', False)
+            and getattr(args, 'distrib_optim_fully_reshardable_mem_efficient', False)
+        ), (
+            "GTP does not support the distributed-optimizer fully-reshardable + "
+            "mem-efficient checkpoint mode. Disable "
+            "--distrib-optim-fully-reshardable-mem-efficient (or "
+            "--dist-ckpt-optim-fully-reshardable)."
+        )
+
         # Propagate --fp8-param-gather into GTPConfig: enables optimizer-side
         # FP32->FP8 cast for GTP shards, so the forward skips BF16->FP8.
         if getattr(args, 'fp8_param_gather', False):

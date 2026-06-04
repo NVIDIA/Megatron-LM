@@ -411,6 +411,7 @@ def linear_with_frozen_weight(
     tp_group: Optional[torch.distributed.ProcessGroup],
     grad_output_buffer: Optional[List[torch.Tensor]] = None,
     wgrad_deferral_limit: None = None,
+    gtp_size: int = 1,
 ) -> torch.Tensor:
     """Linear layer execution with weight.requires_grad == False.
 
@@ -447,6 +448,10 @@ def linear_with_frozen_weight(
 
     wgrad_deferral_limit (int optional): dummy argument, used to
     keep the API unified between all forward implementation functions.
+
+    gtp_size (int): GTP shard count. When > 1 the weight is GTP-sharded and must be
+    all-gathered to its full shape before the matmul, mirroring the trainable path.
+    Defaults to 1 (no-op) for the common non-GTP / non-sharded case.
     """
 
     assert grad_output_buffer is None, (
@@ -466,6 +471,9 @@ def linear_with_frozen_weight(
         )
     else:
         input = input
+
+    if gtp_size > 1:
+        weight = weight.all_gather_and_prefetch(fwd=True)
 
     args = [input, weight, bias, allreduce_dgrad, tp_group]
 

@@ -394,10 +394,26 @@ class MLP(MegatronModule):
         assert hasattr(
             pg_collection, 'tp'
         ), 'TP process group is required for MLP in TransformerLayer'
+
+        # GTP sharding of the dense MLP: forward gtp_group so fc1/fc2 shard their
+        # weights (mirroring attention / shared_experts). Only the non-fused MLP path
+        # honors GTP — the TE op-fused variants (TEFusedMLP / *WithGroupedLinear, which
+        # define _make_fused_impl) build their GEMMs straight from the weight tensors
+        # and never all-gather GTP shards, so a sharded weight would silently produce
+        # wrong output. Fail fast on that combination instead.
+        gtp_group = getattr(pg_collection, 'gtp', None)
+        if hasattr(cls, '_make_fused_impl'):
+            assert gtp_group is None or gtp_group.size() == 1, (
+                f"{cls.__name__}: GTP sharding of the dense MLP is not supported with the "
+                "TE fused MLP / GroupedLinear path (_make_fused_impl ignores GTP shards). "
+                "Use the non-fused MLP submodule, or do not enable GTP for dense MLP layers."
+            )
+            gtp_group = None
         return cls(
             config=config,
             submodules=submodules,
             tp_group=pg_collection.tp,
+            gtp_group=gtp_group,
             is_expert=is_expert,
             input_size=input_size,
             ffn_hidden_size=ffn_hidden_size,
