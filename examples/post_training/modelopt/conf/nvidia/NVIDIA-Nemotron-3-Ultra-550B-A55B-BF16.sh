@@ -1,7 +1,7 @@
 #!/bin/bash
 
 if [ -z "${HF_MODEL_CKPT:-}" ]; then
-    HF_MODEL_CKPT=nvidia/nemotron-ultra-rl-041326
+    HF_MODEL_CKPT=nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16
 fi
 
 if [ -z "${TOKENIZER_MODEL:-}" ]; then
@@ -10,7 +10,7 @@ fi
 
 MODEL_ARGS=" \
     --trust-remote-code \
-    --save-interval 100000 \
+    --save-interval 100 \
     --micro-batch-size 1 \
     --enable-experimental \
     --use-fused-weighted-squared-relu \
