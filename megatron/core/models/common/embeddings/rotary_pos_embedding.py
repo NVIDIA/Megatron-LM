@@ -376,9 +376,9 @@ class MultimodalRotaryEmbedding(nn.Module):
                 emb = torch.cat((freqs, freqs), dim=-1)  # shape (bs, seq_length, 2 * dim)
             else:
                 bs = freqs.shape[0]
-                emb = torch.stack(
-                    (freqs.view(bs, -1, 1), freqs.view(bs, -1, 1)), dim=-1
-                ).view(bs, freqs.shape[1], -1)
+                emb = torch.stack((freqs.view(bs, -1, 1), freqs.view(bs, -1, 1)), dim=-1).view(
+                    bs, freqs.shape[1], -1
+                )
         else:
             # Original section-based layout (Qwen2-VL style).
             if not self.rotary_interleaved:
@@ -391,8 +391,7 @@ class MultimodalRotaryEmbedding(nn.Module):
             # generate freqs with mrope_section: cycle T/H/W per section chunk
             mrope_section_doubled = list(mrope_section) * 2
             emb = torch.cat(
-                [m[i % 3] for i, m in enumerate(emb.split(mrope_section_doubled, dim=-1))],
-                dim=-1,
+                [m[i % 3] for i, m in enumerate(emb.split(mrope_section_doubled, dim=-1))], dim=-1
             )  # shape (bs, seq_length, 2 * dim)
 
         # shape (seq_length, bs, 1, 2 * dim)
