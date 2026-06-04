@@ -364,6 +364,17 @@ def fully_shard_model(
             "Meta device initialization (init_model_with_meta_device=True) is not "
             "supported or necessary for the 'no_shard' / 0 sharding strategy."
         )
+    if prefetch_recompute_forward_weights:
+        if zero_dp_strategy != "optim_grads_params":
+            raise ValueError(
+                "prefetch_recompute_forward_weights is only supported with "
+                "zero_dp_strategy='optim_grads_params'."
+            )
+        if not fsdp_unit_modules:
+            raise ValueError(
+                "prefetch_recompute_forward_weights requires fsdp_unit_modules to define "
+                "the Megatron-FSDP unit-level backward prefetch order."
+            )
 
     # DDP Config for Megatron FSDP.
     ddp_config = DistributedDataParallelConfig(

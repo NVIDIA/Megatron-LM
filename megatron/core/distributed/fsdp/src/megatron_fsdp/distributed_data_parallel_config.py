@@ -187,6 +187,12 @@ class DistributedDataParallelConfig:
         import os
 
         """Check the validity of the config."""
+        if self.megatron_fsdp_prefetch_recompute_forward_weights:
+            assert self.data_parallel_sharding_strategy == "optim_grads_params", (
+                "megatron_fsdp_prefetch_recompute_forward_weights is only supported with "
+                "data_parallel_sharding_strategy='optim_grads_params'."
+            )
+
         if self.nccl_ub and not is_torch_min_version("2.11.0a0"):
             if 'expandable_segments:True' in os.getenv('PYTORCH_CUDA_ALLOC_CONF', '').split(','):
                 raise ValueError(
