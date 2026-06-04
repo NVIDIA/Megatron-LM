@@ -87,7 +87,9 @@ def main(pipeline_id: int, check_for: str, pipeline_context: str, pipeline_creat
             f":doctorge: <https://{GITLAB_ENDPOINT}/ADLR/megatron-lm/-/pipelines/{pipeline_id}|Report - {pipeline_created_at_day} - {pipeline_context} - {bridge_name}>: {len(unsuccessful_jobs)} of {total_num_jobs} failed."
         )
         if TAG_TEAM:
-            messages.append(f"cc {TEAM_SLUG}: Critical event, please react as soon as possible.")
+            messages.append(
+                f"cc {TEAM_SLUG} <!subteam^S0A7B4U1T3P> <@U09TX0DHZ97>: Critical event, please react as soon as possible."
+            )
 
         for job in unsuccessful_jobs:
             messages.append(
