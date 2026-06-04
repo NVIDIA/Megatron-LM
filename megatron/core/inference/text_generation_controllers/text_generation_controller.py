@@ -3044,11 +3044,7 @@ class TextGenerationController:
                 )
                 range_pop()
 
-            if (
-                not pending_forward_reused
-                and not pending_forward_row_mapped
-                and self.num_speculative_tokens == 0
-            ):
+            if not pending_forward_row_mapped and self.num_speculative_tokens == 0:
                 async_next_prepared = self._try_prepare_async_decode_before_sampling()
 
         # This is the best place to yield control back to event loop.

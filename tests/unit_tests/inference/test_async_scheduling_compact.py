@@ -415,7 +415,62 @@ def test_pending_async_forward_discards_when_planned_layout_mismatches_current()
 
 @pytest.mark.internal
 @pytest.mark.asyncio
-async def test_reused_pending_forward_prepares_layout_before_copying_next_input_ids(monkeypatch):
+async def test_reused_pending_forward_prepares_next_step_before_sampling(monkeypatch):
+    monkeypatch.setattr(tgc_module, "range_push", lambda _msg: None)
+    monkeypatch.setattr(tgc_module, "range_pop", lambda: None)
+    events = []
+    context = SimpleNamespace(
+        active_token_count=2,
+        total_request_count=2,
+        paused_request_count=0,
+        is_hybrid_model=False,
+        config=SimpleNamespace(materialize_only_last_token_logits=True),
+        release_deferred_async_resources=lambda: events.append("release"),
+    )
+    controller = object.__new__(TextGenerationController)
+    controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
+    controller.num_speculative_tokens = 0
+    controller._async_pending_forward = True
+    controller._async_pending_cuda_graph_request_count = 2
+    controller._async_prepare_deferred_until_after_sampling = False
+    controller._decide_ep_step_begin = lambda **_kwargs: EPStepBeginDecision(
+        step_id=0,
+        has_real_work=True,
+        reuse_pending_forward=True,
+        discard_pending_forward=False,
+        row_mapped_forward=False,
+    )
+    controller._resolve_pending_async_forward_view = lambda: SimpleNamespace(
+        row_indices=None, row_mapped=False
+    )
+    controller._should_collect_dynamic_sampling_bookkeeping = lambda **_kwargs: False
+    controller._try_prepare_async_decode_before_sampling = lambda: events.append("precheck") or True
+    controller._dynamic_step_sample_logits_to_next_input_ids = (
+        lambda: events.extend(["sample", "copy"])
+    )
+    controller._try_prepare_async_decode_after_sampling = lambda: pytest.fail(
+        "reused non-row-mapped forward should prepare before sampling"
+    )
+    controller._async_transfer_samples_to_cpu = (
+        lambda count: events.append(("d2h", count))
+        or (torch.tensor([4, 5], dtype=torch.int64), None, SimpleNamespace(synchronize=lambda: None))
+    )
+    controller._confirm_prepared_ep_async_handoff = lambda: False
+    controller._ensure_ep_async_handoff_decided = lambda **_kwargs: events.append("ep_done")
+
+    result = await controller.async_generate_output_tokens_dynamic_batch(skip_bookkeeping=True)
+
+    ordering = [event for event in events if event in ("precheck", "sample", "copy")]
+    assert ordering == ["precheck", "sample", "copy"]
+    assert ("d2h", 2) in events
+    assert result["sample"].tolist() == [4, 5]
+
+
+@pytest.mark.internal
+@pytest.mark.asyncio
+async def test_reused_pending_forward_falls_back_after_sampling_when_presampling_declines(
+    monkeypatch,
+):
     monkeypatch.setattr(tgc_module, "range_push", lambda _msg: None)
     monkeypatch.setattr(tgc_module, "range_pop", lambda: None)
     events = []
@@ -447,10 +502,10 @@ async def test_reused_pending_forward_prepares_layout_before_copying_next_input_
     controller._try_prepare_async_decode_before_sampling = lambda: events.append("precheck") or False
     controller._dynamic_step_sample_logits = lambda **_kwargs: events.append("sample")
     controller._try_prepare_async_decode_after_sampling = (
-        lambda: events.append("prepare") or True
+        lambda: events.append("prepare_after") or True
     )
     controller._copy_sampled_decode_tokens_to_next_input_ids = lambda count: events.append(
-        ("copy", count)
+        "copy" if count == 2 else ("copy", count)
     )
     controller._async_transfer_samples_to_cpu = (
         lambda count: events.append(("d2h", count))
@@ -461,8 +516,13 @@ async def test_reused_pending_forward_prepares_layout_before_copying_next_input_
 
     result = await controller.async_generate_output_tokens_dynamic_batch(skip_bookkeeping=True)
 
-    ordering = [event for event in events if event in ("sample", "prepare") or event == ("copy", 2)]
-    assert ordering == ["sample", "prepare", ("copy", 2)]
+    ordering = [
+        event
+        for event in events
+        if event in ("precheck", "sample", "prepare_after", "copy")
+    ]
+    assert ordering == ["precheck", "sample", "prepare_after", "copy"]
+    assert ("d2h", 2) in events
     assert result["sample"].tolist() == [4, 5]
 
 
