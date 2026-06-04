@@ -110,13 +110,6 @@ def get_elastic_buffer(
     return _elastic_buffer
 
 
-def _capture_elastic_previous_event(buffer, async_finish: bool, allocate_on_comm_stream: bool):
-    """Capture the current stream for DeepEP v2 async communication."""
-    if async_finish and allocate_on_comm_stream:
-        return buffer.capture()
-    return None
-
-
 class FusedDispatch(torch.autograd.Function):
     """Fused dispatch operation for MoE routing combining computation and communication."""
 
@@ -317,7 +310,7 @@ else:
 
 
 class DeepepV2Dispatch(torch.autograd.Function):
-    """DeepEP v2 elastic dispatch with autograd support."""
+    """Dispatch operation using the DeepEP v2 ElasticBuffer backend."""
 
     @staticmethod
     def forward(
@@ -333,10 +326,11 @@ class DeepepV2Dispatch(torch.autograd.Function):
         async_finish=False,
         allocate_on_comm_stream=False,
     ):
-        """Forward pass of DeepEP v2 elastic dispatch."""
-        previous_event = _capture_elastic_previous_event(
-            buffer, async_finish, allocate_on_comm_stream
-        )
+        """Forward pass of dispatch using the DeepEP v2 ElasticBuffer backend."""
+        # Capture the current stream for the communication stream to wait on when
+        # DeepEP v2 allocates output tensors on the communication stream.
+        previous_event = buffer.capture() if async_finish and allocate_on_comm_stream else None
+        # Process the dispatch and keep the handle for the subsequent combine call.
         recv_x, recv_token_indices, recv_token_probs, handle, event = buffer.dispatch(
             x,
             topk_idx=token_indices,
@@ -366,9 +360,10 @@ class DeepepV2Dispatch(torch.autograd.Function):
     def backward(
         ctx, grad_output, grad_token_indices, grad_token_probs, grad_tokens_per_expert, grad_handle
     ):
-        """Backward pass of DeepEP v2 elastic dispatch."""
-        previous_event = _capture_elastic_previous_event(
-            ctx.buffer, ctx.async_finish, ctx.allocate_on_comm_stream
+        """Backward pass of dispatch using the DeepEP v2 ElasticBuffer backend."""
+        # The backward pass of dispatch is a combine over the dispatch handle.
+        previous_event = (
+            ctx.buffer.capture() if ctx.async_finish and ctx.allocate_on_comm_stream else None
         )
         grad_x, grad_token_probs, event = ctx.buffer.combine(
             grad_output.contiguous(),
@@ -390,9 +385,7 @@ class DeepepV2Combine(torch.autograd.Function):
     @staticmethod
     def forward(ctx, buffer, x, handle, num_sms, async_finish=False, allocate_on_comm_stream=False):
         """Forward pass of DeepEP v2 elastic combine."""
-        previous_event = _capture_elastic_previous_event(
-            buffer, async_finish, allocate_on_comm_stream
-        )
+        previous_event = buffer.capture() if async_finish and allocate_on_comm_stream else None
         combined_x, combined_token_probs, event = buffer.combine(
             x,
             handle=handle,
@@ -414,8 +407,8 @@ class DeepepV2Combine(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output, grad_combined_token_probs):
         """Backward pass of DeepEP v2 elastic combine."""
-        previous_event = _capture_elastic_previous_event(
-            ctx.buffer, ctx.async_finish, ctx.allocate_on_comm_stream
+        previous_event = (
+            ctx.buffer.capture() if ctx.async_finish and ctx.allocate_on_comm_stream else None
         )
         grad_x, _, _, _, event = ctx.buffer.dispatch(
             grad_output.contiguous(),
@@ -444,7 +437,30 @@ if HAVE_DEEP_EP_V2:
         async_finish=False,
         allocate_on_comm_stream=False,
     ):
-        """Perform DeepEP v2 elastic dispatch."""
+        """Perform dispatch using the DeepEP v2 ElasticBuffer backend.
+
+        Args:
+            buffer (ElasticBuffer):
+                DeepEP v2 buffer used for all-to-all communication.
+            x (torch.Tensor):
+                Input hidden states to dispatch.
+            token_indices (torch.Tensor):
+                Top-k expert indices for each token.
+            token_probs (torch.Tensor):
+                Top-k routing probabilities for each token.
+            num_experts (int):
+                Total number of experts across the communication group.
+            num_max_tokens_per_rank (int):
+                Maximum number of input tokens on each rank.
+            expert_alignment (int):
+                Alignment applied to per-expert token counts.
+            num_sms (int):
+                Number of SMs used by the dispatch API.
+            async_finish (bool):
+                Whether to use asynchronous communication completion.
+            allocate_on_comm_stream (bool):
+                Whether to allocate DeepEP output buffers on the communication stream.
+        """
         return DeepepV2Dispatch.apply(
             buffer,
             x.contiguous(),
