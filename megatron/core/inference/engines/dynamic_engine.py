@@ -310,6 +310,14 @@ class DynamicInferenceEngine(AbstractEngine):
         self._prefix_cache_blocks_matched = 0
         self._prefix_coordination_waits = 0
 
+        self.failed_request_count = 0
+
+        # Snapshots of cumulative counters at the last logging tick, used to
+        # emit per-interval deltas alongside the cumulatives.
+        self._last_logged_finished_count = 0
+        self._last_logged_evicted_count = 0
+        self._last_logged_failed_count = 0
+
         # Coordinator state.
         self.use_coordinator = False
 
@@ -1667,6 +1675,134 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 self.waiting_request_ids.extendleft(reversed(pending_request_ids))
 
+    def _build_request_metrics(self, request: DynamicInferenceRequest) -> Dict:
+        """Derive per-request inference metrics from a finished request.
+
+        Args:
+            request (DynamicInferenceRequest): The finished request to summarize.
+
+        Returns:
+            Dict of scalar metrics suitable for wandb.log. Optional fields
+            (e.g. prefill_time_s when no token was generated) are omitted
+            rather than emitted as None.
+        """
+        add_engine_ts = (
+            request.event_add_engine.timestamp if request.event_add_engine is not None else None
+        )
+        add_context_ts = None
+        first_token_ts = None
+        finish_ts = None
+        num_pauses = 0
+        num_evicts = 0
+        num_forward_passes = 0
+        time_paused_s = 0.0
+        time_evicted_s = 0.0
+        prev_pause_ts: Optional[float] = None
+        prev_evict_ts: Optional[float] = None
+
+        for evt in request.events:
+            t = evt.type
+            # Close any open pause/evict interval at the first non-matching event.
+            if prev_pause_ts is not None and t is not DynamicInferenceEventType.PAUSE:
+                time_paused_s += float(evt.timestamp - prev_pause_ts)
+                prev_pause_ts = None
+            if prev_evict_ts is not None and t is not DynamicInferenceEventType.EVICT:
+                time_evicted_s += float(evt.timestamp - prev_evict_ts)
+                prev_evict_ts = None
+
+            if t is DynamicInferenceEventType.ADD_CONTEXT and add_context_ts is None:
+                add_context_ts = evt.timestamp
+            elif t is DynamicInferenceEventType.GENERATED_TOKEN:
+                if first_token_ts is None:
+                    first_token_ts = evt.timestamp
+                # Upper bound under speculative decoding (multiple events per pass).
+                num_forward_passes += 1
+            elif t is DynamicInferenceEventType.FINISH:
+                finish_ts = evt.timestamp
+            elif t is DynamicInferenceEventType.PAUSE:
+                num_pauses += 1
+                prev_pause_ts = evt.timestamp
+            elif t is DynamicInferenceEventType.EVICT:
+                num_evicts += 1
+                prev_evict_ts = evt.timestamp
+
+        prompt_len = int(len(request.prompt_tokens)) if request.prompt_tokens is not None else 0
+        output_len = int(len(request.generated_tokens))
+        max_tokens = int(getattr(request.sampling_params, "num_tokens_to_generate", 0) or 0)
+
+        block_size = int(self.context.block_size_tokens)
+        prefix_tokens_reused = int(request.prefix_blocks_matched) * block_size
+        prompt_tokens_recomputed = max(0, prompt_len - prefix_tokens_reused)
+
+        metrics: Dict = {
+            'request_id': int(request.request_id),
+            'prompt_len': prompt_len,
+            'output_len': output_len,
+            'max_tokens': max_tokens,
+            'hit_max_tokens': int(max_tokens > 0 and output_len >= max_tokens),
+            'prefix_blocks_matched': int(request.prefix_blocks_matched),
+            'prefix_tokens_reused': prefix_tokens_reused,
+            'prompt_tokens_recomputed': prompt_tokens_recomputed,
+            'num_events': int(len(request.events)),
+            'num_pauses': int(num_pauses),
+            'num_evicts': int(num_evicts),
+            'num_forward_passes': int(num_forward_passes),
+            'time_paused_s': float(time_paused_s),
+            'time_evicted_s': float(time_evicted_s),
+            'inference_step': int(self.inference_step_offset + int(self.context.step_count)),
+        }
+
+        if add_engine_ts is not None:
+            metrics['arrival_ts'] = float(add_engine_ts)
+        if add_context_ts is not None:
+            metrics['add_context_ts'] = float(add_context_ts)
+        if first_token_ts is not None:
+            metrics['first_token_ts'] = float(first_token_ts)
+        if finish_ts is not None:
+            metrics['finish_ts'] = float(finish_ts)
+
+        if request.ttft is not None:
+            metrics['ttft_s'] = float(request.ttft)
+        if add_engine_ts is not None and add_context_ts is not None:
+            metrics['queue_wait_s'] = float(add_context_ts - add_engine_ts)
+        if add_context_ts is not None and first_token_ts is not None:
+            metrics['prefill_time_s'] = float(first_token_ts - add_context_ts)
+        if first_token_ts is not None and finish_ts is not None:
+            metrics['decode_time_s'] = float(finish_ts - first_token_ts)
+        if add_engine_ts is not None and finish_ts is not None:
+            metrics['total_wall_s'] = float(finish_ts - add_engine_ts)
+
+        # tpot is sampled only on logging steps, so num_tpot_samples <= output_len.
+        if request.tpot:
+            metrics['mean_tpot_s'] = float(sum(request.tpot) / len(request.tpot))
+            metrics['num_tpot_samples'] = int(len(request.tpot))
+
+        return metrics
+
+    def _emit_request_metrics(self, record: DynamicInferenceRequestRecord) -> None:
+        """Emit a per-request completion record to W&B.
+
+        Failed requests are skipped; they are visible through the per-step
+        failed_request_count / failed_this_interval counters instead.
+
+        Args:
+            record (DynamicInferenceRequestRecord): Record for one finished
+                request.
+        """
+        if self.metrics_writer is None or not record.requests:
+            return
+
+        last_request = record.requests[-1]
+        if not last_request.succeeded():
+            return
+
+        request_metrics = self._build_request_metrics(last_request)
+        request_metrics['num_checkpoints'] = int(len(record.requests))
+
+        if HAVE_WANDB and self.metrics_writer.__name__ == "wandb":
+            wandb_payload = {f"inference/req/{k}": v for k, v in request_metrics.items()}
+            self.metrics_writer.log(wandb_payload, commit=True)
+
     async def async_forward(self) -> Tuple[Dict, Dict, float]:
         """Uses `asyncio` for continuous generation.
         Sleeps when no requests are available, until new requests have been added.
@@ -1704,6 +1840,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 "paused_request_count": self.context.paused_request_count,
                 "active_token_count": self.context.active_token_count,
                 "step_count": self.context.step_count,
+                "num_prefill_requests": int(self.context.num_prefill_requests),
+                "num_decode_requests": int(self.context.num_decode_requests),
+                # Captured pre-forward so the flag reflects the step about to run.
+                "chunked_prefill_active": int(self.context.chunked_prefill_request_id >= 0),
             }
         else:
             # active_token_count and step_count are still consumed by
@@ -1739,11 +1879,18 @@ class DynamicInferenceEngine(AbstractEngine):
                 if self.metrics_writer is not None
                 else None
             )
+            # Empty dict on non-hybrid models.
+            mamba_state_stats = (
+                self.context.get_mamba_state_utilization_stats()
+                if self.metrics_writer is not None
+                else {}
+            )
             post_step_context_state = {
                 "waiting_request_count": len(self.waiting_request_ids),
                 "finished_request_count": self.finished_request_count,
                 "evicted_request_count": self.evicted_request_count,
                 "kv_stats": kvcache_util_stats,
+                "mamba_stats": mamba_state_stats,
                 "total_active_block_count": self.context.kv_block_allocator.active_count,
                 "total_paused_block_count": self.context.kv_block_allocator.paused_count,
                 "total_active_used_blocks": self.context.kv_block_allocator.get_active_used(),
@@ -1753,7 +1900,7 @@ class DynamicInferenceEngine(AbstractEngine):
         else:
             # Keep kv_stats=None so the metrics-block gate at `async_bookkeep`
             # (`if context_state["kv_stats"] is not None`) remains well-typed.
-            context_state = {**pre_step_context_state, "kv_stats": None}
+            context_state = {**pre_step_context_state, "kv_stats": None, "mamba_stats": {}}
 
         return result, context_state, step_time
 
@@ -1822,7 +1969,16 @@ class DynamicInferenceEngine(AbstractEngine):
             assert (
                 failed_entry.future.done()
             ), f"Failed request {failed_request_id} future has not been properly resolved."
+        self.failed_request_count += len(self.failed_request_ids)
         self.failed_request_ids.clear()
+
+        # Fires on every completion (not gated to logging-interval steps) so
+        # the per-request distribution is complete.
+        if finished_request_records and self.metrics_writer is not None:
+            nvtx_range_push("request_metrics_logging")
+            for record in finished_request_records:
+                self._emit_request_metrics(record)
+            nvtx_range_pop("request_metrics_logging")
 
         nvtx_range_pop("bookkeeping")
 
@@ -1891,6 +2047,63 @@ class DynamicInferenceEngine(AbstractEngine):
                 else:
                     metrics[f'inference/{key}'] = value
 
+            for key, value in context_state["mamba_stats"].items():
+                if key == 'mamba_utilization':
+                    metrics[f'inference/{key}'] = float(value * 100.0)
+                else:
+                    metrics[f'inference/{key}'] = value
+
+            num_prefill = int(context_state["num_prefill_requests"])
+            num_decode = int(context_state["num_decode_requests"])
+            active_tokens = int(context_state["active_token_count"])
+            # Each decode request contributes (1 + num_speculative_tokens) tokens.
+            decode_tokens_per_req = 1 + max(0, int(self.num_speculative_tokens))
+            decode_tokens = num_decode * decode_tokens_per_req
+            prefill_tokens = max(0, active_tokens - decode_tokens)
+            metrics['inference/batch/prefill_requests'] = num_prefill
+            metrics['inference/batch/decode_requests'] = num_decode
+            metrics['inference/batch/prefill_tokens'] = prefill_tokens
+            metrics['inference/batch/decode_tokens'] = decode_tokens
+            metrics['inference/batch/mixed_step'] = int(num_prefill > 0 and num_decode > 0)
+            metrics['inference/batch/is_decode_only'] = int(bool(context_state["is_decode_only"]))
+            metrics['inference/batch/chunked_prefill_active'] = int(
+                context_state["chunked_prefill_active"]
+            )
+
+            if step_time > 0:
+                metrics['inference/batch/prefill_tokens_per_s'] = float(prefill_tokens) / step_time
+                metrics['inference/batch/decode_tokens_per_s'] = float(decode_tokens) / step_time
+                metrics['inference/batch/total_tokens_per_s'] = float(active_tokens) / step_time
+
+            # -1 == eager fallback; >= 0 == graph batch dim the step ran under.
+            if cuda_graph_request_count is not None:
+                metrics['inference/cuda_graph_request_count'] = int(cuda_graph_request_count)
+                metrics['inference/cuda_graph_used'] = int(cuda_graph_request_count >= 0)
+
+            finished_delta = int(self.finished_request_count - self._last_logged_finished_count)
+            evicted_delta = int(self.evicted_request_count - self._last_logged_evicted_count)
+            failed_delta = int(self.failed_request_count - self._last_logged_failed_count)
+            metrics['inference/finished_request_count'] = int(self.finished_request_count)
+            metrics['inference/evicted_request_count'] = int(self.evicted_request_count)
+            metrics['inference/failed_request_count'] = int(self.failed_request_count)
+            metrics['inference/finished_this_interval'] = finished_delta
+            metrics['inference/evicted_this_interval'] = evicted_delta
+            metrics['inference/failed_this_interval'] = failed_delta
+            self._last_logged_finished_count = self.finished_request_count
+            self._last_logged_evicted_count = self.evicted_request_count
+            self._last_logged_failed_count = self.failed_request_count
+
+            # waiting_request_ids is FIFO, so head = oldest.
+            if self.waiting_request_ids:
+                oldest_id = self.waiting_request_ids[0]
+                oldest_entry = self.requests.get(oldest_id)
+                if oldest_entry is not None and oldest_entry.record.requests:
+                    add_engine_evt = oldest_entry.record.requests[-1].event_add_engine
+                    if add_engine_evt is not None and add_engine_evt.timestamp is not None:
+                        metrics['inference/queue/oldest_wait_s'] = float(
+                            time.time() - add_engine_evt.timestamp
+                        )
+
             # Add speculative decoding acceptance metrics.
             if self.num_speculative_tokens > 0 and self._spec_tokens_proposed > 0:
                 acceptance_rate = self._spec_tokens_accepted / self._spec_tokens_proposed
@@ -1904,6 +2117,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 metrics['inference/prefix_cache_hits'] = int(self._prefix_cache_hits)
                 metrics['inference/prefix_cache_blocks_matched'] = int(
                     self._prefix_cache_blocks_matched
+                )
+                metrics['inference/prefix_cache_tokens_reused'] = int(
+                    self._prefix_cache_blocks_matched * self.context.block_size_tokens
                 )
 
             if HAVE_WANDB and self.metrics_writer.__name__ == "wandb":
