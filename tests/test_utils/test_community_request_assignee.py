@@ -71,6 +71,37 @@ def test_create_assignment_plan_uses_engineer_candidate(monkeypatch):
     assert plan.context.startswith("The issue reports a transformer regression.")
 
 
+def test_create_assignment_plan_accepts_topic_mapped_other_candidate(monkeypatch):
+    module = load_assignee_module()
+    issue = make_issue(module, number=129, title="FSDP memory question")
+
+    monkeypatch.setattr(module, "check_assignable", lambda issue, login: True)
+    monkeypatch.setattr(
+        module,
+        "get_team_members",
+        lambda org, team_slug: {"wujingyue"} if team_slug == module.ASSIGNEE_ALLOWED_TEAM_SLUG else set(),
+    )
+
+    plan = module.create_assignment_plan(
+        make_analysis(
+            assignee="wujingyue",
+            confidence=0.86,
+            fallback_to_oncall=False,
+            issue_type="other",
+            feature_topic="FSDP",
+            rationale="FSDP questions should use the FSDP topic mapping.",
+            slack_context="This FSDP question maps to wujingyue under the topic mapping.",
+            relevant_paths=["megatron/core/distributed/fsdp/"],
+        ),
+        issue,
+    )
+
+    assert plan.mode == "candidate"
+    assert plan.assignees == ["wujingyue"]
+    assert plan.notify_users == ["wujingyue"]
+    assert plan.issue_type == "other"
+
+
 def test_create_assignment_plan_rejects_non_engineer_candidate(monkeypatch):
     module = load_assignee_module()
     issue = make_issue(module, number=124, title="Feature request")

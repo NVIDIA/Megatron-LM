@@ -93,7 +93,7 @@ jobs:
                - If a recent PR is likely the root cause, choose the PR author as assignee.
                - If you cannot identify a root-cause PR, choose the mcore-engineer who added
                  or most recently updated the affected feature area.
-            6. For feature requests, use this topic-to-user mapping:
+            6. For feature requests and other non-bug issues, use this topic-to-user mapping:
                - FSDP -> cspades or wujingyue; choose the better fit from evidence.
                - HybridModel -> Phlip79.
                - MoE -> YangFei1990.
@@ -101,8 +101,8 @@ jobs:
                - megatron/training -> maanug-nv.
                - inference -> shanmugamr1992.
                - multi-modal -> yashaswikarnati.
-               If the feature request does not fit one of these categories, set assignee to null
-               and fallback_to_oncall to true.
+               If the issue does not fit one of these categories, set assignee to null and
+               fallback_to_oncall to true.
             7. Return one human GitHub user login when evidence is strong.
                - Do not return GitHub teams as assignees.
                - Do not return service accounts, including svcnvidia-nemo-ci.
