@@ -1,10 +1,12 @@
-# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 from megatron.core.enums import ModelType
@@ -26,6 +28,7 @@ from megatron.core.transformer.hyper_connection import learned_output_contract
 from megatron.core.transformer.multi_token_prediction import (
     MTPLossLoggingHelper,
     MultiTokenPredictionBlock,
+    process_mtp_loss,
     roll_tensor,
 )
 from megatron.core.transformer.transformer_block import TransformerBlock
@@ -50,6 +53,40 @@ else:
     TEColumnParallelGroupedLinear = None
 
 _SEED = 42
+
+
+class _TestOutputLayer(torch.nn.Module):
+    def __init__(self, hidden_size, vocab_size):
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.randn(vocab_size, hidden_size))
+
+    def forward(
+        self,
+        input_,
+        weight=None,
+        runtime_gather_output=None,
+        output_cross_entropy_loss=False,
+        labels=None,
+    ):
+        del runtime_gather_output
+        weight = self.weight if weight is None else weight
+        logits = torch.matmul(input_, weight.t())
+        if output_cross_entropy_loss:
+            logits = logits.transpose(0, 1).contiguous()
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)), labels.reshape(-1), reduction='none'
+            )
+            return loss.view_as(labels)
+        return logits, None
+
+
+class _ScaleMTPLayer(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.scale = torch.nn.Parameter(torch.tensor(2.0))
+
+    def forward(self, input_ids, position_ids, hidden_states, **_kwargs):
+        return hidden_states * self.scale, input_ids, position_ids
 
 
 class TestMultiTokenPredictionLayer:
@@ -132,6 +169,105 @@ class TestMultiTokenPredictionLayer:
             assert num_weights == 29664 * config.mtp_num_layers
         elif tp == 4:
             assert num_weights == 15216 * config.mtp_num_layers
+
+
+class TestProcessMTPLoss:
+    def test_isolated_loss_detaches_encoder_hidden_states(self):
+        """MTP isolated loss should not update the main decoder hidden states."""
+
+        torch.manual_seed(_SEED)
+        seq_length = 4
+        micro_batch_size = 2
+        hidden_size = 8
+        input_ids = torch.arange(seq_length).repeat(micro_batch_size, 1)
+        position_ids = torch.arange(seq_length).repeat(micro_batch_size, 1)
+
+        for isolated_loss in (False, True):
+            config = TransformerConfig(
+                num_layers=1,
+                hidden_size=hidden_size,
+                num_attention_heads=1,
+                mtp_num_layers=1,
+                mtp_loss_scaling_factor=1.0,
+                mtp_isolated_loss=isolated_loss,
+            )
+            mtp_layer = _ScaleMTPLayer()
+            mtp_block = SimpleNamespace(
+                config=config, vp_stage=None, mtp_use_repeated_layer=False, layers=[mtp_layer]
+            )
+            hidden_states = torch.randn(
+                seq_length, micro_batch_size, hidden_size, requires_grad=True
+            )
+
+            output = MultiTokenPredictionBlock.forward(
+                mtp_block,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attention_mask=None,
+            )
+            mtp_output = output[seq_length:]
+            mtp_output.sum().backward()
+
+            assert mtp_layer.scale.grad is not None
+            if isolated_loss:
+                assert hidden_states.grad is None or torch.count_nonzero(hidden_states.grad) == 0
+            else:
+                assert hidden_states.grad is not None
+                assert torch.count_nonzero(hidden_states.grad) > 0
+
+    def test_isolated_loss_detaches_output_layer(self):
+        """MTP isolated loss should not update output layer weights."""
+
+        def compute_language_model_loss(labels, logits):
+            logits = logits.transpose(0, 1).contiguous()
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)), labels.reshape(-1), reduction='none'
+            )
+            return loss.view_as(labels)
+
+        torch.manual_seed(_SEED)
+        seq_length = 4
+        micro_batch_size = 2
+        hidden_size = 8
+        vocab_size = 16
+        labels = torch.randint(vocab_size, (micro_batch_size, seq_length))
+        loss_mask = torch.ones_like(labels, dtype=torch.float32)
+
+        for isolated_loss in (False, True):
+            config = TransformerConfig(
+                num_layers=1,
+                hidden_size=hidden_size,
+                num_attention_heads=1,
+                mtp_num_layers=1,
+                mtp_loss_scaling_factor=1.0,
+                mtp_isolated_loss=isolated_loss,
+            )
+            output_layer = _TestOutputLayer(hidden_size, vocab_size)
+            hidden_states = torch.randn(
+                seq_length * (1 + config.mtp_num_layers),
+                micro_batch_size,
+                hidden_size,
+                requires_grad=True,
+            )
+
+            output = process_mtp_loss(
+                hidden_states=hidden_states,
+                labels=labels,
+                loss_mask=loss_mask,
+                output_layer=output_layer,
+                output_weight=None,
+                runtime_gather_output=False,
+                is_training=False,
+                compute_language_model_loss=compute_language_model_loss,
+                config=config,
+            )
+            output.sum().backward()
+
+            if isolated_loss:
+                assert output_layer.weight.grad is None
+            else:
+                assert output_layer.weight.grad is not None
 
 
 class TestMultiTokenPrediction:
