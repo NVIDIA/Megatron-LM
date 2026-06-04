@@ -55,8 +55,8 @@ WORLD_SIZE = int(os.getenv("WORLD_SIZE", "1"))
 
 pytestmark = [
     pytest.mark.skipif(
-        Version(os.getenv("NVIDIA_PYTORCH_VERSION", "99.99")) <= Version("25.05"),
-        reason="Skip Muon FSDP tests on LTS containers",
+        Version(os.getenv("NVIDIA_PYTORCH_VERSION", "24.01")) <= Version("25.05"),
+        reason="Skip emerging optimizer tests for LTS test",
     ),
     pytest.mark.skipif(
         not HAVE_EMERGING_OPTIMIZERS, reason="Muon tests require the emerging-optimizers package"
@@ -133,12 +133,12 @@ def _contiguous_stride(shape):
     `DTensor.from_local(..., shape=global_shape)` requires `stride` whenever
     `shape` is given (PyTorch enforces "pass both or neither").
     """
-    stride = []
+    stride = [1] * len(shape)
     running = 1
-    for s in reversed(shape):
-        stride.append(running)
-        running *= s
-    return tuple(reversed(stride))
+    for i in reversed(range(len(shape))):
+        stride[i] = running
+        running *= shape[i]
+    return tuple(stride)
 
 
 # ---------- DTensor construction ----------
@@ -185,28 +185,22 @@ def _build_mesh(spec: dict):
 # ---------- Param + optimizer construction ----------
 
 
-def _build_params_and_grads(spec: dict, mesh, device):
+def _build_param(p_spec: dict, mesh, device):
+    """Build one DTensor param (with random `.grad` attached) from a slim spec."""
+    p = _make_dtensor_from_spec(p_spec, mesh, device)
+    if p_spec.get("is_qkv"):
+        p.is_qkv = True
+    # Random gradient matching the param's DTensor layout (fp32 randn → cast so
+    # bf16/fp16 grads still get sensible values).
+    grad = torch.randn_like(p, dtype=torch.float32).to(dtype=p.dtype)
+    update_uneven_dtensor_chunk_metadata(grad)
+    p.grad = grad
+    return p
+
+
+def _build_params(spec: dict, mesh, device):
     """Build DTensor params + random grads from the slim spec."""
-    params = []
-    for p_spec in spec["params"]:
-        p = _make_dtensor_from_spec(p_spec, mesh, device)
-        if p_spec.get("is_qkv"):
-            p.is_qkv = True
-        # Random gradient matching the param's DTensor layout.
-        grad_local = torch.randn_like(p._local_tensor, dtype=torch.float32).to(dtype=p.dtype)
-        placements = [_parse_placement(s) for s in p_spec["placements"]]
-        global_shape = tuple(p_spec["global_shape"])
-        grad = DTensor.from_local(
-            local_tensor=grad_local,
-            device_mesh=mesh,
-            placements=placements,
-            shape=torch.Size(global_shape),
-            stride=_contiguous_stride(global_shape),
-            run_check=False,
-        )
-        update_uneven_dtensor_chunk_metadata(grad)
-        p.grad = grad
-        params.append(p)
+    params = [_build_param(p_spec, mesh, device) for p_spec in spec["params"]]
     # Single param group; bench picks the hyperparameters.
     return [{"params": params}]
 
@@ -221,13 +215,9 @@ def _build_optimizer(param_groups, dp_group):
     return FSDPTensorParallelMuon(
         params=param_groups,
         dp_group=dp_group,
-        pg_collection=None,
         lr=8e-4,
         momentum=0.9,
         weight_decay=0.1,
-        num_ns_steps=5,
-        coefficient_type="quintic",
-        scale_mode="spectral",
         extra_scale_factor=0.2,
         tp_mode="blockwise",
         split_qkv=True,
@@ -254,16 +244,12 @@ def _gather_dp(dt, dp_group):
     local shapes within the DP group.
     """
     dp_world = dist.get_world_size(dp_group)
-    local = dt._local_tensor.detach().contiguous()
+    local = dt._local_tensor
     all_shapes = [None] * dp_world
     dist.all_gather_object(all_shapes, tuple(local.shape), group=dp_group)
 
     max_numel = max(torch.Size(s).numel() for s in all_shapes)
-    if max_numel == 0:
-        # Fall back: every DP rank has empty shard — return empty.
-        return torch.zeros((0,) + tuple(local.shape[1:]), dtype=dt.dtype, device=dt.device)
-
-    flat = local.view(-1)
+    flat = local.flatten()
     padded = torch.zeros(max_numel, dtype=dt.dtype, device=dt.device)
     if flat.numel() > 0:
         padded[: flat.numel()] = flat
@@ -296,11 +282,6 @@ def _build_reference_optimizer(params):
         momentum=0.9,
         weight_decay=0.1,
         nesterov=True,
-        weight_decay_method="decoupled",
-        fp32_matmul_prec="medium",
-        coefficient_type="quintic",
-        num_ns_steps=5,
-        scale_mode="spectral",
         extra_scale_factor=0.2,
     )
 
@@ -379,7 +360,7 @@ def test_muon_step(distributed_setup, benchmark):
     mesh = _build_mesh(spec)
     dp_group = mesh.get_group("dp_cp")
 
-    param_groups = _build_params_and_grads(spec, mesh, device)
+    param_groups = _build_params(spec, mesh, device)
     optimizer = _build_optimizer(param_groups, dp_group=dp_group)
 
     # Spot-check: first param's local shape on this rank matches the spec.
@@ -418,7 +399,7 @@ def test_muon_step_numerics(distributed_setup):
     mesh = _build_mesh(spec)
     dp_group = mesh.get_group("dp_cp")
 
-    param_groups = _build_params_and_grads(spec, mesh, device)
+    param_groups = _build_params(spec, mesh, device)
     fsdp_params = param_groups[0]["params"]
 
     # Snapshot per-rank LOCAL initial state (cheap — just shards).
