@@ -44,7 +44,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.inference.utils import Counter, InferenceMode, await_process_call
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
+from megatron.core.transformer.cuda_graphs import CudaGraphManager, delete_cuda_graphs
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.utils import (
@@ -133,11 +133,40 @@ class EngineSuspendedError(Exception):
 
 def format_mem_bytes(mem_bytes):
     """Convert a byte count to a human-readable string in tb, gb, mb, kb, or bytes."""
+    if mem_bytes < 0:
+        return "-" + format_mem_bytes(-mem_bytes)
     for power, suffix in [(4, "tb"), (3, "gb"), (2, "mb"), (1, "kb"), (0, "bytes")]:
         suffix_bytes = 1024**power
         if mem_bytes >= suffix_bytes:
             return "%.1f %s" % (mem_bytes / suffix_bytes, suffix)
     return "%d bytes" % mem_bytes
+
+
+def _cuda_graph_mempool_bytes() -> Tuple[int, int]:
+    """Return (reserved, allocated) bytes belonging to the global CUDA graph mempool.
+
+    PyTorch's `torch.cuda.memory_stats()` reports process-wide totals that mix in
+    every other allocation (KV cache, NCCL workspaces, layer scratch). To isolate
+    growth caused by graph capture, we walk `torch.cuda.memory_snapshot()` and
+    filter segments by their `segment_pool_id` against the graph pool handle.
+    Returns (0, 0) if the pool hasn't been created yet.
+    """
+    pool_id = CudaGraphManager.global_mempool
+    if pool_id is None:
+        return 0, 0
+    reserved = 0
+    allocated = 0
+    for seg in torch.cuda.memory_snapshot():
+        seg_pool_id = (
+            seg.get("segment_pool_id")
+            or seg.get("private_pool_id")
+            or seg.get("pool_id")
+            or seg.get("pool")
+        )
+        if seg_pool_id == pool_id:
+            reserved += seg.get("total_size", 0)
+            allocated += seg.get("allocated_size", 0)
+    return reserved, allocated
 
 
 @dataclass(kw_only=True)
@@ -347,6 +376,13 @@ class DynamicInferenceEngine(AbstractEngine):
         time_start = time.time()
         mem_stats_start = torch.cuda.memory_stats()
 
+        # Snapshot of process-wide stats for the "total memory used by capture" summary.
+        start_proc_reserved = mem_stats_start["reserved_bytes.all.current"]
+        start_proc_alloc = mem_stats_start["allocated_bytes.all.current"]
+
+        # Pool-scoped baselines for the per-iteration deltas.
+        prev_pool_reserved, prev_pool_alloc = _cuda_graph_mempool_bytes()
+
         logging.info("> dynamic_engine.py: building cuda graphs for ")
         for graph in context.cuda_graph_batch_dimensions_list:
             logging.info(graph)
@@ -427,27 +463,43 @@ class DynamicInferenceEngine(AbstractEngine):
 
                 context.reset()
 
+            # Per-iteration memory accounting, scoped to the CUDA-graph mempool.
+            # This isolates pool growth from process-wide scratch churn (KV cache,
+            # NCCL workspaces, etc.) that pollutes `torch.cuda.memory_stats()`.
+            pool_reserved, pool_alloc = _cuda_graph_mempool_bytes()
+            logging.info(
+                "  [graph %d/%d] %s | pool reserved=%s (Δiter=%s) " "pool allocated=%s (Δiter=%s)",
+                tbar_idx + 1,
+                len(context.cuda_graph_batch_dimensions_list),
+                cuda_graph_batch_dimension,
+                format_mem_bytes(pool_reserved),
+                format_mem_bytes(pool_reserved - prev_pool_reserved),
+                format_mem_bytes(pool_alloc),
+                format_mem_bytes(pool_alloc - prev_pool_alloc),
+            )
+            prev_pool_reserved, prev_pool_alloc = pool_reserved, pool_alloc
+
         if mtp_warmup_enabled and mtp_seen_batch_sizes:
             logging.info("> MTP CUDA graph warmup: %d batch size(s)", len(mtp_seen_batch_sizes))
 
         # Memory usage.
         time_end = time.time()
         mem_stats_end = torch.cuda.memory_stats()
+        final_pool_reserved, final_pool_alloc = _cuda_graph_mempool_bytes()
         capture_stats = {
             "time": time_end - time_start,
-            "allocated_bytes": (
-                mem_stats_end["allocated_bytes.all.current"]
-                - mem_stats_start["allocated_bytes.all.current"]
-            ),
-            "reserved_bytes": (
-                mem_stats_end["reserved_bytes.all.current"]
-                - mem_stats_start["reserved_bytes.all.current"]
-            ),
+            "allocated_bytes": (mem_stats_end["allocated_bytes.all.current"] - start_proc_alloc),
+            "reserved_bytes": (mem_stats_end["reserved_bytes.all.current"] - start_proc_reserved),
+            "pool_reserved_bytes": final_pool_reserved,
+            "pool_allocated_bytes": final_pool_alloc,
         }
         logging.info(
-            "> built cuda graph(s) in %.2f sec, with total memory usage: "
-            "allocated %s, reserved %s.",
+            "> built cuda graph(s) in %.2f sec. "
+            "Mempool: reserved %s, allocated %s. "
+            "Process-wide delta: allocated %s, reserved %s.",
             capture_stats["time"],
+            format_mem_bytes(capture_stats["pool_reserved_bytes"]),
+            format_mem_bytes(capture_stats["pool_allocated_bytes"]),
             format_mem_bytes(capture_stats["allocated_bytes"]),
             format_mem_bytes(capture_stats["reserved_bytes"]),
         )
