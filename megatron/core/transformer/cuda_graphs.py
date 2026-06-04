@@ -1703,11 +1703,31 @@ def _layer_is_graphable(layer, config):
         return True
 
     # import modules here to avoid a circular import
+    from megatron.core.models.hybrid.hybrid_block import HyperConnectionHybridLayer
     from megatron.core.ssm.mamba_layer import MambaLayer
     from megatron.core.transformer.identity_op import IdentityOp
     from megatron.core.transformer.mlp import MLP
     from megatron.core.transformer.moe.moe_layer import MoELayer
     from megatron.core.transformer.transformer_layer import TransformerLayer
+
+    # mHC wrapper: the whole wrapper forward (mHC aggregate + inner layer + BDA) is
+    # captured as one graph, so graphability is decided by the inner layer's
+    # type/scope. MoE inner layers are excluded: a whole-layer capture would try to
+    # graph the expert all-to-all, which is not graph-safe (the GPT path graphs only
+    # moe_router/moe_preprocess and runs experts eagerly). Those wrappers stay eager.
+    if isinstance(layer, HyperConnectionHybridLayer):
+        inner = layer.inner_layer
+        if isinstance(inner, MambaLayer) and CudaGraphModule.mamba in config.cuda_graph_modules:
+            return True
+        if isinstance(inner, TransformerLayer) and not isinstance(inner.mlp, MoELayer):
+            if CudaGraphModule.attn in config.cuda_graph_modules and not (
+                isinstance(inner.self_attention, IdentityOp)
+                and isinstance(inner.cross_attention, IdentityOp)
+            ):
+                return True
+            if CudaGraphModule.mlp in config.cuda_graph_modules and isinstance(inner.mlp, MLP):
+                return True
+        return False
 
     if isinstance(layer, MambaLayer) and CudaGraphModule.mamba in config.cuda_graph_modules:
         # mamba layer.

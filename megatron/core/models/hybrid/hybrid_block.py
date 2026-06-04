@@ -24,12 +24,13 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import CheckpointManager
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.hyper_connection import (
     HyperConnectionModule,
     learned_output_contract,
 )
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import (
@@ -55,7 +56,7 @@ class HybridStackSubmodules:
     mtp_block_spec: Optional[ModuleSpec] = None
 
 
-class HyperConnectionHybridLayer(MegatronModule):
+class HyperConnectionHybridLayer(GraphableMegatronModule):
     """Layer-boundary mHC wrapper for HybridStack layers.
 
     Hybrid layers already own their local residual paths. For this initial
@@ -74,6 +75,17 @@ class HyperConnectionHybridLayer(MegatronModule):
     migration. Note: this differs from `HyperConnectionTransformerLayer`,
     which subclasses `TransformerLayer` and only adds new sibling fields,
     keeping all base keys stable.
+
+    CUDA graphs: this wrapper subclasses ``GraphableMegatronModule`` so that, with
+    ``cuda_graph_impl="transformer_engine"``, the whole wrapper forward (mHC
+    aggregate + inner layer + n-stream BDA) is captured as one per-layer graph —
+    mirroring ``HyperConnectionTransformerLayer`` on the GPT path. Without this,
+    the TE graph discovery (``_layer_is_graphable``) only inspects the top-level
+    layer type and silently skips every wrapped layer, so an mHC-enabled
+    HybridStack would run entirely eager. The inner layer's own ``__call__`` graph
+    routing is bypassed during capture (see ``_call_inner_layer``) to avoid nested
+    capture; the inner layer's params are still covered by the wrapper graph's
+    manual hooks because ``_get_submodules_under_cudagraphs`` returns ``[self]``.
     """
 
     def __init__(self, config: TransformerConfig, layer: MegatronModule) -> None:
@@ -85,6 +97,50 @@ class HyperConnectionHybridLayer(MegatronModule):
             self.hyper_connection.to(dtype=config.params_dtype)
         if hasattr(layer, 'tp_group'):
             self.tp_group = layer.tp_group
+
+    def get_layer_static_inputs(self, seq_length, micro_batch_size):
+        """Override to produce n-stream hidden_states of shape [s, b, n*C].
+
+        CUDA graph capture allocates static buffers sized by this method. The base
+        returns [s, b, C], but mHC layers carry n-stream hidden states [s, b, n*C].
+        Mirrors ``HyperConnectionTransformerLayer.get_layer_static_inputs``.
+        """
+        static_inputs = super().get_layer_static_inputs(seq_length, micro_batch_size)
+        hs = static_inputs["hidden_states"]
+        n = self.config.num_residual_streams
+        static_inputs["hidden_states"] = torch.ones(
+            (hs.shape[0], hs.shape[1], n * self.config.hidden_size),
+            dtype=hs.dtype,
+            requires_grad=hs.requires_grad,
+            device=hs.device,
+        )
+        return static_inputs
+
+    def _te_cuda_graph_capture(self, *args, **kwargs):
+        """Capture the whole wrapper forward as one graph.
+
+        The wrapper forward returns ``(hidden_states, context)``; ``context`` is
+        ``None`` for the hybrid layer types that participate in graphing (no
+        cross-attention), so it is dropped from the captured outputs — a tuple
+        containing ``None`` cannot be a CUDA-graph output. Mirrors the
+        ``context is not None`` handling in ``TransformerLayer._te_cuda_graph_capture``.
+        """
+        hidden_states, context = self.forward(*args, **kwargs)
+        cuda_graph_outputs = [hidden_states]
+        if context is not None:
+            cuda_graph_outputs.append(context)
+        return tuple(cuda_graph_outputs)
+
+    def _te_cuda_graph_replay(self, *args, **kwargs):
+        """Replay the captured wrapper graph and restore the (hidden_states, context) contract.
+
+        The whole wrapper forward is captured as one graph whose only output is the
+        layer's n-stream hidden_states (``context`` is ``None`` for the graphed
+        hybrid layer types, so it was dropped at capture). The HybridStack forward
+        loop unpacks ``hidden_states, _ = layer(...)``, so re-append ``None`` here.
+        """
+        cuda_graph_output = list(super()._te_cuda_graph_replay(*args, **kwargs))
+        return cuda_graph_output[0], None
 
     def mamba_state_shapes_per_request(self) -> Optional[Tuple[Tuple[int], Tuple[int]]]:
         """Delegate Mamba inference state shape requests to the wrapped layer."""
@@ -102,8 +158,18 @@ class HyperConnectionHybridLayer(MegatronModule):
         packed_seq_params: Optional[PackedSeqParams],
         padding_mask: Optional[Tensor],
     ) -> Tuple[Tensor, Optional[Tensor]]:
+        # When this wrapper is itself being CUDA-graph captured, the inner layer
+        # must run as a plain forward: routing through its ``__call__`` would
+        # trigger nested TE graph capture (the inner layer is also a
+        # GraphableMegatronModule). During eager steps we keep ``__call__`` so the
+        # inner layer's forward pre-hooks (e.g. param all-gather) fire normally;
+        # under graph replay these are driven by the wrapper's manual hooks.
+        from megatron.core.transformer.cuda_graphs import is_graph_capturing
+
+        inner = self.inner_layer.forward if is_graph_capturing() else self.inner_layer
+
         if isinstance(self.inner_layer, TransformerLayer):
-            output = self.inner_layer(
+            output = inner(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 inference_context=inference_context,
@@ -120,7 +186,7 @@ class HyperConnectionHybridLayer(MegatronModule):
             # rotary_pos_emb / sequence_len_offset / padding_mask — pass only
             # the common arguments. New layer types that consume any of these
             # must add explicit handling here.
-            output = self.inner_layer(
+            output = inner(
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
                 inference_context=inference_context,
@@ -135,7 +201,7 @@ class HyperConnectionHybridLayer(MegatronModule):
     def forward(
         self,
         hidden_states: Tensor,
-        attention_mask: Tensor,
+        attention_mask: Optional[Tensor] = None,
         inference_context: Optional[BaseInferenceContext] = None,
         rotary_pos_emb: Optional[Tensor] = None,
         sequence_len_offset: Optional[Tensor] = None,
@@ -143,7 +209,13 @@ class HyperConnectionHybridLayer(MegatronModule):
         padding_mask: Optional[Tensor] = None,
         mhc_recompute_manager=None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
-        """Run the wrapped hybrid layer through one layer-boundary mHC update."""
+        """Run the wrapped hybrid layer through one layer-boundary mHC update.
+
+        ``attention_mask`` defaults to ``None`` so that CUDA-graph capture, which
+        calls this forward with only the static ``hidden_states`` input, does not
+        fail on a missing positional argument (causal masking is inferred by the
+        attention backend when the mask is ``None``).
+        """
         residual = hidden_states
         aggregated, h_res, h_post = self.hyper_connection(
             hidden_states, mhc_recompute_manager=mhc_recompute_manager
