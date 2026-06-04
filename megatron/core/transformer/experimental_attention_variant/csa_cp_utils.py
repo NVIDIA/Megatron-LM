@@ -8,6 +8,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.nn.functional import all_gather as differentiable_all_gather
 
+from megatron.core.transformer.experimental_attention_variant import csa_cp_kernels
 from megatron.core.transformer.experimental_attention_variant.dsa_kernels import batch_of_row
 
 
@@ -41,6 +42,12 @@ def cp_group_rank(cp_group: Optional[torch.distributed.ProcessGroup]) -> int:
     if cp_group is None:
         return 0
     return cp_group.rank()
+
+
+def can_use_csa_cp_fused_kernels(*tensors: Optional[torch.Tensor]) -> bool:
+    """Return whether CSA CP fused memory kernels can run for these tensors."""
+
+    return csa_cp_kernels.can_use_cute_kernels(*tensors)
 
 
 def _group_peer(cp_group: torch.distributed.ProcessGroup, group_rank: int) -> int:
@@ -311,6 +318,11 @@ def build_rank_major_compressed_metadata(
     c_cap: int,
     device: torch.device,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if csa_cp_kernels.can_use_cute_kernels(cu_seqlens):
+        return csa_cp_kernels.build_rank_major_compressed_metadata(
+            cu_seqlens, cp_size, l_local, ratio, d_comp, c_cap
+        )
+
     seq_parts = []
     comp_parts = []
     valid_parts = []
@@ -381,6 +393,76 @@ class _CompressorPrepCompact(torch.autograd.Function):
         return grad_hidden, grad_boundary, None, None, None, None
 
 
+class _CompressorPrepCompactCute(torch.autograd.Function):
+    """CuTe implementation of compressor-prep compact with explicit backward."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        hidden_local: torch.Tensor,
+        boundary_hidden: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        global_start: int,
+        l_local: int,
+        ratio: int,
+        d_comp: int,
+        d_window: int,
+        c_cap: int,
+    ):
+        ctx.hidden_shape = tuple(hidden_local.shape)
+        ctx.boundary_shape = tuple(boundary_hidden.shape)
+        ctx.global_start = global_start
+        ctx.l_local = l_local
+        ctx.ratio = ratio
+        ctx.d_comp = d_comp
+        ctx.d_window = d_window
+        ctx.save_for_backward(cu_seqlens)
+        return csa_cp_kernels.compressor_prep_compact(
+            hidden_local,
+            boundary_hidden,
+            cu_seqlens,
+            global_start,
+            l_local,
+            ratio,
+            d_comp,
+            d_window,
+            c_cap,
+        )
+
+    @staticmethod
+    def backward(
+        ctx,
+        grad_hidden_compact: torch.Tensor,
+        _grad_cu_compact: torch.Tensor,
+        _grad_seq_ids: torch.Tensor,
+        _grad_comp_ids: torch.Tensor,
+        _grad_valid: torch.Tensor,
+    ):
+        (cu_seqlens,) = ctx.saved_tensors
+        grad_hidden, grad_boundary = csa_cp_kernels.compressor_prep_compact_backward(
+            grad_hidden_compact.contiguous(),
+            ctx.hidden_shape,
+            ctx.boundary_shape,
+            cu_seqlens,
+            ctx.global_start,
+            ctx.l_local,
+            ctx.ratio,
+            ctx.d_comp,
+            ctx.d_window,
+        )
+        return (
+            grad_hidden,
+            grad_boundary,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
 def build_compressor_prep_compact(
     hidden_local: torch.Tensor,
     boundary_hidden: torch.Tensor,
@@ -429,6 +511,21 @@ def build_compressor_prep_compact(
             torch.zeros((0,), dtype=torch.bool, device=device),
             c_cap,
         )
+    if csa_cp_kernels.can_use_cute_kernels(hidden_local, boundary_hidden, cu_seqlens):
+        hidden_compact, cu_compact, seq_ids_t, comp_ids_t, valid_t = (
+            _CompressorPrepCompactCute.apply(
+                hidden_local,
+                boundary_hidden,
+                cu_seqlens,
+                global_start,
+                l_local,
+                ratio,
+                d_comp,
+                d_window,
+                c_cap,
+            )
+        )
+        return hidden_compact, cu_compact, seq_ids_t, comp_ids_t, valid_t, c_cap
 
     ext_start = global_start - d_window
     src_positions: List[int] = []
@@ -515,6 +612,9 @@ def pad_compressed_to_capacity(
     Returns:
         ``(c_cap, 1, head_dim)`` with valid rows at the front and tail zeros.
     """
+    if compressed is not None and compressed.shape[0] == c_cap:
+        return compressed
+
     fixed = like.new_zeros((c_cap, 1, head_dim))
     if compressed is not None and compressed.shape[0] > 0:
         if compressed.shape[0] > c_cap:
@@ -801,12 +901,78 @@ def pack_cp_window_kv_global(
     return kv_full, window_map
 
 
+def cp_kv_full_capacity(cu_seqlens: torch.Tensor, l_local: int, d_window: int, ratio: int) -> int:
+    """Return the fixed upper-bound KV full capacity for fused CP packing."""
+
+    return csa_cp_kernels.kv_full_capacity(cu_seqlens, l_local, d_window, ratio)
+
+
+def pack_cp_kv_full_fused(
+    kv_local: torch.Tensor,
+    boundary_kv: torch.Tensor,
+    compressed_rank_major: torch.Tensor,
+    seq_ids_rank_major: torch.Tensor,
+    comp_ids_rank_major: torch.Tensor,
+    valid_rank_major: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    global_start: int,
+    l_local: int,
+    d_window: int,
+    ratio: int,
+) -> torch.Tensor:
+    """Pack local window rows and rank-major compressed rows without Python maps.
+
+    Args:
+        kv_local: Local KV rows, ``(L_local, ...)``.
+        boundary_kv: Fixed left boundary KV rows, ``(D_window, ...)``.
+        compressed_rank_major: All-gathered compressed rows in rank-major order.
+        seq_ids_rank_major / comp_ids_rank_major / valid_rank_major:
+            Rank-major compressed metadata.
+        cu_seqlens: Global padded THD cumulative sequence lengths.
+        global_start: First global padded token owned by this rank.
+        l_local: Local padded token capacity.
+        d_window: Left boundary window width.
+        ratio: Compression ratio. Use ``0`` or ``1`` for window-only layouts.
+
+    Returns:
+        Static-capacity ``kv_full`` laid out per active sequence as
+        ``[window rows, compressed rows]`` with tail padding.
+    """
+
+    if not csa_cp_kernels.can_use_cute_kernels(
+        kv_local,
+        boundary_kv,
+        compressed_rank_major,
+        seq_ids_rank_major,
+        comp_ids_rank_major,
+        valid_rank_major,
+        cu_seqlens,
+    ):
+        raise RuntimeError("Fused CSA CP KV pack requires CUDA tensors and CuTe DSL kernels.")
+    capacity = cp_kv_full_capacity(cu_seqlens, l_local, d_window, ratio)
+    return csa_cp_kernels.pack_kv_full(
+        kv_local,
+        boundary_kv,
+        compressed_rank_major,
+        seq_ids_rank_major,
+        comp_ids_rank_major,
+        valid_rank_major,
+        cu_seqlens,
+        global_start,
+        l_local,
+        d_window,
+        ratio,
+        capacity,
+    )
+
+
 def repack_rank_major_compressed_to_seq_major(
     compressed_rank_major: torch.Tensor,
     seq_ids_rank_major: torch.Tensor,
     comp_ids_rank_major: torch.Tensor,
     valid_rank_major: torch.Tensor,
     cu_seqlens_compressed: torch.Tensor,
+    output_capacity: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Reorder rank-major compressed rows into global seq-major order.
 
@@ -818,7 +984,25 @@ def repack_rank_major_compressed_to_seq_major(
         ``(compressed_seq_major, rank_major_by_seq_major)`` where the second
         tensor maps a seq-major compressed row id back to its rank-major row id.
     """
-    total_comp = int(cu_seqlens_compressed[-1].item())
+    total_comp = (
+        output_capacity if output_capacity is not None else int(cu_seqlens_compressed[-1].item())
+    )
+    if csa_cp_kernels.can_use_cute_kernels(
+        compressed_rank_major,
+        seq_ids_rank_major,
+        comp_ids_rank_major,
+        valid_rank_major,
+        cu_seqlens_compressed,
+    ):
+        return csa_cp_kernels.repack_rank_major_compressed_to_seq_major(
+            compressed_rank_major,
+            seq_ids_rank_major,
+            comp_ids_rank_major,
+            valid_rank_major,
+            cu_seqlens_compressed,
+            total_comp,
+        )
+
     compressed_seq_major = compressed_rank_major.new_zeros(
         (total_comp,) + tuple(compressed_rank_major.shape[1:])
     )
@@ -840,7 +1024,10 @@ def repack_rank_major_compressed_to_seq_major(
             compressed_seq_major[seq_major_id] = compressed_rank_major[rank_major_id]
             rank_major_by_seq_major[seq_major_id] = rank_major_id
 
-    if bool((rank_major_by_seq_major < 0).any().item()):
+    check_rows = (
+        int(cu_seqlens_compressed[-1].item()) if output_capacity is not None else total_comp
+    )
+    if bool((rank_major_by_seq_major[:check_rows] < 0).any().item()):
         raise RuntimeError("DSv4 rank-major compressed metadata did not cover all valid rows.")
     return compressed_seq_major, rank_major_by_seq_major
 
@@ -1036,6 +1223,45 @@ def build_cp_flat_idxs(
     return out, topk_length
 
 
+def build_cp_flat_idxs_fused(
+    cu_seqlens: torch.Tensor,
+    global_start: int,
+    l_local: int,
+    d_window: int,
+    window_size: int,
+    ratio: int,
+    indexer_topk_compressed_logical_ids: Optional[torch.Tensor] = None,
+    max_n_compressed: int = 0,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Generate/lower CP final sparse-attention ids without Python maps.
+
+    Returns:
+        ``(topk_idxs, topk_length)`` where ``topk_idxs`` is already in the
+        fused ``kv_full`` flat row space.
+    """
+
+    if indexer_topk_compressed_logical_ids is not None:
+        compressed_width = indexer_topk_compressed_logical_ids.shape[-1]
+    elif ratio > 1:
+        compressed_width = max_n_compressed
+    else:
+        compressed_width = 0
+    if not csa_cp_kernels.can_use_cute_kernels(
+        cu_seqlens, indexer_topk_compressed_logical_ids
+    ):
+        raise RuntimeError("Fused CSA CP final idx generation requires CUDA tensors and CuTe DSL.")
+    return csa_cp_kernels.build_final_idxs(
+        cu_seqlens,
+        global_start,
+        l_local,
+        d_window,
+        window_size,
+        ratio,
+        compressed_width,
+        indexer_topk_compressed_logical_ids,
+    )
+
+
 def build_cp_flat_idxs_for_indexer_loss(
     cu_seqlens: torch.Tensor,
     global_start: int,
@@ -1081,3 +1307,43 @@ def build_cp_flat_idxs_for_indexer_loss(
             if flat is not None:
                 out[row, compressed_width + j] = flat
     return out, indexer_rank_major
+
+
+def build_cp_flat_idxs_for_indexer_loss_fused(
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_compressed: torch.Tensor,
+    global_start: int,
+    l_local: int,
+    d_window: int,
+    window_size: int,
+    ratio: int,
+    indexer_topk_compressed_logical_ids: torch.Tensor,
+    indexer_rank_by_seq_major: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Generate Path-B ids and rank-major compressed ids in one fused kernel.
+
+    The first returned tensor lowers sparse attention indices into fused
+    ``kv_full`` layout. The second tensor maps the compressed top-k columns to
+    rank-major indexer-K rows for the sparse indexer-loss kernel.
+    """
+
+    if not csa_cp_kernels.can_use_cute_kernels(
+        cu_seqlens,
+        cu_seqlens_compressed,
+        indexer_topk_compressed_logical_ids,
+        indexer_rank_by_seq_major,
+    ):
+        raise RuntimeError(
+            "Fused CSA CP indexer-loss idx generation requires CUDA tensors and CuTe DSL."
+        )
+    return csa_cp_kernels.build_indexer_loss_final_idxs(
+        cu_seqlens,
+        cu_seqlens_compressed,
+        global_start,
+        l_local,
+        d_window,
+        window_size,
+        ratio,
+        indexer_topk_compressed_logical_ids,
+        indexer_rank_by_seq_major,
+    )
