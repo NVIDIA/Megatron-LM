@@ -12,46 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""DP-distributed Muon optimizer for Megatron-FSDP v2 (single-root, async-pipelined).
-
-Muon orthogonalizes the gradient of 2D matrix parameters via Newton-Schulz (NS).
-NS needs the *full* gradient matrix, but under FSDP the gradient is sharded over
-the data-parallel (DP) group. This optimizer reconstructs each parameter's full
-gradient on a single, load-balanced "root" DP rank (chosen by the parameter
-group's ``BufferIndex.item_root_ranks``), runs NS there *once*, and scatters the
-orthogonalized gradient back — rather than all-gathering the full gradient to
-every rank and running NS redundantly. Momentum and the weight update stay fully
-local (elementwise on each rank's shard), so optimizer state remains sharded.
-
-Two classes, following the "MegatronOptimizer wraps a torch optimizer" pattern:
-
-- :class:`FullyShardV2Muon` is a ``torch.optim.Optimizer``. Its ``orthogonalize``
-  uses ``emerging_optimizers``' production Newton-Schulz (``newton_schulz_tp`` +
-  ``get_muon_scale_factor``) WHEN that optional package is installed, and falls
-  back to a self-contained vanilla quintic NS otherwise — so it runs (and can be
-  unit-tested) even without the package. Its ``step()`` does the single-root
-  gather/scatter + sharded momentum/update.
-- :class:`FullyShardV2MuonOptimizer` is the thin ``MegatronOptimizer`` adapter
-  that lets the above slot into ``ChainedOptimizer`` alongside Adam.
-
-Per managed 2D matrix parameter, each ``step()`` runs three phases:
-
-1. Local momentum on this rank's gradient shard (sharded optimizer state).
-2. Gather the (post-momentum) full gradient to the parameter's root rank
-   (``ParameterGroup.unshard_grad_to_root_async``).
-3a. Root only: ``self.orthogonalize(param, full_grad)`` (NS + scale), then scatter
-    back (``ParameterGroup.scatter_grad_from_root_async``).
-3b. Local elementwise weight update on this rank's master shard.
-
-The gather/NS/scatter run as an async pipeline on the FSDP reduce-scatter stream:
-each parameter's gather is prefetched and the previous parameter's scatter is left
-in flight so they overlap the current parameter's Newton-Schulz, while the
-collective ops are still issued in the same parameter order on every rank.
-
-Scope: tensor-parallel size 1 (orthogonalize runs the non-TP NS path). Real
-tensor-parallel NS + QKV split and distributed checkpointing of the sharded
-momentum are later phases. Needs validation on a GPU node.
-"""
 
 from typing import List
 
@@ -146,29 +106,28 @@ class FullyShardV2Muon(torch.optim.Optimizer):
         self._managed = []
         for group in self.param_groups:
             for dist_param in group["params"]:
-                pg = getattr(dist_param, "_fsdp_param_group", None)
+                param_group = getattr(dist_param, "_fsdp_param_group", None)
                 orig = getattr(dist_param, "_fsdp_orig_param", None)
-                if pg is None or orig is None:
+                if param_group is None or orig is None:
                     continue  # not an FSDP-v2 param
-                if pg.sharding_strategy == "no_shard":
+                if param_group.sharding_strategy == "no_shard":
                     raise NotImplementedError(
                         "FullyShardV2Muon does not support the 'no_shard' strategy."
                     )
-                if pg.main_grad_buffer is None:
+                if param_group.main_grad_buffer is None:
                     continue
                 if (
                     orig.requires_grad
                     and orig.dim() == 2
                     and not getattr(orig, "is_embedding_or_output_parameter", False)
                 ):
-                    idx = pg.param_idx[orig]
-                    grad_shard = pg.main_grad_buffer.get_item(idx, as_shard=True)
+                    idx = param_group.param_idx[orig]
+                    grad_shard = param_group.main_grad_buffer.get_item(idx, as_shard=True)
                     momentum_shard = torch.zeros_like(grad_shard)
-                    self._managed.append((pg, idx, orig, momentum_shard))
+                    self._managed.append((param_group, idx, orig, momentum_shard))
 
         if not self._managed:
             raise ValueError("FullyShardV2Muon got no 2D matrix parameters to manage.")
-
 
     @torch.no_grad()
     def orthogonalize(self, param, grad: torch.Tensor) -> torch.Tensor:
@@ -198,34 +157,23 @@ class FullyShardV2Muon(torch.optim.Optimizer):
     def step(self, closure=None):
         """Run one Muon update over all managed 2D matrix params.
 
-        Per param: (1) local momentum on this rank's grad shard; (2) gather the full
-        grad to the param's root rank; (3a) root orthogonalizes (NS + scale) and
-        scatters the result back into every holder's grad shard; (3b) local
-        decoupled-weight-decay update of this rank's master shard. Momentum/update
-        stay sharded so optimizer state is sharded.
+        Per param, in order:
+          1. momentum  - update this rank's grad shard locally (stays sharded);
+          2. gather    - send the full grad to the param's root rank;
+          3. NS        - root orthogonalizes the full grad (Newton-Schulz);
+          4. scatter   - root sends each orthogonalized shard back to its holder;
+          5. update    - each rank applies a local decoupled-WD step to its master shard.
 
-        The gather/scatter are async (non-blocking ``batch_isend_irecv``); the NCCL
-        backend runs them on its own stream, so they overlap the Newton-Schulz
-        compute on the main stream — no explicit stream/event management needed. It
-        is a 2-stage pipeline: we prefetch the next param's gather so it overlaps the
-        current param's NS, and leave each scatter in flight so it overlaps the next
-        param's NS (NS dominates, so one gather in flight is enough to hide the comm);
-        the scatters are drained at the end. ``work.wait()``
-        orders compute-after-comm; the backend orders comm-after-compute (a send
-        waits for the grad/NS that produced its buffer). P2P is issued in the same
-        param order on every rank, so it is deadlock-free.
-
-        NOTE: the async pipeline is UNVALIDATED on GPU — needs a multi-rank run to
-        confirm overlap and numerical parity with a serial reference.
+        Gather/scatter are async: all gathers (step 2) fire up front so the later ones
+        overlap the NS (step 3) of earlier params.
         """
+        assert closure is None, "FullyShardV2Muon does not support a closure."
         lr = self.param_groups[0]["lr"]  # set by the LR scheduler
         items = self._managed
-        n = len(items)
 
-        # Phase 1: in-place momentum on every rank's grad shard (view into gbuf), so
-        # the gathers below see a fully post-momentum grad. Cheap elementwise.
-        for pg, idx, _, momentum in items:
-            grad_shard = pg.main_grad_buffer.get_item(idx, as_shard=True)
+        # Phase 1: in-place momentum on each rank's grad shard, so gathers see post-momentum grad.
+        for param_group, idx, _, momentum in items:
+            grad_shard = param_group.main_grad_buffer.get_item(idx, as_shard=True)
             if grad_shard.numel() > 0:
                 momentum.mul_(self._momentum_coef).add_(grad_shard)
                 if self._nesterov:
@@ -233,73 +181,61 @@ class FullyShardV2Muon(torch.optim.Optimizer):
                 else:
                     grad_shard.copy_(momentum)
 
-        # Phase 2/3a: 2-stage pipeline — prefetch the next param's gather so it
-        # overlaps the current param's NS; fire each scatter and don't wait, drain
-        # at the end.
-        inflight = []        # all in-flight P2P Works + tensors kept alive until drained
+        # Phase 2: fire ALL gathers up front so later ones overlap Phase-3 NS.
+        gather_work = []   # (param_group, param, full_grad_or_None, reqs)
+        for param_group, idx, param, _ in items:
+            full_grad, reqs = param_group.unshard_grad_to_root_async(param)
+            gather_work.append((param_group, param, full_grad, reqs))
 
-        pg, _, param, _ = items[0]
-        pending = pg.unshard_grad_to_root_async(param)  # kick off the first gather
+        # Phase 3: root waits its own gather, orthogonalizes, fires scatter; non-root fires recv.
+        scatter_work = []   # (reqs, orth_keepalive)
+        for param_group, param, full_grad, reqs in gather_work:
+            if full_grad is not None:                       # this rank is the param's root
+                for req in reqs:
+                    req.wait()
+                orth = self.orthogonalize(param, full_grad).to(full_grad.dtype)
+                scatter_work.append((param_group.scatter_grad_from_root_async(param, orth), orth))
+            else:                                           # non-root holder / uninvolved
+                scatter_work.append((param_group.scatter_grad_from_root_async(param, None), None))
 
-        for i in range(n):
-            pg, _, param, _ = items[i]
-            full, gather_reqs = pending
-            if i + 1 < n:                             # prefetch next gather before this NS
-                npg, _, nparam, _ = items[i + 1]
-                pending = npg.unshard_grad_to_root_async(nparam)
-
-            if full is not None:                      # this rank is param i's root
-                for req in gather_reqs:
-                    req.wait()                        # only the root waits its gather (NS needs it)
-                orth = self.orthogonalize(param, full).to(full.dtype)
-                inflight.append((pg.scatter_grad_from_root_async(param, orth), orth, full))
-            else:                                     # non-root holder / uninvolved
-                # Fire-and-forget: its grad isend (gather) + the scatter recv straight
-                # into its grad shard. Don't block here; drained below.
-                inflight.append((gather_reqs, None, None))
-                inflight.append((pg.scatter_grad_from_root_async(param, None), None, None))
-
-        # Drain all in-flight P2P. The scatter recvs have written each rank's grad
-        # shard in place, so Phase 3b can read it directly.
-        for reqs, _orth, _full in inflight:
+        # Drain: non-root gather isends, then all scatters (recvs wrote each grad shard in place).
+        for _param_group, _param, _full_grad, reqs in gather_work:
+            for req in reqs:
+                req.wait()
+        for reqs, _orth in scatter_work:
             for req in reqs:
                 req.wait()
 
-        # Phase 3b: decoupled-WD update of each rank's master shard from the (now
-        # orthogonalized) grad shard, then refresh model weights from master.
-        for pg, idx, _, _ in items:
-            wbuf = pg.main_weight_buffer if pg.main_weight_buffer is not None else pg.model_weight_buffer
+        # Phase 3b: decoupled-WD master-shard update from the orthogonalized grad, then refresh weights.
+        for param_group, idx, _, _ in items:
+            wbuf = (
+                param_group.main_weight_buffer
+                if param_group.main_weight_buffer is not None
+                else param_group.model_weight_buffer
+            )
             weight_shard = wbuf.get_item(idx, as_shard=True)
             if weight_shard.numel() == 0:
                 continue
-            orth_shard = pg.main_grad_buffer.get_item(idx, as_shard=True)
+            orth_shard = param_group.main_grad_buffer.get_item(idx, as_shard=True)
             if self._weight_decay != 0.0:
                 weight_shard.mul_(1.0 - lr * self._weight_decay)
             weight_shard.add_(orth_shard.to(weight_shard.dtype), alpha=-lr)
 
         refreshed = set()
-        for pg, _, _, _ in items:
-            if id(pg) in refreshed or pg.main_weight_buffer is None:
+        for param_group, _, _, _ in items:
+            if id(param_group) in refreshed or param_group.main_weight_buffer is None:
                 continue
-            pg.copy_main_weights_to_model_weights()
-            refreshed.add(id(pg))
+            param_group.copy_main_weights_to_model_weights()
+            refreshed.add(id(param_group))
 
 
 class FullyShardV2MuonOptimizer(MegatronOptimizer):
-    """MegatronOptimizer adapter that lets FullyShardV2Muon slot into ChainedOptimizer.
+    """MegatronOptimizer adapter wrapping FullyShardV2Muon for ChainedOptimizer.
 
-    Presents the MegatronOptimizer interface around the inner FullyShardV2Muon
-    (a torch-style optimizer that updates the FSDP buffers directly). The actual
-    Muon update runs in ``step_with_ready_grads`` (-> ``self.optimizer.step()``).
-
-    NOTE (UNVALIDATED): the inner Muon optimizer updates its 2D matrix params
-    end-to-end on the FSDP buffers (gather -> NS -> scatter -> update), so those
-    params are intentionally excluded from the ChainedOptimizer's global gradient
-    clipping / zero-counting / grad-norm (``get_parameters`` and
-    ``get_main_grads_for_grad_norm`` return ``[]``). Orthogonalized Muon updates
-    are already self-normalized, so this matches common practice; revisit if a
-    joint Muon+Adam grad-norm is desired. Checkpointing of the sharded momentum
-    is a TODO. This whole adapter needs validation on a GPU node.
+    The inner Muon optimizer updates its FSDP buffers end-to-end (gather -> NS ->
+    scatter -> update), so its params are excluded from the chained grad clip /
+    grad-norm / zero-count (``get_parameters`` / ``get_main_grads_for_grad_norm``
+    return ``[]``) — orthogonalized updates are already self-normalized.
     """
 
     def __init__(self, muon: "FullyShardV2Muon", config, model_chunks=None):
