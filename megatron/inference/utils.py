@@ -1,13 +1,13 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
-from argparse import ArgumentParser
+import warnings
+from argparse import ArgumentParser, Namespace
 from functools import partial
-from typing import Optional
+from typing import Callable, Optional
+
 import torch
 
-from gpt_builders import gpt_builder
-from hybrid_builders import hybrid_builder
 from megatron.core.inference.config import (
     CudaGraphSizingDistribution,
     InferenceConfig,
@@ -32,10 +32,84 @@ from megatron.core.utils import get_attr_wrapped_model, log_single_rank, unwrap_
 from megatron.training import get_args
 from megatron.training import get_model as _get_model
 from megatron.training import get_tokenizer, get_wandb_writer
+from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args
 from megatron.training.checkpointing import load_checkpoint
+from megatron.training.models import (
+    GPTModelBuilder,
+    HybridModelBuilder,
+    ModelBuilder,
+)
 from model_provider import model_provider
 
 logger = logging.getLogger(__name__)
+
+
+def get_model_builder(args: Namespace, provider: Optional[str] = None) -> ModelBuilder:
+    """Construct a :class:`ModelBuilder` for the requested model provider.
+
+    Replaces the legacy ``gpt_builder`` / ``hybrid_builder`` function selector with
+    a config-driven dispatch that returns a fully-configured :class:`ModelBuilder`
+    instance whose ``build_model()`` and ``build_distributed_models()`` methods can
+    be used to materialize the model.
+
+    Args:
+        args: The parsed argparse namespace, used to populate the model config via
+            ``gpt_config_from_args`` / ``hybrid_config_from_args``.
+        provider: Optional override for the model provider name. Must be one of
+            ``"gpt"``, ``"hybrid"``, or the deprecated ``"mamba"``. When omitted,
+            falls back to ``args.model_provider`` (set by ``add_inference_args``).
+
+    Returns:
+        A :class:`ModelBuilder` instance bound to a config derived from ``args``.
+    """
+    if provider is None:
+        provider = args.model_provider
+    if provider == "gpt":
+        return GPTModelBuilder(gpt_config_from_args(args))
+    if provider in ("hybrid", "mamba"):
+        if provider == "mamba":
+            warnings.warn(
+                '"mamba" model provider is deprecated. Use "hybrid" instead.',
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        return HybridModelBuilder(hybrid_config_from_args(args))
+    raise ValueError(f"Invalid model provider {provider}")
+
+
+def builder_to_legacy_callable(builder: ModelBuilder) -> Callable:
+    """Adapt a :class:`ModelBuilder` to the legacy ``model_provider`` callable signature.
+
+    Routing through ``model_provider`` (from the top-level ``model_provider.py``)
+    preserves legacy hooks that are still on the function-style builder API
+    (e.g. ``args.modelopt_enabled`` swaps in ``modelopt_gpt_hybrid_builder`` and
+    ``args.record_memory_history`` registers the OOM observer) until those code
+    paths are migrated to the new builder API.
+
+    NOTE : If the args.record_history_memory and has_nvidia_modelopt are not needed, then can do a direct pass through. 
+
+
+
+    Intended usage::
+
+        builder = get_model_builder(args)
+        model = get_model(
+            partial(model_provider, builder_to_legacy_callable(builder)),
+            wrap_with_ddp=False,
+        )
+    """
+
+    def legacy_builder(
+        args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None
+    ):
+        return builder.build_model(
+            pg_collection=pg_collection,
+            pre_process=pre_process,
+            post_process=post_process,
+            vp_stage=vp_stage,
+        )
+
+    return legacy_builder
 
 
 def get_model_for_inference() -> MegatronModule:
@@ -43,23 +117,13 @@ def get_model_for_inference() -> MegatronModule:
 
     args = get_args()
 
-    if args.model_provider == "gpt":
-        model_builder = gpt_builder
-    elif args.model_provider in ("hybrid", "mamba"):
-        if args.model_provider == "mamba":
-            import warnings
-
-            warnings.warn(
-                '--model-provider "mamba" is deprecated. Use --model-provider "hybrid" instead.',
-                DeprecationWarning,
-                stacklevel=2,
-            )
-        model_builder = hybrid_builder
-    else:
-        raise ValueError(f"Invalid model provider {args.model_provider}")
+    builder = get_model_builder(args)
 
     # Build model.
-    model = _get_model(partial(model_provider, model_builder), wrap_with_ddp=False)
+    model = _get_model(
+        partial(model_provider, builder_to_legacy_callable(builder)),
+        wrap_with_ddp=False,
+    )
 
     # Load checkpoint.
     assert args.load is not None
