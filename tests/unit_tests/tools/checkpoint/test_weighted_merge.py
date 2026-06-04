@@ -1,6 +1,7 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import io
+import os
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
@@ -36,6 +37,30 @@ def process_group():
     if not already_initialized and dist.is_available() and dist.is_initialized():
         if dist.get_world_size() == 1:
             dist.destroy_process_group()
+
+
+def _configured_world_size():
+    if dist.is_available() and dist.is_initialized():
+        return dist.get_world_size()
+    return int(os.environ.get("WORLD_SIZE", "1"))
+
+
+@pytest.fixture(autouse=True)
+def skip_single_rank_checkpoint_tests(request):
+    if "tmp_path_dist_ckpt" not in request.fixturenames:
+        return
+    if "distributed_checkpoint_world" in request.fixturenames:
+        return
+    if _configured_world_size() != 1:
+        pytest.skip("single-rank weighted merge fixture coverage requires world_size=1")
+
+
+@pytest.fixture
+def distributed_checkpoint_world(process_group):
+    world_size = _world_size()
+    if world_size < 2:
+        pytest.skip("multi-rank metadata same-layout coverage requires torchrun")
+    return world_size
 
 
 @pytest.fixture(autouse=True)
@@ -852,6 +877,12 @@ def test_metadata_same_layout_generated_moe_gpt_round_trip_cpu_without_model_bui
         ):
             _write_generated_moe_gpt_checkpoint(ckpt_a, 1.0)
             _write_generated_moe_gpt_checkpoint(ckpt_b, 5.0)
+            source_metadata = torch_dcp.FileSystemReader(ckpt_a).read_metadata()
+            expected_extra_states = sum(
+                1
+                for fqn, metadata in source_metadata.state_dict_metadata.items()
+                if "_extra_state" in str(fqn) and not hasattr(metadata, "size")
+            )
 
             result = merge_same_layout_dcp_metadata_checkpoints(
                 [ckpt_a, ckpt_b],
@@ -866,7 +897,7 @@ def test_metadata_same_layout_generated_moe_gpt_round_trip_cpu_without_model_bui
             assert result.averaged_tensors == 19
             # All in-root byte/object _extra_state entries are copied from the
             # selected source (the metadata path does no object-entry filtering).
-            assert result.copied_extra_states == 7
+            assert result.copied_extra_states == expected_extra_states
 
             output_metadata = torch_dcp.FileSystemReader(result.output_dir).read_metadata()
             object_metadata_keys = [
@@ -874,7 +905,7 @@ def test_metadata_same_layout_generated_moe_gpt_round_trip_cpu_without_model_bui
                 for fqn, metadata in output_metadata.state_dict_metadata.items()
                 if not hasattr(metadata, "size")
             ]
-            assert len(object_metadata_keys) == 7
+            assert len(object_metadata_keys) == expected_extra_states
             assert all("_extra_state" in fqn for fqn in object_metadata_keys)
             tensor_state = {
                 fqn: torch.empty(
@@ -893,7 +924,6 @@ def test_metadata_same_layout_generated_moe_gpt_round_trip_cpu_without_model_bui
             for fqn, tensor in tensor_state.items():
                 assert torch.equal(tensor, torch.full_like(tensor, 4.0)), fqn
 
-            source_metadata = torch_dcp.FileSystemReader(ckpt_a).read_metadata()
             for fqn in tensor_state:
                 output_tensor_metadata = output_metadata.state_dict_metadata[fqn]
                 source_chunks = [
@@ -1268,12 +1298,9 @@ def test_metadata_same_layout_sidecar_failure_does_not_publish_output_or_latest(
         assert not (output_root / "latest_checkpointed_iteration.txt").exists()
 
 
-def test_metadata_same_layout_two_rank_product_round_trip_public_metadata(
-    tmp_path_dist_ckpt, process_group, monkeypatch
+def test_metadata_same_layout_multi_rank_product_round_trip_public_metadata(
+    tmp_path_dist_ckpt, distributed_checkpoint_world, monkeypatch
 ):
-    if _world_size() != 2:
-        pytest.skip("two-rank metadata same-layout coverage requires torchrun --nproc_per_node=2")
-
     def fail_model_path(*_args, **_kwargs):
         raise AssertionError("metadata same-layout must not use model/template construction")
 
@@ -1307,7 +1334,7 @@ def test_metadata_same_layout_two_rank_product_round_trip_public_metadata(
         loaded = _load_checkpoint(result.output_dir)
         assert result.output_dir == output_root / "iter_0000030"
         assert result.implementation_mode == weighted_merge_module.METADATA_SAME_LAYOUT_MODE
-        assert result.world_size == 2
+        assert result.world_size == distributed_checkpoint_world
         assert result.averaged_tensors == 2
         assert result.copied_extra_states == 1
 
@@ -1320,10 +1347,22 @@ def test_metadata_same_layout_two_rank_product_round_trip_public_metadata(
 
         public = _full_public_dcp_state(result.output_dir)
         expected_public_weight = torch.cat(
-            [torch.full((2, 2), 4.0), torch.full((2, 2), 5.75)], dim=0
+            [
+                torch.full((2, 2), 4.0 + (1.75 * public_rank))
+                for public_rank in range(distributed_checkpoint_world)
+            ],
+            dim=0,
         )
-        expected_public_bias = torch.tensor([5.0, 5.0, 6.75, 6.75])
-        expected_public_extra = torch.tensor([999.0, 1000.0])
+        expected_public_bias = torch.cat(
+            [
+                torch.full((2,), 5.0 + (1.75 * public_rank))
+                for public_rank in range(distributed_checkpoint_world)
+            ],
+            dim=0,
+        )
+        expected_public_extra = torch.tensor(
+            [999.0 + public_rank for public_rank in range(distributed_checkpoint_world)]
+        )
         assert torch.equal(public["model.weight"], expected_public_weight)
         assert torch.equal(public["model.bias"], expected_public_bias)
         assert torch.equal(public["model.decoder.layers.0._extra_state"], expected_public_extra)
@@ -1344,8 +1383,8 @@ def test_metadata_same_layout_two_rank_product_round_trip_public_metadata(
         metadata_summary = _dcp_metadata_summary(result.output_dir)
         assert not metadata_summary["duplicate_chunk_offsets"]
         assert not metadata_summary["duplicate_storage_records"]
-        assert metadata_summary["storage_file_count"] == 2
-        assert len(metadata_summary["chunk_records"]) == 6
+        assert metadata_summary["storage_file_count"] == distributed_checkpoint_world
+        assert len(metadata_summary["chunk_records"]) == 3 * distributed_checkpoint_world
 
         if _rank() == 0:
             common_state = dist_checkpointing.load_common_state_dict(str(result.output_dir))
@@ -1355,17 +1394,12 @@ def test_metadata_same_layout_two_rank_product_round_trip_public_metadata(
             )
             assert provenance["extra_state_source_index"] == 1
             assert (output_root / "latest_checkpointed_iteration.txt").read_text().strip() == "30"
-            assert len(list(result.output_dir.glob("*.distcp"))) == 2
+            assert len(list(result.output_dir.glob("*.distcp"))) == distributed_checkpoint_world
 
 
-def test_metadata_same_layout_two_rank_byte_extra_state_round_trip(
-    tmp_path_dist_ckpt, process_group, monkeypatch
+def test_metadata_same_layout_multi_rank_byte_extra_state_round_trip(
+    tmp_path_dist_ckpt, distributed_checkpoint_world, monkeypatch
 ):
-    if _world_size() != 2:
-        pytest.skip(
-            "two-rank metadata same-layout byte coverage requires torchrun --nproc_per_node=2"
-        )
-
     def fail_model_path(*_args, **_kwargs):
         raise AssertionError("metadata same-layout must not use model/template construction")
 
@@ -1406,7 +1440,7 @@ def test_metadata_same_layout_two_rank_byte_extra_state_round_trip(
 
         assert result.output_dir == output_root / "iter_0000031"
         assert result.averaged_tensors == 4
-        assert result.copied_extra_states == 2
+        assert result.copied_extra_states == distributed_checkpoint_world
         expected_base = 4.0 + (1.75 * rank)
         assert torch.equal(
             loaded["decoder.final_layernorm.weight"], torch.full((3,), expected_base)
@@ -1430,17 +1464,17 @@ def test_metadata_same_layout_two_rank_byte_extra_state_round_trip(
             if type(entry).__name__ == "BytesStorageMetadata"
         )
         assert byte_keys == [
-            f"{UNPREFIXED_GPT_BYTE_EXTRA_STATE_KEY}/shard_0_2",
-            f"{UNPREFIXED_GPT_BYTE_EXTRA_STATE_KEY}/shard_1_2",
+            f"{UNPREFIXED_GPT_BYTE_EXTRA_STATE_KEY}/shard_{shard_rank}_{distributed_checkpoint_world}"
+            for shard_rank in range(distributed_checkpoint_world)
         ]
         metadata_summary = _dcp_metadata_summary(result.output_dir)
         assert not metadata_summary["duplicate_chunk_offsets"]
         assert not metadata_summary["duplicate_storage_records"]
-        assert metadata_summary["storage_file_count"] == 2
+        assert metadata_summary["storage_file_count"] == distributed_checkpoint_world
 
         if _rank() == 0:
             assert (output_root / "latest_checkpointed_iteration.txt").read_text().strip() == "31"
-            assert len(list(result.output_dir.glob("*.distcp"))) == 2
+            assert len(list(result.output_dir.glob("*.distcp"))) == distributed_checkpoint_world
 
 
 # ---------------------------------------------------------------------------
