@@ -73,6 +73,44 @@ _PLANNER_METHODS = (
     "finish_plan",
 )
 
+# Between local planning (``prepare_local_plan``) and the data read
+# (``finish_plan`` / ``read_data``), ``_load_state_dict`` runs a *collective*
+# global-planning step that the reader/planner method wrapping above cannot see:
+#
+#     central_plan = distW.reduce_scatter("plan", local_step, global_step)
+#     ...
+#     distW.all_gather("read", read_data)
+#
+# ``reduce_scatter`` gathers every rank's local plan to the coordinator
+# (``gather_object``), runs ``global_step`` (= create/prepare_global_plan) *only
+# there*, then scatters the per-rank result back (``scatter_object``). On a
+# non-coordinator rank this whole stretch is time spent blocked inside the
+# gather/scatter collectives waiting for the coordinator -- which otherwise shows
+# up as a large unannotated gap in the trace. We instrument the ``_DistWrapper``
+# collective methods (at the class level -- a fresh ``_DistWrapper`` is built per
+# load, so there's nothing stable to wrap per-instance) so that gap is broken
+# into its real phases.
+#
+# The orchestration methods take the phase name as their first positional arg
+# (``step``), so their marker carries it (e.g. ``dcp.reduce_scatter:plan``,
+# ``dcp.all_gather:read``). The primitive object collectives have no such arg and
+# use a fixed label.
+_DIST_WRAPPER_STEP_METHODS = (
+    "reduce_scatter",
+    "all_reduce",
+    "all_gather",
+    "broadcast",
+)
+_DIST_WRAPPER_PRIMITIVE_METHODS = (
+    "gather_object",
+    "scatter_object",
+    "all_gather_object",
+    "broadcast_object",
+    "barrier",
+)
+# Marks a _DistWrapper class method as already wrapped (kept on the wrapper fn).
+_DIST_WRAPPER_WRAPPED_FLAG = "_perfetto_dcp_wrapped"
+
 # Marker prefix so the DCP-internal regions are easy to spot/group in the trace.
 _PREFIX = "dcp."
 
@@ -239,6 +277,44 @@ def _instrument(storage_reader, planner) -> None:
         _wrap_instance_method(planner, name)
 
 
+def _patch_dist_wrapper_collectives() -> None:
+    """Wrap ``_DistWrapper`` collective methods with ``trace_region`` markers.
+
+    Patches the class (not instances) so every ``_DistWrapper`` built inside
+    ``_load_state_dict`` is covered. Idempotent: each wrapped method carries a
+    flag so re-patching is a no-op. Best-effort -- if the import or a method is
+    missing on this PyT version we just skip it.
+    """
+    try:
+        from torch.distributed.checkpoint.utils import _DistWrapper
+    except Exception:
+        return
+
+    def _wrap(name: str, label_from_args) -> None:
+        orig = _DistWrapper.__dict__.get(name)
+        if orig is None or getattr(orig, _DIST_WRAPPER_WRAPPED_FLAG, False):
+            return
+
+        @functools.wraps(orig)
+        def _traced(self, *args, **kwargs):
+            with trace_region(label_from_args(args)):
+                return orig(self, *args, **kwargs)
+
+        setattr(_traced, _DIST_WRAPPER_WRAPPED_FLAG, True)
+        setattr(_DistWrapper, name, _traced)
+
+    for name in _DIST_WRAPPER_STEP_METHODS:
+        # First positional arg is the phase name (a short str, e.g. "plan").
+        _wrap(
+            name,
+            lambda args, _name=name: (
+                f"{_PREFIX}{_name}:{args[0]}" if args else f"{_PREFIX}{_name}"
+            ),
+        )
+    for name in _DIST_WRAPPER_PRIMITIVE_METHODS:
+        _wrap(name, lambda args, _name=name: f"{_PREFIX}{_name}")
+
+
 def apply_torch_dcp_load_trace_patch() -> None:
     """Patch ``_load_state_dict`` to emit per-phase Perfetto regions.
 
@@ -249,6 +325,10 @@ def apply_torch_dcp_load_trace_patch() -> None:
     global _patched
     if _patched or not _tracing_enabled():
         return
+
+    # Break open the cross-rank collective planning/read phases (the gap between
+    # prepare_local_plan and finish_plan/read_data). See module docstring.
+    _patch_dist_wrapper_collectives()
 
     import torch.distributed.checkpoint.state_dict_loader as _sdl
 
