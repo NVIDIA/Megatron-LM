@@ -40,7 +40,7 @@ MODEL_ARGS:
   --exit-duration-in-mins: 220
   --no-check-for-nan-in-loss-and-grad: true
   --cross-entropy-loss-fusion: true
-  --cross-entropy-fusion-impl: te
+  --cross-entropy-fusion-impl: native
   --manual-gc: true
   --manual-gc-interval: 10
 
