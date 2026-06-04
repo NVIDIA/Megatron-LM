@@ -214,9 +214,9 @@ from megatron.core.rerun_state_machine import (
 from megatron.core.resharding.refit import swap_model_weights
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossLoggingHelper
 from megatron.core.transformer.moe import upcycling_utils
-from megatron.core.transformer.moe.moe_utils import clear_aux_losses_tracker, track_moe_metrics
+from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
-from megatron.core.utils import get_batch_on_this_cp_rank, get_batch_on_this_tp_rank
+from megatron.core.utils import get_batch_on_this_cp_rank, get_batch_on_this_tp_rank, unwrap_model
 from megatron.training.config import FaultInjectorConfig
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
 from megatron.training.initialize import (
@@ -275,7 +275,6 @@ from .utils import (
     reduce_max_stat_across_model_parallel_group,
     report_memory,
     to_empty_if_meta_device,
-    unwrap_model,
     update_use_dist_ckpt,
 )
 
@@ -1115,7 +1114,7 @@ def pretrain(
 
 
     if cfg_container.logger.log_progress:
-        append_to_progress_log("Starting job")
+        append_to_progress_log(args.save, "Starting job")
 
     # Set pytorch JIT layer fusion options and warmup JIT functions.
     set_jit_fusion_options()
@@ -1922,6 +1921,16 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
         kwargs["megatron_fsdp_main_grads_dtype"] = args.megatron_fsdp_main_grads_dtype
         kwargs["megatron_fsdp_grad_comm_dtype"] = args.megatron_fsdp_grad_comm_dtype
         kwargs["megatron_fsdp_use_decoupled_grad"] = args.use_precision_aware_optimizer
+        if args.use_megatron_fsdp and args.cuda_graph_impl != "none":
+            # Run Megatron-FSDP in CUDA graph-safe mode. Avoids some graph-unsafe host-side
+            # operations (such as pointer dereferencing) that can break CUDA graph replay.
+            kwargs["megatron_fsdp_cuda_graph_mode"] = True
+            if args.cuda_graph_impl == "full_iteration":
+                # When using full-iteration CUDA graphs, Megatron-FSDP should not AG parameters
+                # during start_param_sync(), which is called during the DistOpt.step(). This
+                # causes an error when we wait() on a CUDA kernel launched in a stream beyond
+                # the scope of the full-iter / FWD-BWD CUDA graph capture.
+                kwargs["fsdp_all_gather_in_start_param_sync"] = False
 
         return DistributedDataParallelConfig(**kwargs)
 
@@ -2194,10 +2203,16 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         # 1. The first iteration's params are already in param.data (from init or checkpoint).
         # 2. Without forward_pre_hook, finish_param_sync() won't be called to zero the grad buffer,
         #    so the main grads will be polluted by the main params.
+        #
+        # Exception: when a full-iteration CUDA graph has been captured, the all-gather
+        # and subsequent param_data zero are baked into the graph and replay
+        # unconditionally. We must populate param_data so the replayed AG gathers
+        # correct weights, even when forward pre-hooks are disabled.
         if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
             # Check if forward_pre_hook is enabled by checking if hooks are registered.
             forward_pre_hook_enabled = len(model[0].remove_forward_pre_hook_handles) > 0
-            if forward_pre_hook_enabled:
+            full_cg_captured = FullCudaGraphWrapper.cuda_graph.get("training") is not None
+            if forward_pre_hook_enabled or full_cg_captured:
                 for optim_instance in optimizer.chained_optimizers:
                     if isinstance(optim_instance, DistributedOptimizer):
                         optim_instance._copy_main_params_to_param_buffer()
@@ -2520,8 +2535,8 @@ def training_log(
             writer.add_scalar('max_attention_logit', max_attention_logit, iteration)
             if wandb_writer:
                 wandb_writer.log({'max_attention_logit': max_attention_logit}, iteration)
-
     # Log MoE metrics.
+    moe_log_string = ""
     if args.num_experts is not None:
         moe_loss_scale = 1 / get_num_microbatches()
         track_names = []
@@ -2545,12 +2560,11 @@ def training_log(
         else:
             layers = args.num_layers
 
-        track_moe_metrics(
+        moe_log_string = get_moe_metrics_tracker().report(
             loss_scale=moe_loss_scale,
             iteration=iteration,
             writer=writer,
             wandb_writer=wandb_writer,
-            total_loss_dict=total_loss_dict,
             per_layer_logging=args.moe_per_layer_logging,
             force_initialize=True,
             track_names=track_names,
@@ -2558,6 +2572,7 @@ def training_log(
             moe_layer_freq=args.moe_layer_freq,
             mtp_num_layers=args.mtp_num_layers,
             pg_collection=pg_collection,
+            total_loss_dict=total_loss_dict,
         )
 
     # Log MTP metrics.
@@ -2650,6 +2665,8 @@ def training_log(
                     log_string += ' {}: {:.6E} |'.format(key, avg)
                 if should_reset:
                     total_loss_dict[key] = torch.tensor([0.0], dtype=torch.float, device='cuda')
+        if args.num_experts is not None and moe_log_string:
+            log_string += moe_log_string
         log_string += f' loss scale: {loss_scale:.1f} |'
         if grad_norm is not None:
             log_string += f' grad norm: {grad_norm:.3f} |'
@@ -2723,6 +2740,7 @@ def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point
     tokens_so_far = args.consumed_train_samples * args.seq_length
     saved_ckpt_prefix = 'Saving async checkpoint' if args.async_save else 'Saved checkpoint'
     append_to_progress_log(
+        args.save,
         f"{saved_ckpt_prefix}\tIteration: {iteration}\t"
         f"Job throughput: {job_throughput:.1f} TFLOP/s/GPU\t"
         f"Cumulative throughput: {cumulative_throughput:.1f} TFLOP/s/GPU\t"
@@ -3276,7 +3294,7 @@ def train(
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
             cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
-            use_single_mempool=args.cuda_graph_use_single_mempool,
+            use_single_mempool=config.cuda_graph_use_single_mempool,
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
     if args.moe_expert_rank_capacity_factor is not None:
@@ -3292,7 +3310,7 @@ def train(
         optimizer.step = OptimizerCudaGraphWrapper(
             optimizer.step,
             cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
-            use_single_mempool=args.cuda_graph_use_single_mempool,
+            use_single_mempool=config.cuda_graph_use_single_mempool,
         )
 
     def get_e2e_base_metrics():
@@ -3663,6 +3681,14 @@ def train(
             if args.log_energy:
                 energy_monitor.pause()
             timers('interval-time').stop()
+            if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
+                # disable_forward_pre_hook(param_sync=True) below force-syncs params for eval.
+                # Copy the main params to param buffer before the forced AllGather.
+                for model_chunk in model:
+                    model_chunk.zero_grad_buffer()
+                for optim_instance in optimizer.chained_optimizers:
+                    if isinstance(optim_instance, DistributedOptimizer):
+                        optim_instance._copy_main_params_to_param_buffer()
             if should_disable_forward_pre_hook(args):
                 disable_forward_pre_hook(model)
                 pre_hook_enabled = False
@@ -3714,7 +3740,7 @@ def train(
             if args.log_energy:
                 energy_monitor.resume()
             if args.num_experts is not None:
-                clear_aux_losses_tracker()
+                get_moe_metrics_tracker().clear()
 
         # Miscellaneous post-training-step functions (e.g., FT heartbeats, GC).
         # Some of these only happen at specific iterations. Capture updated FLOPs accumulator
@@ -3833,7 +3859,7 @@ def evaluate(
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
             cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
-            use_single_mempool=args.cuda_graph_use_single_mempool,
+            use_single_mempool=config.cuda_graph_use_single_mempool,
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
     if args.moe_expert_rank_capacity_factor is not None:

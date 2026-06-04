@@ -10,6 +10,7 @@ spec:
   gpus: 8
   platforms: dgx_h100
   script_setup: |
+    set -euo pipefail
     unset https_proxy
     echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
 
@@ -30,6 +31,7 @@ spec:
       --repo $MCORE_REPO
 
   script: |-
+    set -euo pipefail
     ls
 
     TAG={tag}
@@ -42,15 +44,6 @@ spec:
     else
         TEST_PATH="/opt/megatron-lm-legacy/"
     fi
-
-    # Enable TE's cuDSL fused grouped MLP path for MoE buckets. The kernel
-    # additionally requires SM100 (Blackwell), so on H100/A100 CI this is a
-    # no-op; setting it here means the kernel is picked up automatically when
-    # Blackwell hardware joins the unit-test matrix.
-    if [[ "$BUCKET" == *"transformer/moe"* || "$BUCKET" == *"test_moe_experts"* ]]; then
-        export NVTE_CUTEDSL_FUSED_GROUPED_MLP=1
-    fi
-
 
     bash $TEST_PATH/tests/unit_tests/run_ci_test.sh \
       --tag $TAG \
@@ -137,6 +130,20 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
+  - test_case: [tests/unit_tests/inference/engines/test_dynamic_engine.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest, legacy]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/inference/test_hybrid_moe.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   - test_case: [tests/unit_tests/inference/**/*.py]
     products:
       - environment: [lts, dev]
@@ -165,6 +172,13 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
+  - test_case: [tests/unit_tests/ssm/test_gated_delta_net.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   - test_case: [tests/unit_tests/ssm/**/*.py]
     products:
       - environment: [lts, dev]
@@ -183,6 +197,13 @@ products:
     products:
       - environment: [lts, dev]
         tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/a2a_overlap/**/*.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest, legacy]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
