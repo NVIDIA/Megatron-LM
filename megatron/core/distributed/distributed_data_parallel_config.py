@@ -206,6 +206,12 @@ class DistributedDataParallelConfig:
       main gradients to parameter dtype for `.grad`.
     """
 
+    megatron_fsdp_prefetch_recompute_forward_weights: bool = False
+    """If set to True, Megatron-FSDP prefetches rowwise weights needed by activation
+      recomputation during backward before prefetching backward transpose weights. This
+      also caches parameter bucket views to reduce repeated Python-side view setup.
+    """
+
     def __post_init__(self):
         import os
 
