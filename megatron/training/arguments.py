@@ -1268,6 +1268,25 @@ def validate_args(args, defaults={}):
             args.ckpt_format == "fsdp_dtensor"
         ), "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
 
+        if args.megatron_fsdp_prefetch_recompute_forward_weights:
+            assert args.data_parallel_sharding_strategy == "optim_grads_params", (
+                "--megatron-fsdp-prefetch-recompute-forward-weights is only supported "
+                'with --data-parallel-sharding-strategy optim_grads_params.'
+            )
+            assert args.recompute_granularity == "full", (
+                "--megatron-fsdp-prefetch-recompute-forward-weights is only supported "
+                "with full activation recomputation."
+            )
+            assert not args.overlap_moe_expert_parallel_comm, (
+                "--megatron-fsdp-prefetch-recompute-forward-weights is not supported "
+                "with --overlap-moe-expert-parallel-comm."
+            )
+    else:
+        assert not args.megatron_fsdp_prefetch_recompute_forward_weights, (
+            "--megatron-fsdp-prefetch-recompute-forward-weights requires "
+            "--use-megatron-fsdp."
+        )
+
     if args.nccl_ub and args.use_megatron_fsdp:
         # In Megatron-LM, required implementation for manual registration is already provided.
         # So we enable the manual registration by default when nccl-ub and use_megatron_fsdp is set.
