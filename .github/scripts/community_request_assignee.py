@@ -358,6 +358,7 @@ def build_slack_message(issue: IssueContext, plan: AssignmentPlan) -> str:
         return (
             f"You have been automatically assigned to community issue: <{issue.url}|{issue.url}>.\n\n"
             "Claude has determined that you are the best individual to answer this community issue. "
+            "Please take action at your earliest convenience, at latest within 1 business day. "
             "If Claude has made a mistake or if you are unsure how to proceed, please reach out to "
             "@mcore-oncall directly."
         )
