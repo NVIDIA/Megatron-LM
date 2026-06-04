@@ -8,6 +8,7 @@ Additionally, `load` expects the sharded state dict argument as a guidance for
 loading the sharded tensors.
 """
 
+import io
 import logging
 import os
 from pathlib import Path
@@ -31,7 +32,11 @@ from .mapping import (
 from .state_dict_utils import load_preprocess, save_preprocess
 from .strategies.async_utils import AsyncRequest
 from .strategies.common import COMMON_STATE_FNAME, load_common
-from .strategies.torch import TorchDistLoadShardedStrategy, TorchDistSaveShardedStrategy
+from .strategies.torch import (
+    _get_filesystem_reader,
+    TorchDistLoadShardedStrategy,
+    TorchDistSaveShardedStrategy,
+)
 from .utils import extract_sharded_base, force_all_tensors_to_non_fp8
 from .validation import (
     StrictHandling,
@@ -203,30 +208,14 @@ def load_common_state_dict(checkpoint_dir: Union[str, Path]) -> StateDict:
     if _legacy_common_state_exists(checkpoint_dir):
         return load_common(checkpoint_dir)
 
-    # Current format: common data is a single ShardedObject. Read just that BytesIO
-    # object directly via PyTorch DCP with no_dist=True, so it works even before
-    # torch.distributed is initialized (e.g. the load_args_from_checkpoint rank-0 peek).
-    # Going through the torch_dist strategy here would call torch.distributed.get_rank()
-    # unconditionally and fail when no process group exists.
-    import io
-
-    import torch.distributed.checkpoint as dcp
-
-    from .strategies.torch import _get_filesystem_reader
-
-    # global_shape/offset must match what `save` used so the DCP key matches
-    # (ShardedObject.unique_key -> "common_state/0_1").
     unique_key = ShardedObject("common_state", None, (1,), (0,)).unique_key
     pyt_state_dict = {unique_key: io.BytesIO()}
-    dcp.load(
+    torch.distributed.checkpoint.load(
         pyt_state_dict,
         storage_reader=_get_filesystem_reader(checkpoint_dir),
         no_dist=True,
     )
 
-    # The save side serialized the common dict as a single-element list (one ShardedObject
-    # shard). DCP's default planner deserializes the BytesIO via torch.load on load, but
-    # guard for versions that leave raw bytes in place.
     loaded = pyt_state_dict[unique_key]
     if isinstance(loaded, io.BytesIO):
         loaded.seek(0)
