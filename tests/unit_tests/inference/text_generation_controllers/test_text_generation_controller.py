@@ -1294,6 +1294,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             block_size_tokens=4,
             enable_prefix_caching=True,
             max_requests=16,
+            mtp_num_layers=2,
         )
 
         ctx = self.text_generation_controller.inference_wrapped_model.inference_context
@@ -1343,6 +1344,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             num_speculative_tokens=3,
             block_size_tokens=4,
             max_requests=16,
+            mtp_num_layers=3,
         )
 
         ctx = self.text_generation_controller.inference_wrapped_model.inference_context
