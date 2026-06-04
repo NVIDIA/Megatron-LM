@@ -561,9 +561,9 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
         }
 
         def _broadcast_cu_seqlens(cu_seqlens):
-            if any(s.name == 'full_iteration' for s in args.cuda_graph_scope):
+            if getattr(args, 'cuda_graph_impl', 'none') == 'full_iteration':
                 assert cu_seqlens is None, (
-                    "cu_seqlens is not supported with cuda_graph_scope=full_iteration"
+                    "cu_seqlens is not supported with cuda_graph_impl=full_iteration"
                 )
                 return
             dev = torch.cuda.current_device()
@@ -647,7 +647,7 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
         )
 
         def _broadcast_cu_seqlens():
-            if any(s.name == 'full_iteration' for s in args.cuda_graph_scope):
+            if getattr(args, 'cuda_graph_impl', 'none') == 'full_iteration':
                 return None
             dev = torch.cuda.current_device()
 
