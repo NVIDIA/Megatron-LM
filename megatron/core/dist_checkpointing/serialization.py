@@ -29,7 +29,7 @@ from .mapping import (
 )
 from .state_dict_utils import load_preprocess, save_preprocess
 from .strategies.async_utils import AsyncRequest
-from .strategies.common import load_common, save_common
+from .strategies.common import load_common
 from .strategies.torch import TorchDistLoadShardedStrategy, TorchDistSaveShardedStrategy
 from .utils import extract_sharded_base, force_all_tensors_to_non_fp8
 from .validation import (
@@ -55,7 +55,6 @@ def load(
     sharded_state_dict: ShardedStateDict,
     checkpoint_dir: str,
     sharded_strategy: TorchDistLoadShardedStrategy = None,
-    common_strategy: None = None,
     validate_access_integrity: bool = True,
     strict: Union[str, StrictHandling] = StrictHandling.ASSUME_OK_UNEXPECTED,
     verify_integrity: bool = False,
@@ -80,8 +79,6 @@ def load(
         checkpoint_dir (str): directory with the checkpoint
         sharded_strategy (LoadShardedStrategy, Tuple[str, int], optional):
             configures loading behavior for sharded tensors
-        common_strategy (LoadCommonStrategy, Tuple[str, int], optional):
-            configures loading behavior for common data
         validate_access_integrity (bool default = True): checks if each tensor shard is accessed
             exactly once (as main replica) by some process
         strict (StrictHandling, str, optional): determines the behavior in case of a mismatch
@@ -101,7 +98,6 @@ def load(
         StateDict or Tuple[StateDict, Set[str], Set[str]]: in most cases only
             the loaded state dict is returned. If `strict` flag was set to
     """
-    assert common_strategy is None
 
     verify_checkpoint(checkpoint_dir)
     if verify_integrity:
@@ -120,11 +116,13 @@ def load(
     #      amax_history buffer of Transformer Engine, which is undesirable.
     force_all_tensors_to_non_fp8(sharded_state_dict)
 
-    common_state_dict = load_common(checkpoint_dir)
-
     sharded_state_dict, nonpersistent_state_dict, sh_ten_factories = load_preprocess(
         sharded_state_dict
     )
+    if "common_state" in sharded_state_dict:
+        common_state_dict = sharded_state_dict["common_state"]
+    else:
+        common_state_dict = load_common(checkpoint_dir)
     merge(common_state_dict, nonpersistent_state_dict)
 
     # At this point we are only dealing with ShardedBase objects
@@ -301,7 +299,6 @@ def save(
     sharded_state_dict: ShardedStateDict,
     checkpoint_dir: str,
     sharded_strategy: TorchDistSaveShardedStrategy = None,
-    common_strategy: None = None,
     validate_access_integrity: bool = True,
     async_sharded_save: bool = False,
     preprocess_common_before_consistancy_check: Optional[
@@ -340,8 +337,6 @@ def save(
         checkpoint_dir (str): directory to save the checkpoint to
         sharded_strategy (SaveShardedStrategy, Tuple[str, int], optional):
             configures sharded tensors saving behavior and backend
-        common_strategy (SaveCommonStrategy, Tuple[str, int], optional):
-            configures common data saving behavior and backend
         validate_access_integrity (bool default = True): checks if each tensor shard is accessed
             exactly once (as main replica) by some process.
             It also makes sure the common state dict is consistant across all ranks
@@ -381,8 +376,6 @@ def save(
             if torch.distributed.get_rank() == 0:
                 logger.warning("Overwriting old incomplete / corrupted checkpoint...")
 
-    assert common_strategy is None
-
     if not (
         isinstance(sharded_strategy, TorchDistSaveShardedStrategy)
         or isinstance(sharded_strategy, FullyParallelSaveStrategyWrapper)
@@ -392,11 +385,11 @@ def save(
     if content_metadata is not None:
         sharded_state_dict[_CONTENT_METADATA_KEY] = content_metadata
 
+    sharded_state_dict["common_state"] = state_dict
+
     sharded_state_dict, state_dict = save_preprocess(
         sharded_state_dict, validate_access_integrity, preprocess_common_before_consistancy_check
     )
-
-    save_common(state_dict, checkpoint_dir)
 
     def metadata_finalize_fn():
         if torch.distributed.get_rank() == 0:

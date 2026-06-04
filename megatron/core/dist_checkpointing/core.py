@@ -23,7 +23,7 @@ class CheckpointingConfig:
     """Documents backends used in the checkpoint.
 
     Checkpoint config keeps track of formats used for storing the sharded tensors
-    (sharded_backend) and other objects (common_backend).
+    (sharded_backend).
 
     Note that versioning is not for the checkpoint content (which is application specific),
     but for the checkpoint format itself.
@@ -31,8 +31,6 @@ class CheckpointingConfig:
 
     sharded_backend: str
     sharded_backend_version: int = 1
-    common_backend: str = 'torch'
-    common_backend_version: int = 1
 
 
 def check_is_distributed_checkpoint(checkpoint_dir):
