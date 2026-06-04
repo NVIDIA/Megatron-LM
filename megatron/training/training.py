@@ -2704,6 +2704,15 @@ def training_log(
     one_logger = get_one_logger()
     energy_monitor = get_energy_monitor()
 
+    def _scalarize_optional_stat(stat):
+        if isinstance(stat, torch.Tensor):
+            return stat.detach().item()
+        return stat
+
+    grad_norm = _scalarize_optional_stat(grad_norm)
+    params_norm = _scalarize_optional_stat(params_norm)
+    num_zeros_in_grad = _scalarize_optional_stat(num_zeros_in_grad)
+
     # On first iteration, log stats but don't reset accumulators so normal interval stats remain accurate.
     should_reset = not is_first_iteration
 

@@ -107,6 +107,95 @@ BATCH_KEYS = [
 ]
 
 
+def _apply_legacy_identity_sft_tokenizer_patch(args: Any) -> None:
+    """Restore legacy target masking for identity SFT without editing tokenizer source."""
+    if not getattr(args, "sft", False):
+        return
+    if getattr(args, "sft_tokenizer_prompt_format", None) != "identity":
+        return
+
+    import numpy as np
+
+    from megatron.core.tokenizers.text.libraries.sft_tokenizer import IGNORE_INDEX, SFTTokenizer
+
+    if getattr(SFTTokenizer, "_legacy_identity_runtime_patch_applied", False):
+        return
+
+    original_tokenize_conversation = SFTTokenizer.tokenize_conversation
+
+    def tokenize_conversation_with_legacy_identity_masking(
+        self, conversation, return_target, add_generation_prompt
+    ):
+        if self._prompt_format != "identity":
+            return original_tokenize_conversation(
+                self, conversation, return_target, add_generation_prompt
+            )
+
+        # Skip system message if the tokenizer doesn't have a system role.
+        if not self._prompt_config.has_system_role and conversation[0]["role"] == "system":
+            conversation = conversation[1:]
+
+        tokens = self._extract_token_ids(
+            self._tokenizer.apply_chat_template(
+                conversation,
+                tokenize=True,
+                add_generation_prompt=add_generation_prompt,
+                return_assistant_token_mask=False,
+                return_tensors="np",
+                chat_template=self._prompt_config.custom_chat_template,
+            )
+        )
+
+        if not return_target:
+            return tokens
+
+        target = tokens.copy()
+
+        idx = 0
+        for turn_idx, turn in enumerate(conversation):
+
+            if turn["role"].lower() == "assistant" and len(turn["content"]) == 0:
+                raise ValueError(f"empty assistant turn in conversation: {conversation}.")
+            if turn["role"].lower() == "assistant":
+                assert conversation[turn_idx - 1]["role"].lower() in ("user", "tool")
+
+            turn_tokens = self._extract_token_ids(
+                self._tokenizer.apply_chat_template(
+                    [turn], tokenize=True, chat_template=self._prompt_config.custom_chat_template
+                )
+            )
+
+            # There should be only one BOS at the very beginning.
+            # After the first turn, skip BOS token.
+            if self._prompt_config.has_bos and turn_idx > 0:
+                turn_tokens = turn_tokens[1:]
+            turn_len = len(turn_tokens)
+
+            role = turn["role"].lower()
+            if role in ("system", "user", "tool"):
+                target[idx : idx + turn_len] = IGNORE_INDEX
+            elif role == "assistant":
+                if self._prompt_config.assistant_prefix_len > 0:
+                    target[idx : idx + self._prompt_config.assistant_prefix_len] = IGNORE_INDEX
+            else:
+                raise ValueError("Wrong role value.")
+
+            assert np.allclose(
+                tokens[idx : idx + turn_len], turn_tokens
+            ), f"expected turn tokens to match tokens in conversation {conversation}"
+
+            idx += turn_len
+
+        assert idx == len(tokens), f"mismatch in target masking the conversation {conversation}"
+
+        return tokens, target
+
+    SFTTokenizer._legacy_identity_tokenize_conversation = original_tokenize_conversation
+    SFTTokenizer.tokenize_conversation = tokenize_conversation_with_legacy_identity_masking
+    SFTTokenizer._legacy_identity_runtime_patch_applied = True
+    print_rank_0("Applied legacy identity SFTTokenizer runtime patch.")
+
+
 def get_batch(data_iterator, vp_stage=None):
     """Generate a batch."""
 
@@ -472,6 +561,7 @@ if __name__ == "__main__":
         extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
+    _apply_legacy_identity_sft_tokenizer_patch(args)
     if has_nvidia_modelopt:
         maybe_enable_modelopt(args)
     if has_nvidia_modelopt and getattr(args, "modelopt_enabled", False):
