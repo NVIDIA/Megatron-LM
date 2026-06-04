@@ -53,6 +53,7 @@ def test_create_assignment_plan_uses_high_confidence_candidate(monkeypatch):
     )
 
     monkeypatch.setattr(module, "check_assignable", lambda issue, login: True)
+    monkeypatch.setattr(module, "get_team_members", lambda org, team_slug: set())
 
     plan = module.create_assignment_plan(
         {
@@ -69,6 +70,118 @@ def test_create_assignment_plan_uses_high_confidence_candidate(monkeypatch):
     assert plan.assignees == ["alice"]
     assert plan.notify_users == ["alice"]
     assert plan.confidence == 0.91
+
+
+def test_create_assignment_plan_prioritizes_rotation_candidate(monkeypatch):
+    module = load_assignee_module()
+    issue = module.IssueContext(
+        owner="NVIDIA",
+        repo="Megatron-LM",
+        number=126,
+        title="Transformer bug",
+        url="https://github.com/NVIDIA/Megatron-LM/issues/126",
+        author="external-user",
+    )
+
+    monkeypatch.setattr(module, "check_assignable", lambda issue, login: True)
+    monkeypatch.setattr(
+        module,
+        "get_team_members",
+        lambda org, team_slug: {"bob"} if team_slug == module.PREFERRED_ASSIGNEE_TEAM_SLUG else set(),
+    )
+
+    plan = module.create_assignment_plan(
+        {
+            "assignee": "alice",
+            "candidate_assignees": [
+                {"login": "alice", "confidence": 0.93, "rationale": "Most recent blame."},
+                {"login": "bob", "confidence": 0.88, "rationale": "CODEOWNERS and recent commits."},
+            ],
+            "confidence": 0.93,
+            "fallback_to_oncall": False,
+            "rationale": "Both candidates have relevant history.",
+            "relevant_paths": ["megatron/core/transformer/attention.py"],
+        },
+        issue,
+    )
+
+    assert plan.mode == "candidate"
+    assert plan.assignees == ["bob"]
+    assert plan.notify_users == ["bob"]
+    assert plan.confidence == 0.88
+
+
+def test_create_assignment_plan_keeps_clearly_stronger_non_rotation_candidate(monkeypatch):
+    module = load_assignee_module()
+    issue = module.IssueContext(
+        owner="NVIDIA",
+        repo="Megatron-LM",
+        number=127,
+        title="Transformer bug",
+        url="https://github.com/NVIDIA/Megatron-LM/issues/127",
+        author="external-user",
+    )
+
+    monkeypatch.setattr(module, "check_assignable", lambda issue, login: True)
+    monkeypatch.setattr(
+        module,
+        "get_team_members",
+        lambda org, team_slug: {"bob"} if team_slug == module.PREFERRED_ASSIGNEE_TEAM_SLUG else set(),
+    )
+
+    plan = module.create_assignment_plan(
+        {
+            "assignee": "alice",
+            "candidate_assignees": [
+                {"login": "alice", "confidence": 0.95, "rationale": "Most recent blame."},
+                {"login": "bob", "confidence": 0.80, "rationale": "Some relevant commits."},
+            ],
+            "confidence": 0.95,
+            "fallback_to_oncall": False,
+            "rationale": "Alice has substantially stronger ownership evidence.",
+            "relevant_paths": ["megatron/core/transformer/attention.py"],
+        },
+        issue,
+    )
+
+    assert plan.mode == "candidate"
+    assert plan.assignees == ["alice"]
+    assert plan.notify_users == ["alice"]
+    assert plan.confidence == 0.95
+
+
+def test_create_assignment_plan_continues_when_rotation_team_unavailable(monkeypatch):
+    module = load_assignee_module()
+    issue = module.IssueContext(
+        owner="NVIDIA",
+        repo="Megatron-LM",
+        number=128,
+        title="Transformer bug",
+        url="https://github.com/NVIDIA/Megatron-LM/issues/128",
+        author="external-user",
+    )
+
+    def fail_team_lookup(org, team_slug):
+        raise SystemExit(1)
+
+    monkeypatch.setattr(module, "check_assignable", lambda issue, login: True)
+    monkeypatch.setattr(module, "get_team_members", fail_team_lookup)
+
+    plan = module.create_assignment_plan(
+        {
+            "assignee": "alice",
+            "candidate_assignees": [{"login": "alice", "confidence": 0.92, "rationale": "Recent blame."}],
+            "confidence": 0.92,
+            "fallback_to_oncall": False,
+            "rationale": "Alice has relevant history.",
+            "relevant_paths": ["megatron/core/transformer/attention.py"],
+        },
+        issue,
+    )
+
+    assert plan.mode == "candidate"
+    assert plan.assignees == ["alice"]
+    assert plan.notify_users == ["alice"]
 
 
 def test_create_assignment_plan_falls_back_to_assignable_oncall(monkeypatch):

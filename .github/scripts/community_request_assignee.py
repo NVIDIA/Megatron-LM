@@ -36,8 +36,10 @@ except ImportError:  # pragma: no cover - workflow installs slack-sdk.
 
 GITHUB_API_URL = "https://api.github.com"
 ACTIVE_ONCALL_TEAM_SLUG = "mcore-oncall"
+PREFERRED_ASSIGNEE_TEAM_SLUG = "mcore-oncall-rotation"
 MCORE_ONCALL_SLACK_USERGROUP_ID = "S0A7B4U1T3P"
 CONFIDENCE_THRESHOLD = 0.75
+PREFERRED_ASSIGNEE_CONFIDENCE_DELTA = 0.10
 SERVICE_ACCOUNT_LOGINS = {"svcnvidia-nemo-ci"}
 
 _email_cache = {}
@@ -66,6 +68,14 @@ class AssignmentPlan:
     confidence: float
     rationale: str
     relevant_paths: list[str]
+
+
+@dataclass(frozen=True)
+class CandidateAssignee:
+    """Potential assignee from Claude's ranked analysis."""
+
+    login: str
+    confidence: float
 
 
 def get_required_env(name: str) -> str:
@@ -157,13 +167,17 @@ def human_members(members: set[str] | list[str]) -> list[str]:
     return sorted(member for member in members if not is_service_account(member))
 
 
-def analysis_confidence(analysis: dict) -> float:
+def confidence_value(value, default: float = 0.0) -> float:
     try:
-        confidence = float(analysis.get("confidence", 0.0))
+        confidence = float(value)
     except (TypeError, ValueError):
-        confidence = 0.0
+        confidence = default
 
     return max(0.0, min(confidence, 1.0))
+
+
+def analysis_confidence(analysis: dict) -> float:
+    return confidence_value(analysis.get("confidence", 0.0))
 
 
 def analysis_relevant_paths(analysis: dict) -> list[str]:
@@ -187,6 +201,41 @@ def should_use_candidate(analysis: dict, confidence_threshold: float = CONFIDENC
     if bool(analysis.get("fallback_to_oncall", False)):
         return False
     return analysis_confidence(analysis) >= confidence_threshold
+
+
+def analysis_candidate_assignees(analysis: dict) -> list[CandidateAssignee]:
+    default_confidence = analysis_confidence(analysis)
+    raw_candidates = analysis.get("candidate_assignees", [])
+    if not isinstance(raw_candidates, list):
+        raw_candidates = []
+
+    candidates = []
+    for raw_candidate in raw_candidates:
+        if isinstance(raw_candidate, str):
+            login = normalize_login(raw_candidate)
+            confidence = default_confidence
+        elif isinstance(raw_candidate, dict):
+            login = normalize_login(raw_candidate.get("login") or raw_candidate.get("assignee"))
+            confidence = confidence_value(raw_candidate.get("confidence"), default=default_confidence)
+        else:
+            continue
+
+        if login and not is_service_account(login):
+            candidates.append(CandidateAssignee(login=login, confidence=confidence))
+
+    legacy_candidate = normalize_login(analysis.get("assignee"))
+    if legacy_candidate and not is_service_account(legacy_candidate):
+        candidates.append(CandidateAssignee(login=legacy_candidate, confidence=default_confidence))
+
+    deduped_candidates = []
+    seen_logins = set()
+    for candidate in candidates:
+        if candidate.login in seen_logins:
+            continue
+        deduped_candidates.append(candidate)
+        seen_logins.add(candidate.login)
+
+    return deduped_candidates
 
 
 def check_assignable(issue: IssueContext, login: str) -> bool:
@@ -223,6 +272,45 @@ def get_team_members(org: str, team_slug: str) -> set[str]:
     return members
 
 
+def get_preferred_assignee_members(org: str) -> set[str]:
+    try:
+        return set(human_members(get_team_members(org, PREFERRED_ASSIGNEE_TEAM_SLUG)))
+    except SystemExit:
+        print(f"Warning: Could not read {PREFERRED_ASSIGNEE_TEAM_SLUG}; continuing without preferred-team bias")
+        return set()
+
+
+def select_candidate_assignee(analysis: dict, issue: IssueContext) -> CandidateAssignee | None:
+    if bool(analysis.get("fallback_to_oncall", False)):
+        return None
+
+    assignable_candidates = []
+    for candidate in analysis_candidate_assignees(analysis):
+        if candidate.confidence < CONFIDENCE_THRESHOLD:
+            continue
+        if check_assignable(issue, candidate.login):
+            assignable_candidates.append(candidate)
+
+    if not assignable_candidates:
+        return None
+
+    top_confidence = max(candidate.confidence for candidate in assignable_candidates)
+    preferred_members = get_preferred_assignee_members(issue.owner)
+    for candidate in assignable_candidates:
+        if (
+            candidate.login in preferred_members
+            and candidate.confidence >= top_confidence - PREFERRED_ASSIGNEE_CONFIDENCE_DELTA
+        ):
+            if candidate.login != assignable_candidates[0].login:
+                print(
+                    f"Prioritizing {candidate.login} because they are in "
+                    f"{PREFERRED_ASSIGNEE_TEAM_SLUG}"
+                )
+            return candidate
+
+    return assignable_candidates[0]
+
+
 def assign_issue(issue: IssueContext, assignees: list[str], dry_run: bool = False) -> None:
     if not assignees:
         print("No assignable users found; skipping issue assignment")
@@ -238,22 +326,26 @@ def assign_issue(issue: IssueContext, assignees: list[str], dry_run: bool = Fals
 
 def create_assignment_plan(analysis: dict, issue: IssueContext) -> AssignmentPlan:
     confidence = analysis_confidence(analysis)
-    candidate = normalize_login(analysis.get("assignee"))
+    candidate = select_candidate_assignee(analysis, issue)
     rationale = analysis_rationale(analysis)
     relevant_paths = analysis_relevant_paths(analysis)
 
-    if should_use_candidate(analysis) and candidate and check_assignable(issue, candidate):
+    if candidate:
         return AssignmentPlan(
             mode="candidate",
-            assignees=[candidate],
-            notify_users=[candidate],
-            confidence=confidence,
+            assignees=[candidate.login],
+            notify_users=[candidate.login],
+            confidence=candidate.confidence,
             rationale=rationale,
             relevant_paths=relevant_paths,
         )
 
-    if candidate:
-        print(f"Falling back to {ACTIVE_ONCALL_TEAM_SLUG}; candidate was {candidate} with confidence {confidence:.2f}")
+    candidate_logins = [candidate.login for candidate in analysis_candidate_assignees(analysis)]
+    if candidate_logins:
+        print(
+            f"Falling back to {ACTIVE_ONCALL_TEAM_SLUG}; candidates were "
+            f"{', '.join(candidate_logins)} with top-level confidence {confidence:.2f}"
+        )
     else:
         print(f"Falling back to {ACTIVE_ONCALL_TEAM_SLUG}; Claude did not provide a usable candidate")
 
