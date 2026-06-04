@@ -68,13 +68,7 @@ def _rank_offsets():
 
 
 def _template(
-    value=0.0,
-    *,
-    dtype=torch.float32,
-    extra_value=0.0,
-    include_bias=True,
-    shape=(2, 2),
-    device=None,
+    value=0.0, *, dtype=torch.float32, extra_value=0.0, include_bias=True, shape=(2, 2), device=None
 ):
     rank_offsets = _rank_offsets()
     model_state_dict = {
@@ -154,10 +148,7 @@ def _generated_moe_gpt_model_state(value):
     )
     model = GPTModel(
         config=config,
-        transformer_layer_spec=get_gpt_layer_local_spec(
-            num_experts=2,
-            moe_grouped_gemm=False,
-        ),
+        transformer_layer_spec=get_gpt_layer_local_spec(num_experts=2, moe_grouped_gemm=False),
         vocab_size=16,
         max_sequence_length=8,
         pre_process=True,
@@ -257,11 +248,7 @@ def _write_unprefixed_gpt_like_checkpoint_with_mtp_state(path, value, extra_valu
 def _write_unprefixed_gpt_like_checkpoint_with_outside_byte_extra_state(path, value):
     state = _unprefixed_gpt_like_model_state(value)
     state["optimizer._extra_state"] = ShardedObject(
-        "optimizer._extra_state",
-        _bytesio_state(123),
-        (_world_size(),),
-        (_rank(),),
-        replica_id=0,
+        "optimizer._extra_state", _bytesio_state(123), (_world_size(),), (_rank(),), replica_id=0
     )
     dist_checkpointing.save(state, str(path))
 
@@ -269,9 +256,7 @@ def _write_unprefixed_gpt_like_checkpoint_with_outside_byte_extra_state(path, va
 def _write_unprefixed_gpt_like_checkpoint_with_optimizer_tensor(path, value):
     state = _unprefixed_gpt_like_model_state(value)
     state["optimizer.param_groups.0.lr"] = ShardedTensor.from_rank_offsets(
-        "optimizer.param_groups.0.lr",
-        torch.tensor([value], dtype=torch.float32),
-        replica_id=0,
+        "optimizer.param_groups.0.lr", torch.tensor([value], dtype=torch.float32), replica_id=0
     )
     dist_checkpointing.save(state, str(path))
 
@@ -311,10 +296,7 @@ def _split_weight_factory(sharded_tensor):
 def _factory_template(value=0.0, *, dtype=torch.float32, shape=(4, 2)):
     rank_offsets = _rank_offsets()
     weight = ShardedTensor.from_rank_offsets(
-        "model.factory_weight",
-        torch.full(shape, value, dtype=dtype),
-        *rank_offsets,
-        replica_id=0,
+        "model.factory_weight", torch.full(shape, value, dtype=dtype), *rank_offsets, replica_id=0
     )
     return {"model": {"weight": _split_weight_factory(weight)}}
 
@@ -384,10 +366,7 @@ def _fake_tensor_metadata(*, shape=(2, 2), dtype=torch.float32, chunks=(((0, 0),
     return SimpleNamespace(
         size=shape,
         properties=SimpleNamespace(dtype=dtype),
-        chunks=[
-            SimpleNamespace(offsets=offsets, sizes=sizes)
-            for offsets, sizes in chunks
-        ],
+        chunks=[SimpleNamespace(offsets=offsets, sizes=sizes) for offsets, sizes in chunks],
     )
 
 
@@ -557,9 +536,7 @@ def test_invalid_pure_inputs_raise(tmp_path):
     with pytest.raises(WeightedMergeError, match="PATH:WEIGHT"):
         weighted_merge_module._parse_weighted_inputs([str(tmp_path / "iter_0000010")])
     with pytest.raises(WeightedMergeError, match="Invalid weight"):
-        weighted_merge_module._parse_weighted_inputs(
-            [f"{tmp_path / 'iter_0000010'}:not-a-float"]
-        )
+        weighted_merge_module._parse_weighted_inputs([f"{tmp_path / 'iter_0000010'}:not-a-float"])
     with pytest.raises(WeightedMergeError, match="Unknown coefficient schedule"):
         checkpoint_coefficients([1, 2], "unknown")
     with pytest.raises(WeightedMergeError, match="Unknown coefficient modifier"):
@@ -620,9 +597,7 @@ def test_metadata_same_layout_merge_round_trip_without_model_builder_path(
         raise AssertionError("metadata same-layout must not use model/template construction")
 
     monkeypatch.setattr(
-        weighted_merge_module.dist_checkpointing,
-        "load_tensors_metadata",
-        fail_model_path,
+        weighted_merge_module.dist_checkpointing, "load_tensors_metadata", fail_model_path
     )
 
     with (
@@ -664,11 +639,7 @@ def test_metadata_same_layout_merge_round_trip_without_model_builder_path(
 
         source_metadata = torch_dcp.FileSystemReader(ckpt_a).read_metadata()
         output_metadata = torch_dcp.FileSystemReader(result.output_dir).read_metadata()
-        for fqn in (
-            "model.weight",
-            "model.bias",
-            "model.decoder.layers.0._extra_state",
-        ):
+        for fqn in ("model.weight", "model.bias", "model.decoder.layers.0._extra_state"):
             source_chunks = [
                 (tuple(chunk.offsets), tuple(chunk.sizes))
                 for chunk in source_metadata.state_dict_metadata[fqn].chunks
@@ -685,9 +656,7 @@ def test_metadata_same_layout_merge_round_trip_without_model_builder_path(
         assert provenance["extra_state_source_index"] == 1
 
 
-def test_metadata_same_layout_factory_checkpoint_round_trip(
-    tmp_path_dist_ckpt, process_group
-):
+def test_metadata_same_layout_factory_checkpoint_round_trip(tmp_path_dist_ckpt, process_group):
     with (
         TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_factory_a") as ckpt_a,
         TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_factory_b") as ckpt_b,
@@ -697,10 +666,7 @@ def test_metadata_same_layout_factory_checkpoint_round_trip(
         _write_factory_checkpoint(ckpt_b, 5.0, iteration=2)
 
         result = merge_same_layout_dcp_metadata_checkpoints(
-            [ckpt_a, ckpt_b],
-            [0.25, 0.75],
-            output_root,
-            output_iteration=32,
+            [ckpt_a, ckpt_b], [0.25, 0.75], output_root, output_iteration=32
         )
 
         loaded = dist_checkpointing.load(_factory_template(), str(result.output_dir))
@@ -711,10 +677,9 @@ def test_metadata_same_layout_factory_checkpoint_round_trip(
         source_metadata = torch_dcp.FileSystemReader(ckpt_a).read_metadata()
         output_metadata = torch_dcp.FileSystemReader(result.output_dir).read_metadata()
         assert set(output_metadata.state_dict_metadata) == set(source_metadata.state_dict_metadata)
-        assert {
-            "model.factory_weight.left",
-            "model.factory_weight.right",
-        }.issubset(output_metadata.state_dict_metadata)
+        assert {"model.factory_weight.left", "model.factory_weight.right"}.issubset(
+            output_metadata.state_dict_metadata
+        )
         for fqn, source_tensor_metadata in source_metadata.state_dict_metadata.items():
             source_chunks = [
                 (tuple(chunk.offsets), tuple(chunk.sizes))
@@ -783,9 +748,7 @@ def test_metadata_same_layout_balanced_work_plan_reports_multi_rank_stats(monkey
     selected_keys = tuple(f"model.singleton_{index}" for index in range(4))
     first_layouts = {
         fqn: weighted_merge_module._DcpMetadataTensorLayout(
-            global_shape=(2, 2),
-            dtype=torch.float32,
-            chunks=(((0, 0), (2, 2)),),
+            global_shape=(2, 2), dtype=torch.float32, chunks=(((0, 0), (2, 2)),)
         )
         for fqn in selected_keys
     }
@@ -813,9 +776,7 @@ def test_metadata_same_layout_generated_gpt_round_trip_cpu_without_model_builder
         raise AssertionError("metadata same-layout must not use model/template construction")
 
     monkeypatch.setattr(
-        weighted_merge_module.dist_checkpointing,
-        "load_tensors_metadata",
-        fail_model_path,
+        weighted_merge_module.dist_checkpointing, "load_tensors_metadata", fail_model_path
     )
 
     ps.destroy_model_parallel()
@@ -830,10 +791,7 @@ def test_metadata_same_layout_generated_gpt_round_trip_cpu_without_model_builder
             _write_generated_gpt_checkpoint(ckpt_b, 5.0)
 
             result = merge_same_layout_dcp_metadata_checkpoints(
-                [ckpt_a, ckpt_b],
-                [0.25, 0.75],
-                output_root,
-                output_iteration=40,
+                [ckpt_a, ckpt_b], [0.25, 0.75], output_root, output_iteration=40
             )
 
             assert result.output_dir == output_root / "iter_0000040"
@@ -844,8 +802,7 @@ def test_metadata_same_layout_generated_gpt_round_trip_cpu_without_model_builder
             output_metadata = torch_dcp.FileSystemReader(result.output_dir).read_metadata()
             tensor_state = {
                 fqn: torch.empty(
-                    tuple(int(dim) for dim in metadata.size),
-                    dtype=metadata.properties.dtype,
+                    tuple(int(dim) for dim in metadata.size), dtype=metadata.properties.dtype
                 )
                 for fqn, metadata in output_metadata.state_dict_metadata.items()
             }
@@ -880,9 +837,7 @@ def test_metadata_same_layout_generated_moe_gpt_round_trip_cpu_without_model_bui
         raise AssertionError("metadata same-layout must not use model/template construction")
 
     monkeypatch.setattr(
-        weighted_merge_module.dist_checkpointing,
-        "load_tensors_metadata",
-        fail_model_path,
+        weighted_merge_module.dist_checkpointing, "load_tensors_metadata", fail_model_path
     )
 
     ps.destroy_model_parallel()
@@ -891,7 +846,9 @@ def test_metadata_same_layout_generated_moe_gpt_round_trip_cpu_without_model_bui
         with (
             TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_generated_moe_gpt_a") as ckpt_a,
             TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_generated_moe_gpt_b") as ckpt_b,
-            TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_generated_moe_gpt_out") as output_root,
+            TempNamedDir(
+                tmp_path_dist_ckpt / "weighted_merge_generated_moe_gpt_out"
+            ) as output_root,
         ):
             _write_generated_moe_gpt_checkpoint(ckpt_a, 1.0)
             _write_generated_moe_gpt_checkpoint(ckpt_b, 5.0)
@@ -921,8 +878,7 @@ def test_metadata_same_layout_generated_moe_gpt_round_trip_cpu_without_model_bui
             assert all("_extra_state" in fqn for fqn in object_metadata_keys)
             tensor_state = {
                 fqn: torch.empty(
-                    tuple(int(dim) for dim in metadata.size),
-                    dtype=metadata.properties.dtype,
+                    tuple(int(dim) for dim in metadata.size), dtype=metadata.properties.dtype
                 )
                 for fqn, metadata in output_metadata.state_dict_metadata.items()
                 if hasattr(metadata, "size")
@@ -965,10 +921,7 @@ def test_metadata_same_layout_unprefixed_gpt_model_tensor_roots_round_trip(
         _write_unprefixed_gpt_like_checkpoint(ckpt_b, 5.0)
 
         result = merge_same_layout_dcp_metadata_checkpoints(
-            [ckpt_a, ckpt_b],
-            [0.25, 0.75],
-            output_root,
-            output_iteration=50,
+            [ckpt_a, ckpt_b], [0.25, 0.75], output_root, output_iteration=50
         )
 
         assert result.output_dir == output_root / "iter_0000050"
@@ -985,10 +938,11 @@ def test_metadata_same_layout_unprefixed_gpt_model_tensor_roots_round_trip(
 
         assert torch.equal(public_state["decoder.final_layernorm.weight"], torch.full((3,), 4.0))
         assert torch.equal(
-            public_state["decoder.layers.0.mlp.linear_fc1.weight"],
-            torch.full((2, 3), 5.0),
+            public_state["decoder.layers.0.mlp.linear_fc1.weight"], torch.full((2, 3), 5.0)
         )
-        assert torch.equal(public_state["embedding.word_embeddings.weight"], torch.full((4, 3), 6.0))
+        assert torch.equal(
+            public_state["embedding.word_embeddings.weight"], torch.full((4, 3), 6.0)
+        )
         assert torch.equal(public_state["output_layer.weight"], torch.full((4, 3), 7.0))
 
 
@@ -1024,10 +978,11 @@ def test_metadata_same_layout_copies_unprefixed_byte_extra_state_from_selected_s
         torch_dcp.load(public_state, checkpoint_id=str(result.output_dir), no_dist=True)
         assert torch.equal(public_state["decoder.final_layernorm.weight"], torch.full((3,), 4.0))
         assert torch.equal(
-            public_state["decoder.layers.0.mlp.linear_fc1.weight"],
-            torch.full((2, 3), 5.0),
+            public_state["decoder.layers.0.mlp.linear_fc1.weight"], torch.full((2, 3), 5.0)
         )
-        assert torch.equal(public_state["embedding.word_embeddings.weight"], torch.full((4, 3), 6.0))
+        assert torch.equal(
+            public_state["embedding.word_embeddings.weight"], torch.full((4, 3), 6.0)
+        )
         assert torch.equal(public_state["output_layer.weight"], torch.full((4, 3), 7.0))
 
         object_key = f"{UNPREFIXED_GPT_BYTE_EXTRA_STATE_KEY}/shard_0_1"
@@ -1039,8 +994,7 @@ def test_metadata_same_layout_copies_unprefixed_byte_extra_state_from_selected_s
         assert _decode_sharded_object_value(loaded[object_key]) == {"value": 999}
 
         normal_loaded = dist_checkpointing.load(
-            _unprefixed_gpt_like_byte_extra_template(),
-            str(result.output_dir),
+            _unprefixed_gpt_like_byte_extra_template(), str(result.output_dir)
         )
         normal_extra_state = normal_loaded[UNPREFIXED_GPT_BYTE_EXTRA_STATE_KEY]
         normal_extra_state.seek(0)
@@ -1070,14 +1024,9 @@ def test_metadata_same_layout_accepts_unprefixed_mtp_tensor_and_byte_extra_state
         assert result.averaged_tensors == 5
         assert result.copied_extra_states == 1
 
-        public_state = {
-            "mtp.layers.0.eh_proj.weight": torch.empty((2, 2), dtype=torch.float32),
-        }
+        public_state = {"mtp.layers.0.eh_proj.weight": torch.empty((2, 2), dtype=torch.float32)}
         torch_dcp.load(public_state, checkpoint_id=str(result.output_dir), no_dist=True)
-        assert torch.equal(
-            public_state["mtp.layers.0.eh_proj.weight"],
-            torch.full((2, 2), 8.0),
-        )
+        assert torch.equal(public_state["mtp.layers.0.eh_proj.weight"], torch.full((2, 2), 8.0))
 
         object_key = f"{UNPREFIXED_MTP_BYTE_EXTRA_STATE_KEY}/shard_0_1"
         loaded = dist_checkpointing.load(
@@ -1101,10 +1050,7 @@ def test_metadata_same_layout_rejects_byte_objects_outside_model_roots(
 
         with pytest.raises(WeightedMergeError, match="byte/object DCP entries outside model roots"):
             merge_same_layout_dcp_metadata_checkpoints(
-                [ckpt_a, ckpt_b],
-                [0.25, 0.75],
-                output_root,
-                output_iteration=53,
+                [ckpt_a, ckpt_b], [0.25, 0.75], output_root, output_iteration=53
             )
 
 
@@ -1119,15 +1065,9 @@ def test_metadata_same_layout_rejects_mismatched_byte_extra_state_keys(
         _write_unprefixed_gpt_like_checkpoint_with_byte_extra_state(ckpt_a, 1.0, 111)
         _write_unprefixed_gpt_like_checkpoint(ckpt_b, 5.0)
 
-        with pytest.raises(
-            WeightedMergeError,
-            match="identical byte/object _extra_state key sets",
-        ):
+        with pytest.raises(WeightedMergeError, match="identical byte/object _extra_state key sets"):
             merge_same_layout_dcp_metadata_checkpoints(
-                [ckpt_a, ckpt_b],
-                [0.25, 0.75],
-                output_root,
-                output_iteration=54,
+                [ckpt_a, ckpt_b], [0.25, 0.75], output_root, output_iteration=54
             )
 
 
@@ -1144,10 +1084,7 @@ def test_metadata_same_layout_rejects_unprefixed_non_model_tensor_root(
 
         with pytest.raises(WeightedMergeError, match="non-model DCP tensor keys"):
             merge_same_layout_dcp_metadata_checkpoints(
-                [ckpt_a, ckpt_b],
-                [0.25, 0.75],
-                output_root,
-                output_iteration=52,
+                [ckpt_a, ckpt_b], [0.25, 0.75], output_root, output_iteration=52
             )
 
 
@@ -1178,9 +1115,7 @@ def test_metadata_same_layout_cli_dispatch_skips_megatron_parser(tmp_path, monke
 
     monkeypatch.setattr(weighted_merge_module, "_ensure_process_group", fail_megatron_path)
     monkeypatch.setattr(
-        weighted_merge_module,
-        "merge_same_layout_dcp_metadata_checkpoints",
-        fake_merge,
+        weighted_merge_module, "merge_same_layout_dcp_metadata_checkpoints", fake_merge
     )
 
     args = weighted_merge_module._parse_metadata_same_layout_args(
@@ -1214,9 +1149,7 @@ def test_metadata_same_layout_cli_range_dispatch_selects_paths_and_weights(tmp_p
     checkpoint_root = tmp_path / "checkpoints"
     output_root = tmp_path / "merged"
     for iteration in [10, 20, 30]:
-        (checkpoint_root / weighted_merge_module._iteration_dir_name(iteration)).mkdir(
-            parents=True
-        )
+        (checkpoint_root / weighted_merge_module._iteration_dir_name(iteration)).mkdir(parents=True)
     calls = {}
 
     def fake_merge(input_paths, weights, output_root_arg, **kwargs):
@@ -1235,9 +1168,7 @@ def test_metadata_same_layout_cli_range_dispatch_selects_paths_and_weights(tmp_p
         )
 
     monkeypatch.setattr(
-        weighted_merge_module,
-        "merge_same_layout_dcp_metadata_checkpoints",
-        fake_merge,
+        weighted_merge_module, "merge_same_layout_dcp_metadata_checkpoints", fake_merge
     )
 
     args = weighted_merge_module._parse_metadata_same_layout_args(
@@ -1261,9 +1192,7 @@ def test_metadata_same_layout_cli_range_dispatch_selects_paths_and_weights(tmp_p
         checkpoint_root / weighted_merge_module._iteration_dir_name(iteration)
         for iteration in selected_iterations
     ]
-    expected_weights = list(
-        checkpoint_coefficients(selected_iterations, "minus-sqrt").values()
-    )
+    expected_weights = list(checkpoint_coefficients(selected_iterations, "minus-sqrt").values())
     assert result.implementation_mode == weighted_merge_module.METADATA_SAME_LAYOUT_MODE
     assert calls["input_paths"] == expected_paths
     assert calls["weights"] == pytest.approx(expected_weights)
@@ -1272,9 +1201,7 @@ def test_metadata_same_layout_cli_range_dispatch_selects_paths_and_weights(tmp_p
     assert calls["kwargs"]["merge_style"] == "minus-sqrt"
 
 
-def test_metadata_same_layout_rejects_mismatched_metadata(
-    tmp_path_dist_ckpt, process_group
-):
+def test_metadata_same_layout_rejects_mismatched_metadata(tmp_path_dist_ckpt, process_group):
     with (
         TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_metadata_mismatch_a") as ckpt_a,
         TempNamedDir(tmp_path_dist_ckpt / "weighted_merge_metadata_mismatch_b") as ckpt_b,
@@ -1285,9 +1212,7 @@ def test_metadata_same_layout_rejects_mismatched_metadata(
 
         with pytest.raises(WeightedMergeError, match="Shape mismatch.*metadata-same-layout"):
             merge_same_layout_dcp_metadata_checkpoints(
-                [ckpt_a, ckpt_b],
-                [0.25, 0.75],
-                output_root / "merged",
+                [ckpt_a, ckpt_b], [0.25, 0.75], output_root / "merged"
             )
 
         assert not (output_root / "merged").exists()
@@ -1336,10 +1261,7 @@ def test_metadata_same_layout_sidecar_failure_does_not_publish_output_or_latest(
 
         with pytest.raises((RuntimeError, WeightedMergeError), match="sidecar boom"):
             merge_same_layout_dcp_metadata_checkpoints(
-                [ckpt_a, ckpt_b],
-                [0.25, 0.75],
-                output_root,
-                output_iteration=55,
+                [ckpt_a, ckpt_b], [0.25, 0.75], output_root, output_iteration=55
             )
 
         assert not (output_root / "iter_0000055").exists()
@@ -1356,9 +1278,7 @@ def test_metadata_same_layout_two_rank_product_round_trip_public_metadata(
         raise AssertionError("metadata same-layout must not use model/template construction")
 
     monkeypatch.setattr(
-        weighted_merge_module.dist_checkpointing,
-        "load_tensors_metadata",
-        fail_model_path,
+        weighted_merge_module.dist_checkpointing, "load_tensors_metadata", fail_model_path
     )
 
     with (
@@ -1395,8 +1315,7 @@ def test_metadata_same_layout_two_rank_product_round_trip_public_metadata(
         assert torch.equal(loaded["model"]["weight"], torch.full((2, 2), expected_rank_weight))
         assert torch.equal(loaded["model"]["bias"], torch.full((2,), expected_rank_weight + 1.0))
         assert torch.equal(
-            loaded["model"]["decoder.layers.0._extra_state"],
-            torch.tensor([999.0 + rank]),
+            loaded["model"]["decoder.layers.0._extra_state"], torch.tensor([999.0 + rank])
         )
 
         public = _full_public_dcp_state(result.output_dir)
@@ -1411,11 +1330,7 @@ def test_metadata_same_layout_two_rank_product_round_trip_public_metadata(
 
         source_metadata = torch_dcp.FileSystemReader(ckpt_a).read_metadata()
         output_metadata = torch_dcp.FileSystemReader(result.output_dir).read_metadata()
-        for fqn in (
-            "model.weight",
-            "model.bias",
-            "model.decoder.layers.0._extra_state",
-        ):
+        for fqn in ("model.weight", "model.bias", "model.decoder.layers.0._extra_state"):
             source_chunks = [
                 (tuple(chunk.offsets), tuple(chunk.sizes))
                 for chunk in source_metadata.state_dict_metadata[fqn].chunks
@@ -1435,7 +1350,9 @@ def test_metadata_same_layout_two_rank_product_round_trip_public_metadata(
         if _rank() == 0:
             common_state = dist_checkpointing.load_common_state_dict(str(result.output_dir))
             provenance = common_state["weighted_merge_provenance"]
-            assert provenance["implementation_mode"] == weighted_merge_module.METADATA_SAME_LAYOUT_MODE
+            assert (
+                provenance["implementation_mode"] == weighted_merge_module.METADATA_SAME_LAYOUT_MODE
+            )
             assert provenance["extra_state_source_index"] == 1
             assert (output_root / "latest_checkpointed_iteration.txt").read_text().strip() == "30"
             assert len(list(result.output_dir.glob("*.distcp"))) == 2
@@ -1445,15 +1362,15 @@ def test_metadata_same_layout_two_rank_byte_extra_state_round_trip(
     tmp_path_dist_ckpt, process_group, monkeypatch
 ):
     if _world_size() != 2:
-        pytest.skip("two-rank metadata same-layout byte coverage requires torchrun --nproc_per_node=2")
+        pytest.skip(
+            "two-rank metadata same-layout byte coverage requires torchrun --nproc_per_node=2"
+        )
 
     def fail_model_path(*_args, **_kwargs):
         raise AssertionError("metadata same-layout must not use model/template construction")
 
     monkeypatch.setattr(
-        weighted_merge_module.dist_checkpointing,
-        "load_tensors_metadata",
-        fail_model_path,
+        weighted_merge_module.dist_checkpointing, "load_tensors_metadata", fail_model_path
     )
 
     with (
@@ -1469,16 +1386,10 @@ def test_metadata_same_layout_two_rank_byte_extra_state_round_trip(
     ):
         rank = _rank()
         _write_unprefixed_gpt_like_checkpoint_with_byte_extra_state(
-            ckpt_a,
-            1.0 + rank,
-            111 + rank,
-            rank_sharded=True,
+            ckpt_a, 1.0 + rank, 111 + rank, rank_sharded=True
         )
         _write_unprefixed_gpt_like_checkpoint_with_byte_extra_state(
-            ckpt_b,
-            5.0 + (2 * rank),
-            999 + rank,
-            rank_sharded=True,
+            ckpt_b, 5.0 + (2 * rank), 999 + rank, rank_sharded=True
         )
 
         result = merge_same_layout_dcp_metadata_checkpoints(
@@ -1498,21 +1409,16 @@ def test_metadata_same_layout_two_rank_byte_extra_state_round_trip(
         assert result.copied_extra_states == 2
         expected_base = 4.0 + (1.75 * rank)
         assert torch.equal(
-            loaded["decoder.final_layernorm.weight"],
-            torch.full((3,), expected_base),
+            loaded["decoder.final_layernorm.weight"], torch.full((3,), expected_base)
         )
         assert torch.equal(
             loaded["decoder.layers.0.mlp.linear_fc1.weight"],
             torch.full((2, 3), expected_base + 1.0),
         )
         assert torch.equal(
-            loaded["embedding.word_embeddings.weight"],
-            torch.full((4, 3), expected_base + 2.0),
+            loaded["embedding.word_embeddings.weight"], torch.full((4, 3), expected_base + 2.0)
         )
-        assert torch.equal(
-            loaded["output_layer.weight"],
-            torch.full((4, 3), expected_base + 3.0),
-        )
+        assert torch.equal(loaded["output_layer.weight"], torch.full((4, 3), expected_base + 3.0))
         loaded_extra_state = loaded[UNPREFIXED_GPT_BYTE_EXTRA_STATE_KEY]
         loaded_extra_state.seek(0)
         assert torch.load(loaded_extra_state, weights_only=False) == {"value": 999 + rank}
@@ -1551,7 +1457,9 @@ def test_merge_rejects_existing_output_directory_by_default(tmp_path_dist_ckpt, 
         output_dir = output_root / "merged"
         output_dir.mkdir()
 
-        with pytest.raises(WeightedMergeError, match="Output directory already exists|crash-atomic"):
+        with pytest.raises(
+            WeightedMergeError, match="Output directory already exists|crash-atomic"
+        ):
             merge_same_layout_dcp_metadata_checkpoints([ckpt_a], [1.0], output_dir)
 
 
@@ -1567,9 +1475,7 @@ def test_merge_supports_numbered_model_roots_model0_model1_model2(
         _write_multi_chunk_checkpoint(ckpt_b, 5.0, iteration=2)
 
         result = merge_same_layout_dcp_metadata_checkpoints(
-            [ckpt_a, ckpt_b],
-            [0.25, 0.75],
-            output_root / "merged",
+            [ckpt_a, ckpt_b], [0.25, 0.75], output_root / "merged"
         )
         loaded = dist_checkpointing.load(_multi_chunk_template(), str(result.output_dir))
 
@@ -1629,10 +1535,7 @@ def test_merge_accumulates_fp16_inputs_in_fp32(tmp_path_dist_ckpt, process_group
         _write_checkpoint(ckpt_b, 1.0, dtype=torch.float16, iteration=2)
 
         result = merge_same_layout_dcp_metadata_checkpoints(
-            [ckpt_a, ckpt_b],
-            [0.5, 0.5],
-            output_root / "merged",
-            save_dtype="float32",
+            [ckpt_a, ckpt_b], [0.5, 0.5], output_root / "merged", save_dtype="float32"
         )
         loaded = _load_checkpoint(result.output_dir, dtype=torch.float32)
 
@@ -1654,10 +1557,7 @@ def test_merge_rejects_dtype_mismatch_for_all_save_dtype_policies(
 
         with pytest.raises(WeightedMergeError, match="Dtype mismatch"):
             merge_same_layout_dcp_metadata_checkpoints(
-                [ckpt_a, ckpt_b],
-                [0.5, 0.5],
-                output_root / "merged",
-                save_dtype=save_dtype,
+                [ckpt_a, ckpt_b], [0.5, 0.5], output_root / "merged", save_dtype=save_dtype
             )
 
 
@@ -1672,9 +1572,7 @@ def test_merge_rejects_non_floating_tensors(tmp_path_dist_ckpt, process_group):
 
         with pytest.raises(WeightedMergeError, match="non-floating"):
             merge_same_layout_dcp_metadata_checkpoints(
-                [ckpt_a, ckpt_b],
-                [0.5, 0.5],
-                output_root / "merged",
+                [ckpt_a, ckpt_b], [0.5, 0.5], output_root / "merged"
             )
 
 
@@ -1689,9 +1587,7 @@ def test_merge_rejects_shape_mismatch(tmp_path_dist_ckpt, process_group):
 
         with pytest.raises(WeightedMergeError, match="Shape mismatch|shape|model.weight"):
             merge_same_layout_dcp_metadata_checkpoints(
-                [ckpt_a, ckpt_b],
-                [0.5, 0.5],
-                output_root / "merged",
+                [ckpt_a, ckpt_b], [0.5, 0.5], output_root / "merged"
             )
 
 
@@ -1747,9 +1643,7 @@ def test_merge_rejects_unsupported_checkpoint_format(tmp_path_dist_ckpt, process
         )
 
         with pytest.raises(WeightedMergeError, match="torch_dist checkpoints only"):
-            merge_same_layout_dcp_metadata_checkpoints(
-                [ckpt_a], [1.0], output_root / "merged"
-            )
+            merge_same_layout_dcp_metadata_checkpoints([ckpt_a], [1.0], output_root / "merged")
 
 
 def test_merge_rejects_missing_metadata(tmp_path_dist_ckpt, process_group):
@@ -1795,9 +1689,7 @@ def test_object_extra_state_is_copied(tmp_path_dist_ckpt, process_group):
         _write_object_extra_checkpoint(ckpt_b, 3.0, extra_value=999, iteration=2)
 
         result = merge_same_layout_dcp_metadata_checkpoints(
-            [ckpt_a, ckpt_b],
-            [0.5, 0.5],
-            output_root / "merged",
+            [ckpt_a, ckpt_b], [0.5, 0.5], output_root / "merged"
         )
         loaded = dist_checkpointing.load(_object_extra_template(), str(result.output_dir))
 
@@ -1816,10 +1708,7 @@ def test_extra_state_source_index_can_be_selected(tmp_path_dist_ckpt, process_gr
         _write_checkpoint(ckpt_b, 3.0, extra_value=999.0, iteration=2)
 
         result = merge_same_layout_dcp_metadata_checkpoints(
-            [ckpt_a, ckpt_b],
-            [0.5, 0.5],
-            output_root / "merged",
-            extra_state_source_index=1,
+            [ckpt_a, ckpt_b], [0.5, 0.5], output_root / "merged", extra_state_source_index=1
         )
         loaded = _load_checkpoint(result.output_dir)
 
@@ -1842,10 +1731,7 @@ def test_merge_minus_sqrt_schedule_three_checkpoints_matches_fp32_weighted_sum(
         _write_checkpoint(ckpt_c, values[2], extra_value=333.0, iteration=3)
 
         result = merge_same_layout_dcp_metadata_checkpoints(
-            [ckpt_a, ckpt_b, ckpt_c],
-            coefficients,
-            output_root / "merged",
-            merge_style="minus-sqrt",
+            [ckpt_a, ckpt_b, ckpt_c], coefficients, output_root / "merged", merge_style="minus-sqrt"
         )
         loaded = _load_checkpoint(result.output_dir)
 
@@ -1855,9 +1741,7 @@ def test_merge_minus_sqrt_schedule_three_checkpoints_matches_fp32_weighted_sum(
         assert torch.allclose(
             loaded["model"]["weight"], torch.full((2, 2), expected_weight), atol=1e-6
         )
-        assert torch.allclose(
-            loaded["model"]["bias"], torch.full((2,), expected_bias), atol=1e-6
-        )
+        assert torch.allclose(loaded["model"]["bias"], torch.full((2,), expected_bias), atol=1e-6)
         common_state = dist_checkpointing.load_common_state_dict(str(result.output_dir))
         provenance = common_state["weighted_merge_provenance"]
         assert provenance["merge_style"] == "minus-sqrt"
@@ -1874,18 +1758,14 @@ def test_merge_negative_manual_weights_round_trip(tmp_path_dist_ckpt, process_gr
         _write_checkpoint(ckpt_b, 4.0, extra_value=999.0, iteration=2)
 
         result = merge_same_layout_dcp_metadata_checkpoints(
-            [ckpt_a, ckpt_b],
-            [1.5, -0.5],
-            output_root / "merged",
+            [ckpt_a, ckpt_b], [1.5, -0.5], output_root / "merged"
         )
         loaded = _load_checkpoint(result.output_dir)
 
         # weight = 1.5 * 2.0 - 0.5 * 4.0 = 1.0; bias = 1.5 * 3.0 - 0.5 * 5.0 = 2.0
         assert torch.allclose(loaded["model"]["weight"], torch.full((2, 2), 1.0), atol=1e-6)
         assert torch.allclose(loaded["model"]["bias"], torch.full((2,), 2.0), atol=1e-6)
-        assert torch.equal(
-            loaded["model"]["decoder.layers.0._extra_state"], torch.tensor([111.0])
-        )
+        assert torch.equal(loaded["model"]["decoder.layers.0._extra_state"], torch.tensor([111.0]))
         common_state = dist_checkpointing.load_common_state_dict(str(result.output_dir))
         assert common_state["weighted_merge_provenance"]["weights"] == [1.5, -0.5]
 
@@ -1921,7 +1801,5 @@ def test_cli_argparse_surface_merges_checkpoint(tmp_path_dist_ckpt, process_grou
         loaded = _load_checkpoint(result.output_dir)
         assert torch.allclose(loaded["model"]["weight"], torch.full((2, 2), 4.0))
         assert torch.allclose(loaded["model"]["bias"], torch.full((2,), 5.0))
-        assert torch.equal(
-            loaded["model"]["decoder.layers.0._extra_state"], torch.tensor([111.0])
-        )
+        assert torch.equal(loaded["model"]["decoder.layers.0._extra_state"], torch.tensor([111.0]))
         assert (output_root / "latest_checkpointed_iteration.txt").read_text().strip() == "30"
