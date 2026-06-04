@@ -7,7 +7,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from megatron.core.hyper_comm_grid import HyperCommGrid
+from megatron.core.hyper_comm_grid import GridLayout, HyperCommGrid
 
 
 class TestHyperCommGrid:
@@ -309,6 +309,164 @@ class TestHyperCommGrid:
         expected_ab = [[0, 2, 1, 3], [4, 6, 5, 7]]
         assert rank_enum_ab == expected_ab
 
+    # ------------------------------------------------------------------
+    # register_layout / GridLayout validation (mock-based unit tests)
+    # ------------------------------------------------------------------
+
+    def test_register_layout_returns_handle(self):
+        """Test register_layout returns a GridLayout handle retrievable via get_layout."""
+        grid = HyperCommGrid([2, 2, 2], ["tp", "cp", "dp"])
+
+        handle = grid.register_layout("expert", [4, 2], ["ep", "expt_dp"])
+
+        assert isinstance(handle, GridLayout)
+        assert handle.name == "expert"
+        # get_layout returns the same handle for a consumer in another module.
+        assert grid.get_layout("expert") is handle
+
+    def test_get_layout_unknown_error(self):
+        """Test get_layout raises a clear error for an unregistered layout."""
+        grid = HyperCommGrid([2, 2, 2], ["tp", "cp", "dp"])
+
+        with pytest.raises(KeyError, match="Layout 'nope' is not registered"):
+            grid.get_layout("nope")
+
+    def test_register_layout_duplicate_name_error(self):
+        """Test register_layout rejects re-registering an existing layout name."""
+        grid = HyperCommGrid([2, 2, 2], ["tp", "cp", "dp"])
+
+        grid.register_layout("expert", [2, 2, 2], ["expt_tp", "ep", "expt_dp"])
+        with pytest.raises(ValueError, match="is already registered"):
+            grid.register_layout("expert", [2, 4], ["ep", "expt_dp"])
+
+    def test_register_layout_length_mismatch_error(self):
+        """Test register_layout rejects shape/dim_names length mismatch."""
+        grid = HyperCommGrid([2, 2, 2], ["tp", "cp", "dp"])
+
+        with pytest.raises(ValueError, match="len\\(shape\\).*!= len\\(dim_names\\)"):
+            grid.register_layout("expert", [2, 2, 2], ["ep", "expt_dp"])
+
+    def test_register_layout_duplicate_dim_names_error(self):
+        """Test register_layout rejects duplicate dim_names within a layout."""
+        grid = HyperCommGrid([2, 2, 2], ["tp", "cp", "dp"])
+
+        with pytest.raises(ValueError, match="duplicate dim_names"):
+            grid.register_layout("expert", [2, 2, 2], ["ep", "ep", "expt_dp"])
+
+    def test_register_layout_size_mismatch_error(self):
+        """Test register_layout rejects a layout whose size differs from the grid."""
+        grid = HyperCommGrid([2, 2, 2], ["tp", "cp", "dp"])  # size 8
+
+        with pytest.raises(ValueError, match="but the grid size is 8"):
+            grid.register_layout("expert", [2, 2], ["ep", "expt_dp"])  # size 4
+
+    def test_register_layout_non_positive_shape_error(self):
+        """Test register_layout rejects shape entries that are not positive ints."""
+        grid = HyperCommGrid([2, 2, 2], ["tp", "cp", "dp"])
+
+        with pytest.raises(ValueError, match="shape must be positive ints"):
+            grid.register_layout("expert", [8, 0], ["ep", "expt_dp"])
+        with pytest.raises(ValueError, match="shape must be positive ints"):
+            grid.register_layout("expert2", [-1, 8], ["ep", "expt_dp"])
+
+    def test_register_layout_success_copies_lists(self):
+        """Test a valid layout is registered and stored with copied data."""
+        grid = HyperCommGrid([2, 2, 2], ["tp", "cp", "dp"])
+
+        shape = [4, 2]
+        dim_names = ["ep", "expt_dp"]
+        handle = grid.register_layout("expert", shape, dim_names)
+
+        # Stored layout must be a copy, not an alias of the caller's lists.
+        assert handle.shape == shape and handle.shape is not shape
+        assert handle.dim_names == dim_names and handle.dim_names is not dim_names
+
+    def test_register_layout_shared_dim_not_in_base_error(self):
+        """Test register_layout rejects a shared dim absent from the base layout."""
+        grid = HyperCommGrid([2, 2, 2], ["tp", "cp", "dp"])
+
+        with pytest.raises(ValueError, match="Shared dim 'pp' .* is not in the base layout"):
+            grid.register_layout("expert", [4, 2], ["ep", "pp"], shared_dims=["pp"])
+
+    def test_register_layout_shared_dim_not_in_layout_error(self):
+        """Test register_layout rejects a shared dim absent from the layout's own dim_names."""
+        grid = HyperCommGrid([2, 2, 2], ["tp", "cp", "pp"])
+
+        with pytest.raises(ValueError, match="Shared dim 'pp' .* is not in the layout's dim_names"):
+            grid.register_layout("expert", [4, 2], ["ep", "expt_dp"], shared_dims=["pp"])
+
+    def test_register_layout_shared_dim_membership_mismatch_error(self):
+        """Test register_layout rejects a shared dim whose enumeration differs from base.
+
+        Here the base layout makes ``pp`` the trailing dim of the original order (strided ranks
+        ``[[0,4],[1,5],[2,6],[3,7]]``), but the expert layout makes ``pp`` the leading dim
+        (contiguous ranks ``[[0,1],[2,3],[4,5],[6,7]]``); the memberships differ, so the
+        shared-dim contract is violated and registration must raise.
+        """
+        # base: tp=2, dp=2, pp=2 -> pp trailing -> strided pp groups.
+        grid = HyperCommGrid([2, 2, 2], ["tp", "dp", "pp"])
+
+        with pytest.raises(ValueError, match="Shared dim 'pp' has different membership"):
+            # expert: pp=2, ep=4 -> pp leading -> contiguous pp groups, different membership.
+            grid.register_layout("expert", [2, 4], ["pp", "ep"], shared_dims=["pp"])
+
+    def test_register_layout_shared_dim_membership_match(self):
+        """Test register_layout accepts a shared dim that enumerates identically across layouts.
+
+        The base grid keeps ``pp`` as the trailing (outermost) dim, and the expert layout also
+        keeps ``pp`` trailing, so the ``pp`` groups are the same ranks.
+        """
+        # base: tp=2, dp=2, pp=2 -> reversed [dp, tp, ...]; pp trailing -> contiguous blocks.
+        grid = HyperCommGrid([2, 2, 2], ["tp", "dp", "pp"])
+        # expert: expt_tp=2, ep=2, pp=2 -> pp trailing -> same membership as base.
+        handle = grid.register_layout(
+            "expert", [2, 2, 2], ["expt_tp", "ep", "pp"], shared_dims=["pp"]
+        )
+
+        assert handle.shared_dims == ["pp"]
+        # Both layouts enumerate pp identically.
+        assert grid.get_rank_enum("pp") == handle.get_rank_enum("pp")
+
+    # ------------------------------------------------------------------
+    # GridLayout process-group creation (mock-based)
+    # ------------------------------------------------------------------
+
+    def test_layout_get_pg_not_created_error(self):
+        """Test get_pg on the handle raises when the group is absent."""
+        grid = HyperCommGrid([2, 2, 2], ["tp", "cp", "dp"])
+        handle = grid.register_layout("expert", [4, 2], ["ep", "expt_dp"])
+
+        with pytest.raises(KeyError, match="for layout 'expert' hasn't been created"):
+            handle.get_pg("ep")
+
+    def test_destroy_skips_non_members(self):
+        """Test destroy only destroys groups the current rank is a member of."""
+        member_pg = MagicMock(spec=dist.ProcessGroup)
+        non_member = dist.GroupMember.NON_GROUP_MEMBER
+
+        grid = HyperCommGrid([2, 4], ["tp", "dp"])
+        grid._pgs = {"tp": member_pg, "dp": non_member, "cp": None}
+
+        with patch('torch.distributed.destroy_process_group') as mock_destroy:
+            grid.destroy()
+
+        # Only the real, member process group is destroyed.
+        mock_destroy.assert_called_once_with(member_pg)
+        assert grid._pgs == {}
+
+    @patch('torch.distributed.is_initialized', return_value=False)
+    @patch('torch.distributed.new_subgroups_by_enumeration')
+    def test_create_pg_skips_log_when_not_initialized(self, mock_new_subgroups, _mock_is_init):
+        """Test create_pg does not call get_rank when torch.distributed is not initialized."""
+        mock_pg = MagicMock(spec=dist.ProcessGroup)
+        mock_new_subgroups.return_value = (mock_pg, None)
+
+        grid = HyperCommGrid([2, 4], ["tp", "dp"])
+
+        # get_rank would raise if called before init; the is_initialized guard must short-circuit.
+        with patch('torch.distributed.get_rank', side_effect=AssertionError("get_rank called")):
+            grid.create_pg("tp")
+
 
 class TestHyperCommGridIntegration:
     """Integration tests for HyperCommGrid with real distributed initialization."""
@@ -542,3 +700,82 @@ class TestHyperCommGridIntegration:
             # Verify the sum is correct
             expected_sum = sum(tp_ranks)
             assert tensor.item() == expected_sum
+
+    def test_real_distributed_registered_layout(self):
+        """Verify a registered expert layout's groups with the real distributed backend.
+
+        On 8 ranks, build a base dense grid and register an expert layout that re-partitions the
+        same ranks, declaring ``pp`` as shared. Then assert:
+          * an expert-private group has the correct ACTUAL rank membership;
+          * the expert ``pp`` group IS the same object / same ranks as the base ``pp`` group
+            (shared-dim reuse);
+          * destroy() tears everything down once without double-freeing the reused group.
+        """
+        if not dist.is_initialized():
+            pytest.skip("Distributed not initialized")
+
+        world_size = dist.get_world_size()
+        if world_size != 8:
+            pytest.skip("This test specifically requires 8 GPUs")
+
+        # Base dense layout: tp=2, dp=2, pp=2. Reversed -> [pp(outer-most-on-left after reverse),
+        # dp, tp]; pp is the trailing dim of the original order, so pp groups are [[0,4],[1,5],
+        # [2,6],[3,7]] (strided by 4).
+        grid = HyperCommGrid([2, 2, 2], ["tp", "dp", "pp"], backend="nccl")
+
+        # Expert layout: expt_tp=2, ep=2, pp=2 over the same 8 ranks. pp kept trailing so its
+        # membership matches the base pp groups, satisfying the shared-dim contract.
+        expert = grid.register_layout(
+            "expert", [2, 2, 2], ["expt_tp", "ep", "pp"], shared_dims=["pp"]
+        )
+
+        # Base groups.
+        base_tp = grid.create_pg("tp")
+        base_pp = grid.create_pg("pp")
+
+        # Expert-private group spanning expt_tp + ep (the non-shared dims).
+        expert_te = expert.create_pg(["expt_tp", "ep"])
+        # Shared pp group via the handle must reuse the base object.
+        expert_pp = expert.get_pg("pp")
+
+        assert isinstance(base_tp, dist.ProcessGroup)
+        assert isinstance(base_pp, dist.ProcessGroup)
+        assert isinstance(expert_te, dist.ProcessGroup)
+
+        # Layout-private group is stored under a tuple key (no string namespacing) and is
+        # retrievable through the handle as the same object.
+        assert ("expert", ("ep", "expt_tp")) in grid._pgs
+        assert expert.get_pg(["expt_tp", "ep"]) is expert_te
+
+        # Shared-dim reuse: identical object AND identical ranks, and no layout-private duplicate
+        # was created for the shared dim.
+        assert expert_pp is base_pp
+        assert dist.get_process_group_ranks(expert_pp) == dist.get_process_group_ranks(base_pp)
+        assert ("expert", ("pp",)) not in grid._pgs
+
+        # Re-creating an already-created layout-private group must raise.
+        with pytest.raises(KeyError, match="for layout 'expert' has already been created"):
+            expert.create_pg(["expt_tp", "ep"])
+
+        # ACTUAL membership of the expert-private expt_tp-ep group. Reversed expert dim order is
+        # [pp, ep, expt_tp]; grouping by (ep, expt_tp) within each pp slice yields, per pp block
+        # of 4 contiguous ranks, the whole block. pp trailing => two blocks [0..3] and [4..7].
+        expected_te = [[0, 1, 2, 3], [4, 5, 6, 7]]
+        assert sorted(expert.get_rank_enum(["expt_tp", "ep"])) == sorted(expected_te)
+        my_te_ranks = sorted(dist.get_process_group_ranks(expert_te))
+        rank = dist.get_rank()
+        my_block = [b for b in expected_te if rank in b][0]
+        assert my_te_ranks == my_block
+
+        # Exercise real communication on the expert-private group.
+        device = torch.device(f"cuda:{rank % torch.cuda.device_count()}")
+        tensor = torch.tensor([rank], dtype=torch.float, device=device)
+        dist.all_reduce(tensor, group=expert_te)
+        assert tensor.item() == sum(my_block)
+
+        # destroy() must tear down base_tp, the shared pp group (once), and the expert-private
+        # group, without double-freeing the reused pp group. The pp group object is shared
+        # between base and expert under a single key, so it cannot be destroyed twice. After
+        # teardown the registry is empty.
+        grid.destroy()
+        assert grid._pgs == {}
