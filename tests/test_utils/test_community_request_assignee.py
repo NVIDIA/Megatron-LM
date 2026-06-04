@@ -5,7 +5,9 @@ from pathlib import Path
 
 
 def load_assignee_module():
-    module_path = Path(__file__).parents[2] / ".github" / "scripts" / "community_request_assignee.py"
+    module_path = (
+        Path(__file__).parents[2] / ".github" / "scripts" / "community_request_assignee.py"
+    )
     spec = importlib.util.spec_from_file_location("community_request_assignee", module_path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -58,7 +60,9 @@ def test_create_assignment_plan_uses_engineer_candidate(monkeypatch):
     monkeypatch.setattr(
         module,
         "get_team_members",
-        lambda org, team_slug: {"alice", "bob"} if team_slug == module.ASSIGNEE_ALLOWED_TEAM_SLUG else set(),
+        lambda org, team_slug: (
+            {"alice", "bob"} if team_slug == module.ASSIGNEE_ALLOWED_TEAM_SLUG else set()
+        ),
     )
 
     plan = module.create_assignment_plan(make_analysis(), issue)
@@ -79,7 +83,9 @@ def test_create_assignment_plan_accepts_topic_mapped_other_candidate(monkeypatch
     monkeypatch.setattr(
         module,
         "get_team_members",
-        lambda org, team_slug: {"wujingyue"} if team_slug == module.ASSIGNEE_ALLOWED_TEAM_SLUG else set(),
+        lambda org, team_slug: (
+            {"wujingyue"} if team_slug == module.ASSIGNEE_ALLOWED_TEAM_SLUG else set()
+        ),
     )
 
     plan = module.create_assignment_plan(
@@ -211,10 +217,15 @@ def test_build_slack_message_includes_candidate_context():
 
     message = module.build_slack_message(issue, plan)
 
-    assert "I (Megatron Issue Bot) have assigned you to the newly created community issue" in message
+    assert (
+        "I (Megatron Issue Bot) have assigned you to the newly created community issue" in message
+    )
     assert "Context from my analysis:" in message
     assert "PR #42 changed the affected path and may be the root cause." in message
-    assert "Please take action at your earliest convenience, at latest within 1 business day." in message
+    assert (
+        "Please take action at your earliest convenience, at latest within 1 business day."
+        in message
+    )
     assert "<!subteam^S0A7B4U1T3P|mcore-oncall>" in message
 
 
