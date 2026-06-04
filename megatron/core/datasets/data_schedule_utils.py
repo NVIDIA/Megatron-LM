@@ -869,24 +869,24 @@ def next_hdp_group(
     return micro_batches, leftovers, exec_times, sample_ids_per_gpu
 
 
-def next_hdp_group_v2(
+def next_hdp_group_packing_aware(
     sample_seqlens: List[Tuple[int, int]],
     total_gpus: int,
     max_seq_len_per_rank: int,
     min_cp_size: int = 1,
     delta: float = 0.05,
 ) -> Tuple[List[List[int]], List[Tuple[int, int]], List[float], List[List[int]]]:
-    """Form one DCP microbatch with the V2 packing-aware scheduler.
+    """Form one DCP microbatch with packing-aware CP group selection.
 
-    V2 differs from the default DCP scheduler in two ways:
+    This differs from the legacy DCP scheduler in two ways:
     1. Short sequences may use a larger CP group than their minimum required
        CP size when that lowers the critical-path rank workload.
     2. Candidate placements are bounded by ``tall * max_seq_len_per_rank``,
        the per-rank workload upper bound for packing sequences no longer than
        the local tallest sequence in the microbatch.
 
-    The scheduler keeps the V1 invariant that each returned microbatch has no
-    empty DPxCP rank after the fill step.
+    The scheduler keeps the legacy invariant that each returned microbatch has
+    no empty DPxCP rank after the fill step.
     """
     if not sample_seqlens:
         return (
@@ -909,11 +909,11 @@ def next_hdp_group_v2(
     micro_batches: List[List[int]] = [[] for _ in range(total_gpus)]
     exec_times: List[float] = [0.0 for _ in range(total_gpus)]
     sample_ids_per_gpu: List[List[int]] = [[] for _ in range(total_gpus)]
-    packing_sequence_len = {}
+    packing_sequence_len: Dict[int, float] = {}
 
     gpu_group_id: List[Optional[int]] = [None] * total_gpus
-    group_members = {}
-    group_size = {}
+    group_members: Dict[int, List[int]] = {}
+    group_size: Dict[int, int] = {}
     next_gid = 0
 
     sample_id, seq_len = sample_seqlens[0]
@@ -1051,7 +1051,9 @@ def next_hdp_group_v2(
                 new_sample_ids_per_gpu[target_rank] = sample_ids_to_push[idx]
 
             group_size[group_id] = next_power
-            group_members[group_id] = list(range(group_start_rank, group_end_rank + needed_count + 1))
+            group_members[group_id] = list(
+                range(group_start_rank, group_end_rank + needed_count + 1)
+            )
             for other_group_id in list(group_size.keys()):
                 if other_group_id == group_id:
                     continue
