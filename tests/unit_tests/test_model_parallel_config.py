@@ -32,7 +32,8 @@ def test_te_cross_entropy_loss_fusion_is_disabled_by_training_args(monkeypatch):
     args.max_position_embeddings = 1024
     args.seq_length = 1024
     args.micro_batch_size = 1
-    args.global_batch_size = 1
+    # Let validate_args derive a global batch size that is valid for the
+    # active data-parallel size in distributed unit-test jobs.
     args.train_iters = 1
     args.lr = 1e-4
     args.tokenizer_type = 'NullTokenizer'
