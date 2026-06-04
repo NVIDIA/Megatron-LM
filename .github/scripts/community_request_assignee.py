@@ -36,6 +36,7 @@ except ImportError:  # pragma: no cover - workflow installs slack-sdk.
 
 GITHUB_API_URL = "https://api.github.com"
 ACTIVE_ONCALL_TEAM_SLUG = "mcore-oncall"
+MCORE_ONCALL_SLACK_USERGROUP_ID = "S0A7B4U1T3P"
 CONFIDENCE_THRESHOLD = 0.75
 SERVICE_ACCOUNT_LOGINS = {"svcnvidia-nemo-ci"}
 
@@ -354,18 +355,19 @@ def get_slack_user_id(slack_client, email: str) -> str | None:
 
 def build_slack_message(issue: IssueContext, plan: AssignmentPlan) -> str:
     paths = ", ".join(plan.relevant_paths) if plan.relevant_paths else "none identified"
+    oncall_mention = f"<!subteam^{MCORE_ONCALL_SLACK_USERGROUP_ID}|mcore-oncall>"
     if plan.mode == "candidate":
         return (
             f"You have been automatically assigned to community issue: <{issue.url}|{issue.url}>.\n\n"
-            "Claude has determined that you are the best individual to answer this community issue. "
+            "I determined that you are the best individual to answer this community issue. "
             "Please take action at your earliest convenience, at latest within 1 business day. "
-            "If Claude has made a mistake or if you are unsure how to proceed, please reach out to "
-            "@mcore-oncall directly."
+            "If I made a mistake or if you are unsure how to proceed, please reach out to "
+            f"{oncall_mention} directly."
         )
 
     return (
         f"Community request <{issue.url}|#{issue.number}: {issue.title}> needs on-call triage.\n"
-        f"Claude could not confidently identify a direct assignee; confidence: {plan.confidence:.2f}\n"
+        f"I could not confidently identify a direct assignee; confidence: {plan.confidence:.2f}\n"
         f"Relevant paths: {paths}\n"
         f"Rationale: {plan.rationale}"
     )

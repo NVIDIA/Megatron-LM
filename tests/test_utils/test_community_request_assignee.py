@@ -131,8 +131,8 @@ def test_build_slack_message_uses_requested_candidate_copy():
         "You have been automatically assigned to community issue: "
         "<https://github.com/NVIDIA/Megatron-LM/issues/125|"
         "https://github.com/NVIDIA/Megatron-LM/issues/125>.\n\n"
-        "Claude has determined that you are the best individual to answer this community issue. "
+        "I determined that you are the best individual to answer this community issue. "
         "Please take action at your earliest convenience, at latest within 1 business day. "
-        "If Claude has made a mistake or if you are unsure how to proceed, please reach out to "
-        "@mcore-oncall directly."
+        "If I made a mistake or if you are unsure how to proceed, please reach out to "
+        "<!subteam^S0A7B4U1T3P|mcore-oncall> directly."
     )
