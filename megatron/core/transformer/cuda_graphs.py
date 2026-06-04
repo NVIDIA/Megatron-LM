@@ -58,7 +58,12 @@ try:
 except:
     HAVE_TE_GRAPHS = False
 
-from megatron.experimental.gtp import HAVE_GTP
+try:
+    from megatron.experimental.gtp import HAVE_GTP
+except ImportError:
+    # megatron.experimental is not shipped with the megatron.core wheel; treat
+    # GTP as unavailable when the package is absent.
+    HAVE_GTP = False
 
 if HAVE_GTP:
     from megatron.experimental.gtp import (
@@ -69,6 +74,16 @@ if HAVE_GTP:
         set_cuda_graph_mempool,
         wait_async_comms,
     )
+else:
+    # Placeholders so static analysis does not flag these GTP-only symbols as
+    # possibly-used-before-assignment; every use site is guarded by HAVE_GTP /
+    # gtp_remat at runtime.
+    GTP_CONFIG = None
+    GTPChain = None
+    get_ag_stream = None
+    get_rs_stream = None
+    set_cuda_graph_mempool = None
+    wait_async_comms = None
 
 try:
     from tqdm import tqdm
@@ -615,6 +630,7 @@ class _CudagraphReplayNode(torch.autograd.Function):
     """Replays the runner's cudagraphs with autograd. Handles copying data into/out of the
     cudagraph io and fp8/fp4 if used."""
 
+    # pylint: disable=line-too-long
     ## Capture-time sync schemes (wait_async_comms is called INSIDE the captured
     #  graph so the drain ops are embedded in the graph itself, not before replay).
     #
@@ -635,6 +651,7 @@ class _CudagraphReplayNode(torch.autograd.Function):
     #    Phase 1 AG drain. By the time bwd_completion_event fires and the next
     #    runner launches, the add_ is done (no SM saturation blocking overlap).
     #    finalize_model_grads waits phase2_completion_event before DP grad sync.
+    # pylint: enable=line-too-long
 
     @staticmethod
     def forward(ctx, runner, is_first_microbatch, *inputs):

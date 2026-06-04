@@ -13,6 +13,11 @@ include = [
     "megatron.core.*",
     "megatron.training",
     "megatron.training.*",
+    "megatron.experimental",
+    "megatron.experimental.*",
+]
+exclude = [
+    "megatron.experimental.gtp.images",  # documentation diagrams, not runtime code
 ]
 
 [tool.setuptools.dynamic]
