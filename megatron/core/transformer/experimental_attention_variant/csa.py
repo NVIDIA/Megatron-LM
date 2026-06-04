@@ -314,7 +314,7 @@ def cat_per_segment(
 # ---------------------------------------------------------------------------
 
 
-def _apply_rope_at_positions(
+def apply_rope_at_positions(
     x: torch.Tensor,
     nope_dim: int,
     pos_dim: int,
@@ -985,7 +985,7 @@ class Compressor(MegatronModule):
                     f"positions={rope_positions.shape[0]}, compressed={compressed_thd.shape[0]}"
                 )
             rope_positions = rope_positions[: compressed_thd.shape[0]]
-            compressed_thd = _apply_rope_at_positions(
+            compressed_thd = apply_rope_at_positions(
                 compressed_thd,
                 self.head_dim - self.qk_pos_emb_head_dim,
                 self.qk_pos_emb_head_dim,
@@ -1133,7 +1133,7 @@ class CSAIndexer(MegatronModule):
 
         q, _ = self.linear_wq_b(qr)
         q = q.reshape(sq, bsz, self.index_n_heads, self.index_head_dim).squeeze(1)
-        q = _apply_rope_at_positions(
+        q = apply_rope_at_positions(
             q,
             self.index_head_dim - self.qk_pos_emb_head_dim,
             self.qk_pos_emb_head_dim,

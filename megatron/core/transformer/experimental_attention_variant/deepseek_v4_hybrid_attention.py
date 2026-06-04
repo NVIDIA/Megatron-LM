@@ -19,7 +19,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.experimental_attention_variant.csa import _apply_rope_at_positions
+from megatron.core.transformer.experimental_attention_variant.csa import apply_rope_at_positions
 from megatron.core.transformer.experimental_attention_variant.csa_cp_utils import (
     contiguous_cp_partition,
     exchange_left_boundary_tensor,
@@ -329,7 +329,7 @@ class DSv4HybridAttention(Attention):
         boundary_kv = boundary_kv[-d_window:]
         boundary_kv = self.kv_layernorm(boundary_kv)
         boundary_positions = self._dsv4_cp_boundary_seq_positions(packed_seq_params, d_window)
-        boundary_key = _apply_rope_at_positions(
+        boundary_key = apply_rope_at_positions(
             boundary_kv.unsqueeze(-2),
             self.config.qk_head_dim,
             self.config.qk_pos_emb_head_dim,
@@ -530,7 +530,7 @@ class DSv4HybridAttention(Attention):
                 rot_part_in = rot_part
             if use_contiguous_thd_cp:
                 inverse_positions = self._dsv4_cp_local_seq_positions(packed_seq_params, seq_len)
-                rot_part_out = _apply_rope_at_positions(
+                rot_part_out = apply_rope_at_positions(
                     rot_part_in.clone().unsqueeze(1),
                     0,
                     pos_dim,
@@ -744,10 +744,8 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         else:
             cu_seqlens_q = cu_seqlens_kv = None
 
-        cp_full_projection_input = None
-        cp_local_token_ids = None
         if packed_seq and self.pg_collection.cp.size() > 1:
-            global_start, l_local = contiguous_cp_partition(
+            _, l_local = contiguous_cp_partition(
                 cu_seqlens_q, self.pg_collection.cp.size(), self.pg_collection.cp.rank()
             )
             if l_local != hidden_states.shape[0]:
@@ -755,30 +753,14 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     "DSv4 THD CP projection expects contiguous equal local token chunks: "
                     f"hidden={hidden_states.shape[0]}, L_local={l_local}"
                 )
-            cp_local_token_ids = torch.arange(
-                global_start,
-                global_start + l_local,
-                device=hidden_states.device,
-                dtype=torch.long,
-            )
-            cp_full_projection_input = hidden_states.new_zeros(
-                (int(cu_seqlens_q[-1].item()),) + tuple(hidden_states.shape[1:])
-            )
-            cp_full_projection_input = cp_full_projection_input.index_copy(
-                0, cp_local_token_ids, hidden_states
-            )
-
-        projection_hidden_states = (
-            cp_full_projection_input if cp_full_projection_input is not None else hidden_states
-        )
 
         # =========================================
         # QKV down projection and layernorm
         # =========================================
         # q_compressed: [s, b, q_lora_rank]
-        q_compressed, _ = self.linear_q_down_proj(projection_hidden_states)
+        q_compressed, _ = self.linear_q_down_proj(hidden_states)
 
-        kv_compressed = projection_hidden_states
+        kv_compressed = hidden_states
         k_pos_emb = None
 
         if packed_seq_params is not None:
@@ -787,12 +769,8 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             # So we need to reshape qkv from [t, 1, h, d] to [t, h, d].
             q_compressed = q_compressed.squeeze(1)
             kv_compressed = kv_compressed.squeeze(1)
-        if cp_local_token_ids is not None:
-            q_compressed_local = q_compressed.index_select(0, cp_local_token_ids)
-            kv_compressed_local = kv_compressed.index_select(0, cp_local_token_ids)
-        else:
-            q_compressed_local = q_compressed
-            kv_compressed_local = kv_compressed
+        q_compressed_local = q_compressed
+        kv_compressed_local = kv_compressed
         explicit_cp_positions = None
         if packed_seq and self.pg_collection.cp.size() > 1:
             explicit_cp_positions = self._dsv4_cp_local_seq_positions(
@@ -806,12 +784,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         if self.config.q_lora_rank is not None:
             # q_compressed: [num_tokens, q_lora_rank]
             q_compressed = apply_module(self.q_layernorm)(q_compressed)
-            if cp_local_token_ids is not None:
-                q_compressed_local = q_compressed.index_select(0, cp_local_token_ids)
-            else:
-                q_compressed_local = q_compressed
-        else:
-            q_compressed_local = q_compressed_local
+            q_compressed_local = q_compressed
 
         # =========================================
         # QKV up projection and RoPE apply
@@ -830,13 +803,9 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
 
             # q: [num_tokens, n, q_head_dim]
             q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
-            if cp_local_token_ids is not None:
-                q = q.index_select(0, cp_local_token_ids)
             q = _q_rms_norm(q, self.config.layernorm_epsilon)
 
             kv, _ = self.linear_kv_proj(kv_compressed)
-            if cp_local_token_ids is not None:
-                kv = kv.index_select(0, cp_local_token_ids)
             kv = self.kv_layernorm(kv)
 
             # [num_tokens, qk_pos_emb_head_dim] -> [num_tokens, 1, qk_pos_emb_head_dim]
@@ -872,7 +841,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             else:
                 q_len = q.size()[0]
                 if explicit_cp_positions is not None:
-                    query = _apply_rope_at_positions(
+                    query = apply_rope_at_positions(
                         q,
                         self.config.qk_head_dim,
                         self.config.qk_pos_emb_head_dim,
@@ -880,7 +849,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                         self.config,
                         explicit_cp_positions,
                     )
-                    kv = _apply_rope_at_positions(
+                    kv = apply_rope_at_positions(
                         kv.unsqueeze(-2),
                         self.config.qk_head_dim,
                         self.config.qk_pos_emb_head_dim,
