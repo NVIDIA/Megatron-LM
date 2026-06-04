@@ -31,6 +31,7 @@ try:
     from transformer_engine.pytorch.distributed import (
         _NVFP4AllGatherAsyncHandle,
         gather_along_first_dim,
+        in_fp8_activation_recompute_phase,
         reduce_scatter_along_first_dim,
     )
     from transformer_engine.pytorch.module.base import get_dummy_wgrad
@@ -499,6 +500,10 @@ class GTPShardedParam(torch.nn.Parameter):
     # params with the same chain_id.
     _chain_state: Dict[str, dict] = {}
 
+    # Per-chain cursor for the recompute-forward prefetch chain (see the _recompute_*
+    # slot on GTPShardedParam). Keyed by chain_id like _chain_state.
+    _recompute_chain_state: Dict[str, dict] = {}
+
     @classmethod
     def _get_chain_state(cls, chain_id: str) -> dict:
         if chain_id not in cls._chain_state:
@@ -509,6 +514,12 @@ class GTPShardedParam(torch.nn.Parameter):
                 "link_table_flushed": False,
             }
         return cls._chain_state[chain_id]
+
+    @classmethod
+    def _get_recompute_chain_state(cls, chain_id: str) -> dict:
+        if chain_id not in cls._recompute_chain_state:
+            cls._recompute_chain_state[chain_id] = {"last_weight": None}
+        return cls._recompute_chain_state[chain_id]
 
     @classmethod
     def _buffer_link_table_row(
@@ -575,6 +586,18 @@ class GTPShardedParam(torch.nn.Parameter):
         self.prefetch_initialized = False
         self.next_w = None
         self.prev_w = None
+        # Recompute-forward prefetch chain: a SEPARATE chain (own slot) linking
+        # the weights re-gathered rowwise during an activation-recompute forward
+        # in backward. Kept distinct from state/_prefetch_handle/ag_event above so
+        # it never clobbers the concurrent columnwise dgrad lifecycle of the same
+        # weight. Self-populates lazily from the first backward's recompute-fwd
+        # gathers (see all_gather_and_prefetch).
+        self._recompute_initialized = False
+        self._recompute_next = None
+        self._recompute_prev = None
+        self._recompute_prefetch_handle = None
+        self._recompute_ag_event = torch.cuda.Event(external=True)
+        self._recompute_already_drained = False
         # Chain identity (GTPChain.GRAPHED / GTPChain.UNGRAPHED). Defaults to
         # UNGRAPHED as a safe fallback; classify_gtp_chains(model) walks the
         # model at init time (after set_cuda_graph_modules) and reclassifies
@@ -789,8 +812,11 @@ class GTPShardedParam(torch.nn.Parameter):
 
         weights = self._weights
 
-        # 1. Transition state for async gathers.
-        if GTP_CONFIG.check_param_states:
+        # 1. Transition state for async gathers. Skip during a recompute-forward:
+        #    it gathers this weight rowwise (into _ag_ticket_fwd) while a bwd-chain
+        #    prefetch may hold an in-flight columnwise AG state on the same weight
+        #    (separate _ag_ticket_bwd) — clobbering it would break the dgrad consume.
+        if GTP_CONFIG.check_param_states and not in_fp8_activation_recompute_phase():
             new_state = GTPWeightState.ASYNC_WAIT if async_op else GTPWeightState.DATA_READY_SYNC
             for w in weights:
                 w._set_state(new_state)
@@ -974,6 +1000,50 @@ class GTPShardedParam(torch.nn.Parameter):
         result = [r.detach().requires_grad_(w.requires_grad) for r, w in zip(result, self._weights)]
         return result if self.is_routed_expert else result[0]
 
+    def _wait_recompute_param_gather(self):
+        # Recompute-chain analogue of _wait_param_gather, on the _recompute_* slot.
+        ag_stream = self._cached_ag_stream
+        if ag_stream is None:
+            ag_stream = get_ag_stream(self.chain_id, self.group)
+            self._cached_ag_stream = ag_stream
+        with torch.cuda.stream(ag_stream):
+            if self._recompute_prefetch_handle is not None:
+                self._recompute_prefetch_handle.wait()
+                self._recompute_prefetch_handle = None
+                self._recompute_ag_event.record()
+
+    def _recompute_prefetch_next(self, target, nvtx_label=None):
+        # Issue target's rowwise (fwd) AG into its recompute slot. _all_gather_weight
+        # skips the AG-state transition under recompute, so the dgrad `state` of
+        # target is untouched; result lands in target._ag_ticket_fwd.
+        _, handle = target._all_gather_weight(
+            async_op=True,
+            skip_weight_cast=True,
+            cast_noop_flag=None,
+            fwd=True,
+            nvtx_label=nvtx_label,
+        )
+        target._recompute_prefetch_handle = handle
+
+    def _get_recompute_prefetched_weight(self):
+        # Recompute-chain analogue of _get_prefetched_weight (state-neutral; reads the
+        # rowwise _ag_ticket_fwd via the _recompute_* slot).
+        if self._recompute_already_drained:
+            # Producer already drained via wait_async_comms (CG capture); skip the
+            # captured cross-graph wait (CUDA no-op anyway).
+            self._recompute_already_drained = False
+        else:
+            self._wait_recompute_param_gather()
+            self._recompute_ag_event.wait()
+
+        result = []
+        cache = get_global_GTP_cache()
+        for w in self._weights:
+            result.append(cache.get(w._ag_ticket_fwd))
+        result = [self._strip_padding(r) for r in result]
+        result = [r.detach().requires_grad_(w.requires_grad) for r, w in zip(result, self._weights)]
+        return result if self.is_routed_expert else result[0]
+
     def all_gather_and_prefetch_bwd(self, nvtx_label=None):
         """
         Backward variant: get current weight (from cache if prefetched, else
@@ -1041,14 +1111,31 @@ class GTPShardedParam(torch.nn.Parameter):
         Returns:
             weight_total
         """
-        if GTP_CONFIG.weight_prefetch and self.prev_w is not None:
+        # During an activation-recompute forward (runs in backward), route consume +
+        # prefetch through the recompute-forward chain on its own _recompute_* slot
+        # (see __init__) instead of the fwd/bwd chains; lazy-built below.
+        in_recompute = in_fp8_activation_recompute_phase()
+        use_recompute_chain = in_recompute and GTP_CONFIG.weight_prefetch
+
+        # Consume current weight.
+        if use_recompute_chain and self._recompute_prev is not None:
+            result = self._get_recompute_prefetched_weight()
+        elif not in_recompute and GTP_CONFIG.weight_prefetch and self.prev_w is not None:
             result = self._get_prefetched_weight(True, skip_weight_cast, cast_noop_flag)
         else:
+            # On-demand: chain head (fwd or recompute global-first) or first-iter build.
             result = self._all_gather_weight_on_demand(True, skip_weight_cast, cast_noop_flag)
 
-        # Prefetch next weight
+        # Prefetch next weight on the matching chain.
         if (
-            GTP_CONFIG.weight_prefetch
+            use_recompute_chain
+            and self._recompute_next is not None
+            and self._recompute_next._need_weight_prefetch
+        ):
+            self._recompute_prefetch_next(self._recompute_next, nvtx_label=nvtx_label)
+        elif (
+            not in_recompute
+            and GTP_CONFIG.weight_prefetch
             and self.next_w is not None
             and self.next_w._need_weight_prefetch
         ):
@@ -1063,14 +1150,29 @@ class GTPShardedParam(torch.nn.Parameter):
             )
             self.next_w._prefetch_handle = handle
 
-        # The unsharded tensor has been returned, no pending work so reset state to NONE
-        if GTP_CONFIG.check_param_states:
+        # The unsharded tensor has been returned, no pending work so reset state to NONE.
+        # Skip during recompute: a bwd-chain prefetch may hold an in-flight AG state on
+        # this weight that its later dgrad consume still needs.
+        if GTP_CONFIG.check_param_states and not in_recompute:
             for w in self._weights:
                 w._set_state(GTPWeightState.NONE)
 
-        # Lazy population of linked list: link previous weight to current weight
-        # Uses per-chain state so dense and expert chains never cross-link.
         cls = type(self)
+
+        # Lazy-build the recompute-forward prefetch chain (first backward, in
+        # recompute order). Consume/prefetch above used the prior iteration's links,
+        # so the first backward runs on-demand while these links are established.
+        if in_recompute and not self._recompute_initialized:
+            rchain = cls._get_recompute_chain_state(self.chain_id)
+            last_r = rchain["last_weight"]
+            if last_r is not None and last_r._recompute_next is None:
+                last_r._recompute_next = self
+                self._recompute_prev = last_r
+            self._recompute_initialized = True
+            rchain["last_weight"] = self
+
+        # Lazy population of the fwd/bwd linked list: link previous weight to current.
+        # Uses per-chain state so dense and expert chains never cross-link.
         chain = cls._get_chain_state(self.chain_id)
         if not self.prefetch_initialized:
             last_w = chain["last_weight"]
@@ -1442,7 +1544,7 @@ class GTPWeightCache:
         self._total_bytes += buf_bytes
         print_rank_0(
             f"[GTP Cache] +{buf_bytes / 1024**2:.1f} MB  (shape={out_shape}, dtype={dtype})  "
-            f"total={self._total_bytes / 1024**2:.1f} MB id: {id(buf)} fwd: {fwd}"
+            f"total={self._total_bytes / 1024**2:.1f} MB  param: {param._debug_name} fwd: {fwd}"
         )
         return buf
 
@@ -1634,6 +1736,11 @@ def wait_async_comms(
         param._wait_param_gather()
         if had_ag:
             param._already_ag_drained = True
+        # Recompute-forward chain: drain its separate in-flight rowwise AG so the
+        # captured recompute consumer skips its cross-graph wait (full-iteration CG).
+        if param._recompute_prefetch_handle is not None:
+            param._wait_recompute_param_gather()
+            param._recompute_already_drained = True
         if not skip_rs:
             param._wait_reduce_scatter(finalize_grad=finalize_after_drain)
             # Fallback inline-accumulation: only when finalize is requested,
