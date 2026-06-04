@@ -4141,6 +4141,11 @@ class AllGatherPipeline:
                 bucket_id for bucket_id in ag_buckets if bucket_id not in current_ag_bucket_set
             ]
 
+        # Do not release the buckets that are requested by this call, even if
+        # they are already ready and do not need a new all-gather.
+        for bucket_id in ag_buckets:
+            self.bucket_can_be_released[self.get_bucket_key(bucket_id, bwd)] = False
+
         # Only all-gather on buckets that have not been allocated yet or whose
         # persistent storage was preserved but is not ready for use.
         ag_buckets = [
@@ -4151,10 +4156,6 @@ class AllGatherPipeline:
         ]
         if len(ag_buckets) == 0:
             return
-
-        # Do not release the buckets that are being all-gathered.
-        for bucket_id in ag_buckets:
-            self.bucket_can_be_released[self.get_bucket_key(bucket_id, bwd)] = False
 
         # Divide buckets into aggregate groups. We need to reconstruct the bucket groups
         # because the all-gather parameter groups may be a subset of the buckets.
