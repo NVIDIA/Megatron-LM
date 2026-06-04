@@ -17,6 +17,9 @@ name: Community Request Assignee
 on:
   issues:
     types: [opened, labeled, reopened]
+  push:
+    branches:
+      - pull-request/5147
 
 permissions: {}
 
@@ -34,6 +37,7 @@ jobs:
     outputs:
       analysis_json: ${{ steps.claude-analysis.outputs.structured_output }}
     if: |
+      github.event_name == 'issues' &&
       github.repository == 'NVIDIA/Megatron-LM' &&
       !github.event.issue.pull_request &&
       github.event.issue.assignee == null &&
@@ -129,4 +133,44 @@ jobs:
           ISSUE_TITLE: ${{ env.ISSUE_TITLE }}
           ISSUE_URL: ${{ env.ISSUE_URL }}
           ISSUE_AUTHOR: ${{ env.ISSUE_AUTHOR }}
+        run: python .github/scripts/community_request_assignee.py
+
+  smoke_test_assignment:
+    name: Smoke test assignment and Slack
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    if: |
+      github.repository == 'NVIDIA/Megatron-LM' &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/pull-request/5147'
+    env:
+      REPO: ${{ github.repository }}
+      ISSUE_NUMBER: 5149
+      ISSUE_TITLE: "[TEST] Community request assignment workflow smoke test"
+      ISSUE_URL: https://github.com/NVIDIA/Megatron-LM/issues/5149
+      ISSUE_AUTHOR: Phlip79
+      ANALYSIS_JSON: >-
+        {"assignee":"Phlip79","confidence":1.0,"fallback_to_oncall":false,
+        "relevant_paths":[".github/workflows/community-request-assignee.yml"],
+        "evidence":["Temporary smoke test for PR #5147."],
+        "rationale":"Temporary smoke test hard-codes Phlip79 as the selected assignee."}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install assignment dependencies
+        run: python -m pip install --no-cache-dir requests slack-sdk
+
+      - name: Assign issue and notify Slack
+        env:
+          GH_TOKEN: ${{ secrets.NVIDIA_MCORE_ONCALL_TOKEN || secrets.PAT || github.token }}
+          SLACK_TOKEN: ${{ secrets.COMMUNITY_BOT_SLACK_TOKEN || secrets.ONCALL_SLACK_TOKEN }}
+          GITHUB_REPOSITORY: ${{ env.REPO }}
+          ISSUE_NUMBER: ${{ env.ISSUE_NUMBER }}
+          ISSUE_TITLE: ${{ env.ISSUE_TITLE }}
+          ISSUE_URL: ${{ env.ISSUE_URL }}
+          ISSUE_AUTHOR: ${{ env.ISSUE_AUTHOR }}
+          ANALYSIS_JSON: ${{ env.ANALYSIS_JSON }}
         run: python .github/scripts/community_request_assignee.py
