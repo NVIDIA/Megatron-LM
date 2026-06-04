@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 """MRoPE (Multimodal Rotary Position Embedding) position ID computation.
 
@@ -55,6 +55,7 @@ def _build_sample_mrope_positions(
     vision_tokens = sample_input_ids[vision_start_indices + 1]
     image_nums = int((vision_tokens == image_token_id).sum())
     video_nums = int((vision_tokens == video_token_id).sum())
+    # TODO: fuse into a kernel to drop the per-iter GPU<->CPU sync.
     input_tokens = sample_input_ids.tolist()
     llm_pos_ids_list: list = []
     st = 0

@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 """Model registry for multimodal_dev training.
 
@@ -54,7 +54,7 @@ MODEL_REGISTRY = {
                 ".train_valid_test_datasets_provider"
             ),
             "cord_v2": (
-                "examples.multimodal_dev.data.vlm_dataset"
+                "examples.multimodal_dev.data.cord_v2"
                 ".train_valid_test_datasets_provider"
             ),
         },

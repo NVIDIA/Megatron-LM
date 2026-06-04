@@ -1,26 +1,61 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Tests for THD (packed sequence) support in multimodal_dev."""
+"""Tests for THD / padded batch construction in multimodal_dev.
+
+Exercises the production data path :func:`pack_or_pad_batch`, which
+consumes a list of per-sample dicts produced by the dataset's
+``__getitem__`` and produces either a packed THD batch (``[1, T]``) or a
+padded BSHD batch (``[B, S]``).
+
+``pack_or_pad_batch`` ends with a TP-group broadcast, so these tests
+require ``torch.distributed`` to be initialised.  Run via::
+
+    torchrun --nproc-per-node 1 -m pytest -q \\
+        examples/multimodal_dev/tests/test_thd_e2e.py
+"""
+
+import os
+import sys
 
 import pytest
 import torch
 
-import sys
-import os
-
-# Ensure the repo root is on the path so that the examples package is importable.
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.."))
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
-from examples.multimodal_dev.forward_step import (
-    _build_packed_seq_params,
-    _pack_batch,
-)
+from examples.multimodal_dev.forward_step import _build_packed_seq_params, pack_or_pad_batch
+from tests.unit_tests.test_utilities import Utils
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _init_model_parallel():
+    """Single-rank TP init so pack_or_pad_batch's TP broadcast is a no-op."""
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+    yield
+    Utils.destroy_model_parallel()
+
+
+def _make_sample(
+    seq_len: int, *, base: int = 0, num_patches: int = 4, pixel_dim: int = 8, device: str = "cuda"
+):
+    """Per-sample dict in the shape produced by ``CordV2VLMDataset.__getitem__``.
+
+    1-D ``input_ids`` / ``labels`` / ``loss_mask`` over the sequence dim;
+    ``pixel_values`` is ``[num_patches, pixel_dim]``; ``image_grid_thw`` is
+    ``[1, 3]``.
+    """
+    return {
+        "input_ids": torch.arange(seq_len, dtype=torch.long, device=device) + base,
+        "labels": (torch.arange(seq_len, dtype=torch.long, device=device) + base + 100),
+        "loss_mask": torch.ones(seq_len, dtype=torch.float, device=device),
+        "pixel_values": torch.full((num_patches, pixel_dim), float(base), device=device),
+        "image_grid_thw": torch.tensor([[2, 4, 4]], dtype=torch.long, device=device),
+    }
 
 
 # ===================================================================
-# Unit tests — CPU, no distributed / GPU required
+# _build_packed_seq_params — pure helper, exercised independently
 # ===================================================================
 
 
@@ -28,236 +63,252 @@ class TestBuildPackedSeqParams:
     """Tests for ``_build_packed_seq_params``."""
 
     def test_basic(self):
-        params = _build_packed_seq_params(
-            torch.tensor([5, 3, 7], dtype=torch.int32), device="cpu",
-        )
+        """Mixed-length sample build sanity check."""
+        params = _build_packed_seq_params(torch.tensor([5, 3, 7], dtype=torch.int32), device="cpu")
         assert params.qkv_format == "thd"
         assert params.cu_seqlens_q.tolist() == [0, 5, 8, 15]
         assert params.cu_seqlens_kv.tolist() == [0, 5, 8, 15]
         assert params.max_seqlen_q == 7
         assert params.max_seqlen_kv == 7
         assert params.total_tokens == 15
-        # Padded cu_seqlens mirror actual cu_seqlens (no per-subseq padding).
-        assert params.cu_seqlens_q_padded is not None
         assert params.cu_seqlens_q_padded.tolist() == [0, 5, 8, 15]
-        assert params.cu_seqlens_kv_padded is not None
         assert params.cu_seqlens_kv_padded.tolist() == [0, 5, 8, 15]
 
     def test_equal_lengths(self):
-        params = _build_packed_seq_params(
-            torch.tensor([4, 4, 4], dtype=torch.int32), device="cpu",
-        )
+        """Equal-length samples produce uniform cu_seqlens."""
+        params = _build_packed_seq_params(torch.tensor([4, 4, 4], dtype=torch.int32), device="cpu")
         assert params.cu_seqlens_q.tolist() == [0, 4, 8, 12]
         assert params.max_seqlen_q == 4
         assert params.total_tokens == 12
 
     def test_single_sample(self):
-        params = _build_packed_seq_params(
-            torch.tensor([10], dtype=torch.int32), device="cpu",
-        )
+        """Single-sample batch round-trips its own length."""
+        params = _build_packed_seq_params(torch.tensor([10], dtype=torch.int32), device="cpu")
         assert params.cu_seqlens_q.tolist() == [0, 10]
         assert params.max_seqlen_q == 10
         assert params.total_tokens == 10
 
     def test_dtype_is_int32(self):
-        params = _build_packed_seq_params(
-            torch.tensor([3, 5], dtype=torch.int32), device="cpu",
-        )
+        """``cu_seqlens_q`` is cast to int32 regardless of input dtype."""
+        params = _build_packed_seq_params(torch.tensor([3, 5], dtype=torch.int32), device="cpu")
         assert params.cu_seqlens_q.dtype == torch.int32
 
     def test_seq_idx_computed(self):
-        """Verify __post_init__ computes seq_idx for Mamba compatibility."""
-        params = _build_packed_seq_params(
-            torch.tensor([3, 2], dtype=torch.int32), device="cpu",
-        )
-        # seq_idx should be [0,0,0,1,1] (shape [1, 5])
+        """``__post_init__`` computes ``seq_idx`` for Mamba compatibility."""
+        params = _build_packed_seq_params(torch.tensor([3, 2], dtype=torch.int32), device="cpu")
         assert params.seq_idx is not None
         assert params.seq_idx.shape == (1, 5)
         assert params.seq_idx[0].tolist() == [0, 0, 0, 1, 1]
 
 
-class TestPackBatch:
-    """Tests for ``_pack_batch``."""
+# ===================================================================
+# pack_or_pad_batch — packed (THD) mode
+# ===================================================================
 
-    def test_no_padding(self):
-        """All tokens valid — T == B*S."""
-        B, S = 2, 8
-        batch = {
-            "input_ids": torch.arange(B * S).reshape(B, S),
-            "labels": torch.arange(B * S).reshape(B, S) + 100,
-            "loss_mask": torch.ones(B, S),
-            "position_ids": torch.arange(S).unsqueeze(0).unsqueeze(0).expand(
-                3, B, S,
-            ).clone(),
-        }
-        packed = _pack_batch(batch)
 
-        T = B * S
+class TestPackOrPadBatchPacked:
+    """``pack_or_pad_batch(..., use_packed_sequence=True)`` produces ``[1, T]``."""
+
+    def test_equal_lengths(self):
+        """Two equal-length samples → packed ``[1, 2S]``."""
+        S = 8
+        batch = [_make_sample(S, base=0), _make_sample(S, base=1000)]
+        packed = pack_or_pad_batch(batch, use_packed_sequence=True, device="cuda")
+
+        T = 2 * S
         assert packed["input_ids"].shape == (1, T)
         assert packed["labels"].shape == (1, T)
         assert packed["loss_mask"].shape == (1, T)
-        assert packed["position_ids"].shape == (3, 1, T)
-        assert packed["attention_mask"] is None
-        assert packed["packed_seq_params"].total_tokens == T
+        psp = packed["packed_seq_params"]
+        assert psp.cu_seqlens_q.tolist() == [0, S, T]
+        assert psp.cu_seqlens_q_padded.tolist() == [0, S, T]
+        assert psp.max_seqlen_q == S
+        assert psp.total_tokens == T
 
-    def test_with_padding(self):
-        """attention_mask strips padding — T < B*S."""
-        B, S = 2, 8
-        batch = {
-            "input_ids": torch.arange(B * S).reshape(B, S),
-            "labels": torch.arange(B * S).reshape(B, S),
-            "loss_mask": torch.ones(B, S),
-            "position_ids": torch.zeros(3, B, S, dtype=torch.long),
-            "attention_mask": torch.tensor([
-                [1, 1, 1, 1, 1, 0, 0, 0],  # 5 valid
-                [1, 1, 1, 0, 0, 0, 0, 0],  # 3 valid
-            ]),
-        }
-        packed = _pack_batch(batch)
+    def test_variable_lengths(self):
+        """Variable-length samples concatenated end-to-end."""
+        lens = [5, 8, 3]
+        batch = [_make_sample(L, base=i * 1000) for i, L in enumerate(lens)]
+        packed = pack_or_pad_batch(batch, use_packed_sequence=True, device="cuda")
 
-        T = 5 + 3
+        T = sum(lens)
         assert packed["input_ids"].shape == (1, T)
-        assert packed["labels"].shape == (1, T)
-        assert packed["packed_seq_params"].cu_seqlens_q.tolist() == [0, 5, 8]
-        assert packed["packed_seq_params"].max_seqlen_q == 5
-        assert packed["packed_seq_params"].total_tokens == T
+        psp = packed["packed_seq_params"]
+        assert psp.cu_seqlens_q.tolist() == [0, 5, 13, 16]
+        assert psp.cu_seqlens_q_padded.tolist() == [0, 5, 13, 16]
+        assert psp.max_seqlen_q == 8
+        assert psp.total_tokens == T
 
     def test_token_order_preserved(self):
-        """Packed tokens appear in sample-0 then sample-1 order."""
-        batch = {
-            "input_ids": torch.tensor([[10, 20, 30], [40, 50, 60]]),
-            "position_ids": torch.zeros(3, 2, 3, dtype=torch.long),
-        }
-        packed = _pack_batch(batch)
-        assert packed["input_ids"].tolist() == [[10, 20, 30, 40, 50, 60]]
+        """Sample 0's tokens precede sample 1's tokens in the packed sequence."""
+        s0 = _make_sample(3, base=10)
+        s1 = _make_sample(3, base=40)
+        packed = pack_or_pad_batch([s0, s1], use_packed_sequence=True, device="cuda")
+        assert packed["input_ids"][0].tolist() == [10, 11, 12, 40, 41, 42]
 
-    def test_position_ids_mrope(self):
-        """MRoPE [3, B, S] → [3, 1, T] with correct concatenation."""
-        B, S = 2, 4
-        pos = torch.zeros(3, B, S, dtype=torch.long)
-        # Sample 0: positions [0,1,2,3] on all 3 dims
-        # Sample 1: positions [10,11,12,13] on all 3 dims
-        for d in range(3):
-            pos[d, 0] = torch.tensor([0, 1, 2, 3])
-            pos[d, 1] = torch.tensor([10, 11, 12, 13])
+    def test_labels_loss_mask_content_preserved(self):
+        """labels and loss_mask carry through unchanged when divisible_by=1."""
+        s = _make_sample(4, base=0)
+        packed = pack_or_pad_batch([s], use_packed_sequence=True, device="cuda")
+        assert packed["labels"][0].tolist() == [100, 101, 102, 103]
+        assert packed["loss_mask"][0].tolist() == [1.0, 1.0, 1.0, 1.0]
 
-        batch = {
-            "input_ids": torch.zeros(B, S, dtype=torch.long),
-            "position_ids": pos,
-        }
-        packed = _pack_batch(batch)
+    def test_pixel_values_concatenated(self):
+        """``pixel_values`` are concatenated along the patch dim."""
+        s0 = _make_sample(4, base=0, num_patches=4, pixel_dim=8)
+        s1 = _make_sample(4, base=10, num_patches=6, pixel_dim=8)
+        packed = pack_or_pad_batch([s0, s1], use_packed_sequence=True, device="cuda")
+        assert packed["pixel_values"].shape == (10, 8)
+        assert packed["pixel_values"][:4].eq(0.0).all().item()
+        assert packed["pixel_values"][4:].eq(10.0).all().item()
 
-        assert packed["position_ids"].shape == (3, 1, 8)
-        # Each dim: [0,1,2,3,10,11,12,13]
-        for d in range(3):
-            assert packed["position_ids"][d, 0].tolist() == [
-                0, 1, 2, 3, 10, 11, 12, 13,
-            ]
+    def test_image_grid_thw_concatenated(self):
+        """``image_grid_thw`` rows are concatenated along the first dim."""
+        s0 = _make_sample(4, base=0)
+        s1 = _make_sample(4, base=10)
+        packed = pack_or_pad_batch([s0, s1], use_packed_sequence=True, device="cuda")
+        assert packed["image_grid_thw"].shape == (2, 3)
 
-    def test_standard_position_ids(self):
-        """Standard [B, S] position_ids → [1, T]."""
-        B, S = 2, 3
-        batch = {
-            "input_ids": torch.zeros(B, S, dtype=torch.long),
-            "position_ids": torch.tensor([[0, 1, 2], [0, 1, 2]]),
-        }
-        packed = _pack_batch(batch)
-        assert packed["position_ids"].shape == (1, 6)
-        assert packed["position_ids"].tolist() == [[0, 1, 2, 0, 1, 2]]
+    def test_single_sample_round_trip(self):
+        """A single sample packs to its own length."""
+        s = _make_sample(7, base=0)
+        packed = pack_or_pad_batch([s], use_packed_sequence=True, device="cuda")
+        assert packed["input_ids"].shape == (1, 7)
+        psp = packed["packed_seq_params"]
+        assert psp.cu_seqlens_q.tolist() == [0, 7]
+        assert psp.max_seqlen_q == 7
+        assert psp.total_tokens == 7
 
-    def test_no_labels_no_loss_mask(self):
-        """Gracefully handle missing labels and loss_mask."""
-        batch = {
-            "input_ids": torch.tensor([[1, 2], [3, 4]]),
-            "position_ids": torch.zeros(3, 2, 2, dtype=torch.long),
-        }
-        packed = _pack_batch(batch)
-        assert packed["input_ids"].shape == (1, 4)
-        assert packed.get("labels") is None
-        assert packed.get("loss_mask") is None
 
-    def test_data_provided_cu_seqlens_takes_priority(self):
-        """Prefer dataset-provided cu_seqlens over attention_mask."""
-        B, S = 2, 6
-        batch = {
-            "input_ids": torch.tensor([
-                [1, 2, 3, 4, 5, 6],
-                [7, 8, 9, 10, 11, 12],
-            ]),
-            "labels": torch.tensor([
-                [101, 102, 103, 104, 105, 106],
-                [107, 108, 109, 110, 111, 112],
-            ]),
-            "loss_mask": torch.ones(B, S),
-            "position_ids": torch.zeros(3, B, S, dtype=torch.long),
-            # Deliberately inconsistent with cu_seqlens.
-            "attention_mask": torch.ones(B, S),
-            # Per-sample cu_seqlens: sample0 len=4, sample1 len=2.
-            "cu_seqlens": torch.tensor([[0, 4], [0, 2]], dtype=torch.int32),
-            "cu_seqlens_padded": torch.tensor([[0, 4], [0, 2]], dtype=torch.int32),
-            "max_seqlen": torch.tensor([4, 2], dtype=torch.int32),
-        }
-        packed = _pack_batch(batch)
+# ===================================================================
+# pack_or_pad_batch — padded (BSHD) mode
+# ===================================================================
 
-        assert packed["input_ids"].shape == (1, 6)
-        assert packed["input_ids"].tolist() == [[1, 2, 3, 4, 7, 8]]
-        assert packed["labels"].tolist() == [[101, 102, 103, 104, 107, 108]]
-        assert packed["packed_seq_params"].cu_seqlens_q.tolist() == [0, 4, 6]
-        assert packed["packed_seq_params"].max_seqlen_q == 4
-        # Raw data-side metadata is no longer needed after packing.
-        assert "cu_seqlens" not in packed
-        assert "cu_seqlens_padded" not in packed
-        assert "max_seqlen" not in packed
 
-    def test_multisegment_cu_seqlens_rejected(self):
-        """[B, N] cu_seqlens with N>2 is explicitly unsupported."""
-        batch = {
-            "input_ids": torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]]),
-            "position_ids": torch.zeros(3, 2, 4, dtype=torch.long),
-            "cu_seqlens": torch.tensor(
-                [[0, 2, 4], [0, 1, 4]], dtype=torch.int32,
-            ),
-        }
-        with pytest.raises(ValueError, match="expected \\[B, 2\\]"):
-            _pack_batch(batch)
+class TestPackOrPadBatchPadded:
+    """``pack_or_pad_batch(..., use_packed_sequence=False)`` produces ``[B, S]``."""
 
-    def test_variable_length_with_attention_mask(self):
-        """Variable-length sequences: attention_mask strips padding."""
-        B, S = 3, 10
-        seq_lengths = [8, 5, 10]  # valid tokens per sample
-        batch = {
-            "input_ids": torch.arange(B * S).reshape(B, S),
-            "labels": torch.arange(B * S).reshape(B, S) + 100,
-            "loss_mask": torch.ones(B, S),
-            "position_ids": torch.zeros(3, B, S, dtype=torch.long),
-            "attention_mask": torch.zeros(B, S),
-        }
-        for i, sl in enumerate(seq_lengths):
-            batch["attention_mask"][i, :sl] = 1.0
+    def test_equal_lengths(self):
+        """Equal-length samples → ``[B, S]`` without further padding."""
+        S = 6
+        batch = [_make_sample(S, base=0), _make_sample(S, base=10)]
+        padded = pack_or_pad_batch(batch, use_packed_sequence=False, seq_length=S, device="cuda")
+        assert padded["input_ids"].shape == (2, S)
+        assert padded["labels"].shape == (2, S)
+        assert padded["loss_mask"].shape == (2, S)
+        # Sample-0 content is preserved verbatim.
+        assert padded["input_ids"][0].tolist() == list(range(S))
 
-        packed = _pack_batch(batch)
+    def test_pads_short_sample_to_batch_max(self):
+        """Shorter sample is right-padded to match the batch max length."""
+        long_sample = _make_sample(7, base=0)
+        short_sample = _make_sample(3, base=10)
+        padded = pack_or_pad_batch(
+            [long_sample, short_sample], use_packed_sequence=False, seq_length=7, device="cuda"
+        )
+        assert padded["input_ids"].shape == (2, 7)
+        # Short sample: original [10, 11, 12] then pad zeros.
+        assert padded["input_ids"][1].tolist() == [10, 11, 12, 0, 0, 0, 0]
+        # labels pad with -100 (ignore index).
+        assert padded["labels"][1].tolist() == [110, 111, 112, -100, -100, -100, -100]
+        # loss_mask pads with 0.
+        assert padded["loss_mask"][1].tolist() == [1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
 
-        T = sum(seq_lengths)  # 23
+    def test_seq_length_required(self):
+        """``seq_length`` must be provided in padded mode."""
+        s = _make_sample(4, base=0)
+        with pytest.raises(AssertionError, match="seq_length"):
+            pack_or_pad_batch([s], use_packed_sequence=False, seq_length=None, device="cuda")
+
+    def test_pixel_values_concatenated(self):
+        """``pixel_values`` concat preserves both samples' patches."""
+        s0 = _make_sample(4, base=0, num_patches=4, pixel_dim=8)
+        s1 = _make_sample(4, base=10, num_patches=6, pixel_dim=8)
+        padded = pack_or_pad_batch([s0, s1], use_packed_sequence=False, seq_length=4, device="cuda")
+        assert padded["pixel_values"].shape == (10, 8)
+        assert padded["pixel_values"][:4].eq(0.0).all().item()
+        assert padded["pixel_values"][4:].eq(10.0).all().item()
+
+
+# ===================================================================
+# pack_or_pad_batch — divisible_by = 4 alignment
+# ===================================================================
+
+
+class TestPackOrPadBatchDivisibleBy4:
+    """Per-sample sequence alignment when ``divisible_by = 4``.
+
+    The function computes ``divisible_by`` from the parallel state.  With
+    ``world_size=1`` we cannot stand up a real CP=2 group, so we patch
+    :func:`mpu.get_context_parallel_world_size` to return 2; the function
+    then takes the ``cp_size > 1`` branch and yields
+    ``divisible_by = cp_size * 2 = 4`` (no SP).
+    """
+
+    @pytest.fixture
+    def cp2(self, monkeypatch):
+        """Patch CP world size to 2 so ``divisible_by = 4``."""
+        from examples.multimodal_dev import forward_step
+
+        monkeypatch.setattr(forward_step.mpu, "get_context_parallel_world_size", lambda: 2)
+
+    def test_packed_aligned_samples_no_padding(self, cp2):
+        """Samples already multiples of 4 → cu_seqlens == cu_seqlens_padded."""
+        batch = [_make_sample(8, base=0), _make_sample(4, base=100)]
+        packed = pack_or_pad_batch(batch, use_packed_sequence=True, device="cuda")
+
+        T = 12
         assert packed["input_ids"].shape == (1, T)
-        assert packed["labels"].shape == (1, T)
-        assert packed["loss_mask"].shape == (1, T)
-        assert packed["position_ids"].shape == (3, 1, T)
-        assert packed["packed_seq_params"].cu_seqlens_q.tolist() == [
-            0, 8, 13, 23,
-        ]
-        assert packed["packed_seq_params"].total_tokens == T
+        psp = packed["packed_seq_params"]
+        assert psp.cu_seqlens_q.tolist() == [0, 8, 12]
+        assert psp.cu_seqlens_q_padded.tolist() == [0, 8, 12]
+        assert psp.max_seqlen_q == 8
+        assert psp.total_tokens == 12
 
-        # Verify correct tokens were kept (first sl tokens per sample).
-        ids = packed["input_ids"][0].tolist()
-        expected = list(range(0, 8)) + list(range(10, 15)) + list(range(20, 30))
-        assert ids == expected
+    def test_packed_misaligned_samples_padded_per_sample(self, cp2):
+        """Each sample padded up to the nearest multiple of 4."""
+        # lens=[5, 8, 3] → padded=[8, 8, 4] → T_padded = 20.
+        batch = [_make_sample(5, base=0), _make_sample(8, base=100), _make_sample(3, base=200)]
+        packed = pack_or_pad_batch(batch, use_packed_sequence=True, device="cuda")
 
-    def test_packed_seq_params_cumsum_matches_loop(self):
-        """Verify torch.cumsum produces the same cu_seqlens as a Python loop."""
-        lengths = torch.tensor([17, 31, 11, 42, 1], dtype=torch.int32)
-        params = _build_packed_seq_params(lengths, device="cpu")
-        # Manual cumulative sum
-        expected = [0]
-        for sl in lengths.tolist():
-            expected.append(expected[-1] + int(sl))
-        assert params.cu_seqlens_q.tolist() == expected
+        T_padded = 20
+        assert packed["input_ids"].shape == (1, T_padded)
+        psp = packed["packed_seq_params"]
+        # cu_seqlens reflects real per-sample lengths.
+        assert psp.cu_seqlens_q.tolist() == [0, 5, 13, 16]
+        # cu_seqlens_padded reflects per-sample alignment to 4.
+        assert psp.cu_seqlens_q_padded.tolist() == [0, 8, 16, 20]
+        # max_seqlen comes from the padded lengths.
+        assert psp.max_seqlen_q == 8
+        assert psp.total_tokens == T_padded
+
+    def test_packed_pad_values(self, cp2):
+        """Pad slots filled with input_ids=0, labels=-100, loss_mask=0."""
+        # Single sample len=3 → target_len=4 → 1 pad slot at position 3.
+        batch = [_make_sample(3, base=10)]
+        packed = pack_or_pad_batch(batch, use_packed_sequence=True, device="cuda")
+
+        assert packed["input_ids"].shape == (1, 4)
+        assert packed["input_ids"][0].tolist() == [10, 11, 12, 0]
+        assert packed["labels"][0].tolist() == [110, 111, 112, -100]
+        assert packed["loss_mask"][0].tolist() == [1.0, 1.0, 1.0, 0.0]
+        psp = packed["packed_seq_params"]
+        assert psp.cu_seqlens_q.tolist() == [0, 3]
+        assert psp.cu_seqlens_q_padded.tolist() == [0, 4]
+        assert psp.max_seqlen_q == 4
+        assert psp.total_tokens == 4
+
+    def test_padded_target_rounded_up_to_multiple_of_4(self, cp2):
+        """Padded (BSHD) mode: ``target = ceil(min(max, seq_length) / 4) * 4``."""
+        # lens=[5, 3], seq_length=10 → min(5, 10) = 5 → ceil(5/4)*4 = 8.
+        long_sample = _make_sample(5, base=0)
+        short_sample = _make_sample(3, base=10)
+        padded = pack_or_pad_batch(
+            [long_sample, short_sample], use_packed_sequence=False, seq_length=10, device="cuda"
+        )
+
+        assert padded["input_ids"].shape == (2, 8)
+        assert padded["input_ids"][0].tolist() == [0, 1, 2, 3, 4, 0, 0, 0]
+        assert padded["input_ids"][1].tolist() == [10, 11, 12, 0, 0, 0, 0, 0]
+        assert padded["labels"][1].tolist() == [110, 111, 112, -100, -100, -100, -100, -100]
+        assert padded["loss_mask"][1].tolist() == [1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]

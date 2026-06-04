@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 """Standalone entry point for multimodal_dev model training (FSDP + EP).
 
@@ -148,6 +148,16 @@ if __name__ == "__main__":
         extra_args_provider=add_multimodal_args,
         args_defaults={},
     )
+    # multimodal_dev's model_provider builds the full model on every rank and
+    # does not honor pre_process / post_process pipeline-stage flags. PP>1
+    # would silently violate Megatron's pipeline-parallel contract.
+    if args.pipeline_model_parallel_size > 1:
+        raise ValueError(
+            "multimodal_dev does not support pipeline_model_parallel_size > 1 "
+            f"(got {args.pipeline_model_parallel_size}). The model provider "
+            "builds the full model on every rank; pipeline-stage splitting is "
+            "not wired through. Run with --pipeline-model-parallel-size 1."
+        )
     full_config = pretrain_cfg_container_from_args(args)
     pretrain(
         full_config,

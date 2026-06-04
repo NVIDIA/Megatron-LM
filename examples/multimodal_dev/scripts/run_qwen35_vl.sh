@@ -9,17 +9,18 @@
 #   MODEL_VARIANT: proxy (default), 0.8b, 2b, 4b, 9b, 27b, 35b_a3b, 122b_a10b, 397b_a17b, 35b_a3b_light
 #   CKPT_LOAD: path to a pre-converted checkpoint to load (enables --load + --finetune)
 #   CKPT_FORMAT: checkpoint format override (e.g. torch_dist); auto-detected when empty
-#   TP, EP, PP: parallelism sizes
+#   TP, EP, PP: parallelism sizes (PP must stay 1; multimodal_dev does not
+#               support pipeline parallelism)
 #   MBS, GBS: micro/global batch sizes
 #   NUM_LAYERS, NUM_EXPERTS: override for proxy testing
+#   FORCE_LOAD_BALANCING: set to 1 to enable --moe-router-force-load-balancing
+#                         (perf / mock-data only; OFF for real finetuning)
 #   LAUNCHER: torchrun (default) or python
 #   PROFILE: set to 1 to enable Nsight Systems profiling (default: 0)
 #   PROFILE_STEP_START/PROFILE_STEP_END: profiled iteration window (default: 4-5)
 
 # example script: 
-# WANDB_PROJECT=qwen35-cp-test  WANDB_MODE=online CP=2 GPUS_PER_NODE=8 CKPT_LOAD=/lustre/fs1/portfolios/coreai/users/lit/workspace/dev-project/models/Qwen/Qwen3.5-0.8B-fsdp-0420/ USE_FSDP=1 EP=1  GBS=16 MODEL_VARIANT=0.8b   SAVE_INTERVAL=10000 CKPT_RESUME=0 DRY_RUN=0  USE_PACKED_SEQUENCE=1  bash ./examples/multimodal_dev/scripts/run_qwen35_vl.sh
-
-# WANDB_PROJECT=qwen35-cp-test  WANDB_MODE=online CP=1 GPUS_PER_NODE=4 CKPT_LOAD=/lustre/fs1/portfolios/coreai/users/lit/workspace/dev-project/models/Qwen/Qwen3.5-0.8B-fsdp-0420/ USE_FSDP=1 EP=1  GBS=16 MODEL_VARIANT=0.8b   SAVE_INTERVAL=10000 CKPT_RESUME=0 DRY_RUN=0  USE_PACKED_SEQUENCE=1  bash ./examples/multimodal_dev/scripts/run_qwen35_vl.sh
+# DRY_RUN=0 MODEL_VARIANT=proxy USE_PACKED_SEQUENCE=1  bash ./examples/multimodal_dev/scripts/run_qwen35_vl.sh
 
 set -euo pipefail
 
@@ -50,9 +51,15 @@ GBS=${GBS:-16}
 
 # Parallelism
 TP=${TP:-1}
-EP=${EP:-2}
+# EP defaults to 1; MoE variants override via the variant case block below.
+EP=${EP:-1}
 PP=${PP:-1}
 CP=${CP:-1}
+# Gate --moe-router-force-load-balancing behind an explicit opt-in. Useful for
+# perf / mock-data benchmarking (it disables the auxiliary load-balancing loss
+# coupling so router routes are perfectly uniform), but it must be off for any
+# real fine-tuning / convergence run because it freezes data-dependent routing.
+FORCE_LOAD_BALANCING=${FORCE_LOAD_BALANCING:-0}
 
 # Variant-aware architecture defaults.
 # The model provider builds configs from the variant dict in
@@ -170,6 +177,16 @@ case "$MODEL_VARIANT" in
         VISION_NUM_LAYERS=${VISION_NUM_LAYERS:-27}
         ;;
 esac
+
+# Fail fast on inconsistent expert-parallelism configuration. Dense variants
+# (NUM_EXPERTS=0) do not emit any --num-experts / MoE args, so forwarding
+# --expert-model-parallel-size > 1 would trip Megatron's arg validation.
+if [ "${NUM_EXPERTS:-0}" -eq 0 ] && [ "$EP" -gt 1 ]; then
+    echo "ERROR: MODEL_VARIANT=$MODEL_VARIANT has NUM_EXPERTS=0 (dense) but EP=$EP." >&2
+    echo "       Set EP=1 for dense variants, or pick a MoE variant." >&2
+    exit 1
+fi
+
 SEQ_LEN=${SEQ_LEN:-4096}
 
 WANDB_PROJECT=${WANDB_PROJECT:-'qwen35-vl-0524'}
@@ -242,7 +259,7 @@ TRAINING_ARGS=(
     --cross-entropy-fusion-impl te
     --enable-experimental
     --manual-gc
-    --manual-gc-interval 5
+    --manual-gc-interval 50
     --mtp-num-layers 1
     --mtp-loss-scaling-factor 0.1
     --sft
@@ -288,6 +305,8 @@ EVAL_AND_LOGGING_ARGS=(
     --wandb-exp-name "$EXP_NAME"
     --wandb-save-dir "$CHECKPOINT_STORE_PATH"
     --log-throughput
+    --log-timers-to-tensorboard
+    --log-params-norm
 )
 
 # --- Tokenizer ---
@@ -348,7 +367,6 @@ GPT_MODEL_ARGS=(
     --linear-num-key-heads 16
     --linear-num-value-heads "$LINEAR_NUM_VALUE_HEADS"
     --make-vocab-size-divisible-by 485
-    --moe-router-force-load-balancing
 )
 
 # --- Tied / untied embeddings ---
@@ -388,7 +406,14 @@ if [ "${NUM_EXPERTS:-0}" -gt 0 ]; then
         --moe-aux-loss-coeff 1e-3
         --moe-token-dispatcher-type alltoall
         --moe-router-dtype fp32
+        --moe-permute-fusion
+        --moe-router-fusion
     )
+    # Perf / mock-data only: forces uniform router decisions; do NOT enable for
+    # real finetuning (it freezes data-dependent routing).
+    if [ "$FORCE_LOAD_BALANCING" -eq 1 ]; then
+        MOE_ARGS+=( --moe-router-force-load-balancing )
+    fi
 fi
 
 # --- Recompute ---
@@ -438,7 +463,6 @@ if [ "$USE_FSDP" -eq 1 ]; then
     FSDP_ARGS=(
         --use-megatron-fsdp
         --data-parallel-sharding-strategy optim_grads_params
-        --no-gradient-accumulation-fusion
         --init-model-with-meta-device
         --use-distributed-optimizer
         --ckpt-format fsdp_dtensor
