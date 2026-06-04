@@ -335,7 +335,7 @@ def _make_controller_with_rows(pending_ids, current_ids, current_graph_count=Non
         (None, [10, 11], (True, False), (False, False), None),
         ([10, 11], [10, 11], (True, False), (True, False), None),
         ([10, 11, 12], [12, 10, 11], (True, True), (True, True), [2, 0, 1]),
-        ([10, 11, 12], [12, 10], (False, False), (False, False), None),
+        ([10, 11, 12], [12, 10], (True, True), (True, True), [2, 0]),
         ([10, 11], [10, 12], (False, False), (False, False), None),
         ([10, 11], [], (False, False), (False, False), None),
     ],
@@ -393,6 +393,7 @@ def test_pending_async_forward_discards_when_planned_layout_mismatches_current()
     context = controller.inference_wrapped_model.inference_context
     context.request_query_lengths = torch.tensor([1, 1], dtype=torch.int32)
     context.request_kv_length_offsets = torch.tensor([6, 11], dtype=torch.int64)
+    context.token_to_request_idx = torch.tensor([0, 1], dtype=torch.int32)
     context.token_to_pos_ids = torch.tensor([6, 11], dtype=torch.int64)
     context.token_to_block_idx = torch.tensor([100, 200], dtype=torch.int32)
     context.token_to_local_position_within_kv_block = torch.tensor([6, 11], dtype=torch.int32)
@@ -401,11 +402,88 @@ def test_pending_async_forward_discards_when_planned_layout_mismatches_current()
         cuda_graph_request_count=2,
         planned_request_query_lengths=torch.tensor([1, 1], dtype=torch.int32),
         planned_request_kv_length_offsets=torch.tensor([6, 11], dtype=torch.int64),
+        planned_token_to_request_idx=torch.tensor([[0], [1]], dtype=torch.int32),
         planned_token_to_pos_ids=torch.tensor([[6], [11]], dtype=torch.int64),
         planned_token_to_block_idx=torch.tensor([[100], [201]], dtype=torch.int32),
         planned_token_to_local_position_within_kv_block=torch.tensor(
             [[6], [11]], dtype=torch.int32
         ),
+    )
+
+    assert controller._pending_async_forward_row_status() == (False, False)
+    assert controller._resolve_pending_async_forward_view() is None
+    assert controller._async_discarded_forward_count == 1
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="row mapping returns CUDA tensors")
+def test_pending_async_forward_reuses_subset_when_finished_row_left():
+    controller = _make_controller_with_rows([10, 11, 12], [12, 10])
+    context = controller.inference_wrapped_model.inference_context
+    context.request_query_lengths = torch.tensor([1, 1], dtype=torch.int32)
+    context.request_kv_length_offsets = torch.tensor([21, 5], dtype=torch.int64)
+    context.token_to_request_idx = torch.tensor([0, 1], dtype=torch.int32)
+    context.token_to_pos_ids = torch.tensor([21, 5], dtype=torch.int64)
+    context.token_to_block_idx = torch.tensor([300, 100], dtype=torch.int32)
+    context.token_to_local_position_within_kv_block = torch.tensor([21, 5], dtype=torch.int32)
+    controller._async_pending_forward_view = tgc_module._AsyncPendingForwardView(
+        pending_request_ids=torch.tensor([10, 11, 12], dtype=torch.int64),
+        cuda_graph_request_count=3,
+        planned_request_query_lengths=torch.tensor([1, 1, 1], dtype=torch.int32),
+        planned_request_kv_length_offsets=torch.tensor([5, 13, 21], dtype=torch.int64),
+        planned_token_to_request_idx=torch.tensor([[0], [1], [2]], dtype=torch.int32),
+        planned_token_to_pos_ids=torch.tensor([[5], [13], [21]], dtype=torch.int64),
+        planned_token_to_block_idx=torch.tensor([[100], [200], [300]], dtype=torch.int32),
+        planned_token_to_local_position_within_kv_block=torch.tensor(
+            [[5], [13], [21]], dtype=torch.int32
+        ),
+    )
+
+    pending_view = controller._resolve_pending_async_forward_view()
+
+    assert pending_view is not None
+    assert pending_view.row_mapped
+    assert pending_view.row_indices.tolist() == [2, 0]
+    assert controller._async_discarded_forward_count == 0
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="row mapping returns CUDA tensors")
+def test_pending_async_forward_discards_when_token_request_layout_mismatches():
+    controller = _make_controller_with_rows([10, 11], [10, 11])
+    context = controller.inference_wrapped_model.inference_context
+    context.request_query_lengths = torch.tensor([1, 1], dtype=torch.int32)
+    context.request_kv_length_offsets = torch.tensor([6, 11], dtype=torch.int64)
+    context.token_to_request_idx = torch.tensor([0, 1], dtype=torch.int32)
+    controller._async_pending_forward_view = tgc_module._AsyncPendingForwardView(
+        pending_request_ids=torch.tensor([10, 11], dtype=torch.int64),
+        cuda_graph_request_count=2,
+        planned_token_to_request_idx=torch.tensor([[0], [0]], dtype=torch.int32),
+    )
+
+    assert controller._pending_async_forward_row_status() == (False, False)
+    assert controller._resolve_pending_async_forward_view() is None
+    assert controller._async_discarded_forward_count == 1
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="row mapping returns CUDA tensors")
+def test_pending_async_forward_discards_when_mamba_bank_layout_mismatches():
+    controller = _make_controller_with_rows([10, 11], [10, 11])
+    context = controller.inference_wrapped_model.inference_context
+    context.is_hybrid_model = True
+    context.request_query_lengths = torch.tensor([1, 1], dtype=torch.int32)
+    context.request_kv_length_offsets = torch.tensor([6, 11], dtype=torch.int64)
+    read_indices = torch.tensor([6, 9], dtype=torch.int32)
+    write_indices = torch.tensor([7, 8], dtype=torch.int32)
+    context._mamba_flat_indices = lambda _active_slice, use_candidate_bank=False: (
+        write_indices if use_candidate_bank else read_indices
+    )
+    controller._async_pending_forward_view = tgc_module._AsyncPendingForwardView(
+        pending_request_ids=torch.tensor([10, 11], dtype=torch.int64),
+        cuda_graph_request_count=2,
+        planned_mamba_read_indices=torch.tensor([6, 8], dtype=torch.int32),
+        planned_mamba_write_indices=torch.tensor([7, 8], dtype=torch.int32),
     )
 
     assert controller._pending_async_forward_row_status() == (False, False)
@@ -542,6 +620,7 @@ async def test_prepare_async_decode_before_sampling_steady_state_ordering(monkey
         kv_block_allocator=SimpleNamespace(
             store_routing_per_block=lambda _routing: events.append("routing")
         ),
+        publish_async_prepared_decode_plan=lambda: events.append("publish"),
         transfer_bookkeeping_to_gpu=lambda **_kwargs: events.append("h2d") or None,
         current_input_and_position_ids=lambda: (
             torch.tensor([[1, 2]], dtype=torch.int64),
@@ -607,8 +686,12 @@ async def test_prepare_async_decode_before_sampling_steady_state_ordering(monkey
 
     result = await controller.async_generate_output_tokens_dynamic_batch(skip_bookkeeping=True)
 
-    ordering = [event for event in events if event in ("prepare", "handoff", "sample", "copy")]
-    assert ordering == ["prepare", "handoff", "sample", "copy"]
+    ordering = [
+        event
+        for event in events
+        if event in ("prepare", "handoff", "sample", "copy", "publish", "h2d")
+    ]
+    assert ordering == ["prepare", "handoff", "sample", "copy", "publish", "h2d"]
     assert result["sample"].tolist() == [4, 5]
 
 
@@ -628,6 +711,7 @@ async def test_prepare_async_decode_before_sampling_unsafe_fallback_ordering(mon
         kv_block_allocator=SimpleNamespace(
             store_routing_per_block=lambda _routing: events.append("routing")
         ),
+        publish_async_prepared_decode_plan=lambda: events.append("publish"),
         transfer_bookkeeping_to_gpu=lambda **_kwargs: events.append("h2d") or None,
         current_input_and_position_ids=lambda: (
             torch.tensor([[1, 2]], dtype=torch.int64),
@@ -699,9 +783,9 @@ async def test_prepare_async_decode_before_sampling_unsafe_fallback_ordering(mon
     ordering = [
         event
         for event in events
-        if event in ("sample", "prepare_after") or event == ("copy", 2)
+        if event in ("sample", "prepare_after", "publish", "h2d") or event == ("copy", 2)
     ]
-    assert ordering == ["sample", "prepare_after", ("copy", 2)]
+    assert ordering == ["sample", "prepare_after", ("copy", 2), "publish", "h2d"]
     assert not any(event[0] == "disable" for event in events if isinstance(event, tuple))
     assert result["sample"].tolist() == [4, 5]
 
@@ -831,6 +915,7 @@ def _make_async_gate_controller(active_request_count=2):
         ),
         is_decode_only=lambda: True,
         using_cuda_graph_this_step=lambda: True,
+        is_hybrid_model=False,
         discard_async_prepared_decode_plan=lambda: None,
     )
     controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
@@ -1040,6 +1125,38 @@ def test_prepare_async_decode_before_sampling_deferral_is_not_disable_reason(mon
     assert controller._async_eligibility_check_count == 1
     assert controller._async_eligibility_pass_count == 1
     assert events == [("prepare", {"pre_sampling": True})]
+
+
+@pytest.mark.internal
+def test_prepare_async_decode_before_sampling_keeps_hybrid_fast_path(monkeypatch):
+    monkeypatch.setattr(tgc_module, "range_push", lambda _msg: None)
+    monkeypatch.setattr(tgc_module, "range_pop", lambda: None)
+    controller, context = _make_async_gate_controller()
+    context.is_hybrid_model = True
+    events = []
+    controller._async_scheduling_disabled_reason = (
+        lambda **kwargs: events.append(("disabled", kwargs)) or None
+    )
+    controller._record_async_eligibility_result = lambda reason: events.append(
+        ("eligibility", reason)
+    )
+    controller._decide_ep_async_handoff = (
+        lambda **kwargs: events.append(("handoff", kwargs))
+        or SimpleNamespace(launch_async_forward=True)
+    )
+    context.prepare_async_decode_next_step = (
+        lambda **kwargs: events.append(("prepare", kwargs)) or True
+    )
+
+    assert controller._try_prepare_async_decode_before_sampling()
+
+    assert not controller._async_prepare_deferred_until_after_sampling
+    assert events == [
+        ("disabled", {}),
+        ("eligibility", None),
+        ("prepare", {"pre_sampling": True}),
+        ("handoff", {"has_real_work": True, "can_launch_async_handoff": True}),
+    ]
 
 
 @pytest.mark.internal

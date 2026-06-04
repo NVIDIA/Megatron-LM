@@ -82,9 +82,12 @@ class _AsyncPendingForwardView:
     row_indices_cpu: Optional[Tensor] = None
     planned_request_query_lengths: Optional[Tensor] = None
     planned_request_kv_length_offsets: Optional[Tensor] = None
+    planned_token_to_request_idx: Optional[Tensor] = None
     planned_token_to_pos_ids: Optional[Tensor] = None
     planned_token_to_block_idx: Optional[Tensor] = None
     planned_token_to_local_position_within_kv_block: Optional[Tensor] = None
+    planned_mamba_read_indices: Optional[Tensor] = None
+    planned_mamba_write_indices: Optional[Tensor] = None
 
     @property
     def row_mapped(self) -> bool:
@@ -1645,14 +1648,18 @@ class TextGenerationController:
             "planned_request_kv_length_offsets": _clone_optional(
                 "_staging_request_kv_length_offsets", request_count
             ),
+            "planned_token_to_request_idx": None,
             "planned_token_to_pos_ids": None,
             "planned_token_to_block_idx": None,
             "planned_token_to_local_position_within_kv_block": None,
+            "planned_mamba_read_indices": None,
+            "planned_mamba_write_indices": None,
         }
         if token_count <= 0:
             return layout
 
         for field in (
+            "token_to_request_idx",
             "token_to_pos_ids",
             "token_to_block_idx",
             "token_to_local_position_within_kv_block",
@@ -1663,6 +1670,14 @@ class TextGenerationController:
             layout[f"planned_{field}"] = value[:token_count].view(
                 request_count, tokens_per_request
             ).clone()
+        if getattr(context, "is_hybrid_model", False):
+            for source, target in (
+                ("_cpu_mamba_batch_indices_decode", "planned_mamba_read_indices"),
+                ("_cpu_mamba_batch_indices_decode_write", "planned_mamba_write_indices"),
+            ):
+                value = getattr(context, source, None)
+                if value is not None:
+                    layout[target] = value[:request_count].clone()
         return layout
 
     def _pending_forward_layout_matches_current(
@@ -1672,9 +1687,12 @@ class TextGenerationController:
         planned_fields = (
             pending_view.planned_request_query_lengths,
             pending_view.planned_request_kv_length_offsets,
+            pending_view.planned_token_to_request_idx,
             pending_view.planned_token_to_pos_ids,
             pending_view.planned_token_to_block_idx,
             pending_view.planned_token_to_local_position_within_kv_block,
+            pending_view.planned_mamba_read_indices,
+            pending_view.planned_mamba_write_indices,
         )
         if all(field is None for field in planned_fields):
             return True
@@ -1686,14 +1704,21 @@ class TextGenerationController:
             else self._active_request_ids_cpu()
         )
         request_count = int(current_request_ids.numel())
-        if request_count == 0 or int(pending_view.pending_request_ids.numel()) != request_count:
+        pending_request_count = int(pending_view.pending_request_ids.numel())
+        if request_count == 0 or pending_request_count < request_count:
             return False
 
         row_indices = pending_view.row_indices_cpu
         if row_indices is None:
+            if pending_request_count != request_count:
+                return False
             row_indices = torch.arange(request_count, dtype=torch.long, device='cpu')
         else:
             row_indices = row_indices.to(dtype=torch.long, device='cpu')
+            if row_indices.numel() != request_count:
+                return False
+            if bool((row_indices < 0).any()) or bool((row_indices >= pending_request_count).any()):
+                return False
 
         active_slice = slice(context.paused_request_count, context.total_request_count)
         if pending_view.planned_request_query_lengths is not None:
@@ -1717,6 +1742,31 @@ class TextGenerationController:
         if context.active_token_count != token_count:
             return False
 
+        if pending_view.planned_token_to_request_idx is not None:
+            current_token_rows = (
+                context.token_to_request_idx[:token_count]
+                .view(request_count, tokens_per_request)
+                .to(dtype=torch.long, device='cpu')
+            )
+            planned_token_rows = pending_view.planned_token_to_request_idx.index_select(
+                0, row_indices
+            ).to(dtype=torch.long, device='cpu')
+            if (
+                bool((current_token_rows < 0).any())
+                or bool((current_token_rows >= request_count).any())
+                or bool((planned_token_rows < 0).any())
+                or bool((planned_token_rows >= pending_request_count).any())
+            ):
+                return False
+            current_token_request_ids = current_request_ids.index_select(
+                0, current_token_rows.reshape(-1)
+            ).view_as(current_token_rows)
+            planned_token_request_ids = pending_view.pending_request_ids.index_select(
+                0, planned_token_rows.reshape(-1)
+            ).view_as(planned_token_rows)
+            if not torch.equal(current_token_request_ids, planned_token_request_ids):
+                return False
+
         for field in (
             "token_to_pos_ids",
             "token_to_block_idx",
@@ -1731,6 +1781,27 @@ class TextGenerationController:
             planned_in_current_order = planned.index_select(0, row_indices)
             if not torch.equal(current, planned_in_current_order):
                 return False
+
+        if getattr(context, "is_hybrid_model", False):
+            active_slice = slice(context.paused_request_count, context.total_request_count)
+            if pending_view.planned_mamba_read_indices is not None:
+                current_read_indices = context._mamba_flat_indices(active_slice)[
+                    :request_count
+                ]
+                planned_read_indices = pending_view.planned_mamba_read_indices.index_select(
+                    0, row_indices
+                )
+                if not torch.equal(current_read_indices, planned_read_indices):
+                    return False
+            if pending_view.planned_mamba_write_indices is not None:
+                current_write_indices = context._mamba_flat_indices(
+                    active_slice, use_candidate_bank=True
+                )[:request_count]
+                planned_write_indices = pending_view.planned_mamba_write_indices.index_select(
+                    0, row_indices
+                )
+                if not torch.equal(current_write_indices, planned_write_indices):
+                    return False
 
         return True
 
@@ -1752,18 +1823,21 @@ class TextGenerationController:
                 current_request_ids=current_request_ids,
                 planned_request_query_lengths=pending_view.planned_request_query_lengths,
                 planned_request_kv_length_offsets=pending_view.planned_request_kv_length_offsets,
+                planned_token_to_request_idx=pending_view.planned_token_to_request_idx,
                 planned_token_to_pos_ids=pending_view.planned_token_to_pos_ids,
                 planned_token_to_block_idx=pending_view.planned_token_to_block_idx,
                 planned_token_to_local_position_within_kv_block=(
                     pending_view.planned_token_to_local_position_within_kv_block
                 ),
+                planned_mamba_read_indices=pending_view.planned_mamba_read_indices,
+                planned_mamba_write_indices=pending_view.planned_mamba_write_indices,
             )
             return (
                 current_view
                 if self._pending_forward_layout_matches_current(current_view)
                 else None
             )
-        if pending_request_ids.numel() != current_request_ids.numel():
+        if pending_request_ids.numel() < current_request_ids.numel():
             return None
 
         pending_row_by_request_id = {
@@ -1788,11 +1862,14 @@ class TextGenerationController:
             row_indices_cpu=row_indices_cpu,
             planned_request_query_lengths=pending_view.planned_request_query_lengths,
             planned_request_kv_length_offsets=pending_view.planned_request_kv_length_offsets,
+            planned_token_to_request_idx=pending_view.planned_token_to_request_idx,
             planned_token_to_pos_ids=pending_view.planned_token_to_pos_ids,
             planned_token_to_block_idx=pending_view.planned_token_to_block_idx,
             planned_token_to_local_position_within_kv_block=(
                 pending_view.planned_token_to_local_position_within_kv_block
             ),
+            planned_mamba_read_indices=pending_view.planned_mamba_read_indices,
+            planned_mamba_write_indices=pending_view.planned_mamba_write_indices,
         )
         return (
             current_view if self._pending_forward_layout_matches_current(current_view) else None
@@ -2085,7 +2162,6 @@ class TextGenerationController:
         if self._async_disable_reason is not None:
             self._decide_ep_async_handoff(has_real_work=True, can_launch_async_handoff=False)
             return False
-
         range_push("async_prepare_next_step")
         async_next_prepared = context.prepare_async_decode_next_step(pre_sampling=True)
         range_pop()
@@ -2301,6 +2377,22 @@ class TextGenerationController:
         # Slice to real tokens (remove CUDA padding), move to CPU as numpy with target dtype
         _ri_dtype = np.int16 if (config.num_moe_experts or 0) <= 32768 else np.int32
         return stacked_routing[:active_token_count].cpu().numpy().astype(_ri_dtype)
+
+    def _retire_dynamic_forward_side_effects(self) -> None:
+        """Commit side effects produced by the most recent dynamic forward pass."""
+        context = self.inference_wrapped_model.inference_context
+
+        # Commit Mamba intermediate states before update_requests, which may
+        # swap request indices. The Python lists tracking EOS block IDs and
+        # intermediate offsets are not swapped along with tensors, so commit
+        # must run while indices are still valid.
+        if context.is_hybrid_model and context.mamba_slot_allocator is not None:
+            context.mamba_slot_allocator.commit_intermediate_states()
+
+        # Collect flat routing indices and scatter them into per-block storage.
+        # Must be done before update_requests while token-to-block mappings are valid.
+        # Reconstruction happens from blocks at request completion.
+        context.kv_block_allocator.store_routing_per_block(self._router_record_bookkeeping())
 
     def _dynamic_step_calculate_log_probs(
         self, row_indices: Optional[Tensor] = None
@@ -3028,21 +3120,10 @@ class TextGenerationController:
                 # active, MTP logits are computed serially after verification.
                 range_push("forward_pass")
                 self._dynamic_step_forward_logits(input_ids, position_ids)
-
-                # Commit Mamba intermediate states before update_requests, which
-                # may swap request indices. The Python lists tracking EOS block IDs
-                # and intermediate offsets are not swapped along with tensors, so
-                # commit must run while indices are still valid.
-                if context.is_hybrid_model and context.mamba_slot_allocator is not None:
-                    context.mamba_slot_allocator.commit_intermediate_states()
-
-                # Collect flat routing indices and scatter them into per-block storage.
-                # Must be done before update_requests while token-to-block mappings are valid.
-                # Reconstruction happens from blocks at request completion.
-                context.kv_block_allocator.store_routing_per_block(
-                    self._router_record_bookkeeping()
-                )
+                self._retire_dynamic_forward_side_effects()
                 range_pop()
+            else:
+                self._retire_dynamic_forward_side_effects()
 
             if not pending_forward_row_mapped and self.num_speculative_tokens == 0:
                 async_next_prepared = self._try_prepare_async_decode_before_sampling()
@@ -3151,6 +3232,7 @@ class TextGenerationController:
                     async_sample_ready_event,
                 ) = self._async_transfer_samples_to_cpu(active_request_count)
                 if self._confirm_prepared_ep_async_handoff():
+                    context.publish_async_prepared_decode_plan()
                     range_push("async_transfer_bookkeeping_to_gpu")
                     async_h2d_done_event = context.transfer_bookkeeping_to_gpu(
                         include_token_to_input_ids=False,
