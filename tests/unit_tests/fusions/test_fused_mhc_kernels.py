@@ -77,9 +77,7 @@ def _info():
 
 
 def _ref_sinkhorn(logits: Tensor, num_iters: int, eps: float = 1e-6) -> Tensor:
-    row_max = logits.max(dim=-1, keepdim=True).values
-    M = torch.exp(logits - row_max)
-    M = M / M.sum(dim=-1, keepdim=True) + eps
+    M = logits.softmax(dim=-1) + eps
     M = M / (M.sum(dim=-2, keepdim=True) + eps)
     for _ in range(num_iters - 1):
         M = M / (M.sum(dim=-1, keepdim=True) + eps)

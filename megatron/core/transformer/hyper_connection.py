@@ -21,9 +21,7 @@ _MHC_COMPUTE_H_EPS = 1e-6
 
 @torch.compile
 def _sinkhorn_iterations(input_logits: Tensor, num_iterations: int, eps: float) -> Tensor:
-    row_max = input_logits.max(dim=-1, keepdim=True).values
-    M = torch.exp(input_logits - row_max)
-    M = M / M.sum(dim=-1, keepdim=True) + eps
+    M = input_logits.softmax(dim=-1) + eps
     M = M / (M.sum(dim=-2, keepdim=True) + eps)
     for _ in range(num_iterations - 1):
         M = M / (M.sum(dim=-1, keepdim=True) + eps)
