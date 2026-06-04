@@ -23,9 +23,6 @@ _MHC_COMPUTE_H_EPS = 1e-6
 def _sinkhorn_iterations(input_logits: Tensor, num_iterations: int, eps: float) -> Tensor:
     row_max = input_logits.max(dim=-1, keepdim=True).values
     M = torch.exp(input_logits - row_max)
-    if num_iterations == 0:
-        return M
-
     M = M / M.sum(dim=-1, keepdim=True) + eps
     M = M / (M.sum(dim=-2, keepdim=True) + eps)
     for _ in range(num_iterations - 1):
@@ -289,8 +286,8 @@ class HyperConnectionModule(MegatronModule):
         # H_pre = σ(α_pre * (θ_pre @ x̃) + b_pre)
         h_pre = h[..., : self.n].sigmoid() + self.compute_h_eps  # [s, b, n]
 
-        # H_post = 2(σ(α_post * (θ_post @ x̃) + b_post) + eps)
-        h_post = (h[..., self.n : 2 * self.n].sigmoid() + self.compute_h_eps) * 2
+        # H_post = 2σ(α_post * (θ_post @ x̃) + b_post)
+        h_post = h[..., self.n : 2 * self.n].sigmoid() * 2
         h_res = h[..., 2 * self.n :]
         return h_pre, h_post, h_res
 

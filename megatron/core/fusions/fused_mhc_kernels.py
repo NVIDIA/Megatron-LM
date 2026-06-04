@@ -245,16 +245,15 @@ if _TRITON_AVAILABLE:
         M = tl.exp2((logits - row_max[:, None]) * TLOG2E)
         tl.store(M_init_ptr + mat_ptrs, M.to(M_init_ptr.dtype.element_ty))
 
-        if NUM_ITERS > 0:
+        row_sum = tl.sum(M, axis=1)
+        M = M / row_sum[:, None] + eps
+        col_sum = tl.sum(M, axis=0)
+        M = M / (col_sum[None, :] + eps)
+        for _ in range(NUM_ITERS - 1):
             row_sum = tl.sum(M, axis=1)
-            M = M / row_sum[:, None] + eps
+            M = M / (row_sum[:, None] + eps)
             col_sum = tl.sum(M, axis=0)
             M = M / (col_sum[None, :] + eps)
-            for _ in range(NUM_ITERS - 1):
-                row_sum = tl.sum(M, axis=1)
-                M = M / (row_sum[:, None] + eps)
-                col_sum = tl.sum(M, axis=0)
-                M = M / (col_sum[None, :] + eps)
 
         tl.store(out_ptr + mat_ptrs, M.to(out_ptr.dtype.element_ty))
 
@@ -377,7 +376,7 @@ if _TRITON_AVAILABLE:
         def forward(ctx, input_logits: Tensor, num_iterations: int, eps: float = 1e-6):
             """Run Triton Sinkhorn forward and save initial matrix for backward."""
             out, M_init = _triton_sinkhorn_fwd(input_logits, num_iterations, eps)
-            ctx.save_for_backward(input_logits if num_iterations == 0 else M_init)
+            ctx.save_for_backward(M_init)
             ctx.num_iterations = num_iterations
             ctx.eps = eps
             return out
@@ -385,15 +384,7 @@ if _TRITON_AVAILABLE:
         @staticmethod
         def backward(ctx, grad_output: Tensor):
             """Run Triton Sinkhorn backward."""
-            (saved,) = ctx.saved_tensors
-            if ctx.num_iterations == 0:
-                with torch.enable_grad():
-                    logits = saved.detach().requires_grad_(True)
-                    row_max = logits.max(dim=-1, keepdim=True).values
-                    M = torch.exp(logits - row_max)
-                    M.backward(grad_output)
-                return logits.grad, None, None
-            M_init = saved
+            (M_init,) = ctx.saved_tensors
             grad_input = _triton_sinkhorn_bwd(grad_output, M_init, ctx.num_iterations, ctx.eps)
             return grad_input, None, None
 
@@ -869,16 +860,15 @@ if _CUTILE_AVAILABLE:
             index=(pid, 0, 0),
             tile=ct.reshape(M.astype(M_init_out.dtype), (TILE_SIZE, HC, HC)),
         )
-        if NUM_ITERS > 0:
+        row_sum = ct.sum(M, axis=2, keepdims=True)
+        M = M / row_sum + eps
+        col_sum = ct.sum(M, axis=1, keepdims=True)
+        M = M / (col_sum + eps)
+        for _ in range(NUM_ITERS - 1):
             row_sum = ct.sum(M, axis=2, keepdims=True)
-            M = M / row_sum + eps
+            M = M / (row_sum + eps)
             col_sum = ct.sum(M, axis=1, keepdims=True)
             M = M / (col_sum + eps)
-            for _ in range(NUM_ITERS - 1):
-                row_sum = ct.sum(M, axis=2, keepdims=True)
-                M = M / (row_sum + eps)
-                col_sum = ct.sum(M, axis=1, keepdims=True)
-                M = M / (col_sum + eps)
         ct.store(out, index=(pid, 0, 0), tile=ct.reshape(M.astype(out.dtype), (TILE_SIZE, HC, HC)))
 
     @ct.kernel
@@ -1574,7 +1564,7 @@ if _CUTILE_AVAILABLE:
         h_pre_linear = pre_accum * alpha_pre * inv_r_eps + bias_pre
         h_post_linear = post_accum * alpha_post * inv_r_eps + bias_post
         h_pre = _ct_sigmoid(h_pre_linear) + compute_h_eps
-        h_post = (_ct_sigmoid(h_post_linear) + compute_h_eps) * 2.0
+        h_post = _ct_sigmoid(h_post_linear) * 2.0
 
         ct.store(H_PRE, index=(bid_m, 0), tile=h_pre.astype(H_PRE.dtype))
         ct.store(H_POST, index=(bid_m, 0), tile=h_post.astype(H_POST.dtype))
@@ -2354,7 +2344,7 @@ if _CUTILE_AVAILABLE:
             PROJ, index=(tile_m_id, 1), shape=(TILE_SIZE_M, n), padding_mode=PAD_ZERO
         )
         proj_post = ct.astype(proj_post, ct.float32)
-        sigmoid_post = h_post * 0.5 - compute_h_eps
+        sigmoid_post = h_post * 0.5
         grad_h_post = gy_post * sigmoid_post * (1.0 - sigmoid_post) * 2.0
         grad_proj_post = grad_h_post * alpha_post * inv_r_eps
         grad_r_from_h += ct.sum(
@@ -3137,7 +3127,7 @@ def _torch_proj_rms_compute_h(
     )
     h = proj * alpha.unsqueeze(0) / (r + eps) + bias.unsqueeze(0)
     h_pre = h[..., :n].sigmoid() + compute_h_eps
-    h_post = (h[..., n : 2 * n].sigmoid() + compute_h_eps) * 2
+    h_post = h[..., n : 2 * n].sigmoid() * 2
     h_res = h[..., 2 * n :]
     return h_pre, h_post, h_res, r
 
@@ -3151,7 +3141,7 @@ if _CUTILE_AVAILABLE:
         def forward(ctx, input_logits: Tensor, num_iterations: int, eps: float = 1e-6):
             """Run cuTile Sinkhorn forward and save initial matrix for backward."""
             output, M_init = _cutile_sinkhorn_fwd(input_logits, num_iterations, eps)
-            ctx.save_for_backward(input_logits if num_iterations == 0 else M_init)
+            ctx.save_for_backward(M_init)
             ctx.num_iterations = num_iterations
             ctx.eps = eps
             return output
@@ -3159,15 +3149,7 @@ if _CUTILE_AVAILABLE:
         @staticmethod
         def backward(ctx, grad_output):
             """Run cuTile Sinkhorn backward."""
-            (saved,) = ctx.saved_tensors
-            if ctx.num_iterations == 0:
-                with torch.enable_grad():
-                    logits = saved.detach().requires_grad_(True)
-                    row_max = logits.max(dim=-1, keepdim=True).values
-                    M = torch.exp(logits - row_max)
-                    M.backward(grad_output)
-                return logits.grad, None, None
-            M_init = saved
+            (M_init,) = ctx.saved_tensors
             grad_input = _cutile_sinkhorn_bwd(grad_output, M_init, ctx.num_iterations, ctx.eps)
             return grad_input, None, None
 
