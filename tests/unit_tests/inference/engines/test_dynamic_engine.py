@@ -1200,12 +1200,12 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 f"got {len(request.prompt_log_probs)}"
             )
             for i, log_prob in enumerate(request.prompt_log_probs):
-                assert log_prob is not None, (
-                    f"Request {request.request_id}, prompt token {i}: log_prob is None"
-                )
-                assert not math.isnan(log_prob) and not math.isinf(log_prob), (
-                    f"Request {request.request_id}, prompt token {i}: log_prob {log_prob} invalid"
-                )
+                assert (
+                    log_prob is not None
+                ), f"Request {request.request_id}, prompt token {i}: log_prob is None"
+                assert not math.isnan(log_prob) and not math.isinf(
+                    log_prob
+                ), f"Request {request.request_id}, prompt token {i}: log_prob {log_prob} invalid"
                 assert -50.0 <= log_prob <= 0.0, (
                     f"Request {request.request_id}, prompt token {i}: "
                     f"log_prob {log_prob} is out of expected range [-50.0, 0.0]"
