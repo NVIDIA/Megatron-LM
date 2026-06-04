@@ -356,10 +356,10 @@ def build_slack_message(issue: IssueContext, plan: AssignmentPlan) -> str:
     paths = ", ".join(plan.relevant_paths) if plan.relevant_paths else "none identified"
     if plan.mode == "candidate":
         return (
-            f"You were assigned community request <{issue.url}|#{issue.number}: {issue.title}>.\n"
-            f"Claude confidence: {plan.confidence:.2f}\n"
-            f"Relevant paths: {paths}\n"
-            f"Rationale: {plan.rationale}"
+            f"You have been automatically assigned to community issue: <{issue.url}|{issue.url}>.\n\n"
+            "Claude has determined that you are the best individual to answer this community issue. "
+            "If Claude has made a mistake or if you are unsure how to proceed, please reach out to "
+            "@mcore-oncall directly."
         )
 
     return (

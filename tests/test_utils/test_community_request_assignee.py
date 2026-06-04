@@ -106,7 +106,7 @@ def test_create_assignment_plan_falls_back_to_assignable_oncall(monkeypatch):
     assert plan.confidence == 0.40
 
 
-def test_build_slack_message_describes_sender_context():
+def test_build_slack_message_uses_requested_candidate_copy():
     module = load_assignee_module()
     issue = module.IssueContext(
         owner="NVIDIA",
@@ -127,7 +127,11 @@ def test_build_slack_message_describes_sender_context():
 
     message = module.build_slack_message(issue, plan)
 
-    assert "You were assigned community request" in message
-    assert "#125: Transformer bug" in message
-    assert "Claude confidence: 0.88" in message
-    assert "megatron/core/transformer/attention.py" in message
+    assert message == (
+        "You have been automatically assigned to community issue: "
+        "<https://github.com/NVIDIA/Megatron-LM/issues/125|"
+        "https://github.com/NVIDIA/Megatron-LM/issues/125>.\n\n"
+        "Claude has determined that you are the best individual to answer this community issue. "
+        "If Claude has made a mistake or if you are unsure how to proceed, please reach out to "
+        "@mcore-oncall directly."
+    )
