@@ -127,7 +127,7 @@ jobs:
         env:
           ANALYSIS_JSON: ${{ needs.analyze_community_request.outputs.analysis_json }}
           GH_TOKEN: ${{ secrets.NVIDIA_MCORE_ONCALL_TOKEN || secrets.PAT || github.token }}
-          SLACK_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_TOKEN: ${{ secrets.ISSUE_BOT_SLACK_TOKEN }}
           GITHUB_REPOSITORY: ${{ env.REPO }}
           ISSUE_NUMBER: ${{ env.ISSUE_NUMBER }}
           ISSUE_TITLE: ${{ env.ISSUE_TITLE }}
@@ -166,7 +166,7 @@ jobs:
       - name: Assign issue and notify Slack
         env:
           GH_TOKEN: ${{ secrets.NVIDIA_MCORE_ONCALL_TOKEN || secrets.PAT || github.token }}
-          SLACK_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_TOKEN: ${{ secrets.ISSUE_BOT_SLACK_TOKEN }}
           GITHUB_REPOSITORY: ${{ env.REPO }}
           ISSUE_NUMBER: ${{ env.ISSUE_NUMBER }}
           ISSUE_TITLE: ${{ env.ISSUE_TITLE }}
