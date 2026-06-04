@@ -1027,6 +1027,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._async_prepared_paused_dest_rows_cuda = torch.empty(
             (self.max_requests,), dtype=torch.long, device=torch.cuda.current_device()
         )
+        self._async_pre_sampling_prepared_state: Optional[Dict[str, object]] = None
 
         # Track request metadata. Backed by pinned CPU memory: bookkeeping is
         # CPU-resident; GPU consumers read from the active-slice mirror in
@@ -1318,6 +1319,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # update_requests() (CPU phase), executed by transfer_bookkeeping_to_gpu().
         self._pending_mamba_zeros: list = []
         self._pending_mamba_restores: list = []
+        self._pending_mamba_transfer = None
 
         # Allocate large non-graphed buffers.
         need_static_addr = (
@@ -2808,6 +2810,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._async_prepared_sample_source_count = 0
         self._async_prepared_paused_source_count = 0
         self._async_prepared_decode_input_is_identity = False
+        self._async_pre_sampling_prepared_state = None
 
     def discard_async_prepared_decode_plan(self) -> None:
         """Release resources held only for a prepared async launch that will not run."""
@@ -2818,6 +2821,77 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
             self._clear_async_reserved_kv_blocks()
         self.clear_async_prepared_decode_plan()
+
+    def _snapshot_async_pre_sampling_state(self) -> Dict[str, object]:
+        """Snapshot the mutable context view used by sampling or a prepared forward."""
+        mha_metadata = None
+        mha_state_data = None
+        mha_max_seqlen_q = None
+        mha_max_seqlen_k = None
+        if self.active_attn_metadata is not None:
+            mha_metadata = self.active_attn_metadata.get("mha_metadata")
+            if mha_metadata is not None:
+                mha_state_data = dict(mha_metadata.state_data)
+                mha_max_seqlen_q = getattr(mha_metadata, "_max_seqlen_q", None)
+                mha_max_seqlen_k = getattr(mha_metadata, "_max_seqlen_k", None)
+
+        return {
+            "active_attn_metadata": self.active_attn_metadata,
+            "active_logit_idxs": self.active_logit_idxs.clone(),
+            "active_request_metadata": {
+                label: tensor.clone() for label, tensor in self.active_request_metadata.items()
+            },
+            "active_token_count": self.active_token_count,
+            "batch_dimensions": self.batch_dimensions,
+            "cpu_bookkeeping_buf": self._cpu_bookkeeping_buf.clone(),
+            "mha_metadata": mha_metadata,
+            "mha_state_data": mha_state_data,
+            "mha_max_seqlen_q": mha_max_seqlen_q,
+            "mha_max_seqlen_k": mha_max_seqlen_k,
+            "padded_active_request_count": self.padded_active_request_count,
+            "padded_active_token_count": self.padded_active_token_count,
+            "padded_batch_dimensions": self.padded_batch_dimensions,
+            "padding_slice": getattr(
+                self,
+                "padding_slice",
+                slice(self.active_token_count, self.padded_active_token_count),
+            ),
+            "pending_mamba_transfer": self._pending_mamba_transfer,
+            "using_cuda_graph_this_step": self._using_cuda_graph_this_step,
+        }
+
+    def _restore_async_pre_sampling_state(self, state: Dict[str, object]) -> None:
+        """Restore either the current-step state or a staged pre-sampling state."""
+        self.active_attn_metadata = state["active_attn_metadata"]
+        self.active_logit_idxs.copy_(state["active_logit_idxs"])
+        active_request_metadata = state["active_request_metadata"]
+        for label, tensor in active_request_metadata.items():
+            self.active_request_metadata[label].copy_(tensor)
+        self.active_token_count = state["active_token_count"]
+        self.batch_dimensions = state["batch_dimensions"]
+        self._cpu_bookkeeping_buf.copy_(state["cpu_bookkeeping_buf"])
+        mha_metadata = state.get("mha_metadata")
+        if mha_metadata is not None:
+            mha_metadata.state_data = state["mha_state_data"]
+            if state["mha_max_seqlen_q"] is not None:
+                mha_metadata._max_seqlen_q = state["mha_max_seqlen_q"]
+            if state["mha_max_seqlen_k"] is not None:
+                mha_metadata._max_seqlen_k = state["mha_max_seqlen_k"]
+        self.padded_active_request_count = state["padded_active_request_count"]
+        self.padded_active_token_count = state["padded_active_token_count"]
+        self.padded_batch_dimensions = state["padded_batch_dimensions"]
+        self.padding_slice = state["padding_slice"]
+        self._pending_mamba_transfer = state["pending_mamba_transfer"]
+        self._using_cuda_graph_this_step = state["using_cuda_graph_this_step"]
+        self._prepare_moe_metadata_recording()
+
+    def publish_async_prepared_decode_plan(self) -> None:
+        """Make a pre-sampling prepared decode state visible for H2D and forward launch."""
+        prepared_state = self._async_pre_sampling_prepared_state
+        if prepared_state is None:
+            return
+        self._restore_async_pre_sampling_state(prepared_state)
+        self._async_pre_sampling_prepared_state = None
 
     def async_prepared_request_ids_cpu(self) -> Optional[Tensor]:
         """Return the request order used by the prepared speculative forward."""
@@ -3077,6 +3151,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         if pre_sampling and not self._async_decode_plan_preserves_sampling_layout(dry_plan):
             return False
 
+        pre_sampling_current_state = (
+            self._snapshot_async_pre_sampling_state() if pre_sampling else None
+        )
+
         tokens_per_request = self.num_speculative_tokens + 1
         batch_dimensions = InferenceBatchDimensions(
             token_count=dry_plan.active_token_count,
@@ -3089,10 +3167,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         if not self._configure_step_batch_dimensions(
             batch_dimensions, best_graph, allow_eager_fallback=False
         ):
+            if pre_sampling_current_state is not None:
+                self._restore_async_pre_sampling_state(pre_sampling_current_state)
             return False
 
         plan = self._build_async_decode_lifecycle_plan(reserve_blocks=True)
         if plan is None:
+            if pre_sampling_current_state is not None:
+                self._restore_async_pre_sampling_state(pre_sampling_current_state)
             return False
 
         reserved_block_count = int(plan.reserved_block_ids.numel())
@@ -3115,6 +3197,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.kv_block_allocator.release_memory_blocks(plan.reserved_block_ids)
                 self._clear_async_reserved_kv_blocks()
             self.clear_async_prepared_decode_plan()
+            if pre_sampling_current_state is not None:
+                self._restore_async_pre_sampling_state(pre_sampling_current_state)
             return False
 
         self.active_token_count = plan.active_token_count
@@ -3172,6 +3256,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             active_request_idxs=plan.source_request_idxs,
         )
         self._prepare_moe_metadata_recording()
+        if pre_sampling_current_state is not None:
+            self._async_pre_sampling_prepared_state = self._snapshot_async_pre_sampling_state()
+            self._restore_async_pre_sampling_state(pre_sampling_current_state)
         return True
 
     def transfer_bookkeeping_to_gpu(

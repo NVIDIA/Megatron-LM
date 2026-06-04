@@ -848,15 +848,26 @@ class TestDynamicContext:
         dynamic_context.request_last_kv_block_offset[:3] = torch.tensor(
             [1, 2, 3], dtype=torch.int32
         )
+        dynamic_context.active_request_metadata["top_k"][:3] = torch.tensor(
+            [8, 8, 8], dtype=torch.int32
+        )
+        dynamic_context.token_to_request_idx[:3] = torch.tensor([9, 9, 9], dtype=torch.int32)
+        dynamic_context.token_to_pos_ids[:3] = torch.tensor([4, 4, 4], dtype=torch.int64)
+        dynamic_context._staging_request_query_lengths[:3] = torch.tensor(
+            [7, 7, 7], dtype=torch.int32
+        )
+        dynamic_context._staging_request_kv_length_offsets[:3] = torch.tensor(
+            [4, 4, 4], dtype=torch.int32
+        )
 
         assert dynamic_context.prepare_async_decode_next_step(pre_sampling=True)
 
         assert dynamic_context.async_prepared_request_ids_cpu().tolist() == [10, 11, 12]
-        assert dynamic_context.active_request_metadata["top_k"][:3].tolist() == [1, 2, 3]
-        assert dynamic_context.token_to_request_idx[:3].tolist() == [0, 1, 2]
-        assert dynamic_context.token_to_pos_ids[:3].tolist() == [5, 5, 5]
-        assert dynamic_context._staging_request_query_lengths[:3].tolist() == [1, 1, 1]
-        assert dynamic_context._staging_request_kv_length_offsets[:3].tolist() == [5, 5, 5]
+        assert dynamic_context.active_request_metadata["top_k"][:3].tolist() == [8, 8, 8]
+        assert dynamic_context.token_to_request_idx[:3].tolist() == [9, 9, 9]
+        assert dynamic_context.token_to_pos_ids[:3].tolist() == [4, 4, 4]
+        assert dynamic_context._staging_request_query_lengths[:3].tolist() == [7, 7, 7]
+        assert dynamic_context._staging_request_kv_length_offsets[:3].tolist() == [4, 4, 4]
         assert dynamic_context._async_reserved_kv_block_count == 0
 
         sampled_tokens = torch.tensor([100, 101, 102], dtype=torch.int64, device='cuda')
@@ -868,6 +879,68 @@ class TestDynamicContext:
             101,
             102,
         ]
+
+        dynamic_context.publish_async_prepared_decode_plan()
+
+        assert dynamic_context.active_request_metadata["top_k"][:3].tolist() == [1, 2, 3]
+        assert dynamic_context.token_to_request_idx[:3].tolist() == [0, 1, 2]
+        assert dynamic_context.token_to_pos_ids[:3].tolist() == [5, 5, 5]
+        assert dynamic_context._staging_request_query_lengths[:3].tolist() == [1, 1, 1]
+        assert dynamic_context._staging_request_kv_length_offsets[:3].tolist() == [5, 5, 5]
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_prepare_async_decode_next_step_pre_sampling_discard_keeps_current_state(self):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=128,
+            buffer_size_gb=0.02,
+            block_size_tokens=16,
+            max_tokens=1_000_000,
+            num_cuda_graphs=1,
+            enable_async_scheduling=True,
+        )
+        requests = [
+            DynamicInferenceRequest(
+                request_id=request_id,
+                prompt_tokens=torch.arange(0, 1, device='cpu'),
+                sampling_params=SamplingParams(top_k=top_k, num_tokens_to_generate=31),
+            )
+            for request_id, top_k in [(10, 1), (11, 2), (12, 3)]
+        ]
+        dynamic_context.add_dummy_requests_parallel(requests, count_as_prefill=False)
+        dynamic_context.active_token_count = 3
+        dynamic_context.num_prefill_requests = 0
+        dynamic_context.request_query_lengths[:3] = 1
+        dynamic_context.request_kv_length_offsets[:3] = torch.tensor([4, 4, 4], dtype=torch.int32)
+        dynamic_context.request_output_lengths[:3] = torch.tensor([32, 32, 32], dtype=torch.int32)
+        dynamic_context.request_last_kv_block_offset[:3] = torch.tensor(
+            [1, 2, 3], dtype=torch.int32
+        )
+        dynamic_context.active_request_metadata["top_k"][:3] = torch.tensor(
+            [8, 8, 8], dtype=torch.int32
+        )
+        dynamic_context.token_to_request_idx[:3] = torch.tensor([9, 9, 9], dtype=torch.int32)
+        dynamic_context.token_to_pos_ids[:3] = torch.tensor([4, 4, 4], dtype=torch.int64)
+        dynamic_context._staging_request_query_lengths[:3] = torch.tensor(
+            [7, 7, 7], dtype=torch.int32
+        )
+        dynamic_context._staging_request_kv_length_offsets[:3] = torch.tensor(
+            [4, 4, 4], dtype=torch.int32
+        )
+
+        assert dynamic_context.prepare_async_decode_next_step(pre_sampling=True)
+        dynamic_context.discard_async_prepared_decode_plan()
+
+        assert dynamic_context.active_request_metadata["top_k"][:3].tolist() == [8, 8, 8]
+        assert dynamic_context.token_to_request_idx[:3].tolist() == [9, 9, 9]
+        assert dynamic_context.token_to_pos_ids[:3].tolist() == [4, 4, 4]
+        assert dynamic_context._staging_request_query_lengths[:3].tolist() == [7, 7, 7]
+        assert dynamic_context._staging_request_kv_length_offsets[:3].tolist() == [4, 4, 4]
+        assert dynamic_context.async_prepared_request_ids_cpu() is None
 
     @pytest.mark.internal
     @rounder_override(64)
