@@ -3325,6 +3325,18 @@ def _add_experimental_args(parser):
                 'recomputation will be unsharded.'
             ),
         )
+    group.add_argument(
+            '--megatron-fsdp-prefetch-recompute-forward-weights',
+            action='store_true',
+            default=False,
+            dest='megatron_fsdp_prefetch_recompute_forward_weights',
+            help=(
+                'If set, Megatron-FSDP prefetches rowwise weights needed by activation '
+                'recomputation during backward before prefetching backward transpose '
+                'weights. This also caches parameter bucket views to reduce repeated '
+                'Python-side view setup.'
+            ),
+        )
 
     return parser
 

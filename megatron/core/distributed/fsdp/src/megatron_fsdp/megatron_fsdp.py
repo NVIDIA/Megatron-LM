@@ -3,7 +3,6 @@
 import functools
 import importlib
 import logging
-import os
 from contextlib import contextmanager
 from enum import Enum, auto
 from functools import partial
@@ -261,9 +260,9 @@ class MegatronFSDP(torch.nn.Module):
         self.enable_fine_grained_param_gather_backward_hook = (
             enable_fine_grained_param_gather_backward_hook
         )
-        self.prefetch_recompute_forward_weights = os.environ.get(
-            "MCORE_FSDP_PREFETCH_RECOMPUTE_FORWARD_WEIGHTS", "0"
-        ).lower() in ("1", "true", "yes", "on")
+        self.prefetch_recompute_forward_weights = (
+            self.ddp_config.megatron_fsdp_prefetch_recompute_forward_weights
+        )
         self.report_nan_in_param_grad = report_nan_in_param_grad
 
         # FSDPDistributedIndex stores the process groups and meshes used by Megatron-FSDP.

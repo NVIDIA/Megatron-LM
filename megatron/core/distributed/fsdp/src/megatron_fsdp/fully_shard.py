@@ -103,6 +103,7 @@ def fully_shard_model(
     fsdp_db_use_persist_buf_on_alloc_fail: bool = False,
     disable_symmetric_registration: bool = False,
     enable_fine_grained_param_gather: bool = False,
+    prefetch_recompute_forward_weights: bool = False,
     use_decoupled_grad: bool = False,
     cuda_graph_mode: bool = False,
 ) -> torch.nn.Module:
@@ -262,6 +263,11 @@ def fully_shard_model(
             unshards parameters per-Module instead of unsharding all sub-modules of an FSDP
             unit module simultaneously. Defaults to False.
 
+        prefetch_recompute_forward_weights (bool):
+            Whether to prefetch rowwise weights needed by activation recomputation during
+            backward before prefetching backward transpose weights. This also caches
+            parameter bucket views to reduce repeated Python-side view setup. Defaults to False.
+
         use_decoupled_grad (bool):
             If true, reduced gradients are installed into `Parameter.decoupled_grad` instead
             of `Parameter.grad`. Defaults to False.
@@ -371,6 +377,7 @@ def fully_shard_model(
         fsdp_double_buffer=fsdp_double_buffer or nccl_ub,
         fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
         disable_symmetric_registration=disable_symmetric_registration,
+        megatron_fsdp_prefetch_recompute_forward_weights=prefetch_recompute_forward_weights,
         megatron_fsdp_use_decoupled_grad=use_decoupled_grad,
         megatron_fsdp_cuda_graph_mode=cuda_graph_mode,
     )
@@ -678,6 +685,7 @@ def fully_shard(
     fsdp_db_use_persist_buf_on_alloc_fail: bool = False,
     disable_symmetric_registration: bool = False,
     enable_fine_grained_param_gather: bool = False,
+    prefetch_recompute_forward_weights: bool = False,
     use_decoupled_grad: bool = False,
     cuda_graph_mode: bool = False,
 ) -> tuple[MegatronFSDP, torch.optim.Optimizer]:
@@ -729,6 +737,7 @@ def fully_shard(
         fsdp_double_buffer=fsdp_double_buffer,
         fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
         disable_symmetric_registration=disable_symmetric_registration,
+        prefetch_recompute_forward_weights=prefetch_recompute_forward_weights,
         use_decoupled_grad=use_decoupled_grad,
         cuda_graph_mode=cuda_graph_mode,
     )

@@ -9,7 +9,6 @@ import gc
 import inspect
 import logging
 import math
-import os
 import traceback
 import warnings
 from collections import defaultdict, namedtuple
@@ -46,10 +45,6 @@ from .utils import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-def _env_flag(name: str) -> bool:
-    return os.environ.get(name, "").lower() in ("1", "true", "yes", "on")
 
 
 def _same_tensor_view(a: Optional[torch.Tensor], b: torch.Tensor) -> bool:
@@ -929,7 +924,9 @@ class DataParallelBuffer:
 
         # Count all parameters in this buffer and store their enumerated index.
         self.param_idx = {p: i for i, p in enumerate(self.params)}
-        self.cache_param_bucket_views = _env_flag("MCORE_FSDP_CACHE_PARAM_BUCKET_VIEWS")
+        self.cache_param_bucket_views = (
+            ddp_config.megatron_fsdp_prefetch_recompute_forward_weights
+        )
         self._param_bucket_view_cache = {}
 
     def init_data(self, data: torch.Tensor):
@@ -3928,8 +3925,6 @@ class AllGatherPipeline:
         for i in range(self.buffer.num_buckets):
             for bwd in [False, True]:
                 self.bucket_can_be_released[self.get_bucket_key(i, bwd)] = False
-        self.defer_param_bucket_view_setup = _env_flag("MCORE_FSDP_DEFER_PARAM_VIEW_SETUP")
-        self.deferred_param_bucket_views = {}
 
         # Map each bucket to the bucket group it belongs to by enumerated ID.
         # Made to collect a subset of buckets in the same bucket group.
@@ -4205,10 +4200,6 @@ class AllGatherPipeline:
                         # into an allocated bucket containing unsharded weights.
                         self.async_bucket_gather(bucket_id, bwd)
 
-            if self.defer_param_bucket_view_setup:
-                for bucket_id in buckets:
-                    self.set_deferred_param_bucket_views(bucket_id, bwd)
-
             # Replace the parameter all-gather event with coalescing event.
             for bucket_id in buckets:
                 bucket_key = self.get_bucket_key(bucket_id, bwd)
@@ -4305,15 +4296,6 @@ class AllGatherPipeline:
                 self.release_bucket(bucket_id, is_transpose_weight)
                 self.bucket_can_be_released[bucket_key] = False
 
-    def set_deferred_param_bucket_views(self, bucket_id: int, bwd: bool) -> None:
-        """Attach parameter views after the all-gather has been enqueued."""
-        bucket_key = self.get_bucket_key(bucket_id, bwd)
-        pending = self.deferred_param_bucket_views.pop(bucket_key, None)
-        if pending is None:
-            return
-        wbuf, bucket = pending
-        wbuf.set_param_data_from_bucket(bucket)
-
     def get_fsdp_buffer(self, bucket_id: int, bwd=False) -> DataParallelBuffer:
         """
         Get the FSDP / DP-Shard buffer with the given bucket ID.
@@ -4352,9 +4334,7 @@ class AllGatherPipeline:
         self.recycle_unused_buckets()
 
         # Allocate an empty bucket to store the module weights.
-        bucket = wbuf.fetch_bucket(set_param_data=not self.defer_param_bucket_view_setup)
-        if self.defer_param_bucket_view_setup:
-            self.deferred_param_bucket_views[bucket_key] = (wbuf, bucket)
+        bucket = wbuf.fetch_bucket(set_param_data=True)
 
         # All-gather the module weights in each buffer shard into the allocated bucket.
         # Now each rank will have a copy of this FSDP unit module's weights.
