@@ -8,8 +8,9 @@ from typing import Optional, Protocol
 
 import torch
 
-from megatron.core import parallel_state, tensor_parallel, utils
+from megatron.core import tensor_parallel, utils
 from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_utils import (
@@ -91,6 +92,7 @@ class ExpertsBuilder(Protocol):
         /,
         *,
         pg_collection: ProcessGroupCollection | None,
+        name: str | None = None,
     ) -> ExpertsInterface: ...
 
 
@@ -110,7 +112,12 @@ class SharedExpertsBuilder(Protocol):
     """Protocol for building the shared experts used in an MoELayer."""
 
     def __call__(
-        self, *, config: TransformerConfig, pg_collection: ProcessGroupCollection | None, gate: bool
+        self,
+        *,
+        config: TransformerConfig,
+        pg_collection: ProcessGroupCollection | None,
+        gate: bool,
+        name: str | None = None,
     ) -> SharedExpertsInterface: ...
 
 
@@ -218,7 +225,12 @@ class MoELayer(BaseMoELayer):
         layer_number: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         is_mtp_layer: bool = False,
+        name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         self.submodules = not_none(submodules)
         # TODO(Hepteract): delete the usage of the global parallel_state.
         # Initialize process groups with the global parallel_state.
@@ -268,6 +280,7 @@ class MoELayer(BaseMoELayer):
                 skip_bias_add=False,
                 skip_weight_param_allocation=False,
                 is_expert=False,
+                name=(name + ".fc1_latent_proj") if name is not None else None,
             )
             self.fc2_latent_proj = linear_cls(
                 self.config.moe_latent_size,
@@ -279,6 +292,7 @@ class MoELayer(BaseMoELayer):
                 skip_bias_add=False,
                 skip_weight_param_allocation=False,
                 is_expert=False,
+                name=(name + ".fc2_latent_proj") if name is not None else None,
             )
 
         # Initialize token dispatcher
@@ -310,7 +324,10 @@ class MoELayer(BaseMoELayer):
 
         # Initialize experts
         self.experts = self.submodules.experts(
-            self.num_local_experts, self.config, pg_collection=pg_collection
+            self.num_local_experts,
+            self.config,
+            pg_collection=pg_collection,
+            name=(name + ".experts") if name is not None else None,
         )
 
         # Initialize shared experts
@@ -322,6 +339,7 @@ class MoELayer(BaseMoELayer):
                 config=self.config,
                 pg_collection=pg_collection,
                 gate=self.config.moe_shared_expert_gate,
+                name=(name + ".shared_experts") if name is not None else None,
             )
             if self.shared_expert_overlap:
                 self.token_dispatcher.set_shared_experts(self.shared_experts)
@@ -370,8 +388,8 @@ class MoELayer(BaseMoELayer):
         Called from __init__ when config.transformer_impl == "inference_optimized".
         Stores the training dispatcher and creates the inference dispatcher selected
         by config.inference_moe_token_dispatcher_type ('nccl' or 'nvls').
-        The active dispatcher is swapped automatically via the train() override:
-        eval mode → inference dispatcher, train mode → standard dispatcher.
+        The active dispatcher is selected at the start of `forward` based on
+        `InferenceMode.is_active()`.
         """
         dispatcher_type = self.config.inference_moe_token_dispatcher_type
         dispatcher_cls = (
@@ -405,20 +423,6 @@ class MoELayer(BaseMoELayer):
         # Inference only: side-stream shared-expert output for latent-MoE + NVLS overlap
         # (preprocess launches on SharedExpertMLP.stream; postprocess joins+adds).
         self._latent_shared_expert_output: Optional[torch.Tensor] = None
-
-    def train(self, mode: bool = True):
-        """Swap token dispatcher when switching between train and eval modes."""
-        super().train(mode)
-        if hasattr(self, "_inference_token_dispatcher"):
-            if mode:
-                self.token_dispatcher = self._training_token_dispatcher
-                self.shared_expert_overlap = self.config.moe_shared_expert_overlap
-            else:
-                self.token_dispatcher = self._inference_token_dispatcher
-                self.shared_expert_overlap = (
-                    self._inference_token_dispatcher.shared_experts is not None
-                )
-        return self
 
     def setup_delayed_wgrad_for_dispatch_backward_overlap(self):
         """Initializes CUDA events and streams for overlapping expert
@@ -509,7 +513,7 @@ class MoELayer(BaseMoELayer):
                         apply_module(self.shared_experts),
                         False,
                         tensor_parallel.random.get_cuda_rng_tracker,
-                        parallel_state.get_tensor_model_parallel_group(),
+                        self.tp_group,
                         hidden_states,
                     )
                 else:
@@ -536,7 +540,7 @@ class MoELayer(BaseMoELayer):
         dispatched_input, tokens_per_expert, permuted_probs = (
             self.token_dispatcher.dispatch_postprocess(hidden_states, probs)
         )
-        if hasattr(self, "_inference_token_dispatcher") and not self.training:
+        if hasattr(self, "_inference_token_dispatcher") and InferenceMode.is_active():
             routing_map = self.token_dispatcher.routing_map
             expert_output, mlp_bias = apply_module(self.experts)(
                 dispatched_input, tokens_per_expert, permuted_probs, routing_map=routing_map
@@ -618,6 +622,18 @@ class MoELayer(BaseMoELayer):
                 "During training, performance may degrade if MoE and tensor parallelism"
                 "are enabled without also enabling sequence parallelism."
             )
+        # Select the active token dispatcher based on whether the inference engine
+        # is currently using the model. Only applies when the inference dispatcher
+        # was set up (config.transformer_impl == "inference_optimized").
+        if hasattr(self, "_inference_token_dispatcher"):
+            if InferenceMode.is_active():
+                self.token_dispatcher = self._inference_token_dispatcher
+                self.shared_expert_overlap = (
+                    self._inference_token_dispatcher.shared_experts is not None
+                )
+            else:
+                self.token_dispatcher = self._training_token_dispatcher
+                self.shared_expert_overlap = self.config.moe_shared_expert_overlap
         # Transpose from [bsz, seq_length] to [seq_length, bsz] to align with hidden_states
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()
@@ -637,7 +653,7 @@ class MoELayer(BaseMoELayer):
                 # This signal is raised from the maybe_skip_or_early_return_by_cudagraph decorator.
                 # It means we should early-return from the MoE layer forward pass.
                 # This happens when we are partially capturing the CUDA graph of the MoE layer,
-                # like cuda_graph_scope=["moe_router", "moe_preprocess"].
+                # like cuda_graph_modules=["moe_router", "moe_preprocess"].
                 # We need to return the intermediate tensors as CUDA graph outputs.
                 return e.get_early_return_outputs(hidden_states, shared_expert_output)
 
@@ -672,7 +688,7 @@ class MoELayer(BaseMoELayer):
                     custom_forward,
                     False,
                     tensor_parallel.random.get_cuda_rng_tracker,
-                    parallel_state.get_tensor_model_parallel_group(),
+                    self.tp_group,
                     hidden_states,
                     intermediate_tensors,
                     padding_mask,

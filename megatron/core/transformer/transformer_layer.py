@@ -15,10 +15,11 @@ from torch import Tensor
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
-from megatron.core.transformer.enums import CudaGraphScope, LayerType
+from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope, LayerType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.module import GraphableMegatronModule
@@ -223,6 +224,7 @@ class MlpBuilder(Protocol):
         config: TransformerConfig,
         pg_collection: ProcessGroupCollection,
         is_mtp_layer: bool,
+        name: str | None = None,
     ) -> MlpInterface: ...
 
 
@@ -304,7 +306,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         is_mtp_layer: bool = False,
         add_layer_offset: bool = True,
         pp_layer_offset: Optional[int] = None,
+        name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         self.submodules_config = submodules
         super().__init__(config=config, vp_stage=vp_stage)
 
@@ -357,6 +364,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             config=self.config,
             layer_number=self.layer_number,
             **attention_optional_kwargs,
+            name=(name + ".self_attention") if name is not None else None,
         )
 
         # [Module 3: BiasDropoutFusion]
@@ -375,6 +383,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             config=self.config,
             layer_number=self.layer_number,
             **attention_optional_kwargs,
+            name=(name + ".cross_attention") if name is not None else None,
         )
 
         # [Module 6: BiasDropoutFusion]
@@ -409,7 +418,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 "`as_mlp_submodule` classmethod instead.",
             )
         self.mlp = submodules.mlp(
-            config=self.config, pg_collection=pg_collection, is_mtp_layer=self.is_mtp_layer
+            config=self.config,
+            pg_collection=pg_collection,
+            is_mtp_layer=self.is_mtp_layer,
+            name=(name + ".mlp") if name is not None else None,
         )
         if hasattr(self.mlp, 'set_layer_number'):
             self.mlp.set_layer_number(self.layer_number)
@@ -433,7 +445,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 def can_recompute_pre_mlp_layernorm_for_cudagraph():
                     if (
                         not self.is_moe_layer
-                        or CudaGraphScope.moe_router not in self.config.cuda_graph_scope
+                        or CudaGraphModule.moe_router not in self.config.cuda_graph_modules
                         or self.config.cuda_graph_impl == "local"
                     ):
                         # Not a MoE layer, or not capturing the router part.
@@ -453,7 +465,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                             "recompute.",
                         )
                         return False
-                    if CudaGraphScope.moe_preprocess in self.config.cuda_graph_scope and (
+                    if CudaGraphModule.moe_preprocess in self.config.cuda_graph_modules and (
                         self.config.moe_token_dispatcher_type == "alltoall"
                         or self.config.moe_latent_size
                     ):
@@ -511,18 +523,25 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
     def create_mcore_cudagraph_manager(self, config):
         """Register the transformer layer for cudagraphs."""
 
+        assert self.config.cuda_graph_impl == "local"
+
         from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
-        # If full scope, just cudagraph the entire layer
-        if not self.config.cuda_graph_scope:
+        # If full scope (no specific sub-scope), cudagraph the entire layer.
+        # Skip only when inference uses TransformerBlock-level graphs; otherwise the layer keeps
+        # owning the empty-scope manager.
+        if (
+            not self.config.cuda_graph_modules
+            and self.config.inference_cuda_graph_scope != InferenceCudaGraphScope.block
+        ):
             self.cudagraph_manager = CudaGraphManager(config)
         elif (
-            CudaGraphScope.attn in self.config.cuda_graph_scope
+            CudaGraphModule.attn in self.config.cuda_graph_modules
             and self.submodules_config.self_attention != IdentityOp
         ):
             self.cudagraph_manager = CudaGraphManager(config)
         elif (
-            CudaGraphScope.mlp in self.config.cuda_graph_scope
+            CudaGraphModule.mlp in self.config.cuda_graph_modules
             and self.submodules_config.mlp != IdentityOp
         ):
             # Cudagraphing MoE layers are supposed handled by MoeTransforerLayer
@@ -619,8 +638,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         if self.config.fp32_residual_connection:
             residual = residual.float()
 
-        using_fused_tp_inference_kernel = (not self.training) and (
-            self.config.inference_fuse_tp_communication
+        using_fused_tp_inference_kernel = (
+            InferenceMode.is_active() and self.config.inference_fuse_tp_communication
         )
 
         if using_fused_tp_inference_kernel:
@@ -798,8 +817,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             and not isinstance(self.mlp, IdentityOp)
         )
 
-        using_fused_tp_inference_kernel = (not self.training) and (
-            self.config.inference_fuse_tp_communication
+        using_fused_tp_inference_kernel = (
+            InferenceMode.is_active() and self.config.inference_fuse_tp_communication
         )
 
         if self.recompute_mlp:
@@ -859,7 +878,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             and self.config.cuda_graph_impl == "transformer_engine"
             and self.training
             and is_graph_capturing()
-            and CudaGraphScope.moe_router in self.config.cuda_graph_scope
+            and CudaGraphModule.moe_router in self.config.cuda_graph_modules
         ):
             if self.recompute_pre_mlp_layernorm:
                 # Register the recompute hooks to all the cudagraph output tensors, because some
@@ -889,8 +908,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             FineGrainedActivationOffloadingInterface as off_interface,
         )
 
-        using_fused_tp_inference_kernel = (not self.training) and (
-            self.config.inference_fuse_tp_communication
+        using_fused_tp_inference_kernel = (
+            InferenceMode.is_active() and self.config.inference_fuse_tp_communication
         )
 
         if self.recompute_pre_mlp_layernorm:
@@ -1027,7 +1046,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         static_inputs = super().get_layer_static_inputs(seq_length, micro_batch_size)
 
         if not isinstance(self.self_attention, IdentityOp) and (
-            not self.config.cuda_graph_scope or CudaGraphScope.attn in self.config.cuda_graph_scope
+            not self.config.cuda_graph_modules
+            or CudaGraphModule.attn in self.config.cuda_graph_modules
         ):
             slen_per_cp = seq_length // self.config.context_parallel_size
             static_inputs["attention_mask"] = (
@@ -1042,22 +1062,22 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
         Get the submodules that are covered by cudagraphs.
         """
-        if not self.config.cuda_graph_scope:
+        if not self.config.cuda_graph_modules:
             return super()._get_submodules_under_cudagraphs()
 
         submodules = []
-        if CudaGraphScope.attn in self.config.cuda_graph_scope:
+        if CudaGraphModule.attn in self.config.cuda_graph_modules:
             submodules += [
                 self.input_layernorm,
                 self.self_attention,
                 self.pre_cross_attn_layernorm,
                 self.cross_attention,
             ]
-        if (not self.is_moe_layer and CudaGraphScope.mlp in self.config.cuda_graph_scope) or (
-            self.is_moe_layer and CudaGraphScope.moe in self.config.cuda_graph_scope
+        if (not self.is_moe_layer and CudaGraphModule.mlp in self.config.cuda_graph_modules) or (
+            self.is_moe_layer and CudaGraphModule.moe in self.config.cuda_graph_modules
         ):
             submodules += [self.pre_mlp_layernorm, self.mlp]
-        elif self.is_moe_layer and CudaGraphScope.moe_router in self.config.cuda_graph_scope:
+        elif self.is_moe_layer and CudaGraphModule.moe_router in self.config.cuda_graph_modules:
             submodules += [self.pre_mlp_layernorm, self.mlp.router]
             if (
                 self.config.moe_shared_expert_intermediate_size is not None
@@ -1070,12 +1090,15 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         """
         CUDA Graph capture for this layer using TE interface.
         There are some differences from the normal pass:
-        1. In some conditions CUDA graph cannot cover the entire layer. The `cuda_graph_scope`
+        1. In some conditions CUDA graph cannot cover the entire layer. The `cuda_graph_modules`
            attribute can be set to control the scope of the CUDA graph.
         2. If context is None, it cannot be returned as output.
         """
         context = None
-        if not self.config.cuda_graph_scope or CudaGraphScope.attn in self.config.cuda_graph_scope:
+        if (
+            not self.config.cuda_graph_modules
+            or CudaGraphModule.attn in self.config.cuda_graph_modules
+        ):
             hidden_states, context = self._forward_attention(*args, **kwargs)
         else:
             if len(args) > 0:
@@ -1084,13 +1107,13 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 hidden_states = kwargs.pop("hidden_states")
 
         if (
-            not self.config.cuda_graph_scope
-            or (not self.is_moe_layer and CudaGraphScope.mlp in self.config.cuda_graph_scope)
+            not self.config.cuda_graph_modules
+            or (not self.is_moe_layer and CudaGraphModule.mlp in self.config.cuda_graph_modules)
             or (
                 self.is_moe_layer
                 and (
-                    CudaGraphScope.moe in self.config.cuda_graph_scope
-                    or CudaGraphScope.moe_router in self.config.cuda_graph_scope
+                    CudaGraphModule.moe in self.config.cuda_graph_modules
+                    or CudaGraphModule.moe_router in self.config.cuda_graph_modules
                 )
             )
         ):
@@ -1111,7 +1134,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         Hence, `inference_context` and `packed_seq_params` are excluded from input list.
         """
         context = None
-        if self.config.cuda_graph_scope and CudaGraphScope.attn not in self.config.cuda_graph_scope:
+        if (
+            self.config.cuda_graph_modules
+            and CudaGraphModule.attn not in self.config.cuda_graph_modules
+        ):
             hidden_states, context = self._forward_attention(*args, **kwargs)
             args = (hidden_states,)
             kwargs = {}
@@ -1130,9 +1156,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             context = cuda_graph_output.pop()
 
         if (
-            not self.config.cuda_graph_scope
-            or (not self.is_moe_layer and CudaGraphScope.mlp in self.config.cuda_graph_scope)
-            or (self.is_moe_layer and CudaGraphScope.moe in self.config.cuda_graph_scope)
+            not self.config.cuda_graph_modules
+            or (not self.is_moe_layer and CudaGraphModule.mlp in self.config.cuda_graph_modules)
+            or (self.is_moe_layer and CudaGraphModule.moe in self.config.cuda_graph_modules)
         ):
             # CUDA Graph captures the whole MLP/MoE part. CUDA Graph output is the layer output.
             assert len(cuda_graph_output) == 1, "CUDA Graph output should be the layer output."
@@ -1141,7 +1167,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 not self.config.overlap_moe_expert_parallel_comm
             ), "EP overlap must be \
                 disabled when CUDA graph captures the whole MLP/MoE part."
-        elif self.is_moe_layer and CudaGraphScope.moe_router in self.config.cuda_graph_scope:
+        elif self.is_moe_layer and CudaGraphModule.moe_router in self.config.cuda_graph_modules:
             # CUDA Graph partially captures the MoE.
             # The rest of the layer should go to the normal pass.
             shared_expert_output, routing_map = None, None
@@ -1154,7 +1180,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 # The shared expert output is the last second element in the CUDA graph output.
                 shared_expert_output = cuda_graph_output.pop()
 
-            if CudaGraphScope.moe_preprocess in self.config.cuda_graph_scope:
+            if CudaGraphModule.moe_preprocess in self.config.cuda_graph_modules:
                 # CUDA graph output is [hidden_states, probs] + attributes outputs.
                 (hidden_states, probs), attr_outputs = cuda_graph_output[:2], cuda_graph_output[2:]
                 valid_cudagraph_attrs = self.mlp.token_dispatcher.valid_cudagraph_attrs
@@ -1295,14 +1321,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         ):
             return True
         # Inference mode. CUDA graphs are used in the decode phase only, when attn mask is None
-        elif not self.training and (
+        elif InferenceMode.is_active() and (
             hasattr(self, 'cudagraph_manager')
             and kwargs['attention_mask'] is None
             and (
                 (kwargs.get('inference_context') is not None)
                 or (kwargs.get('inference_params') is not None)
             )
-            and not self.config.cuda_graph_scope  # empty-list = per-layer CUDA graphs
+            and not self.config.cuda_graph_modules  # empty-list = per-layer CUDA graphs
         ):
             if kwargs['inference_context'].is_static_batching():
                 using_cuda_graph = kwargs['inference_context'].is_decode_only()
@@ -1404,17 +1430,22 @@ class MoETransformerLayer(TransformerLayer):
 
         Unlike the standard layer which typically uses a single manager, this method
         can configure multiple graph managers if partial CUDA graphs are enabled via
-        `cuda_graph_scope`. This allows capturing the static parts of the MoE pass
+        `cuda_graph_modules`. This allows capturing the static parts of the MoE pass
         while leaving the expert computation to execute eagerly.
         """
 
+        assert self.config.cuda_graph_impl == "local"
+
         from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
-        if not self.config.cuda_graph_scope or CudaGraphScope.moe in self.config.cuda_graph_scope:
+        if (
+            not self.config.cuda_graph_modules
+            and self.config.inference_cuda_graph_scope != InferenceCudaGraphScope.block
+        ) or CudaGraphModule.moe in self.config.cuda_graph_modules:
             self.cudagraph_manager = CudaGraphManager(config)
         elif (
-            CudaGraphScope.moe_router in self.config.cuda_graph_scope
-            or CudaGraphScope.moe_preprocess in self.config.cuda_graph_scope
+            CudaGraphModule.moe_router in self.config.cuda_graph_modules
+            or CudaGraphModule.moe_preprocess in self.config.cuda_graph_modules
         ):
             self.transition_cudagraph_scope('partial')
 
@@ -1519,7 +1550,7 @@ class MoETransformerLayer(TransformerLayer):
         if inference_context is not None:
             assert not self.use_partial_cudagraphs, (
                 "Partial cudagraphs for MoEs were detected during inference!"
-                "Please do not use --cuda-graph-scope moe_router moe_preprocess "
+                "Please do not use --cuda-graph-modules moe_router moe_preprocess "
                 "alongside inference."
             )
 

@@ -500,7 +500,7 @@ def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
         """
         total_split = sum(split_sizes)
         if isinstance(data, DTensor) and data.shape[split_dim] == total_split:
-            # GDN tensors are already TP-local here.
+            # GDN tensors are already TP-local here (fast-path from #4799).
             return list(
                 split_dtensor(
                     data, split_sizes, dim=split_dim, update_uneven_dtensor_chunk_meta=True

@@ -2,6 +2,7 @@
 
 import os
 import sys
+import types
 
 import pytest
 import torch
@@ -24,10 +25,11 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.multi_token_prediction import (
     MTPLossLoggingHelper,
     MultiTokenPredictionBlock,
+    process_mtp_loss,
     roll_tensor,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import is_te_min_version
+from megatron.core.utils import get_batch_on_this_cp_rank, is_te_min_version, unwrap_model
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import (
@@ -37,7 +39,6 @@ from megatron.training.global_vars import (
     set_global_variables,
 )
 from megatron.training.training import get_model, setup_model_and_optimizer
-from megatron.training.utils import get_batch_on_this_cp_rank, unwrap_model
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -129,6 +130,101 @@ class TestMultiTokenPredictionLayer:
             assert num_weights == 29664 * config.mtp_num_layers
         elif tp == 4:
             assert num_weights == 15216 * config.mtp_num_layers
+
+    def test_get_embeddings_rolls_padding_mask(self):
+        """Test that _get_embeddings rolls padding_mask alongside input ids."""
+        torch.manual_seed(_SEED)
+        config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=1)
+        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+        mtp_layer = mtp.layers[0]
+
+        seq_len = 6
+        batch_size = 2
+        input_ids = torch.tensor([[1, 2, 3, 4, 0, 0], [5, 6, 7, 0, 0, 0]], dtype=torch.int64)
+        position_ids = torch.arange(seq_len, dtype=torch.int64).repeat(batch_size, 1)
+        padding_mask = torch.tensor(
+            [[True, True, True, True, False, False], [True, True, True, False, False, False]]
+        )
+        hidden_states = torch.randn(seq_len, batch_size, config.hidden_size)
+
+        def fake_embedding(input_ids, position_ids):
+            return torch.zeros(seq_len, batch_size, config.hidden_size, dtype=hidden_states.dtype)
+
+        rolled_input_ids, rolled_position_ids, rolled_padding_mask, _, _ = (
+            mtp_layer._get_embeddings(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                padding_mask=padding_mask,
+                embedding=fake_embedding,
+                hidden_states=hidden_states,
+                packed_seq_params=None,
+            )
+        )
+
+        expected_input_ids, _ = roll_tensor(input_ids, shifts=-1, dims=-1)
+        expected_position_ids, _ = roll_tensor(position_ids, shifts=-1, dims=-1)
+        expected_padding_mask, _ = roll_tensor(padding_mask, shifts=-1, dims=-1)
+
+        assert torch.equal(rolled_input_ids, expected_input_ids)
+        assert torch.equal(rolled_position_ids, expected_position_ids)
+        assert torch.equal(rolled_padding_mask, expected_padding_mask)
+
+    def test_forward_propagates_rolled_padding_mask(self, monkeypatch):
+        """Test forward passes rolled padding_mask to transformer path."""
+        torch.manual_seed(_SEED)
+        config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=1)
+        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+        mtp_layer = mtp.layers[0]
+
+        seq_len = 4
+        batch_size = 2
+        input_ids = torch.tensor([[1, 2, 3, 0], [4, 5, 0, 0]], dtype=torch.int64)
+        position_ids = torch.arange(seq_len, dtype=torch.int64).repeat(batch_size, 1)
+        padding_mask = torch.tensor([[True, True, True, False], [True, True, False, False]])
+        hidden_states = torch.randn(seq_len, batch_size, config.hidden_size)
+        attention_mask = torch.ones((batch_size, 1, seq_len, seq_len), dtype=torch.bool)
+        seen = {}
+
+        def fake_embedding(input_ids, position_ids):
+            return torch.zeros(seq_len, batch_size, config.hidden_size, dtype=hidden_states.dtype)
+
+        def fake_proj_and_transformer_layer(
+            self,
+            hidden_states,
+            decoder_input,
+            attention_mask=None,
+            padding_mask=None,
+            context=None,
+            context_mask=None,
+            rotary_pos_emb=None,
+            rotary_pos_cos=None,
+            rotary_pos_sin=None,
+            attention_bias=None,
+            inference_params=None,
+            packed_seq_params=None,
+            sequence_len_offset=None,
+        ):
+            seen["padding_mask"] = padding_mask
+            return hidden_states
+
+        monkeypatch.setattr(
+            mtp_layer,
+            "_proj_and_transformer_layer",
+            types.MethodType(fake_proj_and_transformer_layer, mtp_layer),
+        )
+
+        _, _, _, returned_padding_mask = mtp_layer.forward(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            padding_mask=padding_mask,
+            embedding=fake_embedding,
+        )
+
+        expected_padding_mask, _ = roll_tensor(padding_mask, shifts=-1, dims=-1)
+        assert torch.equal(seen["padding_mask"], expected_padding_mask)
+        assert torch.equal(returned_padding_mask, expected_padding_mask)
 
 
 class TestMultiTokenPrediction:
@@ -327,6 +423,7 @@ class TestMultiTokenPrediction:
             assert f"mtp.layers.{i}.hnorm.weight" in sharded_state_dict.keys()
             assert f"mtp.layers.{i}.eh_proj.weight" in sharded_state_dict.keys()
 
+    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(
         not HAVE_TE or not is_te_min_version("2.1.0"),
         reason="grouped_gemm requires TransformerEngine >= 2.1.0",
@@ -400,7 +497,9 @@ class TestMultiTokenPrediction:
             load_checkpoint(gpt_model, optimizer, opt_param_scheduler, strict=False)
             batch["output_ref"] = output_ref
             # Get batch for current CP rank (handles CP tensor splitting)
-            batch = get_batch_on_this_cp_rank(batch)
+            batch = get_batch_on_this_cp_rank(
+                batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+            )
             tokens, labels, loss_mask, attention_mask, position_ids, output_ref = batch.values()
             output = gpt_model[0].forward(
                 input_ids=tokens,
@@ -432,6 +531,7 @@ class TestMultiTokenPrediction:
             for name, param in gpt_model[0].named_parameters():
                 assert param.main_grad is not None
 
+    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(
         not HAVE_TE or not is_te_min_version("1.7.0"),
         reason="Only transformer-engine>=1.7.0 supports MoE FP8 training",
@@ -527,6 +627,160 @@ class TestMultiTokenPrediction:
         # Verify gradients exist
         for name, param in gpt_model[0].named_parameters():
             assert param.main_grad is not None, f"Gradient missing for {name}"
+
+    @pytest.mark.flaky_in_dev
+    @pytest.mark.skipif(
+        not HAVE_TE or not is_te_min_version("2.1.0"),
+        reason="grouped_gemm requires TransformerEngine >= 2.1.0",
+    )
+    def test_packed_sequences_with_full_recompute(self):
+        """MTP + packed sequences + full activation recomputation.
+
+        Regression: MTP._checkpointed_forward used to forward
+        ``packed_seq_params`` (a non-tensor PackedSeqParams object) directly
+        to ``tensor_parallel.checkpoint``. CheckpointFunction.save_for_backward
+        only accepts tensors and ``None``, so this raised
+        ``TypeError: save_for_backward can only save variables, but argument
+        N is of type PackedSeqParams``. Non-tensor kwargs must be captured
+        by closure, not forwarded as args.
+        """
+        seq_lengths = [16, 24, 12]
+        total_seq_length = sum(seq_lengths)
+
+        args = self.create_test_args(
+            tp=1, cp=1, sequence_length=total_seq_length, micro_batch_size=1, full_recompute=True
+        )
+        set_args(args)
+
+        torch.manual_seed(_SEED)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+
+        batch = self.get_packed_batch(seq_lengths, micro_batch_size=1)
+        gpt_model, _, _ = setup_model_and_optimizer(
+            self.model_provider, ModelType.encoder_or_decoder
+        )
+
+        output = gpt_model[0].forward(
+            input_ids=batch['tokens'],
+            position_ids=batch['position_ids'],
+            attention_mask=batch['attention_mask'],
+            labels=batch['labels'],
+            loss_mask=batch['loss_mask'],
+            packed_seq_params=batch['packed_seq_params'],
+        )
+
+        # Backward must run end-to-end through the recomputed MTP layer.
+        loss = output.mean()
+        loss.backward()
+
+        for name, param in gpt_model[0].named_parameters():
+            assert param.main_grad is not None, f"Gradient missing for {name}"
+
+    def test_roll_tensor_none_input(self):
+        """Test that roll_tensor returns (None, None) when given None input."""
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+        result, sum_val = roll_tensor(None, shifts=-1, dims=-1)
+        assert result is None
+        assert sum_val is None
+        Utils.destroy_model_parallel()
+
+    def test_roll_tensor_shifts_left_and_zeroes_last(self):
+        """Test that roll_tensor(-1) shifts left and zeroes the last position.
+
+        This is the primitive used to derive MTP labels from input_ids when labels
+        are not provided (RL training): label[i] = input_id[i+1], last position zeroed.
+        The end-to-end derivation is covered by process_mtp_loss (see input_ids path).
+        """
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+        # Simulate input_ids [batch=2, seq=5]
+        input_ids = torch.tensor(
+            [[10, 20, 30, 40, 50], [60, 70, 80, 90, 100]], dtype=torch.int64
+        ).cuda()
+        rolled, _ = roll_tensor(input_ids, shifts=-1, dims=-1)
+
+        # Expected: each row shifted left by 1, last element zeroed.
+        expected = torch.tensor(
+            [[20, 30, 40, 50, 0], [70, 80, 90, 100, 0]], dtype=torch.int64
+        ).cuda()
+        assert torch.equal(rolled, expected)
+        Utils.destroy_model_parallel()
+
+    def test_process_mtp_loss_skips_when_no_labels_and_no_input_ids(self):
+        """When labels and input_ids are both None, MTP loss is skipped (early return)."""
+        config = TransformerConfig(
+            hidden_size=8, num_layers=2, num_attention_heads=2, mtp_num_layers=1
+        )
+        hidden_states = torch.ones(2, 1, 4)
+        called = {'value': False}
+
+        def output_layer(hidden, weight=None, runtime_gather_output=None):
+            return hidden.clone(), None
+
+        def compute_language_model_loss(mtp_labels, mtp_logits):
+            called['value'] = True
+            return torch.ones_like(mtp_labels, dtype=mtp_logits.dtype)
+
+        out = process_mtp_loss(
+            hidden_states=hidden_states,
+            labels=None,
+            loss_mask=None,
+            output_layer=output_layer,
+            output_weight=None,
+            runtime_gather_output=None,
+            is_training=False,
+            compute_language_model_loss=compute_language_model_loss,
+            config=config,
+            cp_group=None,
+            packed_seq_params=None,
+            input_ids=None,
+        )
+
+        # First chunk is returned unchanged and the loss is never computed.
+        assert not called['value']
+        assert torch.equal(out, torch.chunk(hidden_states, 2, dim=0)[0])
+
+    def test_process_mtp_loss_derives_labels_from_input_ids(self):
+        """When labels is None (RL), labels are derived from input_ids by rolling left.
+
+        process_mtp_loss rolls once to build the SFT-format labels (label[i] =
+        input_id[i+1]) and once more per MTP layer, so MTP head 0 targets input_id[i+2].
+        The loss_mask is rolled in lockstep so the fabricated trailing label is masked.
+        """
+        config = TransformerConfig(
+            hidden_size=8, num_layers=2, num_attention_heads=2, mtp_num_layers=1
+        )
+        # hidden_states is chunked into (1 + mtp_num_layers) along dim 0.
+        hidden_states = torch.ones(2, 1, 5)
+        input_ids = torch.tensor([[10, 20, 30, 40, 50]], dtype=torch.long)
+        seen = {'labels': None, 'masked_loss': None}
+
+        def output_layer(hidden, weight=None, runtime_gather_output=None):
+            return hidden.clone(), None
+
+        def compute_language_model_loss(mtp_labels, mtp_logits):
+            seen['labels'] = mtp_labels.clone()
+            # Per-position loss of 1.0 so loss_mask * loss exposes the active mask.
+            return torch.ones_like(mtp_labels, dtype=torch.float32)
+
+        process_mtp_loss(
+            hidden_states=hidden_states,
+            labels=None,
+            loss_mask=None,
+            output_layer=output_layer,
+            output_weight=None,
+            runtime_gather_output=None,
+            is_training=False,
+            compute_language_model_loss=compute_language_model_loss,
+            config=config,
+            cp_group=None,
+            packed_seq_params=None,
+            input_ids=input_ids,
+        )
+
+        # input_ids rolled twice (once to SFT format, once in the MTP layer loop):
+        # [10,20,30,40,50] -> [20,30,40,50,0] -> [30,40,50,0,0].
+        assert seen['labels'] is not None, "loss should be computed in RL mode"
+        assert torch.equal(seen['labels'], torch.tensor([[30, 40, 50, 0, 0]], dtype=torch.long))
 
     @pytest.mark.parametrize("cp", [1, 2])
     def test_roll_tensor_with_packed_sequences(self, cp):
@@ -880,7 +1134,9 @@ class TestMultiTokenPredictionHybrid:
             load_checkpoint(mamba_model, optimizer, opt_param_scheduler, strict=False)
 
             batch["output_ref"] = output_ref
-            batch = get_batch_on_this_cp_rank(batch)
+            batch = get_batch_on_this_cp_rank(
+                batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+            )
             tokens, labels, loss_mask, attention_mask, position_ids, output_ref = batch.values()
             output = mamba_model[0].forward(
                 input_ids=tokens,

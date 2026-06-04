@@ -11,6 +11,7 @@ spec:
   n_repeat: 5
   platforms: dgx_a100
   script_setup: |
+    set -euo pipefail
     unset https_proxy
     echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
 
@@ -34,6 +35,7 @@ spec:
     git rev-parse HEAD
     rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
   script: |-
+    set -euo pipefail
     ls
     cd /opt/megatron-lm
 
@@ -50,8 +52,8 @@ spec:
         "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
         "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json"
         "N_REPEAT={n_repeat}"
-        "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE}}"
-        "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS}}"
+        "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE:-}}"
+        "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS:-}}"
     )
 
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
@@ -151,6 +153,11 @@ products:
       - environment: [dev]
         scope: [mr, mr-github]
         platforms: [dgx_h100]
+  - test_case: [gpt3_mcore_te_tp1_pp1_te_4experts_groupedGEMM_op_fuser]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github]
+        platforms: [dgx_h100]
   - test_case: [gpt3_mcore_te_tp2_pp1_te_8experts_etp1_ep4]
     products:
       # - environment: [dev]
@@ -204,6 +211,11 @@ products:
     products:
       - environment: [dev]
         scope: [mr-broken]
+        platforms: [dgx_h100]
+  - test_case: [deepseek_proxy_fsdp_ep2_fsdp2_ep_overlap]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github]
         platforms: [dgx_h100]
   #######################################################################
   # Super important mr, mr-github tests that run for both DEV and LTS per mr, mr-github       #
