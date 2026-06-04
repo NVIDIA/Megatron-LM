@@ -5,8 +5,15 @@ import os
 import random
 import sys
 import time
+from typing import List
 
 import torch
+
+sys.path.append(
+    os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
+)
+
+from megatron.core import mpu
 
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine, StaticInferenceEngine
@@ -29,18 +36,10 @@ from megatron.inference.utils import (
     get_dynamic_inference_engine,
     get_model_for_inference,
 )
-
-sys.path.append(
-    os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
-)
-
-from functools import partial
-from typing import List
-
-from megatron.core import mpu
-from megatron.training import get_args, get_model, get_tokenizer
+from megatron.training import get_args, get_tokenizer
+from megatron.training.argument_utils import inference_cfg_from_args
 from megatron.training.arguments import parse_and_validate_args
-from megatron.training.checkpointing import load_checkpoint
+from megatron.training.config.inference_config import InferenceScriptConfig
 from megatron.training.initialize import initialize_megatron
 
 REQUEST_ID = 0
@@ -64,21 +63,17 @@ def add_inference_benchmarking_args(parser):
     return parser
 
 
-def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> AbstractEngine:
-    """Utility to get the relevant backend for running inference
-
-    Args:
-        args (Namespace): The user arguments parsed from command line
-        model (MegatronModule): The megatron model .
-
-    Returns:
-        AbstractBackend: The chosen backend
-    """
-
-    if args.engine_type == "static":
+def get_inference_engine(
+    inference_cfg: InferenceScriptConfig,
+    model: MegatronModule,
+    engine_type: str,
+) -> AbstractEngine:
+    """Return the static or dynamic inference engine for benchmarking."""
+    if engine_type == "static":
         tokenizer = get_tokenizer()
         context = StaticInferenceContext(
-            args.inference_max_requests, args.inference_max_sequence_length
+            inference_cfg.inference_max_requests,
+            inference_cfg.inference_max_seq_length,
         )
         inference_wrapped_model = GPTInferenceWrapper(model, context)
         inference_wrapped_model.model_is_pipeline_parallel = not (
@@ -88,8 +83,9 @@ def get_inference_engine(args: argparse.Namespace, model: MegatronModule) -> Abs
             inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
         )
         return StaticInferenceEngine(text_generation_controller=text_generation_controller)
-    elif args.engine_type == "dynamic":
-        return get_dynamic_inference_engine(model=model)
+    if engine_type == "dynamic":
+        return get_dynamic_inference_engine(model=model, inference_cfg=inference_cfg)
+    raise ValueError(f"Unknown engine type: {engine_type}")
 
 
 def get_random_prompt_tokens(tokenizer, num_input_tokens) -> List[int]:
@@ -165,32 +161,35 @@ def main():
     initialize_megatron()
 
     args = get_args()
+    inference_cfg = inference_cfg_from_args(args)
 
-    model = get_model_for_inference()
+    model = get_model_for_inference(inference_cfg=inference_cfg)
 
     tokenizer = build_tokenizer(args)
 
-    assert (args.prompts is None) ^ (
+    assert (inference_cfg.prompts is None) ^ (
         args.num_input_tokens is None
     ), "Exactly one of `--prompts` and `--num-prompt-tokens` must be specified"
 
-    inference_engine = get_inference_engine(args, model)
+    inference_engine = get_inference_engine(
+        inference_cfg, model, engine_type=args.engine_type
+    )
 
     sampling_params = SamplingParams(
-        temperature=args.temperature,
-        top_k=args.top_k,
-        top_p=args.top_p,
-        return_log_probs=args.return_log_probs,
-        top_n_logprobs=args.top_n_logprobs,
-        num_tokens_to_generate=args.num_tokens_to_generate,
+        temperature=inference_cfg.temperature,
+        top_k=inference_cfg.top_k,
+        top_p=inference_cfg.top_p,
+        return_log_probs=inference_cfg.return_log_probs,
+        top_n_logprobs=inference_cfg.top_n_logprobs,
+        num_tokens_to_generate=inference_cfg.num_tokens_to_generate,
         termination_id=-1,
     )
     sampling_params.add_attributes({"no_early_termination": True})
 
     requests = []
     if args.num_input_tokens is not None:
-        assert args.prompts is None
-        batch_size = args.inference_max_requests
+        assert inference_cfg.prompts is None
+        batch_size = inference_cfg.inference_max_requests
         for i in range(batch_size):
             prompt_tokens = get_random_prompt_tokens(tokenizer, args.num_input_tokens)
             requests.append(
@@ -202,8 +201,8 @@ def main():
                 )
             )
     else:
-        assert args.prompts is not None
-        for prompt in args.prompts:
+        assert inference_cfg.prompts is not None
+        for prompt in inference_cfg.prompts:
             requests.append(
                 InferenceRequest(
                     request_id=str(time.monotonic()),
@@ -225,7 +224,9 @@ def main():
     start_time = time.perf_counter()
     if args.engine_type == "static":
         results: List[InferenceRequest] = inference_engine.generate(
-            prompts=args.prompts, inference_requests=requests, sampling_params=sampling_params
+            prompts=inference_cfg.prompts,
+            inference_requests=requests,
+            sampling_params=sampling_params,
         )
     else:
         prompts = [request.prompt_tokens for request in requests]
@@ -254,11 +255,13 @@ def main():
                 'latency': latency,
                 'memory_usage_GB': memory_allocated / (1024**3),
             }
-            if args.prompts is not None:
+            if inference_cfg.prompts is not None:
                 result_dict['generated_output'] = tokenizer.detokenize(result.generated_tokens)
             print(result_dict)
 
-    total_output_tokens = args.num_tokens_to_generate * args.inference_max_requests
+    total_output_tokens = (
+        inference_cfg.num_tokens_to_generate * inference_cfg.inference_max_requests
+    )
     throughput = total_output_tokens / latency
     print(f"Throughput: {throughput} output tokens / second")
 

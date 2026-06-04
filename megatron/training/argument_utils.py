@@ -19,16 +19,19 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.spec_utils import import_module
 
 from megatron.training.config import (
-    DistributedInitConfig, 
-    PretrainConfigContainer, 
-    SchedulerConfig, 
+    DistributedInitConfig,
+    InferenceScriptConfig,
+    PretrainConfigContainer,
+    SchedulerConfig,
     TokenizerConfig,
-    TrainingConfig, 
-    ValidationConfig, 
-    RNGConfig, 
+    TrainingConfig,
+    ValidationConfig,
+    RNGConfig,
     LoggerConfig,
     StragglerDetectionConfig,
-    RerunStateMachineConfig, CheckpointConfig, ProfilingConfig
+    RerunStateMachineConfig,
+    CheckpointConfig,
+    ProfilingConfig,
 )
 from megatron.training.models import HybridModelConfig, GPTModelConfig
 # TODO: support arg renames
@@ -475,6 +478,27 @@ def hybrid_config_from_args(args: Namespace, config: TransformerConfig | None=No
     return HybridModelConfig(**kwargs)
 
 
+def inference_cfg_from_args(args: Namespace) -> InferenceScriptConfig:
+    """Build an :class:`InferenceScriptConfig` from the argparse namespace."""
+    kwargs = _default_config_from_args(InferenceScriptConfig, args, return_instance=False)
+
+    # Fields defined outside inference arg groups but consumed by inference utilities.
+    for name in (
+        "load",
+        "exit_on_missing_checkpoint",
+        "transformer_impl",
+        "fp8_recipe",
+        "inference_grouped_gemm_backend",
+        "inference_cuda_graph_scope",
+        "rank",
+        "world_size",
+    ):
+        if hasattr(args, name):
+            kwargs[name] = getattr(args, name)
+
+    return InferenceScriptConfig(**kwargs)
+
+
 def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> PretrainConfigContainer:
     """Build a PretrainConfigContainer from the argparse arguments."""
     from megatron.training.training import get_megatron_ddp_config, get_megatron_optimizer_config
@@ -519,6 +543,7 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
 
         rerun_state_machine=RerunStateMachineConfig(**rerunsm_kwargs),
         straggler=_default_config_from_args(StragglerDetectionConfig, args),
+        inference=inference_cfg_from_args(args),
     )
 
     return cfg

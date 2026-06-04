@@ -5,6 +5,7 @@ from megatron.training.config.common_config import (
     ProfilingConfig,
     DistributedInitConfig,
 )
+from megatron.training.config.inference_config import InferenceScriptConfig
 from megatron.training.config.training_config import (
     TrainingConfig,
     ValidationConfig,

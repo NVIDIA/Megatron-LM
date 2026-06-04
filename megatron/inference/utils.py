@@ -10,7 +10,7 @@ import torch
 
 from megatron.core.inference.config import (
     CudaGraphSizingDistribution,
-    InferenceConfig,
+    InferenceConfig as CoreInferenceConfig,
     KVCacheManagementMode,
     MambaInferenceStateConfig,
     PrefixCachingCoordinatorPolicy,
@@ -32,8 +32,13 @@ from megatron.core.utils import get_attr_wrapped_model, log_single_rank, unwrap_
 from megatron.training import get_args
 from megatron.training import get_model as _get_model
 from megatron.training import get_tokenizer, get_wandb_writer
-from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args
+from megatron.training.argument_utils import (
+    gpt_config_from_args,
+    hybrid_config_from_args,
+    inference_cfg_from_args,
+)
 from megatron.training.checkpointing import load_checkpoint
+from megatron.training.config.inference_config import InferenceScriptConfig
 from megatron.training.models import (
     GPTModelBuilder,
     HybridModelBuilder,
@@ -44,7 +49,11 @@ from model_provider import model_provider
 logger = logging.getLogger(__name__)
 
 
-def get_model_builder(args: Namespace, provider: Optional[str] = None) -> ModelBuilder:
+def get_model_builder(
+    args: Namespace,
+    provider: Optional[str] = None,
+    inference_cfg: InferenceScriptConfig | None = None,
+) -> ModelBuilder:
     """Construct a :class:`ModelBuilder` for the requested model provider.
 
     Replaces the legacy ``gpt_builder`` / ``hybrid_builder`` function selector with
@@ -57,13 +66,17 @@ def get_model_builder(args: Namespace, provider: Optional[str] = None) -> ModelB
             ``gpt_config_from_args`` / ``hybrid_config_from_args``.
         provider: Optional override for the model provider name. Must be one of
             ``"gpt"``, ``"hybrid"``, or the deprecated ``"mamba"``. When omitted,
-            falls back to ``args.model_provider`` (set by ``add_inference_args``).
+            falls back to ``inference_cfg.model_provider``.
+        inference_cfg: Optional inference configuration. When omitted, built from
+            ``args`` via :func:`inference_cfg_from_args`.
 
     Returns:
         A :class:`ModelBuilder` instance bound to a config derived from ``args``.
     """
+    if inference_cfg is None:
+        inference_cfg = inference_cfg_from_args(args)
     if provider is None:
-        provider = args.model_provider
+        provider = inference_cfg.model_provider
     if provider == "gpt":
         return GPTModelBuilder(gpt_config_from_args(args))
     if provider in ("hybrid", "mamba"):
@@ -112,12 +125,13 @@ def builder_to_legacy_callable(builder: ModelBuilder) -> Callable:
     return legacy_builder
 
 
-def get_model_for_inference() -> MegatronModule:
+def get_model_for_inference(inference_cfg: InferenceScriptConfig | None = None) -> MegatronModule:
     """Initialize model and load checkpoint for inference."""
-
     args = get_args()
+    if inference_cfg is None:
+        inference_cfg = inference_cfg_from_args(args)
 
-    builder = get_model_builder(args)
+    builder = get_model_builder(args, inference_cfg=inference_cfg)
 
     # Build model.
     model = _get_model(
@@ -126,13 +140,14 @@ def get_model_for_inference() -> MegatronModule:
     )
 
     # Load checkpoint.
-    assert args.load is not None
+    assert inference_cfg.load is not None
     args.exit_on_missing_checkpoint = True
+    inference_cfg.exit_on_missing_checkpoint = True
     load_checkpoint(
         ddp_model=model,
         optimizer=None,
         opt_param_scheduler=None,
-        strict=not args.inference_ckpt_non_strict,
+        strict=not inference_cfg.inference_ckpt_non_strict,
     )
 
     # No virtual PP.
@@ -142,8 +157,11 @@ def get_model_for_inference() -> MegatronModule:
     # Eval mode.
     model.eval()
 
-    if args.transformer_impl == "inference_optimized" and args.fp8_recipe == "mxfp8":
-        backend = args.inference_grouped_gemm_backend
+    if (
+        inference_cfg.transformer_impl == "inference_optimized"
+        and inference_cfg.fp8_recipe == "mxfp8"
+    ):
+        backend = inference_cfg.inference_grouped_gemm_backend
         if backend == "auto" or backend == "torch":
             quant_backend = "triton"
         elif backend == "te":
@@ -352,14 +370,22 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
     return parser
 
 
-def get_inference_config_from_model_and_args(model: MegatronModule, args):
-    """Returns a `InferenceConfig` constructed from the model and command line arguments."""
+def get_inference_config_from_model_and_args(
+    model: MegatronModule,
+    args: Namespace | None = None,
+    inference_cfg: InferenceScriptConfig | None = None,
+) -> CoreInferenceConfig:
+    """Returns a core :class:`InferenceConfig` from the model and script settings."""
+    if inference_cfg is None:
+        if args is None:
+            args = get_args()
+        inference_cfg = inference_cfg_from_args(args)
 
     # Max sequence length.
     position_embedding_type = get_attr_wrapped_model(model, "position_embedding_type")
     model_max_seq_len = get_attr_wrapped_model(model, "max_sequence_length")
-    inf_max_seq_len = args.inference_max_seq_length
-    max_batch_size = args.inference_dynamic_batching_max_requests
+    inf_max_seq_len = inference_cfg.inference_max_seq_length
+    max_batch_size = inference_cfg.inference_dynamic_batching_max_requests
 
     if position_embedding_type == "learned_absolute":
         # When using absolute position embeddings, it is critical that the
@@ -374,19 +400,19 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         assert max_batch_size is None or max_batch_size <= model_max_seq_len
     else:
         max_sequence_length = inf_max_seq_len
-    if args.inference_dynamic_batching_max_requests is not None:
+    if inference_cfg.inference_dynamic_batching_max_requests is not None:
         max_sequence_length = max(max_sequence_length, max_batch_size)
 
     mamba_inference_state_config = MambaInferenceStateConfig.from_model(
         model,
-        conv_states_dtype=args.mamba_inference_conv_states_dtype,
-        ssm_states_dtype=args.mamba_inference_ssm_states_dtype,
+        conv_states_dtype=inference_cfg.mamba_inference_conv_states_dtype,
+        ssm_states_dtype=inference_cfg.mamba_inference_ssm_states_dtype,
     )
     pg_collection = get_attr_wrapped_model(model, "pg_collection")
 
-    # Get inference logging configuration from args
-    log_inference_wandb = args.inference_wandb_logging
-    inference_logging_step_interval = args.inference_logging_step_interval
+    # Get inference logging configuration.
+    log_inference_wandb = inference_cfg.inference_wandb_logging
+    inference_logging_step_interval = inference_cfg.inference_logging_step_interval
 
     # Get metrics writer if logging is enabled and on the logging rank
     # Use the same rank convention as training (last rank logs)
@@ -394,7 +420,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
     if (
         inference_logging_step_interval > 0
         and log_inference_wandb
-        and args.rank == (args.world_size - 1)
+        and inference_cfg.rank == (inference_cfg.world_size - 1)
     ):
         metrics_writer = get_wandb_writer()
         if metrics_writer is None:
@@ -405,58 +431,70 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
                 "wandb module is available. Inference logging will be disabled.",
             )
 
-    return InferenceConfig(
+    cuda_graph_scope = inference_cfg.inference_cuda_graph_scope
+    return CoreInferenceConfig(
         verbose=True,
-        block_size_tokens=args.inference_dynamic_batching_block_size,
-        buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
-        paused_buffer_size_gb=args.inference_dynamic_batching_paused_buffer_size_gb,
-        mamba_memory_ratio=args.inference_dynamic_batching_mamba_memory_ratio,
+        block_size_tokens=inference_cfg.inference_dynamic_batching_block_size,
+        buffer_size_gb=inference_cfg.inference_dynamic_batching_buffer_size_gb,
+        paused_buffer_size_gb=inference_cfg.inference_dynamic_batching_paused_buffer_size_gb,
+        mamba_memory_ratio=inference_cfg.inference_dynamic_batching_mamba_memory_ratio,
         num_cuda_graphs=(
-            args.inference_dynamic_batching_num_cuda_graphs
-            if args.inference_cuda_graph_scope != InferenceCudaGraphScope.none
+            inference_cfg.inference_dynamic_batching_num_cuda_graphs
+            if cuda_graph_scope is not None and cuda_graph_scope != InferenceCudaGraphScope.none
             else None
         ),
-        max_requests=args.inference_dynamic_batching_max_requests,
-        max_tokens=args.inference_dynamic_batching_max_tokens,
-        unified_memory_level=args.inference_dynamic_batching_unified_memory_level,
-        kv_cache_management_mode=KVCacheManagementMode(args.rl_kv_cache_management_mode),
-        cuda_graph_mixed_prefill_count=args.inference_dynamic_batching_cuda_graph_mixed_prefill_count,  # pylint: disable=line-too-long
+        max_requests=inference_cfg.inference_dynamic_batching_max_requests,
+        max_tokens=inference_cfg.inference_dynamic_batching_max_tokens,
+        unified_memory_level=inference_cfg.inference_dynamic_batching_unified_memory_level,
+        kv_cache_management_mode=KVCacheManagementMode(inference_cfg.rl_kv_cache_management_mode),
+        cuda_graph_mixed_prefill_count=inference_cfg.inference_dynamic_batching_cuda_graph_mixed_prefill_count,  # pylint: disable=line-too-long
         cuda_graph_sizing_distribution=CudaGraphSizingDistribution(
-            args.inference_dynamic_batching_cuda_graph_sizing_distribution
+            inference_cfg.inference_dynamic_batching_cuda_graph_sizing_distribution
         ),
-        use_cuda_graphs_for_non_decode_steps=not args.decode_only_cuda_graphs,
-        cuda_graph_all_prefills=args.inference_cuda_graph_all_prefills,
-        static_kv_memory_pointers=args.rl_persist_cuda_graphs,
+        use_cuda_graphs_for_non_decode_steps=not inference_cfg.decode_only_cuda_graphs,
+        cuda_graph_all_prefills=inference_cfg.inference_cuda_graph_all_prefills,
+        static_kv_memory_pointers=inference_cfg.rl_persist_cuda_graphs,
         max_sequence_length=max_sequence_length,
         mamba_inference_state_config=mamba_inference_state_config,
         pg_collection=pg_collection,
-        use_flashinfer_fused_rope=args.use_flashinfer_fused_rope,
-        materialize_only_last_token_logits=(not args.return_log_probs),
-        track_generated_token_events=args.inference_dynamic_batching_track_generated_token_events,
-        track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
-        enable_chunked_prefill=args.enable_chunked_prefill,
-        enable_prefix_caching=args.inference_dynamic_batching_enable_prefix_caching,
-        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy(args.inference_dynamic_batching_prefix_caching_eviction_policy),
-        prefix_caching_coordinator_policy=PrefixCachingCoordinatorPolicy(args.inference_dynamic_batching_prefix_caching_coordinator_policy),
-        prefix_caching_routing_alpha=getattr(args, 'inference_dynamic_batching_prefix_caching_routing_alpha', 0.5),
-        prefix_caching_mamba_gb=getattr(args, 'inference_dynamic_batching_prefix_caching_mamba_gb', None),
+        use_flashinfer_fused_rope=inference_cfg.use_flashinfer_fused_rope,
+        materialize_only_last_token_logits=(not inference_cfg.return_log_probs),
+        track_generated_token_events=inference_cfg.inference_dynamic_batching_track_generated_token_events,
+        track_paused_request_events=inference_cfg.inference_dynamic_batching_track_paused_request_events,
+        enable_chunked_prefill=inference_cfg.enable_chunked_prefill,
+        enable_prefix_caching=inference_cfg.inference_dynamic_batching_enable_prefix_caching,
+        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy(
+            inference_cfg.inference_dynamic_batching_prefix_caching_eviction_policy
+        ),
+        prefix_caching_coordinator_policy=PrefixCachingCoordinatorPolicy(
+            inference_cfg.inference_dynamic_batching_prefix_caching_coordinator_policy
+        ),
+        prefix_caching_routing_alpha=inference_cfg.inference_dynamic_batching_prefix_caching_routing_alpha,
+        prefix_caching_mamba_gb=inference_cfg.inference_dynamic_batching_prefix_caching_mamba_gb,
         metrics_writer=metrics_writer,
-        logging_step_interval=args.inference_logging_step_interval,
-        num_speculative_tokens=args.num_speculative_tokens,
-        use_synchronous_zmq_collectives=args.inference_use_synchronous_zmq_collectives,
-        disable_ep_consensus=args.inference_disable_ep_consensus,
-        sampling_backend=args.inference_dynamic_batching_sampling_backend,
+        logging_step_interval=inference_cfg.inference_logging_step_interval,
+        num_speculative_tokens=inference_cfg.num_speculative_tokens,
+        use_synchronous_zmq_collectives=inference_cfg.inference_use_synchronous_zmq_collectives,
+        disable_ep_consensus=inference_cfg.inference_disable_ep_consensus,
+        sampling_backend=inference_cfg.inference_dynamic_batching_sampling_backend,
     )
 
 
-def get_dynamic_inference_engine(model: Optional[MegatronModule] = None) -> DynamicInferenceEngine:
+def get_dynamic_inference_engine(
+    model: Optional[MegatronModule] = None,
+    inference_cfg: InferenceScriptConfig | None = None,
+) -> DynamicInferenceEngine:
     """Builds a `DynamicInferenceEngine`."""
     args = get_args()
+    if inference_cfg is None:
+        inference_cfg = inference_cfg_from_args(args)
     if model is None:
-        model = get_model_for_inference()
+        model = get_model_for_inference(inference_cfg=inference_cfg)
     tokenizer = build_tokenizer(args)
 
-    inference_config = get_inference_config_from_model_and_args(model, args)
+    inference_config = get_inference_config_from_model_and_args(
+        model, inference_cfg=inference_cfg
+    )
     context = DynamicInferenceContext(model.config, inference_config)
     inference_wrapped_model = GPTInferenceWrapper(model, context)
     controller = TextGenerationController(inference_wrapped_model, tokenizer)

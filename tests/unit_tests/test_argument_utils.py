@@ -13,9 +13,10 @@ from megatron.core.optimizer import OptimizerConfig
 from megatron.training.argument_utils import (
     ArgumentGroupFactory,
     TypeInferenceError,
+    inference_cfg_from_args,
     pretrain_cfg_container_from_args,
 )
-from megatron.training.config import PretrainConfigContainer
+from megatron.training.config import InferenceScriptConfig, PretrainConfigContainer
 
 
 @dataclass
@@ -709,6 +710,7 @@ class TestPretrainContainerFromArgsStructure:
     def test_returns_pretrain_config_container(self, patch_training_helpers):
         result = pretrain_cfg_container_from_args(_make_args())
         assert isinstance(result, PretrainConfigContainer)
+        assert isinstance(result.inference, InferenceScriptConfig)
 
     @patch("megatron.training.training.get_megatron_ddp_config")
     @patch("megatron.training.training.get_megatron_optimizer_config")
@@ -869,3 +871,50 @@ class TestTrainingConfigMapping:
         assert result.train.train_iters is None
         assert result.train.micro_batch_size is None
         assert result.train.global_batch_size is None
+
+
+class TestInferenceScriptConfigFromArgs:
+    """Tests for inference_cfg_from_args()."""
+
+    def test_maps_inference_script_fields(self):
+        args = Namespace(
+            temperature=0.7,
+            top_k=10,
+            model_provider="hybrid",
+            inference_max_seq_length=4096,
+            decode_only_cuda_graphs=True,
+            rl_kv_cache_management_mode="offload",
+            rl_persist_cuda_graphs=True,
+        )
+        cfg = inference_cfg_from_args(args)
+        assert cfg.temperature == 0.7
+        assert cfg.top_k == 10
+        assert cfg.model_provider == "hybrid"
+        assert cfg.inference_max_seq_length == 4096
+        assert cfg.decode_only_cuda_graphs is True
+        assert cfg.rl_kv_cache_management_mode == "offload"
+        assert cfg.rl_persist_cuda_graphs is True
+
+    def test_maps_fields_outside_inference_arg_groups(self):
+        args = Namespace(
+            load="/path/to/ckpt",
+            transformer_impl="inference_optimized",
+            fp8_recipe="mxfp8",
+            inference_grouped_gemm_backend="torch",
+            rank=3,
+            world_size=8,
+        )
+        cfg = inference_cfg_from_args(args)
+        assert cfg.load == "/path/to/ckpt"
+        assert cfg.transformer_impl == "inference_optimized"
+        assert cfg.fp8_recipe == "mxfp8"
+        assert cfg.inference_grouped_gemm_backend == "torch"
+        assert cfg.rank == 3
+        assert cfg.world_size == 8
+
+    def test_uses_dataclass_defaults_for_missing_fields(self):
+        cfg = inference_cfg_from_args(Namespace())
+        assert cfg.temperature == 1.0
+        assert cfg.inference_max_requests == 8
+        assert cfg.record_throughput is True
+        assert cfg.rl_kv_cache_management_mode == "persist"

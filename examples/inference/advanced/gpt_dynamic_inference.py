@@ -41,6 +41,8 @@ from megatron.inference.utils import (
     get_inference_config_from_model_and_args,
     get_model_for_inference,
 )
+from megatron.training.argument_utils import inference_cfg_from_args
+from megatron.training.config.inference_config import InferenceScriptConfig
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
@@ -49,7 +51,7 @@ import logging
 
 import megatron
 from megatron.core.utils import configure_nvtx_profiling
-from megatron.training import get_args, get_tokenizer, initialize_megatron
+from megatron.training import get_tokenizer, initialize_megatron
 
 torch.serialization.add_safe_globals([io.BytesIO])
 torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunState])
@@ -59,6 +61,8 @@ torch.serialization.add_safe_globals([megatron.core.rerun_state_machine.RerunDia
 def run_inference(
     requests: List[Request],
     engine: DynamicInferenceEngine,
+    inference_cfg: InferenceScriptConfig,
+    cuda_graph_impl: str,
     sampling_params: Optional[SamplingParams] = None,
 ) -> List[Dict[str, float]]:
     """Add requests to engine and generate tokens.
@@ -79,12 +83,10 @@ def run_inference(
             DeprecationWarning,
         )
 
-    args = get_args()
-
     # Parse batch boundaries for batch-drain mode.
     batch_ranges = None
-    if args.drain_between_batches and args.batch_boundaries:
-        boundaries = [int(x) for x in args.batch_boundaries.split(",")]
+    if inference_cfg.drain_between_batches and inference_cfg.batch_boundaries:
+        boundaries = [int(x) for x in inference_cfg.batch_boundaries.split(",")]
         num_requests_total = len(requests)
         batch_ranges = []
         for i, start in enumerate(boundaries):
@@ -106,7 +108,7 @@ def run_inference(
     tbar = tqdm(total=num_requests_total)
     total_output_tokens = 0
     attempted_step_count = 0
-    if args.cuda_graph_impl == "local":
+    if cuda_graph_impl == "local":
         cuda_graph_request_count_map = {}
     else:
         cuda_graph_request_count_map = None
@@ -132,7 +134,7 @@ def run_inference(
 
         # Record cuda_graph_request_count.
         cuda_graph_request_count = result["cuda_graph_request_count"]
-        if args.cuda_graph_impl == "local" and cuda_graph_request_count is not None:
+        if cuda_graph_impl == "local" and cuda_graph_request_count is not None:
             cuda_graph_request_count_map[cuda_graph_request_count] = (
                 cuda_graph_request_count_map.get(cuda_graph_request_count, 0) + 1
             )
@@ -213,7 +215,7 @@ def run_inference(
         while True:
             # Add requests.
             add_start = get_curr_time()
-            if args.incoming_requests_per_step is None:
+            if inference_cfg.incoming_requests_per_step is None:
                 # Add requests with 'earlier' arrival time.
                 while num_requests_added < num_requests_total:
                     if requests[num_requests_added].time_arrival > add_start:
@@ -222,7 +224,10 @@ def run_inference(
             else:
                 # Add deterministic number of requests (generally used for debugging).
                 for i in range(
-                    min(args.incoming_requests_per_step, num_requests_total - num_requests_added)
+                    min(
+                        inference_cfg.incoming_requests_per_step,
+                        num_requests_total - num_requests_added,
+                    )
                 ):
                     _add_request()
             add_times.append(get_curr_time() - add_start)
@@ -237,18 +242,18 @@ def run_inference(
             attempted_step_count += 1
 
             # Test suspending and resuming engine.
-            if args.suspend_resume_interval is not None:
+            if inference_cfg.suspend_resume_interval is not None:
 
                 # Suspend.
-                if attempted_step_count % args.suspend_resume_interval == 0:
+                if attempted_step_count % inference_cfg.suspend_resume_interval == 0:
                     print("**** step %d/%d ... suspend." % (engine.context.step_count, attempted_step_count))
                     engine.suspend()
 
                 # Resume, 0+ attempted steps later.
                 if (
                     attempted_step_count > 0
-                    and (attempted_step_count - args.suspend_resume_interval // 2)
-                    % args.suspend_resume_interval
+                    and (attempted_step_count - inference_cfg.suspend_resume_interval // 2)
+                    % inference_cfg.suspend_resume_interval
                     == 0
                 ):
                     print("**** step %d/%d ... resume." % (engine.context.step_count, attempted_step_count))
@@ -285,6 +290,8 @@ def main():
         args_defaults={'no_load_rng': True, 'no_load_optim': True},
     )
     initialize_megatron()
+    inference_cfg = inference_cfg_from_args(args)
+    cuda_graph_impl = args.cuda_graph_impl
 
     # Start Nsight profiler.
     if os.environ.get("NSIGHT_PREFIX"):
@@ -305,22 +312,28 @@ def main():
 
     # Sampling params.
     sampling_params = SamplingParams(
-        temperature=args.temperature,
-        top_k=args.top_k,
-        top_p=args.top_p,
-        skip_prompt_log_probs=args.skip_prompt_log_probs,
-        return_log_probs=args.return_log_probs,
-        num_tokens_to_generate=args.num_tokens_to_generate,
-        termination_id=args.termination_id if args.termination_id is not None else tokenizer.eod,
-        top_n_logprobs=args.top_n_logprobs,
-        stop_words=args.stop_words,
+        temperature=inference_cfg.temperature,
+        top_k=inference_cfg.top_k,
+        top_p=inference_cfg.top_p,
+        skip_prompt_log_probs=inference_cfg.skip_prompt_log_probs,
+        return_log_probs=inference_cfg.return_log_probs,
+        num_tokens_to_generate=inference_cfg.num_tokens_to_generate,
+        termination_id=(
+            inference_cfg.termination_id
+            if inference_cfg.termination_id is not None
+            else tokenizer.eod
+        ),
+        top_n_logprobs=inference_cfg.top_n_logprobs,
+        stop_words=inference_cfg.stop_words,
     )
 
-    model = get_model_for_inference()
+    model = get_model_for_inference(inference_cfg=inference_cfg)
 
     # Requests, context, controller.
-    requests = build_requests(args, tokenizer, sampling_params)
-    inference_config = get_inference_config_from_model_and_args(model, args)
+    requests = build_requests(inference_cfg, tokenizer, seed=args.seed, sampling_params=sampling_params)
+    inference_config = get_inference_config_from_model_and_args(
+        model, inference_cfg=inference_cfg
+    )
 
     # Calculate max_sequence_length from requests
     max_gen_length = sampling_params.num_tokens_to_generate
@@ -331,7 +344,7 @@ def main():
     controller = TextGenerationController(wrapped_model, tokenizer)
 
     # Validate all context_length's <= max_tokens.
-    if not args.enable_chunked_prefill:
+    if not inference_cfg.enable_chunked_prefill:
         invalid_prompt_length_map = {}
         for request_idx, request in enumerate(requests):
             if len(request.prompt_tokens) > context.max_tokens:
@@ -345,14 +358,16 @@ def main():
     # Inference engine.
     engine = DynamicInferenceEngine(controller, context)
 
-    setup_prefix = build_dynamic_engine_setup_prefix(args, model, context, requests)
+    setup_prefix = build_dynamic_engine_setup_prefix(
+        inference_cfg, cuda_graph_impl, model, context, requests
+    )
     print("~~~")
     print(setup_prefix)
     print("~~~")
 
-    # Run and time test, optionally `args.inference_repeat_n` times.
+    # Run and time test, optionally multiple trials via inference_repeat_n.
     throughputs = []
-    for _ in range(args.inference_repeat_n):
+    for _ in range(inference_cfg.inference_repeat_n):
 
         # Reset engine.
         engine.reset()
@@ -361,7 +376,7 @@ def main():
 
         # Trial.
         t = get_curr_time()
-        result = run_inference(requests, engine)
+        result = run_inference(requests, engine, inference_cfg, cuda_graph_impl)
         step_times = result["step_times"]
         add_times = result["add_times"]
         output_times = result["output_times"]
@@ -435,12 +450,12 @@ def main():
                 text_hashes.append(o_hash)
 
         # Write results to JSON. Primarily used for functional testing.
-        if args.output_path:
+        if inference_cfg.output_path:
             json_results = {}
 
             # Write every 'n' requests, plus the final request.
             for i, req in enumerate(requests):
-                if i % args.output_every_n_results == 0 or i == len(requests) - 1:
+                if i % inference_cfg.output_every_n_results == 0 or i == len(requests) - 1:
                     print(f' Attributes of request {i}: {req.__dict__}')
                     result_dict = {
                         "input_prompt": req.prompt_text,
@@ -459,20 +474,20 @@ def main():
                             req, 'generated_log_probs', None
                         )
                         result_dict["logprobs"] = getattr(req, 'logprobs', None)
-                    if args.output_request_events:
+                    if inference_cfg.output_request_events:
                         result_dict["events"] = [e.serialize() for e in req.events]
                     json_results[req.request_id] = result_dict
 
             # Track system-level throughput as a test / debug metric
-            if args.record_throughput:
+            if inference_cfg.record_throughput:
                 json_results["throughput"] = throughputs
             # Attach peak memory metrics; the functional test only validates these
             # if the fields exist in the golden values.
             json_results.update(peak_mem_stats)
             json_results["lifetime_prefill_token_count"] = engine.context.lifetime_prefill_token_count
 
-            print(f' Saving results to {args.output_path}')
-            with open(args.output_path, "w") as fp:
+            print(f' Saving results to {inference_cfg.output_path}')
+            with open(inference_cfg.output_path, "w") as fp:
                 json.dump(json_results, fp, indent=1)
 
         # Timing results.

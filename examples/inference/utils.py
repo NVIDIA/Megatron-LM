@@ -6,7 +6,6 @@ import itertools
 import json
 import random
 import time
-from argparse import ArgumentParser, Namespace
 from collections import defaultdict
 from functools import partial
 from typing import Any, List, Optional
@@ -19,7 +18,7 @@ from megatron.core.inference.contexts.dynamic_context import get_mem_size_str
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.transformer.module import MegatronModule
-from megatron.training import get_args
+from megatron.training.config.inference_config import InferenceScriptConfig
 
 
 def get_default_sampling_params(termination_id: int = None):
@@ -136,44 +135,56 @@ def get_time_offsets(
 
 
 def get_cli_requests(
-    args: Namespace, tokenizer: Any, sampling_params: Optional[SamplingParams] = None
+    inference_cfg: InferenceScriptConfig,
+    tokenizer: Any,
+    seed: int | None = None,
+    sampling_params: Optional[SamplingParams] = None,
 ) -> list[Request]:
+    assert inference_cfg.prompts is not None
 
     # Get time offsets.
     t_offsets = get_time_offsets(
-        args.seed,
-        args.incoming_requests_per_step,
-        args.incoming_requests_per_sec,
-        len(args.prompts),
+        seed,
+        inference_cfg.incoming_requests_per_step,
+        inference_cfg.incoming_requests_per_sec,
+        len(inference_cfg.prompts),
     )
 
     # Init requests.
-    requests = [Request(p, t, tokenizer, sampling_params) for p, t in zip(args.prompts, t_offsets)]
+    requests = [
+        Request(p, t, tokenizer, sampling_params)
+        for p, t in zip(inference_cfg.prompts, t_offsets)
+    ]
     return requests
 
 
 def get_synthetic_requests(
-    args: Namespace, tokenizer: Any, sampling_params: Optional[SamplingParams] = None
+    inference_cfg: InferenceScriptConfig,
+    tokenizer: Any,
+    seed: int | None = None,
+    sampling_params: Optional[SamplingParams] = None,
 ) -> list[Request]:
     """Get example requests."""
 
     # Get time offsets.
     time_offsets = get_time_offsets(
-        args.seed,
-        args.incoming_requests_per_step,
-        args.incoming_requests_per_sec,
-        int(args.incoming_requests_per_sec * args.incoming_requests_duration),
+        seed,
+        inference_cfg.incoming_requests_per_step,
+        inference_cfg.incoming_requests_per_sec,
+        int(inference_cfg.incoming_requests_per_sec * inference_cfg.incoming_requests_duration),
     )
 
     # Build prompts with expected lengths.
     assert (
-        len(args.num_tokens_to_prompt) == 2
-        and args.num_tokens_to_prompt[1] >= args.num_tokens_to_prompt[0]
+        len(inference_cfg.num_tokens_to_prompt) == 2
+        and inference_cfg.num_tokens_to_prompt[1] >= inference_cfg.num_tokens_to_prompt[0]
     )
-    max_prompt_length = args.num_tokens_to_prompt[1]
+    max_prompt_length = inference_cfg.num_tokens_to_prompt[1]
     max_prompt_text = "hi " * max_prompt_length
     max_prompt_tokens = tokenizer.tokenize(max_prompt_text)
-    prompt_lengths = [random.randint(*args.num_tokens_to_prompt) for _ in time_offsets]
+    prompt_lengths = [
+        random.randint(*inference_cfg.num_tokens_to_prompt) for _ in time_offsets
+    ]
     prompt_tokens_list = [max_prompt_tokens[:l] for l in prompt_lengths]
     prompt_texts = [tokenizer.detokenize(tt) for tt in prompt_tokens_list]
 
@@ -188,34 +199,40 @@ def get_synthetic_requests(
 
 
 def get_requests_from_file(
-    args: Namespace, tokenizer: Any, sampling_params: Optional[SamplingParams] = None
+    inference_cfg: InferenceScriptConfig,
+    tokenizer: Any,
+    seed: int | None = None,
+    sampling_params: Optional[SamplingParams] = None,
 ) -> list[Request]:
     """Get requests from a file."""
-    if not args.prompt_file:
+    if not inference_cfg.prompt_file:
         raise ValueError("Prompt file is required to read requests from a file.")
 
     # Load prompts.
-    n_prompts = sum(1 for _ in open(args.prompt_file))
+    n_prompts = sum(1 for _ in open(inference_cfg.prompt_file))
     prompts = []
     if sampling_params is None:
         sampling_params = get_default_sampling_params(tokenizer.eod)
     sampling_params_list = []
-    with open(args.prompt_file) as f:
+    with open(inference_cfg.prompt_file) as f:
         for line in tqdm(f.readlines(), "read prompt file", total=n_prompts):
             line_dict = json.loads(line)
             prompts.append(line_dict["text"])
 
             sp = copy.deepcopy(sampling_params)
-            if args.num_tokens_from_file:
+            if inference_cfg.num_tokens_from_file:
                 sp.num_tokens_to_generate = line_dict["chatgpt_output_token_length"]
             sampling_params_list.append(sp)
 
-            if len(prompts) == args.prompt_file_num_truncate:
+            if len(prompts) == inference_cfg.prompt_file_num_truncate:
                 break
 
     # Get time offsets.
     time_offsets: list[float] = get_time_offsets(
-        args.seed, args.incoming_requests_per_step, args.incoming_requests_per_sec, len(prompts)
+        seed,
+        inference_cfg.incoming_requests_per_step,
+        inference_cfg.incoming_requests_per_sec,
+        len(prompts),
     )
 
     # Init requests.
@@ -230,17 +247,19 @@ def get_requests_from_file(
 
 
 def build_requests(
-    args: Namespace, tokenizer: Any, sampling_params: Optional[SamplingParams] = None
+    inference_cfg: InferenceScriptConfig,
+    tokenizer: Any,
+    seed: int | None = None,
+    sampling_params: Optional[SamplingParams] = None,
 ) -> list[Request]:
     # Check if we have any prompts (from command line or JSONL)
-    if args.prompts:
-        if args.prompt_file:
+    if inference_cfg.prompts:
+        if inference_cfg.prompt_file:
             raise ValueError("Cannot use both --prompts and --prompt-file")
-        return get_cli_requests(args, tokenizer, sampling_params)
-    elif args.prompt_file:
-        return get_requests_from_file(args, tokenizer, sampling_params)
-    else:
-        return get_synthetic_requests(args, tokenizer, sampling_params)
+        return get_cli_requests(inference_cfg, tokenizer, seed, sampling_params)
+    if inference_cfg.prompt_file:
+        return get_requests_from_file(inference_cfg, tokenizer, seed, sampling_params)
+    return get_synthetic_requests(inference_cfg, tokenizer, seed, sampling_params)
 
 
 def get_model_size_str(model):
@@ -253,7 +272,8 @@ def get_model_size_str(model):
 
 
 def build_dynamic_engine_setup_prefix(
-    args: Namespace,
+    inference_cfg: InferenceScriptConfig,
+    cuda_graph_impl: str,
     model: MegatronModule,
     context: DynamicInferenceContext,
     requests: list[DynamicInferenceRequest],
@@ -266,7 +286,8 @@ def build_dynamic_engine_setup_prefix(
     `dynamic | cg True | prompts: synth(16 256), n 1024, g 512, t 1.0e+02 5.0e-01 | bf 4, 1.2 [r 1024, t 8192] | gtd 0.50 [r 512] | reqs 100` # pylint: disable=line-too-long
 
     Args:
-        args (Namespace): Command-line arguments for this run.
+        inference_cfg: Inference configuration for this run.
+        cuda_graph_impl: CUDA graph implementation from training args.
         context (DynamicInferenceContext): Stores limits such as `max_requests`,
             `max_tokens`, and `gtd_request_count`.
         requests (List[DynamicInferenceRequest]): List of inference requests.
@@ -275,7 +296,7 @@ def build_dynamic_engine_setup_prefix(
         A configuration string for logging.
     """
     # CUDA graph config
-    if args.cuda_graph_impl == "local":
+    if cuda_graph_impl == "local":
         cg_str = f"graphs {len(context.cuda_graph_batch_dimensions_list)}"
     else:
         cg_str = "--"
@@ -286,25 +307,27 @@ def build_dynamic_engine_setup_prefix(
     # Prompt description
     prompt_src_str = (
         "cli"
-        if args.prompts
+        if inference_cfg.prompts
         else (
             "file"
-            if args.prompt_file
-            else f"synth({', '.join(map(str, args.num_tokens_to_prompt))})"
+            if inference_cfg.prompt_file
+            else f"synth({', '.join(map(str, inference_cfg.num_tokens_to_prompt))})"
         )
     )
     request_str = (
-        f"requests: {prompt_src_str}, " f"n {len(requests):d}, g {args.num_tokens_to_generate:d}, "
+        f"requests: {prompt_src_str}, "
+        f"n {len(requests):d}, g {inference_cfg.num_tokens_to_generate:d}, "
     )
     request_str += (
-        f"dur {args.incoming_requests_duration:.1e} " f"r/sec {args.incoming_requests_per_sec:.1e}"
-        if args.incoming_requests_per_step is None
-        else f"r/step {args.incoming_requests_per_step}"
+        f"dur {inference_cfg.incoming_requests_duration:.1e} "
+        f"r/sec {inference_cfg.incoming_requests_per_sec:.1e}"
+        if inference_cfg.incoming_requests_per_step is None
+        else f"r/step {inference_cfg.incoming_requests_per_step}"
     )
 
     # Buffer limits config
     buffer_limits_str = (
-        f"bf: {get_mem_size_str(args.inference_dynamic_batching_buffer_size_gb*1024**3)}, "
+        f"bf: {get_mem_size_str(inference_cfg.inference_dynamic_batching_buffer_size_gb*1024**3)}, "
         f"{context.kv_block_allocator.active_count} chunks "
         f"[r {context.max_requests}, t {context.max_tokens}]"
     )
@@ -376,7 +399,7 @@ def print_unique_prompts_and_outputs(results: List["DynamicInferenceRequest"]) -
 
 
 def dump_inference_results_to_json(
-    args: Namespace,
+    inference_cfg: InferenceScriptConfig,
     results: List["DynamicInferenceRequest"],
     throughputs: List[float],
     peak_mem_stats: dict,
@@ -390,12 +413,12 @@ def dump_inference_results_to_json(
     low-level engine doesn't populate it on ``DynamicInferenceRequest.merge()``;
     will be populated once that field is wired up upstream.
     """
-    if not args.output_path:
+    if not inference_cfg.output_path:
         return
 
     json_results = {}
     for i, req in enumerate(results):
-        if i % args.output_every_n_results == 0 or i == len(results) - 1:
+        if i % inference_cfg.output_every_n_results == 0 or i == len(results) - 1:
             # cuda_graph_request_count_map is only populated by the legacy
             # add_request/step_modern loop and is not surfaced through the
             # high-level API; omitting it here.
@@ -420,15 +443,15 @@ def dump_inference_results_to_json(
                     result_dict["logprobs"] = (prompt_lp or []) + (generated_lp or [])
                 else:
                     result_dict["logprobs"] = None
-            if args.output_request_events:
+            if inference_cfg.output_request_events:
                 result_dict["events"] = [e.serialize() for e in req.events]
             json_results[req.request_id] = result_dict
 
-    if args.record_throughput:
+    if inference_cfg.record_throughput:
         json_results["throughput"] = throughputs
     json_results.update(peak_mem_stats)
     json_results["lifetime_prefill_token_count"] = lifetime_prefill_token_count
 
-    print(f' Saving results to {args.output_path}')
-    with open(args.output_path, "w") as fp:
+    print(f' Saving results to {inference_cfg.output_path}')
+    with open(inference_cfg.output_path, "w") as fp:
         json.dump(json_results, fp, indent=1)

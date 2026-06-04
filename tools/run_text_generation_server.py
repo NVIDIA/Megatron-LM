@@ -30,6 +30,8 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.inference.utils import builder_to_legacy_callable, get_model_builder
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.training import get_model, print_rank_0
+from megatron.training.argument_utils import inference_cfg_from_args
+from megatron.training.config.inference_config import InferenceScriptConfig
 from model_provider import model_provider
 
 sys.path.append(
@@ -43,24 +45,14 @@ from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
 
 
-def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngine:
-    """Get the relevant backend for running inference
-
-    This function will automatically choose the TRTLLMBackend when possible, and default to Mcore
-    backend if the user does not specify any backends. TRTLLMBackend is not implmented yet.
-
-    Args:
-        args (Namespace): The user arguments parsed from command line
-        model (MegatronModule): The megatron model.
-
-    Returns:
-        AbstractBackend: The chosen backend
-    """
-    # TODO(ksanthanam): Convert this to use dynamic inference counterparts
-
+def get_inference_engine(inference_cfg: InferenceScriptConfig, model: MegatronModule) -> AbstractEngine:
+    """Get the static inference engine for the text generation server."""
     tokenizer = get_tokenizer()
 
-    inference_context = StaticInferenceContext(args.inference_max_requests, args.inference_max_sequence_length)
+    inference_context = StaticInferenceContext(
+        inference_cfg.inference_max_requests,
+        inference_cfg.inference_max_seq_length,
+    )
     inference_wrapped_model = GPTInferenceWrapper(
         model, inference_context
     )
@@ -123,6 +115,7 @@ def main(model_type: str = "gpt"):
     )
     initialize_megatron()
     args = get_args()
+    inference_cfg = inference_cfg_from_args(args)
     if args.num_layers_per_virtual_pipeline_stage is not None:
         print("Interleaved pipeline schedule is not yet supported for text generation.")
         exit()
@@ -136,7 +129,7 @@ def main(model_type: str = "gpt"):
 
         load_context = fp8_model_init()
     with load_context:
-        builder = get_model_builder(args, provider=model_type)
+        builder = get_model_builder(args, provider=model_type, inference_cfg=inference_cfg)
         model = get_model(
             partial(model_provider, builder_to_legacy_callable(builder)),
             wrap_with_ddp=False,
@@ -149,7 +142,7 @@ def main(model_type: str = "gpt"):
     model = model[0]
     model.eval()
 
-    inference_engine = get_inference_engine(args, model)
+    inference_engine = get_inference_engine(inference_cfg, model)
 
     if args.cuda_graph_impl == "local":
         print(f"Running warmup for CUDA graphs...")

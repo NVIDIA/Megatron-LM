@@ -31,7 +31,9 @@ from typing import List
 
 from megatron.core import mpu
 from megatron.training import get_args, get_model, get_tokenizer
+from megatron.training.argument_utils import inference_cfg_from_args
 from megatron.training.checkpointing import load_checkpoint
+from megatron.training.config.inference_config import InferenceScriptConfig
 from megatron.training.initialize import initialize_megatron
 
 
@@ -67,24 +69,15 @@ def add_text_generate_args(parser):
     return parser
 
 
-def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngine:
-    """Utility to get the relevant backend for running inference
-
-    This function will automatically chose the TRTLLMBackend when possible, and if not revert to Mcore backend if the user does not specify any backends. TRT LLM Backend is not implmented yet.
-
-    Args:
-        args (Namespace): The user arguments parsed from command line
-        model (MegatronModule): The megatron model .
-
-    Returns:
-        AbstractBackend: The chosen backend
-    """
-    # Build tokenizer
+def get_inference_engine(
+    inference_cfg: InferenceScriptConfig, args: Namespace, model: MegatronModule
+) -> AbstractEngine:
+    """Return the static T5 inference engine."""
     tokenizer = build_tokenizer(args)
 
     inference_wrapper_config = InferenceWrapperConfig(
         hidden_size=args.hidden_size,
-        inference_batch_times_seqlen_threshold=args.inference_batch_times_seqlen_threshold,
+        inference_batch_times_seqlen_threshold=inference_cfg.inference_batch_times_seqlen_threshold,
         fp32_residual_connection=args.fp32_residual_connection,
         params_dtype=args.params_dtype,
         padded_vocab_size=args.padded_vocab_size,
@@ -120,15 +113,16 @@ def main():
     model = model[0]
 
     args = get_args()
+    inference_cfg = inference_cfg_from_args(args)
 
-    inference_engine = get_inference_engine(args, model)
+    inference_engine = get_inference_engine(inference_cfg, args, model)
 
     sampling_params = SamplingParams(
-        temperature=args.temperature,
-        top_k=args.top_k,
-        top_p=args.top_p,
-        return_log_probs=args.return_log_probs,
-        num_tokens_to_generate=args.num_tokens_to_generate,
+        temperature=inference_cfg.temperature,
+        top_k=inference_cfg.top_k,
+        top_p=inference_cfg.top_p,
+        return_log_probs=inference_cfg.return_log_probs,
+        num_tokens_to_generate=inference_cfg.num_tokens_to_generate,
     )
 
     # Build tokenizer
