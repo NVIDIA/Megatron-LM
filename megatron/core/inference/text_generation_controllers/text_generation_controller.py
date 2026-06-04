@@ -1832,7 +1832,7 @@ class TextGenerationController:
 
             ret = {
                 "accepted_tokens": (
-                    # Clone needed: .fill_(-1) on line 1480 would corrupt the returned value.
+                    # Clone needed: .fill_(-1) below would corrupt the returned value.
                     self._accepted_tokens_per_request.clone()
                     if self.num_speculative_tokens > 0 and num_decode_requests > 0
                     else None

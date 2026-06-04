@@ -2437,10 +2437,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.kv_block_allocator.reset()
         self.request_to_kv_block_ids.fill_(-1)
 
-        # Note: step_count and prefix_cache_lru_clock are lifetime counters
-        # and are only reset in reset(), not here, so they persist across
-        # suspend/resume cycles.
-
         # Reset chunked prefill state
         self.chunked_prefill_request_id = -1
         self.num_prefill_requests = 0
