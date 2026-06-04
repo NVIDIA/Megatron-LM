@@ -9,6 +9,7 @@ loading the sharded tensors.
 """
 
 import logging
+import os
 from pathlib import Path
 from typing import Callable, Dict, Optional, Set, Tuple, Union
 
@@ -29,7 +30,7 @@ from .mapping import (
 )
 from .state_dict_utils import load_preprocess, save_preprocess
 from .strategies.async_utils import AsyncRequest
-from .strategies.common import load_common
+from .strategies.common import COMMON_STATE_FNAME, load_common
 from .strategies.torch import TorchDistLoadShardedStrategy, TorchDistSaveShardedStrategy
 from .utils import extract_sharded_base, force_all_tensors_to_non_fp8
 from .validation import (
@@ -119,10 +120,10 @@ def load(
     sharded_state_dict, nonpersistent_state_dict, sh_ten_factories = load_preprocess(
         sharded_state_dict
     )
-    if "common_state" in sharded_state_dict:
-        common_state_dict = sharded_state_dict["common_state"]
-    else:
-        common_state_dict = load_common(checkpoint_dir)
+    # Common (non-tensor) data is stored either as a single ShardedObject inside the
+    # torch_dist checkpoint (current format) or in a legacy common.pt. Loading it up front
+    # is also required to determine `async_strategy` for the sharded load below.
+    common_state_dict = load_common_state_dict(checkpoint_dir)
     merge(common_state_dict, nonpersistent_state_dict)
 
     # At this point we are only dealing with ShardedBase objects
@@ -164,8 +165,22 @@ def load(
         return common_state_dict
 
 
+def _legacy_common_state_exists(checkpoint_dir: str) -> bool:
+    """Check whether the checkpoint stores common data in a legacy common.pt file."""
+    path = os.path.join(checkpoint_dir, COMMON_STATE_FNAME)
+    if MultiStorageClientFeature.is_enabled():
+        msc = MultiStorageClientFeature.import_package()
+        return msc.Path(path).exists()
+    return os.path.exists(path)
+
+
 def load_common_state_dict(checkpoint_dir: Union[str, Path]) -> StateDict:
     """Load common (non-sharded) objects state dict from the checkpoint.
+
+    Supports both checkpoint formats transparently:
+    - legacy: common data stored in a separate common.pt file;
+    - current: common data stored as a single ShardedObject ("common_state")
+      inside the torch_dist checkpoint.
 
     Args:
         checkpoint_dir (str): checkpoint directory
@@ -183,7 +198,40 @@ def load_common_state_dict(checkpoint_dir: Union[str, Path]) -> StateDict:
             "Please pass it as a string instead.",
         )
     verify_checkpoint(str(checkpoint_dir))
-    return load_common(checkpoint_dir)
+
+    # Legacy checkpoints keep common data in a separate common.pt file.
+    if _legacy_common_state_exists(checkpoint_dir):
+        return load_common(checkpoint_dir)
+
+    # Current format: common data is a single ShardedObject. Read just that BytesIO
+    # object directly via PyTorch DCP with no_dist=True, so it works even before
+    # torch.distributed is initialized (e.g. the load_args_from_checkpoint rank-0 peek).
+    # Going through the torch_dist strategy here would call torch.distributed.get_rank()
+    # unconditionally and fail when no process group exists.
+    import io
+
+    import torch.distributed.checkpoint as dcp
+
+    from .strategies.torch import _get_filesystem_reader
+
+    # global_shape/offset must match what `save` used so the DCP key matches
+    # (ShardedObject.unique_key -> "common_state/0_1").
+    unique_key = ShardedObject("common_state", None, (1,), (0,)).unique_key
+    pyt_state_dict = {unique_key: io.BytesIO()}
+    dcp.load(
+        pyt_state_dict,
+        storage_reader=_get_filesystem_reader(checkpoint_dir),
+        no_dist=True,
+    )
+
+    # The save side serialized the common dict as a single-element list (one ShardedObject
+    # shard). DCP's default planner deserializes the BytesIO via torch.load on load, but
+    # guard for versions that leave raw bytes in place.
+    loaded = pyt_state_dict[unique_key]
+    if isinstance(loaded, io.BytesIO):
+        loaded.seek(0)
+        loaded = torch.load(loaded, weights_only=False)
+    return loaded[0]
 
 
 def load_tensors_metadata(
@@ -385,10 +433,16 @@ def save(
     if content_metadata is not None:
         sharded_state_dict[_CONTENT_METADATA_KEY] = content_metadata
 
-    sharded_state_dict["common_state"] = state_dict
-
     sharded_state_dict, state_dict = save_preprocess(
         sharded_state_dict, validate_access_integrity, preprocess_common_before_consistancy_check
+    )
+
+    sharded_state_dict["common_state"] = ShardedObject(
+        key="common_state",
+        data=state_dict,
+        global_shape=(1,),
+        global_offset=(0,),
+        replica_id=torch.distributed.get_rank(),
     )
 
     def metadata_finalize_fn():
