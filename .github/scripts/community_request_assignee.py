@@ -36,10 +36,10 @@ except ImportError:  # pragma: no cover - workflow installs slack-sdk.
 
 GITHUB_API_URL = "https://api.github.com"
 ACTIVE_ONCALL_TEAM_SLUG = "mcore-oncall"
-PREFERRED_ASSIGNEE_TEAM_SLUG = "mcore-oncall-rotation"
+ASSIGNEE_ALLOWED_TEAM_SLUG = "mcore-engineers"
 MCORE_ONCALL_SLACK_USERGROUP_ID = "S0A7B4U1T3P"
 CONFIDENCE_THRESHOLD = 0.75
-PREFERRED_ASSIGNEE_CONFIDENCE_DELTA = 0.10
+MAX_SLACK_CONTEXT_CHARS = 1200
 SERVICE_ACCOUNT_LOGINS = {"svcnvidia-nemo-ci"}
 
 _email_cache = {}
@@ -68,14 +68,8 @@ class AssignmentPlan:
     confidence: float
     rationale: str
     relevant_paths: list[str]
-
-
-@dataclass(frozen=True)
-class CandidateAssignee:
-    """Potential assignee from Claude's ranked analysis."""
-
-    login: str
-    confidence: float
+    issue_type: str = "unknown"
+    context: str = ""
 
 
 def get_required_env(name: str) -> str:
@@ -194,48 +188,22 @@ def analysis_rationale(analysis: dict) -> str:
     return rationale.strip()
 
 
-def should_use_candidate(analysis: dict, confidence_threshold: float = CONFIDENCE_THRESHOLD) -> bool:
-    candidate = normalize_login(analysis.get("assignee"))
-    if not candidate or is_service_account(candidate):
-        return False
-    if bool(analysis.get("fallback_to_oncall", False)):
-        return False
-    return analysis_confidence(analysis) >= confidence_threshold
+def analysis_issue_type(analysis: dict) -> str:
+    issue_type = analysis.get("issue_type", "unknown")
+    if not isinstance(issue_type, str) or not issue_type.strip():
+        return "unknown"
+    return issue_type.strip()
 
 
-def analysis_candidate_assignees(analysis: dict) -> list[CandidateAssignee]:
-    default_confidence = analysis_confidence(analysis)
-    raw_candidates = analysis.get("candidate_assignees", [])
-    if not isinstance(raw_candidates, list):
-        raw_candidates = []
+def analysis_slack_context(analysis: dict) -> str:
+    context = analysis.get("slack_context") or analysis.get("rationale") or ""
+    if not isinstance(context, str) or not context.strip():
+        return "Claude did not provide additional assignment context."
 
-    candidates = []
-    for raw_candidate in raw_candidates:
-        if isinstance(raw_candidate, str):
-            login = normalize_login(raw_candidate)
-            confidence = default_confidence
-        elif isinstance(raw_candidate, dict):
-            login = normalize_login(raw_candidate.get("login") or raw_candidate.get("assignee"))
-            confidence = confidence_value(raw_candidate.get("confidence"), default=default_confidence)
-        else:
-            continue
-
-        if login and not is_service_account(login):
-            candidates.append(CandidateAssignee(login=login, confidence=confidence))
-
-    legacy_candidate = normalize_login(analysis.get("assignee"))
-    if legacy_candidate and not is_service_account(legacy_candidate):
-        candidates.append(CandidateAssignee(login=legacy_candidate, confidence=default_confidence))
-
-    deduped_candidates = []
-    seen_logins = set()
-    for candidate in candidates:
-        if candidate.login in seen_logins:
-            continue
-        deduped_candidates.append(candidate)
-        seen_logins.add(candidate.login)
-
-    return deduped_candidates
+    context = context.strip()
+    if len(context) <= MAX_SLACK_CONTEXT_CHARS:
+        return context
+    return context[:MAX_SLACK_CONTEXT_CHARS].rstrip() + "..."
 
 
 def check_assignable(issue: IssueContext, login: str) -> bool:
@@ -272,43 +240,34 @@ def get_team_members(org: str, team_slug: str) -> set[str]:
     return members
 
 
-def get_preferred_assignee_members(org: str) -> set[str]:
-    try:
-        return set(human_members(get_team_members(org, PREFERRED_ASSIGNEE_TEAM_SLUG)))
-    except SystemExit:
-        print(f"Warning: Could not read {PREFERRED_ASSIGNEE_TEAM_SLUG}; continuing without preferred-team bias")
-        return set()
+def get_allowed_assignees(org: str) -> set[str]:
+    return set(human_members(get_team_members(org, ASSIGNEE_ALLOWED_TEAM_SLUG)))
 
 
-def select_candidate_assignee(analysis: dict, issue: IssueContext) -> CandidateAssignee | None:
+def select_candidate_assignee(analysis: dict, issue: IssueContext, allowed_assignees: set[str]) -> str | None:
     if bool(analysis.get("fallback_to_oncall", False)):
         return None
 
-    assignable_candidates = []
-    for candidate in analysis_candidate_assignees(analysis):
-        if candidate.confidence < CONFIDENCE_THRESHOLD:
-            continue
-        if check_assignable(issue, candidate.login):
-            assignable_candidates.append(candidate)
-
-    if not assignable_candidates:
+    candidate = normalize_login(analysis.get("assignee"))
+    if not candidate:
         return None
 
-    top_confidence = max(candidate.confidence for candidate in assignable_candidates)
-    preferred_members = get_preferred_assignee_members(issue.owner)
-    for candidate in assignable_candidates:
-        if (
-            candidate.login in preferred_members
-            and candidate.confidence >= top_confidence - PREFERRED_ASSIGNEE_CONFIDENCE_DELTA
-        ):
-            if candidate.login != assignable_candidates[0].login:
-                print(
-                    f"Prioritizing {candidate.login} because they are in "
-                    f"{PREFERRED_ASSIGNEE_TEAM_SLUG}"
-                )
-            return candidate
+    if is_service_account(candidate):
+        print(f"Rejecting {candidate}; service accounts cannot be assigned")
+        return None
 
-    return assignable_candidates[0]
+    if analysis_confidence(analysis) < CONFIDENCE_THRESHOLD:
+        return None
+
+    if candidate not in allowed_assignees:
+        print(f"Rejecting {candidate}; they are not in {ASSIGNEE_ALLOWED_TEAM_SLUG}")
+        return None
+
+    if not check_assignable(issue, candidate):
+        print(f"Rejecting {candidate}; they are not assignable to {issue.owner}/{issue.repo}")
+        return None
+
+    return candidate
 
 
 def assign_issue(issue: IssueContext, assignees: list[str], dry_run: bool = False) -> None:
@@ -326,30 +285,38 @@ def assign_issue(issue: IssueContext, assignees: list[str], dry_run: bool = Fals
 
 def create_assignment_plan(analysis: dict, issue: IssueContext) -> AssignmentPlan:
     confidence = analysis_confidence(analysis)
-    candidate = select_candidate_assignee(analysis, issue)
     rationale = analysis_rationale(analysis)
     relevant_paths = analysis_relevant_paths(analysis)
+    issue_type = analysis_issue_type(analysis)
+    context = analysis_slack_context(analysis)
+    allowed_assignees = get_allowed_assignees(issue.owner)
+    candidate = select_candidate_assignee(analysis, issue, allowed_assignees)
 
     if candidate:
         return AssignmentPlan(
             mode="candidate",
-            assignees=[candidate.login],
-            notify_users=[candidate.login],
-            confidence=candidate.confidence,
+            assignees=[candidate],
+            notify_users=[candidate],
+            confidence=confidence,
             rationale=rationale,
             relevant_paths=relevant_paths,
+            issue_type=issue_type,
+            context=context,
         )
 
-    candidate_logins = [candidate.login for candidate in analysis_candidate_assignees(analysis)]
-    if candidate_logins:
+    candidate_login = normalize_login(analysis.get("assignee"))
+    if candidate_login:
         print(
-            f"Falling back to {ACTIVE_ONCALL_TEAM_SLUG}; candidates were "
-            f"{', '.join(candidate_logins)} with top-level confidence {confidence:.2f}"
+            f"Falling back to {ACTIVE_ONCALL_TEAM_SLUG}; candidate was "
+            f"{candidate_login} with confidence {confidence:.2f}"
         )
     else:
         print(f"Falling back to {ACTIVE_ONCALL_TEAM_SLUG}; Claude did not provide a usable candidate")
 
-    oncall_members = human_members(get_team_members(issue.owner, ACTIVE_ONCALL_TEAM_SLUG))
+    oncall_members = [
+        member for member in human_members(get_team_members(issue.owner, ACTIVE_ONCALL_TEAM_SLUG))
+        if member in allowed_assignees
+    ]
     assignable_oncall = [member for member in oncall_members if check_assignable(issue, member)]
 
     return AssignmentPlan(
@@ -359,6 +326,8 @@ def create_assignment_plan(analysis: dict, issue: IssueContext) -> AssignmentPla
         confidence=confidence,
         rationale=rationale,
         relevant_paths=relevant_paths,
+        issue_type=issue_type,
+        context=context,
     )
 
 
@@ -447,11 +416,13 @@ def get_slack_user_id(slack_client, email: str) -> str | None:
 
 def build_slack_message(issue: IssueContext, plan: AssignmentPlan) -> str:
     paths = ", ".join(plan.relevant_paths) if plan.relevant_paths else "none identified"
+    context = plan.context or plan.rationale
     oncall_mention = f"<!subteam^{MCORE_ONCALL_SLACK_USERGROUP_ID}|mcore-oncall>"
     if plan.mode == "candidate":
         return (
             f"I (Megatron Issue Bot) have assigned you to the newly created community issue: <{issue.url}|{issue.url}>.\n\n"
-            "I determined that you are the best individual to answer this community issue. "
+            "I determined that you are the best individual to answer this community issue.\n\n"
+            f"Context from my analysis:\n{context}\n\n"
             "Please take action at your earliest convenience, at latest within 1 business day. "
             "If I made a mistake or if you are unsure how to proceed, please reach out to "
             f"{oncall_mention} directly."
@@ -459,7 +430,11 @@ def build_slack_message(issue: IssueContext, plan: AssignmentPlan) -> str:
 
     return (
         f"Community request <{issue.url}|#{issue.number}: {issue.title}> needs on-call triage.\n"
-        f"I could not confidently identify a direct assignee; confidence: {plan.confidence:.2f}\n"
+        "I found a new community issue, but I am not confident who should own it. "
+        "Please triage it and assign an appropriate mcore engineer.\n"
+        f"Context from my analysis:\n{context}\n"
+        f"Confidence: {plan.confidence:.2f}\n"
+        f"Issue type: {plan.issue_type}\n"
         f"Relevant paths: {paths}\n"
         f"Rationale: {plan.rationale}"
     )

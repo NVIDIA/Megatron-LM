@@ -12,24 +12,31 @@ def load_assignee_module():
     return module
 
 
-def test_should_use_candidate_requires_user_login_and_confidence():
-    module = load_assignee_module()
+def make_issue(module, number=123, title="Community issue"):
+    return module.IssueContext(
+        owner="NVIDIA",
+        repo="Megatron-LM",
+        number=number,
+        title=title,
+        url=f"https://github.com/NVIDIA/Megatron-LM/issues/{number}",
+        author="external-user",
+    )
 
-    assert module.should_use_candidate(
-        {"assignee": "@valid-user", "confidence": 0.75, "fallback_to_oncall": False}
-    )
-    assert not module.should_use_candidate(
-        {"assignee": "@NVIDIA/mcore-oncall", "confidence": 0.95, "fallback_to_oncall": False}
-    )
-    assert not module.should_use_candidate(
-        {"assignee": "valid-user", "confidence": 0.74, "fallback_to_oncall": False}
-    )
-    assert not module.should_use_candidate(
-        {"assignee": "valid-user", "confidence": 0.95, "fallback_to_oncall": True}
-    )
-    assert not module.should_use_candidate(
-        {"assignee": "svcnvidia-nemo-ci", "confidence": 0.95, "fallback_to_oncall": False}
-    )
+
+def make_analysis(**overrides):
+    analysis = {
+        "assignee": "alice",
+        "confidence": 0.91,
+        "fallback_to_oncall": False,
+        "issue_type": "bug",
+        "feature_topic": None,
+        "root_cause_pr": None,
+        "rationale": "A recent PR and blame both point to alice.",
+        "slack_context": "The issue reports a transformer regression. PR #42 changed the affected path.",
+        "relevant_paths": ["megatron/core/transformer/attention.py"],
+    }
+    analysis.update(overrides)
+    return analysis
 
 
 def test_human_members_excludes_service_accounts():
@@ -41,175 +48,73 @@ def test_human_members_excludes_service_accounts():
     ]
 
 
-def test_create_assignment_plan_uses_high_confidence_candidate(monkeypatch):
+def test_create_assignment_plan_uses_engineer_candidate(monkeypatch):
     module = load_assignee_module()
-    issue = module.IssueContext(
-        owner="NVIDIA",
-        repo="Megatron-LM",
-        number=123,
-        title="Feature request",
-        url="https://github.com/NVIDIA/Megatron-LM/issues/123",
-        author="external-user",
-    )
+    issue = make_issue(module)
 
     monkeypatch.setattr(module, "check_assignable", lambda issue, login: True)
-    monkeypatch.setattr(module, "get_team_members", lambda org, team_slug: set())
-
-    plan = module.create_assignment_plan(
-        {
-            "assignee": "@alice",
-            "confidence": 0.91,
-            "fallback_to_oncall": False,
-            "rationale": "CODEOWNERS and blame point to alice.",
-            "relevant_paths": ["megatron/core/transformer/attention.py"],
-        },
-        issue,
+    monkeypatch.setattr(
+        module,
+        "get_team_members",
+        lambda org, team_slug: {"alice", "bob"} if team_slug == module.ASSIGNEE_ALLOWED_TEAM_SLUG else set(),
     )
+
+    plan = module.create_assignment_plan(make_analysis(), issue)
 
     assert plan.mode == "candidate"
     assert plan.assignees == ["alice"]
     assert plan.notify_users == ["alice"]
     assert plan.confidence == 0.91
+    assert plan.issue_type == "bug"
+    assert plan.context.startswith("The issue reports a transformer regression.")
 
 
-def test_create_assignment_plan_prioritizes_rotation_candidate(monkeypatch):
+def test_create_assignment_plan_rejects_non_engineer_candidate(monkeypatch):
     module = load_assignee_module()
-    issue = module.IssueContext(
-        owner="NVIDIA",
-        repo="Megatron-LM",
-        number=126,
-        title="Transformer bug",
-        url="https://github.com/NVIDIA/Megatron-LM/issues/126",
-        author="external-user",
-    )
+    issue = make_issue(module, number=124, title="Feature request")
 
-    monkeypatch.setattr(module, "check_assignable", lambda issue, login: True)
-    monkeypatch.setattr(
-        module,
-        "get_team_members",
-        lambda org, team_slug: {"bob"} if team_slug == module.PREFERRED_ASSIGNEE_TEAM_SLUG else set(),
-    )
+    def fake_team_members(org, team_slug):
+        if team_slug == module.ASSIGNEE_ALLOWED_TEAM_SLUG:
+            return {"bob"}
+        if team_slug == module.ACTIVE_ONCALL_TEAM_SLUG:
+            return {"bob", "carol", "svcnvidia-nemo-ci"}
+        return set()
 
-    plan = module.create_assignment_plan(
-        {
-            "assignee": "alice",
-            "candidate_assignees": [
-                {"login": "alice", "confidence": 0.93, "rationale": "Most recent blame."},
-                {"login": "bob", "confidence": 0.88, "rationale": "CODEOWNERS and recent commits."},
-            ],
-            "confidence": 0.93,
-            "fallback_to_oncall": False,
-            "rationale": "Both candidates have relevant history.",
-            "relevant_paths": ["megatron/core/transformer/attention.py"],
-        },
-        issue,
-    )
+    monkeypatch.setattr(module, "get_team_members", fake_team_members)
+    monkeypatch.setattr(module, "check_assignable", lambda issue, login: login == "bob")
 
-    assert plan.mode == "candidate"
+    plan = module.create_assignment_plan(make_analysis(assignee="alice"), issue)
+
+    assert plan.mode == "oncall"
     assert plan.assignees == ["bob"]
     assert plan.notify_users == ["bob"]
-    assert plan.confidence == 0.88
 
 
-def test_create_assignment_plan_keeps_clearly_stronger_non_rotation_candidate(monkeypatch):
+def test_create_assignment_plan_falls_back_to_engineer_oncall_when_uncertain(monkeypatch):
     module = load_assignee_module()
-    issue = module.IssueContext(
-        owner="NVIDIA",
-        repo="Megatron-LM",
-        number=127,
-        title="Transformer bug",
-        url="https://github.com/NVIDIA/Megatron-LM/issues/127",
-        author="external-user",
-    )
+    issue = make_issue(module, number=125, title="Ambiguous request")
 
-    monkeypatch.setattr(module, "check_assignable", lambda issue, login: True)
-    monkeypatch.setattr(
-        module,
-        "get_team_members",
-        lambda org, team_slug: {"bob"} if team_slug == module.PREFERRED_ASSIGNEE_TEAM_SLUG else set(),
-    )
+    def fake_team_members(org, team_slug):
+        if team_slug == module.ASSIGNEE_ALLOWED_TEAM_SLUG:
+            return {"alice", "bob"}
+        if team_slug == module.ACTIVE_ONCALL_TEAM_SLUG:
+            return {"alice", "bob", "svcnvidia-nemo-ci"}
+        return set()
 
-    plan = module.create_assignment_plan(
-        {
-            "assignee": "alice",
-            "candidate_assignees": [
-                {"login": "alice", "confidence": 0.95, "rationale": "Most recent blame."},
-                {"login": "bob", "confidence": 0.80, "rationale": "Some relevant commits."},
-            ],
-            "confidence": 0.95,
-            "fallback_to_oncall": False,
-            "rationale": "Alice has substantially stronger ownership evidence.",
-            "relevant_paths": ["megatron/core/transformer/attention.py"],
-        },
-        issue,
-    )
-
-    assert plan.mode == "candidate"
-    assert plan.assignees == ["alice"]
-    assert plan.notify_users == ["alice"]
-    assert plan.confidence == 0.95
-
-
-def test_create_assignment_plan_continues_when_rotation_team_unavailable(monkeypatch):
-    module = load_assignee_module()
-    issue = module.IssueContext(
-        owner="NVIDIA",
-        repo="Megatron-LM",
-        number=128,
-        title="Transformer bug",
-        url="https://github.com/NVIDIA/Megatron-LM/issues/128",
-        author="external-user",
-    )
-
-    def fail_team_lookup(org, team_slug):
-        raise SystemExit(1)
-
-    monkeypatch.setattr(module, "check_assignable", lambda issue, login: True)
-    monkeypatch.setattr(module, "get_team_members", fail_team_lookup)
-
-    plan = module.create_assignment_plan(
-        {
-            "assignee": "alice",
-            "candidate_assignees": [{"login": "alice", "confidence": 0.92, "rationale": "Recent blame."}],
-            "confidence": 0.92,
-            "fallback_to_oncall": False,
-            "rationale": "Alice has relevant history.",
-            "relevant_paths": ["megatron/core/transformer/attention.py"],
-        },
-        issue,
-    )
-
-    assert plan.mode == "candidate"
-    assert plan.assignees == ["alice"]
-    assert plan.notify_users == ["alice"]
-
-
-def test_create_assignment_plan_falls_back_to_assignable_oncall(monkeypatch):
-    module = load_assignee_module()
-    issue = module.IssueContext(
-        owner="NVIDIA",
-        repo="Megatron-LM",
-        number=124,
-        title="Ambiguous request",
-        url="https://github.com/NVIDIA/Megatron-LM/issues/124",
-        author="external-user",
-    )
-
-    monkeypatch.setattr(
-        module,
-        "get_team_members",
-        lambda org, team_slug: {"alice", "bob", "svcnvidia-nemo-ci"},
-    )
+    monkeypatch.setattr(module, "get_team_members", fake_team_members)
     monkeypatch.setattr(module, "check_assignable", lambda issue, login: login == "bob")
 
     plan = module.create_assignment_plan(
-        {
-            "assignee": "carol",
-            "confidence": 0.40,
-            "fallback_to_oncall": True,
-            "rationale": "The issue does not name a clear code area.",
-            "relevant_paths": [],
-        },
+        make_analysis(
+            assignee=None,
+            confidence=0.40,
+            fallback_to_oncall=True,
+            issue_type="feature_request",
+            feature_topic="unknown",
+            rationale="The request does not match a known feature topic.",
+            slack_context="This is a new feature request, but it does not match the configured topic map.",
+            relevant_paths=[],
+        ),
         issue,
     )
 
@@ -219,33 +124,46 @@ def test_create_assignment_plan_falls_back_to_assignable_oncall(monkeypatch):
     assert plan.confidence == 0.40
 
 
-def test_build_slack_message_uses_requested_candidate_copy():
+def test_build_slack_message_includes_candidate_context():
     module = load_assignee_module()
-    issue = module.IssueContext(
-        owner="NVIDIA",
-        repo="Megatron-LM",
-        number=125,
-        title="Transformer bug",
-        url="https://github.com/NVIDIA/Megatron-LM/issues/125",
-        author="external-user",
-    )
+    issue = make_issue(module, number=126, title="Transformer bug")
     plan = module.AssignmentPlan(
         mode="candidate",
         assignees=["alice"],
         notify_users=["alice"],
         confidence=0.88,
-        rationale="CODEOWNERS and recent blame point to alice.",
+        rationale="PR #42 likely introduced the regression.",
         relevant_paths=["megatron/core/transformer/attention.py"],
+        issue_type="bug",
+        context="The issue reports a transformer regression. PR #42 changed the affected path and may be the root cause.",
     )
 
     message = module.build_slack_message(issue, plan)
 
-    assert message == (
-        "I (Megatron Issue Bot) have assigned you to the newly created community issue: "
-        "<https://github.com/NVIDIA/Megatron-LM/issues/125|"
-        "https://github.com/NVIDIA/Megatron-LM/issues/125>.\n\n"
-        "I determined that you are the best individual to answer this community issue. "
-        "Please take action at your earliest convenience, at latest within 1 business day. "
-        "If I made a mistake or if you are unsure how to proceed, please reach out to "
-        "<!subteam^S0A7B4U1T3P|mcore-oncall> directly."
+    assert "I (Megatron Issue Bot) have assigned you to the newly created community issue" in message
+    assert "Context from my analysis:" in message
+    assert "PR #42 changed the affected path and may be the root cause." in message
+    assert "Please take action at your earliest convenience, at latest within 1 business day." in message
+    assert "<!subteam^S0A7B4U1T3P|mcore-oncall>" in message
+
+
+def test_build_slack_message_includes_oncall_uncertainty_context():
+    module = load_assignee_module()
+    issue = make_issue(module, number=127, title="Unknown feature request")
+    plan = module.AssignmentPlan(
+        mode="oncall",
+        assignees=["bob"],
+        notify_users=["alice", "bob"],
+        confidence=0.35,
+        rationale="The request does not match the configured feature map.",
+        relevant_paths=[],
+        issue_type="feature_request",
+        context="This is a new community issue, but I am not sure who should own it.",
     )
+
+    message = module.build_slack_message(issue, plan)
+
+    assert "needs on-call triage" in message
+    assert "I found a new community issue, but I am not confident who should own it." in message
+    assert "This is a new community issue, but I am not sure who should own it." in message
+    assert "Issue type: feature_request" in message
