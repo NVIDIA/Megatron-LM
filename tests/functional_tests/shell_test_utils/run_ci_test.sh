@@ -56,8 +56,11 @@ TEST_TYPE=$(cat $TRAINING_PARAMS_PATH |
     /usr/local/bin/yq '.TEST_TYPE')
 TEST_EVALUATION=$(cat $TRAINING_PARAMS_PATH |
     /usr/local/bin/yq '.TEST_EVALUATION // "pass"')
-ENABLE_LIGHTWEIGHT_MODE=$(cat $TRAINING_PARAMS_PATH |
-    /usr/local/bin/yq '.ENV_VARS.ENABLE_LIGHTWEIGHT_MODE // "false"')
+# Honor an externally-provided ENABLE_LIGHTWEIGHT_MODE (e.g. set by the launcher
+# container env for L0-smoke runs) when present; otherwise fall back to the
+# per-test-case model_config.yaml value.
+ENABLE_LIGHTWEIGHT_MODE=${ENABLE_LIGHTWEIGHT_MODE:-$(cat $TRAINING_PARAMS_PATH |
+    /usr/local/bin/yq '.ENV_VARS.ENABLE_LIGHTWEIGHT_MODE // "false"')}
 N_REPEAT=$(cat $TRAINING_PARAMS_PATH |
     /usr/local/bin/yq '.ENV_VARS.N_REPEAT // "'$N_REPEAT'"')
 MODE=$(cat $TRAINING_PARAMS_PATH |

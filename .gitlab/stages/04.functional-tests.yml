@@ -93,6 +93,7 @@ functional:configure:
         "--scope L0-smoke"
         "--n-repeat 1"
         "--time-limit 540"
+        "--enable-lightweight-mode"
         "--test-cases all"
         "--container-image ${UTILITY_IMAGE}"
         "--container-tag ${CI_PIPELINE_ID}"
