@@ -878,23 +878,28 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     def test_cuda_graph_token_counts(self, use_non_decode: bool) -> None:
         """Test initialization of `cuda_graph_token_counts` in dynamic context."""
 
+        # Exponential-decay graph distribution (halve from max down to tp_size).
+        # decode-only path: cuda_graph_max_tokens = max_requests * (spec+1) = 80.
+        # non-decode path: cuda_graph_max_tokens = self.max_tokens (DEFAULT 16384);
+        # most large prefill sizes are filtered by is_valid because
+        # token_count > prefill_req_count * (max_sequence_length - 1).
         decode_only_cases = [
             (0, [80]),
             (1, [80]),
-            (2, [80, 40]),
-            (4, [80, 72, 48, 24]),
-            (8, [80, 64, 48, 32, 16]),
-            (16, [80, 72, 64, 56, 48, 40, 32, 24, 16, 8]),
-            (32, [80, 72, 64, 56, 48, 40, 32, 24, 16, 8]),
+            (2, [80, 1]),
+            (4, [80, 40, 20, 1]),
+            (8, [80, 40, 20, 10, 4, 2, 1]),
+            (16, [80, 40, 20, 10, 4, 2, 1]),
+            (32, [80, 40, 20, 10, 4, 2, 1]),
         ]
         non_decode_cases = [
             (0, [80]),
             (1, [80]),
-            (2, [80, 40]),
-            (4, [80, 72, 48, 24]),
-            (8, [80, 64, 48, 32, 16]),
-            (16, [1024, 80, 72, 64, 56, 48, 40, 32, 24, 16, 8]),
-            (32, [1024, 512, 80, 72, 64, 56, 48, 40, 32, 24, 16, 8]),
+            (2, [80, 1]),
+            (4, [80, 40, 20, 1]),
+            (8, [1024, 512, 256, 80, 40, 20, 10, 4, 2, 1]),
+            (16, [1024, 512, 256, 128, 80, 64, 40, 32, 20, 16, 10, 8, 4, 2, 1]),
+            (32, [1024, 512, 256, 128, 80, 64, 40, 32, 20, 16, 10, 8, 4, 2, 1]),
         ]
         cases = non_decode_cases if use_non_decode else decode_only_cases
 
