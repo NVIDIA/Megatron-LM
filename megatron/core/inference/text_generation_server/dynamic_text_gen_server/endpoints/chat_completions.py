@@ -471,10 +471,6 @@ try:
                         **chat_template_kwargs,
                     )
                 )
-                # transformers 5.x returns BatchEncoding here, but the rest of this
-                # path (and msgpack in inference_client) expects list[int].
-                if hasattr(prompt_tokens, 'input_ids'):
-                    prompt_tokens = list(prompt_tokens['input_ids'])
 
                 if req.get("prevent_retokenization", True):
                     # If we are avoiding retokenization, we need to replace some prompt tokens with the prompt/generation tokens from the previous generation
