@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
 import warnings
@@ -645,7 +645,7 @@ class MTPLossAutoScaler(torch.autograd.Function):
 
 def process_mtp_loss(
     hidden_states: Tensor,
-    labels: Tensor,
+    labels: Optional[Tensor],
     loss_mask: Optional[Tensor],
     output_layer: Callable,
     output_weight: Optional[Tensor],
@@ -690,6 +690,23 @@ def process_mtp_loss(
     if loss_mask is None:
         loss_mask = torch.ones_like(mtp_labels)
 
+    output_weight_for_mtp = output_weight
+    output_layer_for_mtp = output_layer
+    if config.mtp_isolated_loss:
+        if output_weight_for_mtp is not None:
+            output_weight_for_mtp = output_weight_for_mtp.detach()
+        if isinstance(output_layer, torch.nn.Module):
+            output_layer_params = {
+                name: param.detach() for name, param in output_layer.named_parameters()
+            }
+            output_layer_buffers = dict(output_layer.named_buffers())
+            output_layer_state = {**output_layer_params, **output_layer_buffers}
+
+            def output_layer_for_mtp(input_: Tensor, **kwargs):
+                return torch.func.functional_call(
+                    output_layer, output_layer_state, args=(input_,), kwargs=kwargs
+                )
+
     # Store the original number of tokens before rolling for proper normalization
     # when calculate_per_token_loss is enabled. This ensures MTP gradients are
     # correctly scaled relative to the main loss gradients in finalize_model_grads.
@@ -706,17 +723,17 @@ def process_mtp_loss(
             loss_mask, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
         if fuse_linear_cross_entropy:
-            mtp_loss = output_layer(
+            mtp_loss = output_layer_for_mtp(
                 hidden_states_list[mtp_layer_number + 1],
-                weight=output_weight,
+                weight=output_weight_for_mtp,
                 runtime_gather_output=runtime_gather_output,
                 output_cross_entropy_loss=True,
                 labels=mtp_labels,
             )
         else:
-            mtp_logits, _ = output_layer(
+            mtp_logits, _ = output_layer_for_mtp(
                 hidden_states_list[mtp_layer_number + 1],
-                weight=output_weight,
+                weight=output_weight_for_mtp,
                 runtime_gather_output=runtime_gather_output,
             )
             if scale_logits_fn is not None:
@@ -1015,6 +1032,8 @@ class MultiTokenPredictionLayer(MegatronModule):
             )
         # embedding
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
+        if self.config.mtp_isolated_loss:
+            decoder_input = decoder_input.detach()
 
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
 
@@ -1764,6 +1783,11 @@ class MultiTokenPredictionBlock(MegatronModule):
             hidden_states = mhc_chunks[offset]
         else:
             hidden_states = hidden_states_list[offset]
+        if self.config.mtp_isolated_loss:
+            hidden_states = hidden_states.detach().requires_grad_(True)
+            hidden_states = make_viewless_tensor(
+                inp=hidden_states, requires_grad=True, keep_graph=False
+            )
         for iteration in range(self.config.mtp_num_layers):
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
             (hidden_states, input_ids, position_ids, padding_mask) = self.layers[layer_idx](
