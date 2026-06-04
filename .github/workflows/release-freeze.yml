@@ -41,6 +41,8 @@ jobs:
       release-type: ${{ inputs.release-type }}
       freeze-commit: ${{ inputs.freeze-commit }}
       dry-run: ${{ inputs.dry-run }}
+      next-pre-release: ""
+      next-dev: ""
       release-branch-prefix: core_
       use-pat: true
     secrets:
