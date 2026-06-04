@@ -358,7 +358,7 @@ def build_slack_message(issue: IssueContext, plan: AssignmentPlan) -> str:
     oncall_mention = f"<!subteam^{MCORE_ONCALL_SLACK_USERGROUP_ID}|mcore-oncall>"
     if plan.mode == "candidate":
         return (
-            f"You have been automatically assigned to community issue: <{issue.url}|{issue.url}>.\n\n"
+            f"I (Megatron Issue Bot) have assigned you to the newly created community issue: <{issue.url}|{issue.url}>.\n\n"
             "I determined that you are the best individual to answer this community issue. "
             "Please take action at your earliest convenience, at latest within 1 business day. "
             "If I made a mistake or if you are unsure how to proceed, please reach out to "

@@ -128,7 +128,7 @@ def test_build_slack_message_uses_requested_candidate_copy():
     message = module.build_slack_message(issue, plan)
 
     assert message == (
-        "You have been automatically assigned to community issue: "
+        "I (Megatron Issue Bot) have assigned you to the newly created community issue: "
         "<https://github.com/NVIDIA/Megatron-LM/issues/125|"
         "https://github.com/NVIDIA/Megatron-LM/issues/125>.\n\n"
         "I determined that you are the best individual to answer this community issue. "
