@@ -248,20 +248,20 @@ def _gather_dp(dt, dp_group):
     all_shapes = [None] * dp_world
     dist.all_gather_object(all_shapes, tuple(local.shape), group=dp_group)
 
-    max_numel = max(torch.Size(s).numel() for s in all_shapes)
-    flat = local.flatten()
-    padded = torch.zeros(max_numel, dtype=dt.dtype, device=dt.device)
-    if flat.numel() > 0:
-        padded[: flat.numel()] = flat
-    gathered = [torch.empty(max_numel, dtype=dt.dtype, device=dt.device) for _ in range(dp_world)]
-    dist.all_gather(gathered, padded, group=dp_group)
+    # Pad each rank's local along dim 0 to the max dim-0 so NCCL all_gather has
+    # uniform-size inputs; dim 1+ is uniform across DP (DP shards only dim 0).
+    max_dim0 = max(s[0] for s in all_shapes)
+    other_dims = tuple(local.shape[1:])
+    padded = torch.zeros((max_dim0,) + other_dims, dtype=dt.dtype, device=dt.device)
+    if local.shape[0] > 0:
+        padded[: local.shape[0]] = local
 
-    parts = []
-    for r, s in enumerate(all_shapes):
-        n = torch.Size(s).numel()
-        if n == 0:
-            continue
-        parts.append(gathered[r][:n].view(s))
+    output = torch.empty((dp_world * max_dim0,) + other_dims, dtype=dt.dtype, device=dt.device)
+    dist.all_gather_into_tensor(output, padded, group=dp_group)
+
+    parts = [
+        output[r * max_dim0 : r * max_dim0 + s[0]] for r, s in enumerate(all_shapes) if s[0] > 0
+    ]
     return torch.cat(parts, dim=0)
 
 
