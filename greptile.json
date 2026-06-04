@@ -6,7 +6,6 @@
     "ignoreKeywords": "rename\nlinter\nprettier\ngreptile-ignor",
     "ignorePatterns": "greptile.json\ntesting/**/*.py\n*.md\n*.txt\n*.json",
     "patternRepositories": ["NVIDIA/Megatron-LM"],
-    "triggerOnUpdates": true,
     "shouldUpdateDescription": false,
     "disabledLabels": ["docs"],
     "includeAuthors": [],
