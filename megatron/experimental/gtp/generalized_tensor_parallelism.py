@@ -13,8 +13,9 @@ sharding for compounding bandwidth reduction.
 
 import math
 import re
+import warnings
 from collections import defaultdict
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional
@@ -309,7 +310,6 @@ def update_gtp_config(**kwargs):
     if kwargs.get("wgrad_before_dgrad"):
         raise NotImplementedError("Wgrad->Dgrad schedule to be supported later")
     if kwargs.get("coalesce_amax_allreduce"):
-        import warnings
         warnings.warn(
             "GTPConfig.coalesce_amax_allreduce: coalesced amax reduction across the "
             "GTP group is deferred in a followup MR; falling back to per-weight amax "
@@ -653,7 +653,10 @@ class GTPShardedParam(torch.nn.Parameter):
                     continue
 
                 weight._quantizer = _configure_quantizer(quantizer, weight.group)
-                weight.quantized = weight._quantizer.quantize(weight.get_padded_shard())
+                # This init quantize is the only allocation of the quantized storage
+                # (re-quantize writes in place), so route it via _graphed_alloc.
+                with _graphed_alloc(getattr(weight, "chain_id", GTPChain.UNGRAPHED.value)):
+                    weight.quantized = weight._quantizer.quantize(weight.get_padded_shard())
                 weight.quantized.is_routed_expert = getattr(weight, "is_routed_expert", False)
                 # fp8_param_gather: the init quantize above already produced a
                 # valid FP8 cache from the BF16 shard; flag did_cast so iter-0's
@@ -1470,6 +1473,36 @@ class _TicketSlot:
     buf: Optional[torch.Tensor] = field(default=None)  # None when released or after clear()
 
 
+# CUDA-graph memory pool for routing GRAPHED-chain allocations (AG/RS buffers and
+# quantized weight storage) into the capture pool *at creation time*, so no post-hoc
+# reallocation is needed. Registered by the integrator (set_cuda_graph_mempool) after
+# the pool is created and before the first graphed forward; stays None when CG is off,
+# in which case _graphed_alloc is a no-op and allocations use regular memory.
+_CG_MEMPOOL_DEVICE = None
+_CG_MEMPOOL = None
+
+
+def set_cuda_graph_mempool(device, mempool):
+    """Register the CUDA-graph memory pool for GRAPHED-chain GTP allocations."""
+    global _CG_MEMPOOL_DEVICE, _CG_MEMPOOL
+    _CG_MEMPOOL_DEVICE = device
+    _CG_MEMPOOL = mempool
+
+
+@contextmanager
+def _graphed_alloc(chain_id):
+    """Route allocations in this block into the registered CG mempool when ``chain_id``
+    is GRAPHED and a pool is registered; otherwise a no-op (regular allocator)."""
+    if _CG_MEMPOOL is not None and chain_id == GTPChain.GRAPHED.value:
+        torch._C._cuda_beginAllocateCurrentThreadToPool(_CG_MEMPOOL_DEVICE, _CG_MEMPOOL)
+        try:
+            yield
+        finally:
+            torch._C._cuda_endAllocateToPool(_CG_MEMPOOL_DEVICE, _CG_MEMPOOL)
+    else:
+        yield
+
+
 class GTPWeightCache:
     """
     Ticket-based buffer pool for GTP all-gather / reduce-scatter buffers.
@@ -1527,18 +1560,23 @@ class GTPWeightCache:
         else:
             out_shape = param._unsharded_shape_padded
 
-        if not isinstance(dtype, torch.dtype):
-            quantizer = param._quantizer
-            assert quantizer is not None
-            param._quantizer.set_usage(rowwise=fwd, columnwise=not fwd)
+        # Route GRAPHED-chain buffers into the CG mempool at creation (see _graphed_alloc).
+        with _graphed_alloc(getattr(param, "chain_id", GTPChain.UNGRAPHED.value)):
+            if not isinstance(dtype, torch.dtype):
+                quantizer = param._quantizer
+                assert quantizer is not None
+                param._quantizer.set_usage(rowwise=fwd, columnwise=not fwd)
 
-            buf = param._quantizer.make_empty(
-                out_shape, dtype=torch.bfloat16, device=torch.cuda.current_device()
-            )
-        else:
-            buf = torch.empty(
-                out_shape, dtype=dtype, device=param.device, memory_format=torch.contiguous_format
-            )
+                buf = param._quantizer.make_empty(
+                    out_shape, dtype=torch.bfloat16, device=torch.cuda.current_device()
+                )
+            else:
+                buf = torch.empty(
+                    out_shape,
+                    dtype=dtype,
+                    device=param.device,
+                    memory_format=torch.contiguous_format,
+                )
 
         buf_bytes = self._buf_bytes(out_shape, dtype)
         self._total_bytes += buf_bytes
@@ -1589,8 +1627,7 @@ class GTPWeightCache:
         """Return the buffer to the pool.  Ticket remains valid.
 
         slot.buf is intentionally NOT cleared: get() must stay idempotent so that
-        CUDA-graph-captured buffers keep their fixed address across replays, and
-        reallocate_to_mempool() can find every dense-chain buffer.
+        CUDA-graph-captured buffers keep their fixed address across replays.
         """
         slot = self._slots[ticket]
         if slot.buf is None:
@@ -1607,85 +1644,6 @@ class GTPWeightCache:
         self._pool.clear()
         self._total_bytes = 0
 
-    def reallocate_to_mempool(self, device, mempool):
-        """Re-allocate GRAPHED-chain ticket buffers into a CUDA graph memory pool.
-
-        Call BEFORE graph capture so every GRAPHED-chain buffer lives in the capture
-        pool and no allocations are recorded inside the graph. UNGRAPHED-chain
-        buffers are left in regular memory (they are never referenced by any
-        captured graph).
-        """
-
-        # Identify keys that belong to the GRAPHED chain
-        graphed_keys = set()
-        for slot in self._slots.values():
-            if slot.chain_id == GTPChain.GRAPHED.value:
-                graphed_keys.add(slot.key)
-
-        # Clone only GRAPHED-chain pool buffers into the passed in mempool
-        self._total_bytes = 0
-        new_pool = defaultdict(list)
-        torch._C._cuda_beginAllocateCurrentThreadToPool(device, mempool)
-        for key, buffers in self._pool.items():
-            if key not in graphed_keys:
-                continue
-            new_buffers = []
-            for _ in range(len(buffers)):
-                buf = self._allocate_buffer(*self.key_to_allocate_func[key])
-                new_buffers.append(buf)
-            new_pool[key] = new_buffers
-        torch._C._cuda_endAllocateToPool(device, mempool)
-
-        # Map each buffer in the old pool to its corresponding new one (GRAPHED only)
-        old_to_new_buff = {}
-        for key, old_pool in self._pool.items():
-            if key not in graphed_keys:
-                continue
-            new = new_pool[key]
-            for old_buf, new_buf in zip(old_pool, new):
-                old_to_new_buff[old_buf] = new_buf
-
-        # Replace each GRAPHED slot's reference; keep UNGRAPHED slots unchanged
-        for slot in self._slots.values():
-            if (
-                slot.chain_id == GTPChain.GRAPHED.value
-                and slot.buf is not None
-                and slot.buf in old_to_new_buff
-            ):
-                slot.buf = old_to_new_buff[slot.buf]
-
-        # Merge: GRAPHED keys get new buffers, UNGRAPHED keys keep old ones
-        for key, buffers in self._pool.items():
-            if key not in graphed_keys:
-                new_pool[key] = buffers
-        self._pool = new_pool
-
-        # Remap quantized params into the CG mempool — but only for params on
-        # the GRAPHED chain. UNGRAPHED-chain params (embedding, output_layer,
-        # and MoE paths whose scope is not captured) run eagerly and don't
-        # need their quantized storage in the CG mempool.
-        torch._C._cuda_beginAllocateCurrentThreadToPool(device, mempool)
-        for w in _GTP_PARAMS:
-            if getattr(w, "chain_id", GTPChain.GRAPHED.value) != GTPChain.GRAPHED.value:
-                continue
-            if w.quantized is None:
-                continue
-            if isinstance(w.quantized, NVFP4TensorStorage):
-                w.quantized._rowwise_data = torch.clone(w.quantized._rowwise_data)
-                w.quantized._columnwise_data = torch.clone(w.quantized._columnwise_data)
-                w.quantized._rowwise_scale_inv = torch.clone(w.quantized._rowwise_scale_inv)
-                w.quantized._columnwise_scale_inv = torch.clone(w.quantized._columnwise_scale_inv)
-                w.quantized._amax_columnwise = torch.clone(w.quantized._amax_columnwise)
-                w.quantized._amax_rowwise = torch.clone(w.quantized._amax_rowwise)
-            elif isinstance(w.quantized, MXFP8TensorStorage):
-                w.quantized._rowwise_data = torch.clone(w.quantized._rowwise_data)
-                w.quantized._columnwise_data = torch.clone(w.quantized._columnwise_data)
-                w.quantized._rowwise_scale_inv = torch.clone(w.quantized._rowwise_scale_inv)
-                w.quantized._columnwise_scale_inv = torch.clone(w.quantized._columnwise_scale_inv)
-            else:
-                assert False
-        torch._C._cuda_endAllocateToPool(device, mempool)
-
 
 def get_global_GTP_cache() -> GTPWeightCache:
     """Get or lazily create the global cache instance."""
@@ -1693,12 +1651,6 @@ def get_global_GTP_cache() -> GTPWeightCache:
     if _GTP_CACHE is None:
         _GTP_CACHE = GTPWeightCache()
     return _GTP_CACHE
-
-
-def reallocate_gtp_cache_to_mempool(device, mempool):
-    """Re-allocate all GTP cache buffers into a CUDA graph memory pool."""
-    if _GTP_CACHE is not None:
-        _GTP_CACHE.reallocate_to_mempool(device, mempool)
 
 
 def wait_async_comms(
@@ -1879,8 +1831,6 @@ try:
         wrap_fn=wrap_module_params_gtp,
     )
 except ImportError:
-    import warnings
-
     warnings.warn(
         "megatron.experimental.gtp: TransformerEngine does not expose register_gtp_hooks; "
         "GTP will be a no-op for te.Linear / te.LayerNormLinear / te.GroupedLinear. "

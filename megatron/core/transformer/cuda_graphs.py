@@ -66,7 +66,7 @@ if HAVE_GTP:
         GTPChain,
         get_ag_stream,
         get_rs_stream,
-        reallocate_gtp_cache_to_mempool,
+        set_cuda_graph_mempool,
         wait_async_comms,
     )
 
@@ -442,9 +442,6 @@ class _CudagraphGlobalRecord:
                 )
 
         if any(r[0].gtp_remat for r in cls.cudagraph_record):
-            reallocate_gtp_cache_to_mempool(
-                torch.cuda.current_device(), CudaGraphManager.global_mempool
-            )
             GTP_CONFIG.check_param_states = False
 
         gc.collect()
@@ -892,21 +889,13 @@ class _CudaGraphRunner(torch.nn.Module):
                     get_generalized_tensor_parallel_remat_group,
                 )
 
-                gtp_group = get_generalized_tensor_parallel_remat_group()
-                graphed_ag = get_ag_stream(GTPChain.GRAPHED.value, gtp_group)
-                graphed_rs = get_rs_stream(GTPChain.GRAPHED.value, gtp_group)
-                self._register_side_stream(self.fwd_side_streams, graphed_ag)
-                self._register_side_stream(self.bwd_side_streams, graphed_ag)
-                self._register_side_stream(self.bwd_side_streams, graphed_rs)
+                self._register_gtp_side_streams(get_generalized_tensor_parallel_remat_group())
                 # EGTP streams: required so _wait/_sync_side_streams drain EGTP
                 # NCCL into runner_stream before bwd_completion_event fires.
                 if get_expert_generalized_tensor_parallel_remat_world_size() > 1:
-                    egtp_group = get_expert_generalized_tensor_parallel_remat_group()
-                    egtp_graphed_ag = get_ag_stream(GTPChain.GRAPHED.value, egtp_group)
-                    egtp_graphed_rs = get_rs_stream(GTPChain.GRAPHED.value, egtp_group)
-                    self._register_side_stream(self.fwd_side_streams, egtp_graphed_ag)
-                    self._register_side_stream(self.bwd_side_streams, egtp_graphed_ag)
-                    self._register_side_stream(self.bwd_side_streams, egtp_graphed_rs)
+                    self._register_gtp_side_streams(
+                        get_expert_generalized_tensor_parallel_remat_group()
+                    )
                 # Bridges Phase 1 (AG drain on ag_stream) into runner_stream
                 # so bwd_completion_event records past NCCL_AG completion.
                 self.bwd_ag_fence_event = torch.cuda.Event()
@@ -928,9 +917,14 @@ class _CudaGraphRunner(torch.nn.Module):
                 self.fp4_recipe = get_fp4_recipe(self.base_module.config)
                 _set_skip_fp8_weight_update_tensor(False)
 
-    def _register_side_stream(self, side_streams, stream):
-        """Register a side stream for graph capture/replay synchronization."""
-        side_streams.append(stream)
+    def _register_gtp_side_streams(self, group):
+        """Register a GTP (chain, group)'s GRAPHED AG/RS side streams for capture/replay sync: the
+        AG stream on both fwd and bwd, the RS stream on bwd only."""
+        ag = get_ag_stream(GTPChain.GRAPHED.value, group)
+        rs = get_rs_stream(GTPChain.GRAPHED.value, group)
+        self.fwd_side_streams.append(ag)
+        self.bwd_side_streams.append(ag)
+        self.bwd_side_streams.append(rs)
 
     def _sync_against_side_streams(self, side_streams):
         """Make registered side streams wait for the current stream.
@@ -1809,6 +1803,10 @@ class CudaGraphManager(torch.nn.Module):
         self.reuse_cudagraphs = self.pg_collection.pp.size() == 1
         if CudaGraphManager.global_mempool is None:
             CudaGraphManager.global_mempool = torch.cuda.graph_pool_handle()
+            # Register the pool so GTP allocates GRAPHED-chain buffers + quantized
+            # storage directly into it (created before the first graphed forward).
+            if HAVE_GTP:
+                set_cuda_graph_mempool(torch.cuda.current_device(), CudaGraphManager.global_mempool)
             # Cudagraph stream capture requires no operations on the default stream prior to the
             # capture, so change to a side stream.
             torch.cuda.set_stream(torch.cuda.Stream())

@@ -40,11 +40,11 @@ CG compatibility is designed-in from day one, not retrofitted. The entire sync /
 - **Two chains, never cross-linked** (`GTPChain.GRAPHED` / `GTPChain.UNGRAPHED`). `prev_w` / `next_w` only connect same-chain params, so a captured traversal never reaches into eager Python and vice-versa.
 - **`torch.cuda.Event(external=True)`** for `ag_event` / `rs_event` — the events survive CG capture boundaries and can be waited on from replay-time streams.
 - **Idempotent ticket cache**: `GTPWeightCache.get(ticket)` keeps `slot.buf` set even after `release()`, so replays read the same buffer address as capture. `clear()` drops buffers while keeping tickets valid → supports CG re-capture with lazy re-allocation.
-- **`reallocate_to_mempool(device, mempool)`** pre-migrates GRAPHED-chain buffers into the CG memory pool *before* capture, so no CUDA allocations happen inside the captured graph. UNGRAPHED buffers stay in regular allocator memory.
+- **Allocate-in-pool at creation** (`set_cuda_graph_mempool` + `_graphed_alloc`): GRAPHED-chain AG/RS buffers and quantized weight storage are allocated **directly into the CG memory pool** at first creation (during warmup, before capture), so no CUDA allocations happen inside the captured graph — and no post-hoc reallocation/clone is needed. UNGRAPHED buffers stay in regular allocator memory.
 - **Lazy, one-shot chain linking**: `prefetch_initialized` is flipped during the first fwd (warmup), so the chain-construction Python side-effects never execute inside a captured graph. The link table is buffered and flushed atomically at the second forward.
 - **DDP hook manual triggering**: `register_grad_accum_hook` stores the DDP hook on the param; `_CudagraphReplayNode.backward` calls it manually after replay (since `AccumulateGrad` hooks are silenced by replay). This is also how the `assert self.grad_reduce_handle is not None` failure from partial-CG + overlap-grad-reduce is resolved.
 - **Drains at CG / eager boundary**: `_drain_gtp_side_streams()` before eager MoE expert compute. Inside bwd capture, two-phase drain: Phase 1 joins the within-graph cascade and records `bwd_completion_event` (next runner unblocks); Phase 2 calls `wait_async_comms(GRAPHED)` to drain the chain-tail handle and re-joins side streams (queued after the event so it doesn't delay the next runner).
-- **Side-stream registration**: the `(GRAPHED, gtp_group)` ag/rs streams are materialized at runner init so `_register_side_stream` captures them before the first forward.
+- **Side-stream registration**: the `(GRAPHED, gtp_group)` ag/rs streams are materialized at runner init (`_register_gtp_side_streams`) so they are captured before the first forward.
 
 ### 1.3 Low-precision quantize-then-gather
 
@@ -200,7 +200,7 @@ TransformerEngine owns the linear primitives (`Linear` / `LayerNormLinear` / `La
 
 1. The `gtp_group` kwarg that Mcore's `extensions/transformer_engine.py` threads into the TE constructors when `is_te_min_version("2.15.0")`.
 2. The hook registry (`register_gtp_hooks`), called by TE's `module/base.py` at `reset_parameters` time to slice each weight into a `GTPShardedParam` along `out_features`.
-3. The `_register_side_stream` / drain calls that synchronize TE's quantize + GEMM kernels with the side stream that owns the AG/RS NCCL ops.
+3. The `_register_gtp_side_streams` / drain calls that synchronize TE's quantize + GEMM kernels with the side stream that owns the AG/RS NCCL ops.
 
 #### What the flags do under the hood
 
