@@ -106,3 +106,40 @@ class TestFreezeBaseForMTP:
         trainable_2 = {n for n, p in self.model.named_parameters() if p.requires_grad}
 
         assert trainable_1 == trainable_2
+
+    def test_freezes_base_router_expert_bias_only(self):
+        """Non-MTP routers get frozen_expert_bias=True; MTP routers stay updatable.
+
+        The MoE router's expert_bias is updated from load-balancing token counts
+        independently of requires_grad, so freezing must flag base routers to be
+        skipped while leaving the MTP block's own routers free to update.
+        """
+
+        class _Router(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.expert_bias = torch.nn.Parameter(torch.zeros(4), requires_grad=False)
+
+        class _Tree(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                # base MoE router + an MTP block with its own MoE router
+                self.decoder = torch.nn.Module()
+                self.decoder.router = _Router()
+                self.mtp = torch.nn.Module()
+                self.mtp.layers = torch.nn.Module()
+                self.mtp.layers.router = _Router()
+
+        tree = _Tree()
+        _freeze_base_for_mtp(tree)
+
+        for name, module in tree.named_modules():
+            if hasattr(module, 'expert_bias'):
+                if 'mtp.layers.' in name:
+                    assert not getattr(module, 'frozen_expert_bias', False), (
+                        f"MTP router '{name}' expert_bias must stay updatable"
+                    )
+                else:
+                    assert getattr(module, 'frozen_expert_bias', False), (
+                        f"Base router '{name}' expert_bias must be frozen"
+                    )

@@ -171,7 +171,21 @@ def _freeze_base_for_mtp(model):
         else:
             param.requires_grad = False
             frozen += 1
-    print_rank_0(f"Freeze base for MTP: {frozen} frozen, {trainable} trainable")
+
+    # The MoE router's expert bias is updated from load-balancing token counts
+    # in finalize_model_grads._update_router_expert_bias, independently of
+    # requires_grad. Setting requires_grad=False above does NOT stop it, so the
+    # base would keep drifting during MTP training. Flag non-MTP routers so the
+    # update is skipped (the MTP block's own routers must keep updating).
+    frozen_bias = 0
+    for name, module in model.named_modules():
+        if hasattr(module, 'expert_bias') and 'mtp.layers.' not in name:
+            module.frozen_expert_bias = True
+            frozen_bias += 1
+    print_rank_0(
+        f"Freeze base for MTP: {frozen} frozen, {trainable} trainable, "
+        f"{frozen_bias} router expert_bias frozen"
+    )
 
 
 def modelopt_gpt_hybrid_builder(
