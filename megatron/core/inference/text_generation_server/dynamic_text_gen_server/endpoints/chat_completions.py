@@ -519,10 +519,6 @@ try:
                                 **chat_template_kwargs,
                             )
                         )
-                        if hasattr(retokenized_previous_turn_token_ids, 'input_ids'):
-                            retokenized_previous_turn_token_ids = list(
-                                retokenized_previous_turn_token_ids['input_ids']
-                            )
 
                         # Replace the prefix tokens with the tokens from the previous generation.
                         # If prior token IDs are unavailable, fall back to normal retokenized prompt
