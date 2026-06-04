@@ -684,6 +684,7 @@ class GPTModel(LanguageModule):
                     cp_group=self.pg_collection.cp,
                     packed_seq_params=packed_seq_params,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
+                    input_ids=input_ids,
                 )
         sequence_parallel_override = False
 
