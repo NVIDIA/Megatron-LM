@@ -2078,17 +2078,30 @@ class TextGenerationController:
         )
 
     def _try_prepare_async_decode_before_sampling(self) -> bool:
-        """Defer async preparation until current-step sampling has consumed logits."""
+        """Prepare steady-state next-step metadata before current-step sampling."""
+        context = self.inference_wrapped_model.inference_context
         self._async_disable_reason = self._async_scheduling_disabled_reason()
         self._record_async_eligibility_result(self._async_disable_reason)
         if self._async_disable_reason is not None:
             self._decide_ep_async_handoff(has_real_work=True, can_launch_async_handoff=False)
             return False
 
-        self._async_prepare_deferred_until_after_sampling = True
-        self._record_async_disable_reason(
-            "next-step metadata prepared after sampling to preserve current logits"
+        range_push("async_prepare_next_step")
+        async_next_prepared = context.prepare_async_decode_next_step(pre_sampling=True)
+        range_pop()
+        if not async_next_prepared:
+            self._async_prepare_deferred_until_after_sampling = True
+            return False
+
+        handoff_decision = self._decide_ep_async_handoff(
+            has_real_work=True, can_launch_async_handoff=True
         )
+        if handoff_decision.launch_async_forward:
+            return True
+
+        context.discard_async_prepared_decode_plan()
+        self._async_disable_reason = "ep async handoff skipped"
+        self._record_async_disable_reason(self._async_disable_reason)
         return False
 
     def _try_prepare_async_decode_after_sampling(self) -> bool:
@@ -3031,7 +3044,11 @@ class TextGenerationController:
                 )
                 range_pop()
 
-            if not pending_forward_row_mapped and self.num_speculative_tokens == 0:
+            if (
+                not pending_forward_reused
+                and not pending_forward_row_mapped
+                and self.num_speculative_tokens == 0
+            ):
                 async_next_prepared = self._try_prepare_async_decode_before_sampling()
 
         # This is the best place to yield control back to event loop.

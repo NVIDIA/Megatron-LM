@@ -467,6 +467,186 @@ async def test_reused_pending_forward_prepares_layout_before_copying_next_input_
 
 
 @pytest.mark.internal
+@pytest.mark.asyncio
+async def test_prepare_async_decode_before_sampling_steady_state_ordering(monkeypatch):
+    monkeypatch.setattr(tgc_module, "range_push", lambda _msg: None)
+    monkeypatch.setattr(tgc_module, "range_pop", lambda: None)
+    events = []
+    context = SimpleNamespace(
+        active_token_count=2,
+        total_request_count=2,
+        paused_request_count=0,
+        padded_active_request_count=2,
+        is_hybrid_model=False,
+        config=SimpleNamespace(materialize_only_last_token_logits=True),
+        kv_block_allocator=SimpleNamespace(
+            store_routing_per_block=lambda _routing: events.append("routing")
+        ),
+        transfer_bookkeeping_to_gpu=lambda **_kwargs: events.append("h2d") or None,
+        current_input_and_position_ids=lambda: (
+            torch.tensor([[1, 2]], dtype=torch.int64),
+            torch.tensor([[0, 1]], dtype=torch.int64),
+        ),
+        using_cuda_graph_this_step=lambda: True,
+        mark_async_forward_in_flight=lambda: events.append("mark_in_flight"),
+    )
+
+    def _prepare(**kwargs):
+        events.append("prepare" if kwargs.get("pre_sampling") else "prepare_after")
+        return True
+
+    context.prepare_async_decode_next_step = _prepare
+    controller = object.__new__(TextGenerationController)
+    controller.inference_wrapped_model = SimpleNamespace(
+        inference_context=context,
+        model=SimpleNamespace(config=SimpleNamespace(moe_enable_routing_replay=False)),
+    )
+    controller.num_speculative_tokens = 0
+    controller._async_pending_forward = False
+    controller._async_pending_cuda_graph_request_count = None
+    controller._async_prepare_deferred_until_after_sampling = False
+    controller._async_forward_launch_count = 0
+    controller._decide_ep_step_begin = lambda **_kwargs: EPStepBeginDecision(
+        step_id=0,
+        has_real_work=True,
+        reuse_pending_forward=False,
+        discard_pending_forward=False,
+        row_mapped_forward=False,
+    )
+    controller._dynamic_step_context_init = lambda: (
+        torch.tensor([[1, 2]], dtype=torch.int64),
+        torch.tensor([[0, 1]], dtype=torch.int64),
+    )
+    controller._dynamic_step_forward_logits = lambda *_args: events.append("forward")
+    controller._router_record_bookkeeping = lambda: None
+    controller._async_scheduling_disabled_reason = lambda **_kwargs: None
+    controller._record_async_eligibility_result = lambda _reason: None
+    controller._record_async_disable_reason = lambda reason: events.append(("disable", reason))
+    controller._decide_ep_async_handoff = (
+        lambda **_kwargs: events.append("handoff")
+        or EPAsyncHandoffDecision(
+            step_id=0,
+            has_real_work=True,
+            launch_async_forward=True,
+            skip_async_forward=False,
+            any_launch_request=True,
+            any_skip_request=False,
+        )
+    )
+    controller._should_collect_dynamic_sampling_bookkeeping = lambda **_kwargs: False
+    controller._dynamic_step_sample_logits_to_next_input_ids = (
+        lambda: events.extend(["sample", "copy"])
+    )
+    controller._async_transfer_samples_to_cpu = (
+        lambda count: events.append(("d2h", count))
+        or (torch.tensor([4, 5], dtype=torch.int64), None, SimpleNamespace(synchronize=lambda: None))
+    )
+    controller._confirm_prepared_ep_async_handoff = lambda: True
+    controller._record_async_pending_forward_requests = lambda _count: events.append("record")
+    controller._ensure_ep_async_handoff_decided = lambda **_kwargs: events.append("ep_done")
+
+    result = await controller.async_generate_output_tokens_dynamic_batch(skip_bookkeeping=True)
+
+    ordering = [event for event in events if event in ("prepare", "handoff", "sample", "copy")]
+    assert ordering == ["prepare", "handoff", "sample", "copy"]
+    assert result["sample"].tolist() == [4, 5]
+
+
+@pytest.mark.internal
+@pytest.mark.asyncio
+async def test_prepare_async_decode_before_sampling_unsafe_fallback_ordering(monkeypatch):
+    monkeypatch.setattr(tgc_module, "range_push", lambda _msg: None)
+    monkeypatch.setattr(tgc_module, "range_pop", lambda: None)
+    events = []
+    context = SimpleNamespace(
+        active_token_count=2,
+        total_request_count=2,
+        paused_request_count=0,
+        padded_active_request_count=2,
+        is_hybrid_model=False,
+        config=SimpleNamespace(materialize_only_last_token_logits=True),
+        kv_block_allocator=SimpleNamespace(
+            store_routing_per_block=lambda _routing: events.append("routing")
+        ),
+        transfer_bookkeeping_to_gpu=lambda **_kwargs: events.append("h2d") or None,
+        current_input_and_position_ids=lambda: (
+            torch.tensor([[1, 2]], dtype=torch.int64),
+            torch.tensor([[0, 1]], dtype=torch.int64),
+        ),
+        using_cuda_graph_this_step=lambda: True,
+        mark_async_forward_in_flight=lambda: events.append("mark_in_flight"),
+    )
+
+    def _prepare(**kwargs):
+        if kwargs.get("pre_sampling"):
+            events.append("prepare_pre")
+            return False
+        events.append("prepare_after")
+        return True
+
+    context.prepare_async_decode_next_step = _prepare
+    controller = object.__new__(TextGenerationController)
+    controller.inference_wrapped_model = SimpleNamespace(
+        inference_context=context,
+        model=SimpleNamespace(config=SimpleNamespace(moe_enable_routing_replay=False)),
+    )
+    controller.num_speculative_tokens = 0
+    controller._async_pending_forward = False
+    controller._async_pending_cuda_graph_request_count = None
+    controller._async_prepare_deferred_until_after_sampling = False
+    controller._async_forward_launch_count = 0
+    controller._decide_ep_step_begin = lambda **_kwargs: EPStepBeginDecision(
+        step_id=0,
+        has_real_work=True,
+        reuse_pending_forward=False,
+        discard_pending_forward=False,
+        row_mapped_forward=False,
+    )
+    controller._dynamic_step_context_init = lambda: (
+        torch.tensor([[1, 2]], dtype=torch.int64),
+        torch.tensor([[0, 1]], dtype=torch.int64),
+    )
+    controller._dynamic_step_forward_logits = lambda *_args: events.append("forward")
+    controller._router_record_bookkeeping = lambda: None
+    controller._async_scheduling_disabled_reason = lambda **_kwargs: None
+    controller._record_async_eligibility_result = lambda _reason: None
+    controller._record_async_disable_reason = lambda reason: events.append(("disable", reason))
+    controller._decide_ep_async_handoff = (
+        lambda **_kwargs: EPAsyncHandoffDecision(
+            step_id=0,
+            has_real_work=True,
+            launch_async_forward=True,
+            skip_async_forward=False,
+            any_launch_request=True,
+            any_skip_request=False,
+        )
+    )
+    controller._should_collect_dynamic_sampling_bookkeeping = lambda **_kwargs: False
+    controller._dynamic_step_sample_logits = lambda **_kwargs: events.append("sample")
+    controller._copy_sampled_decode_tokens_to_next_input_ids = lambda count: events.append(
+        ("copy", count)
+    )
+    controller._async_transfer_samples_to_cpu = (
+        lambda count: events.append(("d2h", count))
+        or (torch.tensor([4, 5], dtype=torch.int64), None, SimpleNamespace(synchronize=lambda: None))
+    )
+    controller._confirm_prepared_ep_async_handoff = lambda: True
+    controller._record_async_pending_forward_requests = lambda _count: events.append("record")
+    controller._ensure_ep_async_handoff_decided = lambda **_kwargs: events.append("ep_done")
+
+    result = await controller.async_generate_output_tokens_dynamic_batch(skip_bookkeeping=True)
+
+    ordering = [
+        event
+        for event in events
+        if event in ("sample", "prepare_after") or event == ("copy", 2)
+    ]
+    assert ordering == ["sample", "prepare_after", ("copy", 2)]
+    assert not any(event[0] == "disable" for event in events if isinstance(event, tuple))
+    assert result["sample"].tolist() == [4, 5]
+
+
+@pytest.mark.internal
 def test_controller_handoff_decision_is_cached_and_skip_can_be_forced():
     class _Protocol:
         enabled = True
@@ -735,14 +915,16 @@ def _install_async_prepare_stubs(
 
 @pytest.mark.internal
 @pytest.mark.parametrize(
-    ("case", "expected_disable_reason"),
+    ("case", "expected_ok", "expected_deferred", "expected_disable_reason"),
     [
-        ("disabled", None),
-        ("eligible", "next-step metadata prepared after sampling to preserve current logits"),
+        ("disabled", False, False, None),
+        ("prepare_deferred", False, True, None),
+        ("handoff_skipped", False, False, "ep async handoff skipped"),
+        ("success", True, False, None),
     ],
 )
 def test_prepare_async_decode_before_sampling_handoff_paths(
-    monkeypatch, case, expected_disable_reason
+    monkeypatch, case, expected_ok, expected_deferred, expected_disable_reason
 ):
     monkeypatch.setattr(tgc_module, "range_push", lambda _msg: None)
     monkeypatch.setattr(tgc_module, "range_pop", lambda: None)
@@ -750,38 +932,54 @@ def test_prepare_async_decode_before_sampling_handoff_paths(
     events = _install_async_prepare_stubs(
         controller,
         disabled_reason="blocked" if case == "disabled" else None,
+        prepare_result=case != "prepare_deferred",
+        launch_decision=case != "handoff_skipped",
     )
 
     ok = controller._try_prepare_async_decode_before_sampling()
 
-    assert not ok
+    assert ok is expected_ok
+    assert controller._async_prepare_deferred_until_after_sampling is expected_deferred
     if case == "disabled":
         assert ("handoff", True, False) in events
-        assert not controller._async_prepare_deferred_until_after_sampling
-    else:
-        assert controller._async_prepare_deferred_until_after_sampling
+        assert not any(event[0] == "prepare" for event in events if isinstance(event, tuple))
+    elif case == "prepare_deferred":
+        assert ("prepare", {"pre_sampling": True}) in events
         assert not any(event[0] == "handoff" for event in events if isinstance(event, tuple))
-    assert not any(event[0] == "prepare" for event in events if isinstance(event, tuple))
+    else:
+        assert ("prepare", {"pre_sampling": True}) in events
+        assert ("handoff", True, True) in events
     if expected_disable_reason is not None:
         assert ("disable", expected_disable_reason) in events
+    if case == "prepare_deferred":
+        assert not any(event[0] == "disable" for event in events if isinstance(event, tuple))
 
 
 @pytest.mark.internal
-def test_prepare_async_decode_before_sampling_defers_until_after_sampling(monkeypatch):
+def test_prepare_async_decode_before_sampling_deferral_is_not_disable_reason(monkeypatch):
     monkeypatch.setattr(tgc_module, "range_push", lambda _msg: None)
     monkeypatch.setattr(tgc_module, "range_pop", lambda: None)
-    controller, _context = _make_async_gate_controller()
-    events = _install_async_prepare_stubs(controller, prepare_result=True)
+    controller, context = _make_async_gate_controller()
+    controller._async_disable_reason = None
+    controller._async_disable_reason_counts = {}
+    controller._async_eligibility_check_count = 0
+    controller._async_eligibility_pass_count = 0
+    events = []
+    controller._async_scheduling_disabled_reason = lambda **_kwargs: None
+    controller._decide_ep_async_handoff = lambda **kwargs: events.append(
+        ("handoff", kwargs)
+    )
+    context.prepare_async_decode_next_step = (
+        lambda **kwargs: events.append(("prepare", kwargs)) or False
+    )
 
     assert not controller._try_prepare_async_decode_before_sampling()
 
     assert controller._async_prepare_deferred_until_after_sampling
-    assert (
-        "disable",
-        "next-step metadata prepared after sampling to preserve current logits",
-    ) in events
-    assert not any(event[0] == "prepare" for event in events if isinstance(event, tuple))
-    assert not any(event[0] == "handoff" for event in events if isinstance(event, tuple))
+    assert controller._async_disable_reason_counts == {}
+    assert controller._async_eligibility_check_count == 1
+    assert controller._async_eligibility_pass_count == 1
+    assert events == [("prepare", {"pre_sampling": True})]
 
 
 @pytest.mark.internal

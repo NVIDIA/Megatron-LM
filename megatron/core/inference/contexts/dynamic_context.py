@@ -3037,7 +3037,29 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_ssm_states[:, indices] = 0.0
             self._pending_mamba_zeros.clear()
 
-    def prepare_async_decode_next_step(self) -> bool:
+    def _async_decode_plan_preserves_sampling_layout(
+        self, plan: AsyncDecodeLifecyclePlan
+    ) -> bool:
+        """Return whether a dry next-step plan is safe before sampling mutates CPU state."""
+        current_active_request_count = self.total_request_count - self.paused_request_count
+        if plan.active_request_count != current_active_request_count:
+            return False
+        if plan.finished_request_ids.numel() != 0:
+            return False
+
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+        if not torch.equal(plan.request_ids, self.request_ids[active_slice]):
+            return False
+
+        active_source_idxs = torch.arange(
+            self.paused_request_count,
+            self.total_request_count,
+            dtype=plan.source_request_idxs.dtype,
+            device=plan.source_request_idxs.device,
+        )
+        return torch.equal(plan.source_request_idxs, active_source_idxs)
+
+    def prepare_async_decode_next_step(self, *, pre_sampling: bool = False) -> bool:
         """Prepare a decode-only GPU bookkeeping snapshot for a speculative next step.
 
         Persistent CPU request tensors are not updated here. Instead, this
@@ -3052,6 +3074,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         dry_plan = self._build_async_decode_lifecycle_plan(reserve_blocks=False)
         if dry_plan is None:
             return False
+        if pre_sampling and not self._async_decode_plan_preserves_sampling_layout(dry_plan):
+            return False
+
         tokens_per_request = self.num_speculative_tokens + 1
         batch_dimensions = InferenceBatchDimensions(
             token_count=dry_plan.active_token_count,

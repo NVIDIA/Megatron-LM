@@ -818,6 +818,140 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
+    def test_prepare_async_decode_next_step_pre_sampling_allows_steady_state(self):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=128,
+            buffer_size_gb=0.02,
+            block_size_tokens=16,
+            max_tokens=1_000_000,
+            num_cuda_graphs=1,
+            enable_async_scheduling=True,
+        )
+        requests = [
+            DynamicInferenceRequest(
+                request_id=request_id,
+                prompt_tokens=torch.arange(0, 1, device='cpu'),
+                sampling_params=SamplingParams(top_k=top_k, num_tokens_to_generate=31),
+            )
+            for request_id, top_k in [(10, 1), (11, 2), (12, 3)]
+        ]
+        dynamic_context.add_dummy_requests_parallel(requests, count_as_prefill=False)
+        dynamic_context.active_token_count = 3
+        dynamic_context.num_prefill_requests = 0
+        dynamic_context.request_query_lengths[:3] = 1
+        dynamic_context.request_kv_length_offsets[:3] = torch.tensor([4, 4, 4], dtype=torch.int32)
+        dynamic_context.request_output_lengths[:3] = torch.tensor([32, 32, 32], dtype=torch.int32)
+        dynamic_context.request_last_kv_block_offset[:3] = torch.tensor(
+            [1, 2, 3], dtype=torch.int32
+        )
+
+        assert dynamic_context.prepare_async_decode_next_step(pre_sampling=True)
+
+        assert dynamic_context.async_prepared_request_ids_cpu().tolist() == [10, 11, 12]
+        assert dynamic_context.active_request_metadata["top_k"][:3].tolist() == [1, 2, 3]
+        assert dynamic_context.token_to_request_idx[:3].tolist() == [0, 1, 2]
+        assert dynamic_context.token_to_pos_ids[:3].tolist() == [5, 5, 5]
+        assert dynamic_context._staging_request_query_lengths[:3].tolist() == [1, 1, 1]
+        assert dynamic_context._staging_request_kv_length_offsets[:3].tolist() == [5, 5, 5]
+        assert dynamic_context._async_reserved_kv_block_count == 0
+
+        sampled_tokens = torch.tensor([100, 101, 102], dtype=torch.int64, device='cuda')
+        assert dynamic_context.copy_async_prepared_decode_input_ids_from_samples(
+            sampled_tokens, None, num_speculative_tokens=0
+        )
+        assert dynamic_context.gpu_view.token_to_input_ids[:3].cpu().tolist() == [
+            100,
+            101,
+            102,
+        ]
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_prepare_async_decode_next_step_pre_sampling_declines_known_finish(self):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=128,
+            buffer_size_gb=0.02,
+            block_size_tokens=16,
+            max_tokens=1_000_000,
+            num_cuda_graphs=1,
+            enable_async_scheduling=True,
+        )
+        requests = [
+            DynamicInferenceRequest(
+                request_id=request_id,
+                prompt_tokens=torch.arange(0, 1, device='cpu'),
+                sampling_params=SamplingParams(num_tokens_to_generate=31),
+            )
+            for request_id in [10, 11, 12]
+        ]
+        dynamic_context.add_dummy_requests_parallel(requests, count_as_prefill=False)
+        dynamic_context.active_token_count = 3
+        dynamic_context.num_prefill_requests = 0
+        dynamic_context.request_query_lengths[:3] = 1
+        dynamic_context.request_kv_length_offsets[:3] = torch.tensor([4, 4, 4], dtype=torch.int32)
+        dynamic_context.request_output_lengths[:3] = torch.tensor([32, 5, 32], dtype=torch.int32)
+        dynamic_context.request_last_kv_block_offset[:3] = torch.tensor(
+            [1, 2, 3], dtype=torch.int32
+        )
+
+        assert not dynamic_context.prepare_async_decode_next_step(pre_sampling=True)
+
+        assert dynamic_context.async_prepared_request_ids_cpu() is None
+        assert dynamic_context._async_reserved_kv_block_count == 0
+        assert dynamic_context.active_token_count == 3
+        assert dynamic_context.request_ids[:3].tolist() == [10, 11, 12]
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_prepare_async_decode_next_step_pre_sampling_declines_remap_boundary(self):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=128,
+            buffer_size_gb=0.02,
+            block_size_tokens=16,
+            max_tokens=1_000_000,
+            num_cuda_graphs=1,
+            enable_async_scheduling=True,
+        )
+        requests = [
+            DynamicInferenceRequest(
+                request_id=request_id,
+                prompt_tokens=torch.arange(0, 1, device='cpu'),
+                sampling_params=SamplingParams(top_k=top_k, num_tokens_to_generate=31),
+            )
+            for request_id, top_k in [(10, 1), (11, 2), (12, 3)]
+        ]
+        dynamic_context.add_dummy_requests_parallel(requests, count_as_prefill=False)
+        dynamic_context.active_token_count = 3
+        dynamic_context.num_prefill_requests = 0
+        dynamic_context.request_query_lengths[:3] = 1
+        dynamic_context.request_kv_length_offsets[:3] = torch.tensor([4, 4, 4], dtype=torch.int32)
+        dynamic_context.request_output_lengths[:3] = torch.tensor([32, 32, 32], dtype=torch.int32)
+        dynamic_context.request_last_kv_block_offset[:3] = torch.tensor(
+            [15, 0, 15], dtype=torch.int32
+        )
+
+        assert not dynamic_context.prepare_async_decode_next_step(pre_sampling=True)
+
+        assert dynamic_context.async_prepared_request_ids_cpu() is None
+        assert dynamic_context._async_reserved_kv_block_count == 0
+        assert dynamic_context.active_token_count == 3
+        assert dynamic_context.request_ids[:3].tolist() == [10, 11, 12]
+        assert dynamic_context.request_last_kv_block_offset[:3].tolist() == [15, 0, 15]
+
+    @pytest.mark.internal
+    @rounder_override(64)
     def test_prepare_async_decode_matches_graph_shape_from_planned_layout(self, monkeypatch):
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
