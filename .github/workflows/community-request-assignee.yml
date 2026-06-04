@@ -108,6 +108,10 @@ jobs:
                - Do not return service accounts, including svcnvidia-nemo-ci.
                - If you cannot identify an eligible mcore-engineer with confidence >= 0.75,
                  set assignee to null and fallback_to_oncall to true.
+               - When assignee is null but there is a plausible best candidate, set
+                 potential_assignee to that GitHub login and explain why they were considered
+                 in potential_assignee_reason. Leave potential_assignee null only when there
+                 is no plausible individual candidate.
             8. Write slack_context as 2-4 concise sentences explaining the issue and assignment.
                For a bug with a likely root-cause PR, include what the bug appears to be, the PR,
                and why that PR is potentially related. If fallback_to_oncall is true, explain that
@@ -118,7 +122,7 @@ jobs:
           claude_args: |
             --model "claude-opus-4-6"
             --allowedTools "Read,Bash(rg:*),Bash(git ls-files:*),Bash(git log:*),Bash(git blame:*),Bash(git show:*),Bash(gh api:*),Bash(gh issue view:*),Bash(gh pr view:*),Bash(gh pr list:*)"
-            --json-schema '{"type":"object","properties":{"assignee":{"type":["string","null"]},"confidence":{"type":"number","minimum":0,"maximum":1},"fallback_to_oncall":{"type":"boolean"},"issue_type":{"type":"string","enum":["bug","feature_request","other"]},"feature_topic":{"type":["string","null"]},"root_cause_pr":{"anyOf":[{"type":"object","properties":{"number":{"type":"integer"},"title":{"type":"string"},"url":{"type":"string"},"author":{"type":"string"},"reason":{"type":"string"}},"required":["number","title","url","author","reason"],"additionalProperties":false},{"type":"null"}]},"relevant_paths":{"type":"array","items":{"type":"string"}},"evidence":{"type":"array","items":{"type":"string"}},"rationale":{"type":"string"},"slack_context":{"type":"string"}},"required":["assignee","confidence","fallback_to_oncall","issue_type","feature_topic","root_cause_pr","relevant_paths","evidence","rationale","slack_context"],"additionalProperties":false}'
+            --json-schema '{"type":"object","properties":{"assignee":{"type":["string","null"]},"potential_assignee":{"type":["string","null"]},"potential_assignee_reason":{"type":["string","null"]},"confidence":{"type":"number","minimum":0,"maximum":1},"fallback_to_oncall":{"type":"boolean"},"issue_type":{"type":"string","enum":["bug","feature_request","other"]},"feature_topic":{"type":["string","null"]},"root_cause_pr":{"anyOf":[{"type":"object","properties":{"number":{"type":"integer"},"title":{"type":"string"},"url":{"type":"string"},"author":{"type":"string"},"reason":{"type":"string"}},"required":["number","title","url","author","reason"],"additionalProperties":false},{"type":"null"}]},"relevant_paths":{"type":"array","items":{"type":"string"}},"evidence":{"type":"array","items":{"type":"string"}},"rationale":{"type":"string"},"slack_context":{"type":"string"}},"required":["assignee","potential_assignee","potential_assignee_reason","confidence","fallback_to_oncall","issue_type","feature_topic","root_cause_pr","relevant_paths","evidence","rationale","slack_context"],"additionalProperties":false}'
 
   assign_community_request:
     name: Assign community request

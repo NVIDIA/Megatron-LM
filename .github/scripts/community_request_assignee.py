@@ -70,6 +70,18 @@ class AssignmentPlan:
     relevant_paths: list[str]
     issue_type: str = "unknown"
     context: str = ""
+    rejected_candidate: str | None = None
+    rejected_candidate_confidence: float | None = None
+    rejected_candidate_reason: str = ""
+
+
+@dataclass(frozen=True)
+class CandidateDecision:
+    """Candidate selected for assignment, or the candidate rejected before fallback."""
+
+    assignee: str | None
+    rejected_candidate: str | None = None
+    rejected_reason: str = ""
 
 
 def get_required_env(name: str) -> str:
@@ -206,6 +218,17 @@ def analysis_slack_context(analysis: dict) -> str:
     return context[:MAX_SLACK_CONTEXT_CHARS].rstrip() + "..."
 
 
+def analysis_potential_assignee(analysis: dict) -> str | None:
+    return normalize_login(analysis.get("potential_assignee")) or normalize_login(analysis.get("assignee"))
+
+
+def analysis_potential_assignee_reason(analysis: dict) -> str:
+    reason = analysis.get("potential_assignee_reason", "")
+    if not isinstance(reason, str):
+        return ""
+    return reason.strip()
+
+
 def check_assignable(issue: IssueContext, login: str) -> bool:
     url = f"{GITHUB_API_URL}/repos/{issue.owner}/{issue.repo}/assignees/{login}"
     if requests is None:
@@ -244,30 +267,76 @@ def get_allowed_assignees(org: str) -> set[str]:
     return set(human_members(get_team_members(org, ASSIGNEE_ALLOWED_TEAM_SLUG)))
 
 
-def select_candidate_assignee(analysis: dict, issue: IssueContext, allowed_assignees: set[str]) -> str | None:
+def candidate_rejection_reason(analysis: dict, candidate: str, allowed_assignees: set[str]) -> str:
+    if is_service_account(candidate):
+        return "service accounts cannot be assigned"
+
+    confidence = analysis_confidence(analysis)
+    if confidence < CONFIDENCE_THRESHOLD:
+        return f"confidence {confidence:.2f} is below the {CONFIDENCE_THRESHOLD:.2f} threshold"
+
+    if candidate not in allowed_assignees:
+        return f"they are not in {ASSIGNEE_ALLOWED_TEAM_SLUG}"
+
     if bool(analysis.get("fallback_to_oncall", False)):
-        return None
+        return "the analysis requested on-call fallback"
+
+    return analysis_potential_assignee_reason(analysis) or "the analysis did not select them for assignment"
+
+
+def select_candidate_assignee(analysis: dict, issue: IssueContext, allowed_assignees: set[str]) -> CandidateDecision:
+    potential_candidate = analysis_potential_assignee(analysis)
+    if bool(analysis.get("fallback_to_oncall", False)):
+        if potential_candidate:
+            return CandidateDecision(
+                assignee=None,
+                rejected_candidate=potential_candidate,
+                rejected_reason=candidate_rejection_reason(analysis, potential_candidate, allowed_assignees),
+            )
+        return CandidateDecision(assignee=None)
 
     candidate = normalize_login(analysis.get("assignee"))
     if not candidate:
-        return None
+        if potential_candidate:
+            return CandidateDecision(
+                assignee=None,
+                rejected_candidate=potential_candidate,
+                rejected_reason=candidate_rejection_reason(analysis, potential_candidate, allowed_assignees),
+            )
+        return CandidateDecision(assignee=None)
 
     if is_service_account(candidate):
         print(f"Rejecting {candidate}; service accounts cannot be assigned")
-        return None
+        return CandidateDecision(
+            assignee=None,
+            rejected_candidate=candidate,
+            rejected_reason="service accounts cannot be assigned",
+        )
 
     if analysis_confidence(analysis) < CONFIDENCE_THRESHOLD:
-        return None
+        return CandidateDecision(
+            assignee=None,
+            rejected_candidate=candidate,
+            rejected_reason=candidate_rejection_reason(analysis, candidate, allowed_assignees),
+        )
 
     if candidate not in allowed_assignees:
         print(f"Rejecting {candidate}; they are not in {ASSIGNEE_ALLOWED_TEAM_SLUG}")
-        return None
+        return CandidateDecision(
+            assignee=None,
+            rejected_candidate=candidate,
+            rejected_reason=candidate_rejection_reason(analysis, candidate, allowed_assignees),
+        )
 
     if not check_assignable(issue, candidate):
         print(f"Rejecting {candidate}; they are not assignable to {issue.owner}/{issue.repo}")
-        return None
+        return CandidateDecision(
+            assignee=None,
+            rejected_candidate=candidate,
+            rejected_reason=f"they are not assignable to {issue.owner}/{issue.repo}",
+        )
 
-    return candidate
+    return CandidateDecision(assignee=candidate)
 
 
 def assign_issue(issue: IssueContext, assignees: list[str], dry_run: bool = False) -> None:
@@ -290,13 +359,13 @@ def create_assignment_plan(analysis: dict, issue: IssueContext) -> AssignmentPla
     issue_type = analysis_issue_type(analysis)
     context = analysis_slack_context(analysis)
     allowed_assignees = get_allowed_assignees(issue.owner)
-    candidate = select_candidate_assignee(analysis, issue, allowed_assignees)
+    candidate_decision = select_candidate_assignee(analysis, issue, allowed_assignees)
 
-    if candidate:
+    if candidate_decision.assignee:
         return AssignmentPlan(
             mode="candidate",
-            assignees=[candidate],
-            notify_users=[candidate],
+            assignees=[candidate_decision.assignee],
+            notify_users=[candidate_decision.assignee],
             confidence=confidence,
             rationale=rationale,
             relevant_paths=relevant_paths,
@@ -304,7 +373,7 @@ def create_assignment_plan(analysis: dict, issue: IssueContext) -> AssignmentPla
             context=context,
         )
 
-    candidate_login = normalize_login(analysis.get("assignee"))
+    candidate_login = normalize_login(analysis.get("assignee")) or analysis_potential_assignee(analysis)
     if candidate_login:
         print(
             f"Falling back to {ACTIVE_ONCALL_TEAM_SLUG}; candidate was "
@@ -328,6 +397,9 @@ def create_assignment_plan(analysis: dict, issue: IssueContext) -> AssignmentPla
         relevant_paths=relevant_paths,
         issue_type=issue_type,
         context=context,
+        rejected_candidate=candidate_decision.rejected_candidate,
+        rejected_candidate_confidence=confidence if candidate_decision.rejected_candidate else None,
+        rejected_candidate_reason=candidate_decision.rejected_reason,
     )
 
 
@@ -417,6 +489,15 @@ def get_slack_user_id(slack_client, email: str) -> str | None:
 def build_slack_message(issue: IssueContext, plan: AssignmentPlan) -> str:
     paths = ", ".join(plan.relevant_paths) if plan.relevant_paths else "none identified"
     context = plan.context or plan.rationale
+    rejected_candidate_context = ""
+    if plan.rejected_candidate:
+        rejected_candidate_context = f"Potential assignee considered: {plan.rejected_candidate}"
+        if plan.rejected_candidate_confidence is not None:
+            rejected_candidate_context += f" (confidence: {plan.rejected_candidate_confidence:.2f})"
+        if plan.rejected_candidate_reason:
+            rejected_candidate_context += f". Not assigned because {plan.rejected_candidate_reason}."
+        rejected_candidate_context += "\n"
+
     oncall_mention = f"<!subteam^{MCORE_ONCALL_SLACK_USERGROUP_ID}|mcore-oncall>"
     if plan.mode == "candidate":
         return (
@@ -433,6 +514,7 @@ def build_slack_message(issue: IssueContext, plan: AssignmentPlan) -> str:
         "I found a new community issue, but I am not confident who should own it. "
         "Please triage it and assign an appropriate mcore engineer.\n"
         f"Context from my analysis:\n{context}\n"
+        f"{rejected_candidate_context}"
         f"Confidence: {plan.confidence:.2f}\n"
         f"Issue type: {plan.issue_type}\n"
         f"Relevant paths: {paths}\n"

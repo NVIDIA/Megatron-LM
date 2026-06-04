@@ -26,6 +26,8 @@ def make_issue(module, number=123, title="Community issue"):
 def make_analysis(**overrides):
     analysis = {
         "assignee": "alice",
+        "potential_assignee": None,
+        "potential_assignee_reason": None,
         "confidence": 0.91,
         "fallback_to_oncall": False,
         "issue_type": "bug",
@@ -88,6 +90,9 @@ def test_create_assignment_plan_rejects_non_engineer_candidate(monkeypatch):
     assert plan.mode == "oncall"
     assert plan.assignees == ["bob"]
     assert plan.notify_users == ["bob"]
+    assert plan.rejected_candidate == "alice"
+    assert plan.rejected_candidate_confidence == 0.91
+    assert plan.rejected_candidate_reason == "they are not in mcore-engineers"
 
 
 def test_create_assignment_plan_falls_back_to_engineer_oncall_when_uncertain(monkeypatch):
@@ -122,6 +127,41 @@ def test_create_assignment_plan_falls_back_to_engineer_oncall_when_uncertain(mon
     assert plan.assignees == ["bob"]
     assert plan.notify_users == ["alice", "bob"]
     assert plan.confidence == 0.40
+
+
+def test_create_assignment_plan_records_low_confidence_potential_candidate(monkeypatch):
+    module = load_assignee_module()
+    issue = make_issue(module, number=128, title="Pipeline P2P bug")
+
+    def fake_team_members(org, team_slug):
+        if team_slug == module.ASSIGNEE_ALLOWED_TEAM_SLUG:
+            return {"bob", "yashaswikarnati"}
+        if team_slug == module.ACTIVE_ONCALL_TEAM_SLUG:
+            return {"bob", "yashaswikarnati"}
+        return set()
+
+    monkeypatch.setattr(module, "get_team_members", fake_team_members)
+    monkeypatch.setattr(module, "check_assignable", lambda issue, login: login == "bob")
+
+    plan = module.create_assignment_plan(
+        make_analysis(
+            assignee=None,
+            potential_assignee="yashaswikarnati",
+            potential_assignee_reason="They recently updated the affected pipeline-parallel area.",
+            confidence=0.62,
+            fallback_to_oncall=True,
+            rationale="No recent merged root-cause PR was identified.",
+            slack_context="The issue appears to be an older unresolved pipeline P2P ordering bug.",
+            relevant_paths=["megatron/core/pipeline_parallel/p2p_communication.py"],
+        ),
+        issue,
+    )
+
+    assert plan.mode == "oncall"
+    assert plan.assignees == ["bob"]
+    assert plan.rejected_candidate == "yashaswikarnati"
+    assert plan.rejected_candidate_confidence == 0.62
+    assert plan.rejected_candidate_reason == "confidence 0.62 is below the 0.75 threshold"
 
 
 def test_build_slack_message_includes_candidate_context():
@@ -159,6 +199,9 @@ def test_build_slack_message_includes_oncall_uncertainty_context():
         relevant_paths=[],
         issue_type="feature_request",
         context="This is a new community issue, but I am not sure who should own it.",
+        rejected_candidate="yashaswikarnati",
+        rejected_candidate_confidence=0.62,
+        rejected_candidate_reason="confidence 0.62 is below the 0.75 threshold",
     )
 
     message = module.build_slack_message(issue, plan)
@@ -166,4 +209,6 @@ def test_build_slack_message_includes_oncall_uncertainty_context():
     assert "needs on-call triage" in message
     assert "I found a new community issue, but I am not confident who should own it." in message
     assert "This is a new community issue, but I am not sure who should own it." in message
+    assert "Potential assignee considered: yashaswikarnati (confidence: 0.62)." in message
+    assert "Not assigned because confidence 0.62 is below the 0.75 threshold." in message
     assert "Issue type: feature_request" in message
