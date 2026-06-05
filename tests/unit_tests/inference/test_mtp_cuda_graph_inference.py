@@ -424,7 +424,7 @@ class TestMTPCudaGraphInference:
             )
             dist.broadcast(full_hidden, src=0)
             local_hidden = full_hidden.chunk(tp_size)[tp_rank].contiguous()
-            unwrapped._decoder_hidden_states_cache = local_hidden
+            context.mtp_decoder_hidden_states = local_hidden
 
             ctrl._last_accepted_seq_indices = torch.arange(active_request_count, device='cuda')
             ctrl._mtp_resolved_padded_count = padded_count
@@ -445,7 +445,7 @@ class TestMTPCudaGraphInference:
                 assert sampled.dtype == torch.int64
                 assert torch.all(sampled >= 0) and torch.all(sampled < self.VOCAB_SIZE)
 
-            assert not hasattr(unwrapped, '_decoder_hidden_states_cache')
+            assert context.mtp_decoder_hidden_states is None
 
         self._assert_mtp_cuda_graphs_were_replayed(model, True)
 
@@ -527,7 +527,7 @@ class TestMTPCudaGraphInference:
                 )
                 dist.broadcast(full_hidden, src=0)
                 local_hidden = full_hidden.chunk(tp_size)[tp_rank].contiguous()
-                unwrapped._decoder_hidden_states_cache = local_hidden
+                context.mtp_decoder_hidden_states = local_hidden
 
                 ctrl._last_accepted_seq_indices = torch.arange(active_request_count, device='cuda')
                 # Greedy sampling for all active requests.
@@ -1139,8 +1139,7 @@ def _build_hybrid_stack_spec():
     return ModuleSpec(
         module=HybridStack,
         submodules=HybridStackSubmodules(
-            attention_layer=attention_layer_spec,
-            mtp_block_spec=mtp_block_spec,
+            attention_layer=attention_layer_spec, mtp_block_spec=mtp_block_spec
         ),
     )
 
@@ -1150,9 +1149,9 @@ class TestMTPBlockScopeCudaGraph:
     states for MTP inference.
 
     When ``inference_cuda_graph_scope='block'``, the entire model forward is
-    captured as a single CUDA graph.  The ``_decoder_hidden_states_cache``
-    attribute must be set *outside* the graphed forward so that it is available
-    on every replay, not just during capture.
+    captured as a single CUDA graph. ``context.mtp_decoder_hidden_states``
+    holds a pre-allocated buffer that is written via ``copy_()`` during every
+    graph replay so that it is available on every replay, not just during capture.
     """
 
     HIDDEN_SIZE = 32
@@ -1234,16 +1233,20 @@ class TestMTPBlockScopeCudaGraph:
         engine = DynamicInferenceEngine(ctrl, context)
         return engine
 
-    @pytest.mark.parametrize("inference_cuda_graph_scope", ['block', 'none'])
+    @pytest.mark.parametrize("inference_cuda_graph_scope", ['block', 'layer'])
     @torch.inference_mode()
-    def test_decoder_hidden_states_cache_set_after_forward(self, inference_cuda_graph_scope):
-        """_decoder_hidden_states_cache is set after model forward in both
-        graph-capture and graph-replay steps, for both block-scope and eager."""
+    def test_decoder_hidden_states_set_after_forward(self, inference_cuda_graph_scope):
+        """Decoder hidden states are accessible via the context after each forward pass.
+
+        Block-scope CUDA graphs: forward() writes via copy_() into the pre-allocated
+        context buffer, captured once and replayed to the same GPU address each step.
+        Layer-scope (non-block) CUDA graphs: forward() assigns the tensor directly to
+        the context attribute; the controller sets it back to None after reading to allow GC.
+        Both scopes are valid with cuda_graph_impl='local'.
+        """
         engine = self._build_engine(inference_cuda_graph_scope=inference_cuda_graph_scope)
         ctrl = engine.controller
         context = engine.context
-        model = ctrl.inference_wrapped_model.model
-        unwrapped = unwrap_model(model)
 
         prompt_length = 10
         req = DynamicInferenceRequest(
@@ -1258,23 +1261,20 @@ class TestMTPBlockScopeCudaGraph:
         new_tokens = torch.zeros(1, device='cuda', dtype=torch.int64)
         new_spec = torch.zeros(1, 1, device='cuda', dtype=torch.int64)
         context.update_requests(
-            active_requests_mask=active_mask,
-            new_tokens=new_tokens,
-            new_speculative_tokens=new_spec,
+            active_requests_mask=active_mask, new_tokens=new_tokens, new_speculative_tokens=new_spec
         )
         context.initialize_attention_state()
 
         for step in range(3):
-            if hasattr(unwrapped, '_decoder_hidden_states_cache'):
-                del unwrapped._decoder_hidden_states_cache
+            # Simulate the controller consuming hidden states from the previous step.
+            if inference_cuda_graph_scope != 'block':
+                context.mtp_decoder_hidden_states = None
 
-            inference_input = ctrl.inference_wrapped_model.get_batch_for_context_window()
-            ctrl.inference_wrapped_model._forward(inference_input)
+            input_ids, position_ids = ctrl._dynamic_step_context_init()
+            ctrl._dynamic_step_forward_logits(input_ids, position_ids)
 
-            assert hasattr(unwrapped, '_decoder_hidden_states_cache'), (
-                f"Step {step}: _decoder_hidden_states_cache not set after "
-                f"forward (scope={inference_cuda_graph_scope})"
+            assert context.mtp_decoder_hidden_states is not None, (
+                f"Step {step}: context.mtp_decoder_hidden_states is None "
+                f"(scope={inference_cuda_graph_scope})"
             )
-            cache = unwrapped._decoder_hidden_states_cache
-            assert cache is not None
-            assert cache.shape[-1] == self.HIDDEN_SIZE
+            assert context.mtp_decoder_hidden_states.shape[-1] == self.HIDDEN_SIZE

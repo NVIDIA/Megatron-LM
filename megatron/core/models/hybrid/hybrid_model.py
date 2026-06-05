@@ -397,18 +397,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
     def __call__(self, *args, **kwargs):
         if self._should_call_local_cudagraph(*args, **kwargs):
-            result = super().__call__(*args, **kwargs)
-            if isinstance(result, tuple) and len(result) == 2:
-                logits, decoder_hidden_states = result
-                self._decoder_hidden_states_cache = decoder_hidden_states
-                return logits
-            return result[0]
-        result = super().__call__(*args, **kwargs)
-        if isinstance(result, tuple) and len(result) == 2:
-            logits, decoder_hidden_states = result
-            self._decoder_hidden_states_cache = decoder_hidden_states
-            return logits
-        return result
+            return super().__call__(*args, **kwargs)[0]
+        return super().__call__(*args, **kwargs)
 
     def create_mcore_cudagraph_manager(self, config):
         """
@@ -551,11 +541,22 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         if not self.post_process:
             return hidden_states
 
-        decoder_hidden_states_for_mtp = None
         if self.config.mtp_num_layers is not None and self.mtp_process:
             assert self.config.mtp_num_layers > 0
             if in_inference_mode or is_spec_decode:
-                decoder_hidden_states_for_mtp = hidden_states
+                if inference_context is not None:
+                    if self.config.inference_cuda_graph_scope == InferenceCudaGraphScope.block:
+                        # Block-scope CUDA graph mode: copy_() into the
+                        # pre-allocated buffer so every graph replay writes to
+                        # the same fixed GPU address regardless of batch size.
+                        assert inference_context.mtp_decoder_hidden_states is not None
+                        inference_context.mtp_decoder_hidden_states[: hidden_states.shape[0]].copy_(
+                            hidden_states
+                        )
+                    else:
+                        # Non-block scope: direct assignment; the controller will set
+                        # this back to None after reading to allow GC.
+                        inference_context.mtp_decoder_hidden_states = hidden_states
             else:
                 # For RL (labels is None), process_mtp_loss derives labels from
                 # input_ids to match the SFT label format.
@@ -615,10 +616,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         if labels is None:
             # [s b h] => [b s h]
-            logits_out = logits.transpose(0, 1).contiguous()
-            if decoder_hidden_states_for_mtp is not None:
-                return logits_out, decoder_hidden_states_for_mtp
-            return logits_out
+            return logits.transpose(0, 1).contiguous()
 
         loss = self.compute_language_model_loss(labels, logits)
 
