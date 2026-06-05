@@ -4580,6 +4580,10 @@ def _add_mla_args(parser):
 
 def _add_experimental_attention_variant_args(parser):
     group = parser.add_argument_group(title="experimental_attention_variant")
+    # NOTE: --pre-gated-delta-rule-impl is auto-generated from the
+    # TransformerConfig.pre_gated_delta_rule_impl field by ArgumentGroupFactory
+    # (see _add_transformer_engine_args / build_group), so it must NOT be
+    # registered manually here — doing so raises an argparse conflict.
     # Linear attention
     group.add_argument(
         '--linear-attention-freq',
