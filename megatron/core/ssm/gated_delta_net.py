@@ -8,7 +8,7 @@
 import logging
 from dataclasses import dataclass, replace
 from functools import lru_cache
-from typing import List, Optional, Tuple, Union
+from typing import Optional, Union
 
 import torch
 import torch.nn as nn
@@ -85,7 +85,7 @@ class GatedDeltaNet(MegatronModule):
         conv_bias: bool = False,
         conv_init: Optional[float] = None,
         use_qk_l2norm: bool = True,
-        A_init_range: Tuple[float, float] = (1, 16),
+        A_init_range: tuple[float, float] = (1, 16),
         pg_collection: ProcessGroupCollection = None,
         name: str | None = None,
     ):
@@ -290,7 +290,7 @@ class GatedDeltaNet(MegatronModule):
                 inference CUDA graphs.
 
         Return:
-            (Tuple[Tensor, Tensor]) GDN output and bias.
+            (tuple[Tensor, Tensor]) GDN output and bias.
 
         """
         # TODO: Deal with attention_mask
@@ -717,7 +717,7 @@ class GatedDeltaNet(MegatronModule):
 
 def _build_thd_cp_a2a_perm(
     cu_seqlens: torch.Tensor, cp_size: int, t_global: int
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     cu = cu_seqlens.to(dtype=torch.long)
     t_local = t_global // cp_size
 
@@ -757,7 +757,7 @@ def _build_thd_cp_a2a_perm(
 
 @lru_cache(maxsize=8)
 def _build_head_perm_for_split_sections(
-    split_sections: Tuple[int], cp_size: int, device: torch.device
+    split_sections: tuple[int], cp_size: int, device: torch.device
 ) -> torch.Tensor:
     assert all(
         s % cp_size == 0 for s in split_sections
@@ -777,7 +777,7 @@ def _build_head_perm_for_split_sections(
 # Sharded state dict utilities
 ####################
 def _split_tensor_factory(
-    orig_sh_ten: ShardedTensor, split_sections: List[int], split_names: List[str], split_dim: int
+    orig_sh_ten: ShardedTensor, split_sections: list[int], split_names: list[str], split_dim: int
 ) -> ShardedTensorFactory:
     """Builds a factory that splits a given ShardedTensor into several independent chunks."""
     assert isinstance(orig_sh_ten, ShardedTensor), type(orig_sh_ten)
@@ -843,7 +843,7 @@ def get_parameter_local_cp(
     param: torch.Tensor,
     dim: int,
     cp_group: torch.distributed.ProcessGroup,
-    split_sections: Optional[List[int]] = None,
+    split_sections: Optional[list[int]] = None,
 ) -> torch.Tensor:
     """Get the local parameter for the current context parallel rank.
 
@@ -851,7 +851,7 @@ def get_parameter_local_cp(
         param (torch.Tensor): The entire parameter to get the local parameter for.
         dim (int): The dimension to split the parameter along. Usually the dimension of head.
         cp_group (torch.distributed.ProcessGroup): The context parallel group.
-        split_sections (Optional[List[int]]): If not None,
+        split_sections (Optional[list[int]]): If not None,
             first split the parameter along the dimension dim into sections,
             then get the local hidden parallel weights separately,
             finally concatenate the local hidden parallel weights along the dimension dim.
@@ -889,7 +889,7 @@ def tensor_a2a_cp2hp(
     seq_dim: int,
     head_dim: int,
     cp_group: torch.distributed.ProcessGroup,
-    split_sections: Optional[List[int]] = None,
+    split_sections: Optional[list[int]] = None,
     undo_attention_load_balancing: bool = True,
 ):
     """All-to-all context parallel to hidden parallel.
@@ -900,7 +900,7 @@ def tensor_a2a_cp2hp(
         seq_dim (int): The dimension of sequence length. Currently only supports seq_dim == 0.
         head_dim (int): The dimension of head. Currently only supports head_dim == -1 or 2.
         cp_group (torch.distributed.ProcessGroup): The context parallel group.
-        split_sections (Optional[List[int]]): If not None, split the tensor along the dimension
+        split_sections (Optional[list[int]]): If not None, split the tensor along the dimension
             head_dim into sections first, then do all-to-all for each section separately,
             finally concatenate the separated tensors along the dimension head_dim.
         undo_attention_load_balancing (bool): Whether to undo the attention load balancing of CP.
@@ -952,7 +952,7 @@ def tensor_a2a_hp2cp(
     seq_dim: int,
     head_dim: int,
     cp_group: torch.distributed.ProcessGroup,
-    split_sections: Optional[List[int]] = None,
+    split_sections: Optional[list[int]] = None,
     redo_attention_load_balancing: bool = True,
 ):
     """All-to-all hidden parallel to context parallel.
@@ -963,7 +963,7 @@ def tensor_a2a_hp2cp(
         seq_dim (int): The dimension of sequence length. Currently only supports seq_dim == 0.
         head_dim (int): The dimension of head. Currently only supports head_dim == -1 or 2.
         cp_group (torch.distributed.ProcessGroup): The context parallel group.
-        split_sections (Optional[List[int]]): If not None, first split the tensor along the
+        split_sections (Optional[list[int]]): If not None, first split the tensor along the
             dimension head_dim into sections, then do all-to-all for each section separately,
             finally concatenate the separated tensors along the dimension head_dim.
         redo_attention_load_balancing (bool): Whether to redo the attention load balancing of HP.
