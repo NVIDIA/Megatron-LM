@@ -152,6 +152,13 @@ class ProcessGroupCollection:
             else:
                 raise ValueError(f"Unknown attribute: {key}")
 
+    def __getattr__(self, name: str):
+        # Return None for any declared field that was not set during partial construction
+        # (e.g. when use_mpu_process_groups is called with a subset of required_pgs).
+        if name in {f.name for f in fields(self.__class__)}:
+            return None
+        raise AttributeError(f"'ProcessGroupCollection' object has no attribute '{name}'")
+
     def __repr__(self):
         """Return a concise representation showing which process groups exist and their sizes."""
         active_pgs = []

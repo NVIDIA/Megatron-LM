@@ -63,7 +63,7 @@ except (ImportError, ModuleNotFoundError) as _gtp_te_import_err:
 
 
 class GTPChain(str, Enum):
-    """Prefetch chain identifier for an GTPShardedParam.
+    """Prefetch chain identifier for n GTPShardedParam.
 
     GRAPHED   — fwd/bwd captured by a CUDA graph (MLM _CudaGraphRunner).
     UNGRAPHED — fwd/bwd runs eagerly.
