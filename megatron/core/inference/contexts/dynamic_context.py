@@ -288,6 +288,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.async_scheduling = inference_config.async_scheduling
         self.async_txn_diagnostics = AsyncTxnDiagnostics(enabled=self.async_scheduling)
         self.async_decode_slot_ring: Optional[AsyncDecodeSlotRing] = None
+        self.active_decode_slot_id = 0
         self.request_rng_store = (
             RequestRNGStore(
                 model_config.inference_sampling_seed,
@@ -1432,6 +1433,35 @@ class DynamicInferenceContext(BaseInferenceContext):
             self, async_enabled=self.async_scheduling, **kwargs
         )
 
+    def bind_decode_slot(self, slot: Optional[AsyncDecodeSlot] = None) -> Optional[AsyncDecodeSlot]:
+        """Bind GPU metadata views to the selected async decode slot."""
+
+        if not self.async_scheduling:
+            return None
+        assert self.async_decode_slot_ring is not None
+        slot = slot or self.async_decode_slot_ring.current
+        changed = self.gpu_view is not slot.gpu_view
+        self.gpu_view = slot.gpu_view
+        self.active_decode_slot_id = slot.slot_id
+        if changed:
+            self.graph_attn_metadata["mha_metadata"].bind_gpu_buffers(self.gpu_view)
+            self.non_graph_attn_metadata["mha_metadata"].bind_gpu_buffers(self.gpu_view)
+            if self.is_hybrid_model and hasattr(self, "mamba_metadata"):
+                self.mamba_metadata.bind_gpu_buffers(self.gpu_view)
+        if changed and hasattr(self, "_input_position_views"):
+            self._input_position_views.clear()
+        return slot
+
+    def active_decode_slot(self) -> Optional[AsyncDecodeSlot]:
+        """Return the slot currently bound to forward metadata."""
+
+        if not self.async_scheduling or self.async_decode_slot_ring is None:
+            return None
+        for slot in self.async_decode_slot_ring.slots:
+            if slot.slot_id == self.active_decode_slot_id:
+                return slot
+        raise RuntimeError(f"active decode slot {self.active_decode_slot_id} is not in the ring")
+
     def has_unfinished_requests(self) -> bool:
         """Test if any requests remain."""
         return self.total_request_count > 0
@@ -2097,6 +2127,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Launch deferred Mamba GPU ops first (state zeroing/restore) so they
         # overlap with the CPU work below.  These are non-blocking GPU kernels.
         self._execute_pending_mamba_ops()
+        self.bind_decode_slot()
 
         self.is_creating_cuda_graphs = construct_graph_dimensions is not None
         assert not (
@@ -2361,7 +2392,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_ssm_states[:, indices] = 0.0
             self._pending_mamba_zeros.clear()
 
-    def transfer_bookkeeping_to_gpu(self) -> None:
+    def transfer_bookkeeping_to_gpu(self, slot: Optional[AsyncDecodeSlot] = None) -> None:
         """Batch transfer CPU bookkeeping state to GPU staging buffers.
 
         Called after initialize_attention_state() and before the forward pass.
@@ -2374,6 +2405,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         tensors immediately before the H2D (GPU reads them at `[:n_active]`
         while CPU bookkeeping keeps them at `[paused_count:total_count)`).
         """
+        slot = self.bind_decode_slot(slot)
         n_active = self.total_request_count - self.paused_request_count
         active_slice = slice(self.paused_request_count, self.total_request_count)
         padded_active = max(n_active, self.padded_active_request_count)
@@ -2410,7 +2442,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Copying the whole (max_tokens + max_requests)-sized buffer including
         # unused slots is cheap (~71 KB total, ~3-5 us on PCIe Gen4) and saves
         # 8 redundant launch overheads vs. the prior per-field copies.
-        self.gpu_view._buf.copy_(self._cpu_bookkeeping_buf, non_blocking=True)
+        if slot is None:
+            self.gpu_view._buf.copy_(self._cpu_bookkeeping_buf, non_blocking=True)
+        else:
+            slot.copy_bookkeeping_from_cpu(self._cpu_bookkeeping_buf, non_blocking=True)
 
         # MHA metadata GPU views were already bound to state_data in
         # initialize_attention_state(); the H2D above populates the underlying

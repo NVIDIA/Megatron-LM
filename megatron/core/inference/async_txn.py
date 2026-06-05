@@ -273,6 +273,36 @@ class AsyncDecodeSlot:
     def can_reuse(self) -> bool:
         return _event_done(self.h2d_done_event) and _event_done(self.forward_done_event)
 
+    def copy_bookkeeping_from_cpu(
+        self, cpu_bookkeeping_buf: torch.Tensor, *, non_blocking: bool = True
+    ) -> object:
+        """Copy CPU bookkeeping into this slot and record the H2D dependency."""
+
+        self.gpu_view._buf.copy_(cpu_bookkeeping_buf, non_blocking=non_blocking)
+        self.h2d_done_event = self._record_event_if_cuda()
+        return self.h2d_done_event
+
+    def record_forward_done(self) -> object:
+        """Record the forward completion dependency for this slot."""
+
+        self.forward_done_event = self._record_event_if_cuda()
+        return self.forward_done_event
+
+    def cuda_graph_key(self, base_key: Optional[tuple]) -> Optional[tuple]:
+        """Attach slot pointer identity to a CUDA graph key."""
+
+        if base_key is None:
+            return None
+        return (*base_key, ("decode_slot", self.slot_id, self.pointer_signature()))
+
+    def _record_event_if_cuda(self) -> object:
+        buf = getattr(self.gpu_view, "_buf", None)
+        if buf is None or not getattr(buf, "is_cuda", False):
+            return None
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream(buf.device))
+        return event
+
     def pointer_signature(self) -> tuple[int, ...]:
         """Return stable pointer identity for graph-key safety checks."""
 
@@ -298,6 +328,10 @@ class AsyncDecodeSlotRing:
             raise ValueError("async decode transaction ring requires exactly two slots")
         self._slots = tuple(slots)
         self.current_index = 0
+
+    @property
+    def slots(self) -> tuple[AsyncDecodeSlot, AsyncDecodeSlot]:
+        return self._slots
 
     @property
     def current(self) -> AsyncDecodeSlot:

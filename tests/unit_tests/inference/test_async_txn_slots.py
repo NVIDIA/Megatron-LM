@@ -46,6 +46,18 @@ def test_graph_key_changes_when_slot_pointers_differ():
     slot_b = AsyncDecodeSlot(slot_id=1, gpu_view=FakeGPUView())
 
     assert slot_a.pointer_signature() != slot_b.pointer_signature()
+    assert slot_a.cuda_graph_key(("decode", 4)) != slot_b.cuda_graph_key(("decode", 4))
+
+
+def test_slot_copies_cpu_bookkeeping_into_its_gpu_view():
+    slot = AsyncDecodeSlot(slot_id=1, gpu_view=FakeGPUView())
+    cpu_bookkeeping = torch.arange(slot.gpu_view._buf.numel(), dtype=torch.uint8)
+
+    event = slot.copy_bookkeeping_from_cpu(cpu_bookkeeping, non_blocking=False)
+
+    assert event is None
+    assert slot.h2d_done_event is None
+    assert torch.equal(slot.gpu_view._buf, cpu_bookkeeping)
 
 
 def test_ring_promotes_only_reusable_child_slot():

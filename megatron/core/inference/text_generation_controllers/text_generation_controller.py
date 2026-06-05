@@ -1758,6 +1758,8 @@ class TextGenerationController:
             # Must be done before update_requests while token-to-block mappings are valid.
             # Reconstruction happens from blocks at request completion.
             context.kv_block_allocator.store_routing_per_block(self._router_record_bookkeeping())
+            if context.async_scheduling and context.async_decode_slot_ring is not None:
+                context.async_decode_slot_ring.current.record_forward_done()
             range_pop()
 
         # This is the best place to yield control back to event loop.
