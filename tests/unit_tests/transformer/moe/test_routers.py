@@ -8,7 +8,12 @@ import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
-from megatron.core.transformer.moe.moe_utils import get_updated_expert_bias, router_gating_linear
+from megatron.core.transformer.moe.moe_utils import (
+    compute_routing_scores_for_aux_loss,
+    get_updated_expert_bias,
+    router_gating_linear,
+    topk_routing_with_score_function,
+)
 from megatron.core.transformer.moe.router import Router
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -24,6 +29,57 @@ try:
     HAVE_ROUTER_FUSION = _fused_topk_with_score_function is not None
 except Exception:  # pragma: no cover - defensive
     HAVE_ROUTER_FUSION = False
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize("use_pre_softmax", [True, False])
+@pytest.mark.parametrize("score_function", ["softmax", "sigmoid", "sqrtsoftplus"])
+def test_aux_loss_group_limited_routing_map_matches_dispatch(score_function, use_pre_softmax):
+    logits = torch.tensor(
+        [
+            [10.0, 10.0, 10.5, -100.0],
+            [3.0, 3.0, 3.5, -100.0],
+        ]
+    )
+    topk = 2
+    num_groups = 2
+    group_topk = 1
+
+    _, dispatch_map = topk_routing_with_score_function(
+        logits,
+        topk,
+        use_pre_softmax=use_pre_softmax,
+        num_groups=num_groups,
+        group_topk=group_topk,
+        score_function=score_function,
+    )
+    aux_map, aux_scores = compute_routing_scores_for_aux_loss(
+        logits,
+        topk,
+        score_function,
+        use_pre_softmax=use_pre_softmax,
+        num_groups=num_groups,
+        group_topk=group_topk,
+    )
+    aux_map_with_fusion_requested, aux_scores_with_fusion_requested = (
+        compute_routing_scores_for_aux_loss(
+            logits,
+            topk,
+            score_function,
+            fused=True,
+            use_pre_softmax=use_pre_softmax,
+            num_groups=num_groups,
+            group_topk=group_topk,
+        )
+    )
+    aux_map_without_grouping, _ = compute_routing_scores_for_aux_loss(
+        logits, topk, score_function, use_pre_softmax=use_pre_softmax
+    )
+
+    assert torch.equal(aux_map, dispatch_map)
+    assert torch.equal(aux_map_with_fusion_requested, dispatch_map)
+    torch.testing.assert_close(aux_scores_with_fusion_requested, aux_scores)
+    assert not torch.equal(aux_map_without_grouping, dispatch_map)
 
 
 class TestTop2Router:

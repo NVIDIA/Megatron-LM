@@ -845,6 +845,9 @@ def compute_routing_scores_for_aux_loss(
     score_function: str,
     fused: bool = False,
     padding_mask: Optional[torch.Tensor] = None,
+    use_pre_softmax: bool = False,
+    num_groups: Optional[int] = None,
+    group_topk: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute routing scores based on the score function.
 
@@ -857,11 +860,14 @@ def compute_routing_scores_for_aux_loss(
         padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
                                                Shape in [num_tokens]. True for valid tokens,
                                                False for padding tokens. Defaults to None.
+        use_pre_softmax (bool, optional): Whether softmax scores are used for top-k selection.
+        num_groups (int, optional): Number of expert groups for group-limited routing.
+        group_topk (int, optional): Number of groups selected per token for group-limited routing.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: The routing map and the normalized routing scores.
     """
-    if fused:
+    if fused and not group_topk:
         if not HAVE_TE or fused_compute_score_for_moe_aux_loss is None:
             raise ValueError(
                 "fused_compute_score_for_moe_aux_loss is not available. Please install TE >= 2.6.0."
@@ -886,7 +892,24 @@ def compute_routing_scores_for_aux_loss(
         else:
             raise ValueError(f"Invalid score_function: {score_function}")
 
-        _, top_indices = torch.topk(scores, k=topk, dim=1)
+        routing_scores = (
+            logits if score_function == "softmax" and not use_pre_softmax else scores
+        )
+        if group_topk:
+            if num_groups is None:
+                raise ValueError(
+                    "num_groups must be specified when group_topk is set for aux loss routing."
+                )
+            _, top_indices = group_limited_topk(
+                scores=routing_scores,
+                topk=topk,
+                num_tokens=logits.shape[0],
+                num_experts=logits.shape[1],
+                num_groups=num_groups,
+                group_topk=group_topk,
+            )
+        else:
+            _, top_indices = torch.topk(routing_scores, k=topk, dim=1)
         routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
 
     # Apply padding mask to scores if provided
