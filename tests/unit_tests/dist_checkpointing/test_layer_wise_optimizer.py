@@ -679,9 +679,7 @@ class TestLayerWiseOptimizer:
     @pytest.mark.parametrize('tp', [1, 2])
     @pytest.mark.parametrize('pp', [1, 2])
     @pytest.mark.parametrize('bf16', [True])
-    def test_layer_wise_optimizer_save_load_cpu_offload(
-        self, tmp_path_dist_ckpt, tp, pp, bf16
-    ):
+    def test_layer_wise_optimizer_save_load_cpu_offload(self, tmp_path_dist_ckpt, tp, pp, bf16):
         """Test save/load of LayerWiseDistributedOptimizer with cpu_offload=True.
 
         Runs an optimizer step to produce non-trivial post-update momentum
@@ -778,9 +776,9 @@ class TestLayerWiseOptimizer:
                     if isinstance(opt, Float16OptimizerWithFloat16Params):
                         for group in opt.fp32_from_float16_groups:
                             for param in group:
-                                assert not param.data.is_cuda, (
-                                    "After load + offload, master weights must be on CPU"
-                                )
+                                assert (
+                                    not param.data.is_cuda
+                                ), "After load + offload, master weights must be on CPU"
 
                 # Reload and save as checkpoint B (before any extra step)
                 optimizer_B.reload_optimizer_states()
@@ -808,9 +806,9 @@ class TestLayerWiseOptimizer:
                     if isinstance(opt, Float16OptimizerWithFloat16Params):
                         for group in opt.fp32_from_float16_groups:
                             for param in group:
-                                assert not param.data.is_cuda, (
-                                    "After post-load step, states must be on CPU"
-                                )
+                                assert (
+                                    not param.data.is_cuda
+                                ), "After post-load step, states must be on CPU"
 
                 Utils.destroy_model_parallel()
 

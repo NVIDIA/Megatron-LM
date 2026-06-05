@@ -17,7 +17,6 @@ from unittest import mock
 
 import pytest
 import torch
-from tests.unit_tests.test_utilities import Utils
 
 from megatron.core import parallel_state
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
@@ -28,6 +27,7 @@ from megatron.core.optimizer.optimizer import ChainedOptimizer, Float16Optimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from tests.unit_tests.test_utilities import Utils
 
 
 def _create_model(seed: int, tp: int, pp: int, bf16_params: bool = True) -> GPTModel:
@@ -212,9 +212,9 @@ class TestAdamOffloadConfig:
             for group in opt.fp32_from_float16_groups:
                 for param in group:
                     found_any = True
-                    assert not param.data.is_cuda, (
-                        "LayerWise should offload ALL children's master weights"
-                    )
+                    assert (
+                        not param.data.is_cuda
+                    ), "LayerWise should offload ALL children's master weights"
         assert found_any, "Expected at least some fp32 master weights to verify"
 
         # Reload and verify they're back on GPU.
@@ -356,9 +356,7 @@ class TestMuonCPUOffload:
     @pytest.mark.parametrize('tp,pp', [(2, 2), (4, 1)])
     @pytest.mark.parametrize('n_steps', [3, 5])
     @pytest.mark.parametrize('bf16_params', [True, False])
-    def test_numerical_equivalence(
-        self, tp: int, pp: int, n_steps: int, bf16_params: bool
-    ) -> None:
+    def test_numerical_equivalence(self, tp: int, pp: int, n_steps: int, bf16_params: bool) -> None:
         """Offloaded and non-offloaded optimizers produce bit-identical results.
 
         Runs both an offloaded and a non-offloaded optimizer for ``n_steps``
@@ -482,9 +480,9 @@ class TestMuonCPUOffload:
         for opt in _iter_fp16_opts(optimizer):
             for group in opt.fp32_from_float16_groups:
                 for param in group:
-                    assert param.data.is_cuda, (
-                        "After prepare_grads, fp32 master weight must be on GPU"
-                    )
+                    assert (
+                        param.data.is_cuda
+                    ), "After prepare_grads, fp32 master weight must be on GPU"
 
         # Now step_with_ready_grads should work and offload back.
         optimizer.step_with_ready_grads()
@@ -492,9 +490,9 @@ class TestMuonCPUOffload:
         for opt in _iter_fp16_opts(optimizer):
             for group in opt.fp32_from_float16_groups:
                 for param in group:
-                    assert not param.data.is_cuda, (
-                        "After step_with_ready_grads, fp32 master weight must be on CPU"
-                    )
+                    assert (
+                        not param.data.is_cuda
+                    ), "After step_with_ready_grads, fp32 master weight must be on CPU"
 
 
 class TestSeparateDistOptPath:
@@ -522,12 +520,12 @@ class TestSeparateDistOptPath:
         optimizer_offload_fraction=1.0 so HybridDeviceOptimizer offloads all
         Adam params to CPU (not just structurally present).
         """
+        from megatron.training.arguments import parse_args
+        from megatron.training.training import get_model
         from tests.unit_tests.dist_checkpointing.utils import (
             init_basic_mock_args,
             initialize_gpt_model,
         )
-        from megatron.training.arguments import parse_args
-        from megatron.training.training import get_model
 
         Utils.initialize_model_parallel(tp, pp)
 
@@ -634,17 +632,17 @@ class TestSeparateDistOptPath:
 
         # Verify the CPU copies are actually on CPU
         for gpu_param, cpu_copy in hybrid_opt.gpu_params_map_cpu_copy.items():
-            assert not cpu_copy.is_cuda, (
-                f"CPU copy of offloaded Adam param should be on CPU, got {cpu_copy.device}"
-            )
-            assert gpu_param.is_cuda, (
-                f"Original Adam param should remain on GPU, got {gpu_param.device}"
-            )
+            assert (
+                not cpu_copy.is_cuda
+            ), f"CPU copy of offloaded Adam param should be on CPU, got {cpu_copy.device}"
+            assert (
+                gpu_param.is_cuda
+            ), f"Original Adam param should remain on GPU, got {gpu_param.device}"
 
         # Verify CPU optimizers exist and have params
-        assert len(hybrid_opt.cpu_optimizers) > 0, (
-            "With offload_fraction=1.0, there should be CPU optimizer(s)"
-        )
+        assert (
+            len(hybrid_opt.cpu_optimizers) > 0
+        ), "With offload_fraction=1.0, there should be CPU optimizer(s)"
         cpu_param_count = sum(
             sum(1 for _ in group['params'])
             for opt in hybrid_opt.cpu_optimizers
@@ -697,9 +695,9 @@ class TestSeparateDistOptPath:
                 for group in opt.fp32_from_float16_groups:
                     for param in group:
                         found_muon_on_cpu = True
-                        assert not param.data.is_cuda, (
-                            "After LayerWise offload, Muon master weights should be on CPU"
-                        )
+                        assert (
+                            not param.data.is_cuda
+                        ), "After LayerWise offload, Muon master weights should be on CPU"
 
         assert found_muon_on_cpu, "Expected Muon master weights in LayerWise"
 
@@ -711,6 +709,6 @@ class TestSeparateDistOptPath:
             if isinstance(opt, Float16OptimizerWithFloat16Params):
                 for group in opt.fp32_from_float16_groups:
                     for param in group:
-                        assert param.data.is_cuda, (
-                            "After LayerWise reload, Muon master weights should be on GPU"
-                        )
+                        assert (
+                            param.data.is_cuda
+                        ), "After LayerWise reload, Muon master weights should be on GPU"
