@@ -42,12 +42,6 @@ Wraps a module with FSDP sharding semantics:
 
 Controls parameter/gradient dtypes and communication precision.
 
-| Policy | Notes |
-|--------|-------|
-| `MixedPrecisionPolicy` | Base policy; all fields default to ``None`` |
-| `FullyShardFP8Policy` | MXFP8 rowwise/colwise quantized weights |
-| `FullyShardNVFP4Policy` | NVFP4 primary weights |
-
 **Key fields:**
 
 | Field | Default | Purpose |
@@ -57,8 +51,18 @@ Controls parameter/gradient dtypes and communication precision.
 | `grad_comm_dtype` | ``None`` | Dtype for gradient reduce-scatter communication. ``None`` = use ``main_grads_dtype``. |
 | `use_decoupled_grad` | ``False`` | When ``False``, ``main_grads_dtype`` is inferred from ``main_params_dtype`` so the optimizer operates in a consistent precision context. |
 
+**FP8 & NVFP4 recipes**
+
+`FullyShardFP8Policy` and `FullyShardNVFP4Policy` are recipe dataclasses
+that configure quantized mixed-precision behavior within `MixedPrecisionPolicy`,
+passed via the ``fp8`` and ``nvfp4`` fields respectively.  They are not
+standalone policies.
+
 ```python
-from megatron_fsdp.v2 import fully_shard, MixedPrecisionPolicy
+from megatron_fsdp.v2 import (
+    fully_shard, MixedPrecisionPolicy,
+    FullyShardFP8Policy, FullyShardNVFP4Policy,
+)
 
 # No separate main buffer — optimizer mutates model params directly
 mp_policy = MixedPrecisionPolicy()
@@ -68,11 +72,17 @@ fully_shard(model, mp_policy=mp_policy)
 mp_policy = MixedPrecisionPolicy(main_params_dtype=torch.float32)
 fully_shard(model, mp_policy=mp_policy)
 
-# FP8 mixed precision — fp32 main weights auto-created by adapter
-from megatron_fsdp.v2 import FullyShardFP8Policy
+# FP8 mixed precision — fp32 main weights + MXFP8 rowwise/colwise quantized compute
 mp_policy = MixedPrecisionPolicy(
     main_params_dtype=torch.float32,
-    fp8=FullyShardFP8Policy(enabled=True)
+    fp8=FullyShardFP8Policy(enabled=True),
+)
+fully_shard(model, mp_policy=mp_policy)
+
+# NVFP4 mixed precision — fp32 main weights + NVFP4 primary compute weights
+mp_policy = MixedPrecisionPolicy(
+    main_params_dtype=torch.float32,
+    nvfp4=FullyShardNVFP4Policy(enabled=True),
 )
 fully_shard(model, mp_policy=mp_policy)
 ```
@@ -116,6 +126,9 @@ See the parent directory `..` for `uneven_dtensor.py` which provides:
 - `get_state_dict()` — PyTorch DCP-compatible state dict with uneven shard support
 
 ## Sharding Strategies
+
+All strategies except `no_shard` use `Shard(0)` DTensor placements. The
+strategy controls which buffers and communication collectives are used.
 
 | Strategy | Shard Weights | Shard Gradients | Status | Notes |
 |----------|---------------|-----------------|--------|-------|
