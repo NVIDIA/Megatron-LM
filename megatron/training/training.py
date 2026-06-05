@@ -6,6 +6,7 @@ import time
 
 from megatron.training.config.container import PretrainConfigContainer
 from megatron.training.config.training_config import OptimizerConfigOverrideProviderContext
+from megatron.training.setup import init_checkpointing_context, maybe_save_config, validate_and_set_vocab_size
 
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
@@ -1074,6 +1075,7 @@ def pretrain(
 
     state = GlobalState()
     state.cfg = cfg_container
+    maybe_save_config(cfg_container)
 
     if inprocess_call_wrapper is not None:
         iteration = inprocess_call_wrapper.iteration
@@ -1186,39 +1188,19 @@ def pretrain(
     # Track E2E metrics on pretrain start
     one_logger_utils.on_pretrain_start()
 
-    # Context used for persisting some state between checkpoint saves.
-    if cfg_container.checkpoint.non_persistent_ckpt_type == 'local':
-        try:
-            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import (
-                LocalCheckpointManager,
-            )
-            from nvidia_resiliency_ext.checkpointing.local.replication.group_utils import (
-                GroupWrapper,
-                parse_group_sequence,
-            )
-            from nvidia_resiliency_ext.checkpointing.local.replication.strategies import (
-                CliqueReplicationStrategy,
-            )
-        except ModuleNotFoundError:
-            raise RuntimeError(
-                "The 'nvidia_resiliency_ext' module is required for local "
-                "checkpointing but was not found. Please ensure it is installed."
-            )
+    checkpointing_context = init_checkpointing_context(cfg_container.checkpoint)
 
-        if cfg_container.checkpoint.replication:
-            repl_strategy = CliqueReplicationStrategy.from_replication_params(
-                cfg_container.checkpoint.replication_jump, cfg_container.checkpoint.replication_factor
-            )
-        else:
-            repl_strategy = None
-
-        checkpointing_context = {
-            'local_checkpoint_manager': LocalCheckpointManager(
-                cfg_container.checkpoint.non_persistent_local_ckpt_dir, repl_strategy=repl_strategy
-            )
-        }
-    else:
-        checkpointing_context = {}
+    # Tokenizer
+    timers("tokenizer-setup", log_level=0).start(barrier=True)
+    tokenizer = state.tokenizer
+    # Handle model vocab_size configuration with proper validation
+    cfg_container.model.vocab_size, cfg_container.model.should_pad_vocab = validate_and_set_vocab_size(
+        model_vocab_size=cfg_container.model.vocab_size,
+        tokenizer_vocab_size=tokenizer.vocab_size,
+    )
+    cfg_container.dataset.tokenizer = tokenizer
+    timers("tokenizer-setup").stop()
+    barrier_and_log("after tokenizer is built")
 
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
