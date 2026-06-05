@@ -971,12 +971,21 @@ class DynamicInferenceEngine(AbstractEngine):
                 eod = -1
             request.sampling_params.termination_id = eod
 
-        if (
-            len(request.prompt_tokens) + request.sampling_params.num_tokens_to_generate
-            > self.context.max_sequence_length
-        ) or (request.sampling_params.num_tokens_to_generate < 0):
+        # Clamp large `num_tokens_to_generate` instead of rejecting the request.
+        # This is included for compatibility with other frameworks.
+        remaining_tokens = self.context.max_sequence_length - len(request.prompt_tokens)
+        if request.sampling_params.num_tokens_to_generate < 0 or remaining_tokens < 0:
             request.status = Status.FAILED
             request.add_event_error_nontransient(MaxSequenceLengthOverflowError(request_id))
+        elif request.sampling_params.num_tokens_to_generate > remaining_tokens:
+            requested_tokens = request.sampling_params.num_tokens_to_generate
+            request.sampling_params.num_tokens_to_generate = remaining_tokens
+            if self.rank == 0:
+                warnings.warn(
+                    f"Request {request_id} requested num_tokens_to_generate={requested_tokens} "
+                    f"which exceeds the maximum sequence length of the engine. "
+                    f"Clamping num_tokens_to_generate to {remaining_tokens}."
+                )
 
         if len(request.prompt_tokens) > self.context.max_tokens and not self.enable_chunked_prefill:
             request.status = Status.FAILED
