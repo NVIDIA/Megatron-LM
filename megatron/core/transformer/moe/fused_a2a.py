@@ -8,12 +8,15 @@ from megatron.core.utils import internal_api
 try:
     from deep_ep import Buffer
     from deep_ep.utils import EventHandle, EventOverlap
+    from deep_ep_cpp import Config as DeepEPConfig
 
     HAVE_DEEP_EP = True
 except ImportError:
     HAVE_DEEP_EP = False
 
 import torch
+
+from megatron.core.transformer.moe.fused_a2a_config import FusedA2AConfig
 
 _buffer = None
 
@@ -66,6 +69,51 @@ def get_buffer(group: torch.distributed.ProcessGroup, hidden_bytes: int):
     return _buffer
 
 
+def _build_deepep_config(default_config, fused_a2a_cfg):
+    """Build a DeepEP Config from a default config and user overrides in FusedA2AConfig.
+
+    Starts from the hardware-appropriate default (e.g. Buffer.get_dispatch_config) and
+    overrides only the fields the user explicitly set.  Returns the default unchanged when
+    no overrides are needed, avoiding any unnecessary object allocation on the hot path.
+
+    Args:
+        default_config: Config returned by Buffer.get_dispatch_config() or
+                        Buffer.get_combine_config() — hardware-tuned baseline.
+        fused_a2a_cfg:  FusedA2AConfig with optional user overrides, or None.
+
+    Returns:
+        A DeepEP Config (possibly the original default_config if nothing was overridden).
+
+    Note:
+        chunk_size maps to num_max_nvl_chunked_send_tokens.  The DeepEP assertion
+        requires chunk_size < num_max_nvl_chunked_recv_tokens (default 256), so
+        values >= 256 will raise inside the DeepEP C++ constructor.
+    """
+    if fused_a2a_cfg is None:
+        return default_config
+    if fused_a2a_cfg.num_sms is None and fused_a2a_cfg.chunk_size is None:
+        return default_config
+    num_sms = (
+        fused_a2a_cfg.num_sms
+        if fused_a2a_cfg.num_sms is not None
+        else default_config.num_sms
+    )
+    chunk_size = (
+        fused_a2a_cfg.chunk_size
+        if fused_a2a_cfg.chunk_size is not None
+        else default_config.num_max_nvl_chunked_send_tokens
+    )
+    # Build a new Config preserving all RDMA / buffer-size params from the default.
+    # DeepEPConfig == deep_ep_cpp.Config; only available when HAVE_DEEP_EP=True.
+    return DeepEPConfig(  # noqa: F821
+        num_sms,
+        chunk_size,
+        default_config.num_max_nvl_chunked_recv_tokens,
+        default_config.num_max_rdma_chunked_send_tokens,
+        default_config.num_max_rdma_chunked_recv_tokens,
+    )
+
+
 class FusedDispatch(torch.autograd.Function):
     """Fused dispatch operation for MoE routing combining computation and communication."""
 
@@ -79,11 +127,20 @@ class FusedDispatch(torch.autograd.Function):
         group,
         async_finish=False,
         allocate_on_comm_stream=False,
+        fused_a2a_config=None,
     ):
         """Forward pass of fused dispatch."""
         previous_event = None
         if async_finish:
             previous_event = EventOverlap(EventHandle())
+        # Build hardware-appropriate DeepEP Configs, applying user overrides.
+        # _build_deepep_config reads fields from the C++ Config struct exposed by pybind11.
+        dispatch_config = _build_deepep_config(
+            Buffer.get_dispatch_config(group.size()), fused_a2a_config
+        )
+        combine_config = _build_deepep_config(
+            Buffer.get_combine_config(group.size()), fused_a2a_config
+        )
         # Calculate layout before actual dispatch
         buffer = get_buffer(group, get_hidden_bytes(x))
         (
@@ -118,6 +175,7 @@ class FusedDispatch(torch.autograd.Function):
             num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
             is_token_in_rank=is_token_in_rank,
             num_tokens_per_expert=num_tokens_per_expert,
+            config=dispatch_config,
             previous_event=event,  # wait in deepep::intra/inter_dispatch
             async_finish=async_finish,
             allocate_on_comm_stream=allocate_on_comm_stream,
@@ -127,11 +185,12 @@ class FusedDispatch(torch.autograd.Function):
         if async_finish:
             after_event_overlap.current_stream_wait()
 
-        # Save for backward
+        # Save for backward (combine uses the combine config)
         ctx.group = group
         ctx.handle = handle
         ctx.async_finish = async_finish
         ctx.allocate_on_comm_stream = allocate_on_comm_stream
+        ctx.combine_config = combine_config
         tokens_per_expert = torch.tensor(num_recv_tokens_per_expert_list)
 
         return (recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle)
@@ -150,6 +209,7 @@ class FusedDispatch(torch.autograd.Function):
             grad_output.contiguous(),
             handle,
             topk_weights=grad_token_probs.float(),
+            config=ctx.combine_config,
             previous_event=previous_event,
             async_finish=ctx.async_finish,
             allocate_on_comm_stream=ctx.allocate_on_comm_stream,
@@ -157,22 +217,33 @@ class FusedDispatch(torch.autograd.Function):
         # Make sure current stream is synchronized
         if ctx.async_finish:
             after_event.current_stream_wait()
-        return grad_x, None, grad_token_probs, None, None, None, None
+        return grad_x, None, grad_token_probs, None, None, None, None, None
 
 
 class FusedCombine(torch.autograd.Function):
     """Fused combine operation for MoE output combining computation and communication."""
 
     @staticmethod
-    def forward(ctx, x, group, handle, async_finish=False, allocate_on_comm_stream=False):
+    def forward(
+        ctx, x, group, handle, async_finish=False, allocate_on_comm_stream=False,
+        fused_a2a_config=None,
+    ):
         """Forward pass of fused combine."""
         previous_event = None
         if async_finish:
             previous_event = EventOverlap(EventHandle())
+        # Build configs; combine uses combine_config, backward dispatch uses dispatch_config.
+        combine_config = _build_deepep_config(
+            Buffer.get_combine_config(group.size()), fused_a2a_config
+        )
+        dispatch_config = _build_deepep_config(
+            Buffer.get_dispatch_config(group.size()), fused_a2a_config
+        )
         buffer = get_buffer(group, get_hidden_bytes(x))
         combined_x, _, after_event = buffer.combine(
             x,
             handle=handle,
+            config=combine_config,
             async_finish=async_finish,
             previous_event=previous_event,
             allocate_on_comm_stream=allocate_on_comm_stream,
@@ -185,6 +256,7 @@ class FusedCombine(torch.autograd.Function):
         ctx.group = group
         ctx.async_finish = async_finish
         ctx.allocate_on_comm_stream = allocate_on_comm_stream
+        ctx.dispatch_config = dispatch_config
         return combined_x, None
 
     @staticmethod
@@ -197,6 +269,7 @@ class FusedCombine(torch.autograd.Function):
         grad_x, _, _, _, _, after_event = buffer.dispatch(
             grad_output.contiguous(),
             handle=ctx.handle,
+            config=ctx.dispatch_config,
             previous_event=previous_event,
             async_finish=ctx.async_finish,
             allocate_on_comm_stream=ctx.allocate_on_comm_stream,
@@ -204,7 +277,7 @@ class FusedCombine(torch.autograd.Function):
         # Make sure current stream is synchronized
         if ctx.async_finish:
             after_event.current_stream_wait()
-        return grad_x, None, None, None, None
+        return grad_x, None, None, None, None, None
 
 
 if HAVE_DEEP_EP:
@@ -217,6 +290,7 @@ if HAVE_DEEP_EP:
         group,
         async_finish=False,
         allocate_on_comm_stream=False,
+        config=None,
     ):
         """Perform fused dispatch operation if deep_ep is available.
 
@@ -239,9 +313,11 @@ if HAVE_DEEP_EP:
             group,
             async_finish,
             allocate_on_comm_stream,
+            config,
         )
 
-    def fused_combine(x, group, handle, async_finish=False, allocate_on_comm_stream=False):
+    def fused_combine(x, group, handle, async_finish=False, allocate_on_comm_stream=False,
+                      config=None):
         """Perform fused combine operation if deep_ep is available.
 
         Args:
@@ -253,7 +329,7 @@ if HAVE_DEEP_EP:
         Returns:
             Result of FusedCombine
         """
-        return FusedCombine.apply(x, group, handle, async_finish, allocate_on_comm_stream)
+        return FusedCombine.apply(x, group, handle, async_finish, allocate_on_comm_stream, config)
 
     def set_deepep_num_sms(num_sms):
         """Sets the number of SMs to use for DeepEP"""
