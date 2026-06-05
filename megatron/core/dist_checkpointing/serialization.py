@@ -211,9 +211,7 @@ def load_common_state_dict(checkpoint_dir: Union[str, Path]) -> StateDict:
     unique_key = ShardedObject("common_state", None, (1,), (0,)).unique_key
     pyt_state_dict = {unique_key: io.BytesIO()}
     torch.distributed.checkpoint.load(
-        pyt_state_dict,
-        storage_reader=_get_filesystem_reader(checkpoint_dir),
-        no_dist=True,
+        pyt_state_dict, storage_reader=_get_filesystem_reader(checkpoint_dir), no_dist=True
     )
 
     loaded = pyt_state_dict[unique_key]
