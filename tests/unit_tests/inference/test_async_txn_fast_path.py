@@ -113,10 +113,19 @@ class FakeContext:
     def get_max_sequence_lengths(self):
         return self.request_output_lengths
 
-    def update_requests(self, active_request_mask, new_sample_copy, sampled_mtp_tokens_cpu=None):
+    def update_requests(
+        self, active_request_mask, new_sample_copy, sampled_mtp_tokens_cpu=None, async_txn=None
+    ):
         self.updated += 1
         self.request_kv_length_offsets.add_(1)
+        if async_txn is not None:
+            survivors = self.request_ids[active_request_mask.bool()].tolist()
+            terminals = self.request_ids[~active_request_mask.bool()].tolist()
+            async_txn.mark_committed(survivors, terminal_request_ids=terminals)
         return {}
+
+    def retire_unused_async_kv_leases(self, async_txn):
+        return None
 
 
 def _make_controller(context):
@@ -216,7 +225,7 @@ def test_consecutive_decode_steps_adopt_launched_children():
     assert context.async_txn_diagnostics.launched == 2
 
 
-def test_child_launch_skips_when_terminal_detection_is_needed():
+def test_child_launch_allows_ordinary_terminal_rows():
     context = FakeContext(termination_id=7)
     controller, order = _make_controller(context)
     controller._transfer_samples_to_cpu = lambda active_request_count: (
@@ -225,14 +234,8 @@ def test_child_launch_skips_when_terminal_detection_is_needed():
 
     asyncio.run(controller.async_generate_output_tokens_dynamic_batch())
 
-    assert "child_forward" not in order
-    assert context.async_txn_diagnostics.launched == 0
-    assert (
-        context.async_txn_diagnostics.eligibility_skip_reasons[
-            AsyncTxnSkipReason.TERMINAL_CHECK_REQUIRED.value
-        ]
-        == 1
-    )
+    assert "child_forward" in order
+    assert context.async_txn_diagnostics.launched == 1
 
 
 def test_async_disabled_path_does_not_prepare_or_launch():

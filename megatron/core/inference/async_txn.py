@@ -149,6 +149,18 @@ def _event_done(event) -> bool:
 
 
 @dataclass
+class KVBlockLease:
+    """A KV block reserved for a request before an async child launches."""
+
+    request_id: int
+    block_column: int
+    block_id: int
+
+    def key(self) -> tuple[int, int]:
+        return (int(self.request_id), int(self.block_column))
+
+
+@dataclass
 class StepTxn:
     """Ownership record for one decode forward step."""
 
@@ -161,17 +173,68 @@ class StepTxn:
     forward_done_event: object = None
     sample_done_event: object = None
     kv_block_ids: tuple[int, ...] = ()
+    kv_block_leases: tuple[KVBlockLease, ...] = ()
     mamba_slot_ids: tuple[int, ...] = ()
+    terminal_request_ids: tuple[int, ...] = ()
+    committed_request_ids: tuple[int, ...] = ()
     launched: bool = False
     adopted: bool = False
     retired: bool = False
 
     def __post_init__(self) -> None:
         self.request_ids = tuple(int(r) for r in self.request_ids)
+        self.kv_block_leases = tuple(
+            lease
+            if isinstance(lease, KVBlockLease)
+            else KVBlockLease(
+                request_id=int(lease[0]), block_column=int(lease[1]), block_id=int(lease[2])
+            )
+            for lease in self.kv_block_leases
+        )
+        self.terminal_request_ids = tuple(int(r) for r in self.terminal_request_ids)
+        self.committed_request_ids = tuple(int(r) for r in self.committed_request_ids)
 
     @property
     def request_id_set(self) -> set[int]:
         return set(self.request_ids)
+
+    @property
+    def terminal_request_id_set(self) -> set[int]:
+        return set(self.terminal_request_ids)
+
+    @property
+    def kv_lease_map(self) -> dict[tuple[int, int], int]:
+        return {lease.key(): int(lease.block_id) for lease in self.kv_block_leases}
+
+    def get_kv_lease(self, request_id: int, block_column: int) -> Optional[int]:
+        """Return a reserved block for ``(request_id, block_column)``, if any."""
+
+        return self.kv_lease_map.get((int(request_id), int(block_column)))
+
+    def mark_committed(
+        self,
+        committed_request_ids: Iterable[int],
+        *,
+        terminal_request_ids: Iterable[int] = (),
+    ) -> None:
+        """Record CPU commit results keyed by request id."""
+
+        self.committed_request_ids = tuple(int(r) for r in committed_request_ids)
+        self.terminal_request_ids = tuple(int(r) for r in terminal_request_ids)
+
+    def unused_kv_leases(self) -> tuple[KVBlockLease, ...]:
+        """Return leased blocks that did not become part of committed survivors."""
+
+        if not self.kv_block_leases:
+            return ()
+        committed = set(self.committed_request_ids)
+        return tuple(lease for lease in self.kv_block_leases if lease.request_id not in committed)
+
+    def committed_row_indices(self, committed_request_ids: Iterable[int]) -> tuple[int, ...]:
+        """Map committed request ids back to launched row indices."""
+
+        row_by_request_id = {request_id: row for row, request_id in enumerate(self.request_ids)}
+        return tuple(row_by_request_id[int(request_id)] for request_id in committed_request_ids)
 
     def h2d_ready(self) -> bool:
         return _event_done(self.h2d_done_event)

@@ -17,8 +17,10 @@ from megatron.core.inference.async_txn import (
     AsyncDecodeSlotRing,
     AsyncTxnDiagnostics,
     AsyncTxnSkipReason,
+    KVBlockLease,
     RequestRNGStore,
     StepTxn,
+    TxnRetireQueue,
     classify_decode_child_launch,
 )
 from megatron.core.inference.batch_dimensions_utils import (
@@ -289,6 +291,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.step_count = 0
         self.async_scheduling = inference_config.async_scheduling
         self.async_txn_diagnostics = AsyncTxnDiagnostics(enabled=self.async_scheduling)
+        self.async_txn_retire_queue = TxnRetireQueue(self.async_txn_diagnostics)
         self.async_decode_slot_ring: Optional[AsyncDecodeSlotRing] = None
         self.active_decode_slot_id = 0
         self.request_rng_store = (
@@ -1485,13 +1488,14 @@ class DynamicInferenceContext(BaseInferenceContext):
     def prepare_child_from_committed_decode_state(self) -> Optional[StepTxn]:
         """Prestage deterministic plain-decode child metadata into the free slot.
 
-        This covers the ordinary non-hybrid, no-boundary decode case. Later
-        commits extend the same slot ownership to boundary reservations and
-        Mamba metadata; until then those cases are explicit sync gates.
+        This covers ordinary non-hybrid decode, including requests that cross a
+        KV-block boundary. Boundary blocks are reserved before launch and
+        adopted during the later CPU commit by request id.
         """
 
         if not self.async_scheduling or self.async_decode_slot_ring is None:
             return None
+        self.async_txn_retire_queue.drain_ready()
 
         eligibility = self.async_launch_eligibility()
         if not eligibility.eligible:
@@ -1500,11 +1504,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self.is_hybrid_model:
             self.async_txn_diagnostics.record_barrier_skip(
                 AsyncTxnSkipReason.HYBRID_PRESTAGE_DEFERRED
-            )
-            return None
-        if eligibility.required_boundary_blocks:
-            self.async_txn_diagnostics.record_barrier_skip(
-                AsyncTxnSkipReason.BOUNDARY_PRESTAGE_DEFERRED
             )
             return None
 
@@ -1518,25 +1517,72 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.async_txn_diagnostics.record_barrier_skip(AsyncTxnSkipReason.NOT_DECODE_ONLY)
             return None
 
-        child_cpu_buf = self._cpu_bookkeeping_buf.clone()
-        self._patch_plain_decode_child_bookkeeping(child_cpu_buf, active_request_count)
-        h2d_done_event = child_slot.copy_bookkeeping_from_cpu(child_cpu_buf, non_blocking=True)
         request_ids = self.request_ids[
             self.paused_request_count : self.total_request_count
         ].tolist()
+        kv_block_leases = self._reserve_async_boundary_blocks(eligibility.boundary_request_ids)
+        if kv_block_leases is None:
+            self.async_txn_diagnostics.record_barrier_skip(
+                AsyncTxnSkipReason.KV_RESERVATION_UNAVAILABLE
+            )
+            return None
+
+        child_cpu_buf = self._cpu_bookkeeping_buf.clone()
+        self._patch_plain_decode_child_bookkeeping(
+            child_cpu_buf, active_request_count, kv_block_leases=kv_block_leases
+        )
+        h2d_done_event = child_slot.copy_bookkeeping_from_cpu(child_cpu_buf, non_blocking=True)
         self.async_txn_diagnostics.record_prepared(under_forward=True)
         return StepTxn(
             step_id=self.step_count + 1,
             request_ids=request_ids,
             slot_id=child_slot.slot_id,
             h2d_done_event=h2d_done_event,
+            kv_block_leases=kv_block_leases,
             cuda_graph_key=child_slot.cuda_graph_key(
                 ("decode", self.padded_active_request_count, self.padded_active_token_count)
             ),
         )
 
+    def _reserve_async_boundary_blocks(
+        self, boundary_request_ids: Sequence[int]
+    ) -> Optional[tuple[KVBlockLease, ...]]:
+        """Reserve one next-column KV block for each boundary-crossing request."""
+
+        if not boundary_request_ids:
+            return ()
+
+        num_blocks = len(boundary_request_ids)
+        block_ids = self.kv_block_allocator.allocate_memory_blocks(num_blocks)
+        if block_ids is None or block_ids.numel() != num_blocks:
+            return None
+
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+        active_request_ids = self.request_ids[active_slice].tolist()
+        request_id_to_row = {
+            int(request_id): row for row, request_id in enumerate(active_request_ids)
+        }
+        leases = []
+        for request_id, block_id in zip(boundary_request_ids, block_ids.tolist()):
+            row = request_id_to_row[int(request_id)]
+            block_column = int(
+                self.request_kv_block_counts[self.paused_request_count + row].item()
+            )
+            leases.append(
+                KVBlockLease(
+                    request_id=int(request_id),
+                    block_column=block_column,
+                    block_id=int(block_id),
+                )
+            )
+        return tuple(leases)
+
     def _patch_plain_decode_child_bookkeeping(
-        self, child_cpu_buf: Tensor, active_request_count: int
+        self,
+        child_cpu_buf: Tensor,
+        active_request_count: int,
+        *,
+        kv_block_leases: Sequence[KVBlockLease] = (),
     ) -> None:
         """Patch a CPU bookkeeping clone from current decode to child decode."""
 
@@ -1559,10 +1605,17 @@ class DynamicInferenceContext(BaseInferenceContext):
         child_mha_cu_kv_lengths = self._cpu_bookkeeping_clone_view(
             self._cpu_mha_cu_kv_seq_lengths, child_cpu_buf
         )
+        child_token_to_block_idx = self._cpu_bookkeeping_clone_view(
+            self.token_to_block_idx, child_cpu_buf
+        )
+        child_mha_block_table = self._cpu_bookkeeping_clone_view(
+            self._cpu_mha_block_table, child_cpu_buf
+        )
 
         child_token_to_pos_ids[:token_count].add_(1)
         child_token_to_position[:token_count].add_(1)
         child_token_to_local[:token_count].add_(1)
+        child_token_to_local[:token_count].remainder_(self.block_size_tokens)
         child_staging_kv_offsets[:active_request_count].add_(1)
 
         real_bs = self.batch_dimensions.req_count
@@ -1577,6 +1630,18 @@ class DynamicInferenceContext(BaseInferenceContext):
             child_mha_cu_kv_lengths[real_bs + 1 : padded_bs + 1] = child_mha_cu_kv_lengths[
                 real_bs
             ]
+
+        if kv_block_leases:
+            active_request_ids = self.request_ids[
+                self.paused_request_count : self.total_request_count
+            ].tolist()
+            request_id_to_row = {
+                int(request_id): row for row, request_id in enumerate(active_request_ids)
+            }
+            for lease in kv_block_leases:
+                row = request_id_to_row[int(lease.request_id)]
+                child_token_to_block_idx[row] = int(lease.block_id)
+                child_mha_block_table[row, int(lease.block_column)] = int(lease.block_id)
 
     def _cpu_bookkeeping_clone_view(self, source: Tensor, child_cpu_buf: Tensor) -> Tensor:
         """Return the matching typed view inside a cloned CPU bookkeeping buffer."""
@@ -3206,7 +3271,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Returns whether chunked prefill is enabled."""
         return self.enable_chunked_prefill
 
-    def release_memory_blocks_from_request_indexes(self, request_indexes) -> None:
+    def release_memory_blocks_from_request_indexes(
+        self, request_indexes, *, retire_event=None, defer_release: bool = False
+    ) -> None:
         """Release memory blocks used by the given request idxs.
 
         Args:
@@ -3215,7 +3282,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         kv_blocks_assigned = self.request_to_kv_block_ids[request_indexes]
         non_zero_values_in_kv_memory = kv_blocks_assigned[kv_blocks_assigned != -1]
-        self.kv_block_allocator.release_memory_blocks(non_zero_values_in_kv_memory)
+        self.release_kv_blocks(
+            non_zero_values_in_kv_memory,
+            retire_event=retire_event,
+            defer_release=defer_release,
+            label="finished_request_kv",
+        )
 
         # Reset the KV blocks for finished requests.
         # Note: do not use fill_() (or add_() and similar inplace ops) here.
@@ -3235,6 +3307,45 @@ class DynamicInferenceContext(BaseInferenceContext):
             sa._intermediate_offsets_cpu[request_indexes] = 0
             sa._intermediate_block_ids_cpu[request_indexes] = -1
             sa._eos_cache_block_id_cpu[request_indexes] = -1
+
+    def release_kv_blocks(
+        self,
+        block_ids: Tensor,
+        *,
+        retire_event=None,
+        defer_release: bool = False,
+        label: str = "kv",
+    ) -> None:
+        """Release KV blocks now or after a transaction-owned forward event."""
+
+        if block_ids.numel() == 0:
+            return
+        block_ids = block_ids.to(device='cpu', dtype=torch.int32).clone()
+        if not defer_release:
+            self.kv_block_allocator.release_memory_blocks(block_ids)
+            return
+
+        self.async_txn_retire_queue.enqueue(
+            retire_event,
+            lambda block_ids=block_ids: self.kv_block_allocator.release_memory_blocks(block_ids),
+            label=label,
+        )
+
+    def retire_unused_async_kv_leases(self, txn: Optional[StepTxn]) -> None:
+        """Retire reserved KV blocks that were not adopted by committed survivors."""
+
+        if txn is None:
+            return
+        unused = txn.unused_kv_leases()
+        if not unused:
+            return
+        block_ids = torch.tensor([lease.block_id for lease in unused], dtype=torch.int32)
+        self.release_kv_blocks(
+            block_ids,
+            retire_event=txn.forward_done_event,
+            defer_release=txn.launched,
+            label="unused_async_kv_lease",
+        )
 
     def resume_paused_requests(
         self, active_request_count: int, newly_paused_request_ids: torch.Tensor
@@ -3438,6 +3549,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         active_requests_mask: Tensor,
         new_tokens: Tensor,
         new_speculative_tokens: Tensor = None,
+        async_txn: Optional[StepTxn] = None,
     ) -> Tensor:
         """Update context state after calling engine.step().
 
@@ -3491,6 +3603,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             new_tokens = new_tokens.cpu()
         if new_speculative_tokens is not None and new_speculative_tokens.is_cuda:
             new_speculative_tokens = new_speculative_tokens.cpu()
+        defer_finished_release = async_txn is not None and async_txn.launched
+        retire_event = async_txn.forward_done_event if defer_finished_release else None
 
         self.num_prefill_requests = 0  # all turns to decode
         # All request that were in prefill become decode requests.
@@ -3529,7 +3643,11 @@ class DynamicInferenceContext(BaseInferenceContext):
                     torch.nonzero(active_requests_mask == 0, as_tuple=True)[0]
                     + self.paused_request_count
                 )
-                self.release_memory_blocks_from_request_indexes(finished_idxs)
+                self.release_memory_blocks_from_request_indexes(
+                    finished_idxs,
+                    retire_event=retire_event,
+                    defer_release=defer_finished_release,
+                )
 
             # Reset request/token counts.
             self.request_to_kv_block_ids.fill_(-1)
@@ -3559,7 +3677,11 @@ class DynamicInferenceContext(BaseInferenceContext):
                 torch.nonzero(active_requests_mask == 0, as_tuple=True)[0]
                 + self.paused_request_count
             )
-            self.release_memory_blocks_from_request_indexes(finished_idxs)
+            self.release_memory_blocks_from_request_indexes(
+                finished_idxs,
+                retire_event=retire_event,
+                defer_release=defer_finished_release,
+            )
 
             if active_request_count > 0:
                 finished_idxs_on_left = (
@@ -3598,6 +3720,22 @@ class DynamicInferenceContext(BaseInferenceContext):
             active_requests_requiring_new_block = (
                 num_tokens_in_last_block >= self.block_size_tokens - 1 - self.num_speculative_tokens
             ).byte()
+
+            if async_txn is not None and async_txn.kv_block_leases:
+                requiring_relative_idxs = torch.nonzero(
+                    active_requests_requiring_new_block, as_tuple=True
+                )[0]
+                for relative_idx in requiring_relative_idxs.tolist():
+                    row_idx = self.paused_request_count + relative_idx
+                    request_id = int(self.request_ids[row_idx].item())
+                    block_column = int(self.request_kv_block_counts[row_idx].item())
+                    block_id = async_txn.get_kv_lease(request_id, block_column)
+                    if block_id is None:
+                        continue
+                    self.request_to_kv_block_ids[row_idx, block_column] = block_id
+                    self.request_kv_block_counts[row_idx] += 1
+                    self.request_last_kv_block_id[row_idx] = block_id
+                    active_requests_requiring_new_block[relative_idx] = 0
 
             # Find the id in request_ids that is the chunked_prefill_request_id. Only one request should be chunked.
             if (

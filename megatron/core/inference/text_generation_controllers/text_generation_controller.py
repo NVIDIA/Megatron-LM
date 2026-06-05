@@ -711,6 +711,7 @@ class TextGenerationController:
 
         if not child_txn.guard_adoption(
             self._async_active_request_ids(),
+            terminal_request_ids=child_txn.terminal_request_ids,
             decode_only=context.is_decode_only(),
             cuda_graph_key=self._async_decode_cuda_graph_key(),
         ):
@@ -756,8 +757,6 @@ class TextGenerationController:
             return AsyncTxnSkipReason.LOGPROBS_DEFERRED
         if active_request_count != len(child_txn.request_ids):
             return AsyncTxnSkipReason.UNKNOWN_BARRIER
-        if context.plain_decode_child_needs_terminal_check(active_request_count):
-            return AsyncTxnSkipReason.TERMINAL_CHECK_REQUIRED
         return None
 
     def _launch_async_decode_child(self, child_txn: StepTxn) -> None:
@@ -1784,6 +1783,7 @@ class TextGenerationController:
         self,
         sampled_tokens_cpu: Optional[Tensor] = None,
         sampled_mtp_tokens_cpu: Optional[Tensor] = None,
+        async_txn: Optional[StepTxn] = None,
     ) -> Dict[str, Tensor]:
         """Update the dynamic inference context after sampling.
 
@@ -1864,8 +1864,15 @@ class TextGenerationController:
 
         range_push("update_requests")
         update_result = context.update_requests(
-            active_request_mask, new_sample_copy, sampled_mtp_tokens_cpu
+            active_request_mask, new_sample_copy, sampled_mtp_tokens_cpu, async_txn=async_txn
         )
+        if async_txn is not None:
+            committed_slice = slice(context.paused_request_count, context.total_request_count)
+            async_txn.mark_committed(
+                context.request_ids[committed_slice].tolist(),
+                terminal_request_ids=finished_request_ids.tolist(),
+            )
+            context.retire_unused_async_kv_leases(async_txn)
         if context.request_rng_store is not None and finished_request_ids.numel() > 0:
             context.request_rng_store.remove_many(finished_request_ids.tolist())
         range_pop()
@@ -2056,7 +2063,8 @@ class TextGenerationController:
                     else None
                 )
                 request_bookkeeping = self._dynamic_step_context_bookkeeping(
-                    sampled_tokens_cpu=sampled_tokens_cpu
+                    sampled_tokens_cpu=sampled_tokens_cpu,
+                    async_txn=launched_child_txn,
                 )
                 if launched_child_txn is not None:
                     self._async_prepared_child_txn = (
