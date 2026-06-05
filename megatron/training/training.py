@@ -1094,6 +1094,8 @@ def pretrain(
         seed_ep_group=getattr(init_pg_collection, "ep", None),
         seed_etp_group=getattr(init_pg_collection, "expt_tp", None),
     )
+    # TODO (@maanug): temporary until initialize.py is refactored to build pgcollection as bridge does
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     timestamp_after_initialize_megatron = time.time()
 
