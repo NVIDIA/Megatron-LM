@@ -277,6 +277,7 @@ from .utils import (
     to_empty_if_meta_device,
     update_use_dist_ckpt,
 )
+from megatron.training.utils.log_utils import barrier_and_log as print_datetime
 
 stimer = StragglerDetector()
 
@@ -291,16 +292,6 @@ def destroy_global_state():
     destroy_model_parallel()
     destroy_rerun_state_machine()
 
-
-def print_datetime(string, override_timestamp=None):
-    """Note that this call will sync across all ranks. Use override_timestamp if provided;
-       otherwise use current timestamp."""
-    torch.distributed.barrier()
-    if override_timestamp is None:
-        time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
-    else:
-        time_str = datetime.fromtimestamp(override_timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')
-    print_rank_0(f'[{string}] datetime: {time_str} ')
 
 # Per-iteration packed-sequence (THD) accumulator. The tensor holds TWO stats,
 # both computed from the REAL ``cu_seqlens`` (i.e. unpadded sub-sequence lengths
