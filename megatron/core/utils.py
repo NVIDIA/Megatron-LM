@@ -2061,6 +2061,7 @@ def get_batch_on_this_tp_rank(
                 _broadcast(cu_seqlens)
 
         if is_hybrid_cp:
+            #TODO (pmannan): tokens seq len might be on dim 0, check
             hybrid_cp_seq_length = torch.tensor(
                 batch['tokens'].shape[1], dtype=torch.int32, device=torch.cuda.current_device()
             )
@@ -2128,6 +2129,7 @@ def get_batch_on_this_tp_rank(
                 0, dtype=torch.int32, device=torch.cuda.current_device()
             )
             _broadcast(hybrid_cp_seq_length)
+            # TODO (pmannan): Is the shape including micro_batch_size or do we need to do the collate fn style stacking before calling this function?
             shape = (micro_batch_size, hybrid_cp_seq_length.item())
         else:
             shape = (micro_batch_size, seq_length)
@@ -2408,7 +2410,7 @@ def get_batch_on_this_cp_rank(
             ), "local_cp_size is required for hybrid context parallel"
             if batch['local_cp_size'].item() > 1:
                 hybrid_cp_group = hybrid_cp_group_func(group_size=batch['local_cp_size'].item())
-                batch = get_pretrain_batch_on_this_cp_rank(batch, cp_group=hybrid_cp_group)
+                batch = get_sft_batch_on_this_cp_rank(batch, cp_group=hybrid_cp_group)
                 batch["hybrid_cp_group"] = hybrid_cp_group
         else:
             batch = get_sft_batch_on_this_cp_rank(batch, cp_group=cp_group)
