@@ -148,8 +148,17 @@ def setup(
     start_time_tensor = torch.tensor([state.start_time], dtype=torch.double, device="cuda")
     torch.distributed.all_reduce(start_time_tensor, op=torch.distributed.ReduceOp.MIN)
     state.start_time = start_time_tensor.item()
+    if "legacy_train_start_time" in state.startup_timestamps:
+        # Print basic megatron init time (using global min start)
+        # NOTE(asolergi-nv): This is not entirely accurate, but we keep it for backwards compatibility.
+        ts = state.startup_timestamps["legacy_train_start_time"]
+        start_time_tensor = torch.tensor([ts], dtype=torch.double, device="cuda")
+        torch.distributed.all_reduce(start_time_tensor, op=torch.distributed.ReduceOp.MIN)
+        start_time_to_log = start_time_tensor.item()
+    else:
+        start_time_to_log = state.start_time
 
-    print_rank_0("time to initialize megatron (seconds): {:.3f}".format(time.time() - state.start_time))
+    print_rank_0("time to initialize megatron (seconds): {:.3f}".format(time.time() - start_time_to_log))
     barrier_and_log("after megatron is initialized")
 
     # Tokenizer

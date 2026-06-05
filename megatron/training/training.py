@@ -1128,15 +1128,6 @@ def pretrain(
     app_metrics['app_start_time'] = round(program_start_global * 1000.0)
     app_metrics['app_model_init_start_time'] = round(program_start_global * 1000.0)
 
-    # Print basic megatron init time (using global min start)
-    # NOTE(asolergi-nv): This is not entirely accurate, but we keep it for backwards compatibility.
-    start_time_tensor = torch.tensor([_LEGACY_TRAIN_START_TIME], dtype=torch.double, device='cuda')
-    torch.distributed.all_reduce(start_time_tensor, op=torch.distributed.ReduceOp.MIN)
-    legacy_train_start_time = start_time_tensor.item()
-    print_rank_0(
-        'time to initialize megatron (seconds): {:.3f}'.format(megatron_init_end - legacy_train_start_time)
-    )
-
     # Note, not entirely accurate as rank 0 might not be the first or last to hit these timestamps
     print_datetime('after in-process setup and before initialize_megatron', timestamp_after_inprocess_setup)
     print_datetime('after in-job setup and before initialize_megatron', timestamp_after_in_job_setup)
