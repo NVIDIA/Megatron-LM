@@ -3924,27 +3924,12 @@ def evaluate(
                     val = [x[key].view(-1) for x in loss_dicts]
 
                     if val[0].numel() == 2:
-                        if args.sft:
-                            # normalize over micro batch instead of global
-                            val = torch.vstack(val)
-                            val = val[:, 0] / val[:, 1].clamp(min=1)
-                            val = val.mean()
-                            torch.distributed.all_reduce(
-                                val,
-                                group=mpu.get_data_parallel_group(with_context_parallel=True)
-                            )
-                            val /= torch.distributed.get_world_size(
-                                group=mpu.get_data_parallel_group(with_context_parallel=True)
-                            )
-                            total_loss_dict[key][0] += val
-                            total_loss_dict[key][1] += 1
-                        else :
-                            val = torch.vstack(val).sum(dim=0)
-                            torch.distributed.all_reduce(
-                                val,
-                                group=mpu.get_data_parallel_group(with_context_parallel=True)
-                            )
-                            total_loss_dict[key] += val
+                        val = torch.vstack(val).sum(dim=0)
+                        torch.distributed.all_reduce(
+                            val,
+                            group=mpu.get_data_parallel_group(with_context_parallel=True)
+                        )
+                        total_loss_dict[key] += val
                     elif val[0].numel() == 1:
                         val = torch.cat(val).sum()
                         total_loss_dict[key][0] += val
