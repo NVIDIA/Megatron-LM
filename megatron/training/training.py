@@ -187,6 +187,7 @@ from .utils import (
     to_empty_if_meta_device,
     update_use_dist_ckpt,
 )
+from megatron.training.utils.log_utils import barrier_and_log as print_datetime
 
 # Optional dependencies. Each is guarded so the module imports cleanly when the
 # dependency is unavailable; the ``has_*``/``HAVE_*`` flags gate later usage.
@@ -284,15 +285,6 @@ def destroy_global_state():
     destroy_rerun_state_machine()
 
 
-def print_datetime(string, override_timestamp=None):
-    """Note that this call will sync across all ranks. Use override_timestamp if provided;
-       otherwise use current timestamp."""
-    torch.distributed.barrier()
-    if override_timestamp is None:
-        time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
-    else:
-        time_str = datetime.fromtimestamp(override_timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')
-    print_rank_0(f'[{string}] datetime: {time_str} ')
 
 
 def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
