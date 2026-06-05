@@ -16,9 +16,11 @@ Compared to :class:`SFTDataset`, this dataset adds:
     files; the latter are read via pandas to sidestep pyarrow's per-chunk
     JSON schema inference which fails when sample fields vary across rows.
 
-  * **Auto schema detection** — three common instruction-tuning layouts are
-    auto-detected by column name and normalized to the messages list format
-    expected by the parent ``SFTDataset.__getitem__``:
+  * **Auto schema detection** — four input layouts are auto-detected by column
+    name. The three instruction-tuning layouts are normalized to the messages
+    list format expected by the parent ``SFTDataset.__getitem__``; the
+    ``pretrain-text`` fallback instead returns a raw string handled separately
+    in :meth:`VarlenDataset.__getitem__`:
 
       * **openai-messages** — column ``messages`` (Llama post-training,
         HuggingFaceH4/no_robots, ...)
@@ -27,6 +29,8 @@ Compared to :class:`SFTDataset`, this dataset adds:
         ``instruction|prompt|query|question`` + one of
         ``output|response|completion|answer``, plus optional context field
         ``input|context``.
+      * **pretrain-text** — column ``text``; returns the raw string (no
+        messages list, no role masking), tokenized as plain pretraining text.
 
   * **Mock variant** — :class:`MockVarlenDataset` mirrors
     :class:`MockSFTDataset` end-to-end (synthetic lognormal sequence-length
@@ -253,8 +257,10 @@ class VarlenLowLevelDataset(SFTLowLevelDataset):
         chunk and fails with ``CastError`` when the union of fields varies
         between rows (e.g. LongAlpaca-12k).
 
-    A sample->messages converter is selected once at construction time based
-    on column names and applied per-sample at access time.
+    A per-sample converter is selected once at construction time based on
+    column names and applied at access time. The instruction-tuning schemas
+    convert to a messages list; the ``pretrain-text`` fallback returns the raw
+    string instead.
     """
 
     def __init__(self, dataset_path: str) -> None:
@@ -289,7 +295,8 @@ class VarlenLowLevelDataset(SFTLowLevelDataset):
 
     @property
     def schema_name(self) -> str:
-        """Detected schema name: ``alpaca`` / ``sharegpt`` / ``openai-messages``."""
+        """Detected schema name: ``alpaca`` / ``sharegpt`` / ``openai-messages`` /
+        ``pretrain-text`` (the raw ``text``-column fallback)."""
         return self._schema_name
 
     def __len__(self) -> int:
@@ -376,6 +383,15 @@ class VarlenDataset(SFTDataset):
             tokens_list = tokens.tolist()
             targets_list = targets.tolist()
 
+        # 2b. Guard against an empty tokenization (e.g. a blank ``pretrain-text``
+        #     row where ``tokenizer.tokenize("")`` returns no ids). Represent it
+        #     as a single end-of-document token so the next-token shift still
+        #     yields a valid 1-token sample instead of raising on
+        #     ``tokens_list[-1]`` below or producing a zero-length sequence.
+        if len(tokens_list) == 0:
+            tokens_list = [eod, eod]
+            targets_list = [eod, eod]
+
         # 3. Right-truncate to ``sequence_length + 1`` (we drop the last token
         #    after the input/label shift below). Keep an EOD at the end so a
         #    truncated assistant turn still has a valid stop token.
@@ -391,6 +407,8 @@ class VarlenDataset(SFTDataset):
             tokens_list.append(eod)
             targets_list.append(eod)
 
+        valid_len = len(tokens_list) - 1
+
         # 5a. BSHD validation mode: right-pad to sequence_length + 1, drop
         #     packing metadata, return shape [sequence_length]. Useful as a
         #     numerical reference for THD path verification (no scheduler,
@@ -404,7 +422,7 @@ class VarlenDataset(SFTDataset):
             input_ids = torch.tensor(tokens_list[:-1], dtype=torch.int64)
             labels = torch.tensor(targets_list[1:], dtype=torch.int64)
             loss_mask = torch.ones(max_len, dtype=torch.float32)
-            loss_mask[labels == pad] = 0.0
+            loss_mask[valid_len:] = 0.0  # mask the right-padded tail by position
             loss_mask[labels == IGNORE_INDEX] = 0.0
             return {
                 'tokens': input_ids,
@@ -433,7 +451,7 @@ class VarlenDataset(SFTDataset):
         labels = torch.tensor(targets_list[1:], dtype=torch.int64)
         position_ids = torch.arange(padded_seq_len, dtype=torch.int64)
         loss_mask = torch.ones(padded_seq_len, dtype=torch.float32)
-        loss_mask[labels == pad] = 0.0
+        loss_mask[valid_len:] = 0.0  # mask the right-padded tail by position
         loss_mask[labels == IGNORE_INDEX] = 0.0
 
         return {
@@ -463,9 +481,9 @@ class MockVarlenDataset(MockSFTDataset):
       * THD mode: emits **one unpacked sample** padded to ``pad_granularity``
         with ``original_seq_len`` / ``padded_seq_len`` tensors. The upstream
         scheduler packs across the DP×CP grid.
-      * BSHD validation mode (``--varlen-bshd-validation``): right-pads to
-        ``sequence_length`` with no packing metadata, for THD numerical
-        verification against a non-packed reference run.
+
+    ``--varlen-bshd-validation`` is intentionally not implemented for mock
+    data; it is guarded against in argument validation.
     """
 
     @staticmethod
@@ -489,7 +507,7 @@ class MockVarlenDataset(MockSFTDataset):
         tokenizer = self.config.tokenizer
         max_len = self.config.sequence_length
         eod = tokenizer.eod
-        pad = tokenizer.pad
+        pad = tokenizer.pad if tokenizer.pad is not None else eod
 
         # MockSFTLowLevelDataset returns ``length - 1`` token ids; append EOD
         # to make the conversation end on a stop token, mirroring the real
@@ -500,27 +518,9 @@ class MockVarlenDataset(MockSFTDataset):
         # Mock data uses ``tokens == targets`` (no role masking).
         targets_list = list(tokens_list)
 
-        # BSHD validation mode: pad to sequence_length + 1, no packing meta.
-        if self.config.varlen_bshd_validation:
-            if len(tokens_list) > max_len + 1:
-                tokens_list = tokens_list[: max_len - 1] + [eod]
-                targets_list = targets_list[: max_len - 1] + [eod]
-            pad_len = max_len + 1 - len(tokens_list)
-            if pad_len > 0:
-                tokens_list.extend([pad] * pad_len)
-                targets_list.extend([pad] * pad_len)
-            assert len(tokens_list) == max_len + 1
-            input_ids = torch.tensor(tokens_list[:-1], dtype=torch.int64)
-            labels = torch.tensor(targets_list[1:], dtype=torch.int64)
-            loss_mask = torch.ones(max_len, dtype=torch.float32)
-            loss_mask[labels == pad] = 0.0
-            return {
-                'tokens': input_ids,
-                'labels': labels,
-                'loss_mask': loss_mask,
-                'position_ids': torch.arange(max_len, dtype=torch.int64),
-            }
-
+        # MockVarlenDataset only implements the THD (packed) path; BSHD
+        # validation is a real-data numerical-reference mode (guarded against
+        # --mock-data in validate_args).
         # THD mode: unpacked single sample, pad to pad_granularity only.
         if len(tokens_list) > max_len + 1:
             tokens_list = tokens_list[: max_len - 1] + [eod]
@@ -538,7 +538,7 @@ class MockVarlenDataset(MockSFTDataset):
         input_ids = torch.tensor(tokens_list[:-1], dtype=torch.int64)
         labels = torch.tensor(targets_list[1:], dtype=torch.int64)
         loss_mask = torch.ones(padded_seq_len, dtype=torch.float32)
-        loss_mask[labels == pad] = 0.0
+        loss_mask[original_seq_len:] = 0.0  # mask the right-padded tail by position
         return {
             'tokens': input_ids,
             'labels': labels,

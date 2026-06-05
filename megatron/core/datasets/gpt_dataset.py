@@ -77,6 +77,7 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     """The size of the context parallel group. Needed for padding in packed sequences."""
 
     sft_mock_dataset_config_json: Optional[str] = None
+    """This config provides the necessary information for the mock dataset."""
 
     varlen_mock_dataset_config_json: Optional[str] = None
     """Mock-dataset config (same JSON schema as ``sft_mock_dataset_config_json``)
@@ -89,7 +90,6 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     ``padded_seq_len``), bypassing the packed-sequence path. Used to obtain a
     BSHD reference run that mirrors the THD path's tokenization but skips all
     packing — useful for THD numerical-correctness validation."""
-    """This config provides the necessary information for the mock dataset."""
 
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""

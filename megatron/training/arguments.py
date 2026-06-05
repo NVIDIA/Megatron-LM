@@ -1555,16 +1555,6 @@ def validate_args(args, defaults={}):
             f"to {args.data_parallel_size * args.context_parallel_size}."
         )
 
-    if args.sequence_packing_scheduler is not None:
-        if args.sequence_packing_scheduler == 'dp_balanced':
-            total_cp_ranks = args.context_parallel_size
-        else:
-            total_cp_ranks = args.data_parallel_size * args.context_parallel_size
-        assert total_cp_ranks * args.max_seqlen_per_dp_cp_rank >= args.seq_length, (
-            f'Packed sequence buffer size ({total_cp_ranks * args.max_seqlen_per_dp_cp_rank}) '
-            f'must be >= single sequence max length ({args.seq_length})'
-        )
-
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled
     if (
@@ -1710,6 +1700,12 @@ def validate_args(args, defaults={}):
                 "--varlen-bshd-validation does not use a sequence packing "
                 "scheduler; drop --sequence-packing-scheduler."
             )
+            # BSHD validation is a real-data numerical-reference path only;
+            # MockVarlenDataset does not implement it.
+            assert not args.mock_data, (
+                "--varlen-bshd-validation is not supported with --mock-data; "
+                "BSHD validation requires a real dataset."
+            )
         else:
             # VarlenDataset emits one unpacked sample per __getitem__; it
             # relies on an upstream packing scheduler to group variable-length
@@ -1721,6 +1717,20 @@ def validate_args(args, defaults={}):
             #   * Otherwise fall back to ``dp_balanced`` (static packing).
             if args.sequence_packing_scheduler is None:
                 args.sequence_packing_scheduler = 'dp_balanced'
+
+    # Packed-sequence buffer-size check. Placed after all scheduler auto-select
+    # logic (dynamic-cp and --use-varlen-dataset both set the scheduler above)
+    # so it validates the final resolved scheduler; the varlen path picks its
+    # default after the earlier generic validation has run.
+    if args.sequence_packing_scheduler is not None:
+        if args.sequence_packing_scheduler == 'dp_balanced':
+            total_cp_ranks = args.context_parallel_size
+        else:
+            total_cp_ranks = args.data_parallel_size * args.context_parallel_size
+        assert total_cp_ranks * args.max_seqlen_per_dp_cp_rank >= args.seq_length, (
+            f'Packed sequence buffer size ({total_cp_ranks * args.max_seqlen_per_dp_cp_rank}) '
+            f'must be >= single sequence max length ({args.seq_length})'
+        )
 
     # Data blend checks
     assert (
