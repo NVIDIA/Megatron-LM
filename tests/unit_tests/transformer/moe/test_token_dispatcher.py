@@ -1,6 +1,5 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-import copy
 import dataclasses
 
 import pytest
@@ -8,8 +7,9 @@ import torch
 
 from megatron.core import config, parallel_state
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
-from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import get_capacity
+from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import is_te_min_version
@@ -93,17 +93,22 @@ class MoEModelTestContainer:
             add_bias_linear=kwargs.get("add_bias_linear", False),
             moe_permute_fusion=kwargs.get("moe_permute_fusion", False),
             moe_flex_dispatcher_backend=kwargs.get("moe_flex_dispatcher_backend", None),
+            calculate_per_token_loss=kwargs.get("calculate_per_token_loss", False),
         )
 
         # init moe layer
         self.moe_layer = self.new_moe_layer()
 
     def new_moe_layer(self, **kargs):
-        submodules = get_gpt_layer_local_submodules(
-            num_experts=self.config.num_moe_experts, moe_grouped_gemm=self.config.moe_grouped_gemm
+        submodules = get_submodules(
+            get_gpt_layer_local_submodules(
+                num_experts=self.config.num_moe_experts,
+                moe_grouped_gemm=self.config.moe_grouped_gemm,
+            ).mlp
         )
+        assert isinstance(submodules, MoESubmodules)
         new_config = dataclasses.replace(self.config, **kargs)
-        moe_layer = MoELayer(new_config, submodules.mlp.submodules).cuda().to(dtype=self.test_dtype)
+        moe_layer = MoELayer(new_config, submodules).cuda().to(dtype=self.test_dtype)
         moe_layer.set_layer_number(0)
         return moe_layer
 

@@ -36,7 +36,6 @@ from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
     scatter_to_sequence_parallel_region,
 )
-from megatron.core.transformer.enums import CudaGraphScope
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.transformer.utils import set_model_to_sequence_parallel
@@ -105,8 +104,20 @@ class TextGenerationController:
             self.vocab_size = unwrapped_model.vocab_size
 
         self.sampling_rng = torch.Generator(device=torch.cuda.current_device())
-        self.num_mtp_heads = self._get_mtp_num_heads()
         self.sampling_rng.manual_seed(self.model_config.inference_sampling_seed)
+
+        if not self.num_speculative_tokens:
+            self.num_mtp_depths = 0
+        else:
+            assert (
+                self.model_config.mtp_num_layers and self.model_config.mtp_num_layers >= 1
+            ), "mtp_num_layers must be >= 1 when num_speculative_tokens > 0"
+            if self.model_config.mtp_use_repeated_layer:
+                self.num_mtp_depths = self.num_speculative_tokens
+            else:
+                self.num_mtp_depths = min(
+                    self.num_speculative_tokens, self.model_config.mtp_num_layers
+                )
 
         if (
             self.model_config.cuda_graph_impl == "local"
@@ -120,13 +131,6 @@ class TextGenerationController:
 
         if self.inference_wrapped_model.inference_context.is_dynamic_batching():
             self._init_dynamic_sampling_tensors()
-
-    def _get_mtp_num_heads(self) -> int:
-        """Get the number of MTP layers from the model config."""
-        model = self.inference_wrapped_model.model
-        if hasattr(model, 'config') and hasattr(model.config, 'mtp_num_layers'):
-            return model.config.mtp_num_layers or 0
-        return 0
 
     def set_stop_word_finished_ids_callback(self, callback):
         """Set a callback to get request IDs that should be marked as finished due to stop words.
@@ -222,7 +226,6 @@ class TextGenerationController:
             max_requests, dtype=torch.int64, device=device
         )
         self._last_accepted_seq_indices = None
-        self._num_mtp_depths = min(self.num_speculative_tokens, self.num_mtp_heads)
         self._mtp_token_ids_buf = torch.empty([1, max_requests], dtype=torch.int64, device=device)
         self._mtp_position_ids_buf = torch.empty(
             [1, max_requests], dtype=torch.int64, device=device
@@ -836,7 +839,7 @@ class TextGenerationController:
         position_ids_buf[0, active_request_count:] = 0
 
         nvtx_range_pop("mtp-spec-decoding/serial-mtp-init")
-        for depth in range(self._num_mtp_depths):
+        for depth in range(self.num_mtp_depths):
             nvtx_range_push(f"mtp-spec-decoding/depth-{depth}")
 
             token_ids_buf[0, :active_request_count] = next_token_ids
@@ -1507,7 +1510,7 @@ class TextGenerationController:
         - When PP > 1: participate in the ``broadcast_from_last_pipeline_stage``
           that the real ranks also perform.
         """
-        if self.num_speculative_tokens == 0 or self.num_mtp_heads == 0:
+        if self.num_speculative_tokens == 0 or self.num_mtp_depths == 0:
             return
         if self.model_config.expert_model_parallel_size <= 1:
             return
@@ -1548,7 +1551,7 @@ class TextGenerationController:
 
         context = self.inference_wrapped_model.inference_context
 
-        for depth in range(self._num_mtp_depths):
+        for depth in range(self.num_mtp_depths):
             nvtx_range_push(f"mtp-spec-decoding/dummy-depth-{depth}")
             mtp_logits_2d = None
             if has_mtp:
@@ -1805,6 +1808,14 @@ class TextGenerationController:
                         )
             range_pop()
 
+            # Capture before update_requests (called by _dynamic_step_context_bookkeeping)
+            # resets num_prefill_requests to 0, which would make num_decode_requests
+            # always equal to the full active count.
+            num_decode_requests = context.num_decode_requests
+            if self.num_speculative_tokens > 0:
+                # Prefill-only batches must not have any accepted speculative tokens.
+                assert num_decode_requests > 0 or (self._accepted_tokens_per_request == -1).all()
+
             if skip_bookkeeping:
                 # _transfer_samples_to_cpu wasn't invoked on this path, so do
                 # a one-shot D2H here to keep "sample" as a CPU tensor for
@@ -1819,9 +1830,9 @@ class TextGenerationController:
 
             ret = {
                 "accepted_tokens": (
-                    # Clone needed: .fill_(-1) on line 1480 would corrupt the returned value.
+                    # Clone needed: .fill_(-1) below would corrupt the returned value.
                     self._accepted_tokens_per_request.clone()
-                    if self.num_speculative_tokens > 0
+                    if self.num_speculative_tokens > 0 and num_decode_requests > 0
                     else None
                 ),
                 "log_probs": log_probs,
@@ -1922,10 +1933,7 @@ class TextGenerationController:
         )
 
         # Check whether CUDA graphs are enabled
-        enable_cuda_graph = (
-            model_config.cuda_graph_impl == "local"
-            and CudaGraphScope.full_iteration not in model_config.cuda_graph_scope
-        )
+        enable_cuda_graph = model_config.cuda_graph_impl == "local"
 
         # Pad batch tokens if necessary
         batch_size = len(active_requests)
