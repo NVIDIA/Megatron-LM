@@ -9,31 +9,6 @@ from megatron.training.config.container import PretrainConfigContainer
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
 
-# Startup timestamps for tracking program initialization phases
-_STARTUP_TIMESTAMPS = {
-    'program_start': None,  # Set by entry script before imports
-    'main_entry': None,     # Set by entry script at start of __main__
-    'pretrain_entry': None, # Set at top of pretrain()
-}
-
-
-def set_startup_timestamps(program_start=None, main_entry=None):
-    """Set startup timestamps from the entry script.
-
-    Call this after imports but before calling pretrain() to register
-    the program start time and main entry time.
-
-    Args:
-        program_start: Timestamp captured at very start of program, before any imports.
-        main_entry: Timestamp captured right after entering __main__ block.
-    """
-    global _TRAIN_START_TIME, _STARTUP_TIMESTAMPS
-    if program_start is not None:
-        _TRAIN_START_TIME = program_start
-        _STARTUP_TIMESTAMPS['program_start'] = program_start
-    if main_entry is not None:
-        _STARTUP_TIMESTAMPS['main_entry'] = main_entry
-
 
 import copy
 import dataclasses
@@ -1029,6 +1004,7 @@ def pretrain(
     non_loss_data_func=None,
     store=None,
     inprocess_call_wrapper: Optional[Any] = None,
+    startup_timestamps: dict[str, float | None] = {},
 ):
     """Main training program.
 
@@ -1071,10 +1047,23 @@ def pretrain(
             torch.distributed.init_process_group
         inprocess_call_wrapper: an optional instance of inprocess.CallWrapper,
             it is automatically injected when in-process restart is in use
+        startup_timestamps: timestamps of startup events before this function
+            is called. 'program_start' and 'main_entry' times will be 
+            automatically logged if provided.
     """
     # Capture timestamp right at top of pretrain, before initialize_megatron
-    global _STARTUP_TIMESTAMPS
-    _STARTUP_TIMESTAMPS['pretrain_entry'] = time.time()
+    startup_timestamps["pretrain_entry"] = time.time()
+    startup_timestamps["program_start_local"] = startup_timestamps.get("program_start", _TRAIN_START_TIME)
+
+    # Initialize program_start_global with a fallback value in case set_startup_timestamps() wasn't called
+    program_start_global = _TRAIN_START_TIME
+    if "program_start" in startup_timestamps:
+        program_start_global = torch.tensor([startup_timestamps["program_start"]], dtype=torch.double, device='cuda')
+        torch.distributed.all_reduce(program_start_global, op=torch.distributed.ReduceOp.MIN)
+        program_start_global = program_start_global.item()
+    startup_timestamps["program_start"] = program_start_global
+    global _TRAIN_START_TIME    # TODO (@maanug): replace all accesses with GlobalState start_time
+    _TRAIN_START_TIME = program_start_global
 
     if inprocess_call_wrapper is not None:
         iteration = inprocess_call_wrapper.iteration
@@ -1115,22 +1104,9 @@ def pretrain(
     # Adjust the startup time so it reflects the global minimum.
     # This will be closer to what scheduler will see (outside of
     # image ... launches).
-    program_start = _STARTUP_TIMESTAMPS.get('program_start')
-    main_entry = _STARTUP_TIMESTAMPS.get('main_entry')
-    pretrain_entry = _STARTUP_TIMESTAMPS.get('pretrain_entry')
-
-    # Initialize program_start_global with a fallback value in case set_startup_timestamps() wasn't called
-    program_start_global = _TRAIN_START_TIME
-    if _STARTUP_TIMESTAMPS['program_start'] is not None:
-        program_start_global = torch.tensor([_STARTUP_TIMESTAMPS['program_start']], dtype=torch.double, device='cuda')
-        torch.distributed.all_reduce(program_start_global, op=torch.distributed.ReduceOp.MIN)
-        program_start_global = program_start_global.item()
-    set_startup_timestamps(program_start=program_start_global)
-
-    global _LEGACY_TRAIN_START_TIME
-    start_time_tensor = torch.tensor([_LEGACY_TRAIN_START_TIME], dtype=torch.double, device='cuda')
-    torch.distributed.all_reduce(start_time_tensor, op=torch.distributed.ReduceOp.MIN)
-    _LEGACY_TRAIN_START_TIME = start_time_tensor.item()
+    program_start = startup_timestamps.get("program_start")
+    main_entry = startup_timestamps.get("main_entry")
+    pretrain_entry = startup_timestamps.get("pretrain_entry")
 
     # Capture megatron init end time (matches original time.time() placement)
     megatron_init_end = time.time()
@@ -1141,8 +1117,11 @@ def pretrain(
 
     # Print basic megatron init time (using global min start)
     # NOTE(asolergi-nv): This is not entirely accurate, but we keep it for backwards compatibility.
+    start_time_tensor = torch.tensor([_LEGACY_TRAIN_START_TIME], dtype=torch.double, device='cuda')
+    torch.distributed.all_reduce(start_time_tensor, op=torch.distributed.ReduceOp.MIN)
+    legacy_train_start_time = start_time_tensor.item()
     print_rank_0(
-        'time to initialize megatron (seconds): {:.3f}'.format(megatron_init_end - _LEGACY_TRAIN_START_TIME)
+        'time to initialize megatron (seconds): {:.3f}'.format(megatron_init_end - legacy_train_start_time)
     )
 
     # Note, not entirely accurate as rank 0 might not be the first or last to hit these timestamps
@@ -1168,12 +1147,12 @@ def pretrain(
         timers.log(list(startup_timers.keys()), barrier=True)
 
         # Print rank 0's absolute timestamps
-        startup_timestamps = {
+        timestamps = {
             'before library-setup': program_start,
             'after library-setup': main_entry,
             'before megatron-init': pretrain_entry,
         }
-        for name, ts in startup_timestamps.items():
+        for name, ts in timestamps.items():
             ts_str = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S.%f')
             print_rank_0(f'[{name}] datetime: {ts_str}')
 

@@ -336,7 +336,11 @@ if __name__ == "__main__":
     _MAIN_ENTRY_TIME = time.time()
 
     # Register startup timestamps for timing report in pretrain()
-    set_startup_timestamps(program_start=_PROGRAM_START_TIME, main_entry=_MAIN_ENTRY_TIME)
+    startup_timestamps = {
+        "program_start": _PROGRAM_START_TIME,
+        "main_entry": _MAIN_ENTRY_TIME,
+    }
+    # set_startup_timestamps(program_start=_PROGRAM_START_TIME, main_entry=_MAIN_ENTRY_TIME)
 
     # Temporary for transition to core datasets
     setattr(train_valid_test_datasets_provider, "is_distributed", True)
@@ -355,4 +359,5 @@ if __name__ == "__main__":
              ModelType.encoder_or_decoder,
              forward_step,
              store=store,
+             startup_timestamps=startup_timestamps,
              )
