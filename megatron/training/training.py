@@ -2655,11 +2655,18 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         for key in losses_reduced[0].keys():
             val = [x[key].view(-1) for x in losses_reduced]
             if val[0].numel() == 2:
-                # there is one dict per microbatch. in new reporting, we average
-                # over the total number of tokens across the global batch.
+                # There is one dict per microbatch. Average over the total
+                # number of tokens across the global batch. This keeps SFT loss
+                # logging comparable to non-SFT and avoids biasing packed SFT
+                # toward microbatches with fewer trainable tokens.
                 val = torch.vstack(val).sum(dim=0)
                 torch.distributed.all_reduce(val, group=dp_cp_group)
-                loss_reduced[key] = val[0] / val[1]
+                denominator = torch.clamp(val[1], min=1.0)
+                loss_reduced[key] = torch.where(
+                    val[1] > 0,
+                    val[0] / denominator,
+                    torch.zeros_like(val[0]),
+                )
             elif val[0].numel() == 1:
                 # legacy behavior, we average over the number of microbatches
                 val = torch.cat(val).mean()
