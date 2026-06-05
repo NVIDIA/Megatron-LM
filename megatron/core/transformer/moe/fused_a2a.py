@@ -5,6 +5,10 @@
 
 from megatron.core.utils import internal_api
 
+import torch
+
+from megatron.core.transformer.moe.fused_a2a_config import FusedA2AConfig
+
 try:
     from deep_ep import Buffer
     from deep_ep.utils import EventHandle, EventOverlap
@@ -13,10 +17,6 @@ try:
     HAVE_DEEP_EP = True
 except ImportError:
     HAVE_DEEP_EP = False
-
-import torch
-
-from megatron.core.transformer.moe.fused_a2a_config import FusedA2AConfig
 
 _buffer = None
 
@@ -69,49 +69,54 @@ def get_buffer(group: torch.distributed.ProcessGroup, hidden_bytes: int):
     return _buffer
 
 
-def _build_deepep_config(default_config, fused_a2a_cfg):
-    """Build a DeepEP Config from a default config and user overrides in FusedA2AConfig.
+if HAVE_DEEP_EP:
 
-    Starts from the hardware-appropriate default (e.g. Buffer.get_dispatch_config) and
-    overrides only the fields the user explicitly set.  Returns the default unchanged when
-    no overrides are needed, avoiding any unnecessary object allocation on the hot path.
+    def _build_deepep_config(default_config, fused_a2a_cfg):
+        """Build a DeepEP Config from a default config and user overrides in FusedA2AConfig.
 
-    Args:
-        default_config: Config returned by Buffer.get_dispatch_config() or
-                        Buffer.get_combine_config() — hardware-tuned baseline.
-        fused_a2a_cfg:  FusedA2AConfig with optional user overrides, or None.
+        Starts from the hardware-appropriate default (e.g. Buffer.get_dispatch_config) and
+        overrides only the fields the user explicitly set.  Returns the default unchanged
+        when no overrides are needed, avoiding any object allocation on the hot path.
 
-    Returns:
-        A DeepEP Config (possibly the original default_config if nothing was overridden).
+        Args:
+            default_config: Config returned by Buffer.get_dispatch_config() or
+                            Buffer.get_combine_config() — hardware-tuned baseline.
+            fused_a2a_cfg:  FusedA2AConfig with optional user overrides, or None.
 
-    Note:
-        chunk_size maps to num_max_nvl_chunked_send_tokens.  The DeepEP assertion
-        requires chunk_size < num_max_nvl_chunked_recv_tokens (default 256), so
-        values >= 256 will raise inside the DeepEP C++ constructor.
-    """
-    if fused_a2a_cfg is None:
-        return default_config
-    if fused_a2a_cfg.num_sms is None and fused_a2a_cfg.chunk_size is None:
-        return default_config
-    num_sms = (
-        fused_a2a_cfg.num_sms
-        if fused_a2a_cfg.num_sms is not None
-        else default_config.num_sms
-    )
-    chunk_size = (
-        fused_a2a_cfg.chunk_size
-        if fused_a2a_cfg.chunk_size is not None
-        else default_config.num_max_nvl_chunked_send_tokens
-    )
-    # Build a new Config preserving all RDMA / buffer-size params from the default.
-    # DeepEPConfig == deep_ep_cpp.Config; only available when HAVE_DEEP_EP=True.
-    return DeepEPConfig(  # noqa: F821
-        num_sms,
-        chunk_size,
-        default_config.num_max_nvl_chunked_recv_tokens,
-        default_config.num_max_rdma_chunked_send_tokens,
-        default_config.num_max_rdma_chunked_recv_tokens,
-    )
+        Returns:
+            A DeepEP Config (possibly the original default_config if nothing was overridden).
+
+        Note:
+            chunk_size maps to num_max_nvl_chunked_send_tokens.  The DeepEP C++ assertion
+            requires chunk_size < num_max_nvl_chunked_recv_tokens (default 256), so
+            values >= 256 will raise inside the DeepEP C++ constructor.
+        """
+        if fused_a2a_cfg is None:
+            return default_config
+        if fused_a2a_cfg.num_sms is None and fused_a2a_cfg.chunk_size is None:
+            return default_config
+        num_sms = (
+            fused_a2a_cfg.num_sms
+            if fused_a2a_cfg.num_sms is not None
+            else default_config.num_sms
+        )
+        chunk_size = (
+            fused_a2a_cfg.chunk_size
+            if fused_a2a_cfg.chunk_size is not None
+            else default_config.num_max_nvl_chunked_send_tokens
+        )
+        # Build a new Config preserving all RDMA / buffer-size params from the default.
+        # DeepEPConfig == deep_ep_cpp.Config, guaranteed available here (HAVE_DEEP_EP=True).
+        return DeepEPConfig(
+            num_sms,
+            chunk_size,
+            default_config.num_max_nvl_chunked_recv_tokens,
+            default_config.num_max_rdma_chunked_send_tokens,
+            default_config.num_max_rdma_chunked_recv_tokens,
+        )
+
+else:
+    _build_deepep_config = None
 
 
 class FusedDispatch(torch.autograd.Function):
