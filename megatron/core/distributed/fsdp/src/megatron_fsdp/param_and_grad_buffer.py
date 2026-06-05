@@ -924,9 +924,7 @@ class DataParallelBuffer:
 
         # Count all parameters in this buffer and store their enumerated index.
         self.param_idx = {p: i for i, p in enumerate(self.params)}
-        self.cache_param_bucket_views = (
-            ddp_config.megatron_fsdp_prefetch_recompute_forward_weights
-        )
+        self.cache_param_bucket_views = ddp_config.megatron_fsdp_prefetch_recompute_forward_weights
         self._param_bucket_view_cache = {}
 
     def init_data(self, data: torch.Tensor):
