@@ -24,9 +24,8 @@ class NVSHMEMCopyService(CopyService):
     def __init__(self, group=None):
         if not dist.is_initialized():
             raise RuntimeError("torch.distributed must be initialized before NVSHMEMCopyService()")
+        super().__init__(group=group)
 
-        self._group = group
-        self.rank = group.rank() if group is not None else dist.get_rank()
         self._remote = RemoteCopyService(group=group)
         # Lazily initialized on first use to avoid side effects at import time
         self._initialized = False
@@ -39,6 +38,11 @@ class NVSHMEMCopyService(CopyService):
 
         logger.info("NVSHMEMCopyService constructed")
 
+    def close(self) -> None:
+        if self._initialized:
+            self._remote.finalize()
+            self._initialized = False
+
     def _ensure_initialized(self):
         if not self._initialized:
             self._remote.init(log_level="INFO")
@@ -50,7 +54,7 @@ class NVSHMEMCopyService(CopyService):
     def submit_send(self, src_tensor: torch.Tensor, dest_rank: int, task_id: Optional[int] = None):
         if task_id is None:
             raise RuntimeError(
-                "NVSHMEMCopyService requires a task_id for every transfer; " "got task_id=None"
+                "NVSHMEMCopyService requires a task_id for every transfer; got task_id=None"
             )
         self._ensure_initialized()
 
@@ -80,7 +84,7 @@ class NVSHMEMCopyService(CopyService):
     def submit_recv(self, dest_tensor: torch.Tensor, src_rank: int, task_id: Optional[int] = None):
         if task_id is None:
             raise RuntimeError(
-                "NVSHMEMCopyService requires a task_id for every transfer; " "got task_id=None"
+                "NVSHMEMCopyService requires a task_id for every transfer; got task_id=None"
             )
         self._ensure_initialized()
 
@@ -141,7 +145,6 @@ class NVSHMEMCopyService(CopyService):
                             )
                         dst.copy_(src, non_blocking=True)
 
-            torch.cuda.current_stream().wait_stream(self._local_copy_stream)
             self._local_send_ops.clear()
             self._local_recv_ops.clear()
 
@@ -151,8 +154,13 @@ class NVSHMEMCopyService(CopyService):
         #  - schedule() has dist.all_gather_object() (torch distributed collective)
         #  - run() has nvshmem.core.barrier_all() (nvshmem collective)
         # This is critical for non-collocated refit where some ranks may have no work.
+        # Local copies on `_local_copy_stream` run concurrently with this remote
+        # NVSHMEM pipeline because the join below happens after `run()`.
         logger.info("NVSHMEMCopyService: building NVSHMEM schedule and executing")
         self._remote.schedule()
         self._remote.run()
         self._remote.clear_requests()
+
+        # Join local-copy stream after remote pipeline so they overlapped.
+        torch.cuda.current_stream().wait_stream(self._local_copy_stream)
         logger.info("NVSHMEMCopyService: NVSHMEM transfers complete")
