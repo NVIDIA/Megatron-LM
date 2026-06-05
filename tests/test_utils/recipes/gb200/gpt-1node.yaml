@@ -70,7 +70,7 @@ products:
   - test_case: [gpt3_mcore_te_tp1_pp1_resume_torch_dist_dist_optimizer_1node]
     products:
       - environment: [dev]
-        scope: [L1, L0]
+        scope: [L0, L1]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp2_pp1_gdn_1node]
     products:
@@ -90,7 +90,7 @@ products:
   - test_case: [gpt3_mcore_te_tp4_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather_1node]
     products:
       - environment: [dev]
-        scope: [L1, L0]
+        scope: [L0, L1]
         platforms: [dgx_gb200]
   #######################################################################
   # tp1_pp1 variants                                                    #

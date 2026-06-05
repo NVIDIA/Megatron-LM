@@ -50,5 +50,5 @@ products:
   - test_case: [moe_perf]
     products:
       - environment: [dev]
-        scope: [L1]
+        scope: [L1, L2]
         platforms: [dgx_h100]
