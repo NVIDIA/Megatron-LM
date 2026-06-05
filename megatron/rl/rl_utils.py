@@ -467,19 +467,6 @@ def update_inference_logprobs_group_stats(
         group_stats.max_inf_prob = inf_probs.max().item()
         group_stats.mean_inf_prob = inf_probs.mean().item()
 
-        # Surface inf-vs-train logprob delta (gated on logger level — set
-        # `--logging-level debug` or `logger.setLevel(logging.DEBUG)` to see).
-        if logger.isEnabledFor(logging.DEBUG) and dist.get_rank() == 0:
-            bik_tag = "[bik]" if is_batch_invariant_mode_enabled() else "[base]"
-            logger.debug(
-                f"{bik_tag} inf-vs-train logprob: "
-                f"max_abs_diff={group_stats.max_inf_train_prob_abs_diff:.3e} "
-                f"mean_abs_diff={group_stats.mean_inf_train_prob_abs_diff:.3e} "
-                f"max_ratio={group_stats.max_piold_to_inf_prob:.6f} "
-                f"min_ratio={group_stats.min_piold_to_inf_prob:.6f} "
-                f"n={int(n_elems.item())}"
-            )
-
 
 def align_unpacked_inference_logprobs(
     inference_logprobs: List[torch.Tensor],
