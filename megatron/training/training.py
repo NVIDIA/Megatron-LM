@@ -1186,7 +1186,11 @@ def pretrain(
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-        model_provider, model_type, checkpointing_context=checkpointing_context
+        model_provider,
+        model_type,
+        checkpointing_context=checkpointing_context,
+        cfg_container=cfg_container,
+        pg_collection=pg_collection,
     )
 
     timers('model-and-optimizer-setup').stop()
@@ -1953,7 +1957,9 @@ def setup_model_and_optimizer(
     model_provider_func,
     model_type,
     checkpointing_context=None,
-    pg_collection=None,
+    *,
+    cfg_container: PretrainConfigContainer,
+    pg_collection: ProcessGroupCollection,
 ):
     """Setup model and optimizer."""
     args = get_args()
@@ -1966,9 +1972,27 @@ def setup_model_and_optimizer(
     has_rl_optimizer = args.perform_rl_step and not args.no_load_optim
     skip_optimizer = not (has_normal_optimizer or has_rl_optimizer)
     wrap_with_ddp = not skip_optimizer
-    model = get_model(
-        model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp, pg_collection=pg_collection
-    )
+
+    def _build_model_wrapper(wrap_with_ddp: bool):
+        from megatron.training.utils.train_utils import start_memory_history_recording
+
+        start_memory_history_recording(cfg_container.profiling)
+
+        cfg = cfg_container
+        model_config = cfg.model
+        builder_cls = model_config.get_builder_cls()
+        builder = builder_cls(model_config)
+        return builder.build_distributed_models(
+            pg_collection=pg_collection,
+            ddp_config=cfg.ddp,
+            overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
+            use_megatron_fsdp=cfg.dist.use_megatron_fsdp,
+            use_torch_fsdp2=cfg.dist.use_torch_fsdp2,
+            wrap_with_ddp=wrap_with_ddp,
+            data_parallel_random_init=cfg.rng.data_parallel_random_init,
+        )
+
+    model = _build_model_wrapper(wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
 
     if args.logits_save_dir is not None:
@@ -2041,7 +2065,7 @@ def setup_model_and_optimizer(
         args.ffn_hidden_size = moe_ffn_hidden_size * args.moe_upcycling_granularity
 
         # get dense model
-        dense_model_for_upcycling = get_model(model_provider_func, model_type)
+        dense_model_for_upcycling = _build_model_wrapper(wrap_with_ddp=True)
 
         # recover moe upcycling related args in global args before executing upcycling
         args.num_experts = num_experts
