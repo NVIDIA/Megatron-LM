@@ -531,7 +531,7 @@ class GroupedLinearLoRA(nn.Module):
 
 
 class SharedGroupedLinearLoRA(nn.Module):
-    """MBridge-style LoRA shared by all local experts in a GroupedLinear."""
+    """LoRA delta shared by all local experts in a GroupedLinear."""
 
     def __init__(
         self,

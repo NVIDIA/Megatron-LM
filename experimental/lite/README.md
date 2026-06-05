@@ -73,3 +73,8 @@ Model names currently registered by default:
 - [Runtime](docs/runtime.md)
 - [Models](docs/models.md)
 - [Porting Notes](docs/porting.md)
+
+## Acknowledgements
+
+The Qwen3 MoE LoRA adapter support follows Mind-Lab's PEFT/Mint-compatible
+adapter work. Thanks to Mind-Lab for the reference implementation and guidance.
