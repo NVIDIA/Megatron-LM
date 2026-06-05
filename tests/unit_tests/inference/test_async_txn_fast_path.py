@@ -1,0 +1,249 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+import asyncio
+from types import SimpleNamespace
+
+import torch
+
+from megatron.core.inference.async_txn import (
+    AsyncDecodeSlot,
+    AsyncDecodeSlotRing,
+    AsyncTxnDiagnostics,
+    AsyncTxnSkipReason,
+    StepTxn,
+)
+from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+    TextGenerationController,
+)
+
+
+class FakeGPUView:
+    def __init__(self):
+        self._buf = torch.zeros(32, dtype=torch.uint8)
+        self.token_to_input_ids = torch.zeros(4, dtype=torch.int64)
+        self.token_to_pos_ids = torch.arange(4, dtype=torch.int64)
+        self.token_to_block_idx = torch.zeros(4, dtype=torch.int64)
+        self.mha_block_table = torch.zeros((2, 2), dtype=torch.int32)
+
+
+class FakeKVAllocator:
+    block_routing = False
+
+    def store_routing_per_block(self, routing):
+        return None
+
+
+class FakeContext:
+    def __init__(self, *, async_scheduling=True, termination_id=-1):
+        self.async_scheduling = async_scheduling
+        self.async_txn_diagnostics = AsyncTxnDiagnostics(enabled=async_scheduling)
+        self.async_decode_slot_ring = AsyncDecodeSlotRing(
+            (AsyncDecodeSlot(0, FakeGPUView()), AsyncDecodeSlot(1, FakeGPUView()))
+        )
+        self.active_decode_slot_id = 0
+        self.total_request_count = 1
+        self.paused_request_count = 0
+        self.active_token_count = 1
+        self.padded_active_request_count = 1
+        self.padded_active_token_count = 1
+        self.num_decode_requests = 1
+        self.request_ids = torch.tensor([17], dtype=torch.int64)
+        self.request_kv_length_offsets = torch.tensor([1], dtype=torch.int32)
+        self.request_query_lengths = torch.tensor([1], dtype=torch.int32)
+        self.request_output_lengths = torch.tensor([16], dtype=torch.int32)
+        self.active_request_metadata = {
+            "termination_id": torch.tensor([termination_id], dtype=torch.int64),
+            "return_log_probs": torch.tensor([False], dtype=torch.bool),
+            "top_n_logprobs": torch.tensor([0], dtype=torch.int32),
+        }
+        self.config = SimpleNamespace(materialize_only_last_token_logits=True)
+        self.is_hybrid_model = False
+        self.mamba_slot_allocator = None
+        self.kv_block_allocator = FakeKVAllocator()
+        self.request_rng_store = None
+        self.prepared = 0
+        self.updated = 0
+
+    def is_decode_only(self):
+        return True
+
+    def using_cuda_graph_this_step(self):
+        return False
+
+    def active_decode_slot(self):
+        return self.async_decode_slot_ring.current
+
+    def bind_decode_slot(self, slot=None):
+        if slot is None:
+            slot = self.async_decode_slot_ring.current
+        self.active_decode_slot_id = slot.slot_id
+        return slot
+
+    def current_input_and_position_ids(self):
+        view = self.async_decode_slot_ring.current.gpu_view
+        return view.token_to_input_ids[:1].unsqueeze(0), view.token_to_pos_ids[:1].unsqueeze(0)
+
+    def prepare_child_from_committed_decode_state(self):
+        if not self.async_scheduling:
+            return None
+        self.prepared += 1
+        child = self.async_decode_slot_ring.child
+        self.async_txn_diagnostics.record_prepared(under_forward=True)
+        return StepTxn(
+            step_id=self.prepared,
+            request_ids=(17,),
+            slot_id=child.slot_id,
+            cuda_graph_key=child.cuda_graph_key(("decode", 1, 1)),
+        )
+
+    def plain_decode_child_needs_terminal_check(self, active_request_count=None):
+        active_request_count = active_request_count or 1
+        if bool((self.active_request_metadata["termination_id"][:active_request_count] >= 0).any()):
+            return True
+        return bool(
+            torch.ge(
+                self.get_active_sequence_lengths()[:active_request_count] + 1,
+                self.get_max_sequence_lengths()[:active_request_count],
+            ).any()
+        )
+
+    def get_active_sequence_lengths(self):
+        return self.request_kv_length_offsets + self.request_query_lengths
+
+    def get_max_sequence_lengths(self):
+        return self.request_output_lengths
+
+    def update_requests(self, active_request_mask, new_sample_copy, sampled_mtp_tokens_cpu=None):
+        self.updated += 1
+        self.request_kv_length_offsets.add_(1)
+        return {}
+
+
+def _make_controller(context):
+    order = []
+    controller = object.__new__(TextGenerationController)
+    controller.model_config = SimpleNamespace(
+        cuda_graph_impl="none",
+        expert_model_parallel_size=1,
+        moe_enable_routing_replay=False,
+        num_moe_experts=None,
+    )
+    controller.inference_wrapped_model = SimpleNamespace(
+        inference_context=context,
+        model=SimpleNamespace(config=controller.model_config),
+        config=SimpleNamespace(params_dtype=torch.float32),
+    )
+    controller.num_speculative_tokens = 0
+    controller.model_is_pipeline_parallel = False
+    controller._enable_cuda_graph = False
+    controller._get_stop_word_finished_ids_callback = None
+    controller._async_prepared_child_txn = None
+    controller._async_launched_child_txn = None
+    controller._accepted_tokens_per_request = None
+    controller._accepted_token_counts_per_request = None
+    controller._sampled_tokens_cuda = torch.tensor([5], dtype=torch.int64)
+
+    def context_init():
+        order.append("init")
+        return context.current_input_and_position_ids()
+
+    def forward(input_ids, position_ids):
+        if "sample" in order:
+            order.append("child_forward")
+        else:
+            order.append("forward")
+
+    def sample():
+        order.append("sample")
+        controller._sampled_tokens_cuda = torch.tensor([7], dtype=torch.int64)
+
+    def transfer(active_request_count):
+        order.append("transfer")
+        assert "child_forward" in order
+        return controller._sampled_tokens_cuda[:active_request_count].cpu(), None
+
+    controller._dynamic_step_context_init = context_init
+    controller._dynamic_step_forward_logits = forward
+    controller._dynamic_step_sample_logits = sample
+    controller._dynamic_step_log_probs_bookkeeping = lambda: (False, False)
+    controller._dynamic_step_calculate_log_probs = lambda: (None, None)
+    controller._dynamic_step_calculate_top_n_logprobs = lambda log_probs_tensor: None
+    controller._router_record_bookkeeping = lambda: None
+    controller._transfer_samples_to_cpu = transfer
+    return controller, order
+
+
+def test_child_launch_occurs_before_cpu_sample_transfer():
+    context = FakeContext()
+    controller, order = _make_controller(context)
+
+    result = asyncio.run(controller.async_generate_output_tokens_dynamic_batch())
+
+    assert result["sample"].tolist() == [7]
+    assert order.index("child_forward") < order.index("transfer")
+    assert context.async_txn_diagnostics.launched == 1
+    assert context.async_txn_diagnostics.prepared == 2
+    assert controller._async_launched_child_txn is not None
+
+
+def test_bookkeeping_uses_supplied_async_cpu_sample_without_default_transfer():
+    context = FakeContext()
+    controller, _ = _make_controller(context)
+    controller._transfer_samples_to_cpu = lambda active_request_count: (_ for _ in ()).throw(
+        AssertionError("_transfer_samples_to_cpu should not run for async sample handoff")
+    )
+
+    result = controller._dynamic_step_context_bookkeeping(
+        sampled_tokens_cpu=torch.tensor([7], dtype=torch.int64)
+    )
+
+    assert result["sample"].tolist() == [7]
+    assert context.updated == 1
+
+
+def test_consecutive_decode_steps_adopt_launched_children():
+    context = FakeContext()
+    controller, order = _make_controller(context)
+
+    asyncio.run(controller.async_generate_output_tokens_dynamic_batch())
+    order.clear()
+    asyncio.run(controller.async_generate_output_tokens_dynamic_batch())
+
+    assert "init" not in order
+    assert "forward" not in order
+    assert order.index("sample") < order.index("child_forward")
+    assert context.async_txn_diagnostics.adopted >= 1
+    assert context.async_txn_diagnostics.launched == 2
+
+
+def test_child_launch_skips_when_terminal_detection_is_needed():
+    context = FakeContext(termination_id=7)
+    controller, order = _make_controller(context)
+    controller._transfer_samples_to_cpu = lambda active_request_count: (
+        order.append("transfer") or (controller._sampled_tokens_cuda[:active_request_count], None)
+    )
+
+    asyncio.run(controller.async_generate_output_tokens_dynamic_batch())
+
+    assert "child_forward" not in order
+    assert context.async_txn_diagnostics.launched == 0
+    assert (
+        context.async_txn_diagnostics.eligibility_skip_reasons[
+            AsyncTxnSkipReason.TERMINAL_CHECK_REQUIRED.value
+        ]
+        == 1
+    )
+
+
+def test_async_disabled_path_does_not_prepare_or_launch():
+    context = FakeContext(async_scheduling=False)
+    controller, order = _make_controller(context)
+    controller._transfer_samples_to_cpu = lambda active_request_count: (
+        order.append("transfer") or (controller._sampled_tokens_cuda[:active_request_count], None)
+    )
+
+    asyncio.run(controller.async_generate_output_tokens_dynamic_batch())
+
+    assert "child_forward" not in order
+    assert context.prepared == 0
+    assert context.async_txn_diagnostics.snapshot()["launched"] == 0

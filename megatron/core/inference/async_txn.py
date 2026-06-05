@@ -36,6 +36,10 @@ class AsyncTxnSkipReason(str, Enum):
     CHILD_SLOT_BUSY = "child_slot_busy"
     HYBRID_PRESTAGE_DEFERRED = "hybrid_prestage_deferred"
     BOUNDARY_PRESTAGE_DEFERRED = "boundary_prestage_deferred"
+    TERMINAL_CHECK_REQUIRED = "terminal_check_required"
+    LOGPROBS_DEFERRED = "logprobs_deferred"
+    CUDA_GRAPH_DEFERRED = "cuda_graph_deferred"
+    MOE_EP_DEFERRED = "moe_ep_deferred"
     SERIAL_WRAPPED = "serial_wrapped"
     UNKNOWN_BARRIER = "unknown_barrier"
 
@@ -347,6 +351,12 @@ class AsyncDecodeSlotRing:
     def promote_child(self) -> AsyncDecodeSlot:
         if not self.child.can_reuse():
             raise RuntimeError("cannot promote child slot before its prior work has retired")
+        self.current_index = 1 - self.current_index
+        return self.current
+
+    def adopt_child(self) -> AsyncDecodeSlot:
+        """Mark the prepared child slot as the current in-flight forward slot."""
+
         self.current_index = 1 - self.current_index
         return self.current
 

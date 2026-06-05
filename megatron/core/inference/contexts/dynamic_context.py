@@ -1464,6 +1464,24 @@ class DynamicInferenceContext(BaseInferenceContext):
                 return slot
         raise RuntimeError(f"active decode slot {self.active_decode_slot_id} is not in the ring")
 
+    def plain_decode_child_needs_terminal_check(
+        self, active_request_count: Optional[int] = None
+    ) -> bool:
+        """Return whether same-step finish detection could affect child adoption."""
+
+        if active_request_count is None:
+            active_request_count = self.total_request_count - self.paused_request_count
+        if active_request_count <= 0:
+            return True
+
+        termination_ids = self.active_request_metadata["termination_id"][:active_request_count]
+        if bool((termination_ids >= 0).any()):
+            return True
+
+        active_sequence_lengths = self.get_active_sequence_lengths()[:active_request_count]
+        max_sequence_lengths = self.get_max_sequence_lengths()[:active_request_count]
+        return bool(torch.ge(active_sequence_lengths + 1, max_sequence_lengths).any())
+
     def prepare_child_from_committed_decode_state(self) -> Optional[StepTxn]:
         """Prestage deterministic plain-decode child metadata into the free slot.
 
