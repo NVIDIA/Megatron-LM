@@ -1064,16 +1064,17 @@ def pretrain(
     state.startup_timestamps["legacy_train_start_time"] = _LEGACY_TRAIN_START_TIME
     timers = state.timers
 
+    timers("startup-in-process-setup", log_level=0).start()
     if inprocess_call_wrapper is not None:
         iteration = inprocess_call_wrapper.iteration
         store = torch.distributed.PrefixStore(str(iteration), store)
-
-    timestamp_after_inprocess_setup = time.time()
+    timers("startup-in-process-setup").stop()
 
     # Early fault tolerance setup - must be done before initialize_megatron
     # to enable monitoring of the initialization process
+    timers("startup-in-job-setup", log_level=0).start()
     ft_integration.setup()
-    timestamp_after_in_job_setup = time.time()
+    timers("startup-in-job-setup").stop()
 
     setup_output = setup(
         state=state,
@@ -1114,45 +1115,42 @@ def pretrain(
 
     timestamp_after_set_jit_fusion_options = time.time()
 
-    # Adjust the startup time so it reflects the global minimum.
-    # This will be closer to what scheduler will see (outside of
-    # image ... launches).
-    program_start = startup_timestamps.get("program_start")
+    program_start_global = state.start_time
+    program_start_local = startup_timestamps.get("program_start_local")
     main_entry = startup_timestamps.get("main_entry")
     pretrain_entry = startup_timestamps.get("pretrain_entry")
-
-    # Capture megatron init end time (matches original time.time() placement)
-    megatron_init_end = time.time()
+    megatron_init_end = startup_timestamps.get("megatron_init_end")
 
     app_metrics = {}
     app_metrics['app_start_time'] = round(program_start_global * 1000.0)
     app_metrics['app_model_init_start_time'] = round(program_start_global * 1000.0)
 
-    # Note, not entirely accurate as rank 0 might not be the first or last to hit these timestamps
-    print_datetime('after in-process setup and before initialize_megatron', timestamp_after_inprocess_setup)
-    print_datetime('after in-job setup and before initialize_megatron', timestamp_after_in_job_setup)
 
-    if program_start is not None and main_entry is not None and pretrain_entry is not None:
-        # Inject startup deltas into timers
+    if program_start_local is not None and main_entry is not None and pretrain_entry is not None and megatron_init_end is not None:
+        # Log startup deltas
         startup_timers = {
-            'startup-program-entry-spread': program_start - program_start_global, # Local program start timestamp vs the global earliest program start timestamp
-            'startup-library-setup': main_entry - program_start, # Local library imports
+            'startup-program-entry-spread': program_start_local - program_start_global, # Local program start timestamp vs the global earliest program start timestamp
+            'startup-library-setup': main_entry - program_start_local, # Local library imports
             'startup-program-setup': pretrain_entry - main_entry, # Local __main__ entry to pretrain entry
-            'startup-in-process-setup': timestamp_after_inprocess_setup - pretrain_entry, # Local in-process setup
-            'startup-in-job-setup': timestamp_after_in_job_setup - timestamp_after_inprocess_setup, # Local in-job setup
-            'startup-initialize-megatron': timestamp_after_initialize_megatron - timestamp_after_in_job_setup, # Local initialize megatron
-            'startup-set-jit-fusion-options': timestamp_after_set_jit_fusion_options - timestamp_after_initialize_megatron, # Local set JIT fusion options
-            'all-reduce-start-timestamps-tensor': megatron_init_end - timestamp_after_set_jit_fusion_options, # 2x All-reduce, first collective call
             'startup-megatron-init-local': megatron_init_end - pretrain_entry, # Local megatron init
             'startup-megatron-init-global': megatron_init_end - program_start_global, # Local megatron init vs the global earliest program start timestamp
         }
         for name, delta in startup_timers.items():
             timers(name, log_level=0).set_elapsed(delta)
-        timers.log(list(startup_timers.keys()), barrier=True)
+
+        setup_events = [
+            'startup-in-process-setup', # Local in-process setup
+            'startup-in-job-setup', # Local in-job setup
+            'startup-initialize-megatron', # Local initialize megatron
+            'startup-set-jit-fusion-options', # Local set JIT fusion options
+            'all-reduce-start-timestamps-tensor', # 2x All-reduce, first collective call
+        ]
+        startup_events = [name for name in (list(startup_timers.keys()) + setup_events) if name in timers._timers]
+        timers.log(startup_events, barrier=True)
 
         # Print rank 0's absolute timestamps
         timestamps = {
-            'before library-setup': program_start,
+            'before library-setup': program_start_local,
             'after library-setup': main_entry,
             'before megatron-init': pretrain_entry,
         }
