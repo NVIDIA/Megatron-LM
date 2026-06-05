@@ -1101,7 +1101,9 @@ def pretrain(
 
     args = get_args()
     timers = get_timers()
-    state.timers = timers
+    # Inject the legacy timers directly; GlobalState.timers intentionally exposes
+    # no public setter (overriding it is not supported behavior). Temporary.
+    state._timers = timers
 
     if cfg_container.model.fine_grained_activation_offloading:
         from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
@@ -1200,7 +1202,7 @@ def pretrain(
     )
     cfg_container.dataset.tokenizer = tokenizer
     timers("tokenizer-setup").stop()
-    barrier_and_log("after tokenizer is built")
+    print_datetime("after tokenizer is built")
 
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
@@ -1343,7 +1345,7 @@ def pretrain(
         state.train_state.do_train,
         state.train_state.do_valid,
         state.train_state.do_test,
-        state.train_state.dataloader_type,
+        args.dataloader_type,
     )
 
     # Print setup timing.
