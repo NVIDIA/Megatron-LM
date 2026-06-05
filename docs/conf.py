@@ -119,6 +119,8 @@ linkcheck_ignore = [
     ".*githubusercontent\\.com.*",
     "http://localhost.*",
 ]
+linkcheck_retries = 10
+linkcheck_rate_limit_timeout = 600
 
 # PyTorch docs use a JS-rendered frontend; anchor IDs are injected at runtime
 # and are not present in the static HTML that linkcheck fetches.
