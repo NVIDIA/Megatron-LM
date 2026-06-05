@@ -96,6 +96,7 @@ class GlobalState:
         self._tokenizer: Any | None = None
         self._timers: Timers | None = None
         self._train_state: TrainState | None = None
+        self.startup_timestamps: dict[str, float | None] = {}
         self._signal_handler: DistributedSignalHandler | None = None
         self.start_time: float = time.time()
         self._straggler_timer: StragglerDetector | None = None

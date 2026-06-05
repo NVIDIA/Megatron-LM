@@ -5,6 +5,7 @@ import argparse
 import time
 
 from megatron.training.config.container import PretrainConfigContainer
+from megatron.training.state import GlobalState
 
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
@@ -199,6 +200,7 @@ from megatron.training.initialize import (
     set_jit_fusion_options,
     write_args_to_tensorboard,
 )
+from megatron.training.setup import setup
 from megatron.training.utils import is_hybrid_model
 
 try:
@@ -1055,15 +1057,12 @@ def pretrain(
     startup_timestamps["pretrain_entry"] = time.time()
     startup_timestamps["program_start_local"] = startup_timestamps.get("program_start", _TRAIN_START_TIME)
 
-    # Initialize program_start_global with a fallback value in case set_startup_timestamps() wasn't called
-    program_start_global = _TRAIN_START_TIME
-    if "program_start" in startup_timestamps:
-        program_start_global = torch.tensor([startup_timestamps["program_start"]], dtype=torch.double, device='cuda')
-        torch.distributed.all_reduce(program_start_global, op=torch.distributed.ReduceOp.MIN)
-        program_start_global = program_start_global.item()
-    startup_timestamps["program_start"] = program_start_global
-    global _TRAIN_START_TIME    # TODO (@maanug): replace all accesses with GlobalState start_time
-    _TRAIN_START_TIME = program_start_global
+    state = GlobalState()
+    state.cfg = cfg_container
+    state.startup_timestamps = startup_timestamps
+    state.start_time = startup_timestamps["program_start_local"]  # To be min-reduced in setup()
+    state.startup_timestamps["legacy_train_start_time"] = _LEGACY_TRAIN_START_TIME
+    timers = state.timers
 
     if inprocess_call_wrapper is not None:
         iteration = inprocess_call_wrapper.iteration
@@ -1075,6 +1074,20 @@ def pretrain(
     # to enable monitoring of the initialization process
     ft_integration.setup()
     timestamp_after_in_job_setup = time.time()
+
+    setup_output = setup(
+        state=state,
+        train_valid_test_datasets_provider=train_valid_test_dataset_provider,
+        get_embedding_ranks=get_embedding_ranks,
+        get_position_embedding_ranks=get_position_embedding_ranks,
+        restart_store=store,
+        checkpointing_context=None, # TODO
+        model_provider_func=model_provider,
+    )
+
+    global _TRAIN_START_TIME    # TODO (@maanug): replace all accesses with GlobalState start_time
+    _TRAIN_START_TIME = state.start_time
+
 
     # Initalize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(
