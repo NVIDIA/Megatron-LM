@@ -756,7 +756,7 @@ def _get_megatron_emerging_optimizer(
     if not HAVE_EMERGING_OPTIMIZERS:
         raise ImportError(
             f"emerging-optimizers package is required for optimizer='{eopt_name}'. "
-            "Install it with: "
+            "Install it with:\n"
             "pip install git+https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git"
         )
     assert not (use_layer_wise and config.overlap_param_gather_with_optimizer_step), (
