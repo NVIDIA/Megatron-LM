@@ -351,9 +351,9 @@ class TEGroupedMLP(MegatronModule):
             return _unsupported("moe_apply_probs_on_input enabled")
 
         # Check grouped linear modules
-        if not isinstance(self.linear_fc1, te_ops.GroupedLinear):
+        if not isinstance(self.linear_fc1, te.pytorch.GroupedLinear):
             return _unsupported(f"linear_fc1 is {type(self.linear_fc1).__name__}")
-        if not isinstance(self.linear_fc2, te_ops.GroupedLinear):
+        if not isinstance(self.linear_fc2, te.pytorch.GroupedLinear):
             return _unsupported(f"linear_fc2 is {type(self.linear_fc2).__name__}")
 
         # Check activation: SwiGLU, quick GEGLU, or weighted squared ReLU.
