@@ -1681,6 +1681,8 @@ class TextGenerationController:
         update_result = context.update_requests(
             active_request_mask, new_sample_copy, sampled_mtp_tokens_cpu
         )
+        if context.request_rng_store is not None and finished_request_ids.numel() > 0:
+            context.request_rng_store.remove_many(finished_request_ids.tolist())
         range_pop()
 
         return {
@@ -1721,6 +1723,13 @@ class TextGenerationController:
 
         with torch.inference_mode():
             input_ids, position_ids = self._dynamic_step_context_init()
+            async_eligibility = None
+            if context.async_scheduling:
+                async_eligibility = context.async_launch_eligibility()
+                if async_eligibility.eligible:
+                    context.async_txn_diagnostics.record_prepared(under_forward=False)
+                else:
+                    context.async_txn_diagnostics.record_barrier_skip(async_eligibility.reason)
 
             cuda_graph_request_count = (
                 context.padded_active_request_count
@@ -1844,6 +1853,9 @@ class TextGenerationController:
             if self.num_speculative_tokens > 0:
                 self._accepted_tokens_per_request.fill_(-1)
                 self._accepted_token_counts_per_request.fill_(0)
+            if context.async_scheduling:
+                context.async_txn_diagnostics.record_adopted()
+                context.async_txn_diagnostics.record_sync_step("serial_wrapped")
             ret.update(request_bookkeeping)
             return ret
 

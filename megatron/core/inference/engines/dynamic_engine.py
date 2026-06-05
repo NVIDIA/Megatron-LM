@@ -257,6 +257,10 @@ class DynamicInferenceEngine(AbstractEngine):
         self.cuda_graph_modules = model_config.cuda_graph_modules
         # Initialize engine.
         self.reset()
+        logging.info(
+            "> dynamic async scheduling: %s",
+            "enabled" if inference_config.async_scheduling else "disabled",
+        )
 
         # Set callback for getting stop word finished request IDs
         self.controller.set_stop_word_finished_ids_callback(
@@ -2062,6 +2066,13 @@ class DynamicInferenceEngine(AbstractEngine):
                     self._prefix_cache_hits,
                     self._prefix_cache_blocks_matched,
                 )
+            if self.context.async_scheduling:
+                async_diag = self.context.async_txn_diagnostics.snapshot()
+                output_str += (
+                    " ... async txn: prepared %(prepared)d, launched %(launched)d, "
+                    "adopted %(adopted)d, retired %(retired)d, sync %(sync_steps)d, "
+                    "barrier %(barrier_skips)d, top-skip %(top_skip_reason)s"
+                ) % async_diag
             if context_state["is_decode_only"]:
                 output_str = f"\033[94m{output_str}\033[0m"
             logging.info(output_str)

@@ -142,6 +142,11 @@ class TorchSampling(Sampling):
             logits = logits[gather_indices[:n], :]
 
         output = torch.empty(n, device=logits.device, dtype=torch.int64)
+        request_rng_store = getattr(context, "request_rng_store", None)
+        request_ids_cpu = None
+        if request_rng_store is not None:
+            active_slice = slice(context.paused_request_count, context.total_request_count)
+            request_ids_cpu = context.request_ids[active_slice].tolist()
         token_list = []
         indices_list = []
         for idx_tensor, (_, temp, top_k, top_p) in zip(bucket_index_tensors, buckets):
@@ -149,6 +154,23 @@ class TorchSampling(Sampling):
                 row_indices = idx_tensor
             else:
                 row_indices = torch.where(torch.isin(token_to_request_index, idx_tensor))[0]
+            if request_rng_store is not None:
+                assert request_ids_cpu is not None
+                for row_index in row_indices.tolist():
+                    if token_to_request_index is None:
+                        request_index = row_index
+                    else:
+                        request_index = int(token_to_request_index[row_index].item())
+                    generator = request_rng_store.get(request_ids_cpu[request_index])
+                    output[row_index] = TorchSampling.sample_from_logits(
+                        logits[row_index : row_index + 1, :],
+                        temp,
+                        top_k,
+                        top_p,
+                        generator=generator,
+                        vocab_size=self._vocab_size,
+                    )[0]
+                continue
             token_list.append(
                 TorchSampling.sample_from_logits(
                     logits[row_indices, :],
@@ -160,6 +182,9 @@ class TorchSampling(Sampling):
                 )
             )
             indices_list.append(row_indices)
+
+        if request_rng_store is not None:
+            return output
 
         sampled_tokens = torch.cat(token_list, dim=0)
         sampled_indices = torch.cat(indices_list, dim=0)

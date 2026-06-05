@@ -12,6 +12,13 @@ import torch.nn.functional as F  # type: ignore
 from torch import Tensor  # type: ignore
 
 from megatron.core import parallel_state
+from megatron.core.inference.async_txn import (
+    AsyncDecodeSlot,
+    AsyncDecodeSlotRing,
+    AsyncTxnDiagnostics,
+    RequestRNGStore,
+    classify_decode_child_launch,
+)
 from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
     InferenceBatchDimensions,
@@ -278,6 +285,17 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Engine step counter (used for logging, metrics, and event tracking)
         self.step_count = 0
+        self.async_scheduling = inference_config.async_scheduling
+        self.async_txn_diagnostics = AsyncTxnDiagnostics(enabled=self.async_scheduling)
+        self.async_decode_slot_ring: Optional[AsyncDecodeSlotRing] = None
+        self.request_rng_store = (
+            RequestRNGStore(
+                model_config.inference_sampling_seed,
+                device=torch.device("cuda", torch.cuda.current_device()),
+            )
+            if self.async_scheduling
+            else None
+        )
 
         self.cache_mla_latent = (
             isinstance(model_config, MLATransformerConfig) and model_config.cache_mla_latents
@@ -1218,6 +1236,20 @@ class DynamicInferenceContext(BaseInferenceContext):
             device=torch.cuda.current_device(),
             max_mamba_chunks=self._max_mamba_chunks,
         )
+        if self.async_scheduling:
+            child_gpu_view = ContextGPUView(
+                max_requests=self.max_requests,
+                max_tokens=self.max_tokens,
+                max_kv_blocks=self.max_kv_block_count,
+                device=torch.cuda.current_device(),
+                max_mamba_chunks=self._max_mamba_chunks,
+            )
+            self.async_decode_slot_ring = AsyncDecodeSlotRing(
+                (
+                    AsyncDecodeSlot(slot_id=0, gpu_view=self.gpu_view),
+                    AsyncDecodeSlot(slot_id=1, gpu_view=child_gpu_view),
+                )
+            )
 
         # Cache of (input_ids_view, pos_ids_view) keyed by num_tokens. Instead of slicing and
         # unsqueezing on every new inference step (constructing new TensorImpls at 30-60 us),
@@ -1393,6 +1425,12 @@ class DynamicInferenceContext(BaseInferenceContext):
     def using_cuda_graph_this_step(self) -> bool:
         """Returns True if cuda graphs are being used for this step."""
         return self._using_cuda_graph_this_step
+
+    def async_launch_eligibility(self, **kwargs):
+        """Classify whether the next decode child may be launched asynchronously."""
+        return classify_decode_child_launch(
+            self, async_enabled=self.async_scheduling, **kwargs
+        )
 
     def has_unfinished_requests(self) -> bool:
         """Test if any requests remain."""
