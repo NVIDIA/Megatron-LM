@@ -5,7 +5,6 @@ from typing import Any
 import torch
 
 from megatron.core._rank_utils import safe_get_world_size
-from megatron.training.utils import print_rank_0
 
 def get_device(local_rank: int | None = None) -> torch.device:
     """Get the appropriate torch device based on the distributed backend.
@@ -105,6 +104,8 @@ class DistributedSignalHandler:
         return all_received
 
     def __enter__(self) -> "DistributedSignalHandler":
+        from megatron.training.utils import print_rank_0
+
         self._signal_received = False
         self.released = False
         self.original_handler = signal.getsignal(self.sig)
@@ -118,7 +119,7 @@ class DistributedSignalHandler:
 
         return self
 
-    def __exit__(self, exc_type: Optional[type], exc_val: Optional[Exception], exc_tb: Optional[Any]) -> None:
+    def __exit__(self, exc_type: type | None, exc_val: Exception | None, exc_tb: Any | None) -> None:
         """Release the signal handler and restore the original handler."""
         self.release()
 
