@@ -1093,6 +1093,8 @@ def pretrain(
         get_position_embedding_ranks=get_position_embedding_ranks,
         store=store,
     )
+    # TODO (@maanug): temporary until initialize.py is refactored to build pgcollection as bridge does
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     timestamp_after_initialize_megatron = time.time()
 
