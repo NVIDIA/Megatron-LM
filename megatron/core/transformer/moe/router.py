@@ -675,6 +675,7 @@ class TopKRouter(Router):
                 use_pre_softmax=self.config.moe_router_pre_softmax,
                 num_groups=self.config.moe_router_num_groups,
                 group_topk=self.config.moe_router_group_topk,
+                expert_bias=self.expert_bias,
             )
             probs = self._apply_aux_loss(
                 probs,
