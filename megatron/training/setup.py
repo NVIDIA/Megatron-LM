@@ -8,7 +8,7 @@ from megatron.core.config import set_experimental_flag
 from megatron.core.jit import disable_jit_fuser
 from megatron.core.utils import get_model_config
 from megatron.training.checkpointing import load_checkpoint
-from megatron.training.config import PretrainConfigContainer, SchedulerConfig
+from megatron.training.config import PretrainConfigContainer, SchedulerConfig, CheckpointConfig
 from megatron.training.initialize import initialize_megatron, set_jit_fusion_options
 from megatron.training.utils import print_rank_0
 from megatron.training.utils.log_utils import append_to_progress_log, barrier_and_log
@@ -29,6 +29,7 @@ from megatron.core.optimizer import (
 from megatron.core.optimizer.muon import get_megatron_muon_optimizer
 
 from megatron.training.state import GlobalState
+import megatron.training.one_logger_utils as one_logger_utils
 
 try:
     from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
@@ -72,7 +73,6 @@ def setup(
     get_embedding_ranks: Callable[[list[int], int | None], list[int]] | None = None,
     get_position_embedding_ranks: Callable[[list[int], int | None], list[int]] | None = None,
     restart_store: torch.distributed.Store | None = None,
-    checkpointing_context: dict[str, Any] = {},
     model_provider_func=None, # TODO (@maanug): temporary until all scripts can use ModelConfig+Builder
     # callback_manager: CallbackManager | None = None,  # TODO (@maanug): migrate
 ) -> SetupOutput:
@@ -165,8 +165,15 @@ def setup(
     timers("all-reduce-start-timestamps-tensor").stop()
     state.startup_timestamps["megatron_init_end"] = time.time()
 
+    app_metrics = {}
+    app_metrics["app_start_time"] = round(state.start_time * 1000.0)
+    # Track E2E metrics on pretrain start
+    one_logger_utils.on_pretrain_start()  # TODO (@maanug): replace args with config
+
     print_rank_0("time to initialize megatron (seconds): {:.3f}".format(time.time() - start_time_to_log))
     barrier_and_log("after megatron is initialized")
+
+    checkpointing_context = init_checkpointing_context(cfg.checkpoint)
 
     # Tokenizer
     timers("tokenizer-setup", log_level=0).start(barrier=True)
@@ -249,8 +256,8 @@ def setup(
 
     # TODO (@maanug): data iterator setup
 
-    print_rank_0("done with setup ...")
-    timers.log(["model-and-optimizer-setup", "train/valid/test-data-iterators-setup"], barrier=True)
+    # print_rank_0("done with setup ...")
+    # timers.log(["model-and-optimizer-setup"], barrier=True)
 
     return SetupOutput(
         state,
@@ -471,3 +478,65 @@ def maybe_log_and_save_config(cfg: PretrainConfigContainer) -> None:
             cfg.to_yaml(cfg.logger.save_config_filepath)
         except Exception as e:
             print_rank_0(f"Error saving config to file {cfg.logger.save_config_filepath}: {e}")
+
+
+def init_checkpointing_context(checkpoint_config: CheckpointConfig) -> dict[str, Any]:
+    """Initialize the checkpointing context, primarily for local checkpointing support.
+
+    If `non_persistent_ckpt_type` is set to "local", this function sets up
+    the `LocalCheckpointManager` and replication strategy based on the provided
+    `checkpoint_config`.
+
+    Args:
+        checkpoint_config: The checkpoint configuration object.
+
+    Returns:
+        A dictionary containing the checkpointing context. This will include
+        a `local_checkpoint_manager` if local checkpointing is enabled,
+        otherwise it will be an empty dictionary.
+
+    Raises:
+        RuntimeError: If local checkpointing is configured but the
+                      `nvidia_resiliency_ext` module is not found.
+    """
+    if checkpoint_config.non_persistent_ckpt_type != "local":
+        return {}
+
+    if not HAVE_RESIL:
+        raise RuntimeError(
+            "The 'nvidia_resiliency_ext' module is required for local "
+            "checkpointing but was not found. Please ensure it is installed."
+        )
+
+    try:
+        from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import (
+            LocalCheckpointManager,
+        )
+        from nvidia_resiliency_ext.checkpointing.local.replication.group_utils import (
+            GroupWrapper,
+            parse_group_sequence,
+        )
+        from nvidia_resiliency_ext.checkpointing.local.replication.strategies import (
+            CliqueReplicationStrategy,
+        )
+    except ModuleNotFoundError:
+        raise RuntimeError(
+            "The 'nvidia_resiliency_ext' module is required for local "
+            "checkpointing but was not found. Please ensure it is installed."
+        )
+
+    if checkpoint_config.replication:
+        repl_strategy = CliqueReplicationStrategy.from_replication_params(
+            checkpoint_config.replication_jump,
+            checkpoint_config.replication_factor,
+        )
+    else:
+        repl_strategy = None
+
+    checkpointing_context = {
+        "local_checkpoint_manager": LocalCheckpointManager(
+            checkpoint_config.non_persistent_local_ckpt_dir,
+            repl_strategy=repl_strategy,
+        )
+    }
+    return checkpointing_context

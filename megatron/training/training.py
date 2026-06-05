@@ -1078,11 +1078,10 @@ def pretrain(
 
     setup_output = setup(
         state=state,
-        train_valid_test_datasets_provider=train_valid_test_dataset_provider,
+        train_valid_test_dataset_provider=train_valid_test_dataset_provider,
         get_embedding_ranks=get_embedding_ranks,
         get_position_embedding_ranks=get_position_embedding_ranks,
         restart_store=store,
-        checkpointing_context=None, # TODO
         model_provider_func=model_provider,
     )
 
@@ -1090,41 +1089,13 @@ def pretrain(
     _TRAIN_START_TIME = state.start_time
 
 
-    # Initalize and get arguments, timers, and Tensorboard writer.
-    initialize_megatron(
-        get_embedding_ranks=get_embedding_ranks,
-        get_position_embedding_ranks=get_position_embedding_ranks,
-        store=store,
-    )
-
-    timestamp_after_initialize_megatron = time.time()
-
     args = get_args()
-    timers = get_timers()
-
-    if args.fine_grained_activation_offloading:
-        from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
-        set_ideal_affinity_for_current_gpu()
-
-
-    if cfg_container.logger.log_progress:
-        append_to_progress_log(args.save, "Starting job")
-
-    # Set pytorch JIT layer fusion options and warmup JIT functions.
-    set_jit_fusion_options()
-
-    timestamp_after_set_jit_fusion_options = time.time()
 
     program_start_global = state.start_time
     program_start_local = startup_timestamps.get("program_start_local")
     main_entry = startup_timestamps.get("main_entry")
     pretrain_entry = startup_timestamps.get("pretrain_entry")
     megatron_init_end = startup_timestamps.get("megatron_init_end")
-
-    app_metrics = {}
-    app_metrics['app_start_time'] = round(program_start_global * 1000.0)
-    app_metrics['app_model_init_start_time'] = round(program_start_global * 1000.0)
-
 
     if program_start_local is not None and main_entry is not None and pretrain_entry is not None and megatron_init_end is not None:
         # Log startup deltas
@@ -1157,46 +1128,6 @@ def pretrain(
         for name, ts in timestamps.items():
             ts_str = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S.%f')
             print_rank_0(f'[{name}] datetime: {ts_str}')
-
-    print_datetime('after megatron is initialized')
-    app_metrics['app_model_init_finish_time'] = one_logger_utils.get_timestamp_in_ms()
-
-    # Track E2E metrics on pretrain start
-    one_logger_utils.on_pretrain_start()
-
-    # Context used for persisting some state between checkpoint saves.
-    if cfg_container.checkpoint.non_persistent_ckpt_type == 'local':
-        try:
-            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import (
-                LocalCheckpointManager,
-            )
-            from nvidia_resiliency_ext.checkpointing.local.replication.group_utils import (
-                GroupWrapper,
-                parse_group_sequence,
-            )
-            from nvidia_resiliency_ext.checkpointing.local.replication.strategies import (
-                CliqueReplicationStrategy,
-            )
-        except ModuleNotFoundError:
-            raise RuntimeError(
-                "The 'nvidia_resiliency_ext' module is required for local "
-                "checkpointing but was not found. Please ensure it is installed."
-            )
-
-        if cfg_container.checkpoint.replication:
-            repl_strategy = CliqueReplicationStrategy.from_replication_params(
-                cfg_container.checkpoint.replication_jump, cfg_container.checkpoint.replication_factor
-            )
-        else:
-            repl_strategy = None
-
-        checkpointing_context = {
-            'local_checkpoint_manager': LocalCheckpointManager(
-                cfg_container.checkpoint.non_persistent_local_ckpt_dir, repl_strategy=repl_strategy
-            )
-        }
-    else:
-        checkpointing_context = {}
 
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
