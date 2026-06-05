@@ -757,7 +757,7 @@ def _build_thd_cp_a2a_perm(
 
 @lru_cache(maxsize=8)
 def _build_head_perm_for_split_sections(
-    split_sections: tuple[int], cp_size: int, device: torch.device
+    split_sections: tuple[int, ...], cp_size: int, device: torch.device
 ) -> torch.Tensor:
     assert all(
         s % cp_size == 0 for s in split_sections
