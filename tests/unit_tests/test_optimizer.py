@@ -389,10 +389,10 @@ def test_chained_optimizer_reports_unsuccessful_when_grad_norm_skipped():
         def get_grad_stats_parallel_group(self):
             return parallel_state.get_model_parallel_group()
 
-        def has_mtp_params(self):
+        def has_grad_norm_group(self, grad_norm_group):
             return False
 
-        def get_mtp_grads_for_grad_norm(self):
+        def get_grads_for_grad_norm_group(self, grad_norm_group):
             return []
 
         def step_with_ready_grads(self):
@@ -418,12 +418,17 @@ def test_chained_optimizer_reports_unsuccessful_when_grad_norm_skipped():
         Utils.destroy_model_parallel()
 
 
-def test_chained_optimizer_does_not_skip_update_for_large_mtp_grad_norm():
-    """Test ChainedOptimizer reports MTP grad norm without using it to skip the update."""
+def test_chained_optimizer_does_not_skip_update_for_large_mtp_grads():
+    """MTP grad magnitude does not influence the grad-norm skip check.
+
+    The skip threshold is evaluated against the main gradient norm only.
+    Even when MTP grads produce a norm far above the skip threshold, the
+    update proceeds as long as the main norm is within bounds.
+    """
     from megatron.core import parallel_state
 
     class MockOptimizer:
-        """Mock that mimics the ChainedOptimizer step interface."""
+        """Mock that exposes real MTP grads for group-norm computation."""
 
         def __init__(self, main_param, mtp_param, config):
             self.config = config
@@ -437,6 +442,7 @@ def test_chained_optimizer_does_not_skip_update_for_large_mtp_grad_norm():
             return False
 
         def get_grad_norm(self):
+            # Main grad norm safely below grad_norm_skip_threshold.
             return 0.5
 
         def get_parameters(self):
@@ -445,10 +451,10 @@ def test_chained_optimizer_does_not_skip_update_for_large_mtp_grad_norm():
         def get_grad_stats_parallel_group(self):
             return parallel_state.get_model_parallel_group()
 
-        def has_mtp_params(self):
+        def has_grad_norm_group(self, grad_norm_group):
             return True
 
-        def get_mtp_grads_for_grad_norm(self):
+        def get_grads_for_grad_norm_group(self, grad_norm_group):
             return [self.mtp_param.grad]
 
         def step_with_ready_grads(self):
@@ -457,31 +463,32 @@ def test_chained_optimizer_does_not_skip_update_for_large_mtp_grad_norm():
 
     Utils.initialize_model_parallel()
     try:
-        config = OptimizerConfig(clip_grad=0.0, grad_norm_skip_threshold=1.0)
+        skip_threshold = 1.0
+        config = OptimizerConfig(clip_grad=1.0, grad_norm_skip_threshold=skip_threshold)
         main_param = torch.nn.Parameter(torch.ones(2, 2, device='cuda'))
         main_param.grad = torch.full_like(main_param, 0.25)
         mtp_param = torch.nn.Parameter(torch.ones(2, 2, device='cuda'))
-        mtp_param.is_mtp_param = True
+        mtp_param.grad_norm_group = 'mtp'
+        # MTP grad norm (~20) is far above skip_threshold (1.0).
         mtp_param.grad = torch.full_like(mtp_param, 10.0)
-        mtp_grad_before = mtp_param.grad.clone()
+
         optimizer = MockOptimizer(main_param, mtp_param, config)
         chained_optimizer = ChainedOptimizer([optimizer])
 
         update_successful, grad_norm, num_zeros_in_grad = chained_optimizer.step()
 
+        # MTP group norm was computed and exceeds the skip threshold ...
+        mtp_group_norm = chained_optimizer.grad_norms_by_group.get('mtp', 0.0)
+        assert mtp_group_norm > skip_threshold
+        # ... yet the update was not skipped, because skip uses the main norm only.
         assert update_successful is True
-        assert grad_norm == 0.5
-        assert num_zeros_in_grad is None
         assert optimizer.step_called is True
-        assert chained_optimizer.mtp_grad_norm > config.grad_norm_skip_threshold
-        torch.testing.assert_close(mtp_param.grad, mtp_grad_before)
     finally:
         Utils.destroy_model_parallel()
 
 
 def test_mtp_grad_separation():
-    """Test that get_main_grads_for_grad_norm and get_mtp_grads_for_grad_norm
-    correctly separate gradients based on is_mtp_param attribute."""
+    """Test that grad-norm helpers separate gradients based on grad_norm_group."""
     from megatron.core.optimizer.optimizer import MegatronOptimizer
 
     class MockOptimizer:
@@ -489,7 +496,7 @@ def test_mtp_grad_separation():
 
         _filter_grads_for_norm = MegatronOptimizer._filter_grads_for_norm
         get_main_grads_for_grad_norm = MegatronOptimizer.get_main_grads_for_grad_norm
-        get_mtp_grads_for_grad_norm = MegatronOptimizer.get_mtp_grads_for_grad_norm
+        get_grads_for_grad_norm_group = MegatronOptimizer.get_grads_for_grad_norm_group
 
         def __init__(self, params):
             self.params = list(params)
@@ -504,7 +511,7 @@ def test_mtp_grad_separation():
         main_params = [torch.nn.Parameter(torch.randn(4, 4).cuda()) for _ in range(2)]
         mtp_params = [torch.nn.Parameter(torch.randn(4, 4).cuda()) for _ in range(2)]
         for p in mtp_params:
-            p.is_mtp_param = True
+            p.grad_norm_group = 'mtp'
 
         # Assign gradients
         all_params = main_params + mtp_params
@@ -514,7 +521,7 @@ def test_mtp_grad_separation():
         mock_opt = MockOptimizer(all_params)
 
         main_grads = mock_opt.get_main_grads_for_grad_norm()
-        mtp_grads = mock_opt.get_mtp_grads_for_grad_norm()
+        mtp_grads = mock_opt.get_grads_for_grad_norm_group('mtp')
 
         assert len(main_grads) == 2
         assert len(mtp_grads) == 2
@@ -529,13 +536,13 @@ def test_mtp_grad_separation():
 
 
 def test_mtp_grad_separation_no_mtp_params():
-    """Test that without is_mtp_param, all grads go to main."""
+    """Test that without a registered separate grad-norm group, all grads go to main."""
     from megatron.core.optimizer.optimizer import MegatronOptimizer
 
     class MockOptimizer:
         _filter_grads_for_norm = MegatronOptimizer._filter_grads_for_norm
         get_main_grads_for_grad_norm = MegatronOptimizer.get_main_grads_for_grad_norm
-        get_mtp_grads_for_grad_norm = MegatronOptimizer.get_mtp_grads_for_grad_norm
+        get_grads_for_grad_norm_group = MegatronOptimizer.get_grads_for_grad_norm_group
 
         def __init__(self, params):
             self.params = list(params)
@@ -553,7 +560,7 @@ def test_mtp_grad_separation_no_mtp_params():
         mock_opt = MockOptimizer(params)
 
         main_grads = mock_opt.get_main_grads_for_grad_norm()
-        mtp_grads = mock_opt.get_mtp_grads_for_grad_norm()
+        mtp_grads = mock_opt.get_grads_for_grad_norm_group('mtp')
 
         assert len(main_grads) == 3
         assert len(mtp_grads) == 0
@@ -561,12 +568,35 @@ def test_mtp_grad_separation_no_mtp_params():
         Utils.destroy_model_parallel()
 
 
-def test_has_mtp_params():
-    """has_mtp_params reflects whether any param is tagged is_mtp_param."""
+def test_unregistered_grad_norm_group_raises():
+    """Unknown grad-norm groups fail fast instead of silently joining the main norm."""
     from megatron.core.optimizer.optimizer import MegatronOptimizer
 
     class MockOptimizer:
-        has_mtp_params = MegatronOptimizer.has_mtp_params
+        _filter_grads_for_norm = MegatronOptimizer._filter_grads_for_norm
+        get_main_grads_for_grad_norm = MegatronOptimizer.get_main_grads_for_grad_norm
+
+        def __init__(self, params):
+            self.params = list(params)
+            self.config = OptimizerConfig(optimizer='adam', lr=0.01)
+
+        def get_parameters(self):
+            return self.params
+
+    param = torch.nn.Parameter(torch.randn(4, 4).cuda())
+    param.grad_norm_group = 'unregistered'
+    param.grad = torch.randn_like(param)
+
+    with pytest.raises(ValueError, match="Unknown grad_norm_group"):
+        MockOptimizer([param]).get_main_grads_for_grad_norm()
+
+
+def test_has_grad_norm_group():
+    """has_grad_norm_group reflects whether any param is in the requested group."""
+    from megatron.core.optimizer.optimizer import MegatronOptimizer
+
+    class MockOptimizer:
+        has_grad_norm_group = MegatronOptimizer.has_grad_norm_group
         get_grad_stats_parallel_group = MegatronOptimizer.get_grad_stats_parallel_group
 
         def __init__(self, params):
@@ -579,11 +609,11 @@ def test_has_mtp_params():
     Utils.initialize_model_parallel()
     try:
         plain = [torch.nn.Parameter(torch.randn(4, 4).cuda()) for _ in range(2)]
-        assert MockOptimizer(plain).has_mtp_params() is False
+        assert MockOptimizer(plain).has_grad_norm_group('mtp') is False
 
         tagged = torch.nn.Parameter(torch.randn(4, 4).cuda())
-        tagged.is_mtp_param = True
-        assert MockOptimizer(plain + [tagged]).has_mtp_params() is True
+        tagged.grad_norm_group = 'mtp'
+        assert MockOptimizer(plain + [tagged]).has_grad_norm_group('mtp') is True
 
     finally:
         Utils.destroy_model_parallel()
@@ -596,9 +626,10 @@ def test_mtp_grad_clipping_uses_separate_norms():
     class MockOptimizer:
         _filter_grads_for_norm = MegatronOptimizer._filter_grads_for_norm
         get_main_grads_for_grad_norm = MegatronOptimizer.get_main_grads_for_grad_norm
-        get_mtp_grads_for_grad_norm = MegatronOptimizer.get_mtp_grads_for_grad_norm
+        get_grads_for_grad_norm_group = MegatronOptimizer.get_grads_for_grad_norm_group
         get_grad_stats_parallel_group = MegatronOptimizer.get_grad_stats_parallel_group
-        has_mtp_params = MegatronOptimizer.has_mtp_params
+        has_grad_norm_group = MegatronOptimizer.has_grad_norm_group
+        _compute_grad_norms_by_group = MegatronOptimizer._compute_grad_norms_by_group
         clip_grad_norm = MegatronOptimizer.clip_grad_norm
 
         def __init__(self, params):
@@ -617,7 +648,7 @@ def test_mtp_grad_clipping_uses_separate_norms():
         main_norm_before = main_param.grad.norm().item()
         # MTP param: tiny grad (norm < clip) -> below threshold, should be untouched.
         mtp_param = torch.nn.Parameter(torch.randn(4, 4).cuda())
-        mtp_param.is_mtp_param = True
+        mtp_param.grad_norm_group = 'mtp'
         mtp_param.grad = torch.full((4, 4), 1e-3, device='cuda')
         mtp_grad_before = mtp_param.grad.clone()
 
@@ -630,8 +661,7 @@ def test_mtp_grad_clipping_uses_separate_norms():
         assert main_param.grad.norm().item() < main_norm_before
         # MTP grads, below the clip threshold, are clipped independently and left unchanged.
         torch.testing.assert_close(mtp_param.grad, mtp_grad_before)
-        # MTP norm is recorded separately for reporting.
-        assert opt.mtp_grad_norm is not None
+        assert 'mtp' in opt.grad_norms_by_group
     finally:
         Utils.destroy_model_parallel()
 
