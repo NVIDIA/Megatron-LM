@@ -26,7 +26,7 @@ __all__ = ["Experts", "_AllReduceETP"]
 
 @contextmanager
 def _expert_nvtx_range(name: str):
-    if os.environ.get("BUMBLEBEE_EP_EXPERT_NVTX") != "1" or not torch.cuda.is_available():
+    if os.environ.get("MEGATRON_LITE_EP_EXPERT_NVTX") != "1" or not torch.cuda.is_available():
         yield
         return
     torch.cuda.nvtx.range_push(name)

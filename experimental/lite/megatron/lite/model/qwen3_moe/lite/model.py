@@ -52,7 +52,7 @@ class MoELayer(nn.Module):
         lora_config: LoraConfig | dict | None = None,
     ):
         super().__init__()
-        # Mirror bridge's `load_balancing_type="none"` for Qwen3-MoE: no aux loss.
+        # Match Qwen3-MoE's `load_balancing_type="none"` setting: no aux loss.
         self.router = TopKRouter(
             config, ps,
             router_bias_rate=router_bias_rate,

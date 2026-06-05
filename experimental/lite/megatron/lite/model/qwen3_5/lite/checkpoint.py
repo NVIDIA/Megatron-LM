@@ -11,7 +11,7 @@ import torch.nn as nn
 from torch.distributed.tensor import Replicate, Shard
 
 from megatron.lite.model.qwen3_5.config import Qwen35Config
-from megatron.lite.primitive.ckpt.hf_bridge import SafeTensorReader, unwrap_model
+from megatron.lite.primitive.ckpt.hf_weights import SafeTensorReader, unwrap_model
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.utils import ensure_divisible, log_rank0
 

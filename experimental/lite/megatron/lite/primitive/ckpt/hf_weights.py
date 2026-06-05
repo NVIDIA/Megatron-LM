@@ -1,7 +1,7 @@
-"""HF ↔ Megatron Lite weight bridge.
+"""HF ↔ Megatron Lite weight conversion.
 
 Everything needed for HuggingFace safetensors ↔ Megatron Lite model conversion:
-- HFBridge protocol (model implements this)
+- HFWeights protocol (model implements this)
 - SafeTensorReader / save_safetensors (file I/O)
 - Tensor utilities (split_dim, allgather_concat, remap_layer_index, ...)
 - Generic load_hf_weights / export_hf_weights / save_hf_weights (orchestration)
@@ -23,7 +23,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file as _safe_save
 
 @runtime_checkable
-class HFBridge(Protocol):
+class HFWeights(Protocol):
     """Protocol for HF ↔ Megatron Lite weight conversion.
 
     Model-specific implementations only do tensor math, never distributed comm.
@@ -33,20 +33,20 @@ class HFBridge(Protocol):
         """Megatron Lite param name → [HF param names]. Multiple = concat (QKV, gate+up)."""
         ...
 
-    def hf_to_native(self, bb_name: str, hf_tensors: list[torch.Tensor]) -> torch.Tensor:
+    def hf_to_native(self, native_name: str, hf_tensors: list[torch.Tensor]) -> torch.Tensor:
         """Convert HF tensors → single Megatron Lite tensor (e.g. merge QKV)."""
         ...
 
-    def native_to_hf(self, bb_name: str, tensor: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
+    def native_to_hf(self, native_name: str, tensor: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
         """Convert Megatron Lite tensor → [(hf_name, hf_tensor)] (e.g. split QKV back)."""
         ...
 
-    def tp_spec(self, bb_name: str) -> tuple[int, int] | None:
+    def tp_spec(self, native_name: str) -> tuple[int, int] | None:
         """TP sharding: ``(split_dim, 0=TP|1=ETP)``, or None if replicated."""
         ...
 
-    def qkv_spec(self, bb_name: str) -> tuple[int, int, int] | None:
-        """If bb_name is a fused QKV weight, return (num_q_heads, num_kv_heads, head_dim).
+    def qkv_spec(self, native_name: str) -> tuple[int, int, int] | None:
+        """If native_name is a fused QKV weight, return (num_q_heads, num_kv_heads, head_dim).
 
         Needed for correct GQA TP sharding — Q/K/V must be split independently.
         Return None for non-QKV parameters.
@@ -58,15 +58,15 @@ class HFBridge(Protocol):
         """Total number of experts (needed for EP gather index math)."""
         ...
 
-    def is_expert(self, bb_name: str) -> bool:
+    def is_expert(self, native_name: str) -> bool:
         """Whether this param belongs to an expert (for EP sharding)."""
         ...
 
-    def expert_global_id(self, bb_name: str) -> int | None:
+    def expert_global_id(self, native_name: str) -> int | None:
         """Global expert ID from synthetic name. None if not expert."""
         ...
 
-    def expert_local_name(self, bb_name: str, local_idx: int) -> str:
+    def expert_local_name(self, native_name: str, local_idx: int) -> str:
         """Synthetic expert name → actual model param name."""
         ...
 
@@ -224,19 +224,19 @@ def gather_gate_up(
 
 
 # ======================================================================
-# Generic load / export / save using HFBridge
+# Generic load / export / save using HFWeights
 # ======================================================================
 
 
 def load_hf_weights(
     model: nn.Module,
     hf_path: str,
-    spec: HFBridge,
+    spec: HFWeights,
     ps,
     *,
     vocab_size: int | None = None,
 ) -> None:
-    """Load HF safetensors into a Megatron Lite model using an HFBridge.
+    """Load HF safetensors into a Megatron Lite model using HFWeights.
 
     Handles PP layer filtering, TP split, EP shard assignment.
     ``ps`` is a ParallelState (lazy import to avoid GPU dep at module level).
@@ -270,8 +270,8 @@ def load_hf_weights(
         local_start = ps.ep_rank * experts_per_rank
         expert_shard = (experts_per_rank, local_start)
 
-    for bb_name, hf_names in wmap.items():
-        mapped = remap_layer_index(bb_name, global_to_local)
+    for native_name, hf_names in wmap.items():
+        mapped = remap_layer_index(native_name, global_to_local)
         if mapped is None:
             continue
 
@@ -322,7 +322,7 @@ def load_hf_weights(
             log_rank0(f"WARNING: {name} not loaded from checkpoint")
 
 
-def _load_expert_weight(bb_name, hf_names, reader, spec, ps, loaded, expert_gid, expert_shard):
+def _load_expert_weight(native_name, hf_names, reader, spec, ps, loaded, expert_gid, expert_shard):
     if expert_shard is None:
         raise RuntimeError("Expert weight encountered but expert shard metadata is unavailable.")
     experts_per_rank, local_start = expert_shard
@@ -330,18 +330,18 @@ def _load_expert_weight(bb_name, hf_names, reader, spec, ps, loaded, expert_gid,
         return
 
     hf_tensors = [reader.get_tensor(n) for n in hf_names]
-    tensor = spec.hf_to_native(bb_name, hf_tensors)
+    tensor = spec.hf_to_native(native_name, hf_tensors)
 
     if ps.etp_size > 1:
-        tp_info = spec.tp_spec(bb_name)
+        tp_info = spec.tp_spec(native_name)
         if tp_info is not None:
             split_d, _ = tp_info
-            if "fc1" in bb_name:
+            if "fc1" in native_name:
                 tensor = split_gate_up(tensor, ps.etp_rank, ps.etp_size)
             else:
                 tensor = split_dim(tensor, ps.etp_rank, ps.etp_size, dim=split_d)
 
-    loaded[spec.expert_local_name(bb_name, expert_gid - local_start)] = tensor.to(dtype=torch.bfloat16)
+    loaded[spec.expert_local_name(native_name, expert_gid - local_start)] = tensor.to(dtype=torch.bfloat16)
 
 
 def _resolve_param_name(name: str, state_dict: dict) -> str | None:
@@ -355,7 +355,7 @@ def _resolve_param_name(name: str, state_dict: dict) -> str | None:
 
 def export_hf_weights(
     model: nn.Module | list[nn.Module],
-    spec: HFBridge,
+    spec: HFWeights,
     ps,
     *,
     vocab_size: int | None = None,
@@ -399,10 +399,10 @@ def export_hf_weights(
 
                 exported_params += 1
                 if not rank0_only or rank == 0:
-                    for bb_name, gathered_tensor in gathered_one.items():
-                        if vocab_size is not None and ("embed" in bb_name or "head" in bb_name):
+                    for native_name, gathered_tensor in gathered_one.items():
+                        if vocab_size is not None and ("embed" in native_name or "head" in native_name):
                             gathered_tensor = gathered_tensor[:vocab_size]
-                        yield from spec.native_to_hf(bb_name, gathered_tensor)
+                        yield from spec.native_to_hf(native_name, gathered_tensor)
 
                 if limit is not None and exported_params >= limit:
                     return
@@ -446,11 +446,11 @@ def export_hf_weights(
                 gathered[key] = gathered[key][:vocab_size]
 
     # Convert Megatron Lite names → HF names via spec
-    for bb_name, tensor in gathered.items():
-        yield from spec.native_to_hf(bb_name, tensor)
+    for native_name, tensor in gathered.items():
+        yield from spec.native_to_hf(native_name, tensor)
 
 
-def _gather_dense(name: str, tensor: torch.Tensor, spec: HFBridge, ps) -> torch.Tensor:
+def _gather_dense(name: str, tensor: torch.Tensor, spec: HFWeights, ps) -> torch.Tensor:
     """Gather a dense (non-expert) param across TP."""
     tp_info = spec.tp_spec(name)
     if tp_info is not None and ps.tp_size > 1:
@@ -461,7 +461,7 @@ def _gather_dense(name: str, tensor: torch.Tensor, spec: HFBridge, ps) -> torch.
 
 
 def _gather_expert(
-    name: str, tensor: torch.Tensor, spec: HFBridge, ps, out: dict[str, torch.Tensor],
+    name: str, tensor: torch.Tensor, spec: HFWeights, ps, out: dict[str, torch.Tensor],
 ) -> None:
     """Gather an expert param across ETP + EP."""
     # ETP gather
@@ -490,7 +490,7 @@ def _gather_expert(
 def save_hf_weights(
     model: nn.Module | list[nn.Module],
     hf_path: str,
-    spec: HFBridge,
+    spec: HFWeights,
     ps,
     *,
     vocab_size: int | None = None,

@@ -61,7 +61,7 @@ class ImplConfig:
     use_thd: bool = False
     router_aux_loss_coef: float | None = None
     router_bias_rate: float = 0.0
-    # User-level OptimizerConfig threaded from bench via bb runtime.
+    # User-level OptimizerConfig threaded through the runtime.
     optimizer_config: OptimizerConfig | None = None
     mtp_enable: bool = False
     mtp_enable_train: bool = False
@@ -300,7 +300,7 @@ def export_hf_weights(
     ps: ParallelState,
     **kwargs,
 ):
-    """Export HF weights from model chunks (bridge-compatible format)."""
+    """Export HF weights from model chunks."""
     from megatron.lite.model.qwen3_moe.lite.checkpoint import export_hf_weights as _export
 
     for chunk in chunks:

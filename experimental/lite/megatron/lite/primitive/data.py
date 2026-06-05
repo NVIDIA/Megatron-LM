@@ -29,11 +29,11 @@ def _resolve_thd_padding(seq_len: int, cp_size: int) -> tuple[int, int, bool]:
     if cp_size < 1:
         raise ValueError(f"cp_size must be >= 1, got {cp_size}")
 
-    pad_to_alignment = _read_bool_env("BUMBLEBEE_THD_PAD_TO_ALIGNMENT")
+    pad_to_alignment = _read_bool_env("MEGATRON_LITE_THD_PAD_TO_ALIGNMENT")
     if pad_to_alignment is None:
         pad_to_alignment = cp_size > 1
 
-    pad_multiple_env = os.environ.get("BUMBLEBEE_THD_PAD_MULTIPLE", "auto").strip().lower()
+    pad_multiple_env = os.environ.get("MEGATRON_LITE_THD_PAD_MULTIPLE", "auto").strip().lower()
     if pad_multiple_env in ("", "auto", "cp", "min_cp"):
         align_size = cp_size * 2 if cp_size > 1 else 1
     else:
@@ -41,12 +41,12 @@ def _resolve_thd_padding(seq_len: int, cp_size: int) -> tuple[int, int, bool]:
             align_size = int(pad_multiple_env)
         except ValueError as exc:
             raise ValueError(
-                "BUMBLEBEE_THD_PAD_MULTIPLE must be 'auto' or a positive integer, "
+                "MEGATRON_LITE_THD_PAD_MULTIPLE must be 'auto' or a positive integer, "
                 f"got {pad_multiple_env!r}"
             ) from exc
         if align_size <= 0:
             raise ValueError(
-                "BUMBLEBEE_THD_PAD_MULTIPLE must be 'auto' or a positive integer, "
+                "MEGATRON_LITE_THD_PAD_MULTIPLE must be 'auto' or a positive integer, "
                 f"got {pad_multiple_env!r}"
             )
 

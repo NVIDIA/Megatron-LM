@@ -1,0 +1,9 @@
+# Megatron Lite VERL example.
+UPSTREAM=https://github.com/verl-project/verl.git
+MODE=rolling
+BRANCH=main
+# VERL commit used by the external-engine recipe this example is adapted from.
+VERL_COMMIT=ca82c4b47148fe2266d4b4626723d0c4654c5bc0
+PIP_INSTALL=pip install verl@git+https://github.com/verl-project/verl.git@ca82c4b47148fe2266d4b4626723d0c4654c5bc0
+GIT_SETUP=git clone https://github.com/verl-project/verl.git && cd verl && git checkout ca82c4b47148fe2266d4b4626723d0c4654c5bc0 && git submodule update --init --recursive recipe
+NOTES=Megatron Lite must be importable through experimental/lite or an installed package.

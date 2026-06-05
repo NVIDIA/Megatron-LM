@@ -124,7 +124,7 @@ def log_rank0(msg: str) -> None:
 
 
 def _ag(data, size, group, dim=0):
-    from megatron.lite.primitive.ckpt.hf_bridge import allgather_concat
+    from megatron.lite.primitive.ckpt.hf_weights import allgather_concat
 
     return allgather_concat(data, size, group, dim)
 

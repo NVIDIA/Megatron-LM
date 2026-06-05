@@ -151,9 +151,9 @@ def resolve_model_type_from_hf(source: str | Path | dict) -> str:
             hf_config = json.load(f)
 
     hf_model_type = hf_config.get("model_type", "")
-    bb_name = _HF_MODEL_TYPE_MAP.get(hf_model_type)
-    if bb_name is not None:
-        return bb_name
+    native_name = _HF_MODEL_TYPE_MAP.get(hf_model_type)
+    if native_name is not None:
+        return native_name
     raise ValueError(
         f"Cannot resolve model_type={hf_model_type!r}. "
         f"Known: {list(_HF_MODEL_TYPE_MAP)}. Set model_name explicitly."

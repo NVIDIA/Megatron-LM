@@ -7,7 +7,7 @@ import torch
 
 _is_deterministic: bool = False
 _TRUE_VALUES = {"1", "true", "yes", "on"}
-_DETERMINISTIC_ENV = "BUMBLEBEE_DETERMINISTIC"
+_DETERMINISTIC_ENV = "MEGATRON_LITE_DETERMINISTIC"
 
 
 def deterministic_requested() -> bool:
