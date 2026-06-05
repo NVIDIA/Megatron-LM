@@ -103,6 +103,7 @@ def setup(
         SetupOutput containing the populated state, model, optimizer, scheduler, dataloaders, and ckpt context.
     """
     cfg = state.cfg
+    timers = state.timers
     maybe_log_and_save_config(cfg)
 
     # Conditionally enable experimental features for Megatron Core
@@ -116,12 +117,15 @@ def setup(
     # Initialize async checkpoint worker if enabled (idempotent if already initialized)
     state.initialize_async_checkpoint_worker()
 
+    timers("startup-initialize-megatron", log_level=0).start()
     # TODO (@maanug): merge bridge and mlm initialize_megatron() impls
     initialize_megatron(
         get_embedding_ranks=get_embedding_ranks,
         get_position_embedding_ranks=get_position_embedding_ranks,
         store=restart_store,
     )
+    timers("startup-initialize-megatron").stop()
+
     # TODO (@maanug): temporary until initialize.py is refactored to build pgcollection as bridge does
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
@@ -130,8 +134,6 @@ def setup(
         from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
 
         set_ideal_affinity_for_current_gpu()
-
-    timers = state.timers
 
     if cfg.logger.log_progress:
         append_to_progress_log(cfg.checkpoint.save, "Starting job")
@@ -142,9 +144,12 @@ def setup(
     #     fault_tolerance.maybe_setup_simulated_fault(cfg.ft)
 
     # Set pytorch JIT layer fusion options and warmup JIT functions.
+    timers("startup-set-jit-fusion-options", log_level=0).start()
     # TODO (@maanug): merge bridge and mlm impls
     set_jit_fusion_options()
+    timers("startup-set-jit-fusion-options").stop()
 
+    timers("all-reduce-start-timestamps-tensor", log_level=0).start()
     start_time_tensor = torch.tensor([state.start_time], dtype=torch.double, device="cuda")
     torch.distributed.all_reduce(start_time_tensor, op=torch.distributed.ReduceOp.MIN)
     state.start_time = start_time_tensor.item()
@@ -157,6 +162,8 @@ def setup(
         start_time_to_log = start_time_tensor.item()
     else:
         start_time_to_log = state.start_time
+    timers("all-reduce-start-timestamps-tensor").stop()
+    state.startup_timestamps["megatron_init_end"] = time.time()
 
     print_rank_0("time to initialize megatron (seconds): {:.3f}".format(time.time() - start_time_to_log))
     barrier_and_log("after megatron is initialized")
