@@ -1684,9 +1684,9 @@ class MultiTokenPredictionBlock(MegatronModule):
         self.cp_group = pg_collection.cp
 
         if self.config.mtp_detach_heads:
-            # Set is_mtp_param on the mtp params so the optimizer can handle them separately from the main model params
+            # Tag MTP params so the optimizer can clip their gradients separately.
             for param in self.parameters():
-                param.is_mtp_param = True
+                param.grad_norm_group = 'mtp'
 
     def _build_layers(self, pg_collection):
         # Determine number of depths to build
