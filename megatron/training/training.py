@@ -1108,13 +1108,13 @@ def pretrain(
     timers = get_timers()
     state.timers = timers
 
-    if args.fine_grained_activation_offloading:
+    if cfg_container.model.fine_grained_activation_offloading:
         from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
         set_ideal_affinity_for_current_gpu()
 
 
     if cfg_container.logger.log_progress:
-        append_to_progress_log(args.save, "Starting job")
+        append_to_progress_log(cfg_container.checkpoint.save, "Starting job")
 
     # Set pytorch JIT layer fusion options and warmup JIT functions.
     set_jit_fusion_options()
@@ -1217,6 +1217,8 @@ def pretrain(
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
     model_cfg = get_model_config(model[0])
 
+    cfg_container.train.train_iters = args.train_iters
+
     # Build a separate inference model for RL if requested.
     inference_model = None
     if args.perform_rl_step:
@@ -1306,7 +1308,7 @@ def pretrain(
     # Data stuff.
     app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
     timers('train/valid/test-data-iterators-setup', log_level=0).start(barrier=True)
-    if args.virtual_pipeline_model_parallel_size is not None:
+    if cfg_container.model.virtual_pipeline_model_parallel_size is not None:
         train_data_iterator = []
         valid_data_iterator = []
         test_data_iterator = []
@@ -1328,18 +1330,21 @@ def pretrain(
         train_data_iterator, valid_data_iterator, test_data_iterator = (
             build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
         )
+    state.train_state.do_train = args.do_train
+    state.train_state.do_valid = args.do_valid
+    state.train_state.do_test = args.do_test
     timers('train/valid/test-data-iterators-setup').stop()
     print_datetime('after dataloaders are built')
     app_metrics['app_build_dataiters_finish_time'] = one_logger_utils.get_timestamp_in_ms()
 
-    # Track if training is enabled. Can only be done once args.do_train is assigned after dataloader is built.
+    # Track if training is enabled. Can only be done once do_train is assigned after dataloader is built.
     one_logger_utils.track_config_flags(
-        args.train_iters,
+        cfg_container.train.train_iters,
         cfg_container.validation.skip_train,
-        args.do_train,
-        args.do_valid,
-        args.do_test,
-        args.dataloader_type,
+        state.train_state.do_train,
+        state.train_state.do_valid,
+        state.train_state.do_test,
+        state.train_state.dataloader_type,
     )
 
     # Print setup timing.
@@ -1362,7 +1367,7 @@ def pretrain(
 
         iteration = 0
         args.curr_iteration = iteration
-        if args.do_train and (args.train_iters or 0) > 0:
+        if state.train_state.do_train and (cfg_container.train.train_iters or 0) > 0:
             iteration, num_floating_point_operations_so_far = train(
                 forward_step_func,
                 model,
@@ -1399,7 +1404,7 @@ def pretrain(
 
         iteration = args.iteration
 
-    if args.do_valid:
+    if state.train_state.do_valid:
         prefix = f'iteration {iteration} on validation set'
         if args.perform_rl_step:
             rl_eval_model = model
@@ -1429,7 +1434,7 @@ def pretrain(
                 non_loss_data_func=non_loss_data_func
             )
 
-    if args.do_test:
+    if state.train_state.do_test:
         prefix = f'iteration {iteration} on test set'
         evaluate_and_print_results(
             prefix,
