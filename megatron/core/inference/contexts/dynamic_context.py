@@ -662,6 +662,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 max_sequence_length=self.max_sequence_length,
                 use_cuda_graphs_for_non_decode_steps=self.use_cuda_graphs_for_non_decode_steps,
                 num_speculative_tokens=self.num_speculative_tokens,
+                sizing_distribution=inference_config.cuda_graph_sizing_distribution,
             )
         )
 
@@ -966,7 +967,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # then int32 token fields, then int32/float32 request-staging fields.
         #   token_to_input_ids                         (int64,   max_tokens)
         #   token_to_pos_ids                           (int64,   max_tokens)
-        #   token_to_block_idx                         (int32,   max_tokens)
+        #   token_to_block_idx                         (int64,   max_tokens)
         #   token_to_local_position_within_kv_block    (int32,   max_tokens)
         #   token_to_request_idx                       (int32,   max_tokens)
         #   token_to_position_in_request               (int32,   max_tokens)
@@ -996,11 +997,24 @@ class DynamicInferenceContext(BaseInferenceContext):
         _mha_kv_seq_lengths_bytes = self.max_requests * 4
         _mha_cu_kv_seq_lengths_bytes = (self.max_requests + 1) * 4
         _mha_block_table_bytes = self.max_requests * self.max_kv_block_count * 4
-        # Mamba section: 9 int32 fields (hybrid models only). Must match the
-        # MambaMetadata shapes (mirrors the layout documented in ContextGPUView).
+        _pre_mamba_bytes = (
+            3 * _tok_int64_bytes
+            + 3 * _tok_int32_bytes
+            + 7 * _req_4byte_bytes
+            + _mha_query_lengths_bytes
+            + _mha_cu_query_seq_lengths_bytes
+            + _mha_kv_seq_lengths_bytes
+            + _mha_cu_kv_seq_lengths_bytes
+            + _mha_block_table_bytes
+        )
+        # Mamba section (hybrid models only). Must match the MambaMetadata
+        # shapes (mirrors the layout documented in ContextGPUView).
+        # batch_indices_decode is int64; all other fields are int32.
         if self.is_hybrid_model:
+            # mamba_batch_indices_decode is int64; pad to 8-byte alignment.
+            _mamba_align_pad = (8 - _pre_mamba_bytes % 8) % 8
             self._max_mamba_chunks = self.max_tokens // self.mamba_chunk_size + self.max_requests
-            _mamba_batch_indices_decode_bytes = self.max_requests * 4
+            _mamba_batch_indices_decode_bytes = self.max_requests * 8
             _mamba_batch_indices_prefill_bytes = self.max_requests * 4
             _mamba_seq_idx_bytes = self.max_tokens * 4
             _mamba_cu_seqlens_bytes = (self.max_requests + 1) * 4
@@ -1010,6 +1024,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             _mamba_conv_seq_idx_bytes = self.max_tokens * 4
             _mamba_conv_seq_start_bytes = self.max_tokens * 4
         else:
+            _mamba_align_pad = 0
             self._max_mamba_chunks = 0
             _mamba_batch_indices_decode_bytes = 0
             _mamba_batch_indices_prefill_bytes = 0
@@ -1021,14 +1036,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             _mamba_conv_seq_idx_bytes = 0
             _mamba_conv_seq_start_bytes = 0
         _total_bytes = (
-            2 * _tok_int64_bytes
-            + 4 * _tok_int32_bytes
-            + 7 * _req_4byte_bytes
-            + _mha_query_lengths_bytes
-            + _mha_cu_query_seq_lengths_bytes
-            + _mha_kv_seq_lengths_bytes
-            + _mha_cu_kv_seq_lengths_bytes
-            + _mha_block_table_bytes
+            _pre_mamba_bytes
+            + _mamba_align_pad
             + _mamba_batch_indices_decode_bytes
             + _mamba_batch_indices_prefill_bytes
             + _mamba_seq_idx_bytes
@@ -1059,10 +1068,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             torch.long
         )
         _off += _tok_int64_bytes
-        self.token_to_block_idx = self._cpu_bookkeeping_buf[_off : _off + _tok_int32_bytes].view(
-            torch.int32
+        self.token_to_block_idx = self._cpu_bookkeeping_buf[_off : _off + _tok_int64_bytes].view(
+            torch.int64
         )
-        _off += _tok_int32_bytes
+        _off += _tok_int64_bytes
         # i.e For a set of tokens A B C D E F ..  and block_size 4:
         # token_to_position_in_request is  [0, 1, 2, 3, 4, 5]
         # token_to_local_position_within_kv_block is [0 , 1, 2, 3, 0, 1, 2]
@@ -1158,9 +1167,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         # by MambaMetadata.compute_cpu_metadata(); transferred as part of the
         # single coalesced H2D in transfer_bookkeeping_to_gpu().
         if self.is_hybrid_model:
+            _off += _mamba_align_pad
             self._cpu_mamba_batch_indices_decode = self._cpu_bookkeeping_buf[
                 _off : _off + _mamba_batch_indices_decode_bytes
-            ].view(torch.int32)
+            ].view(torch.int64)
             _off += _mamba_batch_indices_decode_bytes
             self._cpu_mamba_batch_indices_prefill = self._cpu_bookkeeping_buf[
                 _off : _off + _mamba_batch_indices_prefill_bytes
@@ -2428,10 +2438,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.kv_block_allocator.reset()
         self.request_to_kv_block_ids.fill_(-1)
 
-        # Reset step counter and LRU clock
-        self.step_count = 0
-        self.prefix_cache_lru_clock = 0
-
         # Reset chunked prefill state
         self.chunked_prefill_request_id = -1
         self.num_prefill_requests = 0
@@ -2455,6 +2461,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         self.reset_tensors()
         self.reset_metadata()
+
+        # Reset lifetime counters (not reset in reset_metadata, which is also
+        # called during suspend/resume where these must persist).
+        self.step_count = 0
+        self.prefix_cache_lru_clock = 0
 
         # Reset Mamba cache state
         if self.mamba_slot_allocator is not None:
