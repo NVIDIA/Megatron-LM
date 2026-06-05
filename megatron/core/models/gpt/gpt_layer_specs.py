@@ -367,6 +367,7 @@ def get_gpt_layer_local_submodules(
     use_kitchen: bool = False,
     use_kitchen_attention: bool = False,
     kitchen_attention_backend: str = "sdpa",
+    use_liger: bool = False,
 ) -> TransformerLayerSubmodules:
     """Use these submodules for an implementation using only modules in Megatron-Core.
 
@@ -378,10 +379,17 @@ def get_gpt_layer_local_submodules(
         multi_latent_attention (bool, optional): To use MLA. Defaults to False.
         fp8 (str, optional): Deprecated. For temporary Nemo compatibility.
         qk_l2_norm (bool, optional): To use l2 norm for queries/keys. Defaults to False.
+        use_liger (bool, optional): Use Liger-Kernel Triton ops where supported
+            (currently RMSNorm). Mutually exclusive with ``use_kitchen``.
+            Defaults to False.
 
     Returns:
         TransformerLayerSubmodules: Megatron-Core modules to construct a TransformerLayer
     """
+
+    assert not (use_kitchen and use_liger), (
+        "use_kitchen and use_liger are mutually exclusive."
+    )
 
     if use_kitchen:
         assert HAVE_KITCHEN
@@ -390,6 +398,11 @@ def get_gpt_layer_local_submodules(
             use_kitchen_attention=use_kitchen_attention,
             kitchen_attention_backend=kitchen_attention_backend,
         )
+    elif use_liger:
+        from megatron.core.extensions.liger_kernel_spec_provider import (
+            LigerSpecProvider,
+        )
+        backend = LigerSpecProvider()
     else:
         backend = LocalSpecProvider()
     # Adjust for RMS norm.
