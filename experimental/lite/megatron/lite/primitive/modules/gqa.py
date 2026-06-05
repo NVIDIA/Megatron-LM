@@ -249,7 +249,10 @@ class GQAttention(nn.Module):
         if self._mrope_section is not None:
             if position_ids is None:
                 raise ValueError("MRoPE attention requires position_ids.")
-            freqs = self.rotary(position_ids, self._mrope_section, packed_seq=is_thd)
+            # For MRoPE the packed THD path applies RoPE directly through the
+            # bshd helper, so the rotary module must slice freqs for this CP
+            # rank before q/k are rotated.
+            freqs = self.rotary(position_ids, self._mrope_section, packed_seq=False)
             if is_thd:
                 q = _apply_rotary_pos_emb_bshd(q[:, None], freqs).squeeze(1)
                 k = _apply_rotary_pos_emb_bshd(k[:, None], freqs).squeeze(1)

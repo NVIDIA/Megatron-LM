@@ -57,6 +57,9 @@ Useful knobs:
 - `ATTENTION_BACKEND=flash`
 - `DRY_RUN=1` to print the resolved `torchrun` command without launching
 
+For the FSDP2 optimizer primitive, keep `PARAM_OFFLOAD=False`; optimizer
+offload is supported through `OPTIMIZER_OFFLOAD=True`.
+
 Example dry run:
 
 ```bash

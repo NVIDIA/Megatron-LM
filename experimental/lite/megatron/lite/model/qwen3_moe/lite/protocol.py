@@ -32,7 +32,6 @@ from megatron.lite.model.qwen3_moe.lite.checkpoint import (
 )
 from megatron.lite.model.qwen3_moe.lite.model import MTPLossAutoScaler, Qwen3MoEModel
 from megatron.lite.primitive.bundle import ModelBundle
-from megatron.lite.primitive.deterministic import deterministic_requested
 from megatron.lite.primitive.modules.lora import (
     LoraConfig,
     freeze_non_lora_params,
@@ -68,6 +67,7 @@ class ImplConfig:
     mtp_detach_encoder: bool = False
     mtp_loss_scaling_factor: float = 0.1
     mtp_use_repeated_layer: bool | None = None
+    deterministic: bool = True
     lora: LoraConfig | dict | None = None
 
 
@@ -155,7 +155,7 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
 
     # ── parallel state (model creates its own) ──
     ps = init_parallel(p)
-    deterministic = deterministic_requested()
+    deterministic = impl_cfg.deterministic
 
     # ── build chunks ──
     recompute_spec = parse_recompute_spec(impl_cfg.recompute)

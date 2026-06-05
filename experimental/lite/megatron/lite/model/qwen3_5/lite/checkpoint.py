@@ -59,6 +59,49 @@ def _split_gate_up(tensor: torch.Tensor, rank: int, size: int) -> torch.Tensor:
     return torch.cat([gate, up], dim=0).contiguous()
 
 
+def _tp_linear_attn_in_proj(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    z: torch.Tensor,
+    b: torch.Tensor,
+    a: torch.Tensor,
+    *,
+    ps: ParallelState,
+) -> torch.Tensor:
+    """Shard each GDN projection independently, then pack the local layout."""
+    return torch.cat(
+        [
+            _tp(q, ps.tp_rank, ps.tp_size),
+            _tp(k, ps.tp_rank, ps.tp_size),
+            _tp(v, ps.tp_rank, ps.tp_size),
+            _tp(z, ps.tp_rank, ps.tp_size),
+            _tp(b, ps.tp_rank, ps.tp_size),
+            _tp(a, ps.tp_rank, ps.tp_size),
+        ],
+        dim=0,
+    ).contiguous()
+
+
+def _tp_linear_attn_conv1d(
+    tensor: torch.Tensor,
+    *,
+    cfg: Qwen35Config,
+    ps: ParallelState,
+) -> torch.Tensor:
+    qk_dim = cfg.linear_num_key_heads * cfg.linear_key_head_dim
+    v_dim = cfg.linear_num_value_heads * cfg.linear_value_head_dim
+    q, k, v = tensor.split([qk_dim, qk_dim, v_dim], dim=0)
+    return torch.cat(
+        [
+            _tp(q, ps.tp_rank, ps.tp_size),
+            _tp(k, ps.tp_rank, ps.tp_size),
+            _tp(v, ps.tp_rank, ps.tp_size),
+        ],
+        dim=0,
+    ).contiguous()
+
+
 def _zero_centered_gamma_from_hf(tensor: torch.Tensor) -> torch.Tensor:
     return tensor - 1
 
@@ -158,19 +201,20 @@ def _load_linear_attn(
     b = _get(reader, f"{hf_prefix}.in_proj_b.weight")
     a = _get(reader, f"{hf_prefix}.in_proj_a.weight")
 
-    # lite GDN splits by contiguous Q/K/V/Z/B/A sections.
-    qkvzba = torch.cat([q, k, v, z, b, a], dim=0)
-    out[f"{local_prefix}.linear_attn.in_proj.linear.weight"] = _tp(
-        qkvzba,
-        ps.tp_rank,
-        ps.tp_size,
-        dim=0,
+    out[f"{local_prefix}.linear_attn.in_proj.linear.weight"] = _tp_linear_attn_in_proj(
+        q,
+        k,
+        v,
+        z,
+        b,
+        a,
+        ps=ps,
     )
     out[f"{local_prefix}.linear_attn.in_proj.linear.layer_norm_weight"] = input_ln
-    out[f"{local_prefix}.linear_attn.conv1d.weight"] = _tp(
+    out[f"{local_prefix}.linear_attn.conv1d.weight"] = _tp_linear_attn_conv1d(
         _get(reader, f"{hf_prefix}.conv1d.weight"),
-        ps.tp_rank,
-        ps.tp_size,
+        cfg=cfg,
+        ps=ps,
     )
     out[f"{local_prefix}.linear_attn.dt_bias"] = _tp(_get(reader, f"{hf_prefix}.dt_bias"), ps.tp_rank, ps.tp_size)
     out[f"{local_prefix}.linear_attn.A_log"] = _tp(_get(reader, f"{hf_prefix}.A_log"), ps.tp_rank, ps.tp_size)
@@ -201,7 +245,7 @@ def _load_shared_expert(
         ],
         dim=0,
     )
-    out[f"{local_prefix}.moe.shared_expert.gate_up.linear.weight"] = _tp(
+    out[f"{local_prefix}.moe.shared_expert.gate_up.linear.weight"] = _split_gate_up(
         gate_up,
         ps.tp_rank,
         ps.tp_size,
