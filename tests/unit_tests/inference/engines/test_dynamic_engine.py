@@ -858,10 +858,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     def test_max_sequence_length_clamp(self) -> None:
         """Clamp (not reject) when num_tokens_to_generate exceeds the remaining sequence budget."""
         test_config = DynamicEngineTestConfig(
-            num_requests=1,
-            min_prompt_length=8,
-            max_prompt_length=8,
-            num_tokens_to_generate=4,
+            num_requests=1, min_prompt_length=8, max_prompt_length=8, num_tokens_to_generate=4
         )
         env = self._build_test_env(test_config)
         request = env.requests[0]
