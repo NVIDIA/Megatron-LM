@@ -28,6 +28,8 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor
 
+from megatron.core.transformer.experimental_attention_variant import csa_cp_kernels
+
 # ---------------------------------------------------------------------------
 # Lazy kernel imports
 # ---------------------------------------------------------------------------
@@ -307,9 +309,8 @@ def build_flat_topk_idxs(
             res = _DSA.compactify_wrapper(global_idxs)
             global_idxs, topk_length_flat = res["indices"], res["topk_length"]
         else:
-            # CPU fallback so the unit tests that exercise this helper without
-            # CUDA still work. Production callers always go through the CUDA
-            # path above.
+            # CPU reference branch for unit tests that exercise this helper
+            # without CUDA. Production callers go through the CUDA path above.
             valid_mask = global_idxs >= 0
             sorted_indices = valid_mask.int().argsort(dim=-1, descending=True, stable=True)
             global_idxs = global_idxs.gather(-1, sorted_indices)
@@ -469,13 +470,14 @@ def _indexer_topk_core(
     cu_seqlens_kv: Optional[Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_kv: Optional[int] = None,
+    fixed_topk_width: Optional[int] = None,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Layout-agnostic core for :func:`indexer_topk`.
 
     Wraps cuDNN Frontend's CuTe-DSL indexer-forward kernel.
-    The pipeline (forward → per-row valid lengths → radix top-K → pad-to-``topk`` → ``topk_length``)
-    is the same for both layouts; only the input shape glue, valid-length derivation,
-    and output reshape differ. Selected by ``cu_seqlens_q``.
+    The pipeline is indexer forward, per-row valid lengths, radix top-K, optional
+    fixed-width output padding, then ``topk_length``. Selected by
+    ``cu_seqlens_q``.
 
     BSHD layout (``cu_seqlens_q is None``):
         q: ``(b, sq, idx_nh, idx_hd)`` bf16, C-contiguous.
@@ -566,19 +568,40 @@ def _indexer_topk_core(
     )
     topk_indices = tk_result["indices"]  # (total_q, topk_k) int32
 
-    if topk_k < topk:
+    output_topk = int(fixed_topk_width) if fixed_topk_width is not None else topk
+    if output_topk < topk_k:
+        raise ValueError(
+            "fixed_topk_width must be greater than or equal to the computed top-k width: "
+            f"fixed={output_topk}, computed={topk_k}."
+        )
+
+    if fixed_topk_width is None and topk_k < topk:
         pad = torch.full((total_q, topk - topk_k), -1, dtype=torch.int32, device=device)
         topk_indices = torch.cat([topk_indices, pad], dim=-1)
 
     if is_thd:
-        safe_topk = topk_indices.clamp(min=0).to(torch.long)
-        selected_scores = torch.gather(scores_flat, dim=-1, index=safe_topk)
-        selected_valid = (topk_indices >= 0) & torch.isfinite(selected_scores)
-        topk_indices = torch.where(
-            selected_valid, topk_indices, torch.full_like(topk_indices, -1)
-        )
-
-    topk_length = (topk_indices >= 0).sum(dim=-1).int()  # (total_q,)
+        if csa_cp_kernels.can_use_cute_kernels(scores_flat, topk_indices):
+            topk_indices, topk_length = csa_cp_kernels.filter_indexer_topk_scores(
+                scores_flat, topk_indices, output_width=output_topk
+            )
+        else:
+            safe_topk = topk_indices.clamp(min=0).to(torch.long)
+            selected_scores = torch.gather(scores_flat, dim=-1, index=safe_topk)
+            selected_valid = (topk_indices >= 0) & torch.isfinite(selected_scores)
+            topk_indices = torch.where(
+                selected_valid, topk_indices, torch.full_like(topk_indices, -1)
+            )
+            topk_length = (topk_indices >= 0).sum(dim=-1).int()  # (total_q,)
+            if output_topk > topk_indices.shape[-1]:
+                pad = torch.full(
+                    (total_q, output_topk - topk_indices.shape[-1]),
+                    -1,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                topk_indices = torch.cat([topk_indices, pad], dim=-1)
+    else:
+        topk_length = (topk_indices >= 0).sum(dim=-1).int()  # (total_q,)
 
     # ---------------- Layout-specific output reshape --------------------
     if is_thd:
@@ -598,6 +621,7 @@ def indexer_topk(
     cu_seqlens_kv: Optional[Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_kv: Optional[int] = None,
+    fixed_topk_width: Optional[int] = None,
 ) -> Tuple[Tensor, Tensor]:
     """Score + top-K selection for inference (no KL loss, no backward).
 
@@ -619,6 +643,9 @@ def indexer_topk(
         cu_seqlens_kv: THD only — ``(B+1,)`` int32 CUDA cumulative KV lens.
         max_seqlen_q: THD only — per-batch max Q length.
         max_seqlen_kv: THD only — per-batch max KV length.
+        fixed_topk_width: THD only — optional static output width. CP callers
+            use this to fuse score filtering and fixed-width padding into one
+            CuTeDSL kernel while keeping the radix top-K visible width smaller.
 
     Returns:
         SBHD: ``(topk_indices (b, sq, topk),  topk_length (b, sq))`` int32
@@ -632,6 +659,8 @@ def indexer_topk(
             "indexer_topk THD mode requires cu_seqlens_q, cu_seqlens_kv, "
             "max_seqlen_q, and max_seqlen_kv to all be supplied."
         )
+    if fixed_topk_width is not None and not is_thd:
+        raise ValueError("fixed_topk_width is only supported in THD mode.")
 
     # ``indexer_softmax_scale`` is applied via the
     # ``relu(c·x) = c·relu(x)`` trick (the cudnn kernel does the relu),
@@ -659,6 +688,7 @@ def indexer_topk(
         cu_seqlens_kv=cu_seqlens_kv,
         max_seqlen_q=int(max_seqlen_q) if max_seqlen_q is not None else None,
         max_seqlen_kv=int(max_seqlen_kv) if max_seqlen_kv is not None else None,
+        fixed_topk_width=fixed_topk_width,
     )
     return topk_indices, topk_length
 

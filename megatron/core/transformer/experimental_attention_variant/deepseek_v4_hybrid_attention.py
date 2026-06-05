@@ -19,9 +19,8 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.experimental_attention_variant.csa import apply_rope_at_positions
+from megatron.core.transformer.experimental_attention_variant.csa import apply_cp_token_rope
 from megatron.core.transformer.experimental_attention_variant.csa_cp_utils import (
-    contiguous_cp_partition,
     exchange_left_boundary_tensor,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -230,78 +229,13 @@ class DSv4HybridAttention(Attention):
         d_comp = max((8 if ratio == 4 else ratio for ratio in ratios), default=0)
         return max(self.config.csa_window_size, d_comp)
 
-    def _dsv4_cp_seq_positions(
-        self, global_ids: torch.Tensor, cu_seqlens: torch.Tensor, clamp: bool
-    ) -> torch.Tensor:
-        if clamp:
-            total_tokens = int(cu_seqlens[-1].item())
-            global_ids = global_ids.clamp(min=0, max=max(total_tokens - 1, 0))
-        batch_ids = torch.searchsorted(cu_seqlens.to(torch.long), global_ids, right=True) - 1
-        batch_ids = batch_ids.clamp(min=0, max=cu_seqlens.numel() - 2)
-        return global_ids - cu_seqlens.to(torch.long)[batch_ids]
-
-    def _dsv4_cp_local_seq_positions(
-        self, packed_seq_params, local_tokens: int
-    ) -> torch.Tensor:
-        cu_seqlens_q = (
-            packed_seq_params.cu_seqlens_q_padded
-            if packed_seq_params.cu_seqlens_q_padded is not None
-            else packed_seq_params.cu_seqlens_q
-        )
-        total_tokens = int(cu_seqlens_q[-1].item())
-        cp_size = self.pg_collection.cp.size()
-        cp_rank = self.pg_collection.cp.rank()
-        if total_tokens % cp_size != 0:
-            raise RuntimeError(
-                "DSv4 THD CP local RoPE requires padded_total_tokens % cp_size == 0: "
-                f"total={total_tokens}, cp_size={cp_size}"
-            )
-        expected_local_tokens = total_tokens // cp_size
-        if local_tokens != expected_local_tokens:
-            raise RuntimeError(
-                "DSv4 THD CP local RoPE expects contiguous equal local token chunks: "
-                f"local={local_tokens}, expected={expected_local_tokens}"
-            )
-        global_start = cp_rank * expected_local_tokens
-        global_ids = torch.arange(
-            global_start,
-            global_start + expected_local_tokens,
-            device=cu_seqlens_q.device,
-            dtype=torch.long,
-        )
-        return self._dsv4_cp_seq_positions(global_ids, cu_seqlens_q, clamp=False)
-
-    def _dsv4_cp_boundary_seq_positions(
-        self, packed_seq_params, d_window: int
-    ) -> torch.Tensor:
-        cu_seqlens_q = (
-            packed_seq_params.cu_seqlens_q_padded
-            if packed_seq_params.cu_seqlens_q_padded is not None
-            else packed_seq_params.cu_seqlens_q
-        )
-        total_tokens = int(cu_seqlens_q[-1].item())
-        cp_size = self.pg_collection.cp.size()
-        cp_rank = self.pg_collection.cp.rank()
-        if total_tokens % cp_size != 0:
-            raise RuntimeError(
-                "DSv4 THD CP boundary RoPE requires padded_total_tokens % cp_size == 0: "
-                f"total={total_tokens}, cp_size={cp_size}"
-            )
-        l_local = total_tokens // cp_size
-        global_start = cp_rank * l_local
-        global_ids = torch.arange(
-            global_start - d_window,
-            global_start,
-            device=cu_seqlens_q.device,
-            dtype=torch.long,
-        )
-        return self._dsv4_cp_seq_positions(global_ids, cu_seqlens_q, clamp=True)
-
     def _exchange_cp_boundary_hidden(
         self, hidden_states: torch.Tensor, d_window: int
     ) -> torch.Tensor:
-        hidden_tail = hidden_states[-d_window:].reshape(d_window, -1)
-        boundary_hidden = exchange_left_boundary_tensor(hidden_tail, d_window, self.pg_collection.cp)
+        # Pass the full local buffer so the custom backward writes tail grads
+        # directly instead of routing them through an outer SliceBackward copy.
+        hidden_flat = hidden_states.view(hidden_states.shape[0], -1)
+        boundary_hidden = exchange_left_boundary_tensor(hidden_flat, d_window, self.pg_collection.cp)
         return boundary_hidden.reshape(
             (d_window,) + tuple(hidden_states.shape[1:])
         )
@@ -319,23 +253,29 @@ class DSv4HybridAttention(Attention):
                 f"D_window={d_window}, L_local={l_local}"
             )
         hidden_2d = boundary_hidden.squeeze(1)
-        if l_local == d_window:
-            padded_hidden = hidden_2d
-        else:
-            pad = hidden_2d.new_zeros((l_local - d_window, hidden_2d.shape[-1]))
-            padded_hidden = torch.cat([pad, hidden_2d], dim=0)
-
-        boundary_kv, _ = self.linear_kv_proj(padded_hidden)
-        boundary_kv = boundary_kv[-d_window:]
+        boundary_kv, _ = self.linear_kv_proj(hidden_2d)
         boundary_kv = self.kv_layernorm(boundary_kv)
-        boundary_positions = self._dsv4_cp_boundary_seq_positions(packed_seq_params, d_window)
-        boundary_key = apply_rope_at_positions(
+        cu_seqlens_q = (
+            packed_seq_params.cu_seqlens_q_padded
+            if packed_seq_params.cu_seqlens_q_padded is not None
+            else packed_seq_params.cu_seqlens_q
+        )
+        max_seqlen_q = packed_seq_params.max_seqlen_q
+        if max_seqlen_q is None:
+            raise RuntimeError("DSv4 THD CP boundary RoPE requires max_seqlen_q.")
+        cp_size = self.pg_collection.cp.size()
+        cp_rank = self.pg_collection.cp.rank()
+        global_start = cp_rank * l_local
+        boundary_key = apply_cp_token_rope(
             boundary_kv.unsqueeze(-2),
             self.config.qk_head_dim,
             self.config.qk_pos_emb_head_dim,
             self.rotary_pos_emb,
-            self.config,
-            boundary_positions,
+            cu_seqlens_q,
+            global_start - d_window,
+            l_local * cp_size,
+            int(max_seqlen_q),
+            clamp_to_valid_token=True,
         )
         return boundary_key.contiguous()
 
@@ -384,21 +324,14 @@ class DSv4HybridAttention(Attention):
         d_window = None
         if use_thd_cp:
             d_window = self._dsv4_cp_boundary_window()
-            cu_trace = (
-                packed_seq_params.cu_seqlens_q_padded
-                if packed_seq_params.cu_seqlens_q_padded is not None
-                else packed_seq_params.cu_seqlens_q
-            )
-            global_start, l_local = contiguous_cp_partition(
-                cu_trace, self.pg_collection.cp.size(), self.pg_collection.cp.rank()
-            )
+            l_local = hidden_states.shape[0]
 
         # =====================
         # Query, Key, and Value
         # =====================
         # Get the query, key and value tensors based on the type of attention -
         # self or cross attn.
-        query, key, value, q_compressed, kv_compressed = self.get_query_key_value_tensors(
+        query, key, value, q_compressed = self.get_query_key_value_tensors(
             hidden_states,
             key_value_states,
             position_ids,
@@ -517,6 +450,22 @@ class DSv4HybridAttention(Attention):
             )
             if packed_seq:
                 core_attn_out = core_attn_out.unsqueeze(1)
+        elif use_contiguous_thd_cp:
+            cp_size = self.pg_collection.cp.size()
+            cp_rank = self.pg_collection.cp.rank()
+            if rope_seqlen is None:
+                raise RuntimeError("DSv4 THD CP inverse RoPE requires max_seqlen_kv.")
+            core_attn_out = apply_cp_token_rope(
+                core_attn_out,
+                nope_dim,
+                pos_dim,
+                self.rotary_pos_emb,
+                cu_seqlens_kv,
+                cp_rank * seq_len,
+                seq_len * cp_size,
+                int(rope_seqlen),
+                inverse=True,
+            )
         else:
             content_part, rot_part = torch.split(
                 core_attn_out, [core_attn_out.size(-1) - pos_dim, pos_dim], dim=-1
@@ -528,36 +477,24 @@ class DSv4HybridAttention(Attention):
                 rot_part_in = rot_part.squeeze(1)
             else:
                 rot_part_in = rot_part
-            if use_contiguous_thd_cp:
-                inverse_positions = self._dsv4_cp_local_seq_positions(packed_seq_params, seq_len)
-                rot_part_out = apply_rope_at_positions(
-                    rot_part_in.clone().unsqueeze(1),
-                    0,
-                    pos_dim,
-                    self.rotary_pos_emb,
-                    self.config,
-                    inverse_positions,
-                    inverse=True,
-                ).squeeze(1)
-            else:
-                rotary_pos_emb_out = rotary_pos_emb
-                cu_seqlens_kv_rope = cu_seqlens_kv
-                rot_part_out = apply_rotary_pos_emb(
-                    rot_part_in,
-                    rotary_pos_emb_out,
-                    self.config,
-                    cu_seqlens=cu_seqlens_kv_rope,
-                    mscale=mscale,
-                    cp_group=self.pg_collection.cp,
-                    mla_rotary_interleaved=True,
-                    inverse=True,
-                    mla_output_remove_interleaving=True,
-                )
+            rotary_pos_emb_out = rotary_pos_emb
+            cu_seqlens_kv_rope = cu_seqlens_kv
+            rot_part_out = apply_rotary_pos_emb(
+                rot_part_in,
+                rotary_pos_emb_out,
+                self.config,
+                cu_seqlens=cu_seqlens_kv_rope,
+                mscale=mscale,
+                cp_group=self.pg_collection.cp,
+                mla_rotary_interleaved=True,
+                inverse=True,
+                mla_output_remove_interleaving=True,
+            )
             if packed_seq:
                 rot_part = rot_part_out.unsqueeze(1)
             else:
                 rot_part = rot_part_out
-        core_attn_out = torch.cat([content_part, rot_part], dim=-1)
+            core_attn_out = torch.cat([content_part, rot_part], dim=-1)
         core_attn_out = core_attn_out.view(seq_len, core_attn_out.size(1), -1)
 
         # Grouped output
@@ -744,16 +681,6 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         else:
             cu_seqlens_q = cu_seqlens_kv = None
 
-        if packed_seq and self.pg_collection.cp.size() > 1:
-            _, l_local = contiguous_cp_partition(
-                cu_seqlens_q, self.pg_collection.cp.size(), self.pg_collection.cp.rank()
-            )
-            if l_local != hidden_states.shape[0]:
-                raise RuntimeError(
-                    "DSv4 THD CP projection expects contiguous equal local token chunks: "
-                    f"hidden={hidden_states.shape[0]}, L_local={l_local}"
-                )
-
         # =========================================
         # QKV down projection and layernorm
         # =========================================
@@ -769,13 +696,6 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             # So we need to reshape qkv from [t, 1, h, d] to [t, h, d].
             q_compressed = q_compressed.squeeze(1)
             kv_compressed = kv_compressed.squeeze(1)
-        q_compressed_local = q_compressed
-        kv_compressed_local = kv_compressed
-        explicit_cp_positions = None
-        if packed_seq and self.pg_collection.cp.size() > 1:
-            explicit_cp_positions = self._dsv4_cp_local_seq_positions(
-                packed_seq_params, kv_compressed_local.shape[0]
-            )
 
         # =========================================
         # Apply norm
@@ -784,7 +704,6 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         if self.config.q_lora_rank is not None:
             # q_compressed: [num_tokens, q_lora_rank]
             q_compressed = apply_module(self.q_layernorm)(q_compressed)
-            q_compressed_local = q_compressed
 
         # =========================================
         # QKV up projection and RoPE apply
@@ -812,7 +731,8 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             if k_pos_emb is not None:
                 k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
 
-            if self.config.apply_rope_fusion and explicit_cp_positions is None:
+            use_contiguous_thd_cp = packed_seq and self.pg_collection.cp.size() > 1
+            if self.config.apply_rope_fusion and not use_contiguous_thd_cp:
                 query = fused_mla_rope_inplace(
                     q,
                     rotary_pos_cos,
@@ -840,22 +760,28 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                 value = kv
             else:
                 q_len = q.size()[0]
-                if explicit_cp_positions is not None:
-                    query = apply_rope_at_positions(
+                if use_contiguous_thd_cp:
+                    cp_size = self.pg_collection.cp.size()
+                    cp_rank = self.pg_collection.cp.rank()
+                    query = apply_cp_token_rope(
                         q,
                         self.config.qk_head_dim,
                         self.config.qk_pos_emb_head_dim,
                         self.rotary_pos_emb,
-                        self.config,
-                        explicit_cp_positions,
+                        cu_seqlens_q,
+                        cp_rank * q_len,
+                        q_len * cp_size,
+                        int(rotary_seq_len),
                     )
-                    kv = apply_rope_at_positions(
+                    kv = apply_cp_token_rope(
                         kv.unsqueeze(-2),
                         self.config.qk_head_dim,
                         self.config.qk_pos_emb_head_dim,
                         self.rotary_pos_emb,
-                        self.config,
-                        explicit_cp_positions,
+                        cu_seqlens_q,
+                        cp_rank * q_len,
+                        q_len * cp_size,
+                        int(rotary_seq_len),
                     )
                     key = kv
                     value = kv
@@ -935,7 +861,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                 q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
             )
 
-        return query, key, value, q_compressed_local, kv_compressed_local
+        return query, key, value, q_compressed
 
     def backward_dw(self) -> NoReturn:
         """Execute weight gradient computation"""

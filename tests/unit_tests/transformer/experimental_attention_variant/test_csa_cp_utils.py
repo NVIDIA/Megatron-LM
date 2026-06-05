@@ -3,18 +3,25 @@
 import pytest
 import torch
 
+from megatron.core.transformer.experimental_attention_variant import csa_cp_kernels
 from megatron.core.transformer.experimental_attention_variant.csa_cp_utils import (
+    apply_cp_compressed_rope_fused,
+    apply_cp_token_rope_fused,
+    apply_thd_overlap_transform_fused,
     build_compressor_prep_compact,
     build_cp_flat_idxs,
     build_cp_flat_idxs_for_indexer_loss,
     build_cp_flat_idxs_for_indexer_loss_fused,
     build_cp_flat_idxs_fused,
     build_cp_indexer_topk_inputs,
+    build_global_compressed_cu_seqlens,
+    build_global_compressed_cu_seqlens_fused,
     can_use_csa_cp_fused_kernels,
     contiguous_cp_partition,
     exchange_left_boundary_tensor,
     pack_cp_kv_full,
     pack_cp_kv_full_fused,
+    pad_indexer_topk_to_fixed_width_fused,
 )
 
 
@@ -24,6 +31,63 @@ def _require_cute_cuda():
     probe = torch.empty(1, device="cuda")
     if not can_use_csa_cp_fused_kernels(probe):
         pytest.skip("CSA CP CuTe kernels are not available in this environment.")
+
+
+def _rope_reference(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    positions: torch.Tensor,
+    nope_dim: int,
+    pos_dim: int,
+    inverse: bool = False,
+) -> torch.Tensor:
+    x_nope, x_pos = torch.split(x, [nope_dim, pos_dim], dim=-1)
+    cos_flat = cos.reshape(cos.shape[0], -1).index_select(0, positions.to(torch.long))
+    sin_flat = sin.reshape(sin.shape[0], -1).index_select(0, positions.to(torch.long))
+    view_shape = (x.shape[0],) + (1,) * (x.ndim - 2) + (pos_dim,)
+    cos_pos = cos_flat[:, :pos_dim].view(view_shape)
+    sin_pos = sin_flat[:, :pos_dim].view(view_shape)
+    if inverse:
+        sin_pos = -sin_pos
+
+    half = pos_dim // 2
+    x1 = x_pos[..., 0::2]
+    x2 = x_pos[..., 1::2]
+    left = x1 * cos_pos[..., :half] - x2 * sin_pos[..., :half]
+    right = x2 * cos_pos[..., half:] + x1 * sin_pos[..., half:]
+    x_rot = torch.stack((left, right), dim=-1).flatten(-2)
+    return torch.cat((x_nope, x_rot), dim=-1)
+
+
+def _seq_positions_from_global_rows(
+    cu_seqlens: torch.Tensor,
+    global_row_base: int,
+    rows: int,
+    total_tokens: int,
+    clamp_to_valid_token: bool = False,
+) -> torch.Tensor:
+    global_rows = torch.arange(global_row_base, global_row_base + rows, dtype=torch.long)
+    if clamp_to_valid_token:
+        global_rows = global_rows.clamp(min=0, max=total_tokens - 1)
+    seq_ids = torch.searchsorted(cu_seqlens.to(torch.long), global_rows, right=True) - 1
+    seq_ids = seq_ids.clamp(min=0, max=cu_seqlens.numel() - 2)
+    return global_rows - cu_seqlens.to(torch.long)[seq_ids]
+
+
+def _overlap_transform_thd_reference(
+    tensor: torch.Tensor,
+    is_first_in_seg: torch.Tensor,
+    head_dim: int,
+    fill_value: float,
+) -> torch.Tensor:
+    n_groups, ratio, b_dim, _ = tensor.shape
+    out = tensor.new_full((n_groups, 2 * ratio, b_dim, head_dim), fill_value)
+    out[:, ratio:] = tensor[:, :, :, head_dim : 2 * head_dim]
+    prev = torch.roll(tensor[:, :, :, :head_dim], shifts=1, dims=0)
+    prev[is_first_in_seg] = fill_value
+    out[:, :ratio] = prev
+    return out
 
 
 def test_contiguous_cp_partition_requires_padded_total_divisible_by_cp_size():
@@ -145,10 +209,10 @@ def test_kv_full_pack_keeps_per_sequence_window_then_compressed_layout():
 def test_build_cp_indexer_topk_inputs_uses_local_trapezoid_cu_seqlens():
     """Validate CP-local indexer top-k input construction for a split sequence.
 
-    Expected: the helper keeps only this rank's Q rows but builds a longer
-    compressed-KV prefix for the same sequence, producing different Q/KV
-    cu_seqlens. A failure here means the THD top-k kernel cannot receive the
-    local trapezoid mask shape needed after CP partitioning.
+    Expected: the helper keeps fixed L_local Q row capacity and builds a
+    compressed-KV prefix for the same sequence, producing different fixed
+    Q/KV cu_seqlens. A failure here means the THD top-k kernel cannot receive
+    the local trapezoid mask shape needed after CP partitioning.
     """
     ratio = 4
     cu_seqlens_q = torch.tensor([0, 32], dtype=torch.int32)
@@ -179,11 +243,58 @@ def test_build_cp_indexer_topk_inputs_uses_local_trapezoid_cu_seqlens():
 
     assert torch.equal(q_topk, q_indexer_local)
     assert torch.equal(weights_topk, weights_indexer_local)
-    assert torch.equal(k_topk, k_indexer_seq_major[:6])
-    assert torch.equal(cu_q_topk, torch.tensor([0, 8], dtype=torch.int32))
-    assert torch.equal(cu_k_topk, torch.tensor([0, 6], dtype=torch.int32))
+    assert torch.equal(k_topk[:6], k_indexer_seq_major[:6])
+    assert torch.equal(k_topk[6:], torch.zeros_like(k_topk[6:]))
+    assert torch.equal(cu_q_topk, torch.tensor([0, 8, 8], dtype=torch.int32))
+    assert torch.equal(cu_k_topk, torch.tensor([0, 6, 6], dtype=torch.int32))
     assert max_q == 8
     assert max_k == 6
+    assert torch.equal(local_row_ids, torch.arange(8, dtype=torch.long))
+
+
+def test_build_cp_indexer_topk_inputs_keeps_tail_padding_rows():
+    """Validate fixed-capacity top-k input construction with padded tail rows.
+
+    Expected: tail padding rows stay in Q/weights with a zero-length K segment,
+    so downstream top-k can return invalid ids without changing tensor shapes.
+    A failure here means the CP indexer path could reintroduce rank-dependent
+    shapes when only the last sequence has padding.
+    """
+    ratio = 4
+    cu_seqlens_q = torch.tensor([0, 6], dtype=torch.int32)
+    cu_seqlens_compressed = torch.tensor([0, 1], dtype=torch.int32)
+    q_indexer_local = torch.arange(16, dtype=torch.float32).reshape(8, 1, 2)
+    weights_indexer_local = torch.arange(8, dtype=torch.float32).reshape(8, 1)
+    k_indexer_seq_major = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+
+    (
+        q_topk,
+        k_topk,
+        weights_topk,
+        cu_q_topk,
+        cu_k_topk,
+        max_q,
+        max_k,
+        local_row_ids,
+    ) = build_cp_indexer_topk_inputs(
+        q_indexer_local,
+        weights_indexer_local,
+        k_indexer_seq_major,
+        cu_seqlens_q,
+        cu_seqlens_compressed,
+        global_start=0,
+        l_local=8,
+        ratio=ratio,
+    )
+
+    assert torch.equal(q_topk, q_indexer_local)
+    assert torch.equal(weights_topk, weights_indexer_local)
+    assert torch.equal(k_topk[:1], k_indexer_seq_major[:1])
+    assert torch.equal(k_topk[1:], torch.zeros_like(k_topk[1:]))
+    assert torch.equal(cu_q_topk, torch.tensor([0, 6, 8], dtype=torch.int32))
+    assert torch.equal(cu_k_topk, torch.tensor([0, 1, 1], dtype=torch.int32))
+    assert max_q == 6
+    assert max_k == 1
     assert torch.equal(local_row_ids, torch.arange(8, dtype=torch.long))
 
 
@@ -259,6 +370,257 @@ def test_build_cp_flat_idxs_for_indexer_loss_preserves_rank_major_ids():
     )
     assert torch.equal(topk_idxs, expected)
     assert torch.equal(lowered_rank_major_ids, rank_major_ids)
+
+
+def test_cute_global_compressed_cu_seqlens_matches_reference():
+    """Validate fused compressed-prefix metadata for ragged padded sequences.
+
+    Expected: each sequence contributes ``padded_seq_len // ratio`` compressed
+    rows to the global seq-major prefix. A failure here means rank-major
+    compressed rows could be repacked with the wrong sequence offsets.
+    """
+    _require_cute_cuda()
+    cu_seqlens_cpu = torch.tensor([0, 7, 128, 381, 512], dtype=torch.int32)
+    ratio = 4
+
+    ref = build_global_compressed_cu_seqlens(cu_seqlens_cpu, ratio)
+    fused = build_global_compressed_cu_seqlens_fused(cu_seqlens_cpu.cuda(), ratio)
+
+    assert torch.equal(fused.cpu(), ref)
+
+
+def test_cute_thd_overlap_transform_matches_reference_forward_and_backward():
+    """Validate fused THD compressor overlap transform.
+
+    Expected: fused output copies the current group's second half and the
+    previous group's first half with segment-boundary fill, and backward routes
+    gradients to the same input positions. A failure here means the compressor
+    could pool the wrong overlapped tokens or lose gradients at segment starts.
+    """
+    _require_cute_cuda()
+    torch.manual_seed(3456)
+    is_first = torch.tensor([True, False, True, False, False], dtype=torch.bool)
+    head_dim = 3
+
+    for fill_value in (0.0, float("-inf")):
+        x_cpu = torch.randn(5, 4, 2, 2 * head_dim, dtype=torch.float32, requires_grad=True)
+        ref = _overlap_transform_thd_reference(x_cpu, is_first, head_dim, fill_value)
+        grad_cpu = torch.randn_like(ref)
+        ref.backward(grad_cpu)
+
+        x_cuda = x_cpu.detach().cuda().requires_grad_(True)
+        fused = apply_thd_overlap_transform_fused(
+            x_cuda,
+            is_first.cuda(),
+            head_dim,
+            fill_value,
+        )
+        fused.backward(grad_cpu.cuda())
+
+        torch.testing.assert_close(fused.cpu(), ref)
+        torch.testing.assert_close(x_cuda.grad.cpu(), x_cpu.grad)
+
+
+def test_cute_pad_indexer_topk_to_fixed_width_fills_invalid_tail():
+    """Validate fused CP indexer top-k padding to the static production width.
+
+    Expected: existing visible top-k ids are copied unchanged and the remaining
+    fixed-width columns are filled with -1, including the zero-visible-K case. A
+    failure here means the CP indexer path may reintroduce PyTorch full/cat
+    padding or feed non-invalid tail ids into final idx lowering.
+    """
+    _require_cute_cuda()
+
+    visible = torch.tensor([[3, 1], [-1, 0], [5, -1]], dtype=torch.int32, device="cuda")
+    padded = pad_indexer_topk_to_fixed_width_fused(visible, 5)
+
+    expected = torch.tensor(
+        [[3, 1, -1, -1, -1], [-1, 0, -1, -1, -1], [5, -1, -1, -1, -1]],
+        dtype=torch.int32,
+    )
+    assert torch.equal(padded.cpu(), expected)
+
+    empty_visible = torch.empty((3, 0), dtype=torch.int32, device="cuda")
+    empty_padded = pad_indexer_topk_to_fixed_width_fused(empty_visible, 4)
+
+    assert torch.equal(empty_padded.cpu(), torch.full((3, 4), -1, dtype=torch.int32))
+
+
+def test_cute_filter_indexer_topk_scores_removes_nonfinite_ids():
+    """Validate fused THD indexer top-k post-filtering.
+
+    Expected: ids whose selected score is finite are preserved, while ids that
+    are already invalid, out of range, NaN, or -inf are replaced with -1 and the
+    per-row valid lengths are counted. A failure here means production top-k may
+    either keep causally masked candidates or reintroduce PyTorch gather/where
+    filtering in the CP hot path.
+    """
+    _require_cute_cuda()
+
+    scores = torch.tensor(
+        [
+            [0.5, float("-inf"), 2.0, float("nan")],
+            [float("-inf"), 1.0, 3.0, 4.0],
+            [float("nan"), float("-inf"), -2.0, 7.0],
+        ],
+        dtype=torch.float32,
+        device="cuda",
+    )
+    topk = torch.tensor(
+        [
+            [0, 1, 3, -1],
+            [2, 0, 5, 1],
+            [0, 1, 2, 3],
+        ],
+        dtype=torch.int32,
+        device="cuda",
+    )
+
+    fused_topk, fused_length = csa_cp_kernels.filter_indexer_topk_scores(scores, topk)
+    fused_padded_topk, fused_padded_length = csa_cp_kernels.filter_indexer_topk_scores(
+        scores, topk, output_width=6
+    )
+
+    safe_topk = topk.clamp(min=0, max=scores.shape[1] - 1).to(torch.long)
+    selected = torch.gather(scores, dim=-1, index=safe_topk)
+    valid = (topk >= 0) & (topk < scores.shape[1]) & torch.isfinite(selected)
+    expected_topk = torch.where(valid, topk, torch.full_like(topk, -1))
+    expected_length = valid.sum(dim=-1).to(torch.int32)
+    expected_padded_topk = torch.cat(
+        [expected_topk, torch.full((topk.shape[0], 2), -1, dtype=torch.int32, device="cuda")],
+        dim=-1,
+    )
+
+    assert torch.equal(fused_topk.cpu(), expected_topk.cpu())
+    assert torch.equal(fused_length.cpu(), expected_length.cpu())
+    assert torch.equal(fused_padded_topk.cpu(), expected_padded_topk.cpu())
+    assert torch.equal(fused_padded_length.cpu(), expected_length.cpu())
+
+
+def test_cute_token_rope_matches_reference_forward_and_backward():
+    """Validate contiguous-CP token RoPE position reconstruction in kernel.
+
+    Expected: fused token RoPE maps ``global_row_base + row`` through
+    ``cu_seqlens_padded`` to the same sequence-local positions as the PyTorch
+    reference, and backward applies the inverse rotation. A failure here means
+    local Q/K, boundary K, or inverse output RoPE would use wrong CP positions.
+    """
+    _require_cute_cuda()
+    torch.manual_seed(1234)
+    cu_seqlens = torch.tensor([0, 5, 11, 16], dtype=torch.int32)
+    rows = 4
+    global_row_base = 8
+    total_tokens = 16
+    nope_dim = 4
+    pos_dim = 4
+
+    x_cpu = torch.randn(rows, 2, nope_dim + pos_dim, dtype=torch.float32, requires_grad=True)
+    cos_cpu = torch.randn(16, 1, 1, pos_dim, dtype=torch.float32)
+    sin_cpu = torch.randn(16, 1, 1, pos_dim, dtype=torch.float32)
+    positions = _seq_positions_from_global_rows(
+        cu_seqlens, global_row_base, rows, total_tokens
+    )
+    ref = _rope_reference(x_cpu, cos_cpu, sin_cpu, positions, nope_dim, pos_dim)
+    grad_cpu = torch.randn_like(ref)
+    ref.backward(grad_cpu)
+
+    x_cuda = x_cpu.detach().cuda().requires_grad_(True)
+    fused = apply_cp_token_rope_fused(
+        x_cuda,
+        cos_cpu.cuda(),
+        sin_cpu.cuda(),
+        cu_seqlens.cuda(),
+        global_row_base,
+        total_tokens,
+        nope_dim,
+        pos_dim,
+    )
+    fused.backward(grad_cpu.cuda())
+
+    torch.testing.assert_close(fused.cpu(), ref)
+    torch.testing.assert_close(x_cuda.grad.cpu(), x_cpu.grad)
+
+
+def test_cute_boundary_rope_clamps_global_rows_before_reference_lookup():
+    """Validate rank-0 left-boundary RoPE clamp semantics.
+
+    Expected: negative boundary global rows clamp to the first valid padded
+    token before sequence-local position lookup. A failure here means rank 0
+    boundary K could read invalid RoPE coordinates.
+    """
+    _require_cute_cuda()
+    torch.manual_seed(5678)
+    cu_seqlens = torch.tensor([0, 6, 12], dtype=torch.int32)
+    rows = 3
+    global_row_base = -2
+    total_tokens = 12
+    nope_dim = 2
+    pos_dim = 4
+
+    x_cpu = torch.randn(rows, 1, nope_dim + pos_dim, dtype=torch.float32, requires_grad=True)
+    cos_cpu = torch.randn(12, 1, 1, pos_dim, dtype=torch.float32)
+    sin_cpu = torch.randn(12, 1, 1, pos_dim, dtype=torch.float32)
+    positions = _seq_positions_from_global_rows(
+        cu_seqlens, global_row_base, rows, total_tokens, clamp_to_valid_token=True
+    )
+    ref = _rope_reference(x_cpu, cos_cpu, sin_cpu, positions, nope_dim, pos_dim)
+    grad_cpu = torch.randn_like(ref)
+    ref.backward(grad_cpu)
+
+    x_cuda = x_cpu.detach().cuda().requires_grad_(True)
+    fused = apply_cp_token_rope_fused(
+        x_cuda,
+        cos_cpu.cuda(),
+        sin_cpu.cuda(),
+        cu_seqlens.cuda(),
+        global_row_base,
+        total_tokens,
+        nope_dim,
+        pos_dim,
+        clamp_to_valid_token=True,
+    )
+    fused.backward(grad_cpu.cuda())
+
+    torch.testing.assert_close(fused.cpu(), ref)
+    torch.testing.assert_close(x_cuda.grad.cpu(), x_cpu.grad)
+
+
+def test_cute_compressed_rope_uses_compressed_group_ids_forward_and_backward():
+    """Validate compressed-row RoPE position reconstruction in kernel.
+
+    Expected: fused compressed RoPE uses ``max(comp_id, 0) * ratio`` for each
+    row and backward applies the inverse rotation. A failure here means
+    compressor output K would use wrong positions after compacting.
+    """
+    _require_cute_cuda()
+    torch.manual_seed(9012)
+    comp_ids = torch.tensor([0, 2, -1, 3], dtype=torch.int32)
+    ratio = 4
+    nope_dim = 3
+    pos_dim = 4
+
+    x_cpu = torch.randn(4, 1, 2, nope_dim + pos_dim, dtype=torch.float32, requires_grad=True)
+    cos_cpu = torch.randn(16, 1, 1, pos_dim, dtype=torch.float32)
+    sin_cpu = torch.randn(16, 1, 1, pos_dim, dtype=torch.float32)
+    positions = comp_ids.clamp(min=0).to(torch.long) * ratio
+    ref = _rope_reference(x_cpu, cos_cpu, sin_cpu, positions, nope_dim, pos_dim)
+    grad_cpu = torch.randn_like(ref)
+    ref.backward(grad_cpu)
+
+    x_cuda = x_cpu.detach().cuda().requires_grad_(True)
+    fused = apply_cp_compressed_rope_fused(
+        x_cuda,
+        cos_cpu.cuda(),
+        sin_cpu.cuda(),
+        comp_ids.cuda(),
+        ratio,
+        nope_dim,
+        pos_dim,
+    )
+    fused.backward(grad_cpu.cuda())
+
+    torch.testing.assert_close(fused.cpu(), ref)
+    torch.testing.assert_close(x_cuda.grad.cpu(), x_cpu.grad)
 
 
 def test_cute_compressor_prep_compact_matches_reference_forward_and_backward():

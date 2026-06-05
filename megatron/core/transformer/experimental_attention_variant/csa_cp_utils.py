@@ -6,7 +6,6 @@ from typing import Dict, List, Optional, Tuple
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch.distributed.nn.functional import all_gather as differentiable_all_gather
 
 from megatron.core.transformer.experimental_attention_variant import csa_cp_kernels
 from megatron.core.transformer.experimental_attention_variant.dsa_kernels import batch_of_row
@@ -22,7 +21,7 @@ class _SingleRankCPGroup:
         return 1
 
 
-_SINGLE_RANK_CP_GROUP = _SingleRankCPGroup()
+SINGLE_RANK_CP_GROUP = _SingleRankCPGroup()
 
 
 def cp_debug_trace(message: str) -> None:
@@ -48,6 +47,202 @@ def can_use_csa_cp_fused_kernels(*tensors: Optional[torch.Tensor]) -> bool:
     """Return whether CSA CP fused memory kernels can run for these tensors."""
 
     return csa_cp_kernels.can_use_cute_kernels(*tensors)
+
+
+class _THDOverlapTransformCute(torch.autograd.Function):
+    """Autograd wrapper for CSA THD compressor overlap transform."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        tensor: torch.Tensor,
+        is_first_in_seg: torch.Tensor,
+        head_dim: int,
+        fill_value: float,
+    ) -> torch.Tensor:
+        ctx.input_shape = tuple(tensor.shape)
+        ctx.head_dim = head_dim
+        ctx.save_for_backward(is_first_in_seg)
+        return csa_cp_kernels.overlap_transform_thd(
+            tensor,
+            is_first_in_seg,
+            head_dim,
+            fill_value,
+        )
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        (is_first_in_seg,) = ctx.saved_tensors
+        grad_input = csa_cp_kernels.overlap_transform_thd_backward(
+            grad_output.contiguous(),
+            is_first_in_seg,
+            ctx.input_shape,
+            ctx.head_dim,
+        )
+        return grad_input, None, None, None
+
+
+def apply_thd_overlap_transform_fused(
+    tensor: torch.Tensor,
+    is_first_in_seg: torch.Tensor,
+    head_dim: int,
+    fill_value: float = 0.0,
+) -> torch.Tensor:
+    """Apply THD overlap transform with fused forward/backward kernels."""
+    if not csa_cp_kernels.can_use_cute_kernels(tensor, is_first_in_seg):
+        raise RuntimeError("DSv4 CP THD overlap transform requires CUDA tensors and CuTeDSL.")
+    return _THDOverlapTransformCute.apply(tensor, is_first_in_seg, head_dim, float(fill_value))
+
+
+class _CPTokenRopeCute(torch.autograd.Function):
+    """Autograd wrapper for contiguous-CP token/boundary RoPE."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        cu_seqlens_padded: torch.Tensor,
+        global_row_base: int,
+        total_tokens: int,
+        nope_dim: int,
+        pos_dim: int,
+        inverse: bool,
+        clamp_to_valid_token: bool,
+    ) -> torch.Tensor:
+        ctx.global_row_base = global_row_base
+        ctx.total_tokens = total_tokens
+        ctx.nope_dim = nope_dim
+        ctx.pos_dim = pos_dim
+        ctx.inverse = inverse
+        ctx.clamp_to_valid_token = clamp_to_valid_token
+        ctx.save_for_backward(cos, sin, cu_seqlens_padded)
+        return csa_cp_kernels.apply_token_rope(
+            x,
+            cos,
+            sin,
+            cu_seqlens_padded,
+            global_row_base,
+            total_tokens,
+            nope_dim,
+            pos_dim,
+            inverse=inverse,
+            clamp_to_valid_token=clamp_to_valid_token,
+        )
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        cos, sin, cu_seqlens_padded = ctx.saved_tensors
+        grad_x = csa_cp_kernels.apply_token_rope(
+            grad_output.contiguous(),
+            cos,
+            sin,
+            cu_seqlens_padded,
+            ctx.global_row_base,
+            ctx.total_tokens,
+            ctx.nope_dim,
+            ctx.pos_dim,
+            inverse=ctx.inverse,
+            clamp_to_valid_token=ctx.clamp_to_valid_token,
+            adjoint=True,
+        )
+        return grad_x, None, None, None, None, None, None, None, None, None
+
+
+class _CPCompressedRopeCute(torch.autograd.Function):
+    """Autograd wrapper for compressed-row RoPE using compressor metadata."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        comp_ids_local: torch.Tensor,
+        ratio: int,
+        nope_dim: int,
+        pos_dim: int,
+        inverse: bool,
+    ) -> torch.Tensor:
+        ctx.ratio = ratio
+        ctx.nope_dim = nope_dim
+        ctx.pos_dim = pos_dim
+        ctx.inverse = inverse
+        ctx.save_for_backward(cos, sin, comp_ids_local)
+        return csa_cp_kernels.apply_compressed_rope(
+            x,
+            cos,
+            sin,
+            comp_ids_local,
+            ratio,
+            nope_dim,
+            pos_dim,
+            inverse=inverse,
+        )
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        cos, sin, comp_ids_local = ctx.saved_tensors
+        grad_x = csa_cp_kernels.apply_compressed_rope(
+            grad_output.contiguous(),
+            cos,
+            sin,
+            comp_ids_local,
+            ctx.ratio,
+            ctx.nope_dim,
+            ctx.pos_dim,
+            inverse=ctx.inverse,
+            adjoint=True,
+        )
+        return grad_x, None, None, None, None, None, None, None
+
+
+def apply_cp_token_rope_fused(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor,
+    global_row_base: int,
+    total_tokens: int,
+    nope_dim: int,
+    pos_dim: int,
+    inverse: bool = False,
+    clamp_to_valid_token: bool = False,
+) -> torch.Tensor:
+    """Apply production contiguous-CP RoPE without explicit positions."""
+    if not csa_cp_kernels.can_use_cute_kernels(x, cos, sin, cu_seqlens_padded):
+        raise RuntimeError("DSv4 CP token RoPE requires CUDA tensors and CuTeDSL kernels.")
+    return _CPTokenRopeCute.apply(
+        x,
+        cos,
+        sin,
+        cu_seqlens_padded,
+        global_row_base,
+        total_tokens,
+        nope_dim,
+        pos_dim,
+        inverse,
+        clamp_to_valid_token,
+    )
+
+
+def apply_cp_compressed_rope_fused(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    comp_ids_local: torch.Tensor,
+    ratio: int,
+    nope_dim: int,
+    pos_dim: int,
+    inverse: bool = False,
+) -> torch.Tensor:
+    """Apply production compressed-row RoPE without sequence-prefix reconstruction."""
+    if not csa_cp_kernels.can_use_cute_kernels(x, cos, sin, comp_ids_local):
+        raise RuntimeError("DSv4 CP compressed RoPE requires CUDA tensors and CuTeDSL kernels.")
+    return _CPCompressedRopeCute.apply(
+        x, cos, sin, comp_ids_local, ratio, nope_dim, pos_dim, inverse
+    )
 
 
 def _group_peer(cp_group: torch.distributed.ProcessGroup, group_rank: int) -> int:
@@ -240,10 +435,53 @@ def build_cp_local_seq_positions(
     return global_ids - cu_long[batch_ids]
 
 
+def build_cp_local_rope_positions(
+    packed_seq_params,
+    local_tokens: int,
+    cp_size: int,
+    cp_rank: int,
+) -> torch.Tensor:
+    """Return sequence-local RoPE positions for this rank's contiguous CP chunk.
+
+    THD CP partitions the global padded packed-token space contiguously. The
+    local tensor rows are numbered from zero, but RoPE needs each row's position
+    inside its original packed sequence, including the global CP offset when a
+    sequence is split across ranks.
+
+    Args:
+        packed_seq_params: THD packed sequence metadata. This uses
+            ``cu_seqlens_q_padded`` when present because MCore partitions the
+            padded THD capacity across CP ranks.
+        local_tokens: Number of local tensor rows that will receive RoPE.
+        cp_size: Number of context-parallel ranks.
+        cp_rank: Context-parallel rank that owns these local rows.
+
+    Returns:
+        ``(local_tokens,)`` int64 tensor of sequence-local positions.
+    """
+    cu_seqlens_padded = (
+        packed_seq_params.cu_seqlens_q_padded
+        if packed_seq_params.cu_seqlens_q_padded is not None
+        else packed_seq_params.cu_seqlens_q
+    )
+    global_start, l_local = contiguous_cp_partition(cu_seqlens_padded, cp_size, cp_rank)
+    if local_tokens != l_local:
+        raise RuntimeError(
+            "DSv4 THD CP local RoPE expects contiguous equal local token chunks: "
+            f"local={local_tokens}, expected={l_local}"
+        )
+
+    # Map this rank's local rows back to global padded THD row ids, then convert
+    # them into per-sequence positions for RoPE.
+    return build_cp_local_seq_positions(
+        cu_seqlens_padded, global_start, l_local, cu_seqlens_padded.device
+    )
+
+
 def build_global_compressed_cu_seqlens(
     cu_seqlens_padded: torch.Tensor, ratio: int
 ) -> torch.Tensor:
-    """Return global seq-major compressed cumulative lengths for ``ratio``."""
+    """Return reference global seq-major compressed cumulative lengths."""
     seq_lens = cu_seqlens_padded[1:] - cu_seqlens_padded[:-1]
     compressed_lens = seq_lens // ratio
     return torch.cat(
@@ -252,6 +490,15 @@ def build_global_compressed_cu_seqlens(
             compressed_lens.cumsum(0).to(cu_seqlens_padded.dtype),
         ]
     )
+
+
+def build_global_compressed_cu_seqlens_fused(
+    cu_seqlens_padded: torch.Tensor, ratio: int
+) -> torch.Tensor:
+    """Return production global compressed prefix lengths with CuTeDSL."""
+    if not csa_cp_kernels.can_use_cute_kernels(cu_seqlens_padded):
+        raise RuntimeError("DSv4 CP compressed cu_seqlens requires CUDA tensors and CuTeDSL.")
+    return csa_cp_kernels.build_global_compressed_cu_seqlens(cu_seqlens_padded, ratio)
 
 
 def _ceil_div_nonnegative(numerator: int, denominator: int) -> int:
@@ -319,7 +566,7 @@ def build_rank_major_compressed_metadata(
     device: torch.device,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     if csa_cp_kernels.can_use_cute_kernels(cu_seqlens):
-        return csa_cp_kernels.build_rank_major_compressed_metadata(
+        return build_rank_major_compressed_metadata_fused(
             cu_seqlens, cp_size, l_local, ratio, d_comp, c_cap
         )
 
@@ -340,6 +587,25 @@ def build_rank_major_compressed_metadata(
         comp_parts.append(comp_ids)
         valid_parts.append(valid)
     return torch.cat(seq_parts), torch.cat(comp_parts), torch.cat(valid_parts)
+
+
+def build_rank_major_compressed_metadata_fused(
+    cu_seqlens: torch.Tensor,
+    cp_size: int,
+    l_local: int,
+    ratio: int,
+    d_comp: int,
+    c_cap: int,
+    device: Optional[torch.device] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build rank-major compressed metadata with the production CuTeDSL kernel."""
+
+    del device
+    if not csa_cp_kernels.can_use_cute_kernels(cu_seqlens):
+        raise RuntimeError("DSv4 CP rank-major metadata requires CUDA tensors and CuTeDSL kernels.")
+    return csa_cp_kernels.build_rank_major_compressed_metadata(
+        cu_seqlens, cp_size, l_local, ratio, d_comp, c_cap
+    )
 
 
 class _CompressorPrepCompact(torch.autograd.Function):
@@ -512,20 +778,16 @@ def build_compressor_prep_compact(
             c_cap,
         )
     if csa_cp_kernels.can_use_cute_kernels(hidden_local, boundary_hidden, cu_seqlens):
-        hidden_compact, cu_compact, seq_ids_t, comp_ids_t, valid_t = (
-            _CompressorPrepCompactCute.apply(
-                hidden_local,
-                boundary_hidden,
-                cu_seqlens,
-                global_start,
-                l_local,
-                ratio,
-                d_comp,
-                d_window,
-                c_cap,
-            )
+        return build_compressor_prep_compact_fused(
+            hidden_local,
+            boundary_hidden,
+            cu_seqlens,
+            global_start,
+            l_local,
+            ratio,
+            d_comp,
+            d_window,
         )
-        return hidden_compact, cu_compact, seq_ids_t, comp_ids_t, valid_t, c_cap
 
     ext_start = global_start - d_window
     src_positions: List[int] = []
@@ -592,6 +854,46 @@ def build_compressor_prep_compact(
     return hidden_compact, cu_compact, seq_ids_t, comp_ids_t, valid_t, c_cap
 
 
+def build_compressor_prep_compact_fused(
+    hidden_local: torch.Tensor,
+    boundary_hidden: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    global_start: int,
+    l_local: int,
+    ratio: int,
+    d_comp: int,
+    d_window: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    """Build compressor-prep compact rows with the production CuTeDSL kernel."""
+
+    device = hidden_local.device
+    c_cap = (l_local + d_comp) // ratio
+    if c_cap == 0:
+        empty_ids = torch.full((0,), -1, dtype=torch.int32, device=device)
+        return (
+            hidden_local.new_zeros((0,) + tuple(hidden_local.shape[1:])),
+            torch.zeros_like(cu_seqlens),
+            empty_ids,
+            empty_ids,
+            torch.zeros((0,), dtype=torch.bool, device=device),
+            c_cap,
+        )
+    if not csa_cp_kernels.can_use_cute_kernels(hidden_local, boundary_hidden, cu_seqlens):
+        raise RuntimeError("DSv4 CP compressor-prep compact requires CUDA tensors and CuTeDSL.")
+    hidden_compact, cu_compact, seq_ids_t, comp_ids_t, valid_t = _CompressorPrepCompactCute.apply(
+        hidden_local,
+        boundary_hidden,
+        cu_seqlens,
+        global_start,
+        l_local,
+        ratio,
+        d_comp,
+        d_window,
+        c_cap,
+    )
+    return hidden_compact, cu_compact, seq_ids_t, comp_ids_t, valid_t, c_cap
+
+
 def pad_compressed_to_capacity(
     compressed: Optional[torch.Tensor],
     c_cap: int,
@@ -628,16 +930,82 @@ def pad_compressed_to_capacity(
     return fixed
 
 
+def _all_gather_into_tensor(output: torch.Tensor, tensor: torch.Tensor, cp_group) -> None:
+    if hasattr(dist, "all_gather_into_tensor"):
+        dist.all_gather_into_tensor(output, tensor, group=cp_group)
+        return
+    if hasattr(dist, "_all_gather_base"):
+        dist._all_gather_base(output, tensor, group=cp_group)
+        return
+    raise RuntimeError("DSv4 CP fixed all-gather requires all_gather_into_tensor support")
+
+
+def _reduce_scatter_tensor(output: torch.Tensor, tensor: torch.Tensor, cp_group) -> None:
+    if hasattr(dist, "reduce_scatter_tensor"):
+        dist.reduce_scatter_tensor(output, tensor, op=dist.ReduceOp.SUM, group=cp_group)
+        return
+    if hasattr(dist, "_reduce_scatter_base"):
+        dist._reduce_scatter_base(output, tensor, op=dist.ReduceOp.SUM, group=cp_group)
+        return
+    raise RuntimeError("DSv4 CP fixed all-gather backward requires reduce_scatter_tensor support")
+
+
+class _AllGatherFixedCPTensor(torch.autograd.Function):
+    """Fixed-capacity CP all-gather with reduce-scatter backward."""
+
+    @staticmethod
+    def forward(ctx, tensor: torch.Tensor, cp_group) -> torch.Tensor:
+        cp_size = cp_group_size(cp_group)
+        ctx.cp_group = cp_group
+        ctx.input_shape = tuple(tensor.shape)
+        ctx.cp_size = cp_size
+
+        if cp_size == 1:
+            return tensor
+
+        local = tensor.contiguous()
+        output_shape = (cp_size * local.shape[0],) + tuple(local.shape[1:])
+        output = local.new_empty(output_shape)
+        _all_gather_into_tensor(output, local, cp_group)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        cp_size = ctx.cp_size
+        if cp_size == 1:
+            return grad_output, None
+
+        expected_shape = (cp_size * ctx.input_shape[0],) + tuple(ctx.input_shape[1:])
+        if tuple(grad_output.shape) != expected_shape:
+            raise RuntimeError(
+                "DSv4 CP fixed all-gather backward received an unexpected gradient shape: "
+                f"grad={tuple(grad_output.shape)}, expected={expected_shape}"
+            )
+
+        grad_output = grad_output.contiguous()
+        grad_input = grad_output.new_empty(ctx.input_shape)
+        _reduce_scatter_tensor(grad_input, grad_output, ctx.cp_group)
+        return grad_input, None
+
+
 def all_gather_fixed_cp_tensor(
     tensor: torch.Tensor, cp_group: torch.distributed.ProcessGroup
 ) -> torch.Tensor:
-    return torch.cat(differentiable_all_gather(tensor.contiguous(), group=cp_group), dim=0)
+    """Gather fixed-capacity local CP rows into rank-major order.
+
+    The first dimension is static and identical on every CP rank. Forward uses a
+    single flat all-gather output buffer; backward is the matching reduce-scatter.
+    """
+
+    return _AllGatherFixedCPTensor.apply(tensor, cp_group)
 
 
 def zero_module_parameter_dependency(module: nn.Module, like: torch.Tensor) -> torch.Tensor:
-    token = like.new_tensor(0.0)
+    # Keep the zero tie on device so rare empty-compressor ranks do not create
+    # host-origin CUDA scalars in the CP production path.
+    token = like.reshape(-1)[:1].sum().to(dtype=like.dtype) * 0
     for param in module.parameters():
-        token = token + param.sum().to(dtype=like.dtype) * like.new_tensor(0.0)
+        token = token + param.sum().to(dtype=like.dtype) * token
     return token
 
 
@@ -994,13 +1362,13 @@ def repack_rank_major_compressed_to_seq_major(
         valid_rank_major,
         cu_seqlens_compressed,
     ):
-        return csa_cp_kernels.repack_rank_major_compressed_to_seq_major(
+        return repack_rank_major_compressed_to_seq_major_fused(
             compressed_rank_major,
             seq_ids_rank_major,
             comp_ids_rank_major,
             valid_rank_major,
             cu_seqlens_compressed,
-            total_comp,
+            output_capacity=total_comp,
         )
 
     compressed_seq_major = compressed_rank_major.new_zeros(
@@ -1032,6 +1400,34 @@ def repack_rank_major_compressed_to_seq_major(
     return compressed_seq_major, rank_major_by_seq_major
 
 
+def repack_rank_major_compressed_to_seq_major_fused(
+    compressed_rank_major: torch.Tensor,
+    seq_ids_rank_major: torch.Tensor,
+    comp_ids_rank_major: torch.Tensor,
+    valid_rank_major: torch.Tensor,
+    cu_seqlens_compressed: torch.Tensor,
+    output_capacity: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Reorder rank-major compressed rows with the production CuTeDSL kernel."""
+
+    if not csa_cp_kernels.can_use_cute_kernels(
+        compressed_rank_major,
+        seq_ids_rank_major,
+        comp_ids_rank_major,
+        valid_rank_major,
+        cu_seqlens_compressed,
+    ):
+        raise RuntimeError("DSv4 CP rank-major repack requires CUDA tensors and CuTeDSL kernels.")
+    return csa_cp_kernels.repack_rank_major_compressed_to_seq_major(
+        compressed_rank_major,
+        seq_ids_rank_major,
+        comp_ids_rank_major,
+        valid_rank_major,
+        cu_seqlens_compressed,
+        output_capacity,
+    )
+
+
 def build_cp_indexer_topk_inputs(
     q_indexer_local: torch.Tensor,
     weights_indexer_local: torch.Tensor,
@@ -1041,6 +1437,8 @@ def build_cp_indexer_topk_inputs(
     global_start: int,
     l_local: int,
     ratio: int,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_kv: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int, torch.Tensor]:
     """Build CP-local packed inputs for the THD indexer top-k kernel.
 
@@ -1053,15 +1451,19 @@ def build_cp_indexer_topk_inputs(
         global_start: First global padded token owned by this CP rank.
         l_local: Local padded token capacity.
         ratio: Compression ratio used by the indexer causal mask.
+        max_seqlen_q / max_seqlen_kv: Static upper bounds passed to the THD
+            indexer kernel. Production callers pass these from packed metadata
+            instead of deriving dynamic maxima from GPU tensors.
 
     Returns:
         ``(q_topk, k_topk, weights_topk, cu_q_topk, cu_k_topk, max_q, max_k, local_row_ids)``.
-        ``cu_q_topk`` and ``cu_k_topk`` have matching segment counts but may
-        describe different per-segment lengths.  That lets the THD indexer
-        kernel represent the trapezoid causal mask for a sequence piece cut by
-        CP.  ``local_row_ids`` maps rows returned by the kernel back to
-        ``[0, L_local)``. Rows with no visible compressed KV are omitted and
-        should be filled with ``-1`` by the caller.
+        ``q_topk`` and ``weights_topk`` keep fixed ``L_local`` row capacity.
+        ``k_topk`` keeps the fixed global compressed capacity and packs only
+        the compressed prefixes visible to this CP rank. ``cu_q_topk`` and
+        ``cu_k_topk`` have matching fixed segment counts but may describe
+        different per-segment lengths, which represents the trapezoid causal
+        mask for a sequence piece cut by CP. ``local_row_ids`` is the identity
+        map because rows are no longer dynamically dropped.
     """
     if q_indexer_local.shape[0] != l_local:
         raise RuntimeError(
@@ -1075,61 +1477,144 @@ def build_cp_indexer_topk_inputs(
         )
 
     device = q_indexer_local.device
+    if csa_cp_kernels.can_use_cute_kernels(
+        q_indexer_local,
+        weights_indexer_local,
+        k_indexer_seq_major,
+        cu_seqlens_q,
+        cu_seqlens_compressed,
+    ):
+        k_topk, cu_q_topk, cu_k_topk = csa_cp_kernels.build_indexer_topk_inputs(
+            k_indexer_seq_major,
+            cu_seqlens_q,
+            cu_seqlens_compressed,
+            global_start,
+            l_local,
+            ratio,
+        )
+        local_row_ids = torch.arange(l_local, dtype=torch.long, device=device)
+        max_q = int(max_seqlen_q) if max_seqlen_q is not None else l_local
+        max_k = (
+            int(max_seqlen_kv)
+            if max_seqlen_kv is not None
+            else max(1, k_indexer_seq_major.shape[0])
+        )
+        return (
+            q_indexer_local,
+            k_topk,
+            weights_indexer_local,
+            cu_q_topk,
+            cu_k_topk,
+            max_q,
+            max_k,
+            local_row_ids,
+        )
+
     global_end = global_start + l_local
-    q_parts: List[torch.Tensor] = []
-    k_parts: List[torch.Tensor] = []
-    weight_parts: List[torch.Tensor] = []
-    local_row_parts: List[torch.Tensor] = []
     cu_q = [0]
     cu_k = [0]
     max_q = 0
     max_k = 0
+    k_topk = torch.zeros_like(k_indexer_seq_major)
+    k_write = 0
 
     for seq_id in range(int(cu_seqlens_q.shape[0]) - 1):
         seq_start = int(cu_seqlens_q[seq_id].item())
         seq_end = int(cu_seqlens_q[seq_id + 1].item())
         local_seq_start = max(seq_start, global_start)
         local_seq_end = min(seq_end, global_end)
-        if local_seq_start >= local_seq_end:
-            continue
-
-        q_len = local_seq_end - local_seq_start
+        q_len = max(0, local_seq_end - local_seq_start)
         seq_comp_start = int(cu_seqlens_compressed[seq_id].item())
         seq_comp_end = int(cu_seqlens_compressed[seq_id + 1].item())
-        k_len = min((local_seq_end - seq_start) // ratio, seq_comp_end - seq_comp_start)
-        if k_len <= 0:
-            continue
-
-        q_local_start = local_seq_start - global_start
-        q_local_end = local_seq_end - global_start
-        q_parts.append(q_indexer_local[q_local_start:q_local_end])
-        weight_parts.append(weights_indexer_local[q_local_start:q_local_end])
-        k_parts.append(k_indexer_seq_major[seq_comp_start : seq_comp_start + k_len])
-        local_row_parts.append(
-            torch.arange(q_local_start, q_local_end, dtype=torch.long, device=device)
-        )
+        k_len = 0
+        if q_len > 0:
+            k_len = min((local_seq_end - seq_start) // ratio, seq_comp_end - seq_comp_start)
+        if k_len > 0:
+            k_topk[k_write : k_write + k_len] = k_indexer_seq_major[
+                seq_comp_start : seq_comp_start + k_len
+            ]
+            k_write += k_len
         cu_q.append(cu_q[-1] + q_len)
         cu_k.append(cu_k[-1] + k_len)
         max_q = max(max_q, q_len)
         max_k = max(max_k, k_len)
 
-    if not q_parts:
-        q_empty = q_indexer_local.new_zeros((0,) + tuple(q_indexer_local.shape[1:]))
-        k_empty = k_indexer_seq_major.new_zeros((0,) + tuple(k_indexer_seq_major.shape[1:]))
-        weights_empty = weights_indexer_local.new_zeros(
-            (0,) + tuple(weights_indexer_local.shape[1:])
-        )
-        cu_empty = torch.zeros((1,), dtype=cu_seqlens_q.dtype, device=device)
-        local_rows_empty = torch.empty((0,), dtype=torch.long, device=device)
-        return q_empty, k_empty, weights_empty, cu_empty, cu_empty, 0, 0, local_rows_empty
+    actual_total = int(cu_seqlens_q[-1].item())
+    padding_start = max(actual_total, global_start)
+    padding_q = max(0, global_end - padding_start)
+    cu_q.append(cu_q[-1] + padding_q)
+    cu_k.append(cu_k[-1])
+    max_q = max(max_q, padding_q)
 
-    q_topk = torch.cat(q_parts, dim=0).contiguous()
-    k_topk = torch.cat(k_parts, dim=0).contiguous()
-    weights_topk = torch.cat(weight_parts, dim=0).contiguous()
     cu_q_topk = torch.tensor(cu_q, dtype=cu_seqlens_q.dtype, device=device)
     cu_k_topk = torch.tensor(cu_k, dtype=cu_seqlens_compressed.dtype, device=device)
-    local_row_ids = torch.cat(local_row_parts, dim=0).contiguous()
-    return q_topk, k_topk, weights_topk, cu_q_topk, cu_k_topk, max_q, max_k, local_row_ids
+    local_row_ids = torch.arange(l_local, dtype=torch.long, device=device)
+    return (
+        q_indexer_local,
+        k_topk,
+        weights_indexer_local,
+        cu_q_topk,
+        cu_k_topk,
+        int(max_seqlen_q) if max_seqlen_q is not None else max_q,
+        int(max_seqlen_kv) if max_seqlen_kv is not None else max_k,
+        local_row_ids,
+    )
+
+
+def build_cp_indexer_topk_inputs_fused(
+    q_indexer_local: torch.Tensor,
+    weights_indexer_local: torch.Tensor,
+    k_indexer_seq_major: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_compressed: torch.Tensor,
+    global_start: int,
+    l_local: int,
+    ratio: int,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_kv: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    """Build fixed CP-local indexer top-k inputs with production CuTeDSL kernels."""
+
+    if q_indexer_local.shape[0] != l_local:
+        raise RuntimeError(
+            "DSv4 CP indexer top-k expects q_indexer_local length to match L_local: "
+            f"q={q_indexer_local.shape[0]}, L_local={l_local}"
+        )
+    if weights_indexer_local.shape[0] != l_local:
+        raise RuntimeError(
+            "DSv4 CP indexer top-k expects weights_indexer_local length to match L_local: "
+            f"weights={weights_indexer_local.shape[0]}, L_local={l_local}"
+        )
+    if not csa_cp_kernels.can_use_cute_kernels(
+        q_indexer_local,
+        weights_indexer_local,
+        k_indexer_seq_major,
+        cu_seqlens_q,
+        cu_seqlens_compressed,
+    ):
+        raise RuntimeError("DSv4 CP indexer top-k input pack requires CUDA tensors and CuTeDSL.")
+
+    k_topk, cu_q_topk, cu_k_topk = csa_cp_kernels.build_indexer_topk_inputs(
+        k_indexer_seq_major,
+        cu_seqlens_q,
+        cu_seqlens_compressed,
+        global_start,
+        l_local,
+        ratio,
+    )
+    max_q = int(max_seqlen_q) if max_seqlen_q is not None else l_local
+    max_k = int(max_seqlen_kv) if max_seqlen_kv is not None else max(1, k_indexer_seq_major.shape[0])
+    return q_indexer_local, k_topk, weights_indexer_local, cu_q_topk, cu_k_topk, max_q, max_k
+
+
+def pad_indexer_topk_to_fixed_width_fused(
+    topk_indices: torch.Tensor,
+    fixed_width: int,
+) -> torch.Tensor:
+    """Pad CP-local indexer top-k ids to the static production width."""
+    if not csa_cp_kernels.can_use_cute_kernels(topk_indices):
+        raise RuntimeError("DSv4 CP top-k index padding requires CUDA tensors and CuTeDSL.")
+    return csa_cp_kernels.pad_topk_indices(topk_indices, int(fixed_width))
 
 
 def map_cp_topk_logical_to_rank_major(
