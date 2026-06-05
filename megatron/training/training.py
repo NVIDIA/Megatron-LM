@@ -149,6 +149,7 @@ from megatron.training.initialize import (
     write_args_to_tensorboard,
 )
 from megatron.training.utils import is_hybrid_model
+from megatron.training.state import GlobalState
 
 # Local.
 from . import ft_integration, one_logger_utils
@@ -1052,6 +1053,9 @@ def pretrain(
     global _STARTUP_TIMESTAMPS
     _STARTUP_TIMESTAMPS['pretrain_entry'] = time.time()
 
+    state = GlobalState()
+    state.cfg = cfg_container
+
     if inprocess_call_wrapper is not None:
         iteration = inprocess_call_wrapper.iteration
         store = torch.distributed.PrefixStore(str(iteration), store)
@@ -1076,6 +1080,7 @@ def pretrain(
 
     args = get_args()
     timers = get_timers()
+    state.timers = timers
 
     if args.fine_grained_activation_offloading:
         from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
@@ -1104,6 +1109,7 @@ def pretrain(
         torch.distributed.all_reduce(program_start_global, op=torch.distributed.ReduceOp.MIN)
         program_start_global = program_start_global.item()
     set_startup_timestamps(program_start=program_start_global)
+    state.start_time = program_start_global
 
     global _LEGACY_TRAIN_START_TIME
     start_time_tensor = torch.tensor([_LEGACY_TRAIN_START_TIME], dtype=torch.double, device='cuda')
