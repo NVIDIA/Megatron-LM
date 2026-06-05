@@ -1,7 +1,11 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Tuple
+
+import torch
+
+from ..utils import is_torch_min_version
 
 
 @dataclass
@@ -46,6 +50,11 @@ class DistributedDataParallelConfig:
        value of max(40000000, 1000000 * dp_size) parameters (larger DP sizes need larger
        buckets to ensure collectives do not become latency-bound)."""
 
+    num_buckets: Optional[int] = None
+    """Number of buckets for data-parallel communication. Should only specify one of
+       `bucket_size` and `num_buckets`. If `num_buckets` is specified, `bucket_size`
+       will be determined at runtime."""
+
     pad_buckets_for_high_nccl_busbw: bool = False
     """If true, make sure the bucket size is divisible by a large power of 2 (2^16) to
        ensure NCCL collectives have high bus bandwidth at large DP counts, since NCCL
@@ -57,6 +66,11 @@ class DistributedDataParallelConfig:
        over the wire (using an all-to-all to keep total communication overhead in line
        with the standard ring implementation) but performs accumulation locally in FP32."""
 
+    param_name_patterns_for_fp32_local_accumulation: Tuple[str, ...] = ()
+    """List of param_name patterns (in Python's fnmatch format) to match against to do
+       local gradient accumulation in FP32. The special pattern 'all' matches every
+       parameter. Do not specify when grad_reduce_in_fp32 is already True."""
+
     average_in_collective: bool = False
     """If true, compute average in collective directly, as opposed to dividing by the
        dp_size first and then computing sum in the collective."""
@@ -64,6 +78,10 @@ class DistributedDataParallelConfig:
     fp8_param_gather: bool = False
     """If true, keep the compute param in fp8 (do not use any other intermediate dtype) and
        perform the param all-gather in fp8."""
+
+    fp4_param_gather: bool = False
+    """If true, keep the compute param in fp4 (do not use any other intermediate dtype) and
+       perform the param all-gather in fp4."""
 
     reuse_grad_buf_for_mxfp8_param_ag: bool = False
     """If true, reuse the grad buffer for param AG when using mxfp8 recipe. Should be 
@@ -136,7 +154,9 @@ class DistributedDataParallelConfig:
     If True, use all-gather during the initial Megatron-FSDP parameter
     synchronization step. This can increase overlap between the first
     parameter all-gather and computation, helping to better hide the
-    initial communication cost.
+    initial communication cost. Should be deactivated when using
+    full-iteration CG, or partial CG if AG/RS is launched beyond the
+    CG capture scope but is waited on during the capture scope.
     """
 
     outer_dp_sharding_strategy: str = 'no_shard'
@@ -162,6 +182,61 @@ class DistributedDataParallelConfig:
     delay_wgrad_compute: bool = False
     """Delay the weight gradient computation to improve batch-level communication overlapping"""
 
+    megatron_fsdp_main_params_dtype: Optional[torch.dtype] = torch.float32
+    """Data type for the main weight buffer utilized for distributed optimization
+      and quantization with Megatron-FSDP. If set to None, the model compute weight
+      buffer will take the role of the main weights, or when no sharding is applied,
+      the native model weights become the main weights. Defaults to torch.float32.
+    """
+
+    megatron_fsdp_main_grads_dtype: Optional[torch.dtype] = None
+    """Data type for the main gradient buffer utilized for distributed optimization with
+      Megatron-FSDP. If set to None, main gradients will match the dtype of the model
+      compute parameters specified by the user model. Defaults to None.
+    """
+
+    megatron_fsdp_grad_comm_dtype: Optional[torch.dtype] = None
+    """Data type for gradient gather / scatter communications. Can be utilized to reduce
+      communication latency, but adds overhead for type-casting and copy operations.
+      If using NCCL UBR v2.27+, gradient reduction may be performed in high-precision
+      depending on the network domain (NVLink or IB), and can enable mixed-precision
+      communication and accumulation, e.g. setting grad_comm_dtype to `BF16` can support
+      `FP32` reduction even though we have `BF16` input and output communication buffers.
+      If set to None, the `main_grads_dtype` is used. If using HSDP (either DP-Replicate
+      or DP-Outer in `outer_dp_sharding_strategy`), `no_shard`, `optim`, or a
+      `FixedPoolAllocator` (`fsdp_double_buffer`), allocating `dtype`-custom gradient
+      communication buffers (per FSDP group) adds memory overhead. Defaults to None.
+      No additional memory is allocated when `grad_comm_dtype == main_grads_dtype`.
+    """
+
+    megatron_fsdp_use_decoupled_grad: bool = False
+    """If true, Megatron-FSDP's ParamAndGradBuffer uses the precision-aware optimizer
+      gradient path (e.g. `decoupled_grad` on optimizer parameters) instead of casting
+      main gradients to parameter dtype for `.grad`.
+    """
+
+    megatron_fsdp_cuda_graph_mode: bool = False
+    """If set to True, Megatron-FSDP will practice CUDA graph-safe operations, such as
+    not dereferencing `param.grad` after the optimizer step to preserve references for
+    CUDA graph replay. Can affect memory utilization in some cases, such as when the
+    gradient shard is not a view of the Megatron-FSDP sharded gradient buffer, so
+    FusedAdam(use_decoupled_grad=True) + megatron_fsdp_use_decoupled_grad=True or
+    setting megatron_fsdp_main_params_dtype == megatron_fsdp_main_grads_dtype is
+    recommended to avoid casting the gradient to the parameter precision and creating
+    a casted-copy of the gradient shard that cannot be dereferenced due to replay.
+    """
+
+    megatron_fsdp_enable_fine_grained_param_gather: bool = False
+    """If set to True, enables fine-grained parameter gathering for Megatron-FSDP.
+      This feature increases the overlap between parameter all-gather and forward computation,
+      at the cost of more frequent communication calls.
+      For MXFP8, this approach helps save memory during fine-grained activation
+      recomputation, because MXFP8 forward and backward passes use different
+      parameter representations (rowwise data for forward, colwise data for backward).
+      In this mode, only the rowwise parameters of modules involved in recomputation
+      will be unsharded.
+    """
+
     def __post_init__(self):
         import os
 
@@ -169,9 +244,19 @@ class DistributedDataParallelConfig:
         if self.reuse_grad_buf_for_mxfp8_param_ag:
             assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
 
-        if self.nccl_ub:
+        if self.nccl_ub and not is_torch_min_version("2.11.0a0"):
             if 'expandable_segments:True' in os.getenv('PYTORCH_CUDA_ALLOC_CONF', '').split(','):
                 raise ValueError(
                     "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is currently not supported "
                     "with nccl_ub due to compatibility issue with torch.cuda.MemPool API."
                 )
+
+        if len(self.param_name_patterns_for_fp32_local_accumulation) > 0:
+            assert not self.grad_reduce_in_fp32, (
+                "Only need to explicitly specify param_name patterns for FP32 local accumulation "
+                "if .main_grads aren't already in FP32"
+            )
+
+        if self.num_buckets is not None:
+            assert self.bucket_size is None, "Cannot specify both num_buckets and bucket_size"
+            assert self.num_buckets > 0, "num_buckets must be greater than 0"

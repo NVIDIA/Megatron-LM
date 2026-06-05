@@ -121,6 +121,12 @@ class ModelParallelConfig:
        None, no function is called on the loss.
     """
 
+    mtp_grad_scale_func: Optional[Callable] = None
+    """If using loss scaling for MTP (Multi-Token Prediction), this function should return the
+       scalar or size-1 scale value for MTP loss. The value is converted to the output tensor
+       device. If None, falls back to grad_scale_func with torch.ones(1).
+    """
+
     no_sync_func: Optional[Callable] = None
     """Function that creates a context that suppresses asynchronous data-parallel communication. If
        the model is an instance of core.distributed.DistributedDataParallel, the default is to use
@@ -261,6 +267,15 @@ class ModelParallelConfig:
     delay_wgrad_compute: bool = False
     """Delay the weight gradient computation to improve batch-level communication overlapping"""
 
+    overlap_dispatch_backward_with_experts_wgrad: bool = False
+    """Delay the weight gradient computation for TE Grouped GEMM MoE experts.
+    When enabled with FSDP, the expert weight gradients are computed on a separate
+    CUDA stream after the data gradients finish, allowing overlap of wgrad compute
+    with EP A2A communication. The FSDP gradient reduce-scatter for
+    expert parameters is deferred until the delayed wgrad computation completes.
+    This requires transformer_engine with GroupedLinear support (TE >= 2.3.0).
+    """
+
     ep_overlap_early_attn_memory_release: bool = False
     """Enable early memory release of attention activations during EP overlap.
     EP overlap can increase peak memory usage when the overlapped forward module allocates 
@@ -381,6 +396,11 @@ class ModelParallelConfig:
     cpu_offloading_double_buffering: bool = False
     """If True, enables double buffering across layers while reloading activations from CPU."""
 
+    cpu_offloading_retain_pinned_cpu_buffers: bool = False
+    """If True, the pinned CPU buffers are retained after offloading and reused for the
+       next iteration. It is useful for cuda graphs capture.
+    """
+
     ###################
     # Timing
     ###################
@@ -413,6 +433,11 @@ class ModelParallelConfig:
 
         if self.autocast_dtype is None:
             self.autocast_dtype = self.params_dtype
+
+        assert not (self.cross_entropy_loss_fusion and self.cross_entropy_fusion_impl == 'te'), (
+            "Transformer Engine cross entropy loss fusion is disabled due to stability issues. "
+            "Use cross_entropy_fusion_impl='native', or disable cross_entropy_loss_fusion."
+        )
 
         if self.defer_embedding_wgrad_compute and self.pipeline_model_parallel_size == 1:
             raise ValueError(

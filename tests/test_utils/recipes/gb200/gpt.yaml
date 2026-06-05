@@ -11,6 +11,7 @@ spec:
   n_repeat: 5
   platforms: dgx_gb200
   script_setup: |
+    set -euo pipefail
     unset https_proxy
     echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
 
@@ -34,6 +35,8 @@ spec:
     git rev-parse HEAD
     rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
   script: |-
+    set -euo pipefail
+    : "${{RUN_ID:=pr-$$}}"
     ls
     cd /opt/megatron-lm
 
@@ -51,8 +54,8 @@ spec:
         "TRAINING_PARAMS_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/model_config.yaml"
         "GOLDEN_VALUES_PATH=./tests/functional_tests/test_cases/{model}/{test_case}/golden_values_{environment}_{platforms}.json"
         "N_REPEAT={n_repeat}"
-        "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE}}"
-        "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS}}"
+        "ENABLE_LIGHTWEIGHT_MODE=${{ENABLE_LIGHTWEIGHT_MODE:-}}"
+        "RECORD_CHECKPOINTS=${{RECORD_CHECKPOINTS:-}}"
     )
 
     set +x 
@@ -117,7 +120,7 @@ products:
   - test_case: [gpt3_mcore_te_tp1_pp1_resume_torch_dist_dist_optimizer]
     products:
       - environment: [dev]
-        scope: [mr, mr-github-broken]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp1_pp1_resume_torch_dist_uniform_full_recompute]
     products:
@@ -266,7 +269,7 @@ products:
   - test_case: [gpt3_mcore_te_tp2_pp1_gdn]
     products:
       - environment: [dev]
-        scope: [mr, mr-github, mr-github-slim]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp2_pp2_mla]
     products:
@@ -334,12 +337,12 @@ products:
   - test_case: [gpt3_mcore_reruns_persistent_1]
     products:
       - environment: [dev]
-        scope: [mr, mr-github-broken]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp1_pp4_vp1_dist_optimizer_overlap_grad_reduce_param_gather_overlap_optimizer]
     products:
       - environment: [dev]
-        scope: [mr, mr-github, mr-github-slim]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp4_pp1_dist_optimizer_overlap_grad_reduce_param_gather]
     products:
@@ -349,7 +352,7 @@ products:
   - test_case: [gpt3_mcore_te_tp4_pp1_resume_torch_dist_dist_optimizer_overlap_grad_reduce_param_gather]
     products:
       - environment: [dev]
-        scope: [mr, mr-github, mr-github-slim]
+        scope: [mr]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_te_tp4_pp2_resume_torch_dist_reshard_8x1xNone]
     products:

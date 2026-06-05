@@ -20,6 +20,7 @@ class Headers(Enum):
     STOP = auto()
     DISCONNECT = auto()
     SHUTDOWN = auto()
+    TP_BROADCAST = auto()
 
 
 class UnknownHeaderError(Exception):

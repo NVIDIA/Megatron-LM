@@ -8,6 +8,7 @@ import torch.distributed
 
 from megatron.core import mpu
 from megatron.core.enums import ModelType
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
     get_gpt_layer_with_transformer_engine_spec,
@@ -17,7 +18,12 @@ from megatron.core.num_microbatches_calculator import destroy_num_microbatches_c
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.experts import SequentialMLP, TEGroupedMLP
-from megatron.core.utils import get_te_version, is_te_min_version
+from megatron.core.utils import (
+    get_batch_on_this_cp_rank,
+    get_te_version,
+    is_te_min_version,
+    unwrap_model,
+)
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
     destroy_global_vars,
@@ -26,19 +32,12 @@ from megatron.training.global_vars import (
     set_global_variables,
 )
 from megatron.training.training import get_model, setup_model_and_optimizer
-from megatron.training.utils import (
-    get_batch_on_this_cp_rank,
-    get_batch_on_this_tp_rank,
-    unwrap_model,
-)
 from tests.unit_tests.test_utilities import Utils
 
-try:
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TEColumnParallelGroupedLinear
-
-    HAVE_TE = True
-except ImportError:
-    HAVE_TE = False
+else:
+    TEColumnParallelGroupedLinear = None
 
 _SEED = 42
 
@@ -157,16 +156,6 @@ def set_bias_value(dense_model):
             value = torch.randn(value.shape)
             state_dict[name] = value
     dense_model[0].load_state_dict(state_dict, strict=True)
-
-
-def get_batch(data_iterator):
-    if (not mpu.is_pipeline_first_stage()) and (not mpu.is_pipeline_last_stage()):
-        return None, None, None, None, None
-
-    batch = get_batch_on_this_tp_rank(data_iterator)
-    batch = get_batch_on_this_cp_rank(batch)
-
-    return batch.values()
 
 
 class TestGPTModel:

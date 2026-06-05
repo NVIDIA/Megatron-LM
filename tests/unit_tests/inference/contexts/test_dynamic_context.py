@@ -16,8 +16,9 @@ from megatron.core.inference.contexts.dynamic_context import (
 )
 from megatron.core.inference.inference_request import DynamicInferenceRequest
 from megatron.core.inference.sampling_params import SamplingParams
-from megatron.core.ssm.mamba_hybrid_layer_allocation import Symbols
+from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.transformer_block import get_num_layers_to_build
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -37,13 +38,25 @@ def rounder_override(n):
 
 class TestDynamicContext:
 
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        model_parallel_cuda_manual_seed(123)
+
     def _setup_model_parallel_group(self, tensor_parallel_size, pipeline_parallel_size):
-
-        self.pp_size = pipeline_parallel_size
-
+        Utils.destroy_model_parallel()
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tensor_parallel_size,
             pipeline_model_parallel_size=pipeline_parallel_size,
+        )
+        model_parallel_cuda_manual_seed(123)
+
+    def _restore_model_parallel(self):
+        Utils.destroy_model_parallel()
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
         )
         model_parallel_cuda_manual_seed(123)
 
@@ -108,14 +121,14 @@ class TestDynamicContext:
         )
         return dynamic_context
 
-    def teardown_method(self, method):
+    @classmethod
+    def teardown_class(cls):
         Utils.destroy_model_parallel()
 
     @pytest.mark.internal
     @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_initialize_dynamic_context(self, is_hybrid_model: bool):
-        self._setup_model_parallel_group(1, 1)
 
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -130,16 +143,16 @@ class TestDynamicContext:
         )
 
         if not is_hybrid_model:
-            assert dynamic_context.block_allocator.total_count == 491
-            assert dynamic_context.block_allocator.active_count == 392
+            assert dynamic_context.kv_block_allocator.total_count == 491
+            assert dynamic_context.kv_block_allocator.active_count == 392
             # We make max_requests divisible by the REQUEST_ROUNDER.
             assert dynamic_context.max_requests == 448
             assert dynamic_context.max_tokens == 16384
             assert dynamic_context.num_mamba_layers == 0
             assert dynamic_context.mamba_metadata is None
         else:
-            assert dynamic_context.block_allocator.total_count == 556
-            assert dynamic_context.block_allocator.active_count == 444
+            assert dynamic_context.kv_block_allocator.total_count == 556
+            assert dynamic_context.kv_block_allocator.active_count == 444
             assert dynamic_context.max_requests == 512
             assert dynamic_context.max_tokens == 16384
             assert dynamic_context.num_mamba_layers == 1
@@ -150,7 +163,7 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     def test_is_static_batching(self):
-        self._setup_model_parallel_group(1, 1)
+
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
             num_layers=2,
@@ -167,7 +180,7 @@ class TestDynamicContext:
     @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_is_memory_available(self, is_hybrid_model):
-        self._setup_model_parallel_group(1, 1)
+
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
             num_layers=2,
@@ -179,19 +192,18 @@ class TestDynamicContext:
             max_tokens=None,
             is_hybrid_model=is_hybrid_model,
         )
-        dynamic_context.block_allocator.total_avail = 10
-        assert dynamic_context.block_allocator.is_memory_available(10)
-        assert not dynamic_context.block_allocator.is_memory_available(11)
+        dynamic_context.kv_block_allocator.total_avail = 10
+        assert dynamic_context.kv_block_allocator.is_memory_available(10)
+        assert not dynamic_context.kv_block_allocator.is_memory_available(11)
 
-        assert dynamic_context.block_allocator.is_memory_available(1)
-        dynamic_context.block_allocator.total_avail = 0
-        assert not dynamic_context.block_allocator.is_memory_available(1)
+        assert dynamic_context.kv_block_allocator.is_memory_available(1)
+        dynamic_context.kv_block_allocator.total_avail = 0
+        assert not dynamic_context.kv_block_allocator.is_memory_available(1)
 
     @pytest.mark.internal
     @rounder_override(1)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_request_overflow(self, is_hybrid_model: bool):
-        self._setup_model_parallel_group(1, 1)
 
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -210,7 +222,7 @@ class TestDynamicContext:
                 dynamic_context.add_request(
                     DynamicInferenceRequest(
                         request_id=i,
-                        prompt_tokens=torch.zeros(10, device='cuda'),
+                        prompt_tokens=torch.zeros(10, device='cpu'),
                         sampling_params=SamplingParams(
                             num_tokens_to_generate=dynamic_context.max_tokens - 10
                         ),
@@ -221,7 +233,6 @@ class TestDynamicContext:
     @rounder_override(1)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_token_overflow_error(self, is_hybrid_model: bool):
-        self._setup_model_parallel_group(1, 1)
 
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -239,7 +250,7 @@ class TestDynamicContext:
             dynamic_context.add_request(
                 DynamicInferenceRequest(
                     request_id=1,
-                    prompt_tokens=torch.arange(0, 225, device='cuda'),
+                    prompt_tokens=torch.arange(0, 225, device='cpu'),
                     sampling_params=SamplingParams(
                         num_tokens_to_generate=dynamic_context.max_tokens - 25
                     ),
@@ -248,9 +259,48 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
+    def test_current_input_and_position_ids_view_cache(self):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=64,
+            num_attention_heads=8,
+            max_sequence_length=128,
+            buffer_size_gb=0.1,
+            block_size_tokens=128,
+            max_tokens=None,
+        )
+
+        num_tokens = 64
+        dynamic_context.padded_active_token_count = num_tokens
+
+        # First call: cache miss, populates entry.
+        assert num_tokens not in dynamic_context._input_position_views
+        input_ids_view, pos_ids_view = dynamic_context.current_input_and_position_ids()
+        assert num_tokens in dynamic_context._input_position_views
+
+        # Second call: cache hit returns the same tensor objects.
+        cached_input_ids, cached_pos_ids = dynamic_context.current_input_and_position_ids()
+        assert cached_input_ids is input_ids_view
+        assert cached_pos_ids is pos_ids_view
+
+        # Writing new values into the underlying storage must be reflected by the cached views.
+        device = dynamic_context.gpu_view.token_to_input_ids.device
+        new_input_ids = torch.arange(num_tokens, dtype=torch.long, device=device)
+        new_pos_ids = torch.arange(num_tokens, 2 * num_tokens, dtype=torch.long, device=device)
+        dynamic_context.gpu_view.token_to_input_ids[:num_tokens] = new_input_ids
+        dynamic_context.gpu_view.token_to_pos_ids[:num_tokens] = new_pos_ids
+
+        refreshed_input_ids, refreshed_pos_ids = dynamic_context.current_input_and_position_ids()
+        assert refreshed_input_ids is input_ids_view
+        assert refreshed_pos_ids is pos_ids_view
+        assert torch.equal(refreshed_input_ids.squeeze(0), new_input_ids)
+        assert torch.equal(refreshed_pos_ids.squeeze(0), new_pos_ids)
+
+    @pytest.mark.internal
+    @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_reset(self, is_hybrid_model: bool):
-        self._setup_model_parallel_group(1, 1)
 
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -270,7 +320,7 @@ class TestDynamicContext:
         dynamic_context.paused_request_count = 5
         dynamic_context.padded_active_token_count = 10
         dynamic_context.padded_active_request_count = 5
-        dynamic_context.paused_tokens = torch.tensor([1, 2, 3], device='cuda')
+        dynamic_context.paused_tokens = torch.tensor([1, 2, 3], device='cpu')
         dynamic_context.request_ids.fill_(1)
         dynamic_context.request_query_lengths.fill_(1)
         dynamic_context.request_kv_length_offsets.fill_(1)
@@ -312,11 +362,11 @@ class TestDynamicContext:
         assert torch.all(dynamic_context.token_to_block_idx == -1)
         assert torch.all(dynamic_context.token_to_local_position_within_kv_block == 0)
         if not is_hybrid_model:
-            assert dynamic_context.block_allocator.active_count == 819
-            assert dynamic_context.block_allocator.total_count == 1024
+            assert dynamic_context.kv_block_allocator.active_count == 819
+            assert dynamic_context.kv_block_allocator.total_count == 1024
         else:
-            assert dynamic_context.block_allocator.active_count == 1517
-            assert dynamic_context.block_allocator.total_count == 1897
+            assert dynamic_context.kv_block_allocator.active_count == 1517
+            assert dynamic_context.kv_block_allocator.total_count == 1897
         assert torch.all(dynamic_context.request_to_kv_block_ids == -1)
         if is_hybrid_model:
             assert torch.all(dynamic_context.mamba_metadata.request_to_mamba_state_idx == -1)
@@ -325,7 +375,7 @@ class TestDynamicContext:
     @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_allocate_and_release_memory_blocks(self, is_hybrid_model):
-        self._setup_model_parallel_group(1, 1)
+
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
             num_layers=4,
@@ -345,27 +395,27 @@ class TestDynamicContext:
         expected_block_count_avail = expected_memory_blocks[0]
 
         assert (
-            dynamic_context.block_allocator.allocate_memory_blocks(4)
+            dynamic_context.kv_block_allocator.allocate_memory_blocks(4)
             .cpu()
             .detach()
             .numpy()
             .tolist()
             == expected_memory_blocks
         )
-        assert dynamic_context.block_allocator.total_avail == expected_block_count_avail
-        dynamic_context.block_allocator.release_memory_blocks(
-            torch.tensor(expected_memory_blocks[-2:], device='cuda')
+        assert dynamic_context.kv_block_allocator.total_avail == expected_block_count_avail
+        dynamic_context.kv_block_allocator.release_memory_blocks(
+            torch.tensor(expected_memory_blocks[-2:], device='cpu')
         )
-        assert dynamic_context.block_allocator.total_avail == expected_block_count_avail + 2
+        assert dynamic_context.kv_block_allocator.total_avail == expected_block_count_avail + 2
         assert (
-            dynamic_context.block_allocator.allocate_memory_blocks(1).item()
+            dynamic_context.kv_block_allocator.allocate_memory_blocks(1).item()
             == expected_memory_blocks[-1]
         )
-        assert dynamic_context.block_allocator.total_avail == expected_block_count_avail + 1
+        assert dynamic_context.kv_block_allocator.total_avail == expected_block_count_avail + 1
         # Should return None since we allocate more blocks than what we have.
         assert (
-            dynamic_context.block_allocator.allocate_memory_blocks(
-                dynamic_context.block_allocator.total_avail + 100
+            dynamic_context.kv_block_allocator.allocate_memory_blocks(
+                dynamic_context.kv_block_allocator.total_avail + 100
             )
             == None
         )
@@ -374,7 +424,6 @@ class TestDynamicContext:
     @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_add_request(self, is_hybrid_model: bool):
-        self._setup_model_parallel_group(1, 1)
 
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -392,7 +441,7 @@ class TestDynamicContext:
         dynamic_context.add_request(
             DynamicInferenceRequest(
                 request_id=0,
-                prompt_tokens=torch.arange(0, context_length, dtype=torch.long, device='cuda'),
+                prompt_tokens=torch.arange(0, context_length, dtype=torch.long, device='cpu'),
                 sampling_params=SamplingParams(
                     num_tokens_to_generate=dynamic_context.max_tokens - context_length
                 ),
@@ -411,15 +460,15 @@ class TestDynamicContext:
         assert dynamic_context.request_last_kv_block_offset[0].item() == 15
         assert torch.all(
             dynamic_context.token_to_pos_ids[0:context_length]
-            == torch.arange(0, context_length, dtype=torch.long, device='cuda')
+            == torch.arange(0, context_length, dtype=torch.long, device='cpu')
         )
         assert torch.all(
             dynamic_context.token_to_input_ids[0:context_length]
-            == torch.arange(0, context_length, dtype=torch.long, device='cuda')
+            == torch.arange(0, context_length, dtype=torch.long, device='cpu')
         )
         assert torch.all(
             dynamic_context.token_to_position_in_request[0:context_length]
-            == torch.arange(0, context_length, dtype=torch.long, device='cuda')
+            == torch.arange(0, context_length, dtype=torch.long, device='cpu')
         )
 
         # Verify token_to_block_idx and token_to_local_position_within_kv_block based on assigned blocks
@@ -440,14 +489,13 @@ class TestDynamicContext:
         )
         assert torch.all(
             dynamic_context.token_to_local_position_within_kv_block[0:context_length]
-            == torch.arange(0, context_length, dtype=torch.long, device='cuda')
+            == torch.arange(0, context_length, dtype=torch.long, device='cpu')
             % dynamic_context.block_size_tokens
         )
 
     @pytest.mark.internal
     @rounder_override(64)
     def test_add_dummy_requests_parallel_populates_state(self):
-        self._setup_model_parallel_group(1, 1)
 
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -463,34 +511,34 @@ class TestDynamicContext:
         requests = [
             DynamicInferenceRequest(
                 request_id=100,
-                prompt_tokens=torch.arange(0, 3, device='cuda'),
+                prompt_tokens=torch.arange(0, 3, device='cpu'),
                 sampling_params=SamplingParams(num_tokens_to_generate=2, termination_id=7),
             ),
             DynamicInferenceRequest(
                 request_id=101,
-                prompt_tokens=torch.arange(3, 9, device='cuda'),
+                prompt_tokens=torch.arange(3, 9, device='cpu'),
                 sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=8),
             ),
         ]
 
         lengths = [req.remaining_prompt_length for req in requests]
         total_tokens = sum(lengths)
-        block_avail_before = dynamic_context.block_allocator.total_avail
+        block_avail_before = dynamic_context.kv_block_allocator.total_avail
 
         dynamic_context.add_dummy_requests_parallel(requests, count_as_prefill=False)
 
         assert dynamic_context.active_token_count == total_tokens
         assert dynamic_context.total_request_count == len(requests)
         assert dynamic_context.num_prefill_requests == 0
-        assert dynamic_context.block_allocator.total_avail == block_avail_before
+        assert dynamic_context.kv_block_allocator.total_avail == block_avail_before
 
         expected_tokens = torch.cat(
-            [torch.arange(0, 3, device='cuda'), torch.arange(3, 9, device='cuda')]
+            [torch.arange(0, 3, device='cpu'), torch.arange(3, 9, device='cpu')]
         )
         assert torch.equal(dynamic_context.token_to_input_ids[:total_tokens], expected_tokens)
 
         expected_positions = torch.tensor(
-            [0, 1, 2, 0, 1, 2, 3, 4, 5], device='cuda', dtype=torch.long
+            [0, 1, 2, 0, 1, 2, 3, 4, 5], device='cpu', dtype=torch.long
         )
         assert torch.equal(
             dynamic_context.token_to_position_in_request[:total_tokens], expected_positions
@@ -498,7 +546,7 @@ class TestDynamicContext:
         assert torch.equal(dynamic_context.token_to_pos_ids[:total_tokens], expected_positions)
 
         expected_request_indices = torch.tensor(
-            [0, 0, 0, 1, 1, 1, 1, 1, 1], device='cuda', dtype=torch.long
+            [0, 0, 0, 1, 1, 1, 1, 1, 1], device='cpu', dtype=torch.long
         )
         assert torch.equal(
             dynamic_context.token_to_request_idx[:total_tokens], expected_request_indices
@@ -509,20 +557,20 @@ class TestDynamicContext:
             dynamic_context.token_to_local_position_within_kv_block[:total_tokens], expected_local
         )
 
-        dummy_block_idx = dynamic_context.block_allocator.dummy_block_idx
+        dummy_block_idx = dynamic_context.kv_block_allocator.dummy_block_idx
         assert torch.all(dynamic_context.token_to_block_idx[:total_tokens] == dummy_block_idx)
 
         assert torch.equal(
             dynamic_context.request_query_lengths[: len(requests)],
-            torch.tensor(lengths, device='cuda', dtype=torch.int32),
+            torch.tensor(lengths, device='cpu', dtype=torch.int32),
         )
         assert torch.equal(
             dynamic_context.request_output_lengths[: len(requests)],
-            torch.tensor([5, 7], device='cuda', dtype=torch.int32),
+            torch.tensor([5, 7], device='cpu', dtype=torch.int32),
         )
         assert torch.equal(
             dynamic_context.request_kv_block_counts[: len(requests)],
-            torch.tensor([1, 2], device='cuda', dtype=torch.int32),
+            torch.tensor([1, 2], device='cpu', dtype=torch.int32),
         )
         assert torch.all(
             dynamic_context.request_to_kv_block_ids[0, :1] == dummy_block_idx
@@ -535,18 +583,17 @@ class TestDynamicContext:
         assert torch.all(dynamic_context.request_last_kv_block_id[:2] == dummy_block_idx)
         assert torch.equal(
             dynamic_context.request_last_kv_block_offset[:2],
-            torch.tensor([2, 1], device='cuda', dtype=torch.int32),
+            torch.tensor([2, 1], device='cpu', dtype=torch.int32),
         )
 
         assert torch.equal(
             dynamic_context.request_metadata["termination_id"][:2],
-            torch.tensor([7.0, 8.0], device='cuda'),
+            torch.tensor([7.0, 8.0], device='cpu'),
         )
 
     @pytest.mark.internal
     @rounder_override(64)
     def test_add_dummy_requests_parallel_hybrid_allocates_mamba(self):
-        self._setup_model_parallel_group(1, 1)
 
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -563,7 +610,7 @@ class TestDynamicContext:
 
         request = DynamicInferenceRequest(
             request_id=55,
-            prompt_tokens=torch.arange(0, 5, device='cuda'),
+            prompt_tokens=torch.arange(0, 5, device='cpu'),
             sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=9),
         )
 
@@ -571,13 +618,16 @@ class TestDynamicContext:
 
         mamba_idx = dynamic_context.mamba_metadata.request_to_mamba_state_idx[0].item()
         assert mamba_idx >= 0
+
+        # Mamba state zeroing is deferred until transfer_bookkeeping_to_gpu().
+        dynamic_context.initialize_attention_state()
+        dynamic_context.transfer_bookkeeping_to_gpu()
         assert torch.all(dynamic_context.mamba_conv_states[:, mamba_idx] == 0)
         assert torch.all(dynamic_context.mamba_ssm_states[:, mamba_idx] == 0)
 
     @pytest.mark.internal
     @rounder_override(64)
     def test_add_dummy_requests_parallel_decode_does_not_count_as_prefill(self):
-        self._setup_model_parallel_group(1, 1)
 
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -592,7 +642,7 @@ class TestDynamicContext:
 
         request = DynamicInferenceRequest(
             request_id=5,
-            prompt_tokens=torch.arange(0, 1, device='cuda'),
+            prompt_tokens=torch.arange(0, 1, device='cpu'),
             sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=2),
         )
 
@@ -604,7 +654,6 @@ class TestDynamicContext:
     @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_update_request(self, is_hybrid_model: bool):
-        self._setup_model_parallel_group(1, 1)
 
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -623,7 +672,7 @@ class TestDynamicContext:
         dynamic_context.paused_request_count = 0
         dynamic_context.total_request_count = 3
         dynamic_context.request_kv_block_counts[0:3] = 1
-        new_block_ids = dynamic_context.block_allocator.allocate_memory_blocks(3)
+        new_block_ids = dynamic_context.kv_block_allocator.allocate_memory_blocks(3)
         dynamic_context.request_to_kv_block_ids[0:3, 0] = new_block_ids
 
         if is_hybrid_model:
@@ -659,10 +708,10 @@ class TestDynamicContext:
             is_hybrid_model=is_hybrid_model,
         )
 
-        active_requests_mask = torch.Tensor([1, 0, 1, 1, 1, 0, 0, 1]).cuda().int()
-        next_tokens = torch.arange(2, 10, device='cuda').int()
+        active_requests_mask = torch.Tensor([1, 0, 1, 1, 1, 0, 0, 1]).int()
+        next_tokens = torch.arange(2, 10, device='cpu').int()
         dynamic_context.paused_request_count = 2
-        dynamic_context.paused_tokens = torch.Tensor([0, 1]).cuda().int()
+        dynamic_context.paused_tokens = torch.Tensor([0, 1]).int()
         dynamic_context.total_request_count = 5
 
         # Total req count should be equal to paused + num elements in active request mask.
@@ -673,16 +722,16 @@ class TestDynamicContext:
             )
 
         total_request_count = 10
-        dynamic_context.block_allocator.total_avail -= 11  # We align 11 blocks to the 10 requests we have. 3rd request alone we setup like it requires 2 blocks
+        dynamic_context.kv_block_allocator.total_avail -= 11  # We align 11 blocks to the 10 requests we have. 3rd request alone we setup like it requires 2 blocks
         dynamic_context.total_request_count = total_request_count
 
         dynamic_context.request_to_kv_block_ids[0:total_request_count, 0] = torch.arange(
-            dynamic_context.block_allocator.total_avail,
-            dynamic_context.block_allocator.total_avail + 10,
+            dynamic_context.kv_block_allocator.total_avail,
+            dynamic_context.kv_block_allocator.total_avail + 10,
         )
         dynamic_context.request_to_kv_block_ids[3][
             1
-        ] = dynamic_context.block_allocator.total_avail  # Assign one extra block  to request 3.
+        ] = dynamic_context.kv_block_allocator.total_avail  # Assign one extra block  to request 3.
         dynamic_context.request_kv_length_offsets[0:total_request_count] = 10
         # For 0, 1, 5, 6, the total number of tokens in last block is block size -1, so that they will all need extra blocks
         dynamic_context.request_kv_length_offsets[0:2] = dynamic_context.block_size_tokens - 1
@@ -719,7 +768,7 @@ class TestDynamicContext:
 
         # Then set up the test data
         dynamic_context.request_ids[0:10] = torch.tensor(
-            [0, 1, 5, 6, 4, 2, 9, 7, 8, 9], device=torch.cuda.current_device()
+            [0, 1, 5, 6, 4, 2, 9, 7, 8, 9], device='cpu'
         )
 
         # Now verify the values
@@ -805,7 +854,6 @@ class TestDynamicContext:
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_release_memory_blocks_for_finished_requests(self, is_hybrid_model):
         """Test that memory blocks are correctly released for finished requests."""
-        self._setup_model_parallel_group(1, 1)
 
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -821,12 +869,12 @@ class TestDynamicContext:
 
         # Set up the initial state with 5 requests
         # Allocate 5 blocks for 5 requests
-        initial_blocks = dynamic_context.block_allocator.allocate_memory_blocks(5)
+        initial_blocks = dynamic_context.kv_block_allocator.allocate_memory_blocks(5)
         dynamic_context.total_request_count = 5
         dynamic_context.paused_request_count = 0
 
         # Record the available blocks before releasing memory
-        initial_available_blocks = dynamic_context.block_allocator.total_avail
+        initial_available_blocks = dynamic_context.kv_block_allocator.total_avail
 
         # Assign blocks to the requests (one block per request)
         for i in range(5):
@@ -847,12 +895,12 @@ class TestDynamicContext:
 
         # Create an active_requests_mask where requests 0, 2, and 4 are finished (0),
         # and requests 1 and 3 are still active (1)
-        active_requests_mask = torch.tensor([0, 1, 0, 1, 0], device=torch.cuda.current_device())
+        active_requests_mask = torch.tensor([0, 1, 0, 1, 0], device='cpu')
 
         # Call update_requests with these parameters
         dynamic_context.update_requests(
             active_requests_mask=active_requests_mask,
-            new_tokens=torch.tensor([10, 11, 12, 13, 14], device=torch.cuda.current_device()),
+            new_tokens=torch.tensor([10, 11, 12, 13, 14], device='cpu'),
         )
 
         # After the update, we should have released 3 blocks (for requests 0, 2, and 4)
@@ -861,7 +909,7 @@ class TestDynamicContext:
         assert dynamic_context.active_token_count == 2
 
         # Verify that 3 blocks were released by checking the available blocks
-        assert dynamic_context.block_allocator.total_avail == initial_available_blocks + 3
+        assert dynamic_context.kv_block_allocator.total_avail == initial_available_blocks + 3
 
         if is_hybrid_model:
             # Request at position 3 now moves into finished request position 0
@@ -882,7 +930,6 @@ class TestDynamicContext:
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_finished_requests_with_multiple_blocks(self, is_hybrid_model):
         """Test that all memory blocks are correctly released for finished requests that use multiple blocks."""
-        self._setup_model_parallel_group(1, 1)
 
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -898,12 +945,12 @@ class TestDynamicContext:
 
         # Set up the initial state with 3 requests, where some use multiple blocks
         # Allocate 6 blocks in total for the requests
-        initial_blocks = dynamic_context.block_allocator.allocate_memory_blocks(6)
+        initial_blocks = dynamic_context.kv_block_allocator.allocate_memory_blocks(6)
         dynamic_context.total_request_count = 3
         dynamic_context.paused_request_count = 0
 
         # Record the available blocks before releasing memory
-        initial_available_blocks = dynamic_context.block_allocator.total_avail
+        initial_available_blocks = dynamic_context.kv_block_allocator.total_avail
 
         # Assign blocks to the requests:
         # - Request 0: 1 block
@@ -937,12 +984,12 @@ class TestDynamicContext:
                 dynamic_context.mamba_metadata.mamba_state_free_slot_count -= 1
 
         # Create an active_requests_mask where all requests are finished
-        active_requests_mask = torch.tensor([0, 0, 0], device=torch.cuda.current_device())
+        active_requests_mask = torch.tensor([0, 0, 0], device='cpu')
 
         # Call update_requests with these parameters
         dynamic_context.update_requests(
             active_requests_mask=active_requests_mask,
-            new_tokens=torch.tensor([10, 11, 12], device=torch.cuda.current_device()),
+            new_tokens=torch.tensor([10, 11, 12], device='cpu'),
         )
 
         # After the update, we should have released all 6 blocks and have 0 active requests
@@ -950,13 +997,12 @@ class TestDynamicContext:
         assert dynamic_context.active_token_count == 0
 
         # Verify that all 6 blocks were released by checking the available blocks
-        assert dynamic_context.block_allocator.total_avail == initial_available_blocks + 6
+        assert dynamic_context.kv_block_allocator.total_avail == initial_available_blocks + 6
 
     @pytest.mark.internal
     @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_mamba_states_cache(self, is_hybrid_model: bool):
-        self._setup_model_parallel_group(1, 1)
 
         if not is_hybrid_model:
             # If not hybrid, mamba_states_cache should fail
@@ -993,7 +1039,7 @@ class TestDynamicContext:
         dynamic_context.add_request(
             DynamicInferenceRequest(
                 request_id=0,
-                prompt_tokens=torch.arange(0, context_length, dtype=torch.long, device='cuda'),
+                prompt_tokens=torch.arange(0, context_length, dtype=torch.long, device='cpu'),
                 sampling_params=SamplingParams(
                     num_tokens_to_generate=dynamic_context.max_tokens - 10
                 ),
@@ -1031,7 +1077,7 @@ class TestDynamicContext:
     @pytest.mark.internal
     @rounder_override(64)
     def test_calculate_and_store_log_probs(self):
-        self._setup_model_parallel_group(1, 1)
+
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
             num_layers=4,
@@ -1046,17 +1092,17 @@ class TestDynamicContext:
         # Add a few requests to the context
         request_data = {
             1001: {
-                "tokens": torch.randint(0, 100, (10,), device='cuda'),
+                "tokens": torch.randint(0, 100, (10,), device='cpu'),
                 "prefill_len": 10,
                 "initial_token_offset": 0,
             },
             1002: {
-                "tokens": torch.randint(0, 100, (5,), device='cuda'),
+                "tokens": torch.randint(0, 100, (5,), device='cpu'),
                 "prefill_len": 5,
                 "initial_token_offset": 10,
             },
             1003: {
-                "tokens": torch.randint(0, 100, (7,), device='cuda'),
+                "tokens": torch.randint(0, 100, (7,), device='cpu'),
                 "prefill_len": 7,
                 "initial_token_offset": 15,
             },
@@ -1080,7 +1126,12 @@ class TestDynamicContext:
         # Simulate prefill step
         total_active_tokens = dynamic_context.active_token_count
         vocab_size = 50000
-        # logits will have shape [1, total_active_tokens, vocab_size]
+
+        # Populate gpu_view for calculate_log_probs (which reads from gpu_view).
+        dynamic_context.initialize_attention_state()
+        dynamic_context.transfer_bookkeeping_to_gpu()
+
+        # logits and new_tokens must be on GPU (calculate_log_probs uses gpu_view).
         prefill_logits = torch.randn(
             1, total_active_tokens, vocab_size, device='cuda', dtype=torch.float32
         )
@@ -1121,11 +1172,15 @@ class TestDynamicContext:
 
         # Simulate decode step
         # All requests are active, so the mask will be all ones for the current active requests
-        active_requests_mask = torch.ones(dynamic_context.total_request_count, device='cuda').int()
+        active_requests_mask = torch.ones(dynamic_context.total_request_count, device='cpu').int()
 
         dynamic_context.update_requests(
             active_requests_mask=active_requests_mask, new_tokens=prefill_new_tokens
         )
+
+        # Populate gpu_view again after update_requests modified bookkeeping state.
+        dynamic_context.initialize_attention_state()
+        dynamic_context.transfer_bookkeeping_to_gpu()
 
         # Generate new logits for the decode step. Now each request contributes 1 token.
         decode_logits = torch.randn(
@@ -1152,7 +1207,7 @@ class TestDynamicContext:
 
         # Add a new prefill request to the existing context
         new_request_id = 1004
-        new_request_tokens = torch.randint(0, 100, (12,), device='cuda').long()
+        new_request_tokens = torch.randint(0, 100, (12,), device='cpu').long()
         new_request_prefill_len = new_request_tokens.shape[0]
         initial_token_offset_new_request = dynamic_context.active_token_count
         dynamic_context.add_request(
@@ -1174,6 +1229,7 @@ class TestDynamicContext:
         # This step will involve both prefill (for the new request) and decode (for existing requests).
 
         dynamic_context.initialize_attention_state()
+        dynamic_context.transfer_bookkeeping_to_gpu()
 
         total_active_tokens_mixed_step = dynamic_context.active_token_count
         mixed_step_logits = torch.randn(
@@ -1298,9 +1354,9 @@ class TestDynamicContext:
             ),
         )
 
-        # Collect the total block counts on each rank
+        # Collect the total block counts on each rank (CUDA needed for NCCL all_gather)
         local_total_blocks = torch.tensor(
-            [context.block_allocator.total_count], device='cuda', dtype=torch.long
+            [context.kv_block_allocator.total_count], device='cuda', dtype=torch.long
         )
         gathered_block_counts = [torch.zeros_like(local_total_blocks) for _ in range(pp_size)]
         torch.distributed.all_gather(
@@ -1316,6 +1372,64 @@ class TestDynamicContext:
             len(unique_counts) == 1
         ), f"Block counts were not synchronized across ranks. Gathered: {all_counts}"
 
+        self._restore_model_parallel()
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_uneven_decoder_pp_layer_map_matches_get_num_layers_to_build(self):
+        """Uneven PP (num_layers_in_first/last): KV layer_map length matches this rank's layer count.
+
+        Using ``num_layers // pipeline_model_parallel_size`` for the identity ``layer_map`` would
+        mis-size KV bookkeeping for non-uniform pipeline splits and can surface as ``KeyError`` in
+        ``append_key_value_cache``. ``DynamicInferenceContext`` must match
+        ``get_num_layers_to_build`` for the current PP rank.
+        """
+        pp_size = 2
+        self._setup_model_parallel_group(tensor_parallel_size=1, pipeline_parallel_size=pp_size)
+        pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+
+        num_layers = 10
+        num_first = 4
+        num_last = 6
+        assert (
+            num_first + num_last == num_layers
+        ), "PP=2 with both ends set: all layers must live on first+last stages (no middle ranks)."
+
+        model_config = TransformerConfig(
+            params_dtype=torch.float32,
+            num_layers=num_layers,
+            kv_channels=64,
+            num_attention_heads=8,
+            pipeline_model_parallel_size=pp_size,
+            tensor_model_parallel_size=1,
+            pipeline_dtype=torch.float32,
+            num_layers_in_first_pipeline_stage=num_first,
+            num_layers_in_last_pipeline_stage=num_last,
+        )
+
+        expected_local = num_first if pp_rank == 0 else num_last
+        wrong_uniform = num_layers // pp_size  # 5 on each rank; true counts are 4 and 6
+
+        assert get_num_layers_to_build(model_config) == expected_local
+        assert wrong_uniform != expected_local
+
+        context = DynamicInferenceContext(
+            model_config=model_config,
+            inference_config=InferenceConfig(
+                max_sequence_length=128,
+                buffer_size_gb=0.1,
+                block_size_tokens=16,
+                max_tokens=1024,
+                unified_memory_level=0,
+            ),
+        )
+
+        assert context.num_attention_layers == expected_local
+        assert len(context.layer_map) == expected_local
+        assert context.layer_map == {i: i for i in range(expected_local)}
+
+        self._restore_model_parallel()
+
     @pytest.mark.internal
     @pytest.mark.parametrize("ratio", [0.2, 0.4, 0.6, 0.8])
     @rounder_override(64)
@@ -1323,7 +1437,6 @@ class TestDynamicContext:
         """
         Test that max_requests and block counts are partitioned correctly by mamba_memory_ratio.
         """
-        self._setup_model_parallel_group(1, 1)
 
         buffer_gb = 0.05
         paused_gb = 0.01
@@ -1384,8 +1497,8 @@ class TestDynamicContext:
         expected_total_blocks = expected_active_blocks + expected_paused_blocks
 
         # Check that block allocator received the reduced block counts
-        assert context.block_allocator.total_count == expected_active_blocks
-        assert context.block_allocator.paused_count == expected_paused_blocks
+        assert context.kv_block_allocator.total_count == expected_active_blocks
+        assert context.kv_block_allocator.paused_count == expected_paused_blocks
 
         # max_requests should be limited by the Mamba calculation if mamba_max_requests is smaller
         # or the block count - 1 if that is smaller
@@ -1396,6 +1509,100 @@ class TestDynamicContext:
 
         assert context.max_requests == expected_max_requests
         assert context.is_hybrid_model is True
+
+    @pytest.mark.internal
+    @rounder_override(1)
+    @pytest.mark.parametrize("max_requests", [1, 4, 64])
+    def test_hybrid_max_requests_auto_derives_mamba_split(self, max_requests):
+        """
+        When max_requests is set on a hybrid model without mamba_memory_ratio,
+        mamba memory should be allocated for exactly max_requests slots, with
+        the remaining memory going to KV cache blocks.
+        """
+
+        buffer_gb = 0.05
+        paused_gb = 0.01
+        block_size = 256
+        num_attention_heads = 8
+        kv_channels = 64
+        params_dtype = torch.float32
+
+        layer_type_list = [Symbols.MAMBA, Symbols.ATTENTION]
+        mamba_conv_states_shape = (544, 4)
+        mamba_ssm_states_shape = (8, 64, 16)
+        mamba_config = MambaInferenceStateConfig(
+            layer_type_list,
+            mamba_conv_states_shape,
+            mamba_ssm_states_shape,
+            params_dtype,
+            params_dtype,
+        )
+
+        context = DynamicInferenceContext(
+            model_config=TransformerConfig(
+                params_dtype=params_dtype,
+                num_layers=2,
+                kv_channels=kv_channels,
+                num_attention_heads=num_attention_heads,
+            ),
+            inference_config=InferenceConfig(
+                max_sequence_length=512,
+                buffer_size_gb=buffer_gb,
+                paused_buffer_size_gb=paused_gb,
+                block_size_tokens=block_size,
+                max_tokens=2048,
+                mamba_inference_state_config=mamba_config,
+                max_requests=max_requests,
+                unified_memory_level=0,
+            ),
+        )
+
+        dtype_size = torch.tensor([], dtype=params_dtype).element_size()
+
+        mamba_mem_per_req = math.prod(mamba_conv_states_shape) + math.prod(mamba_ssm_states_shape)
+        mamba_mem_per_req *= dtype_size
+
+        kv_buffer_bytes = int(buffer_gb * 1024**3)
+        kv_paused_bytes = int(paused_gb * 1024**3)
+        total_mem_bytes = kv_buffer_bytes + kv_paused_bytes
+
+        # Auto-derived ratio from max_requests.
+        mamba_memory_needed = max_requests * mamba_mem_per_req
+        ratio = mamba_memory_needed / total_mem_bytes
+
+        kv_buffer_bytes = int(kv_buffer_bytes * (1.0 - ratio))
+        kv_paused_bytes = int(kv_paused_bytes * (1.0 - ratio))
+
+        kv_block_size_bytes = dtype_size * 2 * 1 * block_size * num_attention_heads * kv_channels
+        expected_active_blocks = kv_buffer_bytes // kv_block_size_bytes
+
+        assert context.kv_block_allocator.total_count == expected_active_blocks
+        assert context.max_requests == max_requests
+
+        # With max_requests=1, more memory goes to KV blocks than with max_requests=64.
+        # Verify we get more blocks with fewer requests.
+        if max_requests == 1:
+            context_many = DynamicInferenceContext(
+                model_config=TransformerConfig(
+                    params_dtype=params_dtype,
+                    num_layers=2,
+                    kv_channels=kv_channels,
+                    num_attention_heads=num_attention_heads,
+                ),
+                inference_config=InferenceConfig(
+                    max_sequence_length=512,
+                    buffer_size_gb=buffer_gb,
+                    paused_buffer_size_gb=paused_gb,
+                    block_size_tokens=block_size,
+                    max_tokens=2048,
+                    mamba_inference_state_config=mamba_config,
+                    max_requests=64,
+                    unified_memory_level=0,
+                ),
+            )
+            assert (
+                context.kv_block_allocator.total_count > context_many.kv_block_allocator.total_count
+            )
 
     @pytest.mark.internal
     @rounder_override(64)
@@ -1418,6 +1625,8 @@ class TestDynamicContext:
         with pytest.raises(AssertionError):
             DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
 
+        self._restore_model_parallel()
+
     @pytest.mark.internal
     @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
@@ -1430,7 +1639,6 @@ class TestDynamicContext:
         the same observable state as the slow path
         (add_dummy_requests_for_cudagraph_capture(min(cuda_graph_dims))).
         """
-        self._setup_model_parallel_group(1, 1)
 
         ctx = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -1451,10 +1659,16 @@ class TestDynamicContext:
             num_speculative_tokens=num_speculative_tokens,
         )
 
-        smallest = min(ctx.cuda_graph_batch_dimensions_list)
+        # The fast path is decode-only by construction, so pick the smallest decode-only batch_dim.
+        # With the geometric grid for mixed cudagraphs, the global min may now be a P=1 mixed shape
+        # when num_speculative_tokens > 0 makes decode-only token_count > 1)
+        smallest = min(
+            batchdim
+            for batchdim in ctx.cuda_graph_batch_dimensions_list
+            if batchdim.prefill_req_count == 0
+        )
         N = smallest.decode_req_count
         T = smallest.token_count  # N * (num_speculative_tokens + 1)
-        assert smallest.prefill_req_count == 0, "smallest graph must be decode-only"
 
         # --- slow path (reference) ---
         ctx.add_dummy_requests_for_cudagraph_capture(smallest)
@@ -1473,7 +1687,7 @@ class TestDynamicContext:
 
         # --- reset and run fast path ---
         ctx.reset()
-        ctx.add_dummy_requests_for_expert_parallel_step()
+        ctx.add_dummy_requests_for_expert_parallel_step(smallest)
 
         # 1. Scalar counts
         assert ctx.total_request_count == slow_total_request_count
@@ -1486,7 +1700,7 @@ class TestDynamicContext:
         assert torch.equal(ctx.request_to_kv_block_ids[:N, 0], slow_request_to_kv_block_ids_col0)
 
         # 3. Token-level state
-        dummy_block_idx = ctx.block_allocator.dummy_block_idx
+        dummy_block_idx = ctx.kv_block_allocator.dummy_block_idx
         assert torch.all(ctx.token_to_block_idx[:T] == dummy_block_idx)
         assert torch.equal(ctx.token_to_block_idx[:T], slow_token_to_block_idx)
         assert torch.equal(ctx.token_to_local_position_within_kv_block[:T], slow_token_to_local_pos)
@@ -1528,6 +1742,8 @@ class TestDynamicContext:
         # With TP=8 and GQA=2, num_attention_heads_per_partition should be clamped to 1
         assert dynamic_context.num_attention_heads_per_partition == 1
 
+        self._restore_model_parallel()
+
     @pytest.mark.internal
     @rounder_override(64)
     def test_chunked_prefill_state_preserved_across_decode_completions(self):
@@ -1536,7 +1752,6 @@ class TestDynamicContext:
         finish (causing the context boundary to shrink), the hidden chunked request
         is safely pulled to the new boundary so it doesn't lose its KV blocks or Mamba slot.
         """
-        self._setup_model_parallel_group(1, 1)
 
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -1556,14 +1771,14 @@ class TestDynamicContext:
         dynamic_context.add_request(
             DynamicInferenceRequest(
                 request_id=10,
-                prompt_tokens=torch.arange(0, 2, device='cuda'),
+                prompt_tokens=torch.arange(0, 2, device='cpu'),
                 sampling_params=SamplingParams(num_tokens_to_generate=10),
             )
         )
         dynamic_context.add_request(
             DynamicInferenceRequest(
                 request_id=11,
-                prompt_tokens=torch.arange(0, 2, device='cuda'),
+                prompt_tokens=torch.arange(0, 2, device='cpu'),
                 sampling_params=SamplingParams(num_tokens_to_generate=10),
             )
         )
@@ -1571,10 +1786,10 @@ class TestDynamicContext:
         # Add Chunk 1 of the chunked prefill request
         req_999 = DynamicInferenceRequest(
             request_id=999,
-            prompt_tokens=torch.arange(0, 8, device='cuda'),
+            prompt_tokens=torch.arange(0, 8, device='cpu'),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
         )
-        dynamic_context.add_request(req_999, chunk_length=4)
+        dynamic_context.add_request(req_999, prefill_chunk_length=4)
         dynamic_context.chunked_prefill_request_id = 999
 
         # Capture the allocated state at index 2
@@ -1585,8 +1800,8 @@ class TestDynamicContext:
         assert kv_block_before != -1
 
         # Step 1: Forward pass for all 3 requests
-        active_requests_mask = torch.tensor([1, 1, 1], dtype=torch.int32, device='cuda')
-        new_tokens = torch.tensor([100, 101, 102], dtype=torch.int32, device='cuda')
+        active_requests_mask = torch.tensor([1, 1, 1], dtype=torch.int32, device='cpu')
+        new_tokens = torch.tensor([100, 101, 102], dtype=torch.int32, device='cpu')
         dynamic_context.update_requests(active_requests_mask, new_tokens)
 
         # At this point, req 999 is hidden at index 2. total_request_count is 2 (req 10, 11).
@@ -1594,8 +1809,8 @@ class TestDynamicContext:
         assert dynamic_context.request_ids[2].item() == 999
 
         # Step 2: Forward pass where req 10 finishes, req 11 continues. Req 999 is NOT scheduled.
-        active_requests_mask = torch.tensor([0, 1], dtype=torch.int32, device='cuda')
-        new_tokens = torch.tensor([103, 104], dtype=torch.int32, device='cuda')
+        active_requests_mask = torch.tensor([0, 1], dtype=torch.int32, device='cpu')
+        new_tokens = torch.tensor([103, 104], dtype=torch.int32, device='cpu')
         dynamic_context.update_requests(active_requests_mask, new_tokens)
 
         # At this point, req 10 is evicted. Req 11 shifts to index 0. total_request_count becomes 1.
@@ -1617,7 +1832,7 @@ class TestDynamicContext:
 
         # Step 3: Add the next chunk. It should sit exactly at the boundary (index 1) and inherit the state.
         req_999.finished_chunk_token_count = 4
-        dynamic_context.add_request(req_999, chunk_length=4)
+        dynamic_context.add_request(req_999, prefill_chunk_length=4)
 
         # Verify state at index 1 is active and its previous Mamba slot and KV blocks were inherited
         assert dynamic_context.total_request_count == 2
@@ -1640,7 +1855,6 @@ class TestDynamicContext:
         3. All remaining active decode requests finish in the same step
         4. active_request_count becomes 0 — the code must not assert-fail
         """
-        self._setup_model_parallel_group(1, 1)
 
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -1659,14 +1873,14 @@ class TestDynamicContext:
         dynamic_context.add_request(
             DynamicInferenceRequest(
                 request_id=10,
-                prompt_tokens=torch.arange(0, 2, device='cuda'),
+                prompt_tokens=torch.arange(0, 2, device='cpu'),
                 sampling_params=SamplingParams(num_tokens_to_generate=10),
             )
         )
         dynamic_context.add_request(
             DynamicInferenceRequest(
                 request_id=11,
-                prompt_tokens=torch.arange(0, 2, device='cuda'),
+                prompt_tokens=torch.arange(0, 2, device='cpu'),
                 sampling_params=SamplingParams(num_tokens_to_generate=10),
             )
         )
@@ -1674,18 +1888,18 @@ class TestDynamicContext:
         # Add Chunk 1 of a chunked prefill request
         req_999 = DynamicInferenceRequest(
             request_id=999,
-            prompt_tokens=torch.arange(0, 8, device='cuda'),
+            prompt_tokens=torch.arange(0, 8, device='cpu'),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
         )
-        dynamic_context.add_request(req_999, chunk_length=4)
+        dynamic_context.add_request(req_999, prefill_chunk_length=4)
         dynamic_context.chunked_prefill_request_id = 999
 
         kv_block_before = dynamic_context.request_to_kv_block_ids[2, 0].item()
         assert kv_block_before != -1
 
         # Step 1: All 3 requests are active, process forward pass
-        active_requests_mask = torch.tensor([1, 1, 1], dtype=torch.int32, device='cuda')
-        new_tokens = torch.tensor([100, 101, 102], dtype=torch.int32, device='cuda')
+        active_requests_mask = torch.tensor([1, 1, 1], dtype=torch.int32, device='cpu')
+        new_tokens = torch.tensor([100, 101, 102], dtype=torch.int32, device='cpu')
         dynamic_context.update_requests(active_requests_mask, new_tokens)
 
         # Chunked prefill is now hidden at position 2, total_request_count = 2
@@ -1694,8 +1908,8 @@ class TestDynamicContext:
 
         # Step 2: Both decode requests finish, chunked prefill NOT scheduled this step.
         # This must NOT crash even though active_request_count becomes 0.
-        active_requests_mask = torch.tensor([0, 0], dtype=torch.int32, device='cuda')
-        new_tokens = torch.tensor([103, 104], dtype=torch.int32, device='cuda')
+        active_requests_mask = torch.tensor([0, 0], dtype=torch.int32, device='cpu')
+        new_tokens = torch.tensor([103, 104], dtype=torch.int32, device='cpu')
         dynamic_context.update_requests(active_requests_mask, new_tokens)
 
         # total_request_count should be 0 (both finished, chunked prefill hidden)
@@ -1708,7 +1922,7 @@ class TestDynamicContext:
 
         # Verify we can still add the next chunk at position 0
         req_999.finished_chunk_token_count = 4
-        dynamic_context.add_request(req_999, chunk_length=4)
+        dynamic_context.add_request(req_999, prefill_chunk_length=4)
 
         assert dynamic_context.total_request_count == 1
         assert dynamic_context.request_ids[0].item() == 999
@@ -1718,7 +1932,6 @@ class TestDynamicContext:
     @rounder_override(64)
     def test_update_requests_speculative(self):
         """Test update_requests correctly interleaves sampled and speculative tokens."""
-        self._setup_model_parallel_group(1, 1)
 
         model_config = TransformerConfig(
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
@@ -1743,10 +1956,10 @@ class TestDynamicContext:
         ctx.request_to_kv_block_ids[:2, 0] = torch.tensor([0, 1])
         ctx.request_last_kv_block_id[:2] = torch.tensor([0, 1])
 
-        active_requests_mask = torch.tensor([1, 1], device='cuda')
-        new_tokens = torch.tensor([99, 100], device='cuda')  # Sampled tokens
+        active_requests_mask = torch.tensor([1, 1], device='cpu')
+        new_tokens = torch.tensor([99, 100], device='cpu')  # Sampled tokens
         new_speculative_tokens = torch.tensor(
-            [[991, 1001], [992, 1002]], device='cuda'
+            [[991, 1001], [992, 1002]], device='cpu'
         )  # Spec tokens
 
         ctx.update_requests(
@@ -1758,22 +1971,20 @@ class TestDynamicContext:
         # Each request generates 1 (sampled) + 2 (speculative) = 3 tokens.
         assert ctx.active_token_count == 6
         assert torch.equal(
-            ctx.request_query_lengths[:2], torch.tensor([3, 3], dtype=torch.int32, device='cuda')
+            ctx.request_query_lengths[:2], torch.tensor([3, 3], dtype=torch.int32, device='cpu')
         )
         assert torch.equal(
-            ctx.request_kv_length_offsets[:2],
-            torch.tensor([6, 9], dtype=torch.int32, device='cuda'),
+            ctx.request_kv_length_offsets[:2], torch.tensor([6, 9], dtype=torch.int32, device='cpu')
         )
 
         # Check interleaving: [sampled_1, spec1_1, spec2_1, sampled_2, spec1_2, spec2_2]
-        expected_tokens = torch.tensor([99, 991, 992, 100, 1001, 1002], device='cuda')
+        expected_tokens = torch.tensor([99, 991, 992, 100, 1001, 1002], device='cpu')
         assert torch.equal(ctx.token_to_input_ids[:6], expected_tokens)
 
     @pytest.mark.internal
     @rounder_override(64)
     def test_speculative_boundary_crossing(self):
         """Test token block assignment when speculative tokens cross a KV block boundary."""
-        self._setup_model_parallel_group(1, 1)
 
         model_config = TransformerConfig(
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
@@ -1803,14 +2014,14 @@ class TestDynamicContext:
         ctx.request_last_kv_block_offset[0] = 253
 
         # Allocate one initial block manually
-        blocks = ctx.block_allocator.allocate_memory_blocks(1)
+        blocks = ctx.kv_block_allocator.allocate_memory_blocks(1)
         first_block = blocks[0]
         ctx.request_to_kv_block_ids[0, 0] = first_block
         ctx.request_last_kv_block_id[0] = first_block
 
-        active_requests_mask = torch.tensor([1], device='cuda')
-        new_tokens = torch.tensor([50], device='cuda')
-        new_speculative_tokens = torch.tensor([[51], [52]], device='cuda')
+        active_requests_mask = torch.tensor([1], device='cpu')
+        new_tokens = torch.tensor([50], device='cpu')
+        new_speculative_tokens = torch.tensor([[51], [52]], device='cpu')
 
         # Run update_requests natively. It will automatically:
         # 1. Detect the boundary crossing and pause the request.
@@ -1834,7 +2045,7 @@ class TestDynamicContext:
         # Token 1 (offset 3) -> first_block
         # Token 2 (offset 4) -> second_block
         expected_blocks = torch.tensor(
-            [first_block, first_block, second_block], dtype=torch.int, device='cuda'
+            [first_block, first_block, second_block], dtype=torch.int, device='cpu'
         )
 
         assert torch.equal(ctx.token_to_block_idx[:3], expected_blocks)
@@ -1846,7 +2057,6 @@ class TestDynamicContext:
         Test that speculative tokens are correctly saved and concatenated
         when requests are temporarily paused.
         """
-        self._setup_model_parallel_group(1, 1)
 
         model_config = TransformerConfig(
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
@@ -1875,20 +2085,20 @@ class TestDynamicContext:
         ctx.request_kv_block_counts[:2] = 1
 
         # Allocate blocks
-        blocks = ctx.block_allocator.allocate_memory_blocks(2)
+        blocks = ctx.kv_block_allocator.allocate_memory_blocks(2)
         ctx.request_to_kv_block_ids[0, 0] = blocks[0]
         ctx.request_to_kv_block_ids[1, 0] = blocks[1]
         ctx.request_last_kv_block_id[:2] = blocks
 
         # Force the allocator to have no available blocks.
         # This guarantees request 0 stays paused and cannot immediately resume.
-        ctx.block_allocator.total_avail = 0
-        ctx.block_allocator.paused_count = 100  # Ensure it doesn't get completely evicted either
+        ctx.kv_block_allocator.total_avail = 0
+        ctx.kv_block_allocator.paused_count = 100  # Ensure it doesn't get completely evicted either
 
-        active_requests_mask = torch.tensor([1, 1], device='cuda')
-        new_tokens = torch.tensor([99, 100], device='cuda')  # Sampled
+        active_requests_mask = torch.tensor([1, 1], device='cpu')
+        new_tokens = torch.tensor([99, 100], device='cpu')  # Sampled
         new_speculative_tokens = torch.tensor(
-            [[991, 1001], [992, 1002]], device='cuda'
+            [[991, 1001], [992, 1002]], device='cpu'
         )  # Speculative
 
         # In update_requests, request 0 will be paused to allocate a new block.
@@ -1910,13 +2120,13 @@ class TestDynamicContext:
 
         assert ctx.paused_tokens[0].item() == 99
         assert torch.equal(
-            ctx.paused_speculative_tokens[:, 0], torch.tensor([991, 992], device='cuda')
+            ctx.paused_speculative_tokens[:, 0], torch.tensor([991, 992], device='cpu')
         )
 
     @pytest.mark.internal
     @rounder_override(64)
     def test_speculative_tokens_less_than_block_size_assert(self):
-        self._setup_model_parallel_group(1, 1)
+
         model_config = TransformerConfig(
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
         )
@@ -1935,7 +2145,6 @@ class TestDynamicContext:
     @pytest.mark.internal
     @rounder_override(64)
     def test_swap_book_keeping_tensors_with_speculative_tokens(self):
-        self._setup_model_parallel_group(1, 1)
 
         model_config = TransformerConfig(
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
@@ -1950,8 +2159,8 @@ class TestDynamicContext:
         ctx = DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
 
         ctx.request_ids[:2] = torch.tensor([10, 11])
-        next_tokens = torch.tensor([99, 100], device='cuda')
-        new_speculative_tokens = torch.tensor([[991, 1001], [992, 1002]], device='cuda')
+        next_tokens = torch.tensor([99, 100], device='cpu')
+        new_speculative_tokens = torch.tensor([[991, 1001], [992, 1002]], device='cpu')
 
         ctx._swap_book_keeping_tensors(
             src_idxs=torch.tensor([0]),
@@ -1960,16 +2169,15 @@ class TestDynamicContext:
             new_speculative_tokens=new_speculative_tokens,
         )
 
-        assert torch.equal(ctx.request_ids[:2], torch.tensor([11, 10], device='cuda'))
-        assert torch.equal(next_tokens[:2], torch.tensor([100, 99], device='cuda'))
+        assert torch.equal(ctx.request_ids[:2], torch.tensor([11, 10], device='cpu'))
+        assert torch.equal(next_tokens[:2], torch.tensor([100, 99], device='cpu'))
         assert torch.equal(
-            new_speculative_tokens[:, :2], torch.tensor([[1001, 991], [1002, 992]], device='cuda')
+            new_speculative_tokens[:, :2], torch.tensor([[1001, 991], [1002, 992]], device='cpu')
         )
 
     @pytest.mark.internal
     @rounder_override(64)
     def test_update_requests_with_finished_requests_and_speculative_tokens(self):
-        self._setup_model_parallel_group(1, 1)
 
         model_config = TransformerConfig(
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
@@ -1995,9 +2203,9 @@ class TestDynamicContext:
         ctx.request_last_kv_block_id[:3] = torch.tensor([0, 1, 2])
         ctx.request_kv_block_counts[:3] = 1
 
-        active_requests_mask = torch.tensor([1, 0, 1], device='cuda')
-        new_tokens = torch.tensor([99, 100, 101], device='cuda')
-        new_speculative_tokens = torch.tensor([[991, 1001, 1011], [992, 1002, 1012]], device='cuda')
+        active_requests_mask = torch.tensor([1, 0, 1], device='cpu')
+        new_tokens = torch.tensor([99, 100, 101], device='cpu')
+        new_speculative_tokens = torch.tensor([[991, 1001, 1011], [992, 1002, 1012]], device='cpu')
 
         ctx.update_requests(
             active_requests_mask=active_requests_mask,
@@ -2008,24 +2216,23 @@ class TestDynamicContext:
         # req1 is finished. req2 moves to req1's position.
         assert ctx.total_request_count == 2
         assert torch.equal(
-            ctx.request_ids[:2], torch.tensor([10, 12], device='cuda', dtype=torch.int32)
+            ctx.request_ids[:2], torch.tensor([10, 12], device='cpu', dtype=torch.int32)
         )
 
         # Check interleaving for req0 and req2
         # req0: [99, 991, 992]
         # req2: [101, 1011, 1012]
-        expected_tokens = torch.tensor([99, 991, 992, 101, 1011, 1012], device='cuda')
+        expected_tokens = torch.tensor([99, 991, 992, 101, 1011, 1012], device='cpu')
         assert torch.equal(ctx.token_to_input_ids[:6], expected_tokens)
 
     @pytest.mark.internal
     @rounder_override(64)
     def test_chunked_prefill_hidden_state_prevents_token_bloat(self):
         """
-        Test that hiding the chunked prefill request in Version 2 effectively prevents
+        Test that hiding the chunked prefill request effectively prevents
         'dummy' speculative tokens from bloating the active_token_count, and that the
         next chunk seamlessly appends without needing legacy offset subtractions.
         """
-        self._setup_model_parallel_group(1, 1)
 
         model_config = TransformerConfig(
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
@@ -2046,7 +2253,7 @@ class TestDynamicContext:
         # 1. Add a standard decode request
         req_decode = DynamicInferenceRequest(
             request_id=10,
-            prompt_tokens=torch.arange(0, 10, device='cuda'),
+            prompt_tokens=torch.arange(0, 10, device='cpu'),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
         )
         ctx.add_request(req_decode)
@@ -2054,20 +2261,20 @@ class TestDynamicContext:
         # 2. Add chunk 1 of a chunked prefill request
         req_chunked = DynamicInferenceRequest(
             request_id=42,
-            prompt_tokens=torch.arange(0, 100, device='cuda'),
+            prompt_tokens=torch.arange(0, 100, device='cpu'),
             sampling_params=SamplingParams(num_tokens_to_generate=10),
         )
         ctx.chunked_prefill_request_id = 42
-        ctx.add_request(req_chunked, chunk_length=50)
+        ctx.add_request(req_chunked, prefill_chunk_length=50)
 
         # Verify initial active token count (10 from decode + 50 from prefill)
         assert ctx.active_token_count == 60
 
         # 3. Call update_requests
-        active_requests_mask = torch.tensor([1, 1], dtype=torch.int32, device='cuda')
-        new_tokens = torch.tensor([99, 199], dtype=torch.int32, device='cuda')
+        active_requests_mask = torch.tensor([1, 1], dtype=torch.int32, device='cpu')
+        new_tokens = torch.tensor([99, 199], dtype=torch.int32, device='cpu')
         new_spec = torch.tensor(
-            [[100, 200], [101, 201], [102, 202]], dtype=torch.int32, device='cuda'
+            [[100, 200], [101, 201], [102, 202]], dtype=torch.int32, device='cpu'
         )
 
         ctx.update_requests(
@@ -2086,7 +2293,7 @@ class TestDynamicContext:
 
         # 5. Add chunk 2
         req_chunked.finished_chunk_token_count = 50
-        ctx.add_request(req_chunked, chunk_length=50)
+        ctx.add_request(req_chunked, prefill_chunk_length=50)
 
         # 6. Verify seamless append (no legacy offset math needed)
         # 4 active decode tokens + 50 new prefill tokens = 54
@@ -2099,7 +2306,6 @@ class TestDynamicContext:
         """Test that swapping a chunked prefill request to the end of the buffer
         correctly brings along the 2D speculative tokens for the other decode requests.
         """
-        self._setup_model_parallel_group(1, 1)
 
         model_config = TransformerConfig(
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
@@ -2133,13 +2339,13 @@ class TestDynamicContext:
         ctx.request_last_kv_block_id[:2] = torch.tensor([0, 1])
         ctx.request_kv_block_counts[:2] = 1
 
-        active_requests_mask = torch.tensor([1, 1], device='cuda')
+        active_requests_mask = torch.tensor([1, 1], device='cpu')
 
         # New base tokens: [100 (for prefill), 200 (for decode)]
-        new_tokens = torch.tensor([100, 200], device='cuda')
+        new_tokens = torch.tensor([100, 200], device='cpu')
 
         # New spec tokens: Col 0 for prefill (dummy), Col 1 for decode (real draft tokens)
-        new_speculative_tokens = torch.tensor([[101, 201], [102, 202]], device='cuda')
+        new_speculative_tokens = torch.tensor([[101, 201], [102, 202]], device='cpu')
 
         # Trigger update_requests.
         # It must detect ID 42 is at index 0, and swap it with index 1.
@@ -2151,7 +2357,7 @@ class TestDynamicContext:
 
         # 1. Verify the IDs were swapped successfully
         assert torch.equal(
-            ctx.request_ids[:2], torch.tensor([99, 42], dtype=torch.int32, device='cuda')
+            ctx.request_ids[:2], torch.tensor([99, 42], dtype=torch.int32, device='cpu')
         )
 
         # 2. Verify the Decode request (now at Index 0) correctly flattened its
@@ -2159,7 +2365,7 @@ class TestDynamicContext:
         # 3. Verify the Prefill request (now at Index 1) is hidden and does NOT
         #    flatten its dummy tokens.
         expected_flattened_tokens = torch.tensor(
-            [200, 201, 202], device='cuda'  # Decode request (ID 99)
+            [200, 201, 202], device='cpu'  # Decode request (ID 99)
         )
 
         assert ctx.active_token_count == 3
@@ -2169,7 +2375,7 @@ class TestDynamicContext:
 
         # 4. Verify that the new_speculative_tokens tensor itself was swapped so that
         # the hidden state perfectly preserves the alignment for subsequent steps.
-        expected_swapped_spec_tokens = torch.tensor([[201, 101], [202, 102]], device='cuda')
+        expected_swapped_spec_tokens = torch.tensor([[201, 101], [202, 102]], device='cpu')
         assert torch.equal(
             new_speculative_tokens, expected_swapped_spec_tokens
         ), "new_speculative_tokens was not swapped in-place alongside the request metadata!"
@@ -2178,7 +2384,6 @@ class TestDynamicContext:
     @rounder_override(64)
     def test_speculative_with_prefix_caching_shared_blocks(self):
         """Test that prefix caching correctly shares blocks when speculative decoding is enabled."""
-        self._setup_model_parallel_group(1, 1)
 
         model_config = TransformerConfig(
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
@@ -2194,7 +2399,11 @@ class TestDynamicContext:
         ctx = DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
 
         bs = ctx.block_size_tokens
-        prompt = torch.arange(bs * 3, device='cuda')
+        # Use bs * 3 + 5 tokens so the prompt extends past the last full block.
+        # This avoids the single-token-chunk clamp (effective_prefill >= 2) and
+        # verifies that the prefix skip actually works.
+        tail = 5
+        prompt = torch.arange(bs * 3 + tail, device='cpu')
 
         # First request registers blocks.
         req1 = DynamicInferenceRequest(
@@ -2205,10 +2414,11 @@ class TestDynamicContext:
             enable_prefix_caching=True,
         )
         ctx.add_request(req1)
-        first_blocks = [ctx.request_to_kv_block_ids[0][i].item() for i in range(3)]
-        avail_after_first = ctx.block_allocator.total_avail
+        # 3 full blocks are prefix-cacheable; the 4th (partial) block is not.
+        first_full_blocks = [ctx.request_to_kv_block_ids[0][i].item() for i in range(3)]
+        avail_after_first = ctx.kv_block_allocator.total_avail
 
-        # Second request with same prefix should share all blocks.
+        # Second request with same prefix should share the 3 full blocks.
         req2 = DynamicInferenceRequest(
             request_id=2,
             prompt_tokens=prompt.clone(),
@@ -2217,24 +2427,26 @@ class TestDynamicContext:
             enable_prefix_caching=True,
         )
         ctx.add_request(req2)
-        second_blocks = [ctx.request_to_kv_block_ids[1][i].item() for i in range(3)]
+        second_full_blocks = [ctx.request_to_kv_block_ids[1][i].item() for i in range(3)]
 
-        # Blocks should be shared (same IDs, no pool consumption).
-        assert first_blocks == second_blocks
-        assert ctx.block_allocator.total_avail == avail_after_first
+        # The 3 full blocks should be shared (same IDs).
+        assert first_full_blocks == second_full_blocks
 
-        # Ref counts should be 2.
-        for bid in first_blocks:
-            assert ctx.block_allocator.block_ref_counts[bid].item() == 2
+        # Only 1 new block allocated for the partial tail of the second request.
+        assert ctx.kv_block_allocator.total_avail == avail_after_first - 1
 
-        # Second request should skip prefix tokens (query_length == 1 for full match).
-        assert ctx.request_query_lengths[1].item() == 1
+        # Ref counts on the shared full blocks should be 2.
+        for bid in first_full_blocks:
+            assert ctx.kv_block_allocator.block_ref_counts[bid].item() == 2
+
+        # Second request should skip the 3 full cached blocks (96 tokens),
+        # leaving only the trailing tokens as the query.
+        assert ctx.request_query_lengths[1].item() == tail
 
     @pytest.mark.internal
     @rounder_override(64)
     def test_speculative_with_prefix_caching_kv_offset(self):
         """Test that KV offset accounts for prefix skip when spec decoding is enabled."""
-        self._setup_model_parallel_group(1, 1)
 
         model_config = TransformerConfig(
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
@@ -2250,7 +2462,10 @@ class TestDynamicContext:
         ctx = DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
 
         bs = ctx.block_size_tokens
-        prompt = torch.arange(bs * 2, device='cuda')
+        # Use bs * 2 + 5 tokens so the prompt extends past the last full block,
+        # avoiding the single-token-chunk clamp while still testing the skip.
+        tail = 5
+        prompt = torch.arange(bs * 2 + tail, device='cpu')
 
         # First request.
         req1 = DynamicInferenceRequest(
@@ -2272,16 +2487,15 @@ class TestDynamicContext:
         )
         ctx.add_request(req2)
 
-        # Full match: prefix_skip = min(2 * bs, 2*bs - 1) = 2*bs - 1
-        expected_skip = 2 * bs - 1
+        # 2 full blocks match → prefix_skip = 2 * bs = 64, query_length = tail.
+        expected_skip = 2 * bs
         assert ctx.request_kv_length_offsets[1].item() == expected_skip
-        assert ctx.request_query_lengths[1].item() == 1
+        assert ctx.request_query_lengths[1].item() == tail
 
     @pytest.mark.internal
     @rounder_override(64)
     def test_speculative_update_then_release_with_prefix_caching(self):
         """Test that update_requests with spec tokens + block release respects ref counts."""
-        self._setup_model_parallel_group(1, 1)
 
         model_config = TransformerConfig(
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
@@ -2299,7 +2513,7 @@ class TestDynamicContext:
         ctx = DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
 
         bs = ctx.block_size_tokens
-        prompt = torch.arange(bs * 2, device='cuda')
+        prompt = torch.arange(bs * 2, device='cpu')
 
         # Two requests sharing the same prefix.
         req1 = DynamicInferenceRequest(
@@ -2323,23 +2537,22 @@ class TestDynamicContext:
 
         # Verify initial ref counts are 2.
         for bid in shared_blocks:
-            assert ctx.block_allocator.block_ref_counts[bid].item() == 2
+            assert ctx.kv_block_allocator.block_ref_counts[bid].item() == 2
 
         # Release one request. Ref counts should decrement to 1.
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
         for bid in shared_blocks:
-            assert ctx.block_allocator.block_ref_counts[bid].item() == 1
+            assert ctx.kv_block_allocator.block_ref_counts[bid].item() == 1
 
         # Blocks should still be discoverable via hash map.
         for bid in shared_blocks:
-            h = ctx.block_allocator.block_hashes[bid].item()
-            assert h in ctx.block_allocator.hash_to_block_id
+            h = ctx.kv_block_allocator.block_hashes[bid].item()
+            assert h in ctx.kv_block_allocator.kv_hash_to_block_id
 
     @pytest.mark.internal
     @rounder_override(64)
     def test_speculative_boundary_crossing_with_prefix_caching(self):
         """Test block boundary crossing from speculative tokens does not corrupt shared blocks."""
-        self._setup_model_parallel_group(1, 1)
 
         model_config = TransformerConfig(
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
@@ -2357,7 +2570,7 @@ class TestDynamicContext:
         ctx = DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
 
         bs = ctx.block_size_tokens
-        prompt = torch.arange(bs * 2, device='cuda')
+        prompt = torch.arange(bs * 2, device='cpu')
 
         # Request 1: adds prefix blocks.
         req1 = DynamicInferenceRequest(
@@ -2394,9 +2607,9 @@ class TestDynamicContext:
         ctx.request_in_prefill_status_tensor[0] = 0
         ctx.active_token_count = 2
 
-        active_mask = torch.tensor([1, 1], device='cuda', dtype=torch.int32)
-        new_tokens = torch.tensor([50, 50], device='cuda')
-        new_spec = torch.tensor([[51, 51], [52, 52]], device='cuda')
+        active_mask = torch.tensor([1, 1], device='cpu', dtype=torch.int32)
+        new_tokens = torch.tensor([50, 50], device='cpu')
+        new_spec = torch.tensor([[51, 51], [52, 52]], device='cpu')
 
         ctx.update_requests(
             active_requests_mask=active_mask, new_tokens=new_tokens, new_speculative_tokens=new_spec
@@ -2410,14 +2623,13 @@ class TestDynamicContext:
         assert new_block != shared_b1
 
         # Shared blocks should remain intact with ref count 2.
-        assert ctx.block_allocator.block_ref_counts[shared_b0].item() == 2
-        assert ctx.block_allocator.block_ref_counts[shared_b1].item() == 2
+        assert ctx.kv_block_allocator.block_ref_counts[shared_b0].item() == 2
+        assert ctx.kv_block_allocator.block_ref_counts[shared_b1].item() == 2
 
     @pytest.mark.internal
     @rounder_override(64)
     def test_chunked_prefill_prefix_caching_from_hidden_state(self):
         """Test prefix caching matching safely resolves from the hidden boundary state."""
-        self._setup_model_parallel_group(1, 1)
 
         model_config = TransformerConfig(
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
@@ -2439,7 +2651,7 @@ class TestDynamicContext:
         bs = ctx.block_size_tokens
 
         # First request: register prefix blocks (bs * 3 tokens = 3 complete blocks).
-        first_prompt = torch.arange(bs * 3, device='cuda')
+        first_prompt = torch.arange(bs * 3, device='cpu')
         req_first = DynamicInferenceRequest(
             request_id=1,
             prompt_tokens=first_prompt.clone(),
@@ -2461,12 +2673,12 @@ class TestDynamicContext:
 
         # Add chunk 1 (bs tokens)
         req2.finished_chunk_token_count = 0
-        ctx.add_request(req2, chunk_length=bs)
+        ctx.add_request(req2, prefill_chunk_length=bs)
 
         # Call update_requests to move req2 to the hidden state
-        active_requests_mask = torch.tensor([1, 1], dtype=torch.int32, device='cuda')
-        new_tokens = torch.tensor([99, 199], dtype=torch.int32, device='cuda')
-        new_spec = torch.tensor([[100, 200], [101, 201]], dtype=torch.int32, device='cuda')
+        active_requests_mask = torch.tensor([1, 1], dtype=torch.int32, device='cpu')
+        new_tokens = torch.tensor([99, 199], dtype=torch.int32, device='cpu')
+        new_spec = torch.tensor([[100, 200], [101, 201]], dtype=torch.int32, device='cpu')
         ctx.update_requests(active_requests_mask, new_tokens, new_speculative_tokens=new_spec)
 
         # Capture active tokens before chunk 2 (which should just be the 3 tokens of req_first)
@@ -2476,7 +2688,7 @@ class TestDynamicContext:
         # Add chunk 2 (bs * 2 tokens)
         req2.finished_chunk_token_count = bs
         chunk_length = bs * 2
-        ctx.add_request(req2, chunk_length=chunk_length)
+        ctx.add_request(req2, prefill_chunk_length=chunk_length)
 
         # Prefix match should find 2 matching blocks (blocks 1 and 2 from req_first).
         # With prefix match: 2 blocks matched -> skip (2*bs - 1) tokens
@@ -2493,7 +2705,6 @@ class TestDynamicContext:
     @rounder_override(64)
     def test_prefix_caching_check_availability_with_speculative(self):
         """Test check_availability accounts for prefix match when spec decoding is enabled."""
-        self._setup_model_parallel_group(1, 1)
 
         model_config = TransformerConfig(
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
@@ -2509,7 +2720,7 @@ class TestDynamicContext:
         ctx = DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
 
         bs = ctx.block_size_tokens
-        prompt = torch.arange(bs * 2, device='cuda')
+        prompt = torch.arange(bs * 2, device='cpu')
 
         # First request registers blocks.
         req1 = DynamicInferenceRequest(
@@ -2522,8 +2733,8 @@ class TestDynamicContext:
         ctx.add_request(req1)
 
         # Exhaust the remaining pool.
-        while ctx.block_allocator.total_avail > 0:
-            ctx.block_allocator.allocate_memory_blocks(1)
+        while ctx.kv_block_allocator.total_avail > 0:
+            ctx.kv_block_allocator.allocate_memory_blocks(1)
 
         # A new request with the same prefix should still be schedulable
         # because prefix matching means 0 new blocks are needed from pool.
@@ -2541,7 +2752,6 @@ class TestDynamicContext:
     @rounder_override(64)
     def test_prefix_match_exact_block_boundary(self):
         """Test prefix matching when the shared prefix is an exact multiple of the block size."""
-        self._setup_model_parallel_group(1, 1)
 
         model_config = TransformerConfig(
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
@@ -2560,7 +2770,7 @@ class TestDynamicContext:
         bs = ctx.block_size_tokens
 
         # req1: 32 tokens (exactly 2 complete blocks)
-        prompt1 = torch.arange(bs * 2, device='cuda')
+        prompt1 = torch.arange(bs * 2, device='cpu')
         req1 = DynamicInferenceRequest(
             request_id=1,
             prompt_tokens=prompt1,
@@ -2571,7 +2781,7 @@ class TestDynamicContext:
         ctx.add_request(req1)
 
         # req2: 35 tokens (first 32 tokens match req1)
-        prompt2 = torch.arange(bs * 2 + 3, device='cuda')
+        prompt2 = torch.arange(bs * 2 + 3, device='cpu')
         req2 = DynamicInferenceRequest(
             request_id=2,
             prompt_tokens=prompt2,
@@ -2601,7 +2811,6 @@ class TestDynamicContext:
     @rounder_override(64)
     def test_eviction_with_shared_prefix_blocks(self):
         """Test that evicting a request drops ref counts correctly without destroying shared blocks."""
-        self._setup_model_parallel_group(1, 1)
 
         model_config = TransformerConfig(
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
@@ -2619,7 +2828,7 @@ class TestDynamicContext:
         ctx = DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
 
         bs = ctx.block_size_tokens
-        prompt = torch.arange(bs * 2, device='cuda')
+        prompt = torch.arange(bs * 2, device='cpu')
 
         # Add req1 and req2 with identical prompts
         req1 = DynamicInferenceRequest(
@@ -2644,7 +2853,7 @@ class TestDynamicContext:
         shared_b1 = ctx.request_to_kv_block_ids[0, 1].item()
 
         # Both blocks should be safely shared with ref count 2
-        assert ctx.block_allocator.block_ref_counts[shared_b0].item() == 2
+        assert ctx.kv_block_allocator.block_ref_counts[shared_b0].item() == 2
 
         # Mock the state to make req1 paused and req2 active
         ctx.paused_request_count = 1
@@ -2655,11 +2864,11 @@ class TestDynamicContext:
         ctx.request_kv_block_counts[1] = 2
 
         # Exhaust the active block allocator
-        ctx.block_allocator.total_avail = 0
+        ctx.kv_block_allocator.total_avail = 0
 
         # Trigger the eviction logic
         # next_tokens must be sized to total_request_count (1 paused + 1 active = 2)
-        next_tokens = torch.tensor([50, 51], device='cuda')
+        next_tokens = torch.tensor([50, 51], device='cpu')
         evicted_ids = ctx.evict_overflow_paused_requests(
             active_request_count=1, next_tokens=next_tokens
         )
@@ -2669,14 +2878,13 @@ class TestDynamicContext:
         assert evicted_ids[0].item() == 1
 
         # req2 remains active, so the shared blocks should drop to a ref count of 1
-        assert ctx.block_allocator.block_ref_counts[shared_b0].item() == 1
-        assert ctx.block_allocator.block_ref_counts[shared_b1].item() == 1
+        assert ctx.kv_block_allocator.block_ref_counts[shared_b0].item() == 1
+        assert ctx.kv_block_allocator.block_ref_counts[shared_b1].item() == 1
 
     @pytest.mark.internal
     @rounder_override(64)
     def test_oom_during_speculative_boundary_crossing(self):
         """Test boundary crossing with speculative tokens pauses the request gracefully when KV cache is full, keeping other requests active."""
-        self._setup_model_parallel_group(1, 1)
 
         model_config = TransformerConfig(
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
@@ -2700,31 +2908,31 @@ class TestDynamicContext:
         ctx.paused_request_count = 0
         ctx.active_token_count = 2
 
-        ctx.request_ids[:2] = torch.tensor([10, 11], device='cuda')
+        ctx.request_ids[:2] = torch.tensor([10, 11], device='cpu')
         ctx.request_query_lengths[:2] = 1
         ctx.request_kv_block_counts[:2] = 1
 
         # Request 0 offset is 15. Adding 1 sampled + 2 spec = 3 tokens crosses the boundary (16).
         # Request 1 offset is 5. Adding 3 tokens = 8 (does not cross).
         ctx.request_kv_length_offsets[:2] = torch.tensor(
-            [bs - 1, 5], device='cuda', dtype=torch.int32
+            [bs - 1, 5], device='cpu', dtype=torch.int32
         )
         ctx.request_last_kv_block_offset[:2] = torch.tensor(
-            [bs - 1, 5], device='cuda', dtype=torch.int32
+            [bs - 1, 5], device='cpu', dtype=torch.int32
         )
 
-        blocks = ctx.block_allocator.allocate_memory_blocks(2)
+        blocks = ctx.kv_block_allocator.allocate_memory_blocks(2)
         ctx.request_to_kv_block_ids[0, 0] = blocks[0]
         ctx.request_to_kv_block_ids[1, 0] = blocks[1]
         ctx.request_last_kv_block_id[:2] = blocks
 
         # Force OOM condition (no blocks left in the active pool)
-        ctx.block_allocator.total_avail = 0
-        ctx.block_allocator.paused_count = 100  # Prevent immediate eviction out of the system
+        ctx.kv_block_allocator.total_avail = 0
+        ctx.kv_block_allocator.paused_count = 100  # Prevent immediate eviction out of the system
 
-        active_mask = torch.tensor([1, 1], device='cuda', dtype=torch.int32)
-        new_tokens = torch.tensor([99, 88], device='cuda')
-        new_spec = torch.tensor([[100, 200], [101, 201]], device='cuda')
+        active_mask = torch.tensor([1, 1], device='cpu', dtype=torch.int32)
+        new_tokens = torch.tensor([99, 88], device='cpu')
+        new_spec = torch.tensor([[100, 200], [101, 201]], device='cpu')
 
         # Run update requests
         ctx.update_requests(
@@ -2749,9 +2957,69 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
+    def test_speculative_boundary_crossing_at_max_kv_block_count(self):
+        """Test that speculative pre-allocation works when a request has already
+        filled all ceil(max_seq_len / block_size) KV blocks.
+        """
+
+        model_config = TransformerConfig(
+            params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
+        )
+        inference_config = InferenceConfig(
+            max_sequence_length=32,
+            buffer_size_gb=0.1,
+            block_size_tokens=16,
+            num_speculative_tokens=2,
+            unified_memory_level=0,
+            max_tokens=512,
+            max_requests=512,
+        )
+        ctx = DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
+        bs = ctx.block_size_tokens
+
+        # Setup 1 active decode request that has already filled all
+        # ceil(32/16) = 2 blocks, with the last block at offset 13.
+        # needs_new_block triggers at offset >= block_size - 1 - num_spec = 13.
+        ctx.total_request_count = 1
+        ctx.paused_request_count = 0
+        ctx.active_token_count = 1
+
+        ctx.request_ids[0] = 10
+        ctx.request_query_lengths[0] = 1
+        ctx.request_kv_block_counts[0] = 2
+        ctx.request_kv_length_offsets[0] = bs + 14  # 16 + 14 = 30 tokens total
+        ctx.request_last_kv_block_offset[0] = 13  # 0-indexed, 14 tokens in last block
+
+        # Allocate 2 blocks manually.
+        blocks = ctx.kv_block_allocator.allocate_memory_blocks(2)
+        ctx.request_to_kv_block_ids[0, 0] = blocks[0]
+        ctx.request_to_kv_block_ids[0, 1] = blocks[1]
+        ctx.request_last_kv_block_id[0] = blocks[1]
+
+        active_requests_mask = torch.tensor([1], device='cpu')
+        new_tokens = torch.tensor([50], device='cpu')
+        new_speculative_tokens = torch.tensor([[51], [52]], device='cpu')
+
+        # This will pause the request (offset 13 >= 13), then resume it by
+        # allocating a 3rd block at col_idx=2. Without the fix, this raises
+        # an IndexError because request_to_kv_block_ids only has 2 columns.
+        ctx.update_requests(
+            active_requests_mask=active_requests_mask,
+            new_tokens=new_tokens,
+            new_speculative_tokens=new_speculative_tokens,
+        )
+
+        # Verify the 3rd block was allocated and assigned.
+        assert ctx.request_kv_block_counts[0] == 3
+        third_block = ctx.request_to_kv_block_ids[0, 2]
+        assert third_block != -1
+        assert third_block != blocks[0]
+        assert third_block != blocks[1]
+
+    @pytest.mark.internal
+    @rounder_override(64)
     def test_chunked_prefill_meets_prefix_caching(self):
         """Test that chunks in a chunked-prefill pipeline properly hit the prefix cache mid-flight."""
-        self._setup_model_parallel_group(1, 1)
 
         model_config = TransformerConfig(
             params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
@@ -2769,7 +3037,7 @@ class TestDynamicContext:
         ctx = DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
 
         bs = ctx.block_size_tokens
-        prompt = torch.arange(128, device='cuda')
+        prompt = torch.arange(128, device='cpu')
 
         # Cache req1 (fully processed)
         req1 = DynamicInferenceRequest(
@@ -2794,7 +3062,7 @@ class TestDynamicContext:
         # Add the first chunk (64 tokens)
         req2.finished_chunk_token_count = 0
         ctx.chunked_prefill_request_id = 2
-        ctx.add_request(req2, chunk_length=64)
+        ctx.add_request(req2, prefill_chunk_length=64)
 
         # Assert the first chunk perfectly matched the first 2 cached blocks
         assert ctx.request_to_kv_block_ids[1, 0].item() == req1_blocks[0]
@@ -2808,7 +3076,7 @@ class TestDynamicContext:
 
         # Add the second chunk (64 tokens)
         req2.finished_chunk_token_count = 64
-        ctx.add_request(req2, chunk_length=64)
+        ctx.add_request(req2, prefill_chunk_length=64)
 
         # It should correctly discover the remaining prefix blocks despite being mid-prefill
         assert ctx.request_to_kv_block_ids[1, 2].item() == req1_blocks[2]
@@ -2816,5 +3084,245 @@ class TestDynamicContext:
         assert ctx.request_kv_block_counts[1].item() == 4
 
         # Verify block references updated appropriately
-        assert ctx.block_allocator.block_ref_counts[req1_blocks[2]].item() == 2
-        assert ctx.block_allocator.block_ref_counts[req1_blocks[3]].item() == 2
+        assert ctx.kv_block_allocator.block_ref_counts[req1_blocks[2]].item() == 2
+        assert ctx.kv_block_allocator.block_ref_counts[req1_blocks[3]].item() == 2
+
+    # ------------------------------------------------------------------ #
+    #  Tests for active_logit_idxs / last_token_logits / pad_active_slices
+    # ------------------------------------------------------------------ #
+
+    def _build_speculative_ctx(self, num_speculative_tokens=2, block_size=256):
+        """Build a context configured for speculative decoding."""
+        model_config = TransformerConfig(
+            params_dtype=torch.float32, num_layers=2, kv_channels=8, num_attention_heads=2
+        )
+        inference_config = InferenceConfig(
+            max_sequence_length=512,
+            buffer_size_gb=0.05,
+            block_size_tokens=block_size,
+            num_speculative_tokens=num_speculative_tokens,
+            unified_memory_level=0,
+        )
+        return DynamicInferenceContext(model_config=model_config, inference_config=inference_config)
+
+    def _add_and_step_decode_requests(self, ctx, num_requests, prompt_length=10):
+        """Add prefill requests, then step them into decode state with speculative tokens.
+
+        Returns the context in a state with ``num_requests`` decode requests whose
+        query_lengths equal ``num_speculative_tokens + 1``.
+        """
+        for i in range(num_requests):
+            req = DynamicInferenceRequest(
+                request_id=i,
+                prompt_tokens=torch.arange(0, prompt_length, device='cuda'),
+                sampling_params=SamplingParams(num_tokens_to_generate=100),
+            )
+            ctx.add_request(req)
+
+        ctx.initialize_attention_state()
+
+        active_mask = torch.ones(num_requests, device='cuda', dtype=torch.int32)
+        new_tokens = torch.arange(num_requests, device='cuda')
+        num_spec = ctx.num_speculative_tokens
+        new_spec = torch.arange(num_spec * num_requests, device='cuda').reshape(
+            num_spec, num_requests
+        )
+        ctx.update_requests(
+            active_requests_mask=active_mask, new_tokens=new_tokens, new_speculative_tokens=new_spec
+        )
+        return ctx
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_pad_active_slices_speculative_decode_only(self):
+        """Verify active_logit_idxs for a decode-only batch with speculative tokens."""
+        num_decode = 3
+        num_spec = 2
+        ctx = self._build_speculative_ctx(num_speculative_tokens=num_spec)
+        self._add_and_step_decode_requests(ctx, num_decode)
+
+        assert ctx.num_prefill_requests == 0
+        assert ctx.num_decode_requests == num_decode
+        tokens_per_decode = num_spec + 1
+
+        ctx.initialize_attention_state()
+
+        decode_token_count = num_decode * tokens_per_decode
+        expected_decode = torch.arange(decode_token_count, dtype=torch.int32, device='cuda')
+        actual = ctx.active_logit_idxs[:decode_token_count]
+        assert torch.equal(
+            actual, expected_decode
+        ), f"decode indices mismatch: {actual.tolist()} vs {expected_decode.tolist()}"
+
+        assert ctx.num_last_token_logits == decode_token_count
+        assert ctx.active_logit_idxs[decode_token_count:].sum().item() == 0
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_pad_active_slices_speculative_mixed_batch(self):
+        """Verify active_logit_idxs for a mixed decode+prefill batch with speculative tokens."""
+        num_decode = 2
+        num_spec = 2
+        ctx = self._build_speculative_ctx(num_speculative_tokens=num_spec)
+        self._add_and_step_decode_requests(ctx, num_decode)
+
+        prefill_lengths = [15, 20]
+        for i, pl in enumerate(prefill_lengths):
+            req = DynamicInferenceRequest(
+                request_id=100 + i,
+                prompt_tokens=torch.arange(0, pl, device='cuda'),
+                sampling_params=SamplingParams(num_tokens_to_generate=50),
+            )
+            ctx.add_request(req)
+
+        assert ctx.num_decode_requests == num_decode
+        assert ctx.num_prefill_requests == len(prefill_lengths)
+        tokens_per_decode = num_spec + 1
+
+        ctx.initialize_attention_state()
+
+        decode_token_count = num_decode * tokens_per_decode
+        expected_decode = torch.arange(decode_token_count, dtype=torch.int32, device='cuda')
+        actual_decode = ctx.active_logit_idxs[:decode_token_count]
+        assert torch.equal(actual_decode, expected_decode)
+
+        cumulative = 0
+        for i, pl in enumerate(prefill_lengths):
+            cumulative += pl
+            expected_prefill_idx = decode_token_count + cumulative - 1
+            actual_prefill_idx = ctx.active_logit_idxs[decode_token_count + i].item()
+            assert (
+                actual_prefill_idx == expected_prefill_idx
+            ), f"prefill request {i}: expected idx {expected_prefill_idx}, got {actual_prefill_idx}"
+
+        expected_num_logits = decode_token_count + len(prefill_lengths)
+        assert ctx.num_last_token_logits == expected_num_logits
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_pad_active_slices_speculative_all_prefill(self):
+        """Verify active_logit_idxs with only prefill requests (no decode) and speculative tokens."""
+        num_spec = 2
+        ctx = self._build_speculative_ctx(num_speculative_tokens=num_spec)
+
+        prefill_lengths = [12, 8, 25]
+        for i, pl in enumerate(prefill_lengths):
+            req = DynamicInferenceRequest(
+                request_id=i,
+                prompt_tokens=torch.arange(0, pl, device='cuda'),
+                sampling_params=SamplingParams(num_tokens_to_generate=50),
+            )
+            ctx.add_request(req)
+
+        assert ctx.num_decode_requests == 0
+        assert ctx.num_prefill_requests == len(prefill_lengths)
+
+        ctx.initialize_attention_state()
+
+        cumulative = 0
+        for i, pl in enumerate(prefill_lengths):
+            cumulative += pl
+            expected_idx = cumulative - 1
+            actual_idx = ctx.active_logit_idxs[i].item()
+            assert (
+                actual_idx == expected_idx
+            ), f"prefill request {i}: expected idx {expected_idx}, got {actual_idx}"
+
+        expected_num_logits = len(prefill_lengths)
+        assert ctx.num_last_token_logits == expected_num_logits
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_pad_active_slices_no_speculative_tokens(self):
+        """Verify active_logit_idxs without speculative tokens matches cumsum - 1."""
+        ctx = self._build_speculative_ctx(num_speculative_tokens=0)
+
+        req0 = DynamicInferenceRequest(
+            request_id=0,
+            prompt_tokens=torch.arange(0, 10, device='cuda'),
+            sampling_params=SamplingParams(num_tokens_to_generate=50),
+        )
+        ctx.add_request(req0)
+        ctx.initialize_attention_state()
+        active_mask = torch.ones(1, device='cuda', dtype=torch.int32)
+        new_tokens = torch.tensor([42], device='cuda')
+        ctx.update_requests(active_requests_mask=active_mask, new_tokens=new_tokens)
+
+        prefill_lengths = [20, 30]
+        for i, pl in enumerate(prefill_lengths):
+            req = DynamicInferenceRequest(
+                request_id=10 + i,
+                prompt_tokens=torch.arange(0, pl, device='cuda'),
+                sampling_params=SamplingParams(num_tokens_to_generate=50),
+            )
+            ctx.add_request(req)
+
+        assert ctx.num_decode_requests == 1
+        assert ctx.num_prefill_requests == 2
+
+        ctx.initialize_attention_state()
+
+        all_query_lengths = ctx.request_query_lengths[
+            ctx.paused_request_count : ctx.total_request_count
+        ]
+        expected_idxs = torch.cumsum(all_query_lengths, dim=0) - 1
+        num_logits = ctx.num_last_token_logits
+        actual_idxs = ctx.active_logit_idxs[:num_logits]
+        assert torch.equal(
+            actual_idxs, expected_idxs.to(device=actual_idxs.device, dtype=torch.int32)
+        ), f"non-speculative mismatch: {actual_idxs.tolist()} vs {expected_idxs.tolist()}"
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_last_token_logits_selects_correct_values_speculative(self):
+        """Verify last_token_logits returns logits at the correct token positions."""
+        num_decode = 2
+        num_spec = 2
+        ctx = self._build_speculative_ctx(num_speculative_tokens=num_spec)
+        self._add_and_step_decode_requests(ctx, num_decode)
+
+        prefill_lengths = [10, 15]
+        for i, pl in enumerate(prefill_lengths):
+            req = DynamicInferenceRequest(
+                request_id=100 + i,
+                prompt_tokens=torch.arange(0, pl, device='cuda'),
+                sampling_params=SamplingParams(num_tokens_to_generate=50),
+            )
+            ctx.add_request(req)
+
+        ctx.initialize_attention_state()
+
+        vocab_size = 32
+        logits = torch.arange(
+            ctx.padded_active_token_count * vocab_size, dtype=torch.float32, device='cuda'
+        ).reshape(1, ctx.padded_active_token_count, vocab_size)
+
+        result = ctx.last_token_logits(logits)
+        expected_num_logits = ctx.num_last_token_logits
+        assert result.shape == (expected_num_logits, vocab_size)
+
+        idxs = ctx.active_logit_idxs[:expected_num_logits].long()
+        expected = logits.squeeze(0)[idxs, :]
+        assert torch.equal(result, expected)
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_speculative_required_logit_indices_matches_active_logit_idxs(self):
+        """speculative_required_logit_indices returns a slice of active_logit_idxs."""
+        num_decode = 2
+        num_spec = 2
+        ctx = self._build_speculative_ctx(num_speculative_tokens=num_spec)
+        self._add_and_step_decode_requests(ctx, num_decode)
+
+        req = DynamicInferenceRequest(
+            request_id=100,
+            prompt_tokens=torch.arange(0, 20, device='cuda'),
+            sampling_params=SamplingParams(num_tokens_to_generate=50),
+        )
+        ctx.add_request(req)
+        ctx.initialize_attention_state()
+
+        indices = ctx.speculative_required_logit_indices()
+        expected_len = ctx.num_last_token_logits
+        assert indices.numel() == expected_len
+        assert indices.data_ptr() == ctx.active_logit_idxs.data_ptr()

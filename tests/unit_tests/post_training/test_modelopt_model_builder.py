@@ -39,7 +39,7 @@ def test_model_provider_switches_to_modelopt_builder(monkeypatch):
     monkeypatch.setattr(mp, "has_nvidia_modelopt", True)
     monkeypatch.setattr(mp, "get_args", lambda: args)
     monkeypatch.setattr(
-        mp, "modelopt_gpt_mamba_builder", _sentinel_builder(modelopt_result, modelopt_calls)
+        mp, "modelopt_gpt_hybrid_builder", _sentinel_builder(modelopt_result, modelopt_calls)
     )
 
     # original_builder should be ignored when ModelOpt is enabled.

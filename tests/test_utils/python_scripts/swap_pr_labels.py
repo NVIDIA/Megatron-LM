@@ -12,6 +12,7 @@ import sys
 from dataclasses import dataclass
 from typing import List
 
+import requests
 from github import Github
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -39,6 +40,7 @@ class PRReviewTracker:
     EXCLUDED_TEAMS = {"core-adlr", "core-nemo"}
 
     def __init__(self, token: str, repo_name: str, pr_number: str):
+        self.token = token
         self.github = Github(token)
         self.repo = self.github.get_repo(repo_name)
         self.pr = self.repo.get_pull(pr_number)
@@ -62,8 +64,7 @@ class PRReviewTracker:
                     for part in parts[1:]:
                         if part.startswith("@NVIDIA/"):
                             teams.add(part.split("/", 1)[1])
-                    if teams:
-                        rules.append((pattern, teams))
+                    rules.append((pattern, teams))
         except FileNotFoundError:
             logger.warning("CODEOWNERS file not found")
         logger.info(f"Parsed {len(rules)} CODEOWNERS rules")
@@ -136,6 +137,48 @@ class PRReviewTracker:
             members.update(self._get_team_members(slug))
         return members
 
+    def _get_latest_reviews(self, pr_number):
+        """Get the active review state per reviewer using GraphQL latestReviews.
+
+        Unlike the REST API's get_reviews(), this returns only the current
+        review per reviewer — matching the green/red checkmarks in the UI.
+        Dismissed or removed approvals are not included.
+        """
+        owner, name = self.repo.full_name.split("/")
+        query = """
+        query($owner: String!, $name: String!, $number: Int!) {
+          repository(owner: $owner, name: $name) {
+            pullRequest(number: $number) {
+              latestReviews(first: 100) {
+                nodes {
+                  author { login }
+                  state
+                }
+              }
+            }
+          }
+        }
+        """
+        reviews = {}
+        try:
+            resp = requests.post(
+                "https://api.github.com/graphql",
+                json={
+                    "query": query,
+                    "variables": {"owner": owner, "name": name, "number": pr_number},
+                },
+                headers={"Authorization": f"Bearer {self.token}"},
+            )
+            resp.raise_for_status()
+            nodes = resp.json()["data"]["repository"]["pullRequest"]["latestReviews"]["nodes"]
+            for node in nodes:
+                if node["author"]:
+                    reviews[node["author"]["login"]] = node["state"]
+        except Exception as e:
+            logger.warning(f"Could not get latest reviews for PR #{pr_number}: {e}")
+        logger.info(f"Active reviews: {reviews}")
+        return reviews
+
     def swap_labels(self):
         """Evaluate review state and update labels accordingly."""
         pr = self.pr
@@ -143,24 +186,13 @@ class PRReviewTracker:
             logger.info(f"PR #{pr.number} is a draft. Skipping label swap.")
             return
 
-        # 1. Get the latest review state for everyone who has submitted a review
-        latest_reviews = {}
-        try:
-            for review in pr.get_reviews():
-                if not review.user:
-                    continue
-                if review.state in ("APPROVED", "CHANGES_REQUESTED"):
-                    if (
-                        review.user.login not in latest_reviews
-                        or review.submitted_at > latest_reviews[review.user.login].submitted_at
-                    ):
-                        latest_reviews[review.user.login] = review
-        except Exception as e:
-            logger.warning(f"Could not get reviews for PR #{pr.number}: {e}")
+        # 1. Get the active review state per reviewer via GraphQL latestReviews,
+        #    which reflects dismissed/removed approvals the same way the GitHub UI does.
+        latest_reviews = self._get_latest_reviews(pr.number)
 
-        approvers = {user for user, review in latest_reviews.items() if review.state == "APPROVED"}
+        approvers = {user for user, state in latest_reviews.items() if state == "APPROVED"}
         non_approvers = {
-            user for user, review in latest_reviews.items() if review.state == "CHANGES_REQUESTED"
+            user for user, state in latest_reviews.items() if state == "CHANGES_REQUESTED"
         }
 
         # 2. Determine required teams from CODEOWNERS + changed files
