@@ -271,8 +271,8 @@ def pad_vocab_for_tp(vocab_size: int, tp_size: int) -> int:
     pad to 128-multiple for GEMM alignment, and also require tp-divisibility.
     For typical `tp_size ∈ {1,2,4,...,128}`, `lcm = 128` so a vocab already
     divisible by 128 (e.g. Qwen3-MoE's 151936) stays unchanged — which is
-    what MC's `output_layer` sees, and what the lite logits vocab dim
-    is. Using `128 * tp_size` instead would over-pad (e.g. 151936 → 152064
+    what MC's `output_layer` sees. Using `128 * tp_size` instead would
+    over-pad (e.g. 151936 -> 152064
     at tp=2), introducing 128 extra logits into the vocab-parallel cross-
     entropy log-sum-exp and driving a ~3e-4 loss drift.
     """

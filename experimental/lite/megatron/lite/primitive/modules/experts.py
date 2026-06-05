@@ -12,6 +12,11 @@ import torch.nn as nn  # pyright: ignore[reportMissingImports]
 import torch.nn.functional as F  # pyright: ignore[reportMissingImports]
 import transformer_engine.pytorch as te  # pyright: ignore[reportMissingImports]
 
+from megatron.lite.primitive.modules.lora import (
+    LoraConfig,
+    SharedGroupedLinearLoRA,
+    normalize_lora_config,
+)
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.recompute import CheckpointWithoutOutput
 from megatron.lite.primitive.utils import ensure_divisible
@@ -127,6 +132,7 @@ class Experts(nn.Module):
         *,
         fp8: bool = False,
         moe_act_recompute: bool = False,
+        lora_config: LoraConfig | dict | None = None,
     ):
         super().__init__()
         self.num_local_experts = ensure_divisible(config.num_experts, ps.ep_size)
@@ -148,22 +154,39 @@ class Experts(nn.Module):
             bias=False,
             params_dtype=torch.bfloat16,
         )
+        lora = normalize_lora_config(lora_config)
+        self.fc1_lora: SharedGroupedLinearLoRA | None = None
+        self.fc2_lora: SharedGroupedLinearLoRA | None = None
+        if lora.enabled and lora.targets_module("linear_fc1"):
+            self.fc1_lora = SharedGroupedLinearLoRA(
+                self.num_local_experts,
+                config.hidden_size,
+                config.moe_intermediate_size * 2 // ps.etp_size,
+                lora.rank,
+                alpha=lora.alpha,
+                dropout=lora.dropout,
+            )
+        if lora.enabled and lora.targets_module("linear_fc2"):
+            self.fc2_lora = SharedGroupedLinearLoRA(
+                self.num_local_experts,
+                config.moe_intermediate_size // ps.etp_size,
+                config.hidden_size,
+                lora.rank,
+                alpha=lora.alpha,
+                dropout=lora.dropout,
+            )
         if ps.tp_size > 1 and ps.ep_size == 1 and ps.etp_size == 1:
             tp_group = ps.tp_group
-            for param in self.fc1.parameters():
+            for module in (self.fc1, self.fc2, self.fc1_lora, self.fc2_lora):
+                if module is None:
+                    continue
+                for param in module.parameters():
 
-                def _ar(grad, g=tp_group):
-                    dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=g)
-                    return grad
+                    def _ar(grad, g=tp_group):
+                        dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=g)
+                        return grad
 
-                param.register_hook(_ar)
-            for param in self.fc2.parameters():
-
-                def _ar(grad, g=tp_group):
-                    dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=g)
-                    return grad
-
-                param.register_hook(_ar)
+                    param.register_hook(_ar)
 
     def forward(
         self,
@@ -218,12 +241,22 @@ class Experts(nn.Module):
         with _expert_nvtx_range("ep_experts.forward"):
             if self.moe_act_recompute and probs is not None:
                 act_ckpt = CheckpointWithoutOutput(preserve_rng_state=True)
-                h = act_ckpt.checkpoint(swiglu_with_probs, self.fc1(x, m_splits), probs)
+                fc1_out = self.fc1(x, m_splits)
+                if self.fc1_lora is not None:
+                    fc1_out = fc1_out + self.fc1_lora(x, m_splits)
+                h = act_ckpt.checkpoint(swiglu_with_probs, fc1_out, probs)
                 out = self.fc2(h, m_splits)
+                if self.fc2_lora is not None:
+                    out = out + self.fc2_lora(h, m_splits)
                 act_ckpt.discard_output_and_register_recompute(out)
             else:
-                h = swiglu_with_probs(self.fc1(x, m_splits), probs)
+                fc1_out = self.fc1(x, m_splits)
+                if self.fc1_lora is not None:
+                    fc1_out = fc1_out + self.fc1_lora(x, m_splits)
+                h = swiglu_with_probs(fc1_out, probs)
                 out = self.fc2(h, m_splits)
+                if self.fc2_lora is not None:
+                    out = out + self.fc2_lora(h, m_splits)
 
         if self.etp_group is not None:
             out = _AllReduceETP.apply(out, self.etp_group)

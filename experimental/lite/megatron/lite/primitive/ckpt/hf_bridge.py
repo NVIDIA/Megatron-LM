@@ -22,11 +22,6 @@ import torch.nn as nn
 from safetensors import safe_open
 from safetensors.torch import save_file as _safe_save
 
-# ======================================================================
-# HFBridge protocol — model implements this
-# ======================================================================
-
-
 @runtime_checkable
 class HFBridge(Protocol):
     """Protocol for HF ↔ Megatron Lite weight conversion.
@@ -35,23 +30,23 @@ class HFBridge(Protocol):
     """
 
     def weight_map(self) -> dict[str, list[str]]:
-        """Lite param name → [HF param names]. Multiple = concat (QKV, gate+up)."""
+        """Megatron Lite param name → [HF param names]. Multiple = concat (QKV, gate+up)."""
         ...
 
-    def hf_to_native(self, lite_name: str, hf_tensors: list[torch.Tensor]) -> torch.Tensor:
-        """Convert HF tensors → single lite tensor (e.g. merge QKV)."""
+    def hf_to_native(self, bb_name: str, hf_tensors: list[torch.Tensor]) -> torch.Tensor:
+        """Convert HF tensors → single Megatron Lite tensor (e.g. merge QKV)."""
         ...
 
-    def native_to_hf(self, lite_name: str, tensor: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
-        """Convert lite tensor → [(hf_name, hf_tensor)] (e.g. split QKV back)."""
+    def native_to_hf(self, bb_name: str, tensor: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
+        """Convert Megatron Lite tensor → [(hf_name, hf_tensor)] (e.g. split QKV back)."""
         ...
 
-    def tp_spec(self, lite_name: str) -> tuple[int, int] | None:
+    def tp_spec(self, bb_name: str) -> tuple[int, int] | None:
         """TP sharding: ``(split_dim, 0=TP|1=ETP)``, or None if replicated."""
         ...
 
-    def qkv_spec(self, lite_name: str) -> tuple[int, int, int] | None:
-        """If lite_name is a fused QKV weight, return (num_q_heads, num_kv_heads, head_dim).
+    def qkv_spec(self, bb_name: str) -> tuple[int, int, int] | None:
+        """If bb_name is a fused QKV weight, return (num_q_heads, num_kv_heads, head_dim).
 
         Needed for correct GQA TP sharding — Q/K/V must be split independently.
         Return None for non-QKV parameters.
@@ -63,15 +58,15 @@ class HFBridge(Protocol):
         """Total number of experts (needed for EP gather index math)."""
         ...
 
-    def is_expert(self, lite_name: str) -> bool:
+    def is_expert(self, bb_name: str) -> bool:
         """Whether this param belongs to an expert (for EP sharding)."""
         ...
 
-    def expert_global_id(self, lite_name: str) -> int | None:
+    def expert_global_id(self, bb_name: str) -> int | None:
         """Global expert ID from synthetic name. None if not expert."""
         ...
 
-    def expert_local_name(self, lite_name: str, local_idx: int) -> str:
+    def expert_local_name(self, bb_name: str, local_idx: int) -> str:
         """Synthetic expert name → actual model param name."""
         ...
 
@@ -261,15 +256,37 @@ def load_hf_weights(
 
     state = base_model.state_dict()
     loaded: dict[str, torch.Tensor] = {}
+    num_experts_total = getattr(spec, "num_experts", None)
+    expert_shard = None
+    if num_experts_total is None:
+        expert_ids = [spec.expert_global_id(name) for name in wmap]
+        expert_ids = [expert_id for expert_id in expert_ids if expert_id is not None]
+        if expert_ids:
+            num_experts_total = max(expert_ids) + 1
+    if num_experts_total:
+        from megatron.lite.primitive.utils import ensure_divisible
 
-    for lite_name, hf_names in wmap.items():
-        mapped = remap_layer_index(lite_name, global_to_local)
+        experts_per_rank = ensure_divisible(num_experts_total, ps.ep_size)
+        local_start = ps.ep_rank * experts_per_rank
+        expert_shard = (experts_per_rank, local_start)
+
+    for bb_name, hf_names in wmap.items():
+        mapped = remap_layer_index(bb_name, global_to_local)
         if mapped is None:
             continue
 
         expert_gid = spec.expert_global_id(mapped)
         if expert_gid is not None:
-            _load_expert_weight(mapped, hf_names, reader, spec, ps, loaded, expert_gid)
+            _load_expert_weight(
+                mapped,
+                hf_names,
+                reader,
+                spec,
+                ps,
+                loaded,
+                expert_gid,
+                expert_shard,
+            )
             continue
 
         hf_tensors = [reader.get_tensor(n) for n in hf_names]
@@ -299,33 +316,32 @@ def load_hf_weights(
     for name, param in base_model.named_parameters():
         if name in loaded:
             param.data.copy_(loaded[name])
+        elif "lora" in name.lower() or "adapter" in name.lower():
+            continue
         else:
             log_rank0(f"WARNING: {name} not loaded from checkpoint")
 
 
-def _load_expert_weight(lite_name, hf_names, reader, spec, ps, loaded, expert_gid):
-    from megatron.lite.primitive.utils import ensure_divisible
-
-    num_experts_total = sum(1 for k in spec.weight_map() if spec.expert_global_id(k) is not None
-                           and k.rsplit("_", 1)[0] == lite_name.rsplit("_", 1)[0])
-    experts_per_rank = ensure_divisible(num_experts_total, ps.ep_size)
-    local_start = ps.ep_rank * experts_per_rank
+def _load_expert_weight(bb_name, hf_names, reader, spec, ps, loaded, expert_gid, expert_shard):
+    if expert_shard is None:
+        raise RuntimeError("Expert weight encountered but expert shard metadata is unavailable.")
+    experts_per_rank, local_start = expert_shard
     if expert_gid < local_start or expert_gid >= local_start + experts_per_rank:
         return
 
     hf_tensors = [reader.get_tensor(n) for n in hf_names]
-    tensor = spec.hf_to_native(lite_name, hf_tensors)
+    tensor = spec.hf_to_native(bb_name, hf_tensors)
 
     if ps.etp_size > 1:
-        tp_info = spec.tp_spec(lite_name)
+        tp_info = spec.tp_spec(bb_name)
         if tp_info is not None:
             split_d, _ = tp_info
-            if "fc1" in lite_name:
+            if "fc1" in bb_name:
                 tensor = split_gate_up(tensor, ps.etp_rank, ps.etp_size)
             else:
                 tensor = split_dim(tensor, ps.etp_rank, ps.etp_size, dim=split_d)
 
-    loaded[spec.expert_local_name(lite_name, expert_gid - local_start)] = tensor.to(dtype=torch.bfloat16)
+    loaded[spec.expert_local_name(bb_name, expert_gid - local_start)] = tensor.to(dtype=torch.bfloat16)
 
 
 def _resolve_param_name(name: str, state_dict: dict) -> str | None:
@@ -383,10 +399,10 @@ def export_hf_weights(
 
                 exported_params += 1
                 if not rank0_only or rank == 0:
-                    for lite_name, gathered_tensor in gathered_one.items():
-                        if vocab_size is not None and ("embed" in lite_name or "head" in lite_name):
+                    for bb_name, gathered_tensor in gathered_one.items():
+                        if vocab_size is not None and ("embed" in bb_name or "head" in bb_name):
                             gathered_tensor = gathered_tensor[:vocab_size]
-                        yield from spec.native_to_hf(lite_name, gathered_tensor)
+                        yield from spec.native_to_hf(bb_name, gathered_tensor)
 
                 if limit is not None and exported_params >= limit:
                     return
@@ -429,9 +445,9 @@ def export_hf_weights(
             if "embed" in key or "head" in key:
                 gathered[key] = gathered[key][:vocab_size]
 
-    # Convert lite names → HF names via spec
-    for lite_name, tensor in gathered.items():
-        yield from spec.native_to_hf(lite_name, tensor)
+    # Convert Megatron Lite names → HF names via spec
+    for bb_name, tensor in gathered.items():
+        yield from spec.native_to_hf(bb_name, tensor)
 
 
 def _gather_dense(name: str, tensor: torch.Tensor, spec: HFBridge, ps) -> torch.Tensor:
@@ -458,7 +474,7 @@ def _gather_expert(
             else:
                 tensor = allgather_concat(tensor, ps.etp_size, ps.etp_group, dim=split_d)
 
-    # EP gather (mbridge pattern: global_id = ep_rank * n_local + local_id)
+    # EP gather: global_id = ep_rank * n_local + local_id.
     local_idx = parse_expert_idx(name)
     if ps.ep_size > 1 and ps.ep_group is not None:
         n_local = spec.num_experts // ps.ep_size

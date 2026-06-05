@@ -116,7 +116,7 @@ def _build_meshes(config):
 
 def log_rank0(msg: str) -> None:
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-        print(f"[Megatron Lite] {msg}", flush=True)
+        print(f"[megatron.lite] {msg}", flush=True)
 
 # ======================================================================
 # QKV / FC1 canonicalize for DCP (interleaved-TP ↔ canonical layout)

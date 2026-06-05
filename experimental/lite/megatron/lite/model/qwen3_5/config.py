@@ -26,6 +26,7 @@ _HF_FIELDS = frozenset({
     "linear_conv_kernel_dim",
     "layer_types",
     "partial_rotary_factor",
+    "mrope_section",
     "mtp_num_hidden_layers",
     "mtp_use_dedicated_embeddings",
     "num_nextn_predict_layers",
@@ -64,6 +65,7 @@ class Qwen35Config:
     )
     partial_rotary_factor: float = 0.25
     rope_theta: float = 10_000_000.0
+    mrope_section: list[int] | None = None
     num_nextn_predict_layers: int = 0
     mtp_loss_scaling_factor: float = 0.1
     mtp_use_dedicated_embeddings: bool = False
@@ -157,6 +159,20 @@ class Qwen35Config:
             0.0 < self.partial_rotary_factor <= 1.0,
             f"partial_rotary_factor must be in (0, 1], got {self.partial_rotary_factor}",
         )
+        if self.mrope_section is not None:
+            _check(
+                len(self.mrope_section) == 3,
+                f"mrope_section must have three entries, got {self.mrope_section}",
+            )
+            _check(
+                all(section >= 0 for section in self.mrope_section),
+                f"mrope_section entries must be non-negative, got {self.mrope_section}",
+            )
+            _check(
+                2 * sum(self.mrope_section) == self.rotary_dim,
+                f"sum(mrope_section)*2 must equal rotary_dim({self.rotary_dim}), "
+                f"got {self.mrope_section}",
+            )
         valid_types = {"linear_attention", "full_attention"}
         for i, lt in enumerate(self.layer_types):
             _check(lt in valid_types, f"layer_types[{i}] must be one of {valid_types}, got '{lt}'")
@@ -196,6 +212,8 @@ class Qwen35Config:
                 kwargs["rope_theta"] = float(rp.get("rope_theta", 10_000_000.0))
             if "partial_rotary_factor" not in kwargs and "partial_rotary_factor" in rp:
                 kwargs["partial_rotary_factor"] = float(rp["partial_rotary_factor"])
+            if "mrope_section" not in kwargs and "mrope_section" in rp:
+                kwargs["mrope_section"] = list(rp["mrope_section"])
         if "head_dim" not in kwargs or kwargs.get("head_dim") is None:
             kwargs["head_dim"] = kwargs.get("hidden_size", 2048) // kwargs.get("num_attention_heads", 16)
         if kwargs.get("num_nextn_predict_layers") is None:

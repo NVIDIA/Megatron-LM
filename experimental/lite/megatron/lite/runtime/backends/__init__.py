@@ -23,16 +23,20 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
-import torch
+if TYPE_CHECKING:
+    import torch
 
-from megatron.lite.runtime.contracts.data import ForwardResult
-from megatron.lite.runtime.contracts.handle import ModelHandle
+    from megatron.lite.runtime.contracts.data import ForwardResult
+    from megatron.lite.runtime.contracts.handle import ModelHandle
 
 
 class Runtime(ABC):
-    """Base class for runtime implementations."""
+    """Base class for all runtime implementations.
+
+    MegatronLiteRuntime and custom impls subclass this.
+    """
 
     # ── L1: Pretrain Ready (必须实现) ────────────────────────────
 
@@ -174,5 +178,5 @@ class Runtime(ABC):
 # ---------------------------------------------------------------------------
 
 RUNTIME_REGISTRY: dict[str, str] = {
-    "lite": "megatron.lite.runtime.backends.lite",
+    "mlite": "megatron.lite.runtime.backends.mlite",
 }

@@ -1,7 +1,7 @@
 """Megatron-Core utilities aligned with VERL's megatron_utils.
 
 All functions here are ported from VERL and could theoretically be replaced
-by ``from verl.utils.megatron_utils import ...`` if this package depends on VERL.
+by ``from verl.utils.megatron_utils import ...`` if Megatron Lite ever depends on verl.
 
 Sources:
   - verl/utils/megatron_utils.py  (offload/load, register_megatron_training_hooks)

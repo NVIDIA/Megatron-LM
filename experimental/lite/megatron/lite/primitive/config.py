@@ -1,6 +1,6 @@
 """Configuration utilities.
 
-Model-specific configs live under `Megatron Lite/models/*/config.py`
+Model-specific configs live under `megatron.lite/models/*/config.py`
 as standalone dataclasses.
 """
 

@@ -3,12 +3,12 @@
 The public runtime entrypoint is `megatron.lite.runtime`.
 
 ```python
-from megatron.lite.runtime import LiteConfig, ParallelConfig, RuntimeConfig, create_runtime
+from megatron.lite.runtime import MegatronLiteConfig, ParallelConfig, RuntimeConfig, create_runtime
 
 cfg = RuntimeConfig(
-    backend="lite",
+    backend="mlite",
     hf_path="/path/to/hf-model",
-    backend_cfg=LiteConfig(
+    backend_cfg=MegatronLiteConfig(
         model_name="qwen3",
         impl="lite",
         parallel=ParallelConfig(tp=1, pp=1, cp=1, ep=1),
@@ -39,7 +39,7 @@ model and optimizer support those operations.
 
 `RuntimeConfig` selects the backend and carries the Hugging Face model path.
 
-`LiteConfig` carries lite-backend settings:
+`MegatronLiteConfig` carries `mlite` backend settings:
 
 - `model_name`: `qwen3`, `qwen3_moe`, or `qwen3_5`.
 - `impl`: currently only `lite`.
@@ -49,7 +49,8 @@ model and optimizer support those operations.
 
 ## Backend Registry
 
-The only built-in backend key is `lite`.
+The only built-in backend key is `mlite`. Model implementations remain selected
+through `MegatronLiteConfig.impl`, which currently supports `impl="lite"`.
 
 Custom runtime backends can be registered with:
 

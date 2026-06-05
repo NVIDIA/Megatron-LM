@@ -1,7 +1,7 @@
-"""Qwen3.5 lite implementation for the Megatron Lite runtime."""
+"""Qwen3.5 lite impl — native model protocol for Megatron Lite runtime."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -10,20 +10,23 @@ import torch
 import torch.nn as nn
 
 from megatron.lite.model.qwen3_5.config import Qwen35Config
-from megatron.lite.model.qwen3_5.common import is_expert_param
 from megatron.lite.model.qwen3_5.lite.checkpoint import (
     load_hf_weights as _load_hf_weights_impl,
 )
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
-from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig
+from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
+
+
+def is_expert_param(name: str) -> bool:
+    return "experts" in name and "router" not in name and "shared" not in name
 
 
 @dataclass(frozen=True)
 class ImplConfig:
     parallel: ParallelConfig = field(default_factory=ParallelConfig)
-    optimizer: str | None = "mc"
+    optimizer: str | None = "mc_full"
     recompute: list[str] = field(default_factory=list)
     offload: list[str] = field(default_factory=list)
     use_deepep: bool = False
@@ -39,15 +42,21 @@ class ImplConfig:
     mtp_detach_encoder: bool = False
     mtp_loss_scaling_factor: float = 0.1
     mtp_use_repeated_layer: bool | None = None
-    deterministic_embedding: bool | None = None
+
+
+def _full_attn_module(layer, name: str):
+    full_attn = getattr(layer, "full_attn", None)
+    return getattr(full_attn, name, None) if full_attn is not None else None
 
 
 MODULE_MAP = {
-    "core_attn": lambda layer: layer.self_attention.core_attention,
-    "experts":   lambda layer: layer.mlp.experts,
-    "moe":       lambda layer: layer.mlp,
-    "router":    lambda layer: layer.mlp.router,
-    "mlp_norm":  lambda layer: layer.pre_mlp_layernorm,
+    "core_attn": lambda layer: _full_attn_module(layer, "core_attn"),
+    "experts":   lambda layer: layer.moe.experts,
+    "moe":       lambda layer: layer.moe,
+    "router":    lambda layer: layer.moe.router,
+    "mlp_norm":  lambda layer: layer.mlp_norm,
+    "attn_proj": lambda layer: _full_attn_module(layer, "proj"),
+    "linear_attn": lambda layer: layer.linear_attn,
 }
 
 
@@ -81,21 +90,54 @@ def _forward_step(model: nn.Module, batch: dict) -> dict:
 
 
 def _make_aux_loss_hook():
-    from megatron.core.transformer.moe.moe_utils import (  # pyright: ignore[reportMissingImports]
-        MoEAuxLossAutoScaler as _MCMoEAuxLossAutoScaler,
-    )
-
     from megatron.lite.primitive.modules.moe import (
-        MoEAuxLossAutoScaler as _LiteMoEAuxLossAutoScaler,
+        MoEAuxLossAutoScaler,
     )
-    from megatron.lite.model.qwen3_5.lite.model import MTPLossAutoScaler
+    from megatron.lite.primitive.modules.mtp import MTPLossAutoScaler
 
     def hook(scale: torch.Tensor) -> None:
-        _MCMoEAuxLossAutoScaler.set_loss_scale(scale)
-        _LiteMoEAuxLossAutoScaler.set_loss_scale(scale)
+        MoEAuxLossAutoScaler.set_loss_scale(scale)
         MTPLossAutoScaler.set_loss_scale(scale)
 
     return hook
+
+
+def _build_mc_optimizer(chunks, model_cfg: Qwen35Config, impl_cfg: ImplConfig, ps: ParallelState):
+    from megatron.lite.primitive.optimizers.megatron_wrap import (
+        build_mc_full_stack,
+        finalize_mc_full_grads,
+    )
+
+    opt_cfg = impl_cfg.optimizer_config
+    if opt_cfg is None:
+        opt_cfg = SimpleNamespace(
+            optimizer="adam",
+            lr=1e-4,
+            weight_decay=0.01,
+            clip_grad=1.0,
+            offload_fraction=None,
+            adam_beta1=None,
+            adam_beta2=None,
+            adam_eps=None,
+        )
+
+    engine_cfg = SimpleNamespace(
+        model_name="qwen3_5",
+        parallel=impl_cfg.parallel,
+        optimizer=opt_cfg,
+    )
+    chunks[:], optimizer = build_mc_full_stack(
+        chunks,
+        model_cfg=model_cfg,
+        engine_cfg=engine_cfg,
+        ps=ps,
+        is_expert=is_expert_param,
+    )
+
+    def finalize() -> None:
+        finalize_mc_full_grads(chunks, optimizer)
+
+    return optimizer, finalize
 
 
 def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle:
@@ -125,9 +167,6 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
     deterministic = impl_cfg.deterministic
     if impl_cfg.use_thd and deterministic and "linear_attention" in model_cfg.layer_types:
         deterministic = False
-    effective_impl_cfg = (
-        impl_cfg if deterministic == impl_cfg.deterministic else replace(impl_cfg, deterministic=deterministic)
-    )
     train_cfg = SimpleNamespace(
         tp=ps.tp_size,
         ep=ps.ep_size,
@@ -139,7 +178,6 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
         fp8=False,
         recompute_modules=recompute_spec,
         deterministic=deterministic,
-        deterministic_embedding=impl_cfg.deterministic_embedding,
     )
     model_kwargs: dict[str, Any] = dict(
         router_bias_rate=impl_cfg.router_bias_rate,
@@ -185,26 +223,35 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
     finalize_grads = None
     post_model_load_hook = None
     optimizer_backend = "none"
-    if impl_cfg.optimizer == "mc":
-        from megatron.lite.primitive.optimizers.megatron_wrap import (
-            build_mc_training_optimizer,
-        )
-
-        optimizer, finalize_grads = build_mc_training_optimizer(
-            chunks,
-            model_cfg=model_cfg,
-            impl_cfg=effective_impl_cfg,
-            ps=ps,
-            model_name="qwen3_5",
-            is_expert=is_expert_param,
-        )
-        optimizer_backend = "mc"
-
-        from megatron.lite.runtime.megatron_utils import (
-            register_training_hooks,
-        )
+    if impl_cfg.optimizer in {"mc", "mc_full"}:
+        optimizer, finalize_grads = _build_mc_optimizer(chunks, model_cfg, impl_cfg, ps)
+        from megatron.lite.runtime.megatron_utils import register_training_hooks
 
         register_training_hooks(chunks, optimizer)
+        optimizer_backend = "mc_full"
+    elif impl_cfg.optimizer == "fsdp2":
+        optimizer_backend = "fsdp2"
+
+        def _post_model_load_hook():
+            from megatron.lite.model.qwen3_5.lite.model import Qwen35Layer
+            from megatron.lite.primitive.optimizers.fsdp2 import (
+                build_fsdp2_training_optimizer,
+            )
+
+            return {
+                "optimizer": build_fsdp2_training_optimizer(
+                    chunks,
+                    impl_cfg.optimizer_config,
+                    ps,
+                    unit_modules=(Qwen35Layer,),
+                    expert_classifier=is_expert_param,
+                    deterministic=deterministic,
+                    vpp=impl_cfg.parallel.vpp,
+                    leaf_module_names=(),
+                ),
+            }
+
+        post_model_load_hook = _post_model_load_hook
     elif impl_cfg.optimizer is not None:
         raise ValueError(f"Unknown qwen3_5 lite optimizer: {impl_cfg.optimizer!r}.")
 
@@ -229,24 +276,6 @@ def load_hf_weights(
     if not hf_path:
         return
     _load_hf_weights_impl(chunk, hf_path, model_cfg, ps)
-
-
-def export_hf_weights(
-    chunks: list[nn.Module],
-    model_cfg: Qwen35Config,
-    ps: ParallelState,
-    **kwargs,
-):
-    from megatron.lite.model.qwen3_5.lite.checkpoint import export_weights as _export_weights
-
-    limit = kwargs.pop("limit", None)
-    if limit is not None and limit <= 0:
-        limit = None
-    hf_flat = _export_weights(chunks, model_cfg, ps, **kwargs)
-    for idx, item in enumerate(hf_flat.items(), start=1):
-        yield item
-        if limit is not None and idx >= limit:
-            break
 
 
 def vocab_size(model_cfg) -> int | None:

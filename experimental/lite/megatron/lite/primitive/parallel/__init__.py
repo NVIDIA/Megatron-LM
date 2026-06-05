@@ -5,6 +5,8 @@ from __future__ import annotations
 from megatron.lite.primitive.parallel.cp import (
     split_packed_for_cp,
     zigzag_position_ids_for_cp,
+    zigzag_reconstruct_from_cp_parts,
+    zigzag_slice_for_cp,
     zigzag_split_for_cp,
 )
 from megatron.lite.primitive.parallel.pipeline import forward_backward_pipelining
@@ -19,7 +21,9 @@ from megatron.lite.primitive.parallel.thd import (
     PackedSeqParams,
     PackedTHDBatch,
     pack_nested_thd,
+    reconstruct_packed_from_cp_parts,
     roll_packed_thd_left,
+    split_packed_to_cp_local,
     unpack_packed_thd_to_nested,
 )
 
@@ -58,10 +62,14 @@ __all__ = [
     "init_parallel",
     "pad_vocab_for_tp",
     "pack_nested_thd",
+    "reconstruct_packed_from_cp_parts",
     "roll_packed_thd_left",
     "scatter_to_sequence_parallel",
+    "split_packed_to_cp_local",
     "split_packed_for_cp",
     "unpack_packed_thd_to_nested",
     "zigzag_position_ids_for_cp",
+    "zigzag_reconstruct_from_cp_parts",
+    "zigzag_slice_for_cp",
     "zigzag_split_for_cp",
 ]

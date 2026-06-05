@@ -35,6 +35,56 @@ def zigzag_split_for_cp(
     return tensor.reshape(*shape)
 
 
+def zigzag_reconstruct_from_cp_parts(
+    parts: list[torch.Tensor] | tuple[torch.Tensor, ...],
+    seq_dim: int = 1,
+) -> torch.Tensor:
+    """Reconstruct a full sequence from per-rank zigzag CP shards."""
+    cp_size = len(parts)
+    if cp_size <= 1:
+        return parts[0]
+    local_len = parts[0].shape[seq_dim]
+    assert local_len % 2 == 0, (
+        f"local seq_len={local_len} must be divisible by 2 for zigzag CP reconstruction"
+    )
+    for idx, part in enumerate(parts):
+        assert part.shape == parts[0].shape, (
+            f"CP part {idx} shape {tuple(part.shape)} != {tuple(parts[0].shape)}"
+        )
+
+    chunk = local_len // 2
+    full_len = local_len * cp_size
+    out_shape = list(parts[0].shape)
+    out_shape[seq_dim] = full_len
+    full = torch.zeros(out_shape, dtype=parts[0].dtype, device=parts[0].device)
+    for rank, part in enumerate(parts):
+        first = part.narrow(seq_dim, 0, chunk)
+        second = part.narrow(seq_dim, chunk, chunk)
+        full.narrow(seq_dim, rank * chunk, chunk).copy_(first)
+        full.narrow(seq_dim, full_len - (rank + 1) * chunk, chunk).copy_(second)
+    return full
+
+
+def zigzag_slice_for_cp(
+    tensor: torch.Tensor,
+    cp_rank: int,
+    cp_size: int,
+    seq_dim: int = 1,
+) -> torch.Tensor:
+    """Return one rank's zigzag CP shard from a full sequence tensor."""
+    if cp_size <= 1:
+        return tensor
+    seq_len = tensor.shape[seq_dim]
+    assert seq_len % (2 * cp_size) == 0, (
+        f"seq_len={seq_len} must be divisible by 2*cp_size={2 * cp_size}"
+    )
+    chunk = seq_len // (2 * cp_size)
+    first = tensor.narrow(seq_dim, cp_rank * chunk, chunk)
+    second_start = seq_len - (cp_rank + 1) * chunk
+    second = tensor.narrow(seq_dim, second_start, chunk)
+    return torch.cat((first, second), dim=seq_dim).contiguous()
+
+
 def zigzag_position_ids_for_cp(
     seq_len: int, cp_rank: int, cp_size: int, device: torch.device,
 ) -> torch.Tensor:
@@ -103,6 +153,8 @@ def split_packed_for_cp(
 
 __all__ = [
     "split_packed_for_cp",
+    "zigzag_reconstruct_from_cp_parts",
     "zigzag_position_ids_for_cp",
+    "zigzag_slice_for_cp",
     "zigzag_split_for_cp",
 ]

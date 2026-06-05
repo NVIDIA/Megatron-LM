@@ -114,7 +114,7 @@ def infinite_batches_thd(
 ):
     """Infinite deterministic batch generator in THD (packed variable-length) format.
 
-    Produces plain dicts consumed directly by the lite model forward
+    Produces plain dicts consumed directly by native lite model forwards
     (input_ids 2-D batch=1, mrope position_ids (3,1,T), pre-built PackedSeqParams).
 
     cp_size/cp_rank should be supplied explicitly by the caller (for example

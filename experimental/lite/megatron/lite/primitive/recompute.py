@@ -357,7 +357,7 @@ def wrap_offload(module: nn.Module) -> None:
 
 def log_rank0(msg: str) -> None:
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-        print(f"[Megatron Lite] {msg}", flush=True)
+        print(f"[megatron.lite] {msg}", flush=True)
 
 
 def parse_recompute_spec(recompute: str | list[str] | None) -> list[str]:
