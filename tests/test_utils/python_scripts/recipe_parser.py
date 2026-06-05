@@ -35,6 +35,7 @@ LEGACY_SCOPE_ALIASES = {
     "weekly": ("L4", ["weekly"]),
 }
 
+
 def _resolve_scope_alias(scope_value: str) -> str:
     """Resolve a legacy scope value to its L-tier alias (or return it unchanged).
 
