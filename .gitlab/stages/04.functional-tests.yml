@@ -75,17 +75,16 @@ functional:configure:
       # input (tests/test_utils/python_scripts/recipe_parser.py):
       #   - `mr-github-slim` -> `L0`
       #   - `mr-github` -> `L1`
-      #   - `mr` -> the full MR suite `{L1, L2}` (== `L1,L2`); a literal `mr`
-      #     recipe-row tag still resolves to the single tier `L2`.
+      #   - `mr` -> `L2`
       #   - `nightly` -> `L3`; `weekly` -> `L4`
       # `unit-tests` and `release` are not aliased and match recipe rows verbatim.
       #
-      # For the full MR suite (`mr` or `L1,L2`), GB200 keeps the legacy GitLab
-      # `mr` footprint (`L2` only) rather than unioning L1 rows that were never in
-      # the old GB200 MR matrix.
+      # For the full MR suite (`L1,L2`), GB200 keeps the legacy GitLab `mr`
+      # footprint (`L2` only) rather than unioning L1 rows that were never in the
+      # old GB200 MR matrix.
       SCOPE_A100_H100="$FUNCTIONAL_TEST_SCOPE"
       SCOPE_GB200="$FUNCTIONAL_TEST_SCOPE"
-      if [[ "$FUNCTIONAL_TEST_SCOPE" == "L1,L2" || "$FUNCTIONAL_TEST_SCOPE" == "mr" ]]; then
+      if [[ "$FUNCTIONAL_TEST_SCOPE" == "L1,L2" ]]; then
         SCOPE_GB200="L2"
       fi
       COMMON_ARGS=(

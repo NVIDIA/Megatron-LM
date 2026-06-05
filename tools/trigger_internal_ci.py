@@ -40,14 +40,9 @@ PIPELINE_VARIABLES_FIXED = {
     "INTEGRATION_TEST": "no",
 }
 
-# Legacy FUNCTIONAL_TEST_SCOPE aliases mapped onto the unified L-tier vocabulary.
-# The internal GitLab CI / recipe parser already resolves these server-side, but
-# normalizing here keeps the triggered pipeline's variables self-documenting:
-# `mr` is the full Merge-Request functional suite, i.e. the union of the GitHub
-# PR tier (L1) and the GitLab-only extras tier (L2).
-SCOPE_ALIASES = {
-    "mr": "L1,L2",
-}
+# No trigger-side scope aliases are applied. The internal GitLab CI / recipe
+# parser resolves legacy scope values server-side; bare `mr` maps to `L2`.
+SCOPE_ALIASES = {}
 
 logger = logging.getLogger(__name__)
 
@@ -138,7 +133,7 @@ def main():
         "--functional-test-scope",
         default="L1,L2",
         help="FUNCTIONAL_TEST_SCOPE pipeline variable (default: L1,L2). "
-        "Legacy 'mr' is normalized to the full MR suite 'L1,L2'.",
+        "Legacy 'mr' resolves server-side to L2.",
     )
     parser.add_argument(
         "--functional-test-repeat",
