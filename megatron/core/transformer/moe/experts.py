@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
 import logging
@@ -323,13 +323,20 @@ class TEGroupedMLP(MegatronModule):
             logger.warning("TE fused GroupedMLP not available: %s", reason)
             return False
 
+        def _activation_name():
+            return getattr(
+                self.config.activation_func, "__name__", str(self.config.activation_func)
+            )
+
         # Check Transformer Engine installation
         if not HAVE_TE:
             return _unsupported("Transformer Engine is not installed")
         try:
-            from transformer_engine.pytorch.ops import GroupedLinear, ScaledSwiGLU
+            from transformer_engine.pytorch import ops as te_ops
         except ImportError:
-            return _unsupported("TE too old (missing pytorch.ops.GroupedLinear)")
+            return _unsupported("TE too old (missing pytorch.ops)")
+        if not hasattr(te_ops, "GroupedLinear") or not hasattr(te_ops, "ScaledSwiGLU"):
+            return _unsupported("TE too old (missing GroupedLinear/ScaledSwiGLU ops)")
 
         if not is_te_min_version("2.14.0"):
             return _unsupported("TE version < 2.14.0")
@@ -348,31 +355,45 @@ class TEGroupedMLP(MegatronModule):
         if not isinstance(self.linear_fc2, te.pytorch.GroupedLinear):
             return _unsupported(f"linear_fc2 is {type(self.linear_fc2).__name__}")
 
-        # Check activation: SwiGLU or quick GEGLU (ScaledClampedQGeGLU, TE >= 2.15)
-        if not self.config.gated_linear_unit:
-            return _unsupported("gated_linear_unit not enabled")
-        if self.activation_func == F.silu:
-            pass  # SwiGLU — supported
-        elif self.activation_func == quick_gelu:
-            try:
-                from transformer_engine.pytorch.ops import ScaledClampedQGeGLU  # noqa: F401
-            except ImportError:
+        # Check activation: SwiGLU, quick GEGLU, or weighted squared ReLU.
+        # Use config.activation_func instead of self.activation_func because when
+        # use_te_activation_func is True, self.activation_func is a TE module, not the raw function.
+        use_glu_fusion = self.config.gated_linear_unit and self.config.activation_func in (
+            F.silu,
+            quick_gelu,
+        )
+        use_srelu_fusion = (
+            self.config.activation_func == squared_relu
+            and self.config.use_fused_weighted_squared_relu
+            and not self.config.gated_linear_unit
+        )
+        if not (use_glu_fusion or use_srelu_fusion):
+            return _unsupported(
+                f"unsupported activation {_activation_name()} "
+                f"(gated_linear_unit={self.config.gated_linear_unit}, "
+                f"use_fused_weighted_squared_relu={self.config.use_fused_weighted_squared_relu})"
+            )
+        if self.config.activation_func == F.silu:
+            pass  # SwiGLU is covered by the ScaledSwiGLU availability check above.
+        elif self.config.activation_func == quick_gelu:
+            if not hasattr(te_ops, "ScaledClampedQGeGLU"):
                 return _unsupported("quick_gelu needs TE >= 2.15")
-        else:
-            return _unsupported(f"unsupported activation: {self.activation_func}")
+        elif self.config.activation_func == squared_relu:
+            if not hasattr(te_ops, "ScaledSReLU"):
+                return _unsupported("weighted squared_relu needs ScaledSReLU")
 
         # Check TE CuTe DSL fused kernel conditions (must match TE's
-        # fuse_grouped_mlp_ops matching logic)
+        # fuse_grouped_mlp_ops matching logic).
         import os
 
-        if os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0") == "0":
+        if int(os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")) <= 0:
             return _unsupported(
-                "NVTE_CUTEDSL_FUSED_GROUPED_MLP not set — CuTe DSL fused kernel disabled"
+                "NVTE_CUTEDSL_FUSED_GROUPED_MLP not set; CuTe DSL fused kernel disabled"
             )
-        if self.config.moe_mlp_glu_interleave_size != 32:
+        if use_glu_fusion and self.config.moe_mlp_glu_interleave_size != 32:
             return _unsupported(
                 f"moe_mlp_glu_interleave_size={self.config.moe_mlp_glu_interleave_size} "
-                f"(CuTe DSL requires 32)"
+                f"(CuTe DSL GLU fusion requires 32)"
             )
 
         return True
@@ -746,13 +767,11 @@ class TEGroupedMLP(MegatronModule):
 
         # Delay the offload of the moe act until after the linear_fc2 has been computed
         # to make sure the fc1_output is reloaded to GPU before recomputing moe_act.
-        if self.offload_moe_act:
-            output = off_interface.group_commit(
-                output,
-                name="moe_act",
-                forced_released_tensors=[fc1_output],
-                delay_offload=self.config.delay_offload_until_cuda_graph,
-            )
+        output = moe_act_manager.group_offload(
+            output,
+            forced_released_tensors=[fc1_output],
+            delay_offload=self.config.delay_offload_until_cuda_graph,
+        )
         output = self._apply_bias(output, output_bias, tokens_per_expert, permuted_probs)
 
         # upad and concat the output
