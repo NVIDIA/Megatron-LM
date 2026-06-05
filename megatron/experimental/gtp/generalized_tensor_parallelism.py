@@ -10,6 +10,7 @@ sharding for compounding bandwidth reduction.
 """
 
 import math
+import os
 import re
 import warnings
 from collections import defaultdict
@@ -19,9 +20,21 @@ from enum import Enum
 from typing import Dict, List, Optional
 
 import torch
+from packaging.version import Version
+
+_GTP_TE_MIN_VERSION = Version("2.17")
 
 try:
     import transformer_engine as te  # noqa: F401
+
+    _te_version = Version(te.__version__)
+    if _te_version < _GTP_TE_MIN_VERSION and not os.environ.get("MEGATRON_GTP_FORCE_ENABLE"):
+        raise ImportError(
+            f"megatron.experimental.gtp requires TransformerEngine >= {_GTP_TE_MIN_VERSION} "
+            f"(found {_te_version}). Set MEGATRON_GTP_FORCE_ENABLE=1 to bypass this check "
+            "when using a custom TE build that includes the GTP hook registry."
+        )
+
     import transformer_engine_torch as tex
     from transformer_engine.pytorch.constants import (
         MXFP8_BLOCK_SCALING_SIZE,
@@ -1832,6 +1845,7 @@ except ImportError:
     warnings.warn(
         "megatron.experimental.gtp: TransformerEngine does not expose register_gtp_hooks; "
         "GTP will be a no-op for te.Linear / te.LayerNormLinear / te.GroupedLinear. "
+        "GTP requires TransformerEngine >= 2.17 (planned release). "
         "Upgrade TransformerEngine to a build that includes the GTP hook registry.",
         RuntimeWarning,
         stacklevel=2,
