@@ -28,7 +28,7 @@ from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
     is_checkpointing,
 )
-from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
@@ -67,6 +67,31 @@ except:
 _IS_GRAPH_CAPTURING = False
 _IS_GRAPH_WARMUP = False
 logger = logging.getLogger(__name__)
+
+
+def _set_skip_fp8_weight_update_tensor(skip: bool) -> None:
+    """Toggle TE's FP8 "skip weight refresh" flag between microbatches.
+
+    TE 2.15 (PR #2759) moved this flag from a classmethod on FP8GlobalStateManager
+    to a dataclass field on FP8GlobalStateManager.quantization_state, with no
+    shim. This helper handles both layouts.
+    """
+    if not HAVE_TE_GRAPHS:
+        return
+
+    # TE <= 2.14: classmethod setter still exists.
+    if hasattr(FP8GlobalStateManager, "set_skip_fp8_weight_update_tensor"):
+        FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(skip)
+        return
+
+    # TE >= 2.15: write the dataclass field directly. Allocate the persistent
+    # 1-element CUDA scalar once so its data pointer stays valid across
+    # cudagraph replays, then fill the value in place.
+    qstate = FP8GlobalStateManager.quantization_state
+    if qstate.skip_fp8_weight_update_tensor is None:
+        qstate.skip_fp8_weight_update_tensor = torch.empty(1, dtype=torch.float32, device="cuda")
+    qstate.skip_fp8_weight_update_tensor.fill_(skip)
+
 
 # Freeze GC during capture.
 # TODO (@lmcafee): remove all freeze-GC code once most users are on PyTorch 2.9+.
@@ -608,7 +633,7 @@ class _CudagraphReplayNode(torch.autograd.Function):
             # Note that FP8GlobalStateManager.is_first_fp8_module() is inacccurate as each
             # layer may be in its own fp8 context, when the fp8 recipe != delayed_scaling
             if runner.is_first_layer and (runner.fp8_param_cache_updated != is_first_microbatch):
-                FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(not is_first_microbatch)
+                _set_skip_fp8_weight_update_tensor(not is_first_microbatch)
                 runner.fp8_param_cache_updated = is_first_microbatch
 
         runner.fwd_graph.replay()
@@ -738,13 +763,13 @@ class _CudaGraphRunner(torch.nn.Module):
 
             if self.fp8_enabled:
                 self.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe()
-                FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(False)
+                _set_skip_fp8_weight_update_tensor(False)
 
             if self.fp4_enabled:
                 from megatron.core.fp4_utils import get_fp4_recipe  # to avoid circular import
 
                 self.fp4_recipe = get_fp4_recipe(self.base_module.config)
-                FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(False)
+                _set_skip_fp8_weight_update_tensor(False)
 
     def __str__(self):
         return "%s; hid %s" % (
@@ -834,13 +859,12 @@ class _CudaGraphRunner(torch.nn.Module):
 
         is_moe = isinstance(self.base_module, MoETransformerLayer)
         if is_moe:
-            from megatron.core.transformer.moe.moe_utils import get_moe_layer_wise_logging_tracker
+            from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 
-            tracker = get_moe_layer_wise_logging_tracker()
+            moe_metrics_tracker = get_moe_metrics_tracker()
             cached_aux_losses = {}
-            for name in tracker:
-                if "values" in tracker[name]:
-                    cached_aux_losses[name] = torch.clone(tracker[name]["values"])
+            for name, entry in moe_metrics_tracker.metrics.items():
+                cached_aux_losses[name] = entry.values.clone()
 
         self.fwd_graph = torch.cuda.CUDAGraph()
 
@@ -1022,8 +1046,11 @@ class _CudaGraphRunner(torch.nn.Module):
                 buf.copy_(buf_copy)
 
         if is_moe:
-            for name in tracker:
-                tracker[name]["values"].copy_(cached_aux_losses[name])
+            for name, cached_values in cached_aux_losses.items():
+                assert (
+                    name in moe_metrics_tracker.metrics
+                ), "cached metrics must be found in the tracker."
+                moe_metrics_tracker.metrics[name].values.copy_(cached_values)
 
     def create_bwd_graph(self):
         """Create a bwd cudagraph for this runner. Should be called inside
@@ -1730,8 +1757,8 @@ def _layer_is_graphable(layer, config):
     if not isinstance(layer, GraphableMegatronModule):
         return False
 
-    # If cuda_graph_scope is not set, every layer is graphed.
-    if not config.cuda_graph_scope:
+    # If cuda_graph_modules is not set, every layer is graphed.
+    if not config.cuda_graph_modules:
         return True
 
     # import modules here to avoid a circular import
@@ -1741,24 +1768,24 @@ def _layer_is_graphable(layer, config):
     from megatron.core.transformer.moe.moe_layer import MoELayer
     from megatron.core.transformer.transformer_layer import TransformerLayer
 
-    if isinstance(layer, MambaLayer) and CudaGraphScope.mamba in config.cuda_graph_scope:
+    if isinstance(layer, MambaLayer) and CudaGraphModule.mamba in config.cuda_graph_modules:
         # mamba layer.
         return True
     if isinstance(layer, TransformerLayer):
-        if CudaGraphScope.attn in config.cuda_graph_scope and not (
+        if CudaGraphModule.attn in config.cuda_graph_modules and not (
             isinstance(layer.self_attention, IdentityOp)
             and isinstance(layer.cross_attention, IdentityOp)
         ):
             # attn layer.
             return True
         if (
-            CudaGraphScope.moe in config.cuda_graph_scope
-            or CudaGraphScope.moe_router in config.cuda_graph_scope
-            or CudaGraphScope.moe_preprocess in config.cuda_graph_scope
+            CudaGraphModule.moe in config.cuda_graph_modules
+            or CudaGraphModule.moe_router in config.cuda_graph_modules
+            or CudaGraphModule.moe_preprocess in config.cuda_graph_modules
         ) and isinstance(layer.mlp, MoELayer):
             # moe layer.
             return True
-        if CudaGraphScope.mlp in config.cuda_graph_scope and isinstance(layer.mlp, MLP):
+        if CudaGraphModule.mlp in config.cuda_graph_modules and isinstance(layer.mlp, MLP):
             # mlp layer.
             return True
     return False
@@ -1787,11 +1814,6 @@ class TECudaGraphHelper:
             "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
             "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
         )
-        assert CudaGraphScope.full_iteration not in config.cuda_graph_scope, (
-            "full_iteration cuda graph is not supported for cuda_graph_impl=transformer_engine. "
-            "Please use cuda_graph_impl=local instead."
-        )
-
         self.model = model
         self.config = config
         self.seq_length = seq_length
@@ -2012,8 +2034,8 @@ class TECudaGraphHelper:
                 isinstance(layer, TransformerLayer)
                 and not isinstance(layer.self_attention, IdentityOp)
                 and (
-                    not self.config.cuda_graph_scope
-                    or CudaGraphScope.attn in self.config.cuda_graph_scope
+                    not self.config.cuda_graph_modules
+                    or CudaGraphModule.attn in self.config.cuda_graph_modules
                 )
             )
 
@@ -2221,8 +2243,8 @@ class TECudaGraphHelper:
         )
         chunk_id_list = None
         if self.config.overlap_moe_expert_parallel_comm:
-            wgrad_in_graph_scope = CudaGraphScope.attn in self.config.cuda_graph_scope or (
-                CudaGraphScope.moe_router in self.config.cuda_graph_scope
+            wgrad_in_graph_scope = CudaGraphModule.attn in self.config.cuda_graph_modules or (
+                CudaGraphModule.moe_router in self.config.cuda_graph_modules
                 and self.config.moe_shared_expert_intermediate_size is not None
                 and not self.config.moe_shared_expert_overlap
             )
@@ -2577,13 +2599,13 @@ class TECudaGraphHelper:
         Reset the model and optimizer state after capturing CUDA Graphs.
         """
         from megatron.core.distributed.finalize_model_grads import reset_model_temporary_tensors
-        from megatron.core.transformer.moe.moe_utils import clear_aux_losses_tracker
+        from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 
         for model_chunk in self.model:
             model_chunk.zero_grad_buffer()
         for optimizer in self.optimizers:
             optimizer.zero_grad()
-        clear_aux_losses_tracker()
+        get_moe_metrics_tracker().clear()
         reset_model_temporary_tensors(self.config, self.model)
 
     def _finish_capturing(self, start_time):

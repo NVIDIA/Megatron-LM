@@ -53,7 +53,7 @@ def combined_1f1b_schedule_for_no_pipelining(
     Phases 4: 4th microbatch backward
     """
 
-    set_streams()
+    set_streams(high_priority=config.high_priority_a2a_comm_stream)
     fsdp_wrapper = find_megatron_fsdp(model)
 
     if fsdp_wrapper is not None:
@@ -189,7 +189,7 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
                 # backward_step_helper_postprocess()
     """
 
-    set_streams()
+    set_streams(high_priority=config.high_priority_a2a_comm_stream)
 
     # Interleaved pipeline with FSDP(optim_grads_params) is not yet supported:
     # _replace_param_with_raw_if_needed() and root pre/post_backward() are not

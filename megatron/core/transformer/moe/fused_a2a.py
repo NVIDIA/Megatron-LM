@@ -3,7 +3,6 @@
 # Copyright (c) 2025 DeepSeek
 # Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
 
-import os
 from typing import Optional
 
 from megatron.core.utils import internal_api
@@ -269,7 +268,6 @@ else:
 
 
 try:
-    import hybrid_ep_cpp
     from deep_ep import HybridEPBuffer
 
     HAVE_HYBRIDEP = True
@@ -277,62 +275,6 @@ except ImportError:
     HAVE_HYBRIDEP = False
 
 _hybrid_ep_buffer = None
-_HYBRID_EP_TOKEN_ALIGNMENT = 16
-_HYBRID_EP_MIN_BUFFER_TOKENS = 512
-_HYBRID_EP_IB_QP_MAX_DEPTH = 65535
-_HYBRID_EP_IB_DISPATCH_DEPTH_PER_TOKEN = 3
-
-
-def _round_up_to_multiple(value: int, multiple: int) -> int:
-    return ((value + multiple - 1) // multiple) * multiple
-
-
-def _hybrid_ep_num_nodes(group: torch.distributed.ProcessGroup) -> int:
-    """Mirror HybridEP's NVLink-domain detection without constructing the full buffer."""
-    ranks_per_nvlink_domain_env = os.getenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN")
-    if ranks_per_nvlink_domain_env is not None:
-        ranks_per_nvlink_domain = int(ranks_per_nvlink_domain_env)
-    else:
-        allocator = hybrid_ep_cpp.ExtendedMemoryAllocator()
-        ranks_per_nvlink_domain = allocator.detect_accessible_ranks(group)
-
-    assert group.size() % ranks_per_nvlink_domain == 0, (
-        f"The number of ranks {group.size()} should be divisible by the number of ranks per "
-        f"NVLink domain {ranks_per_nvlink_domain}."
-    )
-    return group.size() // ranks_per_nvlink_domain
-
-
-def _hybrid_ep_uses_internode_rdma(group: torch.distributed.ProcessGroup) -> bool:
-    if _hybrid_ep_buffer is not None and hasattr(_hybrid_ep_buffer, "num_of_nodes"):
-        return _hybrid_ep_buffer.num_of_nodes > 1
-    return _hybrid_ep_num_nodes(group) > 1
-
-
-def _validate_hybrid_ep_ib_tx_depth(num_tokens: int, group: torch.distributed.ProcessGroup) -> None:
-    buffer_tokens = max(
-        _round_up_to_multiple(num_tokens, _HYBRID_EP_TOKEN_ALIGNMENT), _HYBRID_EP_MIN_BUFFER_TOKENS
-    )
-    tx_depth = _HYBRID_EP_IB_DISPATCH_DEPTH_PER_TOKEN * buffer_tokens + 1
-    if tx_depth <= _HYBRID_EP_IB_QP_MAX_DEPTH:
-        return
-
-    if not _hybrid_ep_uses_internode_rdma(group):
-        return
-
-    max_supported_tokens = (
-        ((_HYBRID_EP_IB_QP_MAX_DEPTH - 1) // _HYBRID_EP_IB_DISPATCH_DEPTH_PER_TOKEN)
-        // _HYBRID_EP_TOKEN_ALIGNMENT
-        * _HYBRID_EP_TOKEN_ALIGNMENT
-    )
-    raise ValueError(
-        f"HybridEP InfiniBand dispatch queue pair depth ({tx_depth}) exceeds the hardware "
-        f"limit of {_HYBRID_EP_IB_QP_MAX_DEPTH}. DeepEP computes this depth from the "
-        f"tokens per rank rounded up to a {_HYBRID_EP_TOKEN_ALIGNMENT}-token buffer "
-        f"alignment ({buffer_tokens}). Reduce sequence length or micro-batch size, or "
-        f"increase Tensor Parallelism (TP) / Context Parallelism (CP), so tokens per rank "
-        f"are at most {max_supported_tokens} for multi-node HybridEP."
-    )
 
 
 def init_hybrid_ep_buffer(
@@ -345,6 +287,7 @@ def init_hybrid_ep_buffer(
     num_blocks_permute: Optional[int] = None,
     num_blocks_unpermute: Optional[int] = None,
     fp8_dispatch: bool = False,
+    num_sms_preprocessing_api: Optional[int] = None,
 ) -> None:
     '''
     Initialize the HybridEP buffer, including buffer allocation and metadata
@@ -373,6 +316,8 @@ def init_hybrid_ep_buffer(
             Number of blocks used by the unpermute part.
         fp8_dispatch (bool):
             Whether to use FP8 communication during the dispatch phase.
+        num_sms_preprocessing_api (Optional[int]):
+            Number of SMs used by the preprocessing (metadata scan) kernel.
     '''
     assert not fp8_dispatch, "HybridEP dispatcher does not support fp8 dispatch now"
     global _hybrid_ep_buffer
@@ -385,6 +330,8 @@ def init_hybrid_ep_buffer(
         kwargs['num_blocks_permute'] = num_blocks_permute
     if num_blocks_unpermute is not None:
         kwargs['num_blocks_unpermute'] = num_blocks_unpermute
+    if num_sms_preprocessing_api is not None:
+        kwargs['num_sms_preprocessing_api'] = num_sms_preprocessing_api
     _hybrid_ep_buffer = HybridEPBuffer(
         group=group,
         hidden_dim=hidden_dim,
@@ -423,6 +370,7 @@ class HybridEPDispatch(torch.autograd.Function):
         fused=False,
         num_permuted_tokens=None,
         pad_multiple=None,
+        num_sms_preprocessing_api=108,
     ):
         '''
         Forward pass of fused dispatch of the HybridEP backend
@@ -444,9 +392,8 @@ class HybridEPDispatch(torch.autograd.Function):
                 num_blocks_permute = None
                 num_blocks_unpermute = None
 
-        num_tokens, hidden_dim = x.shape[-2:]
-        _validate_hybrid_ep_ib_tx_depth(num_tokens, group)
         if _hybrid_ep_buffer is None:
+            num_tokens, hidden_dim = x.shape[-2:]
             fp8_dispatch = False  # Currently, we do not support fp8 dispatch
             init_hybrid_ep_buffer(
                 group,
@@ -458,6 +405,7 @@ class HybridEPDispatch(torch.autograd.Function):
                 num_blocks_permute,
                 num_blocks_unpermute,
                 fp8_dispatch,
+                num_sms_preprocessing_api,
             )
         # If we provide the num_permuted_tokens, we do not need to use sync to
         # wait for the data in pinned memory ready
@@ -509,6 +457,7 @@ class HybridEPDispatch(torch.autograd.Function):
             combined_hidden,
             None,
             combined_probs,
+            None,
             None,
             None,
             None,
@@ -577,6 +526,7 @@ if HAVE_HYBRIDEP:
         fused=False,
         num_permuted_tokens=None,
         pad_multiple=None,
+        num_sms_preprocessing_api=108,
     ):
         '''
         Perform fused dispatch for "permute + dispatch a2a + permute" using the
@@ -608,6 +558,8 @@ if HAVE_HYBRIDEP:
             pad_multiple (int):
                 Alignment multiple required for FP8 GEMM. If not provided, no padding
                 is performed.
+            num_sms_preprocessing_api (int):
+                Number of SMs used by the preprocessing (metadata scan) kernel.
         '''
         return HybridEPDispatch.apply(
             x,
@@ -622,6 +574,7 @@ if HAVE_HYBRIDEP:
             fused,
             num_permuted_tokens,
             pad_multiple,
+            num_sms_preprocessing_api,
         )
 
     @internal_api
