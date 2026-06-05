@@ -1,18 +1,11 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import os
-from operator import itemgetter
-from typing import Any, Optional, Tuple, Union
+from dataclasses import dataclass
+from typing import Any, Optional, Union
 
 import numpy as np
 import torch.distributed as dist
-
-try:
-    import einops
-
-    HAVE_EINOPS = True
-except ImportError:
-    HAVE_EINOPS = False
 
 try:
     from absl import logging
@@ -40,90 +33,17 @@ def _is_process_group_member(pg: Optional[dist.ProcessGroup]) -> bool:
     return pg is not None and pg is not non_member
 
 
-class GridLayout:
-    r"""An additional named factorization of a :class:`HyperCommGrid`'s ranks.
+_BASE_VIEW_NAME = "base"
 
-    Lets one rank span carry a second factorization (e.g. an expert
-    ``[expt_tp, ep, expt_dp, pp]`` alongside the dense base ``[tp, cp, dp, pp]``). Obtained from
-    :meth:`HyperCommGrid.register_layout`, retrieved with :meth:`HyperCommGrid.get_layout`; its
-    groups are reached only through this handle (the grid's own methods use the base layout). Dims
-    in ``shared_dims`` (e.g. ``pp``, which must match between dense and expert) reuse the base
-    grid's group rather than creating a duplicate.
-    """
 
-    def __init__(
-        self,
-        grid: "HyperCommGrid",
-        name: str,
-        shape: list[int],
-        dim_names: list[str],
-        shared_dims: list[str],
-    ) -> None:
-        # [:] insures a copy.
-        self._grid = grid
-        self.name = name
-        self.shape = shape[:]
-        self.dim_names = dim_names[:]
-        self.shared_dims = shared_dims[:]
+@dataclass
+class _RankViewSpec:
+    """A named rank factorization over the same rank span as the base grid."""
 
-    def _is_shared(self, ordered_dims: list[str]) -> bool:
-        """Whether ``ordered_dims`` spans only shared dims (so the group reuses the base grid's)."""
-        return all(d in self.shared_dims for d in ordered_dims)
-
-    def create_pg(self, dims: Union[str, list[str]], **kwargs: Any) -> dist.ProcessGroup | None:
-        """Create this layout's process group for ``dims`` (collective -- call on all ranks).
-
-        A group spanning only shared dims reuses the base grid's group; otherwise it is
-        layout-private. Not idempotent (re-creating raises ``KeyError``); retrieve with
-        :meth:`get_pg`. ``kwargs`` forward to ``dist.new_subgroups_by_enumeration``.
-        """
-        ordered_dims, _ = self._grid._order_dims_for(self.dim_names, dims)
-        if self._is_shared(ordered_dims):
-            # Shared dims must resolve to the *same* group as the base layout. Delegate to the
-            # base grid so the object is shared rather than duplicated.
-            return self._grid.create_pg(dims, **kwargs)
-
-        key = (self.name, tuple(ordered_dims))
-        if key in self._grid._pgs:
-            raise KeyError(
-                f"Process group {dims} for layout {self.name!r} has already been created. Because "
-                f"there is no way to check whether options to create process group matches the "
-                f"first, we error out instead of returning the process group that has already "
-                f"been created before."
-            )
-
-        rank_enum = self._grid._gen_rank_enum_for(self.shape, self.dim_names, ordered_dims)
-        pg, _ = dist.new_subgroups_by_enumeration(rank_enum, backend=self._grid.backend, **kwargs)
-
-        if dist.is_initialized() and dist.get_rank() == 0:
-            logging.info(
-                f"Generated process group for layout {self.name!r} {ordered_dims} with "
-                f"enumeration {rank_enum}"
-            )
-        self._grid._pgs[key] = pg
-        return pg
-
-    def get_pg(self, dims: Union[str, list[str]]) -> dist.ProcessGroup:
-        """Get this layout's previously-created group for ``dims`` (shared dims return the base group).
-
-        Raises ``KeyError`` if it has not been created yet.
-        """
-        ordered_dims, _ = self._grid._order_dims_for(self.dim_names, dims)
-        if self._is_shared(ordered_dims):
-            return self._grid.get_pg(dims)
-
-        key = (self.name, tuple(ordered_dims))
-        if key not in self._grid._pgs:
-            raise KeyError(
-                f"Process group {dims} for layout {self.name!r} hasn't been created. Call "
-                f"create_pg first."
-            )
-        return self._grid._pgs[key]
-
-    def get_rank_enum(self, dims: Union[str, list[str]]) -> list[list[int]]:
-        """Rank enumeration for ``dims`` under this layout (matches the base grid's for shared dims)."""
-        ordered_dims, _ = self._grid._order_dims_for(self.dim_names, dims)
-        return self._grid._gen_rank_enum_for(self.shape, self.dim_names, ordered_dims)
+    name: str
+    shape: list[int]
+    dim_names: list[str]
+    shared_dims: list[str]
 
 
 class HyperCommGrid:
@@ -137,12 +57,12 @@ class HyperCommGrid:
     For any combination of dimensions, a process group can only be created once.
     Creating process groups for the same combination with different options is not supported.
 
-    The grid's own :meth:`create_pg` / :meth:`get_pg` / :meth:`get_rank_enum` always operate on
-    the base factorization passed to the constructor. A rank span that admits more than one
+    The grid's own :meth:`create_pg` / :meth:`get_pg` / :meth:`get_rank_enum` operate on the base
+    factorization passed to the constructor by default. A rank span that admits more than one
     factorization (for example dense ``tp/cp/dp/pp`` groups alongside expert
-    ``expt_tp/ep/expt_dp/pp`` groups over the same ranks) can register an additional layout with
-    :meth:`register_layout`, which returns a :class:`GridLayout` handle. Layout-specific groups
-    are reached only through that handle; the base methods do not infer or route across layouts.
+    ``expt_tp/ep/expt_dp/pp`` groups over the same ranks) can register an additional rank view
+    with :meth:`register_view`. View-specific groups are still created and retrieved through this
+    root grid by passing ``view="..."``; process-group lifecycle is owned in exactly one place.
 
     Note:
         ``create_pg()`` over specific dims must be explicitly called to create a process group.
@@ -205,7 +125,7 @@ class HyperCommGrid:
                 "initialize torch.distributed before creating HyperCommGrid."
             )
         self.rank_offset = rank_offset
-        self.size = np.prod(shape)
+        self.size = int(np.prod(shape))
         if rank_offset < 0:
             raise ValueError(f"rank_offset must be non-negative, got {rank_offset}")
         if self.size > world_size - rank_offset:
@@ -218,59 +138,38 @@ class HyperCommGrid:
         self.shape = shape[:]
         self.dim_names = dim_names[:]
         self.backend = backend
-        # Base-layout groups are keyed by their dash-joined dim string (unchanged from the
-        # single-layout design); layout-private groups are keyed by ``(layout_name, dims_tuple)``.
-        self._pgs: dict[Union[str, Tuple[str, Tuple[str, ...]]], dist.ProcessGroup] = {}
-        self._layouts: dict[str, GridLayout] = {}
+        self._views: dict[str, _RankViewSpec] = {
+            _BASE_VIEW_NAME: _RankViewSpec(
+                _BASE_VIEW_NAME, self.shape[:], self.dim_names[:], shared_dims=[]
+            )
+        }
+        # Base-view groups are keyed by their dash-joined dim string (unchanged from the
+        # single-view design); view-private groups are keyed by ``(view_name, dims_tuple)``.
+        self._pgs: dict[Union[str, tuple[str, tuple[str, ...]]], dist.ProcessGroup] = {}
 
-    def register_layout(
+    def register_view(
         self,
         name: str,
         shape: list[int],
         dim_names: list[str],
         shared_dims: Optional[list[str]] = None,
-    ) -> GridLayout:
-        r"""Register an additional factorization over this grid's rank span.
+    ) -> None:
+        r"""Register an additional rank factorization over this grid's rank span.
 
-        Returns a :class:`GridLayout` handle through which the layout's process groups are
-        created and retrieved. The base layout (the constructor's ``shape``/``dim_names``) is
-        unaffected.
-
-        ``shared_dims`` names dims that are common to the base layout and must map to the *same*
-        process group across both. For example MCore requires the dense and expert pipeline
-        groups to be identical ranks, so ``"pp"`` is declared shared and a request for the
-        ``"pp"`` group through the handle reuses the base grid's group. Every shared dim must
-        exist in the base ``dim_names`` and must enumerate to the same ranks under both layouts,
-        otherwise registration raises.
-
-        Args:
-            name: Unique name for the layout.
-            shape: Shape of the layout. Its product must equal the grid size.
-            dim_names: Name of each dimension corresponding to ``shape``. Must have the same
-                length as ``shape``.
-            shared_dims: Dims shared with (and reused from) the base layout. Default ``None``
-                (no shared dims).
-
-        Returns:
-            GridLayout: A handle for creating/retrieving this layout's process groups.
-
-        Raises:
-            ValueError: If ``name`` is already registered, if ``shape`` and ``dim_names`` lengths
-                differ, if ``dim_names`` are not unique, if any ``shape`` entry is not a positive
-                int, if the layout size does not match the grid size, or if a shared dim is
-                missing from the base layout or enumerates to different ranks across layouts.
+        Shared dims must exist in both the base view and the new view, and must enumerate to the
+        same rank groups as the base view.
         """
-        if name in self._layouts:
-            raise ValueError(f"Layout {name!r} is already registered")
+        if name in self._views:
+            raise ValueError(f"View {name!r} is already registered")
         if len(shape) != len(dim_names):
             raise ValueError(f"len(shape) {shape} != len(dim_names) {dim_names}")
         if len(set(dim_names)) != len(dim_names):
-            raise ValueError(f"Layout {name!r} has duplicate dim_names: {dim_names}")
+            raise ValueError(f"View {name!r} has duplicate dim_names: {dim_names}")
         if any(not isinstance(s, int) or s <= 0 for s in shape):
-            raise ValueError(f"Layout {name!r} shape must be positive ints, got {shape}")
-        if np.prod(shape) != self.size:
+            raise ValueError(f"View {name!r} shape must be positive ints, got {shape}")
+        if int(np.prod(shape)) != self.size:
             raise ValueError(
-                f"Layout {name!r} shape {shape} has size {int(np.prod(shape))}, but the grid "
+                f"View {name!r} shape {shape} has size {int(np.prod(shape))}, but the grid "
                 f"size is {self.size}"
             )
 
@@ -278,45 +177,40 @@ class HyperCommGrid:
         for dim in shared_dims:
             if dim not in self.dim_names:
                 raise ValueError(
-                    f"Shared dim {dim!r} of layout {name!r} is not in the base layout "
+                    f"Shared dim {dim!r} of view {name!r} is not in the base view "
                     f"{self.dim_names}"
                 )
             if dim not in dim_names:
                 raise ValueError(
-                    f"Shared dim {dim!r} of layout {name!r} is not in the layout's dim_names "
+                    f"Shared dim {dim!r} of view {name!r} is not in the view's dim_names "
                     f"{dim_names}"
                 )
             base_dims, _ = self._order_dims_for(self.dim_names, dim)
             base_enum = self._gen_rank_enum_for(self.shape, self.dim_names, base_dims)
-            layout_dims, _ = self._order_dims_for(dim_names, dim)
-            layout_enum = self._gen_rank_enum_for(shape, dim_names, layout_dims)
-            if base_enum != layout_enum:
+            view_dims, _ = self._order_dims_for(dim_names, dim)
+            view_enum = self._gen_rank_enum_for(shape, dim_names, view_dims)
+            if base_enum != view_enum:
                 raise ValueError(
-                    f"Shared dim {dim!r} has different membership across layouts: base "
-                    f"enumeration {base_enum} != layout {name!r} enumeration {layout_enum}"
+                    f"Shared dim {dim!r} has different membership across views: base "
+                    f"enumeration {base_enum} != view {name!r} enumeration {view_enum}"
                 )
 
-        layout = GridLayout(self, name, shape, dim_names, shared_dims)
-        self._layouts[name] = layout
-        return layout
+        if len(shared_dims) > 1:
+            base_dims, _ = self._order_dims_for(self.dim_names, shared_dims)
+            base_enum = self._gen_rank_enum_for(self.shape, self.dim_names, base_dims)
+            view_dims, _ = self._order_dims_for(dim_names, shared_dims)
+            view_enum = self._gen_rank_enum_for(shape, dim_names, view_dims)
+            if base_enum != view_enum:
+                raise ValueError(
+                    f"Shared dims {shared_dims!r} have different membership across views: base "
+                    f"enumeration {base_enum} != view {name!r} enumeration {view_enum}"
+                )
 
-    def get_layout(self, name: str) -> GridLayout:
-        r"""Return the registered :class:`GridLayout` for ``name``.
+        self._views[name] = _RankViewSpec(name, shape[:], dim_names[:], shared_dims[:])
 
-        Args:
-            name: Name a layout was registered under via :meth:`register_layout`.
-
-        Raises:
-            KeyError: If no layout with that name is registered.
-        """
-        if name not in self._layouts:
-            raise KeyError(
-                f"Layout {name!r} is not registered. Registered layouts: "
-                f"{sorted(self._layouts)}"
-            )
-        return self._layouts[name]
-
-    def create_pg(self, dims: Union[str, list[str]], **kwargs: Any) -> dist.ProcessGroup | None:
+    def create_pg(
+        self, dims: Union[str, list[str]], view: Optional[str] = None, **kwargs: Any
+    ) -> dist.ProcessGroup | None:
         r"""Create a process group based on a list of dimension names
 
         Note: The unique key used to store the process group internally will follow the reversed
@@ -326,6 +220,7 @@ class HyperCommGrid:
 
         Args:
             dims: Name of leading dimensions to create process group
+            view: Optional registered rank view name. Defaults to the base view.
 
         Keyword arguments are directly passed into new_subgroups_by_enumeration(). The docstring
         is copied from new_subgroups_by_enumeration().
@@ -344,31 +239,48 @@ class HyperCommGrid:
         Raises:
             KeyError: If attempting to recreate a process group with an existing key.
         """
-        # ordered_dims and unique_group_key will follow the reversed order of self.dim_names
-        ordered_dims, unique_group_key = self._order_dims(dims)
+        view_spec = self._resolve_view(view)
+        ordered_dims, _ = self._order_dims_for_view(view_spec, dims)
+        unique_group_key, enum_view, enum_dims = self._canonical_pg_key_and_enum_view(
+            view_spec, ordered_dims
+        )
 
         if unique_group_key in self._pgs:
+            if self._is_base_pg_key(unique_group_key):
+                raise KeyError(
+                    f"Process group {dims} has already been created. Because there is no way "
+                    f"to check whether options to create process group matches the first, we "
+                    f"error out instead of returning the process group that has already been "
+                    f"created before."
+                )
             raise KeyError(
-                f"Process group {dims} has already been created. Because there is no way to check "
-                f"whether options to create process group matches the first, we error out instead "
-                f"of returning the process group that has already been created before."
+                f"Process group {dims} for view {view_spec.name!r} has already been created. "
+                f"Because there is no way to check whether options to create process group "
+                f"matches the first, we error out instead of returning the process group that "
+                f"has already been created before."
             )
 
-        rank_enum = self._gen_rank_enum(ordered_dims)
+        rank_enum = self._gen_rank_enum_for(enum_view.shape, enum_view.dim_names, enum_dims)
         pg, _ = dist.new_subgroups_by_enumeration(rank_enum, backend=self.backend, **kwargs)
 
         if dist.is_initialized() and dist.get_rank() == 0:
-            logging.info(
-                f"Generated process group for {unique_group_key} with enumeration {rank_enum}"
-            )
+            if view_spec.name == _BASE_VIEW_NAME:
+                logging.info(
+                    f"Generated process group for {unique_group_key} with enumeration {rank_enum}"
+                )
+            else:
+                logging.info(
+                    f"Generated process group for view {view_spec.name!r} {ordered_dims} with "
+                    f"enumeration {rank_enum}"
+                )
         self._pgs[unique_group_key] = pg
         return pg
 
     def destroy(self) -> None:
         """Destroy all process groups created by this grid that the current rank belongs to.
 
-        This includes base-layout groups and layout-private groups. A base group reused by a
-        layout for a shared dim is stored under a single key, so it is torn down exactly once.
+        This includes base-view groups and view-private groups. A base group reused by a
+        view for a shared dim is stored under a single key, so it is torn down exactly once.
         """
         destroyed: set[int] = set()
         for pg in self._pgs.values():
@@ -377,22 +289,33 @@ class HyperCommGrid:
                 destroyed.add(id(pg))
         self._pgs.clear()
 
-    def get_pg(self, dims: Union[str, list[str]]) -> dist.ProcessGroup:
+    def get_pg(self, dims: Union[str, list[str]], view: Optional[str] = None) -> dist.ProcessGroup:
         r"""Get a process group based on a list of dimension names
 
         Args:
             dims: Name of leading dimensions to create process group
+            view: Optional registered rank view name. Defaults to the base view.
         """
-        _, unique_group_key = self._order_dims(dims)
+        view_spec = self._resolve_view(view)
+        ordered_dims, _ = self._order_dims_for_view(view_spec, dims)
+        unique_group_key, _, _ = self._canonical_pg_key_and_enum_view(view_spec, ordered_dims)
 
         if unique_group_key not in self._pgs:
+            if self._is_base_pg_key(unique_group_key):
+                raise KeyError(
+                    f"Process group for {unique_group_key} hasn't been created. Call create_pg "
+                    f"first."
+                )
             raise KeyError(
-                f"Process group for {unique_group_key} hasn't been created. Call create_pg first."
+                f"Process group {dims} for view {view_spec.name!r} hasn't been created. Call "
+                f"create_pg first."
             )
 
         return self._pgs[unique_group_key]
 
-    def get_rank_enum(self, dims: Union[str, list[str]]) -> list[list[int]]:
+    def get_rank_enum(
+        self, dims: Union[str, list[str]], view: Optional[str] = None
+    ) -> list[list[int]]:
         r"""Get the rank enumeration for the requested dimension(s).
 
         This is the exact enumeration that would be used by create_pg for the same
@@ -401,12 +324,14 @@ class HyperCommGrid:
 
         Args:
             dims: Dimension name or list of dimension names.
+            view: Optional registered rank view name. Defaults to the base view.
 
         Returns:
             List of rank lists (one per subgroup).
         """
-        ordered_dims, _ = self._order_dims(dims)
-        return self._gen_rank_enum(ordered_dims)
+        view_spec = self._resolve_view(view)
+        ordered_dims, _ = self._order_dims_for_view(view_spec, dims)
+        return self._gen_rank_enum_for(view_spec.shape, view_spec.dim_names, ordered_dims)
 
     def _gen_rank_enum(self, dims: list[str]) -> list[list[int]]:
         r"""Generate rank enumeration before calling new_subgroups_by_enumeration
@@ -434,62 +359,87 @@ class HyperCommGrid:
     def _gen_rank_enum_for(
         self, shape: list[int], dim_names: list[str], dims: list[str]
     ) -> list[list[int]]:
-        r"""Generate rank enumeration for ``dims`` under an explicit ``shape``/``dim_names``.
-
-        Identical logic to :meth:`_gen_rank_enum` but parameterized by the factorization, so it
-        can serve both the base grid and a registered :class:`GridLayout` without any layout
-        inference. ``dims`` is assumed already ordered against the reversed ``dim_names``.
-        """
-        if not HAVE_EINOPS:
-            raise RuntimeError(
-                "einops is not installed. Please install it with `pip install einops`."
-            )
-
-        # Need to reverse order of dim_names to match MCore convention
+        r"""Generate rank enumeration for ``dims`` under an explicit ``shape``/``dim_names``."""
+        # Need to reverse order of dim_names to match MCore convention.
         dim_names_reverse = dim_names[::-1]
-
-        remaining_dims = []
-        for v in dim_names_reverse:
-            if v not in dims:
-                remaining_dims.append(v)
-
-        rearrange_str = (
-            f"({' '.join(dim_names_reverse)}) -> ({' '.join(remaining_dims)}) ({' '.join(dims)})"
-        )
-        logging.debug(rearrange_str)
-
         shape_dict = {d: s for d, s in zip(dim_names, shape)}
-        return einops.rearrange(
-            np.arange(self.rank_offset, self.rank_offset + self.size), rearrange_str, **shape_dict
-        ).tolist()
+        rank_tensor = np.arange(self.rank_offset, self.rank_offset + self.size).reshape(
+            [shape_dict[d] for d in dim_names_reverse]
+        )
 
-    def _order_dims(self, dims: Union[str, list[str]]) -> Tuple[list[str], str]:
+        source_axes = [dim_names_reverse.index(d) for d in dims]
+        target_axes = list(range(len(dim_names_reverse) - len(dims), len(dim_names_reverse)))
+        logging.debug(
+            "Moving axes %s to %s for dim_names=%s dims=%s",
+            source_axes,
+            target_axes,
+            dim_names,
+            dims,
+        )
+        rank_tensor = np.moveaxis(rank_tensor, source_axes, target_axes)
+
+        group_size = int(np.prod([shape_dict[d] for d in dims]))
+        return rank_tensor.reshape(-1, group_size).tolist()
+
+    def _order_dims(self, dims: Union[str, list[str]]) -> tuple[list[str], str]:
         r"""Reorder dims based on the order of self.dim_names"""
-        ordered_dims, _ = self._order_dims_for(self.dim_names, dims)
+        ordered_dims, _ = self._order_dims_for_view(self._views[_BASE_VIEW_NAME], dims)
         unique_group_key = "-".join(ordered_dims)
         return ordered_dims, unique_group_key
 
     def _order_dims_for(
         self, dim_names: list[str], dims: Union[str, list[str]]
-    ) -> Tuple[list[str], str]:
-        r"""Reorder ``dims`` against an explicit ``dim_names``.
-
-        Identical ordering logic to :meth:`_order_dims` but parameterized by the factorization's
-        ``dim_names``, so it serves both the base grid and a registered :class:`GridLayout`. The
-        returned dash-joined key is informational; callers build their own storage key.
-        """
+    ) -> tuple[list[str], str]:
+        r"""Reorder ``dims`` against an explicit ``dim_names``."""
         if not isinstance(dims, list):
             ordered_dims = [dims]
         else:
             dim_names_reverse = dim_names[::-1]
             indices = sorted([dim_names_reverse.index(d) for d in dims])
-            if len(indices) == 1:
-                ordered_dims = [dim_names_reverse[indices[0]]]
-            else:
-                ordered_dims = list(itemgetter(*indices)(dim_names_reverse))
+            ordered_dims = [dim_names_reverse[i] for i in indices]
 
         unique_group_key = "-".join(ordered_dims)
         return ordered_dims, unique_group_key
+
+    def _resolve_view(self, view: Optional[str]) -> _RankViewSpec:
+        r"""Return the requested rank view, defaulting to the base view."""
+        view_name = _BASE_VIEW_NAME if view is None else view
+        if view_name not in self._views:
+            raise KeyError(
+                f"View {view_name!r} is not registered. Registered views: {sorted(self._views)}"
+            )
+        return self._views[view_name]
+
+    def _order_dims_for_view(
+        self, view: _RankViewSpec, dims: Union[str, list[str]]
+    ) -> tuple[list[str], str]:
+        r"""Reorder ``dims`` against a registered view and report missing dims clearly."""
+        requested_dims = [dims] if not isinstance(dims, list) else dims
+        missing_dims = [d for d in requested_dims if d not in view.dim_names]
+        if missing_dims:
+            raise ValueError(
+                f"{missing_dims[0]!r} is not in view {view.name!r} with dim_names "
+                f"{view.dim_names}"
+            )
+        return self._order_dims_for(view.dim_names, dims)
+
+    def _canonical_pg_key_and_enum_view(
+        self, view: _RankViewSpec, ordered_dims: list[str]
+    ) -> tuple[Union[str, tuple[str, tuple[str, ...]]], _RankViewSpec, list[str]]:
+        r"""Return the storage key and rank view used to enumerate a process group."""
+        if view.name == _BASE_VIEW_NAME:
+            return "-".join(ordered_dims), view, ordered_dims
+
+        if all(d in view.shared_dims for d in ordered_dims):
+            base_view = self._views[_BASE_VIEW_NAME]
+            base_ordered_dims, base_key = self._order_dims_for_view(base_view, ordered_dims)
+            return base_key, base_view, base_ordered_dims
+
+        return (view.name, tuple(ordered_dims)), view, ordered_dims
+
+    def _is_base_pg_key(self, key: Union[str, tuple[str, tuple[str, ...]]]) -> bool:
+        r"""Whether a process-group key belongs to the base view namespace."""
+        return isinstance(key, str)
 
     def is_current_rank_in_grid(self) -> bool:
         """Check if the current rank belongs to this grid.
