@@ -142,7 +142,7 @@ def set_global_variables(args, build_tokenizer=True):
     _set_timers(args)
     _set_energy_monitor(args)
 
-    if args.enable_experimental:
+    if args.enable_megatron_core_experimental:
         set_experimental_flag(True)
 
     if args.exit_signal_handler:
