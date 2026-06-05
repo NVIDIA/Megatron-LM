@@ -16,7 +16,9 @@ from megatron.core.inference.async_txn import (
     AsyncDecodeSlot,
     AsyncDecodeSlotRing,
     AsyncTxnDiagnostics,
+    AsyncTxnSkipReason,
     RequestRNGStore,
+    StepTxn,
     classify_decode_child_launch,
 )
 from megatron.core.inference.batch_dimensions_utils import (
@@ -1461,6 +1463,113 @@ class DynamicInferenceContext(BaseInferenceContext):
             if slot.slot_id == self.active_decode_slot_id:
                 return slot
         raise RuntimeError(f"active decode slot {self.active_decode_slot_id} is not in the ring")
+
+    def prepare_child_from_committed_decode_state(self) -> Optional[StepTxn]:
+        """Prestage deterministic plain-decode child metadata into the free slot.
+
+        This covers the ordinary non-hybrid, no-boundary decode case. Later
+        commits extend the same slot ownership to boundary reservations and
+        Mamba metadata; until then those cases are explicit sync gates.
+        """
+
+        if not self.async_scheduling or self.async_decode_slot_ring is None:
+            return None
+
+        eligibility = self.async_launch_eligibility()
+        if not eligibility.eligible:
+            self.async_txn_diagnostics.record_barrier_skip(eligibility.reason)
+            return None
+        if self.is_hybrid_model:
+            self.async_txn_diagnostics.record_barrier_skip(
+                AsyncTxnSkipReason.HYBRID_PRESTAGE_DEFERRED
+            )
+            return None
+        if eligibility.required_boundary_blocks:
+            self.async_txn_diagnostics.record_barrier_skip(
+                AsyncTxnSkipReason.BOUNDARY_PRESTAGE_DEFERRED
+            )
+            return None
+
+        child_slot = self.async_decode_slot_ring.child
+        if not child_slot.can_reuse():
+            self.async_txn_diagnostics.record_barrier_skip(AsyncTxnSkipReason.CHILD_SLOT_BUSY)
+            return None
+
+        active_request_count = self.total_request_count - self.paused_request_count
+        if active_request_count <= 0 or self.active_token_count != active_request_count:
+            self.async_txn_diagnostics.record_barrier_skip(AsyncTxnSkipReason.NOT_DECODE_ONLY)
+            return None
+
+        child_cpu_buf = self._cpu_bookkeeping_buf.clone()
+        self._patch_plain_decode_child_bookkeeping(child_cpu_buf, active_request_count)
+        h2d_done_event = child_slot.copy_bookkeeping_from_cpu(child_cpu_buf, non_blocking=True)
+        request_ids = self.request_ids[
+            self.paused_request_count : self.total_request_count
+        ].tolist()
+        self.async_txn_diagnostics.record_prepared(under_forward=True)
+        return StepTxn(
+            step_id=self.step_count + 1,
+            request_ids=request_ids,
+            slot_id=child_slot.slot_id,
+            h2d_done_event=h2d_done_event,
+            cuda_graph_key=child_slot.cuda_graph_key(
+                ("decode", self.padded_active_request_count, self.padded_active_token_count)
+            ),
+        )
+
+    def _patch_plain_decode_child_bookkeeping(
+        self, child_cpu_buf: Tensor, active_request_count: int
+    ) -> None:
+        """Patch a CPU bookkeeping clone from current decode to child decode."""
+
+        token_count = active_request_count
+        child_token_to_pos_ids = self._cpu_bookkeeping_clone_view(
+            self.token_to_pos_ids, child_cpu_buf
+        )
+        child_token_to_position = self._cpu_bookkeeping_clone_view(
+            self.token_to_position_in_request, child_cpu_buf
+        )
+        child_token_to_local = self._cpu_bookkeeping_clone_view(
+            self.token_to_local_position_within_kv_block, child_cpu_buf
+        )
+        child_staging_kv_offsets = self._cpu_bookkeeping_clone_view(
+            self._staging_request_kv_length_offsets, child_cpu_buf
+        )
+        child_mha_kv_lengths = self._cpu_bookkeeping_clone_view(
+            self._cpu_mha_kv_seq_lengths, child_cpu_buf
+        )
+        child_mha_cu_kv_lengths = self._cpu_bookkeeping_clone_view(
+            self._cpu_mha_cu_kv_seq_lengths, child_cpu_buf
+        )
+
+        child_token_to_pos_ids[:token_count].add_(1)
+        child_token_to_position[:token_count].add_(1)
+        child_token_to_local[:token_count].add_(1)
+        child_staging_kv_offsets[:active_request_count].add_(1)
+
+        real_bs = self.batch_dimensions.req_count
+        padded_bs = self.padded_batch_dimensions.req_count
+        child_mha_kv_lengths[:real_bs].add_(1)
+        child_mha_cu_kv_lengths[0] = 0
+        if real_bs > 0:
+            child_mha_cu_kv_lengths[1 : real_bs + 1] = torch.cumsum(
+                child_mha_kv_lengths[:real_bs], dim=0
+            )
+        if real_bs < padded_bs:
+            child_mha_cu_kv_lengths[real_bs + 1 : padded_bs + 1] = child_mha_cu_kv_lengths[
+                real_bs
+            ]
+
+    def _cpu_bookkeeping_clone_view(self, source: Tensor, child_cpu_buf: Tensor) -> Tensor:
+        """Return the matching typed view inside a cloned CPU bookkeeping buffer."""
+
+        byte_offset = source.data_ptr() - self._cpu_bookkeeping_buf.data_ptr()
+        byte_count = source.numel() * source.element_size()
+        if byte_offset < 0 or byte_offset + byte_count > child_cpu_buf.numel():
+            raise RuntimeError("source tensor is not backed by the CPU bookkeeping buffer")
+        return child_cpu_buf[byte_offset : byte_offset + byte_count].view(source.dtype).view(
+            source.shape
+        )
 
     def has_unfinished_requests(self) -> bool:
         """Test if any requests remain."""

@@ -77,6 +77,7 @@ class TestDynamicContext:
         num_speculative_tokens=0,
         enable_chunked_prefill: bool = False,
         max_requests: int = None,
+        async_scheduling: bool = False,
     ):
         if is_hybrid_model:
             if layer_type_list is None:
@@ -117,6 +118,7 @@ class TestDynamicContext:
                 unified_memory_level=0,  # unit tests currently broken with UVM
                 enable_chunked_prefill=enable_chunked_prefill,
                 max_requests=max_requests,
+                async_scheduling=async_scheduling,
             ),
         )
         return dynamic_context
@@ -296,6 +298,60 @@ class TestDynamicContext:
         assert refreshed_pos_ids is pos_ids_view
         assert torch.equal(refreshed_input_ids.squeeze(0), new_input_ids)
         assert torch.equal(refreshed_pos_ids.squeeze(0), new_pos_ids)
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_prepare_child_from_committed_decode_state_uses_child_slot(self):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=64,
+            num_attention_heads=8,
+            max_sequence_length=128,
+            buffer_size_gb=0.1,
+            block_size_tokens=128,
+            max_tokens=None,
+            async_scheduling=True,
+        )
+        dynamic_context.add_request(
+            DynamicInferenceRequest(
+                request_id=42,
+                prompt_tokens=torch.tensor([5], dtype=torch.long, device='cpu'),
+                sampling_params=SamplingParams(num_tokens_to_generate=8),
+            )
+        )
+        dynamic_context.update_requests(
+            active_requests_mask=torch.tensor([1], dtype=torch.int32),
+            new_tokens=torch.tensor([7], dtype=torch.int64),
+        )
+        dynamic_context.initialize_attention_state()
+
+        committed_pos_ids = dynamic_context.token_to_pos_ids[:1].clone()
+        committed_kv_offsets = dynamic_context.request_kv_length_offsets[:1].clone()
+        child_txn = dynamic_context.prepare_child_from_committed_decode_state()
+
+        assert child_txn is not None
+        assert child_txn.request_ids == (42,)
+        assert child_txn.slot_id == dynamic_context.async_decode_slot_ring.child.slot_id
+        assert dynamic_context.active_decode_slot_id == dynamic_context.async_decode_slot_ring.current.slot_id
+        if child_txn.h2d_done_event is not None:
+            child_txn.h2d_done_event.synchronize()
+
+        child_view = dynamic_context.async_decode_slot_ring.child.gpu_view
+        assert child_view.token_to_input_ids[0].item() == 7
+        assert child_view.token_to_pos_ids[0].item() == committed_pos_ids[0].item() + 1
+        assert child_view.token_to_position_in_request[0].item() == committed_pos_ids[0].item() + 1
+        assert child_view.token_to_local_position_within_kv_block[0].item() == (
+            committed_pos_ids[0].item() + 1
+        )
+        assert child_view.request_kv_length_offsets[0].item() == (
+            committed_kv_offsets[0].item() + 1
+        )
+        assert child_view.mha_kv_seq_lengths[0].item() == (
+            dynamic_context.gpu_view.mha_kv_seq_lengths[0].item() + 1
+        )
+        assert torch.equal(dynamic_context.token_to_pos_ids[:1], committed_pos_ids)
+        assert torch.equal(dynamic_context.request_kv_length_offsets[:1], committed_kv_offsets)
 
     @pytest.mark.internal
     @rounder_override(64)

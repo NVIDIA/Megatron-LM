@@ -33,6 +33,9 @@ class AsyncTxnSkipReason(str, Enum):
     RESUME_BARRIER = "resume_barrier"
     EVICT_BARRIER = "evict_barrier"
     FORCE_PAUSE_BARRIER = "force_pause_barrier"
+    CHILD_SLOT_BUSY = "child_slot_busy"
+    HYBRID_PRESTAGE_DEFERRED = "hybrid_prestage_deferred"
+    BOUNDARY_PRESTAGE_DEFERRED = "boundary_prestage_deferred"
     SERIAL_WRAPPED = "serial_wrapped"
     UNKNOWN_BARRIER = "unknown_barrier"
 
