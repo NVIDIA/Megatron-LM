@@ -1155,6 +1155,69 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @torch.inference_mode()
+    def test_return_prompt_log_probs_with_zero_tokens_to_generate(self):
+        """Prompt log probs must be returned when scoring only (num_tokens_to_generate=0).
+
+        Regression test for a prefill-step trimming bug: when a request generates
+        no tokens, the end-of-generation trim set ``keep=0`` and front-sliced
+        ``request_log_probs[:0]``, discarding every prompt log prob (in a prefill
+        step ``request_log_probs`` covers the whole prompt, with the disposable
+        sampled-token log prob at the tail). The fix trims the excess *trailing*
+        log probs instead. This is the path exercised by loglikelihood / echo
+        evaluations (e.g. lm-eval-harness sends ``max_tokens=0``).
+        """
+        env = self._run_test(
+            return_log_probs=True,
+            materialize_only_last_token_logits=False,
+            skip_prompt_log_probs=False,
+            num_tokens_to_generate=0,
+        )
+
+        validated_any = False
+        for request in env.requests:
+            if request.status != Status.COMPLETED:
+                continue
+
+            # No tokens were requested, so none should be generated.
+            assert len(request.generated_tokens) == 0, (
+                f"Request {request.request_id}: expected 0 generated tokens, "
+                f"got {len(request.generated_tokens)}"
+            )
+            assert request.generated_log_probs is None or len(request.generated_log_probs) == 0, (
+                f"Request {request.request_id}: expected no generated log probs, got "
+                f"{len(request.generated_log_probs) if request.generated_log_probs else 0}"
+            )
+
+            # The full set of prompt log probs (all tokens except the first) must
+            # still be present -- before the fix this list was empty.
+            prompt_len = len(request.prompt_tokens)
+            assert request.prompt_log_probs is not None, (
+                f"Request {request.request_id}: prompt_log_probs should not be None "
+                f"when scoring with num_tokens_to_generate=0"
+            )
+            assert len(request.prompt_log_probs) == prompt_len - 1, (
+                f"Request {request.request_id}: Expected {prompt_len - 1} prompt log probs, "
+                f"got {len(request.prompt_log_probs)}"
+            )
+            for i, log_prob in enumerate(request.prompt_log_probs):
+                assert (
+                    log_prob is not None
+                ), f"Request {request.request_id}, prompt token {i}: log_prob is None"
+                assert not math.isnan(log_prob) and not math.isinf(
+                    log_prob
+                ), f"Request {request.request_id}, prompt token {i}: log_prob {log_prob} invalid"
+                assert -50.0 <= log_prob <= 0.0, (
+                    f"Request {request.request_id}, prompt token {i}: "
+                    f"log_prob {log_prob} is out of expected range [-50.0, 0.0]"
+                )
+            validated_any = True
+
+        assert validated_any, "No completed requests were validated"
+
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
     def test_log_probs_token_correspondence(self):
         """
         Verify that log probabilities correspond to the actual sampled tokens.

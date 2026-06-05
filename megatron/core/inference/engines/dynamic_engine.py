@@ -1218,12 +1218,21 @@ class DynamicInferenceEngine(AbstractEngine):
                     keep = request.sampling_params.num_tokens_to_generate - len(
                         request.generated_tokens
                     )
+                    num_tokens_before_trim = len(tokens)
                     tokens = tokens[:keep]
-                    # Trim log probs / top-n to match so the counts stay in sync.
-                    if request_log_probs is not None:
-                        request_log_probs = request_log_probs[:keep]
-                    if top_n_logprobs is not None and req_idx in top_n_logprobs:
-                        top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:keep]
+                    # Drop only the excess *trailing* log probs / top-n so the counts stay
+                    # in sync. We must trim from the end, not the front: on a prefill step
+                    # request_log_probs covers the whole prompt and is laid out as
+                    # [<prompt log probs...>, <sampled token log prob>], so front-slicing
+                    # (e.g. [:keep] with keep == 0 when num_tokens_to_generate == 0) would
+                    # discard the prompt log probs that echo+logprobs requests need. In a
+                    # decode step all entries are generated, so trailing == front-equivalent.
+                    num_dropped = num_tokens_before_trim - len(tokens)
+                    if num_dropped > 0:
+                        if request_log_probs is not None:
+                            request_log_probs = request_log_probs[:-num_dropped]
+                        if top_n_logprobs is not None and req_idx in top_n_logprobs:
+                            top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_dropped]
                 if request_id not in self.stop_word_being_finished_ids:
                     is_first_token = len(request.generated_tokens) == 0
                     request.generated_tokens += tokens
@@ -1251,7 +1260,7 @@ class DynamicInferenceEngine(AbstractEngine):
                                 )
                             if first_token_event is None:
                                 first_token_event = event
-                    if is_first_token:
+                    if is_first_token and tokens:
                         if not self.track_generated_token_events:
                             first_token_event = DynamicInferenceEvent(
                                 type=DynamicInferenceEventType.GENERATED_TOKEN,
@@ -1264,7 +1273,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     # non-logging steps (async_forward skips the event sync),
                     # so gate the update to keep the metric a truthful sparse
                     # sample instead of polluting it with zeros.
-                    if step_time > 0:
+                    if step_time > 0 and tokens:
                         per_token_step_time = step_time / len(tokens)
                         request.tpot.extend([per_token_step_time] * len(tokens))
 
