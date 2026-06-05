@@ -1717,7 +1717,8 @@ def get_generalized_tensor_parallel_remat_group(check_initialized=True):
 def get_generalized_tensor_parallel_remat_world_size():
     """Return world size for the parameter-sharding group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return get_generalized_tensor_parallel_remat_group().size()
+        group = get_generalized_tensor_parallel_remat_group(check_initialized=False)
+        return group.size() if group is not None else 0
     else:
         return 0
 
@@ -1725,7 +1726,8 @@ def get_generalized_tensor_parallel_remat_world_size():
 def get_generalized_tensor_parallel_remat_rank():
     """Return caller's rank in the parameter-sharding group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return get_generalized_tensor_parallel_remat_group().rank()
+        group = get_generalized_tensor_parallel_remat_group(check_initialized=False)
+        return group.rank() if group is not None else 0
     else:
         return 0
 
@@ -2185,7 +2187,8 @@ def get_expert_generalized_tensor_parallel_remat_group(check_initialized=True):
 def get_expert_generalized_tensor_parallel_remat_world_size():
     """Return world size for the expert-parameter-sharding group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return get_expert_generalized_tensor_parallel_remat_group().size()
+        group = get_expert_generalized_tensor_parallel_remat_group(check_initialized=False)
+        return group.size() if group is not None else 0
     else:
         return 0
 
@@ -2193,7 +2196,8 @@ def get_expert_generalized_tensor_parallel_remat_world_size():
 def get_expert_generalized_tensor_parallel_remat_rank():
     """Return caller's rank in the expert-parameter-sharding group."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
-        return get_expert_generalized_tensor_parallel_remat_group().rank()
+        group = get_expert_generalized_tensor_parallel_remat_group(check_initialized=False)
+        return group.rank() if group is not None else 0
     else:
         return 0
 

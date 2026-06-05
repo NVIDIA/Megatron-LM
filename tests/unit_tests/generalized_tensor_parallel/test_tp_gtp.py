@@ -31,6 +31,12 @@ the requested combination of tp_size × gtp_size.
 import pytest
 import torch
 import torch.distributed as dist
+
+from megatron.experimental.gtp import HAVE_GTP
+
+if not HAVE_GTP:
+    pytest.skip("GTP requires TransformerEngine >= 2.17", allow_module_level=True)
+
 import transformer_engine.pytorch as te
 from transformer_engine.pytorch.quantization import FP8GlobalStateManager
 

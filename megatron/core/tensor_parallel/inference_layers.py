@@ -83,6 +83,7 @@ class InferenceLinear(TELinear):
         is_expert: bool = False,
         symmetric_ar_type: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        gtp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,
     ):
         assert HAVE_TE, "--transformer-impl=inference_optimized requires transformer engine"
@@ -131,6 +132,7 @@ class InferenceLayerNormColumnParallelLinear(TELayerNormColumnParallelLinear):
         skip_weight_param_allocation: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        gtp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,
     ):
         assert HAVE_TE, "--transformer-impl=inference_optimized requires transformer engine"
@@ -260,6 +262,7 @@ class InferenceColumnParallelLinear(TEColumnParallelLinear):
         skip_weight_param_allocation: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        gtp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,
     ):
         assert HAVE_TE, "--transformer-impl=inference_optimized requires transformer engine"
@@ -358,6 +361,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         is_expert: bool,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        gtp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,
     ):
         assert HAVE_TE, "--transformer-impl=inference_optimized requires transformer engine"

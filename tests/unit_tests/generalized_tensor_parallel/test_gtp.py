@@ -19,7 +19,7 @@ Test groups
 11. TestNVFP4LinearGTP           – Linear + NVFP4 recipe: quantized shard setup, fwd/bwd (multi-GPU)
 12. TestNVFP4GroupedLinearGTP    – GroupedLinear + NVFP4 recipe: coalesced AG + fwd/bwd (multi-GPU)
 13. TestMXFP8LinearGTP           – Linear + MXFP8 recipe: quantized shard setup, fwd/bwd, padding (multi-GPU)
-14. TestGTPConfig                – update_config: valid/invalid keys (single-process)
+14. TestGTPConfig                – update_gtp_config: valid/invalid keys (single-process)
 15. TestGTPShardedParamProperties – shape computations, get_padded_shard, _strip_padding (single-process)
 16. TestGTPCacheKey              – _get_cache_key: expert vs non-expert, fwd vs bwd (single-process)
 17. TestGTPCacheRelease          – reserve/get/release pool semantics (single-process)
@@ -42,6 +42,12 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+
+from megatron.experimental.gtp import HAVE_GTP
+
+if not HAVE_GTP:
+    pytest.skip("GTP requires TransformerEngine >= 2.17", allow_module_level=True)
+
 import transformer_engine.pytorch as te
 from transformer_engine.common.recipe import NVFP4BlockScaling
 from transformer_engine.pytorch import fp8_autocast, is_mxfp8_available, is_nvfp4_available
@@ -991,7 +997,7 @@ class TestMXFP8LinearGTP:
 
 
 # ---------------------------------------------------------------------------
-# 14. GTPConfig / update_config
+# 14. GTPConfig / update_gtp_config
 # ---------------------------------------------------------------------------
 
 
@@ -1000,22 +1006,22 @@ class TestGTPConfig:
     def test_update_pad_for_alignment(self):
         original = gtp_module.GTP_CONFIG.pad_for_alignment
         try:
-            gtp_module.update_config(pad_for_alignment=8)
+            gtp_module.update_gtp_config(pad_for_alignment=8)
             assert gtp_module.GTP_CONFIG.pad_for_alignment == 8
         finally:
-            gtp_module.update_config(pad_for_alignment=original)
+            gtp_module.update_gtp_config(pad_for_alignment=original)
 
     def test_update_weight_prefetch(self):
         original = gtp_module.GTP_CONFIG.weight_prefetch
         try:
-            gtp_module.update_config(weight_prefetch=False)
+            gtp_module.update_gtp_config(weight_prefetch=False)
             assert gtp_module.GTP_CONFIG.weight_prefetch is False
         finally:
-            gtp_module.update_config(weight_prefetch=original)
+            gtp_module.update_gtp_config(weight_prefetch=original)
 
     def test_invalid_key_raises(self):
         with pytest.raises(ValueError, match="Unknown GTP config option"):
-            gtp_module.update_config(nonexistent_key=123)
+            gtp_module.update_gtp_config(nonexistent_key=123)
 
 
 # ---------------------------------------------------------------------------
@@ -1333,7 +1339,7 @@ def _worker_prefetch_disabled(rank, world_size, port):
     dtype = torch.bfloat16
     gtp_group = dist.new_group(list(range(world_size)))
 
-    gtp_module.update_config(weight_prefetch=False)
+    gtp_module.update_gtp_config(weight_prefetch=False)
     try:
         l0 = te.Linear(
             in_features=in_f,
@@ -1362,7 +1368,7 @@ def _worker_prefetch_disabled(rank, world_size, port):
         assert l0.weight.next_w is l1.weight
         assert torch.isfinite(out).all(), "Non-finite output with prefetch disabled"
     finally:
-        gtp_module.update_config(weight_prefetch=True)
+        gtp_module.update_gtp_config(weight_prefetch=True)
 
 
 class TestGTPPrefetchDisabled:
