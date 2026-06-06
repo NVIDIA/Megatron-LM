@@ -1919,6 +1919,14 @@ class TestC5OverlapFlip(AsyncSchedTxnTestBase):
         assert serial_env.engine.controller._async_launch_before_commit_count == 0
 
     @pytest.mark.internal
+    def test_overlap_equals_serial_torch_nongreedy(self) -> None:
+        """Non-greedy torch decode under a CUDA graph: token-exact async==serial. The C3
+        per-request keyed RNG makes draws depend only on (request_id, draw count), which the
+        overlap preserves (each forward is still sampled once, in request order)."""
+        serial_env, async_env = self.assert_async_equals_serial(**self._greedy_cuda_graph_kwargs())
+        assert async_env.engine.controller._async_launch_before_commit_count > 0
+
+    @pytest.mark.internal
     def test_overlap_equals_serial_greedy_staggered_finishes(self) -> None:
         """Staggered finishes under the overlap: a finish forces a non-overlapped (sync) step and
         the pipeline re-primes, staying token-exact vs serial across the reshapes."""
