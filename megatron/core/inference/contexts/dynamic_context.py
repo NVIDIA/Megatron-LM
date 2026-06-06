@@ -1279,6 +1279,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                     ),
                 )
             )
+            self._async_child_h2d_stream = torch.cuda.Stream()
 
         # Cache of (input_ids_view, pos_ids_view) keyed by num_tokens. Instead of slicing and
         # unsqueezing on every new inference step (constructing new TensorImpls at 30-60 us),
@@ -1580,7 +1581,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         h2d_done_event = None
         if not defer_h2d:
-            h2d_done_event = child_slot.copy_bookkeeping_from_cpu(child_cpu_buf, non_blocking=True)
+            h2d_stream = (
+                getattr(self, "_async_child_h2d_stream", None)
+                if child_slot is not self.async_decode_slot_ring.current
+                else None
+            )
+            h2d_done_event = child_slot.copy_bookkeeping_from_cpu(
+                child_cpu_buf, non_blocking=True, stream=h2d_stream
+            )
         self.async_txn_diagnostics.record_prepared(under_forward=True)
         return StepTxn(
             step_id=self.step_count + 1,

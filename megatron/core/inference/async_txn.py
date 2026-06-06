@@ -378,12 +378,21 @@ class AsyncDecodeSlot:
         return _event_done(self.h2d_done_event) and _event_done(self.forward_done_event)
 
     def copy_bookkeeping_from_cpu(
-        self, cpu_bookkeeping_buf: torch.Tensor, *, non_blocking: bool = True
+        self,
+        cpu_bookkeeping_buf: torch.Tensor,
+        *,
+        non_blocking: bool = True,
+        stream: object = None,
     ) -> object:
         """Copy CPU bookkeeping into this slot and record the H2D dependency."""
 
-        self.gpu_view._buf.copy_(cpu_bookkeeping_buf, non_blocking=non_blocking)
-        self.h2d_done_event = self._record_event_if_cuda()
+        if stream is not None and getattr(self.gpu_view._buf, "is_cuda", False):
+            with torch.cuda.stream(stream):
+                self.gpu_view._buf.copy_(cpu_bookkeeping_buf, non_blocking=non_blocking)
+            self.h2d_done_event = self._record_event_if_cuda(stream=stream)
+        else:
+            self.gpu_view._buf.copy_(cpu_bookkeeping_buf, non_blocking=non_blocking)
+            self.h2d_done_event = self._record_event_if_cuda()
         return self.h2d_done_event
 
     def record_forward_done(self) -> object:
@@ -399,12 +408,12 @@ class AsyncDecodeSlot:
             return None
         return (*base_key, ("decode_slot", self.slot_id, self.pointer_signature()))
 
-    def _record_event_if_cuda(self) -> object:
+    def _record_event_if_cuda(self, stream: object = None) -> object:
         buf = getattr(self.gpu_view, "_buf", None)
         if buf is None or not getattr(buf, "is_cuda", False):
             return None
         event = torch.cuda.Event()
-        event.record(torch.cuda.current_stream(buf.device))
+        event.record(stream or torch.cuda.current_stream(buf.device))
         return event
 
     def pointer_signature(self) -> tuple[int, ...]:
