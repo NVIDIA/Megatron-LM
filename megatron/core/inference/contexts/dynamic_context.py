@@ -49,7 +49,7 @@ from .base_context import BaseInferenceContext
 from .gpu_view import ContextGPUView
 from .kv_block_allocator import KVBlockAllocator
 from .mamba_slot_allocator import MambaSlotAllocator
-from .metadata_slot import DecodeMetadataSlot
+from .metadata_slot import DecodeMetadataBuffer, DepthTwoRing
 from .routing_metadata import RoutingMetadata
 
 try:
@@ -1224,25 +1224,32 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_mamba_chunks=self._max_mamba_chunks,
         )
 
-        # Async scheduling (launch-before-commit): wrap the live gpu_view as
-        # slot_current and allocate a free slot_child to prestage the next step's
-        # metadata into. Built only when the opt-in flag is on; the serial path uses
-        # only the single live gpu_view above. The prestage that populates slot_child
-        # and the graph replay that consumes it land in later commits -- here the
-        # child slot is allocated, free, and at a distinct address.
-        self.slot_current: Optional[DecodeMetadataSlot] = None
-        self.slot_child: Optional[DecodeMetadataSlot] = None
+        # Async scheduling (launch-before-commit). The metadata GPU buffer is SINGLE and
+        # fixed-address: a captured decode graph reads it by absolute address, so it is
+        # never reallocated or swapped -- there is no second GPU buffer / no
+        # replay-against-child. `decode_metadata_buffer` wraps the live `gpu_view` above
+        # (carrying the two CUDA fences + the data_ptr()-invariance guard).
+        #
+        # The genuine double-buffer is CPU-side: the next step's bookkeeping is prestaged
+        # into a pinned CPU *staging* buffer (identical layout to `_cpu_bookkeeping_buf`)
+        # while the current forward's already-issued H2D still reads the live buffer, then
+        # the staging buffer is swapped in and one coalesced H2D copies it into the single
+        # GPU buffer. `cpu_staging_ring` is the depth-2 live<->staging ring. Built only
+        # when the opt-in flag is on; the serial path uses the single live gpu_view and
+        # `_cpu_bookkeeping_buf` directly and is unchanged. The prestage that writes the
+        # staging buffer and the graph replay that consumes the GPU buffer land in later
+        # commits.
+        self.decode_metadata_buffer: Optional[DecodeMetadataBuffer] = None
+        self.cpu_staging_ring: Optional[DepthTwoRing] = None
         if self.enable_async_scheduling:
-            self.slot_current = DecodeMetadataSlot(slot_id=0, gpu_view=self.gpu_view)
-            self.slot_child = DecodeMetadataSlot(
-                slot_id=1,
-                gpu_view=ContextGPUView(
-                    max_requests=self.max_requests,
-                    max_tokens=self.max_tokens,
-                    max_kv_blocks=self.max_kv_block_count,
-                    device=torch.cuda.current_device(),
-                    max_mamba_chunks=self._max_mamba_chunks,
-                ),
+            self.decode_metadata_buffer = DecodeMetadataBuffer(gpu_view=self.gpu_view)
+            # Pinned mirror (matches `_cpu_bookkeeping_buf`) so the staging->GPU H2D is a
+            # single cudaMemcpyAsync, exactly like the live buffer's transfer.
+            self._cpu_staging_buf = torch.empty_like(
+                self._cpu_bookkeeping_buf, pin_memory=True
+            )
+            self.cpu_staging_ring = DepthTwoRing.of(
+                self._cpu_bookkeeping_buf, self._cpu_staging_buf
             )
 
         # Cache of (input_ids_view, pos_ids_view) keyed by num_tokens. Instead of slicing and

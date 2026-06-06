@@ -1,53 +1,74 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Decode metadata slots + depth-2 rings for async-scheduling (launch-before-commit).
+"""Single fixed-address GPU decode-metadata buffer + CPU staging double-buffer.
 
 The launch-before-commit pipeline overlaps two decode forwards: while forward ``F(K)``
-runs against one GPU metadata buffer, the next step's metadata is *prestaged* into a
-**free** buffer so that, after sampling, only a token-scatter + launch separate
-``S(K)`` from ``F(K+1)``. That requires two GPU metadata buffers ("slots"):
+runs, the next step's metadata is *prestaged* so that, after sampling, only an in-place
+token-scatter + launch separate ``S(K)`` from ``F(K+1)``.
 
-- ``slot_current`` -- the buffer the running/consumed forward observes.
-- ``slot_child``   -- the free buffer the next step is prestaged into.
+A captured CUDA decode graph reads metadata by **ABSOLUTE ADDRESS**
+(``cuda_graphs.py:605-639``: only the embed-input / hidden-states surface is
+copy-on-replay; every *other* metadata field is read from the exact address captured), so
+the metadata GPU buffer cannot be a swappable child. There is therefore exactly **one**
+fixed-address GPU metadata buffer -- the live ``gpu_view`` -- which is **never reallocated
+or swapped**, only updated in place between steps and read by the captured graph at the
+addresses it captured.
 
-This module provides the slot/ring abstractions. The slots wrap
-:class:`~megatron.core.inference.contexts.gpu_view.ContextGPUView` buffers (whose
-addresses are fixed for CUDA-graph compatibility); a forward is bound to exactly one
-slot. A slot may not be re-staged until its H2D and forward fences have retired, so a
-still-in-flight forward never observes a buffer being overwritten.
+The genuine double-buffer is consequently **CPU-side**: the next step's bookkeeping is
+prestaged into a CPU *staging* buffer while the current forward's already-issued H2D still
+reads the *live* CPU buffer, then the staging buffer is swapped in and a single coalesced
+H2D copies it into the one GPU buffer. :class:`DepthTwoRing` provides that depth-2 CPU
+staging<->live double-buffer (and the per-step output handles two overlapping forwards
+must not share).
 
-The serial (``enable_async_scheduling`` off) decode path uses a single live
-``gpu_view`` and never constructs slots, so its behavior is unchanged. The context
-constructs ``slot_current`` (wrapping the live ``gpu_view``) and a free ``slot_child``
-only when the flag is on; the prestage that builds metadata into ``slot_child`` and the
-graph replay that consumes it land in later commits.
+Replay is only valid against the buffer the graph captured, so
+:class:`DecodeMetadataBuffer` records the GPU buffer's address (and the cached
+input/position view addresses) and :meth:`DecodeMetadataBuffer.assert_pointer_invariant`
+asserts they never move across decode steps -- turning an accidental reallocation (which
+would make a replay read freed/foreign memory) into a loud failure instead of silent
+corruption.
+
+The serial (``enable_async_scheduling`` off) decode path uses the single live ``gpu_view``
+directly and never constructs any of these helpers, so its behavior is unchanged. The
+prestage that builds the next step's metadata into the CPU staging buffer and the graph
+replay that consumes the GPU buffer land in later commits.
 """
 
 from typing import Any, Callable, List, Optional
 
 
-class DecodeMetadataSlot:
-    """A bindable GPU decode-metadata buffer plus its two CUDA fences and identity.
+class DecodeMetadataBuffer:
+    """The single fixed-address GPU decode-metadata buffer plus its two CUDA fences.
 
-    Wraps a ``ContextGPUView``. Slot reuse (re-staging the next step's metadata into it)
-    is gated by ``is_free()``: the slot must not be in use and both of its fences (the
-    coalesced-H2D fence and the forward fence) must have completed. This is the slot-level
-    expression of the design's "a slot can't be reused before its H2D/forward events
-    retire" rule.
+    Wraps the live ``ContextGPUView``. There is exactly one such buffer; it is never
+    reallocated or swapped (a captured decode graph reads its fields by absolute address),
+    only updated in place between steps. Reuse for the next step is gated by
+    :meth:`is_free`: both fences (the coalesced-H2D fence and the forward fence) must have
+    retired, so a still in-flight forward never observes the buffer being overwritten
+    mid-flight.
+
+    The buffer also records the address it (and its cached input/position views) was first
+    observed at; :meth:`assert_pointer_invariant` asserts those addresses never move,
+    because a captured CUDA graph may only be replayed against the exact buffer it
+    captured. This is the single-buffer replacement for the (discarded) two-GPU-buffer
+    "slot" model: there is no ``slot_child`` and no replay-against-child.
     """
 
-    def __init__(self, slot_id: int, gpu_view: Any):
-        self.slot_id = slot_id
+    def __init__(self, gpu_view: Any):
         self.gpu_view = gpu_view
-        # Signalled when the coalesced bookkeeping H2D into this slot completes.
+        # Signalled when the coalesced bookkeeping H2D into this buffer completes.
         self.h2d_done_event: Any = None
-        # Signalled when the forward bound to this slot completes.
+        # Signalled when the forward reading this buffer completes.
         self.forward_done_event: Any = None
-        self._in_use = False
+        # Invariant addresses, recorded lazily on first observation. A captured graph is
+        # only valid against these exact addresses.
+        self._captured_base_ptr: Optional[int] = None
+        self._captured_input_ids_ptr: Optional[int] = None
+        self._captured_pos_ids_ptr: Optional[int] = None
 
     @property
     def base_ptr(self) -> int:
-        """Base address of the slot's backing metadata buffer (fixed for graph capture)."""
+        """Base address of the single backing metadata buffer (fixed for graph capture)."""
         return self.gpu_view._buf.data_ptr()
 
     def fences_retired(self) -> bool:
@@ -58,61 +79,85 @@ class DecodeMetadataSlot:
         return True
 
     def is_free(self) -> bool:
-        """True iff the slot can be re-staged: not in use and both fences retired."""
-        return not self._in_use and self.fences_retired()
-
-    def acquire(self) -> None:
-        """Mark the slot in use for a new transaction. Must be free first."""
-        assert self.is_free(), (
-            f"slot {self.slot_id} acquired while busy "
-            f"(in_use={self._in_use}, fences_retired={self.fences_retired()})"
-        )
-        self._in_use = True
-
-    def release(self) -> None:
-        """Release the slot back to the free pool (its forward has been consumed)."""
-        self._in_use = False
+        """True iff the buffer can be updated in place for the next step (both fences retired)."""
+        return self.fences_retired()
 
     def reset_fences(self) -> None:
         """Clear both fences (e.g. on a barrier/drain that already synchronized them)."""
         self.h2d_done_event = None
         self.forward_done_event = None
 
-    def graph_slot_key(self) -> int:
-        """Slot identity for the CUDA-graph key.
+    def capture_pointers(
+        self, input_ids_ptr: Optional[int] = None, pos_ids_ptr: Optional[int] = None
+    ) -> None:
+        """Record the invariant addresses (call once, after the decode graph is captured).
 
-        When a captured graph references this slot's buffers, the key must encode the
-        slot's buffer address so a replay never targets the wrong slot's metadata. When
-        the key cannot carry slot identity, :func:`assert_slot_pointer_identity` guards
-        replay instead.
+        Records the GPU metadata buffer's base address and, when supplied, the cached
+        input/position view addresses. Idempotent for already-recorded slots.
         """
-        return self.base_ptr
+        self._captured_base_ptr = self.base_ptr
+        if input_ids_ptr is not None:
+            self._captured_input_ids_ptr = input_ids_ptr
+        if pos_ids_ptr is not None:
+            self._captured_pos_ids_ptr = pos_ids_ptr
 
+    def assert_pointer_invariant(
+        self, input_ids_ptr: Optional[int] = None, pos_ids_ptr: Optional[int] = None
+    ) -> None:
+        """Assert the single GPU buffer (and cached input/pos views) have not moved.
 
-def assert_slot_pointer_identity(slot: DecodeMetadataSlot, captured_base_ptr: int) -> None:
-    """Assert ``slot``'s buffer still lives where a graph was captured against it.
-
-    Replaying a CUDA graph against a metadata buffer that moved would read stale
-    pointers; this guard turns that into a loud failure instead of silent corruption.
-    """
-    assert slot.base_ptr == captured_base_ptr, (
-        f"decode metadata slot {slot.slot_id} buffer moved: graph captured against "
-        f"{captured_base_ptr:#x} but slot is now at {slot.base_ptr:#x}; replaying would "
-        f"read stale metadata pointers"
-    )
+        Replaying a captured decode graph against a metadata buffer that moved would read
+        stale/foreign memory; this guard turns that into a loud failure. The first call
+        records the baseline addresses; every subsequent call asserts invariance against
+        them. This is the single-buffer ``data_ptr()``-invariance guard that replaces the
+        two-slot pointer-identity check.
+        """
+        if self._captured_base_ptr is None:
+            self.capture_pointers(input_ids_ptr, pos_ids_ptr)
+            return
+        assert self.base_ptr == self._captured_base_ptr, (
+            f"decode metadata GPU buffer moved: graph captured against "
+            f"{self._captured_base_ptr:#x} but buffer is now at {self.base_ptr:#x}; "
+            f"replaying would read stale/foreign metadata. The single GPU metadata buffer "
+            f"must never be reallocated or swapped."
+        )
+        if input_ids_ptr is not None and self._captured_input_ids_ptr is not None:
+            assert input_ids_ptr == self._captured_input_ids_ptr, (
+                f"cached input_ids view moved: captured {self._captured_input_ids_ptr:#x} "
+                f"but now {input_ids_ptr:#x}"
+            )
+        if pos_ids_ptr is not None and self._captured_pos_ids_ptr is not None:
+            assert pos_ids_ptr == self._captured_pos_ids_ptr, (
+                f"cached pos_ids view moved: captured {self._captured_pos_ids_ptr:#x} "
+                f"but now {pos_ids_ptr:#x}"
+            )
 
 
 class DepthTwoRing:
-    """A depth-2 ring of per-step handles (H2D staging / logits / sample buffers).
+    """A depth-2 ring for the CPU staging<->live double-buffer (and per-step handles).
 
-    Two forwards overlap in the launch-before-commit pipeline, so staging buffers and
-    output handles need depth 2: step ``K`` and step ``K+1`` must not share a buffer.
-    Index by step (or any monotonically increasing counter); the ring selects by parity.
+    Two forwards overlap in the launch-before-commit pipeline, so the next step's metadata
+    must be prestaged into a CPU buffer that is *not* the one the current forward's
+    already-issued H2D is reading. Depth 2 is sufficient: step ``K`` and step ``K+1`` use
+    opposite entries, selected by parity. The same ring also backs per-step output handles
+    (logits / sample buffers) two overlapping forwards must not share.
+
+    Note: the ring's entries are **CPU-side** (staging vs live bookkeeping buffers / output
+    handles). The GPU metadata buffer is single and fixed-address (see
+    :class:`DecodeMetadataBuffer`) -- it is deliberately NOT ring-buffered, because a
+    captured decode graph reads it by absolute address.
     """
 
     def __init__(self, factory: Callable[[int], Any]):
         # Materialize both entries up front so addresses are fixed (graph-friendly).
         self._entries: List[Any] = [factory(0), factory(1)]
+
+    @classmethod
+    def of(cls, first: Any, second: Any) -> "DepthTwoRing":
+        """Build a ring from two already-constructed entries (e.g. live + staging buffers)."""
+        ring = cls.__new__(cls)
+        ring._entries = [first, second]
+        return ring
 
     def __len__(self) -> int:
         return 2
@@ -127,17 +172,3 @@ class DepthTwoRing:
     def other(self, step: int) -> Any:
         """The entry NOT bound to ``step`` (the one ``step+1`` will use)."""
         return self._entries[(step + 1) % 2]
-
-
-def make_decode_metadata_slots(
-    gpu_view: Any, child_gpu_view_factory: Callable[[], Any]
-) -> "tuple[DecodeMetadataSlot, DecodeMetadataSlot]":
-    """Build ``(slot_current, slot_child)`` for async scheduling.
-
-    ``slot_current`` wraps the live ``gpu_view`` (the same buffer the serial path uses),
-    so binding the running forward to ``slot_current`` is identical to the serial path.
-    ``slot_child`` wraps a freshly-allocated metadata buffer that the prestage builds into.
-    """
-    slot_current = DecodeMetadataSlot(slot_id=0, gpu_view=gpu_view)
-    slot_child = DecodeMetadataSlot(slot_id=1, gpu_view=child_gpu_view_factory())
-    return slot_current, slot_child

@@ -24,12 +24,7 @@ import pytest
 import torch
 
 from megatron.core.inference.config import InferenceConfig
-from megatron.core.inference.contexts.metadata_slot import (
-    DecodeMetadataSlot,
-    DepthTwoRing,
-    assert_slot_pointer_identity,
-    make_decode_metadata_slots,
-)
+from megatron.core.inference.contexts.metadata_slot import DecodeMetadataBuffer, DepthTwoRing
 from megatron.core.inference.engines.step_transaction import (
     LaunchDecision,
     LaunchEligibility,
@@ -424,47 +419,60 @@ class _StubGpuView:
 
 @pytest.mark.internal
 class TestMetadataSlotPrimitives:
-    """C2 unit tests for the decode-metadata slot + depth-2 ring abstractions."""
+    """C2 (amended): single GPU metadata buffer + CPU staging double-buffer ring.
 
-    def test_slot_reuse_gated_by_fences(self) -> None:
-        """A slot is free only when not in use and both fences have retired."""
-        slot = DecodeMetadataSlot(slot_id=1, gpu_view=_StubGpuView())
-        assert slot.is_free()  # fresh slot, no fences
+    The two-GPU-buffer "slot" model was discarded: a captured decode graph reads metadata
+    by absolute address, so there is exactly ONE fixed-address GPU buffer
+    (:class:`DecodeMetadataBuffer`) updated in place, and the double-buffer is CPU-side
+    (:class:`DepthTwoRing`).
+    """
 
-        slot.acquire()
-        assert not slot.is_free()  # in use
-        with pytest.raises(AssertionError):
-            slot.acquire()  # cannot double-acquire
-        slot.release()
-        assert slot.is_free()
+    def test_buffer_reuse_gated_by_fences(self) -> None:
+        """The single GPU buffer can be re-staged only when both fences have retired."""
+        buf = DecodeMetadataBuffer(gpu_view=_StubGpuView())
+        assert buf.is_free()  # fresh buffer, no fences
 
-        # Pending fences keep the slot busy even after release.
-        slot.h2d_done_event = _StubEvent(ready=True)
-        slot.forward_done_event = _StubEvent(ready=False)
-        assert not slot.is_free()
-        with pytest.raises(AssertionError):
-            slot.acquire()
+        # Pending fences keep the buffer busy (a still in-flight forward may read it).
+        buf.h2d_done_event = _StubEvent(ready=True)
+        buf.forward_done_event = _StubEvent(ready=False)
+        assert not buf.is_free()
 
-        # Once the forward fence completes, the slot frees up.
-        slot.forward_done_event.ready = True
-        assert slot.is_free()
-        slot.acquire()  # now allowed
-        slot.release()
-        slot.reset_fences()
-        assert slot.h2d_done_event is None and slot.forward_done_event is None
+        # Once the forward fence completes, the buffer is reusable.
+        buf.forward_done_event.ready = True
+        assert buf.is_free()
 
-    def test_slot_identity_and_pointer_assertion(self) -> None:
-        """Distinct slots have distinct graph keys; the pointer guard catches moves."""
-        a = DecodeMetadataSlot(slot_id=0, gpu_view=_StubGpuView())
-        b = DecodeMetadataSlot(slot_id=1, gpu_view=_StubGpuView())
-        assert a.graph_slot_key() == a.base_ptr
-        assert a.graph_slot_key() != b.graph_slot_key()
+        buf.reset_fences()
+        assert buf.h2d_done_event is None and buf.forward_done_event is None
 
-        # Captured-against-current-address: guard passes.
-        assert_slot_pointer_identity(a, a.base_ptr)
-        # Captured-against-the-other-slot's-address: guard fires.
-        with pytest.raises(AssertionError):
-            assert_slot_pointer_identity(a, b.base_ptr)
+    def test_pointer_invariance_guard(self) -> None:
+        """The guard captures the buffer (and view) addresses, then asserts invariance.
+
+        This is the single-buffer ``data_ptr()``-invariance guard that replaces the
+        discarded two-slot pointer-identity check: replay is only valid against the buffer
+        the graph captured, so the address must never move.
+        """
+        buf = DecodeMetadataBuffer(gpu_view=_StubGpuView())
+        input_ptr, pos_ptr = 0x1000, 0x2000
+
+        # First call records the baseline addresses (lazy capture); it must not raise.
+        buf.assert_pointer_invariant(input_ids_ptr=input_ptr, pos_ids_ptr=pos_ptr)
+        assert buf._captured_base_ptr == buf.base_ptr
+
+        # Same addresses on every subsequent step: guard passes.
+        buf.assert_pointer_invariant(input_ids_ptr=input_ptr, pos_ids_ptr=pos_ptr)
+
+        # A moved GPU buffer (the bug the guard exists to catch) fires.
+        moved = DecodeMetadataBuffer(gpu_view=_StubGpuView())
+        moved.capture_pointers()
+        moved.gpu_view = _StubGpuView()  # simulate a reallocation to a new address
+        with pytest.raises(AssertionError, match="GPU buffer moved"):
+            moved.assert_pointer_invariant()
+
+        # A moved cached input/pos view also fires.
+        with pytest.raises(AssertionError, match="input_ids view moved"):
+            buf.assert_pointer_invariant(input_ids_ptr=0xBEEF, pos_ids_ptr=pos_ptr)
+        with pytest.raises(AssertionError, match="pos_ids view moved"):
+            buf.assert_pointer_invariant(input_ids_ptr=input_ptr, pos_ids_ptr=0xBEEF)
 
     def test_depth_two_ring(self) -> None:
         """The ring has two distinct entries selected by step parity."""
@@ -475,23 +483,21 @@ class TestMetadataSlotPrimitives:
         assert ring.current(0) == "buf0" and ring.other(0) == "buf1"
         assert ring.current(1) == "buf1" and ring.other(1) == "buf0"
 
-    def test_make_decode_metadata_slots(self) -> None:
-        """slot_current wraps the live view; slot_child wraps a distinct fresh view."""
-        live = _StubGpuView()
-        current, child = make_decode_metadata_slots(
-            live, child_gpu_view_factory=lambda: _StubGpuView()
-        )
-        assert current.gpu_view is live
-        assert current.slot_id == 0 and child.slot_id == 1
-        assert current.base_ptr != child.base_ptr
-        assert current.is_free() and child.is_free()
+    def test_depth_two_ring_of_prebuilt_entries(self) -> None:
+        """``DepthTwoRing.of`` rings two already-constructed entries (live + staging)."""
+        live, staging = ["live"], ["staging"]
+        ring = DepthTwoRing.of(live, staging)
+        assert len(ring) == 2
+        # Entry identity is preserved (the ring holds the live + staging buffers).
+        assert ring.current(0) is live and ring.other(0) is staging
+        assert ring.current(1) is staging and ring.other(1) is live
 
 
 @pytest.mark.skipif(
     not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
 )
 class TestMetadataSlotsInContext(AsyncSchedTxnTestBase):
-    """C2: the context wires slot_current/slot_child only when async is enabled."""
+    """C2 (amended): the context wires the single GPU buffer + CPU staging ring on async."""
 
     @classmethod
     def setup_class(cls):
@@ -509,34 +515,45 @@ class TestMetadataSlotsInContext(AsyncSchedTxnTestBase):
         Utils.destroy_model_parallel()
 
     @pytest.mark.internal
-    def test_slots_present_only_when_enabled(self) -> None:
-        """Serial path: no slots. Async path: slot_current wraps the live gpu_view."""
+    def test_buffer_and_ring_present_only_when_enabled(self) -> None:
+        """Serial path: nothing. Async path: ONE GPU buffer wrapping the live gpu_view."""
         set_rounder(4)
         off = self._build_test_env(
             DynamicEngineTestConfig(model_provider="gpt", enable_async_scheduling=False)
         ).engine.context
-        assert off.slot_current is None and off.slot_child is None
+        assert off.decode_metadata_buffer is None and off.cpu_staging_ring is None
 
         ctx = self._build_test_env(
             DynamicEngineTestConfig(model_provider="gpt", enable_async_scheduling=True)
         ).engine.context
-        assert ctx.slot_current is not None and ctx.slot_child is not None
-        # slot_current is the live gpu_view; slot_child is a distinct free buffer.
-        assert ctx.slot_current.gpu_view is ctx.gpu_view
-        assert ctx.slot_child.gpu_view is not ctx.gpu_view
-        assert ctx.slot_current.base_ptr != ctx.slot_child.base_ptr
-        assert ctx.slot_child.is_free()
+        # The single GPU metadata buffer wraps the live gpu_view -- there is no second
+        # GPU buffer / no replay-against-child.
+        assert ctx.decode_metadata_buffer is not None
+        assert ctx.decode_metadata_buffer.gpu_view is ctx.gpu_view
+        assert ctx.decode_metadata_buffer.base_ptr == ctx.gpu_view._buf.data_ptr()
+        assert ctx.decode_metadata_buffer.is_free()
+        # Exactly one GPU metadata buffer exists (no ContextGPUView other than gpu_view).
+        from megatron.core.inference.contexts.gpu_view import ContextGPUView
+
+        gpu_views = [v for v in vars(ctx).values() if isinstance(v, ContextGPUView)]
+        assert gpu_views == [ctx.gpu_view], "expected exactly one GPU metadata buffer"
+
+        # The genuine double-buffer is CPU-side: live <-> pinned staging mirror.
+        assert ctx.cpu_staging_ring is not None
+        assert ctx.cpu_staging_ring.current(0) is ctx._cpu_bookkeeping_buf
+        assert ctx.cpu_staging_ring.other(0) is ctx._cpu_staging_buf
 
     @pytest.mark.internal
     @torch.inference_mode()
-    def test_serial_metadata_copied_to_child_slot_matches(self) -> None:
-        """slot_child is a faithful, identically-laid-out, independent metadata buffer.
+    def test_cpu_staging_buffer_faithful_and_independent(self) -> None:
+        """The CPU staging mirror is identically laid out and independent from live.
 
-        The prestage (a later commit) builds the next step's bookkeeping into the
-        child slot and copies it via a single coalesced H2D. This verifies the child
-        slot has the exact same byte layout as the live gpu_view (so the copy is
-        sound) and uses independent storage (so a running forward on slot_current is
-        never disturbed by writes to slot_child).
+        The prestage (a later commit) builds the next step's bookkeeping into the CPU
+        staging buffer; one coalesced H2D then copies it into the single GPU buffer. This
+        verifies the staging buffer has the exact same byte layout as the live CPU
+        bookkeeping buffer (so the copy is sound) and uses independent, pinned storage (so
+        prestaging the next step never disturbs the live buffer the current forward's
+        already-issued H2D reads).
         """
         set_rounder(4)
         ctx = self._build_test_env(
@@ -547,41 +564,26 @@ class TestMetadataSlotsInContext(AsyncSchedTxnTestBase):
                 enable_async_scheduling=True,
             )
         ).engine.context
-        live = ctx.slot_current.gpu_view
-        child = ctx.slot_child.gpu_view
+        live = ctx._cpu_bookkeeping_buf
+        staging = ctx._cpu_staging_buf
 
-        # Same backing-buffer size => identical field layout, distinct storage.
-        assert live._buf.shape == child._buf.shape
-        assert live._buf.data_ptr() != child._buf.data_ptr()
+        # Same size/dtype => identical field layout; distinct, pinned storage.
+        assert live.shape == staging.shape and live.dtype == staging.dtype
+        assert live.data_ptr() != staging.data_ptr()
+        assert staging.is_pinned()
 
-        # Stamp the live buffer with a deterministic pattern, then copy into the
-        # child slot exactly as the prestage's coalesced H2D will.
-        live._buf.copy_(
-            (torch.arange(live._buf.numel(), device=live._buf.device) % 251).to(torch.uint8)
-        )
-        child._buf.copy_(live._buf)
-
-        for field in (
-            "token_to_input_ids",
-            "token_to_pos_ids",
-            "token_to_block_idx",
-            "request_query_lengths",
-            "request_kv_length_offsets",
-            "mha_cu_query_seq_lengths",
-            "mha_cu_kv_seq_lengths",
-        ):
-            assert torch.equal(getattr(live, field), getattr(child, field)), (
-                f"field {field} differs after copy"
-            )
-
-        # Independence: mutating the live buffer must not perturb the child slot.
-        before = child.token_to_input_ids.clone()
-        live.token_to_input_ids[:] += 7
-        assert torch.equal(child.token_to_input_ids, before)
+        # Stamp the staging buffer (as the prestage will), then copy into live exactly as
+        # the publish-step swap does -- the views must agree afterward.
+        staging.copy_((torch.arange(staging.numel()) % 251).to(torch.uint8))
+        before_live = live.clone()
+        # Independence: writing the staging buffer must not perturb the live buffer.
+        assert torch.equal(live, before_live)
+        live.copy_(staging)
+        assert torch.equal(live, staging)
 
     @pytest.mark.internal
-    def test_async_equals_serial_with_slots(self) -> None:
-        """C2 regression: allocating slots (flag on) keeps decode token-exact vs serial."""
+    def test_async_equals_serial_single_buffer(self) -> None:
+        """C2 (amended) regression: the single buffer + ring keep decode token-exact."""
         self.assert_async_equals_serial(
             model_provider="gpt",
             num_requests=4,
