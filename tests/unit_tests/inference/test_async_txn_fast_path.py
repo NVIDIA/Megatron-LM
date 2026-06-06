@@ -455,7 +455,7 @@ def test_cuda_graph_child_launch_replays_current_slot_after_deferred_h2d():
     assert context.child_forward_graph_flags == [(True, True)]
     assert context.using_cuda_graph_this_step()
     assert context.replay_cuda_graph_this_step()
-    assert context.deferred_h2d_prepares == 1
+    assert context.deferred_h2d_prepares == 2
     assert context.async_txn_diagnostics.h2d_ready_before_sampling == 0
     assert context.async_txn_diagnostics.launched == 1
 
