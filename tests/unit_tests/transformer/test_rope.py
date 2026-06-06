@@ -48,6 +48,19 @@ class TestMultimodalRotaryEmbedding:
         assert output.dtype == torch.float32
         assert output.device.type == 'cuda'
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_gpu_forward_interleaved(self):
+        rope_interleaved = MultimodalRotaryEmbedding(
+            self.kv_channels, self.rotary_percent, rotary_interleaved=True
+        )
+        output = rope_interleaved(torch.Tensor(3, 1, 64), mrope_section=[16, 24, 24])
+        assert output.shape[0] == 64
+        assert output.shape[1] == 1
+        assert output.shape[2] == 1
+        assert output.shape[3] == self.kv_channels
+        assert output.dtype == torch.float32
+        assert output.device.type == 'cuda'
+
 
 class TestRotaryEmbedding:
     def setup_method(self):

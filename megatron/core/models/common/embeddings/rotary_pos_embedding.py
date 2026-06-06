@@ -340,7 +340,7 @@ class MultimodalRotaryEmbedding(nn.Module):
         else:
             bs = freqs.shape[1]
             emb = torch.stack((freqs.view(3, bs, -1, 1), freqs.view(3, bs, -1, 1)), dim=-1).view(
-                3, bs, freqs.shape[0], -1
+                3, bs, freqs.shape[2], -1
             )
 
         # generate freqs with mrope_section
