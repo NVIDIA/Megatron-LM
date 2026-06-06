@@ -4,7 +4,7 @@ import logging
 import math
 import operator
 import warnings
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch  # type: ignore
@@ -1458,6 +1458,23 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Returns True if cuda graphs are being used for this step."""
         return self._using_cuda_graph_this_step
 
+    @contextmanager
+    def async_child_forward_eager_scope(self):
+        """Temporarily force async child forwards onto the eager model path.
+
+        Full-iteration CUDA graphs are captured for the committed context
+        metadata. Async child forwards use transient transactional metadata
+        buffers, so they must not replay the committed-step graph unless a
+        separate async graph design is explicitly added.
+        """
+
+        previous = self._using_cuda_graph_this_step
+        self._using_cuda_graph_this_step = False
+        try:
+            yield
+        finally:
+            self._using_cuda_graph_this_step = previous
+
     def cuda_graph_cache_key(self):
         """Return the CUDA graph cache key for the active padded shape.
 
@@ -1595,9 +1612,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             cpu_bookkeeping_buf=child_cpu_buf if defer_h2d else None,
             kv_block_leases=kv_block_leases,
             mamba_slot_ids=mamba_slot_ids,
-            cuda_graph_key=(
-                self.padded_batch_dimensions if self.using_cuda_graph_this_step() else None
-            ),
+            cuda_graph_key=None,
         )
 
     def _reserve_async_boundary_blocks(

@@ -6,6 +6,7 @@ import copy
 import functools
 import time
 from collections import defaultdict
+from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, OrderedDict, Tuple, Union
 
 import numpy as np
@@ -719,13 +720,16 @@ class TextGenerationController:
             self._all_logits_cuda = logits
 
     def _async_decode_cuda_graph_key(self, slot=None) -> Optional[Any]:
-        """Return the active decode graph shape key, if CUDA graphs are active."""
+        """Return the graph key used to guard async child adoption.
 
-        context = self.inference_wrapped_model.inference_context
+        Async child forwards intentionally run outside the full-iteration CUDA graph
+        cache. The cache is keyed by the committed step shape, but the child path
+        owns separate transient metadata buffers and must not depend on a replayed
+        graph captured for the persistent context.
+        """
+
         del slot
-        if not context.using_cuda_graph_this_step():
-            return None
-        return context.padded_batch_dimensions
+        return None
 
     def _async_active_request_ids(self) -> tuple[int, ...]:
         """Return committed active request ids as plain ints."""
@@ -985,7 +989,9 @@ class TextGenerationController:
         if profile_child_forward:
             child_txn.forward_timing_start_event = torch.cuda.Event(enable_timing=True)
             child_txn.forward_timing_start_event.record(torch.cuda.current_stream())
-        self._dynamic_step_forward_logits(input_ids, position_ids)
+        eager_child_scope = getattr(context, "async_child_forward_eager_scope", None)
+        with eager_child_scope() if eager_child_scope is not None else nullcontext():
+            self._dynamic_step_forward_logits(input_ids, position_ids)
         if profile_child_forward:
             child_txn.forward_timing_done_event = torch.cuda.Event(enable_timing=True)
             child_txn.forward_timing_done_event.record(torch.cuda.current_stream())

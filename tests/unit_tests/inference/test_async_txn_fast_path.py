@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import torch
@@ -77,12 +78,22 @@ class FakeContext:
         self.deferred_h2d_prepares = 0
         self.child_graph_shape_syncs = 0
         self.child_graph_shape_order = None
+        self.child_forward_graph_flags = []
 
     def is_decode_only(self):
         return True
 
     def using_cuda_graph_this_step(self):
         return self.use_cuda_graph
+
+    @contextmanager
+    def async_child_forward_eager_scope(self):
+        previous = self.use_cuda_graph
+        self.use_cuda_graph = False
+        try:
+            yield
+        finally:
+            self.use_cuda_graph = previous
 
     def last_token_logits(self, logits):
         return logits.squeeze(0)[: self.total_request_count - self.paused_request_count]
@@ -118,7 +129,7 @@ class FakeContext:
             request_ids=(17,),
             slot_id=child.slot_id,
             cpu_bookkeeping_buf=torch.zeros_like(child.gpu_view._buf) if defer_h2d else None,
-            cuda_graph_key=self.padded_batch_dimensions if self.use_cuda_graph else None,
+            cuda_graph_key=None,
         )
 
     def plain_decode_child_needs_terminal_check(self, active_request_count=None):
@@ -191,6 +202,7 @@ def _make_controller(context):
     def forward(input_ids, position_ids):
         if "sample" in order:
             order.append("child_forward")
+            context.child_forward_graph_flags.append(context.using_cuda_graph_this_step())
         else:
             order.append("forward")
 
@@ -427,6 +439,8 @@ def test_cuda_graph_child_launch_uses_child_slot_without_deferred_h2d():
     assert "child_forward" in order
     assert context.active_decode_slot_id == 1
     assert controller._async_launched_child_txn.slot_id == 1
+    assert context.child_forward_graph_flags == [False]
+    assert context.using_cuda_graph_this_step()
     assert context.deferred_h2d_prepares == 0
     assert context.async_txn_diagnostics.launched == 1
 
