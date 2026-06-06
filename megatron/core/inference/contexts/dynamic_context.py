@@ -1515,9 +1515,35 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.non_graph_attn_metadata["mha_metadata"].bind_gpu_buffers(self.gpu_view)
             if self.is_hybrid_model and hasattr(self, "mamba_metadata"):
                 self.mamba_metadata.bind_gpu_buffers(self.gpu_view)
+            self._refresh_active_metadata_views_for_bound_slot()
         if changed and hasattr(self, "_input_position_views"):
             self._input_position_views.clear()
         return slot
+
+    def _refresh_active_metadata_views_for_bound_slot(self) -> None:
+        """Rebuild active per-step metadata slices after switching decode slots."""
+
+        if self.active_attn_metadata is not None:
+            mha = self.active_attn_metadata["mha_metadata"]
+            if getattr(mha, "state_data", None):
+                mha.set_state_data(
+                    padded_active_request_count=self.padded_active_request_count,
+                    max_seqlen_q=mha.state_data["max_seqlen_q"],
+                    max_seqlen_k=mha.state_data["max_seqlen_k"],
+                )
+
+        if (
+            self.is_hybrid_model
+            and hasattr(self, "mamba_metadata")
+            and self.mamba_metadata is not None
+            and self.is_decode_only()
+            and self.padded_batch_dimensions.decode_req_count > 0
+        ):
+            self.mamba_metadata.batch_indices_decode = (
+                self.gpu_view.mamba_batch_indices_decode[
+                    : self.padded_batch_dimensions.decode_req_count
+                ]
+            )
 
     def active_decode_slot(self) -> Optional[AsyncDecodeSlot]:
         """Return the slot currently bound to forward metadata."""
