@@ -1138,6 +1138,10 @@ class DynamicInferenceEngine(AbstractEngine):
         accepted_tokens: torch.Tensor,
         log_probs: torch.Tensor,
         top_n_logprobs: Optional[Dict[int, List[Tuple[torch.Tensor, torch.Tensor]]]] = None,
+        log_probs_by_request_id: Optional[Dict[int, List[float]]] = None,
+        top_n_logprobs_by_request_id: Optional[
+            Dict[int, List[Tuple[torch.Tensor, torch.Tensor]]]
+        ] = None,
         pre_fwd_active_token_count: Optional[int] = None,
         pre_fwd_step_count: Optional[int] = None,
         finished_routing_block_ids: Optional[Dict[int, list[int]]] = None,
@@ -1155,6 +1159,8 @@ class DynamicInferenceEngine(AbstractEngine):
             log_probs: (List): Log probs for each request
             top_n_logprobs: (Dict): Top-n log probs for each request. Maps request_idx to
                 list of (top_n_logprobs, top_n_indices) tuples.
+            log_probs_by_request_id: Log probs keyed by request id after commit.
+            top_n_logprobs_by_request_id: Top-n log probs keyed by request id after commit.
             finished_routing_block_ids: (Dict[int, List[int]]): Block IDs for
                 finished requests, saved before update_requests released them.
                 Used for per-block routing reconstruction.
@@ -1169,8 +1175,14 @@ class DynamicInferenceEngine(AbstractEngine):
         if evict_request_ids is not None:
             self.evicted_request_count += evict_request_ids.numel()
 
-        log_probs_iter = log_probs if log_probs else repeat(None)
         block_allocator = self.context.kv_block_allocator
+        request_id_list = request_ids.tolist()
+        if log_probs_by_request_id is not None:
+            log_probs_iter = (
+                log_probs_by_request_id.get(int(request_id)) for request_id in request_id_list
+            )
+        else:
+            log_probs_iter = log_probs if log_probs else repeat(None)
 
         # Pre-compute step-level block stats (before the per-request loop)
         if self.track_generated_token_events:
@@ -1190,8 +1202,14 @@ class DynamicInferenceEngine(AbstractEngine):
             self._spec_steps += 1
 
         for req_idx, (request_id, tokens, accepted_tokens_list, request_log_probs) in enumerate(
-            zip(request_ids.tolist(), sample.tolist(), accepted_tokens_iter, log_probs_iter)
+            zip(request_id_list, sample.tolist(), accepted_tokens_iter, log_probs_iter)
         ):
+            request_id = int(request_id)
+            request_top_n_logprobs = None
+            if top_n_logprobs_by_request_id is not None:
+                request_top_n_logprobs = top_n_logprobs_by_request_id.get(request_id)
+            elif top_n_logprobs is not None and req_idx in top_n_logprobs:
+                request_top_n_logprobs = top_n_logprobs[req_idx]
 
             # Ensure tokens is always a list for consistent handling
             if not isinstance(tokens, list):
@@ -1226,8 +1244,8 @@ class DynamicInferenceEngine(AbstractEngine):
                     # Trim log probs / top-n to match so the counts stay in sync.
                     if request_log_probs is not None:
                         request_log_probs = request_log_probs[:keep]
-                    if top_n_logprobs is not None and req_idx in top_n_logprobs:
-                        top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:keep]
+                    if request_top_n_logprobs is not None:
+                        request_top_n_logprobs = request_top_n_logprobs[:keep]
                 if request_id not in self.stop_word_being_finished_ids:
                     is_first_token = len(request.generated_tokens) == 0
                     request.generated_tokens += tokens
@@ -1339,8 +1357,8 @@ class DynamicInferenceEngine(AbstractEngine):
             if num_stop_word_trim > 0:
                 if request_log_probs is not None:
                     request_log_probs = request_log_probs[:-num_stop_word_trim]
-                if top_n_logprobs is not None and req_idx in top_n_logprobs:
-                    top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_stop_word_trim]
+                if request_top_n_logprobs is not None:
+                    request_top_n_logprobs = request_top_n_logprobs[:-num_stop_word_trim]
 
             # Process log_probs if available (unified for both regular and chunked prefill)
             # Skip for requests being finished due to stop words — tokens are not
@@ -1384,8 +1402,7 @@ class DynamicInferenceEngine(AbstractEngine):
             # Process top_n_logprobs if available (unified for both regular and chunked prefill)
             # Same stop-word guard as log probs above.
             if (
-                top_n_logprobs is not None
-                and req_idx in top_n_logprobs
+                request_top_n_logprobs is not None
                 and request_id not in self.stop_word_being_finished_ids
             ):
                 # Initialize lists if they don't exist
@@ -1394,7 +1411,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 if request.generated_top_n_logprobs is None:
                     request.generated_top_n_logprobs = []
 
-                top_n_data_list = top_n_logprobs[req_idx]
+                top_n_data_list = request_top_n_logprobs
                 prompt_length = len(request.prompt_tokens)
 
                 # Process each token's top-n logprobs
@@ -1858,6 +1875,8 @@ class DynamicInferenceEngine(AbstractEngine):
             accepted_tokens = step_result["accepted_tokens"]
             log_probs = step_result["log_probs"]
             top_n_logprobs = step_result.get("top_n_logprobs", None)
+            log_probs_by_request_id = step_result.get("log_probs_by_request_id")
+            top_n_logprobs_by_request_id = step_result.get("top_n_logprobs_by_request_id")
             finished_routing_block_ids = step_result.get("finished_routing_block_ids", None)
             cuda_graph_request_count = step_result["cuda_graph_request_count"]
 
@@ -1876,6 +1895,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 accepted_tokens,
                 log_probs,
                 top_n_logprobs,
+                log_probs_by_request_id=log_probs_by_request_id,
+                top_n_logprobs_by_request_id=top_n_logprobs_by_request_id,
                 pre_fwd_active_token_count=context_state.get("active_token_count"),
                 pre_fwd_step_count=context_state.get("step_count"),
                 finished_routing_block_ids=finished_routing_block_ids,

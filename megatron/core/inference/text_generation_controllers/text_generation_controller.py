@@ -749,10 +749,6 @@ class TextGenerationController:
             or getattr(self.model_config, "num_moe_experts", None) is not None
         ):
             return AsyncTxnSkipReason.MOE_EP_DEFERRED
-        if self._get_stop_word_finished_ids_callback is not None:
-            return AsyncTxnSkipReason.TERMINAL_CHECK_REQUIRED
-        if return_log_probs or return_top_n_logprobs:
-            return AsyncTxnSkipReason.LOGPROBS_DEFERRED
         if active_request_count != len(child_txn.request_ids):
             return AsyncTxnSkipReason.UNKNOWN_BARRIER
         return None
@@ -1887,6 +1883,55 @@ class TextGenerationController:
             **(update_result or {}),
         }
 
+    def _dynamic_step_publication_by_request_id(
+        self,
+        request_ids: Tensor,
+        sample: Tensor,
+        accepted_tokens: Optional[Tensor],
+        log_probs: Optional[List[List[float]]],
+        top_n_logprobs: Optional[Dict[int, List[Tuple[Tensor, Tensor]]]],
+    ) -> Dict[str, Dict[int, Any]]:
+        """Build post-commit publication artifacts keyed by request id.
+
+        The hot path consumes tensors in row order, but anything externally
+        visible must survive compaction. These maps are built after
+        ``update_requests`` so row indices are translated once at the publication
+        boundary and downstream code can address artifacts by request id.
+        """
+
+        request_id_list = [int(request_id) for request_id in request_ids.tolist()]
+
+        sample_by_request_id = {
+            request_id: tokens for request_id, tokens in zip(request_id_list, sample.tolist())
+        }
+
+        accepted_tokens_by_request_id = {}
+        if accepted_tokens is not None:
+            accepted_tokens_by_request_id = {
+                request_id: tokens
+                for request_id, tokens in zip(request_id_list, accepted_tokens.tolist())
+            }
+
+        log_probs_by_request_id = {}
+        if log_probs is not None:
+            log_probs_by_request_id = {
+                request_id: request_log_probs
+                for request_id, request_log_probs in zip(request_id_list, log_probs)
+            }
+
+        top_n_logprobs_by_request_id = {}
+        if top_n_logprobs is not None:
+            for row_idx, request_top_n in top_n_logprobs.items():
+                if row_idx < len(request_id_list):
+                    top_n_logprobs_by_request_id[request_id_list[row_idx]] = request_top_n
+
+        return {
+            "sample_by_request_id": sample_by_request_id,
+            "accepted_tokens_by_request_id": accepted_tokens_by_request_id,
+            "log_probs_by_request_id": log_probs_by_request_id,
+            "top_n_logprobs_by_request_id": top_n_logprobs_by_request_id,
+        }
+
     async def async_generate_output_tokens_dynamic_batch(
         self, skip_bookkeeping: Optional[bool] = False
     ) -> Optional[Dict]:
@@ -2069,17 +2114,28 @@ class TextGenerationController:
                         context.prepare_child_from_committed_decode_state()
                     )
 
+            accepted_tokens_result = (
+                # Clone needed: .fill_(-1) below would corrupt the returned value.
+                self._accepted_tokens_per_request.clone()
+                if self.num_speculative_tokens > 0 and num_decode_requests > 0
+                else None
+            )
             ret = {
-                "accepted_tokens": (
-                    # Clone needed: .fill_(-1) below would corrupt the returned value.
-                    self._accepted_tokens_per_request.clone()
-                    if self.num_speculative_tokens > 0 and num_decode_requests > 0
-                    else None
-                ),
+                "accepted_tokens": accepted_tokens_result,
                 "log_probs": log_probs,
                 "top_n_logprobs": top_n_logprobs,
                 "cuda_graph_request_count": cuda_graph_request_count,
             }
+            if "active_request_ids" in request_bookkeeping:
+                ret.update(
+                    self._dynamic_step_publication_by_request_id(
+                        request_bookkeeping["active_request_ids"],
+                        request_bookkeeping["sample"],
+                        accepted_tokens_result,
+                        log_probs,
+                        top_n_logprobs,
+                    )
+                )
             if self.num_speculative_tokens > 0:
                 self._accepted_tokens_per_request.fill_(-1)
                 self._accepted_token_counts_per_request.fill_(0)
