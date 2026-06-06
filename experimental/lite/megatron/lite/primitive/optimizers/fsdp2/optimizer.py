@@ -75,7 +75,7 @@ class FSDP2Optimizer:
         tp_replicated_grad_params: Iterable[nn.Parameter] | None = None,
         tp_replicated_grad_sync_group: dist.ProcessGroup | None = None,
         grad_norm_accum_dtype: str | torch.dtype = torch.float32,
-        optimizer_offload_dtensor_state: bool = False,
+        optimizer_offload_dtensor_state: bool = True,
         param_names: dict[int, str] | None = None,
     ):
         self.optimizer = optimizer
@@ -301,7 +301,7 @@ def build_fsdp2_adamw(
     tp_replicated_grad_sync_group: dist.ProcessGroup | None = None,
     grad_norm_accum_dtype: str | torch.dtype = torch.float32,
     adamw_foreach: bool | str = "auto",
-    optimizer_offload_dtensor_state: bool = False,
+    optimizer_offload_dtensor_state: bool = True,
     use_fp32_master: bool = False,
     model_param_dtypes: dict[tuple[int, str], torch.dtype] | None = None,
 ) -> FSDP2Optimizer:

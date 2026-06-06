@@ -103,10 +103,7 @@ def offload_model_to_cpu(model_list: list) -> None:
                 if not param.requires_grad and param.device.type != "cpu":
                     param.data = param.data.to("cpu", non_blocking=True)
         else:
-            for p in model_chunk.parameters():
-                p.data = p.data.cpu()
-                if p.grad is not None:
-                    p.grad = p.grad.cpu()
+            model_chunk.to("cpu")
 
 
 def load_model_to_gpu(model_list: list, load_grad: bool = True) -> None:
@@ -134,7 +131,7 @@ def load_model_to_gpu(model_list: list, load_grad: bool = True) -> None:
                 if not param.requires_grad and param.device.type == "cpu":
                     param.data = param.data.to("cuda", non_blocking=True)
         else:
-            model_chunk.cuda()
+            model_chunk.to("cuda")
 
 
 # ======================================================================

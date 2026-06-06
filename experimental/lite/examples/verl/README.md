@@ -57,8 +57,12 @@ Useful knobs:
 - `ATTENTION_BACKEND=flash`
 - `DRY_RUN=1` to print the resolved `torchrun` command without launching
 
-For the FSDP2 optimizer primitive, keep `PARAM_OFFLOAD=False`; optimizer
-offload is supported through `OPTIMIZER_OFFLOAD=True`.
+FSDP2 supports two offload modes. `PARAM_OFFLOAD=True` and
+`OPTIMIZER_OFFLOAD=True` move model parameters and optimizer state between CPU
+and GPU when VERL switches execution contexts. `OPTIMIZER_OFFLOAD=True` also
+sets `optim.override_optimizer_config.offload_fraction=1.0` by default, which
+keeps FSDP2 optimizer update state on CPU during forward/backward to reduce GPU
+memory pressure.
 
 Example dry run:
 

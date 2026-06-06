@@ -164,13 +164,6 @@ class MegatronLiteEngine(BaseEngine):
         self.handle = self.runtime.build_model()
         self.module = self._extract_primary_module()
 
-        optimizer_backend = self.handle._extras.get("optimizer_backend")
-        if optimizer_backend == "fsdp2" and self.is_param_offload_enabled:
-            raise ValueError(
-                "Megatron Lite FSDP2 does not support runtime model param offload yet; "
-                "set engine.param_offload=False."
-            )
-
         if self.handle._optimizer is not None and self.handle._lr_scheduler is None:
             self.handle._lr_scheduler = _build_lr_scheduler(self.handle._optimizer, self._mlite_config.optimizer)
 
