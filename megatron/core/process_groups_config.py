@@ -163,15 +163,16 @@ class ProcessGroupCollection:
         """Return a concise representation showing which process groups exist and their sizes."""
         active_pgs = []
         for field_info in fields(self):
-            if hasattr(self, field_info.name):
-                pg = getattr(self, field_info.name)
-                if pg is None:
-                    active_pgs.append(f"{field_info.name}(None)")
-                elif isinstance(pg, list):
-                    sizes = [g.size() for g in pg]
-                    active_pgs.append(f"{field_info.name}({sizes})")
-                else:
-                    active_pgs.append(f"{field_info.name}({pg.size()})")
+            if field_info.name not in vars(self):
+                continue
+            pg = getattr(self, field_info.name)
+            if pg is None:
+                continue
+            elif isinstance(pg, list):
+                sizes = [g.size() for g in pg]
+                active_pgs.append(f"{field_info.name}({sizes})")
+            else:
+                active_pgs.append(f"{field_info.name}({pg.size()})")
         return (
             f"ProcessGroupCollection({', '.join(active_pgs)})"
             if active_pgs
@@ -371,9 +372,10 @@ class ProcessGroupCollection:
 
         else:
             # Use provided process group collection with validation and fallbacks
+            pg_set = vars(pg_collection)
 
             # 1. dp group - this is always required
-            if not hasattr(pg_collection, 'dp'):
+            if 'dp' not in pg_set:
                 raise ValueError("dp process group is required but not provided in pg_collection")
             dp_group = pg_collection.dp
 
@@ -393,7 +395,7 @@ class ProcessGroupCollection:
                     )
 
             # 3. Handle expert data parallel group
-            if not hasattr(pg_collection, 'expt_dp'):
+            if 'expt_dp' not in pg_set:
                 raise ValueError(
                     "expt_dp process group is required but not provided in pg_collection. "
                     "Please explicitly set it to None if you don't need it."
@@ -414,10 +416,10 @@ class ProcessGroupCollection:
                 else:
                     # With multiple optimizer instances, both groups must be provided
                     if not (
-                        hasattr(pg_collection, 'intra_dp_cp')
-                        and hasattr(pg_collection, 'intra_expt_dp')
-                        and hasattr(pg_collection, 'inter_dist_opt')
-                        and hasattr(pg_collection, 'intra_dist_opt')
+                        'intra_dp_cp' in pg_set
+                        and 'intra_expt_dp' in pg_set
+                        and 'inter_dist_opt' in pg_set
+                        and 'intra_dist_opt' in pg_set
                     ):
                         raise ValueError(
                             "intra_dp_cp, intra_expt_dp, inter_dist_opt, and intra_dist_opt "
@@ -429,7 +431,7 @@ class ProcessGroupCollection:
                     inter_dist_opt_group = pg_collection.inter_dist_opt
 
                 if ddp_config.use_distributed_optimizer:
-                    if not hasattr(pg_collection, 'intra_dist_opt'):
+                    if 'intra_dist_opt' not in pg_set:
                         raise ValueError(
                             "intra_dist_opt process group is required but not provided in "
                             "pg_collection. Please explicitly set it to None if you don't need it."
@@ -445,7 +447,7 @@ class ProcessGroupCollection:
                 intra_dist_opt_group = None
 
             # 5. Model communication groups
-            if not hasattr(pg_collection, 'mp'):
+            if 'mp' not in pg_set:
                 raise ValueError(
                     "mp process group is required but not provided in pg_collection. "
                     "Please explicitly set it to None if you don't need it."
@@ -453,7 +455,7 @@ class ProcessGroupCollection:
             mp_group = pg_collection.mp
 
             # Expert tensor-model-pipeline group for MoE
-            if not hasattr(pg_collection, 'tp_ep_pp'):
+            if 'tp_ep_pp' not in pg_set:
                 raise ValueError(
                     "tp_ep_pp process group is required but not provided in pg_collection. "
                     "Please explicitly set it to None if you don't need it."
@@ -578,9 +580,10 @@ class ProcessGroupCollection:
         else:
             # Use provided process group collection with validation and fallbacks
             result = {}
+            pg_set = vars(pg_collection)
 
             # 1. dp group - this is always required
-            if not hasattr(pg_collection, 'dp'):
+            if 'dp' not in pg_set:
                 raise ValueError("dp process group is required but not provided in pg_collection")
             result['dp_group'] = pg_collection.dp
 
@@ -621,9 +624,9 @@ class ProcessGroupCollection:
             else:
                 # With multiple optimizer instances, groups must be provided
                 if not (
-                    hasattr(pg_collection, 'intra_dp_cp')
-                    and hasattr(pg_collection, 'intra_expt_dp')
-                    and hasattr(pg_collection, 'inter_dist_opt')
+                    'intra_dp_cp' in pg_set
+                    and 'intra_expt_dp' in pg_set
+                    and 'inter_dist_opt' in pg_set
                 ):
                     raise ValueError(
                         "intra_dp_cp, intra_expt_dp, and inter_dist_opt "
@@ -635,13 +638,7 @@ class ProcessGroupCollection:
                 result['inter_dist_opt_group'] = pg_collection.inter_dist_opt
 
             # 5. Model parallel groups (DDP-specific: tp, pp, ep instead of mp, expt_tp_pp)
-            if not all(
-                [
-                    hasattr(pg_collection, 'tp'),
-                    hasattr(pg_collection, 'pp'),
-                    hasattr(pg_collection, 'ep'),
-                ]
-            ):
+            if not all(['tp' in pg_set, 'pp' in pg_set, 'ep' in pg_set]):
                 raise ValueError(
                     "tp, pp and ep process groups are required but not provided in pg_collection"
                 )
