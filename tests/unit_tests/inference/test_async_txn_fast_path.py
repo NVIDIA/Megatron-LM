@@ -264,7 +264,7 @@ def test_child_launch_allows_ordinary_terminal_rows():
     assert context.async_txn_diagnostics.launched == 1
 
 
-def test_cuda_graph_child_launch_reuses_current_slot_with_deferred_h2d():
+def test_cuda_graph_child_launch_uses_child_slot_without_deferred_h2d():
     context = FakeContext(use_cuda_graph=True)
     controller, order = _make_controller(context)
     controller._enable_cuda_graph = True
@@ -272,9 +272,9 @@ def test_cuda_graph_child_launch_reuses_current_slot_with_deferred_h2d():
     asyncio.run(controller.async_generate_output_tokens_dynamic_batch())
 
     assert "child_forward" in order
-    assert context.active_decode_slot_id == 0
-    assert controller._async_launched_child_txn.slot_id == 0
-    assert context.deferred_h2d_prepares >= 1
+    assert context.active_decode_slot_id == 1
+    assert controller._async_launched_child_txn.slot_id == 1
+    assert context.deferred_h2d_prepares == 0
     assert context.async_txn_diagnostics.launched == 1
 
 

@@ -370,6 +370,7 @@ class AsyncDecodeSlot:
 
     slot_id: int
     gpu_view: object
+    cpu_bookkeeping_buf: object = None
     h2d_done_event: object = None
     forward_done_event: object = None
 

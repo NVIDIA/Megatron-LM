@@ -1251,10 +1251,32 @@ class DynamicInferenceContext(BaseInferenceContext):
                 device=torch.cuda.current_device(),
                 max_mamba_chunks=self._max_mamba_chunks,
             )
+            slot_cpu_bookkeeping_bufs = (
+                torch.empty(
+                    self._cpu_bookkeeping_buf.shape,
+                    dtype=self._cpu_bookkeeping_buf.dtype,
+                    device="cpu",
+                    pin_memory=True,
+                ),
+                torch.empty(
+                    self._cpu_bookkeeping_buf.shape,
+                    dtype=self._cpu_bookkeeping_buf.dtype,
+                    device="cpu",
+                    pin_memory=True,
+                ),
+            )
             self.async_decode_slot_ring = AsyncDecodeSlotRing(
                 (
-                    AsyncDecodeSlot(slot_id=0, gpu_view=self.gpu_view),
-                    AsyncDecodeSlot(slot_id=1, gpu_view=child_gpu_view),
+                    AsyncDecodeSlot(
+                        slot_id=0,
+                        gpu_view=self.gpu_view,
+                        cpu_bookkeeping_buf=slot_cpu_bookkeeping_bufs[0],
+                    ),
+                    AsyncDecodeSlot(
+                        slot_id=1,
+                        gpu_view=child_gpu_view,
+                        cpu_bookkeeping_buf=slot_cpu_bookkeeping_bufs[1],
+                    ),
                 )
             )
 
@@ -1552,8 +1574,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
             return None
 
-        child_cpu_buf = self._cpu_bookkeeping_buf.clone()
-        self._patch_plain_decode_child_bookkeeping(
+        child_cpu_buf = self._async_child_cpu_bookkeeping_buf(child_slot)
+        self._build_plain_decode_child_bookkeeping(
             child_cpu_buf, active_request_count, kv_block_leases=kv_block_leases
         )
         h2d_done_event = None
@@ -1606,18 +1628,51 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         return tuple(leases)
 
-    def _patch_plain_decode_child_bookkeeping(
+    def _async_child_cpu_bookkeeping_buf(self, child_slot: AsyncDecodeSlot) -> Tensor:
+        """Return this slot's pinned CPU staging buffer for child metadata."""
+
+        child_cpu_buf = getattr(child_slot, "cpu_bookkeeping_buf", None)
+        if child_cpu_buf is None:
+            child_cpu_buf = torch.empty(
+                self._cpu_bookkeeping_buf.shape,
+                dtype=self._cpu_bookkeeping_buf.dtype,
+                device="cpu",
+                pin_memory=self._cpu_bookkeeping_buf.is_pinned(),
+            )
+            child_slot.cpu_bookkeeping_buf = child_cpu_buf
+        return child_cpu_buf
+
+    def _build_plain_decode_child_bookkeeping(
         self,
         child_cpu_buf: Tensor,
         active_request_count: int,
         *,
         kv_block_leases: Sequence[KVBlockLease] = (),
     ) -> None:
-        """Patch a CPU bookkeeping clone from current decode to child decode."""
+        """Build the child CPU metadata snapshot by active slices only.
+
+        The full bookkeeping layout contains the max-request block table, which
+        is large for long-context graphs.  Child decode differs from committed
+        decode only in active rows plus any newly reserved boundary blocks, so
+        avoid cloning inactive rows that the child graph will never read.
+        """
 
         token_count = active_request_count
+        padded_token_count = max(token_count, self.padded_active_token_count)
+        padded_active = max(active_request_count, self.padded_active_request_count)
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+
+        child_token_to_input_ids = self._cpu_bookkeeping_clone_view(
+            self.token_to_input_ids, child_cpu_buf
+        )
         child_token_to_pos_ids = self._cpu_bookkeeping_clone_view(
             self.token_to_pos_ids, child_cpu_buf
+        )
+        child_token_to_block_idx = self._cpu_bookkeeping_clone_view(
+            self.token_to_block_idx, child_cpu_buf
+        )
+        child_token_to_request_idx = self._cpu_bookkeeping_clone_view(
+            self.token_to_request_idx, child_cpu_buf
         )
         child_token_to_position = self._cpu_bookkeeping_clone_view(
             self.token_to_position_in_request, child_cpu_buf
@@ -1625,8 +1680,28 @@ class DynamicInferenceContext(BaseInferenceContext):
         child_token_to_local = self._cpu_bookkeeping_clone_view(
             self.token_to_local_position_within_kv_block, child_cpu_buf
         )
+        child_staging_prefill = self._cpu_bookkeeping_clone_view(
+            self._staging_request_in_prefill_status, child_cpu_buf
+        )
+        child_staging_query_lengths = self._cpu_bookkeeping_clone_view(
+            self._staging_request_query_lengths, child_cpu_buf
+        )
         child_staging_kv_offsets = self._cpu_bookkeeping_clone_view(
             self._staging_request_kv_length_offsets, child_cpu_buf
+        )
+        child_temperature = self._cpu_bookkeeping_clone_view(
+            self._staging_temperature, child_cpu_buf
+        )
+        child_top_k = self._cpu_bookkeeping_clone_view(self._staging_top_k, child_cpu_buf)
+        child_top_p = self._cpu_bookkeeping_clone_view(self._staging_top_p, child_cpu_buf)
+        child_last_token_idxs = self._cpu_bookkeeping_clone_view(
+            self.active_request_last_token_idxs, child_cpu_buf
+        )
+        child_mha_query_lengths = self._cpu_bookkeeping_clone_view(
+            self._cpu_mha_query_lengths, child_cpu_buf
+        )
+        child_mha_cu_query_lengths = self._cpu_bookkeeping_clone_view(
+            self._cpu_mha_cu_query_seq_lengths, child_cpu_buf
         )
         child_mha_kv_lengths = self._cpu_bookkeeping_clone_view(
             self._cpu_mha_kv_seq_lengths, child_cpu_buf
@@ -1634,21 +1709,63 @@ class DynamicInferenceContext(BaseInferenceContext):
         child_mha_cu_kv_lengths = self._cpu_bookkeeping_clone_view(
             self._cpu_mha_cu_kv_seq_lengths, child_cpu_buf
         )
-        child_token_to_block_idx = self._cpu_bookkeeping_clone_view(
-            self.token_to_block_idx, child_cpu_buf
-        )
         child_mha_block_table = self._cpu_bookkeeping_clone_view(
             self._cpu_mha_block_table, child_cpu_buf
         )
 
+        child_token_to_input_ids[:token_count].copy_(self.token_to_input_ids[:token_count])
+        child_token_to_pos_ids[:token_count].copy_(self.token_to_pos_ids[:token_count])
         child_token_to_pos_ids[:token_count].add_(1)
+        child_token_to_block_idx[:token_count].copy_(self.token_to_block_idx[:token_count])
+        child_token_to_request_idx[:token_count].copy_(self.token_to_request_idx[:token_count])
+        child_token_to_position[:token_count].copy_(
+            self.token_to_position_in_request[:token_count]
+        )
         child_token_to_position[:token_count].add_(1)
+        child_token_to_local[:token_count].copy_(
+            self.token_to_local_position_within_kv_block[:token_count]
+        )
         child_token_to_local[:token_count].add_(1)
         child_token_to_local[:token_count].remainder_(self.block_size_tokens)
+
+        if token_count < padded_token_count:
+            pad_slice = slice(token_count, padded_token_count)
+            child_token_to_input_ids[pad_slice] = 0
+            child_token_to_pos_ids[pad_slice] = 0
+            child_token_to_block_idx[pad_slice] = self.kv_block_allocator.dummy_block_idx
+            child_token_to_request_idx[pad_slice] = -1
+            child_token_to_position[pad_slice] = 0
+            child_token_to_local[pad_slice] = 0
+
+        child_staging_prefill[:active_request_count] = 0
+        child_staging_query_lengths[:active_request_count].copy_(
+            self.request_query_lengths[active_slice]
+        )
+        child_staging_kv_offsets[:active_request_count].copy_(
+            self.request_kv_length_offsets[active_slice]
+        )
         child_staging_kv_offsets[:active_request_count].add_(1)
+        child_temperature[:padded_active].copy_(
+            self.active_request_metadata["temperature"][:padded_active]
+        )
+        child_top_k[:padded_active].copy_(self.active_request_metadata["top_k"][:padded_active])
+        child_top_p[:padded_active].copy_(self.active_request_metadata["top_p"][:padded_active])
+        child_last_token_idxs[:padded_active].copy_(
+            self.active_request_last_token_idxs[:padded_active]
+        )
+        if active_request_count < padded_active:
+            pad_slice = slice(active_request_count, padded_active)
+            child_staging_prefill[pad_slice] = 0
+            child_staging_query_lengths[pad_slice] = 0
+            child_staging_kv_offsets[pad_slice] = 0
 
         real_bs = self.batch_dimensions.req_count
         padded_bs = self.padded_batch_dimensions.req_count
+        child_mha_query_lengths[:padded_bs].copy_(self._cpu_mha_query_lengths[:padded_bs])
+        child_mha_cu_query_lengths[: padded_bs + 1].copy_(
+            self._cpu_mha_cu_query_seq_lengths[: padded_bs + 1]
+        )
+        child_mha_kv_lengths[:real_bs].copy_(self._cpu_mha_kv_seq_lengths[:real_bs])
         child_mha_kv_lengths[:real_bs].add_(1)
         child_mha_cu_kv_lengths[0] = 0
         if real_bs > 0:
@@ -1659,6 +1776,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             child_mha_cu_kv_lengths[real_bs + 1 : padded_bs + 1] = child_mha_cu_kv_lengths[
                 real_bs
             ]
+            child_mha_kv_lengths[real_bs:padded_bs] = 0
+        child_mha_block_table[:real_bs].copy_(self._cpu_mha_block_table[:real_bs])
+        if real_bs < padded_bs:
+            child_mha_block_table[real_bs:padded_bs] = -1
 
         if kv_block_leases:
             active_request_ids = self.request_ids[
@@ -1671,6 +1792,16 @@ class DynamicInferenceContext(BaseInferenceContext):
                 row = request_id_to_row[int(lease.request_id)]
                 child_token_to_block_idx[row] = int(lease.block_id)
                 child_mha_block_table[row, int(lease.block_column)] = int(lease.block_id)
+
+        if self.is_hybrid_model:
+            child_mamba_decode = self._cpu_bookkeeping_clone_view(
+                self._cpu_mamba_batch_indices_decode, child_cpu_buf
+            )
+            child_mamba_decode[:padded_active].copy_(
+                self._cpu_mamba_batch_indices_decode[:padded_active]
+            )
+            if active_request_count < padded_active:
+                child_mamba_decode[active_request_count:padded_active] = -1
 
     def _cpu_bookkeeping_clone_view(self, source: Tensor, child_cpu_buf: Tensor) -> Tensor:
         """Return the matching typed view inside a cloned CPU bookkeeping buffer."""
