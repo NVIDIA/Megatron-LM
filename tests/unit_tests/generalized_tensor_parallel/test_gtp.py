@@ -1623,3 +1623,76 @@ class TestWaitAsyncCommsFallback:
         assert (
             p._already_finalized is False
         ), "_already_finalized must stay False — no finalize happened for a pure-AG param"
+
+
+# ---------------------------------------------------------------------------
+# 24. GTP DDP bucket alignment: distributed optimizer bucket-end assertion
+# ---------------------------------------------------------------------------
+
+
+def _worker_gtp_ddp_bucket_alignment(rank, world_size, port):
+    """GTP buffers must use padded bucket layout when use_distributed_optimizer=True.
+
+    Without the fix (param_layout=None for GTP buffers in DDP), bucket ends are
+    not padded to be divisible by intra_dp_cp_with_gtp_group.size(), violating the
+    assertion at param_and_grad_buffer.py:1427.
+
+    Trigger conditions:
+      GTP=2, DP=4  →  intra_dp_cp_with_gtp_group.size() = 2
+      pad_for_alignment=0  →  shard of [out=2,in=3] weight = [1,3] = 3 elements (odd)
+      Two GTP params (total 6 = 2*3; 6%2==0 passes the per-buffer total check)
+      bucket_size=3  →  first param alone fills bucket-0; end=3, 3%2≠0 → AssertionError
+    """
+    from megatron.core import parallel_state as ps
+    from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    # The module fixture initialized model_parallel without GTP; re-init with GTP=2.
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        gtp_remat_size=2,
+    )
+
+    orig_pad = gtp_module.GTP_CONFIG.pad_for_alignment
+    gtp_module.GTP_CONFIG.pad_for_alignment = 0
+    try:
+        gtp_group = ps.get_generalized_tensor_parallel_remat_group()
+
+        class _TwoLayerModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.fc0 = te.Linear(3, 2, bias=False, device="cuda")
+                self.fc1 = te.Linear(3, 2, bias=False, device="cuda")
+
+        model = _TwoLayerModel()
+        wrap_module_params_gtp(model.fc0, ["weight"], gtp_group)
+        wrap_module_params_gtp(model.fc1, ["weight"], gtp_group)
+
+        config = TransformerConfig(
+            num_attention_heads=1,
+            num_layers=1,
+            hidden_size=4,
+            tensor_model_parallel_size=1,
+        )
+        ddp_config = DistributedDataParallelConfig(
+            use_distributed_optimizer=True,
+            overlap_grad_reduce=True,
+            bucket_size=3,
+        )
+
+        # Without the fix this raises AssertionError at param_and_grad_buffer.py:1427:
+        #   assert end_index % self.data_parallel_world_size == 0
+        DistributedDataParallel(config, ddp_config, model)
+    finally:
+        gtp_module.GTP_CONFIG.pad_for_alignment = orig_pad
+        ps.destroy_model_parallel()
+        ps.initialize_model_parallel()  # restore default for remaining tests
+
+
+class TestGTPDDPBucketAlignment:
+    def test_gtp_buffers_use_padded_layout_with_distributed_optimizer(self):
+        """GTP DDP buffer creation must not violate bucket-end alignment for dist-opt."""
+        _requires_multi_gpu(4)
+        _run_distributed(_worker_gtp_ddp_bucket_alignment, 4)

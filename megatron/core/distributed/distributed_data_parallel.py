@@ -339,6 +339,19 @@ class DistributedDataParallel(_BaseDataParallel):
         # applied to GTP buffers (GTP manages its own sharding).
         for buffer_key, (params, param_indices) in gtp_buffer_groups.items():
             params_with_names = [(p, param_to_name[p]) for p in params]
+            if self.ddp_config.use_distributed_optimizer:
+                # Pad bucket ends to intra_dp_cp_with_gtp_group.size() for dist-opt alignment.
+                from ..optimizer.distrib_optimizer import DistributedOptimizer
+
+                gtp_layout = DistributedOptimizer._compute_per_buffer_param_layout(
+                    params,
+                    self.bucket_size,
+                    self.intra_dp_cp_with_gtp_group.size(),
+                    self.ddp_config,
+                    param_indices,
+                )
+            else:
+                gtp_layout = None
             buffer = _ParamAndGradBuffer(
                 self.ddp_config,
                 buffer_key.param_dtype,
@@ -351,7 +364,7 @@ class DistributedDataParallel(_BaseDataParallel):
                 param_indices,
                 self.ddp_config.nccl_ub,
                 pg_collection,
-                param_layout=None,
+                param_layout=gtp_layout,
             )
             self.gtp_buffers.append(buffer)
 
@@ -362,6 +375,18 @@ class DistributedDataParallel(_BaseDataParallel):
         # params took the full intra_expt_dp_group branch above.
         for buffer_key, (params, param_indices) in egtp_buffer_groups.items():
             params_with_names = [(p, param_to_name[p]) for p in params]
+            if self.ddp_config.use_distributed_optimizer:
+                from ..optimizer.distrib_optimizer import DistributedOptimizer
+
+                egtp_layout = DistributedOptimizer._compute_per_buffer_param_layout(
+                    params,
+                    self.bucket_size,
+                    self.intra_expt_dp_with_egtp_group.size(),
+                    self.ddp_config,
+                    param_indices,
+                )
+            else:
+                egtp_layout = None
             buffer = _ParamAndGradBuffer(
                 self.ddp_config,
                 buffer_key.param_dtype,
@@ -374,7 +399,7 @@ class DistributedDataParallel(_BaseDataParallel):
                 param_indices,
                 self.ddp_config.nccl_ub,
                 pg_collection,
-                param_layout=None,
+                param_layout=egtp_layout,
             )
             self.egtp_buffers.append(buffer)
 

@@ -134,7 +134,7 @@ GTP is enabled through two CLI flags on Megatron's training launcher; everything
 
 ### High-priority streams (Blackwell and later)
 
-Required on GB200 / B100 so the GTP comm streams get the SM priority needed for AG/RS overlap with compute:
+Required on GB200 / GB300 so the GTP comm streams get the SM priority needed for AG/RS overlap with compute:
 
 ```bash
 --high-priority-stream-groups ep gtp expt_gtp tp
