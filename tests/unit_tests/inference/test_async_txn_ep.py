@@ -81,12 +81,12 @@ def test_cuda_graph_cache_key_stays_shape_only_for_async_decode():
     assert key == context.padded_batch_dimensions
 
 
-def test_async_decode_child_adoption_is_not_graph_keyed():
+def test_async_decode_child_adoption_uses_current_slot_graph_key():
     context = _make_graph_key_context(active_slot_id=1)
     controller = object.__new__(TextGenerationController)
     controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
 
-    assert controller._async_decode_cuda_graph_key() is None
+    assert controller._async_decode_cuda_graph_key() == context.padded_batch_dimensions
 
 
 def test_cuda_graph_cache_key_stays_shape_only_for_non_decode_or_non_async():

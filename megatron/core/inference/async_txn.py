@@ -325,7 +325,7 @@ class StepTxn:
         return tuple(row_by_request_id[int(request_id)] for request_id in committed_request_ids)
 
     def h2d_ready(self) -> bool:
-        return _event_done(self.h2d_done_event)
+        return self.cpu_bookkeeping_buf is None and _event_done(self.h2d_done_event)
 
     def forward_done(self) -> bool:
         return _event_done(self.forward_done_event)

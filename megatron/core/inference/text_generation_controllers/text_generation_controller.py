@@ -722,13 +722,17 @@ class TextGenerationController:
     def _async_decode_cuda_graph_key(self, slot=None) -> Optional[Any]:
         """Return the graph key used to guard async child adoption.
 
-        Async child forwards intentionally run outside the full-iteration CUDA graph
-        cache. The cache is keyed by the committed step shape, but the child path
-        owns separate transient metadata buffers and must not depend on a replayed
-        graph captured for the persistent context.
+        CUDA-graph child forwards replay the normal committed-step graph by
+        staging the next-step metadata into the current decode slot after
+        sampling. Separate child-slot forwards intentionally do not use this key,
+        because they cannot safely replay a graph captured with current-slot
+        tensor addresses.
         """
 
         del slot
+        context = self.inference_wrapped_model.inference_context
+        if context.using_cuda_graph_this_step() and context.replay_cuda_graph_this_step():
+            return context.cuda_graph_cache_key()
         return None
 
     def _async_active_request_ids(self) -> tuple[int, ...]:
@@ -897,7 +901,19 @@ class TextGenerationController:
     def _prepare_async_child_from_committed_decode_state_impl(self, context) -> Optional[StepTxn]:
         """Implementation for child transaction preparation, wrapped for diagnostics."""
 
-        return context.prepare_child_from_committed_decode_state()
+        target_slot = None
+        defer_h2d = False
+        if context.using_cuda_graph_this_step() and context.replay_cuda_graph_this_step():
+            target_slot = context.async_decode_slot_ring.current
+            defer_h2d = True
+
+        child_txn = context.prepare_child_from_committed_decode_state(
+            target_slot=target_slot,
+            defer_h2d=defer_h2d,
+        )
+        if child_txn is not None:
+            child_txn.cuda_graph_key = self._async_decode_cuda_graph_key()
+        return child_txn
 
     def _decode_slot_for_txn(self, child_txn: StepTxn):
         context = self.inference_wrapped_model.inference_context
@@ -944,6 +960,10 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         assert context.async_decode_slot_ring is not None
         child_slot = self._decode_slot_for_txn(child_txn)
+        current_slot_replay = (
+            child_slot is context.async_decode_slot_ring.current
+            and context.replay_cuda_graph_this_step()
+        )
 
         if hasattr(context, "sync_ep_child_graph_shape"):
             graph_shape_started_at = (
@@ -996,11 +1016,11 @@ class TextGenerationController:
         disable_child_graph_replay = getattr(
             context, "async_child_forward_graph_replay_disabled_scope", None
         )
-        with (
-            disable_child_graph_replay()
-            if disable_child_graph_replay is not None
-            else nullcontext()
-        ):
+        if current_slot_replay or disable_child_graph_replay is None:
+            child_forward_scope = nullcontext()
+        else:
+            child_forward_scope = disable_child_graph_replay()
+        with child_forward_scope:
             self._dynamic_step_forward_logits(input_ids, position_ids)
         if profile_child_forward:
             child_txn.forward_timing_done_event = torch.cuda.Event(enable_timing=True)

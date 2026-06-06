@@ -24,6 +24,11 @@ def test_step_txn_owns_request_snapshot_and_events():
     event.done = True
     assert txn.h2d_ready()
 
+    txn.cpu_bookkeeping_buf = torch.empty(1, dtype=torch.uint8)
+    assert not txn.h2d_ready()
+    txn.cpu_bookkeeping_buf = None
+    assert txn.h2d_ready()
+
 
 def test_step_txn_guard_allows_only_terminal_disappearances():
     txn = StepTxn(step_id=1, request_ids=[1, 2, 3], cuda_graph_key=("decode", 4))
