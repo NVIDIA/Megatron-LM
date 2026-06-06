@@ -21,7 +21,7 @@ torchrun --nproc_per_node=2 examples/run_simple_mcore_train_loop.py
 
 ## LLaMA-3 Training Example
 
-Train an LLaMA-3 8B model with FP8 precision on 8 GPUs using mock data:
+Train a LLaMA-3 8B model with FP8 precision on 8 GPUs using mock data:
 
 ```bash
 ./examples/llama/train_llama3_8b_h100_fp8.sh
