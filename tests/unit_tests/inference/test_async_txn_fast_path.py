@@ -270,6 +270,22 @@ def test_child_launch_occurs_before_cpu_sample_transfer():
     assert controller._async_launched_child_txn is not None
 
 
+def test_prepared_async_child_path_does_not_yield_before_launch(monkeypatch):
+    context = FakeContext()
+    controller, _ = _make_controller(context)
+    sleeps = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    asyncio.run(controller.async_generate_output_tokens_dynamic_batch())
+
+    assert sleeps == []
+    assert context.async_txn_diagnostics.launched == 1
+
+
 def test_child_launch_enters_graph_shape_sync_before_forward():
     context = FakeContext()
     controller, order = _make_controller(context)

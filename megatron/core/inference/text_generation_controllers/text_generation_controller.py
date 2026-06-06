@@ -2502,14 +2502,11 @@ class TextGenerationController:
                         range_pop()
                 range_pop()
 
-        # This is the best place to yield control back to event loop.
-        # At this point we have enqueued FW pass GPU kernels asynchronously.
-        # While they are running, we can do other useful CPU work.
-        # Note: This can be moved further ahead if sampling can be made
-        # asynchronous.
-        # Todo [Siddharth]: Can we condition the sleep on a cuda event?
-        # NOTE [TDE]: This will be moved once CPU and GPU methods are separated.
-        await asyncio.sleep(0)
+        # Yield only when there is no async child ready to chain. With an async
+        # child staged, the lowest-gap decode path is to immediately enqueue
+        # sampling and the child forward behind the current forward.
+        if not (context.async_scheduling and self._async_prepared_child_txn is not None):
+            await asyncio.sleep(0)
 
         with torch.inference_mode():
             range_push("sampling")
