@@ -16,14 +16,24 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.determinism.bit_exact_runner import BitExactRunner
 from tests.unit_tests.determinism.configs import HYBRID_CONFIGS, hybrid_base
 
-# Hybrid keeps a single PP=2 cell. The first mamba cell of the suite always
-# pays a ~60s JIT tax (TE attention + Mamba selective_scan compilation under
-# the hybrid layer-spec), and that cost dominates regardless of how many
-# subsequent cells run — so additional hybrid parametrize coverage adds wall
-# time without changing the determinism risk surface much. GPT-model tests
-# already cover TP/EP/FSDP composites in depth; the hybrid cell here is a
-# smoke test that "Mamba + attn + MLP + PP" stays bit-exact.
-_HYBRID_PARALLELISM_CONFIGS = [pytest.param({"PP": 2}, id="pp2")]
+# Hybrid covers the cheap-and-valuable composites that exercise Mamba +
+# parallelism interactions. The first cell pays a ~60s JIT tax (TE attention
+# + Mamba selective_scan under the hybrid layer-spec); subsequent cells reuse
+# the cache so they're ~5–10s each. Excluded:
+#   * TP=4 / TP=8 — Mamba shard shape re-JIT costs ~25s/40s extra; TP=2
+#     composites below already exercise the TP+Mamba sharding path.
+#   * EP cells (ep2, tp2-ep2, tp2-ep4, fsdp8-ep4) — MoE-inside-hybrid grouped
+#     GEMM compiles a new (E, K, N) shape that doesn't share with the dense
+#     hybrid kernels (~60s extra JIT). GPT-model EP cells already cover MoE
+#     + EP determinism; "MoE in the MLP slot of a hybrid pattern" is marginal
+#     (Mamba layers have no MoE).
+_HYBRID_PARALLELISM_CONFIGS = [
+    pytest.param({"PP": 2}, id="pp2"),
+    pytest.param({"PP": 4}, id="pp4"),
+    pytest.param({"TP": 2, "PP": 2}, id="tp2-pp2"),
+    pytest.param({"PP": 2, "VPP": 2}, id="pp2-vpp2"),
+    pytest.param({"FSDP": 8}, id="fsdp8"),
+]
 
 _SEQ_LEN = 32
 _MICRO_BATCH = 2
