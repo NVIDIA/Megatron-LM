@@ -1210,6 +1210,190 @@ class TestC5PrestagedPlanPrimitives:
         assert diag["skip_reasons"]["pending_admission"] == 1
 
 
+@pytest.mark.internal
+class TestC5HandoffLifecycle:
+    """C5 (CPU-only): the prestage -> launch -> adopt -> retire transaction handoff.
+
+    These exercise the manager-side launch-before-commit machinery the overlap engine
+    wiring consumes: seeding a speculative child from a prestaged plan, launching it with
+    its two fences, the consume-by-request-id adopt guard (design 1.2 / 1.3), and the
+    two-step fence-gated lease retire (design 1.7). All pure CPU bookkeeping over
+    ``StepTxn`` objects -- no model, no allocators, no GPU buffer.
+    """
+
+    @staticmethod
+    def _eligible_plan(step_id=3, request_ids=(10, 11, 12)):
+        return PrestagedDecodePlan(
+            step_id=step_id,
+            eligible=True,
+            snapshot_request_ids=list(request_ids),
+            active_request_count=len(request_ids),
+            kv_block_leases=[5, 6, 7],
+            reserved_boundary_blocks=[(11, 2)],
+            mamba_slot_leases=[1, 2, 3],
+            kv_blocks_needed=1,
+        )
+
+    def test_from_prestaged_plan_carries_snapshot_and_leases(self) -> None:
+        """A StepTxn seeded from an eligible plan carries its snapshot + lease manifest."""
+        plan = self._eligible_plan()
+        txn = StepTxn.from_prestaged_plan(plan, bucket=("decode", 4))
+        assert txn.phase is TxnPhase.PRESTAGED
+        assert txn.speculative is True
+        assert txn.step_id == 3 and txn.active_request_count == 3
+        assert txn.bucket == ("decode", 4)
+        assert txn.request_ids == [10, 11, 12]
+        # Physical leases the forward reads are carried; the lease lists are independent
+        # copies (mutating the txn must not perturb the plan).
+        assert txn.kv_block_leases == [5, 6, 7]
+        assert txn.mamba_slot_leases == [1, 2, 3]
+        txn.kv_block_leases.append(99)
+        assert plan.kv_block_leases == [5, 6, 7]
+        # Boundary crossers are recorded as PENDING (no block id) -- prestage never allocates.
+        assert txn.pending_boundary_columns == [(11, 2)]
+        assert txn.reserved_boundary_blocks == {}
+
+    def test_from_prestaged_plan_rejects_ineligible(self) -> None:
+        """An ineligible plan cannot seed a speculative transaction."""
+        ineligible = PrestagedDecodePlan(
+            step_id=1, eligible=False, skip_reason=LaunchGateReason.RESUME
+        )
+        with pytest.raises(AssertionError):
+            StepTxn.from_prestaged_plan(ineligible)
+
+    def test_prestage_child_eligible_builds_child(self) -> None:
+        """prestage_child seeds + stores the child and counts a prepared step."""
+        mgr = StepTransactionManager(context=None)
+        child = mgr.prestage_child(self._eligible_plan(), bucket=("decode", 4))
+        assert child is mgr.child_txn
+        assert child.phase is TxnPhase.PRESTAGED and child.request_ids == [10, 11, 12]
+        assert mgr.diagnostics.prepared == 1
+        assert mgr.diagnostics.skip_reasons == {}
+
+    def test_prestage_child_ineligible_records_skip_and_no_child(self) -> None:
+        """An ineligible plan leaves child_txn unset and records its static skip reason."""
+        mgr = StepTransactionManager(context=None)
+        # Seed a stale child to prove an ineligible prestage clears it (sync step).
+        mgr.child_txn = StepTxn(step_id=0, phase=TxnPhase.PRESTAGED)
+        out = mgr.prestage_child(
+            PrestagedDecodePlan(
+                step_id=2, eligible=False, skip_reason=LaunchGateReason.PENDING_ADMISSION
+            )
+        )
+        assert out is None and mgr.child_txn is None
+        assert mgr.diagnostics.prepared == 0
+        assert mgr.diagnostics.skip_reasons["pending_admission"] == 1
+
+    def test_launch_child_transitions_and_attaches_fences(self) -> None:
+        """launch_child moves PRESTAGED -> LAUNCHED, attaches both fences, counts launched."""
+        mgr = StepTransactionManager(context=None)
+        mgr.prestage_child(self._eligible_plan())
+        h2d, fwd = _StubEvent(ready=True), _StubEvent(ready=False)
+        child = mgr.launch_child(forward_done_event=fwd, h2d_done_event=h2d)
+        assert child.phase is TxnPhase.LAUNCHED
+        assert child.forward_done_event is fwd and child.h2d_done_event is h2d
+        assert mgr.diagnostics.launched == 1
+
+    def test_launch_child_requires_prestaged(self) -> None:
+        """launch_child asserts when there is no prestaged child (e.g. after a sync step)."""
+        mgr = StepTransactionManager(context=None)
+        with pytest.raises(AssertionError):
+            mgr.launch_child()
+
+    def test_adopt_child_exact_survivors_promotes(self) -> None:
+        """Survivors == snapshot -> adopted; child promoted to current_txn."""
+        mgr = StepTransactionManager(context=None)
+        child = mgr.prestage_child(self._eligible_plan())
+        mgr.launch_child()
+        assert mgr.adopt_child([10, 11, 12], committed_bucket=None) is True
+        assert child.phase is TxnPhase.ADOPTED
+        assert mgr.current_txn is child and mgr.child_txn is None
+        assert mgr.diagnostics.adopted == 1 and mgr.diagnostics.guard_failures == 0
+
+    def test_adopt_child_absorbs_mid_batch_finish(self) -> None:
+        """A finish removes a row (survivors subset of snapshot) -> still adopted, no rerun."""
+        mgr = StepTransactionManager(context=None)
+        mgr.prestage_child(self._eligible_plan(request_ids=(10, 11, 12)))
+        mgr.launch_child()
+        # Request 11 finished this step; survivors are a strict subset of the snapshot.
+        assert mgr.adopt_child([10, 12]) is True
+        assert mgr.diagnostics.adopted == 1 and mgr.diagnostics.guard_failures == 0
+
+    def test_adopt_guard_trips_on_foreign_survivor(self) -> None:
+        """A survivor absent from the snapshot trips the guard (no promotion, no rerun)."""
+        mgr = StepTransactionManager(context=None)
+        child = mgr.prestage_child(self._eligible_plan(request_ids=(1, 2)))
+        mgr.launch_child()
+        # Request 3 was never in the launched forward's snapshot -> guard failure.
+        assert mgr.adopt_child([1, 2, 3]) is False
+        assert mgr.diagnostics.guard_failures == 1 and mgr.diagnostics.adopted == 0
+        # Recovery is a barrier handled by the caller; the child stays LAUNCHED, not discarded.
+        assert mgr.current_txn is None
+        assert mgr.child_txn is child and child.phase is TxnPhase.LAUNCHED
+
+    def test_adopt_guard_trips_on_bucket_mismatch(self) -> None:
+        """A graph-bucket mismatch trips the guard even when survivors are a subset."""
+        mgr = StepTransactionManager(context=None)
+        mgr.prestage_child(self._eligible_plan(request_ids=(1, 2)), bucket=("decode", 4))
+        mgr.launch_child()
+        assert mgr.adopt_child([1, 2], committed_bucket=("decode", 8)) is False
+        assert mgr.diagnostics.guard_failures == 1 and mgr.diagnostics.adopted == 0
+
+    def test_adopt_child_requires_launched(self) -> None:
+        """adopt_child asserts unless a launched child is in flight."""
+        mgr = StepTransactionManager(context=None)
+        with pytest.raises(AssertionError):
+            mgr.adopt_child([1, 2])
+        mgr.prestage_child(self._eligible_plan())  # PRESTAGED, not yet LAUNCHED
+        with pytest.raises(AssertionError):
+            mgr.adopt_child([10, 11, 12])
+
+    def test_retire_txn_leases_gated_by_forward_event(self) -> None:
+        """A txn's freed leases release only after its forward fence + the two-step delay."""
+        mgr = StepTransactionManager(context=None)
+        fwd = _StubEvent(ready=False)
+        txn = StepTxn(step_id=5, forward_done_event=fwd)
+        freed = []
+        mgr.retire_txn_leases(
+            txn, current_step=5, release=lambda: freed.append("kv"), tag="kv_block"
+        )
+        assert mgr.retire(5) == 0 and freed == []  # neither delay nor fence satisfied
+        assert mgr.retire(7) == 0 and freed == []  # delay satisfied, fence not ready
+        fwd.ready = True
+        assert mgr.retire(7) == 1 and freed == ["kv"]  # both satisfied -> released
+        assert mgr.diagnostics.retired == 1
+
+    def test_retire_txn_leases_event_override(self) -> None:
+        """An explicit event overrides the txn fence (e.g. a coalesced multi-resource fence)."""
+        mgr = StepTransactionManager(context=None)
+        txn = StepTxn(step_id=0, forward_done_event=_StubEvent(ready=False))
+        override = _StubEvent(ready=True)
+        freed = []
+        mgr.retire_txn_leases(
+            txn, current_step=0, release=lambda: freed.append("slot"), event=override, tag="mamba"
+        )
+        assert mgr.retire(2) == 1 and freed == ["slot"]
+
+    def test_full_handoff_sequence_diagnostics(self) -> None:
+        """prestage -> launch -> adopt -> commit -> retire over two steps tallies cleanly."""
+        mgr = StepTransactionManager(context=None)
+        fwd = _StubEvent(ready=True)
+        # Step K: prestage + launch the child for K+1.
+        child = mgr.prestage_child(self._eligible_plan(step_id=1), bucket=("decode", 4))
+        mgr.launch_child(forward_done_event=fwd, h2d_done_event=_StubEvent(ready=True))
+        # Step K+1: adopt the launched forward, commit it, retire a finished request's block.
+        assert mgr.adopt_child([10, 12], committed_bucket=("decode", 4)) is True
+        mgr.commit(child)
+        assert child.phase is TxnPhase.COMMITTED
+        freed = []
+        mgr.retire_txn_leases(child, current_step=1, release=lambda: freed.append("blk"))
+        mgr.retire(3)  # two steps later, fence ready
+        assert freed == ["blk"]
+        snap = mgr.diagnostics.as_dict()
+        assert (snap["prepared"], snap["launched"], snap["adopted"]) == (1, 1, 1)
+        assert snap["guard_failures"] == 0 and snap["retired"] == 1
+
+
 @pytest.mark.skipif(
     not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
 )

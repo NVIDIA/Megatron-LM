@@ -34,7 +34,25 @@ always-adopted transaction (no speculative child launch); :meth:`prestage` and
 from collections import Counter, deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
+
+# Sentinel for "argument not supplied" so that ``None`` remains a usable value
+# (e.g. a graph bucket of ``None`` must be distinguishable from "skip the check").
+_UNSET = object()
+
+
+def _request_id_set(request_ids: Any) -> Set[int]:
+    """Normalize a request-id container (tensor / list / None) to a ``set`` of ints.
+
+    Used by the consume-by-request-id adopt guard to compare the launched forward's
+    pre-compaction snapshot against the committed survivor set without depending on
+    container type or row order.
+    """
+    if request_ids is None:
+        return set()
+    if hasattr(request_ids, "tolist"):
+        request_ids = request_ids.tolist()
+    return {int(r) for r in request_ids}
 
 
 class LaunchEligibility(str, Enum):
@@ -225,6 +243,11 @@ class StepTxn:
     kv_block_leases: List[int] = field(default_factory=list)
     # Boundary blocks reserved for crossers, keyed by (request_id, block_column).
     reserved_boundary_blocks: Dict[Tuple[int, int], int] = field(default_factory=dict)
+    # Boundary crossers known at prestage time that still need a block allocated, as
+    # (request_id, block_column). The prestage MUST NOT allocate; the launch path
+    # allocates each one and records it via ``reserve_boundary_block`` (which moves it
+    # from "pending" to a concrete reserved block id).
+    pending_boundary_columns: List[Tuple[int, int]] = field(default_factory=list)
     # Mamba state slot ids leased for this step.
     mamba_slot_leases: List[int] = field(default_factory=list)
 
@@ -256,6 +279,31 @@ class StepTxn:
     def has_leases(self) -> bool:
         """Whether this transaction owns any resource."""
         return bool(self.kv_block_leases or self.reserved_boundary_blocks or self.mamba_slot_leases)
+
+    @classmethod
+    def from_prestaged_plan(cls, plan: "PrestagedDecodePlan", *, bucket: Any = None) -> "StepTxn":
+        """Seed a PRESTAGED speculative transaction from an (eligible) prestaged plan.
+
+        Carries the consume-by-request-id snapshot (``request_ids``) and the read-only
+        lease manifest the launch path will consume: the physical KV blocks the forward
+        reads, the mamba slots it advances in place, and the boundary crossers that each
+        still need a new block. The crossers are recorded as ``pending_boundary_columns``
+        -- the prestage does NOT allocate (see the design's 1.1 step 2), so their physical
+        block ids are assigned by the launch path, which then calls
+        :meth:`reserve_boundary_block`.
+        """
+        assert plan.eligible, "only an eligible prestaged plan can seed a speculative transaction"
+        return cls(
+            step_id=plan.step_id,
+            phase=TxnPhase.PRESTAGED,
+            request_ids=plan.snapshot_request_ids,
+            active_request_count=plan.active_request_count,
+            bucket=bucket,
+            speculative=True,
+            kv_block_leases=list(plan.kv_block_leases),
+            pending_boundary_columns=[(int(r), int(c)) for (r, c) in plan.reserved_boundary_blocks],
+            mamba_slot_leases=list(plan.mamba_slot_leases),
+        )
 
 
 @dataclass
@@ -463,6 +511,105 @@ class StepTransactionManager:
         else:
             reason = plan.skip_reason.value if plan.skip_reason is not None else "unknown"
             self.diagnostics.skip_reasons[reason] += 1
+
+    # --- Launch-before-commit handoff -----------------------------------------
+    #
+    # The prestage -> launch -> adopt -> commit -> retire-leases handoff the overlap
+    # engine wiring consumes. These are pure CPU bookkeeping over :class:`StepTxn`
+    # objects; they do not touch the GPU buffer or the allocators (the prestage builds
+    # CPU staging metadata; the launch path performs the GPU scatter / H2D / allocation
+    # and supplies the retire release callables). The runtime decode path does not call
+    # them yet -- they are landed + validated ahead of the overlap commit.
+
+    def prestage_child(
+        self, plan: "PrestagedDecodePlan", *, bucket: Any = None
+    ) -> Optional[StepTxn]:
+        """Stage the next forward's transaction from a prestaged plan.
+
+        Records prestage diagnostics either way (see :meth:`record_prestage`). For an
+        eligible plan, seeds the PRESTAGED speculative child (snapshot request ids +
+        read-only lease manifest) via :meth:`StepTxn.from_prestaged_plan` and stores it as
+        ``child_txn``. For an ineligible plan, the static skip reason is recorded and
+        ``child_txn`` is left unset (the step runs synchronously -- no speculative launch).
+
+        Returns the child transaction, or ``None`` for an ineligible plan.
+        """
+        self.record_prestage(plan)
+        if not plan.eligible:
+            self.child_txn = None
+            return None
+        child = StepTxn.from_prestaged_plan(plan, bucket=bucket)
+        self.child_txn = child
+        return child
+
+    def launch_child(
+        self, *, forward_done_event: Any = None, h2d_done_event: Any = None
+    ) -> StepTxn:
+        """Mark the prestaged child as launched (its forward enqueued before commit).
+
+        Attaches the two (and only two) per-transaction fences and transitions
+        PRESTAGED -> LAUNCHED. The launched forward is now in flight and will be consumed
+        (adopted) on the next step. Increments the ``launched`` diagnostic.
+        """
+        child = self.child_txn
+        assert (
+            child is not None and child.phase is TxnPhase.PRESTAGED
+        ), "launch_child requires a prestaged child transaction"
+        child.phase = TxnPhase.LAUNCHED
+        child.speculative = True
+        child.forward_done_event = forward_done_event
+        child.h2d_done_event = h2d_done_event
+        self.diagnostics.launched += 1
+        return child
+
+    def adopt_child(self, committed_survivor_ids: Any, *, committed_bucket: Any = _UNSET) -> bool:
+        """Adopt the in-flight launched forward via the consume-by-request-id guard.
+
+        The launched forward computed the snapshot rows; after commit the committed
+        survivors must be a SUBSET of that snapshot (a finish only removes a row --
+        absorbable, its row is discarded -- and nothing adds a row a launched forward did
+        not compute), and the graph bucket must match when supplied. This is the system's
+        only adopt guard, and it is an assert + diagnostic (design 1.2): on success the
+        child is promoted to the current (adopted) transaction; on failure the recovery is
+        a barrier (drain the in-flight forward, *consume* its valid outputs, take a sync
+        step) -- never discard-and-rerun. Returns ``True`` iff the child was adopted.
+        """
+        child = self.child_txn
+        assert (
+            child is not None and child.phase is TxnPhase.LAUNCHED
+        ), "adopt_child requires a launched child transaction"
+        snapshot = _request_id_set(child.request_ids)
+        survivors = _request_id_set(committed_survivor_ids)
+        bucket_ok = committed_bucket is _UNSET or committed_bucket == child.bucket
+        if not survivors.issubset(snapshot) or not bucket_ok:
+            self.note_guard_failure()
+            return False
+        child.phase = TxnPhase.ADOPTED
+        self.current_txn = child
+        self.child_txn = None
+        self.diagnostics.adopted += 1
+        return True
+
+    def retire_txn_leases(
+        self,
+        txn: StepTxn,
+        *,
+        current_step: int,
+        release: Callable[[], None],
+        event: Any = _UNSET,
+        tag: str = "lease",
+    ) -> None:
+        """Enqueue a transaction's freed resources for two-step fence-gated release.
+
+        A finished request's KV blocks / mamba slots are returned to their allocators only
+        after the forward that may still read them has completed (the transaction's
+        ``forward_done_event``) and the two-step delay has elapsed (see :class:`RetireQueue`).
+        The actual allocator release is the supplied ``release`` callable; this method only
+        schedules it behind the fence. ``event`` defaults to ``txn.forward_done_event``.
+        """
+        if event is _UNSET:
+            event = txn.forward_done_event
+        self.enqueue_retire(enqueue_step=current_step, release=release, event=event, tag=tag)
 
     def note_sync_step(self, reason: str) -> None:
         """Record that this step ran synchronously (a layout-changing step)."""
