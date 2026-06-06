@@ -31,11 +31,16 @@ from megatron.core.inference.contexts.metadata_slot import (
     make_decode_metadata_slots,
 )
 from megatron.core.inference.engines.step_transaction import (
+    LaunchDecision,
+    LaunchEligibility,
+    LaunchGateReason,
+    LaunchSignals,
     RetireQueue,
     StepTransactionManager,
     StepTxn,
     StepTxnDiagnostics,
     TxnPhase,
+    classify_launch_eligibility,
 )
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.utils import is_fa_min_version
@@ -583,3 +588,88 @@ class TestMetadataSlotsInContext(AsyncSchedTxnTestBase):
             num_tokens_to_generate=8,
             num_gap_steps=1,
         )
+
+
+@pytest.mark.internal
+class TestLaunchEligibilityGate:
+    """C5 (diagnostics-only) / section 1.9: the static launch-eligibility gate.
+
+    Pure classification logic for whether a step may launch a speculative child
+    forward before commit. No hot path / CUDA-graph surgery -- the prestage that
+    builds the child metadata and the launch that consumes it land in later commits.
+    """
+
+    @staticmethod
+    def _eligible_signals(**overrides) -> LaunchSignals:
+        """A baseline of signals for which a speculative launch IS eligible."""
+        base = dict(decode_only=True, active_request_count=4, using_cuda_graph=True)
+        base.update(overrides)
+        return LaunchSignals(**base)
+
+    def test_pure_decode_is_eligible(self) -> None:
+        decision = classify_launch_eligibility(self._eligible_signals())
+        assert decision.eligibility is LaunchEligibility.ELIGIBLE
+        assert decision.reason is LaunchGateReason.PURE_DECODE
+        assert decision.eligible is True
+
+    def test_each_ineligible_condition_maps_to_its_reason(self) -> None:
+        """Exhaustive: each non-absorbable condition forces a sync step with its reason."""
+        cases = [
+            (dict(active_request_count=0), LaunchGateReason.NO_ACTIVE_REQUESTS),
+            (dict(decode_only=False), LaunchGateReason.NOT_DECODE_ONLY),
+            (dict(using_cuda_graph=False), LaunchGateReason.GRAPH_INELIGIBLE),
+            (dict(graph_recapture=True), LaunchGateReason.GRAPH_RECAPTURE),
+            (dict(chunked_prefill_active=True), LaunchGateReason.CHUNKED_PREFILL),
+            (dict(pending_admission=True), LaunchGateReason.PENDING_ADMISSION),
+            (dict(resume_pending=True), LaunchGateReason.RESUME),
+            (dict(evict_pending=True), LaunchGateReason.EVICT),
+            (dict(forced_pause_overflow=True), LaunchGateReason.FORCED_PAUSE_OVERFLOW),
+            (dict(mtp_layout_change=True), LaunchGateReason.MTP_DEPENDENT_LAYOUT),
+            (dict(kv_reservation_fits=False), LaunchGateReason.KV_RESERVATION_UNAVAILABLE),
+        ]
+        # Every non-eligible reason is reachable, and no two cases collapse.
+        reasons_seen = set()
+        for overrides, expected_reason in cases:
+            decision = classify_launch_eligibility(self._eligible_signals(**overrides))
+            assert decision.eligibility is LaunchEligibility.SYNC, overrides
+            assert decision.reason is expected_reason, overrides
+            assert not decision.eligible
+            reasons_seen.add(expected_reason)
+        # The cases cover every LaunchGateReason except the eligible one.
+        assert reasons_seen == set(LaunchGateReason) - {LaunchGateReason.PURE_DECODE}
+
+    def test_reason_priority_is_deterministic(self) -> None:
+        """When several gates fail, the most fundamental one is reported."""
+        # not-decode-only outranks a pending admission.
+        d = classify_launch_eligibility(
+            self._eligible_signals(decode_only=False, pending_admission=True)
+        )
+        assert d.reason is LaunchGateReason.NOT_DECODE_ONLY
+        # no-active-requests outranks everything.
+        d = classify_launch_eligibility(
+            self._eligible_signals(active_request_count=0, decode_only=False)
+        )
+        assert d.reason is LaunchGateReason.NO_ACTIVE_REQUESTS
+        # graph recapture outranks downstream layout reasons.
+        d = classify_launch_eligibility(
+            self._eligible_signals(graph_recapture=True, evict_pending=True)
+        )
+        assert d.reason is LaunchGateReason.GRAPH_RECAPTURE
+
+    def test_absorbable_events_are_not_gate_inputs(self) -> None:
+        """Finish / stop-word / cancel must not appear as launch-gate signals.
+
+        They are absorbable (a launched forward discards the finished row), so they
+        never force a sync step -- encoded by their absence from LaunchSignals.
+        """
+        field_names = set(LaunchSignals.__dataclass_fields__.keys())
+        for forbidden in ("finish", "finished", "stop_word", "stopword", "cancel"):
+            assert not any(forbidden in name for name in field_names), (
+                f"absorbable signal '{forbidden}' must not gate launches"
+            )
+
+    def test_launch_decision_dataclass(self) -> None:
+        d = LaunchDecision(LaunchEligibility.ELIGIBLE, LaunchGateReason.PURE_DECODE)
+        assert d.eligible is True
+        d2 = LaunchDecision(LaunchEligibility.SYNC, LaunchGateReason.RESUME)
+        assert d2.eligible is False

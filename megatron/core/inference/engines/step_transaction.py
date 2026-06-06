@@ -37,6 +37,110 @@ from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
+class LaunchEligibility(str, Enum):
+    """Whether a step may launch a speculative child forward before committing."""
+
+    ELIGIBLE = "eligible"  # a speculative child forward may be launched before commit
+    SYNC = "sync"  # layout-changing / unsupported: must run as a synchronous step
+
+
+class LaunchGateReason(str, Enum):
+    """Why a step is (in)eligible for a speculative launch.
+
+    These are the *static* gates and the explicit barrier/sync reasons from the design
+    (sections 1.2 and 1.9). There are deliberately no per-step "disabled" vetoes beyond
+    these. Note that finish / stop-word / cancel are absent: a launched forward absorbs a
+    finish (it discards the finished row; compaction is a pure row permutation), so those
+    events do NOT force a sync step and are never a reason here.
+    """
+
+    PURE_DECODE = "pure_decode"  # eligible: pure decode for the committed members
+    NO_ACTIVE_REQUESTS = "no_active_requests"
+    NOT_DECODE_ONLY = "not_decode_only"  # prefill / mixed step
+    GRAPH_INELIGIBLE = "graph_ineligible"  # not running under a (block-scope) CUDA graph
+    GRAPH_RECAPTURE = "graph_recapture"  # a graph recapture barrier this step
+    CHUNKED_PREFILL = "chunked_prefill"
+    PENDING_ADMISSION = "pending_admission"  # a waiting request can be admitted
+    RESUME = "resume"
+    EVICT = "evict"
+    FORCED_PAUSE_OVERFLOW = "forced_pause_overflow"
+    MTP_DEPENDENT_LAYOUT = "mtp_dependent_layout"  # MTP verify/rewind changes layout
+    KV_RESERVATION_UNAVAILABLE = "kv_reservation_unavailable"  # boundary block can't be reserved
+
+
+@dataclass
+class LaunchSignals:
+    """The (static) facts needed to decide if a speculative child launch is eligible.
+
+    Absorbable events (finish / stop-word / cancel) are intentionally NOT inputs: a
+    launched forward discards a finished row without re-running, so they never block a
+    launch. Only changes a launched forward could not absorb appear here.
+    """
+
+    decode_only: bool  # this step is decode-only (no prefill/mixed)
+    active_request_count: int  # number of active (non-paused) requests
+    using_cuda_graph: bool  # the forward runs under a (block-scope) CUDA graph
+    pending_admission: bool = False  # a waiting request could be admitted
+    resume_pending: bool = False  # a paused request is being resumed
+    evict_pending: bool = False  # a request is being evicted
+    forced_pause_overflow: bool = False  # active requests force-paused on KV overflow
+    chunked_prefill_active: bool = False  # chunked prefill in progress
+    graph_recapture: bool = False  # a CUDA-graph recapture barrier this step
+    mtp_layout_change: bool = False  # MTP verify/rewind changes layout this step
+    kv_reservation_fits: bool = True  # the <=1 boundary block per crosser fits pre-launch
+
+
+@dataclass
+class LaunchDecision:
+    """The result of :func:`classify_launch_eligibility`."""
+
+    eligibility: LaunchEligibility
+    reason: LaunchGateReason
+
+    @property
+    def eligible(self) -> bool:
+        """True iff a speculative child forward may be launched this step."""
+        return self.eligibility is LaunchEligibility.ELIGIBLE
+
+
+def classify_launch_eligibility(signals: LaunchSignals) -> LaunchDecision:
+    """Statically classify whether a step may launch a speculative child forward.
+
+    A speculative launch is attempted ONLY when every static gate holds (feature on +
+    CUDA graph + decode-only + active>0) and no layout-changing / barrier condition is
+    present (admission, resume, evict, forced-pause, chunked prefill, graph recapture,
+    MTP-dependent layout, unfittable KV reservation). Otherwise the step runs
+    synchronously. This mirrors the design's launch gate (1.2) and static eligibility
+    gate (1.9): no per-step dynamic vetoes beyond these.
+
+    The order of checks is fixed so the reported reason is deterministic when several
+    conditions hold at once (the most fundamental gate wins).
+    """
+    if signals.active_request_count <= 0:
+        return LaunchDecision(LaunchEligibility.SYNC, LaunchGateReason.NO_ACTIVE_REQUESTS)
+    if not signals.decode_only:
+        return LaunchDecision(LaunchEligibility.SYNC, LaunchGateReason.NOT_DECODE_ONLY)
+    if not signals.using_cuda_graph:
+        return LaunchDecision(LaunchEligibility.SYNC, LaunchGateReason.GRAPH_INELIGIBLE)
+    if signals.graph_recapture:
+        return LaunchDecision(LaunchEligibility.SYNC, LaunchGateReason.GRAPH_RECAPTURE)
+    if signals.chunked_prefill_active:
+        return LaunchDecision(LaunchEligibility.SYNC, LaunchGateReason.CHUNKED_PREFILL)
+    if signals.pending_admission:
+        return LaunchDecision(LaunchEligibility.SYNC, LaunchGateReason.PENDING_ADMISSION)
+    if signals.resume_pending:
+        return LaunchDecision(LaunchEligibility.SYNC, LaunchGateReason.RESUME)
+    if signals.evict_pending:
+        return LaunchDecision(LaunchEligibility.SYNC, LaunchGateReason.EVICT)
+    if signals.forced_pause_overflow:
+        return LaunchDecision(LaunchEligibility.SYNC, LaunchGateReason.FORCED_PAUSE_OVERFLOW)
+    if signals.mtp_layout_change:
+        return LaunchDecision(LaunchEligibility.SYNC, LaunchGateReason.MTP_DEPENDENT_LAYOUT)
+    if not signals.kv_reservation_fits:
+        return LaunchDecision(LaunchEligibility.SYNC, LaunchGateReason.KV_RESERVATION_UNAVAILABLE)
+    return LaunchDecision(LaunchEligibility.ELIGIBLE, LaunchGateReason.PURE_DECODE)
+
+
 class TxnPhase(str, Enum):
     """Lifecycle phase of a :class:`StepTxn`."""
 
