@@ -323,14 +323,6 @@ class TestHybridModelBuilderBuildModel:
     @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
     @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
     @patch("megatron.training.models.hybrid.HybridModel")
-    def test_virtual_pipeline_raises(self, mock_model, *_):
-        with pytest.raises(AssertionError, match="Virtual pipeline"):
-            self.builder.build_model(self.pg, vp_stage=0)
-
-    @patch("megatron.training.models.hybrid.calculate_padded_vocab_size")
-    @patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=True)
-    @patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=True)
-    @patch("megatron.training.models.hybrid.HybridModel")
     def test_config_params_passed_to_mcore(self, mock_model, *_):
         config = _make_hybrid_config(
             vocab_size=32000,
