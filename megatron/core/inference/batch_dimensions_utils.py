@@ -14,6 +14,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from megatron.core.inference.ep_async_protocol import EPAsyncPhase
 from megatron.core.utils import get_pg_size, round_up_to_nearest_multiple
 
 
@@ -153,6 +154,7 @@ class InferenceBatchDimensions:
         local_batch_dims,
         ep_group: Optional[torch.distributed.ProcessGroup] = None,
         ep_zmq_communicator=None,
+        ep_async_protocol=None,
     ) -> Optional["InferenceBatchDimensions"]:
         """Adjust CUDA graph batch dimensions for expert parallelism.
 
@@ -181,7 +183,16 @@ class InferenceBatchDimensions:
 
         is_non_decode = local_batch_dims.prefill_req_count > 0
 
-        if ep_zmq_communicator is not None:
+        if ep_async_protocol is not None and ep_async_protocol.enabled:
+            # CPU-only sync via the EP async protocol: uses the active EP work
+            # step id so dummy and real child forwards cannot drift by one
+            # decode iteration and still match the same phase string.
+            (max_token_count, max_is_non_decode) = ep_async_protocol.sync_all_reduce_max(
+                EPAsyncPhase.GRAPH_SHAPE,
+                local_batch_dims.token_count,
+                int(is_non_decode),
+            )
+        elif ep_zmq_communicator is not None:
             # CPU-only sync via ZMQ: avoids a NCCL AllReduce kernel on the
             # compute stream plus the H2D/D2H pair that sandwiches it.
             (max_token_count, max_is_non_decode) = _sync_all_reduce_max_with_phase(
@@ -637,6 +648,7 @@ class CUDAGraphBatchDimensionBuilder:
         strict: bool = False,
         ep_group: Optional[torch.distributed.ProcessGroup] = None,
         ep_zmq_communicator=None,
+        ep_async_protocol=None,
         match_ep_token_counts: bool = True,
     ) -> Optional[InferenceBatchDimensions]:
         """
@@ -673,7 +685,10 @@ class CUDAGraphBatchDimensionBuilder:
             # NCCL dispatcher: all EP ranks must select the same CUDA graph. Sync batch dims
             # across the EP group so graph selection is consistent.
             adjusted_batch_dim = InferenceBatchDimensions.adjust_batch_dims_for_expert_parallelism(
-                real_batch_dim, ep_group=ep_group, ep_zmq_communicator=ep_zmq_communicator
+                real_batch_dim,
+                ep_group=ep_group,
+                ep_zmq_communicator=ep_zmq_communicator,
+                ep_async_protocol=ep_async_protocol,
             )
 
             if adjusted_batch_dim is None:

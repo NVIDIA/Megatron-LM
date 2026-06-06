@@ -31,6 +31,7 @@ from megatron.core.inference.communication_utils import (
 )
 from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
 from megatron.core.inference.contexts.static_context import StaticInferenceContext
+from megatron.core.inference.ep_async_protocol import EPAsyncPhase
 from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
     AbstractModelInferenceWrapper,
@@ -145,6 +146,7 @@ class TextGenerationController:
         self._async_prepared_child_txn: Optional[StepTxn] = None
         self._async_launched_child_txn: Optional[StepTxn] = None
         self._ep_decode_broadcast_plan: Optional[EPDecodeBroadcastPlan] = None
+        self._ep_async_protocol = None
         self._ep_dummy_sampled_tokens_cuda: Optional[Tensor] = None
         self._ep_dummy_accepted_counts_cuda: Optional[Tensor] = None
 
@@ -158,6 +160,11 @@ class TextGenerationController:
             callback: Function that returns request IDs to mark as finished.
         """
         self._get_stop_word_finished_ids_callback = callback
+
+    def set_ep_async_protocol(self, protocol) -> None:
+        """Attach the EP async step protocol for tagged, step-scoped CPU sync."""
+
+        self._ep_async_protocol = protocol
 
     def _init_dynamic_sampling_tensors(self):
         """Initialize tensors needed for dynamic sampling."""
@@ -825,6 +832,23 @@ class TextGenerationController:
         except TypeError:
             return communicator.sync_all_reduce_max(*values)
 
+    def _sync_ep_protocol_all_reduce_max(self, phase: EPAsyncPhase, *values: int):
+        if self._ep_async_protocol is not None and self._ep_async_protocol.enabled:
+            return self._ep_async_protocol.sync_all_reduce_max(phase, *values)
+        context = self.inference_wrapped_model.inference_context
+        communicator = getattr(context, "_ep_zmq_communicator", None)
+        if communicator is None:
+            return None
+        return self._sync_all_reduce_max_with_phase(communicator, phase.value, *values)
+
+    def _ep_sync_all_reduce_max_fn(self, phase: EPAsyncPhase):
+        if self._ep_async_protocol is not None and self._ep_async_protocol.enabled:
+            return functools.partial(self._sync_ep_protocol_all_reduce_max, phase)
+        context = self.inference_wrapped_model.inference_context
+        if getattr(context, "_ep_zmq_communicator", None) is None:
+            return None
+        return functools.partial(self._sync_ep_protocol_all_reduce_max, phase)
+
     def _launch_async_decode_child(
         self,
         child_txn: StepTxn,
@@ -949,20 +973,12 @@ class TextGenerationController:
             self._ep_decode_broadcast_plan = None
             return None
 
-        context = self.inference_wrapped_model.inference_context
-        communicator = getattr(context, "_ep_zmq_communicator", None)
         plan = resolve_ep_decode_broadcast_plan(
             active_request_count,
             group,
             has_real_work=has_real_work,
-            sync_all_reduce_max_fn=(
-                functools.partial(
-                    self._sync_all_reduce_max_with_phase,
-                    communicator,
-                    "ep_decode_post_forward",
-                )
-                if communicator is not None
-                else None
+            sync_all_reduce_max_fn=self._ep_sync_all_reduce_max_fn(
+                EPAsyncPhase.DECODE_POST_FORWARD
             ),
         )
         self._ep_decode_broadcast_plan = plan
@@ -983,22 +999,15 @@ class TextGenerationController:
                 has_real_work=bool(can_launch_real_child),
             )
 
-        context = self.inference_wrapped_model.inference_context
-        communicator = getattr(context, "_ep_zmq_communicator", None)
-        return resolve_ep_decode_broadcast_plan(
+        plan = resolve_ep_decode_broadcast_plan(
             active_request_count,
             group,
             has_real_work=can_launch_real_child,
-            sync_all_reduce_max_fn=(
-                functools.partial(
-                    self._sync_all_reduce_max_with_phase,
-                    communicator,
-                    "ep_async_child_handoff",
-                )
-                if communicator is not None
-                else None
+            sync_all_reduce_max_fn=self._ep_sync_all_reduce_max_fn(
+                EPAsyncPhase.ASYNC_CHILD_HANDOFF
             ),
         )
+        return plan
 
     @staticmethod
     def _ep_async_child_launches(plan: EPDecodeBroadcastPlan) -> bool:

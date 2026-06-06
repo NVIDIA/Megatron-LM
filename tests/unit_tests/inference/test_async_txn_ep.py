@@ -1,5 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import asyncio
+
 import pytest
 import torch
 
@@ -14,6 +16,8 @@ from megatron.core.inference.engines.async_zmq_communicator import (
     AsyncZMQCommunicator,
     ZMQCollectiveError,
 )
+from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
+from megatron.core.inference.ep_async_protocol import EPAsyncPhase, EPAsyncStepProtocol
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
@@ -29,6 +33,23 @@ class FakeEPGroup:
 
     def rank(self):
         return self._rank
+
+
+class FakeStepCommunicator:
+    world_size = 4
+    protocol_mismatch_count = 0
+
+    def __init__(self):
+        self.async_calls = []
+        self.sync_calls = []
+
+    async def all_reduce_max(self, *values, async_op=True, phase=None, step_id=None):
+        self.async_calls.append((phase, step_id, values))
+        return values[0] if len(values) == 1 else values
+
+    def sync_all_reduce_max(self, *values, phase=None, step_id=None):
+        self.sync_calls.append((phase, step_id, values))
+        return values[0] if len(values) == 1 else values
 
 
 def test_token_broadcast_gives_identical_survivor_set_across_ranks():
@@ -253,3 +274,102 @@ def test_controller_ep_sync_helper_uses_named_phase_when_supported():
 
     assert result == (1, 3)
     assert calls == [("ep_async_child_handoff", (1, 3))]
+
+
+def test_ep_async_step_protocol_keeps_child_phases_in_active_work_step():
+    async def run_test():
+        communicator = FakeStepCommunicator()
+        protocol = EPAsyncStepProtocol(communicator)
+
+        consensus = await protocol.establish_work_consensus(1, False, async_op=False)
+        decode_result = protocol.sync_all_reduce_max(EPAsyncPhase.DECODE_POST_FORWARD, 1, 2, -2)
+        handoff_result = protocol.sync_all_reduce_max(EPAsyncPhase.ASYNC_CHILD_HANDOFF, 1, 2, -2)
+        graph_result = protocol.sync_all_reduce_max(EPAsyncPhase.GRAPH_SHAPE, 1, 0)
+        await protocol.complete_work_step(async_op=False)
+
+        assert consensus.step_id == 0
+        assert decode_result == (1, 2, -2)
+        assert handoff_result == (1, 2, -2)
+        assert graph_result == (1, 0)
+        assert communicator.sync_calls == [
+            ("ep_decode_post_forward", 0, (1, 2, -2)),
+            ("ep_async_child_handoff", 0, (1, 2, -2)),
+            ("ep_graph_shape", 0, (1, 0)),
+        ]
+        assert communicator.async_calls == [
+            ("ep_work_consensus", 0, (1, 0)),
+            ("ep_work_consensus_ack", 0, (1,)),
+            ("ep_step_complete", 0, (1,)),
+            ("ep_step_complete_ack", 0, (1,)),
+        ]
+
+    asyncio.run(run_test())
+
+
+def test_ep_work_step_sends_coordinator_reply_after_step_completion():
+    async def run_test():
+        events = []
+        engine = object.__new__(DynamicInferenceEngine)
+        engine.ep_world_size = 4
+        engine.use_synchronous_zmq_collectives = True
+
+        class Protocol:
+            def ensure_work_step(self):
+                events.append("ensure")
+
+            async def complete_work_step(self, *, async_op=True):
+                events.append(("complete", async_op))
+
+        async def async_step(*, send_coordinator_replies=True):
+            events.append(("step", send_coordinator_replies))
+            return {"finished_request_records": ["record"]}
+
+        engine.ep_async_step_protocol = Protocol()
+        engine.async_step = async_step
+        engine._send_finished_records_to_coordinator = lambda records: events.append(
+            ("reply", records)
+        )
+
+        await DynamicInferenceEngine._run_ep_work_step(engine, local_pending=1)
+
+        assert events == [
+            "ensure",
+            ("step", False),
+            ("complete", False),
+            ("reply", ["record"]),
+        ]
+
+    asyncio.run(run_test())
+
+
+def test_controller_ep_sync_helper_prefers_step_protocol_when_available():
+    calls = []
+    controller = object.__new__(TextGenerationController)
+
+    class Protocol:
+        enabled = True
+
+        def sync_all_reduce_max(self, phase, *values):
+            calls.append((phase, values))
+            return values
+
+    controller._ep_async_protocol = Protocol()
+
+    result = TextGenerationController._sync_ep_protocol_all_reduce_max(
+        controller, EPAsyncPhase.ASYNC_CHILD_HANDOFF, 1, 3
+    )
+
+    assert result == (1, 3)
+    assert calls == [(EPAsyncPhase.ASYNC_CHILD_HANDOFF, (1, 3))]
+
+
+def test_ep_async_step_protocol_starts_cached_consensus_work_steps():
+    communicator = FakeStepCommunicator()
+    protocol = EPAsyncStepProtocol(communicator)
+
+    step_id = protocol.ensure_work_step()
+    result = protocol.sync_all_reduce_max(EPAsyncPhase.ASYNC_CHILD_HANDOFF, 1, 0, 0)
+
+    assert step_id == 0
+    assert result == (1, 0, 0)
+    assert communicator.sync_calls == [("ep_async_child_handoff", 0, (1, 0, 0))]

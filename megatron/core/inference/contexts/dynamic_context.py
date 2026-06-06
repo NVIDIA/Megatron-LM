@@ -357,6 +357,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # match_graph_config() uses this to perform the MAX reduction on the
         # CPU, avoiding a per-step NCCL AllReduce kernel on the compute stream.
         self._ep_zmq_communicator = None
+        self._ep_async_protocol = None
 
         # Mamba states.
         mamba_inference_state_config = inference_config.mamba_inference_state_config
@@ -2025,6 +2026,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         self._ep_zmq_communicator = communicator
 
+    def set_ep_async_protocol(self, protocol) -> None:
+        """Attach the EP async step protocol for tagged, step-scoped CPU sync."""
+
+        self._ep_async_protocol = protocol
+
     def sync_ep_child_graph_shape(self) -> None:
         """Enter the EP graph-shape sync for a prepared async child forward.
 
@@ -2053,6 +2059,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             ep_group=self.expert_model_parallel_group,
             match_ep_token_counts=self._nccl_ep_dispatcher or self._training_ep_dispatcher,
             ep_zmq_communicator=self._ep_zmq_communicator,
+            ep_async_protocol=self._ep_async_protocol,
         )
         if (best_graph is not None) != self._using_cuda_graph_this_step:
             raise RuntimeError(
@@ -2406,6 +2413,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             ep_group=self.expert_model_parallel_group,
             match_ep_token_counts=self._nccl_ep_dispatcher or self._training_ep_dispatcher,
             ep_zmq_communicator=self._ep_zmq_communicator,
+            ep_async_protocol=self._ep_async_protocol,
         )
         self._using_cuda_graph_this_step = best_graph is not None
 
