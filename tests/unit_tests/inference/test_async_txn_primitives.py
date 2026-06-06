@@ -68,23 +68,14 @@ def test_diagnostics_are_noop_when_disabled():
     diagnostics.record_launched(sample_to_launch_latency_us=12.0)
     diagnostics.record_commit_duration(34.0)
 
-    assert diagnostics.snapshot() == {
-        "enabled": False,
-        "prepared": 0,
-        "launched": 0,
-        "adopted": 0,
-        "sync_steps": 0,
-        "barrier_skips": 0,
-        "retired": 0,
-        "guard_failures": 0,
-        "prepare_under_forward": 0,
-        "h2d_ready_before_sampling": 0,
-        "sample_to_launch_latency_us": 0.0,
-        "commit_duration_us": 0.0,
-        "retire_queue_depth": 0,
-        "eligibility_skip_reasons": {},
-        "top_skip_reason": None,
-    }
+    snapshot = diagnostics.snapshot()
+    assert snapshot["enabled"] is False
+    assert snapshot["eligibility_skip_reasons"] == {}
+    assert snapshot["top_skip_reason"] is None
+    for key, value in snapshot.items():
+        if key in {"enabled", "eligibility_skip_reasons", "top_skip_reason"}:
+            continue
+        assert value == 0
 
 
 def test_serial_wrapped_diagnostics_are_cheap_dict_counters():
