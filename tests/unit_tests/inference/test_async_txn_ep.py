@@ -306,6 +306,48 @@ def test_ep_async_step_protocol_keeps_child_phases_in_active_work_step():
     asyncio.run(run_test())
 
 
+def test_ep_async_step_protocol_reuse_pending_forward_skips_dummy_base_forward():
+    communicator = FakeStepCommunicator()
+    protocol = EPAsyncStepProtocol(communicator)
+    protocol.ensure_work_step()
+
+    decision = protocol.decide_step_begin(
+        has_real_work=True,
+        has_pending_forward=True,
+        pending_forward_reusable=True,
+    )
+
+    assert decision.reuse_pending_forward is True
+    assert decision.discard_pending_forward is False
+    assert communicator.sync_calls == [
+        ("ep_step_begin", 0, (1, 1, 1, 0, 0)),
+        ("ep_step_begin_ack", 0, (1,)),
+    ]
+
+
+def test_ep_async_step_protocol_discards_pending_forward_if_real_rank_missing_child():
+    class MissingChildCommunicator(FakeStepCommunicator):
+        def sync_all_reduce_max(self, *values, phase=None, step_id=None):
+            self.sync_calls.append((phase, step_id, values))
+            if phase == "ep_step_begin":
+                # Some EP rank has a pending child, but a real rank is missing it.
+                return (1, 1, 1, 0, 1)
+            return values[0] if len(values) == 1 else values
+
+    communicator = MissingChildCommunicator()
+    protocol = EPAsyncStepProtocol(communicator)
+    protocol.ensure_work_step()
+
+    decision = protocol.decide_step_begin(
+        has_real_work=True,
+        has_pending_forward=False,
+        pending_forward_reusable=False,
+    )
+
+    assert decision.reuse_pending_forward is False
+    assert decision.discard_pending_forward is True
+
+
 def test_ep_work_step_sends_coordinator_reply_after_step_completion():
     async def run_test():
         events = []

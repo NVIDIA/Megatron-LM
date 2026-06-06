@@ -31,7 +31,7 @@ from megatron.core.inference.communication_utils import (
 )
 from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
 from megatron.core.inference.contexts.static_context import StaticInferenceContext
-from megatron.core.inference.ep_async_protocol import EPAsyncPhase
+from megatron.core.inference.ep_async_protocol import EPAsyncPhase, EPStepBeginDecision
 from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
     AbstractModelInferenceWrapper,
@@ -147,6 +147,7 @@ class TextGenerationController:
         self._async_launched_child_txn: Optional[StepTxn] = None
         self._ep_decode_broadcast_plan: Optional[EPDecodeBroadcastPlan] = None
         self._ep_async_protocol = None
+        self._ep_step_begin_decision: Optional[EPStepBeginDecision] = None
         self._ep_dummy_sampled_tokens_cuda: Optional[Tensor] = None
         self._ep_dummy_accepted_counts_cuda: Optional[Tensor] = None
 
@@ -715,6 +716,48 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         active_slice = slice(context.paused_request_count, context.total_request_count)
         return tuple(int(request_id) for request_id in context.request_ids[active_slice].tolist())
+
+    def _pending_async_child_reusable(self) -> bool:
+        """Return whether the launched child transaction can be this step's forward."""
+
+        child_txn = self._async_launched_child_txn
+        if child_txn is None:
+            return False
+        context = self.inference_wrapped_model.inference_context
+        if not context.async_scheduling:
+            return False
+        return child_txn.guard_adoption(
+            self._async_active_request_ids(),
+            terminal_request_ids=child_txn.terminal_request_ids,
+            decode_only=context.is_decode_only(),
+            cuda_graph_key=self._async_decode_cuda_graph_key(),
+        )
+
+    def _decide_ep_step_begin(self, *, has_real_work: bool) -> EPStepBeginDecision:
+        """Synchronize whether this EP step reuses the previous async child forward."""
+
+        has_pending_forward = self._async_launched_child_txn is not None
+        pending_forward_reusable = (
+            self._pending_async_child_reusable() if has_pending_forward else False
+        )
+        if self._ep_async_protocol is not None and self._ep_async_protocol.enabled:
+            decision = self._ep_async_protocol.decide_step_begin(
+                has_real_work=has_real_work,
+                has_pending_forward=has_pending_forward,
+                pending_forward_reusable=pending_forward_reusable,
+            )
+        else:
+            decision = EPStepBeginDecision(
+                step_id=-1,
+                has_real_work=has_real_work,
+                reuse_pending_forward=bool(has_pending_forward and pending_forward_reusable),
+                discard_pending_forward=bool(has_pending_forward and not pending_forward_reusable),
+            )
+        self._ep_step_begin_decision = decision
+        return decision
+
+    def _clear_ep_step_begin_decision(self) -> None:
+        self._ep_step_begin_decision = None
 
     def _try_adopt_async_child_logits(self) -> bool:
         """Consume logits from a previously launched child forward if still valid."""
@@ -1956,10 +1999,12 @@ class TextGenerationController:
         on ranks that do not have any real requests. It may run in eager mode."""
 
         context = self.inference_wrapped_model.inference_context
+        step_begin_decision = self._decide_ep_step_begin(has_real_work=False)
 
-        # attempt to use cuda-graph if possible
-        input_ids, position_ids = self._dynamic_step_context_init(is_dummy_forward=True)
-        self._dynamic_step_forward_logits(input_ids, position_ids)
+        if not step_begin_decision.reuse_pending_forward:
+            # attempt to use cuda-graph if possible
+            input_ids, position_ids = self._dynamic_step_context_init(is_dummy_forward=True)
+            self._dynamic_step_forward_logits(input_ids, position_ids)
 
         # Disable MoE padding for MTP computation, unless CUDA graphs
         # are active (the graphs were captured with padding enabled).
@@ -1987,6 +2032,7 @@ class TextGenerationController:
             self._dummy_decode_stop_word_collective_tail()
         finally:
             self._clear_ep_decode_broadcast_plan()
+            self._clear_ep_step_begin_decision()
             # clear the context of any temporary state from the dummy forward
             context.reset()
 
@@ -2292,8 +2338,19 @@ class TextGenerationController:
         if context.active_token_count == 0 and active_request_count == 0:
             return None
 
+        ep_step_begin_decision = self._decide_ep_step_begin(has_real_work=True)
+        local_pending_child = self._async_launched_child_txn is not None
+        if ep_step_begin_decision.discard_pending_forward:
+            self._async_launched_child_txn = None
+
         with torch.inference_mode():
             adopted_child = self._try_adopt_async_child_logits()
+            if (
+                local_pending_child
+                and ep_step_begin_decision.reuse_pending_forward
+                and not adopted_child
+            ):
+                raise RuntimeError("EP step-begin selected async child adoption, but adoption failed")
             input_ids = None
             position_ids = None
 
@@ -2540,6 +2597,7 @@ class TextGenerationController:
                 context.async_txn_diagnostics.record_sync_step("serial_wrapped")
             ret.update(request_bookkeeping)
             self._clear_ep_decode_broadcast_plan()
+            self._clear_ep_step_begin_decision()
             return ret
 
     @torch.inference_mode()
