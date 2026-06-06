@@ -49,6 +49,7 @@ from .base_context import BaseInferenceContext
 from .gpu_view import ContextGPUView
 from .kv_block_allocator import KVBlockAllocator
 from .mamba_slot_allocator import MambaSlotAllocator
+from .metadata_slot import DecodeMetadataSlot
 from .routing_metadata import RoutingMetadata
 
 try:
@@ -1222,6 +1223,27 @@ class DynamicInferenceContext(BaseInferenceContext):
             device=torch.cuda.current_device(),
             max_mamba_chunks=self._max_mamba_chunks,
         )
+
+        # Async scheduling (launch-before-commit): wrap the live gpu_view as
+        # slot_current and allocate a free slot_child to prestage the next step's
+        # metadata into. Built only when the opt-in flag is on; the serial path uses
+        # only the single live gpu_view above. The prestage that populates slot_child
+        # and the graph replay that consumes it land in later commits -- here the
+        # child slot is allocated, free, and at a distinct address.
+        self.slot_current: Optional[DecodeMetadataSlot] = None
+        self.slot_child: Optional[DecodeMetadataSlot] = None
+        if self.enable_async_scheduling:
+            self.slot_current = DecodeMetadataSlot(slot_id=0, gpu_view=self.gpu_view)
+            self.slot_child = DecodeMetadataSlot(
+                slot_id=1,
+                gpu_view=ContextGPUView(
+                    max_requests=self.max_requests,
+                    max_tokens=self.max_tokens,
+                    max_kv_blocks=self.max_kv_block_count,
+                    device=torch.cuda.current_device(),
+                    max_mamba_chunks=self._max_mamba_chunks,
+                ),
+            )
 
         # Cache of (input_ids_view, pos_ids_view) keyed by num_tokens. Instead of slicing and
         # unsqueezing on every new inference step (constructing new TensorImpls at 30-60 us),
