@@ -58,6 +58,9 @@ class AsyncTxnDiagnostics:
     barrier_skips: int = 0
     retired: int = 0
     guard_failures: int = 0
+    chain_attempts: int = 0
+    chain_launches: int = 0
+    presampled_commits: int = 0
     prepare_under_forward: int = 0
     h2d_ready_before_sampling: int = 0
     sample_to_launch_latency_us: float = 0.0
@@ -155,6 +158,17 @@ class AsyncTxnDiagnostics:
         if self.enabled:
             self.guard_failures += 1
 
+    def record_chain_attempt(self, *, launched: bool = False) -> None:
+        if not self.enabled:
+            return
+        self.chain_attempts += 1
+        if launched:
+            self.chain_launches += 1
+
+    def record_presampled_commit(self) -> None:
+        if self.enabled:
+            self.presampled_commits += 1
+
     def record_retired(self, count: int = 1) -> None:
         if self.enabled:
             self.retired += count
@@ -182,6 +196,9 @@ class AsyncTxnDiagnostics:
             "barrier_skips": self.barrier_skips,
             "retired": self.retired,
             "guard_failures": self.guard_failures,
+            "chain_attempts": self.chain_attempts,
+            "chain_launches": self.chain_launches,
+            "presampled_commits": self.presampled_commits,
             "prepare_under_forward": self.prepare_under_forward,
             "h2d_ready_before_sampling": self.h2d_ready_before_sampling,
             "sample_to_launch_latency_us": self.sample_to_launch_latency_us,

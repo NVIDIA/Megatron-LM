@@ -268,6 +268,9 @@ class DynamicInferenceEngine(AbstractEngine):
         self.controller.set_stop_word_finished_ids_callback(
             self._get_and_clear_stop_word_finished_ids
         )
+        self.controller.set_stop_word_constraints_callback(
+            self._has_stop_word_constraints
+        )
 
         # Configure wandb to use separate step counter for inference metrics (only once)
         if self.logging_step_interval > 0 and self.metrics_writer is not None:
@@ -1573,6 +1576,20 @@ class DynamicInferenceEngine(AbstractEngine):
         self.stop_word_finished_request_ids -= result
         return result
 
+    def _has_stop_word_constraints(self, active_request_ids: list[int]) -> bool:
+        """Return whether active requests have stop-word state that can affect scheduling."""
+
+        active_ids = set(int(request_id) for request_id in active_request_ids)
+        if self.stop_word_finished_request_ids & active_ids:
+            return True
+        if self.stop_word_being_finished_ids & active_ids:
+            return True
+        for request_id in active_ids:
+            entry = self.requests.get(request_id)
+            if entry is not None and entry.record[-1].stop_word_ids:
+                return True
+        return False
+
     def _check_stop_words_for_request_post_append(
         self, request: DynamicInferenceRequest
     ) -> Tuple[bool, int]:
@@ -2325,6 +2342,8 @@ class DynamicInferenceEngine(AbstractEngine):
                     " ... async txn: prepared %(prepared)d, launched %(launched)d, "
                     "adopted %(adopted)d, retired %(retired)d, sync %(sync_steps)d, "
                     "barrier %(barrier_skips)d, h2d-ready %(h2d_ready_before_sampling)d, "
+                    "chain %(chain_launches)d/%(chain_attempts)d, "
+                    "presampled %(presampled_commits)d, "
                     "sample-launch %(sample_to_launch_latency_us).1f us, "
                     "commit %(commit_duration_us).1f us, "
                     "prestage %(child_prestage_duration_us).1f us, "

@@ -153,6 +153,7 @@ class TextGenerationController:
         self._ep_dummy_sampled_tokens_cuda: Optional[Tensor] = None
         self._ep_dummy_accepted_counts_cuda: Optional[Tensor] = None
         self._dummy_context_h2d_done_event = None
+        self._has_stop_word_constraints_callback = None
 
     def set_stop_word_finished_ids_callback(self, callback):
         """Set a callback to get request IDs that should be marked as finished due to stop words.
@@ -164,6 +165,11 @@ class TextGenerationController:
             callback: Function that returns request IDs to mark as finished.
         """
         self._get_stop_word_finished_ids_callback = callback
+
+    def set_stop_word_constraints_callback(self, callback):
+        """Set a callback that reports whether stop-word state can affect active requests."""
+
+        self._has_stop_word_constraints_callback = callback
 
     def set_ep_async_protocol(self, protocol) -> None:
         """Attach the EP async step protocol for tagged, step-scoped CPU sync."""
@@ -1073,7 +1079,10 @@ class TextGenerationController:
             return False
         if self.num_speculative_tokens > 0:
             return False
-        if self._get_stop_word_finished_ids_callback is not None:
+        if (
+            self._has_stop_word_constraints_callback is not None
+            and self._has_stop_word_constraints_callback(list(parent_txn.request_ids))
+        ):
             return False
         if parent_txn.terminal_request_ids:
             return False
@@ -1115,9 +1124,12 @@ class TextGenerationController:
         )
         ep_chain_plan = self._sync_ep_chain_handoff(active_request_count, can_chain)
         if not (can_chain and self._ep_async_child_launches(ep_chain_plan)):
+            context = self.inference_wrapped_model.inference_context
+            context.async_txn_diagnostics.record_chain_attempt(launched=False)
             return False
 
         context = self.inference_wrapped_model.inference_context
+        context.async_txn_diagnostics.record_chain_attempt(launched=True)
         sampling_started_at = (
             time.perf_counter()
             if context.async_scheduling and context.async_txn_diagnostics.enabled
@@ -2554,6 +2566,7 @@ class TextGenerationController:
         if presampled_txn is None:
             return None
 
+        context.async_txn_diagnostics.record_presampled_commit()
         self._async_presampled_txn = None
         cuda_graph_request_count = self._async_presampled_cuda_graph_request_count
         self._async_presampled_cuda_graph_request_count = None

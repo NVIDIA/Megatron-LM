@@ -166,8 +166,11 @@ def _make_controller(context):
     controller._enable_cuda_graph = False
     controller._ep_async_protocol = None
     controller._get_stop_word_finished_ids_callback = None
+    controller._has_stop_word_constraints_callback = None
     controller._async_prepared_child_txn = None
     controller._async_launched_child_txn = None
+    controller._async_presampled_txn = None
+    controller._async_presampled_cuda_graph_request_count = None
     controller._accepted_tokens_per_request = None
     controller._accepted_token_counts_per_request = None
     controller._sampled_tokens_cuda = torch.tensor([5], dtype=torch.int64)
@@ -310,6 +313,40 @@ def test_bookkeeping_uses_supplied_async_cpu_sample_without_default_transfer():
 
     assert result["sample"].tolist() == [7]
     assert context.updated == 1
+
+
+def test_chain_plain_decode_allows_empty_stop_word_state():
+    context = FakeContext()
+    controller, _ = _make_controller(context)
+    controller._has_stop_word_constraints_callback = lambda request_ids: False
+    parent_txn = StepTxn(step_id=1, request_ids=(17,), slot_id=0)
+    child_txn = StepTxn(step_id=2, request_ids=(17,), slot_id=1)
+
+    assert controller._can_chain_plain_decode_child(
+        parent_txn,
+        child_txn,
+        active_request_count=1,
+        return_log_probs=False,
+        return_top_n_logprobs=False,
+        skip_bookkeeping=False,
+    )
+
+
+def test_chain_plain_decode_defers_active_stop_words():
+    context = FakeContext()
+    controller, _ = _make_controller(context)
+    controller._has_stop_word_constraints_callback = lambda request_ids: True
+    parent_txn = StepTxn(step_id=1, request_ids=(17,), slot_id=0)
+    child_txn = StepTxn(step_id=2, request_ids=(17,), slot_id=1)
+
+    assert not controller._can_chain_plain_decode_child(
+        parent_txn,
+        child_txn,
+        active_request_count=1,
+        return_log_probs=False,
+        return_top_n_logprobs=False,
+        skip_bookkeeping=False,
+    )
 
 
 def test_consecutive_decode_steps_adopt_launched_children():
