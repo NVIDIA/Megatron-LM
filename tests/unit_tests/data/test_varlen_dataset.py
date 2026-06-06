@@ -700,6 +700,7 @@ def _loader_args(*, use_varlen, bshd, scheduler, mbs):
 
 
 def test_bshd_validation_dataloader_uses_default_collate():
+    from megatron.core import parallel_state
     from megatron.training.datasets.data_samplers import build_pretraining_data_loader
     from megatron.training.global_vars import destroy_global_vars, set_args
     from tests.unit_tests.test_utilities import Utils
@@ -708,8 +709,13 @@ def test_bshd_validation_dataloader_uses_default_collate():
     try:
         tok = _FakeTokenizer(eod=0, pad=7)
         seq_len, mbs = 16, 2
+        # One global batch needs micro_batch_size * data_parallel_size samples;
+        # size the dataset off the runtime DP world size so this passes under
+        # any --nproc-per-node (the CI default is 8 ranks -> dp=8).
+        dp = parallel_state.get_data_parallel_world_size()
+        n = mbs * dp * 4
         cfg = _make_config(tok, seq_length=seq_len, bshd=True)
-        ds = _build_varlen_for_loader(["hello world"] * 8, cfg, num_samples=8)
+        ds = _build_varlen_for_loader(["hello world"] * n, cfg, num_samples=n)
         set_args(_loader_args(use_varlen=True, bshd=True, scheduler=None, mbs=mbs))
         loader = build_pretraining_data_loader(ds, consumed_samples=0)
         batch = next(iter(loader))
@@ -724,6 +730,7 @@ def test_bshd_validation_dataloader_uses_default_collate():
 
 
 def test_thd_dataloader_uses_identity_collate():
+    from megatron.core import parallel_state
     from megatron.training.datasets.data_samplers import build_pretraining_data_loader
     from megatron.training.global_vars import destroy_global_vars, set_args
     from tests.unit_tests.test_utilities import Utils
@@ -732,9 +739,13 @@ def test_thd_dataloader_uses_identity_collate():
     try:
         tok = _FakeTokenizer(eod=0, pad=7)
         mbs = 2
+        dp = parallel_state.get_data_parallel_world_size()
+        n = mbs * dp * 4
         cfg = _make_config(tok, seq_length=64, bshd=False)
         # Variable-length samples so identity collate is required.
-        ds = _build_varlen_for_loader(["a", "abcdef", "xy", "qwerty"] * 2, cfg, num_samples=8)
+        variable = ["a", "abcdef", "xy", "qwerty"]
+        items = [variable[i % len(variable)] for i in range(n)]
+        ds = _build_varlen_for_loader(items, cfg, num_samples=n)
         set_args(_loader_args(use_varlen=True, bshd=False, scheduler="dp_balanced", mbs=mbs))
         loader = build_pretraining_data_loader(ds, consumed_samples=0)
         batch = next(iter(loader))
