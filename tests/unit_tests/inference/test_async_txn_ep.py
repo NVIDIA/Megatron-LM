@@ -10,6 +10,13 @@ from megatron.core.inference.async_txn import (
     broadcast_ep_stop_word_finished_ids,
     resolve_ep_decode_broadcast_plan,
 )
+from megatron.core.inference.engines.async_zmq_communicator import (
+    AsyncZMQCommunicator,
+    ZMQCollectiveError,
+)
+from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+    TextGenerationController,
+)
 
 
 class FakeEPGroup:
@@ -218,3 +225,31 @@ def test_phase_tag_mismatch_raises_explicit_error_instead_of_hanging():
             device=torch.device("cpu"),
             all_gather_fn=all_gather,
         )
+
+
+def test_zmq_collective_payload_rejects_wrong_phase():
+    msg = AsyncZMQCommunicator._pack_values_message("ep_graph_shape", 4, (1, 0))
+
+    with pytest.raises(ZMQCollectiveError, match="phase mismatch"):
+        AsyncZMQCommunicator._unpack_values_message(
+            msg,
+            expected_phase="ep_async_child_handoff",
+            expected_step_id=4,
+            expected_count=2,
+        )
+
+
+def test_controller_ep_sync_helper_uses_named_phase_when_supported():
+    calls = []
+
+    class PhaseAwareCommunicator:
+        def sync_all_reduce_max(self, *values, phase=None):
+            calls.append((phase, values))
+            return values
+
+    result = TextGenerationController._sync_all_reduce_max_with_phase(
+        PhaseAwareCommunicator(), "ep_async_child_handoff", 1, 3
+    )
+
+    assert result == (1, 3)
+    assert calls == [("ep_async_child_handoff", (1, 3))]

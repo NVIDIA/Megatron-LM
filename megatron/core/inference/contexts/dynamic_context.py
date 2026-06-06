@@ -2025,6 +2025,45 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         self._ep_zmq_communicator = communicator
 
+    def sync_ep_child_graph_shape(self) -> None:
+        """Enter the EP graph-shape sync for a prepared async child forward.
+
+        The real async child path launches from pre-staged metadata and therefore
+        does not call initialize_attention_state().  EP dummy ranks do call
+        initialize_attention_state() before their matching child forward, which
+        runs the CUDA-graph shape consensus.  This method lets the real rank
+        participate in that same consensus without rebuilding or copying
+        metadata that was already prepared transactionally.
+        """
+
+        if get_pg_size(self.expert_model_parallel_group) <= 1:
+            return
+        if not self.cuda_graph_batch_dimensions_list:
+            return
+
+        batch_dimensions = InferenceBatchDimensions(
+            token_count=self.active_token_count,
+            prefill_req_count=self.num_prefill_requests,
+            decode_req_count=self.num_decode_requests,
+        )
+        best_graph = CUDAGraphBatchDimensionBuilder.match_graph_config(
+            batch_dimensions,
+            self.cuda_graph_batch_dimensions_list,
+            strict=self.is_hybrid_model,
+            ep_group=self.expert_model_parallel_group,
+            match_ep_token_counts=self._nccl_ep_dispatcher or self._training_ep_dispatcher,
+            ep_zmq_communicator=self._ep_zmq_communicator,
+        )
+        if (best_graph is not None) != self._using_cuda_graph_this_step:
+            raise RuntimeError(
+                "EP async child graph-shape consensus diverged from the prepared decode step"
+            )
+        if best_graph is not None and best_graph != self.padded_batch_dimensions:
+            raise RuntimeError(
+                "EP async child graph shape does not match the prepared decode metadata: "
+                f"expected {self.padded_batch_dimensions}, got {best_graph}"
+            )
+
     def reset_attention_state(self) -> None:
         """Reset state used within attention, after each step."""
         # Attention metadata reset is now handled by MHAMetadata.reset()

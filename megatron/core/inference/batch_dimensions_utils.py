@@ -17,6 +17,15 @@ import torch
 from megatron.core.utils import get_pg_size, round_up_to_nearest_multiple
 
 
+def _sync_all_reduce_max_with_phase(communicator, phase: str, *values: int):
+    """Run a tiny CPU MAX reduction, tagging it when the communicator supports phases."""
+
+    try:
+        return communicator.sync_all_reduce_max(*values, phase=phase)
+    except TypeError:
+        return communicator.sync_all_reduce_max(*values)
+
+
 @dataclass(order=True, frozen=True)
 class InferenceBatchDimensions:
     """Batch dimensions for dynamic inference.
@@ -175,8 +184,11 @@ class InferenceBatchDimensions:
         if ep_zmq_communicator is not None:
             # CPU-only sync via ZMQ: avoids a NCCL AllReduce kernel on the
             # compute stream plus the H2D/D2H pair that sandwiches it.
-            (max_token_count, max_is_non_decode) = ep_zmq_communicator.sync_all_reduce_max(
-                local_batch_dims.token_count, int(is_non_decode)
+            (max_token_count, max_is_non_decode) = _sync_all_reduce_max_with_phase(
+                ep_zmq_communicator,
+                "ep_graph_shape",
+                local_batch_dims.token_count,
+                int(is_non_decode),
             )
         else:
             sync_tensor = torch.tensor(

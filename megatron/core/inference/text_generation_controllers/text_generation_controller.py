@@ -818,6 +818,13 @@ class TextGenerationController:
                 return slot
         raise RuntimeError(f"prepared async child slot {child_txn.slot_id} is not in the ring")
 
+    @staticmethod
+    def _sync_all_reduce_max_with_phase(communicator, phase: str, *values: int):
+        try:
+            return communicator.sync_all_reduce_max(*values, phase=phase)
+        except TypeError:
+            return communicator.sync_all_reduce_max(*values)
+
     def _launch_async_decode_child(
         self,
         child_txn: StepTxn,
@@ -830,6 +837,9 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         assert context.async_decode_slot_ring is not None
         child_slot = self._decode_slot_for_txn(child_txn)
+
+        if hasattr(context, "sync_ep_child_graph_shape"):
+            context.sync_ep_child_graph_shape()
 
         if child_txn.cpu_bookkeeping_buf is not None:
             child_txn.h2d_done_event = child_slot.copy_bookkeeping_from_cpu(
@@ -946,7 +956,13 @@ class TextGenerationController:
             group,
             has_real_work=has_real_work,
             sync_all_reduce_max_fn=(
-                communicator.sync_all_reduce_max if communicator is not None else None
+                functools.partial(
+                    self._sync_all_reduce_max_with_phase,
+                    communicator,
+                    "ep_decode_post_forward",
+                )
+                if communicator is not None
+                else None
             ),
         )
         self._ep_decode_broadcast_plan = plan
@@ -974,7 +990,13 @@ class TextGenerationController:
             group,
             has_real_work=can_launch_real_child,
             sync_all_reduce_max_fn=(
-                communicator.sync_all_reduce_max if communicator is not None else None
+                functools.partial(
+                    self._sync_all_reduce_max_with_phase,
+                    communicator,
+                    "ep_async_child_handoff",
+                )
+                if communicator is not None
+                else None
             ),
         )
 

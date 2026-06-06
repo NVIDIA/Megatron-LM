@@ -65,6 +65,8 @@ class FakeContext:
         self.updated = 0
         self.use_cuda_graph = use_cuda_graph
         self.deferred_h2d_prepares = 0
+        self.child_graph_shape_syncs = 0
+        self.child_graph_shape_order = None
 
     def is_decode_only(self):
         return True
@@ -84,6 +86,11 @@ class FakeContext:
     def current_input_and_position_ids(self):
         view = self.async_decode_slot_ring.current.gpu_view
         return view.token_to_input_ids[:1].unsqueeze(0), view.token_to_pos_ids[:1].unsqueeze(0)
+
+    def sync_ep_child_graph_shape(self):
+        self.child_graph_shape_syncs += 1
+        if self.child_graph_shape_order is not None:
+            self.child_graph_shape_order.append("child_graph_shape_sync")
 
     def prepare_child_from_committed_decode_state(self, *, target_slot=None, defer_h2d=False):
         if not self.async_scheduling:
@@ -201,6 +208,17 @@ def test_child_launch_occurs_before_cpu_sample_transfer():
     assert context.async_txn_diagnostics.sample_to_launch_latency_us > 0.0
     assert context.async_txn_diagnostics.commit_duration_us > 0.0
     assert controller._async_launched_child_txn is not None
+
+
+def test_child_launch_enters_graph_shape_sync_before_forward():
+    context = FakeContext()
+    controller, order = _make_controller(context)
+    context.child_graph_shape_order = order
+
+    asyncio.run(controller.async_generate_output_tokens_dynamic_batch())
+
+    assert context.child_graph_shape_syncs == 1
+    assert order.index("child_graph_shape_sync") < order.index("child_forward")
 
 
 def test_bookkeeping_uses_supplied_async_cpu_sample_without_default_transfer():
