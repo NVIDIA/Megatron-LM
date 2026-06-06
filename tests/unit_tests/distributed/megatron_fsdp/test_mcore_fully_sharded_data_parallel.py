@@ -1211,7 +1211,6 @@ class TestMegatronFSDPE2E:
             pretrain(
                 cfg,
                 _pretrain_gpt.train_valid_test_datasets_provider,
-                partial(model_provider, gpt_builder),
                 ModelType.encoder_or_decoder,
                 wrapped_forward_step,
                 get_embedding_ranks=_pretrain_gpt.get_embedding_ranks,
