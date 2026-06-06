@@ -808,6 +808,8 @@ class TextGenerationController:
                 self._async_launched_child_txn = None
                 raise RuntimeError("async decode child adoption invariant failed")
 
+            if context.is_hybrid_model:
+                context.accept_async_mamba_state(child_txn.request_ids)
             child_txn.adopted = True
             self._async_launched_child_txn = None
             if (
@@ -2645,6 +2647,8 @@ class TextGenerationController:
                 if commit_range_active:
                     range_push("async_txn_cpu_commit")
                 try:
+                    if context.is_hybrid_model:
+                        context.accept_async_mamba_state(presampled_txn.request_ids)
                     request_bookkeeping = self._dynamic_step_context_bookkeeping(
                         sampled_tokens_cpu=sampled_tokens_cpu,
                         async_txn=presampled_txn,

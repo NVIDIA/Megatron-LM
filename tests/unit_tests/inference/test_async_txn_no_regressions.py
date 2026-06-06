@@ -36,9 +36,6 @@ def _core_inference_source() -> str:
         "full_layout_signature",
         "row_map",
         "rowmap",
-        "candidate_bank",
-        "candidate_mamba",
-        "mamba_candidate",
         "four_vote",
         "four-vote",
         "vote_protocol",
@@ -54,6 +51,7 @@ class _AdoptionContext:
     total_request_count = 1
     padded_active_request_count = 1
     padded_active_token_count = 1
+    is_hybrid_model = False
 
     def __init__(self):
         self.async_txn_diagnostics = AsyncTxnDiagnostics(enabled=True)
@@ -64,6 +62,12 @@ class _AdoptionContext:
 
     def is_decode_only(self):
         return True
+
+    def using_cuda_graph_this_step(self):
+        return False
+
+    def replay_cuda_graph_this_step(self):
+        return False
 
 
 def test_guard_failure_drops_launched_child_without_plain_decode_rerun():
@@ -82,7 +86,7 @@ def test_guard_failure_drops_launched_child_without_plain_decode_rerun():
     assert context.async_txn_diagnostics.adopted == 0
 
 
-def test_step_txn_tracks_single_bank_mamba_slots_without_candidate_state():
+def test_step_txn_tracks_logical_mamba_slots_without_bank_internals():
     step_txn_fields = {field.name for field in fields(StepTxn)}
 
     assert "mamba_slot_ids" in step_txn_fields

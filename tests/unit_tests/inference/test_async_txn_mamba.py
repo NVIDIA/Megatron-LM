@@ -36,6 +36,7 @@ class FakeKVAllocator:
 class FakeMambaMetadata:
     def __init__(self):
         self.request_to_mamba_state_idx = torch.tensor([5, 7, -1], dtype=torch.int32)
+        self.request_to_mamba_state_bank = torch.tensor([0, 0, 0], dtype=torch.int32)
         self.freed_slot_ids = []
         self.free_slot_request_indices = []
 
@@ -46,6 +47,7 @@ class FakeMambaMetadata:
         self.free_slot_request_indices.extend(int(idx) for idx in request_indices.tolist())
         self.free_slot_ids(self.request_to_mamba_state_idx[request_indices])
         self.request_to_mamba_state_idx[request_indices] = -1
+        self.request_to_mamba_state_bank[request_indices] = 0
 
 
 class FakeLaunchContext:
@@ -115,7 +117,7 @@ def test_finished_hybrid_row_mamba_slot_is_not_reused_before_retire():
     assert context.mamba_metadata.freed_slot_ids == [5]
 
 
-def test_immediate_hybrid_release_uses_existing_single_bank_free_path():
+def test_immediate_hybrid_release_uses_existing_logical_slot_free_path():
     context = _make_release_context()
 
     DynamicInferenceContext.release_memory_blocks_from_request_indexes(
@@ -151,8 +153,34 @@ def test_hybrid_pause_pressure_still_forces_sync_before_child_launch():
     assert eligibility.reason == AsyncTxnSkipReason.PAUSED_REQUESTS
 
 
-def test_step_txn_records_single_bank_mamba_slots_without_candidate_bank():
+def test_step_txn_records_logical_mamba_slots_without_bank_internals():
     txn = StepTxn(step_id=3, request_ids=[101, 102], mamba_slot_ids=(5, 7))
 
     assert txn.mamba_slot_ids == (5, 7)
     assert not hasattr(txn, "candidate_mamba_slot_ids")
+
+
+def test_async_mamba_bank_accept_flips_only_matching_active_requests():
+    context = object.__new__(DynamicInferenceContext)
+    context.is_hybrid_model = True
+    context.mamba_state_bank_count = 2
+    context.paused_request_count = 1
+    context.total_request_count = 4
+    context.request_ids = torch.tensor([900, 101, 102, 103], dtype=torch.int32)
+    context.mamba_metadata = SimpleNamespace(
+        request_to_mamba_state_idx=torch.tensor([90, 5, 7, 9], dtype=torch.int32),
+        request_to_mamba_state_bank=torch.tensor([0, 0, 1, 0], dtype=torch.int32),
+    )
+
+    assert DynamicInferenceContext._mamba_flat_indices(
+        context, slice(context.paused_request_count, context.total_request_count)
+    ).tolist() == [10, 15, 18]
+    assert DynamicInferenceContext._mamba_flat_indices(
+        context,
+        slice(context.paused_request_count, context.total_request_count),
+        use_candidate_bank=True,
+    ).tolist() == [11, 14, 19]
+
+    DynamicInferenceContext.accept_async_mamba_state(context, (102, 999, 101))
+
+    assert context.mamba_metadata.request_to_mamba_state_bank.tolist() == [0, 1, 0, 0]
