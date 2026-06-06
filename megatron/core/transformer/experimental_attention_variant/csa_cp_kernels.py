@@ -10,20 +10,24 @@ for CPU tests and parity checks.
 
 import math
 import os
+from functools import lru_cache
 from typing import Optional, Tuple
 
 import torch
 
 try:
+    import cuda.bindings.driver as cuda
     import cutlass
     import cutlass.cute as cute
-    from cutlass.cute.runtime import from_dlpack
+    from cutlass.cute.runtime import from_dlpack, make_fake_stream
 
     _CUTE_AVAILABLE = True
 except ImportError:
+    cuda = None
     cutlass = None
     cute = None
     from_dlpack = None
+    make_fake_stream = None
     _CUTE_AVAILABLE = False
 
 
@@ -35,8 +39,74 @@ def can_use_cute_kernels(*tensors: Optional[torch.Tensor]) -> bool:
     return all(tensor is None or tensor.is_cuda for tensor in tensors)
 
 
-def _to_cute(tensor: torch.Tensor):
-    return from_dlpack(tensor.detach())
+def _to_cute_tvm(tensor: torch.Tensor):
+    cute_tensor = from_dlpack(tensor.detach(), assumed_align=16, enable_tvm_ffi=True)
+    if tensor.ndim == 0:
+        return cute_tensor
+    return cute_tensor.mark_layout_dynamic(leading_dim=tensor.ndim - 1)
+
+
+def _current_stream(device: torch.device):
+    return cuda.CUstream(torch.cuda.current_stream(device).cuda_stream)
+
+
+@lru_cache(maxsize=None)
+def _gpu_arch_flag() -> str:
+    cap = torch.cuda.get_device_capability()
+    arch_map = {
+        (9, 0): "sm_90a",
+        (10, 0): "sm_100a",
+        (10, 3): "sm_103a",
+    }
+    arch = arch_map.get(cap)
+    if arch is None:
+        raise RuntimeError(f"Unsupported GPU compute capability {cap} for CSA CP CuTe kernels.")
+    return arch
+
+
+def _compile_options() -> str:
+    return f"--enable-tvm-ffi --gpu-arch {_gpu_arch_flag()}"
+
+
+_CUTE_COMPILED_LAUNCH_CACHE = {}
+
+
+def _cute_scalar(value):
+    if isinstance(value, bool):
+        return cutlass.Int32(1 if value else 0)
+    if isinstance(value, int):
+        return cutlass.Int32(value)
+    if isinstance(value, float):
+        return cutlass.Float32(value)
+    return value
+
+
+def _tensor_desc(tensor: torch.Tensor):
+    return tensor.dtype, tuple(tensor.shape), tuple(tensor.stride())
+
+
+def _run_compiled_launch(launch_fn, tensor_args: Tuple[torch.Tensor, ...], scalar_args: Tuple) -> None:
+    key = (
+        launch_fn.__name__,
+        tuple(_tensor_desc(tensor) for tensor in tensor_args),
+        tuple(scalar_args),
+    )
+    compiled = _CUTE_COMPILED_LAUNCH_CACHE.get(key)
+    if compiled is None:
+        fake_stream = make_fake_stream(use_tvm_ffi_env_stream=False)
+        compiled = cute.compile(
+            launch_fn,
+            *(_to_cute_tvm(tensor) for tensor in tensor_args),
+            *(_cute_scalar(arg) for arg in scalar_args),
+            fake_stream,
+            options=_compile_options(),
+        )
+        _CUTE_COMPILED_LAUNCH_CACHE[key] = compiled
+    compiled(
+        *tensor_args,
+        *(_cute_scalar(arg) for arg in scalar_args),
+        _current_stream(tensor_args[0].device),
+    )
 
 
 def _row_width(shape: Tuple[int, ...]) -> int:
@@ -54,7 +124,11 @@ def _flatten_rows(tensor: torch.Tensor, rows: int, row_width: Optional[int] = No
 def _zero_rows(tensor: torch.Tensor, rows: int, row_width: int) -> None:
     total_work = rows * row_width
     if total_work > 0:
-        _zero_2d_launch(_to_cute(_flatten_rows(tensor, rows, row_width)), row_width, total_work)
+        _run_compiled_launch(
+            _zero_2d_launch,
+            (_flatten_rows(tensor, rows, row_width),),
+            (row_width, total_work),
+        )
 
 
 if _CUTE_AVAILABLE:
@@ -79,10 +153,11 @@ if _CUTE_AVAILABLE:
         tensor: cute.Tensor,
         row_width: cutlass.Int32,
         total_work: cutlass.Int32,
+        stream: cuda.CUstream,
     ):
         _zero_2d_kernel.set_name_prefix("dsv4_cp_zero_2d")
         _zero_2d_kernel(tensor, row_width, total_work).launch(
-            grid=(cute.ceil_div(total_work, 128), 1, 1), block=(128, 1, 1)
+            grid=(cute.ceil_div(total_work, 128), 1, 1), block=(128, 1, 1), stream=stream
         )
 
 
@@ -111,10 +186,11 @@ if _CUTE_AVAILABLE:
         cu_compressed: cute.Tensor,
         n_seq: cutlass.Int32,
         ratio: cutlass.Int32,
+        stream: cuda.CUstream,
     ):
         _global_compressed_cu_kernel.set_name_prefix("dsv4_cp_global_compressed_cu")
         _global_compressed_cu_kernel(cu_seqlens, cu_compressed, n_seq, ratio).launch(
-            grid=(cute.ceil_div(n_seq + 1, 128), 1, 1), block=(128, 1, 1)
+            grid=(cute.ceil_div(n_seq + 1, 128), 1, 1), block=(128, 1, 1), stream=stream
         )
 
 
@@ -166,6 +242,7 @@ if _CUTE_AVAILABLE:
         head_dim: cutlass.Int32,
         fill_value: cutlass.Float32,
         total_work: cutlass.Int32,
+        stream: cuda.CUstream,
     ):
         _overlap_transform_thd_kernel.set_name_prefix("dsv4_cp_overlap_transform_thd")
         _overlap_transform_thd_kernel(
@@ -179,7 +256,11 @@ if _CUTE_AVAILABLE:
             head_dim,
             fill_value,
             total_work,
-        ).launch(grid=(cute.ceil_div(total_work, 128), 1, 1), block=(128, 1, 1))
+        ).launch(
+            grid=(cute.ceil_div(total_work, 128), 1, 1),
+            block=(128, 1, 1),
+            stream=stream,
+        )
 
 
     @cute.kernel
@@ -228,6 +309,7 @@ if _CUTE_AVAILABLE:
         input_width: cutlass.Int32,
         head_dim: cutlass.Int32,
         total_work: cutlass.Int32,
+        stream: cuda.CUstream,
     ):
         _overlap_transform_thd_backward_kernel.set_name_prefix(
             "dsv4_cp_overlap_transform_thd_backward"
@@ -242,11 +324,15 @@ if _CUTE_AVAILABLE:
             input_width,
             head_dim,
             total_work,
-        ).launch(grid=(cute.ceil_div(total_work, 128), 1, 1), block=(128, 1, 1))
+        ).launch(
+            grid=(cute.ceil_div(total_work, 128), 1, 1),
+            block=(128, 1, 1),
+            stream=stream,
+        )
 
 
     @cute.kernel
-    def _rope_token_kernel(
+    def _rope_thd_chunked_cp_kernel(
         x: cute.Tensor,
         out: cute.Tensor,
         cos: cute.Tensor,
@@ -254,7 +340,6 @@ if _CUTE_AVAILABLE:
         cu_seqlens: cute.Tensor,
         n_seq: cutlass.Int32,
         global_row_base: cutlass.Int32,
-        total_tokens: cutlass.Int32,
         clamp_to_valid_token: cutlass.Int32,
         row_width: cutlass.Int32,
         head_dim: cutlass.Int32,
@@ -268,54 +353,48 @@ if _CUTE_AVAILABLE:
         bidx, _, _ = cute.arch.block_idx()
         linear = bidx * 128 + tidx
         if linear < total_work:
-            row = linear // row_width
-            col = linear - row * row_width
-            head_col = col - (col // head_dim) * head_dim
+            pair = linear % (pos_dim // 2)
+            tmp = linear // (pos_dim // 2)
+            head = tmp % (row_width // head_dim)
+            row = tmp // (row_width // head_dim)
+            col = head * head_dim + nope_dim + pair * 2
 
-            if head_col < nope_dim:
-                out[row, col] = x[row, col]
-            else:
-                global_token = global_row_base + row
-                if clamp_to_valid_token != 0:
-                    if global_token < 0:
-                        global_token = 0
-                    last_token = total_tokens - 1
-                    if global_token > last_token:
-                        global_token = last_token
+            global_token = global_row_base + row
+            if clamp_to_valid_token != 0:
+                if global_token < 0:
+                    global_token = 0
+                last_token = cu_seqlens[n_seq] - 1
+                if global_token > last_token:
+                    global_token = last_token
 
-                rope_pos = 0
-                for seq in range(n_seq):
-                    seq_start = cu_seqlens[seq]
-                    seq_end = cu_seqlens[seq + 1]
-                    if global_token >= seq_start and global_token < seq_end:
-                        rope_pos = global_token - seq_start
+            rope_pos = 0
+            for seq in range(n_seq):
+                seq_start = cu_seqlens[seq]
+                seq_end = cu_seqlens[seq + 1]
+                if global_token >= seq_start and global_token < seq_end:
+                    rope_pos = global_token - seq_start
 
-                pos_col = head_col - nope_dim
-                pair = pos_col // 2
-                pair_base = col - head_col + nope_dim + pair * 2
-                x1 = x[row, pair_base].to(cutlass.Float32)
-                x2 = x[row, pair_base + 1].to(cutlass.Float32)
+            x1 = x[row, col].to(cutlass.Float32)
+            x2 = x[row, col + 1].to(cutlass.Float32)
+            cos_left = cos[rope_pos, pair].to(cutlass.Float32)
+            sin_left = sin[rope_pos, pair].to(cutlass.Float32)
+            cos_right = cos[rope_pos, pos_dim // 2 + pair].to(cutlass.Float32)
+            sin_right = sin[rope_pos, pos_dim // 2 + pair].to(cutlass.Float32)
+            if inverse != 0:
+                sin_left = cutlass.Float32(0.0) - sin_left
+                sin_right = cutlass.Float32(0.0) - sin_right
 
-                cos_left = cos[rope_pos, pair].to(cutlass.Float32)
-                sin_left = sin[rope_pos, pair].to(cutlass.Float32)
-                cos_right = cos[rope_pos, pos_dim // 2 + pair].to(cutlass.Float32)
-                sin_right = sin[rope_pos, pos_dim // 2 + pair].to(cutlass.Float32)
-                if inverse != 0:
-                    sin_left = cutlass.Float32(0.0) - sin_left
-                    sin_right = cutlass.Float32(0.0) - sin_right
-
-                value = x1 * cos_left - x2 * sin_left
-                if pos_col - pair * 2 != 0:
-                    value = x2 * cos_right + x1 * sin_right
-                if adjoint != 0:
-                    value = x1 * cos_left + x2 * sin_right
-                    if pos_col - pair * 2 != 0:
-                        value = cutlass.Float32(0.0) - x1 * sin_left + x2 * cos_right
-                out[row, col] = value.to(out.element_type)
+            value_left = x1 * cos_left - x2 * sin_left
+            value_right = x2 * cos_right + x1 * sin_right
+            if adjoint != 0:
+                value_left = x1 * cos_left + x2 * sin_right
+                value_right = cutlass.Float32(0.0) - x1 * sin_left + x2 * cos_right
+            out[row, col] = value_left.to(out.element_type)
+            out[row, col + 1] = value_right.to(out.element_type)
 
 
     @cute.jit
-    def _rope_token_launch(
+    def _rope_thd_chunked_cp_launch(
         x: cute.Tensor,
         out: cute.Tensor,
         cos: cute.Tensor,
@@ -323,7 +402,6 @@ if _CUTE_AVAILABLE:
         cu_seqlens: cute.Tensor,
         n_seq: cutlass.Int32,
         global_row_base: cutlass.Int32,
-        total_tokens: cutlass.Int32,
         clamp_to_valid_token: cutlass.Int32,
         row_width: cutlass.Int32,
         head_dim: cutlass.Int32,
@@ -332,9 +410,10 @@ if _CUTE_AVAILABLE:
         inverse: cutlass.Int32,
         adjoint: cutlass.Int32,
         total_work: cutlass.Int32,
+        stream: cuda.CUstream,
     ):
-        _rope_token_kernel.set_name_prefix("dsv4_cp_rope_token")
-        _rope_token_kernel(
+        _rope_thd_chunked_cp_kernel.set_name_prefix("dsv4_thd_chunked_cp_rope")
+        _rope_thd_chunked_cp_kernel(
             x,
             out,
             cos,
@@ -342,7 +421,6 @@ if _CUTE_AVAILABLE:
             cu_seqlens,
             n_seq,
             global_row_base,
-            total_tokens,
             clamp_to_valid_token,
             row_width,
             head_dim,
@@ -351,7 +429,11 @@ if _CUTE_AVAILABLE:
             inverse,
             adjoint,
             total_work,
-        ).launch(grid=(cute.ceil_div(total_work, 128), 1, 1), block=(128, 1, 1))
+        ).launch(
+            grid=(cute.ceil_div(total_work, 128), 1, 1),
+            block=(128, 1, 1),
+            stream=stream,
+        )
 
 
     @cute.kernel
@@ -425,6 +507,7 @@ if _CUTE_AVAILABLE:
         inverse: cutlass.Int32,
         adjoint: cutlass.Int32,
         total_work: cutlass.Int32,
+        stream: cuda.CUstream,
     ):
         _rope_compressed_kernel.set_name_prefix("dsv4_cp_rope_compressed")
         _rope_compressed_kernel(
@@ -441,7 +524,11 @@ if _CUTE_AVAILABLE:
             inverse,
             adjoint,
             total_work,
-        ).launch(grid=(cute.ceil_div(total_work, 128), 1, 1), block=(128, 1, 1))
+        ).launch(
+            grid=(cute.ceil_div(total_work, 128), 1, 1),
+            block=(128, 1, 1),
+            stream=stream,
+        )
 
 
     @cute.kernel
@@ -519,6 +606,7 @@ if _CUTE_AVAILABLE:
         d_comp: cutlass.Int32,
         c_cap: cutlass.Int32,
         total_rows: cutlass.Int32,
+        stream: cuda.CUstream,
     ):
         _rank_major_metadata_kernel.set_name_prefix("dsv4_cp_rank_major_metadata")
         _rank_major_metadata_kernel(
@@ -533,7 +621,11 @@ if _CUTE_AVAILABLE:
             d_comp,
             c_cap,
             total_rows,
-        ).launch(grid=(cute.ceil_div(total_rows, 128), 1, 1), block=(128, 1, 1))
+        ).launch(
+            grid=(cute.ceil_div(total_rows, 128), 1, 1),
+            block=(128, 1, 1),
+            stream=stream,
+        )
 
 
     @cute.kernel
@@ -702,6 +794,7 @@ if _CUTE_AVAILABLE:
         compact_len: cutlass.Int32,
         row_width: cutlass.Int32,
         total_work: cutlass.Int32,
+        stream: cuda.CUstream,
     ):
         _compressor_prep_kernel.set_name_prefix("dsv4_cp_compressor_prep")
         _compressor_prep_kernel(
@@ -723,7 +816,11 @@ if _CUTE_AVAILABLE:
             compact_len,
             row_width,
             total_work,
-        ).launch(grid=(cute.ceil_div(total_work, 128), 1, 1), block=(128, 1, 1))
+        ).launch(
+            grid=(cute.ceil_div(total_work, 128), 1, 1),
+            block=(128, 1, 1),
+            stream=stream,
+        )
 
 
     @cute.kernel
@@ -808,6 +905,7 @@ if _CUTE_AVAILABLE:
         compact_len: cutlass.Int32,
         row_width: cutlass.Int32,
         total_work: cutlass.Int32,
+        stream: cuda.CUstream,
     ):
         _compressor_prep_backward_kernel.set_name_prefix("dsv4_cp_compressor_prep_backward")
         _compressor_prep_backward_kernel(
@@ -824,19 +922,21 @@ if _CUTE_AVAILABLE:
             compact_len,
             row_width,
             total_work,
-        ).launch(grid=(cute.ceil_div(total_work, 128), 1, 1), block=(128, 1, 1))
+        ).launch(
+            grid=(cute.ceil_div(total_work, 128), 1, 1),
+            block=(128, 1, 1),
+            stream=stream,
+        )
 
 
     @cute.kernel
-    def _kv_pack_kernel(
-        kv_local: cute.Tensor,
-        boundary_kv: cute.Tensor,
-        compressed_rank_major: cute.Tensor,
+    def _kv_pack_source_map_kernel(
         seq_ids_rank_major: cute.Tensor,
         comp_ids_rank_major: cute.Tensor,
         valid_rank_major: cute.Tensor,
         cu_seqlens: cute.Tensor,
-        kv_full: cute.Tensor,
+        source_kind: cute.Tensor,
+        source_index: cute.Tensor,
         n_seq: cutlass.Int32,
         global_start: cutlass.Int32,
         l_local: cutlass.Int32,
@@ -844,16 +944,13 @@ if _CUTE_AVAILABLE:
         ratio: cutlass.Int32,
         compressed_rows: cutlass.Int32,
         kv_full_capacity: cutlass.Int32,
-        row_width: cutlass.Int32,
-        total_work: cutlass.Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
-        linear = bidx * 128 + tidx
-        if linear < total_work:
-            out_row = linear // row_width
-            col = linear - out_row * row_width
-            kv_full[out_row, col] = cutlass.Float32(0.0).to(kv_full.element_type)
+        out_row = bidx * 128 + tidx
+        if out_row < kv_full_capacity:
+            source_kind[out_row] = -1
+            source_index[out_row] = 0
 
             offset = 0
             for seq in range(n_seq):
@@ -882,11 +979,11 @@ if _CUTE_AVAILABLE:
                         if inner < window_len:
                             src_global = window_start + inner
                             if src_global < global_start:
-                                boundary_row = src_global - (global_start - d_window)
-                                kv_full[out_row, col] = boundary_kv[boundary_row, col]
+                                source_kind[out_row] = 1
+                                source_index[out_row] = src_global - (global_start - d_window)
                             else:
-                                local_row = src_global - global_start
-                                kv_full[out_row, col] = kv_local[local_row, col]
+                                source_kind[out_row] = 0
+                                source_index[out_row] = src_global - global_start
                         else:
                             comp_id = inner - window_len
                             for comp_row in range(compressed_rows):
@@ -895,20 +992,19 @@ if _CUTE_AVAILABLE:
                                     and seq_ids_rank_major[comp_row] == seq
                                     and comp_ids_rank_major[comp_row] == comp_id
                                 ):
-                                    kv_full[out_row, col] = compressed_rank_major[comp_row, col]
+                                    source_kind[out_row] = 2
+                                    source_index[out_row] = comp_row
                     offset = offset + seq_total
 
 
     @cute.jit
-    def _kv_pack_launch(
-        kv_local: cute.Tensor,
-        boundary_kv: cute.Tensor,
-        compressed_rank_major: cute.Tensor,
+    def _kv_pack_source_map_launch(
         seq_ids_rank_major: cute.Tensor,
         comp_ids_rank_major: cute.Tensor,
         valid_rank_major: cute.Tensor,
         cu_seqlens: cute.Tensor,
-        kv_full: cute.Tensor,
+        source_kind: cute.Tensor,
+        source_index: cute.Tensor,
         n_seq: cutlass.Int32,
         global_start: cutlass.Int32,
         l_local: cutlass.Int32,
@@ -916,19 +1012,16 @@ if _CUTE_AVAILABLE:
         ratio: cutlass.Int32,
         compressed_rows: cutlass.Int32,
         kv_full_capacity: cutlass.Int32,
-        row_width: cutlass.Int32,
-        total_work: cutlass.Int32,
+        stream: cuda.CUstream,
     ):
-        _kv_pack_kernel.set_name_prefix("dsv4_cp_kv_full_pack")
-        _kv_pack_kernel(
-            kv_local,
-            boundary_kv,
-            compressed_rank_major,
+        _kv_pack_source_map_kernel.set_name_prefix("dsv4_cp_kv_full_source_map")
+        _kv_pack_source_map_kernel(
             seq_ids_rank_major,
             comp_ids_rank_major,
             valid_rank_major,
             cu_seqlens,
-            kv_full,
+            source_kind,
+            source_index,
             n_seq,
             global_start,
             l_local,
@@ -936,27 +1029,124 @@ if _CUTE_AVAILABLE:
             ratio,
             compressed_rows,
             kv_full_capacity,
-            row_width,
-            total_work,
-        ).launch(grid=(cute.ceil_div(total_work, 128), 1, 1), block=(128, 1, 1))
+        ).launch(
+            grid=(cute.ceil_div(kv_full_capacity, 128), 1, 1),
+            block=(128, 1, 1),
+            stream=stream,
+        )
 
 
     @cute.kernel
-    def _kv_pack_backward_kernel(
-        grad_kv_full: cute.Tensor,
-        grad_kv_local: cute.Tensor,
-        grad_boundary_kv: cute.Tensor,
-        grad_compressed: cute.Tensor,
-        seq_ids_rank_major: cute.Tensor,
-        comp_ids_rank_major: cute.Tensor,
-        valid_rank_major: cute.Tensor,
+    def _kv_pack_source_map_from_seq_major_kernel(
         cu_seqlens: cute.Tensor,
+        cu_seqlens_compressed: cute.Tensor,
+        rank_major_by_seq_major: cute.Tensor,
+        source_kind: cute.Tensor,
+        source_index: cute.Tensor,
         n_seq: cutlass.Int32,
         global_start: cutlass.Int32,
         l_local: cutlass.Int32,
         d_window: cutlass.Int32,
         ratio: cutlass.Int32,
-        compressed_rows: cutlass.Int32,
+        kv_full_capacity: cutlass.Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        out_row = bidx * 128 + tidx
+        if out_row < kv_full_capacity:
+            source_kind[out_row] = -1
+            source_index[out_row] = 0
+
+            offset = 0
+            for seq in range(n_seq):
+                seq_start = cu_seqlens[seq]
+                seq_end = cu_seqlens[seq + 1]
+                global_end = global_start + l_local
+                local_seq_start = seq_start
+                if local_seq_start < global_start:
+                    local_seq_start = global_start
+                local_seq_end = seq_end
+                if local_seq_end > global_end:
+                    local_seq_end = global_end
+
+                if local_seq_start < local_seq_end:
+                    window_start = local_seq_start - d_window
+                    if window_start < seq_start:
+                        window_start = seq_start
+                    window_len = local_seq_end - window_start
+                    comp_start = cu_seqlens_compressed[seq]
+                    comp_end = cu_seqlens_compressed[seq + 1]
+                    comp_len = comp_end - comp_start
+                    if ratio <= 1:
+                        comp_len = 0
+                    seq_total = window_len + comp_len
+
+                    if out_row >= offset and out_row < offset + seq_total:
+                        inner = out_row - offset
+                        if inner < window_len:
+                            src_global = window_start + inner
+                            if src_global < global_start:
+                                source_kind[out_row] = 1
+                                source_index[out_row] = src_global - (global_start - d_window)
+                            else:
+                                source_kind[out_row] = 0
+                                source_index[out_row] = src_global - global_start
+                        else:
+                            comp_id = inner - window_len
+                            seq_major = comp_start + comp_id
+                            if seq_major >= comp_start and seq_major < comp_end:
+                                rank_major = rank_major_by_seq_major[seq_major]
+                                if rank_major >= 0:
+                                    source_kind[out_row] = 2
+                                    source_index[out_row] = rank_major
+                    offset = offset + seq_total
+
+
+    @cute.jit
+    def _kv_pack_source_map_from_seq_major_launch(
+        cu_seqlens: cute.Tensor,
+        cu_seqlens_compressed: cute.Tensor,
+        rank_major_by_seq_major: cute.Tensor,
+        source_kind: cute.Tensor,
+        source_index: cute.Tensor,
+        n_seq: cutlass.Int32,
+        global_start: cutlass.Int32,
+        l_local: cutlass.Int32,
+        d_window: cutlass.Int32,
+        ratio: cutlass.Int32,
+        kv_full_capacity: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        _kv_pack_source_map_from_seq_major_kernel.set_name_prefix(
+            "dsv4_cp_kv_full_source_map_seq_major"
+        )
+        _kv_pack_source_map_from_seq_major_kernel(
+            cu_seqlens,
+            cu_seqlens_compressed,
+            rank_major_by_seq_major,
+            source_kind,
+            source_index,
+            n_seq,
+            global_start,
+            l_local,
+            d_window,
+            ratio,
+            kv_full_capacity,
+        ).launch(
+            grid=(cute.ceil_div(kv_full_capacity, 128), 1, 1),
+            block=(128, 1, 1),
+            stream=stream,
+        )
+
+
+    @cute.kernel
+    def _kv_pack_direct_kernel(
+        kv_local: cute.Tensor,
+        boundary_kv: cute.Tensor,
+        compressed_rank_major: cute.Tensor,
+        source_kind: cute.Tensor,
+        source_index: cute.Tensor,
+        kv_full: cute.Tensor,
         kv_full_capacity: cutlass.Int32,
         row_width: cutlass.Int32,
         total_work: cutlass.Int32,
@@ -968,91 +1158,109 @@ if _CUTE_AVAILABLE:
         if linear < kv_full_capacity * row_width:
             out_row = linear // row_width
             col = linear - out_row * row_width
+            kind = source_kind[out_row]
+            index = source_index[out_row]
 
-            offset = 0
-            for seq in range(n_seq):
-                seq_start = cu_seqlens[seq]
-                seq_end = cu_seqlens[seq + 1]
-                global_end = global_start + l_local
-                local_seq_start = seq_start
-                if local_seq_start < global_start:
-                    local_seq_start = global_start
-                local_seq_end = seq_end
-                if local_seq_end > global_end:
-                    local_seq_end = global_end
-
-                if local_seq_start < local_seq_end:
-                    window_start = local_seq_start - d_window
-                    if window_start < seq_start:
-                        window_start = seq_start
-                    window_len = local_seq_end - window_start
-                    comp_len = 0
-                    if ratio > 1:
-                        comp_len = (seq_end - seq_start) // ratio
-                    seq_total = window_len + comp_len
-
-                    if out_row >= offset and out_row < offset + seq_total:
-                        inner = out_row - offset
-                        if inner < window_len:
-                            src_global = window_start + inner
-                            if src_global < global_start:
-                                boundary_row = src_global - (global_start - d_window)
-                                grad_boundary_kv[boundary_row, col] = grad_kv_full[out_row, col]
-                            else:
-                                local_row = src_global - global_start
-                                grad_kv_local[local_row, col] = grad_kv_full[out_row, col]
-                        else:
-                            comp_id = inner - window_len
-                            for comp_row in range(compressed_rows):
-                                if (
-                                    valid_rank_major[comp_row]
-                                    and seq_ids_rank_major[comp_row] == seq
-                                    and comp_ids_rank_major[comp_row] == comp_id
-                                ):
-                                    grad_compressed[comp_row, col] = grad_kv_full[out_row, col]
-                    offset = offset + seq_total
+            value = cutlass.Float32(0.0).to(kv_full.element_type)
+            if kind == 0:
+                value = kv_local[index, col]
+            elif kind == 1:
+                value = boundary_kv[index, col]
+            elif kind == 2:
+                value = compressed_rank_major[index, col]
+            kv_full[out_row, col] = value
 
 
     @cute.jit
-    def _kv_pack_backward_launch(
+    def _kv_pack_direct_launch(
+        kv_local: cute.Tensor,
+        boundary_kv: cute.Tensor,
+        compressed_rank_major: cute.Tensor,
+        source_kind: cute.Tensor,
+        source_index: cute.Tensor,
+        kv_full: cute.Tensor,
+        kv_full_capacity: cutlass.Int32,
+        row_width: cutlass.Int32,
+        total_work: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        _kv_pack_direct_kernel.set_name_prefix("dsv4_cp_kv_full_pack")
+        _kv_pack_direct_kernel(
+            kv_local,
+            boundary_kv,
+            compressed_rank_major,
+            source_kind,
+            source_index,
+            kv_full,
+            kv_full_capacity,
+            row_width,
+            total_work,
+        ).launch(
+            grid=(cute.ceil_div(total_work, 128), 1, 1),
+            block=(128, 1, 1),
+            stream=stream,
+        )
+
+
+    @cute.kernel
+    def _kv_pack_direct_backward_kernel(
         grad_kv_full: cute.Tensor,
         grad_kv_local: cute.Tensor,
         grad_boundary_kv: cute.Tensor,
         grad_compressed: cute.Tensor,
-        seq_ids_rank_major: cute.Tensor,
-        comp_ids_rank_major: cute.Tensor,
-        valid_rank_major: cute.Tensor,
-        cu_seqlens: cute.Tensor,
-        n_seq: cutlass.Int32,
-        global_start: cutlass.Int32,
-        l_local: cutlass.Int32,
-        d_window: cutlass.Int32,
-        ratio: cutlass.Int32,
-        compressed_rows: cutlass.Int32,
+        source_kind: cute.Tensor,
+        source_index: cute.Tensor,
         kv_full_capacity: cutlass.Int32,
         row_width: cutlass.Int32,
         total_work: cutlass.Int32,
     ):
-        _kv_pack_backward_kernel.set_name_prefix("dsv4_cp_kv_full_pack_backward")
-        _kv_pack_backward_kernel(
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        linear = bidx * 128 + tidx
+
+        if linear < kv_full_capacity * row_width:
+            out_row = linear // row_width
+            col = linear - out_row * row_width
+            kind = source_kind[out_row]
+            index = source_index[out_row]
+
+            if kind == 0:
+                grad_kv_local[index, col] = grad_kv_full[out_row, col]
+            elif kind == 1:
+                grad_boundary_kv[index, col] = grad_kv_full[out_row, col]
+            elif kind == 2:
+                grad_compressed[index, col] = grad_kv_full[out_row, col]
+
+
+    @cute.jit
+    def _kv_pack_direct_backward_launch(
+        grad_kv_full: cute.Tensor,
+        grad_kv_local: cute.Tensor,
+        grad_boundary_kv: cute.Tensor,
+        grad_compressed: cute.Tensor,
+        source_kind: cute.Tensor,
+        source_index: cute.Tensor,
+        kv_full_capacity: cutlass.Int32,
+        row_width: cutlass.Int32,
+        total_work: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        _kv_pack_direct_backward_kernel.set_name_prefix("dsv4_cp_kv_full_pack_backward")
+        _kv_pack_direct_backward_kernel(
             grad_kv_full,
             grad_kv_local,
             grad_boundary_kv,
             grad_compressed,
-            seq_ids_rank_major,
-            comp_ids_rank_major,
-            valid_rank_major,
-            cu_seqlens,
-            n_seq,
-            global_start,
-            l_local,
-            d_window,
-            ratio,
-            compressed_rows,
+            source_kind,
+            source_index,
             kv_full_capacity,
             row_width,
             total_work,
-        ).launch(grid=(cute.ceil_div(total_work, 128), 1, 1), block=(128, 1, 1))
+        ).launch(
+            grid=(cute.ceil_div(total_work, 128), 1, 1),
+            block=(128, 1, 1),
+            stream=stream,
+        )
 
 
     @cute.kernel
@@ -1108,6 +1316,7 @@ if _CUTE_AVAILABLE:
         seq_major_rows: cutlass.Int32,
         row_width: cutlass.Int32,
         total_work: cutlass.Int32,
+        stream: cuda.CUstream,
     ):
         _repack_rank_major_kernel.set_name_prefix("dsv4_cp_repack_rank_major")
         _repack_rank_major_kernel(
@@ -1122,7 +1331,11 @@ if _CUTE_AVAILABLE:
             seq_major_rows,
             row_width,
             total_work,
-        ).launch(grid=(cute.ceil_div(total_work, 128), 1, 1), block=(128, 1, 1))
+        ).launch(
+            grid=(cute.ceil_div(total_work, 128), 1, 1),
+            block=(128, 1, 1),
+            stream=stream,
+        )
 
 
     @cute.kernel
@@ -1131,6 +1344,7 @@ if _CUTE_AVAILABLE:
         cu_seqlens_compressed: cute.Tensor,
         cu_q_topk: cute.Tensor,
         cu_k_topk: cute.Tensor,
+        seq_lens: cute.Tensor,
         n_seq: cutlass.Int32,
         global_start: cutlass.Int32,
         l_local: cutlass.Int32,
@@ -1168,6 +1382,8 @@ if _CUTE_AVAILABLE:
                 k_prefix = k_prefix + k_len
                 cu_q_topk[seq + 1] = q_prefix
                 cu_k_topk[seq + 1] = k_prefix
+                for row in range(q_len):
+                    seq_lens[q_prefix - q_len + row] = k_len
 
             actual_total = cu_seqlens_q[n_seq]
             padding_q = 0
@@ -1179,6 +1395,8 @@ if _CUTE_AVAILABLE:
                     padding_q = global_end - padding_start
             cu_q_topk[n_seq + 1] = q_prefix + padding_q
             cu_k_topk[n_seq + 1] = k_prefix
+            for row in range(padding_q):
+                seq_lens[q_prefix + row] = cutlass.Int32(0)
 
 
     @cute.jit
@@ -1187,10 +1405,12 @@ if _CUTE_AVAILABLE:
         cu_seqlens_compressed: cute.Tensor,
         cu_q_topk: cute.Tensor,
         cu_k_topk: cute.Tensor,
+        seq_lens: cute.Tensor,
         n_seq: cutlass.Int32,
         global_start: cutlass.Int32,
         l_local: cutlass.Int32,
         ratio: cutlass.Int32,
+        stream: cuda.CUstream,
     ):
         _indexer_topk_input_metadata_kernel.set_name_prefix("dsv4_cp_indexer_topk_inputs_meta")
         _indexer_topk_input_metadata_kernel(
@@ -1198,11 +1418,12 @@ if _CUTE_AVAILABLE:
             cu_seqlens_compressed,
             cu_q_topk,
             cu_k_topk,
+            seq_lens,
             n_seq,
             global_start,
             l_local,
             ratio,
-        ).launch(grid=(1, 1, 1), block=(128, 1, 1))
+        ).launch(grid=(1, 1, 1), block=(128, 1, 1), stream=stream)
 
 
     @cute.kernel
@@ -1245,6 +1466,7 @@ if _CUTE_AVAILABLE:
         row_width: cutlass.Int32,
         seq_major_rows: cutlass.Int32,
         total_work: cutlass.Int32,
+        stream: cuda.CUstream,
     ):
         _indexer_topk_input_k_pack_kernel.set_name_prefix("dsv4_cp_indexer_topk_inputs_k_pack")
         _indexer_topk_input_k_pack_kernel(
@@ -1256,7 +1478,11 @@ if _CUTE_AVAILABLE:
             row_width,
             seq_major_rows,
             total_work,
-        ).launch(grid=(cute.ceil_div(total_work, 128), 1, 1), block=(128, 1, 1))
+        ).launch(
+            grid=(cute.ceil_div(total_work, 128), 1, 1),
+            block=(128, 1, 1),
+            stream=stream,
+        )
 
 
     @cute.kernel
@@ -1288,6 +1514,7 @@ if _CUTE_AVAILABLE:
         input_width: cutlass.Int32,
         output_width: cutlass.Int32,
         total_work: cutlass.Int32,
+        stream: cuda.CUstream,
     ):
         _pad_topk_indices_kernel.set_name_prefix("dsv4_cp_pad_topk_indices")
         _pad_topk_indices_kernel(
@@ -1297,7 +1524,11 @@ if _CUTE_AVAILABLE:
             input_width,
             output_width,
             total_work,
-        ).launch(grid=(cute.ceil_div(total_work, 128), 1, 1), block=(128, 1, 1))
+        ).launch(
+            grid=(cute.ceil_div(total_work, 128), 1, 1),
+            block=(128, 1, 1),
+            stream=stream,
+        )
 
 
     @cute.kernel
@@ -1330,6 +1561,34 @@ if _CUTE_AVAILABLE:
             topk_length[row] = count
 
 
+    @cute.kernel
+    def _filter_indexer_topk_scores_no_length_kernel(
+        scores: cute.Tensor,
+        topk_in: cute.Tensor,
+        topk_out: cute.Tensor,
+        rows: cutlass.Int32,
+        score_width: cutlass.Int32,
+        topk_width: cutlass.Int32,
+        output_width: cutlass.Int32,
+        total_work: cutlass.Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        linear = bidx * 128 + tidx
+        if linear < total_work:
+            row = linear // output_width
+            col = linear - row * output_width
+            out = -1
+            finite_floor = cutlass.Float32(-3.402823e38)
+            if col < topk_width:
+                idx = topk_in[row, col]
+                if idx >= 0 and idx < score_width:
+                    score = scores[row, idx].to(cutlass.Float32)
+                    if score == score and score > finite_floor:
+                        out = idx
+            topk_out[row, col] = out
+
+
     @cute.jit
     def _filter_indexer_topk_scores_launch(
         scores: cute.Tensor,
@@ -1340,6 +1599,7 @@ if _CUTE_AVAILABLE:
         score_width: cutlass.Int32,
         topk_width: cutlass.Int32,
         output_width: cutlass.Int32,
+        stream: cuda.CUstream,
     ):
         _filter_indexer_topk_scores_kernel.set_name_prefix("dsv4_cp_filter_indexer_topk")
         _filter_indexer_topk_scores_kernel(
@@ -1351,7 +1611,34 @@ if _CUTE_AVAILABLE:
             score_width,
             topk_width,
             output_width,
-        ).launch(grid=(cute.ceil_div(rows, 128), 1, 1), block=(128, 1, 1))
+        ).launch(grid=(cute.ceil_div(rows, 128), 1, 1), block=(128, 1, 1), stream=stream)
+
+
+    @cute.jit
+    def _filter_indexer_topk_scores_no_length_launch(
+        scores: cute.Tensor,
+        topk_in: cute.Tensor,
+        topk_out: cute.Tensor,
+        rows: cutlass.Int32,
+        score_width: cutlass.Int32,
+        topk_width: cutlass.Int32,
+        output_width: cutlass.Int32,
+        total_work: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        _filter_indexer_topk_scores_no_length_kernel.set_name_prefix(
+            "dsv4_cp_filter_indexer_topk_no_length"
+        )
+        _filter_indexer_topk_scores_no_length_kernel(
+            scores,
+            topk_in,
+            topk_out,
+            rows,
+            score_width,
+            topk_width,
+            output_width,
+            total_work,
+        ).launch(grid=(cute.ceil_div(total_work, 128), 1, 1), block=(128, 1, 1), stream=stream)
 
 
     @cute.kernel
@@ -1466,6 +1753,7 @@ if _CUTE_AVAILABLE:
         has_indexer_topk: cutlass.Int32,
         has_compressed: cutlass.Int32,
         total_width: cutlass.Int32,
+        stream: cuda.CUstream,
     ):
         _final_idx_kernel.set_name_prefix("dsv4_cp_final_idx")
         _final_idx_kernel(
@@ -1483,7 +1771,7 @@ if _CUTE_AVAILABLE:
             has_indexer_topk,
             has_compressed,
             total_width,
-        ).launch(grid=(cute.ceil_div(l_local, 128), 1, 1), block=(128, 1, 1))
+        ).launch(grid=(cute.ceil_div(l_local, 128), 1, 1), block=(128, 1, 1), stream=stream)
 
 
     @cute.kernel
@@ -1503,16 +1791,16 @@ if _CUTE_AVAILABLE:
         compressed_width: cutlass.Int32,
         seq_major_rows: cutlass.Int32,
         total_width: cutlass.Int32,
+        total_work: cutlass.Int32,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         bidx, _, _ = cute.arch.block_idx()
-        row = bidx * 128 + tidx
-        if row < l_local:
-            for col in range(total_width):
-                topk_idxs[row, col] = -1
-            for col in range(compressed_width):
-                indexer_rank_major[row, col] = -1
-
+        linear = bidx * 128 + tidx
+        if linear < total_work:
+            row = linear // total_width
+            col = linear - row * total_width
+            topk_value = -1
+            rank_major_value = -1
             global_q = global_start + row
             seq_id = -1
             seq_start_found = 0
@@ -1553,26 +1841,32 @@ if _CUTE_AVAILABLE:
                         if seq < seq_id:
                             seq_offset = seq_offset + window_len + comp_len
 
-                for j in range(compressed_width):
-                    comp_id = indexer_topk_logical[row, j]
+                if col < compressed_width:
+                    comp_id = indexer_topk_logical[row, col]
                     if comp_id >= 0 and comp_id < seq_comp_len:
-                        topk_idxs[row, j] = seq_offset + seq_window_len + comp_id
+                        topk_value = seq_offset + seq_window_len + comp_id
                         seq_major_id = cu_seqlens_compressed[seq_id] + comp_id
                         if seq_major_id >= 0 and seq_major_id < seq_major_rows:
                             rank_major_id = indexer_rank_by_seq_major[seq_major_id]
                             if rank_major_id >= 0:
-                                indexer_rank_major[row, j] = rank_major_id
+                                rank_major_value = rank_major_id
+                else:
+                    window_col = col - compressed_width
+                    window_start_for_q = global_q - window_size + 1
+                    if window_start_for_q < seq_start_found:
+                        window_start_for_q = seq_start_found
+                    window_count = global_q - window_start_for_q + 1
+                    pos = window_start_for_q + window_col
+                    if (
+                        window_col < window_count
+                        and pos >= seq_window_start
+                        and pos < seq_window_start + seq_window_len
+                    ):
+                        topk_value = seq_offset + pos - seq_window_start
 
-                window_start_for_q = global_q - window_size + 1
-                if window_start_for_q < seq_start_found:
-                    window_start_for_q = seq_start_found
-                window_count = global_q - window_start_for_q + 1
-                for w in range(window_size):
-                    pos = window_start_for_q + w
-                    if w < window_count and pos >= seq_window_start and pos < seq_window_start + seq_window_len:
-                        topk_idxs[row, compressed_width + w] = (
-                            seq_offset + pos - seq_window_start
-                        )
+            topk_idxs[row, col] = topk_value
+            if col < compressed_width:
+                indexer_rank_major[row, col] = rank_major_value
 
 
     @cute.jit
@@ -1592,6 +1886,8 @@ if _CUTE_AVAILABLE:
         compressed_width: cutlass.Int32,
         seq_major_rows: cutlass.Int32,
         total_width: cutlass.Int32,
+        total_work: cutlass.Int32,
+        stream: cuda.CUstream,
     ):
         _indexer_loss_final_idx_kernel.set_name_prefix("dsv4_cp_indexer_loss_final_idx")
         _indexer_loss_final_idx_kernel(
@@ -1610,7 +1906,8 @@ if _CUTE_AVAILABLE:
             compressed_width,
             seq_major_rows,
             total_width,
-        ).launch(grid=(cute.ceil_div(l_local, 128), 1, 1), block=(128, 1, 1))
+            total_work,
+        ).launch(grid=(cute.ceil_div(total_work, 128), 1, 1), block=(128, 1, 1), stream=stream)
 
 
 def _validate_rope_inputs(
@@ -1640,49 +1937,52 @@ def _validate_rope_inputs(
     return rows, row_width, head_dim
 
 
-def apply_token_rope(
+def apply_thd_chunked_cp_rope(
     x: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
     cu_seqlens_padded: torch.Tensor,
     global_row_base: int,
-    total_tokens: int,
     nope_dim: int,
     pos_dim: int,
     inverse: bool = False,
     clamp_to_valid_token: bool = False,
     adjoint: bool = False,
 ) -> torch.Tensor:
-    """Apply THD CP RoPE for rows mapped by ``cu_seqlens_padded``.
+    """Apply THD chunked-CP RoPE for rows mapped by ``cu_seqlens_padded``.
 
     ``global_row_base + row`` is resolved to a sequence-local RoPE position
     inside the CuTeDSL kernel. This is the production replacement for explicit
-    per-token positions in the contiguous CP path.
+    per-token positions in the THD chunked-CP path.
     """
     if not can_use_cute_kernels(x, cos, sin, cu_seqlens_padded):
-        raise RuntimeError("DSv4 CP token RoPE requires CUDA tensors and available CuTe kernels.")
+        raise RuntimeError("DSv4 THD chunked-CP RoPE requires CUDA tensors and available CuTe kernels.")
     rows, row_width, head_dim = _validate_rope_inputs(x, cos, sin, nope_dim, pos_dim)
     if rows == 0:
         return x
-    out = torch.empty_like(x)
-    total_work = rows * row_width
-    _rope_token_launch(
-        _to_cute(_flatten_rows(x, rows, row_width)),
-        _to_cute(_flatten_rows(out, rows, row_width)),
-        _to_cute(_flatten_rows(cos, cos.shape[0], _row_width(tuple(cos.shape)))),
-        _to_cute(_flatten_rows(sin, sin.shape[0], _row_width(tuple(sin.shape)))),
-        _to_cute(cu_seqlens_padded),
-        cu_seqlens_padded.shape[0] - 1,
-        int(global_row_base),
-        int(total_tokens),
-        1 if clamp_to_valid_token else 0,
-        row_width,
-        head_dim,
-        int(nope_dim),
-        int(pos_dim),
-        1 if inverse else 0,
-        1 if adjoint else 0,
-        total_work,
+    out = x.clone()
+    total_work = rows * (row_width // head_dim) * (int(pos_dim) // 2)
+    _run_compiled_launch(
+        _rope_thd_chunked_cp_launch,
+        (
+            _flatten_rows(x, rows, row_width),
+            _flatten_rows(out, rows, row_width),
+            _flatten_rows(cos, cos.shape[0], _row_width(tuple(cos.shape))),
+            _flatten_rows(sin, sin.shape[0], _row_width(tuple(sin.shape))),
+            cu_seqlens_padded,
+        ),
+        (
+            cu_seqlens_padded.shape[0] - 1,
+            int(global_row_base),
+            1 if clamp_to_valid_token else 0,
+            row_width,
+            head_dim,
+            int(nope_dim),
+            int(pos_dim),
+            1 if inverse else 0,
+            1 if adjoint else 0,
+            total_work,
+        ),
     )
     return out
 
@@ -1697,11 +1997,10 @@ def build_global_compressed_cu_seqlens(
             "DSv4 CP compressed cu_seqlens requires CUDA tensors and available CuTe kernels."
         )
     out = torch.empty_like(cu_seqlens_padded)
-    _global_compressed_cu_launch(
-        _to_cute(cu_seqlens_padded),
-        _to_cute(out),
-        cu_seqlens_padded.shape[0] - 1,
-        int(ratio),
+    _run_compiled_launch(
+        _global_compressed_cu_launch,
+        (cu_seqlens_padded, out),
+        (cu_seqlens_padded.shape[0] - 1, int(ratio)),
     )
     return out
 
@@ -1733,17 +2032,18 @@ def overlap_transform_thd(
     out = tensor.new_empty((n_groups, ratio * 2, b_dim, head_dim))
     total_work = n_groups * ratio * 2 * b_dim * head_dim
     if total_work > 0:
-        _overlap_transform_thd_launch(
-            _to_cute(tensor),
-            _to_cute(is_first_in_seg),
-            _to_cute(out),
-            n_groups,
-            ratio,
-            b_dim,
-            input_width,
-            int(head_dim),
-            float(fill_value),
-            total_work,
+        _run_compiled_launch(
+            _overlap_transform_thd_launch,
+            (tensor, is_first_in_seg, out),
+            (
+                n_groups,
+                ratio,
+                b_dim,
+                input_width,
+                int(head_dim),
+                float(fill_value),
+                total_work,
+            ),
         )
     return out
 
@@ -1763,16 +2063,17 @@ def overlap_transform_thd_backward(
     grad_input = grad_output.new_empty(input_shape)
     total_work = n_groups * ratio * b_dim * input_width
     if total_work > 0:
-        _overlap_transform_thd_backward_launch(
-            _to_cute(grad_output),
-            _to_cute(is_first_in_seg),
-            _to_cute(grad_input),
-            n_groups,
-            ratio,
-            b_dim,
-            input_width,
-            int(head_dim),
-            total_work,
+        _run_compiled_launch(
+            _overlap_transform_thd_backward_launch,
+            (grad_output, is_first_in_seg, grad_input),
+            (
+                n_groups,
+                ratio,
+                b_dim,
+                input_width,
+                int(head_dim),
+                total_work,
+            ),
         )
     return grad_input
 
@@ -1803,20 +2104,25 @@ def apply_compressed_rope(
         return x
     out = torch.empty_like(x)
     total_work = rows * row_width
-    _rope_compressed_launch(
-        _to_cute(_flatten_rows(x, rows, row_width)),
-        _to_cute(_flatten_rows(out, rows, row_width)),
-        _to_cute(_flatten_rows(cos, cos.shape[0], _row_width(tuple(cos.shape)))),
-        _to_cute(_flatten_rows(sin, sin.shape[0], _row_width(tuple(sin.shape)))),
-        _to_cute(comp_ids_local[:rows]),
-        int(ratio),
-        row_width,
-        head_dim,
-        int(nope_dim),
-        int(pos_dim),
-        1 if inverse else 0,
-        1 if adjoint else 0,
-        total_work,
+    _run_compiled_launch(
+        _rope_compressed_launch,
+        (
+            _flatten_rows(x, rows, row_width),
+            _flatten_rows(out, rows, row_width),
+            _flatten_rows(cos, cos.shape[0], _row_width(tuple(cos.shape))),
+            _flatten_rows(sin, sin.shape[0], _row_width(tuple(sin.shape))),
+            comp_ids_local[:rows],
+        ),
+        (
+            int(ratio),
+            row_width,
+            head_dim,
+            int(nope_dim),
+            int(pos_dim),
+            1 if inverse else 0,
+            1 if adjoint else 0,
+            total_work,
+        ),
     )
     return out
 
@@ -1833,18 +2139,18 @@ def build_rank_major_compressed_metadata(
     seq_ids = torch.empty((total_rows,), dtype=torch.int32, device=cu_seqlens.device)
     comp_ids = torch.empty((total_rows,), dtype=torch.int32, device=cu_seqlens.device)
     valid = torch.empty((total_rows,), dtype=torch.bool, device=cu_seqlens.device)
-    _rank_major_metadata_launch(
-        _to_cute(cu_seqlens),
-        _to_cute(seq_ids),
-        _to_cute(comp_ids),
-        _to_cute(valid),
-        cu_seqlens.shape[0] - 1,
-        cp_size,
-        l_local,
-        ratio,
-        d_comp,
-        c_cap,
-        total_rows,
+    _run_compiled_launch(
+        _rank_major_metadata_launch,
+        (cu_seqlens, seq_ids, comp_ids, valid),
+        (
+            cu_seqlens.shape[0] - 1,
+            cp_size,
+            l_local,
+            ratio,
+            d_comp,
+            c_cap,
+            total_rows,
+        ),
     )
     return seq_ids, comp_ids, valid
 
@@ -1873,25 +2179,30 @@ def compressor_prep_compact(
     boundary_flat = _flatten_rows(boundary_hidden, d_window, row_width)
     compact_flat = _flatten_rows(hidden_compact, compact_len, row_width)
     total_work = max(compact_len * row_width, c_cap, cu_seqlens.shape[0])
-    _compressor_prep_launch(
-        _to_cute(hidden_local_flat),
-        _to_cute(boundary_flat),
-        _to_cute(compact_flat),
-        _to_cute(cu_seqlens),
-        _to_cute(cu_compact),
-        _to_cute(seq_ids),
-        _to_cute(comp_ids),
-        _to_cute(valid),
-        cu_seqlens.shape[0] - 1,
-        global_start,
-        l_local,
-        ratio,
-        d_comp,
-        d_window,
-        c_cap,
-        compact_len,
-        row_width,
-        total_work,
+    _run_compiled_launch(
+        _compressor_prep_launch,
+        (
+            hidden_local_flat,
+            boundary_flat,
+            compact_flat,
+            cu_seqlens,
+            cu_compact,
+            seq_ids,
+            comp_ids,
+            valid,
+        ),
+        (
+            cu_seqlens.shape[0] - 1,
+            global_start,
+            l_local,
+            ratio,
+            d_comp,
+            d_window,
+            c_cap,
+            compact_len,
+            row_width,
+            total_work,
+        ),
     )
     return hidden_compact, cu_compact, seq_ids, comp_ids, valid
 
@@ -1916,20 +2227,25 @@ def compressor_prep_compact_backward(
 
     total_work = compact_len * row_width
     if total_work > 0:
-        _compressor_prep_backward_launch(
-            _to_cute(_flatten_rows(grad_hidden_compact, compact_len, row_width)),
-            _to_cute(_flatten_rows(grad_hidden, l_local, row_width)),
-            _to_cute(_flatten_rows(grad_boundary, d_window, row_width)),
-            _to_cute(cu_seqlens),
-            cu_seqlens.shape[0] - 1,
-            global_start,
-            l_local,
-            ratio,
-            d_comp,
-            d_window,
-            compact_len,
-            row_width,
-            total_work,
+        _run_compiled_launch(
+            _compressor_prep_backward_launch,
+            (
+                _flatten_rows(grad_hidden_compact, compact_len, row_width),
+                _flatten_rows(grad_hidden, l_local, row_width),
+                _flatten_rows(grad_boundary, d_window, row_width),
+                cu_seqlens,
+            ),
+            (
+                cu_seqlens.shape[0] - 1,
+                global_start,
+                l_local,
+                ratio,
+                d_comp,
+                d_window,
+                compact_len,
+                row_width,
+                total_work,
+            ),
         )
     return grad_hidden, grad_boundary
 
@@ -1950,6 +2266,8 @@ class _KVFullPackCute(torch.autograd.Function):
         d_window: int,
         ratio: int,
         kv_full_capacity: int,
+        rank_major_by_seq_major: Optional[torch.Tensor] = None,
+        cu_seqlens_compressed: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         ctx.local_shape = tuple(kv_local.shape)
         ctx.boundary_shape = tuple(boundary_kv.shape)
@@ -1959,9 +2277,6 @@ class _KVFullPackCute(torch.autograd.Function):
         ctx.d_window = d_window
         ctx.ratio = ratio
         ctx.kv_full_capacity = kv_full_capacity
-        ctx.save_for_backward(
-            seq_ids_rank_major, comp_ids_rank_major, valid_rank_major, cu_seqlens
-        )
 
         output_shape = (kv_full_capacity,) + tuple(kv_local.shape[1:])
         kv_full = kv_local.new_empty(output_shape)
@@ -1972,30 +2287,79 @@ class _KVFullPackCute(torch.autograd.Function):
         compressed_flat = _flatten_rows(compressed_rank_major, compressed_rows, row_width)
         kv_full_flat = _flatten_rows(kv_full, kv_full_capacity, row_width)
         total_work = kv_full_capacity * row_width
-        _kv_pack_launch(
-            _to_cute(kv_local_flat),
-            _to_cute(boundary_flat),
-            _to_cute(compressed_flat),
-            _to_cute(seq_ids_rank_major),
-            _to_cute(comp_ids_rank_major),
-            _to_cute(valid_rank_major),
-            _to_cute(cu_seqlens),
-            _to_cute(kv_full_flat),
-            cu_seqlens.shape[0] - 1,
-            global_start,
-            l_local,
-            d_window,
-            ratio,
-            compressed_rows,
-            kv_full_capacity,
-            row_width,
-            total_work,
+
+        # A row map removes repeated per-column sequence/compressed metadata
+        # scans. DSv4 KV rows are wide enough that the extra metadata launch is
+        # cheaper than redoing the scan for every column, including the
+        # low-compressed-row ratio=128 path.
+        source_kind = torch.empty((kv_full_capacity,), dtype=torch.int32, device=kv_local.device)
+        source_index = torch.empty((kv_full_capacity,), dtype=torch.int32, device=kv_local.device)
+        if (
+            rank_major_by_seq_major is not None
+            and cu_seqlens_compressed is not None
+            and ratio > 1
+            and compressed_rows > 0
+        ):
+            _run_compiled_launch(
+                _kv_pack_source_map_from_seq_major_launch,
+                (
+                    cu_seqlens,
+                    cu_seqlens_compressed,
+                    rank_major_by_seq_major,
+                    source_kind,
+                    source_index,
+                ),
+                (
+                    cu_seqlens.shape[0] - 1,
+                    global_start,
+                    l_local,
+                    d_window,
+                    ratio,
+                    kv_full_capacity,
+                ),
+            )
+        else:
+            _run_compiled_launch(
+                _kv_pack_source_map_launch,
+                (
+                    seq_ids_rank_major,
+                    comp_ids_rank_major,
+                    valid_rank_major,
+                    cu_seqlens,
+                    source_kind,
+                    source_index,
+                ),
+                (
+                    cu_seqlens.shape[0] - 1,
+                    global_start,
+                    l_local,
+                    d_window,
+                    ratio,
+                    compressed_rows,
+                    kv_full_capacity,
+                ),
+            )
+        _run_compiled_launch(
+            _kv_pack_direct_launch,
+            (
+                kv_local_flat,
+                boundary_flat,
+                compressed_flat,
+                source_kind,
+                source_index,
+                kv_full_flat,
+            ),
+            (
+                kv_full_capacity,
+                row_width,
+                total_work,
+            ),
         )
+        ctx.save_for_backward(source_kind, source_index)
         return kv_full
 
     @staticmethod
     def backward(ctx, grad_kv_full: torch.Tensor):
-        seq_ids_rank_major, comp_ids_rank_major, valid_rank_major, cu_seqlens = ctx.saved_tensors
         grad_kv_local = grad_kv_full.new_empty(ctx.local_shape)
         grad_boundary_kv = grad_kv_full.new_empty(ctx.boundary_shape)
         grad_compressed = grad_kv_full.new_empty(ctx.compressed_shape)
@@ -2011,24 +2375,22 @@ class _KVFullPackCute(torch.autograd.Function):
 
         total_work = kv_full_capacity * row_width
         if total_work > 0:
-            _kv_pack_backward_launch(
-                _to_cute(_flatten_rows(grad_kv_full, kv_full_capacity, row_width)),
-                _to_cute(_flatten_rows(grad_kv_local, l_local, row_width)),
-                _to_cute(_flatten_rows(grad_boundary_kv, d_window, row_width)),
-                _to_cute(_flatten_rows(grad_compressed, compressed_rows, row_width)),
-                _to_cute(seq_ids_rank_major),
-                _to_cute(comp_ids_rank_major),
-                _to_cute(valid_rank_major),
-                _to_cute(cu_seqlens),
-                cu_seqlens.shape[0] - 1,
-                ctx.global_start,
-                l_local,
-                d_window,
-                ctx.ratio,
-                compressed_rows,
-                kv_full_capacity,
-                row_width,
-                total_work,
+            source_kind, source_index = ctx.saved_tensors
+            _run_compiled_launch(
+                _kv_pack_direct_backward_launch,
+                (
+                    _flatten_rows(grad_kv_full, kv_full_capacity, row_width),
+                    _flatten_rows(grad_kv_local, l_local, row_width),
+                    _flatten_rows(grad_boundary_kv, d_window, row_width),
+                    _flatten_rows(grad_compressed, compressed_rows, row_width),
+                    source_kind,
+                    source_index,
+                ),
+                (
+                    kv_full_capacity,
+                    row_width,
+                    total_work,
+                ),
             )
         return (
             grad_kv_local,
@@ -2043,17 +2405,18 @@ class _KVFullPackCute(torch.autograd.Function):
             None,
             None,
             None,
+            None,
+            None,
         )
 
 
-def kv_full_capacity(cu_seqlens: torch.Tensor, l_local: int, d_window: int, ratio: int) -> int:
+def kv_full_capacity(
+    cu_seqlens: torch.Tensor, l_local: int, d_window: int, compressed_rows: int
+) -> int:
     # Static upper bound matching the HTML layout: per active sequence window rows
     # plus compressed rows, followed by tail padding.
     n_seq = cu_seqlens.shape[0] - 1
-    compressed_capacity = 0
-    if ratio > 1:
-        compressed_capacity = (l_local * n_seq + d_window * n_seq) // ratio
-    return max(1, l_local + d_window * n_seq + compressed_capacity)
+    return max(1, l_local + d_window * n_seq + compressed_rows)
 
 
 def pack_kv_full(
@@ -2069,6 +2432,8 @@ def pack_kv_full(
     d_window: int,
     ratio: int,
     kv_full_capacity_value: int,
+    rank_major_by_seq_major: Optional[torch.Tensor] = None,
+    cu_seqlens_compressed: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return _KVFullPackCute.apply(
         kv_local,
@@ -2083,6 +2448,8 @@ def pack_kv_full(
         d_window,
         ratio,
         kv_full_capacity_value,
+        rank_major_by_seq_major,
+        cu_seqlens_compressed,
     )
 
 
@@ -2102,18 +2469,18 @@ def repack_rank_major_compressed_to_seq_major(
     rank_major_rows = compressed_rank_major.shape[0]
     row_width = _row_width(tuple(compressed_rank_major.shape))
     total_work = max(seq_major_rows * row_width, rank_major_rows * row_width, seq_major_rows)
-    _repack_rank_major_launch(
-        _to_cute(_flatten_rows(compressed_rank_major, rank_major_rows, row_width)),
-        _to_cute(seq_ids_rank_major),
-        _to_cute(comp_ids_rank_major),
-        _to_cute(valid_rank_major),
-        _to_cute(cu_seqlens_compressed),
-        _to_cute(_flatten_rows(compressed_seq_major, seq_major_rows, row_width)),
-        _to_cute(rank_major_by_seq_major),
-        rank_major_rows,
-        seq_major_rows,
-        row_width,
-        total_work,
+    _run_compiled_launch(
+        _repack_rank_major_launch,
+        (
+            _flatten_rows(compressed_rank_major, rank_major_rows, row_width),
+            seq_ids_rank_major,
+            comp_ids_rank_major,
+            valid_rank_major,
+            cu_seqlens_compressed,
+            _flatten_rows(compressed_seq_major, seq_major_rows, row_width),
+            rank_major_by_seq_major,
+        ),
+        (rank_major_rows, seq_major_rows, row_width, total_work),
     )
     return compressed_seq_major, rank_major_by_seq_major
 
@@ -2125,7 +2492,7 @@ def build_indexer_topk_inputs(
     global_start: int,
     l_local: int,
     ratio: int,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     seq_major_rows = k_indexer_seq_major.shape[0]
     row_width = _row_width(tuple(k_indexer_seq_major.shape))
     k_topk = k_indexer_seq_major.new_empty(k_indexer_seq_major.shape)
@@ -2135,31 +2502,27 @@ def build_indexer_topk_inputs(
     cu_k_topk = torch.empty(
         (cu_seqlens_q.shape[0] + 1,), dtype=cu_seqlens_compressed.dtype, device=cu_seqlens_q.device
     )
+    seq_lens = torch.empty((l_local,), dtype=torch.int32, device=cu_seqlens_q.device)
     n_seq = cu_seqlens_q.shape[0] - 1
-    _indexer_topk_input_metadata_launch(
-        _to_cute(cu_seqlens_q),
-        _to_cute(cu_seqlens_compressed),
-        _to_cute(cu_q_topk),
-        _to_cute(cu_k_topk),
-        n_seq,
-        global_start,
-        l_local,
-        ratio,
+    _run_compiled_launch(
+        _indexer_topk_input_metadata_launch,
+        (cu_seqlens_q, cu_seqlens_compressed, cu_q_topk, cu_k_topk, seq_lens),
+        (n_seq, global_start, l_local, ratio),
     )
     _zero_rows(k_topk, seq_major_rows, row_width)
     total_work = seq_major_rows * row_width
     if total_work > 0:
-        _indexer_topk_input_k_pack_launch(
-            _to_cute(_flatten_rows(k_indexer_seq_major, seq_major_rows, row_width)),
-            _to_cute(_flatten_rows(k_topk, seq_major_rows, row_width)),
-            _to_cute(cu_seqlens_compressed),
-            _to_cute(cu_k_topk),
-            n_seq,
-            row_width,
-            seq_major_rows,
-            total_work,
+        _run_compiled_launch(
+            _indexer_topk_input_k_pack_launch,
+            (
+                _flatten_rows(k_indexer_seq_major, seq_major_rows, row_width),
+                _flatten_rows(k_topk, seq_major_rows, row_width),
+                cu_seqlens_compressed,
+                cu_k_topk,
+            ),
+            (n_seq, row_width, seq_major_rows, total_work),
         )
-    return k_topk, cu_q_topk, cu_k_topk
+    return k_topk, cu_q_topk, cu_k_topk, seq_lens
 
 
 def pad_topk_indices(topk_indices: torch.Tensor, output_width: int) -> torch.Tensor:
@@ -2190,13 +2553,10 @@ def pad_topk_indices(topk_indices: torch.Tensor, output_width: int) -> torch.Ten
     topk_out = torch.empty((rows, output_width), dtype=torch.int32, device=topk_indices.device)
     total_work = rows * output_width
     if total_work > 0:
-        _pad_topk_indices_launch(
-            _to_cute(topk_indices),
-            _to_cute(topk_out),
-            rows,
-            input_width,
-            output_width,
-            total_work,
+        _run_compiled_launch(
+            _pad_topk_indices_launch,
+            (topk_indices, topk_out),
+            (rows, input_width, output_width, total_work),
         )
     return topk_out
 
@@ -2242,17 +2602,59 @@ def filter_indexer_topk_scores(
         _zero_rows(topk_length, rows, 1)
         return topk_out, topk_length
 
-    _filter_indexer_topk_scores_launch(
-        _to_cute(scores),
-        _to_cute(topk_indices),
-        _to_cute(topk_out),
-        _to_cute(topk_length),
-        rows,
-        score_width,
-        topk_width,
-        output_width,
+    _run_compiled_launch(
+        _filter_indexer_topk_scores_launch,
+        (scores, topk_indices, topk_out, topk_length),
+        (rows, score_width, topk_width, output_width),
     )
     return topk_out, topk_length
+
+
+def filter_indexer_topk_scores_no_length(
+    scores: torch.Tensor,
+    topk_indices: torch.Tensor,
+    output_width: Optional[int] = None,
+) -> torch.Tensor:
+    """Filter top-k ids and pad to a fixed width when the valid length is unused."""
+    if not can_use_cute_kernels(scores, topk_indices):
+        raise RuntimeError(
+            "DSv4 CP indexer top-k score filtering requires CUDA tensors and CuTe kernels."
+        )
+    if scores.ndim != 2 or topk_indices.ndim != 2:
+        raise RuntimeError(
+            "DSv4 CP indexer top-k score filtering expects 2D scores/top-k tensors, "
+            f"got scores={scores.shape}, topk={topk_indices.shape}."
+        )
+    if topk_indices.dtype != torch.int32:
+        raise RuntimeError(
+            f"DSv4 CP indexer top-k filtering expects int32 ids, got {topk_indices.dtype}."
+        )
+    if scores.shape[0] != topk_indices.shape[0]:
+        raise RuntimeError(
+            "DSv4 CP indexer top-k score filtering expects matching row counts: "
+            f"scores={scores.shape[0]}, topk={topk_indices.shape[0]}."
+        )
+    if not scores.is_contiguous() or not topk_indices.is_contiguous():
+        raise RuntimeError("DSv4 CP indexer top-k score filtering expects contiguous tensors.")
+
+    rows, score_width = scores.shape
+    topk_width = topk_indices.shape[1]
+    output_width = topk_width if output_width is None else int(output_width)
+    if output_width < topk_width:
+        raise RuntimeError(
+            "DSv4 CP indexer top-k score filtering cannot shrink top-k width: "
+            f"input={topk_width}, output={output_width}."
+        )
+
+    topk_out = torch.empty((rows, output_width), dtype=torch.int32, device=topk_indices.device)
+    total_work = rows * output_width
+    if total_work > 0:
+        _run_compiled_launch(
+            _filter_indexer_topk_scores_no_length_launch,
+            (scores, topk_indices, topk_out),
+            (rows, score_width, topk_width, output_width, total_work),
+        )
+    return topk_out
 
 
 def build_final_idxs(
@@ -2274,21 +2676,21 @@ def build_final_idxs(
     else:
         dummy = indexer_topk_compressed_logical_ids
         has_indexer = 1
-    _final_idx_launch(
-        _to_cute(cu_seqlens),
-        _to_cute(dummy),
-        _to_cute(topk_idxs),
-        _to_cute(topk_length),
-        cu_seqlens.shape[0] - 1,
-        global_start,
-        l_local,
-        d_window,
-        window_size,
-        ratio,
-        compressed_width,
-        has_indexer,
-        1 if ratio > 1 and compressed_width > 0 else 0,
-        total_width,
+    _run_compiled_launch(
+        _final_idx_launch,
+        (cu_seqlens, dummy, topk_idxs, topk_length),
+        (
+            cu_seqlens.shape[0] - 1,
+            global_start,
+            l_local,
+            d_window,
+            window_size,
+            ratio,
+            compressed_width,
+            has_indexer,
+            1 if ratio > 1 and compressed_width > 0 else 0,
+            total_width,
+        ),
     )
     return topk_idxs, topk_length
 
@@ -2310,21 +2712,30 @@ def build_indexer_loss_final_idxs(
     indexer_rank_major = torch.empty(
         (l_local, compressed_width), dtype=torch.int32, device=cu_seqlens.device
     )
-    _indexer_loss_final_idx_launch(
-        _to_cute(cu_seqlens),
-        _to_cute(cu_seqlens_compressed),
-        _to_cute(indexer_topk_compressed_logical_ids),
-        _to_cute(indexer_rank_by_seq_major),
-        _to_cute(topk_idxs),
-        _to_cute(indexer_rank_major),
-        cu_seqlens.shape[0] - 1,
-        global_start,
-        l_local,
-        d_window,
-        window_size,
-        ratio,
-        compressed_width,
-        indexer_rank_by_seq_major.shape[0],
-        total_width,
+    total_work = l_local * total_width
+    if total_work == 0:
+        return topk_idxs, indexer_rank_major
+    _run_compiled_launch(
+        _indexer_loss_final_idx_launch,
+        (
+            cu_seqlens,
+            cu_seqlens_compressed,
+            indexer_topk_compressed_logical_ids,
+            indexer_rank_by_seq_major,
+            topk_idxs,
+            indexer_rank_major,
+        ),
+        (
+            cu_seqlens.shape[0] - 1,
+            global_start,
+            l_local,
+            d_window,
+            window_size,
+            ratio,
+            compressed_width,
+            indexer_rank_by_seq_major.shape[0],
+            total_width,
+            total_work,
+        ),
     )
     return topk_idxs, indexer_rank_major

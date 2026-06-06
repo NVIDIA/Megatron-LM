@@ -2,7 +2,10 @@
 
 import gc
 import os
+from contextlib import contextmanager, nullcontext
 from unittest.mock import patch
+
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 import pytest
 import torch
@@ -842,6 +845,84 @@ class TestDSv4HybridAttentionThd:
                 assert param.grad is not None, f"no grad on {name}"
                 assert not torch.isnan(param.grad).any(), f"NaN grad on {name}"
 
+    @pytest.mark.parametrize(
+        "layer_number",
+        [1, 2, 3],
+        ids=["ratio_0_window_only", "ratio_4_with_indexer", "ratio_128_compressor_only"],
+    )
+    def test_thd_cuda_graph_matches_eager_forward_backward(self, layer_number):
+        """CUDA graph replay matches eager THD forward/backward without CP.
+
+        This covers the no-CP THD path that computes compressed sequence
+        metadata from ``PackedSeqParams`` before capture. A failure here usually
+        means graph capture found a GPU-to-CPU sync or the graph replay math no
+        longer matches eager execution.
+        """
+        seg_lens = _DSV4_CP_RAGGED_SEG_LENS
+        padded_seg_lens = _DSV4_CP_RAGGED_PADDED_SEG_LENS
+        padded_tokens = sum(padded_seg_lens)
+        packed = _make_thd_packed_seq_params(seg_lens, padded_seg_lens)
+
+        torch.manual_seed(_SEED + 500 + layer_number)
+        model_parallel_cuda_manual_seed(_SEED + 500 + layer_number)
+        config = _make_dsv4_cp_config(
+            context_parallel_size=1,
+            dsa_indexer_loss_coeff=1.0,
+            dsa_indexer_use_sparse_loss=True,
+            apply_rope_fusion=True,
+        )
+        graph_attn = _build_attention(config, layer_number=layer_number, pg_collection=self.pg).cuda()
+        eager_attn = _build_attention(config, layer_number=layer_number, pg_collection=self.pg).cuda()
+        graph_attn.train()
+        eager_attn.train()
+        _copy_module_parameters(graph_attn, eager_attn)
+
+        test_hidden = torch.randn(
+            padded_tokens, 1, config.hidden_size, dtype=torch.bfloat16, device='cuda'
+        )
+        test_grad = torch.randn_like(test_hidden)
+        static_hidden = test_hidden.detach().clone().requires_grad_(True)
+        eager_hidden = test_hidden.detach().clone().requires_grad_(True)
+        static_grad = test_grad.detach().clone()
+
+        graph, graph_output = _capture_dsv4_attention_forward_backward(
+            graph_attn, static_hidden, static_grad, packed
+        )
+        with torch.no_grad():
+            static_hidden.copy_(test_hidden)
+            static_grad.copy_(test_grad)
+            if static_hidden.grad is not None:
+                static_hidden.grad.zero_()
+            for param in graph_attn.parameters():
+                if param.grad is not None:
+                    param.grad.zero_()
+        graph.replay()
+        graph_out = graph_output.detach().clone()
+        graph_hidden_grad = static_hidden.grad.detach().clone()
+        graph_param_grads = {
+            name: param.grad.detach().clone()
+            for name, param in graph_attn.named_parameters()
+            if param.grad is not None
+        }
+
+        eager_out, eager_hidden_grad, eager_param_grads = _run_dsv4_attention_forward_backward(
+            eager_attn, eager_hidden, test_grad, packed
+        )
+        _assert_cp_graph_match(graph_out, eager_out, f"layer={layer_number}:output")
+        _assert_cp_graph_match(
+            graph_hidden_grad, eager_hidden_grad, f"layer={layer_number}:hidden_grad"
+        )
+        for name, graph_grad in graph_param_grads.items():
+            assert name in eager_param_grads, f"Missing eager grad for {name}"
+            _assert_cp_graph_match(
+                graph_grad, eager_param_grads[name], f"layer={layer_number}:param_grad:{name}"
+            )
+
+        del graph_attn, eager_attn, test_hidden, test_grad, static_hidden
+        del eager_hidden, static_grad, graph, graph_output, graph_out, graph_hidden_grad
+        gc.collect()
+        torch.cuda.empty_cache()
+
     def test_thd_single_segment_matches_sbhd_b1(self):
         """B=1 single-segment THD output matches the SBHD-b=1 output on
         identical hidden states (sanity check that the DSv4Hybrid
@@ -884,6 +965,10 @@ class TestDSv4HybridAttentionThd:
 
 
 _DSV4_CP_PARITY_EPS = 1e-3
+_DSV4_CP_GRAPH_FUSED_SIM_EPS = 1e-6
+_DSV4_CP_GRAPH_FUSED_RTOL = 1e-6
+_DSV4_CP_GRAPH_FUSED_BF16_ATOL = 5e-1
+_DSV4_CP_GRAPH_FUSED_FP32_ATOL = 1e-2
 _DSV4_CP_TEST_VARIANT = "flash"
 # Padded total is 4096, divisible by CP2/CP4. Only the final segment has tail
 # padding, so the intermediate sequence boundaries match the unpadded layout.
@@ -935,6 +1020,94 @@ def _assert_cp_tensor_match(actual: torch.Tensor, expected: torch.Tensor, label:
         f"{label}: tensor_sim={tensor_sim:.10f}, "
         f"max_abs={max_abs:.6e}, eps={_DSV4_CP_PARITY_EPS}"
     )
+
+
+def _assert_cp_graph_match(actual: torch.Tensor, expected: torch.Tensor, label: str):
+    assert actual.shape == expected.shape, (
+        f"{label}: shape {tuple(actual.shape)} != {tuple(expected.shape)}"
+    )
+    if torch.equal(actual, expected):
+        return
+    diff = (actual - expected).abs()
+    max_abs = diff.max().item() if diff.numel() else 0.0
+    cosine_sim = _cosine_sim(actual, expected)
+    tensor_sim = _tensor_sim(actual, expected)
+    _cp_debug_trace(
+        f"{label}: graph/eager not bitwise equal; "
+        f"max_abs={max_abs:.6e} cosine_sim={cosine_sim:.10f} "
+        f"tensor_sim={tensor_sim:.10f}"
+    )
+    _assert_cp_tensor_match(actual, expected, label)
+
+
+def _assert_cp_graph_bitwise_match(actual: torch.Tensor, expected: torch.Tensor, label: str):
+    assert actual.shape == expected.shape, (
+        f"{label}: shape {tuple(actual.shape)} != {tuple(expected.shape)}"
+    )
+    if torch.equal(actual, expected):
+        return
+    diff = (actual - expected).abs()
+    max_abs = diff.max().item() if diff.numel() else 0.0
+    cosine_sim = _cosine_sim(actual, expected)
+    tensor_sim = _tensor_sim(actual, expected)
+    raise AssertionError(
+        f"{label}: graph/eager must be bitwise equal; max_abs={max_abs:.6e}, "
+        f"cosine_sim={cosine_sim:.10f}, tensor_sim={tensor_sim:.10f}"
+    )
+
+
+def _assert_cp_graph_fused_backward_match(
+    actual: torch.Tensor, expected: torch.Tensor, label: str
+):
+    assert actual.shape == expected.shape, (
+        f"{label}: shape {tuple(actual.shape)} != {tuple(expected.shape)}"
+    )
+    assert actual.dtype == expected.dtype, f"{label}: dtype {actual.dtype} != {expected.dtype}"
+    assert torch.isfinite(actual).all(), f"{label}: actual has non-finite values"
+    assert torch.isfinite(expected).all(), f"{label}: expected has non-finite values"
+
+    diff = (actual.float() - expected.float()).abs()
+    max_abs = diff.max().item() if diff.numel() else 0.0
+    cosine_sim = _cosine_sim(actual, expected)
+    tensor_sim = _tensor_sim(actual, expected)
+    assert cosine_sim > 1 - _DSV4_CP_GRAPH_FUSED_SIM_EPS, (
+        f"{label}: cosine_sim={cosine_sim:.10f}, "
+        f"max_abs={max_abs:.6e}, eps={_DSV4_CP_GRAPH_FUSED_SIM_EPS}"
+    )
+    assert tensor_sim > 1 - _DSV4_CP_GRAPH_FUSED_SIM_EPS, (
+        f"{label}: tensor_sim={tensor_sim:.10f}, "
+        f"max_abs={max_abs:.6e}, eps={_DSV4_CP_GRAPH_FUSED_SIM_EPS}"
+    )
+
+    if actual.dtype == torch.bfloat16:
+        atol = _DSV4_CP_GRAPH_FUSED_BF16_ATOL
+    elif actual.dtype == torch.float32:
+        atol = _DSV4_CP_GRAPH_FUSED_FP32_ATOL
+    else:
+        raise AssertionError(f"{label}: unsupported dtype for fused graph close check: {actual.dtype}")
+    torch.testing.assert_close(
+        actual,
+        expected,
+        rtol=_DSV4_CP_GRAPH_FUSED_RTOL,
+        atol=atol,
+        msg=(
+            f"{label}: fused graph/eager backward mismatch; "
+            f"rtol={_DSV4_CP_GRAPH_FUSED_RTOL}, atol={atol}, "
+            f"cosine_sim={cosine_sim:.10f}, tensor_sim={tensor_sim:.10f}, "
+            f"max_abs={max_abs:.6e}"
+        ),
+    )
+
+
+@contextmanager
+def _deterministic_torch_algorithms():
+    old_enabled = torch.are_deterministic_algorithms_enabled()
+    old_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    torch.use_deterministic_algorithms(True)
+    try:
+        yield
+    finally:
+        torch.use_deterministic_algorithms(old_enabled, warn_only=old_warn_only)
 
 
 def _make_dsv4_cp_config(
@@ -1010,6 +1183,51 @@ def _make_contiguous_cp_partition_indices(padded_total_tokens, cp_size, device='
         )
         for rank in range(cp_size)
     )
+
+
+def _run_dsv4_attention_forward_backward(
+    attn, hidden, grad, packed_seq_params, *, collect_result=True
+):
+    hidden.grad = None
+    attn.zero_grad(set_to_none=True)
+    output, _ = attn(hidden_states=hidden, attention_mask=None, packed_seq_params=packed_seq_params)
+    output.backward(grad)
+    if not collect_result:
+        return None
+    param_grads = {
+        name: param.grad.detach().clone()
+        for name, param in attn.named_parameters()
+        if param.grad is not None
+    }
+    return output.detach().clone(), hidden.grad.detach().clone(), param_grads
+
+
+def _capture_dsv4_attention_forward_backward(attn, static_hidden, static_grad, packed_seq_params):
+    _cp_debug_trace("cuda graph warmup start")
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(3):
+            _run_dsv4_attention_forward_backward(
+                attn, static_hidden, static_grad, packed_seq_params, collect_result=False
+            )
+    torch.cuda.current_stream().wait_stream(warmup_stream)
+    _cp_debug_trace("cuda graph warmup done")
+
+    static_hidden.grad = None
+    attn.zero_grad(set_to_none=True)
+
+    graph = torch.cuda.CUDAGraph()
+    _cp_debug_trace("cuda graph capture start")
+    with torch.cuda.graph(graph, capture_error_mode="thread_local"):
+        graph_output, _ = attn(
+            hidden_states=static_hidden,
+            attention_mask=None,
+            packed_seq_params=packed_seq_params,
+        )
+        graph_output.backward(static_grad)
+    _cp_debug_trace("cuda graph capture done")
+    return graph, graph_output
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -1121,6 +1339,7 @@ class TestDSv4HybridAttentionTHDCP:
             context_parallel_size=self.cp_size,
             dsa_indexer_loss_coeff=1.0,
             dsa_indexer_use_sparse_loss=True,
+            apply_rope_fusion=True,
         )
         config_ref = _make_dsv4_cp_config(
             context_parallel_size=1,
@@ -1190,11 +1409,118 @@ class TestDSv4HybridAttentionTHDCP:
         [1, 2, 3],
         ids=["ratio_0_window_only", "ratio_4_indexer", "ratio_128_compressor"],
     )
-    def test_thd_cp_fused_rope_matches_unfused_local_position_path(self, layer_number):
-        """Fused RoPE and unfused RoPE match on the same CP-local THD shard.
+    @pytest.mark.parametrize("fused", [True, False])
+    def test_thd_cp_cuda_graph_matches_eager_forward_backward(self, layer_number, fused):
+        """CUDA graph replay matches eager THD CP forward/backward.
 
-        The unfused path passes explicit CP-aware positions into RoPE. This
-        verifies local output, hidden grad, and parameter grads.
+        Captures the DSv4 attention layer's CP-local forward and backward
+        graph, replays it with fresh static-buffer contents, and compares the
+        local output, hidden grad, and parameter grads against an eager module
+        with identical weights. The fused sparse-attn/indexer forward kernels
+        are deterministic, so fused output must match bitwise. Fused backward
+        uses atomic adds inside the sparse-attn/indexer kernels, so accumulation
+        order can vary and backward uses strict similarity plus elementwise
+        ``assert_close`` gates. The unfused sparse-attn/indexer path is
+        deterministic and must match bitwise for both forward and backward.
+        """
+        context = nullcontext() if fused else _deterministic_torch_algorithms()
+        mode = "fused" if fused else "unfused"
+        with context:
+            seg_lens = _DSV4_CP_RAGGED_SEG_LENS
+            padded_seg_lens = _DSV4_CP_RAGGED_PADDED_SEG_LENS
+            padded_tokens = sum(padded_seg_lens)
+            packed = _make_thd_packed_seq_params(seg_lens, padded_seg_lens)
+            partition_indices = _make_contiguous_cp_partition_indices(padded_tokens, self.cp_size)
+            local_idx = partition_indices[self.cp_rank]
+
+            torch.manual_seed(_SEED + 700 + layer_number)
+            model_parallel_cuda_manual_seed(_SEED + 700 + layer_number)
+            config = _make_dsv4_cp_config(
+                context_parallel_size=self.cp_size,
+                dsa_indexer_loss_coeff=1.0,
+                dsa_indexer_use_sparse_loss=True,
+                apply_dsa_kernel_fusion=fused,
+                apply_rope_fusion=True,
+            )
+            graph_attn = _build_attention(
+                config, layer_number=layer_number, pg_collection=self.pg
+            ).cuda()
+            eager_attn = _build_attention(
+                config, layer_number=layer_number, pg_collection=self.pg
+            ).cuda()
+            graph_attn.train()
+            eager_attn.train()
+            _copy_module_parameters(graph_attn, eager_attn)
+
+            full_hidden = torch.randn(
+                padded_tokens, 1, config.hidden_size, dtype=torch.bfloat16, device='cuda'
+            )
+            test_hidden = full_hidden.index_select(0, local_idx).detach().clone()
+            test_grad = torch.randn_like(test_hidden)
+            static_hidden = test_hidden.detach().clone().requires_grad_(True)
+            eager_hidden = test_hidden.detach().clone().requires_grad_(True)
+            static_grad = test_grad.detach().clone()
+
+            graph, graph_output = _capture_dsv4_attention_forward_backward(
+                graph_attn, static_hidden, static_grad, packed
+            )
+            with torch.no_grad():
+                static_hidden.copy_(test_hidden)
+                static_grad.copy_(test_grad)
+                if static_hidden.grad is not None:
+                    static_hidden.grad.zero_()
+                for param in graph_attn.parameters():
+                    if param.grad is not None:
+                        param.grad.zero_()
+            graph.replay()
+            graph_out = graph_output.detach().clone()
+            graph_hidden_grad = static_hidden.grad.detach().clone()
+            graph_param_grads = {
+                name: param.grad.detach().clone()
+                for name, param in graph_attn.named_parameters()
+                if param.grad is not None
+            }
+
+            eager_out, eager_hidden_grad, eager_param_grads = _run_dsv4_attention_forward_backward(
+                eager_attn, eager_hidden, test_grad, packed
+            )
+            assert graph_param_grads.keys() == eager_param_grads.keys()
+            # Fused forward kernels are deterministic, so graph replay must
+            # match eager output bitwise. Fused backward uses atomic adds in the
+            # sparse-attn/indexer kernels, so its accumulation order can differ.
+            _assert_cp_graph_bitwise_match(
+                graph_out, eager_out, f"layer={layer_number}:{mode}:output"
+            )
+            if fused:
+                bwd_match_fn = _assert_cp_graph_fused_backward_match
+            else:
+                bwd_match_fn = _assert_cp_graph_bitwise_match
+            bwd_match_fn(
+                graph_hidden_grad, eager_hidden_grad, f"layer={layer_number}:{mode}:hidden_grad"
+            )
+            for name, graph_grad in graph_param_grads.items():
+                bwd_match_fn(
+                    graph_grad,
+                    eager_param_grads[name],
+                    f"layer={layer_number}:{mode}:param_grad:{name}",
+                )
+
+            del graph_attn, eager_attn, full_hidden, test_hidden, test_grad, static_hidden
+            del eager_hidden, static_grad, graph, graph_output, graph_out, graph_hidden_grad
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    @pytest.mark.parametrize(
+        "layer_number",
+        [1, 2, 3],
+        ids=["ratio_0_window_only", "ratio_4_indexer", "ratio_128_compressor"],
+    )
+    def test_thd_cp_unfused_rope_is_rejected(self, layer_number):
+        """THD CP rejects the unfused RoPE path for every DSv4 ratio.
+
+        Production THD CP requires fused RoPE because CP-local rows can start in
+        the middle of a packed sequence; the unfused path is not implemented for
+        that position reconstruction.
         """
         seg_lens = _DSV4_CP_RAGGED_SEG_LENS
         padded_seg_lens = _DSV4_CP_RAGGED_PADDED_SEG_LENS
@@ -1205,69 +1531,26 @@ class TestDSv4HybridAttentionTHDCP:
 
         torch.manual_seed(_SEED + 300 + layer_number)
         model_parallel_cuda_manual_seed(_SEED + 300 + layer_number)
-        fused_config = _make_dsv4_cp_config(
-            context_parallel_size=self.cp_size,
-            dsa_indexer_loss_coeff=1.0,
-            dsa_indexer_use_sparse_loss=True,
-            apply_dsa_kernel_fusion=True,
-            apply_rope_fusion=True,
-        )
-        explicit_position_config = _make_dsv4_cp_config(
+        config = _make_dsv4_cp_config(
             context_parallel_size=self.cp_size,
             dsa_indexer_loss_coeff=1.0,
             dsa_indexer_use_sparse_loss=True,
             apply_dsa_kernel_fusion=True,
             apply_rope_fusion=False,
         )
-        fused_attn = _build_attention(
-            fused_config, layer_number=layer_number, pg_collection=self.pg
-        ).cuda()
-        explicit_position_attn = _build_attention(
-            explicit_position_config, layer_number=layer_number, pg_collection=self.pg
-        ).cuda()
-        _copy_module_parameters(fused_attn, explicit_position_attn)
+        attn = _build_attention(config, layer_number=layer_number, pg_collection=self.pg).cuda()
 
         full_hidden = torch.randn(
-            padded_tokens, 1, fused_config.hidden_size, dtype=torch.bfloat16, device='cuda'
+            padded_tokens, 1, config.hidden_size, dtype=torch.bfloat16, device='cuda'
         )
-        fused_hidden = full_hidden.index_select(0, local_idx).detach().clone().requires_grad_(True)
-        explicit_position_hidden = (
-            full_hidden.index_select(0, local_idx).detach().clone().requires_grad_(True)
-        )
+        local_hidden = full_hidden.index_select(0, local_idx).detach().clone().requires_grad_(True)
 
-        fused_out, _ = fused_attn(
-            hidden_states=fused_hidden, attention_mask=None, packed_seq_params=packed
-        )
-        explicit_position_out, _ = explicit_position_attn(
-            hidden_states=explicit_position_hidden, attention_mask=None, packed_seq_params=packed
-        )
-        _assert_cp_tensor_match(
-            fused_out.detach(),
-            explicit_position_out.detach(),
-            "apply_rope_fusion:output",
-        )
+        with pytest.raises(
+            RuntimeError,
+            match="DSv4 THD CP requires apply_rope_fusion=True",
+        ):
+            attn(hidden_states=local_hidden, attention_mask=None, packed_seq_params=packed)
 
-        grad = torch.randn_like(fused_out)
-        fused_out.backward(grad)
-        explicit_position_out.backward(grad)
-        _assert_cp_tensor_match(
-            fused_hidden.grad.detach(),
-            explicit_position_hidden.grad.detach(),
-            "apply_rope_fusion:hidden_grad",
-        )
-
-        explicit_position_params = dict(explicit_position_attn.named_parameters())
-        for name, param in fused_attn.named_parameters():
-            explicit_position_grad = explicit_position_params[name].grad
-            assert param.grad is not None, f"Missing fused grad for {name}"
-            assert explicit_position_grad is not None, f"Missing explicit-position grad for {name}"
-            _assert_cp_tensor_match(
-                param.grad.detach(),
-                explicit_position_grad.detach(),
-                f"apply_rope_fusion:param_grad:{name}",
-            )
-
-        del fused_attn, explicit_position_attn, full_hidden, fused_hidden
-        del explicit_position_hidden, fused_out, explicit_position_out, grad
+        del attn, full_hidden, local_hidden
         gc.collect()
         torch.cuda.empty_cache()

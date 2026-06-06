@@ -6,7 +6,7 @@ import torch
 from megatron.core.transformer.experimental_attention_variant import csa_cp_kernels
 from megatron.core.transformer.experimental_attention_variant.csa_cp_utils import (
     apply_cp_compressed_rope_fused,
-    apply_cp_token_rope_fused,
+    apply_thd_chunked_cp_rope_fused,
     apply_thd_overlap_transform_fused,
     build_compressor_prep_compact,
     build_cp_flat_idxs,
@@ -64,12 +64,12 @@ def _seq_positions_from_global_rows(
     cu_seqlens: torch.Tensor,
     global_row_base: int,
     rows: int,
-    total_tokens: int,
+    padded_total_tokens: int,
     clamp_to_valid_token: bool = False,
 ) -> torch.Tensor:
     global_rows = torch.arange(global_row_base, global_row_base + rows, dtype=torch.long)
     if clamp_to_valid_token:
-        global_rows = global_rows.clamp(min=0, max=total_tokens - 1)
+        global_rows = global_rows.clamp(min=0, max=padded_total_tokens - 1)
     seq_ids = torch.searchsorted(cu_seqlens.to(torch.long), global_rows, right=True) - 1
     seq_ids = seq_ids.clamp(min=0, max=cu_seqlens.numel() - 2)
     return global_rows - cu_seqlens.to(torch.long)[seq_ids]
@@ -497,10 +497,10 @@ def test_cute_filter_indexer_topk_scores_removes_nonfinite_ids():
     assert torch.equal(fused_padded_length.cpu(), expected_length.cpu())
 
 
-def test_cute_token_rope_matches_reference_forward_and_backward():
-    """Validate contiguous-CP token RoPE position reconstruction in kernel.
+def test_cute_thd_chunked_cp_rope_matches_reference_forward_and_backward():
+    """Validate THD chunked-CP RoPE position reconstruction in kernel.
 
-    Expected: fused token RoPE maps ``global_row_base + row`` through
+    Expected: fused THD chunked-CP RoPE maps ``global_row_base + row`` through
     ``cu_seqlens_padded`` to the same sequence-local positions as the PyTorch
     reference, and backward applies the inverse rotation. A failure here means
     local Q/K, boundary K, or inverse output RoPE would use wrong CP positions.
@@ -510,7 +510,7 @@ def test_cute_token_rope_matches_reference_forward_and_backward():
     cu_seqlens = torch.tensor([0, 5, 11, 16], dtype=torch.int32)
     rows = 4
     global_row_base = 8
-    total_tokens = 16
+    padded_total_tokens = 16
     nope_dim = 4
     pos_dim = 4
 
@@ -518,22 +518,22 @@ def test_cute_token_rope_matches_reference_forward_and_backward():
     cos_cpu = torch.randn(16, 1, 1, pos_dim, dtype=torch.float32)
     sin_cpu = torch.randn(16, 1, 1, pos_dim, dtype=torch.float32)
     positions = _seq_positions_from_global_rows(
-        cu_seqlens, global_row_base, rows, total_tokens
+        cu_seqlens, global_row_base, rows, padded_total_tokens
     )
     ref = _rope_reference(x_cpu, cos_cpu, sin_cpu, positions, nope_dim, pos_dim)
     grad_cpu = torch.randn_like(ref)
     ref.backward(grad_cpu)
 
     x_cuda = x_cpu.detach().cuda().requires_grad_(True)
-    fused = apply_cp_token_rope_fused(
+    fused = apply_thd_chunked_cp_rope_fused(
         x_cuda,
         cos_cpu.cuda(),
         sin_cpu.cuda(),
-        cu_seqlens.cuda(),
-        global_row_base,
-        total_tokens,
         nope_dim,
         pos_dim,
+        cu_seqlens.cuda(),
+        cp_rank=2,
+        cp_size=4,
     )
     fused.backward(grad_cpu.cuda())
 
@@ -553,7 +553,7 @@ def test_cute_boundary_rope_clamps_global_rows_before_reference_lookup():
     cu_seqlens = torch.tensor([0, 6, 12], dtype=torch.int32)
     rows = 3
     global_row_base = -2
-    total_tokens = 12
+    padded_total_tokens = 12
     nope_dim = 2
     pos_dim = 4
 
@@ -561,22 +561,23 @@ def test_cute_boundary_rope_clamps_global_rows_before_reference_lookup():
     cos_cpu = torch.randn(12, 1, 1, pos_dim, dtype=torch.float32)
     sin_cpu = torch.randn(12, 1, 1, pos_dim, dtype=torch.float32)
     positions = _seq_positions_from_global_rows(
-        cu_seqlens, global_row_base, rows, total_tokens, clamp_to_valid_token=True
+        cu_seqlens, global_row_base, rows, padded_total_tokens, clamp_to_valid_token=True
     )
     ref = _rope_reference(x_cpu, cos_cpu, sin_cpu, positions, nope_dim, pos_dim)
     grad_cpu = torch.randn_like(ref)
     ref.backward(grad_cpu)
 
     x_cuda = x_cpu.detach().cuda().requires_grad_(True)
-    fused = apply_cp_token_rope_fused(
+    fused = apply_thd_chunked_cp_rope_fused(
         x_cuda,
         cos_cpu.cuda(),
         sin_cpu.cuda(),
-        cu_seqlens.cuda(),
-        global_row_base,
-        total_tokens,
         nope_dim,
         pos_dim,
+        cu_seqlens.cuda(),
+        cp_rank=0,
+        cp_size=4,
+        row_offset=global_row_base,
         clamp_to_valid_token=True,
     )
     fused.backward(grad_cpu.cuda())

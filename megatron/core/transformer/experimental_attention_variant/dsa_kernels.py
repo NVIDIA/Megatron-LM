@@ -471,12 +471,14 @@ def _indexer_topk_core(
     max_seqlen_q: Optional[int] = None,
     max_seqlen_kv: Optional[int] = None,
     fixed_topk_width: Optional[int] = None,
+    compute_topk_length: bool = True,
+    precomputed_seq_lens: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Layout-agnostic core for :func:`indexer_topk`.
 
     Wraps cuDNN Frontend's CuTe-DSL indexer-forward kernel.
     The pipeline is indexer forward, per-row valid lengths, radix top-K, optional
-    fixed-width output padding, then ``topk_length``. Selected by
+    fixed-width output padding, and optionally ``topk_length``. Selected by
     ``cu_seqlens_q``.
 
     BSHD layout (``cu_seqlens_q is None``):
@@ -536,15 +538,30 @@ def _indexer_topk_core(
         sk = int(max_seqlen_kv)
         total_q = q.shape[0]
 
-        # The indexer kernel has already applied the causal mask using
-        # cu_seqlens_q/cu_seqlens_k.  In CP, Q and K sequence lengths can
-        # differ for a split sequence piece, which represents a trapezoid
-        # causal mask.  Let top-k scan the whole visible K segment and filter
-        # the kernel-masked ``-inf`` entries after selection.
-        row_idx = torch.arange(total_q, device=device, dtype=torch.int32)
-        row_batch_ids = batch_of_row(cu_seqlens_q, total_q=total_q)
-        seqlen_kv_per_row = (cu_seqlens_kv[1:] - cu_seqlens_kv[:-1])[row_batch_ids]
-        seq_lens = seqlen_kv_per_row.to(torch.int32).contiguous()
+        if precomputed_seq_lens is not None:
+            if precomputed_seq_lens.shape[0] != total_q:
+                raise ValueError(
+                    "precomputed_seq_lens must have one entry per THD query row: "
+                    f"got={precomputed_seq_lens.shape[0]}, expected={total_q}."
+                )
+            if precomputed_seq_lens.dtype != torch.int32:
+                raise ValueError(
+                    f"precomputed_seq_lens must be int32, got {precomputed_seq_lens.dtype}."
+                )
+            if precomputed_seq_lens.device != device:
+                raise ValueError(
+                    "precomputed_seq_lens must be on the same device as q_indexer."
+                )
+            seq_lens = precomputed_seq_lens
+        else:
+            # The indexer kernel has already applied the causal mask using
+            # cu_seqlens_q/cu_seqlens_k.  In CP, Q and K sequence lengths can
+            # differ for a split sequence piece, which represents a trapezoid
+            # causal mask.  Let top-k scan the whole visible K segment and filter
+            # the kernel-masked ``-inf`` entries after selection.
+            row_batch_ids = batch_of_row(cu_seqlens_q, total_q=total_q)
+            seqlen_kv_per_row = (cu_seqlens_kv[1:] - cu_seqlens_kv[:-1])[row_batch_ids]
+            seq_lens = seqlen_kv_per_row.to(torch.int32).contiguous()
     else:
         # Kernel wants k as 4-D ``(b, sk, h_kv, idx_hd)``.
         scores = _DSA.indexer_forward_wrapper(q, k.unsqueeze(2), w, ratio=ratio)[
@@ -581,9 +598,15 @@ def _indexer_topk_core(
 
     if is_thd:
         if csa_cp_kernels.can_use_cute_kernels(scores_flat, topk_indices):
-            topk_indices, topk_length = csa_cp_kernels.filter_indexer_topk_scores(
-                scores_flat, topk_indices, output_width=output_topk
-            )
+            if compute_topk_length:
+                topk_indices, topk_length = csa_cp_kernels.filter_indexer_topk_scores(
+                    scores_flat, topk_indices, output_width=output_topk
+                )
+            else:
+                topk_indices = csa_cp_kernels.filter_indexer_topk_scores_no_length(
+                    scores_flat, topk_indices, output_width=output_topk
+                )
+                topk_length = torch.empty((0,), dtype=torch.int32, device=device)
         else:
             safe_topk = topk_indices.clamp(min=0).to(torch.long)
             selected_scores = torch.gather(scores_flat, dim=-1, index=safe_topk)
@@ -591,7 +614,11 @@ def _indexer_topk_core(
             topk_indices = torch.where(
                 selected_valid, topk_indices, torch.full_like(topk_indices, -1)
             )
-            topk_length = (topk_indices >= 0).sum(dim=-1).int()  # (total_q,)
+            topk_length = (
+                (topk_indices >= 0).sum(dim=-1).int()
+                if compute_topk_length
+                else torch.empty((0,), dtype=torch.int32, device=device)
+            )
             if output_topk > topk_indices.shape[-1]:
                 pad = torch.full(
                     (total_q, output_topk - topk_indices.shape[-1]),
@@ -622,6 +649,8 @@ def indexer_topk(
     max_seqlen_q: Optional[int] = None,
     max_seqlen_kv: Optional[int] = None,
     fixed_topk_width: Optional[int] = None,
+    compute_topk_length: bool = True,
+    precomputed_seq_lens: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor]:
     """Score + top-K selection for inference (no KL loss, no backward).
 
@@ -646,6 +675,13 @@ def indexer_topk(
         fixed_topk_width: THD only — optional static output width. CP callers
             use this to fuse score filtering and fixed-width padding into one
             CuTeDSL kernel while keeping the radix top-K visible width smaller.
+        compute_topk_length: THD only — set ``False`` when the caller only
+            consumes the fixed-width top-k ids. In that case ``topk_length`` is
+            returned as an empty int32 CUDA sentinel.
+        precomputed_seq_lens: THD only — optional ``(total_q,)`` int32 CUDA
+            tensor with the per-row visible K length for the radix top-K wrapper.
+            CP callers pass this from the layout kernel to avoid rebuilding the
+            same metadata with generic PyTorch indexing during CUDA graph replay.
 
     Returns:
         SBHD: ``(topk_indices (b, sq, topk),  topk_length (b, sq))`` int32
@@ -661,6 +697,10 @@ def indexer_topk(
         )
     if fixed_topk_width is not None and not is_thd:
         raise ValueError("fixed_topk_width is only supported in THD mode.")
+    if not compute_topk_length and not is_thd:
+        raise ValueError("compute_topk_length=False is only supported in THD mode.")
+    if precomputed_seq_lens is not None and not is_thd:
+        raise ValueError("precomputed_seq_lens is only supported in THD mode.")
 
     # ``indexer_softmax_scale`` is applied via the
     # ``relu(c·x) = c·relu(x)`` trick (the cudnn kernel does the relu),
@@ -689,6 +729,8 @@ def indexer_topk(
         max_seqlen_q=int(max_seqlen_q) if max_seqlen_q is not None else None,
         max_seqlen_kv=int(max_seqlen_kv) if max_seqlen_kv is not None else None,
         fixed_topk_width=fixed_topk_width,
+        compute_topk_length=compute_topk_length,
+        precomputed_seq_lens=precomputed_seq_lens,
     )
     return topk_indices, topk_length
 

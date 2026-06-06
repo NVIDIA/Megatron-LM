@@ -1,11 +1,9 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-import os
 from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
-import torch.nn as nn
 
 from megatron.core.transformer.experimental_attention_variant import csa_cp_kernels
 from megatron.core.transformer.experimental_attention_variant.dsa_kernels import batch_of_row
@@ -22,13 +20,6 @@ class _SingleRankCPGroup:
 
 
 SINGLE_RANK_CP_GROUP = _SingleRankCPGroup()
-
-
-def cp_debug_trace(message: str) -> None:
-    if not os.environ.get("DSV4_CP_DEBUG_TRACE"):
-        return
-    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else "?"
-    print(f"[dsv4-cp rank={rank}] {message}", flush=True)
 
 
 def cp_group_size(cp_group: Optional[torch.distributed.ProcessGroup]) -> int:
@@ -94,8 +85,8 @@ def apply_thd_overlap_transform_fused(
     return _THDOverlapTransformCute.apply(tensor, is_first_in_seg, head_dim, float(fill_value))
 
 
-class _CPTokenRopeCute(torch.autograd.Function):
-    """Autograd wrapper for contiguous-CP token/boundary RoPE."""
+class _THDChunkedCPRopeCute(torch.autograd.Function):
+    """Autograd wrapper for THD chunked-CP/boundary RoPE."""
 
     @staticmethod
     def forward(
@@ -105,26 +96,23 @@ class _CPTokenRopeCute(torch.autograd.Function):
         sin: torch.Tensor,
         cu_seqlens_padded: torch.Tensor,
         global_row_base: int,
-        total_tokens: int,
         nope_dim: int,
         pos_dim: int,
         inverse: bool,
         clamp_to_valid_token: bool,
     ) -> torch.Tensor:
         ctx.global_row_base = global_row_base
-        ctx.total_tokens = total_tokens
         ctx.nope_dim = nope_dim
         ctx.pos_dim = pos_dim
         ctx.inverse = inverse
         ctx.clamp_to_valid_token = clamp_to_valid_token
         ctx.save_for_backward(cos, sin, cu_seqlens_padded)
-        return csa_cp_kernels.apply_token_rope(
+        return csa_cp_kernels.apply_thd_chunked_cp_rope(
             x,
             cos,
             sin,
             cu_seqlens_padded,
             global_row_base,
-            total_tokens,
             nope_dim,
             pos_dim,
             inverse=inverse,
@@ -134,20 +122,19 @@ class _CPTokenRopeCute(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
         cos, sin, cu_seqlens_padded = ctx.saved_tensors
-        grad_x = csa_cp_kernels.apply_token_rope(
+        grad_x = csa_cp_kernels.apply_thd_chunked_cp_rope(
             grad_output.contiguous(),
             cos,
             sin,
             cu_seqlens_padded,
             ctx.global_row_base,
-            ctx.total_tokens,
             ctx.nope_dim,
             ctx.pos_dim,
             inverse=ctx.inverse,
             clamp_to_valid_token=ctx.clamp_to_valid_token,
             adjoint=True,
         )
-        return grad_x, None, None, None, None, None, None, None, None, None
+        return grad_x, None, None, None, None, None, None, None, None
 
 
 class _CPCompressedRopeCute(torch.autograd.Function):
@@ -198,28 +185,43 @@ class _CPCompressedRopeCute(torch.autograd.Function):
         return grad_x, None, None, None, None, None, None, None
 
 
-def apply_cp_token_rope_fused(
+def apply_thd_chunked_cp_rope_fused(
     x: torch.Tensor,
     cos: torch.Tensor,
     sin: torch.Tensor,
-    cu_seqlens_padded: torch.Tensor,
-    global_row_base: int,
-    total_tokens: int,
     nope_dim: int,
     pos_dim: int,
+    cu_seqlens_padded: torch.Tensor,
+    cp_rank: int = 0,
+    cp_size: int = 1,
+    rotary_interleaved: bool = False,
     inverse: bool = False,
+    remove_interleaving: bool = True,
+    row_offset: int = 0,
+    chunk_len: Optional[int] = None,
     clamp_to_valid_token: bool = False,
 ) -> torch.Tensor:
-    """Apply production contiguous-CP RoPE without explicit positions."""
+    """Apply production THD chunked-CP RoPE without explicit positions."""
     if not csa_cp_kernels.can_use_cute_kernels(x, cos, sin, cu_seqlens_padded):
-        raise RuntimeError("DSv4 CP token RoPE requires CUDA tensors and CuTeDSL kernels.")
-    return _CPTokenRopeCute.apply(
+        raise RuntimeError("DSv4 THD chunked-CP RoPE requires CUDA tensors and CuTeDSL kernels.")
+    if rotary_interleaved:
+        raise RuntimeError("DSv4 THD chunked-CP RoPE does not support rotary_interleaved=True.")
+    if not remove_interleaving:
+        raise RuntimeError("DSv4 THD chunked-CP RoPE requires remove_interleaving=True.")
+    if cp_size < 1 or cp_rank < 0 or cp_rank >= cp_size:
+        raise RuntimeError(
+            f"DSv4 THD chunked-CP RoPE got invalid CP rank/size: cp_rank={cp_rank}, "
+            f"cp_size={cp_size}."
+        )
+    if chunk_len is None:
+        chunk_len = x.shape[0]
+    global_row_base = int(cp_rank) * int(chunk_len) + int(row_offset)
+    return _THDChunkedCPRopeCute.apply(
         x,
         cos,
         sin,
         cu_seqlens_padded,
         global_row_base,
-        total_tokens,
         nope_dim,
         pos_dim,
         inverse,
@@ -278,7 +280,6 @@ class _LeftBoundaryExchange(torch.autograd.Function):
 
         send = tensor[-d_window:].contiguous()
         recv = tensor.new_zeros(send.shape)
-        cp_debug_trace(f"boundary forward start D={d_window} local={tensor.shape[0]}")
         ops = []
         if cp_rank > 0:
             ops.append(dist.P2POp(dist.irecv, recv, _group_peer(cp_group, cp_rank - 1), cp_group))
@@ -287,7 +288,6 @@ class _LeftBoundaryExchange(torch.autograd.Function):
         if ops:
             for req in dist.batch_isend_irecv(ops):
                 req.wait()
-        cp_debug_trace("boundary forward done")
         return recv
 
     @staticmethod
@@ -303,7 +303,6 @@ class _LeftBoundaryExchange(torch.autograd.Function):
 
         send = grad_boundary.contiguous()
         recv = grad_boundary.new_zeros(send.shape)
-        cp_debug_trace(f"boundary backward start D={d_window}")
         ops = []
         if cp_rank + 1 < cp_size:
             ops.append(dist.P2POp(dist.irecv, recv, _group_peer(cp_group, cp_rank + 1), cp_group))
@@ -314,7 +313,6 @@ class _LeftBoundaryExchange(torch.autograd.Function):
                 req.wait()
         if cp_rank + 1 < cp_size:
             grad_input[-d_window:] += recv
-        cp_debug_trace("boundary backward done")
         return grad_input, None, None
 
 
@@ -325,62 +323,6 @@ def exchange_left_boundary_tensor(
 ) -> torch.Tensor:
     """Return the fixed left boundary tensor for this CP rank."""
     return _LeftBoundaryExchange.apply(tensor, d_window, cp_group)
-
-
-class _RouteBoundaryKVGradToLocal(torch.autograd.Function):
-    """Route boundary-KV gradients back to the rank that owns the local tail."""
-
-    @staticmethod
-    def forward(
-        ctx,
-        kv_local: torch.Tensor,
-        boundary_kv: torch.Tensor,
-        d_window: int,
-        cp_group: torch.distributed.ProcessGroup,
-    ):
-        ctx.cp_group = cp_group
-        ctx.d_window = d_window
-        ctx.local_shape = tuple(kv_local.shape)
-        ctx.boundary_shape = tuple(boundary_kv.shape)
-        return boundary_kv
-
-    @staticmethod
-    def backward(ctx, grad_boundary_kv: torch.Tensor):
-        cp_group = ctx.cp_group
-        cp_size = cp_group_size(cp_group)
-        cp_rank = cp_group_rank(cp_group)
-        d_window = ctx.d_window
-
-        grad_local = grad_boundary_kv.new_zeros(ctx.local_shape)
-        grad_boundary = grad_boundary_kv.new_zeros(ctx.boundary_shape)
-        if cp_size <= 1:
-            return grad_local, grad_boundary, None, None
-
-        send = grad_boundary_kv.contiguous()
-        recv = grad_boundary_kv.new_zeros(send.shape)
-        cp_debug_trace(f"boundary kv-grad route start D={d_window}")
-        ops = []
-        if cp_rank + 1 < cp_size:
-            ops.append(dist.P2POp(dist.irecv, recv, _group_peer(cp_group, cp_rank + 1), cp_group))
-        if cp_rank > 0:
-            ops.append(dist.P2POp(dist.isend, send, _group_peer(cp_group, cp_rank - 1), cp_group))
-        if ops:
-            for req in dist.batch_isend_irecv(ops):
-                req.wait()
-        if cp_rank + 1 < cp_size:
-            grad_local[-d_window:] += recv
-        cp_debug_trace("boundary kv-grad route done")
-        return grad_local, grad_boundary, None, None
-
-
-def route_boundary_kv_grad_to_local(
-    kv_local: torch.Tensor,
-    boundary_kv: torch.Tensor,
-    d_window: int,
-    cp_group: torch.distributed.ProcessGroup,
-) -> torch.Tensor:
-    """Use boundary KV in forward and route its backward grad to local tail KV."""
-    return _RouteBoundaryKVGradToLocal.apply(kv_local, boundary_kv, d_window, cp_group)
 
 
 def contiguous_cp_partition(
@@ -894,42 +836,6 @@ def build_compressor_prep_compact_fused(
     return hidden_compact, cu_compact, seq_ids_t, comp_ids_t, valid_t, c_cap
 
 
-def pad_compressed_to_capacity(
-    compressed: Optional[torch.Tensor],
-    c_cap: int,
-    head_dim: int,
-    like: torch.Tensor,
-    module: Optional[nn.Module] = None,
-) -> torch.Tensor:
-    """Pad compressor output to the fixed local compressed capacity.
-
-    Args:
-        compressed: Compressor output ``(n_valid, 1, head_dim)`` or ``None``.
-        c_cap: Fixed local compressed row capacity.
-        head_dim: Last-dimension size of the compressed rows.
-        like: Tensor providing device/dtype.
-        module: Optional module whose parameters receive a zero dependency
-            when ``compressed`` is ``None``.
-
-    Returns:
-        ``(c_cap, 1, head_dim)`` with valid rows at the front and tail zeros.
-    """
-    if compressed is not None and compressed.shape[0] == c_cap:
-        return compressed
-
-    fixed = like.new_zeros((c_cap, 1, head_dim))
-    if compressed is not None and compressed.shape[0] > 0:
-        if compressed.shape[0] > c_cap:
-            raise RuntimeError(
-                "DSv4 local compressed output exceeded fixed capacity: "
-                f"compressed={compressed.shape[0]}, capacity={c_cap}"
-            )
-        fixed[: compressed.shape[0]] = compressed
-    elif module is not None:
-        fixed = fixed + zero_module_parameter_dependency(module, fixed)
-    return fixed
-
-
 def _all_gather_into_tensor(output: torch.Tensor, tensor: torch.Tensor, cp_group) -> None:
     if hasattr(dist, "all_gather_into_tensor"):
         dist.all_gather_into_tensor(output, tensor, group=cp_group)
@@ -998,15 +904,6 @@ def all_gather_fixed_cp_tensor(
     """
 
     return _AllGatherFixedCPTensor.apply(tensor, cp_group)
-
-
-def zero_module_parameter_dependency(module: nn.Module, like: torch.Tensor) -> torch.Tensor:
-    # Keep the zero tie on device so rare empty-compressor ranks do not create
-    # host-origin CUDA scalars in the CP production path.
-    token = like.reshape(-1)[:1].sum().to(dtype=like.dtype) * 0
-    for param in module.parameters():
-        token = token + param.sum().to(dtype=like.dtype) * token
-    return token
 
 
 class _KVFullPack(torch.autograd.Function):
@@ -1269,10 +1166,12 @@ def pack_cp_window_kv_global(
     return kv_full, window_map
 
 
-def cp_kv_full_capacity(cu_seqlens: torch.Tensor, l_local: int, d_window: int, ratio: int) -> int:
+def cp_kv_full_capacity(
+    cu_seqlens: torch.Tensor, l_local: int, d_window: int, compressed_rows: int
+) -> int:
     """Return the fixed upper-bound KV full capacity for fused CP packing."""
 
-    return csa_cp_kernels.kv_full_capacity(cu_seqlens, l_local, d_window, ratio)
+    return csa_cp_kernels.kv_full_capacity(cu_seqlens, l_local, d_window, compressed_rows)
 
 
 def pack_cp_kv_full_fused(
@@ -1287,6 +1186,8 @@ def pack_cp_kv_full_fused(
     l_local: int,
     d_window: int,
     ratio: int,
+    rank_major_by_seq_major: Optional[torch.Tensor] = None,
+    cu_seqlens_compressed: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Pack local window rows and rank-major compressed rows without Python maps.
 
@@ -1315,9 +1216,13 @@ def pack_cp_kv_full_fused(
         comp_ids_rank_major,
         valid_rank_major,
         cu_seqlens,
+        rank_major_by_seq_major,
+        cu_seqlens_compressed,
     ):
         raise RuntimeError("Fused CSA CP KV pack requires CUDA tensors and CuTe DSL kernels.")
-    capacity = cp_kv_full_capacity(cu_seqlens, l_local, d_window, ratio)
+    capacity = cp_kv_full_capacity(
+        cu_seqlens, l_local, d_window, int(compressed_rank_major.shape[0])
+    )
     return csa_cp_kernels.pack_kv_full(
         kv_local,
         boundary_kv,
@@ -1331,6 +1236,8 @@ def pack_cp_kv_full_fused(
         d_window,
         ratio,
         capacity,
+        rank_major_by_seq_major,
+        cu_seqlens_compressed,
     )
 
 
@@ -1484,7 +1391,7 @@ def build_cp_indexer_topk_inputs(
         cu_seqlens_q,
         cu_seqlens_compressed,
     ):
-        k_topk, cu_q_topk, cu_k_topk = csa_cp_kernels.build_indexer_topk_inputs(
+        k_topk, cu_q_topk, cu_k_topk, _seq_lens = csa_cp_kernels.build_indexer_topk_inputs(
             k_indexer_seq_major,
             cu_seqlens_q,
             cu_seqlens_compressed,
@@ -1572,7 +1479,16 @@ def build_cp_indexer_topk_inputs_fused(
     ratio: int,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_kv: Optional[int] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    int,
+    int,
+    torch.Tensor,
+]:
     """Build fixed CP-local indexer top-k inputs with production CuTeDSL kernels."""
 
     if q_indexer_local.shape[0] != l_local:
@@ -1594,7 +1510,7 @@ def build_cp_indexer_topk_inputs_fused(
     ):
         raise RuntimeError("DSv4 CP indexer top-k input pack requires CUDA tensors and CuTeDSL.")
 
-    k_topk, cu_q_topk, cu_k_topk = csa_cp_kernels.build_indexer_topk_inputs(
+    k_topk, cu_q_topk, cu_k_topk, seq_lens = csa_cp_kernels.build_indexer_topk_inputs(
         k_indexer_seq_major,
         cu_seqlens_q,
         cu_seqlens_compressed,
@@ -1604,7 +1520,16 @@ def build_cp_indexer_topk_inputs_fused(
     )
     max_q = int(max_seqlen_q) if max_seqlen_q is not None else l_local
     max_k = int(max_seqlen_kv) if max_seqlen_kv is not None else max(1, k_indexer_seq_major.shape[0])
-    return q_indexer_local, k_topk, weights_indexer_local, cu_q_topk, cu_k_topk, max_q, max_k
+    return (
+        q_indexer_local,
+        k_topk,
+        weights_indexer_local,
+        cu_q_topk,
+        cu_k_topk,
+        max_q,
+        max_k,
+        seq_lens,
+    )
 
 
 def pad_indexer_topk_to_fixed_width_fused(
