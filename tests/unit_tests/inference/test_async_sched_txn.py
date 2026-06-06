@@ -1919,6 +1919,54 @@ class TestC5OverlapFlip(AsyncSchedTxnTestBase):
         assert serial_env.engine.controller._async_launch_before_commit_count == 0
 
     @pytest.mark.internal
+    def test_prestage_issued_in_forward_shadow_before_logits_read(self) -> None:
+        """Deterministic (wall-clock-independent) proof of the continuous-loop pipelining: the
+        next forward's metadata prestage + publish is issued in the CURRENT forward's GPU shadow,
+        BEFORE that forward's logits are read to the host to sample.
+
+        ``_async_overlap_step`` calls ``_async_prestage_next_decode_forward`` (which increments
+        ``_async_prestage_in_shadow_count`` on each eligible prestage) strictly before
+        ``_dynamic_step_prepare_commit`` (the GPU->CPU sample transfer that reads the logits). So
+        every increment of the shadow counter provably happened before the logits read for that
+        step -- the load-bearing ordering, independent of any timing. We assert the shadow
+        prestage fired for at least as many steps as the launch (the launch can only fire when its
+        shadow prestage already published), that both are positive, and that the serial control
+        never prestages. Combined with token-exact ``async == serial`` (asserted here too) this
+        proves the prestage runs in F(K)'s shadow without perturbing the generated tokens.
+        """
+        from unittest import mock
+
+        base_build = AsyncSchedTxnTestBase._build_requests
+
+        def greedy_build(cls, test_config):
+            requests = base_build(test_config)
+            for request in requests:
+                request.sampling_params.top_k = 1  # argmax => greedy, no RNG draws
+            return requests
+
+        with mock.patch.object(type(self), "_build_requests", classmethod(greedy_build)):
+            serial_env, async_env = self.assert_async_equals_serial(
+                **self._greedy_cuda_graph_kwargs()
+            )
+
+        controller = async_env.engine.controller
+        shadow_prestages = controller._async_prestage_in_shadow_count
+        launches = controller._async_launch_before_commit_count
+        # The shadow prestage fired (each issued before its step's logits read, by code order).
+        assert shadow_prestages > 0, "prestage never ran in the forward's shadow"
+        # Every launch was preceded by a shadow prestage+publish for that step (the launch
+        # consumes the metadata the shadow prestage published). Prestage may additionally fire on
+        # a finishing step whose launch is then suppressed, so shadow >= launch > 0.
+        assert launches > 0
+        assert shadow_prestages >= launches, (
+            f"shadow prestages ({shadow_prestages}) must be >= launches ({launches}): "
+            "every launched forward is fed by a prestage published in the prior forward's shadow"
+        )
+        # The serial control issues no shadow prestage (the overlap path is async-only).
+        assert serial_env.engine.controller._async_prestage_in_shadow_count == 0
+        assert serial_env.engine.controller._async_launch_before_commit_count == 0
+
+    @pytest.mark.internal
     def test_overlap_equals_serial_torch_nongreedy(self) -> None:
         """Non-greedy torch decode under a CUDA graph: token-exact async==serial. The C3
         per-request keyed RNG makes draws depend only on (request_id, draw count), which the

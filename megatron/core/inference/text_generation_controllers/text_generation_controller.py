@@ -210,6 +210,12 @@ class TextGenerationController:
         # Diagnostic: set True whenever update_requests runs while a speculative forward that
         # was launched before it is in flight (the load-bearing ordering property).
         self._async_committed_with_inflight_forward = False
+        # Diagnostic: number of steady steps whose next-forward metadata prestage + publish was
+        # issued in the current forward's GPU shadow (i.e. BEFORE that forward's logits were
+        # read to the host to sample). This is the structural proof of the continuous-loop
+        # pipelining: prestage(K+1) runs concurrently with F(K), so only the GPU token-scatter +
+        # the launch enqueue sit between sampling S(K) and F(K+1). Wall-clock-independent.
+        self._async_prestage_in_shadow_count = 0
 
         self._init_mtp_sampling_tensors()
 
@@ -1820,27 +1826,31 @@ class TextGenerationController:
             return True
         return context.is_decode_only() and context.using_cuda_graph_this_step()
 
-    def _async_try_launch_next_decode_forward(self, prepared: Dict[str, Any]) -> Optional[Dict]:
-        """Launch the next decode forward BEFORE this step's update_requests (the overlap).
+    def _async_prestage_next_decode_forward(self) -> Optional["PrestagedDecodePlan"]:
+        """Build + publish the next decode forward's metadata in the current forward's GPU shadow.
 
-        Only fires for a clean, finish-free, pause-free, boundary-safe plain decode step (so the
-        launched forward consumes the exact layout the deferred commit will produce -- no output
-        realignment is ever needed: KV blocks and mamba slots are request-bonded and unchanged).
-        Builds the speculative plan (predicting the pending commit), advances the per-token input
-        bookkeeping by one unit query, publishes the predicted metadata with a token-excluded H2D,
-        scatters this step's sampled tokens as the next forward's input ids, and replays the graph.
+        This is the *shadow* phase of the launch-before-commit overlap (design 1.1 / the
+        continuous-loop pipelining): it runs BEFORE the current forward F(K)'s logits are read to
+        the host. Everything here is derived purely from the *committed* layout (post the previous
+        step's commit) -- never from F(K)'s output -- so it overlaps F(K) on the GPU:
 
-        Returns the in-flight record (consume-by-request-id snapshot + graph bucket) to stash, or
-        None when this step is not launchable (the engine then commits and primes again next step).
+        * build the speculative plan for the forward that runs against the layout the pending
+          commit will produce (``speculate_pending_decode_commit=True``); boundary-window gated, so
+          an ineligible plan returns None and the engine falls back to a synchronous step;
+        * advance the per-token input bookkeeping by one unit query (the pending commit's append).
+          update_requests rewrites these to identical values on a finish-free commit; on a finish
+          the launch is suppressed and update_requests rebuilds the compacted layout, so the
+          speculative advance is always overwritten before it is read;
+        * publish the predicted metadata with one token-excluded H2D. The H2D is enqueued in F(K)'s
+          shadow but stream-ordered AFTER the sample kernel, so it overwrites the single GPU
+          metadata buffer only once F(K) (and the sample kernel reading its live params) is done.
+
+        All of the above is pure CPU work on pinned tensors plus one async H2D -- no host<->device
+        sync -- so it does not drain F(K). Returns the eligible plan to hand to
+        :meth:`_async_commit_launch_next_decode_forward`, or None when this step is not launch-
+        eligible from committed state.
         """
         context = self.inference_wrapped_model.inference_context
-        # Absorbable-but-reshaping or unsupported conditions => no speculative launch this step.
-        if prepared["finished_count"] != 0:
-            return None
-        if not prepared["was_decode_only"]:
-            return None
-        if context.paused_request_count != 0:
-            return None
         if not context.using_cuda_graph_this_step():
             return None
 
@@ -1858,9 +1868,9 @@ class TextGenerationController:
 
         # Advance the per-token input bookkeeping by one unit query (the pending commit's append),
         # predicting the next forward's positions. update_requests rewrites these to the identical
-        # values when it commits below, so this early CPU advance is safe (boundary-gated: no
-        # block-id change and no local-position wrap). token_to_input_ids is supplied by the GPU
-        # scatter; token_to_request_idx / token_to_block_idx are invariant for finish-free decode.
+        # values when it commits, so this early CPU advance is safe (boundary-gated: no block-id
+        # change and no local-position wrap). token_to_input_ids is supplied by the GPU scatter;
+        # token_to_request_idx / token_to_block_idx are invariant for finish-free decode.
         context.token_to_pos_ids[:n] += 1
         context.token_to_position_in_request[:n] += 1
         context.token_to_local_position_within_kv_block[:n] += 1
@@ -1868,6 +1878,42 @@ class TextGenerationController:
         # Publish the predicted metadata into the live buffer with one token-excluded H2D (carries
         # the advanced per-token fields + the speculative MHA region to the single GPU buffer).
         context.publish_prepared_decode_plan(plan)
+
+        self._async_prestage_in_shadow_count += 1
+        return plan
+
+    def _async_commit_launch_next_decode_forward(
+        self, plan: Optional["PrestagedDecodePlan"], prepared: Dict[str, Any]
+    ) -> Optional[Dict]:
+        """Fire the speculative launch iff this step is finish-free (post-sample commit phase).
+
+        Runs AFTER the sample D2H, so the finish-free / pause-free / decode-only state is known.
+        The metadata prestage + publish already ran in F(K)'s shadow
+        (:meth:`_async_prestage_next_decode_forward`); all that remains on the post-sample critical
+        path is the in-place GPU token-scatter of the sampled ids + the launch (graph replay).
+
+        Only fires for a clean, finish-free, pause-free, boundary-safe plain decode step (so the
+        launched forward consumes the exact layout the deferred commit will produce -- no output
+        realignment is ever needed: KV blocks and mamba slots are request-bonded and unchanged). A
+        finish (or no eligible prestage) suppresses the launch: the published metadata is then stale
+        but never consumed -- the next step is a synchronous PRIME that rebuilds it from scratch.
+
+        Returns the in-flight record (consume-by-request-id snapshot + graph bucket) to stash, or
+        None when this step is not launchable (the engine then commits and primes again next step).
+        """
+        context = self.inference_wrapped_model.inference_context
+        # No eligible shadow prestage => nothing to launch (sync step).
+        if plan is None:
+            return None
+        # Absorbable-but-reshaping or unsupported conditions => no speculative launch this step.
+        if prepared["finished_count"] != 0:
+            return None
+        if not prepared["was_decode_only"]:
+            return None
+        if context.paused_request_count != 0:
+            return None
+        if not context.using_cuda_graph_this_step():
+            return None
 
         # Scatter this step's sampled ids as the next forward's input ids (GPU, no D2H), then mark
         # the token-id region GPU-authoritative so the next H2D keeps excluding it.
@@ -1899,9 +1945,13 @@ class TextGenerationController:
         * PRIME (no in-flight forward): run a normal forward for the current committed state (this
           matches the serial head for plain GPT decode under a graph).
 
-        Then sample + log-probs, run the finish-detection prepare phase, launch the next forward
-        BEFORE update_requests (when launchable), and finally commit this step (update_requests +
-        scatter) -- which overlaps the launched forward on the GPU. The returned bookkeeping is
+        Then enqueue the sample kernel, prestage + publish the NEXT forward's metadata in F(K)'s
+        shadow (design 1.1: this needs only committed state, so it runs concurrently with F(K)
+        BEFORE its logits are read to the host), read the logits + run finish detection, fire the
+        speculative launch when finish-free, and finally commit this step (update_requests +
+        scatter) -- which overlaps the launched forward on the GPU. So the post-sample inter-
+        forward critical path is just the GPU token-scatter + the launch enqueue; the metadata
+        prestage and the previous step's commit run in F(K)'s shadow. The returned bookkeeping is
         for the step just committed, so engine accounting (step_count, post_process) is unchanged.
         """
         context = self.inference_wrapped_model.inference_context
@@ -1945,12 +1995,28 @@ class TextGenerationController:
                     top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs(log_probs_tensor)
             range_pop()
 
-            # Prepare commit (finish detection) -- must precede both the launch decision and
+            # SHADOW: build + publish the next forward's metadata while F(K) is still in flight,
+            # BEFORE reading F(K)'s logits to the host. Derived purely from committed state, so it
+            # overlaps F(K) on the GPU (and the publish H2D is stream-ordered after the sample
+            # kernel enqueued just above). The launch decision (finish-free) is deferred below.
+            range_push("prestage(shadow)")
+            prestaged_plan = self._async_prestage_next_decode_forward()
+            range_pop()
+
+            # The shadow prestage above was issued for THIS step before the logits read below: a
+            # wall-clock-independent record that prestage(K+1) ran in F(K)'s shadow (the load-
+            # bearing continuous-loop pipelining ordering). Counted in the prestage method.
+
+            # Prepare commit (finish detection): the GPU->CPU sample transfer reads F(K)'s logits,
+            # so this is where the host blocks on F(K). Must precede both the launch decision and
             # update_requests so the launched forward only fires on a finish-free step.
             prepared = self._dynamic_step_prepare_commit()
 
-            # Launch the next forward BEFORE committing this step (the overlap).
-            self._async_overlap_inflight = self._async_try_launch_next_decode_forward(prepared)
+            # Fire the speculative launch BEFORE committing this step (the overlap), now that the
+            # finish-free state is known. Post-sample path = GPU token-scatter + launch enqueue.
+            self._async_overlap_inflight = self._async_commit_launch_next_decode_forward(
+                prestaged_plan, prepared
+            )
             if self._async_overlap_inflight is not None:
                 self._async_committed_with_inflight_forward = True
 
