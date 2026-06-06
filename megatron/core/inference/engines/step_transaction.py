@@ -141,6 +141,51 @@ def classify_launch_eligibility(signals: LaunchSignals) -> LaunchDecision:
     return LaunchDecision(LaunchEligibility.ELIGIBLE, LaunchGateReason.PURE_DECODE)
 
 
+@dataclass
+class PrestagedDecodePlan:
+    """A read-only plan for the next decode step's launch-before-commit transaction.
+
+    Built by ``DynamicInferenceContext.prestage_next_decode_step_into_cpu_staging`` from the
+    *committed* layout, speculating no finish this step (a finish is absorbable -- its row is
+    discarded, never re-run). It captures everything the launch needs EXCEPT the sampled token
+    values (those are scattered onto the single GPU buffer post-sample). Specifically:
+
+    * :attr:`eligible` / :attr:`skip_reason` -- the static launch decision (1.2 / 1.9), computed
+      from committed state + KV headroom (a same-step finish's soon-to-free block is intentionally
+      NOT counted as headroom).
+    * :attr:`snapshot_request_ids` -- the pre-compaction active request-id snapshot the launched
+      forward is consumed by (consume-by-request-id, never by row: compaction only permutes rows,
+      so physical KV-block / mamba-slot ids stay bonded to each surviving request).
+    * The resource lease manifest (:attr:`kv_block_leases`, :attr:`reserved_boundary_blocks`,
+      :attr:`mamba_slot_leases`, :attr:`kv_blocks_needed`) the forward would touch -- recorded
+      read-only. Actual allocation / boundary-block adoption + the two-step retire are performed by
+      the overlap launch path that consumes the plan (a later commit); the prestage itself MUST NOT
+      mutate live CPU tensors, the allocator, or the GPU buffer.
+
+    The predicted next-step MHA metadata is written into the CPU *staging* views (never the live
+    buffer, never the GPU buffer) so publish can swap it in with one coalesced token-excluded H2D.
+    """
+
+    step_id: int
+    eligible: bool
+    skip_reason: Optional["LaunchGateReason"] = None
+    snapshot_request_ids: Any = None  # torch.Tensor (clone) or None
+    active_request_count: int = 0
+    # Physical KV block ids the forward would read (current last block per active request).
+    kv_block_leases: List[int] = field(default_factory=list)
+    # Boundary crossers that would need a new block next step, as (request_id, block_column).
+    reserved_boundary_blocks: List[Tuple[int, int]] = field(default_factory=list)
+    # Mamba state slot ids the forward would advance in place (hybrid only).
+    mamba_slot_leases: List[int] = field(default_factory=list)
+    # Number of new KV blocks the predicted step needs (== len(reserved_boundary_blocks)).
+    kv_blocks_needed: int = 0
+
+    @property
+    def has_leases(self) -> bool:
+        """Whether the plan records any resource the forward would touch."""
+        return bool(self.kv_block_leases or self.reserved_boundary_blocks or self.mamba_slot_leases)
+
+
 class TxnPhase(str, Enum):
     """Lifecycle phase of a :class:`StepTxn`."""
 
@@ -405,6 +450,19 @@ class StepTransactionManager:
         """Publish ``txn``'s artifacts by request id. Filled in by the publication commit."""
         # Publication (logprobs / top-n / routing / coordinator replies) is keyed by
         # request id and happens after commit; wired up in a later commit.
+
+    def record_prestage(self, plan: "PrestagedDecodePlan") -> None:
+        """Record a prestage outcome in diagnostics.
+
+        An eligible plan counts as ``prepared`` (its metadata + lease manifest were built into
+        the CPU staging buffer this step); an ineligible plan records its static skip reason.
+        Cheap O(1) counter updates; nothing here mutates context state.
+        """
+        if plan.eligible:
+            self.diagnostics.prepared += 1
+        else:
+            reason = plan.skip_reason.value if plan.skip_reason is not None else "unknown"
+            self.diagnostics.skip_reasons[reason] += 1
 
     def note_sync_step(self, reason: str) -> None:
         """Record that this step ran synchronously (a layout-changing step)."""

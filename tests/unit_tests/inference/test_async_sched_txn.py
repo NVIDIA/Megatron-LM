@@ -30,6 +30,7 @@ from megatron.core.inference.engines.step_transaction import (
     LaunchEligibility,
     LaunchGateReason,
     LaunchSignals,
+    PrestagedDecodePlan,
     RetireQueue,
     StepTransactionManager,
     StepTxn,
@@ -1167,3 +1168,400 @@ class TestC4SingleBufferDecode(AsyncSchedTxnTestBase):
             num_gap_steps=1,
             num_tokens_to_generate=16,
         )
+
+
+class TestC5PrestagedPlanPrimitives:
+    """C5 (CPU-only): the prestaged-plan dataclass + manager diagnostics, no model."""
+
+    @pytest.mark.internal
+    def test_plan_dataclass_defaults(self) -> None:
+        empty = PrestagedDecodePlan(step_id=7, eligible=False, skip_reason=LaunchGateReason.RESUME)
+        assert empty.eligible is False
+        assert empty.skip_reason is LaunchGateReason.RESUME
+        assert empty.has_leases is False
+        assert empty.kv_blocks_needed == 0
+
+        leased = PrestagedDecodePlan(
+            step_id=8,
+            eligible=True,
+            kv_block_leases=[3, 4],
+            reserved_boundary_blocks=[(11, 2)],
+            mamba_slot_leases=[5],
+            kv_blocks_needed=1,
+        )
+        assert leased.eligible is True and leased.skip_reason is None
+        assert leased.has_leases is True
+        assert leased.kv_blocks_needed == 1
+
+    @pytest.mark.internal
+    def test_manager_record_prestage_diagnostics(self) -> None:
+        import types
+
+        manager = StepTransactionManager(types.SimpleNamespace())
+        manager.record_prestage(PrestagedDecodePlan(step_id=1, eligible=True))
+        manager.record_prestage(PrestagedDecodePlan(step_id=1, eligible=True))
+        manager.record_prestage(
+            PrestagedDecodePlan(
+                step_id=2, eligible=False, skip_reason=LaunchGateReason.PENDING_ADMISSION
+            )
+        )
+        diag = manager.diagnostics.as_dict()
+        assert diag["prepared"] == 2
+        assert diag["skip_reasons"]["pending_admission"] == 1
+
+
+@pytest.mark.skipif(
+    not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+)
+class TestC5Prestage(AsyncSchedTxnTestBase):
+    """C5: launch-before-commit prestage / publish builders + committed-state launch signals.
+
+    The prestage predicts the *next* decode forward's plan from the committed layout (speculating
+    no finish): it snapshots the consumed request-id set, builds the next forward's MHA metadata
+    into the CPU staging buffer (never live / never GPU), and records the read-only lease manifest
+    (KV blocks, <=1 reserved boundary block per crosser, mamba slots). publish swaps the staging
+    MHA into the live buffer + one token-excluded H2D. These are the building blocks the
+    cross-step shadow overlap consumes; this commit lands + validates them == the serial rebuild,
+    while the runtime decode path is unchanged (so ``async == serial`` / ``async-off == main``).
+
+    Launch eligibility requires a CUDA graph; the tiny test models run eager, so tests that need
+    an *eligible* plan force ``using_cuda_graph_this_step`` True (isolating the prestage logic from
+    the heavyweight graph-capture machinery, which the C4 battery already exercises).
+    """
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+        )
+
+    @classmethod
+    def teardown_class(cls):
+        delete_cuda_graphs()
+        set_rounder(64)
+        Utils.destroy_model_parallel()
+
+    def _decode_context(self, *, n_steps=4, **overrides):
+        """Build an async-enabled engine and step it into a committed decode-only state."""
+        set_rounder(4)
+        cfg = dict(
+            model_provider="gpt",
+            num_requests=2,
+            num_gap_steps=0,
+            num_tokens_to_generate=16,
+            enable_async_scheduling=True,
+        )
+        cfg.update(overrides)
+        env = self._build_test_env(DynamicEngineTestConfig(**cfg))
+        for request in env.requests:
+            env.engine._add_request(request)
+        for _ in range(n_steps):
+            if not env.engine.has_unfinished_requests():
+                break
+            self._run_step(env)
+        return env, env.engine.context
+
+    # --- committed-state launch signals -------------------------------------------
+
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_build_launch_signals_reads_committed_state(self) -> None:
+        """build_launch_signals reflects committed state; eager tiny model => graph-ineligible."""
+        env, ctx = self._decode_context()
+        assert ctx.is_decode_only()
+        sig = ctx.build_launch_signals()
+        assert sig.decode_only is True
+        assert sig.active_request_count == ctx.total_request_count - ctx.paused_request_count
+        assert sig.active_request_count > 0
+        assert sig.mtp_layout_change is False
+        assert sig.kv_reservation_fits is True  # tiny model, ample free blocks
+        assert sig.using_cuda_graph == ctx.using_cuda_graph_this_step()
+        decision = classify_launch_eligibility(sig)
+        if not sig.using_cuda_graph:
+            # No CUDA graph on the tiny eager model -> the launch gate vetoes (sync step).
+            assert not decision.eligible
+            assert decision.reason is LaunchGateReason.GRAPH_INELIGIBLE
+
+    # --- prestage: read-only on live; snapshot + MHA == committed rebuild formula ---
+
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_prestage_is_read_only_on_live_state(self) -> None:
+        """Prestage writes only the staging buffer; it mutates no live tensor or the allocator."""
+        env, ctx = self._decode_context()
+        ctx.using_cuda_graph_this_step = lambda: True
+        try:
+            buf_before = ctx._cpu_bookkeeping_buf.clone()
+            blocks_before = ctx.request_to_kv_block_ids.clone()
+            ids_before = ctx.request_ids.clone()
+            avail_before = ctx.kv_block_allocator.get_active_avail()
+            plan = ctx.prestage_next_decode_step_into_cpu_staging()
+            assert plan.eligible, plan.skip_reason
+            assert torch.equal(ctx._cpu_bookkeeping_buf, buf_before), "prestage mutated live buffer"
+            assert torch.equal(ctx.request_to_kv_block_ids, blocks_before)
+            assert torch.equal(ctx.request_ids, ids_before)
+            assert ctx.kv_block_allocator.get_active_avail() == avail_before
+            # The snapshot is an independent clone (consume-by-request-id stays stable under
+            # a later compaction of the live request_ids).
+            assert plan.snapshot_request_ids.data_ptr() != ctx.request_ids.data_ptr()
+        finally:
+            del ctx.using_cuda_graph_this_step
+
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_prestage_snapshot_and_mha_formula(self) -> None:
+        """Snapshot == active request ids; staging MHA == the decode rebuild formula."""
+        env, ctx = self._decode_context()
+        ctx.using_cuda_graph_this_step = lambda: True
+        try:
+            plan = ctx.prestage_next_decode_step_into_cpu_staging()
+            assert plan.eligible and plan.skip_reason is None
+            bs = plan.active_request_count
+            active = slice(ctx.paused_request_count, ctx.total_request_count)
+            assert torch.equal(plan.snapshot_request_ids, ctx.request_ids[active])
+            assert bs == ctx.total_request_count - ctx.paused_request_count
+
+            exp_kv = (
+                ctx.request_kv_length_offsets[active] + ctx.request_query_lengths[active]
+            ).int()
+            assert torch.equal(ctx._staging_mha_kv_seq_lengths[:bs], exp_kv[:bs])
+            assert torch.equal(
+                ctx._staging_mha_query_lengths[:bs], torch.ones(bs, dtype=torch.int32)
+            )
+            assert torch.equal(
+                ctx._staging_mha_cu_query_seq_lengths[: bs + 1],
+                torch.arange(bs + 1, dtype=torch.int32),
+            )
+            exp_cukv = torch.zeros(bs + 1, dtype=torch.int32)
+            exp_cukv[1:] = torch.cumsum(exp_kv[:bs], dim=0)
+            assert torch.equal(ctx._staging_mha_cu_kv_seq_lengths[: bs + 1], exp_cukv)
+            assert torch.equal(
+                ctx._staging_mha_block_table[:bs], ctx.request_to_kv_block_ids[active][:bs].int()
+            )
+        finally:
+            del ctx.using_cuda_graph_this_step
+
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_prestage_mha_equals_rebuild(self) -> None:
+        """Prestaged staging MHA == initialize_attention_state's live rebuild of the next forward.
+
+        Short prompts + the default (256-token) KV block size => no boundary crossing within a few
+        decode steps, so the full MHA (including the block table) is identical to the rebuild.
+        """
+        env, ctx = self._decode_context()
+        ctx.using_cuda_graph_this_step = lambda: True
+        try:
+            plan = ctx.prestage_next_decode_step_into_cpu_staging()
+        finally:
+            del ctx.using_cuda_graph_this_step
+        assert plan.eligible
+        assert plan.kv_blocks_needed == 0, "this test must not cross a block boundary"
+        bs = plan.active_request_count
+        staging = {
+            "ql": ctx._staging_mha_query_lengths[:bs].clone(),
+            "cuq": ctx._staging_mha_cu_query_seq_lengths[: bs + 1].clone(),
+            "kv": ctx._staging_mha_kv_seq_lengths[:bs].clone(),
+            "cukv": ctx._staging_mha_cu_kv_seq_lengths[: bs + 1].clone(),
+            "bt": ctx._staging_mha_block_table[:bs].clone(),
+        }
+
+        # Rebuild the real next forward's MHA into the live buffer and compare.
+        ctx.initialize_attention_state()
+        assert torch.equal(staging["ql"], ctx._cpu_mha_query_lengths[:bs])
+        assert torch.equal(staging["cuq"], ctx._cpu_mha_cu_query_seq_lengths[: bs + 1])
+        assert torch.equal(staging["kv"], ctx._cpu_mha_kv_seq_lengths[:bs]), (
+            f"prestaged kv_seq != rebuild: {staging['kv']} vs {ctx._cpu_mha_kv_seq_lengths[:bs]}"
+        )
+        assert torch.equal(staging["cukv"], ctx._cpu_mha_cu_kv_seq_lengths[: bs + 1])
+        assert torch.equal(staging["bt"], ctx._cpu_mha_block_table[:bs])
+
+    # --- boundary reservation manifest --------------------------------------------
+
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_prestage_boundary_reservation(self) -> None:
+        """A boundary crosser is recorded as exactly one reserved block (req_id, column)."""
+        set_rounder(4)
+        # Long prompt (250) + 256-token block => the sequence crosses the first block boundary a
+        # few decode steps in (mirrors the C4 boundary fixture).
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                model_provider="gpt",
+                num_requests=1,
+                num_gap_steps=0,
+                min_prompt_length=250,
+                max_prompt_length=250,
+                num_tokens_to_generate=20,
+                enable_async_scheduling=True,
+            )
+        )
+        ctx = env.engine.context
+        env.engine._add_request(env.requests[0])
+
+        saw_boundary = False
+        while env.engine.has_unfinished_requests():
+            if ctx.is_decode_only() and (ctx.total_request_count - ctx.paused_request_count) > 0:
+                ctx.using_cuda_graph_this_step = lambda: True
+                try:
+                    plan = ctx.prestage_next_decode_step_into_cpu_staging()
+                finally:
+                    del ctx.using_cuda_graph_this_step
+                if plan.eligible:
+                    crossers = int(ctx._boundary_crosser_local_indices().numel())
+                    assert plan.kv_blocks_needed == len(plan.reserved_boundary_blocks)
+                    assert plan.kv_blocks_needed == crossers
+                    for req_id, column in plan.reserved_boundary_blocks:
+                        assert req_id >= 0 and column >= 0
+                    if plan.kv_blocks_needed > 0:
+                        saw_boundary = True
+            self._run_step(env)
+
+        assert saw_boundary, "no boundary crosser exercised (tune block size / prompt length)"
+
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_prestage_kv_unavailable_forces_sync(self) -> None:
+        """No free block for a boundary crosser => sync step (and a same-step finish is NOT
+        counted as headroom -- the gate never reads finishes)."""
+        env, ctx = self._decode_context()
+        ctx.using_cuda_graph_this_step = lambda: True
+        ctx._boundary_crosser_local_indices = lambda: torch.tensor([0], dtype=torch.long)
+        ctx.kv_block_allocator.get_active_avail = lambda: 0  # free pool exhausted
+        try:
+            sig = ctx.build_launch_signals()
+            assert sig.kv_reservation_fits is False
+            plan = ctx.prestage_next_decode_step_into_cpu_staging()
+            assert not plan.eligible
+            assert plan.skip_reason is LaunchGateReason.KV_RESERVATION_UNAVAILABLE
+            # A finish this step would free a block only AFTER commit's release; the prestage
+            # runs before finish-detection and must not count it -- still unavailable.
+            assert ctx.build_launch_signals().kv_reservation_fits is False
+        finally:
+            del ctx.using_cuda_graph_this_step
+            del ctx._boundary_crosser_local_indices
+            del ctx.kv_block_allocator.get_active_avail
+
+    # --- static skip reasons ------------------------------------------------------
+
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_prestage_skip_reasons(self) -> None:
+        """Each non-eligible condition surfaces its static skip reason (no staging writes)."""
+        env, ctx = self._decode_context()
+
+        # Eager (no CUDA graph) -> graph-ineligible.
+        assert (
+            ctx.prestage_next_decode_step_into_cpu_staging().skip_reason
+            is LaunchGateReason.GRAPH_INELIGIBLE
+        )
+
+        ctx.using_cuda_graph_this_step = lambda: True
+        try:
+            # Pending admission (engine-driven signal).
+            assert (
+                ctx.prestage_next_decode_step_into_cpu_staging(
+                    pending_admission=True
+                ).skip_reason
+                is LaunchGateReason.PENDING_ADMISSION
+            )
+
+            # Not decode-only (prefill / mixed).
+            ctx.is_decode_only = lambda: False
+            try:
+                assert (
+                    ctx.prestage_next_decode_step_into_cpu_staging().skip_reason
+                    is LaunchGateReason.NOT_DECODE_ONLY
+                )
+            finally:
+                del ctx.is_decode_only
+
+            # Chunked prefill in progress.
+            ctx.get_index_of_chunked_prefill_request = lambda safe=True: 0
+            try:
+                assert (
+                    ctx.prestage_next_decode_step_into_cpu_staging().skip_reason
+                    is LaunchGateReason.CHUNKED_PREFILL
+                )
+            finally:
+                del ctx.get_index_of_chunked_prefill_request
+
+            # MTP-dependent layout (speculative decoding).
+            saved_spec = ctx.num_speculative_tokens
+            ctx.num_speculative_tokens = 1
+            try:
+                assert (
+                    ctx.prestage_next_decode_step_into_cpu_staging().skip_reason
+                    is LaunchGateReason.MTP_DEPENDENT_LAYOUT
+                )
+            finally:
+                ctx.num_speculative_tokens = saved_spec
+        finally:
+            del ctx.using_cuda_graph_this_step
+
+    # --- publish: staging -> live + token-excluded H2D ----------------------------
+
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_publish_transfers_staging_to_live_and_gpu(self) -> None:
+        """publish copies the staging MHA into the live buffer and applies it on the GPU buffer."""
+        env, ctx = self._decode_context()
+        ctx.using_cuda_graph_this_step = lambda: True
+        try:
+            plan = ctx.prestage_next_decode_step_into_cpu_staging()
+            assert plan.eligible
+            bs = plan.active_request_count
+            staging_kv = ctx._staging_mha_kv_seq_lengths[:bs].clone()
+            staging_bt = ctx._staging_mha_block_table[:bs].clone()
+
+            ctx.publish_prepared_decode_plan(plan)
+            torch.cuda.synchronize()
+
+            # Staging MHA is now live.
+            assert torch.equal(ctx._cpu_mha_kv_seq_lengths[:bs], staging_kv)
+            assert torch.equal(ctx._cpu_mha_block_table[:bs], staging_bt)
+            # The GPU buffer's MHA byte-region reflects the live buffer (token-excluded H2D ran).
+            s, e = ctx._mha_region_byte_start, ctx._mha_region_byte_end
+            assert torch.equal(ctx.gpu_view._buf[s:e].cpu(), ctx._cpu_bookkeeping_buf[s:e])
+            assert ctx.decode_metadata_buffer.h2d_done_event is not None
+        finally:
+            del ctx.using_cuda_graph_this_step
+
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_publish_ineligible_plan_is_noop(self) -> None:
+        """Publishing an ineligible plan changes nothing."""
+        env, ctx = self._decode_context()
+        before = ctx._cpu_bookkeeping_buf.clone()
+        ctx.publish_prepared_decode_plan(
+            PrestagedDecodePlan(step_id=0, eligible=False, skip_reason=LaunchGateReason.RESUME)
+        )
+        assert torch.equal(ctx._cpu_bookkeeping_buf, before)
+
+    # --- regression: runtime decode unchanged (async == serial / async-off == main) ---
+
+    @pytest.mark.internal
+    def test_async_equals_serial_regression(self) -> None:
+        """The prestage/publish builders do not run on the decode path, so async stays
+        token-exact vs serial (greedy, reshaping batches)."""
+        from unittest import mock
+
+        base_build = AsyncSchedTxnTestBase._build_requests
+
+        def greedy_build(cls, test_config):
+            requests = base_build(test_config)
+            for request in requests:
+                request.sampling_params.top_k = 1
+            return requests
+
+        with mock.patch.object(type(self), "_build_requests", classmethod(greedy_build)):
+            self.assert_async_equals_serial(
+                model_provider="gpt",
+                num_requests=6,
+                num_gap_steps=1,
+                num_tokens_to_generate=20,
+                use_fixed_output_lengths=True,
+            )

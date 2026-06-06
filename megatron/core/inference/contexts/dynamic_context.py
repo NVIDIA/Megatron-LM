@@ -1267,6 +1267,47 @@ class DynamicInferenceContext(BaseInferenceContext):
             # buffer (the buffer's h2d_done_event). Allocated lazily on first transfer.
             self._h2d_done_event: Optional[Any] = None
 
+            # Staging-side MHA-metadata views (C5). The launch-before-commit prestage builds
+            # the *next* step's MHA metadata into these views -- slices of the CPU staging
+            # mirror at the SAME byte offsets as the live `_cpu_mha_*` views above -- while the
+            # current forward's already-issued H2D still reads the live buffer. publish then
+            # copies the staging MHA byte-region back into the live buffer and issues one
+            # coalesced token-excluded H2D. Offsets are recomputed from the stored max_* sizes
+            # to exactly mirror the live layout (see the coalesced-buffer offset walk above).
+            _tok_i64 = self.max_tokens * 8
+            _tok_i32 = self.max_tokens * 4
+            _req_4 = self.max_requests * 4
+            _mha_start = 3 * _tok_i64 + 3 * _tok_i32 + 7 * _req_4
+            _mha_ql = self.max_requests * 4
+            _mha_cuql = (self.max_requests + 1) * 4
+            _mha_kv = self.max_requests * 4
+            _mha_cukv = (self.max_requests + 1) * 4
+            _mha_bt = self.max_requests * self.max_kv_block_count * 4
+            self._mha_region_byte_start = _mha_start
+            self._mha_region_byte_end = _mha_start + _mha_ql + _mha_cuql + _mha_kv + _mha_cukv + _mha_bt
+            _o = _mha_start
+            self._staging_mha_query_lengths = self._cpu_staging_buf[_o : _o + _mha_ql].view(
+                torch.int32
+            )
+            _o += _mha_ql
+            self._staging_mha_cu_query_seq_lengths = self._cpu_staging_buf[_o : _o + _mha_cuql].view(
+                torch.int32
+            )
+            _o += _mha_cuql
+            self._staging_mha_kv_seq_lengths = self._cpu_staging_buf[_o : _o + _mha_kv].view(
+                torch.int32
+            )
+            _o += _mha_kv
+            self._staging_mha_cu_kv_seq_lengths = self._cpu_staging_buf[_o : _o + _mha_cukv].view(
+                torch.int32
+            )
+            _o += _mha_cukv
+            self._staging_mha_block_table = (
+                self._cpu_staging_buf[_o : _o + _mha_bt]
+                .view(torch.int32)
+                .view(self.max_requests, self.max_kv_block_count)
+            )
+
         # Cache of (input_ids_view, pos_ids_view) keyed by num_tokens. Instead of slicing and
         # unsqueezing on every new inference step (constructing new TensorImpls at 30-60 us),
         # we fix the underlying storage so views are reusable across steps. The number of entries
@@ -2544,6 +2585,189 @@ class DynamicInferenceContext(BaseInferenceContext):
         # block_table tracks the committed physical KV block ids (advanced already by
         # update_requests, including any boundary-crossing reallocation).
         out_block_table[:bs] = committed_block_table[:bs]
+
+    def _boundary_crosser_local_indices(self) -> Tensor:
+        """Active-row indices of requests whose last KV block would overflow next step.
+
+        Uses the SAME condition ``update_requests`` applies to decide a request needs a new
+        block (``num_tokens_in_last_block >= block_size_tokens - 1 - num_speculative_tokens``).
+        Each such request needs exactly one new KV block when the next forward runs. Returned
+        indices are relative to the active slice (``[paused_request_count, total_request_count)``).
+        Pure read; mutates nothing.
+        """
+        active_request_count = self.total_request_count - self.paused_request_count
+        if active_request_count <= 0:
+            return torch.empty(0, dtype=torch.long, device='cpu')
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+        num_tokens_in_last_block = self.request_last_kv_block_offset[active_slice]
+        threshold = self.block_size_tokens - 1 - self.num_speculative_tokens
+        return torch.nonzero(num_tokens_in_last_block >= threshold, as_tuple=True)[0]
+
+    def build_launch_signals(
+        self,
+        *,
+        pending_admission: bool = False,
+        resume_pending: bool = False,
+        evict_pending: bool = False,
+        forced_pause_overflow: bool = False,
+        graph_recapture: bool = False,
+    ) -> "LaunchSignals":
+        """Build the static launch-eligibility signals from the *committed* context state.
+
+        Computes the facts ``classify_launch_eligibility`` (design 1.2 / 1.9) needs to decide
+        whether the next decode step may be launched speculatively before its commit. Only facts
+        derivable from committed state + KV headroom are computed here; engine-driven layout
+        signals (admission / resume / evict / forced-pause / graph recapture) are passed in by
+        the caller and default off.
+
+        A finish is *absorbable* (its row is discarded, never re-run), so it is deliberately NOT
+        a signal -- and the KV-headroom check counts only boundary crossers from the committed
+        active set, never a same-step finish's soon-to-free block. The check uses the free pool
+        only (``get_active_avail``), the conservative choice: when unsure, prefer a sync step.
+        """
+        from megatron.core.inference.engines.step_transaction import LaunchSignals
+
+        active_request_count = self.total_request_count - self.paused_request_count
+        chunked_prefill_active = self.get_index_of_chunked_prefill_request(safe=True) != -1
+        kv_blocks_needed = int(self._boundary_crosser_local_indices().numel())
+        kv_reservation_fits = self.kv_block_allocator.get_active_avail() >= kv_blocks_needed
+        return LaunchSignals(
+            decode_only=self.is_decode_only(),
+            active_request_count=active_request_count,
+            using_cuda_graph=self.using_cuda_graph_this_step(),
+            pending_admission=pending_admission,
+            resume_pending=resume_pending,
+            evict_pending=evict_pending,
+            forced_pause_overflow=forced_pause_overflow,
+            chunked_prefill_active=chunked_prefill_active,
+            graph_recapture=graph_recapture,
+            mtp_layout_change=self.num_speculative_tokens > 0,
+            kv_reservation_fits=kv_reservation_fits,
+        )
+
+    def prestage_next_decode_step_into_cpu_staging(
+        self,
+        *,
+        pending_admission: bool = False,
+        resume_pending: bool = False,
+        evict_pending: bool = False,
+        forced_pause_overflow: bool = False,
+        graph_recapture: bool = False,
+    ) -> "PrestagedDecodePlan":
+        """Build the next decode step's launch plan into the CPU staging buffer.
+
+        Speculating no finish this step, predict the next forward's plan from the *committed*
+        layout and:
+
+        * classify launch eligibility from committed state + KV headroom; if ineligible, return
+          an empty plan carrying the static skip reason (no staging writes, no leases);
+        * snapshot the pre-compaction active request ids the launched forward is consumed by
+          (consume-by-request-id, never by row);
+        * build the next forward's MHA metadata into the CPU *staging* MHA views via the C4
+          in-place advance -- ``prev_kv_seq_lengths = request_kv_length_offsets`` so the advance's
+          ``+1`` yields ``kv_offsets + query_lengths`` (the decode rebuild formula), robust to the
+          per-step attention-state reset;
+        * record the read-only lease manifest (current last-block KV ids, the boundary crossers
+          that would each need exactly one new block, mamba slots).
+
+        MUST NOT mutate any live CPU tensor, the KV/mamba allocators, or the single GPU buffer:
+        it writes only the staging buffer and clones the request-id snapshot. Actual allocation /
+        boundary-block adoption + the two-step retire are performed by the overlap launch path
+        that consumes the plan (a later commit).
+        """
+        from megatron.core.inference.engines.step_transaction import (
+            PrestagedDecodePlan,
+            classify_launch_eligibility,
+        )
+
+        assert (
+            self.enable_async_scheduling and self.decode_metadata_buffer is not None
+        ), "prestage requires async scheduling"
+
+        signals = self.build_launch_signals(
+            pending_admission=pending_admission,
+            resume_pending=resume_pending,
+            evict_pending=evict_pending,
+            forced_pause_overflow=forced_pause_overflow,
+            graph_recapture=graph_recapture,
+        )
+        decision = classify_launch_eligibility(signals)
+        if not decision.eligible:
+            return PrestagedDecodePlan(
+                step_id=self.step_count, eligible=False, skip_reason=decision.reason
+            )
+
+        bs = self.total_request_count - self.paused_request_count
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+
+        # Snapshot the pre-compaction active request-id set (consume-by-request-id). Clone so a
+        # later compaction of the live request_ids never perturbs the snapshot.
+        snapshot_request_ids = self.request_ids[active_slice].detach().clone()
+
+        # Build the next forward's MHA metadata into the STAGING views (never live / GPU). For
+        # plain decode, query_lengths == 1, so request_kv_length_offsets + 1 == kv_offsets +
+        # query_lengths -- exactly the rebuild's kv_seq_lengths.
+        self.advance_decode_metadata_in_place(
+            bs=bs,
+            prev_kv_seq_lengths=self.request_kv_length_offsets[active_slice],
+            committed_block_table=self.request_to_kv_block_ids[active_slice],
+            out_query_lengths=self._staging_mha_query_lengths,
+            out_cu_query=self._staging_mha_cu_query_seq_lengths,
+            out_kv_seq_lengths=self._staging_mha_kv_seq_lengths,
+            out_cu_kv=self._staging_mha_cu_kv_seq_lengths,
+            out_block_table=self._staging_mha_block_table,
+        )
+
+        # Read-only lease manifest: the KV blocks + mamba slots the forward would touch, and the
+        # boundary crossers that would each need exactly one new block (as (request_id, column)).
+        kv_block_leases = [
+            int(b) for b in self.request_last_kv_block_id[active_slice].tolist() if int(b) >= 0
+        ]
+        reserved_boundary_blocks = []
+        for li in self._boundary_crosser_local_indices().tolist():
+            row = self.paused_request_count + li
+            req_id = int(self.request_ids[row].item())
+            block_column = int(self.request_kv_block_counts[row].item())
+            reserved_boundary_blocks.append((req_id, block_column))
+        mamba_slot_leases = []
+        if self.is_hybrid_model and self.mamba_metadata is not None:
+            mamba_slot_leases = [
+                int(s)
+                for s in self.mamba_metadata.request_to_mamba_state_idx[active_slice].tolist()
+                if int(s) >= 0
+            ]
+
+        return PrestagedDecodePlan(
+            step_id=self.step_count,
+            eligible=True,
+            snapshot_request_ids=snapshot_request_ids,
+            active_request_count=bs,
+            kv_block_leases=kv_block_leases,
+            reserved_boundary_blocks=reserved_boundary_blocks,
+            mamba_slot_leases=mamba_slot_leases,
+            kv_blocks_needed=len(reserved_boundary_blocks),
+        )
+
+    def publish_prepared_decode_plan(self, plan: "PrestagedDecodePlan") -> None:
+        """Swap a prestaged plan's staging MHA metadata into the live buffer + token-excluded H2D.
+
+        The launch-before-commit "publish": copy the staging MHA byte-region into the live
+        coalesced buffer (so the live ``_cpu_mha_*`` views now hold the predicted next step),
+        then issue the single coalesced H2D with the token-id region EXCLUDED (the sampled ids
+        are scattered onto the single GPU buffer separately, C4). For an ineligible plan this is a
+        no-op.
+
+        This commit lands the publish *mechanic* and validates it produces the same live MHA
+        region as a from-scratch rebuild. Wiring publish into the live forward-launch ordering --
+        so it runs in the current forward's shadow before the next launch -- is the overlap
+        commit's job.
+        """
+        if not plan.eligible:
+            return
+        assert self.decode_metadata_buffer is not None, "publish requires async scheduling"
+        s, e = self._mha_region_byte_start, self._mha_region_byte_end
+        self._cpu_bookkeeping_buf[s:e].copy_(self._cpu_staging_buf[s:e])
+        self.transfer_bookkeeping_to_gpu(include_token_to_input_ids=False)
 
     def reset_tensors(self) -> None:
         """Fill all bookkeeping tensors with sentinel values."""
