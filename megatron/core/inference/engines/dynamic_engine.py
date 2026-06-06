@@ -1138,6 +1138,7 @@ class DynamicInferenceEngine(AbstractEngine):
         accepted_tokens: torch.Tensor,
         log_probs: torch.Tensor,
         top_n_logprobs: Optional[Dict[int, List[Tuple[torch.Tensor, torch.Tensor]]]] = None,
+        accepted_tokens_by_request_id: Optional[Dict[int, List[int]]] = None,
         log_probs_by_request_id: Optional[Dict[int, List[float]]] = None,
         top_n_logprobs_by_request_id: Optional[
             Dict[int, List[Tuple[torch.Tensor, torch.Tensor]]]
@@ -1159,6 +1160,7 @@ class DynamicInferenceEngine(AbstractEngine):
             log_probs: (List): Log probs for each request
             top_n_logprobs: (Dict): Top-n log probs for each request. Maps request_idx to
                 list of (top_n_logprobs, top_n_indices) tuples.
+            accepted_tokens_by_request_id: Accepted speculative tokens keyed by request id.
             log_probs_by_request_id: Log probs keyed by request id after commit.
             top_n_logprobs_by_request_id: Top-n log probs keyed by request id after commit.
             finished_routing_block_ids: (Dict[int, List[int]]): Block IDs for
@@ -1195,8 +1197,14 @@ class DynamicInferenceEngine(AbstractEngine):
                 blocks_ref_count = None
 
         # When accepted_tokens is None (no speculative decoding), use repeat([]) to provide
-        # empty lists for each request, so the zip produces the correct number of iterations
-        accepted_tokens_iter = repeat([]) if accepted_tokens is None else accepted_tokens.tolist()
+        # empty lists for each request, so the zip produces the correct number of iterations.
+        if accepted_tokens_by_request_id is not None:
+            accepted_tokens_iter = (
+                accepted_tokens_by_request_id.get(int(request_id), [])
+                for request_id in request_id_list
+            )
+        else:
+            accepted_tokens_iter = repeat([]) if accepted_tokens is None else accepted_tokens.tolist()
 
         if self.num_speculative_tokens > 0 and accepted_tokens is not None:
             self._spec_steps += 1
@@ -1895,6 +1903,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 accepted_tokens,
                 log_probs,
                 top_n_logprobs,
+                accepted_tokens_by_request_id=step_result.get("accepted_tokens_by_request_id"),
                 log_probs_by_request_id=log_probs_by_request_id,
                 top_n_logprobs_by_request_id=top_n_logprobs_by_request_id,
                 pre_fwd_active_token_count=context_state.get("active_token_count"),
