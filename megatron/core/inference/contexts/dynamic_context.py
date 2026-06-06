@@ -5,7 +5,7 @@ import math
 import operator
 import warnings
 from contextlib import nullcontext
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch  # type: ignore
 import torch.nn.functional as F  # type: ignore
@@ -263,6 +263,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Transactional async scheduling (launch-before-commit) opt-in. When False,
         # the decode step is byte-for-byte identical to the legacy serial path.
         self.enable_async_scheduling = inference_config.enable_async_scheduling
+
+        # C4: whether the authoritative next-step decode input ids currently live on
+        # the single GPU metadata buffer (placed there by an in-place GPU token scatter
+        # rather than a CPU write + H2D). When True, the upcoming coalesced H2D excludes
+        # the leading token_to_input_ids region so it does not clobber the scattered ids.
+        # Only ever set on the async path for clean steady-state decode transitions;
+        # always False (so the H2D is full, exactly as on main) when async is disabled.
+        self._decode_token_ids_live_on_gpu = False
 
         # Prefix caching configuration
         self.enable_prefix_caching = inference_config.enable_prefix_caching
@@ -1241,6 +1249,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         # commits.
         self.decode_metadata_buffer: Optional[DecodeMetadataBuffer] = None
         self.cpu_staging_ring: Optional[DepthTwoRing] = None
+        # Byte span of the leading token_to_input_ids field (offset 0, int64 x max_tokens)
+        # within the coalesced buffer. The token-excluded H2D (C4) copies _buf[this:]
+        # only, leaving the GPU-scattered token ids intact.
+        self._token_ids_byte_count = self.max_tokens * 8
         if self.enable_async_scheduling:
             self.decode_metadata_buffer = DecodeMetadataBuffer(gpu_view=self.gpu_view)
             # Pinned mirror (matches `_cpu_bookkeeping_buf`) so the staging->GPU H2D is a
@@ -1251,6 +1263,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.cpu_staging_ring = DepthTwoRing.of(
                 self._cpu_bookkeeping_buf, self._cpu_staging_buf
             )
+            # Reusable CUDA event recorded after each coalesced H2D into the single GPU
+            # buffer (the buffer's h2d_done_event). Allocated lazily on first transfer.
+            self._h2d_done_event: Optional[Any] = None
 
         # Cache of (input_ids_view, pos_ids_view) keyed by num_tokens. Instead of slicing and
         # unsqueezing on every new inference step (constructing new TensorImpls at 30-60 us),
@@ -2356,7 +2371,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_ssm_states[:, indices] = 0.0
             self._pending_mamba_zeros.clear()
 
-    def transfer_bookkeeping_to_gpu(self) -> None:
+    def transfer_bookkeeping_to_gpu(self, include_token_to_input_ids: Optional[bool] = None) -> None:
         """Batch transfer CPU bookkeeping state to GPU staging buffers.
 
         Called after initialize_attention_state() and before the forward pass.
@@ -2368,7 +2383,20 @@ class DynamicInferenceContext(BaseInferenceContext):
         Request-level staging slots are refreshed from the persistent CPU
         tensors immediately before the H2D (GPU reads them at `[:n_active]`
         while CPU bookkeeping keeps them at `[paused_count:total_count)`).
+
+        Args:
+            include_token_to_input_ids (Optional[bool]): Whether to include the leading
+                ``token_to_input_ids`` region in the H2D. ``None`` (the default) derives
+                it from context state: the region is EXCLUDED only on the async path
+                when the next step's input ids already live on the single GPU buffer via
+                an in-place token scatter (C4) and this is a decode-only step -- so the
+                H2D never clobbers the scattered ids. When async is disabled this is
+                always ``True``, i.e. the H2D is the same full copy as on main.
         """
+        if include_token_to_input_ids is None:
+            include_token_to_input_ids = not (
+                self._decode_token_ids_live_on_gpu and self.is_decode_only()
+            )
         n_active = self.total_request_count - self.paused_request_count
         active_slice = slice(self.paused_request_count, self.total_request_count)
         padded_active = max(n_active, self.padded_active_request_count)
@@ -2405,7 +2433,27 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Copying the whole (max_tokens + max_requests)-sized buffer including
         # unused slots is cheap (~71 KB total, ~3-5 us on PCIe Gen4) and saves
         # 8 redundant launch overheads vs. the prior per-field copies.
-        self.gpu_view._buf.copy_(self._cpu_bookkeeping_buf, non_blocking=True)
+        #
+        # C4: when the next-step input ids already live on the single GPU buffer
+        # (placed there by an in-place token scatter), exclude the leading
+        # token_to_input_ids region (`_token_ids_byte_count` bytes at offset 0) so
+        # the copy does not clobber them. The remainder of the buffer -- pos ids,
+        # block idx, request staging, MHA metadata, and (hybrid) mamba metadata --
+        # is still a single contiguous cudaMemcpyAsync.
+        if include_token_to_input_ids:
+            self.gpu_view._buf.copy_(self._cpu_bookkeeping_buf, non_blocking=True)
+        else:
+            tib = self._token_ids_byte_count
+            self.gpu_view._buf[tib:].copy_(self._cpu_bookkeeping_buf[tib:], non_blocking=True)
+
+        # Record the H2D completion fence on the single decode metadata buffer (async
+        # only). C4 only records it; the launch-before-commit pipeline (C5) is what
+        # waits on it (before reusing the pinned buffer / before relaunching).
+        if self.decode_metadata_buffer is not None:
+            if self._h2d_done_event is None:
+                self._h2d_done_event = torch.cuda.Event()
+            self._h2d_done_event.record()
+            self.decode_metadata_buffer.h2d_done_event = self._h2d_done_event
 
         # MHA metadata GPU views were already bound to state_data in
         # initialize_attention_state(); the H2D above populates the underlying
@@ -2416,8 +2464,93 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_metadata.load_from_cpu(self._pending_mamba_transfer)
             self._pending_mamba_transfer = None
 
+    def scatter_decode_tokens_to_gpu(self, sampled_tokens_cuda: Tensor) -> None:
+        """In-place GPU scatter of the just-sampled ids into ``token_to_input_ids``.
+
+        For a plain (``num_speculative_tokens == 0``) steady-state decode transition,
+        the next step's input ids are exactly this step's sampled tokens, one per active
+        request in identity order -- the same values ``update_requests`` writes into the
+        CPU ``token_to_input_ids[:active_token_count]``. This writes them directly into
+        the single GPU metadata buffer with NO device->host round trip, so the next
+        step's coalesced H2D can exclude the token-id region (see
+        ``transfer_bookkeeping_to_gpu``). The buffer's captured graph reads
+        ``token_to_input_ids`` at its absolute address, which this scatter writes in
+        place; the buffer is never moved.
+
+        The caller is responsible for gating this to the clean steady-state decode case
+        (no finishes, no paused requests, decode-only, plain decode). For all other
+        transitions the legacy CPU write + full H2D path is used unchanged.
+        """
+        assert self.decode_metadata_buffer is not None, "scatter requires async scheduling"
+        assert self.num_speculative_tokens == 0, "C4 token scatter is plain-decode only"
+        n = self.active_token_count
+        dst = self.gpu_view.token_to_input_ids
+        # Identity scatter of the active rows; .copy_() handles the dtype cast (sampled
+        # ids may be int32/int64 while token_to_input_ids is int64). No .cpu() anywhere.
+        dst[:n].copy_(sampled_tokens_cuda[:n])
+
+    @staticmethod
+    def advance_decode_metadata_in_place(
+        *,
+        bs: int,
+        prev_kv_seq_lengths: Tensor,
+        committed_block_table: Tensor,
+        out_query_lengths: Tensor,
+        out_cu_query: Tensor,
+        out_kv_seq_lengths: Tensor,
+        out_cu_kv: Tensor,
+        out_block_table: Tensor,
+    ) -> None:
+        """Advance one plain decode step's MHA metadata IN PLACE (no full rebuild).
+
+        ``initialize_attention_state`` rebuilds the flash-attention MHA metadata from
+        scratch every step. For a plain (``num_speculative_tokens == 0``) decode step
+        whose active set and graph bucket are unchanged, the same result is reachable by
+        a cheap incremental advance of the *previous* step's metadata:
+
+        * ``query_lengths`` are all ``1`` and ``cu_query`` is ``[0, 1, 2, ...]`` -- both
+          invariant across plain decode steps.
+        * each request's ``kv_seq_length`` grows by exactly its (unit) query length, so
+          ``kv_seq_lengths[:bs] = prev_kv_seq_lengths[:bs] + 1`` and ``cu_kv`` is the
+          recomputed prefix sum.
+        * ``block_table`` is invariant except that a boundary-crossing request's last
+          entry points at its newly reserved block; both are captured by reading the
+          committed ``request_to_kv_block_ids`` (which ``update_requests`` already
+          advanced) -- exactly the source the from-scratch rebuild reads.
+
+        This is the mechanism the launch-before-commit prestage (C5) uses to build the
+        next step's metadata in the current forward's shadow. C4 lands and proves it
+        equals the from-scratch rebuild (see the unit battery) while the serial step
+        keeps using the rebuild as the authoritative source.
+
+        Args:
+            bs (int): the real (unpadded) decode request count.
+            prev_kv_seq_lengths (Tensor): the previous step's ``kv_seq_lengths[:bs]``.
+            committed_block_table (Tensor): the committed ``request_to_kv_block_ids`` rows
+                for the active slice (``[bs, max_kv_blocks]``).
+            out_* (Tensor): destination views (the CPU staging MHA fields). Padded rows are
+                left untouched (the caller pads them exactly as the rebuild does).
+        """
+        # query_lengths are unit for plain decode; cu_query = [0, 1, ..., bs].
+        out_query_lengths[:bs] = 1
+        out_cu_query[: bs + 1] = torch.arange(bs + 1, dtype=out_cu_query.dtype, device='cpu')
+
+        # kv_seq_lengths advance by the (unit) query length; cu_kv is the prefix sum.
+        out_kv_seq_lengths[:bs] = prev_kv_seq_lengths[:bs] + 1
+        out_cu_kv[0] = 0
+        if bs > 0:
+            out_cu_kv[1 : bs + 1] = torch.cumsum(out_kv_seq_lengths[:bs], dim=0)
+
+        # block_table tracks the committed physical KV block ids (advanced already by
+        # update_requests, including any boundary-crossing reallocation).
+        out_block_table[:bs] = committed_block_table[:bs]
+
     def reset_tensors(self) -> None:
         """Fill all bookkeeping tensors with sentinel values."""
+
+        # A full reset clears the CPU token ids; the GPU token region is no longer the
+        # authoritative source, so the next H2D must include it again (C4).
+        self._decode_token_ids_live_on_gpu = False
 
         # Reset request indexes.
         self.request_ids.fill_(-1)

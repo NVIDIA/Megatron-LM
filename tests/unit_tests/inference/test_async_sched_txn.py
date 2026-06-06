@@ -44,6 +44,7 @@ from tests.unit_tests.inference.engines.test_dynamic_engine import (
     DynamicEngineTestConfig,
     DynamicInferenceEngineTestBase,
     set_rounder,
+    skip_if_mamba_sequence_packing_not_available,
 )
 from tests.unit_tests.test_utilities import Utils
 
@@ -903,3 +904,266 @@ class TestPerRequestKeyedRNG:
             eager=True,
         )
         assert torch.equal(batched, again)
+
+
+@pytest.mark.skipif(
+    not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+)
+class TestC4SingleBufferDecode(AsyncSchedTxnTestBase):
+    """C4: single in-place GPU metadata buffer + token-excluded H2D + GPU token scatter.
+
+    The async decode step now places the next step's input ids on the single GPU metadata
+    buffer with an in-place scatter (no D2H round trip) and excludes the token-id region
+    from the coalesced H2D. The in-place metadata advance is landed + proven equal to the
+    from-scratch rebuild. Everything is gated behind ``enable_async_scheduling``; the bar is
+    token-exact ``async == serial``.
+    """
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+        )
+
+    @classmethod
+    def teardown_class(cls):
+        delete_cuda_graphs()
+        set_rounder(64)
+        Utils.destroy_model_parallel()
+
+    # --- (C) in-place metadata advance == from-scratch rebuild --------------------
+
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_inplace_advance_equals_rebuild(self) -> None:
+        """The in-place MHA advance reproduces the from-scratch rebuild, incl. a boundary.
+
+        Drives a real GPT decode with a small KV block size (so requests cross block
+        boundaries mid-generation) and, for every consecutive pair of same-batch decode
+        steps, checks that advancing the *previous* step's MHA metadata in place yields the
+        exact metadata ``initialize_attention_state`` rebuilt from scratch.
+        """
+        set_rounder(4)
+        # KV block size must be a multiple of 256 (flash-attn paged-KV constraint), so a
+        # boundary crossing is forced with a long prompt (250) + a short generation: the
+        # sequence crosses the first 256-token block boundary a few decode steps in.
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                model_provider="gpt",
+                num_requests=1,
+                num_gap_steps=0,
+                min_prompt_length=250,
+                max_prompt_length=250,
+                num_tokens_to_generate=20,
+                enable_async_scheduling=True,
+            )
+        )
+        context = env.engine.context
+
+        snapshots: list = []
+        original_init = context.initialize_attention_state
+
+        def capturing_init(*args, **kwargs):
+            original_init(*args, **kwargs)
+            # Only capture real (non graph-capture) decode-only steps.
+            if context.is_creating_cuda_graphs or not context.is_decode_only():
+                snapshots.append(None)
+                return
+            bs = context.num_decode_requests
+            snapshots.append(
+                {
+                    "bs": bs,
+                    "query_lengths": context._cpu_mha_query_lengths[:bs].clone(),
+                    "cu_query": context._cpu_mha_cu_query_seq_lengths[: bs + 1].clone(),
+                    "kv_seq_lengths": context._cpu_mha_kv_seq_lengths[:bs].clone(),
+                    "cu_kv": context._cpu_mha_cu_kv_seq_lengths[: bs + 1].clone(),
+                    "block_table": context._cpu_mha_block_table[:bs].clone(),
+                }
+            )
+
+        context.initialize_attention_state = capturing_init
+        try:
+            env.engine._add_request(env.requests[0])
+            while env.engine.has_unfinished_requests():
+                self._run_step(env)
+        finally:
+            context.initialize_attention_state = original_init
+
+        max_req = context.max_requests
+        scratch = {
+            "query_lengths": torch.zeros(max_req, dtype=torch.int32),
+            "cu_query": torch.zeros(max_req + 1, dtype=torch.int32),
+            "kv_seq_lengths": torch.zeros(max_req, dtype=torch.int32),
+            "cu_kv": torch.zeros(max_req + 1, dtype=torch.int32),
+            "block_table": torch.full(
+                (max_req, context.max_kv_block_count), -1, dtype=torch.int32
+            ),
+        }
+
+        verified_pairs = 0
+        boundary_pairs = 0
+        for prev, cur in zip(snapshots, snapshots[1:]):
+            if prev is None or cur is None or prev["bs"] != cur["bs"] or cur["bs"] == 0:
+                continue
+            bs = cur["bs"]
+            context.advance_decode_metadata_in_place(
+                bs=bs,
+                prev_kv_seq_lengths=prev["kv_seq_lengths"],
+                committed_block_table=cur["block_table"],
+                out_query_lengths=scratch["query_lengths"],
+                out_cu_query=scratch["cu_query"],
+                out_kv_seq_lengths=scratch["kv_seq_lengths"],
+                out_cu_kv=scratch["cu_kv"],
+                out_block_table=scratch["block_table"],
+            )
+            assert torch.equal(scratch["query_lengths"][:bs], cur["query_lengths"])
+            assert torch.equal(scratch["cu_query"][: bs + 1], cur["cu_query"])
+            assert torch.equal(scratch["kv_seq_lengths"][:bs], cur["kv_seq_lengths"]), (
+                f"in-place kv_seq advance != rebuild: "
+                f"prev={prev['kv_seq_lengths']} -> got {scratch['kv_seq_lengths'][:bs]} "
+                f"expected {cur['kv_seq_lengths']}"
+            )
+            assert torch.equal(scratch["cu_kv"][: bs + 1], cur["cu_kv"])
+            assert torch.equal(scratch["block_table"][:bs], cur["block_table"])
+            verified_pairs += 1
+            if not torch.equal(prev["block_table"], cur["block_table"]):
+                boundary_pairs += 1
+
+        assert verified_pairs > 0, "no same-batch decode pairs were verified"
+        assert boundary_pairs > 0, "no block-boundary crossing exercised (tune block size)"
+
+    # --- (D) single GPU buffer never moves across decode steps --------------------
+
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_buffer_data_ptr_invariant_across_decode(self) -> None:
+        """The single GPU metadata buffer (and cached input/pos views) never move."""
+        set_rounder(4)
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                model_provider="gpt",
+                num_requests=4,
+                num_gap_steps=1,
+                num_tokens_to_generate=8,
+                enable_async_scheduling=True,
+            )
+        )
+        context = env.engine.context
+        base_ptrs = set()
+        for request in env.requests:
+            env.engine._add_request(request)
+            for _ in range(env.config.num_gap_steps):
+                self._run_step(env)
+                base_ptrs.add(context.decode_metadata_buffer.base_ptr)
+        while env.engine.has_unfinished_requests():
+            self._run_step(env)
+            base_ptrs.add(context.decode_metadata_buffer.base_ptr)
+
+        assert len(base_ptrs) == 1, f"GPU metadata buffer moved across steps: {base_ptrs}"
+        # The live guard recorded the captured address; it equals the live buffer address.
+        buf = context.decode_metadata_buffer
+        assert buf.base_ptr == buf._captured_base_ptr == next(iter(base_ptrs))
+
+    # --- (A) token-excluded H2D leaves the GPU-scattered token region intact -------
+
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_h2d_excludes_scattered_token_region(self) -> None:
+        """``transfer_bookkeeping_to_gpu(include_token_to_input_ids=False)`` preserves the
+        GPU token-id region (scattered) while still transferring every other field."""
+        set_rounder(4)
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                model_provider="gpt",
+                num_requests=2,
+                num_gap_steps=0,
+                num_tokens_to_generate=4,
+                enable_async_scheduling=True,
+            )
+        )
+        context = env.engine.context
+        # Step into a valid decode state.
+        env.engine._add_request(env.requests[0])
+        env.engine._add_request(env.requests[1])
+        self._run_step(env)
+
+        n = 6
+        device = context.gpu_view.token_to_input_ids.device
+        scattered = torch.arange(1000, 1000 + n, device=device, dtype=torch.long)
+        context.gpu_view.token_to_input_ids[:n].copy_(scattered)
+        # CPU token region holds DIFFERENT values; a token-excluded H2D must NOT apply them.
+        context.token_to_input_ids[:n] = torch.arange(2000, 2000 + n, dtype=torch.long)
+        # A non-token field (token_to_pos_ids) the H2D MUST transfer.
+        context.token_to_pos_ids[:n] = torch.arange(7, 7 + n, dtype=torch.long)
+
+        context.transfer_bookkeeping_to_gpu(include_token_to_input_ids=False)
+        torch.cuda.synchronize()
+
+        assert torch.equal(
+            context.gpu_view.token_to_input_ids[:n], scattered
+        ), "token-excluded H2D clobbered the GPU-scattered token ids"
+        assert torch.equal(
+            context.gpu_view.token_to_pos_ids[:n].cpu(),
+            torch.arange(7, 7 + n, dtype=torch.long),
+        ), "token-excluded H2D failed to transfer a non-token field"
+
+        # The H2D fence was recorded on the single buffer.
+        assert context.decode_metadata_buffer.h2d_done_event is not None
+
+        # A full H2D (include=True) DOES overwrite the token region from the CPU buffer.
+        context.transfer_bookkeeping_to_gpu(include_token_to_input_ids=True)
+        torch.cuda.synchronize()
+        assert torch.equal(
+            context.gpu_view.token_to_input_ids[:n].cpu(),
+            torch.arange(2000, 2000 + n, dtype=torch.long),
+        ), "full H2D should transfer the CPU token region"
+
+    # --- (B) end-to-end token-exact async == serial -------------------------------
+
+    @pytest.mark.internal
+    def test_async_equals_serial_torch_nongreedy_reshaping(self) -> None:
+        """Torch non-greedy decode, reshaping batches (staggered finishes)."""
+        self.assert_async_equals_serial(
+            model_provider="gpt",
+            num_requests=8,
+            num_gap_steps=1,
+            num_tokens_to_generate=24,
+            use_fixed_output_lengths=True,
+        )
+
+    @pytest.mark.internal
+    def test_async_equals_serial_greedy_reshaping(self) -> None:
+        """Greedy (argmax) decode, reshaping batches + boundaries -- token-exact."""
+        from unittest import mock
+
+        base_build = AsyncSchedTxnTestBase._build_requests
+
+        def greedy_build(cls, test_config):
+            requests = base_build(test_config)
+            for request in requests:
+                request.sampling_params.top_k = 1  # argmax => greedy, no RNG draws
+            return requests
+
+        with mock.patch.object(type(self), "_build_requests", classmethod(greedy_build)):
+            self.assert_async_equals_serial(
+                model_provider="gpt",
+                num_requests=8,
+                num_gap_steps=1,
+                num_tokens_to_generate=24,
+                use_fixed_output_lengths=True,
+            )
+
+    @pytest.mark.internal
+    def test_async_equals_serial_hybrid_decode(self) -> None:
+        """Hybrid (mamba) decode stays token-exact -- the scatter/exclusion path also fires
+        for hybrid steady-state decode (single coalesced H2D still carries mamba metadata)."""
+        skip_if_mamba_sequence_packing_not_available("hybrid")
+        self.assert_async_equals_serial(
+            model_provider="hybrid",
+            num_requests=4,
+            num_gap_steps=1,
+            num_tokens_to_generate=16,
+        )

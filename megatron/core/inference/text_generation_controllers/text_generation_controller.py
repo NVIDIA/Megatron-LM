@@ -615,11 +615,28 @@ class TextGenerationController:
         # If we are running a dummy forward step we want to use the token count agreed upon
         # by all EP ranks rather than the minimum number of tokens.
         if construct_graph_dimensions is not None and not is_dummy_forward:
-            return context.current_input_and_position_ids(
+            input_ids, position_ids = context.current_input_and_position_ids(
                 num_warmup_tokens=construct_graph_dimensions.token_count
             )
         else:
-            return context.current_input_and_position_ids()
+            input_ids, position_ids = context.current_input_and_position_ids()
+
+        # C4: assert the single GPU metadata buffer (and the cached input/position views
+        # the captured decode graph reads at absolute addresses) never moves across decode
+        # steps. A reallocation would make graph replay read freed/foreign memory; this
+        # turns that into a loud failure. Skipped during graph capture / dummy forwards.
+        if (
+            context.decode_metadata_buffer is not None
+            and context.is_decode_only()
+            and not context.is_creating_cuda_graphs
+            and construct_graph_dimensions is None
+            and not is_dummy_forward
+        ):
+            context.decode_metadata_buffer.assert_pointer_invariant(
+                input_ids.data_ptr(), position_ids.data_ptr()
+            )
+
+        return input_ids, position_ids
 
     def _dynamic_step_forward_logits(self, input_ids: Tensor, position_ids: Tensor):
         """Forward step the model to get logits for dynamic batching.
@@ -1625,6 +1642,12 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
         active_request_slice = slice(context.paused_request_count, context.total_request_count)
 
+        # C4: capture whether the step just run was decode-only BEFORE update_requests
+        # (which flips every prefill request to decode, so is_decode_only() would read
+        # True afterwards regardless). Used to gate the in-place GPU token scatter to
+        # clean steady-state decode->decode transitions only.
+        was_decode_only = context.is_decode_only()
+
         # Batch GPU-to-CPU transfer of all sampled tokens.
         range_push("transfer_samples_to_cpu")
         sampled_tokens_cpu, sampled_mtp_tokens_cpu = self._transfer_samples_to_cpu(
@@ -1694,6 +1717,29 @@ class TextGenerationController:
             active_request_mask, new_sample_copy, sampled_mtp_tokens_cpu
         )
         range_pop()
+
+        # C4: in-place GPU token scatter for clean steady-state plain decode. When the
+        # step just run was decode-only and nothing reshaped the active set (no finishes,
+        # no paused requests, plain decode), the next step's input ids are exactly this
+        # step's sampled tokens in identity order -- the same values update_requests just
+        # wrote into the CPU token_to_input_ids[:active_token_count]. Scatter them onto the
+        # single GPU buffer directly (no extra D2H) and mark the region GPU-authoritative
+        # so the next coalesced H2D excludes it. Any other transition (prefill, finish,
+        # pause, MTP) leaves the flag False and uses the legacy CPU write + full H2D path,
+        # so async stays byte-identical to serial. Off entirely when async is disabled.
+        scattered = False
+        if (
+            context.decode_metadata_buffer is not None
+            and context.num_speculative_tokens == 0
+            and was_decode_only
+            and context.paused_request_count == 0
+            and finished_idxs.numel() == 0
+            and context.active_token_count > 0
+        ):
+            context.scatter_decode_tokens_to_gpu(self._sampled_tokens_cuda)
+            scattered = True
+        if context.enable_async_scheduling:
+            context._decode_token_ids_live_on_gpu = scattered
 
         return {
             "active_request_ids": active_request_ids,
@@ -1837,6 +1883,10 @@ class TextGenerationController:
                 request_bookkeeping = {
                     "sample": self._sampled_tokens_cuda[:active_request_count].cpu()
                 }
+                # No update_requests / token scatter ran this step; the next H2D must
+                # include the token-id region again (C4).
+                if context.enable_async_scheduling:
+                    context._decode_token_ids_live_on_gpu = False
             else:
                 # request_bookkeeping supplies "sample" as the already-CPU
                 # tensor produced by _transfer_samples_to_cpu.
