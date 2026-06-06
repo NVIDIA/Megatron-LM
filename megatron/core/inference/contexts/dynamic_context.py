@@ -1520,6 +1520,29 @@ class DynamicInferenceContext(BaseInferenceContext):
             self._input_position_views.clear()
         return slot
 
+    def bind_decode_slot_for_forward(
+        self, slot: Optional[AsyncDecodeSlot] = None
+    ) -> Optional[AsyncDecodeSlot]:
+        """Bind a decode slot and make per-step metadata ready for a forward.
+
+        Async child forwards can be launched from transactionally prepared GPU
+        bookkeeping without re-running initialize_attention_state() on every
+        participating rank. Slot binding therefore owns the final forward-time
+        invariant: active MHA/Mamba metadata must point at the bound slot and at
+        the graph/non-graph metadata family selected by the prepared shape.
+        """
+
+        slot = self.bind_decode_slot(slot)
+        if slot is None:
+            return None
+        self.active_attn_metadata = (
+            self.graph_attn_metadata  # type: ignore[assignment]
+            if self.using_cuda_graph_this_step()
+            else self.non_graph_attn_metadata  # type: ignore[assignment]
+        )
+        self._refresh_active_metadata_views_for_bound_slot()
+        return slot
+
     def _refresh_active_metadata_views_for_bound_slot(self) -> None:
         """Rebuild active per-step metadata slices after switching decode slots."""
 

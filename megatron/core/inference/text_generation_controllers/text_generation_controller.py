@@ -977,7 +977,11 @@ class TextGenerationController:
         )
         range_pop()
 
-        context.bind_decode_slot(child_slot)
+        bind_slot_for_forward = getattr(context, "bind_decode_slot_for_forward", None)
+        if bind_slot_for_forward is not None:
+            bind_slot_for_forward(child_slot)
+        else:
+            context.bind_decode_slot(child_slot)
         input_ids, position_ids = context.current_input_and_position_ids()
 
         sample_to_launch_latency_us = None
