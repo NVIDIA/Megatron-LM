@@ -1650,9 +1650,7 @@ def _worker_gtp_ddp_bucket_alignment(rank, world_size, port):
     # The module fixture initialized model_parallel without GTP; re-init with GTP=2.
     ps.destroy_model_parallel()
     ps.initialize_model_parallel(
-        tensor_model_parallel_size=1,
-        pipeline_model_parallel_size=1,
-        gtp_remat_size=2,
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=2
     )
 
     orig_pad = gtp_module.GTP_CONFIG.pad_for_alignment
@@ -1671,15 +1669,10 @@ def _worker_gtp_ddp_bucket_alignment(rank, world_size, port):
         wrap_module_params_gtp(model.fc1, ["weight"], gtp_group)
 
         config = TransformerConfig(
-            num_attention_heads=1,
-            num_layers=1,
-            hidden_size=4,
-            tensor_model_parallel_size=1,
+            num_attention_heads=1, num_layers=1, hidden_size=4, tensor_model_parallel_size=1
         )
         ddp_config = DistributedDataParallelConfig(
-            use_distributed_optimizer=True,
-            overlap_grad_reduce=True,
-            bucket_size=3,
+            use_distributed_optimizer=True, overlap_grad_reduce=True, bucket_size=3
         )
 
         # Without the fix this raises AssertionError at param_and_grad_buffer.py:1427:
