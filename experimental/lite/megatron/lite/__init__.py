@@ -6,23 +6,25 @@ import importlib
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from megatron.lite.runtime.backends.lite.config import DebugConfig, LiteConfig
-    from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig
+    from megatron.lite.runtime.backends.mlite.config import DebugConfig, MegatronLiteConfig
+    from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig, RuntimeConfig
 
 __all__ = [
     "DebugConfig",
-    "LiteConfig",
+    "MegatronLiteConfig",
     "OptimizerConfig",
     "ParallelConfig",
+    "RuntimeConfig",
 ]
 
 
 def __getattr__(name: str):
     _lazy = {
-        "LiteConfig": "megatron.lite.runtime.backends.lite.config",
-        "DebugConfig": "megatron.lite.runtime.backends.lite.config",
-        "OptimizerConfig": "megatron.lite.runtime.contracts.config",
-        "ParallelConfig": "megatron.lite.runtime.contracts.config",
+        "DebugConfig": "megatron.lite.runtime.backends.mlite.config",
+        "MegatronLiteConfig": "megatron.lite.runtime.backends.mlite.config",
+        "OptimizerConfig": "megatron.lite.runtime.contracts",
+        "ParallelConfig": "megatron.lite.runtime.contracts",
+        "RuntimeConfig": "megatron.lite.runtime.contracts",
     }
     if name in _lazy:
         mod = importlib.import_module(_lazy[name])

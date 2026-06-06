@@ -33,6 +33,11 @@ Hugging Face `model_type` values `qwen3_moe` and `qwen2_moe` resolve to
 megatron.lite.model.qwen3_5.lite.protocol
 ```
 
+## Acknowledgements
+
+The Qwen3 MoE LoRA adapter support follows Mind-Lab's PEFT/Mint-compatible
+adapter work. Thanks to Mind-Lab for the reference implementation and guidance.
+
 ## Adding A Model
 
 Add a model package under `model/`, then register it in

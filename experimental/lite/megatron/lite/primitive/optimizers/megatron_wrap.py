@@ -14,9 +14,9 @@ from megatron.lite.primitive.protocols import ExpertClassifierFn, default_expert
 
 def validate_mc_config(engine_cfg) -> None:
     """Guard the current proof-of-concept surface for mc."""
-    if engine_cfg.model_name not in {"qwen3", "qwen3_moe", "qwen3_5"}:
+    if engine_cfg.model_name not in {"qwen3_moe", "qwen3_5"}:
         raise ValueError(
-            "optimizer_impl='mc' currently supports only qwen3 and qwen3_5."
+            "optimizer_impl='mc' currently supports only qwen3_moe and qwen3_5."
         )
     p = engine_cfg.parallel
     if p.vpp > 1 and p.pp == 1:
@@ -75,7 +75,7 @@ def _ensure_mc_mpu_parallel_state(engine_cfg) -> None:
 def build_mc_optimizer_config(opt, *, override_optimizer_config: dict[str, Any] | None = None):
     """Build MC OptimizerConfig from user's OptimizerConfig (duck-typed).
 
-    Single source of truth for the lite `build_mc_stack` path.
+    Single source of truth for Megatron Lite's Megatron-Core optimizer stack.
 
     Works on either `runtime.contracts.config.OptimizerConfig` (real dataclass)
     or a `SimpleNamespace` with the same field names (legacy lite path).
@@ -128,13 +128,10 @@ def build_mc_stack(
 
     Args:
         skip_ddp_wrap: when True, ``model_chunks`` are assumed to already be
-            MC ``DistributedDataParallel``-wrapped (e.g. produced by
-            ``mbridge.AutoBridge.get_model(wrap_with_ddp=True, ...)``); we skip
-            our own wrapping and feed them directly to the optimizer. Use this
-            when matching bridge backend behaviour bit-for-bit — mbridge fills
-            ``DistributedDataParallelConfig`` with different field defaults
-            than our explicit 3-field construction below, and the bucket
-            layout influences optimizer master-grad sharding.
+            MC ``DistributedDataParallel``-wrapped; we skip our own wrapping
+            and feed them directly to the optimizer. The bucket layout
+            influences optimizer master-grad sharding, so callers that prewrap
+            chunks own the DDP config compatibility.
     """
     from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
     from megatron.core.distributed.finalize_model_grads import finalize_model_grads
@@ -160,13 +157,9 @@ def build_mc_stack(
     pg_collection = None if use_mpu_groups else _build_pg_collection(ps, engine_cfg)
 
     if skip_ddp_wrap:
-        # Caller already wrapped (e.g. bridge.get_model(wrap_with_ddp=True)).
-        # Do NOT run `_mark_mc_parallel_attrs` here — bridge backend never
-        # calls it either. mbridge's internal
-        # `set_defaults_if_not_set_tensor_model_parallel_attributes` has
-        # already marked every param; our helper setting `param.allreduce`
-        # on dense params could clash with MC code paths that distinguish
-        # `hasattr(param,'allreduce')` from `getattr(..., True)`.
+        # Caller already wrapped and marked every param. Our helper setting
+        # `param.allreduce` on dense params could clash with MC code paths that
+        # distinguish `hasattr(param,'allreduce')` from `getattr(..., True)`.
         wrapped_chunks = list(model_chunks)
     else:
         ddp_config = DistributedDataParallelConfig(
@@ -191,13 +184,13 @@ def build_mc_stack(
                 )
             )
 
-    # Single-source-of-truth OptimizerConfig construction.
+    # Single-source-of-truth OptimizerConfig construction for native lite
+    # model protocols.
     opt_config = build_mc_optimizer_config(opt)
 
     # This branch falls back to MC mpu globals for the optimizer's process
-    # groups. Long term, primitive code should not rely on mpu globals; fix
-    # `_build_pg_collection` below so its groups match MC's rank-ordering,
-    # then always pass our own `pg_collection`.
+    # groups. Long term, this primitive should always pass its own
+    # `pg_collection`.
     if skip_ddp_wrap or use_mpu_groups:
         optimizer = get_megatron_optimizer(
             config=opt_config,
@@ -224,6 +217,7 @@ def build_mc_training_optimizer(
     model_name: str,
     is_expert: ExpertClassifierFn | None = None,
     skip_ddp_wrap: bool = False,
+    deterministic: bool | None = None,
 ):
     """Build the MC DDP+optimizer stack from a Megatron Lite model ImplConfig."""
 
@@ -239,12 +233,16 @@ def build_mc_training_optimizer(
             adam_beta2=None,
             adam_eps=None,
         )
+    if deterministic is None:
+        from megatron.lite.primitive.deterministic import deterministic_requested
+
+        deterministic = deterministic_requested()
 
     engine_cfg = SimpleNamespace(
         model_name=model_name,
         parallel=impl_cfg.parallel,
         optimizer=opt,
-        deterministic=getattr(impl_cfg, "deterministic", False),
+        deterministic=bool(deterministic),
     )
     model_chunks[:], optimizer = build_mc_stack(
         model_chunks,
@@ -298,11 +296,10 @@ def _mark_mc_parallel_attrs(
 ) -> None:
     """Mark per-param MC metadata (allreduce / tensor_model_parallel / sequence_parallel).
 
-    IMPORTANT: respect attrs that are already set — mbridge-built MC models
+    IMPORTANT: respect attrs that are already set. Prewrapped MC models may
     mark these correctly per-param (e.g. `moe.router.weight` is 2D but
-    TP-replicated, and must NOT have `tensor_model_parallel=True`).
-    Blind override would cause MC grad-norm to over-count replicated params
-    (one overcount per TP rank) and shift grad_norm by ~1-2%.
+    TP-replicated, and must NOT have `tensor_model_parallel=True`). Blind
+    override would cause MC grad-norm to over-count replicated params.
     """
     sp_param_ids = {id(param) for param in getattr(model, "sp_params", [])}
     for name, param in model.named_parameters():

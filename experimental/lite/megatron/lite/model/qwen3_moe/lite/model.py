@@ -17,6 +17,7 @@ from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts
 from megatron.lite.primitive.modules.gqa import GQAttention
+from megatron.lite.primitive.modules.lora import LoraConfig
 from megatron.lite.primitive.modules.router import TopKRouter
 from megatron.lite.primitive.ops.cross_entropy import vocab_parallel_cross_entropy
 from megatron.lite.primitive.ops.linear_cross_entropy import linear_cross_entropy
@@ -48,15 +49,22 @@ class MoELayer(nn.Module):
         router_bias_rate: float = 0.0,
         fp8: bool = False,
         moe_act_recompute: bool = False,
+        lora_config: LoraConfig | dict | None = None,
     ):
         super().__init__()
-        # Mirror bridge's `load_balancing_type="none"` for Qwen3-MoE: no aux loss.
+        # Match Qwen3-MoE's `load_balancing_type="none"` setting: no aux loss.
         self.router = TopKRouter(
             config, ps,
             router_bias_rate=router_bias_rate,
             compute_aux_loss=False,
         )
-        self.experts = Experts(config, ps, fp8=fp8, moe_act_recompute=moe_act_recompute)
+        self.experts = Experts(
+            config,
+            ps,
+            fp8=fp8,
+            moe_act_recompute=moe_act_recompute,
+            lora_config=lora_config,
+        )
         self.dispatcher = TokenDispatcher(
             config.num_experts, config.hidden_size, ps, use_deepep=use_deepep,
         )
@@ -122,6 +130,7 @@ class TransformerLayer(nn.Module):
         fp8: bool = False,
         moe_act_recompute: bool = False,
         use_thd: bool = False,
+        lora_config: LoraConfig | dict | None = None,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -129,9 +138,8 @@ class TransformerLayer(nn.Module):
         # Declaration order follows MC's TransformerLayer (self_attention →
         # pre_mlp_layernorm → mlp). `named_parameters()` iterates in
         # declaration order, and MC's `DistributedDataParallel` lays out
-        # gradient buckets by that order; mismatching it would make step-0
-        # fp32 master shard layouts diverge from the MC reference path and break
-        # bitwise alignment from step 1 onwards.
+        # gradient buckets by that order; mismatching it changes fp32 master
+        # shard layouts and breaks bitwise alignment from step 1 onwards.
         self.attn = GQAttention(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
@@ -142,6 +150,7 @@ class TransformerLayer(nn.Module):
             rope_theta=config.rope_theta,
             use_thd=use_thd,
             qkv_layout="mcore",
+            lora_config=lora_config,
         )
         self.mlp_norm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.moe = MoELayer(
@@ -150,6 +159,7 @@ class TransformerLayer(nn.Module):
             router_bias_rate=router_bias_rate,
             fp8=fp8,
             moe_act_recompute=moe_act_recompute,
+            lora_config=lora_config,
         )
 
     def forward(
@@ -209,6 +219,7 @@ class MultiTokenPredictionLayer(nn.Module):
         moe_act_recompute: bool,
         use_thd: bool,
         detach_encoder: bool,
+        lora_config: LoraConfig | dict | None,
     ):
         super().__init__()
         self.ps = ps
@@ -232,6 +243,7 @@ class MultiTokenPredictionLayer(nn.Module):
             fp8=fp8,
             moe_act_recompute=moe_act_recompute,
             use_thd=use_thd,
+            lora_config=lora_config,
         )
         self.final_layernorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -291,6 +303,7 @@ class MultiTokenPredictionBlock(nn.Module):
         use_thd: bool,
         detach_encoder: bool,
         repeated_layer: bool,
+        lora_config: LoraConfig | dict | None,
     ):
         super().__init__()
         self.num_layers = config.num_nextn_predict_layers
@@ -309,6 +322,7 @@ class MultiTokenPredictionBlock(nn.Module):
                     moe_act_recompute=moe_act_recompute,
                     use_thd=use_thd,
                     detach_encoder=detach_encoder,
+                    lora_config=lora_config,
                 )
                 for idx in range(layers_to_build)
             ]
@@ -361,6 +375,7 @@ class Qwen3MoEModel(nn.Module):
         mtp_enable: bool = False,
         mtp_enable_train: bool = False,
         mtp_detach_encoder: bool = False,
+        lora_config: LoraConfig | dict | None = None,
     ):
         super().__init__()
         self.config = config
@@ -391,6 +406,7 @@ class Qwen3MoEModel(nn.Module):
                     fp8=fp8,
                     moe_act_recompute=moe_act_recompute,
                     use_thd=use_thd,
+                    lora_config=lora_config,
                 )
                 for idx in self.layer_indices
             ]
@@ -420,6 +436,7 @@ class Qwen3MoEModel(nn.Module):
                 use_thd=use_thd,
                 detach_encoder=mtp_detach_encoder,
                 repeated_layer=config.mtp_use_repeated_layer,
+                lora_config=lora_config,
             )
 
         self.sp_params: list[nn.Parameter] = []
@@ -444,6 +461,7 @@ class Qwen3MoEModel(nn.Module):
         temperature: float | torch.Tensor = 1.0,
         use_fused_kernels: bool = False,
         calculate_entropy: bool = False,
+        return_log_probs: bool = True,
     ) -> dict:
         if self.embed is not None:
             assert input_ids is not None
@@ -499,8 +517,10 @@ class Qwen3MoEModel(nn.Module):
                         temperature_value,
                         self.ps.tp_group,
                     )
-                    output["loss"] = (-log_probs).mean()
-                    output["log_probs"] = log_probs.transpose(0, 1).contiguous()
+                    token_loss = -log_probs
+                    output["loss"] = token_loss.mean()
+                    if return_log_probs:
+                        output["log_probs"] = log_probs.transpose(0, 1).contiguous()
                     if calculate_entropy:
                         output["entropy"] = entropy.transpose(0, 1).contiguous()
                 else:
@@ -509,7 +529,8 @@ class Qwen3MoEModel(nn.Module):
                         logits = logits / temperature_value
                     token_loss = vocab_parallel_cross_entropy(logits, labels_sb, self.ps.tp_group)
                     output["loss"] = token_loss.mean()
-                    output["log_probs"] = (-token_loss).transpose(0, 1).contiguous()
+                    if return_log_probs:
+                        output["log_probs"] = (-token_loss).transpose(0, 1).contiguous()
                     if calculate_entropy:
                         entropy = vocab_parallel_entropy(logits, self.ps.tp_group)
                         output["entropy"] = entropy.transpose(0, 1).contiguous()

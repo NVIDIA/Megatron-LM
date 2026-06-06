@@ -1,1 +1,1 @@
-"""Qwen3.5 lite sub-package."""
+"""Qwen3.5 lite native sub-package."""

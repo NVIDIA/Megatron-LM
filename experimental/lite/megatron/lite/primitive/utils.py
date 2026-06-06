@@ -19,7 +19,7 @@ def ensure_divisible(numerator: int, denominator: int, msg: str = "") -> int:
 
 def log_rank0(msg: str) -> None:
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-        print(f"[Megatron Lite] {msg}", flush=True)
+        print(f"[megatron.lite] {msg}", flush=True)
 
 
 __all__ = [

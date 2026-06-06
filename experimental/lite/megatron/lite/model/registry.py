@@ -13,7 +13,7 @@ from pathlib import Path
 # model_name → model package module path
 MODEL_PACKAGES: dict[str, str] = {}
 
-# HF model_type string -> Megatron Lite model_name
+# HF model_type string → Megatron Lite model_name
 _HF_MODEL_TYPE_MAP: dict[str, str] = {}
 
 # (model_name, impl) → runtime_model_name
@@ -71,31 +71,26 @@ def register_model(
 # Built-in models
 # ---------------------------------------------------------------------------
 
+_QWEN3_MOE_LITE = "megatron.lite.model.qwen3_moe.lite.protocol"
+
 register_model(
     "qwen3",
     package="megatron.lite.model.qwen3_moe",
     hf_model_types=["qwen3_moe", "qwen2_moe"],
-    impls={
-        "lite": "megatron.lite.model.qwen3_moe.lite.protocol",
-    },
+    impls={"lite": _QWEN3_MOE_LITE},
 )
 
 register_model(
     "qwen3_moe",
     package="megatron.lite.model.qwen3_moe",
-    hf_model_types=None,
-    impls={
-        "lite": "megatron.lite.model.qwen3_moe.lite.protocol",
-    },
+    impls={"lite": _QWEN3_MOE_LITE},
 )
 
 register_model(
     "qwen3_5",
     package="megatron.lite.model.qwen3_5",
     hf_model_types=["qwen3_5_moe"],
-    impls={
-        "lite": "megatron.lite.model.qwen3_5.lite.protocol",
-    },
+    impls={"lite": "megatron.lite.model.qwen3_5.lite.protocol"},
 )
 
 
@@ -156,9 +151,9 @@ def resolve_model_type_from_hf(source: str | Path | dict) -> str:
             hf_config = json.load(f)
 
     hf_model_type = hf_config.get("model_type", "")
-    model_name = _HF_MODEL_TYPE_MAP.get(hf_model_type)
-    if model_name is not None:
-        return model_name
+    native_name = _HF_MODEL_TYPE_MAP.get(hf_model_type)
+    if native_name is not None:
+        return native_name
     raise ValueError(
         f"Cannot resolve model_type={hf_model_type!r}. "
         f"Known: {list(_HF_MODEL_TYPE_MAP)}. Set model_name explicitly."

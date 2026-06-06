@@ -6,10 +6,11 @@ implementations and functionally identical MoEAuxLossAutoScaler implementations.
 The qwen3_moe version is used as the canonical form (adds docstring and named
 intermediate variable for clarity).
 
-Note: this is Megatron Lite's own MoEAuxLossAutoScaler, kept deliberately separate
+Note: this is megatron.lite's own MoEAuxLossAutoScaler, kept deliberately separate
 from MC's `megatron.core.transformer.moe.moe_utils.MoEAuxLossAutoScaler`.
-`runtime/backends/lite/runtime.py` calls `set_loss_scale` on this class to apply
-the 1/num_microbatches aux-loss gradient scale.
+`runtime/backends/mlite/runtime.py` calls `set_loss_scale` on this class to
+apply the 1/num_microbatches aux-loss gradient scale. Megatron-Core MoE modules
+use MC's class directly when they are imported by MC internally.
 """
 
 from __future__ import annotations
@@ -79,3 +80,4 @@ class _AllToAll(torch.autograd.Function):
             group=ctx.group,
         )
         return grad_input, None, None, None
+

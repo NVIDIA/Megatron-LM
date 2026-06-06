@@ -194,6 +194,40 @@ def _reconstruct_full_from_cp_parts(
     return full
 
 
+def reconstruct_packed_from_cp_parts(
+    parts: list[torch.Tensor],
+    *,
+    cu_seqlens_padded: torch.Tensor,
+    cp_size: int,
+    dim: int,
+) -> torch.Tensor:
+    """Reconstruct a full packed THD tensor from CP-local zigzag parts."""
+    return _reconstruct_full_from_cp_parts(
+        parts,
+        cu_seqlens_padded=cu_seqlens_padded,
+        cp_size=cp_size,
+        dim=dim,
+    )
+
+
+def split_packed_to_cp_local(
+    tensor: torch.Tensor,
+    *,
+    cu_seqlens_padded: torch.Tensor,
+    cp_size: int,
+    cp_rank: int,
+    dim: int,
+) -> torch.Tensor:
+    """Slice a full packed THD tensor back to one CP rank's zigzag shard."""
+    return _split_full_to_cp_local(
+        tensor,
+        cu_seqlens_padded=cu_seqlens_padded,
+        cp_size=cp_size,
+        cp_rank=cp_rank,
+        dim=dim,
+    )
+
+
 def _all_gather_cp_tensor(tensor: torch.Tensor, *, cp_size: int, cp_group: Any) -> list[torch.Tensor]:
     if cp_size <= 1:
         return [tensor]
@@ -457,6 +491,8 @@ __all__ = [
     "PackedSeqParams",
     "PackedTHDBatch",
     "pack_nested_thd",
+    "reconstruct_packed_from_cp_parts",
     "roll_packed_thd_left",
+    "split_packed_to_cp_local",
     "unpack_packed_thd_to_nested",
 ]

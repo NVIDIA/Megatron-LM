@@ -39,5 +39,7 @@ The model protocol owns:
 
 ## Current Deliberate Omissions
 
-This package currently includes only the lite path. It intentionally excludes
-hybrid implementations, bridge implementations, and FSDP2 optimizer primitives.
+This package currently includes only the lite model implementation path. It
+intentionally excludes non-lite model/runtime implementations and benchmark
+entrypoints. FSDP2 is included as an optimizer primitive and can be selected by
+model protocols that support it.

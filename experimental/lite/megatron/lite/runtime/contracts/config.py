@@ -12,12 +12,12 @@ def pick_fields(cls, src: dict[str, Any]) -> dict[str, Any]:
     return {f.name: src[f.name] for f in dc_fields(cls) if f.name in src}
 
 if TYPE_CHECKING:
-    from megatron.lite.runtime.backends.lite.config import LiteConfig
+    from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
 
 
 @dataclass
 class ParallelConfig:
-    """Parallel dimensions used by the lite runtime."""
+    """Parallel dimensions used by Megatron Lite."""
 
     tp: int = 1
     etp: int | None = None
@@ -67,14 +67,16 @@ class RuntimeConfig:
     """Top-level runtime configuration.
 
     Attributes:
-        backend: Backend name. Defaults to "lite".
+        backend: Runtime backend name. Use ``"mlite"`` for Megatron Lite.
         hf_path: Path to HuggingFace model directory. Required.
-        backend_cfg: Backend-specific config (LiteConfig or dict).
+        backend_cfg: Megatron Lite backend config or a compatible dict.
     """
 
-    backend: str = "lite"
+    backend: str = "mlite"
     hf_path: str = ""
-    backend_cfg: LiteConfig | dict[str, Any] = field(default_factory=dict)
+    backend_cfg: MegatronLiteConfig | dict[str, Any] = field(
+        default_factory=dict
+    )
 
 
 __all__ = [

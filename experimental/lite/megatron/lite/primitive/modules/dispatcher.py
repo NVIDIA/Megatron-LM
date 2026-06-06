@@ -58,7 +58,7 @@ def _build_deepep_buffer(group: dist.ProcessGroup, hidden_size: int):
 
 
 def _use_moe_permute_fusion() -> bool:
-    return os.environ.get("BUMBLEBEE_MOE_PERMUTE_FUSION", "0") == "1"
+    return os.environ.get("MEGATRON_LITE_MOE_PERMUTE_FUSION", "0") == "1"
 
 
 def _tensor_hidden_bytes(x: torch.Tensor) -> int:
@@ -535,7 +535,7 @@ class TokenDispatcher:
         )[:3]
         self._row_id_map = sorted_indices
         self._restore_shape = recv_hidden.shape
-        if os.environ.get("BUMBLEBEE_DEEPEP_DEBUG_METADATA") == "1":
+        if os.environ.get("MEGATRON_LITE_DEEPEP_DEBUG_METADATA") == "1":
             ep_rank = dist.get_rank(group=self.ps.ep_group)
             print(
                 "[DEEPEP_METADATA] "
@@ -549,7 +549,7 @@ class TokenDispatcher:
                 flush=True,
             )
         if (
-            os.environ.get("BUMBLEBEE_DEEPEP_SKIP_DISPATCH_METADATA_CHECK") != "1"
+            os.environ.get("MEGATRON_LITE_DEEPEP_SKIP_DISPATCH_METADATA_CHECK") != "1"
             and int(local_tpe.sum().item()) != int(dispatched.shape[0])
         ):
             ep_rank = dist.get_rank(group=self.ps.ep_group)

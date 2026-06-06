@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 #
 # For QKV / MoE experts we still prefer the TE path (fused LN+linear, FP8
 # readiness) — this vanilla path is a drop-in substitute only when kernel
-# parity with bridge is required.
+# parity with the reference backend is required.
 # ---------------------------------------------------------------------------
 
 
@@ -271,8 +271,8 @@ def pad_vocab_for_tp(vocab_size: int, tp_size: int) -> int:
     pad to 128-multiple for GEMM alignment, and also require tp-divisibility.
     For typical `tp_size ∈ {1,2,4,...,128}`, `lcm = 128` so a vocab already
     divisible by 128 (e.g. Qwen3-MoE's 151936) stays unchanged — which is
-    what MC's `output_layer` sees, and what the lite logits vocab dim
-    is. Using `128 * tp_size` instead would over-pad (e.g. 151936 → 152064
+    what MC's `output_layer` sees. Using `128 * tp_size` instead would
+    over-pad (e.g. 151936 -> 152064
     at tp=2), introducing 128 extra logits into the vocab-parallel cross-
     entropy log-sum-exp and driving a ~3e-4 loss drift.
     """
@@ -340,7 +340,7 @@ class _ColForLMHead(nn.Module):
         super().__init__()
         if backend == "vanilla":
             # Matches MC's LinearCrossEntropyModule → tensor_parallel.ColumnParallelLinear
-            # kernel bit-for-bit in bf16. Preferred for LM head parity with bridge.
+            # kernel bit-for-bit in bf16. Preferred for LM head parity with the reference backend.
             self.linear = _VanillaColLinear(in_features, out_features, ps, sp=sp)
         elif backend == "te":
             # TE-backed path — cuBLAS algo may differ from MC's torch.matmul
@@ -358,7 +358,7 @@ class _ColForLMHead(nn.Module):
 class VocabParallelOutput(nn.Module):
     """Output projection split across TP on the vocab dimension (column parallel).
 
-    Default backend is `"vanilla"` (torch.matmul) to match bridge backend's
+    Default backend is `"vanilla"` (torch.matmul) to match the reference backend's
     `tensor_parallel.ColumnParallelLinear` bit-for-bit. Pass `backend="te"`
     to use TE's `te.Linear` kernel (e.g. for FP8 inference paths).
     """

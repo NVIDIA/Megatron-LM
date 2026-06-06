@@ -10,7 +10,7 @@ from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConf
 
 @dataclass(slots=True)
 class DebugConfig:
-    """Lite backend debug flags. Not exposed to end users."""
+    """Megatron Lite backend debug flags. Not exposed to end users."""
 
     param_update: bool = False
     optimizer_state: bool = False
@@ -21,12 +21,11 @@ class DebugConfig:
 
 
 @dataclass
-class LiteConfig:
-    """Config for MegatronLiteRuntime.
+class MegatronLiteConfig:
+    """Config for MegatronLiteRuntime (Megatron Lite's default 5D parallel runtime).
 
-    Runtime-specific training features live in ``impl_cfg`` (a plain dict);
-    each model implementation reads the keys it needs through its typed
-    ``ImplConfig``.
+    Megatron Lite-specific training features live in ``impl_cfg`` (a plain dict —
+    each impl reads the keys it needs via its own typed ImplConfig).
     """
 
     # ── identity ──
@@ -34,7 +33,7 @@ class LiteConfig:
     impl: str = "lite"
     hf_path: str = ""
 
-    # ── shared runtime knobs ──
+    # ── parallelism and optimizer ──
     parallel: ParallelConfig = field(default_factory=ParallelConfig)
     optimizer: OptimizerConfig = field(default_factory=OptimizerConfig)
 
@@ -53,11 +52,11 @@ class LiteConfig:
     model_config_hook: Any = None
 
     @classmethod
-    def from_dict(cls, hf_path: str, cfg: dict[str, Any]) -> LiteConfig:
-        """Construct LiteConfig from a flat dict (legacy / OmegaConf path)."""
+    def from_dict(cls, hf_path: str, cfg: dict[str, Any]) -> MegatronLiteConfig:
+        """Construct MegatronLiteConfig from a flat dict (legacy / OmegaConf path)."""
         if "num_microbatches" in cfg:
             raise ValueError(
-                "LiteConfig no longer accepts `num_microbatches`; "
+                "MegatronLiteConfig no longer accepts `num_microbatches`; "
                 "pass it to Runtime.forward_backward(..., num_microbatches=...) instead"
             )
         parallel = ParallelConfig(**pick_fields(ParallelConfig, cfg))
@@ -68,6 +67,8 @@ class LiteConfig:
             if isinstance(opt_d, dict)
             else OptimizerConfig()
         )
+        if isinstance(opt_d, dict) and isinstance(opt_d.get("override_optimizer_config"), dict):
+            optimizer.override_optimizer_config = dict(opt_d["override_optimizer_config"])
 
         # impl_cfg: merge nested dict + top-level overrides
         impl_cfg: dict[str, Any] = {}
@@ -92,6 +93,6 @@ class LiteConfig:
 
 
 __all__ = [
-    "LiteConfig",
+    "MegatronLiteConfig",
     "DebugConfig",
 ]

@@ -1,29 +1,36 @@
-"""Qwen3.5 lite model: uses shared MCoreFullAttn/MCoreGDN/MCoreMoELayer ops."""
+"""Qwen3.5 lite native model.
+
+This implementation keeps the lightweight qwen3_moe/lite composition style
+and does not wrap Megatron-Core layer modules. It still reuses Megatron Lite
+parallel/TE primitives and small Megatron atomic RoPE helpers where those are
+already used by other native Megatron Lite modules.
+"""
 
 from __future__ import annotations
 
-import os
 from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import transformer_engine.pytorch as te
 
 from megatron.lite.model.qwen3_5.config import Qwen35Config
-from megatron.lite.model.qwen3_5.mc_ops import (
-    MCoreContext,
-    MCoreFullAttn,
-    MCoreGDN,
-    MCoreMoELayer,
-    _build_vision_model,
-    build_mcore_context,
-)
+from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
+from megatron.lite.primitive.modules.experts import Experts
+from megatron.lite.primitive.modules.gated_delta_net import GatedDeltaNet
+from megatron.lite.primitive.modules.gqa import GQAttention as FullAttention
+from megatron.lite.primitive.modules.gqa import split_grouped_qkvg as _split_grouped_qkvg
+from megatron.lite.primitive.modules.mrope import MultimodalRotaryEmbedding as Qwen35MRoPE
+from megatron.lite.primitive.modules.mtp import MTPBlock, MTPDecoderLayer, MTPLossAutoScaler
+from megatron.lite.primitive.modules.router import TopKRouter
 from megatron.lite.primitive.ops.cross_entropy import vocab_parallel_cross_entropy
 from megatron.lite.primitive.ops.linear_cross_entropy import linear_cross_entropy
 from megatron.lite.primitive.ops.logprob import vocab_parallel_entropy
 from megatron.lite.primitive.parallel import (
     ColumnParallelLinear,
     ParallelState,
+    RowParallelLinear,
     VocabParallelEmbedding,
     VocabParallelOutput,
     build_pipeline_chunk_layout,
@@ -33,23 +40,20 @@ from megatron.lite.primitive.parallel import (
 )
 from megatron.lite.primitive.utils import build_fp8_recipe
 
-# ---------------------------------------------------------------------------
-# SP gradient suffixes — MC naming: self_attention / pre_mlp_layernorm / mlp
-# ---------------------------------------------------------------------------
-
 _SP_GRAD_SUFFIXES: tuple[str, ...] = (
-    ".self_attention.linear_qkv.layer_norm_weight",
-    ".self_attention.q_layernorm.weight",
-    ".self_attention.k_layernorm.weight",
-    ".self_attention.in_proj.layer_norm_weight",
-    ".self_attention.norm.weight",
-    ".pre_mlp_layernorm.weight",
-    ".mlp.router.weight",
-    ".mlp.shared_experts.gate_weight",
+    ".full_attn.qkv.linear.layer_norm_weight",
+    ".full_attn.q_norm.weight",
+    ".full_attn.k_norm.weight",
+    ".linear_attn.in_proj.linear.layer_norm_weight",
+    ".linear_attn.norm.weight",
+    ".mlp_norm.weight",
+    ".moe.router.gate.weight",
+    ".moe.shared_expert.shared_gate.weight",
     ".enorm.weight",
     ".hnorm.weight",
     ".final_layernorm.weight",
 )
+
 
 def _collect_sp_grad_params(model: nn.Module) -> list[nn.Parameter]:
     params = []
@@ -59,23 +63,109 @@ def _collect_sp_grad_params(model: nn.Module) -> list[nn.Parameter]:
     return params
 
 
-# ---------------------------------------------------------------------------
-# Qwen35Layer
-# ---------------------------------------------------------------------------
+def _swiglu(x: torch.Tensor) -> torch.Tensor:
+    x1, x2 = torch.chunk(x, 2, dim=-1)
+    return F.silu(x1) * x2
 
 
-class Qwen35Layer(nn.Module):
-    """Mixed attention layer: MCoreGDN or MCoreFullAttn + MCoreMoELayer."""
+def _qwen_mrope_section(config: Qwen35Config) -> list[int]:
+    section = getattr(config, "mrope_section", None)
+    if section is not None:
+        return list(section)
+    rotary_half = max(int(config.rotary_dim // 2), 1)
+    base = rotary_half // 3
+    return [base, base, rotary_half - 2 * base]
 
+
+class SharedExpert(nn.Module):
+    _stream: torch.cuda.Stream | None = None
+
+    def __init__(self, config: Qwen35Config, ps: ParallelState):
+        super().__init__()
+        ffn = config.shared_expert_intermediate_size
+        self.gate_up = ColumnParallelLinear(config.hidden_size, ffn * 2, ps, bias=False)
+        self.down = RowParallelLinear(ffn, config.hidden_size, ps, bias=False)
+        self.shared_gate = nn.Linear(config.hidden_size, 1, bias=False)
+
+    @staticmethod
+    def _get_stream() -> torch.cuda.Stream:
+        if SharedExpert._stream is None:
+            SharedExpert._stream = torch.cuda.Stream()
+        return SharedExpert._stream
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate_val = self.shared_gate(x).sigmoid()
+        return self.down(_swiglu(self.gate_up(x))) * gate_val
+
+
+class MoELayer(nn.Module):
     def __init__(
         self,
         config: Qwen35Config,
-        train_config,
+        ps: ParallelState,
+        *,
+        use_deepep: bool,
+        router_bias_rate: float,
+        fp8: bool,
+        moe_act_recompute: bool,
+    ):
+        super().__init__()
+        if fp8:
+            raise NotImplementedError("lite qwen35 MoE fp8 is not implemented yet.")
+        self.router = TopKRouter(
+            config,
+            ps,
+            router_bias_rate=router_bias_rate,
+            compute_aux_loss=True,
+        )
+        self.experts = Experts(config, ps, fp8=fp8, moe_act_recompute=moe_act_recompute)
+        self.dispatcher = TokenDispatcher(
+            config.num_experts,
+            config.hidden_size,
+            ps,
+            use_deepep=use_deepep,
+        )
+        self.shared_expert = SharedExpert(config, ps)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        input_shape = x.shape
+        x_2d = x.reshape(-1, x.size(-1))
+
+        shared_out = None
+        side_stream = None
+        if x_2d.is_cuda:
+            side_stream = SharedExpert._get_stream()
+            side_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side_stream):
+                shared_out = self.shared_expert(x_2d)
+        scores, indices = self.router(x_2d)
+        dispatched, tpe, permuted_probs = self.dispatcher.dispatch(x_2d, scores, indices)
+        del scores, indices
+        self.dispatcher.wait_dispatch_event()
+        expert_out = self.experts(
+            dispatched,
+            tpe,
+            permuted_probs,
+            tokens_per_expert_list=getattr(self.dispatcher, "_local_tpe_list", None),
+        )
+        routed_out = self.dispatcher.combine(expert_out)
+
+        if shared_out is None:
+            shared_out = self.shared_expert(x_2d)
+        else:
+            assert side_stream is not None
+            torch.cuda.current_stream().wait_stream(side_stream)
+        return (routed_out + shared_out).view(input_shape).to(x.dtype)
+
+
+class Qwen35Layer(nn.Module):
+    def __init__(
+        self,
+        config: Qwen35Config,
         ps: ParallelState,
         layer_idx: int,
         *,
-        mcore_context: MCoreContext,
-        use_deepep: bool = True,
+        use_deepep: bool = False,
         router_bias_rate: float = 0.0,
         fp8: bool = False,
         moe_act_recompute: bool = False,
@@ -83,50 +173,48 @@ class Qwen35Layer(nn.Module):
     ):
         super().__init__()
         self.layer_idx = layer_idx
-        layer_type = config.layer_type_at(layer_idx)
-        self._layer_type = layer_type
-        is_mtp_layer = layer_idx >= config.num_hidden_layers
-        mtp_layer_number = layer_idx - config.num_hidden_layers + 1 if is_mtp_layer else None
-
-        if layer_type == "full_attention":
-            self.self_attention: nn.Module = MCoreFullAttn(
-                config,
-                train_config,
-                ps,
-                layer_idx,
-                mcore_context,
-                layer_number=mtp_layer_number,
+        self._layer_type = config.layer_type_at(layer_idx)
+        self.full_attn: FullAttention | None = None
+        self.linear_attn: GatedDeltaNet | None = None
+        if self._layer_type == "full_attention":
+            self.full_attn = FullAttention(
+                hidden_size=config.hidden_size,
+                num_attention_heads=config.num_attention_heads,
+                num_key_value_heads=config.num_key_value_heads,
+                head_dim=config.head_dim,
+                ps=ps,
+                rms_norm_eps=config.rms_norm_eps,
+                rope_theta=config.rope_theta,
+                rotary_percent=config.partial_rotary_factor,
+                use_thd=use_thd,
+                output_gate=True,
+                zero_centered_gamma=True,
+                qkv_layout="mcore",
+                mrope_section=_qwen_mrope_section(config),
             )
         else:
-            self.self_attention = MCoreGDN(
-                config,
-                train_config,
-                ps,
-                layer_idx,
-                mcore_context,
-                layer_number=mtp_layer_number,
+            self.linear_attn = GatedDeltaNet(
+                hidden_size=config.hidden_size,
+                linear_num_key_heads=config.linear_num_key_heads,
+                linear_key_head_dim=config.linear_key_head_dim,
+                linear_num_value_heads=config.linear_num_value_heads,
+                linear_value_head_dim=config.linear_value_head_dim,
+                linear_conv_kernel_dim=config.linear_conv_kernel_dim,
+                rms_norm_eps=config.rms_norm_eps,
+                ps=ps,
             )
-
-        self.pre_mlp_layernorm = te.RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, zero_centered_gamma=True
+        self.mlp_norm = te.RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            zero_centered_gamma=True,
         )
-        self.mlp: nn.Module = MCoreMoELayer(
+        self.moe = MoELayer(
             config,
-            train_config,
             ps,
-            layer_idx,
-            mcore_context,
-            layer_number=mtp_layer_number,
-            is_mtp_layer=is_mtp_layer,
-        )
-
-        # D3: verify mc_ops classes are used (not reverted to lite-specific impls)
-        assert isinstance(self.self_attention, MCoreFullAttn | MCoreGDN), (
-            f"Qwen35Layer[{layer_idx}] self_attention is {type(self.self_attention).__name__}, "
-            f"expected MCoreFullAttn or MCoreGDN"
-        )
-        assert isinstance(self.mlp, MCoreMoELayer), (
-            f"Qwen35Layer[{layer_idx}] mlp is {type(self.mlp).__name__}, expected MCoreMoELayer"
+            use_deepep=use_deepep,
+            router_bias_rate=router_bias_rate,
+            fp8=fp8,
+            moe_act_recompute=moe_act_recompute,
         )
 
     def forward(
@@ -136,188 +224,15 @@ class Qwen35Layer(nn.Module):
         packed_seq_params=None,
     ) -> torch.Tensor:
         residual = x
-        if self._layer_type == "full_attention":
-            h = self.self_attention(x, position_ids=position_ids, packed_seq_params=packed_seq_params)
+        if self.full_attn is not None:
+            h = self.full_attn(x, position_ids=position_ids, packed_seq_params=packed_seq_params)
         else:
-            h = self.self_attention(x, packed_seq_params=packed_seq_params)
+            assert self.linear_attn is not None
+            h = self.linear_attn(x, position_ids=position_ids, packed_seq_params=packed_seq_params)
         x = residual + h
-
         residual = x
-        h = self.pre_mlp_layernorm(x)
-        h = self.mlp(h)
-        x = residual + h
+        x = residual + self.moe(self.mlp_norm(x))
         return x
-
-
-class MTPLossAutoScaler(torch.autograd.Function):
-    main_loss_backward_scale: float = 1.0
-
-    @staticmethod
-    def forward(ctx, output: torch.Tensor, mtp_loss: torch.Tensor):
-        ctx.save_for_backward(mtp_loss)
-        return output
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
-        (mtp_loss,) = ctx.saved_tensors
-        scaled_mtp_grad = torch.ones_like(mtp_loss) * MTPLossAutoScaler.main_loss_backward_scale
-        return grad_output, scaled_mtp_grad
-
-    @staticmethod
-    def set_loss_scale(scale: torch.Tensor | float) -> None:
-        if isinstance(scale, torch.Tensor):
-            scale = float(scale.detach().float().item())
-        MTPLossAutoScaler.main_loss_backward_scale = float(scale)
-
-
-class Qwen35MTPLayer(nn.Module):
-    def __init__(
-        self,
-        config: Qwen35Config,
-        train_config,
-        ps: ParallelState,
-        layer_idx: int,
-        *,
-        mcore_context: MCoreContext,
-        embedding: VocabParallelEmbedding,
-        router_bias_rate: float,
-        use_thd: bool,
-        detach_encoder: bool,
-    ):
-        super().__init__()
-        self.ps = ps
-        self.layer_idx = layer_idx
-        self.embedding = embedding
-        self.detach_encoder = detach_encoder
-        self.enorm = te.RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, zero_centered_gamma=True
-        )
-        self.hnorm = te.RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, zero_centered_gamma=True
-        )
-        self.eh_proj = ColumnParallelLinear(
-            config.hidden_size * 2,
-            config.hidden_size,
-            ps,
-            gather_output=True,
-            sequence_parallel=ps.tp_size > 1,
-        )
-        self.transformer_layer = Qwen35Layer(
-            config,
-            train_config,
-            ps,
-            config.num_hidden_layers + layer_idx,
-            mcore_context=mcore_context,
-            use_deepep=train_config.use_deepep,
-            router_bias_rate=router_bias_rate,
-            fp8=train_config.fp8,
-            moe_act_recompute=(
-                "moe_act" in train_config.recompute_modules
-                and "moe" not in train_config.recompute_modules
-            ),
-            use_thd=use_thd,
-        )
-        self.final_layernorm = te.RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, zero_centered_gamma=True
-        )
-
-    def forward(
-        self,
-        *,
-        input_ids: torch.Tensor,
-        position_ids: torch.Tensor | None,
-        hidden_states: torch.Tensor,
-        rotary_position_ids: torch.Tensor | None = None,
-        packed_seq_params=None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        attention_position_ids = rotary_position_ids if rotary_position_ids is not None else position_ids
-        input_ids, _ = roll_packed_thd_left(
-            input_ids,
-            packed_seq_params=packed_seq_params,
-            dims=-1,
-        )
-        if position_ids is not None:
-            position_ids, _ = roll_packed_thd_left(
-                position_ids,
-                packed_seq_params=packed_seq_params,
-                dims=-1,
-            )
-        decoder_input = self.embedding(input_ids)
-        decoder_input = scatter_to_sequence_parallel(decoder_input, self.ps)
-
-        if self.detach_encoder:
-            decoder_input = decoder_input.detach()
-            hidden_states = hidden_states.detach()
-
-        decoder_input = self.enorm(decoder_input)
-        hidden_states = self.hnorm(hidden_states)
-        hidden_states = torch.cat((decoder_input, hidden_states), dim=-1)
-        hidden_states = self.eh_proj(hidden_states)
-        hidden_states = scatter_to_sequence_parallel(hidden_states, self.ps)
-        hidden_states = self.transformer_layer(
-            hidden_states,
-            position_ids=attention_position_ids,
-            packed_seq_params=packed_seq_params,
-        )
-        hidden_states = self.final_layernorm(hidden_states)
-        return hidden_states, input_ids, position_ids
-
-
-class Qwen35MTPBlock(nn.Module):
-    def __init__(
-        self,
-        config: Qwen35Config,
-        train_config,
-        ps: ParallelState,
-        *,
-        mcore_context: MCoreContext,
-        embedding: VocabParallelEmbedding,
-        router_bias_rate: float,
-        use_thd: bool,
-        detach_encoder: bool,
-    ):
-        super().__init__()
-        self.num_layers = config.num_nextn_predict_layers
-        layers_to_build = 1 if config.mtp_use_repeated_layer else self.num_layers
-        self.repeated_layer = config.mtp_use_repeated_layer
-        self.layers = nn.ModuleList(
-            [
-                Qwen35MTPLayer(
-                    config,
-                    train_config,
-                    ps,
-                    idx,
-                    mcore_context=mcore_context,
-                    embedding=embedding,
-                    router_bias_rate=router_bias_rate,
-                    use_thd=use_thd,
-                    detach_encoder=detach_encoder,
-                )
-                for idx in range(layers_to_build)
-            ]
-        )
-
-    def forward(
-        self,
-        *,
-        input_ids: torch.Tensor,
-        position_ids: torch.Tensor | None,
-        hidden_states: torch.Tensor,
-        packed_seq_params=None,
-    ) -> list[torch.Tensor]:
-        outputs: list[torch.Tensor] = []
-        rotary_position_ids = position_ids
-        for depth in range(self.num_layers):
-            layer = self.layers[0] if self.repeated_layer else self.layers[depth]
-            hidden_states, input_ids, position_ids = layer(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                rotary_position_ids=rotary_position_ids,
-                hidden_states=hidden_states,
-                packed_seq_params=packed_seq_params,
-            )
-            outputs.append(hidden_states)
-        return outputs
 
 
 def _temperature_to_float(temperature: float | torch.Tensor) -> float:
@@ -338,20 +253,10 @@ def _ensure_mrope_position_ids(position_ids: torch.Tensor | None) -> torch.Tenso
             return position_ids.expand(3, -1, -1).contiguous()
         if position_ids.shape[0] == 3:
             return position_ids
-    raise ValueError(
-        "Qwen3.5 multimodal RoPE expects position_ids with shape (B, S), "
-        "(1, B, S), or (3, B, S)."
-    )
-
-
-# ---------------------------------------------------------------------------
-# Qwen35Model
-# ---------------------------------------------------------------------------
+    raise ValueError("Qwen3.5 MRoPE expects position_ids shape (B,S), (1,B,S), or (3,B,S).")
 
 
 class Qwen35Model(nn.Module):
-    """Qwen3.5 lite: Embedding → N×Qwen35Layer → RMSNorm → Output (PP-aware)."""
-
     def __init__(
         self,
         config: Qwen35Config,
@@ -359,7 +264,7 @@ class Qwen35Model(nn.Module):
         ps: ParallelState,
         *,
         vpp_chunk_id: int | None = None,
-        router_bias_rate: float = 0.001,
+        router_bias_rate: float = 0.0,
         use_thd: bool = False,
         hf_path: str = "",
         attention_backend_override: str | None = None,
@@ -368,6 +273,7 @@ class Qwen35Model(nn.Module):
         mtp_detach_encoder: bool = False,
     ):
         super().__init__()
+        del hf_path, attention_backend_override
         self.config = config
         self.train_config = train_config
         self.ps = ps
@@ -375,58 +281,30 @@ class Qwen35Model(nn.Module):
         self.mtp_loss_scaling_factor = config.mtp_loss_scaling_factor
         self._input_tensor: torch.Tensor | None = None
 
-        layout = build_pipeline_chunk_layout(
-            config.num_hidden_layers, ps, train_config.vpp, vpp_chunk_id,
-        )
+        layout = build_pipeline_chunk_layout(config.num_hidden_layers, ps, train_config.vpp, vpp_chunk_id)
         self.layer_indices = layout.layer_indices
         has_embed = layout.has_embed
         has_head = layout.has_head
         self.pre_process = has_embed
         self.post_process = has_head
         self.share_embeddings_and_output_weights = False
-
-        use_deepep = train_config.use_deepep
-        fp8 = train_config.fp8
-        deterministic_embedding = getattr(train_config, "deterministic_embedding", None)
-        if deterministic_embedding is None:
-            deterministic_embedding = bool(getattr(train_config, "deterministic", False))
-        moe_act_recompute = (
-            "moe_act" in train_config.recompute_modules
-            and "moe" not in train_config.recompute_modules
-        )
-        mcore_context = build_mcore_context(
-            config, train_config, hf_path=hf_path,
-            attention_backend_override=attention_backend_override,
-            vp_stage=vpp_chunk_id,
-        )
-        self.mbridge_bridge = mcore_context.bridge
-
-        # vision_model registered before embed to match Qwen3_5VLModel param order
-        if has_embed:
-            self.vision_model: nn.Module | None = _build_vision_model(self.mbridge_bridge)
-        else:
-            self.vision_model = None
+        self.vision_model: nn.Module | None = None
 
         self.embed: VocabParallelEmbedding | None = None
         if has_embed:
-            self.embed = VocabParallelEmbedding(
-                config.vocab_size,
-                config.hidden_size,
-                ps,
-                deterministic=deterministic_embedding,
-            )
+            self.embed = VocabParallelEmbedding(config.vocab_size, config.hidden_size, ps)
 
+        recompute_modules = getattr(train_config, "recompute_modules", [])
+        moe_act_recompute = "moe_act" in recompute_modules and "moe" not in recompute_modules
         self.layers = nn.ModuleList(
             [
                 Qwen35Layer(
                     config,
-                    train_config,
                     ps,
                     idx,
-                    mcore_context=mcore_context,
-                    use_deepep=use_deepep,
+                    use_deepep=train_config.use_deepep,
                     router_bias_rate=router_bias_rate,
-                    fp8=fp8,
+                    fp8=train_config.fp8,
                     moe_act_recompute=moe_act_recompute,
                     use_thd=use_thd,
                 )
@@ -441,26 +319,36 @@ class Qwen35Model(nn.Module):
             self.head = VocabParallelOutput(config.vocab_size, config.hidden_size, ps)
 
         self.mtp_embed: VocabParallelEmbedding | None = None
-        self.mtp: Qwen35MTPBlock | None = None
+        self.mtp: MTPBlock | None = None
         if mtp_enable and config.num_nextn_predict_layers > 0 and self.head is not None:
             mtp_embedding = self.embed
             if mtp_embedding is None:
-                mtp_embedding = VocabParallelEmbedding(
-                    config.vocab_size,
-                    config.hidden_size,
-                    ps,
-                    deterministic=deterministic_embedding,
-                )
+                mtp_embedding = VocabParallelEmbedding(config.vocab_size, config.hidden_size, ps)
                 self.mtp_embed = mtp_embedding
-            self.mtp = Qwen35MTPBlock(
-                config,
-                train_config,
-                ps,
-                mcore_context=mcore_context,
-                embedding=mtp_embedding,
-                router_bias_rate=router_bias_rate,
-                use_thd=use_thd,
-                detach_encoder=mtp_detach_encoder,
+
+            def make_mtp_layer(layer_idx: int) -> MTPDecoderLayer:
+                return MTPDecoderLayer(
+                    hidden_size=config.hidden_size,
+                    rms_norm_eps=config.rms_norm_eps,
+                    ps=ps,
+                    embedding=mtp_embedding,
+                    transformer_layer=Qwen35Layer(
+                        config,
+                        ps,
+                        config.num_hidden_layers + layer_idx,
+                        use_deepep=train_config.use_deepep,
+                        router_bias_rate=router_bias_rate,
+                        fp8=train_config.fp8,
+                        moe_act_recompute=moe_act_recompute,
+                        use_thd=use_thd,
+                    ),
+                    detach_encoder=mtp_detach_encoder,
+                )
+
+            self.mtp = MTPBlock(
+                num_layers=config.num_nextn_predict_layers,
+                repeated_layer=config.mtp_use_repeated_layer,
+                layer_factory=make_mtp_layer,
             )
 
         self.sp_params: list[nn.Parameter] = []
@@ -496,19 +384,13 @@ class Qwen35Model(nn.Module):
             h = hidden_states
 
         if packed_seq_params is not None:
-            assert position_ids is not None, (
-                "THD path requires caller-supplied position_ids with shape (3, 1, T)"
-            )
+            assert position_ids is not None, "THD path requires caller-supplied MRoPE position_ids."
         elif position_ids is None and input_ids is not None:
-            from megatron.core import parallel_state as mpu  # pyright: ignore[reportMissingImports]
-            if mpu.is_initialized() and mpu.get_context_parallel_world_size() > 1:
-                raise ValueError(
-                    "CP>1 requires caller-supplied FULL position_ids (3, B, S); "
-                    "cannot auto-build from CP-sliced input_ids."
-                )
-            _b, _s = input_ids.shape
-            _pos = torch.arange(_s, device=input_ids.device, dtype=torch.long)
-            position_ids = _pos.unsqueeze(0).unsqueeze(0).expand(3, _b, _s).contiguous()
+            if self.ps.cp_size > 1:
+                raise ValueError("CP>1 requires caller-supplied FULL position_ids (3,B,S).")
+            batch, seq = input_ids.shape
+            pos = torch.arange(seq, device=input_ids.device, dtype=torch.long)
+            position_ids = pos.unsqueeze(0).unsqueeze(0).expand(3, batch, seq).contiguous()
         position_ids = _ensure_mrope_position_ids(position_ids)
 
         fp8_ctx = (
@@ -516,7 +398,6 @@ class Qwen35Model(nn.Module):
             if self.train_config.fp8
             else nullcontext()
         )
-
         with fp8_ctx:
             if self.embed is not None:
                 h = scatter_to_sequence_parallel(h, self.ps)
@@ -525,6 +406,7 @@ class Qwen35Model(nn.Module):
 
         output = {"hidden_states": h}
         if self.head is not None:
+            assert self.norm is not None
             hidden_for_head = self.norm(h)
             if labels is not None:
                 temperature_value = _temperature_to_float(temperature)
@@ -546,7 +428,7 @@ class Qwen35Model(nn.Module):
                     hidden_full = gather_from_sequence_parallel(hidden_for_head, self.ps)
                     log_probs, entropy = linear_cross_entropy(
                         hidden_full,
-                        self.head.col.linear.weight,
+                        self._head_weight_for_fused_ce(hidden_full),
                         labels_sb,
                         temperature_value,
                         self.ps.tp_group,
@@ -565,7 +447,7 @@ class Qwen35Model(nn.Module):
                     if calculate_entropy:
                         entropy = vocab_parallel_entropy(logits, self.ps.tp_group)
                         output["entropy"] = entropy.transpose(0, 1).contiguous()
-            if labels is None:
+            else:
                 logits = self.head(hidden_for_head)
                 output["logits"] = self.head.gather(logits).transpose(0, 1).contiguous()
         return output
@@ -597,16 +479,11 @@ class Qwen35Model(nn.Module):
             hidden_states=hidden_states,
             packed_seq_params=packed_seq_params,
         )
-
         mtp_labels = labels.clone()
         mtp_loss_mask = loss_mask.clone()
         mtp_loss_values = []
         for mtp_hidden in mtp_hidden_states:
-            mtp_labels, _ = roll_packed_thd_left(
-                mtp_labels,
-                packed_seq_params=packed_seq_params,
-                dims=-1,
-            )
+            mtp_labels, _ = roll_packed_thd_left(mtp_labels, packed_seq_params=packed_seq_params, dims=-1)
             mtp_loss_mask, num_tokens = roll_packed_thd_left(
                 mtp_loss_mask,
                 packed_seq_params=packed_seq_params,
@@ -614,18 +491,18 @@ class Qwen35Model(nn.Module):
             )
             labels_sb = mtp_labels.transpose(0, 1).contiguous()
             mask_sb = mtp_loss_mask.transpose(0, 1).contiguous()
-
             if use_fused_kernels:
                 mtp_hidden_full = gather_from_sequence_parallel(mtp_hidden, self.ps)
                 log_probs, _entropy = linear_cross_entropy(
                     mtp_hidden_full,
-                    self.head.col.linear.weight,
+                    self._head_weight_for_fused_ce(mtp_hidden_full),
                     labels_sb,
                     temperature,
                     self.ps.tp_group,
                 )
                 token_loss = -log_probs
             else:
+                assert self.head is not None
                 logits = self.head(mtp_hidden)
                 if temperature != 1.0:
                     logits = logits / temperature
@@ -633,14 +510,27 @@ class Qwen35Model(nn.Module):
             token_loss = token_loss * mask_sb.to(dtype=token_loss.dtype)
             num_tokens = num_tokens.to(dtype=token_loss.dtype).clamp_min(1.0)
             mtp_loss_values.append(token_loss.sum() / num_tokens)
-
             mtp_loss_scale = self.mtp_loss_scaling_factor / max(len(mtp_hidden_states), 1)
             hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_scale * token_loss / num_tokens)
 
         if not mtp_loss_values:
             return None
-        mtp_loss = torch.stack([loss.detach().float() for loss in mtp_loss_values]).mean()
-        return hidden_states, mtp_loss
+        return hidden_states, torch.stack([loss.detach().float() for loss in mtp_loss_values]).mean()
+
+    def _head_weight_for_fused_ce(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        assert self.head is not None
+        weight = self.head.col.linear.weight
+        return weight if weight.dtype == hidden_states.dtype else weight.to(dtype=hidden_states.dtype)
 
 
-__all__ = ["MTPLossAutoScaler", "Qwen35Layer", "Qwen35MTPBlock", "Qwen35MTPLayer", "Qwen35Model"]
+__all__ = [
+    "FullAttention",
+    "GatedDeltaNet",
+    "MoELayer",
+    "MTPLossAutoScaler",
+    "Qwen35MRoPE",
+    "Qwen35Layer",
+    "Qwen35Model",
+    "SharedExpert",
+    "_split_grouped_qkvg",
+]

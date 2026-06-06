@@ -17,7 +17,7 @@ from megatron.lite.primitive.ckpt.dcp import (  # noqa: F401 — re-export
     decanon_fc1_after_dcp,
     decanon_qkv_after_dcp,
 )
-from megatron.lite.primitive.ckpt.hf_bridge import extract_layer_idx, parse_expert_idx
+from megatron.lite.primitive.ckpt.hf_weights import extract_layer_idx, parse_expert_idx
 
 
 def _pack_mcore_qkv(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, config: Qwen3MoEConfig) -> torch.Tensor:
@@ -109,8 +109,8 @@ class Qwen3MoEWeightSpec:
                 ]
         return wm
 
-    def hf_to_native(self, lite_name: str, hf_tensors: list[torch.Tensor]) -> torch.Tensor:
-        if len(hf_tensors) == 3 and "qkv" in lite_name:
+    def hf_to_native(self, native_name: str, hf_tensors: list[torch.Tensor]) -> torch.Tensor:
+        if len(hf_tensors) == 3 and "qkv" in native_name:
             # Match MCore SelfAttention's local qkv packing:
             # [q heads for kv-group 0, k0, v0, q heads for kv-group 1, k1, v1, ...].
             return _pack_mcore_qkv(*hf_tensors, self.config)
@@ -118,43 +118,43 @@ class Qwen3MoEWeightSpec:
             # gate + up → concat
             return torch.cat(hf_tensors, dim=0)
         t = hf_tensors[0]
-        if "router.gate.weight" in lite_name:
+        if "router.gate.weight" in native_name:
             return t[: self.config.num_experts]
         return t
 
-    def native_to_hf(self, lite_name: str, tensor: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
+    def native_to_hf(self, native_name: str, tensor: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
         c = self.config
-        if lite_name == "mtp_embed.embedding.weight":
+        if native_name == "mtp_embed.embedding.weight":
             return []
-        if lite_name.startswith("mtp.layers."):
-            parts = lite_name.split(".")
+        if native_name.startswith("mtp.layers."):
+            parts = native_name.split(".")
             mtp_idx = int(parts[2])
             hf_li = c.num_hidden_layers + mtp_idx
             hp = f"model.layers.{hf_li}"
-            if lite_name.endswith(".enorm.weight"):
+            if native_name.endswith(".enorm.weight"):
                 return [(f"{hp}.enorm.weight", tensor)]
-            if lite_name.endswith(".hnorm.weight"):
+            if native_name.endswith(".hnorm.weight"):
                 return [(f"{hp}.hnorm.weight", tensor)]
-            if lite_name.endswith(".eh_proj.linear.weight"):
+            if native_name.endswith(".eh_proj.linear.weight"):
                 return [(f"{hp}.eh_proj.weight", tensor)]
-            if lite_name.endswith(".final_layernorm.weight"):
+            if native_name.endswith(".final_layernorm.weight"):
                 return [(f"{hp}.shared_head.norm.weight", tensor)]
-            proxy = lite_name.replace(f"mtp.layers.{mtp_idx}.transformer_layer", f"layers.{hf_li}")
+            proxy = native_name.replace(f"mtp.layers.{mtp_idx}.transformer_layer", f"layers.{hf_li}")
             return self.native_to_hf(proxy, tensor)
-        if "embed" in lite_name and "embedding" in lite_name:
+        if "embed" in native_name and "embedding" in native_name:
             return [("model.embed_tokens.weight", tensor)]
-        if lite_name.endswith("norm.weight") and "layers" not in lite_name and "attn" not in lite_name and "mlp" not in lite_name:
+        if native_name.endswith("norm.weight") and "layers" not in native_name and "attn" not in native_name and "mlp" not in native_name:
             return [("model.norm.weight", tensor)]
-        if "head" in lite_name:
+        if "head" in native_name:
             return [("lm_head.weight", tensor)]
-        if "layer_norm_weight" in lite_name and "qkv" in lite_name:
-            li = extract_layer_idx(lite_name)
+        if "layer_norm_weight" in native_name and "qkv" in native_name:
+            li = extract_layer_idx(native_name)
             return [(f"model.layers.{li}.input_layernorm.weight", tensor)]
-        if "mlp_norm" in lite_name:
-            li = extract_layer_idx(lite_name)
+        if "mlp_norm" in native_name:
+            li = extract_layer_idx(native_name)
             return [(f"model.layers.{li}.post_attention_layernorm.weight", tensor)]
-        if "qkv" in lite_name and "layer_norm" not in lite_name:
-            li = extract_layer_idx(lite_name)
+        if "qkv" in native_name and "layer_norm" not in native_name:
+            li = extract_layer_idx(native_name)
             ap = f"model.layers.{li}.self_attn"
             q, k, v = _unpack_mcore_qkv(tensor, c)
             return [
@@ -162,61 +162,61 @@ class Qwen3MoEWeightSpec:
                 (f"{ap}.k_proj.weight", k),
                 (f"{ap}.v_proj.weight", v),
             ]
-        if "q_norm" in lite_name:
-            li = extract_layer_idx(lite_name)
+        if "q_norm" in native_name:
+            li = extract_layer_idx(native_name)
             return [(f"model.layers.{li}.self_attn.q_norm.weight", tensor)]
-        if "k_norm" in lite_name:
-            li = extract_layer_idx(lite_name)
+        if "k_norm" in native_name:
+            li = extract_layer_idx(native_name)
             return [(f"model.layers.{li}.self_attn.k_norm.weight", tensor)]
-        if "proj.linear" in lite_name:
-            li = extract_layer_idx(lite_name)
+        if "proj.linear" in native_name:
+            li = extract_layer_idx(native_name)
             return [(f"model.layers.{li}.self_attn.o_proj.weight", tensor)]
-        if "router.gate" in lite_name:
-            li = extract_layer_idx(lite_name)
+        if "router.gate" in native_name:
+            li = extract_layer_idx(native_name)
             return [(f"model.layers.{li}.mlp.gate.weight", tensor)]
-        if "experts" in lite_name and "fc1" in lite_name:
-            li = extract_layer_idx(lite_name)
-            ei = parse_expert_idx(lite_name)
+        if "experts" in native_name and "fc1" in native_name:
+            li = extract_layer_idx(native_name)
+            ei = parse_expert_idx(native_name)
             mp = f"model.layers.{li}.mlp"
             gate, up = tensor.chunk(2, dim=0)
             return [(f"{mp}.experts.{ei}.gate_proj.weight", gate), (f"{mp}.experts.{ei}.up_proj.weight", up)]
-        if "experts" in lite_name and "fc2" in lite_name:
-            li = extract_layer_idx(lite_name)
-            ei = parse_expert_idx(lite_name)
+        if "experts" in native_name and "fc2" in native_name:
+            li = extract_layer_idx(native_name)
+            ei = parse_expert_idx(native_name)
             return [(f"model.layers.{li}.mlp.experts.{ei}.down_proj.weight", tensor)]
-        return [(lite_name, tensor)]
+        return [(native_name, tensor)]
 
-    def qkv_spec(self, lite_name: str) -> tuple[int, int, int] | None:
+    def qkv_spec(self, native_name: str) -> tuple[int, int, int] | None:
         return None
 
-    def tp_spec(self, lite_name: str) -> tuple[int, int] | None:
-        if self.is_expert(lite_name):
-            if "fc1" in lite_name:
+    def tp_spec(self, native_name: str) -> tuple[int, int] | None:
+        if self.is_expert(native_name):
+            if "fc1" in native_name:
                 return (0, 1)  # ETP dim 0
-            if "fc2" in lite_name:
+            if "fc2" in native_name:
                 return (1, 1)  # ETP dim 1
             return None
-        if "eh_proj" in lite_name:
+        if "eh_proj" in native_name:
             return (0, 0)
-        if "qkv" in lite_name and "layer_norm" not in lite_name:
+        if "qkv" in native_name and "layer_norm" not in native_name:
             return (0, 0)
-        if "proj" in lite_name and "attn" in lite_name:
+        if "proj" in native_name and "attn" in native_name:
             return (1, 0)
-        if "embed" in lite_name or "head" in lite_name:
+        if "embed" in native_name or "head" in native_name:
             return (0, 0)
         return None
 
-    def is_expert(self, lite_name: str) -> bool:
-        return "experts" in lite_name and "router" not in lite_name
+    def is_expert(self, native_name: str) -> bool:
+        return "experts" in native_name and "router" not in native_name
 
-    def expert_global_id(self, lite_name: str) -> int | None:
-        if "_fc1_weight_" in lite_name or "_fc2_weight_" in lite_name:
-            return int(lite_name.split("_")[-1])
+    def expert_global_id(self, native_name: str) -> int | None:
+        if "_fc1_weight_" in native_name or "_fc2_weight_" in native_name:
+            return int(native_name.split("_")[-1])
         return None
 
-    def expert_local_name(self, lite_name: str, local_idx: int) -> str:
-        prefix = lite_name.rsplit("._fc", 1)[0]
-        fc_tag = "fc1" if "_fc1_weight_" in lite_name else "fc2"
+    def expert_local_name(self, native_name: str, local_idx: int) -> str:
+        prefix = native_name.rsplit("._fc", 1)[0]
+        fc_tag = "fc1" if "_fc1_weight_" in native_name else "fc2"
         return f"{prefix}.{fc_tag}.weight{local_idx}"
 
 
@@ -226,19 +226,19 @@ class Qwen3MoEWeightSpec:
 
 
 def load_hf_weights(model, path: str, config: Qwen3MoEConfig, ps) -> None:
-    from megatron.lite.primitive.ckpt.hf_bridge import load_hf_weights as _load
+    from megatron.lite.primitive.ckpt.hf_weights import load_hf_weights as _load
 
     _load(model, path, Qwen3MoEWeightSpec(config), ps, vocab_size=config.vocab_size)
 
 
 def export_hf_weights(model, config: Qwen3MoEConfig, ps, **kwargs):
-    from megatron.lite.primitive.ckpt.hf_bridge import export_hf_weights as _export
+    from megatron.lite.primitive.ckpt.hf_weights import export_hf_weights as _export
 
     yield from _export(model, Qwen3MoEWeightSpec(config), ps, vocab_size=config.vocab_size, **kwargs)
 
 
 def save_hf_weights(model, path: str, config: Qwen3MoEConfig, ps) -> None:
-    from megatron.lite.primitive.ckpt.hf_bridge import save_hf_weights as _save
+    from megatron.lite.primitive.ckpt.hf_weights import save_hf_weights as _save
 
     _save(model, path, Qwen3MoEWeightSpec(config), ps, vocab_size=config.vocab_size)
 

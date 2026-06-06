@@ -3,7 +3,7 @@
 Internals call the atomic free functions in Megatron-Core's
 `megatron.core.transformer.moe.moe_utils` (plan `docs/moe_mc_wrap_plan.md`
 D3/D4). The outer classes keep the flat-kwargs + `ParallelState` constructor
-style of Megatron Lite primitives — no `TransformerConfig`, no mpu globals.
+style of megatron.lite primitives — no `TransformerConfig`, no mpu globals.
 """
 
 from __future__ import annotations

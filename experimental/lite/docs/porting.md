@@ -9,22 +9,22 @@ lives under `experimental/lite/megatron/lite`, so users can add
 - Use `Megatron Lite` for the component name in docs and comments.
 - Use `megatron.lite` for public and internal imports.
 - Do not introduce project-specific legacy branding.
-- Prefer `lite` for backend names and runtime keys.
+- Use `mlite` for the runtime backend key.
+- Use `lite` for model implementation names.
 
 ## Included Surface
 
-Keep the first PR focused on the lite path:
+Keep the PR focused on the lite model implementation path:
 
-- Runtime backend: `lite`.
+- Runtime backend: `mlite`.
 - Models: Qwen3 MoE and Qwen3.5 MoE.
 - Model implementations: `lite` only.
-- Optimizer primitive: Megatron-Core optimizer wrapping.
+- Optimizer primitives: Megatron-Core optimizer wrapping and FSDP2.
 
 Keep these out of the first PR unless the scope changes:
 
 - Hybrid model implementation packages.
 - Bridge model/runtime implementation packages.
-- FSDP2 optimizer primitives.
 - Benchmark scripts and experiment-specific entrypoints.
 
 ## Package Integration

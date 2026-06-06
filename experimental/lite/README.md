@@ -16,12 +16,12 @@ This initial drop contains:
 - Lite-only model implementations for Qwen3 MoE and Qwen3.5 MoE.
 - Hugging Face safetensors load/export helpers for the included models.
 - Megatron-Core optimizer wrapping for the lite runtime.
+- FSDP2 optimizer primitives for supported lite model protocols.
 
 This initial drop intentionally does not include:
 
 - Hybrid model implementations.
 - Bridge model/runtime implementations.
-- FSDP2 optimizer primitives.
 - Benchmark entrypoints or experiment scripts.
 
 ## Layout
@@ -32,7 +32,7 @@ experimental/lite/
   docs/                       Design and usage notes
   megatron/
     lite/
-      runtime/                Runtime API, config, backend registry, lite backend
+      runtime/                Runtime API, config, and mlite backend registry
       model/                  Model registry and Qwen model implementations
       primitive/              Parallel, checkpoint, optimizer, module, and op primitives
 ```
@@ -46,16 +46,19 @@ export PYTHONPATH=/path/to/Megatron-LM/experimental/lite:$PYTHONPATH
 ## Public API
 
 ```python
-from megatron.lite.runtime import LiteConfig, RuntimeConfig, create_runtime
+from megatron.lite.runtime import MegatronLiteConfig, RuntimeConfig, create_runtime
 
 cfg = RuntimeConfig(
-    backend="lite",
+    backend="mlite",
     hf_path="/path/to/hf-model",
-    backend_cfg=LiteConfig(model_name="qwen3", impl="lite"),
+    backend_cfg=MegatronLiteConfig(model_name="qwen3", impl="lite"),
 )
 runtime = create_runtime(cfg)
 handle = runtime.build_model()
 ```
+
+`backend="mlite"` selects the Megatron Lite runtime backend. `impl="lite"`
+selects the model implementation inside the registered model family.
 
 Model names currently registered by default:
 
@@ -70,3 +73,8 @@ Model names currently registered by default:
 - [Runtime](docs/runtime.md)
 - [Models](docs/models.md)
 - [Porting Notes](docs/porting.md)
+
+## Acknowledgements
+
+The Qwen3 MoE LoRA adapter support follows Mind-Lab's PEFT/Mint-compatible
+adapter work. Thanks to Mind-Lab for the reference implementation and guidance.

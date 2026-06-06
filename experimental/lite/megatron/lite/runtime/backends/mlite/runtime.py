@@ -1,4 +1,4 @@
-"""MegatronLiteRuntime training backend."""
+"""MegatronLiteRuntime — Megatron Lite's default training backend."""
 
 from __future__ import annotations
 
@@ -13,12 +13,12 @@ import torch
 import torch.distributed as dist
 
 from megatron.lite.runtime.backends import Runtime as RuntimeBase
-from megatron.lite.runtime.backends.lite.config import LiteConfig
+from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
 from megatron.lite.runtime.contracts.data import ForwardResult, ModelOutputs
 from megatron.lite.runtime.contracts.handle import ModelHandle
 
 
-def _build_impl_cfg(proto, rt_cfg: LiteConfig):
+def _build_impl_cfg(proto, rt_cfg: MegatronLiteConfig):
     """Construct typed impl config, backfilling hf_path + optimizer_config."""
     impl_cfg_kwargs = {**rt_cfg.impl_cfg, "parallel": rt_cfg.parallel}
     init_fields = {f.name for f in dc_fields(proto.ImplConfig) if f.init}
@@ -33,8 +33,8 @@ def _build_impl_cfg(proto, rt_cfg: LiteConfig):
         and rt_cfg.hf_path
     ):
         impl_cfg_kwargs["hf_path"] = rt_cfg.hf_path
-    # Thread the user-level OptimizerConfig (from BackendConfig.optimizer) so
-    # the protocol can pass it to build_mc_stack.
+    # Thread the user-level OptimizerConfig so the protocol can pass it to
+    # optimizer primitives without reading runtime internals.
     if (
         "optimizer_config" in init_fields
         and impl_cfg_kwargs.get("optimizer_config") is None
@@ -92,7 +92,7 @@ def _infer_pipeline_tensor_shape(batch: Any, model_cfg: Any, ps) -> tuple[int, i
             raise ValueError(
                 f"Pipeline tensor sequence length {local_seq_len} is not divisible by TP={tp_size}."
             )
-        # Qwen3.5 scatters embeddings into Megatron sequence-parallel form
+        # Megatron Lite Qwen3.5 scatters embeddings into Megatron sequence-parallel form
         # before the first layer, so PP activations carry S / (CP * TP).
         local_seq_len //= tp_size
 
@@ -109,16 +109,16 @@ def _last_loss_output(outputs: list[dict]) -> dict:
 class MegatronLiteRuntime(RuntimeBase):
     """Megatron Lite default training backend (Megatron-style 5D parallel)."""
 
-    def __init__(self, hf_path: str, cfg: LiteConfig | dict[str, Any]):
+    def __init__(self, hf_path: str, cfg: MegatronLiteConfig | dict[str, Any]):
         self._hf_path = hf_path
-        self._cfg = cfg if isinstance(cfg, LiteConfig) else LiteConfig.from_dict(hf_path, cfg)
+        self._cfg = cfg if isinstance(cfg, MegatronLiteConfig) else MegatronLiteConfig.from_dict(hf_path, cfg)
 
     # ── build_model ──
 
-    def build_model(self, hf_path: str | None = None, cfg: LiteConfig | dict[str, Any] | None = None, **kwargs) -> ModelHandle:
+    def build_model(self, hf_path: str | None = None, cfg: MegatronLiteConfig | dict[str, Any] | None = None, **kwargs) -> ModelHandle:
         if cfg is not None and isinstance(cfg, dict):
-            rt_cfg = LiteConfig.from_dict(hf_path or self._hf_path, cfg)
-        elif cfg is not None and isinstance(cfg, LiteConfig):
+            rt_cfg = MegatronLiteConfig.from_dict(hf_path or self._hf_path, cfg)
+        elif cfg is not None and isinstance(cfg, MegatronLiteConfig):
             rt_cfg = cfg
         else:
             rt_cfg = self._cfg
@@ -203,7 +203,7 @@ class MegatronLiteRuntime(RuntimeBase):
             },
         )
 
-    def _load_protocol(self, rt_cfg: LiteConfig):
+    def _load_protocol(self, rt_cfg: MegatronLiteConfig):
         """Load and return the model protocol module."""
         from megatron.lite.model.registry import TRAIN_RUNTIME_MODULES, resolve_runtime_model_name
 
