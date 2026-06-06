@@ -18,10 +18,12 @@ from megatron.core import parallel_state
 from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.async_txn import (
     AsyncTxnSkipReason,
+    EPDecodeBroadcastPlan,
     StepTxn,
     broadcast_ep_accepted_counts,
     broadcast_ep_sampled_tokens,
     broadcast_ep_stop_word_finished_ids,
+    resolve_ep_decode_broadcast_plan,
 )
 from megatron.core.inference.communication_utils import (
     broadcast_from_last_pipeline_stage,
@@ -142,6 +144,9 @@ class TextGenerationController:
 
         self._async_prepared_child_txn: Optional[StepTxn] = None
         self._async_launched_child_txn: Optional[StepTxn] = None
+        self._ep_decode_broadcast_plan: Optional[EPDecodeBroadcastPlan] = None
+        self._ep_dummy_sampled_tokens_cuda: Optional[Tensor] = None
+        self._ep_dummy_accepted_counts_cuda: Optional[Tensor] = None
 
     def set_stop_word_finished_ids_callback(self, callback):
         """Set a callback to get request IDs that should be marked as finished due to stop words.
@@ -899,11 +904,55 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         return getattr(context, "expert_model_parallel_group", None)
 
+    def _sync_ep_decode_broadcast_plan(
+        self, active_request_count: int, *, has_real_work: bool
+    ) -> Optional[EPDecodeBroadcastPlan]:
+        """Synchronize source rank and shape for EP decode post-forward collectives."""
+
+        group = self._expert_parallel_group()
+        if get_pg_size(group) <= 1:
+            self._ep_decode_broadcast_plan = None
+            return None
+
+        context = self.inference_wrapped_model.inference_context
+        communicator = getattr(context, "_ep_zmq_communicator", None)
+        plan = resolve_ep_decode_broadcast_plan(
+            active_request_count,
+            group,
+            has_real_work=has_real_work,
+            sync_all_reduce_max_fn=(
+                communicator.sync_all_reduce_max if communicator is not None else None
+            ),
+        )
+        self._ep_decode_broadcast_plan = plan
+        return plan
+
+    def _clear_ep_decode_broadcast_plan(self) -> None:
+        self._ep_decode_broadcast_plan = None
+
+    def _ep_broadcast_source_rank(self) -> int:
+        if self._ep_decode_broadcast_plan is not None:
+            return self._ep_decode_broadcast_plan.src_group_rank
+        return 0
+
+    def _ep_decode_collective_device(self) -> torch.device:
+        if torch.cuda.is_available():
+            return torch.device("cuda", torch.cuda.current_device())
+        return torch.device("cpu")
+
     def _ep_broadcast_sampled_tokens(self, active_request_count: int) -> None:
         group = self._expert_parallel_group()
         if get_pg_size(group) <= 1:
             return
-        broadcast_ep_sampled_tokens(self._sampled_tokens_cuda, active_request_count, group)
+        plan = self._ep_decode_broadcast_plan
+        if plan is not None:
+            active_request_count = plan.active_request_count
+        broadcast_ep_sampled_tokens(
+            self._sampled_tokens_cuda,
+            active_request_count,
+            group,
+            src_group_rank=self._ep_broadcast_source_rank(),
+        )
 
     def _ep_broadcast_stop_word_finished_ids(
         self, request_ids: List[int], finished_request_ids: Iterable[int]
@@ -911,22 +960,102 @@ class TextGenerationController:
         group = self._expert_parallel_group()
         if get_pg_size(group) <= 1:
             return {int(request_id) for request_id in finished_request_ids}
-        device = torch.cuda.current_device() if torch.cuda.is_available() else torch.device("cpu")
+        device = self._ep_decode_collective_device()
         return broadcast_ep_stop_word_finished_ids(
             request_ids,
             finished_request_ids,
             group,
             device=device,
+            src_group_rank=self._ep_broadcast_source_rank(),
         )
 
     def _ep_broadcast_mtp_accepted_counts(self, active_request_count: int) -> None:
         group = self._expert_parallel_group()
         if get_pg_size(group) <= 1 or self._accepted_token_counts_per_request is None:
             return
+        plan = self._ep_decode_broadcast_plan
+        if plan is not None:
+            active_request_count = plan.active_request_count
         broadcast_ep_accepted_counts(
             self._accepted_token_counts_per_request,
             active_request_count,
             group,
+            src_group_rank=self._ep_broadcast_source_rank(),
+        )
+
+    def _ensure_ep_dummy_sampled_tokens(self, active_request_count: int) -> Tensor:
+        device = self._ep_decode_collective_device()
+        needs_alloc = (
+            self._ep_dummy_sampled_tokens_cuda is None
+            or self._ep_dummy_sampled_tokens_cuda.numel() < active_request_count
+            or self._ep_dummy_sampled_tokens_cuda.device != device
+        )
+        if needs_alloc:
+            self._ep_dummy_sampled_tokens_cuda = torch.zeros(
+                active_request_count, dtype=torch.int64, device=device
+            )
+        else:
+            self._ep_dummy_sampled_tokens_cuda[:active_request_count].zero_()
+        return self._ep_dummy_sampled_tokens_cuda
+
+    def _ensure_ep_dummy_accepted_counts(self, active_request_count: int) -> Tensor:
+        device = self._ep_decode_collective_device()
+        needs_alloc = (
+            self._ep_dummy_accepted_counts_cuda is None
+            or self._ep_dummy_accepted_counts_cuda.numel() < active_request_count
+            or self._ep_dummy_accepted_counts_cuda.device != device
+        )
+        if needs_alloc:
+            self._ep_dummy_accepted_counts_cuda = torch.zeros(
+                active_request_count, dtype=torch.int64, device=device
+            )
+        else:
+            self._ep_dummy_accepted_counts_cuda[:active_request_count].zero_()
+        return self._ep_dummy_accepted_counts_cuda
+
+    def _dummy_decode_sample_collective(self) -> None:
+        """Mirror the decode sampling/verification EP collective on dummy ranks."""
+
+        group = self._expert_parallel_group()
+        if get_pg_size(group) <= 1:
+            return
+
+        plan = self._sync_ep_decode_broadcast_plan(0, has_real_work=False)
+        if plan is None or not plan.has_real_work or plan.active_request_count <= 0:
+            return
+
+        if self.num_speculative_tokens > 0:
+            accepted_counts = self._ensure_ep_dummy_accepted_counts(plan.active_request_count)
+            broadcast_ep_accepted_counts(
+                accepted_counts,
+                plan.active_request_count,
+                group,
+                src_group_rank=plan.src_group_rank,
+            )
+        else:
+            sampled_tokens = self._ensure_ep_dummy_sampled_tokens(plan.active_request_count)
+            broadcast_ep_sampled_tokens(
+                sampled_tokens,
+                plan.active_request_count,
+                group,
+                src_group_rank=plan.src_group_rank,
+            )
+
+    def _dummy_decode_stop_word_collective_tail(self) -> None:
+        """Mirror the stop-word EP collective after dummy MTP work."""
+
+        plan = self._ep_decode_broadcast_plan
+        if (
+            plan is None
+            or not plan.has_real_work
+            or plan.active_request_count <= 0
+            or self._get_stop_word_finished_ids_callback is None
+        ):
+            return
+
+        self._ep_broadcast_stop_word_finished_ids(
+            list(range(plan.active_request_count)),
+            finished_request_ids=(),
         )
 
     def _rewind_kv_cache(self) -> tuple:
@@ -1261,6 +1390,7 @@ class TextGenerationController:
             accepted_tokens_mask,
             input_tokens_required,
         )
+        self._sync_ep_decode_broadcast_plan(active_request_count, has_real_work=True)
         self._ep_broadcast_mtp_accepted_counts(active_request_count)
         nvtx_range_pop("mtp-spec-decoding/verify/prepare-next")
 
@@ -1328,6 +1458,7 @@ class TextGenerationController:
             eager=not use_graph,
             cache_key=("sample", n) if use_graph else None,
         )
+        self._sync_ep_decode_broadcast_plan(active_request_count, has_real_work=True)
         self._ep_broadcast_sampled_tokens(active_request_count)
 
     def _dynamic_step_log_probs_bookkeeping(self) -> Tuple[bool, bool]:
@@ -1751,15 +1882,23 @@ class TextGenerationController:
                 unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
                 set_decode_expert_padding(unwrapped_model, False)
 
-        # When speculative decoding is active, the real EP ranks perform serial
-        # MTP forward passes after the main forward pass. MTP layers may contain
-        # MoE sublayers (inherited from the decoder spec), which require EP
-        # all-to-all collectives. The dummy rank must participate in these
-        # collectives to avoid a hang.
-        self._dummy_serial_mtp_forward()
+        try:
+            # The real EP rank performs decode sampling/verification after the
+            # main forward. Dummy ranks must enter the same post-forward
+            # collective phase before any MTP collectives are issued.
+            self._dummy_decode_sample_collective()
 
-        # clear the context of any temporary state from the dummy forward
-        context.reset()
+            # When speculative decoding is active, the real EP ranks perform serial
+            # MTP forward passes after the main forward pass. MTP layers may contain
+            # MoE sublayers (inherited from the decoder spec), which require EP
+            # all-to-all collectives. The dummy rank must participate in these
+            # collectives to avoid a hang.
+            self._dummy_serial_mtp_forward()
+            self._dummy_decode_stop_word_collective_tail()
+        finally:
+            self._clear_ep_decode_broadcast_plan()
+            # clear the context of any temporary state from the dummy forward
+            context.reset()
 
     @torch.inference_mode()
     def _dummy_serial_mtp_forward(self):
@@ -2277,6 +2416,7 @@ class TextGenerationController:
                 context.async_txn_diagnostics.record_adopted()
                 context.async_txn_diagnostics.record_sync_step("serial_wrapped")
             ret.update(request_bookkeeping)
+            self._clear_ep_decode_broadcast_plan()
             return ret
 
     @torch.inference_mode()

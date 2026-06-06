@@ -448,6 +448,15 @@ class AsyncLaunchEligibility:
     required_boundary_blocks: int = 0
 
 
+@dataclass(frozen=True)
+class EPDecodeBroadcastPlan:
+    """Rank-uniform source and shape for EP decode post-forward collectives."""
+
+    active_request_count: int
+    src_group_rank: int
+    has_real_work: bool
+
+
 def _group_size(group) -> int:
     if group is None:
         return 1
@@ -486,6 +495,67 @@ def _broadcast_tensor(tensor: torch.Tensor, group, src_group_rank: int, broadcas
     if broadcast_fn is None:
         broadcast_fn = torch.distributed.broadcast
     broadcast_fn(tensor, src=src_rank, group=group)
+
+
+def resolve_ep_decode_broadcast_plan(
+    active_request_count: int,
+    group,
+    *,
+    has_real_work: bool,
+    sync_all_reduce_max_fn=None,
+) -> EPDecodeBroadcastPlan:
+    """Resolve the one real EP source rank that owns decode sampling results.
+
+    Coordinator EP mode has one rank with persistent request state and peer ranks
+    running dummy model work to satisfy MoE collectives. Post-forward collectives
+    must still be entered by every EP rank with an identical source rank and
+    tensor shape. This CPU-side plan keeps that contract explicit before the
+    NCCL broadcast is issued.
+    """
+
+    local_count = int(active_request_count) if has_real_work else 0
+    group_size = _group_size(group)
+    if group_size <= 1:
+        return EPDecodeBroadcastPlan(
+            active_request_count=local_count,
+            src_group_rank=0,
+            has_real_work=local_count > 0,
+        )
+
+    if sync_all_reduce_max_fn is None:
+        return EPDecodeBroadcastPlan(
+            active_request_count=int(active_request_count),
+            src_group_rank=0,
+            has_real_work=local_count > 0,
+        )
+
+    group_rank = _group_rank(group)
+    local_src_max = group_rank if local_count > 0 else -1
+    local_neg_src_min = -group_rank if local_count > 0 else -(group_size + 1)
+    global_count, max_src, neg_min_src = sync_all_reduce_max_fn(
+        local_count, local_src_max, local_neg_src_min
+    )
+    global_count = int(global_count)
+    max_src = int(max_src)
+    min_src = -int(neg_min_src)
+
+    if global_count <= 0:
+        return EPDecodeBroadcastPlan(
+            active_request_count=0,
+            src_group_rank=0,
+            has_real_work=False,
+        )
+    if max_src != min_src:
+        raise RuntimeError(
+            "EP decode broadcast requires exactly one real source rank per EP group; "
+            f"got min/max real source ranks {min_src}/{max_src}"
+        )
+
+    return EPDecodeBroadcastPlan(
+        active_request_count=global_count,
+        src_group_rank=max_src,
+        has_real_work=True,
+    )
 
 
 def broadcast_ep_sampled_tokens(

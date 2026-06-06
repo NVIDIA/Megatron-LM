@@ -8,6 +8,7 @@ from megatron.core.inference.async_txn import (
     broadcast_ep_accepted_counts,
     broadcast_ep_sampled_tokens,
     broadcast_ep_stop_word_finished_ids,
+    resolve_ep_decode_broadcast_plan,
 )
 
 
@@ -78,6 +79,78 @@ def test_mtp_accepted_count_broadcast_gives_identical_speculative_prefix():
     broadcast_ep_accepted_counts(local_counts, 3, FakeEPGroup(), broadcast_fn=broadcast)
 
     assert local_counts.tolist() == [2, 1, 0, 9]
+
+
+def test_ep_decode_broadcast_plan_selects_nonzero_real_source_rank():
+    group = FakeEPGroup(size=4, rank=3)
+
+    def sync_all_reduce_max(local_count, local_src_max, local_neg_src_min):
+        assert (local_count, local_src_max, local_neg_src_min) == (1, 3, -3)
+        # Ranks 0-2 are dummy ranks and rank 3 owns the real coordinator state.
+        values_by_rank = [
+            (0, -1, -5),
+            (0, -1, -5),
+            (0, -1, -5),
+            (local_count, local_src_max, local_neg_src_min),
+        ]
+        return tuple(max(values[index] for values in values_by_rank) for index in range(3))
+
+    plan = resolve_ep_decode_broadcast_plan(
+        1,
+        group,
+        has_real_work=True,
+        sync_all_reduce_max_fn=sync_all_reduce_max,
+    )
+
+    assert plan.active_request_count == 1
+    assert plan.src_group_rank == 3
+    assert plan.has_real_work is True
+
+
+def test_ep_decode_broadcast_plan_gives_dummy_same_source_and_count():
+    group = FakeEPGroup(size=4, rank=0)
+
+    def sync_all_reduce_max(local_count, local_src_max, local_neg_src_min):
+        assert (local_count, local_src_max, local_neg_src_min) == (0, -1, -5)
+        values_by_rank = [
+            (local_count, local_src_max, local_neg_src_min),
+            (0, -1, -5),
+            (0, -1, -5),
+            (2, 3, -3),
+        ]
+        return tuple(max(values[index] for values in values_by_rank) for index in range(3))
+
+    plan = resolve_ep_decode_broadcast_plan(
+        0,
+        group,
+        has_real_work=False,
+        sync_all_reduce_max_fn=sync_all_reduce_max,
+    )
+
+    assert plan.active_request_count == 2
+    assert plan.src_group_rank == 3
+    assert plan.has_real_work is True
+
+
+def test_ep_decode_broadcast_plan_rejects_multiple_real_sources():
+    group = FakeEPGroup(size=4, rank=1)
+
+    def sync_all_reduce_max(local_count, local_src_max, local_neg_src_min):
+        values_by_rank = [
+            (0, -1, -5),
+            (local_count, local_src_max, local_neg_src_min),
+            (0, -1, -5),
+            (1, 3, -3),
+        ]
+        return tuple(max(values[index] for values in values_by_rank) for index in range(3))
+
+    with pytest.raises(RuntimeError, match="exactly one real source rank"):
+        resolve_ep_decode_broadcast_plan(
+            1,
+            group,
+            has_real_work=True,
+            sync_all_reduce_max_fn=sync_all_reduce_max,
+        )
 
 
 def test_dummy_rank_mirrors_sync_replacement_and_mtp_phase_collectives():
