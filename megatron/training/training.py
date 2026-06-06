@@ -1200,7 +1200,6 @@ def pretrain(
         model_vocab_size=cfg_container.model.vocab_size,
         tokenizer_vocab_size=tokenizer.vocab_size,
     )
-    cfg_container.dataset.tokenizer = tokenizer
     timers("tokenizer-setup").stop()
     print_datetime("after tokenizer is built")
 
