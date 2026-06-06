@@ -4,6 +4,7 @@ import asyncio
 import concurrent
 import copy
 import functools
+import time
 from collections import defaultdict
 from typing import Any, Dict, Iterable, List, Optional, OrderedDict, Tuple, Union
 
@@ -715,20 +716,24 @@ class TextGenerationController:
             self._async_launched_child_txn = None
             return False
 
-        if not child_txn.guard_adoption(
-            self._async_active_request_ids(),
-            terminal_request_ids=child_txn.terminal_request_ids,
-            decode_only=context.is_decode_only(),
-            cuda_graph_key=self._async_decode_cuda_graph_key(),
-        ):
-            context.async_txn_diagnostics.record_guard_failure()
-            self._async_launched_child_txn = None
-            raise RuntimeError("async decode child adoption invariant failed")
+        range_push("async_txn_adopt")
+        try:
+            if not child_txn.guard_adoption(
+                self._async_active_request_ids(),
+                terminal_request_ids=child_txn.terminal_request_ids,
+                decode_only=context.is_decode_only(),
+                cuda_graph_key=self._async_decode_cuda_graph_key(),
+            ):
+                context.async_txn_diagnostics.record_guard_failure()
+                self._async_launched_child_txn = None
+                raise RuntimeError("async decode child adoption invariant failed")
 
-        child_txn.adopted = True
-        self._async_launched_child_txn = None
-        context.async_txn_diagnostics.record_adopted()
-        return True
+            child_txn.adopted = True
+            self._async_launched_child_txn = None
+            context.async_txn_diagnostics.record_adopted()
+            return True
+        finally:
+            range_pop()
 
     @staticmethod
     def _synchronize_async_event(event) -> None:
@@ -789,7 +794,13 @@ class TextGenerationController:
             return AsyncTxnSkipReason.ACTIVE_COUNT_CHANGED
         return None
 
-    def _launch_async_decode_child(self, child_txn: StepTxn) -> None:
+    def _launch_async_decode_child(
+        self,
+        child_txn: StepTxn,
+        *,
+        h2d_ready_before_sampling: bool = False,
+        sample_completed_at: Optional[float] = None,
+    ) -> None:
         """Scatter sampled tokens into the prepared child slot and launch it."""
 
         context = self.inference_wrapped_model.inference_context
@@ -798,23 +809,30 @@ class TextGenerationController:
         if child_slot.slot_id != child_txn.slot_id:
             raise RuntimeError("prepared async child slot no longer matches ring child")
 
-        h2d_ready_before_sampling = child_txn.h2d_ready()
         if child_txn.h2d_done_event is not None:
             torch.cuda.current_stream(child_slot.gpu_view._buf.device).wait_event(
                 child_txn.h2d_done_event
             )
 
         active_request_count = context.total_request_count - context.paused_request_count
+        range_push("async_txn_scatter_to_child_input")
         child_slot.gpu_view.token_to_input_ids[:active_request_count].copy_(
             self._sampled_tokens_cuda[:active_request_count], non_blocking=True
         )
+        range_pop()
 
         context.bind_decode_slot(child_slot)
         input_ids, position_ids = context.current_input_and_position_ids()
 
+        sample_to_launch_latency_us = None
+        if sample_completed_at is not None:
+            sample_to_launch_latency_us = (time.perf_counter() - sample_completed_at) * 1_000_000
+
+        range_push("async_txn_launch_child")
         range_push("async_child_forward")
         self._dynamic_step_forward_logits(input_ids, position_ids)
         child_txn.forward_done_event = child_slot.record_forward_done()
+        range_pop()
         range_pop()
 
         child_txn.launched = True
@@ -822,7 +840,8 @@ class TextGenerationController:
         self._async_launched_child_txn = child_txn
         self._async_prepared_child_txn = None
         context.async_txn_diagnostics.record_launched(
-            h2d_ready_before_sampling=h2d_ready_before_sampling
+            h2d_ready_before_sampling=h2d_ready_before_sampling,
+            sample_to_launch_latency_us=sample_to_launch_latency_us,
         )
 
     def _record_async_sample_ready_event(self):
@@ -2074,9 +2093,13 @@ class TextGenerationController:
                 )
                 if context.async_scheduling and context.async_decode_slot_ring is not None:
                     context.async_decode_slot_ring.current.record_forward_done()
-                    self._async_prepared_child_txn = (
-                        context.prepare_child_from_committed_decode_state()
-                    )
+                    range_push("async_txn_child_prestage")
+                    try:
+                        self._async_prepared_child_txn = (
+                            context.prepare_child_from_committed_decode_state()
+                        )
+                    finally:
+                        range_pop()
                 range_pop()
 
         # This is the best place to yield control back to event loop.
@@ -2093,6 +2116,7 @@ class TextGenerationController:
             return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
             launched_child_txn = None
             child_launch_skip_reason = None
+            h2d_ready_before_sampling = False
             if context.async_scheduling:
                 child_launch_skip_reason = self._async_child_launch_skip_reason(
                     self._async_prepared_child_txn,
@@ -2104,6 +2128,8 @@ class TextGenerationController:
                 if child_launch_skip_reason is not None:
                     context.async_txn_diagnostics.record_barrier_skip(child_launch_skip_reason)
                     self._async_prepared_child_txn = None
+                elif self._async_prepared_child_txn is not None:
+                    h2d_ready_before_sampling = self._async_prepared_child_txn.h2d_ready()
 
             if self.num_speculative_tokens > 0:
                 # Phase 1: Verify speculative tokens using base logits only.
@@ -2130,7 +2156,14 @@ class TextGenerationController:
                 # data-dependent boolean-mask sync overlaps with MTP GPU work.
                 context.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
             else:
-                self._dynamic_step_sample_logits()
+                if context.async_scheduling:
+                    range_push("async_txn_sample")
+                try:
+                    self._dynamic_step_sample_logits()
+                finally:
+                    if context.async_scheduling:
+                        range_pop()
+            sample_completed_at = time.perf_counter() if context.async_scheduling else None
 
             log_probs = None
             top_n_logprobs = None
@@ -2141,7 +2174,11 @@ class TextGenerationController:
             ):
                 launched_child_txn = self._async_prepared_child_txn
                 sample_ready_event = self._record_async_sample_ready_event()
-                self._launch_async_decode_child(launched_child_txn)
+                self._launch_async_decode_child(
+                    launched_child_txn,
+                    h2d_ready_before_sampling=h2d_ready_before_sampling,
+                    sample_completed_at=sample_completed_at,
+                )
                 self._start_async_sample_transfer(active_request_count, sample_ready_event)
 
             if return_log_probs or return_top_n_logprobs:
@@ -2179,19 +2216,37 @@ class TextGenerationController:
             else:
                 # request_bookkeeping supplies "sample" as the already-CPU
                 # tensor produced by _transfer_samples_to_cpu.
-                sampled_tokens_cpu = (
-                    self._consume_async_sample_transfer(active_request_count)
-                    if launched_child_txn is not None
-                    else None
+                commit_started_at = (
+                    time.perf_counter() if context.async_txn_diagnostics.enabled else None
                 )
-                request_bookkeeping = self._dynamic_step_context_bookkeeping(
-                    sampled_tokens_cpu=sampled_tokens_cpu,
-                    async_txn=launched_child_txn,
-                )
-                if launched_child_txn is not None:
-                    self._async_prepared_child_txn = (
-                        context.prepare_child_from_committed_decode_state()
+                commit_range_active = context.async_scheduling
+                if commit_range_active:
+                    range_push("async_txn_cpu_commit")
+                try:
+                    sampled_tokens_cpu = (
+                        self._consume_async_sample_transfer(active_request_count)
+                        if launched_child_txn is not None
+                        else None
                     )
+                    request_bookkeeping = self._dynamic_step_context_bookkeeping(
+                        sampled_tokens_cpu=sampled_tokens_cpu,
+                        async_txn=launched_child_txn,
+                    )
+                finally:
+                    if commit_range_active:
+                        range_pop()
+                    if commit_started_at is not None:
+                        context.async_txn_diagnostics.record_commit_duration(
+                            (time.perf_counter() - commit_started_at) * 1_000_000
+                        )
+                if launched_child_txn is not None:
+                    range_push("async_txn_child_prestage")
+                    try:
+                        self._async_prepared_child_txn = (
+                            context.prepare_child_from_committed_decode_state()
+                        )
+                    finally:
+                        range_pop()
 
             accepted_tokens_result = (
                 # Clone needed: .fill_(-1) below would corrupt the returned value.

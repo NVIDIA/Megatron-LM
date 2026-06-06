@@ -2167,7 +2167,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 output_str += (
                     " ... async txn: prepared %(prepared)d, launched %(launched)d, "
                     "adopted %(adopted)d, retired %(retired)d, sync %(sync_steps)d, "
-                    "barrier %(barrier_skips)d, top-skip %(top_skip_reason)s"
+                    "barrier %(barrier_skips)d, h2d-ready %(h2d_ready_before_sampling)d, "
+                    "sample-launch %(sample_to_launch_latency_us).1f us, "
+                    "commit %(commit_duration_us).1f us, retire-depth %(retire_queue_depth)d, "
+                    "top-skip %(top_skip_reason)s"
                 ) % async_diag
             if context_state["is_decode_only"]:
                 output_str = f"\033[94m{output_str}\033[0m"

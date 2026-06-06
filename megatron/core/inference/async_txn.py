@@ -72,16 +72,27 @@ class AsyncTxnDiagnostics:
         if under_forward:
             self.prepare_under_forward += 1
 
-    def record_launched(self, *, h2d_ready_before_sampling: bool = False) -> None:
+    def record_launched(
+        self,
+        *,
+        h2d_ready_before_sampling: bool = False,
+        sample_to_launch_latency_us: Optional[float] = None,
+    ) -> None:
         if not self.enabled:
             return
         self.launched += 1
         if h2d_ready_before_sampling:
             self.h2d_ready_before_sampling += 1
+        if sample_to_launch_latency_us is not None:
+            self.sample_to_launch_latency_us = max(0.0, float(sample_to_launch_latency_us))
 
     def record_adopted(self) -> None:
         if self.enabled:
             self.adopted += 1
+
+    def record_commit_duration(self, duration_us: float) -> None:
+        if self.enabled:
+            self.commit_duration_us = max(0.0, float(duration_us))
 
     def record_sync_step(self, reason: AsyncTxnSkipReason | str) -> None:
         if not self.enabled:

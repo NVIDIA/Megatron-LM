@@ -192,6 +192,9 @@ def test_child_launch_occurs_before_cpu_sample_transfer():
     assert order.index("child_forward") < order.index("transfer")
     assert context.async_txn_diagnostics.launched == 1
     assert context.async_txn_diagnostics.prepared == 2
+    assert context.async_txn_diagnostics.h2d_ready_before_sampling == 1
+    assert context.async_txn_diagnostics.sample_to_launch_latency_us > 0.0
+    assert context.async_txn_diagnostics.commit_duration_us > 0.0
     assert controller._async_launched_child_txn is not None
 
 

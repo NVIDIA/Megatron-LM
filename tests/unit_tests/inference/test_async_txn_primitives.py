@@ -65,6 +65,8 @@ def test_diagnostics_are_noop_when_disabled():
     diagnostics.record_barrier_skip("not_decode_only")
     diagnostics.record_retired()
     diagnostics.record_guard_failure()
+    diagnostics.record_launched(sample_to_launch_latency_us=12.0)
+    diagnostics.record_commit_duration(34.0)
 
     assert diagnostics.snapshot() == {
         "enabled": False,
@@ -97,3 +99,18 @@ def test_serial_wrapped_diagnostics_are_cheap_dict_counters():
     assert snapshot["sync_steps"] == 1
     assert snapshot["eligibility_skip_reasons"] == {"serial_wrapped": 1}
     assert torch.tensor(snapshot["prepared"]).item() == 1
+
+
+def test_diagnostics_record_latest_latency_samples():
+    diagnostics = AsyncTxnDiagnostics(enabled=True)
+
+    diagnostics.record_launched(
+        h2d_ready_before_sampling=True, sample_to_launch_latency_us=7.25
+    )
+    diagnostics.record_commit_duration(11.5)
+
+    snapshot = diagnostics.snapshot()
+    assert snapshot["launched"] == 1
+    assert snapshot["h2d_ready_before_sampling"] == 1
+    assert snapshot["sample_to_launch_latency_us"] == 7.25
+    assert snapshot["commit_duration_us"] == 11.5
