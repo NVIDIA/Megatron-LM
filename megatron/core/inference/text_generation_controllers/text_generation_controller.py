@@ -2508,6 +2508,12 @@ class TextGenerationController:
         if not (context.async_scheduling and self._async_prepared_child_txn is not None):
             await asyncio.sleep(0)
 
+        sampling_started_at = (
+            time.perf_counter()
+            if context.async_scheduling and context.async_txn_diagnostics.enabled
+            else None
+        )
+
         with torch.inference_mode():
             range_push("sampling")
             return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
@@ -2617,6 +2623,10 @@ class TextGenerationController:
                             log_probs_tensor
                         )
             range_pop()
+            if sampling_started_at is not None:
+                context.async_txn_diagnostics.record_sampling_block_duration(
+                    (time.perf_counter() - sampling_started_at) * 1_000_000
+                )
 
             # Capture before update_requests (called by _dynamic_step_context_bookkeeping)
             # resets num_prefill_requests to 0, which would make num_decode_requests

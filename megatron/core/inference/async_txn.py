@@ -65,6 +65,11 @@ class AsyncTxnDiagnostics:
     child_prestage_duration_us: float = 0.0
     ep_handoff_duration_us: float = 0.0
     child_graph_shape_duration_us: float = 0.0
+    controller_wall_us: float = 0.0
+    sampling_block_us: float = 0.0
+    engine_forward_wall_us: float = 0.0
+    engine_bookkeep_wall_us: float = 0.0
+    engine_postprocess_us: float = 0.0
     retire_queue_depth: int = 0
     eligibility_skip_reasons: Counter = field(default_factory=Counter)
 
@@ -108,6 +113,26 @@ class AsyncTxnDiagnostics:
     def record_child_graph_shape_duration(self, duration_us: float) -> None:
         if self.enabled:
             self.child_graph_shape_duration_us = max(0.0, float(duration_us))
+
+    def record_controller_wall_duration(self, duration_us: float) -> None:
+        if self.enabled:
+            self.controller_wall_us = max(0.0, float(duration_us))
+
+    def record_sampling_block_duration(self, duration_us: float) -> None:
+        if self.enabled:
+            self.sampling_block_us = max(0.0, float(duration_us))
+
+    def record_engine_forward_wall_duration(self, duration_us: float) -> None:
+        if self.enabled:
+            self.engine_forward_wall_us = max(0.0, float(duration_us))
+
+    def record_engine_bookkeep_wall_duration(self, duration_us: float) -> None:
+        if self.enabled:
+            self.engine_bookkeep_wall_us = max(0.0, float(duration_us))
+
+    def record_engine_postprocess_duration(self, duration_us: float) -> None:
+        if self.enabled:
+            self.engine_postprocess_us = max(0.0, float(duration_us))
 
     def record_sync_step(self, reason: AsyncTxnSkipReason | str) -> None:
         if not self.enabled:
@@ -159,6 +184,11 @@ class AsyncTxnDiagnostics:
             "child_prestage_duration_us": self.child_prestage_duration_us,
             "ep_handoff_duration_us": self.ep_handoff_duration_us,
             "child_graph_shape_duration_us": self.child_graph_shape_duration_us,
+            "controller_wall_us": self.controller_wall_us,
+            "sampling_block_us": self.sampling_block_us,
+            "engine_forward_wall_us": self.engine_forward_wall_us,
+            "engine_bookkeep_wall_us": self.engine_bookkeep_wall_us,
+            "engine_postprocess_us": self.engine_postprocess_us,
             "retire_queue_depth": self.retire_queue_depth,
             "eligibility_skip_reasons": dict(self.eligibility_skip_reasons),
             "top_skip_reason": self.top_skip_reason(),

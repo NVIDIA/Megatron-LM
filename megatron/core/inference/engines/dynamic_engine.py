@@ -1870,6 +1870,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 step_time (float): How long this step took.
         """
 
+        forward_wall_started_at = (
+            time.perf_counter()
+            if self.context.async_scheduling and self.context.async_txn_diagnostics.enabled
+            else None
+        )
+
         # If suspended, no stepping.
         if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             raise EngineSuspendedError(self.context.step_count)
@@ -1951,6 +1957,11 @@ class DynamicInferenceEngine(AbstractEngine):
             # Keep kv_stats=None so the metrics-block gate at `async_bookkeep`
             # (`if context_state["kv_stats"] is not None`) remains well-typed.
             context_state = {**pre_step_context_state, "kv_stats": None}
+
+        if forward_wall_started_at is not None:
+            self.context.async_txn_diagnostics.record_engine_forward_wall_duration(
+                (time.perf_counter() - forward_wall_started_at) * 1_000_000
+            )
 
         return result, context_state, step_time
 
@@ -2066,6 +2077,11 @@ class DynamicInferenceEngine(AbstractEngine):
                 step_time (float): The step time in seconds.
                 cuda_graph_request_count (int): The CUDA graph batch size matching this step.
         """
+        bookkeep_wall_started_at = (
+            time.perf_counter()
+            if self.context.async_scheduling and self.context.async_txn_diagnostics.enabled
+            else None
+        )
         # Increment finished_request_count.
         nvtx_range_push("bookkeeping")
         cuda_graph_request_count = None
@@ -2095,22 +2111,33 @@ class DynamicInferenceEngine(AbstractEngine):
                 [self.get_request(i).add_event_pause() for i in newly_paused_request_ids]
 
             # Process finished requests (adds FINISH events and returns records).
-            (active_request_ids, finished_request_records) = self.post_process_requests(
-                active_request_ids,
-                finished_request_ids,
-                evict_request_ids,
-                step_time,
-                sample,
-                accepted_tokens,
-                log_probs,
-                top_n_logprobs,
-                accepted_tokens_by_request_id=step_result.get("accepted_tokens_by_request_id"),
-                log_probs_by_request_id=log_probs_by_request_id,
-                top_n_logprobs_by_request_id=top_n_logprobs_by_request_id,
-                pre_fwd_active_token_count=context_state.get("active_token_count"),
-                pre_fwd_step_count=context_state.get("step_count"),
-                finished_routing_block_ids=finished_routing_block_ids,
+            postprocess_started_at = (
+                time.perf_counter()
+                if self.context.async_scheduling and self.context.async_txn_diagnostics.enabled
+                else None
             )
+            try:
+                (active_request_ids, finished_request_records) = self.post_process_requests(
+                    active_request_ids,
+                    finished_request_ids,
+                    evict_request_ids,
+                    step_time,
+                    sample,
+                    accepted_tokens,
+                    log_probs,
+                    top_n_logprobs,
+                    accepted_tokens_by_request_id=step_result.get("accepted_tokens_by_request_id"),
+                    log_probs_by_request_id=log_probs_by_request_id,
+                    top_n_logprobs_by_request_id=top_n_logprobs_by_request_id,
+                    pre_fwd_active_token_count=context_state.get("active_token_count"),
+                    pre_fwd_step_count=context_state.get("step_count"),
+                    finished_routing_block_ids=finished_routing_block_ids,
+                )
+            finally:
+                if postprocess_started_at is not None:
+                    self.context.async_txn_diagnostics.record_engine_postprocess_duration(
+                        (time.perf_counter() - postprocess_started_at) * 1_000_000
+                    )
 
         else:
             active_request_ids: list[int] = []
@@ -2298,6 +2325,10 @@ class DynamicInferenceEngine(AbstractEngine):
                     "prestage %(child_prestage_duration_us).1f us, "
                     "ep-handoff %(ep_handoff_duration_us).1f us, "
                     "child-graph %(child_graph_shape_duration_us).1f us, "
+                    "sample-block %(sampling_block_us).1f us, "
+                    "eng-fwd %(engine_forward_wall_us).1f us, "
+                    "eng-book %(engine_bookkeep_wall_us).1f us, "
+                    "post %(engine_postprocess_us).1f us, "
                     "retire-depth %(retire_queue_depth)d, "
                     "top-skip %(top_skip_reason)s"
                 ) % async_diag
@@ -2306,6 +2337,11 @@ class DynamicInferenceEngine(AbstractEngine):
             logging.info(output_str)
 
         nvtx_range_pop("console_logging")
+
+        if bookkeep_wall_started_at is not None:
+            self.context.async_txn_diagnostics.record_engine_bookkeep_wall_duration(
+                (time.perf_counter() - bookkeep_wall_started_at) * 1_000_000
+            )
 
         return {
             "active_request_ids": active_request_ids,
