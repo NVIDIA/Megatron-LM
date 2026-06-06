@@ -20,11 +20,11 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.utils import unwrap_model
 from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import set_args
 from megatron.training.training import get_model
-from megatron.training.utils import unwrap_model
 from tests.unit_tests.dist_checkpointing import (
     TempNamedDir,
     init_basic_mock_args,
@@ -280,8 +280,8 @@ class TestGatedDeltaNet:
         output_thd_padded, _ = self.gdn(hidden_states_thd, None, packed_seq_params=padded_params)
         output_thd2bshd = output_thd_padded.view(*output_bshd.shape)
         torch.testing.assert_close(
-            output_bshd[..., :30],
-            output_thd2bshd[..., :30],
+            output_bshd[:, :30, :],
+            output_thd2bshd[:, :30, :],
             atol=atol,
             rtol=rtol,
             msg=lambda msg: f"THD padded output mismatch ({rank=}): {msg}",
@@ -314,7 +314,6 @@ class TestGDNCuSeqlensResolve:
     @pytest.fixture
     def mock_gdn(self):
         class MockGDN:
-            cp_size = 2
             _resolve_cu_seqlens = GatedDeltaNet._resolve_cu_seqlens
 
         return MockGDN()
@@ -322,30 +321,35 @@ class TestGDNCuSeqlensResolve:
     def test_padded_preferred_when_available(self, mock_gdn):
         actual = torch.tensor([0, 500, 1000], dtype=torch.int32)
         padded = torch.tensor([0, 504, 1008], dtype=torch.int32)
-        result = mock_gdn._resolve_cu_seqlens(padded, actual, 1008, "cu_seqlens_q")
+        result = mock_gdn._resolve_cu_seqlens(padded, actual, 1008, "cu_seqlens_q", cp_size=2)
         assert torch.equal(result, padded)
 
     def test_actual_used_when_no_padding(self, mock_gdn):
         actual = torch.tensor([0, 504, 1008], dtype=torch.int32)
-        result = mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q")
+        result = mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q", cp_size=2)
         assert torch.equal(result, actual)
 
     def test_raises_when_padding_mismatch(self, mock_gdn):
         actual = torch.tensor([0, 500, 1000], dtype=torch.int32)
         with pytest.raises(ValueError, match="does not match"):
-            mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q")
+            mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q", cp_size=2)
 
     def test_raises_when_padded_mismatches_total(self, mock_gdn):
         actual = torch.tensor([0, 500, 1000], dtype=torch.int32)
         padded = torch.tensor([0, 504, 1004], dtype=torch.int32)
         with pytest.raises(ValueError, match="does not match"):
-            mock_gdn._resolve_cu_seqlens(padded, actual, 1008, "cu_seqlens_q")
+            mock_gdn._resolve_cu_seqlens(padded, actual, 1008, "cu_seqlens_q", cp_size=2)
+
+    def test_raises_when_not_divisible_by_cp_size(self, mock_gdn):
+        actual = torch.tensor([0, 505, 1008], dtype=torch.int32)
+        with pytest.raises(ValueError, match="must be divisible by cp_size"):
+            mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q", cp_size=2)
 
     def test_cp1_still_validates_total(self, mock_gdn):
         mock_gdn.cp_size = 1
         actual = torch.tensor([0, 500, 1000], dtype=torch.int32)
         with pytest.raises(ValueError, match="does not match"):
-            mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q")
+            mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q", cp_size=1)
 
 
 @pytest.mark.parametrize("sequence_packing", [False, True])

@@ -32,6 +32,9 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import get_context_parallel_rank, get_context_parallel_world_size
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
+from megatron.core.transformer.multi_token_prediction import (
+    mtp_on_this_rank as mtp_on_this_rank_func,
+)
 from megatron.core.utils import StragglerDetector, get_attr_wrapped_model, is_te_min_version
 from megatron.training import (
     get_args,
@@ -41,8 +44,11 @@ from megatron.training import (
     print_rank_0,
     set_startup_timestamps,
 )
-from megatron.training.argument_utils import pretrain_cfg_container_from_args
-from megatron.training.arguments import parse_and_validate_args
+from megatron.training.argument_utils import (
+    hybrid_config_from_args,
+    pretrain_cfg_container_from_args,
+)
+from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.sft_dataset import SFTDataset
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
@@ -67,7 +73,7 @@ try:
     # Alias the PyTorch wrapper so we can call tex.* APIs
     import transformer_engine_torch as tex
 except ImportError:
-    # TE isn’t installed or the torch wrapper is missing
+    # TE isn't installed or the torch wrapper is missing
     tex = None
 
 stimer = StragglerDetector()
@@ -212,7 +218,7 @@ def forward_step(data_iterator, model: HybridModel):
 
     Args:
         data_iterator : Input data iterator
-        model (HybridModel): The Model
+        model (HybridModel): The Hybrid Model
     """
     timers = get_timers()
 
@@ -259,12 +265,18 @@ def forward_step(data_iterator, model: HybridModel):
 
 
 def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
+    args = get_args()
+    config = core_transformer_config_from_args(args)
     if mpu.get_tensor_model_parallel_rank() != 0:
         return False
     elif is_packed_sequence:
         return True
-    else:
-        return is_first_or_last_pipeline_stage(vp_stage)
+    return is_first_or_last_pipeline_stage(vp_stage) or mtp_on_this_rank_func(
+        layout=config.pipeline_model_parallel_layout,
+        mtp_num_layers=config.mtp_num_layers,
+        ignore_virtual=False,
+        vp_stage=vp_stage,
+    )
 
 
 def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
@@ -303,6 +315,9 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         sequences_per_dataset=sequences_per_dataset,
         defer_npy_index_mmap=args.dataloader_defer_npy_index_mmap,
         context_parallel_size=args.context_parallel_size,
+        data_parallel_size=args.data_parallel_size,
+        sequence_parallel_size=args.tensor_model_parallel_size * args.sequence_parallel,
+        dynamic_context_parallel=args.dynamic_context_parallel,
     )
 
 
@@ -356,7 +371,8 @@ if __name__ == "__main__":
         extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
-    full_config = pretrain_cfg_container_from_args(args)
+    model_cfg = hybrid_config_from_args(args)
+    full_config = pretrain_cfg_container_from_args(args, model_cfg)
     pretrain(
         full_config,
         train_valid_test_datasets_provider,

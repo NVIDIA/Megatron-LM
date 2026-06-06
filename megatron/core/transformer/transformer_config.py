@@ -523,6 +523,10 @@ class TransformerConfig(ModelParallelConfig):
     fused_residual_rmsnorm: bool = False
     """If True, fuses residual connection and RMSNorm backward pass when TE is used."""
 
+    use_transformer_engine_op_fuser: bool = False
+    """If True, submodules may use Transformer Engine's operation fuser
+    API to enable advanced fusions."""
+
     ####################
     # activation recomputation
     ####################
@@ -623,6 +627,11 @@ class TransformerConfig(ModelParallelConfig):
     fp8_wgrad: bool = True
     """When set to False, override FP8 config options and do the wgrad computation
     in higher precision."""
+
+    fp8_output_proj: bool = False
+    """If True, run the LM-head output projection with a TE ColumnParallelLinear
+    under the MXFP8 autocast context. Only active when fp8=True and
+    fp8_recipe='mxfp8'."""
 
     fp8_dot_product_attention: bool = False
     """When set to True, use the FP8 implementation of Dot Product Attention."""
@@ -822,6 +831,12 @@ class TransformerConfig(ModelParallelConfig):
     Requires ``use_te_op_fuser=True`` and SwiGLU activation.
     """
 
+    use_grouped_gemm_for_dense_mlp: bool = False
+    """Alias of ``dense_grouped_gemm``. Use GroupedLinear(num_groups=1) for dense MLP to
+    trigger the ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8 fusion on SM100+ with MXFP8 recipe.
+    Requires ``use_te_op_fuser=True`` and SwiGLU activation.
+    """
+
     log_moe_overload_factor: bool = False
     """When True, log MoE overload metrics (avg/max vs balanced token count per step; max cum
     overload = peak cumulative actual tokens / peak cumulative balanced count over interleaved
@@ -948,6 +963,11 @@ class TransformerConfig(ModelParallelConfig):
     interpreted as alternating blocks of gates and linear units.
     This data format is experimental and primarily intended to enable
     advanced fused kernels."""
+
+    moe_expert_rank_capacity_factor: Optional[float] = None
+    """moe_expert_rank_capacity_factor (float): The capacity factor for each expert rank. Tokens
+    exceeding this budget will be dropped. None means no token will be dropped.
+    The default is None."""
 
     ##################
     # Context Parallel
@@ -1544,6 +1564,14 @@ class TransformerConfig(ModelParallelConfig):
         if self.fp8_param and not self.fp8:
             raise ValueError("fp8_param must be used together with fp8 mode.")
 
+        if self.fp8_output_proj:
+            if not self.fp8:
+                raise ValueError("fp8_output_proj must be used together with fp8 mode.")
+            if self.fp8_recipe != Fp8Recipe.mxfp8:
+                raise ValueError(
+                    f"fp8_output_proj requires fp8_recipe='mxfp8', got " f"'{self.fp8_recipe}'."
+                )
+
         # FP4 validation
         if self.fp4_param and not self.fp4:
             raise ValueError("fp4_param must be used together with fp4 mode.")
@@ -1660,6 +1688,18 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "moe_single_grouped_weight and moe_single_grouped_bias require "
                     f"transformer-engine>=2.14.0, but your version is {get_te_version()}."
+                )
+        if self.moe_single_grouped_weight:
+            # The dist-optimizer's quantized-param shard path on the single-grouped-weight
+            # storage is only validated for fp8 mode with the mxfp8 recipe today; other
+            # combinations have a known numerical issue tracked in upstream PR
+            # NVIDIA/Megatron-LM#4621. Reject at construction time so users don't silently
+            # train on a broken numerical path. (moe_single_grouped_bias is not gated:
+            # biases aren't quantized, so they don't enter the buggy code path.)
+            if self.fp4 or not self.fp8 or self.fp8_recipe != Fp8Recipe.mxfp8:
+                raise ValueError(
+                    "moe_single_grouped_weight is currently supported only with fp8 mode "
+                    "and fp8_recipe='mxfp8'."
                 )
         if self.moe_single_grouped_bias and not self.add_bias_linear:
             raise ValueError("moe_single_grouped_bias requires add_bias_linear=True.")
