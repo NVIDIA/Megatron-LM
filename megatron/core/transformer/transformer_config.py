@@ -523,10 +523,6 @@ class TransformerConfig(ModelParallelConfig):
     fused_residual_rmsnorm: bool = False
     """If True, fuses residual connection and RMSNorm backward pass when TE is used."""
 
-    use_transformer_engine_op_fuser: bool = False
-    """If True, submodules may use Transformer Engine's operation fuser
-    API to enable advanced fusions."""
-
     ####################
     # activation recomputation
     ####################
@@ -963,11 +959,6 @@ class TransformerConfig(ModelParallelConfig):
     interpreted as alternating blocks of gates and linear units.
     This data format is experimental and primarily intended to enable
     advanced fused kernels."""
-
-    moe_expert_rank_capacity_factor: Optional[float] = None
-    """moe_expert_rank_capacity_factor (float): The capacity factor for each expert rank. Tokens
-    exceeding this budget will be dropped. None means no token will be dropped.
-    The default is None."""
 
     ##################
     # Context Parallel

@@ -24,6 +24,7 @@ from megatron.training.utils.common_utils import (
     reduce_max_stat_across_model_parallel_group,
     report_memory,
     to_empty_if_meta_device,
+    unwrap_model,
     update_use_dist_ckpt,
     warn_rank_0,
 )

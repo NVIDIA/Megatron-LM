@@ -84,4 +84,9 @@ def is_nvrx_min_version(version: str = NVRX_MIN_VERSION) -> bool:
 
     nvrx_version = str(nvrx.__version__) if HAVE_NVRX else "0.0.0"
 
-    return PkgVersion(nvrx_version) >= PkgVersion(version)
+    # Compare the release segment only so that a pinned pre-release / dev build
+    # of the required version (e.g. "0.6.0.dev33", which PEP 440 orders *below*
+    # "0.6.0") still satisfies a ">= 0.6.0" requirement. The required-symbol
+    # check in has_nvrx_async_support() remains the authoritative guard that the
+    # specific async-checkpoint APIs are actually present.
+    return PkgVersion(nvrx_version).release >= PkgVersion(version).release
