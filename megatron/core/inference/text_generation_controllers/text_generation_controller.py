@@ -848,6 +848,22 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         if not context.async_scheduling or context.async_decode_slot_ring is None:
             return None
+        prepare_started_at = (
+            time.perf_counter()
+            if getattr(context, "async_txn_diagnostics", None) is not None
+            and context.async_txn_diagnostics.enabled
+            else None
+        )
+        try:
+            return self._prepare_async_child_from_committed_decode_state_impl(context)
+        finally:
+            if prepare_started_at is not None:
+                context.async_txn_diagnostics.record_child_prestage_duration(
+                    (time.perf_counter() - prepare_started_at) * 1_000_000
+                )
+
+    def _prepare_async_child_from_committed_decode_state_impl(self, context) -> Optional[StepTxn]:
+        """Implementation for child transaction preparation, wrapped for diagnostics."""
 
         if context.using_cuda_graph_this_step():
             # CUDA graphs capture metadata pointer addresses.  Reuse the currently
@@ -906,7 +922,19 @@ class TextGenerationController:
         child_slot = self._decode_slot_for_txn(child_txn)
 
         if hasattr(context, "sync_ep_child_graph_shape"):
-            context.sync_ep_child_graph_shape()
+            graph_shape_started_at = (
+                time.perf_counter()
+                if getattr(context, "async_txn_diagnostics", None) is not None
+                and context.async_txn_diagnostics.enabled
+                else None
+            )
+            try:
+                context.sync_ep_child_graph_shape()
+            finally:
+                if graph_shape_started_at is not None:
+                    context.async_txn_diagnostics.record_child_graph_shape_duration(
+                        (time.perf_counter() - graph_shape_started_at) * 1_000_000
+                    )
 
         if child_txn.cpu_bookkeeping_buf is not None:
             child_txn.h2d_done_event = child_slot.copy_bookkeeping_from_cpu(
@@ -1032,25 +1060,40 @@ class TextGenerationController:
     ) -> EPDecodeBroadcastPlan:
         """Synchronize whether the EP group will enter an async child forward phase."""
 
+        context = self.inference_wrapped_model.inference_context
+        sync_started_at = (
+            time.perf_counter()
+            if getattr(context, "async_txn_diagnostics", None) is not None
+            and context.async_txn_diagnostics.enabled
+            else None
+        )
         group = self._expert_parallel_group()
-        if get_pg_size(group) <= 1:
-            return EPDecodeBroadcastPlan(
+        try:
+            if get_pg_size(group) <= 1:
+                return EPDecodeBroadcastPlan(
+                    active_request_count=(
+                        int(active_request_count) if can_launch_real_child else 0
+                    ),
+                    src_group_rank=0,
+                    has_real_work=bool(can_launch_real_child),
+                )
+
+            plan = resolve_ep_decode_broadcast_plan(
                 active_request_count=(
                     int(active_request_count) if can_launch_real_child else 0
                 ),
-                src_group_rank=0,
                 has_real_work=bool(can_launch_real_child),
+                group=group,
+                sync_all_reduce_max_fn=self._ep_sync_all_reduce_max_fn(
+                    EPAsyncPhase.ASYNC_CHILD_HANDOFF
+                ),
             )
-
-        plan = resolve_ep_decode_broadcast_plan(
-            active_request_count,
-            group,
-            has_real_work=can_launch_real_child,
-            sync_all_reduce_max_fn=self._ep_sync_all_reduce_max_fn(
-                EPAsyncPhase.ASYNC_CHILD_HANDOFF
-            ),
-        )
-        return plan
+            return plan
+        finally:
+            if sync_started_at is not None:
+                context.async_txn_diagnostics.record_ep_handoff_duration(
+                    (time.perf_counter() - sync_started_at) * 1_000_000
+                )
 
     @staticmethod
     def _ep_async_child_launches(plan: EPDecodeBroadcastPlan) -> bool:

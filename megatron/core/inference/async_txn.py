@@ -62,6 +62,9 @@ class AsyncTxnDiagnostics:
     h2d_ready_before_sampling: int = 0
     sample_to_launch_latency_us: float = 0.0
     commit_duration_us: float = 0.0
+    child_prestage_duration_us: float = 0.0
+    ep_handoff_duration_us: float = 0.0
+    child_graph_shape_duration_us: float = 0.0
     retire_queue_depth: int = 0
     eligibility_skip_reasons: Counter = field(default_factory=Counter)
 
@@ -93,6 +96,18 @@ class AsyncTxnDiagnostics:
     def record_commit_duration(self, duration_us: float) -> None:
         if self.enabled:
             self.commit_duration_us = max(0.0, float(duration_us))
+
+    def record_child_prestage_duration(self, duration_us: float) -> None:
+        if self.enabled:
+            self.child_prestage_duration_us = max(0.0, float(duration_us))
+
+    def record_ep_handoff_duration(self, duration_us: float) -> None:
+        if self.enabled:
+            self.ep_handoff_duration_us = max(0.0, float(duration_us))
+
+    def record_child_graph_shape_duration(self, duration_us: float) -> None:
+        if self.enabled:
+            self.child_graph_shape_duration_us = max(0.0, float(duration_us))
 
     def record_sync_step(self, reason: AsyncTxnSkipReason | str) -> None:
         if not self.enabled:
@@ -141,6 +156,9 @@ class AsyncTxnDiagnostics:
             "h2d_ready_before_sampling": self.h2d_ready_before_sampling,
             "sample_to_launch_latency_us": self.sample_to_launch_latency_us,
             "commit_duration_us": self.commit_duration_us,
+            "child_prestage_duration_us": self.child_prestage_duration_us,
+            "ep_handoff_duration_us": self.ep_handoff_duration_us,
+            "child_graph_shape_duration_us": self.child_graph_shape_duration_us,
             "retire_queue_depth": self.retire_queue_depth,
             "eligibility_skip_reasons": dict(self.eligibility_skip_reasons),
             "top_skip_reason": self.top_skip_reason(),

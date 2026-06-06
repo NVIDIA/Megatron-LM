@@ -2263,7 +2263,11 @@ class DynamicInferenceEngine(AbstractEngine):
                     "adopted %(adopted)d, retired %(retired)d, sync %(sync_steps)d, "
                     "barrier %(barrier_skips)d, h2d-ready %(h2d_ready_before_sampling)d, "
                     "sample-launch %(sample_to_launch_latency_us).1f us, "
-                    "commit %(commit_duration_us).1f us, retire-depth %(retire_queue_depth)d, "
+                    "commit %(commit_duration_us).1f us, "
+                    "prestage %(child_prestage_duration_us).1f us, "
+                    "ep-handoff %(ep_handoff_duration_us).1f us, "
+                    "child-graph %(child_graph_shape_duration_us).1f us, "
+                    "retire-depth %(retire_queue_depth)d, "
                     "top-skip %(top_skip_reason)s"
                 ) % async_diag
             if context_state["is_decode_only"]:
