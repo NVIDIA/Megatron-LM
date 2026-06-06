@@ -1996,6 +1996,10 @@ def _add_inference_args(parser):
                        action=argparse.BooleanOptionalAction,
                        default=False,
                        help='Enable transactional async scheduling for dynamic decode.')
+    group.add_argument('--inference-dynamic-batching-async-chain-scheduling',
+                       action=argparse.BooleanOptionalAction,
+                       default=True,
+                       help='Enable chained sampling plus child-forward launch for async decode.')
     group.add_argument('--inference-logging-step-interval', type=int, default=0,
                        help='Step interval for logging inference metrics. '
                             'Default to 0 to disable inference logging.')

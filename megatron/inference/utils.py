@@ -384,6 +384,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         disable_ep_consensus=args.inference_disable_ep_consensus,
         sampling_backend=args.inference_dynamic_batching_sampling_backend,
         async_scheduling=args.inference_dynamic_batching_async_scheduling,
+        async_chain_scheduling=args.inference_dynamic_batching_async_chain_scheduling,
     )
 
 

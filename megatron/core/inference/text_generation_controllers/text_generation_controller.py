@@ -1073,7 +1073,11 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         if parent_txn is None or child_txn is None:
             return False
-        if not context.async_scheduling or context.async_decode_slot_ring is None:
+        if (
+            not context.async_scheduling
+            or not getattr(context, "async_chain_scheduling", True)
+            or context.async_decode_slot_ring is None
+        ):
             return False
         if skip_bookkeeping or return_log_probs or return_top_n_logprobs:
             return False

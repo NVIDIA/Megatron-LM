@@ -341,6 +341,9 @@ class InferenceConfig:
     async_scheduling: bool = False
     """Enable transactional async scheduling for dynamic decode."""
 
+    async_chain_scheduling: bool = True
+    """Enable chained sampling plus child-forward launch for async decode."""
+
     request_metadata_types: Optional[List[Tuple[str, torch.dtype]]] = None
     """
     A list of the per-request metadata types to track. Each entry is a tuple

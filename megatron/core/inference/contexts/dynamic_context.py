@@ -290,6 +290,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Engine step counter (used for logging, metrics, and event tracking)
         self.step_count = 0
         self.async_scheduling = inference_config.async_scheduling
+        self.async_chain_scheduling = inference_config.async_chain_scheduling
         self.async_txn_diagnostics = AsyncTxnDiagnostics(enabled=self.async_scheduling)
         self.async_txn_retire_queue = TxnRetireQueue(self.async_txn_diagnostics)
         self.async_decode_slot_ring: Optional[AsyncDecodeSlotRing] = None
