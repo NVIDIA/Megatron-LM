@@ -199,7 +199,6 @@ class TestTransformerLayerDeterminism:
         RUNNER.run(cfg_overrides, parallelism)
 
     @pytest.mark.internal
-    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(
         os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS", "1") == "1",
         reason=(
@@ -239,7 +238,6 @@ class TestTransformerLayerDeterminism:
         assert_bit_exact(out_a, g_a, out_b, g_b)
 
     @pytest.mark.internal
-    @pytest.mark.flaky_in_dev
     @pytest.mark.parametrize("cfg_overrides", GPT_CONFIGS)
     def test_bit_exact_under_jitter(self, cfg_overrides):
         if Utils.world_size < 4:
