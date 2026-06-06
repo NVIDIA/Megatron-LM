@@ -1017,7 +1017,12 @@ class TextGenerationController:
         return event
 
     def _start_async_sample_transfer(self, active_request_count: int, sample_ready_event) -> None:
-        """Start sampled-token D2H after child launch without waiting on child forward."""
+        """Start sampled-token D2H at the sample boundary.
+
+        The copy stream waits only for sampling, not for the child forward. This keeps the
+        transaction accept path from paying for sampled-token D2H after the child forward
+        has already been launched.
+        """
 
         if (
             sample_ready_event is None
@@ -1151,13 +1156,13 @@ class TextGenerationController:
             )
 
         sample_ready_event = self._record_async_sample_ready_event()
+        self._start_async_sample_transfer(active_request_count, sample_ready_event)
         self._launch_async_decode_child(
             child_txn,
             h2d_ready_before_sampling=child_txn.h2d_ready(),
             sample_completed_at=sample_completed_at,
             profile_child_forward=profile_child_forward,
         )
-        self._start_async_sample_transfer(active_request_count, sample_ready_event)
         self._async_presampled_txn = parent_txn
         self._async_presampled_cuda_graph_request_count = (
             context.padded_active_request_count if context.using_cuda_graph_this_step() else None
@@ -2852,13 +2857,13 @@ class TextGenerationController:
             ):
                 launched_child_txn = self._async_prepared_child_txn
                 sample_ready_event = self._record_async_sample_ready_event()
+                self._start_async_sample_transfer(active_request_count, sample_ready_event)
                 self._launch_async_decode_child(
                     launched_child_txn,
                     h2d_ready_before_sampling=h2d_ready_before_sampling,
                     sample_completed_at=sample_completed_at,
                     profile_child_forward=profile_async_child_forward,
                 )
-                self._start_async_sample_transfer(active_request_count, sample_ready_event)
 
             if return_log_probs or return_top_n_logprobs:
                 if self.num_speculative_tokens > 0:

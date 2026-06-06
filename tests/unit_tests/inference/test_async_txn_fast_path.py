@@ -174,6 +174,9 @@ def _make_controller(context):
     controller._accepted_tokens_per_request = None
     controller._accepted_token_counts_per_request = None
     controller._sampled_tokens_cuda = torch.tensor([5], dtype=torch.int64)
+    controller._async_sampled_tokens_cpu = torch.empty(4, dtype=torch.int64)
+    controller._async_sample_transfer_done_event = None
+    controller._async_sample_transfer_count = 0
 
     def context_init():
         order.append("init")
@@ -191,8 +194,34 @@ def _make_controller(context):
 
     def transfer(active_request_count):
         order.append("transfer")
-        assert "child_forward" in order
         return controller._sampled_tokens_cuda[:active_request_count].cpu(), None
+
+    def record_sample_ready():
+        order.append("sample_ready")
+        return object()
+
+    def start_async_transfer(active_request_count, sample_ready_event):
+        order.append("transfer_start")
+        assert sample_ready_event is not None
+        assert "sample" in order
+        assert "child_forward" not in order
+        controller._async_sampled_tokens_cpu[:active_request_count].copy_(
+            controller._sampled_tokens_cuda[:active_request_count]
+        )
+        controller._async_sample_transfer_done_event = sample_ready_event
+        controller._async_sample_transfer_count = active_request_count
+
+    def consume_async_transfer(active_request_count):
+        if (
+            controller._async_sample_transfer_done_event is None
+            or controller._async_sample_transfer_count != active_request_count
+        ):
+            return None
+        order.append("transfer")
+        sampled_tokens_cpu = controller._async_sampled_tokens_cpu[:active_request_count].clone()
+        controller._async_sample_transfer_done_event = None
+        controller._async_sample_transfer_count = 0
+        return sampled_tokens_cpu
 
     controller._dynamic_step_context_init = context_init
     controller._dynamic_step_forward_logits = forward
@@ -202,6 +231,9 @@ def _make_controller(context):
     controller._dynamic_step_calculate_top_n_logprobs = lambda log_probs_tensor: None
     controller._router_record_bookkeeping = lambda: None
     controller._transfer_samples_to_cpu = transfer
+    controller._record_async_sample_ready_event = record_sample_ready
+    controller._start_async_sample_transfer = start_async_transfer
+    controller._consume_async_sample_transfer = consume_async_transfer
     return controller, order
 
 
@@ -257,13 +289,15 @@ def test_dynamic_sample_logits_keeps_generic_sampler_for_non_greedy_requests():
     assert controller._sampled_tokens_cuda is sampled
 
 
-def test_child_launch_occurs_before_cpu_sample_transfer():
+def test_cpu_sample_transfer_starts_before_child_launch():
     context = FakeContext()
     controller, order = _make_controller(context)
 
     result = asyncio.run(controller.async_generate_output_tokens_dynamic_batch())
 
     assert result["sample"].tolist() == [7]
+    assert order.index("sample") < order.index("transfer_start")
+    assert order.index("transfer_start") < order.index("child_forward")
     assert order.index("child_forward") < order.index("transfer")
     assert context.async_txn_diagnostics.launched == 1
     assert context.async_txn_diagnostics.prepared == 2
