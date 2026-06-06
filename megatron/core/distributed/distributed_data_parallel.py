@@ -303,17 +303,22 @@ class DistributedDataParallel(_BaseDataParallel):
                 else:
                     assert scaling_factor == target_gradient_scaling_factor
 
-            # If GTP carved params out of all_params, the caller-supplied (or auto-computed)
-            # full_param_layout.layouts[buffer_key].param_index_map will contain GTP entries
-            # that aren't in this buffer's `params_with_names`. _build_gbuf_range_map iterates
-            # param_index_map, so those stray GTP entries would surface as KeyErrors in
-            # DistOpt's world_param_group_map. Force buffer to compute its own layout in
-            # that case.
-            param_layout = (
-                full_param_layout.layouts.get(buffer_key)
-                if full_param_layout is not None and not gtp_params
-                else None
-            )
+            # With GTP: full_param_layout contains stray GTP entries not in this buffer,
+            # so recompute a fresh padded layout to avoid KeyErrors and bucket misalignment.
+            if full_param_layout is not None and not gtp_params:
+                param_layout = full_param_layout.layouts.get(buffer_key)
+            elif self.ddp_config.use_distributed_optimizer:
+                from ..optimizer.distrib_optimizer import DistributedOptimizer
+
+                param_layout = DistributedOptimizer._compute_per_buffer_param_layout(
+                    params,
+                    self.bucket_size,
+                    data_parallel_group.size(),
+                    self.ddp_config,
+                    param_indices,
+                )
+            else:
+                param_layout = None
             params_with_names = [(p, param_to_name[p]) for p in params]
             buffer = _ParamAndGradBuffer(
                 self.ddp_config,

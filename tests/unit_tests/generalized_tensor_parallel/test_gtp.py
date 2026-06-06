@@ -29,6 +29,7 @@ Test groups
 21. TestFuseWgradAccumulation    – fuse_wgrad_accumulation=True: wgrad→main_grad (multi-GPU)
 22. TestGTPGradAccumHook         – main_grad updated after reduce-scatter backward (multi-GPU)
 23. TestWaitAsyncCommsFallback   – wait_async_comms(finalize_after_drain=True) inline-accumulation fallback when _wgrad_rs_handle is None (single-process)
+24. TestGTPDDPBucketAlignment    – GTP and regular DDP buffer bucket ends padded for dist-opt alignment (multi-GPU)
 
 Run via torchrun (matches the rest of Megatron's unit tests):
 
@@ -1631,17 +1632,18 @@ class TestWaitAsyncCommsFallback:
 
 
 def _worker_gtp_ddp_bucket_alignment(rank, world_size, port):
-    """GTP buffers must use padded bucket layout when use_distributed_optimizer=True.
+    """GTP param buffers in DDP must use padded bucket layout with use_distributed_optimizer=True.
 
-    Without the fix (param_layout=None for GTP buffers in DDP), bucket ends are
-    not padded to be divisible by intra_dp_cp_with_gtp_group.size(), violating the
-    assertion at param_and_grad_buffer.py:1427.
+    Bug: DDP used param_layout=None for GTP buffers, falling through to
+    _compute_default_per_buffer_param_layout, which packs params without padding bucket ends.
+    The distributed optimizer requires every bucket end to be divisible by
+    intra_dp_cp_with_gtp_group.size() (asserted at param_and_grad_buffer.py:1427).
 
-    Trigger conditions:
-      GTP=2, DP=4  →  intra_dp_cp_with_gtp_group.size() = 2
-      pad_for_alignment=0  →  shard of [out=2,in=3] weight = [1,3] = 3 elements (odd)
-      Two GTP params (total 6 = 2*3; 6%2==0 passes the per-buffer total check)
-      bucket_size=3  →  first param alone fills bucket-0; end=3, 3%2≠0 → AssertionError
+    Trigger:
+      GTP=2, DP=4  →  intra_dp_cp_with_gtp_group.size()=2
+      pad_for_alignment=0, weight [out=2,in=3]  →  GTP shard=[1,3]=3 elements (odd)
+      Two GTP params: total=6, 6%2==0 (total check passes); bucket_size=3 forces
+      bucket-0 to contain only the first param, end=3, 3%2≠0  →  AssertionError
     """
     from megatron.core import parallel_state as ps
     from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
@@ -1684,8 +1686,70 @@ def _worker_gtp_ddp_bucket_alignment(rank, world_size, port):
         ps.initialize_model_parallel()  # restore default for remaining tests
 
 
+def _worker_regular_buffer_padded_when_gtp_params_present(rank, world_size, port):
+    """Regular (non-GTP) param buffers in DDP must also use padded layout when GTP is active.
+
+    Bug: when gtp_params is non-empty, full_param_layout.layouts contains stale GTP entries
+    that don't belong to the regular buffer, causing KeyErrors in DistOpt's param map.
+    DDP avoided this by forcing param_layout=None for regular buffers, but that falls through
+    to _compute_default_per_buffer_param_layout, which produces unpadded bucket ends, again
+    violating param_and_grad_buffer.py:1427 (end_index % data_parallel_world_size == 0).
+
+    Trigger:
+      GTP=2, DP=4  →  intra_dp_cp_group.size()=4  (regular params reduce over the full DP group)
+      bias=True  →  each bias has 2 elements (not divisible by 4)
+      Two layers: total regular numel=4, 4%4==0 (total check passes); bucket_size=2 forces
+      bucket-0 to contain only the first bias, end=2, 2%4≠0  →  AssertionError
+    """
+    from megatron.core import parallel_state as ps
+    from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+    from megatron.core.transformer.transformer_config import TransformerConfig
+
+    ps.destroy_model_parallel()
+    ps.initialize_model_parallel(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=2
+    )
+
+    orig_pad = gtp_module.GTP_CONFIG.pad_for_alignment
+    gtp_module.GTP_CONFIG.pad_for_alignment = 0
+    try:
+        gtp_group = ps.get_generalized_tensor_parallel_remat_group()
+
+        class _TwoLayerModelWithBias(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                # bias=True: weight → GTPShardedParam (gtp_buffer), bias → regular param
+                self.fc0 = te.Linear(3, 2, bias=True, device="cuda")
+                self.fc1 = te.Linear(3, 2, bias=True, device="cuda")
+
+        model = _TwoLayerModelWithBias()
+        wrap_module_params_gtp(model.fc0, ["weight"], gtp_group)
+        wrap_module_params_gtp(model.fc1, ["weight"], gtp_group)
+
+        config = TransformerConfig(
+            num_attention_heads=1, num_layers=1, hidden_size=4, tensor_model_parallel_size=1
+        )
+        # bucket_size=2: each 2-element bias fills one bucket in the regular buffer.
+        # Without the fix: regular buffer uses param_layout=None → bucket-0 ends at 2,
+        # 2 % intra_dp_cp_group.size()(=4) != 0 → AssertionError at line 1427.
+        ddp_config = DistributedDataParallelConfig(
+            use_distributed_optimizer=True, overlap_grad_reduce=True, bucket_size=2
+        )
+
+        DistributedDataParallel(config, ddp_config, model)
+    finally:
+        gtp_module.GTP_CONFIG.pad_for_alignment = orig_pad
+        ps.destroy_model_parallel()
+        ps.initialize_model_parallel()
+
+
 class TestGTPDDPBucketAlignment:
     def test_gtp_buffers_use_padded_layout_with_distributed_optimizer(self):
-        """GTP DDP buffer creation must not violate bucket-end alignment for dist-opt."""
+        """GTP buffer bucket ends must be padded to intra_dp_cp_with_gtp_group.size()."""
         _requires_multi_gpu(4)
         _run_distributed(_worker_gtp_ddp_bucket_alignment, 4)
+
+    def test_regular_buffers_use_padded_layout_when_gtp_params_present(self):
+        """Regular buf bucket ends must be padded even when gtp_params forces layoutrecompute."""
+        _requires_multi_gpu(4)
+        _run_distributed(_worker_regular_buffer_padded_when_gtp_params_present, 4)
