@@ -30,6 +30,7 @@ from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
+from megatron.core.inference.engines.step_transaction import StepTransactionManager
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import (
     DynamicInferenceEvent,
@@ -246,6 +247,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.track_paused_request_events = inference_config.track_paused_request_events
         self.track_generated_token_events = inference_config.track_generated_token_events
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
+        self.enable_async_scheduling = inference_config.enable_async_scheduling
         self.metrics_writer = inference_config.metrics_writer
         self.logging_step_interval = inference_config.logging_step_interval
         self.unified_memory_level = inference_config.unified_memory_level
@@ -298,6 +300,14 @@ class DynamicInferenceEngine(AbstractEngine):
         """Reset by removing all requests and reset all state."""
 
         self.context.reset()
+
+        # Transactional async-scheduling manager (retire queue + diagnostics +
+        # per-step transaction lifecycle). Constructed only when the opt-in flag is
+        # on, so the disabled decode path carries no extra state or work.
+        self.step_txn_manager = (
+            StepTransactionManager(self.context) if self.enable_async_scheduling else None
+        )
+        self._current_txn = None
 
         # Request state.
         self.request_counter = Counter()
@@ -1771,6 +1781,17 @@ class DynamicInferenceEngine(AbstractEngine):
         # schedule requests
         self.schedule_waiting_requests()
 
+        # Transactional async-scheduling (opt-in): drain the retire queue, then wrap
+        # this step as an always-adopted serial transaction. This commit keeps the
+        # step fully serial -- no speculative child launch -- so generated tokens are
+        # identical to the disabled path; the wrapper only tracks lifecycle/diagnostics.
+        if self.enable_async_scheduling:
+            self.step_txn_manager.retire(self.context.step_count)
+            self._current_txn = self.step_txn_manager.begin_serial_txn(
+                step_id=self.context.step_count,
+                active_request_count=self.context.get_active_request_count(),
+            )
+
         # The print block (async_bookkeep) and metrics block both fire on this
         # condition after step_count is incremented. Predict it up-front so we
         # can skip the GPU-timing sync and the context_state dict builds that
@@ -2085,6 +2106,12 @@ class DynamicInferenceEngine(AbstractEngine):
             logging.info(output_str)
 
         nvtx_range_pop("console_logging")
+
+        # Transactional async-scheduling (opt-in): commit the wrapped serial
+        # transaction now that update_requests + bookkeeping for this step are done.
+        if self.enable_async_scheduling and self._current_txn is not None:
+            self.step_txn_manager.commit(self._current_txn)
+            self._current_txn = None
 
         return {
             "active_request_ids": active_request_ids,

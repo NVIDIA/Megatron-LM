@@ -24,6 +24,13 @@ import pytest
 import torch
 
 from megatron.core.inference.config import InferenceConfig
+from megatron.core.inference.engines.step_transaction import (
+    RetireQueue,
+    StepTransactionManager,
+    StepTxn,
+    StepTxnDiagnostics,
+    TxnPhase,
+)
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.utils import is_fa_min_version
 from tests.unit_tests.inference.engines.test_dynamic_engine import (
@@ -169,3 +176,229 @@ class TestAsyncSchedTxnFlag(AsyncSchedTxnTestBase):
             num_requests=4,
             num_gap_steps=1,
         )
+
+
+class _StubEvent:
+    """A CUDA-event stand-in with a controllable ``query()`` for deterministic tests."""
+
+    def __init__(self, ready: bool):
+        self.ready = ready
+        self.synchronized = False
+
+    def query(self) -> bool:
+        return self.ready
+
+    def synchronize(self) -> None:
+        self.synchronized = True
+        self.ready = True
+
+
+@pytest.mark.internal
+class TestStepTransactionPrimitives:
+    """C1 unit tests for the transaction data structures (no model parallel needed)."""
+
+    def test_lease_ownership_single_owner(self) -> None:
+        """Resources are owned by the transaction via lease fields -- no global arrays."""
+        txn = StepTxn(step_id=7, active_request_count=3)
+        assert txn.phase is TxnPhase.SERIAL
+        assert not txn.has_leases()
+
+        txn.lease_kv_block(11)
+        txn.lease_kv_block(12)
+        txn.reserve_boundary_block(request_id=5, block_column=2, block_id=99)
+        txn.lease_mamba_slot(4)
+
+        assert txn.kv_block_leases == [11, 12]
+        assert txn.reserved_boundary_blocks == {(5, 2): 99}
+        assert txn.mamba_slot_leases == [4]
+        # Reserved boundary blocks are included in the full KV-block ownership view.
+        assert sorted(txn.leased_kv_block_ids()) == [11, 12, 99]
+        assert txn.has_leases()
+
+    def test_retire_queue_two_step_delay_no_event(self) -> None:
+        """Without a fence, a resource is released only after the two-step delay."""
+        released = []
+        q = RetireQueue()
+        assert q.RETIRE_DELAY_STEPS == 2
+        q.enqueue(enqueue_step=0, release=lambda: released.append("blk"), tag="kv")
+
+        assert q.drain(0) == 0  # same step
+        assert q.drain(1) == 0  # one step later
+        assert released == []
+        assert q.pending() == 1
+        assert q.drain(2) == 1  # two steps later -> released
+        assert released == ["blk"]
+        assert q.pending() == 0
+
+    def test_retire_queue_fence_gate(self) -> None:
+        """Even past the delay, a resource is held until its fence completes."""
+        released = []
+        ev = _StubEvent(ready=False)
+        q = RetireQueue()
+        q.enqueue(enqueue_step=0, release=lambda: released.append("blk"), event=ev, tag="kv")
+
+        # Delay satisfied, but fence not yet complete -> still held.
+        assert q.drain(5) == 0
+        assert released == []
+        assert q.pending() == 1
+
+        # Fence completes -> released on next drain.
+        ev.ready = True
+        assert q.drain(5) == 1
+        assert released == ["blk"]
+
+    def test_retire_queue_real_cuda_event(self) -> None:
+        """Integration: a recorded+synchronized CUDA event gates the release."""
+        released = []
+        stream = torch.cuda.current_stream()
+        x = torch.ones(256, 256, device="cuda")
+        _ = x @ x  # enqueue real work
+        ev = torch.cuda.Event()
+        ev.record(stream)
+
+        q = RetireQueue()
+        q.enqueue(enqueue_step=0, release=lambda: released.append("blk"), event=ev)
+        ev.synchronize()  # guarantee completion
+        assert q.drain(2) == 1
+        assert released == ["blk"]
+
+    def test_retire_queue_drain_all_blocking(self) -> None:
+        """Shutdown drain synchronizes fences and releases everything."""
+        released = []
+        ev = _StubEvent(ready=False)
+        q = RetireQueue()
+        q.enqueue(enqueue_step=10, release=lambda: released.append("a"), event=ev)
+        q.enqueue(enqueue_step=10, release=lambda: released.append("b"))
+        assert q.drain_all_blocking() == 2
+        assert sorted(released) == ["a", "b"]
+        assert ev.synchronized is True
+        assert q.pending() == 0
+
+    def test_retire_queue_out_of_order_ready(self) -> None:
+        """A ready entry is not blocked behind an earlier not-ready one."""
+        released = []
+        not_ready = _StubEvent(ready=False)
+        ready = _StubEvent(ready=True)
+        q = RetireQueue()
+        q.enqueue(enqueue_step=0, release=lambda: released.append("first"), event=not_ready)
+        q.enqueue(enqueue_step=0, release=lambda: released.append("second"), event=ready)
+
+        assert q.drain(2) == 1  # only the ready one
+        assert released == ["second"]
+        assert q.pending() == 1
+
+    def test_manager_serial_txn_lifecycle_and_diagnostics(self) -> None:
+        """begin_serial_txn -> commit updates phase and the always-on counters."""
+        mgr = StepTransactionManager(context=None)
+        d = mgr.diagnostics
+        assert d.as_dict()["serial_steps"] == 0
+
+        txn = mgr.begin_serial_txn(step_id=0, active_request_count=2)
+        assert txn.phase is TxnPhase.ADOPTED
+        assert txn.speculative is False
+        assert (d.prepared, d.adopted, d.serial_steps, d.launched) == (1, 1, 1, 0)
+        assert mgr.current_txn is txn
+
+        mgr.commit(txn)
+        assert txn.phase is TxnPhase.COMMITTED
+
+        # Diagnostic hooks are O(1) and route to the right counters.
+        mgr.note_sync_step("admission")
+        mgr.barrier("graph_recapture")
+        mgr.note_skip("paused_request")
+        mgr.note_guard_failure()
+        snap = d.as_dict()
+        assert snap["sync_steps"] == 1
+        assert snap["barrier_skips"] == 1
+        assert snap["guard_failures"] == 1
+        assert snap["skip_reasons"] == {
+            "admission": 1,
+            "graph_recapture": 1,
+            "paused_request": 1,
+        }
+
+    def test_diagnostics_dict_keys(self) -> None:
+        """The diagnostics snapshot exposes the full documented counter set."""
+        keys = set(StepTxnDiagnostics().as_dict().keys())
+        assert keys == {
+            "prepared",
+            "launched",
+            "adopted",
+            "serial_steps",
+            "sync_steps",
+            "barrier_skips",
+            "retired",
+            "guard_failures",
+            "skip_reasons",
+        }
+
+
+@pytest.mark.skipif(
+    not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+)
+class TestAsyncSchedTxnScaffold(AsyncSchedTxnTestBase):
+    """C1: the serial step wrapped as an always-adopted transaction (still serial)."""
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+        )
+
+    @classmethod
+    def teardown_class(cls):
+        delete_cuda_graphs()
+        set_rounder(64)
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    def test_manager_only_when_enabled(self) -> None:
+        """The manager (and its overhead) exists only when the flag is on."""
+        set_rounder(4)
+        off_env = self._build_test_env(
+            DynamicEngineTestConfig(model_provider="gpt", enable_async_scheduling=False)
+        )
+        assert off_env.engine.step_txn_manager is None
+
+        on_env = self._build_test_env(
+            DynamicEngineTestConfig(model_provider="gpt", enable_async_scheduling=True)
+        )
+        assert on_env.engine.step_txn_manager is not None
+        assert on_env.engine.step_txn_manager.diagnostics.as_dict() == StepTxnDiagnostics().as_dict()
+
+    @pytest.mark.internal
+    def test_no_global_async_resource_arrays(self) -> None:
+        """The context must not carry global _async_reserved_* / _async_deferred_* arrays."""
+        set_rounder(4)
+        env = self._build_test_env(
+            DynamicEngineTestConfig(model_provider="gpt", enable_async_scheduling=True)
+        )
+        ctx = env.engine.context
+        offenders = [
+            name
+            for name in vars(ctx)
+            if name.startswith("_async_reserved") or name.startswith("_async_deferred")
+        ]
+        assert offenders == [], f"global async resource arrays present: {offenders}"
+
+    @pytest.mark.internal
+    def test_serial_wrapped_txn_equals_serial_bs1(self) -> None:
+        """bs=1 tiny GPT decode is token-identical when wrapped as a serial txn."""
+        serial_env, async_env = self.assert_async_equals_serial(
+            model_provider="gpt",
+            num_requests=1,
+            num_tokens_to_generate=8,
+            num_gap_steps=1,
+        )
+        # The wrapped path ran as always-adopted serial transactions: every step was
+        # prepared+adopted, none launched speculatively, and no guard ever tripped.
+        d = async_env.engine.step_txn_manager.diagnostics
+        assert d.serial_steps > 0
+        assert d.prepared == d.serial_steps
+        assert d.adopted == d.serial_steps
+        assert d.launched == 0
+        assert d.guard_failures == 0
+        assert d.retired == 0
