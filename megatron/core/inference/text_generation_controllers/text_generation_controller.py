@@ -150,6 +150,7 @@ class TextGenerationController:
         self._ep_step_begin_decision: Optional[EPStepBeginDecision] = None
         self._ep_dummy_sampled_tokens_cuda: Optional[Tensor] = None
         self._ep_dummy_accepted_counts_cuda: Optional[Tensor] = None
+        self._dummy_context_h2d_done_event = None
 
     def set_stop_word_finished_ids_callback(self, callback):
         """Set a callback to get request IDs that should be marked as finished due to stop words.
@@ -591,7 +592,11 @@ class TextGenerationController:
 
         # Single batch CPU-to-GPU transfer of bookkeeping state.
         range_push("transfer_bookkeeping_to_gpu")
-        context.transfer_bookkeeping_to_gpu()
+        h2d_done_event = context.transfer_bookkeeping_to_gpu(
+            record_done_event=is_dummy_forward
+        )
+        if is_dummy_forward:
+            self._dummy_context_h2d_done_event = h2d_done_event
         range_pop()
 
         set_moe_metadata_sync(unwrapped_model)
@@ -1216,6 +1221,15 @@ class TextGenerationController:
             list(range(plan.active_request_count)),
             finished_request_ids=(),
         )
+
+    def _wait_for_dummy_context_h2d(self) -> None:
+        """Fence dummy metadata H2D before reusing its pinned CPU source buffer."""
+
+        h2d_done_event = self._dummy_context_h2d_done_event
+        if h2d_done_event is None:
+            return
+        h2d_done_event.synchronize()
+        self._dummy_context_h2d_done_event = None
 
     def _rewind_kv_cache(self) -> tuple:
         """Update the KV cache bookkeeping for speculative decoding.
@@ -2064,6 +2078,7 @@ class TextGenerationController:
         finally:
             self._clear_ep_decode_broadcast_plan()
             self._clear_ep_step_begin_decision()
+            self._wait_for_dummy_context_h2d()
             # clear the context of any temporary state from the dummy forward
             context.reset()
 

@@ -1243,6 +1243,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             device=torch.cuda.current_device(),
             max_mamba_chunks=self._max_mamba_chunks,
         )
+        self._bookkeeping_h2d_done_event = torch.cuda.Event()
         if self.async_scheduling:
             child_gpu_view = ContextGPUView(
                 max_requests=self.max_requests,
@@ -2798,7 +2799,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.mamba_ssm_states[:, indices] = 0.0
             self._pending_mamba_zeros.clear()
 
-    def transfer_bookkeeping_to_gpu(self, slot: Optional[AsyncDecodeSlot] = None) -> None:
+    def transfer_bookkeeping_to_gpu(
+        self,
+        slot: Optional[AsyncDecodeSlot] = None,
+        *,
+        record_done_event: bool = False,
+    ) -> Optional[torch.cuda.Event]:
         """Batch transfer CPU bookkeeping state to GPU staging buffers.
 
         Called after initialize_attention_state() and before the forward pass.
@@ -2852,6 +2858,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.gpu_view._buf.copy_(self._cpu_bookkeeping_buf, non_blocking=True)
         else:
             slot.copy_bookkeeping_from_cpu(self._cpu_bookkeeping_buf, non_blocking=True)
+        done_event = None
+        if record_done_event:
+            done_event = self._bookkeeping_h2d_done_event
+            done_event.record(torch.cuda.current_stream())
 
         # MHA metadata GPU views were already bound to state_data in
         # initialize_attention_state(); the H2D above populates the underlying
@@ -2861,6 +2871,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         if hasattr(self, '_pending_mamba_transfer') and self._pending_mamba_transfer is not None:
             self.mamba_metadata.load_from_cpu(self._pending_mamba_transfer)
             self._pending_mamba_transfer = None
+
+        return done_event
 
     def reset_tensors(self) -> None:
         """Fill all bookkeeping tensors with sentinel values."""

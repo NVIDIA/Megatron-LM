@@ -248,6 +248,7 @@ def _make_dummy_controller(*, num_speculative_tokens):
     controller._dummy_serial_mtp_forward = lambda: calls.append("serial_mtp")
     controller._clear_ep_decode_broadcast_plan = lambda: calls.append("clear_plan")
     controller._clear_ep_step_begin_decision = lambda: calls.append("clear_step")
+    controller._dummy_context_h2d_done_event = None
     return controller, calls
 
 
@@ -272,6 +273,28 @@ def test_mtp_dummy_reuse_keeps_decode_result_collective_before_mtp_and_child():
         "clear_step",
         "reset",
     ]
+
+
+def test_dummy_forward_fences_metadata_h2d_before_context_reset():
+    controller, calls = _make_dummy_controller(num_speculative_tokens=0)
+
+    class Event:
+        def synchronize(self):
+            calls.append("h2d_wait")
+
+    controller._dummy_context_h2d_done_event = Event()
+
+    controller.dummy_forward()
+
+    assert calls == [
+        "child_forward",
+        "serial_mtp",
+        "clear_plan",
+        "clear_step",
+        "h2d_wait",
+        "reset",
+    ]
+    assert controller._dummy_context_h2d_done_event is None
 
 
 def test_dummy_rank_mirrors_sync_replacement_and_mtp_phase_collectives():
