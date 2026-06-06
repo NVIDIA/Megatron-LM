@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -179,6 +180,54 @@ def test_ep_decode_broadcast_plan_rejects_multiple_real_sources():
             has_real_work=True,
             sync_all_reduce_max_fn=sync_all_reduce_max,
         )
+
+
+def _make_dummy_controller(*, num_speculative_tokens):
+    calls = []
+    controller = object.__new__(TextGenerationController)
+    controller.num_speculative_tokens = num_speculative_tokens
+    controller.model_config = SimpleNamespace(moe_pad_experts_for_cuda_graph_inference=False)
+    controller.inference_wrapped_model = SimpleNamespace(
+        inference_context=SimpleNamespace(reset=lambda: calls.append("reset"))
+    )
+    controller._decide_ep_step_begin = lambda has_real_work: SimpleNamespace(
+        reuse_pending_forward=True
+    )
+    controller._dynamic_step_context_init = lambda is_dummy_forward=False: (_ for _ in ()).throw(
+        AssertionError("non-MTP reuse should not run a base dummy forward")
+    )
+    controller._dynamic_step_forward_logits = lambda input_ids, position_ids: calls.append(
+        "forward"
+    )
+    controller._dummy_decode_sample_collective = lambda: calls.append("decode_result_collective")
+    controller._dummy_decode_async_child_forward_if_planned = lambda: calls.append("child_forward")
+    controller._dummy_serial_mtp_forward = lambda: calls.append("serial_mtp")
+    controller._clear_ep_decode_broadcast_plan = lambda: calls.append("clear_plan")
+    controller._clear_ep_step_begin_decision = lambda: calls.append("clear_step")
+    return controller, calls
+
+
+def test_non_mtp_dummy_reuse_skips_decode_result_collective():
+    controller, calls = _make_dummy_controller(num_speculative_tokens=0)
+
+    controller.dummy_forward()
+
+    assert calls == ["child_forward", "serial_mtp", "clear_plan", "clear_step", "reset"]
+
+
+def test_mtp_dummy_reuse_keeps_decode_result_collective_before_mtp_and_child():
+    controller, calls = _make_dummy_controller(num_speculative_tokens=2)
+
+    controller.dummy_forward()
+
+    assert calls == [
+        "decode_result_collective",
+        "serial_mtp",
+        "child_forward",
+        "clear_plan",
+        "clear_step",
+        "reset",
+    ]
 
 
 def test_dummy_rank_mirrors_sync_replacement_and_mtp_phase_collectives():

@@ -1112,6 +1112,11 @@ class TextGenerationController:
             src_group_rank=self._ep_broadcast_source_rank(),
         )
 
+    def _ep_decode_results_need_collectives(self) -> bool:
+        """Whether decode result tensors have an EP peer consumer this step."""
+
+        return self.num_speculative_tokens > 0
+
     def _ensure_ep_dummy_sampled_tokens(self, active_request_count: int) -> Tensor:
         device = self._ep_decode_collective_device()
         needs_alloc = (
@@ -1153,22 +1158,13 @@ class TextGenerationController:
         if plan is None or not plan.has_real_work or plan.active_request_count <= 0:
             return
 
-        if self.num_speculative_tokens > 0:
-            accepted_counts = self._ensure_ep_dummy_accepted_counts(plan.active_request_count)
-            broadcast_ep_accepted_counts(
-                accepted_counts,
-                plan.active_request_count,
-                group,
-                src_group_rank=plan.src_group_rank,
-            )
-        else:
-            sampled_tokens = self._ensure_ep_dummy_sampled_tokens(plan.active_request_count)
-            broadcast_ep_sampled_tokens(
-                sampled_tokens,
-                plan.active_request_count,
-                group,
-                src_group_rank=plan.src_group_rank,
-            )
+        accepted_counts = self._ensure_ep_dummy_accepted_counts(plan.active_request_count)
+        broadcast_ep_accepted_counts(
+            accepted_counts,
+            plan.active_request_count,
+            group,
+            src_group_rank=plan.src_group_rank,
+        )
 
     def _dummy_decode_stop_word_collective_tail(self) -> None:
         """Mirror the stop-word EP collective after dummy MTP work."""
@@ -1587,8 +1583,9 @@ class TextGenerationController:
             eager=not use_graph,
             cache_key=("sample", n) if use_graph else None,
         )
-        self._sync_ep_decode_broadcast_plan(active_request_count, has_real_work=True)
-        self._ep_broadcast_sampled_tokens(active_request_count)
+        if self._ep_decode_results_need_collectives():
+            self._sync_ep_decode_broadcast_plan(active_request_count, has_real_work=True)
+            self._ep_broadcast_sampled_tokens(active_request_count)
 
     def _dynamic_step_log_probs_bookkeeping(self) -> Tuple[bool, bool]:
         """Perform bookkeeping necessary to compute log probs for dynamic batching.
@@ -2014,10 +2011,11 @@ class TextGenerationController:
                 set_decode_expert_padding(unwrapped_model, False)
 
         try:
-            # The real EP rank performs decode sampling/verification after the
-            # main forward. Dummy ranks must enter the same post-forward
-            # collective phase before any MTP collectives are issued.
-            self._dummy_decode_sample_collective()
+            # The real EP rank performs MTP verification after the main forward.
+            # Dummy ranks only need to mirror decode-result collectives when a
+            # later GPU phase consumes those results on peer ranks.
+            if self._ep_decode_results_need_collectives():
+                self._dummy_decode_sample_collective()
             if self.num_speculative_tokens == 0:
                 self._dummy_decode_async_child_forward_if_planned()
 
@@ -2029,7 +2027,6 @@ class TextGenerationController:
             self._dummy_serial_mtp_forward()
             if self.num_speculative_tokens > 0:
                 self._dummy_decode_async_child_forward_if_planned()
-            self._dummy_decode_stop_word_collective_tail()
         finally:
             self._clear_ep_decode_broadcast_plan()
             self._clear_ep_step_begin_decision()
@@ -2206,9 +2203,6 @@ class TextGenerationController:
         if self._get_stop_word_finished_ids_callback is not None:
             request_ids_list = active_request_ids.tolist()
             stop_word_finished_ids = self._get_stop_word_finished_ids_callback(request_ids_list)
-            stop_word_finished_ids = self._ep_broadcast_stop_word_finished_ids(
-                request_ids_list, stop_word_finished_ids
-            )
             if stop_word_finished_ids:
                 for idx, request_id in enumerate(request_ids_list):
                     if request_id in stop_word_finished_ids:
