@@ -33,7 +33,7 @@ for MODE in det nondet; do
     nsys profile -t cuda,nvtx -f true \
       --capture-range=cudaProfilerApi --capture-range-end=stop-shutdown \
       -o "$OUT/nsys-$MODE" "$@"
-  nsys stats --report nvtx_sum --format csv "$OUT/nsys-$MODE.nsys-rep" > "$OUT/nsys-$MODE.csv"
+  nsys stats --force-export=true --report nvtx_sum --format csv "$OUT/nsys-$MODE.nsys-rep" > "$OUT/nsys-$MODE.csv"
 done
 
 python "$(dirname "$0")/print_nsys_leaderboard.py" "$OUT"

@@ -17,7 +17,7 @@ modes don't depend on parallelism degree):
 import pytest
 import torch
 
-from tests.unit_tests.determinism.correctness._gpt_shared import make_gpt_runner
+from tests.unit_tests.determinism.correctness.test_gpt_model import make_gpt_runner
 
 # Hopper = SM 9.0, Blackwell = SM 10.0+. mxfp8 + nvfp4 need Blackwell.
 _IS_BLACKWELL = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
