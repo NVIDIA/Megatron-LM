@@ -865,15 +865,6 @@ class TextGenerationController:
     def _prepare_async_child_from_committed_decode_state_impl(self, context) -> Optional[StepTxn]:
         """Implementation for child transaction preparation, wrapped for diagnostics."""
 
-        if context.using_cuda_graph_this_step():
-            # CUDA graphs capture metadata pointer addresses.  Reuse the currently
-            # captured slot and defer the H2D until after sampling, when the prior
-            # forward/sampling work has finished using those buffers.
-            return context.prepare_child_from_committed_decode_state(
-                target_slot=context.async_decode_slot_ring.current,
-                defer_h2d=True,
-            )
-
         return context.prepare_child_from_committed_decode_state()
 
     def _decode_slot_for_txn(self, child_txn: StepTxn):

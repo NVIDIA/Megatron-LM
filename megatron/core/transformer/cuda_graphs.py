@@ -1624,6 +1624,8 @@ class CudaGraphManager(torch.nn.Module):
             if inference_context.is_static_batching():
                 batch_size = kwargs['hidden_states'].shape[0]
                 cache_key = (batch_size, inference_context.is_decode_only())
+            elif hasattr(inference_context, "cuda_graph_cache_key"):
+                cache_key = inference_context.cuda_graph_cache_key()
             else:
                 cache_key = inference_context.padded_batch_dimensions
         is_in_checkpoint_fwd = is_checkpointing()
@@ -1665,6 +1667,7 @@ class CudaGraphManager(torch.nn.Module):
                                     getattr(r[0].base_module, 'layer_number', None)
                                     == runner.base_module.layer_number - 1
                                     and r[0].fwd_graph is not None
+                                    and (len(r) < 5 or r[4] == cache_key)
                                     and ArgMetadata(r[3]['hidden_states'])
                                     == ArgMetadata(kwargs['hidden_states'])
                                 )
@@ -1685,7 +1688,7 @@ class CudaGraphManager(torch.nn.Module):
 
                     # Record this to the global execution record
                     _CudagraphGlobalRecord.cudagraph_inference_record.append(
-                        (runner, "fwd", args, kwargs)
+                        (runner, "fwd", args, kwargs, cache_key)
                     )
 
                 # Now replay the graph

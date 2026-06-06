@@ -13,6 +13,8 @@ from megatron.core.inference.async_txn import (
     broadcast_ep_stop_word_finished_ids,
     resolve_ep_decode_broadcast_plan,
 )
+from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
+from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines.async_zmq_communicator import (
     AsyncZMQCommunicator,
     ZMQCollectiveError,
@@ -51,6 +53,48 @@ class FakeStepCommunicator:
     def sync_all_reduce_max(self, *values, phase=None, step_id=None):
         self.sync_calls.append((phase, step_id, values))
         return values[0] if len(values) == 1 else values
+
+
+class FakeGraphSlot:
+    def __init__(self, slot_id):
+        self.slot_id = slot_id
+
+    def cuda_graph_key(self, base_key):
+        return (*base_key, ("slot", self.slot_id))
+
+
+def _make_graph_key_context(*, async_scheduling=True, decode_only=True, active_slot_id=1):
+    context = object.__new__(DynamicInferenceContext)
+    context.async_scheduling = async_scheduling
+    context._using_cuda_graph_this_step = True
+    context.padded_active_request_count = 1
+    context.padded_active_token_count = 1
+    context.padded_batch_dimensions = InferenceBatchDimensions(
+        token_count=1,
+        prefill_req_count=0 if decode_only else 1,
+        decode_req_count=1,
+    )
+    context.async_decode_slot_ring = SimpleNamespace(
+        slots=(FakeGraphSlot(0), FakeGraphSlot(1))
+    )
+    context.active_decode_slot_id = active_slot_id
+    return context
+
+
+def test_cuda_graph_cache_key_includes_active_async_decode_slot():
+    context = _make_graph_key_context(active_slot_id=1)
+
+    key = DynamicInferenceContext.cuda_graph_cache_key(context)
+
+    assert key == ("decode", 1, 1, ("slot", 1))
+
+
+def test_cuda_graph_cache_key_stays_shape_only_for_non_decode_or_non_async():
+    non_decode = _make_graph_key_context(decode_only=False)
+    non_async = _make_graph_key_context(async_scheduling=False)
+
+    assert DynamicInferenceContext.cuda_graph_cache_key(non_decode) == non_decode.padded_batch_dimensions
+    assert DynamicInferenceContext.cuda_graph_cache_key(non_async) == non_async.padded_batch_dimensions
 
 
 def test_token_broadcast_gives_identical_survivor_set_across_ranks():

@@ -1433,6 +1433,21 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Returns True if cuda graphs are being used for this step."""
         return self._using_cuda_graph_this_step
 
+    def cuda_graph_cache_key(self):
+        """Return the CUDA graph cache key for the currently bound metadata slot."""
+
+        if (
+            self.async_scheduling
+            and self.async_decode_slot_ring is not None
+            and self.using_cuda_graph_this_step()
+            and self.is_decode_only()
+        ):
+            slot = self.active_decode_slot()
+            return slot.cuda_graph_key(
+                ("decode", self.padded_active_request_count, self.padded_active_token_count)
+            )
+        return self.padded_batch_dimensions
+
     def async_launch_eligibility(self, **kwargs):
         """Classify whether the next decode child may be launched asynchronously."""
         return classify_decode_child_launch(
