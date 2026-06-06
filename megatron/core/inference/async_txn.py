@@ -14,7 +14,7 @@ import zlib
 from collections import Counter, deque
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Deque, Iterable, Optional, Sequence
+from typing import Any, Callable, Deque, Iterable, Optional, Sequence
 
 import torch
 
@@ -252,7 +252,7 @@ class StepTxn:
     request_ids: Sequence[int]
     slot_id: int = 0
     decode_only: bool = True
-    cuda_graph_key: Optional[tuple] = None
+    cuda_graph_key: Optional[Any] = None
     h2d_done_event: object = None
     forward_done_event: object = None
     forward_timing_start_event: object = None
@@ -336,7 +336,7 @@ class StepTxn:
         *,
         terminal_request_ids: Iterable[int] = (),
         decode_only: bool = True,
-        cuda_graph_key: Optional[tuple] = None,
+        cuda_graph_key: Optional[Any] = None,
     ) -> bool:
         """Check the no-reject-after-launch adoption invariant.
 
@@ -456,13 +456,6 @@ class AsyncDecodeSlot:
         self.forward_done_event = self._record_event_if_cuda()
         return self.forward_done_event
 
-    def cuda_graph_key(self, base_key: Optional[tuple]) -> Optional[tuple]:
-        """Attach slot pointer identity to a CUDA graph key."""
-
-        if base_key is None:
-            return None
-        return (*base_key, ("decode_slot", self.slot_id, self.pointer_signature()))
-
     def _record_event_if_cuda(self, stream: object = None) -> object:
         buf = getattr(self.gpu_view, "_buf", None)
         if buf is None or not getattr(buf, "is_cuda", False):
@@ -470,22 +463,6 @@ class AsyncDecodeSlot:
         event = torch.cuda.Event()
         event.record(stream or torch.cuda.current_stream(buf.device))
         return event
-
-    def pointer_signature(self) -> tuple[int, ...]:
-        """Return stable pointer identity for graph-key safety checks."""
-
-        pointers = []
-        for name in (
-            "_buf",
-            "token_to_input_ids",
-            "token_to_pos_ids",
-            "token_to_block_idx",
-            "mha_block_table",
-        ):
-            tensor = getattr(self.gpu_view, name, None)
-            if tensor is not None and hasattr(tensor, "data_ptr"):
-                pointers.append(int(tensor.data_ptr()))
-        return tuple(pointers)
 
 
 class AsyncDecodeSlotRing:

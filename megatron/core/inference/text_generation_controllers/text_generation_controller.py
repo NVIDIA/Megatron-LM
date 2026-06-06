@@ -718,16 +718,14 @@ class TextGenerationController:
         else:
             self._all_logits_cuda = logits
 
-    def _async_decode_cuda_graph_key(self, slot=None) -> Optional[tuple]:
-        """Return the decode graph key for the currently active shape and slot."""
+    def _async_decode_cuda_graph_key(self, slot=None) -> Optional[Any]:
+        """Return the active decode graph shape key, if CUDA graphs are active."""
 
         context = self.inference_wrapped_model.inference_context
-        slot = slot or context.active_decode_slot()
-        if slot is None:
+        del slot
+        if not context.using_cuda_graph_this_step():
             return None
-        return slot.cuda_graph_key(
-            ("decode", context.padded_active_request_count, context.padded_active_token_count)
-        )
+        return context.padded_batch_dimensions
 
     def _async_active_request_ids(self) -> tuple[int, ...]:
         """Return committed active request ids as plain ints."""

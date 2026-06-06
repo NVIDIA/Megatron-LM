@@ -427,90 +427,59 @@ class DynamicInferenceEngine(AbstractEngine):
         if HAVE_TQDM:
             tbar = tqdm(tbar, total=len(context.cuda_graph_batch_dimensions_list))
         for tbar_idx, cuda_graph_batch_dimension in tbar:
-            capture_slots = (None,)
-            if (
-                context.async_scheduling
-                and context.async_decode_slot_ring is not None
-                and cuda_graph_batch_dimension.prefill_req_count == 0
-            ):
-                capture_slots = context.async_decode_slot_ring.slots
-
-            saved_slot_index = (
-                context.async_decode_slot_ring.current_index
-                if context.async_decode_slot_ring is not None
-                else None
+            input_ids, position_ids = self.controller._dynamic_step_context_init(
+                construct_graph_dimensions=cuda_graph_batch_dimension
             )
-            try:
-                for capture_slot_index, capture_slot in enumerate(capture_slots):
-                    if capture_slot is not None:
-                        context.async_decode_slot_ring.current_index = capture_slot_index
-                        context.bind_decode_slot(capture_slot)
+            # Progress.
+            tbar_str = f"cuda graph warmup - {cuda_graph_batch_dimension}"
+            if HAVE_TQDM:
+                tbar.set_description(tbar_str)
+            else:
+                logging.info(
+                    f"{tbar_idx}/{len(context.cuda_graph_batch_dimensions_list)}. {tbar_str}"
+                )
 
-                    input_ids, position_ids = self.controller._dynamic_step_context_init(
-                        construct_graph_dimensions=cuda_graph_batch_dimension
-                    )
-                    # Progress.
-                    slot_suffix = (
-                        f" slot {capture_slot.slot_id}" if capture_slot is not None else ""
-                    )
-                    tbar_str = f"cuda graph warmup - {cuda_graph_batch_dimension}{slot_suffix}"
-                    if HAVE_TQDM:
-                        tbar.set_description(tbar_str)
+            # Enable routing recording during warmup if routing replay is enabled.
+            # This ensures the record_indices copy operation is captured in the CUDA graph.
+            if model_config.moe_enable_routing_replay:
+                RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+
+            # Forward pass -> logits.
+            with torch.inference_mode():
+                controller._dynamic_step_forward_logits(input_ids, position_ids)
+
+                if controller._sampling_backend == "flashinfer":
+                    if controller.num_speculative_tokens > 0:
+                        controller._dynamic_step_sample_logits_and_verify_tokens(input_ids)
                     else:
-                        logging.info(
-                            f"{tbar_idx}/{len(context.cuda_graph_batch_dimensions_list)}. "
-                            f"{tbar_str}"
-                        )
+                        controller._dynamic_step_sample_logits()
 
-                    # Enable routing recording during warmup if routing replay is enabled.
-                    # This ensures the record_indices copy operation is captured in the CUDA graph.
-                    if model_config.moe_enable_routing_replay:
-                        RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+                # MTP CUDA graph warmup for this batch dimension.
+                if mtp_warmup_enabled:
+                    n = cuda_graph_batch_dimension.req_count
+                    # pylint: disable-next=possibly-used-before-assignment
+                    if sp_enabled:
+                        n = round_up_to_nearest_multiple(n, tp_size)
+                    # pylint: disable-next=possibly-used-before-assignment
+                    if n > 0 and n not in mtp_seen_batch_sizes:
+                        mtp_seen_batch_sizes.add(n)
+                        device = torch.cuda.current_device()
+                        batch_dim = n // tp_size if sp_enabled else n
+                        # Use zeros (not empty) — garbage token IDs cause OOB embedding lookups during graph capture/replay.
+                        for depth in mtp_warmup_depths:
+                            unwrapped.compute_mtp_single_step(
+                                hidden_states=torch.zeros(
+                                    (batch_dim, 1, model_config.hidden_size),
+                                    device=device,
+                                    dtype=model_config.params_dtype,
+                                ),
+                                next_token_ids=torch.zeros((1, n), device=device, dtype=torch.long),
+                                position_ids=torch.zeros((1, n), device=device, dtype=torch.int64),
+                                depth=depth,
+                                cache_key=("mtp", n, depth),
+                            )
 
-                    # Forward pass -> logits.
-                    with torch.inference_mode():
-                        controller._dynamic_step_forward_logits(input_ids, position_ids)
-
-                        if controller._sampling_backend == "flashinfer":
-                            if controller.num_speculative_tokens > 0:
-                                controller._dynamic_step_sample_logits_and_verify_tokens(input_ids)
-                            else:
-                                controller._dynamic_step_sample_logits()
-
-                        # MTP CUDA graph warmup for this batch dimension.
-                        if mtp_warmup_enabled:
-                            n = cuda_graph_batch_dimension.req_count
-                            # pylint: disable-next=possibly-used-before-assignment
-                            if sp_enabled:
-                                n = round_up_to_nearest_multiple(n, tp_size)
-                            # pylint: disable-next=possibly-used-before-assignment
-                            if n > 0 and n not in mtp_seen_batch_sizes:
-                                mtp_seen_batch_sizes.add(n)
-                                device = torch.cuda.current_device()
-                                batch_dim = n // tp_size if sp_enabled else n
-                                # Use zeros (not empty) — garbage token IDs cause OOB embedding lookups during graph capture/replay.
-                                for depth in mtp_warmup_depths:
-                                    unwrapped.compute_mtp_single_step(
-                                        hidden_states=torch.zeros(
-                                            (batch_dim, 1, model_config.hidden_size),
-                                            device=device,
-                                            dtype=model_config.params_dtype,
-                                        ),
-                                        next_token_ids=torch.zeros(
-                                            (1, n), device=device, dtype=torch.long
-                                        ),
-                                        position_ids=torch.zeros(
-                                            (1, n), device=device, dtype=torch.int64
-                                        ),
-                                        depth=depth,
-                                        cache_key=("mtp", n, depth),
-                                    )
-
-                        context.reset()
-            finally:
-                if saved_slot_index is not None:
-                    context.async_decode_slot_ring.current_index = saved_slot_index
-                    context.bind_decode_slot(context.async_decode_slot_ring.current)
+                context.reset()
 
             # Per-iteration memory accounting, scoped to the CUDA-graph mempool.
             # This isolates pool growth from process-wide scratch churn (KV cache,

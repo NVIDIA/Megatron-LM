@@ -55,14 +55,6 @@ class FakeStepCommunicator:
         return values[0] if len(values) == 1 else values
 
 
-class FakeGraphSlot:
-    def __init__(self, slot_id):
-        self.slot_id = slot_id
-
-    def cuda_graph_key(self, base_key):
-        return (*base_key, ("slot", self.slot_id))
-
-
 def _make_graph_key_context(*, async_scheduling=True, decode_only=True, active_slot_id=1):
     context = object.__new__(DynamicInferenceContext)
     context.async_scheduling = async_scheduling
@@ -75,18 +67,18 @@ def _make_graph_key_context(*, async_scheduling=True, decode_only=True, active_s
         decode_req_count=1,
     )
     context.async_decode_slot_ring = SimpleNamespace(
-        slots=(FakeGraphSlot(0), FakeGraphSlot(1))
+        slots=(SimpleNamespace(slot_id=0), SimpleNamespace(slot_id=1))
     )
     context.active_decode_slot_id = active_slot_id
     return context
 
 
-def test_cuda_graph_cache_key_includes_active_async_decode_slot():
+def test_cuda_graph_cache_key_stays_shape_only_for_async_decode():
     context = _make_graph_key_context(active_slot_id=1)
 
     key = DynamicInferenceContext.cuda_graph_cache_key(context)
 
-    assert key == ("decode", 1, 1, ("slot", 1))
+    assert key == context.padded_batch_dimensions
 
 
 def test_cuda_graph_cache_key_stays_shape_only_for_non_decode_or_non_async():

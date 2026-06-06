@@ -44,6 +44,12 @@ class FakeContext:
         self.total_request_count = 1
         self.paused_request_count = 0
         self.active_token_count = 1
+        self.padded_batch_dimensions = SimpleNamespace(
+            token_count=1,
+            prefill_req_count=0,
+            decode_req_count=1,
+            req_count=1,
+        )
         self.padded_active_request_count = 1
         self.padded_active_token_count = 1
         self.num_decode_requests = 1
@@ -112,7 +118,7 @@ class FakeContext:
             request_ids=(17,),
             slot_id=child.slot_id,
             cpu_bookkeeping_buf=torch.zeros_like(child.gpu_view._buf) if defer_h2d else None,
-            cuda_graph_key=child.cuda_graph_key(("decode", 1, 1)),
+            cuda_graph_key=self.padded_batch_dimensions if self.use_cuda_graph else None,
         )
 
     def plain_decode_child_needs_terminal_check(self, active_request_count=None):

@@ -1459,18 +1459,13 @@ class DynamicInferenceContext(BaseInferenceContext):
         return self._using_cuda_graph_this_step
 
     def cuda_graph_cache_key(self):
-        """Return the CUDA graph cache key for the currently bound metadata slot."""
+        """Return the CUDA graph cache key for the active padded shape.
 
-        if (
-            self.async_scheduling
-            and self.async_decode_slot_ring is not None
-            and self.using_cuda_graph_this_step()
-            and self.is_decode_only()
-        ):
-            slot = self.active_decode_slot()
-            return slot.cuda_graph_key(
-                ("decode", self.padded_active_request_count, self.padded_active_token_count)
-            )
+        Async decode slots are transactional metadata owners, not graph-cache
+        dimensions. Keeping this shape-only matches the main inference path and
+        avoids opt-in async CUDA graph capture.
+        """
+
         return self.padded_batch_dimensions
 
     def async_launch_eligibility(self, **kwargs):
@@ -1600,8 +1595,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             cpu_bookkeeping_buf=child_cpu_buf if defer_h2d else None,
             kv_block_leases=kv_block_leases,
             mamba_slot_ids=mamba_slot_ids,
-            cuda_graph_key=child_slot.cuda_graph_key(
-                ("decode", self.padded_active_request_count, self.padded_active_token_count)
+            cuda_graph_key=(
+                self.padded_batch_dimensions if self.using_cuda_graph_this_step() else None
             ),
         )
 

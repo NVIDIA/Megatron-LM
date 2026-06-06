@@ -41,12 +41,12 @@ def test_slot_cannot_reuse_before_forward_event_retires():
     assert slot.can_reuse()
 
 
-def test_graph_key_changes_when_slot_pointers_differ():
+def test_slots_own_distinct_metadata_buffers():
     slot_a = AsyncDecodeSlot(slot_id=0, gpu_view=FakeGPUView())
     slot_b = AsyncDecodeSlot(slot_id=1, gpu_view=FakeGPUView())
 
-    assert slot_a.pointer_signature() != slot_b.pointer_signature()
-    assert slot_a.cuda_graph_key(("decode", 4)) != slot_b.cuda_graph_key(("decode", 4))
+    assert slot_a.gpu_view is not slot_b.gpu_view
+    assert slot_a.gpu_view._buf.data_ptr() != slot_b.gpu_view._buf.data_ptr()
 
 
 def test_slot_copies_cpu_bookkeeping_into_its_gpu_view():
