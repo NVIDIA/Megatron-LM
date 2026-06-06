@@ -19,6 +19,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 from torch import Tensor
 
+from megatron.core.inference.async_txn import AsyncTxnSkipReason
 from megatron.core.inference.config import KVCacheManagementMode
 from megatron.core.inference.contexts.dynamic_context import (
     BlockOverflowError,
@@ -332,6 +333,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self._pending_signals = deque()
 
         self.resume_request_ids = None
+        self._next_async_launch_barrier_reason: Optional[AsyncTxnSkipReason] = None
 
         # Speculative decoding acceptance tracking (per-position).
         # Each tensor has length num_speculative_tokens; index i tracks position i+1
@@ -515,6 +517,9 @@ class DynamicInferenceEngine(AbstractEngine):
         )
 
         self.capture_stats = capture_stats
+        self._request_next_async_launch_barrier(
+            AsyncTxnSkipReason.GRAPH_RECAPTURE_BARRIER
+        )
 
     @internal_api
     async def start_listening_to_data_parallel_coordinator(
@@ -788,6 +793,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             return
 
+        self._drain_async_transactions(drop_launched=True)
         InferenceMode.unset_active()
 
         # Deallocate context tensors.
@@ -887,6 +893,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 )
             )
         )
+        self._request_next_async_launch_barrier(AsyncTxnSkipReason.RESUME_BARRIER)
 
         # If we are not using the inference coordinator, we need to manually handle state.
         if not self.use_coordinator:
@@ -895,6 +902,41 @@ class DynamicInferenceEngine(AbstractEngine):
             self._loop.call_soon_threadsafe(
                 asyncio.create_task, self._notify_cond_for_new_request()
             )
+
+    def _request_next_async_launch_barrier(self, reason: AsyncTxnSkipReason) -> None:
+        """Force the next async child-launch decision through a sync boundary."""
+
+        if getattr(self.context, "async_scheduling", False):
+            self._next_async_launch_barrier_reason = reason
+
+    def _drain_async_transactions(self, *, drop_launched: bool = False) -> None:
+        """Drain async controller work when the controller supports it."""
+
+        drain = getattr(self.controller, "drain_async_transactions", None)
+        if drain is not None:
+            drain(drop_launched=drop_launched)
+
+    def _consume_async_launch_barrier_reason(
+        self,
+        *,
+        admitted_requests: bool,
+        will_log_this_step: bool,
+    ) -> Optional[AsyncTxnSkipReason]:
+        """Return the one-step async barrier reason for the current step, if any."""
+
+        reason = self._next_async_launch_barrier_reason
+        if reason is not None:
+            self._next_async_launch_barrier_reason = None
+            return reason
+        if self.state == EngineState.PAUSING:
+            return AsyncTxnSkipReason.FORCE_PAUSE_BARRIER
+        if getattr(self.context, "chunked_prefill_request_id", -1) != -1:
+            return AsyncTxnSkipReason.CHUNKED_PREFILL
+        if admitted_requests:
+            return AsyncTxnSkipReason.PENDING_ADMISSION
+        if will_log_this_step:
+            return AsyncTxnSkipReason.LOG_INTERVAL_BARRIER
+        return None
 
     @trace_async_exceptions
     async def _notify_cond_for_new_request(self):
@@ -1563,10 +1605,17 @@ class DynamicInferenceEngine(AbstractEngine):
                 return i + 1
         return 0
 
-    def schedule_waiting_requests(self):
-        """Tries to schedule any requests in the waiting pool."""
+    def schedule_waiting_requests(self) -> bool:
+        """Tries to schedule any requests in the waiting pool.
+
+        Returns:
+            Whether the call actually admitted request work into the context.
+        """
         # Keep track of which requests get scheduled.
         waiting_before = set(self.waiting_request_ids)
+        waiting_count_before = len(self.waiting_request_ids)
+        total_request_count_before = self.context.total_request_count
+        active_token_count_before = self.context.active_token_count
         if self.enable_chunked_prefill:
             self.schedule_chunked_prefill()
         else:
@@ -1579,6 +1628,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 req = self.get_request(request_id)
                 if req.kv_cache_epoch is None:
                     req.kv_cache_epoch = [(0, self._generation_epoch)]
+
+        return (
+            len(self.waiting_request_ids) < waiting_count_before
+            or self.context.total_request_count > total_request_count_before
+            or self.context.active_token_count > active_token_count_before
+        )
 
     def schedule_non_chunked_prefill(self):
         """
@@ -1780,7 +1835,7 @@ class DynamicInferenceEngine(AbstractEngine):
             raise EngineSuspendedError(self.context.step_count)
 
         # schedule requests
-        self.schedule_waiting_requests()
+        admitted_requests = self.schedule_waiting_requests()
 
         # The print block (async_bookkeep) and metrics block both fire on this
         # condition after step_count is incremented. Predict it up-front so we
@@ -1792,6 +1847,10 @@ class DynamicInferenceEngine(AbstractEngine):
         )
 
         is_decode_only = self.context.is_decode_only()
+        async_launch_barrier_reason = self._consume_async_launch_barrier_reason(
+            admitted_requests=admitted_requests,
+            will_log_this_step=will_log_this_step,
+        )
         if will_log_this_step:
             pre_step_context_state = {
                 "is_decode_only": is_decode_only,
@@ -1817,7 +1876,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if will_log_this_step:
             self.step_start_event.record()
-        result = await self.controller.async_generate_output_tokens_dynamic_batch()
+        result = await self.controller.async_generate_output_tokens_dynamic_batch(
+            async_launch_barrier_reason=async_launch_barrier_reason
+        )
         if will_log_this_step:
             self.step_end_event.record()
             self.step_end_event.synchronize()
@@ -1887,6 +1948,11 @@ class DynamicInferenceEngine(AbstractEngine):
             top_n_logprobs_by_request_id = step_result.get("top_n_logprobs_by_request_id")
             finished_routing_block_ids = step_result.get("finished_routing_block_ids", None)
             cuda_graph_request_count = step_result["cuda_graph_request_count"]
+
+            if newly_paused_request_ids is not None and len(newly_paused_request_ids) > 0:
+                self._request_next_async_launch_barrier(AsyncTxnSkipReason.FORCE_PAUSE_BARRIER)
+            if evict_request_ids is not None and len(evict_request_ids) > 0:
+                self._request_next_async_launch_barrier(AsyncTxnSkipReason.EVICT_BARRIER)
 
             # Add paused events.
             if newly_paused_request_ids is not None and self.track_paused_request_events:
@@ -2291,6 +2357,9 @@ class DynamicInferenceEngine(AbstractEngine):
 
             if header == Headers.PAUSE:
                 if self.state == EngineState.RUNNING:
+                    self._request_next_async_launch_barrier(
+                        AsyncTxnSkipReason.FORCE_PAUSE_BARRIER
+                    )
                     self.state = EngineState.PAUSING
                     self._state_events[EngineState.RUNNING].clear()
                 # Any other state can safely ignore PAUSE.
@@ -2331,6 +2400,7 @@ class DynamicInferenceEngine(AbstractEngine):
         Called from the engine loop's finally block after the loop exits.
         """
         self.state = EngineState.STOPPED
+        self._drain_async_transactions(drop_launched=True)
 
         # Cleanup the request futures.
         for entry in self.requests.values():
@@ -2477,6 +2547,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         # rank, so when there is no local work we run dummy_forward()
                         # rather than sleeping. Sleeping here would deadlock EP > 1.
                         if self.state == EngineState.PAUSING:
+                            self._drain_async_transactions()
                             await self._world_barrier()
                             self.state = EngineState.PAUSED
                             self._state_events[EngineState.PAUSED].set()
@@ -2516,6 +2587,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
                     if all_pausing:
                         # All EP peers are PAUSING: pause immediately.
+                        self._drain_async_transactions()
                         await self._world_barrier()
                         self.state = EngineState.PAUSED
                         self._state_events[EngineState.PAUSED].set()
@@ -2551,6 +2623,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     self._last_ep_consensus = (0, False)
 
                 elif self.state == EngineState.SUSPENDING:
+                    self._drain_async_transactions(drop_launched=True)
                     await self._world_barrier()
                     self.state = EngineState.SUSPENDED
                     self._state_events[EngineState.SUSPENDED].set()
@@ -2564,6 +2637,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     self._state_events[EngineState.RESUMED].set()
 
                 elif self.state == EngineState.STOPPING:
+                    self._drain_async_transactions(drop_launched=True)
                     await self._world_barrier()
                     if self.rank == 0:
                         logging.info("Stopping engine.")

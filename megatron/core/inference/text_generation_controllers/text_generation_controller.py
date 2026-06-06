@@ -730,6 +730,33 @@ class TextGenerationController:
         context.async_txn_diagnostics.record_adopted()
         return True
 
+    @staticmethod
+    def _synchronize_async_event(event) -> None:
+        """Synchronize a CUDA-like event when a sync boundary needs a drain."""
+
+        if event is None:
+            return
+        if hasattr(event, "synchronize"):
+            event.synchronize()
+        elif hasattr(event, "query") and not event.query() and torch.cuda.is_available():
+            torch.cuda.synchronize()
+
+    def drain_async_transactions(self, *, drop_launched: bool = False) -> None:
+        """Drain in-flight async work before external pause/suspend/shutdown observation."""
+
+        child_txn = self._async_launched_child_txn
+        if child_txn is not None:
+            self._synchronize_async_event(child_txn.forward_done_event)
+            self._synchronize_async_event(child_txn.sample_done_event)
+            if drop_launched:
+                self._async_launched_child_txn = None
+
+        self._async_prepared_child_txn = None
+        context = self.inference_wrapped_model.inference_context
+        retire_queue = getattr(context, "async_txn_retire_queue", None)
+        if retire_queue is not None:
+            retire_queue.drain_all_ready()
+
     def _async_child_launch_skip_reason(
         self,
         child_txn: Optional[StepTxn],
@@ -737,9 +764,12 @@ class TextGenerationController:
         return_log_probs: bool,
         return_top_n_logprobs: bool,
         skip_bookkeeping: bool,
+        async_launch_barrier_reason: Optional[AsyncTxnSkipReason] = None,
     ) -> Optional[AsyncTxnSkipReason]:
         """Return the reason the prepared plain-decode child cannot be launched."""
 
+        if async_launch_barrier_reason is not None:
+            return async_launch_barrier_reason
         if child_txn is None:
             return None
         context = self.inference_wrapped_model.inference_context
@@ -1978,7 +2008,10 @@ class TextGenerationController:
         }
 
     async def async_generate_output_tokens_dynamic_batch(
-        self, skip_bookkeeping: Optional[bool] = False
+        self,
+        skip_bookkeeping: Optional[bool] = False,
+        *,
+        async_launch_barrier_reason: Optional[AsyncTxnSkipReason] = None,
     ) -> Optional[Dict]:
         """Forward step the model and update the inference context.
 
@@ -2066,6 +2099,7 @@ class TextGenerationController:
                     return_log_probs=return_log_probs,
                     return_top_n_logprobs=return_top_n_logprobs,
                     skip_bookkeeping=skip_bookkeeping,
+                    async_launch_barrier_reason=async_launch_barrier_reason,
                 )
                 if child_launch_skip_reason is not None:
                     context.async_txn_diagnostics.record_barrier_skip(child_launch_skip_reason)
