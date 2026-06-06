@@ -200,6 +200,17 @@ class TextGenerationController:
         self._tp_size = get_pg_size(self.inference_wrapped_model.tp_group)
         self._sp_enabled = self.model_config.sequence_parallel and self._tp_size > 1
 
+        # Launch-before-commit overlap state (async scheduling). When a decode forward is
+        # launched speculatively before the current step's update_requests, its consume-by-
+        # request-id snapshot + graph bucket are stashed here; the next call samples + commits
+        # it instead of running a fresh forward. None means "no in-flight speculative forward".
+        self._async_overlap_inflight: Optional[Dict[str, Any]] = None
+        # Diagnostic: number of forwards launched before the prior step's update_requests.
+        self._async_launch_before_commit_count = 0
+        # Diagnostic: set True whenever update_requests runs while a speculative forward that
+        # was launched before it is in flight (the load-bearing ordering property).
+        self._async_committed_with_inflight_forward = False
+
         self._init_mtp_sampling_tensors()
 
     def _init_mtp_sampling_tensors(self):
@@ -1623,24 +1634,20 @@ class TextGenerationController:
             sampled_mtp_tokens_cpu = None
         return sampled_tokens_cpu, sampled_mtp_tokens_cpu
 
-    def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
-        """Update the dynamic inference context after sampling.
+    def _dynamic_step_prepare_commit(self) -> Dict[str, Any]:
+        """Compute the finish/survivor state for the just-sampled step (pre-update_requests).
 
-        Args:
-            new_sample (Tensor): The newly sampled tokens.
-            request_metadata (Optional[Dict[str, Tensor]]): An override for the tensors
-                that manage request metadata, such as sampling parameters. By default, this
-                metadata is retrieved from the context.
+        This is the first half of ``_dynamic_step_context_bookkeeping``: the GPU->CPU sample
+        transfer, the active/finished masks (termination id + length + stop words), the finished
+        per-request RNG retirement, and the saved finished-routing block ids -- everything that
+        must be known *before* ``update_requests`` mutates the layout. Split out so the
+        launch-before-commit overlap can decide whether the next forward is launchable (it is
+        only when this step is finish-free) and launch it *before* the commit below.
 
-        Return:
-            Dict [str, Tensor]: A dictionary containing:
-                active_request_ids (Tensor): Current active request IDs.
-                newly_paused_request_ids (Tensor): Newly paused request IDs.
-                finished_request_ids (Tensor): Finished request IDs.
+        Returns a dict carrying the prepared state for :meth:`_dynamic_step_apply_commit`.
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
-        active_request_slice = slice(context.paused_request_count, context.total_request_count)
 
         # C4: capture whether the step just run was decode-only BEFORE update_requests
         # (which flips every prefill request to decode, so is_decode_only() would read
@@ -1657,7 +1664,9 @@ class TextGenerationController:
 
         range_push("active_request_mask")
         # Everything below is 100% CPU.
-        active_request_ids = context.request_ids[active_request_slice].long()
+        active_request_ids = context.request_ids[
+            slice(context.paused_request_count, context.total_request_count)
+        ].long()
         active_sequence_lengths = context.get_active_sequence_lengths()
 
         # After the forward pass and KV-cache rewind, get_active_sequence_lengths()
@@ -1712,9 +1721,33 @@ class TextGenerationController:
         new_sample_copy = sampled_tokens_cpu.clone()
         range_pop()
 
+        return {
+            "active_request_ids": active_request_ids,
+            "finished_request_ids": finished_request_ids,
+            "finished_routing_block_ids": finished_routing_block_ids,
+            "sampled_tokens_cpu": sampled_tokens_cpu,
+            "sampled_mtp_tokens_cpu": sampled_mtp_tokens_cpu,
+            "new_sample_copy": new_sample_copy,
+            "active_request_mask": active_request_mask,
+            "finished_count": int(finished_idxs.numel()),
+            "was_decode_only": was_decode_only,
+        }
+
+    def _dynamic_step_apply_commit(self, prepared: Dict[str, Any]) -> Dict[str, Tensor]:
+        """Apply ``update_requests`` for a prepared step and return the engine bookkeeping dict.
+
+        Second half of ``_dynamic_step_context_bookkeeping``: commit the sampled tokens via
+        ``update_requests`` (KV offset advance, finish/compaction, boundary-block adoption), then
+        do the C4 in-place GPU token scatter for the clean steady-state decode transition. Takes
+        the dict produced by :meth:`_dynamic_step_prepare_commit`.
+        """
+        context = self.inference_wrapped_model.inference_context
+
         range_push("update_requests")
         update_result = context.update_requests(
-            active_request_mask, new_sample_copy, sampled_mtp_tokens_cpu
+            prepared["active_request_mask"],
+            prepared["new_sample_copy"],
+            prepared["sampled_mtp_tokens_cpu"],
         )
         range_pop()
 
@@ -1731,9 +1764,9 @@ class TextGenerationController:
         if (
             context.decode_metadata_buffer is not None
             and context.num_speculative_tokens == 0
-            and was_decode_only
+            and prepared["was_decode_only"]
             and context.paused_request_count == 0
-            and finished_idxs.numel() == 0
+            and prepared["finished_count"] == 0
             and context.active_token_count > 0
         ):
             context.scatter_decode_tokens_to_gpu(self._sampled_tokens_cuda)
@@ -1742,16 +1775,204 @@ class TextGenerationController:
             context._decode_token_ids_live_on_gpu = scattered
 
         return {
-            "active_request_ids": active_request_ids,
-            "finished_request_ids": finished_request_ids,
+            "active_request_ids": prepared["active_request_ids"],
+            "finished_request_ids": prepared["finished_request_ids"],
             # Already a CPU tensor (independent of _sampled_tokens_cuda via the
             # .cpu() in _transfer_samples_to_cpu; update_requests only mutates
             # the separate new_sample_copy). Returning the CPU copy avoids a
             # D2H sync when the engine later calls sample.tolist().
-            "sample": sampled_tokens_cpu,
-            "finished_routing_block_ids": finished_routing_block_ids,
+            "sample": prepared["sampled_tokens_cpu"],
+            "finished_routing_block_ids": prepared["finished_routing_block_ids"],
             **(update_result or {}),
         }
+
+    def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
+        """Update the dynamic inference context after sampling.
+
+        Return:
+            Dict [str, Tensor]: A dictionary containing:
+                active_request_ids (Tensor): Current active request IDs.
+                newly_paused_request_ids (Tensor): Newly paused request IDs.
+                finished_request_ids (Tensor): Finished request IDs.
+
+        This is the serial path: prepare (finish detection) and apply (update_requests) run
+        back-to-back, byte-identical to the original single method. The launch-before-commit
+        overlap calls the two halves separately so it can launch the next forward in between.
+        """
+        return self._dynamic_step_apply_commit(self._dynamic_step_prepare_commit())
+
+    def _async_overlap_possible(self, context) -> bool:
+        """Whether the launch-before-commit overlap path should handle this step.
+
+        The overlap is scoped (this branch) to plain (non-speculative) GPT decode under a CUDA
+        graph with async scheduling on. It engages when either a speculative forward is already
+        in flight (must be consumed) or this step is a graph-backed decode step that could prime
+        the pipeline. Every other case (eager, prefill/mixed, hybrid, MTP) takes the unchanged
+        serial path, so ``async == serial`` holds trivially there and ``async-off == main`` always.
+        """
+        if not context.enable_async_scheduling:
+            return False
+        if context.decode_metadata_buffer is None:
+            return False
+        if self.num_speculative_tokens > 0 or context.is_hybrid_model:
+            return False
+        if self._async_overlap_inflight is not None:
+            return True
+        return context.is_decode_only() and context.using_cuda_graph_this_step()
+
+    def _async_try_launch_next_decode_forward(self, prepared: Dict[str, Any]) -> Optional[Dict]:
+        """Launch the next decode forward BEFORE this step's update_requests (the overlap).
+
+        Only fires for a clean, finish-free, pause-free, boundary-safe plain decode step (so the
+        launched forward consumes the exact layout the deferred commit will produce -- no output
+        realignment is ever needed: KV blocks and mamba slots are request-bonded and unchanged).
+        Builds the speculative plan (predicting the pending commit), advances the per-token input
+        bookkeeping by one unit query, publishes the predicted metadata with a token-excluded H2D,
+        scatters this step's sampled tokens as the next forward's input ids, and replays the graph.
+
+        Returns the in-flight record (consume-by-request-id snapshot + graph bucket) to stash, or
+        None when this step is not launchable (the engine then commits and primes again next step).
+        """
+        context = self.inference_wrapped_model.inference_context
+        # Absorbable-but-reshaping or unsupported conditions => no speculative launch this step.
+        if prepared["finished_count"] != 0:
+            return None
+        if not prepared["was_decode_only"]:
+            return None
+        if context.paused_request_count != 0:
+            return None
+        if not context.using_cuda_graph_this_step():
+            return None
+
+        # Speculative plan for the forward that runs against the layout the pending commit will
+        # produce (design 1.1 step 2). Boundary-window gated inside; ineligible => sync step.
+        plan = context.prestage_next_decode_step_into_cpu_staging(
+            speculate_pending_decode_commit=True
+        )
+        if not plan.eligible:
+            return None
+
+        n = context.active_token_count
+        if n <= 0:
+            return None
+
+        # Advance the per-token input bookkeeping by one unit query (the pending commit's append),
+        # predicting the next forward's positions. update_requests rewrites these to the identical
+        # values when it commits below, so this early CPU advance is safe (boundary-gated: no
+        # block-id change and no local-position wrap). token_to_input_ids is supplied by the GPU
+        # scatter; token_to_request_idx / token_to_block_idx are invariant for finish-free decode.
+        context.token_to_pos_ids[:n] += 1
+        context.token_to_position_in_request[:n] += 1
+        context.token_to_local_position_within_kv_block[:n] += 1
+
+        # Publish the predicted metadata into the live buffer with one token-excluded H2D (carries
+        # the advanced per-token fields + the speculative MHA region to the single GPU buffer).
+        context.publish_prepared_decode_plan(plan)
+
+        # Scatter this step's sampled ids as the next forward's input ids (GPU, no D2H), then mark
+        # the token-id region GPU-authoritative so the next H2D keeps excluding it.
+        context.scatter_decode_tokens_to_gpu(self._sampled_tokens_cuda)
+        context._decode_token_ids_live_on_gpu = True
+
+        # Launch (replay) the next forward against the published metadata + scattered input ids.
+        cuda_graph_request_count = (
+            context.padded_active_request_count if context.using_cuda_graph_this_step() else None
+        )
+        input_ids, position_ids = context.current_input_and_position_ids()
+        range_push("forward_pass(launch-before-commit)")
+        self._dynamic_step_forward_logits(input_ids, position_ids)
+        context.kv_block_allocator.store_routing_per_block(self._router_record_bookkeeping())
+        range_pop()
+
+        self._async_launch_before_commit_count += 1
+        return {
+            "snapshot": plan.snapshot_request_ids,
+            "cuda_graph_request_count": cuda_graph_request_count,
+        }
+
+    async def _async_overlap_step(self) -> Optional[Dict]:
+        """Run one decode step on the launch-before-commit overlap path.
+
+        Two modes:
+        * PRIMED (a speculative forward is in flight from the previous call): skip the forward --
+          its logits are already in ``_all_logits_cuda`` -- and sample it.
+        * PRIME (no in-flight forward): run a normal forward for the current committed state (this
+          matches the serial head for plain GPT decode under a graph).
+
+        Then sample + log-probs, run the finish-detection prepare phase, launch the next forward
+        BEFORE update_requests (when launchable), and finally commit this step (update_requests +
+        scatter) -- which overlaps the launched forward on the GPU. The returned bookkeeping is
+        for the step just committed, so engine accounting (step_count, post_process) is unchanged.
+        """
+        context = self.inference_wrapped_model.inference_context
+        inflight = self._async_overlap_inflight
+
+        with torch.inference_mode():
+            if inflight is None:
+                # PRIME: forward for the current committed state (serial head, plain GPT decode).
+                input_ids, position_ids = self._dynamic_step_context_init()
+                current_cuda_graph_request_count = (
+                    context.padded_active_request_count
+                    if context.using_cuda_graph_this_step()
+                    else None
+                )
+                config = self.inference_wrapped_model.model.config
+                if config.moe_enable_routing_replay:
+                    RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+                range_push("forward_pass")
+                self._dynamic_step_forward_logits(input_ids, position_ids)
+                context.kv_block_allocator.store_routing_per_block(
+                    self._router_record_bookkeeping()
+                )
+                range_pop()
+            else:
+                # PRIMED: the in-flight forward already ran; consume its logits.
+                current_cuda_graph_request_count = inflight["cuda_graph_request_count"]
+                self._async_overlap_inflight = None
+
+        await asyncio.sleep(0)
+
+        with torch.inference_mode():
+            range_push("sampling")
+            return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
+            self._dynamic_step_sample_logits()
+
+            log_probs = None
+            top_n_logprobs = None
+            if return_log_probs or return_top_n_logprobs:
+                log_probs, log_probs_tensor = self._dynamic_step_calculate_log_probs()
+                if return_top_n_logprobs:
+                    top_n_logprobs = self._dynamic_step_calculate_top_n_logprobs(log_probs_tensor)
+            range_pop()
+
+            # Prepare commit (finish detection) -- must precede both the launch decision and
+            # update_requests so the launched forward only fires on a finish-free step.
+            prepared = self._dynamic_step_prepare_commit()
+
+            # Launch the next forward BEFORE committing this step (the overlap).
+            self._async_overlap_inflight = self._async_try_launch_next_decode_forward(prepared)
+            if self._async_overlap_inflight is not None:
+                self._async_committed_with_inflight_forward = True
+
+            # Commit this step. Runs on the CPU while the launched forward runs on the GPU.
+            request_bookkeeping = self._dynamic_step_apply_commit(prepared)
+
+            ret = {
+                "accepted_tokens": None,
+                "log_probs": log_probs,
+                "top_n_logprobs": top_n_logprobs,
+                "cuda_graph_request_count": current_cuda_graph_request_count,
+            }
+            ret.update(request_bookkeeping)
+            return ret
+
+    def async_drain_inflight_forward(self) -> None:
+        """Drop a stale in-flight speculative forward (suspend / reset / shutdown).
+
+        The pipeline normally consumes its in-flight forward on the next step; this clears the
+        record when the engine tears down or rewinds, so no stale snapshot is consumed later.
+        """
+        self._async_overlap_inflight = None
 
     async def async_generate_output_tokens_dynamic_batch(
         self, skip_bookkeeping: Optional[bool] = False
@@ -1775,7 +1996,13 @@ class TextGenerationController:
 
         # No tokens and no active requests?
         if context.active_token_count == 0 and active_request_count == 0:
+            # Any in-flight speculative forward is moot with nothing active; drop it.
+            self._async_overlap_inflight = None
             return None
+
+        # Launch-before-commit overlap (async scheduling, plain GPT decode under a graph).
+        if not skip_bookkeeping and self._async_overlap_possible(context):
+            return await self._async_overlap_step()
 
         with torch.inference_mode():
             input_ids, position_ids = self._dynamic_step_context_init()

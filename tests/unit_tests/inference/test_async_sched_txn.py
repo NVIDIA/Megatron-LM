@@ -40,6 +40,7 @@ from megatron.core.inference.engines.step_transaction import (
 )
 from megatron.core.inference.sampling import TorchSampling
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
+from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.utils import is_fa_min_version
 from tests.unit_tests.inference.engines.test_dynamic_engine import (
     DynamicEngineTestConfig,
@@ -1843,3 +1844,99 @@ class TestC5Prestage(AsyncSchedTxnTestBase):
                 num_tokens_to_generate=20,
                 use_fixed_output_lengths=True,
             )
+
+
+@pytest.mark.skipif(
+    not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+)
+class TestC5OverlapFlip(AsyncSchedTxnTestBase):
+    """C5 overlap flip: the runtime launches the next decode forward BEFORE update_requests.
+
+    The launch-before-commit overlap engages for plain GPT decode under a CUDA graph (the launch
+    gate requires a graph, design 1.9). It launches the next forward speculatively -- predicting
+    the pending commit, consume-by-request-id, finish-/boundary-gated so no output realignment is
+    ever needed -- so update_requests runs in the launched forward's GPU shadow. The bar is
+    token-exact ``async == serial`` AND evidence (the controller's ordering counter) that the
+    overlap actually fired. Eager / prefill / hybrid / MTP stay on the serial path.
+    """
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+        )
+
+    @classmethod
+    def teardown_class(cls):
+        delete_cuda_graphs()
+        set_rounder(64)
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _greedy_cuda_graph_kwargs(**overrides):
+        cfg = dict(
+            model_provider="gpt",
+            num_requests=4,
+            num_gap_steps=0,
+            num_tokens_to_generate=24,
+            use_fixed_output_lengths=True,
+            num_cuda_graphs=4,
+            force_build_cuda_graphs=True,
+            inference_cuda_graph_scope=InferenceCudaGraphScope.block,
+            use_cuda_graphs_for_non_decode_steps=False,
+            context_max_requests=128,
+        )
+        cfg.update(overrides)
+        return cfg
+
+    @pytest.mark.internal
+    def test_overlap_fires_and_equals_serial_greedy(self) -> None:
+        """Greedy GPT decode under a CUDA graph: token-exact async==serial AND the overlap fired
+        (the next forward was launched before update_requests at least once)."""
+        from unittest import mock
+
+        base_build = AsyncSchedTxnTestBase._build_requests
+
+        def greedy_build(cls, test_config):
+            requests = base_build(test_config)
+            for request in requests:
+                request.sampling_params.top_k = 1  # argmax => greedy, no RNG draws
+            return requests
+
+        with mock.patch.object(type(self), "_build_requests", classmethod(greedy_build)):
+            serial_env, async_env = self.assert_async_equals_serial(
+                **self._greedy_cuda_graph_kwargs()
+            )
+
+        # The overlap actually engaged: at least one forward was launched before its commit.
+        launches = async_env.engine.controller._async_launch_before_commit_count
+        assert launches > 0, "launch-before-commit overlap never fired (no GPU shadow overlap)"
+        assert async_env.engine.controller._async_committed_with_inflight_forward
+        # The serial control did NOT overlap (the flag stays at its default).
+        assert serial_env.engine.controller._async_launch_before_commit_count == 0
+
+    @pytest.mark.internal
+    def test_overlap_equals_serial_greedy_staggered_finishes(self) -> None:
+        """Staggered finishes under the overlap: a finish forces a non-overlapped (sync) step and
+        the pipeline re-primes, staying token-exact vs serial across the reshapes."""
+        from unittest import mock
+
+        base_build = AsyncSchedTxnTestBase._build_requests
+
+        def greedy_build(cls, test_config):
+            requests = base_build(test_config)
+            for i, request in enumerate(requests):
+                request.sampling_params.top_k = 1
+                # Staggered output lengths => finishes land on different steps, exercising the
+                # finish-gated launch (no speculative launch on a finishing step) + re-prime.
+                request.sampling_params.num_tokens_to_generate = 12 + 3 * i
+            return requests
+
+        with mock.patch.object(type(self), "_build_requests", classmethod(greedy_build)):
+            serial_env, async_env = self.assert_async_equals_serial(
+                **self._greedy_cuda_graph_kwargs(num_requests=5, use_fixed_output_lengths=False)
+            )
+        assert async_env.engine.controller._async_launch_before_commit_count > 0
