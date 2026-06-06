@@ -244,7 +244,9 @@ def _make_dummy_controller(*, num_speculative_tokens):
         "forward"
     )
     controller._dummy_decode_sample_collective = lambda: calls.append("decode_result_collective")
-    controller._dummy_decode_async_child_forward_if_planned = lambda: calls.append("child_forward")
+    controller._dummy_decode_async_child_forward_if_planned = (
+        lambda *args, **kwargs: calls.append("child_forward")
+    )
     controller._dummy_serial_mtp_forward = lambda: calls.append("serial_mtp")
     controller._clear_ep_decode_broadcast_plan = lambda: calls.append("clear_plan")
     controller._clear_ep_step_begin_decision = lambda: calls.append("clear_step")
@@ -257,7 +259,14 @@ def test_non_mtp_dummy_reuse_skips_decode_result_collective():
 
     controller.dummy_forward()
 
-    assert calls == ["child_forward", "serial_mtp", "clear_plan", "clear_step", "reset"]
+    assert calls == [
+        "child_forward",
+        "child_forward",
+        "serial_mtp",
+        "clear_plan",
+        "clear_step",
+        "reset",
+    ]
 
 
 def test_mtp_dummy_reuse_keeps_decode_result_collective_before_mtp_and_child():
@@ -287,6 +296,7 @@ def test_dummy_forward_fences_metadata_h2d_before_context_reset():
     controller.dummy_forward()
 
     assert calls == [
+        "child_forward",
         "child_forward",
         "serial_mtp",
         "clear_plan",

@@ -2574,6 +2574,16 @@ class TextGenerationController:
         ep_step_begin_decision = self._decide_ep_step_begin(has_real_work=True)
         if ep_step_begin_decision.discard_pending_forward:
             self._async_launched_child_txn = None
+        if context.async_scheduling and self.num_speculative_tokens == 0:
+            ep_child_launch_plan = self._sync_ep_async_child_launch_plan(
+                active_request_count,
+                can_launch_real_child=False,
+            )
+            if self._ep_async_child_launches(ep_child_launch_plan):
+                raise RuntimeError(
+                    "EP async child launch plan selected a normal child while this rank "
+                    "is consuming a presampled decode step"
+                )
 
         with torch.inference_mode():
             sampled_tokens_cpu = self._consume_async_sample_transfer(active_request_count)

@@ -166,7 +166,7 @@ def _make_controller(context):
     controller._enable_cuda_graph = False
     controller._ep_async_protocol = None
     controller._get_stop_word_finished_ids_callback = None
-    controller._has_stop_word_constraints_callback = None
+    controller._has_stop_word_constraints_callback = lambda request_ids: True
     controller._async_prepared_child_txn = None
     controller._async_launched_child_txn = None
     controller._async_presampled_txn = None
