@@ -308,6 +308,10 @@ class DynamicInferenceEngine(AbstractEngine):
             StepTransactionManager(self.context) if self.enable_async_scheduling else None
         )
         self._current_txn = None
+        # Drop any launch-before-commit forward left in flight by a prior generation: a reset
+        # rewinds the context, so a stale consume-by-request-id snapshot must not be consumed.
+        if self.enable_async_scheduling and getattr(self, "controller", None) is not None:
+            self.controller.async_drain_inflight_forward()
 
         # Request state.
         self.request_counter = Counter()
