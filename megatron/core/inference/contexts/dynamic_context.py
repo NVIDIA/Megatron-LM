@@ -259,6 +259,10 @@ class DynamicInferenceContext(BaseInferenceContext):
     def __init__(self, model_config: TransformerConfig, inference_config: InferenceConfig):
         super().__init__(inference_config=inference_config)
 
+        # Transactional async scheduling (launch-before-commit) opt-in. When False,
+        # the decode step is byte-for-byte identical to the legacy serial path.
+        self.enable_async_scheduling = inference_config.enable_async_scheduling
+
         # Prefix caching configuration
         self.enable_prefix_caching = inference_config.enable_prefix_caching
         self.prefix_caching_eviction_policy = inference_config.prefix_caching_eviction_policy

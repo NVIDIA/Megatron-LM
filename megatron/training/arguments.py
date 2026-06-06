@@ -1943,6 +1943,15 @@ def _add_inference_args(parser):
                        help='Enable/disable prefix caching for dynamic batching inference. '
                        'When disabled, KV cache blocks cannot be shared between '
                        'requests with identical prompt prefixes.')
+    group.add_argument('--inference-dynamic-batching-async-scheduling',
+                       dest='inference_dynamic_batching_async_scheduling',
+                       action=argparse.BooleanOptionalAction,
+                       default=False,
+                       help='Enable/disable transactional async scheduling for dynamic '
+                       'batching decode. When enabled, the engine overlaps CPU '
+                       'scheduling/bookkeeping with the GPU forward (launch-before-commit) '
+                       'so steady-state decode keeps the GPU busy. When disabled (default), '
+                       'the decode step is identical to the legacy serial path.')
     group.add_argument('--inference-dynamic-batching-prefix-caching-eviction-policy',
                        type=str, default='ref_zero',
                        choices=['ref_zero', 'lru'],

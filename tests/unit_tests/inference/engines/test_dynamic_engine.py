@@ -129,6 +129,7 @@ class DynamicEngineTestConfig:
     skip_prompt_log_probs: bool = False
     enable_chunked_prefill: bool = False
     enable_prefix_caching: bool = False
+    enable_async_scheduling: bool = False
     cuda_graph_modules: List[CudaGraphModule] = field(default_factory=list)
     inference_cuda_graph_scope: InferenceCudaGraphScope = InferenceCudaGraphScope.block
     cuda_graph_impl: Optional[str] = None
@@ -291,6 +292,7 @@ class DynamicInferenceEngineTestBase:
                 static_kv_memory_pointers=test_config.static_kv_memory_pointers,
                 enable_chunked_prefill=test_config.enable_chunked_prefill,
                 enable_prefix_caching=test_config.enable_prefix_caching,
+                enable_async_scheduling=test_config.enable_async_scheduling,
                 use_flashinfer_fused_rope=None,  # default to using flash-infer if available
                 # this is for compatibility with the LTS environment
                 unified_memory_level=0,  # unit tests currently broken with UVM

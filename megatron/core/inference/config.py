@@ -275,6 +275,16 @@ class InferenceConfig:
     enable_chunked_prefill: bool = False
     """Whether to enable chunked prefill."""
 
+    enable_async_scheduling: bool = False
+    """Whether to enable transactional async scheduling for dynamic-batching decode.
+
+    When True, the dynamic engine overlaps CPU scheduling/bookkeeping work with the GPU
+    forward (launch-before-commit pipeline) so that steady-state decode keeps the GPU
+    busy. Opt-in; defaults to False. When False, the decode step is byte-for-byte
+    identical to the legacy serial path. Mapped from the Megatron argument
+    ``--inference-dynamic-batching-async-scheduling``.
+    """
+
     num_speculative_tokens: int = 0
     """The number of speculative tokens to generate for decode steps."""
 
