@@ -788,16 +788,35 @@ class TextGenerationController:
             return AsyncTxnSkipReason.SKIP_BOOKKEEPING
         if self.num_speculative_tokens > 0:
             return AsyncTxnSkipReason.MTP_ACTIVE
-        if self._enable_cuda_graph or context.using_cuda_graph_this_step():
-            return AsyncTxnSkipReason.CUDA_GRAPH_DEFERRED
-        if (
-            getattr(self.model_config, "expert_model_parallel_size", 1) > 1
-            or getattr(self.model_config, "num_moe_experts", None) is not None
-        ):
-            return AsyncTxnSkipReason.MOE_EP_DEFERRED
         if active_request_count != len(child_txn.request_ids):
             return AsyncTxnSkipReason.ACTIVE_COUNT_CHANGED
         return None
+
+    def _prepare_async_child_from_committed_decode_state(self) -> Optional[StepTxn]:
+        """Prepare the next plain-decode transaction with graph-safe slot ownership."""
+
+        context = self.inference_wrapped_model.inference_context
+        if not context.async_scheduling or context.async_decode_slot_ring is None:
+            return None
+
+        if context.using_cuda_graph_this_step():
+            # CUDA graphs capture metadata pointer addresses.  Reuse the currently
+            # captured slot and defer the H2D until after sampling, when the prior
+            # forward/sampling work has finished using those buffers.
+            return context.prepare_child_from_committed_decode_state(
+                target_slot=context.async_decode_slot_ring.current,
+                defer_h2d=True,
+            )
+
+        return context.prepare_child_from_committed_decode_state()
+
+    def _decode_slot_for_txn(self, child_txn: StepTxn):
+        context = self.inference_wrapped_model.inference_context
+        assert context.async_decode_slot_ring is not None
+        for slot in context.async_decode_slot_ring.slots:
+            if slot.slot_id == child_txn.slot_id:
+                return slot
+        raise RuntimeError(f"prepared async child slot {child_txn.slot_id} is not in the ring")
 
     def _launch_async_decode_child(
         self,
@@ -810,11 +829,14 @@ class TextGenerationController:
 
         context = self.inference_wrapped_model.inference_context
         assert context.async_decode_slot_ring is not None
-        child_slot = context.async_decode_slot_ring.child
-        if child_slot.slot_id != child_txn.slot_id:
-            raise RuntimeError("prepared async child slot no longer matches ring child")
+        child_slot = self._decode_slot_for_txn(child_txn)
 
-        if child_txn.h2d_done_event is not None:
+        if child_txn.cpu_bookkeeping_buf is not None:
+            child_txn.h2d_done_event = child_slot.copy_bookkeeping_from_cpu(
+                child_txn.cpu_bookkeeping_buf, non_blocking=True
+            )
+            child_txn.cpu_bookkeeping_buf = None
+        elif child_txn.h2d_done_event is not None:
             torch.cuda.current_stream(child_slot.gpu_view._buf.device).wait_event(
                 child_txn.h2d_done_event
             )
@@ -841,7 +863,10 @@ class TextGenerationController:
         range_pop()
 
         child_txn.launched = True
-        context.async_decode_slot_ring.adopt_child()
+        if child_slot is context.async_decode_slot_ring.child:
+            context.async_decode_slot_ring.adopt_child()
+        else:
+            context.bind_decode_slot(child_slot)
         self._async_launched_child_txn = child_txn
         self._async_prepared_child_txn = None
         context.async_txn_diagnostics.record_launched(
@@ -926,6 +951,36 @@ class TextGenerationController:
         )
         self._ep_decode_broadcast_plan = plan
         return plan
+
+    def _sync_ep_async_child_launch_plan(
+        self, active_request_count: int, *, can_launch_real_child: bool
+    ) -> EPDecodeBroadcastPlan:
+        """Synchronize whether the EP group will enter an async child forward phase."""
+
+        group = self._expert_parallel_group()
+        if get_pg_size(group) <= 1:
+            return EPDecodeBroadcastPlan(
+                active_request_count=(
+                    int(active_request_count) if can_launch_real_child else 0
+                ),
+                src_group_rank=0,
+                has_real_work=bool(can_launch_real_child),
+            )
+
+        context = self.inference_wrapped_model.inference_context
+        communicator = getattr(context, "_ep_zmq_communicator", None)
+        return resolve_ep_decode_broadcast_plan(
+            active_request_count,
+            group,
+            has_real_work=can_launch_real_child,
+            sync_all_reduce_max_fn=(
+                communicator.sync_all_reduce_max if communicator is not None else None
+            ),
+        )
+
+    @staticmethod
+    def _ep_async_child_launches(plan: EPDecodeBroadcastPlan) -> bool:
+        return bool(plan.has_real_work and plan.active_request_count > 0)
 
     def _clear_ep_decode_broadcast_plan(self) -> None:
         self._ep_decode_broadcast_plan = None
@@ -1887,6 +1942,8 @@ class TextGenerationController:
             # main forward. Dummy ranks must enter the same post-forward
             # collective phase before any MTP collectives are issued.
             self._dummy_decode_sample_collective()
+            if self.num_speculative_tokens == 0:
+                self._dummy_decode_async_child_forward_if_planned()
 
             # When speculative decoding is active, the real EP ranks perform serial
             # MTP forward passes after the main forward pass. MTP layers may contain
@@ -1894,11 +1951,23 @@ class TextGenerationController:
             # all-to-all collectives. The dummy rank must participate in these
             # collectives to avoid a hang.
             self._dummy_serial_mtp_forward()
+            if self.num_speculative_tokens > 0:
+                self._dummy_decode_async_child_forward_if_planned()
             self._dummy_decode_stop_word_collective_tail()
         finally:
             self._clear_ep_decode_broadcast_plan()
             # clear the context of any temporary state from the dummy forward
             context.reset()
+
+    def _dummy_decode_async_child_forward_if_planned(self) -> None:
+        """Mirror a real EP rank's async child forward phase on dummy ranks."""
+
+        plan = self._sync_ep_async_child_launch_plan(0, can_launch_real_child=False)
+        if not self._ep_async_child_launches(plan):
+            return
+
+        input_ids, position_ids = self._dynamic_step_context_init(is_dummy_forward=True)
+        self._dynamic_step_forward_logits(input_ids, position_ids)
 
     @torch.inference_mode()
     def _dummy_serial_mtp_forward(self):
@@ -2235,7 +2304,7 @@ class TextGenerationController:
                     range_push("async_txn_child_prestage")
                     try:
                         self._async_prepared_child_txn = (
-                            context.prepare_child_from_committed_decode_state()
+                            self._prepare_async_child_from_committed_decode_state()
                         )
                     finally:
                         range_pop()
@@ -2306,10 +2375,33 @@ class TextGenerationController:
 
             log_probs = None
             top_n_logprobs = None
-            if (
+            local_can_launch_child = (
                 context.async_scheduling
                 and child_launch_skip_reason is None
                 and self._async_prepared_child_txn is not None
+            )
+            ep_child_launch_plan = None
+            if context.async_scheduling:
+                ep_child_launch_plan = self._sync_ep_async_child_launch_plan(
+                    active_request_count,
+                    can_launch_real_child=local_can_launch_child,
+                )
+                if local_can_launch_child and not self._ep_async_child_launches(
+                    ep_child_launch_plan
+                ):
+                    raise RuntimeError("EP async child launch plan dropped the real child launch")
+                if (
+                    self._ep_async_child_launches(ep_child_launch_plan)
+                    and not local_can_launch_child
+                ):
+                    raise RuntimeError(
+                        "EP async child launch plan selected a source rank without a local child"
+                    )
+
+            if (
+                local_can_launch_child
+                and ep_child_launch_plan is not None
+                and self._ep_async_child_launches(ep_child_launch_plan)
             ):
                 launched_child_txn = self._async_prepared_child_txn
                 sample_ready_event = self._record_async_sample_ready_event()
@@ -2382,7 +2474,7 @@ class TextGenerationController:
                     range_push("async_txn_child_prestage")
                     try:
                         self._async_prepared_child_txn = (
-                            context.prepare_child_from_committed_decode_state()
+                            self._prepare_async_child_from_committed_decode_state()
                         )
                     finally:
                         range_pop()

@@ -142,6 +142,23 @@ def test_plain_decode_launch_gate_uses_concrete_local_reasons():
     assert active_count_reason == AsyncTxnSkipReason.ACTIVE_COUNT_CHANGED
 
 
+def test_cuda_graph_and_ep_are_not_blanket_async_skip_reasons():
+    controller = _make_launch_gate_controller()
+    controller._enable_cuda_graph = True
+    controller.model_config.expert_model_parallel_size = 4
+    controller.model_config.num_moe_experts = 128
+    child_txn = StepTxn(step_id=1, request_ids=(101, 102))
+
+    reason = controller._async_child_launch_skip_reason(
+        child_txn,
+        return_log_probs=False,
+        return_top_n_logprobs=False,
+        skip_bookkeeping=False,
+    )
+
+    assert reason is None
+
+
 def test_diagnostics_show_compact_transaction_lifecycle():
     diagnostics = AsyncTxnDiagnostics(enabled=True)
     released = []

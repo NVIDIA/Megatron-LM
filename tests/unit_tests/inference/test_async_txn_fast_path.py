@@ -34,7 +34,7 @@ class FakeKVAllocator:
 
 
 class FakeContext:
-    def __init__(self, *, async_scheduling=True, termination_id=-1):
+    def __init__(self, *, async_scheduling=True, termination_id=-1, use_cuda_graph=False):
         self.async_scheduling = async_scheduling
         self.async_txn_diagnostics = AsyncTxnDiagnostics(enabled=async_scheduling)
         self.async_decode_slot_ring = AsyncDecodeSlotRing(
@@ -63,12 +63,14 @@ class FakeContext:
         self.request_rng_store = None
         self.prepared = 0
         self.updated = 0
+        self.use_cuda_graph = use_cuda_graph
+        self.deferred_h2d_prepares = 0
 
     def is_decode_only(self):
         return True
 
     def using_cuda_graph_this_step(self):
-        return False
+        return self.use_cuda_graph
 
     def active_decode_slot(self):
         return self.async_decode_slot_ring.current
@@ -83,16 +85,19 @@ class FakeContext:
         view = self.async_decode_slot_ring.current.gpu_view
         return view.token_to_input_ids[:1].unsqueeze(0), view.token_to_pos_ids[:1].unsqueeze(0)
 
-    def prepare_child_from_committed_decode_state(self):
+    def prepare_child_from_committed_decode_state(self, *, target_slot=None, defer_h2d=False):
         if not self.async_scheduling:
             return None
         self.prepared += 1
-        child = self.async_decode_slot_ring.child
+        child = target_slot or self.async_decode_slot_ring.child
+        if defer_h2d:
+            self.deferred_h2d_prepares += 1
         self.async_txn_diagnostics.record_prepared(under_forward=True)
         return StepTxn(
             step_id=self.prepared,
             request_ids=(17,),
             slot_id=child.slot_id,
+            cpu_bookkeeping_buf=torch.zeros_like(child.gpu_view._buf) if defer_h2d else None,
             cuda_graph_key=child.cuda_graph_key(("decode", 1, 1)),
         )
 
@@ -238,6 +243,20 @@ def test_child_launch_allows_ordinary_terminal_rows():
     asyncio.run(controller.async_generate_output_tokens_dynamic_batch())
 
     assert "child_forward" in order
+    assert context.async_txn_diagnostics.launched == 1
+
+
+def test_cuda_graph_child_launch_reuses_current_slot_with_deferred_h2d():
+    context = FakeContext(use_cuda_graph=True)
+    controller, order = _make_controller(context)
+    controller._enable_cuda_graph = True
+
+    asyncio.run(controller.async_generate_output_tokens_dynamic_batch())
+
+    assert "child_forward" in order
+    assert context.active_decode_slot_id == 0
+    assert controller._async_launched_child_txn.slot_id == 0
+    assert context.deferred_h2d_prepares >= 1
     assert context.async_txn_diagnostics.launched == 1
 
 

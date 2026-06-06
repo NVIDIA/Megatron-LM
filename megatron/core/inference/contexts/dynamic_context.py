@@ -1485,7 +1485,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         max_sequence_lengths = self.get_max_sequence_lengths()[:active_request_count]
         return bool(torch.ge(active_sequence_lengths + 1, max_sequence_lengths).any())
 
-    def prepare_child_from_committed_decode_state(self) -> Optional[StepTxn]:
+    def prepare_child_from_committed_decode_state(
+        self,
+        *,
+        target_slot: Optional[AsyncDecodeSlot] = None,
+        defer_h2d: bool = False,
+    ) -> Optional[StepTxn]:
         """Prestage deterministic plain-decode child metadata into the free slot.
 
         This covers ordinary non-hybrid decode, including requests that cross a
@@ -1502,8 +1507,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.async_txn_diagnostics.record_barrier_skip(eligibility.reason)
             return None
 
-        child_slot = self.async_decode_slot_ring.child
-        if not child_slot.can_reuse():
+        child_slot = target_slot or self.async_decode_slot_ring.child
+        if child_slot is not self.async_decode_slot_ring.current and not child_slot.can_reuse():
             self.async_txn_diagnostics.record_barrier_skip(AsyncTxnSkipReason.CHILD_SLOT_BUSY)
             return None
 
@@ -1535,13 +1540,16 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._patch_plain_decode_child_bookkeeping(
             child_cpu_buf, active_request_count, kv_block_leases=kv_block_leases
         )
-        h2d_done_event = child_slot.copy_bookkeeping_from_cpu(child_cpu_buf, non_blocking=True)
+        h2d_done_event = None
+        if not defer_h2d:
+            h2d_done_event = child_slot.copy_bookkeeping_from_cpu(child_cpu_buf, non_blocking=True)
         self.async_txn_diagnostics.record_prepared(under_forward=True)
         return StepTxn(
             step_id=self.step_count + 1,
             request_ids=request_ids,
             slot_id=child_slot.slot_id,
             h2d_done_event=h2d_done_event,
+            cpu_bookkeeping_buf=child_cpu_buf if defer_h2d else None,
             kv_block_leases=kv_block_leases,
             mamba_slot_ids=mamba_slot_ids,
             cuda_graph_key=child_slot.cuda_graph_key(

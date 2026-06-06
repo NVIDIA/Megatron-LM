@@ -185,6 +185,7 @@ class StepTxn:
     h2d_done_event: object = None
     forward_done_event: object = None
     sample_done_event: object = None
+    cpu_bookkeeping_buf: Optional[torch.Tensor] = None
     kv_block_ids: tuple[int, ...] = ()
     kv_block_leases: tuple[KVBlockLease, ...] = ()
     mamba_slot_ids: tuple[int, ...] = ()
