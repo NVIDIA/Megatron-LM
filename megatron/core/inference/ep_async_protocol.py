@@ -16,6 +16,7 @@ class EPAsyncPhase(str, Enum):
     GRAPH_SHAPE = "ep_graph_shape"
     DECODE_POST_FORWARD = "ep_decode_post_forward"
     ASYNC_CHILD_HANDOFF = "ep_async_child_handoff"
+    ASYNC_CHAIN_HANDOFF = "ep_async_chain_handoff"
 
 
 @dataclass(frozen=True)
