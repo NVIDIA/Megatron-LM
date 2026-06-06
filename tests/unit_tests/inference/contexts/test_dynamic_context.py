@@ -365,6 +365,7 @@ class TestDynamicContext:
             buffer_size_gb=0.1,
             block_size_tokens=128,
             max_tokens=None,
+            num_cuda_graphs=-1,
             async_scheduling=True,
         )
         dynamic_context.add_request(
@@ -379,6 +380,9 @@ class TestDynamicContext:
             new_tokens=torch.tensor([7], dtype=torch.int64),
         )
         dynamic_context.initialize_attention_state()
+        assert dynamic_context.using_cuda_graph_this_step()
+        assert dynamic_context.active_attn_metadata is dynamic_context.graph_attn_metadata
+
         child_txn = dynamic_context.prepare_child_from_committed_decode_state()
         assert child_txn is not None
         if child_txn.h2d_done_event is not None:
@@ -387,7 +391,6 @@ class TestDynamicContext:
         child_slot = dynamic_context.async_decode_slot_ring.child
         dynamic_context.bind_decode_slot(child_slot)
         previous_attn_metadata = dynamic_context.active_attn_metadata
-        dynamic_context._using_cuda_graph_this_step = True
 
         with dynamic_context.async_child_forward_graph_replay_disabled_scope():
             assert dynamic_context.using_cuda_graph_this_step()
