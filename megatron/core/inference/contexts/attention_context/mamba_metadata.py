@@ -749,3 +749,18 @@ class MambaMetadata:
 
         # Invalidate the Mamba state index for the finished requests
         self.request_to_mamba_state_idx[request_indices] = -1
+
+    def free_slot_ids(self, mamba_indices: torch.Tensor) -> None:
+        """Return already-detached Mamba slot ids to the free pool."""
+
+        mamba_indices = mamba_indices[mamba_indices != -1]
+        num_to_free = len(mamba_indices)
+        if num_to_free == 0:
+            return
+
+        start_idx = self.mamba_state_free_slot_count
+        end_idx = start_idx + num_to_free
+        self.mamba_state_free_slots[start_idx:end_idx] = mamba_indices.to(
+            dtype=self.mamba_state_free_slots.dtype, device=self.mamba_state_free_slots.device
+        )
+        self.mamba_state_free_slot_count = end_idx

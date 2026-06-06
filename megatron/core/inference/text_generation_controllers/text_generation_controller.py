@@ -742,8 +742,6 @@ class TextGenerationController:
             return AsyncTxnSkipReason.UNKNOWN_BARRIER
         if self.num_speculative_tokens > 0:
             return AsyncTxnSkipReason.MTP_ACTIVE
-        if context.is_hybrid_model:
-            return AsyncTxnSkipReason.HYBRID_PRESTAGE_DEFERRED
         if self._enable_cuda_graph or context.using_cuda_graph_this_step():
             return AsyncTxnSkipReason.CUDA_GRAPH_DEFERRED
         if (

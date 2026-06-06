@@ -1501,11 +1501,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         if not eligibility.eligible:
             self.async_txn_diagnostics.record_barrier_skip(eligibility.reason)
             return None
-        if self.is_hybrid_model:
-            self.async_txn_diagnostics.record_barrier_skip(
-                AsyncTxnSkipReason.HYBRID_PRESTAGE_DEFERRED
-            )
-            return None
 
         child_slot = self.async_decode_slot_ring.child
         if not child_slot.can_reuse():
@@ -1520,6 +1515,15 @@ class DynamicInferenceContext(BaseInferenceContext):
         request_ids = self.request_ids[
             self.paused_request_count : self.total_request_count
         ].tolist()
+        mamba_slot_ids = ()
+        if self.is_hybrid_model:
+            assert self.mamba_metadata is not None
+            mamba_slot_ids = tuple(
+                int(slot)
+                for slot in self.mamba_metadata.request_to_mamba_state_idx[
+                    self.paused_request_count : self.total_request_count
+                ].tolist()
+            )
         kv_block_leases = self._reserve_async_boundary_blocks(eligibility.boundary_request_ids)
         if kv_block_leases is None:
             self.async_txn_diagnostics.record_barrier_skip(
@@ -1539,6 +1543,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             slot_id=child_slot.slot_id,
             h2d_done_event=h2d_done_event,
             kv_block_leases=kv_block_leases,
+            mamba_slot_ids=mamba_slot_ids,
             cuda_graph_key=child_slot.cuda_graph_key(
                 ("decode", self.padded_active_request_count, self.padded_active_token_count)
             ),
@@ -3296,9 +3301,23 @@ class DynamicInferenceContext(BaseInferenceContext):
         # tensor.
         self.request_to_kv_block_ids[request_indexes] = -1
 
-        # Free Mamba slots.
+        # Free Mamba slots. Async-launched hybrid decode uses single-bank Mamba
+        # state, so finished slots cannot return to the free pool until the
+        # launched child forward has retired.
         if self.is_hybrid_model:
-            self.mamba_metadata.free_slots(request_indexes)
+            if defer_release:
+                mamba_slot_ids = self.mamba_metadata.request_to_mamba_state_idx[
+                    request_indexes
+                ].clone()
+                self.release_mamba_slots(
+                    mamba_slot_ids,
+                    retire_event=retire_event,
+                    defer_release=True,
+                    label="finished_request_mamba",
+                )
+                self.mamba_metadata.request_to_mamba_state_idx[request_indexes] = -1
+            else:
+                self.mamba_metadata.free_slots(request_indexes)
 
         # Clear intermediate offset entries for released requests (CPU writes).
         if self.mamba_slot_allocator is not None:
@@ -3345,6 +3364,31 @@ class DynamicInferenceContext(BaseInferenceContext):
             retire_event=txn.forward_done_event,
             defer_release=txn.launched,
             label="unused_async_kv_lease",
+        )
+
+    def release_mamba_slots(
+        self,
+        mamba_slot_ids: Tensor,
+        *,
+        retire_event=None,
+        defer_release: bool = False,
+        label: str = "mamba",
+    ) -> None:
+        """Release Mamba slots now or after a transaction-owned forward event."""
+
+        if mamba_slot_ids.numel() == 0:
+            return
+        mamba_slot_ids = mamba_slot_ids.to(device='cpu', dtype=torch.int32).clone()
+        if not defer_release:
+            self.mamba_metadata.free_slot_ids(mamba_slot_ids)
+            return
+
+        self.async_txn_retire_queue.enqueue(
+            retire_event,
+            lambda mamba_slot_ids=mamba_slot_ids: self.mamba_metadata.free_slot_ids(
+                mamba_slot_ids
+            ),
+            label=label,
         )
 
     def resume_paused_requests(

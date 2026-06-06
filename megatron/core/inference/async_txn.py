@@ -193,6 +193,7 @@ class StepTxn:
         )
         self.terminal_request_ids = tuple(int(r) for r in self.terminal_request_ids)
         self.committed_request_ids = tuple(int(r) for r in self.committed_request_ids)
+        self.mamba_slot_ids = tuple(int(slot_id) for slot_id in self.mamba_slot_ids)
 
     @property
     def request_id_set(self) -> set[int]:
