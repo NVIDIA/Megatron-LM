@@ -2603,6 +2603,30 @@ class DynamicInferenceContext(BaseInferenceContext):
         threshold = self.block_size_tokens - 1 - self.num_speculative_tokens
         return torch.nonzero(num_tokens_in_last_block >= threshold, as_tuple=True)[0]
 
+    def _decode_crossers_within_window(self, lookahead_steps: int) -> int:
+        """Count active requests that would cross a KV block boundary within the next
+        ``lookahead_steps`` plain-decode steps.
+
+        Uses the SAME boundary condition as ``update_requests`` /
+        ``_boundary_crosser_local_indices`` (``num_tokens_in_last_block >= block_size_tokens
+        - 1 - num_speculative_tokens``), shifted by ``lookahead_steps - 1`` so a request
+        within ``lookahead_steps`` unit-query appends of its block boundary is counted.
+
+        This is the look-ahead the *speculative* launch-before-commit prestage needs: it
+        builds the forward AFTER the pending (not-yet-committed) decode step, so the predicted
+        block table is only invariant if NEITHER the pending commit NOR that forward crosses a
+        boundary. When any request would cross within the window the prestage is ineligible and
+        the engine takes a synchronous step (where the boundary block is allocated normally).
+        Pure read; mutates nothing.
+        """
+        active_request_count = self.total_request_count - self.paused_request_count
+        if active_request_count <= 0:
+            return 0
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+        num_tokens_in_last_block = self.request_last_kv_block_offset[active_slice]
+        threshold = self.block_size_tokens - 1 - self.num_speculative_tokens - (lookahead_steps - 1)
+        return int((num_tokens_in_last_block >= threshold).sum().item())
+
     def build_launch_signals(
         self,
         *,
@@ -2653,11 +2677,25 @@ class DynamicInferenceContext(BaseInferenceContext):
         evict_pending: bool = False,
         forced_pause_overflow: bool = False,
         graph_recapture: bool = False,
+        speculate_pending_decode_commit: bool = False,
     ) -> "PrestagedDecodePlan":
         """Build the next decode step's launch plan into the CPU staging buffer.
 
         Speculating no finish this step, predict the next forward's plan from the *committed*
         layout and:
+
+        ``speculate_pending_decode_commit`` switches between the two plans the pipeline needs:
+
+        * ``False`` (default): build the metadata for the forward that runs against the *current*
+          committed layout -- the immediately-next forward (validated == ``initialize_attention_state``).
+        * ``True``: the launch-before-commit plan (design 1.1 step 2 -- "advance +1 token,
+          speculating no finish this step"). The current decode step's ``update_requests`` is
+          deferred, so the launched forward consumes the layout the pending commit *will* produce;
+          predict it by advancing each active request's kv length by its (unit) query length before
+          building the next forward's metadata. Only valid when no request crosses a KV block
+          boundary within the 2-step speculative window (the pending commit + the launched forward);
+          otherwise the predicted block table would change and the plan is ineligible
+          (``SPECULATIVE_BOUNDARY_WINDOW``) so the engine takes a synchronous step.
 
         * classify launch eligibility from committed state + KV headroom; if ineligible, return
           an empty plan carrying the static skip reason (no staging writes, no leases);
@@ -2676,6 +2714,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         that consumes the plan (a later commit).
         """
         from megatron.core.inference.engines.step_transaction import (
+            LaunchGateReason,
             PrestagedDecodePlan,
             classify_launch_eligibility,
         )
@@ -2697,6 +2736,17 @@ class DynamicInferenceContext(BaseInferenceContext):
                 step_id=self.step_count, eligible=False, skip_reason=decision.reason
             )
 
+        # Launch-before-commit (speculative): the launched forward consumes the layout the
+        # deferred current-step commit will produce, so the predicted block table is only
+        # invariant when no request crosses a boundary within the 2-step window. If one does,
+        # fall back to a synchronous step (where the boundary block is allocated normally).
+        if speculate_pending_decode_commit and self._decode_crossers_within_window(2) > 0:
+            return PrestagedDecodePlan(
+                step_id=self.step_count,
+                eligible=False,
+                skip_reason=LaunchGateReason.SPECULATIVE_BOUNDARY_WINDOW,
+            )
+
         bs = self.total_request_count - self.paused_request_count
         active_slice = slice(self.paused_request_count, self.total_request_count)
 
@@ -2704,12 +2754,22 @@ class DynamicInferenceContext(BaseInferenceContext):
         # later compaction of the live request_ids never perturbs the snapshot.
         snapshot_request_ids = self.request_ids[active_slice].detach().clone()
 
+        # Base kv lengths the next forward is built on. The non-speculative plan builds the
+        # immediately-next forward from the committed offsets (advance's +1 gives the unit query).
+        # The speculative plan predicts the deferred current-step commit first: each active
+        # request's kv length grows by its (unit) query length, so the launched forward sees
+        # request_kv_length_offsets + query_lengths as its base (advance's +1 then adds its own
+        # query). Boundary-gated above, so the block table is invariant either way.
+        prev_kv_seq_lengths = self.request_kv_length_offsets[active_slice]
+        if speculate_pending_decode_commit:
+            prev_kv_seq_lengths = prev_kv_seq_lengths + self.request_query_lengths[active_slice]
+
         # Build the next forward's MHA metadata into the STAGING views (never live / GPU). For
         # plain decode, query_lengths == 1, so request_kv_length_offsets + 1 == kv_offsets +
         # query_lengths -- exactly the rebuild's kv_seq_lengths.
         self.advance_decode_metadata_in_place(
             bs=bs,
-            prev_kv_seq_lengths=self.request_kv_length_offsets[active_slice],
+            prev_kv_seq_lengths=prev_kv_seq_lengths,
             committed_block_table=self.request_to_kv_block_ids[active_slice],
             out_query_lengths=self._staging_mha_query_lengths,
             out_cu_query=self._staging_mha_cu_query_seq_lengths,

@@ -640,8 +640,13 @@ class TestLaunchEligibilityGate:
             assert decision.reason is expected_reason, overrides
             assert not decision.eligible
             reasons_seen.add(expected_reason)
-        # The cases cover every LaunchGateReason except the eligible one.
-        assert reasons_seen == set(LaunchGateReason) - {LaunchGateReason.PURE_DECODE}
+        # The cases cover every reason produced by the static classifier. PURE_DECODE is the
+        # eligible reason, and SPECULATIVE_BOUNDARY_WINDOW is a prestage-only reason (set by the
+        # launch-before-commit boundary look-ahead, not derivable from the static LaunchSignals).
+        assert reasons_seen == set(LaunchGateReason) - {
+            LaunchGateReason.PURE_DECODE,
+            LaunchGateReason.SPECULATIVE_BOUNDARY_WINDOW,
+        }
 
     def test_reason_priority_is_deterministic(self) -> None:
         """When several gates fail, the most fundamental one is reported."""
@@ -1562,6 +1567,95 @@ class TestC5Prestage(AsyncSchedTxnTestBase):
         )
         assert torch.equal(staging["cukv"], ctx._cpu_mha_cu_kv_seq_lengths[: bs + 1])
         assert torch.equal(staging["bt"], ctx._cpu_mha_block_table[:bs])
+
+    # --- speculative (launch-before-commit) prestage ------------------------------
+
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_speculative_prestage_equals_commit_then_rebuild(self) -> None:
+        """The speculative plan == the metadata of the forward AFTER the pending commit.
+
+        Launch-before-commit defers the current decode step's ``update_requests`` and launches
+        the next forward against the layout that commit *will* produce (design 1.1 step 2). So
+        the speculative prestage taken at the committed layout must equal what
+        ``initialize_attention_state`` rebuilds after one more real decode step is committed.
+        """
+        env, ctx = self._decode_context()
+        ctx.using_cuda_graph_this_step = lambda: True
+        try:
+            plan = ctx.prestage_next_decode_step_into_cpu_staging(
+                speculate_pending_decode_commit=True
+            )
+        finally:
+            del ctx.using_cuda_graph_this_step
+        assert plan.eligible, plan.skip_reason
+        assert plan.kv_blocks_needed == 0, "fixture must not cross a boundary in the spec window"
+        bs = plan.active_request_count
+        spec = {
+            "ql": ctx._staging_mha_query_lengths[:bs].clone(),
+            "cuq": ctx._staging_mha_cu_query_seq_lengths[: bs + 1].clone(),
+            "kv": ctx._staging_mha_kv_seq_lengths[:bs].clone(),
+            "cukv": ctx._staging_mha_cu_kv_seq_lengths[: bs + 1].clone(),
+            "bt": ctx._staging_mha_block_table[:bs].clone(),
+        }
+        snapshot = plan.snapshot_request_ids.clone()
+
+        # Commit exactly one more real decode step, then rebuild the next forward's MHA.
+        self._run_step(env)
+        active = slice(ctx.paused_request_count, ctx.total_request_count)
+        # Finish-free, no-boundary step => the active set is unchanged, so the speculative
+        # snapshot (consume-by-request-id) matches the post-commit survivors exactly.
+        assert torch.equal(snapshot, ctx.request_ids[active])
+        ctx.initialize_attention_state()
+        assert torch.equal(spec["kv"], ctx._cpu_mha_kv_seq_lengths[:bs]), (
+            f"spec kv != post-commit rebuild: {spec['kv']} vs {ctx._cpu_mha_kv_seq_lengths[:bs]}"
+        )
+        assert torch.equal(spec["ql"], ctx._cpu_mha_query_lengths[:bs])
+        assert torch.equal(spec["cuq"], ctx._cpu_mha_cu_query_seq_lengths[: bs + 1])
+        assert torch.equal(spec["cukv"], ctx._cpu_mha_cu_kv_seq_lengths[: bs + 1])
+        assert torch.equal(spec["bt"], ctx._cpu_mha_block_table[:bs])
+
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_speculative_prestage_kv_is_one_ahead_of_nonspeculative(self) -> None:
+        """At one committed layout, the speculative kv lengths lead the non-speculative by one
+        unit query (the predicted pending-commit append)."""
+        env, ctx = self._decode_context()
+        ctx.using_cuda_graph_this_step = lambda: True
+        try:
+            non_spec = ctx.prestage_next_decode_step_into_cpu_staging()
+            bs = non_spec.active_request_count
+            non_spec_kv = ctx._staging_mha_kv_seq_lengths[:bs].clone()
+            spec = ctx.prestage_next_decode_step_into_cpu_staging(
+                speculate_pending_decode_commit=True
+            )
+            spec_kv = ctx._staging_mha_kv_seq_lengths[:bs].clone()
+        finally:
+            del ctx.using_cuda_graph_this_step
+        assert non_spec.eligible and spec.eligible
+        active = slice(ctx.paused_request_count, ctx.total_request_count)
+        assert torch.equal(spec_kv, non_spec_kv + ctx.request_query_lengths[active][:bs].int())
+
+    @pytest.mark.internal
+    @torch.inference_mode()
+    def test_speculative_prestage_boundary_window_forces_sync(self) -> None:
+        """A crosser inside the 2-step speculative window makes the speculative plan ineligible
+        (SPECULATIVE_BOUNDARY_WINDOW) even though the non-speculative 1-step plan is eligible."""
+        env, ctx = self._decode_context()
+        ctx.using_cuda_graph_this_step = lambda: True
+        # Force "a request crosses within the spec window" while the 1-step gate still fits.
+        ctx._decode_crossers_within_window = lambda steps: 1 if steps >= 2 else 0
+        try:
+            non_spec = ctx.prestage_next_decode_step_into_cpu_staging()
+            assert non_spec.eligible, non_spec.skip_reason
+            spec = ctx.prestage_next_decode_step_into_cpu_staging(
+                speculate_pending_decode_commit=True
+            )
+            assert not spec.eligible
+            assert spec.skip_reason is LaunchGateReason.SPECULATIVE_BOUNDARY_WINDOW
+        finally:
+            del ctx.using_cuda_graph_this_step
+            del ctx._decode_crossers_within_window
 
     # --- boundary reservation manifest --------------------------------------------
 

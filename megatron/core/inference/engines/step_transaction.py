@@ -84,6 +84,7 @@ class LaunchGateReason(str, Enum):
     FORCED_PAUSE_OVERFLOW = "forced_pause_overflow"
     MTP_DEPENDENT_LAYOUT = "mtp_dependent_layout"  # MTP verify/rewind changes layout
     KV_RESERVATION_UNAVAILABLE = "kv_reservation_unavailable"  # boundary block can't be reserved
+    SPECULATIVE_BOUNDARY_WINDOW = "speculative_boundary_window"  # a crosser sits in the spec window
 
 
 @dataclass
