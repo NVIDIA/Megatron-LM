@@ -796,6 +796,17 @@ class TextGenerationController:
 
             child_txn.adopted = True
             self._async_launched_child_txn = None
+            if (
+                child_txn.forward_timing_start_event is not None
+                and child_txn.forward_timing_done_event is not None
+            ):
+                child_txn.forward_timing_done_event.synchronize()
+                context.async_txn_diagnostics.record_child_forward_gpu_duration(
+                    child_txn.forward_timing_start_event.elapsed_time(
+                        child_txn.forward_timing_done_event
+                    )
+                    * 1000.0
+                )
             context.async_txn_diagnostics.record_adopted()
             return True
         finally:
@@ -916,6 +927,7 @@ class TextGenerationController:
         *,
         h2d_ready_before_sampling: bool = False,
         sample_completed_at: Optional[float] = None,
+        profile_child_forward: bool = False,
     ) -> None:
         """Scatter sampled tokens into the prepared child slot and launch it."""
 
@@ -964,7 +976,13 @@ class TextGenerationController:
 
         range_push("async_txn_launch_child")
         range_push("async_child_forward")
+        if profile_child_forward:
+            child_txn.forward_timing_start_event = torch.cuda.Event(enable_timing=True)
+            child_txn.forward_timing_start_event.record(torch.cuda.current_stream())
         self._dynamic_step_forward_logits(input_ids, position_ids)
+        if profile_child_forward:
+            child_txn.forward_timing_done_event = torch.cuda.Event(enable_timing=True)
+            child_txn.forward_timing_done_event.record(torch.cuda.current_stream())
         child_txn.forward_done_event = child_slot.record_forward_done()
         range_pop()
         range_pop()
@@ -2420,6 +2438,7 @@ class TextGenerationController:
         skip_bookkeeping: Optional[bool] = False,
         *,
         async_launch_barrier_reason: Optional[AsyncTxnSkipReason] = None,
+        profile_async_child_forward: bool = False,
     ) -> Optional[Dict]:
         """Forward step the model and update the inference context.
 
@@ -2604,6 +2623,7 @@ class TextGenerationController:
                     launched_child_txn,
                     h2d_ready_before_sampling=h2d_ready_before_sampling,
                     sample_completed_at=sample_completed_at,
+                    profile_child_forward=profile_async_child_forward,
                 )
                 self._start_async_sample_transfer(active_request_count, sample_ready_event)
 

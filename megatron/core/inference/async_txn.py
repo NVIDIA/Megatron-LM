@@ -65,6 +65,7 @@ class AsyncTxnDiagnostics:
     child_prestage_duration_us: float = 0.0
     ep_handoff_duration_us: float = 0.0
     child_graph_shape_duration_us: float = 0.0
+    child_forward_gpu_us: float = 0.0
     controller_wall_us: float = 0.0
     sampling_block_us: float = 0.0
     engine_forward_wall_us: float = 0.0
@@ -113,6 +114,10 @@ class AsyncTxnDiagnostics:
     def record_child_graph_shape_duration(self, duration_us: float) -> None:
         if self.enabled:
             self.child_graph_shape_duration_us = max(0.0, float(duration_us))
+
+    def record_child_forward_gpu_duration(self, duration_us: float) -> None:
+        if self.enabled:
+            self.child_forward_gpu_us = max(0.0, float(duration_us))
 
     def record_controller_wall_duration(self, duration_us: float) -> None:
         if self.enabled:
@@ -184,6 +189,7 @@ class AsyncTxnDiagnostics:
             "child_prestage_duration_us": self.child_prestage_duration_us,
             "ep_handoff_duration_us": self.ep_handoff_duration_us,
             "child_graph_shape_duration_us": self.child_graph_shape_duration_us,
+            "child_forward_gpu_us": self.child_forward_gpu_us,
             "controller_wall_us": self.controller_wall_us,
             "sampling_block_us": self.sampling_block_us,
             "engine_forward_wall_us": self.engine_forward_wall_us,
@@ -232,6 +238,8 @@ class StepTxn:
     cuda_graph_key: Optional[tuple] = None
     h2d_done_event: object = None
     forward_done_event: object = None
+    forward_timing_start_event: object = None
+    forward_timing_done_event: object = None
     sample_done_event: object = None
     cpu_bookkeeping_buf: Optional[torch.Tensor] = None
     kv_block_ids: tuple[int, ...] = ()

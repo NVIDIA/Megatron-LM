@@ -1922,8 +1922,13 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if will_log_this_step:
             self.step_start_event.record()
+        profile_async_child_forward = (
+            self.logging_step_interval > 0
+            and (self.context.step_count + 2) % self.logging_step_interval == 0
+        )
         result = await self.controller.async_generate_output_tokens_dynamic_batch(
-            async_launch_barrier_reason=async_launch_barrier_reason
+            async_launch_barrier_reason=async_launch_barrier_reason,
+            profile_async_child_forward=profile_async_child_forward,
         )
         if will_log_this_step:
             self.step_end_event.record()
@@ -2325,6 +2330,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     "prestage %(child_prestage_duration_us).1f us, "
                     "ep-handoff %(ep_handoff_duration_us).1f us, "
                     "child-graph %(child_graph_shape_duration_us).1f us, "
+                    "child-fwd-gpu %(child_forward_gpu_us).1f us, "
                     "sample-block %(sampling_block_us).1f us, "
                     "eng-fwd %(engine_forward_wall_us).1f us, "
                     "eng-book %(engine_bookkeep_wall_us).1f us, "
