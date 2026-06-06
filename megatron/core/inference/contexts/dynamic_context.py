@@ -1458,40 +1458,31 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Returns True if cuda graphs are being used for this step."""
         return self._using_cuda_graph_this_step
 
+    def replay_cuda_graph_this_step(self) -> bool:
+        """Return whether module-level CUDA graph replay is allowed now."""
+
+        return self._using_cuda_graph_this_step and not getattr(
+            self, "_disable_cuda_graph_replay_this_scope", False
+        )
+
     @contextmanager
-    def async_child_forward_eager_scope(self):
-        """Temporarily force async child forwards onto the eager model path.
+    def async_child_forward_graph_replay_disabled_scope(self):
+        """Temporarily disable module-level graph replay for async child forwards.
 
         Full-iteration CUDA graphs are captured for the committed context
         metadata. Async child forwards use transient transactional metadata
         buffers, so they must not replay the committed-step graph unless a
-        separate async graph design is explicitly added. The scope also makes
-        the child slot's non-graph attention metadata active for the eager
-        forward.
+        separate async graph design is explicitly added. The graph-mode metadata
+        flag remains true, so the child still uses the same padded graph metadata
+        and optimized kernels as the committed decode path.
         """
 
-        previous_cuda_graph = self._using_cuda_graph_this_step
-        previous_attn_metadata = self.active_attn_metadata
-        self._using_cuda_graph_this_step = False
-        self.active_attn_metadata = self.non_graph_attn_metadata  # type: ignore[assignment]
-        real_bs = self.batch_dimensions.req_count
-        padded_bs = self.padded_batch_dimensions.req_count
-        if real_bs > 0:
-            max_seqlen_q = int(self._cpu_mha_query_lengths[:real_bs].max().item())
-            max_seqlen_k = int((self._cpu_mha_kv_seq_lengths[:real_bs] + 1).max().item())
-        else:
-            max_seqlen_q = self.num_speculative_tokens + 1
-            max_seqlen_k = 1
-        self.non_graph_attn_metadata["mha_metadata"].set_state_data(
-            padded_active_request_count=padded_bs,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-        )
+        previous = getattr(self, "_disable_cuda_graph_replay_this_scope", False)
+        self._disable_cuda_graph_replay_this_scope = True
         try:
             yield
         finally:
-            self.active_attn_metadata = previous_attn_metadata
-            self._using_cuda_graph_this_step = previous_cuda_graph
+            self._disable_cuda_graph_replay_this_scope = previous
 
     def cuda_graph_cache_key(self):
         """Return the CUDA graph cache key for the active padded shape.

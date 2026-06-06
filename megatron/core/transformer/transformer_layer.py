@@ -1332,6 +1332,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
         ):
             if kwargs['inference_context'].is_static_batching():
                 using_cuda_graph = kwargs['inference_context'].is_decode_only()
+            elif hasattr(kwargs['inference_context'], 'replay_cuda_graph_this_step'):
+                using_cuda_graph = kwargs['inference_context'].replay_cuda_graph_this_step()
             else:
                 # it can happen that non-decode steps have a token count greater than the max
                 # supported cuda graph token count. In that case this flag will be set to

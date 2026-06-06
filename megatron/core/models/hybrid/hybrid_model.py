@@ -388,6 +388,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         ):
             if kwargs['inference_context'].is_static_batching():
                 using_cuda_graph = kwargs['inference_context'].is_decode_only()
+            elif hasattr(kwargs['inference_context'], 'replay_cuda_graph_this_step'):
+                using_cuda_graph = kwargs['inference_context'].replay_cuda_graph_this_step()
             else:
                 using_cuda_graph = kwargs['inference_context'].using_cuda_graph_this_step()
 

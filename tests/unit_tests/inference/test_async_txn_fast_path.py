@@ -79,6 +79,7 @@ class FakeContext:
         self.child_graph_shape_syncs = 0
         self.child_graph_shape_order = None
         self.child_forward_graph_flags = []
+        self._disable_cuda_graph_replay_this_scope = False
 
     def is_decode_only(self):
         return True
@@ -86,14 +87,17 @@ class FakeContext:
     def using_cuda_graph_this_step(self):
         return self.use_cuda_graph
 
+    def replay_cuda_graph_this_step(self):
+        return self.use_cuda_graph and not self._disable_cuda_graph_replay_this_scope
+
     @contextmanager
-    def async_child_forward_eager_scope(self):
-        previous = self.use_cuda_graph
-        self.use_cuda_graph = False
+    def async_child_forward_graph_replay_disabled_scope(self):
+        previous = self._disable_cuda_graph_replay_this_scope
+        self._disable_cuda_graph_replay_this_scope = True
         try:
             yield
         finally:
-            self.use_cuda_graph = previous
+            self._disable_cuda_graph_replay_this_scope = previous
 
     def last_token_logits(self, logits):
         return logits.squeeze(0)[: self.total_request_count - self.paused_request_count]
@@ -202,7 +206,12 @@ def _make_controller(context):
     def forward(input_ids, position_ids):
         if "sample" in order:
             order.append("child_forward")
-            context.child_forward_graph_flags.append(context.using_cuda_graph_this_step())
+            context.child_forward_graph_flags.append(
+                (
+                    context.using_cuda_graph_this_step(),
+                    context.replay_cuda_graph_this_step(),
+                )
+            )
         else:
             order.append("forward")
 
@@ -439,8 +448,9 @@ def test_cuda_graph_child_launch_uses_child_slot_without_deferred_h2d():
     assert "child_forward" in order
     assert context.active_decode_slot_id == 1
     assert controller._async_launched_child_txn.slot_id == 1
-    assert context.child_forward_graph_flags == [False]
+    assert context.child_forward_graph_flags == [(True, False)]
     assert context.using_cuda_graph_this_step()
+    assert context.replay_cuda_graph_this_step()
     assert context.deferred_h2d_prepares == 0
     assert context.async_txn_diagnostics.launched == 1
 

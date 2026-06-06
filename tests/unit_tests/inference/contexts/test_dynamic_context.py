@@ -355,7 +355,7 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
-    def test_async_child_forward_eager_scope_activates_child_non_graph_metadata(self):
+    def test_async_child_forward_scope_disables_replay_but_keeps_graph_metadata(self):
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
             num_layers=2,
@@ -389,15 +389,17 @@ class TestDynamicContext:
         previous_attn_metadata = dynamic_context.active_attn_metadata
         dynamic_context._using_cuda_graph_this_step = True
 
-        with dynamic_context.async_child_forward_eager_scope():
-            assert not dynamic_context.using_cuda_graph_this_step()
-            assert dynamic_context.active_attn_metadata is dynamic_context.non_graph_attn_metadata
+        with dynamic_context.async_child_forward_graph_replay_disabled_scope():
+            assert dynamic_context.using_cuda_graph_this_step()
+            assert not dynamic_context.replay_cuda_graph_this_step()
+            assert dynamic_context.active_attn_metadata is previous_attn_metadata
             block_table = dynamic_context.active_attn_metadata["mha_metadata"].state_data[
                 "block_table"
             ]
             assert block_table.data_ptr() == child_slot.gpu_view.mha_block_table.data_ptr()
 
         assert dynamic_context.using_cuda_graph_this_step()
+        assert dynamic_context.replay_cuda_graph_this_step()
         assert dynamic_context.active_attn_metadata is previous_attn_metadata
 
     @pytest.mark.internal

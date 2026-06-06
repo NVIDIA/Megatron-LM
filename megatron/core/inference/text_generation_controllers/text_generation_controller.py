@@ -989,8 +989,14 @@ class TextGenerationController:
         if profile_child_forward:
             child_txn.forward_timing_start_event = torch.cuda.Event(enable_timing=True)
             child_txn.forward_timing_start_event.record(torch.cuda.current_stream())
-        eager_child_scope = getattr(context, "async_child_forward_eager_scope", None)
-        with eager_child_scope() if eager_child_scope is not None else nullcontext():
+        disable_child_graph_replay = getattr(
+            context, "async_child_forward_graph_replay_disabled_scope", None
+        )
+        with (
+            disable_child_graph_replay()
+            if disable_child_graph_replay is not None
+            else nullcontext()
+        ):
             self._dynamic_step_forward_logits(input_ids, position_ids)
         if profile_child_forward:
             child_txn.forward_timing_done_event = torch.cuda.Event(enable_timing=True)
