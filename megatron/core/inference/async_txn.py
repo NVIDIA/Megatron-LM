@@ -41,8 +41,9 @@ class AsyncTxnSkipReason(str, Enum):
     LOGPROBS_DEFERRED = "logprobs_deferred"
     CUDA_GRAPH_DEFERRED = "cuda_graph_deferred"
     MOE_EP_DEFERRED = "moe_ep_deferred"
+    SKIP_BOOKKEEPING = "skip_bookkeeping"
+    ACTIVE_COUNT_CHANGED = "active_count_changed"
     SERIAL_WRAPPED = "serial_wrapped"
-    UNKNOWN_BARRIER = "unknown_barrier"
 
 
 @dataclass

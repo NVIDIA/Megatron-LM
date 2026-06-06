@@ -775,7 +775,7 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
         if skip_bookkeeping:
-            return AsyncTxnSkipReason.UNKNOWN_BARRIER
+            return AsyncTxnSkipReason.SKIP_BOOKKEEPING
         if self.num_speculative_tokens > 0:
             return AsyncTxnSkipReason.MTP_ACTIVE
         if self._enable_cuda_graph or context.using_cuda_graph_this_step():
@@ -786,7 +786,7 @@ class TextGenerationController:
         ):
             return AsyncTxnSkipReason.MOE_EP_DEFERRED
         if active_request_count != len(child_txn.request_ids):
-            return AsyncTxnSkipReason.UNKNOWN_BARRIER
+            return AsyncTxnSkipReason.ACTIVE_COUNT_CHANGED
         return None
 
     def _launch_async_decode_child(self, child_txn: StepTxn) -> None:
