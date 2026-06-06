@@ -52,11 +52,15 @@ class FakeContext:
         self.request_query_lengths = torch.tensor([1], dtype=torch.int32)
         self.request_output_lengths = torch.tensor([16], dtype=torch.int32)
         self.active_request_metadata = {
-            "termination_id": torch.tensor([termination_id], dtype=torch.int64),
-            "return_log_probs": torch.tensor([False], dtype=torch.bool),
-            "top_n_logprobs": torch.tensor([0], dtype=torch.int32),
+            "termination_id": torch.tensor([termination_id, -1, -1, -1], dtype=torch.int64),
+            "return_log_probs": torch.tensor([False, False, False, False], dtype=torch.bool),
+            "top_n_logprobs": torch.tensor([0, 0, 0, 0], dtype=torch.int32),
+            "top_k": torch.tensor([1, 1, 1, 1], dtype=torch.int32),
+            "top_p": torch.tensor([0.0, 0.0, 0.0, 0.0], dtype=torch.float32),
         }
-        self.config = SimpleNamespace(materialize_only_last_token_logits=True)
+        self.config = SimpleNamespace(
+            materialize_only_last_token_logits=True, sampling_backend="flashinfer"
+        )
         self.is_hybrid_model = False
         self.mamba_slot_allocator = None
         self.kv_block_allocator = FakeKVAllocator()
@@ -73,6 +77,9 @@ class FakeContext:
 
     def using_cuda_graph_this_step(self):
         return self.use_cuda_graph
+
+    def last_token_logits(self, logits):
+        return logits.squeeze(0)[: self.total_request_count - self.paused_request_count]
 
     def active_decode_slot(self):
         return self.async_decode_slot_ring.current
@@ -193,6 +200,58 @@ def _make_controller(context):
     controller._router_record_bookkeeping = lambda: None
     controller._transfer_samples_to_cpu = transfer
     return controller, order
+
+
+def _make_sampling_controller(context):
+    controller = object.__new__(TextGenerationController)
+    controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
+    controller.num_speculative_tokens = 0
+    controller._sampling_backend = "flashinfer"
+    controller._enable_cuda_graph = False
+    controller._greedy_sample_values_cuda = torch.empty(4, dtype=torch.float32)
+    controller._greedy_sampled_tokens_cuda = torch.empty(4, dtype=torch.int64)
+    controller._sampled_tokens_cuda = None
+    return controller
+
+
+def test_dynamic_sample_logits_uses_argmax_for_greedy_requests():
+    context = FakeContext()
+    context.total_request_count = 2
+    controller = _make_sampling_controller(context)
+    controller._sampling = SimpleNamespace(
+        sample_kernel=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("greedy requests should not use the generic sampler")
+        )
+    )
+    controller._all_logits_cuda = torch.tensor(
+        [[[1.0, 7.0, 3.0, 0.5], [4.0, 2.0, 9.0, 1.0]]], dtype=torch.float32
+    )
+
+    controller._dynamic_step_sample_logits()
+
+    assert controller._sampled_tokens_cuda is controller._greedy_sampled_tokens_cuda
+    assert controller._sampled_tokens_cuda[:2].tolist() == [1, 2]
+
+
+def test_dynamic_sample_logits_keeps_generic_sampler_for_non_greedy_requests():
+    context = FakeContext()
+    context.total_request_count = 2
+    context.active_request_metadata["top_p"][1] = 0.8
+    controller = _make_sampling_controller(context)
+    sampled = torch.tensor([3, 4], dtype=torch.int64)
+    calls = []
+
+    def sample_kernel(*args, **kwargs):
+        calls.append((args, kwargs))
+        return sampled
+
+    controller._sampling = SimpleNamespace(sample_kernel=sample_kernel)
+    controller._all_logits_cuda = torch.zeros((1, 2, 4), dtype=torch.float32)
+
+    controller._dynamic_step_sample_logits()
+
+    assert calls
+    assert controller._sampled_tokens_cuda is sampled
 
 
 def test_child_launch_occurs_before_cpu_sample_transfer():

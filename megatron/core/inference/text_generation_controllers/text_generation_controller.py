@@ -201,6 +201,12 @@ class TextGenerationController:
         #     - `self._sampled_tokens_cuda` is rebound to the output of `sample_kernel`,
         #     which uses CudaGraphManager syntactic sugar to keep it as a static tensor.
         self._sampled_tokens_cuda = None
+        self._greedy_sample_values_cuda = torch.empty(
+            max_requests, dtype=logits_dtype, device=device
+        )
+        self._greedy_sampled_tokens_cuda = torch.empty(
+            max_requests, dtype=torch.int64, device=device
+        )
         self._async_sampled_tokens_cpu = (
             torch.empty(max_requests, dtype=torch.int64, pin_memory=True)
             if context.async_scheduling
@@ -1601,6 +1607,54 @@ class TextGenerationController:
         # Expose the active slice so downstream code sees the right length.
         self._last_accepted_seq_indices = self._last_accepted_seq_indices_buf[:active_request_count]
 
+    def _active_requests_use_greedy_sampling(
+        self, active_request_count: Optional[int] = None
+    ) -> bool:
+        """Return whether active requests are deterministic greedy requests."""
+
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = (
+            context.total_request_count - context.paused_request_count
+            if active_request_count is None
+            else active_request_count
+        )
+        if active_request_count <= 0:
+            return True
+
+        active_metadata = context.active_request_metadata
+        active_slice = slice(0, active_request_count)
+        return bool(
+            (active_metadata["top_k"][active_slice] == 1).all()
+            and (active_metadata["top_p"][active_slice] == 0.0).all()
+        )
+
+    def _dynamic_step_required_token_logits(self) -> Tensor:
+        """Return the per-active-request logits consumed by normal decode sampling."""
+
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+        if context.config.materialize_only_last_token_logits:
+            return self._all_logits_cuda.squeeze(0)[:active_request_count, :]
+        return context.last_token_logits(
+            self._all_logits_cuda[:, : context.padded_active_token_count, :]
+        )
+
+    def _dynamic_step_sample_logits_greedy(self) -> None:
+        """Greedy-sample logits into the stable sampled-token buffer."""
+
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+        required_token_logits = self._dynamic_step_required_token_logits()
+        torch.max(
+            required_token_logits[:active_request_count],
+            dim=-1,
+            out=(
+                self._greedy_sample_values_cuda[:active_request_count],
+                self._greedy_sampled_tokens_cuda[:active_request_count],
+            ),
+        )
+        self._sampled_tokens_cuda = self._greedy_sampled_tokens_cuda
+
     def _dynamic_step_sample_logits(self):
         """Sample tokens from logits for dynamic batching."""
         # TODO(ksanthanam): Evaluate whether it makes more sense to sample on 1 rank
@@ -1608,6 +1662,13 @@ class TextGenerationController:
 
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
+        if self._active_requests_use_greedy_sampling(active_request_count):
+            self._dynamic_step_sample_logits_greedy()
+            if self._ep_decode_results_need_collectives():
+                self._sync_ep_decode_broadcast_plan(active_request_count, has_real_work=True)
+                self._ep_broadcast_sampled_tokens(active_request_count)
+            return
+
         use_graph = (
             self._sampling_backend == "flashinfer"
             and self._enable_cuda_graph
