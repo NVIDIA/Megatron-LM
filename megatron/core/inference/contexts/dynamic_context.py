@@ -1465,15 +1465,33 @@ class DynamicInferenceContext(BaseInferenceContext):
         Full-iteration CUDA graphs are captured for the committed context
         metadata. Async child forwards use transient transactional metadata
         buffers, so they must not replay the committed-step graph unless a
-        separate async graph design is explicitly added.
+        separate async graph design is explicitly added. The scope also makes
+        the child slot's non-graph attention metadata active for the eager
+        forward.
         """
 
-        previous = self._using_cuda_graph_this_step
+        previous_cuda_graph = self._using_cuda_graph_this_step
+        previous_attn_metadata = self.active_attn_metadata
         self._using_cuda_graph_this_step = False
+        self.active_attn_metadata = self.non_graph_attn_metadata  # type: ignore[assignment]
+        real_bs = self.batch_dimensions.req_count
+        padded_bs = self.padded_batch_dimensions.req_count
+        if real_bs > 0:
+            max_seqlen_q = int(self._cpu_mha_query_lengths[:real_bs].max().item())
+            max_seqlen_k = int((self._cpu_mha_kv_seq_lengths[:real_bs] + 1).max().item())
+        else:
+            max_seqlen_q = self.num_speculative_tokens + 1
+            max_seqlen_k = 1
+        self.non_graph_attn_metadata["mha_metadata"].set_state_data(
+            padded_active_request_count=padded_bs,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+        )
         try:
             yield
         finally:
-            self._using_cuda_graph_this_step = previous
+            self.active_attn_metadata = previous_attn_metadata
+            self._using_cuda_graph_this_step = previous_cuda_graph
 
     def cuda_graph_cache_key(self):
         """Return the CUDA graph cache key for the active padded shape.

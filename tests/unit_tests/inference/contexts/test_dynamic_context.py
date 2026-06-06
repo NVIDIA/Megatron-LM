@@ -355,6 +355,53 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
+    def test_async_child_forward_eager_scope_activates_child_non_graph_metadata(self):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=2,
+            kv_channels=64,
+            num_attention_heads=8,
+            max_sequence_length=128,
+            buffer_size_gb=0.1,
+            block_size_tokens=128,
+            max_tokens=None,
+            async_scheduling=True,
+        )
+        dynamic_context.add_request(
+            DynamicInferenceRequest(
+                request_id=42,
+                prompt_tokens=torch.tensor([5], dtype=torch.long, device='cpu'),
+                sampling_params=SamplingParams(num_tokens_to_generate=8),
+            )
+        )
+        dynamic_context.update_requests(
+            active_requests_mask=torch.tensor([1], dtype=torch.int32),
+            new_tokens=torch.tensor([7], dtype=torch.int64),
+        )
+        dynamic_context.initialize_attention_state()
+        child_txn = dynamic_context.prepare_child_from_committed_decode_state()
+        assert child_txn is not None
+        if child_txn.h2d_done_event is not None:
+            child_txn.h2d_done_event.synchronize()
+
+        child_slot = dynamic_context.async_decode_slot_ring.child
+        dynamic_context.bind_decode_slot(child_slot)
+        previous_attn_metadata = dynamic_context.active_attn_metadata
+        dynamic_context._using_cuda_graph_this_step = True
+
+        with dynamic_context.async_child_forward_eager_scope():
+            assert not dynamic_context.using_cuda_graph_this_step()
+            assert dynamic_context.active_attn_metadata is dynamic_context.non_graph_attn_metadata
+            block_table = dynamic_context.active_attn_metadata["mha_metadata"].state_data[
+                "block_table"
+            ]
+            assert block_table.data_ptr() == child_slot.gpu_view.mha_block_table.data_ptr()
+
+        assert dynamic_context.using_cuda_graph_this_step()
+        assert dynamic_context.active_attn_metadata is previous_attn_metadata
+
+    @pytest.mark.internal
+    @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_reset(self, is_hybrid_model: bool):
 
