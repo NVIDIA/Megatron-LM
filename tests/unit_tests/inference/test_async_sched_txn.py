@@ -37,6 +37,7 @@ from megatron.core.inference.engines.step_transaction import (
     TxnPhase,
     classify_launch_eligibility,
 )
+from megatron.core.inference.sampling import TorchSampling
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.utils import is_fa_min_version
 from tests.unit_tests.inference.engines.test_dynamic_engine import (
@@ -675,3 +676,230 @@ class TestLaunchEligibilityGate:
         assert d.eligible is True
         d2 = LaunchDecision(LaunchEligibility.SYNC, LaunchGateReason.RESUME)
         assert d2.eligible is False
+
+
+class _FakeSamplingContext:
+    """A minimal stand-in for DynamicInferenceContext, exposing only what the torch
+    sampler reads: the active request count, the (compacted) per-request sampling
+    metadata, and ``request_ids`` (active row i == request_ids[paused + i])."""
+
+    def __init__(self, request_ids, temperature, top_k, top_p, paused_request_count=0):
+        device = torch.cuda.current_device()
+        active = len(request_ids)
+        assert len(temperature) == len(top_k) == len(top_p) == active
+        self.paused_request_count = paused_request_count
+        self.total_request_count = paused_request_count + active
+        # request_ids: paused placeholders at the front, then the active ids.
+        rids = [-1] * paused_request_count + [int(r) for r in request_ids]
+        self.request_ids = torch.tensor(rids, dtype=torch.long, device=device)
+        # active_request_metadata is compacted (index 0 == first active request).
+        self.active_request_metadata = {
+            "temperature": torch.tensor(temperature, dtype=torch.float32, device=device),
+            "top_k": torch.tensor(top_k, dtype=torch.int32, device=device),
+            "top_p": torch.tensor(top_p, dtype=torch.float32, device=device),
+        }
+
+
+@pytest.mark.internal
+class TestPerRequestKeyedRNG:
+    """C3: the torch backend's per-request keyed RNG (serial behavior change).
+
+    The migrated sampler draws each request from its own ``(seed + request_id)``-keyed
+    generator, so a request's draw depends only on ``(request_id, its own draw count)`` --
+    invariant to batch composition and row order. That is exactly the property pre-commit
+    async sampling needs, and it makes ``async == serial`` token-exact by construction.
+    Greedy rows (``top_k == 1``) draw no random numbers and are a strict no-op.
+    """
+
+    VOCAB = 32
+
+    def _sampler(self, seed: int) -> TorchSampling:
+        # The shared rng is only used by the static path; per-request keying uses `seed`.
+        shared = torch.Generator(device=torch.cuda.current_device())
+        shared.manual_seed(seed)
+        return TorchSampling(shared, vocab_size=self.VOCAB, seed=seed)
+
+    def _uniform_logits(self, n: int) -> torch.Tensor:
+        # Uniform logits => the sampled token is fully determined by the RNG, which makes
+        # the determinism / invariance assertions sharp.
+        return torch.zeros(n, self.VOCAB, device=torch.cuda.current_device())
+
+    def _neutral(self, n: int):
+        # temperature=1.0, top_k=0, top_p=0.0 => no filtering, pure multinomial draw.
+        return [1.0] * n, [0] * n, [0.0] * n
+
+    def test_fixed_seed_reproducible(self) -> None:
+        """Same seed + same request ids => identical tokens (bs=1 and bs>1)."""
+        for request_ids in ([7], [3, 8, 5, 1]):
+            n = len(request_ids)
+            t, k, p = self._neutral(n)
+            logits = self._uniform_logits(n)
+            a = self._sampler(1234).sample_kernel(
+                logits.clone(), n, _FakeSamplingContext(request_ids, t, k, p)
+            )
+            b = self._sampler(1234).sample_kernel(
+                logits.clone(), n, _FakeSamplingContext(request_ids, t, k, p)
+            )
+            assert torch.equal(a, b), f"non-reproducible for {request_ids}: {a} vs {b}"
+
+    def test_invariant_to_batch_composition(self) -> None:
+        """A request's draw is identical alone vs. batched with other requests.
+
+        This is the load-bearing property: pre-commit async sampling re-orders / re-sizes
+        the batch, so a per-request draw must not depend on who else is present.
+        """
+        t1, k1, p1 = self._neutral(1)
+        alone = self._sampler(99).sample_kernel(
+            self._uniform_logits(1), 1, _FakeSamplingContext([42], t1, k1, p1)
+        )
+
+        # Request 42 is now row 2 in a 4-request batch; its logits row is identical.
+        request_ids = [10, 11, 42, 13]
+        n = len(request_ids)
+        t, k, p = self._neutral(n)
+        batched = self._sampler(99).sample_kernel(
+            self._uniform_logits(n), n, _FakeSamplingContext(request_ids, t, k, p)
+        )
+        assert batched[2].item() == alone[0].item(), (
+            f"request 42 drew {batched[2].item()} in a batch but {alone[0].item()} alone"
+        )
+
+    def test_invariant_to_row_order(self) -> None:
+        """Reordering the rows leaves each request's draw unchanged."""
+        t, k, p = self._neutral(2)
+        forward = self._sampler(7).sample_kernel(
+            self._uniform_logits(2), 2, _FakeSamplingContext([100, 200], t, k, p)
+        )
+        reversed_ = self._sampler(7).sample_kernel(
+            self._uniform_logits(2), 2, _FakeSamplingContext([200, 100], t, k, p)
+        )
+        # request 100 is row 0 forward / row 1 reversed; request 200 is the opposite.
+        assert forward[0].item() == reversed_[1].item()
+        assert forward[1].item() == reversed_[0].item()
+
+    def test_survivor_unperturbed_by_finish_and_retire(self) -> None:
+        """A request's stream is independent of others' presence; retiring is safe."""
+        t3, k3, p3 = self._neutral(3)
+        t1, k1, p1 = self._neutral(1)
+
+        # Survivor request 5 batched with two others, drawn over two steps.
+        big = self._sampler(55)
+        ctx_big = _FakeSamplingContext([5, 6, 7], t3, k3, p3)
+        big_step0 = big.sample_kernel(self._uniform_logits(3), 3, ctx_big)
+        # Retire a finished peer mid-run; survivors must not shift.
+        big.retire_requests([6])
+        big_step1 = big.sample_kernel(self._uniform_logits(3), 3, ctx_big)
+
+        # Request 5 alone over two steps must produce the same two tokens.
+        solo = self._sampler(55)
+        ctx_solo = _FakeSamplingContext([5], t1, k1, p1)
+        solo_step0 = solo.sample_kernel(self._uniform_logits(1), 1, ctx_solo)
+        solo_step1 = solo.sample_kernel(self._uniform_logits(1), 1, ctx_solo)
+
+        assert big_step0[0].item() == solo_step0[0].item()
+        assert big_step1[0].item() == solo_step1[0].item()
+
+        # Retiring then re-adding a request id gives a fresh, identically-seeded stream.
+        s = self._sampler(55)
+        first = s.sample_kernel(self._uniform_logits(1), 1, _FakeSamplingContext([9], t1, k1, p1))
+        s.retire_requests([9])
+        again = s.sample_kernel(self._uniform_logits(1), 1, _FakeSamplingContext([9], t1, k1, p1))
+        assert first[0].item() == again[0].item()
+
+    def test_deferred_admission_does_not_perturb_existing(self) -> None:
+        """Admitting a new request next step does not change existing requests' draws."""
+        t2, k2, p2 = self._neutral(2)
+        t3, k3, p3 = self._neutral(3)
+
+        # Two requests this step; a third admitted next step.
+        s = self._sampler(8)
+        before = s.sample_kernel(
+            self._uniform_logits(2), 2, _FakeSamplingContext([1, 2], t2, k2, p2)
+        )
+        after = s.sample_kernel(
+            self._uniform_logits(3), 3, _FakeSamplingContext([1, 2, 3], t3, k3, p3)
+        )
+
+        # A reference where request 3 was never admitted: requests 1 and 2 over two steps.
+        ref = self._sampler(8)
+        ref0 = ref.sample_kernel(
+            self._uniform_logits(2), 2, _FakeSamplingContext([1, 2], t2, k2, p2)
+        )
+        ref1 = ref.sample_kernel(
+            self._uniform_logits(2), 2, _FakeSamplingContext([1, 2], t2, k2, p2)
+        )
+        assert torch.equal(before, ref0)
+        # Requests 1 and 2's second-step draws are unchanged by admitting request 3.
+        assert after[0].item() == ref1[0].item()
+        assert after[1].item() == ref1[1].item()
+
+    def test_greedy_is_strict_no_op(self) -> None:
+        """top_k == 1 returns argmax and draws no random numbers (seed-independent)."""
+        n = 4
+        request_ids = [1, 2, 3, 4]
+        # Distinct logits so argmax is well-defined: row r peaks at token r.
+        logits = torch.full((n, self.VOCAB), -10.0, device=torch.cuda.current_device())
+        for r in range(n):
+            logits[r, r] = 10.0
+        greedy_t, greedy_k, greedy_p = [1.0] * n, [1] * n, [0.0] * n
+
+        # Two different seeds must give the identical (argmax) result.
+        out_a = self._sampler(1).sample_kernel(
+            logits.clone(), n, _FakeSamplingContext(request_ids, greedy_t, greedy_k, greedy_p)
+        )
+        out_b = self._sampler(987654).sample_kernel(
+            logits.clone(), n, _FakeSamplingContext(request_ids, greedy_t, greedy_k, greedy_p)
+        )
+        expected = torch.tensor([0, 1, 2, 3], device=out_a.device)
+        assert torch.equal(out_a, expected)
+        assert torch.equal(out_a, out_b)
+        # No generators were created for a purely greedy batch.
+        sampler = self._sampler(1)
+        sampler.sample_kernel(
+            logits.clone(), n, _FakeSamplingContext(request_ids, greedy_t, greedy_k, greedy_p)
+        )
+        assert sampler._request_rngs == {}
+
+    def test_speculative_path_routes_through_per_request_helper(self) -> None:
+        """sample_speculative keys per request: a decode request's 1+n_spec rows draw from
+        its own generator, invariant to batch composition."""
+        n_spec = 1
+        # Two decode requests, no prefill; each contributes (1 + n_spec) = 2 rows.
+        request_ids = [21, 22]
+        num_decode, num_prefill = 2, 0
+        n_tokens = num_decode * (1 + n_spec) + num_prefill
+        t, k, p = self._neutral(num_decode + num_prefill)
+
+        batched = self._sampler(321).sample_speculative(
+            self._uniform_logits(n_tokens),
+            num_decode,
+            num_prefill,
+            n_spec,
+            _FakeSamplingContext(request_ids, t, k, p),
+            eager=True,
+        )
+
+        # Request 21 alone: its two (base + spec) rows must match the batched draw.
+        t1, k1, p1 = self._neutral(1)
+        alone = self._sampler(321).sample_speculative(
+            self._uniform_logits(1 * (1 + n_spec)),
+            1,
+            0,
+            n_spec,
+            _FakeSamplingContext([21], t1, k1, p1),
+            eager=True,
+        )
+        # token_to_request_index = [0, 0, 1, 1] => request 21 owns rows 0,1.
+        assert batched[0].item() == alone[0].item()
+        assert batched[1].item() == alone[1].item()
+
+        # Determinism across same-seed samplers.
+        again = self._sampler(321).sample_speculative(
+            self._uniform_logits(n_tokens),
+            num_decode,
+            num_prefill,
+            n_spec,
+            _FakeSamplingContext(request_ids, t, k, p),
+            eager=True,
+        )
+        assert torch.equal(batched, again)

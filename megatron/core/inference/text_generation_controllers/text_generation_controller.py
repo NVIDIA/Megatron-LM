@@ -186,7 +186,13 @@ class TextGenerationController:
                 enable_cuda_graph=self._enable_cuda_graph,
             )
         else:
-            self._sampling: Sampling = TorchSampling(self.sampling_rng, self.vocab_size)
+            # Per-request keyed RNG (torch backend): seeded by (inference_sampling_seed +
+            # request_id) so each request's draws are invariant to batch composition/order.
+            self._sampling: Sampling = TorchSampling(
+                self.sampling_rng,
+                self.vocab_size,
+                seed=self.model_config.inference_sampling_seed,
+            )
 
         # Cache values that are constant across inference steps.
         self._unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
@@ -1660,6 +1666,12 @@ class TextGenerationController:
             torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
         )
         finished_request_ids = context.request_ids[finished_idxs]
+
+        # Retire finished requests' per-request sampling generators (memory hygiene;
+        # no-op for backends without per-request RNG state). Independent per-request
+        # streams mean this never perturbs a survivor's draws.
+        if finished_idxs.numel() > 0:
+            self._sampling.retire_requests(finished_request_ids.tolist())
 
         # Save block IDs for finished requests before update_requests releases them.
         # Needed for per-block routing reconstruction in the engine.

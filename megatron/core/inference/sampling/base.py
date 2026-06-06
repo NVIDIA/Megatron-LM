@@ -41,6 +41,13 @@ class Sampling(ABC):
         """
         ...
 
+    def retire_requests(self, request_ids) -> None:
+        """Release any per-request sampling state for finished requests.
+
+        Default no-op. Backends that keep per-request RNG state (e.g. the torch backend's
+        per-request keyed generators) override this to drop finished requests' state.
+        """
+
     def sample_speculative(
         self,
         required_logits: Tensor,
