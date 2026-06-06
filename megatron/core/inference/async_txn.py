@@ -10,6 +10,7 @@ and when they may be reused.
 
 from __future__ import annotations
 
+import zlib
 from collections import Counter, deque
 from dataclasses import dataclass, field
 from enum import Enum
@@ -433,6 +434,173 @@ class AsyncLaunchEligibility:
     reason: Optional[AsyncTxnSkipReason] = None
     boundary_request_ids: tuple[int, ...] = ()
     required_boundary_blocks: int = 0
+
+
+def _group_size(group) -> int:
+    if group is None:
+        return 1
+    if hasattr(group, "size"):
+        return int(group.size())
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return int(torch.distributed.get_world_size(group))
+    return 1
+
+
+def _group_rank(group) -> int:
+    if group is None:
+        return 0
+    if hasattr(group, "rank"):
+        return int(group.rank())
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return int(torch.distributed.get_rank(group))
+    return 0
+
+
+def _global_src_rank(group, src_group_rank: int) -> int:
+    if (
+        group is not None
+        and torch.distributed.is_available()
+        and torch.distributed.is_initialized()
+        and hasattr(torch.distributed, "get_process_group_ranks")
+    ):
+        return int(torch.distributed.get_process_group_ranks(group)[src_group_rank])
+    return int(src_group_rank)
+
+
+def _broadcast_tensor(tensor: torch.Tensor, group, src_group_rank: int, broadcast_fn=None) -> None:
+    if _group_size(group) <= 1:
+        return
+    src_rank = _global_src_rank(group, src_group_rank)
+    if broadcast_fn is None:
+        broadcast_fn = torch.distributed.broadcast
+    broadcast_fn(tensor, src=src_rank, group=group)
+
+
+def broadcast_ep_sampled_tokens(
+    sampled_tokens: torch.Tensor,
+    active_request_count: int,
+    group,
+    *,
+    src_group_rank: int = 0,
+    broadcast_fn=None,
+) -> torch.Tensor:
+    """Broadcast canonical sampled tokens across an EP group.
+
+    Only row-ordered token values are exchanged. Request ids, row maps, KV block
+    ids, and Mamba slot ids remain local.
+    """
+
+    if sampled_tokens is None or int(active_request_count) <= 0:
+        return sampled_tokens
+    token_slice = sampled_tokens[: int(active_request_count)]
+    _broadcast_tensor(token_slice, group, src_group_rank, broadcast_fn=broadcast_fn)
+    return sampled_tokens
+
+
+def broadcast_ep_stop_word_finished_ids(
+    active_request_ids: Sequence[int] | torch.Tensor,
+    finished_request_ids: Iterable[int],
+    group,
+    *,
+    src_group_rank: int = 0,
+    device: Optional[torch.device | int | str] = None,
+    broadcast_fn=None,
+) -> set[int]:
+    """Broadcast stop-word finishes as an active-row mask.
+
+    The mask lets every EP rank derive its local finished-id set without
+    exchanging request ids.
+    """
+
+    if isinstance(active_request_ids, torch.Tensor):
+        request_id_list = [int(request_id) for request_id in active_request_ids.tolist()]
+    else:
+        request_id_list = [int(request_id) for request_id in active_request_ids]
+    active_count = len(request_id_list)
+    if active_count == 0:
+        return set()
+
+    if device is None:
+        device = (
+            active_request_ids.device
+            if isinstance(active_request_ids, torch.Tensor)
+            else torch.device("cpu")
+        )
+    finished_set = {int(request_id) for request_id in finished_request_ids}
+    mask = torch.tensor(
+        [1 if request_id in finished_set else 0 for request_id in request_id_list],
+        dtype=torch.int32,
+        device=device,
+    )
+    _broadcast_tensor(mask, group, src_group_rank, broadcast_fn=broadcast_fn)
+    mask_cpu = mask.cpu()
+    return {
+        request_id
+        for request_id, finished in zip(request_id_list, mask_cpu.tolist())
+        if int(finished) != 0
+    }
+
+
+def broadcast_ep_accepted_counts(
+    accepted_counts: torch.Tensor,
+    active_request_count: int,
+    group,
+    *,
+    src_group_rank: int = 0,
+    broadcast_fn=None,
+) -> torch.Tensor:
+    """Broadcast canonical MTP accepted-count rows across an EP group."""
+
+    if accepted_counts is None or int(active_request_count) <= 0:
+        return accepted_counts
+    counts_slice = accepted_counts[: int(active_request_count)]
+    _broadcast_tensor(counts_slice, group, src_group_rank, broadcast_fn=broadcast_fn)
+    return accepted_counts
+
+
+def _phase_code(phase: str) -> int:
+    return zlib.adler32(phase.encode("utf-8")) & 0x7FFFFFFF
+
+
+def assert_ep_phase_tag(
+    phase: str,
+    step_id: int,
+    active_request_count: int,
+    group,
+    *,
+    device: Optional[torch.device | int | str] = None,
+    all_gather_fn=None,
+) -> torch.Tensor:
+    """Verify that EP ranks enter the same phase and active shape.
+
+    This is a debug/proof hook. It exchanges only ``(phase, step_id,
+    active_count)`` tags and raises a clear error instead of letting skew hang in
+    a later collective.
+    """
+
+    if device is None:
+        device = torch.cuda.current_device() if torch.cuda.is_available() else torch.device("cpu")
+    local = torch.tensor(
+        [_phase_code(phase), int(step_id), int(active_request_count)],
+        dtype=torch.int64,
+        device=device,
+    )
+    size = _group_size(group)
+    if size <= 1:
+        return local
+    gathered = [torch.empty_like(local) for _ in range(size)]
+    if all_gather_fn is None:
+        all_gather_fn = torch.distributed.all_gather
+    all_gather_fn(gathered, local, group=group)
+    expected = gathered[0]
+    mismatched = [idx for idx, tag in enumerate(gathered) if not torch.equal(tag, expected)]
+    if mismatched:
+        tags = [tag.cpu().tolist() for tag in gathered]
+        raise RuntimeError(
+            "EP async transaction phase mismatch: "
+            f"phase={phase!r}, local_tag={local.cpu().tolist()}, gathered_tags={tags}"
+        )
+    return local
 
 
 def boundary_crossing_request_ids(context) -> tuple[int, ...]:

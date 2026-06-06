@@ -5,7 +5,7 @@ import concurrent
 import copy
 import functools
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, OrderedDict, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, OrderedDict, Tuple, Union
 
 import numpy as np
 import torch
@@ -15,7 +15,13 @@ from torch.cuda.nvtx import range_pop, range_push
 
 from megatron.core import parallel_state
 from megatron.core.inference.async_stream import AsyncStream
-from megatron.core.inference.async_txn import AsyncTxnSkipReason, StepTxn
+from megatron.core.inference.async_txn import (
+    AsyncTxnSkipReason,
+    StepTxn,
+    broadcast_ep_accepted_counts,
+    broadcast_ep_sampled_tokens,
+    broadcast_ep_stop_word_finished_ids,
+)
 from megatron.core.inference.communication_utils import (
     broadcast_from_last_pipeline_stage,
     is_pipeline_last_stage,
@@ -840,6 +846,40 @@ class TextGenerationController:
         self._async_sample_transfer_count = 0
         return sampled_tokens_cpu
 
+    def _expert_parallel_group(self):
+        context = self.inference_wrapped_model.inference_context
+        return getattr(context, "expert_model_parallel_group", None)
+
+    def _ep_broadcast_sampled_tokens(self, active_request_count: int) -> None:
+        group = self._expert_parallel_group()
+        if get_pg_size(group) <= 1:
+            return
+        broadcast_ep_sampled_tokens(self._sampled_tokens_cuda, active_request_count, group)
+
+    def _ep_broadcast_stop_word_finished_ids(
+        self, request_ids: List[int], finished_request_ids: Iterable[int]
+    ) -> set[int]:
+        group = self._expert_parallel_group()
+        if get_pg_size(group) <= 1:
+            return {int(request_id) for request_id in finished_request_ids}
+        device = torch.cuda.current_device() if torch.cuda.is_available() else torch.device("cpu")
+        return broadcast_ep_stop_word_finished_ids(
+            request_ids,
+            finished_request_ids,
+            group,
+            device=device,
+        )
+
+    def _ep_broadcast_mtp_accepted_counts(self, active_request_count: int) -> None:
+        group = self._expert_parallel_group()
+        if get_pg_size(group) <= 1 or self._accepted_token_counts_per_request is None:
+            return
+        broadcast_ep_accepted_counts(
+            self._accepted_token_counts_per_request,
+            active_request_count,
+            group,
+        )
+
     def _rewind_kv_cache(self) -> tuple:
         """Update the KV cache bookkeeping for speculative decoding.
 
@@ -1172,6 +1212,7 @@ class TextGenerationController:
             accepted_tokens_mask,
             input_tokens_required,
         )
+        self._ep_broadcast_mtp_accepted_counts(active_request_count)
         nvtx_range_pop("mtp-spec-decoding/verify/prepare-next")
 
     def _prepare_speculative_tokens_for_next_forward_pass(
@@ -1238,6 +1279,7 @@ class TextGenerationController:
             eager=not use_graph,
             cache_key=("sample", n) if use_graph else None,
         )
+        self._ep_broadcast_sampled_tokens(active_request_count)
 
     def _dynamic_step_log_probs_bookkeeping(self) -> Tuple[bool, bool]:
         """Perform bookkeeping necessary to compute log probs for dynamic batching.
@@ -1830,6 +1872,9 @@ class TextGenerationController:
         if self._get_stop_word_finished_ids_callback is not None:
             request_ids_list = active_request_ids.tolist()
             stop_word_finished_ids = self._get_stop_word_finished_ids_callback(request_ids_list)
+            stop_word_finished_ids = self._ep_broadcast_stop_word_finished_ids(
+                request_ids_list, stop_word_finished_ids
+            )
             if stop_word_finished_ids:
                 for idx, request_id in enumerate(request_ids_list):
                     if request_id in stop_word_finished_ids:
