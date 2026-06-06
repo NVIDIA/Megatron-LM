@@ -193,8 +193,8 @@ def _make_controller(context):
     controller._has_stop_word_constraints_callback = lambda request_ids: True
     controller._async_prepared_child_txn = None
     controller._async_launched_child_txn = None
-    controller._async_presampled_txn = None
-    controller._async_presampled_cuda_graph_request_count = None
+    controller._async_deferred_sample_txn = None
+    controller._async_deferred_sample_cuda_graph_request_count = None
     controller._accepted_tokens_per_request = None
     controller._accepted_token_counts_per_request = None
     controller._sampled_tokens_cuda = torch.tensor([5], dtype=torch.int64)
@@ -413,7 +413,7 @@ def test_chain_plain_decode_defers_active_stop_words():
     )
 
 
-def test_consecutive_decode_steps_adopt_launched_children():
+def test_consecutive_decode_steps_consume_launched_children():
     context = FakeContext()
     controller, order = _make_controller(context)
 
@@ -424,7 +424,7 @@ def test_consecutive_decode_steps_adopt_launched_children():
     assert "init" not in order
     assert "forward" not in order
     assert order.index("sample") < order.index("child_forward")
-    assert context.async_txn_diagnostics.adopted >= 1
+    assert context.async_txn_diagnostics.consumed >= 1
     assert context.async_txn_diagnostics.launched == 2
 
 

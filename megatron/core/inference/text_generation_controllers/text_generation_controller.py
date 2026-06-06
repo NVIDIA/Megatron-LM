@@ -146,8 +146,8 @@ class TextGenerationController:
 
         self._async_prepared_child_txn: Optional[StepTxn] = None
         self._async_launched_child_txn: Optional[StepTxn] = None
-        self._async_presampled_txn: Optional[StepTxn] = None
-        self._async_presampled_cuda_graph_request_count: Optional[int] = None
+        self._async_deferred_sample_txn: Optional[StepTxn] = None
+        self._async_deferred_sample_cuda_graph_request_count: Optional[int] = None
         self._ep_decode_broadcast_plan: Optional[EPDecodeBroadcastPlan] = None
         self._ep_async_protocol = None
         self._ep_step_begin_decision: Optional[EPStepBeginDecision] = None
@@ -720,7 +720,7 @@ class TextGenerationController:
             self._all_logits_cuda = logits
 
     def _async_decode_cuda_graph_key(self, slot=None) -> Optional[Any]:
-        """Return the graph key used to guard async child adoption.
+        """Return the graph key used to guard async child consumption.
 
         CUDA-graph child forwards replay the normal committed-step graph by
         staging the next-step metadata into the current decode slot after
@@ -742,7 +742,7 @@ class TextGenerationController:
         active_slice = slice(context.paused_request_count, context.total_request_count)
         return tuple(int(request_id) for request_id in context.request_ids[active_slice].tolist())
 
-    def _pending_async_child_reusable(self) -> bool:
+    def _launched_async_child_consumable(self) -> bool:
         """Return whether the launched child transaction can be this step's forward."""
 
         child_txn = self._async_launched_child_txn
@@ -751,7 +751,7 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         if not context.async_scheduling:
             return False
-        return child_txn.guard_adoption(
+        return child_txn.is_consumable_after_commit(
             self._async_active_request_ids(),
             terminal_request_ids=child_txn.terminal_request_ids,
             decode_only=context.is_decode_only(),
@@ -761,22 +761,22 @@ class TextGenerationController:
     def _decide_ep_step_begin(self, *, has_real_work: bool) -> EPStepBeginDecision:
         """Synchronize whether this EP step reuses the previous async child forward."""
 
-        has_pending_forward = self._async_launched_child_txn is not None
-        pending_forward_reusable = (
-            self._pending_async_child_reusable() if has_pending_forward else False
+        has_launched_forward = self._async_launched_child_txn is not None
+        launched_forward_consumable = (
+            self._launched_async_child_consumable() if has_launched_forward else False
         )
         if self._ep_async_protocol is not None and self._ep_async_protocol.enabled:
             decision = self._ep_async_protocol.decide_step_begin(
                 has_real_work=has_real_work,
-                has_pending_forward=has_pending_forward,
-                pending_forward_reusable=pending_forward_reusable,
+                has_launched_forward=has_launched_forward,
+                launched_forward_consumable=launched_forward_consumable,
             )
         else:
             decision = EPStepBeginDecision(
                 step_id=-1,
                 has_real_work=has_real_work,
-                reuse_pending_forward=bool(has_pending_forward and pending_forward_reusable),
-                discard_pending_forward=bool(has_pending_forward and not pending_forward_reusable),
+                consume_launched_forward=bool(has_launched_forward and launched_forward_consumable),
+                launched_forward_invariant_failed=bool(has_launched_forward and not launched_forward_consumable),
             )
         self._ep_step_begin_decision = decision
         return decision
@@ -784,7 +784,7 @@ class TextGenerationController:
     def _clear_ep_step_begin_decision(self) -> None:
         self._ep_step_begin_decision = None
 
-    def _try_adopt_async_child_logits(self) -> bool:
+    def _consume_async_child_logits(self) -> bool:
         """Consume logits from a previously launched child forward if still valid."""
 
         child_txn = self._async_launched_child_txn
@@ -796,9 +796,9 @@ class TextGenerationController:
             self._async_launched_child_txn = None
             return False
 
-        range_push("async_txn_adopt")
+        range_push("async_txn_consume_child")
         try:
-            if not child_txn.guard_adoption(
+            if not child_txn.is_consumable_after_commit(
                 self._async_active_request_ids(),
                 terminal_request_ids=child_txn.terminal_request_ids,
                 decode_only=context.is_decode_only(),
@@ -806,11 +806,11 @@ class TextGenerationController:
             ):
                 context.async_txn_diagnostics.record_guard_failure()
                 self._async_launched_child_txn = None
-                raise RuntimeError("async decode child adoption invariant failed")
+                raise RuntimeError("async decode child consumption invariant failed")
 
             if context.is_hybrid_model:
                 context.accept_async_mamba_state(child_txn.request_ids)
-            child_txn.adopted = True
+            child_txn.consumed = True
             self._async_launched_child_txn = None
             if (
                 child_txn.forward_timing_start_event is not None
@@ -823,7 +823,7 @@ class TextGenerationController:
                     )
                     * 1000.0
                 )
-            context.async_txn_diagnostics.record_adopted()
+            context.async_txn_diagnostics.record_consumed()
             return True
         finally:
             range_pop()
@@ -839,14 +839,14 @@ class TextGenerationController:
         elif hasattr(event, "query") and not event.query() and torch.cuda.is_available():
             torch.cuda.synchronize()
 
-    def drain_async_transactions(self, *, drop_launched: bool = False) -> None:
+    def drain_async_transactions(self, *, clear_launched: bool = False) -> None:
         """Drain in-flight async work before external pause/suspend/shutdown observation."""
 
         child_txn = self._async_launched_child_txn
         if child_txn is not None:
             self._synchronize_async_event(child_txn.forward_done_event)
             self._synchronize_async_event(child_txn.sample_done_event)
-            if drop_launched:
+            if clear_launched:
                 self._async_launched_child_txn = None
 
         self._async_prepared_child_txn = None
@@ -1033,7 +1033,7 @@ class TextGenerationController:
 
         child_txn.launched = True
         if child_slot is context.async_decode_slot_ring.child:
-            context.async_decode_slot_ring.adopt_child()
+            context.async_decode_slot_ring.mark_child_current()
         else:
             context.bind_decode_slot(child_slot)
         self._async_launched_child_txn = child_txn
@@ -1199,8 +1199,8 @@ class TextGenerationController:
             sample_completed_at=sample_completed_at,
             profile_child_forward=profile_child_forward,
         )
-        self._async_presampled_txn = parent_txn
-        self._async_presampled_cuda_graph_request_count = (
+        self._async_deferred_sample_txn = parent_txn
+        self._async_deferred_sample_cuda_graph_request_count = (
             context.padded_active_request_count if context.using_cuda_graph_this_step() else None
         )
         return True
@@ -1679,7 +1679,7 @@ class TextGenerationController:
         # Logit indices for tokens that need sampling.
         # Padded under graph capture so the captured `gather_indices` input has a stable shape.
         # Padded slots resolve to row 0; verify and prepare-next read only the actual prefix,
-        # so the padded-row samples produced by the captured kernel are discarded.
+        # so the padded-row samples produced by the captured kernel are ignored.
         nvtx_range_push("mtp-spec-decoding/verify/logit-indices")
         # Use pre-allocated buffer for CUDA graph compatibility.
         logits = self._all_logits_cuda
@@ -2282,7 +2282,7 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         step_begin_decision = self._decide_ep_step_begin(has_real_work=False)
 
-        if not step_begin_decision.reuse_pending_forward:
+        if not step_begin_decision.consume_launched_forward:
             # attempt to use cuda-graph if possible
             input_ids, position_ids = self._dynamic_step_context_init(is_dummy_forward=True)
             self._dynamic_step_forward_logits(input_ids, position_ids)
@@ -2597,7 +2597,7 @@ class TextGenerationController:
             "top_n_logprobs_by_request_id": top_n_logprobs_by_request_id,
         }
 
-    async def _async_generate_presampled_plain_decode(
+    async def _async_generate_deferred_sample_plain_decode(
         self,
         *,
         skip_bookkeeping: bool = False,
@@ -2607,18 +2607,20 @@ class TextGenerationController:
 
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
-        presampled_txn = self._async_presampled_txn
-        if presampled_txn is None:
+        deferred_sample_txn = self._async_deferred_sample_txn
+        if deferred_sample_txn is None:
             return None
 
-        context.async_txn_diagnostics.record_presampled_commit()
-        self._async_presampled_txn = None
-        cuda_graph_request_count = self._async_presampled_cuda_graph_request_count
-        self._async_presampled_cuda_graph_request_count = None
+        context.async_txn_diagnostics.record_deferred_sample_commit()
+        self._async_deferred_sample_txn = None
+        cuda_graph_request_count = self._async_deferred_sample_cuda_graph_request_count
+        self._async_deferred_sample_cuda_graph_request_count = None
 
         ep_step_begin_decision = self._decide_ep_step_begin(has_real_work=True)
-        if ep_step_begin_decision.discard_pending_forward:
-            self._async_launched_child_txn = None
+        if ep_step_begin_decision.launched_forward_invariant_failed:
+            raise RuntimeError(
+                "async decode launched-child invariant failed before deferred-sample commit"
+            )
         if context.async_scheduling and self.num_speculative_tokens == 0:
             ep_child_launch_plan = self._sync_ep_async_child_launch_plan(
                 active_request_count,
@@ -2627,7 +2629,7 @@ class TextGenerationController:
             if self._ep_async_child_launches(ep_child_launch_plan):
                 raise RuntimeError(
                     "EP async child launch plan selected a normal child while this rank "
-                    "is consuming a presampled decode step"
+                    "is consuming a deferred_sample decode step"
                 )
 
         with torch.inference_mode():
@@ -2648,10 +2650,10 @@ class TextGenerationController:
                     range_push("async_txn_cpu_commit")
                 try:
                     if context.is_hybrid_model:
-                        context.accept_async_mamba_state(presampled_txn.request_ids)
+                        context.accept_async_mamba_state(deferred_sample_txn.request_ids)
                     request_bookkeeping = self._dynamic_step_context_bookkeeping(
                         sampled_tokens_cpu=sampled_tokens_cpu,
-                        async_txn=presampled_txn,
+                        async_txn=deferred_sample_txn,
                     )
                 finally:
                     if commit_range_active:
@@ -2731,29 +2733,29 @@ class TextGenerationController:
         if context.active_token_count == 0 and active_request_count == 0:
             return None
 
-        if context.async_scheduling and self._async_presampled_txn is not None:
-            return await self._async_generate_presampled_plain_decode(
+        if context.async_scheduling and self._async_deferred_sample_txn is not None:
+            return await self._async_generate_deferred_sample_plain_decode(
                 skip_bookkeeping=bool(skip_bookkeeping),
                 profile_async_child_forward=profile_async_child_forward,
             )
 
         ep_step_begin_decision = self._decide_ep_step_begin(has_real_work=True)
-        local_pending_child = self._async_launched_child_txn is not None
-        if ep_step_begin_decision.discard_pending_forward:
-            self._async_launched_child_txn = None
+        local_launched_child = self._async_launched_child_txn is not None
+        if ep_step_begin_decision.launched_forward_invariant_failed:
+            raise RuntimeError("async decode launched-child invariant failed at step begin")
 
         with torch.inference_mode():
-            adopted_child = self._try_adopt_async_child_logits()
+            consumed_child = self._consume_async_child_logits()
             if (
-                local_pending_child
-                and ep_step_begin_decision.reuse_pending_forward
-                and not adopted_child
+                local_launched_child
+                and ep_step_begin_decision.consume_launched_forward
+                and not consumed_child
             ):
-                raise RuntimeError("EP step-begin selected async child adoption, but adoption failed")
+                raise RuntimeError("EP step-begin selected async child consumption, but consumption failed")
             input_ids = None
             position_ids = None
 
-            if not adopted_child:
+            if not consumed_child:
                 input_ids, position_ids = self._dynamic_step_context_init()
 
             cuda_graph_request_count = (
@@ -2762,7 +2764,7 @@ class TextGenerationController:
                 else None
             )
 
-            if not adopted_child:
+            if not consumed_child:
                 # Enable routing recording before forward pass if routing replay is enabled
                 config = self.inference_wrapped_model.model.config
                 if config.moe_enable_routing_replay:
@@ -3014,8 +3016,8 @@ class TextGenerationController:
             if self.num_speculative_tokens > 0:
                 self._accepted_tokens_per_request.fill_(-1)
                 self._accepted_token_counts_per_request.fill_(0)
-            if context.async_scheduling and not adopted_child:
-                context.async_txn_diagnostics.record_adopted()
+            if context.async_scheduling and not consumed_child:
+                context.async_txn_diagnostics.record_consumed()
                 context.async_txn_diagnostics.record_sync_step("serial_wrapped")
             ret.update(request_bookkeeping)
             self._clear_ep_decode_broadcast_plan()

@@ -30,9 +30,9 @@ def _core_inference_source() -> str:
     [
         "AsyncDecodeLifecyclePlan",
         "_AsyncPendingForwardView",
-        "pending_forward_signature",
-        "_validate_pending_forward",
-        "_consume_pending_forward",
+        "launched_forward_signature",
+        "_validate_launched_forward",
+        "_consume_previous_forward",
         "full_layout_signature",
         "row_map",
         "rowmap",
@@ -45,7 +45,7 @@ def test_prediction_and_reconciliation_symbols_are_absent(symbol):
     assert symbol not in _core_inference_source()
 
 
-class _AdoptionContext:
+class _ConsumptionContext:
     async_scheduling = True
     paused_request_count = 0
     total_request_count = 1
@@ -70,20 +70,20 @@ class _AdoptionContext:
         return False
 
 
-def test_guard_failure_drops_launched_child_without_plain_decode_rerun():
-    context = _AdoptionContext()
+def test_guard_failure_clears_launched_child_without_plain_decode_rerun():
+    context = _ConsumptionContext()
     controller = object.__new__(TextGenerationController)
     controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
     controller._async_launched_child_txn = StepTxn(
         step_id=1, request_ids=(10,), launched=True
     )
 
-    with pytest.raises(RuntimeError, match="async decode child adoption invariant failed"):
-        controller._try_adopt_async_child_logits()
+    with pytest.raises(RuntimeError, match="async decode child consumption invariant failed"):
+        controller._consume_async_child_logits()
 
     assert controller._async_launched_child_txn is None
     assert context.async_txn_diagnostics.guard_failures == 1
-    assert context.async_txn_diagnostics.adopted == 0
+    assert context.async_txn_diagnostics.consumed == 0
 
 
 def test_step_txn_tracks_logical_mamba_slots_without_bank_internals():
@@ -170,7 +170,7 @@ def test_diagnostics_show_compact_transaction_lifecycle():
 
     diagnostics.record_prepared(under_forward=True)
     diagnostics.record_launched(h2d_ready_before_sampling=True)
-    diagnostics.record_adopted()
+    diagnostics.record_consumed()
     retire_queue.enqueue(None, lambda: released.append("retired"))
     retire_queue.drain_ready()
     diagnostics.record_barrier_skip(AsyncTxnSkipReason.SKIP_BOOKKEEPING)
@@ -179,7 +179,7 @@ def test_diagnostics_show_compact_transaction_lifecycle():
     assert released == ["retired"]
     assert snapshot["prepared"] == 1
     assert snapshot["launched"] == 1
-    assert snapshot["adopted"] == 1
+    assert snapshot["consumed"] == 1
     assert snapshot["retired"] == 1
     assert snapshot["prepare_under_forward"] == 1
     assert snapshot["h2d_ready_before_sampling"] == 1

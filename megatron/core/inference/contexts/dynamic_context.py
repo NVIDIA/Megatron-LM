@@ -1601,7 +1601,7 @@ class DynamicInferenceContext(BaseInferenceContext):
     def plain_decode_child_needs_terminal_check(
         self, active_request_count: Optional[int] = None
     ) -> bool:
-        """Return whether same-step finish detection could affect child adoption."""
+        """Return whether same-step finish detection could affect child consumption."""
 
         if active_request_count is None:
             active_request_count = self.total_request_count - self.paused_request_count
@@ -1626,7 +1626,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         This covers ordinary non-hybrid decode, including requests that cross a
         KV-block boundary. Boundary blocks are reserved before launch and
-        adopted during the later CPU commit by request id.
+        consumed during the later CPU commit by request id.
         """
 
         if not self.async_scheduling or self.async_decode_slot_ring is None:
@@ -3737,7 +3737,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
     def retire_unused_async_kv_leases(self, txn: Optional[StepTxn]) -> None:
-        """Retire reserved KV blocks that were not adopted by committed survivors."""
+        """Retire reserved KV blocks that were not consumed by committed survivors."""
 
         if txn is None:
             return

@@ -65,11 +65,15 @@ def _make_bookkeeping_context() -> DynamicInferenceContext:
     context.block_size_tokens = 4
     context.paused_request_count = 0
     context.total_request_count = 2
+    context.padded_active_request_count = 2
+    context.padded_active_token_count = 2
+    context.is_hybrid_model = False
     context.request_ids = torch.tensor([101, 102], dtype=torch.int32)
     context.batch_dimensions = SimpleNamespace(req_count=2)
     context.padded_batch_dimensions = SimpleNamespace(req_count=2)
+    context.kv_block_allocator = SimpleNamespace(dummy_block_idx=-1)
 
-    buf = torch.zeros(512, dtype=torch.uint8)
+    buf = torch.zeros(2048, dtype=torch.uint8)
     context._cpu_bookkeeping_buf = buf
     offset = 0
 
@@ -84,17 +88,41 @@ def _make_bookkeeping_context() -> DynamicInferenceContext:
         offset += count * element_size
         return out
 
+    context.token_to_input_ids = view(torch.int64, (4,))
     context.token_to_pos_ids = view(torch.int64, (4,))
+    context.token_to_request_idx = view(torch.int32, (4,))
     context.token_to_position_in_request = view(torch.int32, (4,))
     context.token_to_local_position_within_kv_block = view(torch.int32, (4,))
+    context._staging_request_in_prefill_status = view(torch.int32, (4,))
+    context._staging_request_query_lengths = view(torch.int32, (4,))
     context._staging_request_kv_length_offsets = view(torch.int32, (4,))
+    context._staging_temperature = view(torch.float32, (4,))
+    context._staging_top_k = view(torch.int32, (4,))
+    context._staging_top_p = view(torch.float32, (4,))
+    context.active_request_last_token_idxs = view(torch.int32, (4,))
+    context._cpu_mha_query_lengths = view(torch.int32, (2,))
+    context._cpu_mha_cu_query_seq_lengths = view(torch.int32, (3,))
     context._cpu_mha_kv_seq_lengths = view(torch.int32, (4,))
     context._cpu_mha_cu_kv_seq_lengths = view(torch.int32, (5,))
     context.token_to_block_idx = view(torch.int64, (4,))
     context._cpu_mha_block_table = view(torch.int32, (2, 2))
 
+    context.token_to_input_ids[:2] = torch.tensor([11, 22])
+    context.token_to_pos_ids[:2] = torch.tensor([1, 3])
+    context.token_to_request_idx[:2] = torch.tensor([0, 1])
+    context.token_to_position_in_request[:2] = torch.tensor([1, 3])
     context.token_to_local_position_within_kv_block[:2] = torch.tensor([1, 3])
     context.token_to_block_idx[:2] = torch.tensor([10, 20])
+    context.request_query_lengths = torch.ones(2, dtype=torch.int32)
+    context.request_kv_length_offsets = torch.tensor([1, 3], dtype=torch.int32)
+    context.active_request_metadata = {
+        "temperature": torch.ones(4, dtype=torch.float32),
+        "top_k": torch.ones(4, dtype=torch.int32),
+        "top_p": torch.zeros(4, dtype=torch.float32),
+    }
+    context.active_request_last_token_idxs[:2] = torch.tensor([0, 1])
+    context._cpu_mha_query_lengths[:2] = torch.ones(2, dtype=torch.int32)
+    context._cpu_mha_cu_query_seq_lengths[:3] = torch.tensor([0, 1, 2], dtype=torch.int32)
     context._cpu_mha_block_table[:] = torch.tensor([[10, -1], [20, -1]], dtype=torch.int32)
     context._cpu_mha_kv_seq_lengths[:2] = torch.tensor([2, 4], dtype=torch.int32)
     context._cpu_mha_cu_kv_seq_lengths[:3] = torch.tensor([0, 2, 6], dtype=torch.int32)
@@ -147,7 +175,7 @@ def test_finish_in_middle_accepts_survivors():
     txn.launched = True
     txn.mark_committed([101, 103], terminal_request_ids=[102])
 
-    assert txn.guard_adoption([101, 103], terminal_request_ids=txn.terminal_request_ids)
+    assert txn.is_consumable_after_commit([101, 103], terminal_request_ids=txn.terminal_request_ids)
 
 
 def test_compaction_changes_row_order_but_survivor_outputs_follow_request_ids():
@@ -175,7 +203,7 @@ def test_terminal_ignored_row_kv_blocks_are_not_reused_before_retire():
     assert context.kv_block_allocator.released == [10]
 
 
-def test_boundary_crosser_adopts_reserved_block():
+def test_boundary_crosser_uses_reserved_block():
     context = _make_update_context()
     txn = StepTxn(
         step_id=4,
@@ -218,7 +246,7 @@ def test_guard_failure_after_launch_does_not_accept_nonterminal_disappearance():
     txn.launched = True
     txn.mark_committed([101], terminal_request_ids=[])
 
-    assert not txn.guard_adoption([101], terminal_request_ids=txn.terminal_request_ids)
+    assert not txn.is_consumable_after_commit([101], terminal_request_ids=txn.terminal_request_ids)
 
 
 def test_patch_plain_decode_child_uses_reserved_boundary_block():
@@ -226,7 +254,7 @@ def test_patch_plain_decode_child_uses_reserved_boundary_block():
     child = context._cpu_bookkeeping_buf.clone()
     lease = KVBlockLease(request_id=102, block_column=1, block_id=77)
 
-    DynamicInferenceContext._patch_plain_decode_child_bookkeeping(
+    DynamicInferenceContext._build_plain_decode_child_bookkeeping(
         context, child, 2, kv_block_leases=(lease,)
     )
     child_block_idx = DynamicInferenceContext._cpu_bookkeeping_clone_view(

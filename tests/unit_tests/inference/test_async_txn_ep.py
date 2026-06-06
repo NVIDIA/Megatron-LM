@@ -81,7 +81,7 @@ def test_cuda_graph_cache_key_stays_shape_only_for_async_decode():
     assert key == context.padded_batch_dimensions
 
 
-def test_async_decode_child_adoption_uses_current_slot_graph_key():
+def test_async_decode_child_consumption_uses_current_slot_graph_key():
     context = _make_graph_key_context(active_slot_id=1)
     controller = object.__new__(TextGenerationController)
     controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
@@ -235,7 +235,7 @@ def _make_dummy_controller(*, num_speculative_tokens):
         inference_context=SimpleNamespace(reset=lambda: calls.append("reset"))
     )
     controller._decide_ep_step_begin = lambda has_real_work: SimpleNamespace(
-        reuse_pending_forward=True
+        consume_launched_forward=True
     )
     controller._dynamic_step_context_init = lambda is_dummy_forward=False: (_ for _ in ()).throw(
         AssertionError("non-MTP reuse should not run a base dummy forward")
@@ -432,31 +432,31 @@ def test_ep_async_step_protocol_keeps_child_phases_in_active_work_step():
     asyncio.run(run_test())
 
 
-def test_ep_async_step_protocol_reuse_pending_forward_skips_dummy_base_forward():
+def test_ep_async_step_protocol_consume_launched_forward_skips_dummy_base_forward():
     communicator = FakeStepCommunicator()
     protocol = EPAsyncStepProtocol(communicator)
     protocol.ensure_work_step()
 
     decision = protocol.decide_step_begin(
         has_real_work=True,
-        has_pending_forward=True,
-        pending_forward_reusable=True,
+        has_launched_forward=True,
+        launched_forward_consumable=True,
     )
 
-    assert decision.reuse_pending_forward is True
-    assert decision.discard_pending_forward is False
+    assert decision.consume_launched_forward is True
+    assert decision.launched_forward_invariant_failed is False
     assert communicator.sync_calls == [
         ("ep_step_begin", 0, (1, 1, 1, 0, 0)),
         ("ep_step_begin_ack", 0, (1,)),
     ]
 
 
-def test_ep_async_step_protocol_discards_pending_forward_if_real_rank_missing_child():
+def test_ep_async_step_protocol_reports_launched_forward_invariant_failure_if_real_rank_missing_child():
     class MissingChildCommunicator(FakeStepCommunicator):
         def sync_all_reduce_max(self, *values, phase=None, step_id=None):
             self.sync_calls.append((phase, step_id, values))
             if phase == "ep_step_begin":
-                # Some EP rank has a pending child, but a real rank is missing it.
+                # Some EP rank has a launched child, but a real rank is missing it.
                 return (1, 1, 1, 0, 1)
             return values[0] if len(values) == 1 else values
 
@@ -466,12 +466,12 @@ def test_ep_async_step_protocol_discards_pending_forward_if_real_rank_missing_ch
 
     decision = protocol.decide_step_begin(
         has_real_work=True,
-        has_pending_forward=False,
-        pending_forward_reusable=False,
+        has_launched_forward=False,
+        launched_forward_consumable=False,
     )
 
-    assert decision.reuse_pending_forward is False
-    assert decision.discard_pending_forward is True
+    assert decision.consume_launched_forward is False
+    assert decision.launched_forward_invariant_failed is True
 
 
 def test_ep_work_step_sends_coordinator_reply_after_step_completion():

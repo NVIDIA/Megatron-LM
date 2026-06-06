@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-# Some of this code was adopted from https://github.com/vllm-project/vllm.
+# Some of this code was derived from https://github.com/vllm-project/vllm.
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 """vLLM-style Triton fused MoE kernel (BF16) for Megatron inference.

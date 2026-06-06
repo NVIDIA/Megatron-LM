@@ -805,7 +805,7 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             return
 
-        self._drain_async_transactions(drop_launched=True)
+        self._drain_async_transactions(clear_launched=True)
         InferenceMode.unset_active()
 
         # Deallocate context tensors.
@@ -921,12 +921,12 @@ class DynamicInferenceEngine(AbstractEngine):
         if getattr(self.context, "async_scheduling", False):
             self._next_async_launch_barrier_reason = reason
 
-    def _drain_async_transactions(self, *, drop_launched: bool = False) -> None:
+    def _drain_async_transactions(self, *, clear_launched: bool = False) -> None:
         """Drain async controller work when the controller supports it."""
 
         drain = getattr(self.controller, "drain_async_transactions", None)
         if drain is not None:
-            drain(drop_launched=drop_launched)
+            drain(clear_launched=clear_launched)
 
     def _consume_async_launch_barrier_reason(
         self,
@@ -1856,9 +1856,12 @@ class DynamicInferenceEngine(AbstractEngine):
                 step_time (float): How long this step took.
         """
 
+        async_diag = getattr(self.context, "async_txn_diagnostics", None)
         forward_wall_started_at = (
             time.perf_counter()
-            if self.context.async_scheduling and self.context.async_txn_diagnostics.enabled
+            if self.context.async_scheduling
+            and async_diag is not None
+            and async_diag.enabled
             else None
         )
 
@@ -2309,10 +2312,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 async_diag = self.context.async_txn_diagnostics.snapshot()
                 output_str += (
                     " ... async txn: prepared %(prepared)d, launched %(launched)d, "
-                    "adopted %(adopted)d, retired %(retired)d, sync %(sync_steps)d, "
+                    "consumed %(consumed)d, retired %(retired)d, sync %(sync_steps)d, "
                     "barrier %(barrier_skips)d, h2d-ready %(h2d_ready_before_sampling)d, "
                     "chain %(chain_launches)d/%(chain_attempts)d, "
-                    "presampled %(presampled_commits)d, "
+                    "deferred_sample %(deferred_sample_commits)d, "
                     "sample-launch %(sample_to_launch_latency_us).1f us, "
                     "commit %(commit_duration_us).1f us, "
                     "prestage %(child_prestage_duration_us).1f us, "
@@ -2564,7 +2567,7 @@ class DynamicInferenceEngine(AbstractEngine):
         Called from the engine loop's finally block after the loop exits.
         """
         self.state = EngineState.STOPPED
-        self._drain_async_transactions(drop_launched=True)
+        self._drain_async_transactions(clear_launched=True)
         await self._drain_coordinator_reply_tasks()
         if self._coordinator_reply_executor is not None:
             self._coordinator_reply_executor.shutdown(wait=False, cancel_futures=True)
@@ -2808,7 +2811,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     self._last_ep_consensus = (0, False)
 
                 elif self.state == EngineState.SUSPENDING:
-                    self._drain_async_transactions(drop_launched=True)
+                    self._drain_async_transactions(clear_launched=True)
                     await self._world_barrier()
                     self.state = EngineState.SUSPENDED
                     self._state_events[EngineState.SUSPENDED].set()
@@ -2822,7 +2825,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     self._state_events[EngineState.RESUMED].set()
 
                 elif self.state == EngineState.STOPPING:
-                    self._drain_async_transactions(drop_launched=True)
+                    self._drain_async_transactions(clear_launched=True)
                     await self._world_barrier()
                     if self.rank == 0:
                         logging.info("Stopping engine.")

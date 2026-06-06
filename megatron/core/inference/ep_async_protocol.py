@@ -34,8 +34,8 @@ class EPStepBeginDecision:
 
     step_id: int
     has_real_work: bool
-    reuse_pending_forward: bool
-    discard_pending_forward: bool
+    consume_launched_forward: bool
+    launched_forward_invariant_failed: bool
 
 
 class EPAsyncStepProtocol:
@@ -50,7 +50,7 @@ class EPAsyncStepProtocol:
         self._work_completion_count = 0
         self._idle_completion_count = 0
         self._step_begin_reuse_count = 0
-        self._step_begin_discard_count = 0
+        self._step_begin_invariant_failure_count = 0
         self._collective_error_count = 0
 
     @property
@@ -70,7 +70,7 @@ class EPAsyncStepProtocol:
             "work_completions": self._work_completion_count,
             "idle_completions": self._idle_completion_count,
             "step_begin_reuses": self._step_begin_reuse_count,
-            "step_begin_discards": self._step_begin_discard_count,
+            "step_begin_invariant_failures": self._step_begin_invariant_failure_count,
             "collective_errors": self._collective_error_count,
             "phase_mismatches": getattr(self.communicator, "protocol_mismatch_count", 0),
         }
@@ -187,50 +187,52 @@ class EPAsyncStepProtocol:
         self,
         *,
         has_real_work: bool,
-        has_pending_forward: bool,
-        pending_forward_reusable: bool,
+        has_launched_forward: bool,
+        launched_forward_consumable: bool,
     ) -> EPStepBeginDecision:
         """Synchronize whether this EP work step reuses a prior async child forward."""
 
         step_id = self._step_id_for_phase(EPAsyncPhase.STEP_BEGIN)
         local_real = int(has_real_work)
-        local_pending_forward = int(has_pending_forward)
-        local_reusable = int(has_pending_forward and pending_forward_reusable)
-        local_discard = int(has_pending_forward and not pending_forward_reusable)
-        local_real_missing_forward = int(has_real_work and not has_pending_forward)
+        local_launched_forward = int(has_launched_forward)
+        local_reusable = int(has_launched_forward and launched_forward_consumable)
+        local_invariant_failure = int(has_launched_forward and not launched_forward_consumable)
+        local_real_missing_forward = int(has_real_work and not has_launched_forward)
 
         (
             any_real,
-            any_pending_forward,
+            any_launched_forward,
             any_reusable,
-            any_discard,
+            any_invariant_failure,
             any_real_missing_forward,
         ) = self._sync_all_reduce_max_at_step(
             EPAsyncPhase.STEP_BEGIN,
             step_id,
             local_real,
-            local_pending_forward,
+            local_launched_forward,
             local_reusable,
-            local_discard,
+            local_invariant_failure,
             local_real_missing_forward,
         )
         self._sync_all_reduce_max_at_step(EPAsyncPhase.STEP_BEGIN_ACK, step_id, 1)
 
-        reuse_pending_forward = bool(
-            any_pending_forward
+        consume_launched_forward = bool(
+            any_launched_forward
             and any_reusable
-            and not any_discard
+            and not any_invariant_failure
             and not any_real_missing_forward
         )
-        discard_pending_forward = bool(any_pending_forward and not reuse_pending_forward)
-        if reuse_pending_forward:
+        launched_forward_invariant_failed = bool(
+            any_launched_forward and not consume_launched_forward
+        )
+        if consume_launched_forward:
             self._step_begin_reuse_count += 1
-        if discard_pending_forward:
-            self._step_begin_discard_count += 1
+        if launched_forward_invariant_failed:
+            self._step_begin_invariant_failure_count += 1
 
         return EPStepBeginDecision(
             step_id=step_id,
             has_real_work=bool(any_real),
-            reuse_pending_forward=reuse_pending_forward,
-            discard_pending_forward=discard_pending_forward,
+            consume_launched_forward=consume_launched_forward,
+            launched_forward_invariant_failed=launched_forward_invariant_failed,
         )

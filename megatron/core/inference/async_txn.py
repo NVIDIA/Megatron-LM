@@ -53,14 +53,14 @@ class AsyncTxnDiagnostics:
     enabled: bool = False
     prepared: int = 0
     launched: int = 0
-    adopted: int = 0
+    consumed: int = 0
     sync_steps: int = 0
     barrier_skips: int = 0
     retired: int = 0
     guard_failures: int = 0
     chain_attempts: int = 0
     chain_launches: int = 0
-    presampled_commits: int = 0
+    deferred_sample_commits: int = 0
     prepare_under_forward: int = 0
     h2d_ready_before_sampling: int = 0
     sample_to_launch_latency_us: float = 0.0
@@ -98,9 +98,9 @@ class AsyncTxnDiagnostics:
         if sample_to_launch_latency_us is not None:
             self.sample_to_launch_latency_us = max(0.0, float(sample_to_launch_latency_us))
 
-    def record_adopted(self) -> None:
+    def record_consumed(self) -> None:
         if self.enabled:
-            self.adopted += 1
+            self.consumed += 1
 
     def record_commit_duration(self, duration_us: float) -> None:
         if self.enabled:
@@ -165,9 +165,9 @@ class AsyncTxnDiagnostics:
         if launched:
             self.chain_launches += 1
 
-    def record_presampled_commit(self) -> None:
+    def record_deferred_sample_commit(self) -> None:
         if self.enabled:
-            self.presampled_commits += 1
+            self.deferred_sample_commits += 1
 
     def record_retired(self, count: int = 1) -> None:
         if self.enabled:
@@ -191,14 +191,14 @@ class AsyncTxnDiagnostics:
             "enabled": self.enabled,
             "prepared": self.prepared,
             "launched": self.launched,
-            "adopted": self.adopted,
+            "consumed": self.consumed,
             "sync_steps": self.sync_steps,
             "barrier_skips": self.barrier_skips,
             "retired": self.retired,
             "guard_failures": self.guard_failures,
             "chain_attempts": self.chain_attempts,
             "chain_launches": self.chain_launches,
-            "presampled_commits": self.presampled_commits,
+            "deferred_sample_commits": self.deferred_sample_commits,
             "prepare_under_forward": self.prepare_under_forward,
             "h2d_ready_before_sampling": self.h2d_ready_before_sampling,
             "sample_to_launch_latency_us": self.sample_to_launch_latency_us,
@@ -265,7 +265,7 @@ class StepTxn:
     terminal_request_ids: tuple[int, ...] = ()
     committed_request_ids: tuple[int, ...] = ()
     launched: bool = False
-    adopted: bool = False
+    consumed: bool = False
     retired: bool = False
 
     def __post_init__(self) -> None:
@@ -330,7 +330,7 @@ class StepTxn:
     def forward_done(self) -> bool:
         return _event_done(self.forward_done_event)
 
-    def guard_adoption(
+    def is_consumable_after_commit(
         self,
         current_request_ids: Iterable[int],
         *,
@@ -338,7 +338,7 @@ class StepTxn:
         decode_only: bool = True,
         cuda_graph_key: Optional[Any] = None,
     ) -> bool:
-        """Check the no-reject-after-launch adoption invariant.
+        """Check the no-reject-after-launch consumption invariant.
 
         Survivors must be a subset of launched rows.  Any launched row that is
         missing from the current committed set must be terminal; no non-terminal
@@ -492,7 +492,7 @@ class AsyncDecodeSlotRing:
         self.current_index = 1 - self.current_index
         return self.current
 
-    def adopt_child(self) -> AsyncDecodeSlot:
+    def mark_child_current(self) -> AsyncDecodeSlot:
         """Mark the prepared child slot as the current in-flight forward slot."""
 
         self.current_index = 1 - self.current_index

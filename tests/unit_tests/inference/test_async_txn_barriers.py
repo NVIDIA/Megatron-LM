@@ -59,8 +59,9 @@ class FakeController:
         self.barrier_reasons = []
 
     async def async_generate_output_tokens_dynamic_batch(
-        self, *, async_launch_barrier_reason=None
+        self, *, async_launch_barrier_reason=None, profile_async_child_forward=False
     ):
+        del profile_async_child_forward
         self.barrier_reasons.append(async_launch_barrier_reason)
         return None
 
@@ -209,7 +210,7 @@ def test_async_forward_passes_pending_admission_barrier_to_controller():
     assert controller.barrier_reasons == [AsyncTxnSkipReason.PENDING_ADMISSION]
 
 
-def test_drain_synchronizes_inflight_forward_and_keeps_adoptable_child_by_default():
+def test_drain_synchronizes_inflight_forward_and_keeps_consumable_child_by_default():
     diagnostics = AsyncTxnDiagnostics(enabled=True)
     retire_queue = TxnRetireQueue(diagnostics)
     released = []
@@ -236,6 +237,6 @@ def test_drain_synchronizes_inflight_forward_and_keeps_adoptable_child_by_defaul
     assert controller._async_prepared_child_txn is None
     assert controller._async_launched_child_txn is launched
 
-    controller.drain_async_transactions(drop_launched=True)
+    controller.drain_async_transactions(clear_launched=True)
 
     assert controller._async_launched_child_txn is None

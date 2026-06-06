@@ -1,7 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 # Copyright 2025 The vLLM authors.
 #
-# This code was adopted from https://github.com/vllm-project/vllm/
+# This code was derived from https://github.com/vllm-project/vllm/
 # This source code is licensed under the Apache license found in the
 # LICENSE file in the root directory of this source tree.
 

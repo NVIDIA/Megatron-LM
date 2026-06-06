@@ -34,11 +34,11 @@ def test_step_txn_guard_allows_only_terminal_disappearances():
     txn = StepTxn(step_id=1, request_ids=[1, 2, 3], cuda_graph_key=("decode", 4))
     txn.launched = True
 
-    assert txn.guard_adoption([1, 3], terminal_request_ids=[2], cuda_graph_key=("decode", 4))
-    assert not txn.guard_adoption([1, 3], terminal_request_ids=[], cuda_graph_key=("decode", 4))
-    assert not txn.guard_adoption([1, 4], terminal_request_ids=[2], cuda_graph_key=("decode", 4))
-    assert not txn.guard_adoption([1, 3], terminal_request_ids=[2], cuda_graph_key=("decode", 8))
-    assert not txn.guard_adoption([1, 3], terminal_request_ids=[2], decode_only=False)
+    assert txn.is_consumable_after_commit([1, 3], terminal_request_ids=[2], cuda_graph_key=("decode", 4))
+    assert not txn.is_consumable_after_commit([1, 3], terminal_request_ids=[], cuda_graph_key=("decode", 4))
+    assert not txn.is_consumable_after_commit([1, 4], terminal_request_ids=[2], cuda_graph_key=("decode", 4))
+    assert not txn.is_consumable_after_commit([1, 3], terminal_request_ids=[2], cuda_graph_key=("decode", 8))
+    assert not txn.is_consumable_after_commit([1, 3], terminal_request_ids=[2], decode_only=False)
 
 
 def test_retire_queue_releases_only_after_event_completion():
@@ -65,7 +65,7 @@ def test_diagnostics_are_noop_when_disabled():
     diagnostics = AsyncTxnDiagnostics(enabled=False)
     diagnostics.record_prepared(under_forward=True)
     diagnostics.record_launched(h2d_ready_before_sampling=True)
-    diagnostics.record_adopted()
+    diagnostics.record_consumed()
     diagnostics.record_sync_step("serial_wrapped")
     diagnostics.record_barrier_skip("not_decode_only")
     diagnostics.record_retired()
@@ -86,12 +86,12 @@ def test_diagnostics_are_noop_when_disabled():
 def test_serial_wrapped_diagnostics_are_cheap_dict_counters():
     diagnostics = AsyncTxnDiagnostics(enabled=True)
     diagnostics.record_prepared()
-    diagnostics.record_adopted()
+    diagnostics.record_consumed()
     diagnostics.record_sync_step("serial_wrapped")
 
     snapshot = diagnostics.snapshot()
     assert snapshot["prepared"] == 1
-    assert snapshot["adopted"] == 1
+    assert snapshot["consumed"] == 1
     assert snapshot["sync_steps"] == 1
     assert snapshot["eligibility_skip_reasons"] == {"serial_wrapped": 1}
     assert torch.tensor(snapshot["prepared"]).item() == 1
