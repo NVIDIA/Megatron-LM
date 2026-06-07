@@ -16,6 +16,11 @@ from torch.cuda.nvtx import range_pop, range_push
 
 from megatron.core import parallel_state
 from megatron.core.inference.async_stream import AsyncStream
+from megatron.core.inference.async_transaction import (
+    AsyncLayoutSnapshot,
+    AsyncStepTransaction,
+    AsyncTxnState,
+)
 from megatron.core.inference.communication_utils import (
     broadcast_from_last_pipeline_stage,
     is_pipeline_last_stage,
@@ -208,6 +213,8 @@ class TextGenerationController:
         self._async_eligibility_pass_count = 0
         self._async_disable_reason_counts: Dict[str, int] = {}
         self._async_pending_forward_view = None
+        self._async_step_transaction = None
+        self._async_transaction_next_step_id = 0
         self._dummy_context_h2d_done_event = None
         self._async_step_barrier_reason = None
         self._async_admission_barrier_requested = False
@@ -1524,7 +1531,7 @@ class TextGenerationController:
 
     def has_pending_async_forward(self) -> bool:
         """Whether a speculative async forward has already been launched for the next step."""
-        return self._async_pending_forward
+        return self._has_pending_async_forward_state()
 
     def set_ep_async_protocol(self, protocol) -> None:
         """Attach the EP async protocol used by coordinator-driven EP decoding."""
@@ -1548,7 +1555,7 @@ class TextGenerationController:
         """Return cheap async scheduling diagnostics for tests and benchmark logs."""
         return {
             "enabled": self._async_scheduling_enabled,
-            "pending_forward": self._async_pending_forward,
+            "pending_forward": self._has_pending_async_forward_state(),
             "step_barrier_reason": self._async_step_barrier_reason,
             "eligibility_checks": self._async_eligibility_check_count,
             "eligibility_passes": self._async_eligibility_pass_count,
@@ -1561,6 +1568,25 @@ class TextGenerationController:
                 else None
             ),
         }
+
+    def _pending_async_transaction(self) -> Optional[AsyncStepTransaction]:
+        """Return the active async transaction, if one owns pending state."""
+        transaction = getattr(self, "_async_step_transaction", None)
+        if transaction is not None and transaction.is_in_flight:
+            return transaction
+        return None
+
+    def _has_pending_async_forward_state(self) -> bool:
+        """Return whether either the transaction or legacy shim has a pending forward."""
+        transaction = self._pending_async_transaction()
+        return transaction is not None or bool(getattr(self, "_async_pending_forward", False))
+
+    def _retire_async_transaction(self) -> None:
+        """Retire and clear the active async transaction."""
+        transaction = getattr(self, "_async_step_transaction", None)
+        if transaction is not None:
+            transaction.mark_retired()
+        self._async_step_transaction = None
 
     def _record_async_eligibility_result(self, reason: Optional[str]) -> None:
         """Record one async eligibility decision without synchronizing with the GPU."""
@@ -1619,16 +1645,35 @@ class TextGenerationController:
             pending_request_ids = self._active_request_ids_cpu()
         request_count = int(pending_request_ids.numel())
         planned_layout = self._capture_pending_forward_layout(request_count)
-        self._async_pending_forward_view = _AsyncPendingForwardView(
+        pending_forward_view = _AsyncPendingForwardView(
             pending_request_ids=pending_request_ids,
             cuda_graph_request_count=cuda_graph_request_count,
             **planned_layout,
         )
+        self._async_pending_forward_view = pending_forward_view
+        snapshot = AsyncLayoutSnapshot.from_pending_forward_view(
+            pending_forward_view, tokens_per_request=self.num_speculative_tokens + 1
+        )
+        transaction_step_id = getattr(self, "_async_transaction_next_step_id", 0)
+        transaction = AsyncStepTransaction(
+            step_id=transaction_step_id,
+            state=AsyncTxnState.PREPARED,
+            snapshot=snapshot,
+            pending_forward_view=pending_forward_view,
+        )
+        transaction.mark_launched()
+        self._async_step_transaction = transaction
+        self._async_transaction_next_step_id = transaction_step_id + 1
         context.clear_async_prepared_decode_plan()
 
     def _pending_async_forward_matches_current_rows(self) -> bool:
         """Return whether a pending speculative forward still has current row order."""
-        pending_view = self._async_pending_forward_view
+        transaction = self._pending_async_transaction()
+        pending_view = (
+            transaction.pending_forward_view
+            if transaction is not None and transaction.pending_forward_view is not None
+            else self._async_pending_forward_view
+        )
         if pending_view is None:
             return True
         return torch.equal(pending_view.pending_request_ids, self._active_request_ids_cpu())
@@ -1891,7 +1936,12 @@ class TextGenerationController:
 
     def _pending_async_forward_row_status(self) -> tuple[bool, bool]:
         """Return whether the pending forward is reusable and whether row mapping is needed."""
-        pending_view = self._async_pending_forward_view
+        transaction = self._pending_async_transaction()
+        pending_view = (
+            transaction.pending_forward_view
+            if transaction is not None and transaction.pending_forward_view is not None
+            else self._async_pending_forward_view
+        )
         if pending_view is None:
             return True, False
 
@@ -1906,7 +1956,12 @@ class TextGenerationController:
         Returns ``None`` when a current request was not present in the pending
         forward, meaning the pending forward cannot be safely reused.
         """
-        pending_view = self._async_pending_forward_view
+        transaction = self._pending_async_transaction()
+        pending_view = (
+            transaction.pending_forward_view
+            if transaction is not None and transaction.pending_forward_view is not None
+            else self._async_pending_forward_view
+        )
         self._async_pending_forward_view = None
         if pending_view is None:
             return None
@@ -1915,19 +1970,29 @@ class TextGenerationController:
         if current_view is not None:
             if current_view.row_mapped:
                 self._async_row_mapped_forward_count += 1
+            if transaction is not None:
+                transaction.pending_forward_view = current_view
+                transaction.row_map = current_view.row_indices_cpu
+                transaction.state = AsyncTxnState.RESOLVED
             return current_view
 
         self._async_discarded_forward_count += 1
+        if transaction is not None:
+            transaction.discard("pending forward not reusable")
         return None
 
     def _discard_pending_async_forward(self) -> None:
         """Discard a pending async forward and release resources reserved for it."""
         context = self.inference_wrapped_model.inference_context
-        if self._async_pending_forward:
+        transaction = self._pending_async_transaction()
+        if self._has_pending_async_forward_state():
             context.release_deferred_async_resources()
             self._async_pending_forward = False
             self._async_pending_cuda_graph_request_count = None
             self._async_pending_forward_view = None
+            if transaction is not None:
+                transaction.discard("discarded before step begin")
+                self._async_step_transaction = None
             self._async_discarded_forward_count += 1
 
     def _decide_ep_step_begin(self, *, has_real_work: bool) -> EPStepBeginDecision:
@@ -1936,7 +2001,8 @@ class TextGenerationController:
         self._ep_async_handoff_decision_this_step = None
         pending_forward_reusable = True
         pending_forward_row_mapped = False
-        if self._async_pending_forward:
+        has_pending_forward = self._has_pending_async_forward_state()
+        if has_pending_forward:
             pending_forward_reusable, pending_forward_row_mapped = (
                 self._pending_async_forward_row_status()
             )
@@ -1944,7 +2010,7 @@ class TextGenerationController:
         if self._ep_async_protocol is not None and self._ep_async_protocol.enabled:
             return self._ep_async_protocol.decide_step_begin(
                 has_real_work=has_real_work,
-                has_pending_forward=self._async_pending_forward,
+                has_pending_forward=has_pending_forward,
                 pending_forward_reusable=pending_forward_reusable,
                 pending_forward_row_mapped=pending_forward_row_mapped,
             )
@@ -1952,11 +2018,11 @@ class TextGenerationController:
         return EPStepBeginDecision(
             step_id=-1,
             has_real_work=has_real_work,
-            reuse_pending_forward=bool(self._async_pending_forward and pending_forward_reusable),
+            reuse_pending_forward=bool(has_pending_forward and pending_forward_reusable),
             discard_pending_forward=bool(
-                self._async_pending_forward and not pending_forward_reusable
+                has_pending_forward and not pending_forward_reusable
             ),
-            row_mapped_forward=bool(self._async_pending_forward and pending_forward_row_mapped),
+            row_mapped_forward=bool(has_pending_forward and pending_forward_row_mapped),
         )
 
     def _decide_ep_async_handoff(
@@ -3075,8 +3141,13 @@ class TextGenerationController:
             self._discard_pending_async_forward()
 
         with torch.inference_mode():
-            if self._async_pending_forward:
-                cuda_graph_request_count = self._async_pending_cuda_graph_request_count
+            if self._has_pending_async_forward_state():
+                transaction = self._pending_async_transaction()
+                cuda_graph_request_count = (
+                    transaction.snapshot.graph_shape.padded_active_request_count
+                    if transaction is not None
+                    else self._async_pending_cuda_graph_request_count
+                )
                 self._async_pending_forward = False
                 self._async_pending_cuda_graph_request_count = None
                 pending_forward_view = self._resolve_pending_async_forward_view()
@@ -3101,9 +3172,17 @@ class TextGenerationController:
                     pending_forward_row_indices = None
                     pending_forward_row_mapped = False
                     self._async_discarded_forward_count += 1
+                    if transaction is not None:
+                        transaction.discard("row-mapped non-decode forward not reusable")
                 if pending_forward_reused and context.is_hybrid_model:
                     context.accept_async_mamba_state(pending_forward_view.current_request_ids)
                 context.release_deferred_async_resources()
+                if transaction is not None:
+                    if pending_forward_reused:
+                        transaction.mark_committed()
+                    elif transaction.state != AsyncTxnState.DISCARDED:
+                        transaction.discard("pending forward not reused")
+                    self._retire_async_transaction()
                 if pending_forward_reused and self.num_speculative_tokens > 0:
                     input_ids, _ = context.current_input_and_position_ids()
             if not pending_forward_reused:
@@ -3257,6 +3336,9 @@ class TextGenerationController:
                     self._record_async_pending_forward_requests(
                         self._async_pending_cuda_graph_request_count
                     )
+                    transaction = self._pending_async_transaction()
+                    if transaction is not None:
+                        transaction.mark_launched(h2d_done_event=async_h2d_done_event)
                     context.mark_async_forward_in_flight()
                     range_pop()
 
@@ -3304,12 +3386,16 @@ class TextGenerationController:
                 next_active_request_count = (
                     context.total_request_count - context.paused_request_count
                 )
-                if self._async_pending_forward and next_active_request_count == 0:
+                if self._has_pending_async_forward_state() and next_active_request_count == 0:
+                    transaction = self._pending_async_transaction()
                     torch.cuda.current_stream().synchronize()
                     context.release_deferred_async_resources()
                     self._async_pending_forward = False
                     self._async_pending_cuda_graph_request_count = None
                     self._async_pending_forward_view = None
+                    if transaction is not None:
+                        transaction.discard("no active requests after bookkeeping")
+                        self._async_step_transaction = None
 
             ret = {
                 "accepted_tokens": (

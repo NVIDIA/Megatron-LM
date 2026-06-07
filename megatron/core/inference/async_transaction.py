@@ -269,3 +269,73 @@ def _row_field_matches(planned: Tensor | None, current: Tensor | None, row_map: 
     if current is None:
         return False
     return torch.equal(current.to(device="cpu"), planned.index_select(0, row_map).to(device="cpu"))
+
+
+@dataclass
+class AsyncStepTransaction:
+    """Owns one speculative async decode forward and all state tied to it."""
+
+    step_id: int
+    state: AsyncTxnState
+    snapshot: AsyncLayoutSnapshot
+    sample_ticket: object | None = None
+    resources: object | None = None
+    h2d_done_event: object | None = None
+    forward_done_event: object | None = None
+    ep_decision: object | None = None
+    row_map: object | None = None
+    discard_reason: str | None = None
+    pending_forward_view: object | None = None
+
+    def mark_launched(
+        self,
+        *,
+        sample_ticket: object | None = None,
+        resources: object | None = None,
+        h2d_done_event: object | None = None,
+        forward_done_event: object | None = None,
+        ep_decision: object | None = None,
+    ) -> None:
+        """Mark the async forward as launched and attach launch-owned state."""
+        self.sample_ticket = sample_ticket if sample_ticket is not None else self.sample_ticket
+        self.resources = resources if resources is not None else self.resources
+        self.h2d_done_event = h2d_done_event if h2d_done_event is not None else self.h2d_done_event
+        self.forward_done_event = (
+            forward_done_event if forward_done_event is not None else self.forward_done_event
+        )
+        self.ep_decision = ep_decision if ep_decision is not None else self.ep_decision
+        self.state = AsyncTxnState.LAUNCHED
+
+    def resolve_against_current(self, context: object) -> Tensor | None:
+        """Resolve this transaction's pending rows against the current context."""
+        current = AsyncLayoutSnapshot.from_context_current(
+            context, tokens_per_request=self.snapshot.graph_shape.tokens_per_request
+        )
+        if not self.snapshot.graph_compatible_with(current):
+            self.discard("graph shape mismatch")
+            return None
+        row_map = self.snapshot.row_map_to_current(current.request_ids)
+        if row_map is None or not self.snapshot.layout_compatible_with(current, row_map=row_map):
+            self.discard("layout mismatch")
+            return None
+        self.row_map = row_map
+        self.state = AsyncTxnState.RESOLVED
+        return row_map
+
+    def mark_committed(self) -> None:
+        """Mark transaction-owned side effects as committed."""
+        self.state = AsyncTxnState.COMMITTED
+
+    def mark_retired(self) -> None:
+        """Mark the transaction as no longer owning in-flight state."""
+        self.state = AsyncTxnState.RETIRED
+
+    def discard(self, reason: str) -> None:
+        """Discard the transaction and remember why it could not commit."""
+        self.discard_reason = reason
+        self.state = AsyncTxnState.DISCARDED
+
+    @property
+    def is_in_flight(self) -> bool:
+        """Whether the transaction still represents a pending async forward."""
+        return self.state in (AsyncTxnState.PREPARED, AsyncTxnState.LAUNCHED, AsyncTxnState.RESOLVED)
