@@ -17,6 +17,8 @@ runs/
 /test_cases/
 **/dist/
 /experimental/lite/examples/verl/outputs/
+/outputs/
+/compare-qwen35-gsm8k-grpo-*/
 
 # Sphinx documentation
 docs/_build
