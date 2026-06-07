@@ -30,6 +30,7 @@ This initial drop intentionally does not include:
 experimental/lite/
   README.md
   docs/                       Design and usage notes
+  skills/                     Agent-agnostic maintenance skills
   megatron/
     lite/
       runtime/                Runtime API, config, and mlite backend registry
@@ -73,6 +74,7 @@ Model names currently registered by default:
 - [Runtime](docs/runtime.md)
 - [Models](docs/models.md)
 - [Porting Notes](docs/porting.md)
+- [Skills](skills/README.md)
 
 ## Acknowledgements
 
