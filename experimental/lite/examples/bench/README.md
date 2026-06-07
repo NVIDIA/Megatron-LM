@@ -44,6 +44,42 @@ bash experimental/lite/examples/bench/scripts/run_qwen35_pair.sh
 Set `DRY_RUN=0` to run the benchmark under `torchrun`. Results are written to
 `experimental/lite/examples/bench/outputs/`.
 
+## Validated Run
+
+The following paired run completed on 2026-06-07 with 8x NVIDIA H100 80GB GPUs:
+
+```bash
+HF_PATH=/models/Qwen3.5-35B-A3B \
+OUTPUT_DIR=experimental/lite/examples/bench/outputs/qwen35_pair \
+DRY_RUN=0 \
+NPROC=8 \
+MASTER_PORT=31841 \
+MASTER_PORT_BRIDGE=31842 \
+STEPS=15 \
+WARMUP=5 \
+SEQ_LEN=1024 \
+NUM_MICROBATCHES=4 \
+TRUNCATE_LAYERS=8 \
+KEEP_EXPERTS=8 \
+SAME_DATA_ACROSS_DP=1 \
+bash experimental/lite/examples/bench/scripts/run_qwen35_pair.sh
+```
+
+Slurm job `12624917` completed with exit code `0:0`. The run used
+`torch==2.10.0+cu129`; `transformer_engine`, `einops`, and `mbridge` were
+available in the runtime environment.
+
+| Runtime | Impl | Optimizer backend | Measured steps | Avg step ms | Tokens/s | Tokens/s/GPU | Peak memory GB | TFLOPs/GPU |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `mlite` | `lite` | `mc_full` | 10 | 309.433 | 105896.935 | 13237.117 | 14.324 | 80.444 |
+| `bridge` | `bridge` | `mc` | 10 | 332.201 | 98639.089 | 12329.886 | 17.987 | 74.931 |
+
+The two runs used the same synthetic input stream. Loss matched within
+`atol=0.05, rtol=0.005` across 10 measured samples
+(`max_abs_diff=0.000500`). Grad norm did not match that tolerance
+(`max_abs_diff=2.491823`), so treat the recorded correctness result as
+loss-consistent rather than full optimizer-metric parity.
+
 ## Real Run
 
 ```bash

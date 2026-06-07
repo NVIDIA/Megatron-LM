@@ -267,6 +267,7 @@ class BridgeRuntime(RuntimeBase):
                 "mpu": mpu,
                 "model_cfg": bridge.hf_config,
                 "protocol": _resolve_benchmark_protocol(rt_cfg, bridge),
+                "optimizer_backend": "mc" if optimizer is not None else "none",
                 "world_size": dist.get_world_size(),
             },
         )

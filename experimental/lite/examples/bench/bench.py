@@ -9,14 +9,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from dataclasses import dataclass, fields, is_dataclass, replace
 from pathlib import Path
 from typing import Any
 
 _EXPERIMENTAL_LITE_ROOT = Path(__file__).resolve().parents[2]
+_REPO_ROOT = Path(__file__).resolve().parents[4]
 if str(_EXPERIMENTAL_LITE_ROOT) not in sys.path:
     sys.path.insert(0, str(_EXPERIMENTAL_LITE_ROOT))
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(1, str(_REPO_ROOT))
 
 from megatron.lite.runtime import RuntimeConfig, create_runtime
 from megatron.lite.runtime.backends.bridge.config import BridgeConfig
@@ -319,6 +323,18 @@ def build_dry_run_plan(cfg: BenchCliConfig) -> dict[str, Any]:
     }
 
 
+def _distributed_rank() -> int:
+    for name in ("RANK", "SLURM_PROCID"):
+        raw = os.environ.get(name)
+        if raw is None:
+            continue
+        try:
+            return int(raw)
+        except ValueError:
+            continue
+    return 0
+
+
 def _step_reporter(trace: StepTrace) -> None:
     parts = [
         "[MLITE_BENCH_STEP]",
@@ -395,12 +411,13 @@ def parse_args(argv: list[str] | None = None) -> BenchCliConfig:
 def main(argv: list[str] | None = None) -> dict[str, Any]:
     cfg = parse_args(argv)
     artifact = run(cfg)
-    text = json.dumps(artifact, indent=2, sort_keys=True)
-    print(text, flush=True)
-    if cfg.output_json is not None:
-        output_path = Path(cfg.output_json)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(text + "\n", encoding="utf-8")
+    if _distributed_rank() == 0:
+        text = json.dumps(artifact, indent=2, sort_keys=True)
+        print(text, flush=True)
+        if cfg.output_json is not None:
+            output_path = Path(cfg.output_json)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(text + "\n", encoding="utf-8")
     return artifact
 
 

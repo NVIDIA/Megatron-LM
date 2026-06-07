@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+import json
 
 from megatron.lite.runtime.contracts.config import ParallelConfig
 from megatron.lite.runtime.contracts.data import ForwardResult
@@ -111,3 +112,122 @@ def test_pretrain_session_runs_with_fake_runtime_on_cpu():
     assert len(result.step_traces) == 2
     assert [trace.loss for trace in result.step_traces] == [2.0, 3.0]
     assert result.step_traces[0].grad_norm == 3.5
+
+
+def test_bench_main_writes_dry_run_output_json(tmp_path):
+    from examples.bench.bench import main
+
+    output_path = tmp_path / "dry_run.json"
+
+    artifact = main(
+        [
+            "--backend",
+            "mlite",
+            "--hf-path",
+            "/tmp/hf",
+            "--model-name",
+            "qwen3_5",
+            "--truncate-layers",
+            "2",
+            "--disable-mtp",
+            "--dry-run",
+            "--output-json",
+            str(output_path),
+        ]
+    )
+
+    assert output_path.exists()
+    assert json.loads(output_path.read_text()) == artifact
+
+
+def test_bench_main_writes_output_json_only_on_rank_zero(tmp_path, monkeypatch):
+    from examples.bench.bench import main
+
+    output_path = tmp_path / "rank_one.json"
+    monkeypatch.setenv("RANK", "1")
+
+    artifact = main(
+        [
+            "--backend",
+            "mlite",
+            "--hf-path",
+            "/tmp/hf",
+            "--model-name",
+            "qwen3_5",
+            "--dry-run",
+            "--output-json",
+            str(output_path),
+        ]
+    )
+
+    assert artifact["dry_run"] is True
+    assert not output_path.exists()
+
+
+def test_result_artifact_summary_and_trace_compare(tmp_path):
+    from examples.bench.results import (
+        compare_step_traces,
+        load_result_artifact,
+        result_summary,
+    )
+
+    baseline = {
+        "summary": {
+            "backend": "mlite",
+            "avg_step_ms": 10.0,
+            "tok_per_s": 3200.0,
+            "steps_measured": 2,
+        },
+        "result": {
+            "step_traces": [
+                {"step": 0, "loss": 1.0, "grad_norm": 2.0, "step_ms": 10.0},
+                {"step": 1, "loss": 1.5, "grad_norm": 2.5, "step_ms": 10.0},
+            ]
+        },
+    }
+    candidate = {
+        "summary": {
+            "backend": "bridge",
+            "avg_step_ms": 11.0,
+            "tok_per_s": 2900.0,
+            "steps_measured": 2,
+        },
+        "result": {
+            "step_traces": [
+                {"step": 0, "loss": 1.00001, "grad_norm": 2.00001, "step_ms": 11.0},
+                {"step": 1, "loss": 1.49999, "grad_norm": 2.49999, "step_ms": 11.0},
+            ]
+        },
+    }
+    baseline_path = tmp_path / "mlite.json"
+    baseline_path.write_text(json.dumps(baseline), encoding="utf-8")
+
+    loaded = load_result_artifact(baseline_path)
+
+    assert result_summary(loaded)["backend"] == "mlite"
+    assert compare_step_traces(baseline, candidate, atol=1e-3, rtol=0.0)["passed"] is True
+
+
+def test_result_trace_compare_reports_metric_level_failures():
+    from examples.bench.results import compare_step_traces
+
+    baseline = {
+        "result": {
+            "step_traces": [
+                {"step": 0, "loss": 1.0, "grad_norm": 2.0, "step_ms": 10.0},
+            ]
+        },
+    }
+    candidate = {
+        "result": {
+            "step_traces": [
+                {"step": 0, "loss": 1.00001, "grad_norm": 3.0, "step_ms": 10.0},
+            ]
+        },
+    }
+
+    comparison = compare_step_traces(baseline, candidate, atol=1e-3, rtol=0.0)
+
+    assert comparison["passed"] is False
+    assert comparison["loss_passed"] is True
+    assert comparison["grad_norm_passed"] is False

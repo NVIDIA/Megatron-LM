@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
+from pathlib import Path
 from typing import Any
 
 
@@ -92,4 +94,85 @@ class RunResult:
         }
 
 
-__all__ = ["RunResult", "StepTrace"]
+def load_result_artifact(path: str | Path) -> dict[str, Any]:
+    """Load a benchmark JSON artifact from ``bench.py --output-json``."""
+    with Path(path).open(encoding="utf-8") as f:
+        value = json.load(f)
+    if not isinstance(value, dict):
+        raise ValueError(f"Benchmark artifact must be a JSON object: {path}")
+    return value
+
+
+def result_summary(artifact: dict[str, Any]) -> dict[str, Any]:
+    """Return the summary block from a benchmark artifact."""
+    summary = artifact.get("summary")
+    if isinstance(summary, dict):
+        return dict(summary)
+    result = artifact.get("result")
+    if not isinstance(result, dict):
+        raise ValueError("Benchmark artifact must contain `summary` or `result`.")
+    return {
+        "backend": result.get("backend"),
+        "model_name": result.get("model_name"),
+        "impl": result.get("impl"),
+        "optimizer_backend": result.get("optimizer_backend"),
+        "avg_step_ms": result.get("avg_step_ms"),
+        "tok_per_s": result.get("tok_per_s"),
+        "tok_per_s_per_gpu": result.get("tok_per_s_per_gpu"),
+        "peak_mem_gb": result.get("peak_mem_gb"),
+        "tflops_per_gpu": result.get("tflops_per_gpu"),
+        "steps_measured": len(result.get("step_traces", [])),
+    }
+
+
+def compare_step_traces(
+    baseline: dict[str, Any],
+    candidate: dict[str, Any],
+    *,
+    atol: float = 1e-4,
+    rtol: float = 1e-4,
+) -> dict[str, Any]:
+    """Compare loss and grad-norm traces from two benchmark artifacts."""
+    base_steps = baseline.get("result", {}).get("step_traces", [])
+    cand_steps = candidate.get("result", {}).get("step_traces", [])
+    sample_count = min(len(base_steps), len(cand_steps))
+    max_loss_abs = 0.0
+    max_grad_norm_abs = 0.0
+    for idx in range(sample_count):
+        base = base_steps[idx]
+        cand = cand_steps[idx]
+        max_loss_abs = max(max_loss_abs, abs(float(base["loss"]) - float(cand["loss"])))
+        max_grad_norm_abs = max(
+            max_grad_norm_abs,
+            abs(float(base["grad_norm"]) - float(cand["grad_norm"])),
+        )
+
+    lengths_match = sample_count == len(base_steps) == len(cand_steps)
+    loss_ref_max = max([abs(float(step["loss"])) for step in base_steps[:sample_count]] + [0.0])
+    grad_norm_ref_max = max(
+        [abs(float(step["grad_norm"])) for step in base_steps[:sample_count]] + [0.0]
+    )
+    loss_passed = lengths_match and max_loss_abs <= atol + rtol * loss_ref_max
+    grad_norm_passed = (
+        lengths_match and max_grad_norm_abs <= atol + rtol * grad_norm_ref_max
+    )
+
+    return {
+        "samples": sample_count,
+        "atol": atol,
+        "rtol": rtol,
+        "passed": loss_passed and grad_norm_passed,
+        "loss_passed": loss_passed,
+        "grad_norm_passed": grad_norm_passed,
+        "max_loss_abs": max_loss_abs,
+        "max_grad_norm_abs": max_grad_norm_abs,
+    }
+
+
+__all__ = [
+    "RunResult",
+    "StepTrace",
+    "compare_step_traces",
+    "load_result_artifact",
+    "result_summary",
+]

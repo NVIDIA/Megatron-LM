@@ -113,7 +113,9 @@ def _build_mc_optimizer(chunks, model_cfg: Qwen35Config, impl_cfg: ImplConfig, p
         model_cfg=model_cfg,
         impl_cfg=impl_cfg,
         ps=ps,
+        is_expert=is_expert_param,
         model_name="qwen3_5",
+        deterministic=impl_cfg.deterministic,
     )
 
 
