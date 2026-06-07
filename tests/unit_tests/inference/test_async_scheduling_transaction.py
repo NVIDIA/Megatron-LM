@@ -320,6 +320,17 @@ def _eligible_async_context(**overrides):
             "top_n_logprobs": torch.tensor(top_n_logprobs, dtype=torch.int32),
         },
     )
+    context.active_request_metadata_needs_logprob_results = lambda active_count=None: bool(
+        context.active_request_metadata["return_log_probs"][
+            : active_request_count if active_count is None else active_count
+        ].any()
+        or (
+            context.active_request_metadata["top_n_logprobs"][
+                : active_request_count if active_count is None else active_count
+            ]
+            > 0
+        ).any()
+    )
     for name, value in overrides.items():
         setattr(context, name, value)
     return context
