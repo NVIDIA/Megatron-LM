@@ -22,6 +22,7 @@ from megatron.core.inference.async_transaction import (
     AsyncSampleTicket,
     AsyncStepTransaction,
     AsyncTxnState,
+    classify_async_eligibility,
 )
 from megatron.core.inference.communication_utils import (
     broadcast_from_last_pipeline_stage,
@@ -45,7 +46,6 @@ from megatron.core.tensor_parallel.mappings import (
     gather_from_sequence_parallel_region,
     scatter_to_sequence_parallel_region,
 )
-from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.moe.moe_layer import BaseMoELayer
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.transformer.utils import set_model_to_sequence_parallel
@@ -2296,23 +2296,10 @@ class TextGenerationController:
 
     def _async_scheduling_global_disabled_reason(self, *, allow_mtp: bool = False) -> Optional[str]:
         """Return non-step-local reasons async scheduling is disabled, or None."""
-        if not self._async_scheduling_enabled:
-            return "disabled"
-        if self._async_step_barrier_reason is not None:
-            return self._async_step_barrier_reason
-        if not self._enable_cuda_graph:
-            return "requires local cuda graphs"
-        if self.model_config.inference_cuda_graph_scope != InferenceCudaGraphScope.block:
-            return "requires block-scope inference cuda graphs"
-        if self.model_is_pipeline_parallel:
-            return "pipeline parallel is unsupported"
-        if self.num_speculative_tokens != 0 and not allow_mtp:
-            return "mtp pre-sampling graph is unsupported"
-        if self.num_speculative_tokens != 0 and self._num_mtp_depths != self.num_speculative_tokens:
-            return "not enough mtp heads"
-        if self._sampling_backend != "torch":
-            return "sampling backend is unsupported"
-        return None
+        context = self.inference_wrapped_model.inference_context
+        return classify_async_eligibility(
+            self, context, allow_mtp=allow_mtp, check_context=False
+        ).reason
 
     def _dummy_async_handoff_disabled_reason(self) -> Optional[str]:
         """Return why a dummy EP rank cannot mirror an async handoff, or None.
@@ -2327,29 +2314,7 @@ class TextGenerationController:
     def _async_scheduling_disabled_reason(self, *, allow_mtp: bool = False) -> Optional[str]:
         """Return why async scheduling cannot be used for the current step, or None."""
         context = self.inference_wrapped_model.inference_context
-        disabled_reason = self._async_scheduling_global_disabled_reason(allow_mtp=allow_mtp)
-        if disabled_reason is not None:
-            return disabled_reason
-        if not context.is_decode_only():
-            return "not decode-only"
-        if not context.using_cuda_graph_this_step():
-            return "not using cuda graph"
-
-        active_request_count = context.total_request_count - context.paused_request_count
-        if active_request_count <= 0:
-            return "no active requests"
-        if self._async_admission_barrier_requested:
-            self._async_admission_barrier_requested = False
-            return "waiting request admission deferred"
-
-        tokens_per_request = self.num_speculative_tokens + 1
-        if (
-            context.padded_batch_dimensions.token_count
-            != context.padded_batch_dimensions.decode_req_count * tokens_per_request
-        ):
-            return "cuda graph shape does not match decode stride"
-
-        return None
+        return classify_async_eligibility(self, context, allow_mtp=allow_mtp).reason
 
     def _dynamic_step_log_probs_bookkeeping(self) -> Tuple[bool, bool]:
         """Perform bookkeeping necessary to compute log probs for dynamic batching.

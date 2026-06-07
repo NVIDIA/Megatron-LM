@@ -680,3 +680,80 @@ def _tensor_ints(values: Tensor, *, skip_negative: bool = False) -> list[int]:
     if skip_negative:
         values = values[values != -1]
     return [int(value) for value in values.tolist()]
+
+
+@dataclass(frozen=True)
+class AsyncEligibilityDecision:
+    """Classified async scheduling eligibility for the current controller/context state."""
+
+    can_prepare: bool
+    can_launch: bool
+    reason: str | None
+    requires_barrier: bool = False
+
+
+def classify_async_eligibility(
+    controller: object,
+    context: object,
+    *,
+    allow_mtp: bool = False,
+    check_context: bool = True,
+) -> AsyncEligibilityDecision:
+    """Return whether async decode can prepare and launch, preserving diagnostics."""
+    reason = _classify_async_disabled_reason(
+        controller, context, allow_mtp=allow_mtp, check_context=check_context
+    )
+    return AsyncEligibilityDecision(
+        can_prepare=reason is None,
+        can_launch=reason is None,
+        reason=reason,
+        requires_barrier=reason == "waiting request admission deferred",
+    )
+
+
+def _classify_async_disabled_reason(
+    controller: object, context: object, *, allow_mtp: bool, check_context: bool
+) -> str | None:
+    if not controller._async_scheduling_enabled:
+        return "disabled"
+    if controller._async_step_barrier_reason is not None:
+        return controller._async_step_barrier_reason
+    if not controller._enable_cuda_graph:
+        return "requires local cuda graphs"
+    inference_cuda_graph_scope = controller.model_config.inference_cuda_graph_scope
+    if getattr(inference_cuda_graph_scope, "name", inference_cuda_graph_scope) != "block":
+        return "requires block-scope inference cuda graphs"
+    if controller.model_is_pipeline_parallel:
+        return "pipeline parallel is unsupported"
+    if controller.num_speculative_tokens != 0 and not allow_mtp:
+        return "mtp pre-sampling graph is unsupported"
+    if (
+        controller.num_speculative_tokens != 0
+        and controller._num_mtp_depths != controller.num_speculative_tokens
+    ):
+        return "not enough mtp heads"
+    if controller._sampling_backend != "torch":
+        return "sampling backend is unsupported"
+    if not check_context:
+        return None
+
+    if not context.is_decode_only():
+        return "not decode-only"
+    if not context.using_cuda_graph_this_step():
+        return "not using cuda graph"
+
+    active_request_count = context.total_request_count - context.paused_request_count
+    if active_request_count <= 0:
+        return "no active requests"
+    if controller._async_admission_barrier_requested:
+        controller._async_admission_barrier_requested = False
+        return "waiting request admission deferred"
+
+    tokens_per_request = controller.num_speculative_tokens + 1
+    if (
+        context.padded_batch_dimensions.token_count
+        != context.padded_batch_dimensions.decode_req_count * tokens_per_request
+    ):
+        return "cuda graph shape does not match decode stride"
+
+    return None

@@ -7,7 +7,11 @@ import pytest
 import torch
 
 from megatron.core import utils as core_utils
-from megatron.core.inference.async_transaction import AsyncLayoutSnapshot, AsyncResourceLedger
+from megatron.core.inference.async_transaction import (
+    AsyncLayoutSnapshot,
+    AsyncResourceLedger,
+    classify_async_eligibility,
+)
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
@@ -1047,6 +1051,14 @@ def test_async_scheduling_disabled_reason_matrix(case, expected):
         controller.num_speculative_tokens = 1
         controller._num_mtp_depths = 1
         allow_mtp = True
+
+    decision = classify_async_eligibility(controller, context, allow_mtp=allow_mtp)
+    assert decision.reason == expected
+    assert decision.can_prepare is (expected is None)
+    assert decision.can_launch is (expected is None)
+    if case == "admission_barrier":
+        assert not controller._async_admission_barrier_requested
+        controller._async_admission_barrier_requested = True
 
     assert controller._async_scheduling_disabled_reason(allow_mtp=allow_mtp) == expected
     if case == "admission_barrier":
