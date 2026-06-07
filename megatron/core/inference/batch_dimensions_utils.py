@@ -144,6 +144,7 @@ class InferenceBatchDimensions:
         local_batch_dims,
         ep_group: Optional[torch.distributed.ProcessGroup] = None,
         ep_zmq_communicator=None,
+        ep_async_protocol=None,
     ) -> Optional["InferenceBatchDimensions"]:
         """Adjust CUDA graph batch dimensions for expert parallelism.
 
@@ -162,6 +163,8 @@ class InferenceBatchDimensions:
                       (no GPU kernel, no H2D/D2H), avoiding a per-step NCCL AllReduce
                       on the compute stream. When absent, falls back to
                       torch.distributed.all_reduce on a GPU tensor.
+            ep_async_protocol: Optional EPAsyncStepProtocol used to tag the graph-shape
+                      reduction inside a coordinator-driven async EP work step.
 
         Returns:
             InferenceBatchDimensions with max token count, or None for eager mode.
@@ -172,7 +175,14 @@ class InferenceBatchDimensions:
 
         is_non_decode = local_batch_dims.prefill_req_count > 0
 
-        if ep_zmq_communicator is not None:
+        if ep_async_protocol is not None and ep_async_protocol.enabled:
+            from megatron.core.inference.ep_async_protocol import EPAsyncPhase
+
+            # CPU-only tagged sync via the EP async protocol.
+            (max_token_count, max_is_non_decode) = ep_async_protocol.sync_all_reduce_max(
+                EPAsyncPhase.GRAPH_SHAPE, local_batch_dims.token_count, int(is_non_decode)
+            )
+        elif ep_zmq_communicator is not None:
             # CPU-only sync via ZMQ: avoids a NCCL AllReduce kernel on the
             # compute stream plus the H2D/D2H pair that sandwiches it.
             (max_token_count, max_is_non_decode) = ep_zmq_communicator.sync_all_reduce_max(
@@ -625,6 +635,7 @@ class CUDAGraphBatchDimensionBuilder:
         strict: bool = False,
         ep_group: Optional[torch.distributed.ProcessGroup] = None,
         ep_zmq_communicator=None,
+        ep_async_protocol=None,
         match_ep_token_counts: bool = True,
     ) -> Optional[InferenceBatchDimensions]:
         """
@@ -645,6 +656,7 @@ class CUDAGraphBatchDimensionBuilder:
                       provided, batch-dimension MAX reduction uses a CPU-only ZMQ sync
                       instead of a GPU NCCL AllReduce. Forwarded to
                       adjust_batch_dims_for_expert_parallelism.
+            ep_async_protocol: Optional EPAsyncStepProtocol used to tag graph-shape sync.
             match_ep_token_counts: If True (default), token counts are synced across EP ranks via
                 all-reduce-max so all ranks select the same CUDA graph. Set to False when the
                 dispatcher handles per-rank token variation internally (e.g. AGV/RSV in the NVLS
@@ -661,7 +673,10 @@ class CUDAGraphBatchDimensionBuilder:
             # NCCL dispatcher: all EP ranks must select the same CUDA graph. Sync batch dims
             # across the EP group so graph selection is consistent.
             adjusted_batch_dim = InferenceBatchDimensions.adjust_batch_dims_for_expert_parallelism(
-                real_batch_dim, ep_group=ep_group, ep_zmq_communicator=ep_zmq_communicator
+                real_batch_dim,
+                ep_group=ep_group,
+                ep_zmq_communicator=ep_zmq_communicator,
+                ep_async_protocol=ep_async_protocol,
             )
 
             if adjusted_batch_dim is None:

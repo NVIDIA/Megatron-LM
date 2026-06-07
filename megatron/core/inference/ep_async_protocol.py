@@ -11,6 +11,7 @@ class EPAsyncPhase(str, Enum):
     WORK_CONSENSUS_ACK = "ep_work_consensus_ack"
     STEP_COMPLETE = "ep_step_complete"
     STEP_COMPLETE_ACK = "ep_step_complete_ack"
+    GRAPH_SHAPE = "ep_graph_shape"
     STEP_BEGIN = "ep_step_begin"
     STEP_BEGIN_ACK = "ep_step_begin_ack"
     ASYNC_HANDOFF = "ep_async_handoff"
@@ -34,6 +35,7 @@ class EPStepBeginDecision:
     has_real_work: bool
     reuse_pending_forward: bool
     discard_pending_forward: bool
+    row_mapped_forward: bool
 
 
 @dataclass(frozen=True)
@@ -144,6 +146,24 @@ class EPAsyncStepProtocol:
     def _sync_ack_at_step(self, phase: EPAsyncPhase, step_id: int) -> None:
         self._sync_all_reduce_max_at_step(phase, step_id, 1)
 
+    async def all_reduce_max(
+        self, phase: EPAsyncPhase, *local_vals: int, async_op: bool = True
+    ) -> int | tuple[int, ...]:
+        """Run a tagged EP MAX collective for an async call site."""
+
+        if len(local_vals) == 0:
+            raise ValueError("EP async protocol all_reduce_max requires at least one value")
+        step_id = self._step_id_for_phase(phase)
+        return await self._all_reduce_max_at_step(phase, step_id, *local_vals, async_op=async_op)
+
+    def sync_all_reduce_max(self, phase: EPAsyncPhase, *local_vals: int) -> int | tuple[int, ...]:
+        """Run a tagged EP MAX collective for a synchronous call site."""
+
+        if len(local_vals) == 0:
+            raise ValueError("EP async protocol sync_all_reduce_max requires at least one value")
+        step_id = self._step_id_for_phase(phase)
+        return self._sync_all_reduce_max_at_step(phase, step_id, *local_vals)
+
     async def establish_work_consensus(
         self, local_work: int, signal_consensus: bool, *, async_op: bool = True
     ) -> EPWorkConsensus:
@@ -189,6 +209,7 @@ class EPAsyncStepProtocol:
         has_real_work: bool,
         has_pending_forward: bool,
         pending_forward_reusable: bool,
+        pending_forward_row_mapped: bool = False,
     ) -> EPStepBeginDecision:
         """Synchronize pending async state at the start of an EP work step."""
 
@@ -196,6 +217,7 @@ class EPAsyncStepProtocol:
         local_real = int(has_real_work)
         local_pending_forward = int(has_pending_forward)
         local_reusable = int(has_pending_forward and pending_forward_reusable)
+        local_row_mapped = int(has_pending_forward and pending_forward_row_mapped)
         local_discard = int(has_pending_forward and not pending_forward_reusable)
         local_real_missing_forward = int(has_real_work and not has_pending_forward)
 
@@ -203,6 +225,7 @@ class EPAsyncStepProtocol:
             any_real,
             any_pending_forward,
             any_reusable,
+            any_row_mapped,
             any_discard,
             any_real_missing_forward,
         ) = self._sync_all_reduce_max_at_step(
@@ -211,6 +234,7 @@ class EPAsyncStepProtocol:
             local_real,
             local_pending_forward,
             local_reusable,
+            local_row_mapped,
             local_discard,
             local_real_missing_forward,
         )
@@ -233,6 +257,7 @@ class EPAsyncStepProtocol:
             has_real_work=bool(any_real),
             reuse_pending_forward=reuse_pending_forward,
             discard_pending_forward=discard_pending_forward,
+            row_mapped_forward=bool(any_row_mapped and reuse_pending_forward),
         )
 
     def decide_async_handoff(

@@ -12,6 +12,11 @@ from megatron.core.inference.async_scheduling import (
     AsyncRowMap,
     AsyncTransactionState,
 )
+from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
+from megatron.core.inference.ep_async_protocol import EPAsyncPhase, EPAsyncStepProtocol
+from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+    TextGenerationController,
+)
 
 
 def _plan(request_ids):
@@ -146,3 +151,94 @@ def test_kv_lease_records_reserved_blocks():
 
     assert lease.has_reservations
     assert lease.reserved_block_ids.tolist() == [100, 101]
+
+
+class _RecordingEPCommunicator:
+    def __init__(self, *, sync_results=(), world_size=2):
+        self.sync_results = list(sync_results)
+        self.world_size = world_size
+        self.protocol_mismatch_count = 0
+        self.calls = []
+
+    def sync_all_reduce_max(self, *values, phase=None, step_id=None):
+        self.calls.append((EPAsyncPhase(phase), step_id, tuple(values)))
+        if self.sync_results:
+            return self.sync_results.pop(0)
+        return values[0] if len(values) == 1 else tuple(values)
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize(
+    ("global_state", "expected"),
+    [
+        ((1, 1, 1, 0, 0, 0), (True, False, False)),
+        ((1, 1, 1, 1, 0, 0), (True, False, True)),
+        ((1, 1, 0, 0, 1, 0), (False, True, False)),
+        ((1, 1, 1, 0, 0, 1), (False, True, False)),
+    ],
+)
+def test_ep_step_begin_agrees_on_row_mapped_reuse(global_state, expected):
+    communicator = _RecordingEPCommunicator(sync_results=[global_state, 1])
+    protocol = EPAsyncStepProtocol(communicator)
+
+    decision = protocol.decide_step_begin(
+        has_real_work=True,
+        has_pending_forward=True,
+        pending_forward_reusable=True,
+        pending_forward_row_mapped=bool(global_state[3]),
+    )
+
+    assert (
+        decision.reuse_pending_forward,
+        decision.discard_pending_forward,
+        decision.row_mapped_forward,
+    ) == expected
+    assert communicator.calls == [
+        (
+            EPAsyncPhase.STEP_BEGIN,
+            0,
+            (1, 1, 1, int(bool(global_state[3])), 0, 0),
+        ),
+        (EPAsyncPhase.STEP_BEGIN_ACK, 0, (1,)),
+    ]
+
+
+@pytest.mark.internal
+def test_ep_graph_shape_sync_uses_protocol_tag(monkeypatch):
+    communicator = _RecordingEPCommunicator(sync_results=[(16, 0)])
+    protocol = EPAsyncStepProtocol(communicator)
+    monkeypatch.setattr("megatron.core.inference.batch_dimensions_utils.get_pg_size", lambda _: 2)
+
+    adjusted = InferenceBatchDimensions.adjust_batch_dims_for_expert_parallelism(
+        InferenceBatchDimensions(8, 0, 4),
+        ep_group=object(),
+        ep_async_protocol=protocol,
+    )
+
+    assert adjusted == InferenceBatchDimensions(16, 0, 4)
+    assert communicator.calls == [(EPAsyncPhase.GRAPH_SHAPE, 0, (8, 0))]
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize("materialize_only_last_token_logits", [False, True])
+def test_controller_required_logits_uses_pending_row_indices(materialize_only_last_token_logits):
+    logits = torch.arange(1 * 4 * 3, dtype=torch.float32).view(1, 4, 3)
+    context = SimpleNamespace(
+        total_request_count=2,
+        paused_request_count=0,
+        padded_active_token_count=4,
+        config=SimpleNamespace(
+            materialize_only_last_token_logits=materialize_only_last_token_logits
+        ),
+        is_decode_only=lambda: True,
+    )
+    controller = SimpleNamespace(
+        inference_wrapped_model=SimpleNamespace(inference_context=context),
+        _all_logits_cuda=logits,
+    )
+
+    selected = TextGenerationController._dynamic_step_required_token_logits(
+        controller, row_indices=torch.tensor([1, 3])
+    )
+
+    assert torch.equal(selected, logits.squeeze(0).index_select(0, torch.tensor([1, 3])))
