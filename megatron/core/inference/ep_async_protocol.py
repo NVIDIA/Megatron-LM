@@ -144,6 +144,15 @@ class EPAsyncStepProtocol:
     def _sync_ack_at_step(self, phase: EPAsyncPhase, step_id: int) -> None:
         self._sync_all_reduce_max_at_step(phase, step_id, 1)
 
+    def _sync_reduce_with_ack(
+        self, phase: EPAsyncPhase, ack_phase: EPAsyncPhase, *local_vals: int
+    ) -> tuple[int, int | tuple[int, ...]]:
+        """Run one synchronous phase collective and its tagged acknowledgement."""
+        step_id = self._step_id_for_phase(phase)
+        result = self._sync_all_reduce_max_at_step(phase, step_id, *local_vals)
+        self._sync_ack_at_step(ack_phase, step_id)
+        return step_id, result
+
     async def all_reduce_max(
         self, phase: EPAsyncPhase, *local_vals: int, async_op: bool = True
     ) -> int | tuple[int, ...]:
@@ -196,7 +205,7 @@ class EPAsyncStepProtocol:
             self._idle_completion_count += 1
         self._finish_ep_step()
 
-    def decide_step_begin(
+    def begin_step(
         self,
         *,
         has_real_work: bool,
@@ -205,7 +214,6 @@ class EPAsyncStepProtocol:
         pending_forward_row_mapped: bool,
     ) -> EPStepBeginDecision:
         """Synchronize per-rank pending async state at the start of an EP work step."""
-        step_id = self._step_id_for_phase(EPAsyncPhase.STEP_BEGIN)
         local_real = int(has_real_work)
         local_pending_forward = int(has_pending_forward)
         local_reusable = int(has_pending_forward and pending_forward_reusable)
@@ -214,15 +222,18 @@ class EPAsyncStepProtocol:
         local_real_missing_forward = int(has_real_work and not has_pending_forward)
 
         (
-            any_real,
-            any_pending_forward,
-            any_reusable,
-            any_row_mapped,
-            any_discard,
-            any_real_missing_forward,
-        ) = self._sync_all_reduce_max_at_step(
-            EPAsyncPhase.STEP_BEGIN,
             step_id,
+            (
+                any_real,
+                any_pending_forward,
+                any_reusable,
+                any_row_mapped,
+                any_discard,
+                any_real_missing_forward,
+            ),
+        ) = self._sync_reduce_with_ack(
+            EPAsyncPhase.STEP_BEGIN,
+            EPAsyncPhase.STEP_BEGIN_ACK,
             local_real,
             local_pending_forward,
             local_reusable,
@@ -230,7 +241,6 @@ class EPAsyncStepProtocol:
             local_discard,
             local_real_missing_forward,
         )
-        self._sync_ack_at_step(EPAsyncPhase.STEP_BEGIN_ACK, step_id)
 
         reuse_pending_forward = bool(
             any_pending_forward
@@ -252,19 +262,41 @@ class EPAsyncStepProtocol:
             row_mapped_forward=bool(any_row_mapped and reuse_pending_forward),
         )
 
-    def decide_async_handoff(
+    def decide_step_begin(
+        self,
+        *,
+        has_real_work: bool,
+        has_pending_forward: bool,
+        pending_forward_reusable: bool,
+        pending_forward_row_mapped: bool,
+    ) -> EPStepBeginDecision:
+        """Compatibility wrapper for callers using the pre-coordinator API."""
+        return self.begin_step(
+            has_real_work=has_real_work,
+            has_pending_forward=has_pending_forward,
+            pending_forward_reusable=pending_forward_reusable,
+            pending_forward_row_mapped=pending_forward_row_mapped,
+        )
+
+    def decide_launch(
         self, *, has_real_work: bool, can_launch_async_handoff: bool
     ) -> EPAsyncHandoffDecision:
         """Synchronize whether the current EP work step launches an async forward."""
-        step_id = self._step_id_for_phase(EPAsyncPhase.ASYNC_HANDOFF)
         local_real = int(has_real_work)
         local_launch = int(has_real_work and can_launch_async_handoff)
         local_real_skip = int(has_real_work and not can_launch_async_handoff)
 
-        any_real, any_launch, any_real_skip = self._sync_all_reduce_max_at_step(
-            EPAsyncPhase.ASYNC_HANDOFF, step_id, local_real, local_launch, local_real_skip
+        step_id, (
+            any_real,
+            any_launch,
+            any_real_skip,
+        ) = self._sync_reduce_with_ack(
+            EPAsyncPhase.ASYNC_HANDOFF,
+            EPAsyncPhase.ASYNC_HANDOFF_ACK,
+            local_real,
+            local_launch,
+            local_real_skip,
         )
-        self._sync_ack_at_step(EPAsyncPhase.ASYNC_HANDOFF_ACK, step_id)
         launch_async_forward = bool(any_launch and not any_real_skip)
         if launch_async_forward:
             self._async_handoff_launch_count += 1
@@ -279,3 +311,20 @@ class EPAsyncStepProtocol:
             any_launch_request=bool(any_launch),
             any_skip_request=bool(any_real_skip),
         )
+
+    def decide_async_handoff(
+        self, *, has_real_work: bool, can_launch_async_handoff: bool
+    ) -> EPAsyncHandoffDecision:
+        """Compatibility wrapper for callers using the pre-coordinator API."""
+        return self.decide_launch(
+            has_real_work=has_real_work,
+            can_launch_async_handoff=can_launch_async_handoff,
+        )
+
+    async def complete_step(self, *, async_op: bool = True) -> None:
+        """Phase-centered alias for completing the active EP work step."""
+        await self.complete_work_step(async_op=async_op)
+
+
+class EPAsyncCoordinator(EPAsyncStepProtocol):
+    """Phase-centered name for EP async step coordination."""

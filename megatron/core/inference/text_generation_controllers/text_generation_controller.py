@@ -2037,7 +2037,10 @@ class TextGenerationController:
             )
 
         if self._ep_async_protocol is not None and self._ep_async_protocol.enabled:
-            return self._ep_async_protocol.decide_step_begin(
+            begin_step = getattr(self._ep_async_protocol, "begin_step", None)
+            if begin_step is None:
+                begin_step = self._ep_async_protocol.decide_step_begin
+            return begin_step(
                 has_real_work=has_real_work,
                 has_pending_forward=has_pending_forward,
                 pending_forward_reusable=pending_forward_reusable,
@@ -2063,7 +2066,10 @@ class TextGenerationController:
 
         self._ep_async_handoff_decided_this_step = True
         if self._ep_async_protocol is not None and self._ep_async_protocol.enabled:
-            decision = self._ep_async_protocol.decide_async_handoff(
+            decide_launch = getattr(self._ep_async_protocol, "decide_launch", None)
+            if decide_launch is None:
+                decide_launch = self._ep_async_protocol.decide_async_handoff
+            decision = decide_launch(
                 has_real_work=has_real_work, can_launch_async_handoff=can_launch_async_handoff
             )
             self._ep_async_handoff_decision_this_step = decision
