@@ -2487,7 +2487,27 @@ class DynamicInferenceContext(BaseInferenceContext):
             return False
         return torch.equal(self.request_kv_length_offsets[active_slice], plan.kv_length_offsets)
 
-    def async_decode_next_step_skip_reason(self) -> Optional[str]:
+    def active_request_metadata_needs_logprob_results(
+        self, active_request_count: Optional[int] = None
+    ) -> bool:
+        """Return whether current active requests need generated logprob results."""
+
+        active_request_count = (
+            self.total_request_count - self.paused_request_count
+            if active_request_count is None
+            else active_request_count
+        )
+        if active_request_count <= 0:
+            return False
+        active_slice = slice(0, active_request_count)
+        return bool(
+            self.active_request_metadata["return_log_probs"][active_slice].any().item()
+            or (self.active_request_metadata["top_n_logprobs"][active_slice] > 0).any().item()
+        )
+
+    def async_decode_next_step_skip_reason(
+        self, *, skip_bookkeeping: bool = False, active_stop_words: bool = False
+    ) -> Optional[str]:
         """Return why a no-reject async decode child cannot launch locally."""
 
         if not self.enable_async_scheduling:
@@ -2496,6 +2516,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             return "skip_reserved_kv_pending"
         if self.num_speculative_tokens != 0:
             return "skip_mtp"
+        if skip_bookkeeping:
+            return "skip_bookkeeping"
         if not self.is_decode_only():
             return "skip_not_decode"
         if self.paused_request_count != 0:
@@ -2506,6 +2528,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         active_request_count = self.total_request_count - self.paused_request_count
         if active_request_count <= 0:
             return "skip_no_active"
+        if self.active_request_metadata_needs_logprob_results(active_request_count):
+            return "skip_logprob_results"
+        if active_stop_words:
+            return "skip_stop_words"
 
         active_slice = slice(self.paused_request_count, self.total_request_count)
         current_offsets = self.request_kv_length_offsets[active_slice]
@@ -2591,13 +2617,17 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_seqlen_k=max_seqlen_k,
         )
 
-    def prepare_async_decode_next_step(self) -> bool:
+    def prepare_async_decode_next_step(
+        self, *, skip_bookkeeping: bool = False, active_stop_words: bool = False
+    ) -> bool:
         """Prepare next-step decode metadata without mutating request rows."""
 
         self.clear_async_prepared_decode_plan()
         self.record_async_scheduling_counter("prepare_attempt")
 
-        skip_reason = self.async_decode_next_step_skip_reason()
+        skip_reason = self.async_decode_next_step_skip_reason(
+            skip_bookkeeping=skip_bookkeeping, active_stop_words=active_stop_words
+        )
         if skip_reason is not None:
             self.record_async_scheduling_counter(skip_reason)
             return False

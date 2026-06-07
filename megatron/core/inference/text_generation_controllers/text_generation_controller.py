@@ -1237,9 +1237,8 @@ class TextGenerationController:
 
         if not self._async_logprob_requests_seen:
             return False
-
-        return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
-        return bool(return_log_probs or return_top_n_logprobs)
+        context = self.inference_wrapped_model.inference_context
+        return context.active_request_metadata_needs_logprob_results()
 
     def _should_collect_dynamic_logprob_bookkeeping(
         self, *, async_next_prepared: bool, pending_forward_reused: bool
@@ -2130,16 +2129,11 @@ class TextGenerationController:
         """Prepare next-step metadata when the child layout is deterministic."""
 
         context = self.inference_wrapped_model.inference_context
-        if (
-            not context.config.enable_async_scheduling
-            or self.num_speculative_tokens != 0
-            or self._active_requests_need_logprob_results()
-            or skip_bookkeeping
-            or self._active_requests_have_stop_words()
-        ):
-            return False
 
-        return context.prepare_async_decode_next_step()
+        return context.prepare_async_decode_next_step(
+            skip_bookkeeping=skip_bookkeeping,
+            active_stop_words=self._active_requests_have_stop_words(),
+        )
 
     def _launch_async_prepared_decode_forward(
         self, active_request_count: int
