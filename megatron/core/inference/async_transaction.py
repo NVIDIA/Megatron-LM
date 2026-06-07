@@ -339,3 +339,168 @@ class AsyncStepTransaction:
     def is_in_flight(self) -> bool:
         """Whether the transaction still represents a pending async forward."""
         return self.state in (AsyncTxnState.PREPARED, AsyncTxnState.LAUNCHED, AsyncTxnState.RESOLVED)
+
+
+@dataclass(frozen=True)
+class AsyncSampleTicket:
+    """References the sample buffers and fences for one async readback slot."""
+
+    slot: int
+    active_request_count: int
+    sampled_tokens_cuda: object
+    sample_values_cuda: object | None
+    sampled_tokens_cpu: object
+    sampled_mtp_tokens_cuda: object | None = None
+    sampled_mtp_tokens_cpu: object | None = None
+    source_ready_event: object | None = None
+    copy_done_event: object | None = None
+    copy_stream: object | None = None
+
+
+@dataclass
+class AsyncSampleReadback:
+    """Owns CUDA/CPU sample slots and asynchronous sample-copy fences."""
+
+    sample_slot_count: int
+    current_sample_slot: int
+    sampled_tokens_cuda_slots: object
+    sample_values_cuda_slots: object
+    sampled_tokens_cpu_slots: object
+    source_ready_events: tuple[object, ...]
+    copy_done_events: tuple[object, ...]
+    copy_stream: object
+    sampled_mtp_tokens_cuda_slots: object | None = None
+    sampled_mtp_tokens_cpu_slots: object | None = None
+
+    @classmethod
+    def allocate(
+        cls,
+        *,
+        sample_slot_count: int,
+        max_requests: int,
+        logits_dtype: torch.dtype,
+        device: object,
+        num_speculative_tokens: int,
+    ) -> "AsyncSampleReadback":
+        """Allocate the stable sample buffers used by async decode."""
+        sampled_tokens_cuda_slots = torch.empty(
+            (sample_slot_count, max_requests), dtype=torch.int64, device=device
+        )
+        sample_values_cuda_slots = torch.empty(
+            (sample_slot_count, max_requests), dtype=logits_dtype, device=device
+        )
+        sampled_tokens_cpu_slots = torch.empty(
+            (sample_slot_count, max_requests),
+            dtype=torch.int64,
+            device="cpu",
+            pin_memory=True,
+        )
+        sampled_mtp_tokens_cuda_slots = None
+        sampled_mtp_tokens_cpu_slots = None
+        if num_speculative_tokens > 0:
+            sampled_mtp_tokens_cuda_slots = torch.empty(
+                [sample_slot_count, num_speculative_tokens, max_requests],
+                dtype=torch.int64,
+                device=device,
+            )
+            sampled_mtp_tokens_cpu_slots = torch.empty(
+                [sample_slot_count, num_speculative_tokens, max_requests],
+                dtype=torch.int64,
+                device="cpu",
+                pin_memory=True,
+            )
+        return cls(
+            sample_slot_count=sample_slot_count,
+            current_sample_slot=0,
+            sampled_tokens_cuda_slots=sampled_tokens_cuda_slots,
+            sample_values_cuda_slots=sample_values_cuda_slots,
+            sampled_tokens_cpu_slots=sampled_tokens_cpu_slots,
+            sampled_mtp_tokens_cuda_slots=sampled_mtp_tokens_cuda_slots,
+            sampled_mtp_tokens_cpu_slots=sampled_mtp_tokens_cpu_slots,
+            source_ready_events=tuple(torch.cuda.Event() for _ in range(sample_slot_count)),
+            copy_done_events=tuple(torch.cuda.Event() for _ in range(sample_slot_count)),
+            copy_stream=torch.cuda.Stream(device=device),
+        )
+
+    def select_slot(
+        self, sample_slot: int, *, num_speculative_tokens: int
+    ) -> AsyncSampleTicket:
+        """Select a readback slot and return references to its buffers and fences."""
+        if sample_slot < 0 or sample_slot >= self.sample_slot_count:
+            raise IndexError(f"async sample slot {sample_slot} is outside slot count")
+        self.current_sample_slot = sample_slot
+        sampled_mtp_tokens_cuda = None
+        sampled_mtp_tokens_cpu = None
+        if num_speculative_tokens > 0:
+            if self.sampled_mtp_tokens_cuda_slots is not None:
+                sampled_mtp_tokens_cuda = self.sampled_mtp_tokens_cuda_slots[sample_slot]
+            if self.sampled_mtp_tokens_cpu_slots is not None:
+                sampled_mtp_tokens_cpu = self.sampled_mtp_tokens_cpu_slots[sample_slot]
+        return AsyncSampleTicket(
+            slot=sample_slot,
+            active_request_count=0,
+            sampled_tokens_cuda=self.sampled_tokens_cuda_slots[sample_slot],
+            sample_values_cuda=self.sample_values_cuda_slots[sample_slot],
+            sampled_tokens_cpu=self.sampled_tokens_cpu_slots[sample_slot],
+            sampled_mtp_tokens_cuda=sampled_mtp_tokens_cuda,
+            sampled_mtp_tokens_cpu=sampled_mtp_tokens_cpu,
+            source_ready_event=self.source_ready_events[sample_slot],
+            copy_done_event=self.copy_done_events[sample_slot],
+            copy_stream=self.copy_stream,
+        )
+
+    def transfer_to_cpu(
+        self,
+        *,
+        active_request_count: int,
+        num_speculative_tokens: int,
+        sample_source_ready_event: object | None = None,
+        sample_slot: int | None = None,
+    ) -> AsyncSampleTicket:
+        """Copy sampled tokens to pinned CPU memory without blocking the default stream."""
+        sample_slot = self.current_sample_slot if sample_slot is None else sample_slot
+        ticket = self.select_slot(sample_slot, num_speculative_tokens=num_speculative_tokens)
+        if sample_source_ready_event is None:
+            current_stream = torch.cuda.current_stream()
+            sample_source_ready_event = ticket.source_ready_event
+            sample_source_ready_event.record(current_stream)
+
+        with torch.cuda.stream(self.copy_stream):
+            self.copy_stream.wait_event(sample_source_ready_event)
+            self.sampled_tokens_cpu_slots[sample_slot, :active_request_count].copy_(
+                self.sampled_tokens_cuda_slots[sample_slot, :active_request_count],
+                non_blocking=True,
+            )
+            sampled_mtp_tokens_cpu = None
+            if num_speculative_tokens > 0:
+                self.sampled_mtp_tokens_cpu_slots[
+                    sample_slot, :, :active_request_count
+                ].copy_(
+                    self.sampled_mtp_tokens_cuda_slots[
+                        sample_slot, :, :active_request_count
+                    ],
+                    non_blocking=True,
+                )
+                sampled_mtp_tokens_cpu = self.sampled_mtp_tokens_cpu_slots[
+                    sample_slot, :, :active_request_count
+                ]
+            ticket.copy_done_event.record(self.copy_stream)
+
+        return AsyncSampleTicket(
+            slot=sample_slot,
+            active_request_count=active_request_count,
+            sampled_tokens_cuda=self.sampled_tokens_cuda_slots[sample_slot],
+            sample_values_cuda=self.sample_values_cuda_slots[sample_slot],
+            sampled_tokens_cpu=self.sampled_tokens_cpu_slots[
+                sample_slot, :active_request_count
+            ],
+            sampled_mtp_tokens_cuda=(
+                self.sampled_mtp_tokens_cuda_slots[sample_slot]
+                if num_speculative_tokens > 0
+                else None
+            ),
+            sampled_mtp_tokens_cpu=sampled_mtp_tokens_cpu,
+            source_ready_event=sample_source_ready_event,
+            copy_done_event=ticket.copy_done_event,
+            copy_stream=self.copy_stream,
+        )

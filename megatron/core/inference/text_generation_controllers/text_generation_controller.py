@@ -18,6 +18,8 @@ from megatron.core import parallel_state
 from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.async_transaction import (
     AsyncLayoutSnapshot,
+    AsyncSampleReadback,
+    AsyncSampleTicket,
     AsyncStepTransaction,
     AsyncTxnState,
 )
@@ -227,6 +229,7 @@ class TextGenerationController:
         self._async_pause_boundary_count = 0
         self._async_evict_boundary_count = 0
         self._async_prepare_deferred_until_after_sampling = False
+        self._async_sample_readback = None
         self._async_sample_slot_count = 2
         self._async_current_sample_slot = 0
         self._request_sampling_rngs: Dict[int, torch.Generator] = {}
@@ -241,32 +244,14 @@ class TextGenerationController:
             )
         else:
             self._all_logits_cuda = None
-        self._sampled_tokens_cuda_slots = torch.empty(
-            (self._async_sample_slot_count, max_requests), dtype=torch.int64, device=device
+        self._async_sample_readback = AsyncSampleReadback.allocate(
+            sample_slot_count=self._async_sample_slot_count,
+            max_requests=max_requests,
+            logits_dtype=logits_dtype,
+            device=device,
+            num_speculative_tokens=self.num_speculative_tokens,
         )
-        self._async_sample_values_cuda_slots = torch.empty(
-            (self._async_sample_slot_count, max_requests), dtype=logits_dtype, device=device
-        )
-        self._async_sampled_tokens_cpu_slots = torch.empty(
-            (self._async_sample_slot_count, max_requests),
-            dtype=torch.int64,
-            device='cpu',
-            pin_memory=True,
-        )
-        self._sampled_mtp_tokens_cuda_slots = None
-        self._async_sampled_mtp_tokens_cpu_slots = None
-        self._sampled_tokens_cuda = self._sampled_tokens_cuda_slots[0]
-        self._async_sample_values_cuda = self._async_sample_values_cuda_slots[0]
-        self._async_sampled_tokens_cpu = self._async_sampled_tokens_cpu_slots[0]
-        self._async_sample_source_ready_events = tuple(
-            torch.cuda.Event() for _ in range(self._async_sample_slot_count)
-        )
-        self._async_sample_ready_events = tuple(
-            torch.cuda.Event() for _ in range(self._async_sample_slot_count)
-        )
-        self._async_sample_source_ready_event = self._async_sample_source_ready_events[0]
-        self._async_sample_ready_event = self._async_sample_ready_events[0]
-        self._async_copy_stream = torch.cuda.Stream(device=device)
+        self._install_async_sample_readback_shims()
 
         # Sampling backend: provides the sampling kernel.
         if self._sampling_backend == "flashinfer":
@@ -303,17 +288,9 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         max_requests = context.max_requests
         device = torch.cuda.current_device()
-        self._sampled_mtp_tokens_cuda_slots = torch.empty(
-            [self._async_sample_slot_count, self.num_speculative_tokens, max_requests],
-            dtype=torch.int64,
-            device=device,
-        )
-        self._async_sampled_mtp_tokens_cpu_slots = torch.empty(
-            [self._async_sample_slot_count, self.num_speculative_tokens, max_requests],
-            dtype=torch.int64,
-            device='cpu',
-            pin_memory=True,
-        )
+        readback = self._ensure_async_sample_readback()
+        self._sampled_mtp_tokens_cuda_slots = readback.sampled_mtp_tokens_cuda_slots
+        self._async_sampled_mtp_tokens_cpu_slots = readback.sampled_mtp_tokens_cpu_slots
         self._sampled_mtp_tokens_cuda = self._sampled_mtp_tokens_cuda_slots[0]
         self._async_sampled_mtp_tokens_cpu = self._async_sampled_mtp_tokens_cpu_slots[0]
         self._accepted_tokens_per_request = (
@@ -334,19 +311,59 @@ class TextGenerationController:
             [1, max_requests], dtype=torch.int64, device=device
         )
 
-    def _select_async_sample_slot(self, sample_slot: int) -> None:
+    def _ensure_async_sample_readback(self) -> AsyncSampleReadback:
+        """Return the readback owner, creating it from legacy aliases when needed."""
+        readback = getattr(self, "_async_sample_readback", None)
+        if readback is not None:
+            return readback
+        readback = AsyncSampleReadback(
+            sample_slot_count=getattr(self, "_async_sample_slot_count", 2),
+            current_sample_slot=getattr(self, "_async_current_sample_slot", 0),
+            sampled_tokens_cuda_slots=self._sampled_tokens_cuda_slots,
+            sample_values_cuda_slots=self._async_sample_values_cuda_slots,
+            sampled_tokens_cpu_slots=self._async_sampled_tokens_cpu_slots,
+            sampled_mtp_tokens_cuda_slots=getattr(self, "_sampled_mtp_tokens_cuda_slots", None),
+            sampled_mtp_tokens_cpu_slots=getattr(
+                self, "_async_sampled_mtp_tokens_cpu_slots", None
+            ),
+            source_ready_events=self._async_sample_source_ready_events,
+            copy_done_events=self._async_sample_ready_events,
+            copy_stream=getattr(self, "_async_copy_stream", None),
+        )
+        self._async_sample_readback = readback
+        return readback
+
+    def _install_async_sample_readback_shims(self) -> None:
+        """Install temporary compatibility aliases for the readback-owned fields."""
+        readback = self._ensure_async_sample_readback()
+        self._async_sample_slot_count = readback.sample_slot_count
+        self._async_current_sample_slot = readback.current_sample_slot
+        self._sampled_tokens_cuda_slots = readback.sampled_tokens_cuda_slots
+        self._async_sample_values_cuda_slots = readback.sample_values_cuda_slots
+        self._async_sampled_tokens_cpu_slots = readback.sampled_tokens_cpu_slots
+        self._sampled_mtp_tokens_cuda_slots = readback.sampled_mtp_tokens_cuda_slots
+        self._async_sampled_mtp_tokens_cpu_slots = readback.sampled_mtp_tokens_cpu_slots
+        self._async_sample_source_ready_events = readback.source_ready_events
+        self._async_sample_ready_events = readback.copy_done_events
+        self._async_copy_stream = readback.copy_stream
+
+    def _select_async_sample_slot(self, sample_slot: int) -> AsyncSampleTicket:
         """Select the sampled-token buffers used by subsequent GPU sampling operations."""
-        self._async_current_sample_slot = sample_slot
-        self._sampled_tokens_cuda = self._sampled_tokens_cuda_slots[sample_slot]
-        self._async_sample_values_cuda = self._async_sample_values_cuda_slots[sample_slot]
-        self._async_sampled_tokens_cpu = self._async_sampled_tokens_cpu_slots[sample_slot]
-        self._async_sample_source_ready_event = self._async_sample_source_ready_events[sample_slot]
-        self._async_sample_ready_event = self._async_sample_ready_events[sample_slot]
+        readback = self._ensure_async_sample_readback()
+        ticket = readback.select_slot(
+            sample_slot, num_speculative_tokens=self.num_speculative_tokens
+        )
+        self._install_async_sample_readback_shims()
+        self._async_current_sample_slot = readback.current_sample_slot
+        self._sampled_tokens_cuda = ticket.sampled_tokens_cuda
+        self._async_sample_values_cuda = ticket.sample_values_cuda
+        self._async_sampled_tokens_cpu = ticket.sampled_tokens_cpu
+        self._async_sample_source_ready_event = ticket.source_ready_event
+        self._async_sample_ready_event = ticket.copy_done_event
         if self.num_speculative_tokens > 0:
-            self._sampled_mtp_tokens_cuda = self._sampled_mtp_tokens_cuda_slots[sample_slot]
-            self._async_sampled_mtp_tokens_cpu = self._async_sampled_mtp_tokens_cpu_slots[
-                sample_slot
-            ]
+            self._sampled_mtp_tokens_cuda = ticket.sampled_mtp_tokens_cuda
+            self._async_sampled_mtp_tokens_cpu = ticket.sampled_mtp_tokens_cpu
+        return ticket
 
     @staticmethod
     def tokenize_prompt(tokenizer, prompt: str, add_BOS: bool = False) -> List[int]:
@@ -2190,39 +2207,32 @@ class TextGenerationController:
         active_request_count: int,
         sample_source_ready_event: Optional[torch.cuda.Event] = None,
         sample_slot: Optional[int] = None,
-    ) -> Tuple[Tensor, Optional[Tensor], torch.cuda.Event]:
+    ) -> AsyncSampleTicket:
         """Copy sampled tokens to pinned CPU memory without blocking the default stream."""
-        sample_slot = self._async_current_sample_slot if sample_slot is None else sample_slot
-        sampled_tokens_cuda = self._sampled_tokens_cuda_slots[sample_slot]
-        sampled_tokens_cpu = self._async_sampled_tokens_cpu_slots[sample_slot]
-        if sample_source_ready_event is None:
-            current_stream = torch.cuda.current_stream()
-            sample_source_ready_event = self._async_sample_source_ready_events[sample_slot]
-            sample_source_ready_event.record(current_stream)
-        sample_ready_event = self._async_sample_ready_events[sample_slot]
-        with torch.cuda.stream(self._async_copy_stream):
-            self._async_copy_stream.wait_event(sample_source_ready_event)
-            sampled_tokens_cpu[:active_request_count].copy_(
-                sampled_tokens_cuda[:active_request_count], non_blocking=True
+        readback = self._ensure_async_sample_readback()
+        ticket = readback.transfer_to_cpu(
+            active_request_count=active_request_count,
+            num_speculative_tokens=self.num_speculative_tokens,
+            sample_source_ready_event=sample_source_ready_event,
+            sample_slot=sample_slot,
+        )
+        self._select_async_sample_slot(ticket.slot)
+        return ticket
+
+    @staticmethod
+    def _unpack_async_sample_ticket(
+        sample_readback_result: object,
+    ) -> Tuple[Tensor, Optional[Tensor], object, Optional[AsyncSampleTicket]]:
+        """Normalize new readback tickets and legacy tuple test doubles."""
+        if isinstance(sample_readback_result, AsyncSampleTicket):
+            return (
+                sample_readback_result.sampled_tokens_cpu,
+                sample_readback_result.sampled_mtp_tokens_cpu,
+                sample_readback_result.copy_done_event,
+                sample_readback_result,
             )
-            if self.num_speculative_tokens > 0:
-                self._async_sampled_mtp_tokens_cpu_slots[
-                    sample_slot, :, :active_request_count
-                ].copy_(
-                    self._sampled_mtp_tokens_cuda_slots[sample_slot, :, :active_request_count],
-                    non_blocking=True,
-                )
-            sample_ready_event.record(self._async_copy_stream)
-        sampled_mtp_tokens_cpu = (
-            self._async_sampled_mtp_tokens_cpu_slots[sample_slot, :, :active_request_count]
-            if self.num_speculative_tokens > 0
-            else None
-        )
-        return (
-            sampled_tokens_cpu[:active_request_count],
-            sampled_mtp_tokens_cpu,
-            sample_ready_event,
-        )
+        sampled_tokens_cpu, sampled_mtp_tokens_cpu, sample_ready_event = sample_readback_result
+        return sampled_tokens_cpu, sampled_mtp_tokens_cpu, sample_ready_event, None
 
     def _try_prepare_async_decode_before_sampling(self) -> bool:
         """Prepare steady-state next-step metadata before current-step sampling."""
@@ -3125,6 +3135,7 @@ class TextGenerationController:
         async_next_prepared = False
         async_sample_ready_event = None
         async_h2d_done_event = None
+        async_sample_ticket = None
         async_sampled_tokens_cpu = None
         async_sampled_mtp_tokens_cpu = None
         deferred_mtp_blocks_to_release = None
@@ -3313,7 +3324,10 @@ class TextGenerationController:
                     async_sampled_tokens_cpu,
                     async_sampled_mtp_tokens_cpu,
                     async_sample_ready_event,
-                ) = self._async_transfer_samples_to_cpu(active_request_count)
+                    async_sample_ticket,
+                ) = self._unpack_async_sample_ticket(
+                    self._async_transfer_samples_to_cpu(active_request_count)
+                )
                 if self._confirm_prepared_ep_async_handoff():
                     context.publish_async_prepared_decode_plan()
                     range_push("async_transfer_bookkeeping_to_gpu")
@@ -3338,7 +3352,10 @@ class TextGenerationController:
                     )
                     transaction = self._pending_async_transaction()
                     if transaction is not None:
-                        transaction.mark_launched(h2d_done_event=async_h2d_done_event)
+                        transaction.mark_launched(
+                            sample_ticket=async_sample_ticket,
+                            h2d_done_event=async_h2d_done_event,
+                        )
                     context.mark_async_forward_in_flight()
                     range_pop()
 
