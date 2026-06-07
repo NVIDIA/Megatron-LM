@@ -258,7 +258,7 @@ class MegatronLiteRuntime(RuntimeBase):
             **kwargs,
         )
 
-    def load_checkpoint(self, handle: ModelHandle, path: str, **kwargs) -> None:
+    def load_checkpoint(self, handle: ModelHandle, path: str, **kwargs) -> int:
         from megatron.lite.primitive.ckpt import load_training_checkpoint
 
         use_dcp = bool(kwargs.pop("use_dcp", False))
