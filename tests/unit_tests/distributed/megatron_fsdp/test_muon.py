@@ -287,10 +287,10 @@ def _reference_step_single(
         _build_reference_optimizer([full_p]).step()
         return full_p
 
-    g0, in_dim = full_p.shape
+    out_dim, in_dim = full_p.shape
     s = sum(QKV_SPLIT_SHAPES)
-    assert g0 % s == 0, f"QKV global dim-0 {g0} not divisible by sum(qkv_split_shapes)={s}"
-    num_query_groups = g0 // s
+    assert out_dim % s == 0, f"QKV out_dim {out_dim} not divisible by sum(qkv_split_shapes)={s}"
+    num_query_groups = out_dim // s
     p_view = full_p.view(num_query_groups, s, in_dim)
     g_view = full_g.view(num_query_groups, s, in_dim)
     p_parts = [
@@ -306,7 +306,7 @@ def _reference_step_single(
     _build_reference_optimizer(p_parts).step()
     # Re-fuse: each updated part back to (num_query_groups, qkv_dim, in_dim), cat, view.
     refused_parts = [pp.view(num_query_groups, -1, in_dim) for pp in p_parts]
-    return torch.cat(refused_parts, dim=1).reshape(g0, in_dim).contiguous()
+    return torch.cat(refused_parts, dim=1).reshape(out_dim, in_dim).contiguous()
 
 
 def _slice_dp_full_to_local(
@@ -326,17 +326,16 @@ def _slice_dp_full_to_local(
     return full_tensor[offset : offset + local_dim0].contiguous()
 
 
-def _reference_local_for_param(
+def _reference_step_for_param(
     ref_p: torch.Tensor, p_spec: dict[str, Any], dp_group: dist.ProcessGroup
 ) -> torch.Tensor:
-    """Compute one param's reference post-step local shard.
+    """Run the reference Muon step for one param; return this rank's post-step shard.
 
     For boundary params (any rank has a non-empty local that differs from the
-    global shape), gathers across DP — matching FSDP Phase 2 — runs Muon on
-    the full-tensor view, and slices the result back to this rank's local
-    shard. For non-boundary params, runs Muon directly on the local shard.
+    global shape), all-gathers across DP — matching FSDP Phase 2 — runs Muon on
+    the full-tensor view, and slices the result back to this rank's shard. For
+    non-boundary params, runs Muon directly on the local shard (no comms).
 
-    Empty local shards on non-boundary params are passed through unchanged.
     Requires ``ref_p.grad`` to be attached.
     """
     global_shape = tuple(p_spec["global_shape"])
@@ -439,7 +438,7 @@ def test_muon_step_numerics(distributed_setup: dict[str, Any]) -> None:
     # Run the replicated reference Muon. This pass only touches the reference
     # shards and the spec — it never reads `fsdp_params`.
     reference_params = [
-        _reference_local_for_param(ref_p, p_spec, dp_group)
+        _reference_step_for_param(ref_p, p_spec, dp_group)
         for ref_p, p_spec in zip(reference_params, spec["params"])
     ]
 
