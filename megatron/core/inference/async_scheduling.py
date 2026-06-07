@@ -180,6 +180,47 @@ class AsyncDecodeTransaction:
     row_map: Optional[AsyncRowMap] = None
     drop_reason: Optional[str] = None
 
+    @classmethod
+    def from_plan(
+        cls,
+        *,
+        transaction_id: int,
+        prepared_layout: Any,
+        tokens_per_request: int = 1,
+        uses_mamba_candidate_bank: bool = False,
+        cuda_graph_request_count: Optional[int] = None,
+    ) -> "AsyncDecodeTransaction":
+        """Build a transaction and derive all resource leases from the prepared plan."""
+
+        request_ids = prepared_layout.request_ids.clone()
+        transaction = cls(
+            transaction_id=transaction_id,
+            prepared_layout=prepared_layout,
+            graph_shape=AsyncGraphShape.from_plan(
+                prepared_layout, tokens_per_request=tokens_per_request
+            ),
+            kv_lease=AsyncKVBlockLease(
+                reserved_request_ids=prepared_layout.reserved_request_ids.clone(),
+                reserved_block_ids=prepared_layout.reserved_block_ids.clone(),
+                reserved_block_columns=prepared_layout.reserved_block_columns.clone(),
+            ),
+            mamba_lease=AsyncMambaLease(
+                candidate_request_ids=(
+                    request_ids
+                    if uses_mamba_candidate_bank
+                    else torch.empty(0, dtype=request_ids.dtype, device=request_ids.device)
+                ),
+                uses_candidate_bank=uses_mamba_candidate_bank,
+            ),
+            mtp_state=(
+                AsyncMTPState(tokens_per_request=tokens_per_request)
+                if tokens_per_request > 1
+                else None
+            ),
+        )
+        transaction.launch(cuda_graph_request_count=cuda_graph_request_count)
+        return transaction
+
     @property
     def request_ids(self) -> Tensor:
         """Request IDs in the pending forward row order."""

@@ -17,7 +17,6 @@ from megatron.core import parallel_state
 from megatron.core.inference.async_scheduling import (
     AsyncDecodeTransaction,
     AsyncGraphShape,
-    AsyncKVBlockLease,
     AsyncRowMap,
 )
 from megatron.core.inference.async_stream import AsyncStream
@@ -2156,7 +2155,7 @@ class TextGenerationController:
             has_real_work=True, can_launch_async_handoff=True
         )
         if not handoff_decision.launch_async_forward:
-            context.clear_async_prepared_decode_plan()
+            context.discard_async_prepared_decode_plan()
             context.record_async_scheduling_counter("ep_async_handoff_skipped")
             return None
 
@@ -2181,19 +2180,13 @@ class TextGenerationController:
             context.padded_active_request_count if context.using_cuda_graph_this_step() else None
         )
         self._async_transaction_counter += 1
-        transaction = AsyncDecodeTransaction(
+        transaction = AsyncDecodeTransaction.from_plan(
             transaction_id=self._async_transaction_counter,
             prepared_layout=plan,
-            graph_shape=AsyncGraphShape.from_plan(
-                plan, tokens_per_request=self.num_speculative_tokens + 1
-            ),
-            kv_lease=AsyncKVBlockLease(
-                reserved_request_ids=plan.reserved_request_ids.clone(),
-                reserved_block_ids=plan.reserved_block_ids.clone(),
-                reserved_block_columns=plan.reserved_block_columns.clone(),
-            ),
+            tokens_per_request=self.num_speculative_tokens + 1,
+            uses_mamba_candidate_bank=context.is_hybrid_model and context.mamba_state_bank_count > 1,
+            cuda_graph_request_count=cuda_graph_request_count,
         )
-        transaction.launch(cuda_graph_request_count=cuda_graph_request_count)
         self._async_pending_transaction = transaction
         context.mark_async_forward_in_flight()
         context.record_async_scheduling_counter("launch")
@@ -2323,7 +2316,7 @@ class TextGenerationController:
                         active_request_count
                     )
                     if async_h2d_done_event is None:
-                        context.clear_async_prepared_decode_plan()
+                        context.discard_async_prepared_decode_plan()
                         async_next_prepared = False
                 else:
                     self._dynamic_step_sample_logits(row_indices=pending_forward_row_indices)

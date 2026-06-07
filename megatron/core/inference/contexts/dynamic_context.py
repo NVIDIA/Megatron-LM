@@ -1874,7 +1874,16 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def reset_mamba_state(self) -> None:
         """Reset state used within Mamba layers."""
+
         if self.is_hybrid_model:
+            if self._async_forward_in_flight:
+                self._append_deferred_async_mamba_slots(
+                    self.mamba_metadata.request_to_mamba_state_idx
+                )
+                self.mamba_metadata.request_to_mamba_state_idx.fill_(-1)
+                self.mamba_metadata.request_to_mamba_state_bank.zero_()
+                self.mamba_metadata.reset_varlen_metadata()
+                return
             self.mamba_metadata.reset()
 
     def add_dummy_requests_parallel(
@@ -2414,6 +2423,29 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Forget a prepared async decode plan after launch or fallback."""
 
         self._async_prepared_decode_plan = None
+
+    def discard_async_prepared_decode_plan(self) -> None:
+        """Drop an unlaunched async decode plan and release its reserved resources."""
+
+        plan = self._async_prepared_decode_plan
+        if plan is not None and plan.reserved_block_ids.numel() > 0:
+            self.kv_block_allocator.release_memory_blocks(plan.reserved_block_ids)
+            self.record_async_scheduling_counter(
+                "kv_lease_dropped", int(plan.reserved_block_ids.numel())
+            )
+        elif self._async_reserved_kv_block_count > 0:
+            reserved_blocks = self._async_reserved_kv_block_ids[
+                : self._async_reserved_kv_block_count
+            ]
+            reserved_blocks = reserved_blocks[reserved_blocks != -1]
+            if reserved_blocks.numel() > 0:
+                self.kv_block_allocator.release_memory_blocks(reserved_blocks)
+                self.record_async_scheduling_counter(
+                    "kv_lease_dropped", int(reserved_blocks.numel())
+                )
+
+        self._clear_async_reserved_kv_blocks()
+        self.clear_async_prepared_decode_plan()
 
     def _clear_async_reserved_kv_blocks(self) -> None:
         """Clear the request-to-reserved-block map after CPU reconciliation."""
