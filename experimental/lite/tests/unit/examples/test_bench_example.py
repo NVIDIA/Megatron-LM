@@ -37,7 +37,7 @@ def test_bench_builds_mlite_runtime_config_with_model_hook():
     assert model_cfg.num_nextn_predict_layers == 0
 
 
-def test_bench_builds_bridge_dry_run_plan_without_mbridge_import():
+def test_bench_builds_bridge_dry_run_plan_without_bridge_import():
     from examples.bench.bench import BenchCliConfig, build_dry_run_plan
 
     plan = build_dry_run_plan(
@@ -53,6 +53,28 @@ def test_bench_builds_bridge_dry_run_plan_without_mbridge_import():
 
     assert plan["dry_run"] is True
     assert plan["runtime"]["backend"] == "bridge"
+    backend_cfg = plan["runtime"]["backend_cfg"]
+    assert backend_cfg["model_name"] == "qwen3_5"
+    assert backend_cfg["override_transformer_config"] == {"attention_backend": "unfused"}
+    assert backend_cfg["bridge_post_init"].startswith("<callable:")
+
+
+def test_bench_builds_mbridge_dry_run_plan_without_mbridge_import():
+    from examples.bench.bench import BenchCliConfig, build_dry_run_plan
+
+    plan = build_dry_run_plan(
+        BenchCliConfig(
+            backend="mbridge",
+            hf_path="/tmp/hf",
+            model_name="qwen3_5",
+            truncate_layers=2,
+            override_transformer_json='{"attention_backend": "unfused"}',
+            dry_run=True,
+        )
+    )
+
+    assert plan["dry_run"] is True
+    assert plan["runtime"]["backend"] == "mbridge"
     backend_cfg = plan["runtime"]["backend_cfg"]
     assert backend_cfg["model_name"] == "qwen3_5"
     assert backend_cfg["override_transformer_config"] == {"attention_backend": "unfused"}
@@ -231,3 +253,31 @@ def test_result_trace_compare_reports_metric_level_failures():
     assert comparison["passed"] is False
     assert comparison["loss_passed"] is True
     assert comparison["grad_norm_passed"] is False
+
+
+def test_correctness_compare_requires_bitwise_fields():
+    from examples.bench.results import compare_correctness_artifacts
+
+    baseline = {
+        "eval_logits": {"sha256": "a", "shape": [1], "dtype": "torch.bfloat16"},
+        "steps": [
+            {
+                "loss": {"value": 1.0, "float_hex": 1.0.hex()},
+                "logits": {"sha256": "b"},
+                "grad_fingerprint": {"sha256": "c", "tensor_count": 1},
+                "grad_norm": {"value": 2.0, "float_hex": 2.0.hex()},
+                "update_successful": True,
+                "num_zeros": 0,
+                "post_step_weights": {"sha256": "d", "tensor_count": 1},
+            }
+        ],
+    }
+    candidate = json.loads(json.dumps(baseline))
+
+    assert compare_correctness_artifacts(baseline, candidate)["passed"] is True
+
+    candidate["steps"][0]["grad_norm"] = {"value": 2.5, "float_hex": 2.5.hex()}
+    comparison = compare_correctness_artifacts(baseline, candidate)
+
+    assert comparison["passed"] is False
+    assert comparison["max_grad_norm_abs"] == 0.5

@@ -37,7 +37,7 @@ model and optimizer support those operations.
 
 The `bridge` runtime implements the same runtime contract through
 Megatron-Bridge and Megatron-Core optimizer/checkpoint helpers. It imports
-`mbridge` lazily from `build_model()`, so config construction and dry-run
+`megatron.bridge` lazily from `build_model()`, so config construction and dry-run
 examples can execute without Megatron-Bridge installed.
 
 ## Config Types

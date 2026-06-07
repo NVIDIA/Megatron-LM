@@ -8,7 +8,6 @@ style of megatron.lite primitives — no `TransformerConfig`, no mpu globals.
 
 from __future__ import annotations
 
-import inspect
 from typing import TYPE_CHECKING
 
 import torch  # pyright: ignore[reportMissingImports]
@@ -27,25 +26,28 @@ if TYPE_CHECKING:
     from megatron.lite.primitive.parallel import ParallelState
 
 
-def _accepts_kwarg(fn, name: str) -> bool:
-    try:
-        params = inspect.signature(fn).parameters
-    except (TypeError, ValueError):
-        return False
-    return name in params or any(
-        param.kind == inspect.Parameter.VAR_KEYWORD
-        for param in params.values()
+def _ordered_topk_from_routing_map(
+    probs_dense: torch.Tensor,
+    routing_map: torch.Tensor,
+    topk: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    expert_ids = torch.arange(
+        probs_dense.size(-1),
+        device=probs_dense.device,
+        dtype=torch.long,
+    ).expand_as(routing_map)
+    masked_ids = torch.where(
+        routing_map,
+        expert_ids,
+        torch.full_like(expert_ids, probs_dense.size(-1)),
     )
-
-
-_TOPK_ROUTING_SUPPORTS_DENSE_OUTPUT = _accepts_kwarg(
-    topk_routing_with_score_function,
-    "dense_output",
-)
+    topk_indices = torch.sort(masked_ids, dim=-1).values[:, :topk]
+    topk_scores = torch.gather(probs_dense, dim=-1, index=topk_indices)
+    return topk_scores, topk_indices
 
 
 class TopKRouter(nn.Module):
-    """TopK gating: linear(input_dtype) → topk → softmax(fp32) → cast to input dtype."""
+    """TopK gating with optional high-precision router logits/probabilities."""
 
     def __init__(
         self,
@@ -56,6 +58,7 @@ class TopKRouter(nn.Module):
         compute_aux_loss: bool = True,
         use_pre_softmax: bool = False,
         moe_router_fusion: bool = False,
+        router_dtype: torch.dtype | None = None,
     ):
         super().__init__()
         if router_bias_rate > 0:
@@ -70,6 +73,7 @@ class TopKRouter(nn.Module):
         self.compute_aux_loss = compute_aux_loss
         self.use_pre_softmax = use_pre_softmax
         self.moe_router_fusion = moe_router_fusion
+        self.router_dtype = router_dtype
 
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
         self.register_buffer(
@@ -81,7 +85,9 @@ class TopKRouter(nn.Module):
         self._aux_loss_group = ps.tp_group if ps.tp_size > 1 else None
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        logits = router_gating_linear(x, self.gate.weight, None, x.dtype)
+        router_dtype = self.router_dtype or x.dtype
+        logits = router_gating_linear(x, self.gate.weight, None, router_dtype)
+        logits = logits.view(-1, self.num_experts)
         num_tokens = logits.size(0)
         if self.moe_router_fusion:
             probs_dense, _ = topk_routing_with_score_function(
@@ -93,25 +99,20 @@ class TopKRouter(nn.Module):
             )
             topk_scores, topk_indices = torch.topk(probs_dense, k=self.topk, dim=-1)
         else:
-            if _TOPK_ROUTING_SUPPORTS_DENSE_OUTPUT:
-                topk_scores, topk_indices = topk_routing_with_score_function(
-                    logits,
-                    self.topk,
-                    use_pre_softmax=self.use_pre_softmax,
-                    score_function="softmax",
-                    fused=False,
-                    dense_output=True,
-                )
-            else:
-                probs_dense, _ = topk_routing_with_score_function(
-                    logits,
-                    self.topk,
-                    use_pre_softmax=self.use_pre_softmax,
-                    score_function="softmax",
-                    fused=False,
-                )
-                topk_scores, topk_indices = torch.topk(probs_dense, k=self.topk, dim=-1)
-        topk_scores = topk_scores.to(x.dtype)
+            probs_dense, routing_map = topk_routing_with_score_function(
+                logits,
+                self.topk,
+                use_pre_softmax=self.use_pre_softmax,
+                score_function="softmax",
+                fused=False,
+            )
+            topk_scores, topk_indices = _ordered_topk_from_routing_map(
+                probs_dense,
+                routing_map,
+                self.topk,
+            )
+        if self.router_dtype is None:
+            topk_scores = topk_scores.to(x.dtype)
 
         if self.compute_aux_loss and self.training and torch.is_grad_enabled():
             routing_map, aux_scores = compute_routing_scores_for_aux_loss(
@@ -180,6 +181,7 @@ class SigmoidTopKRouter(nn.Module):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         logits = self.gate(x)
+        logits = logits.view(-1, self.num_experts)
         num_tokens = logits.size(0)
         probs_dense, routing_map = topk_routing_with_score_function(
             logits,
@@ -189,8 +191,11 @@ class SigmoidTopKRouter(nn.Module):
             scaling_factor=(self.scaling_factor or None),
             fused=self.moe_router_fusion,
         )
-        # Recover topk from dense probs (see TopKRouter for rationale).
-        topk_scores, topk_indices = torch.topk(probs_dense, k=self.topk, dim=-1)
+        topk_scores, topk_indices = _ordered_topk_from_routing_map(
+            probs_dense,
+            routing_map,
+            self.topk,
+        )
         topk_scores = topk_scores.to(logits.dtype)
 
         if self.compute_aux_loss and self.training and torch.is_grad_enabled():

@@ -7,6 +7,7 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import transformer_engine.pytorch as te
+from megatron.core.jit import jit_fuser
 
 from megatron.lite.primitive.ops.gated_delta_rule import l2norm, torch_chunk_gated_delta_rule
 from megatron.lite.primitive.parallel import ColumnParallelLinear, ParallelState, RowParallelLinear
@@ -44,9 +45,11 @@ class GatedDeltaNet(nn.Module):
         linear_conv_kernel_dim: int,
         rms_norm_eps: float,
         ps: ParallelState,
+        deterministic: bool = False,
     ):
         super().__init__()
         self.ps = ps
+        self.deterministic = bool(deterministic)
         self.num_k_heads = linear_num_key_heads
         self.num_v_heads = linear_num_value_heads
         self.dk = linear_key_head_dim
@@ -192,7 +195,8 @@ class GatedDeltaNet(nn.Module):
         cu_seqlens: torch.Tensor | None,
     ) -> torch.Tensor:
         if cu_seqlens is None:
-            return F.silu(self.conv1d(qkv.transpose(1, 2))[:, :, :seq_len].transpose(1, 2))
+            qkv_t = qkv.transpose(1, 2).contiguous()
+            return F.silu(self.conv1d(qkv_t)[:, :, :seq_len].transpose(1, 2))
         if _HAS_FLA:
             qkv, _ = _fla_causal_conv1d(
                 x=qkv,
@@ -216,7 +220,7 @@ class GatedDeltaNet(nn.Module):
         output_final_state: bool,
         cu_seqlens: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        if _HAS_FLA:
+        if _HAS_FLA and not self.deterministic:
             return _fla_chunk_gated_delta_rule(
                 query,
                 key,
@@ -275,8 +279,9 @@ class GatedDeltaNet(nn.Module):
         query_key, value = qkv.split([2 * self.qk_dim_local, self.v_dim_local], dim=-1)
         query_key = query_key.reshape(batch, seq_len, 2 * self.num_k_heads_local, self.dk)
         value = value.reshape(batch, seq_len, self.num_v_heads_local, self.dv)
-        query_key = l2norm(query_key.contiguous())
         query, key = query_key.split(self.num_k_heads_local, dim=2)
+        query = self._l2norm(query.contiguous())
+        key = self._l2norm(key.contiguous())
         if self.v_heads_per_k_head > 1:
             query = query.repeat_interleave(self.v_heads_per_k_head, dim=2)
             key = key.repeat_interleave(self.v_heads_per_k_head, dim=2)
@@ -289,11 +294,15 @@ class GatedDeltaNet(nn.Module):
             alpha.contiguous(),
         )
 
+    def _l2norm(self, x: torch.Tensor) -> torch.Tensor:
+        return l2norm(x)
+
     @staticmethod
     def _compute_g_and_beta(A_log, dt_bias, alpha, beta):
         g = -A_log.exp() * F.softplus(alpha.float() + dt_bias)
         return g, beta.sigmoid()
 
+    @jit_fuser
     def _apply_gated_norm(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
         x_dtype = x.dtype
         x = x.reshape(-1, x.shape[-1])

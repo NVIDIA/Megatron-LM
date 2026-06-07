@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import sys
+import types
+
 import pytest
 
 
@@ -22,6 +25,26 @@ def test_bridge_runtime_registered_and_lazy_constructible():
     )
 
     assert isinstance(runtime, BridgeRuntime)
+    assert runtime.tier == "rl_best"
+
+
+def test_mbridge_runtime_registered_and_lazy_constructible():
+    from megatron.lite.runtime import RuntimeConfig, create_runtime
+    from megatron.lite.runtime.backends import RUNTIME_REGISTRY
+    from megatron.lite.runtime.backends.bridge.config import BridgeConfig
+    from megatron.lite.runtime.backends.mbridge.runtime import MBridgeRuntime
+
+    assert RUNTIME_REGISTRY["mbridge"] == "megatron.lite.runtime.backends.mbridge"
+
+    runtime = create_runtime(
+        RuntimeConfig(
+            backend="mbridge",
+            hf_path="/tmp/hf-model",
+            backend_cfg=BridgeConfig(model_name="qwen3_5"),
+        )
+    )
+
+    assert isinstance(runtime, MBridgeRuntime)
     assert runtime.tier == "rl_best"
 
 
@@ -53,3 +76,31 @@ def test_bridge_config_from_dict_rejects_num_microbatches():
 
     with pytest.raises(ValueError, match="num_microbatches"):
         BridgeConfig.from_dict({"num_microbatches": 2})
+
+
+def test_bridge_registers_qwen35_moe_compat_aliases(monkeypatch):
+    from megatron.lite.runtime.backends.bridge.runtime import _register_bridge_compat_aliases
+
+    registered = []
+
+    class _FakeDispatcher:
+        _exact_types = {}
+
+    model_bridge = types.SimpleNamespace(
+        get_model_bridge=_FakeDispatcher(),
+        register_bridge_implementation=lambda **kwargs: registered.append(kwargs),
+    )
+    qwen_bridge_mod = types.SimpleNamespace(Qwen3MoEBridge=object)
+    gpt_mod = types.SimpleNamespace(GPTModel=object)
+
+    monkeypatch.setitem(sys.modules, "megatron.bridge.models.conversion", types.SimpleNamespace(model_bridge=model_bridge))
+    monkeypatch.setitem(sys.modules, "megatron.bridge.models.qwen.qwen3_moe_bridge", qwen_bridge_mod)
+    monkeypatch.setitem(sys.modules, "megatron.core.models.gpt.gpt_model", gpt_mod)
+
+    _register_bridge_compat_aliases()
+
+    assert [item["source"] for item in registered] == [
+        "Qwen3_5MoeForConditionalGeneration",
+        "Qwen3_5MoeForCausalLM",
+    ]
+    assert all(item["bridge_class"] is object for item in registered)

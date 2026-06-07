@@ -4,7 +4,7 @@ This example runs the same small pretrain-style benchmark through either
 `backend=mlite` or `backend=bridge`.
 
 `bridge` is a runtime backend backed by Megatron-Bridge. It requires an
-environment where `import mbridge` works. Dry-run mode does not import
+environment where `import megatron.bridge` works. Dry-run mode does not import
 Megatron-Bridge and is safe for config validation.
 
 ## Dry-Run
@@ -66,7 +66,7 @@ bash experimental/lite/examples/bench/scripts/run_qwen35_pair.sh
 ```
 
 Slurm job `12624917` completed with exit code `0:0`. The run used
-`torch==2.10.0+cu129`; `transformer_engine`, `einops`, and `mbridge` were
+`torch==2.10.0+cu129`; `transformer_engine`, `einops`, and `megatron.bridge` were
 available in the runtime environment.
 
 | Runtime | Impl | Optimizer backend | Measured steps | Avg step ms | Tokens/s | Tokens/s/GPU | Peak memory GB | TFLOPs/GPU |
@@ -111,3 +111,43 @@ torchrun --nproc_per_node 1 experimental/lite/examples/bench/bench.py \
 Compare `loss`, `grad_norm`, `avg_step_ms`, `tok_per_s`, peak memory, and
 `tflops_per_gpu` in the two JSON outputs. Benchmarks are performance evidence;
 they are not a replacement for precision tests.
+
+## Deterministic Correctness
+
+Use `correctness.py` for strict deterministic parity. It emits exact scalar
+fingerprints for `loss` and `grad_norm`, SHA256 fingerprints for logits and
+post-step exported weights, and a strict comparison artifact.
+
+```bash
+export MEGATRON_LITE_DETERMINISTIC=1
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+
+torchrun --nproc_per_node 1 experimental/lite/examples/bench/correctness.py run \
+  --backend mlite \
+  --hf-path /models/Qwen3.5-35B-A3B \
+  --model-name qwen3_5 \
+  --steps 2 \
+  --seq-len 128 \
+  --num-microbatches 1 \
+  --truncate-layers 2 \
+  --disable-mtp \
+  --same-data-across-dp \
+  --output-json /tmp/qwen35_mlite_correctness.json
+
+torchrun --nproc_per_node 1 experimental/lite/examples/bench/correctness.py run \
+  --backend bridge \
+  --hf-path /models/Qwen3.5-35B-A3B \
+  --model-name qwen3_5 \
+  --steps 2 \
+  --seq-len 128 \
+  --num-microbatches 1 \
+  --truncate-layers 2 \
+  --disable-mtp \
+  --same-data-across-dp \
+  --output-json /tmp/qwen35_bridge_correctness.json
+
+python experimental/lite/examples/bench/correctness.py compare \
+  /tmp/qwen35_mlite_correctness.json \
+  /tmp/qwen35_bridge_correctness.json \
+  --fail-on-mismatch
+```

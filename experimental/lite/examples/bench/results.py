@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import math
 import json
 from pathlib import Path
 from typing import Any
@@ -169,9 +170,82 @@ def compare_step_traces(
     }
 
 
+def compare_correctness_artifacts(
+    baseline: dict[str, Any],
+    candidate: dict[str, Any],
+) -> dict[str, Any]:
+    """Strict bitwise comparison for deterministic correctness artifacts."""
+    base_steps = baseline.get("steps", [])
+    cand_steps = candidate.get("steps", [])
+    sample_count = min(len(base_steps), len(cand_steps))
+    lengths_match = sample_count == len(base_steps) == len(cand_steps)
+
+    max_loss_abs = 0.0
+    max_grad_norm_abs = 0.0
+    mismatches: list[dict[str, Any]] = []
+
+    def _tensor_fingerprint_matches(base: Any, cand: Any) -> bool:
+        if base == cand:
+            return True
+        if not isinstance(base, dict) or not isinstance(cand, dict):
+            return False
+        if base.get("shape") != cand.get("shape"):
+            return False
+        base_bf16 = base.get("sha256_as_bf16")
+        cand_bf16 = cand.get("sha256_as_bf16")
+        return bool(base_bf16 and base_bf16 == cand_bf16)
+
+    base_eval = baseline.get("eval_logits")
+    cand_eval = candidate.get("eval_logits")
+    if base_eval is not None or cand_eval is not None:
+        if not _tensor_fingerprint_matches(base_eval, cand_eval):
+            mismatches.append({"field": "eval_logits"})
+
+    for idx in range(sample_count):
+        base = base_steps[idx]
+        cand = cand_steps[idx]
+        loss_abs = abs(float(base["loss"]["value"]) - float(cand["loss"]["value"]))
+        grad_abs = abs(float(base["grad_norm"]["value"]) - float(cand["grad_norm"]["value"]))
+        if math.isfinite(loss_abs):
+            max_loss_abs = max(max_loss_abs, loss_abs)
+        if math.isfinite(grad_abs):
+            max_grad_norm_abs = max(max_grad_norm_abs, grad_abs)
+
+        for field in (
+            "loss",
+            "grad_norm",
+            "post_step_weights",
+            "update_successful",
+            "num_zeros",
+        ):
+            if base.get(field) != cand.get(field):
+                mismatches.append({"step": idx, "field": field})
+        if not _tensor_fingerprint_matches(base.get("logits"), cand.get("logits")):
+            mismatches.append({"step": idx, "field": "logits"})
+
+    if not lengths_match:
+        mismatches.append(
+            {
+                "field": "steps",
+                "baseline_count": len(base_steps),
+                "candidate_count": len(cand_steps),
+            }
+        )
+
+    return {
+        "samples": sample_count,
+        "passed": lengths_match and not mismatches,
+        "max_loss_abs": max_loss_abs,
+        "max_grad_norm_abs": max_grad_norm_abs,
+        "tensor_fingerprint_rule": "raw_sha256_or_bf16_canonical_sha256",
+        "mismatches": mismatches,
+    }
+
+
 __all__ = [
     "RunResult",
     "StepTrace",
+    "compare_correctness_artifacts",
     "compare_step_traces",
     "load_result_artifact",
     "result_summary",

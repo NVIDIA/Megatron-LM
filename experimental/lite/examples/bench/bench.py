@@ -106,6 +106,21 @@ def _get_model_config_root(config_obj: Any) -> Any:
     return getattr(config_obj, "text_config", config_obj)
 
 
+def _get_bridge_config_root(bridge: Any) -> Any:
+    hf_pretrained = getattr(bridge, "hf_pretrained", None)
+    if hf_pretrained is not None:
+        return _get_model_config_root(getattr(hf_pretrained, "config", hf_pretrained))
+    hf_config = getattr(bridge, "hf_config", None)
+    if hf_config is not None:
+        return _get_model_config_root(hf_config)
+    raise ValueError("Bridge object does not expose hf_pretrained or hf_config.")
+
+
+def _refresh_bridge_config(bridge: Any) -> None:
+    if hasattr(bridge, "_build_config"):
+        bridge.config = bridge._build_config()
+
+
 def _disable_mtp(config_obj: Any) -> Any:
     root = _get_model_config_root(config_obj)
     for attr in ("mtp_num_hidden_layers", "num_nextn_predict_layers"):
@@ -176,7 +191,7 @@ def _make_bridge_post_init_hook(cfg: BenchCliConfig):
         keep_experts = cfg.keep_experts
 
         def keep_experts_hook(bridge) -> None:
-            hf_cfg = _get_model_config_root(bridge.hf_config)
+            hf_cfg = _get_bridge_config_root(bridge)
             old_num = getattr(hf_cfg, "num_experts", None)
             old_topk = getattr(hf_cfg, "num_experts_per_tok", None)
             if old_num is None or old_topk is None:
@@ -185,7 +200,7 @@ def _make_bridge_post_init_hook(cfg: BenchCliConfig):
                 raise ValueError(f"keep_experts must be in [1, {old_num}], got {keep_experts}.")
             hf_cfg.num_experts = keep_experts
             hf_cfg.num_experts_per_tok = min(old_topk, keep_experts)
-            bridge.config = bridge._build_config()
+            _refresh_bridge_config(bridge)
 
             if hasattr(bridge, "_weight_to_mcore_format"):
                 original = bridge._weight_to_mcore_format
@@ -203,7 +218,7 @@ def _make_bridge_post_init_hook(cfg: BenchCliConfig):
         keep_layers = cfg.truncate_layers
 
         def truncate_layers_hook(bridge) -> None:
-            hf_cfg = _get_model_config_root(bridge.hf_config)
+            hf_cfg = _get_bridge_config_root(bridge)
             old_layers = getattr(hf_cfg, "num_hidden_layers", None)
             if old_layers is None:
                 raise ValueError("truncate_layers requires HF config with num_hidden_layers.")
@@ -212,20 +227,20 @@ def _make_bridge_post_init_hook(cfg: BenchCliConfig):
             hf_cfg.num_hidden_layers = keep_layers
             if hasattr(hf_cfg, "layer_types"):
                 hf_cfg.layer_types = list(hf_cfg.layer_types[:keep_layers])
-            bridge.config = bridge._build_config()
+            _refresh_bridge_config(bridge)
 
         hooks.append(truncate_layers_hook)
 
     if cfg.disable_mtp:
 
         def disable_mtp_hook(bridge) -> None:
-            hf_cfg = _get_model_config_root(bridge.hf_config)
+            hf_cfg = _get_bridge_config_root(bridge)
             for attr in ("mtp_num_hidden_layers", "num_nextn_predict_layers"):
                 if hasattr(hf_cfg, attr):
                     setattr(hf_cfg, attr, 0)
             if hasattr(hf_cfg, "mtp_layer_types"):
                 hf_cfg.mtp_layer_types = []
-            bridge.config = bridge._build_config()
+            _refresh_bridge_config(bridge)
 
         hooks.append(disable_mtp_hook)
 
@@ -249,6 +264,11 @@ def build_runtime_config(cfg: BenchCliConfig) -> RuntimeConfig:
             setattr(optimizer, key, value)
         impl_cfg = _json_mapping(cfg.impl_cfg_json, name="impl_cfg_json")
         impl_cfg.setdefault("use_thd", cfg.use_thd)
+        if cfg.model_name == "qwen3_5":
+            from megatron.lite.primitive.deterministic import deterministic_requested
+
+            if deterministic_requested():
+                impl_cfg.setdefault("mount_mbridge_vision_model", True)
         backend_cfg = MegatronLiteConfig(
             model_name=cfg.model_name,
             impl=cfg.impl,
@@ -259,10 +279,10 @@ def build_runtime_config(cfg: BenchCliConfig) -> RuntimeConfig:
             impl_cfg=impl_cfg,
             model_config_hook=_make_mlite_model_config_hook(cfg),
         )
-    elif cfg.backend == "bridge":
+    elif cfg.backend in {"bridge", "mbridge"}:
         impl_cfg = _json_mapping(cfg.impl_cfg_json, name="impl_cfg_json")
         if impl_cfg:
-            raise ValueError("bridge backend does not accept impl_cfg_json.")
+            raise ValueError(f"{cfg.backend} backend does not accept impl_cfg_json.")
         backend_cfg = BridgeConfig(
             model_name=cfg.model_name,
             parallel=parallel,
@@ -278,7 +298,7 @@ def build_runtime_config(cfg: BenchCliConfig) -> RuntimeConfig:
             bridge_post_init=_make_bridge_post_init_hook(cfg),
         )
     else:
-        raise ValueError(f"backend must be 'mlite' or 'bridge', got {cfg.backend!r}.")
+        raise ValueError(f"backend must be 'mlite', 'bridge', or 'mbridge', got {cfg.backend!r}.")
 
     return RuntimeConfig(backend=cfg.backend, hf_path=cfg.hf_path, backend_cfg=backend_cfg)
 
@@ -367,7 +387,7 @@ def run(cfg: BenchCliConfig) -> dict[str, Any]:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--backend", choices=["mlite", "bridge"], default="mlite")
+    parser.add_argument("--backend", choices=["mlite", "bridge", "mbridge"], default="mlite")
     parser.add_argument("--hf-path", default="")
     parser.add_argument("--model-name", default="qwen3_moe")
     parser.add_argument("--impl", default="lite")

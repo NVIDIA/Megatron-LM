@@ -62,7 +62,7 @@ handle = runtime.build_model()
 `backend="mlite"` selects the Megatron Lite runtime backend. `impl="lite"`
 selects the model implementation inside the registered model family.
 `backend="bridge"` selects the Megatron-Bridge runtime backend and requires an
-environment where `import mbridge` works when the model is built.
+environment where `import megatron.bridge` works when the model is built.
 
 Model names currently registered by default:
 

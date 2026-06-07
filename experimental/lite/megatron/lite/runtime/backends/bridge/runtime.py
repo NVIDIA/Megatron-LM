@@ -82,21 +82,66 @@ def _lower_transformer_overrides(cfg: BridgeConfig) -> dict[str, Any]:
     return overrides
 
 
+def _bridge_hf_config(bridge):
+    hf_pretrained = getattr(bridge, "hf_pretrained", None)
+    if hf_pretrained is None:
+        return None
+    return getattr(hf_pretrained, "config", hf_pretrained)
+
+
+def _lower_provider_value(key: str, value: Any) -> Any:
+    if key == "attention_backend" and isinstance(value, str):
+        from megatron.core.transformer.enums import AttnBackend
+
+        return AttnBackend[value]
+    return value
+
+
+def _configure_provider(provider, cfg: BridgeConfig) -> None:
+    p = cfg.parallel
+    provider.tensor_model_parallel_size = p.tp
+    provider.pipeline_model_parallel_size = p.pp
+    provider.context_parallel_size = p.cp
+    provider.expert_model_parallel_size = p.ep
+    if p.etp is not None:
+        provider.expert_tensor_parallel_size = p.etp
+    if p.vpp > 1:
+        provider.virtual_pipeline_model_parallel_size = p.vpp
+    provider.sequence_parallel = p.tp > 1
+    provider.bf16 = True
+    provider.fp16 = False
+
+    for key, value in _lower_transformer_overrides(cfg).items():
+        setattr(provider, key, _lower_provider_value(key, value))
+
+
+def _register_bridge_compat_aliases() -> None:
+    """Register local Megatron-Bridge aliases for supported checkpoint variants."""
+    from megatron.bridge.models.conversion import model_bridge
+    from megatron.bridge.models.qwen.qwen3_moe_bridge import Qwen3MoEBridge
+    from megatron.core.models.gpt.gpt_model import GPTModel
+
+    registry = getattr(model_bridge.get_model_bridge, "_exact_types", {})
+    for source in ("Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM"):
+        if source not in registry:
+            model_bridge.register_bridge_implementation(
+                source=source,
+                target=GPTModel,
+                bridge_class=Qwen3MoEBridge,
+            )
+
+
 def _build_bridge(hf_path: str, cfg: BridgeConfig):
     """Build Megatron-Bridge AutoBridge lazily from an HF model path."""
-    from mbridge import AutoBridge
+    from megatron.bridge import AutoBridge
+    from transformers import AutoConfig
 
-    bridge = AutoBridge.from_pretrained(hf_path, trust_remote_code=True)
-    bridge.set_extra_args(sequence_parallel=cfg.parallel.tp > 1)
-
-    transformer_overrides = _lower_transformer_overrides(cfg)
-    if transformer_overrides:
-        bridge.set_extra_args(**transformer_overrides)
-
-    if not hasattr(bridge.hf_config, "rope_theta"):
-        bridge.hf_config.rope_theta = bridge.hf_config.to_dict().get("rope_theta", 1000000.0)
-
-    bridge.set_extra_args(bf16=True, fp16=False)
+    hf_config = AutoConfig.from_pretrained(hf_path, trust_remote_code=True)
+    _register_bridge_compat_aliases()
+    bridge = AutoBridge.from_hf_config(hf_config)
+    hf_config = _bridge_hf_config(bridge)
+    if hf_config is not None and not hasattr(hf_config, "rope_theta"):
+        hf_config.rope_theta = hf_config.to_dict().get("rope_theta", 1000000.0)
 
     if callable(cfg.bridge_post_init):
         cfg.bridge_post_init(bridge)
@@ -156,7 +201,7 @@ def _resolve_benchmark_protocol(cfg: BridgeConfig, bridge) -> Any | None:
     model_name = cfg.model_name
     if model_name == "auto":
         try:
-            model_name = resolve_model_type_from_hf(bridge.hf_config)
+            model_name = resolve_model_type_from_hf(_bridge_hf_config(bridge))
         except ValueError:
             return None
 
@@ -222,6 +267,13 @@ class BridgeRuntime(RuntimeBase):
         model_parallel_cuda_manual_seed(rt_cfg.seed)
 
         bridge = _build_bridge(hf_path, rt_cfg)
+        provider = bridge.to_megatron_provider(
+            load_weights=rt_cfg.load_hf_weights,
+            hf_path=hf_path if rt_cfg.load_hf_weights else None,
+        )
+        _configure_provider(provider, rt_cfg)
+        if hasattr(provider, "finalize"):
+            provider.finalize()
 
         ddp_config = {
             "use_distributed_optimizer": True,
@@ -230,13 +282,12 @@ class BridgeRuntime(RuntimeBase):
         }
         ddp_config.update(rt_cfg.override_ddp_config)
 
-        model_list = bridge.get_model(
+        model_list = provider.provide_distributed_model(
             model_type=ModelType.encoder_or_decoder,
             wrap_with_ddp=True,
             ddp_config=ddp_config,
+            bf16=True,
         )
-        if rt_cfg.load_hf_weights:
-            bridge.load_weights(model_list, hf_path, memory_efficient=True)
 
         optimizer = _build_optimizer(model_list, rt_cfg) if rt_cfg.build_optimizer else None
         lr_scheduler = _build_lr_scheduler(optimizer, rt_cfg) if optimizer is not None else None
@@ -263,9 +314,10 @@ class BridgeRuntime(RuntimeBase):
             config=rt_cfg,
             _extras={
                 "bridge": bridge,
+                "provider": provider,
                 "model_list": model_list,
                 "mpu": mpu,
-                "model_cfg": bridge.hf_config,
+                "model_cfg": _bridge_hf_config(bridge),
                 "protocol": _resolve_benchmark_protocol(rt_cfg, bridge),
                 "optimizer_backend": "mc" if optimizer is not None else "none",
                 "world_size": dist.get_world_size(),
@@ -341,6 +393,11 @@ class BridgeRuntime(RuntimeBase):
             micro_batch_size=1,
         )
 
+        if not forward_only:
+            from megatron.core.distributed.finalize_model_grads import finalize_model_grads
+
+            finalize_model_grads(model_list)
+
         loss_val = last_loss[0]
         if mpu.get_pipeline_model_parallel_world_size() > 1:
             loss_t = torch.tensor([loss_val or 0.0], device="cuda")
@@ -362,7 +419,7 @@ class BridgeRuntime(RuntimeBase):
             if hasattr(model, "zero_grad_buffer"):
                 model.zero_grad_buffer()
 
-    def optimizer_step(self, handle: ModelHandle) -> tuple[bool, float, int]:
+    def optimizer_step(self, handle: ModelHandle) -> tuple[bool, float, int | None]:
         if handle._optimizer is None:
             return True, 0.0, 0
         update_successful, grad_norm, num_zeros = handle._optimizer.step()
@@ -411,7 +468,7 @@ class BridgeRuntime(RuntimeBase):
         bridge = handle._extras["bridge"]
         model_list = handle._extras["model_list"]
         load_model_to_gpu(model_list, load_grad=False)
-        return bridge.export_weights(model_list)
+        return bridge.export_hf_weights(model_list, cpu=bool(kwargs.get("cpu", False)))
 
     def save_checkpoint(self, handle: ModelHandle, path: str, **kwargs) -> None:
         model_list = handle._extras["model_list"]
