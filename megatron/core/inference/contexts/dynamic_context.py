@@ -219,7 +219,9 @@ class AsyncDecodePlan:
 
     request_ids: Tensor
     kv_length_offsets: Tensor
+    reserved_request_ids: Tensor
     reserved_block_ids: Tensor
+    reserved_block_columns: Tensor
     active_request_count: int
     active_token_count: int
     padded_active_request_count: int
@@ -983,6 +985,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._async_deferred_mamba_slots_to_free = torch.empty(
             (0,), dtype=torch.int32, device='cpu'
         )
+        self._async_reserved_kv_block_adoption_count = 0
+        self._async_deferred_kv_block_release_count = 0
+        self._async_deferred_mamba_slot_release_count = 0
 
         # Track request metadata. Backed by pinned CPU memory: bookkeeping is
         # CPU-resident; GPU consumers read from the active-slice mirror in
@@ -2425,10 +2430,12 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return self._async_prepared_decode_plan
 
-    def record_async_scheduling_counter(self, name: str) -> None:
+    def record_async_scheduling_counter(self, name: str, amount: int = 1) -> None:
         """Increment a cumulative async scheduling diagnostic counter."""
 
-        self.async_scheduling_counters[name] = self.async_scheduling_counters.get(name, 0) + 1
+        self.async_scheduling_counters[name] = (
+            self.async_scheduling_counters.get(name, 0) + amount
+        )
 
     def async_scheduling_counters_summary(self) -> str:
         """Return compact cumulative async scheduling diagnostics."""
@@ -2611,7 +2618,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         boundary_count = int(boundary_mask.sum().item())
         request_to_kv_block_ids_view = self.request_to_kv_block_ids[active_slice]
         planned_block_ids = self.request_last_kv_block_id[active_slice].clone()
+        reserved_request_ids = torch.empty((0,), dtype=torch.int32, device='cpu')
         reserved_block_ids = torch.empty((0,), dtype=torch.int32, device='cpu')
+        reserved_block_columns = torch.empty((0,), dtype=torch.int32, device='cpu')
         if boundary_count > 0:
             reserved_block_ids = self.kv_block_allocator.allocate_memory_blocks(boundary_count)
             if reserved_block_ids is None or int(reserved_block_ids.numel()) != boundary_count:
@@ -2626,16 +2635,17 @@ class DynamicInferenceContext(BaseInferenceContext):
             request_to_kv_block_ids_view[boundary_rows, block_columns] = reserved_block_ids
             planned_block_ids[boundary_rows] = reserved_block_ids
 
+            reserved_request_ids = self.request_ids[active_slice][boundary_rows].to(
+                dtype=torch.int32
+            )
+            reserved_block_columns = block_columns.to(dtype=torch.int32)
             self._async_reserved_kv_block_count = boundary_count
-            self._async_reserved_kv_block_request_ids[:boundary_count] = self.request_ids[
-                active_slice
-            ][boundary_rows].to(dtype=torch.int32)
+            self._async_reserved_kv_block_request_ids[:boundary_count] = reserved_request_ids
             self._async_reserved_kv_block_ids[:boundary_count] = reserved_block_ids.to(
                 dtype=torch.int32
             )
-            self._async_reserved_kv_block_columns[:boundary_count] = block_columns.to(
-                dtype=torch.int32
-            )
+            self._async_reserved_kv_block_columns[:boundary_count] = reserved_block_columns
+            self.record_async_scheduling_counter("kv_lease_reserved", boundary_count)
 
         self.token_to_pos_ids[:active_request_count] = next_offsets.to(dtype=torch.int64)
         self.token_to_request_idx[:active_request_count] = request_rows
@@ -2710,7 +2720,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._async_prepared_decode_plan = AsyncDecodePlan(
             request_ids=self.request_ids[active_slice].clone(),
             kv_length_offsets=next_offsets.clone(),
+            reserved_request_ids=reserved_request_ids.clone(),
             reserved_block_ids=reserved_block_ids.clone(),
+            reserved_block_columns=reserved_block_columns.clone(),
             active_request_count=active_request_count,
             active_token_count=active_request_count,
             padded_active_request_count=self.padded_active_request_count,
@@ -2741,6 +2753,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self._async_deferred_kv_blocks_to_release.numel() > 0:
             kv_blocks = self._async_deferred_kv_blocks_to_release
             self.kv_block_allocator.release_memory_blocks(kv_blocks)
+            self._async_deferred_kv_block_release_count += int(kv_blocks.numel())
+            self.record_async_scheduling_counter("kv_lease_released", int(kv_blocks.numel()))
             self._async_deferred_kv_blocks_to_release = torch.empty(
                 (0,), dtype=torch.int32, device='cpu'
             )
@@ -2752,6 +2766,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         if blocks.numel() == 0:
             return
         blocks = blocks.to(dtype=torch.int32, device='cpu')
+        self.record_async_scheduling_counter("kv_lease_deferred", int(blocks.numel()))
         self._async_deferred_kv_blocks_to_release = torch.cat(
             (self._async_deferred_kv_blocks_to_release, blocks)
         )
@@ -2782,6 +2797,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self._async_reserved_kv_block_request_ids[slot] = -1
                 self._async_reserved_kv_block_ids[slot] = -1
                 self._async_reserved_kv_block_columns[slot] = -1
+                self._async_reserved_kv_block_adoption_count += 1
+                self.record_async_scheduling_counter("kv_lease_adopted")
                 break
         return reserved_block_ids
 
@@ -2805,6 +2822,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         slots = slots[slots != -1].to(dtype=torch.int32, device='cpu')
         if slots.numel() == 0:
             return
+        self.record_async_scheduling_counter("mamba_lease_deferred", int(slots.numel()))
         self._async_deferred_mamba_slots_to_free = torch.cat(
             (self._async_deferred_mamba_slots_to_free, slots)
         )
@@ -2818,6 +2836,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         ):
             return
         slots = self._async_deferred_mamba_slots_to_free
+        self._async_deferred_mamba_slot_release_count += int(slots.numel())
+        self.record_async_scheduling_counter("mamba_lease_released", int(slots.numel()))
         self.mamba_metadata.free_slot_ids(
             slots.to(device=self.mamba_metadata.mamba_state_free_slots.device)
         )
@@ -2980,6 +3000,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             (0,), dtype=torch.int32, device='cpu'
         )
         self._clear_async_reserved_kv_blocks()
+        self._async_reserved_kv_block_adoption_count = 0
+        self._async_deferred_kv_block_release_count = 0
+        self._async_deferred_mamba_slot_release_count = 0
 
         # Reset request metadata.
         for metadata_tensor in self.request_metadata.values():

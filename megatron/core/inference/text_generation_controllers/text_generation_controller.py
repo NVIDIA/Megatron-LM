@@ -2187,7 +2187,11 @@ class TextGenerationController:
             graph_shape=AsyncGraphShape.from_plan(
                 plan, tokens_per_request=self.num_speculative_tokens + 1
             ),
-            kv_lease=AsyncKVBlockLease(reserved_block_ids=plan.reserved_block_ids.clone()),
+            kv_lease=AsyncKVBlockLease(
+                reserved_request_ids=plan.reserved_request_ids.clone(),
+                reserved_block_ids=plan.reserved_block_ids.clone(),
+                reserved_block_columns=plan.reserved_block_columns.clone(),
+            ),
         )
         transaction.launch(cuda_graph_request_count=cuda_graph_request_count)
         self._async_pending_transaction = transaction
