@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from megatron.core import utils as core_utils
+from megatron.core.inference.async_transaction import AsyncLayoutSnapshot
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
@@ -327,6 +328,20 @@ def _make_controller_with_rows(pending_ids, current_ids, current_graph_count=Non
     return controller
 
 
+def _async_layout_snapshot_status(controller):
+    pending_snapshot = AsyncLayoutSnapshot.from_pending_forward_view(
+        controller._async_pending_forward_view, tokens_per_request=1
+    )
+    current_snapshot = AsyncLayoutSnapshot.from_context_current(
+        controller.inference_wrapped_model.inference_context, tokens_per_request=1
+    )
+    row_map = pending_snapshot.row_map_to_current(current_snapshot.request_ids)
+    if not pending_snapshot.graph_compatible_with(current_snapshot) or row_map is None:
+        return False, False
+    sequential_rows = torch.arange(row_map.numel(), dtype=torch.long, device="cpu")
+    return True, not torch.equal(row_map, sequential_rows)
+
+
 @pytest.mark.internal
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="row mapping returns CUDA tensors")
 @pytest.mark.parametrize(
@@ -373,6 +388,30 @@ def test_pending_async_forward_rows_discard_when_graph_shape_changes():
 
 
 @pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="row mapping returns CUDA tensors")
+@pytest.mark.parametrize(
+    ("pending_ids", "current_ids", "current_graph_count", "expected_status"),
+    [
+        ([10, 11], [10, 11], None, (True, False)),
+        ([10, 11, 12], [12, 10, 11], None, (True, True)),
+        ([10, 11, 12], [12, 10], None, (True, True)),
+        ([10, 11], [10, 12], None, (False, False)),
+        ([10, 11], [], None, (False, False)),
+        ([10, 11, 12], [12, 10, 11], 4, (False, False)),
+    ],
+)
+def test_async_layout_snapshot_matches_pending_forward_row_decisions(
+    pending_ids, current_ids, current_graph_count, expected_status
+):
+    controller = _make_controller_with_rows(
+        pending_ids, current_ids, current_graph_count=current_graph_count
+    )
+
+    assert controller._pending_async_forward_row_status() == expected_status
+    assert _async_layout_snapshot_status(controller) == expected_status
+
+
+@pytest.mark.internal
 def test_record_pending_forward_uses_prepared_request_order():
     controller = _make_controller_with_rows(None, [10, 11, 12])
     context = controller.inference_wrapped_model.inference_context
@@ -409,8 +448,15 @@ def test_pending_async_forward_discards_when_planned_layout_mismatches_current()
             [[6], [11]], dtype=torch.int32
         ),
     )
+    pending_snapshot = AsyncLayoutSnapshot.from_pending_forward_view(
+        controller._async_pending_forward_view, tokens_per_request=1
+    )
+    current_snapshot = AsyncLayoutSnapshot.from_context_current(context, tokens_per_request=1)
+    row_map = pending_snapshot.row_map_to_current(current_snapshot.request_ids)
 
     assert controller._pending_async_forward_row_status() == (False, False)
+    assert row_map is not None
+    assert pending_snapshot.layout_compatible_with(current_snapshot, row_map=row_map) is False
     assert controller._resolve_pending_async_forward_view() is None
     assert controller._async_discarded_forward_count == 1
 
@@ -426,7 +472,7 @@ def test_pending_async_forward_reuses_subset_when_finished_row_left():
     context.token_to_pos_ids = torch.tensor([21, 5], dtype=torch.int64)
     context.token_to_block_idx = torch.tensor([300, 100], dtype=torch.int32)
     context.token_to_local_position_within_kv_block = torch.tensor([21, 5], dtype=torch.int32)
-    controller._async_pending_forward_view = tgc_module._AsyncPendingForwardView(
+    pending_forward_view = tgc_module._AsyncPendingForwardView(
         pending_request_ids=torch.tensor([10, 11, 12], dtype=torch.int64),
         cuda_graph_request_count=3,
         planned_request_query_lengths=torch.tensor([1, 1, 1], dtype=torch.int32),
@@ -438,12 +484,21 @@ def test_pending_async_forward_reuses_subset_when_finished_row_left():
             [[5], [13], [21]], dtype=torch.int32
         ),
     )
+    controller._async_pending_forward_view = pending_forward_view
+    pending_snapshot = AsyncLayoutSnapshot.from_pending_forward_view(
+        pending_forward_view, tokens_per_request=1
+    )
+    current_snapshot = AsyncLayoutSnapshot.from_context_current(context, tokens_per_request=1)
+    row_map = pending_snapshot.row_map_to_current(current_snapshot.request_ids)
 
     pending_view = controller._resolve_pending_async_forward_view()
 
     assert pending_view is not None
     assert pending_view.row_mapped
     assert pending_view.row_indices.tolist() == [2, 0]
+    assert row_map is not None
+    assert row_map.tolist() == [2, 0]
+    assert pending_snapshot.layout_compatible_with(current_snapshot, row_map=row_map)
     assert controller._async_discarded_forward_count == 0
 
 
