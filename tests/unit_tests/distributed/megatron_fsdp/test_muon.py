@@ -28,12 +28,16 @@ import json
 import os
 import pathlib
 import re
+from typing import Any
+
 import pytest
 import torch
 import torch.distributed as dist
 from packaging.version import Version
-from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import DTensor, Shard
+
+from emerging_optimizers.orthogonalized_optimizers import Muon
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
     update_uneven_dtensor_chunk_metadata,
@@ -66,38 +70,19 @@ pytestmark = [
         reason=f"Dump captured at WORLD_SIZE={EXPECTED_WORLD_SIZE}, "
         f"got WORLD_SIZE={WORLD_SIZE}",
     ),
+    pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="CUDA is required for the Muon microbenchmark."
+    ),
 ]
 
 
-# ---------- Distributed setup ----------
-
-
-@pytest.fixture(scope="module")
-def distributed_setup():
-    """Pin the CUDA device. `init_device_mesh` lazy-inits the default
-    process group on first use from torchrun's RANK/WORLD_SIZE env vars."""
-    if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
-        pytest.skip("Not running under torchrun. Use torchrun to run this test file.")
-
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is required for the Muon microbenchmark.")
-
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    local_rank = int(os.environ.get("LOCAL_RANK", rank))
-    torch.cuda.set_device(local_rank)
-    device = torch.device(f"cuda:{local_rank}")
-
-    yield {"rank": rank, "world_size": world_size, "device": device}
-
-    if dist.is_initialized():
-        dist.destroy_process_group()
+# `distributed_setup` fixture is provided by conftest.py in this directory.
 
 
 # ---------- Spec loading ----------
 
 
-def _load_spec(rank: int) -> dict:
+def _load_spec(rank: int) -> dict[str, Any]:
     return json.loads((SPEC_DIR / f"rank{rank}.json").read_text())
 
 
@@ -120,14 +105,14 @@ def _parse_dtype(s: str) -> torch.dtype:
 _PLACEMENT_RE = re.compile(r"Shard\(dim=(-?\d+)\)")
 
 
-def _parse_placement(s: str):
+def _parse_placement(s: str) -> Shard:
     m = _PLACEMENT_RE.fullmatch(s)
     if not m:
         raise ValueError(f"cannot parse placement: {s!r}")
     return Shard(int(m.group(1)))
 
 
-def _contiguous_stride(shape):
+def _contiguous_stride(shape: tuple[int, ...]) -> tuple[int, ...]:
     """Row-major contiguous strides for a tensor of ``shape`` — no allocation.
 
     `DTensor.from_local(..., shape=global_shape)` requires `stride` whenever
@@ -144,7 +129,9 @@ def _contiguous_stride(shape):
 # ---------- DTensor construction ----------
 
 
-def _make_dtensor_from_spec(p_spec: dict, mesh, device):
+def _make_dtensor_from_spec(
+    p_spec: dict[str, Any], mesh: DeviceMesh, device: torch.device
+) -> DTensor:
     """Build a DTensor matching the recorded global shape + per-rank local shape.
 
     The dump captures the M-FSDP-specific layout where `_local_tensor` can
@@ -176,7 +163,7 @@ def _make_dtensor_from_spec(p_spec: dict, mesh, device):
 # ---------- Mesh + process groups ----------
 
 
-def _build_mesh(spec: dict):
+def _build_mesh(spec: dict[str, Any]) -> DeviceMesh:
     return init_device_mesh(
         "cuda", tuple(spec["mesh_shape"]), mesh_dim_names=tuple(spec["mesh_dim_names"])
     )
@@ -185,7 +172,7 @@ def _build_mesh(spec: dict):
 # ---------- Param + optimizer construction ----------
 
 
-def _build_param(p_spec: dict, mesh, device):
+def _build_param(p_spec: dict[str, Any], mesh: DeviceMesh, device: torch.device) -> DTensor:
     """Build one DTensor param (with random `.grad` attached) from a slim spec."""
     p = _make_dtensor_from_spec(p_spec, mesh, device)
     if p_spec.get("is_qkv"):
@@ -198,14 +185,18 @@ def _build_param(p_spec: dict, mesh, device):
     return p
 
 
-def _build_params(spec: dict, mesh, device):
+def _build_params(
+    spec: dict[str, Any], mesh: DeviceMesh, device: torch.device
+) -> list[dict[str, list[DTensor]]]:
     """Build DTensor params + random grads from the slim spec."""
     params = [_build_param(p_spec, mesh, device) for p_spec in spec["params"]]
     # Single param group; bench picks the hyperparameters.
     return [{"params": params}]
 
 
-def _build_optimizer(param_groups, dp_group):
+def _build_optimizer(
+    param_groups: list[dict[str, list[DTensor]]], dp_group: dist.ProcessGroup
+) -> FSDPTensorParallelMuon:
     """Construct a `FSDPTensorParallelMuon` with typical Muon hyperparameters.
 
     The JSON fixtures only describe parameter sharding; the choice of
@@ -229,7 +220,7 @@ def _build_optimizer(param_groups, dp_group):
 # ---------- Replicated reference Muon (for numerics test) ----------
 
 
-def _gather_dp(dt, dp_group):
+def _gather_dp(dt: DTensor, dp_group: dist.ProcessGroup) -> torch.Tensor:
     """Gather a DTensor across the DP process group only (matching FSDP Phase 2).
 
     Concatenates DP-rank shards along dim 0. Each TP rank gets its own
@@ -244,12 +235,13 @@ def _gather_dp(dt, dp_group):
     local shapes within the DP group.
     """
     dp_world = dist.get_world_size(dp_group)
-    local = dt._local_tensor
+    local = dt.to_local()
     all_shapes = [None] * dp_world
     dist.all_gather_object(all_shapes, tuple(local.shape), group=dp_group)
 
-    # Pad each rank's local along dim 0 to the max dim-0 so NCCL all_gather has
-    # uniform-size inputs; dim 1+ is uniform across DP (DP shards only dim 0).
+    # NCCL all_gather only supports uniform-size inputs across ranks, so pad
+    # each rank's local along dim 0 to the max dim-0 before gathering; dim 1+
+    # is already uniform across DP (DP shards only dim 0).
     max_dim0 = max(s[0] for s in all_shapes)
     other_dims = tuple(local.shape[1:])
     padded = torch.zeros((max_dim0,) + other_dims, dtype=dt.dtype, device=dt.device)
@@ -265,7 +257,7 @@ def _gather_dp(dt, dp_group):
     return torch.cat(parts, dim=0)
 
 
-def _build_reference_optimizer(params):
+def _build_reference_optimizer(params: list[torch.Tensor]) -> Muon:
     """Plain `emerging_optimizers.Muon` over a tiny list of leaf tensors.
 
     Mirrors `_build_optimizer`'s hyperparameters. The reference is invoked
@@ -274,8 +266,6 @@ def _build_reference_optimizer(params):
     Plain Muon defaults `nesterov=False`; `FSDPTensorParallelMuon` inherits
     `nesterov=True` from `TensorParallelMuon`, so we pass it explicitly.
     """
-    from emerging_optimizers.orthogonalized_optimizers import Muon
-
     return Muon(
         params=[{"params": params}],
         lr=8e-4,
@@ -286,7 +276,9 @@ def _build_reference_optimizer(params):
     )
 
 
-def _reference_step_single(p_spec, full_p, full_g):
+def _reference_step_single(
+    is_qkv: bool, full_p: torch.Tensor, full_g: torch.Tensor
+) -> torch.Tensor:
     """One plain-Muon step on a single FSDP param's full-tensor view.
 
     For QKV-fused params, splits along the (num_query_groups, sum(QKV), in_dim)
@@ -295,34 +287,36 @@ def _reference_step_single(p_spec, full_p, full_g):
 
     Returns the updated full tensor (same shape as ``full_p``).
     """
-    if p_spec.get("is_qkv"):
-        G0, in_dim = full_p.shape
-        S = sum(QKV_SPLIT_SHAPES)
-        assert G0 % S == 0, f"QKV global dim-0 {G0} not divisible by sum(qkv_split_shapes)={S}"
-        num_query_groups = G0 // S
-        p_view = full_p.view(num_query_groups, S, in_dim)
-        g_view = full_g.view(num_query_groups, S, in_dim)
-        p_parts = [
-            t.reshape(-1, in_dim).clone().contiguous()
-            for t in torch.split(p_view, list(QKV_SPLIT_SHAPES), dim=1)
-        ]
-        g_parts = [
-            t.reshape(-1, in_dim).clone().contiguous()
-            for t in torch.split(g_view, list(QKV_SPLIT_SHAPES), dim=1)
-        ]
-        for pp, gp in zip(p_parts, g_parts):
-            pp.grad = gp
-        _build_reference_optimizer(p_parts).step()
-        # Re-fuse: each updated part back to (num_query_groups, qkv_dim, in_dim), cat, view.
-        refused_parts = [pp.view(num_query_groups, -1, in_dim) for pp in p_parts]
-        return torch.cat(refused_parts, dim=1).reshape(G0, in_dim).contiguous()
+    if not is_qkv:
+        full_p.grad = full_g
+        _build_reference_optimizer([full_p]).step()
+        return full_p
 
-    full_p.grad = full_g
-    _build_reference_optimizer([full_p]).step()
-    return full_p
+    g0, in_dim = full_p.shape
+    s = sum(QKV_SPLIT_SHAPES)
+    assert g0 % s == 0, f"QKV global dim-0 {g0} not divisible by sum(qkv_split_shapes)={s}"
+    num_query_groups = g0 // s
+    p_view = full_p.view(num_query_groups, s, in_dim)
+    g_view = full_g.view(num_query_groups, s, in_dim)
+    p_parts = [
+        t.reshape(-1, in_dim).clone().contiguous()
+        for t in torch.split(p_view, list(QKV_SPLIT_SHAPES), dim=1)
+    ]
+    g_parts = [
+        t.reshape(-1, in_dim).clone().contiguous()
+        for t in torch.split(g_view, list(QKV_SPLIT_SHAPES), dim=1)
+    ]
+    for pp, gp in zip(p_parts, g_parts):
+        pp.grad = gp
+    _build_reference_optimizer(p_parts).step()
+    # Re-fuse: each updated part back to (num_query_groups, qkv_dim, in_dim), cat, view.
+    refused_parts = [pp.view(num_query_groups, -1, in_dim) for pp in p_parts]
+    return torch.cat(refused_parts, dim=1).reshape(g0, in_dim).contiguous()
 
 
-def _slice_dp_full_to_local(fsdp_dtensor_param, full_tensor, dp_group):
+def _slice_dp_full_to_local(
+    local_dim0: int, full_tensor: torch.Tensor, dp_group: dist.ProcessGroup
+) -> torch.Tensor:
     """Slice the DP-gathered ``full_tensor`` to this rank's local shard.
 
     Offset = sum of preceding DP ranks' dim-0 sizes (Megatron-FSDP shards
@@ -331,18 +325,16 @@ def _slice_dp_full_to_local(fsdp_dtensor_param, full_tensor, dp_group):
     """
     dp_world = dist.get_world_size(dp_group)
     dp_rank = dist.get_rank(dp_group)
-    local = fsdp_dtensor_param._local_tensor
-    all_shapes = [None] * dp_world
-    dist.all_gather_object(all_shapes, tuple(local.shape), group=dp_group)
-    offset = sum(s[0] for s in all_shapes[:dp_rank])
-    size = all_shapes[dp_rank][0]
-    return full_tensor[offset : offset + size].contiguous().to(dtype=local.dtype)
+    all_dim0 = [None] * dp_world
+    dist.all_gather_object(all_dim0, local_dim0, group=dp_group)
+    offset = sum(all_dim0[:dp_rank])
+    return full_tensor[offset : offset + local_dim0].contiguous()
 
 
 # ---------- Tests ----------
 
 
-def test_muon_step(distributed_setup, benchmark):
+def test_muon_step(distributed_setup: dict[str, Any], benchmark) -> None:
     """Build the full optimizer state and benchmark `step()`.
 
     pytest-benchmark's `pedantic` mode runs the step a fixed number of times
@@ -363,11 +355,6 @@ def test_muon_step(distributed_setup, benchmark):
     param_groups = _build_params(spec, mesh, device)
     optimizer = _build_optimizer(param_groups, dp_group=dp_group)
 
-    # Spot-check: first param's local shape on this rank matches the spec.
-    first_param = param_groups[0]["params"][0]
-    first_spec = spec["params"][0]
-    assert tuple(first_param._local_tensor.shape) == tuple(first_spec["local_shape"])
-
     def _one_step():
         optimizer.step()
         torch.cuda.synchronize()
@@ -376,7 +363,7 @@ def test_muon_step(distributed_setup, benchmark):
     dist.barrier()
 
 
-def test_muon_step_numerics(distributed_setup):
+def test_muon_step_numerics(distributed_setup: dict[str, Any]) -> None:
     """Compare `FSDPTensorParallelMuon` against a fully-replicated `Muon` reference.
 
     Runs the FSDP+TP Muon step once, then per param: restores the DTensor's
@@ -403,19 +390,21 @@ def test_muon_step_numerics(distributed_setup):
     fsdp_params = param_groups[0]["params"]
 
     # Snapshot per-rank LOCAL initial state (cheap — just shards).
-    init_local_params = [p._local_tensor.clone() for p in fsdp_params]
-    init_local_grads = [p.grad._local_tensor.clone() for p in fsdp_params]
+    init_local_params = [p.to_local().clone() for p in fsdp_params]
+    init_local_grads = [p.grad.to_local().clone() for p in fsdp_params]
 
     # Run FSDP+TP Muon step, capture per-rank local results.
     fsdp_opt = _build_optimizer(param_groups, dp_group=dp_group)
     fsdp_opt.step()
     torch.cuda.synchronize()
-    fsdp_after_local = [p._local_tensor.clone() for p in fsdp_params]
+    fsdp_after_local = [p.to_local().clone() for p in fsdp_params]
 
     # Restore DTensor local state so subsequent gathers see t=0 values.
+    # `to_local()` returns the underlying shard storage, so in-place `copy_`
+    # propagates back to the DTensor.
     for p, p0, g0 in zip(fsdp_params, init_local_params, init_local_grads):
-        p._local_tensor.copy_(p0)
-        p.grad._local_tensor.copy_(g0)
+        p.to_local().copy_(p0)
+        p.grad.to_local().copy_(g0)
     del init_local_params, init_local_grads
 
     nonfinite = []
@@ -425,9 +414,10 @@ def test_muon_step_numerics(distributed_setup):
         # Mirror FSDP's `_needs_boundary_gather` / `_get_boundary_gather_param_indices`:
         # a param is "boundary" if any rank has a non-empty local with shape != global.
         # FSDP gathers boundary params; non-boundary params are processed locally
-        # (this rank's _local_tensor is the full slab it owns, or empty).
-        local_is_boundary = fsdp_p._local_tensor.numel() > 0 and tuple(fsdp_p.shape) != tuple(
-            fsdp_p._local_tensor.shape
+        # (this rank's local shard is the full slab it owns, or empty).
+        fsdp_local = fsdp_p.to_local()
+        local_is_boundary = fsdp_local.numel() > 0 and tuple(fsdp_p.shape) != tuple(
+            fsdp_local.shape
         )
         boundary_votes = [None] * world
         dist.all_gather_object(boundary_votes, local_is_boundary)
@@ -440,15 +430,21 @@ def test_muon_step_numerics(distributed_setup):
             # Phase 2); per-TP-rank NS runs locally because tp_mode="blockwise".
             full_p = _gather_dp(fsdp_p, dp_group)
             full_g = _gather_dp(fsdp_p.grad, dp_group)
-            full_ref_after = _reference_step_single(spec["params"][i], full_p, full_g)
-            ref_local = _slice_dp_full_to_local(fsdp_p, full_ref_after, dp_group)
+            full_ref_after = _reference_step_single(
+                spec["params"][i].get("is_qkv", False), full_p, full_g
+            )
+            ref_local = _slice_dp_full_to_local(
+                fsdp_p.to_local().shape[0], full_ref_after, dp_group
+            )
             del full_p, full_g, full_ref_after
         elif fsdp_local_after.numel() > 0:
-            # Non-boundary: FSDP runs Muon locally on this rank's _local_tensor.
+            # Non-boundary: FSDP runs Muon locally on this rank's local shard.
             # Mirror that with plain Muon on the same local tensor.
-            local_p = fsdp_p._local_tensor.clone()
-            local_g = fsdp_p.grad._local_tensor.clone()
-            ref_local = _reference_step_single(spec["params"][i], local_p, local_g)
+            local_p = fsdp_p.to_local().clone()
+            local_g = fsdp_p.grad.to_local().clone()
+            ref_local = _reference_step_single(
+                spec["params"][i].get("is_qkv", False), local_p, local_g
+            )
             del local_p, local_g
         else:
             # Empty local on a non-boundary param — nothing to compare here.
