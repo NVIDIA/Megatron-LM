@@ -30,6 +30,7 @@ from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
 from megatron.core.inference.engines.abstract_engine import AbstractEngine
+from megatron.core.inference.ep_async_protocol import EPAsyncStepProtocol
 from megatron.core.inference.headers import Headers, UnknownHeaderError
 from megatron.core.inference.inference_request import (
     DynamicInferenceEvent,
@@ -262,6 +263,7 @@ class DynamicInferenceEngine(AbstractEngine):
         self.controller.set_stop_word_finished_ids_callback(
             self._get_and_clear_stop_word_finished_ids
         )
+        self.controller.set_has_active_stop_words_callback(self._has_active_stop_words)
 
         # Configure wandb to use separate step counter for inference metrics (only once)
         if self.logging_step_interval > 0 and self.metrics_writer is not None:
@@ -683,16 +685,20 @@ class DynamicInferenceEngine(AbstractEngine):
         # initialize zmq-based EP communicator
         self.ep_rank = get_pg_rank(self.pg_collection.ep)
         self.ep_world_size = get_pg_size(self.pg_collection.ep)
+        self.ep_async_step_protocol = EPAsyncStepProtocol()
         self._ep_consensus_loop_counter = 0
         self._last_ep_consensus: tuple[int, bool] = (0, False)
         if self.ep_world_size > 1:
             self.expert_parallel_zmq_communicator = AsyncZMQCommunicator(
                 self.zmq_context, process_group=self.pg_collection.ep, hostname=hostname
             )
+            self.ep_async_step_protocol = EPAsyncStepProtocol(self.expert_parallel_zmq_communicator)
             # Give the context a CPU-side MAX-reduction primitive so
             # match_graph_config() can avoid a per-step NCCL AllReduce kernel.
             if hasattr(self.context, "set_ep_zmq_communicator"):
                 self.context.set_ep_zmq_communicator(self.expert_parallel_zmq_communicator)
+            if hasattr(self.controller, "set_ep_async_protocol"):
+                self.controller.set_ep_async_protocol(self.ep_async_step_protocol)
 
         # initialize zmq-based world communicator for consensus barriers
         total_world_size = torch.distributed.get_world_size()
@@ -1007,6 +1013,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 "Set materialize_only_last_token_logits to False in DynamicInferenceContext "
                 "or skip_prompt_log_probs to True in SamplingParams."
             )
+
+        self.controller.note_request_sampling_params(request.sampling_params)
 
         if request.sampling_params.num_tokens_total is not None:
             request.sampling_params.num_tokens_to_generate = (
@@ -1480,6 +1488,17 @@ class DynamicInferenceEngine(AbstractEngine):
         self.stop_word_finished_request_ids -= result
         return result
 
+    def _has_active_stop_words(self, active_request_ids: list[int]) -> bool:
+        """Return whether any active request depends on stop-word handling."""
+
+        for request_id in active_request_ids:
+            if request_id in self.stop_word_finished_request_ids:
+                return True
+            request_entry = self.requests.get(request_id)
+            if request_entry is not None and request_entry.record[-1].stop_word_ids:
+                return True
+        return False
+
     def _check_stop_words_for_request_post_append(
         self, request: DynamicInferenceRequest
     ) -> Tuple[bool, int]:
@@ -1842,8 +1861,56 @@ class DynamicInferenceEngine(AbstractEngine):
 
         return result, context_state, step_time
 
+    def _send_finished_records_to_coordinator(
+        self, finished_request_records: list[DynamicInferenceRequestRecord]
+    ) -> None:
+        """Queue completed request records for the data-parallel coordinator."""
+
+        if not self.use_coordinator or not self.is_mp_coordinator:
+            return
+
+        # Failed request replies were already sent in _handle_failed_request,
+        # so only send completed records here.
+        records_to_send = [
+            r for r in finished_request_records if r.requests[-1].status != Status.FAILED
+        ]
+        if not records_to_send:
+            return
+
+        payload = self._pack_finished_records_for_coordinator(records_to_send)
+        self._send_coordinator_reply_payload(payload)
+
+    @staticmethod
+    def _pack_finished_records_for_coordinator(
+        records_to_send: list[DynamicInferenceRequestRecord],
+    ) -> bytes:
+        """Serialize finished request records for a coordinator reply."""
+
+        nvtx_range_push("coordinator_reply_pack")
+        try:
+            return msgpack.packb(
+                [Headers.ENGINE_REPLY.value, [r.merge().serialize() for r in records_to_send]],
+                use_bin_type=True,
+            )
+        finally:
+            nvtx_range_pop("coordinator_reply_pack")
+
+    def _send_coordinator_reply_payload(self, payload: bytes) -> None:
+        """Send an already-packed coordinator reply payload."""
+
+        nvtx_range_push("coordinator_reply_send")
+        try:
+            self.socket_for_receiving_requests.send(payload)
+        finally:
+            nvtx_range_pop("coordinator_reply_send")
+
     async def async_bookkeep(
-        self, step_result: Optional[Dict], context_state: Dict, step_time: float
+        self,
+        step_result: Optional[Dict],
+        context_state: Dict,
+        step_time: float,
+        *,
+        send_coordinator_replies: bool = True,
     ):
         """Uses `asyncio` for continuous bookkeeping.
 
@@ -1931,21 +1998,8 @@ class DynamicInferenceEngine(AbstractEngine):
                     )
             nvtx_range_pop("detokenization")
 
-        # Handle necessary ZMQ DP coordinator communication.
-        # Failed request replies were already sent in _handle_failed_request,
-        # so only send completed records here.
-        if self.use_coordinator and self.is_mp_coordinator:
-            records_to_send = [
-                r for r in finished_request_records if r.requests[-1].status != Status.FAILED
-            ]
-            if records_to_send:
-                nvtx_range_push("coordinator_communication")
-                payload = msgpack.packb(
-                    [Headers.ENGINE_REPLY.value, [r.merge().serialize() for r in records_to_send]],
-                    use_bin_type=True,
-                )
-                self.socket_for_receiving_requests.send(payload)
-                nvtx_range_pop("coordinator_communication")
+        if send_coordinator_replies:
+            self._send_finished_records_to_coordinator(finished_request_records)
 
         # Drain prefix cache hit counters from context into engine accumulators.
         if self.context.enable_prefix_caching:
@@ -2080,6 +2134,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     self._prefix_cache_hits,
                     self._prefix_cache_blocks_matched,
                 )
+            async_summary = self.context.async_scheduling_counters_summary()
+            if async_summary:
+                output_str += f" ... async (cumul): {async_summary}"
             if context_state["is_decode_only"]:
                 output_str = f"\033[94m{output_str}\033[0m"
             logging.info(output_str)
@@ -2094,7 +2151,7 @@ class DynamicInferenceEngine(AbstractEngine):
         }
 
     async def async_step(
-        self,
+        self, *, send_coordinator_replies: bool = True
     ) -> Tuple[List[DynamicInferenceRequest], List[DynamicInferenceRequest], float]:
         """
         Wrapper for controller.generate_output_tokens_dynamic_batch(), to
@@ -2108,7 +2165,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 3. The step time in seconds.
         """
         last_step_data = await self.async_forward()
-        ret = await self.async_bookkeep(*last_step_data)
+        ret = await self.async_bookkeep(
+            *last_step_data, send_coordinator_replies=send_coordinator_replies
+        )
         # Keep for compatibility with current test suite.
         return ret
 
@@ -2380,8 +2439,6 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         nvtx_range_push("_ep_establish_consensus")
 
-        consensus_val = -1 if signal_consensus else 0
-
         # Signals can be received asynchronously on EP ranks.
         # We do not want a rank to pause prematurely if its peers have yet to receive the signal.
         # So this is an *attempt* to process the signal. This rank has received the signal
@@ -2390,21 +2447,45 @@ class DynamicInferenceEngine(AbstractEngine):
         # will be zero and we will defer processing the signal.
         # When all ranks receive the signal, global consensus will be -1 and we can process.
 
-        if self.ep_world_size > 1:
-            # Note that it is important to use a non-blocking asyncio-friendly all-reduce here.
-            # The user may have other tasks running in the event loop that need to be serviced.
-            # Do not using a torch.distributed blocking all-reduce here using nccl/gloo.
-            # We have tried that and it blocks the event loop in megatron-rl.
-            global_work, global_consensus = (
-                await self.expert_parallel_zmq_communicator.all_reduce_max(
-                    local_work, consensus_val, async_op=(not self.use_synchronous_zmq_collectives)
-                )
-            )
-        else:
-            global_work, global_consensus = local_work, consensus_val
+        # Note that it is important to use a non-blocking asyncio-friendly all-reduce here.
+        # The user may have other tasks running in the event loop that need to be serviced.
+        # Do not use a torch.distributed blocking all-reduce here using nccl/gloo.
+        # We have tried that and it blocks the event loop in megatron-rl.
+        consensus = await self.ep_async_step_protocol.establish_work_consensus(
+            local_work, signal_consensus, async_op=(not self.use_synchronous_zmq_collectives)
+        )
 
         nvtx_range_pop("_ep_establish_consensus")
-        return global_work, global_consensus == -1
+        return consensus.global_work, consensus.all_pausing
+
+    async def _ep_complete_work_step(self) -> None:
+        """Keep real and dummy EP ranks aligned before the next work consensus."""
+
+        if self.ep_world_size > 1:
+            nvtx_range_push("_ep_complete_work_step")
+            await self.ep_async_step_protocol.complete_work_step(
+                async_op=(not self.use_synchronous_zmq_collectives)
+            )
+            nvtx_range_pop("_ep_complete_work_step")
+        else:
+            self.ep_async_step_protocol.complete_idle_step()
+
+    async def _run_ep_work_step(self, local_pending: int) -> None:
+        """Run one coordinator-driven EP work step and close it before external replies."""
+
+        finished_request_records = None
+        if local_pending > 0:
+            step_result = await self.async_step(send_coordinator_replies=False)
+            finished_request_records = step_result["finished_request_records"]
+        else:
+            self.controller.dummy_forward()
+            self.context.step_count += 1
+            self.context.prefix_cache_lru_clock += 1
+
+        await self._ep_complete_work_step()
+
+        if finished_request_records is not None:
+            self._send_finished_records_to_coordinator(finished_request_records)
 
     async def _world_barrier(self):
         """World-wide ZMQ all-reduce barrier for global rank consensus.
@@ -2493,25 +2574,16 @@ class DynamicInferenceEngine(AbstractEngine):
 
                     if all_pausing:
                         # All EP peers are PAUSING: pause immediately.
+                        self.ep_async_step_protocol.complete_idle_step()
                         await self._world_barrier()
                         self.state = EngineState.PAUSED
                         self._state_events[EngineState.PAUSED].set()
                     elif global_work > 0:
                         # At least one EP peer has work: all must participate.
-                        if local_pending > 0:
-                            await self.async_step()
-                        else:
-                            # Dummy forward to participate in the EP collective.
-                            self.step_start_event.record()
-                            nvtx_range_push("EP-dummy-forward")
-                            self.controller.dummy_forward()
-                            self.step_end_event.record()
-                            self.step_end_event.synchronize()
-                            nvtx_range_pop("EP-dummy-forward")
-                            self.context.step_count += 1
-                            self.context.prefix_cache_lru_clock += 1
+                        await self._run_ep_work_step(local_pending)
                     else:
                         # No work, but not all pausing: idle.
+                        self.ep_async_step_protocol.complete_idle_step()
                         await asyncio.sleep(0.02)
 
                 elif self.state == EngineState.PAUSED:

@@ -20,6 +20,10 @@ from megatron.core.inference.communication_utils import (
     is_pipeline_last_stage,
 )
 from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
+from megatron.core.inference.ep_async_protocol import (
+    EPAsyncHandoffDecision,
+    EPStepBeginDecision,
+)
 from megatron.core.inference.contexts.static_context import StaticInferenceContext
 from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
@@ -143,6 +147,21 @@ class TextGenerationController:
         """
         self._get_stop_word_finished_ids_callback = callback
 
+    def set_has_active_stop_words_callback(self, callback):
+        """Set a callback to test whether active requests depend on stop-word handling."""
+
+        self._has_active_stop_words_callback = callback
+
+    def note_request_sampling_params(self, sampling_params: SamplingParams) -> None:
+        """Record request features that affect async scheduling hot-path checks."""
+
+        if sampling_params.return_log_probs or sampling_params.top_n_logprobs > 0:
+            self._async_logprob_requests_seen = True
+        if sampling_params.top_k != 1 or sampling_params.top_p != 0.0:
+            self._async_non_greedy_requests_seen = True
+        if sampling_params.stop_words:
+            self._async_stop_word_requests_seen = True
+
     def _init_dynamic_sampling_tensors(self):
         """Initialize tensors needed for dynamic sampling."""
         context = self.inference_wrapped_model.inference_context
@@ -155,6 +174,7 @@ class TextGenerationController:
 
         # Callback to get request IDs that should be marked as finished due to stop words
         self._get_stop_word_finished_ids_callback = None
+        self._has_active_stop_words_callback = None
 
         device = torch.cuda.current_device()
         logits_dtype = self.inference_wrapped_model.config.params_dtype
@@ -176,6 +196,12 @@ class TextGenerationController:
         #     - `self._sampled_tokens_cuda` is rebound to the output of `sample_kernel`,
         #     which uses CudaGraphManager syntactic sugar to keep it as a static tensor.
         self._sampled_tokens_cuda = None
+        self._greedy_sample_values_cuda = torch.empty(
+            max_requests, dtype=logits_dtype, device=device
+        )
+        self._greedy_sampled_tokens_cuda = torch.empty(
+            max_requests, dtype=torch.int64, device=device
+        )
 
         # Sampling backend: provides the sampling kernel.
         if self._sampling_backend == "flashinfer":
@@ -187,6 +213,24 @@ class TextGenerationController:
             )
         else:
             self._sampling: Sampling = TorchSampling(self.sampling_rng, self.vocab_size)
+
+        self._async_pending_forward_plan = None
+        self._async_pending_cuda_graph_request_count = None
+        self._async_copy_stream = torch.cuda.Stream(device=device)
+        self._async_sample_ready_event = torch.cuda.Event()
+        self._async_sample_transfer_done_event = torch.cuda.Event()
+        self._async_child_h2d_done_event = torch.cuda.Event()
+        self._async_sampled_tokens_cpu = torch.empty(
+            max_requests, dtype=torch.int64, device='cpu', pin_memory=True
+        )
+        self._ep_forward_phase_open = False
+        self._dummy_context_h2d_done_event = None
+        self._ep_async_protocol = None
+        self._ep_async_handoff_decided_this_step = False
+        self._ep_async_handoff_decision_this_step: Optional[EPAsyncHandoffDecision] = None
+        self._async_logprob_requests_seen = False
+        self._async_non_greedy_requests_seen = False
+        self._async_stop_word_requests_seen = False
 
         # Cache values that are constant across inference steps.
         self._unwrapped_model = unwrap_model(self.inference_wrapped_model.model)
@@ -559,7 +603,9 @@ class TextGenerationController:
 
         # Single batch CPU-to-GPU transfer of bookkeeping state.
         range_push("transfer_bookkeeping_to_gpu")
-        context.transfer_bookkeeping_to_gpu()
+        h2d_done_event = context.transfer_bookkeeping_to_gpu(record_done_event=is_dummy_forward)
+        if is_dummy_forward:
+            self._dummy_context_h2d_done_event = h2d_done_event
         range_pop()
 
         set_moe_metadata_sync(unwrapped_model)
@@ -1035,6 +1081,78 @@ class TextGenerationController:
         # Expose the active slice so downstream code sees the right length.
         self._last_accepted_seq_indices = self._last_accepted_seq_indices_buf[:active_request_count]
 
+    def _active_requests_use_greedy_sampling(
+        self, active_request_count: Optional[int] = None
+    ) -> bool:
+        """Return whether active requests are deterministic greedy requests."""
+
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = (
+            context.total_request_count - context.paused_request_count
+            if active_request_count is None
+            else active_request_count
+        )
+        if active_request_count <= 0:
+            return True
+        if not self._async_non_greedy_requests_seen:
+            return True
+
+        active_metadata = context.active_request_metadata
+        active_slice = slice(0, active_request_count)
+        return bool(
+            (active_metadata["top_k"][active_slice] == 1).all()
+            and (active_metadata["top_p"][active_slice] == 0.0).all()
+        )
+
+    def _active_requests_have_stop_words(self) -> bool:
+        """Return whether active requests can finish through CPU stop-word handling."""
+
+        if self._has_active_stop_words_callback is None:
+            return False
+        if not self._async_stop_word_requests_seen:
+            return False
+        context = self.inference_wrapped_model.inference_context
+        active_slice = slice(context.paused_request_count, context.total_request_count)
+        active_request_ids = context.request_ids[active_slice].tolist()
+        return bool(self._has_active_stop_words_callback(active_request_ids))
+
+    def _dynamic_step_required_token_logits(self) -> Tensor:
+        """Return the per-active-request logits consumed by normal decode sampling."""
+
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+        if context.config.materialize_only_last_token_logits:
+            return self._all_logits_cuda.squeeze(0)[:active_request_count, :]
+        return context.last_token_logits(
+            self._all_logits_cuda[:, : context.padded_active_token_count, :]
+        )
+
+    def _dynamic_step_sample_logits_greedy(self) -> None:
+        """Greedy-sample logits into the stable sampled-token buffer."""
+
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+        if active_request_count <= 0:
+            self._sampled_tokens_cuda = self._greedy_sampled_tokens_cuda
+            return
+        required_token_logits = self._dynamic_step_required_token_logits()
+        torch.max(
+            required_token_logits[:active_request_count],
+            dim=-1,
+            out=(
+                self._greedy_sample_values_cuda[:active_request_count],
+                self._greedy_sampled_tokens_cuda[:active_request_count],
+            ),
+        )
+        self._sampled_tokens_cuda = self._greedy_sampled_tokens_cuda
+
+    def _dynamic_step_sample_logits_to_next_input_ids(self) -> None:
+        """Sample logits and write sampled ids into prepared next-step GPU inputs."""
+
+        context = self.inference_wrapped_model.inference_context
+        self._dynamic_step_sample_logits()
+        context.copy_async_prepared_decode_input_ids_from_samples(self._sampled_tokens_cuda)
+
     def _dynamic_step_sample_logits(self):
         """Sample tokens from logits for dynamic batching."""
         # TODO(ksanthanam): Evaluate whether it makes more sense to sample on 1 rank
@@ -1042,6 +1160,10 @@ class TextGenerationController:
 
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
+        if self._active_requests_use_greedy_sampling(active_request_count):
+            self._dynamic_step_sample_logits_greedy()
+            return
+
         use_graph = (
             self._sampling_backend == "flashinfer"
             and self._enable_cuda_graph
@@ -1079,6 +1201,24 @@ class TextGenerationController:
             (context.active_request_metadata["return_log_probs"][:active_request_count]).any(),
             (context.active_request_metadata["top_n_logprobs"][:active_request_count] > 0).any(),
         )
+
+    def _active_requests_need_logprob_results(self) -> bool:
+        """Return whether active requests need generated-token logprob work."""
+
+        if not self._async_logprob_requests_seen:
+            return False
+
+        return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
+        return bool(return_log_probs or return_top_n_logprobs)
+
+    def _should_collect_dynamic_logprob_bookkeeping(
+        self, *, async_next_prepared: bool, pending_forward_reused: bool
+    ) -> bool:
+        """Return whether this step must inspect logprob request metadata."""
+
+        if not (async_next_prepared or pending_forward_reused):
+            return True
+        return self._active_requests_need_logprob_results()
 
     def _router_record_bookkeeping(self) -> Optional[np.ndarray]:
         """Collect flat routing indices for MoE router recording.
@@ -1469,16 +1609,149 @@ class TextGenerationController:
 
         return top_n_results if top_n_results else None
 
+    def set_ep_async_protocol(self, protocol) -> None:
+        """Attach the EP async protocol used by coordinator-driven EP decoding."""
+
+        self._ep_async_protocol = protocol
+
+    def _pending_async_forward_reusable(self) -> bool:
+        """Return whether this rank's pending async forward still matches live CPU state."""
+
+        plan = self._async_pending_forward_plan
+        if plan is None:
+            return True
+        context = self.inference_wrapped_model.inference_context
+        return context.prepared_async_request_ids_match_live(plan)
+
+    def _discard_pending_async_forward(self) -> None:
+        """Drop a pending async forward and release resources reserved for it."""
+
+        context = self.inference_wrapped_model.inference_context
+        if self._async_pending_forward_plan is not None:
+            self._async_pending_forward_plan = None
+            self._async_pending_cuda_graph_request_count = None
+            context.clear_async_prepared_decode_plan()
+            context.release_deferred_async_resources()
+            context.record_async_scheduling_counter("discard")
+
+    def _decide_ep_step_begin(self, *, has_real_work: bool) -> EPStepBeginDecision:
+        """Synchronize pending async state at the beginning of an EP work step."""
+
+        self._ep_async_handoff_decided_this_step = False
+        self._ep_async_handoff_decision_this_step = None
+        has_pending_forward = self._async_pending_forward_plan is not None
+        pending_forward_reusable = self._pending_async_forward_reusable()
+
+        if self._ep_async_protocol is not None and self._ep_async_protocol.enabled:
+            return self._ep_async_protocol.decide_step_begin(
+                has_real_work=has_real_work,
+                has_pending_forward=has_pending_forward,
+                pending_forward_reusable=pending_forward_reusable,
+            )
+
+        return EPStepBeginDecision(
+            step_id=-1,
+            has_real_work=has_real_work,
+            reuse_pending_forward=bool(has_pending_forward and pending_forward_reusable),
+            discard_pending_forward=bool(has_pending_forward and not pending_forward_reusable),
+        )
+
+    def _decide_ep_async_handoff(
+        self, *, has_real_work: bool, can_launch_async_handoff: bool
+    ) -> EPAsyncHandoffDecision:
+        """Synchronize whether this EP work step launches an async forward handoff."""
+
+        if self._ep_async_handoff_decision_this_step is not None:
+            return self._ep_async_handoff_decision_this_step
+
+        self._ep_async_handoff_decided_this_step = True
+        if self._ep_async_protocol is not None and self._ep_async_protocol.enabled:
+            decision = self._ep_async_protocol.decide_async_handoff(
+                has_real_work=has_real_work, can_launch_async_handoff=can_launch_async_handoff
+            )
+            self._ep_async_handoff_decision_this_step = decision
+            return decision
+
+        decision = EPAsyncHandoffDecision(
+            step_id=-1,
+            has_real_work=has_real_work,
+            launch_async_forward=can_launch_async_handoff,
+            skip_async_forward=not can_launch_async_handoff,
+            any_launch_request=can_launch_async_handoff,
+            any_skip_request=not can_launch_async_handoff,
+        )
+        self._ep_async_handoff_decision_this_step = decision
+        return decision
+
+    def _ensure_ep_async_handoff_decided(self, *, has_real_work: bool) -> None:
+        """Publish an explicit EP async handoff skip when this step did not attempt one."""
+
+        if self._ep_async_handoff_decided_this_step:
+            return
+        self._decide_ep_async_handoff(has_real_work=has_real_work, can_launch_async_handoff=False)
+
+    def _wait_for_dummy_context_h2d(self) -> None:
+        """Wait for dummy metadata H2D before reusing its pinned CPU source buffer."""
+
+        h2d_done_event = self._dummy_context_h2d_done_event
+        if h2d_done_event is None:
+            return
+        h2d_done_event.synchronize()
+        self._dummy_context_h2d_done_event = None
+
+    def _dummy_async_handoff_disabled_reason(self) -> Optional[str]:
+        """Return why a dummy EP rank cannot mirror an async handoff, or None."""
+
+        context = self.inference_wrapped_model.inference_context
+        if not context.config.enable_async_scheduling:
+            return "skip_disabled"
+        if self.num_speculative_tokens != 0:
+            return "skip_mtp"
+        if self.model_is_pipeline_parallel:
+            return "skip_pipeline_parallel"
+        if not self._enable_cuda_graph:
+            return "skip_no_cuda_graph"
+        return None
+
+    def _try_launch_dummy_async_handoff(self) -> bool:
+        """Mirror the real-rank async forward handoff on an EP dummy rank."""
+
+        context = self.inference_wrapped_model.inference_context
+        disabled_reason = self._dummy_async_handoff_disabled_reason()
+        handoff_decision = self._decide_ep_async_handoff(
+            has_real_work=False, can_launch_async_handoff=(disabled_reason is None)
+        )
+        if disabled_reason is not None:
+            context.record_async_scheduling_counter(disabled_reason)
+            return False
+        if not handoff_decision.launch_async_forward:
+            context.record_async_scheduling_counter("ep_async_handoff_skipped")
+            return False
+
+        self._wait_for_dummy_context_h2d()
+        context.reset()
+        range_push("ep_dummy_async_handoff")
+        try:
+            input_ids, position_ids = self._dynamic_step_context_init(is_dummy_forward=True)
+            self._dynamic_step_forward_logits(input_ids, position_ids)
+            context.record_async_scheduling_counter("dummy_launch")
+        finally:
+            range_pop()
+        return True
+
     @torch.inference_mode()
     def dummy_forward(self):
         """Perform a dummy forward pass. This is used in expert model parallelism
         on ranks that do not have any real requests. It may run in eager mode."""
 
         context = self.inference_wrapped_model.inference_context
+        step_begin_decision = self._decide_ep_step_begin(has_real_work=False)
 
-        # attempt to use cuda-graph if possible
-        input_ids, position_ids = self._dynamic_step_context_init(is_dummy_forward=True)
-        self._dynamic_step_forward_logits(input_ids, position_ids)
+        # If real ranks are reusing a pending async forward, the matching dummy
+        # forward already ran in the previous step's async handoff.
+        if not step_begin_decision.reuse_pending_forward:
+            input_ids, position_ids = self._dynamic_step_context_init(is_dummy_forward=True)
+            self._dynamic_step_forward_logits(input_ids, position_ids)
 
         # Disable MoE padding for MTP computation, unless CUDA graphs
         # are active (the graphs were captured with padding enabled).
@@ -1493,6 +1766,9 @@ class TextGenerationController:
         # all-to-all collectives. The dummy rank must participate in these
         # collectives to avoid a hang.
         self._dummy_serial_mtp_forward()
+
+        self._try_launch_dummy_async_handoff()
+        self._wait_for_dummy_context_h2d()
 
         # clear the context of any temporary state from the dummy forward
         context.reset()
@@ -1600,7 +1876,30 @@ class TextGenerationController:
             sampled_mtp_tokens_cpu = None
         return sampled_tokens_cpu, sampled_mtp_tokens_cpu
 
-    def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
+    def _start_async_sample_transfer(self, active_request_count: int) -> None:
+        """Copy sampled tokens to pinned CPU memory on a side stream."""
+
+        self._async_sample_ready_event.record(torch.cuda.current_stream())
+        with torch.cuda.stream(self._async_copy_stream):
+            self._async_copy_stream.wait_event(self._async_sample_ready_event)
+            self._async_sampled_tokens_cpu[:active_request_count].copy_(
+                self._sampled_tokens_cuda[:active_request_count], non_blocking=True
+            )
+            self._async_sample_transfer_done_event.record(self._async_copy_stream)
+
+    def _finish_async_sample_transfer(self, active_request_count: int) -> Tensor:
+        """Return sampled tokens after the side-stream D2H copy is complete."""
+
+        self._async_sample_transfer_done_event.synchronize()
+        return self._async_sampled_tokens_cpu[:active_request_count]
+
+    def _dynamic_step_context_bookkeeping(
+        self,
+        *,
+        sampled_tokens_cpu: Optional[Tensor] = None,
+        sampled_mtp_tokens_cpu: Optional[Tensor] = None,
+        h2d_done_event: Optional[torch.cuda.Event] = None,
+    ) -> Dict[str, Tensor]:
         """Update the dynamic inference context after sampling.
 
         Args:
@@ -1619,12 +1918,13 @@ class TextGenerationController:
         active_request_count = context.total_request_count - context.paused_request_count
         active_request_slice = slice(context.paused_request_count, context.total_request_count)
 
-        # Batch GPU-to-CPU transfer of all sampled tokens.
-        range_push("transfer_samples_to_cpu")
-        sampled_tokens_cpu, sampled_mtp_tokens_cpu = self._transfer_samples_to_cpu(
-            active_request_count
-        )
-        range_pop()
+        if sampled_tokens_cpu is None:
+            # Batch GPU-to-CPU transfer of all sampled tokens.
+            range_push("transfer_samples_to_cpu")
+            sampled_tokens_cpu, sampled_mtp_tokens_cpu = self._transfer_samples_to_cpu(
+                active_request_count
+            )
+            range_pop()
 
         range_push("active_request_mask")
         # Everything below is 100% CPU.
@@ -1673,9 +1973,13 @@ class TextGenerationController:
                     finished_routing_block_ids[req_id] = valid
 
         # Clone needed: update_requests mutates next_tokens in-place via tensor_swap,
-        # which would corrupt the reused buffer.
-        new_sample_copy = sampled_tokens_cpu.clone()
+        # and async D2H uses a pinned buffer that is reused on the next step.
+        sample_for_return = sampled_tokens_cpu.clone()
+        new_sample_copy = sample_for_return.clone()
         range_pop()
+
+        if h2d_done_event is not None:
+            h2d_done_event.synchronize()
 
         range_push("update_requests")
         update_result = context.update_requests(
@@ -1690,10 +1994,104 @@ class TextGenerationController:
             # .cpu() in _transfer_samples_to_cpu; update_requests only mutates
             # the separate new_sample_copy). Returning the CPU copy avoids a
             # D2H sync when the engine later calls sample.tolist().
-            "sample": sampled_tokens_cpu,
+            "sample": sample_for_return,
             "finished_routing_block_ids": finished_routing_block_ids,
             **(update_result or {}),
         }
+
+    def _retire_dynamic_forward_side_effects(self) -> None:
+        """Commit side effects produced by the most recent dynamic forward pass."""
+
+        context = self.inference_wrapped_model.inference_context
+
+        if context.is_hybrid_model and context.mamba_slot_allocator is not None:
+            context.mamba_slot_allocator.commit_intermediate_states()
+
+        context.kv_block_allocator.store_routing_per_block(self._router_record_bookkeeping())
+
+    def _try_use_async_pending_forward(self) -> bool:
+        """Use logits from a launched async child if the no-reject invariant holds."""
+
+        plan = self._async_pending_forward_plan
+        if plan is None:
+            return False
+
+        context = self.inference_wrapped_model.inference_context
+        if not context.prepared_async_request_ids_match_live(plan):
+            self._async_pending_forward_plan = None
+            self._async_pending_cuda_graph_request_count = None
+            context.clear_async_prepared_decode_plan()
+            context.release_deferred_async_resources()
+            context.record_async_scheduling_counter("invariant_failure")
+            raise RuntimeError("async decode child invariant failed before reuse")
+
+        context.record_async_scheduling_counter("reuse")
+        if context.is_hybrid_model:
+            context.accept_async_mamba_state(plan.request_ids)
+        self._retire_dynamic_forward_side_effects()
+        context.release_deferred_async_resources()
+        context.clear_async_prepared_decode_plan()
+        return True
+
+    def _try_prepare_async_decode_next_step(
+        self, *, skip_bookkeeping: bool
+    ) -> bool:
+        """Prepare next-step metadata when the child layout is deterministic."""
+
+        context = self.inference_wrapped_model.inference_context
+        if (
+            not context.config.enable_async_scheduling
+            or self.num_speculative_tokens != 0
+            or self._active_requests_need_logprob_results()
+            or skip_bookkeeping
+            or self._active_requests_have_stop_words()
+        ):
+            return False
+
+        return context.prepare_async_decode_next_step()
+
+    def _launch_async_prepared_decode_forward(
+        self, active_request_count: int
+    ) -> Optional[torch.cuda.Event]:
+        """Launch the already-prepared child decode forward after sampling."""
+
+        context = self.inference_wrapped_model.inference_context
+        plan = context.async_prepared_decode_plan()
+        if plan is None:
+            context.record_async_scheduling_counter("launch_missing_plan")
+            return None
+        handoff_decision = self._decide_ep_async_handoff(
+            has_real_work=True, can_launch_async_handoff=True
+        )
+        if not handoff_decision.launch_async_forward:
+            context.clear_async_prepared_decode_plan()
+            context.record_async_scheduling_counter("ep_async_handoff_skipped")
+            return None
+
+        range_push("async_transfer_bookkeeping_to_gpu")
+        h2d_done_event = context.transfer_bookkeeping_to_gpu(
+            include_token_to_input_ids=False,
+            refresh_request_staging=False,
+            record_done_event=True,
+            done_event=self._async_child_h2d_done_event,
+        )
+        range_pop()
+
+        next_input_ids, next_position_ids = context.current_input_and_position_ids()
+        config = self.inference_wrapped_model.model.config
+        if config.moe_enable_routing_replay:
+            RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+        range_push("async_decode_child_forward")
+        self._dynamic_step_forward_logits(next_input_ids, next_position_ids)
+        range_pop()
+
+        self._async_pending_forward_plan = plan
+        self._async_pending_cuda_graph_request_count = (
+            context.padded_active_request_count if context.using_cuda_graph_this_step() else None
+        )
+        context.mark_async_forward_in_flight()
+        context.record_async_scheduling_counter("launch")
+        return h2d_done_event
 
     async def async_generate_output_tokens_dynamic_batch(
         self, skip_bookkeeping: Optional[bool] = False
@@ -1719,37 +2117,48 @@ class TextGenerationController:
         if context.active_token_count == 0 and active_request_count == 0:
             return None
 
+        pending_forward_reused = False
+        async_next_prepared = False
+        async_sample_transfer_started = False
+        async_h2d_done_event = None
+        ep_step_begin_decision = self._decide_ep_step_begin(has_real_work=True)
+        if ep_step_begin_decision.discard_pending_forward:
+            self._discard_pending_async_forward()
+
         with torch.inference_mode():
-            input_ids, position_ids = self._dynamic_step_context_init()
-
-            cuda_graph_request_count = (
-                context.padded_active_request_count
-                if context.using_cuda_graph_this_step()
-                else None
+            input_ids = None
+            pending_forward_reused = (
+                ep_step_begin_decision.reuse_pending_forward
+                and self._try_use_async_pending_forward()
             )
+            if pending_forward_reused:
+                cuda_graph_request_count = self._async_pending_cuda_graph_request_count
+                self._async_pending_forward_plan = None
+                self._async_pending_cuda_graph_request_count = None
+            else:
+                input_ids, position_ids = self._dynamic_step_context_init()
 
-            # Enable routing recording before forward pass if routing replay is enabled
-            config = self.inference_wrapped_model.model.config
-            if config.moe_enable_routing_replay:
-                RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+                cuda_graph_request_count = (
+                    context.padded_active_request_count
+                    if context.using_cuda_graph_this_step()
+                    else None
+                )
 
-            # Forward pass produces only base logits. When speculative decoding is
-            # active, MTP logits are computed serially after verification.
-            range_push("forward_pass")
-            self._dynamic_step_forward_logits(input_ids, position_ids)
+                # Enable routing recording before forward pass if routing replay is enabled
+                config = self.inference_wrapped_model.model.config
+                if config.moe_enable_routing_replay:
+                    RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
 
-            # Commit Mamba intermediate states before update_requests, which
-            # may swap request indices. The Python lists tracking EOS block IDs
-            # and intermediate offsets are not swapped along with tensors, so
-            # commit must run while indices are still valid.
-            if context.is_hybrid_model and context.mamba_slot_allocator is not None:
-                context.mamba_slot_allocator.commit_intermediate_states()
+                # Forward pass produces only base logits. When speculative decoding is
+                # active, MTP logits are computed serially after verification.
+                range_push("forward_pass")
+                self._dynamic_step_forward_logits(input_ids, position_ids)
+                self._retire_dynamic_forward_side_effects()
+                range_pop()
 
-            # Collect flat routing indices and scatter them into per-block storage.
-            # Must be done before update_requests while token-to-block mappings are valid.
-            # Reconstruction happens from blocks at request completion.
-            context.kv_block_allocator.store_routing_per_block(self._router_record_bookkeeping())
-            range_pop()
+            async_next_prepared = self._try_prepare_async_decode_next_step(
+                skip_bookkeeping=bool(skip_bookkeeping),
+            )
 
         # This is the best place to yield control back to event loop.
         # At this point we have enqueued FW pass GPU kernels asynchronously.
@@ -1758,15 +2167,16 @@ class TextGenerationController:
         # asynchronous.
         # Todo [Siddharth]: Can we condition the sleep on a cuda event?
         # NOTE [TDE]: This will be moved once CPU and GPU methods are separated.
-        await asyncio.sleep(0)
+        if not async_next_prepared and not pending_forward_reused:
+            await asyncio.sleep(0)
 
         with torch.inference_mode():
             range_push("sampling")
-            return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
 
             if self.num_speculative_tokens > 0:
                 # Phase 1: Verify speculative tokens using base logits only.
                 nvtx_range_push("mtp-spec-decoding/verify")
+                assert input_ids is not None
                 self._dynamic_step_sample_logits_and_verify_tokens(input_ids)
                 nvtx_range_pop("mtp-spec-decoding/verify")
                 # Phase 2: Rewind KV cache for rejected tokens.
@@ -1789,10 +2199,31 @@ class TextGenerationController:
                 # data-dependent boolean-mask sync overlaps with MTP GPU work.
                 context.kv_block_allocator.release_memory_blocks(blocks_to_release[remove_mask])
             else:
-                self._dynamic_step_sample_logits()
+                if async_next_prepared:
+                    self._dynamic_step_sample_logits_to_next_input_ids()
+                    self._start_async_sample_transfer(active_request_count)
+                    async_sample_transfer_started = True
+                    async_h2d_done_event = self._launch_async_prepared_decode_forward(
+                        active_request_count
+                    )
+                    if async_h2d_done_event is None:
+                        context.clear_async_prepared_decode_plan()
+                        async_next_prepared = False
+                else:
+                    self._dynamic_step_sample_logits()
+
+            self._ensure_ep_async_handoff_decided(has_real_work=True)
 
             log_probs = None
             top_n_logprobs = None
+            if self._should_collect_dynamic_logprob_bookkeeping(
+                async_next_prepared=async_next_prepared,
+                pending_forward_reused=pending_forward_reused,
+            ):
+                return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
+            else:
+                return_log_probs = False
+                return_top_n_logprobs = False
             if return_log_probs or return_top_n_logprobs:
                 if self.num_speculative_tokens > 0:
                     log_probs, log_probs_tensor = (
@@ -1825,6 +2256,12 @@ class TextGenerationController:
                 request_bookkeeping = {
                     "sample": self._sampled_tokens_cuda[:active_request_count].cpu()
                 }
+            elif async_sample_transfer_started:
+                sampled_tokens_cpu = self._finish_async_sample_transfer(active_request_count)
+                request_bookkeeping = self._dynamic_step_context_bookkeeping(
+                    sampled_tokens_cpu=sampled_tokens_cpu,
+                    h2d_done_event=async_h2d_done_event,
+                )
             else:
                 # request_bookkeeping supplies "sample" as the already-CPU
                 # tensor produced by _transfer_samples_to_cpu.

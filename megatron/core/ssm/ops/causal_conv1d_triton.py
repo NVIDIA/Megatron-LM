@@ -47,6 +47,7 @@ def causal_conv1d_update_kernel(
     out_s_stride,
     out_c_stride,
     conv_state_indices_ptr,
+    conv_state_write_indices_ptr,
     batch,
     seq_len,
     dim,
@@ -55,7 +56,9 @@ def causal_conv1d_update_kernel(
     BLOCK_DIM: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     HAS_STATE_INDICES: tl.constexpr,
+    HAS_WRITE_STATE_INDICES: tl.constexpr,
     HAS_INT_STATE: tl.constexpr,
+    STATE_BANK_COUNT: tl.constexpr,
     SILU_ACTIVATION: tl.constexpr,
 ):
     """Triton implementation of causal_conv1d_update (kernel)."""
@@ -70,6 +73,10 @@ def causal_conv1d_update_kernel(
         state_batch_coord = tl.load(conv_state_indices_ptr + batch_id)
     else:
         state_batch_coord = batch_id
+    if HAS_WRITE_STATE_INDICES:
+        write_state_batch_coord = tl.load(conv_state_write_indices_ptr + batch_id)
+    else:
+        write_state_batch_coord = state_batch_coord
 
     # Base Pointers
     conv_state_ptrs = (
@@ -77,10 +84,15 @@ def causal_conv1d_update_kernel(
         + state_batch_coord * conv_state_b_stride
         + channel_offsets * conv_state_c_stride
     )
+    conv_state_write_ptrs = (
+        conv_state_ptr
+        + write_state_batch_coord * conv_state_b_stride
+        + channel_offsets * conv_state_c_stride
+    )
     weight_ptrs = weight_ptr + channel_offsets * weight_c_stride
 
     # Skip padding tokens (block-level uniform condition)
-    if state_batch_coord < 0:
+    if state_batch_coord < 0 or write_state_batch_coord < 0:
         for s in range(seq_len):
             out_ptrs = (
                 out_ptr
@@ -227,6 +239,7 @@ def causal_conv1d_update_kernel(
             out_val = out_val * tl.sigmoid(out_val)
 
         tl.store(out_ptrs, out_val.to(out_ptrs.dtype.element_ty), mask=mask)
+        conv_state_ptrs = conv_state_write_ptrs
 
 
 def causal_conv1d_update(
@@ -236,7 +249,9 @@ def causal_conv1d_update(
     bias: torch.Tensor | None,
     silu_activation: bool,
     conv_state_indices: torch.Tensor | None,
+    conv_state_write_indices: torch.Tensor | None = None,
     intermediate_conv_states: torch.Tensor | None = None,
+    state_bank_count: int = 1,
 ) -> torch.Tensor:
     """Triton implementation of causal_conv1d_update (entrypoint)."""
 
@@ -263,6 +278,11 @@ def causal_conv1d_update(
     else:
         conv_state_indices = x  # Dummy pointer
         has_state_indices = False
+    if conv_state_write_indices is not None:
+        has_write_state_indices = True
+    else:
+        conv_state_write_indices = x  # Dummy pointer
+        has_write_state_indices = False
 
     # Extract intermediate state strides if provided
     if intermediate_conv_states is not None:
@@ -307,6 +327,7 @@ def causal_conv1d_update(
         out.stride(1),
         out.stride(2),
         conv_state_indices,
+        conv_state_write_indices,
         batch,
         seq_len,
         dim,
@@ -315,7 +336,9 @@ def causal_conv1d_update(
         BLOCK_DIM=BLOCK_DIM,
         HAS_BIAS=has_bias,
         HAS_STATE_INDICES=has_state_indices,
+        HAS_WRITE_STATE_INDICES=has_write_state_indices,
         HAS_INT_STATE=has_int_state,
+        STATE_BANK_COUNT=state_bank_count,
         SILU_ACTIVATION=silu_activation == "silu",
     )
 
