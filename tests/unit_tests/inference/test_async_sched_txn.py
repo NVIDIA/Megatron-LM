@@ -2132,3 +2132,79 @@ class TestC6Ungate(AsyncSchedTxnTestBase):
         assert diag.launched > 0
         assert diag.adopted > 0
         assert diag.guard_failures == 0
+
+
+@pytest.mark.skipif(
+    not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+)
+@pytest.mark.internal
+class TestC7Hardening(AsyncSchedTxnTestBase):
+    """C7: boundary hardening -- admission deferral, barrier recovery, drain.
+
+    The ungated overlap launches a forward speculatively each step. A new request admitted while
+    that forward is in flight would allocate KV under a layout the forward did not compute, forcing
+    an adopt-guard barrier (or racing a deferred free). C7 DEFERS admission: while a forward is in
+    flight and a request is waiting, the next launch is suppressed (a sync prime step), so the
+    following step has no forward in flight and admits safely. The bar is token-exact async==serial
+    across staggered mid-decode admission, with the overlap still firing and the adopt guard never
+    failing (deferral prevents the barrier).
+    """
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+        )
+
+    @classmethod
+    def teardown_class(cls):
+        delete_cuda_graphs()
+        set_rounder(64)
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _cuda_graph_kwargs(**overrides):
+        cfg = dict(
+            model_provider="gpt",
+            num_requests=4,
+            num_tokens_to_generate=20,
+            use_fixed_output_lengths=True,
+            num_cuda_graphs=4,
+            force_build_cuda_graphs=True,
+            inference_cuda_graph_scope=InferenceCudaGraphScope.block,
+            use_cuda_graphs_for_non_decode_steps=False,
+            context_max_requests=128,
+        )
+        cfg.update(overrides)
+        return cfg
+
+    @pytest.mark.internal
+    def test_staggered_admission_deferred_equals_serial(self) -> None:
+        """Requests admitted mid-decode (num_gap_steps>0, so a new prefill lands while a forward is
+        in flight): token-exact async==serial, the overlap fired, and the consume-by-request-id
+        adopt guard never tripped -- the C7 admission deferral admits on a clean step, so a forward
+        in flight is never adopted against a layout that grew under it."""
+        serial_env, async_env = self.assert_async_equals_serial(
+            **self._cuda_graph_kwargs(num_requests=5, num_gap_steps=3)
+        )
+        diag = async_env.engine.step_txn_manager.diagnostics
+        assert async_env.engine.controller._async_launch_before_commit_count > 0
+        assert diag.guard_failures == 0, (
+            "admission deferral must prevent the adopt-guard barrier "
+            f"(guard_failures={diag.guard_failures})"
+        )
+
+    @pytest.mark.internal
+    def test_staggered_admission_nongreedy_equals_serial(self) -> None:
+        """Same, with per-request-RNG sampling: a survivor's keyed draws are unperturbed by a new
+        request admitted on a deferred (sync prime) step."""
+        serial_env, async_env = self.assert_async_equals_serial(
+            **self._cuda_graph_kwargs(
+                num_requests=6, num_gap_steps=2, use_fixed_output_lengths=False
+            )
+        )
+        assert async_env.engine.controller._async_launch_before_commit_count > 0
+        assert async_env.engine.step_txn_manager.diagnostics.guard_failures == 0

@@ -1786,8 +1786,21 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.state in (EngineState.SUSPENDED, EngineState.SUSPENDING):
             raise EngineSuspendedError(self.context.step_count)
 
-        # schedule requests
-        self.schedule_waiting_requests()
+        # schedule requests.
+        # C7 admission deferral: when a launch-before-commit forward is in flight, defer admitting
+        # new requests. A new prefill's allocate_memory_blocks must not run while a speculative
+        # forward built on the prior layout is in flight (it would allocate from the same pool a
+        # lazily-finished slot may return to, and would force an adopt-guard barrier). The
+        # controller is told to suppress the next launch (a sync prime step) so the FOLLOWING step
+        # has no forward in flight and admits safely. The non-async / no-inflight path is unchanged.
+        inflight_pending = (
+            self.enable_async_scheduling and getattr(self.controller, "_inflight", None) is not None
+        )
+        defer_admission = inflight_pending and len(self.waiting_request_ids) > 0
+        if self.enable_async_scheduling:
+            self.controller._async_defer_launch_for_admission = defer_admission
+        if not defer_admission:
+            self.schedule_waiting_requests()
 
         # Transactional async-scheduling (opt-in): drain the retire queue, then wrap
         # this step as an always-adopted serial transaction. This commit keeps the

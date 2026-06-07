@@ -222,6 +222,11 @@ class TextGenerationController:
         # the ring is lazily built on first overlap use. The serial path leaves both None.
         self._step_txn_manager: Optional["StepTransactionManager"] = None
         self._async_sample_ring: Optional["AsyncSampleRing"] = None
+        # C7 admission deferral: set by the engine when a waiting request is admittable but a
+        # forward is still in flight. While set, the prestage suppresses the launch so the NEXT
+        # step is clean (no forward in flight) and the engine can admit then -- a new prefill never
+        # allocates KV from the pool under an in-flight forward built on the prior layout.
+        self._async_defer_launch_for_admission = False
         # Diagnostic: number of forwards launched before the prior step's update_requests.
         self._async_launch_before_commit_count = 0
         # Diagnostic: set True whenever update_requests runs while a speculative forward that
@@ -1943,6 +1948,13 @@ class TextGenerationController:
         if not context.using_cuda_graph_this_step():
             return None
 
+        # C7: admission deferral. A waiting request is admittable but a forward is still in flight,
+        # so suppress this launch -- the next step then has no forward in flight and the engine
+        # admits there (the new prefill never allocates KV under an in-flight forward built on the
+        # prior layout). A sync prime step this step keeps async == serial.
+        if self._async_defer_launch_for_admission:
+            return None
+
         # C5: pre-exclude host-known max-length finishers from the launch snapshot. Predict which
         # active requests reach max_sequence_length at the pending commit using the C3 host-maxlen
         # survival mask -- exactly prepare_commit's max-length term for this step (no D2H, no GPU
@@ -2243,6 +2255,7 @@ class TextGenerationController:
         lazily on first use. The serial path never carries a manager, so it never builds a ring.
         """
         self._step_txn_manager = manager
+        self._async_defer_launch_for_admission = False
         # A reset rewinds the context; drop any pending read-back so a stale source ref / event is
         # not later consumed. The ring is rebuilt lazily (it sizes to the context's max_requests).
         if self._async_sample_ring is not None:
@@ -2263,10 +2276,15 @@ class TextGenerationController:
         The pipeline normally consumes its in-flight forward on the next step; this clears the
         record when the engine tears down or rewinds, so no stale snapshot is consumed later. The
         forward's transaction leases are read-only (the prestage allocates nothing), so the
-        in-flight handle and the manager's child transaction are simply dropped, and the async
-        read-back ring is drained so no pending D2H references a soon-to-be-freed tensor.
+        in-flight handle and the manager's child transaction are simply dropped. C7: the in-flight
+        forward's completion fence is drained first, so a still-running forward's KV/metadata reads
+        finish before a teardown frees the buffers it reads; the async read-back ring is then
+        drained so no pending D2H references a soon-to-be-freed tensor.
         """
+        if self._inflight is not None and self._inflight.forward_done_event is not None:
+            self._inflight.forward_done_event.synchronize()
         self._inflight = None
+        self._async_defer_launch_for_admission = False
         if self._step_txn_manager is not None:
             self._step_txn_manager.child_txn = None
         if self._async_sample_ring is not None:
