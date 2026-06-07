@@ -13,15 +13,11 @@ from megatron.lite.primitive.protocols import ExpertClassifierFn, default_expert
 
 
 def validate_mc_config(engine_cfg) -> None:
-    """Guard the current proof-of-concept surface for mc."""
-    if engine_cfg.model_name not in {"qwen3_moe", "qwen3_5"}:
-        raise ValueError(
-            "optimizer_impl='mc' currently supports only qwen3_moe and qwen3_5."
-        )
+    """Validate dist_opt constraints owned by this optimizer primitive."""
     p = engine_cfg.parallel
     if p.vpp > 1 and p.pp == 1:
         raise ValueError(
-            "optimizer_impl='mc' requires pp>1 when vpp>1."
+            "dist_opt requires pp>1 when vpp>1."
         )
 
 
@@ -56,7 +52,7 @@ def _ensure_mc_mpu_parallel_state(engine_cfg) -> None:
         )
         if current != expected:
             raise RuntimeError(
-                "MC optimizer found an incompatible existing Megatron-Core parallel state: "
+                "dist_opt found an incompatible existing Megatron-Core parallel state: "
                 f"current={current}, expected={expected}."
             )
         return
@@ -332,7 +328,7 @@ def _build_pg_collection(ps, engine_cfg):
     from megatron.core.process_groups_config import ProcessGroupCollection
 
     if ps.pp_group is None:
-        raise ValueError("optimizer_impl='mc' requires a local pp_group.")
+        raise ValueError("dist_opt requires a local pp_group.")
 
     def _dense_rank(tp_i: int, cp_i: int, dp_i: int, pp_i: int) -> int:
         return ((pp_i * ps.dp_size + dp_i) * ps.cp_size + cp_i) * ps.tp_size + tp_i
