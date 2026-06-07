@@ -72,6 +72,7 @@ class LinearFc1Builder(Protocol):
         tp_comm_buffer_name: str | None,
         tp_group: torch.distributed.ProcessGroup | None,
         stride: int = 1,
+        name: str | None = None,
     ) -> LinearFc1Interface:
         """Builds a linear_fc1 layer for MLP."""
         ...
@@ -122,6 +123,7 @@ class LinearFc2Builder(Protocol):
         is_expert: bool,
         tp_comm_buffer_name: str | None,
         tp_group: torch.distributed.ProcessGroup | None,
+        name: str | None = None,
     ) -> LinearFc2Interface:
         """Builds a linear_fc2 layer for MLP."""
         ...
@@ -169,7 +171,12 @@ class MLP(MegatronModule):
         input_size: Optional[int] = None,
         ffn_hidden_size: Optional[int] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         super().__init__(config=config)
 
         self.config: TransformerConfig = config
@@ -218,6 +225,7 @@ class MLP(MegatronModule):
             tp_comm_buffer_name="fc1",
             tp_group=tp_group,
             stride=fc1_stride,
+            name=(name + ".linear_fc1") if name is not None else None,
         )
 
         if self.config.use_te_activation_func and not (submodules.activation_func is None):
@@ -238,6 +246,7 @@ class MLP(MegatronModule):
             is_expert=is_expert,
             tp_comm_buffer_name="fc2",
             tp_group=tp_group,
+            name=(name + ".linear_fc2") if name is not None else None,
         )
 
     def forward(
@@ -375,6 +384,7 @@ class MLP(MegatronModule):
         is_expert: bool = False,
         input_size: int | None = None,
         ffn_hidden_size: int | None = None,
+        name: str | None = None,
     ) -> MLP:
         """Helper function to build an MLP as a TransformerLayer's mlp submodule."""
         del is_mtp_layer
@@ -388,6 +398,7 @@ class MLP(MegatronModule):
             is_expert=is_expert,
             input_size=input_size,
             ffn_hidden_size=ffn_hidden_size,
+            name=name,
         )
 
 

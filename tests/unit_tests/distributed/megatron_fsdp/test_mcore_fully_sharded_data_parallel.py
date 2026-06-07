@@ -15,12 +15,18 @@ from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import HAVE_TE_MXFP8TENSOR
+from megatron.core.fp8_utils import HAVE_TE
+from megatron.core.full_cuda_graph import FullCudaGraphWrapper, StaticBufferLoader
 from megatron.core.hyper_comm_grid import HyperCommGrid
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.mamba_layer import MambaLayer
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from megatron.core.utils import is_torch_min_version
+from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.utils import is_te_min_version, is_torch_min_version
 from tests.unit_tests.distributed.megatron_fsdp.utils import (
     make_gpt_mock_data_iterator,
     make_moe_args_model_and_optimizer,
@@ -31,8 +37,6 @@ from tests.unit_tests.test_utilities import Utils
 
 
 # Test model for testing FSDP
-@pytest.mark.flaky
-@pytest.mark.flaky_in_dev
 class TestModel(torch.nn.Module):
     def __init__(self, input_dim, output_dim):
         super().__init__()
@@ -48,8 +52,6 @@ class TestModel(torch.nn.Module):
 
 
 # Test model with uniform shaped weights for testing FSDP
-@pytest.mark.flaky
-@pytest.mark.flaky_in_dev
 class TestModelUniform(torch.nn.Module):
     def __init__(self, hidden_dim):
         super().__init__()
@@ -80,8 +82,6 @@ def setup_seed(seed):
     torch.backends.cudnn.benchmark = False  # Disable auto-tuner for reproducibility
 
 
-@pytest.mark.flaky
-@pytest.mark.flaky_in_dev
 class TestFullyShardedDataParallel:
     @classmethod
     def setup_class(cls):
@@ -739,8 +739,8 @@ class TestFullyShardedDataParallel:
             Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize("num_fsdp_group", [2])
-    @pytest.mark.skipIf(
-        torch.cuda.device_count() % 2 == 0, "This test requires an odd number of GPUs"
+    @pytest.mark.skipif(
+        torch.cuda.device_count() % 2 == 0, reason="This test requires an odd number of GPUs"
     )
     def test_fsdp_with_hybrid_sharding(self, num_fsdp_group):
         """Test that FSDP works correctly with hybrid sharding."""
@@ -909,6 +909,7 @@ class TestMegatronFSDPE2E:
 
         return outputs
 
+    @pytest.mark.flaky_in_dev
     @pytest.mark.skipif(
         not is_torch_min_version("2.4.0"), reason="Test needs to be updated for torch >= 2.4.0"
     )
@@ -1025,6 +1026,230 @@ class TestMegatronFSDPE2E:
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+    @staticmethod
+    def _reset_full_cuda_graph_static_state():
+        """Reset class-level state on FullCudaGraphWrapper / StaticBufferLoader
+        so a test that uses the wrapper does not see leftovers from a previous
+        test in this process."""
+        FullCudaGraphWrapper.curr_iteration = {'training': 0, 'validation': 0}
+        FullCudaGraphWrapper.cuda_graph = {'training': None, 'validation': None}
+        FullCudaGraphWrapper.result = {'training': None, 'validation': None}
+        StaticBufferLoader.static_buffers = {'training': [], 'validation': []}
+
+    @staticmethod
+    def _reset_cuda_rng_tracker():
+        """Force a fresh CUDA RNG tracker on the next initialize_rng_tracker
+        call. A prior test in this process may have created a non-cudagraphable
+        tracker (states stored as Tensors); without a reset, the cuda-graph
+        path would later feed those Tensors into ``Generator.graphsafe_set_state``
+        and raise ``TypeError: expected a Generator, but got Tensor``."""
+        from megatron.core.tensor_parallel import random as _tp_random
+
+        _tp_random._CUDA_RNG_STATE_TRACKER = None
+        _tp_random._CUDA_RNG_STATE_TRACKER_INITIALIZED = False
+
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.4.0"), reason="Test needs to be updated for torch >= 2.4.0"
+    )
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("1.5.0")),
+        reason=(
+            "TransformerEngine FusedAdam and RNG tracker required for "
+            "full-iteration CUDA graphability with Megatron-FSDP."
+        ),
+    )
+    @pytest.mark.parametrize(
+        "extra_overrides",
+        [
+            pytest.param({}, id="fsdp"),
+            pytest.param(
+                dict(num_distributed_optimizer_instances=2, outer_dp_sharding_strategy="optim"),
+                id="hsdp_optim_outer_dp2",
+            ),
+        ],
+    )
+    def test_full_iteration_cuda_graph_e2e(self, extra_overrides):
+        """
+        End-to-end test for Megatron-FSDP + full-iteration CUDA graph.
+
+        Variants:
+          * ``fsdp``: pure FSDP (single distributed-optimizer instance).
+          * ``hsdp_optim_outer_dp2``: Hybrid FSDP with two outer DP groups,
+            outer-DP sharding strategy ``optim``.
+
+        Asserts:
+          1. ``FullCudaGraphWrapper.cuda_graph['training']`` is populated by
+             the end of training (i.e. capture happened).
+          2. Decoupled gradients are globally present before every
+             ``optimizer.step``.
+          3. Loss decreases across the run.
+        """
+        import argparse
+        import os
+        from functools import partial
+
+        from torch.optim.optimizer import register_optimizer_step_pre_hook
+
+        import pretrain_gpt as _pretrain_gpt
+        from megatron.core.enums import ModelType
+        from megatron.core.rerun_state_machine import destroy_rerun_state_machine
+        from megatron.core.transformer.enums import CudaGraphScope
+        from megatron.training import pretrain
+        from megatron.training.argument_utils import pretrain_cfg_container_from_args
+        from megatron.training.arguments import add_megatron_arguments, validate_args
+        from megatron.training.global_vars import set_global_variables, unset_global_variables
+
+        # Because we are using pretrain() to test, destroy the entire global state
+        # before calling pretrain() for the next test case.
+        TestMegatronFSDPE2E._reset_full_cuda_graph_static_state()
+        TestMegatronFSDPE2E._reset_cuda_rng_tracker()
+        mpu.destroy_model_parallel()
+        unset_global_variables()
+        destroy_rerun_state_machine()
+        for _v in ("NVTE_FLASH_ATTN", "NVTE_FUSED_ATTN", "NVTE_UNFUSED_ATTN"):
+            os.environ.pop(_v, None)
+
+        # Minimal setup for Megatron-FSDP and CUDA graphs.
+        arg_overrides = dict(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            seq_length=256,
+            max_position_embeddings=256,
+            micro_batch_size=1,
+            global_batch_size=8,
+            train_iters=8,
+            lr=1e-4,
+            mock_data=True,
+            tokenizer_type="NullTokenizer",
+            vocab_size=256,
+            bf16=True,
+            use_megatron_fsdp=True,
+            ckpt_format="fsdp_dtensor",
+            use_precision_aware_optimizer=True,
+            cuda_graph_impl="full_iteration",
+            check_for_nan_in_loss_and_grad=False,
+            eval_iters=0,
+            eval_interval=8,
+            **extra_overrides,
+        )
+
+        # Test loss and gradients when using full-iter CG with FSDP.
+        losses: list[torch.Tensor] = []
+        grads_present_steps: list[bool] = []
+
+        orig_forward_step = _pretrain_gpt.forward_step
+
+        def wrapped_forward_step(*args, **kwargs):
+            output_tensor, loss_func_partial = orig_forward_step(*args, **kwargs)
+
+            def wrapped_loss(*la, **lk):
+                ret = loss_func_partial(*la, **lk)
+                try:
+                    if isinstance(ret, tuple) and len(ret) >= 1:
+                        report = ret[-1] if isinstance(ret[-1], dict) else None
+                        if report and "lm loss" in report:
+                            val = report["lm loss"]
+                            if isinstance(val, torch.Tensor):
+                                if val.numel() >= 2:
+                                    loss_sum, num_toks = val[0], val[1]
+                                    per_token = loss_sum / num_toks.clamp(min=1)
+                                    losses.append(per_token.detach().clone())
+                                else:
+                                    losses.append(val.detach().clone())
+                except Exception:
+                    pass
+                return ret
+
+            return output_tensor, wrapped_loss
+
+        # Pre-step hook on every Optimizer.step — verify decoupled grads are
+        # visible before the optimizer reads them. With Megatron-FSDP +
+        # precision-aware optimizer the FusedAdam reads from
+        # ``param.decoupled_grad``.
+        def pre_step_hook(optimizer, args_, kwargs_):
+            local_present = any(
+                getattr(p, "decoupled_grad", None) is not None
+                and (
+                    getattr(p, "decoupled_grad")._local_tensor
+                    if hasattr(getattr(p, "decoupled_grad"), "_local_tensor")
+                    else getattr(p, "decoupled_grad")
+                )
+                .count_nonzero()
+                .item()
+                > 0
+                for group in optimizer.param_groups
+                for p in group["params"]
+            )
+            gathered = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(gathered, local_present)
+            grads_present_steps.append(any(gathered))
+
+        hook_handle = register_optimizer_step_pre_hook(pre_step_hook)
+        cuda_graph_was_captured = False
+
+        try:
+            # Setup argument overrides for FSDP <> CG test.
+            parser = argparse.ArgumentParser(allow_abbrev=False)
+            add_megatron_arguments(parser)
+            parser.set_defaults(**arg_overrides)
+            args = parser.parse_args([])
+            args._is_global_batch_size_explicitly_specified = args.global_batch_size is not None
+            args.rank = int(os.getenv("RANK", "0"))
+            args.world_size = int(os.getenv("WORLD_SIZE", "1"))
+            validate_args(args)
+            set_global_variables(args)
+            cfg = pretrain_cfg_container_from_args(args)
+
+            from gpt_builders import gpt_builder
+            from model_provider import model_provider
+
+            pretrain(
+                cfg,
+                _pretrain_gpt.train_valid_test_datasets_provider,
+                partial(model_provider, gpt_builder),
+                ModelType.encoder_or_decoder,
+                wrapped_forward_step,
+                get_embedding_ranks=_pretrain_gpt.get_embedding_ranks,
+            )
+            # Validate CUDA graph was captured and thus replayed.
+            cuda_graph_was_captured = FullCudaGraphWrapper.cuda_graph.get("training") is not None
+        finally:
+            hook_handle.remove()
+            TestMegatronFSDPE2E._reset_full_cuda_graph_static_state()
+            TestMegatronFSDPE2E._reset_cuda_rng_tracker()
+            mpu.destroy_model_parallel()
+            unset_global_variables()
+            destroy_rerun_state_machine()
+
+        # ---- Assertions ----
+        assert cuda_graph_was_captured, (
+            "FullCudaGraphWrapper did not capture a training CUDA graph "
+            "during pretrain(). Capture either failed silently or the "
+            "wrapper was not engaged."
+        )
+
+        assert len(grads_present_steps) > 0, (
+            "Optimizer pre-step hook never fired — pretrain() did not run "
+            "any optimizer.step calls."
+        )
+        assert all(grads_present_steps), (
+            f"Decoupled gradients were missing on at least one "
+            f"optimizer.step call. Per-step presence trace: "
+            f"{grads_present_steps}"
+        )
+
+        finite_losses = [float(l) for l in losses if torch.isfinite(l).all()]
+        assert len(finite_losses) >= 2, (
+            f"Need at least two finite loss observations to check "
+            f"convergence; got {len(finite_losses)}: {finite_losses}"
+        )
+        assert finite_losses[-1] < finite_losses[0], (
+            f"Loss did not decrease across {len(finite_losses)} steps: "
+            f"first={finite_losses[0]:.6f}, last={finite_losses[-1]:.6f}, "
+            f"trace={finite_losses}"
+        )
+
 
 def compare_losses(loss_a: float, loss_b: float, reference: str = "b"):
     """
@@ -1073,11 +1298,236 @@ def compare_losses(loss_a: float, loss_b: float, reference: str = "b"):
     return {"abs_diff": abs_diff, "rel_diff": rel_diff, "better": better}
 
 
-class TestFsdpHybridModelDoubleBuffer:
-    """Smoke test: hybrid (attention + Mamba) model trained for a few steps
-    under Megatron FSDP with TransformerLayer and MambaLayer marked as FSDP
-    unit modules and fsdp_double_buffer=True.
+class TestFsdpNonUnitBucketPreservation:
+    """Regression test for the non-FSDP-unit bucket preservation fix.
+
+    Non-FSDP-unit buckets must remain persistently allocated: cross-module
+    readers (e.g. MambaMixer.forward, which reads self.conv1d.weight as a
+    raw tensor via causal_conv1d_fn(weight=...) instead of self.conv1d(...))
+    can dereference them at any time. Before the fix, AllGatherPipeline.reset()
+    freed every bucket's gather scratch — including the non-unit one — and
+    because nn.Module.__call__ is never invoked on conv1d, no hook ever fires
+    to refresh conv1d.weight's wbuf.data (set_param_data=True) afterwards.
+    The next forward then dereferences freed storage.
+
+    A small bucket_size is required so conv1d.weight lands in a different
+    non-unit bucket from MambaMixer's recurse=False params (A_log/D/dt_bias);
+    otherwise MambaMixer's own pre-forward hook gathers the shared bucket
+    and incidentally refreshes conv1d.weight, masking the bug.
     """
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel()
+
+    @classmethod
+    def teardown_class(cls):
+        Utils.destroy_model_parallel()
+
+    def test_non_unit_bucket_preserved_across_param_sync(self):
+        if not is_torch_min_version("2.4.0"):
+            pytest.skip("Megatron FSDP requires torch >= 2.4.0")
+        if Utils.world_size != 2:
+            pytest.skip("Requires exactly 2 GPUs (DP=2).")
+        pytest.importorskip("mamba_ssm")
+        pytest.importorskip("causal_conv1d")
+        pytest.importorskip("einops")
+
+        from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+        from megatron.core.ssm.mamba_layer import MambaLayer
+        from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+        from megatron.core.transformer.transformer_layer import TransformerLayer
+
+        # MambaMixer's __init__ reads the 'model-parallel-rng' tracker.
+        model_parallel_cuda_manual_seed(0)
+
+        # HIDDEN=256 is the floor: mamba's d_inner = 2*HIDDEN = 512, nheads =
+        # d_inner / mamba_head_dim(64) = 8, and nheads % mamba_num_groups(8) == 0.
+        HIDDEN = 256
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=HIDDEN,
+            num_attention_heads=4,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            normalization="RMSNorm",
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+
+        class HybridStack(torch.nn.Module):
+            def __init__(self, config, pg_collection):
+                super().__init__()
+                self.attn_layer = TransformerLayer(
+                    config=config,
+                    submodules=hybrid_stack_spec.submodules.attention_layer.submodules,
+                    layer_number=1,
+                    pg_collection=pg_collection,
+                    add_layer_offset=False,
+                )
+                self.mamba_layer = MambaLayer(
+                    config=config,
+                    submodules=hybrid_stack_spec.submodules.mamba_layer.submodules,
+                    layer_number=2,
+                    pg_collection=pg_collection,
+                )
+
+            def forward(self, hidden_states):
+                h, _ = self.attn_layer(hidden_states=hidden_states, attention_mask=None)
+                return self.mamba_layer(hidden_states=h)
+
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
+        model = HybridStack(config, pg_collection).cuda().to(torch.bfloat16)
+
+        # bucket_size=4096 forces conv1d.weight into a separate non-unit bucket
+        # from MambaMixer's recurse=False params; fsdp_unit_modules=[TransformerLayer]
+        # matches the production default in mcore_fsdp_adapter.py.
+        fsdp_model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                data_parallel_sharding_strategy="optim_grads_params",
+                overlap_grad_reduce=True,
+                overlap_param_gather=True,
+                bucket_size=4096,
+                use_megatron_fsdp=True,
+            ),
+            module=model,
+            fsdp_unit_modules=[TransformerLayer],
+        )
+
+        # Guard against future bucketing changes silently masking the bug.
+        non_unit_buckets = [
+            pg
+            for pg in fsdp_model.param_and_grad_buffer.parameter_groups
+            if pg.fsdp_unit_id is None
+        ]
+        assert len(non_unit_buckets) >= 2, (
+            f"Expected non-unit params to split across multiple buckets, "
+            f"got {len(non_unit_buckets)}. bucket_size may be too large."
+        )
+
+        x = torch.randn(64, 2, HIDDEN, device="cuda", dtype=torch.bfloat16)
+        out = fsdp_model(x)
+        out.sum().backward()
+        # Mirrors what the pipeline schedule does after backward: finalize_model_grads
+        # calls fsdp_model.finish_grad_sync(), which calls synchronize_param_gather()
+        # (because overlap_param_gather=True), which calls AllGatherPipeline.reset() —
+        # the buggy entry point that frees non-unit buckets.
+        finalize_model_grads([fsdp_model])
+        fsdp_model(x)
+
+        # Surface any deferred CUDA errors before teardown.
+        torch.cuda.synchronize()
+
+
+class TestFsdpMambaConvParamGather:
+    """Regression repro for Mamba fused conv params under Megatron FSDP.
+
+    The fused causal-conv path reads conv weight and bias views inside
+    MambaMixer.forward. Those parameters must therefore be shallow MambaMixer
+    parameters so the existing non-unit module pre-forward hook gathers them.
+    This test makes that dependency deterministic by disabling AG prefetch before
+    the first forward.
+    """
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel()
+
+    @classmethod
+    def teardown_class(cls):
+        Utils.destroy_model_parallel()
+
+    def test_mamba_fused_conv_param_without_prefetch(self):
+        if not is_torch_min_version("2.4.0"):
+            pytest.skip("Megatron FSDP requires torch >= 2.4.0")
+        if Utils.world_size < 2:
+            pytest.skip("Requires at least 2 GPUs (DP>=2).")
+
+        # MambaMixer's __init__ reads the 'model-parallel-rng' tracker.
+        model_parallel_cuda_manual_seed(0)
+
+        # HIDDEN=256 is the floor: d_inner = 2 * HIDDEN, nheads = d_inner / 64,
+        # and nheads must be divisible by the default mamba_num_groups=8.
+        HIDDEN = 256
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=HIDDEN,
+            num_attention_heads=4,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            normalization="RMSNorm",
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+
+        class HybridStack(torch.nn.Module):
+            def __init__(self, config, pg_collection):
+                super().__init__()
+                self.attn_layer = TransformerLayer(
+                    config=config,
+                    submodules=hybrid_stack_spec.submodules.attention_layer.submodules,
+                    layer_number=1,
+                    pg_collection=pg_collection,
+                    add_layer_offset=False,
+                )
+                self.mamba_layer = MambaLayer(
+                    config=config,
+                    submodules=hybrid_stack_spec.submodules.mamba_layer.submodules,
+                    layer_number=2,
+                    pg_collection=pg_collection,
+                )
+
+            def forward(self, hidden_states):
+                h, _ = self.attn_layer(hidden_states=hidden_states, attention_mask=None)
+                return self.mamba_layer(hidden_states=h)
+
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
+        model = HybridStack(config, pg_collection).cuda().to(torch.bfloat16)
+        mixer_state = model.mamba_layer.mixer.state_dict()
+        assert "conv1d_weight" in mixer_state
+        assert not hasattr(model.mamba_layer.mixer, "conv1d")
+
+        fsdp_model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                data_parallel_sharding_strategy="optim_grads_params",
+                overlap_grad_reduce=True,
+                overlap_param_gather=True,
+                bucket_size=4096,
+                use_megatron_fsdp=True,
+            ),
+            module=model,
+            fsdp_unit_modules=[TransformerLayer],
+        )
+
+        non_unit_buckets = [
+            pg
+            for pg in fsdp_model.param_and_grad_buffer.parameter_groups
+            if pg.fsdp_unit_id is None
+        ]
+        assert len(non_unit_buckets) >= 2, (
+            "Expected non-unit params to split across multiple buckets; "
+            "bucket_size may be too large and could mask this repro."
+        )
+        conv_weight = fsdp_model.module.raw_param["mamba_layer.mixer.conv1d_weight"]
+        conv_bucket_id = fsdp_model.param_and_grad_buffer.param_to_param_group[conv_weight]
+        assert (
+            fsdp_model.param_and_grad_buffer.parameter_groups[conv_bucket_id].fsdp_unit_id is None
+        ), "conv1d_weight should be a shallow non-unit MambaMixer parameter."
+
+        # Disabling prefetch isolates the fused conv path: the forward cannot
+        # incidentally gather conv1d_weight from an earlier module hook.
+        x = torch.randn(64, 2, HIDDEN, device="cuda", dtype=torch.bfloat16)
+        fsdp_model.module.suggested_AG_prefetch_size = 0
+        fsdp_model(x)
+
+        # Surface any deferred CUDA errors before teardown.
+        torch.cuda.synchronize()
+
+
+class TestFsdpHybridModelDoubleBuffer:
+    """Smoke test for fsdp_double_buffer with attention and Mamba FSDP units."""
 
     @classmethod
     def setup_class(cls):
@@ -1096,13 +1546,11 @@ class TestFsdpHybridModelDoubleBuffer:
         pytest.importorskip("causal_conv1d")
         pytest.importorskip("einops")
 
-        from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
-        from megatron.core.ssm.mamba_layer import MambaLayer
-        from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-        from megatron.core.transformer.transformer_layer import TransformerLayer
-
+        # MambaMixer's __init__ reads the 'model-parallel-rng' tracker.
         model_parallel_cuda_manual_seed(0)
 
+        # HIDDEN=256 is the floor: d_inner = 2 * HIDDEN, nheads = d_inner / 64,
+        # and nheads must be divisible by the default mamba_num_groups=8.
         HIDDEN = 256
         config = TransformerConfig(
             num_layers=1,
@@ -1118,7 +1566,7 @@ class TestFsdpHybridModelDoubleBuffer:
         class HybridStack(torch.nn.Module):
             def __init__(self, config, pg_collection):
                 super().__init__()
-                self.transformer_layer = TransformerLayer(
+                self.attn_layer = TransformerLayer(
                     config=config,
                     submodules=hybrid_stack_spec.submodules.attention_layer.submodules,
                     layer_number=1,
@@ -1133,7 +1581,7 @@ class TestFsdpHybridModelDoubleBuffer:
                 )
 
             def forward(self, hidden_states):
-                h, _ = self.transformer_layer(hidden_states=hidden_states, attention_mask=None)
+                h, _ = self.attn_layer(hidden_states=hidden_states, attention_mask=None)
                 return self.mamba_layer(hidden_states=h)
 
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])

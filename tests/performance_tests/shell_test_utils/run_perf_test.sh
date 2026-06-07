@@ -10,8 +10,12 @@
 #   RESULTS_ROOT=/path/where/results.json/and/server-logs/go
 #
 # Optional:
-#   RECORD_BASELINE=1   (skip the comparison; copy results.json over baseline_values.json)
+#   RECORD_BASELINE=1   (skip the comparison; merge results.json into baseline_values.json
+#                        under the detected PLATFORM key, preserving other platforms.)
 #   SKIP_COMPARE=1      (skip the comparison step entirely)
+#   PLATFORM=<name>     (override the platform key used to look up / write the baseline.
+#                        Defaults to auto-detection via `nvidia-smi -L` —
+#                        recognizes "h100", "gb200", "b200", "a100".)
 #
 # Expects /usr/local/bin/yq (present in mcore_ci_dev image, NOT in bare NGC PyTorch).
 
@@ -33,6 +37,27 @@ done
 : "${CHECKPOINT_LOAD_PATH:?CHECKPOINT_LOAD_PATH is required}"
 : "${RESULTS_ROOT:?RESULTS_ROOT is required}"
 
+# Resolve PLATFORM. Caller can override via env; otherwise inspect the first GPU.
+# baseline_values.json is a {platform: {batch_key: {metrics}}} mapping, so this
+# value picks which subtree to read / write.
+if [[ -z "${PLATFORM:-}" ]]; then
+    GPU_NAME=$(nvidia-smi -L 2>/dev/null | head -1 || true)
+    case "$GPU_NAME" in
+        *GB200*|*"Grace Blackwell"*) PLATFORM=gb200 ;;
+        *B200*)                      PLATFORM=b200  ;;
+        *H100*)                      PLATFORM=h100  ;;
+        *A100*)                      PLATFORM=a100  ;;
+        *)
+            echo "[run_perf_test] error: could not auto-detect PLATFORM from nvidia-smi (\"$GPU_NAME\")." >&2
+            echo "                  Pass PLATFORM=<h100|gb200|b200|a100> explicitly." >&2
+            exit 2
+            ;;
+    esac
+    echo "[run_perf_test] auto-detected PLATFORM=$PLATFORM from \"$GPU_NAME\""
+else
+    echo "[run_perf_test] using caller-provided PLATFORM=$PLATFORM"
+fi
+
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 PERF_DIR="$ROOT_DIR/tests/performance_tests"
 YQ=/usr/local/bin/yq
@@ -40,6 +65,7 @@ YQ=/usr/local/bin/yq
 mkdir -p "$RESULTS_ROOT"
 RESULTS_JSON="$RESULTS_ROOT/results.json"
 SERVER_LOG_DIR="$RESULTS_ROOT/server_logs"
+# launch_jet_workload.py retries unless torchrun's per-rank std*.log assets exist.
 ASSETS_ROOT="$(dirname "$RESULTS_ROOT")"
 TORCHRUN_LOG_DIR="$ASSETS_ROOT/logs/1"
 mkdir -p "$SERVER_LOG_DIR" "$TORCHRUN_LOG_DIR"
@@ -52,20 +78,30 @@ MODEL=$("$YQ" '.MODEL' "$CONFIG_PATH")
 TP=$("$YQ" '.TP // 1' "$CONFIG_PATH")
 PP=$("$YQ" '.PP // 1' "$CONFIG_PATH")
 DP=$("$YQ" '.DP // 1' "$CONFIG_PATH")
-NUM_INPUT_TOKENS=$("$YQ" '.NUM_INPUT_TOKENS' "$CONFIG_PATH")
+EP=$("$YQ" '.EP // 1' "$CONFIG_PATH")
+NUM_INPUT_TOKENS=$("$YQ" '.NUM_INPUT_TOKENS // 512' "$CONFIG_PATH")
 NUM_OUTPUT_TOKENS=$("$YQ" '.NUM_OUTPUT_TOKENS' "$CONFIG_PATH")
 NUM_WARMUP_ITERS=$("$YQ" '.NUM_WARMUP_ITERS // 2' "$CONFIG_PATH")
 NUM_TIMED_ITERS=$("$YQ" '.NUM_TIMED_ITERS // 5' "$CONFIG_PATH")
+# Prompt source: 'synthetic' (default, fixed-length "hello "*N) or 'gsm8k'
+# (real prompts from the vendored client/data/gsm8k_prompts.jsonl). MoE and
+# hybrid models should use 'gsm8k' — synthetic input gives misleading
+# perf because every token is identical (uniform expert routing, hot KV).
+DATASET=$("$YQ" '.DATASET // "synthetic"' "$CONFIG_PATH")
 mapfile -t BATCH_SIZES < <("$YQ" '.BATCH_SIZES[]' "$CONFIG_PATH")
 
-WORLD_SIZE=$((TP * PP * DP))
+# For MoE configs, expert-parallelism is orthogonal to DP and reshapes the
+# world size when DP=1. Use the max so dense models keep WORLD_SIZE=TP*PP*DP
+# and MoE-with-DP=1 picks up EP correctly.
+GROUP_SIZE=$((DP > EP ? DP : EP))
+WORLD_SIZE=$((TP * PP * GROUP_SIZE))
 ARGS_FILE="$PERF_DIR/server/model_args/${MODEL}.args"
 if [[ ! -f "$ARGS_FILE" ]]; then
     echo "[run_perf_test] error: model args file $ARGS_FILE not found" >&2
     exit 2
 fi
 
-echo "[run_perf_test] MODEL=$MODEL  TP=$TP PP=$PP DP=$DP  world_size=$WORLD_SIZE"
+echo "[run_perf_test] MODEL=$MODEL  TP=$TP PP=$PP DP=$DP EP=$EP  world_size=$WORLD_SIZE  dataset=$DATASET"
 echo "[run_perf_test] ISL=$NUM_INPUT_TOKENS  OSL=$NUM_OUTPUT_TOKENS"
 echo "[run_perf_test] batch sizes: ${BATCH_SIZES[*]}"
 
@@ -82,24 +118,53 @@ while IFS= read -r LINE; do
     done
 done < "$ARGS_FILE"
 
-# Override TP/PP from config (the args file ships defaults; config wins).
-MODEL_ARGS+=(--tensor-model-parallel-size "$TP" --pipeline-model-parallel-size "$PP")
+# Override TP/PP/EP from config (the args file ships defaults; config wins).
+# EP must be overridden too — args files for MoE checkpoints (e.g. hybrid_nanov3_3b.args
+# hardcodes --expert-model-parallel-size 8) would otherwise force a world size that
+# doesn't fit smaller-node platforms like GB200 (4 GPUs/node).
+MODEL_ARGS+=(
+    --tensor-model-parallel-size "$TP"
+    --pipeline-model-parallel-size "$PP"
+    --expert-model-parallel-size "$EP"
+)
 
 # ── Make image-bundled extras (mamba-ssm) visible to the cog venv ─────────────
 # cog's auto-managed venv uses `uv sync --extra dev --extra mlm` and inherits
-# from /usr/lib/python3.12/dist-packages — but mamba-ssm + causal-conv1d are
-# bundled in the image's prebuilt /opt/venv, NOT in system dist-packages.
-# For hybrid/mamba models, prepend /opt/venv's site-packages to PYTHONPATH so
-# the server can import mamba_ssm without re-installing.
+# from /usr/lib/python3.12/dist-packages — but mamba-ssm + causal-conv1d (and
+# their transitive deps) are bundled in the image's prebuilt /opt/venv.
+#
+# We can't add /opt/venv via PYTHONPATH: PYTHONPATH entries come *before* the
+# venv on sys.path, so we'd shadow newer cog-venv packages (e.g.
+# nvidia-resiliency-ext 0.6.0) with older /opt/venv copies (0.6.0.dev69).
+# Instead drop a `.pth` file into the venv that runs
+# `sys.path.append(...)` at import time — .pth files execute after the venv
+# is on sys.path, so /opt/venv ends up *last* and is only consulted for
+# packages not in the venv.
 
-EXTRA_PYTHONPATH=""
-if [[ "$MODEL" == hybrid_* || "$MODEL" == mamba_* ]]; then
+if [[ ( "$MODEL" == hybrid_* || "$MODEL" == mamba_* ) && -n "${VIRTUAL_ENV:-}" ]]; then
     OPT_VENV_SITE=/opt/venv/lib/python3.12/site-packages
-    if [[ -d "$OPT_VENV_SITE" ]]; then
-        echo "[run_perf_test] adding $OPT_VENV_SITE to PYTHONPATH (mamba-ssm shim)"
-        EXTRA_PYTHONPATH="$OPT_VENV_SITE"
+    # cog's VIRTUAL_ENV often points at a stale `.partial.<runid>` path that no
+    # longer exists at runtime (uv sync renames `.partial.<runid>` → real after
+    # finishing). Strip the `.partial.<hex>` segment to find the real venv.
+    REAL_VENV=$(echo "$VIRTUAL_ENV" | sed 's|\.partial\.[A-Za-z0-9]*||g')
+    [[ -d "$REAL_VENV/lib/python3.12/site-packages" ]] || REAL_VENV="$VIRTUAL_ENV"
+    PTH_FILE="$REAL_VENV/lib/python3.12/site-packages/_cog_perf_mamba_shim.pth"
+    if [[ -d "$OPT_VENV_SITE" ]] && [[ -d "$REAL_VENV/lib/python3.12/site-packages" ]]; then
+        # H100 / mcore_ci_dev path: append the image's prebuilt venv to sys.path
+        # via a .pth file so mamba-ssm + causal-conv1d are visible to the cog venv.
+        echo "[run_perf_test] installing mamba-ssm shim .pth: $PTH_FILE -> $OPT_VENV_SITE"
+        echo "import sys; sys.path.append('$OPT_VENV_SITE')" > "$PTH_FILE"
+    elif python -c "import mamba_ssm" 2>/dev/null; then
+        echo "[run_perf_test] mamba_ssm already importable; skipping install"
     else
-        echo "[run_perf_test] warning: $OPT_VENV_SITE not present — hybrid model may fail to load" >&2
+        # GB200 / bare-NGC path: /opt/venv doesn't exist on this image, so install
+        # mamba-ssm + causal-conv1d into the cog venv at runtime. Relies on
+        # prebuilt wheels (PyPI ships linux_aarch64 wheels for both starting
+        # mamba-ssm 2.2.2 / causal-conv1d 1.4.0).
+        echo "[run_perf_test] /opt/venv missing; installing mamba-ssm + causal-conv1d via uv pip"
+        uv pip install --no-build-isolation mamba-ssm causal-conv1d || {
+            echo "[run_perf_test] warning: mamba-ssm install failed — hybrid tests will fail with ImportError" >&2
+        }
     fi
 fi
 
@@ -127,9 +192,6 @@ SERVER_COMMON_ARGS=(
 
 (
     cd "$ROOT_DIR"
-    if [[ -n "$EXTRA_PYTHONPATH" ]]; then
-        export PYTHONPATH="$EXTRA_PYTHONPATH${PYTHONPATH:+:$PYTHONPATH}"
-    fi
     uv run --no-sync python -m torch.distributed.run \
         --nproc-per-node "$WORLD_SIZE" \
         --master_addr "$MASTER_ADDR" \
@@ -138,8 +200,8 @@ SERVER_COMMON_ARGS=(
         --tee "0:3" \
         --redirects "3" \
         -m tools.run_dynamic_text_generation_server \
-        "${MODEL_ARGS[@]}" \
         "${SERVER_COMMON_ARGS[@]}" \
+        "${MODEL_ARGS[@]}" \
         > "$SERVER_LOG" 2>&1
 ) &
 SERVER_PGID=$!
@@ -191,6 +253,7 @@ for BS in "${BATCH_SIZES[@]}"; do
         --server-url "http://localhost:$SERVER_PORT/v1" \
         --model "$MODEL" \
         --batch-size "$BS" \
+        --dataset "$DATASET" \
         --num-input-tokens "$NUM_INPUT_TOKENS" \
         --num-output-tokens "$NUM_OUTPUT_TOKENS" \
         --num-warmup-iters "$NUM_WARMUP_ITERS" \
@@ -207,8 +270,23 @@ CASE_DIR="$(dirname "$CONFIG_PATH")"
 BASELINE_PATH="$CASE_DIR/baseline_values.json"
 
 if [[ "${RECORD_BASELINE:-0}" == "1" ]]; then
-    echo "[run_perf_test] RECORD_BASELINE=1 → copying results.json over $BASELINE_PATH"
-    cp "$RESULTS_JSON" "$BASELINE_PATH"
+    echo "[run_perf_test] RECORD_BASELINE=1 → merging results.json into $BASELINE_PATH under key '$PLATFORM'"
+    uv run --no-sync python - "$RESULTS_JSON" "$BASELINE_PATH" "$PLATFORM" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+results_path, baseline_path, platform = sys.argv[1], sys.argv[2], sys.argv[3]
+results = json.loads(Path(results_path).read_text())
+baseline = {}
+if Path(baseline_path).exists():
+    baseline = json.loads(Path(baseline_path).read_text())
+# Merge: overwrite only the current platform's subtree, leave others intact.
+baseline[platform] = results
+Path(baseline_path).write_text(json.dumps(baseline, indent=2) + "\n")
+print(f"[run_perf_test] wrote {len(results)} batch entries under '{platform}' "
+      f"({sorted(baseline.keys())} platforms recorded total)")
+PY
     exit 0
 fi
 
@@ -226,4 +304,5 @@ fi
 uv run --no-sync python "$PERF_DIR/shell_test_utils/compare_to_baseline.py" \
     --results "$RESULTS_JSON" \
     --baseline "$BASELINE_PATH" \
-    --config "$CONFIG_PATH"
+    --config "$CONFIG_PATH" \
+    --platform "$PLATFORM"

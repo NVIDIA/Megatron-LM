@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
+import inspect
 import logging
 from collections.abc import Callable
 from contextlib import nullcontext
@@ -108,6 +109,7 @@ class GroupedLinearFc1Builder(Protocol):
         is_expert: bool,
         tp_comm_buffer_name: str | None,
         pg_collection: ProcessGroupCollection | None,
+        name: str | None = None,
     ) -> GroupedLinearFc1Interface:
         """Builds a linear_fc1 layer for TEGroupedMLP."""
         ...
@@ -144,6 +146,7 @@ class GroupedLinearFc2Builder(Protocol):
         is_expert: bool,
         tp_comm_buffer_name: str | None,
         pg_collection: ProcessGroupCollection | None,
+        name: str | None = None,
     ) -> GroupedLinearFc2Interface:
         """Builds a linear_fc2 layer for TEGroupedMLP."""
         ...
@@ -179,7 +182,12 @@ class TEGroupedMLP(MegatronModule):
         config: TransformerConfig,
         submodules: GroupedMLPSubmodules,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         super().__init__(config=config)
         self.num_local_experts = num_local_experts
         self.input_size = self.config.hidden_size
@@ -206,6 +214,7 @@ class TEGroupedMLP(MegatronModule):
             is_expert=True,
             tp_comm_buffer_name='fc1',
             pg_collection=pg_collection,
+            name=(name + ".linear_fc1") if name is not None else None,
         )
 
         if self.config.use_te_activation_func and not (submodules.activation_func is None):
@@ -228,6 +237,7 @@ class TEGroupedMLP(MegatronModule):
             is_expert=True,
             tp_comm_buffer_name='fc2',
             pg_collection=pg_collection,
+            name=(name + ".linear_fc2") if name is not None else None,
         )
 
         self.offload_expert_fc1 = (
@@ -330,16 +340,34 @@ class TEGroupedMLP(MegatronModule):
         if not isinstance(self.linear_fc2, te.pytorch.GroupedLinear):
             return False
 
-        # Check activation: SwiGLU (ScaledSwiGLU) or quick GEGLU (ScaledClampedQGeGLU, TE >= 2.15)
-        if self.config.gated_linear_unit:
-            if self.activation_func == F.silu:
-                return True
-            if self.activation_func == quick_gelu:
-                try:
-                    from transformer_engine.pytorch.ops import ScaledClampedQGeGLU  # noqa: F401
-                except ImportError:
-                    return False
-                return True
+        # Check activation: SwiGLU, quick GEGLU, or weighted squared ReLU.
+        # Use config.activation_func instead of self.activation_func because when
+        # use_te_activation_func is True, self.activation_func is a TE module, not the raw function.
+        use_glu_fusion = self.config.gated_linear_unit and self.config.activation_func in (
+            F.silu,
+            quick_gelu,
+        )
+        use_srelu_fusion = (
+            self.config.activation_func == squared_relu
+            and self.config.use_fused_weighted_squared_relu
+            and not self.config.gated_linear_unit
+        )
+        if not (use_glu_fusion or use_srelu_fusion):
+            return False
+        if self.config.activation_func == F.silu:
+            return True
+        if self.config.activation_func == quick_gelu:
+            try:
+                from transformer_engine.pytorch.ops import ScaledClampedQGeGLU  # noqa: F401
+            except ImportError:
+                return False
+            return True
+        if self.config.activation_func == squared_relu:
+            try:
+                from transformer_engine.pytorch.ops import ScaledSReLU  # noqa: F401
+            except ImportError:
+                return False
+            return True
 
         return False
 
@@ -401,21 +429,64 @@ class TEGroupedMLP(MegatronModule):
             setattr(op, "bias", getattr(self.linear_fc1, "bias"))
         ops.append(op)
 
-        # Activation and post-multiply probs (SwiGLU or clamped quick-GeGLU)
+        # Activation and post-multiply probs (SwiGLU, clamped quick-GeGLU, or SReLU)
         glu_interleave = self.config.moe_mlp_glu_interleave_size
-        if self.activation_func == F.silu and self.config.gated_linear_unit:
-            op = te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=glu_interleave)
-        elif self.activation_func == quick_gelu and self.config.gated_linear_unit:
-            clamp = self.config.activation_func_clamp_value
-            if clamp is not None:
-                op = te.pytorch.ops.ScaledClampedQGeGLU(
-                    glu_interleave_size=glu_interleave, limit=clamp
+        activation_recompute_in_mlp = bool(getattr(self, "activation_recompute", False))
+        if self.config.activation_func == F.silu and self.config.gated_linear_unit:
+            if (
+                "activation_recompute_in_mlp"
+                in inspect.signature(te.pytorch.ops.ScaledSwiGLU).parameters
+            ):
+                op = te.pytorch.ops.ScaledSwiGLU(
+                    glu_interleave_size=glu_interleave,
+                    activation_recompute_in_mlp=activation_recompute_in_mlp,
                 )
             else:
-                op = te.pytorch.ops.ScaledClampedQGeGLU(glu_interleave_size=glu_interleave)
+                op = te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=glu_interleave)
+        elif self.config.activation_func == quick_gelu and self.config.gated_linear_unit:
+            clamp = self.config.activation_func_clamp_value
+            if clamp is not None:
+                if (
+                    "activation_recompute_in_mlp"
+                    in inspect.signature(te.pytorch.ops.ScaledClampedQGeGLU).parameters
+                ):
+                    op = te.pytorch.ops.ScaledClampedQGeGLU(
+                        glu_interleave_size=glu_interleave,
+                        activation_recompute_in_mlp=activation_recompute_in_mlp,
+                        limit=clamp,
+                    )
+                else:
+                    op = te.pytorch.ops.ScaledClampedQGeGLU(
+                        glu_interleave_size=glu_interleave, limit=clamp
+                    )
+            else:
+                if (
+                    "activation_recompute_in_mlp"
+                    in inspect.signature(te.pytorch.ops.ScaledClampedQGeGLU).parameters
+                ):
+                    op = te.pytorch.ops.ScaledClampedQGeGLU(
+                        glu_interleave_size=glu_interleave,
+                        activation_recompute_in_mlp=activation_recompute_in_mlp,
+                    )
+                else:
+                    op = te.pytorch.ops.ScaledClampedQGeGLU(glu_interleave_size=glu_interleave)
+        elif (
+            self.config.activation_func == squared_relu
+            and self.config.use_fused_weighted_squared_relu
+            and not self.config.gated_linear_unit
+        ):
+            if (
+                "activation_recompute_in_mlp"
+                in inspect.signature(te.pytorch.ops.ScaledSReLU).parameters
+            ):
+                op = te.pytorch.ops.ScaledSReLU(
+                    activation_recompute_in_mlp=activation_recompute_in_mlp
+                )
+            else:
+                op = te.pytorch.ops.ScaledSReLU()
         else:
             raise RuntimeError(
-                "_make_fused_ops expected SwiGLU or quick_gelu with gated_linear_unit; "
+                "_make_fused_ops expected SwiGLU, quick_gelu, or weighted squared_relu; "
                 "call _is_fused_impl_supported() before constructing fused ops."
             )
         ops.append(op)
@@ -817,6 +888,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
         config: TransformerConfig,
         submodules: GroupedMLPSubmodules,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        name: str | None = None,
     ):
         # Initialize parent TEGroupedMLP (creates linear_fc1, linear_fc2)
         super().__init__(
@@ -824,6 +896,7 @@ class InferenceGroupedMLP(TEGroupedMLP):
             config=config,
             submodules=submodules,
             pg_collection=pg_collection,
+            name=name,
         )
 
         # Concatenated weights are built lazily on first forward to ensure
@@ -1079,6 +1152,7 @@ class SequentialMLP(MegatronModule):
         config: TransformerConfig,
         submodules: MLPSubmodules,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        name: str | None = None,
     ):
 
         if config.moe_ffn_hidden_size == config.ffn_hidden_size:
@@ -1098,13 +1172,14 @@ class SequentialMLP(MegatronModule):
         # TODO (Hepteract): expt_dp wont be needed here once distributed checkpoint is refactored
         self.dp_group = pg_collection.expt_dp
 
-        for _ in range(self.num_local_experts):
+        for expert_idx in range(self.num_local_experts):
             expert = MLP(
                 self.config,
                 submodules,
                 ffn_hidden_size=self.config.moe_ffn_hidden_size,
                 is_expert=True,
                 tp_group=pg_collection.expt_tp,
+                name=(name + f".local_experts.{expert_idx}") if name is not None else None,
             )
             self.local_experts.append(expert)
 
