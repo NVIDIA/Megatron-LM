@@ -3351,12 +3351,13 @@ class TextGenerationController:
                         self._async_pending_cuda_graph_request_count
                     )
                     transaction = self._pending_async_transaction()
+                    resources = context.mark_async_forward_in_flight()
                     if transaction is not None:
                         transaction.mark_launched(
                             sample_ticket=async_sample_ticket,
+                            resources=resources,
                             h2d_done_event=async_h2d_done_event,
                         )
-                    context.mark_async_forward_in_flight()
                     range_pop()
 
             if deferred_mtp_blocks_to_release is not None:

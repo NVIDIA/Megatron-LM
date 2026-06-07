@@ -13,6 +13,7 @@ import torch.nn.functional as F  # type: ignore
 from torch import Tensor  # type: ignore
 
 from megatron.core import parallel_state
+from megatron.core.inference.async_transaction import AsyncResourceLedger
 from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
     InferenceBatchDimensions,
@@ -980,23 +981,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             device='cpu',
             pin_memory=True,
         )
-        self._async_reserved_kv_block_request_ids = torch.full(
-            (self.max_requests,), -1, dtype=torch.int32, device='cpu'
-        )
-        self._async_reserved_kv_block_ids = torch.full(
-            (self.max_requests,), -1, dtype=torch.int32, device='cpu'
-        )
-        self._async_reserved_kv_block_columns = torch.full(
-            (self.max_requests,), -1, dtype=torch.int32, device='cpu'
-        )
-        self._async_reserved_kv_block_count = 0
-        self._async_deferred_kv_blocks_to_release = torch.empty(
-            (0,), dtype=torch.int32, device='cpu'
-        )
-        self._async_deferred_mamba_slots_to_free = torch.empty(
-            (0,), dtype=torch.int32, device='cpu'
-        )
-        self._async_forward_in_flight = False
+        self._async_resource_ledger = AsyncResourceLedger()
         self._async_reserved_kv_block_adoption_count = 0
         self._async_deferred_kv_block_release_count = 0
         self._async_deferred_mamba_slot_release_count = 0
@@ -1944,7 +1929,7 @@ class DynamicInferenceContext(BaseInferenceContext):
     def reset_mamba_state(self) -> None:
         """Reset state used within Mamba layers."""
         if self.is_hybrid_model:
-            if getattr(self, "_async_forward_in_flight", False):
+            if self._async_resource_ledger.in_flight:
                 self._append_deferred_async_mamba_slots(
                     self.mamba_metadata.request_to_mamba_state_idx
                 )
@@ -2555,30 +2540,16 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def _clear_async_reserved_kv_blocks(self) -> None:
         """Clear the request-to-reserved-block map after CPU reconciliation."""
-        count = self._async_reserved_kv_block_count
-        if count > 0:
-            self._async_reserved_kv_block_request_ids[:count] = -1
-            self._async_reserved_kv_block_ids[:count] = -1
-            self._async_reserved_kv_block_columns[:count] = -1
-        self._async_reserved_kv_block_count = 0
+        self._async_resource_ledger.clear_reservations()
 
-    def mark_async_forward_in_flight(self) -> None:
+    def mark_async_forward_in_flight(self) -> AsyncResourceLedger:
         """Mark that a speculative forward may still be using old resources."""
-        self._async_forward_in_flight = True
+        self._async_resource_ledger.in_flight = True
+        return self._async_resource_ledger
 
     def release_deferred_async_resources(self) -> None:
         """Release async-reserved resources after their speculative forward retires."""
-        self._async_forward_in_flight = False
-        if self._async_deferred_kv_blocks_to_release.numel() == 0:
-            self._release_deferred_async_mamba_slots()
-            return
-        kv_block_count = int(self._async_deferred_kv_blocks_to_release.numel())
-        self._async_deferred_kv_block_release_count += kv_block_count
-        self.kv_block_allocator.release_memory_blocks(self._async_deferred_kv_blocks_to_release)
-        self._async_deferred_kv_blocks_to_release = torch.empty(
-            (0,), dtype=torch.int32, device='cpu'
-        )
-        self._release_deferred_async_mamba_slots()
+        self._async_resource_ledger.release_deferred(self)
 
     def release_deferred_async_kv_blocks(self) -> None:
         """Compatibility wrapper for callers that only deferred KV blocks before P14."""
@@ -2586,43 +2557,21 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def _append_deferred_async_kv_blocks(self, blocks: Tensor) -> None:
         """Defer releasing blocks that may still be used by an in-flight forward."""
-        if blocks.numel() == 0:
-            return
-        blocks = blocks.to(dtype=torch.int32, device='cpu')
-        self._async_deferred_kv_blocks_to_release = torch.cat(
-            (self._async_deferred_kv_blocks_to_release, blocks)
-        )
+        self._async_resource_ledger.defer_kv_blocks(blocks)
 
     def _append_deferred_async_mamba_slots(self, slots: Tensor) -> None:
         """Defer freeing Mamba slots that an in-flight forward may still write."""
-        if slots.numel() == 0:
-            return
-        slots = slots[slots != -1].to(dtype=torch.int32, device='cpu')
-        if slots.numel() == 0:
-            return
-        self._async_deferred_mamba_slots_to_free = torch.cat(
-            (self._async_deferred_mamba_slots_to_free, slots)
-        )
+        self._async_resource_ledger.defer_mamba_slots(slots)
 
     def _release_deferred_async_mamba_slots(self) -> None:
         """Return deferred Mamba slots to the free pool after async forward retirement."""
-        if (
-            not self.is_hybrid_model
-            or self._async_deferred_mamba_slots_to_free.numel() == 0
-        ):
-            return
-        slots = self._async_deferred_mamba_slots_to_free
-        self._async_deferred_mamba_slot_release_count += int(slots.numel())
-        self.mamba_metadata.free_slot_ids(slots)
-        self._async_deferred_mamba_slots_to_free = torch.empty(
-            (0,), dtype=torch.int32, device='cpu'
-        )
+        self._async_resource_ledger._release_deferred_mamba_slots(self)
 
     def _free_mamba_slots_for_request_indexes(self, request_indexes: Tensor) -> None:
         """Free request-owned Mamba slots now or defer them past an async forward."""
         if not self.is_hybrid_model:
             return
-        if self._async_forward_in_flight:
+        if self._async_resource_ledger.in_flight:
             mamba_indices_to_free = self.mamba_metadata.request_to_mamba_state_idx[
                 request_indexes
             ]
@@ -2641,7 +2590,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             return None
         if self.get_index_of_chunked_prefill_request(safe=True) != -1:
             return None
-        if self._async_reserved_kv_block_count != 0:
+        if self._async_resource_ledger.reservation_count != 0:
             return None
 
         tokens_per_request = self.num_speculative_tokens + 1
@@ -2836,10 +2785,9 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def discard_async_prepared_decode_plan(self) -> None:
         """Release resources held only for a prepared async launch that will not run."""
-        count = self._async_reserved_kv_block_count
-        if count > 0:
+        if self._async_resource_ledger.reservation_count > 0:
             self.kv_block_allocator.release_memory_blocks(
-                self._async_reserved_kv_block_ids[:count]
+                self._async_resource_ledger.reserved_block_ids_tensor()
             )
             self._clear_async_reserved_kv_blocks()
         self.clear_async_prepared_decode_plan()
@@ -3068,41 +3016,18 @@ class DynamicInferenceContext(BaseInferenceContext):
         self, request_ids: Tensor, block_columns: Tensor
     ) -> Tensor:
         """Return reserved blocks for resumed requests, or -1 where none is reserved."""
-        reserved_block_ids = torch.full(
-            (request_ids.numel(),), -1, dtype=torch.int32, device='cpu'
+        consumed_before = self._async_resource_ledger.consumed_reservation_count
+        reserved_block_ids = self._async_resource_ledger.consume_reserved_blocks(
+            request_ids, block_columns
         )
-        count = self._async_reserved_kv_block_count
-        if count == 0 or request_ids.numel() == 0:
-            return reserved_block_ids
-
-        for request_idx, (request_id_tensor, block_column_tensor) in enumerate(
-            zip(request_ids.tolist(), block_columns.tolist())
-        ):
-            request_id = int(request_id_tensor)
-            block_column = int(block_column_tensor)
-            for slot in range(count):
-                if int(self._async_reserved_kv_block_request_ids[slot]) != request_id:
-                    continue
-                if int(self._async_reserved_kv_block_columns[slot]) != block_column:
-                    continue
-                reserved_block_ids[request_idx] = self._async_reserved_kv_block_ids[slot]
-                self._async_reserved_kv_block_request_ids[slot] = -1
-                self._async_reserved_kv_block_ids[slot] = -1
-                self._async_reserved_kv_block_columns[slot] = -1
-                self._async_reserved_kv_block_adoption_count += 1
-                break
+        self._async_reserved_kv_block_adoption_count += (
+            self._async_resource_ledger.consumed_reservation_count - consumed_before
+        )
         return reserved_block_ids
 
     def _defer_remaining_async_reserved_kv_blocks(self) -> None:
         """Quarantine reserved blocks that actual CPU bookkeeping did not consume."""
-        count = self._async_reserved_kv_block_count
-        if count == 0:
-            return
-        remaining_blocks = self._async_reserved_kv_block_ids[:count]
-        remaining_blocks = remaining_blocks[remaining_blocks != -1]
-        if remaining_blocks.numel() > 0:
-            self._append_deferred_async_kv_blocks(remaining_blocks)
-        self._clear_async_reserved_kv_blocks()
+        self._async_resource_ledger.defer_unused_reservations()
 
     def _execute_pending_mamba_ops(self) -> None:
         """Execute Mamba GPU operations deferred from add_request() / update_requests().
@@ -3201,14 +3126,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         reserved_block_count = int(plan.reserved_block_ids.numel())
         if reserved_block_count > 0:
-            self._async_reserved_kv_block_count = reserved_block_count
-            self._async_reserved_kv_block_request_ids[:reserved_block_count] = (
-                plan.reserved_request_ids
-            )
-            self._async_reserved_kv_block_ids[:reserved_block_count] = plan.reserved_block_ids
-            self._async_reserved_kv_block_columns[:reserved_block_count] = (
-                plan.reserved_block_columns
-            )
+            self._async_resource_ledger.record_reservations_from_plan(plan)
 
         if not self._record_async_decode_input_sources(
             plan,
@@ -4004,7 +3922,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         kv_blocks_assigned = self.request_to_kv_block_ids[request_indexes]
         non_zero_values_in_kv_memory = kv_blocks_assigned[kv_blocks_assigned != -1]
-        if self._async_forward_in_flight:
+        if self._async_resource_ledger.in_flight:
             self._append_deferred_async_kv_blocks(non_zero_values_in_kv_memory)
         else:
             self.kv_block_allocator.release_memory_blocks(non_zero_values_in_kv_memory)

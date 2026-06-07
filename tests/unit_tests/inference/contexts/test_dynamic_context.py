@@ -804,7 +804,10 @@ class TestDynamicContext:
         assert dynamic_context.async_prepared_request_ids_cpu().tolist() == [10, 12, 11]
         assert dynamic_context.active_request_metadata["top_k"][:3].tolist() == [1, 3, 2]
         assert dynamic_context.token_to_request_idx[:3].tolist() == [0, 1, 2]
-        assert dynamic_context._async_reserved_kv_block_request_ids[:2].tolist() == [10, 12]
+        assert (
+            dynamic_context._async_resource_ledger.reserved_request_ids_tensor().tolist()
+            == [10, 12]
+        )
 
         sampled_tokens = torch.tensor([100, 101, 102], dtype=torch.int64, device='cuda')
         assert dynamic_context.copy_async_prepared_decode_input_ids_from_samples(
@@ -820,9 +823,9 @@ class TestDynamicContext:
             dynamic_context.paused_request_count : dynamic_context.total_request_count
         ].tolist()
         assert actual_active_ids == [10, 12, 11]
-        assert dynamic_context._async_reserved_kv_block_count == 0
+        assert dynamic_context._async_resource_ledger.reservation_count == 0
         assert dynamic_context._async_reserved_kv_block_adoption_count == 2
-        assert dynamic_context._async_deferred_kv_blocks_to_release.numel() == 0
+        assert dynamic_context._async_resource_ledger.deferred_kv_tensor().numel() == 0
 
     @pytest.mark.internal
     @rounder_override(64)
@@ -876,7 +879,7 @@ class TestDynamicContext:
         assert dynamic_context.token_to_pos_ids[:3].tolist() == [4, 4, 4]
         assert dynamic_context._staging_request_query_lengths[:3].tolist() == [7, 7, 7]
         assert dynamic_context._staging_request_kv_length_offsets[:3].tolist() == [4, 4, 4]
-        assert dynamic_context._async_reserved_kv_block_count == 0
+        assert dynamic_context._async_resource_ledger.reservation_count == 0
 
         sampled_tokens = torch.tensor([100, 101, 102], dtype=torch.int64, device='cuda')
         assert dynamic_context.copy_async_prepared_decode_input_ids_from_samples(
@@ -986,7 +989,7 @@ class TestDynamicContext:
         assert not dynamic_context.prepare_async_decode_next_step(pre_sampling=True)
 
         assert dynamic_context.async_prepared_request_ids_cpu() is None
-        assert dynamic_context._async_reserved_kv_block_count == 0
+        assert dynamic_context._async_resource_ledger.reservation_count == 0
         assert dynamic_context.active_token_count == 3
         assert dynamic_context.request_ids[:3].tolist() == [10, 11, 12]
 
@@ -1026,7 +1029,7 @@ class TestDynamicContext:
         assert not dynamic_context.prepare_async_decode_next_step(pre_sampling=True)
 
         assert dynamic_context.async_prepared_request_ids_cpu() is None
-        assert dynamic_context._async_reserved_kv_block_count == 0
+        assert dynamic_context._async_resource_ledger.reservation_count == 0
         assert dynamic_context.active_token_count == 3
         assert dynamic_context.request_ids[:3].tolist() == [10, 11, 12]
         assert dynamic_context.request_last_kv_block_offset[:3].tolist() == [15, 0, 15]

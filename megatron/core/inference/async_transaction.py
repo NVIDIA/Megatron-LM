@@ -504,3 +504,179 @@ class AsyncSampleReadback:
             copy_done_event=ticket.copy_done_event,
             copy_stream=self.copy_stream,
         )
+
+
+@dataclass(frozen=True)
+class AsyncKVReservation:
+    """One KV block reserved by a speculative async decode plan."""
+
+    request_id: int
+    block_column: int
+    block_id: int
+
+
+@dataclass(frozen=True)
+class AsyncMambaLease:
+    """One Mamba slot/bank lease associated with an async forward."""
+
+    request_id: int
+    slot_id: int
+    bank_id: int
+
+
+@dataclass
+class AsyncResourceLedger:
+    """Owns resource lifetime for one speculative async forward."""
+
+    kv_reservations: list[AsyncKVReservation] | None = None
+    deferred_kv_blocks: list[int] | None = None
+    deferred_mamba_slots: list[int] | None = None
+    mamba_leases: list[AsyncMambaLease] | None = None
+    in_flight: bool = False
+    consumed_reservation_count: int = 0
+
+    def __post_init__(self) -> None:
+        if self.kv_reservations is None:
+            self.kv_reservations = []
+        if self.deferred_kv_blocks is None:
+            self.deferred_kv_blocks = []
+        if self.deferred_mamba_slots is None:
+            self.deferred_mamba_slots = []
+        if self.mamba_leases is None:
+            self.mamba_leases = []
+
+    @property
+    def reservation_count(self) -> int:
+        """Number of KV reservations still owned by the ledger."""
+        return len(self.kv_reservations)
+
+    def clear_reservations(self) -> None:
+        """Forget all unused KV reservations without releasing them."""
+        self.kv_reservations.clear()
+
+    def record_reservations_from_plan(self, plan: object) -> None:
+        """Record KV reservations produced by an async lifecycle plan."""
+        self.record_reservations(
+            request_ids=plan.reserved_request_ids,
+            block_ids=plan.reserved_block_ids,
+            block_columns=plan.reserved_block_columns,
+        )
+
+    def record_reservations(
+        self, *, request_ids: Tensor, block_ids: Tensor, block_columns: Tensor
+    ) -> None:
+        """Replace current reservations with the provided request/block mapping."""
+        self.kv_reservations = [
+            AsyncKVReservation(
+                request_id=int(request_id),
+                block_column=int(block_column),
+                block_id=int(block_id),
+            )
+            for request_id, block_id, block_column in zip(
+                request_ids.tolist(), block_ids.tolist(), block_columns.tolist()
+            )
+        ]
+
+    def consume_reserved_blocks(self, request_ids: Tensor, block_columns: Tensor) -> Tensor:
+        """Return reserved blocks for request/block-column pairs, or -1 where absent."""
+        reserved_block_ids = torch.full(
+            (request_ids.numel(),), -1, dtype=torch.int32, device="cpu"
+        )
+        if not self.kv_reservations or request_ids.numel() == 0:
+            return reserved_block_ids
+
+        remaining = list(self.kv_reservations)
+        for request_idx, (request_id_tensor, block_column_tensor) in enumerate(
+            zip(request_ids.tolist(), block_columns.tolist())
+        ):
+            request_id = int(request_id_tensor)
+            block_column = int(block_column_tensor)
+            for reservation in tuple(remaining):
+                if reservation.request_id != request_id:
+                    continue
+                if reservation.block_column != block_column:
+                    continue
+                reserved_block_ids[request_idx] = reservation.block_id
+                remaining.remove(reservation)
+                self.consumed_reservation_count += 1
+                break
+        self.kv_reservations = remaining
+        return reserved_block_ids
+
+    def defer_unused_reservations(self) -> None:
+        """Move unconsumed KV reservations into the deferred release list."""
+        if self.kv_reservations:
+            self.deferred_kv_blocks.extend(
+                reservation.block_id for reservation in self.kv_reservations
+            )
+        self.kv_reservations.clear()
+
+    def defer_kv_blocks(self, blocks: Tensor) -> None:
+        """Defer releasing KV blocks that may be visible to an in-flight forward."""
+        self.deferred_kv_blocks.extend(_tensor_ints(blocks, skip_negative=True))
+
+    def defer_mamba_slots(self, slots: Tensor) -> None:
+        """Defer freeing Mamba slots that may still receive async writes."""
+        self.deferred_mamba_slots.extend(_tensor_ints(slots, skip_negative=True))
+
+    def release_deferred(self, context: object) -> None:
+        """Release all deferred KV and Mamba resources through the context allocators."""
+        self.in_flight = False
+        if self.deferred_kv_blocks:
+            blocks = torch.tensor(self.deferred_kv_blocks, dtype=torch.int32, device="cpu")
+            context._async_deferred_kv_block_release_count += int(blocks.numel())
+            context.kv_block_allocator.release_memory_blocks(blocks)
+            self.deferred_kv_blocks.clear()
+        self._release_deferred_mamba_slots(context)
+
+    def drain(self, context: object) -> None:
+        """Defer unused reservations and release every deferred resource."""
+        self.defer_unused_reservations()
+        self.release_deferred(context)
+
+    def deferred_kv_tensor(self) -> Tensor:
+        """Return deferred KV blocks as a CPU tensor for diagnostics/tests."""
+        return torch.tensor(self.deferred_kv_blocks, dtype=torch.int32, device="cpu")
+
+    def deferred_mamba_tensor(self) -> Tensor:
+        """Return deferred Mamba slots as a CPU tensor for diagnostics/tests."""
+        return torch.tensor(self.deferred_mamba_slots, dtype=torch.int32, device="cpu")
+
+    def reserved_request_ids_tensor(self) -> Tensor:
+        """Return reserved request ids as a CPU tensor for diagnostics/tests."""
+        return torch.tensor(
+            [reservation.request_id for reservation in self.kv_reservations],
+            dtype=torch.int32,
+            device="cpu",
+        )
+
+    def reserved_block_ids_tensor(self) -> Tensor:
+        """Return reserved KV block ids as a CPU tensor for diagnostics/tests."""
+        return torch.tensor(
+            [reservation.block_id for reservation in self.kv_reservations],
+            dtype=torch.int32,
+            device="cpu",
+        )
+
+    def reserved_block_columns_tensor(self) -> Tensor:
+        """Return reserved KV block columns as a CPU tensor for diagnostics/tests."""
+        return torch.tensor(
+            [reservation.block_column for reservation in self.kv_reservations],
+            dtype=torch.int32,
+            device="cpu",
+        )
+
+    def _release_deferred_mamba_slots(self, context: object) -> None:
+        if not getattr(context, "is_hybrid_model", False) or not self.deferred_mamba_slots:
+            return
+        slots = torch.tensor(self.deferred_mamba_slots, dtype=torch.int32, device="cpu")
+        context._async_deferred_mamba_slot_release_count += int(slots.numel())
+        context.mamba_metadata.free_slot_ids(slots)
+        self.deferred_mamba_slots.clear()
+
+
+def _tensor_ints(values: Tensor, *, skip_negative: bool = False) -> list[int]:
+    values = values.to(dtype=torch.int64, device="cpu").reshape(-1)
+    if skip_negative:
+        values = values[values != -1]
+    return [int(value) for value in values.tolist()]

@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from megatron.core import utils as core_utils
-from megatron.core.inference.async_transaction import AsyncLayoutSnapshot
+from megatron.core.inference.async_transaction import AsyncLayoutSnapshot, AsyncResourceLedger
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
@@ -1637,23 +1637,21 @@ def test_async_pending_resources_are_quarantined_until_forward_retires():
     context.is_hybrid_model = False
     context.mamba_slot_allocator = None
     context.kv_block_allocator = _ReleaseRecordingAllocator()
-    context._async_forward_in_flight = True
-    context._async_deferred_kv_blocks_to_release = torch.empty(0, dtype=torch.int32)
-    context._async_deferred_mamba_slots_to_free = torch.empty(0, dtype=torch.int32)
+    context._async_resource_ledger = AsyncResourceLedger(in_flight=True)
     context._async_deferred_kv_block_release_count = 0
     context._async_deferred_mamba_slot_release_count = 0
 
     context.release_memory_blocks_from_request_indexes(torch.tensor([0], dtype=torch.long))
 
     assert context.kv_block_allocator.released == []
-    assert context._async_deferred_kv_blocks_to_release.tolist() == [10, 11]
+    assert context._async_resource_ledger.deferred_kv_tensor().tolist() == [10, 11]
     assert context.request_to_kv_block_ids.tolist() == [[-1, -1, -1], [12, -1, -1]]
 
     context.release_deferred_async_resources()
 
     assert [blocks.tolist() for blocks in context.kv_block_allocator.released] == [[10, 11]]
-    assert not context._async_forward_in_flight
-    assert context._async_deferred_kv_blocks_to_release.numel() == 0
+    assert not context._async_resource_ledger.in_flight
+    assert context._async_resource_ledger.deferred_kv_tensor().numel() == 0
     assert context._async_deferred_kv_block_release_count == 2
 
 
@@ -1667,9 +1665,7 @@ def test_async_pending_forward_defers_mamba_slot_free_until_forward_retires():
     context.mamba_metadata = _MambaMetadataWithFreeRecording(slots=[3, 5], banks=[0, 1])
     context.mamba_slot_allocator = None
     context.kv_block_allocator = _ReleaseRecordingAllocator()
-    context._async_forward_in_flight = True
-    context._async_deferred_kv_blocks_to_release = torch.empty(0, dtype=torch.int32)
-    context._async_deferred_mamba_slots_to_free = torch.empty(0, dtype=torch.int32)
+    context._async_resource_ledger = AsyncResourceLedger(in_flight=True)
     context._async_deferred_kv_block_release_count = 0
     context._async_deferred_mamba_slot_release_count = 0
 
@@ -1677,8 +1673,8 @@ def test_async_pending_forward_defers_mamba_slot_free_until_forward_retires():
 
     assert context.kv_block_allocator.released == []
     assert context.mamba_metadata.freed_slots == []
-    assert context._async_deferred_kv_blocks_to_release.tolist() == [10, 11]
-    assert context._async_deferred_mamba_slots_to_free.tolist() == [3]
+    assert context._async_resource_ledger.deferred_kv_tensor().tolist() == [10, 11]
+    assert context._async_resource_ledger.deferred_mamba_tensor().tolist() == [3]
     assert context.mamba_metadata.request_to_mamba_state_idx.tolist() == [-1, 5]
     assert context.mamba_metadata.request_to_mamba_state_bank.tolist() == [0, 1]
 
@@ -1686,9 +1682,9 @@ def test_async_pending_forward_defers_mamba_slot_free_until_forward_retires():
 
     assert [blocks.tolist() for blocks in context.kv_block_allocator.released] == [[10, 11]]
     assert [slots.tolist() for slots in context.mamba_metadata.freed_slots] == [[3]]
-    assert context._async_deferred_mamba_slots_to_free.numel() == 0
+    assert context._async_resource_ledger.deferred_mamba_tensor().numel() == 0
     assert context._async_deferred_mamba_slot_release_count == 1
-    assert not context._async_forward_in_flight
+    assert not context._async_resource_ledger.in_flight
 
 
 @pytest.mark.internal
@@ -1696,23 +1692,21 @@ def test_async_mamba_reset_defers_allocated_slots_while_forward_is_in_flight():
     context = object.__new__(DynamicInferenceContext)
     context.is_hybrid_model = True
     context.mamba_metadata = _MambaMetadataWithFreeRecording(slots=[2, -1, 4], banks=[0, 0, 1])
-    context._async_forward_in_flight = True
-    context._async_deferred_kv_blocks_to_release = torch.empty(0, dtype=torch.int32)
-    context._async_deferred_mamba_slots_to_free = torch.empty(0, dtype=torch.int32)
+    context._async_resource_ledger = AsyncResourceLedger(in_flight=True)
     context._async_deferred_mamba_slot_release_count = 0
 
     context.reset_mamba_state()
 
     assert not context.mamba_metadata.reset_called
     assert context.mamba_metadata.reset_varlen_count == 1
-    assert context._async_deferred_mamba_slots_to_free.tolist() == [2, 4]
+    assert context._async_resource_ledger.deferred_mamba_tensor().tolist() == [2, 4]
     assert context.mamba_metadata.request_to_mamba_state_idx.tolist() == [-1, -1, -1]
     assert context.mamba_metadata.request_to_mamba_state_bank.tolist() == [0, 0, 0]
 
     context.release_deferred_async_resources()
 
     assert [slots.tolist() for slots in context.mamba_metadata.freed_slots] == [[2, 4]]
-    assert context._async_deferred_mamba_slots_to_free.numel() == 0
+    assert context._async_resource_ledger.deferred_mamba_tensor().numel() == 0
     assert context._async_deferred_mamba_slot_release_count == 2
 
 
@@ -1727,12 +1721,12 @@ def test_async_reserved_kv_blocks_are_adopted_or_deferred_then_released():
         [[1, -1, -1], [2, -1, -1], [3, -1, -1]], dtype=torch.int32
     )
     context.request_last_kv_block_id = torch.tensor([1, 2, 3], dtype=torch.int32)
-    context._async_reserved_kv_block_count = 3
-    context._async_reserved_kv_block_request_ids = torch.tensor([10, 11, 99], dtype=torch.int32)
-    context._async_reserved_kv_block_ids = torch.tensor([100, 101, 102], dtype=torch.int32)
-    context._async_reserved_kv_block_columns = torch.tensor([1, 1, 1], dtype=torch.int32)
-    context._async_deferred_kv_blocks_to_release = torch.empty(0, dtype=torch.int32)
-    context._async_deferred_mamba_slots_to_free = torch.empty(0, dtype=torch.int32)
+    context._async_resource_ledger = AsyncResourceLedger()
+    context._async_resource_ledger.record_reservations(
+        request_ids=torch.tensor([10, 11, 99], dtype=torch.int32),
+        block_ids=torch.tensor([100, 101, 102], dtype=torch.int32),
+        block_columns=torch.tensor([1, 1, 1], dtype=torch.int32),
+    )
     context._async_reserved_kv_block_adoption_count = 0
     context._async_deferred_kv_block_release_count = 0
     context._async_deferred_mamba_slot_release_count = 0
@@ -1747,20 +1741,19 @@ def test_async_reserved_kv_blocks_are_adopted_or_deferred_then_released():
     assert context.request_to_kv_block_ids.tolist() == [[1, -1, -1], [2, -1, -1], [3, -1, -1]]
     assert context.request_kv_block_counts.tolist() == [1, 1, 1]
     assert context.request_last_kv_block_id.tolist() == [1, 2, 3]
-    assert context._async_reserved_kv_block_count == 3
-    assert context._async_reserved_kv_block_ids.tolist() == [-1, 101, 102]
+    assert context._async_resource_ledger.reservation_count == 2
+    assert context._async_resource_ledger.reserved_block_ids_tensor().tolist() == [101, 102]
     assert context._async_reserved_kv_block_adoption_count == 1
 
     context._defer_remaining_async_reserved_kv_blocks()
 
-    assert context._async_reserved_kv_block_count == 0
-    assert context._async_reserved_kv_block_request_ids.tolist() == [-1, -1, -1]
-    assert context._async_deferred_kv_blocks_to_release.tolist() == [101, 102]
+    assert context._async_resource_ledger.reservation_count == 0
+    assert context._async_resource_ledger.deferred_kv_tensor().tolist() == [101, 102]
 
     context.release_deferred_async_resources()
 
     assert [blocks.tolist() for blocks in context.kv_block_allocator.released] == [[101, 102]]
-    assert context._async_deferred_kv_blocks_to_release.numel() == 0
+    assert context._async_resource_ledger.deferred_kv_tensor().numel() == 0
     assert context._async_deferred_kv_block_release_count == 2
 
 
