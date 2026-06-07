@@ -30,6 +30,8 @@ Install or expose these packages before running:
   `MEGATRON_ROOT=/path/to/Megatron-LM`.
 - Megatron Lite from this repository. The script automatically adds
   `experimental/lite` to `PYTHONPATH`.
+- The examples directory is also added to `PYTHONPATH` and loads a local
+  compatibility hook for known VERL/vLLM/Transformers dependency gaps.
 
 Optional source-tree override:
 
@@ -141,14 +143,22 @@ Useful GRPO knobs:
   `ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU`
 - `MAX_PROMPT_LENGTH`, `MAX_RESPONSE_LENGTH`, `PPO_MAX_TOKEN_LEN_PER_GPU`
 - `ROLLOUT_N`, `ROLLOUT_TP`, `ROLLOUT_GPU_MEMORY_UTILIZATION`
+- `ROLLOUT_MODE=async`, `ROLLOUT_MAX_MODEL_LEN`, `ROLLOUT_MAX_NUM_BATCHED_TOKENS`
+- `ROLLOUT_LIMIT_IMAGES=0`, `ROLLOUT_LIMIT_VIDEOS=0` keep the vLLM rollout
+  backend in text-only mode for GSM8K by default.
 - `ACTOR_TP`, `ACTOR_PP`, `ACTOR_VPP`, `ACTOR_CP`, `ACTOR_EP`, `ACTOR_ETP`
 - `PARAM_OFFLOAD`, `OPTIMIZER_OFFLOAD`, `GRAD_OFFLOAD`
 - `INFER_BACKEND=vllm`
+- `USE_LEGACY_WORKER_IMPL=disable` to use VERL's new engine worker path
+- `POLICY_LOSS_MODE=vanilla` and `LOSS_AGG_MODE=seq-mean-token-sum-norm`
+  select the pure GRPO baseline policy loss and aggregation mode.
 
 The GRPO launcher keeps the reference policy disabled by default
 (`algorithm.use_kl_in_reward=False`, `actor_rollout_ref.actor.use_kl_loss=False`)
 so the example exercises the current MLite actor path without expanding scope
-to a separate reference model.
+to a separate reference model. It also disables VERL's legacy worker path by
+default so `actor@actor_rollout_ref.actor=mlite_actor` is handled by the new
+engine worker implementation.
 
 By default, GSM8K GRPO artifacts are written under
 `experimental/lite/examples/verl/outputs/qwen35_gsm8k_grpo`.
@@ -178,4 +188,5 @@ cover end-to-end SFT or GRPO training.
     `actor_rollout_ref.rollout.name=vllm`,
     `actor_rollout_ref.actor.engine.impl=lite`,
     `actor_rollout_ref.actor.engine.ep=8`,
-    `algorithm.adv_estimator=grpo`, and `critic.enable=False`.
+    `algorithm.adv_estimator=grpo`, `actor_rollout_ref.actor.policy_loss.loss_mode=vanilla`,
+    `critic.enable=False`, and `trainer.use_legacy_worker_impl=disable`.

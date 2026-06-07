@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -13,6 +14,7 @@ class MegatronLiteEngineConfig(EngineConfig):
     """Minimal VERL-facing config for the external Megatron Lite engine."""
 
     strategy: str = "mlite"
+    custom_backend_module: str | None = "verl_mlite.engine.mlite_engine"
     model_name: str = "auto"
     impl: str = "lite"
 
@@ -31,3 +33,5 @@ class MegatronLiteEngineConfig(EngineConfig):
         super().__post_init__()
         if self.strategy != "mlite":
             raise ValueError(f"MegatronLiteEngineConfig expects strategy='mlite', got {self.strategy!r}")
+        if self.custom_backend_module:
+            importlib.import_module(self.custom_backend_module)

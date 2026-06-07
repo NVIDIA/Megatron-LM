@@ -24,6 +24,10 @@ add_pythonpath "${VERL_ROOT:-}"
 add_pythonpath "${MEGATRON_ROOT:-}"
 
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
+if [[ -n "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+  unset ROCR_VISIBLE_DEVICES
+  unset HIP_VISIBLE_DEVICES
+fi
 
 DATASET_DIR="${DATASET_DIR:-${HOME}/data/gsm8k}"
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3.5-35B-A3B}"
@@ -45,13 +49,26 @@ MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-1024}"
 PPO_MAX_TOKEN_LEN_PER_GPU="${PPO_MAX_TOKEN_LEN_PER_GPU:-8192}"
 
 ROLLOUT_N="${ROLLOUT_N:-5}"
+ROLLOUT_MODE="${ROLLOUT_MODE:-async}"
 ROLLOUT_TP="${ROLLOUT_TP:-2}"
 ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.6}"
 ROLLOUT_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU="${ROLLOUT_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU:-1}"
 ROLLOUT_LOG_PROB_MAX_TOKEN_LEN_PER_GPU="${ROLLOUT_LOG_PROB_MAX_TOKEN_LEN_PER_GPU:-${PPO_MAX_TOKEN_LEN_PER_GPU}}"
+ROLLOUT_MAX_MODEL_LEN="${ROLLOUT_MAX_MODEL_LEN:-$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))}"
+ROLLOUT_MAX_NUM_SEQS="${ROLLOUT_MAX_NUM_SEQS:-1024}"
+ROLLOUT_DEFAULT_MAX_NUM_BATCHED_TOKENS="$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))"
+if (( ROLLOUT_DEFAULT_MAX_NUM_BATCHED_TOKENS < ROLLOUT_MAX_NUM_SEQS )); then
+  ROLLOUT_DEFAULT_MAX_NUM_BATCHED_TOKENS="${ROLLOUT_MAX_NUM_SEQS}"
+fi
+ROLLOUT_MAX_NUM_BATCHED_TOKENS="${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-${ROLLOUT_DEFAULT_MAX_NUM_BATCHED_TOKENS}}"
+if (( ROLLOUT_MAX_NUM_BATCHED_TOKENS < ROLLOUT_MAX_NUM_SEQS )); then
+  ROLLOUT_MAX_NUM_BATCHED_TOKENS="${ROLLOUT_MAX_NUM_SEQS}"
+fi
 ROLLOUT_TEMPERATURE="${ROLLOUT_TEMPERATURE:-1.0}"
 ROLLOUT_TOP_P="${ROLLOUT_TOP_P:-1.0}"
 ROLLOUT_TOP_K="${ROLLOUT_TOP_K:--1}"
+ROLLOUT_LIMIT_IMAGES="${ROLLOUT_LIMIT_IMAGES:-0}"
+ROLLOUT_LIMIT_VIDEOS="${ROLLOUT_LIMIT_VIDEOS:-0}"
 VAL_TEMPERATURE="${VAL_TEMPERATURE:-0.0}"
 VAL_TOP_P="${VAL_TOP_P:-1.0}"
 VAL_DO_SAMPLE="${VAL_DO_SAMPLE:-False}"
@@ -69,6 +86,8 @@ MLITE_IMPL="${MLITE_IMPL:-lite}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flash}"
 
 ACTOR_LR="${ACTOR_LR:-1e-6}"
+POLICY_LOSS_MODE="${POLICY_LOSS_MODE:-vanilla}"
+LOSS_AGG_MODE="${LOSS_AGG_MODE:-seq-mean-token-sum-norm}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.1}"
 BETAS="${BETAS:-[0.9,0.95]}"
 CLIP_GRAD="${CLIP_GRAD:-1.0}"
@@ -90,12 +109,18 @@ TEST_FREQ="${TEST_FREQ:-5}"
 RESUME_MODE="${RESUME_MODE:-auto}"
 LOG_VAL_GENERATIONS="${LOG_VAL_GENERATIONS:-10}"
 LOGGER="${LOGGER:-[console,file]}"
+USE_LEGACY_WORKER_IMPL="${USE_LEGACY_WORKER_IMPL:-disable}"
 DRY_RUN="${DRY_RUN:-0}"
 EXTRA_ARGS=("$@")
 
 if [[ "${INFER_BACKEND}" != "vllm" && "${INFER_BACKEND}" != "sglang" && "${INFER_BACKEND}" != "trtllm" ]]; then
   echo "Unsupported INFER_BACKEND=${INFER_BACKEND}. Expected vllm, sglang, or trtllm." >&2
   exit 1
+fi
+
+if [[ "${INFER_BACKEND}" == "vllm" ]]; then
+  export VLLM_USE_V1="${VLLM_USE_V1:-1}"
+  export VLLM_ALLREDUCE_USE_SYMM_MEM="${VLLM_ALLREDUCE_USE_SYMM_MEM:-0}"
 fi
 
 MLITE_VPP_SIZE="${ACTOR_VPP}"
@@ -122,6 +147,8 @@ ALGORITHM=(
   "algorithm.adv_estimator=grpo"
   "algorithm.use_kl_in_reward=False"
   "algorithm.kl_ctrl.kl_coef=0.0"
+  "algorithm.rollout_correction.bypass_mode=True"
+  "algorithm.norm_adv_by_std_in_grpo=False"
 )
 
 DATA=(
@@ -159,7 +186,8 @@ ACTOR=(
   "actor_rollout_ref.actor.use_kl_loss=False"
   "actor_rollout_ref.actor.kl_loss_coef=0.0"
   "actor_rollout_ref.actor.entropy_coeff=${ENTROPY_COEFF}"
-  "actor_rollout_ref.actor.loss_agg_mode=token-mean"
+  "actor_rollout_ref.actor.policy_loss.loss_mode=${POLICY_LOSS_MODE}"
+  "actor_rollout_ref.actor.loss_agg_mode=${LOSS_AGG_MODE}"
   "actor_rollout_ref.actor.engine.dtype=${DTYPE}"
   "actor_rollout_ref.actor.engine.model_name=${MLITE_MODEL_NAME}"
   "actor_rollout_ref.actor.engine.impl=${MLITE_IMPL}"
@@ -186,6 +214,7 @@ fi
 
 ROLLOUT=(
   "actor_rollout_ref.rollout.name=${INFER_BACKEND}"
+  "actor_rollout_ref.rollout.mode=${ROLLOUT_MODE}"
   "actor_rollout_ref.rollout.tensor_model_parallel_size=${ROLLOUT_TP}"
   "actor_rollout_ref.rollout.gpu_memory_utilization=${ROLLOUT_GPU_MEMORY_UTILIZATION}"
   "actor_rollout_ref.rollout.n=${ROLLOUT_N}"
@@ -195,6 +224,9 @@ ROLLOUT=(
   "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=${ROLLOUT_LOG_PROB_MICRO_BATCH_SIZE_PER_GPU}"
   "actor_rollout_ref.rollout.prompt_length=${MAX_PROMPT_LENGTH}"
   "actor_rollout_ref.rollout.response_length=${MAX_RESPONSE_LENGTH}"
+  "actor_rollout_ref.rollout.max_model_len=${ROLLOUT_MAX_MODEL_LEN}"
+  "actor_rollout_ref.rollout.max_num_seqs=${ROLLOUT_MAX_NUM_SEQS}"
+  "actor_rollout_ref.rollout.max_num_batched_tokens=${ROLLOUT_MAX_NUM_BATCHED_TOKENS}"
   "actor_rollout_ref.rollout.temperature=${ROLLOUT_TEMPERATURE}"
   "actor_rollout_ref.rollout.top_p=${ROLLOUT_TOP_P}"
   "actor_rollout_ref.rollout.top_k=${ROLLOUT_TOP_K}"
@@ -204,6 +236,13 @@ ROLLOUT=(
   "actor_rollout_ref.rollout.val_kwargs.n=${VAL_N}"
   "actor_rollout_ref.rollout.free_cache_engine=True"
 )
+
+if [[ "${INFER_BACKEND}" == "vllm" ]]; then
+  ROLLOUT+=(
+    "+actor_rollout_ref.rollout.engine_kwargs.vllm.limit_mm_per_prompt.image=${ROLLOUT_LIMIT_IMAGES}"
+    "+actor_rollout_ref.rollout.engine_kwargs.vllm.limit_mm_per_prompt.video=${ROLLOUT_LIMIT_VIDEOS}"
+  )
+fi
 
 TRAINER=(
   "critic.enable=False"
@@ -221,6 +260,7 @@ TRAINER=(
   "trainer.default_local_dir=${CKPT_DIR}"
   "trainer.val_before_train=False"
   "trainer.log_val_generations=${LOG_VAL_GENERATIONS}"
+  "trainer.use_legacy_worker_impl=${USE_LEGACY_WORKER_IMPL}"
 )
 
 COMMAND=(

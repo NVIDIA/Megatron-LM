@@ -11,6 +11,7 @@ import torch.nn as nn
 
 from megatron.lite.model.qwen3_5.config import Qwen35Config
 from megatron.lite.model.qwen3_5.lite.checkpoint import (
+    export_hf_weights as _export_hf_weights_impl,
     load_hf_weights as _load_hf_weights_impl,
 )
 from megatron.lite.primitive.bundle import ModelBundle
@@ -104,40 +105,16 @@ def _make_aux_loss_hook():
 
 def _build_mc_optimizer(chunks, model_cfg: Qwen35Config, impl_cfg: ImplConfig, ps: ParallelState):
     from megatron.lite.primitive.optimizers.megatron_wrap import (
-        build_mc_full_stack,
-        finalize_mc_full_grads,
+        build_mc_training_optimizer,
     )
 
-    opt_cfg = impl_cfg.optimizer_config
-    if opt_cfg is None:
-        opt_cfg = SimpleNamespace(
-            optimizer="adam",
-            lr=1e-4,
-            weight_decay=0.01,
-            clip_grad=1.0,
-            offload_fraction=None,
-            adam_beta1=None,
-            adam_beta2=None,
-            adam_eps=None,
-        )
-
-    engine_cfg = SimpleNamespace(
-        model_name="qwen3_5",
-        parallel=impl_cfg.parallel,
-        optimizer=opt_cfg,
-    )
-    chunks[:], optimizer = build_mc_full_stack(
+    return build_mc_training_optimizer(
         chunks,
         model_cfg=model_cfg,
-        engine_cfg=engine_cfg,
+        impl_cfg=impl_cfg,
         ps=ps,
-        is_expert=is_expert_param,
+        model_name="qwen3_5",
     )
-
-    def finalize() -> None:
-        finalize_mc_full_grads(chunks, optimizer)
-
-    return optimizer, finalize
 
 
 def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle:
@@ -276,6 +253,15 @@ def load_hf_weights(
     if not hf_path:
         return
     _load_hf_weights_impl(chunk, hf_path, model_cfg, ps)
+
+
+def export_hf_weights(
+    chunks: list[nn.Module],
+    model_cfg: Qwen35Config,
+    ps: ParallelState,
+    **kwargs,
+):
+    yield from _export_hf_weights_impl(chunks, model_cfg, ps, **kwargs)
 
 
 def vocab_size(model_cfg) -> int | None:
