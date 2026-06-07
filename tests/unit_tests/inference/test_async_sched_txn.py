@@ -19,6 +19,7 @@ Run (8 GPUs, in its own ``torch.distributed.run`` invocation)::
 """
 
 import argparse
+import types
 
 import pytest
 import torch
@@ -39,6 +40,9 @@ from megatron.core.inference.engines.step_transaction import (
     classify_launch_eligibility,
 )
 from megatron.core.inference.sampling import TorchSampling
+from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+    TextGenerationController,
+)
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.utils import is_fa_min_version
@@ -2208,3 +2212,229 @@ class TestC7Hardening(AsyncSchedTxnTestBase):
         )
         assert async_env.engine.controller._async_launch_before_commit_count > 0
         assert async_env.engine.step_txn_manager.diagnostics.guard_failures == 0
+
+
+@pytest.mark.skipif(
+    not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+)
+@pytest.mark.internal
+class TestC8Parity(AsyncSchedTxnTestBase):
+    """C8: the async==serial parity harness across the full mandated prompt mix + scope gates.
+
+    This is the proof artifact for the build: the launch-before-commit overlap must reproduce the
+    serial oracle token-for-token across greedy AND per-request-RNG sampling, data-dependent
+    (EOS/stop-word) finishes (which drain+discard the doomed forward), simultaneous finishes,
+    batch-drain-to-zero, and (for logprob/top-n requests) the fall-to-serial scope gate. The
+    crash-loud launch-site asserts (mirrored here) keep the overlap from silently widening.
+    """
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+        )
+
+    @classmethod
+    def teardown_class(cls):
+        delete_cuda_graphs()
+        set_rounder(64)
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _cuda_graph_kwargs(**overrides):
+        cfg = dict(
+            model_provider="gpt",
+            num_requests=4,
+            num_gap_steps=0,
+            num_tokens_to_generate=24,
+            use_fixed_output_lengths=True,
+            num_cuda_graphs=4,
+            force_build_cuda_graphs=True,
+            inference_cuda_graph_scope=InferenceCudaGraphScope.block,
+            use_cuda_graphs_for_non_decode_steps=False,
+            context_max_requests=128,
+        )
+        cfg.update(overrides)
+        return cfg
+
+    @staticmethod
+    def _force_data_dependent_finish(rows_at_step):
+        """Patch context: force a data-dependent (EOS-like) finish for given active rows at a step.
+
+        Returns a mock.patch context manager over the controller's data-dependent finish mask that
+        zeros the chosen active rows when the context reaches ``target_step`` -- deterministically,
+        in BOTH the serial and async runs (each env has its own context.step_count), so the
+        comparison is fair and the async path exercises the doomed-forward drain+discard + reprime.
+        """
+        from unittest import mock
+
+        orig = TextGenerationController._data_dependent_finish_mask
+        target_step, rows = rows_at_step
+
+        def forced(self, sampled_tokens_cpu, active_request_ids, active_request_count):
+            mask = orig(self, sampled_tokens_cpu, active_request_ids, active_request_count)
+            ctx = self.inference_wrapped_model.inference_context
+            if ctx.step_count == target_step and active_request_count > max(rows):
+                mask = mask.clone()
+                for r in rows:
+                    mask[r] = 0
+            return mask
+
+        return mock.patch.object(TextGenerationController, "_data_dependent_finish_mask", forced)
+
+    @pytest.mark.internal
+    def test_forced_eos_discard_midbatch_equals_serial(self) -> None:
+        """A single data-dependent (EOS-like) finish at a mid-batch row mid-decode: the launched
+        forward is doomed (it predicted finish-free), so it is drained+discarded and the step
+        re-primes. Token-exact async==serial across the reshape (the multi-finisher discard counter
+        is asserted in the two-EOS test); the overlap fired and the adopt guard never tripped."""
+        with self._force_data_dependent_finish((6, [0])):
+            serial_env, async_env = self.assert_async_equals_serial(
+                **self._cuda_graph_kwargs(num_requests=4)
+            )
+        diag = async_env.engine.step_txn_manager.diagnostics
+        assert async_env.engine.controller._async_launch_before_commit_count > 0
+        assert diag.guard_failures == 0
+
+    @pytest.mark.internal
+    def test_two_eos_same_step_equals_serial(self) -> None:
+        """Two simultaneous data-dependent finishers (rows 0 and 2) on the same step: both popped,
+        survivors stay aligned, the doomed forward drained+discarded. Token-exact async==serial."""
+        with self._force_data_dependent_finish((5, [0, 2])):
+            serial_env, async_env = self.assert_async_equals_serial(
+                **self._cuda_graph_kwargs(num_requests=5)
+            )
+        diag = async_env.engine.step_txn_manager.diagnostics
+        assert async_env.engine.controller._async_launch_before_commit_count > 0
+        assert diag.barrier_skips > 0
+        assert diag.guard_failures == 0
+
+    @pytest.mark.internal
+    def test_two_eos_same_step_nongreedy_equals_serial(self) -> None:
+        """Same, with per-request-RNG sampling: each survivor's keyed draw is its own across the
+        mid-batch compaction the discard+reprime produces."""
+        with self._force_data_dependent_finish((7, [1, 3])):
+            serial_env, async_env = self.assert_async_equals_serial(
+                **self._cuda_graph_kwargs(num_requests=5, use_fixed_output_lengths=False)
+            )
+        assert async_env.engine.controller._async_launch_before_commit_count > 0
+        assert async_env.engine.step_txn_manager.diagnostics.guard_failures == 0
+
+    @pytest.mark.internal
+    def test_two_finishers_same_step_maxlen_equals_serial(self) -> None:
+        """Two requests with the same fixed length finish (max-length) on the same step. Max-length
+        is host-gated, so the launch is suppressed that step (sync prime). Token-exact + drains to
+        zero at the end."""
+        serial_env, async_env = self.assert_async_equals_serial(
+            **self._cuda_graph_kwargs(num_requests=4, num_tokens_to_generate=18)
+        )
+        assert async_env.engine.controller._async_launch_before_commit_count > 0
+        assert async_env.engine.step_txn_manager.diagnostics.guard_failures == 0
+
+    @pytest.mark.internal
+    def test_logprobs_falls_to_serial_path(self) -> None:
+        """A request asking for log probs takes the SERIAL path (single-buffered logits cannot ride
+        the ungated overlap): the launch-before-commit overlap NEVER fires, and tokens are
+        identical to async-off."""
+        from unittest import mock
+
+        base_build = AsyncSchedTxnTestBase._build_requests
+
+        def logprob_build(cls, test_config):
+            requests = base_build(test_config)
+            for request in requests:
+                request.sampling_params.return_log_probs = True
+                # The tiny test model materializes only last-token logits; skip prompt logprobs so
+                # the generated-token logprobs (which force the serial path) are still requested.
+                request.sampling_params.skip_prompt_log_probs = True
+            return requests
+
+        with mock.patch.object(type(self), "_build_requests", classmethod(logprob_build)):
+            serial_env, async_env = self.assert_async_equals_serial(**self._cuda_graph_kwargs())
+        # Scope gate: logprob-bearing requests keep the overlap OFF entirely.
+        assert async_env.engine.controller._async_launch_before_commit_count == 0, (
+            "overlap must not fire while a logprob/top-n request is active (it falls to serial)"
+        )
+
+
+@pytest.mark.internal
+class TestC8ScopeAsserts:
+    """C8: the static scope predicate is crash-loud-tight (no silent widening).
+
+    Unit-level checks of ``_async_overlap_scope_ok`` / ``_active_requests_need_logprobs`` against a
+    tiny fake controller+context: the overlap is refused for MTP, hybrid, EP>1, and logprob/top-n,
+    matching the launch-site asserts exactly. (Multi-rank EP behavior is exercised by the EP gate
+    here without needing a multi-GPU job.)"""
+
+    def _fake(self, *, async_on=True, has_buffer=True, mtp=0, hybrid=False, ep_size=1):
+        class _PG:
+            pass
+
+        ep_group = _PG() if ep_size != 1 else None
+
+        ctx = types.SimpleNamespace(
+            enable_async_scheduling=async_on,
+            decode_metadata_buffer=object() if has_buffer else None,
+            is_hybrid_model=hybrid,
+            expert_model_parallel_group=ep_group,
+            total_request_count=2,
+            paused_request_count=0,
+            active_request_metadata={
+                "return_log_probs": torch.zeros(2, dtype=torch.int32),
+                "top_n_logprobs": torch.zeros(2, dtype=torch.int32),
+            },
+        )
+        iwm = types.SimpleNamespace(inference_context=ctx)
+        ctrl = types.SimpleNamespace(
+            inference_wrapped_model=iwm,
+            num_speculative_tokens=mtp,
+            _async_overlap_scope_ok=lambda c: TextGenerationController._async_overlap_scope_ok(
+                ctrl, c
+            ),
+            _active_requests_need_logprobs=(
+                lambda c: TextGenerationController._active_requests_need_logprobs(ctrl, c)
+            ),
+        )
+        return ctrl, ctx, ep_size
+
+    @pytest.mark.internal
+    def test_scope_ok_for_plain_gpt_ep1(self) -> None:
+        ctrl, ctx, _ = self._fake()
+        assert ctrl._async_overlap_scope_ok(ctx) is True
+
+    @pytest.mark.internal
+    def test_scope_refused_for_mtp_hybrid_ep_and_disabled(self) -> None:
+        import unittest.mock as mock
+
+        # MTP.
+        ctrl, ctx, _ = self._fake(mtp=2)
+        assert ctrl._async_overlap_scope_ok(ctx) is False
+        # Hybrid (mamba single bank).
+        ctrl, ctx, _ = self._fake(hybrid=True)
+        assert ctrl._async_overlap_scope_ok(ctx) is False
+        # Async off / no buffer.
+        ctrl, ctx, _ = self._fake(async_on=False)
+        assert ctrl._async_overlap_scope_ok(ctx) is False
+        ctrl, ctx, _ = self._fake(has_buffer=False)
+        assert ctrl._async_overlap_scope_ok(ctx) is False
+        # EP > 1 (the gate calls get_pg_size on the EP group; patch it to report size 4).
+        ctrl, ctx, _ = self._fake(ep_size=4)
+        with mock.patch(
+            "megatron.core.inference.text_generation_controllers."
+            "text_generation_controller.get_pg_size",
+            return_value=4,
+        ):
+            assert ctrl._async_overlap_scope_ok(ctx) is False
+
+    @pytest.mark.internal
+    def test_logprobs_predicate(self) -> None:
+        ctrl, ctx, _ = self._fake()
+        assert ctrl._active_requests_need_logprobs(ctx) is False
+        ctx.active_request_metadata["return_log_probs"][1] = 1
+        assert ctrl._active_requests_need_logprobs(ctx) is True
+        ctx.active_request_metadata["return_log_probs"][1] = 0
+        ctx.active_request_metadata["top_n_logprobs"][0] = 3
+        assert ctrl._active_requests_need_logprobs(ctx) is True

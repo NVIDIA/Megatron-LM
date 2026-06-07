@@ -1901,14 +1901,25 @@ class TextGenerationController:
         """
         return self._dynamic_step_apply_commit(self._dynamic_step_prepare_commit())
 
-    def _async_overlap_possible(self, context) -> bool:
-        """Whether the launch-before-commit overlap path should handle this step.
+    def _async_overlap_scope_ok(self, context) -> bool:
+        """The STATIC scope gate for the launch-before-commit overlap (C8).
 
-        The overlap is scoped (this branch) to plain (non-speculative) GPT decode under a CUDA
-        graph with async scheduling on. It engages when either a speculative forward is already
-        in flight (must be consumed) or this step is a graph-backed decode step that could prime
-        the pipeline. Every other case (eager, prefill/mixed, hybrid, MTP) takes the unchanged
-        serial path, so ``async == serial`` holds trivially there and ``async-off == main`` always.
+        These conditions never change within a generation, so they are the hard scope boundary:
+        async scheduling on + a decode metadata buffer + NOT speculative (MTP) + NOT hybrid (mamba
+        single-bank) + EP == 1. The C6 ungate (launch before commit, lazy EOS finish-detect) is
+        sound ONLY for plain attention-only GPT decode at EP=1:
+
+        * MTP / spec decode: the post-verify rewind makes every step a data-dependent reshape
+          (unpredictable at launch); overlap would require the row-remap this design deletes.
+        * hybrid / mamba: SSM state advances in place and is not rewindable; a speculative forward
+          over a single bank would bake a post-finish advance into live state with no rollback.
+        * EP > 1: the step-begin decision (issue a real forward vs a dummy_forward on idle ranks)
+          is NOT rank-local, so a primed rank and an idle rank would enqueue a different number of
+          NCCL all-to-all collectives in the same wall-clock step and deadlock / mispair the MoE
+          all-to-all. EP needs an all-reduce-max step-begin consensus (a future commit).
+
+        The matching crash-loud assert lives at the launch site so a future widening cannot
+        silently launch a speculative forward outside this scope.
         """
         if not context.enable_async_scheduling:
             return False
@@ -1916,8 +1927,48 @@ class TextGenerationController:
             return False
         if self.num_speculative_tokens > 0 or context.is_hybrid_model:
             return False
+        ep_group = getattr(context, "expert_model_parallel_group", None)
+        if ep_group is not None and get_pg_size(ep_group) > 1:
+            return False
+        return True
+
+    def _active_requests_need_logprobs(self, context) -> bool:
+        """Whether any active request asks for log probs / top-n (host-only check, no D2H).
+
+        The overlap path is gated OFF the moment any active request needs logprobs: under the CUDA
+        graph the overlap requires, ``_all_logits_cuda`` is a fixed buffer the launched forward
+        overwrites in place, so a logprob computed against it after the launch would read the wrong
+        forward's logits. ``active_request_metadata`` is CPU-pinned, so ``.any()`` is a cheap host
+        read (no device sync). Such requests fall to the serial path, where logprobs are exact.
+        """
+        n = context.total_request_count - context.paused_request_count
+        if n <= 0:
+            return False
+        md = context.active_request_metadata
+        return bool(
+            md["return_log_probs"][:n].any() or (md["top_n_logprobs"][:n] > 0).any()
+        )
+
+    def _async_overlap_possible(self, context) -> bool:
+        """Whether the launch-before-commit overlap path should handle this step.
+
+        The overlap is scoped (C8) to plain (non-speculative, non-hybrid) GPT decode under a CUDA
+        graph, EP=1, with no logprob/top-n request active. It engages when either a speculative
+        forward is already in flight (must be consumed) or this step is a graph-backed decode step
+        with no logprobs that could prime the pipeline. Every other case (eager, prefill/mixed,
+        hybrid, MTP, EP>1, logprobs) takes the unchanged serial path, so ``async == serial`` holds
+        trivially there and ``async-off == main`` always.
+        """
+        if not self._async_overlap_scope_ok(context):
+            return False
+        # A forward already in flight must be consumed regardless of the per-step gates below
+        # (it ran under the prior, in-scope step). The launch site never fires under logprobs, and
+        # admission is deferred, so a logprob-bearing request never becomes active while a forward
+        # is in flight; this consume self-heals to the serial path on the next step.
         if self._inflight is not None:
             return True
+        if self._active_requests_need_logprobs(context):
+            return False
         return context.is_decode_only() and context.using_cuda_graph_this_step()
 
     def _async_prestage_next_decode_forward(self) -> Optional["PrestagedDecodePlan"]:
@@ -2040,12 +2091,27 @@ class TextGenerationController:
         # No eligible shadow prestage (boundary window / max-length gated) => nothing to launch.
         if plan is None:
             return None
-        # Static host-known gates (no D2H, no GPU sample): decode-only, no paused, under a graph.
-        if not context.is_decode_only():
-            return None
+
+        # C8 crash-loud scope asserts: a speculative forward must NEVER be launched outside the
+        # supported scope (the lazy-EOS-retire / launch-before-commit relaxation is unsound
+        # elsewhere). These mirror _async_overlap_scope_ok + the logprob gate exactly, so a future
+        # change that widens the overlap path trips here loudly instead of silently corrupting.
+        ep_group = getattr(context, "expert_model_parallel_group", None)
+        assert self.num_speculative_tokens == 0, "overlap launch forbidden for MTP/spec decode"
+        assert not context.is_hybrid_model, "overlap launch forbidden for hybrid (mamba single-bank)"
+        assert not (
+            ep_group is not None and get_pg_size(ep_group) > 1
+        ), "overlap launch forbidden for expert-parallel size > 1 (needs EP step-begin consensus)"
+        assert (
+            not self._active_requests_need_logprobs(context)
+        ), "overlap launch forbidden while a logprob/top-n request is active (single-buffered logits)"
+        assert context.is_decode_only(), "overlap launch forbidden on a non-decode (prefill/mixed) step"
+        assert (
+            context.using_cuda_graph_this_step()
+        ), "overlap launch forbidden on a non-graph step"
+
+        # Static host-known gates (no D2H, no GPU sample): no paused requests.
         if context.paused_request_count != 0:
-            return None
-        if not context.using_cuda_graph_this_step():
             return None
 
         # Scatter this step's sampled ids as the next forward's input ids (GPU, no D2H), then mark

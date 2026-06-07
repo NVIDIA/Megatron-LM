@@ -2130,6 +2130,20 @@ class DynamicInferenceEngine(AbstractEngine):
                     self._prefix_cache_hits,
                     self._prefix_cache_blocks_matched,
                 )
+            # C8 async-scheduling diagnostics (cumulative). launched ~= steady decode steps;
+            # adopted ~= launched; barrier_skips counts doomed-forward discards (data-dependent
+            # finish / adopt-guard); guard_failures should stay 0; retired counts fence-gated
+            # frees. retire_queue pending should return to 0 between waves (no leaks).
+            if self.enable_async_scheduling and self.step_txn_manager is not None:
+                d = self.step_txn_manager.diagnostics
+                output_str += (
+                    " ... async (cumul): launched=%d adopted=%d serial=%d sync=%d "
+                    "barrier=%d guard_fail=%d retired=%d pending=%d" % (
+                        d.launched, d.adopted, d.serial_steps, d.sync_steps,
+                        d.barrier_skips, d.guard_failures, d.retired,
+                        self.step_txn_manager.retire_queue.pending(),
+                    )
+                )
             if context_state["is_decode_only"]:
                 output_str = f"\033[94m{output_str}\033[0m"
             logging.info(output_str)
