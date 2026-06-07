@@ -348,16 +348,16 @@ def _reference_local_for_param(
     boundary_votes = [None] * dist.get_world_size()
     dist.all_gather_object(boundary_votes, local_is_boundary)
 
-    if any(boundary_votes):
-        # Every rank participates in the gather collectives, regardless of
-        # whether its local shard is empty — skipping asymmetrically misaligns
-        # subsequent collective calls. Per-TP-rank NS runs locally because
-        # tp_mode="blockwise".
-        full_p = _gather_dp(ref_p, dp_group)
-        full_g = _gather_dp(ref_p.grad, dp_group)
-        full_ref_after = _reference_step_single(is_qkv, full_p, full_g)
-        return _slice_dp_full_to_local(ref_p.shape[0], full_ref_after, dp_group)
-    return _reference_step_single(is_qkv, ref_p, ref_p.grad)
+    if not any(boundary_votes):
+        return _reference_step_single(is_qkv, ref_p, ref_p.grad)
+
+    # Every rank participates in the gather collectives, regardless of whether
+    # its local shard is empty — skipping asymmetrically misaligns subsequent
+    # collective calls. Per-TP-rank NS runs locally because tp_mode="blockwise".
+    full_p = _gather_dp(ref_p, dp_group)
+    full_g = _gather_dp(ref_p.grad, dp_group)
+    full_ref_after = _reference_step_single(is_qkv, full_p, full_g)
+    return _slice_dp_full_to_local(ref_p.shape[0], full_ref_after, dp_group)
 
 
 # ---------- Tests ----------
@@ -444,10 +444,7 @@ def test_muon_step_numerics(distributed_setup: dict[str, Any]) -> None:
     ]
 
     # Compare each FSDP post-step shard against the replicated reference.
-    for i, fsdp_p in enumerate(fsdp_params):
-        ref_p = reference_params[i]
-        if ref_p.numel() == 0:
-            continue
+    for i, (fsdp_p, ref_p) in enumerate(zip(fsdp_params, reference_params)):
         torch.testing.assert_close(
             fsdp_p.to_local().float(),
             ref_p.float(),
