@@ -501,8 +501,12 @@ async def test_reused_pending_forward_prepares_next_step_before_sampling(monkeyp
         active_token_count=2,
         total_request_count=2,
         paused_request_count=0,
+        num_decode_requests=2,
         is_hybrid_model=False,
         config=SimpleNamespace(materialize_only_last_token_logits=True),
+        kv_block_allocator=SimpleNamespace(
+            store_routing_per_block=lambda _routing: events.append("routing")
+        ),
         release_deferred_async_resources=lambda: events.append("release"),
     )
     controller = object.__new__(TextGenerationController)
@@ -521,6 +525,7 @@ async def test_reused_pending_forward_prepares_next_step_before_sampling(monkeyp
     controller._resolve_pending_async_forward_view = lambda: SimpleNamespace(
         row_indices=None, row_mapped=False
     )
+    controller._router_record_bookkeeping = lambda: None
     controller._should_collect_dynamic_sampling_bookkeeping = lambda **_kwargs: False
     controller._try_prepare_async_decode_before_sampling = lambda: events.append("precheck") or True
     controller._dynamic_step_sample_logits_to_next_input_ids = (
@@ -556,8 +561,12 @@ async def test_reused_pending_forward_falls_back_after_sampling_when_presampling
         active_token_count=2,
         total_request_count=2,
         paused_request_count=0,
+        num_decode_requests=2,
         is_hybrid_model=False,
         config=SimpleNamespace(materialize_only_last_token_logits=True),
+        kv_block_allocator=SimpleNamespace(
+            store_routing_per_block=lambda _routing: events.append("routing")
+        ),
         release_deferred_async_resources=lambda: events.append("release"),
     )
     controller = object.__new__(TextGenerationController)
@@ -576,6 +585,7 @@ async def test_reused_pending_forward_falls_back_after_sampling_when_presampling
     controller._resolve_pending_async_forward_view = lambda: SimpleNamespace(
         row_indices=None, row_mapped=False
     )
+    controller._router_record_bookkeeping = lambda: None
     controller._should_collect_dynamic_sampling_bookkeeping = lambda **_kwargs: False
     controller._try_prepare_async_decode_before_sampling = lambda: events.append("precheck") or False
     controller._dynamic_step_sample_logits = lambda **_kwargs: events.append("sample")
@@ -614,6 +624,7 @@ async def test_prepare_async_decode_before_sampling_steady_state_ordering(monkey
         active_token_count=2,
         total_request_count=2,
         paused_request_count=0,
+        num_decode_requests=2,
         padded_active_request_count=2,
         is_hybrid_model=False,
         config=SimpleNamespace(materialize_only_last_token_logits=True),
@@ -705,6 +716,7 @@ async def test_prepare_async_decode_before_sampling_unsafe_fallback_ordering(mon
         active_token_count=2,
         total_request_count=2,
         paused_request_count=0,
+        num_decode_requests=2,
         padded_active_request_count=2,
         is_hybrid_model=False,
         config=SimpleNamespace(materialize_only_last_token_logits=True),
@@ -1334,6 +1346,61 @@ def test_note_sampling_params_tracks_async_logprob_requests(sampling_params, exp
     controller.note_request_sampling_params(sampling_params)
 
     assert controller._async_logprob_requests_seen is expected_seen
+
+
+@pytest.mark.internal
+def test_async_diagnostics_report_pending_forward_disable_counts_and_ep_protocol():
+    controller = object.__new__(TextGenerationController)
+    controller._async_scheduling_enabled = True
+    controller._async_pending_forward = True
+    controller._async_step_barrier_reason = "logging step"
+    controller._async_eligibility_check_count = 4
+    controller._async_eligibility_pass_count = 2
+    controller._async_disable_reason_counts = {"not decode-only": 1, "logging step": 1}
+    controller._async_disable_reason = "logging step"
+    controller._async_forward_launch_count = 3
+    controller._ep_async_protocol = SimpleNamespace(
+        diagnostics=lambda: {"step_begin_reuses": 1, "handoff_launches": 2}
+    )
+
+    diagnostics = controller.get_async_scheduling_diagnostics()
+
+    assert diagnostics == {
+        "enabled": True,
+        "pending_forward": True,
+        "step_barrier_reason": "logging step",
+        "eligibility_checks": 4,
+        "eligibility_passes": 2,
+        "disable_reason_counts": {"not decode-only": 1, "logging step": 1},
+        "last_disable_reason": "logging step",
+        "forward_launches": 3,
+        "ep_protocol": {"step_begin_reuses": 1, "handoff_launches": 2},
+    }
+
+
+@pytest.mark.internal
+def test_select_async_sample_slot_owns_all_readback_buffers_and_events():
+    controller = object.__new__(TextGenerationController)
+    controller.num_speculative_tokens = 2
+    controller._async_current_sample_slot = 0
+    controller._sampled_tokens_cuda_slots = ["cuda_tokens_0", "cuda_tokens_1"]
+    controller._async_sample_values_cuda_slots = ["cuda_values_0", "cuda_values_1"]
+    controller._async_sampled_tokens_cpu_slots = ["cpu_tokens_0", "cpu_tokens_1"]
+    controller._async_sample_source_ready_events = ("source_ready_0", "source_ready_1")
+    controller._async_sample_ready_events = ("copy_ready_0", "copy_ready_1")
+    controller._sampled_mtp_tokens_cuda_slots = ["cuda_mtp_0", "cuda_mtp_1"]
+    controller._async_sampled_mtp_tokens_cpu_slots = ["cpu_mtp_0", "cpu_mtp_1"]
+
+    controller._select_async_sample_slot(1)
+
+    assert controller._async_current_sample_slot == 1
+    assert controller._sampled_tokens_cuda == "cuda_tokens_1"
+    assert controller._async_sample_values_cuda == "cuda_values_1"
+    assert controller._async_sampled_tokens_cpu == "cpu_tokens_1"
+    assert controller._async_sample_source_ready_event == "source_ready_1"
+    assert controller._async_sample_ready_event == "copy_ready_1"
+    assert controller._sampled_mtp_tokens_cuda == "cuda_mtp_1"
+    assert controller._async_sampled_mtp_tokens_cpu == "cpu_mtp_1"
 
 
 class _FakeBookkeepingContext:

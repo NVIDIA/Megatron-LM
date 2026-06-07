@@ -46,6 +46,7 @@ class TestDynamicContext:
         model_parallel_cuda_manual_seed(123)
 
     def _setup_model_parallel_group(self, tensor_parallel_size, pipeline_parallel_size):
+        self._skip_if_world_size_less_than(tensor_parallel_size * pipeline_parallel_size)
         Utils.destroy_model_parallel()
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tensor_parallel_size,
@@ -59,6 +60,13 @@ class TestDynamicContext:
             tensor_model_parallel_size=1, pipeline_model_parallel_size=1
         )
         model_parallel_cuda_manual_seed(123)
+
+    def _skip_if_world_size_less_than(self, required_world_size: int):
+        world_size = (
+            torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        )
+        if world_size < required_world_size:
+            pytest.skip(f"requires distributed world size >= {required_world_size}")
 
     def _get_dynamic_context(
         self,
@@ -1733,6 +1741,7 @@ class TestDynamicContext:
         pipeline stages when they have unequal layer counts.
         """
         pp_size = 2
+        self._skip_if_world_size_less_than(pp_size)
         self._setup_model_parallel_group(tensor_parallel_size=1, pipeline_parallel_size=pp_size)
 
         rank = parallel_state.get_pipeline_model_parallel_rank()
@@ -1808,6 +1817,7 @@ class TestDynamicContext:
         ``get_num_layers_to_build`` for the current PP rank.
         """
         pp_size = 2
+        self._skip_if_world_size_less_than(pp_size)
         self._setup_model_parallel_group(tensor_parallel_size=1, pipeline_parallel_size=pp_size)
         pp_rank = parallel_state.get_pipeline_model_parallel_rank()
 
