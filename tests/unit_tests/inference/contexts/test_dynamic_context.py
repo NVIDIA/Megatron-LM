@@ -824,7 +824,7 @@ class TestDynamicContext:
         ].tolist()
         assert actual_active_ids == [10, 12, 11]
         assert dynamic_context._async_resource_ledger.reservation_count == 0
-        assert dynamic_context._async_reserved_kv_block_adoption_count == 2
+        assert dynamic_context.async_kv_reservation_adoption_count == 2
         assert dynamic_context._async_resource_ledger.deferred_kv_tensor().numel() == 0
 
     @pytest.mark.internal

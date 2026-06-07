@@ -8,8 +8,13 @@ import torch
 
 from megatron.core import utils as core_utils
 from megatron.core.inference.async_transaction import (
+    AsyncGraphShape,
     AsyncLayoutSnapshot,
     AsyncResourceLedger,
+    AsyncSampleReadback,
+    AsyncSampleTicket,
+    AsyncStepTransaction,
+    AsyncTxnState,
     classify_async_eligibility,
 )
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
@@ -309,16 +314,9 @@ def _make_controller_with_rows(pending_ids, current_ids, current_graph_count=Non
         current_graph_count = (
             pending_graph_count if pending_graph_count is not None else len(current_ids)
         )
-    controller._async_pending_forward_view = (
-        None
-        if pending_ids is None
-        else tgc_module._AsyncPendingForwardView(
-            pending_request_ids=torch.tensor(pending_ids, dtype=torch.int64),
-            cuda_graph_request_count=pending_graph_count,
-        )
-    )
     controller._async_discarded_forward_count = 0
     controller._async_row_mapped_forward_count = 0
+    controller._async_step_transaction = None
     controller.inference_wrapped_model = SimpleNamespace(
         inference_context=SimpleNamespace(
             request_ids=torch.tensor(current_ids, dtype=torch.int64),
@@ -329,13 +327,62 @@ def _make_controller_with_rows(pending_ids, current_ids, current_graph_count=Non
             using_cuda_graph_this_step=lambda: True,
         )
     )
+    if pending_ids is not None:
+        _install_pending_transaction(
+            controller,
+            _make_async_layout_snapshot(pending_ids, cuda_graph_request_count=pending_graph_count),
+        )
     return controller
 
 
-def _async_layout_snapshot_status(controller):
-    pending_snapshot = AsyncLayoutSnapshot.from_pending_forward_view(
-        controller._async_pending_forward_view, tokens_per_request=1
+def _make_async_layout_snapshot(
+    request_ids,
+    *,
+    cuda_graph_request_count=None,
+    tokens_per_request=1,
+    **layout_fields,
+):
+    request_ids_tensor = torch.tensor(request_ids, dtype=torch.int64)
+    request_count = int(request_ids_tensor.numel())
+    if cuda_graph_request_count is None:
+        cuda_graph_request_count = request_count
+    return AsyncLayoutSnapshot(
+        request_ids=request_ids_tensor,
+        graph_shape=AsyncGraphShape(
+            active_request_count=request_count,
+            active_token_count=request_count * tokens_per_request,
+            padded_active_request_count=cuda_graph_request_count,
+            tokens_per_request=tokens_per_request,
+        ),
+        **layout_fields,
     )
+
+
+def _install_pending_transaction(controller, snapshot, *, state=AsyncTxnState.LAUNCHED):
+    transaction = AsyncStepTransaction(step_id=0, state=state, snapshot=snapshot)
+    controller._async_step_transaction = transaction
+    return transaction
+
+
+def _sample_ticket(tokens, mtp_tokens=None):
+    sampled_tokens = torch.tensor(tokens, dtype=torch.int64)
+    sampled_mtp_tokens = None if mtp_tokens is None else torch.tensor(mtp_tokens, dtype=torch.int64)
+    return AsyncSampleTicket(
+        slot=0,
+        active_request_count=int(sampled_tokens.numel()),
+        sampled_tokens_cuda=None,
+        sample_values_cuda=None,
+        sampled_tokens_cpu=sampled_tokens,
+        sampled_mtp_tokens_cpu=sampled_mtp_tokens,
+        copy_done_event=SimpleNamespace(synchronize=lambda: None),
+    )
+
+
+def _async_layout_snapshot_status(controller):
+    transaction = controller._pending_async_transaction()
+    if transaction is None:
+        return True, False
+    pending_snapshot = transaction.snapshot
     current_snapshot = AsyncLayoutSnapshot.from_context_current(
         controller.inference_wrapped_model.inference_context, tokens_per_request=1
     )
@@ -365,10 +412,7 @@ def test_pending_async_forward_rows_reuse_map_or_discard(
     controller = _make_controller_with_rows(pending_ids, current_ids)
 
     assert controller._pending_async_forward_row_status() == expected_status
-    pending_view = controller._resolve_pending_async_forward_view()
-    usable = pending_view is not None
-    row_indices = pending_view.row_indices if pending_view is not None else None
-    row_mapped = pending_view.row_mapped if pending_view is not None else False
+    usable, row_indices, row_mapped = controller._resolve_pending_async_forward()
 
     assert (usable, row_mapped) == expected_resolve
     if expected_rows is None:
@@ -378,7 +422,6 @@ def test_pending_async_forward_rows_reuse_map_or_discard(
     expected_discards = 0 if pending_ids is None else int(not expected_resolve[0])
     assert controller._async_discarded_forward_count == expected_discards
     assert controller._async_row_mapped_forward_count == int(expected_resolve[1])
-    assert controller._async_pending_forward_view is None
 
 
 @pytest.mark.internal
@@ -387,7 +430,7 @@ def test_pending_async_forward_rows_discard_when_graph_shape_changes():
     controller = _make_controller_with_rows([10, 11, 12], [12, 10, 11], current_graph_count=4)
 
     assert controller._pending_async_forward_row_status() == (False, False)
-    assert controller._resolve_pending_async_forward_view() is None
+    assert controller._resolve_pending_async_forward() == (False, None, False)
     assert controller._async_discarded_forward_count == 1
 
 
@@ -423,9 +466,9 @@ def test_record_pending_forward_uses_prepared_request_order():
     context.async_prepared_request_ids_cpu = lambda: torch.tensor([10, 12, 11], dtype=torch.int32)
     context.clear_async_prepared_decode_plan = lambda: cleared.append(True)
 
-    controller._record_async_pending_forward_requests(cuda_graph_request_count=3)
+    transaction = controller._begin_async_step_transaction(cuda_graph_request_count=3)
 
-    assert controller._async_pending_forward_view.pending_request_ids.tolist() == [10, 12, 11]
+    assert transaction.snapshot.request_ids.tolist() == [10, 12, 11]
     assert cleared == [True]
 
 
@@ -440,28 +483,26 @@ def test_pending_async_forward_discards_when_planned_layout_mismatches_current()
     context.token_to_pos_ids = torch.tensor([6, 11], dtype=torch.int64)
     context.token_to_block_idx = torch.tensor([100, 200], dtype=torch.int32)
     context.token_to_local_position_within_kv_block = torch.tensor([6, 11], dtype=torch.int32)
-    controller._async_pending_forward_view = tgc_module._AsyncPendingForwardView(
-        pending_request_ids=torch.tensor([10, 11], dtype=torch.int64),
+    pending_snapshot = _make_async_layout_snapshot(
+        [10, 11],
         cuda_graph_request_count=2,
-        planned_request_query_lengths=torch.tensor([1, 1], dtype=torch.int32),
-        planned_request_kv_length_offsets=torch.tensor([6, 11], dtype=torch.int64),
-        planned_token_to_request_idx=torch.tensor([[0], [1]], dtype=torch.int32),
-        planned_token_to_pos_ids=torch.tensor([[6], [11]], dtype=torch.int64),
-        planned_token_to_block_idx=torch.tensor([[100], [201]], dtype=torch.int32),
-        planned_token_to_local_position_within_kv_block=torch.tensor(
+        request_query_lengths=torch.tensor([1, 1], dtype=torch.int32),
+        request_kv_length_offsets=torch.tensor([6, 11], dtype=torch.int64),
+        token_to_request_idx=torch.tensor([[0], [1]], dtype=torch.int32),
+        token_to_pos_ids=torch.tensor([[6], [11]], dtype=torch.int64),
+        token_to_block_idx=torch.tensor([[100], [201]], dtype=torch.int32),
+        token_to_local_position_within_kv_block=torch.tensor(
             [[6], [11]], dtype=torch.int32
         ),
     )
-    pending_snapshot = AsyncLayoutSnapshot.from_pending_forward_view(
-        controller._async_pending_forward_view, tokens_per_request=1
-    )
+    _install_pending_transaction(controller, pending_snapshot)
     current_snapshot = AsyncLayoutSnapshot.from_context_current(context, tokens_per_request=1)
     row_map = pending_snapshot.row_map_to_current(current_snapshot.request_ids)
 
     assert controller._pending_async_forward_row_status() == (False, False)
     assert row_map is not None
     assert pending_snapshot.layout_compatible_with(current_snapshot, row_map=row_map) is False
-    assert controller._resolve_pending_async_forward_view() is None
+    assert controller._resolve_pending_async_forward() == (False, None, False)
     assert controller._async_discarded_forward_count == 1
 
 
@@ -476,30 +517,27 @@ def test_pending_async_forward_reuses_subset_when_finished_row_left():
     context.token_to_pos_ids = torch.tensor([21, 5], dtype=torch.int64)
     context.token_to_block_idx = torch.tensor([300, 100], dtype=torch.int32)
     context.token_to_local_position_within_kv_block = torch.tensor([21, 5], dtype=torch.int32)
-    pending_forward_view = tgc_module._AsyncPendingForwardView(
-        pending_request_ids=torch.tensor([10, 11, 12], dtype=torch.int64),
+    pending_snapshot = _make_async_layout_snapshot(
+        [10, 11, 12],
         cuda_graph_request_count=3,
-        planned_request_query_lengths=torch.tensor([1, 1, 1], dtype=torch.int32),
-        planned_request_kv_length_offsets=torch.tensor([5, 13, 21], dtype=torch.int64),
-        planned_token_to_request_idx=torch.tensor([[0], [1], [2]], dtype=torch.int32),
-        planned_token_to_pos_ids=torch.tensor([[5], [13], [21]], dtype=torch.int64),
-        planned_token_to_block_idx=torch.tensor([[100], [200], [300]], dtype=torch.int32),
-        planned_token_to_local_position_within_kv_block=torch.tensor(
+        request_query_lengths=torch.tensor([1, 1, 1], dtype=torch.int32),
+        request_kv_length_offsets=torch.tensor([5, 13, 21], dtype=torch.int64),
+        token_to_request_idx=torch.tensor([[0], [1], [2]], dtype=torch.int32),
+        token_to_pos_ids=torch.tensor([[5], [13], [21]], dtype=torch.int64),
+        token_to_block_idx=torch.tensor([[100], [200], [300]], dtype=torch.int32),
+        token_to_local_position_within_kv_block=torch.tensor(
             [[5], [13], [21]], dtype=torch.int32
         ),
     )
-    controller._async_pending_forward_view = pending_forward_view
-    pending_snapshot = AsyncLayoutSnapshot.from_pending_forward_view(
-        pending_forward_view, tokens_per_request=1
-    )
+    _install_pending_transaction(controller, pending_snapshot)
     current_snapshot = AsyncLayoutSnapshot.from_context_current(context, tokens_per_request=1)
     row_map = pending_snapshot.row_map_to_current(current_snapshot.request_ids)
 
-    pending_view = controller._resolve_pending_async_forward_view()
+    reused, row_indices, row_mapped = controller._resolve_pending_async_forward()
 
-    assert pending_view is not None
-    assert pending_view.row_mapped
-    assert pending_view.row_indices.tolist() == [2, 0]
+    assert reused
+    assert row_mapped
+    assert row_indices.tolist() == [2, 0]
     assert row_map is not None
     assert row_map.tolist() == [2, 0]
     assert pending_snapshot.layout_compatible_with(current_snapshot, row_map=row_map)
@@ -514,14 +552,17 @@ def test_pending_async_forward_discards_when_token_request_layout_mismatches():
     context.request_query_lengths = torch.tensor([1, 1], dtype=torch.int32)
     context.request_kv_length_offsets = torch.tensor([6, 11], dtype=torch.int64)
     context.token_to_request_idx = torch.tensor([0, 1], dtype=torch.int32)
-    controller._async_pending_forward_view = tgc_module._AsyncPendingForwardView(
-        pending_request_ids=torch.tensor([10, 11], dtype=torch.int64),
-        cuda_graph_request_count=2,
-        planned_token_to_request_idx=torch.tensor([[0], [0]], dtype=torch.int32),
+    _install_pending_transaction(
+        controller,
+        _make_async_layout_snapshot(
+            [10, 11],
+            cuda_graph_request_count=2,
+            token_to_request_idx=torch.tensor([[0], [0]], dtype=torch.int32),
+        ),
     )
 
     assert controller._pending_async_forward_row_status() == (False, False)
-    assert controller._resolve_pending_async_forward_view() is None
+    assert controller._resolve_pending_async_forward() == (False, None, False)
     assert controller._async_discarded_forward_count == 1
 
 
@@ -538,15 +579,18 @@ def test_pending_async_forward_discards_when_mamba_bank_layout_mismatches():
     context._mamba_flat_indices = lambda _active_slice, use_candidate_bank=False: (
         write_indices if use_candidate_bank else read_indices
     )
-    controller._async_pending_forward_view = tgc_module._AsyncPendingForwardView(
-        pending_request_ids=torch.tensor([10, 11], dtype=torch.int64),
-        cuda_graph_request_count=2,
-        planned_mamba_read_indices=torch.tensor([6, 8], dtype=torch.int32),
-        planned_mamba_write_indices=torch.tensor([7, 8], dtype=torch.int32),
+    _install_pending_transaction(
+        controller,
+        _make_async_layout_snapshot(
+            [10, 11],
+            cuda_graph_request_count=2,
+            mamba_read_indices=torch.tensor([6, 8], dtype=torch.int32),
+            mamba_write_indices=torch.tensor([7, 8], dtype=torch.int32),
+        ),
     )
 
     assert controller._pending_async_forward_row_status() == (False, False)
-    assert controller._resolve_pending_async_forward_view() is None
+    assert controller._resolve_pending_async_forward() == (False, None, False)
     assert controller._async_discarded_forward_count == 1
 
 
@@ -571,8 +615,9 @@ async def test_reused_pending_forward_prepares_next_step_before_sampling(monkeyp
     controller = object.__new__(TextGenerationController)
     controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
     controller.num_speculative_tokens = 0
-    controller._async_pending_forward = True
-    controller._async_pending_cuda_graph_request_count = 2
+    _install_pending_transaction(
+        controller, _make_async_layout_snapshot([10, 11], cuda_graph_request_count=2)
+    )
     controller._async_prepare_deferred_until_after_sampling = False
     controller._decide_ep_step_begin = lambda **_kwargs: EPStepBeginDecision(
         step_id=0,
@@ -581,9 +626,7 @@ async def test_reused_pending_forward_prepares_next_step_before_sampling(monkeyp
         discard_pending_forward=False,
         row_mapped_forward=False,
     )
-    controller._resolve_pending_async_forward_view = lambda: SimpleNamespace(
-        row_indices=None, row_mapped=False
-    )
+    controller._resolve_pending_async_forward = lambda: (True, None, False)
     controller._router_record_bookkeeping = lambda: None
     controller._should_collect_dynamic_sampling_bookkeeping = lambda **_kwargs: False
     controller._try_prepare_async_decode_before_sampling = lambda: events.append("precheck") or True
@@ -593,9 +636,8 @@ async def test_reused_pending_forward_prepares_next_step_before_sampling(monkeyp
     controller._try_prepare_async_decode_after_sampling = lambda: pytest.fail(
         "reused non-row-mapped forward should prepare before sampling"
     )
-    controller._async_transfer_samples_to_cpu = (
-        lambda count: events.append(("d2h", count))
-        or (torch.tensor([4, 5], dtype=torch.int64), None, SimpleNamespace(synchronize=lambda: None))
+    controller._transfer_async_samples_to_cpu = (
+        lambda count: events.append(("d2h", count)) or _sample_ticket([4, 5])
     )
     controller._confirm_prepared_ep_async_handoff = lambda: False
     controller._ensure_ep_async_handoff_decided = lambda **_kwargs: events.append("ep_done")
@@ -631,8 +673,9 @@ async def test_reused_pending_forward_falls_back_after_sampling_when_presampling
     controller = object.__new__(TextGenerationController)
     controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
     controller.num_speculative_tokens = 0
-    controller._async_pending_forward = True
-    controller._async_pending_cuda_graph_request_count = 2
+    _install_pending_transaction(
+        controller, _make_async_layout_snapshot([10, 11], cuda_graph_request_count=2)
+    )
     controller._async_prepare_deferred_until_after_sampling = False
     controller._decide_ep_step_begin = lambda **_kwargs: EPStepBeginDecision(
         step_id=0,
@@ -641,9 +684,7 @@ async def test_reused_pending_forward_falls_back_after_sampling_when_presampling
         discard_pending_forward=False,
         row_mapped_forward=False,
     )
-    controller._resolve_pending_async_forward_view = lambda: SimpleNamespace(
-        row_indices=None, row_mapped=False
-    )
+    controller._resolve_pending_async_forward = lambda: (True, None, False)
     controller._router_record_bookkeeping = lambda: None
     controller._should_collect_dynamic_sampling_bookkeeping = lambda **_kwargs: False
     controller._try_prepare_async_decode_before_sampling = lambda: events.append("precheck") or False
@@ -654,9 +695,8 @@ async def test_reused_pending_forward_falls_back_after_sampling_when_presampling
     controller._copy_sampled_decode_tokens_to_next_input_ids = lambda count: events.append(
         "copy" if count == 2 else ("copy", count)
     )
-    controller._async_transfer_samples_to_cpu = (
-        lambda count: events.append(("d2h", count))
-        or (torch.tensor([4, 5], dtype=torch.int64), None, SimpleNamespace(synchronize=lambda: None))
+    controller._transfer_async_samples_to_cpu = (
+        lambda count: events.append(("d2h", count)) or _sample_ticket([4, 5])
     )
     controller._confirm_prepared_ep_async_handoff = lambda: False
     controller._ensure_ep_async_handoff_decided = lambda **_kwargs: events.append("ep_done")
@@ -697,7 +737,7 @@ async def test_prepare_async_decode_before_sampling_steady_state_ordering(monkey
             torch.tensor([[0, 1]], dtype=torch.int64),
         ),
         using_cuda_graph_this_step=lambda: True,
-        mark_async_forward_in_flight=lambda: events.append("mark_in_flight"),
+        mark_async_resources_in_flight=lambda: events.append("mark_in_flight") or "ledger",
     )
 
     def _prepare(**kwargs):
@@ -711,8 +751,7 @@ async def test_prepare_async_decode_before_sampling_steady_state_ordering(monkey
         model=SimpleNamespace(config=SimpleNamespace(moe_enable_routing_replay=False)),
     )
     controller.num_speculative_tokens = 0
-    controller._async_pending_forward = False
-    controller._async_pending_cuda_graph_request_count = None
+    controller._async_step_transaction = None
     controller._async_prepare_deferred_until_after_sampling = False
     controller._async_forward_launch_count = 0
     controller._decide_ep_step_begin = lambda **_kwargs: EPStepBeginDecision(
@@ -746,12 +785,13 @@ async def test_prepare_async_decode_before_sampling_steady_state_ordering(monkey
     controller._dynamic_step_sample_logits_to_next_input_ids = (
         lambda: events.extend(["sample", "copy"])
     )
-    controller._async_transfer_samples_to_cpu = (
-        lambda count: events.append(("d2h", count))
-        or (torch.tensor([4, 5], dtype=torch.int64), None, SimpleNamespace(synchronize=lambda: None))
+    controller._transfer_async_samples_to_cpu = (
+        lambda count: events.append(("d2h", count)) or _sample_ticket([4, 5])
     )
     controller._confirm_prepared_ep_async_handoff = lambda: True
-    controller._record_async_pending_forward_requests = lambda _count: events.append("record")
+    controller._begin_async_step_transaction = lambda _count: events.append(
+        "record"
+    ) or SimpleNamespace(mark_launched=lambda **_kwargs: events.append("tx_launch"))
     controller._ensure_ep_async_handoff_decided = lambda **_kwargs: events.append("ep_done")
 
     result = await controller.async_generate_output_tokens_dynamic_batch(skip_bookkeeping=True)
@@ -789,7 +829,7 @@ async def test_prepare_async_decode_before_sampling_unsafe_fallback_ordering(mon
             torch.tensor([[0, 1]], dtype=torch.int64),
         ),
         using_cuda_graph_this_step=lambda: True,
-        mark_async_forward_in_flight=lambda: events.append("mark_in_flight"),
+        mark_async_resources_in_flight=lambda: events.append("mark_in_flight") or "ledger",
     )
 
     def _prepare(**kwargs):
@@ -806,8 +846,7 @@ async def test_prepare_async_decode_before_sampling_unsafe_fallback_ordering(mon
         model=SimpleNamespace(config=SimpleNamespace(moe_enable_routing_replay=False)),
     )
     controller.num_speculative_tokens = 0
-    controller._async_pending_forward = False
-    controller._async_pending_cuda_graph_request_count = None
+    controller._async_step_transaction = None
     controller._async_prepare_deferred_until_after_sampling = False
     controller._async_forward_launch_count = 0
     controller._decide_ep_step_begin = lambda **_kwargs: EPStepBeginDecision(
@@ -841,12 +880,13 @@ async def test_prepare_async_decode_before_sampling_unsafe_fallback_ordering(mon
     controller._copy_sampled_decode_tokens_to_next_input_ids = lambda count: events.append(
         ("copy", count)
     )
-    controller._async_transfer_samples_to_cpu = (
-        lambda count: events.append(("d2h", count))
-        or (torch.tensor([4, 5], dtype=torch.int64), None, SimpleNamespace(synchronize=lambda: None))
+    controller._transfer_async_samples_to_cpu = (
+        lambda count: events.append(("d2h", count)) or _sample_ticket([4, 5])
     )
     controller._confirm_prepared_ep_async_handoff = lambda: True
-    controller._record_async_pending_forward_requests = lambda _count: events.append("record")
+    controller._begin_async_step_transaction = lambda _count: events.append(
+        "record"
+    ) or SimpleNamespace(mark_launched=lambda **_kwargs: events.append("tx_launch"))
     controller._ensure_ep_async_handoff_decided = lambda **_kwargs: events.append("ep_done")
 
     result = await controller.async_generate_output_tokens_dynamic_batch(skip_bookkeeping=True)
@@ -914,7 +954,7 @@ def test_controller_step_begin_bridges_local_and_ep_protocol_decisions(
     use_protocol, pending_forward, row_status, expected
 ):
     controller = object.__new__(TextGenerationController)
-    controller._async_pending_forward = pending_forward
+    controller._has_pending_async_forward_state = lambda: pending_forward
     controller._ep_async_handoff_decided_this_step = True
     controller._ep_async_handoff_decision_this_step = object()
     controller._pending_async_forward_row_status = lambda: row_status
@@ -1361,23 +1401,20 @@ def test_pending_async_forward_cleanup_releases_only_when_needed():
     )
     controller = object.__new__(TextGenerationController)
     controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
-    controller._async_pending_forward = False
-    controller._async_pending_cuda_graph_request_count = 3
-    controller._async_pending_forward_view = tgc_module._AsyncPendingForwardView(
-        pending_request_ids=torch.tensor([1, 2]), cuda_graph_request_count=2
-    )
+    controller._async_step_transaction = None
     controller._async_discarded_forward_count = 0
 
     controller._discard_pending_async_forward()
     assert context.release_count == 0
     assert controller._async_discarded_forward_count == 0
 
-    controller._async_pending_forward = True
+    transaction = _install_pending_transaction(
+        controller, _make_async_layout_snapshot([1, 2], cuda_graph_request_count=2)
+    )
     controller._discard_pending_async_forward()
     assert context.release_count == 1
-    assert not controller._async_pending_forward
-    assert controller._async_pending_cuda_graph_request_count is None
-    assert controller._async_pending_forward_view is None
+    assert controller._async_step_transaction is None
+    assert transaction.state == AsyncTxnState.DISCARDED
     assert controller._async_discarded_forward_count == 1
 
 
@@ -1389,10 +1426,8 @@ def test_pending_async_forward_row_discard_releases_without_accepting_mamba_bank
     context.accept_async_mamba_state = lambda _request_ids: pytest.fail(
         "discarded forwards must not commit candidate Mamba banks"
     )
-    controller._async_pending_forward = True
-    controller._async_pending_cuda_graph_request_count = 2
 
-    assert controller._resolve_pending_async_forward_view() is None
+    assert controller._resolve_pending_async_forward() == (False, None, False)
 
     assert controller._async_discarded_forward_count == 1
 
@@ -1419,7 +1454,9 @@ def test_note_sampling_params_tracks_async_logprob_requests(sampling_params, exp
 def test_async_diagnostics_report_pending_forward_disable_counts_and_ep_protocol():
     controller = object.__new__(TextGenerationController)
     controller._async_scheduling_enabled = True
-    controller._async_pending_forward = True
+    _install_pending_transaction(
+        controller, _make_async_layout_snapshot([1], cuda_graph_request_count=1)
+    )
     controller._async_step_barrier_reason = "logging step"
     controller._async_eligibility_check_count = 4
     controller._async_eligibility_pass_count = 2
@@ -1446,21 +1483,25 @@ def test_async_diagnostics_report_pending_forward_disable_counts_and_ep_protocol
 
 
 @pytest.mark.internal
-def test_select_async_sample_slot_owns_all_readback_buffers_and_events():
+def test_activate_async_sample_slot_uses_readback_owned_buffers_and_events():
     controller = object.__new__(TextGenerationController)
     controller.num_speculative_tokens = 2
-    controller._async_current_sample_slot = 0
-    controller._sampled_tokens_cuda_slots = ["cuda_tokens_0", "cuda_tokens_1"]
-    controller._async_sample_values_cuda_slots = ["cuda_values_0", "cuda_values_1"]
-    controller._async_sampled_tokens_cpu_slots = ["cpu_tokens_0", "cpu_tokens_1"]
-    controller._async_sample_source_ready_events = ("source_ready_0", "source_ready_1")
-    controller._async_sample_ready_events = ("copy_ready_0", "copy_ready_1")
-    controller._sampled_mtp_tokens_cuda_slots = ["cuda_mtp_0", "cuda_mtp_1"]
-    controller._async_sampled_mtp_tokens_cpu_slots = ["cpu_mtp_0", "cpu_mtp_1"]
+    controller._async_sample_readback = AsyncSampleReadback(
+        sample_slot_count=2,
+        current_sample_slot=0,
+        sampled_tokens_cuda_slots=["cuda_tokens_0", "cuda_tokens_1"],
+        sample_values_cuda_slots=["cuda_values_0", "cuda_values_1"],
+        sampled_tokens_cpu_slots=["cpu_tokens_0", "cpu_tokens_1"],
+        source_ready_events=("source_ready_0", "source_ready_1"),
+        copy_done_events=("copy_ready_0", "copy_ready_1"),
+        copy_stream="copy_stream",
+        sampled_mtp_tokens_cuda_slots=["cuda_mtp_0", "cuda_mtp_1"],
+        sampled_mtp_tokens_cpu_slots=["cpu_mtp_0", "cpu_mtp_1"],
+    )
 
-    controller._select_async_sample_slot(1)
+    controller._activate_async_sample_slot(1)
 
-    assert controller._async_current_sample_slot == 1
+    assert controller._async_sample_readback.current_sample_slot == 1
     assert controller._sampled_tokens_cuda == "cuda_tokens_1"
     assert controller._async_sample_values_cuda == "cuda_values_1"
     assert controller._async_sampled_tokens_cpu == "cpu_tokens_1"
@@ -1650,8 +1691,8 @@ def test_async_pending_resources_are_quarantined_until_forward_retires():
     context.mamba_slot_allocator = None
     context.kv_block_allocator = _ReleaseRecordingAllocator()
     context._async_resource_ledger = AsyncResourceLedger(in_flight=True)
-    context._async_deferred_kv_block_release_count = 0
-    context._async_deferred_mamba_slot_release_count = 0
+    context.async_kv_deferred_release_count = 0
+    context.async_mamba_deferred_release_count = 0
 
     context.release_memory_blocks_from_request_indexes(torch.tensor([0], dtype=torch.long))
 
@@ -1664,11 +1705,11 @@ def test_async_pending_resources_are_quarantined_until_forward_retires():
     assert [blocks.tolist() for blocks in context.kv_block_allocator.released] == [[10, 11]]
     assert not context._async_resource_ledger.in_flight
     assert context._async_resource_ledger.deferred_kv_tensor().numel() == 0
-    assert context._async_deferred_kv_block_release_count == 2
+    assert context.async_kv_deferred_release_count == 2
 
 
 @pytest.mark.internal
-def test_async_pending_forward_defers_mamba_slot_free_until_forward_retires():
+def test_async_transaction_defers_mamba_slot_free_until_forward_retires():
     context = object.__new__(DynamicInferenceContext)
     context.request_to_kv_block_ids = torch.tensor(
         [[10, 11, -1], [12, -1, -1]], dtype=torch.int32
@@ -1678,8 +1719,8 @@ def test_async_pending_forward_defers_mamba_slot_free_until_forward_retires():
     context.mamba_slot_allocator = None
     context.kv_block_allocator = _ReleaseRecordingAllocator()
     context._async_resource_ledger = AsyncResourceLedger(in_flight=True)
-    context._async_deferred_kv_block_release_count = 0
-    context._async_deferred_mamba_slot_release_count = 0
+    context.async_kv_deferred_release_count = 0
+    context.async_mamba_deferred_release_count = 0
 
     context.release_memory_blocks_from_request_indexes(torch.tensor([0], dtype=torch.long))
 
@@ -1695,7 +1736,7 @@ def test_async_pending_forward_defers_mamba_slot_free_until_forward_retires():
     assert [blocks.tolist() for blocks in context.kv_block_allocator.released] == [[10, 11]]
     assert [slots.tolist() for slots in context.mamba_metadata.freed_slots] == [[3]]
     assert context._async_resource_ledger.deferred_mamba_tensor().numel() == 0
-    assert context._async_deferred_mamba_slot_release_count == 1
+    assert context.async_mamba_deferred_release_count == 1
     assert not context._async_resource_ledger.in_flight
 
 
@@ -1705,7 +1746,7 @@ def test_async_mamba_reset_defers_allocated_slots_while_forward_is_in_flight():
     context.is_hybrid_model = True
     context.mamba_metadata = _MambaMetadataWithFreeRecording(slots=[2, -1, 4], banks=[0, 0, 1])
     context._async_resource_ledger = AsyncResourceLedger(in_flight=True)
-    context._async_deferred_mamba_slot_release_count = 0
+    context.async_mamba_deferred_release_count = 0
 
     context.reset_mamba_state()
 
@@ -1719,11 +1760,11 @@ def test_async_mamba_reset_defers_allocated_slots_while_forward_is_in_flight():
 
     assert [slots.tolist() for slots in context.mamba_metadata.freed_slots] == [[2, 4]]
     assert context._async_resource_ledger.deferred_mamba_tensor().numel() == 0
-    assert context._async_deferred_mamba_slot_release_count == 2
+    assert context.async_mamba_deferred_release_count == 2
 
 
 @pytest.mark.internal
-def test_async_reserved_kv_blocks_are_adopted_or_deferred_then_released():
+def test_async_kv_reservations_are_adopted_or_deferred_then_released():
     context = object.__new__(DynamicInferenceContext)
     context.paused_request_count = 0
     context.total_request_count = 3
@@ -1739,13 +1780,13 @@ def test_async_reserved_kv_blocks_are_adopted_or_deferred_then_released():
         block_ids=torch.tensor([100, 101, 102], dtype=torch.int32),
         block_columns=torch.tensor([1, 1, 1], dtype=torch.int32),
     )
-    context._async_reserved_kv_block_adoption_count = 0
-    context._async_deferred_kv_block_release_count = 0
-    context._async_deferred_mamba_slot_release_count = 0
+    context.async_kv_reservation_adoption_count = 0
+    context.async_kv_deferred_release_count = 0
+    context.async_mamba_deferred_release_count = 0
     context.is_hybrid_model = False
     context.kv_block_allocator = _ReleaseRecordingAllocator()
 
-    consumed = context._consume_async_reserved_kv_blocks(
+    consumed = context.consume_async_kv_reservations(
         torch.tensor([10], dtype=torch.int32), torch.tensor([1], dtype=torch.int32)
     )
 
@@ -1755,9 +1796,9 @@ def test_async_reserved_kv_blocks_are_adopted_or_deferred_then_released():
     assert context.request_last_kv_block_id.tolist() == [1, 2, 3]
     assert context._async_resource_ledger.reservation_count == 2
     assert context._async_resource_ledger.reserved_block_ids_tensor().tolist() == [101, 102]
-    assert context._async_reserved_kv_block_adoption_count == 1
+    assert context.async_kv_reservation_adoption_count == 1
 
-    context._defer_remaining_async_reserved_kv_blocks()
+    context.defer_unused_async_kv_reservations()
 
     assert context._async_resource_ledger.reservation_count == 0
     assert context._async_resource_ledger.deferred_kv_tensor().tolist() == [101, 102]
@@ -1766,7 +1807,7 @@ def test_async_reserved_kv_blocks_are_adopted_or_deferred_then_released():
 
     assert [blocks.tolist() for blocks in context.kv_block_allocator.released] == [[101, 102]]
     assert context._async_resource_ledger.deferred_kv_tensor().numel() == 0
-    assert context._async_deferred_kv_block_release_count == 2
+    assert context.async_kv_deferred_release_count == 2
 
 
 @pytest.mark.internal

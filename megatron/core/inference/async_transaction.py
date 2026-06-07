@@ -45,33 +45,60 @@ class AsyncLayoutSnapshot:
     mamba_write_indices: Tensor | None = None
 
     @classmethod
-    def from_pending_forward_view(
-        cls, pending_view: Any, *, tokens_per_request: int
+    def from_prepared_context(
+        cls,
+        context: Any,
+        *,
+        request_ids: Tensor,
+        padded_active_request_count: int | None,
+        tokens_per_request: int,
     ) -> "AsyncLayoutSnapshot":
-        """Build a snapshot from the legacy pending-forward view."""
-        request_ids = pending_view.pending_request_ids.clone()
+        """Build a snapshot from the prepared async-forward context layout."""
+        request_ids = request_ids.clone()
         request_count = int(request_ids.numel())
         graph_shape = AsyncGraphShape(
             active_request_count=request_count,
             active_token_count=request_count * tokens_per_request,
-            padded_active_request_count=pending_view.cuda_graph_request_count,
+            padded_active_request_count=padded_active_request_count,
             tokens_per_request=tokens_per_request,
         )
+
+        mamba_read_indices = None
+        mamba_write_indices = None
+        if getattr(context, "is_hybrid_model", False):
+            mamba_read_indices = _clone_prefix(
+                getattr(context, "_cpu_mamba_batch_indices_decode", None), request_count
+            )
+            mamba_write_indices = _clone_prefix(
+                getattr(context, "_cpu_mamba_batch_indices_decode_write", None), request_count
+            )
+
         return cls(
             request_ids=request_ids,
             graph_shape=graph_shape,
-            request_query_lengths=_clone_optional(pending_view.planned_request_query_lengths),
-            request_kv_length_offsets=_clone_optional(
-                pending_view.planned_request_kv_length_offsets
+            request_query_lengths=_clone_prefix(
+                getattr(context, "_staging_request_query_lengths", None), request_count
             ),
-            token_to_request_idx=_clone_optional(pending_view.planned_token_to_request_idx),
-            token_to_pos_ids=_clone_optional(pending_view.planned_token_to_pos_ids),
-            token_to_block_idx=_clone_optional(pending_view.planned_token_to_block_idx),
-            token_to_local_position_within_kv_block=_clone_optional(
-                pending_view.planned_token_to_local_position_within_kv_block
+            request_kv_length_offsets=_clone_prefix(
+                getattr(context, "_staging_request_kv_length_offsets", None), request_count
             ),
-            mamba_read_indices=_clone_optional(pending_view.planned_mamba_read_indices),
-            mamba_write_indices=_clone_optional(pending_view.planned_mamba_write_indices),
+            token_to_request_idx=_clone_token_rows(
+                context, "token_to_request_idx", request_count, tokens_per_request
+            ),
+            token_to_pos_ids=_clone_token_rows(
+                context, "token_to_pos_ids", request_count, tokens_per_request
+            ),
+            token_to_block_idx=_clone_token_rows(
+                context, "token_to_block_idx", request_count, tokens_per_request
+            ),
+            token_to_local_position_within_kv_block=_clone_token_rows(
+                context,
+                "token_to_local_position_within_kv_block",
+                request_count,
+                tokens_per_request,
+            ),
+            mamba_read_indices=mamba_read_indices,
+            mamba_write_indices=mamba_write_indices,
         )
 
     @classmethod
@@ -244,6 +271,12 @@ def _clone_optional(value: Tensor | None) -> Tensor | None:
     return value.clone()
 
 
+def _clone_prefix(value: Tensor | None, count: int) -> Tensor | None:
+    if value is None:
+        return None
+    return value[:count].clone()
+
+
 def _clone_active(context: Any, name: str, active_slice: slice) -> Tensor | None:
     value = getattr(context, name, None)
     if value is None:
@@ -285,7 +318,6 @@ class AsyncStepTransaction:
     ep_decision: object | None = None
     row_map: object | None = None
     discard_reason: str | None = None
-    pending_forward_view: object | None = None
 
     def mark_launched(
         self,
@@ -624,7 +656,7 @@ class AsyncResourceLedger:
         self.in_flight = False
         if self.deferred_kv_blocks:
             blocks = torch.tensor(self.deferred_kv_blocks, dtype=torch.int32, device="cpu")
-            context._async_deferred_kv_block_release_count += int(blocks.numel())
+            context.async_kv_deferred_release_count += int(blocks.numel())
             context.kv_block_allocator.release_memory_blocks(blocks)
             self.deferred_kv_blocks.clear()
         self._release_deferred_mamba_slots(context)
@@ -670,7 +702,7 @@ class AsyncResourceLedger:
         if not getattr(context, "is_hybrid_model", False) or not self.deferred_mamba_slots:
             return
         slots = torch.tensor(self.deferred_mamba_slots, dtype=torch.int32, device="cpu")
-        context._async_deferred_mamba_slot_release_count += int(slots.numel())
+        context.async_mamba_deferred_release_count += int(slots.numel())
         context.mamba_metadata.free_slot_ids(slots)
         self.deferred_mamba_slots.clear()
 

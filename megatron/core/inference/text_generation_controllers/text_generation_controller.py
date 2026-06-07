@@ -5,7 +5,6 @@ import concurrent
 import copy
 import functools
 from collections import defaultdict
-from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, OrderedDict, Tuple, Union
 
 import numpy as np
@@ -79,30 +78,6 @@ from megatron.core.inference.text_generation_controllers.mtp_utils_triton import
     prepare_next_forward_pass,
     verify_speculative_tokens,
 )
-
-
-@dataclass(frozen=True)
-class _AsyncPendingForwardView:
-    """Request-row view for a pending speculative async forward."""
-
-    pending_request_ids: Tensor
-    cuda_graph_request_count: Optional[int]
-    current_request_ids: Optional[Tensor] = None
-    row_indices: Optional[Tensor] = None
-    row_indices_cpu: Optional[Tensor] = None
-    planned_request_query_lengths: Optional[Tensor] = None
-    planned_request_kv_length_offsets: Optional[Tensor] = None
-    planned_token_to_request_idx: Optional[Tensor] = None
-    planned_token_to_pos_ids: Optional[Tensor] = None
-    planned_token_to_block_idx: Optional[Tensor] = None
-    planned_token_to_local_position_within_kv_block: Optional[Tensor] = None
-    planned_mamba_read_indices: Optional[Tensor] = None
-    planned_mamba_write_indices: Optional[Tensor] = None
-
-    @property
-    def row_mapped(self) -> bool:
-        """Whether current rows must gather from different pending-forward rows."""
-        return self.row_indices is not None
 
 
 # pylint: disable=line-too-long
@@ -209,15 +184,12 @@ class TextGenerationController:
         self._sampling_backend = context.config.sampling_backend
         self._enable_cuda_graph = self.model_config.cuda_graph_impl == "local"
         self._async_scheduling_enabled = context.config.enable_async_scheduling
-        self._async_pending_forward = False
-        self._async_pending_cuda_graph_request_count = None
         self._async_disable_reason = None
         self._async_forward_launch_count = 0
         self._async_deferred_mtp_release_count = 0
         self._async_eligibility_check_count = 0
         self._async_eligibility_pass_count = 0
         self._async_disable_reason_counts: Dict[str, int] = {}
-        self._async_pending_forward_view = None
         self._async_step_transaction = None
         self._async_transaction_next_step_id = 0
         self._dummy_context_h2d_done_event = None
@@ -234,8 +206,6 @@ class TextGenerationController:
         self._async_prepare_deferred_until_after_sampling = False
         self._async_sample_readback = None
         self._async_decode_coordinator = None
-        self._async_sample_slot_count = 2
-        self._async_current_sample_slot = 0
         self._request_sampling_rngs: Dict[int, torch.Generator] = {}
         self._ep_async_protocol = None
         self._ep_async_handoff_decided_this_step = False
@@ -249,13 +219,12 @@ class TextGenerationController:
         else:
             self._all_logits_cuda = None
         self._async_sample_readback = AsyncSampleReadback.allocate(
-            sample_slot_count=self._async_sample_slot_count,
+            sample_slot_count=2,
             max_requests=max_requests,
             logits_dtype=logits_dtype,
             device=device,
             num_speculative_tokens=self.num_speculative_tokens,
         )
-        self._install_async_sample_readback_shims()
 
         # Sampling backend: provides the sampling kernel.
         if self._sampling_backend == "flashinfer":
@@ -275,7 +244,7 @@ class TextGenerationController:
         self._sp_enabled = self.model_config.sequence_parallel and self._tp_size > 1
 
         self._init_mtp_sampling_tensors()
-        self._select_async_sample_slot(0)
+        self._activate_async_sample_slot(0)
 
     def _init_mtp_sampling_tensors(self):
         """Pre-allocate MTP sampling tensors.
@@ -293,10 +262,8 @@ class TextGenerationController:
         max_requests = context.max_requests
         device = torch.cuda.current_device()
         readback = self._ensure_async_sample_readback()
-        self._sampled_mtp_tokens_cuda_slots = readback.sampled_mtp_tokens_cuda_slots
-        self._async_sampled_mtp_tokens_cpu_slots = readback.sampled_mtp_tokens_cpu_slots
-        self._sampled_mtp_tokens_cuda = self._sampled_mtp_tokens_cuda_slots[0]
-        self._async_sampled_mtp_tokens_cpu = self._async_sampled_mtp_tokens_cpu_slots[0]
+        self._sampled_mtp_tokens_cuda = readback.sampled_mtp_tokens_cuda_slots[0]
+        self._async_sampled_mtp_tokens_cpu = readback.sampled_mtp_tokens_cpu_slots[0]
         self._accepted_tokens_per_request = (
             torch.ones(
                 [max_requests, self.num_speculative_tokens], dtype=torch.int64, device=device
@@ -316,49 +283,18 @@ class TextGenerationController:
         )
 
     def _ensure_async_sample_readback(self) -> AsyncSampleReadback:
-        """Return the readback owner, creating it from legacy aliases when needed."""
+        """Return the readback owner for async sample slots."""
         readback = getattr(self, "_async_sample_readback", None)
-        if readback is not None:
-            return readback
-        readback = AsyncSampleReadback(
-            sample_slot_count=getattr(self, "_async_sample_slot_count", 2),
-            current_sample_slot=getattr(self, "_async_current_sample_slot", 0),
-            sampled_tokens_cuda_slots=self._sampled_tokens_cuda_slots,
-            sample_values_cuda_slots=self._async_sample_values_cuda_slots,
-            sampled_tokens_cpu_slots=self._async_sampled_tokens_cpu_slots,
-            sampled_mtp_tokens_cuda_slots=getattr(self, "_sampled_mtp_tokens_cuda_slots", None),
-            sampled_mtp_tokens_cpu_slots=getattr(
-                self, "_async_sampled_mtp_tokens_cpu_slots", None
-            ),
-            source_ready_events=self._async_sample_source_ready_events,
-            copy_done_events=self._async_sample_ready_events,
-            copy_stream=getattr(self, "_async_copy_stream", None),
-        )
-        self._async_sample_readback = readback
+        if readback is None:
+            raise RuntimeError("async sample readback has not been initialized")
         return readback
 
-    def _install_async_sample_readback_shims(self) -> None:
-        """Install temporary compatibility aliases for the readback-owned fields."""
-        readback = self._ensure_async_sample_readback()
-        self._async_sample_slot_count = readback.sample_slot_count
-        self._async_current_sample_slot = readback.current_sample_slot
-        self._sampled_tokens_cuda_slots = readback.sampled_tokens_cuda_slots
-        self._async_sample_values_cuda_slots = readback.sample_values_cuda_slots
-        self._async_sampled_tokens_cpu_slots = readback.sampled_tokens_cpu_slots
-        self._sampled_mtp_tokens_cuda_slots = readback.sampled_mtp_tokens_cuda_slots
-        self._async_sampled_mtp_tokens_cpu_slots = readback.sampled_mtp_tokens_cpu_slots
-        self._async_sample_source_ready_events = readback.source_ready_events
-        self._async_sample_ready_events = readback.copy_done_events
-        self._async_copy_stream = readback.copy_stream
-
-    def _select_async_sample_slot(self, sample_slot: int) -> AsyncSampleTicket:
+    def _activate_async_sample_slot(self, sample_slot: int) -> AsyncSampleTicket:
         """Select the sampled-token buffers used by subsequent GPU sampling operations."""
         readback = self._ensure_async_sample_readback()
         ticket = readback.select_slot(
             sample_slot, num_speculative_tokens=self.num_speculative_tokens
         )
-        self._install_async_sample_readback_shims()
-        self._async_current_sample_slot = readback.current_sample_slot
         self._sampled_tokens_cuda = ticket.sampled_tokens_cuda
         self._async_sample_values_cuda = ticket.sample_values_cuda
         self._async_sampled_tokens_cpu = ticket.sampled_tokens_cpu
@@ -1598,9 +1534,8 @@ class TextGenerationController:
         return None
 
     def _has_pending_async_forward_state(self) -> bool:
-        """Return whether either the transaction or legacy shim has a pending forward."""
-        transaction = self._pending_async_transaction()
-        return transaction is not None or bool(getattr(self, "_async_pending_forward", False))
+        """Return whether a transaction owns a pending async forward."""
+        return self._pending_async_transaction() is not None
 
     def _retire_async_transaction(self) -> None:
         """Retire and clear the active async transaction."""
@@ -1664,364 +1599,99 @@ class TextGenerationController:
             context.paused_request_count : context.total_request_count
         ].clone()
 
-    def _record_async_pending_forward_requests(
+    def _begin_async_step_transaction(
         self, cuda_graph_request_count: Optional[int]
-    ) -> None:
-        """Remember the request-row order that a speculative forward is computing."""
+    ) -> AsyncStepTransaction:
+        """Create the transaction that owns the just-launched speculative forward."""
         context = self.inference_wrapped_model.inference_context
         pending_request_ids = context.async_prepared_request_ids_cpu()
         if pending_request_ids is None:
             pending_request_ids = self._active_request_ids_cpu()
-        request_count = int(pending_request_ids.numel())
-        planned_layout = self._capture_pending_forward_layout(request_count)
-        pending_forward_view = _AsyncPendingForwardView(
-            pending_request_ids=pending_request_ids,
-            cuda_graph_request_count=cuda_graph_request_count,
-            **planned_layout,
-        )
-        self._async_pending_forward_view = pending_forward_view
-        snapshot = AsyncLayoutSnapshot.from_pending_forward_view(
-            pending_forward_view, tokens_per_request=self.num_speculative_tokens + 1
+        snapshot = AsyncLayoutSnapshot.from_prepared_context(
+            context,
+            request_ids=pending_request_ids,
+            padded_active_request_count=cuda_graph_request_count,
+            tokens_per_request=self.num_speculative_tokens + 1,
         )
         transaction_step_id = getattr(self, "_async_transaction_next_step_id", 0)
         transaction = AsyncStepTransaction(
             step_id=transaction_step_id,
             state=AsyncTxnState.PREPARED,
             snapshot=snapshot,
-            pending_forward_view=pending_forward_view,
         )
-        transaction.mark_launched()
         self._async_step_transaction = transaction
         self._async_transaction_next_step_id = transaction_step_id + 1
         context.clear_async_prepared_decode_plan()
+        return transaction
 
-    def _pending_async_forward_matches_current_rows(self) -> bool:
-        """Return whether a pending speculative forward still has current row order."""
-        transaction = self._pending_async_transaction()
-        pending_view = (
-            transaction.pending_forward_view
-            if transaction is not None and transaction.pending_forward_view is not None
-            else self._async_pending_forward_view
-        )
-        if pending_view is None:
-            return True
-        return torch.equal(pending_view.pending_request_ids, self._active_request_ids_cpu())
-
-    def _capture_pending_forward_layout(self, request_count: int) -> Dict[str, Optional[Tensor]]:
-        """Snapshot the CPU-visible layout used by the prepared async forward."""
+    def _pending_async_row_map(self, transaction: AsyncStepTransaction) -> Optional[Tensor]:
+        """Return the current-row to transaction-row map if the pending forward is reusable."""
         context = self.inference_wrapped_model.inference_context
-        tokens_per_request = self.num_speculative_tokens + 1
-        token_count = request_count * tokens_per_request
-
-        def _clone_optional(name: str, count: int) -> Optional[Tensor]:
-            value = getattr(context, name, None)
-            if value is None:
-                return None
-            return value[:count].clone()
-
-        layout = {
-            "planned_request_query_lengths": _clone_optional(
-                "_staging_request_query_lengths", request_count
-            ),
-            "planned_request_kv_length_offsets": _clone_optional(
-                "_staging_request_kv_length_offsets", request_count
-            ),
-            "planned_token_to_request_idx": None,
-            "planned_token_to_pos_ids": None,
-            "planned_token_to_block_idx": None,
-            "planned_token_to_local_position_within_kv_block": None,
-            "planned_mamba_read_indices": None,
-            "planned_mamba_write_indices": None,
-        }
-        if token_count <= 0:
-            return layout
-
-        for field in (
-            "token_to_request_idx",
-            "token_to_pos_ids",
-            "token_to_block_idx",
-            "token_to_local_position_within_kv_block",
-        ):
-            value = getattr(context, field, None)
-            if value is None:
-                continue
-            layout[f"planned_{field}"] = value[:token_count].view(
-                request_count, tokens_per_request
-            ).clone()
-        if getattr(context, "is_hybrid_model", False):
-            for source, target in (
-                ("_cpu_mamba_batch_indices_decode", "planned_mamba_read_indices"),
-                ("_cpu_mamba_batch_indices_decode_write", "planned_mamba_write_indices"),
-            ):
-                value = getattr(context, source, None)
-                if value is not None:
-                    layout[target] = value[:request_count].clone()
-        return layout
-
-    def _pending_forward_layout_matches_current(
-        self, pending_view: _AsyncPendingForwardView
-    ) -> bool:
-        """Return whether the prepared async layout matches reconciled CPU state."""
-        planned_fields = (
-            pending_view.planned_request_query_lengths,
-            pending_view.planned_request_kv_length_offsets,
-            pending_view.planned_token_to_request_idx,
-            pending_view.planned_token_to_pos_ids,
-            pending_view.planned_token_to_block_idx,
-            pending_view.planned_token_to_local_position_within_kv_block,
-            pending_view.planned_mamba_read_indices,
-            pending_view.planned_mamba_write_indices,
+        current_snapshot = AsyncLayoutSnapshot.from_context_current(
+            context, tokens_per_request=self.num_speculative_tokens + 1
         )
-        if all(field is None for field in planned_fields):
-            return True
-
-        context = self.inference_wrapped_model.inference_context
-        current_request_ids = (
-            pending_view.current_request_ids
-            if pending_view.current_request_ids is not None
-            else self._active_request_ids_cpu()
-        )
-        request_count = int(current_request_ids.numel())
-        pending_request_count = int(pending_view.pending_request_ids.numel())
-        if request_count == 0 or pending_request_count < request_count:
-            return False
-
-        row_indices = pending_view.row_indices_cpu
-        if row_indices is None:
-            if pending_request_count != request_count:
-                return False
-            row_indices = torch.arange(request_count, dtype=torch.long, device='cpu')
-        else:
-            row_indices = row_indices.to(dtype=torch.long, device='cpu')
-            if row_indices.numel() != request_count:
-                return False
-            if bool((row_indices < 0).any()) or bool((row_indices >= pending_request_count).any()):
-                return False
-
-        active_slice = slice(context.paused_request_count, context.total_request_count)
-        if pending_view.planned_request_query_lengths is not None:
-            current_query_lengths = context.request_query_lengths[active_slice][:request_count]
-            planned_query_lengths = pending_view.planned_request_query_lengths.index_select(
-                0, row_indices
-            )
-            if not torch.equal(current_query_lengths, planned_query_lengths):
-                return False
-
-        if pending_view.planned_request_kv_length_offsets is not None:
-            current_kv_offsets = context.request_kv_length_offsets[active_slice][:request_count]
-            planned_kv_offsets = pending_view.planned_request_kv_length_offsets.index_select(
-                0, row_indices
-            )
-            if not torch.equal(current_kv_offsets, planned_kv_offsets):
-                return False
-
-        tokens_per_request = self.num_speculative_tokens + 1
-        token_count = request_count * tokens_per_request
-        if context.active_token_count != token_count:
-            return False
-
-        if pending_view.planned_token_to_request_idx is not None:
-            current_token_rows = (
-                context.token_to_request_idx[:token_count]
-                .view(request_count, tokens_per_request)
-                .to(dtype=torch.long, device='cpu')
-            )
-            planned_token_rows = pending_view.planned_token_to_request_idx.index_select(
-                0, row_indices
-            ).to(dtype=torch.long, device='cpu')
-            if (
-                bool((current_token_rows < 0).any())
-                or bool((current_token_rows >= request_count).any())
-                or bool((planned_token_rows < 0).any())
-                or bool((planned_token_rows >= pending_request_count).any())
-            ):
-                return False
-            current_token_request_ids = current_request_ids.index_select(
-                0, current_token_rows.reshape(-1)
-            ).view_as(current_token_rows)
-            planned_token_request_ids = pending_view.pending_request_ids.index_select(
-                0, planned_token_rows.reshape(-1)
-            ).view_as(planned_token_rows)
-            if not torch.equal(current_token_request_ids, planned_token_request_ids):
-                return False
-
-        for field in (
-            "token_to_pos_ids",
-            "token_to_block_idx",
-            "token_to_local_position_within_kv_block",
-        ):
-            planned = getattr(pending_view, f"planned_{field}")
-            if planned is None:
-                continue
-            current = getattr(context, field)[:token_count].view(
-                request_count, tokens_per_request
-            )
-            planned_in_current_order = planned.index_select(0, row_indices)
-            if not torch.equal(current, planned_in_current_order):
-                return False
-
-        if getattr(context, "is_hybrid_model", False):
-            active_slice = slice(context.paused_request_count, context.total_request_count)
-            if pending_view.planned_mamba_read_indices is not None:
-                current_read_indices = context._mamba_flat_indices(active_slice)[
-                    :request_count
-                ]
-                planned_read_indices = pending_view.planned_mamba_read_indices.index_select(
-                    0, row_indices
-                )
-                if not torch.equal(current_read_indices, planned_read_indices):
-                    return False
-            if pending_view.planned_mamba_write_indices is not None:
-                current_write_indices = context._mamba_flat_indices(
-                    active_slice, use_candidate_bank=True
-                )[:request_count]
-                planned_write_indices = pending_view.planned_mamba_write_indices.index_select(
-                    0, row_indices
-                )
-                if not torch.equal(current_write_indices, planned_write_indices):
-                    return False
-
-        return True
-
-    def _map_pending_forward_to_current_rows(
-        self, pending_view: _AsyncPendingForwardView
-    ) -> Optional[_AsyncPendingForwardView]:
-        """Resolve current request rows against the pending forward's row layout."""
-        current_request_ids = self._active_request_ids_cpu()
-        if current_request_ids.numel() == 0:
+        if not transaction.snapshot.graph_compatible_with(current_snapshot):
             return None
-        if not self._pending_forward_graph_shape_matches_current(pending_view):
+        row_map = transaction.snapshot.row_map_to_current(current_snapshot.request_ids)
+        if row_map is None:
             return None
-
-        pending_request_ids = pending_view.pending_request_ids
-        if torch.equal(pending_request_ids, current_request_ids):
-            current_view = _AsyncPendingForwardView(
-                pending_request_ids=pending_request_ids,
-                cuda_graph_request_count=pending_view.cuda_graph_request_count,
-                current_request_ids=current_request_ids,
-                planned_request_query_lengths=pending_view.planned_request_query_lengths,
-                planned_request_kv_length_offsets=pending_view.planned_request_kv_length_offsets,
-                planned_token_to_request_idx=pending_view.planned_token_to_request_idx,
-                planned_token_to_pos_ids=pending_view.planned_token_to_pos_ids,
-                planned_token_to_block_idx=pending_view.planned_token_to_block_idx,
-                planned_token_to_local_position_within_kv_block=(
-                    pending_view.planned_token_to_local_position_within_kv_block
-                ),
-                planned_mamba_read_indices=pending_view.planned_mamba_read_indices,
-                planned_mamba_write_indices=pending_view.planned_mamba_write_indices,
-            )
-            return (
-                current_view
-                if self._pending_forward_layout_matches_current(current_view)
-                else None
-            )
-        if pending_request_ids.numel() < current_request_ids.numel():
+        if not transaction.snapshot.layout_compatible_with(current_snapshot, row_map=row_map):
             return None
+        return row_map
 
-        pending_row_by_request_id = {
-            int(request_id): row for row, request_id in enumerate(pending_request_ids.tolist())
-        }
-        mapped_rows = []
-        for request_id in current_request_ids.tolist():
-            row = pending_row_by_request_id.get(int(request_id))
-            if row is None:
-                return None
-            mapped_rows.append(row)
-
-        row_indices_cpu = torch.tensor(mapped_rows, dtype=torch.long, device='cpu')
-        row_indices = torch.tensor(
-            mapped_rows, dtype=torch.long, device=torch.cuda.current_device()
-        )
-        current_view = _AsyncPendingForwardView(
-            pending_request_ids=pending_request_ids,
-            cuda_graph_request_count=pending_view.cuda_graph_request_count,
-            current_request_ids=current_request_ids,
-            row_indices=row_indices,
-            row_indices_cpu=row_indices_cpu,
-            planned_request_query_lengths=pending_view.planned_request_query_lengths,
-            planned_request_kv_length_offsets=pending_view.planned_request_kv_length_offsets,
-            planned_token_to_request_idx=pending_view.planned_token_to_request_idx,
-            planned_token_to_pos_ids=pending_view.planned_token_to_pos_ids,
-            planned_token_to_block_idx=pending_view.planned_token_to_block_idx,
-            planned_token_to_local_position_within_kv_block=(
-                pending_view.planned_token_to_local_position_within_kv_block
-            ),
-            planned_mamba_read_indices=pending_view.planned_mamba_read_indices,
-            planned_mamba_write_indices=pending_view.planned_mamba_write_indices,
-        )
-        return (
-            current_view if self._pending_forward_layout_matches_current(current_view) else None
-        )
-
-    def _pending_forward_graph_shape_matches_current(
-        self, pending_view: _AsyncPendingForwardView
-    ) -> bool:
-        """Return whether the pending forward used the graph shape current rows expect."""
-        context = self.inference_wrapped_model.inference_context
-        current_graph_request_count = (
-            context.padded_active_request_count if context.using_cuda_graph_this_step() else None
-        )
-        return pending_view.cuda_graph_request_count == current_graph_request_count
+    @staticmethod
+    def _row_map_requires_gather(row_map: Tensor) -> bool:
+        """Return whether row order differs from identity."""
+        identity = torch.arange(int(row_map.numel()), dtype=torch.long, device="cpu")
+        return not torch.equal(row_map.to(dtype=torch.long, device="cpu"), identity)
 
     def _pending_async_forward_row_status(self) -> tuple[bool, bool]:
         """Return whether the pending forward is reusable and whether row mapping is needed."""
         transaction = self._pending_async_transaction()
-        pending_view = (
-            transaction.pending_forward_view
-            if transaction is not None and transaction.pending_forward_view is not None
-            else self._async_pending_forward_view
-        )
-        if pending_view is None:
+        if transaction is None:
             return True, False
 
-        current_view = self._map_pending_forward_to_current_rows(pending_view)
-        if current_view is None:
+        row_map = self._pending_async_row_map(transaction)
+        if row_map is None:
             return False, False
-        return True, current_view.row_mapped
+        return True, self._row_map_requires_gather(row_map)
 
-    def _resolve_pending_async_forward_view(self) -> Optional[_AsyncPendingForwardView]:
+    def _resolve_pending_async_forward(self) -> tuple[bool, Optional[Tensor], bool]:
         """Resolve the pending speculative forward's row layout for current consumers.
 
-        Returns ``None`` when a current request was not present in the pending
-        forward, meaning the pending forward cannot be safely reused.
+        Returns whether the forward was reused, optional CUDA row indices, and
+        whether row mapping was required.
         """
         transaction = self._pending_async_transaction()
-        pending_view = (
-            transaction.pending_forward_view
-            if transaction is not None and transaction.pending_forward_view is not None
-            else self._async_pending_forward_view
-        )
-        self._async_pending_forward_view = None
-        if pending_view is None:
-            return None
+        if transaction is None:
+            return False, None, False
 
-        current_view = self._map_pending_forward_to_current_rows(pending_view)
-        if current_view is not None:
-            if current_view.row_mapped:
+        row_map = self._pending_async_row_map(transaction)
+        if row_map is not None:
+            row_mapped = self._row_map_requires_gather(row_map)
+            if row_mapped:
                 self._async_row_mapped_forward_count += 1
-            if transaction is not None:
-                transaction.pending_forward_view = current_view
-                transaction.row_map = current_view.row_indices_cpu
-                transaction.state = AsyncTxnState.RESOLVED
-            return current_view
+            transaction.row_map = row_map
+            transaction.state = AsyncTxnState.RESOLVED
+            row_indices = (
+                row_map.to(device=torch.cuda.current_device(), dtype=torch.long)
+                if row_mapped
+                else None
+            )
+            return True, row_indices, row_mapped
 
         self._async_discarded_forward_count += 1
-        if transaction is not None:
-            transaction.discard("pending forward not reusable")
-        return None
+        transaction.discard("pending forward not reusable")
+        return False, None, False
 
     def _discard_pending_async_forward(self) -> None:
         """Discard a pending async forward and release resources reserved for it."""
         context = self.inference_wrapped_model.inference_context
         transaction = self._pending_async_transaction()
-        if self._has_pending_async_forward_state():
+        if transaction is not None:
             context.release_deferred_async_resources()
-            self._async_pending_forward = False
-            self._async_pending_cuda_graph_request_count = None
-            self._async_pending_forward_view = None
-            if transaction is not None:
-                transaction.discard("discarded before step begin")
-                self._async_step_transaction = None
+            transaction.discard("discarded before step begin")
+            self._async_step_transaction = None
             self._async_discarded_forward_count += 1
 
     def _decide_ep_step_begin(self, *, has_real_work: bool) -> EPStepBeginDecision:
@@ -2220,7 +1890,7 @@ class TextGenerationController:
             self._sampled_mtp_tokens_cuda[:, :active_request_count].transpose(0, 1)
         )
 
-    def _async_transfer_samples_to_cpu(
+    def _transfer_async_samples_to_cpu(
         self,
         active_request_count: int,
         sample_source_ready_event: Optional[torch.cuda.Event] = None,
@@ -2234,23 +1904,8 @@ class TextGenerationController:
             sample_source_ready_event=sample_source_ready_event,
             sample_slot=sample_slot,
         )
-        self._select_async_sample_slot(ticket.slot)
+        self._activate_async_sample_slot(ticket.slot)
         return ticket
-
-    @staticmethod
-    def _unpack_async_sample_ticket(
-        sample_readback_result: object,
-    ) -> Tuple[Tensor, Optional[Tensor], object, Optional[AsyncSampleTicket]]:
-        """Normalize new readback tickets and legacy tuple test doubles."""
-        if isinstance(sample_readback_result, AsyncSampleTicket):
-            return (
-                sample_readback_result.sampled_tokens_cpu,
-                sample_readback_result.sampled_mtp_tokens_cpu,
-                sample_readback_result.copy_done_event,
-                sample_readback_result,
-            )
-        sampled_tokens_cpu, sampled_mtp_tokens_cpu, sample_ready_event = sample_readback_result
-        return sampled_tokens_cpu, sampled_mtp_tokens_cpu, sample_ready_event, None
 
     def _try_prepare_async_decode_before_sampling(self) -> bool:
         """Prepare steady-state next-step metadata before current-step sampling."""
@@ -3134,7 +2789,6 @@ class TextGenerationController:
         input_ids = None
         cuda_graph_request_count = None
         pending_forward_reused = False
-        pending_forward_view = None
         pending_forward_row_indices = None
         pending_forward_row_mapped = False
         self._async_prepare_deferred_until_after_sampling = False
@@ -3145,21 +2799,13 @@ class TextGenerationController:
         with torch.inference_mode():
             if self._has_pending_async_forward_state():
                 transaction = self._pending_async_transaction()
-                cuda_graph_request_count = (
-                    transaction.snapshot.graph_shape.padded_active_request_count
-                    if transaction is not None
-                    else self._async_pending_cuda_graph_request_count
-                )
-                self._async_pending_forward = False
-                self._async_pending_cuda_graph_request_count = None
-                pending_forward_view = self._resolve_pending_async_forward_view()
-                pending_forward_reused = pending_forward_view is not None
-                pending_forward_row_indices = (
-                    pending_forward_view.row_indices if pending_forward_view is not None else None
-                )
-                pending_forward_row_mapped = (
-                    pending_forward_view.row_mapped if pending_forward_view is not None else False
-                )
+                assert transaction is not None
+                cuda_graph_request_count = transaction.snapshot.graph_shape.padded_active_request_count
+                (
+                    pending_forward_reused,
+                    pending_forward_row_indices,
+                    pending_forward_row_mapped,
+                ) = self._resolve_pending_async_forward()
                 pending_forward_row_mapped = (
                     pending_forward_row_mapped or ep_step_begin_decision.row_mapped_forward
                 )
@@ -3170,14 +2816,13 @@ class TextGenerationController:
                     and not context.is_decode_only()
                 ):
                     pending_forward_reused = False
-                    pending_forward_view = None
                     pending_forward_row_indices = None
                     pending_forward_row_mapped = False
                     self._async_discarded_forward_count += 1
                     if transaction is not None:
                         transaction.discard("row-mapped non-decode forward not reusable")
                 if pending_forward_reused and context.is_hybrid_model:
-                    context.accept_async_mamba_state(pending_forward_view.current_request_ids)
+                    context.accept_async_mamba_state(self._active_request_ids_cpu())
                 context.release_deferred_async_resources()
                 if transaction is not None:
                     if pending_forward_reused:
@@ -3311,14 +2956,10 @@ class TextGenerationController:
                         )
 
             if async_next_prepared:
-                (
-                    async_sampled_tokens_cpu,
-                    async_sampled_mtp_tokens_cpu,
-                    async_sample_ready_event,
-                    async_sample_ticket,
-                ) = self._unpack_async_sample_ticket(
-                    self._async_transfer_samples_to_cpu(active_request_count)
-                )
+                async_sample_ticket = self._transfer_async_samples_to_cpu(active_request_count)
+                async_sampled_tokens_cpu = async_sample_ticket.sampled_tokens_cpu
+                async_sampled_mtp_tokens_cpu = async_sample_ticket.sampled_mtp_tokens_cpu
+                async_sample_ready_event = async_sample_ticket.copy_done_event
                 if self._confirm_prepared_ep_async_handoff():
                     context.publish_async_prepared_decode_plan()
                     range_push("async_transfer_bookkeeping_to_gpu")
@@ -3332,23 +2973,18 @@ class TextGenerationController:
                     next_input_ids, next_position_ids = context.current_input_and_position_ids()
                     self._dynamic_step_forward_logits(next_input_ids, next_position_ids)
                     self._async_forward_launch_count += 1
-                    self._async_pending_forward = True
-                    self._async_pending_cuda_graph_request_count = (
+                    cuda_graph_request_count = (
                         context.padded_active_request_count
                         if context.using_cuda_graph_this_step()
                         else None
                     )
-                    self._record_async_pending_forward_requests(
-                        self._async_pending_cuda_graph_request_count
+                    transaction = self._begin_async_step_transaction(cuda_graph_request_count)
+                    resources = context.mark_async_resources_in_flight()
+                    transaction.mark_launched(
+                        sample_ticket=async_sample_ticket,
+                        resources=resources,
+                        h2d_done_event=async_h2d_done_event,
                     )
-                    transaction = self._pending_async_transaction()
-                    resources = context.mark_async_forward_in_flight()
-                    if transaction is not None:
-                        transaction.mark_launched(
-                            sample_ticket=async_sample_ticket,
-                            resources=resources,
-                            h2d_done_event=async_h2d_done_event,
-                        )
                     range_pop()
 
             if deferred_mtp_blocks_to_release is not None:
@@ -3399,9 +3035,6 @@ class TextGenerationController:
                     transaction = self._pending_async_transaction()
                     torch.cuda.current_stream().synchronize()
                     context.release_deferred_async_resources()
-                    self._async_pending_forward = False
-                    self._async_pending_cuda_graph_request_count = None
-                    self._async_pending_forward_view = None
                     if transaction is not None:
                         transaction.discard("no active requests after bookkeeping")
                         self._async_step_transaction = None

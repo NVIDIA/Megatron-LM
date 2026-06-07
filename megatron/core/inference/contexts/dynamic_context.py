@@ -982,9 +982,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             pin_memory=True,
         )
         self._async_resource_ledger = AsyncResourceLedger()
-        self._async_reserved_kv_block_adoption_count = 0
-        self._async_deferred_kv_block_release_count = 0
-        self._async_deferred_mamba_slot_release_count = 0
+        self.async_kv_reservation_adoption_count = 0
+        self.async_kv_deferred_release_count = 0
+        self.async_mamba_deferred_release_count = 0
         self._async_prepared_request_count = 0
         self._async_prepared_request_ids = torch.empty(
             (self.max_requests,), dtype=torch.int32, device='cpu'
@@ -1930,7 +1930,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Reset state used within Mamba layers."""
         if self.is_hybrid_model:
             if self._async_resource_ledger.in_flight:
-                self._append_deferred_async_mamba_slots(
+                self.defer_async_mamba_slots(
                     self.mamba_metadata.request_to_mamba_state_idx
                 )
                 self.mamba_metadata.request_to_mamba_state_idx.fill_(-1)
@@ -2538,11 +2538,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         if transfer_bookkeeping_to_gpu:
             self.transfer_bookkeeping_to_gpu()
 
-    def _clear_async_reserved_kv_blocks(self) -> None:
+    def clear_async_resource_reservations(self) -> None:
         """Clear the request-to-reserved-block map after CPU reconciliation."""
         self._async_resource_ledger.clear_reservations()
 
-    def mark_async_forward_in_flight(self) -> AsyncResourceLedger:
+    def mark_async_resources_in_flight(self) -> AsyncResourceLedger:
         """Mark that a speculative forward may still be using old resources."""
         self._async_resource_ledger.in_flight = True
         return self._async_resource_ledger
@@ -2552,18 +2552,18 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._async_resource_ledger.release_deferred(self)
 
     def release_deferred_async_kv_blocks(self) -> None:
-        """Compatibility wrapper for callers that only deferred KV blocks before P14."""
+        """Release async-reserved resources after their speculative forward retires."""
         self.release_deferred_async_resources()
 
-    def _append_deferred_async_kv_blocks(self, blocks: Tensor) -> None:
+    def defer_async_kv_blocks(self, blocks: Tensor) -> None:
         """Defer releasing blocks that may still be used by an in-flight forward."""
         self._async_resource_ledger.defer_kv_blocks(blocks)
 
-    def _append_deferred_async_mamba_slots(self, slots: Tensor) -> None:
+    def defer_async_mamba_slots(self, slots: Tensor) -> None:
         """Defer freeing Mamba slots that an in-flight forward may still write."""
         self._async_resource_ledger.defer_mamba_slots(slots)
 
-    def _release_deferred_async_mamba_slots(self) -> None:
+    def release_deferred_async_mamba_slots(self) -> None:
         """Return deferred Mamba slots to the free pool after async forward retirement."""
         self._async_resource_ledger._release_deferred_mamba_slots(self)
 
@@ -2575,7 +2575,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             mamba_indices_to_free = self.mamba_metadata.request_to_mamba_state_idx[
                 request_indexes
             ]
-            self._append_deferred_async_mamba_slots(mamba_indices_to_free)
+            self.defer_async_mamba_slots(mamba_indices_to_free)
             self.mamba_metadata.request_to_mamba_state_idx[request_indexes] = -1
             self.mamba_metadata.request_to_mamba_state_bank[request_indexes] = 0
         else:
@@ -2789,7 +2789,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.kv_block_allocator.release_memory_blocks(
                 self._async_resource_ledger.reserved_block_ids_tensor()
             )
-            self._clear_async_reserved_kv_blocks()
+            self.clear_async_resource_reservations()
         self.clear_async_prepared_decode_plan()
 
     def _snapshot_async_pre_sampling_state(self) -> Dict[str, object]:
@@ -3012,7 +3012,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         return True
 
-    def _consume_async_reserved_kv_blocks(
+    def consume_async_kv_reservations(
         self, request_ids: Tensor, block_columns: Tensor
     ) -> Tensor:
         """Return reserved blocks for resumed requests, or -1 where none is reserved."""
@@ -3020,12 +3020,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         reserved_block_ids = self._async_resource_ledger.consume_reserved_blocks(
             request_ids, block_columns
         )
-        self._async_reserved_kv_block_adoption_count += (
+        self.async_kv_reservation_adoption_count += (
             self._async_resource_ledger.consumed_reservation_count - consumed_before
         )
         return reserved_block_ids
 
-    def _defer_remaining_async_reserved_kv_blocks(self) -> None:
+    def defer_unused_async_kv_reservations(self) -> None:
         """Quarantine reserved blocks that actual CPU bookkeeping did not consume."""
         self._async_resource_ledger.defer_unused_reservations()
 
@@ -3135,7 +3135,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         ):
             if reserved_block_count > 0:
                 self.kv_block_allocator.release_memory_blocks(plan.reserved_block_ids)
-                self._clear_async_reserved_kv_blocks()
+                self.clear_async_resource_reservations()
             self.clear_async_prepared_decode_plan()
             if pre_sampling_current_state is not None:
                 self._restore_async_pre_sampling_state(pre_sampling_current_state)
@@ -3923,7 +3923,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         kv_blocks_assigned = self.request_to_kv_block_ids[request_indexes]
         non_zero_values_in_kv_memory = kv_blocks_assigned[kv_blocks_assigned != -1]
         if self._async_resource_ledger.in_flight:
-            self._append_deferred_async_kv_blocks(non_zero_values_in_kv_memory)
+            self.defer_async_kv_blocks(non_zero_values_in_kv_memory)
         else:
             self.kv_block_allocator.release_memory_blocks(non_zero_values_in_kv_memory)
 
@@ -4012,7 +4012,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 row_idx = resume_start + relative_row_idx
                 col_idx = self.request_kv_block_counts[row_idx]
                 request_ids = self.request_ids[row_idx]
-                block_ids = self._consume_async_reserved_kv_blocks(request_ids, col_idx)
+                block_ids = self.consume_async_kv_reservations(request_ids, col_idx)
                 missing_reserved_mask = block_ids == -1
                 missing_reserved_count = int(missing_reserved_mask.sum().item())
                 if missing_reserved_count > 0:
@@ -4255,7 +4255,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
             # Reset Mamba state.
             self.reset_mamba_state()
-            self._defer_remaining_async_reserved_kv_blocks()
+            self.defer_unused_async_kv_reservations()
             return
 
         # 3. Concatenate the paused tokens to the active tokens if present.
@@ -4607,7 +4607,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             # Convert back to 1d tensor
             self.token_to_block_idx[: self.active_token_count] = block_idx.flatten()
 
-        self._defer_remaining_async_reserved_kv_blocks()
+        self.defer_unused_async_kv_reservations()
 
         return {
             "newly_paused_request_ids": newly_paused_request_ids,
