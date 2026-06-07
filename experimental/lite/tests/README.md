@@ -34,7 +34,7 @@ Current matrix:
 | Checkpoint restore vs direct training | xfail sentinels only in this validation PR | FSDP2 and distopt checkpoint smokes are xfail until the follow-up bugfix PR |
 | Runtime backend registry/config | `unit/primitive/test_runtime_config_unit.py`, `unit/runtime/test_runtime_backend_unit.py` | covered through checkpoint/model handles |
 | Runtime env/offload controls | `unit/runtime/test_runtime_backend_unit.py` | `smoke/primitive/test_fsdp2_offload_checkpoint_smoke.py` |
-| Optimizer update-state offload fraction | `unit/primitive/test_runtime_config_unit.py` | `smoke/primitive/test_fsdp2_offload_checkpoint_smoke.py` |
+| Optimizer update-state offload fraction | `unit/primitive/test_runtime_config_unit.py` and single-process CUDA coverage in `unit/primitive/test_fsdp2_offload_gpu.py` | multi-rank FSDP2 grad clipping is xfail until the follow-up bugfix PR |
 | Qwen3 lite config/build/forward | `unit/model/test_qwen_config_unit.py` | `smoke/model/test_qwen_lite_forward_smoke.py` |
 | Qwen3.5 lite config/build/forward | `unit/model/test_qwen_config_unit.py` | `smoke/model/test_qwen_lite_forward_smoke.py` |
 

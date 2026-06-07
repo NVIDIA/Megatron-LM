@@ -179,6 +179,11 @@ def test_fsdp2_runtime_model_and_optimizer_offload_roundtrip_single_node():
     assert _optimizer_state_devices(optimizer) == {"cuda"}
 
 
+@pytest.mark.xfail(
+    int(os.environ.get("WORLD_SIZE", "1")) > 1,
+    reason="MLite FSDP2 offload_fraction multi-rank grad clipping is covered by a follow-up bugfix PR.",
+    strict=True,
+)
 def test_fsdp2_offload_fraction_keeps_optimizer_update_state_on_cpu_single_node():
     model, ps = _build_fsdp2_model()
     optimizer = _build_optimizer(model, ps, offload_fraction=1.0)
