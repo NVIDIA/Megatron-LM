@@ -90,7 +90,10 @@ class AsyncRowMap:
             mapped_rows.append(row)
 
         pending_rows_cpu = torch.tensor(mapped_rows, dtype=torch.long, device="cpu")
-        if device is None:
+        identity = torch.arange(
+            current_cpu.numel(), dtype=pending_rows_cpu.dtype, device="cpu"
+        )
+        if device is None or torch.equal(pending_rows_cpu, identity):
             pending_rows = None
         else:
             pending_rows = pending_rows_cpu.to(device=device)

@@ -2234,7 +2234,11 @@ class TextGenerationController:
                     if pending_transaction is not None
                     else None
                 )
-                pending_forward_row_indices = pending_forward_row_map.pending_rows
+                pending_forward_row_indices = (
+                    pending_forward_row_map.pending_rows
+                    if pending_forward_row_map.row_mapped
+                    else None
+                )
                 self._async_pending_transaction = None
             else:
                 input_ids, position_ids = self._dynamic_step_context_init()

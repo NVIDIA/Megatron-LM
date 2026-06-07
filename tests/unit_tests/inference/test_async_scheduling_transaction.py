@@ -124,6 +124,33 @@ def test_row_map_rejects_incompatible_rows(pending, current):
 
 
 @pytest.mark.internal
+def test_identity_row_map_does_not_materialize_device_gather_rows():
+    row_map = AsyncRowMap.for_current(
+        pending_request_ids=torch.tensor([10, 11, 12]),
+        current_request_ids=torch.tensor([10, 11]),
+        device="cpu",
+    )
+
+    assert row_map is not None
+    assert not row_map.row_mapped
+    assert row_map.pending_rows is None
+
+
+@pytest.mark.internal
+def test_row_mapped_forward_materializes_device_gather_rows():
+    row_map = AsyncRowMap.for_current(
+        pending_request_ids=torch.tensor([10, 11, 12]),
+        current_request_ids=torch.tensor([11, 12]),
+        device="cpu",
+    )
+
+    assert row_map is not None
+    assert row_map.row_mapped
+    assert row_map.pending_rows is not None
+    assert row_map.pending_rows.tolist() == [1, 2]
+
+
+@pytest.mark.internal
 def test_transaction_rejects_graph_shape_mismatch():
     plan = _plan([1, 2])
     txn = AsyncDecodeTransaction(
