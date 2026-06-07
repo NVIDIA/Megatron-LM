@@ -2678,6 +2678,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         forced_pause_overflow: bool = False,
         graph_recapture: bool = False,
         speculate_pending_decode_commit: bool = False,
+        snapshot_survival_mask: Optional[Tensor] = None,
     ) -> "PrestagedDecodePlan":
         """Build the next decode step's launch plan into the CPU staging buffer.
 
@@ -2753,6 +2754,19 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Snapshot the pre-compaction active request-id set (consume-by-request-id). Clone so a
         # later compaction of the live request_ids never perturbs the snapshot.
         snapshot_request_ids = self.request_ids[active_slice].detach().clone()
+
+        # C5: pre-exclude host-known max-length finishers from the launch snapshot. A request the
+        # host already knows will reach max_sequence_length at the pending commit is freed at its
+        # OWN commit (host-deterministic, no D2H) and must never ride the speculative forward, so
+        # it is dropped from the consume-by-request-id snapshot here. ``snapshot_survival_mask`` is
+        # the caller's ``_host_maxlen_finish_mask`` for the pending commit (1 = survives) over the
+        # active slice in row order. NOTE: the launch is also gated on the max-length half being
+        # clean (controller), so on any step that actually launches no request is excluded -- this
+        # narrowing is vacuous there (byte-identical to no exclusion) and is the seam that keeps
+        # max-length exactly gated under the C6 EOS ungate.
+        if snapshot_survival_mask is not None:
+            survive = snapshot_survival_mask[:bs].to(dtype=torch.bool, device=snapshot_request_ids.device)
+            snapshot_request_ids = snapshot_request_ids[survive]
 
         # Base kv lengths the next forward is built on. The non-speculative plan builds the
         # immediately-next forward from the committed offsets (advance's +1 gives the unit query).

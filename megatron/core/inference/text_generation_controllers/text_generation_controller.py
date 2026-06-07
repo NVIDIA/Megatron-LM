@@ -1779,6 +1779,14 @@ class TextGenerationController:
         )
         active_request_mask = data_dependent_mask & host_maxlen_mask
 
+        # C5: the per-half finisher counts, so the launch gate can treat them asymmetrically. The
+        # host-maxlen half is host-deterministic (no D2H, knowable before the launch); the
+        # data-dependent (EOS/stop-word) half needs the sampled token. This commit gates the
+        # launch on BOTH halves being clean (== finished_count==0, token-identical to C4); C6
+        # deletes only the data-dependent requirement (the ungate) while max-length stays gated.
+        host_maxlen_finished_count = int((host_maxlen_mask == 0).sum().item())
+        data_dependent_finished_count = int((data_dependent_mask == 0).sum().item())
+
         finished_idxs = (
             torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
         )
@@ -1815,6 +1823,8 @@ class TextGenerationController:
             "new_sample_copy": new_sample_copy,
             "active_request_mask": active_request_mask,
             "finished_count": int(finished_idxs.numel()),
+            "host_maxlen_finished_count": host_maxlen_finished_count,
+            "data_dependent_finished_count": data_dependent_finished_count,
             "was_decode_only": was_decode_only,
         }
 
@@ -1933,10 +1943,23 @@ class TextGenerationController:
         if not context.using_cuda_graph_this_step():
             return None
 
+        # C5: pre-exclude host-known max-length finishers from the launch snapshot. Predict which
+        # active requests reach max_sequence_length at the pending commit using the C3 host-maxlen
+        # survival mask -- exactly prepare_commit's max-length term for this step (no D2H, no GPU
+        # sample): get_active_sequence_lengths() reads request_kv_length_offsets+query_lengths,
+        # which the (not-yet-run) commit will read identically, and +1 is the new sampled token.
+        # A predicted max-length finisher is dropped from the snapshot so it never rides the
+        # speculative forward (it is freed at its own commit). On a step that actually launches the
+        # launch is gated max-length-clean, so this mask survives every row -- vacuous there.
+        host_maxlen_survival = self._host_maxlen_finish_mask(
+            context.get_active_sequence_lengths() + 1, context.get_max_sequence_lengths()
+        )
+
         # Speculative plan for the forward that runs against the layout the pending commit will
         # produce (design 1.1 step 2). Boundary-window gated inside; ineligible => sync step.
         plan = context.prestage_next_decode_step_into_cpu_staging(
-            speculate_pending_decode_commit=True
+            speculate_pending_decode_commit=True,
+            snapshot_survival_mask=host_maxlen_survival,
         )
         if not plan.eligible:
             return None
@@ -1994,10 +2017,17 @@ class TextGenerationController:
         if plan is None:
             return None
         # Absorbable-but-reshaping or unsupported conditions => no speculative launch this step.
-        # NOTE (C4): the launch stays gated on the FULL finished_count (max-length + EOS). C6
-        # relaxes only the EOS half (max-length stays host-gated); this commit is a structural
-        # swap with timing/behavior unchanged.
-        if prepared["finished_count"] != 0:
+        # The finish gate is split into its two halves (C5):
+        #   * host-maxlen: host-deterministic (no D2H). A max-length finisher is freed at its own
+        #     commit and pre-excluded from the launch snapshot, so it never rides an extra forward.
+        #     This half stays gated through C6 (a max-length finish forces a sync prime step).
+        #   * data-dependent (EOS/stop-word): needs the sampled token. C6 DELETES this requirement
+        #     -- the single load-bearing ungate -- moving EOS finish-detection to the lagged
+        #     RetirementLane. This commit keeps BOTH required, so the gate == finished_count==0 and
+        #     the behavior is byte-identical to C4.
+        if prepared["host_maxlen_finished_count"] != 0:
+            return None
+        if prepared["data_dependent_finished_count"] != 0:
             return None
         if not prepared["was_decode_only"]:
             return None

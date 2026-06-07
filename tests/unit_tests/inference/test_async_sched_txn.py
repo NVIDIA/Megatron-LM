@@ -1536,6 +1536,40 @@ class TestC5Prestage(AsyncSchedTxnTestBase):
 
     @pytest.mark.internal
     @torch.inference_mode()
+    def test_prestage_excludes_host_maxlen_finishers_from_snapshot(self) -> None:
+        """C5: a host-known max-length finisher is dropped from the launch snapshot.
+
+        The launch-before-commit prestage builds the consume-by-request-id snapshot from the
+        committed active set. When the caller supplies the host-maxlen survival mask (1 = survives,
+        0 = reaches max_sequence_length at the pending commit -- host-deterministic, no D2H), the
+        finisher row's request id must be absent from ``snapshot_request_ids`` (it is freed at its
+        own commit and must never ride the speculative forward). A None mask is byte-identical to
+        no exclusion (the serial-path default)."""
+        env, ctx = self._decode_context()
+        ctx.using_cuda_graph_this_step = lambda: True
+        try:
+            active = slice(ctx.paused_request_count, ctx.total_request_count)
+            bs = ctx.total_request_count - ctx.paused_request_count
+            assert bs >= 2, "need >=2 active requests to exercise a mid-batch exclusion"
+            full_ids = ctx.request_ids[active].clone()
+
+            # Baseline: no mask -> snapshot is the full active set (default serial behavior).
+            plan_full = ctx.prestage_next_decode_step_into_cpu_staging()
+            assert torch.equal(plan_full.snapshot_request_ids, full_ids)
+
+            # Mark the first active row a host-known max-length finisher; it must be excluded.
+            survival = torch.ones(bs, dtype=torch.uint8)
+            survival[0] = 0
+            plan = ctx.prestage_next_decode_step_into_cpu_staging(snapshot_survival_mask=survival)
+            finisher_id = int(full_ids[0].item())
+            snap = plan.snapshot_request_ids.tolist()
+            assert finisher_id not in snap, "host max-length finisher leaked into the snapshot"
+            assert snap == [int(x) for x in full_ids[1:].tolist()], "survivors must be kept in order"
+        finally:
+            del ctx.using_cuda_graph_this_step
+
+    @pytest.mark.internal
+    @torch.inference_mode()
     def test_prestage_mha_equals_rebuild(self) -> None:
         """Prestaged staging MHA == initialize_attention_state's live rebuild of the next forward.
 
