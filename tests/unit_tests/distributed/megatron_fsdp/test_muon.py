@@ -293,20 +293,14 @@ def _reference_step_single(
     num_query_groups = out_dim // s
     p_view = full_p.view(num_query_groups, s, in_dim)
     g_view = full_g.view(num_query_groups, s, in_dim)
-    p_parts = [
-        t.reshape(-1, in_dim).clone().contiguous()
-        for t in torch.split(p_view, list(QKV_SPLIT_SHAPES), dim=1)
-    ]
-    g_parts = [
-        t.reshape(-1, in_dim).clone().contiguous()
-        for t in torch.split(g_view, list(QKV_SPLIT_SHAPES), dim=1)
-    ]
+    p_parts = [t.reshape(-1, in_dim) for t in torch.split(p_view, list(QKV_SPLIT_SHAPES), dim=1)]
+    g_parts = [t.reshape(-1, in_dim) for t in torch.split(g_view, list(QKV_SPLIT_SHAPES), dim=1)]
     for pp, gp in zip(p_parts, g_parts):
         pp.grad = gp
     _build_reference_optimizer(p_parts).step()
     # Re-fuse: each updated part back to (num_query_groups, qkv_dim, in_dim), cat, view.
     refused_parts = [pp.view(num_query_groups, -1, in_dim) for pp in p_parts]
-    return torch.cat(refused_parts, dim=1).reshape(out_dim, in_dim).contiguous()
+    return torch.cat(refused_parts, dim=1).reshape(out_dim, in_dim)
 
 
 def _slice_dp_full_to_local(
@@ -323,7 +317,7 @@ def _slice_dp_full_to_local(
     all_dim0 = [None] * dp_world
     dist.all_gather_object(all_dim0, local_dim0, group=dp_group)
     offset = sum(all_dim0[:dp_rank])
-    return full_tensor[offset : offset + local_dim0].contiguous()
+    return full_tensor[offset : offset + local_dim0]
 
 
 def _reference_step_for_param(
