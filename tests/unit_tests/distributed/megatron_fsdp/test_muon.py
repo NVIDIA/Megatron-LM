@@ -326,6 +326,40 @@ def _slice_dp_full_to_local(
     return full_tensor[offset : offset + local_dim0].contiguous()
 
 
+def _reference_local_for_param(
+    ref_p: torch.Tensor, p_spec: dict[str, Any], dp_group: dist.ProcessGroup
+) -> torch.Tensor:
+    """Compute one param's reference post-step local shard.
+
+    For boundary params (any rank has a non-empty local that differs from the
+    global shape), gathers across DP — matching FSDP Phase 2 — runs Muon on
+    the full-tensor view, and slices the result back to this rank's local
+    shard. For non-boundary params, runs Muon directly on the local shard.
+
+    Empty local shards on non-boundary params are passed through unchanged.
+    Requires ``ref_p.grad`` to be attached.
+    """
+    global_shape = tuple(p_spec["global_shape"])
+    is_qkv = p_spec.get("is_qkv", False)
+
+    # Mirror FSDP's `_needs_boundary_gather`: a param is "boundary" if any
+    # rank has a non-empty local with shape != global.
+    local_is_boundary = ref_p.numel() > 0 and global_shape != tuple(ref_p.shape)
+    boundary_votes = [None] * dist.get_world_size()
+    dist.all_gather_object(boundary_votes, local_is_boundary)
+
+    if any(boundary_votes):
+        # Every rank participates in the gather collectives, regardless of
+        # whether its local shard is empty — skipping asymmetrically misaligns
+        # subsequent collective calls. Per-TP-rank NS runs locally because
+        # tp_mode="blockwise".
+        full_p = _gather_dp(ref_p, dp_group)
+        full_g = _gather_dp(ref_p.grad, dp_group)
+        full_ref_after = _reference_step_single(is_qkv, full_p, full_g)
+        return _slice_dp_full_to_local(ref_p.shape[0], full_ref_after, dp_group)
+    return _reference_step_single(is_qkv, ref_p, ref_p.grad)
+
+
 # ---------- Tests ----------
 
 
@@ -388,13 +422,14 @@ def test_muon_step_numerics(distributed_setup: dict[str, Any]) -> None:
     param_groups = _build_params(spec, mesh, device)
     fsdp_params = param_groups[0]["params"]
 
-    # Build reference param/grad shards — a clone of each pre-step local. The
-    # reference Muon will mutate these in place (boundary params via a gathered
-    # full-tensor view, non-boundary via the local shard directly). Grads are
-    # captured as views, not clones, because `FSDPTensorParallelMuon.step()`
-    # doesn't mutate them.
+    # Build reference param shards — a clone of each pre-step local, with the
+    # grad attached. The reference Muon will mutate these in place (boundary
+    # params via a gathered full-tensor view, non-boundary via the local shard
+    # directly). Grads are captured as views, not clones, because
+    # `FSDPTensorParallelMuon.step()` doesn't mutate them.
     reference_params = [p.to_local().clone() for p in fsdp_params]
-    reference_grads = [p.grad.to_local() for p in fsdp_params]
+    for ref_p, fsdp_p in zip(reference_params, fsdp_params):
+        ref_p.grad = fsdp_p.grad.to_local()
 
     # Run FSDP+TP Muon step on the DTensors.
     fsdp_opt = _build_optimizer(param_groups, dp_group=dp_group)
@@ -403,37 +438,10 @@ def test_muon_step_numerics(distributed_setup: dict[str, Any]) -> None:
 
     # Run the replicated reference Muon. This pass only touches the reference
     # shards and the spec — it never reads `fsdp_params`.
-    world = dist.get_world_size()
-    for i in range(len(fsdp_params)):
-        ref_p = reference_params[i]
-        ref_g = reference_grads[i]
-        p_spec = spec["params"][i]
-        global_shape = tuple(p_spec["global_shape"])
-        is_qkv = p_spec.get("is_qkv", False)
-
-        # Mirror FSDP's `_needs_boundary_gather`: a param is "boundary" if any
-        # rank has a non-empty local with shape != global. FSDP gathers boundary
-        # params; non-boundary params are processed locally (this rank's local
-        # shard is the full slab it owns, or empty).
-        local_is_boundary = ref_p.numel() > 0 and global_shape != tuple(ref_p.shape)
-        boundary_votes = [None] * world
-        dist.all_gather_object(boundary_votes, local_is_boundary)
-        is_boundary = any(boundary_votes)
-
-        if is_boundary:
-            # Every rank participates in the gather collectives, regardless of
-            # whether its local shard is empty — skipping asymmetrically misaligns
-            # subsequent collective calls. Gather across DP only (matching FSDP
-            # Phase 2); per-TP-rank NS runs locally because tp_mode="blockwise".
-            full_p = _gather_dp(ref_p, dp_group)
-            full_g = _gather_dp(ref_g, dp_group)
-            full_ref_after = _reference_step_single(is_qkv, full_p, full_g)
-            reference_params[i] = _slice_dp_full_to_local(ref_p.shape[0], full_ref_after, dp_group)
-            del full_p, full_g, full_ref_after
-        elif ref_p.numel() > 0:
-            reference_params[i] = _reference_step_single(is_qkv, ref_p, ref_g)
-        # else: empty local on a non-boundary param — reference_params[i] stays
-        # as the empty clone and the comparison loop skips it.
+    reference_params = [
+        _reference_local_for_param(ref_p, p_spec, dp_group)
+        for ref_p, p_spec in zip(reference_params, spec["params"])
+    ]
 
     # Compare each FSDP post-step shard against the replicated reference.
     for i, fsdp_p in enumerate(fsdp_params):
