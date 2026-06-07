@@ -16,6 +16,7 @@ onelogger.err
 runs/
 /test_cases/
 **/dist/
+/experimental/lite/examples/verl/outputs/
 
 # Sphinx documentation
 docs/_build
