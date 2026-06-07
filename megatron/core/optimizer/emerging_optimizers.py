@@ -37,7 +37,7 @@ except ImportError:
     _HAVE_DTENSOR = False
 
 try:
-    from emerging_optimizers import registry
+    from emerging_optimizers import registry, utils
     from emerging_optimizers.orthogonalized_optimizers import (
         AdaptiveMuon,
         OrthogonalizedOptimizer,
@@ -324,6 +324,9 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
         self.dp_group = dp_group
         super().__init__(params, **kwargs)
 
+    # Optimizer-step convention: `@torch.no_grad()` disables autograd around the
+    # in-place param updates; `type: ignore[misc]` suppresses mypy's spurious
+    # complaint about decorating a non-None-returning function with no_grad.
     @torch.no_grad()  # type: ignore[misc]
     def step(self, closure: Callable | None = None) -> float | None:
         """Muon step for Megatron-FSDP ZeRO-1/2/3.
@@ -390,8 +393,6 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
             all_updates[i] = (p, full_pre_ns_grad, True, lr, group_kwargs)
 
         # Phase 3: NS orthogonalization and weight update (fully local).
-        from emerging_optimizers import utils
-
         with utils.fp32_matmul_precision(self.fp32_matmul_prec):
             for p, pre_ns_grad, is_gathered, lr, group_kwargs in all_updates:
                 p_local = p.to_local()
@@ -473,7 +474,6 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
         local_update = full_update[slices].contiguous().to(dtype=value.to_local().dtype)
         return self._dtensor_from_local_like(value, local_update)
 
-    @torch.no_grad()  # type: ignore[misc]
     def _local_muon_update(
         self, p: torch.Tensor, grad: torch.Tensor, group: dict[str, Any]
     ) -> None:
