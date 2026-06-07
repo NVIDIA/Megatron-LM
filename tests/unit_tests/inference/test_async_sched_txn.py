@@ -2030,3 +2030,105 @@ class TestC5OverlapFlip(AsyncSchedTxnTestBase):
                 **self._greedy_cuda_graph_kwargs(num_requests=5, use_fixed_output_lengths=False)
             )
         assert async_env.engine.controller._async_launch_before_commit_count > 0
+
+
+@pytest.mark.skipif(
+    not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+)
+@pytest.mark.internal
+class TestC6Ungate(AsyncSchedTxnTestBase):
+    """C6: the launch is UNGATED -- fired before the sample D2H, from host-known state only.
+
+    The single load-bearing relaxation. The launch of the next forward no longer waits on the
+    blocking sample D2H + EOS finish-check (the ~360us bubble): it fires from host-known state
+    (max-length gated, EOS ungated) before the D2H, which is consumed after the launch enqueue.
+    Max-length stays exactly gated (a max-length finish forces a sync prime, no ride). A
+    data-dependent (EOS/stop-word) finish drains+discards the doomed forward and re-primes -- the
+    finishing step is re-run synchronously, so async stays token-exact vs serial across reshapes.
+
+    The bar (per the design) is token-exact ``async == serial`` across greedy AND per-request-RNG
+    sampling with staggered, mid-batch, and simultaneous finishes, plus evidence that the overlap
+    fired (the launch ran before the commit) and that max-length finishes never rode a forward.
+    """
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+        )
+
+    @classmethod
+    def teardown_class(cls):
+        delete_cuda_graphs()
+        set_rounder(64)
+        Utils.destroy_model_parallel()
+
+    @staticmethod
+    def _cuda_graph_kwargs(**overrides):
+        cfg = dict(
+            model_provider="gpt",
+            num_requests=6,
+            num_gap_steps=0,
+            num_tokens_to_generate=20,
+            use_fixed_output_lengths=True,
+            num_cuda_graphs=4,
+            force_build_cuda_graphs=True,
+            inference_cuda_graph_scope=InferenceCudaGraphScope.block,
+            use_cuda_graphs_for_non_decode_steps=False,
+            context_max_requests=128,
+        )
+        cfg.update(overrides)
+        return cfg
+
+    @pytest.mark.internal
+    def test_ungated_nongreedy_staggered_midbatch_finishes(self) -> None:
+        """Per-request-RNG decode with staggered, mid-batch max-length finishes: token-exact
+        async==serial under the ungate. Each finish forces a sync prime (max-length stays gated);
+        survivors keep their own per-request keyed draws across the reshapes."""
+        from unittest import mock
+
+        base_build = AsyncSchedTxnTestBase._build_requests
+
+        def staggered_build(cls, test_config):
+            requests = base_build(test_config)
+            for i, request in enumerate(requests):
+                # Per-request RNG (no top_k=1). Staggered lengths => finishes land on different
+                # steps, including mid-batch (compaction reorders rows), exercising the re-prime.
+                request.sampling_params.num_tokens_to_generate = 10 + 2 * i
+            return requests
+
+        with mock.patch.object(type(self), "_build_requests", classmethod(staggered_build)):
+            serial_env, async_env = self.assert_async_equals_serial(
+                **self._cuda_graph_kwargs(num_requests=6, use_fixed_output_lengths=False)
+            )
+        # The overlap actually engaged (launched before commit), and the serial control did not.
+        assert async_env.engine.controller._async_launch_before_commit_count > 0
+        assert serial_env.engine.controller._async_launch_before_commit_count == 0
+        # Max-length finishes are host-gated: the launch is suppressed on a finishing step, so no
+        # doomed forward is ever drained/discarded (barrier_skips stays 0 -- no EOS in this mix).
+        assert async_env.engine.step_txn_manager.diagnostics.guard_failures == 0
+
+    @pytest.mark.internal
+    def test_ungated_greedy_equals_serial(self) -> None:
+        """Greedy (argmax, no RNG) fixed-length decode: token-exact async==serial, overlap fired,
+        and the consume-by-request-id adopt guard never failed (steady decode adopts every step)."""
+        from unittest import mock
+
+        base_build = AsyncSchedTxnTestBase._build_requests
+
+        def greedy_build(cls, test_config):
+            requests = base_build(test_config)
+            for request in requests:
+                request.sampling_params.top_k = 1
+            return requests
+
+        with mock.patch.object(type(self), "_build_requests", classmethod(greedy_build)):
+            serial_env, async_env = self.assert_async_equals_serial(**self._cuda_graph_kwargs())
+        diag = async_env.engine.step_txn_manager.diagnostics
+        assert async_env.engine.controller._async_launch_before_commit_count > 0
+        assert diag.launched > 0
+        assert diag.adopted > 0
+        assert diag.guard_failures == 0

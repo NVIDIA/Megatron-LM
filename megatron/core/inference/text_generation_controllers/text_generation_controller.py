@@ -1949,11 +1949,19 @@ class TextGenerationController:
         # sample): get_active_sequence_lengths() reads request_kv_length_offsets+query_lengths,
         # which the (not-yet-run) commit will read identically, and +1 is the new sampled token.
         # A predicted max-length finisher is dropped from the snapshot so it never rides the
-        # speculative forward (it is freed at its own commit). On a step that actually launches the
-        # launch is gated max-length-clean, so this mask survives every row -- vacuous there.
+        # speculative forward (it is freed at its own commit).
         host_maxlen_survival = self._host_maxlen_finish_mask(
             context.get_active_sequence_lengths() + 1, context.get_max_sequence_lengths()
         )
+
+        # C6: max-length stays EXACTLY gated -- host-deterministic, so the gate moves ahead of the
+        # (now-ungated) launch with zero D2H. If any active request reaches max_sequence_length at
+        # the pending commit, suppress the launch (return None => the engine takes a synchronous
+        # prime step), so a max-length finisher never rides an extra forward and never runs one
+        # token past its block table. Only the data-dependent EOS/stop-word half is ungated (it is
+        # detected after the launch and handled by discarding the doomed forward).
+        if not bool(host_maxlen_survival.all()):
+            return None
 
         # Speculative plan for the forward that runs against the layout the pending commit will
         # produce (design 1.1 step 2). Boundary-window gated inside; ineligible => sync step.
@@ -1987,49 +1995,41 @@ class TextGenerationController:
     def _async_commit_launch_next_decode_forward(
         self,
         plan: Optional["PrestagedDecodePlan"],
-        prepared: Dict[str, Any],
         *,
         sample_ticket: Any = None,
     ) -> Optional["InflightForward"]:
-        """Fire the speculative launch iff this step is finish-free (post-sample commit phase).
+        """Fire the speculative launch from HOST-KNOWN state, BEFORE the sample D2H (C6 ungate).
 
-        Runs AFTER the sample D2H, so the finish-free / pause-free / decode-only state is known.
-        The metadata prestage + publish already ran in F(K)'s shadow
-        (:meth:`_async_prestage_next_decode_forward`); all that remains on the post-sample critical
-        path is the in-place GPU token-scatter of the sampled ids + the launch (graph replay).
+        This is the single load-bearing relaxation. The launch now runs *before* the sampled
+        tokens of the current forward are read to the host, so the blocking D2H + finish-check no
+        longer gate it (that ordering defect was the ~360us inter-forward bubble). The decision is
+        therefore HOST-KNOWN only:
 
-        Only fires for a clean, finish-free, pause-free, boundary-safe plain decode step (so the
-        launched forward consumes the exact layout the deferred commit will produce -- no output
-        realignment is ever needed: KV blocks and mamba slots are request-bonded and unchanged). A
-        finish (or no eligible prestage) suppresses the launch: the published metadata is then stale
-        but never consumed -- the next step is a synchronous PRIME that rebuilds it from scratch.
+        * the eligible shadow prestage (``plan``) -- itself boundary-window gated AND max-length
+          gated (it returns None if any active request reaches max_sequence_length at the pending
+          commit, so a max-length finisher forces a sync prime step and never rides a forward); and
+        * the static decode-only / no-paused / under-a-graph checks.
+
+        The data-dependent EOS/stop-word finish is NOT consulted here (it needs the sample). It is
+        detected after this launch enqueue (off the inter-forward path), and if the step turns out
+        to finish for an EOS/stop-word reason the launched forward is doomed: the caller drains +
+        discards it and the next step re-primes synchronously (token-identical -- the finishing
+        step is simply re-run, like the gated path's finish step, never consumed).
 
         The fired GPU forward is wrapped in a typed :class:`InflightForward` (manager-backed
         ``StepTxn``): ``InflightForward.launch`` records the consume-by-request-id snapshot, the
-        graph bucket, and the two CUDA fences via ``prestage_child`` / ``launch_child`` (pure CPU
-        bookkeeping -- no GPU work, no allocation). Returns the handle to stash, or ``None`` when
-        this step is not launchable (the engine then commits and primes again next step).
+        graph bucket, and the two CUDA fences (the ``forward_done_event`` is the drain fence used
+        on discard so a still-in-flight forward never has its KV pulled out from under it). Returns
+        the handle to stash, or ``None`` when this step is not launchable.
         """
         from megatron.core.inference.engines.inflight_forward import InflightForward
 
         context = self.inference_wrapped_model.inference_context
-        # No eligible shadow prestage => nothing to launch (sync step).
+        # No eligible shadow prestage (boundary window / max-length gated) => nothing to launch.
         if plan is None:
             return None
-        # Absorbable-but-reshaping or unsupported conditions => no speculative launch this step.
-        # The finish gate is split into its two halves (C5):
-        #   * host-maxlen: host-deterministic (no D2H). A max-length finisher is freed at its own
-        #     commit and pre-excluded from the launch snapshot, so it never rides an extra forward.
-        #     This half stays gated through C6 (a max-length finish forces a sync prime step).
-        #   * data-dependent (EOS/stop-word): needs the sampled token. C6 DELETES this requirement
-        #     -- the single load-bearing ungate -- moving EOS finish-detection to the lagged
-        #     RetirementLane. This commit keeps BOTH required, so the gate == finished_count==0 and
-        #     the behavior is byte-identical to C4.
-        if prepared["host_maxlen_finished_count"] != 0:
-            return None
-        if prepared["data_dependent_finished_count"] != 0:
-            return None
-        if not prepared["was_decode_only"]:
+        # Static host-known gates (no D2H, no GPU sample): decode-only, no paused, under a graph.
+        if not context.is_decode_only():
             return None
         if context.paused_request_count != 0:
             return None
@@ -2049,8 +2049,9 @@ class TextGenerationController:
         range_push("forward_pass(launch-before-commit)")
         self._dynamic_step_forward_logits(input_ids, position_ids)
         context.kv_block_allocator.store_routing_per_block(self._router_record_bookkeeping())
-        # Record the forward-completion fence (gates the C6 fence-gated retire of finished
-        # leases). The H2D fence was recorded by the publish's token-excluded transfer.
+        # Record the forward-completion fence: the drain fence on discard, so the doomed forward's
+        # KV reads complete before its finisher rows' blocks are freed. The H2D fence was recorded
+        # by the publish's token-excluded transfer.
         forward_done_event = torch.cuda.Event()
         forward_done_event.record()
         h2d_done_event = (
@@ -2069,6 +2070,31 @@ class TextGenerationController:
             h2d_done_event=h2d_done_event,
             sample_ticket=sample_ticket,
         )
+
+    def _async_discard_inflight_forward(self, inflight: "InflightForward", *, reason: str) -> None:
+        """Drain + drop a launched forward whose outputs will NOT be consumed (C6 barrier/doomed).
+
+        Used when (a) the just-launched forward is doomed -- the step it predicted finish-free for
+        actually had a data-dependent (EOS/stop-word) finish, so its layout will reshape -- or
+        (b) the in-flight forward fails the consume-by-request-id adopt guard (a layout change
+        slipped in). In both cases the recovery is to consume-not-corrupt: drain the forward's
+        completion fence (so its KV reads finish before any finisher's blocks are freed at the
+        eager commit), drop the manager's child transaction (its leases are read-only -- the
+        prestage allocates nothing), and reset the GPU-authoritative token flag so the next PRIME's
+        H2D rebuilds the token region from scratch. The next step then re-primes synchronously and
+        is token-identical to serial. Diagnostics record the reason."""
+        context = self.inference_wrapped_model.inference_context
+        # Drain so the doomed forward's KV/metadata reads complete before the eager commit frees
+        # any finisher's blocks back to the allocator pool (no use-after-free under the forward).
+        if inflight.forward_done_event is not None:
+            inflight.forward_done_event.synchronize()
+        if self._step_txn_manager is not None:
+            if self._step_txn_manager.child_txn is inflight.txn:
+                self._step_txn_manager.child_txn = None
+            self._step_txn_manager.barrier(reason)
+        # The doomed forward scattered tokens + published next-step metadata; the next PRIME must
+        # rebuild from scratch with a full (token-inclusive) H2D.
+        context._decode_token_ids_live_on_gpu = False
 
     async def _async_overlap_step(self) -> Optional[Dict]:
         """Run one decode step on the launch-before-commit overlap path.
@@ -2092,6 +2118,24 @@ class TextGenerationController:
         inflight = self._inflight
 
         with torch.inference_mode():
+            if inflight is not None:
+                # PRIMED: the in-flight forward already ran; adopt it (consume-by-request-id) and
+                # consume its logits. We keep an in-flight forward only on a finish-free step (a
+                # data-dependent finish drains+discards it below), so the committed survivor set
+                # equals the snapshot and the SUBSET adopt guard holds exactly. If a layout change
+                # nonetheless slipped in (e.g. admission/eviction), resolve returns False and we
+                # barrier: drain+discard and re-prime synchronously (consume-not-corrupt).
+                committed_survivor_ids = context.request_ids[
+                    context.paused_request_count : context.total_request_count
+                ]
+                if inflight.resolve(committed_survivor_ids):
+                    current_cuda_graph_request_count = inflight.cuda_graph_request_count
+                    self._inflight = None
+                else:
+                    self._async_discard_inflight_forward(inflight, reason="adopt_guard_failure")
+                    self._inflight = None
+                    inflight = None
+
             if inflight is None:
                 # PRIME: forward for the current committed state (serial head, plain GPT decode).
                 input_ids, position_ids = self._dynamic_step_context_init()
@@ -2109,21 +2153,6 @@ class TextGenerationController:
                     self._router_record_bookkeeping()
                 )
                 range_pop()
-            else:
-                # PRIMED: the in-flight forward already ran; adopt it (consume-by-request-id) and
-                # consume its logits. The launch was gated finish-free, so the committed active set
-                # equals the snapshot and the SUBSET adopt guard is trivially satisfied. (C4 skips
-                # the bucket check -- the survivor-bucket recompute arrives with the C6 ungate.)
-                current_cuda_graph_request_count = inflight.cuda_graph_request_count
-                committed_survivor_ids = context.request_ids[
-                    context.paused_request_count : context.total_request_count
-                ]
-                adopted = inflight.resolve(committed_survivor_ids)
-                assert adopted, (
-                    "C4 gated launch must always adopt: a finish-free launch snapshot equals the "
-                    "committed survivor set (the barrier-recovery path arrives with the C6 ungate)"
-                )
-                self._inflight = None
 
         await asyncio.sleep(0)
 
@@ -2143,20 +2172,16 @@ class TextGenerationController:
             # SHADOW: build + publish the next forward's metadata while F(K) is still in flight,
             # BEFORE reading F(K)'s logits to the host. Derived purely from committed state, so it
             # overlaps F(K) on the GPU (and the publish H2D is stream-ordered after the sample
-            # kernel enqueued just above). The launch decision (finish-free) is deferred below.
+            # kernel enqueued just above). Returns None (=> no launch, sync prime) on a host-known
+            # max-length finish (max-length stays exactly gated) or an ineligible boundary step.
             range_push("prestage(shadow)")
             prestaged_plan = self._async_prestage_next_decode_forward()
             range_pop()
 
-            # The shadow prestage above was issued for THIS step before the logits read below: a
-            # wall-clock-independent record that prestage(K+1) ran in F(K)'s shadow (the load-
-            # bearing continuous-loop pipelining ordering). Counted in the prestage method.
-
-            # Drain F(K)'s sampled tokens to the host through the AsyncSampleRing instead of a bare
-            # blocking .cpu(): enqueue the D2H on the ring's copy stream, then (C4) consume it
-            # IMMEDIATELY -- still same-iteration, so timing/behavior is unchanged vs the prior
-            # gated overlap. C6 moves this consume to AFTER the launch enqueue (the gap-closer).
-            range_push("transfer_samples_to_cpu(ring)")
+            # Enqueue F(K)'s sampled tokens to the host on the ring's copy stream WITHOUT syncing,
+            # so the D2H overlaps the launch enqueue below (the gap-closer). The consume (sync on
+            # copy_done) happens AFTER the launch, off the inter-forward critical path.
+            range_push("enqueue_readback")
             active_request_count = context.total_request_count - context.paused_request_count
             ring = self._ensure_async_sample_ring()
             ticket = ring.enqueue_readback(
@@ -2166,25 +2191,39 @@ class TextGenerationController:
                     context.paused_request_count : context.total_request_count
                 ],
             )
-            # Clone so the returned "sample" is independent of the reused pinned slot (matches the
-            # legacy .cpu() semantics; update_requests mutates only the separate new_sample_copy).
+            range_pop()
+
+            # C6 UNGATE (the single load-bearing relaxation): fire the launch of the next forward
+            # from HOST-KNOWN state, BEFORE the sample D2H is read. The post-sample inter-forward
+            # critical path is now just the GPU token-scatter + the graph-replay enqueue -- no
+            # blocking .cpu()/.synchronize()/.item(). The blocking D2H + EOS finish-check that used
+            # to gate this launch (the ~360us bubble) move below, off the critical path.
+            self._inflight = self._async_commit_launch_next_decode_forward(
+                prestaged_plan, sample_ticket=ticket
+            )
+
+            # Consume F(K)'s sample AFTER the launch enqueue (its D2H overlapped the launch). Clone
+            # so the returned "sample" is independent of the reused pinned slot.
+            range_push("consume_readback")
             sampled_tokens_cpu = ring.consume(ticket).clone()
             range_pop()
 
-            # Prepare commit (finish detection) from the already-on-CPU sample. Must precede both
-            # the launch decision and update_requests so the launched forward only fires on a
-            # finish-free step (still gated this commit).
+            # Finish-detect step K from the already-on-CPU sample (lagged off the launch path).
             prepared = self._dynamic_step_prepare_commit(sampled_tokens_cpu=sampled_tokens_cpu)
 
-            # Fire the speculative launch BEFORE committing this step (the overlap), now that the
-            # finish-free state is known. Post-sample path = GPU token-scatter + launch enqueue.
-            self._inflight = self._async_commit_launch_next_decode_forward(
-                prestaged_plan, prepared
-            )
+            # The launch was fired on HOST-KNOWN state only (max-length gated, EOS ungated). If the
+            # step actually had a data-dependent (EOS/stop-word) finish, the launched forward
+            # predicted it away and is doomed: drain + discard it, and the next step re-primes
+            # synchronously. The commit below then frees the finisher's KV eagerly -- safe, because
+            # the discard drained the forward that read it. Token-identical: the finishing step is
+            # simply re-run, exactly as the gated path handled a finish (never consumed corrupt).
+            if self._inflight is not None and prepared["data_dependent_finished_count"] != 0:
+                self._async_discard_inflight_forward(self._inflight, reason="data_dependent_finish")
+                self._inflight = None
             if self._inflight is not None:
                 self._async_committed_with_inflight_forward = True
 
-            # Commit this step. Runs on the CPU while the launched forward runs on the GPU.
+            # Commit this step. On a finish-free step this overlaps the launched forward on the GPU.
             request_bookkeeping = self._dynamic_step_apply_commit(prepared)
 
             ret = {
