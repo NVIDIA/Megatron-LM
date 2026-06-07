@@ -35,6 +35,11 @@ All runtime backends implement the pretraining tier:
 The lite runtime also implements `export_weights` and `to` when the underlying
 model and optimizer support those operations.
 
+The `bridge` runtime implements the same runtime contract through
+Megatron-Bridge and Megatron-Core optimizer/checkpoint helpers. It imports
+`mbridge` lazily from `build_model()`, so config construction and dry-run
+examples can execute without Megatron-Bridge installed.
+
 ## Config Types
 
 `RuntimeConfig` selects the backend and carries the Hugging Face model path.
@@ -47,10 +52,21 @@ model and optimizer support those operations.
 - `optimizer`: Megatron-Core optimizer settings.
 - `impl_cfg`: model-specific options consumed by each model protocol.
 
+`BridgeConfig` carries `bridge` backend settings:
+
+- `model_name`: optional model identifier used for benchmark metadata.
+- `parallel`: tensor, expert, pipeline, virtual pipeline, and context sizes.
+- `optimizer`: Megatron-Core optimizer settings.
+- `override_ddp_config`, `override_transformer_config`, and
+  `override_optimizer_config`: explicit Megatron-Bridge/Core override maps.
+- `param_offload` and `optimizer_offload`: offload model/optimizer state between
+  train/eval contexts.
+
 ## Backend Registry
 
-The only built-in backend key is `mlite`. Model implementations remain selected
-through `MegatronLiteConfig.impl`, which currently supports `impl="lite"`.
+The built-in backend keys are `mlite` and `bridge`. Model implementations for
+the native runtime remain selected through `MegatronLiteConfig.impl`, which
+currently supports `impl="lite"`.
 
 Custom runtime backends can be registered with:
 

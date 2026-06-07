@@ -11,6 +11,7 @@ import importlib
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from megatron.lite.runtime.backends.bridge.config import BridgeConfig
     from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig, DebugConfig
     from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig, RuntimeConfig
     from megatron.lite.runtime.contracts.data import (
@@ -25,6 +26,7 @@ if TYPE_CHECKING:
 __all__ = [
     "MegatronLiteConfig",
     "Batch",
+    "BridgeConfig",
     "DebugConfig",
     "ForwardResult",
     "ModelHandle",
@@ -40,6 +42,7 @@ __all__ = [
 def __getattr__(name: str):
     _lazy = {
         "Batch": "megatron.lite.runtime.contracts.data",
+        "BridgeConfig": "megatron.lite.runtime.backends.bridge.config",
         "DebugConfig": "megatron.lite.runtime.backends.mlite.config",
         "MegatronLiteConfig": "megatron.lite.runtime.backends.mlite.config",
         "ForwardResult": "megatron.lite.runtime.contracts.data",

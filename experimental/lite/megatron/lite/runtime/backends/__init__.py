@@ -178,5 +178,6 @@ class Runtime(ABC):
 # ---------------------------------------------------------------------------
 
 RUNTIME_REGISTRY: dict[str, str] = {
+    "bridge": "megatron.lite.runtime.backends.bridge",
     "mlite": "megatron.lite.runtime.backends.mlite",
 }

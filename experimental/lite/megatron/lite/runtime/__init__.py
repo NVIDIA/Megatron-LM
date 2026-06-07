@@ -9,6 +9,7 @@ from megatron.lite.runtime.contracts.config import RuntimeConfig
 
 if TYPE_CHECKING:
     from megatron.lite.runtime.backends import Runtime
+    from megatron.lite.runtime.backends.bridge.config import BridgeConfig
     from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
     from megatron.lite.runtime.contracts.data import (
         Batch,
@@ -50,6 +51,7 @@ def create_runtime(cfg: RuntimeConfig) -> Runtime:
 def __getattr__(name: str):
     _lazy = {
         "Batch": "megatron.lite.runtime.contracts.data",
+        "BridgeConfig": "megatron.lite.runtime.backends.bridge.config",
         "MegatronLiteConfig": "megatron.lite.runtime.backends.mlite.config",
         "ForwardResult": "megatron.lite.runtime.contracts.data",
         "ModelHandle": "megatron.lite.runtime.contracts.handle",
@@ -66,6 +68,7 @@ def __getattr__(name: str):
 
 __all__ = [
     "Batch",
+    "BridgeConfig",
     "ForwardResult",
     "MegatronLiteConfig",
     "ModelHandle",
