@@ -1640,6 +1640,55 @@ class TextGenerationController:
             sampled_mtp_tokens_cpu = None
         return sampled_tokens_cpu, sampled_mtp_tokens_cpu
 
+    def _host_maxlen_finish_mask(
+        self, active_sequence_lengths: Tensor, max_sequence_lengths: Tensor
+    ) -> Tensor:
+        """Host-deterministic max-length survival mask -- no D2H, never reads the GPU sample.
+
+        Returns a byte mask: 1 where the request's post-step sequence length is still strictly
+        below its ``max_sequence_length`` (it continues), 0 where it reaches max this step (a
+        host-known finish). ``request_output_lengths`` is fixed at ``add_request`` and KV
+        offsets advance +1 deterministically, so this term is exactly known on the host without
+        the sampled token.
+
+        Both operands are CPU tensors. This is the half C5 consults to pre-exclude host-known
+        max-length finishers from the launch snapshot (a max-length finisher is freed at its own
+        commit -- it never rides an extra forward), and it stays inline / exactly gated rather
+        than moving to the lagged RetirementLane.
+        """
+        return torch.less(active_sequence_lengths, max_sequence_lengths).byte()
+
+    def _data_dependent_finish_mask(
+        self, sampled_tokens_cpu: Tensor, active_request_ids: Tensor, active_request_count: int
+    ) -> Tensor:
+        """Data-dependent (EOS + stop-word) survival mask -- the lagged-capable half.
+
+        Returns a byte mask: 1 where the sampled token is not the request's termination id and
+        the request did not hit a stop word this step, 0 where it finished for one of those
+        data-dependent reasons. This is the only half that depends on the sampled token, so it
+        is the part the RetirementLane consumes after the launch enqueue (C6); max-length stays
+        host-inline.
+
+        Note: the stop-word callback (``_get_stop_word_finished_ids_callback``) advances the
+        two-phase stop-word state machine (it pops ids into ``stop_word_being_finished_ids``), so
+        this must be called exactly once per committed step with that step's active request ids.
+        """
+        context = self.inference_wrapped_model.inference_context
+        mask = (
+            sampled_tokens_cpu
+            != context.active_request_metadata["termination_id"][:active_request_count]
+        ).byte()
+        # Mark requests as finished if they hit stop words
+        # (detected in previous step's post_process_requests).
+        if self._get_stop_word_finished_ids_callback is not None:
+            request_ids_list = active_request_ids.tolist()
+            stop_word_finished_ids = self._get_stop_word_finished_ids_callback(request_ids_list)
+            if stop_word_finished_ids:
+                for idx, request_id in enumerate(request_ids_list):
+                    if request_id in stop_word_finished_ids:
+                        mask[idx] = 0
+        return mask
+
     def _dynamic_step_prepare_commit(self) -> Dict[str, Any]:
         """Compute the finish/survivor state for the just-sampled step (pre-update_requests).
 
@@ -1682,23 +1731,23 @@ class TextGenerationController:
         active_sequence_lengths += 1
         max_sequence_lengths = context.get_max_sequence_lengths()
 
-        # Request finished if termination_id or length >= max_sequence_length.
-        # Both operands are CPU: sampled_tokens_cpu was D2H'd above, and
-        # active_request_metadata is CPU-pinned.
-        active_request_mask = (
-            sampled_tokens_cpu
-            != context.active_request_metadata["termination_id"][:active_request_count]
-        ).byte() & torch.less(active_sequence_lengths, max_sequence_lengths).byte()
-
-        # Mark requests as finished if they hit stop words
-        # (detected in previous step's post_process_requests)
-        if self._get_stop_word_finished_ids_callback is not None:
-            request_ids_list = active_request_ids.tolist()
-            stop_word_finished_ids = self._get_stop_word_finished_ids_callback(request_ids_list)
-            if stop_word_finished_ids:
-                for idx, request_id in enumerate(request_ids_list):
-                    if request_id in stop_word_finished_ids:
-                        active_request_mask[idx] = 0
+        # Request finished if termination_id, stop word, or length >= max_sequence_length.
+        # The survival mask is built from two named halves (C3) so the launch-before-commit
+        # pipeline can treat them asymmetrically: the host-deterministic max-length half stays
+        # inline (no D2H), while the data-dependent EOS/stop-word half is the part the
+        # RetirementLane lags off the launch critical path. Here both halves are AND'd back-to-
+        # back, so the combined mask is byte-identical to the original single build:
+        #   original = (eos & maxlen), then stop-worded idxs zeroed
+        #   combined = maxlen & (eos, then stop-worded idxs zeroed)
+        # which are equal because AND is commutative and zeroing one operand zeroes the product
+        # (proved bit-for-bit in test_async_sched_txn's host&eos==original case).
+        host_maxlen_mask = self._host_maxlen_finish_mask(
+            active_sequence_lengths, max_sequence_lengths
+        )
+        data_dependent_mask = self._data_dependent_finish_mask(
+            sampled_tokens_cpu, active_request_ids, active_request_count
+        )
+        active_request_mask = data_dependent_mask & host_maxlen_mask
 
         finished_idxs = (
             torch.nonzero(active_request_mask == 0, as_tuple=True)[0] + context.paused_request_count
