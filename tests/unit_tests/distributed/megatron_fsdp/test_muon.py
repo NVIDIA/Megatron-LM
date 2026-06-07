@@ -361,13 +361,17 @@ def test_muon_step(distributed_setup: dict[str, Any], benchmark) -> None:
 def test_muon_step_numerics(distributed_setup: dict[str, Any]) -> None:
     """Compare `FSDPTensorParallelMuon` against a fully-replicated `Muon` reference.
 
-    Snapshots each param's pre-step local shard, runs the FSDP+TP Muon step,
-    then per param: all-gathers the snapshot across DP (mirroring FSDP Phase 2),
-    runs a plain `emerging_optimizers.Muon` step on the gathered view (manual
-    QKV split where applicable), slices the reference output back to this
-    rank's local shard, and asserts close to the post-step FSDP local with
-    `atol=rtol=1e-2`. Each param is processed in isolation so peak HBM stays
-    at one param's full-tensor size.
+    Flow:
+        1. Build DTensor params + grads from the spec.
+        2. Clone the local shards into `reference_params` (plain tensors).
+        3. Run FSDP+TP Muon on the DTensors (mutates in place).
+        4. Run plain `emerging_optimizers.Muon` on `reference_params`. For
+           boundary params, gather across DP (mirroring FSDP Phase 2), run
+           Muon on the full view (manual QKV split where applicable), and
+           slice the result back to the local shard. For non-boundary params,
+           run Muon directly on the local shard.
+        5. Assert each FSDP post-step shard is close to its reference local
+           with `atol=rtol=1e-2`.
     """
     rank = distributed_setup["rank"]
     world_size = distributed_setup["world_size"]
@@ -384,27 +388,34 @@ def test_muon_step_numerics(distributed_setup: dict[str, Any]) -> None:
     param_groups = _build_params(spec, mesh, device)
     fsdp_params = param_groups[0]["params"]
 
-    # Snapshot pre-step param shards. The reference runs on these (FSDP mutates
-    # `p` in place, so we need the original values somewhere). Grads aren't
-    # snapshotted because `FSDPTensorParallelMuon.step()` doesn't mutate them.
-    init_local_params = [p.to_local().clone() for p in fsdp_params]
+    # Build reference param/grad shards — a clone of each pre-step local. The
+    # reference Muon will mutate these in place (boundary params via a gathered
+    # full-tensor view, non-boundary via the local shard directly). Grads are
+    # captured as views, not clones, because `FSDPTensorParallelMuon.step()`
+    # doesn't mutate them.
+    reference_params = [p.to_local().clone() for p in fsdp_params]
+    reference_grads = [p.grad.to_local() for p in fsdp_params]
 
-    # Run FSDP+TP Muon step. `p.to_local()` afterwards yields the post-step shard.
+    # Run FSDP+TP Muon step on the DTensors.
     fsdp_opt = _build_optimizer(param_groups, dp_group=dp_group)
     fsdp_opt.step()
     torch.cuda.synchronize()
 
+    # Run the replicated reference Muon. This pass only touches the reference
+    # shards and the spec — it never reads `fsdp_params`.
     world = dist.get_world_size()
-    for i, fsdp_p in enumerate(fsdp_params):
-        fsdp_local_after = fsdp_p.to_local()
-        init_local = init_local_params[i]
+    for i in range(len(fsdp_params)):
+        ref_p = reference_params[i]
+        ref_g = reference_grads[i]
+        p_spec = spec["params"][i]
+        global_shape = tuple(p_spec["global_shape"])
+        is_qkv = p_spec.get("is_qkv", False)
+
         # Mirror FSDP's `_needs_boundary_gather`: a param is "boundary" if any
         # rank has a non-empty local with shape != global. FSDP gathers boundary
         # params; non-boundary params are processed locally (this rank's local
         # shard is the full slab it owns, or empty).
-        local_is_boundary = fsdp_local_after.numel() > 0 and tuple(fsdp_p.shape) != tuple(
-            fsdp_local_after.shape
-        )
+        local_is_boundary = ref_p.numel() > 0 and global_shape != tuple(ref_p.shape)
         boundary_votes = [None] * world
         dist.all_gather_object(boundary_votes, local_is_boundary)
         is_boundary = any(boundary_votes)
@@ -414,32 +425,27 @@ def test_muon_step_numerics(distributed_setup: dict[str, Any]) -> None:
             # whether its local shard is empty — skipping asymmetrically misaligns
             # subsequent collective calls. Gather across DP only (matching FSDP
             # Phase 2); per-TP-rank NS runs locally because tp_mode="blockwise".
-            full_p = _gather_dp(init_local, dp_group)
-            full_g = _gather_dp(fsdp_p.grad.to_local(), dp_group)
-            full_ref_after = _reference_step_single(
-                spec["params"][i].get("is_qkv", False), full_p, full_g
-            )
-            ref_local = _slice_dp_full_to_local(fsdp_local_after.shape[0], full_ref_after, dp_group)
+            full_p = _gather_dp(ref_p, dp_group)
+            full_g = _gather_dp(ref_g, dp_group)
+            full_ref_after = _reference_step_single(is_qkv, full_p, full_g)
+            reference_params[i] = _slice_dp_full_to_local(ref_p.shape[0], full_ref_after, dp_group)
             del full_p, full_g, full_ref_after
-        elif fsdp_local_after.numel() > 0:
-            # Non-boundary: FSDP runs Muon locally on this rank's local shard.
-            # Mirror that with plain Muon on the snapshot (consumed in place).
-            ref_local = _reference_step_single(
-                spec["params"][i].get("is_qkv", False), init_local, fsdp_p.grad.to_local()
-            )
-        else:
-            # Empty local on a non-boundary param — nothing to compare here.
-            init_local_params[i] = None  # release the snapshot
-            continue
+        elif ref_p.numel() > 0:
+            reference_params[i] = _reference_step_single(is_qkv, ref_p, ref_g)
+        # else: empty local on a non-boundary param — reference_params[i] stays
+        # as the empty clone and the comparison loop skips it.
 
+    # Compare each FSDP post-step shard against the replicated reference.
+    for i, fsdp_p in enumerate(fsdp_params):
+        ref_p = reference_params[i]
+        if ref_p.numel() == 0:
+            continue
         torch.testing.assert_close(
-            fsdp_local_after.float(),
-            ref_local.float(),
+            fsdp_p.to_local().float(),
+            ref_p.float(),
             atol=1e-2,
             rtol=1e-2,
             msg=lambda m, i=i: (
                 f"rank{rank} param[{i}] shape={tuple(spec['params'][i]['global_shape'])}: {m}"
             ),
         )
-        init_local_params[i] = None  # release the snapshot
-        del ref_local
