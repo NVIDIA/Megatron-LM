@@ -36,6 +36,9 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
     AbstractModelInferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.text_generation_controllers.async_decode_coordinator import (
+    AsyncDecodeCoordinator,
+)
 from megatron.core.inference.utils import (
     get_attention_mask,
     set_decode_expert_padding,
@@ -230,6 +233,7 @@ class TextGenerationController:
         self._async_evict_boundary_count = 0
         self._async_prepare_deferred_until_after_sampling = False
         self._async_sample_readback = None
+        self._async_decode_coordinator = None
         self._async_sample_slot_count = 2
         self._async_current_sample_slot = 0
         self._request_sampling_rngs: Dict[int, torch.Generator] = {}
@@ -1604,6 +1608,14 @@ class TextGenerationController:
         if transaction is not None:
             transaction.mark_retired()
         self._async_step_transaction = None
+
+    def _get_async_decode_coordinator(self) -> AsyncDecodeCoordinator:
+        """Return the coordinator that owns async decode step orchestration."""
+        coordinator = getattr(self, "_async_decode_coordinator", None)
+        if coordinator is None:
+            coordinator = AsyncDecodeCoordinator(self)
+            self._async_decode_coordinator = coordinator
+        return coordinator
 
     def _record_async_eligibility_result(self, reason: Optional[str]) -> None:
         """Record one async eligibility decision without synchronizing with the GPU."""
@@ -3074,6 +3086,14 @@ class TextGenerationController:
         }
 
     async def async_generate_output_tokens_dynamic_batch(
+        self, skip_bookkeeping: Optional[bool] = False
+    ) -> Optional[Dict]:
+        """Forward one dynamic-batch step through the async decode coordinator."""
+        return await self._get_async_decode_coordinator().async_generate_output_tokens_dynamic_batch(
+            skip_bookkeeping=skip_bookkeeping
+        )
+
+    async def _async_generate_output_tokens_dynamic_batch_impl(
         self, skip_bookkeeping: Optional[bool] = False
     ) -> Optional[Dict]:
         """Forward step the model and update the inference context.
