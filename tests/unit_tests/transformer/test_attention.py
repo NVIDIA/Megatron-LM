@@ -41,6 +41,7 @@ from tests.unit_tests.dist_checkpointing import (
     init_checkpointing_mock_args,
 )
 from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.transformer.test_multi_latent_attention import make_test_packed_seq_params
 
 try:
     from transformer_engine.pytorch.attention.rope import apply_fused_qkv_rotary_pos_emb
@@ -712,6 +713,7 @@ def _test_parallel_attention_correctness(
     seed=123,
     sequence_length=256,
     micro_batch_size=4,
+    sequence_packing=False,
 ):
     # Model initialization function
     def initialize_gpt_model(
@@ -805,17 +807,24 @@ def _test_parallel_attention_correctness(
         def get_tensor_on_this_rank(tensor):
             if cp > 1:
                 tensor = get_tensor_on_this_cp_rank(tensor, 0, cp_group)
+            if sequence_packing:
+                tensor = tensor.transpose(0, 1).contiguous().view(-1, 1, *tensor.shape[2:])
             if tp > 1 and sp:
-                sp_seg = sequence_length // tp // cp
+                sp_seg = tensor.shape[0] // tp
                 tensor = tensor[tp_rank * sp_seg : (tp_rank + 1) * sp_seg]
             return tensor
 
         # Calculate parallel model output
+        if sequence_packing:
+            cu_seqlens = [i * sequence_length for i in range(micro_batch_size + 1)]
+            packed_seq_params = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
+        else:
+            packed_seq_params = None
         input_hidden_states = get_tensor_on_this_rank(input_hidden_states)
         input_hidden_states = input_hidden_states.detach().requires_grad_(True)
         parallel_attention = gpt_model[0].decoder.layers[0].self_attention
         output_hidden_states_parallel, bias_hidden_states_parallel = parallel_attention(
-            input_hidden_states, attention_mask=None
+            input_hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
         )
         output_hidden_states_parallel.sum().backward()
         input_grad_parallel = input_hidden_states.grad.detach()
@@ -881,6 +890,7 @@ def _test_parallel_attention_correctness(
 
 
 # TODO(yuzhongw): Add test case for fallback_to_eager_attn
+@pytest.mark.parametrize("sequence_packing", [False, True])
 @pytest.mark.parametrize("apply_rope_fusion", [False, True])
 @pytest.mark.parametrize(
     ("tp", "sp", "cp"),
@@ -895,7 +905,7 @@ def _test_parallel_attention_correctness(
 @pytest.mark.parametrize("qk_layernorm", [False, True])
 @pytest.mark.parametrize("output_gate", [False, True])
 def test_parallel_attention_correctness(
-    tmp_path_dist_ckpt, apply_rope_fusion, tp, sp, cp, qk_layernorm, output_gate
+    tmp_path_dist_ckpt, sequence_packing, apply_rope_fusion, tp, sp, cp, qk_layernorm, output_gate
 ):
     transformer_config = TransformerConfig(
         num_layers=1,
@@ -924,134 +934,109 @@ def test_parallel_attention_correctness(
         cp=cp,
         seed=123,
         sequence_length=256,
+        sequence_packing=sequence_packing,
     )
 
 
-def _torch_native_attention(query, key, value, attention_mask, sinks, scaling: float):
-    """Torch native attention implementation
-    This was not in the original implementation and slightly affect results;
-    it prevents overflow in BF16/FP16 when training with batch size > 1 we clamp max values.
-    """
-    # Rearrange query, key, value to (b, h, s, d)
-    query = einops.rearrange(query, 's b h d -> b h s d')
-    key = einops.rearrange(key, 's b h d -> b h s d')
-    value = einops.rearrange(value, 's b h d -> b h s d')
+@pytest.mark.parametrize("sp", [True, False])
+@pytest.mark.parametrize("output_gate", [False, True])
+def test_parallel_attention_correctness_num_query_groups_less_than_tp_size(
+    tmp_path_dist_ckpt, sp, output_gate
+):
+    transformer_config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=8,
+        num_query_groups=2,
+        normalization="RMSNorm",
+        bf16=True,
+        attention_output_gate=output_gate,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+    )
 
-    # Compute attention weights
-    attn_weights = torch.matmul(query, key.transpose(2, 3)) * scaling
-    if attention_mask is not None:
-        nheads = query.shape[1]
-        nheads_k = key.shape[1]
-        heads_k_stride = 1
-        mask_bias = to_zz_mask_attn_bias(
-            attention_mask, 1, nheads, nheads_k, heads_k_stride, query.device, query.dtype
+    transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+    atol, rtol = 1e-2, 1e-2
+
+    _test_parallel_attention_correctness(
+        transformer_config,
+        transformer_layer_spec,
+        tmp_path_dist_ckpt,
+        atol=atol,
+        rtol=rtol,
+        tp=4,
+        sp=sp,
+        seed=123,
+        sequence_length=256,
+    )
+
+
+def test_qk_layernorm_from_config_fallback():
+    """config.qk_layernorm=True with spec q/k_layernorm=None builds TENorm."""
+    te_pytorch = pytest.importorskip("transformer_engine.pytorch")
+    from dataclasses import replace
+
+    Utils.initialize_model_parallel(1, 1)
+    model_parallel_cuda_manual_seed(123)
+    try:
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            qk_layernorm=True,
         )
-        attn_weights = attn_weights + mask_bias
-
-    # Add sinks to attention weights
-    if sinks is None:
-        combined_logits = attn_weights
-    else:
-        sinks = sinks.reshape(1, -1, 1, 1).expand(query.shape[0], -1, query.shape[-2], -1)
-        combined_logits = torch.cat([attn_weights, sinks], dim=-1)
-
-    # Compute attention scores
-    probs = F.softmax(combined_logits, dim=-1, dtype=combined_logits.dtype)
-    if sinks is None:
-        scores = probs
-    else:
-        scores = probs[..., :-1]
-
-    # Compute attention output
-    attn_output = torch.matmul(scores, value)
-    attn_output = einops.rearrange(attn_output, 'b h s d -> s b h d')
-    attn_output = attn_output.contiguous()
-    return attn_output
+        base = get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules
+        submodules = replace(base, q_layernorm=None, k_layernorm=None)
+        attn = SelfAttention(config, submodules, layer_number=1)
+        assert isinstance(attn.q_layernorm, te_pytorch.LayerNorm)
+        assert isinstance(attn.k_layernorm, te_pytorch.LayerNorm)
+    finally:
+        Utils.destroy_model_parallel()
 
 
-def test_eager_attention_function_correctness():
-    """Test the correctness of the context parallel eager attention function"""
+def test_qk_l2_norm_from_config_fallback():
+    """config.qk_l2_norm=True with spec q/k_layernorm=None builds L2Norm."""
+    pytest.importorskip("transformer_engine.pytorch")
+    from dataclasses import replace
 
-    # Configuration
-    batch_size = 4
-    num_heads = 2
-    head_dim = 256
-    seq_len_q = 512
-    seq_len_k = 2048
-    scale = 1 / (head_dim**2)
+    from megatron.core.transformer.torch_norm import L2Norm
 
-    # Initialize inputs
-    q = torch.rand(
-        (seq_len_q, batch_size, num_heads, head_dim),
-        device='cuda',
-        dtype=torch.bfloat16,
-        requires_grad=True,
-    )
-    k = torch.rand(
-        (seq_len_k, batch_size, num_heads, head_dim),
-        device='cuda',
-        dtype=torch.bfloat16,
-        requires_grad=True,
-    )
-    v = torch.rand(
-        (seq_len_k, batch_size, num_heads, head_dim),
-        device='cuda',
-        dtype=torch.bfloat16,
-        requires_grad=True,
-    )
+    Utils.initialize_model_parallel(1, 1)
+    model_parallel_cuda_manual_seed(123)
+    try:
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            qk_l2_norm=True,
+        )
+        base = get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules
+        submodules = replace(base, q_layernorm=None, k_layernorm=None)
+        attn = SelfAttention(config, submodules, layer_number=1)
+        assert isinstance(attn.q_layernorm, L2Norm)
+        assert isinstance(attn.k_layernorm, L2Norm)
+    finally:
+        Utils.destroy_model_parallel()
 
-    def randbool(shape, **kwargs):
-        return torch.randn(shape, **kwargs) > 0
 
-    attn_bias = randbool((batch_size, 1, seq_len_q, seq_len_k), device='cuda')
-    sinks = None
+def test_qk_layernorm_spec_config_mismatch_raises():
+    """Spec sets a concrete norm but config disables qk_layernorm/qk_l2_norm -> ValueError."""
+    pytest.importorskip("transformer_engine")
+    from dataclasses import replace
 
-    # Torch native attention forward and backward pass
-    out_torch = _torch_native_attention(
-        query=q, key=k, value=v, attention_mask=attn_bias, sinks=sinks, scaling=scale
-    )
-    loss_torch = out_torch.sum()
-    loss_torch.backward()
-    torch_q_grad = q.grad.clone()
-    torch_k_grad = k.grad.clone()
-    torch_v_grad = v.grad.clone()
-    q.grad.zero_()
-    k.grad.zero_()
-    v.grad.zero_()
-    if sinks is not None:
-        torch_sinks_grad = sinks.grad.clone()
-        sinks.grad.zero_()
-    else:
-        torch_sinks_grad = None
+    from megatron.core.transformer.torch_norm import L2Norm
 
-    # Custom attention forward and backward pass
-    out_custom = AttentionFuncionWithContextParallel.apply(
-        q, k, v, attn_bias, 0.0, scale, None  # dropout
-    )
-    loss_custom = out_custom.sum()
-    loss_custom.backward()
-    custom_q_grad = q.grad.clone()
-    custom_k_grad = k.grad.clone()
-    custom_v_grad = v.grad.clone()
-    q.grad.zero_()
-    k.grad.zero_()
-    v.grad.zero_()
-    if sinks is not None:
-        custom_sinks_grad = sinks.grad.clone()
-        sinks.grad.zero_()
-    else:
-        custom_sinks_grad = None
-
-    # Check attention output and gradients
-    assert torch.equal(out_custom, out_torch), "Mismatch in attention output"
-    tol = {"atol": 1e-4, "rtol": 1e-4}
-    for tensor_name, tensor_torch, tensor_custom in [
-        ("q_grad", torch_q_grad, custom_q_grad),
-        ("k_grad", torch_k_grad, custom_k_grad),
-        ("v_grad", torch_v_grad, custom_v_grad),
-        ("sinks_grad", torch_sinks_grad, custom_sinks_grad),
-    ]:
-        if (tensor_torch is not None) and (tensor_custom is not None):
-            torch.testing.assert_close(
-                out_custom, out_torch, **tol, msg=lambda msg: f"Mismatch in {tensor_name}: {msg}"
-            )
+    Utils.initialize_model_parallel(1, 1)
+    model_parallel_cuda_manual_seed(123)
+    try:
+        config = TransformerConfig(
+            num_layers=1, hidden_size=128, num_attention_heads=4, use_cpu_initialization=True
+        )
+        base = get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules
+        submodules = replace(base, q_layernorm=L2Norm, k_layernorm=L2Norm)
+        with pytest.raises(ValueError, match="qk_layernorm"):
+            SelfAttention(config, submodules, layer_number=1)
+    finally:
+        Utils.destroy_model_parallel()

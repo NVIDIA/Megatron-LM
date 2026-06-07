@@ -9,16 +9,19 @@
 
 # Advanced Features
 
-Advanced feature guides for key Megatron Core capabilities.
+Guides for Megatron Core training features.
 
 ```{toctree}
 :maxdepth: 2
 
+cuda_graph
+fine_grained_activation_offloading
 moe
 context_parallel
-custom_fsdp
+megatron_fsdp
 dist_optimizer
 optimizer_cpu_offload
+paged_stash
 pipeline_parallel_layout
 tokenizers
 megatron_energon

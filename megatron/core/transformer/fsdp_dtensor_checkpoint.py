@@ -31,7 +31,8 @@ try:
         make_fsdp_dtensor,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
-        gather_uneven_dtensor_to_full_tensor,
+        split_dtensor,
+        uneven_dtensor_to_full_tensor,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import (
         get_mcore_tensor_parallel_partition_dim,
@@ -193,6 +194,12 @@ def expert_param_local_key(key: str, num_experts: int | None = None) -> str:
 def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
     """
     Handle SWiGLU in model and optimizer state dicts.
+
+    Only splits linear_fc1 parameters whose parent TransformerLayer has
+    ``config.gated_linear_unit == True``.  This is critical for heterogeneous
+    models (e.g. VLMs) where the vision encoder uses GELU while the language
+    decoder uses SWiGLU — splitting non-SWiGLU fc1 weights would create _w/_v
+    keys that don't exist in the checkpoint, causing a load-time mismatch.
     """
     assert HAVE_MEGATRON_FSDP, "This function requires Megatron-FSDP to be installed."
 
@@ -201,6 +208,35 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
     num_experts = (
         getattr(model_config, 'num_moe_experts', None) if model_config is not None else None
     )
+
+    # ------------------------------------------------------------------
+    # Build per-TransformerLayer gated_linear_unit map.
+    # For homogeneous LLMs every layer agrees; for VLMs the vision encoder
+    # layers have gated_linear_unit=False while language decoder layers
+    # have gated_linear_unit=True.
+    # ------------------------------------------------------------------
+    def _strip_wrappers(path):
+        """Strip DDP/FSDP wrapper prefixes (module., model.) from a path."""
+        parts = path.split('.')
+        while parts and parts[0] in ('module', 'model'):
+            parts = parts[1:]
+        return '.'.join(parts)
+
+    _layer_glu = {}
+    for name, module in model.named_modules():
+        if isinstance(module, TransformerLayer):
+            _layer_glu[_strip_wrappers(name)] = getattr(module.config, 'gated_linear_unit', False)
+
+    def _key_in_glu_layer(key):
+        """Return True if *key* belongs to a TransformerLayer with gated_linear_unit=True."""
+        norm_key = _strip_wrappers(key)
+        best_glu, best_len = None, -1
+        for layer_path, uses_glu in _layer_glu.items():
+            if norm_key.startswith(layer_path + '.') and len(layer_path) > best_len:
+                best_glu, best_len = uses_glu, len(layer_path)
+        if best_glu is None:
+            return True  # no TransformerLayer found — assume GLU for backward compat
+        return best_glu
 
     def intersection(s1, s2):
         # Only works for step=1
@@ -238,10 +274,21 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
     def split_swiglu_linear_fc1(data, dist_param, swiglu_shard_axis, is_expert_param):
         """
         Split the SWiGLU linear_fc1 parameter into two parts: weight_w and weight_v.
+
+        Args:
+            data: The tensor to split. May be a DTensor (model state dict) or a
+                plain Tensor (optimizer states from FusedAdam).
+            dist_param: The corresponding model parameter (always a DTensor).
+                Used for global shape, numel, FSDP slice, and dist index metadata.
+            swiglu_shard_axis: Axis along which to split W and V gates.
+            is_expert_param: Whether this is an expert parameter (affects TP mesh).
         """
-        assert data.shape[swiglu_shard_axis] % 2 == 0, (
-            f"SWiGLU weights must have an even size along the shard axis {swiglu_shard_axis}, "
-            f"got {data.shape[swiglu_shard_axis]}"
+        # Use dist_param (always a DTensor) for global shape/numel,
+        # as data may be a regular Tensor (e.g., optimizer states).
+        global_shape = dist_param.shape
+        assert global_shape[swiglu_shard_axis] % 2 == 0, (
+            f"SWiGLU FC1 must have even global size along axis {swiglu_shard_axis}, "
+            f"got {global_shape[swiglu_shard_axis]} (global_shape={list(global_shape)})"
         )
 
         fsdp_slice = dist_param.megatron_fsdp_slice
@@ -250,13 +297,27 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
         tp_mesh = megatron_fsdp_dist_index.get_submesh(
             [megatron_fsdp_dist_index.tp_dim], is_expert_parallel=is_expert_param
         )
-        data_size = data.numel() // tp_mesh.mesh.numel()
+        data_size = dist_param.numel() // tp_mesh.mesh.numel()
         w_slice = slice(0, data_size // 2)
         v_slice = slice(data_size // 2, data_size)
 
-        view_shape = list(data.shape)
+        view_shape = list(global_shape)
         view_shape[swiglu_shard_axis] = -1
-        local_tensor = data.to_local()
+        if isinstance(data, DTensor):
+            assert data.shape == global_shape, (
+                f"DTensor shape mismatch: data.shape={data.shape} vs "
+                f"dist_param.shape={global_shape}"
+            )
+            local_tensor = data.to_local()
+        else:
+            # Plain Tensor must already be the FSDP-local shard; other layouts
+            # (TP-local / global) would silently misalign in the slice below.
+            expected = fsdp_slice.stop - fsdp_slice.start
+            assert data.numel() == expected, (
+                f"Plain Tensor must be FSDP-local shard "
+                f"(expected numel={expected}, got {data.numel()}; fsdp_slice={fsdp_slice})"
+            )
+            local_tensor = data
         weight_w = local_tensor.view(-1)[
             offset_slice(intersection(fsdp_slice, w_slice), -fsdp_slice.start)
         ]
@@ -268,7 +329,7 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
 
         # Fake parameters w and v are used to provide the correct parameter
         # shape and Tensor-Parallelism information.
-        per_tp_rank_shape = list(data.shape)
+        per_tp_rank_shape = list(global_shape)
         if is_mcore_tensor_model_parallel(dist_param):
             tp_dim = get_mcore_tensor_parallel_partition_dim(dist_param)
             assert tp_dim is not None, "Tensor model parallel dimension not found"
@@ -297,8 +358,13 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
         return weight_w, weight_v
 
     model_state_dict = model_state_dict.copy()
+    _swiglu_split_count = 0
+    _swiglu_skip_count = 0
     for key in list(model_state_dict.keys()):
         if is_swiglu_key(key):
+            if not _key_in_glu_layer(key):
+                _swiglu_skip_count += 1
+                continue
             dist_param = model.get_parameter(f"module.{key}")
             weight_w, weight_v = split_swiglu_linear_fc1(
                 model_state_dict[key],
@@ -311,6 +377,13 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
             model_state_dict[f"{key}_w"] = weight_w
             model_state_dict[f"{key}_v"] = weight_v
             del model_state_dict[key]
+            _swiglu_split_count += 1
+
+    if _swiglu_skip_count > 0:
+        logger.info(
+            f"[SWiGLU] Split {_swiglu_split_count} fc1 keys; "
+            f"skipped {_swiglu_skip_count} keys in non-GLU layers (e.g. vision encoder)."
+        )
 
     if optimizer_state_dict is not None:
         optimizer_state_dict = optimizer_state_dict.copy()
@@ -318,8 +391,7 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
             opt_state_dict = optimizer_state_dict["state"]
             new_opt_state_dict = {}
             for key in list(opt_state_dict.keys()):
-                # Only process SWIGLU keys
-                if not is_swiglu_key(key):
+                if not is_swiglu_key(key) or not _key_in_glu_layer(key):
                     new_opt_state_dict[key] = opt_state_dict[key]
                     continue
                 new_opt_state_dict[f"{key}_w"] = opt_state_dict[key].copy()
@@ -334,10 +406,213 @@ def handle_swiglu_in_state_dict(model, model_state_dict, optimizer_state_dict):
                         swiglu_shard_axis=0,
                         is_expert_param="mlp.experts" in key,
                     )
-                    # Update the optimizer state dict with the new keys
                     new_opt_state_dict[f"{key}_w"][subkey] = weight_w
                     new_opt_state_dict[f"{key}_v"][subkey] = weight_v
             optimizer_state_dict["state"] = new_opt_state_dict
+
+    return model_state_dict, optimizer_state_dict
+
+
+def handle_gdn_in_state_dict(model, model_state_dict, optimizer_state_dict):
+    """Handle GDN (Gated DeltaNet) fused projections in model and optimizer state dicts.
+
+    GDN layers fuse query/key/value/gate/beta/alpha projections into a single
+    ``in_proj.weight`` ColumnParallelLinear, and query/key/value into ``conv1d``
+    (weight + optional bias).  For FSDP checkpoints these fused tensors must be
+    split back into their constituent sub-tensors so that each can be
+    independently TP-sharded — otherwise loading a checkpoint written at TP=M
+    into TP=N would slice across logical component boundaries.
+
+    This is analogous to :func:`handle_swiglu_in_state_dict` which splits
+    ``linear_fc1`` into ``weight_w`` / ``weight_v``.
+
+    Sub-key naming follows ``GatedDeltaNet.sharded_state_dict()``::
+
+        in_proj.weight  → .query / .key / .value / .z / .beta / .alpha   (6-way)
+        conv1d.weight   → .query / .key / .value                         (3-way)
+        conv1d.bias     → .query / .key / .value                         (3-way)
+    """
+    assert HAVE_MEGATRON_FSDP, "This function requires Megatron-FSDP to be installed."
+
+    GDN_IN_PROJ_NAMES = ["query", "key", "value", "z", "beta", "alpha"]
+    GDN_CONV1D_NAMES = ["query", "key", "value"]
+
+    def _strip_wrappers(path):
+        """Strip DDP/FSDP wrapper prefixes (module., model.) from a path."""
+        parts = path.split('.')
+        while parts and parts[0] in ('module', 'model'):
+            parts = parts[1:]
+        return '.'.join(parts)
+
+    # ------------------------------------------------------------------
+    # Build per-GDN-module split-size map by walking the model tree.
+    # GDN modules are identified by the presence of qk_dim / v_dim /
+    # in_proj_dim attributes (set in GatedDeltaNet.__init__).
+    # ------------------------------------------------------------------
+    _gdn_info = {}  # normalized_path → {in_proj_sizes, conv1d_sizes}
+    for name, mod in model.named_modules():
+        if not (hasattr(mod, 'qk_dim') and hasattr(mod, 'v_dim') and hasattr(mod, 'in_proj_dim')):
+            continue
+        tp = getattr(mod, 'tp_size', 1)
+        qk = mod.qk_dim // tp
+        v = mod.v_dim // tp
+        nvh = mod.num_value_heads // tp
+        _gdn_info[_strip_wrappers(name)] = {
+            'in_proj_sizes': [qk, qk, v, v, nvh, nvh],
+            'conv1d_sizes': [qk, qk, v],
+        }
+
+    if not _gdn_info:
+        return model_state_dict, optimizer_state_dict
+
+    def _match_gdn_key(key):
+        """Return (split_sizes, sub_names, split_dim) if *key* is a GDN fused
+        parameter that needs splitting, else ``None``."""
+        norm = _strip_wrappers(key)
+        for gdn_path, info in _gdn_info.items():
+            if not norm.startswith(gdn_path + '.'):
+                continue
+            rel = norm[len(gdn_path) + 1 :]
+            if rel == 'in_proj.weight':
+                return info['in_proj_sizes'], GDN_IN_PROJ_NAMES, 0
+            if rel in ('conv1d.weight', 'conv1d.bias'):
+                return info['conv1d_sizes'], GDN_CONV1D_NAMES, 0
+        return None
+
+    def intersection(s1, s2):
+        start = max(s1.start, s2.start)
+        stop = min(s1.stop, s2.stop)
+        return slice(0, 0) if start >= stop else slice(start, stop)
+
+    def offset_slice(s, offset):
+        return slice(s.start + offset, s.stop + offset)
+
+    def split_gdn_fused(data, dist_param, split_sizes, split_dim):
+        """Split a fused GDN projection DTensor into per-component DTensors.
+
+        Args:
+            data: The tensor to split. May be a DTensor (model state dict) or a
+                plain Tensor (optimizer states from FusedAdam).
+            dist_param: The corresponding model parameter (always a DTensor).
+                Used for global shape, numel, FSDP slice, and dist index metadata.
+            split_sizes: List of sizes for each component along split_dim.
+            split_dim: Dimension along which to split.
+        """
+        total_split = sum(split_sizes)
+        if isinstance(data, DTensor) and data.shape[split_dim] == total_split:
+            # GDN tensors are already TP-local here (fast-path from #4799).
+            return list(
+                split_dtensor(
+                    data, split_sizes, dim=split_dim, update_uneven_dtensor_chunk_meta=True
+                )
+            )
+
+        # Use dist_param (always a DTensor) for global shape/numel,
+        # as data may be a regular Tensor (e.g., optimizer states).
+        global_shape = dist_param.shape
+
+        fsdp_slice = dist_param.megatron_fsdp_slice
+        dist_index = dist_param.megatron_fsdp_dist_index
+        tp_mesh = dist_index.get_submesh([dist_index.tp_dim], is_expert_parallel=False)
+
+        data_size = dist_param.numel() // tp_mesh.mesh.numel()
+        elems_per_unit = data_size // total_split
+
+        if isinstance(data, DTensor):
+            assert data.shape == global_shape, (
+                f"DTensor shape mismatch: data.shape={data.shape} vs "
+                f"dist_param.shape={global_shape}"
+            )
+            local_tensor = data.to_local()
+        else:
+            # Plain Tensor must already be the FSDP-local shard; other layouts
+            # (TP-local / global) would silently misalign in the slice below.
+            expected = fsdp_slice.stop - fsdp_slice.start
+            assert data.numel() == expected, (
+                f"Plain Tensor must be FSDP-local shard "
+                f"(expected numel={expected}, got {data.numel()}; fsdp_slice={fsdp_slice})"
+            )
+            local_tensor = data
+        view_shape = list(global_shape)
+
+        per_tp_rank_shape = list(global_shape)
+        if is_mcore_tensor_model_parallel(dist_param):
+            tp_dim = get_mcore_tensor_parallel_partition_dim(dist_param)
+            assert tp_dim is not None, "Tensor model parallel dimension not found"
+            per_tp_rank_shape[tp_dim] //= tp_mesh.mesh.numel()
+
+        results = []
+        flat_offset = 0
+        for s in split_sizes:
+            comp_flat = s * elems_per_unit
+            comp_slice = slice(flat_offset, flat_offset + comp_flat)
+
+            shard = intersection(fsdp_slice, comp_slice)
+            comp_data = local_tensor.view(-1)[offset_slice(shard, -fsdp_slice.start)]
+
+            comp_view = list(view_shape)
+            comp_view[split_dim] = -1
+            comp_data = comp_data.reshape(comp_view)
+
+            meta_shape = list(per_tp_rank_shape)
+            meta_shape[split_dim] = s
+            meta = torch.empty(*meta_shape, device="meta")
+            copy_tensor_model_parallel_attributes(meta, dist_param)
+
+            dtensor = make_fsdp_dtensor(
+                comp_data.data,
+                meta,
+                dist_index=dist_index,
+                is_expert_param=False,
+                run_check=True,
+                update_uneven_dtensor_chunk_meta=True,
+            )
+            results.append(dtensor)
+            flat_offset += comp_flat
+
+        return results
+
+    # ---- Model state dict ------------------------------------------------
+    model_state_dict = model_state_dict.copy()
+    _gdn_split_count = 0
+    for key in list(model_state_dict.keys()):
+        match = _match_gdn_key(key)
+        if match is None:
+            continue
+        sizes, names, dim = match
+        dist_param = model.get_parameter(f"module.{key}")
+        sub_tensors = split_gdn_fused(model_state_dict[key], dist_param, sizes, dim)
+        for sub_name, tensor in zip(names, sub_tensors):
+            model_state_dict[f"{key}.{sub_name}"] = tensor
+        del model_state_dict[key]
+        _gdn_split_count += 1
+
+    if _gdn_split_count > 0:
+        logger.info(
+            f"[GDN] Split {_gdn_split_count} fused keys into sub-tensors "
+            f"(in_proj/conv1d → query/key/value/...)."
+        )
+
+    # ---- Optimizer state dict --------------------------------------------
+    if optimizer_state_dict is not None:
+        optimizer_state_dict = optimizer_state_dict.copy()
+        if len(optimizer_state_dict["state"]) != 0:
+            opt_state = optimizer_state_dict["state"]
+            new_opt_state = {}
+            for key in list(opt_state.keys()):
+                match = _match_gdn_key(key)
+                if match is None:
+                    new_opt_state[key] = opt_state[key]
+                    continue
+                sizes, names, dim = match
+                for sub_name in names:
+                    new_opt_state[f"{key}.{sub_name}"] = opt_state[key].copy()
+                for subkey in ["exp_avg", "exp_avg_sq"]:
+                    dist_param = model.get_parameter(key[len("module.") :])
+                    sub_tensors = split_gdn_fused(opt_state[key][subkey], dist_param, sizes, dim)
+                    for sub_name, tensor in zip(names, sub_tensors):
+                        new_opt_state[f"{key}.{sub_name}"][subkey] = tensor
+            optimizer_state_dict["state"] = new_opt_state
 
     return model_state_dict, optimizer_state_dict
 
@@ -440,13 +715,13 @@ def validate_loaded_state_dict(state_dict, checkpoint_path):
             load_item_dict, storage_reader=reader, planner=default_planner.DefaultLoadPlanner()
         )
         if isinstance(value, DTensor):
-            full_value = gather_uneven_dtensor_to_full_tensor(value)
+            full_tensor_v = uneven_dtensor_to_full_tensor(value)
             loaded_tensor = load_item_dict[key].redistribute(
                 placements=[Replicate()] * len(value.placements)
             )
             assert torch.allclose(
-                loaded_tensor._local_tensor, full_value._local_tensor, atol=1e-8, rtol=1e-5
-            ), f"key: {key}; {loaded_tensor} {full_value}"
+                loaded_tensor._local_tensor, full_tensor_v, atol=1e-8, rtol=1e-5
+            ), f"key: {key}; {loaded_tensor} {full_tensor_v}"
         else:
             assert torch.allclose(
                 value, load_item_dict[key]

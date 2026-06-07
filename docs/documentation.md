@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 <!---
    Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
    NVIDIA CORPORATION and its licensors retain all intellectual property
@@ -6,10 +10,6 @@
    distribution of this software and related documentation without an express
    license agreement from NVIDIA CORPORATION is strictly prohibited.
 -->
-
----
-orphan: true
----
 
 # Documentation Development
 

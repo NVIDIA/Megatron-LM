@@ -62,14 +62,29 @@ class ModelParallelConfig:
     can handle without overflowing the memory. Typically, a good starting point is to set this
     to maximum sequence length / context parallel size.
     This is used to calculate the number and length of sub-samples assigned to 
-    each rank when using hybrid_context_parallel.
+    each rank when sequence_packing_scheduler is not None.
     """
 
-    hybrid_context_parallel: bool = False
+    dynamic_context_parallel: bool = False
     """
-    If true, enables hybrid context parallel. This is used to balance the workload of 
+    If true, enables dynamic context parallel. This is used to balance the workload of 
     each CP rank when we use packed samples with variable sequence lengths.
-    Please set max_seqlen_per_dp_cp_rank when using hybrid_context_parallel.
+    Dynamic CP forms variable-sized CP groups from the DPxCP ranks dynamically.
+    Please set max_seqlen_per_dp_cp_rank.
+    """
+
+    min_dynamic_context_parallel_size: int = 1
+    """Minimum CP group size for dynamic context parallel. Default 1 (no CP).
+    The maximum is dp_size * context_parallel_size (the full DPxCP group)."""
+
+    hybrid_context_parallel: bool = False
+    """Deprecated. Use ``dynamic_context_parallel`` instead."""
+
+    sequence_packing_scheduler: Optional[Literal['dp_balanced', 'default_dynamic_cp']] = None
+    """
+    Scheduler for sequence packing and dynamic context parallel.
+    dp_balanced: DP-balanced scheduler for sequence packing.
+    default_dynamic_cp: Dynamic-CP scheduler for packed sequence balancing.
     """
 
     expert_model_parallel_size: int = 1
@@ -269,6 +284,15 @@ class ModelParallelConfig:
     delay_wgrad_compute: bool = False
     """Delay the weight gradient computation to improve batch-level communication overlapping"""
 
+    overlap_dispatch_backward_with_experts_wgrad: bool = False
+    """Delay the weight gradient computation for TE Grouped GEMM MoE experts.
+    When enabled with FSDP, the expert weight gradients are computed on a separate
+    CUDA stream after the data gradients finish, allowing overlap of wgrad compute
+    with EP A2A communication. The FSDP gradient reduce-scatter for
+    expert parameters is deferred until the delayed wgrad computation completes.
+    This requires transformer_engine with GroupedLinear support (TE >= 2.3.0).
+    """
+
     ep_overlap_early_attn_memory_release: bool = False
     """Enable early memory release of attention activations during EP overlap.
     EP overlap can increase peak memory usage when the overlapped forward module allocates 
@@ -389,6 +413,11 @@ class ModelParallelConfig:
     cpu_offloading_double_buffering: bool = False
     """If True, enables double buffering across layers while reloading activations from CPU."""
 
+    cpu_offloading_retain_pinned_cpu_buffers: bool = False
+    """If True, the pinned CPU buffers are retained after offloading and reused for the
+       next iteration. It is useful for cuda graphs capture.
+    """
+
     ###################
     # Timing
     ###################
@@ -406,6 +435,34 @@ class ModelParallelConfig:
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
         details.
         """
+        if self.hybrid_context_parallel:
+            warnings.warn(
+                "hybrid_context_parallel is deprecated and will be removed in a future release. "
+                "Use dynamic_context_parallel instead.",
+                DeprecationWarning,
+            )
+            if self.dynamic_context_parallel:
+                raise ValueError(
+                    "Cannot set both hybrid_context_parallel and dynamic_context_parallel. "
+                    "Please use dynamic_context_parallel only."
+                )
+            self.dynamic_context_parallel = True
+
+        if self.dynamic_context_parallel:
+            if self.sequence_packing_scheduler is None:
+                self.sequence_packing_scheduler = 'default_dynamic_cp'
+            if self.sequence_packing_scheduler != 'default_dynamic_cp':
+                raise ValueError(
+                    'Dynamic context parallelism requires '
+                    'sequence_packing_scheduler=default_dynamic_cp'
+                )
+
+            if self.min_dynamic_context_parallel_size < 1:
+                raise ValueError(
+                    f"min_dynamic_context_parallel_size must be >= 1, "
+                    f"got {self.min_dynamic_context_parallel_size}"
+                )
+
         if self.sequence_parallel:
             if self.tensor_model_parallel_size <= 1:
                 raise ValueError("Cannot use sequence parallelism without tensor parallelism")

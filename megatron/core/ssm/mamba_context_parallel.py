@@ -85,6 +85,9 @@ class MambaContextParallel:
         self.D_cp1 = D_cp1
         self.D_has_hdim = D_has_hdim
 
+        self._set_cp_params()
+
+    def _set_cp_params(self) -> None:
         self.cp_size = self.cp_group.size()
 
         if self.cp_size == 1:
@@ -129,6 +132,11 @@ class MambaContextParallel:
         # because `nheads % ngroups == 0`, and therefore `nheads_local_tp % ngroups_local_tp == 0`,
         # and also `nheads_local_tpcp = nheads_local_tp // cp_size` whilst ngroups_local_tpcp is
         # either 1 or `ngroups_local_tp // cp_size`
+
+    def set_context_parallel_group(self, cp_group: torch.distributed.ProcessGroup):
+        """Set the context parallel group."""
+        self.cp_group = cp_group
+        self._set_cp_params()
 
     def pre_conv_ssm(
         self, input_: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None

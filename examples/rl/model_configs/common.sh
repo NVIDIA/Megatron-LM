@@ -16,7 +16,6 @@ COMMON_OPTIONS="\
     --transformer-impl transformer_engine \
     --${PRECISION:-bf16} \
     --te-rng-tracker \
-    --rl-offload-optimizer-during-inference \
     --inference-dynamic-batching-buffer-size-gb 20 \
     --data-parallel-random-init \
     --attention-backend flash \
@@ -39,5 +38,5 @@ else
 fi
 
 if [ ${ENABLE_CUDA_GRAPH:-true} == true ]; then
-    COMMON_OPTIONS="${COMMON_OPTIONS} --cuda-graph-impl=local"
+    COMMON_OPTIONS="${COMMON_OPTIONS} --cuda-graph-impl=local --rl-persist-cuda-graphs"
 fi
