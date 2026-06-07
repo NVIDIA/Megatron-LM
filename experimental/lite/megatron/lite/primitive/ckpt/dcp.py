@@ -8,6 +8,9 @@ HF weight loading/saving is model-specific and lives in models/<name>/checkpoint
 from __future__ import annotations
 
 import os
+from collections.abc import Iterable
+from pathlib import Path
+from typing import Any
 
 import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
@@ -26,23 +29,44 @@ from megatron.lite.primitive.protocols import (
 
 
 def save_training_checkpoint(
-    model: nn.Module,
+    model: nn.Module | Iterable[nn.Module],
     optimizer,
-    step: int,
-    path: str,
-    config,
-    ps: ParallelState,
+    step: int | str,
+    path: str | None = None,
+    config=None,
+    ps: ParallelState | None = None,
     get_placements: PlacementFn = default_placement_fn,
     is_expert: ExpertClassifierFn = default_expert_classifier,
+    *,
+    use_dcp: bool | None = None,
 ) -> None:
     """Save training checkpoint using DTensor + DCP for automatic resharding."""
+    if path is None and isinstance(step, str):
+        path = step
+        step = 0
+    if path is None:
+        raise ValueError("checkpoint path is required")
+    step = int(step)
+    if use_dcp is None:
+        use_dcp = config is not None and ps is not None
+    if not use_dcp:
+        _save_local_training_checkpoint(model, optimizer, step, path)
+        return
+    if config is None or ps is None:
+        raise ValueError("DCP checkpointing requires config and ParallelState.")
+    if not isinstance(model, nn.Module):
+        raise TypeError("DCP checkpointing currently expects a single nn.Module.")
     dense_mesh, expert_mesh = _build_meshes(config)
     state_dict: dict = {"step": step}
 
     for name, param in model.named_parameters():
         placements = get_placements(name)
         mesh = expert_mesh if is_expert(name) else dense_mesh
-        state_dict[f"model.{name}"] = DTensor.from_local(param.data.detach(), mesh, placements)
+        state_dict[f"model.{name}"] = DTensor.from_local(
+            _to_local_tensor(param.data.detach()),
+            mesh,
+            placements,
+        )
 
     ckpt_path = os.path.join(path, f"step_{step}")
     dcp.save(state_dict, checkpoint_id=ckpt_path)
@@ -50,15 +74,25 @@ def save_training_checkpoint(
 
 
 def load_training_checkpoint(
-    model: nn.Module,
+    model: nn.Module | Iterable[nn.Module],
     optimizer,
     path: str,
-    config,
-    ps: ParallelState,
+    config=None,
+    ps: ParallelState | None = None,
     get_placements: PlacementFn = default_placement_fn,
     is_expert: ExpertClassifierFn = default_expert_classifier,
+    *,
+    use_dcp: bool | None = None,
 ) -> int:
     """Load training checkpoint with automatic resharding across different parallel configs."""
+    if use_dcp is None:
+        use_dcp = config is not None and ps is not None
+    if not use_dcp:
+        return _load_local_training_checkpoint(model, optimizer, path)
+    if config is None or ps is None:
+        raise ValueError("DCP checkpointing requires config and ParallelState.")
+    if not isinstance(model, nn.Module):
+        raise TypeError("DCP checkpointing currently expects a single nn.Module.")
     dense_mesh, expert_mesh = _build_meshes(config)
 
     ckpt_path = path
@@ -74,7 +108,11 @@ def load_training_checkpoint(
     for name, param in model.named_parameters():
         placements = get_placements(name)
         mesh = expert_mesh if is_expert(name) else dense_mesh
-        state_dict[f"model.{name}"] = DTensor.from_local(torch.empty_like(param.data), mesh, placements)
+        state_dict[f"model.{name}"] = DTensor.from_local(
+            torch.empty_like(_to_local_tensor(param.data)),
+            mesh,
+            placements,
+        )
 
     dcp.load(state_dict, checkpoint_id=ckpt_path)
 
@@ -82,10 +120,140 @@ def load_training_checkpoint(
         key = f"model.{name}"
         if key in state_dict:
             t = state_dict[key]
-            param.data.copy_(t.to_local() if isinstance(t, DTensor) else t)
+            with torch.no_grad():
+                _copy_tensor_(param.data, t.to_local() if isinstance(t, DTensor) else t)
 
     step = state_dict.get("step", 0)
     log_rank0(f"Loaded training checkpoint from {path} at step {step}")
+    return step
+
+
+def _model_chunks(model: nn.Module | Iterable[nn.Module]) -> list[nn.Module]:
+    if isinstance(model, nn.Module):
+        return [model]
+    chunks = list(model)
+    if not all(isinstance(chunk, nn.Module) for chunk in chunks):
+        raise TypeError("checkpoint model chunks must be nn.Module instances.")
+    return chunks
+
+
+def _to_local_tensor(tensor: Any) -> torch.Tensor:
+    local_tensor = getattr(tensor, "_local_tensor", None)
+    if isinstance(local_tensor, torch.Tensor):
+        return local_tensor
+    to_local = getattr(tensor, "to_local", None)
+    if callable(to_local):
+        return to_local()
+    return tensor
+
+
+def _copy_tensor_(target: torch.Tensor, src: torch.Tensor) -> None:
+    local_target = _to_local_tensor(target)
+    local_src = _to_local_tensor(src).to(
+        device=local_target.device,
+        dtype=local_target.dtype,
+    )
+    if isinstance(local_target, torch.Tensor) and local_target is not target:
+        local_target.copy_(local_src)
+    else:
+        target.copy_(local_src)
+
+
+def _chunk_tensor_state(module: nn.Module) -> dict[str, torch.Tensor]:
+    state: dict[str, torch.Tensor] = {}
+    for name, param in module.named_parameters():
+        state[f"param.{name}"] = _to_local_tensor(param.detach()).cpu().clone()
+    for name, buffer in module.named_buffers():
+        state[f"buffer.{name}"] = _to_local_tensor(buffer.detach()).cpu().clone()
+    return state
+
+
+def _load_chunk_tensor_state(module: nn.Module, state: dict[str, torch.Tensor]) -> None:
+    params = dict(module.named_parameters())
+    buffers = dict(module.named_buffers())
+    missing: list[str] = []
+    for key, src in state.items():
+        kind, name = key.split(".", 1)
+        if kind == "param" and name in params:
+            with torch.no_grad():
+                _copy_tensor_(params[name], src)
+        elif kind == "buffer" and name in buffers:
+            with torch.no_grad():
+                _copy_tensor_(buffers[name], src)
+        else:
+            missing.append(key)
+    if missing:
+        raise RuntimeError(f"checkpoint contains unknown tensor keys: {missing}")
+
+
+def _local_checkpoint_file(path: str | os.PathLike[str]) -> Path:
+    ckpt_path = Path(path)
+    if ckpt_path.is_dir() or ckpt_path.suffix == "":
+        return ckpt_path / "training_state.pt"
+    return ckpt_path
+
+
+def _local_optimizer_parameter_state_file(ckpt_file: Path) -> Path:
+    return ckpt_file.with_name(f"{ckpt_file.stem}.optimizer_parameter_state{ckpt_file.suffix}")
+
+
+def _save_local_training_checkpoint(
+    model: nn.Module | Iterable[nn.Module],
+    optimizer,
+    step: int,
+    path: str,
+) -> None:
+    chunks = _model_chunks(model)
+    ckpt_file = _local_checkpoint_file(path)
+    ckpt_file.parent.mkdir(parents=True, exist_ok=True)
+    save_parameter_state = getattr(optimizer, "save_parameter_state", None)
+    optimizer_parameter_state_file = (
+        _local_optimizer_parameter_state_file(ckpt_file) if callable(save_parameter_state) else None
+    )
+    state = {
+        "format": "megatron_lite.local_training.v1",
+        "step": int(step),
+        "model": [_chunk_tensor_state(chunk) for chunk in chunks],
+        "optimizer": optimizer.state_dict() if optimizer is not None else None,
+        "optimizer_parameter_state": (
+            optimizer_parameter_state_file.name
+            if optimizer_parameter_state_file is not None
+            else None
+        ),
+    }
+    torch.save(state, ckpt_file)
+    if optimizer_parameter_state_file is not None:
+        save_parameter_state(str(optimizer_parameter_state_file))
+    log_rank0(f"Saved local training checkpoint at step {step} to {ckpt_file}")
+
+
+def _load_local_training_checkpoint(
+    model: nn.Module | Iterable[nn.Module],
+    optimizer,
+    path: str,
+) -> int:
+    ckpt_file = _local_checkpoint_file(path)
+    state = torch.load(ckpt_file, map_location="cpu", weights_only=False)
+    if state.get("format") != "megatron_lite.local_training.v1":
+        raise RuntimeError(f"Unsupported local checkpoint format in {ckpt_file}")
+    chunks = _model_chunks(model)
+    chunk_states = state.get("model")
+    if not isinstance(chunk_states, list) or len(chunk_states) != len(chunks):
+        raise RuntimeError("Checkpoint model chunk count does not match target model.")
+    for chunk, chunk_state in zip(chunks, chunk_states, strict=True):
+        _load_chunk_tensor_state(chunk, chunk_state)
+    if optimizer is not None and state.get("optimizer") is not None:
+        optimizer.load_state_dict(state["optimizer"])
+        parameter_state_name = state.get("optimizer_parameter_state")
+        load_parameter_state = getattr(optimizer, "load_parameter_state", None)
+        if parameter_state_name is not None and callable(load_parameter_state):
+            load_parameter_state(str(ckpt_file.with_name(parameter_state_name)))
+        else:
+            reload_model_params = getattr(optimizer, "reload_model_params", None)
+            if callable(reload_model_params):
+                reload_model_params()
+    step = int(state.get("step", 0))
+    log_rank0(f"Loaded local training checkpoint from {ckpt_file} at step {step}")
     return step
 
 
@@ -100,10 +268,11 @@ def _build_meshes(config):
     init_parallel's rank = (...) * inner_size + inner_rank formula.
     """
     ws = dist.get_world_size()
-    tp, ep = config.tp, config.ep
-    etp = max(config.etp, 1)
-    cp = max(config.cp, 1)
-    pp = max(config.pp, 1)
+    tp = int(config.tp or 1)
+    ep = int(config.ep or 1)
+    etp = max(int(config.etp or 1), 1)
+    cp = max(int(config.cp or 1), 1)
+    pp = max(int(config.pp or 1), 1)
 
     dense_dp = ws // (tp * cp * pp)
     expert_dp = ws // (etp * ep * pp)
