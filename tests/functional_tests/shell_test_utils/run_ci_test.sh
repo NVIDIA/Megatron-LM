@@ -40,7 +40,6 @@ MANDATORY_VARS=(
     "CHECKPOINT_LOAD_PATH"
     "DATA_PATH"
     "DATA_CACHE_PATH"
-    "ENABLE_LIGHTWEIGHT_MODE"
 )
 for mandatory_var in "${MANDATORY_VARS[@]}"; do
     if [[ -z "${!mandatory_var}" ]]; then
@@ -56,11 +55,14 @@ TEST_TYPE=$(cat $TRAINING_PARAMS_PATH |
     /usr/local/bin/yq '.TEST_TYPE')
 TEST_EVALUATION=$(cat $TRAINING_PARAMS_PATH |
     /usr/local/bin/yq '.TEST_EVALUATION // "pass"')
-# Honor an externally-provided ENABLE_LIGHTWEIGHT_MODE (e.g. set by the launcher
-# container env for L0-smoke runs) when present; otherwise fall back to the
-# per-test-case model_config.yaml value.
-ENABLE_LIGHTWEIGHT_MODE=${ENABLE_LIGHTWEIGHT_MODE:-$(cat $TRAINING_PARAMS_PATH |
-    /usr/local/bin/yq '.ENV_VARS.ENABLE_LIGHTWEIGHT_MODE // "false"')}
+CONFIG_LIGHTWEIGHT_MODE=$(cat $TRAINING_PARAMS_PATH |
+    /usr/local/bin/yq '.ENV_VARS.ENABLE_LIGHTWEIGHT_MODE // "false"')
+ENV_LIGHTWEIGHT_MODE="${ENABLE_LIGHTWEIGHT_MODE:-false}"
+if [[ "$ENV_LIGHTWEIGHT_MODE" == "true" || "$CONFIG_LIGHTWEIGHT_MODE" == "true" ]]; then
+    export ENABLE_LIGHTWEIGHT_MODE=true
+else
+    export ENABLE_LIGHTWEIGHT_MODE=false
+fi
 N_REPEAT=$(cat $TRAINING_PARAMS_PATH |
     /usr/local/bin/yq '.ENV_VARS.N_REPEAT // "'$N_REPEAT'"')
 MODE=$(cat $TRAINING_PARAMS_PATH |
