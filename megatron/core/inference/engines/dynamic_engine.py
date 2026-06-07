@@ -308,10 +308,14 @@ class DynamicInferenceEngine(AbstractEngine):
             StepTransactionManager(self.context) if self.enable_async_scheduling else None
         )
         self._current_txn = None
-        # Drop any launch-before-commit forward left in flight by a prior generation: a reset
-        # rewinds the context, so a stale consume-by-request-id snapshot must not be consumed.
-        if self.enable_async_scheduling and getattr(self, "controller", None) is not None:
-            self.controller.async_drain_inflight_forward()
+        if getattr(self, "controller", None) is not None:
+            # Hand the controller the async-scheduling manager (None when the flag is off) so its
+            # launch-before-commit overlap can drive the InflightForward lifecycle. Also drop any
+            # forward left in flight by a prior generation: a reset rewinds the context, so a stale
+            # consume-by-request-id snapshot must not be consumed.
+            self.controller.attach_step_transaction_manager(self.step_txn_manager)
+            if self.enable_async_scheduling:
+                self.controller.async_drain_inflight_forward()
 
         # Request state.
         self.request_counter = Counter()
@@ -1791,10 +1795,18 @@ class DynamicInferenceEngine(AbstractEngine):
         # identical to the disabled path; the wrapper only tracks lifecycle/diagnostics.
         if self.enable_async_scheduling:
             self.step_txn_manager.retire(self.context.step_count)
-            self._current_txn = self.step_txn_manager.begin_serial_txn(
-                step_id=self.context.step_count,
-                active_request_count=self.context.get_active_request_count(),
-            )
+            # Only wrap the step as an always-adopted serial transaction when it will NOT take the
+            # launch-before-commit overlap path. The overlap path runs its own prestage/launch/
+            # adopt transaction lifecycle (InflightForward), so a serial wrap would double-count
+            # diagnostics and clobber current_txn. This is the "serial-only branch keeps
+            # begin_serial_txn" split; the check mirrors the controller's own path decision.
+            if self.controller._async_overlap_possible(self.context):
+                self._current_txn = None
+            else:
+                self._current_txn = self.step_txn_manager.begin_serial_txn(
+                    step_id=self.context.step_count,
+                    active_request_count=self.context.get_active_request_count(),
+                )
 
         # The print block (async_bookkeep) and metrics block both fire on this
         # condition after step_count is incremented. Predict it up-front so we

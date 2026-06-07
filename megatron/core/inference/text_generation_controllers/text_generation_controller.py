@@ -5,7 +5,7 @@ import concurrent
 import copy
 import functools
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, OrderedDict, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, OrderedDict, Tuple, Union
 
 import numpy as np
 import torch
@@ -60,12 +60,23 @@ except ImportError:
 
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 from megatron.core.inference.sampling import FlashInferSampling, Sampling, TorchSampling
+from megatron.core.inference.text_generation_controllers.async_sample_ring import AsyncSampleRing
 from megatron.core.inference.text_generation_controllers.mtp_utils_pytorch import rewind_kv_cache
 from megatron.core.inference.text_generation_controllers.mtp_utils_triton import (
     mamba_state_selective_copy,
     prepare_next_forward_pass,
     verify_speculative_tokens,
 )
+
+if TYPE_CHECKING:
+    # Type-only imports. The runtime uses lazy imports inside the overlap methods because the
+    # ``engines`` package __init__ imports ``dynamic_engine`` (which imports this controller),
+    # so a module-top import of these symbols would be circular.
+    from megatron.core.inference.engines.inflight_forward import InflightForward
+    from megatron.core.inference.engines.step_transaction import (
+        PrestagedDecodePlan,
+        StepTransactionManager,
+    )
 
 
 # pylint: disable=line-too-long
@@ -200,11 +211,17 @@ class TextGenerationController:
         self._tp_size = get_pg_size(self.inference_wrapped_model.tp_group)
         self._sp_enabled = self.model_config.sequence_parallel and self._tp_size > 1
 
-        # Launch-before-commit overlap state (async scheduling). When a decode forward is
-        # launched speculatively before the current step's update_requests, its consume-by-
-        # request-id snapshot + graph bucket are stashed here; the next call samples + commits
-        # it instead of running a fresh forward. None means "no in-flight speculative forward".
-        self._async_overlap_inflight: Optional[Dict[str, Any]] = None
+        # Launch-before-commit overlap state (async scheduling). The single speculative forward
+        # F(K+1) launched before the current step's update_requests is held as a typed
+        # InflightForward (backed by a StepTxn): the next call adopts it (consume-by-request-id)
+        # + samples it instead of running a fresh forward. None means "no in-flight forward".
+        self._inflight: Optional["InflightForward"] = None
+        # The async-scheduling transaction manager (retire queue + diagnostics + prestage/launch/
+        # adopt lifecycle) and the async sampled-token read-back ring. Both belong to the engine's
+        # async setup: the engine attaches the manager on reset (only when the opt-in flag is on);
+        # the ring is lazily built on first overlap use. The serial path leaves both None.
+        self._step_txn_manager: Optional["StepTransactionManager"] = None
+        self._async_sample_ring: Optional["AsyncSampleRing"] = None
         # Diagnostic: number of forwards launched before the prior step's update_requests.
         self._async_launch_before_commit_count = 0
         # Diagnostic: set True whenever update_requests runs while a speculative forward that
@@ -1689,7 +1706,11 @@ class TextGenerationController:
                         mask[idx] = 0
         return mask
 
-    def _dynamic_step_prepare_commit(self) -> Dict[str, Any]:
+    def _dynamic_step_prepare_commit(
+        self,
+        sampled_tokens_cpu: Optional[Tensor] = None,
+        sampled_mtp_tokens_cpu: Optional[Tensor] = None,
+    ) -> Dict[str, Any]:
         """Compute the finish/survivor state for the just-sampled step (pre-update_requests).
 
         This is the first half of ``_dynamic_step_context_bookkeeping``: the GPU->CPU sample
@@ -1698,6 +1719,13 @@ class TextGenerationController:
         must be known *before* ``update_requests`` mutates the layout. Split out so the
         launch-before-commit overlap can decide whether the next forward is launchable (it is
         only when this step is finish-free) and launch it *before* the commit below.
+
+        Args:
+            sampled_tokens_cpu (Optional[Tensor]): the already-on-CPU sampled tokens. The serial
+                path leaves this ``None`` and does the legacy blocking ``.cpu()`` here. The overlap
+                path (C4) drains the sample through the :class:`AsyncSampleRing` and passes the
+                consumed (cloned) CPU tensor in, so the D2H flows through the ring + copy stream.
+            sampled_mtp_tokens_cpu (Optional[Tensor]): companion MTP samples (serial path only).
 
         Returns a dict carrying the prepared state for :meth:`_dynamic_step_apply_commit`.
         """
@@ -1710,11 +1738,13 @@ class TextGenerationController:
         # clean steady-state decode->decode transitions only.
         was_decode_only = context.is_decode_only()
 
-        # Batch GPU-to-CPU transfer of all sampled tokens.
+        # Batch GPU-to-CPU transfer of all sampled tokens (serial path). The overlap path
+        # supplies the CPU sample already drained through the AsyncSampleRing.
         range_push("transfer_samples_to_cpu")
-        sampled_tokens_cpu, sampled_mtp_tokens_cpu = self._transfer_samples_to_cpu(
-            active_request_count
-        )
+        if sampled_tokens_cpu is None:
+            sampled_tokens_cpu, sampled_mtp_tokens_cpu = self._transfer_samples_to_cpu(
+                active_request_count
+            )
         range_pop()
 
         range_push("active_request_mask")
@@ -1871,7 +1901,7 @@ class TextGenerationController:
             return False
         if self.num_speculative_tokens > 0 or context.is_hybrid_model:
             return False
-        if self._async_overlap_inflight is not None:
+        if self._inflight is not None:
             return True
         return context.is_decode_only() and context.using_cuda_graph_this_step()
 
@@ -1932,8 +1962,12 @@ class TextGenerationController:
         return plan
 
     def _async_commit_launch_next_decode_forward(
-        self, plan: Optional["PrestagedDecodePlan"], prepared: Dict[str, Any]
-    ) -> Optional[Dict]:
+        self,
+        plan: Optional["PrestagedDecodePlan"],
+        prepared: Dict[str, Any],
+        *,
+        sample_ticket: Any = None,
+    ) -> Optional["InflightForward"]:
         """Fire the speculative launch iff this step is finish-free (post-sample commit phase).
 
         Runs AFTER the sample D2H, so the finish-free / pause-free / decode-only state is known.
@@ -1947,14 +1981,22 @@ class TextGenerationController:
         finish (or no eligible prestage) suppresses the launch: the published metadata is then stale
         but never consumed -- the next step is a synchronous PRIME that rebuilds it from scratch.
 
-        Returns the in-flight record (consume-by-request-id snapshot + graph bucket) to stash, or
-        None when this step is not launchable (the engine then commits and primes again next step).
+        The fired GPU forward is wrapped in a typed :class:`InflightForward` (manager-backed
+        ``StepTxn``): ``InflightForward.launch`` records the consume-by-request-id snapshot, the
+        graph bucket, and the two CUDA fences via ``prestage_child`` / ``launch_child`` (pure CPU
+        bookkeeping -- no GPU work, no allocation). Returns the handle to stash, or ``None`` when
+        this step is not launchable (the engine then commits and primes again next step).
         """
+        from megatron.core.inference.engines.inflight_forward import InflightForward
+
         context = self.inference_wrapped_model.inference_context
         # No eligible shadow prestage => nothing to launch (sync step).
         if plan is None:
             return None
         # Absorbable-but-reshaping or unsupported conditions => no speculative launch this step.
+        # NOTE (C4): the launch stays gated on the FULL finished_count (max-length + EOS). C6
+        # relaxes only the EOS half (max-length stays host-gated); this commit is a structural
+        # swap with timing/behavior unchanged.
         if prepared["finished_count"] != 0:
             return None
         if not prepared["was_decode_only"]:
@@ -1977,13 +2019,26 @@ class TextGenerationController:
         range_push("forward_pass(launch-before-commit)")
         self._dynamic_step_forward_logits(input_ids, position_ids)
         context.kv_block_allocator.store_routing_per_block(self._router_record_bookkeeping())
+        # Record the forward-completion fence (gates the C6 fence-gated retire of finished
+        # leases). The H2D fence was recorded by the publish's token-excluded transfer.
+        forward_done_event = torch.cuda.Event()
+        forward_done_event.record()
+        h2d_done_event = (
+            context.decode_metadata_buffer.h2d_done_event
+            if context.decode_metadata_buffer is not None
+            else None
+        )
         range_pop()
 
         self._async_launch_before_commit_count += 1
-        return {
-            "snapshot": plan.snapshot_request_ids,
-            "cuda_graph_request_count": cuda_graph_request_count,
-        }
+        return InflightForward.launch(
+            self._step_txn_manager,
+            plan,
+            bucket=cuda_graph_request_count,
+            forward_done_event=forward_done_event,
+            h2d_done_event=h2d_done_event,
+            sample_ticket=sample_ticket,
+        )
 
     async def _async_overlap_step(self) -> Optional[Dict]:
         """Run one decode step on the launch-before-commit overlap path.
@@ -2004,7 +2059,7 @@ class TextGenerationController:
         for the step just committed, so engine accounting (step_count, post_process) is unchanged.
         """
         context = self.inference_wrapped_model.inference_context
-        inflight = self._async_overlap_inflight
+        inflight = self._inflight
 
         with torch.inference_mode():
             if inflight is None:
@@ -2025,9 +2080,20 @@ class TextGenerationController:
                 )
                 range_pop()
             else:
-                # PRIMED: the in-flight forward already ran; consume its logits.
-                current_cuda_graph_request_count = inflight["cuda_graph_request_count"]
-                self._async_overlap_inflight = None
+                # PRIMED: the in-flight forward already ran; adopt it (consume-by-request-id) and
+                # consume its logits. The launch was gated finish-free, so the committed active set
+                # equals the snapshot and the SUBSET adopt guard is trivially satisfied. (C4 skips
+                # the bucket check -- the survivor-bucket recompute arrives with the C6 ungate.)
+                current_cuda_graph_request_count = inflight.cuda_graph_request_count
+                committed_survivor_ids = context.request_ids[
+                    context.paused_request_count : context.total_request_count
+                ]
+                adopted = inflight.resolve(committed_survivor_ids)
+                assert adopted, (
+                    "C4 gated launch must always adopt: a finish-free launch snapshot equals the "
+                    "committed survivor set (the barrier-recovery path arrives with the C6 ungate)"
+                )
+                self._inflight = None
 
         await asyncio.sleep(0)
 
@@ -2056,17 +2122,36 @@ class TextGenerationController:
             # wall-clock-independent record that prestage(K+1) ran in F(K)'s shadow (the load-
             # bearing continuous-loop pipelining ordering). Counted in the prestage method.
 
-            # Prepare commit (finish detection): the GPU->CPU sample transfer reads F(K)'s logits,
-            # so this is where the host blocks on F(K). Must precede both the launch decision and
-            # update_requests so the launched forward only fires on a finish-free step.
-            prepared = self._dynamic_step_prepare_commit()
+            # Drain F(K)'s sampled tokens to the host through the AsyncSampleRing instead of a bare
+            # blocking .cpu(): enqueue the D2H on the ring's copy stream, then (C4) consume it
+            # IMMEDIATELY -- still same-iteration, so timing/behavior is unchanged vs the prior
+            # gated overlap. C6 moves this consume to AFTER the launch enqueue (the gap-closer).
+            range_push("transfer_samples_to_cpu(ring)")
+            active_request_count = context.total_request_count - context.paused_request_count
+            ring = self._ensure_async_sample_ring()
+            ticket = ring.enqueue_readback(
+                self._sampled_tokens_cuda,
+                n=active_request_count,
+                snapshot_request_ids=context.request_ids[
+                    context.paused_request_count : context.total_request_count
+                ],
+            )
+            # Clone so the returned "sample" is independent of the reused pinned slot (matches the
+            # legacy .cpu() semantics; update_requests mutates only the separate new_sample_copy).
+            sampled_tokens_cpu = ring.consume(ticket).clone()
+            range_pop()
+
+            # Prepare commit (finish detection) from the already-on-CPU sample. Must precede both
+            # the launch decision and update_requests so the launched forward only fires on a
+            # finish-free step (still gated this commit).
+            prepared = self._dynamic_step_prepare_commit(sampled_tokens_cpu=sampled_tokens_cpu)
 
             # Fire the speculative launch BEFORE committing this step (the overlap), now that the
             # finish-free state is known. Post-sample path = GPU token-scatter + launch enqueue.
-            self._async_overlap_inflight = self._async_commit_launch_next_decode_forward(
+            self._inflight = self._async_commit_launch_next_decode_forward(
                 prestaged_plan, prepared
             )
-            if self._async_overlap_inflight is not None:
+            if self._inflight is not None:
                 self._async_committed_with_inflight_forward = True
 
             # Commit this step. Runs on the CPU while the launched forward runs on the GPU.
@@ -2081,13 +2166,42 @@ class TextGenerationController:
             ret.update(request_bookkeeping)
             return ret
 
+    def attach_step_transaction_manager(self, manager: Optional["StepTransactionManager"]) -> None:
+        """Attach the engine's async-scheduling transaction manager (or ``None`` to detach).
+
+        Called by the engine on reset. The manager backs the :class:`InflightForward`
+        launch/adopt/retire lifecycle on the overlap path; the async sampled-token ring is rebuilt
+        lazily on first use. The serial path never carries a manager, so it never builds a ring.
+        """
+        self._step_txn_manager = manager
+        # A reset rewinds the context; drop any pending read-back so a stale source ref / event is
+        # not later consumed. The ring is rebuilt lazily (it sizes to the context's max_requests).
+        if self._async_sample_ring is not None:
+            self._async_sample_ring.reset()
+
+    def _ensure_async_sample_ring(self) -> "AsyncSampleRing":
+        """Lazily construct the depth-2 async sampled-token read-back ring (overlap path only)."""
+        if self._async_sample_ring is None:
+            context = self.inference_wrapped_model.inference_context
+            self._async_sample_ring = AsyncSampleRing(
+                max_requests=context.max_requests, device=torch.cuda.current_device()
+            )
+        return self._async_sample_ring
+
     def async_drain_inflight_forward(self) -> None:
         """Drop a stale in-flight speculative forward (suspend / reset / shutdown).
 
         The pipeline normally consumes its in-flight forward on the next step; this clears the
-        record when the engine tears down or rewinds, so no stale snapshot is consumed later.
+        record when the engine tears down or rewinds, so no stale snapshot is consumed later. The
+        forward's transaction leases are read-only (the prestage allocates nothing), so the
+        in-flight handle and the manager's child transaction are simply dropped, and the async
+        read-back ring is drained so no pending D2H references a soon-to-be-freed tensor.
         """
-        self._async_overlap_inflight = None
+        self._inflight = None
+        if self._step_txn_manager is not None:
+            self._step_txn_manager.child_txn = None
+        if self._async_sample_ring is not None:
+            self._async_sample_ring.drain()
 
     async def async_generate_output_tokens_dynamic_batch(
         self, skip_bookkeeping: Optional[bool] = False
@@ -2111,8 +2225,10 @@ class TextGenerationController:
 
         # No tokens and no active requests?
         if context.active_token_count == 0 and active_request_count == 0:
-            # Any in-flight speculative forward is moot with nothing active; drop it.
-            self._async_overlap_inflight = None
+            # Any in-flight speculative forward is moot with nothing active; drop it (and drain
+            # the read-back ring). C7 hardens this empty-batch boundary for the C6 lazy-retire
+            # pipeline (consume the pending ticket + commit_lagged before returning None).
+            self.async_drain_inflight_forward()
             return None
 
         # Launch-before-commit overlap (async scheduling, plain GPT decode under a graph).
