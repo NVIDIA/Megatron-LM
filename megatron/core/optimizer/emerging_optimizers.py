@@ -21,20 +21,12 @@ from megatron.core.utils import get_pg_size, log_single_rank
 
 from .optimizer_config import ParamKey, ParamPredicate
 
-try:
-    from torch.distributed.tensor import DTensor as _DTensor
+from torch.distributed.tensor import DTensor
 
-    from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
-        gather_uneven_dtensor_to_full_tensor,
-        update_uneven_dtensor_chunk_metadata,
-    )
-
-    _HAVE_DTENSOR = True
-except ImportError:
-    _DTensor = None  # type: ignore[assignment,misc]
-    gather_uneven_dtensor_to_full_tensor = None  # type: ignore[assignment]
-    update_uneven_dtensor_chunk_metadata = None  # type: ignore[assignment]
-    _HAVE_DTENSOR = False
+from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
+    gather_uneven_dtensor_to_full_tensor,
+    update_uneven_dtensor_chunk_metadata,
+)
 
 try:
     from emerging_optimizers import registry, utils
@@ -302,10 +294,6 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
     def __init__(
         self, params: ParamsT, dp_group: torch.distributed.ProcessGroup | None = None, **kwargs: Any
     ) -> None:
-        assert _HAVE_DTENSOR, (
-            "[Megatron-FSDP] torch.distributed.tensor.DTensor "
-            f"is required to use {type(self).__name__}."
-        )
         self.dp_group = dp_group
         super().__init__(params, **kwargs)
 
@@ -368,11 +356,6 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
         for i, (p, pre_ns_grad, needs_gather, lr, group_kwargs) in enumerate(all_updates):
             if not needs_gather:
                 continue
-            if gather_uneven_dtensor_to_full_tensor is None:
-                raise RuntimeError(
-                    "Megatron-FSDP `gather_uneven_dtensor_to_full_tensor` is required "
-                    "to gather un-evenly sharded parameters for Muon step()."
-                )
             pre_ns_grad_dtensor = self._dtensor_from_local_like(p, pre_ns_grad.contiguous())
             full_pre_ns_grad = gather_uneven_dtensor_to_full_tensor(pre_ns_grad_dtensor).to_local()
             all_updates[i] = (p, full_pre_ns_grad, True, lr, group_kwargs)
@@ -401,10 +384,7 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
 
         return loss
 
-    def _needs_boundary_gather(self, dtensor: torch.Tensor) -> bool:
-        assert isinstance(
-            dtensor, _DTensor
-        ), f"Detected non-DTensor during {type(self).__name__}: {dtensor}"
+    def _needs_boundary_gather(self, dtensor: DTensor) -> bool:
         local_tensor = dtensor.to_local()
         return local_tensor.numel() > 0 and tuple(dtensor.shape) != tuple(local_tensor.shape)
 
@@ -429,14 +409,14 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
             for idx in rank_indices
         }
 
-    def _copy_dtensor_chunk_metadata(self, dst, src) -> None:
+    def _copy_dtensor_chunk_metadata(self, dst: DTensor, src: DTensor) -> None:
         if hasattr(src._local_tensor, "__create_chunk_list__"):
             dst._local_tensor.__create_chunk_list__ = src._local_tensor.__create_chunk_list__
         if hasattr(src._local_tensor, "__create_write_items__"):
             dst._local_tensor.__create_write_items__ = src._local_tensor.__create_write_items__
 
-    def _dtensor_from_local_like(self, value, local_tensor: torch.Tensor):
-        dtensor = _DTensor.from_local(
+    def _dtensor_from_local_like(self, value: DTensor, local_tensor: torch.Tensor) -> DTensor:
+        dtensor = DTensor.from_local(
             local_tensor=local_tensor,
             device_mesh=value.device_mesh,
             placements=value.placements,
@@ -446,10 +426,8 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
         self._copy_dtensor_chunk_metadata(dtensor, value)
         return dtensor
 
-    def _reshard_full_update_like(self, value, full_update: torch.Tensor):
+    def _reshard_full_update_like(self, value: DTensor, full_update: torch.Tensor) -> DTensor:
         if not hasattr(value._local_tensor, "__create_chunk_list__"):
-            if update_uneven_dtensor_chunk_metadata is None:
-                raise RuntimeError("DTensor support is required for Megatron-FSDP Muon.")
             update_uneven_dtensor_chunk_metadata(value)
         value_metadata = value._local_tensor.__create_chunk_list__()[0]
         slices = tuple(
@@ -463,8 +441,6 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
         self, p: torch.Tensor, grad: torch.Tensor, group: dict[str, Any]
     ) -> None:
         """Local (non-DP) Muon update – identical to OrthogonalizedOptimizer.step body."""
-        from emerging_optimizers import utils
-
         state = self.state[p]
         self._apply_weight_decay_inplace(p, grad, group["lr"], group["weight_decay"])
         state["momentum_buffer"].lerp_(grad, 1 - group["momentum"])
