@@ -389,9 +389,11 @@ def test_muon_step_numerics(distributed_setup: dict[str, Any]) -> None:
     param_groups = _build_params(spec, mesh, device)
     fsdp_params = param_groups[0]["params"]
 
-    # Snapshot per-rank LOCAL initial state (cheap — just shards).
+    # Snapshot per-rank initial param shards so we can restore them after the
+    # FSDP step and feed t=0 values to the reference. Grads aren't snapshotted
+    # because `FSDPTensorParallelMuon.step()` reads `p.grad` but doesn't mutate
+    # it in place.
     init_local_params = [p.to_local().clone() for p in fsdp_params]
-    init_local_grads = [p.grad.to_local().clone() for p in fsdp_params]
 
     # Run FSDP+TP Muon step, capture per-rank local results.
     fsdp_opt = _build_optimizer(param_groups, dp_group=dp_group)
@@ -399,13 +401,11 @@ def test_muon_step_numerics(distributed_setup: dict[str, Any]) -> None:
     torch.cuda.synchronize()
     fsdp_after_local = [p.to_local().clone() for p in fsdp_params]
 
-    # Restore DTensor local state so subsequent gathers see t=0 values.
-    # `to_local()` returns the underlying shard storage, so in-place `copy_`
-    # propagates back to the DTensor.
-    for p, p0, g0 in zip(fsdp_params, init_local_params, init_local_grads):
+    # Restore param shards so subsequent gathers see t=0 values. `to_local()`
+    # returns the underlying storage, so in-place `copy_` propagates back.
+    for p, p0 in zip(fsdp_params, init_local_params):
         p.to_local().copy_(p0)
-        p.grad.to_local().copy_(g0)
-    del init_local_params, init_local_grads
+    del init_local_params
 
     nonfinite = []
     mismatches = []
