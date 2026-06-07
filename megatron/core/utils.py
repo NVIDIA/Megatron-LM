@@ -2866,17 +2866,9 @@ def deprecate_inference_params(inference_context, inference_params):
 
 # ---------- Backported from muon-m-fsdp branch for FSDPTensorParallelMuon ----------
 
-from megatron.core._rank_utils import log_single_rank  # noqa: E402
-
-try:
-    from torch.distributed.tensor.placement_types import _StridedShard
-except ImportError:  # pragma: no cover
-    _StridedShard = None  # type: ignore[assignment]
-
 
 def is_same_process_group(
-    group: "torch.distributed.ProcessGroup | None",
-    other: "torch.distributed.ProcessGroup | None",
+    group: "torch.distributed.ProcessGroup | None", other: "torch.distributed.ProcessGroup | None"
 ) -> bool:
     """Returns whether two process groups contain the same ranks."""
     if group is other:
@@ -2892,16 +2884,14 @@ def is_same_process_group(
 
 
 def contains_process_group(
-    groups: "list[torch.distributed.ProcessGroup]",
-    group: "torch.distributed.ProcessGroup | None",
+    groups: "list[torch.distributed.ProcessGroup]", group: "torch.distributed.ProcessGroup | None"
 ) -> bool:
     """Returns whether `groups` already contains a process group with `group`'s ranks."""
     return any(is_same_process_group(group, existing) for existing in groups)
 
 
 def append_unique_process_group(
-    groups: "list[torch.distributed.ProcessGroup]",
-    group: "torch.distributed.ProcessGroup | None",
+    groups: "list[torch.distributed.ProcessGroup]", group: "torch.distributed.ProcessGroup | None"
 ) -> None:
     """Appends `group` to `groups` if an equivalent process group is not already present."""
     if group is None:
@@ -2914,12 +2904,11 @@ def get_dtensor_data_parallel_shard_groups(tensor):
     """Return DTensor shard groups that should contribute to global grad stats."""
     if not HAVE_DTENSOR or not isinstance(tensor, DTensor):
         return []
-    shard_placement_types = (Shard,) if _StridedShard is None else (Shard, _StridedShard)
     mesh = tensor.device_mesh
     mesh_dim_names = getattr(mesh, "mesh_dim_names", None)
     groups = []
     for mesh_dim, placement in enumerate(tensor.placements):
-        if not isinstance(placement, shard_placement_types):
+        if not placement.is_shard():
             continue
         mesh_dim_name = None
         if mesh_dim_names is not None and mesh_dim < len(mesh_dim_names):
