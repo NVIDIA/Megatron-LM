@@ -3,17 +3,13 @@
 import pytest
 
 from megatron.core.enums import Fp8Recipe
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.quantization.quant_config import MatchContext, RecipeConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
-
-try:
-    from megatron.core.extensions.transformer_engine import HAVE_TE
-except ImportError:
-    HAVE_TE = False
 
 try:
     from megatron.core.extensions.kitchen import (
@@ -267,7 +263,6 @@ class TestGPTModelKitchenQuantizationConfig:
             moe_router_load_balancing_type="sinkhorn",
             moe_router_topk=1,
             moe_grouped_gemm=True,
-            moe_use_legacy_grouped_gemm=False,
             num_layers=2,
             hidden_size=12,
             num_attention_heads=4,

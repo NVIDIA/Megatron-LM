@@ -1,6 +1,8 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 """Utilities for transformer layers."""
+import gc
+import logging
 from operator import itemgetter
 from typing import TYPE_CHECKING, Any, Dict, Iterable, Optional, Tuple, Union
 
@@ -18,6 +20,8 @@ from megatron.core.utils import (
 
 if TYPE_CHECKING:
     from megatron.core.transformer import TransformerConfig
+
+logger = logging.getLogger(__name__)
 
 
 def get_linear_layer(rows, columns, init_method, perform_initialization=True):
@@ -70,6 +74,22 @@ def erf_gelu(x):
     return (
         x * 0.5 * (torch.erf(x / 1.41421).to(dtype=x.dtype) + torch.ones_like(x).to(dtype=x.dtype))
     )
+
+
+@torch.no_grad()
+def cat_with_oom_fallback(sub_state_dict):
+    """Merge sharded tensor pieces, falling back to CPU if device-side cat OOMs."""
+    try:
+        return torch.cat(sub_state_dict)
+    except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+        logger.warning(
+            f"CUDA OutOfMemoryError encountered during tensors merging."
+            f" Switching to CPU merge. (Error: {e})"
+        )
+        merged_sub_state_dict = torch.cat([t.cpu() for t in sub_state_dict])
+        gc.collect()
+        torch.cuda.empty_cache()
+        return merged_sub_state_dict
 
 
 def make_sharded_tensors_for_checkpoint(
@@ -432,6 +452,22 @@ def toggle_cuda_graphs(model, set_to="none"):
                         # If we are deleting the cuda graph, we delete its attribute
                         if hasattr(module[0], "cudagraph_manager"):
                             delattr(module[0], "cudagraph_manager")
+
+
+def transition_moe_cudagraphs(model, scope: str):
+    """
+    Switch MoE layers to the given cudagraph scope. Flips between 'partial' and 'full'.
+
+    Args:
+        model: The model with MoE layers which will be transitioned.
+        scope: 'partial' for training (router + postprocess captured, expert dispatch eager)
+               or 'full' for inference (full-layer graph capture).
+    """
+    from megatron.core.transformer.transformer_layer import MoETransformerLayer
+
+    for module in model.modules():
+        if isinstance(module, MoETransformerLayer):
+            module.transition_cudagraph_scope(scope)
 
 
 def is_layer_window_attention(

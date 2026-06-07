@@ -3,6 +3,7 @@
 import torch.nn.functional as F
 from torch import Tensor
 
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -15,14 +16,10 @@ from megatron.core.tensor_parallel.mappings import (
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import divide
 
-try:
-    import transformer_engine as te  # pylint: disable=unused-import
-
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TELayerNormColumnParallelLinear
-
-    HAVE_TE = True
-except ImportError:
-    HAVE_TE = False
+else:
+    TELayerNormColumnParallelLinear = None
 
 
 def _gather_from_tensor_parallel_region(x: Tensor, config: TransformerConfig) -> Tensor:

@@ -7,6 +7,7 @@ request methods, and lifecycle sequences with exactly 9 substantial tests.
 """
 
 import time
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -381,6 +382,85 @@ def test_request_record_merge_across_eviction_recovery():
     single_merged = single_record.merge()
     assert len(single_merged.events) == len(req1.events)
     assert single_merged.generated_tokens == req1.generated_tokens
+
+
+# ============================================================================
+# Test 5b: Merge does not recompute precomputed_block_hashes
+# ============================================================================
+
+
+def test_merge_preserves_precomputed_block_hashes():
+    """Test that merge() carries over precomputed_block_hashes and does not recompute them."""
+    fake_hashes = [111, 222, 333]
+
+    with patch.object(DynamicInferenceRequest, '_compute_block_hashes') as mock_compute:
+        req = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=torch.tensor([1, 2, 3, 4, 5, 6, 7, 8], dtype=torch.int64),
+            sampling_params=SamplingParams(num_tokens_to_generate=4),
+            enable_prefix_caching=True,
+            block_size_tokens=4,
+            precomputed_block_hashes=fake_hashes,
+        )
+
+        # __post_init__ should have skipped recomputation since hashes were provided.
+        mock_compute.assert_not_called()
+
+        req.generated_tokens.extend([100, 101])
+        req.add_event_finish()
+
+        record = DynamicInferenceRequestRecord.from_request(req)
+        merged = record.merge()
+
+        # Merge should carry hashes through and also skip recomputation.
+        mock_compute.assert_not_called()
+
+
+# ============================================================================
+# Test 5c: Merge tolerates sparse tpot across checkpoints
+# ============================================================================
+
+
+def test_merge_with_unpopulated_tpot_in_later_segment():
+    """Regression test: merge() must not crash when a post-checkpoint sub-request
+    never observed a logging step and therefore has an empty tpot list while the
+    pre-checkpoint sub-request has populated entries.
+
+    The dynamic engine populates `tpot` lazily, only on logging steps
+    (`step_time > 0`). A request that gets evicted then finishes within fewer
+    than `logging_step_interval` decode steps after recompute will produce a
+    record whose later sub-request never accumulated any tpot samples, while
+    earlier sub-requests did. `merge()` must concatenate what's there without
+    erroring on the empty segment.
+    """
+    # Pre-checkpoint sub-request: lived through a logging step, so tpot has data.
+    req1 = DynamicInferenceRequest(
+        request_id=1,
+        prompt_tokens=torch.tensor([1, 2, 3], dtype=torch.int64),
+        sampling_params=SamplingParams(num_tokens_to_generate=10),
+    )
+    req1.generated_tokens.extend([100, 101])
+    req1.tpot = [0.10, 0.11]
+
+    # Post-checkpoint sub-request: recomputed but never saw a logging step
+    # before finishing, so tpot is left at its default.
+    req2 = DynamicInferenceRequest(
+        request_id=1,
+        prompt_tokens=torch.tensor([1, 2, 3, 100, 101], dtype=torch.int64),
+        sampling_params=SamplingParams(num_tokens_to_generate=8),
+    )
+    req2.generated_tokens.extend([200])
+
+    record = DynamicInferenceRequestRecord()
+    record.requests.append(req1)
+    record.requests.append(req2)
+
+    merged = record.merge()
+
+    # The pre-checkpoint segment's measurements must survive the merge,
+    # and the empty post-checkpoint segment must contribute nothing.
+    assert merged.tpot == [0.10, 0.11]
+    assert merged.generated_tokens == [100, 101, 200]
 
 
 # ============================================================================

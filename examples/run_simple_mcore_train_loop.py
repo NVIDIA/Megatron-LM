@@ -1,30 +1,26 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
 import os
+from functools import partial
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterator, Tuple
+
 import torch
 from torch.optim import Adam
 from torch.utils.data import DataLoader
-from functools import partial
-from pathlib import Path
-from typing import Any, Callable, Dict, Tuple, Iterator
 
-from megatron.core import parallel_state
-from megatron.core import dist_checkpointing
+from megatron.core import dist_checkpointing, parallel_state
+from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
+from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
+from megatron.core.datasets.utils import compile_helpers
+from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.distributed.finalize_model_grads import finalize_model_grads
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
-from megatron.core.datasets.utils import compile_helpers
-from megatron.core.datasets.blended_megatron_dataset_builder import (
-    BlendedMegatronDatasetBuilder,
-)
-from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
-from megatron.core.distributed import DistributedDataParallel
-from megatron.core.distributed import DistributedDataParallelConfig
-from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.tokenizers import MegatronTokenizer
-
+from megatron.core.transformer.transformer_config import TransformerConfig
 
 _SEQUENCE_LENGTH: int = 64
 
@@ -33,11 +29,11 @@ def initialize_distributed(
     tensor_model_parallel_size: int = 1, pipeline_model_parallel_size: int = 1
 ) -> None:
     """
-    Initialize torch.distributed and Megatron-Core model parallel groups.
+    Set up torch.distributed and Megatron-Core model parallel groups.
 
     Args:
-        tensor_model_parallel_size: Number of GPUs for tensor model parallelism.
-        pipeline_model_parallel_size: Number of GPUs for pipeline model parallelism.
+        tensor_model_parallel_size (int): Number of GPUs to use for tensor model parallelism.
+        pipeline_model_parallel_size (int): Number of GPUs to use for pipeline model parallelism.
     """
     parallel_state.destroy_model_parallel()
 
@@ -47,9 +43,7 @@ def initialize_distributed(
     local_rank: int = int(os.environ["LOCAL_RANK"])
 
     torch.cuda.set_device(local_rank)
-    torch.distributed.init_process_group(
-        backend="nccl", rank=rank, world_size=world_size
-    )
+    torch.distributed.init_process_group(backend="nccl", rank=rank, world_size=world_size)
 
     # Megatron core distributed training initialization
     parallel_state.initialize_model_parallel(
@@ -59,10 +53,10 @@ def initialize_distributed(
 
 def model_provider() -> GPTModel:
     """
-    Build and return a simple GPT model for demonstration.
+    Construct a minimal GPT model for demonstration and testing purposes.
 
     Returns:
-        GPTModel: A small GPT model with 2 layers for testing.
+        GPTModel: A small GPT model instance with 2 layers.
     """
     transformer_config: TransformerConfig = TransformerConfig(
         num_layers=2,
@@ -84,10 +78,14 @@ def model_provider() -> GPTModel:
 
 def get_train_data_iterator() -> Iterator:
     """
-    Create a mock dataset and return a data iterator.
+    Initialize and return an iterator over the training dataset for the GPT model.
+
+    This function sets up a mock dataset using the provided configuration and tokenizer, builds the dataset,
+    and returns an iterator for use in the training loop. It ensures that helper functions are compiled
+    across distributed processes if running in a distributed environment.
 
     Returns:
-        Iterator: Data iterator for training batches.
+        Iterator: An iterator that yields training batches for the GPT model.
     """
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         if torch.distributed.get_rank() == 0:
@@ -103,8 +101,7 @@ def get_train_data_iterator() -> Iterator:
         reset_attention_mask=False,
         eod_mask_loss=False,
         tokenizer=MegatronTokenizer.from_pretrained(
-            metadata_path={"library": "null-text"},
-            vocab_size=_SEQUENCE_LENGTH,
+            metadata_path={"library": "null-text"}, vocab_size=_SEQUENCE_LENGTH
         ),
         mid_level_dataset_surplus=0.005,
     )
@@ -124,15 +121,20 @@ def forward_step_func(
     data_iterator: Iterator, model: torch.nn.Module
 ) -> Tuple[torch.Tensor, Callable]:
     """
-    Forward step function that computes model output and returns loss function.
+    Perform a forward pass on a batch of training data and return the model output and loss function.
+
+    This function retrieves the next batch from the data iterator, moves all tensors to the appropriate device,
+    and computes the model's output tensor. It also defines and returns a loss function, partially applied with the
+    current loss mask, for use in the training loop.
 
     Args:
-        data_iterator: Iterator providing training batches.
-        model: The GPT model to train.
+        data_iterator (Iterator): Iterator yielding training batches as dictionaries of tensors.
+        model (torch.nn.Module): The GPT model to be trained.
 
     Returns:
-        Tuple of (output_tensor, loss_function) where loss_function is a partial
-        function that will compute the final loss when called.
+        Tuple[torch.Tensor, Callable]:
+            - output_tensor: The output tensor from the model's forward pass.
+            - loss_function: A callable that computes the loss when invoked with the model output.
     """
 
     def loss_func(
@@ -153,50 +155,47 @@ def forward_step_func(
     labels: torch.Tensor = data["labels"].to(device)
     loss_mask: torch.Tensor = data["loss_mask"].to(device)
 
-    output_tensor: torch.Tensor = model(
-        tokens, position_ids, attention_mask, labels=labels
-    )
+    output_tensor: torch.Tensor = model(tokens, position_ids, attention_mask, labels=labels)
 
     return output_tensor, partial(loss_func, loss_mask)
 
 
-def save_distributed_checkpoint(
-    checkpoint_path: str, gpt_model: torch.nn.Module
-) -> None:
+def save_distributed_checkpoint(checkpoint_path: str, gpt_model: torch.nn.Module) -> None:
     """
-    Save model checkpoint using Megatron-Core distributed checkpointing.
+    Save a distributed checkpoint of the GPT model using Megatron-Core utilities.
+
+    This function extracts the underlying model if wrapped with DistributedDataParallel (DDP),
+    obtains its sharded state dictionary, and saves it to the specified directory using
+    Megatron-Core's distributed checkpointing mechanism.
 
     Args:
-        checkpoint_path: Directory path to save checkpoint.
-        gpt_model: The model to checkpoint (may be wrapped with DDP).
+        checkpoint_path (str): Directory path where the checkpoint will be saved.
+        gpt_model (torch.nn.Module): The GPT model to checkpoint (may be wrapped with DDP).
     """
     # Access underlying model if wrapped with DDP
-    model: torch.nn.Module = (
-        gpt_model.module if hasattr(gpt_model, "module") else gpt_model
-    )
+    model: torch.nn.Module = gpt_model.module if hasattr(gpt_model, "module") else gpt_model
     sharded_state_dict: Dict = model.sharded_state_dict(prefix="")
-    dist_checkpointing.save(
-        sharded_state_dict=sharded_state_dict, checkpoint_dir=checkpoint_path
-    )
+    dist_checkpointing.save(sharded_state_dict=sharded_state_dict, checkpoint_dir=checkpoint_path)
 
 
 def load_distributed_checkpoint(
     checkpoint_path: str, gpt_model: torch.nn.Module
 ) -> torch.nn.Module:
     """
-    Load model checkpoint using Megatron-Core distributed checkpointing.
+    Load a distributed checkpoint into the GPT model using Megatron-Core utilities.
+
+    This function extracts the underlying model if wrapped with DistributedDataParallel (DDP),
+    loads the checkpoint from the specified directory, and updates the model's state dictionary.
 
     Args:
-        checkpoint_path: Directory path to load checkpoint from.
-        gpt_model: The model to load into (may be wrapped with DDP).
+        checkpoint_path (str): Directory path from which to load the checkpoint.
+        gpt_model (torch.nn.Module): The GPT model to load the checkpoint into (may be wrapped with DDP).
 
     Returns:
-        The model with loaded checkpoint weights.
+        torch.nn.Module: The model with loaded checkpoint weights.
     """
     # Access underlying model if wrapped with DDP
-    model: torch.nn.Module = (
-        gpt_model.module if hasattr(gpt_model, "module") else gpt_model
-    )
+    model: torch.nn.Module = gpt_model.module if hasattr(gpt_model, "module") else gpt_model
     sharded_state_dict: Dict = model.sharded_state_dict(prefix="")
     checkpoint: Dict = dist_checkpointing.load(
         sharded_state_dict=sharded_state_dict, checkpoint_dir=checkpoint_path
@@ -217,15 +216,9 @@ if __name__ == "__main__":
     # This provides the finish_grad_sync() method required by finalize_model_grads().
     config: TransformerConfig = gpt_model.config
     ddp_config: DistributedDataParallelConfig = DistributedDataParallelConfig(
-        grad_reduce_in_fp32=False,
-        overlap_grad_reduce=False,
-        use_distributed_optimizer=False,
+        grad_reduce_in_fp32=False, overlap_grad_reduce=False, use_distributed_optimizer=False
     )
-    gpt_model = DistributedDataParallel(
-        config=config,
-        ddp_config=ddp_config,
-        module=gpt_model,
-    )
+    gpt_model = DistributedDataParallel(config=config, ddp_config=ddp_config, module=gpt_model)
 
     optim: Adam = Adam(gpt_model.parameters())
 
@@ -263,8 +256,6 @@ if __name__ == "__main__":
     save_distributed_checkpoint(gpt_model=gpt_model, checkpoint_path=ckpt_path)
 
     # Loading the model
-    gpt_model = load_distributed_checkpoint(
-        gpt_model=gpt_model, checkpoint_path=ckpt_path
-    )
+    gpt_model = load_distributed_checkpoint(gpt_model=gpt_model, checkpoint_path=ckpt_path)
     gpt_model.to(device)
     print("Successfully loaded the model")

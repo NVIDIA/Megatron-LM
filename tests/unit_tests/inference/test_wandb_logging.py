@@ -30,16 +30,16 @@ def set_rounder(value):
 class TestInferenceWandbLogging:
     """Test suite for wandb logging in inference."""
 
-    def setup_method(self):
-        """Set up test fixtures."""
+    @classmethod
+    def setup_class(cls):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1, pipeline_model_parallel_size=1
         )
         model_parallel_cuda_manual_seed(123)
         set_rounder(64)
 
-    def teardown_method(self):
-        """Clean up test fixtures."""
+    @classmethod
+    def teardown_class(cls):
         set_rounder(64)
         Utils.destroy_model_parallel()
 
@@ -149,7 +149,7 @@ class TestInferenceWandbLogging:
         # Verify relationship: allocated_blocks + block_count_avail + 1 (dummy) = total
         assert (
             stats_after['allocated_blocks'] + stats_after['block_count_avail'] + 1
-            == dynamic_context.block_allocator.total_count
+            == dynamic_context.kv_block_allocator.total_count
         )
 
         # Verify utilization bounds [0, 1]

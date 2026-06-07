@@ -42,9 +42,6 @@ MODEL_ARGS:
   --top_k: 1
   --return-log-probs: true
   --num-tokens-to-generate: 30
-  --inference-dynamic-batching-max-requests-override: 8 # hardcode decode padding tokens to 7 for reproducibility
-  --inference-dynamic-batching-buffer-guaranteed-fraction: 0
-  --inference-dynamic-batching-buffer-overflow-factor: 0.2
   --inference-dynamic-batching-buffer-size-gb: 20
   --dist-ckpt-strictness: log_unexpected
   --inference-ckpt-non-strict: true # To handle the extra_state errors

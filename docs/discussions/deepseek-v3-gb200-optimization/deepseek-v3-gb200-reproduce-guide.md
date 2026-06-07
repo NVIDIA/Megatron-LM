@@ -1,3 +1,7 @@
+---
+orphan: true
+---
+
 # A Guide to Reproduce DeepSeek-V3 Pre-training Performance on GB200
 
 ## 1. Dockerfile
@@ -259,7 +263,7 @@ This is a very important step on GB200.
 --recompute-granularity selective \
 --recompute-modules moe_act mlp \
 --cuda-graph-impl transformer_engine \
---cuda-graph-scope attn moe_router moe_preprocess \
+--cuda-graph-modules attn moe_router moe_preprocess \
 --te-rng-tracker \
 --pipeline-model-parallel-layout "Et|(tt|)*30L" \
 --moe-router-force-load-balancing \
@@ -300,7 +304,7 @@ The following arguments indicate key optimizations.
 
 ```bash
 --cuda-graph-impl transformer_engine \
---cuda-graph-scope attn moe_router moe_preprocess \
+--cuda-graph-modules attn moe_router moe_preprocess \
 --te-rng-tracker \
 ```
 

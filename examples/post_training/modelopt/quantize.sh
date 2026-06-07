@@ -20,9 +20,26 @@ if [ -z ${QUANT_CFG} ]; then
     printf "${MLM_WARNING} Variable ${PURPLE}QUANT_CFG${WHITE} is not set (default: ${QUANT_CFG})!\n"
 fi
 
+# If the 2nd positional arg looks like a recipe path (contains '/' or ends in
+# '.yaml'/'.yml') pass it via --recipe; otherwise treat it as a built-in
+# config name and pass it via --export-quant-cfg.
+case "${QUANT_CFG}" in
+    */*|*.yaml|*.yml)
+        QUANT_CFG_ARGS=(--recipe "${QUANT_CFG}")
+        ;;
+    *)
+        QUANT_CFG_ARGS=(--export-quant-cfg "${QUANT_CFG}")
+        ;;
+esac
+
 if [ -z ${MLM_MODEL_SAVE} ]; then
     MLM_MODEL_SAVE=${MLM_WORK_DIR}/${MLM_MODEL_CFG}_quant
     printf "${MLM_WARNING} Variable ${PURPLE}MLM_MODEL_SAVE${WHITE} is not set (default: ${MLM_MODEL_SAVE})!\n"
+fi
+
+EXTRA_ARGS=(${MLM_DEFAULT_ARGS} ${MLM_EXTRA_ARGS})
+if [ -n "${MLM_PROMPTS}" ]; then
+    EXTRA_ARGS+=(--prompts "${MLM_PROMPTS}")
 fi
 
 if [ -z ${MLM_MODEL_CKPT} ]; then
@@ -36,9 +53,9 @@ if [ -z ${MLM_MODEL_CKPT} ]; then
         --tokenizer-model ${TOKENIZER_MODEL} \
         --pretrained-model-path ${HF_MODEL_CKPT} \
         --save ${MLM_MODEL_SAVE} \
-        --export-quant-cfg ${QUANT_CFG} \
+        "${QUANT_CFG_ARGS[@]}" \
         --references "${MLM_REF_LABEL}" \
-        ${MLM_DEFAULT_ARGS} ${MLM_EXTRA_ARGS}
+        "${EXTRA_ARGS[@]}"
 else
     ${LAUNCH_SCRIPT} ${SCRIPT_DIR}/quantize.py \
         ${MODEL_ARGS} \
@@ -50,7 +67,7 @@ else
         --tokenizer-model ${TOKENIZER_MODEL} \
         --load ${MLM_MODEL_CKPT} \
         --save ${MLM_MODEL_SAVE} \
-        --export-quant-cfg ${QUANT_CFG} \
+        "${QUANT_CFG_ARGS[@]}" \
         --references "${MLM_REF_LABEL}" \
-        ${MLM_DEFAULT_ARGS} ${MLM_EXTRA_ARGS}
+        "${EXTRA_ARGS[@]}"
 fi

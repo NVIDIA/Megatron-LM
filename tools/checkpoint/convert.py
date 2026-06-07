@@ -2,8 +2,9 @@
 
 import argparse
 import importlib
-import torch.multiprocessing as mp
 import sys
+
+import torch.multiprocessing as mp
 
 # A loader is a python file with at least two functions
 # - add_arguments - takes in a parser and adds any arguments needed
@@ -87,6 +88,7 @@ import sys
 # }
 # - "done"
 
+
 def load_plugin(plugin_type, name):
     module_name = f"{plugin_type}_{name}"
     try:
@@ -106,37 +108,55 @@ def load_plugin(plugin_type, name):
     print(f"Loaded {module_name} as the {plugin_type}.")
     return plugin
 
+
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Megatron Checkpoint Converter Arguments",
-                                     allow_abbrev=False, conflict_handler='resolve')
 
-    parser.add_argument('--model-type', type=str, required=True,
-                        choices=['GPT', 'BERT'],
-                        help='Type of the model')
-    parser.add_argument('--loader', type=str, default='megatron',
-                        help='Module name to load checkpoint, should be on python path')
-    parser.add_argument('--saver', type=str, default='megatron',
-                        help='Module name to save checkpoint, should be on python path')
-    parser.add_argument('--load-dir', type=str, required=True,
-                        help='Directory to load model checkpoint from')
-    parser.add_argument('--save-dir', type=str, required=True,
-                        help='Directory to save model checkpoint to')
-    parser.add_argument('--max-queue-size', type=int, default=50,
-                        help='Maximum number of tensors in the queue')
-    parser.add_argument('--no-checking', action='store_false',
-                        help='Do not perform checking on the name and ordering of weights',
-                        dest='checking')
+    parser = argparse.ArgumentParser(
+        description="Megatron Checkpoint Converter Arguments",
+        allow_abbrev=False,
+        conflict_handler='resolve',
+    )
+
+    parser.add_argument(
+        '--model-type', type=str, required=True, choices=['GPT', 'BERT'], help='Type of the model'
+    )
+    parser.add_argument(
+        '--loader',
+        type=str,
+        default='megatron',
+        help='Module name to load checkpoint, should be on python path',
+    )
+    parser.add_argument(
+        '--saver',
+        type=str,
+        default='megatron',
+        help='Module name to save checkpoint, should be on python path',
+    )
+    parser.add_argument(
+        '--load-dir', type=str, required=True, help='Directory to load model checkpoint from'
+    )
+    parser.add_argument(
+        '--save-dir', type=str, required=True, help='Directory to save model checkpoint to'
+    )
+    parser.add_argument(
+        '--max-queue-size', type=int, default=50, help='Maximum number of tensors in the queue'
+    )
+    parser.add_argument(
+        '--no-checking',
+        action='store_false',
+        help='Do not perform checking on the name and ordering of weights',
+        dest='checking',
+    )
 
     known_args, _ = parser.parse_known_args()
 
     # Handle old arg values.
     def update_loader_saver(key):
         old_value = getattr(known_args, key)
-        if old_value == "megatron":
-            setattr(known_args, key, "legacy")
         if old_value == "mcore":
             setattr(known_args, key, "core")
+
     update_loader_saver("loader")
     update_loader_saver("saver")
 

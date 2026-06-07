@@ -34,6 +34,7 @@ knowledge distillation, pruning, speculative decoding, and more.
 | `moonshotai/Kimi-K2-Instruct` | ✅ | ✅ | - | - |
 | `nvidia/NVIDIA-Nemotron-Nano-9B-v2` | ✅ | - | ✅ | ✅ |
 | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16` | ✅ | - | ✅ | ✅ |
+| `nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16` | ✅ | - | ✅ | ✅ |
 | `openai/gpt-oss-{20b, 120b}` | ✅ | **Online** | ✅ | ✅ |
 | `Qwen/Qwen3-{0.6B, 8B}` | ✅ | ✅ | ✅ | ✅ |
 | `Qwen/Qwen3-{30B-A3B, 235B-A22B}` | **WAR** | ✅ | ✅ | ✅ |
@@ -75,6 +76,18 @@ provide `${EXPORT_DIR}` to `export.sh`.
 
 \
     PP=1 \
+    HF_MODEL_CKPT=<pretrained_model_name_or_path> \
+    MLM_MODEL_CKPT=/tmp/Llama-3.2-1B-Instruct_quant \
+    EXPORT_DIR=/tmp/Llama-3.2-1B-Instruct_export \
+    ./export.sh meta-llama/Llama-3.2-1B-Instruct
+```
+
+To export the model for vLLM fakequant example in `modelopt/examples/vllm_serve/vllm_serve_fakequant.py`,
+export the model with flag `--export-vllm-fq`:
+```sh
+\
+    PP=1 \
+    MLM_EXTRA_ARGS=--export-vllm-fq \
     HF_MODEL_CKPT=<pretrained_model_name_or_path> \
     MLM_MODEL_CKPT=/tmp/Llama-3.2-1B-Instruct_quant \
     EXPORT_DIR=/tmp/Llama-3.2-1B-Instruct_export \

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 import torch
 import torch.distributed as dist
@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class SendOp:
-    """Simple container describing a single NCCL send operation."""
+    """Simple container describing a single send operation."""
 
     task_id: int | None
     tensor: torch.Tensor
@@ -24,7 +24,7 @@ class SendOp:
 
 @dataclass
 class RecvOp:
-    """Simple container describing a single NCCL receive operation."""
+    """Simple container describing a single receive operation."""
 
     task_id: int | None
     tensor: torch.Tensor
@@ -37,9 +37,11 @@ class NCCLCopyService(CopyService):
     a batch of point-to-point sends and recvs.
     """
 
-    def __init__(self):
-        self.rank = dist.get_rank()
-        self.world_size = dist.get_world_size()
+    def __init__(self, group=None):
+        self.group = group
+        # Use group.rank()/size() to support cross-cluster ProcessGroups
+        self.rank = group.rank() if group is not None else dist.get_rank()
+        self.world_size = group.size() if group is not None else dist.get_world_size()
         self.send_ops: List[SendOp] = []
         self.recv_ops: List[RecvOp] = []
         # Dedicated stream for local (same-rank) copies to avoid unnecessary
@@ -48,19 +50,10 @@ class NCCLCopyService(CopyService):
         if self.rank == 0:
             logger.info(f"NCCLCopyService initialized with {self.world_size} ranks")
 
-    def submit_send(self, src_tensor: torch.Tensor, dest_rank: int):
-        self.send_ops.append(SendOp(task_id=None, tensor=src_tensor, dest_rank=dest_rank))
-
-    def submit_send_with_id(self, task_id: int, src_tensor: torch.Tensor, dest_rank: int):
-        """Submit a send operation with a unique task identifier."""
+    def submit_send(self, src_tensor: torch.Tensor, dest_rank: int, task_id: Optional[int] = None):
         self.send_ops.append(SendOp(task_id=task_id, tensor=src_tensor, dest_rank=dest_rank))
 
-    def submit_recv(self, dest_tensor: torch.Tensor, src_rank: int):
-        """Submit a receive operation."""
-        self.recv_ops.append(RecvOp(task_id=None, tensor=dest_tensor, src_rank=src_rank))
-
-    def submit_recv_with_id(self, task_id: int, dest_tensor: torch.Tensor, src_rank: int):
-        """Submit a receive operation with a unique task identifier."""
+    def submit_recv(self, dest_tensor: torch.Tensor, src_rank: int, task_id: Optional[int] = None):
         self.recv_ops.append(RecvOp(task_id=task_id, tensor=dest_tensor, src_rank=src_rank))
 
     def run(self):
@@ -82,14 +75,14 @@ class NCCLCopyService(CopyService):
             local_sends_by_id = {op.task_id: op for op in local_sends}
             if None in local_sends_by_id:
                 raise RuntimeError(
-                    "NCCLCopyService: local send missing task_id; "
-                    "use submit_send_with_id/submit_recv_with_id for local copies"
+                    "NCCLCopyService: local (same-rank) transfer requires a task_id "
+                    "to match sends with recvs"
                 )
             local_recvs_by_id = {op.task_id: op for op in local_recvs}
             if None in local_recvs_by_id:
                 raise RuntimeError(
-                    "NCCLCopyService: local recv missing task_id; "
-                    "use submit_send_with_id/submit_recv_with_id for local copies"
+                    "NCCLCopyService: local (same-rank) transfer requires a task_id "
+                    "to match sends with recvs"
                 )
             if len(local_sends_by_id) != len(local_sends) or len(local_recvs_by_id) != len(
                 local_recvs
@@ -111,9 +104,9 @@ class NCCLCopyService(CopyService):
 
         p2p_ops = []
         for op in remote_sends:
-            p2p_ops.append(dist.P2POp(dist.isend, op.tensor, op.dest_rank))
+            p2p_ops.append(dist.P2POp(dist.isend, op.tensor, op.dest_rank, group=self.group))
         for op in remote_recvs:
-            p2p_ops.append(dist.P2POp(dist.irecv, op.tensor, op.src_rank))
+            p2p_ops.append(dist.P2POp(dist.irecv, op.tensor, op.src_rank, group=self.group))
 
         if p2p_ops:
             reqs = dist.batch_isend_irecv(p2p_ops)

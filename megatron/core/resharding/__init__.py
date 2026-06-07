@@ -7,11 +7,14 @@ from .refit import (
     reshard_model_weights,
     swap_model_weights,
 )
+from .transforms import MXFP8ReshardTransform, ReshardTransform
 from .utils import ParameterMetadata, ReshardPlan, ShardingDescriptor, TransferOp
 
 __all__ = [
     "build_centralized_reshard_plan",
     "execute_reshard_plan",
+    "MXFP8ReshardTransform",
+    "ReshardTransform",
     "swap_model_weights",
     "reshard_model_weights",
     "get_or_create_service",

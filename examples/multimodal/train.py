@@ -12,7 +12,7 @@ sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
 )
 
-from dataloader_provider import train_valid_test_dataloaders_provider, is_first_or_last_stage
+from dataloader_provider import is_first_or_last_stage, train_valid_test_dataloaders_provider
 from model import model_provider
 from multimodal_args import add_multimodal_extra_args
 
@@ -22,12 +22,13 @@ from megatron.core.models.multimodal import context_parallel
 from megatron.core.models.multimodal.llava_model import IGNORE_INDEX, LLaVAModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
-    get_tensor_model_parallel_rank,
     get_pipeline_model_parallel_world_size,
+    get_tensor_model_parallel_rank,
     is_pipeline_last_stage,
 )
+from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 from megatron.training import get_args, get_timers, get_tokenizer, pretrain
-from megatron.training.utils import is_last_rank, get_batch_on_this_cp_rank
+from megatron.training.utils import get_batch_on_this_cp_rank, is_last_rank
 
 
 def get_batch(data_iterator, image_token_index, img_seq_len):
@@ -50,10 +51,19 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
     pp_size = get_pipeline_model_parallel_world_size()
     if not is_first_or_last_stage(pp_size):
         # Note these are all set to None above.
-        return tokens, labels, loss_mask, attention_mask, position_ids, imgs, num_tiles, packed_seq_params
+        return (
+            tokens,
+            labels,
+            loss_mask,
+            attention_mask,
+            position_ids,
+            imgs,
+            num_tiles,
+            packed_seq_params,
+        )
 
     # Broadcast data.
-    torch.cuda.nvtx.range_push("get_data")
+    nvtx_range_push("get_data")
     if data_iterator is not None and get_tensor_model_parallel_rank() == 0:
         data = next(data_iterator)
     else:
@@ -73,7 +83,9 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
         # FSDP can hang with text-only samples. A workaround is to run a valid dummy image through the vision
         # model and then add image embeddings with a zero multiplier.
         if args.use_torch_fsdp2:
-            imgs = torch.zeros((1, 3, args.img_h, args.img_w), dtype=torch.float32, device=data_text.device)
+            imgs = torch.zeros(
+                (1, 3, args.img_h, args.img_w), dtype=torch.float32, device=data_text.device
+            )
             num_tiles = torch.tensor([], dtype=torch.int, device=data_text.device)
         else:
             # Similar workaround is not needed without FSDP and we can use an empty image.
@@ -102,22 +114,22 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
             max_seqlen_kv=max_lengths,
         )
 
-    torch.cuda.nvtx.range_pop()
+    nvtx_range_pop("get_data")
 
     tokens_ = data_text.long()
 
-    torch.cuda.nvtx.range_push("index tokens")
+    nvtx_range_push("index tokens")
     tokenizer = get_tokenizer()
     text_length = tokens_.shape[1]
     tokens = tokens_[:, :text_length].contiguous()
     labels = labels[:, 1 : text_length + 1].contiguous()
 
     assert tokens.shape == labels.shape, f"tokens: {tokens.shape} != labels: {labels.shape}"
-    torch.cuda.nvtx.range_pop()
+    nvtx_range_pop("index tokens")
 
-    torch.cuda.nvtx.range_push("get_ltor_masks_and_position_ids")
+    nvtx_range_push("get_ltor_masks_and_position_ids")
     loss_mask, position_ids = get_ltor_masks_and_position_ids(tokens, labels, tokenizer.pad)
-    torch.cuda.nvtx.range_pop()
+    nvtx_range_pop("get_ltor_masks_and_position_ids")
 
     # If context parallel is enabled, must shard inputs to CP ranks.
     if args.context_parallel_size > 1 or args.sequence_parallel:
@@ -129,13 +141,20 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
 
         # CP expects sequence length is divisible by CP size so apply padding.
         mp_padding_needed = context_parallel.get_padding(
-            seq_len, args.context_parallel_size,
-            args.tensor_model_parallel_size, args.sequence_parallel,
+            seq_len,
+            args.context_parallel_size,
+            args.tensor_model_parallel_size,
+            args.sequence_parallel,
         )
-        tokens, position_ids, labels, loss_mask = [torch.nn.functional.pad(item, (0, mp_padding_needed)) for item in (tokens, position_ids, labels, loss_mask)]
+        tokens, position_ids, labels, loss_mask = [
+            torch.nn.functional.pad(item, (0, mp_padding_needed))
+            for item in (tokens, position_ids, labels, loss_mask)
+        ]
 
         # Get PackedSeqParams that indicate the amount of padding for TransformerEngine.
-        packed_seq_params = context_parallel.get_packed_seq_params(tokens, num_image_embeddings, mp_padding_needed, args.context_parallel_size, True)
+        packed_seq_params = context_parallel.get_packed_seq_params(
+            tokens, num_image_embeddings, mp_padding_needed, args.context_parallel_size, True
+        )
 
     return (
         tokens,
@@ -174,14 +193,15 @@ def get_mask_start_and_end_idx(arr):
     get_mask_start_and_end_idx(arr) = [(1, 1), (4, 5)]
     such that arr[1:1+1] = [1] and arr[4:5+1] = [1, 1]
     """
-    mask = (arr != 0)
+    mask = arr != 0
 
     mask_int = mask.int()
 
     diff = mask_int[1:] - mask_int[:-1]
     start_indices = (diff == 1).nonzero(as_tuple=False).flatten() + 1
     end_indices = (diff == -1).nonzero(as_tuple=False).flatten()
-    if len(mask)==0: return []
+    if len(mask) == 0:
+        return []
     if mask[0]:
         start_indices = torch.cat((torch.tensor([0], device=arr.device), start_indices))
     if mask[-1]:
@@ -210,8 +230,8 @@ def scaled_loss_func(loss_mask, output_tensor):
         turn_start_end_list = get_mask_start_and_end_idx(loss_mask[idx])
         for turn_start, turn_end in turn_start_end_list:
             # compute loss for each turn
-            loss_this_turn = loss_this_sample[turn_start:turn_end+1].sum()
-            assert (1 - loss_mask)[idx][turn_start:turn_end+1].sum() < 1.0
+            loss_this_turn = loss_this_sample[turn_start : turn_end + 1].sum()
+            assert (1 - loss_mask)[idx][turn_start : turn_end + 1].sum() < 1.0
             num_valid_labels_this_turn = turn_end - turn_start + 1
             loss_this_turn = loss_this_turn / num_valid_labels_this_turn
             loss_list.append(loss_this_turn)
@@ -230,7 +250,9 @@ def scaled_loss_func(loss_mask, output_tensor):
         total_tokens = loss_mask.sum()
         total_loss = torch.sum(losses.view(-1) * loss_mask)
     else:
-        raise RuntimeError("loss_list for loss scaling per conversation unexpectedly got empty list")
+        raise RuntimeError(
+            "loss_list for loss scaling per conversation unexpectedly got empty list"
+        )
 
     num_tokens = total_tokens.clone().detach().to(torch.int)
     reporting_loss = torch.cat([total_loss.clone().detach().view(1), num_tokens.view(1)])
@@ -275,7 +297,9 @@ def forward_step(data_iterator, model: LLaVAModel):
         images,
         num_image_tiles,
         packed_seq_params,
-    ) = get_batch(data_iterator, model.module.module.image_token_index, model.module.module.img_seq_len)
+    ) = get_batch(
+        data_iterator, model.module.module.image_token_index, model.module.module.img_seq_len
+    )
     timers('batch-generator').stop()
 
     output_tensor, loss_mask = model(
@@ -332,6 +356,7 @@ def run_online_eval(model):
         return []
 
     from config import EvaluationConfig
+
     # Import the common evaluation functions
     from run_text_generation import get_evaluation_configs, run_evaluation_loop
 
@@ -343,9 +368,11 @@ def run_online_eval(model):
     # We must write to a storage space that all ranks see.
     output_dir = os.path.join(args.save, "online_eval")
     os.makedirs(output_dir, exist_ok=True)
-    
+
     # Use the common evaluation loop
-    scores = run_evaluation_loop(model[0].module, configs, output_dir_override=output_dir, print_output=False)
+    scores = run_evaluation_loop(
+        model[0].module, configs, output_dir_override=output_dir, print_output=False
+    )
 
     return [scores]
 
@@ -363,6 +390,7 @@ def write_eval_to_tensorboard(data, iteration, writer, walltime=None):
 def write_online_eval_to_tensorboard(data, iteration, writer, walltime=None):
     """Write online evaluation data to Tensorboard."""
     import shutil
+
     args = get_args()
 
     # Define source and destination directories

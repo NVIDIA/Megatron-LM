@@ -12,10 +12,12 @@ try:
         multi_tensor_applier,
         multi_tensor_l2norm,
         multi_tensor_scale,
+        multi_tensor_scale_tensor,
     )
 
     l2_norm_impl = multi_tensor_l2norm
     multi_tensor_scale_impl = multi_tensor_scale
+    multi_tensor_scale_tensor_impl = multi_tensor_scale_tensor
 except ImportError:
     try:
         import amp_C
@@ -23,6 +25,7 @@ except ImportError:
 
         l2_norm_impl = amp_C.multi_tensor_l2norm
         multi_tensor_scale_impl = amp_C.multi_tensor_scale
+        multi_tensor_scale_tensor_impl = None
     except ImportError:
         import warnings
 
@@ -41,6 +44,7 @@ except ImportError:
         multi_tensor_applier = local_multi_tensor_applier
         l2_norm_impl = local_multi_tensor_l2_norm
         multi_tensor_scale_impl = local_multi_tensor_scale
+        multi_tensor_scale_tensor_impl = None
 
 
 from ..tensor_parallel import param_is_not_tensor_parallel_duplicate
@@ -53,22 +57,24 @@ def get_grad_norm_fp32(
     norm_type: Union[int, float] = 2,
     grad_stats_parallel_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> float:
-    """Calculate the norm of gradients in fp32.
+    """Calculate the p-norm of gradients in FP32 precision.
 
-    This is adapted from torch.nn.utils.clip_grad.clip_grad_norm_ and
-    added functionality to handle model parallel parameters.
+    This function is adapted from `torch.nn.utils.clip_grad.clip_grad_norm_`
+    and extends it with functionality to handle model-parallel parameters.
+    It ensures that the norm is correctly computed and reduced across
+    the specified process group (typically the model-parallel group for
+    non-distributed optimizers or the entire world for distributed optimizers).
 
-    Arguments:
-        grads_for_norm (Iterable[Tensor] or Tensor): an iterable of Tensors or a single
-            Tensor that will be used for calculating the grad norm.
-        norm_type (float or int): type of the used p-norm. Can be ``'inf'`` for
-            infinity norm.
-        grad_stats_parallel_group (group): Process group for reducing the grad norms. This is
-            generally the model-parallel group for non-distributed optimizers, and the entire
-            world for the distributed optimizer.
+    Args:
+        grads_for_norm (Union[List[torch.Tensor], torch.Tensor]): An iterable
+            of Tensors or a single Tensor used to calculate the gradient norm.
+        norm_type (Union[int, float]): The type of the p-norm to use. Can be
+            'inf' for infinity norm. Defaults to 2.
+        grad_stats_parallel_group (ProcessGroup, optional): The process group
+            used for reducing gradient statistics (e.g., norms and zero counts).
 
     Returns:
-        Total norm of the parameters (viewed as a single vector).
+        float: The total norm of the parameters, treated as a single vector.
     """
 
     if isinstance(grads_for_norm, torch.Tensor):
@@ -130,7 +136,10 @@ def get_grad_norm_fp32(
         torch.distributed.all_reduce(
             total_norm, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
         )
-        total_norm = total_norm.item() ** (1.0 / norm_type)
+        if multi_tensor_scale_tensor_impl is not None:
+            total_norm = total_norm.pow(1.0 / norm_type)
+        else:
+            total_norm = total_norm.item() ** (1.0 / norm_type)
 
     return total_norm
 
@@ -141,17 +150,19 @@ def clip_grad_by_total_norm_fp32(
     total_norm: float,
     use_decoupled_grad: bool = False,
 ):
-    """Clips gradient of an iterable of parameters in fp32 by total norm.
+    """Clips the gradients of an iterable of parameters in FP32 by total norm.
 
-    Note that the gradients are modified in place.
+    Note that the gradients are modified in-place.
 
     Args:
-        parameters (Iterable[Tensor] or Tensor): an iterable of Tensors or a
-            single Tensor that will have gradients normalized.
-        max_norm (float or int): max norm of the gradients.
-        total_norm (float): total norm of the gradients.
-        use_decoupled_grad (bool, optional): whether to read grad from ".grad" or ".decoupled_grad",
-            default value is False.
+        parameters (Union[List[torch.Tensor], torch.Tensor]): An iterable of
+            Tensors or a single Tensor that will have gradients normalized.
+        max_norm (Union[int, float]): The maximum permissible total norm
+            of the gradients.
+        total_norm (float): The current total norm of the gradients.
+        use_decoupled_grad (bool, optional): Whether to read from the
+            '.decoupled_grad' attribute instead of the standard '.grad'.
+            Defaults to False.
     """
     # Grads.
     params = []
@@ -170,8 +181,16 @@ def clip_grad_by_total_norm_fp32(
 
     # Scale.
     clip_coeff = max_norm / (total_norm + 1.0e-6)
-    if clip_coeff < 1.0:
-        dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device='cuda')
+    dummy_overflow_buf = torch.zeros(1, dtype=torch.int, device='cuda')
+    if isinstance(clip_coeff, torch.Tensor):
+        clip_coeff.clamp_max_(1.0)
+        assert (
+            multi_tensor_scale_tensor_impl is not None
+        ), "clip_coeff is tensor type. But multi_tensor_scale_tensor not available."
+        multi_tensor_applier(
+            multi_tensor_scale_tensor_impl, dummy_overflow_buf, [grads, grads], clip_coeff
+        )
+    elif clip_coeff < 1.0:
         multi_tensor_applier(
             multi_tensor_scale_impl, dummy_overflow_buf, [grads, grads], clip_coeff
         )
@@ -183,18 +202,25 @@ def count_zeros_fp32(
     use_decoupled_grad: bool = False,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> float:
-    """Counts the number of zeros in gradients associated with the passed-in list of
-    parameters.
+    """Counts the number of zero values in the gradients of the given parameters.
+
+    The count is performed in FP32. This method filters parameters to ensure
+    gradients are not double-counted by checking if the gradient is not None,
+    the parameter is not shared, and the parameter is not a replica due
+    to tensor model parallelism. It also handles parameters managed by
+    Megatron FSDP specifically.
 
     Args:
-        parameters (Iterable[Tensor] or Tensor): an iterable of Tensors or a
-            single Tensor that will have the number of zeros in its corresponding
-            gradient counted.
-        grad_stats_parallel_group (group): Process group for reducing the num_zeros count. This is
-            generally the model-parallel group for non-distributed optimizers, and the entire
-            world for the distributed optimizer.
-        use_decoupled_grad (bool, optional) whether to read grad from ".grad" or ".decoupled_grad",
-            default value is False.
+        parameters (Union[List[torch.Tensor], torch.Tensor]): An iterable of
+            Tensors or a single Tensor whose gradients will be checked for zeros.
+        grad_stats_parallel_group (ProcessGroup): The process group used for
+            reducing the zero count across distributed ranks.
+        use_decoupled_grad (bool, optional): If True, reads from the
+            '.decoupled_grad' attribute instead of the standard '.grad'.
+            Defaults to False.
+
+    Returns:
+        float: The total number of zeros in the gradients across the process group.
     """
 
     if isinstance(parameters, torch.Tensor):
@@ -204,7 +230,7 @@ def count_zeros_fp32(
     #   - grad should not be none
     #   - parameter should not be shared
     #   - should not be a replica due to tensor model parallelism
-    total_num_zeros = torch.zeros(1, dtype=torch.float, device='cuda')
+    total_num_zeros = torch.zeros(1, dtype=torch.int64, device='cuda')
     data_parallel_group = None
     use_megatron_fsdp = False
     for param in parameters:

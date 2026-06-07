@@ -45,6 +45,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         config: OptimizerConfig,
         pg_collection: Optional[ProcessGroupCollection] = None,
         init_state_fn_list: Optional[List[Callable]] = None,
+        model_chunks: Optional[List] = None,
     ) -> None:
         """
         Initialize LayerWiseDistributedOptimizer.
@@ -54,28 +55,36 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
             config: OptimizerConfig.
             pg_collection: ProcessGroupCollection.
             init_state_fn_list: List of init state functions.
+            model_chunks: DDP-wrapped model chunks (needed for overlap_param_gather).
         """
 
         self.pg_collection = pg_collection
         self.shard_params(optimizers)
+
+        # Set up overlap param gather using DDP bucket infrastructure.
+        self.overlap_param_gather = config.overlap_param_gather
+        if self.overlap_param_gather:
+            assert (
+                model_chunks is not None
+            ), "model_chunks must be provided if overlap_param_gather is True"
+            self.set_bucket_layerwise_params_list(model_chunks)
+
         if init_state_fn_list:
             assert len(init_state_fn_list) == len(
                 optimizers
             ), "init_state_fn_list must be the same length as optimizers if provided"
 
-        # wrap optimizer after sharding to avoid unnecessary master weight creation
-        # for higher precision, optimizers are wrapped with megatron already
+        # Wrap base torch optimizers with Float16 for bf16 training.
+        # Callers pass base optimizers; wrapping happens here *after*
+        # shard_params so master weights are only created for the local shard.
         if config.bf16:
-            # unwrap FP32 optimizer, possibly from reusing get_megatron_optimizer for adam
             for i in range(len(optimizers)):
                 opt = optimizers[i]
-                if isinstance(opt, Float16OptimizerWithFloat16Params):
+                if isinstance(opt, (Float16OptimizerWithFloat16Params, FP32Optimizer)):
                     raise TypeError(
-                        'LayerWiseDistributedOptimizer received Float16 optimizer already.'
+                        'LayerWiseDistributedOptimizer expects base torch optimizers, '
+                        f'got {type(opt).__name__}. Do not pre-wrap with Megatron optimizers.'
                     )
-                # unwrap FP32 optimizer from reusing get_megatron_optimizer for adam
-                if isinstance(opt, FP32Optimizer):
-                    opt = opt.optimizer
                 optimizers[i] = Float16OptimizerWithFloat16Params(
                     opt, config, None, init_state_fn_list[i] if init_state_fn_list else None
                 )
@@ -143,34 +152,83 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         if expt_dp_size == 1 or len(self.expt_dp_params_list[0]) == 0:
             self.expt_dp_params_list = None
 
+    def set_bucket_layerwise_params_list(self, model_chunks):
+        """Map sharded params to DDP buckets for async all-gather.
+
+        For each bucket in each model chunk's bucket groups, build per-rank param lists
+        by cross-referencing the layer-wise sharded param lists with the bucket's params.
+
+        Args:
+            model_chunks: DDP-wrapped model chunks with bucket_groups.
+        """
+        for model_chunk in model_chunks:
+            for group in model_chunk.bucket_groups:
+                for bucket in group.buckets:
+                    bucket_params_list = [[] for _ in range(get_pg_size(self.pg_collection.dp_cp))]
+                    for bucket_list, full_params_list in zip(
+                        bucket_params_list, self.dp_cp_params_list
+                    ):
+                        for param in full_params_list:
+                            if param in bucket.params:
+                                bucket_list.append(param)
+                    bucket.set_layerwise_params_list(bucket_params_list)
+            # Do the same for expert parallel bucket groups.
+            for group in model_chunk.expert_parallel_bucket_groups:
+                for bucket in group.buckets:
+                    if self.expt_dp_params_list is not None:
+                        bucket_params_list = [
+                            [] for _ in range(get_pg_size(self.pg_collection.expt_dp))
+                        ]
+                        for bucket_list, full_params_list in zip(
+                            bucket_params_list, self.expt_dp_params_list
+                        ):
+                            for param in full_params_list:
+                                if param in bucket.params:
+                                    bucket_list.append(param)
+                    else:
+                        # expt_dp_size == 1: single rank owns all params, no
+                        # all-gather needed but data structures must be initialized.
+                        bucket_params_list = [list(bucket.params_list)]
+                    bucket.set_layerwise_params_list(bucket_params_list)
+
     @torch.no_grad()
     def allgather_params(self) -> None:
         """All-gather updated params from all ranks."""
 
-        # helper function to flatten local params, allgather, unflatten and copy to model params
+        # helper function to flatten local params, all-gather,
+        # unflatten and copy to model params
         def _allgather_helper(params_list, group):
-            # flatten this rank's params and create empty tensor output list
             device = params_list[0][0].device
             dtype = params_list[0][0].dtype
             rank = get_pg_rank(group)
-            # for rank without params create empty tensor and participate in allgather
+            dp_size = get_pg_size(group)
+            # Flatten this rank's params.
             src = (
                 _flatten_dense_tensors(params_list[rank])
                 if len(params_list[rank]) > 0
                 else torch.empty(0, device=device, dtype=dtype)
             )
-            output_list = [
-                torch.empty(sum([p.numel() for p in params]), device=device, dtype=dtype)
-                for params in params_list
-            ]
-            # single all_gather_v to collect all updated params
-            torch.distributed.all_gather(output_list, src, group=group)
-            # unflatten and copy gathered params for each rank i
-            for idx, (flat_params, params) in enumerate(zip(output_list, params_list)):
-                # skip local params and empty tensors
+            flat_sizes = [sum(p.numel() for p in params) for params in params_list]
+            if max(flat_sizes) == 0:
+                return
+
+            # Allocate per-rank receive buffers with actual sizes (no padding).
+            # PyTorch's NCCL backend handles uneven sizes in all_gather via
+            # grouped send/recv internally. Reuse src for local rank's slot.
+            gather_list = []
+            for i in range(dp_size):
+                if i == rank:
+                    gather_list.append(src)
+                else:
+                    gather_list.append(torch.empty(flat_sizes[i], device=device, dtype=dtype))
+
+            torch.distributed.all_gather(gather_list, src, group=group)
+
+            # Unflatten and copy gathered params for each rank.
+            for idx, params in enumerate(params_list):
                 if len(params) == 0 or idx == rank:
                     continue
-                updated_params = _unflatten_dense_tensors(flat_params, params)
+                updated_params = _unflatten_dense_tensors(gather_list[idx], params)
                 for updated_p, model_p in zip(updated_params, params):
                     model_p.data.copy_(updated_p)
 
@@ -223,8 +281,10 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         """step function for layer-wise optimizer."""
         update_successful, grad_norm, num_zeros_in_grad = super().step()
 
-        # All gather updated params.
-        self.allgather_params()
+        # All gather updated params. If overlap_param_gather is True, the allgather
+        # is deferred to the forward pre-hooks via DDP bucket infrastructure.
+        if not self.overlap_param_gather:
+            self.allgather_params()
 
         return update_successful, grad_norm, num_zeros_in_grad
 

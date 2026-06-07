@@ -7,7 +7,6 @@ import json
 import logging
 import re
 import uuid
-from types import SimpleNamespace
 from typing import Any
 
 from megatron.core.tokenizers.text.parsers.base_parser import BaseParser
@@ -48,21 +47,20 @@ class _Qwen3CoderToolParser:
         if tools is None:
             return {}
         for config in tools:
-            config = SimpleNamespace(**config)  # Convert to SimpleNamespace for ease of access
-            if not hasattr(config, "type") or not (
-                hasattr(config, "function") and hasattr(config.function, "name")
-            ):
+            if not isinstance(config, dict):
                 continue
-            if config.type == "function" and config.function.name == func_name:
-                if not hasattr(config.function, "parameters"):
-                    return {}
-                params = config.function.parameters
-                if isinstance(params, dict) and "properties" in params:
-                    return params["properties"]
-                elif isinstance(params, dict):
-                    return params
-                else:
-                    return {}
+            fn = config.get("function", {})
+            if not isinstance(fn, dict):
+                continue
+            if config.get("type") != "function" or fn.get("name") != func_name:
+                continue
+            params = fn.get("parameters", {})
+            if isinstance(params, dict) and "properties" in params:
+                return params["properties"]
+            elif isinstance(params, dict):
+                return params
+            else:
+                return {}
         logger.debug("Tool '%s' is not defined in the tools list.", func_name)
         return {}
 
@@ -87,6 +85,9 @@ class _Qwen3CoderToolParser:
 
         if isinstance(param_config[param_name], dict) and "type" in param_config[param_name]:
             param_type = str(param_config[param_name]["type"]).strip().lower()
+        elif isinstance(param_config[param_name], dict) and "anyOf" in param_config[param_name]:
+            # anyOf has no top-level "type"; treat as object to trigger json.loads.
+            param_type = "object"
         else:
             param_type = "string"
         if param_type in ["string", "str", "text", "varchar", "char", "enum"]:
@@ -173,7 +174,9 @@ class _Qwen3CoderToolParser:
         self, function_call_str: str, tools: list[ChatCompletionToolsParam] | None
     ) -> ToolCall | None:
         # Extract function name
-        end_index = function_call_str.index(">")
+        end_index = function_call_str.find(">")
+        if end_index == -1:
+            return None
         function_name = function_call_str[:end_index]
         param_config = self._get_arguments_config(function_name, tools)
         parameters = function_call_str[end_index + 1 :]
@@ -236,6 +239,7 @@ class _Qwen3CoderToolParser:
                 self._parse_xml_function_call(function_call_str, tools)
                 for function_call_str in function_calls
             ]
+            tool_calls = [tc for tc in tool_calls if tc is not None]
 
             # Extract content before tool calls
             content_index = model_output.find(self.tool_call_start_token)

@@ -10,7 +10,7 @@ import torch
 
 from megatron.core.dist_checkpointing import ShardedTensor, load, save
 from megatron.core.dist_checkpointing.dict_utils import diff
-from megatron.core.dist_checkpointing.serialization import get_default_save_sharded_strategy
+from megatron.core.dist_checkpointing.strategies.torch import TorchDistSaveShardedStrategy
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
@@ -52,7 +52,7 @@ class TestCachedMetadata:
             with md_path.open('rb') as f:
                 md_non_cached = pickle.load(f)
 
-        save_strategy = deepcopy(get_default_save_sharded_strategy())
+        save_strategy = deepcopy(TorchDistSaveShardedStrategy())
         save_strategy.use_cached_ckpt_structure = True
         # Run over 3 iterations with cached metadata enabled
         # The 3rd iteration will run with cached metadata

@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import enum
 import glob
 import json
@@ -215,7 +216,9 @@ def pipeline(
                     ]
                     total_steps_evaluated = 1
                 else:
-                    total_steps_evaluated = golden_value.end_step / golden_value.step_interval + 1
+                    total_steps_evaluated = (
+                        golden_value.end_step - golden_value.start_step
+                    ) / golden_value.step_interval + 1
 
                     actual_value_list = [np.inf if type(v) is str else v for v in actual_value_list]
                     golden_value_list = [np.inf if type(v) is str else v for v in golden_value_list]
@@ -226,8 +229,16 @@ def pipeline(
                 # Tolerance check
                 is_close = np.isclose(actual, golden, rtol=test.rtol, atol=test.atol)
 
-                num_failing_steps_allowed = min(max(total_steps_evaluated // 100, 1), 50)
-                passing = np.mean(is_close) >= (num_failing_steps_allowed / total_steps_evaluated)
+                if (
+                    test.type_of_test_result == TypeOfTestResult.DETERMINISTIC
+                    or total_steps_evaluated == 1
+                ):
+                    passing = bool(np.all(is_close))
+                else:
+                    num_failing_steps_allowed = min(max(total_steps_evaluated // 100, 1), 50)
+                    passing = np.mean(is_close) >= 1 - (
+                        num_failing_steps_allowed / total_steps_evaluated
+                    )
 
                 if not passing:
                     logger.info(

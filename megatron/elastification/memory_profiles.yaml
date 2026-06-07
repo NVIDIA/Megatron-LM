@@ -1,0 +1,59 @@
+# memory_profiles.yaml
+#
+# Named memory quantization profiles for Flextron budget calculations.
+# Each preset specifies bytes-per-element (bpe) for each memory component
+# and whether the param budget loss targets total or active parameters.
+#
+# Select a preset via:  --memory-profile <name>
+# Override a single value via:  --bpe-kv-cache 1  (takes priority over preset)
+# Use a custom file via:  --memory-profile-path /path/to/file.yaml
+
+presets:
+
+  # ── Standard BF16 inference (current implementation) ──────────────────────
+  bf16:
+    params: 2           # BF16 weights
+    kv_cache: 2         # BF16 KV cache
+    ssm_cache: 2        # BF16 SSM state (conv + ssm)
+    max_buffer: 2       # BF16 MoE dispatch buffer
+    param_budget_target: active
+
+  # ── FP8 KV cache, BF16 weights (common serving optimisation) ──────────────
+  fp8_kv:
+    params: 2           # BF16 weights
+    kv_cache: 1         # FP8 KV cache
+    ssm_cache: 2        # BF16 SSM state
+    max_buffer: 2       # BF16 MoE dispatch buffer
+    param_budget_target: active
+
+  # ── FP8 KV + SSM cache ────────────────────────────────────────────────────
+  fp8_kv_ssm:
+    params: 2           # BF16 weights
+    kv_cache: 1         # FP8 KV cache
+    ssm_cache: 1        # FP8/INT8 SSM state
+    max_buffer: 2       # BF16 MoE dispatch buffer
+    param_budget_target: active
+
+  # ── Fully quantised FP8 inference ─────────────────────────────────────────
+  fp8_all:
+    params: 1           # FP8 weights
+    kv_cache: 1         # FP8 KV cache
+    ssm_cache: 1        # FP8 SSM state
+    max_buffer: 1       # FP8 MoE dispatch buffer
+    param_budget_target: active
+
+  # ── INT8 weights + INT8 caches ────────────────────────────────────────────
+  int8:
+    params: 1           # INT8 weights
+    kv_cache: 1         # INT8 KV cache
+    ssm_cache: 1        # INT8 SSM state
+    max_buffer: 2       # BF16 MoE dispatch buffer (activation, usually not quantised)
+    param_budget_target: active
+
+  # ── FP4 (speculative / future) ────────────────────────────────────────────
+  fp4:
+    params: 0.5625      # FP4 weights
+    kv_cache: 0.5625    # FP4 KV cache
+    ssm_cache: 1        # INT8 SSM state
+    max_buffer: 2       # BF16 MoE dispatch buffer
+    param_budget_target: active

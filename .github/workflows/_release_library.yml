@@ -53,12 +53,33 @@ on:
         description: Starting tag for changelog builder (leave empty for auto-detect)
         type: string
         default: ""
+      publish-docs:
+        required: false
+        description: Publish documentation to S3 after release
+        type: boolean
+        default: true
     secrets:
       TWINE_PASSWORD:
         required: true
       SLACK_WEBHOOK:
         required: true
       PAT:
+        required: true
+      AWS_ASSUME_ROLE_ARN:
+        required: true
+      AWS_ACCESS_KEY_ID:
+        required: true
+      AWS_SECRET_ACCESS_KEY:
+        required: true
+      AKAMAI_HOST:
+        required: true
+      AKAMAI_CLIENT_TOKEN:
+        required: true
+      AKAMAI_CLIENT_SECRET:
+        required: true
+      AKAMAI_ACCESS_TOKEN:
+        required: true
+      S3_BUCKET_NAME:
         required: true
 
 permissions:
@@ -89,7 +110,7 @@ jobs:
       IS_DRY_RUN: ${{ inputs.dry-run }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: ${{ github.run_id }}
           token: ${{ secrets.PAT }}
@@ -199,11 +220,8 @@ jobs:
           # Extract PR number from URL
           PR_NUMBER=$(echo $PR_URL | grep -o '[0-9]*$')
 
-          # Add comment to the newly created PR
-          echo gh pr comment $PR_NUMBER --body "/ok to test $(git rev-parse HEAD)"
-
       - name: Wait for status checks on tmp branch
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         id: wait-status
         with:
           github-token: ${{ secrets.PAT }}
@@ -326,7 +344,6 @@ jobs:
       ref: ${{ inputs.release-ref }}
       no-publish: false
     secrets:
-      TWINE_USERNAME: ${{ secrets.TWINE_USERNAME }}
       TWINE_PASSWORD: ${{ secrets.TWINE_PASSWORD }}
 
   create-gh-release:
@@ -344,10 +361,10 @@ jobs:
       REPOSITORY: ${{ github.repository }}
       PROJECT_NAME: Megatron Core
       VERSION: ${{ needs.bump-next-version.outputs.release-version }}
-      TAG_PREFIX: ${{ inputs.gh-release-tag-prefix || '' }}
+      TAG_PREFIX: core_
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           path: ${{ github.run_id }}
           ref: ${{ inputs.release-ref }}
@@ -455,6 +472,12 @@ jobs:
   publish-docs:
     needs: [bump-next-version, create-gh-release]
     uses: ./.github/workflows/release-docs.yml
+    if: |
+      (
+        success() || !failure()
+      )
+      && inputs.publish-docs == true
+      && !cancelled()
     with:
       dry-run: ${{ inputs.dry-run }}
       publish-as-latest: true
@@ -463,16 +486,11 @@ jobs:
     secrets: inherit
 
   notify:
-    needs: [build-test-publish-wheels, create-gh-release]
+    needs: [build-test-publish-wheels, create-gh-release, bump-next-version]
     runs-on: ubuntu-latest
-    env:
-      GH_URL: https://github.com/${{ github.repository }}/releases/tag/v${{ needs.build-test-publish-wheels.outputs.version }}
-      PYPI_URL: https://${{ inputs.dry-run == true && 'test.' || '' }}pypi.org/project/${{ needs.build-test-publish-wheels.outputs.pypi-name }}/${{ needs.build-test-publish-wheels.outputs.version }}/
-      PROJECT_NAME: Megatron Core
-      VERSION: ${{ needs.build-test-publish-wheels.outputs.version }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: NVIDIA-NeMo/FW-CI-templates
           ref: v0.17.0
@@ -482,10 +500,10 @@ jobs:
         uses: ./send-slack-alert/.github/actions/send-slack-alert
         env:
           MESSAGE: |
-            ${{ inputs.dry-run == true && 'This is a dry-run, nothing actually happened: ' || '' }}We have released `${{ env.VERSION }}` of `NVIDIA ${{ env.PROJECT_NAME }}` 🚀✨🎉
+            ${{ inputs.dry-run == true && 'This is a dry-run, nothing actually happened: ' || '' }}We have released `${{ needs.bump-next-version.outputs.release-version }}` of `NVIDIA Megatron Core` 🚀✨🎉
 
-            • <${{ env.GH_URL }}|GitHub release>
-            • <${{ env.PYPI_URL }}|PyPi release>
+            • <https://github.com/${{ github.repository }}/releases/tag/core_v${{ needs.bump-next-version.outputs.release-version }}|GitHub release>
+            • <https://${{ inputs.dry-run == true && 'test.' || '' }}pypi.org/project/megatron-core/${{ needs.bump-next-version.outputs.release-version }}/|PyPi release>
 
         with:
           message: ${{ env.MESSAGE }}

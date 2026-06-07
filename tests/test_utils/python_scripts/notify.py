@@ -1,3 +1,5 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import logging
 import os
 
@@ -93,6 +95,10 @@ def main(pipeline_id: int, check_for: str, pipeline_context: str, pipeline_creat
             )
 
     messages.append("===============================================")
+
+    if not WEBHOOK_URL:
+        logger.info("No webhook URL configured, skipping Slack notification")
+        return
 
     for message in messages:
         response = slack_sdk.webhook.WebhookClient(WEBHOOK_URL).send(text=message)

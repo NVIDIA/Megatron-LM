@@ -68,8 +68,8 @@ MODEL_OPTIONS="\
     --first-last-layers-bf16 \
     \
     --fp8-recipe tensorwise \
-    --hybrid-override-pattern M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M- \
-    --spec megatron.core.models.mamba.mamba_layer_specs mamba_stack_spec \
+    --hybrid-layer-pattern M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M- \
+    --spec megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec \
     --mamba-state-dim 256 \
     --per-split-data-args-path ${BLEND_PATH} \
     --tiktoken-pattern v2 \
@@ -82,7 +82,6 @@ MODEL_OPTIONS="\
     --init-method-std 0.0099 \
     --position-embedding-type none \
     --squared-relu \
-    --num-layers 118 \
     --hidden-size 8192 \
     --num-attention-heads 64 \
     --group-query-attention \

@@ -66,6 +66,16 @@ functional:configure:
         RELEASE_ARGS=()
       fi
     - |
+      # NOTE: $FUNCTIONAL_TEST_SCOPE is supplied by external scheduled-pipeline
+      # configurations and uses the GitLab-side legacy values: `mr`, `mr-slim`,
+      # `nightly`, `weekly`, `unit-tests`, `release`.
+      #   - `mr` / `mr-slim` / `unit-tests` / `release` pass through verbatim
+      #     and match recipe rows tagged with the same string. They are
+      #     intentionally NOT aliased (see LEGACY_SCOPE_ALIASES in
+      #     tests/test_utils/python_scripts/recipe_parser.py) so the GitLab
+      #     and GitHub matrices stay decoupled.
+      #   - `nightly` / `weekly` are aliased to L2 / L3 by the parser and also
+      #     inject a default cadence when the recipe has no explicit one.
       ARGS=(
         "--scope $FUNCTIONAL_TEST_SCOPE"
         "--n-repeat $FUNCTIONAL_TEST_REPEAT"

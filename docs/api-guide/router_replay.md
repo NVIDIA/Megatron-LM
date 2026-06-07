@@ -9,19 +9,19 @@
 
 # Design Document: MoE Router Replay Feature
 
-### 1. Overview
+## 1. Overview
 
 This document provides a detailed description of the "Router Replay" feature implemented within the Megatron-LM Core for Mixture-of-Experts (MoE) models.
 
 This feature is designed to enhance determinism and analyzability in MoE model training and inference. It enables the model to load routing decisions from a predefined file and enforce their use during the forward pass, thereby bypassing the real-time routing computation.
 
-### 2. Motivation
+## 2. Motivation
 
 *   **Determinism & Reproducibility**: In distributed training, MoE routing decisions can exhibit minor variations due to factors like floating-point precision. By replaying a fixed routing table, the MoE computation path is guaranteed to be identical across runs, which facilitates debugging and reproducing experimental results.
 *   **Performance Profiling**: The router's own computation (e.g., logits calculation, top-k selection) incurs overhead. In replay mode, this part of the computation can be completely skipped, allowing for more precise isolation and profiling of performance bottlenecks within the Expert Layers themselves.
 *   **Debugging Aid**: When issues arise in the model, fixing the routing decisions helps to isolate variables, making it easier to determine whether the problem lies with the routing mechanism or the expert computations.
 
-### 3. Design and Architecture
+## 3. Design and Architecture
 
 The design follows the principles of being non-intrusive and on-demand, with the core idea of activating the replay logic only when explicitly requested by the user.
 
@@ -44,7 +44,7 @@ The design follows the principles of being non-intrusive and on-demand, with the
             *   For each micro-batch (processed in reverse order in pipeline parallelism), the `router_replay_action` is checked again.
             *   **In `backward_replay` mode**: The function retrieves the expert indices for the corresponding micro-batch by popping them from the `replay_backward_list`. This mode is intended for training recomputation (e.g., activation checkpointing and pipeline recompute) so the same routing decisions are used during recompute/backward as in forward, ensuring determinism and correctness.
 
-### 4. Implementation Details
+## 4. Implementation Details
 
 The implementation cleanly separates the replay logic from the router's core computation.
 
@@ -60,11 +60,12 @@ The implementation cleanly separates the replay logic from the router's core com
         *   `record_indices()`: A method to save the computed indices.
     *   The `topk_routing_with_score_function` is modified to contain the core logic. It checks the `router_replay_action` on the `router_replay` instance and accordingly performs one of the following actions: computes and records indices, replays indices from `target_topk_idx` (for forward), replays indices from `replay_backward_list` (for backward), or falls through to the default dynamic routing.
 
-#### Training recompute usage
+### Training recompute usage
+
 - During forward replay, `set_target_indices()` prepares `replay_backward_list` so each micro-batch’s indices are available for recomputation.
 - During recompute/backward, set action to `REPLAY_BACKWARD` so indices are consumed in FIFO order to mirror the forward sequence.
 
-### 5. Usage Guide
+## 5. Usage Guide
 
 1.  **Enable & Instantiate**
     - Create one `RouterReplay` instance per MoE router layer when building the model.
@@ -82,7 +83,7 @@ The implementation cleanly separates the replay logic from the router's core com
 5.  **Cleanup**
     - Use `RouterReplay.clear_global_indices()`, `RouterReplay.clear_global_router_replay_action()`, and `RouterReplay.clear_global_router_replay_instances()` to restore default behavior and prevent memory leaks.
 
-#### Quick usage with `topk_routing_with_score_function`
+### Quick usage with `topk_routing_with_score_function`
 
 ```python
 import torch
@@ -114,7 +115,7 @@ RouterReplay.clear_global_indices()
 RouterReplay.clear_global_router_replay_instances()
 ```
 
-### 6. Minimal Demo
+## 6. Minimal Demo
 
 Here is a minimal code example showing how to use RouterReplay for recording and replaying:
 

@@ -2,6 +2,7 @@
 
 """Full iteration CUDA graph for training."""
 
+import gc
 import logging
 
 import torch
@@ -9,6 +10,47 @@ import torch
 from megatron.core.tensor_parallel.random import get_all_rng_states
 
 logger = logging.getLogger(__name__)
+
+# Process-wide handle so full-iter and optimizer graph captures share one pool and one
+# non-default stream (per-stream alloc segments can inflate memory_reserved; see
+# tools/debug_cuda_graph_pool_memory*.py).
+_shared_graph_pool = None
+_shared_capture_stream = None
+
+
+def get_shared_capture_stream():
+    """Return one `torch.cuda.Stream` for all full-iter and optimizer graph captures.
+
+    Call after the target CUDA device is selected.
+    """
+    global _shared_capture_stream
+    if _shared_capture_stream is None:
+        _shared_capture_stream = torch.cuda.Stream()
+    return _shared_capture_stream
+
+
+def get_shared_graph_pool():
+    """Return a process-wide handle so all call sites share one graph memory pool.
+
+    `torch.cuda.graph_pool_handle()` returns a new pool each time; this lazy singleton
+    ensures e.g. full-iteration and optimizer captures reuse the same pool.
+    """
+    global _shared_graph_pool
+    if _shared_graph_pool is None:
+        _shared_graph_pool = torch.cuda.graph_pool_handle()
+    return _shared_graph_pool
+
+
+def get_graph_pool(use_single_mempool):
+    """Return graph pool handle for full-iter/optimizer graph capture.
+
+    When `use_single_mempool` is True, train/eval and optimizer captures reuse one
+    process-wide pool. Otherwise, each capture call gets a new pool handle.
+    """
+    if use_single_mempool:
+        return get_shared_graph_pool()
+    return torch.cuda.graph_pool_handle()
+
 
 # The below functions traverse through nested data structures (tuples, lists, dicts)
 # present in src and creates a deep copy where all PyTorch tensors are cloned,
@@ -70,6 +112,7 @@ class StaticBufferLoader:
 
         assert isinstance(inputs, dict)
         if microbatch == len(StaticBufferLoader.static_buffers[stage]):
+            self.stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self.stream):
                 StaticBufferLoader.static_buffers[stage].append(copy_tensors_in_struct(inputs))
         else:
@@ -83,6 +126,7 @@ class StaticBufferLoader:
                     else:
                         StaticBufferLoader.static_buffers[stage][microbatch][k] = inputs[k]
 
+            self.stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(self.stream):
                 clone_tensors_in_struct(
                     StaticBufferLoader.static_buffers[stage][microbatch], inputs
@@ -98,10 +142,11 @@ class FullCudaGraphWrapper:
     cuda_graph = {'training': None, 'validation': None}
     result = {'training': None, 'validation': None}
 
-    def __init__(self, forward_backward_func, cuda_graph_warmup_steps=1):
+    def __init__(self, forward_backward_func, cuda_graph_warmup_steps=1, use_single_mempool=False):
         self.forward_backward_func = forward_backward_func
         self.static_loader = StaticBufferLoader()
         self.cuda_graph_warmup_steps = cuda_graph_warmup_steps
+        self.use_single_mempool = use_single_mempool
 
     def data_read(self, data_iterator, model, training, num_microbatches):
         """Read all microbatch inputs from Dataloader and copy to static buffers."""
@@ -168,10 +213,11 @@ class FullCudaGraphWrapper:
             for _, state in get_all_rng_states().items():
                 FullCudaGraphWrapper.cuda_graph[training_str].register_generator_state(state)
             torch.cuda.synchronize()
-            capture_stream = torch.cuda.Stream()
+            capture_stream = get_shared_capture_stream()
             with torch.cuda.graph(
                 FullCudaGraphWrapper.cuda_graph[training_str],
                 stream=capture_stream,
+                pool=get_graph_pool(self.use_single_mempool),
                 capture_error_mode="thread_local",
             ):
                 FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(
@@ -180,12 +226,10 @@ class FullCudaGraphWrapper:
             torch.cuda.synchronize()
             torch.distributed.barrier()
             logger.info(f'CUDA graph capture done for {training_str}!!!')
-
         if FullCudaGraphWrapper.cuda_graph[training_str] is None:
             FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(*args, **kwargs)
         else:
             FullCudaGraphWrapper.cuda_graph[training_str].replay()
-
         self.next_iter(training_str)
         return FullCudaGraphWrapper.result[training_str]
 
@@ -196,3 +240,19 @@ class FullCudaGraphWrapper:
     def next_iter(self, stage):
         """Increment current training/validation iteration."""
         FullCudaGraphWrapper.curr_iteration[stage] += 1
+
+    def reset_cuda_graph(self, stage=None):
+        """Reset CUDA graph."""
+        if stage is None or stage == 'training':
+            if FullCudaGraphWrapper.cuda_graph['training'] is not None:
+                del FullCudaGraphWrapper.cuda_graph['training']
+                FullCudaGraphWrapper.cuda_graph['training'] = None
+            FullCudaGraphWrapper.result['training'] = None
+            FullCudaGraphWrapper.curr_iteration['training'] = 0
+        if stage is None or stage == 'validation':
+            if FullCudaGraphWrapper.cuda_graph['validation'] is not None:
+                del FullCudaGraphWrapper.cuda_graph['validation']
+                FullCudaGraphWrapper.cuda_graph['validation'] = None
+            FullCudaGraphWrapper.result['validation'] = None
+            FullCudaGraphWrapper.curr_iteration['validation'] = 0
+        gc.collect()

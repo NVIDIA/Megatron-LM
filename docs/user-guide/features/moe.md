@@ -15,6 +15,7 @@
 
 multi_token_prediction
 multi_latent_attention
+../../api-guide/router_replay
 ```
 
 ```{include} ../../../megatron/core/transformer/moe/README.md
