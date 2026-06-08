@@ -314,17 +314,6 @@ class TestHyperCommGrid:
     # register_view validation (mock-based unit tests)
     # ------------------------------------------------------------------
 
-    def test_register_view_stores_rank_view(self):
-        """Test register_view stores metadata without returning a PG-owning object."""
-        grid = HyperCommGrid([2, 2, 2], ["tp", "cp", "dp"])
-
-        result = grid.register_view("expert", [4, 2], ["ep", "expt_dp"])
-
-        assert result is None
-        assert grid._views["expert"].name == "expert"
-        assert grid._views["expert"].shape == [4, 2]
-        assert grid._views["expert"].dim_names == ["ep", "expt_dp"]
-
     def test_unknown_view_error(self):
         """Test view-scoped APIs raise clearly for an unregistered view."""
         grid = HyperCommGrid([2, 2, 2], ["tp", "cp", "dp"])
@@ -388,15 +377,17 @@ class TestHyperCommGrid:
                 "expert", [2, 2, 2], ["expt_tp", "ep", "pp"], shared_dims=["pp", "pp"]
             )
 
-    def test_register_view_success_copies_lists(self):
-        """Test a valid view is registered and stored with copied data."""
+    def test_register_view_success_stores_copied_metadata(self):
+        """Test a valid view is registered, returns None, and is stored with copied data."""
         grid = HyperCommGrid([2, 2, 2], ["tp", "cp", "dp"])
 
         shape = [4, 2]
         dim_names = ["ep", "expt_dp"]
-        grid.register_view("expert", shape, dim_names)
+        result = grid.register_view("expert", shape, dim_names)
         view = grid._views["expert"]
 
+        assert result is None
+        assert view.name == "expert"
         # Stored view must be a copy, not an alias of the caller's lists.
         assert view.shape == shape and view.shape is not shape
         assert view.dim_names == dim_names and view.dim_names is not dim_names
