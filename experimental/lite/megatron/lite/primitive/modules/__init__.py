@@ -18,7 +18,10 @@ _EXPORTS = {
     "TokenDispatcher": ("megatron.lite.primitive.modules.dispatcher", "TokenDispatcher"),
     "TopKRouter": ("megatron.lite.primitive.modules.router", "TopKRouter"),
     "_AllToAll": ("megatron.lite.primitive.modules.moe", "_AllToAll"),
-    "split_grouped_qkvg": ("megatron.lite.primitive.modules.gqa", "split_grouped_qkvg"),
+    "split_grouped_qkvg": (
+        "megatron.lite.primitive.modules.gqa_utils",
+        "split_grouped_qkvg",
+    ),
 }
 
 

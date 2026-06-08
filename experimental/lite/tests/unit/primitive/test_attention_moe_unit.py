@@ -10,21 +10,23 @@ pytestmark = pytest.mark.mlite
 
 
 def _split_grouped_qkvg():
-    pytest.importorskip("transformer_engine.pytorch")
-    from megatron.lite.primitive.modules.gqa import split_grouped_qkvg
+    from megatron.lite.primitive.modules import split_grouped_qkvg
 
     return split_grouped_qkvg
 
 
 def _moe_aux_scaler():
-    pytest.importorskip("transformer_engine.pytorch")
     from megatron.lite.primitive.modules.moe import MoEAuxLossAutoScaler
 
     return MoEAuxLossAutoScaler
 
 
-def _router_and_parallel_state():
-    pytest.importorskip("transformer_engine.pytorch")
+def _router_and_parallel_state(monkeypatch):
+    from megatron.core.transformer.moe import moe_utils
+
+    if not hasattr(moe_utils, "te_general_gemm"):
+        monkeypatch.setattr(moe_utils, "te_general_gemm", None, raising=False)
+
     from megatron.lite.primitive.modules.router import TopKRouter
     from megatron.lite.primitive.parallel import ParallelState
 
@@ -93,8 +95,8 @@ def test_moe_aux_loss_auto_scaler_threads_scaled_aux_gradient():
     MoEAuxLossAutoScaler.main_loss_backward_scale = None
 
 
-def test_topk_router_returns_finite_scores_and_valid_expert_indices():
-    TopKRouter, ParallelState = _router_and_parallel_state()
+def test_topk_router_returns_finite_scores_and_valid_expert_indices(monkeypatch):
+    TopKRouter, ParallelState = _router_and_parallel_state(monkeypatch)
     config = _router_config()
     router = TopKRouter(config, ParallelState(), compute_aux_loss=False)
     hidden = torch.randn(5, 4)
@@ -109,8 +111,8 @@ def test_topk_router_returns_finite_scores_and_valid_expert_indices():
     assert indices.max().item() < config.num_experts
 
 
-def test_topk_router_scores_are_normalized_and_deterministic_in_eval():
-    TopKRouter, ParallelState = _router_and_parallel_state()
+def test_topk_router_scores_are_normalized_and_deterministic_in_eval(monkeypatch):
+    TopKRouter, ParallelState = _router_and_parallel_state(monkeypatch)
     config = _router_config()
     router = TopKRouter(config, ParallelState(), compute_aux_loss=False)
     hidden = torch.randn(5, config.hidden_size)
@@ -124,8 +126,8 @@ def test_topk_router_scores_are_normalized_and_deterministic_in_eval():
     assert torch.equal(indices_1, indices_2)
 
 
-def test_topk_router_does_not_attach_aux_scaler_in_eval():
-    TopKRouter, ParallelState = _router_and_parallel_state()
+def test_topk_router_does_not_attach_aux_scaler_in_eval(monkeypatch):
+    TopKRouter, ParallelState = _router_and_parallel_state(monkeypatch)
     config = _router_config()
     router = TopKRouter(config, ParallelState(), compute_aux_loss=True)
     hidden = torch.randn(5, config.hidden_size)
@@ -136,8 +138,8 @@ def test_topk_router_does_not_attach_aux_scaler_in_eval():
     assert not any("MoEAuxLoss" in name for name in _walk_grad_fn_names(scores))
 
 
-def test_topk_router_aux_loss_contributes_gate_gradient():
-    TopKRouter, ParallelState = _router_and_parallel_state()
+def test_topk_router_aux_loss_contributes_gate_gradient(monkeypatch):
+    TopKRouter, ParallelState = _router_and_parallel_state(monkeypatch)
     config = _router_config()
     router = TopKRouter(config, ParallelState(), compute_aux_loss=True)
     hidden = torch.randn(8, config.hidden_size)

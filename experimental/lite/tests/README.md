@@ -2,7 +2,7 @@
 
 `experimental/lite/tests` separates MLite validation into two layers:
 
-- Unit tests: CPU/single-process contract tests for primitive, model, runtime, checkpoint sentinels, config, and helper behavior. Tests that need optional packages such as Transformer Engine explicitly skip when unavailable.
+- Unit tests: CPU/single-process contract tests for primitive, model, runtime, checkpoint sentinels, config, and helper behavior. Pure helper tests stub optional imports when no Transformer Engine runtime path is exercised; tests that need the real package explicitly skip when unavailable.
 - Smoke tests: real `torch.distributed` tests for TP/EP/PP/CP/FSDP2/offload/checkpoint/distopt and tiny Qwen lite forward/backward behavior. Smoke runs are capped at one node and at most 8 GPUs.
 
 Run unit coverage:

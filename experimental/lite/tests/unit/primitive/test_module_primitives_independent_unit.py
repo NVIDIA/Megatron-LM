@@ -113,8 +113,8 @@ def test_mrope_interleaves_text_height_and_width_sections():
     torch.testing.assert_close(interleaved, expected)
 
 
-def test_mtp_aux_loss_scaler_threads_independent_gradient():
-    pytest.importorskip("transformer_engine.pytorch")
+def test_mtp_aux_loss_scaler_threads_independent_gradient(transformer_engine_import_stub):
+    transformer_engine_import_stub()
     from megatron.lite.primitive.modules.mtp import MTPLossAutoScaler
 
     MTPLossAutoScaler.set_loss_scale(torch.tensor(0.125))
@@ -128,8 +128,8 @@ def test_mtp_aux_loss_scaler_threads_independent_gradient():
     MTPLossAutoScaler.main_loss_backward_scale = 1.0
 
 
-def test_gated_delta_static_helpers_are_finite_and_shape_stable():
-    pytest.importorskip("transformer_engine.pytorch")
+def test_gated_delta_static_helpers_are_finite_and_shape_stable(transformer_engine_import_stub):
+    transformer_engine_import_stub()
     from megatron.lite.primitive.modules.gated_delta_net import GatedDeltaNet
 
     alpha = torch.tensor([[[0.0, 1.0], [-1.0, 2.0]]])

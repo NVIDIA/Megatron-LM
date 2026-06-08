@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from megatron.lite.primitive.parallel.cp import split_packed_for_cp
+from megatron.lite.primitive.parallel.pipeline import _num_microbatches_from_config
 from megatron.lite.primitive.parallel.pp import build_pipeline_chunk_layout
 from megatron.lite.primitive.parallel.sp import (
     gather_for_non_sp_head,
@@ -16,8 +19,8 @@ from megatron.lite.primitive.parallel.state import ParallelState
 pytestmark = pytest.mark.mlite
 
 
-def test_tp_vocab_embedding_and_output_single_rank_contract():
-    pytest.importorskip("transformer_engine.pytorch")
+def test_tp_vocab_embedding_and_output_single_rank_contract(transformer_engine_import_stub):
+    transformer_engine_import_stub()
     from megatron.lite.primitive.parallel.linear import (
         VocabParallelEmbedding,
         VocabParallelOutput,
@@ -100,8 +103,20 @@ def test_pp_layout_rejects_non_divisible_layer_counts():
         build_pipeline_chunk_layout(7, ps)
 
 
+def test_dp_dimension_controls_dense_microbatch_contract():
+    ps = ParallelState(dp_size=4, dp_rank=2, dp_cp_size=8, dp_cp_rank=5)
+    config = SimpleNamespace(gbs=32, mbs=2, num_microbatches=None)
+
+    assert _num_microbatches_from_config(config, ps) == 4
+
+    config.num_microbatches = 7
+    assert _num_microbatches_from_config(config, ps) == 7
+    assert ps.dp_rank == 2
+    assert ps.dp_cp_size == 8
+    assert ps.dp_cp_rank == 5
+
+
 def test_ep_token_dispatcher_local_roundtrip_is_independent_of_deepep():
-    pytest.importorskip("transformer_engine.pytorch")
     from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 
     ps = ParallelState(ep_size=1, ep_rank=0)
