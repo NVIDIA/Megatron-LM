@@ -140,6 +140,11 @@ def load(
     strict = parse_strict_flag(strict)
     if StrictHandling.requires_explicit_ckpt_mismatch_check(strict):
         ckpt_sharded_metadata = load_sharded_metadata(str(checkpoint_dir), sharded_strategy)
+        # common_state is an internal format key loaded separately by load_common_state_dict();
+        # exclude it so it doesn't surface as a spurious missing key during strict validation.
+        ckpt_sharded_metadata = {
+            k: v for k, v in ckpt_sharded_metadata.items() if v.key != 'common_state'
+        }
     if validate_access_integrity or StrictHandling.requires_global_app_metadata(strict):
         local_metadata, global_metadata = determine_global_metadata(sharded_state_dict)
 
