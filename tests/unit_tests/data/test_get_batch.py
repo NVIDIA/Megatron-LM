@@ -66,11 +66,14 @@ def initialize_test_environment(
 
 
 def create_sft_data_iterator(max_seq_length: int = 1024):
-    """Create a mock SFT data iterator matching the old SFTDataset output after DataLoader collation.
+    """Create a mock SFT data iterator matching the new SFTDataset output after DataLoader collation.
 
-    The old SFTDataset (megatron/training/datasets/sft_dataset.py) returns per-sample dicts with
-    keys: tokens, labels, loss_mask, position_ids, cu_seqlens, max_seqlen — all padded to
-    seq_length.  After PyTorch DataLoader default_collate, tensors get a leading batch dim of 1.
+    The new SFTDataset (megatron/core/datasets/sft_dataset.py) returns per-sample dicts with
+    keys: tokens, labels, loss_mask, cu_seqlens — un-padded (length == sum of segment lengths,
+    cu_seqlens last entry == total real tokens). After PyTorch DataLoader default_collate, the
+    tensors get a leading batch dim of 1. ``preprocess_sft_batch`` (invoked inside get_batch)
+    is then responsible for padding to ``max_seq_length``, computing position_ids, and
+    appending the padding segment to cu_seqlens.
     """
     min_len = max(1, int(0.1 * max_seq_length))
     max_len = max(2, int(0.4 * max_seq_length))
@@ -92,58 +95,25 @@ def create_sft_data_iterator(max_seq_length: int = 1024):
     # Generate packed token sequence (num_real_tokens + 1 for labels shift)
     text = torch.randint(0, 10000, (num_real_tokens + 1,), dtype=torch.int64)
 
-    # Pad to max_seq_length (mimics old SFTDataset padding)
-    pad_len = max_seq_length - num_real_tokens
-    pad_token = 0
+    tokens = text[:-1].contiguous()
+    labels = text[1:].contiguous()
+    loss_mask = torch.ones(num_real_tokens, dtype=torch.float32)
 
-    tokens = torch.cat([text[:-1], torch.full((pad_len,), pad_token, dtype=torch.int64)])
-    labels = torch.cat([text[1:], torch.full((pad_len,), pad_token, dtype=torch.int64)])
-
-    # Position IDs: per-segment positions, then padding positions
-    position_ids = torch.cat([torch.arange(l, dtype=torch.int64) for l in lengths])
-    position_ids = torch.cat(
-        [
-            position_ids,
-            torch.arange(
-                position_ids[-1].item() + 1,
-                position_ids[-1].item() + 1 + pad_len,
-                dtype=torch.int64,
-            ),
-        ]
-    )
-
-    # Loss mask: 1 for real tokens, 0 for padding
-    loss_mask = torch.cat(
-        [
-            torch.ones(num_real_tokens, dtype=torch.float32),
-            torch.zeros(pad_len, dtype=torch.float32),
-        ]
-    )
-
-    # cu_seqlens: cumulative lengths ending at max_seq_length (last entry = seq_length after padding)
+    # cu_seqlens ends at total real tokens — preprocess_sft_batch appends the padding
+    # segment when it pads/truncates to max_seq_length.
     cu_seqlens = torch.cat(
         (
             torch.zeros(1, dtype=torch.int32),
             torch.cumsum(torch.tensor(lengths, dtype=torch.int64), dim=0).to(torch.int32),
         )
     )
-    cu_seqlens[-1] = max_seq_length  # last entry is padded to seq_length
-
-    # max_seqlen: max segment length
-    seg_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-    max_seqlen = torch.tensor([seg_lengths.max().item()], dtype=torch.int32)
 
     # Add batch dimension to all per-sample tensors to mimic DataLoader default_collate.
-    # The dataset emits cu_seqlens as 1-D (S+1,) and max_seqlen as 0-D; default_collate
-    # stacks them with a leading batch dim of 1. get_batch_on_this_tp_rank's sender is
-    # responsible for squeezing the batch dim of cu_seqlens before broadcast.
     batch = {
         "tokens": tokens.unsqueeze(0),
         "labels": labels.unsqueeze(0),
         "loss_mask": loss_mask.unsqueeze(0),
-        "position_ids": position_ids.unsqueeze(0),
         "cu_seqlens": cu_seqlens.unsqueeze(0),
-        "max_seqlen": max_seqlen,
     }
     return iter([batch]), num_real_tokens
 
@@ -202,7 +172,15 @@ def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
         assert attention_mask is None
         assert hybrid_cp_group is None
         assert local_cp_size is None
-        assert cu_seqlens_padded is None
+        if cp_size > 1:
+            assert cu_seqlens_padded is not None
+            assert cu_seqlens_padded.dim() == 2
+            assert cu_seqlens_padded.shape[0] == 1
+            assert cu_seqlens_padded.dtype == torch.int32
+            assert cu_seqlens_padded[0, 0].item() == 0
+            assert cu_seqlens_padded[0, -1].item() == seq_length
+        else:
+            assert cu_seqlens_padded is None
 
         assert tokens.shape == (
             1,
@@ -250,7 +228,15 @@ def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
         assert attention_mask is None
         assert hybrid_cp_group is None
         assert local_cp_size is None
-        assert cu_seqlens_padded is None
+        if cp_size > 1:
+            assert cu_seqlens_padded is not None
+            assert cu_seqlens_padded.dim() == 2
+            assert cu_seqlens_padded.shape[0] == 1
+            assert cu_seqlens_padded.dtype == torch.int32
+            assert cu_seqlens_padded[0, 0].item() == 0
+            assert cu_seqlens_padded[0, -1].item() == seq_length
+        else:
+            assert cu_seqlens_padded is None
 
         assert tokens.shape == (
             1,
@@ -286,7 +272,15 @@ def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
         assert attention_mask is None
         assert hybrid_cp_group is None
         assert local_cp_size is None
-        assert cu_seqlens_padded is None
+        if cp_size > 1:
+            assert cu_seqlens_padded is not None
+            assert cu_seqlens_padded.dim() == 2
+            assert cu_seqlens_padded.shape[0] == 1
+            assert cu_seqlens_padded.dtype == torch.int32
+            assert cu_seqlens_padded[0, 0].item() == 0
+            assert cu_seqlens_padded[0, -1].item() == seq_length
+        else:
+            assert cu_seqlens_padded is None
 
         assert labels.shape == (
             1,
@@ -325,7 +319,15 @@ def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
 
         assert cu_seqlens is not None
         assert max_seqlen is not None
-        assert cu_seqlens_padded is None
+        if cp_size > 1:
+            assert cu_seqlens_padded is not None
+            assert cu_seqlens_padded.dim() == 2
+            assert cu_seqlens_padded.shape[0] == 1
+            assert cu_seqlens_padded.dtype == torch.int32
+            assert cu_seqlens_padded[0, 0].item() == 0
+            assert cu_seqlens_padded[0, -1].item() == seq_length
+        else:
+            assert cu_seqlens_padded is None
 
         assert cu_seqlens.dim() == 2
         assert cu_seqlens.shape[0] == 1
@@ -428,6 +430,7 @@ def test_pretrain_batch(
         assert loss_mask is not None
         assert position_ids is not None
         assert cu_seqlens is None
+
         assert cu_seqlens_padded is None
         assert max_seqlen is None
         assert hybrid_cp_group is None
@@ -719,7 +722,15 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
         assert cu_seqlens_padded[0, -1].item() == total_seq_len
         assert hybrid_cp_group is not None
     else:
-        assert cu_seqlens_padded is None
+        if cp_size > 1:
+            assert cu_seqlens_padded is not None
+            assert cu_seqlens_padded.dim() == 2
+            assert cu_seqlens_padded.shape[0] == 1
+            assert cu_seqlens_padded.dtype == torch.int32
+            assert cu_seqlens_padded[0, 0].item() == 0
+            assert cu_seqlens_padded[0, -1].item() == seq_length
+        else:
+            assert cu_seqlens_padded is None
         assert hybrid_cp_group is None
 
     Utils.destroy_model_parallel()
