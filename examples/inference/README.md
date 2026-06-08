@@ -114,7 +114,8 @@ still target these scripts.
 ```bash
 --moe-routing-trace-path /path/to/trace_dir   # enable tracing
 --moe-routing-trace-max-iters 500             # optional: stop after N iters
---moe-routing-trace-capture-hidden-states     # required for load-balance distribution predictability
+--moe-routing-trace-capture-hidden-states     # required for distribution predictability
+--moe-routing-trace-dump-weights              # required for distribution predictability
 ```
 
 **During inference**, add these flags (e.g. to
@@ -124,71 +125,40 @@ still target these scripts.
 --moe-routing-trace-path /path/to/trace_dir
 --moe-routing-trace-max-steps 200
 --moe-routing-trace-capture-hidden-states
+--moe-routing-trace-dump-weights
 ```
 
 Both write `router_trace_rank{N}.jsonl` into the specified directory (one file per rank).
-`--moe-routing-trace-capture-hidden-states` also writes `hidden_states_rank{N}.bin`, which is
-required by `analyze_routing_load_balance.py` for the distribution-predictability analysis.
+`--moe-routing-trace-capture-hidden-states` also writes `hidden_states_rank{N}.bin` and
+`--moe-routing-trace-dump-weights` writes `router_state_rank{N}.pt`; both are required by
+`analyze_routing_predictability.py`.
 
 #### Running analyses
 
 ```bash
-python tools/moe_routing/analyze_routing.py /path/to/trace_dir \
-    --ep-size 8 --num-experts 512
+python tools/moe_routing/analyze_routing.py /path/to/trace_dir --num-experts 512
 ```
 
 The dispatcher runs these analyses in order:
 
-| Script | Primary question | Role                                                                                                                         |
-|--------|-----------------|------------------------------------------------------------------------------------------------------------------------------|
-| `tools/moe_routing/analyze_routing_concentration.py` | How concentrated is routing? (hot-set size) | Hypothesis test: is per-layer static caching viable? High concentration (ratio > 2x) supports it; near-uniform rules it out. |
-| `tools/moe_routing/analyze_routing_load_balance.py` | Can one-layer-ahead hidden-state prediction close the EP load-imbalance gap? | High cosine/Spearman in the distribution predictability block suggests that there is predictive signal                       |
+| Script | Primary question | Role |
+|--------|-----------------|------|
+| `tools/moe_routing/analyze_routing_concentration.py` | How concentrated is routing? (hot-set size) | Hypothesis test: is per-layer static caching viable? High concentration (ratio > 2×) supports it; near-uniform rules it out. |
+| `tools/moe_routing/analyze_routing_predictability.py` | How well do L_prev's hidden states predict L's routing distribution? | Affirmative signal: high cosine/Spearman means distributional routing is predictable one layer ahead. |
 
-#### Interpreting the load-balance simulation output
+#### Interpreting the distribution predictability output
 
-`analyze_routing_load_balance.py` is used for what-if analysis for load balancing.  
+`analyze_routing_predictability.py` applies layer L's router weights to the hidden states
+from L_prev and compares the resulting predicted per-expert token-count distribution to
+what L actually routed.  The `cos` and `spearman` columns measure that agreement:
 
-**Distribution predictability**: applies layer L's router weights to the hidden states from
-layer L_prev and compares the resulting predicted expert-load distribution to what L actually
-routed.  The `cos` and `spearman` columns measure that agreement:
+- `cos` ≥ 0.90 and `spearman` ≥ 0.70: the hidden-state signal from the previous MoE layer
+  is sufficient to predict the aggregate expert load distribution of the next layer with high
+  fidelity.
+- Values near zero: weak cross-layer signal for this layer pair.
 
-- `cos` ≥ 0.90 and `spearman` ≥ 0.70 (most layer pairs in a well-trained model): the
-  hidden-state signal from the previous MoE layer is sufficient to predict the aggregate load
-  distribution of the next layer with high fidelity.  This is the affirmative result that
-  motivates a predictor-based prefetch or placement policy.
-- Values near zero: this layer pair has weak cross-layer signal; a learned predictor operating
-  on hidden states is unlikely to help here.
-
-Note: `hot-K overlap` is always 1.0 when the pool of experts is small relative to K.
-
-**Load-imbalance simulation**: simulates whether re-placing experts based on predicted counts
-(using distribution predictability) would reduce the max-GPU / mean-GPU load ratio vs. a
-static round-robin baseline.
-
-- `baseline`: observed imbalance under the current static placement.
-- `oracle`: lower bound assuming perfect foreknowledge of the actual counts.
-- `predicted`: simulated imbalance using the L_prev predictor.
-- `recovery`: fraction of the gap `(baseline − predicted) / (baseline − oracle)` that the
-  predictor closes.
-
-**Critical: always pass `--ep-size` matching actual deployment.**  At EP=1 every metric
-collapses to 1.000 (one GPU holds all experts; max = mean by definition).  The interesting
-regime starts at EP≥8, where load skew across GPUs becomes a factor.  Run the
-trace at the actual deployment EP size or post-hoc simulate multiple EP sizes with
-`--ep-size`:
-
-```bash
-# Trace collected with EP=8 deployment:
-python tools/moe_routing/analyze_routing_load_balance.py /path/to/trace_dir \
-    --ep-size 8 --num-experts 512
-
-# Sweep EP sizes from the same trace to see where imbalance starts mattering:
-for EP in 8 16 32 64; do
-    echo "=== EP=$EP ===" && \
-    python tools/moe_routing/analyze_routing_load_balance.py /path/to/trace_dir \
-        --ep-size $EP --num-experts 512
-done
-```
+This is a distributional result: per-token assignment errors cancel in the aggregate count
+histogram, so this measure is far more forgiving than per-token index overlap.
 
 #### Adding new routing metrics
 

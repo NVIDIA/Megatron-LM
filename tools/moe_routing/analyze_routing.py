@@ -6,12 +6,11 @@ Traces can come from either training or inference by passing --moe-routing-trace
 The JSONL format is identical in both cases, so every analysis works on both.
 
 Usage:
-    python analyze_routing.py /path/to/trace_dir --ep-size 8
-    python analyze_routing.py /path/to/trace_dir --ep-size 8 --num-experts 512
-    python analyze_routing.py /path/to/trace_dir --ep-size 8 --output-dir plots/
+    python analyze_routing.py /path/to/trace_dir --num-experts 512
+    python analyze_routing.py /path/to/trace_dir --num-experts 512 --output-dir plots/
 
 Each analysis is printed to stdout separated by a header.  Pass --output-dir
-to also write per-analysis CSV files.
+to also write per-analysis CSV files and plots.
 """
 
 import argparse
@@ -41,12 +40,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("trace_dir", help="Directory containing router_trace_rank*.jsonl files.")
     parser.add_argument(
-        "--ep-size",
-        type=int,
-        required=True,
-        help="Expert-parallel size used during the run (number of EP GPUs).",
-    )
-    parser.add_argument(
         "--top-k",
         type=int,
         default=None,
@@ -56,37 +49,31 @@ def main():
         "--num-experts",
         type=int,
         default=None,
-        help="Total number of experts.  Used for concentration baselines and load-balance simulation.",
+        help="Total number of experts.  Used for concentration baselines.",
     )
     parser.add_argument(
         "--output-dir",
         default=None,
-        help="Write per-analysis CSVs here in addition to stdout.",
+        help="Write per-analysis CSVs and plots here in addition to stdout.",
     )
     args = parser.parse_args()
 
     nexpert_args = ["--num-experts", str(args.num_experts)] if args.num_experts else []
+    topk_args = ["--top-k", str(args.top_k)] if args.top_k else []
     outdir_args = ["--output-dir", args.output_dir] if args.output_dir else []
 
     # 1. Expert concentration (hot-set size).
     run(
         "analyze_routing_concentration.py",
         [args.trace_dir] + nexpert_args + outdir_args,
-        "Expert concentration  (hot-set size, load distribution)",
+        "Expert concentration  (hot-set size, routing distribution)",
     )
 
-    # 2. EP load balance: can one-layer-ahead prediction close the imbalance gap?
-    lb_args = [args.trace_dir, "--ep-size", str(args.ep_size)]
-    if args.num_experts:
-        lb_args += ["--num-experts", str(args.num_experts)]
-    if args.top_k:
-        lb_args += ["--top-k", str(args.top_k)]
-    if args.output_dir:
-        lb_args += ["--output-dir", args.output_dir]
+    # 2. Distribution predictability: how well do L_prev's hidden states predict L's routing?
     run(
-        "analyze_routing_load_balance.py",
-        lb_args,
-        "EP load balance  (one-layer-ahead prediction recovery fraction)",
+        "analyze_routing_predictability.py",
+        [args.trace_dir] + nexpert_args + topk_args + outdir_args,
+        "Distribution predictability  (L_prev hidden states -> L routing distribution)",
     )
 
 
