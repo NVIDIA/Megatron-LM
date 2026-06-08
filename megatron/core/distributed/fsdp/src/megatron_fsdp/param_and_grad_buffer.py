@@ -4021,7 +4021,6 @@ class AllGatherPipeline:
         async_param_gather: bool = True,
         outer_fsdp_group_param_gather: bool = False,
         bwd: bool = False,
-        include_current: bool = True,
     ):
         """All-gather the params. If prefetch is enabled, prefetch next buckets
         in the order of `prefetch_order`.
@@ -4038,9 +4037,6 @@ class AllGatherPipeline:
             bwd (bool, optional):
                 Whether to all-gather column-wise parameters instead of row-wise parameters
                 for the backward pass for formats that require a transpose buffer like MXFP8.
-            include_current (bool, optional):
-                Whether to all-gather the buckets that contain ``params``. If False,
-                only the prefetch buckets adjacent to the current buckets are issued.
         """
         if len(params) == 0:
             return
@@ -4131,12 +4127,6 @@ class AllGatherPipeline:
                 # Re-sort and find the next bucket not in the list.
                 ag_buckets = list(sorted(set(ag_buckets)))
                 bucket_id = next_bucket_id(ag_buckets)
-
-        if not include_current:
-            current_ag_bucket_set = set(current_ag_buckets)
-            ag_buckets = [
-                bucket_id for bucket_id in ag_buckets if bucket_id not in current_ag_bucket_set
-            ]
 
         # Do not release the buckets that are requested by this call, even if
         # they are already ready and do not need a new all-gather.
