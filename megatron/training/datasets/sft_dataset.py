@@ -1,8 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
-import atexit, json
+import atexit
 from collections import Counter
-import json
 import math
 from typing import Any, Dict, Optional, List, Union
 
@@ -13,6 +12,7 @@ import torch
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.megatron_dataset import LowLevelDataset, MegatronDataset
 from megatron.core.datasets.utils import Split
+from megatron.training.datasets.utils import load_json_arg
 
 IGNORE_INDEX = -100
 
@@ -283,7 +283,17 @@ class MockSFTDataset(SFTDataset):
 
     @staticmethod
     def build_low_level_dataset(dataset_path: str, config: GPTDatasetConfig) -> LowLevelDataset:
-        mock_config = json.loads(config.sft_mock_dataset_config_json)
+        if config.sft_mock_dataset_config_json is None:
+            mock_config = {
+                "mode": "distribution",
+                "type": "lognormal",
+                "min_seq_len": config.sequence_length // 2,
+                "max_seq_len": config.sequence_length,
+                "mean_seq_len": config.sequence_length // 4 * 3,
+                "lognormal_sigma": 1.1,
+            }
+        else:
+            mock_config = load_json_arg(config.sft_mock_dataset_config_json)
         return MockSFTLowLevelDataset(**mock_config)
 
     def __len__(self) -> int:

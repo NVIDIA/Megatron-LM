@@ -59,6 +59,7 @@ from megatron.training.argument_utils import pretrain_cfg_container_from_args, g
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
+from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
 from model_provider import model_provider
@@ -324,6 +325,8 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         "hybrid_context_parallel": args.hybrid_context_parallel,
         "sft_mock_dataset_config_json": args.sft_mock_dataset_config_json,
         "sequence_packing_scheduler": args.sequence_packing_scheduler,
+        "varlen_mock_dataset_config_json": args.varlen_mock_dataset_config_json,
+        "varlen_sbhd_validation": args.varlen_sbhd_validation,
     }
 
     # add FIM args to the config
@@ -368,6 +371,17 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
         else:
             dataset_type = SFTDataset
         is_packed_sequence = True  # SFT always uses packed sequence
+    elif args.use_varlen_dataset:
+        # Variable-length packed (THD) dataset, independent of --sft.
+        # Reuses SFTDataset's THD packing internally but is gated
+        # by its own top-level flag.
+        if args.mock_data:
+            dataset_type = MockVarlenDataset
+        else:
+            dataset_type = VarlenDataset
+        # SBHD validation mode runs the non-packed pipeline; THD mode
+        # is the packed-sequence path.
+        is_packed_sequence = not args.varlen_sbhd_validation
     else:
         if args.mock_data:
             dataset_type = MockGPTDataset
