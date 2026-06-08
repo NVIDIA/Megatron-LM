@@ -98,6 +98,8 @@ def _lower_provider_value(key: str, value: Any) -> Any:
 
 
 def _configure_provider(provider, cfg: BridgeConfig) -> None:
+    from megatron.lite.primitive.deterministic import deterministic_requested
+
     p = cfg.parallel
     provider.tensor_model_parallel_size = p.tp
     provider.pipeline_model_parallel_size = p.pp
@@ -110,6 +112,7 @@ def _configure_provider(provider, cfg: BridgeConfig) -> None:
     provider.sequence_parallel = p.tp > 1
     provider.bf16 = True
     provider.fp16 = False
+    provider.deterministic_mode = deterministic_requested()
 
     for key, value in _lower_transformer_overrides(cfg).items():
         setattr(provider, key, _lower_provider_value(key, value))
@@ -118,32 +121,259 @@ def _configure_provider(provider, cfg: BridgeConfig) -> None:
 def _register_bridge_compat_aliases() -> None:
     """Register local Megatron-Bridge aliases for supported checkpoint variants."""
     from megatron.bridge.models.conversion import model_bridge
-    from megatron.bridge.models.qwen.qwen3_moe_bridge import Qwen3MoEBridge
+    from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
+    from megatron.bridge.models.conversion.param_mapping import (
+        AutoMapping,
+        GDNConv1dMapping,
+        GatedMLPMapping,
+        QKVMapping,
+        ReplicatedMapping,
+        RMSNorm2ZeroCenteredRMSNormMapping,
+        merge_gdn_linear_weights,
+        split_gdn_linear_weights,
+    )
+    from megatron.bridge.models.qwen.qwen3_next_bridge import Qwen3NextBridge
+    from megatron.bridge.utils.common_utils import extract_expert_number_from_param
     from megatron.core.models.gpt.gpt_model import GPTModel
 
-    class Qwen35MoEBridge(Qwen3MoEBridge):
-        """Megatron-Bridge Qwen3 MoE bridge adjusted for Qwen3.5 nested text config."""
+    class Qwen35SplitGDNMapping(AutoMapping):
+        """Bridge mapping for Qwen3.5 split GDN in-proj weights."""
 
-        def provider_bridge(self, hf_pretrained):
+        def __init__(self, megatron_param: str, qkv: str, z: str, b: str, a: str):
+            super().__init__(megatron_param=megatron_param, hf_param={"qkv": qkv, "z": z, "b": b, "a": a})
+            self._tp_mapping = AutoMapping(megatron_param, megatron_param)
+
+        def hf_to_megatron(self, hf_weights: dict[str, torch.Tensor], megatron_module) -> torch.Tensor:
+            if self.tp_rank == 0:
+                config = self._get_config(megatron_module)
+                qkvz = torch.cat([hf_weights["qkv"], hf_weights["z"]], dim=0)
+                ba = torch.cat([hf_weights["b"], hf_weights["a"]], dim=0)
+                merged = merge_gdn_linear_weights(config, qkvz, ba, tp_size=self.tp_size)
+            else:
+                merged = None
+            return self._tp_mapping.hf_to_megatron(merged, megatron_module)
+
+        def megatron_to_hf(self, megatron_weights, megatron_module) -> dict[str, torch.Tensor]:
+            if megatron_weights is not None:
+                megatron_weights = self.maybe_dequantize(megatron_weights)
+
+            if megatron_module is None:
+                config = self.broadcast_obj_from_pp_rank(None)
+            else:
+                config = self._get_config(megatron_module)
+                config = self.broadcast_obj_from_pp_rank(config)
+
+            packed_dict = self._tp_mapping.megatron_to_hf(megatron_weights, megatron_module)
+            if not packed_dict:
+                return {}
+
+            packed = next(iter(packed_dict.values()))
+            qkvz, ba = split_gdn_linear_weights(config, packed, tp_size=self.tp_size)
+            qk_dim = config.linear_key_head_dim * config.linear_num_key_heads
+            v_dim = config.linear_value_head_dim * config.linear_num_value_heads
+            qkv, z = qkvz.split([2 * qk_dim + v_dim, v_dim], dim=0)
+            b, a = ba.chunk(2, dim=0)
+            return {
+                self.hf_param["qkv"]: qkv,
+                self.hf_param["z"]: z,
+                self.hf_param["b"]: b,
+                self.hf_param["a"]: a,
+            }
+
+        def resolve(self, captures):
+            megatron_param, hf_param = self._resolve_names(captures)
+            return type(self)(
+                megatron_param,
+                hf_param["qkv"],
+                hf_param["z"],
+                hf_param["b"],
+                hf_param["a"],
+            )
+
+    class Qwen35PackedExpertDownMapping(AutoMapping):
+        """Bridge mapping for Qwen3.5 packed expert down-projection weights."""
+
+        def __init__(self, megatron_param: str, hf_param: str, permute_dims=None):
+            super().__init__(megatron_param=megatron_param, hf_param=hf_param, permute_dims=permute_dims)
+            self.allow_hf_name_mismatch = True
+
+        def hf_to_megatron(self, hf_weights: torch.Tensor, megatron_module) -> torch.Tensor:
+            expert_number = extract_expert_number_from_param(self.megatron_param)
+            expert_weight = hf_weights[expert_number].contiguous()
+            return super().hf_to_megatron(expert_weight, megatron_module)
+
+        def megatron_to_hf(self, megatron_weights, megatron_module) -> dict[str, torch.Tensor]:
+            converted = super().megatron_to_hf(megatron_weights, megatron_module)
+            return converted
+
+        def _validate_patterns(self, *args, **kwargs):
+            pass
+
+    class Qwen35RouterMapping(AutoMapping):
+        """Bridge mapping for Qwen3.5 router weights with bench expert truncation."""
+
+        def hf_to_megatron(self, hf_weights: torch.Tensor, megatron_module) -> torch.Tensor:
+            config = self._get_config(megatron_module)
+            num_experts = getattr(config, "num_moe_experts", None)
+            if num_experts is not None and hf_weights.shape[0] != num_experts:
+                hf_weights = hf_weights[:num_experts].contiguous()
+            return super().hf_to_megatron(hf_weights, megatron_module)
+
+    class Qwen35PackedExpertGateUpMapping(AutoMapping):
+        """Bridge mapping for Qwen3.5 packed expert gate/up projection weights."""
+
+        def __init__(self, megatron_param: str, hf_param: str, permute_dims=None):
+            super().__init__(megatron_param=megatron_param, hf_param=hf_param, permute_dims=permute_dims)
+            self.allow_hf_name_mismatch = True
+            GatedMLPMapping._validate_patterns = lambda *args, **kwargs: None
+            self._gated_mapping = GatedMLPMapping(
+                megatron_param=self.megatron_param,
+                gate=f"{self.hf_param}.gate",
+                up=f"{self.hf_param}.up",
+            )
+
+        def hf_to_megatron(self, hf_weights: torch.Tensor, megatron_module) -> torch.Tensor:
+            expert_number = extract_expert_number_from_param(self.megatron_param)
+            expert_weight = hf_weights[expert_number].contiguous()
+            gate, up = torch.chunk(expert_weight, 2, dim=0)
+            return self._gated_mapping.hf_to_megatron({"gate": gate, "up": up}, megatron_module)
+
+        def megatron_to_hf(self, megatron_weights, megatron_module) -> dict[str, torch.Tensor]:
+            converted = self._gated_mapping.megatron_to_hf(megatron_weights, megatron_module)
+            if not converted:
+                return {}
+
+            fused = {}
+            for name, tensor in converted.items():
+                if not name.endswith(".gate"):
+                    continue
+                base_name = name[: -len(".gate")]
+                up_tensor = converted.get(f"{base_name}.up")
+                if up_tensor is None:
+                    continue
+                gate_tensor = tensor.contiguous()
+                up_tensor = up_tensor.contiguous()
+                fused[base_name] = torch.stack([gate_tensor, up_tensor], dim=0 if up_tensor.ndim == 2 else 1)
+            return fused
+
+        def _validate_patterns(self, *args, **kwargs):
+            pass
+
+    class Qwen35MoEBridge(Qwen3NextBridge):
+        """Megatron-Bridge Qwen3-Next bridge adjusted for Qwen3.5 HF naming."""
+
+        def _text_config(self, hf_pretrained):
             config = getattr(hf_pretrained, "config", hf_pretrained)
             text_config = getattr(config, "text_config", config)
-            shim = type("_Qwen35TextConfigShim", (), {"config": text_config})()
-            provider = super().provider_bridge(shim)
+
+            if getattr(text_config, "intermediate_size", None) is None:
+                text_config.intermediate_size = 5120
 
             rope_parameters = getattr(text_config, "rope_parameters", None)
             if isinstance(rope_parameters, dict):
                 rope_theta = rope_parameters.get("rope_theta")
                 if rope_theta is not None:
-                    provider.rotary_base = rope_theta
+                    text_config.rope_theta = rope_theta
                 partial_rotary_factor = rope_parameters.get("partial_rotary_factor")
                 if partial_rotary_factor is not None:
-                    provider.rotary_percent = partial_rotary_factor
+                    text_config.partial_rotary_factor = partial_rotary_factor
+
+            if not hasattr(text_config, "tie_word_embeddings") and hasattr(config, "tie_word_embeddings"):
+                text_config.tie_word_embeddings = config.tie_word_embeddings
+
+            return text_config
+
+        def provider_bridge(self, hf_pretrained):
+            text_config = self._text_config(hf_pretrained)
+            shim = type("_Qwen35TextConfigShim", (), {"config": text_config})()
+            provider = super().provider_bridge(shim)
 
             aux_loss = getattr(text_config, "router_aux_loss_coef", None)
             if aux_loss is not None:
                 provider.moe_aux_loss_coeff = aux_loss
 
             return provider
+
+        def mapping_registry(self):
+            prefix = "model.language_model"
+            param_mappings = {
+                "embedding.word_embeddings.weight": f"{prefix}.embed_tokens.weight",
+                "output_layer.weight": "lm_head.weight",
+                "decoder.final_layernorm.weight": f"{prefix}.norm.weight",
+                "decoder.layers.*.pre_mlp_layernorm.weight": f"{prefix}.layers.*.post_attention_layernorm.weight",
+                "decoder.layers.*.self_attention.linear_qkv.layer_norm_weight": (
+                    f"{prefix}.layers.*.input_layernorm.weight"
+                ),
+                "decoder.layers.*.self_attention.q_layernorm.weight": f"{prefix}.layers.*.self_attn.q_norm.weight",
+                "decoder.layers.*.self_attention.k_layernorm.weight": f"{prefix}.layers.*.self_attn.k_norm.weight",
+                "decoder.layers.*.self_attention.linear_proj.weight": f"{prefix}.layers.*.self_attn.o_proj.weight",
+                "decoder.layers.*.self_attention.in_proj.layer_norm_weight": (
+                    f"{prefix}.layers.*.input_layernorm.weight"
+                ),
+                "decoder.layers.*.self_attention.out_proj.weight": f"{prefix}.layers.*.linear_attn.out_proj.weight",
+                "decoder.layers.*.self_attention.A_log": f"{prefix}.layers.*.linear_attn.A_log",
+                "decoder.layers.*.self_attention.dt_bias": f"{prefix}.layers.*.linear_attn.dt_bias",
+            }
+
+            mapping_list = [
+                AutoMapping(megatron_param=megatron_param, hf_param=hf_param)
+                for megatron_param, hf_param in param_mappings.items()
+            ]
+            AutoMapping.register_module_type("SharedExpertMLP", "column")
+            AutoMapping.register_module_type("GatedDeltaNet", "column")
+
+            mapping_list.extend(
+                [
+                    QKVMapping(
+                        megatron_param="decoder.layers.*.self_attention.linear_qkv.weight",
+                        q=f"{prefix}.layers.*.self_attn.q_proj.weight",
+                        k=f"{prefix}.layers.*.self_attn.k_proj.weight",
+                        v=f"{prefix}.layers.*.self_attn.v_proj.weight",
+                    ),
+                    GDNConv1dMapping(
+                        megatron_param="decoder.layers.*.self_attention.conv1d.weight",
+                        hf_param=f"{prefix}.layers.*.linear_attn.conv1d.weight",
+                    ),
+                    Qwen35SplitGDNMapping(
+                        megatron_param="decoder.layers.*.self_attention.in_proj.weight",
+                        qkv=f"{prefix}.layers.*.linear_attn.in_proj_qkv.weight",
+                        z=f"{prefix}.layers.*.linear_attn.in_proj_z.weight",
+                        b=f"{prefix}.layers.*.linear_attn.in_proj_b.weight",
+                        a=f"{prefix}.layers.*.linear_attn.in_proj_a.weight",
+                    ),
+                    Qwen35RouterMapping(
+                        megatron_param="decoder.layers.*.mlp.router.weight",
+                        hf_param=f"{prefix}.layers.*.mlp.gate.weight",
+                    ),
+                    Qwen35PackedExpertGateUpMapping(
+                        megatron_param="decoder.layers.*.mlp.experts.linear_fc1.weight*",
+                        hf_param=f"{prefix}.layers.*.mlp.experts.gate_up_proj",
+                    ),
+                    Qwen35PackedExpertDownMapping(
+                        megatron_param="decoder.layers.*.mlp.experts.linear_fc2.weight*",
+                        hf_param=f"{prefix}.layers.*.mlp.experts.down_proj",
+                    ),
+                    GatedMLPMapping(
+                        megatron_param="decoder.layers.*.mlp.shared_experts.linear_fc1.weight",
+                        gate=f"{prefix}.layers.*.mlp.shared_expert.gate_proj.weight",
+                        up=f"{prefix}.layers.*.mlp.shared_expert.up_proj.weight",
+                    ),
+                    AutoMapping(
+                        megatron_param="decoder.layers.*.mlp.shared_experts.linear_fc2.weight",
+                        hf_param=f"{prefix}.layers.*.mlp.shared_expert.down_proj.weight",
+                    ),
+                    ReplicatedMapping(
+                        megatron_param="decoder.layers.*.mlp.shared_experts.gate_weight",
+                        hf_param=f"{prefix}.layers.*.mlp.shared_expert_gate.weight",
+                    ),
+                    RMSNorm2ZeroCenteredRMSNormMapping(
+                        "decoder.layers.*.self_attention.out_norm.weight",
+                        f"{prefix}.layers.*.linear_attn.norm.weight",
+                    ),
+                ]
+            )
+
+            return MegatronMappingRegistry(*mapping_list)
 
     registry = getattr(model_bridge.get_model_bridge, "_exact_types", {})
     for source in ("Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM"):

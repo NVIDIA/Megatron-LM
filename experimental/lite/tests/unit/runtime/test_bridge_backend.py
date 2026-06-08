@@ -114,6 +114,19 @@ def test_bridge_registers_qwen35_moe_compat_aliases(monkeypatch):
 
     registered = []
 
+    class _FakeMapping:
+        def __init__(self, *args, **kwargs):
+            self.args = args
+            self.kwargs = kwargs
+
+        @classmethod
+        def register_module_type(cls, *args, **kwargs):
+            return None
+
+    class _FakeQwen3NextBridge:
+        def provider_bridge(self, hf_pretrained):
+            return types.SimpleNamespace()
+
     class _FakeDispatcher:
         _exact_types = {}
 
@@ -121,11 +134,26 @@ def test_bridge_registers_qwen35_moe_compat_aliases(monkeypatch):
         get_model_bridge=_FakeDispatcher(),
         register_bridge_implementation=lambda **kwargs: registered.append(kwargs),
     )
-    qwen_bridge_mod = types.SimpleNamespace(Qwen3MoEBridge=object)
+    mapping_registry_mod = types.SimpleNamespace(MegatronMappingRegistry=lambda *items: list(items))
+    param_mapping_mod = types.SimpleNamespace(
+        AutoMapping=_FakeMapping,
+        GDNConv1dMapping=_FakeMapping,
+        GatedMLPMapping=_FakeMapping,
+        QKVMapping=_FakeMapping,
+        ReplicatedMapping=_FakeMapping,
+        RMSNorm2ZeroCenteredRMSNormMapping=_FakeMapping,
+        merge_gdn_linear_weights=lambda *args, **kwargs: None,
+        split_gdn_linear_weights=lambda *args, **kwargs: (None, None),
+    )
+    qwen_bridge_mod = types.SimpleNamespace(Qwen3NextBridge=_FakeQwen3NextBridge)
+    common_utils_mod = types.SimpleNamespace(extract_expert_number_from_param=lambda name: 0)
     gpt_mod = types.SimpleNamespace(GPTModel=object)
 
     monkeypatch.setitem(sys.modules, "megatron.bridge.models.conversion", types.SimpleNamespace(model_bridge=model_bridge))
-    monkeypatch.setitem(sys.modules, "megatron.bridge.models.qwen.qwen3_moe_bridge", qwen_bridge_mod)
+    monkeypatch.setitem(sys.modules, "megatron.bridge.models.conversion.mapping_registry", mapping_registry_mod)
+    monkeypatch.setitem(sys.modules, "megatron.bridge.models.conversion.param_mapping", param_mapping_mod)
+    monkeypatch.setitem(sys.modules, "megatron.bridge.models.qwen.qwen3_next_bridge", qwen_bridge_mod)
+    monkeypatch.setitem(sys.modules, "megatron.bridge.utils.common_utils", common_utils_mod)
     monkeypatch.setitem(sys.modules, "megatron.core.models.gpt.gpt_model", gpt_mod)
 
     _register_bridge_compat_aliases()
@@ -134,6 +162,7 @@ def test_bridge_registers_qwen35_moe_compat_aliases(monkeypatch):
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen3_5MoeForCausalLM",
     ]
-    assert all(issubclass(item["bridge_class"], object) for item in registered)
-    assert all(item["bridge_class"] is not object for item in registered)
+    assert all(issubclass(item["bridge_class"], _FakeQwen3NextBridge) for item in registered)
+    assert all(item["bridge_class"] is not _FakeQwen3NextBridge for item in registered)
     assert all("provider_bridge" in item["bridge_class"].__dict__ for item in registered)
+    assert all("mapping_registry" in item["bridge_class"].__dict__ for item in registered)
