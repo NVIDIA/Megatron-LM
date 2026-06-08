@@ -6,16 +6,9 @@ Traces can come from either training or inference by passing --moe-routing-trace
 The JSONL format is identical in both cases, so every analysis works on both.
 
 Usage:
-    # Run all analyses (no logit sidecar required):
     python analyze_routing.py /path/to/trace_dir --ep-size 8
-
-    # Also run logit analyses (requires --moe-routing-trace-capture-logits
-    when the trace was collected):
-    python analyze_routing.py /path/to/trace_dir --ep-size 8 --with-logits
-
-    # Compare routing stability across two training checkpoints:
-    python analyze_routing.py /path/to/trace_dir --ep-size 8 \\
-        --snapshots early:/path/to/early_trace late:/path/to/late_trace
+    python analyze_routing.py /path/to/trace_dir --ep-size 8 --num-experts 512
+    python analyze_routing.py /path/to/trace_dir --ep-size 8 --output-dir plots/
 
 Each analysis is printed to stdout separated by a header.  Pass --output-dir
 to also write per-analysis CSV files.
@@ -63,22 +56,7 @@ def main():
         "--num-experts",
         type=int,
         default=None,
-        help="Total number of experts.  Used for load-balance simulation baselines.",
-    )
-    parser.add_argument(
-        "--with-logits",
-        action="store_true",
-        default=False,
-        help="Also run score-level analyses that require a logits sidecar "
-             "(collected with --moe-routing-trace-capture-logits).",
-    )
-    parser.add_argument(
-        "--snapshots",
-        nargs="+",
-        default=None,
-        metavar="LABEL:DIR",
-        help="For cross-snapshot stability analysis, pass two or more label:trace_dir pairs "
-             "in chronological order, e.g. --snapshots step1k:/dir1 step10k:/dir2",
+        help="Total number of experts.  Used for concentration baselines and load-balance simulation.",
     )
     parser.add_argument(
         "--output-dir",
@@ -87,7 +65,6 @@ def main():
     )
     args = parser.parse_args()
 
-    topk_args = ["--top-k", str(args.top_k)] if args.top_k else []
     nexpert_args = ["--num-experts", str(args.num_experts)] if args.num_experts else []
     outdir_args = ["--output-dir", args.output_dir] if args.output_dir else []
 
@@ -111,32 +88,6 @@ def main():
         lb_args,
         "EP load balance  (one-layer-ahead prediction recovery fraction)",
     )
-
-    # 3. Score-level analyses (boundary margin, cosine similarity, soft Jaccard).
-    if args.with_logits:
-        logit_args = [args.trace_dir]
-        if args.top_k:
-            logit_args += ["--top-k", str(args.top_k)]
-        if args.num_experts:
-            logit_args += ["--num-experts", str(args.num_experts)]
-        run(
-            "analyze_routing_logits.py",
-            logit_args,
-            "Score-level analyses  (boundary margin, cosine similarity, soft Jaccard)",
-        )
-
-    # 4. Cross-snapshot stability (step-after-step expert reuse).
-    if args.snapshots:
-        snap_args = args.snapshots + ["--ep-size", str(args.ep_size)]
-        if args.num_experts:
-            snap_args += ["--num-experts", str(args.num_experts)]
-        if args.output_dir:
-            snap_args += ["--output-dir", args.output_dir]
-        run(
-            "analyze_routing_cross_snapshot.py",
-            snap_args,
-            "Cross-snapshot stability  (step-after-step expert reuse across checkpoints)",
-        )
 
 
 if __name__ == "__main__":
