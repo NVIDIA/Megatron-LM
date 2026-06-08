@@ -1,11 +1,9 @@
-#!/usr/bin/env python3
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 """Can one-layer-ahead routing prediction balance expert load across EP GPUs?
 
-This is the *load-balancing* counterpart to ``andrii_test_router_application.py``.
 That script asks a per-token question (does L_prev's hidden state let us recover
-L's exact top-K?). Load balancing is a *distributional* question: we never need
+L's exact top-K?). Load balancing is a distributional question: we never need
 to know which expert an individual token picks — we still run L's real router and
 dispatch tokens to their true experts. The only thing decided one MoE layer ahead
 is the expert -> GPU placement, and that depends solely on the per-expert token
@@ -17,8 +15,7 @@ doom load-aware placement — this script measures the aggregate directly.
 
 For each consecutive MoE-layer pair (L_prev, L):
   1. Build the predicted per-expert count vector by applying L's actual router to
-     L_prev's hidden state, then taking top-K per token (no learning — same idea
-     as Andrii's test, just aggregated to a histogram).
+     L_prev's hidden state, then taking top-K per token (no learning, just aggregated to histogram).
   2. Build the actual per-expert count vector from L's real top-K decisions.
   3. Characterize predictability of the *distribution* (cosine / Spearman /
      hot-expert overlap).
