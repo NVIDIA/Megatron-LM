@@ -18,10 +18,10 @@ from megatron.core.num_microbatches_calculator import (
     get_micro_batch_size,
 )
 from megatron.core.parallel_state import (
-    get_context_parallel_rank,
-    get_context_parallel_world_size,
+    get_context_parallel_group,
     get_data_parallel_rank,
     get_data_parallel_world_size,
+    get_hybrid_data_context_parallel_groups,
     get_pipeline_model_parallel_rank,
     get_pipeline_model_parallel_world_size,
     get_tensor_model_parallel_group,
@@ -29,8 +29,15 @@ from megatron.core.parallel_state import (
 )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.multi_token_prediction import (
+    mtp_on_this_rank as mtp_on_this_rank_func,
+)
 from megatron.core.transformer.spec_utils import import_module
-from megatron.core.utils import StragglerDetector
+from megatron.core.utils import (
+    StragglerDetector,
+    get_batch_on_this_cp_rank,
+    get_batch_on_this_tp_rank,
+)
 from megatron.elastification.arguments import add_flextron_args
 from megatron.training import (
     get_args,
@@ -43,11 +50,7 @@ from megatron.training import (
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.sft_dataset import SFTDataset
-from megatron.training.utils import (
-    get_batch_on_this_cp_rank,
-    get_batch_on_this_tp_rank,
-    get_blend_and_blend_per_split,
-)
+from megatron.training.utils import get_blend_and_blend_per_split, is_first_or_last_pipeline_stage
 
 # modelopt distillation
 try:
@@ -62,18 +65,6 @@ except ImportError:
     has_nvidia_modelopt = False
 print_rank_0("has_nvidia_modelopt is {}".format(has_nvidia_modelopt))
 import numpy as np
-
-try:
-    # Register the TE CUDA kernels
-    import transformer_engine  # pylint: disable=unused-import
-
-    # Alias the PyTorch wrapper so we can call tex.* APIs
-    import transformer_engine_torch as tex
-except ImportError:
-    # TE isn’t installed or the torch wrapper is missing
-    tex = None
-
-from megatron.core.utils import is_te_min_version
 
 _global_choice_counter = 0
 _logged_params_norm = False
@@ -163,49 +154,89 @@ def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] 
     return model
 
 
-def get_batch(data_iterator):
+BATCH_KEYS = [
+    "attention_mask",
+    "cu_seqlens",
+    "cu_seqlens_padded",
+    "hybrid_cp_group",
+    "labels",
+    "local_cp_size",
+    "loss_mask",
+    "max_seqlen",
+    "position_ids",
+    "tokens",
+]
+
+
+def get_batch(data_iterator, vp_stage=None):
     """Generate a batch."""
 
-    # TODO: this is pretty hacky, find a better way
-    if (not mpu.is_pipeline_first_stage()) and (not mpu.is_pipeline_last_stage()):
+    args = get_args()
+    config = core_transformer_config_from_args(args)
+
+    cp_size = args.context_parallel_size
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+    is_sft = args.sft
+    is_hybrid_cp = args.hybrid_context_parallel
+    mtp_on_this_rank = mtp_on_this_rank_func(
+        layout=config.pipeline_model_parallel_layout,
+        mtp_num_layers=config.mtp_num_layers,
+        ignore_virtual=False,
+        vp_stage=vp_stage,
+    )
+
+    if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank and not is_sft:
         return None, None, None, None, None, None, None
 
-    # get batches based on the TP rank you are on
-    batch = get_batch_on_this_tp_rank(data_iterator)
+    batch = {}
+    if tp_rank == 0:
+        batch = next(data_iterator)
+        for key in BATCH_KEYS:
+            batch[key] = (
+                batch[key].cuda(non_blocking=True)
+                if key in batch and batch[key] is not None
+                else None
+            )
 
-    cu_seqlens = batch['cu_seqlens']
-    if cu_seqlens is None:
-        # slice batch along sequence dimension for context parallelism
-        batch = get_batch_on_this_cp_rank(batch)  # The implementation of this function is in MCore
-    else:  # Packed THD format
-        assert (
-            cu_seqlens.dim() == 2 and cu_seqlens.shape[0] == 1
-        ), "micro-batch-size must be 1 for packing"
+    batch = get_batch_on_this_tp_rank(
+        batch,
+        broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(),
+        broadcast_group=mpu.get_tensor_model_parallel_group(),
+        is_sft=is_sft,
+        is_hybrid_cp=is_hybrid_cp,
+        create_attention_mask_in_dataloader=args.create_attention_mask_in_dataloader,
+        cp_size=cp_size,
+        tp_rank=tp_rank,
+        micro_batch_size=args.micro_batch_size,
+        seq_length=args.seq_length,
+        mtp_on_this_rank=mtp_on_this_rank,
+        pipeline_model_parallel_size=args.pipeline_model_parallel_size,
+        is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
+        is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
+    )
+
+    # Intermediate PP stage under SFT only needs THD metadata (matches the
+    # pretrain_hybrid.py PP-SFT shortcut, collapsed to the flex 7-tuple shape).
+    if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:
+        assert is_sft
+        return None, None, None, None, None, batch['cu_seqlens'], batch['max_seqlen']
+
+    batch = get_batch_on_this_cp_rank(
+        batch,
+        is_hybrid_cp=is_hybrid_cp,
+        cp_group=get_context_parallel_group(),
+        hybrid_cp_group_func=get_hybrid_data_context_parallel_groups,
+    )
+
+    # cu_seqlens / max_seqlen arrive with the dataloader's batch dim (shape (1, n)
+    # and (1,) respectively when micro_batch_size==1). Squeeze to match the historical
+    # 1-D / scalar shape the flextron forward path was built around.
+    cu_seqlens = batch.get('cu_seqlens')
+    max_seqlen = batch.get('max_seqlen')
+    if cu_seqlens is not None:
         cu_seqlens = cu_seqlens[0]
-        batch['cu_seqlens'] = cu_seqlens
-
-        max_seqlen = batch['max_seqlen']
-        assert max_seqlen.dim() == 1
-        # TODO(duncan): can this be kept as a 0-D tensor?
-        batch['max_seqlen'] = int(max_seqlen[0].item())
-
-        cp_size = get_context_parallel_world_size()
-        if cp_size > 1:  # slice batch along sequence dimension for context parallelism
-            assert tex is not None and is_te_min_version("1.10.0"), (
-                "Please update Transformer Engine to >= 1.10 to use "
-                "Context Parallel with THD format data"
-            )
-            cp_rank = get_context_parallel_rank()
-            index = tex.thd_get_partitioned_indices(
-                cu_seqlens,
-                batch['tokens'].size(1),
-                cp_size,
-                cp_rank,
-            )
-            for key, data in batch.items():
-                if key in {'attention_mask', 'cu_seqlens', 'max_seqlen'}:
-                    continue
-                batch[key] = data.index_select(1, index)
+    if max_seqlen is not None:
+        max_seqlen = int(max_seqlen.item()) if max_seqlen.dim() == 0 else int(max_seqlen[0].item())
 
     return (
         batch.get('tokens'),
@@ -213,8 +244,8 @@ def get_batch(data_iterator):
         batch.get('loss_mask'),
         batch.get('attention_mask'),
         batch.get('position_ids'),
-        batch.get('cu_seqlens'),
-        batch.get('max_seqlen'),
+        cu_seqlens,
+        max_seqlen,
     )
 
 
