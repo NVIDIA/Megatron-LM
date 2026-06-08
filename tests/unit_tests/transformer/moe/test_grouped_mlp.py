@@ -704,17 +704,7 @@ def test_make_fused_ops_attaches_single_grouped_bias_for_fc1(monkeypatch):
     ), "bias should not be split into bias{idx} when single_grouped_bias=True"
 
 
-@pytest.mark.parametrize(
-    "offload_expert_fc1, offload_moe_act, expected_fc1_no_offload, expected_act_no_offload",
-    [(True, True, False, False), (True, False, False, True), (False, True, True, False)],
-)
-def test_make_fused_ops_sets_fine_grained_offload_opt_out_attrs(
-    monkeypatch,
-    offload_expert_fc1,
-    offload_moe_act,
-    expected_fc1_no_offload,
-    expected_act_no_offload,
-):
+def test_make_fused_ops_does_not_set_deprecated_offload_opt_out_attrs(monkeypatch):
     fake_te, FakeGroupedLinear = _make_fake_te_namespace()
     monkeypatch.setattr(experts_module, "te", fake_te)
 
@@ -729,8 +719,8 @@ def test_make_fused_ops_sets_fine_grained_offload_opt_out_attrs(
     )
     module.activation_func = F.silu
     module.activation_recompute = False
-    module.offload_expert_fc1 = offload_expert_fc1
-    module.offload_moe_act = offload_moe_act
+    module.offload_expert_fc1 = True
+    module.offload_moe_act = True
     common = dict(
         device="cuda",
         dtype=torch.bfloat16,
@@ -746,8 +736,8 @@ def test_make_fused_ops_sets_fine_grained_offload_opt_out_attrs(
 
     ops = module._make_fused_ops()
 
-    assert ops[0].no_offload_activation is expected_fc1_no_offload
-    assert ops[1].no_offload_activation is expected_act_no_offload
+    assert not hasattr(ops[0], "no_offload_activation")
+    assert not hasattr(ops[1], "no_offload_activation")
     assert not hasattr(ops[2], "no_offload_activation")
 
 
