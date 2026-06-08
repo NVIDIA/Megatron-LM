@@ -185,7 +185,7 @@ static round-robin baseline.
 - `recovery`: fraction of the gap `(baseline − predicted) / (baseline − oracle)` that the
   predictor closes.
 
-**Critical: always pass `--ep-size` matching your actual deployment.**  At EP=1 every metric
+**Critical: always pass `--ep-size` matching actual deployment.**  At EP=1 every metric
 collapses to 1.000 (one GPU holds all experts; max = mean by definition).  The interesting
 regime starts at EP≥8, where load skew across GPUs becomes a factor.  Run the
 trace at the actual deployment EP size or post-hoc simulate multiple EP sizes with
