@@ -6,7 +6,9 @@ import torch.nn as nn
 from megatron.lite.model.qwen3_5.config import Qwen35Config
 from megatron.lite.model.qwen3_5.lite.checkpoint import (
     Qwen35WeightSpec,
+    _merge_gate_up_tp_shards,
     _merge_full_attn_qkvg,
+    _merge_linear_attn_in_proj_tp_shards,
     export_hf_weights,
 )
 from megatron.lite.model.registry import TRAIN_RUNTIME_MODULES, resolve_runtime_model_name
@@ -164,6 +166,50 @@ def test_qwen35_export_maps_linear_attention_to_vllm_loader_names() -> None:
         exported["language_model.model.layers.0.linear_attn.in_proj_a.weight"].shape[0]
         == cfg.linear_num_value_heads
     )
+
+
+def test_qwen35_export_reorders_linear_attention_tp_shards_before_hf_split() -> None:
+    cfg = _tiny_config()
+    qk_dim = cfg.linear_num_key_heads * cfg.linear_key_head_dim
+    v_dim = cfg.linear_num_value_heads * cfg.linear_value_head_dim
+    hidden = cfg.hidden_size
+    parts = [
+        torch.arange(0, qk_dim * hidden).reshape(qk_dim, hidden),
+        torch.arange(100, 100 + qk_dim * hidden).reshape(qk_dim, hidden),
+        torch.arange(200, 200 + v_dim * hidden).reshape(v_dim, hidden),
+        torch.arange(300, 300 + v_dim * hidden).reshape(v_dim, hidden),
+        torch.arange(400, 400 + cfg.linear_num_value_heads * hidden).reshape(
+            cfg.linear_num_value_heads,
+            hidden,
+        ),
+        torch.arange(500, 500 + cfg.linear_num_value_heads * hidden).reshape(
+            cfg.linear_num_value_heads,
+            hidden,
+        ),
+    ]
+    full = torch.cat(parts, dim=0)
+    shards = [
+        torch.cat([part.chunk(2, dim=0)[rank] for part in parts], dim=0)
+        for rank in range(2)
+    ]
+
+    merged = _merge_linear_attn_in_proj_tp_shards(shards, cfg=cfg)
+
+    assert torch.equal(merged, full)
+
+
+def test_qwen35_export_reorders_shared_expert_gate_up_tp_shards() -> None:
+    gate = torch.arange(0, 32).reshape(4, 8)
+    up = torch.arange(100, 132).reshape(4, 8)
+    full = torch.cat([gate, up], dim=0)
+    shards = [
+        torch.cat([gate.chunk(2, dim=0)[rank], up.chunk(2, dim=0)[rank]], dim=0)
+        for rank in range(2)
+    ]
+
+    merged = _merge_gate_up_tp_shards(shards)
+
+    assert torch.equal(merged, full)
 
 
 def test_qwen35_export_restores_zero_centered_linear_attention_norm() -> None:

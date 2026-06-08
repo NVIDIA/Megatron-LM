@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.tensor import Replicate, Shard
 
@@ -241,6 +242,44 @@ def _split_linear_attn_in_proj(
     )
 
 
+def _merge_linear_attn_in_proj_tp_shards(
+    shards: list[torch.Tensor],
+    *,
+    cfg: Qwen35Config,
+) -> torch.Tensor:
+    world_size = len(shards)
+    qk_dim = ensure_divisible(cfg.linear_num_key_heads * cfg.linear_key_head_dim, world_size)
+    v_dim = ensure_divisible(cfg.linear_num_value_heads * cfg.linear_value_head_dim, world_size)
+    value_heads = ensure_divisible(cfg.linear_num_value_heads, world_size)
+
+    parts: list[list[torch.Tensor]] = [[] for _ in range(6)]
+    for shard in shards:
+        for bucket, part in zip(
+            parts,
+            shard.split([qk_dim, qk_dim, v_dim, v_dim, value_heads, value_heads], dim=0),
+            strict=True,
+        ):
+            bucket.append(part)
+
+    return torch.cat([torch.cat(bucket, dim=0) for bucket in parts], dim=0).contiguous()
+
+
+def _merge_gate_up_tp_shards(shards: list[torch.Tensor]) -> torch.Tensor:
+    gates: list[torch.Tensor] = []
+    ups: list[torch.Tensor] = []
+    for shard in shards:
+        gate, up = shard.chunk(2, dim=0)
+        gates.append(gate)
+        ups.append(up)
+    return torch.cat([torch.cat(gates, dim=0), torch.cat(ups, dim=0)], dim=0).contiguous()
+
+
+def _allgather_tp_shards(tensor: torch.Tensor, ps: ParallelState) -> list[torch.Tensor]:
+    shards = [torch.empty_like(tensor) for _ in range(ps.tp_size)]
+    dist.all_gather(shards, tensor.contiguous(), group=ps.tp_group)
+    return shards
+
+
 class Qwen35WeightSpec:
     """Export Qwen35 lite weights to names accepted by vLLM's Qwen3.5 loader."""
 
@@ -257,6 +296,18 @@ class Qwen35WeightSpec:
     def hf_to_native(self, native_name: str, hf_tensors: list[torch.Tensor]) -> torch.Tensor:
         del native_name
         return hf_tensors[0]
+
+    def gather_dense(self, native_name: str, tensor: torch.Tensor, ps: ParallelState) -> torch.Tensor | None:
+        if ps.tp_size <= 1:
+            return None
+        if native_name.endswith(".linear_attn.in_proj.linear.weight"):
+            return _merge_linear_attn_in_proj_tp_shards(
+                _allgather_tp_shards(tensor, ps),
+                cfg=self.config,
+            )
+        if native_name.endswith(".moe.shared_expert.gate_up.linear.weight"):
+            return _merge_gate_up_tp_shards(_allgather_tp_shards(tensor, ps))
+        return None
 
     def native_to_hf(self, native_name: str, tensor: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
         if native_name == "embed.embedding.weight":

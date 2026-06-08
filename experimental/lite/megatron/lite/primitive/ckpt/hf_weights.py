@@ -452,6 +452,12 @@ def export_hf_weights(
 
 def _gather_dense(name: str, tensor: torch.Tensor, spec: HFWeights, ps) -> torch.Tensor:
     """Gather a dense (non-expert) param across TP."""
+    custom_gather = getattr(spec, "gather_dense", None)
+    if callable(custom_gather):
+        gathered = custom_gather(name, tensor, ps)
+        if gathered is not None:
+            return gathered.float().cpu()
+
     tp_info = spec.tp_spec(name)
     if tp_info is not None and ps.tp_size > 1:
         split_d, tp_or_etp = tp_info
