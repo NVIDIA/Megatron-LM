@@ -113,6 +113,8 @@ def _configure_provider(provider, cfg: BridgeConfig) -> None:
     provider.bf16 = True
     provider.fp16 = False
     provider.deterministic_mode = deterministic_requested()
+    if provider.deterministic_mode:
+        os.environ.setdefault("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
 
     for key, value in _lower_transformer_overrides(cfg).items():
         setattr(provider, key, _lower_provider_value(key, value))

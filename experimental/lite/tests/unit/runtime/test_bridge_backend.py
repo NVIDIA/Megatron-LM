@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 import types
 
@@ -107,6 +108,21 @@ def test_bridge_builds_mcore_ddp_config_object(monkeypatch):
     assert ddp_config.grad_reduce_in_fp32 is True
     assert ddp_config.overlap_grad_reduce is True
     assert ddp_config.bucket_size == 1024
+
+
+def test_bridge_deterministic_provider_sets_te_env(monkeypatch):
+    from megatron.lite.runtime.backends.bridge.config import BridgeConfig
+    from megatron.lite.runtime.backends.bridge.runtime import _configure_provider
+
+    monkeypatch.setenv("MEGATRON_LITE_DETERMINISTIC", "1")
+    monkeypatch.delenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", raising=False)
+    provider = types.SimpleNamespace()
+
+    _configure_provider(provider, BridgeConfig())
+
+    assert provider.deterministic_mode is True
+    assert "NVTE_ALLOW_NONDETERMINISTIC_ALGO" in os.environ
+    assert os.environ["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] == "0"
 
 
 def test_bridge_registers_qwen35_moe_compat_aliases(monkeypatch):
