@@ -10,13 +10,7 @@ from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.handle import ModelHandle
 
 
-pytestmark = [
-    pytest.mark.mlite,
-    pytest.mark.xfail(
-        reason="MLite runtime checkpoint API/DCP continuity is covered by a follow-up bugfix PR.",
-        strict=True,
-    ),
-]
+pytestmark = pytest.mark.mlite
 
 
 class TinyMLP(nn.Module):

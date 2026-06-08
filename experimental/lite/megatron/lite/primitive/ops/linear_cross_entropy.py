@@ -61,7 +61,7 @@ def linear_cross_entropy(
     logits = torch.matmul(hidden, weight.t())
     if temperature != 1.0:
         logits = logits / float(temperature)
-    loss = vocab_parallel_cross_entropy(logits, labels, tp_group)
+    loss = vocab_parallel_cross_entropy(logits.clone(), labels, tp_group)
     entropy = _vocab_parallel_entropy(logits, tp_group)
     return _reshape_like_labels(-loss, labels), _reshape_like_labels(entropy, labels)
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -41,3 +42,34 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if "smoke" in item.keywords:
             item.add_marker(skip_smoke)
+
+
+@pytest.fixture
+def transformer_engine_import_stub(monkeypatch):
+    def install() -> None:
+        try:
+            import transformer_engine.pytorch  # noqa: F401
+
+            return
+        except ModuleNotFoundError as exc:
+            if exc.name not in {"transformer_engine", "transformer_engine.pytorch"}:
+                raise
+
+        class _UnavailableTE:
+            def __init__(self, *args, **kwargs):
+                raise RuntimeError(
+                    "Transformer Engine is not installed in this test environment."
+                )
+
+        root = types.ModuleType("transformer_engine")
+        root.__version__ = "0.0.0"
+        pytorch = types.ModuleType("transformer_engine.pytorch")
+        pytorch.DotProductAttention = _UnavailableTE
+        pytorch.LayerNormLinear = _UnavailableTE
+        pytorch.Linear = _UnavailableTE
+        pytorch.RMSNorm = _UnavailableTE
+        root.pytorch = pytorch
+        monkeypatch.setitem(sys.modules, "transformer_engine", root)
+        monkeypatch.setitem(sys.modules, "transformer_engine.pytorch", pytorch)
+
+    return install
