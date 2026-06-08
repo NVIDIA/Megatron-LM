@@ -221,6 +221,43 @@ def test_qwen35_export_batches_ep_expert_gather(monkeypatch) -> None:
     )
 
 
+def test_qwen35_export_uses_packed_expert_group_names(monkeypatch) -> None:
+    class TinyQwen35Module(nn.Module):
+        def __init__(self, config: Qwen35Config) -> None:
+            super().__init__()
+            self.layers = nn.ModuleList([nn.Module()])
+            self.layers[0].moe = nn.Module()
+            self.layers[0].moe.experts = nn.Module()
+            self.layers[0].moe.experts.fc1 = nn.Module()
+
+            rows = config.moe_intermediate_size * 2
+            for expert_idx in range(config.num_experts):
+                tensor = torch.arange(rows * config.hidden_size, dtype=torch.bfloat16).reshape(
+                    rows,
+                    config.hidden_size,
+                )
+                tensor = tensor + expert_idx * 1000
+                self.layers[0].moe.experts.fc1.register_parameter(
+                    f"weight{expert_idx}",
+                    nn.Parameter(tensor),
+                )
+
+    cfg = _tiny_config()
+    seen_native_names = []
+    original = Qwen35WeightSpec.native_to_hf
+
+    def spy_native_to_hf(self, native_name, tensor):
+        seen_native_names.append(native_name)
+        return original(self, native_name, tensor)
+
+    monkeypatch.setattr(Qwen35WeightSpec, "native_to_hf", spy_native_to_hf)
+
+    exported = dict(export_hf_weights(TinyQwen35Module(cfg), cfg, _single_rank_parallel_state()))
+
+    assert seen_native_names == ["layers.0.moe.experts.fc1.packed"]
+    assert set(exported) == {"model.language_model.layers.0.mlp.experts.gate_up_proj"}
+
+
 def test_qwen35_export_rank0_only_still_participates_in_ep_gather(monkeypatch) -> None:
     class TinyQwen35Module(nn.Module):
         def __init__(self, config: Qwen35Config) -> None:

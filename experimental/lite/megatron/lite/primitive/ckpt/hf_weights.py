@@ -559,6 +559,23 @@ def _gather_expert_group(
         (local_idx, name, _gather_expert_etp(name, tensor, spec, ps))
         for local_idx, name, tensor in sorted(entries)
     ]
+    packed_group_name = getattr(spec, "packed_expert_group_name", None)
+    if callable(packed_group_name):
+        packed_name = packed_group_name(prepared[0][1])
+        if packed_name is not None:
+            if ps.ep_size <= 1 or ps.ep_group is None:
+                out[packed_name] = torch.stack(
+                    [tensor.contiguous() for _, _, tensor in prepared],
+                    dim=0,
+                ).cpu()
+                return
+
+            stacked = torch.stack([tensor.contiguous() for _, _, tensor in prepared], dim=0)
+            ep_gathered = [torch.empty_like(stacked) for _ in range(ps.ep_size)]
+            dist.all_gather(ep_gathered, stacked, group=ps.ep_group)
+            out[packed_name] = torch.cat(ep_gathered, dim=0).cpu()
+            return
+
     if ps.ep_size <= 1 or ps.ep_group is None:
         for _, name, tensor in prepared:
             out[name] = tensor.cpu()

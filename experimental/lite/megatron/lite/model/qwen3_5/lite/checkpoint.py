@@ -313,6 +313,11 @@ class Qwen35WeightSpec:
             return _merge_gate_up_tp_shards(_allgather_tp_shards(tensor, ps))
         return None
 
+    def packed_expert_group_name(self, native_name: str) -> str | None:
+        if re.fullmatch(r"layers\.\d+\.moe\.experts\.fc[12]\.weight\d+", native_name) is None:
+            return None
+        return re.sub(r"\.weight\d+$", ".packed", native_name)
+
     def native_to_hf(self, native_name: str, tensor: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
         if self.target == "vllm":
             return self._native_to_vllm(native_name, tensor)
@@ -403,6 +408,13 @@ class Qwen35WeightSpec:
                 return [(f"{prefix}.mlp.experts.gate_up_proj", packed)]
             return [(f"{prefix}.mlp.experts.down_proj", packed)]
 
+        packed_expert_match = re.fullmatch(r"moe\.experts\.fc([12])\.packed", suffix)
+        if packed_expert_match is not None:
+            kind = packed_expert_match.group(1)
+            if kind == "1":
+                return [(f"{prefix}.mlp.experts.gate_up_proj", tensor.contiguous())]
+            return [(f"{prefix}.mlp.experts.down_proj", tensor.contiguous())]
+
         return []
 
     def _native_to_vllm(self, native_name: str, tensor: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
@@ -491,6 +503,13 @@ class Qwen35WeightSpec:
             if kind == "1":
                 return [(f"{prefix}.mlp.experts.gate_up_proj", packed)]
             return [(f"{prefix}.mlp.experts.down_proj", packed)]
+
+        packed_expert_match = re.fullmatch(r"moe\.experts\.fc([12])\.packed", suffix)
+        if packed_expert_match is not None:
+            kind = packed_expert_match.group(1)
+            if kind == "1":
+                return [(f"{prefix}.mlp.experts.gate_up_proj", tensor.contiguous())]
+            return [(f"{prefix}.mlp.experts.down_proj", tensor.contiguous())]
 
         return []
 
