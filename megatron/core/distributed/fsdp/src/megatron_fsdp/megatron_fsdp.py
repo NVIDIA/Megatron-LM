@@ -876,33 +876,17 @@ class MegatronFSDP(torch.nn.Module):
                     prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER,
                     bwd=True,
                 )
-
-                outer_fsdp_group_param_gather = (
-                    self.dist_index.use_hybrid_fsdp
-                    and self.ddp_config.outer_dp_sharding_strategy != "no_shard"
-                    and (self.microbatch_count == 0 or self.model_auto_sync)
-                )
-                # During full activation recomputation, the next backward layer
-                # first reruns its forward path, so row-wise weights are more
-                # urgent than the column-wise transpose buffers used later in
-                # the same layer's backward path.
-                self.all_gather_pipeline.all_gather_params(
-                    params=param_list,
+                self.all_gather_and_wait_parameters_ready(
+                    param_list,
                     prefetch=True,
                     prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER,
-                    suggested_AG_prefetch_size=self.suggested_AG_prefetch_size,
-                    outer_fsdp_group_param_gather=outer_fsdp_group_param_gather,
                     bwd=False,
-                    include_current=False,
                 )
-                self.all_gather_pipeline.all_gather_params(
-                    params=param_list,
+                self.all_gather_and_wait_parameters_ready(
+                    param_list,
                     prefetch=True,
                     prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER,
-                    suggested_AG_prefetch_size=self.suggested_AG_prefetch_size,
-                    outer_fsdp_group_param_gather=outer_fsdp_group_param_gather,
                     bwd=True,
-                    include_current=False,
                 )
             else:
                 self.all_gather_and_wait_parameters_ready(
