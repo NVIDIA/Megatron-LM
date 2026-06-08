@@ -103,6 +103,69 @@ prefer `offline_inference.py` and `launch_inference_server.py`. CI
 recipes under `tests/test_utils/recipes/h100/{gpt,moe,mamba}-*-inference.yaml`
 still target these scripts.
 
+### MoE routing analysis
+
+`tools/moe_routing/analyze_routing.py` and the `analyze_routing_*.py`
+scripts analyze per-layer top-K routing decisions from MoE models.  The same JSONL
+trace format and the same analysis scripts work for both training and
+inference.
+
+#### Collecting traces
+
+**During training** — enable these flags:
+
+```bash
+--moe-routing-trace-path /path/to/trace_dir   # enable tracing
+--moe-routing-trace-max-iters 500             # optional: stop after N iters
+--moe-routing-trace-capture-logits            # optional: pre-topk scores
+--moe-routing-trace-capture-hidden-states     # optional: input hidden states
+```
+
+**During inference** — add to your inference launch (e.g.
+`advanced/gpt_dynamic_inference_with_coordinator.py`):
+
+```bash
+--moe-routing-trace-path /path/to/trace_dir
+--moe-routing-trace-max-steps 200
+--moe-routing-trace-capture-logits
+```
+
+Both write `router_trace_rank{N}.jsonl` into the specified directory (one file per rank).  Optional sidecar files `hidden_states_rank{N}.bin`
+and `logits_rank{N}.bin` can be written via `--moe-routing-trace-capture-hidden-states` and `--moe-routing-trace-capture-logits`.
+
+#### Running analyses
+
+```bash
+# All core analyses (no logit sidecar needed):
+python tools/moe_routing/analyze_routing.py /path/to/trace_dir --ep-size 8
+
+# Include score-level analyses (requires --moe-routing-trace-capture-logits):
+python tools/moe_routing/analyze_routing.py /path/to/trace_dir --ep-size 8 --with-logits
+
+# Cross-checkpoint stability (step-after-step expert reuse):
+python tools/moe_routing/analyze_routing.py /path/to/trace_dir --ep-size 8 \
+    --snapshots step1k:/path/to/early_trace step10k:/path/to/late_trace
+```
+
+The dispatcher runs these analyses in order:
+
+| Script | Question answered |
+|--------|-------------------|
+| `tools/moe_routing/analyze_router_trace.py` | How much does layer L's top-K overlap with layer L-1? (predictor accuracy ceiling) |
+| `tools/moe_routing/analyze_routing_jaccard.py` | Jaccard similarity between consecutive MoE layers |
+| `tools/moe_routing/analyze_routing_concentration.py` | How concentrated is routing? (hot-set size, Gini coefficient) |
+| `tools/moe_routing/analyze_routing_load_balance.py` | Can one-layer-ahead prediction close the EP load-imbalance gap? |
+| `tools/moe_routing/analyze_routing_logits.py` | Boundary margins, score-level cosine similarity, soft top-N Jaccard |
+| `tools/moe_routing/analyze_routing_cross_snapshot.py` | Do the same experts stay hot across training checkpoints? |
+
+#### Adding new routing metrics
+
+To add a new routing metric, put capture logic in `megatron/core/transformer/moe/router_trace.py`
+(as part of the `RouterTracer` class) so it is available to both training and inference.  Avoid
+adding bespoke logging flows to `megatron/training/activation_logging.py`
+for routing metrics — that file handles lightweight count monitoring
+(`tokens_per_expert`) and uses a different output format.
+
 ### See also
 
 - API reference: [`megatron/core/inference/README.md`](../../megatron/core/inference/README.md)

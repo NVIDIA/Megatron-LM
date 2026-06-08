@@ -160,12 +160,6 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe.paged_stash import PagedStashRunner
-from megatron.core.distributed import DistributedDataParallelConfig, TorchFullyShardedDataParallelConfig
-from megatron.core.distributed import DistributedDataParallel as DDP
-from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
-from megatron.core.optimizer.optimizer import param_group_identifier_keys
-
-from megatron.core.optimizer.qk_clip import clip_qk
 from megatron.core.utils import (
     StragglerDetector,
     check_param_hashes_across_dp_replicas,
@@ -241,6 +235,7 @@ from megatron.core.num_microbatches_calculator import (
     update_num_microbatches,
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.transformer.moe.router_trace import get_tracer, init_tracer
 
 from . import ft_integration, one_logger_utils
 from .activation_logging import (
@@ -2246,6 +2241,11 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             save_dgrads(iteration + 1)
             disable_dgrad_logging()
 
+        # Advance the router tracer step if active.
+        tracer = get_tracer()
+        if tracer is not None:
+            tracer.advance_step()
+
         # Reset force_all_reduce field.
         for model_chunk in model:
             model_chunk.force_all_reduce = False
@@ -3254,6 +3254,23 @@ def train(
     # GPU sniff test at start of training.
     if args.gpu_sniff_test_interval is not None:
         _run_gpu_sniff_test('before training')
+
+    # Initialize router trace if requested.  The tracer attaches forward hooks
+    # to all TopKRouter modules and writes one JSONL record per (iteration,
+    # layer).  advance_step() is called at the end of each train_step().
+    if getattr(args, 'moe_routing_trace_path', None):
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        max_steps = getattr(args, 'moe_routing_trace_max_iters', None) or args.train_iters
+        init_tracer(
+            output_dir=args.moe_routing_trace_path,
+            max_steps=max_steps,
+            rank=rank,
+            training_mode=True,
+            capture_hidden_states=getattr(args, 'moe_routing_trace_capture_hidden_states', False),
+            capture_logits=getattr(args, 'moe_routing_trace_capture_logits', False),
+            dump_router_weights=getattr(args, 'moe_routing_trace_dump_weights', False),
+        )
+        get_tracer().register_hooks(model)
 
     report_memory_flag = True
     pre_hook_enabled = False

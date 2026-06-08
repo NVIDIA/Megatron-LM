@@ -9,7 +9,6 @@ import warnings
 from collections import defaultdict
 from typing import List
 
-from megatron.training.arguments import parse_and_validate_args
 import torch
 import torch.distributed as dist
 
@@ -19,13 +18,15 @@ from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.inference_request import DynamicInferenceRequestRecord
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.transformer.moe.router_trace import get_tracer, init_tracer
+from megatron.core.utils import configure_nvtx_profiling
 from megatron.inference.utils import (
     add_inference_args,
     get_dynamic_inference_engine,
     get_model_for_inference,
 )
 from megatron.training import get_args, get_tokenizer, initialize_megatron
-from megatron.core.utils import configure_nvtx_profiling
+from megatron.training.arguments import parse_and_validate_args
 
 # pylint: disable=line-too-long
 
@@ -225,7 +226,22 @@ if __name__ == "__main__":
             ),
         )
 
+        if getattr(args, 'moe_routing_trace_path', None):
+            rank = dist.get_rank() if dist.is_initialized() else 0
+            max_steps = getattr(args, 'moe_routing_trace_max_steps', None) or 10**9
+            init_tracer(
+                output_dir=args.moe_routing_trace_path,
+                max_steps=max_steps,
+                rank=rank,
+                capture_hidden_states=getattr(args, 'moe_routing_trace_capture_hidden_states', False),
+                capture_logits=getattr(args, 'moe_routing_trace_capture_logits', False),
+                dump_router_weights=getattr(args, 'moe_routing_trace_dump_weights', False),
+            )
+
         model = get_model_for_inference()
+
+        if get_tracer() is not None:
+            get_tracer().register_hooks(model)
 
         requests = build_requests(args, tokenizer, sampling_params)
 
