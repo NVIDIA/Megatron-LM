@@ -156,16 +156,10 @@ class MegatronOptimizer(ABC):
                 and getattr(param, "__fsdp_param__", False)
             ):
                 grad = param.decoupled_grad if hasattr(param, "decoupled_grad") else None
-                if (
-                    getattr(param, "__fsdp_param__", False)
-                    and grad is not None
-                    and hasattr(grad, "_local_tensor")
-                ):
-                    # Megatron-FSDP gradients are DTensors.
-                    grad = grad._local_tensor
             elif getattr(param, "__fsdp_param__", False):
-                # Megatron-FSDP gradients are DTensors.
-                grad = param.grad._local_tensor if param.grad is not None else None
+                # Megatron-FSDP gradients are DTensors. Keep the DTensor
+                # wrapper so grad-norm code can reduce over FSDP shard groups.
+                grad = param.grad
             else:
                 grad = param.grad
             grad_not_none = grad is not None

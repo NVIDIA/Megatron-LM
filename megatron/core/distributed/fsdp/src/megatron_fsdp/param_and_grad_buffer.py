@@ -3436,8 +3436,10 @@ class GradReducePipeline:
             # If there are multiple FSDP groups, we need to reduce gradients across groups.
             self.outer_fsdp_group_grad_reduce = True
             self.outer_fsdp_group_grad_reduce_stream = torch.cuda.Stream()
+            self._pending_outer_fsdp_grad_reduce_buckets = set()
         else:
             self.outer_fsdp_group_grad_reduce = False
+            self._pending_outer_fsdp_grad_reduce_buckets = set()
 
     @property
     def num_buckets(self):
@@ -3447,6 +3449,7 @@ class GradReducePipeline:
     def reset(self):
         """Handle the processing tasks and reset the pipeline."""
         self.wait_for_previous_grad_reduce(0)
+        self.finish_pending_outer_fsdp_grad_reduce()
         for bucket_id, grad_ready_params in enumerate(self.bucket_grad_ready_params):
             param_list = self.buffer.parameter_groups[bucket_id].params
             n_params = len(param_list)
@@ -3597,6 +3600,89 @@ class GradReducePipeline:
             return param_group.hfsdp_helper_gbuf
         return param_group.main_grad_buffer
 
+    def finish_pending_outer_fsdp_grad_reduce(self) -> None:
+        """Complete delayed HSDP/HFSDP outer-DP gradient reduction.
+
+        With `optim_grads` and `optim_grads_params`, the inner-DP reduce-scatter
+        can be issued from backward hooks before the final microbatch is known to
+        the wrapper. In that case the outer-DP reduction is delayed until
+        `finish_grad_sync()`, after all inner-DP reductions have completed and
+        before optimizer gradients are attached.
+        """
+        if not self._pending_outer_fsdp_grad_reduce_buckets:
+            return
+        if not self.buffer.dist_index.use_hybrid_fsdp:
+            self._pending_outer_fsdp_grad_reduce_buckets.clear()
+            return
+
+        bucket_group = sorted(self._pending_outer_fsdp_grad_reduce_buckets)
+        ddp_config = self.buffer.ddp_config
+        mp_policy = self.buffer.mp_policy
+        current_stream = torch.cuda.current_stream()
+        self.outer_fsdp_group_grad_reduce_stream.wait_stream(current_stream)
+        outer_fsdp_group = self.buffer.dist_index.get_outer_fsdp_group()
+
+        with torch.cuda.stream(self.outer_fsdp_group_grad_reduce_stream):
+            with _coalescing_manager(outer_fsdp_group):
+                grad_accum_closure = []
+                for bucket_id in bucket_group:
+                    if ddp_config.average_in_collective:
+                        reduce_op = torch.distributed.ReduceOp.AVG
+                    else:
+                        reduce_op = torch.distributed.ReduceOp.SUM
+
+                    main_grad_buffer = self.buffer.parameter_groups[bucket_id].main_grad_buffer
+                    fsdp_grad_buffer = self.get_fsdp_buffer(bucket_id)
+                    unreduced_grad = fsdp_grad_buffer.data
+                    assert (
+                        main_grad_buffer.dtype == fsdp_grad_buffer.dtype
+                    ), "Main and DP-Shard gradient buffer must share the exact same dtype."
+
+                    custom_grad_comm_dtype = (
+                        mp_policy.grad_comm_dtype is not None
+                        and unreduced_grad.dtype != mp_policy.grad_comm_dtype
+                    )
+                    if custom_grad_comm_dtype:
+                        hsdp_comm_gbuf = self.buffer.parameter_groups[bucket_id].hsdp_comm_gbuf
+                        unreduced_grad = hsdp_comm_gbuf.allocate_bucket_storage(
+                            shard=fsdp_grad_buffer.is_data_distributed,
+                            dtype=mp_policy.grad_comm_dtype,
+                            device=unreduced_grad.device,
+                            init_values=unreduced_grad,
+                        ).data
+
+                    if ddp_config.outer_dp_sharding_strategy != "no_shard":
+                        main_grad_shard = main_grad_buffer.get_shard_from_local_buffer()
+                        if custom_grad_comm_dtype:
+                            dp_outer_rank = outer_fsdp_group.rank()
+                            output_buffer = unreduced_grad[
+                                dp_outer_rank
+                                * main_grad_shard.numel() : (dp_outer_rank + 1)
+                                * main_grad_shard.numel()
+                            ]
+                        else:
+                            output_buffer = main_grad_shard
+                        torch.distributed.reduce_scatter_tensor(
+                            output=output_buffer,
+                            input=unreduced_grad,
+                            op=reduce_op,
+                            group=outer_fsdp_group,
+                        )
+                        if custom_grad_comm_dtype:
+                            grad_accum_closure.append((main_grad_shard, output_buffer))
+                    else:
+                        torch.distributed.all_reduce(
+                            unreduced_grad, group=outer_fsdp_group, op=reduce_op
+                        )
+                        if custom_grad_comm_dtype:
+                            grad_accum_closure.append((main_grad_buffer.data, unreduced_grad))
+
+            for main_grad_buffer, reduced_grad in grad_accum_closure:
+                main_grad_buffer.copy_(reduced_grad)
+
+        current_stream.wait_stream(self.outer_fsdp_group_grad_reduce_stream)
+        self._pending_outer_fsdp_grad_reduce_buckets.clear()
+
     def _bucket_group_gradient_reduce(
         self,
         bucket_group: List[int],
@@ -3718,6 +3804,12 @@ class GradReducePipeline:
             # Record a checkpoint for the event to synchronize against the reduce-scatter stream.
             reduce_scatter_view_out_event = reduce_scatter_stream.record_event()
 
+        if self.buffer.dist_index.use_hybrid_fsdp:
+            if outer_fsdp_group_grad_reduce:
+                self._pending_outer_fsdp_grad_reduce_buckets.difference_update(bucket_group)
+            else:
+                self._pending_outer_fsdp_grad_reduce_buckets.update(bucket_group)
+
         # DP-Outer Gradient Reduction
         if outer_fsdp_group_grad_reduce:
             # Wait on the DP-Shard reduction before further reduction.
@@ -3810,6 +3902,7 @@ class GradReducePipeline:
                     main_grad_buffer.copy_(reduced_grad)
 
             reduce_scatter_view_out_event = self.outer_fsdp_group_grad_reduce_stream.record_event()
+            self._pending_outer_fsdp_grad_reduce_buckets.difference_update(bucket_group)
 
         free_up_grad_bucket_func = {}
         for bucket_id in bucket_group:
