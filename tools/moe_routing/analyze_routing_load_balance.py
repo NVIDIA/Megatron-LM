@@ -28,7 +28,7 @@ For each consecutive MoE-layer pair (L_prev, L):
      Imbalance is max_gpu_load / mean_gpu_load — the slowest GPU sets MoE step
      time, so this factor bounds the load-imbalance slowdown directly.
 
-The headline number is the *recovery fraction*:
+The headline number is the recovery fraction:
     (baseline_imbalance - predicted_imbalance) / (baseline_imbalance - oracle_imbalance)
 ~1.0 means one-layer-ahead prediction closes essentially all of the achievable
 load-imbalance gap (i.e., recovers the ~10% E2E lost to imbalance).
@@ -49,9 +49,7 @@ from collections import defaultdict
 import torch
 
 
-# --------------------------------------------------------------------------- #
-# Trace / router-state loading (self-contained, mirrors the sibling scripts).
-# --------------------------------------------------------------------------- #
+# Trace / router-state loading
 def load_router_state(trace_dir):
     """Load saved per-layer router state (weight, expert_bias, score_function)."""
     pattern = os.path.join(trace_dir, "router_state_rank*.pt")
