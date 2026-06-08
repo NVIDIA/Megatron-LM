@@ -234,6 +234,15 @@ class ModalitySubmodules(ABC, nn.Module):
 
             encoder_inputs = encoders_data_batch[name]
             encoder_outputs = encoder(**encoder_inputs)
+            # Some encoders return (embeddings, aux_state). MIMO consumes the
+            # primary embedding tensor here; model-specific aux handling should
+            # live in a modality-specific submodule.
+            if (
+                isinstance(encoder_outputs, tuple)
+                and encoder_outputs
+                and torch.is_tensor(encoder_outputs[0])
+            ):
+                encoder_outputs = encoder_outputs[0]
             logger.debug(f"Encoder '{name}' output shape: {encoder_outputs.shape}")
 
             if encoder_outputs.ndim == 3:

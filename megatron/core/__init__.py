@@ -1,5 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import torch
+
 import megatron.core.tensor_parallel
 import megatron.core.utils
 from megatron.core import parallel_state
@@ -46,7 +48,11 @@ __all__ = [
     "__version__",
 ]
 
-from .safe_globals import register_safe_globals
+from .safe_globals import register_safe_globals, safe_load_from_bytes
 
 if is_torch_min_version("2.6a0"):
     register_safe_globals()
+
+# Avoid direct usage of unsafe `torch.storage._load_from_bytes` (weights_only=False)
+# Use safe implementation with weights_only=True
+torch.storage._load_from_bytes = safe_load_from_bytes

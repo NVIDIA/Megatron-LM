@@ -8,8 +8,10 @@ from torch import Tensor
 from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
@@ -19,7 +21,9 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.enums import ModelType
+from megatron.core.transformer.enums import InferenceCudaGraphScope, ModelType
+from megatron.core.transformer.module import GraphableMegatronModule
+from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_handler
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
     mtp_on_this_rank,
@@ -36,7 +40,19 @@ from megatron.core.utils import (
 logger = logging.getLogger(__name__)
 
 
-class HybridModel(LanguageModule):
+def _hybrid_logging_pg_kwargs(pg_collection: ProcessGroupCollection) -> dict:
+    tp_group = getattr(pg_collection, 'tp', None)
+    dp_cp_group = getattr(pg_collection, 'dp_cp', None)
+    if (tp_group is None) != (dp_cp_group is None):
+        raise ValueError(
+            "pg_collection.tp and pg_collection.dp_cp must both be set or both be unset."
+        )
+    if tp_group is None:
+        return {}
+    return {'tp_group': tp_group, 'dp_cp_group': dp_cp_group}
+
+
+class HybridModel(LanguageModule, GraphableMegatronModule):
     """Hybrid language model.
 
     Args:
@@ -71,7 +87,7 @@ class HybridModel(LanguageModule):
             parallel ranks. Defaults to True.
         share_embeddings_and_output_weights (bool, optional): When True, input embeddings and
             output logit weights are shared. Defaults to False.
-        position_embedding_type (Literal[learned_absolute,rope,none], optional):  Position
+        position_embedding_type (Literal[learned_absolute,rope,yarn,none], optional):  Position
             embedding type. Defaults to 'none'.
         rotary_percent (float, optional): Percent of rotary dimension to use for rotary position
             embeddings. Ignored unless position_embedding_type is 'rope'. Defaults to 1.0.
@@ -100,7 +116,7 @@ class HybridModel(LanguageModule):
         parallel_output: bool = True,
         share_embeddings_and_output_weights: bool = False,
         # Mamba with no attention has no need for position embeddings, so none is default
-        position_embedding_type: Literal['learned_absolute', 'rope', 'none'] = 'none',
+        position_embedding_type: Literal['learned_absolute', 'rope', 'yarn', 'none'] = 'none',
         rotary_percent: float = 1.0,
         rotary_base: int = 10000,
         scatter_embedding_sequence_parallel: bool = True,
@@ -184,12 +200,15 @@ class HybridModel(LanguageModule):
         self.mtp_pattern = parsed.mtp_pattern
         self.mtp_num_depths = parsed.mtp_num_depths
 
+        logging_pg_kwargs = _hybrid_logging_pg_kwargs(self.pg_collection)
+
         layer_type_list, layer_offset = select_pipeline_segment(
             parsed.main_pattern or '',
             self.pg_collection.pp,
             vp_stage,
             first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
             last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
+            **logging_pg_kwargs,
         )
 
         # Determine if MTP is needed (based on pattern parsing)
@@ -200,7 +219,12 @@ class HybridModel(LanguageModule):
             # to split the hybrid layer pattern into pipeline stages before parsing the pattern for
             # the current pipeline stage. This could also enable MTP standalone (MTP in a pipeline
             # stage separate from loss) to be supported in the hybrid model.
-            and mtp_on_this_rank(self.config, ignore_virtual=False, vp_stage=self.vp_stage)
+            and mtp_on_this_rank(
+                layout=self.config.pipeline_model_parallel_layout,
+                mtp_num_layers=self.config.mtp_num_layers,
+                ignore_virtual=False,
+                vp_stage=self.vp_stage,
+            )
         )
 
         # megatron core pipelining currently depends on model type
@@ -228,7 +252,26 @@ class HybridModel(LanguageModule):
                 use_cpu_initialization=self.config.use_cpu_initialization,
                 cp_group=self.pg_collection.cp,
             )
-
+        elif self.position_embedding_type == 'yarn':
+            self.rotary_pos_emb = YarnRotaryEmbedding(
+                kv_channels=self.config.kv_channels,
+                rotary_percent=rotary_percent,
+                seq_len_interpolation_factor=seq_len_interpolation_factor,
+                rotary_base=rotary_base,
+                scaling_factor=getattr(self.config, "yarn_rotary_scaling_factor"),
+                original_max_position_embeddings=getattr(
+                    self.config, "yarn_original_max_position_embeddings"
+                ),
+                beta_fast=getattr(self.config, "yarn_beta_fast"),
+                beta_slow=getattr(self.config, "yarn_beta_slow"),
+                mscale=getattr(self.config, "yarn_mscale"),
+                mscale_all_dim=getattr(self.config, "yarn_mscale_all_dim"),
+                correction_range_round_to_int=getattr(
+                    self.config, "yarn_correction_range_round_to_int"
+                ),
+                use_cpu_initialization=self.config.use_cpu_initialization,
+                cp_group=self.pg_collection.cp,
+            )
         self.decoder = build_module(
             hybrid_stack_spec,
             self.config,
@@ -238,6 +281,7 @@ class HybridModel(LanguageModule):
             post_process=self.post_process,
             dtype=config.params_dtype,
             pg_collection=self.pg_collection,
+            name="decoder",
         )
 
         # MTP block - uses mtp_block_spec from hybrid_stack_spec.submodules
@@ -257,7 +301,9 @@ class HybridModel(LanguageModule):
                 mtp_layer_pattern=self.mtp_pattern,
                 mtp_num_depths=self.mtp_num_depths,
                 hybrid_submodules=hybrid_submodules,
+                name="mtp",
             )
+            self._setup_mtp_cuda_graphs()
 
         # Output
         if post_process or self.mtp_process:
@@ -308,6 +354,7 @@ class HybridModel(LanguageModule):
             vp_size=self.config.virtual_pipeline_model_parallel_size,
             vp_stage=self.vp_stage,
             min_offloaded_tensor_size=self.config.min_offloaded_tensor_size,
+            max_inflight_offloads=self.config.fine_grained_offloading_max_inflight_offloads,
         )
         if self.disable_param_offloading:
             for param in self.decoder.parameters():
@@ -319,6 +366,48 @@ class HybridModel(LanguageModule):
                 for param in self.output_layer.parameters():
                     off_interface.mark_not_offloadable(param)
             self.disable_param_offloading = False
+
+    def preprocess_for_paged_stash(self):
+        """Preprocess for paged stash."""
+        return paged_stash_init_chunk_handler(
+            vp_size=self.config.virtual_pipeline_model_parallel_size, vp_stage=self.vp_stage
+        )
+
+    def _should_call_local_cudagraph(self, *args, **kwargs):
+        """
+        Check if we should call the local cudagraph path.
+        """
+        if (
+            InferenceMode.is_active()
+            and hasattr(self, 'cudagraph_manager')
+            and (
+                kwargs.get('inference_context') is not None
+                or kwargs.get('inference_params') is not None
+            )
+            and self.config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+        ):
+            if kwargs['inference_context'].is_static_batching():
+                using_cuda_graph = kwargs['inference_context'].is_decode_only()
+            else:
+                using_cuda_graph = kwargs['inference_context'].using_cuda_graph_this_step()
+
+            if using_cuda_graph:
+                return True
+        return False
+
+    def __call__(self, *args, **kwargs):
+        if self._should_call_local_cudagraph(*args, **kwargs):
+            return super().__call__(*args, **kwargs)[0]
+        return super().__call__(*args, **kwargs)
+
+    def create_mcore_cudagraph_manager(self, config):
+        """
+        Create the cudagraph manager for the full iteration inference scope
+        """
+        if config.inference_cuda_graph_scope == InferenceCudaGraphScope.block:
+            from megatron.core.transformer.cuda_graphs import CudaGraphManager
+
+            self.cudagraph_manager = CudaGraphManager(config)
 
     def forward(
         self,
@@ -334,7 +423,6 @@ class HybridModel(LanguageModule):
         loss_mask: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask: Optional[Tensor] = None,
-        is_spec_decode: Optional[bool] = None,
     ) -> Tensor:
         """Forward function of the Hybrid model. This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -348,9 +436,12 @@ class HybridModel(LanguageModule):
         if self.config.fine_grained_activation_offloading:
             self.preprocess_for_fine_grained_offloading()
 
+        if self.config.moe_paged_stash:
+            self.preprocess_for_paged_stash()
+
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        in_inference_mode = inference_context is not None and not self.training
+        in_inference_mode = InferenceMode.is_active()
 
         if in_inference_mode:
             assert runtime_gather_output, "Inference must always gather TP logits"
@@ -365,6 +456,7 @@ class HybridModel(LanguageModule):
             # quantization scales to avoid corrupting amax calculations
             if (
                 in_inference_mode
+                and inference_context is not None
                 and inference_context.is_dynamic_batching()
                 and is_using_quantization_scales(self.config)
             ):
@@ -380,6 +472,15 @@ class HybridModel(LanguageModule):
                 inference_context, self.decoder, decoder_input, self.config, packed_seq_params
             )
             rotary_pos_emb = self.rotary_pos_emb(
+                rotary_seq_len,
+                packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
+            )
+        elif self.position_embedding_type == 'yarn':
+            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+                inference_context, self.decoder, decoder_input, self.config, packed_seq_params
+            )
+            # YarnRotaryEmbedding.forward returns (emb, mscale); discard mscale here
+            rotary_pos_emb, _ = self.rotary_pos_emb(
                 rotary_seq_len,
                 packed_seq=packed_seq_params is not None and packed_seq_params.qkv_format == 'thd',
             )
@@ -417,12 +518,12 @@ class HybridModel(LanguageModule):
         # Check if speculative decoding is active. When it is, MTP must be
         # computed *after* verification so that it is conditioned on verified
         # tokens rather than stale speculative tokens from the previous step.
-        if is_spec_decode is None:
-            is_spec_decode = (
-                in_inference_mode
-                and inference_context.is_dynamic_batching()
-                and inference_context.num_speculative_tokens > 0
-            )
+        is_spec_decode = (
+            in_inference_mode
+            and inference_context is not None
+            and inference_context.is_dynamic_batching()
+            and inference_context.num_speculative_tokens > 0
+        )
 
         mtp_forward_ran = self.mtp_process and not (in_inference_mode or is_spec_decode)
         if mtp_forward_ran:
@@ -445,6 +546,8 @@ class HybridModel(LanguageModule):
             if in_inference_mode or is_spec_decode:
                 self._decoder_hidden_states_cache = hidden_states
             else:
+                # For RL (labels is None), process_mtp_loss derives labels from
+                # input_ids to match the SFT label format.
                 hidden_states = process_mtp_loss(
                     hidden_states=hidden_states,
                     labels=labels,
@@ -456,11 +559,17 @@ class HybridModel(LanguageModule):
                     compute_language_model_loss=self.compute_language_model_loss,
                     config=self.config,
                     cp_group=self.pg_collection.cp,
+                    tp_group=self.tp_group,
                     packed_seq_params=packed_seq_params,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
+                    input_ids=input_ids,
                 )
         sequence_parallel_override = False
-        if in_inference_mode and inference_context.config.materialize_only_last_token_logits:
+        if (
+            in_inference_mode
+            and inference_context is not None
+            and inference_context.config.materialize_only_last_token_logits
+        ):
             if inference_context.is_static_batching():
                 hidden_states = hidden_states[-1:, :, :]
             else:

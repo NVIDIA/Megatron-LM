@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 import torch
 
 from megatron.core.distributed import DistributedDataParallel
+from megatron.core.models.mimo.comm.colocated_communicator import ColocatedBridgeCommunicator
 from megatron.core.models.mimo.config import MimoModelConfig
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY, ModuleLayout, RankRole
 from megatron.core.models.mimo.partition.utils import PartitionAdapter, PartitionConfig
@@ -59,10 +60,12 @@ class MimoModel(MegatronModule):
 
         self.mimo_config = mimo_config
         modality_names = list(mimo_config.modality_submodules_spec.keys())
-        if mimo_config.module_to_grid_map:
-            self.role = RankRole.from_grid_map(mimo_config.module_to_grid_map, modality_names)
-        else:
-            self.role = RankRole.unified(modality_names + [MIMO_LANGUAGE_MODULE_KEY])
+        self.colocated_comms = {}
+        self.role = RankRole.build(modality_names, mimo_config.module_to_grid_map)
+        if self.role.mode is ModuleLayout.COLOCATED and mimo_config.module_to_grid_map:
+            # Per-encoder bridge needed iff modules share ranks but may differ
+            # in TP/DP within those ranks.
+            self._build_colocated_communicators()
 
         # Use special token IDs from the config
         self.special_token_ids = (
@@ -295,9 +298,14 @@ class MimoModel(MegatronModule):
         batch_idx, seq_idx = text_mask.nonzero(as_tuple=True)
         input_ids_text = input_ids[batch_idx, seq_idx].unsqueeze(0)
 
-        position_ids_text = (
-            position_ids[batch_idx, seq_idx].unsqueeze(0) if position_ids is not None else None
-        )
+        if position_ids is None:
+            position_ids_text = None
+        elif position_ids.dim() == 3:
+            # Multimodal RoPE can carry [rope_dim, batch, seq] ids. Text
+            # embedding lookup only needs a single absolute position channel.
+            position_ids_text = position_ids[0, batch_idx, seq_idx].unsqueeze(0)
+        else:
+            position_ids_text = position_ids[batch_idx, seq_idx].unsqueeze(0)
 
         text_embeddings = (
             unwrap_model(self.language_model)
@@ -358,7 +366,7 @@ class MimoModel(MegatronModule):
         # Get any tensors passed via set_input_tensor
         input_tensors = getattr(self, 'input_tensors', None)
 
-        if self.role.mode == ModuleLayout.UNIFIED:
+        if self.role.mode == ModuleLayout.COLOCATED:
             return self._forward_all_modules(
                 input_ids,
                 position_ids,
@@ -371,7 +379,7 @@ class MimoModel(MegatronModule):
 
         if self.role.mode == ModuleLayout.NON_COLOCATED:
             if self.role.has_modality_modules:
-                return self._forward_encoders(modality_inputs, input_tensors), loss_mask
+                return self._forward_encoders(input_ids, modality_inputs, input_tensors), loss_mask
 
             if self.role.has_language_module:
                 return (
@@ -387,6 +395,7 @@ class MimoModel(MegatronModule):
 
     def _forward_encoders(
         self,
+        input_ids: Optional[torch.Tensor],
         modality_inputs: Optional[Dict[str, Dict[str, Any]]],
         input_tensors: Optional[Dict[str, torch.Tensor]],
     ) -> Dict[str, torch.Tensor]:
@@ -406,15 +415,87 @@ class MimoModel(MegatronModule):
                 continue
 
             submodule = self.modality_submodules[encoder_name]
-            output = submodule.forward(
-                encoder_inputs=modality_inputs.get(encoder_name) if modality_inputs else None,
-                hidden_states=input_tensors.get(encoder_name) if input_tensors else None,
-            )
+            encoder_inputs = modality_inputs.get(encoder_name) if modality_inputs else None
+            hidden_states = input_tensors.get(encoder_name) if input_tensors else None
+            output = submodule.forward(encoder_inputs=encoder_inputs, hidden_states=hidden_states)
+            if output is None and encoder_inputs is None and hidden_states is None:
+                if self._has_encoder_tokens(input_ids, encoder_name):
+                    raise RuntimeError(
+                        f"{encoder_name} inputs are missing, but matching special tokens exist"
+                    )
+                output = self._empty_encoder_output(encoder_name)
 
             if output is not None:
+                self._attach_modality_split_sizes(output, input_ids, encoder_name)
                 outputs[encoder_name] = output
 
         return outputs
+
+    def _attach_modality_split_sizes(
+        self, output: torch.Tensor, input_ids: Optional[torch.Tensor], encoder_name: str
+    ) -> None:
+        """Annotate flat modality outputs with per-sample split sizes for bridge fan-out.
+
+        Only attaches when per-sample token counts are non-uniform. Uniform counts
+        give equal splits, which the bridge's ``torch.tensor_split`` fallback
+        already produces, so the metadata would be a no-op.
+
+        TODO(mimo): non-uniform per-sample counts in fan-in (encoder DP > LM DP)
+        are not supported. Multiple encoder ranks contribute slices to a single
+        LM peer, and the receiver-side ``torch.cat`` path in BridgeCommunicator
+        has no metadata channel today, so per-sample boundaries are lost on the
+        LM rank. Lift this by routing per-sample sizes through the bridge
+        alongside the activations and adding a sample-aligned concat path.
+        """
+        token_id = self.special_token_ids.get(encoder_name)
+        if token_id is None or input_ids is None or output.ndim != 2 or input_ids.size(0) <= 1:
+            return
+
+        split_sizes = (input_ids == token_id).sum(dim=1).to(torch.long).tolist()
+        if sum(split_sizes) != output.size(0):
+            return
+        if len(set(split_sizes)) <= 1:
+            # Uniform counts — tensor_split fallback gives the same result.
+            return
+
+        if self.role.mode is ModuleLayout.NON_COLOCATED:
+            grid_map = self.mimo_config.module_to_grid_map
+            encoder_grid = grid_map[encoder_name]
+            language_grid = grid_map[MIMO_LANGUAGE_MODULE_KEY]
+            encoder_dp = encoder_grid.shape[encoder_grid.dim_names.index("dp")]
+            language_dp = language_grid.shape[language_grid.dim_names.index("dp")]
+            assert encoder_dp <= language_dp, (
+                f"Bridge fan-out split metadata with non-uniform per-sample sizes "
+                f"requires encoder DP <= LM DP (got encoder='{encoder_name}' "
+                f"DP={encoder_dp}, LM DP={language_dp}). Fan-in with variable "
+                f"modality token counts is not supported yet — see TODO in "
+                f"_attach_modality_split_sizes."
+            )
+
+        output._mimo_bridge_split_sizes = split_sizes
+
+    def _has_encoder_tokens(self, input_ids: Optional[torch.Tensor], encoder_name: str) -> bool:
+        """Return whether the batch contains tokens for an encoder module."""
+        if input_ids is None or encoder_name not in self.special_token_ids:
+            return False
+        return bool((input_ids == self.special_token_ids[encoder_name]).any().item())
+
+    def _empty_encoder_output(self, encoder_name: str) -> torch.Tensor:
+        """Return the bridge payload for text-only non-colocated batches."""
+        language_config = self.mimo_config.language_model_spec.params['config']
+        hidden_size = getattr(language_config, 'hidden_size', None)
+        if hidden_size is None:
+            raise ValueError(
+                "Language model config must define hidden_size for empty modality output"
+            )
+
+        output_dtype = getattr(language_config, 'params_dtype', None) or torch.float32
+        return torch.empty(
+            (0, hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=output_dtype,
+            requires_grad=True,
+        )
 
     def _forward_language_module(
         self,
@@ -461,8 +542,11 @@ class MimoModel(MegatronModule):
             )
 
             lm_output = self.language_model(
+                # decoder_input replaces the embedding lookup, so input_ids is
+                # unused here; position_ids is still consumed by mRoPE in models
+                # such as Qwen3-VL.
                 input_ids=None,
-                position_ids=None,
+                position_ids=position_ids,
                 decoder_input=combined_embeddings,
                 labels=labels,
                 attention_mask=attention_mask,
@@ -478,8 +562,10 @@ class MimoModel(MegatronModule):
                     underlying_lm.set_input_tensor(hidden_states)
 
             lm_output = self.language_model(
+                # Hidden states arrive via set_input_tensor; position_ids is
+                # still consumed by mRoPE on non-first PP stages.
                 input_ids=None,
-                position_ids=None,
+                position_ids=position_ids,
                 decoder_input=None,
                 labels=labels,
                 attention_mask=attention_mask,
@@ -490,6 +576,47 @@ class MimoModel(MegatronModule):
             return {lang_name: lm_output}
 
         return lm_output
+
+    def _build_colocated_communicators(self):
+        grid_map = self.mimo_config.module_to_grid_map
+        if any(
+            'tp' not in grid.dim_names or 'dp' not in grid.dim_names for grid in grid_map.values()
+        ):
+            logger.info(
+                "Skipping colocated communicator setup because module_to_grid_map "
+                "does not define TP/DP topology for every module."
+            )
+            return
+
+        lang_key = MIMO_LANGUAGE_MODULE_KEY
+        lang_grid = grid_map[lang_key]
+        for mod_name in self.mimo_config.modality_submodules_spec:
+            if mod_name == lang_key:
+                continue
+            self.colocated_comms[(mod_name, lang_key)] = ColocatedBridgeCommunicator(
+                src_grid=grid_map[mod_name],
+                dest_grid=lang_grid,
+                src_module_name=mod_name,
+                dest_module_name=lang_key,
+                dim_mapping={'b': 0, 'h': 1},
+            )
+
+    def destroy(self) -> None:
+        """Release process groups owned by this MimoModel."""
+        for comm in self.colocated_comms.values():
+            comm.destroy()
+        self.colocated_comms.clear()
+
+    def _apply_colocated_comms(self, modality_embeddings):
+        """Transform encoder embeddings from encoder TP/DP to LLM TP/DP layout."""
+        lang_key = MIMO_LANGUAGE_MODULE_KEY
+        for modality_name in list(modality_embeddings.keys()):
+            comm = self.colocated_comms.get((modality_name, lang_key))
+            if comm is not None:
+                modality_embeddings[modality_name] = comm.communicate(
+                    modality_embeddings[modality_name]
+                )
+        return modality_embeddings
 
     def _forward_all_modules(
         self,
@@ -533,6 +660,10 @@ class MimoModel(MegatronModule):
                         f"Generated embeddings for {modality_name} with shape {embeddings.shape}"
                     )
 
+        # Apply colocated communication if configured (no-op when colocated_comms is empty)
+        if self.colocated_comms:
+            modality_embeddings = self._apply_colocated_comms(modality_embeddings)
+
         # Get text embeddings
         text_embeddings = self.get_text_embeddings(input_ids, position_ids, self.special_token_ids)
         logger.debug(f"Generated text embeddings with shape {text_embeddings.shape}")
@@ -570,8 +701,11 @@ class MimoModel(MegatronModule):
 
         # 5. Forward pass through language model
         lm_output = self.language_model(
+            # decoder_input replaces the embedding lookup, so input_ids is
+            # unused here; position_ids is still consumed by mRoPE in models
+            # such as Qwen3-VL.
             input_ids=None,
-            position_ids=None,
+            position_ids=position_ids,
             decoder_input=combined_embeddings,
             labels=labels,
             attention_mask=None,
