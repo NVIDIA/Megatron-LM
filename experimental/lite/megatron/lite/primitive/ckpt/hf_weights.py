@@ -124,6 +124,33 @@ def save_safetensors(
     _safe_save(tensors, os.path.join(path, filename))
 
 
+def _resolve_export_dtype(export_dtype: str | torch.dtype | None) -> torch.dtype | None:
+    if export_dtype is None:
+        return None
+    if isinstance(export_dtype, torch.dtype):
+        return export_dtype
+    normalized = str(export_dtype).lower()
+    aliases = {
+        "bf16": torch.bfloat16,
+        "bfloat16": torch.bfloat16,
+        "fp16": torch.float16,
+        "float16": torch.float16,
+        "half": torch.float16,
+        "fp32": torch.float32,
+        "float32": torch.float32,
+        "float": torch.float32,
+    }
+    if normalized not in aliases:
+        raise ValueError(f"Unsupported export_dtype={export_dtype!r}")
+    return aliases[normalized]
+
+
+def _cast_export_tensor(tensor: torch.Tensor, export_dtype: torch.dtype | None) -> torch.Tensor:
+    if export_dtype is None or not tensor.is_floating_point():
+        return tensor
+    return tensor.to(dtype=export_dtype)
+
+
 # ======================================================================
 # Tensor utilities
 # ======================================================================
@@ -361,6 +388,7 @@ def export_hf_weights(
     vocab_size: int | None = None,
     limit: int | None = None,
     rank0_only: bool = False,
+    export_dtype: str | torch.dtype | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Export model weights as HF-format (name, tensor) pairs.
 
@@ -377,6 +405,7 @@ def export_hf_weights(
         chunks = [model]
 
     rank = dist.get_rank() if dist.is_initialized() else 0
+    resolved_export_dtype = _resolve_export_dtype(export_dtype)
 
     if ps.pp_size <= 1:
         exported_params = 0
@@ -402,7 +431,8 @@ def export_hf_weights(
                     for native_name, gathered_tensor in gathered_one.items():
                         if vocab_size is not None and ("embed" in native_name or "head" in native_name):
                             gathered_tensor = gathered_tensor[:vocab_size]
-                        yield from spec.native_to_hf(native_name, gathered_tensor)
+                        for hf_name, hf_tensor in spec.native_to_hf(native_name, gathered_tensor):
+                            yield hf_name, _cast_export_tensor(hf_tensor, resolved_export_dtype)
 
                 if limit is not None and exported_params >= limit:
                     return
@@ -447,7 +477,8 @@ def export_hf_weights(
 
     # Convert Megatron Lite names → HF names via spec
     for native_name, tensor in gathered.items():
-        yield from spec.native_to_hf(native_name, tensor)
+        for hf_name, hf_tensor in spec.native_to_hf(native_name, tensor):
+            yield hf_name, _cast_export_tensor(hf_tensor, resolved_export_dtype)
 
 
 def _gather_dense(name: str, tensor: torch.Tensor, spec: HFWeights, ps) -> torch.Tensor:

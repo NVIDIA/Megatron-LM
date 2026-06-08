@@ -81,6 +81,47 @@ def test_qwen35_export_uses_hf_checkpoint_names_without_module_prefix() -> None:
     assert all(not name.startswith(("embed.", "norm.", "head.")) for name in exported)
 
 
+def test_qwen35_export_dtype_cast_is_opt_in() -> None:
+    class TinyQwen35Module(nn.Module):
+        def __init__(self, config: Qwen35Config) -> None:
+            super().__init__()
+            self.norm = nn.LayerNorm(8)
+            self.layers = nn.ModuleList([nn.Module()])
+            self.layers[0].moe = nn.Module()
+            self.layers[0].moe.experts = nn.Module()
+            self.layers[0].moe.experts.fc1 = nn.Module()
+
+            rows = config.moe_intermediate_size * 2
+            for expert_idx in range(config.num_experts):
+                tensor = torch.arange(rows * config.hidden_size, dtype=torch.float32).reshape(
+                    rows,
+                    config.hidden_size,
+                )
+                tensor = tensor + expert_idx * 1000
+                self.layers[0].moe.experts.fc1.register_parameter(
+                    f"weight{expert_idx}",
+                    nn.Parameter(tensor),
+                )
+
+    cfg = _tiny_config()
+    model = TinyQwen35Module(cfg)
+
+    default_export = dict(export_hf_weights(model, cfg, _single_rank_parallel_state()))
+    bf16_export = dict(
+        export_hf_weights(
+            model,
+            cfg,
+            _single_rank_parallel_state(),
+            export_dtype="bfloat16",
+        )
+    )
+
+    assert default_export["model.language_model.norm.weight"].dtype == torch.float32
+    assert bf16_export["model.language_model.norm.weight"].dtype == torch.bfloat16
+    assert default_export["model.language_model.layers.0.mlp.experts.gate_up_proj"].dtype == torch.float32
+    assert bf16_export["model.language_model.layers.0.mlp.experts.gate_up_proj"].dtype == torch.bfloat16
+
+
 def test_qwen35_export_maps_top_level_and_layer_norm_names() -> None:
     cfg = _tiny_config()
     spec = Qwen35WeightSpec(cfg)

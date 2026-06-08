@@ -304,6 +304,8 @@ class MegatronLiteEngine(BaseEngine):
             for key in ("limit", "include_mtp_only", "include_local_prefixes")
             if key in kwargs
         }
+        if self.engine_config.export_dtype:
+            export_kwargs["export_dtype"] = self.engine_config.export_dtype
         return self.runtime.export_weights(self.handle, **export_kwargs), None
 
     def get_data_parallel_size(self):

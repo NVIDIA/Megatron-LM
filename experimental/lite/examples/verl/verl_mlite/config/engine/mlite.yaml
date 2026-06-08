@@ -7,6 +7,7 @@ optimizer_offload: false
 grad_offload: false
 forward_only: false
 dtype: bfloat16
+export_dtype: bfloat16
 
 model_name: auto
 impl: lite

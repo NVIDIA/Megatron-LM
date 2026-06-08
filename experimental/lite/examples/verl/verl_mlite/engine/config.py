@@ -27,6 +27,7 @@ class MegatronLiteEngineConfig(EngineConfig):
 
     attention_backend_override: str | None = "flash"
     router_aux_loss_coef: float | None = None
+    export_dtype: str | None = "bfloat16"
     impl_cfg: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
