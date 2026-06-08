@@ -19,10 +19,6 @@ pytestmark = [
     pytest.mark.smoke,
     pytest.mark.gpu,
     pytest.mark.distributed,
-    pytest.mark.xfail(
-        reason="MLite distopt checkpoint continuity is covered by a follow-up bugfix PR.",
-        strict=True,
-    ),
 ]
 
 

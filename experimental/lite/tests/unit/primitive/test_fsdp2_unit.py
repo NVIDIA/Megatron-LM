@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import importlib
 from types import SimpleNamespace
 
@@ -331,3 +332,56 @@ def test_fp32_adamw_state_dict_roundtrip_cpu():
     torch.testing.assert_close(loaded_state["exp_avgs"][0], state["exp_avgs"][0])
     torch.testing.assert_close(loaded_state["exp_avg_sqs"][0], state["exp_avg_sqs"][0])
     assert loaded_state["steps"] == state["steps"]
+
+
+@pytest.mark.parametrize("cpu_update", [False, True])
+def test_fp32_adamw_load_matches_uninterrupted_next_step_cpu(cpu_update: bool):
+    def build(initial_value: torch.Tensor):
+        param = nn.Parameter(initial_value.clone().to(dtype=torch.bfloat16))
+        optimizer = build_adamw_optimizer(
+            [{"params": [param], "weight_decay": 0.0}],
+            all_params=[param],
+            lr=0.1,
+            weight_decay=0.0,
+            betas=(0.9, 0.99),
+            eps=1.0e-8,
+            foreach=False,
+            use_fp32_master=True,
+            cpu_update=cpu_update,
+            model_param_dtypes={id(param): torch.bfloat16},
+            opt=SimpleNamespace(),
+        )
+        return param, optimizer
+
+    initial = torch.tensor([1.0, -2.0], dtype=torch.float32)
+    first_grad = torch.tensor([0.5, -0.25], dtype=torch.bfloat16)
+    second_grad = torch.tensor([-0.125, 0.375], dtype=torch.bfloat16)
+
+    ckpt_param, ckpt_optimizer = build(initial)
+    direct_param, direct_optimizer = build(initial)
+    loaded_param, loaded_optimizer = build(initial)
+
+    ckpt_param.grad = first_grad.clone()
+    ckpt_optimizer.step()
+    direct_param.grad = first_grad.clone()
+    direct_optimizer.step()
+
+    saved_param = ckpt_param.detach().clone()
+    saved_state = copy.deepcopy(ckpt_optimizer.state_dict())
+
+    with torch.no_grad():
+        loaded_param.copy_(saved_param)
+    loaded_optimizer.load_state_dict(saved_state)
+
+    direct_param.grad = second_grad.clone()
+    direct_optimizer.step()
+    loaded_param.grad = second_grad.clone()
+    loaded_optimizer.step()
+
+    torch.testing.assert_close(loaded_param, direct_param, atol=0.0, rtol=0.0)
+    direct_state = direct_optimizer.state_dict()
+    loaded_state = loaded_optimizer.state_dict()
+    assert loaded_state["step_count"] == direct_state["step_count"]
+    for key in ("master_params", "exp_avgs", "exp_avg_sqs"):
+        torch.testing.assert_close(loaded_state[key][0], direct_state[key][0], atol=0.0, rtol=0.0)
+    assert loaded_state["steps"] == direct_state["steps"]
