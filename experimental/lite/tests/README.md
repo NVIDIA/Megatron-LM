@@ -24,14 +24,20 @@ Current matrix:
 
 | Surface | Unit | Smoke |
 | --- | --- | --- |
-| TP/EP/PP/CP topology | `unit/primitive/test_parallel_unit.py` | `smoke/primitive/test_parallel_topologies_smoke.py` |
+| TP/EP/PP/CP/SP topology | `unit/primitive/test_parallel_unit.py`, `unit/primitive/test_parallel_dimensions_independent_unit.py` | `smoke/primitive/test_parallel_topologies_smoke.py` |
+| TP linear/vocab primitives | `unit/primitive/test_parallel_dimensions_independent_unit.py` | Qwen model smoke exercises TP linear surfaces |
+| EP token dispatch | `unit/primitive/test_parallel_dimensions_independent_unit.py` | Qwen model smoke exercises router, dispatcher, and experts |
 | THD packing helpers | `unit/primitive/test_parallel_unit.py` | CP topology smoke exercises distributed CP groups |
 | GQA/attention split contract | `unit/primitive/test_attention_moe_unit.py` | Qwen model smoke exercises attention forward/backward |
 | MoE router/aux-loss contract | `unit/primitive/test_attention_moe_unit.py` | Qwen model smoke exercises router, dispatcher, and experts |
-| DDP + distributed optimizer | `unit/primitive/test_checkpoint_unit.py` has xfail checkpoint contract sentinels | `smoke/primitive/test_distopt_checkpoint_smoke.py` is xfail until the follow-up bugfix PR |
+| LoRA adapter primitives | `unit/primitive/test_module_primitives_independent_unit.py` | Qwen model smoke can enable adapters in follow-up coverage |
+| MTP/MRoPE/Gated Delta helper contracts | `unit/primitive/test_module_primitives_independent_unit.py`, `unit/primitive/test_ops_data_trainstep_unit.py` | Qwen3.5 model smoke exercises MRoPE/Gated DeltaNet paths |
+| Loss/logprob/math ops | `unit/primitive/test_ops_data_trainstep_unit.py` | Qwen model smoke exercises loss plumbing |
+| Data/recompute/train-step primitives | `unit/primitive/test_ops_data_trainstep_unit.py` | model/runtime smoke exercises training loop integration |
+| DDP + distributed optimizer | `unit/primitive/test_checkpoint_unit.py`, `unit/primitive/test_checkpoint_runtime.py` | `smoke/primitive/test_distopt_checkpoint_smoke.py` |
 | FSDP2 config/wrap/offload | `unit/primitive/test_fsdp2_unit.py` | `smoke/primitive/test_fsdp2_offload_checkpoint_smoke.py` |
-| FSDP2 save/load resume | `unit/primitive/test_checkpoint_unit.py` has xfail checkpoint contract sentinels | FSDP2 checkpoint smoke is xfail until the follow-up bugfix PR |
-| Checkpoint restore vs direct training | xfail sentinels only in this validation PR | FSDP2 and distopt checkpoint smokes are xfail until the follow-up bugfix PR |
+| FSDP2 save/load resume | `unit/primitive/test_checkpoint_unit.py`, `unit/primitive/test_checkpoint_runtime.py` | `smoke/primitive/test_fsdp2_offload_checkpoint_smoke.py` |
+| Checkpoint restore vs direct training | `unit/primitive/test_checkpoint_unit.py`, `unit/primitive/test_checkpoint_runtime.py` | FSDP2 and distopt checkpoint smokes cover distributed restore paths |
 | Runtime backend registry/config | `unit/primitive/test_runtime_config_unit.py`, `unit/runtime/test_runtime_backend_unit.py` | covered through checkpoint/model handles |
 | Runtime env/offload controls | `unit/runtime/test_runtime_backend_unit.py` | `smoke/primitive/test_fsdp2_offload_checkpoint_smoke.py` |
 | Optimizer update-state offload fraction | `unit/primitive/test_runtime_config_unit.py` and single-process CUDA coverage in `unit/primitive/test_fsdp2_offload_gpu.py` | multi-rank FSDP2 grad clipping is xfail until the follow-up bugfix PR |
