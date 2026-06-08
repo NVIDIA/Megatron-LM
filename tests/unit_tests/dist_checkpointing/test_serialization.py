@@ -830,7 +830,13 @@ class TestNonStrictLoad:
             'ObjB': ShardedObject(
                 'ObjB', {Utils.rank + 7}, (1, Utils.world_size), (0, Utils.rank), replica_id=0
             ),
-            'common_state': {},
+            'common_state': ShardedObject(
+                key="common_state",
+                data={},
+                global_shape=(1,),
+                global_offset=(0,),
+                replica_id=torch.distributed.get_rank(),
+            ),
         }
 
     @pytest.mark.parametrize('validate_integrity', [True, False])
