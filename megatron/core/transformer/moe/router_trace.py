@@ -1,12 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Router decision tracing for MoE models — training and inference.
+"""Router decision tracing for MoE models for both training and inference.
 
 Captures per-layer top-K routing decisions to a JSONL file for offline
 analysis of routing patterns (e.g., layer-to-layer top-K overlap, expert
 load balance, predictor accuracy for speculative expert prefetch).
-
-Works in two modes:
 
 - **Inference mode** (default): step boundaries are auto-detected by
   watching for layer repeats.  When a layer that already fired this step
@@ -77,7 +75,9 @@ def init_tracer(
     if _TRACER is not None:
         return
     _TRACER = RouterTracer(
-        output_dir, max_steps, rank,
+        output_dir,
+        max_steps,
+        rank,
         training_mode=training_mode,
         capture_hidden_states=capture_hidden_states,
         capture_logits=capture_logits,
@@ -305,7 +305,8 @@ class RouterTracer:
                         "weight": weight.detach().to("cpu", dtype=torch.float32).clone(),
                         "expert_bias": (
                             expert_bias.detach().to("cpu", dtype=torch.float32).clone()
-                            if torch.is_tensor(expert_bias) else None
+                            if torch.is_tensor(expert_bias)
+                            else None
                         ),
                         "score_function": score_fn,
                         "topk": topk_attr,
@@ -395,9 +396,7 @@ class RouterTracer:
                 self._logits_file.close()
                 self._logits_file = None
             if self.dump_router_weights and self._router_state:
-                weights_path = os.path.join(
-                    self.output_dir, f"router_state_rank{self.rank}.pt"
-                )
+                weights_path = os.path.join(self.output_dir, f"router_state_rank{self.rank}.pt")
                 torch.save(self._router_state, weights_path)
                 self._router_state = {}
 
@@ -406,6 +405,7 @@ def _unwrap_model(model):
     """Unwrap DDP/FSDP wrappers to get the underlying module."""
     try:
         from megatron.core.utils import unwrap_model
+
         return unwrap_model(model)
     except Exception:
         # Fallback: strip common wrappers manually.
