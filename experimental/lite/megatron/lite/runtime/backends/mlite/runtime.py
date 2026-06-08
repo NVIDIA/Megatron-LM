@@ -265,6 +265,12 @@ class MegatronLiteRuntime(RuntimeBase):
 
         use_dcp = bool(kwargs.pop("use_dcp", False))
         load_rng = bool(kwargs.pop("load_rng", True))
+        update_legacy_format = bool(
+            kwargs.pop(
+                "load_parameter_state_update_legacy_format",
+                kwargs.pop("update_legacy_format", False),
+            )
+        )
         get_placements, is_expert = _checkpoint_hooks(handle)
         return load_training_checkpoint(
             _checkpoint_model(handle, use_dcp=use_dcp),
@@ -276,6 +282,7 @@ class MegatronLiteRuntime(RuntimeBase):
             is_expert=kwargs.pop("is_expert", is_expert),
             use_dcp=use_dcp,
             load_rng=load_rng,
+            load_parameter_state_update_legacy_format=update_legacy_format,
             **kwargs,
         )
 

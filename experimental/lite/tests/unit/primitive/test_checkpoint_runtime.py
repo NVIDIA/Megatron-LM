@@ -9,6 +9,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from megatron.lite.primitive.ckpt import save_training_checkpoint
 from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.config import ParallelConfig
 from megatron.lite.runtime.contracts.handle import ModelHandle
@@ -89,6 +90,7 @@ class DistOptLike:
         self.load_calls = 0
         self.parameter_save_calls = 0
         self.parameter_load_calls = 0
+        self.update_legacy_format = None
 
     def zero_grad(self):
         self.optimizer.zero_grad(set_to_none=True)
@@ -112,9 +114,9 @@ class DistOptLike:
         torch.save({"parameter_save_calls": self.parameter_save_calls}, filename)
 
     def load_parameter_state(self, filename: str, *, update_legacy_format: bool = False):
-        del update_legacy_format
         state = torch.load(filename, weights_only=False)
         self.parameter_load_calls = int(state["parameter_save_calls"])
+        self.update_legacy_format = update_legacy_format
 
 
 def test_runtime_local_checkpoint_uses_optimizer_parameter_state_contract(tmp_path):
@@ -139,9 +141,11 @@ def test_runtime_local_checkpoint_uses_optimizer_parameter_state_contract(tmp_pa
     assert runtime.load_checkpoint(
         ModelHandle(model=loaded_model, optimizer=loaded_optimizer),
         str(tmp_path),
+        update_legacy_format=True,
     ) == 7
     assert loaded_optimizer.load_calls == 1
     assert loaded_optimizer.parameter_load_calls == 1
+    assert loaded_optimizer.update_legacy_format is True
     assert (tmp_path / "training_state.optimizer_parameter_state.pt").exists()
     _assert_model_close(model, loaded_model)
 
@@ -172,6 +176,61 @@ def test_runtime_local_checkpoint_restores_rng_state(tmp_path):
     assert random.random() == expected_python
     np.testing.assert_allclose(np.random.random(4), expected_numpy, atol=0.0, rtol=0.0)
     torch.testing.assert_close(torch.rand(4), expected_torch, atol=0.0, rtol=0.0)
+
+
+def test_runtime_local_checkpoint_uses_rank_specific_files_when_distributed(tmp_path):
+    model = TinyMLP()
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+
+    with (
+        patch("megatron.lite.primitive.ckpt.dcp.dist.is_available", return_value=True),
+        patch("megatron.lite.primitive.ckpt.dcp.dist.is_initialized", return_value=True),
+        patch("megatron.lite.primitive.ckpt.dcp.dist.get_rank", return_value=3),
+    ):
+        runtime.save_checkpoint(ModelHandle(model=model, optimizer=None), str(tmp_path), step=11)
+        assert (tmp_path / "training_state_rank_00003.pt").exists()
+        assert not (tmp_path / "training_state.pt").exists()
+        assert runtime.load_checkpoint(ModelHandle(model=model, optimizer=None), str(tmp_path)) == 11
+
+
+def test_primitive_auto_dcp_keeps_optimizer_checkpoints_local(tmp_path):
+    model = TinyMLP()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
+    parallel = ParallelConfig(tp=1, ep=1, pp=1, cp=1)
+
+    with patch("megatron.lite.primitive.ckpt.dcp.dcp.save") as dcp_save_mock:
+        save_training_checkpoint(
+            model,
+            optimizer,
+            12,
+            str(tmp_path),
+            parallel,
+            object(),
+        )
+
+    dcp_save_mock.assert_not_called()
+    assert (tmp_path / "training_state.pt").exists()
+
+
+def test_primitive_explicit_dcp_rejects_optimizer_state(tmp_path):
+    model = TinyMLP()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
+    parallel = ParallelConfig(tp=1, ep=1, pp=1, cp=1)
+
+    try:
+        save_training_checkpoint(
+            model,
+            optimizer,
+            12,
+            str(tmp_path),
+            parallel,
+            object(),
+            use_dcp=True,
+        )
+    except NotImplementedError as exc:
+        assert "optimizer state" in str(exc)
+    else:
+        raise AssertionError("explicit DCP optimizer checkpointing should be rejected")
 
 
 def test_runtime_dcp_checkpoint_threads_parallel_config_and_protocol_hooks(tmp_path):

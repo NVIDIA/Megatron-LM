@@ -51,10 +51,15 @@ def save_training_checkpoint(
         raise ValueError("checkpoint path is required")
     step = int(step)
     if use_dcp is None:
-        use_dcp = config is not None and ps is not None
+        use_dcp = config is not None and ps is not None and optimizer is None
     if not use_dcp:
         _save_local_training_checkpoint(model, optimizer, step, path, save_rng=save_rng)
         return
+    if optimizer is not None:
+        raise NotImplementedError(
+            "DCP checkpointing does not yet support optimizer state; use the local "
+            "training checkpoint path or Megatron Core dist_checkpointing."
+        )
     if config is None or ps is None:
         raise ValueError("DCP checkpointing requires config and ParallelState.")
     if not isinstance(model, nn.Module):
@@ -89,12 +94,24 @@ def load_training_checkpoint(
     *,
     use_dcp: bool | None = None,
     load_rng: bool = True,
+    load_parameter_state_update_legacy_format: bool = False,
 ) -> int:
     """Load training checkpoint with automatic resharding across different parallel configs."""
     if use_dcp is None:
-        use_dcp = config is not None and ps is not None
+        use_dcp = config is not None and ps is not None and optimizer is None
     if not use_dcp:
-        return _load_local_training_checkpoint(model, optimizer, path, load_rng=load_rng)
+        return _load_local_training_checkpoint(
+            model,
+            optimizer,
+            path,
+            load_rng=load_rng,
+            load_parameter_state_update_legacy_format=load_parameter_state_update_legacy_format,
+        )
+    if optimizer is not None:
+        raise NotImplementedError(
+            "DCP checkpointing does not yet support optimizer state; use the local "
+            "training checkpoint path or Megatron Core dist_checkpointing."
+        )
     if config is None or ps is None:
         raise ValueError("DCP checkpointing requires config and ParallelState.")
     if not isinstance(model, nn.Module):
@@ -197,6 +214,8 @@ def _load_chunk_tensor_state(module: nn.Module, state: dict[str, torch.Tensor]) 
 def _local_checkpoint_file(path: str | os.PathLike[str]) -> Path:
     ckpt_path = Path(path)
     if ckpt_path.is_dir() or ckpt_path.suffix == "":
+        if _is_distributed_checkpoint_ranked():
+            return ckpt_path / f"training_state_{_rank_suffix()}.pt"
         return ckpt_path / "training_state.pt"
     return ckpt_path
 
@@ -209,6 +228,10 @@ def _rank_suffix() -> str:
     if dist.is_available() and dist.is_initialized():
         return f"rank_{dist.get_rank():05d}"
     return "rank_00000"
+
+
+def _is_distributed_checkpoint_ranked() -> bool:
+    return dist.is_available() and dist.is_initialized()
 
 
 def _rng_sidecar_file(path: str | os.PathLike[str]) -> Path:
@@ -230,12 +253,10 @@ def _get_cuda_rng_state() -> torch.Tensor | None:
 def _get_cuda_rng_tracker_states() -> dict[str, torch.Tensor]:
     if not torch.cuda.is_initialized():
         return {}
-    try:
-        from megatron.core import tensor_parallel
 
-        states = tensor_parallel.get_cuda_rng_tracker().get_states()
-    except Exception:
-        return {}
+    from megatron.core import tensor_parallel
+
+    states = tensor_parallel.get_cuda_rng_tracker().get_states()
     return {name: _cpu_clone(state) for name, state in states.items() if state is not None}
 
 
@@ -331,6 +352,7 @@ def _load_local_training_checkpoint(
     path: str,
     *,
     load_rng: bool = True,
+    load_parameter_state_update_legacy_format: bool = False,
 ) -> int:
     ckpt_file = _local_checkpoint_file(path)
     state = torch.load(ckpt_file, map_location="cpu", weights_only=False)
@@ -347,7 +369,10 @@ def _load_local_training_checkpoint(
         parameter_state_name = state.get("optimizer_parameter_state")
         load_parameter_state = getattr(optimizer, "load_parameter_state", None)
         if parameter_state_name is not None and callable(load_parameter_state):
-            load_parameter_state(str(ckpt_file.with_name(parameter_state_name)))
+            load_parameter_state(
+                str(ckpt_file.with_name(parameter_state_name)),
+                update_legacy_format=load_parameter_state_update_legacy_format,
+            )
         else:
             reload_model_params = getattr(optimizer, "reload_model_params", None)
             if callable(reload_model_params):
