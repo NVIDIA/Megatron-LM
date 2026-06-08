@@ -6,7 +6,6 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import load, load_plain_tensors, save
 from megatron.core.dist_checkpointing.dict_utils import diff
-from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
     FullyParallelSaveStrategyWrapper,
@@ -82,14 +81,6 @@ def common_test_parallel_reconfiguration_e2e(
             pipeline_model_parallel_size=src_tp_pp[1],
             **src_model_init_kwargs,
         )
-        sharded_state_dict_A = gpt_model_A.sharded_state_dict(metadata=metadata)
-        sharded_state_dict_A["common_state"] = ShardedObject(
-            key="common_state",
-            data={},
-            global_shape=(1,),
-            global_offset=(0,),
-            replica_id=torch.distributed.get_rank(),
-        )
         save_strategy = TorchDistSaveShardedStrategy()
         if use_fpsl:
             save_strategy = FullyParallelSaveStrategyWrapper(
@@ -97,7 +88,7 @@ def common_test_parallel_reconfiguration_e2e(
                 parallel_state.get_data_parallel_group(with_context_parallel=True),
                 True,
             )
-        save(sharded_state_dict_A, ckpt_dir_A, save_strategy)
+        save(gpt_model_A.sharded_state_dict(metadata=metadata), ckpt_dir_A, save_strategy)
         regular_state_dict_A = gpt_model_A.state_dict()
         Utils.destroy_model_parallel()
         if metadata is not None:
@@ -112,21 +103,13 @@ def common_test_parallel_reconfiguration_e2e(
             pipeline_model_parallel_size=dest_tp_pp[1],
             **dst_model_init_kwargs,
         )
-        sharded_state_dict_B = gpt_model_B.sharded_state_dict(metadata=metadata)
-        sharded_state_dict_B["common_state"] = ShardedObject(
-            key="common_state",
-            data={},
-            global_shape=(1,),
-            global_offset=(0,),
-            replica_id=torch.distributed.get_rank(),
-        )
         if use_fpsl:
             load_strategy = TorchDistLoadShardedStrategy()
             load_strategy = FullyParallelLoadStrategyWrapper(load_strategy)
         else:
             load_strategy = None
         state_dict, missing_keys, unexpected_keys = load(
-            sharded_state_dict_B,
+            gpt_model_B.sharded_state_dict(metadata=metadata),
             ckpt_dir_A,
             load_strategy,
             strict=StrictHandling.RETURN_ALL,
@@ -135,7 +118,7 @@ def common_test_parallel_reconfiguration_e2e(
         assert all('_extra_state' in k for k in missing_keys)
         assert all('_extra_state' in k for k in unexpected_keys)
         gpt_model_B.load_state_dict(state_dict)
-        save(sharded_state_dict_B, ckpt_dir_B)
+        save(gpt_model_B.sharded_state_dict(metadata=metadata), ckpt_dir_B)
         regular_state_dict_B = gpt_model_A.state_dict()
         Utils.destroy_model_parallel()
 
