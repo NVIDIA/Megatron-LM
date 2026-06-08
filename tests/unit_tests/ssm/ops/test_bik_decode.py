@@ -44,9 +44,8 @@ class TestBikDecodeBufferedScan(unittest.TestCase):
 
     def setUp(self):
         torch.manual_seed(0)
-        # use_deterministic_algorithms is what BIK actually flips on; the
-        # mamba_chunk_scan_combined kernel is deterministic under that flag.
-        torch.use_deterministic_algorithms(False)
+        # No global flags: bik_decode_buffered_scan is a pure tensor-ops function
+        # and BIK by design does not require torch.use_deterministic_algorithms.
         self.device = torch.device("cuda")
         self.dtype = torch.bfloat16
         # Small but non-trivial mamba dims.
