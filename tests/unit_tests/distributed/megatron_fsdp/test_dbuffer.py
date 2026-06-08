@@ -316,10 +316,10 @@ def test_replicate_scatter_round_trip(setup: DistributedSetup):
     assert redistributed_sharded_buffer.placements == (Flat(),)
     expected_sharded_local_numel = replicated_buffer.layout.size // setup.world_size
     assert sharded_buffer.offset == setup.rank * expected_sharded_local_numel
-    source_slice = replicated_buffer.local_buffer.narrow(
-        0, sharded_buffer.offset - replicated_buffer.offset, sharded_buffer.local_buffer.numel()
+    assert (
+        sharded_buffer.local_buffer.untyped_storage()
+        is replicated_buffer.local_buffer.untyped_storage()
     )
-    assert sharded_buffer.local_buffer.data_ptr() == source_slice.data_ptr()
     torch.testing.assert_close(
         sharded_buffer.local_buffer, redistributed_sharded_buffer.local_buffer, rtol=0, atol=0
     )
