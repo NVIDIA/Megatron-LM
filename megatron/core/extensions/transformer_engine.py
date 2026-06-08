@@ -1557,6 +1557,10 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         num_splits: Optional[int] = None,
     ) -> torch.Tensor:
         """Forward."""
+        # Save TE's current CP group before potential DCP switch (for restore at end).
+        _te_orig_cp_group = self.cp_group
+        _te_orig_cp_global_ranks = self.cp_global_ranks
+
         if packed_seq_params is not None:
             # If Dynamic CP group is provided, update TE DPA CP group
             if packed_seq_params.local_cp_size is not None:
@@ -1646,6 +1650,17 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             if num_splits is not None:
                 _fa_kwargs["num_splits"] = num_splits
             core_attn_out = super().forward(query, key, value, attention_mask, **_fa_kwargs)
+
+        # Restore TE's CP group after dynamic CP forward.
+        if packed_seq_params is not None \
+           and packed_seq_params.local_cp_size is not None \
+           and self.config.context_parallel_size > 1:
+            super().set_context_parallel_group(
+                _te_orig_cp_group,
+                _te_orig_cp_global_ranks,
+                TEDotProductAttention.cp_stream,
+                self.cp_comm_type,
+            )
 
         return core_attn_out
 
