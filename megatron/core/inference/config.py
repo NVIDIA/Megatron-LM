@@ -281,6 +281,13 @@ class InferenceConfig:
     enable_async_scheduling: bool = False
     """Whether to speculatively launch eligible decode-only forward passes."""
 
+    async_row_map_policy: str = "reuse"
+    """
+    Pending-forward row reuse policy for async scheduling. ``reuse`` preserves
+    PR 5202 row-mapped pending-forward reuse; ``identity_only`` accepts only
+    exact-layout pending forwards for async-on/off parity validation.
+    """
+
     enable_prefix_caching: bool = False
     """Whether to enable prefix caching for KV cache block sharing."""
 

@@ -18,10 +18,13 @@ from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.async_transaction import (
     AsyncDecodeTransaction,
     AsyncLayoutSnapshot,
+    AsyncPendingForwardDecision,
+    AsyncRowMapPolicy,
     AsyncSampleReadback,
     AsyncSampleTicket,
     AsyncTxnState,
     classify_async_eligibility,
+    resolve_async_pending_forward,
 )
 from megatron.core.inference.communication_utils import (
     broadcast_from_last_pipeline_stage,
@@ -204,6 +207,9 @@ class TextGenerationController:
         self._async_step_barrier_reason = None
         self._async_admission_barrier_requested = False
         self._async_logprob_requests_seen = False
+        self._async_row_map_policy = AsyncRowMapPolicy.from_value(
+            getattr(context.config, "async_row_map_policy", AsyncRowMapPolicy.REUSE.value)
+        )
         self._async_row_mapped_forward_count = 0
         self._async_discarded_forward_count = 0
         self._async_add_deferral_count = 0
@@ -1650,20 +1656,24 @@ class TextGenerationController:
         context.clear_async_prepared_decode_plan()
         return transaction
 
-    def _pending_async_row_map(self, transaction: AsyncDecodeTransaction) -> Optional[Tensor]:
-        """Return the current-row to transaction-row map if the pending forward is reusable."""
+    def _pending_async_forward_decision(
+        self, transaction: AsyncDecodeTransaction
+    ) -> AsyncPendingForwardDecision:
+        """Return the centralized pending-forward reuse decision."""
         context = self.inference_wrapped_model.inference_context
         current_snapshot = AsyncLayoutSnapshot.from_context_current(
             context, tokens_per_request=self.num_speculative_tokens + 1
         )
-        if not transaction.snapshot.graph_compatible_with(current_snapshot):
-            return None
-        row_map = transaction.snapshot.row_map_to_current(current_snapshot.request_ids)
-        if row_map is None:
-            return None
-        if not transaction.snapshot.layout_compatible_with(current_snapshot, row_map=row_map):
-            return None
-        return row_map
+        return resolve_async_pending_forward(
+            transaction.snapshot,
+            current_snapshot,
+            row_map_policy=getattr(self, "_async_row_map_policy", AsyncRowMapPolicy.REUSE),
+        )
+
+    def _pending_async_row_map(self, transaction: AsyncDecodeTransaction) -> Optional[Tensor]:
+        """Return the current-row to transaction-row map if the pending forward is reusable."""
+        decision = self._pending_async_forward_decision(transaction)
+        return decision.row_map if decision.reusable else None
 
     @staticmethod
     def _row_map_requires_gather(row_map: Tensor) -> bool:
@@ -1677,10 +1687,10 @@ class TextGenerationController:
         if transaction is None:
             return True, False
 
-        row_map = self._pending_async_row_map(transaction)
-        if row_map is None:
+        decision = self._pending_async_forward_decision(transaction)
+        if not decision.reusable:
             return False, False
-        return True, self._row_map_requires_gather(row_map)
+        return True, decision.row_mapped
 
     def _resolve_pending_async_forward(self) -> tuple[bool, Optional[Tensor], bool]:
         """Resolve the pending speculative forward's row layout for current consumers.
@@ -1692,10 +1702,11 @@ class TextGenerationController:
         if transaction is None:
             return False, None, False
 
-        row_map = self._pending_async_row_map(transaction)
-        if row_map is not None:
-            row_mapped = self._row_map_requires_gather(row_map)
-            if row_mapped:
+        decision = self._pending_async_forward_decision(transaction)
+        if decision.reusable:
+            row_map = decision.row_map
+            assert row_map is not None
+            if decision.row_mapped:
                 self._increment_async_counter("_async_row_mapped_forward_count")
             else:
                 self._increment_async_counter("_async_identity_forward_count")
@@ -1704,22 +1715,18 @@ class TextGenerationController:
             transaction.state = AsyncTxnState.RESOLVED
             row_indices = (
                 row_map.to(device=torch.cuda.current_device(), dtype=torch.long)
-                if row_mapped
+                if decision.row_mapped
                 else None
             )
-            return True, row_indices, row_mapped
+            return True, row_indices, decision.row_mapped
 
-        context = self.inference_wrapped_model.inference_context
-        current_snapshot = AsyncLayoutSnapshot.from_context_current(
-            context, tokens_per_request=self.num_speculative_tokens + 1
-        )
-        if not transaction.snapshot.graph_compatible_with(current_snapshot):
+        if not decision.graph_compatible:
             self._increment_async_counter("_async_graph_mismatch_discard_count")
         else:
             self._increment_async_counter("_async_layout_mismatch_discard_count")
         self._increment_async_counter("_async_discarded_forward_count")
         self._increment_async_counter("_async_rolled_back_forward_count")
-        transaction.discard("pending forward not reusable")
+        transaction.discard(decision.reason or "pending forward not reusable")
         return False, None, False
 
     def _discard_pending_async_forward(self) -> None:

@@ -13,12 +13,14 @@ from megatron.core.inference.async_transaction import (
     AsyncGraphShape,
     AsyncLayoutSnapshot,
     AsyncResourceLedger,
+    AsyncRowMapPolicy,
     AsyncSampleReadback,
     AsyncSampleTicket,
     AsyncStepTransaction,
     AsyncTransactionParticipant,
     AsyncTxnState,
     classify_async_eligibility,
+    resolve_async_pending_forward,
 )
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 from megatron.core.inference.config import InferenceConfig
@@ -459,6 +461,47 @@ def test_async_layout_snapshot_matches_pending_forward_row_decisions(
 
     assert controller._pending_async_forward_row_status() == expected_status
     assert _async_layout_snapshot_status(controller) == expected_status
+
+
+@pytest.mark.internal
+def test_async_pending_forward_decision_respects_row_map_policy():
+    pending = _make_async_layout_snapshot([10, 11, 12], cuda_graph_request_count=3)
+    current = _make_async_layout_snapshot([12, 10], cuda_graph_request_count=3)
+
+    reuse = resolve_async_pending_forward(
+        pending, current, row_map_policy=AsyncRowMapPolicy.REUSE
+    )
+    identity_only = resolve_async_pending_forward(
+        pending, current, row_map_policy=AsyncRowMapPolicy.IDENTITY_ONLY
+    )
+
+    assert reuse.reusable
+    assert reuse.row_mapped
+    assert reuse.row_map.tolist() == [2, 0]
+    assert reuse.diagnostics()["row_map_policy"] == "reuse"
+    assert not identity_only.reusable
+    assert identity_only.row_mapped
+    assert identity_only.reason == "row map policy rejected non-identity layout"
+    assert identity_only.diagnostics()["row_map_policy"] == "identity_only"
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="row mapping returns CUDA tensors")
+def test_identity_only_row_map_policy_discards_row_mapped_pending_forward():
+    controller = _make_controller_with_rows([10, 11, 12], [12, 10])
+    controller._async_row_map_policy = AsyncRowMapPolicy.IDENTITY_ONLY
+
+    assert controller._pending_async_forward_row_status() == (False, False)
+    reused, row_indices, row_mapped = controller._resolve_pending_async_forward()
+
+    transaction = controller._async_step_transaction
+    assert not reused
+    assert row_indices is None
+    assert not row_mapped
+    assert transaction.discard_reason == "row map policy rejected non-identity layout"
+    assert controller._async_discarded_forward_count == 1
+    assert controller._async_layout_mismatch_discard_count == 1
+    assert controller._async_row_mapped_forward_count == 0
 
 
 @pytest.mark.internal
@@ -2425,10 +2468,16 @@ def test_mamba_prefix_cache_uses_current_live_bank_for_store_and_restore():
 @pytest.mark.internal
 def test_inference_config_async_scheduling_flags_are_opt_in():
     default_config = InferenceConfig()
-    enabled_config = InferenceConfig(enable_async_scheduling=True, logging_step_interval=0)
+    enabled_config = InferenceConfig(
+        enable_async_scheduling=True,
+        async_row_map_policy=AsyncRowMapPolicy.IDENTITY_ONLY.value,
+        logging_step_interval=0,
+    )
 
     assert not default_config.enable_async_scheduling
+    assert default_config.async_row_map_policy == AsyncRowMapPolicy.REUSE.value
     assert enabled_config.enable_async_scheduling
+    assert enabled_config.async_row_map_policy == AsyncRowMapPolicy.IDENTITY_ONLY.value
     assert enabled_config.logging_step_interval == 0
 
 

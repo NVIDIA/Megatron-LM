@@ -22,6 +22,24 @@ class AsyncTxnState(Enum):
     DISCARDED = "discarded"
 
 
+class AsyncRowMapPolicy(str, Enum):
+    """Policy for accepting pending-forward row maps."""
+
+    REUSE = "reuse"
+    IDENTITY_ONLY = "identity_only"
+
+    @classmethod
+    def from_value(cls, value: object) -> "AsyncRowMapPolicy":
+        """Normalize config strings and enum values into an async row-map policy."""
+        if isinstance(value, cls):
+            return value
+        try:
+            return cls(str(value))
+        except ValueError as exc:
+            allowed = ", ".join(policy.value for policy in cls)
+            raise ValueError(f"Unknown async row-map policy {value!r}; expected one of: {allowed}") from exc
+
+
 @dataclass(frozen=True)
 class AsyncGraphShape:
     """CUDA graph and decode-stride shape used by an async forward."""
@@ -393,6 +411,104 @@ class AsyncDecodePlan:
         }
 
 
+@dataclass(frozen=True)
+class AsyncPendingForwardDecision:
+    """Structured decision for reusing or discarding one pending async forward."""
+
+    reusable: bool
+    row_map: Tensor | None
+    row_mapped: bool
+    reason: str | None
+    row_map_policy: AsyncRowMapPolicy
+    graph_compatible: bool
+    layout_compatible: bool
+
+    @property
+    def discard(self) -> bool:
+        """Whether a pending forward exists but must be discarded."""
+        return not self.reusable
+
+    def diagnostics(self) -> dict[str, Any]:
+        """Return a stable pending-forward decision snapshot."""
+        return {
+            "reusable": self.reusable,
+            "row_map": None if self.row_map is None else self.row_map.to(device="cpu").tolist(),
+            "row_mapped": self.row_mapped,
+            "reason": self.reason,
+            "row_map_policy": self.row_map_policy.value,
+            "graph_compatible": self.graph_compatible,
+            "layout_compatible": self.layout_compatible,
+        }
+
+
+def resolve_async_pending_forward(
+    pending: AsyncLayoutSnapshot,
+    current: AsyncLayoutSnapshot,
+    *,
+    row_map_policy: AsyncRowMapPolicy | str = AsyncRowMapPolicy.REUSE,
+) -> AsyncPendingForwardDecision:
+    """Return the centralized pending-forward reuse decision."""
+    policy = AsyncRowMapPolicy.from_value(row_map_policy)
+    graph_compatible = pending.graph_compatible_with(current)
+    if not graph_compatible:
+        return AsyncPendingForwardDecision(
+            reusable=False,
+            row_map=None,
+            row_mapped=False,
+            reason="graph shape mismatch",
+            row_map_policy=policy,
+            graph_compatible=False,
+            layout_compatible=False,
+        )
+
+    row_map = pending.row_map_to_current(current.request_ids)
+    if row_map is None:
+        return AsyncPendingForwardDecision(
+            reusable=False,
+            row_map=None,
+            row_mapped=False,
+            reason="request row mismatch",
+            row_map_policy=policy,
+            graph_compatible=True,
+            layout_compatible=False,
+        )
+
+    identity = torch.arange(int(row_map.numel()), dtype=torch.long, device="cpu")
+    row_mapped = not torch.equal(row_map.to(dtype=torch.long, device="cpu"), identity)
+    if policy == AsyncRowMapPolicy.IDENTITY_ONLY and row_mapped:
+        return AsyncPendingForwardDecision(
+            reusable=False,
+            row_map=row_map,
+            row_mapped=True,
+            reason="row map policy rejected non-identity layout",
+            row_map_policy=policy,
+            graph_compatible=True,
+            layout_compatible=False,
+        )
+
+    layout_compatible = pending.layout_compatible_with(current, row_map=row_map)
+    if not layout_compatible:
+        return AsyncPendingForwardDecision(
+            reusable=False,
+            row_map=row_map,
+            row_mapped=row_mapped,
+            reason="layout mismatch",
+            row_map_policy=policy,
+            graph_compatible=True,
+            layout_compatible=False,
+        )
+
+    return AsyncPendingForwardDecision(
+        reusable=True,
+        row_map=row_map,
+        row_mapped=row_mapped,
+        reason=None,
+        row_map_policy=policy,
+        graph_compatible=True,
+        layout_compatible=True,
+    )
+
+
 @runtime_checkable
 class AsyncTransactionParticipant(Protocol):
     """Hook protocol for subsystems participating in async transaction lifecycle."""
@@ -532,13 +648,12 @@ class AsyncDecodeTransaction:
         current = AsyncLayoutSnapshot.from_context_current(
             context, tokens_per_request=self.snapshot.graph_shape.tokens_per_request
         )
-        if not self.snapshot.graph_compatible_with(current):
-            self.discard("graph shape mismatch")
+        decision = resolve_async_pending_forward(self.snapshot, current)
+        if not decision.reusable:
+            self.discard(decision.reason or "pending forward not reusable")
             return None
-        row_map = self.snapshot.row_map_to_current(current.request_ids)
-        if row_map is None or not self.snapshot.layout_compatible_with(current, row_map=row_map):
-            self.discard("layout mismatch")
-            return None
+        row_map = decision.row_map
+        assert row_map is not None
         self.row_map = row_map
         self.state = AsyncTxnState.RESOLVED
         return row_map
