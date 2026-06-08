@@ -268,7 +268,7 @@ def build_runtime_config(cfg: BenchCliConfig) -> RuntimeConfig:
             from megatron.lite.primitive.deterministic import deterministic_requested
 
             if deterministic_requested():
-                impl_cfg.setdefault("mount_mbridge_vision_model", True)
+                impl_cfg.setdefault("mount_vision_model", True)
         backend_cfg = MegatronLiteConfig(
             model_name=cfg.model_name,
             impl=cfg.impl,

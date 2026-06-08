@@ -9,6 +9,11 @@ Megatron-Bridge package and requires an environment where `import
 megatron.bridge` works. Dry-run mode does not import either reference package and
 is safe for config validation.
 
+The `backend=mlite` path remains native MLite. For deterministic Qwen3.5 runs it
+mounts the Qwen3.5 vision module from the local Hugging Face model code through
+`transformers`; it does not import `mbridge` or Megatron-Bridge to build the
+MLite model.
+
 ## Dry-Run
 
 ```bash

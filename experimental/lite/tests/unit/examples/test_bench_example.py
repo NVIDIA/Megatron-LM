@@ -4,10 +4,16 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 import json
+from pathlib import Path
+import sys
 
 from megatron.lite.runtime.contracts.config import ParallelConfig
 from megatron.lite.runtime.contracts.data import ForwardResult
 from megatron.lite.runtime.contracts.handle import ModelHandle
+
+_LITE_ROOT = str(Path(__file__).resolve().parents[3])
+sys.path = [path for path in sys.path if path != _LITE_ROOT]
+sys.path.insert(0, _LITE_ROOT)
 
 
 def test_bench_builds_mlite_runtime_config_with_model_hook():
@@ -35,6 +41,24 @@ def test_bench_builds_mlite_runtime_config_with_model_hook():
     assert model_cfg.num_hidden_layers == 2
     assert len(model_cfg.layer_types) == 2
     assert model_cfg.num_nextn_predict_layers == 0
+
+
+def test_bench_mlite_deterministic_mounts_native_vision_not_mbridge(monkeypatch):
+    from examples.bench.bench import BenchCliConfig, build_runtime_config
+
+    monkeypatch.setenv("MEGATRON_LITE_DETERMINISTIC", "1")
+
+    runtime_cfg = build_runtime_config(
+        BenchCliConfig(
+            backend="mlite",
+            hf_path="/tmp/hf",
+            model_name="qwen3_5",
+        )
+    )
+
+    impl_cfg = runtime_cfg.backend_cfg.impl_cfg
+    assert impl_cfg["mount_vision_model"] is True
+    assert ("mount_" + "mbridge_vision_model") not in impl_cfg
 
 
 def test_bench_builds_bridge_dry_run_plan_without_bridge_import():
@@ -79,6 +103,28 @@ def test_bench_builds_mbridge_dry_run_plan_without_mbridge_import():
     assert backend_cfg["model_name"] == "qwen3_5"
     assert backend_cfg["override_transformer_config"] == {"attention_backend": "unfused"}
     assert backend_cfg["bridge_post_init"].startswith("<callable:")
+
+
+def test_qwen35_lite_sources_use_native_vision_not_mbridge_anchor():
+    root = Path(__file__).resolve().parents[3]
+    protocol = root / "megatron/lite/model/qwen3_5/lite/protocol.py"
+    model = root / "megatron/lite/model/qwen3_5/lite/model.py"
+
+    protocol_text = protocol.read_text(encoding="utf-8")
+    model_text = model.read_text(encoding="utf-8")
+
+    assert "mount_vision_model" in protocol_text
+    assert "_build_native_vision_model" in model_text
+    forbidden = (
+        "mount_" + "mbridge_vision_model",
+        "_build_" + "mbridge_for_vision_anchor",
+        "mbridge_" + "bridge",
+        "from mbridge import",
+        "megatron.bridge",
+    )
+    for item in forbidden:
+        assert item not in protocol_text
+        assert item not in model_text
 
 
 class _FakeRuntime:

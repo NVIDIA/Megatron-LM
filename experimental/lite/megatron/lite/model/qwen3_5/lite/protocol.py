@@ -43,29 +43,7 @@ class ImplConfig:
     mtp_detach_encoder: bool = False
     mtp_loss_scaling_factor: float = 0.1
     mtp_use_repeated_layer: bool | None = None
-    mount_mbridge_vision_model: bool = False
-
-
-def _build_mbridge_for_vision_anchor(hf_path: str, impl_cfg: ImplConfig):
-    if not hf_path:
-        raise ValueError("mount_mbridge_vision_model requires hf_path.")
-    from mbridge import AutoBridge
-
-    from megatron.lite.primitive.optimizers.megatron_wrap import _ensure_mc_mpu_parallel_state
-    from megatron.lite.primitive.deterministic import deterministic_requested
-
-    _ensure_mc_mpu_parallel_state(
-        SimpleNamespace(
-            parallel=impl_cfg.parallel,
-            deterministic=impl_cfg.deterministic,
-        )
-    )
-    bridge = AutoBridge.from_pretrained(hf_path, trust_remote_code=True)
-    bridge.set_extra_args(
-        deterministic_mode=deterministic_requested(),
-        fused_single_qkv_rope=False,
-    )
-    return bridge
+    mount_vision_model: bool = False
 
 
 def _full_attn_module(layer, name: str):
@@ -189,9 +167,8 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
         mtp_enable=mtp_enable,
         mtp_enable_train=mtp_enable_train,
         mtp_detach_encoder=impl_cfg.mtp_detach_encoder,
+        mount_vision_model=impl_cfg.mount_vision_model,
     )
-    if impl_cfg.mount_mbridge_vision_model:
-        model_kwargs["mbridge_bridge"] = _build_mbridge_for_vision_anchor(impl_cfg.hf_path, impl_cfg)
 
     if vpp is None:
         chunks = [

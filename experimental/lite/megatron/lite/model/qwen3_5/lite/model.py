@@ -9,7 +9,6 @@ already used by other native Megatron Lite modules.
 from __future__ import annotations
 
 from contextlib import nullcontext
-from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -347,10 +346,10 @@ class Qwen35Model(nn.Module):
         mtp_enable: bool = False,
         mtp_enable_train: bool = False,
         mtp_detach_encoder: bool = False,
-        mbridge_bridge: Any | None = None,
+        mount_vision_model: bool = False,
     ):
         super().__init__()
-        del hf_path, attention_backend_override
+        del attention_backend_override
         self.config = config
         self.train_config = train_config
         self.ps = ps
@@ -366,7 +365,7 @@ class Qwen35Model(nn.Module):
         self.post_process = has_head
         self.share_embeddings_and_output_weights = False
         self.vision_model: nn.Module | None = (
-            _build_mbridge_vision_model(mbridge_bridge) if has_embed and mbridge_bridge is not None else None
+            _build_native_vision_model(hf_path) if has_embed and mount_vision_model else None
         )
 
         self.embed: VocabParallelEmbedding | None = None
@@ -604,11 +603,49 @@ class Qwen35Model(nn.Module):
         return weight if weight.dtype == hidden_states.dtype else weight.to(dtype=hidden_states.dtype)
 
 
-def _resolve_hf_vision_cls(bridge: Any) -> type:
-    cls = getattr(type(bridge), "HfVisionClass", None)
-    if cls is None:
-        raise RuntimeError("mbridge bridge does not expose HfVisionClass; cannot build vision_model.")
-    return cls
+def _iter_auto_model_class_refs(hf_config) -> list[str]:
+    auto_map = getattr(hf_config, "auto_map", None) or {}
+    preferred_keys = (
+        "AutoModelForCausalLM",
+        "AutoModelForImageTextToText",
+        "AutoModelForVision2Seq",
+        "AutoModel",
+    )
+    refs: list[str] = []
+    for key in preferred_keys:
+        ref = auto_map.get(key)
+        if isinstance(ref, (list, tuple)):
+            ref = ref[0] if ref else None
+        if isinstance(ref, str) and ref not in refs:
+            refs.append(ref)
+    return refs
+
+
+def _resolve_hf_vision_cls(hf_config, hf_path: str) -> type:
+    try:
+        from transformers.dynamic_module_utils import get_class_from_dynamic_module
+    except ImportError as exc:
+        raise ImportError(
+            "mount_vision_model=True requires transformers with dynamic module support."
+        ) from exc
+
+    errors: list[str] = []
+    for class_ref in _iter_auto_model_class_refs(hf_config):
+        try:
+            model_cls = get_class_from_dynamic_module(
+                class_ref,
+                hf_path,
+                trust_remote_code=True,
+            )
+        except Exception as exc:
+            errors.append(f"{class_ref}: {exc}")
+            continue
+        vision_cls = getattr(model_cls, "HfVisionClass", None)
+        if vision_cls is not None:
+            return vision_cls
+        errors.append(f"{class_ref}: missing HfVisionClass")
+    detail = "; ".join(errors) if errors else "config auto_map has no supported AutoModel entry"
+    raise RuntimeError(f"Cannot resolve native HF vision class for Qwen3.5: {detail}.")
 
 
 def _hook_fp32_rotary_emb(module: nn.Module) -> None:
@@ -629,12 +666,23 @@ def _hook_vision_params_avg_grad_across_tp(module: nn.Module) -> None:
         param.average_gradients_across_tp_domain = True  # type: ignore[assignment]
 
 
-def _build_mbridge_vision_model(bridge: Any) -> nn.Module:
-    hf_vision_cls = _resolve_hf_vision_cls(bridge)
-    vision_config = getattr(bridge.hf_config, "vision_config", None)
+def _build_native_vision_model(hf_path: str) -> nn.Module:
+    if not hf_path:
+        raise ValueError("mount_vision_model requires hf_path.")
+    try:
+        from transformers import AutoConfig
+    except ImportError as exc:
+        raise ImportError("mount_vision_model=True requires transformers.") from exc
+
+    hf_config = AutoConfig.from_pretrained(hf_path, trust_remote_code=True)
+    vision_config = getattr(hf_config, "vision_config", None)
     if vision_config is None:
-        raise RuntimeError("mbridge hf_config does not expose vision_config; cannot build vision_model.")
-    vision = hf_vision_cls._from_config(vision_config)
+        raise RuntimeError("HF config does not expose vision_config; cannot build vision_model.")
+    hf_vision_cls = _resolve_hf_vision_cls(hf_config, hf_path)
+    if hasattr(hf_vision_cls, "_from_config"):
+        vision = hf_vision_cls._from_config(vision_config)
+    else:
+        vision = hf_vision_cls(vision_config)
     _hook_fp32_rotary_emb(vision)
     _hook_vision_params_avg_grad_across_tp(vision)
     return vision.to(torch.bfloat16)
