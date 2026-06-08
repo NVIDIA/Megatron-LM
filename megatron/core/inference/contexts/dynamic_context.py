@@ -662,6 +662,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 max_sequence_length=self.max_sequence_length,
                 use_cuda_graphs_for_non_decode_steps=self.use_cuda_graphs_for_non_decode_steps,
                 num_speculative_tokens=self.num_speculative_tokens,
+                sizing_distribution=inference_config.cuda_graph_sizing_distribution,
             )
         )
 
@@ -2437,10 +2438,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.kv_block_allocator.reset()
         self.request_to_kv_block_ids.fill_(-1)
 
-        # Reset step counter and LRU clock
-        self.step_count = 0
-        self.prefix_cache_lru_clock = 0
-
         # Reset chunked prefill state
         self.chunked_prefill_request_id = -1
         self.num_prefill_requests = 0
@@ -2464,6 +2461,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         self.reset_tensors()
         self.reset_metadata()
+
+        # Reset lifetime counters (not reset in reset_metadata, which is also
+        # called during suspend/resume where these must persist).
+        self.step_count = 0
+        self.prefix_cache_lru_clock = 0
 
         # Reset Mamba cache state
         if self.mamba_slot_allocator is not None:
