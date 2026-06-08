@@ -353,7 +353,9 @@ class MegatronLiteEngine(BaseEngine):
         self._require_initialized()
 
         save_contents = self.checkpoint_config.get("save_contents", None)
-        if save_contents is not None and not any(item in save_contents for item in ("model", "optimizer")):
+        save_model = save_contents is None or "model" in save_contents
+        save_optimizer = save_contents is None or "optimizer" in save_contents
+        if not save_model and not save_optimizer:
             if self._rank == 0:
                 print(f"Skipping Megatron Lite checkpoint save at step {global_step}: save_contents={save_contents}")
             if dist.is_initialized():
@@ -376,6 +378,8 @@ class MegatronLiteEngine(BaseEngine):
                 self.handle._parallel_state,
                 get_placements=placement_fn,
                 is_expert=expert_classifier,
+                save_model=save_model,
+                save_optimizer=save_optimizer,
             )
             if self.handle._lr_scheduler is not None and self._rank == 0:
                 torch.save(self.handle._lr_scheduler.state_dict(), os.path.join(local_path, _LR_SCHEDULER_STATE))
@@ -409,6 +413,8 @@ class MegatronLiteEngine(BaseEngine):
                 self.handle._parallel_state,
                 get_placements=placement_fn,
                 is_expert=expert_classifier,
+                load_model=True,
+                load_optimizer=True,
             )
             scheduler_path = os.path.join(local_path, _LR_SCHEDULER_STATE)
             if self.handle._lr_scheduler is not None and os.path.exists(scheduler_path):

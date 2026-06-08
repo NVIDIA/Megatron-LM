@@ -69,6 +69,10 @@ DTYPE="${DTYPE:-bfloat16}"
 MLITE_MODEL_NAME="${MLITE_MODEL_NAME:-auto}"
 MLITE_IMPL="${MLITE_IMPL:-lite}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flash}"
+# Optimizer backend:
+# - distopt (default): Megatron-Core DDP + distributed optimizer.
+# - fsdp2: Megatron Lite FSDP2 wrapper + optimizer.
+MLITE_OPTIMIZER_BACKEND="${MLITE_OPTIMIZER_BACKEND:-distopt}"
 
 LR="${LR:-1e-5}"
 MIN_LR="${MIN_LR:-${LR}}"
@@ -96,6 +100,19 @@ if [[ "${PAD_MODE}" != "no_padding" ]]; then
   echo "Megatron Lite VERL example currently supports PAD_MODE=no_padding only." >&2
   exit 1
 fi
+
+case "${MLITE_OPTIMIZER_BACKEND}" in
+  distopt)
+    MLITE_IMPL_OPTIMIZER="mc"
+    ;;
+  fsdp2)
+    MLITE_IMPL_OPTIMIZER="fsdp2"
+    ;;
+  *)
+    echo "Unsupported MLITE_OPTIMIZER_BACKEND=${MLITE_OPTIMIZER_BACKEND}. Expected distopt or fsdp2." >&2
+    exit 1
+    ;;
+esac
 
 MLITE_VPP_SIZE="${VPP_SIZE}"
 if [[ "${MLITE_VPP_SIZE}" == "null" ]]; then
@@ -179,6 +196,7 @@ BACKEND_ARGS=(
   "engine.grad_offload=${GRAD_OFFLOAD}"
   "engine.attention_backend_override=${ATTENTION_BACKEND}"
   "engine.impl_cfg.use_thd=True"
+  "+engine.impl_cfg.optimizer=${MLITE_IMPL_OPTIMIZER}"
 )
 
 if [[ "${OPTIMIZER_OFFLOAD}" == "True" || "${OPTIMIZER_OFFLOAD}" == "true" || "${OPTIMIZER_OFFLOAD}" == "1" ]]; then
@@ -216,6 +234,7 @@ echo "[${BACKEND}] output_root=${OUTPUT_ROOT}"
 echo "[${BACKEND}] log=${LOG_FILE}"
 echo "[${BACKEND}] jsonl=${JSONL_FILE}"
 echo "[${BACKEND}] cmd=${CMD_FILE}"
+echo "[${BACKEND}] optimizer_backend=${MLITE_OPTIMIZER_BACKEND} impl_cfg.optimizer=${MLITE_IMPL_OPTIMIZER}"
 
 set +e
 "${COMMAND[@]}" 2>&1 | tee "${LOG_FILE}"

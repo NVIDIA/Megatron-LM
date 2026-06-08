@@ -84,6 +84,10 @@ DTYPE="${DTYPE:-bfloat16}"
 MLITE_MODEL_NAME="${MLITE_MODEL_NAME:-auto}"
 MLITE_IMPL="${MLITE_IMPL:-lite}"
 ATTENTION_BACKEND="${ATTENTION_BACKEND:-flash}"
+# Optimizer backend:
+# - distopt (default): Megatron-Core DDP + distributed optimizer.
+# - fsdp2: Megatron Lite FSDP2 wrapper + optimizer.
+MLITE_OPTIMIZER_BACKEND="${MLITE_OPTIMIZER_BACKEND:-distopt}"
 
 ACTOR_LR="${ACTOR_LR:-1e-6}"
 POLICY_LOSS_MODE="${POLICY_LOSS_MODE:-vanilla}"
@@ -107,6 +111,7 @@ TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-null}"
 SAVE_FREQ="${SAVE_FREQ:-20}"
 TEST_FREQ="${TEST_FREQ:-5}"
 RESUME_MODE="${RESUME_MODE:-auto}"
+RESUME_FROM_PATH="${RESUME_FROM_PATH:-null}"
 LOG_VAL_GENERATIONS="${LOG_VAL_GENERATIONS:-10}"
 LOGGER="${LOGGER:-[console,file]}"
 USE_LEGACY_WORKER_IMPL="${USE_LEGACY_WORKER_IMPL:-disable}"
@@ -117,6 +122,19 @@ if [[ "${INFER_BACKEND}" != "vllm" && "${INFER_BACKEND}" != "sglang" && "${INFER
   echo "Unsupported INFER_BACKEND=${INFER_BACKEND}. Expected vllm, sglang, or trtllm." >&2
   exit 1
 fi
+
+case "${MLITE_OPTIMIZER_BACKEND}" in
+  distopt)
+    MLITE_IMPL_OPTIMIZER="mc"
+    ;;
+  fsdp2)
+    MLITE_IMPL_OPTIMIZER="fsdp2"
+    ;;
+  *)
+    echo "Unsupported MLITE_OPTIMIZER_BACKEND=${MLITE_OPTIMIZER_BACKEND}. Expected distopt or fsdp2." >&2
+    exit 1
+    ;;
+esac
 
 if [[ "${INFER_BACKEND}" == "vllm" ]]; then
   export VLLM_USE_V1="${VLLM_USE_V1:-1}"
@@ -202,6 +220,7 @@ ACTOR=(
   "actor_rollout_ref.actor.engine.grad_offload=${GRAD_OFFLOAD}"
   "actor_rollout_ref.actor.engine.attention_backend_override=${ATTENTION_BACKEND}"
   "actor_rollout_ref.actor.engine.impl_cfg.use_thd=True"
+  "+actor_rollout_ref.actor.engine.impl_cfg.optimizer=${MLITE_IMPL_OPTIMIZER}"
 )
 
 if [[ "${OPTIMIZER_OFFLOAD}" == "True" || "${OPTIMIZER_OFFLOAD}" == "true" || "${OPTIMIZER_OFFLOAD}" == "1" ]]; then
@@ -257,6 +276,7 @@ TRAINER=(
   "trainer.total_epochs=${TOTAL_EPOCHS}"
   "trainer.total_training_steps=${TOTAL_TRAINING_STEPS}"
   "trainer.resume_mode=${RESUME_MODE}"
+  "trainer.resume_from_path=${RESUME_FROM_PATH}"
   "trainer.default_local_dir=${CKPT_DIR}"
   "trainer.val_before_train=False"
   "trainer.log_val_generations=${LOG_VAL_GENERATIONS}"
@@ -290,6 +310,7 @@ echo "[mlite] output_root=${OUTPUT_ROOT}"
 echo "[mlite] log=${LOG_FILE}"
 echo "[mlite] jsonl=${JSONL_FILE}"
 echo "[mlite] cmd=${CMD_FILE}"
+echo "[mlite] optimizer_backend=${MLITE_OPTIMIZER_BACKEND} impl_cfg.optimizer=${MLITE_IMPL_OPTIMIZER}"
 
 set +e
 "${COMMAND[@]}" 2>&1 | tee "${LOG_FILE}"

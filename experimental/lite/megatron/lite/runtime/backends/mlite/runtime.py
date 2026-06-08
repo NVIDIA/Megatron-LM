@@ -106,6 +106,14 @@ def _last_loss_output(outputs: list[dict]) -> dict:
     return {}
 
 
+def _checkpoint_module(model: Any) -> torch.nn.Module:
+    if isinstance(model, torch.nn.Module):
+        return model
+    if isinstance(model, list | tuple):
+        return torch.nn.ModuleList(model)
+    raise TypeError(f"Checkpoint model must be an nn.Module or sequence of modules, got {type(model).__name__}.")
+
+
 class MegatronLiteRuntime(RuntimeBase):
     """Megatron Lite default training backend (Megatron-style 5D parallel)."""
 
@@ -238,12 +246,29 @@ class MegatronLiteRuntime(RuntimeBase):
     def save_checkpoint(self, handle: ModelHandle, path: str, **kwargs) -> None:
         from megatron.lite.primitive.ckpt import save_training_checkpoint
 
-        save_training_checkpoint(handle._model, handle._optimizer, path)
+        save_training_checkpoint(
+            _checkpoint_module(handle._model),
+            handle._optimizer,
+            int(kwargs.get("global_step", kwargs.get("step", 0))),
+            path,
+            handle._config.parallel,
+            handle._parallel_state,
+            save_model=kwargs.get("save_model", True),
+            save_optimizer=kwargs.get("save_optimizer", True),
+        )
 
     def load_checkpoint(self, handle: ModelHandle, path: str, **kwargs) -> None:
         from megatron.lite.primitive.ckpt import load_training_checkpoint
 
-        load_training_checkpoint(handle._model, handle._optimizer, path)
+        load_training_checkpoint(
+            _checkpoint_module(handle._model),
+            handle._optimizer,
+            path,
+            handle._config.parallel,
+            handle._parallel_state,
+            load_model=kwargs.get("load_model", True),
+            load_optimizer=kwargs.get("load_optimizer", True),
+        )
 
     def export_weights(self, handle: ModelHandle, **kwargs) -> Iterator[tuple[str, torch.Tensor]]:
         model_chunks = handle._extras.get("model_chunks", [handle._model])
