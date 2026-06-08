@@ -16,8 +16,10 @@ onelogger.err
 runs/
 /test_cases/
 **/dist/
-experimental/lite/examples/bench/outputs/
 
 # Sphinx documentation
 docs/_build
 docs/apidocs
+
+# Git worktrees
+.worktrees/
