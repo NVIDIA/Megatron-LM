@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Pretrain utilities."""
 import argparse
@@ -172,6 +172,7 @@ from megatron.training.checkpointing import (
     save_checkpoint,
     save_grads,
 )
+from megatron.training.simulation import SimulationArgsOverride, VppSimulator
 
 try:
     from megatron.core.distributed import TorchFullyShardedDataParallel as torch_FSDP
@@ -1033,6 +1034,25 @@ def preprocess_common_state_dict(common_state_dict):
     return preprocessed_common_state_dict
 
 
+def simulate_global_step(
+    train_valid_test_dataset_provider,
+    model_provider,
+    forward_step_func,
+):
+
+    train_data_iterator, valid_data_iterator, test_data_iterator = (
+        build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
+    )
+
+    vpp_simulator = VppSimulator(
+        train_data_iterator,
+        model_provider,
+        forward_step_func,
+    )
+
+    vpp_simulator.run_global_step()
+
+
 def pretrain(
     cfg_container: PretrainConfigContainer,
     train_valid_test_dataset_provider,
@@ -1091,24 +1111,27 @@ def pretrain(
     # Capture timestamp right at top of pretrain, before initialize_megatron
     global _STARTUP_TIMESTAMPS
     _STARTUP_TIMESTAMPS['pretrain_entry'] = time.time()
+    args = get_args()
 
-    if inprocess_call_wrapper is not None:
-        iteration = inprocess_call_wrapper.iteration
-        store = torch.distributed.PrefixStore(str(iteration), store)
+    # Temporarily override PP args for simulation initialization
+    with SimulationArgsOverride(args, enable=getattr(args, 'simulate_global_step', False)):
+        if inprocess_call_wrapper is not None:
+            iteration = inprocess_call_wrapper.iteration
+            store = torch.distributed.PrefixStore(str(iteration), store)
 
-    timestamp_after_inprocess_setup = time.time()
+        timestamp_after_inprocess_setup = time.time()
 
-    # Early fault tolerance setup - must be done before initialize_megatron
-    # to enable monitoring of the initialization process
-    ft_integration.setup()
-    timestamp_after_in_job_setup = time.time()
+        # Early fault tolerance setup - must be done before initialize_megatron
+        # to enable monitoring of the initialization process
+        ft_integration.setup()
+        timestamp_after_in_job_setup = time.time()
 
-    # Initalize and get arguments, timers, and Tensorboard writer.
-    initialize_megatron(
-        get_embedding_ranks=get_embedding_ranks,
-        get_position_embedding_ranks=get_position_embedding_ranks,
-        store=store,
-    )
+        # Initialize Megatron with PP=1 in simulation mode.
+        initialize_megatron(
+            get_embedding_ranks=get_embedding_ranks,
+            get_position_embedding_ranks=get_position_embedding_ranks,
+            store=store,
+        )
 
     timestamp_after_initialize_megatron = time.time()
 
@@ -1215,6 +1238,14 @@ def pretrain(
 
     # Track E2E metrics on pretrain start
     one_logger_utils.on_pretrain_start()
+
+    if args.simulate_global_step:
+        simulate_global_step(
+            train_valid_test_dataset_provider,
+            model_provider,
+            forward_step_func,
+        )
+        return
 
     # Context used for persisting some state between checkpoint saves.
     if cfg_container.checkpoint.non_persistent_ckpt_type == 'local':
