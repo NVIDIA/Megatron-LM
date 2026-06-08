@@ -11,37 +11,37 @@
 
 This document outlines the processes and policies for issues and pull requests by non-NVIDIA contributors to the Megatron-LM GitHub repository.
 
-Everyone is welcome to contribute to the project! We recently migrated from using an internal repo to doing all development directly from the GitHub repository.
+Everyone is welcome to contribute. The project recently migrated from an internal repository to doing all development directly on GitHub.
 
-When contributing it is important to ensure that changes are in line with the project direction. Small changes to fix bugs are welcomed and appreciated. **If proposing large architectural changes or changes for stylistic reasons open an issue first so we can discuss it.**
+When contributing, it is important to ensure that changes are in line with the project direction. Small bug fixes are always welcome. **If proposing large architectural changes or changes for stylistic reasons, open an issue first for discussion.**
 
-## Issue policy
+## Issue Policy
 
-Please do file any bugs you find, keeping the following in mind:
+File any bugs you find, keeping the following in mind:
 
-- If filing a bug, i.e. you have found something that doesn't work as expected, use the BUG template.
-- If you've found a regression in speed or accuracy use the REGRESSION template.
-- If you are requesting a new feature or modification of an existing feature use the ENHANCEMENT template.
-- If opening an issue to ask a question no template is needed but please make your question as clear and concise as possible.
+- If filing a bug, that is, you have found something that does not work as expected, use the `BUG` template.
+- If you've found a regression in speed or accuracy, use the `REGRESSION` template.
+- If you are requesting a new feature or modification of an existing feature, use the `ENHANCEMENT` template.
+- If opening an issue to ask a question, you do not need a template, but make your question as clear and concise as possible.
 - One issue per bug. Putting multiple things in the same issue makes both discussion and completion unnecessarily complicated.
-- Your bug is mostly likely to get attention from the development team quickly if we can easily reproduce it.
+- Reproducible bugs get the fastest attention from the development team.
 - Use proper spelling, grammar, and punctuation.
 - Write in an authoritative and technical tone.
 
-## Code submission policy
+## Code Submission Policy
 
 ### Do
 
 - Format new code in a style that is consistent with the file being changed. Megatron-LM doesn't (yet) have a style guide or enforced formatting.
-- Split your changes into separate, atomic commits i.e. A commit per feature or fix.
-- Make sure your commits are rebased on the master branch.
+- Split your changes into separate, atomic commits, that is, a commit per feature or fix.
+- Make sure your commits are rebased on the `main` branch.
 - Write the commit message subject line in the imperative mood ("Change the default argument for X", not "Changed the default argument for X").
 - Write your commit messages in proper English, with care and punctuation.
-- Check the spelling of your code, comments and commit messages.
+- Check the spelling of your code, comments, and commit messages.
 
 ### Don't
 
-- Submit code that's incompatible with the project licence.
+- Submit code that's incompatible with the project license.
 - Touch anything outside the stated scope of the PR. This includes formatting changes to code not relevant to the PR.
 - Iterate excessively on your design across multiple commits.
 - Include commented-out code.
@@ -49,22 +49,22 @@ Please do file any bugs you find, keeping the following in mind:
 
 ## Issue and Pull Request Q&A
 
-### I've submitted an issue and PR. When can I expect to get some feedback?
+### Response Time for Issues and PRs
 
-You should receive a response within 2 business days.
+You should receive a response within two business days.
 
-### I need help, who should I ping?
+### Getting Help
 
-Use @NVIDIA/mcore-oncall.
+Use `@NVIDIA/mcore-oncall`.
 
-### If my issue or PR isn't getting attention, what should I do?
+### Escalating Unresponsive Issues or PRs
 
-After 2 business days, tag the user @NVIDIA/mcore-oncall.
+After two business days, tag `@NVIDIA/mcore-oncall`.
 
-### Is there a policy for issues and PRs that haven't been touched in X days? Should they be closed?
+### Stale Issue and PR Policy
 
-Yes, we have a bot that will mark untouched PRs as "stale" after 60 days.
+A bot marks untouched PRs as "stale" after 60 days.
 
-We have a long backlog of issues and PRs dating back years. We are trying to triage these now by working backwards. Older issues we believe may still be relevant may receive a request to re-test them with the latest code. If there's no response they may be closed. Again, if you they should be re-opened then just respond with a comment to that effect.
+A long backlog of issues and PRs dates back years, and triage works backwards through it. Older issues that may still be relevant receive a request to re-test with the latest code. Without a response, the issue may be closed. To request reopening, respond with a comment.
 
-Thank you!
+Thank you.
