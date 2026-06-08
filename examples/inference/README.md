@@ -118,7 +118,7 @@ still target these scripts.
 --moe-routing-trace-capture-hidden-states     # optional: input hidden states
 ```
 
-**During inference**, add these flags (e.g.
+**During inference**, add these flags (e.g. to
 `advanced/gpt_dynamic_inference_with_coordinator.py`):
 
 ```bash
@@ -146,14 +146,13 @@ python tools/moe_routing/analyze_routing.py /path/to/trace_dir --ep-size 8 \
 
 The dispatcher runs these analyses in order:
 
-| Script | Question answered |
-|--------|-------------------|
+| Script | Analysis                                                                                                                                                   |
+|--------|-----------------------|
 | `tools/moe_routing/analyze_router_trace.py` | How much does MoE layer L's top-K overlap with the previous MoE layer? (predictor accuracy ceiling; handles non-MoE layers between them, e.g. MEMEME pattern) |
-| `tools/moe_routing/analyze_routing_jaccard.py` | Jaccard similarity between consecutive MoE layers |
-| `tools/moe_routing/analyze_routing_concentration.py` | How concentrated is routing? (hot-set size) |
-| `tools/moe_routing/analyze_routing_load_balance.py` | Can one-layer-ahead prediction close the EP load-imbalance gap? |
-| `tools/moe_routing/analyze_routing_logits.py` | Boundary margins, score-level cosine similarity, soft top-N Jaccard |
-| `tools/moe_routing/analyze_routing_cross_snapshot.py` | Do the same experts stay hot across training checkpoints? |
+| `tools/moe_routing/analyze_routing_concentration.py` | How concentrated is routing? (hot-set size)                                                                                                                |
+| `tools/moe_routing/analyze_routing_load_balance.py` | Can one-layer-ahead prediction close the EP load-imbalance gap?                                                                                            |
+| `tools/moe_routing/analyze_routing_logits.py` | Boundary margins, score-level cosine similarity, soft top-N Jaccard                                                                                        |
+| `tools/moe_routing/analyze_routing_cross_snapshot.py` | Do the same experts stay hot across training checkpoints?                                                                                                  |
 
 #### Adding new routing metrics
 
