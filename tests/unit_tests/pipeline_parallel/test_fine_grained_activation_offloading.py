@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Tuple
 import pytest
 import torch
 
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
@@ -451,6 +452,53 @@ def test_full_recompute_layer_input_offloading(recompute_num_layers: int):
             assert torch.allclose(go, gb, rtol=1e-3, atol=1e-3), f"Grad mismatch for {name}"
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.experimental
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+@pytest.mark.skipif(
+    not (HAVE_TE and is_te_min_version("1.5.0")),
+    reason="TE checkpoint patch requires Transformer Engine 1.5.0+.",
+)
+def test_te_checkpoint_resizes_fgao_reloaded_input(monkeypatch):
+    """TE checkpoint backward releases FGAO-reloaded checkpoint input storage."""
+    from megatron.core.extensions import transformer_engine as te_ext
+    from megatron.core.pipeline_parallel.fine_grained_activation_offload import mark_reloaded_tensor
+
+    resize_calls = []
+    original_resize = te_ext._resize_fgao_checkpoint_inputs
+
+    def _record_resize(detached_inputs):
+        resize_calls.append(
+            sum(
+                1
+                for inp in detached_inputs
+                if torch.is_tensor(inp)
+                and getattr(inp, "_mcore_fgao_resize_after_backward", False)
+            )
+        )
+        return original_resize(detached_inputs)
+
+    monkeypatch.setattr(te_ext, "_resize_fgao_checkpoint_inputs", _record_resize)
+
+    x = torch.randn(16, 16, device="cuda", requires_grad=True)
+    mark_reloaded_tensor(x)
+
+    def forward_func(inp):
+        return (inp * inp).sum()
+
+    loss = te_ext.te_checkpoint(
+        forward_func,
+        False,
+        None,
+        None,
+        x,
+    )
+    loss.backward()
+    torch.cuda.synchronize()
+
+    assert x.grad is not None
+    assert resize_calls and resize_calls[-1] == 1
 
 
 @pytest.mark.flaky_in_dev

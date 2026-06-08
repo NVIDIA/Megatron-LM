@@ -1,4 +1,4 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
 
 """Model and data parallel groups."""
 
@@ -219,16 +219,6 @@ def create_group(
     group_desc=None,
 ):
     """Creates a ProcessGroup."""
-    if (
-        pg_options is not None
-        and backend is None
-        and torch.distributed.is_initialized()
-        and torch.distributed.get_backend() == "fake"
-    ):
-        # PyTorch fake_pg does not accept ProcessGroupNCCL.Options. Fake-pg
-        # still exercises Megatron's group topology, but it should not carry
-        # NCCL-only tuning objects into the fake backend.
-        pg_options = None
     kwargs = {
         "ranks": ranks,
         "timeout": timeout,
