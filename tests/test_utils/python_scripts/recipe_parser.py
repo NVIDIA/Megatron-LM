@@ -25,6 +25,12 @@ ALLOWED_CADENCE_VALUES = set(DEFAULT_CADENCE) | {"weekly"}
 # intentionally left as pass-through so GitLab `--scope mr*` / `--scope
 # unit-tests` continue to match recipes verbatim and don't bleed into the
 # GitHub L0 / L1 matrix.
+#
+# L-tier vocabulary (cost class, ascending): `L0` (slim PR) < `L1` (full PR /
+# merge queue) < `L2` (nightly) < `L3` (weekly). `L0-smoke` is a sub-L0 tier
+# for fast lightweight smoke tests (cheaper than `L0`); it is GitLab-only and
+# passes through verbatim (not aliased here). Recipes tag rows with
+# `scope: [L0-smoke]` and GitLab selects them via `--scope L0-smoke`.
 LEGACY_SCOPE_ALIASES = {
     # GitHub-only scopes are aliased onto the L-tier vocabulary so the GH CI
     # workflow can filter on `L0` / `L1`. GitLab-only scopes (`mr`, `mr-slim`)

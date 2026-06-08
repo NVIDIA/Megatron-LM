@@ -67,7 +67,7 @@ products:
   - test_case: [gpt3_mcore_tp2_pp2_ep2_te_4experts2parallel]
     products:
       - environment: [dev]
-        scope: [nightly]
+        scope: [nightly, L0-smoke]
         platforms: [dgx_gb200]
   - test_case: [gpt3_mcore_tp2_cp2_pp2_ep2_te_4experts2parallel]
     products:
