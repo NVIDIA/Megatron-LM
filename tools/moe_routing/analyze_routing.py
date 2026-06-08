@@ -98,7 +98,7 @@ def main():
         "Expert concentration  (hot-set size, load distribution)",
     )
 
-    # 4. EP load balance: can one-layer-ahead prediction close the imbalance gap?
+    # 2. EP load balance: can one-layer-ahead prediction close the imbalance gap?
     lb_args = [args.trace_dir, "--ep-size", str(args.ep_size)]
     if args.num_experts:
         lb_args += ["--num-experts", str(args.num_experts)]
@@ -112,7 +112,7 @@ def main():
         "EP load balance  (one-layer-ahead prediction recovery fraction)",
     )
 
-    # 5. Score-level analyses (boundary margin, cosine similarity, soft Jaccard).
+    # 3. Score-level analyses (boundary margin, cosine similarity, soft Jaccard).
     if args.with_logits:
         logit_args = [args.trace_dir]
         if args.top_k:
@@ -125,7 +125,7 @@ def main():
             "Score-level analyses  (boundary margin, cosine similarity, soft Jaccard)",
         )
 
-    # 6. Cross-snapshot stability (step-after-step expert reuse).
+    # 4. Cross-snapshot stability (step-after-step expert reuse).
     if args.snapshots:
         snap_args = args.snapshots + ["--ep-size", str(args.ep_size)]
         if args.num_experts:
