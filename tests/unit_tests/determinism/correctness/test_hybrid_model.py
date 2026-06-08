@@ -95,9 +95,7 @@ class TestHybridModelDeterminism:
         # evenly across stages.
         if vpp > 1:
             seg = len(layer_pattern) // stages
-            layer_pattern = "|".join(
-                layer_pattern[i * seg : (i + 1) * seg] for i in range(stages)
-            )
+            layer_pattern = "|".join(layer_pattern[i * seg : (i + 1) * seg] for i in range(stages))
 
         def build(overrides, pre_process=True, post_process=True, vp_stage=None, **_):
             cfg = TransformerConfig(**(hybrid_base() | overrides))
