@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import torch
 
 from megatron.lite.primitive.ckpt import dcp
+from megatron.lite.primitive.protocols import default_expert_classifier, default_placement_fn
 from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.handle import ModelHandle
 
@@ -79,7 +80,7 @@ def test_runtime_checkpoint_api_passes_current_training_checkpoint_signature(mon
         save_model=True,
         save_optimizer=False,
     )
-    runtime.load_checkpoint(
+    loaded_step = runtime.load_checkpoint(
         handle,
         str(tmp_path),
         load_model=False,
@@ -93,7 +94,14 @@ def test_runtime_checkpoint_api_passes_current_training_checkpoint_signature(mon
         str(tmp_path),
         parallel,
         ps,
-        {"save_model": True, "save_optimizer": False},
+        {
+            "get_placements": default_placement_fn,
+            "is_expert": default_expert_classifier,
+            "use_dcp": True,
+            "save_rng": True,
+            "save_model": True,
+            "save_optimizer": False,
+        },
     )
     assert calls["load"] == (
         model,
@@ -101,5 +109,14 @@ def test_runtime_checkpoint_api_passes_current_training_checkpoint_signature(mon
         str(tmp_path),
         parallel,
         ps,
-        {"load_model": False, "load_optimizer": True},
+        {
+            "get_placements": default_placement_fn,
+            "is_expert": default_expert_classifier,
+            "use_dcp": True,
+            "load_rng": True,
+            "load_parameter_state_update_legacy_format": False,
+            "load_model": False,
+            "load_optimizer": True,
+        },
     )
+    assert loaded_step == 7
