@@ -966,6 +966,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.async_kv_deferred_release_count = 0
         self.async_mamba_deferred_release_count = 0
         self._async_prepared_request_count = 0
+        self._async_prepared_decode_plan: Optional[AsyncDecodeLifecyclePlan] = None
         self._async_prepared_request_ids = torch.empty(
             (self.max_requests,), dtype=torch.int32, device='cpu'
         )
@@ -2763,6 +2764,7 @@ class DynamicInferenceContext(BaseInferenceContext):
     def clear_async_prepared_decode_plan(self) -> None:
         """Forget the prepared async decode plan after it has been launched or discarded."""
         self._async_prepared_request_count = 0
+        self._async_prepared_decode_plan = None
         self._async_prepared_sample_source_count = 0
         self._async_prepared_paused_source_count = 0
         self._async_prepared_decode_input_is_identity = False
@@ -2854,6 +2856,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             return None
         return self._async_prepared_request_ids[: self._async_prepared_request_count].clone()
 
+    def async_prepared_decode_plan(self) -> Optional[AsyncDecodeLifecyclePlan]:
+        """Return the prepared speculative decode plan, if one is staged."""
+        return self._async_prepared_decode_plan
+
     def _record_async_decode_input_sources(
         self,
         plan: AsyncDecodeLifecyclePlan,
@@ -2870,6 +2876,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             return False
 
         request_count = plan.active_request_count
+        self._async_prepared_decode_plan = plan
         self._async_prepared_request_count = request_count
         self._async_prepared_request_ids[:request_count].copy_(plan.request_ids)
 

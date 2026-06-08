@@ -435,6 +435,10 @@ class AsyncDecodePlan:
             layout_compatible=decision.layout_compatible,
         )
 
+    def with_layout_snapshot(self, snapshot: AsyncLayoutSnapshot) -> "AsyncDecodePlan":
+        """Return a copy of the plan with the prepared runtime layout snapshot attached."""
+        return replace(self, layout_snapshot=snapshot)
+
 
 @dataclass(frozen=True)
 class AsyncPendingForwardDecision:
@@ -687,6 +691,8 @@ class AsyncDecodeTransaction:
 
     def mark_committed(self) -> None:
         """Mark transaction-owned side effects as committed."""
+        if self.state == AsyncTxnState.COMMITTED:
+            return
         self.commit_participants()
         self.state = AsyncTxnState.COMMITTED
 
@@ -696,6 +702,8 @@ class AsyncDecodeTransaction:
 
     def rollback(self, reason: str) -> None:
         """Rollback the transaction and remember why it could not commit."""
+        if self.state in (AsyncTxnState.COMMITTED, AsyncTxnState.ROLLED_BACK):
+            return
         self.discard_reason = reason
         self.rollback_participants()
         self.state = AsyncTxnState.ROLLED_BACK
@@ -1082,6 +1090,165 @@ class AsyncResourceLedger:
         context.async_mamba_deferred_release_count += int(slots.numel())
         context.mamba_metadata.free_slot_ids(slots)
         self.deferred_mamba_slots.clear()
+
+
+@dataclass
+class AsyncResourceParticipant:
+    """Participant that owns rollback for one async resource ledger."""
+
+    ledger: AsyncResourceLedger
+    context: object | None = None
+    prepared: bool = False
+    committed: bool = False
+    rolled_back: bool = False
+
+    def prepare(self, plan: AsyncDecodePlan) -> dict[str, int | bool]:
+        """Capture resource diagnostics for the prepared transaction."""
+        self.prepared = True
+        return self.diagnostics()
+
+    def validate(self, plan: AsyncDecodePlan, current_state: object) -> bool:
+        """Resource ledgers are valid as long as they are still in flight or empty."""
+        return self.ledger.in_flight or self.ledger.reservation_count == 0
+
+    def commit(self, plan: AsyncDecodePlan) -> None:
+        """Mark resource side effects as accepted by the transaction."""
+        if self.committed:
+            return
+        if self.context is not None:
+            self.ledger.release_deferred(self.context)
+        self.committed = True
+
+    def rollback(self, plan: AsyncDecodePlan) -> None:
+        """Release every speculative resource exactly once."""
+        if self.committed or self.rolled_back:
+            return
+        if self.context is not None:
+            self.ledger.drain(self.context)
+        else:
+            self.ledger.defer_unused_reservations()
+        self.rolled_back = True
+
+    def diagnostics(self) -> dict[str, int | bool]:
+        """Return participant-local resource diagnostics."""
+        return {
+            **self.ledger.diagnostics(),
+            "prepared": self.prepared,
+            "committed": self.committed,
+            "rolled_back": self.rolled_back,
+        }
+
+
+@dataclass
+class AsyncMambaStateParticipant:
+    """Participant that commits async Mamba candidate banks."""
+
+    context: object
+    committed: bool = False
+    rolled_back: bool = False
+
+    def prepare(self, plan: AsyncDecodePlan) -> dict[str, bool]:
+        """Mamba state is already prepared in context staging buffers."""
+        return self.diagnostics()
+
+    def validate(self, plan: AsyncDecodePlan, current_state: object) -> bool:
+        """Mamba state validity is covered by the plan layout decision."""
+        return True
+
+    def commit(self, plan: AsyncDecodePlan) -> None:
+        """Accept candidate Mamba banks for active requests in the committed plan."""
+        if self.committed:
+            return
+        if getattr(self.context, "is_hybrid_model", False):
+            self.context.accept_async_mamba_state(plan.request_ids)
+        self.committed = True
+
+    def rollback(self, plan: AsyncDecodePlan) -> None:
+        """Rollback does not publish candidate Mamba banks."""
+        if self.committed:
+            return
+        self.rolled_back = True
+
+    def diagnostics(self) -> dict[str, bool]:
+        """Return Mamba participant diagnostics."""
+        return {"committed": self.committed, "rolled_back": self.rolled_back}
+
+
+@dataclass
+class AsyncSampleReadbackParticipant:
+    """Participant that tracks sample readback ticket lifetime."""
+
+    ticket: AsyncSampleTicket
+    committed: bool = False
+    rolled_back: bool = False
+
+    def prepare(self, plan: AsyncDecodePlan) -> dict[str, int | bool]:
+        """Sample copy is already queued; expose the ticket diagnostics."""
+        return self.diagnostics()
+
+    def validate(self, plan: AsyncDecodePlan, current_state: object) -> bool:
+        """Sample tickets remain valid until their owning transaction retires."""
+        return True
+
+    def commit(self, plan: AsyncDecodePlan) -> None:
+        """Mark the sample ticket as consumed by a committed transaction."""
+        if self.committed:
+            return
+        self.committed = True
+
+    def rollback(self, plan: AsyncDecodePlan) -> None:
+        """Mark the sample ticket as discarded with the transaction."""
+        if self.committed:
+            return
+        self.rolled_back = True
+
+    def diagnostics(self) -> dict[str, int | bool]:
+        """Return sample ticket diagnostics."""
+        return {
+            "slot": self.ticket.slot,
+            "active_request_count": self.ticket.active_request_count,
+            "committed": self.committed,
+            "rolled_back": self.rolled_back,
+        }
+
+
+@dataclass
+class AsyncLogprobMTPParticipant:
+    """Participant that records generated-logprob and MTP requirements."""
+
+    requires_logprobs: bool
+    requires_mtp: bool
+    committed: bool = False
+    rolled_back: bool = False
+
+    def prepare(self, plan: AsyncDecodePlan) -> dict[str, bool]:
+        """Logprob and MTP tensors are prepared by controller sampling paths."""
+        return self.diagnostics()
+
+    def validate(self, plan: AsyncDecodePlan, current_state: object) -> bool:
+        """Logprob and MTP state is valid when the pending forward itself is valid."""
+        return True
+
+    def commit(self, plan: AsyncDecodePlan) -> None:
+        """Mark logprob/MTP participant state as accepted."""
+        if self.committed:
+            return
+        self.committed = True
+
+    def rollback(self, plan: AsyncDecodePlan) -> None:
+        """Mark logprob/MTP participant state as discarded."""
+        if self.committed:
+            return
+        self.rolled_back = True
+
+    def diagnostics(self) -> dict[str, bool]:
+        """Return logprob/MTP participant diagnostics."""
+        return {
+            "requires_logprobs": self.requires_logprobs,
+            "requires_mtp": self.requires_mtp,
+            "committed": self.committed,
+            "rolled_back": self.rolled_back,
+        }
 
 
 def _tensor_ints(values: Tensor, *, skip_negative: bool = False) -> list[int]:

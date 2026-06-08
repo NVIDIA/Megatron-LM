@@ -18,9 +18,14 @@ from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.async_transaction import (
     AsyncDecodeTransaction,
     AsyncLayoutSnapshot,
+    AsyncLogprobMTPParticipant,
+    AsyncMambaStateParticipant,
     AsyncPendingForwardDecision,
+    AsyncResourceLedger,
+    AsyncResourceParticipant,
     AsyncRowMapPolicy,
     AsyncSampleReadback,
+    AsyncSampleReadbackParticipant,
     AsyncSampleTicket,
     AsyncTxnState,
     classify_async_eligibility,
@@ -1644,16 +1649,71 @@ class TextGenerationController:
             padded_active_request_count=cuda_graph_request_count,
             tokens_per_request=self.num_speculative_tokens + 1,
         )
+        prepared_plan = None
+        if hasattr(context, "async_prepared_decode_plan"):
+            prepared_plan = context.async_prepared_decode_plan()
+        if prepared_plan is not None:
+            prepared_plan = prepared_plan.with_layout_snapshot(snapshot)
         transaction_step_id = getattr(self, "_async_transaction_next_step_id", 0)
         transaction = AsyncDecodeTransaction(
             step_id=transaction_step_id,
             state=AsyncTxnState.PREPARED,
             snapshot=snapshot,
+            plan=prepared_plan,
         )
         self._async_step_transaction = transaction
         self._async_transaction_next_step_id = transaction_step_id + 1
         context.clear_async_prepared_decode_plan()
         return transaction
+
+    def _async_transaction_has_participant(
+        self, transaction: object | None, participant_type: type
+    ) -> bool:
+        """Return whether a transaction already owns a participant type."""
+        participants = getattr(transaction, "participants", ())
+        return any(isinstance(participant, participant_type) for participant in participants)
+
+    def _attach_async_transaction_participants(
+        self,
+        transaction: object,
+        *,
+        resources: object | None,
+        sample_ticket: object | None,
+    ) -> None:
+        """Attach launch-owned participant adapters to a real async transaction."""
+        if not hasattr(transaction, "participants") or not hasattr(
+            transaction, "prepare_participants"
+        ):
+            return
+
+        context = self.inference_wrapped_model.inference_context
+        participants = []
+        if getattr(context, "is_hybrid_model", False):
+            participants.append(AsyncMambaStateParticipant(context))
+        if isinstance(sample_ticket, AsyncSampleTicket):
+            participants.append(AsyncSampleReadbackParticipant(sample_ticket))
+
+        requires_logprobs = False
+        if getattr(self, "_async_logprob_requests_seen", False):
+            try:
+                requires_logprobs = self._active_requests_need_logprob_results()
+            except (AttributeError, KeyError):
+                requires_logprobs = True
+        requires_mtp = self.num_speculative_tokens > 0
+        if requires_logprobs or requires_mtp:
+            participants.append(
+                AsyncLogprobMTPParticipant(
+                    requires_logprobs=requires_logprobs, requires_mtp=requires_mtp
+                )
+            )
+
+        if isinstance(resources, AsyncResourceLedger):
+            participants.append(AsyncResourceParticipant(resources, context))
+
+        if not participants:
+            return
+        transaction.participants = (*transaction.participants, *participants)
+        transaction.prepare_participants()
 
     def _pending_async_forward_decision(
         self, transaction: AsyncDecodeTransaction
@@ -1721,7 +1781,10 @@ class TextGenerationController:
             self._increment_async_counter("_async_layout_mismatch_discard_count")
         self._increment_async_counter("_async_discarded_forward_count")
         self._increment_async_counter("_async_rolled_back_forward_count")
-        transaction.discard(decision.reason or "pending forward not reusable")
+        if self._async_transaction_has_participant(transaction, AsyncResourceParticipant):
+            transaction.rollback(decision.reason or "pending forward not reusable")
+        else:
+            transaction.discard(decision.reason or "pending forward not reusable")
         return False, None, False
 
     def _discard_pending_async_forward(self) -> None:
@@ -1729,8 +1792,11 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         transaction = self._pending_async_transaction()
         if transaction is not None:
-            context.release_deferred_async_resources()
-            transaction.discard("discarded before step begin")
+            if self._async_transaction_has_participant(transaction, AsyncResourceParticipant):
+                transaction.rollback("discarded before step begin")
+            else:
+                context.release_deferred_async_resources()
+                transaction.discard("discarded before step begin")
             self._async_step_transaction = None
             self._increment_async_counter("_async_discarded_forward_count")
             self._increment_async_counter("_async_rolled_back_forward_count")
@@ -2867,15 +2933,37 @@ class TextGenerationController:
                     self._increment_async_counter("_async_discarded_forward_count")
                     self._increment_async_counter("_async_rolled_back_forward_count")
                     if transaction is not None:
-                        transaction.discard("row-mapped non-decode forward not reusable")
-                if pending_forward_reused and context.is_hybrid_model:
+                        if self._async_transaction_has_participant(
+                            transaction, AsyncResourceParticipant
+                        ):
+                            transaction.rollback("row-mapped non-decode forward not reusable")
+                        else:
+                            transaction.discard("row-mapped non-decode forward not reusable")
+                if (
+                    pending_forward_reused
+                    and context.is_hybrid_model
+                    and not self._async_transaction_has_participant(
+                        transaction, AsyncMambaStateParticipant
+                    )
+                ):
                     context.accept_async_mamba_state(self._active_request_ids_cpu())
-                context.release_deferred_async_resources()
                 if transaction is not None:
+                    resource_participant_owned = self._async_transaction_has_participant(
+                        transaction, AsyncResourceParticipant
+                    )
                     if pending_forward_reused:
+                        if not resource_participant_owned:
+                            context.release_deferred_async_resources()
                         transaction.mark_committed()
                         self._increment_async_counter("_async_committed_forward_count")
-                    elif transaction.state != AsyncTxnState.DISCARDED:
+                    else:
+                        if not resource_participant_owned:
+                            context.release_deferred_async_resources()
+                    if (
+                        not pending_forward_reused
+                        and transaction.state
+                        not in (AsyncTxnState.DISCARDED, AsyncTxnState.ROLLED_BACK)
+                    ):
                         transaction.discard("pending forward not reused")
                         self._increment_async_counter("_async_rolled_back_forward_count")
                     self._retire_async_transaction()
@@ -3030,6 +3118,9 @@ class TextGenerationController:
                     )
                     transaction = self._begin_async_step_transaction(cuda_graph_request_count)
                     resources = context.mark_async_resources_in_flight()
+                    self._attach_async_transaction_participants(
+                        transaction, resources=resources, sample_ticket=async_sample_ticket
+                    )
                     transaction.mark_launched(
                         sample_ticket=async_sample_ticket,
                         resources=resources,
@@ -3084,9 +3175,14 @@ class TextGenerationController:
                 if self._has_pending_async_forward_state() and next_active_request_count == 0:
                     transaction = self._pending_async_transaction()
                     torch.cuda.current_stream().synchronize()
-                    context.release_deferred_async_resources()
                     if transaction is not None:
-                        transaction.discard("no active requests after bookkeeping")
+                        if self._async_transaction_has_participant(
+                            transaction, AsyncResourceParticipant
+                        ):
+                            transaction.rollback("no active requests after bookkeeping")
+                        else:
+                            context.release_deferred_async_resources()
+                            transaction.discard("no active requests after bookkeeping")
                         self._increment_async_counter("_async_discarded_forward_count")
                         self._increment_async_counter("_async_rolled_back_forward_count")
                         self._async_step_transaction = None

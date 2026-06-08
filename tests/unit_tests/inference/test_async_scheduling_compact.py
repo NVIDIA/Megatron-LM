@@ -12,9 +12,13 @@ from megatron.core.inference.async_transaction import (
     AsyncDecodeTransaction,
     AsyncGraphShape,
     AsyncLayoutSnapshot,
+    AsyncLogprobMTPParticipant,
+    AsyncMambaStateParticipant,
     AsyncResourceLedger,
+    AsyncResourceParticipant,
     AsyncRowMapPolicy,
     AsyncSampleReadback,
+    AsyncSampleReadbackParticipant,
     AsyncSampleTicket,
     AsyncStepTransaction,
     AsyncTransactionParticipant,
@@ -1693,6 +1697,133 @@ def test_async_decode_plan_and_transaction_participant_hooks_are_canonical():
     assert transaction.state == AsyncTxnState.COMMITTED
     assert rollback_transaction.state == AsyncTxnState.ROLLED_BACK
     assert rollback_transaction.discard_reason == "validation failed"
+
+
+@pytest.mark.internal
+def test_async_resource_participant_rolls_back_speculative_resources_once():
+    released_blocks = []
+    context = SimpleNamespace(
+        is_hybrid_model=False,
+        async_kv_deferred_release_count=0,
+        kv_block_allocator=SimpleNamespace(
+            release_memory_blocks=lambda blocks: released_blocks.append(blocks.clone())
+        ),
+    )
+    ledger = AsyncResourceLedger(in_flight=True)
+    ledger.record_reservations(
+        request_ids=torch.tensor([10], dtype=torch.int32),
+        block_ids=torch.tensor([100], dtype=torch.int32),
+        block_columns=torch.tensor([1], dtype=torch.int32),
+    )
+    ledger.defer_kv_blocks(torch.tensor([200], dtype=torch.int32))
+    participant = AsyncResourceParticipant(ledger, context)
+    snapshot = _make_async_layout_snapshot([10], cuda_graph_request_count=1)
+    transaction = AsyncDecodeTransaction(
+        step_id=5,
+        state=AsyncTxnState.PREPARED,
+        snapshot=snapshot,
+        participants=(participant,),
+    )
+
+    transaction.prepare_participants()
+    transaction.rollback("invalidated")
+    transaction.rollback("invalidated again")
+
+    assert [blocks.tolist() for blocks in released_blocks] == [[200, 100]]
+    assert context.async_kv_deferred_release_count == 2
+    assert participant.diagnostics()["rolled_back"]
+    assert not participant.diagnostics()["committed"]
+    assert ledger.diagnostics() == {
+        "in_flight": False,
+        "reservations": 0,
+        "deferred_kv_blocks": 0,
+        "deferred_mamba_slots": 0,
+        "mamba_leases": 0,
+        "consumed_reservations": 0,
+    }
+
+
+@pytest.mark.internal
+def test_async_mamba_participant_commits_candidate_bank_once():
+    accepted_request_ids = []
+    context = SimpleNamespace(
+        is_hybrid_model=True,
+        accept_async_mamba_state=lambda request_ids: accepted_request_ids.append(
+            request_ids.clone()
+        ),
+    )
+    snapshot = _make_async_layout_snapshot([21, 22], cuda_graph_request_count=2)
+    plan = AsyncDecodePlan.from_snapshot(snapshot)
+    participant = AsyncMambaStateParticipant(context)
+    transaction = AsyncDecodeTransaction(
+        step_id=6,
+        state=AsyncTxnState.RESOLVED,
+        snapshot=snapshot,
+        plan=plan,
+        participants=(participant,),
+    )
+
+    transaction.mark_committed()
+    transaction.mark_committed()
+    transaction.rollback("late rollback")
+
+    assert [request_ids.tolist() for request_ids in accepted_request_ids] == [[21, 22]]
+    assert participant.diagnostics() == {"committed": True, "rolled_back": False}
+    assert transaction.state == AsyncTxnState.COMMITTED
+
+
+@pytest.mark.internal
+def test_controller_attaches_speculative_resource_participants_to_launch_transaction():
+    accepted_request_ids = []
+    released_blocks = []
+    context = SimpleNamespace(
+        is_hybrid_model=True,
+        accept_async_mamba_state=lambda request_ids: accepted_request_ids.append(
+            request_ids.clone()
+        ),
+        async_kv_deferred_release_count=0,
+        kv_block_allocator=SimpleNamespace(
+            release_memory_blocks=lambda blocks: released_blocks.append(blocks.clone())
+        ),
+    )
+    controller = object.__new__(TextGenerationController)
+    controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
+    controller.num_speculative_tokens = 2
+    controller._async_logprob_requests_seen = False
+    snapshot = _make_async_layout_snapshot([31, 32], cuda_graph_request_count=2)
+    transaction = AsyncDecodeTransaction(
+        step_id=7,
+        state=AsyncTxnState.PREPARED,
+        snapshot=snapshot,
+        plan=AsyncDecodePlan.from_snapshot(snapshot),
+    )
+    ledger = AsyncResourceLedger(in_flight=True)
+    ledger.defer_kv_blocks(torch.tensor([300], dtype=torch.int32))
+    sample_ticket = _sample_ticket([4, 5], mtp_tokens=[[6, 7], [8, 9]])
+
+    controller._attach_async_transaction_participants(
+        transaction, resources=ledger, sample_ticket=sample_ticket
+    )
+
+    assert tuple(type(participant) for participant in transaction.participants) == (
+        AsyncMambaStateParticipant,
+        AsyncSampleReadbackParticipant,
+        AsyncLogprobMTPParticipant,
+        AsyncResourceParticipant,
+    )
+    assert transaction.participant_state.keys() == {
+        "AsyncMambaStateParticipant",
+        "AsyncSampleReadbackParticipant",
+        "AsyncLogprobMTPParticipant",
+        "AsyncResourceParticipant",
+    }
+
+    transaction.mark_committed()
+
+    assert [request_ids.tolist() for request_ids in accepted_request_ids] == [[31, 32]]
+    assert [blocks.tolist() for blocks in released_blocks] == [[300]]
+    assert context.async_kv_deferred_release_count == 1
+    assert not ledger.in_flight
 
 
 @pytest.mark.internal
