@@ -501,7 +501,7 @@ def test_qwen35_export_matches_mbridge_qwen35_moe_packed_expert_contract() -> No
     )
 
 
-def test_qwen35_export_vllm_target_uses_runtime_prefix_and_per_expert_names() -> None:
+def test_qwen35_export_vllm_target_uses_runtime_prefix_and_packed_expert_names() -> None:
     cfg = _tiny_config()
     spec = Qwen35WeightSpec(cfg, target="vllm")
     dense = torch.arange(cfg.hidden_size)
@@ -522,39 +522,46 @@ def test_qwen35_export_vllm_target_uses_runtime_prefix_and_per_expert_names() ->
         dense,
     )
 
-    fc1 = torch.arange(
-        cfg.moe_intermediate_size * 2 * cfg.hidden_size,
-        dtype=torch.bfloat16,
-    ).reshape(-1, cfg.hidden_size)
-    fc2 = torch.arange(
-        cfg.hidden_size * cfg.moe_intermediate_size,
-        dtype=torch.bfloat16,
-    ).reshape(cfg.hidden_size, cfg.moe_intermediate_size)
+    fc1_tensors = [
+        torch.arange(
+            cfg.moe_intermediate_size * 2 * cfg.hidden_size,
+            dtype=torch.bfloat16,
+        ).reshape(-1, cfg.hidden_size)
+        + expert_idx * 1000
+        for expert_idx in range(cfg.num_experts)
+    ]
+    fc2_tensors = [
+        torch.arange(
+            cfg.hidden_size * cfg.moe_intermediate_size,
+            dtype=torch.bfloat16,
+        ).reshape(cfg.hidden_size, cfg.moe_intermediate_size)
+        + expert_idx * 2000
+        for expert_idx in range(cfg.num_experts)
+    ]
 
-    fc1_exported = dict(spec.native_to_hf("layers.0.moe.experts.fc1.weight2", fc1))
-    fc2_exported = dict(spec.native_to_hf("layers.0.moe.experts.fc2.weight2", fc2))
-    gate, up = fc1.chunk(2, dim=0)
+    fc1_exported = {}
+    fc2_exported = {}
+    for expert_idx, (fc1, fc2) in enumerate(zip(fc1_tensors, fc2_tensors, strict=True)):
+        fc1_exported.update(
+            dict(spec.native_to_hf(f"layers.0.moe.experts.fc1.weight{expert_idx}", fc1))
+        )
+        fc2_exported.update(
+            dict(spec.native_to_hf(f"layers.0.moe.experts.fc2.weight{expert_idx}", fc2))
+        )
 
-    assert set(fc1_exported) == {
-        "language_model.model.layers.0.mlp.experts.2.gate_proj.weight",
-        "language_model.model.layers.0.mlp.experts.2.up_proj.weight",
-    }
+    assert set(fc1_exported) == {"language_model.model.layers.0.mlp.experts.gate_up_proj"}
+    assert set(fc2_exported) == {"language_model.model.layers.0.mlp.experts.down_proj"}
     assert torch.equal(
-        fc1_exported["language_model.model.layers.0.mlp.experts.2.gate_proj.weight"],
-        gate,
+        fc1_exported["language_model.model.layers.0.mlp.experts.gate_up_proj"],
+        torch.stack(fc1_tensors, dim=0),
     )
     assert torch.equal(
-        fc1_exported["language_model.model.layers.0.mlp.experts.2.up_proj.weight"],
-        up,
-    )
-    assert set(fc2_exported) == {"language_model.model.layers.0.mlp.experts.2.down_proj.weight"}
-    assert torch.equal(
-        fc2_exported["language_model.model.layers.0.mlp.experts.2.down_proj.weight"],
-        fc2,
+        fc2_exported["language_model.model.layers.0.mlp.experts.down_proj"],
+        torch.stack(fc2_tensors, dim=0),
     )
 
 
-def test_qwen35_export_vllm_target_expands_experts_without_packed_buffers() -> None:
+def test_qwen35_export_vllm_target_packs_experts_with_runtime_prefix() -> None:
     class TinyQwen35Module(nn.Module):
         def __init__(self, config: Qwen35Config) -> None:
             super().__init__()
@@ -599,14 +606,29 @@ def test_qwen35_export_vllm_target_expands_experts_without_packed_buffers() -> N
 
     assert "model.language_model.layers.0.mlp.experts.gate_up_proj" not in exported
     assert "model.language_model.layers.0.mlp.experts.down_proj" not in exported
+    assert "language_model.model.layers.0.mlp.experts.0.gate_proj.weight" not in exported
+    assert "language_model.model.layers.0.mlp.experts.0.down_proj.weight" not in exported
+    assert set(exported) == {
+        "language_model.model.layers.0.mlp.experts.gate_up_proj",
+        "language_model.model.layers.0.mlp.experts.down_proj",
+    }
+
+    expected_fc1 = []
+    expected_fc2 = []
     for expert_idx in range(cfg.num_experts):
         fc1 = getattr(model.layers[0].moe.experts.fc1, f"weight{expert_idx}").detach()
-        gate, up = fc1.chunk(2, dim=0)
         fc2 = getattr(model.layers[0].moe.experts.fc2, f"weight{expert_idx}").detach()
-        prefix = f"language_model.model.layers.0.mlp.experts.{expert_idx}"
-        assert torch.equal(exported[f"{prefix}.gate_proj.weight"], gate)
-        assert torch.equal(exported[f"{prefix}.up_proj.weight"], up)
-        assert torch.equal(exported[f"{prefix}.down_proj.weight"], fc2)
+        expected_fc1.append(fc1)
+        expected_fc2.append(fc2)
+
+    assert torch.equal(
+        exported["language_model.model.layers.0.mlp.experts.gate_up_proj"],
+        torch.stack(expected_fc1, dim=0),
+    )
+    assert torch.equal(
+        exported["language_model.model.layers.0.mlp.experts.down_proj"],
+        torch.stack(expected_fc2, dim=0),
+    )
 
 
 def test_qwen35_export_packs_base_expert_fc2_and_expert_metadata() -> None:

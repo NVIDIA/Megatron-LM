@@ -481,14 +481,16 @@ class Qwen35WeightSpec:
         expert_match = re.fullmatch(r"moe\.experts\.fc([12])\.weight(\d+)", suffix)
         if expert_match is not None:
             kind, expert_idx = expert_match.groups()
-            expert_prefix = f"{prefix}.mlp.experts.{expert_idx}"
+            buffer_key = (layer_idx, "vllm_gate_up" if kind == "1" else "vllm_down")
+            buffer = self._expert_export_buffers.setdefault(buffer_key, {})
+            buffer[int(expert_idx)] = tensor.contiguous()
+            if len(buffer) < self.config.num_experts:
+                return []
+            packed = torch.stack([buffer[i] for i in range(self.config.num_experts)], dim=0).contiguous()
+            del self._expert_export_buffers[buffer_key]
             if kind == "1":
-                gate, up = tensor.chunk(2, dim=0)
-                return [
-                    (f"{expert_prefix}.gate_proj.weight", gate.contiguous()),
-                    (f"{expert_prefix}.up_proj.weight", up.contiguous()),
-                ]
-            return [(f"{expert_prefix}.down_proj.weight", tensor)]
+                return [(f"{prefix}.mlp.experts.gate_up_proj", packed)]
+            return [(f"{prefix}.mlp.experts.down_proj", packed)]
 
         return []
 
