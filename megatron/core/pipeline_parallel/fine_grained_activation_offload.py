@@ -2,16 +2,14 @@
 
 from collections import defaultdict, deque
 from contextlib import nullcontext
-import os
 from typing import Any, Dict, Optional, Tuple
 
 import torch
 from torch.autograd.graph import saved_tensors_hooks
 
 # CPU offload implementation for pipeline parallelism
-DEBUG = os.environ.get("MCORE_FGAO_DEBUG", "0").lower() in ("1", "true", "yes", "on")
-DEBUG_RANK = int(os.environ.get("MCORE_FGAO_DEBUG_RANK", "0"))
-DEBUG_GROUP = os.environ.get("MCORE_FGAO_DEBUG_GROUP", "")
+DEBUG = False
+DEBUG_RANK = 0
 
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
@@ -22,11 +20,9 @@ def debug_rank(message):
     # pylint: disable=bad-builtin
     if not DEBUG:
         return
-    if DEBUG_GROUP and DEBUG_GROUP not in message:
-        return
     assert torch.distributed.is_initialized()
     if torch.distributed.get_rank() == DEBUG_RANK:
-        print(f"[FGAO_DEBUG] {message}", flush=True)
+        print(message)
 
 
 def mark_reloaded_tensor(tensor: torch.Tensor) -> None:
