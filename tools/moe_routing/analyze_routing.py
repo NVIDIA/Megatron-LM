@@ -1,18 +1,16 @@
-#!/usr/bin/env python3
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Dispatch script: run all MoE routing analyses against a trace directory.
+"""Run all MoE routing analyses against a trace directory.
 
-Traces can come from either training (--moe-routing-trace-path) or inference
-(--moe-routing-trace-path in the inference launcher).  The JSONL format is
-identical in both cases, so every analysis works on both.
+Traces can come from either training or inference by passing --moe-routing-trace-path.
+The JSONL format is identical in both cases, so every analysis works on both.
 
 Usage:
     # Run all analyses (no logit sidecar required):
     python analyze_routing.py /path/to/trace_dir --ep-size 8
 
     # Also run logit analyses (requires --moe-routing-trace-capture-logits
-    # when the trace was collected):
+    when the trace was collected):
     python analyze_routing.py /path/to/trace_dir --ep-size 8 --with-logits
 
     # Compare routing stability across two training checkpoints:
@@ -107,11 +105,11 @@ def main():
         "Jaccard similarity between consecutive MoE layers",
     )
 
-    # 3. Expert concentration (hot-set size, Gini coefficient).
+    # 3. Expert concentration (hot-set size).
     run(
         "analyze_routing_concentration.py",
         [args.trace_dir] + nexpert_args + outdir_args,
-        "Expert concentration  (hot-set size, Gini, load distribution)",
+        "Expert concentration  (hot-set size, load distribution)",
     )
 
     # 4. EP load balance: can one-layer-ahead prediction close the imbalance gap?

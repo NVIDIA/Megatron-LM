@@ -387,27 +387,24 @@ class CheckpointConfig:
     """Number of iterations between tokens-per-expert routing metadata saves."""
 
     moe_routing_trace_path: str | None = None
-    """Directory for MoE router decision traces (JSONL).  When set, a
-    RouterTracer is initialized at training start and hooks are registered
-    on all TopKRouter modules.  Traces are written in the same format as
-    inference traces so the analysis scripts under
-    ``examples/inference/`` work on both."""
+    """Directory for MoE router decision traces (JSONL).  When set, a RouterTracer is initialized 
+    at training start and hooks are registered on all TopKRouter modules.  
+    Traces are written in the same format as inference traces so the analysis scripts under
+    tools/moe_routing work on both."""
 
     moe_routing_trace_max_iters: int | None = None
     """Maximum number of training iterations to trace.  Tracing stops
-    automatically after this many calls to ``advance_step()``.  Defaults
-    to tracing all iterations when ``moe_routing_trace_path`` is set."""
+    automatically after this many calls to advance_step().  Defaults
+    to tracing all iterations when moe_routing_trace_path is set."""
 
     moe_routing_trace_capture_logits: bool = False
-    """Capture pre-topk routing logits for each router call (bfloat16
-    binary sidecar).  Substantially increases disk usage."""
+    """Capture pre-topk routing logits for each router call (bfloat16 binary sidecar)."""
 
     moe_routing_trace_capture_hidden_states: bool = False
-    """Capture input hidden-state tensors for each router call (bfloat16
-    binary sidecar).  Very high disk usage."""
+    """Capture input hidden-state tensors for each router call (bfloat16 binary sidecar)."""
 
     moe_routing_trace_dump_weights: bool = False
-    """Save router weight tensors to a ``.pt`` sidecar file."""
+    """Save router weight tensors to a .pt sidecar file."""
 
     save_wgrads_interval: int | None = None
     """Number of iterations between wgrad (main_grad) saves."""

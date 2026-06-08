@@ -6,31 +6,30 @@ Captures per-layer top-K routing decisions to a JSONL file for offline
 analysis of routing patterns (e.g., layer-to-layer top-K overlap, expert
 load balance, predictor accuracy for speculative expert prefetch).
 
-- **Inference mode** (default): step boundaries are auto-detected by
-  watching for layer repeats.  When a layer that already fired this step
-  fires again, a new step has started.  Enable via ``--moe-routing-trace-path``
-  in the inference launcher.
+- Inference mode (default): step boundaries are auto-detected by watching for layer repeats.
+  When a layer that already fired this step fires again, a new step has started.
+  Enable via `--moe-routing-trace-path` in the inference launcher.
 
-- **Training mode** (``training_mode=True``): the training loop drives step
-  boundaries explicitly by calling ``advance_step()`` once per iteration.
-  Enable via ``--moe-routing-trace-path`` in the training launcher.
+- Training mode (training_mode=True): the training loop drives step boundaries explicitly by calling
+  `advance_step()` once per iteration.
+  Enable via `--moe-routing-trace-path` in the training launcher.
 
-Output format — one JSONL file per rank, one record per (step, layer)::
+Output format — one JSONL file per rank, one record per (step, layer):
 
     {"step": 0, "layer": 3, "rank": 0, "num_tokens": 128, "topk": 22,
      "top_indices": [[12, 45, ...], ...]}
 
 Optional sidecar binary files (same directory):
-- ``hidden_states_rank{rank}.bin`` — bfloat16 hidden-state tensors; each
-  JSONL record gains ``hs_offset``, ``hs_bytes``, ``hs_shape`` fields.
-- ``logits_rank{rank}.bin`` — bfloat16 pre-topk routing logits; each JSONL
-  record gains ``logit_offset``, ``logit_bytes``, ``logit_shape`` fields.
+- hidden_states_rank{rank}.bin — bfloat16 hidden-state tensors; each
+  JSONL record gains `hs_offset`, `hs_bytes`, `hs_shape` fields.
+- logits_rank{rank}.bin — bfloat16 pre-topk routing logits; each JSONL
+  record gains `logit_offset`, `logit_bytes`, `logit_shape` fields.
 
-Use ``load_hidden_states_for_record`` / ``load_logits_for_record`` to read
+Use `load_hidden_states_for_record` / `load_logits_for_record` to read
 sidecar tensors back from the binary files.
 
 Note: Python forward hooks do not fire during CUDA graph replay.  For
-complete traces, run with ``--cuda-graph-impl none``.
+complete traces, run with `--cuda-graph-impl none`.
 """
 
 import atexit
@@ -55,8 +54,8 @@ def init_tracer(
 ) -> None:
     """Initialize the global router tracer.
 
-    Must be called after torch.distributed is initialized and before
-    ``register_hooks`` is called on the model.
+    Call after torch.distributed is initialized and before`register_hooks` is called on the model.
+
 
     Args:
         output_dir: Directory for JSONL trace files (and optional sidecars).
@@ -64,12 +63,11 @@ def init_tracer(
             inference) to capture before the tracer self-disables.
         rank: Distributed rank; used to name output files.
         training_mode: If True, step boundaries are driven by explicit
-            ``advance_step()`` calls from the training loop rather than the
+            advance_step() calls from the training loop rather than the
             layer-repeat heuristic used during inference.
-        capture_hidden_states: Capture the input hidden-state tensor for each
-            router call.  Adds substantial disk cost.
+        capture_hidden_states: Capture the input hidden-state tensor for each router call.
         capture_logits: Capture pre-topk routing logits.
-        dump_router_weights: Save router weight tensors to a ``.pt`` file.
+        dump_router_weights: Save router weight tensors to a .pt file.
     """
     global _TRACER
     if _TRACER is not None:
@@ -137,17 +135,15 @@ def load_logits_for_record(record: dict, trace_dir: str) -> torch.Tensor:
 class RouterTracer:
     """Captures router top-K decisions across all MoE layers per step.
 
-    Works in two modes controlled by ``training_mode``:
+    Works in two modes controlled by `training_mode`:
 
-    - **Inference mode** (``training_mode=False``): step boundaries are
-      auto-detected.  When a layer that has already fired this step fires
-      again, a new step has started.
-    - **Training mode** (``training_mode=True``): the training loop calls
-      ``advance_step()`` at each iteration boundary.  The layer-repeat
-      heuristic is not used.
+    - Inference mode (training_mode=False): step boundaries are auto-detected.  When a layer that
+      has already fired this step fires again, a new step has started.
+    - Training mode (training_mode=True): the training loop calls `advance_step()` at each iteration
+      boundary.  The layer-repeat heuristic is not used.
 
-    Recording is skipped during CUDA graph capture — ``D2H`` copies inside a
-    captured graph would record stale values on replay.
+    Recording is skipped during CUDA graph capture since D2H copies inside a captured graph would
+    record stale values on replay.
     """
 
     def __init__(
@@ -196,10 +192,9 @@ class RouterTracer:
     # ------------------------------------------------------------------
 
     def register_hooks(self, model) -> None:
-        """Walk *model* and register forward hooks on every TopKRouter module.
+        """Walk model and register forward hooks on every TopKRouter module.
 
-        Accepts a single model or a list of model chunks (the convention used
-        throughout the training and inference code).
+        Accepts a single model or a list of model chunks.
         """
         from megatron.core.transformer.moe.router import TopKRouter
 
@@ -219,16 +214,12 @@ class RouterTracer:
             handle.remove()
         self._hook_handles.clear()
 
-    # ------------------------------------------------------------------
-    # Step control
-    # ------------------------------------------------------------------
-
     def advance_step(self) -> None:
         """Advance to the next step (training mode only).
 
-        Call once per training iteration, *after* the forward-backward pass.
+        Call once per training iteration, after the forward-backward pass.
         Flushes accumulated records to disk and increments the step counter.
-        Disables the tracer once ``max_steps`` is reached.
+        Disables the tracer once max_steps is reached.
         """
         with self._lock:
             self._flush_records_to_disk()
@@ -237,10 +228,6 @@ class RouterTracer:
             if self.step_id >= self.max_steps:
                 self._stopped = True
                 self.remove_hooks()
-
-    # ------------------------------------------------------------------
-    # Hook implementation
-    # ------------------------------------------------------------------
 
     def make_hook(self):
         """Build a forward hook callable for a single TopKRouter module."""

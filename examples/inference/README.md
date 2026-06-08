@@ -105,10 +105,7 @@ still target these scripts.
 
 ### MoE routing analysis
 
-`tools/moe_routing/analyze_routing.py` and the `analyze_routing_*.py`
-scripts analyze per-layer top-K routing decisions from MoE models.  The same JSONL
-trace format and the same analysis scripts work for both training and
-inference.
+`tools/moe_routing/analyze_routing.py` and the `analyze_routing_*.py`scripts analyze per-layer top-K routing decisions from MoE models.  The same JSONL trace format and the same analysis scripts work for both training and inference.
 
 #### Collecting traces
 
@@ -153,7 +150,7 @@ The dispatcher runs these analyses in order:
 |--------|-------------------|
 | `tools/moe_routing/analyze_router_trace.py` | How much does layer L's top-K overlap with layer L-1? (predictor accuracy ceiling) |
 | `tools/moe_routing/analyze_routing_jaccard.py` | Jaccard similarity between consecutive MoE layers |
-| `tools/moe_routing/analyze_routing_concentration.py` | How concentrated is routing? (hot-set size, Gini coefficient) |
+| `tools/moe_routing/analyze_routing_concentration.py` | How concentrated is routing? (hot-set size) |
 | `tools/moe_routing/analyze_routing_load_balance.py` | Can one-layer-ahead prediction close the EP load-imbalance gap? |
 | `tools/moe_routing/analyze_routing_logits.py` | Boundary margins, score-level cosine similarity, soft top-N Jaccard |
 | `tools/moe_routing/analyze_routing_cross_snapshot.py` | Do the same experts stay hot across training checkpoints? |
