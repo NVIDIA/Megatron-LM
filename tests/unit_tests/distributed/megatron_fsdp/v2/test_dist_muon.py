@@ -56,15 +56,17 @@ from megatron.core.optimizer.fully_shard_v2_muon import FullyShardV2Muon
 
 STRATEGIES = ["optim", "optim_grads", "optim_grads_params"]
 
-# Each set is a list of param shapes at a different scale: a wide matrix
-# (rows < cols), a tall one (rows > cols -> NS transposes), and a trailing 1D bias
-# Muon must skip. Sizes are picked so that under grad sharding (ZeRO-2/3) each
-# matrix straddles a shard boundary and is split across ranks, so the gather/scatter
-# is actually exercised.
+# Each set is a list of param shapes at a different scale: four 2D matrices (mixing
+# wide rows<cols and tall rows>cols -> NS transposes) + a trailing 1D bias Muon must
+# skip. Four matrices let the test split them into 2 multi-param packages, exercising
+# both the batched all_to_all packing and the cross-package pipeline. Sizes are picked
+# so each matrix straddles a shard boundary (ZeRO-2/3), so gather/scatter is real.
 SHAPE_SETS = [
-    pytest.param([(5, 8), (9, 8), (8,)], id="small"),  # dims < 10
-    pytest.param([(200, 256), (400, 256), (256,)], id="medium"),  # dims in the hundreds
-    pytest.param([(1500, 2048), (3000, 2048), (2048,)], id="large"),  # dims in the thousands
+    pytest.param([(5, 8), (9, 8), (8, 6), (7, 8), (8,)], id="small"),  # dims < 10
+    pytest.param([(200, 256), (400, 256), (256, 300), (256, 128), (256,)], id="medium"),
+    pytest.param(
+        [(1500, 2048), (3000, 2048), (2048, 1200), (2048, 2600), (2048,)], id="large"
+    ),
 ]
 
 
@@ -113,8 +115,23 @@ def test_dist_muon_matches_reference(strategy, nesterov, shapes):
         mesh=None,
         sharding_strategy=strategy,
     )
+    # Pass only the 2D-matrix dist_params + their grad DTensors (in production the
+    # FullyShardV2MuonOptimizer wrapper does this filtering). The 1D bias is excluded,
+    # so the optimizer never touches it. grad DTensors may be None on ranks whose shard
+    # of a param is empty.
+    muon_params, muon_grads = [], []
+    for dp, dg in zip(pg.dist_params, pg.dist_grads):
+        if dp.dim() == 2:
+            muon_params.append(dp)
+            muon_grads.append(dg)
+    # Split the matrices into two multi-param packages to exercise both the batched
+    # all_to_all packing and the cross-package pipeline.
+    half = len(muon_params) // 2
+    packages = [list(range(half)), list(range(half, len(muon_params)))]
     opt = FullyShardV2Muon(
-        pg.dist_params,
+        muon_params,
+        muon_grads,
+        packages=packages,
         lr=lr,
         momentum=momentum,
         nesterov=nesterov,
