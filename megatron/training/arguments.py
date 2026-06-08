@@ -1691,20 +1691,20 @@ def validate_args(args, defaults={}):
             "--use-varlen-dataset and --sft are mutually exclusive; both "
             "select the packed-sequence dataset family. Pick one."
         )
-        if args.varlen_bshd_validation:
-            # ``--dynamic-context-parallel`` ⊥ ``--varlen-bshd-validation`` is
+        if args.varlen_sbhd_validation:
+            # ``--dynamic-context-parallel`` ⊥ ``--varlen-sbhd-validation`` is
             # checked in ``GPTDatasetConfig.__post_init__``; only the
             # scheduler check stays here, since ``sequence_packing_scheduler``
             # is a training-framework flag not stored on the dataset config.
             assert args.sequence_packing_scheduler is None, (
-                "--varlen-bshd-validation does not use a sequence packing "
+                "--varlen-sbhd-validation does not use a sequence packing "
                 "scheduler; drop --sequence-packing-scheduler."
             )
-            # BSHD validation is a real-data numerical-reference path only;
+            # SBHD validation is a real-data numerical-reference path only;
             # MockVarlenDataset does not implement it.
             assert not args.mock_data, (
-                "--varlen-bshd-validation is not supported with --mock-data; "
-                "BSHD validation requires a real dataset."
+                "--varlen-sbhd-validation is not supported with --mock-data; "
+                "SBHD validation requires a real dataset."
             )
         else:
             # VarlenDataset emits one unpacked sample per __getitem__; it
@@ -4911,9 +4911,9 @@ def _add_varlen_dataset_args(parser):
         'distribution; see --varlen-mock-dataset-config-json.',
     )
     group.add_argument(
-        '--varlen-bshd-validation',
+        '--varlen-sbhd-validation',
         action="store_true",
-        help='Reference BSHD mode for THD numerical verification. When set, '
+        help='Reference SBHD mode for THD numerical verification. When set, '
         'VarlenDataset emits SBHD-style samples right-padded to '
         '--seq-length (no cu_seqlens, no packing scheduler), so the run can '
         'be compared against the THD path to validate correctness. '

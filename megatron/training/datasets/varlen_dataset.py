@@ -409,11 +409,11 @@ class VarlenDataset(SFTDataset):
 
         valid_len = len(tokens_list) - 1
 
-        # 5a. BSHD validation mode: right-pad to sequence_length + 1, drop
+        # 5a. SBHD validation mode: right-pad to sequence_length + 1, drop
         #     packing metadata, return shape [sequence_length]. Useful as a
         #     numerical reference for THD path verification (no scheduler,
         #     no dynamic-cp).
-        if self.config.varlen_bshd_validation:
+        if self.config.varlen_sbhd_validation:
             pad_len = max_len + 1 - len(tokens_list)
             if pad_len > 0:
                 tokens_list.extend([pad] * pad_len)
@@ -482,7 +482,7 @@ class MockVarlenDataset(MockSFTDataset):
         with ``original_seq_len`` / ``padded_seq_len`` tensors. The upstream
         scheduler packs across the DP×CP grid.
 
-    ``--varlen-bshd-validation`` is intentionally not implemented for mock
+    ``--varlen-sbhd-validation`` is intentionally not implemented for mock
     data; it is guarded against in argument validation.
     """
 
@@ -518,7 +518,7 @@ class MockVarlenDataset(MockSFTDataset):
         # Mock data uses ``tokens == targets`` (no role masking).
         targets_list = list(tokens_list)
 
-        # MockVarlenDataset only implements the THD (packed) path; BSHD
+        # MockVarlenDataset only implements the THD (packed) path; SBHD
         # validation is a real-data numerical-reference mode (guarded against
         # --mock-data in validate_args).
         # THD mode: unpacked single sample, pad to pad_granularity only.

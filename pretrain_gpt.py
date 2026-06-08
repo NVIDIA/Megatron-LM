@@ -135,7 +135,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
 
     # TODO: this is pretty hacky, find a better way
     is_packed_sequence = args.sft or (
-        args.use_varlen_dataset and not args.varlen_bshd_validation
+        args.use_varlen_dataset and not args.varlen_sbhd_validation
     )
     if (
         not is_first_or_last_pipeline_stage(vp_stage)
@@ -354,7 +354,7 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         "sequence_parallel_size": args.tensor_model_parallel_size * args.sequence_parallel,
         "dynamic_context_parallel": args.dynamic_context_parallel,
         "varlen_mock_dataset_config_json": args.varlen_mock_dataset_config_json,
-        "varlen_bshd_validation": args.varlen_bshd_validation,
+        "varlen_sbhd_validation": args.varlen_sbhd_validation,
     }
 
     # add FIM args to the config
@@ -406,9 +406,9 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
             dataset_type = MockVarlenDataset
         else:
             dataset_type = VarlenDataset
-        # BSHD validation mode runs the SBHD non-packed pipeline; THD mode
+        # SBHD validation mode runs the non-packed pipeline; THD mode
         # is the packed-sequence path.
-        is_packed_sequence = not args.varlen_bshd_validation
+        is_packed_sequence = not args.varlen_sbhd_validation
     else:
         if args.mock_data:
             dataset_type = MockGPTDataset

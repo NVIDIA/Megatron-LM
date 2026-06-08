@@ -92,11 +92,11 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     maybe_worker_init_fn = worker_init_fn if args.num_workers > 0 else None
     # Identity collate for VarlenDataset and packing-scheduler paths;
     # they emit one variable-length dict per sample, not stack-able by
-    # the default collate. --varlen-bshd-validation is excluded: it bypasses
+    # the default collate. --varlen-sbhd-validation is excluded: it bypasses
     # packing and emits fixed-length [seq_length] samples that the default
     # collate stacks normally.
     if (
-        (args.use_varlen_dataset and not args.varlen_bshd_validation)
+        (args.use_varlen_dataset and not args.varlen_sbhd_validation)
         or args.dynamic_context_parallel
         or args.sequence_packing_scheduler is not None
         or getattr(args, "use_vanilla_collate_fn", False)

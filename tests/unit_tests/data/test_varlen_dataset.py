@@ -461,14 +461,14 @@ class _FakeTokenizer:
         return (torch.tensor(tokens, dtype=torch.int64), torch.tensor(targets, dtype=torch.int64))
 
 
-def _make_config(tokenizer, seq_length=64, *, cp=1, dp=1, sp=1, dynamic_cp=False, bshd=False):
+def _make_config(tokenizer, seq_length=64, *, cp=1, dp=1, sp=1, dynamic_cp=False, sbhd=False):
     return SimpleNamespace(
         tokenizer=tokenizer,
         sequence_length=seq_length,
         reset_position_ids=False,
         create_attention_mask=False,
         reset_attention_mask=False,
-        varlen_bshd_validation=bshd,
+        varlen_sbhd_validation=sbhd,
         dynamic_context_parallel=dynamic_cp,
         data_parallel_size=dp,
         context_parallel_size=cp,
@@ -564,11 +564,11 @@ def test_getitem_thd_empty_text_does_not_crash():
     assert out["loss_mask"].numel() == out["tokens"].numel()
 
 
-def test_getitem_bshd_pads_to_seq_length_and_masks_tail():
+def test_getitem_sbhd_pads_to_seq_length_and_masks_tail():
     tok = _FakeTokenizer(eod=0, pad=None)
-    ds = _make_varlen(["abc"], _make_config(tok, seq_length=8, bshd=True))
+    ds = _make_varlen(["abc"], _make_config(tok, seq_length=8, sbhd=True))
     out = ds[0]
-    # BSHD emits fixed [seq_length] samples with no packing metadata.
+    # SBHD emits fixed [seq_length] samples with no packing metadata.
     assert set(out) == {"tokens", "labels", "loss_mask", "position_ids"}
     assert out["tokens"].numel() == 8
     loss_mask = out["loss_mask"].tolist()
@@ -666,9 +666,9 @@ def test_unpack_batch_slices_prepacked_cu_seqlens_samples():
 # DataLoader collate selection (distributed; run under torch.distributed.run).
 #
 # Validates the build_pretraining_data_loader contract for the varlen paths:
-#   * --varlen-bshd-validation emits fixed-length [seq_length] samples that the
+#   * --varlen-sbhd-validation emits fixed-length [seq_length] samples that the
 #     DEFAULT collate stacks into a [mbs, seq_length] batch.
-#   * The THD path (--use-varlen-dataset without BSHD) uses the identity collate
+#   * The THD path (--use-varlen-dataset without SBHD) uses the identity collate
 #     (variable-length dicts are returned as a list, not stacked).
 # ----------------------------------------------------------------------------
 
@@ -685,7 +685,7 @@ def _build_varlen_for_loader(items, config, num_samples):
     return ds
 
 
-def _loader_args(*, use_varlen, bshd, scheduler, mbs, dynamic_cp=False, gbs=None):
+def _loader_args(*, use_varlen, sbhd, scheduler, mbs, dynamic_cp=False, gbs=None):
     return SimpleNamespace(
         dataloader_type='single',
         micro_batch_size=mbs,
@@ -694,12 +694,12 @@ def _loader_args(*, use_varlen, bshd, scheduler, mbs, dynamic_cp=False, gbs=None
         dynamic_context_parallel=dynamic_cp,
         num_workers=0,
         use_varlen_dataset=use_varlen,
-        varlen_bshd_validation=bshd,
+        varlen_sbhd_validation=sbhd,
         sequence_packing_scheduler=scheduler,
     )
 
 
-def test_bshd_validation_dataloader_uses_default_collate():
+def test_sbhd_validation_dataloader_uses_default_collate():
     from megatron.core import parallel_state
     from megatron.training.datasets.data_samplers import build_pretraining_data_loader
     from megatron.training.global_vars import destroy_global_vars, set_args
@@ -714,12 +714,12 @@ def test_bshd_validation_dataloader_uses_default_collate():
         # any --nproc-per-node (the CI default is 8 ranks -> dp=8).
         dp = parallel_state.get_data_parallel_world_size()
         n = mbs * dp * 4
-        cfg = _make_config(tok, seq_length=seq_len, bshd=True)
+        cfg = _make_config(tok, seq_length=seq_len, sbhd=True)
         ds = _build_varlen_for_loader(["hello world"] * n, cfg, num_samples=n)
-        set_args(_loader_args(use_varlen=True, bshd=True, scheduler=None, mbs=mbs))
+        set_args(_loader_args(use_varlen=True, sbhd=True, scheduler=None, mbs=mbs))
         loader = build_pretraining_data_loader(ds, consumed_samples=0)
         batch = next(iter(loader))
-        # Default collate stacks fixed-length BSHD samples into a tensor batch.
+        # Default collate stacks fixed-length SBHD samples into a tensor batch.
         assert isinstance(batch, dict)
         assert batch["tokens"].shape == (mbs, seq_len)
         assert batch["labels"].shape == (mbs, seq_len)
@@ -741,12 +741,12 @@ def test_thd_dataloader_uses_identity_collate():
         mbs = 2
         dp = parallel_state.get_data_parallel_world_size()
         n = mbs * dp * 4
-        cfg = _make_config(tok, seq_length=64, bshd=False)
+        cfg = _make_config(tok, seq_length=64, sbhd=False)
         # Variable-length samples so identity collate is required.
         variable = ["a", "abcdef", "xy", "qwerty"]
         items = [variable[i % len(variable)] for i in range(n)]
         ds = _build_varlen_for_loader(items, cfg, num_samples=n)
-        set_args(_loader_args(use_varlen=True, bshd=False, scheduler="dp_balanced", mbs=mbs))
+        set_args(_loader_args(use_varlen=True, sbhd=False, scheduler="dp_balanced", mbs=mbs))
         loader = build_pretraining_data_loader(ds, consumed_samples=0)
         batch = next(iter(loader))
         # Identity collate returns the raw list of per-sample dicts (unstacked).
@@ -779,7 +779,7 @@ def test_dcp_dataloader_yields_microbatches_for_scheduler():
         set_args(
             _loader_args(
                 use_varlen=True,
-                bshd=False,
+                sbhd=False,
                 scheduler="default_dynamic_cp",
                 mbs=mbs,
                 dynamic_cp=True,
