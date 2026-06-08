@@ -154,6 +154,52 @@ The dispatcher runs these analyses in order:
 | `tools/moe_routing/analyze_routing_logits.py` | Boundary margins, score-level cosine similarity, soft top-N Jaccard                                                                                        |
 | `tools/moe_routing/analyze_routing_cross_snapshot.py` | Do the same experts stay hot across training checkpoints?                                                                                                  |
 
+#### Interpreting the load-balance simulation output
+
+`analyze_routing_load_balance.py` is the most actionable analysis.  It outputs two blocks.
+
+**Distribution predictability**: applies layer L's router weights to the hidden states from
+layer L_prev and compares the resulting predicted expert-load distribution to what L actually
+routed.  The `cos` and `spearman` columns measure that agreement:
+
+- `cos` ≥ 0.90 and `spearman` ≥ 0.70 (most layer pairs in a well-trained model): the
+  hidden-state signal from the previous MoE layer is sufficient to predict the aggregate load
+  distribution of the next layer with high fidelity.  This is the affirmative result that
+  motivates a predictor-based prefetch or placement policy.
+- Values near zero: this layer pair has weak cross-layer signal; a learned predictor operating
+  on hidden states is unlikely to help here.
+
+Note: `hot-K overlap` is always 1.0 when the pool of experts is small relative to K.
+
+**Load-imbalance simulation**: simulates whether re-placing experts based on predicted counts
+(using distribution predictability) would reduce the max-GPU / mean-GPU load ratio vs. a
+static round-robin baseline.
+
+- `baseline`: observed imbalance under the current static placement.
+- `oracle`: lower bound assuming perfect foreknowledge of the actual counts.
+- `predicted`: simulated imbalance using the L_prev predictor.
+- `recovery`: fraction of the gap `(baseline − predicted) / (baseline − oracle)` that the
+  predictor closes.
+
+**Critical: always pass `--ep-size` matching your actual deployment.**  At EP=1 every metric
+collapses to 1.000 (one GPU holds all experts; max = mean by definition).  The interesting
+regime starts at EP≥8, where load skew across GPUs becomes a factor.  Run the
+trace at the actual deployment EP size or post-hoc simulate multiple EP sizes with
+`--ep-size`:
+
+```bash
+# Trace collected with EP=8 deployment:
+python tools/moe_routing/analyze_routing_load_balance.py /path/to/trace_dir \
+    --ep-size 8 --num-experts 512
+
+# Sweep EP sizes from the same trace to see where imbalance starts mattering:
+for EP in 8 16 32 64; do
+    echo "=== EP=$EP ===" && \
+    python tools/moe_routing/analyze_routing_load_balance.py /path/to/trace_dir \
+        --ep-size $EP --num-experts 512
+done
+```
+
 #### Adding new routing metrics
 
 To add a new routing metric, put capture logic in `megatron/core/transformer/moe/router_trace.py`

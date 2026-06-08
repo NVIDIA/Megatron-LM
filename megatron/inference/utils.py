@@ -287,40 +287,17 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
         help="Path to write coordinator request scheduling decisions as JSON",
     )
 
-    # MoE router tracing (shared with training via megatron/core/transformer/moe/router_trace.py).
-    group.add_argument(
-        "--moe-routing-trace-path",
-        type=str,
-        default=None,
-        help="Directory to write per-rank MoE router trace JSONL files.  When set, "
-             "a RouterTracer is attached to all TopKRouter modules before inference "
-             "starts.  Traces use the same format as training traces so the "
-             "analyze_routing_*.py scripts work on both.",
-    )
+    # MoE router tracing: --moe-routing-trace-path, --moe-routing-trace-capture-logits,
+    # --moe-routing-trace-capture-hidden-states, and --moe-routing-trace-dump-weights are
+    # registered by TrainingConfig (_add_training_args) for all argument parsing.
+    # Only the inference-specific step limit needs to be added here.
     group.add_argument(
         "--moe-routing-trace-max-steps",
         type=int,
         default=None,
-        help="Maximum number of decode steps to trace.  Tracing stops after this "
-             "many steps; default is unlimited.",
-    )
-    group.add_argument(
-        "--moe-routing-trace-capture-logits",
-        action="store_true",
-        default=False,
-        help="Capture pre-topk routing logits alongside top-K indices (bfloat16 sidecar).",
-    )
-    group.add_argument(
-        "--moe-routing-trace-capture-hidden-states",
-        action="store_true",
-        default=False,
-        help="Capture input hidden-state tensors for each router call (bfloat16 sidecar).",
-    )
-    group.add_argument(
-        "--moe-routing-trace-dump-weights",
-        action="store_true",
-        default=False,
-        help="Save router weight tensors to a .pt sidecar file.",
+        help="Maximum number of decode steps to trace (inference).  Tracing stops after "
+             "this many steps; default is unlimited.  Training uses "
+             "--moe-routing-trace-max-iters instead.",
     )
 
     return parser
