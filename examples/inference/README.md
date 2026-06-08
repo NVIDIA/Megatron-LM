@@ -139,14 +139,14 @@ python tools/moe_routing/analyze_routing.py /path/to/trace_dir \
 
 The dispatcher runs these analyses in order:
 
-| Script | Primary question | Role |
-|--------|-----------------|------|
-| `tools/moe_routing/analyze_routing_concentration.py` | How concentrated is routing? (hot-set size) | Hypothesis test: is per-layer static caching viable? High concentration (ratio > 2×) supports it; near-uniform rules it out. |
-| `tools/moe_routing/analyze_routing_load_balance.py` | Can one-layer-ahead hidden-state prediction close the EP load-imbalance gap? | Affirmative signal: high cosine/Spearman in the distribution predictability block is the core evidence that a predictor is worth building. |
+| Script | Primary question | Role                                                                                                                         |
+|--------|-----------------|------------------------------------------------------------------------------------------------------------------------------|
+| `tools/moe_routing/analyze_routing_concentration.py` | How concentrated is routing? (hot-set size) | Hypothesis test: is per-layer static caching viable? High concentration (ratio > 2x) supports it; near-uniform rules it out. |
+| `tools/moe_routing/analyze_routing_load_balance.py` | Can one-layer-ahead hidden-state prediction close the EP load-imbalance gap? | High cosine/Spearman in the distribution predictability block suggests that there is predictive signal                       |
 
 #### Interpreting the load-balance simulation output
 
-`analyze_routing_load_balance.py` is the most actionable analysis.  It outputs two blocks.
+`analyze_routing_load_balance.py` is used for what-if analysis for load balancing.  
 
 **Distribution predictability**: applies layer L's router weights to the hidden states from
 layer L_prev and compares the resulting predicted expert-load distribution to what L actually

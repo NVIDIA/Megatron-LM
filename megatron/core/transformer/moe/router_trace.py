@@ -54,14 +54,14 @@ def init_tracer(
 ) -> None:
     """Initialize the global router tracer.
 
-    Call after torch.distributed is initialized and before`register_hooks` is called on the model.
+    Call after torch.distributed is initialized and before `register_hooks` is called on the model.
 
 
     Args:
         output_dir: Directory for JSONL trace files (and optional sidecars).
         max_steps: Maximum steps (iterations in training, decode steps in
-            inference) to capture before the tracer self-disables.
-        rank: Distributed rank; used to name output files.
+            inference) to capture before the tracer disables.
+        rank: Distributed rank.
         training_mode: If True, step boundaries are driven by explicit
             advance_step() calls from the training loop rather than the
             layer-repeat heuristic used during inference.

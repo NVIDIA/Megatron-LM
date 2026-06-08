@@ -287,10 +287,6 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
         help="Path to write coordinator request scheduling decisions as JSON",
     )
 
-    # MoE router tracing: --moe-routing-trace-path, --moe-routing-trace-capture-logits,
-    # --moe-routing-trace-capture-hidden-states, and --moe-routing-trace-dump-weights are
-    # registered by TrainingConfig (_add_training_args) for all argument parsing.
-    # Only the inference-specific step limit needs to be added here.
     group.add_argument(
         "--moe-routing-trace-max-steps",
         type=int,
