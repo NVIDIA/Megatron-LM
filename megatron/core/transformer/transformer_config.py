@@ -3021,6 +3021,21 @@ class TransformerConfig(ModelParallelConfig):
                 self.attention_backend == AttnBackend.flash
             ), "Batch invariant mode only supports FlashAttention"
 
+        if self.cuda_graph_impl != "none" and (
+            self.sequence_packing_scheduler is not None or self.dynamic_context_parallel
+        ):
+            assert self.pad_packed_seq_alignment is not None, (
+                "THD CUDA Graph requires --pad-packed-seq-alignment to be set."
+            )
+            assert (
+                self.pad_packed_seq_alignment == 0
+                or self.pad_packed_seq_alignment == self.max_seqlen_per_dp_cp_rank
+            ), (
+                "THD CUDA Graph requires --pad-packed-seq-alignment without a value "
+                "or --pad-packed-seq-alignment equal to max_seqlen_per_dp_cp_rank "
+                f"({self.max_seqlen_per_dp_cp_rank}), got {self.pad_packed_seq_alignment}."
+            )
+
         if self.sequence_packing_scheduler is not None:
             # Check TE version.
             if not HAVE_PACKAGING:

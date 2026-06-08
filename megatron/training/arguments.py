@@ -1571,6 +1571,39 @@ def validate_args(args, defaults={}):
             f"to {args.data_parallel_size * args.context_parallel_size}."
         )
 
+    if args.sequence_packing_scheduler is not None:
+        if args.sequence_packing_scheduler == 'dp_balanced':
+            total_cp_ranks = args.context_parallel_size
+        else:
+            total_cp_ranks = args.data_parallel_size * args.context_parallel_size
+        assert total_cp_ranks * args.max_seqlen_per_dp_cp_rank >= args.seq_length, (
+            f'Packed sequence buffer size ({total_cp_ranks * args.max_seqlen_per_dp_cp_rank}) '
+            f'must be >= single sequence max length ({args.seq_length})'
+        )
+
+    if getattr(args, 'pad_packed_seq_alignment', None) is not None:
+        if args.pad_packed_seq_alignment < 0:
+            raise ValueError(
+                '--pad-packed-seq-alignment must be used without a value or with a '
+                'non-negative integer alignment.'
+            )
+
+    if args.cuda_graph_impl != "none" and (
+        args.sequence_packing_scheduler is not None or args.dynamic_context_parallel
+    ):
+        if getattr(args, 'pad_packed_seq_alignment', None) is None:
+            raise ValueError('THD CUDA Graph requires --pad-packed-seq-alignment to be set.')
+        if (
+            args.pad_packed_seq_alignment != 0
+            and args.pad_packed_seq_alignment != args.max_seqlen_per_dp_cp_rank
+        ):
+            raise ValueError(
+                'THD CUDA Graph requires --pad-packed-seq-alignment without a value '
+                'or --pad-packed-seq-alignment equal to '
+                f'--max-seqlen-per-dp-cp-rank ({args.max_seqlen_per_dp_cp_rank}), '
+                f'got {args.pad_packed_seq_alignment}.'
+            )
+
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled
     if (
