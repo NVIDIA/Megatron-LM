@@ -22,7 +22,6 @@ from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import get_context_parallel_group
-from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.hyper_connection import learned_output_contract
 from megatron.core.transformer.multi_token_prediction import (
@@ -495,8 +494,10 @@ class TestMultiTokenPrediction:
             labels=labels,
             loss_mask=loss_mask,
         )
+        # forward only fills raw loss_sums / num_tokens. Trigger the reduction
+        # so tracker["values"] (per-token loss across DP+CP) becomes available.
+        MTPLossLoggingHelper.reduce_loss_in_tracker()
         tracker = MTPLossLoggingHelper.tracker
-        mtp_loss_ref = None
         assert "values" in tracker
         mtp_loss_ref = tracker['values'].clone()
         MTPLossLoggingHelper.clean_loss_in_tracker()
@@ -547,14 +548,13 @@ class TestMultiTokenPrediction:
                 labels=labels,
                 loss_mask=loss_mask,
             )
+            # reduce_loss_in_tracker performs sum-reduce of loss_sums and
+            # num_tokens across DP+CP, then computes sum/sum -- already the
+            # correct global per-token loss, no extra CP averaging needed.
+            MTPLossLoggingHelper.reduce_loss_in_tracker()
             tracker = MTPLossLoggingHelper.tracker
             assert "values" in tracker
             mtp_loss = tracker['values'].clone()
-            # Average MTP loss across CP ranks for comparison with reference
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['cp'])
-            torch.distributed.all_reduce(
-                mtp_loss, group=pg_collection.cp, op=torch.distributed.ReduceOp.AVG
-            )
             MTPLossLoggingHelper.clean_loss_in_tracker()
             assert torch.allclose(output_ref, output, rtol=1e-03, atol=1e-03)
             assert torch.allclose(mtp_loss, mtp_loss_ref, rtol=1e-02, atol=1e-02)
@@ -651,7 +651,9 @@ class TestMultiTokenPrediction:
         assert output.shape[0] == 1  # batch size
         assert output.shape[1] == total_seq_length
 
-        # Verify MTP loss was computed
+        # Verify MTP loss was computed; reduce raw loss_sums/num_tokens into
+        # tracker["values"] (per-token loss) first.
+        MTPLossLoggingHelper.reduce_loss_in_tracker()
         tracker = MTPLossLoggingHelper.tracker
         assert "values" in tracker
         mtp_loss = tracker['values'].clone()
@@ -906,35 +908,40 @@ class TestMTPLossLoggingHelper:
         MTPLossLoggingHelper.tracker = {}
 
     def test_save_loss_to_tracker(self):
-        """Test saving loss to tracker."""
-        # Create a dummy loss tensor
-        loss = torch.tensor(1.3)
+        """Test saving loss sum and token count to tracker."""
+        loss_sum = torch.tensor(1.3)
+        num_tokens = torch.tensor(5.0)
         layer_number = 2
         num_layers = self.num_layers
 
-        # Test saving loss
         MTPLossLoggingHelper.save_loss_to_tracker(
-            loss=loss, layer_number=layer_number, num_layers=num_layers
+            loss_sum=loss_sum,
+            num_tokens=num_tokens,
+            layer_number=layer_number,
+            num_layers=num_layers,
         )
 
-        # Verify tracker state
-        assert "values" in MTPLossLoggingHelper.tracker
-        assert MTPLossLoggingHelper.tracker["values"].shape == (num_layers,)
-        assert MTPLossLoggingHelper.tracker["values"][layer_number] == loss
+        # Tracker now stores raw loss sums and token counts; per-token loss
+        # is computed in reduce_loss_in_tracker.
+        assert "loss_sums" in MTPLossLoggingHelper.tracker
+        assert "num_tokens" in MTPLossLoggingHelper.tracker
+        assert MTPLossLoggingHelper.tracker["loss_sums"].shape == (num_layers,)
+        assert MTPLossLoggingHelper.tracker["num_tokens"].shape == (num_layers,)
+        assert MTPLossLoggingHelper.tracker["loss_sums"][layer_number] == loss_sum
+        assert MTPLossLoggingHelper.tracker["num_tokens"][layer_number] == num_tokens
         assert MTPLossLoggingHelper.tracker["reduce_group"] is None
         assert MTPLossLoggingHelper.tracker["avg_group"] is None
 
     def test_track_mtp_metrics(self):
         """Test tracking MTP metrics."""
-        # First save some losses
-        loss = torch.tensor(2.3)
+        loss_sum = torch.tensor(2.3)
+        num_tokens = torch.tensor(1.0)
         num_layers = self.num_layers
         for i in range(num_layers):
             MTPLossLoggingHelper.save_loss_to_tracker(
-                loss=loss, layer_number=i, num_layers=num_layers
+                loss_sum=loss_sum, num_tokens=num_tokens, layer_number=i, num_layers=num_layers
             )
 
-        # Create dummy writer and loss dict
         class DummyWriter:
             def add_scalar(self, name, value, iteration):
                 pass
@@ -949,7 +956,6 @@ class TestMTPLossLoggingHelper:
         wandb_writer = DummyWandBWriter()
         total_loss_dict = {}
 
-        # Test tracking metrics
         MTPLossLoggingHelper.track_mtp_metrics(
             loss_scale=loss_scale,
             iteration=iteration,
@@ -958,13 +964,18 @@ class TestMTPLossLoggingHelper:
             total_loss_dict=total_loss_dict,
         )
 
-        # Verify total_loss_dict is populated
+        # track_mtp_metrics reduces the tracker first, so per-layer log value
+        # equals (loss_sum / num_tokens) * loss_scale.
+        expected_per_token_loss = loss_sum / num_tokens
         for i in range(num_layers):
             assert f"mtp_{i + 1} loss" in total_loss_dict
-            assert total_loss_dict[f"mtp_{i + 1} loss"] == loss * loss_scale
+            assert torch.allclose(
+                total_loss_dict[f"mtp_{i + 1} loss"], expected_per_token_loss * loss_scale
+            )
 
-        # Verify tracker is cleaned
-        assert torch.all(MTPLossLoggingHelper.tracker["values"] == 0)
+        # Tracker raw sums are cleared by track_mtp_metrics.
+        assert torch.all(MTPLossLoggingHelper.tracker["loss_sums"] == 0)
+        assert torch.all(MTPLossLoggingHelper.tracker["num_tokens"] == 0)
         assert MTPLossLoggingHelper.tracker["reduce_group"] is None
         assert MTPLossLoggingHelper.tracker["avg_group"] is None
 
@@ -1125,8 +1136,10 @@ class TestMultiTokenPredictionHybrid:
             labels=labels,
             loss_mask=loss_mask,
         )
+        # forward only fills raw loss_sums / num_tokens. Reduce them first so
+        # tracker["values"] (per-token loss across DP+CP) becomes available.
+        MTPLossLoggingHelper.reduce_loss_in_tracker()
         tracker = MTPLossLoggingHelper.tracker
-        mtp_loss_ref = None
         assert "values" in tracker
         mtp_loss_ref = tracker['values'].clone()
         MTPLossLoggingHelper.clean_loss_in_tracker()
@@ -1172,13 +1185,12 @@ class TestMultiTokenPredictionHybrid:
                 labels=labels,
                 loss_mask=loss_mask,
             )
+            # reduce_loss_in_tracker already computes the cross-DP+CP per-token
+            # loss (sum/sum), no extra CP averaging needed.
+            MTPLossLoggingHelper.reduce_loss_in_tracker()
             tracker = MTPLossLoggingHelper.tracker
             assert "values" in tracker
             mtp_loss = tracker['values'].clone()
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['cp'])
-            torch.distributed.all_reduce(
-                mtp_loss, group=pg_collection.cp, op=torch.distributed.ReduceOp.AVG
-            )
             MTPLossLoggingHelper.clean_loss_in_tracker()
             assert torch.allclose(output_ref, output, rtol=1e-03, atol=1e-03)
             assert torch.allclose(mtp_loss, mtp_loss_ref, rtol=1e-02, atol=1e-02)
@@ -1478,6 +1490,9 @@ class TestMHCMTPIntegration:
         )
         assert torch.isfinite(output).all(), f"Non-finite output (TP={tp})"
 
+        # Reduce raw loss_sums/num_tokens into tracker["values"] (per-token
+        # loss across DP+CP) before reading.
+        MTPLossLoggingHelper.reduce_loss_in_tracker()
         tracker = MTPLossLoggingHelper.tracker
         assert "values" in tracker, f"MTP loss not logged (TP={tp})"
         assert torch.isfinite(tracker['values']).all()
