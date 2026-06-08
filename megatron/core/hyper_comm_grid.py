@@ -25,11 +25,7 @@ except ImportError:
 
 
 def _is_process_group_member(pg: Optional[dist.ProcessGroup]) -> bool:
-    """Whether the current rank belongs to ``pg``.
-
-    ``new_subgroups_by_enumeration`` returns the ``GroupMember.NON_GROUP_MEMBER``
-    sentinel (not ``None``) for non-member ranks, which must not be destroyed.
-    """
+    """Whether the current rank belongs to ``pg`` (not the non-member sentinel)."""
     non_member = getattr(getattr(dist, "GroupMember", None), "NON_GROUP_MEMBER", None)
     return pg is not None and pg is not non_member
 
@@ -58,12 +54,8 @@ class HyperCommGrid:
     For any combination of dimensions, a process group can only be created once.
     Creating process groups for the same combination with different options is not supported.
 
-    The grid's own :meth:`create_pg` / :meth:`get_pg` / :meth:`get_rank_enum` operate on the base
-    factorization passed to the constructor by default. A rank span that admits more than one
-    factorization (for example dense ``tp/cp/dp/pp`` groups alongside expert
-    ``expt_tp/ep/expt_dp/pp`` groups over the same ranks) can register an additional rank view
-    with :meth:`register_view`. View-specific groups are still created and retrieved through this
-    root grid by passing ``view="..."``; process-group lifecycle is owned in exactly one place.
+    Methods default to the base factorization. Register additional factorizations of the same
+    rank span with :meth:`register_view` and target them via ``view="..."``.
 
     Note:
         ``create_pg()`` over specific dims must be explicitly called to create a process group.
