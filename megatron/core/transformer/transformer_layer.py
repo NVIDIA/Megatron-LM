@@ -1363,10 +1363,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 return residual, hidden_states, probs, shared_expert_output
 
             # CUDA Graph does not capture the MLP/MoE part at all.
-            # Pull hidden_states explicitly from cuda_graph_output rather than
-            # using `*cuda_graph_output, padding_mask=...`: the latter would
-            # collide if cuda_graph_output ever included a `padding_mask`
-            # positional element.
+            # The first CUDA Graph output is hidden_states for the uncaptured
+            # MLP path. Pass padding_mask as a keyword so it is not consumed as
+            # a positional output.
             assert (
                 len(cuda_graph_output) >= 1
             ), "expected at least hidden_states in cuda_graph_output"

@@ -261,7 +261,7 @@ class GraphableMegatronModule(MegatronModule):
         slen_per_cptp = slen_full // tensor_model_parallel_size if sequence_parallel else slen_full
 
         # Static input dtype must match the runtime activation dtype that flows
-        # through the captured graph. Hardcoding bfloat16 silently breaks --fp16.
+        # through the captured graph.
         if self.config.bf16:
             dtype = torch.bfloat16
         elif self.config.fp16:

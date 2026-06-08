@@ -27,7 +27,10 @@ from pathlib import Path
 import pytest
 import torch
 
-from megatron.core.packed_seq_params import PackedSeqParams, pad_thd_for_cuda_graph
+from megatron.core.packed_seq_params import (
+    PackedSeqParams,
+    pad_sequence_for_thd,
+)
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
@@ -88,11 +91,11 @@ def _build_layer(H, nh, nkv, ffn, max_seqlen, max_num_seqs, tp=1, sp=False):
 
 
 # =============================================================================
-# 1. pad_thd_for_cuda_graph correctness
+# 1. pad_sequence_for_thd correctness
 # =============================================================================
 
 
-class TestPadThdForCudaGraph:
+class TestPadSequenceForThd:
 
     def setup_method(self):
         Utils.initialize_model_parallel(tensor_model_parallel_size=1)
@@ -102,19 +105,34 @@ class TestPadThdForCudaGraph:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_generic_alignment_preserves_cu_seqlens(self):
+        """Generic THD padding aligns token tensors while preserving sequence metadata."""
+        seqlens, total_T = [50, 30], 80
+        psp = _make_psp(seqlens)
+        orig = psp.cu_seqlens_q.clone()
+        p_tok, _, _, _, p, mask = pad_sequence_for_thd(
+            torch.ones(1, total_T, device="cuda"), None, None, None, psp, alignment=64
+        )
+        assert p_tok.shape == (1, 128)
+        assert torch.equal(p.cu_seqlens_q, orig)
+        assert mask.shape == (1, 128)
+        assert not mask[0, :total_T].any() and mask[0, total_T:].all()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_shapes_and_data_preservation(self):
         """Shapes are static; original data intact; padding zero-filled."""
         seqlens, max_seqlen, max_num_seqs = [100, 50, 30], 256, 8
         total_T = sum(seqlens)
         tokens = torch.arange(total_T, device="cuda").unsqueeze(0).float()
-        p_tok, p_lab, p_loss, p_pos, p_params, p_mask = pad_thd_for_cuda_graph(
+        p_tok, p_lab, p_loss, p_pos, p_params, p_mask = pad_sequence_for_thd(
             tokens,
             tokens.clone(),
             torch.ones(1, total_T, device="cuda"),
             torch.arange(total_T, device="cuda").unsqueeze(0),
             _make_psp(seqlens),
-            max_seqlen,
-            max_num_seqs,
+            target_len=max_seqlen,
+            max_num_seqs=max_num_seqs,
         )
         for t in (p_tok, p_lab, p_loss, p_pos):
             assert t.shape == (1, max_seqlen)
@@ -134,14 +152,14 @@ class TestPadThdForCudaGraph:
     def test_padding_mask_boundary(self):
         """False at real positions, True at padding (MoE aux-loss contract)."""
         seqlens, total_T, max_seqlen = [60, 40], 100, 128
-        _, _, _, _, _, m = pad_thd_for_cuda_graph(
+        _, _, _, _, _, m = pad_sequence_for_thd(
             torch.ones(1, total_T, device="cuda"),
             None,
             None,
             None,
             _make_psp(seqlens),
-            max_seqlen,
-            4,
+            target_len=max_seqlen,
+            max_num_seqs=4,
         )
         assert not m[0, :total_T].any() and m[0, total_T:].all()
 
@@ -150,8 +168,14 @@ class TestPadThdForCudaGraph:
     def test_cu_seqlens_fill_value(self):
         """Padded entries repeat last cumulative sum (prevents OOB reads)."""
         seqlens, total_T = [50, 30], 80
-        _, _, _, _, p, _ = pad_thd_for_cuda_graph(
-            torch.ones(1, total_T, device="cuda"), None, None, None, _make_psp(seqlens), 128, 32
+        _, _, _, _, p, _ = pad_sequence_for_thd(
+            torch.ones(1, total_T, device="cuda"),
+            None,
+            None,
+            None,
+            _make_psp(seqlens),
+            target_len=128,
+            max_num_seqs=32,
         )
         assert p.cu_seqlens_q[0] == 0 and p.cu_seqlens_q[2] == 80
         assert (p.cu_seqlens_q[3:] == 80).all()
@@ -161,8 +185,8 @@ class TestPadThdForCudaGraph:
     def test_none_inputs(self):
         """Non-pre_process PP: mask from cu_seqlens when all tensors None."""
         seqlens, total_T, max_seqlen = [50, 30], 80, 128
-        _, _, _, _, _, mask = pad_thd_for_cuda_graph(
-            None, None, None, None, _make_psp(seqlens), max_seqlen, 4
+        _, _, _, _, _, mask = pad_sequence_for_thd(
+            None, None, None, None, _make_psp(seqlens), target_len=max_seqlen, max_num_seqs=4
         )
         assert mask.shape == (1, max_seqlen)
         assert not mask[0, :total_T].any() and mask[0, total_T:].all()
@@ -281,6 +305,7 @@ _COMMON_ARGS = [
     "dp_balanced",
     "--max-seqlen-per-dp-cp-rank",
     "1024",
+    "--pad-packed-seq-alignment",
     "--calculate-per-token-loss",
     "--transformer-impl",
     "transformer_engine",
@@ -343,7 +368,9 @@ _MOONLIGHT_ARGS = _COMMON_ARGS + [
     "--moe-layer-freq",
     "([0]+[1]*26)",
     "--moe-token-dispatcher-type",
-    "alltoall",
+    "flex",
+    "--moe-flex-dispatcher-backend",
+    "hybridep",
     "--moe-router-score-function",
     "sigmoid",
     "--moe-router-topk-scaling-factor",
@@ -386,7 +413,9 @@ _QWEN3_ARGS = _COMMON_ARGS + [
     "--vocab-size",
     "151936",
     "--moe-token-dispatcher-type",
-    "alltoall",
+    "flex",
+    "--moe-flex-dispatcher-backend",
+    "hybridep",
 ]
 
 

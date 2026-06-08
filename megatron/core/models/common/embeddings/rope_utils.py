@@ -293,10 +293,8 @@ def _apply_rotary_pos_emb_thd(
         # sequence, no shift is needed.
         freq_pos = freq_pos + global_seq_start
 
-    # Same rationale as the seq_idx clamp above: padded positions can index
-    # past `freqs`; they receive a known wrong-but-harmless freq that gets
-    # masked away. If you suspect a real out-of-range bug, swap clamp for an
-    # assert during development.
+    # Padded positions can sit outside the frequency table. Clamp them into
+    # range; downstream padding masks exclude those positions from the result.
     freq_pos = freq_pos.clamp(min=0, max=freqs.shape[0] - 1)
     freqs_packed = freqs[freq_pos]
 
