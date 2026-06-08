@@ -154,6 +154,7 @@ def _run_one_iter_and_capture(
 
 
 @pytest.mark.flaky_in_dev
+@pytest.mark.experimental
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
 @pytest.mark.parametrize(
     "is_moe, is_mla, offload_modules",
@@ -454,7 +455,6 @@ def test_full_recompute_layer_input_offloading(recompute_num_layers: int):
         Utils.destroy_model_parallel()
 
 
-@pytest.mark.experimental
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
 @pytest.mark.skipif(
     not (HAVE_TE and is_te_min_version("1.5.0")),
