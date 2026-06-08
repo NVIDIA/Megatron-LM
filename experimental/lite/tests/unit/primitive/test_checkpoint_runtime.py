@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import copy
+import random
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import torch
 import torch.nn as nn
 
@@ -144,6 +146,34 @@ def test_runtime_local_checkpoint_uses_optimizer_parameter_state_contract(tmp_pa
     _assert_model_close(model, loaded_model)
 
 
+def test_runtime_local_checkpoint_restores_rng_state(tmp_path):
+    model = TinyMLP()
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+
+    random.seed(2031)
+    np.random.seed(2031)
+    torch.manual_seed(2031)
+
+    runtime.save_checkpoint(
+        ModelHandle(model=model, optimizer=None),
+        str(tmp_path),
+        step=9,
+    )
+
+    expected_python = random.random()
+    expected_numpy = np.random.random(4)
+    expected_torch = torch.rand(4)
+
+    random.seed(9999)
+    np.random.seed(9999)
+    torch.manual_seed(9999)
+
+    assert runtime.load_checkpoint(ModelHandle(model=model, optimizer=None), str(tmp_path)) == 9
+    assert random.random() == expected_python
+    np.testing.assert_allclose(np.random.random(4), expected_numpy, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(torch.rand(4), expected_torch, atol=0.0, rtol=0.0)
+
+
 def test_runtime_dcp_checkpoint_threads_parallel_config_and_protocol_hooks(tmp_path):
     model = TinyMLP()
     parallel = ParallelConfig(tp=2, ep=1, pp=1, cp=1)
@@ -182,6 +212,7 @@ def test_runtime_dcp_checkpoint_threads_parallel_config_and_protocol_hooks(tmp_p
     assert save_kwargs["get_placements"] is placement_fn
     assert save_kwargs["is_expert"] is expert_classifier
     assert save_kwargs["use_dcp"] is True
+    assert save_kwargs["save_rng"] is True
 
     with patch(
         "megatron.lite.primitive.ckpt.load_training_checkpoint",
@@ -198,3 +229,4 @@ def test_runtime_dcp_checkpoint_threads_parallel_config_and_protocol_hooks(tmp_p
     assert load_kwargs["get_placements"] is placement_fn
     assert load_kwargs["is_expert"] is expert_classifier
     assert load_kwargs["use_dcp"] is True
+    assert load_kwargs["load_rng"] is True

@@ -244,6 +244,7 @@ class MegatronLiteRuntime(RuntimeBase):
         if step is None:
             step = kwargs.pop("global_step", 0)
         use_dcp = bool(kwargs.pop("use_dcp", False))
+        save_rng = bool(kwargs.pop("save_rng", True))
         get_placements, is_expert = _checkpoint_hooks(handle)
         save_training_checkpoint(
             _checkpoint_model(handle, use_dcp=use_dcp),
@@ -255,6 +256,7 @@ class MegatronLiteRuntime(RuntimeBase):
             get_placements=kwargs.pop("get_placements", get_placements),
             is_expert=kwargs.pop("is_expert", is_expert),
             use_dcp=use_dcp,
+            save_rng=save_rng,
             **kwargs,
         )
 
@@ -262,6 +264,7 @@ class MegatronLiteRuntime(RuntimeBase):
         from megatron.lite.primitive.ckpt import load_training_checkpoint
 
         use_dcp = bool(kwargs.pop("use_dcp", False))
+        load_rng = bool(kwargs.pop("load_rng", True))
         get_placements, is_expert = _checkpoint_hooks(handle)
         return load_training_checkpoint(
             _checkpoint_model(handle, use_dcp=use_dcp),
@@ -272,6 +275,7 @@ class MegatronLiteRuntime(RuntimeBase):
             get_placements=kwargs.pop("get_placements", get_placements),
             is_expert=kwargs.pop("is_expert", is_expert),
             use_dcp=use_dcp,
+            load_rng=load_rng,
             **kwargs,
         )
 

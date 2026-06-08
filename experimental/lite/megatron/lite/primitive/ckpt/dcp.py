@@ -8,10 +8,12 @@ HF weight loading/saving is model-specific and lives in models/<name>/checkpoint
 from __future__ import annotations
 
 import os
+import random
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 import torch.distributed.checkpoint as dcp  # pyright: ignore[reportMissingImports]
@@ -39,6 +41,7 @@ def save_training_checkpoint(
     is_expert: ExpertClassifierFn = default_expert_classifier,
     *,
     use_dcp: bool | None = None,
+    save_rng: bool = True,
 ) -> None:
     """Save training checkpoint using DTensor + DCP for automatic resharding."""
     if path is None and isinstance(step, str):
@@ -50,7 +53,7 @@ def save_training_checkpoint(
     if use_dcp is None:
         use_dcp = config is not None and ps is not None
     if not use_dcp:
-        _save_local_training_checkpoint(model, optimizer, step, path)
+        _save_local_training_checkpoint(model, optimizer, step, path, save_rng=save_rng)
         return
     if config is None or ps is None:
         raise ValueError("DCP checkpointing requires config and ParallelState.")
@@ -70,6 +73,8 @@ def save_training_checkpoint(
 
     ckpt_path = os.path.join(path, f"step_{step}")
     dcp.save(state_dict, checkpoint_id=ckpt_path)
+    if save_rng:
+        _save_rng_sidecar(ckpt_path)
     log_rank0(f"Saved training checkpoint at step {step} to {ckpt_path}")
 
 
@@ -83,12 +88,13 @@ def load_training_checkpoint(
     is_expert: ExpertClassifierFn = default_expert_classifier,
     *,
     use_dcp: bool | None = None,
+    load_rng: bool = True,
 ) -> int:
     """Load training checkpoint with automatic resharding across different parallel configs."""
     if use_dcp is None:
         use_dcp = config is not None and ps is not None
     if not use_dcp:
-        return _load_local_training_checkpoint(model, optimizer, path)
+        return _load_local_training_checkpoint(model, optimizer, path, load_rng=load_rng)
     if config is None or ps is None:
         raise ValueError("DCP checkpointing requires config and ParallelState.")
     if not isinstance(model, nn.Module):
@@ -124,6 +130,8 @@ def load_training_checkpoint(
                 _copy_tensor_(param.data, t.to_local() if isinstance(t, DTensor) else t)
 
     step = state_dict.get("step", 0)
+    if load_rng:
+        _load_rng_sidecar(ckpt_path)
     log_rank0(f"Loaded training checkpoint from {path} at step {step}")
     return step
 
@@ -197,11 +205,100 @@ def _local_optimizer_parameter_state_file(ckpt_file: Path) -> Path:
     return ckpt_file.with_name(f"{ckpt_file.stem}.optimizer_parameter_state{ckpt_file.suffix}")
 
 
+def _rank_suffix() -> str:
+    if dist.is_available() and dist.is_initialized():
+        return f"rank_{dist.get_rank():05d}"
+    return "rank_00000"
+
+
+def _rng_sidecar_file(path: str | os.PathLike[str]) -> Path:
+    return Path(path) / f"rng_state_{_rank_suffix()}.pt"
+
+
+def _cpu_clone(tensor: torch.Tensor | None) -> torch.Tensor | None:
+    if tensor is None:
+        return None
+    return tensor.detach().cpu().clone()
+
+
+def _get_cuda_rng_state() -> torch.Tensor | None:
+    if not torch.cuda.is_initialized():
+        return None
+    return _cpu_clone(torch.cuda.get_rng_state())
+
+
+def _get_cuda_rng_tracker_states() -> dict[str, torch.Tensor]:
+    if not torch.cuda.is_initialized():
+        return {}
+    try:
+        from megatron.core import tensor_parallel
+
+        states = tensor_parallel.get_cuda_rng_tracker().get_states()
+    except Exception:
+        return {}
+    return {name: _cpu_clone(state) for name, state in states.items() if state is not None}
+
+
+def _get_rng_state() -> dict[str, Any]:
+    return {
+        "random_rng_state": random.getstate(),
+        "np_rng_state": np.random.get_state(),
+        "torch_rng_state": _cpu_clone(torch.get_rng_state()),
+        "cuda_rng_state": _get_cuda_rng_state(),
+        "rng_tracker_states": _get_cuda_rng_tracker_states(),
+    }
+
+
+def _restore_cuda_rng_tracker_states(states: dict[str, torch.Tensor]) -> None:
+    if not states or not torch.cuda.is_initialized():
+        return
+    try:
+        from megatron.core import tensor_parallel
+
+        tracker = tensor_parallel.get_cuda_rng_tracker()
+        graph_safe = tensor_parallel.is_graph_safe_cuda_rng_tracker(tracker)
+        restored = {
+            name: tensor_parallel.convert_cuda_rng_state(state, to_graphable=graph_safe)
+            for name, state in states.items()
+        }
+        tracker.set_states(restored)
+    except Exception as exc:
+        raise RuntimeError("Failed to restore Megatron tensor-parallel RNG tracker state.") from exc
+
+
+def _restore_rng_state(state: dict[str, Any] | None) -> None:
+    if not state:
+        return
+    random.setstate(state["random_rng_state"])
+    np.random.set_state(state["np_rng_state"])
+    torch.set_rng_state(state["torch_rng_state"])
+    cuda_rng_state = state.get("cuda_rng_state")
+    if cuda_rng_state is not None and torch.cuda.is_initialized():
+        torch.cuda.set_rng_state(cuda_rng_state)
+    _restore_cuda_rng_tracker_states(state.get("rng_tracker_states", {}))
+
+
+def _save_rng_sidecar(path: str | os.PathLike[str]) -> None:
+    rng_file = _rng_sidecar_file(path)
+    rng_file.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(_get_rng_state(), rng_file)
+
+
+def _load_rng_sidecar(path: str | os.PathLike[str]) -> None:
+    rng_file = _rng_sidecar_file(path)
+    if not rng_file.exists():
+        log_rank0(f"RNG sidecar not found at {rng_file}; skipping RNG restore.")
+        return
+    _restore_rng_state(torch.load(rng_file, map_location="cpu", weights_only=False))
+
+
 def _save_local_training_checkpoint(
     model: nn.Module | Iterable[nn.Module],
     optimizer,
     step: int,
     path: str,
+    *,
+    save_rng: bool = True,
 ) -> None:
     chunks = _model_chunks(model)
     ckpt_file = _local_checkpoint_file(path)
@@ -220,6 +317,7 @@ def _save_local_training_checkpoint(
             if optimizer_parameter_state_file is not None
             else None
         ),
+        "rng_state": _get_rng_state() if save_rng else None,
     }
     torch.save(state, ckpt_file)
     if optimizer_parameter_state_file is not None:
@@ -231,6 +329,8 @@ def _load_local_training_checkpoint(
     model: nn.Module | Iterable[nn.Module],
     optimizer,
     path: str,
+    *,
+    load_rng: bool = True,
 ) -> int:
     ckpt_file = _local_checkpoint_file(path)
     state = torch.load(ckpt_file, map_location="cpu", weights_only=False)
@@ -252,6 +352,8 @@ def _load_local_training_checkpoint(
             reload_model_params = getattr(optimizer, "reload_model_params", None)
             if callable(reload_model_params):
                 reload_model_params()
+    if load_rng:
+        _restore_rng_state(state.get("rng_state"))
     step = int(state.get("step", 0))
     log_rank0(f"Loaded local training checkpoint from {ckpt_file} at step {step}")
     return step
