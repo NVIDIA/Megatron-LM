@@ -1562,21 +1562,15 @@ class TextGenerationController:
 
     def _pending_async_transaction(self) -> Optional[AsyncDecodeTransaction]:
         """Return the active async transaction, if one owns pending state."""
-        transaction = getattr(self, "_async_step_transaction", None)
-        if transaction is not None and transaction.is_in_flight:
-            return transaction
-        return None
+        return self._get_async_decode_coordinator().pending_transaction()
 
     def _has_pending_async_forward_state(self) -> bool:
         """Return whether a transaction owns a pending async forward."""
-        return self._pending_async_transaction() is not None
+        return self._get_async_decode_coordinator().has_pending_forward()
 
     def _retire_async_transaction(self) -> None:
         """Retire and clear the active async transaction."""
-        transaction = getattr(self, "_async_step_transaction", None)
-        if transaction is not None:
-            transaction.mark_retired()
-        self._async_step_transaction = None
+        self._get_async_decode_coordinator().retire_transaction()
 
     def _get_async_decode_coordinator(self) -> AsyncDecodeCoordinator:
         """Return the coordinator that owns async decode step orchestration."""
@@ -1656,15 +1650,11 @@ class TextGenerationController:
             prepared_plan = context.async_prepared_decode_plan()
         if prepared_plan is not None:
             prepared_plan = prepared_plan.with_layout_snapshot(snapshot)
-        transaction_step_id = getattr(self, "_async_transaction_next_step_id", 0)
-        transaction = AsyncDecodeTransaction(
-            step_id=transaction_step_id,
-            state=AsyncTxnState.PREPARED,
+        transaction = self._get_async_decode_coordinator().begin_transaction(
             snapshot=snapshot,
             plan=prepared_plan,
+            state=AsyncTxnState.PREPARED,
         )
-        self._async_step_transaction = transaction
-        self._async_transaction_next_step_id = transaction_step_id + 1
         context.clear_async_prepared_decode_plan()
         return transaction
 

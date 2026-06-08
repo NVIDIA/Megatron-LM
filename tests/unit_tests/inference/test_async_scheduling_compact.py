@@ -42,6 +42,9 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers import (
     text_generation_controller as tgc_module,
 )
+from megatron.core.inference.text_generation_controllers.async_decode_coordinator import (
+    AsyncDecodeCoordinator,
+)
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
@@ -386,6 +389,31 @@ def _sample_ticket(tokens, mtp_tokens=None):
         sampled_mtp_tokens_cpu=sampled_mtp_tokens,
         copy_done_event=SimpleNamespace(synchronize=lambda: None),
     )
+
+
+@pytest.mark.internal
+def test_async_decode_coordinator_owns_transaction_state_machine():
+    controller = object.__new__(TextGenerationController)
+    controller._async_step_transaction = None
+    controller._async_transaction_next_step_id = 0
+    coordinator = AsyncDecodeCoordinator(controller)
+    controller._async_decode_coordinator = coordinator
+    snapshot = _make_async_layout_snapshot([10, 11], cuda_graph_request_count=2)
+    plan = AsyncDecodePlan.from_snapshot(snapshot)
+
+    transaction = coordinator.begin_transaction(snapshot=snapshot, plan=plan)
+
+    assert transaction.step_id == 0
+    assert coordinator.pending_transaction() is transaction
+    assert controller._pending_async_transaction() is transaction
+    assert controller._has_pending_async_forward_state()
+
+    coordinator.retire_transaction()
+
+    assert transaction.state == AsyncTxnState.RETIRED
+    assert coordinator.pending_transaction() is None
+    assert controller._async_step_transaction is None
+    assert not controller._has_pending_async_forward_state()
 
 
 def _async_layout_snapshot_status(controller):
