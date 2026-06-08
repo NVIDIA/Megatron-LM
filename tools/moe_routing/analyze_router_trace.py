@@ -3,9 +3,13 @@
 """Analyze MoE router traces. Used to estimate predictor accuracy for speculative expert prefetch.
 
 Given JSONL traces produced by `--moe-routing-trace-path`, compute the per-token overlap between
-layer L's actual top-K experts and layer L-1's top-N experts (for a sweep of N). The mean overlap
-fraction is the empirical ceiling on the cache hit rate of a "use L-1's top-N as L's predicted
-experts" prefetch policy.
+consecutive MoE layer pairs.  In hybrid models (e.g. MEMEME pattern where M=Mamba, E=MoE), MoE
+layers are not adjacent in absolute numbering — "consecutive MoE layers" means the previous MoE
+layer in the stack, regardless of how many non-MoE layers separate them.
+
+For each consecutive pair (L_prev, L), compute the overlap between L's actual top-K experts and
+L_prev's top-N experts (for a sweep of N).  The mean overlap fraction is the empirical ceiling on
+the cache hit rate of a "use L_prev's top-N as L's predicted experts" prefetch policy.
 
 Usage:
     python analyze_router_trace.py /path/to/trace_dir
@@ -13,7 +17,7 @@ Usage:
     python analyze_router_trace.py /path/to/trace_dir --save-csv overlaps.csv
 
 Output: a table of (N, mean overlap, percentiles, sample count) summarizing predictor accuracy
-across all (token, adjacent-MoE-layer-pair, step) triples.
+across all (token, consecutive-MoE-layer-pair, step) triples.
 """
 
 import argparse

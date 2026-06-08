@@ -109,7 +109,7 @@ still target these scripts.
 
 #### Collecting traces
 
-**During training** — enable these flags:
+**During training**, enable these flags:
 
 ```bash
 --moe-routing-trace-path /path/to/trace_dir   # enable tracing
@@ -118,7 +118,7 @@ still target these scripts.
 --moe-routing-trace-capture-hidden-states     # optional: input hidden states
 ```
 
-**During inference** — add to your inference launch (e.g.
+**During inference**, add these flags (e.g.
 `advanced/gpt_dynamic_inference_with_coordinator.py`):
 
 ```bash
@@ -148,7 +148,7 @@ The dispatcher runs these analyses in order:
 
 | Script | Question answered |
 |--------|-------------------|
-| `tools/moe_routing/analyze_router_trace.py` | How much does layer L's top-K overlap with layer L-1? (predictor accuracy ceiling) |
+| `tools/moe_routing/analyze_router_trace.py` | How much does MoE layer L's top-K overlap with the previous MoE layer? (predictor accuracy ceiling; handles non-MoE layers between them, e.g. MEMEME pattern) |
 | `tools/moe_routing/analyze_routing_jaccard.py` | Jaccard similarity between consecutive MoE layers |
 | `tools/moe_routing/analyze_routing_concentration.py` | How concentrated is routing? (hot-set size) |
 | `tools/moe_routing/analyze_routing_load_balance.py` | Can one-layer-ahead prediction close the EP load-imbalance gap? |
