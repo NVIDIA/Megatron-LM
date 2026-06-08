@@ -279,90 +279,6 @@ class ParameterGroup:
                     del param.main_grad
             self.main_grad_buffer.reshard()
 
-    @torch.no_grad()
-    def unshard_grad_to_root_async(self, param):
-        """Gather this param's grad to its assigned root rank (async, non-blocking).
-
-        All ranks must call this collectively (after reduce_grad), in the same param
-        order. The cross-rank gather is issued as non-blocking P2P
-        (``batch_isend_irecv``), which runs on the NCCL backend's own stream and so
-        overlaps the caller's compute; the root's own-piece copy is a local memcpy on
-        the current stream. Returns ``(full_grad_or_None, reqs)`` — the full grad on
-        root (valid only after ``reqs`` complete, so the caller waits them before NS),
-        None on others; the returned tensors must stay alive until ``reqs`` complete.
-        """
-        idx = self.param_idx[param]
-        root, src, dst = self._grad_gather_plans[idx]
-        gbuf = self.main_grad_buffer
-        ops = []
-        if self._dp_rank == root:
-            full_grad = torch.empty(param.shape, dtype=gbuf.dtype, device=gbuf.device).flatten()
-            for r in range(self._dp_world_size):
-                src_lo, src_hi = src[r]
-                dst_lo, dst_hi = dst[r]
-                if dst_hi <= dst_lo:
-                    continue  # rank r holds no part of this param
-                if r == root:
-                    full_grad[dst_lo:dst_hi].copy_(gbuf.data[src_lo:src_hi])  # local
-                else:
-                    ops.append(
-                        torch.distributed.P2POp(
-                            torch.distributed.irecv, full_grad[dst_lo:dst_hi], r, self.dp_group
-                        )
-                    )
-            reqs = torch.distributed.batch_isend_irecv(ops) if ops else []
-            return full_grad.view(param.shape), reqs
-        else:
-            src_lo, src_hi = src[self._dp_rank]
-            if src_hi <= src_lo:
-                return None, []
-            ops.append(
-                torch.distributed.P2POp(
-                    torch.distributed.isend, gbuf.data[src_lo:src_hi], root, self.dp_group
-                )
-            )
-            return None, torch.distributed.batch_isend_irecv(ops)
-
-    @torch.no_grad()
-    def scatter_grad_from_root_async(self, param, data=None):
-        """Scatter this param's transformed grad from root back (async, non-blocking).
-
-        All ranks must call this collectively, in the same param order. P2P runs on
-        the NCCL backend's stream (overlaps compute). Root copies its own piece
-        locally and isends the rest; each non-root holder irecvs its piece straight
-        into its grad-buffer shard (safe: the matching gather isend that read that
-        shard was enqueued earlier on the same NCCL stream, so it completes before
-        this recv writes). Returns the in-flight P2P Works (empty if uninvolved).
-        """
-        idx = self.param_idx[param]
-        root, src, dst = self._grad_gather_plans[idx]
-        gbuf = self.main_grad_buffer
-        ops = []
-        if self._dp_rank == root:
-            full = data.to(dtype=gbuf.dtype).flatten()
-            for r in range(self._dp_world_size):
-                src_lo, src_hi = src[r]
-                dst_lo, dst_hi = dst[r]
-                if dst_hi <= dst_lo:
-                    continue  # rank r holds no part of this param
-                if r == root:
-                    gbuf.data[src_lo:src_hi].copy_(full[dst_lo:dst_hi])  # local
-                else:
-                    ops.append(
-                        torch.distributed.P2POp(
-                            torch.distributed.isend, full[dst_lo:dst_hi], r, self.dp_group
-                        )
-                    )
-        else:
-            src_lo, src_hi = src[self._dp_rank]
-            if src_hi > src_lo:
-                ops.append(
-                    torch.distributed.P2POp(
-                        torch.distributed.irecv, gbuf.data[src_lo:src_hi], root, self.dp_group
-                    )
-                )
-        return torch.distributed.batch_isend_irecv(ops) if ops else []
-
     def _init_dist_params(self):
         """
         Initialize distributed parameter views (DTensors) into the buffers.
@@ -404,11 +320,6 @@ class ParameterGroup:
             # Mark as FSDP parameter for special handling
             setattr(param, "__fsdp_param__", True)
             setattr(dist_param, "__fsdp_param__", True)
-            # Back-references so an optimizer that only sees the optimizer-facing
-            # dist_param (e.g. FullyShardV2Muon) can reach this ParameterGroup and
-            # the original param it indexes (for per-param gather/scatter).
-            dist_param._fsdp_param_group = self
-            dist_param._fsdp_orig_param = param
             self.dist_params.append(dist_param)
 
         # Update dist_param chunk metadata for checkpointing and debugging.
@@ -436,50 +347,3 @@ class ParameterGroup:
                 )
             else:
                 self.dist_grads.append(None)
-
-        # Per-param send/recv plans from BufferIndex (identical on all ranks, so
-        # no metadata comm). Entry is (root, src, dst):
-        #   root   — DP rank that assembles the full grad.
-        #   src[r] — (lo, hi) of rank r's piece in its LOCAL grad buffer.
-        #   dst[r] — (lo, hi) of that piece in the ASSEMBLED full grad on root.
-        # Same elements live at gbuf.data[src[r]] (rank r) and full_grad[dst[r]]
-        # (root); unshard moves src->dst, scatter moves dst->src. Empty range
-        # (lo==hi) => rank r owns nothing (runtime skips via lo<hi). src follows
-        # the layout, where [lo, hi) is the piece in GLOBAL coords: distributed
-        # buffer -> (lo-shard_start, hi-shard_start) (gbuf.data is the shard);
-        # replicated buffer (ZeRO-1) -> (lo, hi) (gbuf.data is the full buffer).
-        # Only src[self._dp_rank] ever indexes gbuf.data.
-        #
-        #          Example (distributed): 4 ranks, shard_size=100, param [150,380).
-        #            rank 0: shard [0,100)   ∩ param = ∅      -> src=(0,0)   dst=(0,0)
-        #            rank 1: shard [100,200) ∩ [150,200)      -> src=(50,100) dst=(0,50)
-        #            rank 2: shard [200,300) ∩ [200,300)      -> src=(0,100)  dst=(50,150)
-        #            rank 3: shard [300,400) ∩ [300,380)      -> src=(0,80)   dst=(150,230)
-        #          (rank 1's src starts at 50 because the param begins 50 into
-        #          its shard; its dst starts at 0 because it is the param's head.)
-        bi = self.main_grad_buffer.buffer_index
-        is_distributed = self.main_grad_buffer.is_distributed
-        shard_size = bi.bucket_meta.size // self._dp_world_size
-        self._grad_gather_plans: List[tuple] = []
-        for idx in range(len(self.params)):
-            item = bi.item_index_map[idx]
-            root = bi.item_root_ranks[idx]
-            param_start = item.global_data_index
-            param_end = param_start + item.size
-
-            src, dst = [], []
-            for r in range(self._dp_world_size):
-                shard_start = r * shard_size
-                shard_end = shard_start + shard_size
-                lo = max(param_start, shard_start)
-                hi = min(param_end, shard_end)
-                if hi <= lo:
-                    src.append((0, 0))
-                    dst.append((0, 0))
-                else:
-                    if is_distributed:
-                        src.append((lo - shard_start, hi - shard_start))
-                    else:
-                        src.append((lo, hi))
-                    dst.append((lo - param_start, hi - param_start))
-            self._grad_gather_plans.append((root, src, dst))

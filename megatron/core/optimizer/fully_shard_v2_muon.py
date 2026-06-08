@@ -151,13 +151,11 @@ class FullyShardV2Muon(torch.optim.Optimizer):
             )
 
         # Each entry: (master weight, grad or None, momentum, post_momentum_shard).
-        # post_momentum_shard is THIS rank's slice of the momentum-adjusted gradient —
-        # both where Phase 1 puts it AND where gather reads it (isend source / a single
-        # root's full grad), so there is no copy:
-        #   nesterov: grad + coef*m (a fresh value) -> a split root's full-grad slice, else
-        #     the grad shard written in place; momentum is a separate buffer.
-        #   non-nesterov: == m -> it IS the momentum buffer (which for a split root already
-        #     lives in the full-grad slice); Phase 1 just updates it, nothing else.
+        # post_momentum_shard is this rank's momentum-adjusted gradient slice, written by
+        # Phase 1 and read by gather in its FINAL location (no copy). nesterov: a fresh
+        # grad+coef*m, into the split root's full-grad slice or the grad shard (momentum
+        # separate). non-nesterov: == m, so it aliases momentum (which for a split root
+        # lives in the full-grad slice).
         self._managed = []
         for i in range(len(self._main_weights)):
             main_weight = self._main_weights[i]
@@ -173,20 +171,15 @@ class FullyShardV2Muon(torch.optim.Optimizer):
             )
             if self._nesterov:
                 momentum = torch.zeros(this_size, dtype=dtype, device=main_weight.device)
-                # nesterov's post-momentum (grad + coef*m) is a fresh value, written into a
-                # split root's full-grad slice, else the grad shard in place.
                 post_momentum_shard = grad_slice if grad_slice is not None else (
                     grad.to_local().reshape(-1) if grad is not None else None
                 )
+            elif grad_slice is not None:  # split root: momentum lives in the full grad
+                momentum = grad_slice
+                momentum.zero_()
+                post_momentum_shard = momentum
             else:
-                # non-nesterov post-momentum == m, so momentum IS the post-momentum; put it
-                # where gather reads it (the full-grad slice for a split root, else a
-                # standalone buffer) and let post_momentum_shard alias it.
-                if grad_slice is not None:
-                    momentum = grad_slice
-                    momentum.zero_()
-                else:
-                    momentum = torch.zeros(this_size, dtype=dtype, device=main_weight.device)
+                momentum = torch.zeros(this_size, dtype=dtype, device=main_weight.device)
                 post_momentum_shard = momentum
             self._managed.append((main_weight, grad, momentum, post_momentum_shard))
 
@@ -449,19 +442,16 @@ class FullyShardV2Muon(torch.optim.Optimizer):
         its root; (3) root orthogonalizes (NS); (4) scatter the orthogonalized shards
         back; (5) decoupled-WD update of this rank's master shard.
 
-        Gather/scatter are batched per package (one async batch_isend_irecv each, into/out
-        of the grad and full-grad tensors directly) and pipelined across packages: package
-        i+1's gather (NCCL stream) is fired before package i's NS (compute stream) so the
-        two overlap.
+        Gather/scatter are batched per package (one async batch_isend_irecv each, directly
+        into/out of the grad and full-grad tensors) and pipelined: package i+1's gather is
+        fired before package i's NS, so the P2Ps overlap the NS GEMMs.
         """
         assert closure is None, "FullyShardV2Muon does not support a closure."
         lr = self.param_groups[0]["lr"]  # set by the LR scheduler
         items = self._managed
 
-        # Phase 1: momentum on each rank's grad shard, producing post_momentum_shard with
-        # no copy. nesterov writes the look-ahead grad + coef*m into it (a split root's
-        # full-grad slice / the grad shard). non-nesterov's value == m and
-        # post_momentum_shard already aliases momentum, so updating momentum is all we do.
+        # Phase 1: momentum on each rank's grad shard. nesterov also writes the look-ahead
+        # grad+coef*m into post_momentum_shard; non-nesterov's == m (already aliased).
         coef = self._momentum_coef
         for _main_weight, grad, momentum, post_momentum_shard in items:
             if grad is None:
@@ -473,10 +463,7 @@ class FullyShardV2Muon(torch.optim.Optimizer):
             if self._nesterov:
                 torch.add(grad_shard, momentum, alpha=coef, out=post_momentum_shard)
 
-        # Phase 2/3 (per-package batched P2P, pipelined): one batch_isend_irecv per
-        # package gathers grads to roots; NS runs there; one more scatters orth shards
-        # back. Each package's gather is fired before the previous package's NS so the
-        # P2Ps (NCCL stream) overlap the NS GEMMs (compute stream).
+        # Phase 2/3: per-package gather -> NS -> scatter, pipelined (gather i+1 before NS i).
         num_packages = len(self._packages)
         scatter_reqs = []  # (package index, in-flight scatter Works)
         owned_orths = {}   # param_idx -> full orth this rank rooted (read by Phase 3b)
@@ -498,10 +485,8 @@ class FullyShardV2Muon(torch.optim.Optimizer):
         for i, reqs in scatter_reqs:
             self._finish_scatter(i, reqs)
 
-        # Phase 3b: decoupled-WD update of each rank's master shard (fp32) from its orth
-        # shard. The root reads its own segment straight out of the orth it computed (no
-        # grad round-trip); every other holder reads the orth shard scatter delivered into
-        # its grad.
+        # Phase 3b: decoupled-WD master update from each rank's orth shard — the root reads
+        # its own segment from the orth it computed, other holders read scatter's grad.
         for param_idx, (main_weight, grad, _momentum, _post_momentum_shard) in enumerate(items):
             if grad is None:
                 continue
@@ -531,14 +516,11 @@ class FullyShardV2MuonOptimizer(MegatronOptimizer):
 
     def __init__(self, config, model_chunks, **muon_hyperparams):
         self.model_chunks = list(model_chunks) if model_chunks else []
-        # Pull every chunk's 2D matrix dist_param + its grad DTensor straight from the
-        # FSDP v2 ParameterGroups, in module-declaration (== layer) order, and build the
-        # inner torch optimizer purely from those DTensors (no factory plumbing needed).
         from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import FSDPModule
 
-        # One package per FSDPModule (== fsdp unit / transformer layer), so each package's
-        # gather can pipeline with the next layer's NS. A single FSDPModule's params share
-        # one dp_group (the per-package batch_isend_irecv requirement).
+        # Build the inner optimizer from the FSDP-v2 2D-matrix dist_params + their grad
+        # DTensors, one package per FSDPModule (== layer) so each layer's gather pipelines
+        # with the next layer's NS (a package shares one dp_group, as the P2P needs).
         params, grads, packages = [], [], []
         for chunk in self.model_chunks:
             root = chunk if isinstance(chunk, FSDPModule) else chunk.module
@@ -548,9 +530,8 @@ class FullyShardV2MuonOptimizer(MegatronOptimizer):
                 package = []
                 for param_group in m._fsdp_param_groups:
                     for dist_param, dist_grad in zip(param_group.dist_params, param_group.dist_grads):
-                        # Filter by the PARAM's global attrs only (rank-consistent); the
-                        # grad may be None where this rank's shard is empty — keep it
-                        # aligned so every rank's managed set matches (collectives align).
+                        # filter by the param's global attrs only (rank-consistent); keep
+                        # grad aligned even when None (empty shard) so collectives match
                         if dist_param.dim() == 2 and not getattr(
                             dist_param, "is_embedding_or_output_parameter", False
                         ):
@@ -580,11 +561,9 @@ class FullyShardV2MuonOptimizer(MegatronOptimizer):
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:
         self.optimizer.step()
-        # Cast the updated fp32 master weights back into the model (bf16) weight buffers
-        # via the Megatron-FSDP v2 FSDPModule API. The inner optimizer only updates
-        # master weights; this master->model cast (and all ZeRO-1/2/3 / quantization
-        # handling) lives in FSDP. _copy_main_weights_to_model_weights recurses over
-        # child FSDPModules, so one call on each chunk's root FSDPModule suffices.
+        # The inner optimizer only updated the fp32 master weights; cast them back into the
+        # model (bf16) buffers via the v2 FSDPModule API (it recurses over child
+        # FSDPModules, so one call per chunk root suffices).
         from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import FSDPModule
 
         for model_chunk in self.model_chunks:
