@@ -1029,12 +1029,21 @@ class DynamicInferenceEngine(AbstractEngine):
                 eod = -1
             request.sampling_params.termination_id = eod
 
-        if (
-            len(request.prompt_tokens) + request.sampling_params.num_tokens_to_generate
-            > self.context.max_sequence_length
-        ) or (request.sampling_params.num_tokens_to_generate < 0):
+        # Clamp large `num_tokens_to_generate` instead of rejecting the request.
+        # This is included for compatibility with other frameworks.
+        remaining_tokens = self.context.max_sequence_length - len(request.prompt_tokens)
+        if request.sampling_params.num_tokens_to_generate < 0 or remaining_tokens < 0:
             request.status = Status.FAILED
             request.add_event_error_nontransient(MaxSequenceLengthOverflowError(request_id))
+        elif request.sampling_params.num_tokens_to_generate > remaining_tokens:
+            requested_tokens = request.sampling_params.num_tokens_to_generate
+            request.sampling_params.num_tokens_to_generate = remaining_tokens
+            if self.rank == 0:
+                warnings.warn(
+                    f"Request {request_id} requested num_tokens_to_generate={requested_tokens} "
+                    f"which exceeds the maximum sequence length of the engine. "
+                    f"Clamping num_tokens_to_generate to {remaining_tokens}."
+                )
 
         if len(request.prompt_tokens) > self.context.max_tokens and not self.enable_chunked_prefill:
             request.status = Status.FAILED
@@ -1218,12 +1227,21 @@ class DynamicInferenceEngine(AbstractEngine):
                     keep = request.sampling_params.num_tokens_to_generate - len(
                         request.generated_tokens
                     )
+                    num_tokens_before_trim = len(tokens)
                     tokens = tokens[:keep]
-                    # Trim log probs / top-n to match so the counts stay in sync.
-                    if request_log_probs is not None:
-                        request_log_probs = request_log_probs[:keep]
-                    if top_n_logprobs is not None and req_idx in top_n_logprobs:
-                        top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:keep]
+                    # Drop only the excess *trailing* log probs / top-n so the counts stay
+                    # in sync. We must trim from the end, not the front: on a prefill step
+                    # request_log_probs covers the whole prompt and is laid out as
+                    # [<prompt log probs...>, <sampled token log prob>], so front-slicing
+                    # (e.g. [:keep] with keep == 0 when num_tokens_to_generate == 0) would
+                    # discard the prompt log probs that echo+logprobs requests need. In a
+                    # decode step all entries are generated, so trailing == front-equivalent.
+                    num_dropped = num_tokens_before_trim - len(tokens)
+                    if num_dropped > 0:
+                        if request_log_probs is not None:
+                            request_log_probs = request_log_probs[:-num_dropped]
+                        if top_n_logprobs is not None and req_idx in top_n_logprobs:
+                            top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_dropped]
                 if request_id not in self.stop_word_being_finished_ids:
                     is_first_token = len(request.generated_tokens) == 0
                     request.generated_tokens += tokens
@@ -1251,7 +1269,7 @@ class DynamicInferenceEngine(AbstractEngine):
                                 )
                             if first_token_event is None:
                                 first_token_event = event
-                    if is_first_token:
+                    if is_first_token and tokens:
                         if not self.track_generated_token_events:
                             first_token_event = DynamicInferenceEvent(
                                 type=DynamicInferenceEventType.GENERATED_TOKEN,
@@ -1264,7 +1282,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     # non-logging steps (async_forward skips the event sync),
                     # so gate the update to keep the metric a truthful sparse
                     # sample instead of polluting it with zeros.
-                    if step_time > 0:
+                    if step_time > 0 and tokens:
                         per_token_step_time = step_time / len(tokens)
                         request.tpot.extend([per_token_step_time] * len(tokens))
 
