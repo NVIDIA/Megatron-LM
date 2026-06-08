@@ -1,15 +1,17 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from collections import defaultdict, deque
 from contextlib import nullcontext
+import os
 from typing import Any, Dict, Optional, Tuple
 
 import torch
 from torch.autograd.graph import saved_tensors_hooks
 
 # CPU offload implementation for pipeline parallelism
-DEBUG = False
-DEBUG_RANK = 0
+DEBUG = os.environ.get("MCORE_FGAO_DEBUG", "0").lower() in ("1", "true", "yes", "on")
+DEBUG_RANK = int(os.environ.get("MCORE_FGAO_DEBUG_RANK", "0"))
+DEBUG_GROUP = os.environ.get("MCORE_FGAO_DEBUG_GROUP", "")
 
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
@@ -20,9 +22,27 @@ def debug_rank(message):
     # pylint: disable=bad-builtin
     if not DEBUG:
         return
+    if DEBUG_GROUP and DEBUG_GROUP not in message:
+        return
     assert torch.distributed.is_initialized()
     if torch.distributed.get_rank() == DEBUG_RANK:
-        print(message)
+        print(f"[FGAO_DEBUG] {message}", flush=True)
+
+
+def mark_reloaded_tensor(tensor: torch.Tensor) -> None:
+    """Track GPU tensors reloaded by FGAO across saved-tensor unpack boundaries."""
+    if tensor.is_cuda:
+        tensor._mcore_fgao_reloaded = True
+
+
+def consume_reloaded_tensor_mark(tensor: torch.Tensor) -> bool:
+    """Return True once for tensors reloaded by FGAO."""
+    if not tensor.is_cuda:
+        return False
+    if not getattr(tensor, "_mcore_fgao_reloaded", False):
+        return False
+    tensor._mcore_fgao_reloaded = False
+    return True
 
 
 def print_offload_summary_table(total_offload_bytes: Dict[str, int]):
@@ -828,6 +848,7 @@ class ChunkOffloadHandler:
             cpu_backup.size(), dtype=cpu_backup.dtype, layout=cpu_backup.layout, device=dev
         )
         gpu_tensor.copy_(cpu_backup, non_blocking=non_blocking)
+        mark_reloaded_tensor(gpu_tensor)
         if use_cpu_pool:
             self.cpu_tensor_pool.free(cpu_backup)
         return gpu_tensor

@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import dataclasses
 import enum
@@ -2787,6 +2787,136 @@ class TECudaRNGStatesTracker(te.pytorch.distributed.CudaRNGStatesTracker):
         self._is_initialized = True
 
 
+_TE_CHECKPOINT_FGAO_RESIZE_PATCHED = False
+
+
+def _detach_checkpoint_inputs_with_fgao_resize(inputs):
+    """Detach checkpoint inputs and mark FGAO reload storage for post-backward release."""
+    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+        consume_reloaded_tensor_mark,
+    )
+
+    detached_inputs = []
+    for inp in inputs:
+        if not torch.is_tensor(inp):
+            detached_inputs.append(inp)
+            continue
+
+        detached = inp.detach()
+        detached.requires_grad = inp.requires_grad
+        if consume_reloaded_tensor_mark(inp):
+            detached._mcore_fgao_resize_after_backward = True
+        detached_inputs.append(detached)
+    return tuple(detached_inputs)
+
+
+def _resize_fgao_checkpoint_inputs(detached_inputs):
+    """Release FGAO-reloaded checkpoint input storage after its recompute backward."""
+    for inp in detached_inputs:
+        if not (
+            torch.is_tensor(inp) and getattr(inp, "_mcore_fgao_resize_after_backward", False)
+        ):
+            continue
+        if inp.is_cuda:
+            inp.record_stream(torch.cuda.current_stream(inp.device))
+        inp.untyped_storage().resize_(0)
+        inp._mcore_fgao_resize_after_backward = False
+
+
+def _install_te_checkpoint_fgao_resize_patch():
+    """Patch TE reentrant checkpoint to resize FGAO-reloaded inputs after nested backward."""
+    global _TE_CHECKPOINT_FGAO_RESIZE_PATCHED
+    if _TE_CHECKPOINT_FGAO_RESIZE_PATCHED:
+        return
+
+    import transformer_engine.pytorch.distributed as te_dist
+
+    checkpoint_cls = getattr(te_dist, "_CheckpointFunction", None)
+    if checkpoint_cls is None or getattr(checkpoint_cls, "_mcore_fgao_resize_patch", False):
+        _TE_CHECKPOINT_FGAO_RESIZE_PATCHED = True
+        return
+
+    @staticmethod
+    def backward(ctx, *args):
+        """TE reentrant checkpoint backward with post-backward FGAO input resize."""
+        if not torch.autograd._is_checkpoint_valid():
+            raise RuntimeError(
+                "Checkpointing is not compatible with .grad(), please use .backward() if possible"
+            )
+
+        inputs = tuple(
+            t if t is not None else arg for (t, arg) in zip(ctx.saved_tensors, ctx.inputs)
+        )
+
+        get_rng_state_tracker = ctx.get_rng_state_tracker
+
+        if ctx.distribute_saved_activations:
+            te_dist.safely_set_viewless_tensor_data(
+                inputs[0],
+                te_dist.gather_split_1d_tensor(inputs[0].data, ctx.tp_group).view(
+                    ctx.input_0_shape
+                ),
+            )
+
+        bwd_cpu_rng_state = torch.get_rng_state()
+        bwd_cuda_rng_state = te_dist._get_cuda_rng_state(
+            graph_safe=ctx.graph_safe_rng_state
+        )
+        if get_rng_state_tracker is not None:
+            bwd_cuda_rng_state_tracker = get_rng_state_tracker().get_states()
+
+        torch.set_rng_state(ctx.fwd_cpu_rng_state)
+        te_dist._set_cuda_rng_state(
+            ctx.fwd_cuda_rng_state, graph_safe=ctx.graph_safe_rng_state
+        )
+        if get_rng_state_tracker is not None:
+            get_rng_state_tracker().set_states(ctx.fwd_cuda_rng_state_tracker)
+
+        detached_inputs = _detach_checkpoint_inputs_with_fgao_resize(inputs)
+
+        with (
+            torch.enable_grad(),
+            ctx.recompute_ctx,
+            ctx.torch_gpu_amp_ctx,
+            ctx.torch_cpu_amp_ctx,
+            te_dist.activation_recompute_forward(
+                activation_recompute=True, recompute_phase=True
+            ),
+            te_dist.autocast(enabled=ctx.fp8, recipe=ctx.fp8_recipe),
+        ):
+            outputs = ctx.run_function(*detached_inputs, **ctx.kwargs)
+
+        torch.set_rng_state(bwd_cpu_rng_state)
+        te_dist._set_cuda_rng_state(bwd_cuda_rng_state, graph_safe=ctx.graph_safe_rng_state)
+        if get_rng_state_tracker is not None:
+            get_rng_state_tracker().set_states(bwd_cuda_rng_state_tracker)
+
+        if isinstance(outputs, torch.Tensor):
+            outputs = (outputs,)
+
+        outputs_with_grad = []
+        args_with_grad = []
+        for i, output in enumerate(outputs):
+            if torch.is_tensor(output) and output.requires_grad:
+                outputs_with_grad.append(output)
+                args_with_grad.append(args[i])
+        if len(outputs_with_grad) == 0:
+            raise RuntimeError(
+                "none of output has requires_grad=True, this checkpoint() is not necessary"
+            )
+
+        torch.autograd.backward(outputs_with_grad, args_with_grad)
+        grads = tuple(
+            inp.grad if isinstance(inp, torch.Tensor) else None for inp in detached_inputs
+        )
+        _resize_fgao_checkpoint_inputs(detached_inputs)
+        return (None, None, None, None, None, None) + grads
+
+    checkpoint_cls.backward = backward
+    checkpoint_cls._mcore_fgao_resize_patch = True
+    _TE_CHECKPOINT_FGAO_RESIZE_PATCHED = True
+
+
 def te_checkpoint(
     forward_func, distribute_saved_activations, get_rng_state_tracker, tp_group, *args, **kwargs
 ):
@@ -2800,6 +2930,7 @@ def te_checkpoint(
     from transformer_engine.pytorch.distributed import checkpoint
 
     if is_te_min_version("1.5.0"):
+        _install_te_checkpoint_fgao_resize_patch()
         return checkpoint(
             forward_func,
             *args,

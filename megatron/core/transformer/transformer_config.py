@@ -1244,7 +1244,7 @@ class TransformerConfig(ModelParallelConfig):
     offload_modules: Optional[list[str]] = field(default_factory=list)
     """The submodules to offload its input.
     choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj",
-             "mlp_norm", "expert_fc1", "moe_act".
+             "mlp_norm", "expert_fc1", "moe_act", "layer_input".
     "attn_norm": offload the input of the normalization in the attention part.
     "qkv_linear": offload the input of the qkv linear part.
     "core_attn": offload the input of the core attention part.
@@ -1252,6 +1252,8 @@ class TransformerConfig(ModelParallelConfig):
     "mlp_norm": offload the input of the normalization in the mlp part.
     "expert_fc1": offload the input of the expert fc1 part.
     "moe_act": offload the input of the moe act part.
+    "layer_input": offload the input checkpoint saved by full recompute. With uniform full
+    recompute, this offloads one input per recompute_num_layers-layer segment.
     """
     min_offloaded_tensor_size: int = 1024 * 1024
     """The minimum size of the tensor to be offloaded."""
@@ -1959,12 +1961,22 @@ class TransformerConfig(ModelParallelConfig):
                 "attn_norm",
                 "mlp_norm",
                 "qkv_linear",
+                "layer_input",
             }
             invalid_modules = set(self.offload_modules) - allowed_modules
             assert not invalid_modules, (
                 f'Invalid choices for offload_modules: {invalid_modules}. '
                 f'Allowed modules are: {allowed_modules}'
             )
+            if (
+                "layer_input" in self.offload_modules
+                and self.recompute_granularity != "full"
+            ):
+                raise ValueError(
+                    "offload_modules includes 'layer_input', which only applies to "
+                    "full activation recompute because it offloads the checkpoint input "
+                    "saved for each full-recompute segment."
+                )
             if "attn_proj" in self.offload_modules and "core_attn" not in self.offload_modules:
                 raise ValueError(
                     "attn_proj cannot be set to offload_modules alone without core_attn "
