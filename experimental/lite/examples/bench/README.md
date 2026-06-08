@@ -1,11 +1,13 @@
 # MLite Bench Example
 
-This example runs the same small pretrain-style benchmark through either
-`backend=mlite` or `backend=bridge`.
+This example runs the same small pretrain-style benchmark through `backend=mlite`
+and a reference backend.
 
-`bridge` is a runtime backend backed by Megatron-Bridge. It requires an
-environment where `import megatron.bridge` works. Dry-run mode does not import
-Megatron-Bridge and is safe for config validation.
+The validated reference backend in this PR is `backend=mbridge`, backed by the
+legacy `mbridge` package. `backend=bridge` is reserved for the real
+Megatron-Bridge package and requires an environment where `import
+megatron.bridge` works. Dry-run mode does not import either reference package and
+is safe for config validation.
 
 ## Dry-Run
 
@@ -21,7 +23,7 @@ python experimental/lite/examples/bench/bench.py \
   --dry-run
 
 python experimental/lite/examples/bench/bench.py \
-  --backend bridge \
+  --backend mbridge \
   --hf-path /models/Qwen3.5-35B-A3B \
   --model-name qwen3_5 \
   --truncate-layers 2 \
@@ -37,12 +39,14 @@ axis.
 
 ```bash
 HF_PATH=/models/Qwen3.5-35B-A3B \
+REFERENCE_BACKEND=mbridge \
 DRY_RUN=1 \
 bash experimental/lite/examples/bench/scripts/run_qwen35_pair.sh
 ```
 
 Set `DRY_RUN=0` to run the benchmark under `torchrun`. Results are written to
-`experimental/lite/examples/bench/outputs/`.
+`experimental/lite/examples/bench/outputs/`. Set `REFERENCE_BACKEND=bridge` only
+when Megatron-Bridge is installed and `import megatron.bridge` succeeds.
 
 ## Validated Run
 
@@ -51,6 +55,7 @@ The following paired run completed on 2026-06-07 with 8x NVIDIA H100 80GB GPUs:
 ```bash
 HF_PATH=/models/Qwen3.5-35B-A3B \
 OUTPUT_DIR=experimental/lite/examples/bench/outputs/qwen35_pair \
+REFERENCE_BACKEND=mbridge \
 DRY_RUN=0 \
 NPROC=8 \
 MASTER_PORT=31841 \
@@ -66,19 +71,39 @@ bash experimental/lite/examples/bench/scripts/run_qwen35_pair.sh
 ```
 
 Slurm job `12624917` completed with exit code `0:0`. The run used
-`torch==2.10.0+cu129`; `transformer_engine`, `einops`, and `megatron.bridge` were
+`torch==2.10.0+cu129`; `transformer_engine`, `einops`, and `mbridge` were
 available in the runtime environment.
 
 | Runtime | Impl | Optimizer backend | Measured steps | Avg step ms | Tokens/s | Tokens/s/GPU | Peak memory GB | TFLOPs/GPU |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | `mlite` | `lite` | `mc_full` | 10 | 309.433 | 105896.935 | 13237.117 | 14.324 | 80.444 |
-| `bridge` | `bridge` | `mc` | 10 | 332.201 | 98639.089 | 12329.886 | 17.987 | 74.931 |
+| `mbridge` | `bridge` | `mc` | 10 | 332.201 | 98639.089 | 12329.886 | 17.987 | 74.931 |
 
 The two runs used the same synthetic input stream. Loss matched within
 `atol=0.05, rtol=0.005` across 10 measured samples
-(`max_abs_diff=0.000500`). Grad norm did not match that tolerance
-(`max_abs_diff=2.491823`), so treat the recorded correctness result as
-loss-consistent rather than full optimizer-metric parity.
+(`max_abs_diff=0.000500`). This long benchmark is performance evidence; the
+strict optimizer-metric evidence is the deterministic run below.
+
+## Deterministic mbridge Correctness
+
+Slurm job `12630675` completed a strict deterministic MLite vs `mbridge` run
+with 1x GPU, `seed=42`, Qwen3.5, `seq_len=8`, `truncate_layers=1`,
+`keep_experts=2`, and `steps=2`.
+
+The comparison passed with no mismatches:
+
+- `samples=2`
+- `max_loss_abs=0.0`
+- `max_grad_norm_abs=0.0`
+- `mismatches=[]`
+- step 0: `loss=13.027458190917969`,
+  `grad_norm=120.75512734973202`, post-step weight SHA256
+  `1e3176a8cb18d68c5da9bfa5f31a507fa8d51a3a5ddc10fbcd821260a4c6c980`
+- step 1: `loss=14.698704719543457`,
+  `grad_norm=96.15656991334498`, post-step weight SHA256
+  `e6d034f7e05ee5ee6a42ceddda8970874c6742baf59cade38f53550abd7aec29`
+- eval logits canonical bf16 SHA256
+  `2f805802633927852c5ec87455b1afa3a68597e1e411b979f2678eaedfb1c710`
 
 ## Real Run
 
@@ -96,7 +121,7 @@ torchrun --nproc_per_node 1 experimental/lite/examples/bench/bench.py \
   --output-json /tmp/qwen35_mlite_bench.json
 
 torchrun --nproc_per_node 1 experimental/lite/examples/bench/bench.py \
-  --backend bridge \
+  --backend mbridge \
   --hf-path /models/Qwen3.5-35B-A3B \
   --model-name qwen3_5 \
   --steps 5 \
@@ -105,7 +130,7 @@ torchrun --nproc_per_node 1 experimental/lite/examples/bench/bench.py \
   --num-microbatches 1 \
   --truncate-layers 2 \
   --disable-mtp \
-  --output-json /tmp/qwen35_bridge_bench.json
+  --output-json /tmp/qwen35_mbridge_bench.json
 ```
 
 Compare `loss`, `grad_norm`, `avg_step_ms`, `tok_per_s`, peak memory, and
@@ -135,7 +160,7 @@ torchrun --nproc_per_node 1 experimental/lite/examples/bench/correctness.py run 
   --output-json /tmp/qwen35_mlite_correctness.json
 
 torchrun --nproc_per_node 1 experimental/lite/examples/bench/correctness.py run \
-  --backend bridge \
+  --backend mbridge \
   --hf-path /models/Qwen3.5-35B-A3B \
   --model-name qwen3_5 \
   --steps 2 \
@@ -144,10 +169,10 @@ torchrun --nproc_per_node 1 experimental/lite/examples/bench/correctness.py run 
   --truncate-layers 2 \
   --disable-mtp \
   --same-data-across-dp \
-  --output-json /tmp/qwen35_bridge_correctness.json
+  --output-json /tmp/qwen35_mbridge_correctness.json
 
 python experimental/lite/examples/bench/correctness.py compare \
   /tmp/qwen35_mlite_correctness.json \
-  /tmp/qwen35_bridge_correctness.json \
+  /tmp/qwen35_mbridge_correctness.json \
   --fail-on-mismatch
 ```

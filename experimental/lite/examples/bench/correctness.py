@@ -1,4 +1,4 @@
-"""Deterministic correctness runner for MLite and Megatron-Bridge backends."""
+"""Deterministic correctness runner for MLite and reference backends."""
 
 from __future__ import annotations
 

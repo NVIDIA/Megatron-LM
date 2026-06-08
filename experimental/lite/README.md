@@ -17,8 +17,10 @@ This initial drop contains:
 - Hugging Face safetensors load/export helpers for the included models.
 - Megatron-Core optimizer wrapping for the lite runtime.
 - FSDP2 optimizer primitives for supported lite model protocols.
-- A Megatron-Bridge runtime backend for reference/backend comparison runs.
-- A benchmark example that can dry-run or execute `mlite` and `bridge` backends.
+- Reference runtime backends for comparison runs: `mbridge` for the legacy
+  package and `bridge` for real Megatron-Bridge environments.
+- A benchmark example that can dry-run or execute `mlite`, `mbridge`, and
+  `bridge` backends.
 
 This initial drop intentionally does not include:
 
@@ -61,8 +63,10 @@ handle = runtime.build_model()
 
 `backend="mlite"` selects the Megatron Lite runtime backend. `impl="lite"`
 selects the model implementation inside the registered model family.
-`backend="bridge"` selects the Megatron-Bridge runtime backend and requires an
-environment where `import megatron.bridge` works when the model is built.
+`backend="mbridge"` selects the legacy `mbridge` reference backend used by the
+validated benchmark example. `backend="bridge"` selects the Megatron-Bridge
+runtime backend and requires an environment where `import megatron.bridge` works
+when the model is built.
 
 Model names currently registered by default:
 

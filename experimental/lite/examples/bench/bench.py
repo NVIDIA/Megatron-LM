@@ -1,8 +1,8 @@
-"""Benchmark MLite and Megatron-Bridge runtime backends.
+"""Benchmark MLite and reference runtime backends.
 
 Run from the Megatron-LM repo root after adding ``experimental/lite`` to
 ``PYTHONPATH``. ``--dry-run`` validates config construction without importing
-Megatron-Bridge or initializing distributed state.
+reference backend packages or initializing distributed state.
 """
 
 from __future__ import annotations

@@ -6,7 +6,7 @@ REPO_ROOT=${REPO_ROOT:-$(pwd)}
 PYTHON_BIN=${PYTHON_BIN:-python}
 NPROC=${NPROC:-1}
 OUTPUT_DIR=${OUTPUT_DIR:-"${REPO_ROOT}/experimental/lite/examples/bench/outputs/correctness"}
-REFERENCE_BACKEND=${REFERENCE_BACKEND:-bridge}
+REFERENCE_BACKEND=${REFERENCE_BACKEND:-mbridge}
 
 export PYTHONPATH="${REPO_ROOT}/experimental/lite:${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 export MEGATRON_LITE_DETERMINISTIC=1

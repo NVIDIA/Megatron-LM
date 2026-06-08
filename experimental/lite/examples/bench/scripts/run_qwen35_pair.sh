@@ -7,6 +7,7 @@ PYTHON_BIN=${PYTHON_BIN:-python}
 NPROC=${NPROC:-1}
 DRY_RUN=${DRY_RUN:-1}
 OUTPUT_DIR=${OUTPUT_DIR:-"${REPO_ROOT}/experimental/lite/examples/bench/outputs"}
+REFERENCE_BACKEND=${REFERENCE_BACKEND:-mbridge}
 
 export PYTHONPATH="${REPO_ROOT}/experimental/lite:${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 
@@ -43,7 +44,7 @@ if [[ "${DRY_RUN}" == "1" ]]; then
   "${PYTHON_BIN}" "${REPO_ROOT}/experimental/lite/examples/bench/bench.py" \
     --backend mlite "${COMMON_ARGS[@]}" --dry-run
   "${PYTHON_BIN}" "${REPO_ROOT}/experimental/lite/examples/bench/bench.py" \
-    --backend bridge "${COMMON_ARGS[@]}" --dry-run
+    --backend "${REFERENCE_BACKEND}" "${COMMON_ARGS[@]}" --dry-run
 else
   mkdir -p "${OUTPUT_DIR}"
   MLITE_TORCHRUN_ARGS=(--nproc_per_node "${NPROC}")
@@ -61,7 +62,7 @@ else
     2>&1 | tee "${OUTPUT_DIR}/qwen35_mlite.log"
   torchrun "${BRIDGE_TORCHRUN_ARGS[@]}" \
     "${REPO_ROOT}/experimental/lite/examples/bench/bench.py" \
-    --backend bridge "${COMMON_ARGS[@]}" \
-    --output-json "${OUTPUT_DIR}/qwen35_bridge.json" \
-    2>&1 | tee "${OUTPUT_DIR}/qwen35_bridge.log"
+    --backend "${REFERENCE_BACKEND}" "${COMMON_ARGS[@]}" \
+    --output-json "${OUTPUT_DIR}/qwen35_${REFERENCE_BACKEND}.json" \
+    2>&1 | tee "${OUTPUT_DIR}/qwen35_${REFERENCE_BACKEND}.log"
 fi
