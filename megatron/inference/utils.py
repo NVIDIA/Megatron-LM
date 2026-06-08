@@ -291,9 +291,8 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
         "--moe-routing-trace-max-steps",
         type=int,
         default=None,
-        help="Maximum number of decode steps to trace (inference).  Tracing stops after "
-             "this many steps; default is unlimited.  Training uses "
-             "--moe-routing-trace-max-iters instead.",
+        help="Maximum number of decode steps to trace (inference). Default is unlimited."
+             "Training uses --moe-routing-trace-max-iters instead.",
     )
 
     return parser

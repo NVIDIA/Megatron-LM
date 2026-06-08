@@ -4,18 +4,15 @@
 
 Captures per-layer top-K routing decisions to a JSONL file for offline
 analysis of routing patterns (e.g., expert load balance, predictor accuracy for
-speculative expert prefetch).
+speculative expert prefetch). Enable via `--moe-routing-trace-path` in both training and inference.
 
 - Inference mode (default): step boundaries are auto-detected by watching for layer repeats.
   When a layer that already fired this step fires again, a new step has started.
-  Enable via `--moe-routing-trace-path` in the inference launcher.
 
 - Training mode (training_mode=True): the training loop drives step boundaries explicitly by calling
   `advance_step()` once per iteration.
-  Enable via `--moe-routing-trace-path` in the training launcher.
 
 Output format — one JSONL file per rank, one record per (step, layer):
-
     {"step": 0, "layer": 3, "rank": 0, "num_tokens": 128, "topk": 22,
      "top_indices": [[12, 45, ...], ...]}
 
@@ -28,8 +25,7 @@ Optional sidecar binary files (same directory):
 Use `load_hidden_states_for_record` / `load_logits_for_record` to read
 sidecar tensors back from the binary files.
 
-Note: Python forward hooks do not fire during CUDA graph replay.  For
-complete traces, run with `--cuda-graph-impl none`.
+Note: Python forward hooks do not fire during CUDA graph replay.  Run with `--cuda-graph-impl none`.
 """
 
 import atexit
@@ -134,8 +130,6 @@ def load_logits_for_record(record: dict, trace_dir: str) -> torch.Tensor:
 
 class RouterTracer:
     """Captures router top-K decisions across all MoE layers per step.
-
-    Works in two modes controlled by `training_mode`:
 
     - Inference mode (training_mode=False): step boundaries are auto-detected.  When a layer that
       has already fired this step fires again, a new step has started.
@@ -373,7 +367,7 @@ class RouterTracer:
             self._logits_file.flush()
 
     def flush(self) -> None:
-        """Final flush of any remaining records (registered at atexit)."""
+        """Final flush of any remaining records."""
         with self._lock:
             self._flush_records_to_disk()
             if self._hs_file is not None:

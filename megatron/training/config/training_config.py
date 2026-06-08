@@ -398,10 +398,10 @@ class CheckpointConfig:
     to tracing all iterations when moe_routing_trace_path is set."""
 
     moe_routing_trace_capture_logits: bool = False
-    """Capture pre-topk routing logits for each router call (bfloat16 binary sidecar)."""
+    """Capture pre-topk routing logits for each router call."""
 
     moe_routing_trace_capture_hidden_states: bool = False
-    """Capture input hidden-state tensors for each router call (bfloat16 binary sidecar)."""
+    """Capture input hidden-state tensors for each router call."""
 
     moe_routing_trace_dump_weights: bool = False
     """Save router weight tensors to a .pt sidecar file."""
