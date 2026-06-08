@@ -1251,6 +1251,65 @@ class AsyncLogprobMTPParticipant:
         }
 
 
+@dataclass
+class AsyncEPParticipant:
+    """Participant that records EP step-begin and async-handoff decisions."""
+
+    step_begin_decision: object | None = None
+    handoff_decision: object | None = None
+    prepared: bool = False
+    committed: bool = False
+    rolled_back: bool = False
+
+    def record_step_begin(self, decision: object) -> None:
+        """Attach the EP step-begin decision that resolved pending transaction state."""
+        self.step_begin_decision = decision
+
+    def record_handoff(self, decision: object) -> None:
+        """Attach the EP handoff launch or skip decision for a candidate transaction."""
+        self.handoff_decision = decision
+
+    def prepare(self, plan: AsyncDecodePlan) -> dict[str, object]:
+        """Record that EP state is prepared with the transaction plan."""
+        self.prepared = True
+        return self.diagnostics()
+
+    def validate(self, plan: AsyncDecodePlan, current_state: object) -> bool:
+        """EP decisions are validated by their tagged collectives."""
+        return True
+
+    def commit(self, plan: AsyncDecodePlan) -> None:
+        """Mark EP decision state as committed with the transaction."""
+        if self.committed:
+            return
+        self.committed = True
+
+    def rollback(self, plan: AsyncDecodePlan) -> None:
+        """Mark EP decision state as rolled back with the transaction."""
+        if self.committed:
+            return
+        self.rolled_back = True
+
+    def diagnostics(self) -> dict[str, object]:
+        """Return EP participant diagnostics."""
+        return {
+            "prepared": self.prepared,
+            "committed": self.committed,
+            "rolled_back": self.rolled_back,
+            "step_begin": self._decision_diagnostics(self.step_begin_decision),
+            "handoff": self._decision_diagnostics(self.handoff_decision),
+        }
+
+    @staticmethod
+    def _decision_diagnostics(decision: object | None) -> dict[str, object] | None:
+        if decision is None:
+            return None
+        return {
+            field: getattr(decision, field)
+            for field in getattr(decision, "__dataclass_fields__", {})
+        }
+
+
 def _tensor_ints(values: Tensor, *, skip_negative: bool = False) -> list[int]:
     values = values.to(dtype=torch.int64, device="cpu").reshape(-1)
     if skip_negative:

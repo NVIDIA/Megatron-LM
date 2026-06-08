@@ -17,6 +17,7 @@ from megatron.core import parallel_state
 from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.async_transaction import (
     AsyncDecodeTransaction,
+    AsyncEPParticipant,
     AsyncLayoutSnapshot,
     AsyncLogprobMTPParticipant,
     AsyncMambaStateParticipant,
@@ -224,6 +225,7 @@ class TextGenerationController:
         self._async_prepare_deferred_until_after_sampling = False
         self._async_sample_readback = None
         self._async_decode_coordinator = None
+        self._async_ep_participant_this_step = None
         self._request_sampling_rngs: Dict[int, torch.Generator] = {}
         self._ep_async_protocol = None
         self._ep_async_handoff_decided_this_step = False
@@ -1673,6 +1675,40 @@ class TextGenerationController:
         participants = getattr(transaction, "participants", ())
         return any(isinstance(participant, participant_type) for participant in participants)
 
+    def _async_ep_participant_for_transaction(
+        self, transaction: object | None, *, create: bool
+    ) -> AsyncEPParticipant | None:
+        """Return or attach the EP participant owned by a transaction."""
+        if transaction is None:
+            return None
+        participants = getattr(transaction, "participants", None)
+        if participants is None:
+            return None
+        for participant in participants:
+            if isinstance(participant, AsyncEPParticipant):
+                return participant
+        if not create:
+            return None
+        participant = AsyncEPParticipant()
+        transaction.participants = (*transaction.participants, participant)
+        if hasattr(transaction, "plan") and transaction.plan is not None:
+            participant.prepare(transaction.plan)
+        return participant
+
+    def _record_ep_step_begin_decision(self, decision: EPStepBeginDecision) -> None:
+        """Attach EP step-begin state to the pending transaction lifecycle."""
+        participant = self._async_ep_participant_for_transaction(
+            self._pending_async_transaction(), create=True
+        )
+        if participant is not None:
+            participant.record_step_begin(decision)
+
+    def _record_ep_handoff_decision(self, decision: EPAsyncHandoffDecision) -> None:
+        """Stage EP handoff state for the transaction that may be launched."""
+        participant = AsyncEPParticipant()
+        participant.record_handoff(decision)
+        self._async_ep_participant_this_step = participant
+
     def _attach_async_transaction_participants(
         self,
         transaction: object,
@@ -1688,6 +1724,10 @@ class TextGenerationController:
 
         context = self.inference_wrapped_model.inference_context
         participants = []
+        ep_participant = getattr(self, "_async_ep_participant_this_step", None)
+        if ep_participant is not None:
+            participants.append(ep_participant)
+            self._async_ep_participant_this_step = None
         if getattr(context, "is_hybrid_model", False):
             participants.append(AsyncMambaStateParticipant(context))
         if isinstance(sample_ticket, AsyncSampleTicket):
@@ -1805,6 +1845,7 @@ class TextGenerationController:
         """Synchronize pending async state at the beginning of an EP work step."""
         self._ep_async_handoff_decided_this_step = False
         self._ep_async_handoff_decision_this_step = None
+        self._async_ep_participant_this_step = None
         pending_forward_reusable = True
         pending_forward_row_mapped = False
         has_pending_forward = self._has_pending_async_forward_state()
@@ -1817,14 +1858,16 @@ class TextGenerationController:
             begin_step = getattr(self._ep_async_protocol, "begin_step", None)
             if begin_step is None:
                 begin_step = self._ep_async_protocol.decide_step_begin
-            return begin_step(
+            decision = begin_step(
                 has_real_work=has_real_work,
                 has_pending_forward=has_pending_forward,
                 pending_forward_reusable=pending_forward_reusable,
                 pending_forward_row_mapped=pending_forward_row_mapped,
             )
+            self._record_ep_step_begin_decision(decision)
+            return decision
 
-        return EPStepBeginDecision(
+        decision = EPStepBeginDecision(
             step_id=-1,
             has_real_work=has_real_work,
             reuse_pending_forward=bool(has_pending_forward and pending_forward_reusable),
@@ -1833,6 +1876,8 @@ class TextGenerationController:
             ),
             row_mapped_forward=bool(has_pending_forward and pending_forward_row_mapped),
         )
+        self._record_ep_step_begin_decision(decision)
+        return decision
 
     def _decide_ep_async_handoff(
         self, *, has_real_work: bool, can_launch_async_handoff: bool
@@ -1850,6 +1895,7 @@ class TextGenerationController:
                 has_real_work=has_real_work, can_launch_async_handoff=can_launch_async_handoff
             )
             self._ep_async_handoff_decision_this_step = decision
+            self._record_ep_handoff_decision(decision)
             return decision
 
         decision = EPAsyncHandoffDecision(
@@ -1861,6 +1907,7 @@ class TextGenerationController:
             any_skip_request=not can_launch_async_handoff,
         )
         self._ep_async_handoff_decision_this_step = decision
+        self._record_ep_handoff_decision(decision)
         return decision
 
     def _ensure_ep_async_handoff_decided(self, *, has_real_work: bool) -> None:

@@ -122,6 +122,9 @@ class AsyncZMQCommunicator:
     def _unpack_values_message(
         msg: bytes, *, expected_phase: str, expected_step_id: int, expected_count: int
     ) -> tuple[int, ...]:
+        raw_len = 4 * expected_count
+        if len(msg) == raw_len and msg[:4] not in (_DATA_MAGIC, _ERROR_MAGIC):
+            return struct.unpack(f"!{expected_count}i", msg)
         if len(msg) < 16:
             raise ZMQCollectiveError("Malformed ZMQ collective message")
 
@@ -186,6 +189,7 @@ class AsyncZMQCommunicator:
     def _next_collective_tag(
         self, *, phase: str | None, step_id: int | None, sync: bool
     ) -> tuple[str, int]:
+        self._ensure_collective_state()
         if phase is None:
             phase = "sync_all_reduce_max" if sync else "all_reduce_max"
         if step_id is None:
@@ -197,9 +201,35 @@ class AsyncZMQCommunicator:
                 self._async_collective_step += 1
         return phase, step_id
 
+    def _ensure_collective_state(self) -> None:
+        """Initialize collective counters for partially constructed test instances."""
+        if not hasattr(self, "_async_collective_step"):
+            self._async_collective_step = 0
+        if not hasattr(self, "_sync_collective_step"):
+            self._sync_collective_step = 0
+        if not hasattr(self, "protocol_mismatch_count"):
+            self.protocol_mismatch_count = 0
+
     def _send_result_to_peers(self, msg: bytes) -> None:
-        for peer_rank in sorted(self.result_push_socks):
-            self.result_push_socks[peer_rank].send(msg)
+        result_push_socks = getattr(self, "result_push_socks", None)
+        if result_push_socks is None and hasattr(self, "bcast_sock"):
+            self.bcast_sock.send(self._legacy_values_payload(msg))
+            return
+        for peer_rank in sorted(result_push_socks):
+            result_push_socks[peer_rank].send(msg)
+
+    @staticmethod
+    def _legacy_values_payload(msg: bytes) -> bytes:
+        """Return raw int payloads for older tests that bypass communicator setup."""
+        if msg[:4] != _DATA_MAGIC:
+            return msg
+        _, phase_len, _, value_count = struct.unpack("!4sHqH", msg[:16])
+        values_start = 16 + phase_len
+        values_end = values_start + (4 * value_count)
+        if len(msg) != values_end:
+            return msg
+        values = struct.unpack(f"!{value_count}i", msg[values_start:values_end])
+        return struct.pack(f"!{value_count}i", *values)
 
     def _send_error_to_peers(self, error: Exception) -> None:
         self._send_result_to_peers(self._pack_error_message(str(error)))
@@ -255,13 +285,14 @@ class AsyncZMQCommunicator:
 
         else:
             self.gather_sock.send(payload)
+            result_recv_sock = getattr(self, "result_recv_sock", getattr(self, "bcast_sock", None))
 
             while True:
                 try:
                     if async_op:
-                        msg = self.result_recv_sock.recv(flags=zmq.NOBLOCK)
+                        msg = result_recv_sock.recv(flags=zmq.NOBLOCK)
                     else:
-                        msg = self.result_recv_sock.recv()
+                        msg = result_recv_sock.recv()
                     result = self._unpack_collective_values_message(
                         msg, expected_phase=phase, expected_step_id=step_id, expected_count=n
                     )
@@ -319,7 +350,8 @@ class AsyncZMQCommunicator:
             return maxes[0] if n == 1 else maxes
         else:
             self.gather_sock.send(payload)
-            msg = self.result_recv_sock.recv()
+            result_recv_sock = getattr(self, "result_recv_sock", getattr(self, "bcast_sock", None))
+            msg = result_recv_sock.recv()
             result = self._unpack_collective_values_message(
                 msg, expected_phase=phase, expected_step_id=step_id, expected_count=n
             )

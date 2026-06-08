@@ -10,6 +10,7 @@ from megatron.core import utils as core_utils
 from megatron.core.inference.async_transaction import (
     AsyncDecodePlan,
     AsyncDecodeTransaction,
+    AsyncEPParticipant,
     AsyncGraphShape,
     AsyncLayoutSnapshot,
     AsyncLogprobMTPParticipant,
@@ -1077,6 +1078,81 @@ def test_controller_step_begin_bridges_local_and_ep_protocol_decisions(
             decision.discard_pending_forward,
             decision.row_mapped_forward,
         ) == expected
+
+
+@pytest.mark.internal
+def test_controller_step_begin_records_ep_decision_on_transaction_participant():
+    controller = object.__new__(TextGenerationController)
+    controller._ep_async_protocol = None
+    controller._ep_async_handoff_decided_this_step = True
+    controller._ep_async_handoff_decision_this_step = object()
+    transaction = _install_pending_transaction(
+        controller, _make_async_layout_snapshot([10, 11], cuda_graph_request_count=2)
+    )
+    controller._pending_async_forward_row_status = lambda: (True, True)
+
+    decision = controller._decide_ep_step_begin(has_real_work=True)
+
+    participant = next(
+        participant
+        for participant in transaction.participants
+        if isinstance(participant, AsyncEPParticipant)
+    )
+    diagnostics = participant.diagnostics()
+    assert decision.row_mapped_forward
+    assert diagnostics["prepared"]
+    assert diagnostics["step_begin"] == {
+        "step_id": -1,
+        "has_real_work": True,
+        "reuse_pending_forward": True,
+        "discard_pending_forward": False,
+        "row_mapped_forward": True,
+    }
+
+
+@pytest.mark.internal
+def test_controller_ep_handoff_participant_attaches_to_launch_transaction():
+    controller = object.__new__(TextGenerationController)
+    controller._ep_async_protocol = None
+    controller._ep_async_handoff_decided_this_step = False
+    controller._ep_async_handoff_decision_this_step = None
+    controller.num_speculative_tokens = 0
+    controller._async_logprob_requests_seen = False
+    controller.inference_wrapped_model = SimpleNamespace(
+        inference_context=SimpleNamespace(is_hybrid_model=False)
+    )
+    snapshot = _make_async_layout_snapshot([30], cuda_graph_request_count=1)
+    transaction = AsyncDecodeTransaction(
+        step_id=8,
+        state=AsyncTxnState.PREPARED,
+        snapshot=snapshot,
+        plan=AsyncDecodePlan.from_snapshot(snapshot),
+    )
+
+    handoff = controller._decide_ep_async_handoff(
+        has_real_work=True, can_launch_async_handoff=True
+    )
+    controller._attach_async_transaction_participants(
+        transaction, resources=None, sample_ticket=None
+    )
+
+    participant = next(
+        participant
+        for participant in transaction.participants
+        if isinstance(participant, AsyncEPParticipant)
+    )
+    assert handoff.launch_async_forward
+    assert controller._async_ep_participant_this_step is None
+    assert transaction.participant_state["AsyncEPParticipant"]["handoff"] == {
+        "step_id": -1,
+        "has_real_work": True,
+        "launch_async_forward": True,
+        "skip_async_forward": False,
+        "any_launch_request": True,
+        "any_skip_request": False,
+    }
+    transaction.rollback("handoff invalidated")
+    assert participant.diagnostics()["rolled_back"]
 
 
 def _make_async_gate_controller(active_request_count=2):
