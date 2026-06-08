@@ -60,10 +60,7 @@ _BASE_HYBRID = dict(
 # Overrides that turn a dense GPT preset into a MoE one. Applied automatically
 # by tests when the chosen parallelism dict sets EP > 1.
 _MOE_OVERRIDES = dict(
-    num_moe_experts=4,
-    moe_router_topk=2,
-    moe_grouped_gemm=True,
-    add_bias_linear=False,
+    num_moe_experts=4, moe_router_topk=2, moe_grouped_gemm=True, add_bias_linear=False
 )
 
 
@@ -123,7 +120,7 @@ GPT_CONFIGS = [
 HYBRID_CONFIGS = [
     # mamba-attn-mlp covers Mamba + attention + MLP paths. pure-mamba is
     # dropped (Mamba path alone is already exercised here).
-    pytest.param("M*-", {}, id="mamba-attn-mlp"),
+    pytest.param("M*-", {}, id="mamba-attn-mlp")
 ]
 
 

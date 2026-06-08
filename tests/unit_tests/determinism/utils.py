@@ -52,11 +52,13 @@ def cuda_timer(name: str = "cuda_timer"):
         timer.stop()
         box.elapsed_ms = timer.elapsed(reset=False) * 1000.0
 
+
 try:
     # Public-by-import helper used by PyTorch's own test_cuda.py to convert
     # milliseconds to device-cycle counts for torch.cuda._sleep.
     from torch.testing._internal.common_utils import get_cycles_per_ms
 except ImportError:  # pragma: no cover — fallback only if PyTorch internals move
+
     def get_cycles_per_ms() -> float:
         # Rough lower bound: H100 boosts to ~1.8 GHz → ~1.8M cycles/ms. Picking
         # 1M is conservative — the jitter will be a bit shorter than requested,
@@ -236,11 +238,7 @@ class RacingStreams:
     _BASE_SEED = 0xC0FFEE
 
     def __init__(self, num_streams: int = 4, num_iters: int = 200):
-        rank = (
-            torch.distributed.get_rank()
-            if torch.distributed.is_initialized()
-            else 0
-        )
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         self.num_streams = num_streams + (rank % self._RANK_STREAM_CYCLE)
         self.num_iters = num_iters
         self._gen = torch.Generator()
@@ -257,9 +255,7 @@ class RacingStreams:
             with torch.cuda.stream(stream):
                 # One randint call instead of num_iters calls.
                 size_indices = torch.randint(
-                    0, len(self._SIZE_CHOICES),
-                    (self.num_iters,),
-                    generator=self._gen,
+                    0, len(self._SIZE_CHOICES), (self.num_iters,), generator=self._gen
                 ).tolist()
                 # Keep only the last matmul result alive — earlier ones get
                 # GC'd (PyTorch's caching allocator preserves storage while
@@ -298,23 +294,14 @@ class CudaSleepJitter:
     manager around each run rather than reusing one across runs.
     """
 
-    def __init__(
-        self,
-        module: torch.nn.Module,
-        max_us_per_hook: int = 200,
-        seed: int = 0xCAFE,
-    ):
+    def __init__(self, module: torch.nn.Module, max_us_per_hook: int = 200, seed: int = 0xCAFE):
         self._module = module
         self._max_us = max_us_per_hook
         self._seed = seed
         self._handles: list = []
 
     def __enter__(self):
-        rank = (
-            torch.distributed.get_rank()
-            if torch.distributed.is_initialized()
-            else 0
-        )
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         gen = torch.Generator()
         gen.manual_seed(self._seed + rank)
 
@@ -365,10 +352,7 @@ def maybe_fsdp_wrap(model: torch.nn.Module, parallelism: dict) -> torch.nn.Modul
     )
     config = getattr(model, "config", None)
     return FullyShardedDataParallel(
-        config=config,
-        ddp_config=ddp_config,
-        module=model,
-        pg_collection=pg_collection,
+        config=config, ddp_config=ddp_config, module=model, pg_collection=pg_collection
     )
 
 
