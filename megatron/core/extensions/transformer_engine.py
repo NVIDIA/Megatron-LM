@@ -2816,7 +2816,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 name=name,
             )
 
-    class TEFusedDenseMLP(TEFusedMLP):
+    class TEFusedMLPWithGroupedLinear(TEFusedMLP):
         """Dense MLP using GroupedLinear(num_groups=1) to trigger
         ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8 fusion on SM100+ with MXFP8 recipe.
 
@@ -2974,7 +2974,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             recipe = self._recipe
 
             if self._fused_impl is None:
-                with te.pytorch.fp8_autocast(enabled=True, fp8_recipe=recipe):
+                with te.pytorch.quantized_model_init(enabled=True, recipe=recipe):
                     self._fused_impl = (self._make_fused_impl(),)
 
             # Apply norm in BF16 OUTSIDE the MXFP8 autocast to preserve the rstd
@@ -2982,7 +2982,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             # gradient amplification, and causes convergence issues).
             normed = self._norm_seq[0](hidden_states_2d)
 
-            with te.pytorch.fp8_autocast(enabled=True, fp8_recipe=recipe):
+            with te.pytorch.autocast(enabled=True, recipe=recipe):
                 out = self._fused_impl[0](normed, tokens_per_expert, scales, tokens_per_expert)
 
             out = out.view(*orig_shape[:-1], out.size(-1))
@@ -2995,11 +2995,9 @@ if HAVE_TE and is_te_min_version("1.13.0"):
 
             return out, bias
 
-    # ``TEFusedMLPWithGroupedLinear`` is the name introduced on main for this
-    # class; ``TEFusedDenseMLP`` is the original dev name. Keep both importable
-    # so callers (e.g. gpt_layer_specs.py) that reference either name resolve to
-    # the same class.
-    TEFusedMLPWithGroupedLinear = TEFusedDenseMLP
+    # ``TEFusedDenseMLP`` is the original dev name for the main-side
+    # ``TEFusedMLPWithGroupedLinear`` class. Keep it importable for dev callers.
+    TEFusedDenseMLP = TEFusedMLPWithGroupedLinear
 
 else:
     TEFusedMLP = None  # type: ignore[assignment, misc]

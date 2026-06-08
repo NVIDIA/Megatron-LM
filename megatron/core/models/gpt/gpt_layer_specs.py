@@ -48,20 +48,13 @@ from megatron.core.utils import is_te_min_version
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
-        TEFusedDenseMLP,
         TEFusedMLP,
         TEFusedMLPWithGroupedLinear,
         TENorm,
     )
     from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 else:
-    TEFusedDenseMLP, TEFusedMLP, TEFusedMLPWithGroupedLinear, TENorm, TESpecProvider = (
-        None,
-        None,
-        None,
-        None,
-        None,
-    )
+    TEFusedMLP, TEFusedMLPWithGroupedLinear, TENorm, TESpecProvider = (None, None, None, None)
 
 try:
     from megatron.core.extensions.kitchen import HAVE_KITCHEN, KitchenSpecProvider
@@ -569,13 +562,9 @@ def get_mlp_module_spec_for_backend(
     if num_experts is None:
         # Dense MLP w/ or w/o TE modules.
         # `dense_grouped_gemm` (dev) and `use_grouped_gemm_for_dense_mlp` (main) both request
-        # the grouped-GEMM dense MLP fusion (SM100+ / MXFP8). They select equivalent TE modules
-        # (TEFusedDenseMLP / TEFusedMLPWithGroupedLinear); both names are retained for backward
-        # compatibility with dev- and main-side callers and their respective unit tests.
-        if use_grouped_gemm_for_dense_mlp and use_te_op_fuser:
+        # the grouped-GEMM dense MLP fusion (SM100+ / MXFP8).
+        if (dense_grouped_gemm or use_grouped_gemm_for_dense_mlp) and use_te_op_fuser:
             module = not_none(TEFusedMLPWithGroupedLinear).as_mlp_submodule
-        elif dense_grouped_gemm and use_te_op_fuser:
-            module = not_none(TEFusedDenseMLP).as_mlp_submodule
         elif use_te_op_fuser:
             module = not_none(TEFusedMLP).as_mlp_submodule
         else:

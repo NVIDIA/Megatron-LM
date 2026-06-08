@@ -529,7 +529,8 @@ class MTPLossLoggingHelper:
             mtp_corrects = tracker["correct_values"]
             mtp_totals = tracker["total_values"]
 
-            # Process-local logging state; cumulative rates intentionally reset after restart/resume.
+            # Process-local logging state; cumulative rates intentionally
+            # reset after restart/resume.
             if (
                 "cumulative_correct_values" not in tracker
                 or tracker["cumulative_correct_values"].shape != mtp_corrects.shape

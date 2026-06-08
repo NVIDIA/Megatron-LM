@@ -1916,6 +1916,19 @@ def get_model(
             if args.use_megatron_fsdp:
                 dp_init_kwargs["pg_collection"] = pg_collection
 
+            compute_param_layout = None
+            if DP is DDP:
+                use_layer_wise_param_layout = getattr(args, "use_layer_wise_param_layout", False)
+                use_layer_wise_distributed_optimizer = getattr(
+                    args, "use_layer_wise_distributed_optimizer", False
+                )
+                if use_layer_wise_distributed_optimizer and use_layer_wise_param_layout:
+                    ddp_config.use_distributed_optimizer = True
+                    tag_params_for_buffer_routing(model)
+                    compute_param_layout = LayerWiseDistributedOptimizer.compute_full_param_layout
+                elif getattr(args, "use_distributed_optimizer", False):
+                    compute_param_layout = DistributedOptimizer.compute_full_param_layout
+
             wrapped_model = []
             for model_chunk_idx, model_chunk in enumerate(model):
                 chunk_kwargs = dict(dp_init_kwargs)
@@ -1923,24 +1936,20 @@ def get_model(
                     model_chunk_idx > 0
                 ) or args.overlap_param_gather_with_optimizer_step
 
-                # Pre-compute parameter layouts for the distributed optimizer.
+                # Pre-compute parameter layouts for DDP-backed optimizer sharding.
                 # Only pass to DDP; FSDP variants don't accept full_param_layout.
-                if args.use_distributed_optimizer and DP is DDP:
+                if compute_param_layout is not None:
                     all_params = [p for p in model_chunk.parameters() if p.requires_grad]
                     pp_rank = mpu.get_pipeline_model_parallel_rank()
                     effective_bucket_size = (
                         None if disable_bucketing or pp_rank > 0 else ddp_config.bucket_size
                     )
-                    chunk_kwargs["full_param_layout"] = (
-                        DistributedOptimizer.compute_full_param_layout(
-                            all_params,
-                            effective_bucket_size,
-                            mpu.get_data_parallel_world_size(with_context_parallel=True),
-                            ddp_config,
-                            expert_data_parallel_world_size=(
-                                mpu.get_expert_data_parallel_world_size()
-                            ),
-                        )
+                    chunk_kwargs["full_param_layout"] = compute_param_layout(
+                        all_params,
+                        effective_bucket_size,
+                        mpu.get_data_parallel_world_size(with_context_parallel=True),
+                        ddp_config,
+                        expert_data_parallel_world_size=(mpu.get_expert_data_parallel_world_size()),
                     )
 
                 wrapped_model.append(
@@ -2058,6 +2067,10 @@ def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallel
     kwargs["megatron_fsdp_main_grads_dtype"] = args.megatron_fsdp_main_grads_dtype
     kwargs["megatron_fsdp_grad_comm_dtype"] = args.megatron_fsdp_grad_comm_dtype
     kwargs["megatron_fsdp_use_decoupled_grad"] = args.use_precision_aware_optimizer
+    if args.use_megatron_fsdp and args.cuda_graph_impl != "none":
+        kwargs["megatron_fsdp_cuda_graph_mode"] = True
+        if args.cuda_graph_impl == "full_iteration":
+            kwargs["fsdp_all_gather_in_start_param_sync"] = False
 
     return DistributedDataParallelConfig(**kwargs)
 

@@ -1575,6 +1575,12 @@ def validate_args(args, defaults={}):
             total_cp_ranks = args.context_parallel_size
         else:
             total_cp_ranks = args.data_parallel_size * args.context_parallel_size
+        if args.max_seqlen_per_dp_cp_rank is None:
+            args.max_seqlen_per_dp_cp_rank = getattr(args, "max_seqlen_per_cp_rank", None)
+        if args.max_seqlen_per_dp_cp_rank is None:
+            args.max_seqlen_per_dp_cp_rank = (
+                args.seq_length + total_cp_ranks - 1
+            ) // total_cp_ranks
         assert total_cp_ranks * args.max_seqlen_per_dp_cp_rank >= args.seq_length, (
             f'Packed sequence buffer size ({total_cp_ranks * args.max_seqlen_per_dp_cp_rank}) '
             f'must be >= single sequence max length ({args.seq_length})'

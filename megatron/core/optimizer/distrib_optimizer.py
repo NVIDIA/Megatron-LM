@@ -8,7 +8,7 @@ import logging
 from collections import ChainMap
 from dataclasses import replace
 from logging import getLogger
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import torch
 import torch.nn.functional
@@ -253,6 +253,26 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 cls._build_model_gbuf_range(param_and_grad_buffer, bucket_index)
                 for bucket_index in range(len(param_and_grad_buffer.buckets))
             ]
+        }
+
+    @classmethod
+    def _filter_gbuf_range_map(
+        cls, gbuf_range_map: Dict, optimizer_params: Set[torch.nn.Parameter]
+    ) -> Dict:
+        """Filter grad-buffer range maps to the params owned by this optimizer instance."""
+        return {
+            dtype: [
+                {
+                    **range_map,
+                    "param_map": {
+                        param: param_range
+                        for param, param_range in range_map["param_map"].items()
+                        if param in optimizer_params
+                    },
+                }
+                for range_map in range_maps
+            ]
+            for dtype, range_maps in gbuf_range_map.items()
         }
 
     @classmethod
@@ -702,6 +722,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for model_idx, buffers in self.per_model_buffers.items():
             self.per_model_bucket_groups[model_idx] = partition_buckets(buffers)
 
+        optimizer_params = {
+            param for param_group in self.optimizer.param_groups for param in param_group['params']
+        }
         self.gbuf_ranges = []
         self.per_bucket_numel = []
         self.per_bucket_numel_unpadded = []
@@ -721,7 +744,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     ]
                 }
             )
-            self.gbuf_ranges.append(self._build_gbuf_range_map(buffer))
+            self.gbuf_ranges.append(
+                self._filter_gbuf_range_map(self._build_gbuf_range_map(buffer), optimizer_params)
+            )
         self.model_param_gbuf_map = self._build_model_param_gbuf_map(self.gbuf_ranges)
 
         # Add main_param field to each parameter. We will use this fp32 copy to compute

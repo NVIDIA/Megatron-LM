@@ -441,12 +441,22 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 "Consider migrating the `mlp` submodule spec to a direct call of the "
                 "`as_mlp_submodule` classmethod instead.",
             )
-        self.mlp = submodules.mlp(
-            config=self.config,
-            pg_collection=pg_collection,
-            is_mtp_layer=self.is_mtp_layer,
-            name=(name + ".mlp") if name is not None else None,
-        )
+        try:
+            self.mlp = submodules.mlp(
+                config=self.config,
+                pg_collection=pg_collection,
+                is_mtp_layer=self.is_mtp_layer,
+                layer_number=self.layer_number,
+                name=(name + ".mlp") if name is not None else None,
+            )
+        except TypeError:
+            # Fallback for MLP builders that don't accept layer_number (dense MLP, TEFusedMLP).
+            self.mlp = submodules.mlp(
+                config=self.config,
+                pg_collection=pg_collection,
+                is_mtp_layer=self.is_mtp_layer,
+                name=(name + ".mlp") if name is not None else None,
+            )
         if hasattr(self.mlp, 'set_layer_number'):
             self.mlp.set_layer_number(self.layer_number)
 
