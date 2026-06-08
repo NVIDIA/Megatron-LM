@@ -281,10 +281,13 @@ def _allgather_tp_shards(tensor: torch.Tensor, ps: ParallelState) -> list[torch.
 
 
 class Qwen35WeightSpec:
-    """Export Qwen35 lite weights to names accepted by vLLM's Qwen3.5 loader."""
+    """Export Qwen35 lite weights to HF checkpoint or vLLM runtime names."""
 
-    def __init__(self, config: Qwen35Config):
+    def __init__(self, config: Qwen35Config, target: str = "hf"):
+        if target not in {"hf", "vllm"}:
+            raise ValueError(f"Unsupported Qwen3.5 export target: {target!r}")
         self.config = config
+        self.target = target
         self._expert_export_buffers: dict[tuple[int, str], dict[int, torch.Tensor]] = {}
 
     @property
@@ -311,6 +314,9 @@ class Qwen35WeightSpec:
         return None
 
     def native_to_hf(self, native_name: str, tensor: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
+        if self.target == "vllm":
+            return self._native_to_vllm(native_name, tensor)
+
         if native_name == "embed.embedding.weight":
             return [("model.language_model.embed_tokens.weight", tensor)]
         if native_name == "norm.weight":
@@ -396,6 +402,93 @@ class Qwen35WeightSpec:
             if kind == "1":
                 return [(f"{prefix}.mlp.experts.gate_up_proj", packed)]
             return [(f"{prefix}.mlp.experts.down_proj", packed)]
+
+        return []
+
+    def _native_to_vllm(self, native_name: str, tensor: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
+        if native_name == "embed.embedding.weight":
+            return [("language_model.model.embed_tokens.weight", tensor)]
+        if native_name == "norm.weight":
+            return [("language_model.model.norm.weight", tensor)]
+        if native_name == "head.col.linear.weight":
+            return [("language_model.lm_head.weight", tensor)]
+        if native_name == "mtp_embed.embedding.weight" or native_name.startswith("mtp."):
+            return []
+
+        match = re.match(r"layers\.(\d+)\.(.*)", native_name)
+        if match is None:
+            return []
+
+        layer_idx = int(match.group(1))
+        suffix = match.group(2)
+        prefix = f"language_model.model.layers.{layer_idx}"
+
+        if suffix == "full_attn.qkv.linear.layer_norm_weight":
+            return [(f"{prefix}.input_layernorm.weight", tensor)]
+        if suffix == "full_attn.qkv.linear.weight":
+            q_gate, key, value = _unmerge_full_attn_qkvg(tensor, cfg=self.config)
+            return [
+                (f"{prefix}.self_attn.q_proj.weight", q_gate),
+                (f"{prefix}.self_attn.k_proj.weight", key),
+                (f"{prefix}.self_attn.v_proj.weight", value),
+            ]
+        if suffix == "full_attn.q_norm.weight":
+            return [(f"{prefix}.self_attn.q_norm.weight", tensor)]
+        if suffix == "full_attn.k_norm.weight":
+            return [(f"{prefix}.self_attn.k_norm.weight", tensor)]
+        if suffix == "full_attn.proj.linear.weight":
+            return [(f"{prefix}.self_attn.o_proj.weight", tensor)]
+
+        if suffix == "linear_attn.in_proj.linear.layer_norm_weight":
+            return [(f"{prefix}.input_layernorm.weight", tensor)]
+        if suffix == "linear_attn.in_proj.linear.weight":
+            q, k, value, z, b, a = _split_linear_attn_in_proj(tensor, cfg=self.config)
+            return [
+                (
+                    f"{prefix}.linear_attn.in_proj_qkv.weight",
+                    torch.cat([q, k, value], dim=0).contiguous(),
+                ),
+                (f"{prefix}.linear_attn.in_proj_z.weight", z.contiguous()),
+                (f"{prefix}.linear_attn.in_proj_b.weight", b.contiguous()),
+                (f"{prefix}.linear_attn.in_proj_a.weight", a.contiguous()),
+            ]
+        if suffix == "linear_attn.conv1d.weight":
+            return [(f"{prefix}.linear_attn.conv1d.weight", tensor)]
+        if suffix == "linear_attn.dt_bias":
+            return [(f"{prefix}.linear_attn.dt_bias", tensor)]
+        if suffix == "linear_attn.A_log":
+            return [(f"{prefix}.linear_attn.A_log", tensor)]
+        if suffix == "linear_attn.norm.weight":
+            return [(f"{prefix}.linear_attn.norm.weight", tensor + 1)]
+        if suffix == "linear_attn.o_proj.linear.weight":
+            return [(f"{prefix}.linear_attn.out_proj.weight", tensor)]
+
+        if suffix == "mlp_norm.weight":
+            return [(f"{prefix}.post_attention_layernorm.weight", tensor)]
+        if suffix == "moe.router.gate.weight":
+            return [(f"{prefix}.mlp.gate.weight", tensor)]
+        if suffix == "moe.shared_expert.gate_up.linear.weight":
+            gate, up = tensor.chunk(2, dim=0)
+            return [
+                (f"{prefix}.mlp.shared_expert.gate_proj.weight", gate.contiguous()),
+                (f"{prefix}.mlp.shared_expert.up_proj.weight", up.contiguous()),
+            ]
+        if suffix == "moe.shared_expert.down.linear.weight":
+            return [(f"{prefix}.mlp.shared_expert.down_proj.weight", tensor)]
+        if suffix == "moe.shared_expert.shared_gate.weight":
+            return [(f"{prefix}.mlp.shared_expert_gate.weight", tensor)]
+
+        expert_match = re.fullmatch(r"moe\.experts\.fc([12])\.weight(\d+)", suffix)
+        if expert_match is not None:
+            kind, expert_idx = expert_match.groups()
+            expert_prefix = f"{prefix}.mlp.experts.{expert_idx}"
+            if kind == "1":
+                gate, up = tensor.chunk(2, dim=0)
+                return [
+                    (f"{expert_prefix}.gate_proj.weight", gate.contiguous()),
+                    (f"{expert_prefix}.up_proj.weight", up.contiguous()),
+                ]
+            return [(f"{expert_prefix}.down_proj.weight", tensor)]
 
         return []
 
@@ -657,9 +750,10 @@ def export_hf_weights(
 
     include_mtp_only = kwargs.pop("include_mtp_only", False)
     kwargs.pop("include_local_prefixes", None)
+    target = kwargs.pop("target", "hf")
     if include_mtp_only:
         return
-    yield from _export(model, Qwen35WeightSpec(config), ps, vocab_size=config.vocab_size, **kwargs)
+    yield from _export(model, Qwen35WeightSpec(config, target=target), ps, vocab_size=config.vocab_size, **kwargs)
 
 
 __all__ = [
