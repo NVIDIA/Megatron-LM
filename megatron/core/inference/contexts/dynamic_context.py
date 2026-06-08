@@ -5,7 +5,6 @@ import math
 import operator
 import warnings
 from contextlib import nullcontext
-from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch  # type: ignore
@@ -13,7 +12,7 @@ import torch.nn.functional as F  # type: ignore
 from torch import Tensor  # type: ignore
 
 from megatron.core import parallel_state
-from megatron.core.inference.async_transaction import AsyncResourceLedger
+from megatron.core.inference.async_transaction import AsyncDecodePlan, AsyncResourceLedger
 from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
     InferenceBatchDimensions,
@@ -214,26 +213,7 @@ class ContextErrorFactory:
         return error
 
 
-@dataclass
-class AsyncDecodeLifecyclePlan:
-    """Planned post-bookkeeping layout for a speculative decode forward."""
-
-    request_ids: Tensor
-    source_request_idxs: Tensor
-    query_lengths: Tensor
-    kv_length_offsets: Tensor
-    request_to_kv_block_ids: Tensor
-    token_to_pos_ids: Tensor
-    token_to_request_idx: Tensor
-    token_to_position_in_request: Tensor
-    token_to_local_position_within_kv_block: Tensor
-    token_to_block_idx: Tensor
-    reserved_request_ids: Tensor
-    reserved_block_ids: Tensor
-    reserved_block_columns: Tensor
-    finished_request_ids: Tensor
-    active_request_count: int
-    active_token_count: int
+AsyncDecodeLifecyclePlan = AsyncDecodePlan
 
 
 def get_mem_size_str(n_bytes: int) -> str:
@@ -2773,6 +2753,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             finished_request_ids=finished_request_ids.clone(),
             active_request_count=planned_active_request_count,
             active_token_count=planned_active_request_count * tokens_per_request,
+            padded_active_request_count=self.padded_active_request_count,
+            tokens_per_request=tokens_per_request,
+            requires_mamba_state=self.is_hybrid_model,
+            requires_mtp=self.num_speculative_tokens > 0,
+            expected_kv_reservation_count=int(reserved_block_ids.numel()),
         )
 
     def clear_async_prepared_decode_plan(self) -> None:

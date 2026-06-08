@@ -8,12 +8,15 @@ import torch
 
 from megatron.core import utils as core_utils
 from megatron.core.inference.async_transaction import (
+    AsyncDecodePlan,
+    AsyncDecodeTransaction,
     AsyncGraphShape,
     AsyncLayoutSnapshot,
     AsyncResourceLedger,
     AsyncSampleReadback,
     AsyncSampleTicket,
     AsyncStepTransaction,
+    AsyncTransactionParticipant,
     AsyncTxnState,
     classify_async_eligibility,
 )
@@ -1520,7 +1523,23 @@ def test_async_transaction_and_resource_diagnostics_are_stable():
         row_map=torch.tensor([1, 0], dtype=torch.long),
     )
 
-    assert transaction.diagnostics() == {
+    diagnostics = transaction.diagnostics()
+    assert {
+        key: diagnostics[key]
+        for key in (
+            "step_id",
+            "state",
+            "request_ids",
+            "row_map",
+            "discard_reason",
+            "has_sample_ticket",
+            "has_resources",
+            "has_h2d_done_event",
+            "has_forward_done_event",
+            "has_ep_decision",
+            "participants",
+        )
+    } == {
         "step_id": 7,
         "state": "launched",
         "request_ids": [10, 11],
@@ -1531,7 +1550,10 @@ def test_async_transaction_and_resource_diagnostics_are_stable():
         "has_h2d_done_event": False,
         "has_forward_done_event": False,
         "has_ep_decision": False,
+        "participants": {},
     }
+    assert diagnostics["plan"]["request_ids"] == [10, 11]
+    assert diagnostics["plan"]["active_request_count"] == 2
     assert ledger.diagnostics() == {
         "in_flight": True,
         "reservations": 1,
@@ -1540,6 +1562,69 @@ def test_async_transaction_and_resource_diagnostics_are_stable():
         "mamba_leases": 0,
         "consumed_reservations": 0,
     }
+
+
+@pytest.mark.internal
+def test_async_decode_plan_and_transaction_participant_hooks_are_canonical():
+    events = []
+
+    class _Participant:
+        def diagnostics(self):
+            return {"events": list(events)}
+
+        def prepare(self, plan):
+            events.append(("prepare", plan.request_ids.tolist()))
+            return "prepared"
+
+        def validate(self, plan, current_state):
+            events.append(("validate", plan.active_request_count, current_state))
+            return True
+
+        def commit(self, plan):
+            events.append(("commit", plan.active_request_count))
+
+        def rollback(self, plan):
+            events.append(("rollback", plan.active_request_count))
+
+    participant = _Participant()
+    snapshot = _make_async_layout_snapshot([21, 22], cuda_graph_request_count=2)
+    plan = AsyncDecodePlan.from_snapshot(snapshot)
+    transaction = AsyncDecodeTransaction(
+        step_id=3,
+        state=AsyncTxnState.PLANNED,
+        snapshot=snapshot,
+        plan=plan,
+        participants=(participant,),
+    )
+
+    assert isinstance(participant, AsyncTransactionParticipant)
+    assert AsyncStepTransaction is AsyncDecodeTransaction
+    assert plan.graph_shape.padded_active_request_count == 2
+    assert plan.diagnostics()["request_ids"] == [21, 22]
+
+    transaction.prepare_participants()
+    assert transaction.participant_state == {"_Participant": "prepared"}
+    assert transaction.validate_participants("current")
+    transaction.mark_committed()
+
+    rollback_transaction = AsyncDecodeTransaction(
+        step_id=4,
+        state=AsyncTxnState.PREPARED,
+        snapshot=snapshot,
+        plan=plan,
+        participants=(participant,),
+    )
+    rollback_transaction.rollback("validation failed")
+
+    assert events == [
+        ("prepare", [21, 22]),
+        ("validate", 2, "current"),
+        ("commit", 2),
+        ("rollback", 2),
+    ]
+    assert transaction.state == AsyncTxnState.COMMITTED
+    assert rollback_transaction.state == AsyncTxnState.ROLLED_BACK
+    assert rollback_transaction.discard_reason == "validation failed"
 
 
 @pytest.mark.internal

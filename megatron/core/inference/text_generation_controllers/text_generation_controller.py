@@ -16,10 +16,10 @@ from torch.cuda.nvtx import range_pop, range_push
 from megatron.core import parallel_state
 from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.async_transaction import (
+    AsyncDecodeTransaction,
     AsyncLayoutSnapshot,
     AsyncSampleReadback,
     AsyncSampleTicket,
-    AsyncStepTransaction,
     AsyncTxnState,
     classify_async_eligibility,
 )
@@ -1548,7 +1548,7 @@ class TextGenerationController:
             ),
         }
 
-    def _pending_async_transaction(self) -> Optional[AsyncStepTransaction]:
+    def _pending_async_transaction(self) -> Optional[AsyncDecodeTransaction]:
         """Return the active async transaction, if one owns pending state."""
         transaction = getattr(self, "_async_step_transaction", None)
         if transaction is not None and transaction.is_in_flight:
@@ -1627,7 +1627,7 @@ class TextGenerationController:
 
     def _begin_async_step_transaction(
         self, cuda_graph_request_count: Optional[int]
-    ) -> AsyncStepTransaction:
+    ) -> AsyncDecodeTransaction:
         """Create the transaction that owns the just-launched speculative forward."""
         context = self.inference_wrapped_model.inference_context
         pending_request_ids = context.async_prepared_request_ids_cpu()
@@ -1640,7 +1640,7 @@ class TextGenerationController:
             tokens_per_request=self.num_speculative_tokens + 1,
         )
         transaction_step_id = getattr(self, "_async_transaction_next_step_id", 0)
-        transaction = AsyncStepTransaction(
+        transaction = AsyncDecodeTransaction(
             step_id=transaction_step_id,
             state=AsyncTxnState.PREPARED,
             snapshot=snapshot,
@@ -1650,7 +1650,7 @@ class TextGenerationController:
         context.clear_async_prepared_decode_plan()
         return transaction
 
-    def _pending_async_row_map(self, transaction: AsyncStepTransaction) -> Optional[Tensor]:
+    def _pending_async_row_map(self, transaction: AsyncDecodeTransaction) -> Optional[Tensor]:
         """Return the current-row to transaction-row map if the pending forward is reusable."""
         context = self.inference_wrapped_model.inference_context
         current_snapshot = AsyncLayoutSnapshot.from_context_current(

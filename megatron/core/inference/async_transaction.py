@@ -1,8 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 import torch
 from torch import Tensor
@@ -11,10 +11,13 @@ from torch import Tensor
 class AsyncTxnState(Enum):
     """Lifecycle states for one async decode transaction."""
 
+    IDLE = "idle"
+    PLANNED = "planned"
     PREPARED = "prepared"
     LAUNCHED = "launched"
     RESOLVED = "resolved"
     COMMITTED = "committed"
+    ROLLED_BACK = "rolled_back"
     RETIRED = "retired"
     DISCARDED = "discarded"
 
@@ -265,6 +268,156 @@ class AsyncLayoutSnapshot:
         return True
 
 
+@dataclass(frozen=True)
+class AsyncDecodePlan:
+    """Canonical immutable description of one candidate async decode step."""
+
+    request_ids: Tensor
+    source_request_idxs: Tensor
+    query_lengths: Tensor
+    kv_length_offsets: Tensor
+    request_to_kv_block_ids: Tensor
+    token_to_pos_ids: Tensor
+    token_to_request_idx: Tensor
+    token_to_position_in_request: Tensor
+    token_to_local_position_within_kv_block: Tensor
+    token_to_block_idx: Tensor
+    reserved_request_ids: Tensor
+    reserved_block_ids: Tensor
+    reserved_block_columns: Tensor
+    finished_request_ids: Tensor
+    active_request_count: int
+    active_token_count: int
+    padded_active_request_count: int | None = None
+    tokens_per_request: int = 1
+    layout_snapshot: AsyncLayoutSnapshot | None = None
+    row_map: Tensor | None = None
+    row_mapped: bool = False
+    graph_compatible: bool = True
+    layout_compatible: bool = True
+    eligibility: object | None = None
+    ep_decision: object | None = None
+    requires_mamba_state: bool = False
+    requires_mtp: bool = False
+    requires_logprobs: bool = False
+    expected_kv_reservation_count: int = 0
+    expected_mamba_lease_count: int = 0
+
+    @classmethod
+    def from_snapshot(cls, snapshot: AsyncLayoutSnapshot) -> "AsyncDecodePlan":
+        """Build a minimal canonical plan around an existing layout snapshot."""
+        request_count = int(snapshot.request_ids.numel())
+        tokens_per_request = snapshot.graph_shape.tokens_per_request
+        active_token_count = request_count * tokens_per_request
+        empty_int = torch.empty((0,), dtype=torch.int32, device="cpu")
+        return cls(
+            request_ids=snapshot.request_ids.clone(),
+            source_request_idxs=torch.arange(request_count, dtype=torch.long, device="cpu"),
+            query_lengths=torch.full(
+                (request_count,), tokens_per_request, dtype=torch.int32, device="cpu"
+            ),
+            kv_length_offsets=torch.empty((request_count,), dtype=torch.int32, device="cpu"),
+            request_to_kv_block_ids=torch.empty((request_count, 0), dtype=torch.int32, device="cpu"),
+            token_to_pos_ids=(
+                snapshot.token_to_pos_ids.reshape(-1).clone()
+                if snapshot.token_to_pos_ids is not None
+                else torch.empty((active_token_count,), dtype=torch.int64, device="cpu")
+            ),
+            token_to_request_idx=(
+                snapshot.token_to_request_idx.reshape(-1).clone()
+                if snapshot.token_to_request_idx is not None
+                else torch.arange(request_count, dtype=torch.int32, device="cpu").repeat_interleave(
+                    tokens_per_request
+                )
+            ),
+            token_to_position_in_request=(
+                snapshot.token_to_pos_ids.reshape(-1).clone()
+                if snapshot.token_to_pos_ids is not None
+                else torch.empty((active_token_count,), dtype=torch.int64, device="cpu")
+            ),
+            token_to_local_position_within_kv_block=(
+                snapshot.token_to_local_position_within_kv_block.reshape(-1).clone()
+                if snapshot.token_to_local_position_within_kv_block is not None
+                else torch.empty((active_token_count,), dtype=torch.int32, device="cpu")
+            ),
+            token_to_block_idx=(
+                snapshot.token_to_block_idx.reshape(-1).clone()
+                if snapshot.token_to_block_idx is not None
+                else torch.empty((active_token_count,), dtype=torch.int32, device="cpu")
+            ),
+            reserved_request_ids=empty_int.clone(),
+            reserved_block_ids=empty_int.clone(),
+            reserved_block_columns=empty_int.clone(),
+            finished_request_ids=torch.empty((0,), dtype=snapshot.request_ids.dtype, device="cpu"),
+            active_request_count=request_count,
+            active_token_count=active_token_count,
+            padded_active_request_count=snapshot.graph_shape.padded_active_request_count,
+            tokens_per_request=tokens_per_request,
+            layout_snapshot=snapshot,
+            requires_mamba_state=(
+                snapshot.mamba_read_indices is not None or snapshot.mamba_write_indices is not None
+            ),
+        )
+
+    @property
+    def graph_shape(self) -> AsyncGraphShape:
+        """Return the CUDA graph shape owned by the plan."""
+        if self.layout_snapshot is not None:
+            return self.layout_snapshot.graph_shape
+        return AsyncGraphShape(
+            active_request_count=self.active_request_count,
+            active_token_count=self.active_token_count,
+            padded_active_request_count=self.padded_active_request_count,
+            tokens_per_request=self.tokens_per_request,
+        )
+
+    def diagnostics(self) -> dict[str, Any]:
+        """Return a cheap immutable-plan diagnostic snapshot."""
+        return {
+            "request_ids": self.request_ids.to(device="cpu").tolist(),
+            "active_request_count": self.active_request_count,
+            "active_token_count": self.active_token_count,
+            "padded_active_request_count": self.padded_active_request_count,
+            "tokens_per_request": self.tokens_per_request,
+            "row_map": None if self.row_map is None else self.row_map.to(device="cpu").tolist(),
+            "row_mapped": self.row_mapped,
+            "graph_compatible": self.graph_compatible,
+            "layout_compatible": self.layout_compatible,
+            "requires_mamba_state": self.requires_mamba_state,
+            "requires_mtp": self.requires_mtp,
+            "requires_logprobs": self.requires_logprobs,
+            "expected_kv_reservation_count": self.expected_kv_reservation_count,
+            "expected_mamba_lease_count": self.expected_mamba_lease_count,
+            "reserved_kv_blocks": int(self.reserved_block_ids.numel()),
+            "finished_requests": int(self.finished_request_ids.numel()),
+        }
+
+
+@runtime_checkable
+class AsyncTransactionParticipant(Protocol):
+    """Hook protocol for subsystems participating in async transaction lifecycle."""
+
+    def prepare(self, plan: AsyncDecodePlan) -> object | None:
+        """Prepare speculative state for ``plan``."""
+        ...
+
+    def validate(self, plan: AsyncDecodePlan, current_state: object) -> bool:
+        """Return whether prepared speculative state is still valid."""
+        ...
+
+    def commit(self, plan: AsyncDecodePlan) -> None:
+        """Commit prepared speculative side effects."""
+        ...
+
+    def rollback(self, plan: AsyncDecodePlan) -> None:
+        """Rollback prepared speculative side effects."""
+        ...
+
+    def diagnostics(self) -> dict[str, Any]:
+        """Return participant-local diagnostics."""
+        ...
+
+
 def _clone_optional(value: Tensor | None) -> Tensor | None:
     if value is None:
         return None
@@ -305,12 +458,13 @@ def _row_field_matches(planned: Tensor | None, current: Tensor | None, row_map: 
 
 
 @dataclass
-class AsyncStepTransaction:
+class AsyncDecodeTransaction:
     """Owns one speculative async decode forward and all state tied to it."""
 
     step_id: int
     state: AsyncTxnState
     snapshot: AsyncLayoutSnapshot
+    plan: AsyncDecodePlan | None = None
     sample_ticket: object | None = None
     resources: object | None = None
     h2d_done_event: object | None = None
@@ -318,6 +472,12 @@ class AsyncStepTransaction:
     ep_decision: object | None = None
     row_map: object | None = None
     discard_reason: str | None = None
+    participants: tuple[AsyncTransactionParticipant, ...] = ()
+    participant_state: dict[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.plan is None:
+            self.plan = AsyncDecodePlan.from_snapshot(self.snapshot)
 
     def mark_launched(
         self,
@@ -338,6 +498,35 @@ class AsyncStepTransaction:
         self.ep_decision = ep_decision if ep_decision is not None else self.ep_decision
         self.state = AsyncTxnState.LAUNCHED
 
+    def prepare_participants(self, plan: AsyncDecodePlan | None = None) -> None:
+        """Prepare all transaction participants for the plan."""
+        plan = self.plan if plan is None else plan
+        assert plan is not None
+        for participant in self.participants:
+            self.participant_state[type(participant).__name__] = participant.prepare(plan)
+
+    def validate_participants(
+        self, current_state: object, plan: AsyncDecodePlan | None = None
+    ) -> bool:
+        """Validate all prepared participants against current state."""
+        plan = self.plan if plan is None else plan
+        assert plan is not None
+        return all(participant.validate(plan, current_state) for participant in self.participants)
+
+    def commit_participants(self, plan: AsyncDecodePlan | None = None) -> None:
+        """Commit all participant-owned speculative side effects."""
+        plan = self.plan if plan is None else plan
+        assert plan is not None
+        for participant in self.participants:
+            participant.commit(plan)
+
+    def rollback_participants(self, plan: AsyncDecodePlan | None = None) -> None:
+        """Rollback all participant-owned speculative side effects."""
+        plan = self.plan if plan is None else plan
+        assert plan is not None
+        for participant in reversed(self.participants):
+            participant.rollback(plan)
+
     def resolve_against_current(self, context: object) -> Tensor | None:
         """Resolve this transaction's pending rows against the current context."""
         current = AsyncLayoutSnapshot.from_context_current(
@@ -356,11 +545,18 @@ class AsyncStepTransaction:
 
     def mark_committed(self) -> None:
         """Mark transaction-owned side effects as committed."""
+        self.commit_participants()
         self.state = AsyncTxnState.COMMITTED
 
     def mark_retired(self) -> None:
         """Mark the transaction as no longer owning in-flight state."""
         self.state = AsyncTxnState.RETIRED
+
+    def rollback(self, reason: str) -> None:
+        """Rollback the transaction and remember why it could not commit."""
+        self.discard_reason = reason
+        self.rollback_participants()
+        self.state = AsyncTxnState.ROLLED_BACK
 
     def discard(self, reason: str) -> None:
         """Discard the transaction and remember why it could not commit."""
@@ -385,12 +581,20 @@ class AsyncStepTransaction:
             "has_h2d_done_event": self.h2d_done_event is not None,
             "has_forward_done_event": self.forward_done_event is not None,
             "has_ep_decision": self.ep_decision is not None,
+            "plan": None if self.plan is None else self.plan.diagnostics(),
+            "participants": {
+                type(participant).__name__: participant.diagnostics()
+                for participant in self.participants
+            },
         }
 
     @property
     def is_in_flight(self) -> bool:
         """Whether the transaction still represents a pending async forward."""
         return self.state in (AsyncTxnState.PREPARED, AsyncTxnState.LAUNCHED, AsyncTxnState.RESOLVED)
+
+
+AsyncStepTransaction = AsyncDecodeTransaction
 
 
 @dataclass(frozen=True)
