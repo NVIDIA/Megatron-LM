@@ -1684,6 +1684,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 prefill_req_count=active_p + 1,
                 decode_req_count=active_d,
             )
+            # candidate.token_count == cg.token_count, so the token-dimension check inside
+            # is_applicable_for_batch_dim is always True here; this call filters on P/D compatibility only.
             if cg.is_applicable_for_batch_dim(candidate, strict=strict):
                 return chunk
 
@@ -1809,6 +1811,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Flash-attn guard: if this chunk would leave exactly 1 token for the
                 # final chunk, reduce by 1 (or defer if we only have 1 token of budget).
                 # See https://github.com/Dao-AILab/flash-attention/issues/1537
+                # The -1 is safe after CG snapping: is_applicable_for_batch_dim matches on
+                # cg.token_count >= real.token_count, so the snapped CG still covers token_count-1.
                 if remaining_len - prefill_chunk_length == 1:
                     if prefill_chunk_length > 1:
                         prefill_chunk_length -= 1
