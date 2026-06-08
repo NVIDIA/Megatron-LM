@@ -47,13 +47,9 @@ class _FakeOffloadGroup:
         self.recorded_reload = True
 
 
-def test_group_start_backward_consumes_current_noop_slot_before_reloading_next(
-    monkeypatch,
-):
+def test_group_start_backward_consumes_current_noop_slot_before_reloading_next(monkeypatch):
     """No-op reload slots should preserve cadence without delaying the next reload."""
-    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-        ChunkOffloadHandler,
-    )
+    from megatron.core.pipeline_parallel.fine_grained_activation_offload import ChunkOffloadHandler
 
     monkeypatch.setattr(torch.cuda, "current_stream", lambda: _FakeCudaStream())
     monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
@@ -481,18 +477,18 @@ def test_gpt_fine_grained_activation_offload_fraction_correctness_and_memory():
         return logits, grads, peak, expected_bytes
 
     def _assert_matches_base(label, logits, grads, base_logits, base_grads):
-        assert torch.allclose(logits, base_logits, rtol=1e-3, atol=1e-3), (
-            f"{label} logits mismatch: max_diff={torch.max(torch.abs(logits - base_logits))}"
-        )
+        assert torch.allclose(
+            logits, base_logits, rtol=1e-3, atol=1e-3
+        ), f"{label} logits mismatch: max_diff={torch.max(torch.abs(logits - base_logits))}"
         assert set(grads.keys()) == set(base_grads.keys())
         for name, gb in base_grads.items():
             go = grads[name]
             if gb is None or go is None:
                 assert gb is None and go is None, f"{label} grad None mismatch for {name}"
                 continue
-            assert torch.allclose(go, gb, rtol=1e-3, atol=1e-3), (
-                f"{label} grad mismatch for {name}: max_diff={torch.max(torch.abs(go - gb))}"
-            )
+            assert torch.allclose(
+                go, gb, rtol=1e-3, atol=1e-3
+            ), f"{label} grad mismatch for {name}: max_diff={torch.max(torch.abs(go - gb))}"
 
     try:
         base_logits, base_grads, base_peak, params = _run_baseline()

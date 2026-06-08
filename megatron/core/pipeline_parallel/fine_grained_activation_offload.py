@@ -1055,9 +1055,7 @@ class ChunkOffloadHandler:
         """Offload a group of tensors and optionally release their GPU memory."""
         debug_rank("----bulk_offload")
         group_to_offload = self.find_group_with_name(self._groups_to_offload, name)
-        assert (
-            group_to_offload is not None
-        ), f"Group {name} not found in {self._groups_to_offload}"
+        assert group_to_offload is not None, f"Group {name} not found in {self._groups_to_offload}"
         # Keep every group in the reload queue, including groups that are not
         # actually offloaded.  Non-offloaded groups become no-op reload slots,
         # preserving the backward clock when activation_offload_fraction < 1.
