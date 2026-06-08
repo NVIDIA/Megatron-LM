@@ -829,6 +829,7 @@ class TestNonStrictLoad:
             'ObjB': ShardedObject(
                 'ObjB', {Utils.rank + 7}, (1, Utils.world_size), (0, Utils.rank), replica_id=0
             ),
+            'common_state': {},
         }
 
     @pytest.mark.parametrize('validate_integrity', [True, False])
