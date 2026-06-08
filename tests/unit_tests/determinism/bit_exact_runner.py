@@ -197,8 +197,7 @@ class BitExactRunner:
         num_microbatches = pp
 
         self._two_runs(
-            chunks,
-            lambda: self._pipeline_fwd_bwd(chunks, num_microbatches=num_microbatches),
+            chunks, lambda: self._pipeline_fwd_bwd(chunks, num_microbatches=num_microbatches)
         )
 
     def _build_chunks(self, cfg_overrides: dict, pp: int, vpp: int) -> list:
@@ -271,10 +270,12 @@ class BitExactRunner:
             loss_sum = sum(d["loss"] for d in losses) / len(losses)
         else:
             loss_sum = torch.zeros((), device="cuda")
-        if torch.distributed.is_initialized() and parallel_state.get_pipeline_model_parallel_world_size() > 1:
+        if (
+            torch.distributed.is_initialized()
+            and parallel_state.get_pipeline_model_parallel_world_size() > 1
+        ):
             last_rank = parallel_state.get_pipeline_model_parallel_last_rank()
             torch.distributed.broadcast(
-                loss_sum, src=last_rank,
-                group=parallel_state.get_pipeline_model_parallel_group(),
+                loss_sum, src=last_rank, group=parallel_state.get_pipeline_model_parallel_group()
             )
         return loss_sum.detach().clone(), collect_grads(chunks)

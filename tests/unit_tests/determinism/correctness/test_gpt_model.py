@@ -33,7 +33,7 @@ def build_gpt(overrides, pre_process=True, post_process=True, vp_stage=None, **_
     return GPTModel(
         config=TransformerConfig(**cfg_kwargs),
         transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(
-            num_experts=cfg_kwargs.get("num_moe_experts"),
+            num_experts=cfg_kwargs.get("num_moe_experts")
         ),
         vocab_size=VOCAB_SIZE,
         max_sequence_length=SEQ_LEN,

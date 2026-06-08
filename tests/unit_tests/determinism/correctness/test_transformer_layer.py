@@ -27,9 +27,7 @@ import pytest
 import torch
 
 from megatron.core.enums import ModelType
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_layer_with_transformer_engine_spec,
-)
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -101,10 +99,7 @@ class _LayerStackWrapper(torch.nn.Module):
 
 
 def _build_layer(
-    overrides: dict,
-    pre_process: bool = True,
-    post_process: bool = True,
-    vp_stage=None,
+    overrides: dict, pre_process: bool = True, post_process: bool = True, vp_stage=None
 ):
     """Build a ``TransformerBlock`` — a real stack of TransformerLayers —
     wrapped so PP set_input_tensor list-unwrap matches the schedule contract.
@@ -114,9 +109,7 @@ def _build_layer(
     cfg_kwargs = gpt_base() | overrides
     cfg_kwargs.setdefault("deterministic_mode", True)
     config = TransformerConfig(**cfg_kwargs)
-    spec = get_gpt_layer_with_transformer_engine_spec(
-        num_experts=cfg_kwargs.get("num_moe_experts"),
-    )
+    spec = get_gpt_layer_with_transformer_engine_spec(num_experts=cfg_kwargs.get("num_moe_experts"))
     block = TransformerBlock(
         config=config,
         spec=spec,
@@ -158,9 +151,7 @@ def _fwd_bwd(layer, hidden, mask):
     loss = out.float().pow(2).mean()
     loss.backward()
     grads = {
-        name: p.grad.detach().clone()
-        for name, p in layer.named_parameters()
-        if p.grad is not None
+        name: p.grad.detach().clone() for name, p in layer.named_parameters() if p.grad is not None
     }
     return out.detach().clone(), grads
 
