@@ -31,7 +31,7 @@ Current matrix:
 | GQA/attention split contract | `unit/primitive/test_attention_moe_unit.py` | Qwen model smoke exercises attention forward/backward |
 | MoE router/aux-loss contract | `unit/primitive/test_attention_moe_unit.py` | Qwen model smoke exercises router, dispatcher, and experts |
 | LoRA adapter primitives | `unit/primitive/test_module_primitives_independent_unit.py` | Qwen model smoke can enable adapters in follow-up coverage |
-| MTP/MRoPE/Gated Delta helper contracts | `unit/primitive/test_module_primitives_independent_unit.py`, `unit/primitive/test_ops_data_trainstep_unit.py` | Qwen3.5 model smoke exercises MRoPE/Gated DeltaNet paths |
+| MTP/MRoPE/Gated Delta helper contracts | `unit/primitive/test_module_primitives_independent_unit.py`, `unit/primitive/test_ops_data_trainstep_unit.py` | Qwen3.5 MoE model smoke exercises MRoPE/Gated DeltaNet paths |
 | Loss/logprob/math ops | `unit/primitive/test_ops_data_trainstep_unit.py` | Qwen model smoke exercises loss plumbing |
 | Data/recompute/train-step primitives | `unit/primitive/test_ops_data_trainstep_unit.py` | model/runtime smoke exercises training loop integration |
 | DDP + distributed optimizer | `unit/primitive/test_checkpoint_unit.py`, `unit/primitive/test_checkpoint_runtime.py` | `smoke/primitive/test_distopt_checkpoint_smoke.py` |
@@ -41,7 +41,7 @@ Current matrix:
 | Runtime backend registry/config | `unit/primitive/test_runtime_config_unit.py`, `unit/runtime/test_runtime_backend_unit.py` | covered through checkpoint/model handles |
 | Runtime env/offload controls | `unit/runtime/test_runtime_backend_unit.py` | `smoke/primitive/test_fsdp2_offload_checkpoint_smoke.py` |
 | Optimizer update-state offload fraction | `unit/primitive/test_runtime_config_unit.py` and single-process CUDA coverage in `unit/primitive/test_fsdp2_offload_gpu.py` | multi-rank FSDP2 grad clipping is xfail until the follow-up bugfix PR |
-| Qwen3 lite config/build/forward | `unit/model/test_qwen_config_unit.py` | `smoke/model/test_qwen_lite_forward_smoke.py` |
-| Qwen3.5 lite config/build/forward | `unit/model/test_qwen_config_unit.py` | `smoke/model/test_qwen_lite_forward_smoke.py` |
+| Qwen3 MoE lite config/build/forward | `unit/model/test_qwen_config_unit.py` | `smoke/model/test_qwen_lite_forward_smoke.py` |
+| Qwen3.5 MoE lite config/build/forward | `unit/model/test_qwen_config_unit.py` | `smoke/model/test_qwen_lite_forward_smoke.py` |
 
 Classic FSDP is not a separate MLite primitive in the current source tree; MLite's native sharded optimizer coverage is FSDP2 plus Megatron DDP/distopt.

@@ -9,7 +9,7 @@ cfg = RuntimeConfig(
     backend="mlite",
     hf_path="/path/to/hf-model",
     backend_cfg=MegatronLiteConfig(
-        model_name="qwen3",
+        model_name="qwen3_moe",
         impl="lite",
         parallel=ParallelConfig(tp=1, pp=1, cp=1, ep=1),
     ),
@@ -49,7 +49,8 @@ examples can execute without Megatron-Bridge installed.
 
 `MegatronLiteConfig` carries `mlite` backend settings:
 
-- `model_name`: `qwen3`, `qwen3_moe`, or `qwen3_5`.
+- `model_name`: `qwen3_moe` or `qwen3_5` for new configs. `qwen3` remains
+  accepted as a legacy alias for `qwen3_moe` only; dense Qwen3 is not included.
 - `impl`: currently only `lite`.
 - `parallel`: tensor, expert, pipeline, virtual pipeline, and context sizes.
 - `optimizer`: Megatron-Core optimizer settings.

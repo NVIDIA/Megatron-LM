@@ -9,10 +9,19 @@ Megatron-Bridge package and requires an environment where `import
 megatron.bridge` works. Dry-run mode does not import either reference package and
 is safe for config validation.
 
-The `backend=mlite` path remains native MLite. For deterministic Qwen3.5 runs it
-mounts the Qwen3.5 vision module from the local Hugging Face model code through
-`transformers`; it does not import `mbridge` or Megatron-Bridge to build the
-MLite model.
+The `backend=mlite` path remains native MLite. For deterministic Qwen3.5 MoE
+runs it mounts the Qwen3.5 vision module from the local Hugging Face model code
+through `transformers`; it does not import `mbridge` or Megatron-Bridge to build
+the MLite model.
+
+This benchmark separates two validation lines:
+
+- `mbridge`: the validated reference for MLite vs Megatron-Core distributed
+  optimizer (`distopt`) parity.
+- `bridge`: a real Megatron-Bridge environment check when `import
+  megatron.bridge` works.
+
+Use the `mbridge` line for Core/distopt precision and speed claims.
 
 ## Dry-Run
 
@@ -93,10 +102,10 @@ strict optimizer-metric evidence is the deterministic run below.
 ## Deterministic mbridge Correctness
 
 Slurm job `12630675` completed a strict deterministic MLite vs `mbridge` run
-with 1x GPU, `seed=42`, Qwen3.5, `seq_len=8`, `truncate_layers=1`,
-`keep_experts=2`, and `steps=2`.
+with 1x GPU, `seed=42`, Qwen3.5 MoE, `seq_len=8`, `truncate_layers=1`,
+`keep_experts=2`, `optimizer_backend=distopt`, and `steps=2`.
 
-The comparison passed with no mismatches:
+The comparison passed with bitwise scalar parity and no mismatches:
 
 - `samples=2`
 - `max_loss_abs=0.0`
@@ -181,4 +190,16 @@ python experimental/lite/examples/bench/correctness.py compare \
   /tmp/qwen35_mlite_correctness.json \
   /tmp/qwen35_mbridge_correctness.json \
   --fail-on-mismatch
+```
+
+For the PR signoff pair script:
+
+```bash
+export MEGATRON_LITE_DETERMINISTIC=1
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+
+HF_PATH=/models/Qwen3.5-35B-A3B \
+REFERENCE_BACKEND=mbridge \
+DRY_RUN=0 \
+bash experimental/lite/examples/bench/scripts/run_qwen35_correctness_pair.sh
 ```

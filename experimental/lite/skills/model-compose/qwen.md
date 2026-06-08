@@ -1,13 +1,13 @@
 # Qwen Compose Skill
 
-Compose Qwen3 and Qwen3.5 Megatron Lite models.
+Compose Qwen3 MoE and Qwen3.5 Megatron Lite models.
 
 ## Schema
 
 <!-- MLITE_SKILL_SCHEMA_BEGIN -->
 ```python
 schema = Skill(
-    "model_compose.qwen", kind="state_machine", purpose="compose Qwen3/Qwen3.5 MLite models",
+    "model_compose.qwen", kind="state_machine", purpose="compose Qwen3 MoE/Qwen3.5 MLite models",
     imports=["basic.constitution"], calls=["model_compose.config_mapping", "model_compose.weight_mapping", "model_compose.build_model"],
     inputs=["task", "hf_model", "lite_model", "budget"],
     outputs=["model", "mapping", "evidence", "risks"], exits=["done", "blocked", "out_of_scope"],
@@ -17,8 +17,8 @@ schema = Skill(
 
 ```python
 def qwen(task, hf_model, lite_model, budget):
-    if hf_model.family not in ["qwen3", "qwen3_5"]:
-        return out_of_scope("not a Qwen3/Qwen3.5 model")
+    if hf_model.family not in ["qwen3_moe", "qwen3_5"]:
+        return out_of_scope("not a Qwen3 MoE/Qwen3.5 model")
 
     config = model_compose.config_mapping(task, hf_model.config, lite_model.config, budget.config)
     if not config.done:
