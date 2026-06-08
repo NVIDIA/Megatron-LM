@@ -12,6 +12,7 @@ def pick_fields(cls, src: dict[str, Any]) -> dict[str, Any]:
     return {f.name: src[f.name] for f in dc_fields(cls) if f.name in src}
 
 if TYPE_CHECKING:
+    from megatron.lite.runtime.backends.bridge.config import BridgeConfig
     from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
 
 
@@ -67,14 +68,15 @@ class RuntimeConfig:
     """Top-level runtime configuration.
 
     Attributes:
-        backend: Runtime backend name. Use ``"mlite"`` for Megatron Lite.
-        hf_path: Path to HuggingFace model directory. Required.
-        backend_cfg: Megatron Lite backend config or a compatible dict.
+        backend: Runtime backend name. Use ``"mlite"`` for Megatron Lite or
+            ``"bridge"`` for Megatron-Bridge.
+        hf_path: Path to HuggingFace model directory. Required for real runs.
+        backend_cfg: Backend config or a compatible dict.
     """
 
     backend: str = "mlite"
     hf_path: str = ""
-    backend_cfg: MegatronLiteConfig | dict[str, Any] = field(
+    backend_cfg: MegatronLiteConfig | BridgeConfig | dict[str, Any] = field(
         default_factory=dict
     )
 

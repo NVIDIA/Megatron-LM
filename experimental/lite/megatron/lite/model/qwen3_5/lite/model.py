@@ -11,9 +11,10 @@ from __future__ import annotations
 from contextlib import nullcontext
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
-import torch.nn.functional as F
 import transformer_engine.pytorch as te
+from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
 
 from megatron.lite.model.qwen3_5.config import Qwen35Config
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
@@ -64,8 +65,7 @@ def _collect_sp_grad_params(model: nn.Module) -> list[nn.Parameter]:
 
 
 def _swiglu(x: torch.Tensor) -> torch.Tensor:
-    x1, x2 = torch.chunk(x, 2, dim=-1)
-    return F.silu(x1) * x2
+    return bias_swiglu_impl(x, bias=None)
 
 
 def _qwen_mrope_section(config: Qwen35Config) -> list[int]:
@@ -80,12 +80,54 @@ def _qwen_mrope_section(config: Qwen35Config) -> list[int]:
 class SharedExpert(nn.Module):
     _stream: torch.cuda.Stream | None = None
 
-    def __init__(self, config: Qwen35Config, ps: ParallelState):
+    class _CopyToTPRegion(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x, group):
+            ctx.group = group
+            return x
+
+        @staticmethod
+        def backward(ctx, grad):
+            group = ctx.group
+            if group is not None and dist.get_world_size(group) > 1:
+                dist.all_reduce(grad, group=group)
+            return grad, None
+
+    class _PlainTELinear(nn.Module):
+        def __init__(self, in_features: int, out_features: int):
+            super().__init__()
+            self.linear = te.Linear(
+                in_features,
+                out_features,
+                bias=False,
+                params_dtype=torch.bfloat16,
+                parallel_mode=None,
+                sequence_parallel=False,
+                tp_group=None,
+                tp_size=1,
+            )
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            return self.linear(x)
+
+    def __init__(
+        self,
+        config: Qwen35Config,
+        ps: ParallelState,
+        *,
+        use_plain_te_linear: bool = False,
+    ):
         super().__init__()
         ffn = config.shared_expert_intermediate_size
-        self.gate_up = ColumnParallelLinear(config.hidden_size, ffn * 2, ps, bias=False)
-        self.down = RowParallelLinear(ffn, config.hidden_size, ps, bias=False)
+        if use_plain_te_linear and ps.tp_size == 1:
+            self.gate_up = self._PlainTELinear(config.hidden_size, ffn * 2)
+            self.down = self._PlainTELinear(ffn, config.hidden_size)
+        else:
+            self.gate_up = ColumnParallelLinear(config.hidden_size, ffn * 2, ps, bias=False)
+            self.down = RowParallelLinear(ffn, config.hidden_size, ps, bias=False)
         self.shared_gate = nn.Linear(config.hidden_size, 1, bias=False)
+        self.tp_group = ps.tp_group
+        self.use_mcore_overlap_graph = bool(use_plain_te_linear and ps.tp_size == 1)
 
     @staticmethod
     def _get_stream() -> torch.cuda.Stream:
@@ -93,9 +135,22 @@ class SharedExpert(nn.Module):
             SharedExpert._stream = torch.cuda.Stream()
         return SharedExpert._stream
 
+    @staticmethod
+    def _set_grad_fn_sequence_sr(tensor: torch.Tensor) -> None:
+        grad_fn = getattr(tensor, "grad_fn", None)
+        if grad_fn is not None and hasattr(grad_fn, "_set_sequence_nr"):
+            grad_fn._set_sequence_nr(torch.iinfo(torch.int).max)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate_val = self.shared_gate(x).sigmoid()
-        return self.down(_swiglu(self.gate_up(x))) * gate_val
+        fc1_input = x
+        if self.use_mcore_overlap_graph:
+            fc1_input = self._CopyToTPRegion.apply(x, self.tp_group)
+            self._set_grad_fn_sequence_sr(fc1_input)
+        output = self.down(_swiglu(self.gate_up(fc1_input)))
+        if self.use_mcore_overlap_graph:
+            self._set_grad_fn_sequence_sr(output)
+        return output * gate_val
 
 
 class MoELayer(nn.Module):
@@ -108,6 +163,9 @@ class MoELayer(nn.Module):
         router_bias_rate: float,
         fp8: bool,
         moe_act_recompute: bool,
+        router_dtype: torch.dtype | None = None,
+        preserve_3d_graph: bool = False,
+        shared_expert_plain_te: bool = False,
     ):
         super().__init__()
         if fp8:
@@ -117,6 +175,7 @@ class MoELayer(nn.Module):
             ps,
             router_bias_rate=router_bias_rate,
             compute_aux_loss=True,
+            router_dtype=router_dtype,
         )
         self.experts = Experts(config, ps, fp8=fp8, moe_act_recompute=moe_act_recompute)
         self.dispatcher = TokenDispatcher(
@@ -125,11 +184,18 @@ class MoELayer(nn.Module):
             ps,
             use_deepep=use_deepep,
         )
-        self.shared_expert = SharedExpert(config, ps)
+        self.shared_expert = SharedExpert(
+            config,
+            ps,
+            use_plain_te_linear=shared_expert_plain_te,
+        )
+        self.preserve_3d_graph = bool(preserve_3d_graph)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         input_shape = x.shape
         x_2d = x.reshape(-1, x.size(-1))
+        shared_input = x_2d.view(input_shape) if self.preserve_3d_graph else x_2d
+        router_input = x if self.preserve_3d_graph else x_2d
 
         shared_out = None
         side_stream = None
@@ -137,8 +203,8 @@ class MoELayer(nn.Module):
             side_stream = SharedExpert._get_stream()
             side_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(side_stream):
-                shared_out = self.shared_expert(x_2d)
-        scores, indices = self.router(x_2d)
+                shared_out = self.shared_expert(shared_input)
+        scores, indices = self.router(router_input)
         dispatched, tpe, permuted_probs = self.dispatcher.dispatch(x_2d, scores, indices)
         del scores, indices
         self.dispatcher.wait_dispatch_event()
@@ -151,11 +217,15 @@ class MoELayer(nn.Module):
         routed_out = self.dispatcher.combine(expert_out)
 
         if shared_out is None:
-            shared_out = self.shared_expert(x_2d)
+            shared_out = self.shared_expert(shared_input)
         else:
             assert side_stream is not None
             torch.cuda.current_stream().wait_stream(side_stream)
-        return (routed_out + shared_out).view(input_shape).to(x.dtype)
+        output = routed_out.view(input_shape)
+        if shared_out.shape != input_shape:
+            shared_out = shared_out.view(input_shape)
+        output += shared_out
+        return output.to(x.dtype)
 
 
 class Qwen35Layer(nn.Module):
@@ -170,6 +240,7 @@ class Qwen35Layer(nn.Module):
         fp8: bool = False,
         moe_act_recompute: bool = False,
         use_thd: bool = False,
+        deterministic: bool = False,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -202,6 +273,7 @@ class Qwen35Layer(nn.Module):
                 linear_conv_kernel_dim=config.linear_conv_kernel_dim,
                 rms_norm_eps=config.rms_norm_eps,
                 ps=ps,
+                deterministic=deterministic,
             )
         self.mlp_norm = te.RMSNorm(
             config.hidden_size,
@@ -215,6 +287,9 @@ class Qwen35Layer(nn.Module):
             router_bias_rate=router_bias_rate,
             fp8=fp8,
             moe_act_recompute=moe_act_recompute,
+            router_dtype=torch.float32 if deterministic else None,
+            preserve_3d_graph=deterministic,
+            shared_expert_plain_te=deterministic,
         )
 
     def forward(
@@ -271,9 +346,10 @@ class Qwen35Model(nn.Module):
         mtp_enable: bool = False,
         mtp_enable_train: bool = False,
         mtp_detach_encoder: bool = False,
+        mount_vision_model: bool = False,
     ):
         super().__init__()
-        del hf_path, attention_backend_override
+        del attention_backend_override
         self.config = config
         self.train_config = train_config
         self.ps = ps
@@ -288,7 +364,9 @@ class Qwen35Model(nn.Module):
         self.pre_process = has_embed
         self.post_process = has_head
         self.share_embeddings_and_output_weights = False
-        self.vision_model: nn.Module | None = None
+        self.vision_model: nn.Module | None = (
+            _build_native_vision_model(hf_path) if has_embed and mount_vision_model else None
+        )
 
         self.embed: VocabParallelEmbedding | None = None
         if has_embed:
@@ -307,6 +385,7 @@ class Qwen35Model(nn.Module):
                     fp8=train_config.fp8,
                     moe_act_recompute=moe_act_recompute,
                     use_thd=use_thd,
+                    deterministic=getattr(train_config, "deterministic", False),
                 )
                 for idx in self.layer_indices
             ]
@@ -341,6 +420,7 @@ class Qwen35Model(nn.Module):
                         fp8=train_config.fp8,
                         moe_act_recompute=moe_act_recompute,
                         use_thd=use_thd,
+                        deterministic=getattr(train_config, "deterministic", False),
                     ),
                     detach_encoder=mtp_detach_encoder,
                 )
@@ -521,6 +601,91 @@ class Qwen35Model(nn.Module):
         assert self.head is not None
         weight = self.head.col.linear.weight
         return weight if weight.dtype == hidden_states.dtype else weight.to(dtype=hidden_states.dtype)
+
+
+def _iter_auto_model_class_refs(hf_config) -> list[str]:
+    auto_map = getattr(hf_config, "auto_map", None) or {}
+    preferred_keys = (
+        "AutoModelForCausalLM",
+        "AutoModelForImageTextToText",
+        "AutoModelForVision2Seq",
+        "AutoModel",
+    )
+    refs: list[str] = []
+    for key in preferred_keys:
+        ref = auto_map.get(key)
+        if isinstance(ref, (list, tuple)):
+            ref = ref[0] if ref else None
+        if isinstance(ref, str) and ref not in refs:
+            refs.append(ref)
+    return refs
+
+
+def _resolve_hf_vision_cls(hf_config, hf_path: str) -> type:
+    try:
+        from transformers.dynamic_module_utils import get_class_from_dynamic_module
+    except ImportError as exc:
+        raise ImportError(
+            "mount_vision_model=True requires transformers with dynamic module support."
+        ) from exc
+
+    errors: list[str] = []
+    for class_ref in _iter_auto_model_class_refs(hf_config):
+        try:
+            model_cls = get_class_from_dynamic_module(
+                class_ref,
+                hf_path,
+                trust_remote_code=True,
+            )
+        except Exception as exc:
+            errors.append(f"{class_ref}: {exc}")
+            continue
+        vision_cls = getattr(model_cls, "HfVisionClass", None)
+        if vision_cls is not None:
+            return vision_cls
+        errors.append(f"{class_ref}: missing HfVisionClass")
+    detail = "; ".join(errors) if errors else "config auto_map has no supported AutoModel entry"
+    raise RuntimeError(f"Cannot resolve native HF vision class for Qwen3.5: {detail}.")
+
+
+def _hook_fp32_rotary_emb(module: nn.Module) -> None:
+    for submodule in module.modules():
+        if hasattr(submodule, "inv_freq") and submodule.inv_freq is not None:
+            submodule._inv_freq_fp32_original = submodule.inv_freq.detach().clone().float()
+
+            def _hook(mod, args):
+                del args
+                if hasattr(mod, "_inv_freq_fp32_original"):
+                    mod.inv_freq = mod._inv_freq_fp32_original.to(device=mod.inv_freq.device)
+
+            submodule.register_forward_pre_hook(_hook)
+
+
+def _hook_vision_params_avg_grad_across_tp(module: nn.Module) -> None:
+    for param in module.parameters(recurse=True):
+        param.average_gradients_across_tp_domain = True  # type: ignore[assignment]
+
+
+def _build_native_vision_model(hf_path: str) -> nn.Module:
+    if not hf_path:
+        raise ValueError("mount_vision_model requires hf_path.")
+    try:
+        from transformers import AutoConfig
+    except ImportError as exc:
+        raise ImportError("mount_vision_model=True requires transformers.") from exc
+
+    hf_config = AutoConfig.from_pretrained(hf_path, trust_remote_code=True)
+    vision_config = getattr(hf_config, "vision_config", None)
+    if vision_config is None:
+        raise RuntimeError("HF config does not expose vision_config; cannot build vision_model.")
+    hf_vision_cls = _resolve_hf_vision_cls(hf_config, hf_path)
+    if hasattr(hf_vision_cls, "_from_config"):
+        vision = hf_vision_cls._from_config(vision_config)
+    else:
+        vision = hf_vision_cls(vision_config)
+    _hook_fp32_rotary_emb(vision)
+    _hook_vision_params_avg_grad_across_tp(vision)
+    return vision.to(torch.bfloat16)
 
 
 __all__ = [

@@ -6,10 +6,12 @@ import importlib
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from megatron.lite.runtime.backends.bridge.config import BridgeConfig
     from megatron.lite.runtime.backends.mlite.config import DebugConfig, MegatronLiteConfig
     from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig, RuntimeConfig
 
 __all__ = [
+    "BridgeConfig",
     "DebugConfig",
     "MegatronLiteConfig",
     "OptimizerConfig",
@@ -20,6 +22,7 @@ __all__ = [
 
 def __getattr__(name: str):
     _lazy = {
+        "BridgeConfig": "megatron.lite.runtime.backends.bridge.config",
         "DebugConfig": "megatron.lite.runtime.backends.mlite.config",
         "MegatronLiteConfig": "megatron.lite.runtime.backends.mlite.config",
         "OptimizerConfig": "megatron.lite.runtime.contracts",

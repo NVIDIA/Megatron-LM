@@ -43,6 +43,7 @@ class ImplConfig:
     mtp_detach_encoder: bool = False
     mtp_loss_scaling_factor: float = 0.1
     mtp_use_repeated_layer: bool | None = None
+    mount_vision_model: bool = False
 
 
 def _full_attn_module(layer, name: str):
@@ -113,7 +114,9 @@ def _build_mc_optimizer(chunks, model_cfg: Qwen35Config, impl_cfg: ImplConfig, p
         model_cfg=model_cfg,
         impl_cfg=impl_cfg,
         ps=ps,
+        is_expert=is_expert_param,
         model_name="qwen3_5",
+        deterministic=impl_cfg.deterministic,
     )
 
 
@@ -164,6 +167,7 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
         mtp_enable=mtp_enable,
         mtp_enable_train=mtp_enable_train,
         mtp_detach_encoder=impl_cfg.mtp_detach_encoder,
+        mount_vision_model=impl_cfg.mount_vision_model,
     )
 
     if vpp is None:
@@ -205,7 +209,7 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
         from megatron.lite.runtime.megatron_utils import register_training_hooks
 
         register_training_hooks(chunks, optimizer)
-        optimizer_backend = "mc_full"
+        optimizer_backend = "distopt"
     elif impl_cfg.optimizer == "fsdp2":
         optimizer_backend = "fsdp2"
 

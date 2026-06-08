@@ -104,7 +104,7 @@ class Runtime(ABC):
     def zero_grad(self, handle: ModelHandle) -> None: ...
 
     @abstractmethod
-    def optimizer_step(self, handle: ModelHandle) -> tuple[bool, float, int]:
+    def optimizer_step(self, handle: ModelHandle) -> tuple[bool, float, int | None]:
         """Run optimizer step.
 
         Returns:
@@ -178,5 +178,7 @@ class Runtime(ABC):
 # ---------------------------------------------------------------------------
 
 RUNTIME_REGISTRY: dict[str, str] = {
+    "bridge": "megatron.lite.runtime.backends.bridge",
+    "mbridge": "megatron.lite.runtime.backends.mbridge",
     "mlite": "megatron.lite.runtime.backends.mlite",
 }

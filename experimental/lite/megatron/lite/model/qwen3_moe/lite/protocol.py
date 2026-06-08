@@ -222,7 +222,7 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
             is_expert=is_expert_param,
             deterministic=deterministic,
         )
-        optimizer_backend = "mc"
+        optimizer_backend = "distopt"
     elif impl_cfg.optimizer == "fsdp2":
         optimizer_backend = "fsdp2"
 

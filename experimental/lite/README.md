@@ -17,12 +17,14 @@ This initial drop contains:
 - Hugging Face safetensors load/export helpers for the included models.
 - Megatron-Core optimizer wrapping for the lite runtime.
 - FSDP2 optimizer primitives for supported lite model protocols.
+- Reference runtime backends for comparison runs: `mbridge` for the legacy
+  package and `bridge` for real Megatron-Bridge environments.
+- A benchmark example that can dry-run or execute `mlite`, `mbridge`, and
+  `bridge` backends.
 
 This initial drop intentionally does not include:
 
 - Hybrid model implementations.
-- Bridge model/runtime implementations.
-- Benchmark entrypoints or experiment scripts.
 
 ## Layout
 
@@ -30,10 +32,11 @@ This initial drop intentionally does not include:
 experimental/lite/
   README.md
   docs/                       Design and usage notes
+  examples/                   Optional integration and benchmark examples
   skills/                     Agent-agnostic maintenance skills
   megatron/
     lite/
-      runtime/                Runtime API, config, and mlite backend registry
+      runtime/                Runtime API, config, and backend registry
       model/                  Model registry and Qwen model implementations
       primitive/              Parallel, checkpoint, optimizer, module, and op primitives
 ```
@@ -60,6 +63,10 @@ handle = runtime.build_model()
 
 `backend="mlite"` selects the Megatron Lite runtime backend. `impl="lite"`
 selects the model implementation inside the registered model family.
+`backend="mbridge"` selects the legacy `mbridge` reference backend used by the
+validated benchmark example. `backend="bridge"` selects the Megatron-Bridge
+runtime backend and requires an environment where `import megatron.bridge` works
+when the model is built.
 
 Model names currently registered by default:
 
@@ -75,6 +82,7 @@ Model names currently registered by default:
 - [Models](docs/models.md)
 - [Porting Notes](docs/porting.md)
 - [Skills](skills/README.md)
+- [Bench Example](examples/bench/README.md)
 
 ## Acknowledgements
 

@@ -459,7 +459,7 @@ class MegatronLiteRuntime(RuntimeBase):
         if handle._optimizer is not None:
             handle._optimizer.zero_grad()
 
-    def optimizer_step(self, handle: ModelHandle) -> tuple[bool, float, int]:
+    def optimizer_step(self, handle: ModelHandle) -> tuple[bool, float, int | None]:
         if handle._optimizer is None:
             return True, 0.0, 0
         update_successful, grad_norm, num_zeros = handle._optimizer.step()
