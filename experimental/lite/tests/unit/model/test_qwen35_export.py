@@ -122,6 +122,37 @@ def test_qwen35_export_dtype_cast_is_opt_in() -> None:
     assert bf16_export["model.language_model.layers.0.mlp.experts.gate_up_proj"].dtype == torch.bfloat16
 
 
+def test_qwen35_export_preserves_runtime_parameter_dtype_by_default() -> None:
+    class TinyQwen35Module(nn.Module):
+        def __init__(self, config: Qwen35Config) -> None:
+            super().__init__()
+            self.norm = nn.LayerNorm(8).to(torch.bfloat16)
+            self.layers = nn.ModuleList([nn.Module()])
+            self.layers[0].moe = nn.Module()
+            self.layers[0].moe.experts = nn.Module()
+            self.layers[0].moe.experts.fc1 = nn.Module()
+
+            rows = config.moe_intermediate_size * 2
+            for expert_idx in range(config.num_experts):
+                tensor = torch.arange(rows * config.hidden_size, dtype=torch.bfloat16).reshape(
+                    rows,
+                    config.hidden_size,
+                )
+                tensor = tensor + expert_idx * 1000
+                self.layers[0].moe.experts.fc1.register_parameter(
+                    f"weight{expert_idx}",
+                    nn.Parameter(tensor),
+                )
+
+    cfg = _tiny_config()
+    model = TinyQwen35Module(cfg)
+
+    exported = dict(export_hf_weights(model, cfg, _single_rank_parallel_state()))
+
+    assert exported["model.language_model.norm.weight"].dtype == torch.bfloat16
+    assert exported["model.language_model.layers.0.mlp.experts.gate_up_proj"].dtype == torch.bfloat16
+
+
 def test_qwen35_export_maps_top_level_and_layer_norm_names() -> None:
     cfg = _tiny_config()
     spec = Qwen35WeightSpec(cfg)
@@ -311,6 +342,46 @@ def test_qwen35_export_packs_base_expert_fc1_to_hf_gate_up_proj() -> None:
     assert torch.equal(
         exported["model.language_model.layers.0.mlp.experts.gate_up_proj"],
         torch.stack(expert_tensors, dim=0),
+    )
+
+
+def test_qwen35_export_matches_mbridge_qwen35_moe_packed_expert_contract() -> None:
+    cfg = _tiny_config()
+    spec = Qwen35WeightSpec(cfg)
+    rows = cfg.moe_intermediate_size * 2
+    fc1_tensors = [
+        torch.arange(rows * cfg.hidden_size, dtype=torch.bfloat16).reshape(rows, cfg.hidden_size)
+        + expert_idx * 1000
+        for expert_idx in range(cfg.num_experts)
+    ]
+    fc2_tensors = [
+        torch.arange(cfg.hidden_size * cfg.moe_intermediate_size, dtype=torch.bfloat16).reshape(
+            cfg.hidden_size,
+            cfg.moe_intermediate_size,
+        )
+        + expert_idx * 1000
+        for expert_idx in range(cfg.num_experts)
+    ]
+
+    fc1_exported = {}
+    fc2_exported = {}
+    for expert_idx, (fc1, fc2) in enumerate(zip(fc1_tensors, fc2_tensors, strict=True)):
+        fc1_exported.update(
+            dict(spec.native_to_hf(f"layers.0.moe.experts.fc1.weight{expert_idx}", fc1))
+        )
+        fc2_exported.update(
+            dict(spec.native_to_hf(f"layers.0.moe.experts.fc2.weight{expert_idx}", fc2))
+        )
+
+    assert set(fc1_exported) == {"model.language_model.layers.0.mlp.experts.gate_up_proj"}
+    assert set(fc2_exported) == {"model.language_model.layers.0.mlp.experts.down_proj"}
+    assert torch.equal(
+        fc1_exported["model.language_model.layers.0.mlp.experts.gate_up_proj"],
+        torch.stack(fc1_tensors, dim=0),
+    )
+    assert torch.equal(
+        fc2_exported["model.language_model.layers.0.mlp.experts.down_proj"],
+        torch.stack(fc2_tensors, dim=0),
     )
 
 

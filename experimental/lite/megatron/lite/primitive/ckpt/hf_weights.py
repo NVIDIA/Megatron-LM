@@ -487,14 +487,14 @@ def _gather_dense(name: str, tensor: torch.Tensor, spec: HFWeights, ps) -> torch
     if callable(custom_gather):
         gathered = custom_gather(name, tensor, ps)
         if gathered is not None:
-            return gathered.float().cpu()
+            return gathered.cpu()
 
     tp_info = spec.tp_spec(name)
     if tp_info is not None and ps.tp_size > 1:
         split_d, tp_or_etp = tp_info
         if tp_or_etp == 0:
             tensor = allgather_concat(tensor, ps.tp_size, ps.tp_group, dim=split_d)
-    return tensor.float().cpu()
+    return tensor.cpu()
 
 
 def _gather_expert(
@@ -519,9 +519,9 @@ def _gather_expert(
         dist.all_gather(ep_gathered, tensor.contiguous(), group=ps.ep_group)
         for ep_rank, ep_tensor in enumerate(ep_gathered):
             global_idx = ep_rank * n_local + local_idx
-            out[set_expert_idx(name, global_idx)] = ep_tensor.float().cpu()
+            out[set_expert_idx(name, global_idx)] = ep_tensor.cpu()
     else:
-        out[name] = tensor.float().cpu()
+        out[name] = tensor.cpu()
 
 
 def save_hf_weights(
