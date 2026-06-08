@@ -38,6 +38,9 @@ from megatron.core.dist_checkpointing.strategies.torch import (
 from megatron.core.dist_checkpointing.strategies.torch_dcp_load_trace import (
     apply_torch_dcp_load_trace_patch,
 )
+from megatron.core.dist_checkpointing.strategies.torch_dcp_save_trace import (
+    apply_torch_dcp_save_trace_patch,
+)
 from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer
@@ -496,6 +499,7 @@ def save_grads(save_dir, state_dict, iteration, grad_label):
                  f"from iteration {iteration:7d}")
 
 
+@trace_region("save_checkpoint")
 def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far,
                     checkpointing_context=None, pipeline_rank=None, expert_rank=None, tensor_rank=None, pipeline_parallel=None, expert_parallel=None, non_persistent_ckpt=False,
                     train_data_iterator=None, preprocess_common_state_dict_fn = None, release=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None):
@@ -561,13 +565,14 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
     if tp_group is None and pp_group is None:
         tp_group = mpu.get_tensor_model_parallel_group()
         pp_group = mpu.get_pipeline_model_parallel_group()
-    rng_state = get_rng_state(args.ckpt_format, tp_group, pp_group)
+    with trace_region("collect_rng_and_rerun_state"):
+        rng_state = get_rng_state(args.ckpt_format, tp_group, pp_group)
 
-    # Collect rerun state across all ranks
-    rerun_state_machine = get_rerun_state_machine()
-    rerun_state = rerun_state_machine.state_dict(
-        data_iterator=train_data_iterator, ckpt_format=args.ckpt_format,
-    )
+        # Collect rerun state across all ranks
+        rerun_state_machine = get_rerun_state_machine()
+        rerun_state = rerun_state_machine.state_dict(
+            data_iterator=train_data_iterator, ckpt_format=args.ckpt_format,
+        )
 
     # Checkpoint name.
     return_base_dir = (ckpt_type != CheckpointType.LEGACY)
@@ -623,17 +628,18 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                              f' {sharded_sd_metadata["distrib_optim_sharding_type"]}')
         else:
             sharded_sd_metadata = None
-        state_dict = generate_state_dict(
-            args,
-            model,
-            optimizer,
-            opt_param_scheduler,
-            rng_state,
-            iteration=iteration,
-            optim_sd_kwargs=dict(metadata=sharded_sd_metadata),
-            model_sd_kwargs=dict(metadata=sharded_sd_metadata),
-            rerun_state=rerun_state,
-        )
+        with trace_region("generate_state_dict"):
+            state_dict = generate_state_dict(
+                args,
+                model,
+                optimizer,
+                opt_param_scheduler,
+                rng_state,
+                iteration=iteration,
+                optim_sd_kwargs=dict(metadata=sharded_sd_metadata),
+                model_sd_kwargs=dict(metadata=sharded_sd_metadata),
+                rerun_state=rerun_state,
+            )
 
         state_dict['num_floating_point_operations_so_far'] = num_floating_point_operations_so_far
         if ckpt_type == CheckpointType.GLOBAL and ckpt_format == "torch_dist":
@@ -700,8 +706,15 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 ensure_directory_exists(checkpoint_name, check_parent=False)
 
             if ckpt_format == "fsdp_dtensor":
-                state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
+                with trace_region("preprocess_fsdp_dtensor_state_dict"):
+                    state_dict = preprocess_fsdp_dtensor_state_dict(args, state_dict, model[0])
 
+            # Break the DCP save black box (planning / staging / write) into
+            # per-phase Perfetto regions by instrumenting the SavePlanner,
+            # StorageWriter and _DistWrapper collective methods. Covers both the
+            # async (save_state_dict_async_plan) and sync (checkpoint.save)
+            # paths. No-op unless CKPT_PERFETTO_TRACE=1.
+            apply_torch_dcp_save_trace_patch()
             if args.async_save:
                 planner = torch.distributed.checkpoint.DefaultSavePlanner()
                 coordinator_rank = 0
@@ -722,25 +735,32 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                             "use_cpu_shm_for_gpu_tensors. Update nvidia-resiliency-ext "
                             "to use --async-ckpt-use-cpu-shm."
                         )
-                fs_storage_writer = FileSystemWriterAsync(
-                    checkpoint_name,
-                    thread_count=args.dist_ckpt_workers,
-                    use_msc=args.enable_msc,
-                    **_writer_kwargs,
-                )
+                with trace_region("FileSystemWriterAsync"):
+                    fs_storage_writer = FileSystemWriterAsync(
+                        checkpoint_name,
+                        thread_count=args.dist_ckpt_workers,
+                        use_msc=args.enable_msc,
+                        **_writer_kwargs,
+                    )
 
-                save_state_dict_ret = save_state_dict_async_plan(
-                    state_dict, fs_storage_writer, None, coordinator_rank, planner=planner, enable_cache=args.ckpt_assume_constant_structure
-                )
-                async_save_request = get_save_and_finalize_callbacks(
-                    fs_storage_writer, save_state_dict_ret, args.async_strategy
-                )
+                # Synchronous part of the async save: DCP planning + GPU->CPU/shm
+                # staging (prepare_write_data). The actual file write happens
+                # later in the background worker.
+                with trace_region("save_state_dict_async_plan"):
+                    save_state_dict_ret = save_state_dict_async_plan(
+                        state_dict, fs_storage_writer, None, coordinator_rank, planner=planner, enable_cache=args.ckpt_assume_constant_structure
+                    )
+                with trace_region("get_save_and_finalize_callbacks"):
+                    async_save_request = get_save_and_finalize_callbacks(
+                        fs_storage_writer, save_state_dict_ret, args.async_strategy
+                    )
             else:
                 fs_storage_writer = torch.distributed.checkpoint.FileSystemWriter(checkpoint_name)
-                torch.distributed.checkpoint.save(
-                    state_dict=state_dict,
-                    storage_writer=fs_storage_writer,
-                )
+                with trace_region("checkpoint.save"):
+                    torch.distributed.checkpoint.save(
+                        state_dict=state_dict,
+                        storage_writer=fs_storage_writer,
+                    )
         else:
             # [ModelOpt]: Inject modelopt_state into state_dict
             if has_nvidia_modelopt:
@@ -879,13 +899,15 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
             wandb_finalize_fn()
 
     if args.async_save:
-        schedule_async_save(async_save_request)
+        with trace_region("schedule_async_save"):
+            schedule_async_save(async_save_request)
         print_rank_0(f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] scheduled "
                      f"an async checkpoint save at iteration {iteration:7d} to {save_dir}")
 
     # Wait so everyone is done (not necessary)
-    if torch.distributed.is_initialized():
-        torch.distributed.barrier()
+    with trace_region("save_checkpoint_final_barrier"):
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
     end_misc = time()
     logger.debug(f"rank: {rank}, takes {end_misc - start_misc} to finalize ckpt save ")
