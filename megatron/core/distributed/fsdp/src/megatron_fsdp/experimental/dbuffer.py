@@ -327,7 +327,7 @@ class DBuffer:
         local_start = buffer.offset
         local_end = local_start + buffer.local_buffer.numel()
         # Only logical tensor ranges are initialized. Padding and layout gaps are not
-        # observable through get_tensor() and can remain unspecified.
+        # observable through get_local_tensor() and can remain unspecified.
         for tensor, tensor_start in zip(tensors, buffer.layout.tensor_to_offset, strict=True):
             tensor_end = tensor_start + tensor.numel()
             overlap_start = max(local_start, tensor_start)
@@ -518,7 +518,7 @@ class DBuffer:
         out.local_buffer.copy_(local_slice)
         return out
 
-    def get_tensor(self, index: int) -> torch.Tensor:
+    def get_local_tensor(self, index: int) -> torch.Tensor:
         """Return this rank's local view for logical tensor ``index``.
 
         Flat placements shard dim 0, so the returned view preserves all
@@ -560,7 +560,7 @@ class DBuffer:
             else:
                 raise TypeError(f"Unsupported placement for DTensor conversion: {placement!r}.")
 
-        local_tensor = self.get_tensor(index)
+        local_tensor = self.get_local_tensor(index)
         tensor_shape = self.layout.tensor_shapes[index]
         return DTensor.from_local(
             local_tensor=local_tensor,

@@ -61,7 +61,7 @@ def _same_tensors_on_all_ranks(device: torch.device) -> list[torch.Tensor]:
 
 def _assert_dbuffer_contains_tensors(buffer: DBuffer, expected: Iterable[torch.Tensor]) -> None:
     for index, tensor in enumerate(expected):
-        torch.testing.assert_close(buffer.get_tensor(index), tensor)
+        torch.testing.assert_close(buffer.get_local_tensor(index), tensor)
 
 
 @pytest.mark.distributed
@@ -147,7 +147,7 @@ def test_compute_layout_fills_lcm_padding_gaps(setup: DistributedSetup):
     assert layout.size == 60
     expected_local_shapes = expected_local_shapes_by_rank[mesh.get_local_rank(0)]
     for index, expected_shape in enumerate(expected_local_shapes):
-        assert buffer.get_tensor(index).shape == torch.Size(expected_shape)
+        assert buffer.get_local_tensor(index).shape == torch.Size(expected_shape)
         assert buffer.get_dtensor(index).shape == shapes[index]
 
 
@@ -207,7 +207,7 @@ def test_from_local_reuses_required_local_buffer(setup: DistributedSetup):
 
 
 @pytest.mark.distributed
-def test_replicate_get_tensor_and_dtensor(setup: DistributedSetup):
+def test_replicate_get_local_tensor_and_dtensor(setup: DistributedSetup):
     """Replicated DBuffer returns full local tensors and replicated DTensors."""
     mesh = init_device_mesh(setup.device.type, (setup.world_size,))
     tensors = _same_tensors_on_all_ranks(setup.device)
@@ -240,7 +240,7 @@ def test_sharded_allgather_round_trip(setup: DistributedSetup):
     sharded_buffer = DBuffer.distribute_tensors(tensors, mesh, [Flat()])
     layout = sharded_buffer.layout
     for index, tensor in enumerate(tensors):
-        local_tensor = sharded_buffer.get_tensor(index)
+        local_tensor = sharded_buffer.get_local_tensor(index)
         assert local_tensor.shape[1:] == tensor.shape[1:]
         assert local_tensor.is_contiguous()
 
@@ -449,7 +449,9 @@ def test_get_dtensor_from_sharded_buffer(setup: DistributedSetup):
 
     dtensor = sharded_buffer.get_dtensor(0)
 
-    torch.testing.assert_close(dtensor.to_local(), sharded_buffer.get_tensor(0), rtol=0, atol=0)
+    torch.testing.assert_close(
+        dtensor.to_local(), sharded_buffer.get_local_tensor(0), rtol=0, atol=0
+    )
     assert dtensor.shape == tensors[0].shape
 
 
@@ -514,7 +516,7 @@ def test_2d_mesh_shards_across_all_ranks(setup: DistributedSetup):
         fully_sharded_buffer.local_buffer.numel() == fully_sharded_buffer.layout.size // mesh.size()
     )
     for index, _ in enumerate(tensors):
-        assert fully_sharded_buffer.get_tensor(index).is_contiguous()
+        assert fully_sharded_buffer.get_local_tensor(index).is_contiguous()
 
 
 @pytest.mark.distributed
