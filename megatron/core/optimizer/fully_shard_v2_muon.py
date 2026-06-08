@@ -13,9 +13,12 @@
 # limitations under the License.
 
 
+from collections import OrderedDict
 from typing import List
 
 import torch
+from torch.distributed.tensor import DTensor
+from torch.distributed.tensor.placement_types import Replicate
 
 from .emerging_optimizers import HAVE_EMERGING_OPTIMIZERS
 from .optimizer import MegatronOptimizer
@@ -56,21 +59,22 @@ class FullyShardV2Muon(torch.optim.Optimizer):
     """Single-root distributed Muon for Megatron-FSDP v2 (a torch optimizer).
 
     Args:
-        params: optimizer-facing params (FSDP-v2 ``dist_param`` DTensors) or param
-            groups — the same form every torch/Megatron optimizer takes. Each
-            dist_param carries ``_fsdp_param_group`` / ``_fsdp_orig_param``
-            back-references (set in ``ParameterGroup._init_dist_params``) used to
-            drive the per-param gather/scatter.
+        params: optimizer-facing params — all assumed to be FSDP-v2 ``dist_param``
+            DTensors (asserted). A flat list or param groups, as any torch optimizer.
+        grads: the gradient DTensor for each param, aligned 1:1 with the flattened
+            params (asserted to be DTensors). This is the sole gradient source —
+            replaces the old ParameterGroup back-reference path.
         lr / momentum / nesterov / weight_decay: Muon update hyperparameters.
         num_ns_steps / coefficient_type / scale_mode / extra_scale_factor: NS +
             scaling config used by ``orthogonalize``.
-        fp32_matmul_prec / pg_collection / tp_mode: reserved for the Phase-2
-            tensor-parallel NS path (currently TP size 1; accepted and ignored).
+        fp32_matmul_prec / tp_mode: reserved for the Phase-2 tensor-parallel NS path
+            (currently TP size 1; accepted and ignored).
     """
 
     def __init__(
         self,
         params,
+        grads,
         *,
         lr: float,
         momentum: float = 0.95,
@@ -81,10 +85,24 @@ class FullyShardV2Muon(torch.optim.Optimizer):
         scale_mode: str = "spectral",
         extra_scale_factor: float = 1.0,
         fp32_matmul_prec: str = "medium",
-        pg_collection=None,
         tp_mode: str = "duplicated",
     ) -> None:
         super().__init__(params, dict(lr=lr, weight_decay=weight_decay))
+
+        # Refactor contract: this optimizer is driven purely by DTensors. Assert the
+        # two assumptions the new design rests on — every param (FSDP-v2 dist_param)
+        # and every grad is a DTensor, and grads align 1:1 with the flattened params.
+        flat_params = [p for grp in self.param_groups for p in grp["params"]]
+        assert all(
+            isinstance(p, DTensor) for p in flat_params
+        ), "FullyShardV2Muon expects every param to be a DTensor (FSDP-v2 dist_param)."
+        assert all(
+            isinstance(g, DTensor) for g in grads
+        ), "FullyShardV2Muon expects every grad to be a DTensor."
+        assert len(grads) == len(flat_params), (
+            f"grads ({len(grads)}) must align 1:1 with params ({len(flat_params)})."
+        )
+        self._grads = list(grads)
 
         # Muon update hyperparameters owned by this class. lr is NOT stored — it
         # lives in param_groups[0]["lr"] (where an LR scheduler writes), read in step.
@@ -104,8 +122,12 @@ class FullyShardV2Muon(torch.optim.Optimizer):
         # keeps the collective send/recv in phases 2/3a aligned across ranks.
         # Each entry: (ParameterGroup, idx, original param, momentum shard).
         self._managed = []
+        self._managed_grads = []  # grad DTensor for each managed entry (aligned with _managed)
+        gi = 0  # running index into self._grads (== flattened params order)
         for group in self.param_groups:
             for dist_param in group["params"]:
+                grad_dtensor = self._grads[gi]
+                gi += 1
                 param_group = getattr(dist_param, "_fsdp_param_group", None)
                 orig = getattr(dist_param, "_fsdp_orig_param", None)
                 if param_group is None or orig is None:
@@ -125,9 +147,80 @@ class FullyShardV2Muon(torch.optim.Optimizer):
                     grad_shard = param_group.main_grad_buffer.get_item(idx, as_shard=True)
                     momentum_shard = torch.zeros_like(grad_shard)
                     self._managed.append((param_group, idx, orig, momentum_shard))
+                    self._managed_grads.append(grad_dtensor)
 
         if not self._managed:
             raise ValueError("FullyShardV2Muon got no 2D matrix parameters to manage.")
+
+        # Reconstruct, purely from the grad DTensors, every DP rank's (flat_offset,
+        # size) slice of each managed param — the global sharding the gather/scatter
+        # needs. A DTensor only knows its OWN rank's shard, so one all_gather per
+        # dp_group recovers the rest. (Root assignment is computed in a later step.)
+        self._shard_ranges = self._gather_shard_ranges()
+        self._crosscheck_shard_ranges_against_param_group()
+
+    def _gather_shard_ranges(self):
+        """Per managed param, every DP rank's (flat_offset, size) within the full
+        param, derived from the grad DTensor sharding + one all_gather per dp_group.
+
+        FSDP-v2 shards 2D grads as Shard(0) over the flattened buffer, aligned so each
+        rank owns whole rows (chunk_size_factor = lcm(cols)); to_local() is therefore a
+        contiguous block of full rows. A DTensor only knows its OWN rank's row count, so
+        we all_gather row counts within each grad's dp_group and prefix-sum them.
+        Replicated grads (ZeRO-1) live fully on every rank -> (0, numel) for all ranks.
+        """
+        import torch.distributed as dist
+
+        by_group = OrderedDict()  # dp process group -> [managed indices]
+        for mi, g in enumerate(self._managed_grads):
+            by_group.setdefault(g.device_mesh.get_group(), []).append(mi)
+
+        ranges = [None] * len(self._managed_grads)
+        for grp, mis in by_group.items():
+            ws = dist.get_world_size(grp)
+            my_rows = []  # this rank's row count per param (-1 sentinel = replicated)
+            for mi in mis:
+                g = self._managed_grads[mi]
+                my_rows.append(-1 if isinstance(g.placements[0], Replicate) else g.to_local().shape[0])
+            gathered = [None] * ws
+            dist.all_gather_object(gathered, my_rows, group=grp)
+            for j, mi in enumerate(mis):
+                g = self._managed_grads[mi]
+                row_numel = 1
+                for d in g.shape[1:]:
+                    row_numel *= d
+                rows_per_rank = [gathered[r][j] for r in range(ws)]
+                if rows_per_rank[0] == -1:  # replicated: full param on every rank
+                    ranges[mi] = [(0, g.shape.numel())] * ws
+                else:
+                    rr, off = [], 0
+                    for r in range(ws):
+                        sz = rows_per_rank[r] * row_numel
+                        rr.append((off, sz))
+                        off += sz
+                    ranges[mi] = rr
+        return ranges
+
+    def _crosscheck_shard_ranges_against_param_group(self):
+        """TEMP (drop once step() is rewired): assert the DTensor-derived shard ranges
+        match the ParameterGroup's old ``_grad_gather_plans`` dst ranges + holders,
+        proving the pure-DTensor reconstruction is correct. Skips replicated (ZeRO-1)."""
+        for mi, (param_group, idx, _orig, _mom) in enumerate(self._managed):
+            if isinstance(self._managed_grads[mi].placements[0], Replicate):
+                continue
+            _old_root, _old_src, old_dst = param_group._grad_gather_plans[idx]
+            for r, (off, sz) in enumerate(self._shard_ranges[mi]):
+                old_lo, old_hi = old_dst[r]
+                if sz > 0:
+                    assert (off, off + sz) == (old_lo, old_hi), (
+                        f"[muon-refactor] param {mi} rank {r}: DTensor range "
+                        f"{(off, off + sz)} != old plan {(old_lo, old_hi)}"
+                    )
+                else:
+                    assert old_hi <= old_lo, (
+                        f"[muon-refactor] param {mi} rank {r}: DTensor says empty "
+                        f"but old plan has {(old_lo, old_hi)}"
+                    )
 
     @torch.no_grad()
     def orthogonalize(self, param, grad: torch.Tensor) -> torch.Tensor:
@@ -221,13 +314,6 @@ class FullyShardV2Muon(torch.optim.Optimizer):
                 weight_shard.mul_(1.0 - lr * self._weight_decay)
             weight_shard.add_(orth_shard.to(weight_shard.dtype), alpha=-lr)
 
-        refreshed = set()
-        for param_group, _, _, _ in items:
-            if id(param_group) in refreshed or param_group.main_weight_buffer is None:
-                continue
-            param_group.copy_main_weights_to_model_weights()
-            refreshed.add(id(param_group))
-
 
 class FullyShardV2MuonOptimizer(MegatronOptimizer):
     """MegatronOptimizer adapter wrapping FullyShardV2Muon for ChainedOptimizer.
@@ -238,9 +324,29 @@ class FullyShardV2MuonOptimizer(MegatronOptimizer):
     return ``[]``) — orthogonalized updates are already self-normalized.
     """
 
-    def __init__(self, muon: "FullyShardV2Muon", config, model_chunks=None):
-        super().__init__(muon, config)
+    def __init__(self, config, model_chunks, **muon_hyperparams):
         self.model_chunks = list(model_chunks) if model_chunks else []
+        # Pull every chunk's 2D matrix dist_param + its grad DTensor straight from the
+        # FSDP v2 ParameterGroups, in module-declaration (== layer) order, and build the
+        # inner torch optimizer purely from those DTensors (no factory plumbing needed).
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import FSDPModule
+
+        params, grads = [], []
+        for chunk in self.model_chunks:
+            root = chunk if isinstance(chunk, FSDPModule) else chunk.module
+            for m in root.modules():
+                if not isinstance(m, FSDPModule):
+                    continue
+                for pg in m._fsdp_param_groups:
+                    for dp, dg in zip(pg.dist_params, pg.dist_grads):
+                        if (
+                            dg is not None
+                            and dp.dim() == 2
+                            and not getattr(dp, "is_embedding_or_output_parameter", False)
+                        ):
+                            params.append(dp)
+                            grads.append(dg)
+        super().__init__(FullyShardV2Muon(params, grads, **muon_hyperparams), config)
         self.is_stub_optimizer = False
 
     # --- Excluded from the chained grad-norm / clip / zero-count machinery. ---
@@ -259,6 +365,16 @@ class FullyShardV2MuonOptimizer(MegatronOptimizer):
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:
         self.optimizer.step()
+        # Cast the updated fp32 master weights back into the model (bf16) weight buffers
+        # via the Megatron-FSDP v2 FSDPModule API. The inner optimizer only updates
+        # master weights; this master->model cast (and all ZeRO-1/2/3 / quantization
+        # handling) lives in FSDP. _copy_main_weights_to_model_weights recurses over
+        # child FSDPModules, so one call on each chunk's root FSDPModule suffices.
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import FSDPModule
+
+        for model_chunk in self.model_chunks:
+            fsdp_module = model_chunk if isinstance(model_chunk, FSDPModule) else model_chunk.module
+            fsdp_module._copy_main_weights_to_model_weights()
         return True
 
     def step(self):
