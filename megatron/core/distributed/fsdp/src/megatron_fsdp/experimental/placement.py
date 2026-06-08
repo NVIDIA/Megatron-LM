@@ -12,7 +12,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""DBuffer placement definitions."""
+"""DBuffer placement definitions.
+
+These placement concepts are borrowed from PyTorch DTensor placements:
+``Replicate`` and ``Partial`` mirror DTensor's placements. ``Flat`` is the
+only sharded DBuffer placement implemented so far; it stores dim-0 shards in a
+flattened local buffer.
+
+=============  =============  ====================
+Source         Destination    DBuffer operation
+=============  =============  ====================
+sharded        ``Replicate``  ``allgather()``
+``Partial``    sharded        ``reduce_scatter()``
+``Partial``    ``Replicate``  ``allreduce()``
+``Replicate``  sharded        ``scatter()`` (local)
+=============  =============  ====================
+"""
 
 import dataclasses
 from collections.abc import Iterable
