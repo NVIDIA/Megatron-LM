@@ -975,10 +975,7 @@ class TestMultiTokenPrediction:
                 hidden_states=[torch.ones(1, 1, 4)],
                 labels=None,
                 loss_mask=None,
-                output_layer=lambda hidden, weight=None, runtime_gather_output=None: (
-                    hidden,
-                    None,
-                ),
+                output_layer=lambda hidden, weight=None, runtime_gather_output=None: (hidden, None),
                 output_weight=None,
                 runtime_gather_output=None,
                 is_training=False,
