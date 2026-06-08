@@ -423,20 +423,21 @@ class DBuffer:
         )
 
     def allgather(self, mesh_axis: int, *, out: "DBuffer | None" = None) -> "DBuffer":
-        """All-gather a Flat axis into Replicate placement."""
+        """All-gather a sharded axis into Replicate placement."""
         _validate_mesh_axis(self.mesh, mesh_axis)
-        axis = mesh_axis
-        if not isinstance(self.placements[axis], Flat):
-            raise ValueError(f"allgather() requires Flat placement on axis {mesh_axis!r}.")
+        if not isinstance(self.placements[mesh_axis], Flat):
+            raise ValueError(
+                f"allgather() currently requires Flat placement on axis {mesh_axis!r}."
+            )
 
         placements = list(self.placements)
-        placements[axis] = Replicate()
+        placements[mesh_axis] = Replicate()
         validate_placements(placements)
         out = self._create_or_validate_out(placements, out)
         dist.all_gather_into_tensor(
             output_tensor=out.local_buffer,
             input_tensor=self.local_buffer,
-            group=self.mesh.get_group(axis),
+            group=self.mesh.get_group(mesh_axis),
         )
         return out
 
