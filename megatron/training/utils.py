@@ -561,6 +561,11 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
         }
 
         def _broadcast_cu_seqlens(cu_seqlens):
+            if getattr(args, 'cuda_graph_impl', 'none') == 'full_iteration':
+                assert cu_seqlens is None, (
+                    "cu_seqlens is not supported with cuda_graph_impl=full_iteration"
+                )
+                return
             dev = torch.cuda.current_device()
             n = 0 if cu_seqlens is None else int(cu_seqlens.numel())
             n_tensor = torch.empty(1, dtype=torch.int64, device=dev).fill_(n)
@@ -642,6 +647,8 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
         )
 
         def _broadcast_cu_seqlens():
+            if getattr(args, 'cuda_graph_impl', 'none') == 'full_iteration':
+                return None
             dev = torch.cuda.current_device()
 
             n = torch.empty((), dtype=torch.int64, device=dev)
