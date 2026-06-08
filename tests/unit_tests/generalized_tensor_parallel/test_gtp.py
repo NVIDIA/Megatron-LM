@@ -1,39 +1,32 @@
-# Copyright (c) 2022-2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-#
-# See LICENSE for license information.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Unit tests for Generalized Tensor Parallelism (GTP).
 
 Test groups
 -----------
-1.  TestGTPWeightState           – state-machine transitions (single-process)
-2.  TestGTPWeightCache           – coat-check buffer pool (single-process)
-3.  TestGTPSharding              – wrap_module_params_gtp: shard content + padding (multi-GPU)
-4.  TestWrapModuleParams         – wrap_module_params_gtp: param replacement + weight_list (multi-GPU)
-5.  TestLinearGTP                – Linear forward/backward numerical correctness (multi-GPU)
-6.  TestLayerNormLinearGTP       – LayerNormLinear forward/backward smoke test (multi-GPU)
-7.  TestGroupedLinearGTP         – GroupedLinear forward/backward smoke test (multi-GPU)
-8.  TestGTPPrefetchChain         – linked-list next_w/prev_w wiring (multi-GPU)
-9.  TestGTPWgradRS               – wgrad reduce-scatter shape + multi-layer deferred path (multi-GPU)
-10. TestGTPMicrobatches          – output consistency across microbatches (multi-GPU)
-11. TestNVFP4LinearGTP           – Linear + NVFP4 recipe: quantized shard setup, fwd/bwd (multi-GPU)
-12. TestNVFP4GroupedLinearGTP    – GroupedLinear + NVFP4 recipe: coalesced AG + fwd/bwd (multi-GPU)
-13. TestMXFP8LinearGTP           – Linear + MXFP8 recipe: quantized shard setup, fwd/bwd, padding (multi-GPU)
-14. TestGTPConfig                – update_gtp_config: valid/invalid keys (single-process)
-15. TestGTPShardedParamProperties – shape computations, get_padded_shard, _strip_padding (single-process)
-16. TestGTPCacheKey              – _get_cache_key: expert vs non-expert, fwd vs bwd (single-process)
-17. TestGTPCacheRelease          – reserve/get/release pool semantics (single-process)
-18. TestTagGTPParamsWithNames    – _debug_name population on GTPShardedParam (single-process)
-19. TestGTPGroupSizeOne          – wrap_module_params_gtp no-op when gtp_group.size()==1 (single-process)
-20. TestGTPPrefetchDisabled      – weight_prefetch=False: single-pass forward still works (multi-GPU)
-21. TestFuseWgradAccumulation    – fuse_wgrad_accumulation=True: wgrad→main_grad (multi-GPU)
-22. TestGTPGradAccumHook         – main_grad updated after reduce-scatter backward (multi-GPU)
-23. TestWaitAsyncCommsFallback   – wait_async_comms(finalize_after_drain=True) inline-accumulation fallback when _wgrad_rs_handle is None (single-process)
-24. TestGTPDDPBucketAlignment    – GTP and regular DDP buffer bucket ends padded for dist-opt alignment (multi-GPU)
-
-Run via torchrun (matches the rest of Megatron's unit tests):
-
-    torchrun --nproc-per-node 4 -m pytest tests/unit_tests/generalized_tensor_parallel/test_gtp.py -v
+1.  TestGTPWeightState           - state-machine transitions (single-process)
+2.  TestGTPWeightCache           - coat-check buffer pool + reserve/get/release semantics (single-process)
+3.  TestGTPSharding              - wrap_module_params_gtp: shard content + padding (multi-GPU)
+4.  TestWrapModuleParams         - wrap_module_params_gtp: param replacement + weight_list (multi-GPU)
+5.  TestLinearGTP                - Linear forward/backward numerical correctness (multi-GPU)
+6.  TestLayerNormLinearGTP       - LayerNormLinear forward/backward smoke test (multi-GPU)
+7.  TestGroupedLinearGTP         - GroupedLinear forward/backward smoke test (multi-GPU)
+8.  TestGTPPrefetchChain         - linked-list next_w/prev_w wiring (multi-GPU)
+9.  TestGTPWgradRS               - wgrad reduce-scatter shape + multi-layer deferred path (multi-GPU)
+10. TestGTPMicrobatches          - output consistency across microbatches (multi-GPU)
+11. TestNVFP4LinearGTP           - Linear + NVFP4 recipe: quantized shard setup, fwd/bwd (multi-GPU)
+12. TestNVFP4GroupedLinearGTP    - GroupedLinear + NVFP4 recipe: coalesced AG + fwd/bwd (multi-GPU)
+13. TestMXFP8LinearGTP           - Linear + MXFP8 recipe: quantized shard setup, fwd/bwd, padding (multi-GPU)
+14. TestGTPConfig                - update_gtp_config: valid/invalid keys (single-process)
+15. TestGTPShardedParamProperties - shape computations, get_padded_shard, _strip_padding (single-process)
+16. TestGTPCacheKey              - _get_cache_key: expert vs non-expert, fwd vs bwd (single-process)
+17. TestTagGTPParamsWithNames    - _debug_name population on GTPShardedParam (single-process)
+18. TestGTPGroupSizeOne          - wrap_module_params_gtp no-op when gtp_group.size()==1 (single-process)
+19. TestGTPPrefetchDisabled      - weight_prefetch=False: single-pass forward still works (multi-GPU)
+20. TestFuseWgradAccumulation    - fuse_wgrad_accumulation=True: wgrad→main_grad (multi-GPU)
+21. TestGTPGradAccumHook         - main_grad updated after reduce-scatter backward (multi-GPU)
+22. TestWaitAsyncCommsFallback   - wait_async_comms(finalize_after_drain=True) inline-accumulation fallback when _wgrad_rs_handle is None (single-process)
+23. TestGTPDDPBucketAlignment    - GTP and regular DDP buffer bucket ends padded for dist-opt alignment (multi-GPU)
 
 Multi-GPU tests skip when ``torch.distributed.get_world_size()`` doesn't match the required
 world size (4 for everything in this file).
@@ -51,81 +44,41 @@ if not HAVE_GTP:
 
 import transformer_engine.pytorch as te
 from transformer_engine.common.recipe import NVFP4BlockScaling
-from transformer_engine.pytorch import fp8_autocast, is_mxfp8_available, is_nvfp4_available
-from transformer_engine.pytorch.quantization import FP8GlobalStateManager
+from transformer_engine.pytorch import fp8_autocast
 from transformer_engine.pytorch.quantized_tensor import QuantizedTensor
 
 import megatron.experimental.gtp.generalized_tensor_parallelism as gtp_module
 from megatron.experimental.gtp import GTPShardedParam, wrap_module_params_gtp
 from megatron.experimental.gtp.generalized_tensor_parallelism import GTPWeightCache, GTPWeightState
-from tests.unit_tests.test_utilities import Utils
-
-# ---------------------------------------------------------------------------
-# Fixtures
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture(scope="module", autouse=True)
-def _torchrun_dist_init():
-    """Initialize the torchrun-managed dist group once per module.
-
-    GTP tests use ``dist.new_group(...)`` to build their own GTP subgroup
-    within the world that torchrun set up. Each test runs on every torchrun
-    rank in parallel (standard Mcore convention); ``_run_distributed`` below
-    only skips when the required world size doesn't match what torchrun
-    provides.
-    """
-    Utils.initialize_model_parallel()
-    yield
-    Utils.destroy_model_parallel()
+from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (
+    _make_gtp_grouped_linear,
+    _make_gtp_linear,
+    _requires_multi_gpu,
+    _requires_mxfp8,
+    _requires_nvfp4,
+    _run_distributed,
+    _torchrun_dist_init,
+    reset_fp8_state,
+    reset_gtp_globals,
+)
 
 
-@pytest.fixture(autouse=True)
-def reset_fp8_state():
-    yield
-    FP8GlobalStateManager.reset()
+class _FakeGroup:
+    """Minimal mock for a dist process group — used in single-process unit tests."""
 
+    def __init__(self, size=1, rank=0):
+        self._size = size
+        self._rank = rank
 
-@pytest.fixture(autouse=True)
-def reset_gtp_globals():
-    """Reset all GTP mutable class/module-level state between tests."""
-    yield
-    GTPShardedParam._chain_state = {}
+    def size(self):
+        return self._size
+
+    def rank(self):
+        return self._rank
 
 
 # ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-def _run_distributed(fn, required_world_size: int, *args) -> None:
-    """Run ``fn`` on every torchrun rank.
-
-    ``fn(rank, world_size, port, *args)`` matches the pre-existing worker
-    signature; ``port`` is unused (dist already initialized by torchrun) but
-    kept so the worker bodies don't need editing.
-    """
-    actual_world_size = torch.distributed.get_world_size()
-    if actual_world_size != required_world_size:
-        pytest.skip(
-            f"Requires world_size={required_world_size}, "
-            f"got {actual_world_size} (launch with torchrun --nproc-per-node={required_world_size})"
-        )
-    fn(torch.distributed.get_rank(), actual_world_size, None, *args)
-
-
-def _requires_multi_gpu(n: int = 4):
-    if torch.cuda.device_count() < n:
-        pytest.skip(f"Requires at least {n} CUDA devices")
-
-
-def _requires_nvfp4():
-    if not is_nvfp4_available():
-        pytest.skip("NVFP4 not available (requires compute capability >= 10.0)")
-
-
-# ---------------------------------------------------------------------------
-# 1. GTPWeightState – state-machine transition tests
+# 1. GTPWeightState - state-machine transition tests
 # ---------------------------------------------------------------------------
 
 
@@ -161,25 +114,15 @@ class TestGTPWeightState:
 
 
 # ---------------------------------------------------------------------------
-# 2. GTPWeightCache – coat-check buffer pool tests
+# 2. GTPWeightCache - coat-check buffer pool tests
 # ---------------------------------------------------------------------------
 
 
 class TestGTPWeightCache:
 
-    class _FakeGroup:
-        def __init__(self, size=2):
-            self._size = size
-
-        def size(self):
-            return self._size
-
-        def rank(self):
-            return 0
-
     def _param(self, shape=(8, 4), gtp_size=2):
         p = GTPShardedParam(torch.zeros(*shape))
-        p.group = self._FakeGroup(gtp_size)
+        p.group = _FakeGroup(size=gtp_size)
         p.expert_idx = None
         p.pad_length = 0
         p._quantizer = None
@@ -246,6 +189,22 @@ class TestGTPWeightCache:
         assert buf1.shape != buf2.shape
         cache.release(t1)
         cache.release(t2)
+
+    def test_without_release_pool_stays_empty(self):
+        """Without release(), subsequent reserves allocate fresh buffers."""
+        cache = GTPWeightCache()
+        p = self._param()
+        t1 = cache.reserve(p, torch.bfloat16, fwd=True)
+        buf1 = cache.get(t1)
+        # Do NOT release t1 — pool stays empty
+        t2 = cache.reserve(p, torch.bfloat16, fwd=True)
+        buf2 = cache.get(t2)
+        assert buf2 is not buf1, "Without release, a fresh buffer must be allocated"
+
+    def test_release_invalid_ticket_raises(self):
+        cache = GTPWeightCache()
+        with pytest.raises(KeyError):
+            cache.release(9999)
 
     def test_fwd_bwd_tickets_are_distinct(self):
         """fwd=True and fwd=False reserves always receive distinct ticket IDs."""
@@ -331,14 +290,7 @@ class TestGTPSharding:
 def _worker_linear_param_replaced(rank, world_size, port):
     in_f, out_f = 64, 128
     gtp_group = dist.new_group(list(range(world_size)))
-    layer = te.Linear(
-        in_features=in_f,
-        out_features=out_f,
-        bias=False,
-        params_dtype=torch.bfloat16,
-        device="cuda",
-        gtp_group=gtp_group,
-    )
+    layer = _make_gtp_linear(in_f, out_f, gtp_group)
     w = layer.weight
     assert isinstance(w, GTPShardedParam), "weight must be GTPShardedParam"
     assert w.shape == (out_f // world_size, in_f), f"unexpected shard shape {w.shape}"
@@ -348,15 +300,7 @@ def _worker_linear_param_replaced(rank, world_size, port):
 def _worker_grouped_weight_list(rank, world_size, port):
     num_gemms, in_f, out_f = 3, 32, 64
     gtp_group = dist.new_group(list(range(world_size)))
-    layer = te.GroupedLinear(
-        num_gemms=num_gemms,
-        in_features=in_f,
-        out_features=out_f,
-        bias=False,
-        params_dtype=torch.bfloat16,
-        device="cuda",
-        gtp_group=gtp_group,
-    )
+    layer = _make_gtp_grouped_linear(num_gemms, in_f, out_f, gtp_group)
     w0 = layer.weight0
     assert isinstance(w0, GTPShardedParam)
     assert w0.weight_list is not None
@@ -386,14 +330,7 @@ def _worker_linear_correctness(rank, world_size, port):
     dtype = torch.bfloat16
     gtp_group = dist.new_group(list(range(world_size)))
 
-    layer = te.Linear(
-        in_features=in_f,
-        out_features=out_f,
-        bias=False,
-        params_dtype=dtype,
-        device="cuda",
-        gtp_group=gtp_group,
-    )
+    layer = _make_gtp_linear(in_f, out_f, gtp_group, dtype)
 
     # Reconstruct full weight from shards (all-gather)
     shard = layer.weight.data.clone()
@@ -417,7 +354,7 @@ def _worker_linear_correctness(rank, world_size, port):
 
     assert out_gtp.shape == out_ref.shape, f"Shape mismatch {out_gtp.shape} vs {out_ref.shape}"
     assert torch.allclose(
-        out_gtp.float(), out_ref.float(), atol=0.1, rtol=0.1
+        out_gtp.float(), out_ref.float(), atol=1e-5, rtol=1e-5
     ), f"Output mismatch max_diff={(out_gtp.float()-out_ref.float()).abs().max():.4f}"
 
     # wgrad RS path always accumulates into main_grad; allocate before backward.
@@ -431,7 +368,7 @@ def _worker_linear_correctness(rank, world_size, port):
 
     assert inp_gtp.grad is not None
     assert torch.allclose(
-        inp_gtp.grad.float(), inp_ref.grad.float(), atol=0.1, rtol=0.1
+        inp_gtp.grad.float(), inp_ref.grad.float(), atol=1e-5, rtol=1e-5
     ), f"dX mismatch max_diff={(inp_gtp.grad.float()-inp_ref.grad.float()).abs().max():.4f}"
 
 
@@ -490,15 +427,7 @@ def _worker_grouped_linear(rank, world_size, port, num_gemms):
     dtype = torch.bfloat16
     gtp_group = dist.new_group(list(range(world_size)))
 
-    layer = te.GroupedLinear(
-        num_gemms=num_gemms,
-        in_features=in_f,
-        out_features=out_f,
-        bias=False,
-        params_dtype=dtype,
-        device="cuda",
-        gtp_group=gtp_group,
-    )
+    layer = _make_gtp_grouped_linear(num_gemms, in_f, out_f, gtp_group, dtype)
     assert isinstance(layer.weight0, GTPShardedParam)
 
     m_splits = [total_tokens // num_gemms] * num_gemms
@@ -535,22 +464,8 @@ def _worker_chain_wired(rank, world_size, port):
     dtype = torch.bfloat16
     gtp_group = dist.new_group(list(range(world_size)))
 
-    l0 = te.Linear(
-        in_features=in_f,
-        out_features=out_f,
-        bias=False,
-        params_dtype=dtype,
-        device="cuda",
-        gtp_group=gtp_group,
-    )
-    l1 = te.Linear(
-        in_features=in_f,
-        out_features=out_f,
-        bias=False,
-        params_dtype=dtype,
-        device="cuda",
-        gtp_group=gtp_group,
-    )
+    l0 = _make_gtp_linear(in_f, out_f, gtp_group, dtype)
+    l1 = _make_gtp_linear(in_f, out_f, gtp_group, dtype)
 
     inp = torch.randn(4, in_f, dtype=dtype, device="cuda")
     dist.broadcast(inp, src=0)
@@ -573,22 +488,8 @@ def _worker_chain_async_prefetch(rank, world_size, port):
     dtype = torch.bfloat16
     gtp_group = dist.new_group(list(range(world_size)))
 
-    l0 = te.Linear(
-        in_features=in_f,
-        out_features=out_f,
-        bias=False,
-        params_dtype=dtype,
-        device="cuda",
-        gtp_group=gtp_group,
-    )
-    l1 = te.Linear(
-        in_features=in_f,
-        out_features=out_f,
-        bias=False,
-        params_dtype=dtype,
-        device="cuda",
-        gtp_group=gtp_group,
-    )
+    l0 = _make_gtp_linear(in_f, out_f, gtp_group, dtype)
+    l1 = _make_gtp_linear(in_f, out_f, gtp_group, dtype)
 
     inp = torch.randn(4, in_f, dtype=dtype, device="cuda")
     dist.broadcast(inp, src=0)
@@ -621,15 +522,7 @@ def _worker_wgrad_shape(rank, world_size, port):
     dtype = torch.bfloat16
     gtp_group = dist.new_group(list(range(world_size)))
 
-    layer = te.Linear(
-        in_features=in_f,
-        out_features=out_f,
-        bias=False,
-        params_dtype=dtype,
-        device="cuda",
-        gtp_group=gtp_group,
-        fuse_wgrad_accumulation=False,
-    )
+    layer = _make_gtp_linear(in_f, out_f, gtp_group, dtype, fuse_wgrad_accumulation=False)
     inp = torch.randn(8, in_f, dtype=dtype, device="cuda", requires_grad=True)
     dist.broadcast(inp, src=0)
 
@@ -648,22 +541,8 @@ def _worker_multilayer_deferred_rs(rank, world_size, port):
     dtype = torch.bfloat16
     gtp_group = dist.new_group(list(range(world_size)))
 
-    l0 = te.Linear(
-        in_features=in_f,
-        out_features=out_f,
-        bias=False,
-        params_dtype=dtype,
-        device="cuda",
-        gtp_group=gtp_group,
-    )
-    l1 = te.Linear(
-        in_features=in_f,
-        out_features=out_f,
-        bias=False,
-        params_dtype=dtype,
-        device="cuda",
-        gtp_group=gtp_group,
-    )
+    l0 = _make_gtp_linear(in_f, out_f, gtp_group, dtype)
+    l1 = _make_gtp_linear(in_f, out_f, gtp_group, dtype)
 
     inp = torch.randn(8, in_f, dtype=dtype, device="cuda", requires_grad=True)
     dist.broadcast(inp, src=0)
@@ -702,14 +581,7 @@ def _worker_microbatches(rank, world_size, port):
     dtype = torch.bfloat16
     gtp_group = dist.new_group(list(range(world_size)))
 
-    layer = te.Linear(
-        in_features=in_f,
-        out_features=out_f,
-        bias=False,
-        params_dtype=dtype,
-        device="cuda",
-        gtp_group=gtp_group,
-    )
+    layer = _make_gtp_linear(in_f, out_f, gtp_group, dtype)
     inp = torch.randn(batch, in_f, dtype=dtype, device="cuda")
     dist.broadcast(inp, src=0)
 
@@ -743,18 +615,11 @@ def _worker_nvfp4_linear(rank, world_size, port):
     dtype = torch.bfloat16
     gtp_group = dist.new_group(list(range(world_size)))
 
-    layer = te.Linear(
-        in_features=in_f,
-        out_features=out_f,
-        bias=False,
-        params_dtype=dtype,
-        device="cuda",
-        gtp_group=gtp_group,
-    )
+    layer = _make_gtp_linear(in_f, out_f, gtp_group, dtype)
     inp = torch.randn(batch, in_f, dtype=dtype, device="cuda", requires_grad=True)
     dist.broadcast(inp, src=0)
 
-    # Forward under NVFP4 recipe – triggers setup() and NVFP4 quantization
+    # Forward under NVFP4 recipe - triggers setup() and NVFP4 quantization
     recipe = NVFP4BlockScaling()
     with fp8_autocast(enabled=True, fp8_recipe=recipe):
         out = layer(inp, is_first_microbatch=True)
@@ -794,14 +659,7 @@ def _worker_nvfp4_linear_unaligned(rank, world_size, port):
     dtype = torch.bfloat16
     gtp_group = dist.new_group(list(range(world_size)))
 
-    layer = te.Linear(
-        in_features=in_f,
-        out_features=out_f,
-        bias=False,
-        params_dtype=dtype,
-        device="cuda",
-        gtp_group=gtp_group,
-    )
+    layer = _make_gtp_linear(in_f, out_f, gtp_group, dtype)
     inp = torch.randn(batch, in_f, dtype=dtype, device="cuda", requires_grad=True)
     dist.broadcast(inp, src=0)
 
@@ -839,15 +697,7 @@ def _worker_nvfp4_grouped_linear(rank, world_size, port, num_gemms):
     dtype = torch.bfloat16
     gtp_group = dist.new_group(list(range(world_size)))
 
-    layer = te.GroupedLinear(
-        num_gemms=num_gemms,
-        in_features=in_f,
-        out_features=out_f,
-        bias=False,
-        params_dtype=dtype,
-        device="cuda",
-        gtp_group=gtp_group,
-    )
+    layer = _make_gtp_grouped_linear(num_gemms, in_f, out_f, gtp_group, dtype)
     assert isinstance(layer.weight0, GTPShardedParam)
 
     m_splits = [total_tokens // num_gemms] * num_gemms
@@ -902,18 +752,11 @@ def _worker_mxfp8_linear(rank, world_size, port):
     dtype = torch.bfloat16
     gtp_group = dist.new_group(list(range(world_size)))
 
-    layer = te.Linear(
-        in_features=in_f,
-        out_features=out_f,
-        bias=False,
-        params_dtype=dtype,
-        device="cuda",
-        gtp_group=gtp_group,
-    )
+    layer = _make_gtp_linear(in_f, out_f, gtp_group, dtype)
     inp = torch.randn(batch, in_f, dtype=dtype, device="cuda", requires_grad=True)
     dist.broadcast(inp, src=0)
 
-    # Forward under MXFP8 recipe – triggers setup() and MXFP8 quantization
+    # Forward under MXFP8 recipe - triggers setup() and MXFP8 quantization
     recipe = MXFP8BlockScaling()
     with fp8_autocast(enabled=True, fp8_recipe=recipe):
         out = layer(inp, is_first_microbatch=True)
@@ -960,14 +803,7 @@ def _worker_mxfp8_linear_unaligned(rank, world_size, port):
     dtype = torch.bfloat16
     gtp_group = dist.new_group(list(range(world_size)))
 
-    layer = te.Linear(
-        in_features=in_f,
-        out_features=out_f,
-        bias=False,
-        params_dtype=dtype,
-        device="cuda",
-        gtp_group=gtp_group,
-    )
+    layer = _make_gtp_linear(in_f, out_f, gtp_group, dtype)
     inp = torch.randn(batch, in_f, dtype=dtype, device="cuda", requires_grad=True)
     dist.broadcast(inp, src=0)
 
@@ -977,12 +813,6 @@ def _worker_mxfp8_linear_unaligned(rank, world_size, port):
     # After _strip_padding removes the padded rows, output has out_f (not padded) cols.
     assert out.shape == (batch, out_f), f"unexpected output shape {out.shape}"
     assert torch.isfinite(out).all(), "MXFP8 GTP (unaligned) output has non-finite values"
-
-
-def _requires_mxfp8():
-    available, reason = is_mxfp8_available(return_reason=True)
-    if not available:
-        pytest.skip(f"MXFP8 not available: {reason}")
 
 
 class TestMXFP8LinearGTP:
@@ -1026,26 +856,15 @@ class TestGTPConfig:
 
 
 # ---------------------------------------------------------------------------
-# 15. GTPShardedParam properties – shape computations and padding
+# 15. GTPShardedParam properties - shape computations and padding
 # ---------------------------------------------------------------------------
 
 
 class TestGTPShardedParamProperties:
 
-    class _FakeGroup:
-        def __init__(self, size=4, rank=0):
-            self._size = size
-            self._rank = rank
-
-        def size(self):
-            return self._size
-
-        def rank(self):
-            return self._rank
-
     def _make_param(self, shape, pad_length=0, group_size=4, group_rank=0):
         p = GTPShardedParam(torch.zeros(*shape))
-        p.group = self._FakeGroup(size=group_size, rank=group_rank)
+        p.group = _FakeGroup(size=group_size, rank=group_rank)
         p.pad_length = pad_length
         p.expert_idx = None
         return p
@@ -1086,7 +905,7 @@ class TestGTPShardedParamProperties:
     def test_get_padded_shard_identity_when_no_padding(self):
         p = self._make_param((6, 4), pad_length=0)
         result = p.get_padded_shard()
-        assert result is p  # identity – no copy needed
+        assert result is p  # identity - no copy needed
 
     def test_get_padded_shard_identity_non_last_rank(self):
         # pad_length > 0 but not the padded last rank → no padding added
@@ -1125,22 +944,15 @@ class TestGTPShardedParamProperties:
 
 
 # ---------------------------------------------------------------------------
-# 16. _get_cache_key – expert vs non-expert, fwd vs bwd
+# 16. _get_cache_key - expert vs non-expert, fwd vs bwd
 # ---------------------------------------------------------------------------
 
 
 class TestGTPCacheKey:
 
-    class _FakeGroup:
-        def size(self):
-            return 4
-
-        def rank(self):
-            return 0
-
     def _param(self, shape=(16, 32), expert_idx=None):
         p = GTPShardedParam(torch.zeros(*shape))
-        p.group = self._FakeGroup()
+        p.group = _FakeGroup(size=4)
         p.expert_idx = expert_idx
         p.pad_length = 0
         return p
@@ -1193,70 +1005,7 @@ class TestGTPCacheKey:
 
 
 # ---------------------------------------------------------------------------
-# 17. GTPWeightCache.take() deferred vs get() immediate pool return
-# ---------------------------------------------------------------------------
-
-
-class TestGTPCacheRelease:
-    """Tests for GTPWeightCache reserve/get/release semantics."""
-
-    class _FakeGroup:
-        def size(self):
-            return 2
-
-        def rank(self):
-            return 0
-
-    def _param(self, shape=(8, 4)):
-        p = GTPShardedParam(torch.zeros(*shape))
-        p.group = self._FakeGroup()
-        p.expert_idx = None
-        p.pad_length = 0
-        p._quantizer = None
-        return p
-
-    def test_release_returns_buffer_to_pool(self):
-        """release() puts the buffer back so the next reserve+get reuses it."""
-        cache = GTPWeightCache()
-        p = self._param()
-        t1 = cache.reserve(p, torch.bfloat16, fwd=True)
-        buf1 = cache.get(t1)
-        cache.release(t1)
-        # New ticket should pop buf1 from pool
-        t2 = cache.reserve(p, torch.bfloat16, fwd=True)
-        buf2 = cache.get(t2)
-        assert buf2 is buf1, "Buffer should be reused after release()"
-        cache.release(t2)
-
-    def test_without_release_pool_stays_empty(self):
-        """Without release(), subsequent reserves allocate fresh buffers."""
-        cache = GTPWeightCache()
-        p = self._param()
-        t1 = cache.reserve(p, torch.bfloat16, fwd=True)
-        buf1 = cache.get(t1)
-        # Do NOT release t1 — pool stays empty
-        t2 = cache.reserve(p, torch.bfloat16, fwd=True)
-        buf2 = cache.get(t2)
-        assert buf2 is not buf1, "Without release, a fresh buffer must be allocated"
-
-    def test_get_same_ticket_returns_same_buf(self):
-        """get() is idempotent — calling it twice returns the same buffer."""
-        cache = GTPWeightCache()
-        p = self._param()
-        t = cache.reserve(p, torch.bfloat16, fwd=True)
-        buf_a = cache.get(t)
-        buf_b = cache.get(t)
-        assert buf_a is buf_b
-        cache.release(t)
-
-    def test_release_invalid_ticket_raises(self):
-        cache = GTPWeightCache()
-        with pytest.raises(KeyError):
-            cache.release(9999)
-
-
-# ---------------------------------------------------------------------------
-# 18. tag_gtp_params_with_names – _debug_name population
+# 17. tag_gtp_params_with_names - _debug_name population
 # ---------------------------------------------------------------------------
 
 
@@ -1264,14 +1013,6 @@ class TestTagGTPParamsWithNames:
 
     def test_debug_name_populated_for_gtp_param(self):
         """GTPShardedParam._debug_name is set to the dotted parameter path."""
-
-        class _FakeGroup:
-            def size(self):
-                return 1
-
-            def rank(self):
-                return 0
-
         model = nn.Linear(4, 8, bias=False)
         w = GTPShardedParam(torch.randn(8, 4))
         w.group = _FakeGroup()
@@ -1282,14 +1023,6 @@ class TestTagGTPParamsWithNames:
 
     def test_nested_module_debug_name(self):
         """Nested module produces a dotted debug name."""
-
-        class _FakeGroup:
-            def size(self):
-                return 1
-
-            def rank(self):
-                return 0
-
         outer = nn.Sequential(nn.Linear(4, 8, bias=False))
         w = GTPShardedParam(torch.randn(8, 4))
         w.group = _FakeGroup()
@@ -1305,24 +1038,17 @@ class TestTagGTPParamsWithNames:
 
 
 # ---------------------------------------------------------------------------
-# 19. wrap_module_params_gtp is a no-op when gtp_group.size() == 1
+# 18. wrap_module_params_gtp is a no-op when gtp_group.size() == 1
 # ---------------------------------------------------------------------------
 
 
 class TestGTPGroupSizeOne:
 
-    class _SingletonGroup:
-        def size(self):
-            return 1
-
-        def rank(self):
-            return 0
-
     def test_no_sharding_when_gtp_size_one(self):
         """wrap_module_params_gtp must be a no-op for a singleton GTP group."""
         mod = nn.Linear(32, 64, bias=False)
         original_weight = mod.weight
-        wrap_module_params_gtp(mod, ["weight"], self._SingletonGroup())
+        wrap_module_params_gtp(mod, ["weight"], _FakeGroup())
         assert (
             mod.weight is original_weight
         ), "gtp_group.size()==1 should leave parameters unchanged"
@@ -1330,7 +1056,7 @@ class TestGTPGroupSizeOne:
 
 
 # ---------------------------------------------------------------------------
-# 21. weight_prefetch=False: forward still produces correct output
+# 19. weight_prefetch=False: forward still produces correct output
 # ---------------------------------------------------------------------------
 
 
@@ -1342,22 +1068,8 @@ def _worker_prefetch_disabled(rank, world_size, port):
 
     gtp_module.update_gtp_config(weight_prefetch=False)
     try:
-        l0 = te.Linear(
-            in_features=in_f,
-            out_features=out_f,
-            bias=False,
-            params_dtype=dtype,
-            device="cuda",
-            gtp_group=gtp_group,
-        )
-        l1 = te.Linear(
-            in_features=in_f,
-            out_features=out_f,
-            bias=False,
-            params_dtype=dtype,
-            device="cuda",
-            gtp_group=gtp_group,
-        )
+        l0 = _make_gtp_linear(in_f, out_f, gtp_group, dtype)
+        l1 = _make_gtp_linear(in_f, out_f, gtp_group, dtype)
 
         inp = torch.randn(4, in_f, dtype=dtype, device="cuda")
         dist.broadcast(inp, src=0)
@@ -1379,7 +1091,7 @@ class TestGTPPrefetchDisabled:
 
 
 # ---------------------------------------------------------------------------
-# 22. fuse_wgrad_accumulation=True: wgrad is accumulated into main_grad
+# 20. fuse_wgrad_accumulation=True: wgrad is accumulated into main_grad
 # ---------------------------------------------------------------------------
 
 
@@ -1389,15 +1101,7 @@ def _worker_fuse_wgrad(rank, world_size, port):
     dtype = torch.bfloat16
     gtp_group = dist.new_group(list(range(world_size)))
 
-    layer = te.Linear(
-        in_features=in_f,
-        out_features=out_f,
-        bias=False,
-        params_dtype=dtype,
-        device="cuda",
-        gtp_group=gtp_group,
-        fuse_wgrad_accumulation=True,
-    )
+    layer = _make_gtp_linear(in_f, out_f, gtp_group, dtype, fuse_wgrad_accumulation=True)
 
     # Allocate main_grad on the local shard shape
     w = layer.weight
@@ -1421,7 +1125,7 @@ class TestFuseWgradAccumulation:
 
 
 # ---------------------------------------------------------------------------
-# 23. _grad_accum_hook is called after reduce-scatter
+# 21. _grad_accum_hook is called after reduce-scatter
 # ---------------------------------------------------------------------------
 
 
@@ -1432,14 +1136,7 @@ def _worker_main_grad_updated_after_bwd(rank, world_size, port):
     dtype = torch.bfloat16
     gtp_group = dist.new_group(list(range(world_size)))
 
-    layer = te.Linear(
-        in_features=in_f,
-        out_features=out_f,
-        bias=False,
-        params_dtype=dtype,
-        device="cuda",
-        gtp_group=gtp_group,
-    )
+    layer = _make_gtp_linear(in_f, out_f, gtp_group, dtype)
 
     # wgrad RS path always accumulates into main_grad; allocate before backward.
     layer.weight.main_grad = torch.zeros(layer.weight.shape, dtype=dtype, device="cuda")
@@ -1460,7 +1157,7 @@ class TestGTPGradAccumHook:
 
 
 # ---------------------------------------------------------------------------
-# 24. wait_async_comms(finalize_after_drain=True) inline-accumulation fallback
+# 22. wait_async_comms(finalize_after_drain=True) inline-accumulation fallback
 # ---------------------------------------------------------------------------
 
 
@@ -1478,33 +1175,33 @@ class TestWaitAsyncCommsFallback:
     pin down the fallback's contract.
     """
 
-    class _FakeGroup:
-        def size(self):
-            return 1
-
-        def rank(self):
-            return 0
-
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-    def test_fallback_accumulates_when_no_rs_handle(self):
+    @staticmethod
+    def _make_inflight_param(main_grad_fill=0.0, already_finalized=False):
+        """Build a minimal GTPShardedParam wired for wait_async_comms testing."""
         dtype = torch.bfloat16
         p = GTPShardedParam(torch.zeros(8, 4, dtype=dtype, device="cuda"))
-        p.group = self._FakeGroup()
+        p.group = _FakeGroup()
         p.expert_idx = None
         p.pad_length = 0
         p.chain_id = gtp_module.GTPChain.UNGRAPHED.value
         p._quantizer = None
         p.is_routed_expert = False  # ⇒ self._weights property returns [self]
-        p.main_grad = torch.zeros(8, 4, dtype=dtype, device="cuda")
-        p._prefetch_handle = None  # _wait_param_gather is no-op
-        p._wgrad_rs_handle = None  # _wait_reduce_scatter is no-op → fallback fires
+        p.main_grad = torch.full((8, 4), main_grad_fill, dtype=dtype, device="cuda")
+        p._prefetch_handle = None   # _wait_param_gather is no-op
+        p._wgrad_rs_handle = None   # _wait_reduce_scatter is no-op → fallback fires
         p._cached_ag_stream = None
         p._cached_rs_stream = None
         p.ag_event = torch.cuda.Event(external=True)
         p.rs_event = torch.cuda.Event(external=True)
-        p.rs_event.record()  # so rs_event.wait() in fallback doesn't block
-        p._already_finalized = False
+        p.rs_event.record()         # so rs_event.wait() in fallback doesn't block
+        p._already_finalized = already_finalized
         p.grad_added_to_main_grad = False
+        return p
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_fallback_accumulates_when_no_rs_handle(self):
+        dtype = torch.bfloat16
+        p = self._make_inflight_param(main_grad_fill=0.0)
 
         # Place a known wgrad in the cache for the fallback to read.
         cache = gtp_module.get_global_GTP_cache()
@@ -1534,27 +1231,8 @@ class TestWaitAsyncCommsFallback:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
     def test_fallback_skipped_when_already_finalized(self):
         """When _already_finalized=True, the fallback must NOT re-accumulate."""
-        dtype = torch.bfloat16
-        p = GTPShardedParam(torch.zeros(8, 4, dtype=dtype, device="cuda"))
-        p.group = self._FakeGroup()
-        p.expert_idx = None
-        p.pad_length = 0
-        p.chain_id = gtp_module.GTPChain.UNGRAPHED.value
-        p._quantizer = None
-        p.is_routed_expert = False  # ⇒ self._weights property returns [self]
-        # Pre-existing main_grad with a value the fallback must NOT overwrite.
-        p.main_grad = torch.full((8, 4), 5.0, dtype=dtype, device="cuda")
-        p._prefetch_handle = None
-        p._wgrad_rs_handle = None
-        p._cached_ag_stream = None
-        p._cached_rs_stream = None
-        p.ag_event = torch.cuda.Event(external=True)
-        p.rs_event = torch.cuda.Event(external=True)
-        p.rs_event.record()
-        p._already_finalized = True  # ← short-circuits the fallback
-
-        # No _rs_ticket: if the fallback ran it would AttributeError on
-        # cache.get(None).  The skip path must not touch the cache at all.
+        p = self._make_inflight_param(main_grad_fill=5.0, already_finalized=True)
+        # No _rs_ticket: if the fallback ran it would AttributeError on cache.get(None).
         p._rs_ticket = None
 
         saved = set(gtp_module._inflight_comm_params)
@@ -1584,24 +1262,7 @@ class TestWaitAsyncCommsFallback:
         called cache.get(None) and crashed with KeyError; the guard now skips
         the inline accumulation entirely when no weight has an RS ticket.
         """
-        dtype = torch.bfloat16
-        p = GTPShardedParam(torch.zeros(8, 4, dtype=dtype, device="cuda"))
-        p.group = self._FakeGroup()
-        p.expert_idx = None
-        p.pad_length = 0
-        p.chain_id = gtp_module.GTPChain.UNGRAPHED.value
-        p._quantizer = None
-        p.is_routed_expert = False
-        # Pre-existing main_grad with a sentinel that must survive untouched.
-        p.main_grad = torch.full((8, 4), 7.0, dtype=dtype, device="cuda")
-        p._prefetch_handle = None
-        p._wgrad_rs_handle = None
-        p._cached_ag_stream = None
-        p._cached_rs_stream = None
-        p.ag_event = torch.cuda.Event(external=True)
-        p.rs_event = torch.cuda.Event(external=True)
-        p.rs_event.record()
-        p._already_finalized = False
+        p = self._make_inflight_param(main_grad_fill=7.0)
         # Critical: simulates a pure-AG prefetch — no RS ever issued, ticket is None.
         p._rs_ticket = None
 
@@ -1627,7 +1288,7 @@ class TestWaitAsyncCommsFallback:
 
 
 # ---------------------------------------------------------------------------
-# 24. GTP DDP bucket alignment: distributed optimizer bucket-end assertion
+# 23. GTP DDP bucket alignment: distributed optimizer bucket-end assertion
 # ---------------------------------------------------------------------------
 
 

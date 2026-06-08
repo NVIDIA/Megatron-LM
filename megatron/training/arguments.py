@@ -1441,9 +1441,9 @@ def validate_args(args, defaults={}):
             # architectures. Assigning high priority to communication streams ensures that
             # communication kernels are scheduled with higher priority, minimizing the exposed
             # communication when it is overlapped with other computation kernels.
-            if 'ps' not in args.high_priority_stream_groups:
-                args.high_priority_stream_groups.append('ps')
-                warn_rank_0("Setting 'ps' group for high priority streams.")
+            if 'gtp' not in args.high_priority_stream_groups:
+                args.high_priority_stream_groups.append('gtp')
+                warn_rank_0("Setting 'gtp' group for high priority streams.")
             if egtp_size > 1 and 'expt_gtp' not in args.high_priority_stream_groups:
                 args.high_priority_stream_groups.append('expt_gtp')
                 warn_rank_0("Setting 'expt_gtp' group for high priority streams.")
