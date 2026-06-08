@@ -670,6 +670,13 @@ class TopKRouter(Router):
         # and get flattened to [s*b, h]. Transpose to match.
         flat_ids = input_ids.T.reshape(-1)
         top_indices = self.tid2eid[flat_ids].long()  # [num_tokens, topk]
+        if (
+            self.config.moe_router_force_load_balancing
+            or self.config.moe_router_force_biased is not None
+        ):
+            # override top_indices with random topk indices
+            # logits in processed by apply_random_logits or apply_biased_logits
+            _, top_indices = torch.topk(logits, k=self.topk, dim=1)
 
         probs = scores.gather(1, top_indices)
         if self.score_function != "softmax":

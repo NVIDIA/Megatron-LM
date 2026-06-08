@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
 import inspect
@@ -324,13 +324,20 @@ class TEGroupedMLP(MegatronModule):
             logger.warning("TE fused GroupedMLP not available: %s", reason)
             return False
 
+        def _activation_name():
+            return getattr(
+                self.config.activation_func, "__name__", str(self.config.activation_func)
+            )
+
         # Check Transformer Engine installation
         if not HAVE_TE:
             return _unsupported("Transformer Engine is not installed")
         try:
-            from transformer_engine.pytorch.ops import GroupedLinear, ScaledSwiGLU
+            from transformer_engine.pytorch import ops as te_ops
         except ImportError:
-            return _unsupported("TE too old (missing pytorch.ops.GroupedLinear)")
+            return _unsupported("TE too old (missing pytorch.ops)")
+        if not hasattr(te_ops, "GroupedLinear") or not hasattr(te_ops, "ScaledSwiGLU"):
+            return _unsupported("TE too old (missing GroupedLinear/ScaledSwiGLU ops)")
 
         if not is_te_min_version("2.14.0"):
             return _unsupported("TE version < 2.14.0")
@@ -349,8 +356,9 @@ class TEGroupedMLP(MegatronModule):
         if not isinstance(self.linear_fc2, te.pytorch.GroupedLinear):
             return _unsupported(f"linear_fc2 is {type(self.linear_fc2).__name__}")
 
-        # Check activation: SwiGLU or quick GEGLU (ScaledClampedQGeGLU, TE >= 2.15) on the
-        # gated-linear-unit path, or weighted squared ReLU (ScaledSReLU) on the non-GLU path.
+        # Check activation: SwiGLU, quick GEGLU, or weighted squared ReLU.
+        # Clamped SwiGLU (e.g. DSv4) routes through ScaledClampedQGeGLU with
+        # alpha=1.0, since the cuDNN geglu kernel is a superset of swiglu.
         # Use config.activation_func instead of self.activation_func because when
         # use_te_activation_func is True, self.activation_func is a TE module, not the raw function.
         use_glu_fusion = self.config.gated_linear_unit and self.config.activation_func in (
@@ -364,35 +372,35 @@ class TEGroupedMLP(MegatronModule):
         )
         if not (use_glu_fusion or use_srelu_fusion):
             return _unsupported(
-                f"unsupported activation/config: gated_linear_unit="
-                f"{self.config.gated_linear_unit}, activation={self.config.activation_func}"
+                f"unsupported activation {_activation_name()} "
+                f"(gated_linear_unit={self.config.gated_linear_unit}, "
+                f"use_fused_weighted_squared_relu={self.config.use_fused_weighted_squared_relu})"
             )
-        if self.config.activation_func == quick_gelu:
-            try:
-                from transformer_engine.pytorch.ops import ScaledClampedQGeGLU  # noqa: F401
-            except ImportError:
+        if self.config.activation_func == F.silu:
+            if self.config.activation_func_clamp_value is not None:
+                if not is_te_min_version("2.17.0.dev0"):
+                    return _unsupported("clamped SwiGLU needs TE >= 2.17.0.dev0")
+                if not hasattr(te_ops, "ScaledClampedQGeGLU"):
+                    return _unsupported("clamped SwiGLU needs ScaledClampedQGeGLU")
+        elif self.config.activation_func == quick_gelu:
+            if not hasattr(te_ops, "ScaledClampedQGeGLU"):
                 return _unsupported("quick_gelu needs TE >= 2.15")
-        if self.config.activation_func == squared_relu:
-            try:
-                from transformer_engine.pytorch.ops import ScaledSReLU  # noqa: F401
-            except ImportError:
-                return _unsupported("squared_relu needs ScaledSReLU (TE too old)")
-            # The weighted squared ReLU fusion is a non-GLU path and does not use the
-            # CuTe DSL GLU-interleave kernel, so skip the GLU-specific checks below.
-            return True
+        elif self.config.activation_func == squared_relu:
+            if not hasattr(te_ops, "ScaledSReLU"):
+                return _unsupported("weighted squared_relu needs ScaledSReLU")
 
-        # Check TE CuTe DSL fused kernel conditions for the GLU path (must match TE's
-        # fuse_grouped_mlp_ops matching logic)
+        # Check TE CuTe DSL fused kernel conditions (must match TE's
+        # fuse_grouped_mlp_ops matching logic).
         import os
 
-        if os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0") == "0":
+        if use_glu_fusion and int(os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")) <= 0:
             return _unsupported(
-                "NVTE_CUTEDSL_FUSED_GROUPED_MLP not set — CuTe DSL fused kernel disabled"
+                "NVTE_CUTEDSL_FUSED_GROUPED_MLP not set; CuTe DSL fused kernel disabled"
             )
-        if self.config.moe_mlp_glu_interleave_size != 32:
+        if use_glu_fusion and self.config.moe_mlp_glu_interleave_size != 32:
             return _unsupported(
                 f"moe_mlp_glu_interleave_size={self.config.moe_mlp_glu_interleave_size} "
-                f"(CuTe DSL requires 32)"
+                f"(CuTe DSL GLU fusion requires 32)"
             )
 
         return True
@@ -455,11 +463,29 @@ class TEGroupedMLP(MegatronModule):
             setattr(op, "bias", getattr(self.linear_fc1, "bias"))
         ops.append(op)
 
-        # Activation and post-multiply probs (SwiGLU, clamped quick-GeGLU, or SReLU)
+        # Activation and post-multiply probs (SwiGLU, clamped GeGLU, or SReLU).
+        # TE's ScaledClampedQGeGLU computes sigmoid(alpha * x) * x, so
+        # alpha=1.702 gives quick_gelu and alpha=1.0 gives silu/swiglu.
+        # With cuDNN FE >= 1.24.0 the alpha, limit and offset are
+        # forwarded as runtime params to the cuDNN kernel.
         glu_interleave = self.config.moe_mlp_glu_interleave_size
         activation_recompute_in_mlp = bool(getattr(self, "activation_recompute", False))
         if self.config.activation_func == F.silu and self.config.gated_linear_unit:
-            if (
+            clamp = self.config.activation_func_clamp_value
+            if clamp is not None:
+                qgeglu_kwargs = {
+                    "glu_interleave_size": glu_interleave,
+                    "alpha": 1.0,
+                    "limit": clamp,
+                    "glu_linear_offset": 0.0,
+                }
+                if (
+                    "activation_recompute_in_mlp"
+                    in inspect.signature(te.pytorch.ops.ScaledClampedQGeGLU).parameters
+                ):
+                    qgeglu_kwargs["activation_recompute_in_mlp"] = activation_recompute_in_mlp
+                op = te.pytorch.ops.ScaledClampedQGeGLU(**qgeglu_kwargs)
+            elif (
                 "activation_recompute_in_mlp"
                 in inspect.signature(te.pytorch.ops.ScaledSwiGLU).parameters
             ):

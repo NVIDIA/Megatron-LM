@@ -394,11 +394,21 @@ def _make_fake_te_namespace():
             self.activation_recompute_in_mlp = activation_recompute_in_mlp
 
     class FakeScaledClampedQGeGLU(torch.nn.Module):
-        def __init__(self, glu_interleave_size, *, activation_recompute_in_mlp=False, limit=None):
+        def __init__(
+            self,
+            glu_interleave_size,
+            *,
+            activation_recompute_in_mlp=False,
+            alpha=None,
+            limit=None,
+            glu_linear_offset=None,
+        ):
             super().__init__()
             self.glu_interleave_size = glu_interleave_size
             self.activation_recompute_in_mlp = activation_recompute_in_mlp
+            self.alpha = alpha
             self.limit = limit
+            self.glu_linear_offset = glu_linear_offset
 
     class FakeScaledSReLU(torch.nn.Module):
         def __init__(self, *, activation_recompute_in_mlp=False):
@@ -552,14 +562,22 @@ def _install_fake_te_ops_modules(
 
 
 def _make_fused_impl_support_module(
-    FakeGroupedLinear, *, activation_func, gated_linear_unit, use_fused_weighted_squared_relu=False
+    FakeGroupedLinear,
+    *,
+    activation_func,
+    gated_linear_unit,
+    use_fused_weighted_squared_relu=False,
+    moe_mlp_glu_interleave_size=32,
+    activation_func_clamp_value=None,
 ):
     module = TEGroupedMLP.__new__(TEGroupedMLP)
     torch.nn.Module.__init__(module)
     module.config = SimpleNamespace(
         activation_func=activation_func,
+        activation_func_clamp_value=activation_func_clamp_value,
         gated_linear_unit=gated_linear_unit,
         use_fused_weighted_squared_relu=use_fused_weighted_squared_relu,
+        moe_mlp_glu_interleave_size=moe_mlp_glu_interleave_size,
         moe_apply_probs_on_input=False,
     )
     module.activation_func = object()
@@ -582,6 +600,7 @@ def test_is_fused_impl_supported_uses_config_activation_for_swiglu(monkeypatch):
     monkeypatch.setattr(experts_module, "te", fake_te)
     monkeypatch.setattr(experts_module, "HAVE_TE", True)
     monkeypatch.setattr(experts_module, "is_te_min_version", lambda _: True)
+    monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
     _install_fake_te_ops_modules(monkeypatch, fake_te)
 
     module = _make_fused_impl_support_module(
@@ -591,12 +610,54 @@ def test_is_fused_impl_supported_uses_config_activation_for_swiglu(monkeypatch):
     assert module._is_fused_impl_supported() is True
 
 
+def test_is_fused_impl_supported_requires_cutedsl_env(monkeypatch):
+    fake_te, FakeGroupedLinear = _make_fake_te_namespace()
+    monkeypatch.setattr(experts_module, "te", fake_te)
+    monkeypatch.setattr(experts_module, "HAVE_TE", True)
+    monkeypatch.setattr(experts_module, "is_te_min_version", lambda _: True)
+    monkeypatch.delenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", raising=False)
+    _install_fake_te_ops_modules(monkeypatch, fake_te)
+
+    module = _make_fused_impl_support_module(
+        FakeGroupedLinear, activation_func=F.silu, gated_linear_unit=True
+    )
+
+    assert module._is_fused_impl_supported() is False
+
+
+def test_is_fused_impl_supported_requires_glu_interleave_32(monkeypatch):
+    fake_te, FakeGroupedLinear = _make_fake_te_namespace()
+    monkeypatch.setattr(experts_module, "te", fake_te)
+    monkeypatch.setattr(experts_module, "HAVE_TE", True)
+    monkeypatch.setattr(experts_module, "is_te_min_version", lambda _: True)
+    monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
+    _install_fake_te_ops_modules(monkeypatch, fake_te)
+
+    module = _make_fused_impl_support_module(
+        FakeGroupedLinear,
+        activation_func=F.silu,
+        gated_linear_unit=True,
+        moe_mlp_glu_interleave_size=16,
+    )
+
+    assert module._is_fused_impl_supported() is False
+
+
 @pytest.mark.parametrize(
-    ("use_fused_weighted_squared_relu", "gated_linear_unit", "expected"),
-    [(True, False, True), (False, False, False), (True, True, False)],
+    (
+        "use_fused_weighted_squared_relu",
+        "gated_linear_unit",
+        "moe_mlp_glu_interleave_size",
+        "expected",
+    ),
+    [(True, False, None, True), (False, False, None, False), (True, True, 32, False)],
 )
 def test_is_fused_impl_supported_gates_scaled_srelu_on_weighted_flag_and_non_glu(
-    monkeypatch, use_fused_weighted_squared_relu, gated_linear_unit, expected
+    monkeypatch,
+    use_fused_weighted_squared_relu,
+    gated_linear_unit,
+    moe_mlp_glu_interleave_size,
+    expected,
 ):
     fake_te, FakeGroupedLinear = _make_fake_te_namespace()
     monkeypatch.setattr(experts_module, "te", fake_te)
@@ -609,6 +670,7 @@ def test_is_fused_impl_supported_gates_scaled_srelu_on_weighted_flag_and_non_glu
         activation_func=squared_relu,
         gated_linear_unit=gated_linear_unit,
         use_fused_weighted_squared_relu=use_fused_weighted_squared_relu,
+        moe_mlp_glu_interleave_size=moe_mlp_glu_interleave_size,
     )
 
     assert module._is_fused_impl_supported() is expected
@@ -962,6 +1024,7 @@ class TestTEGroupedMLP:
             moe_router_topk=1,
             moe_grouped_gemm=True,
             use_transformer_engine_op_fuser=True,
+            moe_mlp_glu_interleave_size=32,
         )
         _set_random_seed(seed_=123, data_parallel_random_init=False)
         submodules = get_submodules(
@@ -1049,6 +1112,7 @@ class TestTEGroupedMLP:
             moe_router_topk=1,
             moe_grouped_gemm=True,
             use_transformer_engine_op_fuser=True,
+            moe_mlp_glu_interleave_size=32,
         )
         _set_random_seed(seed_=123, data_parallel_random_init=False)
         submodules = get_submodules(

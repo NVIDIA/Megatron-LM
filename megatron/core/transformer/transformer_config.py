@@ -2299,11 +2299,6 @@ class TransformerConfig(ModelParallelConfig):
                         "use_te_activation_func must be False "
                         "when activation_func_clamp_value is not None for SwiGLU"
                     )
-                if self.use_transformer_engine_op_fuser:
-                    raise ValueError(
-                        "use_transformer_engine_op_fuser must be False "
-                        "when activation_func_clamp_value is not None for SwiGLU"
-                    )
 
         if self.apply_rope_fusion:
             if self.multi_latent_attention:
