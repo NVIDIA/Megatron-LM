@@ -666,6 +666,11 @@ def _apply_rope(
                 cos, sin = _stride_tables_per_segment(
                     cos, sin, cu_seqlens_compressed=cu_seqlens, ratio=ratio, total_comp=x.shape[0]
                 )
+                # The strided tables are already aligned one-to-one with
+                # compressed rows, including static-capacity tail rows. Passing
+                # cu_seqlens would make the fused kernel recompute local token
+                # positions and read before the table for tail rows.
+                return _apply_fused_rope(x, cos, sin, nope_dim, pos_dim, None, cp_group)
         else:
             total = rotary_seq_len * ratio if ratio > 1 else rotary_seq_len
             cos, sin = rotary_pos_emb_module.get_cached_cos_sin(

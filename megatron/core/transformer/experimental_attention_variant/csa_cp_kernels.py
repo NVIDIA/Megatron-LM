@@ -225,8 +225,9 @@ if _CUTE_AVAILABLE:
                 if src_col < input_width:
                     value = tensor[row, src_slot, b, src_col].to(cutlass.Float32)
             else:
-                if row > 0 and not is_first[row]:
-                    value = tensor[row - 1, out_slot, b, head_col].to(cutlass.Float32)
+                if row > 0:
+                    if is_first[row] == 0:
+                        value = tensor[row - 1, out_slot, b, head_col].to(cutlass.Float32)
             out[row, out_slot, b, head_col] = value.to(out.element_type)
 
 
@@ -289,8 +290,9 @@ if _CUTE_AVAILABLE:
             value = cutlass.Float32(0.0)
             if col < head_dim:
                 next_row = row + 1
-                if next_row < n_groups and not is_first[next_row]:
-                    value = grad_output[next_row, in_slot, b, col].to(cutlass.Float32)
+                if next_row < n_groups:
+                    if is_first[next_row] == 0:
+                        value = grad_output[next_row, in_slot, b, col].to(cutlass.Float32)
             elif col < head_dim * 2:
                 value = grad_output[row, ratio + in_slot, b, col - head_dim].to(
                     cutlass.Float32
@@ -1641,7 +1643,7 @@ if _CUTE_AVAILABLE:
         if linear < rank_major_rows * row_width:
             rank_row = linear // row_width
             col = linear - rank_row * row_width
-            if valid_rank_major[rank_row]:
+            if valid_rank_major[rank_row] == 1:
                 seq = seq_ids_rank_major[rank_row]
                 comp = comp_ids_rank_major[rank_row]
                 seq_major = cu_seqlens_compressed[seq] + comp
