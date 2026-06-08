@@ -153,6 +153,122 @@ def test_qwen35_export_preserves_runtime_parameter_dtype_by_default() -> None:
     assert exported["model.language_model.layers.0.mlp.experts.gate_up_proj"].dtype == torch.bfloat16
 
 
+def test_qwen35_export_batches_ep_expert_gather(monkeypatch) -> None:
+    class TinyQwen35Module(nn.Module):
+        def __init__(self, config: Qwen35Config) -> None:
+            super().__init__()
+            self.layers = nn.ModuleList([nn.Module()])
+            self.layers[0].moe = nn.Module()
+            self.layers[0].moe.experts = nn.Module()
+            self.layers[0].moe.experts.fc1 = nn.Module()
+
+            rows = config.moe_intermediate_size * 2
+            for local_idx in range(config.num_experts // 2):
+                tensor = torch.arange(rows * config.hidden_size, dtype=torch.bfloat16).reshape(
+                    rows,
+                    config.hidden_size,
+                )
+                tensor = tensor + local_idx * 1000
+                self.layers[0].moe.experts.fc1.register_parameter(
+                    f"weight{local_idx}",
+                    nn.Parameter(tensor),
+                )
+
+    cfg = _tiny_config()
+    model = TinyQwen35Module(cfg)
+    ps = SimpleNamespace(
+        pp_size=1,
+        tp_size=1,
+        tp_group=None,
+        ep_size=2,
+        ep_group=object(),
+        etp_size=1,
+        etp_group=None,
+    )
+    gather_calls = []
+
+    def fake_all_gather(outputs, tensor, group=None):
+        del group
+        gather_calls.append(tensor.clone())
+        outputs[0].copy_(tensor)
+        outputs[1].copy_(tensor + 2000)
+
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.hf_weights.dist.all_gather",
+        fake_all_gather,
+    )
+
+    exported = dict(export_hf_weights(model, cfg, ps))
+
+    assert len(gather_calls) == 1
+    assert gather_calls[0].shape[0] == cfg.num_experts // ps.ep_size
+    local_tensors = [
+        model.layers[0].moe.experts.fc1.weight0.detach(),
+        model.layers[0].moe.experts.fc1.weight1.detach(),
+    ]
+    expected = torch.stack(
+        [
+            local_tensors[0],
+            local_tensors[1],
+            local_tensors[0] + 2000,
+            local_tensors[1] + 2000,
+        ],
+        dim=0,
+    )
+    assert torch.equal(
+        exported["model.language_model.layers.0.mlp.experts.gate_up_proj"],
+        expected,
+    )
+
+
+def test_qwen35_export_rank0_only_still_participates_in_ep_gather(monkeypatch) -> None:
+    class TinyQwen35Module(nn.Module):
+        def __init__(self, config: Qwen35Config) -> None:
+            super().__init__()
+            self.layers = nn.ModuleList([nn.Module()])
+            self.layers[0].moe = nn.Module()
+            self.layers[0].moe.experts = nn.Module()
+            self.layers[0].moe.experts.fc1 = nn.Module()
+
+            rows = config.moe_intermediate_size * 2
+            for local_idx in range(config.num_experts // 2):
+                tensor = torch.zeros(rows, config.hidden_size, dtype=torch.bfloat16) + local_idx
+                self.layers[0].moe.experts.fc1.register_parameter(
+                    f"weight{local_idx}",
+                    nn.Parameter(tensor),
+                )
+
+    cfg = _tiny_config()
+    ps = SimpleNamespace(
+        pp_size=1,
+        tp_size=1,
+        tp_group=None,
+        ep_size=2,
+        ep_group=object(),
+        etp_size=1,
+        etp_group=None,
+    )
+    gather_calls = []
+
+    def fake_all_gather(outputs, tensor, group=None):
+        del group
+        gather_calls.append(tensor.clone())
+        outputs[0].copy_(tensor)
+        outputs[1].copy_(tensor + 2)
+
+    monkeypatch.setattr("megatron.lite.primitive.ckpt.hf_weights.dist.is_initialized", lambda: True)
+    monkeypatch.setattr("megatron.lite.primitive.ckpt.hf_weights.dist.get_rank", lambda: 1)
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.hf_weights.dist.all_gather",
+        fake_all_gather,
+    )
+
+    exported = list(export_hf_weights(TinyQwen35Module(cfg), cfg, ps, rank0_only=True))
+
+    assert exported == []
+    assert len(gather_calls) == 1
+
+
 def test_qwen35_export_maps_top_level_and_layer_norm_names() -> None:
     cfg = _tiny_config()
     spec = Qwen35WeightSpec(cfg)

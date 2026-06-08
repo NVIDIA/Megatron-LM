@@ -409,6 +409,7 @@ def export_hf_weights(
 
     if ps.pp_size <= 1:
         exported_params = 0
+        expert_groups: dict[str, list[tuple[int, str, torch.Tensor]]] = {}
         for chunk in chunks:
             base_chunk = unwrap_model(chunk)
             layer_map = (
@@ -422,6 +423,12 @@ def export_hf_weights(
 
                 gathered_one: dict[str, torch.Tensor] = {}
                 if spec.is_expert(gname):
+                    if limit is None:
+                        expert_groups.setdefault(_expert_group_key(gname), []).append(
+                            (parse_expert_idx(gname), gname, tensor)
+                        )
+                        exported_params += 1
+                        continue
                     _gather_expert(gname, tensor, spec, ps, gathered_one)
                 else:
                     gathered_one[gname] = _gather_dense(gname, tensor, spec, ps)
@@ -436,6 +443,15 @@ def export_hf_weights(
 
                 if limit is not None and exported_params >= limit:
                     return
+
+        for group_key in sorted(expert_groups):
+            gathered_group: dict[str, torch.Tensor] = {}
+            _gather_expert_group(expert_groups[group_key], spec, ps, gathered_group)
+            if not rank0_only or rank == 0:
+                for native_name in sorted(gathered_group, key=parse_expert_idx):
+                    gathered_tensor = gathered_group[native_name]
+                    for hf_name, hf_tensor in spec.native_to_hf(native_name, gathered_tensor):
+                        yield hf_name, _cast_export_tensor(hf_tensor, resolved_export_dtype)
         return
 
     gathered: dict[str, torch.Tensor] = {}
@@ -501,15 +517,7 @@ def _gather_expert(
     name: str, tensor: torch.Tensor, spec: HFWeights, ps, out: dict[str, torch.Tensor],
 ) -> None:
     """Gather an expert param across ETP + EP."""
-    # ETP gather
-    if ps.etp_size > 1 and ps.etp_group is not None:
-        tp_info = spec.tp_spec(name)
-        if tp_info is not None:
-            split_d, _ = tp_info
-            if "fc1" in name:
-                tensor = gather_gate_up(tensor, ps.etp_size, ps.etp_group)
-            else:
-                tensor = allgather_concat(tensor, ps.etp_size, ps.etp_group, dim=split_d)
+    tensor = _gather_expert_etp(name, tensor, spec, ps)
 
     # EP gather: global_id = ep_rank * n_local + local_id.
     local_idx = parse_expert_idx(name)
@@ -522,6 +530,48 @@ def _gather_expert(
             out[set_expert_idx(name, global_idx)] = ep_tensor.cpu()
     else:
         out[name] = tensor.cpu()
+
+
+def _gather_expert_etp(name: str, tensor: torch.Tensor, spec: HFWeights, ps) -> torch.Tensor:
+    # ETP gather
+    if ps.etp_size > 1 and ps.etp_group is not None:
+        tp_info = spec.tp_spec(name)
+        if tp_info is not None:
+            split_d, _ = tp_info
+            if "fc1" in name:
+                return gather_gate_up(tensor, ps.etp_size, ps.etp_group)
+            return allgather_concat(tensor, ps.etp_size, ps.etp_group, dim=split_d)
+    return tensor
+
+
+def _expert_group_key(name: str) -> str:
+    return re.sub(r"weight\d+$", "weight", name)
+
+
+def _gather_expert_group(
+    entries: list[tuple[int, str, torch.Tensor]],
+    spec: HFWeights,
+    ps,
+    out: dict[str, torch.Tensor],
+) -> None:
+    """Gather local experts in one EP collective per layer/kind."""
+    prepared = [
+        (local_idx, name, _gather_expert_etp(name, tensor, spec, ps))
+        for local_idx, name, tensor in sorted(entries)
+    ]
+    if ps.ep_size <= 1 or ps.ep_group is None:
+        for _, name, tensor in prepared:
+            out[name] = tensor.cpu()
+        return
+
+    n_local = spec.num_experts // ps.ep_size
+    stacked = torch.stack([tensor.contiguous() for _, _, tensor in prepared], dim=0)
+    ep_gathered = [torch.empty_like(stacked) for _ in range(ps.ep_size)]
+    dist.all_gather(ep_gathered, stacked, group=ps.ep_group)
+    for ep_rank, ep_tensor in enumerate(ep_gathered):
+        for slot, (local_idx, name, _) in enumerate(prepared):
+            global_idx = ep_rank * n_local + local_idx
+            out[set_expert_idx(name, global_idx)] = ep_tensor[slot].cpu()
 
 
 def save_hf_weights(
