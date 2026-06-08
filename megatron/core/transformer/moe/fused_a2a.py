@@ -282,9 +282,7 @@ _hybrid_ep_warned_unsupported_fused_dispatch = False
 
 
 def _normalize_hybrid_ep_dispatch_options(
-    fused: bool,
-    num_blocks_permute: Optional[int],
-    num_blocks_unpermute: Optional[int],
+    fused: bool, num_blocks_permute: Optional[int], num_blocks_unpermute: Optional[int]
 ):
     """Drop unsupported HybridEP fused-dispatch options after checking the API once."""
     global _hybrid_ep_supports_fused_dispatch
