@@ -2760,7 +2760,7 @@ class TransformerConfig(ModelParallelConfig):
                         "fine-grained activation offloading with full-iteration CUDA graphs "
                     )
 
-        if self.moe_token_dispatcher_type in ["allgather"]:
+        if self.num_moe_experts is not None and self.moe_token_dispatcher_type in ["allgather"]:
             if self.variable_seq_lengths is True:
                 raise ValueError(
                     f"Token dispatcher type: {self.moe_token_dispatcher_type} does not support "
@@ -2996,10 +2996,11 @@ class TransformerConfig(ModelParallelConfig):
             # Needed for passing variable sequences between pp stages.
             self.variable_seq_lengths = True
 
-            assert self.moe_token_dispatcher_type in ("alltoall", "flex"), (
-                f"sequence_packing only supports moe_token_dispatcher_type in "
-                f"('alltoall', 'flex'), got '{self.moe_token_dispatcher_type}'"
-            )
+            if self.num_moe_experts is not None:
+                assert self.moe_token_dispatcher_type in ("alltoall", "flex"), (
+                    f"sequence_packing only supports moe_token_dispatcher_type in "
+                    f"('alltoall', 'flex'), got '{self.moe_token_dispatcher_type}'"
+                )
 
             supported_schedulers = ['dp_balanced', 'default_dynamic_cp']
             if (

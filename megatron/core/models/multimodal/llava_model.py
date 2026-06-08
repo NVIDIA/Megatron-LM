@@ -427,6 +427,18 @@ class LLaVAModel(MegatronModule):
             return self.language_model.shared_embedding_or_output_weight()
         return None
 
+    def zero_grad_buffer(self):
+        """Clear distributed grad buffers on wrapped child modules when they exist."""
+        for module in (
+            self.language_model,
+            self.vision_model,
+            self.vision_projection,
+            self.sound_model,
+            self.sound_projection,
+        ):
+            if module is not None and hasattr(module, "zero_grad_buffer"):
+                module.zero_grad_buffer()
+
     def set_input_tensor(self, input_tensor) -> None:
         """Set model chunk input tensor."""
         # This is usually handled in schedules.py but some inference code still

@@ -559,6 +559,16 @@ class TestVisionTECudaGraphHelperPP2:
             num_microbatches=num_microbatches,
         )
 
+    def _init_microbatches(self, num_microbatches):
+        destroy_num_microbatches_calculator()
+        init_num_microbatches_calculator(
+            rank=0,
+            global_batch_size=self.micro_batch_size * num_microbatches,
+            micro_batch_size=self.micro_batch_size,
+            data_parallel_size=1,
+            decrease_batch_size_if_needed=False,
+        )
+
     def test_pp2_first_stage_finds_vision_layers(self):
         """Stage 0 should discover all vision encoder layers."""
         if not self.is_first_stage:
@@ -601,24 +611,24 @@ class TestVisionTECudaGraphHelperPP2:
     )
     def test_pp2_create_cudagraphs_first_stage(self):
         """On stage 0, CUDA graphs should be captured with the full pipeline order."""
-        if not self.is_first_stage:
-            pytest.skip("Vision layers only on pp_rank 0")
-
         self.llava_model.cuda()
         num_mb = 4
         helper = self._make_helper(num_microbatches=num_mb)
 
-        init_num_microbatches_calculator(
-            rank=0,
-            global_batch_size=self.micro_batch_size * num_mb,
-            micro_batch_size=self.micro_batch_size,
-            data_parallel_size=1,
-            decrease_batch_size_if_needed=False,
-        )
+        self._init_microbatches(num_mb)
 
         assert not helper.graphs_created()
 
+        # create_cudagraphs() contains a distributed barrier even on stages
+        # without graphable vision layers, so all PP stages must participate.
         helper.create_cudagraphs()
+        assert helper.capture_finished()
+
+        if not self.is_first_stage:
+            assert helper.vision_model is None
+            assert not helper.graphs_created()
+            return
+
         assert helper.graphs_created()
 
         # num_microbatches should be preserved (PP>1 does not collapse)
@@ -645,11 +655,20 @@ class TestVisionTECudaGraphHelperPP2:
     )
     def test_pp2_create_cudagraphs_last_stage_noop(self):
         """On stage 1 (no vision model), create_cudagraphs should be a no-op."""
-        if self.is_first_stage:
-            pytest.skip("This assertion is only for pp_rank 1")
-
+        self.llava_model.cuda()
         helper = self._make_helper(num_microbatches=4)
+        self._init_microbatches(num_microbatches=4)
+
+        # create_cudagraphs() synchronizes all ranks at capture completion.
+        # The first stage creates graphs only to keep collective ordering aligned
+        # while the last stage exercises the no-vision-layer path.
         helper.create_cudagraphs()
+
+        if self.is_first_stage:
+            assert helper.graphs_created()
+            helper.delete_cuda_graphs()
+            return
+
         assert helper.capture_finished()  # Capture process finished
         assert not helper.graphs_created()  # But no graphs were created
 
