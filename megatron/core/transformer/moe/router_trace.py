@@ -305,7 +305,7 @@ class RouterTracer:
             else:
                 top_indices = second
 
-            top_indices_cpu = top_indices.detach().to("cpu", torch.int32).contiguous()
+            top_indices_cpu = top_indices.detach().to("cpu", torch.int32, non_blocking=True)
             num_tokens = int(top_indices_cpu.shape[0])
 
             record: dict = {
@@ -314,7 +314,7 @@ class RouterTracer:
                 "rank": self.rank,
                 "num_tokens": num_tokens,
                 "topk": int(top_indices_cpu.shape[1]),
-                "top_indices": top_indices_cpu.tolist(),
+                "_top_indices_tensor": top_indices_cpu,
             }
 
             if self.capture_hidden_states:
@@ -359,6 +359,9 @@ class RouterTracer:
             return
         with open(self.output_path, "a") as f:
             for rec in self.records:
+                # .tolist() syncs the async D2H copy started in _record().
+                tensor = rec.pop("_top_indices_tensor")
+                rec["top_indices"] = tensor.tolist()
                 f.write(json.dumps(rec) + "\n")
         self.records.clear()
         if self._hs_file is not None:
