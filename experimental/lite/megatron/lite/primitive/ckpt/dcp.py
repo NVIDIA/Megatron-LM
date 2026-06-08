@@ -40,8 +40,10 @@ def save_training_checkpoint(
     get_placements: PlacementFn = default_placement_fn,
     is_expert: ExpertClassifierFn = default_expert_classifier,
     *,
-    use_dcp: bool | None = None,
+    use_dcp: bool | None = True,
     save_rng: bool = True,
+    save_model: bool = True,
+    save_optimizer: bool = True,
 ) -> None:
     """Save training checkpoint using DTensor + DCP for automatic resharding."""
     if path is None and isinstance(step, str):
@@ -51,15 +53,10 @@ def save_training_checkpoint(
         raise ValueError("checkpoint path is required")
     step = int(step)
     if use_dcp is None:
-        use_dcp = config is not None and ps is not None and optimizer is None
+        use_dcp = True
     if not use_dcp:
         _save_local_training_checkpoint(model, optimizer, step, path, save_rng=save_rng)
         return
-    if optimizer is not None:
-        raise NotImplementedError(
-            "DCP checkpointing does not yet support optimizer state; use the local "
-            "training checkpoint path or Megatron Core dist_checkpointing."
-        )
     if config is None or ps is None:
         raise ValueError("DCP checkpointing requires config and ParallelState.")
     if not isinstance(model, nn.Module):
@@ -67,17 +64,21 @@ def save_training_checkpoint(
     dense_mesh, expert_mesh = _build_meshes(config)
     state_dict: dict = {"step": step}
 
-    for name, param in model.named_parameters():
-        placements = get_placements(name)
-        mesh = expert_mesh if is_expert(name) else dense_mesh
-        state_dict[f"model.{name}"] = DTensor.from_local(
-            _to_local_tensor(param.data.detach()),
-            mesh,
-            placements,
-        )
+    if save_model:
+        for name, param in model.named_parameters():
+            placements = get_placements(name)
+            mesh = expert_mesh if is_expert(name) else dense_mesh
+            state_dict[f"model.{name}"] = DTensor.from_local(
+                _to_local_tensor(param.data.detach()),
+                mesh,
+                placements,
+            )
 
     ckpt_path = os.path.join(path, f"step_{step}")
+    os.makedirs(ckpt_path, exist_ok=True)
     dcp.save(state_dict, checkpoint_id=ckpt_path)
+    if save_optimizer:
+        _save_optimizer_checkpoint(optimizer, ckpt_path)
     if save_rng:
         _save_rng_sidecar(ckpt_path)
     log_rank0(f"Saved training checkpoint at step {step} to {ckpt_path}")
@@ -92,13 +93,15 @@ def load_training_checkpoint(
     get_placements: PlacementFn = default_placement_fn,
     is_expert: ExpertClassifierFn = default_expert_classifier,
     *,
-    use_dcp: bool | None = None,
+    use_dcp: bool | None = True,
     load_rng: bool = True,
     load_parameter_state_update_legacy_format: bool = False,
+    load_model: bool = True,
+    load_optimizer: bool = True,
 ) -> int:
     """Load training checkpoint with automatic resharding across different parallel configs."""
     if use_dcp is None:
-        use_dcp = config is not None and ps is not None and optimizer is None
+        use_dcp = True
     if not use_dcp:
         return _load_local_training_checkpoint(
             model,
@@ -107,50 +110,87 @@ def load_training_checkpoint(
             load_rng=load_rng,
             load_parameter_state_update_legacy_format=load_parameter_state_update_legacy_format,
         )
-    if optimizer is not None:
-        raise NotImplementedError(
-            "DCP checkpointing does not yet support optimizer state; use the local "
-            "training checkpoint path or Megatron Core dist_checkpointing."
-        )
     if config is None or ps is None:
         raise ValueError("DCP checkpointing requires config and ParallelState.")
     if not isinstance(model, nn.Module):
         raise TypeError("DCP checkpointing currently expects a single nn.Module.")
     dense_mesh, expert_mesh = _build_meshes(config)
 
-    ckpt_path = path
-    step_dirs = sorted(
-        [d for d in os.listdir(path) if d.startswith("step_")],
-        key=lambda d: int(d.split("_")[1]),
-    )
-    if step_dirs:
-        ckpt_path = os.path.join(path, step_dirs[-1])
+    ckpt_path = _resolve_step_checkpoint_path(path)
 
     state_dict: dict = {"step": 0}
 
-    for name, param in model.named_parameters():
-        placements = get_placements(name)
-        mesh = expert_mesh if is_expert(name) else dense_mesh
-        state_dict[f"model.{name}"] = DTensor.from_local(
-            torch.empty_like(_to_local_tensor(param.data)),
-            mesh,
-            placements,
-        )
+    if load_model:
+        for name, param in model.named_parameters():
+            placements = get_placements(name)
+            mesh = expert_mesh if is_expert(name) else dense_mesh
+            state_dict[f"model.{name}"] = DTensor.from_local(
+                torch.empty_like(_to_local_tensor(param.data)),
+                mesh,
+                placements,
+            )
 
     dcp.load(state_dict, checkpoint_id=ckpt_path)
 
-    for name, param in model.named_parameters():
-        key = f"model.{name}"
-        if key in state_dict:
-            t = state_dict[key]
-            with torch.no_grad():
-                _copy_tensor_(param.data, t.to_local() if isinstance(t, DTensor) else t)
+    if load_model:
+        for name, param in model.named_parameters():
+            key = f"model.{name}"
+            if key in state_dict:
+                t = state_dict[key]
+                with torch.no_grad():
+                    _copy_tensor_(param.data, t.to_local() if isinstance(t, DTensor) else t)
+
+    if load_optimizer:
+        _load_optimizer_checkpoint(optimizer, ckpt_path)
 
     step = state_dict.get("step", 0)
     if load_rng:
         _load_rng_sidecar(ckpt_path)
     log_rank0(f"Loaded training checkpoint from {path} at step {step}")
     return step
+
+
+def _resolve_step_checkpoint_path(path: str) -> str:
+    if os.path.basename(path).startswith("step_"):
+        return path
+
+    step_dirs = sorted(
+        [d for d in os.listdir(path) if d.startswith("step_")],
+        key=lambda d: int(d.split("_")[1]),
+    )
+    if step_dirs:
+        return os.path.join(path, step_dirs[-1])
+    return path
+
+
+def _optimizer_checkpoint_path(path: str) -> str:
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    return os.path.join(path, f"optimizer_rank_{rank}.pt")
+
+
+def _save_optimizer_checkpoint(optimizer, path: str) -> None:
+    if optimizer is None:
+        log_rank0("Skipping optimizer checkpoint save because optimizer is None")
+        return
+    state_dict_fn = getattr(optimizer, "state_dict", None)
+    if not callable(state_dict_fn):
+        raise TypeError(f"Optimizer {type(optimizer).__name__} does not provide state_dict().")
+    torch.save(state_dict_fn(), _optimizer_checkpoint_path(path))
+
+
+def _load_optimizer_checkpoint(optimizer, path: str) -> None:
+    if optimizer is None:
+        log_rank0("Skipping optimizer checkpoint load because optimizer is None")
+        return
+    ckpt_path = _optimizer_checkpoint_path(path)
+    if not os.path.exists(ckpt_path):
+        log_rank0(f"No optimizer checkpoint found at {ckpt_path}; loading model state only")
+        return
+    load_state_dict_fn = getattr(optimizer, "load_state_dict", None)
+    if not callable(load_state_dict_fn):
+        raise TypeError(f"Optimizer {type(optimizer).__name__} does not provide load_state_dict().")
+    state = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    load_state_dict_fn(state)
 
 
 def _model_chunks(model: nn.Module | Iterable[nn.Module]) -> list[nn.Module]:

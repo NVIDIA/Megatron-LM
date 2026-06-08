@@ -106,6 +106,14 @@ def _last_loss_output(outputs: list[dict]) -> dict:
     return {}
 
 
+def _checkpoint_module(model: Any) -> torch.nn.Module:
+    if isinstance(model, torch.nn.Module):
+        return model
+    if isinstance(model, list | tuple):
+        return torch.nn.ModuleList(model)
+    raise TypeError(f"Checkpoint model must be an nn.Module or sequence of modules, got {type(model).__name__}.")
+
+
 class MegatronLiteRuntime(RuntimeBase):
     """Megatron Lite default training backend (Megatron-style 5D parallel)."""
 
@@ -243,7 +251,7 @@ class MegatronLiteRuntime(RuntimeBase):
             step = kwargs.pop("iteration", None)
         if step is None:
             step = kwargs.pop("global_step", 0)
-        use_dcp = bool(kwargs.pop("use_dcp", False))
+        use_dcp = bool(kwargs.pop("use_dcp", True))
         save_rng = bool(kwargs.pop("save_rng", True))
         get_placements, is_expert = _checkpoint_hooks(handle)
         save_training_checkpoint(
@@ -257,13 +265,15 @@ class MegatronLiteRuntime(RuntimeBase):
             is_expert=kwargs.pop("is_expert", is_expert),
             use_dcp=use_dcp,
             save_rng=save_rng,
+            save_model=kwargs.pop("save_model", True),
+            save_optimizer=kwargs.pop("save_optimizer", True),
             **kwargs,
         )
 
     def load_checkpoint(self, handle: ModelHandle, path: str, **kwargs) -> int:
         from megatron.lite.primitive.ckpt import load_training_checkpoint
 
-        use_dcp = bool(kwargs.pop("use_dcp", False))
+        use_dcp = bool(kwargs.pop("use_dcp", True))
         load_rng = bool(kwargs.pop("load_rng", True))
         update_legacy_format = bool(
             kwargs.pop(
@@ -283,6 +293,8 @@ class MegatronLiteRuntime(RuntimeBase):
             use_dcp=use_dcp,
             load_rng=load_rng,
             load_parameter_state_update_legacy_format=update_legacy_format,
+            load_model=kwargs.pop("load_model", True),
+            load_optimizer=kwargs.pop("load_optimizer", True),
             **kwargs,
         )
 
