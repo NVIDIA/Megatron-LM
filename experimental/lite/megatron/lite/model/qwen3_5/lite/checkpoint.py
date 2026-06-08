@@ -285,6 +285,7 @@ class Qwen35WeightSpec:
 
     def __init__(self, config: Qwen35Config):
         self.config = config
+        self._expert_export_buffers: dict[tuple[int, str], dict[int, torch.Tensor]] = {}
 
     @property
     def num_experts(self) -> int:
@@ -311,11 +312,11 @@ class Qwen35WeightSpec:
 
     def native_to_hf(self, native_name: str, tensor: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
         if native_name == "embed.embedding.weight":
-            return [("language_model.model.embed_tokens.weight", tensor)]
+            return [("model.language_model.embed_tokens.weight", tensor)]
         if native_name == "norm.weight":
-            return [("language_model.model.norm.weight", tensor)]
+            return [("model.language_model.norm.weight", tensor)]
         if native_name == "head.col.linear.weight":
-            return [("language_model.lm_head.weight", tensor)]
+            return [("lm_head.weight", tensor)]
         if native_name == "mtp_embed.embedding.weight" or native_name.startswith("mtp."):
             return []
 
@@ -325,7 +326,7 @@ class Qwen35WeightSpec:
 
         layer_idx = int(match.group(1))
         suffix = match.group(2)
-        prefix = f"language_model.model.layers.{layer_idx}"
+        prefix = f"model.language_model.layers.{layer_idx}"
 
         if suffix == "full_attn.qkv.linear.layer_norm_weight":
             return [(f"{prefix}.input_layernorm.weight", tensor)]
@@ -385,14 +386,16 @@ class Qwen35WeightSpec:
         expert_match = re.fullmatch(r"moe\.experts\.fc([12])\.weight(\d+)", suffix)
         if expert_match is not None:
             kind, expert_idx = expert_match.groups()
-            expert_prefix = f"{prefix}.mlp.experts.{expert_idx}"
+            buffer_key = (layer_idx, "gate_up" if kind == "1" else "down")
+            buffer = self._expert_export_buffers.setdefault(buffer_key, {})
+            buffer[int(expert_idx)] = tensor.contiguous()
+            if len(buffer) < self.config.num_experts:
+                return []
+            packed = torch.stack([buffer[i] for i in range(self.config.num_experts)], dim=0).contiguous()
+            del self._expert_export_buffers[buffer_key]
             if kind == "1":
-                gate, up = tensor.chunk(2, dim=0)
-                return [
-                    (f"{expert_prefix}.gate_proj.weight", gate.contiguous()),
-                    (f"{expert_prefix}.up_proj.weight", up.contiguous()),
-                ]
-            return [(f"{expert_prefix}.down_proj.weight", tensor)]
+                return [(f"{prefix}.mlp.experts.gate_up_proj", packed)]
+            return [(f"{prefix}.mlp.experts.down_proj", packed)]
 
         return []
 

@@ -56,7 +56,7 @@ def test_qwen35_protocol_registers_vllm_export_entrypoint() -> None:
     assert callable(module.export_hf_weights)
 
 
-def test_qwen35_export_uses_vllm_loader_names_without_module_prefix() -> None:
+def test_qwen35_export_uses_hf_checkpoint_names_without_module_prefix() -> None:
     class TinyQwen35Module(nn.Module):
         def __init__(self) -> None:
             super().__init__()
@@ -73,9 +73,9 @@ def test_qwen35_export_uses_vllm_loader_names_without_module_prefix() -> None:
     exported = dict(export_hf_weights(model, cfg, _single_rank_parallel_state()))
 
     assert set(exported) == {
-        "language_model.model.embed_tokens.weight",
-        "language_model.model.norm.weight",
-        "language_model.lm_head.weight",
+        "model.language_model.embed_tokens.weight",
+        "model.language_model.norm.weight",
+        "lm_head.weight",
     }
     assert all(not name.startswith("module.") for name in exported)
     assert all(not name.startswith(("embed.", "norm.", "head.")) for name in exported)
@@ -87,13 +87,13 @@ def test_qwen35_export_maps_top_level_and_layer_norm_names() -> None:
     tensor = torch.arange(cfg.hidden_size)
 
     cases = {
-        "embed.embedding.weight": "language_model.model.embed_tokens.weight",
-        "norm.weight": "language_model.model.norm.weight",
-        "head.col.linear.weight": "language_model.lm_head.weight",
+        "embed.embedding.weight": "model.language_model.embed_tokens.weight",
+        "norm.weight": "model.language_model.norm.weight",
+        "head.col.linear.weight": "lm_head.weight",
         "layers.0.full_attn.qkv.linear.layer_norm_weight": (
-            "language_model.model.layers.0.input_layernorm.weight"
+            "model.language_model.layers.0.input_layernorm.weight"
         ),
-        "layers.0.mlp_norm.weight": "language_model.model.layers.0.post_attention_layernorm.weight",
+        "layers.0.mlp_norm.weight": "model.language_model.layers.0.post_attention_layernorm.weight",
     }
 
     for native_name, hf_name in cases.items():
@@ -128,16 +128,16 @@ def test_qwen35_export_unpacks_full_attention_q_gate() -> None:
     exported = dict(spec.native_to_hf("layers.0.full_attn.qkv.linear.weight", packed))
 
     assert set(exported) == {
-        "language_model.model.layers.0.self_attn.q_proj.weight",
-        "language_model.model.layers.0.self_attn.k_proj.weight",
-        "language_model.model.layers.0.self_attn.v_proj.weight",
+        "model.language_model.layers.0.self_attn.q_proj.weight",
+        "model.language_model.layers.0.self_attn.k_proj.weight",
+        "model.language_model.layers.0.self_attn.v_proj.weight",
     }
-    assert torch.equal(exported["language_model.model.layers.0.self_attn.q_proj.weight"], q_gate)
-    assert torch.equal(exported["language_model.model.layers.0.self_attn.k_proj.weight"], key)
-    assert torch.equal(exported["language_model.model.layers.0.self_attn.v_proj.weight"], value)
+    assert torch.equal(exported["model.language_model.layers.0.self_attn.q_proj.weight"], q_gate)
+    assert torch.equal(exported["model.language_model.layers.0.self_attn.k_proj.weight"], key)
+    assert torch.equal(exported["model.language_model.layers.0.self_attn.v_proj.weight"], value)
 
 
-def test_qwen35_export_maps_linear_attention_to_vllm_loader_names() -> None:
+def test_qwen35_export_maps_linear_attention_to_hf_checkpoint_names() -> None:
     cfg = _tiny_config()
     spec = Qwen35WeightSpec(cfg)
     qk_dim = cfg.linear_num_key_heads * cfg.linear_key_head_dim
@@ -148,22 +148,22 @@ def test_qwen35_export_maps_linear_attention_to_vllm_loader_names() -> None:
     exported = dict(spec.native_to_hf("layers.0.linear_attn.in_proj.linear.weight", tensor))
 
     assert set(exported) == {
-        "language_model.model.layers.0.linear_attn.in_proj_qkv.weight",
-        "language_model.model.layers.0.linear_attn.in_proj_z.weight",
-        "language_model.model.layers.0.linear_attn.in_proj_b.weight",
-        "language_model.model.layers.0.linear_attn.in_proj_a.weight",
+        "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+        "model.language_model.layers.0.linear_attn.in_proj_z.weight",
+        "model.language_model.layers.0.linear_attn.in_proj_b.weight",
+        "model.language_model.layers.0.linear_attn.in_proj_a.weight",
     }
     assert (
-        exported["language_model.model.layers.0.linear_attn.in_proj_qkv.weight"].shape[0]
+        exported["model.language_model.layers.0.linear_attn.in_proj_qkv.weight"].shape[0]
         == qk_dim * 2 + v_dim
     )
-    assert exported["language_model.model.layers.0.linear_attn.in_proj_z.weight"].shape[0] == v_dim
+    assert exported["model.language_model.layers.0.linear_attn.in_proj_z.weight"].shape[0] == v_dim
     assert (
-        exported["language_model.model.layers.0.linear_attn.in_proj_b.weight"].shape[0]
+        exported["model.language_model.layers.0.linear_attn.in_proj_b.weight"].shape[0]
         == cfg.linear_num_value_heads
     )
     assert (
-        exported["language_model.model.layers.0.linear_attn.in_proj_a.weight"].shape[0]
+        exported["model.language_model.layers.0.linear_attn.in_proj_a.weight"].shape[0]
         == cfg.linear_num_value_heads
     )
 
@@ -219,14 +219,14 @@ def test_qwen35_export_restores_zero_centered_linear_attention_norm() -> None:
 
     exported = dict(spec.native_to_hf("layers.0.linear_attn.norm.weight", tensor))
 
-    assert set(exported) == {"language_model.model.layers.0.linear_attn.norm.weight"}
+    assert set(exported) == {"model.language_model.layers.0.linear_attn.norm.weight"}
     assert torch.equal(
-        exported["language_model.model.layers.0.linear_attn.norm.weight"],
+        exported["model.language_model.layers.0.linear_attn.norm.weight"],
         tensor + 1,
     )
 
 
-def test_qwen35_export_maps_shared_expert_to_vllm_loader_names() -> None:
+def test_qwen35_export_maps_shared_expert_to_hf_checkpoint_names() -> None:
     cfg = _tiny_config()
     spec = Qwen35WeightSpec(cfg)
     tensor = torch.arange(
@@ -236,53 +236,65 @@ def test_qwen35_export_maps_shared_expert_to_vllm_loader_names() -> None:
     exported = dict(spec.native_to_hf("layers.0.moe.shared_expert.gate_up.linear.weight", tensor))
 
     assert set(exported) == {
-        "language_model.model.layers.0.mlp.shared_expert.gate_proj.weight",
-        "language_model.model.layers.0.mlp.shared_expert.up_proj.weight",
+        "model.language_model.layers.0.mlp.shared_expert.gate_proj.weight",
+        "model.language_model.layers.0.mlp.shared_expert.up_proj.weight",
     }
     gate, up = tensor.chunk(2, dim=0)
     assert torch.equal(
-        exported["language_model.model.layers.0.mlp.shared_expert.gate_proj.weight"],
+        exported["model.language_model.layers.0.mlp.shared_expert.gate_proj.weight"],
         gate,
     )
     assert torch.equal(
-        exported["language_model.model.layers.0.mlp.shared_expert.up_proj.weight"],
+        exported["model.language_model.layers.0.mlp.shared_expert.up_proj.weight"],
         up,
     )
 
 
-def test_qwen35_export_maps_expert_fc1_to_individual_expert_names() -> None:
+def test_qwen35_export_packs_base_expert_fc1_to_hf_gate_up_proj() -> None:
     cfg = _tiny_config()
     spec = Qwen35WeightSpec(cfg)
-    tensor = torch.arange(
+    base = torch.arange(
         cfg.moe_intermediate_size * 2 * cfg.hidden_size,
     ).reshape(-1, cfg.hidden_size)
 
-    exported = dict(spec.native_to_hf("layers.0.moe.experts.fc1.weight3", tensor))
+    exported = {}
+    expert_tensors = []
+    for expert_idx in range(cfg.num_experts):
+        tensor = base + expert_idx * 1000
+        expert_tensors.append(tensor)
+        exported.update(
+            dict(spec.native_to_hf(f"layers.0.moe.experts.fc1.weight{expert_idx}", tensor))
+        )
 
-    assert set(exported) == {
-        "language_model.model.layers.0.mlp.experts.3.gate_proj.weight",
-        "language_model.model.layers.0.mlp.experts.3.up_proj.weight",
-    }
-    gate, up = tensor.chunk(2, dim=0)
+    assert set(exported) == {"model.language_model.layers.0.mlp.experts.gate_up_proj"}
     assert torch.equal(
-        exported["language_model.model.layers.0.mlp.experts.3.gate_proj.weight"],
-        gate,
+        exported["model.language_model.layers.0.mlp.experts.gate_up_proj"],
+        torch.stack(expert_tensors, dim=0),
     )
-    assert torch.equal(exported["language_model.model.layers.0.mlp.experts.3.up_proj.weight"], up)
 
 
-def test_qwen35_export_maps_expert_fc2_and_expert_metadata() -> None:
+def test_qwen35_export_packs_base_expert_fc2_and_expert_metadata() -> None:
     cfg = _tiny_config()
     spec = Qwen35WeightSpec(cfg)
-    tensor = torch.arange(
+    base = torch.arange(
         cfg.hidden_size * cfg.moe_intermediate_size,
     ).reshape(cfg.hidden_size, cfg.moe_intermediate_size)
     native_name = "layers.0.moe.experts.fc2.weight2"
 
-    exported = dict(spec.native_to_hf(native_name, tensor))
+    exported = {}
+    expert_tensors = []
+    for expert_idx in range(cfg.num_experts):
+        tensor = base + expert_idx * 1000
+        expert_tensors.append(tensor)
+        exported.update(
+            dict(spec.native_to_hf(f"layers.0.moe.experts.fc2.weight{expert_idx}", tensor))
+        )
 
-    assert set(exported) == {"language_model.model.layers.0.mlp.experts.2.down_proj.weight"}
-    assert torch.equal(exported["language_model.model.layers.0.mlp.experts.2.down_proj.weight"], tensor)
+    assert set(exported) == {"model.language_model.layers.0.mlp.experts.down_proj"}
+    assert torch.equal(
+        exported["model.language_model.layers.0.mlp.experts.down_proj"],
+        torch.stack(expert_tensors, dim=0),
+    )
     assert spec.is_expert(native_name)
     assert spec.expert_global_id(native_name) == 2
     assert spec.expert_local_name(native_name, 0) == "layers.0.moe.experts.fc2.weight0"
