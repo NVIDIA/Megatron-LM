@@ -805,10 +805,6 @@ if HAVE_TE_EP:
     def nccl_ep_combine(context, expert_out, num_local_tokens=None):
         """Autograd-aware combine via TransformerEngine NCCL EP (no scatter step).
 
-        Routing weights are applied upstream in the expert MLP (mirroring the DeepEP
-        backend), so ``recv_topk_weights=None`` is passed and TE skips its in-kernel
-        multiply.
-
         Args:
             context (NcclEpContext): The per-layer EP routing context.
             expert_out (torch.Tensor): Expert outputs ``[recv_capacity_per_rank, hidden]``,
@@ -821,11 +817,7 @@ if HAVE_TE_EP:
             order.
         """
         return te_ep.ep_combine(
-            context.handle,
-            context.buffer,
-            expert_out,
-            recv_topk_weights=None,
-            num_local_tokens=num_local_tokens,
+            context.handle, context.buffer, expert_out, num_local_tokens=num_local_tokens
         )
 
 else:

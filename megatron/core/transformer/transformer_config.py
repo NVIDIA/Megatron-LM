@@ -1485,11 +1485,6 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_flex_dispatcher_backend='ncclep' requires "
                     "moe_token_dispatcher_type='flex'."
                 )
-            if self.fp8 or self.fp4:
-                # TODO(ncclep, fp8): low-precision dispatch/combine not yet supported.
-                raise ValueError(
-                    "moe_flex_dispatcher_backend='ncclep' does not yet support FP8/FP4."
-                )
 
         if self.moe_shared_expert_intermediate_size is not None:
             if self.moe_shared_expert_intermediate_size <= 0:

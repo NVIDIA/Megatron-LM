@@ -1361,13 +1361,13 @@ def skip_routed_expert_padding(config: TransformerConfig) -> bool:
     """Whether the expert module should skip quantization padding.
 
     Returns True when padding is already applied by the router or the
-    HybridEP dispatcher.
+    HybridEP / NCCL-EP dispatcher.
     """
     if config.moe_router_padding_for_quantization:
         return True
-    if (
-        config.moe_token_dispatcher_type == "flex"
-        and config.moe_flex_dispatcher_backend == "hybridep"
+    if config.moe_token_dispatcher_type == "flex" and config.moe_flex_dispatcher_backend in (
+        "hybridep",
+        "ncclep",
     ):
         return True
     return False
