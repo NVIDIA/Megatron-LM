@@ -1463,6 +1463,16 @@ def test_async_diagnostics_report_pending_forward_disable_counts_and_ep_protocol
     controller._async_disable_reason_counts = {"not decode-only": 1, "logging step": 1}
     controller._async_disable_reason = "logging step"
     controller._async_forward_launch_count = 3
+    controller._async_prepared_forward_count = 4
+    controller._async_launched_forward_count = 3
+    controller._async_reused_forward_count = 2
+    controller._async_committed_forward_count = 2
+    controller._async_rolled_back_forward_count = 1
+    controller._async_discarded_forward_count = 1
+    controller._async_row_mapped_forward_count = 1
+    controller._async_identity_forward_count = 1
+    controller._async_graph_mismatch_discard_count = 1
+    controller._async_layout_mismatch_discard_count = 0
     controller._ep_async_protocol = SimpleNamespace(
         diagnostics=lambda: {"step_begin_reuses": 1, "handoff_launches": 2}
     )
@@ -1478,8 +1488,157 @@ def test_async_diagnostics_report_pending_forward_disable_counts_and_ep_protocol
         "disable_reason_counts": {"not decode-only": 1, "logging step": 1},
         "last_disable_reason": "logging step",
         "forward_launches": 3,
+        "prepared_forwards": 4,
+        "launched_forwards": 3,
+        "reused_forwards": 2,
+        "committed_forwards": 2,
+        "rolled_back_forwards": 1,
+        "discarded_forwards": 1,
+        "row_mapped_forwards": 1,
+        "identity_reused_forwards": 1,
+        "graph_mismatch_discards": 1,
+        "layout_mismatch_discards": 0,
         "ep_protocol": {"step_begin_reuses": 1, "handoff_launches": 2},
     }
+
+
+@pytest.mark.internal
+def test_async_transaction_and_resource_diagnostics_are_stable():
+    snapshot = _make_async_layout_snapshot([10, 11], cuda_graph_request_count=2)
+    ledger = AsyncResourceLedger(in_flight=True)
+    ledger.record_reservations(
+        request_ids=torch.tensor([10], dtype=torch.int32),
+        block_ids=torch.tensor([100], dtype=torch.int32),
+        block_columns=torch.tensor([1], dtype=torch.int32),
+    )
+    ledger.defer_kv_blocks(torch.tensor([200], dtype=torch.int32))
+    transaction = AsyncStepTransaction(
+        step_id=7,
+        state=AsyncTxnState.LAUNCHED,
+        snapshot=snapshot,
+        resources=ledger,
+        row_map=torch.tensor([1, 0], dtype=torch.long),
+    )
+
+    assert transaction.diagnostics() == {
+        "step_id": 7,
+        "state": "launched",
+        "request_ids": [10, 11],
+        "row_map": [1, 0],
+        "discard_reason": None,
+        "has_sample_ticket": False,
+        "has_resources": True,
+        "has_h2d_done_event": False,
+        "has_forward_done_event": False,
+        "has_ep_decision": False,
+    }
+    assert ledger.diagnostics() == {
+        "in_flight": True,
+        "reservations": 1,
+        "deferred_kv_blocks": 1,
+        "deferred_mamba_slots": 0,
+        "mamba_leases": 0,
+        "consumed_reservations": 0,
+    }
+
+
+@pytest.mark.internal
+@pytest.mark.asyncio
+async def test_async_h2d_and_forward_launch_before_cpu_bookkeeping_drains(monkeypatch):
+    monkeypatch.setattr(tgc_module, "range_push", lambda _msg: None)
+    monkeypatch.setattr(tgc_module, "range_pop", lambda: None)
+    events = []
+
+    class _Event:
+        def __init__(self, name):
+            self.name = name
+
+        def synchronize(self):
+            events.append(f"{self.name}_sync")
+
+    context = SimpleNamespace(
+        active_token_count=2,
+        total_request_count=2,
+        paused_request_count=0,
+        num_decode_requests=2,
+        padded_active_request_count=2,
+        is_hybrid_model=False,
+        config=SimpleNamespace(materialize_only_last_token_logits=True),
+        kv_block_allocator=SimpleNamespace(
+            store_routing_per_block=lambda _routing: events.append("routing")
+        ),
+        publish_async_prepared_decode_plan=lambda: events.append("publish"),
+        transfer_bookkeeping_to_gpu=lambda **_kwargs: events.append("h2d")
+        or _Event("h2d"),
+        current_input_and_position_ids=lambda: (
+            torch.tensor([[1, 2]], dtype=torch.int64),
+            torch.tensor([[0, 1]], dtype=torch.int64),
+        ),
+        using_cuda_graph_this_step=lambda: True,
+        mark_async_resources_in_flight=lambda: events.append("mark_in_flight") or "ledger",
+    )
+    controller = object.__new__(TextGenerationController)
+    controller.inference_wrapped_model = SimpleNamespace(
+        inference_context=context,
+        model=SimpleNamespace(config=SimpleNamespace(moe_enable_routing_replay=False)),
+    )
+    controller.num_speculative_tokens = 0
+    controller._async_step_transaction = None
+    controller._async_prepare_deferred_until_after_sampling = False
+    controller._async_forward_launch_count = 0
+    controller._decide_ep_step_begin = lambda **_kwargs: EPStepBeginDecision(
+        step_id=0,
+        has_real_work=True,
+        reuse_pending_forward=False,
+        discard_pending_forward=False,
+        row_mapped_forward=False,
+    )
+    controller._dynamic_step_context_init = lambda: (
+        torch.tensor([[1, 2]], dtype=torch.int64),
+        torch.tensor([[0, 1]], dtype=torch.int64),
+    )
+
+    def _forward(*_args):
+        events.append("async_forward" if "h2d" in events else "forward")
+
+    controller._dynamic_step_forward_logits = _forward
+    controller._router_record_bookkeeping = lambda: None
+    controller._async_scheduling_disabled_reason = lambda **_kwargs: None
+    controller._record_async_eligibility_result = lambda _reason: None
+    controller._record_async_disable_reason = lambda reason: events.append(("disable", reason))
+    controller._try_prepare_async_decode_before_sampling = lambda: events.append(
+        "prepare"
+    ) or True
+    controller._should_collect_dynamic_sampling_bookkeeping = lambda **_kwargs: False
+    controller._dynamic_step_sample_logits_to_next_input_ids = (
+        lambda: events.extend(["sample", "copy"])
+    )
+    controller._transfer_async_samples_to_cpu = lambda count: events.append(
+        ("d2h", count)
+    ) or _sample_ticket([4, 5])
+    controller._confirm_prepared_ep_async_handoff = lambda: True
+    controller._begin_async_step_transaction = lambda _count: events.append(
+        "record"
+    ) or SimpleNamespace(mark_launched=lambda **_kwargs: events.append("tx_launch"))
+    controller._ensure_ep_async_handoff_decided = lambda **_kwargs: events.append("ep_done")
+
+    def _bookkeeping(**kwargs):
+        events.append("bookkeeping_start")
+        kwargs["sample_ready_event"].synchronize()
+        kwargs["h2d_done_event"].synchronize()
+        events.append("bookkeeping_done")
+        return {"sample": torch.tensor([4, 5], dtype=torch.int64)}
+
+    controller._dynamic_step_context_bookkeeping = _bookkeeping
+
+    result = await controller.async_generate_output_tokens_dynamic_batch(skip_bookkeeping=False)
+
+    assert result["sample"].tolist() == [4, 5]
+    assert events.index("h2d") < events.index("async_forward") < events.index(
+        "bookkeeping_start"
+    )
+    assert events.index("async_forward") < events.index("h2d_sync")
+    assert "h2d_sync" not in events[: events.index("async_forward")]
 
 
 @pytest.mark.internal

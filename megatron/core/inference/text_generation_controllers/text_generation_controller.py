@@ -186,6 +186,14 @@ class TextGenerationController:
         self._async_scheduling_enabled = context.config.enable_async_scheduling
         self._async_disable_reason = None
         self._async_forward_launch_count = 0
+        self._async_prepared_forward_count = 0
+        self._async_launched_forward_count = 0
+        self._async_reused_forward_count = 0
+        self._async_committed_forward_count = 0
+        self._async_rolled_back_forward_count = 0
+        self._async_identity_forward_count = 0
+        self._async_graph_mismatch_discard_count = 0
+        self._async_layout_mismatch_discard_count = 0
         self._async_deferred_mtp_release_count = 0
         self._async_eligibility_check_count = 0
         self._async_eligibility_pass_count = 0
@@ -1519,6 +1527,20 @@ class TextGenerationController:
             "disable_reason_counts": dict(self._async_disable_reason_counts),
             "last_disable_reason": self._async_disable_reason,
             "forward_launches": self._async_forward_launch_count,
+            "prepared_forwards": getattr(self, "_async_prepared_forward_count", 0),
+            "launched_forwards": getattr(self, "_async_launched_forward_count", 0),
+            "reused_forwards": getattr(self, "_async_reused_forward_count", 0),
+            "committed_forwards": getattr(self, "_async_committed_forward_count", 0),
+            "rolled_back_forwards": getattr(self, "_async_rolled_back_forward_count", 0),
+            "discarded_forwards": getattr(self, "_async_discarded_forward_count", 0),
+            "row_mapped_forwards": getattr(self, "_async_row_mapped_forward_count", 0),
+            "identity_reused_forwards": getattr(self, "_async_identity_forward_count", 0),
+            "graph_mismatch_discards": getattr(
+                self, "_async_graph_mismatch_discard_count", 0
+            ),
+            "layout_mismatch_discards": getattr(
+                self, "_async_layout_mismatch_discard_count", 0
+            ),
             "ep_protocol": (
                 self._ep_async_protocol.diagnostics()
                 if self._ep_async_protocol is not None
@@ -1565,6 +1587,10 @@ class TextGenerationController:
         self._async_disable_reason_counts[reason] = (
             self._async_disable_reason_counts.get(reason, 0) + 1
         )
+
+    def _increment_async_counter(self, name: str, value: int = 1) -> None:
+        """Increment an async diagnostics counter, tolerating lightweight test stubs."""
+        setattr(self, name, getattr(self, name, 0) + value)
 
     def _active_requests_use_greedy_sampling(
         self, active_request_count: Optional[int] = None
@@ -1670,7 +1696,10 @@ class TextGenerationController:
         if row_map is not None:
             row_mapped = self._row_map_requires_gather(row_map)
             if row_mapped:
-                self._async_row_mapped_forward_count += 1
+                self._increment_async_counter("_async_row_mapped_forward_count")
+            else:
+                self._increment_async_counter("_async_identity_forward_count")
+            self._increment_async_counter("_async_reused_forward_count")
             transaction.row_map = row_map
             transaction.state = AsyncTxnState.RESOLVED
             row_indices = (
@@ -1680,7 +1709,16 @@ class TextGenerationController:
             )
             return True, row_indices, row_mapped
 
-        self._async_discarded_forward_count += 1
+        context = self.inference_wrapped_model.inference_context
+        current_snapshot = AsyncLayoutSnapshot.from_context_current(
+            context, tokens_per_request=self.num_speculative_tokens + 1
+        )
+        if not transaction.snapshot.graph_compatible_with(current_snapshot):
+            self._increment_async_counter("_async_graph_mismatch_discard_count")
+        else:
+            self._increment_async_counter("_async_layout_mismatch_discard_count")
+        self._increment_async_counter("_async_discarded_forward_count")
+        self._increment_async_counter("_async_rolled_back_forward_count")
         transaction.discard("pending forward not reusable")
         return False, None, False
 
@@ -1692,7 +1730,8 @@ class TextGenerationController:
             context.release_deferred_async_resources()
             transaction.discard("discarded before step begin")
             self._async_step_transaction = None
-            self._async_discarded_forward_count += 1
+            self._increment_async_counter("_async_discarded_forward_count")
+            self._increment_async_counter("_async_rolled_back_forward_count")
 
     def _decide_ep_step_begin(self, *, has_real_work: bool) -> EPStepBeginDecision:
         """Synchronize pending async state at the beginning of an EP work step."""
@@ -1792,6 +1831,7 @@ class TextGenerationController:
             input_ids, position_ids = self._dynamic_step_context_init(is_dummy_forward=True)
             self._dynamic_step_forward_logits(input_ids, position_ids)
             self._async_forward_launch_count += 1
+            self._increment_async_counter("_async_launched_forward_count")
         finally:
             range_pop()
         return True
@@ -1921,6 +1961,7 @@ class TextGenerationController:
         if not async_next_prepared:
             self._async_prepare_deferred_until_after_sampling = True
             return False
+        self._increment_async_counter("_async_prepared_forward_count")
 
         handoff_decision = self._decide_ep_async_handoff(
             has_real_work=True, can_launch_async_handoff=True
@@ -1931,6 +1972,7 @@ class TextGenerationController:
         context.discard_async_prepared_decode_plan()
         self._async_disable_reason = "ep async handoff skipped"
         self._record_async_disable_reason(self._async_disable_reason)
+        self._increment_async_counter("_async_rolled_back_forward_count")
         return False
 
     def _try_prepare_async_decode_after_sampling(self) -> bool:
@@ -1951,6 +1993,7 @@ class TextGenerationController:
             self._decide_ep_async_handoff(has_real_work=True, can_launch_async_handoff=False)
             return False
 
+        self._increment_async_counter("_async_prepared_forward_count")
         return True
 
     def _confirm_prepared_ep_async_handoff(self) -> bool:
@@ -1965,6 +2008,7 @@ class TextGenerationController:
         context.discard_async_prepared_decode_plan()
         self._async_disable_reason = "ep async handoff skipped"
         self._record_async_disable_reason(self._async_disable_reason)
+        self._increment_async_counter("_async_rolled_back_forward_count")
         return False
 
     def _async_scheduling_global_disabled_reason(self, *, allow_mtp: bool = False) -> Optional[str]:
@@ -2818,7 +2862,8 @@ class TextGenerationController:
                     pending_forward_reused = False
                     pending_forward_row_indices = None
                     pending_forward_row_mapped = False
-                    self._async_discarded_forward_count += 1
+                    self._increment_async_counter("_async_discarded_forward_count")
+                    self._increment_async_counter("_async_rolled_back_forward_count")
                     if transaction is not None:
                         transaction.discard("row-mapped non-decode forward not reusable")
                 if pending_forward_reused and context.is_hybrid_model:
@@ -2827,8 +2872,10 @@ class TextGenerationController:
                 if transaction is not None:
                     if pending_forward_reused:
                         transaction.mark_committed()
+                        self._increment_async_counter("_async_committed_forward_count")
                     elif transaction.state != AsyncTxnState.DISCARDED:
                         transaction.discard("pending forward not reused")
+                        self._increment_async_counter("_async_rolled_back_forward_count")
                     self._retire_async_transaction()
                 if pending_forward_reused and self.num_speculative_tokens > 0:
                     input_ids, _ = context.current_input_and_position_ids()
@@ -2973,6 +3020,7 @@ class TextGenerationController:
                     next_input_ids, next_position_ids = context.current_input_and_position_ids()
                     self._dynamic_step_forward_logits(next_input_ids, next_position_ids)
                     self._async_forward_launch_count += 1
+                    self._increment_async_counter("_async_launched_forward_count")
                     cuda_graph_request_count = (
                         context.padded_active_request_count
                         if context.using_cuda_graph_this_step()
@@ -3037,6 +3085,8 @@ class TextGenerationController:
                     context.release_deferred_async_resources()
                     if transaction is not None:
                         transaction.discard("no active requests after bookkeeping")
+                        self._increment_async_counter("_async_discarded_forward_count")
+                        self._increment_async_counter("_async_rolled_back_forward_count")
                         self._async_step_transaction = None
 
             ret = {

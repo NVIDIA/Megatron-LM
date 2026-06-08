@@ -367,6 +367,26 @@ class AsyncStepTransaction:
         self.discard_reason = reason
         self.state = AsyncTxnState.DISCARDED
 
+    def diagnostics(self) -> dict[str, Any]:
+        """Return stable transaction diagnostics for tests and benchmark logs."""
+        row_map = None
+        if self.row_map is not None and hasattr(self.row_map, "tolist"):
+            row_map = self.row_map.tolist()
+        elif self.row_map is not None:
+            row_map = self.row_map
+        return {
+            "step_id": self.step_id,
+            "state": self.state.value,
+            "request_ids": self.snapshot.request_ids.to(device="cpu").tolist(),
+            "row_map": row_map,
+            "discard_reason": self.discard_reason,
+            "has_sample_ticket": self.sample_ticket is not None,
+            "has_resources": self.resources is not None,
+            "has_h2d_done_event": self.h2d_done_event is not None,
+            "has_forward_done_event": self.forward_done_event is not None,
+            "has_ep_decision": self.ep_decision is not None,
+        }
+
     @property
     def is_in_flight(self) -> bool:
         """Whether the transaction still represents a pending async forward."""
@@ -697,6 +717,17 @@ class AsyncResourceLedger:
             dtype=torch.int32,
             device="cpu",
         )
+
+    def diagnostics(self) -> dict[str, int | bool]:
+        """Return stable resource-lifetime counters for tests and benchmark logs."""
+        return {
+            "in_flight": self.in_flight,
+            "reservations": len(self.kv_reservations),
+            "deferred_kv_blocks": len(self.deferred_kv_blocks),
+            "deferred_mamba_slots": len(self.deferred_mamba_slots),
+            "mamba_leases": len(self.mamba_leases),
+            "consumed_reservations": self.consumed_reservation_count,
+        }
 
     def _release_deferred_mamba_slots(self, context: object) -> None:
         if not getattr(context, "is_hybrid_model", False) or not self.deferred_mamba_slots:
