@@ -5,6 +5,7 @@
 import dataclasses
 import os
 from collections.abc import Iterable, Iterator
+from typing import cast
 
 import pytest
 import torch
@@ -272,6 +273,26 @@ def test_sharded_allgather_into_existing_buffer(setup: DistributedSetup):
 
 
 @pytest.mark.distributed
+def test_mesh_axis_must_be_non_negative_int(setup: DistributedSetup):
+    """DBuffer communication methods require explicit non-negative integer mesh axes."""
+    mesh = init_device_mesh(setup.device.type, (setup.world_size,))
+    buffer = DBuffer(
+        mesh=mesh,
+        placements=[Replicate()],
+        tensor_shapes=[torch.Size((4,))],
+        dtype=torch.float32,
+        device=setup.device,
+    )
+
+    with pytest.raises(TypeError, match="Mesh axis must be an int"):
+        buffer.allgather(cast(int, "dp"))
+    with pytest.raises(TypeError, match="Mesh axis must be an int"):
+        buffer.allgather(True)
+    with pytest.raises(ValueError, match="Mesh axis -1 is out of bounds"):
+        buffer.allgather(-1)
+
+
+@pytest.mark.distributed
 def test_replicate_scatter_round_trip(setup: DistributedSetup):
     """Replicated buffers locally chunk into sharded buffers and all-gather back."""
     mesh = init_device_mesh(setup.device.type, (setup.world_size,))
@@ -444,7 +465,7 @@ def test_2d_mesh_replicate_flat_round_trip(setup: DistributedSetup):
     )
 
     sharded_buffer = DBuffer.distribute_tensors(tensors, mesh, [Replicate(), Flat()])
-    replicated_buffer = sharded_buffer.allgather("flat")
+    replicated_buffer = sharded_buffer.allgather(1)
 
     _assert_dbuffer_contains_tensors(replicated_buffer, tensors)
 
@@ -485,8 +506,8 @@ def test_2d_mesh_shards_across_all_ranks(setup: DistributedSetup):
     expected_local_numel = fully_sharded_buffer.layout.size // mesh.size()
     expected_inner_axis_shard_numel = fully_sharded_buffer.layout.size // mesh.size(1)
     expected_offset = (
-        mesh.get_local_rank("dp_inner") * expected_inner_axis_shard_numel
-        + mesh.get_local_rank("dp_outer") * expected_local_numel
+        mesh.get_local_rank(1) * expected_inner_axis_shard_numel
+        + mesh.get_local_rank(0) * expected_local_numel
     )
     assert fully_sharded_buffer.offset == expected_offset
     assert (
@@ -512,15 +533,15 @@ def test_2d_mesh_partial_flat_reduce_scatter_to_flat_flat(setup: DistributedSetu
     ]
 
     partial_sharded_buffer = DBuffer.distribute_tensors(tensors, mesh, [Partial(), Flat()])
-    fully_sharded_buffer = partial_sharded_buffer.reduce_scatter("dp_outer", Flat())
-    replicated_buffer = fully_sharded_buffer.allgather("dp_outer").allgather("dp_inner")
+    fully_sharded_buffer = partial_sharded_buffer.reduce_scatter(0, Flat())
+    replicated_buffer = fully_sharded_buffer.allgather(0).allgather(1)
 
     assert fully_sharded_buffer.placements == (Flat(), Flat())
     expected_local_numel = fully_sharded_buffer.layout.size // mesh.size()
     expected_inner_axis_shard_numel = fully_sharded_buffer.layout.size // mesh.size(1)
     expected_offset = (
-        mesh.get_local_rank("dp_inner") * expected_inner_axis_shard_numel
-        + mesh.get_local_rank("dp_outer") * expected_local_numel
+        mesh.get_local_rank(1) * expected_inner_axis_shard_numel
+        + mesh.get_local_rank(0) * expected_local_numel
     )
     assert fully_sharded_buffer.offset == expected_offset
     assert (
@@ -548,15 +569,15 @@ def test_2d_mesh_replicate_flat_scatter_to_flat_flat(setup: DistributedSetup):
     )
 
     replicated_sharded_buffer = DBuffer.distribute_tensors(tensors, mesh, [Replicate(), Flat()])
-    fully_sharded_buffer = replicated_sharded_buffer.scatter("dp_outer", Flat())
-    replicated_buffer = fully_sharded_buffer.allgather("dp_outer").allgather("dp_inner")
+    fully_sharded_buffer = replicated_sharded_buffer.scatter(0, Flat())
+    replicated_buffer = fully_sharded_buffer.allgather(0).allgather(1)
 
     assert fully_sharded_buffer.placements == (Flat(), Flat())
     expected_local_numel = fully_sharded_buffer.layout.size // mesh.size()
     expected_inner_axis_shard_numel = fully_sharded_buffer.layout.size // mesh.size(1)
     expected_offset = (
-        mesh.get_local_rank("dp_inner") * expected_inner_axis_shard_numel
-        + mesh.get_local_rank("dp_outer") * expected_local_numel
+        mesh.get_local_rank(1) * expected_inner_axis_shard_numel
+        + mesh.get_local_rank(0) * expected_local_numel
     )
     assert fully_sharded_buffer.offset == expected_offset
     assert (

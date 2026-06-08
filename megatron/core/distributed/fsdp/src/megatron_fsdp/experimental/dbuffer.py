@@ -17,6 +17,7 @@
 import dataclasses
 import math
 from collections.abc import Iterable
+from typing import TypeAlias
 
 import torch
 import torch.distributed as dist
@@ -26,8 +27,7 @@ from torch.distributed.tensor import DTensor
 
 from .placement import Flat, Partial, Placement, Replicate, validate_placements
 
-MeshAxis = int | str
-Shape = torch.Size | Iterable[int]
+Shape: TypeAlias = torch.Size | Iterable[int]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -64,18 +64,11 @@ def _pad_to_multiple(value: int, multiple: int) -> int:
     return ((value + multiple - 1) // multiple) * multiple
 
 
-def _axis_index(mesh: DeviceMesh, axis: MeshAxis) -> int:
-    if isinstance(axis, int):
-        if axis < 0:
-            axis += mesh.ndim
-        if axis < 0 or axis >= mesh.ndim:
-            raise ValueError(f"Mesh axis {axis} is out of bounds for mesh ndim {mesh.ndim}.")
-        return axis
-
-    dim_names = mesh.mesh_dim_names
-    if dim_names is None or axis not in dim_names:
-        raise ValueError(f"Mesh axis {axis!r} is not present in mesh dim names {dim_names}.")
-    return dim_names.index(axis)
+def _validate_mesh_axis(mesh: DeviceMesh, axis: int) -> None:
+    if not isinstance(axis, int) or isinstance(axis, bool):
+        raise TypeError(f"Mesh axis must be an int, got {type(axis).__name__}.")
+    if axis < 0 or axis >= mesh.ndim:
+        raise ValueError(f"Mesh axis {axis} is out of bounds for mesh ndim {mesh.ndim}.")
 
 
 def _compute_layout(shapes: Iterable[Shape], dp_size: int) -> GlobalLayout:
@@ -100,9 +93,9 @@ def _compute_layout(shapes: Iterable[Shape], dp_size: int) -> GlobalLayout:
     if dp_size <= 0:
         raise ValueError(f"DP size must be positive, got {dp_size}.")
 
-    shapes = tuple(torch.Size(shape) for shape in shapes)
+    tensor_shapes = tuple(torch.Size(shape) for shape in shapes)
     chunk_size = 1
-    for shape in shapes:
+    for shape in tensor_shapes:
         non_leading_numel = _non_leading_numel(shape)
         if non_leading_numel <= 0:
             raise ValueError(f"Cannot compute a layout for zero-sized non-leading dims: {shape}.")
@@ -110,10 +103,10 @@ def _compute_layout(shapes: Iterable[Shape], dp_size: int) -> GlobalLayout:
 
     # The LCM part is the packing grid. Since every row size divides this grid,
     # DP shard boundaries that are multiples of the grid avoid splitting dim-0 rows.
-    tensor_to_offset: list[int | None] = [None] * len(shapes)
+    tensor_to_offset: list[int | None] = [None] * len(tensor_shapes)
     fragment_items = []
     regular_items = []
-    for tensor_id, shape in enumerate(shapes):
+    for tensor_id, shape in enumerate(tensor_shapes):
         if shape.numel() < chunk_size:
             fragment_items.append((tensor_id, shape))
         else:
@@ -181,15 +174,17 @@ def _compute_layout(shapes: Iterable[Shape], dp_size: int) -> GlobalLayout:
         next_offset += frag_shape.numel()
 
     if any(offset is None for offset in tensor_to_offset):
-        raise AssertionError(f"Incomplete DBuffer layout for shapes {shapes}.")
+        raise AssertionError(f"Incomplete DBuffer layout for shapes {tensor_shapes}.")
 
     resolved_tensor_to_offset = tuple(offset for offset in tensor_to_offset if offset is not None)
-    for shape, offset in zip(shapes, resolved_tensor_to_offset, strict=True):
+    for shape, offset in zip(tensor_shapes, resolved_tensor_to_offset, strict=True):
         row_size = _non_leading_numel(shape)
         if offset % row_size != 0:
             raise AssertionError(f"Tensor offset {offset} is not aligned to row size {row_size}.")
     size = _pad_to_multiple(next_offset, chunk_size * dp_size)
-    return GlobalLayout(tensor_shapes=shapes, tensor_to_offset=resolved_tensor_to_offset, size=size)
+    return GlobalLayout(
+        tensor_shapes=tensor_shapes, tensor_to_offset=resolved_tensor_to_offset, size=size
+    )
 
 
 class DBuffer:
@@ -433,9 +428,10 @@ class DBuffer:
             f"{axis}: {old_placement!r} -> {new_placement!r}."
         )
 
-    def allgather(self, mesh_axis: MeshAxis, *, out: "DBuffer | None" = None) -> "DBuffer":
+    def allgather(self, mesh_axis: int, *, out: "DBuffer | None" = None) -> "DBuffer":
         """All-gather a Flat axis into Replicate placement."""
-        axis = _axis_index(self.mesh, mesh_axis)
+        _validate_mesh_axis(self.mesh, mesh_axis)
+        axis = mesh_axis
         if not isinstance(self.placements[axis], Flat):
             raise ValueError(f"allgather() requires Flat placement on axis {mesh_axis!r}.")
 
@@ -450,9 +446,10 @@ class DBuffer:
         )
         return out
 
-    def allreduce(self, mesh_axis: MeshAxis, *, out: "DBuffer | None" = None) -> "DBuffer":
+    def allreduce(self, mesh_axis: int, *, out: "DBuffer | None" = None) -> "DBuffer":
         """All-reduce a Partial axis into Replicate placement."""
-        axis = _axis_index(self.mesh, mesh_axis)
+        _validate_mesh_axis(self.mesh, mesh_axis)
+        axis = mesh_axis
         partial_placement = self.placements[axis]
         if not isinstance(partial_placement, Partial):
             raise ValueError(f"allreduce() requires Partial placement on axis {mesh_axis!r}.")
@@ -462,17 +459,16 @@ class DBuffer:
         out = self._create_or_validate_out(placements, out)
         out.local_buffer.copy_(self.local_buffer)
         dist.all_reduce(
-            out.local_buffer,
-            op=partial_placement.reduce_op,
-            group=self.mesh.get_group(axis),
+            out.local_buffer, op=partial_placement.reduce_op, group=self.mesh.get_group(axis)
         )
         return out
 
     def reduce_scatter(
-        self, mesh_axis: MeshAxis, new_placement: Placement, *, out: "DBuffer | None" = None
+        self, mesh_axis: int, new_placement: Placement, *, out: "DBuffer | None" = None
     ) -> "DBuffer":
         """Reduce-scatter a Partial axis into ``new_placement``."""
-        axis = _axis_index(self.mesh, mesh_axis)
+        _validate_mesh_axis(self.mesh, mesh_axis)
+        axis = mesh_axis
         if not isinstance(new_placement, Flat):
             raise NotImplementedError("DBuffer currently supports reduce_scatter() to Flat only.")
         partial_placement = self.placements[axis]
@@ -492,10 +488,11 @@ class DBuffer:
         return out
 
     def scatter(
-        self, mesh_axis: MeshAxis, new_placement: Placement, *, out: "DBuffer | None" = None
+        self, mesh_axis: int, new_placement: Placement, *, out: "DBuffer | None" = None
     ) -> "DBuffer":
         """Locally chunk a Replicate axis into ``new_placement``."""
-        axis = _axis_index(self.mesh, mesh_axis)
+        _validate_mesh_axis(self.mesh, mesh_axis)
+        axis = mesh_axis
         if not isinstance(new_placement, Flat):
             raise NotImplementedError("DBuffer currently supports scatter() to Flat only.")
         if not isinstance(self.placements[axis], Replicate):
