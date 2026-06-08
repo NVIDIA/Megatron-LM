@@ -133,9 +133,7 @@ def main():
         print("No data to analyze. Exiting.")
         return
 
-    # Compute per-layer stats.
-    print()
-    print("Per-layer concentration:")
+    print("\nPer-layer concentration:")
     header = (
         f"  {'layer':>5} | {'tokens':>6} | {'uniq':>4} | "
         + " | ".join(f"top{n}" for n in n_values)
@@ -163,23 +161,19 @@ def main():
             f"{cov_str} | {uniform_bl:.3f}"
         )
 
-    # Aggregate stats.
-    print()
-    print("Aggregate (averaged across layers):")
+    print("\nAggregate (averaged across layers):")
     for n in n_values:
         cov_vals = [r[f"top{n}"] for r in per_layer_results]
+        mean_cov = sum(cov_vals) / len(cov_vals)
         uniform_bl = n / args.num_experts
-        ratio = (sum(cov_vals) / len(cov_vals)) / uniform_bl
-        print(
-            f"  Mean top-{n} coverage: {sum(cov_vals) / len(cov_vals):.3f} "
-            f"(uniform baseline: {uniform_bl:.3f}, ratio: {ratio:.2f}×)"
-        )
+        ratio = mean_cov / uniform_bl
+        print(f"  Mean top-{n} coverage: {mean_cov:.3f}  (uniform baseline: {uniform_bl:.3f}, ratio: {ratio:.2f}×)")
 
-    print()
-    print("Interpretation guide:")
-    print("  Coverage ratio = (observed coverage) / (uniform baseline). 1.0 = no signal, >2 = real concentration")
-    print("  top-22 ratio > 2× : routing is concentrated — a small hot-set accounts for most activations")
-    print("  top-22 ratio ~1×  : near-uniform routing — load balancing is effective, no static strategy helps")
+    print(
+        "\nInterpretation: coverage ratio = observed / uniform baseline."
+        "\n  > 2× : concentrated — a small hot-set accounts for most activations"
+        "\n  ~1×  : near-uniform — load balancing is effective, no static strategy helps"
+    )
 
     # Optional: write CSV + plots.
     if args.output_dir:
