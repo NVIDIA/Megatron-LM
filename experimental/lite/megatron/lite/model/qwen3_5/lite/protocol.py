@@ -11,6 +11,8 @@ import torch.nn as nn
 
 from megatron.lite.model.qwen3_5.config import Qwen35Config
 from megatron.lite.model.qwen3_5.lite.checkpoint import (
+    EXPERT_CLASSIFIER,
+    PLACEMENT_FN,
     load_hf_weights as _load_hf_weights_impl,
 )
 from megatron.lite.primitive.bundle import ModelBundle

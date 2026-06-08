@@ -28,6 +28,8 @@ import torch.nn as nn
 from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
 from megatron.lite.model.qwen3_moe.common import is_expert_param
 from megatron.lite.model.qwen3_moe.lite.checkpoint import (
+    EXPERT_CLASSIFIER,
+    PLACEMENT_FN,
     load_hf_weights as _load_hf_weights_impl,
 )
 from megatron.lite.model.qwen3_moe.lite.model import MTPLossAutoScaler, Qwen3MoEModel

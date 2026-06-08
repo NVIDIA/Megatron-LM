@@ -238,12 +238,53 @@ class MegatronLiteRuntime(RuntimeBase):
     def save_checkpoint(self, handle: ModelHandle, path: str, **kwargs) -> None:
         from megatron.lite.primitive.ckpt import save_training_checkpoint
 
-        save_training_checkpoint(handle._model, handle._optimizer, path)
+        step = kwargs.pop("step", None)
+        if step is None:
+            step = kwargs.pop("iteration", None)
+        if step is None:
+            step = kwargs.pop("global_step", 0)
+        use_dcp = bool(kwargs.pop("use_dcp", False))
+        save_rng = bool(kwargs.pop("save_rng", True))
+        get_placements, is_expert = _checkpoint_hooks(handle)
+        save_training_checkpoint(
+            _checkpoint_model(handle, use_dcp=use_dcp),
+            handle._optimizer,
+            int(step),
+            path,
+            _checkpoint_parallel_config(handle),
+            handle._parallel_state,
+            get_placements=kwargs.pop("get_placements", get_placements),
+            is_expert=kwargs.pop("is_expert", is_expert),
+            use_dcp=use_dcp,
+            save_rng=save_rng,
+            **kwargs,
+        )
 
-    def load_checkpoint(self, handle: ModelHandle, path: str, **kwargs) -> None:
+    def load_checkpoint(self, handle: ModelHandle, path: str, **kwargs) -> int:
         from megatron.lite.primitive.ckpt import load_training_checkpoint
 
-        load_training_checkpoint(handle._model, handle._optimizer, path)
+        use_dcp = bool(kwargs.pop("use_dcp", False))
+        load_rng = bool(kwargs.pop("load_rng", True))
+        update_legacy_format = bool(
+            kwargs.pop(
+                "load_parameter_state_update_legacy_format",
+                kwargs.pop("update_legacy_format", False),
+            )
+        )
+        get_placements, is_expert = _checkpoint_hooks(handle)
+        return load_training_checkpoint(
+            _checkpoint_model(handle, use_dcp=use_dcp),
+            handle._optimizer,
+            path,
+            _checkpoint_parallel_config(handle),
+            handle._parallel_state,
+            get_placements=kwargs.pop("get_placements", get_placements),
+            is_expert=kwargs.pop("is_expert", is_expert),
+            use_dcp=use_dcp,
+            load_rng=load_rng,
+            load_parameter_state_update_legacy_format=update_legacy_format,
+            **kwargs,
+        )
 
     def export_weights(self, handle: ModelHandle, **kwargs) -> Iterator[tuple[str, torch.Tensor]]:
         model_chunks = handle._extras.get("model_chunks", [handle._model])
@@ -451,3 +492,30 @@ class _EvalModeCtx:
     def __exit__(self, *exc):
         torch.set_grad_enabled(self._prev_grad)
         return False
+
+
+def _checkpoint_parallel_config(handle: ModelHandle):
+    cfg = handle.config
+    if cfg is None:
+        return None
+    return getattr(cfg, "parallel", cfg)
+
+
+def _checkpoint_model(handle: ModelHandle, *, use_dcp: bool):
+    model = handle._model
+    if not use_dcp or isinstance(model, torch.nn.Module):
+        return model
+    return torch.nn.ModuleList(handle._extras.get("model_chunks", model))
+
+
+def _checkpoint_hooks(handle: ModelHandle):
+    from megatron.lite.primitive.protocols import (
+        default_expert_classifier,
+        default_placement_fn,
+    )
+
+    proto = handle._extras.get("protocol")
+    return (
+        getattr(proto, "PLACEMENT_FN", default_placement_fn),
+        getattr(proto, "EXPERT_CLASSIFIER", default_expert_classifier),
+    )
