@@ -226,11 +226,7 @@ class PagedTensor:
             "row_scaled_nvfp4": metadata["row_scaled_nvfp4"],
         }
         optional_kwargs = {}
-        for optional_name in (
-            "requires_grad",
-            "nvfp4_use_4over6",
-            "nvfp4_e4m3_max",
-        ):
+        for optional_name in ("requires_grad", "nvfp4_use_4over6", "nvfp4_e4m3_max"):
             if optional_name in metadata:
                 optional_kwargs[optional_name] = metadata[optional_name]
 
