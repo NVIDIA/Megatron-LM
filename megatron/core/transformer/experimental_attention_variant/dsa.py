@@ -778,10 +778,12 @@ class DSAIndexer(MegatronModule):
 
     def _apply_rope(self, x: torch.Tensor, rotary_pos_emb: torch.Tensor, mscale: float):
         """Apply RoPE to the input tensor."""
-        # x_nope [seqlen, batch, *, index_head_dim - qk_pos_emb_head_dim]
         # x_pe   [seqlen, batch, *, qk_pos_emb_head_dim]
-        x_nope, x_pe = torch.split(
-            x, [self.index_head_dim - self.qk_pos_emb_head_dim, self.qk_pos_emb_head_dim], dim=-1
+        # x_nope [seqlen, batch, *, index_head_dim - qk_pos_emb_head_dim]
+        # To align with DeepSeek's implementation,
+        # x_pe is placed at the front, and x_nope is placed at the back.
+        x_pe, x_nope = torch.split(
+            x, [self.qk_pos_emb_head_dim, self.index_head_dim - self.qk_pos_emb_head_dim], dim=-1
         )
         x_pe = apply_rotary_pos_emb(
             x_pe,
@@ -790,9 +792,12 @@ class DSAIndexer(MegatronModule):
             cu_seqlens=None,
             mscale=mscale,
             cp_group=self.pg_collection.cp,
+            # This flag is for the MLA-style interleaving in RoPE.
+            # Set it to False, as indexer does not apply interleaved RoPE.
+            mla_rotary_interleaved=False,
         )
         # [seqlen, batch, *, index_head_dim]
-        x = torch.cat([x_nope, x_pe], dim=-1)
+        x = torch.cat([x_pe, x_nope], dim=-1)
         return x
 
     def forward_before_topk(

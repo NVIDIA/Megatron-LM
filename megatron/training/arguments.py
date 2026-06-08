@@ -1141,18 +1141,18 @@ def validate_args(args, defaults={}):
 
         assert args.ckpt_format == "fsdp_dtensor", \
             "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
+    
+        if args.nccl_ub:
+            # In Megatron-LM, required implementation for manual registration is already provided.
+            # So we enable the manual registration by default when nccl-ub and use_megatron_fsdp is set.
+            args.fsdp_manual_registration = True
+            warn_rank_0('FSDP manual registration is enabled by default when --nccl-ub is enabled!')
 
         if args.init_model_with_meta_device and args.data_parallel_sharding_strategy == "no_shard":
             raise ValueError(
                 "Meta device initialization (init_model_with_meta_device=True) is not "
                 "supported or necessary for the 'no_shard' / 0 sharding strategy."
             )
-
-    if args.nccl_ub and args.use_megatron_fsdp:
-        # In Megatron-LM, required implementation for manual registration is already provided.
-        # So we enable the manual registration by default when nccl-ub and use_megatron_fsdp is set.
-        args.fsdp_manual_registration = True
-        warn_rank_0('FSDP manual registration is enabled by default when nccl-ub is enabled')
 
     if args.fsdp_manual_registration:
         assert args.use_megatron_fsdp, "FSDP manual registration is only supported with Megatron FSDP."
@@ -1524,6 +1524,13 @@ def validate_args(args, defaults={}):
         assert args.fim_rate, "--fim-rate should be specified."
         assert args.fim_spm_rate, "--fim-spm-rate should be specified."
         assert all(token is not None for token in extra_tokens), "FIM extra tokens should be specified."
+
+    assert not (
+        args.cross_entropy_loss_fusion and args.cross_entropy_fusion_impl == 'te'
+    ), (
+        "Transformer Engine cross entropy loss fusion is disabled due to stability issues. "
+        "Use --cross-entropy-fusion-impl native, or omit --cross-entropy-loss-fusion."
+    )
 
     # Deterministic mode
     if args.deterministic_mode:
@@ -1969,6 +1976,14 @@ def _add_inference_args(parser):
     group.add_argument('--inference-dynamic-batching-cuda-graph-mixed-prefill-count',
                        type=int, default=16,
                        help='Number of mixed prefill requests to capture in a cuda graph.')
+    group.add_argument('--inference-dynamic-batching-cuda-graph-sizing-distribution',
+                       type=str, default='exponential',
+                       choices=['exponential', 'linear'],
+                       dest='inference_dynamic_batching_cuda_graph_sizing_distribution',
+                       help='Spacing of CUDA graph token counts. "exponential" (default) '
+                            'halves from cuda_graph_max_tokens down to tp_size, giving a '
+                            'log-spaced distribution with bounded relative padding. '
+                            '"linear" uses varying linear strides across the range.')
     group.add_argument('--inference-dynamic-batching-sampling-backend',
                        type=str, default='torch',
                        choices=['torch', 'flashinfer'],
@@ -2007,6 +2022,7 @@ def _add_network_size_args(parser):
         "timers",
         "finalize_model_grads_func",
         "grad_scale_func",
+        "mtp_grad_scale_func",
         "no_sync_func",
         "grad_sync_func",
         "param_sync_func",
@@ -3291,11 +3307,11 @@ def _add_experimental_args(parser):
     group.add_argument('--megatron-fsdp-main-params-dtype', default='fp32', choices=['fp32', 'bf16', 'fp16', 'auto'],
                        help="Data type for the main weight buffer utilized for distributed optimization "
                             "and quantization with Megatron-FSDP. If 'auto', then the native model parameter "
-                            "data-type will be used for the main weight data-type.")
+                            "data-type will be used for the main weight data-type. Replaces --main-params-dtype.")
     group.add_argument('--megatron-fsdp-main-grads-dtype', default='auto', choices=['fp32', 'bf16', 'fp16', 'auto'],
                        help="Data type for the main gradient buffer utilized for distributed optimization "
                             "with Megatron-FSDP. If 'auto', then the native model gradient data-type will "
-                            "be used for the main gradient / accumulation data-type.")
+                            "be used for the main gradient / accumulation data-type. Replaces --main-grads-dtype.")
     group.add_argument("--megatron-fsdp-grad-comm-dtype", default='auto', choices=['fp32', 'fp16', 'bf16', 'auto'],
                         help="When using Megatron-FSDP, this controls the data-type used when communicating "
                              "model gradients during FSDP. If 'auto', then the main gradient data-type will "
