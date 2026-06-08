@@ -685,13 +685,13 @@ def _build_varlen_for_loader(items, config, num_samples):
     return ds
 
 
-def _loader_args(*, use_varlen, bshd, scheduler, mbs):
+def _loader_args(*, use_varlen, bshd, scheduler, mbs, dynamic_cp=False, gbs=None):
     return SimpleNamespace(
         dataloader_type='single',
         micro_batch_size=mbs,
-        global_batch_size=mbs,
+        global_batch_size=mbs if gbs is None else gbs,
         full_validation=False,
-        dynamic_context_parallel=False,
+        dynamic_context_parallel=dynamic_cp,
         num_workers=0,
         use_varlen_dataset=use_varlen,
         varlen_bshd_validation=bshd,
@@ -750,6 +750,47 @@ def test_thd_dataloader_uses_identity_collate():
         loader = build_pretraining_data_loader(ds, consumed_samples=0)
         batch = next(iter(loader))
         # Identity collate returns the raw list of per-sample dicts (unstacked).
+        assert isinstance(batch, list)
+        assert len(batch) == mbs
+        assert "padded_seq_len" in batch[0]
+    finally:
+        destroy_global_vars()
+        Utils.destroy_model_parallel()
+
+
+def test_dcp_dataloader_yields_microbatches_for_scheduler():
+    from megatron.core import parallel_state
+    from megatron.training.datasets.data_samplers import build_pretraining_data_loader
+    from megatron.training.global_vars import destroy_global_vars, set_args
+    from tests.unit_tests.test_utilities import Utils
+
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        tok = _FakeTokenizer(eod=0, pad=7)
+        mbs = 2
+        num_microbatches = 3
+        dp = parallel_state.get_data_parallel_world_size()
+        gbs = mbs * dp * num_microbatches
+        n = gbs * 2
+        cfg = _make_config(tok, seq_length=64, dp=dp, cp=1, dynamic_cp=True)
+        variable = ["a", "abcdef", "xy", "qwerty"]
+        items = [variable[i % len(variable)] for i in range(n)]
+        ds = _build_varlen_for_loader(items, cfg, num_samples=n)
+        set_args(
+            _loader_args(
+                use_varlen=True,
+                bshd=False,
+                scheduler="default_dynamic_cp",
+                mbs=mbs,
+                dynamic_cp=True,
+                gbs=gbs,
+            )
+        )
+        loader = build_pretraining_data_loader(ds, consumed_samples=0)
+        batch = next(iter(loader))
+        # The DCP scheduler calls next(data_iterator) num_microbatches times;
+        # each loader step must therefore be one local microbatch, not all
+        # local samples from the global batch.
         assert isinstance(batch, list)
         assert len(batch) == mbs
         assert "padded_seq_len" in batch[0]

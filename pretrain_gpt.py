@@ -352,6 +352,7 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         "context_parallel_size": args.context_parallel_size,
         "data_parallel_size": args.data_parallel_size,
         "sequence_parallel_size": args.tensor_model_parallel_size * args.sequence_parallel,
+        "dynamic_context_parallel": args.dynamic_context_parallel,
         "varlen_mock_dataset_config_json": args.varlen_mock_dataset_config_json,
         "varlen_bshd_validation": args.varlen_bshd_validation,
     }
