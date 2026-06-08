@@ -8,6 +8,7 @@ from megatron.lite.model.qwen3_5.lite.checkpoint import (
     Qwen35WeightSpec,
     _merge_gate_up_tp_shards,
     _merge_full_attn_qkvg,
+    _merge_linear_attn_conv1d_tp_shards,
     _merge_linear_attn_in_proj_tp_shards,
     export_hf_weights,
 )
@@ -421,6 +422,107 @@ def test_qwen35_export_reorders_linear_attention_tp_shards_before_hf_split() -> 
     merged = _merge_linear_attn_in_proj_tp_shards(shards, cfg=cfg)
 
     assert torch.equal(merged, full)
+
+
+def test_qwen35_export_reorders_linear_attention_conv1d_tp_shards() -> None:
+    cfg = _tiny_config()
+    qk_dim = cfg.linear_num_key_heads * cfg.linear_key_head_dim
+    v_dim = cfg.linear_num_value_heads * cfg.linear_value_head_dim
+    trailing = (1, cfg.linear_conv_kernel_dim)
+    parts = [
+        torch.arange(0, qk_dim * trailing[0] * trailing[1], dtype=torch.float32).reshape(
+            qk_dim,
+            *trailing,
+        ),
+        torch.arange(
+            100,
+            100 + qk_dim * trailing[0] * trailing[1],
+            dtype=torch.float32,
+        ).reshape(qk_dim, *trailing),
+        torch.arange(
+            200,
+            200 + v_dim * trailing[0] * trailing[1],
+            dtype=torch.float32,
+        ).reshape(v_dim, *trailing),
+    ]
+    full = torch.cat(parts, dim=0)
+    shards = [
+        torch.cat([part.chunk(2, dim=0)[rank] for part in parts], dim=0)
+        for rank in range(2)
+    ]
+
+    merged = _merge_linear_attn_conv1d_tp_shards(shards, cfg=cfg)
+
+    assert torch.equal(merged, full)
+
+
+def test_qwen35_export_uses_mbridge_conv1d_tp_gather(monkeypatch) -> None:
+    class TinyQwen35Module(nn.Module):
+        def __init__(self, local_shard: torch.Tensor) -> None:
+            super().__init__()
+            self.layers = nn.ModuleList([nn.Module()])
+            self.layers[0].linear_attn = nn.Module()
+            self.layers[0].linear_attn.conv1d = nn.Module()
+            self.layers[0].linear_attn.conv1d.register_parameter(
+                "weight",
+                nn.Parameter(local_shard.clone()),
+            )
+
+    cfg = _tiny_config()
+    qk_dim = cfg.linear_num_key_heads * cfg.linear_key_head_dim
+    v_dim = cfg.linear_num_value_heads * cfg.linear_value_head_dim
+    trailing = (1, cfg.linear_conv_kernel_dim)
+    parts = [
+        torch.arange(0, qk_dim * trailing[0] * trailing[1], dtype=torch.float32).reshape(
+            qk_dim,
+            *trailing,
+        ),
+        torch.arange(
+            100,
+            100 + qk_dim * trailing[0] * trailing[1],
+            dtype=torch.float32,
+        ).reshape(qk_dim, *trailing),
+        torch.arange(
+            200,
+            200 + v_dim * trailing[0] * trailing[1],
+            dtype=torch.float32,
+        ).reshape(v_dim, *trailing),
+    ]
+    full = torch.cat(parts, dim=0)
+    shards = [
+        torch.cat([part.chunk(2, dim=0)[rank] for part in parts], dim=0)
+        for rank in range(2)
+    ]
+    ps = SimpleNamespace(
+        pp_size=1,
+        tp_size=2,
+        tp_group=object(),
+        ep_size=1,
+        ep_group=None,
+        etp_size=1,
+        etp_group=None,
+    )
+    gather_calls = []
+
+    def fake_all_gather(outputs, tensor, group=None):
+        assert group is ps.tp_group
+        gather_calls.append(tensor.clone())
+        outputs[0].copy_(shards[0])
+        outputs[1].copy_(shards[1])
+
+    monkeypatch.setattr(
+        "megatron.lite.model.qwen3_5.lite.checkpoint.dist.all_gather",
+        fake_all_gather,
+    )
+
+    exported = dict(export_hf_weights(TinyQwen35Module(shards[0]), cfg, ps))
+
+    assert len(gather_calls) == 1
+    assert torch.equal(gather_calls[0], shards[0])
+    assert torch.equal(
+        exported["model.language_model.layers.0.linear_attn.conv1d.weight"],
+        full,
+    )
 
 
 def test_qwen35_export_reorders_shared_expert_gate_up_tp_shards() -> None:

@@ -264,6 +264,23 @@ def _merge_linear_attn_in_proj_tp_shards(
     return torch.cat([torch.cat(bucket, dim=0) for bucket in parts], dim=0).contiguous()
 
 
+def _merge_linear_attn_conv1d_tp_shards(
+    shards: list[torch.Tensor],
+    *,
+    cfg: Qwen35Config,
+) -> torch.Tensor:
+    world_size = len(shards)
+    qk_dim = ensure_divisible(cfg.linear_num_key_heads * cfg.linear_key_head_dim, world_size)
+    v_dim = ensure_divisible(cfg.linear_num_value_heads * cfg.linear_value_head_dim, world_size)
+
+    parts: list[list[torch.Tensor]] = [[] for _ in range(3)]
+    for shard in shards:
+        for bucket, part in zip(parts, shard.split([qk_dim, qk_dim, v_dim], dim=0), strict=True):
+            bucket.append(part)
+
+    return torch.cat([torch.cat(bucket, dim=0) for bucket in parts], dim=0).contiguous()
+
+
 def _merge_gate_up_tp_shards(shards: list[torch.Tensor]) -> torch.Tensor:
     gates: list[torch.Tensor] = []
     ups: list[torch.Tensor] = []
@@ -306,6 +323,11 @@ class Qwen35WeightSpec:
             return None
         if native_name.endswith(".linear_attn.in_proj.linear.weight"):
             return _merge_linear_attn_in_proj_tp_shards(
+                _allgather_tp_shards(tensor, ps),
+                cfg=self.config,
+            )
+        if native_name.endswith(".linear_attn.conv1d.weight"):
+            return _merge_linear_attn_conv1d_tp_shards(
                 _allgather_tp_shards(tensor, ps),
                 cfg=self.config,
             )
