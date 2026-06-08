@@ -1280,9 +1280,8 @@ class ChainedOptimizer(MegatronOptimizer):
 
         return found_inf_flag
 
-    @torch.no_grad()
-    def step_with_ready_grads(self) -> bool:
-        """Step the optimizer with ready gradients, return successful."""
+    def _step(self) -> bool:
+        """Step all optimizers in this chain."""
         success = True
         for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
             success &= optimizer.step_with_ready_grads()
@@ -1290,8 +1289,105 @@ class ChainedOptimizer(MegatronOptimizer):
                 assert success
                 assert len(optimizer.model_chunks) == 1
                 optimizer.model_chunks[0].start_param_sync(force_dispatch=True)
+        return success
+
+    def _should_defer_mxfp8_param_sync(self) -> bool:
+        """Return whether MXFP8 param sync should be deferred until chained steps finish.
+
+        The deferred-sync path is only needed when MXFP8 grad/param buffer reuse is active
+        AND the DDP-level param gather is not overlapped (i.e. the race fixed by PR #4800
+        can occur). The OptimizerConfig.overlap_param_gather field is unreliable as a proxy
+        for the DDP-level setting -- the two configs can diverge -- so probe the underlying
+        DistOpts directly.
+        """
+        if not self.config.reuse_grad_buf_for_mxfp8_param_ag:
+            return False
+
+        from .distrib_optimizer import DistributedOptimizer
+
+        for optimizer in self.chained_optimizers:
+            if not isinstance(optimizer, DistributedOptimizer):
+                continue
+            if not optimizer.ddp_config.overlap_param_gather:
+                return True
+        return False
+
+    def _enable_deferred_mxfp8_param_sync(self) -> List[Tuple[Any, Any]]:
+        """Enable deferred DistOpt param sync and collect bucket groups to sync later."""
+        from .distrib_optimizer import DistributedOptimizer
+        from .layer_wise_optimizer import _bucket_is_managed_by_layer_wise_optimizer
+
+        # With MXFP8 grad-buffer reuse and non-overlap param gather, each DistOpt stages
+        # its own updated main-param shards into its param buffers during step. However,
+        # param sync is a DDP bucket-group operation that copies gathered values into model
+        # weights and zeros the shared MXFP8 param/grad buffers. For MoE, dense and expert
+        # DistOpts may share the same model chunk, so defer param sync until all chained
+        # optimizers have staged their params, then sync each DistOpt-managed bucket group once.
+        deferred_bucket_groups = []
+        deferred_bucket_group_ids = set()
+
+        for optimizer in self.chained_optimizers:
+            if not isinstance(optimizer, DistributedOptimizer):
+                continue
+
+            optimizer._defer_param_sync = True
+            for model_chunk in optimizer.model_chunks:
+                for bucket_group in (
+                    model_chunk.bucket_groups + model_chunk.expert_parallel_bucket_groups
+                ):
+                    if not bucket_group.buckets:
+                        continue
+                    if _bucket_is_managed_by_layer_wise_optimizer(
+                        bucket_group.buckets[0], default_for_untagged=False
+                    ):
+                        continue
+
+                    bucket_group_id = id(bucket_group)
+                    if bucket_group_id in deferred_bucket_group_ids:
+                        continue
+
+                    deferred_bucket_group_ids.add(bucket_group_id)
+                    deferred_bucket_groups.append((model_chunk, bucket_group))
+
+        return deferred_bucket_groups
+
+    def _disable_deferred_mxfp8_param_sync(self) -> None:
+        """Disable deferred DistOpt param sync."""
+        for optimizer in self.chained_optimizers:
+            if hasattr(optimizer, '_defer_param_sync'):
+                optimizer._defer_param_sync = False
+
+    def _start_deferred_mxfp8_param_sync(
+        self, deferred_bucket_groups: List[Tuple[Any, Any]]
+    ) -> None:
+        """Start param sync for deferred bucket groups."""
+        timers = self.config.timers
+        if timers is not None:
+            timers('params-all-gather', log_level=1).start(barrier=self.config.barrier_with_L1_time)
+        for model_chunk, bucket_group in deferred_bucket_groups:
+            model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=False)
+        if timers is not None:
+            timers('params-all-gather').stop()
+
+    def _step_with_deferred_mxfp8_param_sync(self) -> bool:
+        """Step optimizers with MXFP8 param sync deferred until all steps finish."""
+        deferred_bucket_groups = self._enable_deferred_mxfp8_param_sync()
+        try:
+            success = self._step()
+        finally:
+            self._disable_deferred_mxfp8_param_sync()
+
+        if success and deferred_bucket_groups:
+            self._start_deferred_mxfp8_param_sync(deferred_bucket_groups)
 
         return success
+
+    @torch.no_grad()
+    def step_with_ready_grads(self) -> bool:
+        """Step the optimizer with ready gradients, return successful."""
+        if self._should_defer_mxfp8_param_sync():
+            return self._step_with_deferred_mxfp8_param_sync()
+        return self._step()
 
     def grads_states_parallel_group_is_shared(self):
         """Check if all optimizers share the same gradient statistics parallel group."""
@@ -1359,6 +1455,7 @@ class ChainedOptimizer(MegatronOptimizer):
             return False, None, None
 
         grad_norm = self.get_grad_norm()
+        should_skip_update = False
 
         # Clip gradients.
         for optimizer in self.chained_optimizers:
@@ -1382,10 +1479,15 @@ class ChainedOptimizer(MegatronOptimizer):
                     ),
                 )
 
+            if grad_norm > optimizer.config.grad_norm_skip_threshold:
+                log_single_rank(
+                    logger, logging.INFO, "skipping grad norm because it's too large %s", grad_norm
+                )
+                should_skip_update = True
+
         # Count the zeros in the grads.
         num_zeros_in_grad = self.count_zeros() if self.config.log_num_zeros_in_grad else None
-
-        update_successful = self.step_with_ready_grads()
+        update_successful = False if should_skip_update else self.step_with_ready_grads()
 
         return update_successful, grad_norm, num_zeros_in_grad
 

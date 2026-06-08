@@ -60,6 +60,7 @@ except ImportError:
 _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
     "expert_tp": False,
     "is_qkv": False,
+    "qkv_split_shapes": None,
     "tensor_model_parallel": False,
     "partition_dim": -1,
     "partition_stride": 1,
@@ -373,7 +374,14 @@ class LinearWithFrozenWeight(torch.autograd.Function):
     def backward(ctx, grad_output):
         """Backward with frozen weight."""
         (weight,) = ctx.saved_tensors
-        grad_input = grad_output.matmul(weight)
+        if grad_output.dim() > 2:
+            # Work around PyTorch matmul not folding some size-1 leading dims to mm.
+            # Remove this once https://github.com/pytorch/pytorch/issues/186148 is fixed.
+            grad_output_2d = grad_output.reshape(-1, grad_output.size(-1))
+            grad_input = grad_output_2d.matmul(weight)
+            grad_input = grad_input.reshape(*grad_output.shape[:-1], weight.size(1))
+        else:
+            grad_input = grad_output.matmul(weight)
 
         if ctx.allreduce_dgrad:
             # All-reduce. Note: here async and sync are effectively the same.
@@ -835,6 +843,7 @@ class ColumnParallelLinear(torch.nn.Module):
         tp_comm_buffer_name: Optional[str] = None,  # Not used
         disable_grad_reduce: bool = False,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        name: str | None = None,
     ):
         super(ColumnParallelLinear, self).__init__()
 
@@ -1181,6 +1190,7 @@ class RowParallelLinear(torch.nn.Module):
         is_expert: bool = False,
         tp_comm_buffer_name: str | None = None,  # Not used
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        name: str | None = None,
     ):
         super(RowParallelLinear, self).__init__()
 
