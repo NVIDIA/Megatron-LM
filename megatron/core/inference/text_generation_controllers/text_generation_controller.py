@@ -1514,6 +1514,12 @@ class TextGenerationController:
         """Attach the EP async protocol used by coordinator-driven EP decoding."""
         self._ep_async_protocol = protocol
 
+    def set_async_row_map_policy(self, policy: AsyncRowMapPolicy | str) -> AsyncRowMapPolicy:
+        """Set pending-forward row reuse policy for async validation or benchmarking."""
+        resolved_policy = AsyncRowMapPolicy.from_value(policy)
+        self._async_row_map_policy = resolved_policy
+        return resolved_policy
+
     def request_async_admission_barrier(self) -> None:
         """Stop chaining async forwards once so waiting requests can be admitted."""
         self._async_add_deferral_count += 1
@@ -1533,6 +1539,9 @@ class TextGenerationController:
         return {
             "enabled": self._async_scheduling_enabled,
             "pending_forward": self._has_pending_async_forward_state(),
+            "row_map_policy": AsyncRowMapPolicy.from_value(
+                getattr(self, "_async_row_map_policy", AsyncRowMapPolicy.REUSE)
+            ).value,
             "step_barrier_reason": self._async_step_barrier_reason,
             "eligibility_checks": self._async_eligibility_check_count,
             "eligibility_passes": self._async_eligibility_pass_count,

@@ -1652,6 +1652,7 @@ def test_async_diagnostics_report_pending_forward_disable_counts_and_ep_protocol
     controller._async_identity_forward_count = 1
     controller._async_graph_mismatch_discard_count = 1
     controller._async_layout_mismatch_discard_count = 0
+    controller._async_row_map_policy = AsyncRowMapPolicy.IDENTITY_ONLY
     controller._ep_async_protocol = SimpleNamespace(
         diagnostics=lambda: {"step_begin_reuses": 1, "handoff_launches": 2}
     )
@@ -1661,6 +1662,7 @@ def test_async_diagnostics_report_pending_forward_disable_counts_and_ep_protocol
     assert diagnostics == {
         "enabled": True,
         "pending_forward": True,
+        "row_map_policy": "identity_only",
         "step_barrier_reason": "logging step",
         "eligibility_checks": 4,
         "eligibility_passes": 2,
@@ -1679,6 +1681,19 @@ def test_async_diagnostics_report_pending_forward_disable_counts_and_ep_protocol
         "layout_mismatch_discards": 0,
         "ep_protocol": {"step_begin_reuses": 1, "handoff_launches": 2},
     }
+
+
+@pytest.mark.internal
+def test_async_row_map_policy_setter_switches_exact_parity_mode():
+    controller = object.__new__(TextGenerationController)
+    controller._async_row_map_policy = AsyncRowMapPolicy.REUSE
+
+    resolved = controller.set_async_row_map_policy("identity_only")
+
+    assert resolved == AsyncRowMapPolicy.IDENTITY_ONLY
+    assert controller._async_row_map_policy == AsyncRowMapPolicy.IDENTITY_ONLY
+    with pytest.raises(ValueError, match="Unknown async row-map policy"):
+        controller.set_async_row_map_policy("invalid")
 
 
 @pytest.mark.internal
