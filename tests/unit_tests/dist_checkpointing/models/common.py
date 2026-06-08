@@ -82,7 +82,8 @@ def common_test_parallel_reconfiguration_e2e(
             pipeline_model_parallel_size=src_tp_pp[1],
             **src_model_init_kwargs,
         )
-        gpt_model_A.sharded_state_dict["common_state"] = ShardedObject(
+        sharded_state_dict_A = gpt_model_A.sharded_state_dict(metadata=metadata)
+        sharded_state_dict_A["common_state"] = ShardedObject(
             key="common_state",
             data={},
             global_shape=(1,),
@@ -96,7 +97,7 @@ def common_test_parallel_reconfiguration_e2e(
                 parallel_state.get_data_parallel_group(with_context_parallel=True),
                 True,
             )
-        save(gpt_model_A.sharded_state_dict(metadata=metadata), ckpt_dir_A, save_strategy)
+        save(sharded_state_dict_A, ckpt_dir_A, save_strategy)
         regular_state_dict_A = gpt_model_A.state_dict()
         Utils.destroy_model_parallel()
         if metadata is not None:
@@ -111,7 +112,8 @@ def common_test_parallel_reconfiguration_e2e(
             pipeline_model_parallel_size=dest_tp_pp[1],
             **dst_model_init_kwargs,
         )
-        gpt_model_B.sharded_state_dict["common_state"] = ShardedObject(
+        sharded_state_dict_B = gpt_model_B.sharded_state_dict(metadata=metadata)
+        sharded_state_dict_B["common_state"] = ShardedObject(
             key="common_state",
             data={},
             global_shape=(1,),
@@ -124,7 +126,7 @@ def common_test_parallel_reconfiguration_e2e(
         else:
             load_strategy = None
         state_dict, missing_keys, unexpected_keys = load(
-            gpt_model_B.sharded_state_dict(metadata=metadata),
+            sharded_state_dict_B,
             ckpt_dir_A,
             load_strategy,
             strict=StrictHandling.RETURN_ALL,
@@ -133,7 +135,7 @@ def common_test_parallel_reconfiguration_e2e(
         assert all('_extra_state' in k for k in missing_keys)
         assert all('_extra_state' in k for k in unexpected_keys)
         gpt_model_B.load_state_dict(state_dict)
-        save(gpt_model_B.sharded_state_dict(metadata=metadata), ckpt_dir_B)
+        save(sharded_state_dict_B, ckpt_dir_B)
         regular_state_dict_B = gpt_model_A.state_dict()
         Utils.destroy_model_parallel()
 
