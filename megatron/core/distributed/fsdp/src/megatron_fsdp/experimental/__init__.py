@@ -14,7 +14,7 @@
 
 """Experimental Megatron-FSDP implementation."""
 
-from .dbuffer import DBuffer, MeshAxis
+from .dbuffer import DBuffer
 from .placement import Flat, Partial, Placement, Replicate
 
-__all__ = ["DBuffer", "Flat", "MeshAxis", "Partial", "Placement", "Replicate"]
+__all__ = ["DBuffer", "Flat", "Partial", "Placement", "Replicate"]
