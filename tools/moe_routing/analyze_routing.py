@@ -91,14 +91,7 @@ def main():
     nexpert_args = ["--num-experts", str(args.num_experts)] if args.num_experts else []
     outdir_args = ["--output-dir", args.output_dir] if args.output_dir else []
 
-    # 1. Layer-to-layer overlap (intra-step predictor accuracy).
-    run(
-        "analyze_router_trace.py",
-        [args.trace_dir] + topk_args,
-        "Layer-to-layer top-K overlap  (intra-step routing stability)",
-    )
-
-    # 2. Expert concentration (hot-set size).
+    # 1. Expert concentration (hot-set size).
     run(
         "analyze_routing_concentration.py",
         [args.trace_dir] + nexpert_args + outdir_args,

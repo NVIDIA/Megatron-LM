@@ -3,8 +3,8 @@
 """Router decision tracing for MoE models for both training and inference.
 
 Captures per-layer top-K routing decisions to a JSONL file for offline
-analysis of routing patterns (e.g., layer-to-layer top-K overlap, expert
-load balance, predictor accuracy for speculative expert prefetch).
+analysis of routing patterns (e.g., expert load balance, predictor accuracy for
+speculative expert prefetch).
 
 - Inference mode (default): step boundaries are auto-detected by watching for layer repeats.
   When a layer that already fired this step fires again, a new step has started.
