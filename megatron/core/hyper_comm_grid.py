@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import numbers
 import os
 from dataclasses import dataclass
 from typing import Any, Optional, Union
@@ -165,7 +166,7 @@ class HyperCommGrid:
             raise ValueError(f"len(shape) {shape} != len(dim_names) {dim_names}")
         if len(set(dim_names)) != len(dim_names):
             raise ValueError(f"View {name!r} has duplicate dim_names: {dim_names}")
-        if any(not isinstance(s, int) or s <= 0 for s in shape):
+        if any(not isinstance(s, numbers.Integral) or s <= 0 for s in shape):
             raise ValueError(f"View {name!r} shape must be positive ints, got {shape}")
         if int(np.prod(shape)) != self.size:
             raise ValueError(
@@ -174,6 +175,8 @@ class HyperCommGrid:
             )
 
         shared_dims = list(shared_dims) if shared_dims is not None else []
+        if len(set(shared_dims)) != len(shared_dims):
+            raise ValueError(f"View {name!r} has duplicate shared_dims: {shared_dims}")
         for dim in shared_dims:
             if dim not in self.dim_names:
                 raise ValueError(
@@ -209,7 +212,7 @@ class HyperCommGrid:
         self._views[name] = _RankViewSpec(name, shape[:], dim_names[:], shared_dims[:])
 
     def create_pg(
-        self, dims: Union[str, list[str]], view: Optional[str] = None, **kwargs: Any
+        self, dims: Union[str, list[str]], *, view: Optional[str] = None, **kwargs: Any
     ) -> dist.ProcessGroup | None:
         r"""Create a process group based on a list of dimension names
 
@@ -264,7 +267,7 @@ class HyperCommGrid:
         pg, _ = dist.new_subgroups_by_enumeration(rank_enum, backend=self.backend, **kwargs)
 
         if dist.is_initialized() and dist.get_rank() == 0:
-            if view_spec.name == _BASE_VIEW_NAME:
+            if self._is_base_pg_key(unique_group_key):
                 logging.info(
                     f"Generated process group for {unique_group_key} with enumeration {rank_enum}"
                 )
@@ -289,7 +292,9 @@ class HyperCommGrid:
                 destroyed.add(id(pg))
         self._pgs.clear()
 
-    def get_pg(self, dims: Union[str, list[str]], view: Optional[str] = None) -> dist.ProcessGroup:
+    def get_pg(
+        self, dims: Union[str, list[str]], *, view: Optional[str] = None
+    ) -> dist.ProcessGroup:
         r"""Get a process group based on a list of dimension names
 
         Args:
@@ -314,7 +319,7 @@ class HyperCommGrid:
         return self._pgs[unique_group_key]
 
     def get_rank_enum(
-        self, dims: Union[str, list[str]], view: Optional[str] = None
+        self, dims: Union[str, list[str]], *, view: Optional[str] = None
     ) -> list[list[int]]:
         r"""Get the rank enumeration for the requested dimension(s).
 
@@ -363,7 +368,8 @@ class HyperCommGrid:
         # Need to reverse order of dim_names to match MCore convention.
         dim_names_reverse = dim_names[::-1]
         shape_dict = {d: s for d, s in zip(dim_names, shape)}
-        rank_tensor = np.arange(self.rank_offset, self.rank_offset + self.size).reshape(
+        size = int(np.prod(shape))
+        rank_tensor = np.arange(self.rank_offset, self.rank_offset + size).reshape(
             [shape_dict[d] for d in dim_names_reverse]
         )
 
@@ -380,12 +386,6 @@ class HyperCommGrid:
 
         group_size = int(np.prod([shape_dict[d] for d in dims]))
         return rank_tensor.reshape(-1, group_size).tolist()
-
-    def _order_dims(self, dims: Union[str, list[str]]) -> tuple[list[str], str]:
-        r"""Reorder dims based on the order of self.dim_names"""
-        ordered_dims, _ = self._order_dims_for_view(self._views[_BASE_VIEW_NAME], dims)
-        unique_group_key = "-".join(ordered_dims)
-        return ordered_dims, unique_group_key
 
     def _order_dims_for(
         self, dim_names: list[str], dims: Union[str, list[str]]

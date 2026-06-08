@@ -3,6 +3,7 @@
 import os
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
@@ -58,7 +59,7 @@ class TestHyperCommGrid:
             [2, 2, 2], ["tp", "cp", "dp"]
         )  # Changed from [2, 3, 4] to fit world size
 
-        ordered_dims, unique_key = grid._order_dims("cp")
+        ordered_dims, unique_key = grid._order_dims_for(grid.dim_names, "cp")
 
         assert ordered_dims == ["cp"]
         assert unique_key == "cp"
@@ -70,7 +71,7 @@ class TestHyperCommGrid:
         )  # Changed from [2, 3, 4, 5] to fit world size
 
         # Should order according to reversed dim_names order
-        ordered_dims, unique_key = grid._order_dims(["dp", "tp"])
+        ordered_dims, unique_key = grid._order_dims_for(grid.dim_names, ["dp", "tp"])
 
         assert ordered_dims == [
             "dp",
@@ -84,7 +85,7 @@ class TestHyperCommGrid:
             [2, 2, 2], ["tp", "cp", "dp"]
         )  # Changed from [2, 3, 4] to fit world size
 
-        ordered_dims, unique_key = grid._order_dims(["dp", "cp", "tp"])
+        ordered_dims, unique_key = grid._order_dims_for(grid.dim_names, ["dp", "cp", "tp"])
 
         assert ordered_dims == ["dp", "cp", "tp"]  # Changed: reversed order
         assert unique_key == "dp-cp-tp"
@@ -238,7 +239,7 @@ class TestHyperCommGrid:
         assert grid.dim_names == ["tp", "cp", "pp", "dp"]
 
         # Test ordering of different dimension combinations
-        ordered_dims, key = grid._order_dims(["dp", "pp"])
+        ordered_dims, key = grid._order_dims_for(grid.dim_names, ["dp", "pp"])
         assert ordered_dims == ["dp", "pp"]  # Changed: actual order matches reversed dim_names
         assert key == "dp-pp"
 
@@ -368,6 +369,24 @@ class TestHyperCommGrid:
             grid.register_view("expert", [8, 0], ["ep", "expt_dp"])
         with pytest.raises(ValueError, match="shape must be positive ints"):
             grid.register_view("expert2", [-1, 8], ["ep", "expt_dp"])
+
+    def test_register_view_accepts_numpy_int_shape(self):
+        """Test register_view accepts numpy integer shape entries, like the base grid does."""
+        grid = HyperCommGrid([2, 2, 2], ["tp", "cp", "dp"])
+
+        # Shapes derived programmatically are often numpy ints; they must be accepted.
+        shape = [np.int64(4), np.int64(2)]
+        grid.register_view("expert", shape, ["ep", "expt_dp"])
+        assert "expert" in grid._views
+
+    def test_register_view_duplicate_shared_dims_error(self):
+        """Test register_view rejects duplicate entries in shared_dims with a clear message."""
+        grid = HyperCommGrid([2, 2, 2], ["tp", "cp", "pp"])
+
+        with pytest.raises(ValueError, match="duplicate shared_dims"):
+            grid.register_view(
+                "expert", [2, 2, 2], ["expt_tp", "ep", "pp"], shared_dims=["pp", "pp"]
+            )
 
     def test_register_view_success_copies_lists(self):
         """Test a valid view is registered and stored with copied data."""
