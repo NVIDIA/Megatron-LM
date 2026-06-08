@@ -1,0 +1,16 @@
+  name: Test dev cluster ARC Runner
+
+  on:
+    pull_request:
+      branches:
+        - main
+
+  jobs:
+    test:
+      runs-on:
+        group: nemo-ci-cpu
+        labels: nvidia-ci-aws-cpu-dev-01
+      steps:
+        - run: |
+            docker --version
+            echo "Dev cluster ARC runner works"
