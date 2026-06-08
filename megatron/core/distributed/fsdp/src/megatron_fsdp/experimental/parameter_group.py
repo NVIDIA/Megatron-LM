@@ -231,28 +231,25 @@ class ParameterGroup:
                 raise RuntimeError(f"Missing gradient for FSDP parameter {name!r}.")
             grads.append(parameter.grad)
 
+        # This packs per-parameter grads into the reduce-scatter input buffer. A future
+        # fused-wgrad path can avoid this copy by writing directly into those buffer views.
         partial_grad = DBuffer.distribute_tensors(
             grads, mesh=self.mesh, placements=[Partial(dist.ReduceOp.AVG)] * self.mesh.ndim
         )
 
-        # zero_grad(set_to_none=True) clears sharded parameter grads, so the next
-        # backward can reduce directly into main_grad. zero_grad(set_to_none=False)
-        # leaves sharded grads installed, so this backward accumulates into main_grad.
-        has_sharded_grads = has_grad(self.sharded_parameters)
-        can_reduce_into_main_grad = (
-            not has_sharded_grads
-            and partial_grad.local_buffer.dtype == self.main_grad.local_buffer.dtype
-        )
-        if can_reduce_into_main_grad:
-            partial_grad.redistribute(self.main_grad.placements, out=self.main_grad)
-        else:
+        # zero_grad(set_to_none=True) clears sharded parameter grads, so the first
+        # backward can reduce directly into main_grad. Later microbatches, or
+        # zero_grad(set_to_none=False), leave sharded grads installed and accumulate.
+        if has_grad(self.sharded_parameters):
             reduced_grad = partial_grad.redistribute(self.main_grad.placements)
-            if has_sharded_grads:
-                self.main_grad.local_buffer.add_(reduced_grad.local_buffer)
+            self.main_grad.local_buffer.add_(reduced_grad.local_buffer)
+        else:
+            if partial_grad.local_buffer.dtype == self.main_grad.local_buffer.dtype:
+                partial_grad.redistribute(self.main_grad.placements, out=self.main_grad)
             else:
+                reduced_grad = partial_grad.redistribute(self.main_grad.placements)
                 self.main_grad.local_buffer.copy_(reduced_grad.local_buffer)
 
-        if not has_sharded_grads:
             for index, parameter in enumerate(self.sharded_parameters):
                 parameter.grad = self.main_grad.get_dtensor(index)
 
