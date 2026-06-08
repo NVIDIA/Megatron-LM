@@ -14,6 +14,16 @@ for root in (REPO_ROOT, LITE_ROOT):
         sys.path.insert(0, str(root))
 
 
+def pytest_configure(config):
+    config.addinivalue_line("markers", "mlite: mark a test as Megatron Lite validation coverage")
+    config.addinivalue_line(
+        "markers",
+        "smoke: mark a Megatron Lite smoke test; skipped unless --mlite-smoke or MLITE_RUN_SMOKE=1 is set",
+    )
+    config.addinivalue_line("markers", "gpu: mark a test as requiring CUDA")
+    config.addinivalue_line("markers", "distributed: mark a test as requiring torch.distributed")
+
+
 def pytest_addoption(parser):
     parser.addoption(
         "--mlite-smoke",

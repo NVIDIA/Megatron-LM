@@ -211,16 +211,12 @@ exclude = '''
 
 [tool.pytest.ini_options]
 addopts = "--durations=15 -s -rA -x"
-testpaths = ["tests", "experimental/lite/tests"]
+testpaths = ["tests"]
 python_files = "test_*.py"
 markers = [
     "internal: mark a test as a test to private/internal functions.",
     "flaky: mark flaky tests for LTS environment",
     "flaky_in_dev: mark flaky tests for DEV environment",
-    "mlite: mark a test as Megatron Lite validation coverage",
-    "smoke: mark a Megatron Lite smoke test; skipped unless --mlite-smoke or MLITE_RUN_SMOKE=1 is set",
-    "gpu: mark a test as requiring CUDA",
-    "distributed: mark a test as requiring torch.distributed",
 ]
 
 [tool.coverage.run]
