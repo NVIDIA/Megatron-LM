@@ -182,7 +182,9 @@ class TestGatedDeltaNet:
         # which are normally wrapped by @jit_fuser (torch.compile).
         with torch._dynamo.config.patch(disable=True):
             query, key, value, gate_out, beta_out, alpha_out = (
-                gdn._prepare_qkv_for_gated_delta_rule(qkv, gate, beta, alpha, batch, seq_len)
+                gdn._prepare_qkv_for_gated_delta_rule(
+                    qkv, gate, beta, alpha, batch, seq_len, gdn.cp_size
+                )
             )
 
         assert query.shape == (batch, seq_len, num_v_heads_local, gdn.key_head_dim)

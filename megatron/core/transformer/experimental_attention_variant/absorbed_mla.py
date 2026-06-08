@@ -367,11 +367,6 @@ class AbsorbedMLASelfAttention(Attention):
         assert (
             hidden_states.ndim == 3
         ), f"hidden_states should be 3D, [s, b, h], got {hidden_states.ndim}D"
-        if packed_seq_params is not None:
-            assert (
-                packed_seq_params.local_cp_size is None
-            ), "dynamic context parallel is not supported with MLA yet and is planned for future. \
-            Please disable dynamic context parallel."
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
@@ -736,6 +731,14 @@ class AbsorbedMLASelfAttention(Attention):
             inference_context is None and inference_params is None
         ), "Inference is not supported for AbsorbedMLA"
 
+        # Set the right cp group for dynamic-cp. Mirrors Attention.forward:
+        # downstream RoPE uses self.pg_collection.cp, which must point at this
+        # microbatch's dynamic CP group. Restored before every return.
+        _orig_cp_group = self.pg_collection.cp
+        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
+            assert packed_seq_params.cp_group is not None, "cp_group must be set in dynamic-cp mode"
+            self.pg_collection.cp = packed_seq_params.cp_group
+
         # =====================
         # Query, Key, and Value
         # =====================
@@ -817,6 +820,7 @@ class AbsorbedMLASelfAttention(Attention):
         # =================
         output, bias = self.linear_proj(core_attn_out)
 
+        self.pg_collection.cp = _orig_cp_group
         return output, bias
 
     def backward_dw(self) -> NoReturn:
