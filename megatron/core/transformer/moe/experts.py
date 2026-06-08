@@ -600,6 +600,7 @@ class TEGroupedMLP(MegatronModule):
                 max_num_tokens=max_num_tokens,
                 num_tokens_tensor=tokens_per_expert.sum(),
                 avg_num_tokens=avg_num_tokens,
+                allow_untagged_token_major_tensors=not (self.config.fp8 or self.config.fp4),
             )
         else:
             stash_context = nullcontext()

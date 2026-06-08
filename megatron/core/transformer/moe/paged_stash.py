@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import inspect
 import logging
 from contextlib import nullcontext
 from typing import Any
@@ -145,6 +146,8 @@ class PagedTensor:
         max_num_tokens=None,
         hidden_size=None,
         page_size=64,
+        tensor_attrs=None,
+        grouped_tensor_metadata=None,
     ):
         """
         Args:
@@ -171,6 +174,8 @@ class PagedTensor:
         self.max_num_tokens = max_num_tokens
         self.hidden_size = hidden_size
         self.page_size = page_size
+        self.tensor_attrs = tensor_attrs or {}
+        self.grouped_tensor_metadata = grouped_tensor_metadata
 
         # Original tensor information
         self.original_shape = list(tensor.shape) if original_shape is None else original_shape
@@ -184,6 +189,62 @@ class PagedTensor:
         # Page record / spill flag: allocated here; zeroed in offload_to_stash (pack stream).
         self.page_record = torch.empty(self.max_num_pages, dtype=torch.int64, device=self.device)
         self.spilled_to_host = torch.empty(1, dtype=torch.int64, device=self.device)
+
+    def restore_tensor_metadata(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Restore lightweight Python metadata expected by TE tensor wrappers."""
+        for name, value in self.tensor_attrs.items():
+            setattr(tensor, name, value)
+        return tensor
+
+    def restore_grouped_tensor(self) -> torch.Tensor:
+        """Recreate a TE GroupedTensor wrapper over the reloaded rowwise backing data."""
+        assert self._tensor is not None
+        metadata = self.grouped_tensor_metadata
+        assert metadata is not None
+
+        grouped_cls = metadata["cls"]
+        kwargs = {
+            "shape": metadata["shape"],
+            "dtype": metadata["dtype"],
+            "num_tensors": metadata["num_tensors"],
+            "shapes": metadata["shapes"],
+            "quantizer": metadata["quantizer"],
+            "data": self._tensor.view(-1),
+            "columnwise_data": metadata["columnwise_data"],
+            "scale_inv": metadata["scale_inv"],
+            "columnwise_scale_inv": metadata["columnwise_scale_inv"],
+            "amax": metadata["amax"],
+            "columnwise_amax": metadata["columnwise_amax"],
+            "scale": metadata["scale"],
+            "first_dims": metadata["first_dims"],
+            "last_dims": metadata["last_dims"],
+            "tensor_offsets": metadata["tensor_offsets"],
+            "offsets": metadata["offsets"],
+            "scale_inv_offsets": metadata["scale_inv_offsets"],
+            "columnwise_scale_inv_offsets": metadata["columnwise_scale_inv_offsets"],
+            "with_gemm_swizzled_scales": metadata["with_gemm_swizzled_scales"],
+            "row_scaled_nvfp4": metadata["row_scaled_nvfp4"],
+        }
+        optional_kwargs = {}
+        for optional_name in (
+            "requires_grad",
+            "nvfp4_use_4over6",
+            "nvfp4_e4m3_max",
+        ):
+            if optional_name in metadata:
+                optional_kwargs[optional_name] = metadata[optional_name]
+
+        try:
+            signature = inspect.signature(grouped_cls)
+            for name, value in optional_kwargs.items():
+                if name in signature.parameters:
+                    kwargs[name] = value
+        except (TypeError, ValueError):
+            # Some TE builds expose tensor wrappers without Python signatures.
+            pass
+
+        grouped_tensor = grouped_cls(**kwargs)
+        return self.restore_tensor_metadata(grouped_tensor)
 
     @property
     def schedule_layer(self):
@@ -429,6 +490,10 @@ class PagedStashManager:
         self.max_num_tokens = None
         # Optional hint: expected/average number of tokens (e.g., pre-padding estimate)
         self.avg_num_tokens = None
+        # Pure BF16 TE op-fuser activations do not carry the MXFP8 grouped-tensor scale marker.
+        # Keep this opt-in and scoped to the GroupedMLP paged-stash context so generic saved
+        # tensors such as weights, counters, and internal metadata are not captured accidentally.
+        self.allow_untagged_token_major_tensors = False
         self.stash_buffers = None
         self.overflow = None
         self.host_spill = None
@@ -436,6 +501,45 @@ class PagedStashManager:
 
         # Page size for paged memory (default; overwritten from config in paged_stash_reset)
         self.page_size = 64
+
+    def _get_grouped_tensor_metadata(self, tensor: torch.Tensor):
+        """Capture TE GroupedTensor metadata needed to recreate the wrapper on reload."""
+        rowwise_data = getattr(tensor, 'rowwise_data', None)
+        if (
+            rowwise_data is None
+            or not hasattr(tensor, 'num_tensors')
+            or not hasattr(tensor, 'logical_shape')
+        ):
+            return None
+
+        get_dtype = getattr(tensor, 'get_dtype', None)
+        return {
+            "cls": type(tensor),
+            "shape": tuple(tensor.shape),
+            "logical_shape": tuple(tensor.logical_shape),
+            "dtype": get_dtype() if get_dtype is not None else tensor.dtype,
+            "num_tensors": tensor.num_tensors,
+            "shapes": getattr(tensor, 'tensor_shapes', None),
+            "quantizer": getattr(tensor, 'quantizer', None),
+            "columnwise_data": getattr(tensor, 'columnwise_data', None),
+            "scale_inv": getattr(tensor, 'scale_inv', None),
+            "columnwise_scale_inv": getattr(tensor, 'columnwise_scale_inv', None),
+            "amax": getattr(tensor, 'amax', None),
+            "columnwise_amax": getattr(tensor, 'columnwise_amax', None),
+            "scale": getattr(tensor, 'scale', None),
+            "first_dims": getattr(tensor, 'first_dims', None),
+            "last_dims": getattr(tensor, 'last_dims', None),
+            "tensor_offsets": getattr(tensor, 'tensor_offsets', None),
+            "offsets": getattr(tensor, 'offsets', None),
+            "scale_inv_offsets": getattr(tensor, 'scale_inv_offsets', None),
+            "columnwise_scale_inv_offsets": getattr(tensor, 'columnwise_scale_inv_offsets', None),
+            "with_gemm_swizzled_scales": getattr(tensor, '_with_gemm_swizzled_scales', False),
+            "row_scaled_nvfp4": getattr(tensor, 'row_scaled_nvfp4', False),
+            "requires_grad": tensor.requires_grad,
+            "stride": tuple(tensor.stride()),
+            "nvfp4_use_4over6": getattr(tensor, 'nvfp4_use_4over6', False),
+            "nvfp4_e4m3_max": getattr(tensor, 'nvfp4_e4m3_max', 448),
+        }
 
     @property
     def pack_stream(self):
@@ -681,19 +785,38 @@ class PagedStashManager:
         Hook called when autograd saves a tensor for backward pass.
         Returns a tag to identify the tensor later.
         """
-        # Handle 0-dim tensors (torch.Size([])) - they have no size(0)
-        if (
-            self.max_num_tokens is None
-            or tensor.dim() == 0
-            or not hasattr(tensor, 'grouped_tensor_scale_inv')
-        ):
+        if not isinstance(tensor, torch.Tensor):
             return tensor
 
-        assert isinstance(tensor, torch.Tensor), f"tensor is not a torch.Tensor {type(tensor)}"
+        # Handle 0-dim tensors (torch.Size([])) - they have no size(0).
+        if self.max_num_tokens is None or tensor.dim() == 0:
+            return tensor
 
-        original_shape = tensor.shape
-        columnwise_scale_inv = tensor.grouped_tensor_scale_inv
-        tensor = tensor.flatten()
+        has_grouped_tensor_marker = hasattr(tensor, 'grouped_tensor_scale_inv')
+        if has_grouped_tensor_marker:
+            columnwise_scale_inv = tensor.grouped_tensor_scale_inv
+        elif (
+            self.allow_untagged_token_major_tensors
+            and tensor.is_floating_point()
+            and tensor.dim() == 2
+            and tensor.shape[0] == self.max_num_tokens
+            and tensor.numel() % self.max_num_tokens == 0
+        ):
+            columnwise_scale_inv = False
+        else:
+            return tensor
+
+        tensor_attrs = {"grouped_tensor_scale_inv": columnwise_scale_inv}
+        grouped_tensor_metadata = (
+            None if has_grouped_tensor_marker else self._get_grouped_tensor_metadata(tensor)
+        )
+        if grouped_tensor_metadata is not None:
+            tensor = tensor.rowwise_data
+            original_shape = tensor.shape
+        else:
+            original_shape = tensor.shape
+            tensor = tensor.flatten()
+
         dtype = tensor.dtype
         hidden_size = tensor.numel() // (
             self.max_num_tokens
@@ -766,6 +889,8 @@ class PagedStashManager:
             max_num_tokens=self.max_num_tokens,
             hidden_size=hidden_size,
             page_size=self.page_size,
+            tensor_attrs=tensor_attrs,
+            grouped_tensor_metadata=grouped_tensor_metadata,
         )
 
         if self.status == 'captured':
@@ -818,7 +943,11 @@ class PagedStashManager:
                 saved_state._tensor is not None
             ), f"saved_state._tensor is None {saved_state._tensor}"
 
-            return saved_state._tensor.view(saved_state.original_shape)
+            if saved_state.grouped_tensor_metadata is not None:
+                return saved_state.restore_grouped_tensor()
+            return saved_state.restore_tensor_metadata(
+                saved_state._tensor.view(saved_state.original_shape)
+            )
 
         return saved_state
 
@@ -853,7 +982,11 @@ def paged_stash_group_start(tensor):
 
 
 def get_paged_stash_context(
-    name=None, max_num_tokens=None, num_tokens_tensor=None, avg_num_tokens=None
+    name=None,
+    max_num_tokens=None,
+    num_tokens_tensor=None,
+    avg_num_tokens=None,
+    allow_untagged_token_major_tensors=False,
 ):
     """Get the paged stash context"""
     stash_manager = PagedStashManager.get_instance()
@@ -861,6 +994,7 @@ def get_paged_stash_context(
         return nullcontext()
     stash_manager.max_num_tokens = max_num_tokens
     stash_manager.avg_num_tokens = avg_num_tokens
+    stash_manager.allow_untagged_token_major_tensors = allow_untagged_token_major_tensors
     assert num_tokens_tensor is not None and isinstance(num_tokens_tensor, torch.Tensor)
     # One clone per context; PagedTensor reuses this tensor (no per-instance clone).
     stash_manager.num_tokens_tensor = num_tokens_tensor.clone()
