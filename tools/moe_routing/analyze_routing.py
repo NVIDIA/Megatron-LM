@@ -98,14 +98,7 @@ def main():
         "Layer-to-layer top-K overlap  (intra-step routing stability)",
     )
 
-    # 2. Jaccard similarity between consecutive MoE layers.
-    run(
-        "analyze_routing_jaccard.py",
-        [args.trace_dir] + topk_args + outdir_args,
-        "Jaccard similarity between consecutive MoE layers",
-    )
-
-    # 3. Expert concentration (hot-set size).
+    # 2. Expert concentration (hot-set size).
     run(
         "analyze_routing_concentration.py",
         [args.trace_dir] + nexpert_args + outdir_args,
