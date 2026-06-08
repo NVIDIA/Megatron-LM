@@ -486,6 +486,23 @@ def test_async_pending_forward_decision_respects_row_map_policy():
 
 
 @pytest.mark.internal
+def test_async_decode_plan_owns_pending_forward_layout_decision():
+    pending = _make_async_layout_snapshot([10, 11, 12], cuda_graph_request_count=3)
+    current = _make_async_layout_snapshot([12, 10], cuda_graph_request_count=3)
+    plan = AsyncDecodePlan.from_snapshot(pending)
+
+    decision = plan.resolve_pending_forward(current, row_map_policy=AsyncRowMapPolicy.REUSE)
+    resolved_plan = plan.with_pending_forward_decision(decision)
+
+    assert decision.reusable
+    assert resolved_plan.row_mapped
+    assert resolved_plan.row_map.tolist() == [2, 0]
+    assert resolved_plan.graph_compatible
+    assert resolved_plan.layout_compatible
+    assert resolved_plan.graph_shape.padded_active_request_count == 3
+
+
+@pytest.mark.internal
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="row mapping returns CUDA tensors")
 def test_identity_only_row_map_policy_discards_row_mapped_pending_forward():
     controller = _make_controller_with_rows([10, 11, 12], [12, 10])
@@ -499,6 +516,9 @@ def test_identity_only_row_map_policy_discards_row_mapped_pending_forward():
     assert row_indices is None
     assert not row_mapped
     assert transaction.discard_reason == "row map policy rejected non-identity layout"
+    assert transaction.plan.row_map.tolist() == [2, 0]
+    assert transaction.plan.row_mapped
+    assert not transaction.plan.layout_compatible
     assert controller._async_discarded_forward_count == 1
     assert controller._async_layout_mismatch_discard_count == 1
     assert controller._async_row_mapped_forward_count == 0
@@ -587,6 +607,11 @@ def test_pending_async_forward_reuses_subset_when_finished_row_left():
     assert row_map is not None
     assert row_map.tolist() == [2, 0]
     assert pending_snapshot.layout_compatible_with(current_snapshot, row_map=row_map)
+    transaction = controller._async_step_transaction
+    assert transaction.plan.row_map.tolist() == [2, 0]
+    assert transaction.plan.row_mapped
+    assert transaction.plan.graph_compatible
+    assert transaction.plan.layout_compatible
     assert controller._async_discarded_forward_count == 0
 
 

@@ -24,7 +24,6 @@ from megatron.core.inference.async_transaction import (
     AsyncSampleTicket,
     AsyncTxnState,
     classify_async_eligibility,
-    resolve_async_pending_forward,
 )
 from megatron.core.inference.communication_utils import (
     broadcast_from_last_pipeline_stage,
@@ -1664,8 +1663,8 @@ class TextGenerationController:
         current_snapshot = AsyncLayoutSnapshot.from_context_current(
             context, tokens_per_request=self.num_speculative_tokens + 1
         )
-        return resolve_async_pending_forward(
-            transaction.snapshot,
+        assert transaction.plan is not None
+        return transaction.plan.resolve_pending_forward(
             current_snapshot,
             row_map_policy=getattr(self, "_async_row_map_policy", AsyncRowMapPolicy.REUSE),
         )
@@ -1674,12 +1673,6 @@ class TextGenerationController:
         """Return the current-row to transaction-row map if the pending forward is reusable."""
         decision = self._pending_async_forward_decision(transaction)
         return decision.row_map if decision.reusable else None
-
-    @staticmethod
-    def _row_map_requires_gather(row_map: Tensor) -> bool:
-        """Return whether row order differs from identity."""
-        identity = torch.arange(int(row_map.numel()), dtype=torch.long, device="cpu")
-        return not torch.equal(row_map.to(dtype=torch.long, device="cpu"), identity)
 
     def _pending_async_forward_row_status(self) -> tuple[bool, bool]:
         """Return whether the pending forward is reusable and whether row mapping is needed."""
@@ -1703,6 +1696,8 @@ class TextGenerationController:
             return False, None, False
 
         decision = self._pending_async_forward_decision(transaction)
+        assert transaction.plan is not None
+        transaction.plan = transaction.plan.with_pending_forward_decision(decision)
         if decision.reusable:
             row_map = decision.row_map
             assert row_map is not None

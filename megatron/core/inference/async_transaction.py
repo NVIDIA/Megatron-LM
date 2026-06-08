@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any, Protocol, runtime_checkable
 
@@ -410,6 +410,31 @@ class AsyncDecodePlan:
             "finished_requests": int(self.finished_request_ids.numel()),
         }
 
+    def resolve_pending_forward(
+        self,
+        current: AsyncLayoutSnapshot,
+        *,
+        row_map_policy: AsyncRowMapPolicy | str = AsyncRowMapPolicy.REUSE,
+    ) -> "AsyncPendingForwardDecision":
+        """Resolve this plan's layout snapshot against the current context layout."""
+        if self.layout_snapshot is None:
+            raise ValueError("AsyncDecodePlan requires a layout_snapshot to resolve row reuse")
+        return resolve_async_pending_forward(
+            self.layout_snapshot, current, row_map_policy=row_map_policy
+        )
+
+    def with_pending_forward_decision(
+        self, decision: "AsyncPendingForwardDecision"
+    ) -> "AsyncDecodePlan":
+        """Return a copy of the plan annotated with a pending-forward decision."""
+        return replace(
+            self,
+            row_map=decision.row_map,
+            row_mapped=decision.row_mapped,
+            graph_compatible=decision.graph_compatible,
+            layout_compatible=decision.layout_compatible,
+        )
+
 
 @dataclass(frozen=True)
 class AsyncPendingForwardDecision:
@@ -648,7 +673,9 @@ class AsyncDecodeTransaction:
         current = AsyncLayoutSnapshot.from_context_current(
             context, tokens_per_request=self.snapshot.graph_shape.tokens_per_request
         )
-        decision = resolve_async_pending_forward(self.snapshot, current)
+        assert self.plan is not None
+        decision = self.plan.resolve_pending_forward(current)
+        self.plan = self.plan.with_pending_forward_decision(decision)
         if not decision.reusable:
             self.discard(decision.reason or "pending forward not reusable")
             return None
