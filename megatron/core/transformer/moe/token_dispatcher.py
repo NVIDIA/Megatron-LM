@@ -1476,12 +1476,6 @@ class _NCCLEPManager(_DispatchManager):
                 "sizes the per-rank receive buffer. Exceeding the budget hard-traps, so set it "
                 "generously."
             )
-        # TODO(ncclep) support FP8/FP4.
-        if config.fp8 or config.fp4:
-            raise ValueError(
-                "The 'ncclep' backend does not support FP8/FP4 yet; the EP dispatch/combine "
-                "payload is bf16-only."
-            )
 
         # Created lazily on the first setup_metadata (sizing needs the local token count).
         self._context: Optional[NcclEpContext] = None
