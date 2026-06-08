@@ -1282,6 +1282,7 @@ class ChainedOptimizer(MegatronOptimizer):
 
     def _step(self) -> bool:
         """Step all optimizers in this chain."""
+        success = True
         for optimizer_idx, optimizer in enumerate(self.chained_optimizers):
             success &= optimizer.step_with_ready_grads()
             if self.config.overlap_param_gather_with_optimizer_step and optimizer_idx == 0:

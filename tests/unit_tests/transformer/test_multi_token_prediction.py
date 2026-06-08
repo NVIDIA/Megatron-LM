@@ -86,8 +86,8 @@ class _ScaleMTPLayer(torch.nn.Module):
         super().__init__()
         self.scale = torch.nn.Parameter(torch.tensor(2.0))
 
-    def forward(self, input_ids, position_ids, hidden_states, **_kwargs):
-        return hidden_states * self.scale, input_ids, position_ids
+    def forward(self, input_ids, position_ids, hidden_states, padding_mask=None, **_kwargs):
+        return hidden_states * self.scale, input_ids, position_ids, padding_mask
 
 
 class TestMultiTokenPredictionLayer:

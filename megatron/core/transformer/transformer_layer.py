@@ -1567,7 +1567,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         hidden_dropout: Optional[float] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
+        pp_layer_offset: Optional[int] = None,
         is_mtp_layer: bool = False,
+        name: str | None = None,
     ):
         super().__init__(
             config=config,
@@ -1576,7 +1578,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             hidden_dropout=hidden_dropout,
             pg_collection=pg_collection,
             vp_stage=vp_stage,
+            pp_layer_offset=pp_layer_offset,
             is_mtp_layer=is_mtp_layer,
+            name=name,
         )
 
         if submodules.cross_attention_hyper_connection is not IdentityOp:
