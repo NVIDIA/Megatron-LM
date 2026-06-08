@@ -4037,15 +4037,12 @@ class AllGatherPipeline:
         if len(params) == 0:
             return
 
-        current_ag_buckets = [self.buffer.param_to_param_group[item] for item in params]
-        current_ag_buckets = list(
-            sorted(set(current_ag_buckets))
-        )  # Sort in order of unique bucket ID.
-        ag_buckets = list(current_ag_buckets)
+        ag_buckets = [self.buffer.param_to_param_group[item] for item in params]
+        ag_buckets = list(sorted(set(ag_buckets)))  # Sort in order of unique bucket ID.
         parameter_groups = self.buffer.parameter_groups
         if self.buffer.ddp_config.fsdp_double_buffer:
             double_buf_units = set()
-            for bucket_id in current_ag_buckets:
+            for bucket_id in ag_buckets:
                 fsdp_unit_id = parameter_groups[bucket_id].fsdp_unit_id
                 if fsdp_unit_id in self.buffer.double_buf_units:
                     double_buf_units.add(fsdp_unit_id)
