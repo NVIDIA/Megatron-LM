@@ -198,10 +198,6 @@ def test_fsdp2_offload_fraction_keeps_optimizer_update_state_on_cpu_single_node(
     assert _optimizer_state_devices(optimizer) == {"cpu"}
 
 
-@pytest.mark.xfail(
-    reason="MLite FSDP2 checkpoint continuity is covered by a follow-up bugfix PR.",
-    strict=True,
-)
 def test_fsdp2_checkpoint_load_matches_uninterrupted_training_single_node(tmp_path):
     model_for_ckpt, ps = _build_fsdp2_model()
     optimizer_for_ckpt = _build_optimizer(model_for_ckpt, ps, offload_fraction=0.0)
