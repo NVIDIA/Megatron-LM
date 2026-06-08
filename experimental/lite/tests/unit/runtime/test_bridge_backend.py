@@ -78,6 +78,37 @@ def test_bridge_config_from_dict_rejects_num_microbatches():
         BridgeConfig.from_dict({"num_microbatches": 2})
 
 
+def test_bridge_builds_mcore_ddp_config_object(monkeypatch):
+    from megatron.lite.runtime.backends.bridge.config import BridgeConfig
+    from megatron.lite.runtime.backends.bridge.runtime import _build_ddp_config
+
+    class _FakeDDPConfig:
+        def __init__(self, **kwargs):
+            for key, value in kwargs.items():
+                setattr(self, key, value)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "megatron.core.distributed",
+        types.SimpleNamespace(DistributedDataParallelConfig=_FakeDDPConfig),
+    )
+
+    ddp_config = _build_ddp_config(
+        BridgeConfig(
+            override_ddp_config={
+                "overlap_grad_reduce": True,
+                "bucket_size": 1024,
+            }
+        )
+    )
+
+    assert isinstance(ddp_config, _FakeDDPConfig)
+    assert ddp_config.use_distributed_optimizer is True
+    assert ddp_config.grad_reduce_in_fp32 is True
+    assert ddp_config.overlap_grad_reduce is True
+    assert ddp_config.bucket_size == 1024
+
+
 def test_bridge_registers_qwen35_moe_compat_aliases(monkeypatch):
     from megatron.lite.runtime.backends.bridge.runtime import _register_bridge_compat_aliases
 
@@ -103,4 +134,6 @@ def test_bridge_registers_qwen35_moe_compat_aliases(monkeypatch):
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen3_5MoeForCausalLM",
     ]
-    assert all(item["bridge_class"] is object for item in registered)
+    assert all(issubclass(item["bridge_class"], object) for item in registered)
+    assert all(item["bridge_class"] is not object for item in registered)
+    assert all("provider_bridge" in item["bridge_class"].__dict__ for item in registered)

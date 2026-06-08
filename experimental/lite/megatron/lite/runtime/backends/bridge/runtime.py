@@ -121,24 +121,46 @@ def _register_bridge_compat_aliases() -> None:
     from megatron.bridge.models.qwen.qwen3_moe_bridge import Qwen3MoEBridge
     from megatron.core.models.gpt.gpt_model import GPTModel
 
+    class Qwen35MoEBridge(Qwen3MoEBridge):
+        """Megatron-Bridge Qwen3 MoE bridge adjusted for Qwen3.5 nested text config."""
+
+        def provider_bridge(self, hf_pretrained):
+            config = getattr(hf_pretrained, "config", hf_pretrained)
+            text_config = getattr(config, "text_config", config)
+            shim = type("_Qwen35TextConfigShim", (), {"config": text_config})()
+            provider = super().provider_bridge(shim)
+
+            rope_parameters = getattr(text_config, "rope_parameters", None)
+            if isinstance(rope_parameters, dict):
+                rope_theta = rope_parameters.get("rope_theta")
+                if rope_theta is not None:
+                    provider.rotary_base = rope_theta
+                partial_rotary_factor = rope_parameters.get("partial_rotary_factor")
+                if partial_rotary_factor is not None:
+                    provider.rotary_percent = partial_rotary_factor
+
+            aux_loss = getattr(text_config, "router_aux_loss_coef", None)
+            if aux_loss is not None:
+                provider.moe_aux_loss_coeff = aux_loss
+
+            return provider
+
     registry = getattr(model_bridge.get_model_bridge, "_exact_types", {})
     for source in ("Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM"):
         if source not in registry:
             model_bridge.register_bridge_implementation(
                 source=source,
                 target=GPTModel,
-                bridge_class=Qwen3MoEBridge,
+                bridge_class=Qwen35MoEBridge,
             )
 
 
 def _build_bridge(hf_path: str, cfg: BridgeConfig):
     """Build Megatron-Bridge AutoBridge lazily from an HF model path."""
     from megatron.bridge import AutoBridge
-    from transformers import AutoConfig
 
-    hf_config = AutoConfig.from_pretrained(hf_path, trust_remote_code=True)
     _register_bridge_compat_aliases()
-    bridge = AutoBridge.from_hf_config(hf_config)
+    bridge = AutoBridge.from_hf_pretrained(hf_path, trust_remote_code=True)
     hf_config = _bridge_hf_config(bridge)
     if hf_config is not None and not hasattr(hf_config, "rope_theta"):
         hf_config.rope_theta = hf_config.to_dict().get("rope_theta", 1000000.0)
@@ -192,6 +214,18 @@ def _build_lr_scheduler(optimizer, cfg: BridgeConfig):
         wsd_decay_steps=opt.lr_wsd_decay_steps,
         lr_wsd_decay_style=opt.lr_wsd_decay_style,
     )
+
+
+def _build_ddp_config(cfg: BridgeConfig):
+    from megatron.core.distributed import DistributedDataParallelConfig
+
+    ddp_kwargs = {
+        "use_distributed_optimizer": True,
+        "overlap_grad_reduce": False,
+        "grad_reduce_in_fp32": True,
+    }
+    ddp_kwargs.update(cfg.override_ddp_config)
+    return DistributedDataParallelConfig(**ddp_kwargs)
 
 
 def _resolve_benchmark_protocol(cfg: BridgeConfig, bridge) -> Any | None:
@@ -275,17 +309,10 @@ class BridgeRuntime(RuntimeBase):
         if hasattr(provider, "finalize"):
             provider.finalize()
 
-        ddp_config = {
-            "use_distributed_optimizer": True,
-            "overlap_grad_reduce": False,
-            "grad_reduce_in_fp32": True,
-        }
-        ddp_config.update(rt_cfg.override_ddp_config)
-
         model_list = provider.provide_distributed_model(
             model_type=ModelType.encoder_or_decoder,
             wrap_with_ddp=True,
-            ddp_config=ddp_config,
+            ddp_config=_build_ddp_config(rt_cfg),
             bf16=True,
         )
 
