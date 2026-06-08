@@ -112,7 +112,7 @@ products:
   - test_case: [gpt3_mcore_te_tp1_pp1_dist_optimizer_no_mmap_bin_files]
     products:
       - environment: [dev]
-        scope: [mr, mr-github]
+        scope: [mr, mr-github, L0-smoke]
         platforms: [dgx_h100]
       - environment: [lts]
         scope: [nightly]
