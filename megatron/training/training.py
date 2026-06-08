@@ -2803,34 +2803,41 @@ def save_checkpoint_and_time(
     timer_key = 'save-checkpoint-non-persistent' if non_persistent_ckpt else 'save-checkpoint'
     timers(timer_key, log_level=0).start(barrier=True)
 
-    # Log E2E metrics before save-checkpoint
-    one_logger_utils.track_e2e_metrics()
-    # Free overlap param-gather buffers and release cached GPU memory so
-    # that the async checkpoint worker process has enough GPU headroom for
-    # D2H tensor transfers.
-    for model_chunk in model:
-        if hasattr(model_chunk, 'free_overlap_buffers'):
-            model_chunk.free_overlap_buffers()
-    torch.cuda.empty_cache()
+    # Mark the full span measured by the 'save-checkpoint' timer started just
+    # above (with barrier=True). This region covers the pre-save buffer free +
+    # empty_cache AND the save_checkpoint() call, so it is directly comparable
+    # to the printed `save-checkpoint` timer (the only delta is the stop-barrier
+    # straggler wait, which lives inside timers(...).stop(barrier=True) below).
+    with trace_region("save_checkpoint_and_time"):
+        # Log E2E metrics before save-checkpoint
+        one_logger_utils.track_e2e_metrics()
+        # Free overlap param-gather buffers and release cached GPU memory so
+        # that the async checkpoint worker process has enough GPU headroom for
+        # D2H tensor transfers.
+        with trace_region("pre_save_free_memory"):
+            for model_chunk in model:
+                if hasattr(model_chunk, 'free_overlap_buffers'):
+                    model_chunk.free_overlap_buffers()
+            torch.cuda.empty_cache()
 
-    global num_checkpoints_memory_reported, MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
-    should_report_memory = num_checkpoints_memory_reported < MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
+        global num_checkpoints_memory_reported, MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
+        should_report_memory = num_checkpoints_memory_reported < MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
 
-    if should_report_memory:
-        # Track memory before checkpoint save.
-        report_memory(f"(before save_checkpoint for iteration {iteration})")
-    # Save checkpoint.
-    save_checkpoint(
-        iteration,
-        model,
-        optimizer,
-        opt_param_scheduler,
-        num_floating_point_operations_so_far,
-        checkpointing_context,
-        non_persistent_ckpt=non_persistent_ckpt,
-        train_data_iterator=train_data_iterator,
-        preprocess_common_state_dict_fn=preprocess_common_state_dict,
-    )
+        if should_report_memory:
+            # Track memory before checkpoint save.
+            report_memory(f"(before save_checkpoint for iteration {iteration})")
+        # Save checkpoint.
+        save_checkpoint(
+            iteration,
+            model,
+            optimizer,
+            opt_param_scheduler,
+            num_floating_point_operations_so_far,
+            checkpointing_context,
+            non_persistent_ckpt=non_persistent_ckpt,
+            train_data_iterator=train_data_iterator,
+            preprocess_common_state_dict_fn=preprocess_common_state_dict,
+        )
     
     # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.
     timers(timer_key).stop(barrier=True)
