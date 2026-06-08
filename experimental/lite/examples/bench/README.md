@@ -76,8 +76,9 @@ available in the runtime environment.
 
 | Runtime | Impl | Optimizer backend | Measured steps | Avg step ms | Tokens/s | Tokens/s/GPU | Peak memory GB | TFLOPs/GPU |
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `mlite` | `lite` | `mc_full` | 10 | 309.433 | 105896.935 | 13237.117 | 14.324 | 80.444 |
-| `mbridge` | `bridge` | `mc` | 10 | 332.201 | 98639.089 | 12329.886 | 17.987 | 74.931 |
+| `mlite` | `lite` | `distopt` | 10 | 309.433 | 105896.935 | 13237.117 | 14.324 | 80.444 |
+| `mbridge` | `bridge` | `distopt` | 10 | 332.201 | 98639.089 | 12329.886 | 17.987 | 74.931 |
+| `bridge` | `bridge` | `distopt` | 10 | 334.936 | 97833.496 | 12229.187 | 16.403 | 74.319 |
 
 The two runs used the same synthetic input stream. Loss matched within
 `atol=0.05, rtol=0.005` across 10 measured samples

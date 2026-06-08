@@ -232,7 +232,7 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
         from megatron.lite.runtime.megatron_utils import register_training_hooks
 
         register_training_hooks(chunks, optimizer)
-        optimizer_backend = "mc_full"
+        optimizer_backend = "distopt"
     elif impl_cfg.optimizer == "fsdp2":
         optimizer_backend = "fsdp2"
 
