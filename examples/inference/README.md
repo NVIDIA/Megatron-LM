@@ -114,8 +114,7 @@ still target these scripts.
 ```bash
 --moe-routing-trace-path /path/to/trace_dir   # enable tracing
 --moe-routing-trace-max-iters 500             # optional: stop after N iters
---moe-routing-trace-capture-logits            # optional: pre-topk scores
---moe-routing-trace-capture-hidden-states     # optional: input hidden states
+--moe-routing-trace-capture-hidden-states     # required for load-balance distribution predictability
 ```
 
 **During inference**, add these flags (e.g. to
@@ -124,24 +123,18 @@ still target these scripts.
 ```bash
 --moe-routing-trace-path /path/to/trace_dir
 --moe-routing-trace-max-steps 200
---moe-routing-trace-capture-logits
+--moe-routing-trace-capture-hidden-states
 ```
 
-Both write `router_trace_rank{N}.jsonl` into the specified directory (one file per rank).  Optional sidecar files `hidden_states_rank{N}.bin`
-and `logits_rank{N}.bin` can be written via `--moe-routing-trace-capture-hidden-states` and `--moe-routing-trace-capture-logits`.
+Both write `router_trace_rank{N}.jsonl` into the specified directory (one file per rank).
+`--moe-routing-trace-capture-hidden-states` also writes `hidden_states_rank{N}.bin`, which is
+required by `analyze_routing_load_balance.py` for the distribution-predictability analysis.
 
 #### Running analyses
 
 ```bash
-# All core analyses (no logit sidecar needed):
-python tools/moe_routing/analyze_routing.py /path/to/trace_dir --ep-size 8
-
-# Include score-level analyses (requires --moe-routing-trace-capture-logits):
-python tools/moe_routing/analyze_routing.py /path/to/trace_dir --ep-size 8 --with-logits
-
-# Cross-checkpoint stability (step-after-step expert reuse):
-python tools/moe_routing/analyze_routing.py /path/to/trace_dir --ep-size 8 \
-    --snapshots step1k:/path/to/early_trace step10k:/path/to/late_trace
+python tools/moe_routing/analyze_routing.py /path/to/trace_dir \
+    --ep-size 8 --num-experts 512
 ```
 
 The dispatcher runs these analyses in order:
@@ -150,13 +143,6 @@ The dispatcher runs these analyses in order:
 |--------|-----------------|------|
 | `tools/moe_routing/analyze_routing_concentration.py` | How concentrated is routing? (hot-set size) | Hypothesis test: is per-layer static caching viable? High concentration (ratio > 2×) supports it; near-uniform rules it out. |
 | `tools/moe_routing/analyze_routing_load_balance.py` | Can one-layer-ahead hidden-state prediction close the EP load-imbalance gap? | Affirmative signal: high cosine/Spearman in the distribution predictability block is the core evidence that a predictor is worth building. |
-| `tools/moe_routing/analyze_routing_logits.py` | Are top-K boundaries sharp or brittle? Do score vectors correlate across layers? | Hypothesis test: rules out boundary noise as an explanation for null concentration results; confirms whether score-level signal exists independently of hard top-K. |
-| `tools/moe_routing/analyze_routing_cross_snapshot.py` | Do the same experts stay hot across training checkpoints? | Stability check: high overlap → a predictor trained at one checkpoint transfers; low overlap → retraining is required after each checkpoint. |
-
-The negative-result analyses (`analyze_routing_concentration.py`, `analyze_routing_logits.py`)
-are intentionally included: they disprove cheaper hypotheses (static caching, boundary-noise
-explanations), and their
-null results are evidence justifying that expert prediction is worthwhile.
 
 #### Interpreting the load-balance simulation output
 
