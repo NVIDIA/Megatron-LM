@@ -6,6 +6,7 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import load, load_plain_tensors, save
 from megatron.core.dist_checkpointing.dict_utils import diff
+from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
     FullyParallelSaveStrategyWrapper,
@@ -81,6 +82,13 @@ def common_test_parallel_reconfiguration_e2e(
             pipeline_model_parallel_size=src_tp_pp[1],
             **src_model_init_kwargs,
         )
+        gpt_model_A.sharded_state_dict["common_state"] = ShardedObject(
+            key="common_state",
+            data={},
+            global_shape=(1,),
+            global_offset=(0,),
+            replica_id=torch.distributed.get_rank(),
+        )
         save_strategy = TorchDistSaveShardedStrategy()
         if use_fpsl:
             save_strategy = FullyParallelSaveStrategyWrapper(
@@ -102,6 +110,13 @@ def common_test_parallel_reconfiguration_e2e(
             tensor_model_parallel_size=dest_tp_pp[0],
             pipeline_model_parallel_size=dest_tp_pp[1],
             **dst_model_init_kwargs,
+        )
+        gpt_model_B.sharded_state_dict["common_state"] = ShardedObject(
+            key="common_state",
+            data={},
+            global_shape=(1,),
+            global_offset=(0,),
+            replica_id=torch.distributed.get_rank(),
         )
         if use_fpsl:
             load_strategy = TorchDistLoadShardedStrategy()
