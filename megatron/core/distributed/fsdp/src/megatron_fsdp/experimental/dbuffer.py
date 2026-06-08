@@ -243,6 +243,11 @@ class DBuffer:
         """Dtype of the local buffer."""
         return self.local_buffer.dtype
 
+    @property
+    def device(self) -> torch.device:
+        """Device of the local buffer."""
+        return self.local_buffer.device
+
     @classmethod
     def from_local(
         cls,
@@ -302,24 +307,14 @@ class DBuffer:
         Returns:
             A DBuffer whose local storage matches ``placements``.
         """
-        tensors = tuple(
-            (
-                tensor.to(mesh.device_type)
-                if tensor.device.type != mesh.device_type and not tensor.is_meta
-                else tensor
-            )
-            .detach()
-            .contiguous()
-            for tensor in tensors
-        )
+        tensors = tuple(tensor.detach().contiguous() for tensor in tensors)
         if not tensors:
             raise ValueError("DBuffer.distribute_tensors() requires at least one tensor.")
 
         dtype = tensors[0].dtype
-        device = tensors[0].device
         for tensor in tensors:
-            if tensor.dtype != dtype or tensor.device != device:
-                raise ValueError("All tensors in a DBuffer must have the same dtype and device.")
+            if tensor.dtype != dtype:
+                raise ValueError("All tensors in a DBuffer must have the same dtype.")
 
         tensor_shapes = tuple(tensor.shape for tensor in tensors)
         buffer = cls(
@@ -327,7 +322,7 @@ class DBuffer:
             placements=placements,
             tensor_shapes=tensor_shapes,
             dtype=dtype,
-            device=device,
+            device=mesh.device_type,
         )
         local_start = buffer.offset
         local_end = local_start + buffer.local_buffer.numel()
@@ -343,8 +338,9 @@ class DBuffer:
             overlap_numel = overlap_end - overlap_start
             source_offset = overlap_start - tensor_start
             destination_offset = overlap_start - local_start
+            source_slice = tensor.view(-1).narrow(0, source_offset, overlap_numel)
             buffer.local_buffer.narrow(0, destination_offset, overlap_numel).copy_(
-                tensor.view(-1).narrow(0, source_offset, overlap_numel)
+                source_slice.to(buffer.device)
             )
         return buffer
 
@@ -358,7 +354,7 @@ class DBuffer:
                 placements=placements,
                 tensor_shapes=self.layout.tensor_shapes,
                 dtype=self.dtype,
-                device=self.local_buffer.device,
+                device=self.device,
             )
 
         if out.mesh != self.mesh:
@@ -369,10 +365,8 @@ class DBuffer:
             raise ValueError(f"Expected out layout {self.layout!r}, got {out.layout!r}.")
         if out.dtype != self.dtype:
             raise ValueError(f"Expected out dtype {self.dtype}, got {out.dtype}.")
-        if out.local_buffer.device != self.local_buffer.device:
-            raise ValueError(
-                f"Expected out device {self.local_buffer.device}, got {out.local_buffer.device}."
-            )
+        if out.device != self.device:
+            raise ValueError(f"Expected out device {self.device}, got {out.device}.")
         return out
 
     def redistribute(
@@ -542,7 +536,7 @@ class DBuffer:
         row_size = _non_leading_numel(shape)
         if overlap_end <= overlap_start:
             empty_shape = torch.Size((0, *shape[1:]))
-            return torch.empty(empty_shape, dtype=self.dtype, device=self.local_buffer.device)
+            return torch.empty(empty_shape, dtype=self.dtype, device=self.device)
 
         local_numel = overlap_end - overlap_start
         local_buffer_offset = overlap_start - self.offset
