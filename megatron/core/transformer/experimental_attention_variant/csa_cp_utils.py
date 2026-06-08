@@ -1,12 +1,15 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
 
 from megatron.core.transformer.experimental_attention_variant import csa_cp_kernels
-from megatron.core.transformer.experimental_attention_variant.dsa_kernels import batch_of_row
+from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
+    batch_of_row,
+    indexer_topk,
+)
 
 
 class _SingleRankCPGroup:
@@ -20,6 +23,26 @@ class _SingleRankCPGroup:
 
 
 SINGLE_RANK_CP_GROUP = _SingleRankCPGroup()
+
+DSV4_CP_PARTITION_CONTIGUOUS = "contiguous"
+DSV4_CP_PARTITION_PACKED_STREAM_TWO_CHUNK = "packed_stream_two_chunk"
+DSV4_CP_PARTITION_MODES = (
+    DSV4_CP_PARTITION_CONTIGUOUS,
+    DSV4_CP_PARTITION_PACKED_STREAM_TWO_CHUNK,
+)
+
+
+def normalize_dsv4_cp_partition_mode(mode: Optional[str]) -> str:
+    """Validate and normalize the DSv4 CP packed-token partition mode."""
+
+    if mode is None:
+        return DSV4_CP_PARTITION_CONTIGUOUS
+    if mode not in DSV4_CP_PARTITION_MODES:
+        raise RuntimeError(
+            "Unsupported DSv4 CP partition mode: "
+            f"{mode!r}. Expected one of {DSV4_CP_PARTITION_MODES}."
+        )
+    return mode
 
 
 def cp_group_size(cp_group: Optional[torch.distributed.ProcessGroup]) -> int:
@@ -86,7 +109,7 @@ def apply_thd_overlap_transform_fused(
 
 
 class _THDChunkedCPRopeCute(torch.autograd.Function):
-    """Autograd wrapper for THD chunked-CP/boundary RoPE."""
+    """Autograd wrapper for THD CP RoPE on a known packed-token interval."""
 
     @staticmethod
     def forward(
@@ -185,6 +208,66 @@ class _CPCompressedRopeCute(torch.autograd.Function):
         return grad_x, None, None, None, None, None, None, None
 
 
+class _THDCPChunksRopeCute(torch.autograd.Function):
+    """Autograd wrapper for the two-chunk THD CP RoPE fast path."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        cu_seqlens_padded: torch.Tensor,
+        chunk0_global_start: int,
+        chunk1_global_start: int,
+        chunk_len: int,
+        nope_dim: int,
+        pos_dim: int,
+        inverse: bool,
+        clamp_to_valid_token: bool,
+    ) -> torch.Tensor:
+        ctx.chunk0_global_start = int(chunk0_global_start)
+        ctx.chunk1_global_start = int(chunk1_global_start)
+        ctx.chunk_len = int(chunk_len)
+        ctx.nope_dim = int(nope_dim)
+        ctx.pos_dim = int(pos_dim)
+        ctx.inverse = inverse
+        ctx.clamp_to_valid_token = clamp_to_valid_token
+        ctx.save_for_backward(cos, sin, cu_seqlens_padded)
+        return csa_cp_kernels.apply_thd_cp_two_chunks_rope(
+            x,
+            cos,
+            sin,
+            cu_seqlens_padded,
+            ctx.chunk0_global_start,
+            ctx.chunk1_global_start,
+            ctx.chunk_len,
+            ctx.nope_dim,
+            ctx.pos_dim,
+            inverse=inverse,
+            clamp_to_valid_token=clamp_to_valid_token,
+        )
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        cos, sin, cu_seqlens_padded = ctx.saved_tensors
+        grad_x = csa_cp_kernels.apply_thd_cp_two_chunks_rope(
+            grad_output.contiguous(),
+            cos,
+            sin,
+            cu_seqlens_padded,
+            ctx.chunk0_global_start,
+            ctx.chunk1_global_start,
+            ctx.chunk_len,
+            ctx.nope_dim,
+            ctx.pos_dim,
+            inverse=ctx.inverse,
+            clamp_to_valid_token=ctx.clamp_to_valid_token,
+            adjoint=True,
+        )
+        return grad_x, None, None, None, None, None, None, None, None, None, None
+
+
 def apply_thd_chunked_cp_rope_fused(
     x: torch.Tensor,
     cos: torch.Tensor,
@@ -200,22 +283,30 @@ def apply_thd_chunked_cp_rope_fused(
     row_offset: int = 0,
     chunk_len: Optional[int] = None,
     clamp_to_valid_token: bool = False,
+    global_row_base: Optional[int] = None,
 ) -> torch.Tensor:
-    """Apply production THD chunked-CP RoPE without explicit positions."""
+    """Apply THD CP RoPE for rows in one packed-token interval.
+
+    ``global_row_base`` can override the contiguous formula
+    ``cp_rank * chunk_len``. This is used when local rows are split across
+    explicit global chunks and each slice has its own global start.
+    """
     if not csa_cp_kernels.can_use_cute_kernels(x, cos, sin, cu_seqlens_padded):
-        raise RuntimeError("DSv4 THD chunked-CP RoPE requires CUDA tensors and CuTeDSL kernels.")
+        raise RuntimeError("DSv4 THD CP RoPE requires CUDA tensors and CuTeDSL kernels.")
     if rotary_interleaved:
-        raise RuntimeError("DSv4 THD chunked-CP RoPE does not support rotary_interleaved=True.")
+        raise RuntimeError("DSv4 THD CP RoPE does not support rotary_interleaved=True.")
     if not remove_interleaving:
-        raise RuntimeError("DSv4 THD chunked-CP RoPE requires remove_interleaving=True.")
+        raise RuntimeError("DSv4 THD CP RoPE requires remove_interleaving=True.")
     if cp_size < 1 or cp_rank < 0 or cp_rank >= cp_size:
         raise RuntimeError(
-            f"DSv4 THD chunked-CP RoPE got invalid CP rank/size: cp_rank={cp_rank}, "
+            f"DSv4 THD CP RoPE got invalid CP rank/size: cp_rank={cp_rank}, "
             f"cp_size={cp_size}."
         )
     if chunk_len is None:
         chunk_len = x.shape[0]
-    global_row_base = int(cp_rank) * int(chunk_len) + int(row_offset)
+    if global_row_base is None:
+        global_row_base = int(cp_rank) * int(chunk_len)
+    global_row_base = int(global_row_base) + int(row_offset)
     return _THDChunkedCPRopeCute.apply(
         x,
         cos,
@@ -227,6 +318,92 @@ def apply_thd_chunked_cp_rope_fused(
         inverse,
         clamp_to_valid_token,
     )
+
+
+def apply_thd_cp_chunks_rope_fused(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    nope_dim: int,
+    pos_dim: int,
+    cu_seqlens_padded: torch.Tensor,
+    chunk_ranges: Sequence[Tuple[int, int]],
+    rotary_interleaved: bool = False,
+    inverse: bool = False,
+    remove_interleaving: bool = True,
+    row_offset: int = 0,
+    clamp_to_valid_token: bool = False,
+) -> torch.Tensor:
+    """Apply THD RoPE to local rows already ordered as explicit global chunks.
+
+    ``chunk_ranges`` describes the global padded-token interval for each local
+    slice in first-dimension order. This is the path for packed-stream
+    two-chunk CP partition; it avoids building a per-token positions tensor.
+    """
+
+    if not chunk_ranges:
+        raise RuntimeError("DSv4 THD CP chunk RoPE requires at least one chunk range.")
+    if not csa_cp_kernels.can_use_cute_kernels(x, cos, sin, cu_seqlens_padded):
+        raise RuntimeError("DSv4 THD CP chunk RoPE requires CUDA tensors and CuTeDSL.")
+    if rotary_interleaved:
+        raise RuntimeError("DSv4 THD CP chunk RoPE does not support rotary_interleaved=True.")
+    if not remove_interleaving:
+        raise RuntimeError("DSv4 THD CP chunk RoPE requires remove_interleaving=True.")
+    chunk_lengths = [int(end) - int(start) for start, end in chunk_ranges]
+    if any(length <= 0 for length in chunk_lengths):
+        raise RuntimeError(f"DSv4 THD CP chunk RoPE got invalid chunks: {chunk_ranges}.")
+    l_local = sum(chunk_lengths)
+    if x.shape[0] != l_local:
+        raise RuntimeError(
+            "DSv4 THD CP chunk RoPE expects x rows to match chunk ranges: "
+            f"x={x.shape[0]}, chunks={l_local}."
+        )
+
+    if len(chunk_ranges) == 2 and chunk_lengths[0] == chunk_lengths[1]:
+        chunk0_start = int(chunk_ranges[0][0]) + int(row_offset)
+        chunk1_start = int(chunk_ranges[1][0]) + int(row_offset)
+        return _THDCPChunksRopeCute.apply(
+            x,
+            cos,
+            sin,
+            cu_seqlens_padded,
+            chunk0_start,
+            chunk1_start,
+            chunk_lengths[0],
+            nope_dim,
+            pos_dim,
+            inverse,
+            clamp_to_valid_token,
+        )
+
+    outputs: List[torch.Tensor] = []
+    local_offset = 0
+    for (global_start, _global_end), l_chunk in zip(chunk_ranges, chunk_lengths):
+        x_chunk = x.narrow(0, local_offset, l_chunk)
+        outputs.append(
+            apply_thd_chunked_cp_rope_fused(
+                x_chunk,
+                cos,
+                sin,
+                nope_dim,
+                pos_dim,
+                cu_seqlens_padded,
+                cp_rank=0,
+                cp_size=1,
+                rotary_interleaved=rotary_interleaved,
+                inverse=inverse,
+                remove_interleaving=remove_interleaving,
+                row_offset=row_offset,
+                chunk_len=l_chunk,
+                clamp_to_valid_token=clamp_to_valid_token,
+                global_row_base=int(global_start),
+            )
+        )
+        local_offset += l_chunk
+
+    if len(outputs) == 1:
+        return outputs[0]
+    return torch.cat(outputs, dim=0)
 
 
 def apply_cp_compressed_rope_fused(
@@ -325,6 +502,174 @@ def exchange_left_boundary_tensor(
     return _LeftBoundaryExchange.apply(tensor, d_window, cp_group)
 
 
+def _chunked_cp_owner_rank(chunk_id: int, cp_size: int) -> int:
+    if chunk_id < cp_size:
+        return chunk_id
+    return 2 * cp_size - 1 - chunk_id
+
+
+class _ChunkedLeftBoundaryExchange(torch.autograd.Function):
+    """Exchange left boundaries for packed-stream two-chunk CP local rows."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        tensor: torch.Tensor,
+        d_window: int,
+        cp_group: torch.distributed.ProcessGroup,
+    ):
+        cp_size = cp_group_size(cp_group)
+        cp_rank = cp_group_rank(cp_group)
+        local_chunks = 1 if cp_size <= 1 else 2
+        ctx.cp_group = cp_group
+        ctx.d_window = d_window
+        ctx.input_shape = tensor.shape
+        ctx.local_chunks = local_chunks
+
+        if tensor.shape[0] % local_chunks != 0:
+            raise RuntimeError(
+                "DSv4 chunked CP boundary exchange expects equal local chunks: "
+                f"local={tensor.shape[0]}, chunks={local_chunks}."
+            )
+        chunk_len = tensor.shape[0] // local_chunks
+        ctx.chunk_len = chunk_len
+        if chunk_len < d_window:
+            raise RuntimeError(
+                "DSv4 chunked CP boundary exchange requires chunk_len >= D_window: "
+                f"chunk_len={chunk_len}, D_window={d_window}."
+            )
+        if cp_size <= 1:
+            return tensor.new_zeros((d_window,) + tuple(tensor.shape[1:]))
+
+        total_chunks = 2 * cp_size
+        local_chunk_ids = (cp_rank, total_chunks - 1 - cp_rank)
+        ctx.local_chunk_ids = local_chunk_ids
+        local_index_by_chunk = {chunk_id: idx for idx, chunk_id in enumerate(local_chunk_ids)}
+        recv = tensor.new_zeros((local_chunks, d_window) + tuple(tensor.shape[1:]))
+        ops = []
+        send_tensors = []
+
+        for local_idx, chunk_id in enumerate(local_chunk_ids):
+            if chunk_id > 0:
+                prev_chunk_id = chunk_id - 1
+                source_rank = _chunked_cp_owner_rank(prev_chunk_id, cp_size)
+                if source_rank == cp_rank:
+                    source_idx = local_index_by_chunk[prev_chunk_id]
+                    source_start = source_idx * chunk_len
+                    recv[local_idx].copy_(tensor[source_start + chunk_len - d_window : source_start + chunk_len])
+                else:
+                    ops.append(
+                        dist.P2POp(
+                            dist.irecv,
+                            recv[local_idx],
+                            _group_peer(cp_group, source_rank),
+                            cp_group,
+                        )
+                    )
+
+            next_chunk_id = chunk_id + 1
+            if next_chunk_id < total_chunks:
+                target_rank = _chunked_cp_owner_rank(next_chunk_id, cp_size)
+                if target_rank != cp_rank:
+                    start = local_idx * chunk_len
+                    send_tensors.append(tensor[start + chunk_len - d_window : start + chunk_len].contiguous())
+                    ops.append(
+                        dist.P2POp(
+                            dist.isend,
+                            send_tensors[-1],
+                            _group_peer(cp_group, target_rank),
+                            cp_group,
+                        )
+                    )
+
+        if ops:
+            for req in dist.batch_isend_irecv(ops):
+                req.wait()
+        return recv.reshape((local_chunks * d_window,) + tuple(tensor.shape[1:]))
+
+    @staticmethod
+    def backward(ctx, grad_boundary: torch.Tensor):
+        cp_group = ctx.cp_group
+        cp_size = cp_group_size(cp_group)
+        cp_rank = cp_group_rank(cp_group)
+        d_window = ctx.d_window
+        local_chunks = ctx.local_chunks
+        chunk_len = ctx.chunk_len
+        grad_input = grad_boundary.new_zeros(ctx.input_shape)
+        if cp_size <= 1:
+            return grad_input, None, None
+
+        total_chunks = 2 * cp_size
+        local_chunk_ids = ctx.local_chunk_ids
+        local_index_by_chunk = {chunk_id: idx for idx, chunk_id in enumerate(local_chunk_ids)}
+        grad_chunks = grad_boundary.reshape((local_chunks, d_window) + tuple(grad_boundary.shape[1:]))
+        ops = []
+        send_tensors = []
+        recv_specs = []
+
+        for local_idx, chunk_id in enumerate(local_chunk_ids):
+            if chunk_id > 0:
+                prev_chunk_id = chunk_id - 1
+                source_rank = _chunked_cp_owner_rank(prev_chunk_id, cp_size)
+                if source_rank == cp_rank:
+                    source_idx = local_index_by_chunk[prev_chunk_id]
+                    source_start = source_idx * chunk_len
+                    grad_input[source_start + chunk_len - d_window : source_start + chunk_len] += grad_chunks[
+                        local_idx
+                    ]
+                else:
+                    send_tensors.append(grad_chunks[local_idx].contiguous())
+                    ops.append(
+                        dist.P2POp(
+                            dist.isend,
+                            send_tensors[-1],
+                            _group_peer(cp_group, source_rank),
+                            cp_group,
+                        )
+                    )
+
+            next_chunk_id = chunk_id + 1
+            if next_chunk_id < total_chunks:
+                target_rank = _chunked_cp_owner_rank(next_chunk_id, cp_size)
+                if target_rank != cp_rank:
+                    recv = grad_chunks.new_zeros((d_window,) + tuple(grad_chunks.shape[2:]))
+                    recv_specs.append((local_idx, recv))
+                    ops.append(
+                        dist.P2POp(
+                            dist.irecv,
+                            recv,
+                            _group_peer(cp_group, target_rank),
+                            cp_group,
+                        )
+                    )
+
+        if ops:
+            for req in dist.batch_isend_irecv(ops):
+                req.wait()
+        for local_idx, recv in recv_specs:
+            start = local_idx * chunk_len
+            grad_input[start + chunk_len - d_window : start + chunk_len] += recv
+        return grad_input, None, None
+
+
+def exchange_chunked_left_boundary_tensor(
+    tensor: torch.Tensor,
+    d_window: int,
+    cp_group: torch.distributed.ProcessGroup,
+) -> torch.Tensor:
+    """Return fixed left boundaries for packed-stream two-chunk CP local rows.
+
+    For ``cp_size > 1``, ``tensor`` is interpreted as two equal local chunks in
+    packed-stream order ``[rank, 2 * cp_size - 1 - rank]``. The output has
+    ``2 * d_window`` rows, one boundary window per local chunk in the same
+    order.  Backward scatters/adds each boundary gradient to the tail of the
+    global previous chunk, including the self-boundary case such as rank 3's
+    chunks ``[3, 4]`` when ``cp_size == 4``.
+    """
+
+    return _ChunkedLeftBoundaryExchange.apply(tensor, d_window, cp_group)
+
+
 def contiguous_cp_partition(
     cu_seqlens_padded: torch.Tensor, cp_size: int, cp_rank: int
 ) -> Tuple[int, int]:
@@ -332,7 +677,7 @@ def contiguous_cp_partition(
 
     Args:
         cu_seqlens_padded: Global padded THD cumulative sequence lengths. The
-            last entry is the padded total token count that MCore partitions
+            last entry is the padded total token count that CP partitions
             evenly across CP ranks.
         cp_size: Number of context-parallel ranks.
         cp_rank: Context-parallel rank whose contiguous partition is requested.
@@ -350,6 +695,42 @@ def contiguous_cp_partition(
         )
     l_local = padded_total // cp_size
     return cp_rank * l_local, l_local
+
+
+def chunked_cp_partition(
+    padded_total_tokens: int,
+    cp_size: int,
+    cp_rank: int,
+) -> Tuple[Tuple[int, int], ...]:
+    """Return the packed-stream two-chunk CP token ranges for this rank.
+
+    Args:
+        padded_total_tokens: Host-known padded global token capacity. Production
+            callers should pass a shape-derived value, not read this from a GPU
+            cumulative-length tensor.
+        cp_size: Number of context-parallel ranks.
+        cp_rank: Context-parallel rank whose chunked partition is requested.
+
+    Returns:
+        Global padded-token intervals ``(start, end)`` in packed-stream two-chunk CP
+        order: rank ``r`` owns chunk ``r`` followed by chunk
+        ``2 * cp_size - 1 - r``. For ``cp_size == 1``, returns one full chunk.
+    """
+
+    padded_total_tokens = int(padded_total_tokens)
+    if cp_size < 1 or cp_rank < 0 or cp_rank >= cp_size:
+        raise RuntimeError(f"Invalid CP rank/size: cp_rank={cp_rank}, cp_size={cp_size}.")
+    if cp_size == 1:
+        return ((0, padded_total_tokens),)
+    total_chunks = 2 * cp_size
+    if padded_total_tokens % total_chunks != 0:
+        raise RuntimeError(
+            "DSv4 chunked CP partition expects padded_total_tokens % (2 * cp_size) == 0: "
+            f"padded_total_tokens={padded_total_tokens}, cp_size={cp_size}."
+        )
+    chunk_len = padded_total_tokens // total_chunks
+    chunk_ids = (cp_rank, total_chunks - 1 - cp_rank)
+    return tuple((chunk_id * chunk_len, (chunk_id + 1) * chunk_len) for chunk_id in chunk_ids)
 
 
 def build_cp_local_seq_positions(
@@ -392,7 +773,7 @@ def build_cp_local_rope_positions(
 
     Args:
         packed_seq_params: THD packed sequence metadata. This uses
-            ``cu_seqlens_q_padded`` when present because MCore partitions the
+            ``cu_seqlens_q_padded`` when present because CP partitions the
             padded THD capacity across CP ranks.
         local_tokens: Number of local tensor rows that will receive RoPE.
         cp_size: Number of context-parallel ranks.
@@ -547,6 +928,44 @@ def build_rank_major_compressed_metadata_fused(
         raise RuntimeError("DSv4 CP rank-major metadata requires CUDA tensors and CuTeDSL kernels.")
     return csa_cp_kernels.build_rank_major_compressed_metadata(
         cu_seqlens, cp_size, l_local, ratio, d_comp, c_cap
+    )
+
+
+def build_chunked_rank_major_compressed_metadata_fused(
+    cu_seqlens: torch.Tensor,
+    cp_size: int,
+    chunk_len: int,
+    ratio: int,
+    d_comp: int,
+    c_cap_per_chunk: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build rank-major metadata for packed-stream two-chunk CP rows.
+
+    Rank ``r`` owns global chunks ``r`` and ``2 * cp_size - 1 - r``. The output
+    row order is still rank-major and matches all-gathered local compressed rows:
+    all rows for rank 0's two chunks, then rank 1, and so on.
+    """
+
+    if cp_size <= 1:
+        return build_rank_major_compressed_metadata_fused(
+            cu_seqlens,
+            cp_size,
+            chunk_len,
+            ratio,
+            d_comp,
+            c_cap_per_chunk,
+        )
+    if not csa_cp_kernels.can_use_cute_kernels(cu_seqlens):
+        raise RuntimeError(
+            "DSv4 chunked CP rank-major metadata requires CUDA tensors and CuTeDSL kernels."
+        )
+    return csa_cp_kernels.build_chunked_rank_major_compressed_metadata(
+        cu_seqlens,
+        cp_size,
+        chunk_len,
+        ratio,
+        d_comp,
+        c_cap_per_chunk,
     )
 
 
@@ -834,6 +1253,115 @@ def build_compressor_prep_compact_fused(
         c_cap,
     )
     return hidden_compact, cu_compact, seq_ids_t, comp_ids_t, valid_t, c_cap
+
+
+def build_chunked_compressor_prep_compact_fused(
+    hidden_local: torch.Tensor,
+    boundary_hidden: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    chunk_ranges: Sequence[Tuple[int, int]],
+    ratio: int,
+    d_comp: int,
+    d_window: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
+    """Build compressor compact rows for explicit packed-stream CP chunks.
+
+    Args:
+        hidden_local: Local hidden rows ordered as ``chunk_ranges``.
+        boundary_hidden: One left-boundary window per chunk, concatenated in the
+            same order as ``chunk_ranges``.
+        cu_seqlens: Global padded THD cumulative sequence lengths.
+        chunk_ranges: Global padded-token intervals owned by this rank.
+        ratio / d_comp / d_window: DSv4 compressor layout parameters.
+
+    Returns:
+        ``(hidden_compact, cu_compact, seq_ids, comp_ids, valid, c_cap, c_cap_per_chunk)``.
+        ``c_cap`` is the fixed local compressed capacity for all chunks on this
+        rank, and ``c_cap_per_chunk`` is the per-chunk capacity used by
+        rank-major metadata reconstruction.
+    """
+
+    if not chunk_ranges:
+        raise RuntimeError("DSv4 chunked compressor-prep requires at least one chunk range.")
+    chunk_lengths = [int(end) - int(start) for start, end in chunk_ranges]
+    if any(length <= 0 for length in chunk_lengths):
+        raise RuntimeError(f"DSv4 chunked compressor-prep got invalid chunks: {chunk_ranges}.")
+    if len(set(chunk_lengths)) != 1:
+        raise RuntimeError(
+            "DSv4 chunked compressor-prep expects equal-size chunks: "
+            f"chunk_lengths={chunk_lengths}."
+        )
+    l_local = sum(chunk_lengths)
+    if hidden_local.shape[0] != l_local:
+        raise RuntimeError(
+            "DSv4 chunked compressor-prep expects hidden rows to match chunks: "
+            f"hidden={hidden_local.shape[0]}, chunks={l_local}."
+        )
+    expected_boundary = len(chunk_ranges) * int(d_window)
+    if boundary_hidden.shape[0] != expected_boundary:
+        raise RuntimeError(
+            "DSv4 chunked compressor-prep expects one boundary window per chunk: "
+            f"boundary={boundary_hidden.shape[0]}, expected={expected_boundary}."
+        )
+
+    compact_parts: List[torch.Tensor] = []
+    cu_parts: List[torch.Tensor] = []
+    seq_parts: List[torch.Tensor] = []
+    comp_parts: List[torch.Tensor] = []
+    valid_parts: List[torch.Tensor] = []
+    c_caps: List[int] = []
+    local_offset = 0
+    for chunk_id, ((global_start, _global_end), l_chunk) in enumerate(
+        zip(chunk_ranges, chunk_lengths)
+    ):
+        (
+            hidden_compact,
+            cu_compact,
+            seq_ids,
+            comp_ids,
+            valid,
+            c_cap,
+        ) = build_compressor_prep_compact_fused(
+            hidden_local.narrow(0, local_offset, l_chunk),
+            boundary_hidden.narrow(0, chunk_id * int(d_window), int(d_window)),
+            cu_seqlens,
+            int(global_start),
+            l_chunk,
+            ratio,
+            d_comp,
+            d_window,
+        )
+        compact_parts.append(hidden_compact)
+        cu_parts.append(cu_compact)
+        seq_parts.append(seq_ids)
+        comp_parts.append(comp_ids)
+        valid_parts.append(valid)
+        c_caps.append(c_cap)
+        local_offset += l_chunk
+
+    if len(set(c_caps)) != 1:
+        raise RuntimeError(
+            "DSv4 chunked compressor-prep expects equal fixed capacity per chunk: "
+            f"c_caps={c_caps}."
+        )
+    cu_deltas = torch.stack([cu[1:] - cu[:-1] for cu in cu_parts], dim=0).sum(dim=0)
+    cu_compact = torch.cat(
+        (
+            torch.zeros((1,), dtype=cu_seqlens.dtype, device=cu_seqlens.device),
+            torch.cumsum(cu_deltas, dim=0),
+        )
+    )
+    c_cap_per_chunk = c_caps[0]
+    c_cap = sum(c_caps)
+    return (
+        torch.cat(compact_parts, dim=0),
+        cu_compact,
+        torch.cat(seq_parts, dim=0),
+        torch.cat(comp_parts, dim=0),
+        torch.cat(valid_parts, dim=0),
+        c_cap,
+        c_cap_per_chunk,
+    )
 
 
 def _all_gather_into_tensor(output: torch.Tensor, tensor: torch.Tensor, cp_group) -> None:
@@ -1241,6 +1769,94 @@ def pack_cp_kv_full_fused(
     )
 
 
+def pack_chunked_cp_kv_full_fused(
+    kv_local: torch.Tensor,
+    boundary_kv: torch.Tensor,
+    compressed_rank_major: torch.Tensor,
+    seq_ids_rank_major: torch.Tensor,
+    comp_ids_rank_major: torch.Tensor,
+    valid_rank_major: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    chunk_ranges: Sequence[Tuple[int, int]],
+    d_window: int,
+    ratio: int,
+    rank_major_by_seq_major: Optional[torch.Tensor] = None,
+    cu_seqlens_compressed: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, Tuple[int, ...]]:
+    """Pack chunked local windows into one sparse-attention row space.
+
+    When rank-major compressed metadata is available, the packed layout is
+    ``[chunk0 window, chunk1 window, shared compressed]`` so that compressed KV
+    rows are stored once and all chunk rows can still use one top-k index tensor.
+    Without that metadata this falls back to concatenating one full ``kv_full``
+    layout per chunk.
+    """
+
+    if not chunk_ranges:
+        raise RuntimeError("DSv4 chunked KV pack requires at least one chunk range.")
+    chunk_lengths = [int(end) - int(start) for start, end in chunk_ranges]
+    if any(length <= 0 for length in chunk_lengths):
+        raise RuntimeError(f"DSv4 chunked KV pack got invalid chunks: {chunk_ranges}.")
+    l_local = sum(chunk_lengths)
+    if kv_local.shape[0] != l_local:
+        raise RuntimeError(
+            "DSv4 chunked KV pack expects local KV rows to match chunks: "
+            f"kv_local={kv_local.shape[0]}, chunks={l_local}."
+        )
+    expected_boundary = len(chunk_ranges) * int(d_window)
+    if boundary_kv.shape[0] != expected_boundary:
+        raise RuntimeError(
+            "DSv4 chunked KV pack expects one boundary window per chunk: "
+            f"boundary={boundary_kv.shape[0]}, expected={expected_boundary}."
+        )
+    if (
+        ratio > 1
+        and compressed_rank_major.shape[0] > 0
+        and rank_major_by_seq_major is not None
+        and cu_seqlens_compressed is not None
+    ):
+        return csa_cp_kernels.pack_chunked_shared_kv_full(
+            kv_local,
+            boundary_kv,
+            compressed_rank_major,
+            cu_seqlens,
+            tuple(int(start) for start, _end in chunk_ranges),
+            chunk_lengths[0],
+            d_window,
+        )[:2]
+
+    outputs: List[torch.Tensor] = []
+    offsets: List[int] = []
+    local_offset = 0
+    kv_offset = 0
+    for chunk_id, ((global_start, _global_end), l_chunk) in enumerate(
+        zip(chunk_ranges, chunk_lengths)
+    ):
+        offsets.append(kv_offset)
+        kv_chunk = pack_cp_kv_full_fused(
+            kv_local.narrow(0, local_offset, l_chunk),
+            boundary_kv.narrow(0, chunk_id * int(d_window), int(d_window)),
+            compressed_rank_major,
+            seq_ids_rank_major,
+            comp_ids_rank_major,
+            valid_rank_major,
+            cu_seqlens,
+            int(global_start),
+            l_chunk,
+            d_window,
+            ratio,
+            rank_major_by_seq_major=rank_major_by_seq_major,
+            cu_seqlens_compressed=cu_seqlens_compressed,
+        )
+        outputs.append(kv_chunk)
+        local_offset += l_chunk
+        kv_offset += kv_chunk.shape[0]
+
+    if len(outputs) == 1:
+        return outputs[0], tuple(offsets)
+    return torch.cat(outputs, dim=0), tuple(offsets)
+
+
 def repack_rank_major_compressed_to_seq_major(
     compressed_rank_major: torch.Tensor,
     seq_ids_rank_major: torch.Tensor,
@@ -1532,6 +2148,118 @@ def build_cp_indexer_topk_inputs_fused(
     )
 
 
+def compute_chunked_cp_indexer_topk_logical_fused(
+    q_indexer_local: torch.Tensor,
+    weights_indexer_local: torch.Tensor,
+    k_indexer_seq_major: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_compressed: torch.Tensor,
+    chunk_ranges: Sequence[Tuple[int, int]],
+    ratio: int,
+    topk_width: int,
+    indexer_softmax_scale: float,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_kv: Optional[int] = None,
+) -> torch.Tensor:
+    """Run THD CP indexer top-k on each contiguous local chunk.
+
+    Packed-stream two-chunk CP gives one rank rows from two global token intervals. The
+    current cuDNN indexer forward/top-k kernel builds its causal/trapezoid mask
+    from ``cu_seqlens_q`` and ``cu_seqlens_kv`` and therefore must see one
+    contiguous global interval per call.  Sparse attention does not have this
+    restriction because it consumes explicit ``topk_idxs``; this helper only
+    splits indexer top-k and returns rows concatenated in local chunk order.
+    """
+
+    topk_width = int(topk_width)
+    if topk_width < 0:
+        raise RuntimeError(f"DSv4 CP chunked indexer top-k got negative width: {topk_width}.")
+    if ratio <= 1:
+        raise RuntimeError(f"DSv4 CP chunked indexer top-k expects ratio > 1, got {ratio}.")
+    if not chunk_ranges:
+        raise RuntimeError("DSv4 CP chunked indexer top-k requires at least one chunk range.")
+
+    chunk_lengths = [int(end) - int(start) for start, end in chunk_ranges]
+    if any(length <= 0 for length in chunk_lengths):
+        raise RuntimeError(f"DSv4 CP chunked indexer top-k got invalid chunks: {chunk_ranges}.")
+    l_local = sum(chunk_lengths)
+    if q_indexer_local.shape[0] != l_local:
+        raise RuntimeError(
+            "DSv4 CP chunked indexer top-k expects q_indexer_local rows to match chunks: "
+            f"q={q_indexer_local.shape[0]}, chunks={l_local}."
+        )
+    if weights_indexer_local.shape[0] != l_local:
+        raise RuntimeError(
+            "DSv4 CP chunked indexer top-k expects weights rows to match chunks: "
+            f"weights={weights_indexer_local.shape[0]}, chunks={l_local}."
+        )
+    if not csa_cp_kernels.can_use_cute_kernels(
+        q_indexer_local,
+        weights_indexer_local,
+        k_indexer_seq_major,
+        cu_seqlens_q,
+        cu_seqlens_compressed,
+    ):
+        raise RuntimeError("DSv4 CP chunked indexer top-k requires CUDA tensors and CuTeDSL.")
+
+    if topk_width == 0 or k_indexer_seq_major.shape[0] == 0:
+        return torch.empty((l_local, 0), dtype=torch.int32, device=q_indexer_local.device)
+
+    chunk_outputs: List[torch.Tensor] = []
+    local_offset = 0
+    for (global_start, _global_end), l_chunk in zip(chunk_ranges, chunk_lengths):
+        q_chunk = q_indexer_local.narrow(0, local_offset, l_chunk)
+        weights_chunk = weights_indexer_local.narrow(0, local_offset, l_chunk)
+        (
+            q_for_topk,
+            k_for_topk,
+            weights_for_topk,
+            cu_q_topk,
+            cu_k_topk,
+            max_q_topk,
+            max_k_topk,
+            seq_lens_topk,
+        ) = build_cp_indexer_topk_inputs_fused(
+            q_chunk,
+            weights_chunk,
+            k_indexer_seq_major,
+            cu_seqlens_q,
+            cu_seqlens_compressed,
+            int(global_start),
+            l_chunk,
+            ratio,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_kv=max_seqlen_kv,
+        )
+        topk_compute_width = min(topk_width, max_k_topk)
+        if topk_compute_width <= 0:
+            topk_chunk = torch.empty((l_chunk, 0), dtype=torch.int32, device=q_indexer_local.device)
+        else:
+            topk_chunk, _ = indexer_topk(
+                q_for_topk,
+                k_for_topk,
+                weights_for_topk,
+                topk=topk_compute_width,
+                ratio=ratio,
+                indexer_softmax_scale=indexer_softmax_scale,
+                cu_seqlens_q=cu_q_topk,
+                cu_seqlens_kv=cu_k_topk,
+                max_seqlen_q=max_q_topk,
+                max_seqlen_kv=max_k_topk,
+                fixed_topk_width=topk_width,
+                compute_topk_length=False,
+                precomputed_seq_lens=seq_lens_topk,
+            )
+        if topk_chunk.shape[-1] < topk_width:
+            topk_chunk = pad_indexer_topk_to_fixed_width_fused(topk_chunk, topk_width)
+        chunk_outputs.append(topk_chunk)
+        local_offset += l_chunk
+
+    if len(chunk_outputs) == 1:
+        return chunk_outputs[0]
+    return torch.cat(chunk_outputs, dim=0)
+
+
 def pad_indexer_topk_to_fixed_width_fused(
     topk_indices: torch.Tensor,
     fixed_width: int,
@@ -1672,6 +2400,106 @@ def build_cp_flat_idxs_fused(
     )
 
 
+def _offset_valid_topk_idxs(topk_idxs: torch.Tensor, kv_offset: int) -> torch.Tensor:
+    if kv_offset == 0:
+        return topk_idxs
+    return torch.where(topk_idxs >= 0, topk_idxs + int(kv_offset), topk_idxs)
+
+
+def build_chunked_cp_flat_idxs_fused(
+    cu_seqlens: torch.Tensor,
+    chunk_ranges: Sequence[Tuple[int, int]],
+    kv_full_offsets: Sequence[int],
+    d_window: int,
+    window_size: int,
+    ratio: int,
+    indexer_topk_compressed_logical_ids: Optional[torch.Tensor] = None,
+    max_n_compressed: int = 0,
+    rank_major_by_seq_major: Optional[torch.Tensor] = None,
+    cu_seqlens_compressed: Optional[torch.Tensor] = None,
+    shared_compressed_base: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Build sparse-attention ids for a concatenated chunked ``kv_full`` row space."""
+
+    if len(chunk_ranges) != len(kv_full_offsets):
+        raise RuntimeError(
+            "DSv4 chunked final idx expects one KV offset per chunk: "
+            f"chunks={len(chunk_ranges)}, offsets={len(kv_full_offsets)}."
+        )
+    chunk_lengths = [int(end) - int(start) for start, end in chunk_ranges]
+    if any(length <= 0 for length in chunk_lengths):
+        raise RuntimeError(f"DSv4 chunked final idx got invalid chunks: {chunk_ranges}.")
+    l_local = sum(chunk_lengths)
+    if (
+        indexer_topk_compressed_logical_ids is not None
+        and indexer_topk_compressed_logical_ids.shape[0] != l_local
+    ):
+        raise RuntimeError(
+            "DSv4 chunked final idx expects indexer rows to match chunks: "
+            f"indexer={indexer_topk_compressed_logical_ids.shape[0]}, chunks={l_local}."
+        )
+    if (
+        ratio > 1
+        and shared_compressed_base is not None
+        and rank_major_by_seq_major is not None
+        and cu_seqlens_compressed is not None
+    ):
+        if len(set(chunk_lengths)) != 1:
+            raise RuntimeError(
+                "DSv4 shared-compressed chunked final idx expects equal-size chunks: "
+                f"chunk_lengths={chunk_lengths}."
+            )
+        window_capacity = int(shared_compressed_base) // len(chunk_ranges)
+        compressed_width = (
+            int(indexer_topk_compressed_logical_ids.shape[-1])
+            if indexer_topk_compressed_logical_ids is not None
+            else int(max_n_compressed)
+        )
+        return csa_cp_kernels.build_chunked_shared_final_idxs(
+            cu_seqlens,
+            cu_seqlens_compressed,
+            rank_major_by_seq_major,
+            tuple(int(start) for start, _end in chunk_ranges),
+            chunk_lengths[0],
+            window_capacity,
+            int(shared_compressed_base),
+            d_window,
+            window_size,
+            ratio,
+            compressed_width,
+            indexer_topk_compressed_logical_ids,
+        )
+
+    topk_chunks: List[torch.Tensor] = []
+    length_chunks: List[torch.Tensor] = []
+    local_offset = 0
+    for (global_start, _global_end), l_chunk, kv_offset in zip(
+        chunk_ranges, chunk_lengths, kv_full_offsets
+    ):
+        indexer_chunk = (
+            None
+            if indexer_topk_compressed_logical_ids is None
+            else indexer_topk_compressed_logical_ids.narrow(0, local_offset, l_chunk)
+        )
+        topk_chunk, length_chunk = build_cp_flat_idxs_fused(
+            cu_seqlens,
+            int(global_start),
+            l_chunk,
+            d_window,
+            window_size,
+            ratio,
+            indexer_chunk,
+            max_n_compressed=max_n_compressed,
+        )
+        topk_chunks.append(_offset_valid_topk_idxs(topk_chunk, int(kv_offset)))
+        length_chunks.append(length_chunk)
+        local_offset += l_chunk
+
+    if len(topk_chunks) == 1:
+        return topk_chunks[0], length_chunks[0]
+    return torch.cat(topk_chunks, dim=0), torch.cat(length_chunks, dim=0)
+
+
 def build_cp_flat_idxs_for_indexer_loss(
     cu_seqlens: torch.Tensor,
     global_start: int,
@@ -1757,3 +2585,78 @@ def build_cp_flat_idxs_for_indexer_loss_fused(
         indexer_topk_compressed_logical_ids,
         indexer_rank_by_seq_major,
     )
+
+
+def build_chunked_cp_flat_idxs_for_indexer_loss_fused(
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_compressed: torch.Tensor,
+    chunk_ranges: Sequence[Tuple[int, int]],
+    kv_full_offsets: Sequence[int],
+    d_window: int,
+    window_size: int,
+    ratio: int,
+    indexer_topk_compressed_logical_ids: torch.Tensor,
+    indexer_rank_by_seq_major: torch.Tensor,
+    shared_compressed_base: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Build Path-B ids for one sparse-attention call over chunked local rows."""
+
+    if len(chunk_ranges) != len(kv_full_offsets):
+        raise RuntimeError(
+            "DSv4 chunked indexer-loss idx expects one KV offset per chunk: "
+            f"chunks={len(chunk_ranges)}, offsets={len(kv_full_offsets)}."
+        )
+    chunk_lengths = [int(end) - int(start) for start, end in chunk_ranges]
+    if any(length <= 0 for length in chunk_lengths):
+        raise RuntimeError(f"DSv4 chunked indexer-loss idx got invalid chunks: {chunk_ranges}.")
+    l_local = sum(chunk_lengths)
+    if indexer_topk_compressed_logical_ids.shape[0] != l_local:
+        raise RuntimeError(
+            "DSv4 chunked indexer-loss idx expects indexer rows to match chunks: "
+            f"indexer={indexer_topk_compressed_logical_ids.shape[0]}, chunks={l_local}."
+        )
+    if shared_compressed_base is not None:
+        if len(set(chunk_lengths)) != 1:
+            raise RuntimeError(
+                "DSv4 shared-compressed chunked indexer-loss idx expects equal-size chunks: "
+                f"chunk_lengths={chunk_lengths}."
+            )
+        window_capacity = int(shared_compressed_base) // len(chunk_ranges)
+        return csa_cp_kernels.build_chunked_shared_indexer_loss_final_idxs(
+            cu_seqlens,
+            cu_seqlens_compressed,
+            indexer_topk_compressed_logical_ids,
+            indexer_rank_by_seq_major,
+            tuple(int(start) for start, _end in chunk_ranges),
+            chunk_lengths[0],
+            window_capacity,
+            int(shared_compressed_base),
+            d_window,
+            window_size,
+            ratio,
+        )
+
+    topk_chunks: List[torch.Tensor] = []
+    rank_major_chunks: List[torch.Tensor] = []
+    local_offset = 0
+    for (global_start, _global_end), l_chunk, kv_offset in zip(
+        chunk_ranges, chunk_lengths, kv_full_offsets
+    ):
+        topk_chunk, rank_major_chunk = build_cp_flat_idxs_for_indexer_loss_fused(
+            cu_seqlens,
+            cu_seqlens_compressed,
+            int(global_start),
+            l_chunk,
+            d_window,
+            window_size,
+            ratio,
+            indexer_topk_compressed_logical_ids.narrow(0, local_offset, l_chunk),
+            indexer_rank_by_seq_major,
+        )
+        topk_chunks.append(_offset_valid_topk_idxs(topk_chunk, int(kv_offset)))
+        rank_major_chunks.append(rank_major_chunk)
+        local_offset += l_chunk
+
+    if len(topk_chunks) == 1:
+        return topk_chunks[0], rank_major_chunks[0]
+    return torch.cat(topk_chunks, dim=0), torch.cat(rank_major_chunks, dim=0)

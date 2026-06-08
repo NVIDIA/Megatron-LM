@@ -17,8 +17,23 @@ from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.experimental_attention_variant.csa import (
+    SINGLE_RANK_CP_GROUP,
+    unfused_precomputed_indexer_sparse_attn,
+)
+from megatron.core.transformer.experimental_attention_variant.dsa_kernels import indexer_topk
 from megatron.core.transformer.experimental_attention_variant.csa_cp_utils import (
+    DSV4_CP_PARTITION_CONTIGUOUS,
+    DSV4_CP_PARTITION_PACKED_STREAM_TWO_CHUNK,
+    all_gather_fixed_cp_tensor,
+    build_chunked_compressor_prep_compact_fused,
+    build_chunked_cp_flat_idxs_for_indexer_loss_fused,
+    build_chunked_rank_major_compressed_metadata_fused,
+    build_global_compressed_cu_seqlens_fused,
+    chunked_cp_partition,
+    compute_chunked_cp_indexer_topk_logical_fused,
     exchange_left_boundary_tensor,
+    repack_rank_major_compressed_to_seq_major_fused,
 )
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from tests.unit_tests.transformer.experimental_attention_variant.test_dsv4_hybrid_native_parity import (
@@ -967,7 +982,9 @@ class TestDSv4HybridAttentionThd:
 _DSV4_CP_PARITY_EPS = 1e-3
 _DSV4_CP_GRAPH_FUSED_SIM_EPS = 1e-6
 _DSV4_CP_GRAPH_FUSED_RTOL = 1e-6
-_DSV4_CP_GRAPH_FUSED_BF16_ATOL = 5e-1
+# Fused BF16 backward uses atomic accumulation; graph/eager order can differ by
+# one BF16-sized absolute step while preserving strict vector similarity.
+_DSV4_CP_GRAPH_FUSED_BF16_ATOL = 1.0
 _DSV4_CP_GRAPH_FUSED_FP32_ATOL = 1e-2
 _DSV4_CP_TEST_VARIANT = "flash"
 # Padded total is 4096, divisible by CP2/CP4. Only the final segment has tail
@@ -1012,13 +1029,19 @@ def _assert_cp_tensor_match(actual: torch.Tensor, expected: torch.Tensor, label:
     max_abs = diff.max().item() if diff.numel() else 0.0
     cosine_sim = _cosine_sim(actual, expected)
     tensor_sim = _tensor_sim(actual, expected)
+    actual_norm = actual.double().norm().item()
+    expected_norm = expected.double().norm().item()
     assert cosine_sim > 1 - _DSV4_CP_PARITY_EPS, (
         f"{label}: cosine_sim={cosine_sim:.10f}, "
-        f"max_abs={max_abs:.6e}, eps={_DSV4_CP_PARITY_EPS}"
+        f"tensor_sim={tensor_sim:.10f}, max_abs={max_abs:.6e}, "
+        f"actual_norm={actual_norm:.6e}, expected_norm={expected_norm:.6e}, "
+        f"eps={_DSV4_CP_PARITY_EPS}"
     )
     assert tensor_sim > 1 - _DSV4_CP_PARITY_EPS, (
         f"{label}: tensor_sim={tensor_sim:.10f}, "
-        f"max_abs={max_abs:.6e}, eps={_DSV4_CP_PARITY_EPS}"
+        f"cosine_sim={cosine_sim:.10f}, max_abs={max_abs:.6e}, "
+        f"actual_norm={actual_norm:.6e}, expected_norm={expected_norm:.6e}, "
+        f"eps={_DSV4_CP_PARITY_EPS}"
     )
 
 
@@ -1028,15 +1051,6 @@ def _assert_cp_graph_match(actual: torch.Tensor, expected: torch.Tensor, label: 
     )
     if torch.equal(actual, expected):
         return
-    diff = (actual - expected).abs()
-    max_abs = diff.max().item() if diff.numel() else 0.0
-    cosine_sim = _cosine_sim(actual, expected)
-    tensor_sim = _tensor_sim(actual, expected)
-    _cp_debug_trace(
-        f"{label}: graph/eager not bitwise equal; "
-        f"max_abs={max_abs:.6e} cosine_sim={cosine_sim:.10f} "
-        f"tensor_sim={tensor_sim:.10f}"
-    )
     _assert_cp_tensor_match(actual, expected, label)
 
 
@@ -1117,6 +1131,7 @@ def _make_dsv4_cp_config(
     dsa_indexer_use_sparse_loss=True,
     apply_dsa_kernel_fusion=True,
     apply_rope_fusion=False,
+    dsv4_cp_partition_mode=DSV4_CP_PARTITION_CONTIGUOUS,
 ):
     shape = _DSV4_VARIANTS[_DSV4_CP_TEST_VARIANT]
     return _make_config(
@@ -1144,14 +1159,8 @@ def _make_dsv4_cp_config(
         expert_model_parallel_size=1,
         apply_dsa_kernel_fusion=apply_dsa_kernel_fusion,
         apply_rope_fusion=apply_rope_fusion,
+        dsv4_cp_partition_mode=dsv4_cp_partition_mode,
     )
-
-
-def _cp_debug_trace(message: str) -> None:
-    if not os.environ.get("DSV4_CP_DEBUG_TRACE"):
-        return
-    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else "?"
-    print(f"[dsv4-cp-test rank={rank}] {message}", flush=True)
 
 
 class _SingleRankCPGroup:
@@ -1185,6 +1194,20 @@ def _make_contiguous_cp_partition_indices(padded_total_tokens, cp_size, device='
     )
 
 
+def _make_chunked_cp_partition_indices(padded_total_tokens, cp_size, device='cuda'):
+    assert padded_total_tokens % (2 * cp_size) == 0
+    return tuple(
+        torch.cat(
+            [
+                torch.arange(start, end, device=device, dtype=torch.long)
+                for start, end in chunked_cp_partition(padded_total_tokens, cp_size, rank)
+            ],
+            dim=0,
+        )
+        for rank in range(cp_size)
+    )
+
+
 def _run_dsv4_attention_forward_backward(
     attn, hidden, grad, packed_seq_params, *, collect_result=True
 ):
@@ -1203,7 +1226,6 @@ def _run_dsv4_attention_forward_backward(
 
 
 def _capture_dsv4_attention_forward_backward(attn, static_hidden, static_grad, packed_seq_params):
-    _cp_debug_trace("cuda graph warmup start")
     warmup_stream = torch.cuda.Stream()
     warmup_stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(warmup_stream):
@@ -1212,13 +1234,11 @@ def _capture_dsv4_attention_forward_backward(attn, static_hidden, static_grad, p
                 attn, static_hidden, static_grad, packed_seq_params, collect_result=False
             )
     torch.cuda.current_stream().wait_stream(warmup_stream)
-    _cp_debug_trace("cuda graph warmup done")
 
     static_hidden.grad = None
     attn.zero_grad(set_to_none=True)
 
     graph = torch.cuda.CUDAGraph()
-    _cp_debug_trace("cuda graph capture start")
     with torch.cuda.graph(graph, capture_error_mode="thread_local"):
         graph_output, _ = attn(
             hidden_states=static_hidden,
@@ -1226,7 +1246,6 @@ def _capture_dsv4_attention_forward_backward(attn, static_hidden, static_grad, p
             packed_seq_params=packed_seq_params,
         )
         graph_output.backward(static_grad)
-    _cp_debug_trace("cuda graph capture done")
     return graph, graph_output
 
 
@@ -1261,6 +1280,61 @@ class TestDSv4HybridAttentionTHDCP:
 
         yield
         Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize(
+        "partition_mode, uses_two_chunk",
+        [
+            (DSV4_CP_PARTITION_CONTIGUOUS, False),
+            (DSV4_CP_PARTITION_PACKED_STREAM_TWO_CHUNK, True),
+        ],
+        ids=["contiguous", "packed_stream_two_chunk"],
+    )
+    def test_thd_cp_partition_mode_selects_expected_row_order(
+        self, partition_mode, uses_two_chunk
+    ):
+        """DSv4 CP partition mode controls the attention-layer row order.
+
+        Expected: ``contiguous`` keeps the original one-range CP partition,
+        while ``packed_stream_two_chunk`` makes this rank own chunk ``rank`` and
+        chunk ``2*cp_size-1-rank``. A failure here means the config knob could
+        drift from the layout helpers even if lower-level utility tests pass.
+        """
+        config = _make_dsv4_cp_config(
+            context_parallel_size=self.cp_size,
+            dsv4_cp_partition_mode=partition_mode,
+        )
+        attn = _build_attention(config, layer_number=1, pg_collection=self.pg).cuda()
+
+        assert attn._use_packed_stream_two_chunk_cp_partition() == uses_two_chunk
+        if uses_two_chunk:
+            l_local = 16
+            assert attn._packed_stream_two_chunk_cp_ranges(l_local) == chunked_cp_partition(
+                l_local * self.cp_size, self.cp_size, self.cp_rank
+            )
+
+        del attn
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def test_thd_cp_partition_mode_rejects_unknown_value(self):
+        """Unknown DSv4 CP partition modes fail before a forward pass.
+
+        Expected: the attention layer rejects stale values such as the old
+        chunked bool spelling instead of silently falling back to contiguous
+        mode. A failure here could hide a misconfigured benchmark or test.
+        """
+        config = _make_dsv4_cp_config(
+            context_parallel_size=self.cp_size,
+            dsv4_cp_partition_mode="chunked",
+        )
+        attn = _build_attention(config, layer_number=1, pg_collection=self.pg).cuda()
+
+        with pytest.raises(RuntimeError, match="Unsupported DSv4 CP partition mode"):
+            attn._use_packed_stream_two_chunk_cp_partition()
+
+        del attn
+        gc.collect()
+        torch.cuda.empty_cache()
 
     def test_left_boundary_exchange_forward_backward(self):
         """CP boundary exchange receives the previous rank's tail window.
@@ -1324,10 +1398,6 @@ class TestDSv4HybridAttentionTHDCP:
         """
         seg_lens = _DSV4_CP_RAGGED_SEG_LENS
         padded_seg_lens = _DSV4_CP_RAGGED_PADDED_SEG_LENS
-        _cp_debug_trace(
-            f"test start layer={layer_number} seg_lens={seg_lens} "
-            f"padded_seg_lens={padded_seg_lens}"
-        )
         padded_tokens = sum(padded_seg_lens)
         packed = _make_thd_packed_seq_params(seg_lens, padded_seg_lens)
         partition_indices = _make_contiguous_cp_partition_indices(padded_tokens, self.cp_size)
@@ -1360,16 +1430,12 @@ class TestDSv4HybridAttentionTHDCP:
         local_hidden = full_hidden.index_select(0, local_idx).detach().clone().requires_grad_(True)
         ref_hidden = full_hidden.detach().clone().requires_grad_(True)
 
-        _cp_debug_trace("cp forward start")
         local_out, _ = cp_attn(
             hidden_states=local_hidden, attention_mask=None, packed_seq_params=packed
         )
-        _cp_debug_trace("cp forward done")
-        _cp_debug_trace("reference forward start")
         ref_out, _ = ref_attn(
             hidden_states=ref_hidden, attention_mask=None, packed_seq_params=packed
         )
-        _cp_debug_trace("reference forward done")
         _assert_cp_tensor_match(
             local_out.detach(),
             ref_out.detach().index_select(0, local_idx),
@@ -1377,12 +1443,8 @@ class TestDSv4HybridAttentionTHDCP:
         )
 
         grad = torch.randn_like(ref_out)
-        _cp_debug_trace("cp backward start")
         local_out.backward(grad.index_select(0, local_idx))
-        _cp_debug_trace("cp backward done")
-        _cp_debug_trace("reference backward start")
         ref_out.backward(grad)
-        _cp_debug_trace("reference backward done")
         _assert_cp_tensor_match(
             local_hidden.grad.detach(),
             ref_hidden.grad.index_select(0, local_idx),
@@ -1395,10 +1457,391 @@ class TestDSv4HybridAttentionTHDCP:
             assert param.grad is not None, f"Missing CP grad for {name}"
             assert ref_grad is not None, f"Missing reference grad for {name}"
             grad_sum = param.grad.detach().clone()
-            _cp_debug_trace(f"param grad all_reduce start {name}")
             dist.all_reduce(grad_sum, group=self.pg.cp)
-            _cp_debug_trace(f"param grad all_reduce done {name}")
             _assert_cp_tensor_match(grad_sum, ref_grad, f"layer={layer_number}:param_grad:{name}")
+
+        del cp_attn, ref_attn, full_hidden, local_hidden, ref_hidden, local_out, ref_out, grad
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def test_thd_chunked_cp_indexer_inputs_match_full_reference(self):
+        """Chunked CP indexer Q/weights and compressed K match full THD reference."""
+        seg_lens = _DSV4_CP_RAGGED_SEG_LENS
+        padded_seg_lens = _DSV4_CP_RAGGED_PADDED_SEG_LENS
+        padded_tokens = sum(padded_seg_lens)
+        packed = _make_thd_packed_seq_params(seg_lens, padded_seg_lens)
+        partition_indices = _make_chunked_cp_partition_indices(padded_tokens, self.cp_size)
+        local_idx = partition_indices[self.cp_rank]
+
+        torch.manual_seed(_SEED + 400)
+        model_parallel_cuda_manual_seed(_SEED + 400)
+        config_cp = _make_dsv4_cp_config(
+            context_parallel_size=self.cp_size,
+            dsa_indexer_loss_coeff=1.0,
+            dsa_indexer_use_sparse_loss=True,
+            apply_rope_fusion=True,
+            dsv4_cp_partition_mode=DSV4_CP_PARTITION_PACKED_STREAM_TWO_CHUNK,
+        )
+        config_ref = _make_dsv4_cp_config(
+            context_parallel_size=1,
+            dsa_indexer_loss_coeff=1.0,
+            dsa_indexer_use_sparse_loss=True,
+        )
+        cp_attn = _build_attention(config_cp, layer_number=2, pg_collection=self.pg).cuda()
+        ref_attn = _build_attention(config_ref, layer_number=2, pg_collection=self.ref_pg).cuda()
+        _copy_module_parameters(cp_attn, ref_attn)
+
+        full_hidden = torch.randn(
+            padded_tokens, 1, config_cp.hidden_size, dtype=torch.bfloat16, device='cuda'
+        )
+        local_hidden = full_hidden.index_select(0, local_idx).detach().clone()
+        ref_hidden = full_hidden.detach().clone()
+
+        query_local, _, _, qr_local, _ = cp_attn.get_query_key_value_tensors(
+            local_hidden, packed_seq_params=packed
+        )
+        query_ref, _, _, qr_ref, _ = ref_attn.get_query_key_value_tensors(
+            ref_hidden, packed_seq_params=packed
+        )
+
+        core_cp = cp_attn.core_attention
+        core_ref = ref_attn.core_attention
+        cu_seqlens = packed.cu_seqlens_q_padded
+        chunk_ranges = chunked_cp_partition(padded_tokens, self.cp_size, self.cp_rank)
+        chunk_len = chunk_ranges[0][1] - chunk_ranges[0][0]
+        d_window = cp_attn._dsv4_cp_boundary_window()
+        d_comp = 8
+        ratio = 4
+
+        q_local, weights_local = core_cp.indexer._forward_thd_query_weights_cp(
+            local_hidden.detach(),
+            qr_local.detach(),
+            cu_seqlens,
+            self.cp_rank,
+            self.cp_size,
+            local_hidden.shape[0],
+            int(packed.max_seqlen_q),
+            chunk_ranges=chunk_ranges,
+        )
+        q_ref, k_ref, weights_ref, cu_ref = core_ref.indexer.forward_before_topk(
+            ref_hidden.detach(), qr_ref.detach(), packed
+        )
+        _assert_cp_tensor_match(
+            q_local.detach(),
+            q_ref.squeeze(1).detach().index_select(0, local_idx),
+            "chunked-indexer:q",
+        )
+        _assert_cp_tensor_match(
+            weights_local.detach(),
+            weights_ref.squeeze(1).detach().index_select(0, local_idx),
+            "chunked-indexer:weights",
+        )
+
+        boundary_hidden = cp_attn._exchange_cp_boundary_hidden(local_hidden, d_window)
+        (
+            hidden_compact,
+            cu_compact,
+            _seq_ids_local,
+            comp_ids_local,
+            _valid_local,
+            c_cap,
+            c_cap_per_chunk,
+        ) = build_chunked_compressor_prep_compact_fused(
+            local_hidden,
+            boundary_hidden,
+            cu_seqlens,
+            chunk_ranges,
+            ratio,
+            d_comp,
+            d_window,
+        )
+        k_local, _ = core_cp.indexer.compressor._forward_thd(
+            hidden_compact.detach(),
+            cu_compact,
+            max_seqlen_q=int(packed.max_seqlen_q),
+            cp_group=SINGLE_RANK_CP_GROUP,
+            rope_positions=comp_ids_local,
+            fixed_total_comp=c_cap,
+            pre_grouped_compact_input=True,
+        )
+        k_rank_major = all_gather_fixed_cp_tensor(k_local.squeeze(1), self.pg.cp)
+        seq_ids, comp_ids, valid = build_chunked_rank_major_compressed_metadata_fused(
+            cu_seqlens,
+            self.cp_size,
+            chunk_len,
+            ratio,
+            d_comp,
+            c_cap_per_chunk,
+        )
+        cu_compressed = build_global_compressed_cu_seqlens_fused(cu_seqlens, ratio)
+        k_seq_major, _rank_by_seq_major = repack_rank_major_compressed_to_seq_major_fused(
+            k_rank_major,
+            seq_ids,
+            comp_ids,
+            valid,
+            cu_compressed,
+            output_capacity=(padded_tokens // ratio),
+        )
+        actual_comp = int(cu_ref[-1].item())
+        _assert_cp_tensor_match(
+            k_seq_major[:actual_comp].detach(),
+            k_ref.squeeze(1).detach()[:actual_comp],
+            "chunked-indexer:k_seq_major",
+        )
+
+        topk_width = core_cp.indexer.index_topk
+        max_seqlen_compressed_idx = int(packed.max_seqlen_q) // ratio
+        cp_topk = compute_chunked_cp_indexer_topk_logical_fused(
+            q_local,
+            weights_local,
+            k_seq_major,
+            cu_seqlens,
+            cu_compressed,
+            chunk_ranges,
+            ratio,
+            topk_width,
+            core_cp.indexer.softmax_scale,
+            max_seqlen_q=int(packed.max_seqlen_q),
+            max_seqlen_kv=max_seqlen_compressed_idx,
+        )
+        ref_topk, _ = indexer_topk(
+            q_ref.squeeze(1),
+            k_ref.squeeze(1),
+            weights_ref.squeeze(1),
+            topk=min(topk_width, max_seqlen_compressed_idx),
+            ratio=ratio,
+            indexer_softmax_scale=core_ref.indexer.softmax_scale,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_ref,
+            max_seqlen_q=int(packed.max_seqlen_q),
+            max_seqlen_kv=max_seqlen_compressed_idx,
+            fixed_topk_width=topk_width,
+            compute_topk_length=False,
+        )
+        ref_topk_local = ref_topk.index_select(0, local_idx)
+        assert torch.equal(cp_topk.cpu(), ref_topk_local.cpu()), (
+            "chunked-indexer:topk logical mismatch: "
+            f"num_diff={(cp_topk != ref_topk_local).sum().item()}"
+        )
+        _loss_topk, cp_rank_major_topk = build_chunked_cp_flat_idxs_for_indexer_loss_fused(
+            cu_seqlens,
+            cu_compressed,
+            chunk_ranges,
+            tuple(0 for _ in chunk_ranges),
+            d_window,
+            core_cp.window_size,
+            ratio,
+            cp_topk,
+            _rank_by_seq_major,
+        )
+        row_seq = torch.searchsorted(cu_seqlens, local_idx.to(cu_seqlens.dtype), right=True) - 1
+        row_seq = row_seq.clamp(min=0, max=cu_seqlens.numel() - 2)
+        seq_comp_start = cu_compressed.index_select(0, row_seq).unsqueeze(1)
+        safe_topk = ref_topk_local.clamp(min=0).to(torch.long)
+        safe_seq_major = (seq_comp_start.to(torch.long) + safe_topk).reshape(-1)
+        expected_rank_major = _rank_by_seq_major.index_select(0, safe_seq_major).reshape_as(
+            ref_topk_local
+        )
+        expected_rank_major = torch.where(
+            ref_topk_local >= 0,
+            expected_rank_major,
+            torch.full_like(expected_rank_major, -1),
+        )
+        assert torch.equal(cp_rank_major_topk.cpu(), expected_rank_major.cpu()), (
+            "chunked-indexer:rank-major topk mismatch: "
+            f"num_diff={(cp_rank_major_topk != expected_rank_major).sum().item()}"
+        )
+
+        attn_compressed_local, _ = core_cp.compressor._forward_thd(
+            hidden_compact.detach(),
+            cu_compact,
+            max_seqlen_q=int(packed.max_seqlen_q),
+            cp_group=SINGLE_RANK_CP_GROUP,
+            rope_positions=comp_ids_local,
+            fixed_total_comp=c_cap,
+            pre_grouped_compact_input=True,
+        )
+        attn_compressed_rank_major = all_gather_fixed_cp_tensor(
+            attn_compressed_local.squeeze(1), self.pg.cp
+        )
+        attn_compressed_ref, _ = core_ref.compressor(
+            ref_hidden.detach(), packed_seq_params=packed
+        )
+
+        dummy_topk_local = torch.full(
+            (local_hidden.shape[0], 1), -1, dtype=torch.int32, device='cuda'
+        )
+        dummy_topk_ref = torch.full((padded_tokens, 1), -1, dtype=torch.int32, device='cuda')
+        dummy_kv_local = query_local.new_zeros((1, query_local.shape[-1]))
+        dummy_kv_ref = query_ref.new_zeros((1, query_ref.shape[-1]))
+
+        k_cp_for_loss = k_rank_major.detach().clone().requires_grad_(True)
+        _out_cp, cp_loss = unfused_precomputed_indexer_sparse_attn(
+            query_local.detach(),
+            dummy_kv_local,
+            core_cp.attn_sink.float().detach(),
+            dummy_topk_local,
+            q_local.detach(),
+            k_cp_for_loss,
+            weights_local.detach(),
+            cp_rank_major_topk.int(),
+            attn_compressed_rank_major.detach(),
+            core_cp.softmax_scale,
+            core_cp.indexer.softmax_scale,
+            1.0,
+            False,
+            padded_tokens,
+        )
+
+        global_rows = torch.arange(padded_tokens, dtype=cu_seqlens.dtype, device='cuda')
+        ref_row_seq = torch.searchsorted(cu_seqlens, global_rows, right=True) - 1
+        ref_row_seq = ref_row_seq.clamp(min=0, max=cu_seqlens.numel() - 2)
+        ref_seq_major_topk = cu_ref.index_select(0, ref_row_seq).unsqueeze(1).to(
+            torch.long
+        ) + ref_topk.clamp(min=0).to(torch.long)
+        ref_seq_major_topk = torch.where(
+            ref_topk >= 0,
+            ref_seq_major_topk,
+            torch.full_like(ref_seq_major_topk, -1),
+        )
+        k_ref_for_loss = k_ref.squeeze(1).detach().clone().requires_grad_(True)
+        _out_ref, ref_loss = unfused_precomputed_indexer_sparse_attn(
+            query_ref.detach(),
+            dummy_kv_ref,
+            core_ref.attn_sink.float().detach(),
+            dummy_topk_ref,
+            q_ref.squeeze(1).detach(),
+            k_ref_for_loss,
+            weights_ref.squeeze(1).detach(),
+            ref_seq_major_topk.int(),
+            attn_compressed_ref.squeeze(1).detach(),
+            core_ref.softmax_scale,
+            core_ref.indexer.softmax_scale,
+            1.0,
+            False,
+            padded_tokens,
+        )
+        cp_loss_total = cp_loss.detach().clone()
+        dist.all_reduce(cp_loss_total, group=self.pg.cp)
+        _assert_cp_tensor_match(
+            cp_loss_total.reshape(1),
+            ref_loss.detach().reshape(1),
+            "chunked-indexer:loss",
+        )
+
+        cp_loss.backward()
+        dk_cp_local = k_cp_for_loss.grad.detach().clone()
+        dk_cp = dk_cp_local.clone()
+        dist.all_reduce(dk_cp, group=self.pg.cp)
+        ref_loss.backward()
+        dk_ref_seq_major = k_ref_for_loss.grad.detach().clone()
+        expected_dk_rank_major = torch.zeros_like(dk_cp)
+        expected_dk_rank_major.index_copy_(
+            0,
+            _rank_by_seq_major[:actual_comp].to(torch.long),
+            dk_ref_seq_major[:actual_comp],
+        )
+        _assert_cp_tensor_match(
+            dk_cp,
+            expected_dk_rank_major,
+            "chunked-indexer:dK_rank_major",
+        )
+
+        core_cp.indexer.compressor.zero_grad(set_to_none=True)
+        core_ref.indexer.compressor.zero_grad(set_to_none=True)
+        k_rank_major.backward(dk_cp_local)
+        k_ref.backward(dk_ref_seq_major.unsqueeze(1))
+        cp_ape_grad = core_cp.indexer.compressor.ape.grad.detach().clone()
+        dist.all_reduce(cp_ape_grad, group=self.pg.cp)
+        _assert_cp_tensor_match(
+            cp_ape_grad,
+            core_ref.indexer.compressor.ape.grad.detach(),
+            "chunked-indexer:compressor_ape_grad_from_dK",
+        )
+
+        del cp_attn, ref_attn, full_hidden, local_hidden, ref_hidden
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    @pytest.mark.parametrize(
+        "layer_number",
+        [1, 2, 3],
+        ids=["ratio_0_window_only", "ratio_4_indexer", "ratio_128_compressor"],
+    )
+    def test_thd_chunked_cp_matches_full_reference_forward_backward(self, layer_number):
+        """Two-chunk THD CP path matches full-sequence THD reference.
+
+        Verifies the packed-stream two-chunk row order: rank r owns
+        chunk r followed by chunk 2*cp_size-1-r. Sparse attention still runs as
+        one call; only the layout metadata, boundary windows, RoPE positions,
+        and indexer top-k inputs are chunk-aware.
+        """
+        seg_lens = _DSV4_CP_RAGGED_SEG_LENS
+        padded_seg_lens = _DSV4_CP_RAGGED_PADDED_SEG_LENS
+        padded_tokens = sum(padded_seg_lens)
+        packed = _make_thd_packed_seq_params(seg_lens, padded_seg_lens)
+        partition_indices = _make_chunked_cp_partition_indices(padded_tokens, self.cp_size)
+        local_idx = partition_indices[self.cp_rank]
+
+        torch.manual_seed(_SEED + 300 + layer_number)
+        model_parallel_cuda_manual_seed(_SEED + 300 + layer_number)
+        config_cp = _make_dsv4_cp_config(
+            context_parallel_size=self.cp_size,
+            dsa_indexer_loss_coeff=1.0,
+            dsa_indexer_use_sparse_loss=True,
+            apply_rope_fusion=True,
+            dsv4_cp_partition_mode=DSV4_CP_PARTITION_PACKED_STREAM_TWO_CHUNK,
+        )
+        config_ref = _make_dsv4_cp_config(
+            context_parallel_size=1,
+            dsa_indexer_loss_coeff=1.0,
+            dsa_indexer_use_sparse_loss=True,
+        )
+        cp_attn = _build_attention(
+            config_cp, layer_number=layer_number, pg_collection=self.pg
+        ).cuda()
+        ref_attn = _build_attention(
+            config_ref, layer_number=layer_number, pg_collection=self.ref_pg
+        ).cuda()
+        _copy_module_parameters(cp_attn, ref_attn)
+
+        full_hidden = torch.randn(
+            padded_tokens, 1, config_cp.hidden_size, dtype=torch.bfloat16, device='cuda'
+        )
+        local_hidden = full_hidden.index_select(0, local_idx).detach().clone().requires_grad_(True)
+        ref_hidden = full_hidden.detach().clone().requires_grad_(True)
+
+        local_out, _ = cp_attn(
+            hidden_states=local_hidden, attention_mask=None, packed_seq_params=packed
+        )
+        ref_out, _ = ref_attn(
+            hidden_states=ref_hidden, attention_mask=None, packed_seq_params=packed
+        )
+        _assert_cp_tensor_match(
+            local_out.detach(),
+            ref_out.detach().index_select(0, local_idx),
+            f"chunked layer={layer_number}:output",
+        )
+
+        grad = torch.randn_like(ref_out)
+        local_out.backward(grad.index_select(0, local_idx))
+        ref_out.backward(grad)
+        _assert_cp_tensor_match(
+            local_hidden.grad.detach(),
+            ref_hidden.grad.index_select(0, local_idx),
+            f"chunked layer={layer_number}:hidden_grad",
+        )
+
+        ref_params = dict(ref_attn.named_parameters())
+        for name, param in cp_attn.named_parameters():
+            ref_grad = ref_params[name].grad
+            assert param.grad is not None, f"Missing CP grad for {name}"
+            assert ref_grad is not None, f"Missing reference grad for {name}"
+            grad_sum = param.grad.detach().clone()
+            dist.all_reduce(grad_sum, group=self.pg.cp)
+            _assert_cp_tensor_match(
+                grad_sum, ref_grad, f"chunked layer={layer_number}:param_grad:{name}"
+            )
 
         del cp_attn, ref_attn, full_hidden, local_hidden, ref_hidden, local_out, ref_out, grad
         gc.collect()
@@ -1410,7 +1853,14 @@ class TestDSv4HybridAttentionTHDCP:
         ids=["ratio_0_window_only", "ratio_4_indexer", "ratio_128_compressor"],
     )
     @pytest.mark.parametrize("fused", [True, False])
-    def test_thd_cp_cuda_graph_matches_eager_forward_backward(self, layer_number, fused):
+    @pytest.mark.parametrize(
+        "partition_mode",
+        [DSV4_CP_PARTITION_CONTIGUOUS, DSV4_CP_PARTITION_PACKED_STREAM_TWO_CHUNK],
+        ids=["contiguous", "packed_stream_two_chunk"],
+    )
+    def test_thd_cp_cuda_graph_matches_eager_forward_backward(
+        self, layer_number, fused, partition_mode
+    ):
         """CUDA graph replay matches eager THD CP forward/backward.
 
         Captures the DSv4 attention layer's CP-local forward and backward
@@ -1430,7 +1880,12 @@ class TestDSv4HybridAttentionTHDCP:
             padded_seg_lens = _DSV4_CP_RAGGED_PADDED_SEG_LENS
             padded_tokens = sum(padded_seg_lens)
             packed = _make_thd_packed_seq_params(seg_lens, padded_seg_lens)
-            partition_indices = _make_contiguous_cp_partition_indices(padded_tokens, self.cp_size)
+            if partition_mode == DSV4_CP_PARTITION_PACKED_STREAM_TWO_CHUNK:
+                partition_indices = _make_chunked_cp_partition_indices(padded_tokens, self.cp_size)
+            else:
+                partition_indices = _make_contiguous_cp_partition_indices(
+                    padded_tokens, self.cp_size
+                )
             local_idx = partition_indices[self.cp_rank]
 
             torch.manual_seed(_SEED + 700 + layer_number)
@@ -1441,6 +1896,7 @@ class TestDSv4HybridAttentionTHDCP:
                 dsa_indexer_use_sparse_loss=True,
                 apply_dsa_kernel_fusion=fused,
                 apply_rope_fusion=True,
+                dsv4_cp_partition_mode=partition_mode,
             )
             graph_attn = _build_attention(
                 config, layer_number=layer_number, pg_collection=self.pg
@@ -1489,20 +1945,22 @@ class TestDSv4HybridAttentionTHDCP:
             # match eager output bitwise. Fused backward uses atomic adds in the
             # sparse-attn/indexer kernels, so its accumulation order can differ.
             _assert_cp_graph_bitwise_match(
-                graph_out, eager_out, f"layer={layer_number}:{mode}:output"
+                graph_out, eager_out, f"layer={layer_number}:{mode}:{partition_mode}:output"
             )
             if fused:
                 bwd_match_fn = _assert_cp_graph_fused_backward_match
             else:
                 bwd_match_fn = _assert_cp_graph_bitwise_match
             bwd_match_fn(
-                graph_hidden_grad, eager_hidden_grad, f"layer={layer_number}:{mode}:hidden_grad"
+                graph_hidden_grad,
+                eager_hidden_grad,
+                f"layer={layer_number}:{mode}:{partition_mode}:hidden_grad",
             )
             for name, graph_grad in graph_param_grads.items():
                 bwd_match_fn(
                     graph_grad,
                     eager_param_grads[name],
-                    f"layer={layer_number}:{mode}:param_grad:{name}",
+                    f"layer={layer_number}:{mode}:{partition_mode}:param_grad:{name}",
                 )
 
             del graph_attn, eager_attn, full_hidden, test_hidden, test_grad, static_hidden

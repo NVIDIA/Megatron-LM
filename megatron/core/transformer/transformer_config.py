@@ -337,6 +337,11 @@ class TransformerConfig(ModelParallelConfig):
     """Whether to use dense mode for compressed sparse attention. If True, the CSA indexer will be
     disabled."""
 
+    dsv4_cp_partition_mode: str = "contiguous"
+    """DSv4 CP token partition mode. Supported values are ``contiguous`` and
+    ``packed_stream_two_chunk``. The latter mirrors the global packed-token stream into
+    two equal chunks per rank and is intended for single-long-sequence balance tests."""
+
     apply_dsa_kernel_fusion: bool = False
     """If True, use fused DSA sparse-attention kernels (FlashMLA forward + cuDNN DSA backward,
     indexer scoring, and top-K selection). Requires ``flash_mla`` and ``nvidia-cudnn-frontend``

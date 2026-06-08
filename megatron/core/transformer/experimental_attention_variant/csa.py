@@ -16,10 +16,16 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.csa_cp_utils import (
     SINGLE_RANK_CP_GROUP,
+    DSV4_CP_PARTITION_PACKED_STREAM_TWO_CHUNK,
     all_gather_fixed_cp_tensor,
     apply_cp_compressed_rope_fused,
+    apply_thd_cp_chunks_rope_fused,
     apply_thd_chunked_cp_rope_fused,
     apply_thd_overlap_transform_fused,
+    build_chunked_compressor_prep_compact_fused,
+    build_chunked_cp_flat_idxs_for_indexer_loss_fused,
+    build_chunked_cp_flat_idxs_fused,
+    build_chunked_rank_major_compressed_metadata_fused,
     build_compressor_prep_compact_fused,
     build_cp_flat_idxs_for_indexer_loss_fused,
     build_cp_flat_idxs_fused,
@@ -27,8 +33,12 @@ from megatron.core.transformer.experimental_attention_variant.csa_cp_utils impor
     build_global_compressed_cu_seqlens_fused,
     build_rank_major_compressed_metadata_fused,
     can_use_csa_cp_fused_kernels,
+    chunked_cp_partition,
+    compute_chunked_cp_indexer_topk_logical_fused,
     cp_group_rank,
     cp_group_size,
+    normalize_dsv4_cp_partition_mode,
+    pack_chunked_cp_kv_full_fused,
     pack_cp_kv_full_fused,
     pad_indexer_topk_to_fixed_width_fused,
     repack_rank_major_compressed_to_seq_major_fused,
@@ -411,8 +421,9 @@ def apply_thd_chunked_cp_rope(
     row_offset: int = 0,
     chunk_len: Optional[int] = None,
     clamp_to_valid_token: bool = False,
+    global_row_base: Optional[int] = None,
 ) -> torch.Tensor:
-    """Apply DSv4 THD chunked-CP RoPE without building explicit positions."""
+    """Apply DSv4 THD CP RoPE without building explicit positions."""
     cos, sin = _get_dsv4_cp_rope_cos_sin(rotary_pos_emb_module, max_position, x.dtype)
     return apply_thd_chunked_cp_rope_fused(
         x,
@@ -429,6 +440,7 @@ def apply_thd_chunked_cp_rope(
         row_offset=row_offset,
         chunk_len=chunk_len,
         clamp_to_valid_token=clamp_to_valid_token,
+        global_row_base=global_row_base,
     )
 
 
@@ -844,18 +856,20 @@ def unfused_precomputed_indexer_sparse_attn(
 
     selected_kv = compressed_kv.detach().index_select(0, safe_indices.reshape(-1))
     selected_kv = selected_kv.reshape(total_q, indexer_topk, hn)
+
+    # Match the fused precomputed path: the target uses the attention
+    # probability mass of the compressed top-k prefix, normalized by the same
+    # sink-aware denominator that FlashMLA reports as lse_indexer.
     attn_scores = torch.einsum("rhd,rkd->rhk", query.detach().float(), selected_kv.float())
     attn_scores = attn_scores * softmax_scale
     attn_scores = attn_scores.masked_fill(~valid.unsqueeze(1), float("-inf"))
-
-    sink = attn_sink.detach().view(1, np_, 1).float()
-    score_max = torch.max(attn_scores.max(dim=-1, keepdim=True).values, sink)
-    exp_scores = torch.exp(attn_scores - score_max)
-    exp_sink = torch.exp(sink - score_max)
+    sink = attn_sink.view(1, np_, 1).float()
+    scores_max = torch.maximum(attn_scores.max(dim=-1, keepdim=True).values, sink)
+    exp_scores = torch.exp(attn_scores - scores_max)
+    exp_sink = torch.exp(sink - scores_max)
     attn_probs = exp_scores / (exp_scores.sum(dim=-1, keepdim=True) + exp_sink)
+    attn_probs = attn_probs * row_valid.unsqueeze(1).float()
     target = attn_probs.sum(dim=1)
-    target = target / target.sum(dim=-1, keepdim=True).clamp(min=1e-10)
-    target = target * row_valid.float()
 
     eps = torch.finfo(torch.float32).tiny
     target = target.clamp(min=eps)
@@ -1382,30 +1396,43 @@ class CSAIndexer(MegatronModule):
         cp_size: int,
         l_local: int,
         max_position: int,
+        chunk_ranges: Optional[Tuple[Tuple[int, int], ...]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute local THD indexer Q/weights for the contiguous CP shard."""
+        """Compute local THD indexer Q/weights for the current CP row order."""
         sq, bsz, _ = x.size()
         if bsz != 1:
             raise RuntimeError(f"DSv4 THD CP indexer expects bsz=1, got {bsz}.")
         if sq != l_local:
             raise RuntimeError(
-                "DSv4 THD CP indexer expects one local contiguous shard: "
+                "DSv4 THD CP indexer expects one local shard: "
                 f"tokens={sq}, L_local={l_local}."
             )
 
         q, _ = self.linear_wq_b(qr)
         q = q.reshape(sq, bsz, self.index_n_heads, self.index_head_dim).squeeze(1)
-        q = apply_thd_chunked_cp_rope(
-            q,
-            self.index_head_dim - self.qk_pos_emb_head_dim,
-            self.qk_pos_emb_head_dim,
-            self.rotary_pos_emb,
-            cu_seqlens_padded,
-            max_position,
-            cp_rank=cp_rank,
-            cp_size=cp_size,
-            chunk_len=l_local,
-        )
+        if chunk_ranges is None:
+            q = apply_thd_chunked_cp_rope(
+                q,
+                self.index_head_dim - self.qk_pos_emb_head_dim,
+                self.qk_pos_emb_head_dim,
+                self.rotary_pos_emb,
+                cu_seqlens_padded,
+                max_position,
+                cp_rank=cp_rank,
+                cp_size=cp_size,
+                chunk_len=l_local,
+            )
+        else:
+            cos, sin = _get_dsv4_cp_rope_cos_sin(self.rotary_pos_emb, max_position, q.dtype)
+            q = apply_thd_cp_chunks_rope_fused(
+                q,
+                cos,
+                sin,
+                self.index_head_dim - self.qk_pos_emb_head_dim,
+                self.qk_pos_emb_head_dim,
+                cu_seqlens_padded,
+                chunk_ranges,
+            )
         q = rotate_activation(q)
 
         weights, _ = self.linear_weights_proj(x)
@@ -2391,7 +2418,31 @@ class CompressedSparseAttention(MegatronModule):
             raise RuntimeError("DSv4 THD CP path currently supports self-attention only.")
 
         l_local = total_q_local
-        global_start = cp_rank * l_local
+        cp_partition_mode = normalize_dsv4_cp_partition_mode(
+            getattr(self.config, "dsv4_cp_partition_mode", None)
+        )
+        use_chunked_cp_partition = (
+            cp_partition_mode == DSV4_CP_PARTITION_PACKED_STREAM_TWO_CHUNK
+        )
+        if use_chunked_cp_partition:
+            chunk_ranges = chunked_cp_partition(l_local * cp_size, cp_size, cp_rank)
+            chunk_lengths = [int(end) - int(start) for start, end in chunk_ranges]
+            if sum(chunk_lengths) != l_local:
+                raise RuntimeError(
+                    "DSv4 packed-stream two-chunk CP partition must cover exactly L_local rows: "
+                    f"chunks={chunk_lengths}, L_local={l_local}."
+                )
+            if len(set(chunk_lengths)) != 1:
+                raise RuntimeError(
+                    "DSv4 packed-stream two-chunk CP partition expects equal-size chunks: "
+                    f"chunk_lengths={chunk_lengths}."
+                )
+            chunk_len = chunk_lengths[0]
+            global_start = int(chunk_ranges[0][0])
+        else:
+            chunk_ranges = None
+            chunk_len = l_local
+            global_start = cp_rank * l_local
         kv_local = key.squeeze(-2).squeeze(1)
         if boundary_hidden is None or boundary_key is None:
             raise RuntimeError(
@@ -2399,7 +2450,15 @@ class CompressedSparseAttention(MegatronModule):
                 "the hidden-only boundary exchange and boundary KV projection path."
             )
         boundary_kv = boundary_key.squeeze(-2).squeeze(1)
-        d_window = boundary_hidden.shape[0]
+        if use_chunked_cp_partition:
+            if boundary_hidden.shape[0] % len(chunk_ranges) != 0:
+                raise RuntimeError(
+                    "DSv4 packed-stream two-chunk CP boundary rows must be divisible by chunk count: "
+                    f"boundary={boundary_hidden.shape[0]}, chunks={len(chunk_ranges)}."
+                )
+            d_window = boundary_hidden.shape[0] // len(chunk_ranges)
+        else:
+            d_window = boundary_hidden.shape[0]
         use_cp_fused_layout = can_use_csa_cp_fused_kernels(
             query, kv_local, boundary_kv, boundary_hidden, cu_seqlens_q
         )
@@ -2430,34 +2489,66 @@ class CompressedSparseAttention(MegatronModule):
                 cu_seqlens_kv, self.compress_ratio
             )
             global_compressed_capacity = (l_local * cp_size) // self.compress_ratio
-            (
-                hidden_compact,
-                cu_compact,
-                _seq_ids_local,
-                comp_ids_local,
-                _valid_local,
-                c_cap,
-            ) = build_compressor_prep_compact_fused(
-                x,
-                boundary_hidden,
-                cu_seqlens_kv,
-                global_start,
-                l_local,
-                self.compress_ratio,
-                d_comp,
-                d_window,
-            )
-            seq_ids_rank_major, comp_ids_rank_major, valid_rank_major = (
-                build_rank_major_compressed_metadata_fused(
+            if use_chunked_cp_partition:
+                (
+                    hidden_compact,
+                    cu_compact,
+                    _seq_ids_local,
+                    comp_ids_local,
+                    _valid_local,
+                    c_cap,
+                    c_cap_per_chunk,
+                ) = build_chunked_compressor_prep_compact_fused(
+                    x,
+                    boundary_hidden,
                     cu_seqlens_kv,
-                    cp_size,
+                    chunk_ranges,
+                    self.compress_ratio,
+                    d_comp,
+                    d_window,
+                )
+            else:
+                (
+                    hidden_compact,
+                    cu_compact,
+                    _seq_ids_local,
+                    comp_ids_local,
+                    _valid_local,
+                    c_cap,
+                ) = build_compressor_prep_compact_fused(
+                    x,
+                    boundary_hidden,
+                    cu_seqlens_kv,
+                    global_start,
                     l_local,
                     self.compress_ratio,
                     d_comp,
-                    c_cap,
-                    device,
+                    d_window,
                 )
-            )
+                c_cap_per_chunk = c_cap
+            if use_chunked_cp_partition:
+                seq_ids_rank_major, comp_ids_rank_major, valid_rank_major = (
+                    build_chunked_rank_major_compressed_metadata_fused(
+                        cu_seqlens_kv,
+                        cp_size,
+                        chunk_len,
+                        self.compress_ratio,
+                        d_comp,
+                        c_cap_per_chunk,
+                    )
+                )
+            else:
+                seq_ids_rank_major, comp_ids_rank_major, valid_rank_major = (
+                    build_rank_major_compressed_metadata_fused(
+                        cu_seqlens_kv,
+                        cp_size,
+                        l_local,
+                        self.compress_ratio,
+                        d_comp,
+                        c_cap,
+                        device,
+                    )
+                )
 
             if self.indexer is not None:
                 indexer_loss_coeff = self.config.dsa_indexer_loss_coeff or 0.0
@@ -2483,6 +2574,7 @@ class CompressedSparseAttention(MegatronModule):
                         cp_size,
                         l_local,
                         max_seqlen_q,
+                        chunk_ranges=chunk_ranges if use_chunked_cp_partition else None,
                     )
                 )
 
@@ -2519,6 +2611,20 @@ class CompressedSparseAttention(MegatronModule):
                 topk_width = self.indexer.index_topk if max_seqlen_compressed_idx > 0 else 0
                 if topk_width == 0 or k_indexer_seq_major.shape[0] == 0:
                     indexer_topk_logical = None
+                elif use_chunked_cp_partition:
+                    indexer_topk_logical = compute_chunked_cp_indexer_topk_logical_fused(
+                        q_indexer_cp,
+                        weights_indexer_cp,
+                        k_indexer_seq_major,
+                        cu_seqlens_q,
+                        cu_seqlens_compressed,
+                        chunk_ranges,
+                        self.compress_ratio,
+                        topk_width,
+                        self.indexer.softmax_scale,
+                        max_seqlen_q=max_seqlen_q,
+                        max_seqlen_kv=max_seqlen_compressed_idx,
+                    )
                 else:
                     (
                         q_indexer_for_topk,
@@ -2585,6 +2691,22 @@ class CompressedSparseAttention(MegatronModule):
                 )
             compressed_fixed = compressed_kv_local.squeeze(1)
             compressed_rank_major = all_gather_fixed_cp_tensor(compressed_fixed, cp_group)
+            if (
+                use_chunked_cp_partition
+                and indexer_rank_by_seq_major is None
+                and cu_seqlens_compressed is not None
+                and compressed_rank_major.shape[0] > 0
+            ):
+                _compressed_seq_major_unused, indexer_rank_by_seq_major = (
+                    repack_rank_major_compressed_to_seq_major_fused(
+                        compressed_rank_major,
+                        seq_ids_rank_major,
+                        comp_ids_rank_major,
+                        valid_rank_major,
+                        cu_seqlens_compressed,
+                        output_capacity=global_compressed_capacity,
+                    )
+                )
 
         indexer_loss_coeff = self.config.dsa_indexer_loss_coeff or 0.0
         indexer_training_enabled = (
@@ -2593,33 +2715,74 @@ class CompressedSparseAttention(MegatronModule):
             and indexer_topk_logical is not None
         )
 
-        kv_full_thd = pack_cp_kv_full_fused(
-            kv_local,
-            boundary_kv,
-            compressed_rank_major,
-            seq_ids_rank_major,
-            comp_ids_rank_major,
-            valid_rank_major,
-            cu_seqlens_kv,
-            global_start,
-            l_local,
-            d_window,
-            self.compress_ratio,
-            rank_major_by_seq_major=indexer_rank_by_seq_major,
-            cu_seqlens_compressed=cu_seqlens_compressed,
-        )
-        if indexer_training_enabled:
-            topk_idxs, indexer_topk_rank_major = build_cp_flat_idxs_for_indexer_loss_fused(
-                cu_seqlens_q,
-                cu_seqlens_compressed,
+        shared_compressed_base = None
+        if use_chunked_cp_partition:
+            kv_full_thd, kv_full_offsets = pack_chunked_cp_kv_full_fused(
+                kv_local,
+                boundary_kv,
+                compressed_rank_major,
+                seq_ids_rank_major,
+                comp_ids_rank_major,
+                valid_rank_major,
+                cu_seqlens_kv,
+                chunk_ranges,
+                d_window,
+                self.compress_ratio,
+                rank_major_by_seq_major=indexer_rank_by_seq_major,
+                cu_seqlens_compressed=cu_seqlens_compressed,
+            )
+            if (
+                self.compress_ratio > 1
+                and compressed_rank_major.shape[0] > 0
+                and indexer_rank_by_seq_major is not None
+                and cu_seqlens_compressed is not None
+            ):
+                shared_compressed_base = kv_full_thd.shape[0] - compressed_rank_major.shape[0]
+        else:
+            kv_full_offsets = None
+            kv_full_thd = pack_cp_kv_full_fused(
+                kv_local,
+                boundary_kv,
+                compressed_rank_major,
+                seq_ids_rank_major,
+                comp_ids_rank_major,
+                valid_rank_major,
+                cu_seqlens_kv,
                 global_start,
                 l_local,
                 d_window,
-                self.window_size,
                 self.compress_ratio,
-                indexer_topk_logical,
-                indexer_rank_by_seq_major,
+                rank_major_by_seq_major=indexer_rank_by_seq_major,
+                cu_seqlens_compressed=cu_seqlens_compressed,
             )
+        if indexer_training_enabled:
+            if use_chunked_cp_partition:
+                topk_idxs, indexer_topk_rank_major = (
+                    build_chunked_cp_flat_idxs_for_indexer_loss_fused(
+                        cu_seqlens_q,
+                        cu_seqlens_compressed,
+                        chunk_ranges,
+                        kv_full_offsets,
+                        d_window,
+                        self.window_size,
+                        self.compress_ratio,
+                        indexer_topk_logical,
+                        indexer_rank_by_seq_major,
+                        shared_compressed_base=shared_compressed_base,
+                    )
+                )
+            else:
+                topk_idxs, indexer_topk_rank_major = build_cp_flat_idxs_for_indexer_loss_fused(
+                    cu_seqlens_q,
+                    cu_seqlens_compressed,
+                    global_start,
+                    l_local,
+                    d_window,
+                    self.window_size,
+                    self.compress_ratio,
+                    indexer_topk_logical,
+                    indexer_rank_by_seq_major,
+                )
             if self.apply_dsa_kernel_fusion:
                 output, indexer_loss = fused_precomputed_indexer_sparse_attn(
                     query,
@@ -2668,16 +2831,31 @@ class CompressedSparseAttention(MegatronModule):
             if self.compress_ratio > 1 and indexer_topk_logical is None
             else 0
         )
-        topk_idxs, topk_length = build_cp_flat_idxs_fused(
-            cu_seqlens_q,
-            global_start,
-            l_local,
-            d_window,
-            self.window_size,
-            self.compress_ratio,
-            indexer_topk_logical,
-            max_n_compressed=max_n_compressed,
-        )
+        if use_chunked_cp_partition:
+            topk_idxs, topk_length = build_chunked_cp_flat_idxs_fused(
+                cu_seqlens_q,
+                chunk_ranges,
+                kv_full_offsets,
+                d_window,
+                self.window_size,
+                self.compress_ratio,
+                indexer_topk_logical,
+                max_n_compressed=max_n_compressed,
+                rank_major_by_seq_major=indexer_rank_by_seq_major,
+                cu_seqlens_compressed=cu_seqlens_compressed,
+                shared_compressed_base=shared_compressed_base,
+            )
+        else:
+            topk_idxs, topk_length = build_cp_flat_idxs_fused(
+                cu_seqlens_q,
+                global_start,
+                l_local,
+                d_window,
+                self.window_size,
+                self.compress_ratio,
+                indexer_topk_logical,
+                max_n_compressed=max_n_compressed,
+            )
         sparse_topk_length = topk_length
 
         if self.apply_dsa_kernel_fusion:

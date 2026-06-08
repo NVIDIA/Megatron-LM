@@ -5,8 +5,12 @@ import torch
 
 from megatron.core.transformer.experimental_attention_variant import csa_cp_kernels
 from megatron.core.transformer.experimental_attention_variant.csa_cp_utils import (
+    DSV4_CP_PARTITION_CONTIGUOUS,
+    DSV4_CP_PARTITION_MODES,
+    DSV4_CP_PARTITION_PACKED_STREAM_TWO_CHUNK,
     apply_cp_compressed_rope_fused,
     apply_thd_chunked_cp_rope_fused,
+    apply_thd_cp_chunks_rope_fused,
     apply_thd_overlap_transform_fused,
     build_compressor_prep_compact,
     build_cp_flat_idxs,
@@ -14,15 +18,27 @@ from megatron.core.transformer.experimental_attention_variant.csa_cp_utils impor
     build_cp_flat_idxs_for_indexer_loss_fused,
     build_cp_flat_idxs_fused,
     build_cp_indexer_topk_inputs,
+    build_cp_indexer_topk_inputs_fused,
+    build_chunked_compressor_prep_compact_fused,
+    build_chunked_cp_flat_idxs_for_indexer_loss_fused,
+    build_chunked_cp_flat_idxs_fused,
+    build_chunked_rank_major_compressed_metadata_fused,
     build_global_compressed_cu_seqlens,
     build_global_compressed_cu_seqlens_fused,
+    build_compressor_prep_compact_fused,
     can_use_csa_cp_fused_kernels,
+    chunked_cp_partition,
+    compute_chunked_cp_indexer_topk_logical_fused,
     contiguous_cp_partition,
+    exchange_chunked_left_boundary_tensor,
     exchange_left_boundary_tensor,
     pack_cp_kv_full,
     pack_cp_kv_full_fused,
+    pack_chunked_cp_kv_full_fused,
     pad_indexer_topk_to_fixed_width_fused,
+    normalize_dsv4_cp_partition_mode,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa_kernels import indexer_topk
 
 
 def _require_cute_cuda():
@@ -90,6 +106,31 @@ def _overlap_transform_thd_reference(
     return out
 
 
+def test_dsv4_cp_partition_mode_contract():
+    """Validate the public DSv4 CP partition-mode names.
+
+    Expected: omitted mode defaults to the original contiguous partition,
+    supported strings round-trip exactly, and unknown values fail before any CP
+    layout helper can silently choose the wrong row order.
+    """
+    assert DSV4_CP_PARTITION_MODES == (
+        DSV4_CP_PARTITION_CONTIGUOUS,
+        DSV4_CP_PARTITION_PACKED_STREAM_TWO_CHUNK,
+    )
+    assert normalize_dsv4_cp_partition_mode(None) == DSV4_CP_PARTITION_CONTIGUOUS
+    assert (
+        normalize_dsv4_cp_partition_mode(DSV4_CP_PARTITION_CONTIGUOUS)
+        == DSV4_CP_PARTITION_CONTIGUOUS
+    )
+    assert (
+        normalize_dsv4_cp_partition_mode(DSV4_CP_PARTITION_PACKED_STREAM_TWO_CHUNK)
+        == DSV4_CP_PARTITION_PACKED_STREAM_TWO_CHUNK
+    )
+
+    with pytest.raises(RuntimeError, match="Unsupported DSv4 CP partition mode"):
+        normalize_dsv4_cp_partition_mode("chunked")
+
+
 def test_contiguous_cp_partition_requires_padded_total_divisible_by_cp_size():
     """Validate the fixed-size padded contiguous CP partition contract.
 
@@ -106,6 +147,23 @@ def test_contiguous_cp_partition_requires_padded_total_divisible_by_cp_size():
         contiguous_cp_partition(cu_seqlens_padded, cp_size=2, cp_rank=0)
 
 
+def test_chunked_cp_partition_matches_packed_stream_two_chunk_order():
+    """Validate the packed-stream two-chunk CP partition contract.
+
+    Expected: rank r owns global chunk r followed by chunk 2*cp_size-1-r.
+    A failure here means DSv4 chunk-aware CP helpers would disagree with the
+    packed-stream two-chunk local row order.
+    """
+    assert chunked_cp_partition(16, cp_size=1, cp_rank=0) == ((0, 16),)
+    assert chunked_cp_partition(16, cp_size=4, cp_rank=0) == ((0, 2), (14, 16))
+    assert chunked_cp_partition(16, cp_size=4, cp_rank=1) == ((2, 4), (12, 14))
+    assert chunked_cp_partition(16, cp_size=4, cp_rank=2) == ((4, 6), (10, 12))
+    assert chunked_cp_partition(16, cp_size=4, cp_rank=3) == ((6, 8), (8, 10))
+
+    with pytest.raises(RuntimeError, match=r"padded_total_tokens % \(2 \* cp_size\)"):
+        chunked_cp_partition(18, cp_size=4, cp_rank=0)
+
+
 def test_boundary_exchange_single_rank_returns_zero_boundary_and_zero_grad():
     """Validate the no-CP boundary exchange contract.
 
@@ -116,6 +174,22 @@ def test_boundary_exchange_single_rank_returns_zero_boundary_and_zero_grad():
     local = torch.arange(12, dtype=torch.float32).reshape(4, 3).requires_grad_(True)
 
     boundary = exchange_left_boundary_tensor(local, d_window=2, cp_group=None)
+
+    assert torch.equal(boundary, torch.zeros(2, 3))
+    boundary.sum().backward()
+    assert torch.equal(local.grad, torch.zeros_like(local))
+
+
+def test_chunked_boundary_exchange_single_rank_returns_zero_boundary_and_zero_grad():
+    """Validate the no-CP two-chunk boundary exchange contract.
+
+    Expected: with cp_group=None, the helper degenerates to one zero-filled
+    boundary and contributes no local gradient. A failure here means chunk-aware
+    CP boundary plumbing could perturb disabled-CP paths.
+    """
+    local = torch.arange(12, dtype=torch.float32).reshape(4, 3).requires_grad_(True)
+
+    boundary = exchange_chunked_left_boundary_tensor(local, d_window=2, cp_group=None)
 
     assert torch.equal(boundary, torch.zeros(2, 3))
     boundary.sum().backward()
@@ -296,6 +370,380 @@ def test_build_cp_indexer_topk_inputs_keeps_tail_padding_rows():
     assert max_q == 6
     assert max_k == 1
     assert torch.equal(local_row_ids, torch.arange(8, dtype=torch.long))
+
+
+def test_cute_chunked_cp_indexer_topk_matches_explicit_chunk_calls():
+    """Validate the two-chunk CP indexer-topk scheduling contract.
+
+    Expected: the chunked helper is exactly equivalent to calling the current
+    THD indexer forward/top-k once per contiguous global chunk and concatenating
+    the resulting logical compressed ids in local row order. A failure here means
+    Packed-stream two-chunk CP could accidentally feed a mixed row space to a kernel that
+    can only build one contiguous causal/trapezoid mask per call.
+    """
+    _require_cute_cuda()
+    torch.manual_seed(1234)
+    ratio = 4
+    topk_width = 3
+    chunk_ranges = chunked_cp_partition(32, cp_size=4, cp_rank=1)
+    l_local = sum(end - start for start, end in chunk_ranges)
+    cu_seqlens_q = torch.tensor([0, 32], dtype=torch.int32, device="cuda")
+    cu_seqlens_compressed = torch.tensor([0, 8], dtype=torch.int32, device="cuda")
+    q_indexer_local = torch.randn(l_local, 2, 8, dtype=torch.bfloat16, device="cuda")
+    weights_indexer_local = torch.randn(l_local, 2, dtype=torch.bfloat16, device="cuda")
+    k_indexer_seq_major = torch.randn(8, 8, dtype=torch.bfloat16, device="cuda")
+
+    actual = compute_chunked_cp_indexer_topk_logical_fused(
+        q_indexer_local,
+        weights_indexer_local,
+        k_indexer_seq_major,
+        cu_seqlens_q,
+        cu_seqlens_compressed,
+        chunk_ranges,
+        ratio,
+        topk_width,
+        indexer_softmax_scale=0.125,
+        max_seqlen_q=32,
+        max_seqlen_kv=8,
+    )
+
+    expected_chunks = []
+    local_offset = 0
+    for global_start, global_end in chunk_ranges:
+        l_chunk = global_end - global_start
+        (
+            q_for_topk,
+            k_for_topk,
+            weights_for_topk,
+            cu_q_topk,
+            cu_k_topk,
+            max_q_topk,
+            max_k_topk,
+            seq_lens_topk,
+        ) = build_cp_indexer_topk_inputs_fused(
+            q_indexer_local.narrow(0, local_offset, l_chunk),
+            weights_indexer_local.narrow(0, local_offset, l_chunk),
+            k_indexer_seq_major,
+            cu_seqlens_q,
+            cu_seqlens_compressed,
+            global_start,
+            l_chunk,
+            ratio,
+            max_seqlen_q=32,
+            max_seqlen_kv=8,
+        )
+        chunk_topk, _ = indexer_topk(
+            q_for_topk,
+            k_for_topk,
+            weights_for_topk,
+            topk=min(topk_width, max_k_topk),
+            ratio=ratio,
+            indexer_softmax_scale=0.125,
+            cu_seqlens_q=cu_q_topk,
+            cu_seqlens_kv=cu_k_topk,
+            max_seqlen_q=max_q_topk,
+            max_seqlen_kv=max_k_topk,
+            fixed_topk_width=topk_width,
+            compute_topk_length=False,
+            precomputed_seq_lens=seq_lens_topk,
+        )
+        expected_chunks.append(chunk_topk)
+        local_offset += l_chunk
+    expected = torch.cat(expected_chunks, dim=0)
+
+    assert torch.equal(actual.cpu(), expected.cpu())
+
+
+def test_cute_chunked_compressor_prep_matches_explicit_chunk_calls():
+    """Validate chunked compressor-prep compact against per-chunk fused calls.
+
+    Expected: local rows ordered as packed-stream two-chunk CP produce the same compact
+    rows, compact cu_seqlens, compressed ids, and backward gradients as explicit
+    contiguous calls on each chunk followed by GPU-side concatenation. A failure
+    here means the production compressor input would not match the local row
+    order used by the layer.
+    """
+    _require_cute_cuda()
+    torch.manual_seed(2468)
+    cu_seqlens = torch.tensor([0, 32, 64], dtype=torch.int32, device="cuda")
+    chunk_ranges = chunked_cp_partition(64, cp_size=4, cp_rank=1)
+    ratio = 4
+    d_comp = 8
+    d_window = 8
+    hidden_size = 4
+
+    hidden_local = torch.randn(16, hidden_size, dtype=torch.bfloat16, device="cuda").requires_grad_(
+        True
+    )
+    boundary_hidden = torch.randn(
+        2 * d_window, hidden_size, dtype=torch.bfloat16, device="cuda"
+    ).requires_grad_(True)
+    actual = build_chunked_compressor_prep_compact_fused(
+        hidden_local,
+        boundary_hidden,
+        cu_seqlens,
+        chunk_ranges,
+        ratio,
+        d_comp,
+        d_window,
+    )
+
+    compact_parts = []
+    cu_parts = []
+    seq_parts = []
+    comp_parts = []
+    valid_parts = []
+    c_caps = []
+    local_offset = 0
+    for chunk_id, (global_start, global_end) in enumerate(chunk_ranges):
+        l_chunk = global_end - global_start
+        part = build_compressor_prep_compact_fused(
+            hidden_local.narrow(0, local_offset, l_chunk),
+            boundary_hidden.narrow(0, chunk_id * d_window, d_window),
+            cu_seqlens,
+            global_start,
+            l_chunk,
+            ratio,
+            d_comp,
+            d_window,
+        )
+        compact, cu_compact, seq_ids, comp_ids, valid, c_cap = part
+        compact_parts.append(compact)
+        cu_parts.append(cu_compact)
+        seq_parts.append(seq_ids)
+        comp_parts.append(comp_ids)
+        valid_parts.append(valid)
+        c_caps.append(c_cap)
+        local_offset += l_chunk
+
+    cu_deltas = torch.stack([cu[1:] - cu[:-1] for cu in cu_parts], dim=0).sum(dim=0)
+    expected_cu = torch.cat(
+        (torch.zeros((1,), dtype=cu_seqlens.dtype, device="cuda"), torch.cumsum(cu_deltas, dim=0))
+    )
+    expected = (
+        torch.cat(compact_parts, dim=0),
+        expected_cu,
+        torch.cat(seq_parts, dim=0),
+        torch.cat(comp_parts, dim=0),
+        torch.cat(valid_parts, dim=0),
+        sum(c_caps),
+        c_caps[0],
+    )
+
+    for actual_tensor, expected_tensor in zip(actual[:5], expected[:5]):
+        assert torch.equal(actual_tensor.cpu(), expected_tensor.cpu())
+    assert actual[5:] == expected[5:]
+
+    grad = torch.randn_like(actual[0])
+    actual[0].backward(grad, retain_graph=True)
+    actual_hidden_grad = hidden_local.grad.detach().clone()
+    actual_boundary_grad = boundary_hidden.grad.detach().clone()
+    hidden_local.grad.zero_()
+    boundary_hidden.grad.zero_()
+    expected[0].backward(grad)
+    assert torch.equal(hidden_local.grad.cpu(), actual_hidden_grad.cpu())
+    assert torch.equal(boundary_hidden.grad.cpu(), actual_boundary_grad.cpu())
+
+
+def test_cute_chunked_rank_major_metadata_matches_explicit_chunk_metadata():
+    """Validate rank-major compressed metadata for the two-chunk CP order.
+
+    Expected: the metadata kernel reconstructs each rank's two global chunks and
+    emits rows in the same rank-major order as the compressed KV all-gather. A
+    failure here means later seq-major repack or KV full packing could read the
+    wrong compressed rows without any communication mismatch.
+    """
+    _require_cute_cuda()
+    cu_seqlens = torch.tensor([0, 32, 64], dtype=torch.int32, device="cuda")
+    cp_size = 4
+    chunk_len = 8
+    ratio = 4
+    d_comp = 8
+    d_window = 8
+    c_cap_per_chunk = (chunk_len + d_comp) // ratio
+
+    actual = build_chunked_rank_major_compressed_metadata_fused(
+        cu_seqlens,
+        cp_size,
+        chunk_len,
+        ratio,
+        d_comp,
+        c_cap_per_chunk,
+    )
+
+    seq_parts = []
+    comp_parts = []
+    valid_parts = []
+    dummy_hidden = torch.zeros(chunk_len, 4, dtype=torch.bfloat16, device="cuda")
+    dummy_boundary = torch.zeros(d_window, 4, dtype=torch.bfloat16, device="cuda")
+    for cp_rank in range(cp_size):
+        for global_start, global_end in chunked_cp_partition(64, cp_size, cp_rank):
+            _compact, _cu, seq_ids, comp_ids, valid, c_cap = build_compressor_prep_compact_fused(
+                dummy_hidden,
+                dummy_boundary,
+                cu_seqlens,
+                global_start,
+                global_end - global_start,
+                ratio,
+                d_comp,
+                d_window,
+            )
+            assert c_cap == c_cap_per_chunk
+            seq_parts.append(seq_ids)
+            comp_parts.append(comp_ids)
+            valid_parts.append(valid)
+
+    expected = (torch.cat(seq_parts), torch.cat(comp_parts), torch.cat(valid_parts))
+    for actual_tensor, expected_tensor in zip(actual, expected):
+        assert torch.equal(actual_tensor.cpu(), expected_tensor.cpu())
+
+
+def test_cute_chunked_kv_pack_and_final_idx_use_one_sparse_row_space():
+    """Validate chunked KV packing and final idx lowering for one sparse-attn call.
+
+    Expected: the helper packs per-chunk window rows, stores shared compressed
+    rows once, and lowers every compressed top-k id into that shared section.
+    The indexer-loss rank-major ids still point to the separate all-gathered
+    compressed-K tensor. A failure here means one sparse-attention call would
+    index a different row space from the packed KV tensor.
+    """
+    _require_cute_cuda()
+    cu_seqlens = torch.tensor([0, 16], dtype=torch.int32, device="cuda")
+    cu_seqlens_compressed = torch.tensor([0, 4], dtype=torch.int32, device="cuda")
+    chunk_ranges = ((0, 4), (12, 16))
+    d_window = 2
+    window_size = 2
+    ratio = 4
+
+    kv_local = torch.arange(8 * 4, dtype=torch.float32, device="cuda").reshape(8, 4)
+    boundary_kv = (100 + torch.arange(4 * 4, dtype=torch.float32, device="cuda")).reshape(4, 4)
+    compressed_rank_major = (
+        900 + torch.arange(4 * 4, dtype=torch.float32, device="cuda")
+    ).reshape(4, 4)
+    seq_ids_rank_major = torch.zeros((4,), dtype=torch.int32, device="cuda")
+    comp_ids_rank_major = torch.arange(4, dtype=torch.int32, device="cuda")
+    valid_rank_major = torch.ones((4,), dtype=torch.bool, device="cuda")
+    rank_major_by_seq_major = torch.arange(4, dtype=torch.int32, device="cuda")
+    indexer_logical = torch.tensor(
+        [[0, -1], [0, -1], [0, -1], [0, -1], [2, 3], [2, 3], [2, 3], [2, 3]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+
+    kv_full, offsets = pack_chunked_cp_kv_full_fused(
+        kv_local,
+        boundary_kv,
+        compressed_rank_major,
+        seq_ids_rank_major,
+        comp_ids_rank_major,
+        valid_rank_major,
+        cu_seqlens,
+        chunk_ranges,
+        d_window,
+        ratio,
+        rank_major_by_seq_major=rank_major_by_seq_major,
+        cu_seqlens_compressed=cu_seqlens_compressed,
+    )
+
+    empty_compressed = compressed_rank_major[:0]
+    empty_seq_ids = seq_ids_rank_major[:0]
+    empty_comp_ids = comp_ids_rank_major[:0]
+    empty_valid = valid_rank_major[:0]
+    first_window = pack_cp_kv_full_fused(
+        kv_local[:4],
+        boundary_kv[:2],
+        empty_compressed,
+        empty_seq_ids,
+        empty_comp_ids,
+        empty_valid,
+        cu_seqlens,
+        0,
+        4,
+        d_window,
+        ratio,
+    )
+    second_window = pack_cp_kv_full_fused(
+        kv_local[4:],
+        boundary_kv[2:],
+        empty_compressed,
+        empty_seq_ids,
+        empty_comp_ids,
+        empty_valid,
+        cu_seqlens,
+        12,
+        4,
+        d_window,
+        ratio,
+    )
+    shared_compressed_base = first_window.shape[0] + second_window.shape[0]
+    expected_kv_full = torch.cat([first_window, second_window, compressed_rank_major], dim=0)
+    assert offsets == (0, first_window.shape[0])
+    assert shared_compressed_base == kv_full.shape[0] - compressed_rank_major.shape[0]
+    assert torch.equal(kv_full.cpu(), expected_kv_full.cpu())
+
+    topk_idxs, topk_length = build_chunked_cp_flat_idxs_fused(
+        cu_seqlens,
+        chunk_ranges,
+        offsets,
+        d_window,
+        window_size,
+        ratio,
+        indexer_logical,
+        rank_major_by_seq_major=rank_major_by_seq_major,
+        cu_seqlens_compressed=cu_seqlens_compressed,
+        shared_compressed_base=shared_compressed_base,
+    )
+    expected_topk = torch.tensor(
+        [
+            [0, shared_compressed_base + 0, -1, -1],
+            [0, 1, shared_compressed_base + 0, -1],
+            [1, 2, shared_compressed_base + 0, -1],
+            [2, 3, shared_compressed_base + 0, -1],
+            [7, 8, shared_compressed_base + 2, shared_compressed_base + 3],
+            [8, 9, shared_compressed_base + 2, shared_compressed_base + 3],
+            [9, 10, shared_compressed_base + 2, shared_compressed_base + 3],
+            [10, 11, shared_compressed_base + 2, shared_compressed_base + 3],
+        ],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    expected_length = torch.tensor([2, 3, 3, 3, 4, 4, 4, 4], dtype=torch.int32, device="cuda")
+    assert torch.equal(topk_idxs.cpu(), expected_topk.cpu())
+    assert torch.equal(topk_length.cpu(), expected_length.cpu())
+
+    loss_topk, loss_rank_major = build_chunked_cp_flat_idxs_for_indexer_loss_fused(
+        cu_seqlens,
+        cu_seqlens_compressed,
+        chunk_ranges,
+        offsets,
+        d_window,
+        window_size,
+        ratio,
+        indexer_logical,
+        rank_major_by_seq_major,
+        shared_compressed_base=shared_compressed_base,
+    )
+    expected_loss_topk = torch.tensor(
+        [
+            [shared_compressed_base + 0, -1, 0, -1],
+            [shared_compressed_base + 0, -1, 0, 1],
+            [shared_compressed_base + 0, -1, 1, 2],
+            [shared_compressed_base + 0, -1, 2, 3],
+            [shared_compressed_base + 2, shared_compressed_base + 3, 7, 8],
+            [shared_compressed_base + 2, shared_compressed_base + 3, 8, 9],
+            [shared_compressed_base + 2, shared_compressed_base + 3, 9, 10],
+            [shared_compressed_base + 2, shared_compressed_base + 3, 10, 11],
+        ],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    expected_loss_rank_major = torch.tensor(
+        [[0, -1], [0, -1], [0, -1], [0, -1], [2, 3], [2, 3], [2, 3], [2, 3]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    assert torch.equal(loss_topk.cpu(), expected_loss_topk.cpu())
+    assert torch.equal(loss_rank_major.cpu(), expected_loss_rank_major.cpu())
 
 
 def test_build_cp_flat_idxs_respect_sequence_local_compressed_ids():
@@ -498,9 +946,9 @@ def test_cute_filter_indexer_topk_scores_removes_nonfinite_ids():
 
 
 def test_cute_thd_chunked_cp_rope_matches_reference_forward_and_backward():
-    """Validate THD chunked-CP RoPE position reconstruction in kernel.
+    """Validate THD CP RoPE position reconstruction in kernel.
 
-    Expected: fused THD chunked-CP RoPE maps ``global_row_base + row`` through
+    Expected: fused THD CP RoPE maps ``global_row_base + row`` through
     ``cu_seqlens_padded`` to the same sequence-local positions as the PyTorch
     reference, and backward applies the inverse rotation. A failure here means
     local Q/K, boundary K, or inverse output RoPE would use wrong CP positions.
@@ -534,6 +982,75 @@ def test_cute_thd_chunked_cp_rope_matches_reference_forward_and_backward():
         cu_seqlens.cuda(),
         cp_rank=2,
         cp_size=4,
+    )
+    fused.backward(grad_cpu.cuda())
+
+    torch.testing.assert_close(fused.cpu(), ref)
+    torch.testing.assert_close(x_cuda.grad.cpu(), x_cpu.grad)
+
+    x_cuda_explicit = x_cpu.detach().cuda().requires_grad_(True)
+    fused_explicit = apply_thd_chunked_cp_rope_fused(
+        x_cuda_explicit,
+        cos_cpu.cuda(),
+        sin_cpu.cuda(),
+        nope_dim,
+        pos_dim,
+        cu_seqlens.cuda(),
+        cp_rank=0,
+        cp_size=4,
+        global_row_base=global_row_base,
+    )
+    fused_explicit.backward(grad_cpu.cuda())
+
+    torch.testing.assert_close(fused_explicit.cpu(), ref)
+    torch.testing.assert_close(x_cuda_explicit.grad.cpu(), x_cpu.grad)
+
+
+def test_cute_thd_cp_chunks_rope_matches_reference_forward_and_backward():
+    """Validate the two-chunk THD CP RoPE fast path.
+
+    Expected: local rows are split by ``chunk_ranges`` and each row uses the
+    sequence-local RoPE position corresponding to its chunk's global token. A
+    failure here means packed-stream two-chunk CP would rotate Q/K or output gradients
+    with positions from the wrong half of the global token stream.
+    """
+    _require_cute_cuda()
+    torch.manual_seed(4321)
+    cu_seqlens = torch.tensor([0, 7, 18, 32], dtype=torch.int32)
+    chunk_ranges = ((3, 9), (22, 28))
+    rows = sum(end - start for start, end in chunk_ranges)
+    padded_total_tokens = 32
+    nope_dim = 4
+    pos_dim = 4
+
+    x_cpu = torch.randn(rows, 2, nope_dim + pos_dim, dtype=torch.float32, requires_grad=True)
+    cos_cpu = torch.randn(32, 1, 1, pos_dim, dtype=torch.float32)
+    sin_cpu = torch.randn(32, 1, 1, pos_dim, dtype=torch.float32)
+    positions = torch.cat(
+        [
+            _seq_positions_from_global_rows(
+                cu_seqlens,
+                start,
+                end - start,
+                padded_total_tokens,
+            )
+            for start, end in chunk_ranges
+        ],
+        dim=0,
+    )
+    ref = _rope_reference(x_cpu, cos_cpu, sin_cpu, positions, nope_dim, pos_dim)
+    grad_cpu = torch.randn_like(ref)
+    ref.backward(grad_cpu)
+
+    x_cuda = x_cpu.detach().cuda().requires_grad_(True)
+    fused = apply_thd_cp_chunks_rope_fused(
+        x_cuda,
+        cos_cpu.cuda(),
+        sin_cpu.cuda(),
+        nope_dim,
+        pos_dim,
+        cu_seqlens.cuda(),
+        chunk_ranges,
     )
     fused.backward(grad_cpu.cuda())
 
