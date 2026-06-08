@@ -54,7 +54,7 @@ from megatron.training import (
     print_rank_0,
     set_startup_timestamps,
 )
-from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.argument_utils import pretrain_cfg_container_from_args, gpt_config_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.datasets.sft_dataset import SFTDataset
@@ -105,7 +105,13 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     
     batch = get_batch_on_this_cp_rank(batch, is_hybrid_cp=is_hybrid_cp, cp_group=get_context_parallel_group(), hybrid_cp_group_func=get_hybrid_data_context_parallel_groups)
 
-    return [batch[key] for key in sorted(batch.keys())]
+    # Return values in BATCH_KEYS order so callers can unpack into the fixed
+    # names regardless of any provenance fields wrappers like BlendedDataset
+    # add (e.g. "dataset_id"). The for-loop above already populates every
+    # BATCH_KEYS entry on tp_rank 0; other tp_ranks receive a fresh dict from
+    # get_batch_on_this_tp_rank. BATCH_KEYS is already alphabetical, matching
+    # the historical sorted(batch.keys()) order.
+    return [batch[key] for key in BATCH_KEYS]
 
 
 # define spiky loss as a loss that's 10x the max loss observed
@@ -390,7 +396,8 @@ if __name__ == "__main__":
         extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
-    full_config = pretrain_cfg_container_from_args(args)
+    model_cfg = gpt_config_from_args(args)
+    full_config = pretrain_cfg_container_from_args(args, model_cfg)
     pretrain(full_config,
         train_valid_test_datasets_provider,
         partial(model_provider, gpt_builder),
