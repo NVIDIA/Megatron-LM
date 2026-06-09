@@ -24,7 +24,7 @@ from typing import Any, List, Optional, Tuple
 import torch
 
 from gpt_builders import gpt_builder
-from megatron.core import parallel_state
+from megatron.core import mpu
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
@@ -134,9 +134,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         )
 
     # TODO: this is pretty hacky, find a better way
-    is_packed_sequence = args.sft or (
-        args.use_varlen_dataset and not args.varlen_sbhd_validation
-    )
+    is_packed_sequence = args.sft or (args.use_varlen_dataset and not args.varlen_sbhd_validation)
     if (
         not is_first_or_last_pipeline_stage(vp_stage)
         and not is_packed_sequence
@@ -305,7 +303,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
 def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
     args = get_args()
     config = core_transformer_config_from_args(args)
-    if parallel_state.get_tensor_model_parallel_rank() != 0:
+    if mpu.get_tensor_model_parallel_rank() != 0:
         return False
     elif is_packed_sequence:
         return True

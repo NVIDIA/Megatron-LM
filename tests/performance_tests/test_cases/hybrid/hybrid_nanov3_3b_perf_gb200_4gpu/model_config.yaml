@@ -1,0 +1,31 @@
+# Inference perf test: nanov3 3B hybrid MoE checkpoint, TP=1 PP=1 EP=4 (4 GPUs).
+#
+# GB200 single-node variant of hybrid_nanov3_3b_perf (EP=8). GB200 nodes have
+# a 4-GPU/node limit, so the EP=8 single-node configuration used on H100
+# doesn't fit on a single GB200 node. EP=4 reshapes the expert sharding —
+# this is a separate test with its own baseline, not a port.
+
+MODEL: hybrid_nanov3_3b
+TP: 1
+PP: 1
+DP: 1
+EP: 4
+DATASET: gsm8k
+NUM_OUTPUT_TOKENS: 128
+# 2 warmup iters left the first timed iteration cold at batch 128 (~2.5x slower
+# than steady state), poisoning the mean/tail metrics (throughput, avg/p99
+# latency, tpot). Warm up more so timing starts at steady state.
+NUM_WARMUP_ITERS: 5
+NUM_TIMED_ITERS: 5
+BATCH_SIZES:
+  - 1
+  - 8
+  - 32
+  - 128
+TOLERANCE_PCT: 10
+METRICS:
+  - throughput_tok_per_sec
+  - avg_latency_ms
+  - p50_latency_ms
+  - p99_latency_ms
+  - tpot_ms_per_tok

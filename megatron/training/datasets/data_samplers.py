@@ -184,6 +184,7 @@ class MegatronPretrainingSampler:
             start_idx, end_idx = self.get_start_end_idx()
             yield batch[start_idx:end_idx]
 
+
 class MegatronFullValidationSampler:
     """Sampler for full validation that handles small datasets gracefully.
 

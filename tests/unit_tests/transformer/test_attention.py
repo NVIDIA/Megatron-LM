@@ -29,12 +29,11 @@ from megatron.core.transformer.dot_product_attention_context_parallel import (
     to_zz_mask_attn_bias,
 )
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.utils import is_te_min_version
+from megatron.core.utils import is_te_min_version, unwrap_model
 from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from megatron.training.global_vars import set_args
 from megatron.training.training import get_model
-from megatron.training.utils import unwrap_model
 from tests.unit_tests.dist_checkpointing import (
     TempNamedDir,
     init_basic_mock_args,
