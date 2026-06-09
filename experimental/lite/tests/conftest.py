@@ -10,7 +10,8 @@ import pytest
 
 LITE_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = Path(__file__).resolve().parents[3]
-for root in (REPO_ROOT, LITE_ROOT):
+VERL_EXAMPLE_ROOT = LITE_ROOT / "examples" / "verl"
+for root in (REPO_ROOT, LITE_ROOT, VERL_EXAMPLE_ROOT):
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
 

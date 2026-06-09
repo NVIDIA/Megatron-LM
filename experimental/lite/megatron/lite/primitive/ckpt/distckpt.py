@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, MutableMapping
 from types import MethodType
 from typing import Any
 
@@ -74,10 +74,15 @@ def save_distopt_checkpoint(
     if save_model:
         state_dict.update(model_sd)
     if save_optimizer and optimizer is not None:
-        state_dict["optimizer"] = optimizer.sharded_state_dict(
-            _single_or_all_model_state(model_sd),
-            metadata=_DISTOPT_METADATA,
-        )
+        _synchronize_native_optimizer_steps(optimizer)
+        patches = _patch_empty_native_optimizer_state_dicts(optimizer, fallback_step=step)
+        try:
+            state_dict["optimizer"] = optimizer.sharded_state_dict(
+                _single_or_all_model_state(model_sd),
+                metadata=_DISTOPT_METADATA,
+            )
+        finally:
+            _restore_state_dict_patches(patches)
     dist_checkpointing.save(
         state_dict,
         checkpoint_dir,
@@ -101,17 +106,213 @@ def load_distopt_checkpoint(
     if load_model:
         load_sd.update(model_sd)
     if load_optimizer and optimizer is not None:
-        load_sd["optimizer"] = optimizer.sharded_state_dict(
-            _single_or_all_model_state(model_sd),
-            is_loading=True,
-            metadata=_DISTOPT_METADATA,
-        )
+        patches = _patch_empty_native_optimizer_state_dicts(optimizer, fallback_step=0)
+        try:
+            load_sd["optimizer"] = optimizer.sharded_state_dict(
+                _single_or_all_model_state(model_sd),
+                is_loading=True,
+                metadata=_DISTOPT_METADATA,
+            )
+        finally:
+            _restore_state_dict_patches(patches)
     state_dict = dist_checkpointing.load(load_sd, checkpoint_dir, validate_access_integrity=False)
     if load_model:
         _load_model_state_dict(model, state_dict)
     if load_optimizer and optimizer is not None and "optimizer" in state_dict:
-        optimizer.load_state_dict(state_dict["optimizer"])
+        load_patches = _patch_native_optimizer_step_load(optimizer)
+        try:
+            optimizer.load_state_dict(state_dict["optimizer"])
+        finally:
+            _restore_set_state_patches(load_patches)
+        _synchronize_native_optimizer_steps(optimizer)
+    elif load_model and optimizer is not None:
+        reload_model_params = getattr(optimizer, "reload_model_params", None)
+        if callable(reload_model_params):
+            reload_model_params()
     return int(state_dict.get("step", 0))
+
+
+def _synchronize_native_optimizer_steps(optimizer: Any) -> None:
+    """Align torch optimizer per-parameter steps before mcore fallback checkpointing."""
+
+    seen: set[int] = set()
+
+    def visit(obj: Any) -> None:
+        obj_id = id(obj)
+        if obj_id in seen:
+            return
+        seen.add(obj_id)
+
+        chained = getattr(obj, "chained_optimizers", None)
+        if isinstance(chained, Iterable):
+            for child in chained:
+                visit(child)
+
+        inner = getattr(obj, "optimizer", None)
+        if inner is not None and inner is not obj:
+            visit(inner)
+
+        state = getattr(obj, "state", None)
+        if isinstance(state, MutableMapping):
+            _synchronize_step_mapping(state)
+
+    visit(optimizer)
+
+
+def _patch_empty_native_optimizer_state_dicts(
+    optimizer: Any,
+    *,
+    fallback_step: int,
+) -> list[tuple[Any, Any]]:
+    patches: list[tuple[Any, Any]] = []
+    for distopt in _iter_distributed_optimizers(optimizer):
+        inner = getattr(distopt, "optimizer", None)
+        state = getattr(inner, "state", None)
+        if not isinstance(state, MutableMapping) or state:
+            continue
+        original_state_dict = distopt.state_dict
+
+        def patched_state_dict(
+            original_state_dict=original_state_dict,
+            distopt=distopt,
+            fallback_step=fallback_step,
+        ):
+            try:
+                return original_state_dict()
+            except AssertionError:
+                return _empty_native_optimizer_state_dict(distopt, fallback_step)
+
+        distopt.state_dict = patched_state_dict  # type: ignore[method-assign]
+        patches.append((distopt, original_state_dict))
+    return patches
+
+
+def _restore_state_dict_patches(patches: list[tuple[Any, Any]]) -> None:
+    for distopt, original_state_dict in patches:
+        distopt.state_dict = original_state_dict  # type: ignore[method-assign]
+
+
+def _patch_native_optimizer_step_load(optimizer: Any) -> list[tuple[Any, Any]]:
+    patches: list[tuple[Any, Any]] = []
+    for distopt in _iter_distributed_optimizers(optimizer):
+        original_set_state = distopt._set_main_param_and_optimizer_states
+
+        def patched_set_state(
+            model_param,
+            tensors,
+            distopt=distopt,
+            original_set_state=original_set_state,
+        ):
+            removed_step = _pop_optimizer_step_for_model_param(distopt, model_param, tensors)
+            try:
+                return original_set_state(model_param, tensors)
+            finally:
+                if removed_step is not None:
+                    state, step = removed_step
+                    state["step"] = step
+
+        distopt._set_main_param_and_optimizer_states = patched_set_state  # type: ignore[method-assign]
+        patches.append((distopt, original_set_state))
+    return patches
+
+
+def _restore_set_state_patches(patches: list[tuple[Any, Any]]) -> None:
+    for distopt, original_set_state in patches:
+        distopt._set_main_param_and_optimizer_states = original_set_state  # type: ignore[method-assign]
+
+
+def _pop_optimizer_step_for_model_param(
+    distopt: Any,
+    model_param,
+    tensors: dict[str, Any],
+) -> tuple[MutableMapping, Any] | None:
+    if "step" in tensors:
+        return None
+    try:
+        group_index, group_order = distopt.model_param_group_index_map[model_param]
+        main_param = distopt.optimizer.param_groups[group_index]["params"][group_order]
+        state = distopt.optimizer.state[main_param]
+    except (KeyError, IndexError, TypeError):
+        return None
+    if not isinstance(state, MutableMapping) or "step" not in state:
+        return None
+    return state, state.pop("step")
+
+
+def _iter_distributed_optimizers(optimizer: Any) -> Iterable[Any]:
+    seen: set[int] = set()
+
+    def visit(obj: Any):
+        obj_id = id(obj)
+        if obj_id in seen:
+            return
+        seen.add(obj_id)
+
+        if (
+            callable(getattr(obj, "sharded_state_dict", None))
+            and hasattr(obj, "gbuf_ranges")
+            and hasattr(obj, "buffers")
+            and hasattr(obj, "optimizer")
+        ):
+            yield obj
+
+        chained = getattr(obj, "chained_optimizers", None)
+        if isinstance(chained, Iterable):
+            for child in chained:
+                yield from visit(child)
+
+        sub_optimizers = getattr(obj, "sub_optimizers", None)
+        if isinstance(sub_optimizers, Iterable):
+            for child in sub_optimizers:
+                yield from visit(child)
+
+        inner = getattr(obj, "optimizer", None)
+        if inner is not None and inner is not obj:
+            yield from visit(inner)
+
+    yield from visit(optimizer)
+
+
+def _empty_native_optimizer_state_dict(distopt: Any, fallback_step: int) -> dict[str, Any]:
+    inner_state_dict = distopt.optimizer.state_dict()
+    optimizer_state = {
+        key: ([group.copy() for group in value] if key == "param_groups" else value)
+        for key, value in inner_state_dict.items()
+        if key != "state"
+    }
+    for param_group in optimizer_state["param_groups"]:
+        param_group.pop("params", None)
+        param_group["step"] = int(fallback_step)
+    state_dict: dict[str, Any] = {"optimizer": optimizer_state}
+    grad_scaler = getattr(distopt, "grad_scaler", None)
+    if grad_scaler:
+        state_dict["grad_scaler"] = grad_scaler.state_dict()
+    return state_dict
+
+
+def _synchronize_step_mapping(state: MutableMapping) -> None:
+    steps: list[Any] = []
+    for param_state in state.values():
+        if isinstance(param_state, MutableMapping) and "step" in param_state:
+            steps.append(param_state["step"])
+    if not steps:
+        return
+    target = max(_step_as_int(step) for step in steps)
+    for param_state in state.values():
+        if isinstance(param_state, MutableMapping) and "step" in param_state:
+            param_state["step"] = _step_like(param_state["step"], target)
+
+
+def _step_as_int(step: Any) -> int:
+    if isinstance(step, torch.Tensor):
+        return int(step.detach().cpu().item())
+    return int(step)
+
+
+def _step_like(reference: Any, value: int) -> Any:
+    if isinstance(reference, torch.Tensor):
+        return torch.full_like(reference, value)
+    return value
 
 
 def _build_bound_sharded_state_dict(
