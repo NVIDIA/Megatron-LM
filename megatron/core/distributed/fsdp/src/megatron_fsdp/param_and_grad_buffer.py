@@ -906,7 +906,7 @@ class DataParallelBuffer:
             # Build the data parallel buffer index, which contains information
             # on where each parameter / gradient tensor will be stored in this
             # distributed buffer.
-            (self.item_index_map, self.bucket_index, self.shard_bucket_index) = (
+            self.item_index_map, self.bucket_index, self.shard_bucket_index = (
                 build_data_parallel_buffer_index(
                     [to_local_if_dtensor(p).shape for p in self.params],
                     self.dp_rank,
@@ -1767,7 +1767,7 @@ class ParamAndGradBuffer:
                         )
 
         # Get the parameter groups.
-        (self.parameter_groups, self.param_to_param_group, self.bucket_to_bucket_group) = (
+        self.parameter_groups, self.param_to_param_group, self.bucket_to_bucket_group = (
             _get_parameter_groups(module, bucketing_policy, meta_device_init_fp8_params)
         )
         self._init_each_parameter_group_buffers(meta_device_init_fp8_params)
@@ -3946,7 +3946,7 @@ class AllGatherPipeline:
                 UserWarning,
             )
             while len(self.param_gather_event_map) > 0:
-                (bucket_id, bwd) = next(iter(self.param_gather_event_map))
+                bucket_id, bwd = next(iter(self.param_gather_event_map))
                 self.wait_bucket_ready(bucket_id, bwd)
 
         for bucket_id in range(self.num_buckets):
