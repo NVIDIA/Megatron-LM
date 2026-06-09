@@ -61,7 +61,7 @@ MODEL_OPTIONS="\
   --inference-max-requests $MAX_INFERENCE_BS \
   --pretrained-checkpoint $CHECKPOINT \
   --hybrid-layer-pattern M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M- \
-    --spec megatron.core.models.mamba.mamba_layer_specs mamba_stack_spec \
+    --spec megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec \
     --tiktoken-pattern v2 \
     --distributed-timeout-minutes 60 \
     --use-mcore-models \

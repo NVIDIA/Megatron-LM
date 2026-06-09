@@ -133,8 +133,6 @@ def main():
     # Handle old arg values.
     def update_loader_saver(key):
         old_value = getattr(known_args, key)
-        if old_value == "megatron":
-            setattr(known_args, key, "legacy")
         if old_value == "mcore":
             setattr(known_args, key, "core")
     update_loader_saver("loader")

@@ -35,6 +35,7 @@ knowledge distillation, pruning, speculative decoding, and more.
 | `nvidia/NVIDIA-Nemotron-Nano-9B-v2` | ✅ | - | ✅ | ✅ |
 | `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16` | ✅ | - | ✅ | ✅ |
 | `nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-BF16` | ✅ | - | ✅ | ✅ |
+| `nvidia/NVIDIA-Nemotron-3-Ultra-550B-A55B-BF16` | ✅ | - | ✅ | ✅ |
 | `openai/gpt-oss-{20b, 120b}` | ✅ | **Online** | ✅ | ✅ |
 | `Qwen/Qwen3-{0.6B, 8B}` | ✅ | ✅ | ✅ | ✅ |
 | `Qwen/Qwen3-{30B-A3B, 235B-A22B}` | **WAR** | ✅ | ✅ | ✅ |
@@ -76,6 +77,18 @@ provide `${EXPORT_DIR}` to `export.sh`.
 
 \
     PP=1 \
+    HF_MODEL_CKPT=<pretrained_model_name_or_path> \
+    MLM_MODEL_CKPT=/tmp/Llama-3.2-1B-Instruct_quant \
+    EXPORT_DIR=/tmp/Llama-3.2-1B-Instruct_export \
+    ./export.sh meta-llama/Llama-3.2-1B-Instruct
+```
+
+To export the model for vLLM fakequant example in `modelopt/examples/vllm_serve/vllm_serve_fakequant.py`,
+export the model with flag `--export-vllm-fq`:
+```sh
+\
+    PP=1 \
+    MLM_EXTRA_ARGS=--export-vllm-fq \
     HF_MODEL_CKPT=<pretrained_model_name_or_path> \
     MLM_MODEL_CKPT=/tmp/Llama-3.2-1B-Instruct_quant \
     EXPORT_DIR=/tmp/Llama-3.2-1B-Instruct_export \
@@ -153,44 +166,46 @@ Then only the draft model is called during training. AL is no longer reported du
 
 ### ⭐ Pruning
 
-Checkout pruning getting started section and guidelines for configuring pruning parameters in the [ModelOpt pruning README](https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/pruning).
+Pruning is supported for GPT and Mamba models in Pipeline Parallel mode. The `prune.sh` script
+prunes a model by passing `--prune-export-config '<json_without_spaces>'` to `prune.py` via `MLM_EXTRA_ARGS`.
+The JSON describes the target pruned architecture; calibration data is used to compute importance
+scores that drive the dimension reduction.
 
-Pruning is supported for GPT and Mamba models in Pipeline Parallel mode. Available pruning dimensions are:
-
-- `TARGET_FFN_HIDDEN_SIZE`
-- `TARGET_HIDDEN_SIZE`
-- `TARGET_NUM_ATTENTION_HEADS`
-- `TARGET_NUM_QUERY_GROUPS`
-- `TARGET_MAMBA_NUM_HEADS`
-- `TARGET_MAMBA_HEAD_DIM`
-- `TARGET_NUM_MOE_EXPERTS`
-- `TARGET_MOE_FFN_HIDDEN_SIZE`
-- `TARGET_MOE_SHARED_EXPERT_INTERMEDIATE_SIZE`
-- `TARGET_NUM_LAYERS`
-- `LAYERS_TO_DROP` (comma separated, 1-indexed list of layer numbers to directly drop)
+Supported hyperparameters (any subset can appear as keys in `--prune-export-config`):
+`hidden_size`, `ffn_hidden_size`, `num_attention_heads`, `num_query_groups`, `mamba_num_heads`,
+`mamba_head_dim`, `num_moe_experts`, `moe_ffn_hidden_size`, `moe_shared_expert_intermediate_size`,
+`num_layers`.
 
 Example for depth pruning Qwen3-8B from 36 to 24 layers:
 
 ```sh
 PP=1 \
-TARGET_NUM_LAYERS=24 \
+MLM_EXTRA_ARGS='--prune-export-config {"num_layers":24}' \
 HF_MODEL_CKPT=<pretrained_model_name_or_path> \
 MLM_MODEL_SAVE=Qwen3-8B-Pruned \
 ./prune.sh Qwen/Qwen3-8B
 ```
 
-> [!TIP]
-> If number of layers in the model is not divisible by pipeline parallel size (PP), you can configure uneven
-> PP by setting `MLM_EXTRA_ARGS="--decoder-first-pipeline-num-layers <X> --decoder-last-pipeline-num-layers <Y>"`
+The default calibration dataset is `nemotron-post-training-dataset-v2` (gated, requires
+`hf auth login`). Override it by adding `--calib-dataset <hf_dataset_name_or_local_jsonl>`
+to `MLM_EXTRA_ARGS` (e.g. `cnn_dailymail` for an ungated alternative).
 
 > [!TIP]
-> You can reuse pruning scores for pruning same model again to different architectures by setting
-> `PRUNE_ARGS="--pruning-scores-path <path_to_save_scores>"`
+> If number of layers in the model is not divisible by pipeline parallel size (PP), you can configure uneven
+> PP by adding `--decoder-first-pipeline-num-layers <X> --decoder-last-pipeline-num-layers <Y>` to `MLM_EXTRA_ARGS`.
+
+> [!TIP]
+> You can reuse intermediate pruning scores when pruning the same model again to a different config
+> by adding `--prune-intermediate-ckpt <path_to_cache_dir>` to `MLM_EXTRA_ARGS`.
 
 > [!NOTE]
 > When loading pruned M-LM checkpoint for subsequent steps, make sure overwrite the pruned parameters in the
 > default `conf/` by setting `MLM_EXTRA_ARGS`. E.g.: for loading above pruned Qwen3-8B checkpoint for mmlu, set:
 > `MLM_EXTRA_ARGS="--num-layers 24"`
+
+For NAS-based automatic pruning (search across many candidate architectures and pick the best via
+MMLU scoring), see the [Megatron-Bridge pruning example](https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/megatron_bridge#pruning).
+Checkout pruning getting started and general guidelines in the [ModelOpt pruning README](https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/pruning).
 
 ### ⭐ Inference and Training
 
