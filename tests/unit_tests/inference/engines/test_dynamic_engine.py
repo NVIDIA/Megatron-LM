@@ -51,7 +51,7 @@ from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.ssm.mamba_mixer import _check_mamba_sequence_packing_support
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
-from megatron.core.transformer.enums import CudaGraphScope
+from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
@@ -121,6 +121,7 @@ class DynamicEngineTestConfig:
     use_fixed_output_lengths: bool = False
     num_cuda_graphs: int = None
     use_cuda_graphs_for_non_decode_steps: bool = True
+    cuda_graph_all_prefills: bool = False
     fp8: bool = False
     model_provider: str = "gpt"
     return_log_probs: bool = False
@@ -128,9 +129,9 @@ class DynamicEngineTestConfig:
     skip_prompt_log_probs: bool = False
     enable_chunked_prefill: bool = False
     enable_prefix_caching: bool = False
-    cuda_graph_scope: List[CudaGraphScope] = field(
-        default_factory=lambda: [CudaGraphScope.full_iteration_inference]
-    )
+    cuda_graph_modules: List[CudaGraphModule] = field(default_factory=list)
+    inference_cuda_graph_scope: InferenceCudaGraphScope = InferenceCudaGraphScope.block
+    cuda_graph_impl: Optional[str] = None
     force_build_cuda_graphs: bool = False
     transformer_impl: str = "local"
     inference_moe_token_dispatcher_type: str = "nccl"
@@ -181,6 +182,23 @@ class DynamicEngineTestEnv:
 
 
 class DynamicInferenceEngineTestBase:
+
+    @staticmethod
+    def _assert_inference_cuda_graphs_disabled(env) -> None:
+        model = env.engine.controller.inference_wrapped_model.model
+        assert env.engine.cuda_graph_impl == "full_iteration"
+        assert env.engine.inference_cuda_graph_scope == InferenceCudaGraphScope.none
+        assert env.engine.capture_stats is None
+        assert not hasattr(model.decoder, 'cudagraph_manager')
+        for layer in model.decoder.layers:
+            assert not hasattr(layer, 'cudagraph_manager')
+
+    @staticmethod
+    def _cuda_graph_batch_dimension_signature(env) -> List[Tuple[int, int, int]]:
+        return [
+            (dim.token_count, dim.prefill_req_count, dim.decode_req_count)
+            for dim in env.engine.context.cuda_graph_batch_dimensions_list
+        ]
 
     @classmethod
     def _build_requests(cls, test_config: DynamicEngineTestConfig) -> List[DynamicInferenceRequest]:
@@ -256,7 +274,10 @@ class DynamicInferenceEngineTestBase:
             inference_config=InferenceConfig(
                 max_sequence_length=test_config.max_sequence_length,
                 num_cuda_graphs=test_config.num_cuda_graphs,
-                use_cuda_graphs_for_non_decode_steps=True,
+                use_cuda_graphs_for_non_decode_steps=(
+                    test_config.use_cuda_graphs_for_non_decode_steps
+                ),
+                cuda_graph_all_prefills=test_config.cuda_graph_all_prefills,
                 buffer_size_gb=test_config.context_buffer_size_gb,
                 paused_buffer_size_gb=test_config.context_paused_buffer_size_gb,
                 block_size_tokens=test_config.context_block_size_tokens,
@@ -299,6 +320,13 @@ class DynamicInferenceEngineTestBase:
 
         # Requests.
         requests = cls._build_requests(test_config)
+        effective_cuda_graph_impl = test_config.cuda_graph_impl
+        if effective_cuda_graph_impl is None:
+            effective_cuda_graph_impl = (
+                "local"
+                if test_config.num_cuda_graphs is not None and test_config.force_build_cuda_graphs
+                else "none"
+            )
 
         if test_config.model_provider == "gpt":
             # Transformer config.
@@ -309,12 +337,7 @@ class DynamicInferenceEngineTestBase:
                 hidden_size=128 if test_config.fp8 else 32,
                 num_attention_heads=4,
                 use_cpu_initialization=True,
-                cuda_graph_impl=(
-                    "local"
-                    if test_config.num_cuda_graphs is not None
-                    and test_config.force_build_cuda_graphs
-                    else "none"
-                ),
+                cuda_graph_impl=effective_cuda_graph_impl,
                 inference_rng_tracker=True,
                 tensor_model_parallel_size=test_config.tensor_model_parallel_size,
                 pipeline_model_parallel_size=test_config.pipeline_model_parallel_size,
@@ -331,7 +354,13 @@ class DynamicInferenceEngineTestBase:
                 fp8="hybrid" if test_config.fp8 else None,
                 fp8_recipe="tensorwise" if test_config.fp8 else None,
                 inference_sampling_seed=test_config.random_seed,
-                cuda_graph_scope=test_config.cuda_graph_scope,
+                cuda_graph_modules=test_config.cuda_graph_modules,
+                inference_cuda_graph_scope=(
+                    test_config.inference_cuda_graph_scope
+                    if test_config.num_cuda_graphs is not None
+                    and test_config.force_build_cuda_graphs
+                    else InferenceCudaGraphScope.none
+                ),
                 transformer_impl=test_config.transformer_impl,
                 inference_moe_token_dispatcher_type=(
                     test_config.inference_moe_token_dispatcher_type
@@ -383,12 +412,7 @@ class DynamicInferenceEngineTestBase:
                 mamba_num_heads=16,
                 num_attention_heads=16,
                 use_cpu_initialization=True,
-                cuda_graph_impl=(
-                    "local"
-                    if test_config.num_cuda_graphs is not None
-                    and test_config.force_build_cuda_graphs
-                    else "none"
-                ),
+                cuda_graph_impl=effective_cuda_graph_impl,
                 inference_rng_tracker=True,
                 tensor_model_parallel_size=test_config.tensor_model_parallel_size,
                 pipeline_model_parallel_size=pp_size,
@@ -405,7 +429,13 @@ class DynamicInferenceEngineTestBase:
                 fp8="hybrid" if test_config.fp8 else None,
                 fp8_recipe="tensorwise" if test_config.fp8 else None,
                 inference_sampling_seed=test_config.random_seed,
-                cuda_graph_scope=test_config.cuda_graph_scope,
+                cuda_graph_modules=test_config.cuda_graph_modules,
+                inference_cuda_graph_scope=(
+                    test_config.inference_cuda_graph_scope
+                    if test_config.num_cuda_graphs is not None
+                    and test_config.force_build_cuda_graphs
+                    else InferenceCudaGraphScope.none
+                ),
                 transformer_impl=test_config.transformer_impl,
                 inference_moe_token_dispatcher_type=(
                     test_config.inference_moe_token_dispatcher_type
@@ -597,20 +627,24 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     )
     @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
     @pytest.mark.parametrize("num_cuda_graphs", [None, 1, 4, -1])
-    @pytest.mark.parametrize("cuda_graph_scope", [[], [CudaGraphScope.full_iteration_inference]])
-    def test_simple(self, model_provider, num_cuda_graphs, cuda_graph_scope) -> None:
+    @pytest.mark.parametrize(
+        "inference_cuda_graph_scope", [InferenceCudaGraphScope.layer, InferenceCudaGraphScope.block]
+    )
+    def test_simple(self, model_provider, num_cuda_graphs, inference_cuda_graph_scope) -> None:
         """Simple test that runs without errors, and validates output."""
         skip_if_mamba_sequence_packing_not_available(model_provider)
         num_tokens_to_generate = 16
 
         # Run test.
+        # Force decode-only CG capture: capturing mixed graphs across the full range will OOM.
         env = self._run_test(
             num_tokens_to_generate=num_tokens_to_generate,
             model_provider=model_provider,
             num_cuda_graphs=num_cuda_graphs,
-            cuda_graph_scope=cuda_graph_scope,
+            inference_cuda_graph_scope=inference_cuda_graph_scope,
             force_build_cuda_graphs=True,
             context_max_requests=128,
+            use_cuda_graphs_for_non_decode_steps=False,
         )
 
         # Validate max_requests, max_tokens.
@@ -620,7 +654,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             assert env.engine.context.cuda_graph_token_counts is not None
             assert env.engine.context.cuda_graph_batch_dimensions_list
             model = env.engine.controller.inference_wrapped_model.model
-            if cuda_graph_scope == [CudaGraphScope.full_iteration_inference]:
+            if inference_cuda_graph_scope == InferenceCudaGraphScope.block:
                 # hybrid models attach cudagraph_manager to the model; others attach to the decoder
                 if model_provider == "hybrid":
                     assert model.cudagraph_manager.cudagraph_runners
@@ -673,6 +707,63 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 f"result ({request.generated_tokens}) != "
                 f"expected ({expected_generated_tokens})."
             )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_full_iteration_impl_does_not_setup_inference_cuda_graphs(self) -> None:
+        """impl=full_iteration is training-only; inference graph setup follows inference scope."""
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                model_provider="gpt",
+                num_tokens_to_generate=4,
+                num_cuda_graphs=1,
+                force_build_cuda_graphs=True,
+                context_max_requests=128,
+                cuda_graph_impl="full_iteration",
+                inference_cuda_graph_scope=InferenceCudaGraphScope.none,
+            )
+        )
+
+        self._assert_inference_cuda_graphs_disabled(env)
+
+        with mock.patch.object(
+            env.engine.controller,
+            "_dynamic_step_forward_logits",
+            wraps=env.engine.controller._dynamic_step_forward_logits,
+        ) as forward_logits:
+            with torch.inference_mode():
+                env.engine.create_cuda_graphs()
+
+        assert forward_logits.call_count == 0
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    def test_deprecated_full_iteration_inference_scope_matches_new_flag_runtime_behavior(
+        self,
+    ) -> None:
+        """Deprecated scope='full_iteration_inference' must still build block-level graphs."""
+        with pytest.warns(
+            DeprecationWarning, match="cuda_graph_modules 'full_iteration_inference' is deprecated"
+        ):
+            env = self._run_test(
+                num_tokens_to_generate=4,
+                model_provider="gpt",
+                num_cuda_graphs=1,
+                cuda_graph_modules='full_iteration_inference',
+                force_build_cuda_graphs=True,
+                context_max_requests=128,
+            )
+
+        model = env.engine.controller.inference_wrapped_model.model
+        assert model.config.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+        assert model.config.cuda_graph_modules == []
+        assert model.decoder.cudagraph_manager.cudagraph_runners
+        for layer in model.decoder.layers:
+            assert not hasattr(layer, 'cudagraph_manager')
 
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
@@ -763,6 +854,28 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @torch.inference_mode()
+    def test_max_sequence_length_clamp(self) -> None:
+        """Clamp (not reject) when num_tokens_to_generate exceeds the remaining sequence budget."""
+        test_config = DynamicEngineTestConfig(
+            num_requests=1, min_prompt_length=8, max_prompt_length=8, num_tokens_to_generate=4
+        )
+        env = self._build_test_env(test_config)
+        request = env.requests[0]
+
+        remaining_tokens = env.engine.context.max_sequence_length - len(request.prompt_tokens)
+        request.sampling_params.num_tokens_to_generate = remaining_tokens + 100
+
+        env.engine._add_request(request)
+
+        # Clamped to the remaining budget, not rejected.
+        assert request.status != Status.FAILED
+        assert request.sampling_params.num_tokens_to_generate == remaining_tokens
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
     def test_multi_add(self, model_provider: str) -> None:
         """Test adding multiple requests simultaneously."""
@@ -783,33 +896,56 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    def test_cuda_graph_token_counts(self) -> None:
+    @pytest.mark.parametrize("use_non_decode", [False, True])
+    def test_cuda_graph_token_counts(self, use_non_decode: bool) -> None:
         """Test initialization of `cuda_graph_token_counts` in dynamic context."""
 
-        # Test num_cuda_graphs.
-        for num_cuda_graphs, expected_cuda_graph_token_counts in [
+        # Exponential-decay graph distribution (halve from max down to tp_size).
+        # decode-only path: cuda_graph_max_tokens = max_requests * (spec+1) = 80.
+        # non-decode path: cuda_graph_max_tokens = self.max_tokens (DEFAULT 16384);
+        # most large prefill sizes are filtered by is_valid because
+        # token_count > prefill_req_count * (max_sequence_length - 1).
+        decode_only_cases = [
             (0, [80]),
             (1, [80]),
-            (2, [80, 40]),
-            (4, [80, 72, 48, 24]),
-            (8, [80, 64, 48, 32, 16]),
-            (16, [80, 72, 64, 56, 48, 40, 32, 24, 16, 8]),
-            (32, [80, 72, 64, 56, 48, 40, 32, 24, 16, 8]),
-        ]:
+            (2, [80, 1]),
+            (4, [80, 40, 20, 1]),
+            (8, [80, 40, 20, 10, 4, 2, 1]),
+            (16, [80, 40, 20, 10, 4, 2, 1]),
+            (32, [80, 40, 20, 10, 4, 2, 1]),
+        ]
+        non_decode_cases = [
+            (0, [80]),
+            (1, [80]),
+            (2, [80, 1]),
+            (4, [80, 40, 20, 1]),
+            (8, [1024, 512, 256, 80, 40, 20, 10, 4, 2, 1]),
+            (16, [1024, 512, 256, 128, 80, 64, 40, 32, 20, 16, 10, 8, 4, 2, 1]),
+            (32, [1024, 512, 256, 128, 80, 64, 40, 32, 20, 16, 10, 8, 4, 2, 1]),
+        ]
+        cases = non_decode_cases if use_non_decode else decode_only_cases
+
+        for num_cuda_graphs, expected_cuda_graph_token_counts in cases:
 
             # Build cuda graphs (inside dynamic engine).
             env = self._build_test_env(
                 DynamicEngineTestConfig(
-                    context_buffer_size_gb=0.01, num_cuda_graphs=num_cuda_graphs
+                    context_buffer_size_gb=0.01,
+                    num_cuda_graphs=num_cuda_graphs,
+                    use_cuda_graphs_for_non_decode_steps=use_non_decode,
+                    cuda_graph_all_prefills=use_non_decode,
                 )
             )
             actual_cuda_graph_token_counts = env.engine.context.cuda_graph_token_counts
-            assert (
-                actual_cuda_graph_token_counts == expected_cuda_graph_token_counts
-            ), "num_cuda_graphs %d ... cuda_graph_token_counts: expected %s, found %s." % (
-                num_cuda_graphs,
-                expected_cuda_graph_token_counts,
-                actual_cuda_graph_token_counts,
+            assert actual_cuda_graph_token_counts == expected_cuda_graph_token_counts, (
+                "num_cuda_graphs %d use_non_decode=%s ... cuda_graph_token_counts: "
+                "expected %s, found %s."
+                % (
+                    num_cuda_graphs,
+                    use_non_decode,
+                    expected_cuda_graph_token_counts,
+                    actual_cuda_graph_token_counts,
+                )
             )
 
     @pytest.mark.internal
@@ -1036,6 +1172,69 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                     f"Request {request.request_id}, generated token {i}: "
                     f"log_prob {log_prob} is out of expected range [-50.0, 0.0]"
                 )
+
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_return_prompt_log_probs_with_zero_tokens_to_generate(self):
+        """Prompt log probs must be returned when scoring only (num_tokens_to_generate=0).
+
+        Regression test for a prefill-step trimming bug: when a request generates
+        no tokens, the end-of-generation trim set ``keep=0`` and front-sliced
+        ``request_log_probs[:0]``, discarding every prompt log prob (in a prefill
+        step ``request_log_probs`` covers the whole prompt, with the disposable
+        sampled-token log prob at the tail). The fix trims the excess *trailing*
+        log probs instead. This is the path exercised by loglikelihood / echo
+        evaluations (e.g. lm-eval-harness sends ``max_tokens=0``).
+        """
+        env = self._run_test(
+            return_log_probs=True,
+            materialize_only_last_token_logits=False,
+            skip_prompt_log_probs=False,
+            num_tokens_to_generate=0,
+        )
+
+        validated_any = False
+        for request in env.requests:
+            if request.status != Status.COMPLETED:
+                continue
+
+            # No tokens were requested, so none should be generated.
+            assert len(request.generated_tokens) == 0, (
+                f"Request {request.request_id}: expected 0 generated tokens, "
+                f"got {len(request.generated_tokens)}"
+            )
+            assert request.generated_log_probs is None or len(request.generated_log_probs) == 0, (
+                f"Request {request.request_id}: expected no generated log probs, got "
+                f"{len(request.generated_log_probs) if request.generated_log_probs else 0}"
+            )
+
+            # The full set of prompt log probs (all tokens except the first) must
+            # still be present -- before the fix this list was empty.
+            prompt_len = len(request.prompt_tokens)
+            assert request.prompt_log_probs is not None, (
+                f"Request {request.request_id}: prompt_log_probs should not be None "
+                f"when scoring with num_tokens_to_generate=0"
+            )
+            assert len(request.prompt_log_probs) == prompt_len - 1, (
+                f"Request {request.request_id}: Expected {prompt_len - 1} prompt log probs, "
+                f"got {len(request.prompt_log_probs)}"
+            )
+            for i, log_prob in enumerate(request.prompt_log_probs):
+                assert (
+                    log_prob is not None
+                ), f"Request {request.request_id}, prompt token {i}: log_prob is None"
+                assert not math.isnan(log_prob) and not math.isinf(
+                    log_prob
+                ), f"Request {request.request_id}, prompt token {i}: log_prob {log_prob} invalid"
+                assert -50.0 <= log_prob <= 0.0, (
+                    f"Request {request.request_id}, prompt token {i}: "
+                    f"log_prob {log_prob} is out of expected range [-50.0, 0.0]"
+                )
+            validated_any = True
+
+        assert validated_any, "No completed requests were validated"
 
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
@@ -3210,6 +3409,150 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
         assert env.engine.context.active_token_count == 0
         assert env.engine.context.total_request_count == 0
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_speculative_decoding_stats_exclude_prefill(self):
+        """Test that MTP acceptance stats are cumulative and exclude prefill requests.
+
+        Prefill requests don't get MTP speculative proposals (MTP heads only run for
+        decode requests). Verify that:
+        1. Stats accumulate across the engine lifetime (no reset between logging).
+        2. Prefill steps don't inflate _spec_tokens_proposed.
+        3. The acceptance rate reflects only decode steps.
+        """
+        test_config = DynamicEngineTestConfig(
+            num_requests=0,  # Added manually below to stagger prefill vs decode
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=10,
+            num_speculative_tokens=2,
+            materialize_only_last_token_logits=False,
+            model_provider="gpt",
+        )
+        env = self._build_test_env(test_config)
+        unwrapped_model = env.engine.controller.inference_wrapped_model.model
+        hidden_size = unwrapped_model.config.hidden_size
+
+        # Mock forward: all tokens get the same high-probability logit so every
+        # speculative token is accepted (acceptance rate should be 100%).
+        def mock_mtp_forward(*args, **kwargs):
+            tokens = kwargs.get("tokens", args[0] if args else kwargs.get("input_ids"))
+            base_logits = torch.zeros(
+                tokens.size(0),
+                tokens.size(1),
+                test_config.vocab_size,
+                device=tokens.device,
+                dtype=torch.bfloat16,
+            )
+            base_logits[:, :, 0] = 100.0
+            unwrapped_model._decoder_hidden_states_cache = torch.zeros(
+                tokens.size(1), 1, hidden_size, device=tokens.device, dtype=torch.bfloat16
+            )
+            return base_logits
+
+        def mock_compute_mtp_single_step(
+            hidden_states, next_token_ids, position_ids, depth, eager=False, cache_key=None
+        ):
+            n = hidden_states.size(0)
+            logits = torch.zeros(
+                n, 1, test_config.vocab_size, device=hidden_states.device, dtype=torch.bfloat16
+            )
+            logits[:, :, 0] = 100.0
+            return hidden_states, logits
+
+        unwrapped_model.forward = mock_mtp_forward
+        unwrapped_model.compute_mtp_single_step = mock_compute_mtp_single_step
+
+        # Verify counters start at zero.
+        assert sum(env.engine._spec_tokens_proposed_per_pos) == 0
+        assert sum(env.engine._spec_tokens_accepted_per_pos) == 0
+        assert env.engine._spec_steps == 0
+
+        # Add first request and run through prefill + some decode steps.
+        env.engine.add_request(
+            request_id=0,
+            prompt=torch.randint(
+                0, test_config.vocab_size - 1, (4,), dtype=torch.int64, device='cuda'
+            ),
+            sampling_params=SamplingParams(num_tokens_to_generate=10, termination_id=-1),
+        )
+
+        # Step 1: prefill for request 0 — should NOT count as a spec step.
+        # The controller returns accepted_tokens=None for prefill-only batches
+        # (num_decode_requests == 0), so the engine must not increment any stats.
+        env.engine.step_modern()
+        proposed_after_prefill = sum(env.engine._spec_tokens_proposed_per_pos)
+        accepted_after_prefill = sum(env.engine._spec_tokens_accepted_per_pos)
+        assert proposed_after_prefill == 0, "Prefill step should not propose any spec tokens"
+        assert accepted_after_prefill == 0, "Prefill step should not accept any spec tokens"
+        assert env.engine._spec_steps == 0, "Prefill step should not count as a spec step"
+
+        # Step 2: decode for request 0 — should count spec tokens.
+        env.engine.step_modern()
+        assert (
+            sum(env.engine._spec_tokens_proposed_per_pos) > proposed_after_prefill
+        ), "Decode step should have incremented _spec_tokens_proposed_per_pos"
+        assert (
+            sum(env.engine._spec_tokens_accepted_per_pos) > accepted_after_prefill
+        ), "With deterministic mock, decode step should have accepted spec tokens"
+
+        # Now add a second request while request 0 is decoding.
+        # The next step is a mixed prefill (req 1) + decode (req 0) step.
+        env.engine.add_request(
+            request_id=1,
+            prompt=torch.randint(
+                0, test_config.vocab_size - 1, (4,), dtype=torch.int64, device='cuda'
+            ),
+            sampling_params=SamplingParams(num_tokens_to_generate=10, termination_id=-1),
+        )
+
+        proposed_before_mixed = sum(env.engine._spec_tokens_proposed_per_pos)
+        env.engine.step_modern()
+        proposed_after_mixed = sum(env.engine._spec_tokens_proposed_per_pos)
+
+        # In the mixed step, only the decode request (req 0) should contribute to
+        # proposed count, NOT the prefilling request (req 1). With 2 spec tokens and
+        # 1 decode request, proposed should increase by exactly 2.
+        proposed_delta = proposed_after_mixed - proposed_before_mixed
+        assert proposed_delta == test_config.num_speculative_tokens, (
+            f"Mixed prefill+decode step: expected proposed delta of "
+            f"{test_config.num_speculative_tokens} (1 decode request), got {proposed_delta}"
+        )
+
+        # Run to completion.
+        while env.engine.has_unfinished_requests():
+            env.engine.step_modern()
+
+        # Stats should be cumulative (non-zero after all requests finish).
+        total_proposed = sum(env.engine._spec_tokens_proposed_per_pos)
+        total_accepted = sum(env.engine._spec_tokens_accepted_per_pos)
+        assert total_proposed > 0
+        assert total_accepted > 0
+        assert env.engine._spec_steps > 0
+
+        # With deterministic mock (all tokens accepted), acceptance rate should be 100%.
+        acceptance_rate = total_accepted / total_proposed
+        assert (
+            acceptance_rate == 1.0
+        ), f"Expected 100% acceptance with deterministic mock, got {acceptance_rate * 100:.1f}%"
+
+        # With deterministic mock, every position should have 100% acceptance.
+        for pos in range(test_config.num_speculative_tokens):
+            assert (
+                env.engine._spec_tokens_proposed_per_pos[pos] > 0
+            ), f"Position {pos} should have proposals"
+            pos_rate = (
+                env.engine._spec_tokens_accepted_per_pos[pos]
+                / env.engine._spec_tokens_proposed_per_pos[pos]
+            )
+            assert pos_rate == 1.0, (
+                f"Expected 100% acceptance at position {pos} with deterministic mock, "
+                f"got {pos_rate * 100:.1f}%"
+            )
 
     @pytest.mark.internal
     @pytest.mark.skipif(
