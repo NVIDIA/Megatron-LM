@@ -2313,7 +2313,9 @@ class TECudaGraphHelper:
                 FineGrainedActivationOffloadingInterface as off_interface,
             )
 
-            # Disable and enable offloading before and after the warmup stage of cuda graph.
+            # TE CUDA graph warmup should establish graph state without launching
+            # activation D2H copies; the post-warmup hook restores offloading for
+            # the measured/replay iterations.
             if self.config.fine_grained_activation_offloading:
                 kwargs['pre_warmup_hook'] = off_interface.disable_offload
                 kwargs['post_warmup_hook'] = off_interface.enable_offload
