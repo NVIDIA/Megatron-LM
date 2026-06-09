@@ -882,7 +882,7 @@ def _build_megatron_fsdp_v2_muon_optimizer(
     checkpointing, and passing full FSDP buffers to an Adam built over only the
     non-matrix param subset).
     """
-    from .fully_shard_v2_muon import FullyShardV2Muon, FullyShardV2MuonOptimizer
+    from .fully_shard_v2_muon import FullyShardV2MuonOptimizer
 
     # Tag params and route non-linear/embedding params to Adam (same mechanism
     # as the non-FSDP emerging path in _get_megatron_emerging_optimizer).
@@ -911,8 +911,6 @@ def _build_megatron_fsdp_v2_muon_optimizer(
         scale_mode=getattr(config, 'muon_scale_mode', 'spectral'),
         extra_scale_factor=getattr(config, 'muon_extra_scale_factor', 1.0),
         fp32_matmul_prec=getattr(config, 'muon_fp32_matmul_prec', 'medium'),
-        # TODO(phase3): wire pg_collection/tp_mode for tensor-parallel NS (Phase 2).
-        pg_collection=None,
     )
 
     adam_config = copy.copy(config)
@@ -954,25 +952,12 @@ def _build_megatron_fsdp_v2_muon_optimizer(
             adam_part.config = config
             optimizers.append(adam_part)
 
-        # --- Muon for the 2D matrix params (single-root FSDP v2) ---
-        # Symmetric with Adam: pass the muon bucket of optimizer-facing params
-        # (dist_params). FullyShardV2Muon resolves each back to its FSDP
-        # ParameterGroup via the dist_param back-references.
-        muon_groups, _ = _get_param_groups_and_buffers(
-            chunk_list,
-            model_chunk_offset=model_chunk_offset,
-            config=config,
-            config_overrides=config_overrides,
-            filter_fn=lambda g: g.get('optimizer') != 'adam',
-            buffer_name='buffers',
-        )
-        if muon_groups:
-            muon = FullyShardV2Muon(muon_groups, **muon_kwargs)
-            optimizers.append(
-                FullyShardV2MuonOptimizer(muon, config, model_chunks=chunk_list)
-            )
-
         model_chunk_offset += 1
+
+    # One single-root Muon over every chunk's 2D matrix params on this rank. The
+    # wrapper pulls those dist_params + grad DTensors out of the FSDP modules itself
+    # (in layer order), so the factory needs no per-chunk muon param-group plumbing.
+    optimizers.append(FullyShardV2MuonOptimizer(config, model_chunks, **muon_kwargs))
 
     if len(optimizers) == 1:
         return optimizers[0]
