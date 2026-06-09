@@ -17,32 +17,28 @@ context bookkeeping. Async policy and transaction state live in
 ## Canonical Plan
 
 `AsyncDecodePlan` is the immutable description of a candidate decode step. It
-contains:
+owns layout and feature requirements only:
 
-- request IDs and source rows for the planned active layout
-- query lengths, KV offsets, token positions, token-to-request rows, and KV
-  block indices
-- reserved KV block metadata and finished request IDs
-- CUDA graph shape, decode stride, and padded request count
-- the prepared `AsyncLayoutSnapshot`
-- row-map decision, graph compatibility, and layout compatibility
-- EP, Mamba, MTP, logprob, and expected resource requirements
+- `AsyncDecodeLayout`, including request IDs, source rows, graph shape, request
+  lengths, KV offsets, token positions, token-to-request rows, KV block mapping,
+  and optional Mamba read/write indices
+- finished request IDs
+- Mamba, MTP, and logprob requirements
 
-The context builds this plan while preparing the speculative next-step layout.
-When the controller launches the async forward, the transaction keeps that plan
-and attaches the runtime layout snapshot used for pending-forward resolution.
+Resource reservations are not part of the plan. They live in the
+transaction-owned `AsyncResourceLedger`, and row reuse decisions live in the
+transaction resolution.
 
 ## Transaction Lifecycle
 
 `AsyncDecodeTransaction` owns speculative async work for one pending forward:
-state, fences/events, sample tickets, resource ledger, row map, participant
-state, and diagnostics.
+state, plan, resolution, resource ledger, participants, fences/events, sample
+tickets, discard reason, and diagnostics.
 
-The coordinator owns transaction creation, pending detection, and retirement.
-Controller compatibility helpers delegate to the coordinator so legacy call
-sites can keep using `_pending_async_transaction`,
-`_has_pending_async_forward_state`, `_begin_async_step_transaction`, and
-`_retire_async_transaction`.
+`AsyncDecodeCoordinator` is the only owner of prepared decode state, the
+pending transaction, step IDs, and per-step EP state. The controller owns async
+configuration values, diagnostics counters, sampling/readback buffers, and the
+coordinator reference; it does not own lifecycle state.
 
 The lifecycle rules are:
 
@@ -82,13 +78,13 @@ Pending-forward reuse is centralized separately in
 the reusable flag, row map, row-mapped flag, discard reason, row-map policy, and
 layout/graph compatibility. `AsyncDecodeTransaction.pending_forward_decision`
 previews this decision without changing state. `resolve_against_current`
-records the decision on the plan and transitions the transaction to `resolved`
-or a discarded state. Controller code consumes this decision instead of
-recomputing row-map or graph facts in multiple places.
+records the accepted `AsyncPendingForwardUse` on the transaction, or records the
+discard reason. Controller code consumes this decision instead of recomputing
+row-map or graph facts in multiple places.
 
 ## Layout And Row Maps
 
-`AsyncLayoutSnapshot` captures the prepared request IDs, graph shape, request
+`AsyncDecodeLayout` captures the prepared request IDs, graph shape, request
 lengths, KV offsets, token rows, token positions, KV block mapping, and optional
 Mamba read/write indices. A pending forward can be reused only when:
 
@@ -120,9 +116,11 @@ Current participants include:
 - `AsyncResourceParticipant`: releases deferred resources on commit and drains
   all speculative resources on rollback.
 
-Participant hooks are idempotent. A commit or rollback retry must not publish
-Mamba banks twice, release a KV block twice, or consume the same sample ticket
-twice.
+Participant lifecycle flags live only in the shared participant base. Concrete
+participants store only side-effect-specific handles or configuration. Their
+commit, rollback, and retire hooks are guarded by those shared flags so a retry
+does not publish Mamba banks twice, release a KV block twice, or consume the
+same sample ticket twice.
 
 Participants are attached through transaction helpers. If a participant is
 added after the transaction has already prepared its hooks, the new participant
@@ -147,12 +145,12 @@ unused reservations into the deferred list and then releases everything. This
 keeps prepare, commit, and rollback symmetric for speculative resources.
 
 The context borrows the active ledger reference only while the coordinator-owned
-transaction is in flight. Commit and rollback release behavior remains owned by
-the transaction ledger.
+transaction is in flight. Commit, rollback, drain, and release behavior remains
+owned by the transaction ledger.
 
 ## Mamba, MTP, And Logprobs
 
-Hybrid models include Mamba bank read/write indices in the layout snapshot.
+Hybrid models include Mamba bank read/write indices in the decode layout.
 Pending forwards are reusable only when the current rows match the planned
 Mamba layout after row-map resolution. On commit, the Mamba participant accepts
 candidate banks for the transaction plan's request IDs. On rollback, candidate
@@ -184,8 +182,8 @@ Async diagnostics are intentionally cheap and deterministic:
 - transaction diagnostics include state, request IDs, row map, discard reason,
   plan diagnostics, and participant diagnostics
 - resource diagnostics include reservations, deferred KV blocks, deferred
-  Mamba slots, Mamba leases, and consumed reservations
-- EP diagnostics include protocol counters and transaction-local EP decisions
+  Mamba slots, in-flight state, and consumed reservations
+- EP diagnostics include protocol counters and coordinator-owned step decisions
 
 The focused unit tests cover overlap ordering, no pre-launch host sync, reuse
 and commit counters, rollback and release-once behavior, graph mismatch

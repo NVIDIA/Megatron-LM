@@ -27,11 +27,7 @@ TEXT_CONTROLLER = (
 DYNAMIC_CONTEXT = "megatron/core/inference/contexts/dynamic_context.py"
 
 
-EXPECTED_VIOLATIONS = {
-    ("async-dataclass-slots", ASYNC_TRANSACTION, "AsyncGraphShape"),
-    ("async-dataclass-slots", ASYNC_TRANSACTION, "AsyncSampleReadback"),
-    ("async-dataclass-slots", ASYNC_TRANSACTION, "AsyncSampleTicket"),
-}
+EXPECTED_VIOLATIONS = {}
 
 
 EXACT_DATACLASS_FIELDS = {
@@ -297,7 +293,7 @@ class Violation:
 
 def test_async_transaction_architecture_contract() -> None:
     actual = {violation.as_tuple() for violation in scan_production()}
-    assert actual == EXPECTED_VIOLATIONS
+    assert actual == set(EXPECTED_VIOLATIONS)
 
 
 def test_architecture_guard_positive_fixture() -> None:

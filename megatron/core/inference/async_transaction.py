@@ -40,7 +40,7 @@ class AsyncRowMapPolicy(str, Enum):
             raise ValueError(f"Unknown async row-map policy {value!r}; expected one of: {allowed}") from exc
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class AsyncGraphShape:
     """CUDA graph and decode-stride shape used by an async forward."""
 
@@ -444,11 +444,11 @@ class AsyncDecodePlan:
         *,
         row_map_policy: AsyncRowMapPolicy | str = AsyncRowMapPolicy.REUSE,
     ) -> "AsyncPendingForwardDecision":
-        """Resolve this plan's layout snapshot against the current context layout."""
+        """Resolve this plan's layout against the current context layout."""
         return resolve_async_pending_forward(self.layout, current, row_map_policy=row_map_policy)
 
     def with_layout(self, layout: AsyncDecodeLayout) -> "AsyncDecodePlan":
-        """Return a copy of the plan with the prepared runtime layout attached."""
+        """Return a copy of the plan with an updated layout."""
         return replace(self, layout=layout)
 
 
@@ -860,7 +860,7 @@ class AsyncDecodeTransaction:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class AsyncSampleTicket:
     """References the sample buffers and fences for one async readback slot."""
 
@@ -876,7 +876,7 @@ class AsyncSampleTicket:
     copy_stream: object | None = None
 
 
-@dataclass
+@dataclass(slots=True)
 class AsyncSampleReadback:
     """Owns CUDA/CPU sample slots and asynchronous sample-copy fences."""
 
@@ -1393,13 +1393,13 @@ class AsyncLogprobMTPParticipant(AsyncParticipantLifecycle):
         return True
 
     def commit(self, plan: AsyncDecodePlan) -> None:
-        """Mark logprob/MTP participant state as accepted."""
+        """Mark logprob/MTP requirements as accepted."""
         if self.committed:
             return
         self.committed = True
 
     def rollback(self, plan: AsyncDecodePlan) -> None:
-        """Mark logprob/MTP participant state as discarded."""
+        """Mark logprob/MTP requirements as discarded."""
         if self.committed:
             return
         self.rolled_back = True
