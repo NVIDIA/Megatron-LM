@@ -242,7 +242,7 @@ def send_slack_rotation_failure_notification(
         f"Reason: {reason}",
         f"Target GitHub oncall: {new_oncall_username}",
         f"Email tried for Slack lookup: {new_oncall_email}",
-        f"Slack usergroup left unchanged: @{SLACK_USERGROUP_HANDLE}",
+        f"Slack usergroup not fully updated: @{SLACK_USERGROUP_HANDLE}",
         f"You should still be in @{SLACK_USERGROUP_HANDLE}; please update the Slack usergroup manually or fix the GitHub-to-Slack email mapping.",
     ]
     if run_url:

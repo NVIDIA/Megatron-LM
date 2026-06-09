@@ -110,7 +110,7 @@ def test_update_slack_usergroup_notifies_previous_oncall_when_new_oncall_lookup_
     assert client.messages[0]["channel"] == "UOLD"
     assert "new-oncall@users.noreply.github.com" in client.messages[0]["text"]
     assert "@mcore-oncall" in client.messages[0]["text"]
-    assert "left unchanged" in client.messages[0]["text"]
+    assert "You should still be in @mcore-oncall" in client.messages[0]["text"]
 
 
 def test_update_slack_usergroup_does_not_notify_fallback_when_previous_oncall_lookup_fails(
