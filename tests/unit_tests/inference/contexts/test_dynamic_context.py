@@ -799,9 +799,10 @@ class TestDynamicContext:
             [15, 0, 15], dtype=torch.int32
         )
 
-        assert dynamic_context.prepare_async_decode_next_step()
+        prepared_state = dynamic_context.prepare_async_decode_next_step()
+        assert prepared_state is not None
 
-        assert dynamic_context.async_prepared_request_ids_cpu().tolist() == [10, 12, 11]
+        assert prepared_state.plan.request_ids.tolist() == [10, 12, 11]
         assert dynamic_context.active_request_metadata["top_k"][:3].tolist() == [1, 3, 2]
         assert dynamic_context.token_to_request_idx[:3].tolist() == [0, 1, 2]
         ledger = dynamic_context._active_async_ledger_ref
@@ -813,7 +814,7 @@ class TestDynamicContext:
 
         sampled_tokens = torch.tensor([100, 101, 102], dtype=torch.int64, device='cuda')
         assert dynamic_context.copy_async_prepared_decode_input_ids_from_samples(
-            sampled_tokens, None, num_speculative_tokens=0
+            prepared_state, sampled_tokens, None, num_speculative_tokens=0
         )
         assert dynamic_context.gpu_view.token_to_input_ids[:3].cpu().tolist() == [100, 102, 101]
 
@@ -873,9 +874,10 @@ class TestDynamicContext:
             [4, 4, 4], dtype=torch.int32
         )
 
-        assert dynamic_context.prepare_async_decode_next_step(pre_sampling=True)
+        prepared_state = dynamic_context.prepare_async_decode_next_step(pre_sampling=True)
+        assert prepared_state is not None
 
-        assert dynamic_context.async_prepared_request_ids_cpu().tolist() == [10, 11, 12]
+        assert prepared_state.plan.request_ids.tolist() == [10, 11, 12]
         assert dynamic_context.active_request_metadata["top_k"][:3].tolist() == [8, 8, 8]
         assert dynamic_context.token_to_request_idx[:3].tolist() == [9, 9, 9]
         assert dynamic_context.token_to_pos_ids[:3].tolist() == [4, 4, 4]
@@ -886,7 +888,7 @@ class TestDynamicContext:
 
         sampled_tokens = torch.tensor([100, 101, 102], dtype=torch.int64, device='cuda')
         assert dynamic_context.copy_async_prepared_decode_input_ids_from_samples(
-            sampled_tokens, None, num_speculative_tokens=0
+            prepared_state, sampled_tokens, None, num_speculative_tokens=0
         )
         assert dynamic_context.gpu_view.token_to_input_ids[:3].cpu().tolist() == [
             100,
@@ -894,7 +896,7 @@ class TestDynamicContext:
             102,
         ]
 
-        dynamic_context.publish_async_prepared_decode_plan()
+        dynamic_context.publish_async_prepared_decode_state(prepared_state)
 
         assert dynamic_context.active_request_metadata["top_k"][:3].tolist() == [1, 2, 3]
         assert dynamic_context.token_to_request_idx[:3].tolist() == [0, 1, 2]
@@ -946,15 +948,16 @@ class TestDynamicContext:
             [4, 4, 4], dtype=torch.int32
         )
 
-        assert dynamic_context.prepare_async_decode_next_step(pre_sampling=True)
-        dynamic_context.discard_async_prepared_decode_plan()
+        prepared_state = dynamic_context.prepare_async_decode_next_step(pre_sampling=True)
+        assert prepared_state is not None
+        dynamic_context.discard_async_prepared_decode_state(prepared_state)
 
         assert dynamic_context.active_request_metadata["top_k"][:3].tolist() == [8, 8, 8]
         assert dynamic_context.token_to_request_idx[:3].tolist() == [9, 9, 9]
         assert dynamic_context.token_to_pos_ids[:3].tolist() == [4, 4, 4]
         assert dynamic_context._staging_request_query_lengths[:3].tolist() == [7, 7, 7]
         assert dynamic_context._staging_request_kv_length_offsets[:3].tolist() == [4, 4, 4]
-        assert dynamic_context.async_prepared_request_ids_cpu() is None
+        assert prepared_state.plan.request_ids.tolist() == [10, 11, 12]
 
     @pytest.mark.internal
     @rounder_override(64)
@@ -991,7 +994,6 @@ class TestDynamicContext:
 
         assert not dynamic_context.prepare_async_decode_next_step(pre_sampling=True)
 
-        assert dynamic_context.async_prepared_request_ids_cpu() is None
         ledger = dynamic_context._active_async_ledger_ref
         assert ledger is None or ledger.reservation_count == 0
         assert dynamic_context.active_token_count == 3
@@ -1032,7 +1034,6 @@ class TestDynamicContext:
 
         assert not dynamic_context.prepare_async_decode_next_step(pre_sampling=True)
 
-        assert dynamic_context.async_prepared_request_ids_cpu() is None
         ledger = dynamic_context._active_async_ledger_ref
         assert ledger is None or ledger.reservation_count == 0
         assert dynamic_context.active_token_count == 3
@@ -1081,9 +1082,10 @@ class TestDynamicContext:
 
         monkeypatch.setattr(dynamic_context, "_match_cuda_graph_batch_dimensions", _record_match)
 
-        assert dynamic_context.prepare_async_decode_next_step()
+        prepared_state = dynamic_context.prepare_async_decode_next_step()
+        assert prepared_state is not None
 
-        assert dynamic_context.async_prepared_request_ids_cpu().tolist() == [10, 12]
+        assert prepared_state.plan.request_ids.tolist() == [10, 12]
         assert len(matched_dimensions) == 1
         assert matched_dimensions[0].token_count == 2
         assert matched_dimensions[0].prefill_req_count == 0

@@ -16,6 +16,8 @@ from megatron.core.inference.async_transaction import (
     AsyncDecodeLayout,
     AsyncDecodePlan,
     AsyncGraphShape,
+    AsyncPreparedDecodeState,
+    AsyncPreSamplingContextState,
     AsyncResourceLedger,
 )
 from megatron.core.inference.batch_dimensions_utils import (
@@ -967,36 +969,27 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.async_kv_reservation_adoption_count = 0
         self.async_kv_deferred_release_count = 0
         self.async_mamba_deferred_release_count = 0
-        self._async_prepared_request_count = 0
-        self._async_prepared_decode_plan: Optional[AsyncDecodePlan] = None
-        self._async_prepared_request_ids = torch.empty(
-            (self.max_requests,), dtype=torch.int32, device='cpu'
-        )
-        self._async_prepared_sample_source_count = 0
-        self._async_prepared_paused_source_count = 0
-        self._async_prepared_decode_input_is_identity = False
-        self._async_prepared_sample_source_rows = torch.empty(
+        self._async_decode_sample_source_rows_workspace = torch.empty(
             (self.max_requests,), dtype=torch.long, device='cpu', pin_memory=True
         )
-        self._async_prepared_sample_dest_rows = torch.empty(
+        self._async_decode_sample_dest_rows_workspace = torch.empty(
             (self.max_requests,), dtype=torch.long, device='cpu', pin_memory=True
         )
-        self._async_prepared_paused_source_rows = torch.empty(
+        self._async_decode_paused_source_rows_workspace = torch.empty(
             (self.max_requests,), dtype=torch.long, device='cpu', pin_memory=True
         )
-        self._async_prepared_paused_dest_rows = torch.empty(
+        self._async_decode_paused_dest_rows_workspace = torch.empty(
             (self.max_requests,), dtype=torch.long, device='cpu', pin_memory=True
         )
-        self._async_prepared_sample_source_rows_cuda = torch.empty(
+        self._async_decode_sample_source_rows_cuda_workspace = torch.empty(
             (self.max_requests,), dtype=torch.long, device=torch.cuda.current_device()
         )
-        self._async_prepared_sample_dest_rows_cuda = torch.empty(
+        self._async_decode_sample_dest_rows_cuda_workspace = torch.empty(
             (self.max_requests,), dtype=torch.long, device=torch.cuda.current_device()
         )
-        self._async_prepared_paused_dest_rows_cuda = torch.empty(
+        self._async_decode_paused_dest_rows_cuda_workspace = torch.empty(
             (self.max_requests,), dtype=torch.long, device=torch.cuda.current_device()
         )
-        self._async_pre_sampling_prepared_state: Optional[Dict[str, object]] = None
 
         # Track request metadata. Backed by pinned CPU memory: bookkeeping is
         # CPU-resident; GPU consumers read from the active-slice mirror in
@@ -2807,27 +2800,17 @@ class DynamicInferenceContext(BaseInferenceContext):
             requires_mtp=self.num_speculative_tokens > 0,
         )
 
-    def clear_async_prepared_decode_plan(self) -> None:
-        """Forget the prepared async decode plan after it has been launched or discarded."""
-        self._async_prepared_request_count = 0
-        self._async_prepared_decode_plan = None
-        self._async_prepared_sample_source_count = 0
-        self._async_prepared_paused_source_count = 0
-        self._async_prepared_decode_input_is_identity = False
-        self._async_pre_sampling_prepared_state = None
-
-    def discard_async_prepared_decode_plan(self) -> None:
+    def discard_async_prepared_decode_state(self, state: AsyncPreparedDecodeState) -> None:
         """Release resources held only for a prepared async launch that will not run."""
-        ledger = self._active_async_ledger_ref
+        ledger = state.resource_ledger
         if ledger is not None and ledger.reservation_count > 0:
             self.kv_block_allocator.release_memory_blocks(
                 ledger.reserved_block_ids_tensor()
             )
-            self.clear_async_resource_reservations()
-            self.clear_active_async_ledger(ledger)
-        self.clear_async_prepared_decode_plan()
+            ledger.clear_reservations()
+        self.clear_active_async_ledger(ledger)
 
-    def _snapshot_async_pre_sampling_state(self) -> Dict[str, object]:
+    def _snapshot_async_pre_sampling_state(self) -> AsyncPreSamplingContextState:
         """Snapshot the mutable context view used by sampling or a prepared forward."""
         mha_metadata = None
         mha_state_data = None
@@ -2840,93 +2823,81 @@ class DynamicInferenceContext(BaseInferenceContext):
                 mha_max_seqlen_q = getattr(mha_metadata, "_max_seqlen_q", None)
                 mha_max_seqlen_k = getattr(mha_metadata, "_max_seqlen_k", None)
 
-        return {
-            "active_attn_metadata": self.active_attn_metadata,
-            "active_logit_idxs": self.active_logit_idxs.clone(),
-            "active_request_metadata": {
+        return AsyncPreSamplingContextState(
+            active_attn_metadata=self.active_attn_metadata,
+            active_logit_idxs=self.active_logit_idxs.clone(),
+            active_request_metadata={
                 label: tensor.clone() for label, tensor in self.active_request_metadata.items()
             },
-            "active_token_count": self.active_token_count,
-            "batch_dimensions": self.batch_dimensions,
-            "cpu_bookkeeping_buf": self._cpu_bookkeeping_buf.clone(),
-            "mha_metadata": mha_metadata,
-            "mha_state_data": mha_state_data,
-            "mha_max_seqlen_q": mha_max_seqlen_q,
-            "mha_max_seqlen_k": mha_max_seqlen_k,
-            "padded_active_request_count": self.padded_active_request_count,
-            "padded_active_token_count": self.padded_active_token_count,
-            "padded_batch_dimensions": self.padded_batch_dimensions,
-            "padding_slice": getattr(
+            active_token_count=self.active_token_count,
+            batch_dimensions=self.batch_dimensions,
+            cpu_bookkeeping_buf=self._cpu_bookkeeping_buf.clone(),
+            mha_metadata=mha_metadata,
+            mha_state_data=mha_state_data,
+            mha_max_seqlen_q=mha_max_seqlen_q,
+            mha_max_seqlen_k=mha_max_seqlen_k,
+            padded_active_request_count=self.padded_active_request_count,
+            padded_active_token_count=self.padded_active_token_count,
+            padded_batch_dimensions=self.padded_batch_dimensions,
+            padding_slice=getattr(
                 self,
                 "padding_slice",
                 slice(self.active_token_count, self.padded_active_token_count),
             ),
-            "pending_mamba_transfer": self._pending_mamba_transfer,
-            "using_cuda_graph_this_step": self._using_cuda_graph_this_step,
-        }
+            pending_mamba_transfer=self._pending_mamba_transfer,
+            using_cuda_graph_this_step=self._using_cuda_graph_this_step,
+        )
 
-    def _restore_async_pre_sampling_state(self, state: Dict[str, object]) -> None:
+    def _restore_async_pre_sampling_state(self, state: AsyncPreSamplingContextState) -> None:
         """Restore either the current-step state or a staged pre-sampling state."""
-        self.active_attn_metadata = state["active_attn_metadata"]
-        self.active_logit_idxs.copy_(state["active_logit_idxs"])
-        active_request_metadata = state["active_request_metadata"]
+        self.active_attn_metadata = state.active_attn_metadata
+        self.active_logit_idxs.copy_(state.active_logit_idxs)
+        active_request_metadata = state.active_request_metadata
         for label, tensor in active_request_metadata.items():
             self.active_request_metadata[label].copy_(tensor)
-        self.active_token_count = state["active_token_count"]
-        self.batch_dimensions = state["batch_dimensions"]
-        self._cpu_bookkeeping_buf.copy_(state["cpu_bookkeeping_buf"])
-        mha_metadata = state.get("mha_metadata")
+        self.active_token_count = state.active_token_count
+        self.batch_dimensions = state.batch_dimensions
+        self._cpu_bookkeeping_buf.copy_(state.cpu_bookkeeping_buf)
+        mha_metadata = state.mha_metadata
         if mha_metadata is not None:
-            mha_metadata.state_data = state["mha_state_data"]
-            if state["mha_max_seqlen_q"] is not None:
-                mha_metadata._max_seqlen_q = state["mha_max_seqlen_q"]
-            if state["mha_max_seqlen_k"] is not None:
-                mha_metadata._max_seqlen_k = state["mha_max_seqlen_k"]
-        self.padded_active_request_count = state["padded_active_request_count"]
-        self.padded_active_token_count = state["padded_active_token_count"]
-        self.padded_batch_dimensions = state["padded_batch_dimensions"]
-        self.padding_slice = state["padding_slice"]
-        self._pending_mamba_transfer = state["pending_mamba_transfer"]
-        self._using_cuda_graph_this_step = state["using_cuda_graph_this_step"]
+            mha_metadata.state_data = state.mha_state_data
+            if state.mha_max_seqlen_q is not None:
+                mha_metadata._max_seqlen_q = state.mha_max_seqlen_q
+            if state.mha_max_seqlen_k is not None:
+                mha_metadata._max_seqlen_k = state.mha_max_seqlen_k
+        self.padded_active_request_count = state.padded_active_request_count
+        self.padded_active_token_count = state.padded_active_token_count
+        self.padded_batch_dimensions = state.padded_batch_dimensions
+        self.padding_slice = state.padding_slice
+        self._pending_mamba_transfer = state.pending_mamba_transfer
+        self._using_cuda_graph_this_step = state.using_cuda_graph_this_step
         self._prepare_moe_metadata_recording()
 
-    def publish_async_prepared_decode_plan(self) -> None:
+    def publish_async_prepared_decode_state(self, state: AsyncPreparedDecodeState) -> None:
         """Make a pre-sampling prepared decode state visible for H2D and forward launch."""
-        prepared_state = self._async_pre_sampling_prepared_state
-        if prepared_state is None:
+        pre_sampling_state = state.pre_sampling_state
+        if pre_sampling_state is None:
             return
-        self._restore_async_pre_sampling_state(prepared_state)
-        self._async_pre_sampling_prepared_state = None
-
-    def async_prepared_request_ids_cpu(self) -> Optional[Tensor]:
-        """Return the request order used by the prepared speculative forward."""
-        if self._async_prepared_request_count == 0:
-            return None
-        return self._async_prepared_request_ids[: self._async_prepared_request_count].clone()
-
-    def async_prepared_decode_plan(self) -> Optional[AsyncDecodePlan]:
-        """Return the prepared speculative decode plan, if one is staged."""
-        return self._async_prepared_decode_plan
+        self._restore_async_pre_sampling_state(pre_sampling_state)
 
     def _record_async_decode_input_sources(
         self,
         plan: AsyncDecodePlan,
         *,
+        resource_ledger: AsyncResourceLedger,
         previous_paused_request_count: int,
         previous_total_request_count: int,
-    ) -> bool:
+        pre_sampling_state: Optional[AsyncPreSamplingContextState],
+    ) -> Optional[AsyncPreparedDecodeState]:
         """Record how sampled/paused tokens should fill the planned input rows."""
         source_request_idxs = plan.source_request_idxs.to(dtype=torch.long)
         if (
             (source_request_idxs < 0).any()
             or (source_request_idxs >= previous_total_request_count).any()
         ):
-            return False
+            return None
 
         request_count = plan.active_request_count
-        self._async_prepared_decode_plan = plan
-        self._async_prepared_request_count = request_count
-        self._async_prepared_request_ids[:request_count].copy_(plan.request_ids)
 
         dest_rows = torch.arange(request_count, dtype=torch.long, device='cpu')
         sampled_mask = source_request_idxs >= previous_paused_request_count
@@ -2938,55 +2909,85 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         sampled_source_count = int(sampled_source_rows.numel())
         paused_source_count = int(paused_source_rows.numel())
-        self._async_prepared_sample_source_count = sampled_source_count
-        self._async_prepared_paused_source_count = paused_source_count
 
         if sampled_source_count > 0:
-            self._async_prepared_sample_source_rows[:sampled_source_count].copy_(
+            self._async_decode_sample_source_rows_workspace[:sampled_source_count].copy_(
                 sampled_source_rows
             )
-            self._async_prepared_sample_dest_rows[:sampled_source_count].copy_(sampled_dest_rows)
-            self._async_prepared_sample_source_rows_cuda[:sampled_source_count].copy_(
-                self._async_prepared_sample_source_rows[:sampled_source_count], non_blocking=True
+            self._async_decode_sample_dest_rows_workspace[:sampled_source_count].copy_(
+                sampled_dest_rows
             )
-            self._async_prepared_sample_dest_rows_cuda[:sampled_source_count].copy_(
-                self._async_prepared_sample_dest_rows[:sampled_source_count], non_blocking=True
+            self._async_decode_sample_source_rows_cuda_workspace[:sampled_source_count].copy_(
+                self._async_decode_sample_source_rows_workspace[:sampled_source_count],
+                non_blocking=True,
+            )
+            self._async_decode_sample_dest_rows_cuda_workspace[:sampled_source_count].copy_(
+                self._async_decode_sample_dest_rows_workspace[:sampled_source_count],
+                non_blocking=True,
             )
 
         if paused_source_count > 0:
             if self.paused_tokens is None:
-                return False
-            self._async_prepared_paused_source_rows[:paused_source_count].copy_(
+                return None
+            self._async_decode_paused_source_rows_workspace[:paused_source_count].copy_(
                 paused_source_rows
             )
-            self._async_prepared_paused_dest_rows[:paused_source_count].copy_(paused_dest_rows)
-            self._async_prepared_paused_dest_rows_cuda[:paused_source_count].copy_(
-                self._async_prepared_paused_dest_rows[:paused_source_count], non_blocking=True
+            self._async_decode_paused_dest_rows_workspace[:paused_source_count].copy_(
+                paused_dest_rows
+            )
+            self._async_decode_paused_dest_rows_cuda_workspace[:paused_source_count].copy_(
+                self._async_decode_paused_dest_rows_workspace[:paused_source_count],
+                non_blocking=True,
             )
 
         identity_source_rows = torch.arange(request_count, dtype=torch.long, device='cpu')
-        self._async_prepared_decode_input_is_identity = bool(
+        decode_input_is_identity = bool(
             paused_source_count == 0
             and sampled_source_count == request_count
             and torch.equal(sampled_source_rows, identity_source_rows)
             and torch.equal(sampled_dest_rows, identity_source_rows)
         )
-        return True
+        return AsyncPreparedDecodeState(
+            plan=plan,
+            resource_ledger=resource_ledger,
+            sample_source_rows=self._async_decode_sample_source_rows_workspace[
+                :sampled_source_count
+            ],
+            sample_dest_rows=self._async_decode_sample_dest_rows_workspace[
+                :sampled_source_count
+            ],
+            paused_source_rows=self._async_decode_paused_source_rows_workspace[
+                :paused_source_count
+            ],
+            paused_dest_rows=self._async_decode_paused_dest_rows_workspace[:paused_source_count],
+            sample_source_rows_cuda=self._async_decode_sample_source_rows_cuda_workspace[
+                :sampled_source_count
+            ],
+            sample_dest_rows_cuda=self._async_decode_sample_dest_rows_cuda_workspace[
+                :sampled_source_count
+            ],
+            paused_dest_rows_cuda=self._async_decode_paused_dest_rows_cuda_workspace[
+                :paused_source_count
+            ],
+            decode_input_is_identity=decode_input_is_identity,
+            pre_sampling_state=pre_sampling_state,
+        )
 
     def copy_async_prepared_decode_input_ids_from_samples(
         self,
+        state: AsyncPreparedDecodeState,
         sampled_tokens_cuda: Tensor,
         sampled_mtp_tokens_cuda: Optional[Tensor],
         *,
         num_speculative_tokens: int,
     ) -> bool:
         """Write sampled tokens into GPU input rows using the prepared layout map."""
-        request_count = self._async_prepared_request_count
+        request_count = state.plan.active_request_count
         if request_count == 0:
             return False
 
         tokens_per_request = num_speculative_tokens + 1
-        if self._async_prepared_decode_input_is_identity:
+        if state.decode_input_is_identity:
             if tokens_per_request == 1:
                 self.gpu_view.token_to_input_ids[:request_count].copy_(
                     sampled_tokens_cuda[:request_count]
@@ -3004,19 +3005,19 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         if tokens_per_request == 1:
             token_ids = self.gpu_view.token_to_input_ids[:request_count]
-            sample_count = self._async_prepared_sample_source_count
+            sample_count = int(state.sample_source_rows.numel())
             if sample_count > 0:
-                src_rows = self._async_prepared_sample_source_rows_cuda[:sample_count]
-                dst_rows = self._async_prepared_sample_dest_rows_cuda[:sample_count]
+                src_rows = state.sample_source_rows_cuda
+                dst_rows = state.sample_dest_rows_cuda
                 token_ids.index_copy_(0, dst_rows, sampled_tokens_cuda.index_select(0, src_rows))
 
-            paused_count = self._async_prepared_paused_source_count
+            paused_count = int(state.paused_source_rows.numel())
             if paused_count > 0:
                 paused_tokens = self.paused_tokens.index_select(
-                    0, self._async_prepared_paused_source_rows[:paused_count]
+                    0, state.paused_source_rows
                 ).to(device=sampled_tokens_cuda.device, non_blocking=True)
                 token_ids.index_copy_(
-                    0, self._async_prepared_paused_dest_rows_cuda[:paused_count], paused_tokens
+                    0, state.paused_dest_rows_cuda, paused_tokens
                 )
             return True
 
@@ -3024,10 +3025,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         token_ids = self.gpu_view.token_to_input_ids[
             : request_count * tokens_per_request
         ].view(request_count, tokens_per_request)
-        sample_count = self._async_prepared_sample_source_count
+        sample_count = int(state.sample_source_rows.numel())
         if sample_count > 0:
-            src_rows = self._async_prepared_sample_source_rows_cuda[:sample_count]
-            dst_rows = self._async_prepared_sample_dest_rows_cuda[:sample_count]
+            src_rows = state.sample_source_rows_cuda
+            dst_rows = state.sample_dest_rows_cuda
             token_ids[:, 0].index_copy_(
                 0, dst_rows, sampled_tokens_cuda.index_select(0, src_rows)
             )
@@ -3035,11 +3036,11 @@ class DynamicInferenceContext(BaseInferenceContext):
                 0, dst_rows, sampled_mtp_tokens_cuda.index_select(1, src_rows).transpose(0, 1)
             )
 
-        paused_count = self._async_prepared_paused_source_count
+        paused_count = int(state.paused_source_rows.numel())
         if paused_count > 0:
             assert self.paused_speculative_tokens is not None
-            paused_source_rows = self._async_prepared_paused_source_rows[:paused_count]
-            paused_dest_rows = self._async_prepared_paused_dest_rows_cuda[:paused_count]
+            paused_source_rows = state.paused_source_rows
+            paused_dest_rows = state.paused_dest_rows_cuda
             paused_tokens = self.paused_tokens.index_select(0, paused_source_rows).to(
                 device=sampled_tokens_cuda.device, non_blocking=True
             )
@@ -3126,7 +3127,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         return torch.equal(plan.source_request_idxs, active_source_idxs)
 
-    def prepare_async_decode_next_step(self, *, pre_sampling: bool = False) -> bool:
+    def prepare_async_decode_next_step(
+        self, *, pre_sampling: bool = False
+    ) -> Optional[AsyncPreparedDecodeState]:
         """Prepare a decode-only GPU bookkeeping snapshot for a speculative next step.
 
         Persistent CPU request tensors are not updated here. Instead, this
@@ -3134,15 +3137,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         staging buffers while ``update_requests`` remains the live CPU source of
         truth and validates the plan after the speculative forward is launched.
         """
-        self.clear_async_prepared_decode_plan()
         previous_paused_request_count = self.paused_request_count
         previous_total_request_count = self.total_request_count
 
         dry_plan = self._build_async_decode_plan(reserve_blocks=False)
         if dry_plan is None:
-            return False
+            return None
         if pre_sampling and not self._async_decode_plan_preserves_sampling_layout(dry_plan):
-            return False
+            return None
 
         pre_sampling_current_state = (
             self._snapshot_async_pre_sampling_state() if pre_sampling else None
@@ -3162,28 +3164,30 @@ class DynamicInferenceContext(BaseInferenceContext):
         ):
             if pre_sampling_current_state is not None:
                 self._restore_async_pre_sampling_state(pre_sampling_current_state)
-            return False
+            return None
 
         plan = self._build_async_decode_plan(reserve_blocks=True)
         if plan is None:
             if pre_sampling_current_state is not None:
                 self._restore_async_pre_sampling_state(pre_sampling_current_state)
-            return False
+            return None
 
-        if not self._record_async_decode_input_sources(
+        ledger = self._active_async_ledger()
+        prepared_state = self._record_async_decode_input_sources(
             plan,
+            resource_ledger=ledger,
             previous_paused_request_count=previous_paused_request_count,
             previous_total_request_count=previous_total_request_count,
-        ):
-            ledger = self._active_async_ledger_ref
-            if ledger is not None and ledger.reservation_count > 0:
+            pre_sampling_state=None,
+        )
+        if prepared_state is None:
+            if ledger.reservation_count > 0:
                 self.kv_block_allocator.release_memory_blocks(ledger.reserved_block_ids_tensor())
-                self.clear_async_resource_reservations()
-                self.clear_active_async_ledger(ledger)
-            self.clear_async_prepared_decode_plan()
+                ledger.clear_reservations()
+            self.clear_active_async_ledger(ledger)
             if pre_sampling_current_state is not None:
                 self._restore_async_pre_sampling_state(pre_sampling_current_state)
-            return False
+            return None
 
         self.active_token_count = plan.active_token_count
         self.padding_slice = slice(self.active_token_count, self.padded_active_token_count)
@@ -3241,9 +3245,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         self._prepare_moe_metadata_recording()
         if pre_sampling_current_state is not None:
-            self._async_pre_sampling_prepared_state = self._snapshot_async_pre_sampling_state()
+            prepared_state.pre_sampling_state = self._snapshot_async_pre_sampling_state()
             self._restore_async_pre_sampling_state(pre_sampling_current_state)
-        return True
+        return prepared_state
 
     def transfer_bookkeeping_to_gpu(
         self,

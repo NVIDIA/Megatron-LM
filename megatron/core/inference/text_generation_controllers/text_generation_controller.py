@@ -22,6 +22,7 @@ from megatron.core.inference.async_transaction import (
     AsyncEPParticipant,
     AsyncLogprobMTPParticipant,
     AsyncMambaStateParticipant,
+    AsyncPreparedDecodeState,
     AsyncResourceParticipant,
     AsyncRowMapPolicy,
     AsyncSampleReadback,
@@ -1638,31 +1639,32 @@ class TextGenerationController:
         ].clone()
 
     def _begin_async_step_transaction(
-        self, cuda_graph_request_count: Optional[int]
+        self,
+        cuda_graph_request_count: Optional[int],
+        prepared_state: Optional[AsyncPreparedDecodeState] = None,
     ) -> AsyncDecodeTransaction:
         """Create the transaction that owns the just-launched speculative forward."""
         context = self.inference_wrapped_model.inference_context
-        pending_request_ids = context.async_prepared_request_ids_cpu()
-        if pending_request_ids is None:
-            pending_request_ids = self._active_request_ids_cpu()
+        pending_request_ids = (
+            prepared_state.plan.request_ids
+            if prepared_state is not None
+            else self._active_request_ids_cpu()
+        )
         layout = AsyncDecodeLayout.from_prepared_context(
             context,
             request_ids=pending_request_ids,
             padded_active_request_count=cuda_graph_request_count,
             tokens_per_request=self.num_speculative_tokens + 1,
         )
-        prepared_plan = None
-        if hasattr(context, "async_prepared_decode_plan"):
-            prepared_plan = context.async_prepared_decode_plan()
-        if prepared_plan is not None:
-            prepared_plan = prepared_plan.with_layout(layout)
-        else:
-            prepared_plan = AsyncDecodePlan.from_layout(layout)
+        prepared_plan = (
+            prepared_state.plan.with_layout(layout)
+            if prepared_state is not None
+            else AsyncDecodePlan.from_layout(layout)
+        )
         transaction = self._get_async_decode_coordinator().begin_transaction(
             plan=prepared_plan,
             state=AsyncTxnState.PREPARED,
         )
-        context.clear_async_prepared_decode_plan()
         return transaction
 
     def _async_transaction_has_participant(
@@ -1963,10 +1965,9 @@ class TextGenerationController:
     ) -> None:
         """Write sampled decode tokens into the next-step GPU input-id buffer."""
         context = self.inference_wrapped_model.inference_context
-        if context.copy_async_prepared_decode_input_ids_from_samples(
+        if self._get_async_decode_coordinator().copy_samples_to_prepared_inputs(
             self._sampled_tokens_cuda,
             self._sampled_mtp_tokens_cuda,
-            num_speculative_tokens=self.num_speculative_tokens,
         ):
             return
 
@@ -2016,7 +2017,7 @@ class TextGenerationController:
             self._decide_ep_async_handoff(has_real_work=True, can_launch_async_handoff=False)
             return False
         range_push("async_prepare_next_step")
-        async_next_prepared = context.prepare_async_decode_next_step(pre_sampling=True)
+        async_next_prepared = self._get_async_decode_coordinator().prepare_next(pre_sampling=True)
         range_pop()
         if not async_next_prepared:
             self._async_prepare_deferred_until_after_sampling = True
@@ -2029,7 +2030,7 @@ class TextGenerationController:
         if handoff_decision.launch_async_forward:
             return True
 
-        context.discard_async_prepared_decode_plan()
+        self._get_async_decode_coordinator().discard_prepared_state()
         self._async_disable_reason = "ep async handoff skipped"
         self._record_async_disable_reason(self._async_disable_reason)
         self._increment_async_counter("_async_rolled_back_forward_count")
@@ -2045,7 +2046,7 @@ class TextGenerationController:
             return False
 
         range_push("async_prepare_next_step")
-        async_next_prepared = context.prepare_async_decode_next_step()
+        async_next_prepared = self._get_async_decode_coordinator().prepare_next()
         range_pop()
         if not async_next_prepared:
             self._async_disable_reason = "failed to prepare next-step metadata"
@@ -2064,8 +2065,7 @@ class TextGenerationController:
         if handoff_decision.launch_async_forward:
             return True
 
-        context = self.inference_wrapped_model.inference_context
-        context.discard_async_prepared_decode_plan()
+        self._get_async_decode_coordinator().discard_prepared_state()
         self._async_disable_reason = "ep async handoff skipped"
         self._record_async_disable_reason(self._async_disable_reason)
         self._increment_async_counter("_async_rolled_back_forward_count")
@@ -2079,7 +2079,9 @@ class TextGenerationController:
             return False, None, None
 
         context = self.inference_wrapped_model.inference_context
-        context.publish_async_prepared_decode_plan()
+        coordinator = self._get_async_decode_coordinator()
+        prepared_state = coordinator.prepared_state()
+        coordinator.publish_prepared_state()
         range_push("async_transfer_bookkeeping_to_gpu")
         async_h2d_done_event = context.transfer_bookkeeping_to_gpu(
             include_token_to_input_ids=False,
@@ -2096,8 +2098,16 @@ class TextGenerationController:
         cuda_graph_request_count = (
             context.padded_active_request_count if context.using_cuda_graph_this_step() else None
         )
-        transaction = self._begin_async_step_transaction(cuda_graph_request_count)
-        resources = context.mark_async_resources_in_flight()
+        transaction = self._begin_async_step_transaction(
+            cuda_graph_request_count, prepared_state=prepared_state
+        )
+        if prepared_state is not None:
+            resources = prepared_state.resource_ledger
+            resources.in_flight = True
+            if hasattr(context, "register_active_async_ledger"):
+                context.register_active_async_ledger(resources)
+        else:
+            resources = context.mark_async_resources_in_flight()
         self._attach_async_transaction_participants(
             transaction, resources=resources, sample_ticket=sample_ticket
         )
@@ -2106,6 +2116,7 @@ class TextGenerationController:
             resources=resources,
             h2d_done_event=async_h2d_done_event,
         )
+        coordinator.consume_prepared_state()
         range_pop()
         return True, async_h2d_done_event, cuda_graph_request_count
 

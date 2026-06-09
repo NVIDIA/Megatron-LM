@@ -1212,6 +1212,45 @@ class AsyncResourceLedger:
         self.deferred_mamba_slots.clear()
 
 
+@dataclass(slots=True)
+class AsyncPreSamplingContextState:
+    """Mutable context view captured before pre-sampling async preparation."""
+
+    active_attn_metadata: object | None
+    active_logit_idxs: Tensor
+    active_request_metadata: dict[str, Tensor]
+    active_token_count: int
+    batch_dimensions: object
+    cpu_bookkeeping_buf: Tensor
+    mha_metadata: object | None
+    mha_state_data: object | None
+    mha_max_seqlen_q: object | None
+    mha_max_seqlen_k: object | None
+    padded_active_request_count: int
+    padded_active_token_count: int
+    padded_batch_dimensions: object
+    padding_slice: object
+    pending_mamba_transfer: object
+    using_cuda_graph_this_step: bool
+
+
+@dataclass(slots=True)
+class AsyncPreparedDecodeState:
+    """Coordinator-owned prepared async decode state."""
+
+    plan: AsyncDecodePlan
+    resource_ledger: AsyncResourceLedger
+    sample_source_rows: Tensor
+    sample_dest_rows: Tensor
+    paused_source_rows: Tensor
+    paused_dest_rows: Tensor
+    sample_source_rows_cuda: Tensor
+    sample_dest_rows_cuda: Tensor
+    paused_dest_rows_cuda: Tensor
+    decode_input_is_identity: bool
+    pre_sampling_state: AsyncPreSamplingContextState | None
+
+
 @dataclass
 class AsyncResourceParticipant:
     """Participant that owns rollback for one async resource ledger."""

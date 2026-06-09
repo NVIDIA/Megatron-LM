@@ -16,6 +16,7 @@ from megatron.core.inference.async_transaction import (
     AsyncLogprobMTPParticipant,
     AsyncMambaStateParticipant,
     AsyncPendingForwardUse,
+    AsyncPreparedDecodeState,
     AsyncResourceLedger,
     AsyncResourceParticipant,
     AsyncRowMapPolicy,
@@ -372,6 +373,24 @@ def _make_async_decode_layout(
     )
 
 
+def _make_prepared_state(request_ids=(10, 11), *, ledger=None, tokens_per_request=1):
+    layout = _make_async_decode_layout(request_ids, tokens_per_request=tokens_per_request)
+    empty_rows = torch.empty((0,), dtype=torch.long)
+    return AsyncPreparedDecodeState(
+        plan=AsyncDecodePlan.from_layout(layout),
+        resource_ledger=ledger if ledger is not None else AsyncResourceLedger(),
+        sample_source_rows=empty_rows,
+        sample_dest_rows=empty_rows,
+        paused_source_rows=empty_rows,
+        paused_dest_rows=empty_rows,
+        sample_source_rows_cuda=empty_rows,
+        sample_dest_rows_cuda=empty_rows,
+        paused_dest_rows_cuda=empty_rows,
+        decode_input_is_identity=True,
+        pre_sampling_state=None,
+    )
+
+
 def _install_pending_transaction(controller, layout, *, state=AsyncTxnState.LAUNCHED):
     if not hasattr(controller, "inference_wrapped_model"):
         controller.inference_wrapped_model = SimpleNamespace(
@@ -642,15 +661,13 @@ def test_identity_only_row_map_policy_discards_row_mapped_pending_forward():
 @pytest.mark.internal
 def test_record_pending_forward_uses_prepared_request_order():
     controller = _make_controller_with_rows(None, [10, 11, 12])
-    context = controller.inference_wrapped_model.inference_context
-    cleared = []
-    context.async_prepared_request_ids_cpu = lambda: torch.tensor([10, 12, 11], dtype=torch.int32)
-    context.clear_async_prepared_decode_plan = lambda: cleared.append(True)
+    prepared_state = _make_prepared_state([10, 12, 11])
 
-    transaction = controller._begin_async_step_transaction(cuda_graph_request_count=3)
+    transaction = controller._begin_async_step_transaction(
+        cuda_graph_request_count=3, prepared_state=prepared_state
+    )
 
     assert transaction.plan.layout.request_ids.tolist() == [10, 12, 11]
-    assert cleared == [True]
 
 
 @pytest.mark.internal
@@ -944,7 +961,7 @@ async def test_prepare_async_decode_before_sampling_steady_state_ordering(monkey
         kv_block_allocator=SimpleNamespace(
             store_routing_per_block=lambda _routing: events.append("routing")
         ),
-        publish_async_prepared_decode_plan=lambda: events.append("publish"),
+        publish_async_prepared_decode_state=lambda _state: events.append("publish"),
         transfer_bookkeeping_to_gpu=lambda **_kwargs: events.append("h2d") or None,
         current_input_and_position_ids=lambda: (
             torch.tensor([[1, 2]], dtype=torch.int64),
@@ -956,7 +973,7 @@ async def test_prepare_async_decode_before_sampling_steady_state_ordering(monkey
 
     def _prepare(**kwargs):
         events.append("prepare" if kwargs.get("pre_sampling") else "prepare_after")
-        return True
+        return _make_prepared_state([10, 11])
 
     context.prepare_async_decode_next_step = _prepare
     controller = object.__new__(TextGenerationController)
@@ -1003,7 +1020,7 @@ async def test_prepare_async_decode_before_sampling_steady_state_ordering(monkey
         lambda count: events.append(("d2h", count)) or _sample_ticket([4, 5])
     )
     controller._confirm_prepared_ep_async_handoff = lambda: True
-    controller._begin_async_step_transaction = lambda _count: events.append(
+    controller._begin_async_step_transaction = lambda _count, **_kwargs: events.append(
         "record"
     ) or SimpleNamespace(mark_launched=lambda **_kwargs: events.append("tx_launch"))
     controller._ensure_ep_async_handoff_decided = lambda **_kwargs: events.append("ep_done")
@@ -1036,7 +1053,7 @@ async def test_prepare_async_decode_before_sampling_unsafe_fallback_ordering(mon
         kv_block_allocator=SimpleNamespace(
             store_routing_per_block=lambda _routing: events.append("routing")
         ),
-        publish_async_prepared_decode_plan=lambda: events.append("publish"),
+        publish_async_prepared_decode_state=lambda _state: events.append("publish"),
         transfer_bookkeeping_to_gpu=lambda **_kwargs: events.append("h2d") or None,
         current_input_and_position_ids=lambda: (
             torch.tensor([[1, 2]], dtype=torch.int64),
@@ -1049,9 +1066,9 @@ async def test_prepare_async_decode_before_sampling_unsafe_fallback_ordering(mon
     def _prepare(**kwargs):
         if kwargs.get("pre_sampling"):
             events.append("prepare_pre")
-            return False
+            return None
         events.append("prepare_after")
-        return True
+        return _make_prepared_state([10, 11])
 
     context.prepare_async_decode_next_step = _prepare
     controller = object.__new__(TextGenerationController)
@@ -1098,7 +1115,7 @@ async def test_prepare_async_decode_before_sampling_unsafe_fallback_ordering(mon
         lambda count: events.append(("d2h", count)) or _sample_ticket([4, 5])
     )
     controller._confirm_prepared_ep_async_handoff = lambda: True
-    controller._begin_async_step_transaction = lambda _count: events.append(
+    controller._begin_async_step_transaction = lambda _count, **_kwargs: events.append(
         "record"
     ) or SimpleNamespace(mark_launched=lambda **_kwargs: events.append("tx_launch"))
     controller._ensure_ep_async_handoff_decided = lambda **_kwargs: events.append("ep_done")
@@ -1286,7 +1303,6 @@ def _make_async_gate_controller(active_request_count=2):
         is_decode_only=lambda: True,
         using_cuda_graph_this_step=lambda: True,
         is_hybrid_model=False,
-        discard_async_prepared_decode_plan=lambda: None,
     )
     controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
     return controller, context
@@ -1410,8 +1426,10 @@ def _install_async_prepare_stubs(
 ):
     events = []
     context = controller.inference_wrapped_model.inference_context
+    prepared_state = _make_prepared_state()
     context.prepare_async_decode_next_step = (
-        lambda **kwargs: events.append(("prepare", kwargs)) or prepare_result
+        lambda **kwargs: events.append(("prepare", kwargs))
+        or (prepared_state if prepare_result else None)
     )
     controller._async_scheduling_disabled_reason = (
         lambda **_kwargs: events.append(("disabled", _kwargs)) or disabled_reason
@@ -1493,7 +1511,7 @@ def test_prepare_async_decode_before_sampling_deferral_is_not_disable_reason(mon
         ("handoff", kwargs)
     )
     context.prepare_async_decode_next_step = (
-        lambda **kwargs: events.append(("prepare", kwargs)) or False
+        lambda **kwargs: events.append(("prepare", kwargs)) or None
     )
 
     assert not controller._try_prepare_async_decode_before_sampling()
@@ -1523,7 +1541,7 @@ def test_prepare_async_decode_before_sampling_keeps_hybrid_fast_path(monkeypatch
         or SimpleNamespace(launch_async_forward=True)
     )
     context.prepare_async_decode_next_step = (
-        lambda **kwargs: events.append(("prepare", kwargs)) or True
+        lambda **kwargs: events.append(("prepare", kwargs)) or _make_prepared_state()
     )
 
     assert controller._try_prepare_async_decode_before_sampling()
@@ -2204,7 +2222,7 @@ async def test_async_h2d_and_forward_launch_before_cpu_bookkeeping_drains(monkey
         kv_block_allocator=SimpleNamespace(
             store_routing_per_block=lambda _routing: events.append("routing")
         ),
-        publish_async_prepared_decode_plan=lambda: events.append("publish"),
+        publish_async_prepared_decode_state=lambda _state: events.append("publish"),
         transfer_bookkeeping_to_gpu=lambda **_kwargs: events.append("h2d")
         or _Event("h2d"),
         current_input_and_position_ids=lambda: (
@@ -2254,7 +2272,7 @@ async def test_async_h2d_and_forward_launch_before_cpu_bookkeeping_drains(monkey
         ("d2h", count)
     ) or _sample_ticket([4, 5])
     controller._confirm_prepared_ep_async_handoff = lambda: True
-    controller._begin_async_step_transaction = lambda _count: events.append(
+    controller._begin_async_step_transaction = lambda _count, **_kwargs: events.append(
         "record"
     ) or SimpleNamespace(mark_launched=lambda **_kwargs: events.append("tx_launch"))
     controller._ensure_ep_async_handoff_decided = lambda **_kwargs: events.append("ep_done")
@@ -2304,7 +2322,7 @@ async def test_async_prepare_and_launch_do_not_move_after_cpu_bookkeeping(monkey
         kv_block_allocator=SimpleNamespace(
             store_routing_per_block=lambda _routing: events.append("routing")
         ),
-        publish_async_prepared_decode_plan=lambda: events.append("publish"),
+        publish_async_prepared_decode_state=lambda _state: events.append("publish"),
         transfer_bookkeeping_to_gpu=lambda **_kwargs: events.append("h2d")
         or _Event("h2d"),
         current_input_and_position_ids=lambda: (
@@ -2317,7 +2335,7 @@ async def test_async_prepare_and_launch_do_not_move_after_cpu_bookkeeping(monkey
 
     def _prepare(**kwargs):
         events.append("prepare_pre" if kwargs.get("pre_sampling") else "prepare_after")
-        return True
+        return _make_prepared_state([10, 11])
 
     context.prepare_async_decode_next_step = _prepare
     controller = object.__new__(TextGenerationController)
@@ -2364,7 +2382,7 @@ async def test_async_prepare_and_launch_do_not_move_after_cpu_bookkeeping(monkey
     controller._transfer_async_samples_to_cpu = lambda count: events.append(
         ("d2h", count)
     ) or _sample_ticket([4, 5])
-    controller._begin_async_step_transaction = lambda _count: events.append(
+    controller._begin_async_step_transaction = lambda _count, **_kwargs: events.append(
         "record"
     ) or SimpleNamespace(mark_launched=lambda **_kwargs: events.append("tx_launch"))
     controller._attach_async_transaction_participants = (

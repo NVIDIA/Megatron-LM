@@ -10,6 +10,7 @@ from megatron.core.inference.async_transaction import (
     AsyncDecodeLayout,
     AsyncDecodePlan,
     AsyncDecodeTransaction,
+    AsyncPreparedDecodeState,
     AsyncRowMapPolicy,
     AsyncTxnState,
 )
@@ -19,16 +20,19 @@ from megatron.core.inference.ep_async_protocol import EPAsyncHandoffDecision, EP
 class AsyncDecodeContextOps(Protocol):
     """Context operations used by the async decode coordinator."""
 
-    def build_prepared_state(self) -> object | None:
+    def build_prepared_state(
+        self, *, pre_sampling: bool = False
+    ) -> AsyncPreparedDecodeState | None:
         """Build and return a prepared decode state."""
         ...
 
-    def publish_prepared_state(self) -> None:
+    def publish_prepared_state(self, state: AsyncPreparedDecodeState) -> None:
         """Publish a prepared decode state to the live context."""
         ...
 
     def copy_prepared_input_ids(
         self,
+        state: AsyncPreparedDecodeState,
         sampled_tokens_cuda: Tensor,
         sampled_mtp_tokens_cuda: Tensor | None,
         *,
@@ -181,7 +185,7 @@ class AsyncDecodeCoordinator:
         self._ep_ops = ep_ops
         self._diagnostics_ops = diagnostics_ops
         self._model_callbacks = model_callbacks
-        self._prepared_state = None
+        self._prepared_state: AsyncPreparedDecodeState | None = None
         self._pending_transaction: AsyncDecodeTransaction | None = None
         self._next_step_id = 0
         self._step_state = AsyncCoordinatorStepState()
@@ -219,6 +223,51 @@ class AsyncDecodeCoordinator:
         if transaction is not None:
             transaction.mark_retired()
         self._pending_transaction = None
+
+    def prepare_next(self, *, pre_sampling: bool = False) -> bool:
+        """Build and own one prepared async decode state."""
+        self._discard_prepared_state()
+        state = self._context_ops.build_prepared_state(pre_sampling=pre_sampling)
+        if state is None:
+            return False
+        self._prepared_state = state
+        return True
+
+    def prepared_state(self) -> AsyncPreparedDecodeState | None:
+        """Return the coordinator-owned prepared decode state, if any."""
+        return self._prepared_state
+
+    def consume_prepared_state(self) -> AsyncPreparedDecodeState | None:
+        """Return and clear the prepared state after launch ownership transfers."""
+        state = self._prepared_state
+        self._prepared_state = None
+        return state
+
+    def discard_prepared_state(self) -> None:
+        """Discard the prepared state and release prepared-only resources."""
+        self._discard_prepared_state()
+
+    def publish_prepared_state(self) -> None:
+        """Publish the currently prepared state to the live context."""
+        state = self._prepared_state
+        if state is not None:
+            self._context_ops.publish_prepared_state(state)
+
+    def copy_samples_to_prepared_inputs(
+        self,
+        sampled_tokens_cuda: Tensor,
+        sampled_mtp_tokens_cuda: Tensor | None,
+    ) -> bool:
+        """Copy sampled ids through the coordinator-owned prepared state."""
+        state = self._prepared_state
+        if state is None:
+            return False
+        return self._context_ops.copy_prepared_input_ids(
+            state,
+            sampled_tokens_cuda,
+            sampled_mtp_tokens_cuda,
+            num_speculative_tokens=self._model_callbacks.speculative_token_count(),
+        )
 
     def begin_step(self, *, has_real_work: bool) -> EPStepBeginDecision:
         """Preview pending forward status and resolve EP step-begin state."""
@@ -271,7 +320,14 @@ class AsyncDecodeCoordinator:
         self.retire_transaction()
 
     def _discard_prepared_state(self) -> None:
-        """Compatibility placeholder for prepared-state discard."""
+        """Release resources held by a prepared state that was never launched."""
+        state = self._prepared_state
+        if state is not None:
+            ledger = state.resource_ledger
+            if ledger.reservation_count > 0:
+                self._allocator_ops.release_kv_blocks(ledger.reserved_block_ids_tensor())
+                ledger.clear_reservations()
+            self._context_ops.clear_active_ledger(ledger)
         self._prepared_state = None
 
     def _build_transaction_participants(self) -> tuple[object, ...]:
@@ -289,20 +345,24 @@ class _DynamicContextOps:
     def __init__(self, context: object) -> None:
         self._context = context
 
-    def build_prepared_state(self) -> object | None:
-        return None
+    def build_prepared_state(
+        self, *, pre_sampling: bool = False
+    ) -> AsyncPreparedDecodeState | None:
+        return self._context.prepare_async_decode_next_step(pre_sampling=pre_sampling)
 
-    def publish_prepared_state(self) -> None:
-        self._context.publish_async_prepared_decode_plan()
+    def publish_prepared_state(self, state: AsyncPreparedDecodeState) -> None:
+        self._context.publish_async_prepared_decode_state(state)
 
     def copy_prepared_input_ids(
         self,
+        state: AsyncPreparedDecodeState,
         sampled_tokens_cuda: Tensor,
         sampled_mtp_tokens_cuda: Tensor | None,
         *,
         num_speculative_tokens: int,
     ) -> bool:
         return self._context.copy_async_prepared_decode_input_ids_from_samples(
+            state,
             sampled_tokens_cuda,
             sampled_mtp_tokens_cuda,
             num_speculative_tokens=num_speculative_tokens,
