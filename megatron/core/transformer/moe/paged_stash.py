@@ -223,10 +223,14 @@ class PagedTensor:
             "scale_inv_offsets": metadata["scale_inv_offsets"],
             "columnwise_scale_inv_offsets": metadata["columnwise_scale_inv_offsets"],
             "with_gemm_swizzled_scales": metadata["with_gemm_swizzled_scales"],
-            "row_scaled_nvfp4": metadata["row_scaled_nvfp4"],
         }
         optional_kwargs = {}
-        for optional_name in ("requires_grad", "nvfp4_use_4over6", "nvfp4_e4m3_max"):
+        for optional_name in (
+            "requires_grad",
+            "nvfp4_use_4over6",
+            "nvfp4_e4m3_max",
+            "row_scaled_nvfp4",
+        ):
             if optional_name in metadata:
                 optional_kwargs[optional_name] = metadata[optional_name]
 
