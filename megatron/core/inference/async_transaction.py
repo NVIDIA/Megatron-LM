@@ -502,8 +502,9 @@ def resolve_async_pending_forward(
             layout_compatible=False,
         )
 
-    identity = torch.arange(int(row_map.numel()), dtype=torch.long, device="cpu")
-    row_mapped = not torch.equal(row_map.to(dtype=torch.long, device="cpu"), identity)
+    row_mapped = not torch.equal(
+        pending.request_ids.to(device="cpu"), current.request_ids.to(device="cpu")
+    )
     if policy == AsyncRowMapPolicy.IDENTITY_ONLY and row_mapped:
         return AsyncPendingForwardDecision(
             reusable=False,

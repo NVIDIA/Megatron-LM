@@ -427,8 +427,7 @@ def _async_layout_snapshot_status(controller):
     row_map = pending_snapshot.row_map_to_current(current_snapshot.request_ids)
     if not pending_snapshot.graph_compatible_with(current_snapshot) or row_map is None:
         return False, False
-    sequential_rows = torch.arange(row_map.numel(), dtype=torch.long, device="cpu")
-    return True, not torch.equal(row_map, sequential_rows)
+    return True, not torch.equal(pending_snapshot.request_ids, current_snapshot.request_ids)
 
 
 @pytest.mark.internal
@@ -438,6 +437,7 @@ def _async_layout_snapshot_status(controller):
     [
         (None, [10, 11], (True, False), (False, False), None),
         ([10, 11], [10, 11], (True, False), (True, False), None),
+        ([10, 11, 12], [10, 11], (True, True), (True, True), [0, 1]),
         ([10, 11, 12], [12, 10, 11], (True, True), (True, True), [2, 0, 1]),
         ([10, 11, 12], [12, 10], (True, True), (True, True), [2, 0]),
         ([10, 11], [10, 12], (False, False), (False, False), None),
@@ -478,6 +478,7 @@ def test_pending_async_forward_rows_discard_when_graph_shape_changes():
     ("pending_ids", "current_ids", "current_graph_count", "expected_status"),
     [
         ([10, 11], [10, 11], None, (True, False)),
+        ([10, 11, 12], [10, 11], None, (True, True)),
         ([10, 11, 12], [12, 10, 11], None, (True, True)),
         ([10, 11, 12], [12, 10], None, (True, True)),
         ([10, 11], [10, 12], None, (False, False)),
@@ -500,12 +501,19 @@ def test_async_layout_snapshot_matches_pending_forward_row_decisions(
 def test_async_pending_forward_decision_respects_row_map_policy():
     pending = _make_async_layout_snapshot([10, 11, 12], cuda_graph_request_count=3)
     current = _make_async_layout_snapshot([12, 10], cuda_graph_request_count=3)
+    truncated_current = _make_async_layout_snapshot([10, 11], cuda_graph_request_count=3)
 
     reuse = resolve_async_pending_forward(
         pending, current, row_map_policy=AsyncRowMapPolicy.REUSE
     )
     identity_only = resolve_async_pending_forward(
         pending, current, row_map_policy=AsyncRowMapPolicy.IDENTITY_ONLY
+    )
+    truncated = resolve_async_pending_forward(
+        pending, truncated_current, row_map_policy=AsyncRowMapPolicy.REUSE
+    )
+    truncated_identity_only = resolve_async_pending_forward(
+        pending, truncated_current, row_map_policy=AsyncRowMapPolicy.IDENTITY_ONLY
     )
 
     assert reuse.reusable
@@ -516,6 +524,12 @@ def test_async_pending_forward_decision_respects_row_map_policy():
     assert identity_only.row_mapped
     assert identity_only.reason == "row map policy rejected non-identity layout"
     assert identity_only.diagnostics()["row_map_policy"] == "identity_only"
+    assert truncated.reusable
+    assert truncated.row_mapped
+    assert truncated.row_map.tolist() == [0, 1]
+    assert not truncated_identity_only.reusable
+    assert truncated_identity_only.row_mapped
+    assert truncated_identity_only.reason == "row map policy rejected non-identity layout"
 
 
 @pytest.mark.internal
