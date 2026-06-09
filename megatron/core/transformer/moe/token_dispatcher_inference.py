@@ -178,6 +178,7 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
             Also updates self.routing_map to [total_tokens, topk].
         """
         if self.ep_size == 1:
+            InferenceAllGatherDispatcherBase._valid_tokens_tensor.fill_(hidden_states.shape[0])
             return hidden_states, probs
 
         if self._runs_metadata_sync:
@@ -505,6 +506,7 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             Also updates self.routing_map to [global_max, topk] int64.
         """
         if self.ep_size == 1:
+            InferenceAllGatherDispatcherBase._valid_tokens_tensor.fill_(hidden_states.shape[0])
             return hidden_states, probs
 
         if self._runs_metadata_sync:

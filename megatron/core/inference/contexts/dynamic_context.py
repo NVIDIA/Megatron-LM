@@ -668,8 +668,8 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Allocate per-step dispatcher buffers upfront so update_metadata never
         # triggers an allocation inside a captured CUDA graph.
-        # NCCLAllGatherDispatcher is still needed at EP=1: mcore_fused_moe's Triton
-        # kernel reads _valid_tokens_tensor as a pointer regardless of EP size.
+        # Both dispatchers need _valid_tokens_tensor initialized even at EP=1:
+        # mcore_fused_moe's Triton kernel reads it as a pointer regardless of EP size.
         if model_config.inference_moe_token_dispatcher_type == 'nccl':
             NCCLAllGatherDispatcher.allocate_buffers()
         elif get_pg_size(self.expert_model_parallel_group) > 1:
@@ -681,6 +681,10 @@ class DynamicInferenceContext(BaseInferenceContext):
                 hidden_size=moe_hidden_size,
                 ep_group=self.expert_model_parallel_group,
             )
+        else:
+            # EP=1 with nvls: skip symmetric memory init (requires NVLink between
+            # multiple GPUs) and just initialize the shared valid_tokens scalar.
+            NCCLAllGatherDispatcher.allocate_buffers()
 
         # Deal with chunked prefill
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
