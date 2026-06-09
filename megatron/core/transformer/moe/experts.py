@@ -335,7 +335,7 @@ class TEGroupedMLP(MegatronModule):
         if (
             getattr(self, "offload_expert_fc1", False) or getattr(self, "offload_moe_act", False)
         ) and not fused_grouped_mlp_activation_offload_supported():
-            return False  # TE fused grouped MLP offload support requires TE >= 2.17.
+            return False  # TE fused grouped MLP selective offload support requires a TE opt-out API.
         if self.config.moe_apply_probs_on_input:
             return False  # Pre-multiplying probs is not supported
 
@@ -432,6 +432,7 @@ class TEGroupedMLP(MegatronModule):
                 setattr(op, f"bias{idx}", getattr(self.linear_fc1, f"bias{idx}"))
         if self.linear_fc1.use_bias and fc1_single_grouped_bias:
             setattr(op, "bias", getattr(self.linear_fc1, "bias"))
+        fc1_op = op
         ops.append(op)
 
         # Activation and post-multiply probs (SwiGLU, clamped quick-GeGLU, or SReLU)
@@ -494,6 +495,7 @@ class TEGroupedMLP(MegatronModule):
                 "_make_fused_ops expected SwiGLU, quick_gelu, or weighted squared_relu; "
                 "call _is_fused_impl_supported() before constructing fused ops."
             )
+        activation_op = op
         ops.append(op)
 
         # FC2
@@ -521,7 +523,18 @@ class TEGroupedMLP(MegatronModule):
                 setattr(op, f"bias{idx}", getattr(self.linear_fc2, f"bias{idx}"))
         if self.linear_fc2.use_bias and fc2_single_grouped_bias:
             setattr(op, "bias", getattr(self.linear_fc2, "bias"))
+        fc2_op = op
         ops.append(op)
+
+        fine_grained_activation_offloading = getattr(
+            self, "offload_expert_fc1", False
+        ) or getattr(self, "offload_moe_act", False)
+        if fine_grained_activation_offloading:
+            if not getattr(self, "offload_expert_fc1", False):
+                fc1_op.disable_cpu_offloading()
+            if not getattr(self, "offload_moe_act", False):
+                activation_op.disable_cpu_offloading()
+            fc2_op.disable_cpu_offloading()
 
         # Emulate submodule pre-forward hooks
         ops.register_forward_pre_hook(self._make_fused_impl_pre_forward_hook())

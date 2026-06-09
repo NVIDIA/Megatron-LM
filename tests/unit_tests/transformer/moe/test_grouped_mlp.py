@@ -357,7 +357,11 @@ def test_make_fused_ops_handles_single_grouped_weight_for_fc1(monkeypatch):
 def _make_fake_te_namespace():
     """Build a fake TE namespace with the activation classes _make_fused_ops uses."""
 
-    class FakeGroupedLinear(torch.nn.Module):
+    class FakeCpuOffloadControl:
+        def disable_cpu_offloading(self, disabled=True):
+            self.cpu_offloading_disabled = disabled
+
+    class FakeGroupedLinear(FakeCpuOffloadControl, torch.nn.Module):
         def __init__(
             self,
             num_gemms,
@@ -383,27 +387,31 @@ def _make_fake_te_namespace():
             self.single_grouped_weight = single_grouped_weight
             self.single_grouped_bias = single_grouped_bias
             self.delay_wgrad_compute = delay_wgrad_compute
+            self.cpu_offloading_disabled = False
 
         def need_backward_dw(self):
             return False
 
-    class FakeScaledSwiGLU(torch.nn.Module):
+    class FakeScaledSwiGLU(FakeCpuOffloadControl, torch.nn.Module):
         def __init__(self, glu_interleave_size, *, activation_recompute_in_mlp=False):
             super().__init__()
             self.glu_interleave_size = glu_interleave_size
             self.activation_recompute_in_mlp = activation_recompute_in_mlp
+            self.cpu_offloading_disabled = False
 
-    class FakeScaledClampedQGeGLU(torch.nn.Module):
+    class FakeScaledClampedQGeGLU(FakeCpuOffloadControl, torch.nn.Module):
         def __init__(self, glu_interleave_size, *, activation_recompute_in_mlp=False, limit=None):
             super().__init__()
             self.glu_interleave_size = glu_interleave_size
             self.activation_recompute_in_mlp = activation_recompute_in_mlp
             self.limit = limit
+            self.cpu_offloading_disabled = False
 
-    class FakeScaledSReLU(torch.nn.Module):
+    class FakeScaledSReLU(FakeCpuOffloadControl, torch.nn.Module):
         def __init__(self, *, activation_recompute_in_mlp=False):
             super().__init__()
             self.activation_recompute_in_mlp = activation_recompute_in_mlp
+            self.cpu_offloading_disabled = False
 
     class FakeSequential(list):
         def register_forward_pre_hook(self, hook):
@@ -647,6 +655,24 @@ def test_fused_grouped_mlp_activation_offload_requires_te_217(monkeypatch):
     assert checked_versions == ["2.17"]
 
 
+def test_fused_grouped_mlp_activation_offload_requires_te_opt_out_api(monkeypatch):
+    import megatron.core.extensions.transformer_engine as te_ext
+
+    class FakeGroupedLinearWithoutOptOut:
+        pass
+
+    fake_te = SimpleNamespace(
+        pytorch=SimpleNamespace(
+            ops=SimpleNamespace(GroupedLinear=FakeGroupedLinearWithoutOptOut)
+        )
+    )
+    monkeypatch.setattr(te_ext, "te", fake_te)
+    monkeypatch.setattr(te_ext, "HAVE_TE", True)
+    monkeypatch.setattr(te_ext, "is_te_min_version", lambda _: True)
+
+    assert te_ext.fused_grouped_mlp_activation_offload_supported() is False
+
+
 def test_is_fused_impl_supported_rejects_offload_without_te_217(monkeypatch):
     fake_te, FakeGroupedLinear = _make_fake_te_namespace()
     monkeypatch.setattr(experts_module, "te", fake_te)
@@ -704,7 +730,17 @@ def test_make_fused_ops_attaches_single_grouped_bias_for_fc1(monkeypatch):
     ), "bias should not be split into bias{idx} when single_grouped_bias=True"
 
 
-def test_make_fused_ops_does_not_set_deprecated_offload_opt_out_attrs(monkeypatch):
+@pytest.mark.parametrize(
+    ("offload_expert_fc1", "offload_moe_act", "expected_disabled"),
+    (
+        (True, False, (False, True, True)),
+        (False, True, (True, False, True)),
+        (True, True, (False, False, True)),
+    ),
+)
+def test_make_fused_ops_configures_te_cpu_offload_opt_out(
+    monkeypatch, offload_expert_fc1, offload_moe_act, expected_disabled
+):
     fake_te, FakeGroupedLinear = _make_fake_te_namespace()
     monkeypatch.setattr(experts_module, "te", fake_te)
 
@@ -719,8 +755,8 @@ def test_make_fused_ops_does_not_set_deprecated_offload_opt_out_attrs(monkeypatc
     )
     module.activation_func = F.silu
     module.activation_recompute = False
-    module.offload_expert_fc1 = True
-    module.offload_moe_act = True
+    module.offload_expert_fc1 = offload_expert_fc1
+    module.offload_moe_act = offload_moe_act
     common = dict(
         device="cuda",
         dtype=torch.bfloat16,
@@ -736,9 +772,7 @@ def test_make_fused_ops_does_not_set_deprecated_offload_opt_out_attrs(monkeypatc
 
     ops = module._make_fused_ops()
 
-    assert not hasattr(ops[0], "no_offload_activation")
-    assert not hasattr(ops[1], "no_offload_activation")
-    assert not hasattr(ops[2], "no_offload_activation")
+    assert tuple(op.cpu_offloading_disabled for op in ops) == expected_disabled
 
 
 def test_backward_dw_dispatches_fused_children_in_fc2_then_fc1_order():

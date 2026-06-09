@@ -88,7 +88,12 @@ _TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
 
 def fused_grouped_mlp_activation_offload_supported() -> bool:
     """Return whether TE fused grouped MLP handles fine-grained activation offload."""
-    return HAVE_TE and is_te_min_version("2.17")
+    if not HAVE_TE or not is_te_min_version("2.17"):
+        return False
+    grouped_linear_cls = getattr(getattr(te.pytorch, "ops", None), "GroupedLinear", None)
+    return grouped_linear_cls is not None and hasattr(
+        grouped_linear_cls, "disable_cpu_offloading"
+    )
 
 
 class TransformerEngineConfigType(enum.Enum):
