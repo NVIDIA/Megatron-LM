@@ -843,9 +843,6 @@ class AsyncDecodeTransaction:
         return self.state in (AsyncTxnState.PREPARED, AsyncTxnState.LAUNCHED, AsyncTxnState.RESOLVED)
 
 
-AsyncStepTransaction = AsyncDecodeTransaction
-
-
 @dataclass(frozen=True)
 class AsyncSampleTicket:
     """References the sample buffers and fences for one async readback slot."""

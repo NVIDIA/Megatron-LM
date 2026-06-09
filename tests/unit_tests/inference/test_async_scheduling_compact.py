@@ -21,7 +21,6 @@ from megatron.core.inference.async_transaction import (
     AsyncSampleReadback,
     AsyncSampleReadbackParticipant,
     AsyncSampleTicket,
-    AsyncStepTransaction,
     AsyncTransactionParticipant,
     AsyncTxnState,
     classify_async_eligibility,
@@ -372,7 +371,7 @@ def _make_async_layout_snapshot(
 
 
 def _install_pending_transaction(controller, snapshot, *, state=AsyncTxnState.LAUNCHED):
-    transaction = AsyncStepTransaction(step_id=0, state=state, snapshot=snapshot)
+    transaction = AsyncDecodeTransaction(step_id=0, state=state, snapshot=snapshot)
     controller._async_step_transaction = transaction
     return transaction
 
@@ -1800,7 +1799,7 @@ def test_async_transaction_and_resource_diagnostics_are_stable():
         block_columns=torch.tensor([1], dtype=torch.int32),
     )
     ledger.defer_kv_blocks(torch.tensor([200], dtype=torch.int32))
-    transaction = AsyncStepTransaction(
+    transaction = AsyncDecodeTransaction(
         step_id=7,
         state=AsyncTxnState.LAUNCHED,
         snapshot=snapshot,
@@ -1883,7 +1882,6 @@ def test_async_decode_plan_and_transaction_participant_hooks_are_canonical():
     )
 
     assert isinstance(participant, AsyncTransactionParticipant)
-    assert AsyncStepTransaction is AsyncDecodeTransaction
     assert plan.graph_shape.padded_active_request_count == 2
     assert plan.diagnostics()["request_ids"] == [21, 22]
 

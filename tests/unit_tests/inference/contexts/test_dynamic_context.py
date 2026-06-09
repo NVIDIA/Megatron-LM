@@ -746,7 +746,7 @@ class TestDynamicContext:
         )
 
         total_avail_before = dynamic_context.kv_block_allocator.total_avail
-        plan = dynamic_context._build_async_decode_lifecycle_plan()
+        plan = dynamic_context._build_async_decode_plan()
 
         assert dynamic_context.kv_block_allocator.total_avail == total_avail_before
         assert plan is not None

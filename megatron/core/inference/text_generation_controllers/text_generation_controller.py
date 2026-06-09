@@ -1789,11 +1789,6 @@ class TextGenerationController:
             row_map_policy=getattr(self, "_async_row_map_policy", AsyncRowMapPolicy.REUSE),
         )
 
-    def _pending_async_row_map(self, transaction: AsyncDecodeTransaction) -> Optional[Tensor]:
-        """Return the current-row to transaction-row map if the pending forward is reusable."""
-        decision = self._pending_async_forward_decision(transaction)
-        return decision.row_map if decision.reusable else None
-
     def _pending_async_forward_row_status(self) -> tuple[bool, bool]:
         """Return whether the pending forward is reusable and whether row mapping is needed."""
         transaction = self._pending_async_transaction()
@@ -2968,8 +2963,8 @@ class TextGenerationController:
     async def async_generate_output_tokens_dynamic_batch(
         self, skip_bookkeeping: Optional[bool] = False
     ) -> Optional[Dict]:
-        """Forward one dynamic-batch step through the async decode coordinator."""
-        return await self._get_async_decode_coordinator().async_generate_output_tokens_dynamic_batch(
+        """Forward one dynamic-batch step through the async decode implementation."""
+        return await self._async_generate_output_tokens_dynamic_batch_impl(
             skip_bookkeeping=skip_bookkeeping
         )
 

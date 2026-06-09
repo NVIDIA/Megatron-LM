@@ -1,7 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from typing import Dict, Optional
-
 from megatron.core.inference.async_transaction import (
     AsyncDecodePlan,
     AsyncDecodeTransaction,
@@ -52,11 +50,3 @@ class AsyncDecodeCoordinator:
         if transaction is not None:
             transaction.mark_retired()
         self.controller._async_step_transaction = None
-
-    async def async_generate_output_tokens_dynamic_batch(
-        self, *, skip_bookkeeping: Optional[bool] = False
-    ) -> Optional[Dict]:
-        """Run one async dynamic decode step through the controller primitives."""
-        return await self.controller._async_generate_output_tokens_dynamic_batch_impl(
-            skip_bookkeeping=skip_bookkeeping
-        )

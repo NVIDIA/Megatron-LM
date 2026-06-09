@@ -213,9 +213,6 @@ class ContextErrorFactory:
         return error
 
 
-AsyncDecodeLifecyclePlan = AsyncDecodePlan
-
-
 def get_mem_size_str(n_bytes: int) -> str:
     """Convert number of bytes to human-readable string."""
     if n_bytes == 0:
@@ -966,7 +963,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.async_kv_deferred_release_count = 0
         self.async_mamba_deferred_release_count = 0
         self._async_prepared_request_count = 0
-        self._async_prepared_decode_plan: Optional[AsyncDecodeLifecyclePlan] = None
+        self._async_prepared_decode_plan: Optional[AsyncDecodePlan] = None
         self._async_prepared_request_ids = torch.empty(
             (self.max_requests,), dtype=torch.int32, device='cpu'
         )
@@ -2532,10 +2529,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         """Release async-reserved resources after their speculative forward retires."""
         self._async_resource_ledger.release_deferred(self)
 
-    def release_deferred_async_kv_blocks(self) -> None:
-        """Release async-reserved resources after their speculative forward retires."""
-        self.release_deferred_async_resources()
-
     def defer_async_kv_blocks(self, blocks: Tensor) -> None:
         """Defer releasing blocks that may still be used by an in-flight forward."""
         self._async_resource_ledger.defer_kv_blocks(blocks)
@@ -2543,10 +2536,6 @@ class DynamicInferenceContext(BaseInferenceContext):
     def defer_async_mamba_slots(self, slots: Tensor) -> None:
         """Defer freeing Mamba slots that an in-flight forward may still write."""
         self._async_resource_ledger.defer_mamba_slots(slots)
-
-    def release_deferred_async_mamba_slots(self) -> None:
-        """Return deferred Mamba slots to the free pool after async forward retirement."""
-        self._async_resource_ledger._release_deferred_mamba_slots(self)
 
     def _free_mamba_slots_for_request_indexes(self, request_indexes: Tensor) -> None:
         """Free request-owned Mamba slots now or defer them past an async forward."""
@@ -2562,9 +2551,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             self.mamba_metadata.free_slots(request_indexes)
 
-    def _build_async_decode_lifecycle_plan(
+    def _build_async_decode_plan(
         self, *, reserve_blocks: bool = False
-    ) -> Optional[AsyncDecodeLifecyclePlan]:
+    ) -> Optional[AsyncDecodePlan]:
         """Plan the next decode-only layout without mutating live request rows."""
         n_active = self.total_request_count - self.paused_request_count
         if n_active <= 0 or self.num_prefill_requests != 0:
@@ -2737,7 +2726,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             device='cpu',
         ).repeat_interleave(tokens_per_request)
 
-        return AsyncDecodeLifecyclePlan(
+        return AsyncDecodePlan(
             request_ids=self.request_ids[planned_active_source_idxs].clone(),
             source_request_idxs=planned_active_source_idxs.clone(),
             query_lengths=query_lengths,
@@ -2856,13 +2845,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             return None
         return self._async_prepared_request_ids[: self._async_prepared_request_count].clone()
 
-    def async_prepared_decode_plan(self) -> Optional[AsyncDecodeLifecyclePlan]:
+    def async_prepared_decode_plan(self) -> Optional[AsyncDecodePlan]:
         """Return the prepared speculative decode plan, if one is staged."""
         return self._async_prepared_decode_plan
 
     def _record_async_decode_input_sources(
         self,
-        plan: AsyncDecodeLifecyclePlan,
+        plan: AsyncDecodePlan,
         *,
         previous_paused_request_count: int,
         previous_total_request_count: int,
@@ -3051,7 +3040,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self._pending_mamba_zeros.clear()
 
     def _async_decode_plan_preserves_sampling_layout(
-        self, plan: AsyncDecodeLifecyclePlan
+        self, plan: AsyncDecodePlan
     ) -> bool:
         """Return whether a dry next-step plan is safe before sampling mutates CPU state."""
         current_active_request_count = self.total_request_count - self.paused_request_count
@@ -3084,7 +3073,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         previous_paused_request_count = self.paused_request_count
         previous_total_request_count = self.total_request_count
 
-        dry_plan = self._build_async_decode_lifecycle_plan(reserve_blocks=False)
+        dry_plan = self._build_async_decode_plan(reserve_blocks=False)
         if dry_plan is None:
             return False
         if pre_sampling and not self._async_decode_plan_preserves_sampling_layout(dry_plan):
@@ -3110,7 +3099,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self._restore_async_pre_sampling_state(pre_sampling_current_state)
             return False
 
-        plan = self._build_async_decode_lifecycle_plan(reserve_blocks=True)
+        plan = self._build_async_decode_plan(reserve_blocks=True)
         if plan is None:
             if pre_sampling_current_state is not None:
                 self._restore_async_pre_sampling_state(pre_sampling_current_state)
