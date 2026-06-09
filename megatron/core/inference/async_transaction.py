@@ -755,7 +755,6 @@ class AsyncDecodeTransaction:
         assert self.plan is not None
         self.plan = self.plan.with_pending_forward_decision(decision)
         if not decision.reusable:
-            self.discard(decision.reason or "pending forward not reusable")
             return decision
         row_map = decision.row_map
         assert row_map is not None

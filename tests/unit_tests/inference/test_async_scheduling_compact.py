@@ -564,6 +564,29 @@ def test_async_transaction_owns_pending_forward_resolution_transition():
 
 
 @pytest.mark.internal
+def test_async_transaction_failed_resolution_defers_terminal_cleanup():
+    controller = _make_controller_with_rows([10, 11], [10, 12])
+    context = controller.inference_wrapped_model.inference_context
+    transaction = controller._pending_async_transaction()
+
+    decision = transaction.resolve_against_current(
+        context, row_map_policy=AsyncRowMapPolicy.REUSE
+    )
+
+    assert not decision.reusable
+    assert decision.reason == "request row mismatch"
+    assert transaction.state == AsyncTxnState.LAUNCHED
+    assert transaction.discard_reason is None
+    assert transaction.plan.row_map is None
+    assert not transaction.plan.layout_compatible
+
+    transaction.rollback(decision.reason)
+
+    assert transaction.state == AsyncTxnState.ROLLED_BACK
+    assert transaction.discard_reason == "request row mismatch"
+
+
+@pytest.mark.internal
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="row mapping returns CUDA tensors")
 def test_identity_only_row_map_policy_discards_row_mapped_pending_forward():
     controller = _make_controller_with_rows([10, 11, 12], [12, 10])
