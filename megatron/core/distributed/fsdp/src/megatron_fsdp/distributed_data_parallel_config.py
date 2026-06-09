@@ -36,7 +36,11 @@ class DistributedDataParallelConfig:
 
     fp8_param_gather: bool = False
     """If true, keep the compute param in fp8 (do not use any other intermediate dtype) and
-       perform the param all-gather in fp8."""
+        perform the param all-gather in fp8."""
+
+    fp4_param_gather: bool = False
+    """If true, keep the compute param in fp4 (do not use any other intermediate dtype) and
+        perform the param all-gather in fp4."""
 
     data_parallel_sharding_strategy: str = 'no_shard'
     """Sharding strategy for FSDP. Valid values are 'no_shard', 'optim',
@@ -149,6 +153,10 @@ class DistributedDataParallelConfig:
     """If true, Megatron-FSDP's ParamAndGradBuffer uses the precision-aware optimizer
       gradient path (e.g. `decoupled_grad` on optimizer parameters) instead of casting
       main gradients to parameter dtype for `.grad`.
+    """
+
+    use_megatron_fsdp_v2: bool = False
+    """If true, use the `fully_shard` API for FSDP sharding the model.
     """
 
     def __post_init__(self):

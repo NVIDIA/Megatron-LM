@@ -14,6 +14,7 @@
 
 import logging
 import random
+from contextlib import nullcontext
 from typing import Dict, List, Optional
 
 try:
@@ -41,6 +42,9 @@ from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.ssm.mamba_layer import MambaLayer
+from megatron.core.transformer.moe.router import Router as MoERouter
+from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version, log_single_rank
 
@@ -50,11 +54,16 @@ try:
         MegatronFSDP,
         MixedPrecisionPolicy,
     )
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import FSDPModule
 
     HAVE_MEGATRON_FSDP = True
 except ImportError as import_megatron_fsdp_error:
     IMPORT_MEGATRON_FSDP_ERROR = import_megatron_fsdp_error
     HAVE_MEGATRON_FSDP = False
+
+from megatron.core.transformer.moe.experts import SequentialMLP, TEGroupedMLP
+
+from .checkpoint import _propagate_chunk_metadata_to_state_dict
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +77,6 @@ class FullyShardedDataParallel(_BaseDataParallel):
     _MODULE_TYPE_REGISTRY: Dict[str, set] = {
         "column": {
             "ColumnParallelLinear",
-            "LinearCrossEntropyModule",
             "TEColumnParallelLinear",
             "TELayerNormColumnParallelLinear",
             "TEColumnParallelGroupedLinear",
@@ -103,6 +111,19 @@ class FullyShardedDataParallel(_BaseDataParallel):
     ):
         if not HAVE_MEGATRON_FSDP:
             raise IMPORT_MEGATRON_FSDP_ERROR
+
+        if ddp_config.use_megatron_fsdp_v2:
+            self._init_with_fully_shard(
+                config,
+                ddp_config,
+                module,
+                fsdp_unit_modules,
+                disable_bucketing,
+                device,
+                pg_collection,
+            )
+            self._set_dist_param_unique_name()
+            return
 
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
@@ -158,26 +179,6 @@ class FullyShardedDataParallel(_BaseDataParallel):
 
         self._annotate_tensor_parallelism(module)
 
-        if config.overlap_moe_expert_parallel_comm:
-            assert not ddp_config.fsdp_double_buffer, (
-                "1F1B overlap with FSDP does not support double buffer. "
-                "Please set fsdp_double_buffer=False in the ddp config."
-            )
-            assert config.cuda_graph_impl in ("none", "full_iteration"), (
-                "1F1B overlap with FSDP does not support per-layer CUDA graphs "
-                f"(cuda_graph_impl={config.cuda_graph_impl!r}). "
-                "Use cuda_graph_impl='full_iteration' or disable CUDA graphs "
-                "(cuda_graph_impl='none')."
-            )
-
-        if (
-            config.overlap_moe_expert_parallel_comm
-            and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
-        ):
-            assert self.fsdp_unit_modules == [TransformerLayer], (
-                "EP overlap with FSDP currently requires fsdp_unit_modules "
-                f"to be [TransformerLayer], got {self.fsdp_unit_modules}."
-            )
         super().__init__(
             config=config,
             module=MegatronFSDP(
@@ -190,20 +191,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 dist_index=self.megatron_fsdp_dist_index,
                 calculate_per_token_loss=config.calculate_per_token_loss,
                 init_model_with_meta_device=config.init_model_with_meta_device,
-                # EP overlap schedule calls sub-modules directly instead of
-                # TransformerLayer.forward(), so fine-grained hooks are needed
-                # to manage _training_state and all-gather each sub-module's
-                # parameters individually.  This applies to all sharding
-                # strategies (not only optim_grads_params) because the hooks
-                # also maintain per-module training-state bookkeeping that the
-                # gradient-reduction pipeline relies on.
                 enable_fine_grained_param_gather_hook=(
-                    (config.fp8_recipe == "mxfp8" and ddp_config.fp8_param_gather)
-                    or config.overlap_moe_expert_parallel_comm
-                ),
-                enable_fine_grained_param_gather_backward_hook=(
-                    config.overlap_moe_expert_parallel_comm
-                    and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+                    config.fp8_recipe == "mxfp8" and ddp_config.fp8_param_gather
                 ),
             ),
         )
@@ -214,18 +203,234 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self.finish_grad_sync = self.module.finish_grad_sync
         self.scale_gradients = self.module.scale_gradients
         self.zero_grad_buffer = self.module.zero_grad_buffer
+        self.log_per_param_norms = self.module._log_per_param_norms
+        self.compute_per_param_norms = self.module._compute_per_param_norms
         self.broadcast_params = self.module.broadcast_params
         self.synchronize_param_gather = self.module.synchronize_param_gather
         self.module.state_dict_for_save_checkpoint = self.module.state_dict
         self.state_dict_for_save_checkpoint = self.state_dict
         self.module.config = config
-
         self.sync_rng_states_across_tp_group()
+        self._set_dist_param_unique_name()
+
+    def _init_with_fully_shard(
+        self,
+        config: TransformerConfig,
+        ddp_config: DistributedDataParallelConfig,
+        module: torch.nn.Module,
+        fsdp_unit_modules: Optional[List[torch.nn.Module]] = None,
+        disable_bucketing: bool = False,
+        device: Optional[torch.device] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+    ):
+        if ddp_config.use_megatron_fsdp:
+            from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import fully_shard
+            from megatron.core.distributed.fsdp.src.megatron_fsdp.v2.mixed_precision import (
+                FullyShardFP8Policy,
+                MixedPrecisionPolicy,
+                FullyShardNVFP4Policy,
+            )
+        else:
+            from torch.distributed.fsdp import fully_shard
+
+        if (
+            fsdp_unit_modules is None
+            and ddp_config.data_parallel_sharding_strategy == "optim_grads_params"
+        ):
+            fsdp_unit_modules = [TransformerLayer, MambaLayer, TEGroupedMLP, SequentialMLP]
+
+        if pg_collection is None:
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+
+        edp_mesh = _init_dp_mesh(pg_collection, edp=True)
+        dp_mesh = _init_dp_mesh(pg_collection, edp=False)
+
+        fully_shard_mp_policy = MixedPrecisionPolicy(
+            main_params_dtype=ddp_config.megatron_fsdp_main_params_dtype,
+            main_grads_dtype=(
+                torch.float32
+                if ddp_config.grad_reduce_in_fp32
+                else ddp_config.megatron_fsdp_main_grads_dtype
+            ),
+            grad_comm_dtype=(
+                torch.float32
+                if ddp_config.grad_reduce_in_fp32
+                else ddp_config.megatron_fsdp_grad_comm_dtype
+            ),
+            use_decoupled_grad=ddp_config.megatron_fsdp_use_decoupled_grad,
+            fp8=FullyShardFP8Policy(
+                enabled=ddp_config.fp8_param_gather,
+                recipe=config.fp8_recipe,
+                keep_transpose_cache=ddp_config.keep_fp8_transpose_cache,
+            ),
+            nvfp4=FullyShardNVFP4Policy(
+                enabled=ddp_config.fp4_param_gather, recipe=config.fp4_recipe
+            ),
+        )
+        kwargs = {
+            "mp_policy": fully_shard_mp_policy,
+            "enable_unshard_prefetch": ddp_config.overlap_param_gather,
+            "enable_async_reduce_grad": ddp_config.overlap_grad_reduce,
+            "enable_trace_pool": ddp_config.fsdp_double_buffer,
+            "sharding_strategy": ddp_config.data_parallel_sharding_strategy,
+        }
+        if config.calculate_per_token_loss:
+            gradient_scaling_factor = None
+            expert_gradient_scaling_factor = None
+        elif ddp_config.average_in_collective:
+            dp_world_size = pg_collection.dp.size()
+            expt_dp_world_size = pg_collection.expt_dp.size()
+            gradient_scaling_factor = 1.0
+            expert_gradient_scaling_factor = expt_dp_world_size / dp_world_size
+        else:
+            dp_world_size = pg_collection.dp.size()
+            gradient_scaling_factor = 1.0 / dp_world_size
+            expert_gradient_scaling_factor = 1.0 / dp_world_size
+
+        if fsdp_unit_modules is not None:
+            cuda_graph_on = set(ddp_config.mfsdp_cuda_graph_modules)
+            # Iterate modules post order to ensure that child modules are fully sharded
+            # before their parents, which is required for correct param group divide.
+            for name, m in reversed(list(module.named_modules())):
+                if isinstance(m, (TEGroupedMLP, SequentialMLP)):
+                    grad_sf = expert_gradient_scaling_factor
+                    mesh = edp_mesh
+                else:
+                    grad_sf = gradient_scaling_factor
+                    mesh = dp_mesh
+
+                if any([
+                    isinstance(m, MambaLayer) and "mamba" in cuda_graph_on,
+                    isinstance(m, Attention) and "attn" in cuda_graph_on,
+                    isinstance(m, MoERouter) and "moe_router" in cuda_graph_on,
+                ]):
+                    fully_shard(
+                        m,
+                        enable_cuda_graph=True,
+                        mesh=mesh,
+                        gradient_scaling_factor=grad_sf,
+                        **kwargs
+                    )
+                elif isinstance(m, tuple(fsdp_unit_modules)):
+                    fully_shard(
+                        m,
+                        mesh=mesh,
+                        gradient_scaling_factor=grad_sf,
+                        enable_cuda_graph=False,
+                        **kwargs
+                    )
+        fully_shard(module, mesh=dp_mesh, gradient_scaling_factor=gradient_scaling_factor, **kwargs)
+
+        # Propagate relevant attributes from original parameters to the new
+        # distributed parameters created by FSDP.  This is REQUIRED for
+        # correctness: the optimizer's param group builder
+        # (_get_param_groups) relies on attributes like
+        # is_embedding_parameter and is_embedding_or_output_parameter to
+        # classify parameters into groups.  If these attributes are missing
+        # on the DTensor dist_params, the optimizer may assign a param to
+        # the wrong group, causing skipped weight decay on embeddings or
+        # incorrect learning-rate multipliers, which leads to convergence
+        # divergence.
+        for child in module.modules():
+            if not isinstance(child, FSDPModule):
+                continue
+            for param_group in child._fsdp_param_groups:
+                for param, dist_param in zip(param_group.params, param_group.dist_params):
+                    for attr_name in [
+                        # allreduce: expert params have allreduce=False set by
+                        # te layers.  Missing this causes is_expert_parallel
+                        # misclassification in _get_param_groups, which can
+                        # produce NaN gradients when wgrad fusion writes to
+                        # the wrong buffer or when expert gradient scaling is
+                        # incorrect.
+                        "allreduce",
+                        "requires_grad",
+                        "sequence_parallel",
+                        "shared",
+                        "tensor_model_parallel",
+                        "partition_dim",
+                        "partition_stride",
+                        "is_embedding_or_output_parameter",
+                        "is_embedding_parameter",
+                        "_tensor_parallel_mode",
+                    ]:
+                        if hasattr(param, attr_name):
+                            setattr(dist_param, attr_name, getattr(param, attr_name))
+
+        # Per-module NaN checking is disabled by default on the fully_shard
+        # path to avoid the per-parameter synchronization overhead on every
+        # unshard. Enable via a manual call to module._set_nan_check(True).
+        # if ddp_config.check_for_nan_in_grad:
+        #     module._set_nan_check(True)
+
+        super().__init__(config=config, module=module)
+
+        noop = lambda *args, **kwargs: None
+
+        def not_implemented_op():
+            raise NotImplementedError(
+                "This operation is not implemented for the fully_shard API path. "
+            )
+
+        from unittest.mock import Mock
+
+        self.param_and_grad_buffer = Mock()
+        self.param_and_grad_buffer.parameter_groups = []
+        self.param_and_grad_buffer.copy_main_weights_to_model_weights = (
+            self.module._copy_main_weights_to_model_weights
+        )
+        self.ddp_config = ddp_config
+        self.no_sync = nullcontext
+        self.start_param_sync = noop
+        self.start_grad_sync = noop
+
+        def synchronize_param_gather():
+            ctx = self.module._fsdp_root_context
+            torch.cuda.current_stream().wait_stream(ctx.ag_stream)
+
+        self.finish_grad_sync = self.module.finish_grad_sync
+        self.scale_gradients = self.module._scale_gradients
+        self.zero_grad_buffer = self.module._zero_grad_buffer
+        self.log_per_param_norms = self.module._log_per_param_norms
+        self.compute_per_param_norms = self.module._compute_per_param_norms
+        self.log_parameter_groups = self.module._log_parameter_groups
+        # Parameter broadcast is handled during _materialize_meta_module
+        # for the fully_shard path (params are synced across DP ranks
+        # immediately after meta-device init, before DTensor wrapping).
+        # For non-meta init, all ranks share the same seed so no sync is
+        # needed.  This is intentionally a no-op instead of
+        # not_implemented_op to avoid crashing when the training loop
+        # calls broadcast_params() with --data-parallel-random-init.
+        self.broadcast_params = noop
+        self.synchronize_param_gather = synchronize_param_gather
+        self.module.state_dict_for_save_checkpoint = module.state_dict
+        self.state_dict_for_save_checkpoint = lambda *args, **kwargs: self.state_dict()
+
+        # Register state dict post-hook on the root module to propagate
+        # chunk metadata (``__create_chunk_list__``) from model params to
+        # the DTensors in the state dict.  The hook receives the complete
+        # state dict so all parameter names can be matched in one pass.
+        def _post_hook(module, state_dict, prefix, local_metadata):
+            _propagate_chunk_metadata_to_state_dict(module, state_dict)
+
+        self.module.register_state_dict_post_hook(_post_hook)
+
+        if torch.distributed.get_rank() == 0:
+            self.module._log_parameter_groups()
+
+    def _set_dist_param_unique_name(self):
+        for name, param in self.module.named_parameters():
+            if not hasattr(param, "_unique_name"):
+                setattr(param, "_unique_name", name)
 
     def load_state_dict(self, state_dict, strict=True):
         """
         Load the state dictionary into the module.
         """
+        if self.ddp_config.use_megatron_fsdp_v2:
+            super().load_state_dict(state_dict, strict=strict)
+            return
+
         custom_state_dict = {}
         for key, value in state_dict.items():
             if self.config.fp8 and key.endswith('._extra_state'):
@@ -447,8 +652,20 @@ class FullyShardedDataParallel(_BaseDataParallel):
 
     def stop_communication(self):
         """
-        Stop communication for the module.
+        Cease all pending FSDP communication and synchronize main stream.
+
+        For the fully_shard path: waits on both ag_stream (async all-gather)
+        and rs_stream (async reduce-scatter) to bring their work into the
+        main CUDA stream.
+        For the Megatron-FSDP path: calls synchronize_gradient_reduce and
+        synchronize_param_gather.
         """
+        if self.ddp_config.use_megatron_fsdp_v2:
+            ctx = self.module._fsdp_root_context
+            torch.cuda.current_stream().wait_stream(ctx.ag_stream)
+            torch.cuda.current_stream().wait_stream(ctx.rs_stream)
+            return
+
         self.module.synchronize_gradient_reduce()
         self.module.synchronize_param_gather()
 
@@ -465,6 +682,51 @@ class FullyShardedDataParallel(_BaseDataParallel):
             broadcast_list = [None]
         torch.distributed.broadcast_object_list(broadcast_list, group=self.tp_group, group_src=0)
         _load_rng_state_dict(broadcast_list[0])
+
+
+def _reset_parameters(module):
+    """
+    Recursively reset parameters for the module and its submodules.
+    This is used to ensure that all ranks start with the same initial parameters
+    before sharding, which is important for correctness when using FSDP.
+    """
+    parent_fsdp_module_map = {}
+    for m in module.modules():
+        if isinstance(m, FSDPModule):
+            for child in m.module.modules():
+                parent_fsdp_module_map[child] = m
+
+    for m in module.modules():
+        if hasattr(m, "reset_parameters"):
+            parent_fsdp_module_map[m].unshard()
+            m.reset_parameters()
+            parent_fsdp_module_map[m].reshard()
+
+
+def _init_dp_mesh(pg_collection, edp=False):
+    assert HAVE_DTENSOR, (
+        "DTensor support is required to initialize the device mesh. "
+        "Please install a compatible version of PyTorch."
+    )
+
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    if edp:
+        mesh = DeviceMesh.from_group(
+            device_type="cuda",
+            group=pg_collection.expt_dp,
+            mesh=dist.get_process_group_ranks(pg_collection.expt_dp),
+            mesh_dim_names=("edp",),
+        )
+    else:
+        mesh = DeviceMesh.from_group(
+            device_type="cuda",
+            group=pg_collection.dp_cp,
+            mesh=dist.get_process_group_ranks(pg_collection.dp_cp),
+            mesh_dim_names=("dp",),
+        )
+
+    return mesh
 
 
 def _get_hsdp_tp_mesh(outer_fsdp_dp_group, dp_cp_group, tp_group, ep_size=1):

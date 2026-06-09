@@ -4,6 +4,58 @@ Example scripts for training and checkpoint conversion using [Megatron-FSDP](../
 
 ## Scripts
 
+### `fsdp_toy.py`
+
+Standalone toy example (not Megatron-LM) demonstrating Megatron-FSDP v2 usage:
+
+- Basic model wrapping with `fully_shard()`
+- CUDA graph capture (`--cuda-graph` / `--no-cuda-graph`)
+  > **Experimental** — CUDA graph support is experimental and may change.
+- Activation checkpointing (`--activation-checkpoint`)
+- Distributed checkpointing
+
+```bash
+torchrun --nproc_per_node=2 examples/megatron_fsdp/fsdp_toy.py \
+    --model-dim 512 --n-layers 2 --batch-size 4 \
+    --use-megatron-fsdp
+
+# With CUDA graph
+torchrun --nproc_per_node=2 examples/megatron_fsdp/fsdp_toy.py \
+    --model-dim 512 --n-layers 2 --batch-size 4 \
+    --use-megatron-fsdp --cuda-graph
+
+# Without CUDA graph
+torchrun --nproc_per_node=2 examples/megatron_fsdp/fsdp_toy.py \
+    --model-dim 512 --n-layers 2 --batch-size 4 \
+    --use-megatron-fsdp --no-cuda-graph
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--model-dim` | `1024` | Hidden dimension size |
+| `--n-layers` | `3` | Number of transformer layers |
+| `--use-megatron-fsdp` | off | Use Megatron-FSDP v2 instead of PyTorch FSDP2 |
+| `--cuda-graph` | on | Enable CUDA graph capture on transformer layers |
+| `--no-cuda-graph` | — | Disable CUDA graph capture |
+| `--activation-checkpoint` | off | Enable activation checkpointing |
+
+### `qwen3-30b-a3b.gbs128_mbs4_seq4096_n2_mfsdp2_mxfp8_wandb.sh`
+
+2-node SLURM training script for **Qwen3-30B-A3B** (MoE) using Megatron-FSDP v2
+with MXFP8 precision and Weights & Biases logging.  Serves as a reference for
+production-scale MoE training with FSDP v2.
+
+```bash
+export MEGATRON_PATH=/path/to/Megatron-LM
+export DATA_PATH=/path/to/data/c4/en/c4-train.en_6_text_document
+export TOKENIZER_MODEL=/path/to/data/c4/en/tokenizer
+
+sbatch examples/megatron_fsdp/qwen3-30b-a3b.gbs128_mbs4_seq4096_n2_mfsdp2_mxfp8_wandb.sh
+```
+
+Update the `#SBATCH` directives and `--container-image` in the script to match
+your cluster configuration before submitting.
+
 ### `train_llama3_8b_fsdp_h100_fp8.sh`
 
 Single-node training script for **Llama 3 8B** using Megatron-FSDP with FP8 precision on H100 GPUs. Uses `torchrun` for local distributed training and supports both mock data (for benchmarking) and real datasets.

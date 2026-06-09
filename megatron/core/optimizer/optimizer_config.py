@@ -336,6 +336,9 @@ class OptimizerConfig:
     overlap_param_gather_with_optimizer_step: bool = False
     """If true, overlap param all-gather of first bucket with optimizer step."""
 
+    use_megatron_fsdp: bool = False
+    """If true, use Megatron-FSDP and include its custom gradient clipping implementation."""
+
     #######################
     # Optimizer Offload
     #######################

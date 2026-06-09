@@ -52,6 +52,10 @@ try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
         preprocess_state_dict_for_uneven_dtensor,
     )
+    from megatron.core.distributed.fsdp.checkpoint import (
+        _apply_mcore_postprocess,
+        _load_torch_dist_into_megatron_fsdp_v2,
+    )
     from megatron.core.transformer.fsdp_dtensor_checkpoint import (
         handle_experts_in_state_dict,
         handle_fp8_extra_state_case,
@@ -1178,6 +1182,17 @@ def maybe_save_dataloader_state(train_iterator, iteration, dataloader_save_path)
     torch.save(dataloader_save_dict, data_state_save_path)
 
 
+def _is_megatron_fsdp_v2(model):
+    """Check if model uses Megatron FSDP v2 (use_megatron_fsdp_v2 flag)."""
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import FSDPModule
+    first_model = model[0] if isinstance(model, (list, tuple)) else model
+    for m in first_model.modules():
+        if isinstance(m, FSDPModule):
+            return True
+
+    return False
+
+
 def generate_state_dict(
     args,
     model,
@@ -1216,6 +1231,9 @@ def generate_state_dict(
             )
         else:  # torch, torch_dcp, fsdp_dtensor
             model_sd = model[i].state_dict_for_save_checkpoint()
+            if args.use_megatron_fsdp_v2 and args.ckpt_format == "fsdp_dtensor":
+                from megatron.core.distributed.fsdp.checkpoint import _propagate_chunk_metadata_to_state_dict
+                _propagate_chunk_metadata_to_state_dict(model[i], model_sd)
 
         state_dict[key] = model_sd
 
@@ -1264,6 +1282,9 @@ def generate_state_dict(
 
 
 def preprocess_fsdp_dtensor_state_dict(args, raw_state_dict, model):
+    if _is_megatron_fsdp_v2(model):
+        return _apply_mcore_postprocess(raw_state_dict, args, model)
+
     state_dict = raw_state_dict.copy()
     handle_fp8_extra_state_case(state_dict["model"])
     if args.swiglu:
@@ -1433,13 +1454,25 @@ def _load_non_persistent_base_checkpoint(
 
 
 def _load_global_dist_base_checkpoint(
-    load_dir, args, rank0, sharded_state_dict, iteration, release, checkpointing_context=None
+    load_dir, args, rank0, sharded_state_dict, iteration, release, checkpointing_context=None, model=None
 ):
     """Load the base state_dict from the given directory containing the global distributed checkpoint"""
     if rank0:
         checkpoint_name = find_checkpoint_rank_0(load_dir, iteration, release)
         state_dict = dist_checkpointing.load_common_state_dict(checkpoint_name)
         return state_dict, checkpoint_name, release, CheckpointType.GLOBAL
+
+    # Load torch_dist checkpoint into Megatron FSDP v2
+    if args.use_megatron_fsdp_v2:
+        checkpoint_name = find_checkpoint_rank_0(load_dir, iteration, release)
+        state_dict = _load_torch_dist_into_megatron_fsdp_v2(
+            args,
+            checkpoint_name,
+            model=model,
+            v2_state_dict=sharded_state_dict,
+            strict=True,
+        )
+        return state_dict, checkpoint_name, release, CheckpointType.FSDP_DTENSOR
 
     if sharded_state_dict is None:
         assert not args.auto_detect_ckpt_format and not args.use_dist_ckpt, (
@@ -1506,7 +1539,12 @@ def _get_checkpoint_format(checkpoint_name, args):
 
 
 def _load_base_checkpoint(
-    load_dir, args, rank0=False, sharded_state_dict=None, checkpointing_context=None
+    load_dir,
+    args,
+    rank0=False,
+    sharded_state_dict=None,
+    checkpointing_context=None,
+    model=None,
 ):
     """Load the base state_dict from the given directory
 
@@ -1589,6 +1627,7 @@ def _load_base_checkpoint(
             iteration,
             release,
             checkpointing_context=checkpointing_context,
+            model=model,
         )
     elif ckpt_format == "torch":
         ckpt_type = CheckpointType.LEGACY
@@ -1903,7 +1942,7 @@ def load_checkpoint(
     model = unwrap_model(ddp_model)
 
     ckpt_format = args.ckpt_format
-    if args.auto_detect_ckpt_format or ckpt_format == "torch_dist":
+    if args.auto_detect_ckpt_format or ckpt_format in ("torch_dist", "fsdp_dtensor"):
         state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
             load_dir, args, rank0=True, checkpointing_context=checkpointing_context
         )
@@ -2010,6 +2049,16 @@ def load_checkpoint(
                         f"{mismatch_msg}: not supported for DistributedOptimizer with sharding type"
                         f" {sharded_sd_metadata['distrib_optim_sharding_type']}."
                         f" Please use `--ckpt-fully-parallel-save` flag during checkpoint saving."
+                    )
+
+                if (
+                    args.use_megatron_fsdp_v2
+                    and sharded_sd_metadata['distrib_optim_sharding_type'] == 'dp_reshardable'
+                ):
+                    raise RuntimeError(
+                        "Megatron FSDP v2 does not support checkpoint conversion from "
+                        "distrib_optim_sharding_type=dp_reshardable. "
+                        "Please re-save the checkpoint with --dist-ckpt-optim-fully-reshardable."
                     )
 
                 # Check if fully parallel load is compatible with sharding type
@@ -2131,7 +2180,12 @@ def load_checkpoint(
         load_kwargs["sharded_state_dict"] = state_dict
 
     state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
-        load_dir, args, rank0=False, checkpointing_context=checkpointing_context, **load_kwargs
+        load_dir,
+        args,
+        rank0=False,
+        checkpointing_context=checkpointing_context,
+        model=model,
+        **load_kwargs
     )
 
     # Checkpoint not loaded.
@@ -2184,6 +2238,14 @@ def load_checkpoint(
                 # Fallback support for backward compatibility breaking changes in TransformerEngine
                 load_return = module.load_state_dict(state_dict, strict=False)
                 print(f"load_return: {load_return}")
+
+        # Megatron FSDP v2 checkpoints require an extra step to sync module states after loading.
+        if _is_megatron_fsdp_v2(module):
+            from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import FSDPModule
+            for m in module.modules():
+                if isinstance(m, FSDPModule):
+                    root_module = m.get_root_module()
+                    root_module._sync_module_states_after_load()
 
     # Model.
     if not skip_load_to_model_and_opt:

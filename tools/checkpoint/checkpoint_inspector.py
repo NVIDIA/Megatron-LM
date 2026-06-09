@@ -218,7 +218,32 @@ def print_tensor(checkpoint_dir, key):
     torch.distributed.checkpoint.load(
         state_dict, storage_reader=reader, planner=DefaultLoadPlanner()
     )
-    print(state_dict, state_dict[key].shape, state_dict[key]._local_tensor.shape)
+
+    dtensor = state_dict[key]
+    local_data = dtensor._local_tensor.float()
+    local_norm = torch.norm(local_data)
+    local_norm_sq = local_norm.pow(2)
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        global_norm_sq = local_norm_sq.clone()
+        dist.all_reduce(global_norm_sq, op=dist.ReduceOp.SUM)
+        global_norm = torch.sqrt(global_norm_sq)
+    else:
+        global_norm = local_norm
+
+    click.echo(click.style(f"L2 Norm: {global_norm.item():.6f}", fg="green"))
+    click.echo(click.style(f"  Global shape: {dtensor.shape}", fg="white"))
+    click.echo(click.style(f"  Local  shape: {dtensor._local_tensor.shape}", fg="white"))
+
+    click.echo(click.style(f"\nLocal shard data (rank {dist.get_rank()}):", fg="cyan"))
+    if local_data.numel() <= 100:
+        click.echo(local_data)
+    else:
+        flat = local_data.flatten()
+        half = flat.numel() // 2
+        click.echo(f"  First {half}: {flat[:half]}")
+        click.echo(f"  Last  {flat.numel() - half}: {flat[half:]}")
+
+    dist.destroy_process_group()
 
 
 def check_gpu_memory(threshold=0.9):
@@ -1002,82 +1027,233 @@ def modify_state_dict(input_dir, output_dir, op, enable_msc):
     )
 
 
-def _compare_two_checkpoint(checkpoint_1, checkpoint_2):
+def _compare_two_checkpoint(
+    checkpoint_1,
+    checkpoint_2,
+    memory_threshold: float = 0.7,
+    batch_max_bytes: int = 4 * 1024**3,
+    atol: float = 1e-8,
+    rtol: float = 1e-5,
+):
+    """Compare two distributed checkpoints with batched loading and memory awareness.
+
+    Parameters
+    ----------
+    checkpoint_1, checkpoint_2 : Path
+        Paths to the two checkpoint directories.
+    memory_threshold : float
+        GPU memory utilisation ratio (0–1) that triggers CPU offload.
+        Default 0.7 (70 %).
+    batch_max_bytes : int
+        Maximum number of bytes to load in a single dcp.load call.
+        Default 4 GiB.
+    atol, rtol : float
+        Absolute / relative tolerance for torch.allclose.
+    """
+    device_mesh = DeviceMesh.from_group(dist.group.WORLD, device_type="cuda")
+
     reader_1 = FileSystemReader(checkpoint_1)
     metadata_1 = reader_1.read_metadata()
-
     reader_2 = FileSystemReader(checkpoint_2)
     metadata_2 = reader_2.read_metadata()
 
     keys_1 = set(metadata_1.state_dict_metadata.keys())
     keys_2 = set(metadata_2.state_dict_metadata.keys())
 
-    click.echo(click.style("Comparing checkpoints...", fg="blue"))
+    rank0_echo(f"Checkpoint 1: {len(keys_1)} keys")
+    rank0_echo(f"Checkpoint 2: {len(keys_2)} keys")
 
-    # Compare keys
-    missing_in_1 = keys_2 - keys_1
-    missing_in_2 = keys_1 - keys_2
-    common_keys = keys_1 & keys_2
+    # Phase 1 — key set comparison (no I/O)
+    _report_keys("Keys only in checkpoint 1", keys_1 - keys_2, "yellow")
+    _report_keys("Keys only in checkpoint 2", keys_2 - keys_1, "yellow")
 
-    click.echo(click.style("Keys missing in checkpoint 1:", fg="red"))
-    for key in missing_in_1:
-        click.echo(click.style(f" - {key}", fg="red"))
+    # Collect tensor keys with matching metadata for batch load
+    common_keys = sorted(keys_1 & keys_2)
+    metadata_mismatches = []
+    batch_candidates = []
 
-    click.echo(click.style("Keys missing in checkpoint 2:", fg="red"))
-    for key in missing_in_2:
-        click.echo(click.style(f" - {key}", fg="red"))
-
-    # Compare common keys
-    click.echo(click.style("Common keys in both checkpoints:", fg="green"))
+    total_bytes = 0
     for key in common_keys:
-        meta_1 = metadata_1.state_dict_metadata[key]
-        meta_2 = metadata_2.state_dict_metadata[key]
+        m1 = metadata_1.state_dict_metadata[key]
+        m2 = metadata_2.state_dict_metadata[key]
 
-        if not isinstance(meta_1, TensorStorageMetadata):
+        if not isinstance(m1, TensorStorageMetadata):
+            continue
+        if not isinstance(m2, TensorStorageMetadata):
             continue
 
-        if meta_1.size != meta_2.size or meta_1.properties.dtype != meta_2.properties.dtype:
-            click.echo(
-                click.style(
-                    f" - {key} (metadata differ) meta_1: {meta_1}, meta_2: {meta_2}", fg="red"
-                )
+        if m1.size != m2.size or m1.properties.dtype != m2.properties.dtype:
+            metadata_mismatches.append((key, m1, m2))
+            continue
+
+        size_bytes = m1.size.numel() * m1.properties.dtype.itemsize
+        total_bytes += size_bytes
+        batch_candidates.append((key, m1.size, m1.properties.dtype, size_bytes))
+
+    if metadata_mismatches:
+        rank0_echo(f"[Metadata mismatch] {len(metadata_mismatches)} keys:")
+        for key, m1, m2 in metadata_mismatches[:20]:
+            rank0_echo(
+                f"  {key} | ckpt1: {m1.size} {m1.properties.dtype}"
+                f" | ckpt2: {m2.size} {m2.properties.dtype}"
             )
-        else:
-            value_1 = torch.empty(meta_1.size, dtype=meta_1.properties.dtype)
-            value_2 = value_1.clone()
+        if len(metadata_mismatches) > 20:
+            rank0_echo(f"  ... and {len(metadata_mismatches) - 20} more")
 
-            dcp.load({key: value_1}, storage_reader=reader_1, planner=DefaultLoadPlanner())
-            dcp.load({key: value_2}, storage_reader=reader_2, planner=DefaultLoadPlanner())
+    rank0_echo(
+        f"[Phase 2] Load & compare {len(batch_candidates)} matching tensors "
+        f"({total_bytes / 1e9:.2f} GB total across ranks)"
+    )
 
-            if not torch.allclose(value_1, value_2, atol=1e-8, rtol=1e-5):
-                click.echo(
-                    click.style(
-                        f" - {key} (values differ) value_1: {value_1}, value_2: {value_2}", fg="red"
+    # Phase 2 — batched load & compare
+    mismatched_keys = []
+    matched_count = 0
+    skipped_non_recv = 0
+    batch_start = 0
+    batch_idx = 0
+
+    while batch_start < len(batch_candidates):
+        batch_bytes = 0
+        batch_end = batch_start
+        while batch_end < len(batch_candidates):
+            if batch_bytes + batch_candidates[batch_end][3] > batch_max_bytes and batch_end > batch_start:
+                break
+            batch_bytes += batch_candidates[batch_end][3]
+            batch_end += 1
+
+        batch_keys = batch_candidates[batch_start:batch_end]
+        rank0_echo(
+            f"  Batch {batch_idx} | {batch_start}-{batch_end - 1} "
+            f"({len(batch_keys)} keys, {batch_bytes / 1e9:.2f} GB)"
+        )
+
+        # Build state dicts for this batch
+        sd_1 = {}
+        sd_2 = {}
+        for key, shape, dtype, _ in batch_keys:
+            empty_tensor_1 = torch.distributed.tensor.empty(
+                shape, dtype=dtype, device_mesh=device_mesh, placements=[Shard(0)]
+            )
+            empty_tensor_2 = torch.distributed.tensor.empty(
+                shape, dtype=dtype, device_mesh=device_mesh, placements=[Shard(0)]
+            )
+            sd_1[key] = empty_tensor_1
+            sd_2[key] = empty_tensor_2
+
+        # Load both checkpoints in one call each
+        dcp.load(sd_1, storage_reader=reader_1, planner=DefaultLoadPlanner())
+        dcp.load(sd_2, storage_reader=reader_2, planner=DefaultLoadPlanner())
+
+        # Compare and count mismatches per key
+        for key, shape, dtype, _ in batch_keys:
+            v1 = sd_1[key]
+            v2 = sd_2[key]
+
+            if v1._local_tensor.numel() == 0 or v2._local_tensor.numel() == 0:
+                skipped_non_recv += 1
+                continue
+
+            if not torch.allclose(v1._local_tensor, v2._local_tensor, atol=atol, rtol=rtol):
+                diff = (v1._local_tensor.float() - v2._local_tensor.float()).abs()
+                mismatched_keys.append(
+                    (
+                        key,
+                        diff.max().item(),
+                        diff.mean().item(),
+                        (diff > atol + rtol * v2._local_tensor.float().abs()).sum().item(),
                     )
                 )
+            else:
+                matched_count += 1
+
+        # Free batch tensors and manage GPU memory
+        del sd_1, sd_2
+        if check_gpu_memory(memory_threshold):
+            gc.collect()
+            torch.cuda.empty_cache()
+
+        batch_start = batch_end
+        batch_idx += 1
+
+    # Phase 3 — report
+    if skipped_non_recv > 0:
+        rank0_echo(f"[Skipped] {skipped_non_recv} keys with empty local shard on this rank")
+    rank0_echo(
+        f"[Result] {matched_count} matched, {len(mismatched_keys)} mismatched",
+    )
+    if metadata_mismatches:
+        rank0_echo(f"[Result] {len(metadata_mismatches)} metadata mismatches")
+
+    if mismatched_keys:
+        rank0_echo("Mismatched keys (max_abs_err | mean_abs_err | elems_mismatched):")
+        for key, max_err, mean_err, n_mis in mismatched_keys:
+            rank0_echo(f"  {key} | {max_err:.6e} | {mean_err:.6e} | {n_mis}")
+    else:
+        rank0_echo("All matching tensors are bitwise-identical within tolerance.")
+
+
+def _report_keys(title, keys, color):
+    if not keys:
+        return
+    rank0_echo(f"[{title}] {len(keys)}:")
+    for k in sorted(keys)[:20]:
+        rank0_echo(f"  {k}")
+    if len(keys) > 20:
+        rank0_echo(f"  ... and {len(keys) - 20} more")
 
 
 @cli.command()
 @click.argument("checkpoint_1", type=click.Path(exists=True))
 @click.argument("checkpoint_2", type=click.Path(exists=True))
 @click.option("--enable-msc", is_flag=True, help="Enable MultiStorageClient feature.")
-def compare_two_checkpoint(checkpoint_1, checkpoint_2, enable_msc):
+@click.option(
+    "--memory-threshold",
+    type=float,
+    default=0.7,
+    help="GPU memory utilisation ratio (0-1) that triggers CPU offload. Default 0.7.",
+)
+@click.option(
+    "--batch-max-bytes",
+    type=int,
+    default=4 * 1024**3,
+    help="Max bytes to load per batch. Default 4 GiB.",
+)
+@click.option("--atol", type=float, default=1e-8, help="Absolute tolerance for allclose.")
+@click.option("--rtol", type=float, default=1e-5, help="Relative tolerance for allclose.")
+def compare_two_checkpoint(
+    checkpoint_1,
+    checkpoint_2,
+    enable_msc,
+    memory_threshold,
+    batch_max_bytes,
+    atol,
+    rtol,
+):
     """
-    Compare two checkpoints.
+    Compare two distributed checkpoints with batched, memory-aware loading.
+
+    Supports torchrun for DTensor (sharded) checkpoints:
+
+    \\b
+      torchrun --nproc_per_node=8 checkpoint_inspector.py \\
+        compare-two-checkpoint /ckpt/a /ckpt/b
     """
     init_process_group(f"compare_two_checkpoint from {checkpoint_1} to {checkpoint_2}")
 
     if not enable_msc:
         MultiStorageClientFeature.disable()
 
-    _compare_two_checkpoint(Path(checkpoint_1), Path(checkpoint_2))
+    _compare_two_checkpoint(
+        Path(checkpoint_1),
+        Path(checkpoint_2),
+        memory_threshold=memory_threshold,
+        batch_max_bytes=batch_max_bytes,
+        atol=atol,
+        rtol=rtol,
+    )
 
-    click.echo(
-        click.style(
-            f"Comparison between {checkpoint_1} and {checkpoint_2} completed.",
-            fg="green",
-            bold=True,
-        )
+    rank0_echo(
+        f"Comparison between {checkpoint_1} and {checkpoint_2} completed.",
     )
 
 

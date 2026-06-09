@@ -1207,6 +1207,14 @@ def validate_args(args, defaults={}):
     ):
         raise ValueError("MXFP8 with inference optimized layers requires FlashInfer >= 0.6.4")
 
+    if getattr(args, 'use_megatron_fsdp_v2', False):
+        args.use_megatron_fsdp = True
+
+    if getattr(args, 'mfsdp_cuda_graph_modules', None):
+        assert getattr(args, 'use_megatron_fsdp_v2', False), (
+            "--mfsdp-cuda-graph requires --use-megatron-fsdp-v2"
+        )
+
     if args.inference_dynamic_batching_sampling_backend == 'flashinfer':
         try:
             import flashinfer  # noqa: F401
@@ -1232,11 +1240,15 @@ def validate_args(args, defaults={}):
         args.use_distributed_optimizer = True
         # Optimizer step MXFP8 buffer operation that is not relevant or supported for Megatron-FSDP.
         args.reuse_grad_buf_for_mxfp8_param_ag = False
-        # Optimizer compatibility check.
-        assert args.optimizer in (
-            'sgd',
-            'adam',
-        ), f"Megatron-FSDP does not support the {args.optimizer} optimizer yet."
+        # Optimizer compatibility check. Megatron-FSDP supports sgd/adam, plus the
+        # single-root distributed Muon (FullyShardV2Muon) on the v2 path only
+        # (the v2 ParameterGroup sets the dist_param back-references it needs).
+        assert args.optimizer in ('sgd', 'adam') or (
+            args.optimizer == 'muon' and getattr(args, 'use_megatron_fsdp_v2', False)
+        ), (
+            f"Megatron-FSDP does not support the {args.optimizer} optimizer "
+            "(muon requires --use-megatron-fsdp-v2)."
+        )
 
         if (
             args.data_parallel_sharding_strategy in ["optim_grads_params", "optim_grads"]
@@ -1782,7 +1794,12 @@ def validate_args(args, defaults={}):
 
     # emerging optimizer check
     args.use_layer_wise_distributed_optimizer = False
-    if args.optimizer not in ('sgd', 'adam'):
+    # Megatron-FSDP handles emerging optimizers (e.g. muon) through its own
+    # optimizer factory (FullyShardV2Muon), NOT the LayerWiseDistributedOptimizer
+    # path below — so skip this whole block when Megatron-FSDP is enabled (it
+    # would otherwise disable use_distributed_optimizer and reject FSDP / the
+    # fsdp_dtensor ckpt format). muon+FSDP is gated to v2 by the assert above.
+    if args.optimizer not in ('sgd', 'adam') and not args.use_megatron_fsdp:
         if args.optimizer == 'dist_muon':
             warn_rank_0(
                 "optimizer='dist_muon' is deprecated. "
@@ -3924,6 +3941,25 @@ def _add_distributed_args(parser):
         default=False,
         help='Manually register the FSDP communication buffers to NCCL user buffer.'
         'This option is only effective when use-megatron-fsdp and use-nccl-ub is set.',
+    )
+    group.add_argument(
+        '--use-megatron-fsdp-v2',
+        action='store_true',
+        dest='use_megatron_fsdp_v2',
+        help='Use PyTorch fully shard API for FSDP implementation. '
+        'This option is only effective when use-megatron-fsdp is set. ',
+    )
+    group.add_argument(
+        '--mfsdp-cuda-graph',
+        nargs='+',
+        default=[],
+        choices=['mamba', 'transformer', 'moe_router', 'attn'],
+        dest='mfsdp_cuda_graph_modules',
+        help='Enable CUDA graph capture on specific FSDP module types '
+        'when using Megatron FSDP v2 (--use-megatron-fsdp-v2). '
+        'Choices: mamba (MambaLayer), transformer (TransformerLayer). '
+        'Can be combined, e.g. --mfsdp-cuda-graph mamba transformer. '
+        'Only non-nested (leaf) FSDP modules are eligible.',
     )
     group.add_argument(
         '--create-all-gather-group',

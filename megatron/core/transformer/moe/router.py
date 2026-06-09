@@ -26,7 +26,7 @@ from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
-class Router(ABC, MegatronModule):
+class Router(MegatronModule):
     """Base Router class"""
 
     def __init__(

@@ -17,7 +17,6 @@ import importlib
 import logging
 from contextlib import contextmanager
 from enum import Enum, auto
-from functools import partial
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -47,12 +46,11 @@ logger = logging.getLogger(__name__)
 
 try:
     # Default to Megatron-LM FW.
+    logger.info("Detected Megatron Core, using Megatron-FSDP with Megatron.")
     from megatron.core.distributed.distributed_data_parallel_config import (
         DistributedDataParallelConfig,
     )
     from megatron.core.utils import is_submodule
-
-    logger.info("Detected Megatron Core, using Megatron-FSDP with Megatron.")
 except ImportError:
     # Megatron-LM is not installed, use Megatron-FSDP as a standalone module.
     logger.info("Megatron Core is not installed, Megatron-FSDP will run without Megatron Core.")
@@ -216,7 +214,6 @@ class MegatronFSDP(torch.nn.Module):
         fsdp_db_use_persist_buf_on_alloc_fail: bool = False,
         disable_symmetric_registration: bool = False,
         enable_fine_grained_param_gather_hook: bool = False,
-        enable_fine_grained_param_gather_backward_hook: bool = False,
         report_nan_in_param_grad: bool = False,
     ):
         super().__init__()
@@ -269,9 +266,6 @@ class MegatronFSDP(torch.nn.Module):
         self.calculate_per_token_loss = calculate_per_token_loss
         self.init_model_with_meta_device = init_model_with_meta_device
         self.enable_fine_grained_param_gather_hook = enable_fine_grained_param_gather_hook
-        self.enable_fine_grained_param_gather_backward_hook = (
-            enable_fine_grained_param_gather_backward_hook
-        )
         self.report_nan_in_param_grad = report_nan_in_param_grad
 
         # FSDPDistributedIndex stores the process groups and meshes used by Megatron-FSDP.
@@ -699,12 +693,18 @@ class MegatronFSDP(torch.nn.Module):
             # Filter out shared parameters whose gradients are handled by the root hook.
             param_list = [p for p in param_list if not getattr(p, "_is_shared", False)]
 
-            # Make sure for delayed wgrad params, the grad_acc_hooks are registered.
-            for p in param_list:
-                if getattr(p, 'skip_backward_post_hook', False):
-                    assert hasattr(
-                        p, 'post_wgrad_grad_acc_hook'
-                    ), "Missing grad accumulation hook for delayed_wgrad_compute param."
+            # Filter out parameters whose gradient processing is deferred to a delayed
+            # wgrad accumulation hook (post_wgrad_grad_acc_hook).  If skip_backward_post_hook
+            # is set but the delayed hook was never installed, process the parameter
+            # immediately as a safety fallback to avoid silently dropping gradients.
+            param_list = [
+                p
+                for p in param_list
+                if not (
+                    getattr(p, 'skip_backward_post_hook', False)
+                    and hasattr(p, 'post_wgrad_grad_acc_hook')
+                )
+            ]
 
             if not param_list:
                 return
@@ -884,7 +884,7 @@ class MegatronFSDP(torch.nn.Module):
 
         self._root_pre_backward_hook_issued = False
 
-        def _root_pre_backward(module: nn.Module, *unused, skip_backward_hook: bool = False):
+        def _root_pre_backward(module: nn.Module, *unused):
             """Marks the module's training state as PRE_BACKWARD before the
             backprop, this function is registered on the root module.
 
@@ -920,8 +920,6 @@ class MegatronFSDP(torch.nn.Module):
                     param.grad_added_to_main_grad = False
             # Queue the root post-backward hook to reduce leftover gradients after
             # the backward pass.
-            if skip_backward_hook:
-                return
             torch.autograd.Variable._execution_engine.queue_callback(_root_post_backward)
 
         @torch.compiler.disable
@@ -1009,24 +1007,12 @@ class MegatronFSDP(torch.nn.Module):
                 create_custom_backward_hook(module, _pre_backward_param_unshard)
             )
 
-        # These hooks need to be exposed for manual management by 1F1B Overlapping
-        # and triggered by 1F1B Overlapped execution pipeline, except for
-        # `param_unshard` hook that needs to be installed at param level,
-        # such that non-overlapped params like embedding layer are also correctly
-        # unsharded.
-        self.post_forward_release_module = partial(_post_forward, input=None, output=None)
-        self.post_backward_release_module = _post_backward_release_module
-        self.pre_backward = partial(_root_pre_backward, module=None, skip_backward_hook=True)
-        self.post_backward = _root_post_backward
-
         fsdp_modules = []
         for name, module in root_module.named_modules():
             # Set post backward hook for TE grouped gemm if enabled comm overlap
             setup_delayed_wgrad_acc_hook(module, _process_post_backward_gradients)
             if self.enable_fine_grained_param_gather_hook:
                 _register_pre_forward_param_unshard_hook(module)
-            if self.enable_fine_grained_param_gather_backward_hook:
-                _register_pre_backward_param_unshard_hook(module)
 
             # Skip if the module is already registered in fsdp_modules.
             if any(is_submodule(module, fsdp_module) for fsdp_module in fsdp_modules):
@@ -1081,11 +1067,7 @@ class MegatronFSDP(torch.nn.Module):
                     continue
                 self.grad_acc_hooks[f"grad_acc and reduce for {self.param_to_name[param]}"] = (
                     param.register_post_accumulate_grad_hook(
-                        lambda p: (
-                            None
-                            if getattr(p, 'skip_backward_post_hook', False)
-                            else _process_post_backward_gradients([p])
-                        )
+                        lambda p: _process_post_backward_gradients([p])
                     )
                 )
 
@@ -1241,9 +1223,6 @@ class MegatronFSDP(torch.nn.Module):
             force_dispatch (bool, optional): force dispatch regardless of other settings.
         """
         self._replace_param_with_raw_if_needed()
-
-        if self.data_parallel_sharding_strategy == "no_shard":
-            return
 
         if not force_sync and self.ddp_config.overlap_param_gather:
             # All-gather the first bucket before the forward pass.
@@ -1431,6 +1410,66 @@ class MegatronFSDP(torch.nn.Module):
         managed by Megatron-FSDP. Should be called after the optimizer.step().
         """
         self.param_and_grad_buffer.copy_main_weights_to_model_weights()
+
+    def _compute_per_param_norms(self):
+        """
+        Compute per-parameter L2 norms for params and grads.
+
+        Returns a dict {param_name: {"param_norm": float, "grad_norm": float}}.
+        The norms are globally reduced across DP ranks for direct comparison.
+        """
+        results = {}
+        pg_buffer = self.param_and_grad_buffer
+        param_to_group = pg_buffer.param_to_param_group
+        dp_group = self.dist_index.get_dp_group(is_expert_parallel=False)
+
+        for full_name, param in self.module.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            results[full_name] = {"param_norm": 0.0, "grad_norm": 0.0}
+            if hasattr(param, '_local_tensor'):
+                local_param = param._local_tensor
+            else:
+                local_param = param
+            if local_param.numel() > 0:
+                results[full_name]["param_norm"] = local_param.float().norm(p=2).item() ** 2
+
+            if param in param_to_group:
+                group = pg_buffer.parameter_groups[param_to_group[param]]
+                if group.requires_grad:
+                    gbuf = (
+                        group.hfsdp_helper_gbuf
+                        if group.hfsdp_helper_gbuf
+                        else group.main_grad_buffer
+                    )
+                    if gbuf is not None and hasattr(gbuf, 'data') and gbuf.data is not None:
+                        item_id = group.param_idx[param]
+                        local_grad = gbuf.get_item(item_id, only_shard=True)
+                        if local_grad.numel() > 0:
+                            results[full_name]["grad_norm"] = (
+                                local_grad.float().norm(p=2).item() ** 2
+                            )
+
+        for param_name in results:
+            for key in ("param_norm", "grad_norm"):
+                t = torch.tensor([results[param_name][key]], device="cuda")
+                torch.distributed.all_reduce(t, group=dp_group)
+                results[param_name][key] = t.sqrt().item()
+        return results
+
+    def _log_per_param_norms(self, iteration: int, prefix: str = ""):
+        """Log per-parameter param and gradient L2 norms via print (rank 0 only)."""
+        norms = self._compute_per_param_norms()
+        if torch.distributed.get_rank() != 0:
+            return
+        for param_name in sorted(norms.keys()):
+            pn = norms[param_name]["param_norm"]
+            gn = norms[param_name]["grad_norm"]
+            logger.info(
+                f"{prefix} iter={iteration} param={param_name} "
+                f"param_norm={pn:.6f} grad_norm={gn:.6f}"
+            )
 
     def broadcast_params(self):
         """
