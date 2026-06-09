@@ -1,5 +1,7 @@
 # Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 
+import dataclasses
+import functools
 import os
 from datetime import timedelta
 from itertools import accumulate
@@ -46,6 +48,51 @@ def _mock_hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tenso
     don't ship the upstream library.
     """
     return x * scale
+
+
+def _is_dataclass_instance(value):
+    return dataclasses.is_dataclass(value) and not isinstance(value, type)
+
+
+def _assert_equal_with_partial_contents(left, right, path="root"):
+    """Assert recursive equality while comparing `partial` objects structurally."""
+    if isinstance(left, functools.partial) or isinstance(right, functools.partial):
+        assert isinstance(left, functools.partial), f"{path}: left is not `partial`"
+        assert isinstance(right, functools.partial), f"{path}: right is not `partial`"
+        _assert_equal_with_partial_contents(left.func, right.func, f"{path}.func")
+        _assert_equal_with_partial_contents(left.args, right.args, f"{path}.args")
+        _assert_equal_with_partial_contents(
+            left.keywords or {}, right.keywords or {}, f"{path}.keywords"
+        )
+        return
+
+    if _is_dataclass_instance(left) or _is_dataclass_instance(right):
+        assert _is_dataclass_instance(left), f"{path}: left is not a dataclass"
+        assert _is_dataclass_instance(right), f"{path}: right is not a dataclass"
+        assert type(left) is type(right), f"{path}: dataclass types differ"
+        for field in dataclasses.fields(left):
+            if field.compare:
+                _assert_equal_with_partial_contents(
+                    getattr(left, field.name), getattr(right, field.name), f"{path}.{field.name}"
+                )
+        return
+
+    if isinstance(left, dict) or isinstance(right, dict):
+        assert isinstance(left, dict), f"{path}: left is not a dict"
+        assert isinstance(right, dict), f"{path}: right is not a dict"
+        assert left.keys() == right.keys(), f"{path}: dict keys differ"
+        for key in left:
+            _assert_equal_with_partial_contents(left[key], right[key], f"{path}[{key!r}]")
+        return
+
+    if isinstance(left, (list, tuple)) or isinstance(right, (list, tuple)):
+        assert type(left) is type(right), f"{path}: sequence types differ"
+        assert len(left) == len(right), f"{path}: sequence lengths differ"
+        for index, (left_item, right_item) in enumerate(zip(left, right)):
+            _assert_equal_with_partial_contents(left_item, right_item, f"{path}[{index}]")
+        return
+
+    assert left == right, f"{path}: values differ"
 
 
 def test_hybrid_logging_process_groups_are_paired():
@@ -1002,12 +1049,9 @@ class TestMLADownProjFusion:
 
         result = self._call_fuse(submodules, mla_down_proj_fusion=True)
 
-        # Equality via deep-copy means the returned specs compare as equal to
-        # the originals (dataclass equality) even though they are fresh
-        # objects.
-        assert result.mamba_layer == original_mamba
-        assert result.attention_layer == original_attention
-        assert result.mlp_layer == original_mlp
+        _assert_equal_with_partial_contents(result.mamba_layer, original_mamba)
+        _assert_equal_with_partial_contents(result.attention_layer, original_attention)
+        _assert_equal_with_partial_contents(result.mlp_layer, original_mlp)
 
     def test_model_uses_fused_mla_when_enabled(self):
         """Integration: a full HybridModel built with the flag uses
