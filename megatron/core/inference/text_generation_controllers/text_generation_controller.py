@@ -1779,14 +1779,7 @@ class TextGenerationController:
 
     def _pending_async_forward_row_status(self) -> tuple[bool, bool]:
         """Return whether the pending forward is reusable and whether row mapping is needed."""
-        transaction = self._pending_async_transaction()
-        if transaction is None:
-            return True, False
-
-        decision = self._pending_async_forward_decision(transaction)
-        if not decision.reusable:
-            return False, False
-        return True, decision.row_mapped
+        return self._get_async_decode_coordinator().pending_forward_row_status()
 
     def _resolve_pending_async_forward(self) -> tuple[bool, Optional[Tensor], bool]:
         """Resolve the pending speculative forward's row layout for current consumers.
@@ -1794,57 +1787,11 @@ class TextGenerationController:
         Returns whether the forward was reused, optional CUDA row indices, and
         whether row mapping was required.
         """
-        transaction = self._pending_async_transaction()
-        if transaction is None:
-            return False, None, False
-
-        context = self.inference_wrapped_model.inference_context
-        decision = transaction.resolve_against_current(
-            context,
-            row_map_policy=getattr(self, "_async_row_map_policy", AsyncRowMapPolicy.REUSE),
-        )
-        if decision.reusable:
-            resolution = transaction.resolution
-            assert resolution is not None
-            row_map = resolution.row_indices
-            assert row_map is not None
-            if decision.row_mapped:
-                self._increment_async_counter("_async_row_mapped_forward_count")
-            else:
-                self._increment_async_counter("_async_identity_forward_count")
-            self._increment_async_counter("_async_reused_forward_count")
-            row_indices = (
-                row_map.to(device=torch.cuda.current_device(), dtype=torch.long)
-                if decision.row_mapped
-                else None
-            )
-            return True, row_indices, decision.row_mapped
-
-        if not decision.graph_compatible:
-            self._increment_async_counter("_async_graph_mismatch_discard_count")
-        else:
-            self._increment_async_counter("_async_layout_mismatch_discard_count")
-        self._increment_async_counter("_async_discarded_forward_count")
-        self._increment_async_counter("_async_rolled_back_forward_count")
-        self._rollback_or_discard_async_transaction(
-            transaction,
-            decision.reason or "pending forward not reusable",
-            release_fallback_resources=False,
-        )
-        return False, None, False
+        return self._get_async_decode_coordinator().consume_pending_forward()
 
     def _discard_pending_async_forward(self) -> None:
         """Discard a pending async forward and release resources reserved for it."""
-        transaction = self._pending_async_transaction()
-        if transaction is not None:
-            self._rollback_or_discard_async_transaction(
-                transaction,
-                "discarded before step begin",
-                release_fallback_resources=True,
-            )
-            self._retire_async_transaction()
-            self._increment_async_counter("_async_discarded_forward_count")
-            self._increment_async_counter("_async_rolled_back_forward_count")
+        self._get_async_decode_coordinator().discard_pending("discarded before step begin")
 
     def _decide_ep_step_begin(self, *, has_real_work: bool) -> EPStepBeginDecision:
         """Synchronize pending async state at the beginning of an EP work step."""
@@ -2951,9 +2898,9 @@ class TextGenerationController:
 
         with torch.inference_mode():
             if self._has_pending_async_forward_state():
-                transaction = self._pending_async_transaction()
-                assert transaction is not None
-                cuda_graph_request_count = transaction.plan.graph_shape.padded_active_request_count
+                cuda_graph_request_count = (
+                    self._get_async_decode_coordinator().pending_graph_request_count()
+                )
                 (
                     pending_forward_reused,
                     pending_forward_row_indices,
@@ -2962,55 +2909,6 @@ class TextGenerationController:
                 pending_forward_row_mapped = (
                     pending_forward_row_mapped or ep_step_begin_decision.row_mapped_forward
                 )
-                if (
-                    pending_forward_reused
-                    and pending_forward_row_mapped
-                    and not context.config.materialize_only_last_token_logits
-                    and not context.is_decode_only()
-                ):
-                    pending_forward_reused = False
-                    pending_forward_row_indices = None
-                    pending_forward_row_mapped = False
-                    self._increment_async_counter("_async_discarded_forward_count")
-                    self._increment_async_counter("_async_rolled_back_forward_count")
-                    if transaction is not None:
-                        self._rollback_or_discard_async_transaction(
-                            transaction,
-                            "row-mapped non-decode forward not reusable",
-                            release_fallback_resources=False,
-                        )
-                if (
-                    pending_forward_reused
-                    and context.is_hybrid_model
-                    and not self._async_transaction_has_participant(
-                        transaction, AsyncMambaStateParticipant
-                    )
-                ):
-                    context.accept_async_mamba_state(self._active_request_ids_cpu())
-                if transaction is not None:
-                    resource_participant_owned = self._async_transaction_has_participant(
-                        transaction, AsyncResourceParticipant
-                    )
-                    if pending_forward_reused:
-                        if not resource_participant_owned:
-                            context.release_deferred_async_resources()
-                        transaction.mark_committed()
-                        self._increment_async_counter("_async_committed_forward_count")
-                    else:
-                        if not resource_participant_owned:
-                            context.release_deferred_async_resources()
-                    if (
-                        not pending_forward_reused
-                        and transaction.state
-                        not in (AsyncTxnState.DISCARDED, AsyncTxnState.ROLLED_BACK)
-                    ):
-                        self._rollback_or_discard_async_transaction(
-                            transaction,
-                            "pending forward not reused",
-                            release_fallback_resources=False,
-                        )
-                        self._increment_async_counter("_async_rolled_back_forward_count")
-                    self._retire_async_transaction()
                 if pending_forward_reused and self.num_speculative_tokens > 0:
                     input_ids, _ = context.current_input_and_position_ids()
             if not pending_forward_reused:
@@ -3192,17 +3090,10 @@ class TextGenerationController:
                     context.total_request_count - context.paused_request_count
                 )
                 if self._has_pending_async_forward_state() and next_active_request_count == 0:
-                    transaction = self._pending_async_transaction()
                     torch.cuda.current_stream().synchronize()
-                    if transaction is not None:
-                        self._rollback_or_discard_async_transaction(
-                            transaction,
-                            "no active requests after bookkeeping",
-                            release_fallback_resources=True,
-                        )
-                        self._increment_async_counter("_async_discarded_forward_count")
-                        self._increment_async_counter("_async_rolled_back_forward_count")
-                    self._retire_async_transaction()
+                    self._get_async_decode_coordinator().discard_pending(
+                        "no active requests after bookkeeping"
+                    )
 
             ret = {
                 "accepted_tokens": (

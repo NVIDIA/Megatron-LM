@@ -643,9 +643,9 @@ def test_identity_only_row_map_policy_discards_row_mapped_pending_forward():
     controller._async_row_map_policy = AsyncRowMapPolicy.IDENTITY_ONLY
 
     assert controller._pending_async_forward_row_status() == (False, False)
+    transaction = controller._pending_async_transaction()
     reused, row_indices, row_mapped = controller._resolve_pending_async_forward()
 
-    transaction = controller._get_async_decode_coordinator()._pending_transaction
     assert not reused
     assert row_indices is None
     assert not row_mapped
@@ -724,11 +724,10 @@ def test_pending_async_forward_discards_next_step_position_drift():
         token_to_block_idx=torch.tensor([[100], [200]], dtype=torch.int32),
         token_to_local_position_within_kv_block=torch.tensor([[7], [12]], dtype=torch.int32),
     )
-    _install_pending_transaction(controller, pending_layout)
+    transaction = _install_pending_transaction(controller, pending_layout)
 
     assert controller._pending_async_forward_row_status() == (False, False)
     assert controller._resolve_pending_async_forward() == (False, None, False)
-    transaction = controller._get_async_decode_coordinator()._pending_transaction
     assert transaction.discard_reason == "layout mismatch"
     assert controller._async_discarded_forward_count == 1
 
@@ -756,7 +755,7 @@ def test_pending_async_forward_reuses_subset_when_finished_row_left():
             [[5], [13], [21]], dtype=torch.int32
         ),
     )
-    _install_pending_transaction(controller, pending_layout)
+    transaction = _install_pending_transaction(controller, pending_layout)
     current_layout = AsyncDecodeLayout.from_context_current(context, tokens_per_request=1)
     row_map = pending_layout.row_map_to_current(current_layout.request_ids)
 
@@ -768,7 +767,6 @@ def test_pending_async_forward_reuses_subset_when_finished_row_left():
     assert row_map is not None
     assert row_map.tolist() == [2, 0]
     assert pending_layout.layout_compatible_with(current_layout, row_map=row_map)
-    transaction = controller._pending_async_transaction()
     assert transaction.resolution.row_indices.tolist() == [2, 0]
     assert transaction.resolution.row_mapped
     assert transaction.resolution.reused
@@ -1672,9 +1670,14 @@ def test_wait_for_dummy_context_h2d_synchronizes_once():
 
 @pytest.mark.internal
 def test_pending_async_forward_cleanup_releases_only_when_needed():
-    context = SimpleNamespace(release_count=0)
-    context.release_deferred_async_resources = lambda: setattr(
-        context, "release_count", context.release_count + 1
+    released = []
+    context = SimpleNamespace(
+        kv_block_allocator=SimpleNamespace(
+            release_memory_blocks=lambda blocks: released.append(blocks.tolist())
+        ),
+        async_kv_deferred_release_count=0,
+        async_mamba_deferred_release_count=0,
+        is_hybrid_model=False,
     )
     controller = object.__new__(TextGenerationController)
     controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
@@ -1682,14 +1685,17 @@ def test_pending_async_forward_cleanup_releases_only_when_needed():
     controller._async_discarded_forward_count = 0
 
     controller._discard_pending_async_forward()
-    assert context.release_count == 0
+    assert released == []
     assert controller._async_discarded_forward_count == 0
 
     transaction = _install_pending_transaction(
         controller, _make_async_decode_layout([1, 2], cuda_graph_request_count=2)
     )
+    ledger = AsyncResourceLedger(deferred_kv_blocks=[101], in_flight=True)
+    transaction.resource_ledger = ledger
     controller._discard_pending_async_forward()
-    assert context.release_count == 1
+    assert released == [[101]]
+    assert context.async_kv_deferred_release_count == 1
     assert controller._pending_async_transaction() is None
     assert transaction.state == AsyncTxnState.RETIRED
     assert controller._async_discarded_forward_count == 1

@@ -10,6 +10,7 @@ from megatron.core.inference.async_transaction import (
     AsyncDecodeLayout,
     AsyncDecodePlan,
     AsyncDecodeTransaction,
+    AsyncPendingForwardUse,
     AsyncPreparedDecodeState,
     AsyncRowMapPolicy,
     AsyncTxnState,
@@ -201,6 +202,13 @@ class AsyncDecodeCoordinator:
         """Return whether a transaction owns a pending async forward."""
         return self.pending_transaction() is not None
 
+    def pending_graph_request_count(self) -> int | None:
+        """Return the pending transaction's CUDA graph request count, if any."""
+        transaction = self.pending_transaction()
+        if transaction is None:
+            return None
+        return transaction.plan.graph_shape.padded_active_request_count
+
     def begin_transaction(
         self,
         *,
@@ -269,6 +277,85 @@ class AsyncDecodeCoordinator:
             num_speculative_tokens=self._model_callbacks.speculative_token_count(),
         )
 
+    def pending_forward_row_status(self) -> tuple[bool, bool]:
+        """Return whether the pending forward is reusable and row-mapped."""
+        transaction = self.pending_transaction()
+        if transaction is None:
+            return True, False
+        current_layout = self._context_ops.current_layout(
+            tokens_per_request=transaction.plan.graph_shape.tokens_per_request
+        )
+        decision = transaction.plan.resolve_pending_forward(
+            current_layout, row_map_policy=self._model_callbacks.row_map_policy()
+        )
+        if not decision.reusable:
+            return False, False
+        return True, decision.row_mapped
+
+    def consume_pending_forward(self) -> tuple[bool, Tensor | None, bool]:
+        """Resolve, commit or rollback, and retire the pending forward."""
+        transaction = self.pending_transaction()
+        if transaction is None:
+            return False, None, False
+
+        current_layout = self._context_ops.current_layout(
+            tokens_per_request=transaction.plan.graph_shape.tokens_per_request
+        )
+        decision = transaction.plan.resolve_pending_forward(
+            current_layout, row_map_policy=self._model_callbacks.row_map_policy()
+        )
+        graph_request_count = transaction.plan.graph_shape.padded_active_request_count
+        if graph_request_count is None:
+            graph_request_count = transaction.plan.graph_shape.active_request_count
+        transaction.resolution = AsyncPendingForwardUse(
+            reused=decision.reusable,
+            row_indices=decision.row_map,
+            row_mapped=decision.row_mapped,
+            graph_request_count=graph_request_count,
+        )
+
+        if not decision.reusable:
+            if not decision.graph_compatible:
+                self._diagnostics_ops.increment_counter("_async_graph_mismatch_discard_count")
+            else:
+                self._diagnostics_ops.increment_counter("_async_layout_mismatch_discard_count")
+            self._finalize_transaction(
+                transaction, reused=False, reason=decision.reason or "pending forward not reusable"
+            )
+            return False, None, False
+
+        if decision.row_mapped and not self._context_ops.row_mapped_reuse_allowed(row_mapped=True):
+            transaction.resolution = AsyncPendingForwardUse(
+                reused=False,
+                row_indices=decision.row_map,
+                row_mapped=True,
+                graph_request_count=graph_request_count,
+            )
+            self._finalize_transaction(
+                transaction, reused=False, reason="row-mapped non-decode forward not reusable"
+            )
+            return False, None, False
+
+        if decision.row_mapped:
+            self._diagnostics_ops.increment_counter("_async_row_mapped_forward_count")
+        else:
+            self._diagnostics_ops.increment_counter("_async_identity_forward_count")
+        self._diagnostics_ops.increment_counter("_async_reused_forward_count")
+        row_indices = (
+            decision.row_map.to(device=torch.cuda.current_device(), dtype=torch.long)
+            if decision.row_mapped and decision.row_map is not None
+            else None
+        )
+        self._finalize_transaction(transaction, reused=True, reason=None)
+        return True, row_indices, decision.row_mapped
+
+    def discard_pending(self, reason: str = "discarded before step begin") -> None:
+        """Rollback and retire the pending forward, if one exists."""
+        transaction = self.pending_transaction()
+        if transaction is None:
+            return
+        self._finalize_transaction(transaction, reused=False, reason=reason)
+
     def begin_step(self, *, has_real_work: bool) -> EPStepBeginDecision:
         """Preview pending forward status and resolve EP step-begin state."""
         self._step_state = AsyncCoordinatorStepState()
@@ -315,9 +402,27 @@ class AsyncDecodeCoordinator:
             return
         self.decide_handoff(has_real_work=has_real_work, can_launch_async_handoff=False)
 
-    def _finalize_transaction(self) -> None:
-        """Compatibility placeholder for the single transaction finalization path."""
-        self.retire_transaction()
+    def _finalize_transaction(
+        self, transaction: AsyncDecodeTransaction, *, reused: bool, reason: str | None
+    ) -> None:
+        """Commit or rollback transaction-owned effects and retire the transaction."""
+        ledger = transaction.resource_ledger
+        if reused:
+            transaction.mark_committed()
+            if ledger is not None:
+                ledger.release_deferred(self._allocator_ops)
+                self._context_ops.clear_active_ledger(ledger)
+            self._diagnostics_ops.increment_counter("_async_committed_forward_count")
+        else:
+            transaction.rollback(reason or "pending forward not reused")
+            if ledger is not None:
+                ledger.drain(self._allocator_ops)
+                self._context_ops.clear_active_ledger(ledger)
+            self._diagnostics_ops.increment_counter("_async_discarded_forward_count")
+            self._diagnostics_ops.increment_counter("_async_rolled_back_forward_count")
+        transaction.mark_retired()
+        if self._pending_transaction is transaction:
+            self._pending_transaction = None
 
     def _discard_prepared_state(self) -> None:
         """Release resources held by a prepared state that was never launched."""
@@ -386,8 +491,12 @@ class _DynamicContextOps:
     def row_mapped_reuse_allowed(self, *, row_mapped: bool) -> bool:
         if not row_mapped:
             return True
+        config = getattr(self._context, "config", None)
+        is_decode_only = getattr(self._context, "is_decode_only", None)
+        if config is None or is_decode_only is None:
+            return True
         return bool(
-            self._context.config.materialize_only_last_token_logits or self._context.is_decode_only()
+            config.materialize_only_last_token_logits or is_decode_only()
         )
 
     def register_active_ledger(self, ledger: object) -> None:
