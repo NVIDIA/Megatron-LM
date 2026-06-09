@@ -1848,6 +1848,90 @@ def test_async_decode_plan_and_transaction_participant_hooks_are_canonical():
 
 
 @pytest.mark.internal
+def test_async_transaction_terminal_lifecycle_is_idempotent_and_fenced():
+    events = []
+
+    class _Event:
+        def synchronize(self):
+            events.append("forward_sync")
+
+    class _Participant:
+        def prepare(self, plan):
+            events.append(("prepare", plan.active_request_count))
+            return "prepared"
+
+        def validate(self, plan, current_state):
+            return True
+
+        def commit(self, plan):
+            events.append(("commit", plan.active_request_count))
+
+        def rollback(self, plan):
+            events.append(("rollback", plan.active_request_count))
+
+        def retire(self, plan):
+            events.append(("retire", plan.active_request_count))
+
+        def diagnostics(self):
+            return {}
+
+    snapshot = _make_async_layout_snapshot([31, 32], cuda_graph_request_count=2)
+    participant = _Participant()
+    transaction = AsyncDecodeTransaction(
+        step_id=9,
+        state=AsyncTxnState.LAUNCHED,
+        snapshot=snapshot,
+        forward_done_event=_Event(),
+        participants=(participant,),
+    )
+
+    transaction.prepare_participants()
+    transaction.prepare_participants()
+    transaction.rollback("invalidated")
+    transaction.rollback("late rollback")
+    transaction.discard("late discard")
+    transaction.mark_committed()
+
+    assert events == [
+        ("prepare", 2),
+        "forward_sync",
+        ("rollback", 2),
+    ]
+    assert transaction.state == AsyncTxnState.ROLLED_BACK
+    assert transaction.discard_reason == "invalidated"
+    assert transaction.diagnostics()["participants_prepared"]
+    assert transaction.diagnostics()["participants_rolled_back"]
+    assert not transaction.diagnostics()["participants_committed"]
+
+    committed = AsyncDecodeTransaction(
+        step_id=10,
+        state=AsyncTxnState.LAUNCHED,
+        snapshot=snapshot,
+        forward_done_event=_Event(),
+        participants=(participant,),
+    )
+    committed.mark_committed()
+    committed.mark_committed()
+    committed.rollback("late rollback")
+    committed.discard("late discard")
+    committed.mark_retired()
+    committed.mark_retired()
+
+    assert events == [
+        ("prepare", 2),
+        "forward_sync",
+        ("rollback", 2),
+        ("commit", 2),
+        "forward_sync",
+        ("retire", 2),
+    ]
+    assert committed.state == AsyncTxnState.RETIRED
+    assert committed.discard_reason is None
+    assert committed.diagnostics()["participants_committed"]
+    assert committed.diagnostics()["participants_retired"]
+
+
+@pytest.mark.internal
 def test_async_resource_participant_rolls_back_speculative_resources_once():
     released_blocks = []
     context = SimpleNamespace(
