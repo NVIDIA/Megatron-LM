@@ -358,8 +358,8 @@ def _make_fake_te_namespace():
     """Build a fake TE namespace with the activation classes _make_fused_ops uses."""
 
     class FakeCpuOffloadControl:
-        def disable_activation_offloading(self, disabled=True):
-            self.activation_offloading = not disabled
+        def set_activation_offloading(self, enabled):
+            self.activation_offloading = enabled
 
     class FakeGroupedLinear(FakeCpuOffloadControl, torch.nn.Module):
         def __init__(

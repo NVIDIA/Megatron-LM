@@ -92,7 +92,7 @@ def fused_grouped_mlp_activation_offload_supported() -> bool:
         return False
     grouped_linear_cls = getattr(getattr(te.pytorch, "ops", None), "GroupedLinear", None)
     return grouped_linear_cls is not None and hasattr(
-        grouped_linear_cls, "disable_activation_offloading"
+        grouped_linear_cls, "set_activation_offloading"
     )
 
 
