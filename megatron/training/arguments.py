@@ -1110,7 +1110,12 @@ def validate_args(args, defaults={}):
             # In Megatron-LM, required implementation for manual registration is already provided.
             # So we enable the manual registration by default when nccl-ub and use_megatron_fsdp is set.
             args.fsdp_manual_registration = True
-            warn_rank_0('FSDP manual registration is enabled by default when --nccl-ub is enabled!')
+            args.fsdp_double_buffer = True
+            warn_rank_0('FSDP double buffer and manual registration is enabled by default when --nccl-ub is enabled!')
+
+        if args.megatron_fsdp_max_pool_double_buffer:
+            # MaxPoolAllocator is a type of FSDP double buffer.
+            args.fsdp_double_buffer = True
 
         if args.init_model_with_meta_device and args.data_parallel_sharding_strategy == "no_shard":
             raise ValueError(
@@ -3383,6 +3388,16 @@ def _add_experimental_args(parser):
                 'recomputation will be unsharded.'
             ),
         )
+
+    group.add_argument("--megatron-fsdp-max-pool-double-buffer", action='store_true',
+                        help="When using Megatron-FSDP double buffering, use the MaxPoolAllocator instead of "
+                             "the FixedPoolAllocator to support asymmetrical FSDP unit configurations. Will "
+                             "increase memory overhead to recycle buffers that fit all FSDP units. Enables "
+                             "NCCL user buffer registration and CUDA graph replay for mixed-arch models.")
+    group.add_argument("--fsdp-db-use-persist-buf-on-alloc-fail", action='store_true',
+                        help="When using Megatron-FSDP double buffering, persist non-unit modules that "
+                             "are not included in the symmetric buffer pool. May be necessary for NCCL "
+                             "UBR or CUDA Graphs on hybrid architectures.")
 
     return parser
 

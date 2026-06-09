@@ -177,6 +177,15 @@ class DistributedDataParallelConfig:
       will be unsharded.
     """
 
+    megatron_fsdp_max_pool_double_buffer: bool = False
+    """
+    Uses an asymmetrical MaxPoolAllocator that can be recycled across different
+    FSDP units, instead of the symmetrical FixedPoolAllocator that requires exact
+    parity between FSDP units, when using fsdp_double_buffer=True. Enables NCCL
+    user buffer registration and CUDA graph replay for models with asymmetrical
+    FSDP units, such as models with hybrid architectures (e.g. Mamba and MoE).
+    """
+
     def __post_init__(self):
         import os
 
