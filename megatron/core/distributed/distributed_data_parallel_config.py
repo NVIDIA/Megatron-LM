@@ -1,6 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Tuple
 
 import torch
@@ -83,6 +83,15 @@ class DistributedDataParallelConfig:
     use_megatron_fsdp: bool = False
     """If true, use the FSDP code path for DDP."""
 
+    use_megatron_fsdp_v2: bool = False
+    """If true, use the `fully_shard` API for FSDP sharding the model.
+    """
+
+    mfsdp_cuda_graph_modules: list = field(default_factory=list)
+    """If set and ``use_megatron_fsdp_v2`` is set, enable CUDA graph capture
+    on specific FSDP module types.  Valid values: ``'mamba'`` (MambaLayer),
+    ``'transformer'`` (TransformerLayer).  Example: ``['mamba', 'transformer']``.
+    Only leaf FSDP modules (without FSDP children) are eligible."""
     use_custom_fsdp: bool = False
     """
     NOTE: The flag `use_custom_fsdp` is deprecated and will be removed in future versions.

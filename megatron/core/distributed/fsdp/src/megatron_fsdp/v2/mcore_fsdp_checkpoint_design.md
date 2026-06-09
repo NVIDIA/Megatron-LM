@@ -25,7 +25,7 @@ the checkpoint save/load architecture and how it integrates with MCore's
 | Source Format | Target Format | Model | Optimizer | Notes |
 |---------------|--------------|-------|-----------|-------|
 | MFSDP v2 | MFSDP v2 | ✓ | ✓ | Full round-trip and cross-setting (`optim_grads` ↔ `optim_grads_params`) |
-| MFSDP v1 baseline | MFSDP v2 | ✓ | ✓ | Both `fsdp_dtensor` format, canonical key matching |
+| MFSDP v1 baseline | MFSDP v2 | ✗ | ✗ | Currently skipped in tests (``pytest.skip("v1 checkpoint format not available")``).  Both use ``fsdp_dtensor`` format but key names may differ.  Planned for future support. |
 | ND-parallel (`torch_dist`) | MFSDP v2 | ✓ | ✓ (``fully_reshardable`` only) | Online conversion via `_load_torch_dist_into_megatron_fsdp_v2` in `checkpointing.py`. Expert weights are split from flattened multi-expert tensors. Optimizer states (`exp_avg`, `exp_avg_sq`) are loaded into V2's name-based format. Hi-precision FP32 optimizer param copies are used for model weights when available. ``dp_reshardable`` format is not supported (bucket-based layout incompatible with name-based V2 format). |
 | ND-parallel (`torch`) | MFSDP v2 | ✗ | ✗ | Not supported (different serialization) |
 
@@ -53,10 +53,10 @@ format for both paths. It uses DCP directly, storing each parameter as a `DTenso
 | Module | Location | Responsibility |
 |--------|----------|----------------|
 | `uneven_dtensor.py` | `megatron/core/distributed/fsdp/src/megatron_fsdp/` | `get_state_dict`, `preprocess_state_dict_for_uneven_dtensor`, chunk metadata for uneven DTensors |
-| `fsdp_dtensor_checkpoint.py` | `megatron/core/transformer/` | SWiGLU split, GDN split, expert key remapping, FP8 cleanup |
+| `fsdp_dtensor_checkpoint.py` | `megatron/core/transformer/` | (v1 only) SWiGLU split, GDN split, expert key remapping, FP8 cleanup.  v2 equivalents live in ``checkpoint.py``.
 | `distrib_optimizer.py` | `megatron/core/optimizer/` | `state_dict()`, `load_state_dict()`, `sharded_state_dict()`, `sharded_param_state_fsdp_dtensor()` |
 | `checkpointing.py` | `megatron/training/` | High-level save/load orchestration, `_build_megatron_fsdp_v2_state_dict`, `preprocess_fsdp_dtensor_state_dict()` |
-| `checkpoint.py` | `megatron/core/distributed/fsdp/` | `MegatronFSDPStateful`, `_apply_mcore_postprocess`, `_split_fused_params_v2` (SwiGLU+GDN), `_build_dtensor_optim_sd`, `_preprocess_and_verify_v2_state_dict`, `_build_torch_dist_to_v2_map`, `load_torch_dist_into_fsdp_v2` |
+| `checkpoint.py` | `megatron/core/distributed/fsdp/` | `MegatronFSDPStateful`, `_apply_mcore_postprocess`, `_verify_chunk_metadata`, `_propagate_chunk_metadata_to_state_dict`, `_split_fused_params_v2` (SwiGLU+GDN+MambaMixer), `_build_dtensor_optim_sd`, `_preprocess_and_verify_v2_state_dict`, `_build_torch_dist_to_v2_map`, `load_torch_dist_into_fsdp_v2` |
 | `mcore_fsdp_adapter.py` | `megatron/core/distributed/fsdp/` | Routes to v1 `MegatronFSDP` or Megatron FSDP v2 `fully_shard` |
 
 ### 3.1.1 `checkpoint.py` Functions (Megatron FSDP v2)
@@ -77,7 +77,11 @@ format for both paths. It uses DCP directly, storing each parameter as a `DTenso
 | `handle_experts_in_state_dict(model_sd, num_experts)` | Rename expert parameter keys for expert-parallel sharding. |
 | `handle_swiglu_in_state_dict_v2(model, model_sd, opt_sd)` | Thin wrapper: precomputes ``layer_glu`` map, delegates to ``_split_fused_params_v2`` with SwiGLU detector and ``_w``/``_v`` suffix format. |
 | `handle_gdn_in_state_dict_v2(model, model_sd, opt_sd)` | Thin wrapper: delegates to ``_split_fused_params_v2`` with ``_match_gdn_key`` detector and ``.query``/``.key``/``.value`` suffix format. |
-| `_split_fused_params_v2(model, model_sd, opt_sd, detector, key_fmt, tag)` | Unified fused-parameter splitting skeleton. Iterates model and optimizer state dicts, calls the ``detector(key, dtensor, model) -> (sizes, names, dim)`` callback to identify fused tensors, splits via ``split_dtensor``, and renames keys via ``key_fmt(key, sub_name)``. Shared by SwiGLU and GDN. |
+| `handle_mamba_in_state_dict_v2(model, model_sd, opt_sd)` | Thin wrapper: delegates to ``_split_fused_params_v2`` with ``_mamba_mixer_detector`` and MambaMixer suffix format. |
+| `_split_fused_params_v2(...)` | Unified fused-parameter splitting skeleton. Iterates model and optimizer state dicts, calls the ``detector(key, dtensor, model) -> (sizes, names, dim)`` callback to identify fused tensors, splits via ``split_dtensor``, and renames keys via ``key_fmt(key, sub_name)``. Shared by SwiGLU, GDN, and MambaMixer. |
+| `_verify_chunk_metadata(flattened_sd)` | Final verification: checks every DTensor has ``__create_chunk_list__`` AND that ``chunks_total_numel == local_numel``. On failure, logs key, shape, chunk details, source tag, and device mesh before raising ``AssertionError``. |
+| `_propagate_chunk_metadata_to_state_dict(model, state_dict)` | Copy ``__create_chunk_list__`` / ``__create_write_items__`` from model parameters (which have them from init) to state dict DTensors (fresh from ``model.state_dict()``). Matches by key name. Logs unmatched DTensors at rank 0 for diagnostic tracing. |
+| `get_chunk_meta_source(dtensor)` | Return the source tag (e.g. ``"init"``, ``"preprocess"``, ``"split"``, ``"propagate:init"``) stored on ``dtensor._local_tensor._chunk_meta_source``. |
 | `_is_swiglu_key(key)` | Check whether a key matches any SwiGLU fc1 pattern. |
 | `_match_gdn_key(key, dtensor)` | GDN detector: returns ``(sizes, names, dim)`` for fused QKV projections, or ``None``. |
 | `_detect_glu_layers(model)` | Return ``{layer_path: gated_linear_unit}`` for all TransformerLayers. |
@@ -398,11 +402,15 @@ SwiGLU split, expert key remapping) can be applied as a separate layer.
                            │
 ┌──────────────────────────▼───────────────────────────────────┐
 │  Layer 2: MCore Post-Processing                              │
-│  preprocess_fsdp_dtensor_state_dict()                        │
-│  → handle_fp8_extra_state_case()    # strip FP8 artifacts    │
-│  → handle_swiglu_in_state_dict()    # split fc1 into _w/_v   │
-│  → handle_experts_in_state_dict()   # EP key remapping       │
-│  (uneven DTensor is already handled by Layer 1)              │
+│  _apply_mcore_postprocess(state_dict, args, model)           │
+│  → _propagate_chunk_metadata_to_state_dict  (copy metadata)  │
+│  → _build_dtensor_optim_sd                  (wrap as DTensor)│
+│  → handle_fp8_extra_state_case              (FP8 cleanup)    │
+│  → handle_swiglu_in_state_dict_v2           (split fc1)      │
+│  → handle_gdn_in_state_dict_v2              (split QKV)      │
+│  → handle_mamba_in_state_dict_v2            (split Mamba)    │
+│  → handle_experts_in_state_dict             (EP key remap)   │
+│  → _verify_chunk_metadata                   (consistency ✓)  │
 └──────────────────────────┬───────────────────────────────────┘
                            │
 ┌──────────────────────────▼───────────────────────────────────┐
@@ -511,8 +519,7 @@ def load_checkpoint_fsdp_v2(model_chunks, optimizer, ...):
 
 `uneven_dtensor.get_state_dict` adds uneven DTensor chunk metadata in the same call.
 With the raw PyTorch version, `preprocess_state_dict_for_uneven_dtensor` must be called
-separately, and the caller must ensure it is not double-called (once by the wrapper,
-once by `preprocess_fsdp_dtensor_state_dict`). Using `uneven_dtensor.get_state_dict`
+once by `preprocess_state_dict_for_uneven_dtensor`). Using `uneven_dtensor.get_state_dict`
 consolidates this into a single well-tested entry point.
 
 **Why separate the layers?**
@@ -802,6 +809,37 @@ This function:
 
 This is called on **both** model and optimizer state dicts.
 
+### 9.3 Chunk Metadata Source Tag
+
+Each DTensor's local tensor carries a `_chunk_meta_source` attribute that records
+where its `__create_chunk_list__` metadata was set. This enables tracing the
+provenance of chunk metadata when debugging size mismatches.
+
+| Source Tag | Set By | When |
+|---|---|---|
+| `"init"` | `update_uneven_dtensor_chunk_metadata` (default) | FSDP v2 construction (`param_group.py`) |
+| `"preprocess"` | `preprocess_state_dict_for_uneven_dtensor` | Save Phase 1 (re-computes via all_gather) |
+| `"propagate:<src>"` | `copy_chunk_metadata` | Save Phase 2 (copied from model param; `<src>` is the original tag) |
+| `"split"` | `split_dtensor` | Save Phase 3 (locally derived from parent's metadata) |
+| `"make_uneven"` | `make_uneven_dtensor(chunk_metadata=...)` | Optimizer state wrapping as DTensors |
+
+Use `get_chunk_meta_source(dtensor)` to read the tag (returns `"none"` if unset).
+
+### 9.4 Final Consistency Check (`_verify_chunk_metadata`)
+
+At the end of `_apply_mcore_postprocess`, `_verify_chunk_metadata` validates
+every DTensor in the flattened state dict:
+
+1. **Existence check** — every DTensor must have `__create_chunk_list__`.
+2. **Numel consistency check** — `sum(prod(chunk.sizes)) == local_tensor.numel()`.
+   Each chunk's sizes may be multi-dimensional (e.g., `(256, 512)`), so the
+   element count is the product of all dimensions. A mismatch (e.g., 40960 vs
+   2560) indicates chunk metadata was computed with the wrong device mesh
+   (DP instead of EDP) or against stale state.
+3. **On failure** — logs the key, global/local shapes, chunk list with offsets
+   and sizes, source tag, and device mesh before raising `AssertionError`.
+   This pinpoints which phase produced incorrect metadata and what mesh was used.
+
 ---
 
 ## 10. DTensor Attribute Propagation
@@ -891,8 +929,8 @@ ensures model and optimizer state dict keys are consistent in the checkpoint.
 - [x] Skip `preprocess_fsdp_dtensor_state_dict` for v2 in both save and load paths
       (post-processing already handled by ``_apply_mcore_postprocess`` inside
       ``MegatronFSDPStateful.state_dict()``)
-- [ ] Handle PP: iterate model chunks, build per-chunk state dicts
-- [ ] Handle multi-optimizer (ChainedOptimizer: expert + non-expert optimizers)
+- [ ] Handle PP: iterate model chunks, build per-chunk state dicts (not yet required — all current tests use PP=1)
+- [ ] Handle multi-optimizer (ChainedOptimizer: expert + non-expert optimizers) (not yet required — all current tests use single optimizer)
 
 ### Phase 2: Path A — Standalone Save/Load (`checkpoint.py`)
 
@@ -991,7 +1029,22 @@ ensures model and optimizer state dict keys are consistent in the checkpoint.
 5. **Optimizer state restored?** — Check that `optimizer.state` is non-empty and
    contains expected keys (`exp_avg`, `exp_avg_sq`, `step`).
 
-6. **NaN after load?** — Common causes:
+6. **Chunk metadata present?** — After save, verify `__create_chunk_list__` exists
+   on all DTensors and the state dict passed `_verify_chunk_metadata` without error.
+   Check the log for `[chunk_metadata_diag]` warnings about unmatched DTensors.
+
+7. **Chunk metadata consistent?** — If DCP reports `invalid fill tensor-volume`,
+   inspect the `[chunk_metadata_verify]` error log. It shows global/local shapes,
+   chunk offsets/sizes, the source tag (which phase set the metadata), and the
+   device mesh. Common causes:
+   - `source=preprocess` + wrong device mesh → `all_gather_object` computed
+     offsets against DP mesh when parameter is sharded across EDP mesh.
+   - `source=propagate:init` + key mismatch → metadata was copied from a
+     different parameter (or not copied at all, falling back to Phase 1 metadata).
+   - `source=split` + wrong split → fused param split derived wrong local
+     offsets from parent's chunk metadata.
+
+8. **NaN after load?** — Common causes:
    - Missing `allreduce` attribute propagation (expert params misclassified)
    - Missing `overwrite_main_grad=True` for wgrad fusion (gradient doubling)
    - Wrong `gradient_accumulation_fusion` setting

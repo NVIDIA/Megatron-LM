@@ -1214,6 +1214,11 @@ def validate_args(args, defaults={}):
     if getattr(args, 'use_megatron_fsdp_v2', False):
         args.use_megatron_fsdp = True
 
+    if getattr(args, 'mfsdp_cuda_graph_modules', None):
+        assert getattr(args, 'use_megatron_fsdp_v2', False), (
+            "--mfsdp-cuda-graph requires --use-megatron-fsdp-v2"
+        )
+
     if args.inference_dynamic_batching_sampling_backend == 'flashinfer':
         try:
             import flashinfer  # noqa: F401
@@ -3906,6 +3911,18 @@ def _add_distributed_args(parser):
         dest='use_megatron_fsdp_v2',
         help='Use PyTorch fully shard API for FSDP implementation. '
         'This option is only effective when use-megatron-fsdp is set. ',
+    )
+    group.add_argument(
+        '--mfsdp-cuda-graph',
+        nargs='+',
+        default=[],
+        choices=['mamba', 'transformer', 'moe_router', 'attn'],
+        dest='mfsdp_cuda_graph_modules',
+        help='Enable CUDA graph capture on specific FSDP module types '
+        'when using Megatron FSDP v2 (--use-megatron-fsdp-v2). '
+        'Choices: mamba (MambaLayer), transformer (TransformerLayer). '
+        'Can be combined, e.g. --mfsdp-cuda-graph mamba transformer. '
+        'Only non-nested (leaf) FSDP modules are eligible.',
     )
     group.add_argument(
         '--create-all-gather-group',

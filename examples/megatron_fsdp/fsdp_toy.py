@@ -84,6 +84,7 @@ def build_fsdp_model(
     n_layers: int,
     use_megatron_fsdp: bool,
     use_activation_checkpointing: bool = False,
+    enable_cuda_graph: bool = True,
 ) -> Tuple["FSDPModule", torch.distributed.device_mesh.DeviceMesh]:
     if use_megatron_fsdp:
         try:
@@ -101,12 +102,18 @@ def build_fsdp_model(
     if use_activation_checkpointing:
         model.enable_activation_checkpointing()
 
-    # Example: per-layer sharding
-    for layer in model.layers:
-        fully_shard(layer, mesh=mesh)
+    if use_megatron_fsdp:
+        sublayer_kwargs = dict(
+            enable_cuda_graph=enable_cuda_graph,
+        )
+        kwargs = {}
+    else:
+        sublayer_kwargs = {}
+        kwargs = {}
 
-    # Optionally shard the root as well
-    fully_shard(model, mesh=mesh)
+    for layer in model.layers:
+        fully_shard(layer, mesh=mesh, **sublayer_kwargs)
+    fully_shard(model, mesh=mesh, **kwargs)
 
     assert isinstance(model, ToyModel)
     assert isinstance(model, FSDPModule)
@@ -227,7 +234,7 @@ def train(
             loss = y.sum() / (world_size * args.batch_size)
             loss.backward()
             optimizer.step()
-            optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad()
 
             if step % args.log_interval == 0 and rank == 0:
                 print(f"[rank0] epoch={epoch} step={step} loss={loss.item():.4f}")
@@ -259,6 +266,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--log-interval", type=int, default=5)
     parser.add_argument("--use-megatron-fsdp", action="store_true", help="Use Megatron-FSDP instead of PyTorch FSDP2")
     parser.add_argument("--activation-checkpoint", action="store_true", help="Enable activation checkpointing on transformer layers")
+    parser.add_argument("--cuda-graph", action="store_true", default=True, help="Enable CUDA graph capture (default: on)")
+    parser.add_argument("--no-cuda-graph", action="store_false", dest="cuda_graph", help="Disable CUDA graph capture")
     return parser.parse_args()
 
 
@@ -270,6 +279,7 @@ def main() -> None:
         n_layers=args.n_layers,
         use_megatron_fsdp=args.use_megatron_fsdp,
         use_activation_checkpointing=args.activation_checkpoint,
+        enable_cuda_graph=args.cuda_graph,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
 

@@ -42,12 +42,6 @@ Wraps a module with FSDP sharding semantics:
 
 Controls parameter/gradient dtypes and communication precision.
 
-| Policy | Notes |
-|--------|-------|
-| `MixedPrecisionPolicy` | Base policy; all fields default to ``None`` |
-| `FullyShardFP8Policy` | MXFP8 rowwise/colwise quantized weights |
-| `FullyShardNVFP4Policy` | NVFP4 primary weights |
-
 **Key fields:**
 
 | Field | Default | Purpose |
@@ -57,8 +51,18 @@ Controls parameter/gradient dtypes and communication precision.
 | `grad_comm_dtype` | ``None`` | Dtype for gradient reduce-scatter communication. ``None`` = use ``main_grads_dtype``. |
 | `use_decoupled_grad` | ``False`` | When ``False``, ``main_grads_dtype`` is inferred from ``main_params_dtype`` so the optimizer operates in a consistent precision context. |
 
+**FP8 & NVFP4 recipes**
+
+`FullyShardFP8Policy` and `FullyShardNVFP4Policy` are recipe dataclasses
+that configure quantized mixed-precision behavior within `MixedPrecisionPolicy`,
+passed via the ``fp8`` and ``nvfp4`` fields respectively.  They are not
+standalone policies.
+
 ```python
-from megatron_fsdp.v2 import fully_shard, MixedPrecisionPolicy
+from megatron_fsdp.v2 import (
+    fully_shard, MixedPrecisionPolicy,
+    FullyShardFP8Policy, FullyShardNVFP4Policy,
+)
 
 # No separate main buffer — optimizer mutates model params directly
 mp_policy = MixedPrecisionPolicy()
@@ -68,11 +72,17 @@ fully_shard(model, mp_policy=mp_policy)
 mp_policy = MixedPrecisionPolicy(main_params_dtype=torch.float32)
 fully_shard(model, mp_policy=mp_policy)
 
-# FP8 mixed precision — fp32 main weights auto-created by adapter
-from megatron_fsdp.v2 import FullyShardFP8Policy
+# FP8 mixed precision — fp32 main weights + MXFP8 rowwise/colwise quantized compute
 mp_policy = MixedPrecisionPolicy(
     main_params_dtype=torch.float32,
-    fp8=FullyShardFP8Policy(enabled=True)
+    fp8=FullyShardFP8Policy(enabled=True),
+)
+fully_shard(model, mp_policy=mp_policy)
+
+# NVFP4 mixed precision — fp32 main weights + NVFP4 primary compute weights
+mp_policy = MixedPrecisionPolicy(
+    main_params_dtype=torch.float32,
+    nvfp4=FullyShardNVFP4Policy(enabled=True),
 )
 fully_shard(model, mp_policy=mp_policy)
 ```
@@ -86,6 +96,52 @@ Mixin class added to wrapped modules. Methods:
 | `unshard()` | Pre-forward | All-gather params from sharded buffer |
 | `reshard()` | Post-forward, post-backward | Release unsharded buffer |
 | `reduce_grad()` | Post-backward / grad sync | All-reduce no-shard grads or reduce-scatter ZeRO grads |
+
+### CUDA Graph Capture
+
+> **Experimental** — CUDA graph support in Megatron FSDP v2 is an experimental
+> feature.  The API and behaviour may change in future releases without notice.
+
+FSDP v2 supports transparent CUDA graph capture for individual FSDP modules.
+Enable it per-module with ``enable_cuda_graph=True``:
+
+```python
+for layer in model.layers:
+    fully_shard(layer, enable_cuda_graph=True)
+fully_shard(model)  # root without CUDA graph
+```
+
+Capture happens automatically on the first optimized forward pass
+(after the trace pool has been planned).  Subsequent forward passes replay
+the captured graph, bypassing FSDP hooks entirely for that module.
+
+**How it works:**
+
+1. The forward pre-hook detects ``enable_cuda_graph=True`` and creates an
+   ``FSDPCudaGraphRunner`` for the module.
+2. The runner pops FSDP hooks, warms up via ``make_graphed_callables``,
+   and captures the module's ``forward()`` (without FSDP collectives) into a
+   CUDA graph.
+3. After capture, ``install()`` patches ``module.forward`` to a wrapper
+   that replays the graph on subsequent calls.
+4. After capture, ``install()`` patches ``module.forward`` to a wrapper that
+   replays the graph on subsequent calls. During replay, the patched forward
+   calls the graphed callable directly, bypassing FSDP forward hooks entirely.
+   Backward hooks (unshard/reshard/reduce_grad) still fire normally.
+
+**Limitation — nesting:** A parent FSDP module that contains other FSDP
+modules as children **cannot** use ``enable_cuda_graph=True``.  Only leaf
+FSDP modules (those without FSDP children) are eligible.  Attempting to
+enable CUDA graph on a module with FSDP children raises a ``RuntimeError``.
+
+```python
+# OK — layers are leaf FSDP modules (no FSDP children inside them)
+for layer in model.layers:
+    fully_shard(layer, enable_cuda_graph=True)
+
+# NOT OK — model contains FSDP layers as children
+fully_shard(model, enable_cuda_graph=True)   # raises RuntimeError
+```
 
 ### DataParallelBuffer
 
@@ -117,12 +173,15 @@ See the parent directory `..` for `uneven_dtensor.py` which provides:
 
 ## Sharding Strategies
 
+All strategies except `no_shard` use `Shard(0)` DTensor placements. The
+strategy controls which buffers and communication collectives are used.
+
 | Strategy | Shard Weights | Shard Gradients | Status | Notes |
 |----------|---------------|-----------------|--------|-------|
-| `optim_grads_params` | Yes | Yes | **Supported** | Like ZeRO-3: full parameter/gradient/optimizer sharding |
-| `no_shard` | No | No | **Supported** | Like DDP: replicated weights and full-gradient all-reduce |
-| `optim` | No | No | **Supported** | Like ZeRO-1: shard optimizer states only |
-| `optim_grads` | No | Yes | **Supported** | Like ZeRO-2: shard optimizer states + gradients |
+| `optim_grads_params` | Yes | Yes | **Supported** | Like ZeRO-3: all-gather weights pre-forward, reduce-scatter grads during backward, sharded optimizer states |
+| `optim_grads` | No | Yes | **Supported** | Like ZeRO-2: replicated weights, reduce-scatter grads during backward, sharded optimizer states. No param-gather overlap. |
+| `optim` | No | No | **Supported** | Like ZeRO-1: replicated weights, grads accumulated in replicated buffer, single reduce-scatter at ``finish_grad_sync``, sharded optimizer states. No param-gather overlap. |
+| `no_shard` | No | No | **Supported** | Like DDP: replicated weights, full-gradient all-reduce, replicated optimizer states. No param-gather overlap. |
 
 ## Known Limitations
 
@@ -138,7 +197,20 @@ See the parent directory `..` for `uneven_dtensor.py` which provides:
 ### Sharding Strategies
 
 `no_shard` (DDP-like), `optim` (ZeRO-1), `optim_grads` (ZeRO-2), and
-`optim_grads_params` (ZeRO-3 equivalent) are implemented.
+`optim_grads_params` (ZeRO-3 equivalent) are implemented. `no_shard`,
+`optim`, and `optim_grads` use replicated compute weights, so parameter gather
+overlap (prefetch/unshard pipelining) is not applicable.
+
+### CUDA Graph
+
+- **Experimental.** CUDA graph support is experimental. The API and behavior
+  may change in future releases without notice. Enable via
+  ``enable_cuda_graph=True`` on leaf FSDP modules only.
+- **Nesting not supported.** A parent FSDP module that contains other FSDP
+  modules as children cannot use ``enable_cuda_graph=True``.  Only leaf FSDP
+  modules (those without FSDP children) are eligible for CUDA graph capture.
+  Attempting to enable CUDA graph on a nested FSDP module raises a
+  ``RuntimeError``.
 
 ### `fully_shard()` API Parameters
 
@@ -216,6 +288,7 @@ without any Megatron-LM dependency once the package is released.
 See `examples/megatron_fsdp/fsdp_toy.py` for a standalone example showing:
 
 - Basic model wrapping with `fully_shard()`
+- CUDA graph capture (`--cuda-graph` / `--no-cuda-graph`)
 - Training loop with gradient accumulation
 - Activation checkpointing (`--activation-checkpoint`)
 - Distributed checkpointing with `torch.distributed.checkpoint`
@@ -228,12 +301,23 @@ torchrun --nproc_per_node=2 examples/megatron_fsdp/fsdp_toy.py \
 torchrun --nproc_per_node=2 examples/megatron_fsdp/fsdp_toy.py \
     --model-dim 512 --n-layers 2 --batch-size 4 \
     --use-megatron-fsdp --activation-checkpoint
+
+# Disable CUDA graph capture
+torchrun --nproc_per_node=2 examples/megatron_fsdp/fsdp_toy.py \
+    --model-dim 512 --n-layers 2 --batch-size 4 \
+    --use-megatron-fsdp --no-cuda-graph
 ```
 
 ## Gotchas / Pitfalls
 
 - **Zero-numel gradient shards and fused optimizers.** When a parameter's local shard is empty on some DP ranks (e.g., small biases on high DP counts), creating a `DTensor` gradient with `numel() == 0` and passing it to fused multi-tensor optimizers (TE `FusedAdam`) can silently corrupt updates for neighboring non-empty parameters. This manifests only as convergence divergence with no error — see [design.md § Pitfall](design.md) for details and the fix in `param_group.py`.
-- **Temporary communication buckets must record their CUDA stream.** `DataParallelBuffer.reshard()` and `release_grad_buffer()` can return temporary all-gather / reduce-scatter bucket storage to the allocator while side-stream CUDA work is still queued. A CUDA event wait orders streams, but it does not tell PyTorch's caching allocator that the freed storage is still used by `ag_stream` or `rs_stream`. If the block is recycled on another stream, the communication payload can be silently corrupted. Call `record_stream()` on any temporary CUDA tensor that participates in side-stream communication before it may be freed; a full synchronization only masks the bug and hurts overlap.
+- **Temporary communication bucket lifecycle.** All temporary all-gather /
+  reduce-scatter buckets are allocated on the default CUDA stream and only
+  compute operations (all-gather, reduce-scatter) run on side streams
+  (`ag_stream`, `rs_stream`). CUDA events inserted at the boundary between
+  allocation and compute, and between compute and free, guarantee ordering
+  without ``record_stream``. Keeping allocations on the default stream avoids
+  non-deterministic caching-allocator behaviour and peak memory regressions.
 
 ## Unit Tests
 
