@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import gc
 import os
@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Tuple
 import pytest
 import torch
 
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
@@ -49,12 +50,17 @@ def _build_gpt_model(
     enable_hyper_connections: bool = False,
     num_residual_streams: int = 4,
     mhc_recompute_layer_num: Optional[int] = None,
+    recompute_granularity: Optional[str] = "selective",
+    recompute_method: Optional[str] = None,
+    recompute_num_layers: Optional[int] = None,
+    recompute_modules: Optional[List[str]] = None,
 ) -> GPTModel:
     """Build a GPTModel that uses TE-based transformer layer spec."""
     model_parallel_cuda_manual_seed(seed)
     torch.manual_seed(seed)
     ConfigClass = MLATransformerConfig if is_mla else TransformerConfig
-    recompute_modules = ["layernorm", "moe_act"] if num_experts is not None else ["layernorm"]
+    if recompute_modules is None:
+        recompute_modules = ["layernorm", "moe_act"] if num_experts is not None else ["layernorm"]
     if enable_hyper_connections and mhc_recompute_layer_num is not None:
         recompute_modules.append("mhc")
     transformer_config = ConfigClass(
@@ -67,7 +73,9 @@ def _build_gpt_model(
         params_dtype=torch.bfloat16,
         # Recompute
         recompute_modules=recompute_modules,
-        recompute_granularity="selective",
+        recompute_granularity=recompute_granularity,
+        recompute_method=recompute_method,
+        recompute_num_layers=recompute_num_layers,
         # MoE
         num_moe_experts=num_experts,
         moe_grouped_gemm=(num_experts is not None),
@@ -315,6 +323,198 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
             )
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+@pytest.mark.parametrize("recompute_num_layers", [1, 2])
+def test_full_recompute_layer_input_offloading(recompute_num_layers: int):
+    """Full recompute can offload one checkpoint input per recompute segment."""
+    os.environ.pop("NVTE_FUSED_ATTN", None)
+    os.environ.pop("NVTE_FLASH_ATTN", None)
+    os.environ.pop("NVTE_UNFUSED_ATTN", None)
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+
+    seed = 123
+    num_layers = 4
+    hidden_size = 512
+    num_attention_heads = 8
+    vocab_size = 512
+    seq_length = 256
+    micro_batch_size = 2
+    device = torch.device("cuda")
+
+    input_ids, position_ids, attention_mask = _make_gpt_inputs(
+        seq_length=seq_length, micro_batch_size=micro_batch_size, device=device
+    )
+
+    off_interface.reset_instance()
+
+    try:
+        _reset_cuda_memory()
+        base_model = _build_gpt_model(
+            seed=seed,
+            num_layers=num_layers,
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            vocab_size=vocab_size,
+            seq_length=seq_length,
+            num_experts=None,
+            fine_grained_activation_offloading=False,
+            offload_modules=None,
+            min_offloaded_tensor_size=1024 * 1024,
+            is_mla=False,
+            recompute_granularity="full",
+            recompute_method="uniform",
+            recompute_num_layers=recompute_num_layers,
+            recompute_modules=[],
+        ).cuda()
+        base_model.train()
+
+        _run_one_iter_and_capture(
+            base_model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            enable_offload_reset=False,
+        )
+        _reset_cuda_memory()
+        base_logits, base_grads, _ = _run_one_iter_and_capture(
+            base_model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            enable_offload_reset=False,
+        )
+        del base_model
+        _reset_cuda_memory()
+
+        off_model = _build_gpt_model(
+            seed=seed,
+            num_layers=num_layers,
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            vocab_size=vocab_size,
+            seq_length=seq_length,
+            num_experts=None,
+            fine_grained_activation_offloading=True,
+            offload_modules=["layer_input"],
+            min_offloaded_tensor_size=0,
+            is_mla=False,
+            recompute_granularity="full",
+            recompute_method="uniform",
+            recompute_num_layers=recompute_num_layers,
+            recompute_modules=[],
+        ).cuda()
+        off_model.train()
+
+        _run_one_iter_and_capture(
+            off_model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            enable_offload_reset=True,
+        )
+        off_interface.reset()
+
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            PipelineOffloadManager,
+        )
+
+        mgr = PipelineOffloadManager.get_instance()
+        expected_groups = (num_layers + recompute_num_layers - 1) // recompute_num_layers
+        layer_input_groups = [
+            group
+            for group in mgr._cached_chunks_forward[0].offload_groups
+            if group._name == "layer_input"
+        ]
+        assert len(layer_input_groups) == expected_groups
+        assert all(group.total_tensor_count == 1 for group in layer_input_groups)
+        assert mgr.offload_summary_bytes.get("layer_input", 0) > 0
+
+        _reset_cuda_memory()
+        off_logits, off_grads, _ = _run_one_iter_and_capture(
+            off_model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            enable_offload_reset=True,
+        )
+        del off_model
+        _reset_cuda_memory()
+
+        assert torch.allclose(off_logits, base_logits, rtol=1e-3, atol=1e-3)
+        assert set(off_grads.keys()) == set(base_grads.keys())
+        for name, gb in base_grads.items():
+            go = off_grads[name]
+            if gb is None or go is None:
+                assert gb is None and go is None, f"Grad None mismatch for {name}"
+                continue
+            assert torch.allclose(go, gb, rtol=1e-3, atol=1e-3), f"Grad mismatch for {name}"
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_layer_input_offloading_requires_uniform_full_recompute():
+    """layer_input offloading is limited to uniform full recompute."""
+    with pytest.raises(ValueError, match="uniform full activation recompute"):
+        TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            fine_grained_activation_offloading=True,
+            offload_modules=["layer_input"],
+            recompute_granularity="full",
+            recompute_method="block",
+            recompute_num_layers=1,
+            recompute_modules=[],
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+@pytest.mark.skipif(
+    not (HAVE_TE and is_te_min_version("1.5.0")),
+    reason="TE checkpoint patch requires Transformer Engine 1.5.0+.",
+)
+def test_te_checkpoint_resizes_fgao_reloaded_input(monkeypatch):
+    """TE checkpoint backward releases FGAO-reloaded checkpoint input storage."""
+    from megatron.core.extensions import transformer_engine as te_ext
+    from megatron.core.pipeline_parallel.fine_grained_activation_offload import mark_reloaded_tensor
+
+    resize_calls = []
+    original_resize = te_ext._resize_fgao_checkpoint_inputs
+
+    def _record_resize(detached_inputs):
+        resize_calls.append(
+            sum(
+                1
+                for inp in detached_inputs
+                if torch.is_tensor(inp)
+                and getattr(inp, "_mcore_fgao_resize_after_backward", False)
+            )
+        )
+        return original_resize(detached_inputs)
+
+    monkeypatch.setattr(te_ext, "_resize_fgao_checkpoint_inputs", _record_resize)
+
+    x = torch.randn(16, 16, device="cuda", requires_grad=True)
+    mark_reloaded_tensor(x)
+
+    def forward_func(inp):
+        return (inp * inp).sum()
+
+    loss = te_ext.te_checkpoint(
+        forward_func,
+        False,
+        None,
+        None,
+        x,
+        release_fgao_reloaded_inputs=True,
+    )
+    loss.backward()
+    torch.cuda.synchronize()
+
+    assert x.grad is not None
+    assert resize_calls and resize_calls[-1] == 1
 
 
 @pytest.mark.flaky_in_dev

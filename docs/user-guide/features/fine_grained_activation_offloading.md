@@ -13,7 +13,7 @@ Contributed in collaboration with RedNote.
 
 Memory is often the limiting factor for very large sparse MoE models such as DeepSeek-V3 and Qwen3-235B. Fine-grained recomputation lowers activation memory at the cost of extra compute. Offloading can use host-device bandwidth so that reload overlaps compute and keeps overhead small in many setups. Fine-grained activation offloading moves activations at module granularity so you can tune how much activation memory leaves the device and adjust training throughput.
 
-Supported offloading modules are `"attn_norm"`, `"core_attn"`, `"attn_proj"`, `"mlp_norm"`, `"expert_fc1"`, and `"moe_act"`. They can be combined with fine-grained recomputation to free almost all activations for a transformer layer on the device.
+Supported offloading modules are `"attn_norm"`, `"qkv_linear"`, `"core_attn"`, `"attn_proj"`, `"mlp_norm"`, `"expert_fc1"`, `"moe_act"`, and `"layer_input"`. They can be combined with fine-grained recomputation to free almost all activations for a transformer layer on the device. `"layer_input"` is only valid with uniform full recompute and offloads one checkpoint input per segment; `--recompute-num-layers N` controls the per-N-layer segment size.
 
 ## Features
 
@@ -33,8 +33,13 @@ Supported offloading modules are `"attn_norm"`, `"core_attn"`, `"attn_proj"`, `"
 --fine-grained-activation-offloading
 
 # Modules whose inputs are offloaded (refer to your training script for list or delimiter syntax).
-# Choices: "attn_norm", "core_attn", "attn_proj", "mlp_norm", "expert_fc1", "moe_act".
+# Choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj", "mlp_norm",
+#          "expert_fc1", "moe_act", "layer_input".
 --offload-modules expert_fc1
+
+# Offload one full-recompute checkpoint input per two-layer segment.
+--recompute-granularity full --recompute-method uniform --recompute-num-layers 2 \
+  --offload-modules layer_input
 ```
 
 ## Max inflight offloads

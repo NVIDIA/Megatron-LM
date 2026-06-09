@@ -539,7 +539,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
             return custom_forward
 
-        def checkpoint_handler(forward_func):
+        def checkpoint_handler(forward_func, release_fgao_reloaded_inputs=False):
             """Determines whether to use the `te_checkpoint` or `tensor_parallel.checkpoint`"""
             # TODO: check if fp4 is supported in this case
             if self.config.fp8 or self.config.fp4:
@@ -554,6 +554,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     context_mask,
                     rotary_pos_emb,
                     padding_mask,
+                    release_fgao_reloaded_inputs=release_fgao_reloaded_inputs,
                 )
             else:
                 return tensor_parallel.checkpoint(
@@ -567,6 +568,29 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     padding_mask,
                 )
 
+        def checkpoint_segment(start: int, end: int):
+            """Checkpoint one full-recompute segment, optionally offloading its saved inputs."""
+            nonlocal hidden_states, context
+            if (
+                self.config.fine_grained_activation_offloading
+                and "layer_input" in self.config.offload_modules
+            ):
+                from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+                    FineGrainedActivationOffloadingInterface as off_interface,
+                )
+
+                layer_input_offloader = off_interface(
+                    True, hidden_states, "layer_input", max_offloaded_tensors=1
+                )
+                with layer_input_offloader as hidden_states_for_checkpoint:
+                    hidden_states = hidden_states_for_checkpoint
+                    hidden_states, context = checkpoint_handler(
+                        custom(start, end), release_fgao_reloaded_inputs=True
+                    )
+                hidden_states = layer_input_offloader.group_offload(hidden_states)
+            else:
+                hidden_states, context = checkpoint_handler(custom(start, end))
+
         if self.config.recompute_method == 'uniform':
             # Uniformly divide the total number of Transformer layers and checkpoint
             # the input activation of each divided chunk.
@@ -576,7 +600,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 chunk_end = min(
                     layer_idx + self.config.recompute_num_layers, self.num_layers_per_pipeline_rank
                 )
-                hidden_states, context = checkpoint_handler(custom(layer_idx, chunk_end))
+                checkpoint_segment(layer_idx, chunk_end)
 
                 # Feature extraction for uniform recompute: collect at end of each chunk
                 # Note: Only the last layer of each chunk can have features collected
@@ -605,7 +629,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     layer_idx >= recompute_skip_num_layers
                     and layer_idx < self.config.recompute_num_layers + recompute_skip_num_layers
                 ):
-                    hidden_states, context = checkpoint_handler(custom(layer_idx, layer_idx + 1))
+                    checkpoint_segment(layer_idx, layer_idx + 1)
                 else:
                     hidden_states, context = custom(layer_idx, layer_idx + 1)(
                         hidden_states, attention_mask, context, context_mask, rotary_pos_emb
