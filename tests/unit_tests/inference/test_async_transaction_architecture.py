@@ -28,25 +28,9 @@ DYNAMIC_CONTEXT = "megatron/core/inference/contexts/dynamic_context.py"
 
 
 EXPECTED_VIOLATIONS = {
-    ("async-dataclass-fields", ASYNC_TRANSACTION, "AsyncDecodeTransaction"),
-    ("async-dataclass-fields", ASYNC_TRANSACTION, "AsyncEligibilityDecision"),
-    ("async-dataclass-slots", ASYNC_TRANSACTION, "AsyncDecodeTransaction"),
-    ("async-dataclass-slots", ASYNC_TRANSACTION, "AsyncEligibilityDecision"),
     ("async-dataclass-slots", ASYNC_TRANSACTION, "AsyncGraphShape"),
     ("async-dataclass-slots", ASYNC_TRANSACTION, "AsyncSampleReadback"),
     ("async-dataclass-slots", ASYNC_TRANSACTION, "AsyncSampleTicket"),
-    ("async-dataclass-unexpected", ASYNC_TRANSACTION, "AsyncEPParticipant"),
-    ("async-dataclass-unexpected", ASYNC_TRANSACTION, "AsyncLogprobMTPParticipant"),
-    ("async-dataclass-unexpected", ASYNC_TRANSACTION, "AsyncMambaLease"),
-    ("async-dataclass-unexpected", ASYNC_TRANSACTION, "AsyncMambaStateParticipant"),
-    ("async-dataclass-unexpected", ASYNC_TRANSACTION, "AsyncResourceParticipant"),
-    ("async-dataclass-unexpected", ASYNC_TRANSACTION, "AsyncSampleReadbackParticipant"),
-    ("async-removed-symbol", ASYNC_TRANSACTION, "AsyncMambaLease"),
-    ("participant-lifecycle-fields", ASYNC_TRANSACTION, "AsyncEPParticipant"),
-    ("participant-lifecycle-fields", ASYNC_TRANSACTION, "AsyncLogprobMTPParticipant"),
-    ("participant-lifecycle-fields", ASYNC_TRANSACTION, "AsyncMambaStateParticipant"),
-    ("participant-lifecycle-fields", ASYNC_TRANSACTION, "AsyncResourceParticipant"),
-    ("participant-lifecycle-fields", ASYNC_TRANSACTION, "AsyncSampleReadbackParticipant"),
 }
 
 
@@ -200,6 +184,7 @@ REQUIRED_DATACLASSES = {
     "AsyncPreparedDecodeState",
     "AsyncDecodeTransaction",
     "AsyncCoordinatorStepState",
+    "AsyncParticipantLifecycle",
 }
 
 REMOVED_ASYNC_SYMBOLS = {

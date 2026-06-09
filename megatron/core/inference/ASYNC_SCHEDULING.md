@@ -114,7 +114,6 @@ and `diagnostics` hooks.
 
 Current participants include:
 
-- `AsyncEPParticipant`: records EP step-begin and handoff launch/skip decisions.
 - `AsyncMambaStateParticipant`: accepts async Mamba candidate banks on commit.
 - `AsyncSampleReadbackParticipant`: tracks the sample readback ticket lifetime.
 - `AsyncLogprobMTPParticipant`: records generated-logprob and MTP requirements.
@@ -133,10 +132,11 @@ retirement is rejected.
 ## Resource Ownership
 
 `AsyncResourceLedger` records KV reservations, deferred KV blocks, deferred
-Mamba slots, Mamba leases, in-flight state, and consumed reservations.
+Mamba slots, in-flight state, and consumed reservations.
 
-When a speculative forward is launched, the context marks the ledger in flight
-and the transaction attaches an `AsyncResourceParticipant`. During CPU
+When a speculative forward is launched, the coordinator marks the ledger in
+flight and attaches an `AsyncResourceParticipant` when the ledger owns
+reservations or deferred resources. During CPU
 reconciliation, matching reserved KV blocks can be consumed by request ID and
 block column. Unused reservations are deferred. Request cleanup that overlaps an
 in-flight forward defers KV and Mamba releases through the same ledger.
@@ -146,10 +146,9 @@ context allocators and clears in-flight state. On rollback, it first moves any
 unused reservations into the deferred list and then releases everything. This
 keeps prepare, commit, and rollback symmetric for speculative resources.
 
-Controller fallback cleanup exists only for lightweight tests and legacy
-transaction stubs that do not own an `AsyncResourceParticipant`. Real launched
-async forwards attach the resource participant when the context marks the
-ledger in flight.
+The context borrows the active ledger reference only while the coordinator-owned
+transaction is in flight. Commit and rollback release behavior remains owned by
+the transaction ledger.
 
 ## Mamba, MTP, And Logprobs
 
@@ -170,11 +169,10 @@ resolved row indices when row-mapped pending logits are consumed.
 completion, graph-shape sync, step-begin reuse/discard decisions, and async
 handoff launch/skip decisions.
 
-The transaction lifecycle records EP state through `AsyncEPParticipant`.
-Step-begin decisions are attached to the pending transaction. Handoff decisions
-are staged and attached to the transaction that is launched. If EP skips an
-async handoff, the prepared plan is discarded and the skip reason is counted
-without launching a transaction.
+The coordinator owns per-step EP state separately from the transaction. It
+previews pending-forward reuse at step begin, records the handoff decision for
+the current step, and discards prepared state without launching a transaction
+when EP skips an async handoff.
 
 ## Diagnostics
 

@@ -2515,12 +2515,6 @@ class DynamicInferenceContext(BaseInferenceContext):
         if transfer_bookkeeping_to_gpu:
             self.transfer_bookkeeping_to_gpu()
 
-    def clear_async_resource_reservations(self) -> None:
-        """Clear the request-to-reserved-block map after CPU reconciliation."""
-        ledger = self._active_async_ledger_ref
-        if ledger is not None:
-            ledger.clear_reservations()
-
     def register_active_async_ledger(self, ledger: AsyncResourceLedger) -> None:
         """Borrow the transaction-owned resource ledger for context bookkeeping."""
         self._active_async_ledger_ref = ledger
@@ -2537,18 +2531,6 @@ class DynamicInferenceContext(BaseInferenceContext):
             ledger = AsyncResourceLedger()
             self._active_async_ledger_ref = ledger
         return ledger
-
-    def mark_async_resources_in_flight(self) -> AsyncResourceLedger:
-        """Mark that a speculative forward may still be using old resources."""
-        ledger = self._active_async_ledger()
-        ledger.in_flight = True
-        return ledger
-
-    def release_deferred_async_resources(self) -> None:
-        """Release async-reserved resources after their speculative forward retires."""
-        ledger = self._active_async_ledger_ref
-        if ledger is not None:
-            ledger.release_deferred(self)
 
     def defer_async_kv_blocks(self, blocks: Tensor) -> None:
         """Defer releasing blocks that may still be used by an in-flight forward."""

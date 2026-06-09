@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Protocol, runtime_checkable
 
@@ -634,7 +634,7 @@ def _row_field_matches(planned: Tensor | None, current: Tensor | None, row_map: 
     return torch.equal(current.to(device="cpu"), planned.index_select(0, row_map).to(device="cpu"))
 
 
-@dataclass
+@dataclass(slots=True)
 class AsyncDecodeTransaction:
     """Owns one speculative async decode forward and all state tied to it."""
 
@@ -642,32 +642,23 @@ class AsyncDecodeTransaction:
     state: AsyncTxnState
     plan: AsyncDecodePlan
     resolution: AsyncPendingForwardUse | None = None
-    sample_ticket: object | None = None
     resource_ledger: object | None = None
+    participants: tuple[AsyncTransactionParticipant, ...] = ()
+    sample_ticket: object | None = None
     h2d_done_event: object | None = None
     forward_done_event: object | None = None
-    ep_decision: object | None = None
     discard_reason: str | None = None
-    participants: tuple[AsyncTransactionParticipant, ...] = ()
-    participant_state: dict[str, object] = field(default_factory=dict)
-    _participants_prepared: bool = False
-    _participants_committed: bool = False
-    _participants_rolled_back: bool = False
-    _participants_retired: bool = False
 
     def mark_launched(
         self,
         *,
         sample_ticket: object | None = None,
-        resources: object | None = None,
         resource_ledger: object | None = None,
         h2d_done_event: object | None = None,
         forward_done_event: object | None = None,
-        ep_decision: object | None = None,
     ) -> None:
         """Mark the async forward as launched and attach launch-owned state."""
         self.sample_ticket = sample_ticket if sample_ticket is not None else self.sample_ticket
-        resource_ledger = resources if resources is not None else resource_ledger
         self.resource_ledger = (
             resource_ledger if resource_ledger is not None else self.resource_ledger
         )
@@ -675,7 +666,6 @@ class AsyncDecodeTransaction:
         self.forward_done_event = (
             forward_done_event if forward_done_event is not None else self.forward_done_event
         )
-        self.ep_decision = ep_decision if ep_decision is not None else self.ep_decision
         self.state = AsyncTxnState.LAUNCHED
 
     def has_participant(self, participant_type: type) -> bool:
@@ -686,33 +676,31 @@ class AsyncDecodeTransaction:
         """Attach participants, preparing new hooks immediately when needed."""
         if not participants:
             return
-        if (
-            self._participants_committed
-            or self._participants_rolled_back
-            or self._participants_retired
+        if self.state in (
+            AsyncTxnState.COMMITTED,
+            AsyncTxnState.ROLLED_BACK,
+            AsyncTxnState.RETIRED,
+            AsyncTxnState.DISCARDED,
         ):
             raise RuntimeError("Cannot attach async participants after transaction finalization")
+        prepare_now = self._participants_all("prepared")
         self.participants = (*self.participants, *participants)
-        if not self._participants_prepared:
-            return
-        plan = self.plan
-        for participant in participants:
-            self._prepare_participant(participant, plan)
+        if prepare_now:
+            for participant in participants:
+                self._prepare_participant(participant, self.plan)
 
     def _prepare_participant(
         self, participant: AsyncTransactionParticipant, plan: AsyncDecodePlan
     ) -> None:
-        self.participant_state[type(participant).__name__] = participant.prepare(plan)
+        participant.prepare(plan)
 
     def prepare_participants(self, plan: AsyncDecodePlan | None = None) -> None:
         """Prepare all transaction participants for the plan."""
-        if self._participants_prepared:
-            return
         plan = self.plan if plan is None else plan
         assert plan is not None
         for participant in self.participants:
-            self._prepare_participant(participant, plan)
-        self._participants_prepared = True
+            if not getattr(participant, "prepared", False):
+                self._prepare_participant(participant, plan)
 
     def validate_participants(
         self, current_state: object, plan: AsyncDecodePlan | None = None
@@ -724,28 +712,20 @@ class AsyncDecodeTransaction:
 
     def commit_participants(self, plan: AsyncDecodePlan | None = None) -> None:
         """Commit all participant-owned speculative side effects."""
-        if self._participants_committed or self._participants_rolled_back:
-            return
         plan = self.plan if plan is None else plan
         assert plan is not None
         for participant in self.participants:
             participant.commit(plan)
-        self._participants_committed = True
 
     def rollback_participants(self, plan: AsyncDecodePlan | None = None) -> None:
         """Rollback all participant-owned speculative side effects."""
-        if self._participants_committed or self._participants_rolled_back:
-            return
         plan = self.plan if plan is None else plan
         assert plan is not None
         for participant in reversed(self.participants):
             participant.rollback(plan)
-        self._participants_rolled_back = True
 
     def retire_participants(self, plan: AsyncDecodePlan | None = None) -> None:
         """Retire participant-owned handles that expose an optional retire hook."""
-        if self._participants_retired:
-            return
         plan = self.plan if plan is None else plan
         for participant in self.participants:
             retire = getattr(participant, "retire", None)
@@ -755,7 +735,6 @@ class AsyncDecodeTransaction:
                 retire()
             else:
                 retire(plan)
-        self._participants_retired = True
 
     def current_layout(self, context: object) -> AsyncDecodeLayout:
         """Build the current layout using this transaction's decode stride."""
@@ -859,11 +838,10 @@ class AsyncDecodeTransaction:
             "has_resources": self.resource_ledger is not None,
             "has_h2d_done_event": self.h2d_done_event is not None,
             "has_forward_done_event": self.forward_done_event is not None,
-            "has_ep_decision": self.ep_decision is not None,
-            "participants_prepared": self._participants_prepared,
-            "participants_committed": self._participants_committed,
-            "participants_rolled_back": self._participants_rolled_back,
-            "participants_retired": self._participants_retired,
+            "participants_prepared": self._participants_all("prepared"),
+            "participants_committed": self._participants_all("committed"),
+            "participants_rolled_back": self._participants_all("rolled_back"),
+            "participants_retired": self._participants_all("retired"),
             "plan": self.plan.diagnostics(),
             "participants": {
                 type(participant).__name__: participant.diagnostics()
@@ -875,6 +853,11 @@ class AsyncDecodeTransaction:
     def is_in_flight(self) -> bool:
         """Whether the transaction still represents a pending async forward."""
         return self.state in (AsyncTxnState.PREPARED, AsyncTxnState.LAUNCHED, AsyncTxnState.RESOLVED)
+
+    def _participants_all(self, field_name: str) -> bool:
+        return bool(self.participants) and all(
+            bool(getattr(participant, field_name, False)) for participant in self.participants
+        )
 
 
 @dataclass(frozen=True)
@@ -1049,15 +1032,6 @@ class AsyncKVReservation:
     request_id: int
     block_column: int
     block_id: int
-
-
-@dataclass(frozen=True)
-class AsyncMambaLease:
-    """One Mamba slot/bank lease associated with an async forward."""
-
-    request_id: int
-    slot_id: int
-    bank_id: int
 
 
 @dataclass(slots=True)
@@ -1260,15 +1234,29 @@ class AsyncPreparedDecodeState:
     pre_sampling_state: AsyncPreSamplingContextState | None
 
 
-@dataclass
-class AsyncResourceParticipant:
-    """Participant that owns rollback for one async resource ledger."""
+@dataclass(slots=True)
+class AsyncParticipantLifecycle:
+    """Shared lifecycle flags for async transaction participants."""
 
-    ledger: AsyncResourceLedger
-    context: object | None = None
     prepared: bool = False
     committed: bool = False
     rolled_back: bool = False
+    retired: bool = False
+
+    def retire(self, plan: AsyncDecodePlan | None = None) -> None:
+        """Mark participant handles as retired."""
+        self.retired = True
+
+
+class AsyncResourceParticipant(AsyncParticipantLifecycle):
+    """Participant that owns rollback for one async resource ledger."""
+
+    __slots__ = ("ledger", "context")
+
+    def __init__(self, ledger: AsyncResourceLedger, context: object | None = None) -> None:
+        super().__init__()
+        self.ledger = ledger
+        self.context = context
 
     def prepare(self, plan: AsyncDecodePlan) -> dict[str, int | bool]:
         """Capture resource diagnostics for the prepared transaction."""
@@ -1304,19 +1292,22 @@ class AsyncResourceParticipant:
             "prepared": self.prepared,
             "committed": self.committed,
             "rolled_back": self.rolled_back,
+            "retired": self.retired,
         }
 
 
-@dataclass
-class AsyncMambaStateParticipant:
+class AsyncMambaStateParticipant(AsyncParticipantLifecycle):
     """Participant that commits async Mamba candidate banks."""
 
-    context: object
-    committed: bool = False
-    rolled_back: bool = False
+    __slots__ = ("context",)
+
+    def __init__(self, context: object) -> None:
+        super().__init__()
+        self.context = context
 
     def prepare(self, plan: AsyncDecodePlan) -> dict[str, bool]:
         """Mamba state is already prepared in context staging buffers."""
+        self.prepared = True
         return self.diagnostics()
 
     def validate(self, plan: AsyncDecodePlan, current_state: object) -> bool:
@@ -1342,16 +1333,18 @@ class AsyncMambaStateParticipant:
         return {"committed": self.committed, "rolled_back": self.rolled_back}
 
 
-@dataclass
-class AsyncSampleReadbackParticipant:
+class AsyncSampleReadbackParticipant(AsyncParticipantLifecycle):
     """Participant that tracks sample readback ticket lifetime."""
 
-    ticket: AsyncSampleTicket
-    committed: bool = False
-    rolled_back: bool = False
+    __slots__ = ("ticket",)
+
+    def __init__(self, ticket: AsyncSampleTicket) -> None:
+        super().__init__()
+        self.ticket = ticket
 
     def prepare(self, plan: AsyncDecodePlan) -> dict[str, int | bool]:
         """Sample copy is already queued; expose the ticket diagnostics."""
+        self.prepared = True
         return self.diagnostics()
 
     def validate(self, plan: AsyncDecodePlan, current_state: object) -> bool:
@@ -1380,17 +1373,19 @@ class AsyncSampleReadbackParticipant:
         }
 
 
-@dataclass
-class AsyncLogprobMTPParticipant:
+class AsyncLogprobMTPParticipant(AsyncParticipantLifecycle):
     """Participant that records generated-logprob and MTP requirements."""
 
-    requires_logprobs: bool
-    requires_mtp: bool
-    committed: bool = False
-    rolled_back: bool = False
+    __slots__ = ("requires_logprobs", "requires_mtp")
+
+    def __init__(self, *, requires_logprobs: bool, requires_mtp: bool) -> None:
+        super().__init__()
+        self.requires_logprobs = requires_logprobs
+        self.requires_mtp = requires_mtp
 
     def prepare(self, plan: AsyncDecodePlan) -> dict[str, bool]:
         """Logprob and MTP tensors are prepared by controller sampling paths."""
+        self.prepared = True
         return self.diagnostics()
 
     def validate(self, plan: AsyncDecodePlan, current_state: object) -> bool:
@@ -1419,65 +1414,6 @@ class AsyncLogprobMTPParticipant:
         }
 
 
-@dataclass
-class AsyncEPParticipant:
-    """Participant that records EP step-begin and async-handoff decisions."""
-
-    step_begin_decision: object | None = None
-    handoff_decision: object | None = None
-    prepared: bool = False
-    committed: bool = False
-    rolled_back: bool = False
-
-    def record_step_begin(self, decision: object) -> None:
-        """Attach the EP step-begin decision that resolved pending transaction state."""
-        self.step_begin_decision = decision
-
-    def record_handoff(self, decision: object) -> None:
-        """Attach the EP handoff launch or skip decision for a candidate transaction."""
-        self.handoff_decision = decision
-
-    def prepare(self, plan: AsyncDecodePlan) -> dict[str, object]:
-        """Record that EP state is prepared with the transaction plan."""
-        self.prepared = True
-        return self.diagnostics()
-
-    def validate(self, plan: AsyncDecodePlan, current_state: object) -> bool:
-        """EP decisions are validated by their tagged collectives."""
-        return True
-
-    def commit(self, plan: AsyncDecodePlan) -> None:
-        """Mark EP decision state as committed with the transaction."""
-        if self.committed:
-            return
-        self.committed = True
-
-    def rollback(self, plan: AsyncDecodePlan) -> None:
-        """Mark EP decision state as rolled back with the transaction."""
-        if self.committed:
-            return
-        self.rolled_back = True
-
-    def diagnostics(self) -> dict[str, object]:
-        """Return EP participant diagnostics."""
-        return {
-            "prepared": self.prepared,
-            "committed": self.committed,
-            "rolled_back": self.rolled_back,
-            "step_begin": self._decision_diagnostics(self.step_begin_decision),
-            "handoff": self._decision_diagnostics(self.handoff_decision),
-        }
-
-    @staticmethod
-    def _decision_diagnostics(decision: object | None) -> dict[str, object] | None:
-        if decision is None:
-            return None
-        return {
-            field: getattr(decision, field)
-            for field in getattr(decision, "__dataclass_fields__", {})
-        }
-
-
 def _tensor_ints(values: Tensor, *, skip_negative: bool = False) -> list[int]:
     values = values.to(dtype=torch.int64, device="cpu").reshape(-1)
     if skip_negative:
@@ -1485,14 +1421,12 @@ def _tensor_ints(values: Tensor, *, skip_negative: bool = False) -> list[int]:
     return [int(value) for value in values.tolist()]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class AsyncEligibilityDecision:
     """Classified async scheduling eligibility for the current controller/context state."""
 
     can_prepare: bool
-    can_launch: bool
     reason: str | None
-    requires_barrier: bool = False
 
 
 def classify_async_eligibility(
@@ -1508,9 +1442,7 @@ def classify_async_eligibility(
     )
     return AsyncEligibilityDecision(
         can_prepare=reason is None,
-        can_launch=reason is None,
         reason=reason,
-        requires_barrier=reason == "waiting request admission deferred",
     )
 
 

@@ -14,6 +14,7 @@ from megatron.core.inference.async_transaction import (
     AsyncGraphShape,
     AsyncLogprobMTPParticipant,
     AsyncMambaStateParticipant,
+    AsyncParticipantLifecycle,
     AsyncPendingForwardUse,
     AsyncPreparedDecodeState,
     AsyncResourceLedger,
@@ -1380,7 +1381,6 @@ def test_async_scheduling_disabled_reason_matrix(case, expected):
     decision = classify_async_eligibility(controller, context, allow_mtp=allow_mtp)
     assert decision.reason == expected
     assert decision.can_prepare is (expected is None)
-    assert decision.can_launch is (expected is None)
     if case == "admission_barrier":
         assert not controller._async_admission_barrier_requested
         controller._async_admission_barrier_requested = True
@@ -1852,7 +1852,6 @@ def test_async_transaction_and_resource_diagnostics_are_stable():
             "has_resources",
             "has_h2d_done_event",
             "has_forward_done_event",
-            "has_ep_decision",
             "participants",
         )
     } == {
@@ -1865,7 +1864,6 @@ def test_async_transaction_and_resource_diagnostics_are_stable():
         "has_resources": True,
         "has_h2d_done_event": False,
         "has_forward_done_event": False,
-        "has_ep_decision": False,
         "participants": {},
     }
     assert diagnostics["plan"]["request_ids"] == [10, 11]
@@ -1883,11 +1881,12 @@ def test_async_transaction_and_resource_diagnostics_are_stable():
 def test_async_decode_plan_and_transaction_participant_hooks_are_canonical():
     events = []
 
-    class _Participant:
+    class _Participant(AsyncParticipantLifecycle):
         def diagnostics(self):
             return {"events": list(events)}
 
         def prepare(self, plan):
+            self.prepared = True
             events.append(("prepare", plan.request_ids.tolist()))
             return "prepared"
 
@@ -1896,9 +1895,11 @@ def test_async_decode_plan_and_transaction_participant_hooks_are_canonical():
             return True
 
         def commit(self, plan):
+            self.committed = True
             events.append(("commit", plan.active_request_count))
 
         def rollback(self, plan):
+            self.rolled_back = True
             events.append(("rollback", plan.active_request_count))
 
     participant = _Participant()
@@ -1916,7 +1917,7 @@ def test_async_decode_plan_and_transaction_participant_hooks_are_canonical():
     assert plan.diagnostics()["request_ids"] == [21, 22]
 
     transaction.prepare_participants()
-    assert transaction.participant_state == {"_Participant": "prepared"}
+    assert participant.prepared
     assert transaction.validate_participants("current")
     transaction.mark_committed()
 
@@ -1947,8 +1948,9 @@ def test_async_transaction_terminal_lifecycle_fences_rollback_not_retire():
         def synchronize(self):
             events.append("forward_sync")
 
-    class _Participant:
+    class _Participant(AsyncParticipantLifecycle):
         def prepare(self, plan):
+            self.prepared = True
             events.append(("prepare", plan.active_request_count))
             return "prepared"
 
@@ -1956,12 +1958,15 @@ def test_async_transaction_terminal_lifecycle_fences_rollback_not_retire():
             return True
 
         def commit(self, plan):
+            self.committed = True
             events.append(("commit", plan.active_request_count))
 
         def rollback(self, plan):
+            self.rolled_back = True
             events.append(("rollback", plan.active_request_count))
 
         def retire(self, plan):
+            self.retired = True
             events.append(("retire", plan.active_request_count))
 
         def diagnostics(self):
@@ -2026,8 +2031,9 @@ def test_async_transaction_terminal_lifecycle_fences_rollback_not_retire():
 def test_async_transaction_prepares_late_participants_once():
     events = []
 
-    class _FirstParticipant:
+    class _FirstParticipant(AsyncParticipantLifecycle):
         def prepare(self, plan):
+            self.prepared = True
             events.append(("prepare_first", plan.active_request_count))
             return "first"
 
@@ -2035,16 +2041,19 @@ def test_async_transaction_prepares_late_participants_once():
             return True
 
         def commit(self, plan):
+            self.committed = True
             events.append(("commit_first", plan.active_request_count))
 
         def rollback(self, plan):
+            self.rolled_back = True
             events.append(("rollback_first", plan.active_request_count))
 
         def diagnostics(self):
             return {}
 
-    class _SecondParticipant:
+    class _SecondParticipant(AsyncParticipantLifecycle):
         def prepare(self, plan):
+            self.prepared = True
             events.append(("prepare_second", plan.active_request_count))
             return "second"
 
@@ -2052,9 +2061,11 @@ def test_async_transaction_prepares_late_participants_once():
             return True
 
         def commit(self, plan):
+            self.committed = True
             events.append(("commit_second", plan.active_request_count))
 
         def rollback(self, plan):
+            self.rolled_back = True
             events.append(("rollback_second", plan.active_request_count))
 
         def diagnostics(self):
@@ -2083,10 +2094,8 @@ def test_async_transaction_prepares_late_participants_once():
     ]
     assert transaction.has_participant(_FirstParticipant)
     assert transaction.has_participant(_SecondParticipant)
-    assert transaction.participant_state == {
-        "_FirstParticipant": "first",
-        "_SecondParticipant": "second",
-    }
+    assert first.prepared
+    assert second.prepared
     with pytest.raises(RuntimeError, match="after transaction finalization"):
         transaction.add_participants(_SecondParticipant())
 
@@ -2205,12 +2214,7 @@ def test_controller_attaches_speculative_resource_participants_to_launch_transac
         AsyncLogprobMTPParticipant,
         AsyncResourceParticipant,
     )
-    assert transaction.participant_state.keys() == {
-        "AsyncMambaStateParticipant",
-        "AsyncSampleReadbackParticipant",
-        "AsyncLogprobMTPParticipant",
-        "AsyncResourceParticipant",
-    }
+    assert all(participant.prepared for participant in transaction.participants)
 
     transaction.mark_committed()
 
@@ -2665,7 +2669,7 @@ def test_async_pending_resources_are_quarantined_until_forward_retires():
     assert context._active_async_ledger_ref.deferred_kv_tensor().tolist() == [10, 11]
     assert context.request_to_kv_block_ids.tolist() == [[-1, -1, -1], [12, -1, -1]]
 
-    context.release_deferred_async_resources()
+    ledger.release_deferred(context)
 
     assert [blocks.tolist() for blocks in context.kv_block_allocator.released] == [[10, 11]]
     assert context._active_async_ledger_ref is None
@@ -2698,7 +2702,7 @@ def test_async_transaction_defers_mamba_slot_free_until_forward_retires():
     assert context.mamba_metadata.request_to_mamba_state_idx.tolist() == [-1, 5]
     assert context.mamba_metadata.request_to_mamba_state_bank.tolist() == [0, 1]
 
-    context.release_deferred_async_resources()
+    ledger.release_deferred(context)
 
     assert [blocks.tolist() for blocks in context.kv_block_allocator.released] == [[10, 11]]
     assert [slots.tolist() for slots in context.mamba_metadata.freed_slots] == [[3]]
@@ -2725,7 +2729,7 @@ def test_async_mamba_reset_defers_allocated_slots_while_forward_is_in_flight():
     assert context.mamba_metadata.request_to_mamba_state_idx.tolist() == [-1, -1, -1]
     assert context.mamba_metadata.request_to_mamba_state_bank.tolist() == [0, 0, 0]
 
-    context.release_deferred_async_resources()
+    ledger.release_deferred(context)
 
     assert [slots.tolist() for slots in context.mamba_metadata.freed_slots] == [[2, 4]]
     assert context._active_async_ledger_ref is None
@@ -2774,7 +2778,7 @@ def test_async_kv_reservations_are_adopted_or_deferred_then_released():
     assert ledger.reservation_count == 0
     assert ledger.deferred_kv_tensor().tolist() == [101, 102]
 
-    context.release_deferred_async_resources()
+    ledger.release_deferred(context)
 
     assert [blocks.tolist() for blocks in context.kv_block_allocator.released] == [[101, 102]]
     assert context._active_async_ledger_ref is None
