@@ -245,7 +245,7 @@ def test_filter_reorder_distinguishes_by_optional_override_key():
     )
     current = [
         _make_pg(**common, start_wd=0.05),  # explicit per-group start_wd
-        _make_pg(**common),  # default start_wd (absent → sentinel)
+        _make_pg(**common),  # default start_wd (absent -> None)
     ]
     saved = [
         _make_pg(**common, _tag="default_wd"),
