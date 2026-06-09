@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable, Iterable, MutableMapping
+from dataclasses import replace
 from types import MethodType
 from typing import Any
 
@@ -43,6 +44,7 @@ def attach_model_sharded_state_dict(
             chunk,
         )
         chunk._mlite_distopt_sharded_state_dict = True  # type: ignore[attr-defined]
+        chunk._mlite_distopt_parallel_state = ps  # type: ignore[attr-defined]
 
 
 def supports_distopt_distckpt(model: nn.Module | Iterable[nn.Module], optimizer: Any) -> bool:
@@ -143,14 +145,8 @@ def _synchronize_native_optimizer_steps(optimizer: Any) -> None:
             return
         seen.add(obj_id)
 
-        chained = getattr(obj, "chained_optimizers", None)
-        if isinstance(chained, Iterable):
-            for child in chained:
-                visit(child)
-
-        inner = getattr(obj, "optimizer", None)
-        if inner is not None and inner is not obj:
-            visit(inner)
+        for child in _iter_optimizer_children(obj):
+            visit(child)
 
         state = getattr(obj, "state", None)
         if isinstance(state, MutableMapping):
@@ -248,29 +244,42 @@ def _iter_distributed_optimizers(optimizer: Any) -> Iterable[Any]:
             return
         seen.add(obj_id)
 
+        inner = _safe_inner_optimizer(obj)
         if (
             callable(getattr(obj, "sharded_state_dict", None))
             and hasattr(obj, "gbuf_ranges")
             and hasattr(obj, "buffers")
-            and hasattr(obj, "optimizer")
+            and inner is not None
         ):
             yield obj
 
-        chained = getattr(obj, "chained_optimizers", None)
-        if isinstance(chained, Iterable):
-            for child in chained:
-                yield from visit(child)
-
-        sub_optimizers = getattr(obj, "sub_optimizers", None)
-        if isinstance(sub_optimizers, Iterable):
-            for child in sub_optimizers:
-                yield from visit(child)
-
-        inner = getattr(obj, "optimizer", None)
-        if inner is not None and inner is not obj:
-            yield from visit(inner)
+        for child in _iter_optimizer_children(obj, known_inner=inner):
+            yield from visit(child)
 
     yield from visit(optimizer)
+
+
+def _iter_optimizer_children(obj: Any, *, known_inner: Any | None = None) -> Iterable[Any]:
+    chained = getattr(obj, "chained_optimizers", None)
+    if isinstance(chained, Iterable):
+        yield from chained
+
+    sub_optimizers = getattr(obj, "sub_optimizers", None)
+    if isinstance(sub_optimizers, Iterable):
+        yield from sub_optimizers
+
+    inner = _safe_inner_optimizer(obj) if known_inner is None else known_inner
+    if inner is not None and inner is not obj:
+        yield inner
+
+
+def _safe_inner_optimizer(obj: Any) -> Any | None:
+    if isinstance(getattr(obj, "chained_optimizers", None), Iterable):
+        # Megatron-Core ChainedOptimizer exposes `.optimizer` only for the
+        # single-optimizer compatibility case; multi-optimizer PP/EP chains
+        # assert on access. The children above are the real traversal targets.
+        return None
+    return getattr(obj, "optimizer", None)
 
 
 def _empty_native_optimizer_state_dict(distopt: Any, fallback_step: int) -> dict[str, Any]:
@@ -394,7 +403,7 @@ def _rank_offsets_and_replica_id(
     ps: ParallelState,
     *,
     expert: bool,
-) -> tuple[tuple[tuple[int, int, int], ...], tuple[int, int, int]]:
+) -> tuple[tuple[tuple[int, int, int], ...], tuple[int, ...]]:
     ranks, sizes = _mesh_ranks_and_sizes(ps, expert=expert)
     axis_fragments: dict[int, tuple[int, int]] = {}
     for placement, rank, size in zip(placements, ranks, sizes, strict=True):
@@ -409,9 +418,11 @@ def _rank_offsets_and_replica_id(
 
 
 def _replica_id(placements: list, ps: ParallelState, *, expert: bool) -> tuple[int, int, int]:
+    # PP stages own different parameters. They are not replicas of one
+    # another, so PP rank must not make a shard non-main.
     if expert:
         return (
-            _replica_axis_rank(placements, 0, ps.pp_rank),
+            0,
             _replica_axis_rank(placements, 2, ps.ep_rank),
             _replica_axis_rank(placements, 1, ps.expert_dp_rank),
         )
@@ -421,7 +432,7 @@ def _replica_id(placements: list, ps: ParallelState, *, expert: bool) -> tuple[i
         else ps.dp_cp_rank
     )
     return (
-        _replica_axis_rank(placements, 0, ps.pp_rank),
+        0,
         _replica_axis_rank(placements, 3, ps.tp_rank),
         int(dp_cp_rank),
     )
@@ -460,11 +471,46 @@ def _shard_dim(placement: Any) -> int | None:
 
 def _model_sharded_state_dict(model: nn.Module | Iterable[nn.Module]) -> dict[str, Any]:
     chunks = _model_chunks(model)
-    if len(chunks) == 1:
-        return {"model": chunks[0].sharded_state_dict()}  # type: ignore[attr-defined]
+    ps = _chunk_parallel_state(chunks[0]) if chunks else None
     return {
-        f"model{idx}": chunk.sharded_state_dict()  # type: ignore[attr-defined]
+        _model_chunk_key(ps, idx, len(chunks)): _chunk_sharded_state_dict(
+            chunk,
+            _model_chunk_sharded_key_prefix(ps, idx, len(chunks)),
+        )
         for idx, chunk in enumerate(chunks)
+    }
+
+
+def _model_chunk_key(ps: ParallelState | None, idx: int, num_chunks: int) -> str:
+    if ps is not None and ps.pp_size > 1:
+        key = f"model_pp{ps.pp_rank}"
+        if num_chunks > 1:
+            key = f"{key}_vpp{idx}"
+        return key
+    if num_chunks == 1:
+        return "model"
+    return f"model{idx}"
+
+
+def _model_chunk_sharded_key_prefix(ps: ParallelState | None, idx: int, num_chunks: int) -> str:
+    if ps is None and num_chunks == 1:
+        return ""
+    if ps is not None and ps.pp_size <= 1 and num_chunks == 1:
+        return ""
+    return f"{_model_chunk_key(ps, idx, num_chunks)}."
+
+
+def _chunk_sharded_state_dict(chunk: nn.Module, sharded_key_prefix: str) -> dict[str, Any]:
+    chunk_sd = chunk.sharded_state_dict()  # type: ignore[attr-defined]
+    if not sharded_key_prefix:
+        return chunk_sd
+    return {
+        key: (
+            replace(value, key=f"{sharded_key_prefix}{value.key}")
+            if isinstance(value, ShardedTensor)
+            else value
+        )
+        for key, value in chunk_sd.items()
     }
 
 
@@ -479,10 +525,24 @@ def _load_model_state_dict(model: nn.Module | Iterable[nn.Module], state_dict: d
     if len(chunks) == 1 and "model" in state_dict:
         _wrapped_module(chunks[0]).load_state_dict(state_dict["model"], strict=False)
         return
+    ps = _chunk_parallel_state(chunks[0]) if chunks else None
+    if len(chunks) == 1 and ps is not None and ps.pp_size > 1:
+        key = _model_chunk_key(ps, 0, 1)
+        if key in state_dict:
+            _wrapped_module(chunks[0]).load_state_dict(state_dict[key], strict=False)
+        return
     for idx, chunk in enumerate(chunks):
-        key = f"model{idx}"
+        key = _model_chunk_key(ps, idx, len(chunks))
         if key in state_dict:
             _wrapped_module(chunk).load_state_dict(state_dict[key], strict=False)
+
+
+def _chunk_parallel_state(chunk: nn.Module) -> ParallelState | None:
+    ps = getattr(chunk, "_mlite_distopt_parallel_state", None)
+    if ps is not None:
+        return ps
+    wrapped = _wrapped_module(chunk)
+    return getattr(wrapped, "_mlite_distopt_parallel_state", None)
 
 
 def _model_chunks(model: nn.Module | Iterable[nn.Module]) -> list[nn.Module]:

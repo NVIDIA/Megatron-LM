@@ -6,9 +6,15 @@ from types import SimpleNamespace
 import torch
 from torch.distributed.tensor import Replicate, Shard
 
+from megatron.core.dist_checkpointing.strategies.torch import (
+    _replace_state_dict_keys_with_sharded_keys,
+)
 from megatron.lite.primitive.ckpt import dcp
 from megatron.lite.primitive.ckpt.distckpt import (
+    _model_sharded_state_dict,
     _rank_offsets_and_replica_id,
+    _single_or_all_model_state,
+    _synchronize_native_optimizer_steps,
     attach_model_sharded_state_dict,
 )
 from megatron.lite.primitive.parallel import ParallelState
@@ -114,7 +120,7 @@ def test_distopt_checkpoint_dispatches_to_mcore_distckpt(monkeypatch, tmp_path) 
 
     model_sd = saved["state_dict"]["model"]
     assert set(model_sd) == {"weight", "bias"}
-    assert model_sd["weight"].replica_id == (1, 2, 3)
+    assert model_sd["weight"].replica_id == (0, 2, 3)
     assert optimizer.save_model_sd is model_sd
     assert saved["state_dict"]["optimizer"] == {"is_loading": False}
     assert saved["state_dict"]["step"] == 5
@@ -155,9 +161,94 @@ def test_distopt_checkpoint_offsets_cover_tp_pp_ep_etp_topology() -> None:
     )
 
     assert dense_offsets == ((0, 1, 2),)
-    assert dense_replica == (1, 0, 0)
+    assert dense_replica == (0, 0, 0)
     assert expert_offsets == ((0, 3, 4),)
-    assert expert_replica == (1, 0, 0)
+    assert expert_replica == (0, 0, 0)
+
+
+def test_distopt_replica_id_groups_sharded_axes_by_placement() -> None:
+    placements = [Replicate(), Replicate(), Replicate(), Shard(0)]
+    rank_offsets0, replica_id0 = _rank_offsets_and_replica_id(
+        placements,
+        ParallelState(tp_size=2, tp_rank=0),
+        expert=False,
+    )
+    rank_offsets1, replica_id1 = _rank_offsets_and_replica_id(
+        placements,
+        ParallelState(tp_size=2, tp_rank=1),
+        expert=False,
+    )
+
+    assert rank_offsets0 == ((0, 0, 2),)
+    assert rank_offsets1 == ((0, 1, 2),)
+    assert replica_id0 == replica_id1 == (0, 0, 0)
+
+    expert_offsets, expert_replica_id = _rank_offsets_and_replica_id(
+        [Replicate(), Replicate(), Shard(0), Shard(1)],
+        ParallelState(ep_size=2, ep_rank=1, etp_size=2, etp_rank=1),
+        expert=True,
+    )
+
+    assert expert_offsets == ((0, 1, 2), (1, 1, 2))
+    assert expert_replica_id == (0, 0, 0)
+
+
+def test_distopt_replica_id_does_not_treat_pp_as_a_replica_axis() -> None:
+    rank_offsets, replica_id = _rank_offsets_and_replica_id(
+        [Replicate(), Replicate(), Replicate(), Shard(0)],
+        ParallelState(pp_size=2, pp_rank=1, tp_size=2, tp_rank=1),
+        expert=False,
+    )
+
+    assert rank_offsets == ((0, 1, 2),)
+    assert replica_id == (0, 0, 0)
+
+    _rank_offsets, replica_id = _rank_offsets_and_replica_id(
+        [Replicate(), Replicate(), Replicate(), Replicate()],
+        ParallelState(pp_size=2, pp_rank=1, tp_size=2, tp_rank=0),
+        expert=False,
+    )
+
+    assert replica_id == (0, 0, 0)
+
+
+def test_distopt_pp_rank_one_model_keys_survive_torch_dist_main_replica_filter() -> None:
+    ps = ParallelState(pp_size=2, pp_rank=1, pp_is_first=False, pp_is_last=True)
+    model = torch.nn.Linear(4, 2)
+    attach_model_sharded_state_dict([model], ps)
+
+    model_sd = _model_sharded_state_dict(model)
+    filtered_sd, _flat_mapping, _rename_mapping = _replace_state_dict_keys_with_sharded_keys(
+        model_sd,
+        keep_only_main_replica=True,
+    )
+
+    assert set(filtered_sd) == {"model_pp1.weight", "model_pp1.bias"}
+
+
+def test_distopt_model_state_keys_are_pp_and_vpp_aware() -> None:
+    ps = ParallelState(pp_size=2, pp_rank=1, pp_is_first=False, pp_is_last=True)
+    single_chunk = torch.nn.Linear(4, 2)
+    attach_model_sharded_state_dict([single_chunk], ps)
+
+    single_sd = _model_sharded_state_dict(single_chunk)
+
+    assert set(single_sd) == {"model_pp1"}
+    assert set(single_sd["model_pp1"]) == {"weight", "bias"}
+    assert single_sd["model_pp1"]["weight"].key == "model_pp1.weight"
+    assert _single_or_all_model_state(single_sd) is single_sd
+
+    chunks = [torch.nn.Linear(4, 2), torch.nn.Linear(4, 2)]
+    attach_model_sharded_state_dict(chunks, ps)
+
+    vpp_sd = _model_sharded_state_dict(chunks)
+
+    assert set(vpp_sd) == {"model_pp1_vpp0", "model_pp1_vpp1"}
+    assert set(vpp_sd["model_pp1_vpp0"]) == {"weight", "bias"}
+    assert set(vpp_sd["model_pp1_vpp1"]) == {"weight", "bias"}
+    assert vpp_sd["model_pp1_vpp0"]["weight"].key == "model_pp1_vpp0.weight"
+    assert vpp_sd["model_pp1_vpp1"]["weight"].key == "model_pp1_vpp1.weight"
+    assert _single_or_all_model_state(vpp_sd) is vpp_sd
 
 
 def test_distopt_checkpoint_loads_from_mcore_distckpt(monkeypatch, tmp_path) -> None:
@@ -192,6 +283,37 @@ def test_distopt_checkpoint_loads_from_mcore_distckpt(monkeypatch, tmp_path) -> 
     torch.testing.assert_close(wrapped_module.weight, expected_weight)
     torch.testing.assert_close(wrapped_module.bias, expected_bias)
     assert optimizer.loaded_state == {"loaded": True}
+
+
+def test_distopt_step_sync_traverses_multi_optimizer_chain_without_optimizer_property() -> None:
+    class FakeTorchOptimizer:
+        def __init__(self, steps):
+            self.state = {
+                object(): {"step": torch.tensor(step, dtype=torch.int64)}
+                for step in steps
+            }
+
+    class FakeDistOpt:
+        def __init__(self, steps):
+            self.optimizer = FakeTorchOptimizer(steps)
+
+    class FakeChainedOptimizer:
+        def __init__(self):
+            self.chained_optimizers = [FakeDistOpt([1, 3]), FakeDistOpt([2, 4])]
+
+        @property
+        def optimizer(self):
+            raise AssertionError(
+                "ChainedOptimizer has more than one optimizer when accessing self.optimizer"
+            )
+
+    chained = FakeChainedOptimizer()
+
+    _synchronize_native_optimizer_steps(chained)
+
+    for child in chained.chained_optimizers:
+        steps = [int(state["step"].item()) for state in child.optimizer.state.values()]
+        assert steps == [max(steps)] * len(steps)
 
 
 def test_runtime_checkpoint_api_passes_current_training_checkpoint_signature(monkeypatch, tmp_path) -> None:
