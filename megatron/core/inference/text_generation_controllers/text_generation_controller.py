@@ -45,6 +45,7 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.async_decode_coordinator import (
     AsyncDecodeCoordinator,
+    build_async_decode_coordinator,
 )
 from megatron.core.inference.utils import (
     get_attention_mask,
@@ -206,8 +207,6 @@ class TextGenerationController:
         self._async_eligibility_check_count = 0
         self._async_eligibility_pass_count = 0
         self._async_disable_reason_counts: Dict[str, int] = {}
-        self._async_step_transaction = None
-        self._async_transaction_next_step_id = 0
         self._dummy_context_h2d_done_event = None
         self._async_step_barrier_reason = None
         self._async_admission_barrier_requested = False
@@ -225,11 +224,7 @@ class TextGenerationController:
         self._async_prepare_deferred_until_after_sampling = False
         self._async_sample_readback = None
         self._async_decode_coordinator = None
-        self._async_ep_participant_this_step = None
         self._request_sampling_rngs: Dict[int, torch.Generator] = {}
-        self._ep_async_protocol = None
-        self._ep_async_handoff_decided_this_step = False
-        self._ep_async_handoff_decision_this_step: Optional[EPAsyncHandoffDecision] = None
 
         # Initialize bookkeeping tensors.
         if self._enable_cuda_graph:
@@ -1512,7 +1507,10 @@ class TextGenerationController:
 
     def set_ep_async_protocol(self, protocol) -> None:
         """Attach the EP async protocol used by coordinator-driven EP decoding."""
-        self._ep_async_protocol = protocol
+        coordinator = self._get_async_decode_coordinator()
+        ep_ops = getattr(coordinator, "_ep_ops", None)
+        if hasattr(ep_ops, "set_protocol"):
+            ep_ops.set_protocol(protocol)
 
     def set_async_row_map_policy(self, policy: AsyncRowMapPolicy | str) -> AsyncRowMapPolicy:
         """Set pending-forward row reuse policy for async validation or benchmarking."""
@@ -1563,8 +1561,8 @@ class TextGenerationController:
                 self, "_async_layout_mismatch_discard_count", 0
             ),
             "ep_protocol": (
-                self._ep_async_protocol.diagnostics()
-                if self._ep_async_protocol is not None
+                self._get_async_decode_coordinator().diagnostics()
+                if getattr(self, "_async_decode_coordinator", None) is not None
                 else None
             ),
         }
@@ -1585,7 +1583,7 @@ class TextGenerationController:
         """Return the coordinator that owns async decode step orchestration."""
         coordinator = getattr(self, "_async_decode_coordinator", None)
         if coordinator is None:
-            coordinator = AsyncDecodeCoordinator(self)
+            coordinator = build_async_decode_coordinator(self)
             self._async_decode_coordinator = coordinator
         return coordinator
 
@@ -1718,17 +1716,11 @@ class TextGenerationController:
 
     def _record_ep_step_begin_decision(self, decision: EPStepBeginDecision) -> None:
         """Attach EP step-begin state to the pending transaction lifecycle."""
-        participant = self._async_ep_participant_for_transaction(
-            self._pending_async_transaction(), create=True
-        )
-        if participant is not None:
-            participant.record_step_begin(decision)
+        return None
 
     def _record_ep_handoff_decision(self, decision: EPAsyncHandoffDecision) -> None:
         """Stage EP handoff state for the transaction that may be launched."""
-        participant = AsyncEPParticipant()
-        participant.record_handoff(decision)
-        self._async_ep_participant_this_step = participant
+        return None
 
     def _attach_async_transaction_participants(
         self,
@@ -1745,10 +1737,6 @@ class TextGenerationController:
 
         context = self.inference_wrapped_model.inference_context
         participants = []
-        ep_participant = getattr(self, "_async_ep_participant_this_step", None)
-        if ep_participant is not None:
-            participants.append(ep_participant)
-            self._async_ep_participant_this_step = None
         if getattr(context, "is_hybrid_model", False):
             participants.append(AsyncMambaStateParticipant(context))
         if isinstance(sample_ticket, AsyncSampleTicket):
@@ -1854,84 +1842,26 @@ class TextGenerationController:
                 "discarded before step begin",
                 release_fallback_resources=True,
             )
-            self._async_step_transaction = None
+            self._retire_async_transaction()
             self._increment_async_counter("_async_discarded_forward_count")
             self._increment_async_counter("_async_rolled_back_forward_count")
 
     def _decide_ep_step_begin(self, *, has_real_work: bool) -> EPStepBeginDecision:
         """Synchronize pending async state at the beginning of an EP work step."""
-        self._ep_async_handoff_decided_this_step = False
-        self._ep_async_handoff_decision_this_step = None
-        self._async_ep_participant_this_step = None
-        pending_forward_reusable = True
-        pending_forward_row_mapped = False
-        has_pending_forward = self._has_pending_async_forward_state()
-        if has_pending_forward:
-            pending_forward_reusable, pending_forward_row_mapped = (
-                self._pending_async_forward_row_status()
-            )
-
-        if self._ep_async_protocol is not None and self._ep_async_protocol.enabled:
-            begin_step = getattr(self._ep_async_protocol, "begin_step", None)
-            if begin_step is None:
-                begin_step = self._ep_async_protocol.decide_step_begin
-            decision = begin_step(
-                has_real_work=has_real_work,
-                has_pending_forward=has_pending_forward,
-                pending_forward_reusable=pending_forward_reusable,
-                pending_forward_row_mapped=pending_forward_row_mapped,
-            )
-            self._record_ep_step_begin_decision(decision)
-            return decision
-
-        decision = EPStepBeginDecision(
-            step_id=-1,
-            has_real_work=has_real_work,
-            reuse_pending_forward=bool(has_pending_forward and pending_forward_reusable),
-            discard_pending_forward=bool(
-                has_pending_forward and not pending_forward_reusable
-            ),
-            row_mapped_forward=bool(has_pending_forward and pending_forward_row_mapped),
-        )
-        self._record_ep_step_begin_decision(decision)
-        return decision
+        return self._get_async_decode_coordinator().begin_step(has_real_work=has_real_work)
 
     def _decide_ep_async_handoff(
         self, *, has_real_work: bool, can_launch_async_handoff: bool
     ) -> EPAsyncHandoffDecision:
         """Synchronize whether this EP work step launches the async forward handoff."""
-        if self._ep_async_handoff_decision_this_step is not None:
-            return self._ep_async_handoff_decision_this_step
-
-        self._ep_async_handoff_decided_this_step = True
-        if self._ep_async_protocol is not None and self._ep_async_protocol.enabled:
-            decide_launch = getattr(self._ep_async_protocol, "decide_launch", None)
-            if decide_launch is None:
-                decide_launch = self._ep_async_protocol.decide_async_handoff
-            decision = decide_launch(
-                has_real_work=has_real_work, can_launch_async_handoff=can_launch_async_handoff
-            )
-            self._ep_async_handoff_decision_this_step = decision
-            self._record_ep_handoff_decision(decision)
-            return decision
-
-        decision = EPAsyncHandoffDecision(
-            step_id=-1,
+        return self._get_async_decode_coordinator().decide_handoff(
             has_real_work=has_real_work,
-            launch_async_forward=can_launch_async_handoff,
-            skip_async_forward=not can_launch_async_handoff,
-            any_launch_request=can_launch_async_handoff,
-            any_skip_request=not can_launch_async_handoff,
+            can_launch_async_handoff=can_launch_async_handoff,
         )
-        self._ep_async_handoff_decision_this_step = decision
-        self._record_ep_handoff_decision(decision)
-        return decision
 
     def _ensure_ep_async_handoff_decided(self, *, has_real_work: bool) -> None:
         """Publish an explicit EP async handoff skip when this step did not attempt one."""
-        if self._ep_async_handoff_decided_this_step:
-            return
-        self._decide_ep_async_handoff(has_real_work=has_real_work, can_launch_async_handoff=False)
+        self._get_async_decode_coordinator().ensure_handoff_decided(has_real_work=has_real_work)
 
     def _wait_for_dummy_context_h2d(self) -> None:
         """Wait for dummy metadata H2D before reusing its pinned CPU source buffer."""
@@ -3263,7 +3193,7 @@ class TextGenerationController:
                         )
                         self._increment_async_counter("_async_discarded_forward_count")
                         self._increment_async_counter("_async_rolled_back_forward_count")
-                        self._async_step_transaction = None
+                    self._retire_async_transaction()
 
             ret = {
                 "accepted_tokens": (

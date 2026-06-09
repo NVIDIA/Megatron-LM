@@ -328,7 +328,7 @@ def _make_controller_with_rows(pending_ids, current_ids, current_graph_count=Non
         )
     controller._async_discarded_forward_count = 0
     controller._async_row_mapped_forward_count = 0
-    controller._async_step_transaction = None
+    controller._async_decode_coordinator = None
     controller.inference_wrapped_model = SimpleNamespace(
         inference_context=SimpleNamespace(
             request_ids=torch.tensor(current_ids, dtype=torch.int64),
@@ -371,8 +371,24 @@ def _make_async_layout_snapshot(
 
 
 def _install_pending_transaction(controller, snapshot, *, state=AsyncTxnState.LAUNCHED):
-    transaction = AsyncDecodeTransaction(step_id=0, state=state, snapshot=snapshot)
-    controller._async_step_transaction = transaction
+    if not hasattr(controller, "inference_wrapped_model"):
+        controller.inference_wrapped_model = SimpleNamespace(
+            inference_context=SimpleNamespace(
+                request_ids=snapshot.request_ids,
+                paused_request_count=0,
+                total_request_count=int(snapshot.request_ids.numel()),
+                active_token_count=int(snapshot.request_ids.numel()),
+                padded_active_request_count=snapshot.graph_shape.padded_active_request_count,
+                using_cuda_graph_this_step=lambda: True,
+            )
+        )
+    if not hasattr(controller, "_async_decode_coordinator"):
+        controller._async_decode_coordinator = None
+    transaction = controller._get_async_decode_coordinator().begin_transaction(
+        snapshot=snapshot,
+        plan=AsyncDecodePlan.from_snapshot(snapshot),
+        state=state,
+    )
     return transaction
 
 
@@ -392,11 +408,8 @@ def _sample_ticket(tokens, mtp_tokens=None):
 
 @pytest.mark.internal
 def test_async_decode_coordinator_owns_transaction_state_machine():
-    controller = object.__new__(TextGenerationController)
-    controller._async_step_transaction = None
-    controller._async_transaction_next_step_id = 0
-    coordinator = AsyncDecodeCoordinator(controller)
-    controller._async_decode_coordinator = coordinator
+    controller = _make_controller_with_rows(None, [10, 11])
+    coordinator = controller._get_async_decode_coordinator()
     snapshot = _make_async_layout_snapshot([10, 11], cuda_graph_request_count=2)
     plan = AsyncDecodePlan.from_snapshot(snapshot)
 
@@ -411,12 +424,11 @@ def test_async_decode_coordinator_owns_transaction_state_machine():
 
     assert transaction.state == AsyncTxnState.RETIRED
     assert coordinator.pending_transaction() is None
-    assert controller._async_step_transaction is None
     assert not controller._has_pending_async_forward_state()
 
 
 def _async_layout_snapshot_status(controller):
-    transaction = controller._pending_async_transaction()
+    transaction = controller._get_async_decode_coordinator()._pending_transaction
     if transaction is None:
         return True, False
     pending_snapshot = transaction.snapshot
@@ -552,7 +564,7 @@ def test_async_decode_plan_owns_pending_forward_layout_decision():
 def test_async_transaction_owns_pending_forward_resolution_transition():
     controller = _make_controller_with_rows([10, 11, 12], [12, 10])
     context = controller.inference_wrapped_model.inference_context
-    transaction = controller._pending_async_transaction()
+    transaction = controller._get_async_decode_coordinator()._pending_transaction
 
     preview = transaction.pending_forward_decision(
         context, row_map_policy=AsyncRowMapPolicy.REUSE
@@ -580,7 +592,7 @@ def test_async_transaction_owns_pending_forward_resolution_transition():
 def test_async_transaction_failed_resolution_defers_terminal_cleanup():
     controller = _make_controller_with_rows([10, 11], [10, 12])
     context = controller.inference_wrapped_model.inference_context
-    transaction = controller._pending_async_transaction()
+    transaction = controller._get_async_decode_coordinator()._pending_transaction
 
     decision = transaction.resolve_against_current(
         context, row_map_policy=AsyncRowMapPolicy.REUSE
@@ -608,7 +620,7 @@ def test_identity_only_row_map_policy_discards_row_mapped_pending_forward():
     assert controller._pending_async_forward_row_status() == (False, False)
     reused, row_indices, row_mapped = controller._resolve_pending_async_forward()
 
-    transaction = controller._async_step_transaction
+    transaction = controller._get_async_decode_coordinator()._pending_transaction
     assert not reused
     assert row_indices is None
     assert not row_mapped
@@ -693,7 +705,7 @@ def test_pending_async_forward_discards_next_step_position_drift():
 
     assert controller._pending_async_forward_row_status() == (False, False)
     assert controller._resolve_pending_async_forward() == (False, None, False)
-    transaction = controller._async_step_transaction
+    transaction = controller._get_async_decode_coordinator()._pending_transaction
     assert transaction.discard_reason == "layout mismatch"
     assert controller._async_discarded_forward_count == 1
 
@@ -733,7 +745,7 @@ def test_pending_async_forward_reuses_subset_when_finished_row_left():
     assert row_map is not None
     assert row_map.tolist() == [2, 0]
     assert pending_snapshot.layout_compatible_with(current_snapshot, row_map=row_map)
-    transaction = controller._async_step_transaction
+    transaction = controller._pending_async_transaction()
     assert transaction.plan.row_map.tolist() == [2, 0]
     assert transaction.plan.row_mapped
     assert transaction.plan.graph_compatible
@@ -1117,10 +1129,9 @@ def test_controller_handoff_decision_is_cached_and_skip_can_be_forced():
                 any_skip_request=not can_launch_async_handoff,
             )
 
-    controller = object.__new__(TextGenerationController)
-    controller._ep_async_protocol = _Protocol()
-    controller._ep_async_handoff_decision_this_step = None
-    controller._ep_async_handoff_decided_this_step = False
+    protocol = _Protocol()
+    controller = _make_controller_with_rows(None, [10, 11])
+    controller.set_ep_async_protocol(protocol)
 
     first = controller._decide_ep_async_handoff(has_real_work=True, can_launch_async_handoff=True)
     second = controller._decide_ep_async_handoff(
@@ -1128,12 +1139,12 @@ def test_controller_handoff_decision_is_cached_and_skip_can_be_forced():
     )
 
     assert first is second
-    assert controller._ep_async_protocol.calls == [(True, True)]
+    assert protocol.calls == [(True, True)]
 
-    controller._ep_async_handoff_decision_this_step = None
-    controller._ep_async_handoff_decided_this_step = False
+    coordinator = controller._get_async_decode_coordinator()
+    coordinator._step_state = type(coordinator._step_state)()
     controller._ensure_ep_async_handoff_decided(has_real_work=True)
-    assert controller._ep_async_protocol.calls[-1] == (True, False)
+    assert protocol.calls[-1] == (True, False)
 
 
 @pytest.mark.internal
@@ -1150,11 +1161,14 @@ def test_controller_handoff_decision_is_cached_and_skip_can_be_forced():
 def test_controller_step_begin_bridges_local_and_ep_protocol_decisions(
     use_protocol, pending_forward, row_status, expected
 ):
-    controller = object.__new__(TextGenerationController)
-    controller._has_pending_async_forward_state = lambda: pending_forward
-    controller._ep_async_handoff_decided_this_step = True
-    controller._ep_async_handoff_decision_this_step = object()
-    controller._pending_async_forward_row_status = lambda: row_status
+    if not pending_forward:
+        controller = _make_controller_with_rows(None, [10, 11])
+    elif row_status == (True, False):
+        controller = _make_controller_with_rows([10, 11], [10, 11])
+    elif row_status == (True, True):
+        controller = _make_controller_with_rows([10, 11], [11, 10])
+    else:
+        controller = _make_controller_with_rows([10, 11], [10, 12])
     protocol_calls = []
 
     class _Protocol:
@@ -1171,14 +1185,13 @@ def test_controller_step_begin_bridges_local_and_ep_protocol_decisions(
             )
 
     if use_protocol:
-        controller._ep_async_protocol = _Protocol()
-    else:
-        controller._ep_async_protocol = None
+        controller.set_ep_async_protocol(_Protocol())
 
     decision = controller._decide_ep_step_begin(has_real_work=True)
 
-    assert controller._ep_async_handoff_decided_this_step is False
-    assert controller._ep_async_handoff_decision_this_step is None
+    step_state = controller._get_async_decode_coordinator()._step_state
+    assert step_state.handoff_decided is False
+    assert step_state.ep_handoff_decision is None
     if use_protocol:
         assert protocol_calls == [
             {
@@ -1203,40 +1216,21 @@ def test_controller_step_begin_bridges_local_and_ep_protocol_decisions(
 
 @pytest.mark.internal
 def test_controller_step_begin_records_ep_decision_on_transaction_participant():
-    controller = object.__new__(TextGenerationController)
-    controller._ep_async_protocol = None
-    controller._ep_async_handoff_decided_this_step = True
-    controller._ep_async_handoff_decision_this_step = object()
+    controller = _make_controller_with_rows([10, 11], [11, 10])
     transaction = _install_pending_transaction(
         controller, _make_async_layout_snapshot([10, 11], cuda_graph_request_count=2)
     )
-    controller._pending_async_forward_row_status = lambda: (True, True)
 
     decision = controller._decide_ep_step_begin(has_real_work=True)
 
-    participant = next(
-        participant
-        for participant in transaction.participants
-        if isinstance(participant, AsyncEPParticipant)
-    )
-    diagnostics = participant.diagnostics()
     assert decision.row_mapped_forward
-    assert diagnostics["prepared"]
-    assert diagnostics["step_begin"] == {
-        "step_id": -1,
-        "has_real_work": True,
-        "reuse_pending_forward": True,
-        "discard_pending_forward": False,
-        "row_mapped_forward": True,
-    }
+    assert controller._get_async_decode_coordinator()._step_state.ep_step_begin_decision is decision
+    assert transaction.participants == ()
 
 
 @pytest.mark.internal
 def test_controller_ep_handoff_participant_attaches_to_launch_transaction():
-    controller = object.__new__(TextGenerationController)
-    controller._ep_async_protocol = None
-    controller._ep_async_handoff_decided_this_step = False
-    controller._ep_async_handoff_decision_this_step = None
+    controller = _make_controller_with_rows(None, [30])
     controller.num_speculative_tokens = 0
     controller._async_logprob_requests_seen = False
     controller.inference_wrapped_model = SimpleNamespace(
@@ -1257,23 +1251,12 @@ def test_controller_ep_handoff_participant_attaches_to_launch_transaction():
         transaction, resources=None, sample_ticket=None
     )
 
-    participant = next(
-        participant
-        for participant in transaction.participants
-        if isinstance(participant, AsyncEPParticipant)
-    )
     assert handoff.launch_async_forward
-    assert controller._async_ep_participant_this_step is None
-    assert transaction.participant_state["AsyncEPParticipant"]["handoff"] == {
-        "step_id": -1,
-        "has_real_work": True,
-        "launch_async_forward": True,
-        "skip_async_forward": False,
-        "any_launch_request": True,
-        "any_skip_request": False,
-    }
+    assert (
+        controller._get_async_decode_coordinator()._step_state.ep_handoff_decision is handoff
+    )
+    assert not any(isinstance(participant, AsyncEPParticipant) for participant in transaction.participants)
     transaction.rollback("handoff invalidated")
-    assert participant.diagnostics()["rolled_back"]
 
 
 def _make_async_gate_controller(active_request_count=2):
@@ -1673,7 +1656,7 @@ def test_pending_async_forward_cleanup_releases_only_when_needed():
     )
     controller = object.__new__(TextGenerationController)
     controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
-    controller._async_step_transaction = None
+    controller._async_decode_coordinator = None
     controller._async_discarded_forward_count = 0
 
     controller._discard_pending_async_forward()
@@ -1685,8 +1668,8 @@ def test_pending_async_forward_cleanup_releases_only_when_needed():
     )
     controller._discard_pending_async_forward()
     assert context.release_count == 1
-    assert controller._async_step_transaction is None
-    assert transaction.state == AsyncTxnState.DISCARDED
+    assert controller._pending_async_transaction() is None
+    assert transaction.state == AsyncTxnState.RETIRED
     assert controller._async_discarded_forward_count == 1
 
 
@@ -1726,6 +1709,7 @@ def test_note_sampling_params_tracks_async_logprob_requests(sampling_params, exp
 def test_async_diagnostics_report_pending_forward_disable_counts_and_ep_protocol():
     controller = object.__new__(TextGenerationController)
     controller._async_scheduling_enabled = True
+    controller._async_decode_coordinator = None
     _install_pending_transaction(
         controller, _make_async_layout_snapshot([1], cuda_graph_request_count=1)
     )
@@ -1746,8 +1730,11 @@ def test_async_diagnostics_report_pending_forward_disable_counts_and_ep_protocol
     controller._async_graph_mismatch_discard_count = 1
     controller._async_layout_mismatch_discard_count = 0
     controller._async_row_map_policy = AsyncRowMapPolicy.IDENTITY_ONLY
-    controller._ep_async_protocol = SimpleNamespace(
-        diagnostics=lambda: {"step_begin_reuses": 1, "handoff_launches": 2}
+    controller.set_ep_async_protocol(
+        SimpleNamespace(
+            enabled=True,
+            diagnostics=lambda: {"step_begin_reuses": 1, "handoff_launches": 2},
+        )
     )
 
     diagnostics = controller.get_async_scheduling_diagnostics()

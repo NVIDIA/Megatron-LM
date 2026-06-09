@@ -13,7 +13,6 @@ import ast
 from dataclasses import dataclass
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
 PRODUCTION_ROOT = REPO_ROOT / "megatron" / "core" / "inference"
 
@@ -55,11 +54,6 @@ EXPECTED_VIOLATIONS = {
     ("async-dataclass-unexpected", ASYNC_TRANSACTION, "AsyncMambaStateParticipant"),
     ("async-dataclass-unexpected", ASYNC_TRANSACTION, "AsyncResourceParticipant"),
     ("async-dataclass-unexpected", ASYNC_TRANSACTION, "AsyncSampleReadbackParticipant"),
-    ("async-protocol-missing", ASYNC_COORDINATOR, "AsyncDecodeAllocatorOps"),
-    ("async-protocol-missing", ASYNC_COORDINATOR, "AsyncDecodeContextOps"),
-    ("async-protocol-missing", ASYNC_COORDINATOR, "AsyncDecodeDiagnosticsOps"),
-    ("async-protocol-missing", ASYNC_COORDINATOR, "AsyncDecodeEPOps"),
-    ("async-protocol-missing", ASYNC_COORDINATOR, "AsyncDecodeModelCallbacks"),
     ("async-removed-symbol", ASYNC_TRANSACTION, "AsyncLayoutSnapshot"),
     ("async-removed-symbol", ASYNC_TRANSACTION, "AsyncMambaLease"),
     ("context-forbidden-lifecycle-field", DYNAMIC_CONTEXT, "_async_pre_sampling_prepared_state"),
@@ -101,24 +95,6 @@ EXPECTED_VIOLATIONS = {
         "_async_prepared_sample_source_rows_cuda",
     ),
     ("context-forbidden-lifecycle-field", DYNAMIC_CONTEXT, "_async_resource_ledger"),
-    (
-        "controller-forbidden-lifecycle-field",
-        TEXT_CONTROLLER,
-        "_async_ep_participant_this_step",
-    ),
-    ("controller-forbidden-lifecycle-field", TEXT_CONTROLLER, "_async_step_transaction"),
-    ("controller-forbidden-lifecycle-field", TEXT_CONTROLLER, "_async_transaction_next_step_id"),
-    (
-        "controller-forbidden-lifecycle-field",
-        TEXT_CONTROLLER,
-        "_ep_async_handoff_decided_this_step",
-    ),
-    (
-        "controller-forbidden-lifecycle-field",
-        TEXT_CONTROLLER,
-        "_ep_async_handoff_decision_this_step",
-    ),
-    ("controller-forbidden-lifecycle-field", TEXT_CONTROLLER, "_ep_async_protocol"),
     ("controller-forbidden-lifecycle-import", TEXT_CONTROLLER, "AsyncDecodeTransaction"),
     ("controller-forbidden-lifecycle-import", TEXT_CONTROLLER, "AsyncEPParticipant"),
     ("controller-forbidden-lifecycle-import", TEXT_CONTROLLER, "AsyncLayoutSnapshot"),
@@ -128,14 +104,6 @@ EXPECTED_VIOLATIONS = {
     ("controller-forbidden-lifecycle-import", TEXT_CONTROLLER, "AsyncResourceLedger"),
     ("controller-forbidden-lifecycle-import", TEXT_CONTROLLER, "AsyncResourceParticipant"),
     ("controller-forbidden-lifecycle-import", TEXT_CONTROLLER, "AsyncTxnState"),
-    ("coordinator-discard-prepared-path", ASYNC_COORDINATOR, "_discard_prepared_state"),
-    ("coordinator-finalize-path", ASYNC_COORDINATOR, "_finalize_transaction"),
-    ("coordinator-missing-owned-field", ASYNC_COORDINATOR, "_next_step_id"),
-    ("coordinator-missing-owned-field", ASYNC_COORDINATOR, "_pending_transaction"),
-    ("coordinator-missing-owned-field", ASYNC_COORDINATOR, "_prepared_state"),
-    ("coordinator-missing-owned-field", ASYNC_COORDINATOR, "_step_state"),
-    ("coordinator-participant-helper", ASYNC_COORDINATOR, "_build_transaction_participants"),
-    ("coordinator-raw-controller", ASYNC_COORDINATOR, "controller"),
     ("participant-lifecycle-fields", ASYNC_TRANSACTION, "AsyncEPParticipant"),
     ("participant-lifecycle-fields", ASYNC_TRANSACTION, "AsyncLogprobMTPParticipant"),
     ("participant-lifecycle-fields", ASYNC_TRANSACTION, "AsyncMambaStateParticipant"),
