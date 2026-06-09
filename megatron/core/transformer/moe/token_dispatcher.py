@@ -1312,6 +1312,8 @@ class _DeepepManager(_DispatchManager):
         # Manually release the metadata to avoid memory leak.
         self.dispatched_indices = None
         self.dispatched_probs = None
+        self.token_indices = None
+        self.token_probs = None
         return hidden_states
 
     def _pad_routing_map(
