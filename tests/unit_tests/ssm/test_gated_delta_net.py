@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
+import os
 from unittest import mock
 
 import pytest
@@ -49,6 +50,10 @@ try:
     HAVE_FLA = True
 except ImportError:
     HAVE_FLA = False
+
+# https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/env.html#nccl-multi-rank-gpu-enable
+# NVLS doesn't support one single GPU to be shared by multiple ranks, so disable this in test
+os.environ.update({"NCCL_NVLS_ENABLE": "0"})
 
 
 def _unpack_sequence(x: torch.Tensor, cu_seqlens: torch.Tensor, dim=1) -> list[torch.Tensor]:
