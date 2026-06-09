@@ -97,6 +97,52 @@ Mixin class added to wrapped modules. Methods:
 | `reshard()` | Post-forward, post-backward | Release unsharded buffer |
 | `reduce_grad()` | Post-backward / grad sync | Reduce-scatter gradients into optimizer-facing shards |
 
+### CUDA Graph Capture
+
+> **Experimental** — CUDA graph support in Megatron FSDP v2 is an experimental
+> feature.  The API and behaviour may change in future releases without notice.
+
+FSDP v2 supports transparent CUDA graph capture for individual FSDP modules.
+Enable it per-module with ``enable_cuda_graph=True``:
+
+```python
+for layer in model.layers:
+    fully_shard(layer, enable_cuda_graph=True)
+fully_shard(model)  # root without CUDA graph
+```
+
+Capture happens automatically on the first optimized forward pass
+(after the trace pool has been planned).  Subsequent forward passes replay
+the captured graph, bypassing FSDP hooks entirely for that module.
+
+**How it works:**
+
+1. The forward pre-hook detects ``enable_cuda_graph=True`` and creates an
+   ``FSDPCudaGraphRunner`` for the module.
+2. The runner pops FSDP hooks, warms up via ``make_graphed_callables``,
+   and captures the module's ``forward()`` (without FSDP collectives) into a
+   CUDA graph.
+3. After capture, ``install()`` patches ``module.forward`` to a wrapper
+   that replays the graph on subsequent calls.
+4. After capture, ``install()`` patches ``module.forward`` to a wrapper that
+   replays the graph on subsequent calls. During replay, the patched forward
+   calls the graphed callable directly, bypassing FSDP forward hooks entirely.
+   Backward hooks (unshard/reshard/reduce_grad) still fire normally.
+
+**Limitation — nesting:** A parent FSDP module that contains other FSDP
+modules as children **cannot** use ``enable_cuda_graph=True``.  Only leaf
+FSDP modules (those without FSDP children) are eligible.  Attempting to
+enable CUDA graph on a module with FSDP children raises a ``RuntimeError``.
+
+```python
+# OK — layers are leaf FSDP modules (no FSDP children inside them)
+for layer in model.layers:
+    fully_shard(layer, enable_cuda_graph=True)
+
+# NOT OK — model contains FSDP layers as children
+fully_shard(model, enable_cuda_graph=True)   # raises RuntimeError
+```
+
 ### DataParallelBuffer
 
 Flat buffer managing (a shard of) parameter/gradient data:
@@ -154,6 +200,17 @@ All strategies except `no_shard` are supported. `optim_grads` (ZeRO-2) and
 `optim` (ZeRO-1) do not support parameter gather overlap (prefetch/unshard
 pipelining) — weights are replicated so no all-gather is needed.
 `no_shard` (DDP-like) is not yet implemented and raises ``NotImplementedError``.
+
+### CUDA Graph
+
+- **Experimental.** CUDA graph support is experimental. The API and behavior
+  may change in future releases without notice. Enable via
+  ``enable_cuda_graph=True`` on leaf FSDP modules only.
+- **Nesting not supported.** A parent FSDP module that contains other FSDP
+  modules as children cannot use ``enable_cuda_graph=True``.  Only leaf FSDP
+  modules (those without FSDP children) are eligible for CUDA graph capture.
+  Attempting to enable CUDA graph on a nested FSDP module raises a
+  ``RuntimeError``.
 
 ### `fully_shard()` API Parameters
 
@@ -231,6 +288,7 @@ without any Megatron-LM dependency once the package is released.
 See `examples/megatron_fsdp/fsdp_toy.py` for a standalone example showing:
 
 - Basic model wrapping with `fully_shard()`
+- CUDA graph capture (`--cuda-graph` / `--no-cuda-graph`)
 - Training loop with gradient accumulation
 - Activation checkpointing (`--activation-checkpoint`)
 - Distributed checkpointing with `torch.distributed.checkpoint`
@@ -243,12 +301,23 @@ torchrun --nproc_per_node=2 examples/megatron_fsdp/fsdp_toy.py \
 torchrun --nproc_per_node=2 examples/megatron_fsdp/fsdp_toy.py \
     --model-dim 512 --n-layers 2 --batch-size 4 \
     --use-megatron-fsdp --activation-checkpoint
+
+# Disable CUDA graph capture
+torchrun --nproc_per_node=2 examples/megatron_fsdp/fsdp_toy.py \
+    --model-dim 512 --n-layers 2 --batch-size 4 \
+    --use-megatron-fsdp --no-cuda-graph
 ```
 
 ## Gotchas / Pitfalls
 
 - **Zero-numel gradient shards and fused optimizers.** When a parameter's local shard is empty on some DP ranks (e.g., small biases on high DP counts), creating a `DTensor` gradient with `numel() == 0` and passing it to fused multi-tensor optimizers (TE `FusedAdam`) can silently corrupt updates for neighboring non-empty parameters. This manifests only as convergence divergence with no error — see [design.md § Pitfall](design.md) for details and the fix in `param_group.py`.
-- **Temporary communication buckets must record their CUDA stream.** `DataParallelBuffer.reshard()` and `release_grad_buffer()` can return temporary all-gather / reduce-scatter bucket storage to the allocator while side-stream CUDA work is still queued. A CUDA event wait orders streams, but it does not tell PyTorch's caching allocator that the freed storage is still used by `ag_stream` or `rs_stream`. If the block is recycled on another stream, the communication payload can be silently corrupted. Call `record_stream()` on any temporary CUDA tensor that participates in side-stream communication before it may be freed; a full synchronization only masks the bug and hurts overlap.
+- **Temporary communication bucket lifecycle.** All temporary all-gather /
+  reduce-scatter buckets are allocated on the default CUDA stream and only
+  compute operations (all-gather, reduce-scatter) run on side streams
+  (`ag_stream`, `rs_stream`). CUDA events inserted at the boundary between
+  allocation and compute, and between compute and free, guarantee ordering
+  without ``record_stream``. Keeping allocations on the default stream avoids
+  non-deterministic caching-allocator behaviour and peak memory regressions.
 
 ## Unit Tests
 

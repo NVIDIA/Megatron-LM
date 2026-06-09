@@ -96,7 +96,7 @@ def gather_and_compute_chunk_metadata(dtensor: DTensor) -> ChunkStorageMetadata:
     return ChunkStorageMetadata(offsets=tuple(offsets), sizes=tuple(local_shape))
 
 
-def update_uneven_dtensor_chunk_metadata(dtensor: DTensor) -> dict:
+def update_uneven_dtensor_chunk_metadata(dtensor: DTensor, source: str = "init") -> dict:
     """
     Update the DTensor's chunk metadata to handle uneven sharding.
     This function modifies the DTensor in-place to include chunk metadata
@@ -111,7 +111,7 @@ def update_uneven_dtensor_chunk_metadata(dtensor: DTensor) -> dict:
     uneven_chunk_meta = gather_and_compute_chunk_metadata(dtensor)
 
     # Set the chunk list and write items closure for the DTensor
-    _set_chunk_metadata(dtensor, uneven_chunk_meta.offsets, uneven_chunk_meta.sizes)
+    _set_chunk_metadata(dtensor, uneven_chunk_meta.offsets, uneven_chunk_meta.sizes, source=source)
 
 
 def validate_uneven_dtensor(dtensor: DTensor) -> None:
@@ -227,7 +227,7 @@ def preprocess_state_dict_for_uneven_dtensor(state_dict: dict) -> dict:
     for key_chain in sorted(visit_dtensor):
         # Get the DTensor at the key chain
         dtensor = get_unflattened_state_dict(state_dict, key_chain)
-        update_uneven_dtensor_chunk_metadata(dtensor)
+        update_uneven_dtensor_chunk_metadata(dtensor, source="preprocess")
     return state_dict
 
 
@@ -562,7 +562,7 @@ def split_dtensor(
                 new_offsets[dim] = 0
                 new_sizes[dim] = 0
 
-            _set_chunk_metadata(new_dtensor, tuple(new_offsets), tuple(new_sizes))
+            _set_chunk_metadata(new_dtensor, tuple(new_offsets), tuple(new_sizes), source="split")
 
         yield new_dtensor
 
@@ -613,7 +613,7 @@ def make_uneven_dtensor(
         # existing uneven DTensor instead of recomputing it.
         copy_chunk_metadata(copy_chunk_meta_from, dtensor)
     elif chunk_metadata is not None:
-        _set_chunk_metadata(dtensor, *chunk_metadata)
+        _set_chunk_metadata(dtensor, *chunk_metadata, source="make_uneven")
     return dtensor
 
 
@@ -645,6 +645,16 @@ def copy_chunk_metadata(src: DTensor, dst: DTensor) -> None:
     """Copy ``__create_chunk_list__`` / ``__create_write_items__`` from *src* to *dst*."""
     dst._local_tensor.__create_chunk_list__ = src._local_tensor.__create_chunk_list__
     dst._local_tensor.__create_write_items__ = src._local_tensor.__create_write_items__
+    src_source = getattr(src._local_tensor, "_chunk_meta_source", None)
+    if src_source is not None:
+        dst._local_tensor._chunk_meta_source = f"propagate:{src_source}"
+    else:
+        dst._local_tensor._chunk_meta_source = "propagate:unknown"
+
+
+def get_chunk_meta_source(dtensor: DTensor) -> str:
+    """Return the source tag for *dtensor*'s chunk metadata, or ``"none"``."""
+    return getattr(dtensor._local_tensor, "_chunk_meta_source", "none")
 
 
 def compute_split_offsets_and_sizes(dist_param, split_dim, comp_idx, total_split, comp_data):
@@ -710,10 +720,17 @@ def get_fsdp_slice_from_uneven_dtensor(dist_param: DTensor) -> slice:
     return slice(start, start + local_numel)
 
 
-def _set_chunk_metadata(dtensor: DTensor, offsets: tuple, sizes: tuple) -> None:
+def _set_chunk_metadata(
+    dtensor: DTensor, offsets: tuple, sizes: tuple, source: str = "unknown"
+) -> None:
     """Set ``__create_chunk_list__`` / ``__create_write_items__`` closures on *dtensor*.
 
     No collective ops — *offsets* and *sizes* are computed locally.
+
+    Args:
+        source: A tag describing where the metadata was set, e.g. ``"init"``,
+            ``"preprocess"``, ``"split"``.  Stored on the local tensor as
+            ``_chunk_meta_source`` for diagnostic tracing.
     """
     chunk_meta = ChunkStorageMetadata(offsets=tuple(offsets), sizes=tuple(sizes))
 
@@ -734,3 +751,4 @@ def _set_chunk_metadata(dtensor: DTensor, offsets: tuple, sizes: tuple) -> None:
 
     dtensor._local_tensor.__create_chunk_list__ = lambda: [chunk_meta]
     dtensor._local_tensor.__create_write_items__ = _write_items
+    dtensor._local_tensor._chunk_meta_source = source

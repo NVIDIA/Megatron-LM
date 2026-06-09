@@ -1454,7 +1454,7 @@ def _load_non_persistent_base_checkpoint(
 
 
 def _load_global_dist_base_checkpoint(
-    load_dir, args, rank0, sharded_state_dict, iteration, release, checkpointing_context=None
+    load_dir, args, rank0, sharded_state_dict, iteration, release, checkpointing_context=None, model=None
 ):
     """Load the base state_dict from the given directory containing the global distributed checkpoint"""
     if rank0:
@@ -1462,10 +1462,15 @@ def _load_global_dist_base_checkpoint(
         state_dict = dist_checkpointing.load_common_state_dict(checkpoint_name)
         return state_dict, checkpoint_name, release, CheckpointType.GLOBAL
 
+    # Load torch_dist checkpoint into Megatron FSDP v2
     if args.use_megatron_fsdp_v2:
         checkpoint_name = find_checkpoint_rank_0(load_dir, iteration, release)
         state_dict = _load_torch_dist_into_megatron_fsdp_v2(
-            args, checkpoint_name, sharded_state_dict, strict=True
+            args,
+            checkpoint_name,
+            model=model,
+            v2_state_dict=sharded_state_dict,
+            strict=True,
         )
         return state_dict, checkpoint_name, release, CheckpointType.FSDP_DTENSOR
 
@@ -1534,7 +1539,12 @@ def _get_checkpoint_format(checkpoint_name, args):
 
 
 def _load_base_checkpoint(
-    load_dir, args, rank0=False, sharded_state_dict=None, checkpointing_context=None
+    load_dir,
+    args,
+    rank0=False,
+    sharded_state_dict=None,
+    checkpointing_context=None,
+    model=None,
 ):
     """Load the base state_dict from the given directory
 
@@ -1617,6 +1627,7 @@ def _load_base_checkpoint(
             iteration,
             release,
             checkpointing_context=checkpointing_context,
+            model=model,
         )
     elif ckpt_format == "torch":
         ckpt_type = CheckpointType.LEGACY
@@ -2169,7 +2180,12 @@ def load_checkpoint(
         load_kwargs["sharded_state_dict"] = state_dict
 
     state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
-        load_dir, args, rank0=False, checkpointing_context=checkpointing_context, **load_kwargs
+        load_dir,
+        args,
+        rank0=False,
+        checkpointing_context=checkpointing_context,
+        model=model,
+        **load_kwargs
     )
 
     # Checkpoint not loaded.

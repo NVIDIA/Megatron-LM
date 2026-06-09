@@ -50,7 +50,8 @@ def dist_env():
     device = torch.device(f"cuda:{rank % torch.cuda.device_count()}")
     torch.cuda.set_device(device)
     yield
-    torch.distributed.destroy_process_group()
+    if torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
 
 
 # ------------------------------------------------------------------ #
@@ -237,8 +238,8 @@ def test_unshard_reshard(strategy):
             # Distributed: after all-gather, every param should be fully
             # recoverable from the unsharded buffer at its global offset
             for i, p in enumerate(orig):
-                off, sz = wbuf.buffer_index._get_item_global_range(i)
-                recovered = unsharded[off : off + sz]
+                start, end = wbuf.buffer_index._get_item_global_range(i)
+                recovered = unsharded[start:end]
                 assert torch.equal(recovered, p.flatten())
 
         # Reshard: release temporary buffer, persistent shard must be intact

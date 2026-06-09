@@ -15,16 +15,16 @@
 """FSDPModule implementation for Megatron-FSDP2."""
 
 import logging
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
-from .allocator import BucketAllocator
+from .allocator import BucketAllocator, TracePoolAllocator
 from .mixed_precision import MixedPrecisionPolicy
 from .param_group import ParameterGroup
 from .utils import ParamGroupIdx, _replace_module_parameter
@@ -44,6 +44,7 @@ class _FSDPState:
     def __init__(self):
         self._is_root = True
         self._post_backward_callback_queued = False
+        self.enable_cuda_graph: bool = False
 
 
 @dataclass
@@ -89,7 +90,9 @@ class _FSDPRootContext:
     # ------------------------------------------------------------------
     # Unshard (all-gather) tracking
     # ------------------------------------------------------------------
-    unshard_done_events: Dict[int, Optional[torch.cuda.Event]] = field(default_factory=dict)
+    unshard_done_events: Dict[int, Optional[torch.cuda.Event]] = field(
+        default_factory=dict
+    )
     """
     Maps module_id -> CUDA event signaling completion of parameter unshard.
 
@@ -102,9 +105,9 @@ class _FSDPRootContext:
     # ------------------------------------------------------------------
     # Reduce-scatter (gradient sync) tracking
     # ------------------------------------------------------------------
-    reduce_grad_buckets: Dict[
-        int, List[Tuple[torch.cuda.Event, "ParameterGroup"]]
-    ] = field(default_factory=dict)
+    reduce_grad_buckets: Dict[int, List[Tuple[torch.cuda.Event, "ParameterGroup"]]] = (
+        field(default_factory=dict)
+    )
     """
     Maps module_id -> list of (event, parameter_group) tuples.
 
@@ -125,7 +128,34 @@ class _FSDPRootContext:
     # Activation recompute / gradient checkpointing support
     # ------------------------------------------------------------------
     backward_phase: bool = False
-    """True from the root backward pre-hook until the final callback."""
+    """True from the root backward pre-hook until the final callback.
+    ``forward_phase`` is set to ``False`` when this becomes ``True``."""
+
+    forward_phase: bool = False
+    """True from the root forward pre-hook until the root backward pre-hook.
+    ``backward_phase`` is set to ``False`` when this becomes ``True``."""
+
+    enable_cuda_graph: bool = False
+    """Set by enable_cuda_graph() — tells hooks to manage the side stream."""
+
+    cuda_graph_stream: Optional[torch.cuda.Stream] = None
+    """Side stream for CUDA graph capture/replay.  Created lazily on the
+    first forward pre-hook and shared across all FSDP modules."""
+
+    cuda_graph_active: bool = False
+    """True while ``make_graphed_callables`` is inside its capture
+    region.  All hooks must assert ``not cuda_graph_active`` — hooks
+    are popped during capture, so a callback firing inside the capture
+    window indicates a bug."""
+
+    cuda_graph_pool: Optional[Any] = None
+    f"""Shared CUDA graph memory pool handle for CUDA graph capture.
+
+    Obtained via ``torch.cuda.graph_pool_handle()``.  Multiple
+    ``torch.cuda.CUDAGraph`` objects created with this handle share
+    the same backing memory pool, allowing the CUDA driver to reuse
+    graph memory across FSDP modules and reduce total GPU memory
+    consumption."""
 
     backward_module: Optional[int] = None
     """``id(module)`` of the FSDP module whose backward is pending next.
@@ -152,7 +182,9 @@ class _FSDPRootContext:
         self, module: "FSDPModule", bwd_pass: bool = False
     ) -> List["FSDPModule"]:
         """Return the next FSDP module to prefetch in forward or backward order."""
-        module_order = list(reversed(self.forward_order)) if bwd_pass else self.forward_order
+        module_order = (
+            list(reversed(self.forward_order)) if bwd_pass else self.forward_order
+        )
 
         for module_index, candidate_module in enumerate(module_order):
             if candidate_module is module:
@@ -167,7 +199,7 @@ class _FSDPRootContext:
         return self.forward_order[0] if self.forward_order else None
 
 
-class FSDPModule(nn.Module):
+class FSDPModule:
     """
     Mixin class for FSDP-wrapped modules.
 
@@ -178,12 +210,43 @@ class FSDPModule(nn.Module):
     - reduce_grad(): Reduce gradients after backward
     """
 
+    @property
+    def cuda_graph_compatible(self) -> bool:
+        """Return True when the root context is configured for CUDA graph capture.
+
+        Requires side-stream collectives to be disabled so every CUDA
+        operation lands on the default stream.  Can be used as a guard
+        before entering a graph capture region::
+
+            assert module.cuda_graph_compatible
+        """
+        ctx = self._fsdp_root_context
+        if not isinstance(ctx.bucket_allocator, TracePoolAllocator):
+            return False
+        if ctx.bucket_allocator.phase != "optimized":
+            return False
+        return True
+
+    def enable_cuda_graph(self) -> None:
+        """Enable CUDA graph capture for this FSDP module.
+
+        Must be called while the module is resharded (before the first
+        forward pass).  Sets the ``enable_cuda_graph`` flag on both the
+        per-module FSDP state and the shared root context.  The side
+        stream is created lazily on the first root forward pre-hook.
+
+        Usage::
+
+            fully_shard(layer, mesh=mesh)
+            layer.enable_cuda_graph()   # call before first forward
+        """
+        self._fsdp_state.enable_cuda_graph = True
+
     def _init_named_param_groups(
         self,
         mesh: Optional[DeviceMesh],
         ignored_params: Optional[set],
         mp_policy: MixedPrecisionPolicy,
-        bucket_allocator: BucketAllocator,
         gradient_scaling_factor: Optional[float] = None,
         sharding_strategy: str = "optim_grads_params",
     ):
@@ -215,7 +278,6 @@ class FSDPModule(nn.Module):
             mp_policy=mp_policy,
             mesh=mesh,
             ignored_params=ignored_params,
-            allocator=bucket_allocator,
             gradient_scaling_factor=gradient_scaling_factor,
             sharding_strategy=sharding_strategy,
         )
@@ -251,9 +313,9 @@ class FSDPModule(nn.Module):
             assert gbuf_data.numel() > 0
 
             # Get offset and size from buffer index
-            offset, size = gbuf.buffer_index._get_item_global_range(item_id)
+            start, end = gbuf.buffer_index._get_item_global_range(item_id)
             param_shape = gbuf.buffer_index.item_index_map[item_id].shape
-            grad_data = gbuf_data[offset : offset + size].view(param_shape)
+            grad_data = gbuf_data[start:end].view(param_shape)
 
             return grad_data
 
@@ -287,11 +349,15 @@ class FSDPModule(nn.Module):
                 continue
 
             m._apply(
-                lambda t: torch.empty_like(t, device=materialization_device) if t.is_meta else t,
+                lambda t: torch.empty_like(t, device=materialization_device)
+                if t.is_meta
+                else t,
                 recurse=False,
             )
             init_context = (
-                mp_policy.model_init_context(m) if mp_policy is not None else nullcontext()
+                mp_policy.model_init_context(m)
+                if mp_policy is not None
+                else nullcontext()
             )
             with init_context:
                 if hasattr(m, "reset_parameters"):
@@ -315,7 +381,11 @@ class FSDPModule(nn.Module):
                 torch.distributed.broadcast(param.data, src=src_rank, group=dp_group)
 
     def _init_fsdp_state(
-        self, enable_unshard_prefetch, enable_async_reduce_grad, bucket_allocator: BucketAllocator
+        self,
+        enable_unshard_prefetch,
+        enable_async_reduce_grad,
+        bucket_allocator: BucketAllocator,
+        enable_cuda_graph: bool = False,
     ):
         """Initialize FSDP state and mark nested FSDP modules as non-root.
 
@@ -325,7 +395,9 @@ class FSDPModule(nn.Module):
         check below enforces that constraint.
         """
         named_forward_modules = [
-            (name, child) for name, child in self.named_modules() if isinstance(child, FSDPModule)
+            (name, child)
+            for name, child in self.named_modules()
+            if isinstance(child, FSDPModule)
         ]
         forward_order = [child for name, child in named_forward_modules]
 
@@ -357,10 +429,14 @@ class FSDPModule(nn.Module):
 
         root_context = _FSDPRootContext(
             ag_stream=(
-                torch.cuda.Stream() if enable_unshard_prefetch else torch.cuda.current_stream()
+                torch.cuda.Stream()
+                if enable_unshard_prefetch
+                else torch.cuda.current_stream()
             ),
             rs_stream=(
-                torch.cuda.Stream() if enable_async_reduce_grad else torch.cuda.current_stream()
+                torch.cuda.Stream()
+                if enable_async_reduce_grad
+                else torch.cuda.current_stream()
             ),
             forward_order=forward_order,
             reduce_grad_buckets={id(module): [] for module in forward_order},
@@ -385,6 +461,23 @@ class FSDPModule(nn.Module):
             setattr(module, "_fsdp_module_idx", module_idx)
             setattr(module, "_fsdp_module_name", name)
             module_idx += 1
+
+        if enable_cuda_graph:
+            if len(forward_order) > 1:
+                child_names = [
+                    name for name, m in named_forward_modules if m is not self
+                ]
+                raise RuntimeError(
+                    f"enable_cuda_graph=True is not supported for FSDP modules that contain "
+                    f"other FSDP modules as children. "
+                    f"Module '{self._fsdp_module_name}' (type={type(self).__name__}) "
+                    f"has FSDP children: {child_names}. "
+                    f"Only leaf FSDP modules (no FSDP children) can use CUDA graph capture."
+                )
+            self.enable_cuda_graph()
+
+        if any(module._fsdp_state.enable_cuda_graph for module in forward_order):
+            root_context.enable_cuda_graph = True
 
     def unshard(self, async_op: bool = False, bwd_pass: bool = False):
         """
@@ -424,9 +517,9 @@ class FSDPModule(nn.Module):
                 # Optional NaN checking for debugging
                 if getattr(module, "_enable_nan_checks", False):
                     for name, dist_param in zip(param_names, param_group.dist_params):
-                        assert not torch.isnan(
-                            dist_param._local_tensor
-                        ).any(), f"NaN detected in dist param for parameter {name}"
+                        assert not torch.isnan(dist_param._local_tensor).any(), (
+                            f"NaN detected in dist param for parameter {name}"
+                        )
 
                 with torch.cuda.stream(stream):
                     param_group.unshard(bwd_pass=bwd_pass)
@@ -451,7 +544,9 @@ class FSDPModule(nn.Module):
             # Optional NaN checking for debugging
             if getattr(self, "_enable_nan_checks", False):
                 for name, param in zip(param_names, param_group.params):
-                    assert not torch.isnan(param).any(), f"NaN detected in parameter {name}"
+                    assert not torch.isnan(param).any(), (
+                        f"NaN detected in parameter {name}"
+                    )
 
         torch.cuda.nvtx.range_pop()
 
@@ -508,19 +603,34 @@ class FSDPModule(nn.Module):
             if getattr(self, "_enable_nan_checks", False):
                 for name, param in zip(param_names, param_group.params):
                     if param.grad is not None:
-                        assert not torch.isnan(
-                            param.grad
-                        ).any(), f"NaN in parameter grad for {name}"
+                        assert not torch.isnan(param.grad).any(), (
+                            f"NaN in parameter grad for {name}"
+                        )
 
             # Copy .grad -> main grad buffer on main stream (fast memcpy).
             # When gradient_accumulation_fusion is active for FSDP params, the backward
             # kernel writes directly into main_grad (weight.main_grad = get_main_grad() in
             # layers.py) and sets grad_added_to_main_grad=True. In that case we must NOT
             # zero or overwrite main_grad; discard the dummy .grad tensor if present.
+            #
+            # Under CUDA graph replay, TE's pure-GPU backward kernel still runs, but
+            # the Python-side ``setattr(param, "grad_added_to_main_grad", True)`` that
+            # accompanies the eager backward is captured away.  We record the per-param
+            # flag during the trace micro-batch and restore it here.
             for name, param in zip(param_names, param_group.params):
-                if getattr(param, "grad_added_to_main_grad", False):
+                grad_added = getattr(param, "grad_added_to_main_grad", False)
+                recorded = getattr(param, "_mfsdp_recorded_te_wgrad", False)
+                if grad_added or recorded:
                     if param.grad is not None:
                         del param.grad
+                    # Record TE wgrad-fusion flags for CUDA graph restore.
+                    # The trace backward ran eagerly, so TE set
+                    # grad_added_to_main_grad on each param it wrote to.
+                    # Under CUDA graph replay only the GPU kernel runs;
+                    # we record the flags here and restore them in
+                    # the CG replay backward.
+                    if grad_added and self._fsdp_state.enable_cuda_graph:
+                        setattr(param, "_mfsdp_recorded_te_wgrad", True)
                 elif param.grad is None:
                     main_grad = param.get_main_grad()
                     param_main_grad = getattr(param, "main_grad", None)
@@ -563,7 +673,9 @@ class FSDPModule(nn.Module):
                     else:
                         assert (
                             dist_grad is None or dist_param.dtype == dist_grad.dtype
-                        ), f"{name} Dist param dtype {dist_param.dtype} does not match dist grad dtype {dist_grad.dtype}"
+                        ), (
+                            f"{name} Dist param dtype {dist_param.dtype} does not match dist grad dtype {dist_grad.dtype}"
+                        )
                         setattr(dist_param, "grad", dist_grad)
                         if hasattr(dist_param, "decoupled_grad"):
                             dist_param.decoupled_grad = None
@@ -576,9 +688,9 @@ class FSDPModule(nn.Module):
             if getattr(self, "_enable_nan_checks", False):
                 for name, dist_grad in zip(param_names, param_group.dist_grads):
                     if dist_grad is not None:
-                        assert not torch.isnan(
-                            dist_grad._local_tensor
-                        ).any(), f"NaN in dist grad for parameter {name}"
+                        assert not torch.isnan(dist_grad._local_tensor).any(), (
+                            f"NaN in dist grad for parameter {name}"
+                        )
 
         torch.cuda.nvtx.range_pop()
 
@@ -631,14 +743,7 @@ class FSDPModule(nn.Module):
             if not isinstance(child, FSDPModule):
                 continue
             for param_group in child._fsdp_param_groups:
-                if param_group.main_grad_buffer is not None:
-                    param_group.main_grad_buffer.data.zero_()
-                    param_group.release_grad_buffer()
-                for dist_param in param_group.dist_params:
-                    if dist_param.grad is not None:
-                        del dist_param.grad
-                    if hasattr(dist_param, "decoupled_grad"):
-                        dist_param.decoupled_grad = None
+                param_group.zero_grad()
 
     def _copy_main_weights_to_model_weights(self):
         """Copy main weight buffer to model weight buffer."""
@@ -667,7 +772,9 @@ class FSDPModule(nn.Module):
                 for param_name, dist_param, dist_grad in zip(
                     param_names, param_group.dist_params, param_group.dist_grads
                 ):
-                    full_name = f"{module_name}.{param_name}" if module_name else param_name
+                    full_name = (
+                        f"{module_name}.{param_name}" if module_name else param_name
+                    )
                     results[full_name] = {"param_norm": 0.0, "grad_norm": 0.0}
                     if dist_param._local_tensor.numel() > 0:
                         results[full_name]["param_norm"] = (
@@ -779,15 +886,18 @@ class FSDPModule(nn.Module):
                 ):
                     dist_idx = param_group.param_idx.get(param)
                     offset_info = ""
-                    if param_group.model_weight_buffer is not None and dist_idx is not None:
-                        item_index = (
-                            param_group.model_weight_buffer.buffer_index.item_index_map.get(
-                                dist_idx
-                            )
+                    if (
+                        param_group.model_weight_buffer is not None
+                        and dist_idx is not None
+                    ):
+                        item_index = param_group.model_weight_buffer.buffer_index.item_index_map.get(
+                            dist_idx
                         )
                         if item_index is not None:
                             offset_info = f" @{item_index.global_data_index:,}+{item_index.size:,}"
-                    lines.append(f"    {param_name:50s} {str(tuple(param_shape)):24s}{offset_info}")
+                    lines.append(
+                        f"    {param_name:50s} {str(tuple(param_shape)):24s}{offset_info}"
+                    )
                 group_idx += 1
 
         lines.append(
@@ -809,17 +919,21 @@ class FSDPModule(nn.Module):
                     param_data = param.data._local_tensor
                 else:
                     param_data = param.data
-                assert not torch.isnan(param_data).any(), f"NaN detected in parameter {name}"
+                assert not torch.isnan(param_data).any(), (
+                    f"NaN detected in parameter {name}"
+                )
             for child in self.modules():
                 if not isinstance(child, FSDPModule):
                     continue
                 for param_group in child._fsdp_param_groups:
                     for param in param_group.params:
                         wbuf = param_group.model_weight_buffer
-                        param_data = wbuf.get_item(param_group.param_idx[param], as_shard=False)
-                        assert not torch.isnan(
-                            param_data
-                        ).any(), "NaN detected in model weight buffer"
+                        param_data = wbuf.get_item(
+                            param_group.param_idx[param], as_shard=False
+                        )
+                        assert not torch.isnan(param_data).any(), (
+                            "NaN detected in model weight buffer"
+                        )
 
     def get_root_module(self):
         """Return the root FSDP module associated with this module."""
@@ -832,7 +946,6 @@ class FSDPModule(nn.Module):
 def _get_module_fsdp_param_groups(
     module: nn.Module,
     mp_policy: MixedPrecisionPolicy,
-    allocator: BucketAllocator,
     mesh: Optional[DeviceMesh] = None,
     ignored_params: Optional[set[nn.Parameter]] = None,
     gradient_scaling_factor: Optional[float] = None,
@@ -868,7 +981,6 @@ def _get_module_fsdp_param_groups(
                 param_group_id=ParamGroupIdx(id(module), i),
                 mp_policy=mp_policy,
                 gradient_scaling_factor=gradient_scaling_factor,
-                allocator=allocator,
                 sharding_strategy=sharding_strategy,
             )
         )
