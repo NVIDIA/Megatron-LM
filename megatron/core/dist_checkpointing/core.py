@@ -2,6 +2,7 @@
 
 """ Module for managing distributed checkpoints metadata. """
 
+import dataclasses
 import json
 import os
 from dataclasses import asdict, dataclass
@@ -67,7 +68,8 @@ def maybe_load_config(checkpoint_dir: str) -> Optional[CheckpointingConfig]:
                 return None
             with open(config_path) as f:
                 config_dict = json.load(f)
-        return CheckpointingConfig(**config_dict)
+        known_fields = {f.name for f in dataclasses.fields(CheckpointingConfig)}
+        return CheckpointingConfig(**{k: v for k, v in config_dict.items() if k in known_fields})
     return None
 
 
