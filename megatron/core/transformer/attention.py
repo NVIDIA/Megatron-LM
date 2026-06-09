@@ -675,7 +675,11 @@ class Attention(MegatronModule, ABC):
             elif rotary_pos_emb is not None:
                 q_pos_emb, k_pos_emb = rotary_pos_emb
                 key = inference_context.apply_rotary_emb_key(
-                    key, k_pos_emb, self.config, self.pg_collection.cp
+                    key,
+                    k_pos_emb,
+                    self.config,
+                    self.pg_collection.cp,
+                    mscale=_yarn_get_concentration_factor_from_config(self.config),
                 )
 
                 rotary_pos_emb = (q_pos_emb, None)  # key rotary emb has been applied
@@ -1170,11 +1174,16 @@ class Attention(MegatronModule, ABC):
                         num_requests, tokens_per_request, *output_total.shape[1:]
                     )
                 else:
+                    if getattr(self, "softmax_scale", None) is not None:
+                        softmax_scale = self.softmax_scale
+                    else:
+                        softmax_scale = q.shape[-1] ** -0.5
                     flash_attn_args = {
                         "q": q,
                         "k_cache": k,
                         "v_cache": v,
                         "cache_seqlens": seqlens_k,
+                        "softmax_scale": softmax_scale,
                         "causal": True,
                         "window_size": window_size,
                         "page_table" if HAVE_FA3 else "block_table": block_table,
@@ -1193,12 +1202,14 @@ class Attention(MegatronModule, ABC):
                         # FA2/FA3 *_with_kvcache return (out, softmax_lse) when
                         # return_softmax_lse=True.
                         output_total, softmax_lse = kvcache_ret
+                    else:
+                        output_total = kvcache_ret
+                        softmax_lse = None
+                    if need_lse:
                         # output_total: (B, S, H, D); softmax_lse: (B, H, S)
                         output_total = self._apply_sink_softmax_correction_bshd(
                             output_total, softmax_lse, softmax_offset
                         )
-                    else:
-                        output_total = kvcache_ret
 
             # Reshape back to (B*S, 1, H, D) for consistent output shape.
             output_total = output_total.reshape(
@@ -1440,7 +1451,12 @@ class Attention(MegatronModule, ABC):
                         )
                     else:
                         query = inference_context.apply_rotary_emb_query(
-                            query, q_pos_emb, self.config, cu_seqlens_q, self.pg_collection.cp
+                            query,
+                            q_pos_emb,
+                            self.config,
+                            cu_seqlens_q,
+                            self.pg_collection.cp,
+                            mscale=_yarn_get_concentration_factor_from_config(self.config),
                         )
                 if k_pos_emb is not None:
                     key = apply_rotary_pos_emb(
