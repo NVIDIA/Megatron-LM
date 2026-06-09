@@ -108,15 +108,10 @@ class TestMambaDynamicInference(unittest.TestCase):
 
         # Create real parameters for ssm_decode to access
         conv_dim = self.d_inner + 2 * self.ngroups * self.d_state
-        self.mixer.conv1d = nn.Conv1d(
-            in_channels=conv_dim,
-            out_channels=conv_dim,
-            kernel_size=self.d_conv,
-            groups=conv_dim,
-            padding=self.d_conv - 1,
-            bias=True,
-            device=self.device,
+        self.mixer.conv1d_weight = nn.Parameter(
+            torch.randn(conv_dim, 1, self.d_conv, device=self.device)
         )
+        self.mixer.conv1d_bias = nn.Parameter(torch.randn(conv_dim, device=self.device))
         self.mixer.dt_bias = nn.Parameter(torch.randn(self.nheads, device=self.device))
         self.mixer.A_log = nn.Parameter(torch.randn(self.nheads, device=self.device))
         self.mixer.D = nn.Parameter(torch.ones(self.nheads, device=self.device))
