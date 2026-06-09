@@ -9,25 +9,25 @@
 
 # How to Submit a PR
 
-All PRs start as **draft**. If you open a non-draft PR, it will be automatically converted to draft.
+All PRs start as **draft**. If you open a non-draft PR, the system automatically converts it to draft.
 
 ## Step 1: Mark PR as "Ready for Review"
 
 1. When your PR is ready, click **Ready for Review**.
-2. The oncall reviewer is auto-assigned and expert reviewers are notified based on your changes. They will get notified and pick up your PR soon.
+2. The system auto-assigns the oncall reviewer and notifies expert reviewers based on your changes.
 
-:warning: Only mark as ready once all merge-conflicts are resolved and the CI is passing.
-Final Review might get declined if these requirements are not fulfilled.
+:warning: Only mark as ready after all merge-conflicts are resolved and the CI is passing.
+Reviewers may decline the Final Review if you have not met these requirements.
 
 ## Step 2: Final Review (`megatron/core` only)
 
-For PRs that change `megatron/core`, once all expert reviewers have approved, the `Final Review` label is applied **automatically** and final reviewers are assigned.
+For PRs that change `megatron/core`, after all expert reviewers approve, the system **automatically** applies the `Final Review` label and assigns final reviewers.
 
 For PRs outside `megatron/core`, this step is skipped.
 
 ## Step 3: Approved
 
-Once all required reviewers have approved, the `Approved` label is applied **automatically**. The PR is now ready to merge.
+After all required reviewers approve, the system **automatically** applies the `Approved` label. The PR is now ready to merge.
 
 ## Step 4: Merge
 
