@@ -2799,9 +2799,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """Stage FP32 master shards into DDP param buffers before explicit param sync."""
         if self.is_stub_optimizer:
             return
-        if not (
-            self.config.reuse_grad_buf_for_mxfp8_param_ag and self.config.overlap_param_gather
-        ):
+        if not (self.config.reuse_grad_buf_for_mxfp8_param_ag and self.config.overlap_param_gather):
             return
 
         for model_chunk in self.model_chunks:
