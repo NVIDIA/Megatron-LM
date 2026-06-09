@@ -12,6 +12,7 @@ from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_align_size_for_quantization
 from megatron.core.transformer.moe.paged_stash import (
     PagedStashManager,
+    PagedTensor,
     check_paged_stash_overflow,
     paged_stash_init_chunk_handler,
     paged_stash_reset,
@@ -209,6 +210,174 @@ def _is_mxfp8_supported() -> bool:
 _MXFP8_SKIP_REASON = (
     "MXFP8 (tests configure fp8_recipe='mxfp8') requires compute capability >= 10.0 (Blackwell)"
 )
+
+
+class _LegacyGroupedTensor:
+    """Fake TE 2.14/2.15-style GroupedTensor constructor."""
+
+    def __init__(
+        self,
+        shape,
+        dtype,
+        *,
+        num_tensors,
+        shapes=None,
+        quantizer=None,
+        data=None,
+        columnwise_data=None,
+        scale_inv=None,
+        columnwise_scale_inv=None,
+        amax=None,
+        columnwise_amax=None,
+        scale=None,
+        first_dims=None,
+        last_dims=None,
+        tensor_offsets=None,
+        offsets=None,
+        scale_inv_offsets=None,
+        columnwise_scale_inv_offsets=None,
+        requires_grad=False,
+        with_gemm_swizzled_scales=False,
+    ):
+        self.kwargs = {
+            "shape": shape,
+            "dtype": dtype,
+            "num_tensors": num_tensors,
+            "shapes": shapes,
+            "quantizer": quantizer,
+            "data": data,
+            "columnwise_data": columnwise_data,
+            "scale_inv": scale_inv,
+            "columnwise_scale_inv": columnwise_scale_inv,
+            "amax": amax,
+            "columnwise_amax": columnwise_amax,
+            "scale": scale,
+            "first_dims": first_dims,
+            "last_dims": last_dims,
+            "tensor_offsets": tensor_offsets,
+            "offsets": offsets,
+            "scale_inv_offsets": scale_inv_offsets,
+            "columnwise_scale_inv_offsets": columnwise_scale_inv_offsets,
+            "requires_grad": requires_grad,
+            "with_gemm_swizzled_scales": with_gemm_swizzled_scales,
+        }
+
+
+class _RowScaledGroupedTensor(_LegacyGroupedTensor):
+    """Fake newer GroupedTensor constructor with row-scaled NVFP4 support."""
+
+    def __init__(
+        self,
+        shape,
+        dtype,
+        *,
+        num_tensors,
+        shapes=None,
+        quantizer=None,
+        data=None,
+        columnwise_data=None,
+        scale_inv=None,
+        columnwise_scale_inv=None,
+        amax=None,
+        columnwise_amax=None,
+        scale=None,
+        first_dims=None,
+        last_dims=None,
+        tensor_offsets=None,
+        offsets=None,
+        scale_inv_offsets=None,
+        columnwise_scale_inv_offsets=None,
+        requires_grad=False,
+        with_gemm_swizzled_scales=False,
+        row_scaled_nvfp4=False,
+    ):
+        super().__init__(
+            shape,
+            dtype,
+            num_tensors=num_tensors,
+            shapes=shapes,
+            quantizer=quantizer,
+            data=data,
+            columnwise_data=columnwise_data,
+            scale_inv=scale_inv,
+            columnwise_scale_inv=columnwise_scale_inv,
+            amax=amax,
+            columnwise_amax=columnwise_amax,
+            scale=scale,
+            first_dims=first_dims,
+            last_dims=last_dims,
+            tensor_offsets=tensor_offsets,
+            offsets=offsets,
+            scale_inv_offsets=scale_inv_offsets,
+            columnwise_scale_inv_offsets=columnwise_scale_inv_offsets,
+            requires_grad=requires_grad,
+            with_gemm_swizzled_scales=with_gemm_swizzled_scales,
+        )
+        self.kwargs["row_scaled_nvfp4"] = row_scaled_nvfp4
+
+
+def _grouped_tensor_metadata(grouped_cls):
+    return {
+        "cls": grouped_cls,
+        "shape": (2, 3),
+        "logical_shape": (2, 3),
+        "dtype": torch.float32,
+        "num_tensors": 2,
+        "shapes": [(1, 3), (1, 3)],
+        "quantizer": None,
+        "columnwise_data": None,
+        "scale_inv": None,
+        "columnwise_scale_inv": None,
+        "amax": None,
+        "columnwise_amax": None,
+        "scale": None,
+        "first_dims": None,
+        "last_dims": None,
+        "tensor_offsets": None,
+        "offsets": None,
+        "scale_inv_offsets": None,
+        "columnwise_scale_inv_offsets": None,
+        "with_gemm_swizzled_scales": False,
+        "row_scaled_nvfp4": True,
+        "requires_grad": True,
+        "nvfp4_use_4over6": True,
+        "nvfp4_e4m3_max": 448,
+    }
+
+
+def _restore_fake_grouped_tensor(grouped_cls):
+    rowwise_data = torch.arange(6, dtype=torch.float32).view(2, 3)
+    paged_tensor = PagedTensor(
+        rowwise_data,
+        num_tokens_tensor=torch.tensor([2], dtype=torch.int64),
+        max_num_tokens=2,
+        hidden_size=3,
+        tensor_attrs={"grouped_tensor_scale_inv": False},
+        grouped_tensor_metadata=_grouped_tensor_metadata(grouped_cls),
+    )
+    return paged_tensor.restore_grouped_tensor()
+
+
+def test_grouped_tensor_restore_skips_row_scaled_nvfp4_for_legacy_signature():
+    """Older TE GroupedTensor constructors should not receive newer NVFP4 kwargs."""
+    restored = _restore_fake_grouped_tensor(_LegacyGroupedTensor)
+
+    assert restored.kwargs["requires_grad"] is True
+    assert "row_scaled_nvfp4" not in restored.kwargs
+    assert "nvfp4_use_4over6" not in restored.kwargs
+    assert "nvfp4_e4m3_max" not in restored.kwargs
+    assert restored.grouped_tensor_scale_inv is False
+
+
+def test_grouped_tensor_restore_passes_row_scaled_nvfp4_when_signature_supports_it():
+    """Newer TE GroupedTensor constructors should keep row-scaled NVFP4 metadata."""
+    restored = _restore_fake_grouped_tensor(_RowScaledGroupedTensor)
+
+    assert restored.kwargs["requires_grad"] is True
+    assert restored.kwargs["row_scaled_nvfp4"] is True
+    assert "nvfp4_use_4over6" not in restored.kwargs
+    assert "nvfp4_e4m3_max" not in restored.kwargs
+    assert restored.grouped_tensor_scale_inv is False
 
 
 @pytest.mark.skipif(not _is_mxfp8_supported(), reason=_MXFP8_SKIP_REASON)
