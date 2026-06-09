@@ -15,7 +15,12 @@ from megatron.training.argument_utils import (
     TypeInferenceError,
     pretrain_cfg_container_from_args,
 )
-from megatron.training.config import PretrainConfigContainer
+from megatron.training.config import (
+    OptimizerConfigOverrideProvider,
+    OptimizerConfigOverrideProviderContext,
+    PretrainConfigContainer,
+    SchedulerConfig,
+)
 
 
 @dataclass
@@ -703,12 +708,79 @@ def patch_training_helpers(mock_optimizer_config, mock_ddp_config):
         yield
 
 
+class TestOptimizerConfigOverrideProvider:
+    """Tests for optimizer config override provider behavior."""
+
+    def _param(self, shape, **attrs):
+        param = type("Param", (), {})()
+        param.shape = shape
+        for key, value in attrs.items():
+            setattr(param, key, value)
+        return param
+
+    def _matching_overrides(self, overrides, param, name):
+        return [override for key, override in overrides.items() if key.matches(param, name)]
+
+    def test_default_provider_uses_standard_matchers(self):
+        provider = OptimizerConfigOverrideProvider()
+        optimizer_config = OptimizerConfig(
+            optimizer="adam", lr=1e-3, decoupled_lr=2e-4, decoupled_min_lr=2e-5
+        )
+        context = OptimizerConfigOverrideProviderContext(
+            scheduler_config=SchedulerConfig(), optimizer_config=optimizer_config, model=MagicMock()
+        )
+
+        overrides = provider.build_config_overrides(context)
+
+        bias_param = self._param((8, 8))
+        bias_overrides = self._matching_overrides(
+            overrides, bias_param, "decoder.layers.0.mlp.bias"
+        )
+        assert any(override.get("wd_mult") == 0.0 for override in bias_overrides)
+
+        output_param = self._param((8, 8), is_embedding_or_output_parameter=True)
+        output_overrides = self._matching_overrides(
+            overrides, output_param, "decoder.output_layer.weight"
+        )
+        assert any(
+            override.get("max_lr") == 2e-4 and override.get("min_lr") == 2e-5
+            for override in output_overrides
+        )
+
+    def test_qwen3_next_condition_applies_weight_decay_to_qk_layernorm(self):
+        provider = OptimizerConfigOverrideProvider()
+        context = OptimizerConfigOverrideProviderContext(
+            scheduler_config=SchedulerConfig(no_weight_decay_cond_type="qwen3_next"),
+            optimizer_config=OptimizerConfig(optimizer="adam", lr=1e-3),
+            model=MagicMock(),
+        )
+
+        overrides = provider.build_config_overrides(context)
+
+        def has_no_wd(param, name):
+            return any(
+                override.get("wd_mult") == 0.0
+                for override in self._matching_overrides(overrides, param, name)
+            )
+
+        layernorm_param = self._param((8,))
+        q_layernorm_param = self._param((8,))
+
+        assert has_no_wd(layernorm_param, "decoder.layers.0.input_layernorm.weight")
+        assert not has_no_wd(
+            q_layernorm_param, "decoder.layers.0.self_attention.q_layernorm.weight"
+        )
+
+
 class TestPretrainContainerFromArgsStructure:
     """Test the top-level structure of the object returned by pretrain_cfg_container_from_args."""
 
     def test_returns_pretrain_config_container(self, patch_training_helpers):
         result = pretrain_cfg_container_from_args(_make_args())
         assert isinstance(result, PretrainConfigContainer)
+        assert isinstance(
+            result.optimizer_config_override_provider, OptimizerConfigOverrideProvider
+        )
 
     @patch("megatron.training.training.get_megatron_ddp_config")
     @patch("megatron.training.training.get_megatron_optimizer_config")

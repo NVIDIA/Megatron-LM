@@ -1,8 +1,14 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 import signal
-from dataclasses import dataclass, field
-from typing import List, Literal, Optional
+from dataclasses import dataclass, field, replace
+from typing import Any, List, Literal, Optional
 
+from megatron.core.optimizer import (
+    OptimizerConfig,
+    ParamGroupOverride,
+    ParamKey,
+    get_standard_config_overrides,
+)
 
 
 @dataclass(kw_only=True)
@@ -232,13 +238,59 @@ class SchedulerConfig:
     """Type of no weight decay condition. Choices:
     None (default): param no weight decay if and only if it is 1D; or it is bias;
     or it is embedding and embedding_init_method_std is not None.
-    "qwen3_next": In addition to the default rules, apply weight decay to qk layernorm as a special case."""
+    "qwen3_next": In addition to the default rules, apply weight decay to qk
+    layernorm as a special case.
+    Equivalent to setting OptimizerConfig.apply_wd_to_qk_layernorm=True."""
 
     wd_incr_steps: int | None = field(init=False, default=None)
     """Number of samples to increment weight decay over. Calculated at runtime."""
 
     wsd_decay_steps: int | None = field(init=False, default=None)
     """Number of samples to decay WSD weight decay. Calculated at runtime."""
+
+
+@dataclass(frozen=True)
+class OptimizerConfigOverrideProviderContext:
+    """Context passed to an optimizer config override provider."""
+
+    scheduler_config: SchedulerConfig
+    optimizer_config: OptimizerConfig
+    model: Any
+
+
+@dataclass
+class OptimizerConfigOverrideProvider:
+    """Build optimizer parameter-group overrides for training.
+
+    The default implementation delegates to MCore's ParamKey matcher based standard
+    overrides. This keeps the provider extensible while avoiding eager parameter-name
+    enumeration in training config code.
+    """
+
+    def build_config_overrides(
+        self, context: OptimizerConfigOverrideProviderContext
+    ) -> dict[ParamKey, ParamGroupOverride] | None:
+        """Build optimizer parameter-group overrides.
+
+        Args:
+            context: Scheduler, optimizer, and model context for override construction.
+
+        Returns:
+            Mapping from ``ParamKey`` matchers to per-group optimizer overrides, or ``None``
+            if no overrides are needed.
+        """
+        optimizer_config = context.optimizer_config
+        no_weight_decay_cond_type = context.scheduler_config.no_weight_decay_cond_type
+
+        if no_weight_decay_cond_type is not None:
+            if no_weight_decay_cond_type != "qwen3_next":
+                raise ValueError(
+                    f"Invalid no_weight_decay_cond_type: {no_weight_decay_cond_type}"
+                )
+            optimizer_config = replace(optimizer_config, apply_wd_to_qk_layernorm=True)
+
+        config_overrides = get_standard_config_overrides(config=optimizer_config)
+        return config_overrides if config_overrides else None
 
 
 @dataclass(kw_only=True)
