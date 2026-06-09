@@ -19,7 +19,13 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 import requests
-from github_slack_utils import SlackApiError, get_slack_client, get_slack_user_id, get_user_email
+from github_slack_utils import (
+    SlackApiError,
+    get_slack_client,
+    get_slack_error,
+    get_slack_user_id,
+    get_user_email,
+)
 
 # Constants
 GITHUB_API_URL = "https://api.github.com"
@@ -30,6 +36,7 @@ SLACK_USERGROUP_HANDLE = "mcore-oncall"
 COMMUNITY_REQUEST_LABEL = "community-request"
 SERVICE_ACCOUNT_USERNAME = "svcnvidia-nemo-ci"
 TARGET_WEEKS = 12
+SLACK_ROTATION_FALLBACK_EMAILS = ["ppetrakian@nvidia.com"]
 
 
 def get_headers():
@@ -98,8 +105,96 @@ def get_slack_usergroup_id(slack_client, handle):
         print(f"Warning: Slack usergroup '{handle}' not found")
         return None, []
     except SlackApiError as e:
-        print(f"Warning: Could not list Slack usergroups: {e.response['error']}")
+        print(f"Warning: Could not list Slack usergroups: {get_slack_error(e)}")
         return None, []
+
+
+def get_slack_rotation_fallback_emails():
+    emails = os.environ.get("ONCALL_SLACK_NOTIFY_EMAILS", "")
+    if emails:
+        parsed_emails = [email.strip() for email in emails.split(",") if email.strip()]
+        if parsed_emails:
+            return parsed_emails
+    return SLACK_ROTATION_FALLBACK_EMAILS
+
+
+def get_github_actions_run_url():
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    run_id = os.environ.get("GITHUB_RUN_ID")
+    if not repo or not run_id:
+        return None
+
+    server_url = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+    return f"{server_url}/{repo}/actions/runs/{run_id}"
+
+
+def get_slack_user_ids_for_emails(slack_client, emails):
+    slack_user_ids = []
+    seen = set()
+    for email in emails:
+        slack_id = get_slack_user_id(slack_client, email)
+        if slack_id and slack_id not in seen:
+            slack_user_ids.append(slack_id)
+            seen.add(slack_id)
+    return slack_user_ids
+
+
+def get_slack_user_ids_for_usernames(slack_client, usernames):
+    emails = [get_user_email(username) for username in usernames]
+    return get_slack_user_ids_for_emails(slack_client, emails)
+
+
+def get_slack_rotation_notification_recipients(slack_client, old_members_usernames):
+    previous_oncall_recipients = get_slack_user_ids_for_usernames(
+        slack_client, old_members_usernames
+    )
+    if previous_oncall_recipients:
+        return previous_oncall_recipients, "previous oncall"
+
+    fallback_emails = get_slack_rotation_fallback_emails()
+    fallback_recipients = get_slack_user_ids_for_emails(slack_client, fallback_emails)
+    return fallback_recipients, "fallback contacts"
+
+
+def send_slack_rotation_failure_notification(
+    slack_client, reason, new_oncall_username, new_oncall_email, old_members_usernames
+):
+    recipients, recipient_source = get_slack_rotation_notification_recipients(
+        slack_client, old_members_usernames
+    )
+
+    run_url = get_github_actions_run_url()
+    message_lines = [
+        "MCore on-call Slack rotation needs manual attention.",
+        f"Reason: {reason}",
+        f"Target GitHub oncall: {new_oncall_username}",
+        f"Email tried for Slack lookup: {new_oncall_email}",
+        f"Slack usergroup not updated: @{SLACK_USERGROUP_HANDLE}",
+        "Please update the Slack usergroup manually or fix the GitHub-to-Slack email mapping.",
+    ]
+    if run_url:
+        message_lines.append(f"Workflow run: {run_url}")
+    message = "\n".join(message_lines)
+
+    if not recipients:
+        print("Warning: Could not resolve Slack notification recipients for rotation failure")
+        print(message)
+        return False
+
+    sent = False
+    for recipient in recipients:
+        try:
+            slack_client.chat_postMessage(channel=recipient, text=message)
+            print(f"Sent Slack rotation failure notification to {recipient} ({recipient_source})")
+            sent = True
+        except SlackApiError as e:
+            print(
+                f"Warning: Could not send Slack rotation failure notification to {recipient}: {get_slack_error(e)}"
+            )
+
+    if not sent:
+        print("Warning: Failed to send Slack rotation failure notification")
+    return sent
 
 
 def update_slack_usergroup(new_oncall_username, old_members_usernames):
@@ -117,8 +212,10 @@ def update_slack_usergroup(new_oncall_username, old_members_usernames):
     new_slack_id = get_slack_user_id(slack_client, new_email)
 
     if not new_slack_id:
-        print(
-            f"Could not find Slack user ID for {new_oncall_username} ({new_email}), skipping Slack update"
+        reason = f"Could not find Slack user ID for {new_oncall_username} ({new_email})"
+        print(f"{reason}, skipping Slack update")
+        send_slack_rotation_failure_notification(
+            slack_client, reason, new_oncall_username, new_email, old_members_usernames
         )
         return
 
@@ -128,14 +225,18 @@ def update_slack_usergroup(new_oncall_username, old_members_usernames):
     )
 
     if not usergroup_id:
-        print(f"Could not find Slack usergroup '{SLACK_USERGROUP_HANDLE}', skipping Slack update")
+        reason = f"Could not find Slack usergroup '{SLACK_USERGROUP_HANDLE}'"
+        print(f"{reason}, skipping Slack update")
+        send_slack_rotation_failure_notification(
+            slack_client, reason, new_oncall_username, new_email, old_members_usernames
+        )
         return
 
     try:
         # Step 1: Add new oncall first (include current members to avoid removing anyone yet)
         # This ensures usergroup always has at least one member
         if new_slack_id not in current_slack_members:
-            updated_members = list(set(current_slack_members + [new_slack_id]))
+            updated_members = current_slack_members + [new_slack_id]
             slack_client.usergroups_users_update(usergroup=usergroup_id, users=updated_members)
             print(f"Added {new_oncall_username} to Slack usergroup '{SLACK_USERGROUP_HANDLE}'")
 
@@ -146,7 +247,15 @@ def update_slack_usergroup(new_oncall_username, old_members_usernames):
         )
 
     except SlackApiError as e:
-        print(f"Failed to update Slack usergroup: {e.response['error']}")
+        error = get_slack_error(e)
+        print(f"Failed to update Slack usergroup: {error}")
+        send_slack_rotation_failure_notification(
+            slack_client,
+            f"Failed to update Slack usergroup: {error}",
+            new_oncall_username,
+            new_email,
+            old_members_usernames,
+        )
 
 
 def load_schedule():

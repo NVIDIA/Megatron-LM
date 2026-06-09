@@ -41,8 +41,10 @@ jobs:
         env:
           # Token to read org team members. Needs read:org scope.
           GH_TOKEN: ${{ secrets.NVIDIA_MCORE_ONCALL_TOKEN || secrets.PAT || secrets.GITHUB_TOKEN }}
-          # Slack token for updating the Slack usergroup
+          # Slack token for updating the Slack usergroup and sending failure notifications.
           SLACK_TOKEN: ${{ secrets.ONCALL_SLACK_TOKEN }}
+          # Optional comma-separated fallback emails for Slack rotation failure notifications.
+          ONCALL_SLACK_NOTIFY_EMAILS: ${{ vars.ONCALL_SLACK_NOTIFY_EMAILS }}
         run: |
           pip install --no-cache-dir "uv<0.9.29"
           uv venv .venv

@@ -132,6 +132,23 @@ def get_slack_client(require_slack: bool = False):
     return WebClient(token=slack_token)
 
 
+def get_slack_error(error) -> str:
+    """Return the Slack API error code from a SlackApiError, or the exception text.
+
+    Slack errors carry their code in ``error.response["error"]``; anything else
+    (a missing or malformed response) falls back to ``str(error)`` so a lookup
+    failure never raises a second error while being reported.
+    """
+
+    response = getattr(error, "response", None)
+    if response is not None:
+        try:
+            return response["error"]
+        except (KeyError, TypeError):
+            pass
+    return str(error)
+
+
 def get_slack_user_id(slack_client, email: str) -> str | None:
     """Resolve an email address to a Slack user ID."""
 
@@ -147,6 +164,6 @@ def get_slack_user_id(slack_client, email: str) -> str | None:
         _slack_id_cache[email] = user_id
         return user_id
     except SlackApiError as exc:
-        print(f"Warning: Could not find Slack user for {email}: {exc.response['error']}")
+        print(f"Warning: Could not find Slack user for {email}: {get_slack_error(exc)}")
         _slack_id_cache[email] = None
         return None
