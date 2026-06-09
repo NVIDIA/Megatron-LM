@@ -1524,3 +1524,106 @@ class TestFsdpMambaConvParamGather:
 
         # Surface any deferred CUDA errors before teardown.
         torch.cuda.synchronize()
+
+
+class TestFsdpHybridModelDoubleBuffer:
+    """Smoke test for fsdp_double_buffer with attention and Mamba FSDP units."""
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel()
+
+    @classmethod
+    def teardown_class(cls):
+        Utils.destroy_model_parallel()
+
+    def test_train_steps_with_double_buffer(self):
+        if not is_torch_min_version("2.4.0"):
+            pytest.skip("Megatron FSDP requires torch >= 2.4.0")
+        if Utils.world_size != 2:
+            pytest.skip("Requires exactly 2 GPUs (DP=2).")
+        pytest.importorskip("mamba_ssm")
+        pytest.importorskip("causal_conv1d")
+        pytest.importorskip("einops")
+
+        # MambaMixer's __init__ reads the 'model-parallel-rng' tracker.
+        model_parallel_cuda_manual_seed(0)
+
+        # HIDDEN=256 is the floor: d_inner = 2 * HIDDEN, nheads = d_inner / 64,
+        # and nheads must be divisible by the default mamba_num_groups=8.
+        HIDDEN = 256
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=HIDDEN,
+            num_attention_heads=4,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            normalization="RMSNorm",
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+
+        class HybridStack(torch.nn.Module):
+            def __init__(self, config, pg_collection):
+                super().__init__()
+                self.attn_layer = TransformerLayer(
+                    config=config,
+                    submodules=hybrid_stack_spec.submodules.attention_layer.submodules,
+                    layer_number=1,
+                    pg_collection=pg_collection,
+                    add_layer_offset=False,
+                )
+                self.mamba_layer = MambaLayer(
+                    config=config,
+                    submodules=hybrid_stack_spec.submodules.mamba_layer.submodules,
+                    layer_number=2,
+                    pg_collection=pg_collection,
+                )
+
+            def forward(self, hidden_states):
+                h, _ = self.attn_layer(hidden_states=hidden_states, attention_mask=None)
+                return self.mamba_layer(hidden_states=h)
+
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
+        model = HybridStack(config, pg_collection).cuda().to(torch.bfloat16)
+
+        fsdp_model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                data_parallel_sharding_strategy="optim_grads_params",
+                overlap_grad_reduce=True,
+                overlap_param_gather=True,
+                bucket_size=4096,
+                use_megatron_fsdp=True,
+                fsdp_double_buffer=True,
+            ),
+            module=model,
+            fsdp_unit_modules=[TransformerLayer, MambaLayer],
+        )
+
+        optimizer = DistributedOptimizer(
+            optimizer=None,
+            config=OptimizerConfig(optimizer="adam", lr=1e-3),
+            grad_scaler=None,
+            init_state_fn=None,
+            model_chunks=[fsdp_model],
+            per_model_buffers={0: [fsdp_model.param_and_grad_buffer]},
+            data_parallel_group=fsdp_model.megatron_fsdp_dist_index.get_dp_group(),
+            data_parallel_group_gloo=None,
+            data_parallel_group_idx=0,
+            distributed_optimizer_instance_id=0,
+        )
+
+        NUM_MICROBATCHES = 4
+        for _ in range(5):
+            optimizer.zero_grad()
+            for microbatch_idx in range(NUM_MICROBATCHES):
+                fsdp_model.is_last_microbatch = microbatch_idx == NUM_MICROBATCHES - 1
+                x = torch.randn(64, 2, HIDDEN, device="cuda", dtype=torch.bfloat16)
+                out = fsdp_model(x)
+                loss = out.sum()
+                loss.backward()
+            finalize_model_grads([fsdp_model])
+            optimizer.step()
+
+        torch.cuda.synchronize()
