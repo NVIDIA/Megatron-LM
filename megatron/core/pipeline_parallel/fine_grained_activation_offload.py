@@ -852,8 +852,9 @@ class ChunkOffloadHandler:
         assert name is not None, "Name is required"
         return self.find_group_with_name(name, self._offloaded_group_index)
 
-    def tensor_push(self, tensor):
-        """Push tensor to the offload handler."""
+    @staticmethod
+    def _can_manage_tensor_for_offload(tensor):
+        """Return whether the tensor can be managed by activation offload hooks."""
         torch_stray_tensor = isinstance(
             tensor,
             (
@@ -861,7 +862,16 @@ class ChunkOffloadHandler:
                 torch._subclasses.functional_tensor.FunctionalTensor,
             ),
         )
-        assert not torch_stray_tensor, "Stray tensor should not be offloaded"
+        return (
+            not isinstance(tensor, torch.nn.Parameter)
+            and not torch_stray_tensor
+            and tensor.device.type == "cuda"
+        )
+
+    def tensor_push(self, tensor):
+        """Push tensor to the offload handler."""
+        if not self._can_manage_tensor_for_offload(tensor):
+            return tensor
 
         # Assign unique tag based on group index and position within group
         tensor_tag = (self._offloaded_group_index, self._tensor_count_current_group)
@@ -872,6 +882,9 @@ class ChunkOffloadHandler:
 
     def tensor_pop(self, tensor_tag):
         """Pop tensor from the offload handler."""
+        if isinstance(tensor_tag, torch.Tensor):
+            debug_rank(f"--------tensor_pop passthrough tensor {tensor_tag.shape}")
+            return tensor_tag
         debug_rank(f"--------tensor_pop {tensor_tag}")
         group_id, idx = tensor_tag
         tensor = self.offload_groups[group_id - 1].pop_tensor(tensor_tag)
@@ -886,6 +899,8 @@ class ChunkOffloadHandler:
         debug_rank(
             f"tensor_need_offloading_checker {getattr(tensor, 'offloading_activation', None)}"
         )
+        if not self._can_manage_tensor_for_offload(tensor):
+            return False
         if getattr(tensor, "_TE_do_not_offload", False):
             return False
         if tensor.numel() < self.min_offloaded_tensor_size:
