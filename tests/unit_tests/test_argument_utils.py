@@ -771,6 +771,20 @@ class TestOptimizerConfigOverrideProvider:
             q_layernorm_param, "decoder.layers.0.self_attention.q_layernorm.weight"
         )
 
+    def test_invalid_no_weight_decay_cond_type_error_points_to_provider_override(self):
+        provider = OptimizerConfigOverrideProvider()
+        context = OptimizerConfigOverrideProviderContext(
+            scheduler_config=SchedulerConfig(no_weight_decay_cond_type="custom"),
+            optimizer_config=OptimizerConfig(optimizer="adam", lr=1e-3),
+            model=MagicMock(),
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="scheduler_config.no_weight_decay_cond_type.*OptimizerConfigOverrideProvider",
+        ):
+            provider.build_config_overrides(context)
+
 
 class TestPretrainContainerFromArgsStructure:
     """Test the top-level structure of the object returned by pretrain_cfg_container_from_args."""

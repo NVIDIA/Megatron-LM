@@ -1937,7 +1937,8 @@ def setup_model_and_optimizer(
     model_provider_func,
     model_type,
     checkpointing_context=None,
-    cfg_container: PretrainConfigContainer | None = None,
+    *,
+    cfg_container: PretrainConfigContainer,
 ):
     """Setup model and optimizer."""
     args = get_args()
@@ -1960,17 +1961,14 @@ def setup_model_and_optimizer(
         if args.perform_rl_step:
             update_train_iters(args)
     else:
-        if cfg_container is None:
-            config, config_overrides = get_megatron_optimizer_config(args)
-        else:
-            config = cfg_container.optimizer
-            config_overrides = cfg_container.optimizer_config_override_provider.build_config_overrides(
-                OptimizerConfigOverrideProviderContext(
-                    scheduler_config=cfg_container.scheduler,
-                    optimizer_config=config,
-                    model=model,
-                )
+        config = cfg_container.optimizer
+        config_overrides = cfg_container.optimizer_config_override_provider.build_config_overrides(
+            OptimizerConfigOverrideProviderContext(
+                scheduler_config=cfg_container.scheduler,
+                optimizer_config=config,
+                model=model,
             )
+        )
         config.timers = timers
         if getattr(args, "use_mup", False):
             model_config_source = (

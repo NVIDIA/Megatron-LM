@@ -633,7 +633,9 @@ class TestMultiTokenPrediction:
         batch = self.get_batch(self.seq_length, self.micro_batch_size)
         tokens, labels, loss_mask, attention_mask, position_ids = batch.values()
         gpt_model_ref, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            self.model_provider, ModelType.encoder_or_decoder
+            self.model_provider,
+            ModelType.encoder_or_decoder,
+            cfg_container=Utils.pretrain_config_from_global_args(),
         )
         output_ref = gpt_model_ref[0].forward(
             input_ids=tokens,
@@ -680,7 +682,9 @@ class TestMultiTokenPrediction:
             torch.manual_seed(_SEED)
             Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
             gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-                self.model_provider, ModelType.encoder_or_decoder
+                self.model_provider,
+                ModelType.encoder_or_decoder,
+                cfg_container=Utils.pretrain_config_from_global_args(),
             )
             load_checkpoint(gpt_model, optimizer, opt_param_scheduler, strict=False)
             batch["output_ref"] = output_ref
@@ -740,7 +744,9 @@ class TestMultiTokenPrediction:
         batch = self.get_batch(self.seq_length, self.micro_batch_size)
         tokens, labels, loss_mask, attention_mask, position_ids = batch.values()
         gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            self.model_provider, ModelType.encoder_or_decoder
+            self.model_provider,
+            ModelType.encoder_or_decoder,
+            cfg_container=Utils.pretrain_config_from_global_args(),
         )
 
         output = gpt_model[0].forward(
@@ -784,7 +790,9 @@ class TestMultiTokenPrediction:
 
         # Create model
         gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            self.model_provider, ModelType.encoder_or_decoder
+            self.model_provider,
+            ModelType.encoder_or_decoder,
+            cfg_container=Utils.pretrain_config_from_global_args(),
         )
 
         # Forward pass with packed sequences
@@ -845,7 +853,9 @@ class TestMultiTokenPrediction:
 
         batch = self.get_packed_batch(seq_lengths, micro_batch_size=1)
         gpt_model, _, _ = setup_model_and_optimizer(
-            self.model_provider, ModelType.encoder_or_decoder
+            self.model_provider,
+            ModelType.encoder_or_decoder,
+            cfg_container=Utils.pretrain_config_from_global_args(),
         )
 
         output = gpt_model[0].forward(
@@ -1378,7 +1388,9 @@ class TestMultiTokenPredictionHybrid:
         tokens, labels, loss_mask, attention_mask, position_ids = batch.values()
 
         mamba_model_ref, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            self.model_provider, ModelType.encoder_or_decoder
+            self.model_provider,
+            ModelType.encoder_or_decoder,
+            cfg_container=Utils.pretrain_config_from_global_args(),
         )
 
         output_ref = mamba_model_ref[0].forward(
@@ -1421,7 +1433,9 @@ class TestMultiTokenPredictionHybrid:
             torch.manual_seed(_SEED)
             Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
             mamba_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-                self.model_provider, ModelType.encoder_or_decoder
+                self.model_provider,
+                ModelType.encoder_or_decoder,
+                cfg_container=Utils.pretrain_config_from_global_args(),
             )
             load_checkpoint(mamba_model, optimizer, opt_param_scheduler, strict=False)
 

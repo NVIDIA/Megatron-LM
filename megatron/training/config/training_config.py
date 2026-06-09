@@ -285,7 +285,10 @@ class OptimizerConfigOverrideProvider:
         if no_weight_decay_cond_type is not None:
             if no_weight_decay_cond_type != "qwen3_next":
                 raise ValueError(
-                    f"Invalid no_weight_decay_cond_type: {no_weight_decay_cond_type}"
+                    "Currently only None or `qwen3_next` is supported for "
+                    "scheduler_config.no_weight_decay_cond_type, unless you override "
+                    "OptimizerConfigOverrideProvider. "
+                    f"Got: {no_weight_decay_cond_type}"
                 )
             optimizer_config = replace(optimizer_config, apply_wd_to_qk_layernorm=True)
 

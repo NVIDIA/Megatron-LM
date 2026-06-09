@@ -184,7 +184,9 @@ class TestGPTModel:
         )
 
         dense_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            model_provider, ModelType.encoder_or_decoder
+            model_provider,
+            ModelType.encoder_or_decoder,
+            cfg_container=Utils.pretrain_config_from_global_args(),
         )
         data = list(range(args.seq_length))
         input_ids = torch.tensor(data, dtype=torch.int64).repeat((args.micro_batch_size, 1)).cuda()
@@ -255,7 +257,9 @@ class TestGPTModel:
         )
 
         dense_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            model_provider, ModelType.encoder_or_decoder
+            model_provider,
+            ModelType.encoder_or_decoder,
+            cfg_container=Utils.pretrain_config_from_global_args(),
         )
         data = list(range(args.seq_length))
         input_ids = torch.tensor(data, dtype=torch.int64).repeat((args.micro_batch_size, 1)).cuda()

@@ -135,6 +135,17 @@ class Utils:
         Utils.inited = True
 
     @staticmethod
+    def pretrain_config_from_global_args():
+        import warnings
+
+        from megatron.training.argument_utils import pretrain_cfg_container_from_args
+        from megatron.training.global_vars import get_args
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*It is recommended to use a ModelConfig.*")
+            return pretrain_cfg_container_from_args(get_args())
+
+    @staticmethod
     def fake_initialize_model_parallel(
         tensor_model_parallel_size=1,
         pipeline_model_parallel_size=1,
