@@ -259,7 +259,9 @@ class DBuffer:
         """Create a DBuffer from an existing local buffer.
 
         Args:
-            local_buffer: Local tensor storage for this rank.
+            local_buffer: Contiguous local tensor storage for this rank. DBuffer
+                uses it directly in collectives such as all-gather and
+                reduce-scatter, which are efficient with contiguous tensors.
             mesh: Device mesh whose dimensions correspond to ``placements``.
             placements: Per-mesh-axis DBuffer placements.
             tensor_shapes: Global shapes for each logical tensor in this buffer.
@@ -275,6 +277,8 @@ class DBuffer:
         validate_placements(placements)
         if local_buffer.dim() != 1:
             raise ValueError("local_buffer must be a flat 1D tensor.")
+        if not local_buffer.is_contiguous():
+            raise ValueError("local_buffer must be contiguous for collective operations.")
 
         tensor_shapes = tuple(torch.Size(shape) for shape in tensor_shapes)
         layout = _compute_layout(tensor_shapes, dp_size=mesh.size())
@@ -563,6 +567,8 @@ class DBuffer:
 
         local_tensor = self.get_local_tensor(index)
         tensor_shape = self.layout.tensor_shapes[index]
+        # DBuffer uses contiguous flat storage, and Flat only shards dim 0, so
+        # the local view's stride matches the logical global tensor stride.
         return DTensor.from_local(
             local_tensor=local_tensor,
             device_mesh=self.mesh,
