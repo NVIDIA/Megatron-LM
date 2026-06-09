@@ -48,7 +48,10 @@ def setup() -> Iterator[DistributedSetup]:
     yield DistributedSetup(rank=rank, world_size=world_size, device=device)
 
     if dist.is_initialized():
-        dist.destroy_process_group()
+        dist.barrier()
+        # Leave the default process group alive for later distributed tests;
+        # only clear DeviceMesh bookkeeping from this module.
+        _clear_device_mesh_resources()
 
 
 def _same_tensors_on_all_ranks(device: torch.device) -> list[torch.Tensor]:
@@ -62,6 +65,21 @@ def _same_tensors_on_all_ranks(device: torch.device) -> list[torch.Tensor]:
 def _assert_dbuffer_local_tensors_close(buffer: DBuffer, expected: Iterable[torch.Tensor]) -> None:
     for index, tensor in enumerate(expected):
         torch.testing.assert_close(buffer.get_local_tensor(index), tensor)
+
+
+def _clear_device_mesh_resources() -> None:
+    from torch.distributed.device_mesh import _mesh_resources
+
+    for resource_name in (
+        "child_to_root_mapping",
+        "root_to_flatten_mapping",
+        "mesh_stack",
+        "mesh_dim_group_options",
+        "flatten_name_to_root_dims",
+    ):
+        resource = getattr(_mesh_resources, resource_name, None)
+        if resource is not None:
+            resource.clear()
 
 
 @pytest.mark.distributed
