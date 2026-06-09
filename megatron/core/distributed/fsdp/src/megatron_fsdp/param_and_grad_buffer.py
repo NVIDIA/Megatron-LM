@@ -724,7 +724,7 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
 
         # Fallback allocator used if the fixed pool allocator cannot fulfill a request.
         self.fallback_to_persistent_buffer = fallback_to_persistent_buffer
-        self.backup_allocator = TemporaryBucketAllocator()
+        self.backup_allocator = StorageResizeBasedBucketAllocator()
 
     def _is_two_bucket_group_equal(self, group_a, group_b):
         # Check if two bucket groups are equivalent in dtype and size.
