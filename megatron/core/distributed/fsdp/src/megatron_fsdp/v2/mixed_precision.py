@@ -591,9 +591,10 @@ class MixedPrecisionPolicy:
         main_params = []
         start_offsets = []
         model_param_shards = []
+        no_shard = model_weight_buffer.sharding_strategy == "no_shard"
         for param in params:
             item_id = param_idx[param]
-            model_shard = model_weight_buffer.get_item(item_id, as_shard=True)
+            model_shard = model_weight_buffer.get_item(item_id, as_shard=not no_shard)
             if model_shard.numel() == 0:
                 fp8_params.append(param)
                 main_params.append(None)
@@ -603,9 +604,14 @@ class MixedPrecisionPolicy:
 
             transpose_shard = None
             if transpose_weight_buffer is not None:
-                transpose_shard = transpose_weight_buffer.get_item(item_id, as_shard=True)
-            main_weight = main_weight_buffer.get_item(item_id, as_shard=True)
-            start_offset, _ = model_weight_buffer.buffer_index._get_item_self_range(item_id)
+                transpose_shard = transpose_weight_buffer.get_item(
+                    item_id, as_shard=not no_shard
+                )
+            main_weight = main_weight_buffer.get_item(item_id, as_shard=not no_shard)
+            if no_shard:
+                start_offset = 0
+            else:
+                start_offset, _ = model_weight_buffer.buffer_index._get_item_self_range(item_id)
             fp8_params.append(param)
             main_params.append(main_weight)
             start_offsets.append(start_offset)

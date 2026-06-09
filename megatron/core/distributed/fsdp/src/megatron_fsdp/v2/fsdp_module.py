@@ -590,11 +590,12 @@ class FSDPModule(nn.Module):
             if not isinstance(child, FSDPModule):
                 continue
             if any(
-                param_group.sharding_strategy == "optim"
+                param_group.sharding_strategy in ("no_shard", "optim")
                 for param_group in child._fsdp_param_groups
             ):
-                # ZeRO-1 keeps gradients replicated during backward and performs
-                # exactly one reduce-scatter at the iteration grad-sync boundary.
+                # no_shard and ZeRO-1 keep gradients replicated during backward.
+                # Sync them once at the iteration grad-sync boundary: no_shard
+                # all-reduces full grads, ZeRO-1 reduce-scatters virtual shards.
                 child.reduce_grad(async_op=False)
             for param_group in child._fsdp_param_groups:
                 for param, dist_grad in zip(param_group.params, param_group.dist_grads):
@@ -653,9 +654,11 @@ class FSDPModule(nn.Module):
         Compute per-parameter L2 norms for params and grads.
 
         Returns {param_name: {"param_norm": float, "grad_norm": float}}.
-        Local squared norms are all-reduced across the DP group.
+        Sharded DTensor squared norms are all-reduced across the DP group;
+        replicated no-shard norms are computed from the local full tensor.
         """
         results = {}
+        reduce_norms = {}
         dp_group = None
 
         for module_name, child in self.named_modules():
@@ -669,6 +672,7 @@ class FSDPModule(nn.Module):
                 ):
                     full_name = f"{module_name}.{param_name}" if module_name else param_name
                     results[full_name] = {"param_norm": 0.0, "grad_norm": 0.0}
+                    reduce_norms[full_name] = param_group.sharding_strategy != "no_shard"
                     if dist_param._local_tensor.numel() > 0:
                         results[full_name]["param_norm"] = (
                             dist_param._local_tensor.float().norm(p=2).item() ** 2
@@ -680,6 +684,10 @@ class FSDPModule(nn.Module):
 
         if dp_group is not None:
             for param_name in results:
+                if not reduce_norms[param_name]:
+                    for key in ("param_norm", "grad_norm"):
+                        results[param_name][key] = results[param_name][key] ** 0.5
+                    continue
                 for key in ("param_norm", "grad_norm"):
                     value = torch.tensor([results[param_name][key]], device="cuda")
                     torch.distributed.all_reduce(value, group=dp_group)
