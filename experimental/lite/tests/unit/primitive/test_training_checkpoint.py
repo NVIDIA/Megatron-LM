@@ -4,9 +4,13 @@ import copy
 from types import SimpleNamespace
 
 import torch
+from torch.distributed.tensor import Replicate, Shard
 
 from megatron.lite.primitive.ckpt import dcp
-from megatron.lite.primitive.ckpt.distckpt import attach_model_sharded_state_dict
+from megatron.lite.primitive.ckpt.distckpt import (
+    _rank_offsets_and_replica_id,
+    attach_model_sharded_state_dict,
+)
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.protocols import default_expert_classifier, default_placement_fn
 from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
@@ -118,6 +122,42 @@ def test_distopt_checkpoint_dispatches_to_mcore_distckpt(monkeypatch, tmp_path) 
     assert saved["kwargs"]["validate_access_integrity"] is False
     assert saved["kwargs"]["content_metadata"] == DISTOPT_METADATA
     assert not (tmp_path / "step_5" / "optimizer_rank_0.pt").exists()
+
+
+def test_distopt_checkpoint_offsets_cover_tp_pp_ep_etp_topology() -> None:
+    ps = ParallelState(
+        pp_size=2,
+        pp_rank=1,
+        tp_size=2,
+        tp_rank=1,
+        ep_size=2,
+        ep_rank=1,
+        etp_size=2,
+        etp_rank=1,
+        dp_size=2,
+        dp_rank=0,
+        cp_size=1,
+        cp_rank=0,
+        dp_cp_rank=0,
+        expert_dp_size=1,
+        expert_dp_rank=0,
+    )
+
+    dense_offsets, dense_replica = _rank_offsets_and_replica_id(
+        [Replicate(), Replicate(), Replicate(), Shard(0)],
+        ps,
+        expert=False,
+    )
+    expert_offsets, expert_replica = _rank_offsets_and_replica_id(
+        [Replicate(), Replicate(), Shard(0), Shard(0)],
+        ps,
+        expert=True,
+    )
+
+    assert dense_offsets == ((0, 1, 2),)
+    assert dense_replica == (1, 0, 0)
+    assert expert_offsets == ((0, 3, 4),)
+    assert expert_replica == (1, 0, 0)
 
 
 def test_distopt_checkpoint_loads_from_mcore_distckpt(monkeypatch, tmp_path) -> None:

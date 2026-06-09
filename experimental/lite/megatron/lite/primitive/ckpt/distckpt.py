@@ -204,13 +204,34 @@ def _rank_offsets_and_replica_id(
             prev_rank, prev_size = axis_fragments.get(dim, (0, 1))
             axis_fragments[dim] = (prev_rank * size + rank, prev_size * size)
     rank_offsets = tuple((dim, rank, size) for dim, (rank, size) in axis_fragments.items())
-    return rank_offsets, _replica_id(ps, expert=expert)
+    return rank_offsets, _replica_id(placements, ps, expert=expert)
 
 
-def _replica_id(ps: ParallelState, *, expert: bool) -> tuple[int, int, int]:
+def _replica_id(placements: list, ps: ParallelState, *, expert: bool) -> tuple[int, int, int]:
     if expert:
-        return (int(ps.pp_rank), int(ps.ep_rank), int(ps.expert_dp_rank))
-    return (int(ps.pp_rank), int(ps.tp_rank), int(ps.dp_cp_rank))
+        return (
+            _replica_axis_rank(placements, 0, ps.pp_rank),
+            _replica_axis_rank(placements, 2, ps.ep_rank),
+            _replica_axis_rank(placements, 1, ps.expert_dp_rank),
+        )
+    dp_cp_rank = (
+        0
+        if _placement_is_sharded(placements, 1) or _placement_is_sharded(placements, 2)
+        else ps.dp_cp_rank
+    )
+    return (
+        _replica_axis_rank(placements, 0, ps.pp_rank),
+        _replica_axis_rank(placements, 3, ps.tp_rank),
+        int(dp_cp_rank),
+    )
+
+
+def _replica_axis_rank(placements: list, axis: int, rank: int) -> int:
+    return 0 if _placement_is_sharded(placements, axis) else int(rank)
+
+
+def _placement_is_sharded(placements: list, axis: int) -> bool:
+    return axis < len(placements) and _is_shard_placement(placements[axis])
 
 
 def _mesh_ranks_and_sizes(ps: ParallelState, *, expert: bool) -> tuple[list[int], list[int]]:
