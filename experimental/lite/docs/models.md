@@ -17,15 +17,15 @@ Optional protocol symbols:
 
 ## Included Models
 
-`qwen3` maps to the Qwen3 MoE lite implementation:
+`qwen3_moe` is the canonical name for the Qwen3 MoE lite implementation:
 
 ```text
 megatron.lite.model.qwen3_moe.lite.protocol
 ```
 
-`qwen3_moe` is kept as a compatibility alias for the same implementation.
-Hugging Face `model_type` values `qwen3_moe` and `qwen2_moe` resolve to
-`qwen3`.
+`qwen3` is kept as a legacy compatibility alias for the same implementation. It
+does not mean dense Qwen3 support. Hugging Face `model_type` values `qwen3_moe`
+and `qwen2_moe` currently resolve through this compatibility path.
 
 `qwen3_5` maps to the Qwen3.5 MoE lite implementation:
 

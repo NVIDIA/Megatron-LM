@@ -40,6 +40,7 @@ The model protocol owns:
 ## Current Deliberate Omissions
 
 This package currently includes only the lite model implementation path. It
-intentionally excludes non-lite model/runtime implementations and benchmark
-entrypoints. FSDP2 is included as an optimizer primitive and can be selected by
-model protocols that support it.
+intentionally excludes non-lite and hybrid model implementation packages. The
+optional benchmark entrypoints under `examples/bench` are comparison tools and
+are not imported by the package runtime. FSDP2 is included as an optimizer
+primitive and can be selected by model protocols that support it.

@@ -17,15 +17,18 @@ lives under `experimental/lite/megatron/lite`, so users can add
 Keep the PR focused on the lite model implementation path:
 
 - Runtime backend: `mlite`.
-- Models: Qwen3 MoE and Qwen3.5 MoE.
+- Reference comparison backends: `mbridge` for the validated legacy
+  Megatron-Core/distopt path and `bridge` for real Megatron-Bridge environments.
+- Models: Qwen3 MoE and Qwen3.5 MoE. Dense Qwen3 is not included.
 - Model implementations: `lite` only.
 - Optimizer primitives: Megatron-Core optimizer wrapping and FSDP2.
+- Optional examples: benchmark and VERL launchers under `experimental/lite/examples`.
 
 Keep these out of the first PR unless the scope changes:
 
 - Hybrid model implementation packages.
-- Bridge model/runtime implementation packages.
-- Benchmark scripts and experiment-specific entrypoints.
+- Megatron-Bridge model implementation packages.
+- Undocumented experiment-specific entrypoints.
 
 ## Package Integration
 
