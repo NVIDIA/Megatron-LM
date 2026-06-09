@@ -110,13 +110,13 @@ def test_update_slack_usergroup_notifies_previous_oncall_when_new_oncall_lookup_
     assert client.messages[0]["channel"] == "UOLD"
     assert "new-oncall@users.noreply.github.com" in client.messages[0]["text"]
     assert "@mcore-oncall" in client.messages[0]["text"]
+    assert "left unchanged" in client.messages[0]["text"]
 
 
-def test_update_slack_usergroup_notifies_fallback_when_previous_oncall_lookup_fails(
+def test_update_slack_usergroup_does_not_notify_fallback_when_previous_oncall_lookup_fails(
     oncall_manager, monkeypatch
 ):
     client = FakeSlackClient(users_by_email={"fallback@nvidia.com": "UFALLBACK"})
-    monkeypatch.setenv("ONCALL_SLACK_NOTIFY_EMAILS", "fallback@nvidia.com")
     monkeypatch.setattr(oncall_manager, "get_slack_client", lambda: client)
     monkeypatch.setattr(
         oncall_manager,
@@ -130,9 +130,7 @@ def test_update_slack_usergroup_notifies_fallback_when_previous_oncall_lookup_fa
     oncall_manager.update_slack_usergroup("new-oncall", ["previous-oncall"])
 
     assert client.usergroup_updates == []
-    assert len(client.messages) == 1
-    assert client.messages[0]["channel"] == "UFALLBACK"
-    assert "new-oncall@users.noreply.github.com" in client.messages[0]["text"]
+    assert client.messages == []
 
 
 def test_update_slack_usergroup_updates_members_when_new_oncall_lookup_succeeds(

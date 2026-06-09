@@ -30,7 +30,6 @@ ACTIVE_ONCALL_TEAM_SLUG = "mcore-oncall"
 SLACK_USERGROUP_HANDLE = "mcore-oncall"
 COMMUNITY_REQUEST_LABEL = "community-request"
 TARGET_WEEKS = 12
-SLACK_ROTATION_FALLBACK_EMAILS = ["ppetrakian@nvidia.com"]
 
 # Caches for email and Slack lookups
 _email_cache = {}
@@ -206,15 +205,6 @@ def get_slack_usergroup_id(slack_client, handle):
         return None, []
 
 
-def get_slack_rotation_fallback_emails():
-    emails = os.environ.get("ONCALL_SLACK_NOTIFY_EMAILS", "")
-    if emails:
-        parsed_emails = [email.strip() for email in emails.split(",") if email.strip()]
-        if parsed_emails:
-            return parsed_emails
-    return SLACK_ROTATION_FALLBACK_EMAILS
-
-
 def get_github_actions_run_url():
     repo = os.environ.get("GITHUB_REPOSITORY")
     run_id = os.environ.get("GITHUB_RUN_ID")
@@ -241,24 +231,10 @@ def get_slack_user_ids_for_usernames(slack_client, usernames):
     return get_slack_user_ids_for_emails(slack_client, emails)
 
 
-def get_slack_rotation_notification_recipients(slack_client, old_members_usernames):
-    previous_oncall_recipients = get_slack_user_ids_for_usernames(
-        slack_client, old_members_usernames
-    )
-    if previous_oncall_recipients:
-        return previous_oncall_recipients, "previous oncall"
-
-    fallback_emails = get_slack_rotation_fallback_emails()
-    fallback_recipients = get_slack_user_ids_for_emails(slack_client, fallback_emails)
-    return fallback_recipients, "fallback contacts"
-
-
 def send_slack_rotation_failure_notification(
     slack_client, reason, new_oncall_username, new_oncall_email, old_members_usernames
 ):
-    recipients, recipient_source = get_slack_rotation_notification_recipients(
-        slack_client, old_members_usernames
-    )
+    recipients = get_slack_user_ids_for_usernames(slack_client, old_members_usernames)
 
     run_url = get_github_actions_run_url()
     message_lines = [
@@ -266,15 +242,17 @@ def send_slack_rotation_failure_notification(
         f"Reason: {reason}",
         f"Target GitHub oncall: {new_oncall_username}",
         f"Email tried for Slack lookup: {new_oncall_email}",
-        f"Slack usergroup not updated: @{SLACK_USERGROUP_HANDLE}",
-        "Please update the Slack usergroup manually or fix the GitHub-to-Slack email mapping.",
+        f"Slack usergroup left unchanged: @{SLACK_USERGROUP_HANDLE}",
+        f"You should still be in @{SLACK_USERGROUP_HANDLE}; please update the Slack usergroup manually or fix the GitHub-to-Slack email mapping.",
     ]
     if run_url:
         message_lines.append(f"Workflow run: {run_url}")
     message = "\n".join(message_lines)
 
     if not recipients:
-        print("Warning: Could not resolve Slack notification recipients for rotation failure")
+        print(
+            "Warning: Could not resolve previous oncall Slack user for rotation failure notification"
+        )
         print(message)
         return False
 
@@ -282,7 +260,7 @@ def send_slack_rotation_failure_notification(
     for recipient in recipients:
         try:
             slack_client.chat_postMessage(channel=recipient, text=message)
-            print(f"Sent Slack rotation failure notification to {recipient} ({recipient_source})")
+            print(f"Sent Slack rotation failure notification to previous oncall {recipient}")
             sent = True
         except SlackApiError as e:
             print(
