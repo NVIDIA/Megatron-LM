@@ -116,7 +116,8 @@ class HybridStack(MegatronModule):
         )
         self.layer_type_list = layer_type_list
 
-        submodules = self._maybe_fuse_mla_down_proj(submodules)
+        if getattr(self.config, "mla_down_proj_fusion", False):
+            submodules = self._fuse_mla_down_proj(submodules)
 
         # Build layers from the pre-selected segment
         self.layers = nn.ModuleList()
@@ -213,23 +214,22 @@ class HybridStack(MegatronModule):
                 eps=self.config.layernorm_epsilon,
             )
 
-    def _maybe_fuse_mla_down_proj(self, submodules: HybridStackSubmodules) -> HybridStackSubmodules:
-        if getattr(self.config, "mla_down_proj_fusion", False):
-            submodules = copy.deepcopy(submodules)
-            mla_spec = submodules.mla_layer
-            # We always fuse the input layernorm because Hybrid always uses TransformerEngine.
-            mla_spec.submodules.input_layernorm = IdentityOp
-            mla_spec.submodules.self_attention.module = FusedMLASelfAttention
-            mla_spec.submodules.self_attention.submodules.linear_qkv_down_proj = (
-                TELayerNormColumnParallelLinear
-            )
-            mla_spec.submodules.self_attention.submodules.linear_q_down_proj = None
-            mla_spec.submodules.self_attention.submodules.linear_kv_down_proj = None
-            mla_spec.submodules.sharded_state_dict_keys_map = {
-                "self_attention.linear_q_down_proj.layer_norm_": "input_layernorm.",
-                "self_attention.linear_kv_down_proj.layer_norm_": "input_layernorm.",
-                "self_attention.linear_qkv_down_proj.layer_norm_": "input_layernorm.",
-            }
+    def _fuse_mla_down_proj(self, submodules: HybridStackSubmodules) -> HybridStackSubmodules:
+        submodules = copy.deepcopy(submodules)
+        mla_spec = submodules.mla_layer
+        # We always fuse the input layernorm because Hybrid always uses TransformerEngine.
+        mla_spec.submodules.input_layernorm = IdentityOp
+        mla_spec.submodules.self_attention.module = FusedMLASelfAttention
+        mla_spec.submodules.self_attention.submodules.linear_qkv_down_proj = (
+            TELayerNormColumnParallelLinear
+        )
+        mla_spec.submodules.self_attention.submodules.linear_q_down_proj = None
+        mla_spec.submodules.self_attention.submodules.linear_kv_down_proj = None
+        mla_spec.submodules.sharded_state_dict_keys_map = {
+            "self_attention.linear_q_down_proj.layer_norm_": "input_layernorm.",
+            "self_attention.linear_kv_down_proj.layer_norm_": "input_layernorm.",
+            "self_attention.linear_qkv_down_proj.layer_norm_": "input_layernorm.",
+        }
         return submodules
 
     def set_input_tensor(self, input_tensor: Tensor):
