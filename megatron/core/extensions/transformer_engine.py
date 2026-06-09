@@ -2836,9 +2836,14 @@ def _install_te_checkpoint_fgao_resize_patch():
         _TE_CHECKPOINT_FGAO_RESIZE_PATCHED = True
         return
 
+    original_backward = checkpoint_cls.backward
+
     @staticmethod
     def backward(ctx, *args):
         """TE reentrant checkpoint backward with post-backward FGAO input resize."""
+        if not getattr(ctx.run_function, "_mcore_release_fgao_reloaded_inputs", False):
+            return original_backward(ctx, *args)
+
         if not torch.autograd._is_checkpoint_valid():
             raise RuntimeError(
                 "Checkpointing is not compatible with .grad(), please use .backward() if possible"
@@ -2912,13 +2917,20 @@ def _install_te_checkpoint_fgao_resize_patch():
         _resize_fgao_checkpoint_inputs(detached_inputs)
         return (None, None, None, None, None, None) + grads
 
+    checkpoint_cls._mcore_original_backward = original_backward
     checkpoint_cls.backward = backward
     checkpoint_cls._mcore_fgao_resize_patch = True
     _TE_CHECKPOINT_FGAO_RESIZE_PATCHED = True
 
 
 def te_checkpoint(
-    forward_func, distribute_saved_activations, get_rng_state_tracker, tp_group, *args, **kwargs
+    forward_func,
+    distribute_saved_activations,
+    get_rng_state_tracker,
+    tp_group,
+    *args,
+    release_fgao_reloaded_inputs=False,
+    **kwargs,
 ):
     """Checkpointing with Transformer-Engine."""
     if not HAVE_TE:
@@ -2930,7 +2942,16 @@ def te_checkpoint(
     from transformer_engine.pytorch.distributed import checkpoint
 
     if is_te_min_version("1.5.0"):
-        _install_te_checkpoint_fgao_resize_patch()
+        if release_fgao_reloaded_inputs:
+            _install_te_checkpoint_fgao_resize_patch()
+            original_forward_func = forward_func
+
+            def forward_func_with_fgao_release(*inner_args, **inner_kwargs):
+                return original_forward_func(*inner_args, **inner_kwargs)
+
+            forward_func_with_fgao_release._mcore_release_fgao_reloaded_inputs = True
+            forward_func = forward_func_with_fgao_release
+
         return checkpoint(
             forward_func,
             *args,

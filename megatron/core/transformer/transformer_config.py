@@ -1252,8 +1252,8 @@ class TransformerConfig(ModelParallelConfig):
     "mlp_norm": offload the input of the normalization in the mlp part.
     "expert_fc1": offload the input of the expert fc1 part.
     "moe_act": offload the input of the moe act part.
-    "layer_input": offload the input checkpoint saved by full recompute. With uniform full
-    recompute, this offloads one input per recompute_num_layers-layer segment.
+    "layer_input": offload the input checkpoint saved by uniform full recompute. This offloads
+    one input per recompute_num_layers-layer segment.
     """
     min_offloaded_tensor_size: int = 1024 * 1024
     """The minimum size of the tensor to be offloaded."""
@@ -1976,6 +1976,15 @@ class TransformerConfig(ModelParallelConfig):
                     "offload_modules includes 'layer_input', which only applies to "
                     "full activation recompute because it offloads the checkpoint input "
                     "saved for each full-recompute segment."
+                )
+            if (
+                "layer_input" in self.offload_modules
+                and self.recompute_method != "uniform"
+            ):
+                raise ValueError(
+                    "offload_modules includes 'layer_input', which currently requires "
+                    "uniform full activation recompute so it can offload one checkpoint "
+                    "input per recompute_num_layers-layer segment."
                 )
             if "attn_proj" in self.offload_modules and "core_attn" not in self.offload_modules:
                 raise ValueError(

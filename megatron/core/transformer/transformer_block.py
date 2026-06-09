@@ -539,7 +539,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
             return custom_forward
 
-        def checkpoint_handler(forward_func):
+        def checkpoint_handler(forward_func, release_fgao_reloaded_inputs=False):
             """Determines whether to use the `te_checkpoint` or `tensor_parallel.checkpoint`"""
             # TODO: check if fp4 is supported in this case
             if self.config.fp8 or self.config.fp4:
@@ -554,6 +554,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     context_mask,
                     rotary_pos_emb,
                     padding_mask,
+                    release_fgao_reloaded_inputs=release_fgao_reloaded_inputs,
                 )
             else:
                 return tensor_parallel.checkpoint(
@@ -578,26 +579,15 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     FineGrainedActivationOffloadingInterface as off_interface,
                 )
 
-                missing = object()
-                guarded_tensors = []
-                for tensor in (attention_mask, context, context_mask, rotary_pos_emb, padding_mask):
-                    if isinstance(tensor, torch.Tensor):
-                        guarded_tensors.append(
-                            (tensor, getattr(tensor, "_do_not_offload", missing))
-                        )
-                        tensor._do_not_offload = True
-                try:
-                    layer_input_offloader = off_interface(True, hidden_states, "layer_input")
-                    with layer_input_offloader as hidden_states_for_checkpoint:
-                        hidden_states = hidden_states_for_checkpoint
-                        hidden_states, context = checkpoint_handler(custom(start, end))
-                    hidden_states = layer_input_offloader.group_offload(hidden_states)
-                finally:
-                    for tensor, previous_value in guarded_tensors:
-                        if previous_value is missing:
-                            delattr(tensor, "_do_not_offload")
-                        else:
-                            tensor._do_not_offload = previous_value
+                layer_input_offloader = off_interface(
+                    True, hidden_states, "layer_input", max_offloaded_tensors=1
+                )
+                with layer_input_offloader as hidden_states_for_checkpoint:
+                    hidden_states = hidden_states_for_checkpoint
+                    hidden_states, context = checkpoint_handler(
+                        custom(start, end), release_fgao_reloaded_inputs=True
+                    )
+                hidden_states = layer_input_offloader.group_offload(hidden_states)
             else:
                 hidden_states, context = checkpoint_handler(custom(start, end))
 

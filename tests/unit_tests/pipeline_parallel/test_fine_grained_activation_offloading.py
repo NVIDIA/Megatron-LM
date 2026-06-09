@@ -428,6 +428,7 @@ def test_full_recompute_layer_input_offloading(recompute_num_layers: int):
             if group._name == "layer_input"
         ]
         assert len(layer_input_groups) == expected_groups
+        assert all(group.total_tensor_count == 1 for group in layer_input_groups)
         assert mgr.offload_summary_bytes.get("layer_input", 0) > 0
 
         _reset_cuda_memory()
@@ -451,6 +452,22 @@ def test_full_recompute_layer_input_offloading(recompute_num_layers: int):
             assert torch.allclose(go, gb, rtol=1e-3, atol=1e-3), f"Grad mismatch for {name}"
     finally:
         Utils.destroy_model_parallel()
+
+
+def test_layer_input_offloading_requires_uniform_full_recompute():
+    """layer_input offloading is limited to uniform full recompute."""
+    with pytest.raises(ValueError, match="uniform full activation recompute"):
+        TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            fine_grained_activation_offloading=True,
+            offload_modules=["layer_input"],
+            recompute_granularity="full",
+            recompute_method="block",
+            recompute_num_layers=1,
+            recompute_modules=[],
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
@@ -491,6 +508,7 @@ def test_te_checkpoint_resizes_fgao_reloaded_input(monkeypatch):
         None,
         None,
         x,
+        release_fgao_reloaded_inputs=True,
     )
     loss.backward()
     torch.cuda.synchronize()
