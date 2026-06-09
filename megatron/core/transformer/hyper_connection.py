@@ -15,8 +15,9 @@ from megatron.core.utils import nvtx_decorator
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import CheckpointManager
 
+
 # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
-@torch.compile(dynamic=True)  
+@torch.compile
 def _sinkhorn_iterations(input_logits: Tensor, num_iterations: int, eps: float) -> Tensor:
     row_max = input_logits.max(dim=-1, keepdim=True).values
     M = torch.exp(input_logits - row_max)
@@ -60,14 +61,14 @@ def native_sinkhorn(input_logits: Tensor, num_iterations: int, eps: float = 1e-6
 
 
 # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
-@torch.compile(dynamic=True)  
+@torch.compile
 def native_h_aggregate(x: Tensor, h_pre: Tensor) -> Tensor:
     """Native n-stream weighted aggregation: out = sum_j(h_pre_j * x_j)."""
     return (x * h_pre.unsqueeze(-1)).sum(dim=2)
 
 
 # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
-@torch.compile(dynamic=True)  
+@torch.compile
 def native_h_post_bda(
     h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
 ) -> Tensor:
@@ -84,7 +85,7 @@ def native_h_post_bda(
 
 
 # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
-@torch.compile(dynamic=True)  
+@torch.compile
 def native_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tuple[Tensor, Tensor]:
     """Native fused projection + RMS normalization."""
     proj = torch.matmul(x, weight.t())
@@ -96,7 +97,7 @@ def native_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tuple[Tenso
 
 
 # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
-@torch.compile(dynamic=True)  
+@torch.compile
 def learned_output_contract(
     hidden_states: Tensor, head_fn: Tensor, base: Tensor, scale: Tensor, n: int, eps: float
 ) -> Tensor:
@@ -216,7 +217,7 @@ class HyperConnectionModule(MegatronModule):
         return proj.view(s, b, -1), r.view(s, b, 1)
 
     # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
-    @torch.compile(dynamic=True)  
+    @torch.compile
     def _compute_h(self, proj: Tensor, r: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Compute h from projected hidden states and scaling factors.
@@ -274,7 +275,7 @@ class HyperConnectionModule(MegatronModule):
         return h_pre, h_post, h_res
 
     # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
-    @torch.compile(dynamic=True)  
+    @torch.compile
     def _apply_h_post(self, x: Tensor, h_post: Tensor) -> Tensor:
         """
         Core implementation of H_post application to a single tensor.
@@ -374,7 +375,7 @@ class HyperConnectionModule(MegatronModule):
         return self._h_aggregate_op(x_streams, h_pre)
 
     # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
-    @torch.compile(dynamic=True)  
+    @torch.compile
     def apply_h_res(self, h_res: Tensor, residual: Tensor) -> Tensor:
         """
         Apply H_res to residual using H_res weights.
