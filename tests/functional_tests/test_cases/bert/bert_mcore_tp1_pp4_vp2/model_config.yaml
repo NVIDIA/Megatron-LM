@@ -42,4 +42,9 @@ MODEL_ARGS:
   --bf16: true
   --ckpt-format: torch
   --attention-backend: unfused
+  # Interleaved/VPP schedule defaults to overlap_p2p_comm=True, which forces
+  # batch_p2p_comm=False and uses unbatched per-pair P2P that lazily creates
+  # 2-rank NCCL communicators -> intermittent lazy-comm-init deadlock (RECV hang).
+  # Use batched P2P here (pp=4 > 2 satisfies the interleaved+no-overlap assert).
+  --no-overlap-p2p-communication: true
 TEST_TYPE: regular
