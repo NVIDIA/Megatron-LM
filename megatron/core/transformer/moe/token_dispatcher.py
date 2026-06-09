@@ -12,6 +12,7 @@ from megatron.core.config import is_experimental_enabled
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
 from megatron.core.jit import jit_fuser
+from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.tensor_parallel import (
     all_to_all,
     gather_from_sequence_parallel_region,
@@ -20,6 +21,8 @@ from megatron.core.tensor_parallel import (
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.fused_a2a import (
     NcclEpContext,
+    NcclEpContextPool,
+    _EpLease,
     ensure_nccl_ep_bootstrapped,
     fused_combine,
     fused_dispatch,
@@ -1477,8 +1480,10 @@ class _NCCLEPManager(_DispatchManager):
                 "generously."
             )
 
-        # Created lazily on the first setup_metadata (sizing needs the local token count).
-        self._context: Optional[NcclEpContext] = None
+        # pool and active lease that manage the NCCL EP context lifecycle
+        self._pool: Optional[NcclEpContextPool] = None
+        self._active_lease: Optional[_EpLease] = None
+
         self._recv_capacity: Optional[int] = None
 
         # Metadata
@@ -1495,9 +1500,9 @@ class _NCCLEPManager(_DispatchManager):
         self.token_probs, self.token_indices = torch.topk(probs, self.router_topk, dim=-1)
         self.num_local_tokens = num_tokens
 
-    def _ensure_context(self):
-        """Bootstrap NCCL EP and create the per-layer context on first use (static shapes)."""
-        if self._context is not None:
+    def _ensure_pool(self):
+        """Bootstrap NCCL EP and build the per-layer context pool on first use (static shapes)."""
+        if self._pool is not None:
             return
         max_tokens_per_rank = self.num_local_tokens
         # NCCL EP requires an even number of dispatched tokens per rank
@@ -1523,14 +1528,30 @@ class _NCCLEPManager(_DispatchManager):
             hidden_dim=self.hidden_dim,
             num_sms=self.config.moe_ncclep_num_sms,
         )
-        self._context = NcclEpContext(
-            top_k=self.router_topk,
-            max_tokens_per_rank=max_tokens_per_rank,
-            recv_capacity_per_rank=self._recv_capacity,
-            hidden_dim=self.hidden_dim,
-            num_local_experts=self.num_local_experts,
-            alignment=self.alignment,
+
+        def _context_factory() -> NcclEpContext:
+            return NcclEpContext(
+                top_k=self.router_topk,
+                max_tokens_per_rank=max_tokens_per_rank,
+                recv_capacity_per_rank=self._recv_capacity,
+                hidden_dim=self.hidden_dim,
+                num_local_experts=self.num_local_experts,
+                alignment=self.alignment,
+            )
+
+        self._pool = NcclEpContextPool(
+            _context_factory, max_size_fn=self._max_pool_size, layer_name="ncclep"
         )
+
+    @staticmethod
+    def _max_pool_size() -> int:
+        """Leak-backstop ceiling: in-flight microbatches cannot exceed the microbatch count."""
+        try:
+            return get_num_microbatches()
+        except AttributeError:
+            # Microbatch calculator not configured (e.g. a unit test driving the manager
+            # directly). Fall back to a generous backstop; growth past it still flags a leak.
+            return 1024
 
     def dispatch(
         self,
@@ -1540,7 +1561,9 @@ class _NCCLEPManager(_DispatchManager):
     ) -> torch.Tensor:
         # Note: this needs to stay out of the torch.compile region because TE's ep_bootstrap does
         # opaque ProcessGroup._get_backend()._comm_ptr() access that dynamo cannot trace.
-        self._ensure_context()
+        self._ensure_pool()
+        lease = self._pool.lease()
+        self._active_lease = lease
         # TE requires int64 indices and float32 weights.
         # token_indices/token_probs: [num_local_tokens, router_topk]
         topk_idx = self.token_indices.to(torch.int64)
@@ -1549,8 +1572,16 @@ class _NCCLEPManager(_DispatchManager):
         #   tokens_per_expert: [num_local_experts]
         #   dispatched_probs: [recv_capacity_per_rank]
         recv_tokens, tokens_per_expert, dispatched_probs = nccl_ep_dispatch(
-            self._context, hidden_states, topk_idx, topk_weights
+            lease.ctx, hidden_states, topk_idx, topk_weights
         )
+        # Return the context to the pool once its last consumer finishes. With grad enabled the
+        # last consumer is this execution's backward, so release on the dispatch-input grad hook
+        # Under no_grad, e.g. the discarded original pass of an activation-checkpointed layer,
+        # no backward will run, so release at combine (end of forward) instead.
+        if torch.is_grad_enabled() and hidden_states.requires_grad:
+            self._arm_release_on_backward(lease, hidden_states)
+        else:
+            lease.release_at_combine = True
         self.tokens_per_expert = tokens_per_expert.to(torch.int64)
         if self.static_shape and not self.skip_capacity_pad:
             # Absorb the slack into the last expert so sum(counts) == recv_capacity
@@ -1558,6 +1589,17 @@ class _NCCLEPManager(_DispatchManager):
             self.tokens_per_expert[-1] += self._recv_capacity - self.tokens_per_expert.sum()
         self.dispatched_probs = dispatched_probs
         return recv_tokens
+
+    def _arm_release_on_backward(self, lease: _EpLease, dispatch_input: torch.Tensor):
+        """
+        Return ``lease``'s context to the pool when this execution's backward consumes it.
+        """
+        pool = self._pool
+
+        def _release_hook(grad):
+            pool.release(lease)
+
+        dispatch_input.register_hook(_release_hook)
 
     def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if self.static_shape:
@@ -1593,11 +1635,15 @@ class _NCCLEPManager(_DispatchManager):
         async_finish: bool = True,
         allocate_on_comm_stream: bool = True,
     ) -> torch.Tensor:
-        # Routing weights were applied in the expert MLP (recv_topk_weights=None).
+        lease = self._active_lease
         # hidden_states: [recv_capacity_per_rank, H] -> [num_local_tokens, H]
         hidden_states = nccl_ep_combine(
-            self._context, hidden_states, num_local_tokens=self.num_local_tokens
+            lease.ctx, hidden_states, num_local_tokens=self.num_local_tokens
         )
+        # Under no_grad there is no backward to return the context, so release it here
+        if lease.release_at_combine:
+            self._pool.release(lease)
+        self._active_lease = None
         # Release per-iteration metadata.
         self.dispatched_probs = None
         self.tokens_per_expert = None
