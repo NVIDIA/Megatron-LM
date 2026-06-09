@@ -338,13 +338,17 @@ class TEGroupedMLP(MegatronModule):
         if not isinstance(self.linear_fc2, te.pytorch.GroupedLinear):
             return _unsupported(f"linear_fc2 is {type(self.linear_fc2).__name__}")
 
-        # Check activation: SwiGLU or quick GEGLU (ScaledClampedQGeGLU, TE >= 2.15)
+        # Check activation: SwiGLU or quick GEGLU (ScaledClampedQGeGLU, TE >= 2.15).
+        # Clamped SwiGLU (e.g. DSv4) also routes through ScaledClampedQGeGLU
+        # with alpha=1.0, since the cuDNN geglu kernel is a superset of swiglu.
         # Use config.activation_func instead of self.activation_func because when
         # use_te_activation_func is True, self.activation_func is a TE module, not the raw function.
         if not self.config.gated_linear_unit:
             return _unsupported("gated_linear_unit not enabled")
         if self.config.activation_func == F.silu:
-            pass  # SwiGLU — supported
+            if self.config.activation_func_clamp_value is not None:
+                if not is_te_min_version("2.17.0.dev0"):
+                    return _unsupported("clamped SwiGLU needs TE >= 2.17.0.dev0")
         elif self.config.activation_func == quick_gelu:
             try:
                 from transformer_engine.pytorch.ops import ScaledClampedQGeGLU  # noqa: F401
@@ -418,10 +422,23 @@ class TEGroupedMLP(MegatronModule):
             setattr(op, "bias", getattr(self.linear_fc1, "bias"))
         ops.append(op)
 
-        # Activation and post-multiply probs (SwiGLU or clamped quick-GEGL)
+        # Activation and post-multiply probs (SwiGLU or clamped GeGLU).
+        # TE's ScaledClampedQGeGLU computes sigmoid(alpha * x) * x, so
+        # alpha=1.702 gives quick_gelu and alpha=1.0 gives silu/swiglu.
+        # With cuDNN FE >= 1.24.0 the alpha, limit and offset are
+        # forwarded as runtime params to the cuDNN kernel.
         glu_interleave = self.config.moe_mlp_glu_interleave_size
         if self.config.activation_func == F.silu and self.config.gated_linear_unit:
-            op = te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=glu_interleave)
+            clamp = self.config.activation_func_clamp_value
+            if clamp is not None:
+                op = te.pytorch.ops.ScaledClampedQGeGLU(
+                    glu_interleave_size=glu_interleave,
+                    alpha=1.0,
+                    limit=clamp,
+                    glu_linear_offset=0.0,
+                )
+            else:
+                op = te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=glu_interleave)
         elif self.config.activation_func == quick_gelu and self.config.gated_linear_unit:
             clamp = self.config.activation_func_clamp_value
             if clamp is not None:
