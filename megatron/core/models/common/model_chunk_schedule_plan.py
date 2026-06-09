@@ -126,6 +126,9 @@ class TransformerLayerSchedulePlan:
         transformer_layer = self.layer.mtp_model_layer if is_mtp else self.layer
         is_moe = isinstance(transformer_layer.mlp, MoELayer)
         num_local_experts = transformer_layer.mlp.num_local_experts if is_moe else None
+        self.is_moe = is_moe
+        self.is_mtp = is_mtp
+        self.transformer_layer = self.layer.mtp_model_layer if is_mtp else self.layer
 
         extra_args["config"] = self.layer.config
         extra_args["is_moe"] = is_moe
@@ -261,6 +264,8 @@ class TransformerLayerSchedulePlan:
                 f_input = f_layer.attn.forward(f_input)
 
         if b_layer is not None:
+            if b_layer.is_moe:
+                b_layer.pre_backward_param_unshard(b_layer.transformer_layer)
             b_grad = b_layer.mlp.backward(b_grad)
 
         if f_layer is not None:
