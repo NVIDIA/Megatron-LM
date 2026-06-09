@@ -312,10 +312,6 @@ class AsyncDecodePlan:
     reserved_block_ids: Tensor
     reserved_block_columns: Tensor
     finished_request_ids: Tensor
-    row_map: Tensor | None = None
-    row_mapped: bool = False
-    graph_compatible: bool = True
-    layout_compatible: bool = True
     eligibility: object | None = None
     ep_decision: object | None = None
     requires_mamba_state: bool = False
@@ -450,10 +446,6 @@ class AsyncDecodePlan:
             "active_token_count": self.active_token_count,
             "padded_active_request_count": self.padded_active_request_count,
             "tokens_per_request": self.tokens_per_request,
-            "row_map": None if self.row_map is None else self.row_map.to(device="cpu").tolist(),
-            "row_mapped": self.row_mapped,
-            "graph_compatible": self.graph_compatible,
-            "layout_compatible": self.layout_compatible,
             "requires_mamba_state": self.requires_mamba_state,
             "requires_mtp": self.requires_mtp,
             "requires_logprobs": self.requires_logprobs,
@@ -472,34 +464,22 @@ class AsyncDecodePlan:
         """Resolve this plan's layout snapshot against the current context layout."""
         return resolve_async_pending_forward(self.layout, current, row_map_policy=row_map_policy)
 
-    def with_pending_forward_decision(
-        self, decision: "AsyncPendingForwardDecision"
-    ) -> "AsyncDecodePlan":
-        """Return a copy of the plan annotated with a pending-forward decision."""
-        return replace(
-            self,
-            row_map=decision.row_map,
-            row_mapped=decision.row_mapped,
-            graph_compatible=decision.graph_compatible,
-            layout_compatible=decision.layout_compatible,
-        )
-
     def with_layout(self, layout: AsyncDecodeLayout) -> "AsyncDecodePlan":
         """Return a copy of the plan with the prepared runtime layout attached."""
         return replace(self, layout=layout)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class AsyncPendingForwardDecision:
     """Structured decision for reusing or discarding one pending async forward."""
 
     reusable: bool
     row_map: Tensor | None
     row_mapped: bool
-    reason: str | None
     row_map_policy: AsyncRowMapPolicy
     graph_compatible: bool
     layout_compatible: bool
+    reason: str | None
 
     @property
     def discard(self) -> bool:
@@ -517,6 +497,16 @@ class AsyncPendingForwardDecision:
             "graph_compatible": self.graph_compatible,
             "layout_compatible": self.layout_compatible,
         }
+
+
+@dataclass(frozen=True, slots=True)
+class AsyncPendingForwardUse:
+    """Consumed pending-forward reuse metadata owned by a transaction."""
+
+    reused: bool
+    row_indices: Tensor | None
+    row_mapped: bool
+    graph_request_count: int
 
 
 def resolve_async_pending_forward(
@@ -659,12 +649,12 @@ class AsyncDecodeTransaction:
     step_id: int
     state: AsyncTxnState
     plan: AsyncDecodePlan
+    resolution: AsyncPendingForwardUse | None = None
     sample_ticket: object | None = None
     resources: object | None = None
     h2d_done_event: object | None = None
     forward_done_event: object | None = None
     ep_decision: object | None = None
-    row_map: object | None = None
     discard_reason: str | None = None
     participants: tuple[AsyncTransactionParticipant, ...] = ()
     participant_state: dict[str, object] = field(default_factory=dict)
@@ -795,12 +785,17 @@ class AsyncDecodeTransaction:
     ) -> AsyncPendingForwardDecision:
         """Resolve this transaction's pending rows against the current context."""
         decision = self.pending_forward_decision(context, row_map_policy=row_map_policy)
-        self.plan = self.plan.with_pending_forward_decision(decision)
+        graph_request_count = self.plan.graph_shape.padded_active_request_count
+        if graph_request_count is None:
+            graph_request_count = self.plan.graph_shape.active_request_count
+        self.resolution = AsyncPendingForwardUse(
+            reused=decision.reusable,
+            row_indices=decision.row_map,
+            row_mapped=decision.row_mapped,
+            graph_request_count=graph_request_count,
+        )
         if not decision.reusable:
             return decision
-        row_map = decision.row_map
-        assert row_map is not None
-        self.row_map = row_map
         self.state = AsyncTxnState.RESOLVED
         return decision
 
@@ -852,10 +847,12 @@ class AsyncDecodeTransaction:
     def diagnostics(self) -> dict[str, Any]:
         """Return stable transaction diagnostics for tests and benchmark logs."""
         row_map = None
-        if self.row_map is not None and hasattr(self.row_map, "tolist"):
-            row_map = self.row_map.tolist()
-        elif self.row_map is not None:
-            row_map = self.row_map
+        if self.resolution is not None:
+            row_indices = self.resolution.row_indices
+            if row_indices is not None and hasattr(row_indices, "tolist"):
+                row_map = row_indices.tolist()
+            elif row_indices is not None:
+                row_map = row_indices
         return {
             "step_id": self.step_id,
             "state": self.state.value,

@@ -15,6 +15,7 @@ from megatron.core.inference.async_transaction import (
     AsyncGraphShape,
     AsyncLogprobMTPParticipant,
     AsyncMambaStateParticipant,
+    AsyncPendingForwardUse,
     AsyncResourceLedger,
     AsyncResourceParticipant,
     AsyncRowMapPolicy,
@@ -550,14 +551,13 @@ def test_async_decode_plan_owns_pending_forward_layout_decision():
     plan = AsyncDecodePlan.from_layout(pending)
 
     decision = plan.resolve_pending_forward(current, row_map_policy=AsyncRowMapPolicy.REUSE)
-    resolved_plan = plan.with_pending_forward_decision(decision)
 
     assert decision.reusable
-    assert resolved_plan.row_mapped
-    assert resolved_plan.row_map.tolist() == [2, 0]
-    assert resolved_plan.graph_compatible
-    assert resolved_plan.layout_compatible
-    assert resolved_plan.graph_shape.padded_active_request_count == 3
+    assert decision.row_mapped
+    assert decision.row_map.tolist() == [2, 0]
+    assert decision.graph_compatible
+    assert decision.layout_compatible
+    assert plan.graph_shape.padded_active_request_count == 3
 
 
 @pytest.mark.internal
@@ -574,8 +574,7 @@ def test_async_transaction_owns_pending_forward_resolution_transition():
     assert preview.row_mapped
     assert preview.row_map.tolist() == [2, 0]
     assert transaction.state == AsyncTxnState.LAUNCHED
-    assert transaction.row_map is None
-    assert transaction.plan.row_map is None
+    assert transaction.resolution is None
 
     resolved = transaction.resolve_against_current(
         context, row_map_policy=AsyncRowMapPolicy.REUSE
@@ -583,9 +582,12 @@ def test_async_transaction_owns_pending_forward_resolution_transition():
 
     assert resolved.diagnostics() == preview.diagnostics()
     assert transaction.state == AsyncTxnState.RESOLVED
-    assert transaction.row_map.tolist() == [2, 0]
-    assert transaction.plan.row_map.tolist() == [2, 0]
-    assert transaction.plan.row_mapped
+    assert transaction.resolution == AsyncPendingForwardUse(
+        reused=True,
+        row_indices=resolved.row_map,
+        row_mapped=True,
+        graph_request_count=3,
+    )
 
 
 @pytest.mark.internal
@@ -602,8 +604,12 @@ def test_async_transaction_failed_resolution_defers_terminal_cleanup():
     assert decision.reason == "request row mismatch"
     assert transaction.state == AsyncTxnState.LAUNCHED
     assert transaction.discard_reason is None
-    assert transaction.plan.row_map is None
-    assert not transaction.plan.layout_compatible
+    assert transaction.resolution == AsyncPendingForwardUse(
+        reused=False,
+        row_indices=None,
+        row_mapped=False,
+        graph_request_count=2,
+    )
 
     transaction.rollback(decision.reason)
 
@@ -625,9 +631,9 @@ def test_identity_only_row_map_policy_discards_row_mapped_pending_forward():
     assert row_indices is None
     assert not row_mapped
     assert transaction.discard_reason == "row map policy rejected non-identity layout"
-    assert transaction.plan.row_map.tolist() == [2, 0]
-    assert transaction.plan.row_mapped
-    assert not transaction.plan.layout_compatible
+    assert transaction.resolution.row_indices.tolist() == [2, 0]
+    assert transaction.resolution.row_mapped
+    assert not transaction.resolution.reused
     assert controller._async_discarded_forward_count == 1
     assert controller._async_layout_mismatch_discard_count == 1
     assert controller._async_row_mapped_forward_count == 0
@@ -746,10 +752,9 @@ def test_pending_async_forward_reuses_subset_when_finished_row_left():
     assert row_map.tolist() == [2, 0]
     assert pending_layout.layout_compatible_with(current_layout, row_map=row_map)
     transaction = controller._pending_async_transaction()
-    assert transaction.plan.row_map.tolist() == [2, 0]
-    assert transaction.plan.row_mapped
-    assert transaction.plan.graph_compatible
-    assert transaction.plan.layout_compatible
+    assert transaction.resolution.row_indices.tolist() == [2, 0]
+    assert transaction.resolution.row_mapped
+    assert transaction.resolution.reused
     assert controller._async_discarded_forward_count == 0
 
 
@@ -1789,8 +1794,13 @@ def test_async_transaction_and_resource_diagnostics_are_stable():
         step_id=7,
         state=AsyncTxnState.LAUNCHED,
         plan=AsyncDecodePlan.from_layout(snapshot),
+        resolution=AsyncPendingForwardUse(
+            reused=True,
+            row_indices=torch.tensor([1, 0], dtype=torch.long),
+            row_mapped=True,
+            graph_request_count=2,
+        ),
         resources=ledger,
-        row_map=torch.tensor([1, 0], dtype=torch.long),
     )
 
     diagnostics = transaction.diagnostics()

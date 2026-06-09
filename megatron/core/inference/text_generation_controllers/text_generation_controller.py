@@ -22,7 +22,6 @@ from megatron.core.inference.async_transaction import (
     AsyncEPParticipant,
     AsyncLogprobMTPParticipant,
     AsyncMambaStateParticipant,
-    AsyncPendingForwardDecision,
     AsyncResourceLedger,
     AsyncResourceParticipant,
     AsyncRowMapPolicy,
@@ -1769,9 +1768,7 @@ class TextGenerationController:
             transaction.participants = (*transaction.participants, *participants)
         transaction.prepare_participants()
 
-    def _pending_async_forward_decision(
-        self, transaction: AsyncDecodeTransaction
-    ) -> AsyncPendingForwardDecision:
+    def _pending_async_forward_decision(self, transaction: AsyncDecodeTransaction):
         """Return the centralized pending-forward reuse decision."""
         context = self.inference_wrapped_model.inference_context
         return transaction.pending_forward_decision(
@@ -1806,15 +1803,15 @@ class TextGenerationController:
             row_map_policy=getattr(self, "_async_row_map_policy", AsyncRowMapPolicy.REUSE),
         )
         if decision.reusable:
-            row_map = decision.row_map
+            resolution = transaction.resolution
+            assert resolution is not None
+            row_map = resolution.row_indices
             assert row_map is not None
             if decision.row_mapped:
                 self._increment_async_counter("_async_row_mapped_forward_count")
             else:
                 self._increment_async_counter("_async_identity_forward_count")
             self._increment_async_counter("_async_reused_forward_count")
-            transaction.row_map = row_map
-            transaction.state = AsyncTxnState.RESOLVED
             row_indices = (
                 row_map.to(device=torch.cuda.current_device(), dtype=torch.long)
                 if decision.row_mapped
