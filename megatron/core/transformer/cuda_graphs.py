@@ -1968,6 +1968,12 @@ class TECudaGraphHelper:
 
             static_inputs = layer.get_layer_static_inputs(self.seq_length, self.micro_batch_size)
 
+            if self._needs_full_local_padding_mask(layer, chunk_of_the_layer, static_inputs):
+                local_slen = self.config.max_seqlen_per_dp_cp_rank
+                static_inputs["padding_mask"] = torch.ones(
+                    1, local_slen, dtype=torch.bool, device=torch.cuda.current_device()
+                )
+
             from megatron.core.transformer.identity_op import IdentityOp
             from megatron.core.transformer.transformer_layer import TransformerLayer
 
@@ -2139,6 +2145,83 @@ class TECudaGraphHelper:
                 assert self.pg_collection.tp is not None
                 return self.pg_collection.tp
 
+    def _should_use_dynamic_microbatch_slots(self) -> bool:
+        """Whether to capture a bounded number of graph slots and reuse them by modulo."""
+        return bool(getattr(self.config, "cuda_graph_dynamic_microbatches", False))
+
+    def _needs_full_local_padding_mask(self, layer, chunk, static_inputs) -> bool:
+        """Whether this layer's static padding_mask needs full max_seqlen_per_dp_cp_rank.
+
+        For the post_process chunk (last PP/VPP chunk that holds labels),
+        padding_mask arrives at the full CP-local length because:
+          1. labels are present -> actual_T_is_local=True -> no CP re-partition;
+          2. pre_process=False  -> _preprocess does not scatter under SP.
+        Other non-pre_process chunks (intermediate VPP) have no data, so their
+        captured padding_mask stays at the default scattered size from
+        `get_layer_static_inputs` (~max_seqlen/CP/TP).
+
+        Returns True only for that post_process-with-data case under THD CUDA
+        Graph + SP + PP>1.
+        """
+        return (
+            hasattr(layer, "_is_thd_cuda_graph")
+            and layer._is_thd_cuda_graph()
+            and self.config.sequence_parallel
+            and self.config.pipeline_model_parallel_size > 1
+            and not getattr(chunk, "pre_process", True)
+            and getattr(chunk, "post_process", False)
+            and "padding_mask" in static_inputs
+        )
+
+    @staticmethod
+    def _get_required_num_microbatch_slots_from_order(order, num_model_chunks):
+        """Infer the minimum safe slot count from a PP/VPP order.
+
+        The slot count is defined as the maximum number of real microbatches whose forward has
+        happened but whose corresponding backward for the same chunk has not completed yet.
+        This is the exact liveness condition for whether a static buffer/graph slot can be reused.
+        """
+        outstanding = [0] * num_model_chunks
+        max_outstanding = [0] * num_model_chunks
+
+        for c_id in order:
+            if ceil(c_id) != c_id:
+                continue
+            model_chunk_idx = abs(int(ceil(c_id))) - 1
+            if c_id > 0:
+                outstanding[model_chunk_idx] += 1
+                max_outstanding[model_chunk_idx] = max(
+                    max_outstanding[model_chunk_idx], outstanding[model_chunk_idx]
+                )
+            else:
+                outstanding[model_chunk_idx] -= 1
+                assert outstanding[model_chunk_idx] >= 0, (
+                    "Invalid PP/VPP schedule: negative outstanding microbatches while "
+                    f"inferring CUDA graph slots for chunk {model_chunk_idx}."
+                )
+
+        assert all(count == 0 for count in outstanding), (
+            "Invalid PP/VPP schedule: outstanding microbatches did not drain to zero when "
+            f"inferring CUDA graph slots. outstanding={outstanding}"
+        )
+        return max(1, max(max_outstanding, default=1))
+
+    def _get_probe_num_microbatches_for_dynamic_slots(self):
+        """Return a topology-only probe microbatch count for slot inference."""
+        pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
+        if pipeline_parallel_size == 1 and not self.config.overlap_moe_expert_parallel_comm:
+            return 1
+
+        group_size = self.config.microbatch_group_size_per_vp_stage
+        if group_size is None:
+            group_size = pipeline_parallel_size
+
+        return max(
+            pipeline_parallel_size * max(1, self.num_model_chunks) * 4,
+            group_size * max(1, self.num_model_chunks) * 2,
+            1,
+        )
+
     def _get_cuda_graph_input_data(self):
         """
         Create the CUDA Graph capturing input data.
@@ -2157,6 +2240,62 @@ class TECudaGraphHelper:
                 self.num_model_chunks == 1
             ), "If PP is not enabled, there should be only one model chunk."
             self.num_microbatches = 1
+        elif self._should_use_dynamic_microbatch_slots():
+            probe_num_microbatches = self._get_probe_num_microbatches_for_dynamic_slots()
+            from megatron.core.pipeline_parallel.schedules import (
+                get_pp_rank_microbatches as _probe_get_pp,
+            )
+            from megatron.core.pipeline_parallel.schedules import (
+                get_schedule_table as _probe_get_st,
+            )
+
+            _, _, _probe_warmup, _ = _probe_get_pp(
+                probe_num_microbatches,
+                self.num_model_chunks,
+                self.config.microbatch_group_size_per_vp_stage,
+                False,
+                overlap_moe_expert_parallel_comm=self.config.overlap_moe_expert_parallel_comm,
+            )
+            _probe_st = _probe_get_st(
+                probe_num_microbatches,
+                self.num_model_chunks,
+                self.config.microbatch_group_size_per_vp_stage,
+            )
+            _probe_order = convert_schedule_table_to_order(
+                _probe_warmup, self.num_model_chunks, _probe_st
+            )
+            auto_num_slots = self._get_required_num_microbatch_slots_from_order(
+                _probe_order, self.num_model_chunks
+            )
+            pp_group = parallel_state.get_pipeline_model_parallel_group()
+            if pp_group is not None and pp_group.size() > 1:
+                auto_num_slots_tensor = torch.tensor(
+                    [auto_num_slots], dtype=torch.int32, device=torch.cuda.current_device()
+                )
+                torch.distributed.all_reduce(
+                    auto_num_slots_tensor, op=torch.distributed.ReduceOp.MAX, group=pp_group
+                )
+                auto_num_slots = int(auto_num_slots_tensor.item())
+            requested_num_slots = self.config.cuda_graph_num_microbatch_slots
+            if requested_num_slots is not None:
+                assert requested_num_slots >= auto_num_slots, (
+                    "cuda_graph_num_microbatch_slots is smaller than the minimum safe number "
+                    f"of slots for the current PP/VPP topology: requested={requested_num_slots}, "
+                    f"required>={auto_num_slots}"
+                )
+                self.num_microbatches = requested_num_slots
+            else:
+                self.num_microbatches = auto_num_slots
+            log_on_each_pipeline_stage(
+                logger=logger,
+                tp_group=None,
+                dp_cp_group=None,
+                level=logging.INFO,
+                msg=f'Rank {torch.distributed.get_rank()}: dynamic CUDA graph slots enabled. '
+                f'runtime_num_microbatches={get_num_microbatches()}, '
+                f'auto_num_slots={auto_num_slots}, '
+                f'capture_num_microbatches={self.num_microbatches}',
+            )
         else:
             self.num_microbatches = get_num_microbatches()
 

@@ -19,7 +19,7 @@ from megatron.core.datasets.data_schedule_utils import (
     next_hdp_group,
     reroute_samples_to_dcp_ranks,
 )
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, pad_sequence_for_thd
 from megatron.core.pipeline_parallel.hybrid_cp_schedule import BalancedCPScheduler
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank
@@ -34,6 +34,7 @@ class BasePackingScheduler:
         cp_size: int,
         dp_size: int,
         microbatch_group_size_per_vp_stage: Optional[int],
+        max_num_seqs: Optional[int] = None,
     ):
         """
         Args:
@@ -42,11 +43,15 @@ class BasePackingScheduler:
             dp_size: The data parallel size.
             microbatch_group_size_per_vp_stage: The microbatch group size per virtual
             pipeline stage, only used when enabling VPP, otherwise None.
+            max_num_seqs: Optional cap on the number of packed sequences per
+            microbatch. When set, the scheduler closes a pack as soon as it
+            reaches this many sequences in addition to the token-budget condition.
         """
         self.max_seqlen_per_dp_cp_rank = max_seqlen_per_dp_cp_rank
         self.cp_size = cp_size
         self.dp_size = dp_size
         self.microbatch_group_size_per_vp_stage = microbatch_group_size_per_vp_stage
+        self.max_num_seqs = max_num_seqs
 
     def get_required_sample_keys(self):
         """Return the required key of each batch."""
@@ -118,7 +123,9 @@ class DpBalancedScheduler(BasePackingScheduler):
         single_microbatch = []
 
         for i in range(len(sample_id_seqlens)):
-            if sum_seqlen + sample_id_seqlens[i][1] <= self.max_seq_len_all_ranks:
+            if sum_seqlen + sample_id_seqlens[i][1] <= self.max_seq_len_all_ranks and (
+                self.max_num_seqs is None or len(single_microbatch) < self.max_num_seqs
+            ):
                 single_microbatch.append(i)
                 sum_seqlen += sample_id_seqlens[i][1]
             else:
@@ -459,6 +466,7 @@ def wrap_data_iterator(
             if config.virtual_pipeline_model_parallel_size is None
             else config.microbatch_group_size_per_vp_stage
         ),
+        max_num_seqs=getattr(config, 'thd_max_num_seqs', None),
         **scheduler_kwargs,
     )
 
@@ -486,6 +494,7 @@ def get_batch_on_this_rank_for_sequence_packing(
     vp_stage: Optional[int] = None,
     dynamic_cp: bool = False,
     pg_collection: Optional[ProcessGroupCollection] = None,
+    config=None,
 ):
     """
     Get a batch of data for sequence packing.
@@ -493,8 +502,11 @@ def get_batch_on_this_rank_for_sequence_packing(
         data_iterator (Iterator): The data iterator to get the batch from.
         mtp_on_this_rank (bool): Whether to use multi-token prediction.
         vp_stage (Optional[int]): The stage of the pipeline.
+        config: Model parallel config used for optional THD packed-sequence padding.
+            When None or config.pad_packed_seq_alignment is None, no padding is applied.
     Returns:
-        tuple of (tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params)
+        tuple of (tokens, labels, loss_mask, attention_mask, position_ids,
+        packed_seq_params, padding_mask)
     """
 
     if pg_collection is None:
@@ -567,13 +579,12 @@ def get_batch_on_this_rank_for_sequence_packing(
 
     if is_first_or_last_stage or mtp_on_this_rank:
         if is_tp_rank_0:
-            # Use whichever data field is available (first stage has tokens, last has labels).
-            # Avoid `tokens or labels`: PyTorch tensors raise on truthiness when they have
-            # more than one element ("Boolean value of Tensor ... is ambiguous").
-            _data_field = batch.get('tokens')
-            if _data_field is None:
-                _data_field = batch.get('labels')
-            total_tokens = torch.tensor(_data_field.size(0), dtype=torch.int32, device=dev)
+            # Under VPP, the last PP stage has labels but no tokens, so derive
+            # total_tokens from cu_seqlens_padded, which is present on every
+            # stage. cu_seqlens_padded keeps the pre-CP packed length; divide
+            # by cp_size to match the already CP-sliced tokens/labels length.
+            cp_world = cp_group.size()
+            total_tokens = (batch['cu_seqlens_padded'][-1].to(torch.int32) // cp_world).reshape(1)
         else:
             total_tokens = torch.empty(1, dtype=torch.int32, device=dev)
         broadcast_tensor(total_tokens, tp_src_rank, tp_group)
@@ -665,9 +676,8 @@ def get_batch_on_this_rank_for_sequence_packing(
         else None
     )
 
-    # Transformer Engine has a bug of cu_seqlens, we must treat cu_seqlens_padded as cu_seqlens to
-    # get the correct result.
-    # TODO: Revert this workaround once TE fixes the issue.
+    # Use padded cumulative lengths for THD partitioning so token slices follow
+    # the padded sequence boundaries consumed by attention kernels.
     packed_seq_params = PackedSeqParams(
         qkv_format="thd",
         cu_seqlens_q=cu_seqlens_padded,
@@ -680,8 +690,40 @@ def get_batch_on_this_rank_for_sequence_packing(
         cp_group=cp_group,
     )
 
+    # Pad the already-packed THD tensors at the end when requested. CUDA Graph
+    # additionally pads cu_seqlens tensors to thd_max_num_seqs + 1 entries.
+    padding_mask = None
+    pad_alignment = (
+        getattr(config, 'pad_packed_seq_alignment', None) if config is not None else None
+    )
+    if pad_alignment is not None and packed_seq_params is not None:
+        cuda_graph_static = getattr(config, 'cuda_graph_impl', 'none') != 'none'
+        static_target = (
+            pad_alignment == 0 and getattr(config, 'max_seqlen_per_dp_cp_rank', None) is not None
+        )
+        if cuda_graph_static or static_target:
+            target_len = config.max_seqlen_per_dp_cp_rank
+            max_num_seqs = config.thd_max_num_seqs
+            alignment = None
+        else:
+            target_len = None
+            max_num_seqs = None
+            alignment = max_seqlen if pad_alignment == 0 else pad_alignment
+        tokens, labels, loss_mask, position_ids, packed_seq_params, padding_mask = (
+            pad_sequence_for_thd(
+                tokens,
+                labels,
+                loss_mask,
+                position_ids,
+                packed_seq_params,
+                alignment=alignment,
+                target_len=target_len,
+                max_num_seqs=max_num_seqs,
+            )
+        )
+
     # "attention_mask" is not valid for sequence packing, so set it to None.
-    return tokens, labels, loss_mask, None, position_ids, packed_seq_params
+    return tokens, labels, loss_mask, None, position_ids, packed_seq_params, padding_mask
 
 
 class HybridCPDataLoaderWrapper:

@@ -210,8 +210,13 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp, loc
             dynamic_cp=dynamic_cp,
         )
 
-        # Unpack the result
-        tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = result
+        # The helper returns a 7-tuple; padding_mask is None when THD padding is disabled.
+        tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params, padding_mask = (
+            result
+        )
+        assert (
+            padding_mask is None
+        ), "padding_mask should be None when no padding config is provided."
 
         # Get parallel state info
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
