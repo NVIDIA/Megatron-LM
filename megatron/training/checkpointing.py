@@ -1549,6 +1549,7 @@ def _load_global_dist_base_checkpoint(
     checkpointing_context=None,
     dp_cp_group=None,
     expt_dp_group=None,
+    model=None,
 ):
     """Load the base state_dict from the given directory containing the global distributed checkpoint"""
     if rank0:
@@ -1556,10 +1557,15 @@ def _load_global_dist_base_checkpoint(
         state_dict = dist_checkpointing.load_common_state_dict(checkpoint_name)
         return state_dict, checkpoint_name, release, CheckpointType.GLOBAL
 
+    # Load torch_dist checkpoint into Megatron FSDP v2
     if args.use_megatron_fsdp_v2:
         checkpoint_name = find_checkpoint_rank_0(load_dir, iteration, release)
         state_dict = _load_torch_dist_into_megatron_fsdp_v2(
-            args, checkpoint_name, sharded_state_dict, strict=True
+            args,
+            checkpoint_name,
+            model=model,
+            v2_state_dict=sharded_state_dict,
+            strict=True,
         )
         return state_dict, checkpoint_name, release, CheckpointType.FSDP_DTENSOR
 
@@ -1641,6 +1647,7 @@ def _load_base_checkpoint(
     checkpointing_context=None,
     dp_cp_group=None,
     expt_dp_group=None,
+    model=None,
 ):
     """Load the base state_dict from the given directory
 
@@ -1727,6 +1734,7 @@ def _load_base_checkpoint(
             checkpointing_context=checkpointing_context,
             dp_cp_group=dp_cp_group,
             expt_dp_group=expt_dp_group,
+            model=model,
         )
     elif ckpt_format == "torch":
         ckpt_type = CheckpointType.LEGACY
@@ -2302,6 +2310,7 @@ def load_checkpoint(
         checkpointing_context=checkpointing_context,
         dp_cp_group=dp_cp_group,
         expt_dp_group=expt_dp_group,
+        model=model,
         **load_kwargs,
     )
 

@@ -22,6 +22,7 @@ The implementation is split across:
 
 from typing import Callable, Optional
 
+import torch
 import torch.nn as nn
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor.placement_types import Shard
@@ -31,7 +32,6 @@ from .fsdp_module import FSDPModule
 from .hooks import (
     _register_backward_hook,
     _register_backward_pre_hook,
-    _register_fine_grained_forward_pre_hooks,
     _register_forward_hook,
     _register_forward_pre_hook,
 )
@@ -58,6 +58,7 @@ def fully_shard(
     gradient_scaling_factor: Optional[float] = None,
     enable_trace_pool: bool = False,
     sharding_strategy: str = "optim_grads_params",
+    enable_cuda_graph: bool = False,
 ) -> nn.Module:
     """
     Wrap a module with FSDP sharding semantics.
@@ -83,7 +84,15 @@ def fully_shard(
     new_cls = type(f"FSDP{cls.__name__}", (FSDPModule, cls), {})
     module.__class__ = new_cls
 
-    use_trace_pool = enable_trace_pool and sharding_strategy in (
+    use_trace_pool = (
+        enable_trace_pool
+        or enable_cuda_graph
+        or any(
+            getattr(m._fsdp_state, "enable_cuda_graph", False)
+            for m in module.modules()
+            if isinstance(m, FSDPModule) and m is not module
+        )
+    ) and sharding_strategy in (
         "optim",
         "optim_grads",
         "optim_grads_params",
@@ -94,7 +103,6 @@ def fully_shard(
         mesh,
         ignored_params,
         mp_policy=mp_policy,
-        bucket_allocator=bucket_allocator,
         gradient_scaling_factor=gradient_scaling_factor,
         sharding_strategy=sharding_strategy,
     )
@@ -102,13 +110,14 @@ def fully_shard(
         enable_unshard_prefetch=enable_unshard_prefetch,
         enable_async_reduce_grad=enable_async_reduce_grad,
         bucket_allocator=bucket_allocator,
+        enable_cuda_graph=enable_cuda_graph,
     )
     module._init_param_main_grad_func()
 
-    if mp_policy.fine_grained_forward_hooks_required(module._fsdp_param_groups):
-        _register_fine_grained_forward_pre_hooks(module)
-    else:
-        _register_forward_pre_hook(module)
+    _register_forward_pre_hook(
+        fsdp_module=module,
+        fine_grained=mp_policy.fine_grained_forward_hooks_required(module._fsdp_param_groups),
+    )
     _register_forward_hook(module)
     _register_backward_pre_hook(module)
     _register_backward_hook(module)
