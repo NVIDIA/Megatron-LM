@@ -267,10 +267,3 @@ class InferenceScriptConfig:
 
     coordinator_schedule_output_path: str | None = None
     """Path for coordinator scheduling decision JSON output."""
-
-    # Distributed context (populated after ``initialize_megatron``)
-    rank: int | None = None
-    """Global rank (used for inference metric logging)."""
-
-    world_size: int | None = None
-    """World size (used for inference metric logging)."""

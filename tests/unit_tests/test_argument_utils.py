@@ -16,7 +16,7 @@ from megatron.training.argument_utils import (
     inference_cfg_from_args,
     pretrain_cfg_container_from_args,
 )
-from megatron.training.config import InferenceScriptConfig, PretrainConfigContainer
+from megatron.training.config import PretrainConfigContainer
 
 
 @dataclass
@@ -710,7 +710,6 @@ class TestPretrainContainerFromArgsStructure:
     def test_returns_pretrain_config_container(self, patch_training_helpers):
         result = pretrain_cfg_container_from_args(_make_args())
         assert isinstance(result, PretrainConfigContainer)
-        assert isinstance(result.inference, InferenceScriptConfig)
 
     @patch("megatron.training.training.get_megatron_ddp_config")
     @patch("megatron.training.training.get_megatron_optimizer_config")
@@ -901,16 +900,12 @@ class TestInferenceScriptConfigFromArgs:
             transformer_impl="inference_optimized",
             fp8_recipe="mxfp8",
             inference_grouped_gemm_backend="torch",
-            rank=3,
-            world_size=8,
         )
         cfg = inference_cfg_from_args(args)
         assert cfg.load == "/path/to/ckpt"
         assert cfg.transformer_impl == "inference_optimized"
         assert cfg.fp8_recipe == "mxfp8"
         assert cfg.inference_grouped_gemm_backend == "torch"
-        assert cfg.rank == 3
-        assert cfg.world_size == 8
 
     def test_uses_dataclass_defaults_for_missing_fields(self):
         cfg = inference_cfg_from_args(Namespace())

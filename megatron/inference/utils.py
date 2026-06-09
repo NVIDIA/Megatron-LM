@@ -8,6 +8,7 @@ from typing import Callable, Optional
 
 import torch
 
+from megatron.core._rank_utils import safe_get_rank, safe_get_world_size
 from megatron.core.inference.config import (
     CudaGraphSizingDistribution,
     InferenceConfig as CoreInferenceConfig,
@@ -420,7 +421,7 @@ def get_inference_config_from_model_and_args(
     if (
         inference_logging_step_interval > 0
         and log_inference_wandb
-        and inference_cfg.rank == (inference_cfg.world_size - 1)
+        and safe_get_rank() == (safe_get_world_size() - 1)
     ):
         metrics_writer = get_wandb_writer()
         if metrics_writer is None:

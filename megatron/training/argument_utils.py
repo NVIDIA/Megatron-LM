@@ -490,8 +490,6 @@ def inference_cfg_from_args(args: Namespace) -> InferenceScriptConfig:
         "fp8_recipe",
         "inference_grouped_gemm_backend",
         "inference_cuda_graph_scope",
-        "rank",
-        "world_size",
     ):
         if hasattr(args, name):
             kwargs[name] = getattr(args, name)
@@ -543,7 +541,6 @@ def pretrain_cfg_container_from_args(args: Namespace, model_cfg=None) -> Pretrai
 
         rerun_state_machine=RerunStateMachineConfig(**rerunsm_kwargs),
         straggler=_default_config_from_args(StragglerDetectionConfig, args),
-        inference=inference_cfg_from_args(args),
     )
 
     return cfg
