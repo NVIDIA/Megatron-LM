@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import math
+import os
 from typing import List, Optional, Union
 
 import torch
@@ -391,12 +392,31 @@ def unpermute(
         # allocation.
         permuted_tokens = permuted_tokens * permuted_probs.unsqueeze(-1)
 
-    # Create an output tensor filled with zeros
-    output_tokens = torch.zeros(
-        restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
-    )
-    # Scatter add the permuted_input back to the original positions
-    output_tokens.scatter_add_(0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens)
+    _use_deterministic = os.environ.get("MOE_DETERMINISTIC_UNPERMUTE", "1") == "1"
+
+    if _use_deterministic and routing_map is not None:
+        num_tokens = restore_shape[0]
+        num_experts = routing_map.shape[1]
+        routing_map_bool = routing_map.bool()
+        routing_map_T = routing_map_bool.T.contiguous()  # [num_experts, num_tokens]
+        tokens_per_expert = routing_map_T.long().sum(dim=-1)  # [num_experts]
+        expert_offsets = torch.zeros(num_experts + 1, dtype=torch.long, device=permuted_tokens.device)
+        expert_offsets[1:] = torch.cumsum(tokens_per_expert, dim=0)
+        position_in_expert_T = routing_map_T.long().cumsum(dim=-1) - 1  # [num_experts, num_tokens]
+        global_position = position_in_expert_T + expert_offsets[:-1].unsqueeze(1)  # [num_experts, num_tokens]
+        global_position_per_token = global_position.T  # [num_tokens, num_experts]
+        topk = int(routing_map_bool.long().sum(dim=-1)[0].item())
+        valid_positions = global_position_per_token * routing_map_bool.long()
+        reverse_indices = valid_positions[routing_map_bool].reshape(num_tokens, topk)
+        gathered = permuted_tokens.index_select(0, reverse_indices.reshape(-1))
+        gathered = gathered.reshape(num_tokens, topk, hidden)
+        output_tokens = gathered.sum(dim=1)
+    else:
+        output_tokens = torch.zeros(
+            restore_shape, dtype=permuted_tokens.dtype, device=permuted_tokens.device
+        )
+        output_tokens.scatter_add_(0, sorted_indices.unsqueeze(1).expand(-1, hidden), permuted_tokens)
+
     return output_tokens.to(dtype=input_dtype)
 
 
@@ -599,7 +619,10 @@ def topk_softmax_with_capacity(
             scores = torch.gather(scores, dim=1, index=top_indices).type_as(logits)
         else:
             scores, top_indices = compute_topk(scores, topk, num_groups, group_topk)
-        probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20) if topk > 1 else scores
+        _scores_f64 = scores.double()
+        _sum_f64 = _scores_f64.sum(dim=-1, keepdim=True)
+        _denom = _sum_f64.float() + 1e-20
+        probs = scores / _denom if topk > 1 else scores
     else:
         raise ValueError(f"Invalid score_function: {score_function}")
 
@@ -884,7 +907,9 @@ class RouterGatingLinearFunction(torch.autograd.Function):
             output = te_general_gemm(weight, inp, router_dtype, layout="TN")
             output = output[0]
         else:
-            output = torch.mm(inp.to(router_dtype), weight.to(router_dtype).t())
+            inp_bf16 = inp.bfloat16()
+            w_bf16 = weight.bfloat16().t().contiguous()
+            output = torch.mm(inp_bf16, w_bf16).float()
 
         output = output.view(*inp_shape[:-1], -1)
         return output
