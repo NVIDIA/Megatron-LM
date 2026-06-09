@@ -721,9 +721,11 @@ def nccl_ep_finalize():
 class NcclEpContext:
     """Per-MoE-layer NCCL EP routing context: one TE ``EpHandle`` + one ``EpBuffer``.
 
-    Holds a single handle+buffer. Each concurrently in-flight microbatch needs its own:
-    a second forward on the same handle before the first's backward corrupts the earlier
-    backward (relevant once 1F1B pipelining is enabled; ``TODO(ncclep, PP>1)``).
+    Holds a single handle+buffer, which a forward overwrites in place. Under pipeline
+    parallelism (1F1B) several microbatches are in flight at once, so each in-flight execution
+    must use its own context -- a second forward on the same handle/buffer before the first's
+    backward consumes it would corrupt that backward. Concurrent contexts are managed by
+    :class:`NcclEpContextPool`; do not share one context across in-flight executions.
 
     Args:
         top_k (int): Routing fan-out per token (TP-folded router_topk at the call site).
@@ -765,9 +767,131 @@ class NcclEpContext:
             alignment=alignment,
             payload_dtype=payload_dtype,
         )
-        self.buffer = te_ep.EpBuffer(
-            self.handle, ep_group=ep_group if use_symm_mem else None, use_symm_mem=use_symm_mem
-        )
+        # TE selects the symm-mem (zero-copy) payload path when an ep_group is passed (paired with
+        # ep_bootstrap(zero_copy=True)); ep_group=None gives the HBM staged-copy path.
+        self.buffer = te_ep.EpBuffer(self.handle, ep_group=ep_group if use_symm_mem else None)
+        self.state = "free"
+        self.generation = 0
+
+
+class _EpLease:
+    """A leased :class:`NcclEpContext` bound to one forward(->backward) execution.
+
+    The pool hands out one lease per dispatch. ``generation`` is the context's generation
+    stamped at lease time; the release path asserts the context has not been re-leased
+    (generation bumped) before this execution's backward consumed it -- a loud tripwire for an
+    EP-buffer override. See :class:`NcclEpContextPool`.
+
+    Args:
+        ctx (NcclEpContext): The leased routing context.
+        generation (int): ``ctx.generation`` captured at lease time.
+        dispatch_id (int): Monotonic id of the dispatch that took this lease (for diagnostics).
+    """
+
+    __slots__ = ("ctx", "generation", "dispatch_id", "released", "release_at_combine")
+
+    def __init__(self, ctx: "NcclEpContext", generation: int, dispatch_id: int):
+        self.ctx = ctx
+        self.generation = generation
+        self.dispatch_id = dispatch_id
+        self.released = False
+        # Set when the dispatch ran under no_grad, so no backward will consume the context
+        # (e.g. the discarded original pass of an activation-checkpointed layer): release at
+        # combine instead of waiting for a backward that never comes.
+        self.release_at_combine = False
+
+
+class NcclEpContextPool:
+    """A lazily-growing pool of :class:`NcclEpContext` for one MoE layer.
+
+    Under pipeline parallelism (1F1B) several microbatches are in flight at once, so a
+    microbatch's forward must not overwrite the EP handle/buffer that an earlier microbatch's
+    pending backward still reads. Each in-flight execution leases its own context; the lease is
+    returned when that execution's last consumer finishes (its backward, or its forward
+    ``combine`` when running under ``no_grad``). The pool grows on demand to the high-water-mark
+    of concurrent leases (~ the pipeline warmup depth) and recycles contexts thereafter.
+
+    The pool self-sizes via lazy growth, settling at one context per in-flight microbatch (the
+    pipeline schedule's warmup depth + 1). ``max_size_fn`` is only a leak backstop: a microbatch
+    can never have more peers in flight than the total microbatch count, so that count is a
+    ceiling that never false-triggers a correct run. It is a callable (evaluated per growth) so
+    batch-size rampup, which raises the microbatch count over the run, cannot make a frozen cap
+    reject a legitimately deeper pipeline later.
+
+    Args:
+        context_factory (Callable[[], NcclEpContext]): Builds a fresh context. TE bootstrap and
+            sizing are fixed by the caller, which the factory captures.
+        max_size_fn (Callable[[], int]): Returns the current leak-backstop ceiling (the
+            microbatch count). Growth past it raises -- signalling leaked leases (a release bug)
+            or an unexpectedly deep schedule.
+        layer_name (str): Identifier used in diagnostics.
+    """
+
+    def __init__(self, context_factory, max_size_fn, layer_name: str = ""):
+        self._factory = context_factory
+        self._max_size_fn = max_size_fn
+        self._layer_name = layer_name
+        self._free: list = []
+        self._all: list = []
+        self._next_dispatch_id = 0
+
+    @property
+    def high_water_mark(self) -> int:
+        """Number of contexts ever allocated (the peak of concurrent leases)."""
+        return len(self._all)
+
+    def lease(self) -> _EpLease:
+        """Lease a free context, allocating a new one if all are in use."""
+        ctx = self._free.pop() if self._free else self._acquire()
+        if ctx.state != "free":
+            raise RuntimeError(
+                f"ncclep[{self._layer_name}]: pool handed out a context in state "
+                f"'{ctx.state}' (expected 'free') -- pool bookkeeping bug."
+            )
+        ctx.state = "leased"
+        ctx.generation += 1
+        lease = _EpLease(ctx, ctx.generation, self._next_dispatch_id)
+        self._next_dispatch_id += 1
+        return lease
+
+    def release(self, lease: _EpLease) -> None:
+        """Return a lease's context to the pool, loudly rejecting an out-of-order reuse."""
+        if lease.released:
+            return
+        ctx = lease.ctx
+        # Loud tripwire: in correct operation a context is not re-leased until after this
+        # lease's backward has run, so its generation is unchanged here. A mismatch means the
+        # context was leased again (its buffer overwritten) before this execution's backward
+        # consumed it -- concurrent in-flight microbatches exceeded safe reuse.
+        if ctx.generation != lease.generation:
+            raise RuntimeError(
+                f"ncclep[{self._layer_name}]: EP context for dispatch #{lease.dispatch_id} "
+                f"(generation {lease.generation}) was re-leased (now generation "
+                f"{ctx.generation}) before its backward ran -- a concurrent microbatch "
+                f"overwrote the EP buffer this backward needs. Buffer-override bug."
+            )
+        ctx.state = "free"
+        lease.released = True
+        self._retire(ctx)
+
+    def _acquire(self) -> "NcclEpContext":
+        max_size = self._max_size_fn()
+        if len(self._all) >= max_size:
+            raise RuntimeError(
+                f"ncclep[{self._layer_name}]: EP context pool would exceed the microbatch-count "
+                f"ceiling ({max_size}); in-flight microbatches cannot exceed it, so leases are "
+                f"not being released (a release bug) or the schedule is unexpectedly deep."
+            )
+        ctx = self._factory()
+        self._all.append(ctx)
+        return ctx
+
+    def _retire(self, ctx: "NcclEpContext") -> None:
+        # TODO(ncclep, comm-overlap): when dispatch/combine run on a comm stream separate from
+        # the expert-compute stream, record an event on the consuming (backward) stream here and
+        # have lease() make the dispatch stream wait on it before overwriting the buffer, to
+        # order cross-stream reuse. Single-stream training is ordered implicitly and needs none.
+        self._free.append(ctx)
 
 
 if HAVE_TE_EP:
