@@ -439,14 +439,6 @@ class AsyncDecodePlan:
         """Return a copy of the plan with the prepared runtime layout snapshot attached."""
         return replace(self, layout_snapshot=snapshot)
 
-    def current_request_ids(self) -> Tensor:
-        """Return committed request IDs in current-row order."""
-        if self.row_map is None:
-            return self.request_ids.clone()
-        return self.request_ids.index_select(
-            0, self.row_map.to(device=self.request_ids.device, dtype=torch.long)
-        ).clone()
-
 
 @dataclass(frozen=True)
 class AsyncPendingForwardDecision:
@@ -1267,7 +1259,7 @@ class AsyncMambaStateParticipant:
         if self.committed:
             return
         if getattr(self.context, "is_hybrid_model", False):
-            self.context.accept_async_mamba_state(plan.current_request_ids())
+            self.context.accept_async_mamba_state(plan.request_ids)
         self.committed = True
 
     def rollback(self, plan: AsyncDecodePlan) -> None:

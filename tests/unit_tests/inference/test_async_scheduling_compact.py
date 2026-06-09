@@ -2101,42 +2101,6 @@ def test_async_mamba_participant_commits_candidate_bank_once():
 
 
 @pytest.mark.internal
-def test_async_mamba_participant_commits_row_mapped_current_request_ids():
-    accepted_request_ids = []
-    context = SimpleNamespace(
-        is_hybrid_model=True,
-        accept_async_mamba_state=lambda request_ids: accepted_request_ids.append(
-            request_ids.clone()
-        ),
-    )
-    pending_snapshot = _make_async_layout_snapshot([21, 22, 23], cuda_graph_request_count=3)
-    current_snapshot = _make_async_layout_snapshot([23, 21], cuda_graph_request_count=3)
-    decision = resolve_async_pending_forward(
-        pending_snapshot,
-        current_snapshot,
-        row_map_policy=AsyncRowMapPolicy.REUSE,
-    )
-    plan = AsyncDecodePlan.from_snapshot(pending_snapshot).with_pending_forward_decision(
-        decision
-    )
-    participant = AsyncMambaStateParticipant(context)
-    transaction = AsyncDecodeTransaction(
-        step_id=7,
-        state=AsyncTxnState.RESOLVED,
-        snapshot=pending_snapshot,
-        plan=plan,
-        participants=(participant,),
-    )
-
-    transaction.mark_committed()
-
-    assert decision.reusable
-    assert decision.row_map.tolist() == [2, 0]
-    assert plan.current_request_ids().tolist() == [23, 21]
-    assert [request_ids.tolist() for request_ids in accepted_request_ids] == [[23, 21]]
-
-
-@pytest.mark.internal
 def test_controller_attaches_speculative_resource_participants_to_launch_transaction():
     accepted_request_ids = []
     released_blocks = []
