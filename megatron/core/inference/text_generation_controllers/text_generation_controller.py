@@ -1759,12 +1759,8 @@ class TextGenerationController:
     ) -> AsyncPendingForwardDecision:
         """Return the centralized pending-forward reuse decision."""
         context = self.inference_wrapped_model.inference_context
-        current_snapshot = AsyncLayoutSnapshot.from_context_current(
-            context, tokens_per_request=self.num_speculative_tokens + 1
-        )
-        assert transaction.plan is not None
-        return transaction.plan.resolve_pending_forward(
-            current_snapshot,
+        return transaction.pending_forward_decision(
+            context,
             row_map_policy=getattr(self, "_async_row_map_policy", AsyncRowMapPolicy.REUSE),
         )
 
@@ -1794,9 +1790,11 @@ class TextGenerationController:
         if transaction is None:
             return False, None, False
 
-        decision = self._pending_async_forward_decision(transaction)
-        assert transaction.plan is not None
-        transaction.plan = transaction.plan.with_pending_forward_decision(decision)
+        context = self.inference_wrapped_model.inference_context
+        decision = transaction.resolve_against_current(
+            context,
+            row_map_policy=getattr(self, "_async_row_map_policy", AsyncRowMapPolicy.REUSE),
+        )
         if decision.reusable:
             row_map = decision.row_map
             assert row_map is not None

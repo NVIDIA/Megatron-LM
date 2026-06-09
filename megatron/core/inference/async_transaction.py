@@ -700,22 +700,41 @@ class AsyncDecodeTransaction:
                 retire(plan)
         self._participants_retired = True
 
-    def resolve_against_current(self, context: object) -> Tensor | None:
-        """Resolve this transaction's pending rows against the current context."""
-        current = AsyncLayoutSnapshot.from_context_current(
+    def current_layout_snapshot(self, context: object) -> AsyncLayoutSnapshot:
+        """Build the current layout snapshot using this transaction's decode stride."""
+        return AsyncLayoutSnapshot.from_context_current(
             context, tokens_per_request=self.snapshot.graph_shape.tokens_per_request
         )
+
+    def pending_forward_decision(
+        self,
+        context: object,
+        *,
+        row_map_policy: AsyncRowMapPolicy | str = AsyncRowMapPolicy.REUSE,
+    ) -> AsyncPendingForwardDecision:
+        """Preview whether this transaction's pending forward is reusable."""
+        current = self.current_layout_snapshot(context)
         assert self.plan is not None
-        decision = self.plan.resolve_pending_forward(current)
+        return self.plan.resolve_pending_forward(current, row_map_policy=row_map_policy)
+
+    def resolve_against_current(
+        self,
+        context: object,
+        *,
+        row_map_policy: AsyncRowMapPolicy | str = AsyncRowMapPolicy.REUSE,
+    ) -> AsyncPendingForwardDecision:
+        """Resolve this transaction's pending rows against the current context."""
+        decision = self.pending_forward_decision(context, row_map_policy=row_map_policy)
+        assert self.plan is not None
         self.plan = self.plan.with_pending_forward_decision(decision)
         if not decision.reusable:
             self.discard(decision.reason or "pending forward not reusable")
-            return None
+            return decision
         row_map = decision.row_map
         assert row_map is not None
         self.row_map = row_map
         self.state = AsyncTxnState.RESOLVED
-        return row_map
+        return decision
 
     def mark_committed(self) -> None:
         """Mark transaction-owned side effects as committed."""
