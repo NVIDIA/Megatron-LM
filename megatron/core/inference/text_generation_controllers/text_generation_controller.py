@@ -2125,6 +2125,44 @@ class TextGenerationController:
         self._increment_async_counter("_async_rolled_back_forward_count")
         return False
 
+    def _launch_prepared_async_forward_before_bookkeeping(
+        self, sample_ticket: Optional[AsyncSampleTicket]
+    ) -> tuple[bool, Optional[torch.cuda.Event], Optional[int]]:
+        """Launch an already-prepared async forward before CPU bookkeeping drains."""
+        if not self._confirm_prepared_ep_async_handoff():
+            return False, None, None
+
+        context = self.inference_wrapped_model.inference_context
+        context.publish_async_prepared_decode_plan()
+        range_push("async_transfer_bookkeeping_to_gpu")
+        async_h2d_done_event = context.transfer_bookkeeping_to_gpu(
+            include_token_to_input_ids=False,
+            refresh_request_staging=False,
+            record_done_event=True,
+        )
+        range_pop()
+
+        range_push("async_forward_launch")
+        next_input_ids, next_position_ids = context.current_input_and_position_ids()
+        self._dynamic_step_forward_logits(next_input_ids, next_position_ids)
+        self._async_forward_launch_count += 1
+        self._increment_async_counter("_async_launched_forward_count")
+        cuda_graph_request_count = (
+            context.padded_active_request_count if context.using_cuda_graph_this_step() else None
+        )
+        transaction = self._begin_async_step_transaction(cuda_graph_request_count)
+        resources = context.mark_async_resources_in_flight()
+        self._attach_async_transaction_participants(
+            transaction, resources=resources, sample_ticket=sample_ticket
+        )
+        transaction.mark_launched(
+            sample_ticket=sample_ticket,
+            resources=resources,
+            h2d_done_event=async_h2d_done_event,
+        )
+        range_pop()
+        return True, async_h2d_done_event, cuda_graph_request_count
+
     def _async_scheduling_global_disabled_reason(self, *, allow_mtp: bool = False) -> Optional[str]:
         """Return non-step-local reasons async scheduling is disabled, or None."""
         context = self.inference_wrapped_model.inference_context
@@ -3143,36 +3181,11 @@ class TextGenerationController:
                 async_sampled_tokens_cpu = async_sample_ticket.sampled_tokens_cpu
                 async_sampled_mtp_tokens_cpu = async_sample_ticket.sampled_mtp_tokens_cpu
                 async_sample_ready_event = async_sample_ticket.copy_done_event
-                if self._confirm_prepared_ep_async_handoff():
-                    context.publish_async_prepared_decode_plan()
-                    range_push("async_transfer_bookkeeping_to_gpu")
-                    async_h2d_done_event = context.transfer_bookkeeping_to_gpu(
-                        include_token_to_input_ids=False,
-                        refresh_request_staging=False,
-                        record_done_event=True,
-                    )
-                    range_pop()
-                    range_push("async_forward_launch")
-                    next_input_ids, next_position_ids = context.current_input_and_position_ids()
-                    self._dynamic_step_forward_logits(next_input_ids, next_position_ids)
-                    self._async_forward_launch_count += 1
-                    self._increment_async_counter("_async_launched_forward_count")
-                    cuda_graph_request_count = (
-                        context.padded_active_request_count
-                        if context.using_cuda_graph_this_step()
-                        else None
-                    )
-                    transaction = self._begin_async_step_transaction(cuda_graph_request_count)
-                    resources = context.mark_async_resources_in_flight()
-                    self._attach_async_transaction_participants(
-                        transaction, resources=resources, sample_ticket=async_sample_ticket
-                    )
-                    transaction.mark_launched(
-                        sample_ticket=async_sample_ticket,
-                        resources=resources,
-                        h2d_done_event=async_h2d_done_event,
-                    )
-                    range_pop()
+                _, async_h2d_done_event, launch_graph_request_count = (
+                    self._launch_prepared_async_forward_before_bookkeeping(async_sample_ticket)
+                )
+                if launch_graph_request_count is not None:
+                    cuda_graph_request_count = launch_graph_request_count
 
             if deferred_mtp_blocks_to_release is not None:
                 range_push("mtp_deferred_release_memory_blocks")
