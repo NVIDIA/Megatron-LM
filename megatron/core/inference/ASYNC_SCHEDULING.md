@@ -1,7 +1,7 @@
 # Async Scheduling
 
-Async scheduling for dynamic decode overlaps CPU bookkeeping for step `N + 1`
-with GPU work from step `N`. The architecture is transactional: one canonical
+Async scheduling for dynamic decode overlaps CPU bookkeeping for step `N` with
+GPU work for step `N + 1`. The architecture is transactional: one canonical
 plan describes the candidate forward, one transaction owns its speculative
 state, and participants own subsystem side effects.
 
@@ -48,14 +48,26 @@ The lifecycle rules are:
 
 - `planned` and `prepared`: a candidate plan and CPU layout exist, but the
   pending forward has not been launched.
-- `launched`: H2D bookkeeping and the forward have been enqueued, and resources
-  that may still be visible to the forward are marked in flight.
+- `launched`: H2D bookkeeping and the forward have been enqueued before CPU
+  bookkeeping drains, and resources that may still be visible to the forward
+  are marked in flight.
 - `resolved`: the pending forward was matched against current rows and either
   identity reuse or row-mapped reuse was selected.
 - `committed`: participant-owned side effects are accepted exactly once.
 - `rolled_back`: participant-owned side effects are released or discarded
   exactly once.
 - `retired`: the transaction no longer owns active pending-forward state.
+
+The hot-path ordering is intentionally pre-commit:
+
+```text
+forward(N) -> sample(N) -> prepare plan(N+1) -> launch forward(N+1)
+           -> CPU bookkeeping(N) -> resolve/commit or rollback(N+1)
+```
+
+The next-step plan is prepared and launched before CPU bookkeeping can reveal
+whether it will be reused. Resolution after bookkeeping is therefore a
+transaction decision, not a second scheduling path.
 
 ## Central Eligibility
 
@@ -68,7 +80,10 @@ barriers, and graph stride compatibility.
 Pending-forward reuse is centralized separately in
 `resolve_async_pending_forward`. It returns `AsyncPendingForwardDecision` with
 the reusable flag, row map, row-mapped flag, discard reason, row-map policy, and
-layout/graph compatibility. Controller code consumes this decision instead of
+layout/graph compatibility. `AsyncDecodeTransaction.pending_forward_decision`
+previews this decision without changing state. `resolve_against_current`
+records the decision on the plan and transitions the transaction to `resolved`
+or a discarded state. Controller code consumes this decision instead of
 recomputing row-map or graph facts in multiple places.
 
 ## Layout And Row Maps
@@ -110,6 +125,11 @@ Participant hooks are idempotent. A commit or rollback retry must not publish
 Mamba banks twice, release a KV block twice, or consume the same sample ticket
 twice.
 
+Participants are attached through transaction helpers. If a participant is
+added after the transaction has already prepared its hooks, the new participant
+is prepared immediately. Attaching participants after commit, rollback, or
+retirement is rejected.
+
 ## Resource Ownership
 
 `AsyncResourceLedger` records KV reservations, deferred KV blocks, deferred
@@ -125,6 +145,11 @@ On commit, the resource participant releases deferred resources through the
 context allocators and clears in-flight state. On rollback, it first moves any
 unused reservations into the deferred list and then releases everything. This
 keeps prepare, commit, and rollback symmetric for speculative resources.
+
+Controller fallback cleanup exists only for lightweight tests and legacy
+transaction stubs that do not own an `AsyncResourceParticipant`. Real launched
+async forwards attach the resource participant when the context marks the
+ledger in flight.
 
 ## Mamba, MTP, And Logprobs
 
