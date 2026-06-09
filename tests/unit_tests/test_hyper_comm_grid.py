@@ -430,9 +430,7 @@ class TestHyperCommGrid:
         # base: tp=2, dp=2, pp=2 -> reversed [dp, tp, ...]; pp trailing -> contiguous blocks.
         grid = HyperCommGrid([2, 2, 2], ["tp", "dp", "pp"])
         # expert: expt_tp=2, ep=2, pp=2 -> pp trailing -> same membership as base.
-        grid.register_view(
-            "expert", [2, 2, 2], ["expt_tp", "ep", "pp"], shared_dims=["pp"]
-        )
+        grid.register_view("expert", [2, 2, 2], ["expt_tp", "ep", "pp"], shared_dims=["pp"])
 
         assert grid._views["expert"].shared_dims == ["pp"]
         # Both layouts enumerate pp identically.
