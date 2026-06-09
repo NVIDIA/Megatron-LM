@@ -50,6 +50,8 @@ class DistributedDataParallel(_BaseDataParallel):
         disable_bucketing: bool = False,
         pg_collection: Optional[ProcessGroupCollection] = None,
         full_param_layout: Optional[FullParamLayout] = None,
+        disable_grad_buffers_cpu_backup: bool = False,
+        disable_param_buffers_cpu_backup: bool = False,
     ):
         super().__init__(config=config, module=module)
         if has_config_logger_enabled(config):
@@ -249,6 +251,8 @@ class DistributedDataParallel(_BaseDataParallel):
                 self.ddp_config.nccl_ub,
                 pg_collection,
                 param_layout=param_layout,
+                disable_grad_buffers_cpu_backup=disable_grad_buffers_cpu_backup,
+                disable_param_buffers_cpu_backup=disable_param_buffers_cpu_backup,
             )
             if buffer_key.is_expert_parallel:
                 self.expert_parallel_buffers.append(buffer)
