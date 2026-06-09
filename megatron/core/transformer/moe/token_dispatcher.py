@@ -1016,6 +1016,8 @@ class _HybridEPManager(_DispatchManager):
         # Actually the the up-bound for the number of tokens
         # after permute op, None means no up-bound, will cause a CPU sync
         self.num_permuted_tokens = None
+        # Exact number of dispatched tokens when a bounded workspace contains an inactive tail.
+        self.num_actual_permuted_tokens = None
 
         # Metadata
         self.token_probs: Optional[torch.Tensor] = None
@@ -1040,16 +1042,19 @@ class _HybridEPManager(_DispatchManager):
 
         if self.moe_expert_rank_capacity_factor is not None:
             pad_multiple = get_align_size_for_quantization(self.config)
-            # Static upper bound on permuted tokens passed to HybridEP (dropless EP rank
-            # budget). Tokens above this budget are dropped inside HybridEP; dispatch then
-            # sets overflow_flag on the handle (accumulated in over_budget in dispatch()).
+            # Upper bound on permuted tokens passed to HybridEP. This enables nonblocking
+            # dispatch and avoids the dynamic-size host sync. If the real dynamic routing result
+            # is over budget, HybridEP reports it through the handle; the training/eval wrapper
+            # must discard the attempt and rerun without this bound.
             budget = int(
                 routing_map.shape[0]
                 * self.config.moe_router_topk
                 * self.moe_expert_rank_capacity_factor
             )
-            # Round budget up to pad_multiple (FP8/FP4/CUTLASS alignment for permute buffers).
-            budget += -budget % pad_multiple
+            # Round budget up when the dispatcher/expert path needs aligned permute buffers
+            # (FP8/FP4/CUTLASS). BF16 without the TE op-fuser has no alignment requirement.
+            if pad_multiple > 0:
+                budget += -budget % pad_multiple
             self.num_permuted_tokens = budget
         # else: num_permuted_tokens stays None; HybridEP sizes buffers dynamically (CPU sync
         # in dispatch) and does not drop tokens or report overflow.
@@ -1102,8 +1107,8 @@ class _HybridEPManager(_DispatchManager):
             )
         )
         if self.moe_expert_rank_capacity_factor is not None:
-            # Static-budget path only: handle[-1] is HybridEP overflow_flag when tokens were
-            # dropped because permuted count exceeded num_permuted_tokens from setup_metadata.
+            # Bounded-workspace path only: handle[-1] is HybridEP overflow_flag when the real
+            # permuted count exceeded num_permuted_tokens from setup_metadata.
             over_budget = self.handle[-1] != 0
             self.over_budget |= over_budget
         # When capacity factor is None, skip overflow tracking (no token drops). Actual
@@ -1115,6 +1120,15 @@ class _HybridEPManager(_DispatchManager):
             self.num_permuted_tokens = self.tokens_per_expert.sum()
         if self.moe_expert_rank_capacity_factor is not None:
             self.tokens_per_expert = tokens_per_expert.to(torch.int64)
+            if not self.config.use_transformer_engine_op_fuser:
+                # Non-fuser grouped GEMM consumes exact split metadata via tokens_per_expert.
+                # Trim the inactive workspace tail before experts; combine receives exact tokens,
+                # while backward uses the bounded workspace and trims gradients back to this count.
+                # Routing probabilities must be trimmed with hidden states because non-fuser expert
+                # activations apply them elementwise.
+                self.num_actual_permuted_tokens = int(self.tokens_per_expert.sum().item())
+                dispatched_hidden = dispatched_hidden[: self.num_actual_permuted_tokens]
+                self.dispatched_probs = self.dispatched_probs[: self.num_actual_permuted_tokens]
         return dispatched_hidden
 
     def combine(
@@ -1123,17 +1137,34 @@ class _HybridEPManager(_DispatchManager):
         async_finish: bool = True,
         allocate_on_comm_stream: bool = True,
     ) -> torch.Tensor:
+        if (
+            self.moe_expert_rank_capacity_factor is not None
+            and not self.config.use_transformer_engine_op_fuser
+            and self.num_actual_permuted_tokens is not None
+        ):
+            if hidden_states.shape[0] > self.num_permuted_tokens:
+                raise RuntimeError(
+                    "HybridEP bounded workspace expert output exceeds num_permuted_tokens: "
+                    f"{hidden_states.shape[0]} > {self.num_permuted_tokens}"
+                )
+            if hidden_states.shape[0] != self.num_actual_permuted_tokens:
+                raise RuntimeError(
+                    "HybridEP bounded workspace expert output must preserve exact token count: "
+                    f"{hidden_states.shape[0]} != {self.num_actual_permuted_tokens}"
+                )
         hidden_states = hybrid_ep_combine(
             x=hidden_states,
             handle=self.handle,
             num_permuted_tokens=self.num_permuted_tokens,
             pad_multiple=self.pad_multiple,
             fused=self.config.moe_permute_fusion_into_hybridep,
+            num_actual_permuted_tokens=self.num_actual_permuted_tokens,
         )
         # Release the used handle/num_permuted_tokens which could change in each iteration.
         # For drop_and_pad mode, we don't need to reset the num_permuted_tokens and
         # num_dispatched_tokens, because their values never change.
         self.handle = None
+        self.num_actual_permuted_tokens = None
         if not self.drop_and_pad:
             self.num_permuted_tokens = None
         return hidden_states
