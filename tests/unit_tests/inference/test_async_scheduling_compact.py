@@ -2267,6 +2267,7 @@ async def test_async_prepare_and_launch_do_not_move_after_cpu_bookkeeping(monkey
         def synchronize(self):
             events.append(f"{self.name}_sync")
 
+    cuda_graph_use = iter([True, False])
     context = SimpleNamespace(
         active_token_count=2,
         total_request_count=2,
@@ -2285,7 +2286,7 @@ async def test_async_prepare_and_launch_do_not_move_after_cpu_bookkeeping(monkey
             torch.tensor([[1, 2]], dtype=torch.int64),
             torch.tensor([[0, 1]], dtype=torch.int64),
         ),
-        using_cuda_graph_this_step=lambda: True,
+        using_cuda_graph_this_step=lambda: next(cuda_graph_use),
         mark_async_resources_in_flight=lambda: events.append("mark_in_flight") or "ledger",
     )
 
@@ -2358,6 +2359,7 @@ async def test_async_prepare_and_launch_do_not_move_after_cpu_bookkeeping(monkey
     result = await controller.async_generate_output_tokens_dynamic_batch(skip_bookkeeping=False)
 
     assert result["sample"].tolist() == [4, 5]
+    assert result["cuda_graph_request_count"] is None
     ordering = [
         event
         for event in events

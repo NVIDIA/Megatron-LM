@@ -3207,10 +3207,10 @@ class TextGenerationController:
                 async_sampled_tokens_cpu = async_sample_ticket.sampled_tokens_cpu
                 async_sampled_mtp_tokens_cpu = async_sample_ticket.sampled_mtp_tokens_cpu
                 async_sample_ready_event = async_sample_ticket.copy_done_event
-                _, async_h2d_done_event, launch_graph_request_count = (
+                async_launched, async_h2d_done_event, launch_graph_request_count = (
                     self._launch_prepared_async_forward_before_bookkeeping(async_sample_ticket)
                 )
-                if launch_graph_request_count is not None:
+                if async_launched:
                     cuda_graph_request_count = launch_graph_request_count
 
             if deferred_mtp_blocks_to_release is not None:
