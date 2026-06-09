@@ -1,16 +1,16 @@
 ---
 name: respond-to-issue
-description: On-call triage and response for GitHub issues and PRs in NVIDIA/Megatron-LM. Use when asked to reply to, classify, route, assign, scan open or out-of-SLA issues, batch-draft maintainer responses, ask for reproducibility/scenario details, or identify owners from CODEOWNERS, changed files, history, and similar reports.
-when_to_use: User shares a GitHub issue or PR URL/number, asks on-call to triage, route, assign, respond, draft a reply, scan issues needing response, find out-of-SLA community issues, ask for more information, or design automation for GitHub community intake.
+description: Maintainer triage and response for GitHub issues and PRs in NVIDIA/Megatron-LM. Use when asked to reply to, classify, route, assign, scan open or out-of-SLA issues, batch-draft responses, ask for reproducibility/scenario details, or identify owners from CODEOWNERS, changed files, history, and similar reports.
+when_to_use: User shares a GitHub issue or PR URL/number, asks a maintainer or on-call to triage, route, assign, respond, draft a reply, scan issues needing response, find out-of-SLA community issues, ask for more information, or design automation for GitHub community intake.
 user_invocable: true
 argument: "<github-issue-or-pr-url-or-number>"
 ---
 
-# On-call GitHub Triage
+# GitHub Issue and PR Triage
 
-Help the on-call maintainer respond quickly, route to the right owner, and ask for the minimum information needed to make progress on GitHub issues and PRs.
+Help maintainers and on-call responders reply quickly, route to the right owner, and ask for the minimum information needed to make progress on GitHub issues and PRs.
 
-Default posture: helpful coordinator first, technical diagnoser second. The on-call reply should either unblock the reporter, route the item to a likely owner, or ask for the exact missing data needed to reproduce and diagnose.
+Default posture: helpful coordinator first, technical diagnoser second. The reply should either unblock the reporter, route the item to a likely owner, or ask for the exact missing data needed to reproduce and diagnose.
 
 ## Workflow
 
@@ -84,9 +84,9 @@ Use evidence in this order:
 2. `.github/CODEOWNERS` for path/team ownership.
 3. Recent file history: `git log --oneline -20 -- <path>` and, when useful, `git log -S "<symbol>" -- <path>`.
 4. Similar issues/PRs and maintainers who already handled the same area.
-5. Current on-call when the report lacks enough information to route.
+5. Current on-call or maintainer coordinator when the report lacks enough information to route.
 
-Prefer routing to teams from CODEOWNERS when possible. Assign or request an individual only when they are clearly the code-change writer, active owner, or already engaged. If ownership is uncertain, keep on-call as coordinator and ask for the missing scenario/repro details.
+Prefer routing to teams from CODEOWNERS when possible. Assign or request an individual only when they are clearly the code-change writer, active owner, or already engaged. If ownership is uncertain, keep a maintainer/on-call responder as coordinator and ask for the missing scenario/repro details.
 
 Common owner evidence:
 
@@ -104,12 +104,12 @@ If the response will make a technical claim, verify it against code or CI first.
 - If claiming code is unused or missing, use `rg` and, if needed, `git log -S`.
 - If a fix already exists, link the issue/PR and state the relationship precisely.
 
-### 6. Draft the on-call reply
+### 6. Draft the maintainer reply
 
 Every reply should contain:
 
 1. Acknowledge the report or PR.
-2. Summarize the on-call understanding in one sentence.
+2. Summarize the maintainer understanding in one sentence.
 3. State the route or next action.
 4. Ask for exactly the missing information, or point to the likely owner/workaround/guide.
 
@@ -127,7 +127,7 @@ Thanks for the report. To route this to the right maintainer and reproduce it, c
 - Environment: container/OS, PyTorch, CUDA, NCCL, GPU type/count, node count
 - Scenario: model family, training/inference path, precision, and parallelism setup (TP/PP/DP/CP/EP/FSDP)
 
-Once we have that, on-call can route it to the right area owner.
+Once we have that, a maintainer can route it to the right area owner.
 ```
 
 Owner routing template:
@@ -141,13 +141,13 @@ If you can also add <one missing item>, that will make it easier for the owner t
 Question template:
 
 ```markdown
-Thanks for the question. My understanding is that you are trying to <scenario>. The relevant path appears to be <feature/config/doc>. Could you share the command/config and the parallelism/model setup you are using? With that, on-call can either answer directly or route to the owner of that path.
+Thanks for the question. My understanding is that you are trying to <scenario>. The relevant path appears to be <feature/config/doc>. Could you share the command/config and the parallelism/model setup you are using? With that, a maintainer can either answer directly or route to the owner of that path.
 ```
 
 PR routing template:
 
 ```markdown
-Thanks for the PR. To accelerate review, could you link the issue or describe the user scenario this fixes, list the validation commands/results, and note the affected area/owners if known? Based on the changed files, this likely needs review from @NVIDIA/<team>. On-call will keep this routed once the PR is ready for review and CI is passing.
+Thanks for the PR. To accelerate review, could you link the issue or describe the user scenario this fixes, list the validation commands/results, and note the affected area/owners if known? Based on the changed files, this likely needs review from @NVIDIA/<team>. Maintainers will keep this routed once the PR is ready for review and CI is passing.
 ```
 
 ### 7. Automation guidance
@@ -166,11 +166,11 @@ Recommended event model:
 
 - Issues: `opened`, `reopened`, `edited`, and `labeled` with `community-request`.
 - PRs: `opened`, `ready_for_review`, `reopened`, and `synchronize` only for routing/checklist refreshes.
-- Outputs: labels, team review requests, a concise public ask-for-info comment, and an on-call summary with owner evidence.
+- Outputs: labels, team review requests, a concise public ask-for-info comment, and a maintainer-facing summary with owner evidence.
 
 ### 8. Batch SLA scan
 
-When asked to scan issues needing on-call response, produce drafts first; never post during the scan.
+When asked to scan issues needing maintainer response, produce drafts first; never post during the scan.
 
 If the user gives an SLA, use it. If not, use age buckets instead of claiming an issue is out-of-SLA: `new` (<1 day), `watch` (1-2 days), `at-risk` (2-5 days), `stale` (>5 days), based on the latest reporter/community update that still needs maintainer action.
 
@@ -195,7 +195,7 @@ Classify as **needs reply** when:
 - the latest substantive comment is from the reporter/community and asks a new question or adds requested data;
 - the issue has `community-request`, `needs-info`, `needs-repro`, or no clear owner/label and is aging;
 - the issue was routed but no owner has engaged after the requested SLA;
-- a prior on-call reply asked for information and the reporter has now provided it.
+- a prior maintainer/on-call reply asked for information and the reporter has now provided it.
 
 Do **not** draft a new reply when:
 

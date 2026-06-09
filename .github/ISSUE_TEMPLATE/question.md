@@ -19,4 +19,4 @@ inference path, command/config if relevant, and parallelism setup
 
 **What have you tried?**
 Share links to docs, examples, configs, or related issues you have already
-checked. This helps oncall route the question to the right owner.
+checked. This helps maintainers route the question to the right owner.

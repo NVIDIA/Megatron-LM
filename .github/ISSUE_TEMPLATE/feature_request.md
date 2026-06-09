@@ -26,7 +26,7 @@ A clear and concise description of any alternative solutions or features you've 
 
 **Affected area / possible owners**
 If you know the relevant files, modules, or maintainers, list them here. This
-helps oncall route the request to the right owner.
+helps maintainers route the request to the right owner.
 
 **Contribution**
 Are you interested in contributing this change or helping validate a proposed
