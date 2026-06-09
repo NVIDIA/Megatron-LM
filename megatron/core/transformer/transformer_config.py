@@ -875,6 +875,13 @@ class TransformerConfig(ModelParallelConfig):
     moe_permute_fusion_into_hybridep: bool = False
     """Fuse token rearrangement ops during token dispatching for HybridEP."""
 
+    moe_hybridep_pad_variable_tokens: bool = False
+    """Pad uneven local token counts to the HybridEP group maximum before dispatch.
+
+    This is needed when the frontend supplies locally packed THD inputs whose token counts
+    can differ across ranks, without using Megatron Core's sequence_packing_scheduler.
+    """
+
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
 
