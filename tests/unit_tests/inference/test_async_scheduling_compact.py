@@ -1960,6 +1960,75 @@ def test_async_transaction_terminal_lifecycle_is_idempotent_and_fenced():
 
 
 @pytest.mark.internal
+def test_async_transaction_prepares_late_participants_once():
+    events = []
+
+    class _FirstParticipant:
+        def prepare(self, plan):
+            events.append(("prepare_first", plan.active_request_count))
+            return "first"
+
+        def validate(self, plan, current_state):
+            return True
+
+        def commit(self, plan):
+            events.append(("commit_first", plan.active_request_count))
+
+        def rollback(self, plan):
+            events.append(("rollback_first", plan.active_request_count))
+
+        def diagnostics(self):
+            return {}
+
+    class _SecondParticipant:
+        def prepare(self, plan):
+            events.append(("prepare_second", plan.active_request_count))
+            return "second"
+
+        def validate(self, plan, current_state):
+            return True
+
+        def commit(self, plan):
+            events.append(("commit_second", plan.active_request_count))
+
+        def rollback(self, plan):
+            events.append(("rollback_second", plan.active_request_count))
+
+        def diagnostics(self):
+            return {}
+
+    snapshot = _make_async_layout_snapshot([41, 42], cuda_graph_request_count=2)
+    first = _FirstParticipant()
+    second = _SecondParticipant()
+    transaction = AsyncDecodeTransaction(
+        step_id=11,
+        state=AsyncTxnState.PREPARED,
+        snapshot=snapshot,
+        participants=(first,),
+    )
+
+    transaction.prepare_participants()
+    transaction.add_participants(second)
+    transaction.prepare_participants()
+    transaction.mark_committed()
+
+    assert events == [
+        ("prepare_first", 2),
+        ("prepare_second", 2),
+        ("commit_first", 2),
+        ("commit_second", 2),
+    ]
+    assert transaction.has_participant(_FirstParticipant)
+    assert transaction.has_participant(_SecondParticipant)
+    assert transaction.participant_state == {
+        "_FirstParticipant": "first",
+        "_SecondParticipant": "second",
+    }
+    with pytest.raises(RuntimeError, match="after transaction finalization"):
+        transaction.add_participants(_SecondParticipant())
+
+
+@pytest.mark.internal
 def test_async_resource_participant_rolls_back_speculative_resources_once():
     released_blocks = []
     context = SimpleNamespace(

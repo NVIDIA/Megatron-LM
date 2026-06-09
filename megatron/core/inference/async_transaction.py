@@ -647,6 +647,33 @@ class AsyncDecodeTransaction:
         self.ep_decision = ep_decision if ep_decision is not None else self.ep_decision
         self.state = AsyncTxnState.LAUNCHED
 
+    def has_participant(self, participant_type: type) -> bool:
+        """Return whether this transaction owns a participant of ``participant_type``."""
+        return any(isinstance(participant, participant_type) for participant in self.participants)
+
+    def add_participants(self, *participants: AsyncTransactionParticipant) -> None:
+        """Attach participants, preparing new hooks immediately when needed."""
+        if not participants:
+            return
+        if (
+            self._participants_committed
+            or self._participants_rolled_back
+            or self._participants_retired
+        ):
+            raise RuntimeError("Cannot attach async participants after transaction finalization")
+        self.participants = (*self.participants, *participants)
+        if not self._participants_prepared:
+            return
+        plan = self.plan
+        assert plan is not None
+        for participant in participants:
+            self._prepare_participant(participant, plan)
+
+    def _prepare_participant(
+        self, participant: AsyncTransactionParticipant, plan: AsyncDecodePlan
+    ) -> None:
+        self.participant_state[type(participant).__name__] = participant.prepare(plan)
+
     def prepare_participants(self, plan: AsyncDecodePlan | None = None) -> None:
         """Prepare all transaction participants for the plan."""
         if self._participants_prepared:
@@ -654,7 +681,7 @@ class AsyncDecodeTransaction:
         plan = self.plan if plan is None else plan
         assert plan is not None
         for participant in self.participants:
-            self.participant_state[type(participant).__name__] = participant.prepare(plan)
+            self._prepare_participant(participant, plan)
         self._participants_prepared = True
 
     def validate_participants(

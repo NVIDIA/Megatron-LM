@@ -1671,8 +1671,26 @@ class TextGenerationController:
         self, transaction: object | None, participant_type: type
     ) -> bool:
         """Return whether a transaction already owns a participant type."""
+        if hasattr(transaction, "has_participant"):
+            return transaction.has_participant(participant_type)
         participants = getattr(transaction, "participants", ())
         return any(isinstance(participant, participant_type) for participant in participants)
+
+    def _rollback_or_discard_async_transaction(
+        self,
+        transaction: object,
+        reason: str,
+        *,
+        release_fallback_resources: bool,
+    ) -> None:
+        """Rollback participant-owned resources or use legacy context cleanup."""
+        context = self.inference_wrapped_model.inference_context
+        if self._async_transaction_has_participant(transaction, AsyncResourceParticipant):
+            transaction.rollback(reason)
+            return
+        if release_fallback_resources:
+            context.release_deferred_async_resources()
+        transaction.discard(reason)
 
     def _async_ep_participant_for_transaction(
         self, transaction: object | None, *, create: bool
@@ -1689,9 +1707,13 @@ class TextGenerationController:
         if not create:
             return None
         participant = AsyncEPParticipant()
-        transaction.participants = (*transaction.participants, participant)
-        if hasattr(transaction, "plan") and transaction.plan is not None:
-            participant.prepare(transaction.plan)
+        if hasattr(transaction, "add_participants"):
+            transaction.add_participants(participant)
+            transaction.prepare_participants()
+        else:
+            transaction.participants = (*transaction.participants, participant)
+            if hasattr(transaction, "plan") and transaction.plan is not None:
+                participant.prepare(transaction.plan)
         return participant
 
     def _record_ep_step_begin_decision(self, decision: EPStepBeginDecision) -> None:
@@ -1751,7 +1773,10 @@ class TextGenerationController:
 
         if not participants:
             return
-        transaction.participants = (*transaction.participants, *participants)
+        if hasattr(transaction, "add_participants"):
+            transaction.add_participants(*participants)
+        else:
+            transaction.participants = (*transaction.participants, *participants)
         transaction.prepare_participants()
 
     def _pending_async_forward_decision(
@@ -1818,22 +1843,22 @@ class TextGenerationController:
             self._increment_async_counter("_async_layout_mismatch_discard_count")
         self._increment_async_counter("_async_discarded_forward_count")
         self._increment_async_counter("_async_rolled_back_forward_count")
-        if self._async_transaction_has_participant(transaction, AsyncResourceParticipant):
-            transaction.rollback(decision.reason or "pending forward not reusable")
-        else:
-            transaction.discard(decision.reason or "pending forward not reusable")
+        self._rollback_or_discard_async_transaction(
+            transaction,
+            decision.reason or "pending forward not reusable",
+            release_fallback_resources=False,
+        )
         return False, None, False
 
     def _discard_pending_async_forward(self) -> None:
         """Discard a pending async forward and release resources reserved for it."""
-        context = self.inference_wrapped_model.inference_context
         transaction = self._pending_async_transaction()
         if transaction is not None:
-            if self._async_transaction_has_participant(transaction, AsyncResourceParticipant):
-                transaction.rollback("discarded before step begin")
-            else:
-                context.release_deferred_async_resources()
-                transaction.discard("discarded before step begin")
+            self._rollback_or_discard_async_transaction(
+                transaction,
+                "discarded before step begin",
+                release_fallback_resources=True,
+            )
             self._async_step_transaction = None
             self._increment_async_counter("_async_discarded_forward_count")
             self._increment_async_counter("_async_rolled_back_forward_count")
@@ -3020,12 +3045,11 @@ class TextGenerationController:
                     self._increment_async_counter("_async_discarded_forward_count")
                     self._increment_async_counter("_async_rolled_back_forward_count")
                     if transaction is not None:
-                        if self._async_transaction_has_participant(
-                            transaction, AsyncResourceParticipant
-                        ):
-                            transaction.rollback("row-mapped non-decode forward not reusable")
-                        else:
-                            transaction.discard("row-mapped non-decode forward not reusable")
+                        self._rollback_or_discard_async_transaction(
+                            transaction,
+                            "row-mapped non-decode forward not reusable",
+                            release_fallback_resources=False,
+                        )
                 if (
                     pending_forward_reused
                     and context.is_hybrid_model
@@ -3051,7 +3075,11 @@ class TextGenerationController:
                         and transaction.state
                         not in (AsyncTxnState.DISCARDED, AsyncTxnState.ROLLED_BACK)
                     ):
-                        transaction.discard("pending forward not reused")
+                        self._rollback_or_discard_async_transaction(
+                            transaction,
+                            "pending forward not reused",
+                            release_fallback_resources=False,
+                        )
                         self._increment_async_counter("_async_rolled_back_forward_count")
                     self._retire_async_transaction()
                 if pending_forward_reused and self.num_speculative_tokens > 0:
@@ -3238,13 +3266,11 @@ class TextGenerationController:
                     transaction = self._pending_async_transaction()
                     torch.cuda.current_stream().synchronize()
                     if transaction is not None:
-                        if self._async_transaction_has_participant(
-                            transaction, AsyncResourceParticipant
-                        ):
-                            transaction.rollback("no active requests after bookkeeping")
-                        else:
-                            context.release_deferred_async_resources()
-                            transaction.discard("no active requests after bookkeeping")
+                        self._rollback_or_discard_async_transaction(
+                            transaction,
+                            "no active requests after bookkeeping",
+                            release_fallback_resources=True,
+                        )
                         self._increment_async_counter("_async_discarded_forward_count")
                         self._increment_async_counter("_async_rolled_back_forward_count")
                         self._async_step_transaction = None
