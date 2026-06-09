@@ -573,7 +573,7 @@ def num_floating_point_operations(args, batch_size):
                 ## for in the dsv4_hybrid branch below.
                 q_term = args.q_lora_rank * (
                     args.hidden_size
-                    + args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim)
+                    + args.num_attention_heads * args.v_head_dim
                     + 1  # q norm
                 )
                 kv_term = args.hidden_size * args.v_head_dim + args.v_head_dim  # kv proj + kv norm
@@ -2546,7 +2546,10 @@ def training_log(
 
     # Log MTP metrics.
     if args.mtp_num_layers is not None:
-        mtp_loss_scale = 1 / get_num_microbatches()
+        # MTP tracker stores raw loss sums and token counts, so after reduction
+        # tracker["values"] already equals the per-token loss (loss_sum / num_tokens)
+        # aggregated across all ranks and microbatches. No further scaling needed.
+        mtp_loss_scale = 1.0
         MTPLossLoggingHelper.track_mtp_metrics(
             mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
         )
