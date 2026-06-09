@@ -308,30 +308,16 @@ class AsyncDecodePlan:
     """Canonical immutable description of one candidate async decode step."""
 
     layout: AsyncDecodeLayout
-    reserved_request_ids: Tensor
-    reserved_block_ids: Tensor
-    reserved_block_columns: Tensor
     finished_request_ids: Tensor
-    eligibility: object | None = None
-    ep_decision: object | None = None
     requires_mamba_state: bool = False
     requires_mtp: bool = False
     requires_logprobs: bool = False
-    expected_kv_reservation_count: int = 0
-    expected_mamba_lease_count: int = 0
 
     @classmethod
     def from_layout(cls, layout: AsyncDecodeLayout) -> "AsyncDecodePlan":
         """Build a minimal canonical plan around an existing layout."""
-        request_count = int(layout.request_ids.numel())
-        tokens_per_request = layout.graph_shape.tokens_per_request
-        active_token_count = request_count * tokens_per_request
-        empty_int = torch.empty((0,), dtype=torch.int32, device="cpu")
         return cls(
             layout=layout,
-            reserved_request_ids=empty_int.clone(),
-            reserved_block_ids=empty_int.clone(),
-            reserved_block_columns=empty_int.clone(),
             finished_request_ids=torch.empty((0,), dtype=layout.request_ids.dtype, device="cpu"),
             requires_mamba_state=(
                 layout.mamba_read_indices is not None or layout.mamba_write_indices is not None
@@ -449,9 +435,6 @@ class AsyncDecodePlan:
             "requires_mamba_state": self.requires_mamba_state,
             "requires_mtp": self.requires_mtp,
             "requires_logprobs": self.requires_logprobs,
-            "expected_kv_reservation_count": self.expected_kv_reservation_count,
-            "expected_mamba_lease_count": self.expected_mamba_lease_count,
-            "reserved_kv_blocks": int(self.reserved_block_ids.numel()),
             "finished_requests": int(self.finished_request_ids.numel()),
         }
 
@@ -651,7 +634,7 @@ class AsyncDecodeTransaction:
     plan: AsyncDecodePlan
     resolution: AsyncPendingForwardUse | None = None
     sample_ticket: object | None = None
-    resources: object | None = None
+    resource_ledger: object | None = None
     h2d_done_event: object | None = None
     forward_done_event: object | None = None
     ep_decision: object | None = None
@@ -668,13 +651,17 @@ class AsyncDecodeTransaction:
         *,
         sample_ticket: object | None = None,
         resources: object | None = None,
+        resource_ledger: object | None = None,
         h2d_done_event: object | None = None,
         forward_done_event: object | None = None,
         ep_decision: object | None = None,
     ) -> None:
         """Mark the async forward as launched and attach launch-owned state."""
         self.sample_ticket = sample_ticket if sample_ticket is not None else self.sample_ticket
-        self.resources = resources if resources is not None else self.resources
+        resource_ledger = resources if resources is not None else resource_ledger
+        self.resource_ledger = (
+            resource_ledger if resource_ledger is not None else self.resource_ledger
+        )
         self.h2d_done_event = h2d_done_event if h2d_done_event is not None else self.h2d_done_event
         self.forward_done_event = (
             forward_done_event if forward_done_event is not None else self.forward_done_event
@@ -860,7 +847,7 @@ class AsyncDecodeTransaction:
             "row_map": row_map,
             "discard_reason": self.discard_reason,
             "has_sample_ticket": self.sample_ticket is not None,
-            "has_resources": self.resources is not None,
+            "has_resources": self.resource_ledger is not None,
             "has_h2d_done_event": self.h2d_done_event is not None,
             "has_forward_done_event": self.forward_done_event is not None,
             "has_ep_decision": self.ep_decision is not None,
@@ -1046,7 +1033,7 @@ class AsyncSampleReadback:
         )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class AsyncKVReservation:
     """One KV block reserved by a speculative async decode plan."""
 
@@ -1064,14 +1051,13 @@ class AsyncMambaLease:
     bank_id: int
 
 
-@dataclass
+@dataclass(slots=True)
 class AsyncResourceLedger:
     """Owns resource lifetime for one speculative async forward."""
 
     kv_reservations: list[AsyncKVReservation] | None = None
     deferred_kv_blocks: list[int] | None = None
     deferred_mamba_slots: list[int] | None = None
-    mamba_leases: list[AsyncMambaLease] | None = None
     in_flight: bool = False
     consumed_reservation_count: int = 0
 
@@ -1082,8 +1068,6 @@ class AsyncResourceLedger:
             self.deferred_kv_blocks = []
         if self.deferred_mamba_slots is None:
             self.deferred_mamba_slots = []
-        if self.mamba_leases is None:
-            self.mamba_leases = []
 
     @property
     def reservation_count(self) -> int:
@@ -1093,14 +1077,6 @@ class AsyncResourceLedger:
     def clear_reservations(self) -> None:
         """Forget all unused KV reservations without releasing them."""
         self.kv_reservations.clear()
-
-    def record_reservations_from_plan(self, plan: object) -> None:
-        """Record KV reservations produced by an async lifecycle plan."""
-        self.record_reservations(
-            request_ids=plan.reserved_request_ids,
-            block_ids=plan.reserved_block_ids,
-            block_columns=plan.reserved_block_columns,
-        )
 
     def record_reservations(
         self, *, request_ids: Tensor, block_ids: Tensor, block_columns: Tensor
@@ -1159,20 +1135,27 @@ class AsyncResourceLedger:
         """Defer freeing Mamba slots that may still receive async writes."""
         self.deferred_mamba_slots.extend(_tensor_ints(slots, skip_negative=True))
 
-    def release_deferred(self, context: object) -> None:
-        """Release all deferred KV and Mamba resources through the context allocators."""
+    def release_deferred(self, allocator_ops: object) -> None:
+        """Release all deferred KV and Mamba resources through allocator operations."""
         self.in_flight = False
         if self.deferred_kv_blocks:
             blocks = torch.tensor(self.deferred_kv_blocks, dtype=torch.int32, device="cpu")
-            context.async_kv_deferred_release_count += int(blocks.numel())
-            context.kv_block_allocator.release_memory_blocks(blocks)
+            if hasattr(allocator_ops, "record_deferred_kv_release"):
+                allocator_ops.record_deferred_kv_release(int(blocks.numel()))
+                allocator_ops.release_kv_blocks(blocks)
+            else:
+                allocator_ops.async_kv_deferred_release_count += int(blocks.numel())
+                allocator_ops.kv_block_allocator.release_memory_blocks(blocks)
             self.deferred_kv_blocks.clear()
-        self._release_deferred_mamba_slots(context)
+        self._release_deferred_mamba_slots(allocator_ops)
+        clear_active = getattr(allocator_ops, "clear_active_async_ledger", None)
+        if clear_active is not None:
+            clear_active(self)
 
-    def drain(self, context: object) -> None:
+    def drain(self, allocator_ops: object) -> None:
         """Defer unused reservations and release every deferred resource."""
         self.defer_unused_reservations()
-        self.release_deferred(context)
+        self.release_deferred(allocator_ops)
 
     def deferred_kv_tensor(self) -> Tensor:
         """Return deferred KV blocks as a CPU tensor for diagnostics/tests."""
@@ -1213,16 +1196,19 @@ class AsyncResourceLedger:
             "reservations": len(self.kv_reservations),
             "deferred_kv_blocks": len(self.deferred_kv_blocks),
             "deferred_mamba_slots": len(self.deferred_mamba_slots),
-            "mamba_leases": len(self.mamba_leases),
             "consumed_reservations": self.consumed_reservation_count,
         }
 
-    def _release_deferred_mamba_slots(self, context: object) -> None:
-        if not getattr(context, "is_hybrid_model", False) or not self.deferred_mamba_slots:
+    def _release_deferred_mamba_slots(self, allocator_ops: object) -> None:
+        if not self.deferred_mamba_slots:
             return
         slots = torch.tensor(self.deferred_mamba_slots, dtype=torch.int32, device="cpu")
-        context.async_mamba_deferred_release_count += int(slots.numel())
-        context.mamba_metadata.free_slot_ids(slots)
+        if hasattr(allocator_ops, "record_deferred_mamba_release"):
+            allocator_ops.record_deferred_mamba_release(int(slots.numel()))
+            allocator_ops.release_mamba_slots(slots)
+        elif getattr(allocator_ops, "is_hybrid_model", False):
+            allocator_ops.async_mamba_deferred_release_count += int(slots.numel())
+            allocator_ops.mamba_metadata.free_slot_ids(slots)
         self.deferred_mamba_slots.clear()
 
 

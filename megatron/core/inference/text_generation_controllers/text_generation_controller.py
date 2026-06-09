@@ -22,7 +22,6 @@ from megatron.core.inference.async_transaction import (
     AsyncEPParticipant,
     AsyncLogprobMTPParticipant,
     AsyncMambaStateParticipant,
-    AsyncResourceLedger,
     AsyncResourceParticipant,
     AsyncRowMapPolicy,
     AsyncSampleReadback,
@@ -1757,7 +1756,7 @@ class TextGenerationController:
                 )
             )
 
-        if isinstance(resources, AsyncResourceLedger):
+        if resources is not None and hasattr(resources, "release_deferred"):
             participants.append(AsyncResourceParticipant(resources, context))
 
         if not participants:

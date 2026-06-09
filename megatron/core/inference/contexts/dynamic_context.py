@@ -963,7 +963,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             device='cpu',
             pin_memory=True,
         )
-        self._async_resource_ledger = AsyncResourceLedger()
+        self._active_async_ledger_ref: Optional[AsyncResourceLedger] = None
         self.async_kv_reservation_adoption_count = 0
         self.async_kv_deferred_release_count = 0
         self.async_mamba_deferred_release_count = 0
@@ -1912,7 +1912,8 @@ class DynamicInferenceContext(BaseInferenceContext):
     def reset_mamba_state(self) -> None:
         """Reset state used within Mamba layers."""
         if self.is_hybrid_model:
-            if self._async_resource_ledger.in_flight:
+            ledger = self._active_async_ledger_ref
+            if ledger is not None and ledger.in_flight:
                 self.defer_async_mamba_slots(
                     self.mamba_metadata.request_to_mamba_state_idx
                 )
@@ -2523,30 +2524,53 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def clear_async_resource_reservations(self) -> None:
         """Clear the request-to-reserved-block map after CPU reconciliation."""
-        self._async_resource_ledger.clear_reservations()
+        ledger = self._active_async_ledger_ref
+        if ledger is not None:
+            ledger.clear_reservations()
+
+    def register_active_async_ledger(self, ledger: AsyncResourceLedger) -> None:
+        """Borrow the transaction-owned resource ledger for context bookkeeping."""
+        self._active_async_ledger_ref = ledger
+
+    def clear_active_async_ledger(self, ledger: AsyncResourceLedger) -> None:
+        """Clear the borrowed active ledger reference if it still matches."""
+        if self._active_async_ledger_ref is ledger:
+            self._active_async_ledger_ref = None
+
+    def _active_async_ledger(self) -> AsyncResourceLedger:
+        """Return the borrowed active ledger, creating one for the current prepare path."""
+        ledger = self._active_async_ledger_ref
+        if ledger is None:
+            ledger = AsyncResourceLedger()
+            self._active_async_ledger_ref = ledger
+        return ledger
 
     def mark_async_resources_in_flight(self) -> AsyncResourceLedger:
         """Mark that a speculative forward may still be using old resources."""
-        self._async_resource_ledger.in_flight = True
-        return self._async_resource_ledger
+        ledger = self._active_async_ledger()
+        ledger.in_flight = True
+        return ledger
 
     def release_deferred_async_resources(self) -> None:
         """Release async-reserved resources after their speculative forward retires."""
-        self._async_resource_ledger.release_deferred(self)
+        ledger = self._active_async_ledger_ref
+        if ledger is not None:
+            ledger.release_deferred(self)
 
     def defer_async_kv_blocks(self, blocks: Tensor) -> None:
         """Defer releasing blocks that may still be used by an in-flight forward."""
-        self._async_resource_ledger.defer_kv_blocks(blocks)
+        self._active_async_ledger().defer_kv_blocks(blocks)
 
     def defer_async_mamba_slots(self, slots: Tensor) -> None:
         """Defer freeing Mamba slots that an in-flight forward may still write."""
-        self._async_resource_ledger.defer_mamba_slots(slots)
+        self._active_async_ledger().defer_mamba_slots(slots)
 
     def _free_mamba_slots_for_request_indexes(self, request_indexes: Tensor) -> None:
         """Free request-owned Mamba slots now or defer them past an async forward."""
         if not self.is_hybrid_model:
             return
-        if self._async_resource_ledger.in_flight:
+        ledger = self._active_async_ledger_ref
+        if ledger is not None and ledger.in_flight:
             mamba_indices_to_free = self.mamba_metadata.request_to_mamba_state_idx[
                 request_indexes
             ]
@@ -2565,7 +2589,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             return None
         if self.get_index_of_chunked_prefill_request(safe=True) != -1:
             return None
-        if self._async_resource_ledger.reservation_count != 0:
+        ledger = self._active_async_ledger_ref
+        if ledger is not None and ledger.reservation_count != 0:
             return None
 
         tokens_per_request = self.num_speculative_tokens + 1
@@ -2769,15 +2794,17 @@ class DynamicInferenceContext(BaseInferenceContext):
             mamba_read_indices=mamba_read_indices,
             mamba_write_indices=mamba_write_indices,
         )
+        if reserve_blocks and reserved_block_ids.numel() > 0:
+            self._active_async_ledger().record_reservations(
+                request_ids=reserved_request_ids,
+                block_ids=reserved_block_ids,
+                block_columns=reserved_block_columns,
+            )
         return AsyncDecodePlan(
             layout=layout,
-            reserved_request_ids=reserved_request_ids,
-            reserved_block_ids=reserved_block_ids,
-            reserved_block_columns=reserved_block_columns,
             finished_request_ids=finished_request_ids.clone(),
             requires_mamba_state=self.is_hybrid_model,
             requires_mtp=self.num_speculative_tokens > 0,
-            expected_kv_reservation_count=int(reserved_block_ids.numel()),
         )
 
     def clear_async_prepared_decode_plan(self) -> None:
@@ -2791,11 +2818,13 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def discard_async_prepared_decode_plan(self) -> None:
         """Release resources held only for a prepared async launch that will not run."""
-        if self._async_resource_ledger.reservation_count > 0:
+        ledger = self._active_async_ledger_ref
+        if ledger is not None and ledger.reservation_count > 0:
             self.kv_block_allocator.release_memory_blocks(
-                self._async_resource_ledger.reserved_block_ids_tensor()
+                ledger.reserved_block_ids_tensor()
             )
             self.clear_async_resource_reservations()
+            self.clear_active_async_ledger(ledger)
         self.clear_async_prepared_decode_plan()
 
     def _snapshot_async_pre_sampling_state(self) -> Dict[str, object]:
@@ -3027,18 +3056,24 @@ class DynamicInferenceContext(BaseInferenceContext):
         self, request_ids: Tensor, block_columns: Tensor
     ) -> Tensor:
         """Return reserved blocks for resumed requests, or -1 where none is reserved."""
-        consumed_before = self._async_resource_ledger.consumed_reservation_count
-        reserved_block_ids = self._async_resource_ledger.consume_reserved_blocks(
-            request_ids, block_columns
-        )
+        ledger = self._active_async_ledger_ref
+        consumed_before = 0 if ledger is None else ledger.consumed_reservation_count
+        if ledger is None:
+            reserved_block_ids = torch.full(
+                (request_ids.numel(),), -1, dtype=torch.int32, device="cpu"
+            )
+        else:
+            reserved_block_ids = ledger.consume_reserved_blocks(request_ids, block_columns)
         self.async_kv_reservation_adoption_count += (
-            self._async_resource_ledger.consumed_reservation_count - consumed_before
+            (0 if ledger is None else ledger.consumed_reservation_count) - consumed_before
         )
         return reserved_block_ids
 
     def defer_unused_async_kv_reservations(self) -> None:
         """Quarantine reserved blocks that actual CPU bookkeeping did not consume."""
-        self._async_resource_ledger.defer_unused_reservations()
+        ledger = self._active_async_ledger_ref
+        if ledger is not None:
+            ledger.defer_unused_reservations()
 
     def _execute_pending_mamba_ops(self) -> None:
         """Execute Mamba GPU operations deferred from add_request() / update_requests().
@@ -3135,18 +3170,16 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self._restore_async_pre_sampling_state(pre_sampling_current_state)
             return False
 
-        reserved_block_count = int(plan.reserved_block_ids.numel())
-        if reserved_block_count > 0:
-            self._async_resource_ledger.record_reservations_from_plan(plan)
-
         if not self._record_async_decode_input_sources(
             plan,
             previous_paused_request_count=previous_paused_request_count,
             previous_total_request_count=previous_total_request_count,
         ):
-            if reserved_block_count > 0:
-                self.kv_block_allocator.release_memory_blocks(plan.reserved_block_ids)
+            ledger = self._active_async_ledger_ref
+            if ledger is not None and ledger.reservation_count > 0:
+                self.kv_block_allocator.release_memory_blocks(ledger.reserved_block_ids_tensor())
                 self.clear_async_resource_reservations()
+                self.clear_active_async_ledger(ledger)
             self.clear_async_prepared_decode_plan()
             if pre_sampling_current_state is not None:
                 self._restore_async_pre_sampling_state(pre_sampling_current_state)
@@ -3933,7 +3966,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         kv_blocks_assigned = self.request_to_kv_block_ids[request_indexes]
         non_zero_values_in_kv_memory = kv_blocks_assigned[kv_blocks_assigned != -1]
-        if self._async_resource_ledger.in_flight:
+        ledger = self._active_async_ledger_ref
+        if ledger is not None and ledger.in_flight:
             self.defer_async_kv_blocks(non_zero_values_in_kv_memory)
         else:
             self.kv_block_allocator.release_memory_blocks(non_zero_values_in_kv_memory)
