@@ -16,9 +16,10 @@ from torch.cuda.nvtx import range_pop, range_push
 from megatron.core import parallel_state
 from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.async_transaction import (
+    AsyncDecodeLayout,
+    AsyncDecodePlan,
     AsyncDecodeTransaction,
     AsyncEPParticipant,
-    AsyncLayoutSnapshot,
     AsyncLogprobMTPParticipant,
     AsyncMambaStateParticipant,
     AsyncPendingForwardDecision,
@@ -1646,7 +1647,7 @@ class TextGenerationController:
         pending_request_ids = context.async_prepared_request_ids_cpu()
         if pending_request_ids is None:
             pending_request_ids = self._active_request_ids_cpu()
-        snapshot = AsyncLayoutSnapshot.from_prepared_context(
+        layout = AsyncDecodeLayout.from_prepared_context(
             context,
             request_ids=pending_request_ids,
             padded_active_request_count=cuda_graph_request_count,
@@ -1656,9 +1657,10 @@ class TextGenerationController:
         if hasattr(context, "async_prepared_decode_plan"):
             prepared_plan = context.async_prepared_decode_plan()
         if prepared_plan is not None:
-            prepared_plan = prepared_plan.with_layout_snapshot(snapshot)
+            prepared_plan = prepared_plan.with_layout(layout)
+        else:
+            prepared_plan = AsyncDecodePlan.from_layout(layout)
         transaction = self._get_async_decode_coordinator().begin_transaction(
-            snapshot=snapshot,
             plan=prepared_plan,
             state=AsyncTxnState.PREPARED,
         )
@@ -2944,7 +2946,7 @@ class TextGenerationController:
             if self._has_pending_async_forward_state():
                 transaction = self._pending_async_transaction()
                 assert transaction is not None
-                cuda_graph_request_count = transaction.snapshot.graph_shape.padded_active_request_count
+                cuda_graph_request_count = transaction.plan.graph_shape.padded_active_request_count
                 (
                     pending_forward_reused,
                     pending_forward_row_indices,

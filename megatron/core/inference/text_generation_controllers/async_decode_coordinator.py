@@ -7,9 +7,9 @@ import torch
 from torch import Tensor
 
 from megatron.core.inference.async_transaction import (
+    AsyncDecodeLayout,
     AsyncDecodePlan,
     AsyncDecodeTransaction,
-    AsyncLayoutSnapshot,
     AsyncRowMapPolicy,
     AsyncTxnState,
 )
@@ -37,7 +37,7 @@ class AsyncDecodeContextOps(Protocol):
         """Copy sampled tokens into prepared decode input rows."""
         ...
 
-    def current_layout(self, *, tokens_per_request: int) -> AsyncLayoutSnapshot:
+    def current_layout(self, *, tokens_per_request: int) -> AsyncDecodeLayout:
         """Return the current context layout."""
         ...
 
@@ -200,15 +200,13 @@ class AsyncDecodeCoordinator:
     def begin_transaction(
         self,
         *,
-        snapshot: AsyncLayoutSnapshot,
-        plan: AsyncDecodePlan | None = None,
+        plan: AsyncDecodePlan,
         state: AsyncTxnState = AsyncTxnState.PREPARED,
     ) -> AsyncDecodeTransaction:
         """Create and register the transaction for a just-prepared async forward."""
         transaction = AsyncDecodeTransaction(
             step_id=self._next_step_id,
             state=state,
-            snapshot=snapshot,
             plan=plan,
         )
         self._pending_transaction = transaction
@@ -231,9 +229,8 @@ class AsyncDecodeCoordinator:
         has_pending_forward = transaction is not None
         if transaction is not None:
             current_layout = self._context_ops.current_layout(
-                tokens_per_request=transaction.snapshot.graph_shape.tokens_per_request
+                tokens_per_request=transaction.plan.graph_shape.tokens_per_request
             )
-            assert transaction.plan is not None
             decision = transaction.plan.resolve_pending_forward(
                 current_layout, row_map_policy=self._model_callbacks.row_map_policy()
             )
@@ -311,8 +308,8 @@ class _DynamicContextOps:
             num_speculative_tokens=num_speculative_tokens,
         )
 
-    def current_layout(self, *, tokens_per_request: int) -> AsyncLayoutSnapshot:
-        return AsyncLayoutSnapshot.from_context_current(
+    def current_layout(self, *, tokens_per_request: int) -> AsyncDecodeLayout:
+        return AsyncDecodeLayout.from_context_current(
             self._context, tokens_per_request=tokens_per_request
         )
 

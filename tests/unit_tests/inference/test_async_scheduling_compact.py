@@ -8,11 +8,11 @@ import torch
 
 from megatron.core import utils as core_utils
 from megatron.core.inference.async_transaction import (
+    AsyncDecodeLayout,
     AsyncDecodePlan,
     AsyncDecodeTransaction,
     AsyncEPParticipant,
     AsyncGraphShape,
-    AsyncLayoutSnapshot,
     AsyncLogprobMTPParticipant,
     AsyncMambaStateParticipant,
     AsyncResourceLedger,
@@ -342,12 +342,12 @@ def _make_controller_with_rows(pending_ids, current_ids, current_graph_count=Non
     if pending_ids is not None:
         _install_pending_transaction(
             controller,
-            _make_async_layout_snapshot(pending_ids, cuda_graph_request_count=pending_graph_count),
+            _make_async_decode_layout(pending_ids, cuda_graph_request_count=pending_graph_count),
         )
     return controller
 
 
-def _make_async_layout_snapshot(
+def _make_async_decode_layout(
     request_ids,
     *,
     cuda_graph_request_count=None,
@@ -358,8 +358,9 @@ def _make_async_layout_snapshot(
     request_count = int(request_ids_tensor.numel())
     if cuda_graph_request_count is None:
         cuda_graph_request_count = request_count
-    return AsyncLayoutSnapshot(
+    return AsyncDecodeLayout(
         request_ids=request_ids_tensor,
+        source_request_idxs=torch.arange(request_count, dtype=torch.long),
         graph_shape=AsyncGraphShape(
             active_request_count=request_count,
             active_token_count=request_count * tokens_per_request,
@@ -370,23 +371,22 @@ def _make_async_layout_snapshot(
     )
 
 
-def _install_pending_transaction(controller, snapshot, *, state=AsyncTxnState.LAUNCHED):
+def _install_pending_transaction(controller, layout, *, state=AsyncTxnState.LAUNCHED):
     if not hasattr(controller, "inference_wrapped_model"):
         controller.inference_wrapped_model = SimpleNamespace(
             inference_context=SimpleNamespace(
-                request_ids=snapshot.request_ids,
+                request_ids=layout.request_ids,
                 paused_request_count=0,
-                total_request_count=int(snapshot.request_ids.numel()),
-                active_token_count=int(snapshot.request_ids.numel()),
-                padded_active_request_count=snapshot.graph_shape.padded_active_request_count,
+                total_request_count=int(layout.request_ids.numel()),
+                active_token_count=int(layout.request_ids.numel()),
+                padded_active_request_count=layout.graph_shape.padded_active_request_count,
                 using_cuda_graph_this_step=lambda: True,
             )
         )
     if not hasattr(controller, "_async_decode_coordinator"):
         controller._async_decode_coordinator = None
     transaction = controller._get_async_decode_coordinator().begin_transaction(
-        snapshot=snapshot,
-        plan=AsyncDecodePlan.from_snapshot(snapshot),
+        plan=AsyncDecodePlan.from_layout(layout),
         state=state,
     )
     return transaction
@@ -410,10 +410,10 @@ def _sample_ticket(tokens, mtp_tokens=None):
 def test_async_decode_coordinator_owns_transaction_state_machine():
     controller = _make_controller_with_rows(None, [10, 11])
     coordinator = controller._get_async_decode_coordinator()
-    snapshot = _make_async_layout_snapshot([10, 11], cuda_graph_request_count=2)
-    plan = AsyncDecodePlan.from_snapshot(snapshot)
+    layout = _make_async_decode_layout([10, 11], cuda_graph_request_count=2)
+    plan = AsyncDecodePlan.from_layout(layout)
 
-    transaction = coordinator.begin_transaction(snapshot=snapshot, plan=plan)
+    transaction = coordinator.begin_transaction(plan=plan)
 
     assert transaction.step_id == 0
     assert coordinator.pending_transaction() is transaction
@@ -431,14 +431,14 @@ def _async_layout_snapshot_status(controller):
     transaction = controller._get_async_decode_coordinator()._pending_transaction
     if transaction is None:
         return True, False
-    pending_snapshot = transaction.snapshot
-    current_snapshot = AsyncLayoutSnapshot.from_context_current(
+    pending_layout = transaction.plan.layout
+    current_layout = AsyncDecodeLayout.from_context_current(
         controller.inference_wrapped_model.inference_context, tokens_per_request=1
     )
-    row_map = pending_snapshot.row_map_to_current(current_snapshot.request_ids)
-    if not pending_snapshot.graph_compatible_with(current_snapshot) or row_map is None:
+    row_map = pending_layout.row_map_to_current(current_layout.request_ids)
+    if not pending_layout.graph_compatible_with(current_layout) or row_map is None:
         return False, False
-    return True, not torch.equal(pending_snapshot.request_ids, current_snapshot.request_ids)
+    return True, not torch.equal(pending_layout.request_ids, current_layout.request_ids)
 
 
 @pytest.mark.internal
@@ -510,9 +510,9 @@ def test_async_layout_snapshot_matches_pending_forward_row_decisions(
 
 @pytest.mark.internal
 def test_async_pending_forward_decision_respects_row_map_policy():
-    pending = _make_async_layout_snapshot([10, 11, 12], cuda_graph_request_count=3)
-    current = _make_async_layout_snapshot([12, 10], cuda_graph_request_count=3)
-    truncated_current = _make_async_layout_snapshot([10, 11], cuda_graph_request_count=3)
+    pending = _make_async_decode_layout([10, 11, 12], cuda_graph_request_count=3)
+    current = _make_async_decode_layout([12, 10], cuda_graph_request_count=3)
+    truncated_current = _make_async_decode_layout([10, 11], cuda_graph_request_count=3)
 
     reuse = resolve_async_pending_forward(
         pending, current, row_map_policy=AsyncRowMapPolicy.REUSE
@@ -545,9 +545,9 @@ def test_async_pending_forward_decision_respects_row_map_policy():
 
 @pytest.mark.internal
 def test_async_decode_plan_owns_pending_forward_layout_decision():
-    pending = _make_async_layout_snapshot([10, 11, 12], cuda_graph_request_count=3)
-    current = _make_async_layout_snapshot([12, 10], cuda_graph_request_count=3)
-    plan = AsyncDecodePlan.from_snapshot(pending)
+    pending = _make_async_decode_layout([10, 11, 12], cuda_graph_request_count=3)
+    current = _make_async_decode_layout([12, 10], cuda_graph_request_count=3)
+    plan = AsyncDecodePlan.from_layout(pending)
 
     decision = plan.resolve_pending_forward(current, row_map_policy=AsyncRowMapPolicy.REUSE)
     resolved_plan = plan.with_pending_forward_decision(decision)
@@ -643,7 +643,7 @@ def test_record_pending_forward_uses_prepared_request_order():
 
     transaction = controller._begin_async_step_transaction(cuda_graph_request_count=3)
 
-    assert transaction.snapshot.request_ids.tolist() == [10, 12, 11]
+    assert transaction.plan.layout.request_ids.tolist() == [10, 12, 11]
     assert cleared == [True]
 
 
@@ -658,7 +658,7 @@ def test_pending_async_forward_discards_when_planned_layout_mismatches_current()
     context.token_to_pos_ids = torch.tensor([6, 11], dtype=torch.int64)
     context.token_to_block_idx = torch.tensor([100, 200], dtype=torch.int32)
     context.token_to_local_position_within_kv_block = torch.tensor([6, 11], dtype=torch.int32)
-    pending_snapshot = _make_async_layout_snapshot(
+    pending_layout = _make_async_decode_layout(
         [10, 11],
         cuda_graph_request_count=2,
         request_query_lengths=torch.tensor([1, 1], dtype=torch.int32),
@@ -670,13 +670,13 @@ def test_pending_async_forward_discards_when_planned_layout_mismatches_current()
             [[6], [11]], dtype=torch.int32
         ),
     )
-    _install_pending_transaction(controller, pending_snapshot)
-    current_snapshot = AsyncLayoutSnapshot.from_context_current(context, tokens_per_request=1)
-    row_map = pending_snapshot.row_map_to_current(current_snapshot.request_ids)
+    _install_pending_transaction(controller, pending_layout)
+    current_layout = AsyncDecodeLayout.from_context_current(context, tokens_per_request=1)
+    row_map = pending_layout.row_map_to_current(current_layout.request_ids)
 
     assert controller._pending_async_forward_row_status() == (False, False)
     assert row_map is not None
-    assert pending_snapshot.layout_compatible_with(current_snapshot, row_map=row_map) is False
+    assert pending_layout.layout_compatible_with(current_layout, row_map=row_map) is False
     assert controller._resolve_pending_async_forward() == (False, None, False)
     assert controller._async_discarded_forward_count == 1
 
@@ -691,7 +691,7 @@ def test_pending_async_forward_discards_next_step_position_drift():
     context.token_to_pos_ids = torch.tensor([6, 11], dtype=torch.int64)
     context.token_to_block_idx = torch.tensor([100, 200], dtype=torch.int32)
     context.token_to_local_position_within_kv_block = torch.tensor([6, 11], dtype=torch.int32)
-    pending_snapshot = _make_async_layout_snapshot(
+    pending_layout = _make_async_decode_layout(
         [10, 11],
         cuda_graph_request_count=2,
         request_query_lengths=torch.tensor([1, 1], dtype=torch.int32),
@@ -701,7 +701,7 @@ def test_pending_async_forward_discards_next_step_position_drift():
         token_to_block_idx=torch.tensor([[100], [200]], dtype=torch.int32),
         token_to_local_position_within_kv_block=torch.tensor([[7], [12]], dtype=torch.int32),
     )
-    _install_pending_transaction(controller, pending_snapshot)
+    _install_pending_transaction(controller, pending_layout)
 
     assert controller._pending_async_forward_row_status() == (False, False)
     assert controller._resolve_pending_async_forward() == (False, None, False)
@@ -721,7 +721,7 @@ def test_pending_async_forward_reuses_subset_when_finished_row_left():
     context.token_to_pos_ids = torch.tensor([21, 5], dtype=torch.int64)
     context.token_to_block_idx = torch.tensor([300, 100], dtype=torch.int32)
     context.token_to_local_position_within_kv_block = torch.tensor([21, 5], dtype=torch.int32)
-    pending_snapshot = _make_async_layout_snapshot(
+    pending_layout = _make_async_decode_layout(
         [10, 11, 12],
         cuda_graph_request_count=3,
         request_query_lengths=torch.tensor([1, 1, 1], dtype=torch.int32),
@@ -733,9 +733,9 @@ def test_pending_async_forward_reuses_subset_when_finished_row_left():
             [[5], [13], [21]], dtype=torch.int32
         ),
     )
-    _install_pending_transaction(controller, pending_snapshot)
-    current_snapshot = AsyncLayoutSnapshot.from_context_current(context, tokens_per_request=1)
-    row_map = pending_snapshot.row_map_to_current(current_snapshot.request_ids)
+    _install_pending_transaction(controller, pending_layout)
+    current_layout = AsyncDecodeLayout.from_context_current(context, tokens_per_request=1)
+    row_map = pending_layout.row_map_to_current(current_layout.request_ids)
 
     reused, row_indices, row_mapped = controller._resolve_pending_async_forward()
 
@@ -744,7 +744,7 @@ def test_pending_async_forward_reuses_subset_when_finished_row_left():
     assert row_indices.tolist() == [2, 0]
     assert row_map is not None
     assert row_map.tolist() == [2, 0]
-    assert pending_snapshot.layout_compatible_with(current_snapshot, row_map=row_map)
+    assert pending_layout.layout_compatible_with(current_layout, row_map=row_map)
     transaction = controller._pending_async_transaction()
     assert transaction.plan.row_map.tolist() == [2, 0]
     assert transaction.plan.row_mapped
@@ -763,7 +763,7 @@ def test_pending_async_forward_discards_when_token_request_layout_mismatches():
     context.token_to_request_idx = torch.tensor([0, 1], dtype=torch.int32)
     _install_pending_transaction(
         controller,
-        _make_async_layout_snapshot(
+        _make_async_decode_layout(
             [10, 11],
             cuda_graph_request_count=2,
             token_to_request_idx=torch.tensor([[0], [0]], dtype=torch.int32),
@@ -790,7 +790,7 @@ def test_pending_async_forward_discards_when_mamba_bank_layout_mismatches():
     )
     _install_pending_transaction(
         controller,
-        _make_async_layout_snapshot(
+        _make_async_decode_layout(
             [10, 11],
             cuda_graph_request_count=2,
             mamba_read_indices=torch.tensor([6, 8], dtype=torch.int32),
@@ -825,7 +825,7 @@ async def test_reused_pending_forward_prepares_next_step_before_sampling(monkeyp
     controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
     controller.num_speculative_tokens = 0
     _install_pending_transaction(
-        controller, _make_async_layout_snapshot([10, 11], cuda_graph_request_count=2)
+        controller, _make_async_decode_layout([10, 11], cuda_graph_request_count=2)
     )
     controller._async_prepare_deferred_until_after_sampling = False
     controller._decide_ep_step_begin = lambda **_kwargs: EPStepBeginDecision(
@@ -883,7 +883,7 @@ async def test_reused_pending_forward_falls_back_after_sampling_when_presampling
     controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
     controller.num_speculative_tokens = 0
     _install_pending_transaction(
-        controller, _make_async_layout_snapshot([10, 11], cuda_graph_request_count=2)
+        controller, _make_async_decode_layout([10, 11], cuda_graph_request_count=2)
     )
     controller._async_prepare_deferred_until_after_sampling = False
     controller._decide_ep_step_begin = lambda **_kwargs: EPStepBeginDecision(
@@ -1218,7 +1218,7 @@ def test_controller_step_begin_bridges_local_and_ep_protocol_decisions(
 def test_controller_step_begin_records_ep_decision_on_transaction_participant():
     controller = _make_controller_with_rows([10, 11], [11, 10])
     transaction = _install_pending_transaction(
-        controller, _make_async_layout_snapshot([10, 11], cuda_graph_request_count=2)
+        controller, _make_async_decode_layout([10, 11], cuda_graph_request_count=2)
     )
 
     decision = controller._decide_ep_step_begin(has_real_work=True)
@@ -1236,12 +1236,11 @@ def test_controller_ep_handoff_participant_attaches_to_launch_transaction():
     controller.inference_wrapped_model = SimpleNamespace(
         inference_context=SimpleNamespace(is_hybrid_model=False)
     )
-    snapshot = _make_async_layout_snapshot([30], cuda_graph_request_count=1)
+    snapshot = _make_async_decode_layout([30], cuda_graph_request_count=1)
     transaction = AsyncDecodeTransaction(
         step_id=8,
         state=AsyncTxnState.PREPARED,
-        snapshot=snapshot,
-        plan=AsyncDecodePlan.from_snapshot(snapshot),
+        plan=AsyncDecodePlan.from_layout(snapshot),
     )
 
     handoff = controller._decide_ep_async_handoff(
@@ -1664,7 +1663,7 @@ def test_pending_async_forward_cleanup_releases_only_when_needed():
     assert controller._async_discarded_forward_count == 0
 
     transaction = _install_pending_transaction(
-        controller, _make_async_layout_snapshot([1, 2], cuda_graph_request_count=2)
+        controller, _make_async_decode_layout([1, 2], cuda_graph_request_count=2)
     )
     controller._discard_pending_async_forward()
     assert context.release_count == 1
@@ -1711,7 +1710,7 @@ def test_async_diagnostics_report_pending_forward_disable_counts_and_ep_protocol
     controller._async_scheduling_enabled = True
     controller._async_decode_coordinator = None
     _install_pending_transaction(
-        controller, _make_async_layout_snapshot([1], cuda_graph_request_count=1)
+        controller, _make_async_decode_layout([1], cuda_graph_request_count=1)
     )
     controller._async_step_barrier_reason = "logging step"
     controller._async_eligibility_check_count = 4
@@ -1778,7 +1777,7 @@ def test_async_row_map_policy_setter_switches_exact_parity_mode():
 
 @pytest.mark.internal
 def test_async_transaction_and_resource_diagnostics_are_stable():
-    snapshot = _make_async_layout_snapshot([10, 11], cuda_graph_request_count=2)
+    snapshot = _make_async_decode_layout([10, 11], cuda_graph_request_count=2)
     ledger = AsyncResourceLedger(in_flight=True)
     ledger.record_reservations(
         request_ids=torch.tensor([10], dtype=torch.int32),
@@ -1789,7 +1788,7 @@ def test_async_transaction_and_resource_diagnostics_are_stable():
     transaction = AsyncDecodeTransaction(
         step_id=7,
         state=AsyncTxnState.LAUNCHED,
-        snapshot=snapshot,
+        plan=AsyncDecodePlan.from_layout(snapshot),
         resources=ledger,
         row_map=torch.tensor([1, 0], dtype=torch.long),
     )
@@ -1858,12 +1857,11 @@ def test_async_decode_plan_and_transaction_participant_hooks_are_canonical():
             events.append(("rollback", plan.active_request_count))
 
     participant = _Participant()
-    snapshot = _make_async_layout_snapshot([21, 22], cuda_graph_request_count=2)
-    plan = AsyncDecodePlan.from_snapshot(snapshot)
+    snapshot = _make_async_decode_layout([21, 22], cuda_graph_request_count=2)
+    plan = AsyncDecodePlan.from_layout(snapshot)
     transaction = AsyncDecodeTransaction(
         step_id=3,
         state=AsyncTxnState.PLANNED,
-        snapshot=snapshot,
         plan=plan,
         participants=(participant,),
     )
@@ -1880,7 +1878,6 @@ def test_async_decode_plan_and_transaction_participant_hooks_are_canonical():
     rollback_transaction = AsyncDecodeTransaction(
         step_id=4,
         state=AsyncTxnState.PREPARED,
-        snapshot=snapshot,
         plan=plan,
         participants=(participant,),
     )
@@ -1925,12 +1922,12 @@ def test_async_transaction_terminal_lifecycle_fences_rollback_not_retire():
         def diagnostics(self):
             return {}
 
-    snapshot = _make_async_layout_snapshot([31, 32], cuda_graph_request_count=2)
+    snapshot = _make_async_decode_layout([31, 32], cuda_graph_request_count=2)
     participant = _Participant()
     transaction = AsyncDecodeTransaction(
         step_id=9,
         state=AsyncTxnState.LAUNCHED,
-        snapshot=snapshot,
+        plan=AsyncDecodePlan.from_layout(snapshot),
         forward_done_event=_Event(),
         participants=(participant,),
     )
@@ -1956,7 +1953,7 @@ def test_async_transaction_terminal_lifecycle_fences_rollback_not_retire():
     committed = AsyncDecodeTransaction(
         step_id=10,
         state=AsyncTxnState.LAUNCHED,
-        snapshot=snapshot,
+        plan=AsyncDecodePlan.from_layout(snapshot),
         forward_done_event=_Event(),
         participants=(participant,),
     )
@@ -2018,13 +2015,13 @@ def test_async_transaction_prepares_late_participants_once():
         def diagnostics(self):
             return {}
 
-    snapshot = _make_async_layout_snapshot([41, 42], cuda_graph_request_count=2)
+    snapshot = _make_async_decode_layout([41, 42], cuda_graph_request_count=2)
     first = _FirstParticipant()
     second = _SecondParticipant()
     transaction = AsyncDecodeTransaction(
         step_id=11,
         state=AsyncTxnState.PREPARED,
-        snapshot=snapshot,
+        plan=AsyncDecodePlan.from_layout(snapshot),
         participants=(first,),
     )
 
@@ -2067,11 +2064,11 @@ def test_async_resource_participant_rolls_back_speculative_resources_once():
     )
     ledger.defer_kv_blocks(torch.tensor([200], dtype=torch.int32))
     participant = AsyncResourceParticipant(ledger, context)
-    snapshot = _make_async_layout_snapshot([10], cuda_graph_request_count=1)
+    snapshot = _make_async_decode_layout([10], cuda_graph_request_count=1)
     transaction = AsyncDecodeTransaction(
         step_id=5,
         state=AsyncTxnState.PREPARED,
-        snapshot=snapshot,
+        plan=AsyncDecodePlan.from_layout(snapshot),
         participants=(participant,),
     )
 
@@ -2102,13 +2099,12 @@ def test_async_mamba_participant_commits_candidate_bank_once():
             request_ids.clone()
         ),
     )
-    snapshot = _make_async_layout_snapshot([21, 22], cuda_graph_request_count=2)
-    plan = AsyncDecodePlan.from_snapshot(snapshot)
+    snapshot = _make_async_decode_layout([21, 22], cuda_graph_request_count=2)
+    plan = AsyncDecodePlan.from_layout(snapshot)
     participant = AsyncMambaStateParticipant(context)
     transaction = AsyncDecodeTransaction(
         step_id=6,
         state=AsyncTxnState.RESOLVED,
-        snapshot=snapshot,
         plan=plan,
         participants=(participant,),
     )
@@ -2140,12 +2136,11 @@ def test_controller_attaches_speculative_resource_participants_to_launch_transac
     controller.inference_wrapped_model = SimpleNamespace(inference_context=context)
     controller.num_speculative_tokens = 2
     controller._async_logprob_requests_seen = False
-    snapshot = _make_async_layout_snapshot([31, 32], cuda_graph_request_count=2)
+    snapshot = _make_async_decode_layout([31, 32], cuda_graph_request_count=2)
     transaction = AsyncDecodeTransaction(
         step_id=7,
         state=AsyncTxnState.PREPARED,
-        snapshot=snapshot,
-        plan=AsyncDecodePlan.from_snapshot(snapshot),
+        plan=AsyncDecodePlan.from_layout(snapshot),
     )
     ledger = AsyncResourceLedger(in_flight=True)
     ledger.defer_kv_blocks(torch.tensor([300], dtype=torch.int32))

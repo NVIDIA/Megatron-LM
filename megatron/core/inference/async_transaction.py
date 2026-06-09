@@ -50,18 +50,21 @@ class AsyncGraphShape:
     tokens_per_request: int
 
 
-@dataclass(frozen=True)
-class AsyncLayoutSnapshot:
+@dataclass(frozen=True, slots=True)
+class AsyncDecodeLayout:
     """CPU-visible request, token, and state layout for an async decode forward."""
 
     request_ids: Tensor
+    source_request_idxs: Tensor
     graph_shape: AsyncGraphShape
     request_query_lengths: Tensor | None = None
     request_kv_length_offsets: Tensor | None = None
-    token_to_request_idx: Tensor | None = None
+    request_to_kv_block_ids: Tensor | None = None
     token_to_pos_ids: Tensor | None = None
-    token_to_block_idx: Tensor | None = None
+    token_to_request_idx: Tensor | None = None
+    token_to_position_in_request: Tensor | None = None
     token_to_local_position_within_kv_block: Tensor | None = None
+    token_to_block_idx: Tensor | None = None
     mamba_read_indices: Tensor | None = None
     mamba_write_indices: Tensor | None = None
 
@@ -73,7 +76,7 @@ class AsyncLayoutSnapshot:
         request_ids: Tensor,
         padded_active_request_count: int | None,
         tokens_per_request: int,
-    ) -> "AsyncLayoutSnapshot":
+    ) -> "AsyncDecodeLayout":
         """Build a snapshot from the prepared async-forward context layout."""
         request_ids = request_ids.clone()
         request_count = int(request_ids.numel())
@@ -96,6 +99,7 @@ class AsyncLayoutSnapshot:
 
         return cls(
             request_ids=request_ids,
+            source_request_idxs=torch.arange(request_count, dtype=torch.long, device="cpu"),
             graph_shape=graph_shape,
             request_query_lengths=_clone_prefix(
                 getattr(context, "_staging_request_query_lengths", None), request_count
@@ -103,11 +107,17 @@ class AsyncLayoutSnapshot:
             request_kv_length_offsets=_clone_prefix(
                 getattr(context, "_staging_request_kv_length_offsets", None), request_count
             ),
+            request_to_kv_block_ids=_clone_prefix(
+                getattr(context, "request_to_kv_block_ids", None), request_count
+            ),
             token_to_request_idx=_clone_token_rows(
                 context, "token_to_request_idx", request_count, tokens_per_request
             ),
             token_to_pos_ids=_clone_token_rows(
                 context, "token_to_pos_ids", request_count, tokens_per_request
+            ),
+            token_to_position_in_request=_clone_token_rows(
+                context, "token_to_position_in_request", request_count, tokens_per_request
             ),
             token_to_block_idx=_clone_token_rows(
                 context, "token_to_block_idx", request_count, tokens_per_request
@@ -123,9 +133,7 @@ class AsyncLayoutSnapshot:
         )
 
     @classmethod
-    def from_context_current(
-        cls, context: Any, *, tokens_per_request: int
-    ) -> "AsyncLayoutSnapshot":
+    def from_context_current(cls, context: Any, *, tokens_per_request: int) -> "AsyncDecodeLayout":
         """Build a snapshot from the context's current active rows."""
         active_slice = slice(context.paused_request_count, context.total_request_count)
         request_ids = context.request_ids[active_slice].clone()
@@ -153,16 +161,25 @@ class AsyncLayoutSnapshot:
 
         return cls(
             request_ids=request_ids,
+            source_request_idxs=torch.arange(
+                context.paused_request_count, context.total_request_count, dtype=torch.long
+            ),
             graph_shape=graph_shape,
             request_query_lengths=_clone_active(context, "request_query_lengths", active_slice),
             request_kv_length_offsets=_clone_active(
                 context, "request_kv_length_offsets", active_slice
+            ),
+            request_to_kv_block_ids=_clone_active(
+                context, "request_to_kv_block_ids", active_slice
             ),
             token_to_request_idx=_clone_token_rows(
                 context, "token_to_request_idx", request_count, tokens_per_request
             ),
             token_to_pos_ids=_clone_token_rows(
                 context, "token_to_pos_ids", request_count, tokens_per_request
+            ),
+            token_to_position_in_request=_clone_token_rows(
+                context, "token_to_position_in_request", request_count, tokens_per_request
             ),
             token_to_block_idx=_clone_token_rows(
                 context, "token_to_block_idx", request_count, tokens_per_request
@@ -198,7 +215,7 @@ class AsyncLayoutSnapshot:
             mapped_rows.append(row)
         return torch.tensor(mapped_rows, dtype=torch.long, device="cpu")
 
-    def graph_compatible_with(self, current: "AsyncLayoutSnapshot") -> bool:
+    def graph_compatible_with(self, current: "AsyncDecodeLayout") -> bool:
         """Return whether the pending graph execution shape can satisfy current rows."""
         return (
             self.graph_shape.tokens_per_request == current.graph_shape.tokens_per_request
@@ -207,7 +224,7 @@ class AsyncLayoutSnapshot:
         )
 
     def layout_compatible_with(
-        self, current: "AsyncLayoutSnapshot", *, row_map: Tensor | None = None
+        self, current: "AsyncDecodeLayout", *, row_map: Tensor | None = None
     ) -> bool:
         """Return whether current CPU bookkeeping matches this pending layout."""
         planned_fields = (
@@ -286,29 +303,15 @@ class AsyncLayoutSnapshot:
         return True
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class AsyncDecodePlan:
     """Canonical immutable description of one candidate async decode step."""
 
-    request_ids: Tensor
-    source_request_idxs: Tensor
-    query_lengths: Tensor
-    kv_length_offsets: Tensor
-    request_to_kv_block_ids: Tensor
-    token_to_pos_ids: Tensor
-    token_to_request_idx: Tensor
-    token_to_position_in_request: Tensor
-    token_to_local_position_within_kv_block: Tensor
-    token_to_block_idx: Tensor
+    layout: AsyncDecodeLayout
     reserved_request_ids: Tensor
     reserved_block_ids: Tensor
     reserved_block_columns: Tensor
     finished_request_ids: Tensor
-    active_request_count: int
-    active_token_count: int
-    padded_active_request_count: int | None = None
-    tokens_per_request: int = 1
-    layout_snapshot: AsyncLayoutSnapshot | None = None
     row_map: Tensor | None = None
     row_mapped: bool = False
     graph_compatible: bool = True
@@ -322,72 +325,122 @@ class AsyncDecodePlan:
     expected_mamba_lease_count: int = 0
 
     @classmethod
-    def from_snapshot(cls, snapshot: AsyncLayoutSnapshot) -> "AsyncDecodePlan":
-        """Build a minimal canonical plan around an existing layout snapshot."""
-        request_count = int(snapshot.request_ids.numel())
-        tokens_per_request = snapshot.graph_shape.tokens_per_request
+    def from_layout(cls, layout: AsyncDecodeLayout) -> "AsyncDecodePlan":
+        """Build a minimal canonical plan around an existing layout."""
+        request_count = int(layout.request_ids.numel())
+        tokens_per_request = layout.graph_shape.tokens_per_request
         active_token_count = request_count * tokens_per_request
         empty_int = torch.empty((0,), dtype=torch.int32, device="cpu")
         return cls(
-            request_ids=snapshot.request_ids.clone(),
-            source_request_idxs=torch.arange(request_count, dtype=torch.long, device="cpu"),
-            query_lengths=torch.full(
-                (request_count,), tokens_per_request, dtype=torch.int32, device="cpu"
-            ),
-            kv_length_offsets=torch.empty((request_count,), dtype=torch.int32, device="cpu"),
-            request_to_kv_block_ids=torch.empty((request_count, 0), dtype=torch.int32, device="cpu"),
-            token_to_pos_ids=(
-                snapshot.token_to_pos_ids.reshape(-1).clone()
-                if snapshot.token_to_pos_ids is not None
-                else torch.empty((active_token_count,), dtype=torch.int64, device="cpu")
-            ),
-            token_to_request_idx=(
-                snapshot.token_to_request_idx.reshape(-1).clone()
-                if snapshot.token_to_request_idx is not None
-                else torch.arange(request_count, dtype=torch.int32, device="cpu").repeat_interleave(
-                    tokens_per_request
-                )
-            ),
-            token_to_position_in_request=(
-                snapshot.token_to_pos_ids.reshape(-1).clone()
-                if snapshot.token_to_pos_ids is not None
-                else torch.empty((active_token_count,), dtype=torch.int64, device="cpu")
-            ),
-            token_to_local_position_within_kv_block=(
-                snapshot.token_to_local_position_within_kv_block.reshape(-1).clone()
-                if snapshot.token_to_local_position_within_kv_block is not None
-                else torch.empty((active_token_count,), dtype=torch.int32, device="cpu")
-            ),
-            token_to_block_idx=(
-                snapshot.token_to_block_idx.reshape(-1).clone()
-                if snapshot.token_to_block_idx is not None
-                else torch.empty((active_token_count,), dtype=torch.int32, device="cpu")
-            ),
+            layout=layout,
             reserved_request_ids=empty_int.clone(),
             reserved_block_ids=empty_int.clone(),
             reserved_block_columns=empty_int.clone(),
-            finished_request_ids=torch.empty((0,), dtype=snapshot.request_ids.dtype, device="cpu"),
-            active_request_count=request_count,
-            active_token_count=active_token_count,
-            padded_active_request_count=snapshot.graph_shape.padded_active_request_count,
-            tokens_per_request=tokens_per_request,
-            layout_snapshot=snapshot,
+            finished_request_ids=torch.empty((0,), dtype=layout.request_ids.dtype, device="cpu"),
             requires_mamba_state=(
-                snapshot.mamba_read_indices is not None or snapshot.mamba_write_indices is not None
+                layout.mamba_read_indices is not None or layout.mamba_write_indices is not None
             ),
         )
 
     @property
+    def request_ids(self) -> Tensor:
+        """Return planned request ids from the layout."""
+        return self.layout.request_ids
+
+    @property
+    def source_request_idxs(self) -> Tensor:
+        """Return source request rows from the layout."""
+        return self.layout.source_request_idxs
+
+    @property
+    def query_lengths(self) -> Tensor:
+        """Return planned per-request query lengths."""
+        if self.layout.request_query_lengths is None:
+            return torch.full(
+                (self.active_request_count,),
+                self.tokens_per_request,
+                dtype=torch.int32,
+                device="cpu",
+            )
+        return self.layout.request_query_lengths
+
+    @property
+    def kv_length_offsets(self) -> Tensor:
+        """Return planned KV length offsets."""
+        if self.layout.request_kv_length_offsets is None:
+            return torch.empty((self.active_request_count,), dtype=torch.int32, device="cpu")
+        return self.layout.request_kv_length_offsets
+
+    @property
+    def request_to_kv_block_ids(self) -> Tensor:
+        """Return planned request-to-KV-block table."""
+        if self.layout.request_to_kv_block_ids is None:
+            return torch.empty((self.active_request_count, 0), dtype=torch.int32, device="cpu")
+        return self.layout.request_to_kv_block_ids
+
+    @property
+    def token_to_pos_ids(self) -> Tensor:
+        """Return planned token position ids."""
+        if self.layout.token_to_pos_ids is None:
+            return torch.empty((self.active_token_count,), dtype=torch.int64, device="cpu")
+        return self.layout.token_to_pos_ids.reshape(-1)
+
+    @property
+    def token_to_request_idx(self) -> Tensor:
+        """Return planned token-to-request rows."""
+        if self.layout.token_to_request_idx is None:
+            return torch.arange(
+                self.active_request_count, dtype=torch.int32, device="cpu"
+            ).repeat_interleave(self.tokens_per_request)
+        return self.layout.token_to_request_idx.reshape(-1)
+
+    @property
+    def token_to_position_in_request(self) -> Tensor:
+        """Return planned token positions within each request."""
+        if self.layout.token_to_position_in_request is not None:
+            return self.layout.token_to_position_in_request.reshape(-1)
+        if self.layout.token_to_pos_ids is not None:
+            return self.layout.token_to_pos_ids.reshape(-1)
+        return torch.empty((self.active_token_count,), dtype=torch.int64, device="cpu")
+
+    @property
+    def token_to_local_position_within_kv_block(self) -> Tensor:
+        """Return planned token positions within KV blocks."""
+        if self.layout.token_to_local_position_within_kv_block is None:
+            return torch.empty((self.active_token_count,), dtype=torch.int32, device="cpu")
+        return self.layout.token_to_local_position_within_kv_block.reshape(-1)
+
+    @property
+    def token_to_block_idx(self) -> Tensor:
+        """Return planned token block ids."""
+        if self.layout.token_to_block_idx is None:
+            return torch.empty((self.active_token_count,), dtype=torch.int32, device="cpu")
+        return self.layout.token_to_block_idx.reshape(-1)
+
+    @property
     def graph_shape(self) -> AsyncGraphShape:
         """Return the CUDA graph shape owned by the plan."""
-        if self.layout_snapshot is not None:
-            return self.layout_snapshot.graph_shape
-        return AsyncGraphShape(
-            active_request_count=self.active_request_count,
-            active_token_count=self.active_token_count,
-            padded_active_request_count=self.padded_active_request_count,
-            tokens_per_request=self.tokens_per_request,
-        )
+        return self.layout.graph_shape
+
+    @property
+    def active_request_count(self) -> int:
+        """Return planned active request count."""
+        return self.graph_shape.active_request_count
+
+    @property
+    def active_token_count(self) -> int:
+        """Return planned active token count."""
+        return self.graph_shape.active_token_count
+
+    @property
+    def padded_active_request_count(self) -> int | None:
+        """Return planned padded request count."""
+        return self.graph_shape.padded_active_request_count
+
+    @property
+    def tokens_per_request(self) -> int:
+        """Return planned decode stride."""
+        return self.graph_shape.tokens_per_request
 
     def diagnostics(self) -> dict[str, Any]:
         """Return a cheap immutable-plan diagnostic snapshot."""
@@ -412,16 +465,12 @@ class AsyncDecodePlan:
 
     def resolve_pending_forward(
         self,
-        current: AsyncLayoutSnapshot,
+        current: AsyncDecodeLayout,
         *,
         row_map_policy: AsyncRowMapPolicy | str = AsyncRowMapPolicy.REUSE,
     ) -> "AsyncPendingForwardDecision":
         """Resolve this plan's layout snapshot against the current context layout."""
-        if self.layout_snapshot is None:
-            raise ValueError("AsyncDecodePlan requires a layout_snapshot to resolve row reuse")
-        return resolve_async_pending_forward(
-            self.layout_snapshot, current, row_map_policy=row_map_policy
-        )
+        return resolve_async_pending_forward(self.layout, current, row_map_policy=row_map_policy)
 
     def with_pending_forward_decision(
         self, decision: "AsyncPendingForwardDecision"
@@ -435,9 +484,9 @@ class AsyncDecodePlan:
             layout_compatible=decision.layout_compatible,
         )
 
-    def with_layout_snapshot(self, snapshot: AsyncLayoutSnapshot) -> "AsyncDecodePlan":
-        """Return a copy of the plan with the prepared runtime layout snapshot attached."""
-        return replace(self, layout_snapshot=snapshot)
+    def with_layout(self, layout: AsyncDecodeLayout) -> "AsyncDecodePlan":
+        """Return a copy of the plan with the prepared runtime layout attached."""
+        return replace(self, layout=layout)
 
 
 @dataclass(frozen=True)
@@ -471,8 +520,8 @@ class AsyncPendingForwardDecision:
 
 
 def resolve_async_pending_forward(
-    pending: AsyncLayoutSnapshot,
-    current: AsyncLayoutSnapshot,
+    pending: AsyncDecodeLayout,
+    current: AsyncDecodeLayout,
     *,
     row_map_policy: AsyncRowMapPolicy | str = AsyncRowMapPolicy.REUSE,
 ) -> AsyncPendingForwardDecision:
@@ -609,8 +658,7 @@ class AsyncDecodeTransaction:
 
     step_id: int
     state: AsyncTxnState
-    snapshot: AsyncLayoutSnapshot
-    plan: AsyncDecodePlan | None = None
+    plan: AsyncDecodePlan
     sample_ticket: object | None = None
     resources: object | None = None
     h2d_done_event: object | None = None
@@ -624,10 +672,6 @@ class AsyncDecodeTransaction:
     _participants_committed: bool = False
     _participants_rolled_back: bool = False
     _participants_retired: bool = False
-
-    def __post_init__(self) -> None:
-        if self.plan is None:
-            self.plan = AsyncDecodePlan.from_snapshot(self.snapshot)
 
     def mark_launched(
         self,
@@ -666,7 +710,6 @@ class AsyncDecodeTransaction:
         if not self._participants_prepared:
             return
         plan = self.plan
-        assert plan is not None
         for participant in participants:
             self._prepare_participant(participant, plan)
 
@@ -728,10 +771,10 @@ class AsyncDecodeTransaction:
                 retire(plan)
         self._participants_retired = True
 
-    def current_layout_snapshot(self, context: object) -> AsyncLayoutSnapshot:
-        """Build the current layout snapshot using this transaction's decode stride."""
-        return AsyncLayoutSnapshot.from_context_current(
-            context, tokens_per_request=self.snapshot.graph_shape.tokens_per_request
+    def current_layout(self, context: object) -> AsyncDecodeLayout:
+        """Build the current layout using this transaction's decode stride."""
+        return AsyncDecodeLayout.from_context_current(
+            context, tokens_per_request=self.plan.graph_shape.tokens_per_request
         )
 
     def pending_forward_decision(
@@ -741,8 +784,7 @@ class AsyncDecodeTransaction:
         row_map_policy: AsyncRowMapPolicy | str = AsyncRowMapPolicy.REUSE,
     ) -> AsyncPendingForwardDecision:
         """Preview whether this transaction's pending forward is reusable."""
-        current = self.current_layout_snapshot(context)
-        assert self.plan is not None
+        current = self.current_layout(context)
         return self.plan.resolve_pending_forward(current, row_map_policy=row_map_policy)
 
     def resolve_against_current(
@@ -753,7 +795,6 @@ class AsyncDecodeTransaction:
     ) -> AsyncPendingForwardDecision:
         """Resolve this transaction's pending rows against the current context."""
         decision = self.pending_forward_decision(context, row_map_policy=row_map_policy)
-        assert self.plan is not None
         self.plan = self.plan.with_pending_forward_decision(decision)
         if not decision.reusable:
             return decision
@@ -818,7 +859,7 @@ class AsyncDecodeTransaction:
         return {
             "step_id": self.step_id,
             "state": self.state.value,
-            "request_ids": self.snapshot.request_ids.to(device="cpu").tolist(),
+            "request_ids": self.plan.request_ids.to(device="cpu").tolist(),
             "row_map": row_map,
             "discard_reason": self.discard_reason,
             "has_sample_ticket": self.sample_ticket is not None,
@@ -830,7 +871,7 @@ class AsyncDecodeTransaction:
             "participants_committed": self._participants_committed,
             "participants_rolled_back": self._participants_rolled_back,
             "participants_retired": self._participants_retired,
-            "plan": None if self.plan is None else self.plan.diagnostics(),
+            "plan": self.plan.diagnostics(),
             "participants": {
                 type(participant).__name__: participant.diagnostics()
                 for participant in self.participants

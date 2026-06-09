@@ -12,7 +12,12 @@ import torch.nn.functional as F  # type: ignore
 from torch import Tensor  # type: ignore
 
 from megatron.core import parallel_state
-from megatron.core.inference.async_transaction import AsyncDecodePlan, AsyncResourceLedger
+from megatron.core.inference.async_transaction import (
+    AsyncDecodeLayout,
+    AsyncDecodePlan,
+    AsyncGraphShape,
+    AsyncResourceLedger,
+)
 from megatron.core.inference.batch_dimensions_utils import (
     CUDAGraphBatchDimensionBuilder,
     InferenceBatchDimensions,
@@ -2726,25 +2731,50 @@ class DynamicInferenceContext(BaseInferenceContext):
             device='cpu',
         ).repeat_interleave(tokens_per_request)
 
-        return AsyncDecodePlan(
-            request_ids=self.request_ids[planned_active_source_idxs].clone(),
-            source_request_idxs=planned_active_source_idxs.clone(),
-            query_lengths=query_lengths,
-            kv_length_offsets=kv_length_offsets,
-            request_to_kv_block_ids=request_to_kv_block_ids_view,
-            token_to_pos_ids=token_positions,
-            token_to_request_idx=token_request_idxs,
-            token_to_position_in_request=token_positions.clone(),
-            token_to_local_position_within_kv_block=token_positions % self.block_size_tokens,
-            token_to_block_idx=token_block_idxs,
-            reserved_request_ids=reserved_request_ids,
-            reserved_block_ids=reserved_block_ids,
-            reserved_block_columns=reserved_block_columns,
-            finished_request_ids=finished_request_ids.clone(),
+        graph_shape = AsyncGraphShape(
             active_request_count=planned_active_request_count,
             active_token_count=planned_active_request_count * tokens_per_request,
             padded_active_request_count=self.padded_active_request_count,
             tokens_per_request=tokens_per_request,
+        )
+        mamba_read_indices = None
+        mamba_write_indices = None
+        if self.is_hybrid_model:
+            mamba_read_indices = self._mamba_flat_indices_from_request_idxs(
+                planned_active_source_idxs
+            )
+            mamba_write_indices = self._mamba_flat_indices_from_request_idxs(
+                planned_active_source_idxs, use_candidate_bank=True
+            )
+        layout = AsyncDecodeLayout(
+            request_ids=self.request_ids[planned_active_source_idxs].clone(),
+            source_request_idxs=planned_active_source_idxs.clone(),
+            graph_shape=graph_shape,
+            request_query_lengths=query_lengths,
+            request_kv_length_offsets=kv_length_offsets,
+            request_to_kv_block_ids=request_to_kv_block_ids_view,
+            token_to_pos_ids=token_positions.view(planned_active_request_count, tokens_per_request),
+            token_to_request_idx=token_request_idxs.view(
+                planned_active_request_count, tokens_per_request
+            ),
+            token_to_position_in_request=token_positions.view(
+                planned_active_request_count, tokens_per_request
+            ).clone(),
+            token_to_local_position_within_kv_block=(
+                token_positions % self.block_size_tokens
+            ).view(planned_active_request_count, tokens_per_request),
+            token_to_block_idx=token_block_idxs.view(
+                planned_active_request_count, tokens_per_request
+            ),
+            mamba_read_indices=mamba_read_indices,
+            mamba_write_indices=mamba_write_indices,
+        )
+        return AsyncDecodePlan(
+            layout=layout,
+            reserved_request_ids=reserved_request_ids,
+            reserved_block_ids=reserved_block_ids,
+            reserved_block_columns=reserved_block_columns,
+            finished_request_ids=finished_request_ids.clone(),
             requires_mamba_state=self.is_hybrid_model,
             requires_mtp=self.num_speculative_tokens > 0,
             expected_kv_reservation_count=int(reserved_block_ids.numel()),
