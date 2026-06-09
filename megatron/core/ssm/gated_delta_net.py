@@ -14,6 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
 from megatron.core.fp8_utils import get_fp8_align_size
@@ -85,6 +86,7 @@ class GatedDeltaNet(MegatronModule):
         use_qk_l2norm: bool = True,
         A_init_range: Tuple[float, float] = (1, 16),
         pg_collection: ProcessGroupCollection = None,
+        name: str | None = None,
     ):
         """
         Args:
@@ -98,6 +100,7 @@ class GatedDeltaNet(MegatronModule):
             A_init_range: The initialization range for the attention weights.
             pg_collection: The required process groups to use for tensor model parallel and context
                 parallel.
+            name (str | None): module instance name passed top-down from its paranet module
         """
 
         if not HAVE_FLA:
@@ -158,6 +161,7 @@ class GatedDeltaNet(MegatronModule):
             is_expert=False,
             tp_comm_buffer_name="fc1",
             tp_group=self.pg_collection.tp,
+            name=(name + ".in_proj") if name is not None else None,
         )
 
         # Conv1d for QKV
@@ -217,6 +221,10 @@ class GatedDeltaNet(MegatronModule):
             hidden_size=self.value_head_dim,
             eps=self.config.layernorm_epsilon,
         )
+        self.recompute_norm_out = False
+        self.norm_out_checkpoint = None
+        if self.config.recompute_granularity == "selective":
+            self.recompute_norm_out = "gdn_norm_out" in self.config.recompute_modules
 
         self.out_proj = build_module(
             submodules.out_proj,
@@ -230,6 +238,7 @@ class GatedDeltaNet(MegatronModule):
             is_expert=False,
             tp_comm_buffer_name="fc2",
             tp_group=self.pg_collection.tp,
+            name=(name + ".out_proj") if name is not None else None,
         )
 
         self.reset_parameters()
@@ -473,35 +482,47 @@ class GatedDeltaNet(MegatronModule):
         )
         nvtx_range_pop(suffix="gated_delta_rule")
 
-        # RMSNorm
-        nvtx_range_push(suffix="gated_norm")
-        norm_out = self._apply_gated_norm(core_attn_out, gate)
-        nvtx_range_pop(suffix="gated_norm")
+        def _gated_norm_and_a2a(core_attn_out: torch.Tensor, gate: torch.Tensor):
+            # RMSNorm
+            nvtx_range_push(suffix="gated_norm")
+            norm_out_hp = self._apply_gated_norm(core_attn_out, gate)
+            nvtx_range_pop(suffix="gated_norm")
 
-        # Transpose: b s x --> s b x
-        # From bshd back to sbhd format
-        norm_out = norm_out.reshape(batch, seq_len, -1)
-        norm_out = norm_out.transpose(0, 1).contiguous()
+            # Transpose: b s x --> s b x
+            # From bshd back to sbhd format
+            norm_out_hp = norm_out_hp.reshape(batch, seq_len, -1)
+            norm_out_hp = norm_out_hp.transpose(0, 1).contiguous()
 
-        # CP all to all: HP to CP
-        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-            unpacked_norm_out = _unpack_sequence(norm_out, cu_seqlens_q, dim=0)
-            outputs = []
-            for norm_out_i in unpacked_norm_out:
-                norm_out_i = tensor_a2a_hp2cp(
-                    norm_out_i, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
+            # CP all to all: HP to CP
+            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+                unpacked_norm_out = _unpack_sequence(norm_out_hp, cu_seqlens_q, dim=0)
+                outputs = []
+                for norm_out_i in unpacked_norm_out:
+                    norm_out_i = tensor_a2a_hp2cp(
+                        norm_out_i, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
+                    )
+                    outputs.append(norm_out_i)
+                norm_out = torch.cat(outputs, dim=0)
+            else:
+                norm_out = tensor_a2a_hp2cp(
+                    norm_out_hp, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
                 )
-                outputs.append(norm_out_i)
-            norm_out = torch.cat(outputs, dim=0)
+
+            return norm_out
+
+        if self.recompute_norm_out:
+            self.norm_out_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+            norm_out = self.norm_out_checkpoint.checkpoint(_gated_norm_and_a2a, core_attn_out, gate)
         else:
-            norm_out = tensor_a2a_hp2cp(
-                norm_out, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
-            )
+            norm_out = _gated_norm_and_a2a(core_attn_out, gate)
 
         # Output projection
         nvtx_range_push(suffix="out_proj")
         out, out_bias = self.out_proj(norm_out)
         nvtx_range_pop(suffix="out_proj")
+
+        if self.recompute_norm_out:
+            self.norm_out_checkpoint.discard_output_and_register_recompute(out)
 
         return out, out_bias
 

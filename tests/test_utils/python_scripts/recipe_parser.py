@@ -25,6 +25,12 @@ ALLOWED_CADENCE_VALUES = set(DEFAULT_CADENCE) | {"weekly"}
 # intentionally left as pass-through so GitLab `--scope mr*` / `--scope
 # unit-tests` continue to match recipes verbatim and don't bleed into the
 # GitHub L0 / L1 matrix.
+#
+# L-tier vocabulary (cost class, ascending): `L0` (slim PR) < `L1` (full PR /
+# merge queue) < `L2` (nightly) < `L3` (weekly). `L0-smoke` is a sub-L0 tier
+# for fast lightweight smoke tests (cheaper than `L0`); it is GitLab-only and
+# passes through verbatim (not aliased here). Recipes tag rows with
+# `scope: [L0-smoke]` and GitLab selects them via `--scope L0-smoke`.
 LEGACY_SCOPE_ALIASES = {
     # GitHub-only scopes are aliased onto the L-tier vocabulary so the GH CI
     # workflow can filter on `L0` / `L1`. GitLab-only scopes (`mr`, `mr-slim`)
@@ -97,6 +103,14 @@ def resolve_cluster_config(cluster: str) -> str:
         return "draco-oci-ord"
     if cluster == "dgxh100_coreweave":
         return "coreweave"
+    if cluster == "cpu_eos":
+        return "eos-cpu"
+    if cluster == "cpu_coreweave":
+        return "coreweave-cpu"
+    if cluster == "cpu_dracooci":
+        return "draco-oci-iad-cpu"
+    if cluster == "cpu_oci-hsg":
+        return "oci-hsg-cpu"
     if cluster == "ghci":
         return "ghci"
     raise ValueError(f"Unknown cluster {cluster} provided.")
@@ -394,7 +408,8 @@ def load_workloads(
         workloads = filter_by_test_cases(workload_manifests=workloads, test_cases=test_cases)
 
     if workloads and test_case:
-        workloads = [filter_by_test_case(workload_manifests=workloads, test_case=test_case)]
+        match = filter_by_test_case(workload_manifests=workloads, test_case=test_case)
+        workloads = [match] if match is not None else []
 
     if not workloads:
         return []

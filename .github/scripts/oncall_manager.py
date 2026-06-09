@@ -28,6 +28,7 @@ SCHEDULE_FILE = ".github/oncall_schedule.json"
 ROTATION_TEAM_SLUG = "mcore-oncall-rotation"
 ACTIVE_ONCALL_TEAM_SLUG = "mcore-oncall"
 SLACK_USERGROUP_HANDLE = "mcore-oncall"
+COMMUNITY_REQUEST_LABEL = "community-request"
 TARGET_WEEKS = 12
 
 # Caches for email and Slack lookups
@@ -391,14 +392,44 @@ def ensure_schedule_filled(schedule, repo_owner):
         print(f"Appended: {new_entry}")
 
 def assign_reviewer(pr_number):
-    """Assigns the mcore-oncall team as the reviewer for the PR."""
+    """Assigns mcore-oncall if no reviewers are set or community-request is applied."""
     owner, repo = get_repo_info()
+
+    pr_url = f"{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{pr_number}"
+    pr_resp = requests.get(pr_url, headers=get_headers())
+
+    if pr_resp.status_code != 200:
+        print(f"Failed to fetch PR: {pr_resp.status_code} {pr_resp.text}")
+        sys.exit(1)
+
+    pr_data = pr_resp.json()
+    requested_reviewers = pr_data.get("requested_reviewers", [])
+    requested_teams = pr_data.get("requested_teams", [])
+    labels = {label.get("name") for label in pr_data.get("labels", [])}
+    requested_team_slugs = {team.get("slug") for team in requested_teams}
+    has_community_request_label = COMMUNITY_REQUEST_LABEL in labels
+
+    if ACTIVE_ONCALL_TEAM_SLUG in requested_team_slugs:
+        print(
+            f"Skipping reviewer request: team NVIDIA/{ACTIVE_ONCALL_TEAM_SLUG} "
+            "is already requested"
+        )
+        return
+
+    if not has_community_request_label and (requested_reviewers or requested_teams):
+        print(
+            "Skipping reviewer request: PR already has "
+            f"{len(requested_reviewers)} user reviewer(s) and "
+            f"{len(requested_teams)} team reviewer(s)"
+        )
+        return
+
     url = f"{GITHUB_API_URL}/repos/{owner}/{repo}/pulls/{pr_number}/requested_reviewers"
-    
+
     # Assign the oncall team as reviewer
     data = {"team_reviewers": [ACTIVE_ONCALL_TEAM_SLUG]}
     resp = requests.post(url, headers=get_headers(), json=data)
-    
+
     if resp.status_code in [201, 200]:
         print(f"Successfully requested review from team NVIDIA/{ACTIVE_ONCALL_TEAM_SLUG}")
     else:

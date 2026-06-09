@@ -39,14 +39,14 @@ from megatron.core.msc_utils import MultiStorageClientFeature, open_file
 from megatron.core.num_microbatches_calculator import update_num_microbatches
 from megatron.core.optimizer import DistributedOptimizer
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.utils import get_pg_rank, get_pg_size
+from megatron.core.utils import get_pg_rank, get_pg_size, unwrap_model
 
 from ..core.dist_checkpointing.utils import _clean_metadata_for_serialization
 from . import ft_integration, wandb_utils
 from .async_utils import get_save_and_finalize_callbacks, is_empty_async_queue, schedule_async_save
 from .global_vars import get_args
 from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_success
-from .utils import append_to_progress_log, is_last_rank, print_rank_0, unwrap_model
+from .utils import append_to_progress_log, is_last_rank, print_rank_0
 
 try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
@@ -431,10 +431,18 @@ def _build_sharded_state_dict_metadata(args: Namespace, dp_cp_group: Optional[to
     """
     metadata = {}
 
-    if args.use_distributed_optimizer and args.ckpt_format == "fsdp_dtensor":
+    # ``use_layer_wise_distributed_optimizer`` shares the DistOpt sub-optimizer
+    # for non-Muon params (embeddings, biases, layernorm, ...), so it needs the
+    # same sharding-type metadata even though the parser flips
+    # ``use_distributed_optimizer`` off in that mode.
+    has_distributed_optimizer = args.use_distributed_optimizer or getattr(
+        args, 'use_layer_wise_distributed_optimizer', False
+    )
+
+    if has_distributed_optimizer and args.ckpt_format == "fsdp_dtensor":
         metadata['distrib_optim_sharding_type'] = 'fsdp_dtensor'
 
-    if args.use_distributed_optimizer and args.ckpt_format != "fsdp_dtensor":
+    if has_distributed_optimizer and args.ckpt_format != "fsdp_dtensor":
         if args.dist_ckpt_optim_fully_reshardable:
             metadata['distrib_optim_sharding_type'] = 'fully_reshardable'
             metadata['distrib_optim_fully_reshardable_mem_efficient'] = args.distrib_optim_fully_reshardable_mem_efficient
@@ -782,7 +790,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                 print_rank_0(f"  [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}] successfully "
                              f"saved local checkpoint from iteration {iteration:7d}")
                 if args.log_progress and args.async_save:
-                    append_to_progress_log(f'Saved async local checkpoint\tIteration: {iteration}',
+                    append_to_progress_log(args.save, f'Saved async local checkpoint\tIteration: {iteration}',
                                            barrier=False)
         else:
             def iter_finalize_fn():
@@ -801,7 +809,7 @@ def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floati
                              f"[ t {tensor_rank_to_print}/{mpu.get_tensor_model_parallel_world_size()}, "
                              f"p {pipeline_rank_to_print}/{mpu.get_pipeline_model_parallel_world_size()} ]")
                 if args.log_progress and args.async_save:
-                    append_to_progress_log(f'Saved async checkpoint\tIteration: {iteration}',
+                    append_to_progress_log(args.save, f'Saved async checkpoint\tIteration: {iteration}',
                                            barrier=False)
 
                 if save_retain_interval is not None:
@@ -902,7 +910,7 @@ def _async_delete_checkpoint_impl(save_path, iteration_to_delete, log_progress=F
         print(f'  successfully deleted checkpoint from iteration {iteration_to_delete:7d} '
               f'at {save_path}', flush=True)
         if log_progress:
-            append_to_progress_log(f'Deleted checkpoint\tIteration: {iteration_to_delete}', barrier=False)
+            append_to_progress_log(save_path, f'Deleted checkpoint\tIteration: {iteration_to_delete}', barrier=False)
     except Exception as e:
         print(f'  encountered exception "{e}" when trying to delete checkpoint from '
               f'iteration {iteration_to_delete:7d} at {save_path}', flush=True)
@@ -1554,6 +1562,8 @@ def load_args_from_checkpoint(
     _set_arg('moe_token_dispatcher_type', force=False)
     _set_arg('moe_router_pre_softmax', force=True)
     _set_arg('moe_grouped_gemm', force=True)
+    _set_arg('moe_single_grouped_weight', force=True)
+    _set_arg('moe_single_grouped_bias', force=True)
     _set_arg('moe_shared_expert_intermediate_size', force=True)
     _set_arg('moe_router_score_function', force=True)
     _set_arg('moe_router_enable_expert_bias', force=True)
