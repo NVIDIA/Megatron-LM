@@ -412,7 +412,9 @@ class PipelineOffloadManager:
         # allocate streams and events for synchronization
         self._d2h_stream = torch.cuda.Stream()
         self._h2d_stream = torch.cuda.Stream()
-        # CUDA graph stream and event for offloading modules in cuda graph
+        # TE CUDA graph offload paths need a stream/event pair that lives outside
+        # individual layer objects so capture, replay, and backward hooks order
+        # the same D2H/H2D work with the same synchronization primitives.
         self._cuda_graph_stream = torch.cuda.Stream()
         self._cuda_graph_event = torch.cuda.Event(external=True)
         # Shared CPU tensor pool for all chunks to improve reuse efficiency
@@ -440,6 +442,8 @@ class PipelineOffloadManager:
         self._delayed_offload_groups = []
         self.reset()
 
+        # Keep the hook context object around so each offload scope can enter/exit
+        # the same autograd saved-tensor hooks without touching private torch APIs.
         self._saved_tensors_hooks = saved_tensors_hooks(
             self.on_save_for_backward, self.on_get_saved_tensor
         )
@@ -472,12 +476,15 @@ class PipelineOffloadManager:
     def push_offload_groups(self, group_hook, name, forced_released_tensors):
         """Push the offload groups to the delayed queue."""
         debug_rank(f"pushing offload groups to the delayed queue")
+        # Store the group name because delayed CUDA graph replay flushes later,
+        # after the original group-start site has already moved on.
         self._delayed_offload_groups.append((group_hook, name, forced_released_tensors))
 
     def flush_delayed_groups(self):
         """Flush the delayed groups."""
         debug_rank("flushing delayed groups")
-        # Flush the delayed groups in forward order.
+        # Preserve the original forward commit order; reload scheduling still
+        # relies on the same group order discovered during warmup.
         for group_hook, name, forced_released_tensors in self._delayed_offload_groups:
             group_hook(name, forced_released_tensors)
         self._delayed_offload_groups = []
@@ -592,6 +599,8 @@ class PipelineOffloadManager:
                 offloaded_groups_count * (1 - self._activation_offload_fraction)
             )
             debug_rank(f"Disabled {disabled_groups_count}/{offloaded_groups_count} groups")
+            # Prefer keeping earlier forward groups offloaded because releasing
+            # those activations sooner gives the longest memory-pressure relief.
             for group in reversed(chunk.offload_groups):
                 if group.offload:
                     if disabled_groups_count > 0:
@@ -746,6 +755,8 @@ class PipelineOffloadManager:
     def mark_not_offload(self, tensor: torch.Tensor):
         """Mark the current forward chunk as not offloadable."""
         if tensor is not None:
+            # TE marks some tensors with _TE_do_not_offload; this local flag
+            # gives Megatron-owned tensors the same opt-out path.
             tensor._do_not_offload = True
 
     def __enter__(self):
@@ -1021,6 +1032,8 @@ class ChunkOffloadHandler:
     def should_bulk_offload(self, name):
         """Determine if the current group should be offloaded."""
         assert len(self._groups_to_offload) > 0, "No groups to offload"
+        # CUDA graph scoped modules can create several pending groups before a
+        # commit runs, so match by name instead of assuming LIFO order.
         group = self.find_group_with_name(self._groups_to_offload, name)
         assert group is not None, f"Group {name} not found in {self._groups_to_offload}"
         debug_rank(f"should_bulk_offload {self.is_warmup} {group.offload}")
@@ -1182,6 +1195,8 @@ class FineGrainedOffloadingGroupCommitFunction(torch.autograd.Function):
         debug_rank("FineGrainedOffloadingGroupCommitFunction forward")
 
         if delay_offload and PipelineOffloadManager.get_instance()._in_replay:
+            # During TE CUDA graph replay, queue D2H work and launch it after
+            # replay returns, where CPU scheduling can overlap with graph/comm gaps.
             PipelineOffloadManager.get_instance().push_offload_groups(
                 cur_forward_chunk.on_group_commit_forward, name, forced_released_tensors
             )
@@ -1300,6 +1315,8 @@ class FineGrainedOffloadingBackwardRecordFunction(torch.autograd.Function):
         """Record the backward event and wait for the h2d stream on cuda graph stream."""
         debug_rank("FineGrainedOffloadingBackwardRecordFunction backward")
         mgr = PipelineOffloadManager.get_instance()
+        # This event connects TE's graph stream with the reload stream so
+        # backward consumers do not race H2D reloads launched outside the graph.
         torch.cuda.current_stream().record_event(mgr.cuda_graph_event)
         torch.cuda.current_stream().wait_stream(mgr.h2d_stream)
         return (grad_output,)
