@@ -55,10 +55,12 @@ def _topologies(world_size: int):
         yield "cp2", SimpleNamespace(tp=1, ep=1, etp=1, cp=2, pp=1)
         yield "pp2", SimpleNamespace(tp=1, ep=1, etp=1, cp=1, pp=2)
         yield "ep2", SimpleNamespace(tp=1, ep=2, etp=1, cp=1, pp=1)
+        yield "etp2", SimpleNamespace(tp=1, ep=1, etp=2, cp=1, pp=1)
     if world_size >= 4:
         yield "tp2_ep2_pp2", SimpleNamespace(tp=2, ep=2, etp=1, cp=1, pp=2)
     if world_size >= 8:
         yield "tp2_ep2_cp2_pp2", SimpleNamespace(tp=2, ep=2, etp=1, cp=2, pp=2)
+        yield "tp2_ep2_etp2_pp2", SimpleNamespace(tp=2, ep=2, etp=2, cp=1, pp=2)
 
 
 def test_parallel_state_builds_expected_primitive_groups():
@@ -91,8 +93,9 @@ def test_parallel_state_builds_expected_primitive_groups():
         _assert_group_size(ps.dp_cp_group, dense_dp * cfg.cp)
         _assert_group_size(ps.ep_dp_group, expert_dp)
         # tp_ep follows Megatron Core's expert tensor + expert model group,
-        # not the dense-layer TP group. MLite currently keeps ETP at 1.
+        # not the dense-layer TP group.
         _assert_group_size(ps.tp_ep_group, cfg.etp * cfg.ep)
+        _assert_group_size(ps.etp_group, cfg.etp)
         if cfg.pp > 1:
             assert ps.pp_next_rank in ps.pp_global_ranks
             assert ps.pp_prev_rank in ps.pp_global_ranks

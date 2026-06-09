@@ -18,6 +18,7 @@ from megatron.lite.primitive.optimizers.fsdp2 import (
 from megatron.lite.primitive.optimizers.fsdp2.adamw import iter_torch_optimizers, to_local_tensor
 from megatron.lite.primitive.parallel.state import ParallelState
 from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
+from megatron.lite.runtime.contracts.config import ParallelConfig
 from megatron.lite.runtime.contracts.handle import ModelHandle
 
 
@@ -86,6 +87,16 @@ def _parallel_state() -> ParallelState:
         dp_rank=rank,
         dp_cp_rank=rank,
     )
+
+
+def _shared_tmp_path(tmp_path) -> str:
+    payload = [str(tmp_path) if dist.get_rank() == 0 else None]
+    dist.broadcast_object_list(payload, src=0)
+    return payload[0]
+
+
+def _checkpoint_config():
+    return SimpleNamespace(parallel=ParallelConfig())
 
 
 def _build_fsdp2_model(dtype: torch.dtype = torch.bfloat16) -> tuple[nn.Module, ParallelState]:
@@ -215,15 +226,17 @@ def test_fsdp2_checkpoint_load_matches_uninterrupted_training_single_node(tmp_pa
 
     _train_step(model_for_ckpt, optimizer_for_ckpt, x0, y0)
     _train_step(direct_model, direct_optimizer, x0, y0)
+    checkpoint_dir = _shared_tmp_path(tmp_path)
 
     runtime.save_checkpoint(
         ModelHandle(
             model=model_for_ckpt,
             optimizer=optimizer_for_ckpt,
             parallel_state=ps,
+            config=_checkpoint_config(),
             _extras={"model_chunks": [model_for_ckpt]},
         ),
-        str(tmp_path),
+        checkpoint_dir,
         step=1,
     )
     assert runtime.load_checkpoint(
@@ -231,9 +244,10 @@ def test_fsdp2_checkpoint_load_matches_uninterrupted_training_single_node(tmp_pa
             model=loaded_model,
             optimizer=loaded_optimizer,
             parallel_state=loaded_ps,
+            config=_checkpoint_config(),
             _extras={"model_chunks": [loaded_model]},
         ),
-        str(tmp_path),
+        checkpoint_dir,
     ) == 1
 
     _train_step(direct_model, direct_optimizer, x1, y1)

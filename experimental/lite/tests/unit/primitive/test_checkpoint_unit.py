@@ -68,14 +68,14 @@ def test_runtime_checkpoint_load_matches_uninterrupted_training(tmp_path):
         optimizer=ckpt_optimizer,
         _extras={"model_chunks": [ckpt_model]},
     )
-    runtime.save_checkpoint(ckpt_handle, str(tmp_path), step=1)
+    runtime.save_checkpoint(ckpt_handle, str(tmp_path), step=1, use_dcp=False)
 
     loaded_handle = ModelHandle(
         model=loaded_model,
         optimizer=loaded_optimizer,
         _extras={"model_chunks": [loaded_model]},
     )
-    assert runtime.load_checkpoint(loaded_handle, str(tmp_path)) == 1
+    assert runtime.load_checkpoint(loaded_handle, str(tmp_path), use_dcp=False) == 1
 
     _step(direct_model, direct_optimizer, x1, y1)
     _step(loaded_model, loaded_optimizer, x1, y1)
@@ -132,6 +132,7 @@ def test_runtime_checkpoint_uses_optimizer_state_dict_contract(tmp_path):
         ModelHandle(model=model, optimizer=optimizer, _extras={"model_chunks": [model]}),
         str(tmp_path),
         step=7,
+        use_dcp=False,
     )
 
     loaded_model = TinyMLP()
@@ -142,7 +143,7 @@ def test_runtime_checkpoint_uses_optimizer_state_dict_contract(tmp_path):
         _extras={"model_chunks": [loaded_model]},
     )
 
-    assert runtime.load_checkpoint(loaded_handle, str(tmp_path)) == 7
+    assert runtime.load_checkpoint(loaded_handle, str(tmp_path), use_dcp=False) == 7
     assert loaded_optimizer.load_calls == 1
     assert loaded_optimizer.parameter_load_calls == 1
     assert (tmp_path / "training_state.optimizer_parameter_state.pt").exists()

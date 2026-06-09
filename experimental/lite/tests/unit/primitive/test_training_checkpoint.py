@@ -4,8 +4,14 @@ import copy
 from types import SimpleNamespace
 
 import torch
+from torch.distributed.tensor import Replicate, Shard
 
 from megatron.lite.primitive.ckpt import dcp
+from megatron.lite.primitive.ckpt.distckpt import (
+    _rank_offsets_and_replica_id,
+    attach_model_sharded_state_dict,
+)
+from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.protocols import default_expert_classifier, default_placement_fn
 from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.handle import ModelHandle
@@ -46,6 +52,146 @@ def test_optimizer_checkpoint_roundtrips_rank_local_state(tmp_path) -> None:
 
     assert (tmp_path / "optimizer_rank_0.pt").exists()
     _assert_state_equal(optimizer.state_dict(), expected)
+
+
+class FakeDistOpt:
+    def __init__(self):
+        self.save_model_sd = None
+        self.load_model_sd = None
+        self.loaded_state = None
+
+    def sharded_state_dict(self, model_sd, is_loading: bool = False, metadata=None):
+        assert metadata == DISTOPT_METADATA
+        if is_loading:
+            self.load_model_sd = model_sd
+        else:
+            self.save_model_sd = model_sd
+        return {"is_loading": is_loading}
+
+    def load_state_dict(self, state):
+        self.loaded_state = state
+
+
+class FakeWrapper(torch.nn.Module):
+    def __init__(self, module):
+        super().__init__()
+        self.module = module
+        self.wrapper_load_called = False
+
+    def forward(self, *args, **kwargs):
+        return self.module(*args, **kwargs)
+
+    def load_state_dict(self, *args, **kwargs):
+        self.wrapper_load_called = True
+        return super().load_state_dict(*args, **kwargs)
+
+
+DISTOPT_METADATA = {
+    "distrib_optim_sharding_type": "fully_reshardable",
+    "distrib_optim_fully_reshardable_mem_efficient": False,
+    "chained_optim_avoid_prefix": True,
+}
+
+
+def test_distopt_checkpoint_dispatches_to_mcore_distckpt(monkeypatch, tmp_path) -> None:
+    model = torch.nn.Linear(4, 2)
+    optimizer = FakeDistOpt()
+    ps = ParallelState(pp_rank=1, tp_rank=2, dp_cp_rank=3)
+    attach_model_sharded_state_dict([model], ps)
+    saved = {}
+
+    def fake_save(state_dict, checkpoint_dir, **kwargs):
+        saved["state_dict"] = state_dict
+        saved["checkpoint_dir"] = checkpoint_dir
+        saved["kwargs"] = kwargs
+
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.distckpt.dist_checkpointing.save",
+        fake_save,
+    )
+
+    dcp.save_training_checkpoint(model, optimizer, 5, str(tmp_path), use_dcp=True)
+
+    model_sd = saved["state_dict"]["model"]
+    assert set(model_sd) == {"weight", "bias"}
+    assert model_sd["weight"].replica_id == (1, 2, 3)
+    assert optimizer.save_model_sd is model_sd
+    assert saved["state_dict"]["optimizer"] == {"is_loading": False}
+    assert saved["state_dict"]["step"] == 5
+    assert saved["checkpoint_dir"] == str(tmp_path / "step_5")
+    assert saved["kwargs"]["validate_access_integrity"] is False
+    assert saved["kwargs"]["content_metadata"] == DISTOPT_METADATA
+    assert not (tmp_path / "step_5" / "optimizer_rank_0.pt").exists()
+
+
+def test_distopt_checkpoint_offsets_cover_tp_pp_ep_etp_topology() -> None:
+    ps = ParallelState(
+        pp_size=2,
+        pp_rank=1,
+        tp_size=2,
+        tp_rank=1,
+        ep_size=2,
+        ep_rank=1,
+        etp_size=2,
+        etp_rank=1,
+        dp_size=2,
+        dp_rank=0,
+        cp_size=1,
+        cp_rank=0,
+        dp_cp_rank=0,
+        expert_dp_size=1,
+        expert_dp_rank=0,
+    )
+
+    dense_offsets, dense_replica = _rank_offsets_and_replica_id(
+        [Replicate(), Replicate(), Replicate(), Shard(0)],
+        ps,
+        expert=False,
+    )
+    expert_offsets, expert_replica = _rank_offsets_and_replica_id(
+        [Replicate(), Replicate(), Shard(0), Shard(0)],
+        ps,
+        expert=True,
+    )
+
+    assert dense_offsets == ((0, 1, 2),)
+    assert dense_replica == (1, 0, 0)
+    assert expert_offsets == ((0, 3, 4),)
+    assert expert_replica == (1, 0, 0)
+
+
+def test_distopt_checkpoint_loads_from_mcore_distckpt(monkeypatch, tmp_path) -> None:
+    wrapped_module = torch.nn.Linear(4, 2)
+    model = FakeWrapper(wrapped_module)
+    optimizer = FakeDistOpt()
+    attach_model_sharded_state_dict([model], ParallelState())
+    expected_weight = torch.full_like(wrapped_module.weight, 3.0)
+    expected_bias = torch.full_like(wrapped_module.bias, -2.0)
+
+    def fake_load(sharded_state_dict, checkpoint_dir, **kwargs):
+        assert set(sharded_state_dict["model"]) == {"weight", "bias"}
+        assert optimizer.load_model_sd is sharded_state_dict["model"]
+        assert sharded_state_dict["optimizer"] == {"is_loading": True}
+        assert checkpoint_dir == str(tmp_path / "step_5")
+        assert kwargs["validate_access_integrity"] is False
+        return {
+            "step": 5,
+            "model": {"weight": expected_weight, "bias": expected_bias},
+            "optimizer": {"loaded": True},
+        }
+
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.distckpt.dist_checkpointing.load",
+        fake_load,
+    )
+
+    step = dcp.load_training_checkpoint(model, optimizer, str(tmp_path / "step_5"), use_dcp=True)
+
+    assert step == 5
+    assert not model.wrapper_load_called
+    torch.testing.assert_close(wrapped_module.weight, expected_weight)
+    torch.testing.assert_close(wrapped_module.bias, expected_bias)
+    assert optimizer.loaded_state == {"loaded": True}
 
 
 def test_runtime_checkpoint_api_passes_current_training_checkpoint_signature(monkeypatch, tmp_path) -> None:

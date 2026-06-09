@@ -57,6 +57,21 @@ def save_training_checkpoint(
     if not use_dcp:
         _save_local_training_checkpoint(model, optimizer, step, path, save_rng=save_rng)
         return
+    if _supports_distopt_distckpt(model, optimizer):
+        ckpt_path = os.path.join(path, f"step_{step}")
+        os.makedirs(ckpt_path, exist_ok=True)
+        _save_distopt_checkpoint(
+            model,
+            optimizer,
+            step,
+            ckpt_path,
+            save_model=save_model,
+            save_optimizer=save_optimizer,
+        )
+        if save_rng:
+            _save_rng_sidecar(ckpt_path)
+        log_rank0(f"Saved distopt checkpoint at step {step} to {ckpt_path}")
+        return
     if config is None or ps is None:
         raise ValueError("DCP checkpointing requires config and ParallelState.")
     if not isinstance(model, nn.Module):
@@ -68,8 +83,8 @@ def save_training_checkpoint(
         for name, param in model.named_parameters():
             placements = get_placements(name)
             mesh = expert_mesh if is_expert(name) else dense_mesh
-            state_dict[f"model.{name}"] = DTensor.from_local(
-                _to_local_tensor(param.data.detach()),
+            state_dict[f"model.{name}"] = _dcp_tensor_from_param(
+                param,
                 mesh,
                 placements,
             )
@@ -110,13 +125,24 @@ def load_training_checkpoint(
             load_rng=load_rng,
             load_parameter_state_update_legacy_format=load_parameter_state_update_legacy_format,
         )
+    ckpt_path = _resolve_step_checkpoint_path(path)
+    if _supports_distopt_distckpt(model, optimizer):
+        step = _load_distopt_checkpoint(
+            model,
+            optimizer,
+            ckpt_path,
+            load_model=load_model,
+            load_optimizer=load_optimizer,
+        )
+        if load_rng:
+            _load_rng_sidecar(ckpt_path)
+        log_rank0(f"Loaded distopt checkpoint from {path} at step {step}")
+        return step
     if config is None or ps is None:
         raise ValueError("DCP checkpointing requires config and ParallelState.")
     if not isinstance(model, nn.Module):
         raise TypeError("DCP checkpointing currently expects a single nn.Module.")
     dense_mesh, expert_mesh = _build_meshes(config)
-
-    ckpt_path = _resolve_step_checkpoint_path(path)
 
     state_dict: dict = {"step": 0}
 
@@ -124,8 +150,8 @@ def load_training_checkpoint(
         for name, param in model.named_parameters():
             placements = get_placements(name)
             mesh = expert_mesh if is_expert(name) else dense_mesh
-            state_dict[f"model.{name}"] = DTensor.from_local(
-                torch.empty_like(_to_local_tensor(param.data)),
+            state_dict[f"model.{name}"] = _empty_dcp_tensor_like_param(
+                param,
                 mesh,
                 placements,
             )
@@ -138,7 +164,7 @@ def load_training_checkpoint(
             if key in state_dict:
                 t = state_dict[key]
                 with torch.no_grad():
-                    _copy_tensor_(param.data, t.to_local() if isinstance(t, DTensor) else t)
+                    _copy_tensor_(param, t)
 
     if load_optimizer:
         _load_optimizer_checkpoint(optimizer, ckpt_path)
@@ -161,6 +187,52 @@ def _resolve_step_checkpoint_path(path: str) -> str:
     if step_dirs:
         return os.path.join(path, step_dirs[-1])
     return path
+
+
+def _supports_distopt_distckpt(model: nn.Module | Iterable[nn.Module], optimizer) -> bool:
+    from megatron.lite.primitive.ckpt.distckpt import supports_distopt_distckpt
+
+    return supports_distopt_distckpt(model, optimizer)
+
+
+def _save_distopt_checkpoint(
+    model: nn.Module | Iterable[nn.Module],
+    optimizer,
+    step: int,
+    path: str,
+    *,
+    save_model: bool,
+    save_optimizer: bool,
+) -> None:
+    from megatron.lite.primitive.ckpt.distckpt import save_distopt_checkpoint
+
+    save_distopt_checkpoint(
+        model,
+        optimizer,
+        step,
+        path,
+        save_model=save_model,
+        save_optimizer=save_optimizer,
+    )
+
+
+def _load_distopt_checkpoint(
+    model: nn.Module | Iterable[nn.Module],
+    optimizer,
+    path: str,
+    *,
+    load_model: bool,
+    load_optimizer: bool,
+) -> int:
+    from megatron.lite.primitive.ckpt.distckpt import load_distopt_checkpoint
+
+    return load_distopt_checkpoint(
+        model,
+        optimizer,
+        path,
+        load_model=load_model,
+        load_optimizer=load_optimizer,
+    )
 
 
 def _optimizer_checkpoint_path(path: str) -> str:
@@ -210,6 +282,40 @@ def _to_local_tensor(tensor: Any) -> torch.Tensor:
     if callable(to_local):
         return to_local()
     return tensor
+
+
+def _is_dtensor_like(tensor: Any) -> bool:
+    return (
+        callable(getattr(tensor, "to_local", None))
+        and hasattr(tensor, "device_mesh")
+        and hasattr(tensor, "placements")
+    )
+
+
+def _dcp_tensor_from_param(param: torch.Tensor, mesh: DeviceMesh, placements: list) -> DTensor:
+    if _is_dtensor_like(param):
+        return _dtensor_from_dtensor_like_param(param, _to_local_tensor(param).detach())
+    return DTensor.from_local(_to_local_tensor(param).detach(), mesh, placements)
+
+
+def _empty_dcp_tensor_like_param(
+    param: torch.Tensor,
+    mesh: DeviceMesh,
+    placements: list,
+) -> DTensor:
+    if _is_dtensor_like(param):
+        return _dtensor_from_dtensor_like_param(param, torch.empty_like(_to_local_tensor(param)))
+    return DTensor.from_local(torch.empty_like(_to_local_tensor(param)), mesh, placements)
+
+
+def _dtensor_from_dtensor_like_param(param: torch.Tensor, local_tensor: torch.Tensor) -> DTensor:
+    return DTensor.from_local(
+        local_tensor,
+        param.device_mesh,
+        param.placements,
+        shape=tuple(param.shape),
+        stride=tuple(param.stride()),
+    )
 
 
 def _copy_tensor_(target: torch.Tensor, src: torch.Tensor) -> None:

@@ -222,6 +222,14 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
             is_expert=is_expert_param,
             deterministic=deterministic,
         )
+        from megatron.lite.primitive.ckpt import attach_model_sharded_state_dict
+
+        attach_model_sharded_state_dict(
+            chunks,
+            ps,
+            get_placements=PLACEMENT_FN,
+            is_expert=is_expert_param,
+        )
         optimizer_backend = "distopt"
     elif impl_cfg.optimizer == "fsdp2":
         optimizer_backend = "fsdp2"

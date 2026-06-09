@@ -282,6 +282,10 @@ def _build_transformer_config(model_cfg, engine_cfg):
         bf16=True,
         params_dtype=torch.bfloat16,
     )
+    if hasattr(model_cfg, "add_bias_linear"):
+        kwargs["add_bias_linear"] = bool(model_cfg.add_bias_linear)
+    elif kwargs["num_moe_experts"] is not None and kwargs["expert_tensor_parallel_size"] > 1:
+        kwargs["add_bias_linear"] = False
     if p.pp > 1:
         kwargs["pipeline_dtype"] = torch.bfloat16
     return TransformerConfig(**kwargs)

@@ -60,7 +60,6 @@ def init_parallel(config) -> ParallelState:
     world = dist.get_world_size()
     rank = dist.get_rank()
     tp, ep, etp, cp, pp = config.tp, config.ep, config.etp, config.cp, config.pp
-    assert etp == 1, "ETP>1 is temporarily disabled pending fix"
 
     dense_dp = ensure_divisible(world, tp * cp * pp)
     expert_dp = ensure_divisible(world, etp * ep * pp)
