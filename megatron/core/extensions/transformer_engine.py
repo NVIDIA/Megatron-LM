@@ -1652,9 +1652,11 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             core_attn_out = super().forward(query, key, value, attention_mask, **_fa_kwargs)
 
         # Restore TE's CP group after dynamic CP forward.
-        if packed_seq_params is not None \
-           and packed_seq_params.local_cp_size is not None \
-           and self.config.context_parallel_size > 1:
+        if (
+            packed_seq_params is not None
+            and packed_seq_params.local_cp_size is not None
+            and self.config.context_parallel_size > 1
+        ):
             super().set_context_parallel_group(
                 _te_orig_cp_group,
                 _te_orig_cp_global_ranks,
