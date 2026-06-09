@@ -24,7 +24,6 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import CheckpointManager
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.hyper_connection import (
     HyperConnectionModule,
     learned_output_contract,
