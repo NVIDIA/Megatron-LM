@@ -1681,7 +1681,19 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args = {}
     for f in dataclasses.fields(config_class):
         if hasattr(args, f.name):
-            kw_args[f.name] = getattr(args, f.name)
+            value = getattr(args, f.name)
+            # Skip explicit None values for fields whose dataclass default is non-None.
+            # Without this, adding a CLI flag with default=None would shadow the field
+            # default and propagate None into the config. Example: --moe-deepep-num-sms
+            # is a new optional CLI flag; when the user does not set it, the field must
+            # keep its historical default (20), not become None.
+            if value is None:
+                has_non_none_default = (
+                    f.default is not dataclasses.MISSING and f.default is not None
+                ) or f.default_factory is not dataclasses.MISSING
+                if has_non_none_default:
+                    continue
+            kw_args[f.name] = value
     kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
     kw_args['deallocate_pipeline_outputs'] = True
     kw_args['pipeline_dtype'] = args.params_dtype

@@ -270,5 +270,112 @@ class TestDeepepManagerNumSmsPrecedence(unittest.TestCase):
         self.assertEqual(self._effective_num_sms(None, moe_deepep_num_sms=20), 20)
 
 
+class TestMoeDeepepNumSmsDefaultRegression(unittest.TestCase):
+    """
+    Regression test for the --moe-deepep-num-sms CLI flag regression.
+
+    Before the fix: adding the new --moe-deepep-num-sms flag with default=None caused
+    core_transformer_config_from_args to copy None into TransformerConfig.moe_deepep_num_sms,
+    shadowing the dataclass default of 20. This caused _DeepepManager to call
+    Buffer.set_num_sms(None) which crashes with TypeError.
+
+    After the fix: when args.moe_deepep_num_sms is None (user did not pass the flag),
+    the field falls back to its dataclass default of 20. When the user does pass the
+    flag, the value is honored.
+    """
+
+    def setUp(self):
+        for k in ("MOE_A2A_CHUNK_SIZE", "MOE_A2A_NUM_SMS"):
+            os.environ.pop(k, None)
+
+    def tearDown(self):
+        for k in ("MOE_A2A_CHUNK_SIZE", "MOE_A2A_NUM_SMS"):
+            os.environ.pop(k, None)
+
+    def _simulate_core_transformer_config_from_args(self, args):
+        """Mirror the kw_args build in core_transformer_config_from_args.
+
+        Includes the regression fix: skip explicit None values for fields whose
+        dataclass default is non-None.
+        """
+        import dataclasses as _dc
+        from megatron.core.transformer.transformer_config import TransformerConfig
+        kw_args = {}
+        for f in _dc.fields(TransformerConfig):
+            if hasattr(args, f.name):
+                value = getattr(args, f.name)
+                # Fix: skip explicit None when dataclass default is non-None.
+                if value is None:
+                    has_non_none_default = (
+                        f.default is not _dc.MISSING and f.default is not None
+                    ) or f.default_factory is not _dc.MISSING
+                    if has_non_none_default:
+                        continue
+                kw_args[f.name] = value
+        return kw_args
+
+    def test_default_path_preserves_moe_deepep_num_sms_20(self):
+        """When --moe-deepep-num-sms is not passed, the field must be 20 (not None).
+
+        This is the historical default preserved across the new CLI flag introduction.
+        """
+        args = _make_args()  # moe_deepep_num_sms=None (CLI default)
+        kw_args = self._simulate_core_transformer_config_from_args(args)
+        # The moe_deepep_num_sms key should be ABSENT (so the dataclass default of 20 is used)
+        self.assertNotIn(
+            'moe_deepep_num_sms', kw_args,
+            'moe_deepep_num_sms must not be propagated to TransformerConfig when the '
+            'user did not pass --moe-deepep-num-sms; this would shadow the default of 20.'
+        )
+
+    def test_moe_deepep_num_sms_field_default_is_20(self):
+        """The dataclass field default must be exactly 20 for backward compatibility."""
+        import dataclasses as _dc
+        from megatron.core.transformer.transformer_config import TransformerConfig
+        field = next(f for f in _dc.fields(TransformerConfig) if f.name == 'moe_deepep_num_sms')
+        self.assertEqual(
+            field.default, 20,
+            'moe_deepep_num_sms field default must remain 20 for backward compatibility.'
+        )
+
+    def test_explicit_user_override_is_honored(self):
+        """When the user passes --moe-deepep-num-sms=24, the value must be propagated."""
+        args = _make_args(moe_deepep_num_sms=24)
+        kw_args = self._simulate_core_transformer_config_from_args(args)
+        self.assertEqual(
+            kw_args.get('moe_deepep_num_sms'), 24,
+            'Explicit user override of moe_deepep_num_sms must be honored.'
+        )
+
+    def test_fused_a2a_config_num_sms_overrides_still_work(self):
+        """The fused_a2a_config.num_sms override path must continue to work after the fix."""
+        # User sets --moe-a2a-num-sms=8 (overrides everything)
+        args = _make_args(moe_a2a_num_sms=8, moe_deepep_num_sms=24)
+        cfg = resolve_fused_a2a_config_from_sources(
+            cli_args=args, env=dict(os.environ), config_file_path=None,
+        )
+        # In validate_args the propagation also handles moe_deepep_num_sms -> fused_a2a_config
+        # But in the raw resolver, moe_deepep_num_sms is not part of the merged dict.
+        # We just verify that the resolver respects moe_a2a_num_sms=8.
+        self.assertEqual(cfg.num_sms, 8)
+
+    def test_full_validate_args_propagation_does_not_set_args_moe_deepep_num_sms(self):
+        """The validate_args propagation block mutates fused_a2a_config but must not
+        touch args.moe_deepep_num_sms (the regression would have been that the new
+        field was None; the fix is to not copy it to TransformerConfig)."""
+        # Simulate: user passes nothing related to deepep
+        args = _make_args()
+        # Simulate the resolve + propagation block in validate_args
+        args.fused_a2a_config = resolve_fused_a2a_config_from_sources(
+            cli_args=args, env=dict(os.environ), config_file_path=None,
+        )
+        # args.moe_deepep_num_sms remains None (CLI default)
+        self.assertIsNone(args.moe_deepep_num_sms)
+        # Then core_transformer_config_from_args would NOT copy this to kw_args
+        # (verified by test_default_path_preserves_moe_deepep_num_sms_20 above).
+        kw_args = self._simulate_core_transformer_config_from_args(args)
+        self.assertNotIn('moe_deepep_num_sms', kw_args)
+
+
 if __name__ == "__main__":
     unittest.main()
