@@ -2159,6 +2159,26 @@ def dummy_train_step(data_iterator):
             )
 
 
+def _is_param_gather_pre_hook_enabled(model_chunk):
+    """Return whether param all-gather pre-forward hooks can zero the shared grad buffer."""
+    forward_pre_hook_handles = getattr(model_chunk, "remove_forward_pre_hook_handles", None)
+    if forward_pre_hook_handles is not None:
+        return len(forward_pre_hook_handles) > 0
+
+    return False
+
+
+def _iter_param_buffer_distributed_optimizers(optimizer):
+    """Yield DistributedOptimizer instances with DDP-style param buffers."""
+    for optim_instance in getattr(optimizer, "chained_optimizers", [optimizer]):
+        if (
+            isinstance(optim_instance, DistributedOptimizer)
+            and hasattr(optim_instance, "shard_fp32_from_float16_groups")
+            and hasattr(optim_instance, "model_float16_groups")
+        ):
+            yield optim_instance
+
+
 def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None):
     """Single training step."""
     args = get_args()
@@ -2210,12 +2230,11 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
         # correct weights, even when forward pre-hooks are disabled.
         if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
             # Check if forward_pre_hook is enabled by checking if hooks are registered.
-            forward_pre_hook_enabled = len(model[0].remove_forward_pre_hook_handles) > 0
+            forward_pre_hook_enabled = _is_param_gather_pre_hook_enabled(model[0])
             full_cg_captured = FullCudaGraphWrapper.cuda_graph.get("training") is not None
             if forward_pre_hook_enabled or full_cg_captured:
-                for optim_instance in optimizer.chained_optimizers:
-                    if isinstance(optim_instance, DistributedOptimizer):
-                        optim_instance._copy_main_params_to_param_buffer()
+                for optim_instance in _iter_param_buffer_distributed_optimizers(optimizer):
+                    optim_instance._copy_main_params_to_param_buffer()
 
         # Forward pass.
         if save_activations_in_this_iteration:
@@ -3468,6 +3487,9 @@ def train(
             cuda_graph_helper.create_cudagraphs()
             if args.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(args):
                 enable_forward_pre_hook(model)
+            if args.cuda_graph_warmup_steps > 0 and (
+                should_disable_forward_pre_hook(args) or args.use_megatron_fsdp
+            ):
                 cuda_graph_helper.cuda_graph_set_manual_hooks()
 
         # Completely skip iteration if needed.
@@ -3572,15 +3594,16 @@ def train(
                     enable_forward_pre_hook(model)
                     config.param_sync_func = param_sync_func
                     pre_hook_enabled = True
-                    # Set the manual hooks here since it's not set right after the capturing.
-                    if (
-                        args.cuda_graph_impl == "transformer_engine"
-                        and args.cuda_graph_warmup_steps == 0
-                    ):
-                        assert (
-                            cuda_graph_helper.capture_finished()
-                        ), "CUDA Graph capture should have been finished."
-                        cuda_graph_helper.cuda_graph_set_manual_hooks()
+                # Set the manual hooks here since it's not set right after the capturing.
+                if (
+                    args.cuda_graph_impl == "transformer_engine"
+                    and args.cuda_graph_warmup_steps == 0
+                    and (should_disable_forward_pre_hook(args) or args.use_megatron_fsdp)
+                ):
+                    assert (
+                        cuda_graph_helper.capture_finished()
+                    ), "CUDA Graph capture should have been finished."
+                    cuda_graph_helper.cuda_graph_set_manual_hooks()
 
         iteration += 1
 

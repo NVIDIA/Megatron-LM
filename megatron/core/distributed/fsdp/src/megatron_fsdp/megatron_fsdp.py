@@ -28,6 +28,8 @@ from .mixed_precision import (
     MixedPrecisionPolicy,
     fp8_create_transpose_cache,
     fp8_discard_transpose_cache,
+    fp8_get_raw_data,
+    fp8_set_raw_data,
     is_float8tensor,
 )
 from .param_and_grad_buffer import (
@@ -36,7 +38,7 @@ from .param_and_grad_buffer import (
     GradReducePipeline,
     ParamAndGradBuffer,
     PrefetchOrder,
-    _check_nan_in_grad,
+    get_param_group_id,
     override_sharded_param_methods_with_safety_checks,
     to_local_if_dtensor,
 )
@@ -50,6 +52,7 @@ try:
     from megatron.core.distributed.distributed_data_parallel_config import (
         DistributedDataParallelConfig,
     )
+    from megatron.core.transformer.cuda_graphs import is_graph_capturing
     from megatron.core.utils import is_submodule
 
     logger.info("Detected Megatron Core, using Megatron-FSDP with Megatron.")
@@ -58,6 +61,9 @@ except ImportError:
     logger.info("Megatron Core is not installed, Megatron-FSDP will run without Megatron Core.")
     from .distributed_data_parallel_config import DistributedDataParallelConfig
     from .utils import is_submodule
+
+    def is_graph_capturing():
+        return torch.cuda.is_current_stream_capturing()
 
 
 class TrainingState(Enum):
@@ -490,7 +496,7 @@ class MegatronFSDP(torch.nn.Module):
         )
         if wait_bucket_ready:
             for param in params:
-                bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
+                bucket_id = get_param_group_id(self.param_and_grad_buffer, param)
                 ag_pipeline.wait_bucket_ready(bucket_id, bwd)
                 if bwd and is_float8tensor(param):
                     fp8_create_transpose_cache(param)
@@ -553,6 +559,33 @@ class MegatronFSDP(torch.nn.Module):
         """
         fsdp_unit_modules = self.fsdp_unit_modules
 
+        def _get_canonical_module_params(module: nn.Module, recurse: bool = True):
+            """Return canonical FSDP buffer params owned by a module."""
+            param_to_direct_module = getattr(
+                self.param_and_grad_buffer, "param_to_direct_module", None
+            )
+            if param_to_direct_module is None:
+                return list(module.parameters(recurse=recurse))
+
+            if recurse:
+                return [
+                    param
+                    for param, (_, direct_module) in param_to_direct_module.items()
+                    if direct_module is module or is_submodule(direct_module, module)
+                ]
+
+            params_by_local_name = {}
+            for param, (_, direct_module) in param_to_direct_module.items():
+                if direct_module is not module:
+                    continue
+                param_name = self.param_and_grad_buffer.param_to_name[param]
+                params_by_local_name[param_name.rsplit(".", 1)[-1]] = param
+            return [
+                params_by_local_name[name]
+                for name, _ in module.named_parameters(recurse=False)
+                if name in params_by_local_name
+            ]
+
         def release_module_parameters(module, bwd, lazy=False, *unused):
             """
             Release the parameters of a given module after completing the forward
@@ -574,12 +607,21 @@ class MegatronFSDP(torch.nn.Module):
                 - If `ddp_config.keep_fp8_transpose_cache` is False, it also clears
                 the FP8 transpose cache associated with the module’s parameters.
             """
-            for param in module.parameters():
-                bucket_id = self.param_and_grad_buffer.param_to_param_group[param]
+            params = (
+                _get_canonical_module_params(module, recurse=True)
+                if (
+                    self.enable_fine_grained_param_gather_hook
+                    or is_graph_capturing()
+                    or bool(getattr(module, "cuda_graphs", None))
+                )
+                else list(module.parameters())
+            )
+            for param in params:
+                bucket_id = get_param_group_id(self.param_and_grad_buffer, param)
                 self.all_gather_pipeline.release_bucket(bucket_id, bwd, lazy=lazy)
 
             if not self.ddp_config.keep_fp8_transpose_cache:
-                release_params_fp8_transpose_cache(module.parameters())
+                release_params_fp8_transpose_cache(params)
 
         def release_params_fp8_transpose_cache(params):
             for param in params:
@@ -593,7 +635,23 @@ class MegatronFSDP(torch.nn.Module):
             Utilizes the patched main_grad property of the parameter to allocate
             or fetch the main gradient bucket for the parameter.
             """
-            group_id = self.param_and_grad_buffer.param_to_param_group[param]
+            def _check_finite(tensor, source):
+                if not self.report_nan_in_param_grad or tensor is None:
+                    return
+                local_tensor = to_local_if_dtensor(tensor)
+                if not torch.is_tensor(local_tensor) or not torch.is_floating_point(local_tensor):
+                    return
+                is_finite = torch.isfinite(local_tensor)
+                if not bool(is_finite.all().detach().cpu().item()):
+                    name = self.param_to_name.get(param, "<unknown>")
+                    nonfinite_count = int((~is_finite).sum().detach().cpu().item())
+                    raise RuntimeError(
+                        "[Megatron-FSDP] Detected non-finite value in "
+                        f"{source}: param={name}, shape={tuple(local_tensor.shape)}, "
+                        f"dtype={local_tensor.dtype}, nonfinite_count={nonfinite_count}"
+                    )
+
+            group_id = get_param_group_id(self.param_and_grad_buffer, param)
             group = self.param_and_grad_buffer.parameter_groups[group_id]
             if not group.requires_grad:
                 return
@@ -613,7 +671,7 @@ class MegatronFSDP(torch.nn.Module):
                     param.main_grad = param.get_main_grad()
                     if param.grad is not None:
                         if self.report_nan_in_param_grad:
-                            _check_nan_in_grad(to_local_if_dtensor(param.grad))
+                            _check_finite(param.grad, "param.grad before main_grad copy")
                         # Copy the gradient into the allocated main gradient bucket.
                         # It will be reduce-scattered and accumulated into gbuf.
                         param.main_grad.copy_(to_local_if_dtensor(param.grad))
@@ -625,7 +683,7 @@ class MegatronFSDP(torch.nn.Module):
                 if not param.grad_added_to_main_grad:
                     if param.grad is not None:
                         if self.report_nan_in_param_grad:
-                            _check_nan_in_grad(to_local_if_dtensor(param.grad))
+                            _check_finite(param.grad, "param.grad before main_grad add")
                         # Accumulate the gradient into the main gradient buffer,
                         # because we only reduce once per optimization cycle.
                         param.main_grad = param.get_main_grad()
@@ -634,6 +692,9 @@ class MegatronFSDP(torch.nn.Module):
 
             if param.grad_added_to_main_grad and param.grad is not None:
                 del param.grad
+
+            if self.report_nan_in_param_grad:
+                _check_finite(getattr(param, "main_grad", None), "param.main_grad after grad_acc")
 
             # Reset the grad accumulate flag.
             param.grad_added_to_main_grad = False
@@ -653,6 +714,18 @@ class MegatronFSDP(torch.nn.Module):
             """
             assert isinstance(module, tuple(fsdp_unit_modules))
             assert self.data_parallel_sharding_strategy == "optim_grads_params"
+
+            # CUDA graph replay may bypass per-parameter post-accumulate hooks for
+            # parameters owned by the graphed FSDP unit. Process any remaining
+            # gradients before the unit's parameter buckets can be released/reused.
+            if bool(getattr(module, "cuda_graphs", None)):
+                pending_params = [
+                    param
+                    for param in _get_canonical_module_params(module, recurse=True)
+                    if param in self._params_require_handle_grad
+                ]
+                if pending_params:
+                    _process_post_backward_gradients(pending_params)
 
             # Release parameters for this module after backward.
             release_module_parameters(module, bwd=True)
@@ -697,6 +770,10 @@ class MegatronFSDP(torch.nn.Module):
                 - In hybrid FSDP configurations, an outer FSDP group gradient reduction
                 may be triggered.
             """
+            # Skip entire gradient processing during CUDA graph capture.
+            if is_graph_capturing():
+                return
+
             # Filter out shared parameters whose gradients are handled by the root hook.
             param_list = [p for p in param_list if not getattr(p, "_is_shared", False)]
 
@@ -737,8 +814,120 @@ class MegatronFSDP(torch.nn.Module):
             for param in param_list:
                 self._params_require_handle_grad.discard(param)
 
+        def _get_direct_module_params(module: nn.Module):
+            """Return canonical FSDP buffer params for a module's direct parameters."""
+            return _get_canonical_module_params(module, recurse=False)
+
+        def _mirror_fsdp_param_attrs(module: nn.Module, canonical_params):
+            """Mirror FSDP buffer state onto transient wrappers exposed by modules."""
+            current_named_params = list(module.named_parameters(recurse=False))
+            current_params = [param for _, param in current_named_params]
+            if len(current_params) != len(canonical_params):
+                return
+
+            def _get_param_data(param):
+                local_param = to_local_if_dtensor(param)
+                if is_float8tensor(local_param):
+                    return fp8_get_raw_data(local_param)
+                return local_param.data
+
+            def _set_param_data(param, data):
+                local_param = to_local_if_dtensor(param)
+                if is_float8tensor(local_param):
+                    fp8_set_raw_data(local_param, data)
+                else:
+                    local_param.data = data
+
+            def _mirror_param_data(canonical_param, current_param):
+                canonical_data = _get_param_data(canonical_param)
+                current_data = _get_param_data(current_param)
+                if current_data is canonical_data:
+                    return
+                if (
+                    current_data is not None
+                    and canonical_data is not None
+                    and current_data.shape == canonical_data.shape
+                    and current_data.data_ptr() == canonical_data.data_ptr()
+                ):
+                    return
+                _set_param_data(current_param, canonical_data)
+
+            attrs = (
+                "_gbuf",
+                "_item_id",
+                "grad_added_to_main_grad",
+                "__fsdp_param__",
+                "overwrite_main_grad",
+                "skip_backward_post_hook",
+                "post_wgrad_grad_acc_hook",
+            )
+            for (name, current_param), canonical_param in zip(
+                current_named_params, canonical_params
+            ):
+                if canonical_param is current_param:
+                    continue
+                if is_graph_capturing():
+                    _replace_module_parameter(module, name, canonical_param)
+                    continue
+                _mirror_param_data(canonical_param, current_param)
+                for attr in attrs:
+                    if hasattr(canonical_param, attr):
+                        setattr(current_param, attr, getattr(canonical_param, attr))
+                if hasattr(canonical_param, "_gbuf") and hasattr(canonical_param, "_item_id"):
+
+                    def main_grad_getter(param):
+                        bucket = param._gbuf.fetch_bucket(
+                            dtype=(
+                                self.mp_policy.grad_comm_dtype
+                                if param._gbuf.is_data_distributed
+                                else None
+                            )
+                        )
+                        return param._gbuf.get_item_from_bucket(bucket, param._item_id).view(
+                            to_local_if_dtensor(param).shape
+                        )
+
+                    current_param.get_main_grad = main_grad_getter.__get__(current_param)
+
+        def _mirror_fsdp_tree_param_attrs(module: nn.Module, canonical_params):
+            """Mirror canonical FSDP params onto direct owner modules in a module tree."""
+            param_to_direct_module = getattr(
+                self.param_and_grad_buffer, "param_to_direct_module", None
+            )
+            if param_to_direct_module is None:
+                _mirror_fsdp_param_attrs(module, canonical_params)
+                return
+
+            direct_modules = []
+            seen_modules = set()
+            for param in canonical_params:
+                entry = param_to_direct_module.get(param)
+                if entry is None:
+                    continue
+                _, direct_module = entry
+                if not (direct_module is module or is_submodule(direct_module, module)):
+                    continue
+                if id(direct_module) in seen_modules:
+                    continue
+                seen_modules.add(id(direct_module))
+                direct_modules.append(direct_module)
+
+            if not direct_modules:
+                _mirror_fsdp_param_attrs(module, canonical_params)
+                return
+
+            for direct_module in direct_modules:
+                direct_params = _get_canonical_module_params(direct_module, recurse=False)
+                _mirror_fsdp_param_attrs(direct_module, direct_params)
+
         @torch.compiler.disable
-        def _pre_forward_param_unshard(module: nn.Module, *unused):
+        def _pre_forward_param_unshard(
+            module: nn.Module, *unused, force_disable_prefetch: bool = False
+        ):
+            # Fine-grained schedules may call inner modules directly and bypass
+            # MegatronFSDP.forward(), so restore raw module params here too.
+            self._replace_param_with_raw_if_needed()
+
             # Unshard the parameters before the forward pass.
             input_training_state = module._training_state
             fsdp_forward_prefetch = True
@@ -747,16 +936,30 @@ class MegatronFSDP(torch.nn.Module):
                 fsdp_forward_prefetch = False
             else:
                 module._training_state = TrainingState.FORWARD
+                if (
+                    force_disable_prefetch
+                    or is_graph_capturing()
+                    or bool(getattr(module, "cuda_graphs", None))
+                ):
+                    # TE invokes extracted FSDP hooks around each callable while building CUDA
+                    # graphs, and manual hooks before graph replay. Keep allocation order
+                    # identical by not leaving async prefetch collectives outstanding.
+                    fsdp_forward_prefetch = False
 
-            if isinstance(module, tuple(fsdp_unit_modules)):
+            use_canonical_params = (
+                self.enable_fine_grained_param_gather_hook
+                or is_graph_capturing()
+                or bool(getattr(module, "cuda_graphs", None))
+            )
+            recurse = isinstance(module, tuple(fsdp_unit_modules))
+            if use_canonical_params:
+                param_list = _get_canonical_module_params(module, recurse=recurse)
+            elif recurse:
                 param_list = list(module.parameters())
             else:
                 # All-gather the shallow parameters in every forward pass for modules
                 # that are not FSDP units. Do not recurse unless absolutely necessary,
                 # to allocate as little memory as possible for this forward pass.
-                param_list = list(module.parameters(recurse=False))
-
-            if self.enable_fine_grained_param_gather_hook:
                 param_list = list(module.parameters(recurse=False))
 
             # All-gather the parameters before the forward pass.
@@ -765,7 +968,21 @@ class MegatronFSDP(torch.nn.Module):
                 prefetch=fsdp_forward_prefetch,
                 prefetch_order=PrefetchOrder.FORWARD_PASS_ORDER,
             )
+            if use_canonical_params:
+                _mirror_fsdp_tree_param_attrs(module, param_list)
             return None
+
+        def _make_forward_pre_hook():
+            """Create a manual pre-forward hook for CUDA graph replay."""
+
+            def hook(module, *unused):
+                return _pre_forward_param_unshard(
+                    module, *unused, force_disable_prefetch=True
+                )
+
+            return hook
+
+        self._make_forward_pre_hook = _make_forward_pre_hook
 
         @torch.compiler.disable
         def _register_post_backward_hook(
@@ -873,15 +1090,25 @@ class MegatronFSDP(torch.nn.Module):
             for sub_module in module.modules():
                 sub_module._training_state = TrainingState.PRE_BACKWARD
 
-            if isinstance(module, tuple(fsdp_unit_modules)):
+            if self.enable_fine_grained_param_gather_hook:
+                param_list = _get_canonical_module_params(
+                    module, recurse=isinstance(module, tuple(fsdp_unit_modules))
+                )
+            elif isinstance(module, tuple(fsdp_unit_modules)):
                 param_list = list(module.parameters())
             else:
-                param_list = list(module.parameters(recurse=False))
+                param_list = _get_direct_module_params(module)
 
             # All-gather / unshard the module parameters before the backward pass.
             self.all_gather_and_wait_parameters_ready(
-                param_list, prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER, bwd=True
+                param_list,
+                prefetch=not (
+                    is_graph_capturing() or bool(getattr(module, "cuda_graphs", None))
+                ),
+                prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER,
+                bwd=True,
             )
+            _mirror_fsdp_tree_param_attrs(module, param_list)
 
         self._root_pre_backward_hook_issued = False
 
@@ -983,6 +1210,12 @@ class MegatronFSDP(torch.nn.Module):
                 )
                 return output
 
+            # Tag for cuda_graphs.py: this forward hook wraps a pre-backward handler.
+            # cuda_graphs.py will withhold it from TE and extract the inner handler
+            # into backward_pre_hooks for per-callable manual invocation.
+            # Attribute name must match _CUDA_GRAPH_BACKWARD_PRE_HANDLER_ATTR in cuda_graphs.py.
+            forward_hook._cuda_graph_backward_pre_handler = custom_backward_handler
+
             # Register the post-forward hook that attaches the custom backward hook
             # on the output tensor(s).
             return module.register_forward_hook(forward_hook)
@@ -1062,13 +1295,16 @@ class MegatronFSDP(torch.nn.Module):
             # and reduce-scatter gradients after the backward pass.
             if isinstance(module, tuple(fsdp_unit_modules)):
                 if self.ddp_config.data_parallel_sharding_strategy == "optim_grads_params":
+                    _post_bwd_hook = functools.partial(
+                        _register_post_backward_hook, _post_backward_release_module
+                    )
+                    # Tag for cuda_graphs.py: this forward_pre hook wraps a post-backward handler.
+                    # cuda_graphs.py will withhold it from TE and extract the inner handler
+                    # into backward_hooks for per-callable manual invocation.
+                    # Attribute name must match _CUDA_GRAPH_BACKWARD_HANDLER_ATTR in cuda_graphs.py.
+                    _post_bwd_hook._cuda_graph_backward_handler = _post_backward_release_module
                     self.forward_pre_hooks[f"module {name} register post-backward hook"] = (
-                        module.register_forward_pre_hook(
-                            functools.partial(
-                                _register_post_backward_hook, _post_backward_release_module
-                            ),
-                            with_kwargs=True,
-                        )
+                        module.register_forward_pre_hook(_post_bwd_hook, with_kwargs=True)
                     )
                 grad_acc_param_list = [p for p in module.parameters() if p.requires_grad]
             else:
@@ -1354,11 +1590,19 @@ class MegatronFSDP(torch.nn.Module):
         fsdp_params = dict(pg_buffer.optimizer_named_parameters)
         for name, _ in self.module.named_parameters():
             assert name in fsdp_params, f"Parameter {name} not found in FSDP parameters."
+            raw_param = self.raw_param[name]
             dist_param = fsdp_params[name]
             # Set the __fsdp_param__ attribute to True to indicate that this
             # DTensor parameter is managed by Megatron FSDP.
             if not hasattr(dist_param, "__fsdp_param__"):
                 dist_param.__fsdp_param__ = True
+            self.param_to_name[dist_param] = self.param_to_name[raw_param]
+            if raw_param in pg_buffer.param_to_name:
+                pg_buffer.param_to_name[dist_param] = pg_buffer.param_to_name[raw_param]
+            if raw_param in pg_buffer.param_to_param_group:
+                pg_buffer.param_to_param_group[dist_param] = pg_buffer.param_to_param_group[
+                    raw_param
+                ]
             _replace_module_parameter(self.module, name, dist_param)
 
         # Handle shared weights

@@ -223,7 +223,7 @@ class InferenceConfig:
     """
     How CUDA graph token counts are spaced. EXPONENTIAL (default) halves from
     `cuda_graph_max_tokens` down to `tp_size` (log-spaced, ~log2(max_tokens) graphs).
-    LINEAR uses a range of linear strides (includes small graphs + mid-range linearity + 
+    LINEAR uses a range of linear strides (includes small graphs + mid-range linearity +
     a bigger step size at the top end).
     """
 

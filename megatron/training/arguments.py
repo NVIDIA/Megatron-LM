@@ -1141,7 +1141,7 @@ def validate_args(args, defaults={}):
 
         assert args.ckpt_format == "fsdp_dtensor", \
             "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
-    
+
         if args.nccl_ub:
             # In Megatron-LM, required implementation for manual registration is already provided.
             # So we enable the manual registration by default when nccl-ub and use_megatron_fsdp is set.
@@ -1156,7 +1156,7 @@ def validate_args(args, defaults={}):
 
     if args.fsdp_manual_registration:
         assert args.use_megatron_fsdp, "FSDP manual registration is only supported with Megatron FSDP."
-        assert args.nccl_ub, "FSDP manual registration is only supported with --nccl-ub argument."      
+        assert args.nccl_ub, "FSDP manual registration is only supported with --nccl-ub argument."
 
     # Parameters dtype.
     args.params_dtype = torch.float
@@ -1753,10 +1753,24 @@ def validate_args(args, defaults={}):
                 "Setting NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when using "
                 "CUDA Graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
             )
+        if args.use_megatron_fsdp:
+            assert args.fsdp_double_buffer, (
+                "CUDA Graph requires --fsdp-double-buffer when using Megatron-FSDP. "
+                "Without double buffer, FSDP parameter buffers addresses are dynamic across "
+                "iterations, causing numerical errors during graph replay."
+            )
+            assert args.fsdp_db_use_persist_buf_on_alloc_fail, (
+                "CUDA Graph with Megatron-FSDP and MoE requires "
+                "--fsdp-db-use-persist-buf-on-alloc-fail. This is to prevent failed allocation "
+                "goes to a dynamic buffer, causing illegal memory access during graph replay. "
+                "You may disable this assertion if you are sure there is no allocation failure "
+                "in the CUDA graph scope."
+            )
+
     assert not (
         args.cuda_graph_impl == "full_iteration" and args.cuda_graph_modules
     ), '--cuda-graph-modules must be empty when --cuda-graph-impl=full_iteration.'
-    
+
     if args.multi_latent_attention:
         assert not args.group_query_attention, "Group query attention is mutually exclusive with multi latent attention."
         
@@ -2779,6 +2793,11 @@ def _add_distributed_args(parser):
                        default=False, help='If set, average directly in data-parallel communication collective.')
     group.add_argument('--overlap-param-gather', action='store_true',
                        default=False, help='If set, overlap param all-gather in distributed optimizer.')
+    group.add_argument('--fsdp-all-gather-in-start-param-sync',
+                       action=argparse.BooleanOptionalAction, default=True,
+                       help='If set, Megatron FSDP starts the first parameter all-gather in '
+                       'start_param_sync. Use --no-fsdp-all-gather-in-start-param-sync to '
+                       'let forward pre-hooks issue the first all-gather instead.')
     group.add_argument('--overlap-param-gather-with-optimizer-step', action='store_true',
                        default=False, help='If set, overlap param all-gather of first bucket with optimizer step.')
     group.add_argument('--no-align-param-gather', action='store_false',
@@ -2828,6 +2847,12 @@ def _add_distributed_args(parser):
                         "Double-buffering the communication memory improves memory management efficiency by "
                         "reusing previously allocated buffers, rather than creating new buffers for each FSDP communication. "
                         "This is required for user buffer registration and is enabled by default when using NCCL user buffers.")
+    group.add_argument('--fsdp-db-use-persist-buf-on-alloc-fail', action='store_true',
+                       help="Whether to fall back to persistent buffer when a bucket does not fit FSDP double buffer "
+                        "size. If true, FSDP will use the persistently allocated buffer for the bucket that does not "
+                        "fit, it will enable NCCL user buffer with the cost of more memory usage. If false, FSDP will "
+                        "use dynamic memory allocator, NCCL user buffer won't be enabled, which usually leads to low "
+                        "performance.")
     group.add_argument('--suggested-communication-unit-size', type=int, default=None,
                    help='Specifies the number of elements to communicate at once during FSDP (Fully Sharded Data Parallel) operations. '
                         'This flag also affects FSDP all-gather prefetch behavior. Setting a larger value increases the communication buffer size, '

@@ -1434,6 +1434,40 @@ class _CudaGraphRunner(torch.nn.Module):
         return [x] if torch.is_tensor(x) else list(x)
 
 
+# Keys used to split per-module hooks_dict into TE-facing vs restore-only dicts.
+_TE_HOOK_KEYS = frozenset(
+    {
+        'forward_pre_hooks',
+        'forward_pre_hooks_with_kwargs',
+        'forward_hooks',
+        'forward_hooks_with_kwargs',
+        'backward_pre_hooks',
+        'backward_hooks',
+    }
+)
+_NESTED_RESTORE_KEY = '_nested_hook_restores'
+
+_RESTORE_KEYS = frozenset(
+    {
+        'forward_pre_hooks_restore',
+        'forward_hooks_restore',
+        'backward_pre_hooks_restore',
+        'backward_hooks_restore',
+        _NESTED_RESTORE_KEY,
+    }
+)
+
+# Sentinel attribute names set by megatron_fsdp.py on forward hooks that wrap backward handlers.
+# cuda_graphs.py reads these to detect which hooks to withhold from TE and how to reroute them.
+# The attribute value is the inner backward handler to extract.
+# Must match the attribute names used in megatron_fsdp.py.
+#
+# Set on a forward_pre hook: inner handler goes to backward_hooks (post-backward).
+_CUDA_GRAPH_BACKWARD_HANDLER_ATTR = '_cuda_graph_backward_handler'
+# Set on a forward hook: inner handler goes to backward_pre_hooks (pre-backward).
+_CUDA_GRAPH_BACKWARD_PRE_HANDLER_ATTR = '_cuda_graph_backward_pre_handler'
+
+
 class CudaGraphManager(torch.nn.Module):
     """Creates and runs cudagraphs for a megatron module"""
 
@@ -2238,6 +2272,203 @@ class TECudaGraphHelper:
         # Generate sample arguments and keyword arguments for capturing.
         sample_args, sample_kwargs = self._get_sample_arguments(order, chunk_id_list)
 
+        # Extract hooks from callables for manual invocation during CUDA Graph capture/replay.
+        # Two-phase approach:
+        #   Phase 1 (_extract_module_hooks): general — copies ALL 4 hook dicts uniformly, clears them.
+        #   Phase 2 (_apply_fsdp_hook_transforms): FSDP-specific — reroutes FSDP wrappers so their
+        #     inner backward handlers land in the right TE-facing key while the wrappers themselves
+        #     are withheld from TE. *_restore keys are never modified in Phase 2.
+
+        def _extract_module_hooks(module):
+            """Phase 1 (general): copy all 4 PyTorch hook dicts; clear them from module.
+
+            Every hook goes into both its TE-facing key and its *_restore key (independent copy).
+            *_with_kwargs flag sets are populated where applicable.
+            No FSDP-specific logic here.
+            """
+            hooks_dict = {}
+
+            if getattr(module, '_forward_pre_hooks', None):
+                with_kw = getattr(module, '_forward_pre_hooks_with_kwargs', set())
+                fph = dict(module._forward_pre_hooks)
+                hooks_dict['forward_pre_hooks'] = fph
+                hooks_dict['forward_pre_hooks_restore'] = dict(fph)
+                fph_kw = {hid: True for hid in fph if hid in with_kw}
+                if fph_kw:
+                    hooks_dict['forward_pre_hooks_with_kwargs'] = fph_kw
+                module._forward_pre_hooks.clear()
+
+            if getattr(module, '_forward_hooks', None):
+                with_kw = getattr(module, '_forward_hooks_with_kwargs', set())
+                fh = dict(module._forward_hooks)
+                hooks_dict['forward_hooks'] = fh
+                hooks_dict['forward_hooks_restore'] = dict(fh)
+                fh_kw = {hid: True for hid in fh if hid in with_kw}
+                if fh_kw:
+                    hooks_dict['forward_hooks_with_kwargs'] = fh_kw
+                module._forward_hooks.clear()
+
+            if getattr(module, '_backward_pre_hooks', None):
+                bph = dict(module._backward_pre_hooks)
+                hooks_dict['backward_pre_hooks'] = bph
+                hooks_dict['backward_pre_hooks_restore'] = dict(bph)
+                module._backward_pre_hooks.clear()
+
+            if getattr(module, '_backward_hooks', None):
+                bh = dict(module._backward_hooks)
+                hooks_dict['backward_hooks'] = bh
+                hooks_dict['backward_hooks_restore'] = dict(bh)
+                module._backward_hooks.clear()
+
+            return hooks_dict
+
+        def _hook_target(hook_fn):
+            return hook_fn.func if isinstance(hook_fn, partial) else hook_fn
+
+        def _is_megatron_fsdp_capture_hook(hook_fn):
+            target = _hook_target(hook_fn)
+            module_name = getattr(inspect.getmodule(target), '__name__', '')
+            qualname = getattr(target, '__qualname__', '')
+            return (
+                'megatron_fsdp' in module_name
+                and (
+                    '_pre_forward_param_unshard' in qualname
+                    or '_release_module_fp8_transpose_cache' in qualname
+                )
+            )
+
+        def _iter_cudagraph_submodules(module):
+            if not isinstance(module, GraphableMegatronModule):
+                return
+            seen = set()
+            for submodule in module._get_submodules_under_cudagraphs():
+                for nested in submodule.modules():
+                    if nested is module or id(nested) in seen:
+                        continue
+                    seen.add(id(nested))
+                    yield nested
+
+        def _bind_forward_pre_hook(module, hook_fn, with_kwargs):
+            def wrapper(_callable_module, _args):
+                if with_kwargs:
+                    return hook_fn(module, (), {})
+                return hook_fn(module, ())
+
+            return wrapper
+
+        def _bind_forward_hook(module, hook_fn, with_kwargs):
+            def wrapper(_callable_module, _args, _output):
+                if with_kwargs:
+                    return hook_fn(module, (), {}, _output)
+                return hook_fn(module, (), _output)
+
+            return wrapper
+
+        def _extract_nested_fsdp_hooks(callable_module, hooks_dict):
+            """Move FSDP hooks on graph-covered child modules out of the captured graph."""
+            nested_restores = []
+            for module in _iter_cudagraph_submodules(callable_module):
+                module_restore = {}
+
+                fph = getattr(module, '_forward_pre_hooks', None)
+                if fph:
+                    with_kw = getattr(module, '_forward_pre_hooks_with_kwargs', set())
+                    for hook_id, hook_fn in list(fph.items()):
+                        if not _is_megatron_fsdp_capture_hook(hook_fn):
+                            continue
+                        module_restore.setdefault('forward_pre_hooks_restore', {})[
+                            hook_id
+                        ] = hook_fn
+                        hooks_dict.setdefault('forward_pre_hooks', {})[
+                            ('nested_forward_pre', id(module), hook_id)
+                        ] = _bind_forward_pre_hook(module, hook_fn, hook_id in with_kw)
+                        del fph[hook_id]
+
+                fh = getattr(module, '_forward_hooks', None)
+                if fh:
+                    with_kw = getattr(module, '_forward_hooks_with_kwargs', set())
+                    for hook_id, hook_fn in list(fh.items()):
+                        if not _is_megatron_fsdp_capture_hook(hook_fn):
+                            continue
+                        module_restore.setdefault('forward_hooks_restore', {})[hook_id] = hook_fn
+                        hooks_dict.setdefault('forward_hooks', {})[
+                            ('nested_forward', id(module), hook_id)
+                        ] = _bind_forward_hook(module, hook_fn, hook_id in with_kw)
+                        del fh[hook_id]
+
+                if module_restore:
+                    nested_restores.append((module, module_restore))
+
+            if nested_restores:
+                hooks_dict.setdefault(_NESTED_RESTORE_KEY, []).extend(nested_restores)
+
+        def _apply_fsdp_hook_transforms(hooks_dict):
+            """Phase 2 (FSDP-specific): reroute forward hooks that wrap backward handlers.
+
+            megatron_fsdp.py tags such hooks with sentinel attributes before registering them:
+            - _CUDA_GRAPH_BACKWARD_HANDLER_ATTR: set on forward_pre hooks wrapping a post-backward
+              handler (e.g. functools.partial over _post_backward_release_module). Cannot be passed
+              to TE — TE's per-callable backward would fire the handler for ALL callables at once.
+            - _CUDA_GRAPH_BACKWARD_PRE_HANDLER_ATTR: set on forward hooks wrapping a pre-backward
+              handler (e.g. create_custom_backward_hook pattern).
+
+            Each tagged hook is withheld from TE; its inner handler is extracted to the
+            appropriate backward key for per-callable manual invocation.
+            *_restore keys are NOT modified.
+            """
+            # 1. forward_pre_hooks: hooks tagged with _CUDA_GRAPH_BACKWARD_HANDLER_ATTR
+            fph = hooks_dict.get('forward_pre_hooks')
+            if fph:
+                to_remove = []
+                new_bh = {}
+                for hook_id, hook_fn in fph.items():
+                    handler = getattr(hook_fn, _CUDA_GRAPH_BACKWARD_HANDLER_ATTR, None)
+                    if handler is not None:
+                        new_bh[hook_id] = handler
+                        to_remove.append(hook_id)
+                for hook_id in to_remove:
+                    del fph[hook_id]
+                    hooks_dict.get('forward_pre_hooks_with_kwargs', {}).pop(hook_id, None)
+                if new_bh:
+                    hooks_dict.setdefault('backward_hooks', {}).update(new_bh)
+                if not fph:
+                    del hooks_dict['forward_pre_hooks']
+                    hooks_dict.pop('forward_pre_hooks_with_kwargs', None)
+
+            # 2. forward_hooks: hooks tagged with _CUDA_GRAPH_BACKWARD_PRE_HANDLER_ATTR
+            fh = hooks_dict.get('forward_hooks')
+            if fh:
+                to_remove = []
+                new_bph = {}
+                for hook_id, hook_fn in fh.items():
+                    handler = getattr(hook_fn, _CUDA_GRAPH_BACKWARD_PRE_HANDLER_ATTR, None)
+                    if handler is not None:
+                        new_bph[hook_id] = handler
+                        to_remove.append(hook_id)
+                for hook_id in to_remove:
+                    del fh[hook_id]
+                    hooks_dict.get('forward_hooks_with_kwargs', {}).pop(hook_id, None)
+                if new_bph:
+                    hooks_dict.setdefault('backward_pre_hooks', {}).update(new_bph)
+                if not fh:
+                    del hooks_dict['forward_hooks']
+                    hooks_dict.pop('forward_hooks_with_kwargs', None)
+
+        extracted_hooks = []  # TE-facing: passed to make_graphed_callables as capture_time_hooks
+        restore_hooks = []  # restore-only: applied to modules after graph capture
+        for callable_module in self.flattened_callables:
+            if isinstance(callable_module, torch.nn.Module):
+                hooks_dict = _extract_module_hooks(callable_module)
+                _apply_fsdp_hook_transforms(hooks_dict)
+                _extract_nested_fsdp_hooks(callable_module, hooks_dict)
+                te_hooks = {k: v for k, v in hooks_dict.items() if k in _TE_HOOK_KEYS}
+                restore = {k: v for k, v in hooks_dict.items() if k in _RESTORE_KEYS}
+                extracted_hooks.append(te_hooks if te_hooks else None)
+                restore_hooks.append(restore if restore else None)
+            else:
+                extracted_hooks.append(None)
+                restore_hooks.append(None)
+
         def get_make_graphed_callables_kwargs():
             kwargs = {
                 'allow_unused_input': True,
@@ -2299,7 +2530,10 @@ class TECudaGraphHelper:
                 kwargs['fp8_recipe'] = (
                     get_fp8_recipe(self.config) if self.config.fp8 else get_fp4_recipe(self.config)
                 )
-                kwargs['fp8_weight_caching'] = True
+                # TE's cached FP8 weights assume graph replay sees the same parameter storage
+                # that was used during capture. Megatron-FSDP FP8 param gather swaps gathered
+                # parameter views around graph boundaries, so quantized weights must be refreshed.
+                kwargs['fp8_weight_caching'] = not getattr(self.config, 'fp8_param', False)
                 if (
                     is_te_min_version("1.14.0")
                     and self.pg_collection is not None
@@ -2313,7 +2547,36 @@ class TECudaGraphHelper:
             return kwargs
 
         kwargs = get_make_graphed_callables_kwargs()
-        return sample_args, kwargs
+
+        # Add extracted hooks to kwargs for TE to invoke during warmup/capture
+        # Note: We DON'T pass replay_hooks - hooks will be restored to modules after capture
+        # and automatically triggered during replay
+        if extracted_hooks and any(h for h in extracted_hooks):
+            # TE's make_graphed_callables asserts that all capture_time_hooks return None
+            # (hooks must only have side effects; returning tensors would corrupt the static
+            # CUDA graph buffers). Wrap each hook_fn so the return value is always None.
+            def _wrap_none(fn):
+                def wrapper(*args, **kwargs):
+                    fn(*args, **kwargs)
+
+                return wrapper
+
+            def _wrap_hooks_dict(hooks_dict):
+                if hooks_dict is None:
+                    return None
+                wrapped = {}
+                for key, id_to_fn in hooks_dict.items():
+                    # forward_pre_hooks_with_kwargs and forward_hooks_with_kwargs are flag sets
+                    # ({hook_id: True}), not hook_fn dicts — skip wrapping.
+                    if key in ('forward_pre_hooks_with_kwargs', 'forward_hooks_with_kwargs'):
+                        wrapped[key] = id_to_fn
+                    else:
+                        wrapped[key] = {hid: _wrap_none(fn) for hid, fn in id_to_fn.items()}
+                return wrapped
+
+            kwargs['capture_time_hooks'] = [_wrap_hooks_dict(h) for h in extracted_hooks]
+
+        return sample_args, kwargs, restore_hooks
 
     def _start_capturing(self):
         """
@@ -2380,7 +2643,7 @@ class TECudaGraphHelper:
             )
         else:
             # Prepare CUDA Graph capturing input data and call `make_graphed_callables`.
-            sample_args, kwargs = self._get_cuda_graph_input_data()
+            sample_args, kwargs, restore_hooks = self._get_cuda_graph_input_data()
             if self.config.sequence_parallel:
                 rng_context = get_cuda_rng_tracker().fork()
             else:
@@ -2389,6 +2652,37 @@ class TECudaGraphHelper:
                 graphs = make_graphed_callables(
                     tuple(self.flattened_callables), sample_args, **kwargs
                 )
+
+            # Restore original hooks to callables after CUDA Graph capture.
+            # restore_hooks contains only the hooks cleared before capture; _with_kwargs flag dicts
+            # survive .clear() and need no explicit restoration.
+            if restore_hooks and any(h for h in restore_hooks):
+                for callable_module, restore in zip(self.flattened_callables, restore_hooks):
+                    if isinstance(callable_module, torch.nn.Module) and restore:
+                        if 'forward_pre_hooks_restore' in restore:
+                            for hook_id, hook_fn in restore['forward_pre_hooks_restore'].items():
+                                callable_module._forward_pre_hooks[hook_id] = hook_fn
+                        if 'forward_hooks_restore' in restore:
+                            for hook_id, hook_fn in restore['forward_hooks_restore'].items():
+                                callable_module._forward_hooks[hook_id] = hook_fn
+                        if 'backward_pre_hooks_restore' in restore:
+                            for hook_id, hook_fn in restore['backward_pre_hooks_restore'].items():
+                                callable_module._backward_pre_hooks[hook_id] = hook_fn
+                        if 'backward_hooks_restore' in restore:
+                            for hook_id, hook_fn in restore['backward_hooks_restore'].items():
+                                callable_module._backward_hooks[hook_id] = hook_fn
+                        if _NESTED_RESTORE_KEY in restore:
+                            for nested_module, nested_restore in restore[_NESTED_RESTORE_KEY]:
+                                if 'forward_pre_hooks_restore' in nested_restore:
+                                    for hook_id, hook_fn in nested_restore[
+                                        'forward_pre_hooks_restore'
+                                    ].items():
+                                        nested_module._forward_pre_hooks[hook_id] = hook_fn
+                                if 'forward_hooks_restore' in nested_restore:
+                                    for hook_id, hook_fn in nested_restore[
+                                        'forward_hooks_restore'
+                                    ].items():
+                                        nested_module._forward_hooks[hook_id] = hook_fn
 
             # Push the captured graphs to the corresponding TransformerBlock.
             num_layers_accumulated = 0

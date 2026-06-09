@@ -3027,6 +3027,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # Optionally all-gather Megatron-FSDP sharded main weights
             # early in preparation for the subsequent forward pass.
             for model_chunk in self.model_chunks:
+                model_config = getattr(model_chunk, "config", None)
+                if model_config is None:
+                    model_config = getattr(getattr(model_chunk, "module", None), "config", None)
+                if getattr(model_config, "cuda_graph_impl", "none") == "transformer_engine":
+                    # TE CUDA graph warmup/capture/replay runs on a side stream.
+                    # Restore raw FSDP parameters for the next forward pre-hooks, but
+                    # avoid carrying async post-step all-gather work across iterations.
+                    model_chunk._replace_param_with_raw_if_needed()
+                    continue
                 model_chunk.start_param_sync()
         else:
             # If not overlapping all-gather for parameters, launch synchronous all-gather

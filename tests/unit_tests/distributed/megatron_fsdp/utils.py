@@ -77,6 +77,13 @@ def make_moe_args_model_and_optimizer(ut_filename, **overrides):
         min_lr=3e-5,
         use_distributed_optimizer=True,
         finalize_model_grads_func=finalize_model_grads,
+        micro_batch_size=2,
+        global_batch_size=32,
+        vocab_size=100,
+        seq_length=128,
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        train_iters=20,
     )
 
     base_args.update(overrides)

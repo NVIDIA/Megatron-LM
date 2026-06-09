@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 import copy
 import gc
+import os
 import random
 
 import numpy as np
@@ -25,8 +26,10 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
+from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.transformer_layer import TransformerLayer
-from megatron.core.utils import is_te_min_version, is_torch_min_version
+from megatron.core.utils import get_attr_wrapped_model, is_te_min_version, is_torch_min_version
 from tests.unit_tests.distributed.megatron_fsdp.utils import (
     make_gpt_mock_data_iterator,
     make_moe_args_model_and_optimizer,
@@ -774,6 +777,31 @@ def ref_cache():
 class TestMegatronFSDPE2E:
 
     @staticmethod
+    def _debug_values(output):
+        values = {}
+        for key, value in output.items():
+            if not key.startswith("__debug_"):
+                continue
+            if torch.is_tensor(value):
+                values[key] = value.item() if value.numel() == 1 else value.tolist()
+            else:
+                values[key] = value
+        return values
+
+    @staticmethod
+    def _detach_for_compare(value):
+        if torch.is_tensor(value):
+            return value.detach().clone()
+        return value
+
+    @staticmethod
+    def _detach_output_for_compare(output):
+        return {
+            key: TestMegatronFSDPE2E._detach_for_compare(value)
+            for key, value in output.items()
+        }
+
+    @staticmethod
     def _training_loop(seed=42, **kwargs):
         """
         Run a small deterministic (optional) training loop using a mocked MoE/GPT model and optimizer.
@@ -795,6 +823,12 @@ class TestMegatronFSDPE2E:
                 - expert_model_parallel_size (int): Expert model parallel size for MoE. Default: 1.
                 - expert_tensor_parallel_size (int): Expert tensor parallel size for MoE. Default: 1.
                 - num_distributed_optimizer_instances (int): Number of distributed optimizer instances. Default: 1.
+                - cuda_graph_impl (str): CUDA graph backend. "transformer_engine" enables TE CUDA graphs.
+                  The model and warmup steps run on a non-default side stream so AccumulateGrad nodes
+                  are never on the legacy default stream (avoids cudaErrorStreamCaptureImplicit).
+                - cuda_graph_warmup_steps (int): Warmup iterations before CUDA graph capture. Default: 0.
+                  Consumed locally; not forwarded to make_moe_args_model_and_optimizer.
+                - cuda_graph_modules (list[CudaGraphModule]): Modules to capture; forwarded to TransformerConfig.
         Returns:
             list: A list of length train_iters containing the per-step language-model loss values
             (the value appended from output[-1] each iteration). Loss objects are returned as produced
@@ -823,6 +857,26 @@ class TestMegatronFSDPE2E:
         EP = kwargs.get("expert_model_parallel_size", 1)
         ETP = kwargs.get("expert_tensor_parallel_size", 1)
         OUTER_DP = kwargs.get("num_distributed_optimizer_instances", 1)
+        CUDA_GRAPH_IMPL = kwargs.get("cuda_graph_impl", "none")
+        CUDA_GRAPH_WARMUP_STEPS = kwargs.pop("cuda_graph_warmup_steps", 0)
+        DEBUG_CUDAGRAPH_ALIGNMENT = kwargs.pop("debug_cudagraph_alignment", False)
+        USE_TE_SIDE_STREAM = kwargs.pop(
+            "use_te_side_stream", CUDA_GRAPH_IMPL == "transformer_engine"
+        )
+        USE_TE_RNG_TRACKER = kwargs.pop(
+            "use_te_rng_tracker",
+            kwargs.get("te_rng_tracker", CUDA_GRAPH_IMPL == "transformer_engine"),
+        )
+        if USE_TE_RNG_TRACKER:
+            kwargs["te_rng_tracker"] = True
+        if kwargs.get("deterministic_mode", False):
+            os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+            os.environ.setdefault("NCCL_ALGO", "Ring")
+            os.environ.setdefault("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+            torch.use_deterministic_algorithms(True)
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.allow_tf32 = False
 
         # Initialize model parallel groups
         Utils.initialize_model_parallel(
@@ -832,24 +886,42 @@ class TestMegatronFSDPE2E:
             expert_tensor_parallel_size=ETP,
             num_distributed_optimizer_instances=OUTER_DP,
         )
+        # FSDP/DTensor model construction creates additional process groups. Make sure
+        # every rank has finished the model-parallel group creation sequence first.
+        torch.distributed.barrier()
         DP_GROUP = mpu.get_data_parallel_group()
 
-        # Set manual seed for reproducibility
-        set_manual_seed(seed)
+        # When using TE CUDA graphs, switch to a non-default side stream BEFORE
+        # seed/model initialization. This mirrors the production initialization path
+        # where CUDA graph mode selects the side stream before seeding RNG state.
+        # AccumulateGrad nodes are associated with the CUDA stream current at creation
+        # time. If they are created on the legacy/default stream (stream 0), TE's
+        # backward capture (which runs on an internal non-default capture stream)
+        # triggers cudaErrorStreamCaptureImplicit when the autograd engine tries to
+        # synchronize the default stream with the capture stream.
+        te_side_stream = None
+        original_stream = torch.cuda.current_stream()
+        if USE_TE_SIDE_STREAM:
+            te_side_stream = torch.cuda.Stream()
+            te_side_stream.wait_stream(original_stream)
+            torch.cuda.set_stream(te_side_stream)
+
+        # Set manual seed for reproducibility. TE CUDA graphs require TE's
+        # graph-safe RNG tracker, so initialize it directly instead of first
+        # creating Megatron's default tracker and then switching tracker types.
+        if USE_TE_RNG_TRACKER:
+            torch.manual_seed(seed)
+            model_parallel_cuda_manual_seed(
+                seed, te_rng_tracker=True, use_cudagraphable_rng=True, force_reset_rng=True
+            )
+        else:
+            set_manual_seed(seed)
 
         # Create model and optimizer
         model_chunks, optim = make_moe_args_model_and_optimizer(
             ut_filename="test_mcore_fully_sharded_data_parallel.py",
-            micro_batch_size=MICRO_BATCH_SIZE,
-            global_batch_size=GLOBAL_BATCH_SIZE,
-            vocab_size=VOCAB_SIZE,
             padded_vocab_size=VOCAB_SIZE,
-            seq_length=MAX_SEQ_LEN,
             sequence_parallel=TP > 1,
-            tensor_model_parallel_size=TP,
-            pipeline_model_parallel_size=PP,
-            num_layers_per_virtual_pipeline_stage=VPP,
-            train_iters=NUM_TRAINING_STEPS,
             **kwargs,
         )
         megatron_fsdp_te_fused_adam = kwargs.get("use_megatron_fsdp", False) and kwargs.get(
@@ -877,10 +949,27 @@ class TestMegatronFSDPE2E:
             num_samples=GLOBAL_BATCH_SIZE * NUM_TRAINING_STEPS,
         )
 
+        # Create CUDA graph helper (after model is built).
+        cuda_graph_helper = None
+        if CUDA_GRAPH_IMPL == "transformer_engine":
+            config = get_attr_wrapped_model(model_chunks[0], 'config')
+            cuda_graph_helper = TECudaGraphHelper(
+                model=model_chunks,
+                config=config,
+                seq_length=MAX_SEQ_LEN,
+                micro_batch_size=MICRO_BATCH_SIZE,
+                optimizers=[optim],
+            )
+
         outputs = []
 
         # Training loop
-        for _ in range(NUM_TRAINING_STEPS):
+        for i in range(NUM_TRAINING_STEPS):
+            if te_side_stream is not None:
+                torch.cuda.synchronize()
+            if cuda_graph_helper is not None and i == CUDA_GRAPH_WARMUP_STEPS:
+                cuda_graph_helper.create_cudagraphs()
+
             optim.zero_grad()
             output = pretrain_forward_backward(
                 model=model_chunks,
@@ -900,12 +989,45 @@ class TestMegatronFSDPE2E:
                         for p in model_chunks[0].parameters()
                     ]
                 ), f"[Megatron-FSDP] Missing gradient in Parameter.{grad_attr}..."
+            if te_side_stream is not None:
+                torch.cuda.synchronize()
+
+            step_output = TestMegatronFSDPE2E._detach_output_for_compare(output[-1])
+            if DEBUG_CUDAGRAPH_ALIGNMENT:
+                lm_losses = [loss_dict["lm loss"].detach().float().double() for loss_dict in output]
+                step_output["__debug_loss_sum"] = TestMegatronFSDPE2E._detach_for_compare(
+                    sum(lm_losses)
+                )
+                step_output["__debug_loss_first"] = TestMegatronFSDPE2E._detach_for_compare(
+                    lm_losses[0]
+                )
+                step_output["__debug_loss_last"] = TestMegatronFSDPE2E._detach_for_compare(
+                    lm_losses[-1]
+                )
+
             optim.step()
+            if te_side_stream is not None:
+                torch.cuda.synchronize()
 
             # Collect loss
-            outputs.append(output[-1])
+            outputs.append(step_output)
+
+        if cuda_graph_helper is not None and cuda_graph_helper.graphs_created():
+            cuda_graph_helper.delete_cuda_graphs()
+
+        for model_chunk in model_chunks:
+            stop_communication = getattr(model_chunk, "stop_communication", None)
+            if stop_communication is not None:
+                stop_communication()
+
+        if te_side_stream is not None:
+            torch.cuda.synchronize()
+            torch.cuda.set_stream(original_stream)
 
         Utils.destroy_model_parallel()
+        del model_chunks, optim, data_iterator, cuda_graph_helper
+        gc.collect()
+        torch.cuda.empty_cache()
 
         return outputs
 
@@ -1021,6 +1143,122 @@ class TestMegatronFSDPE2E:
                         f", Compare = {compare_losses(loss.item(), ref_loss.item())}"
                     ),
                 )
+
+    @pytest.mark.flaky_in_dev
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("2.10.0")),
+        reason="Partial CUDA graph support requires TransformerEngine >= 2.10.0",
+    )
+    @pytest.mark.parametrize(
+        "parallel_config",
+        [
+            pytest.param({}, id="default"),
+            pytest.param({"tensor_model_parallel_size": 2}, id="TP2"),
+            pytest.param(
+                {"expert_model_parallel_size": 2, "expert_tensor_parallel_size": 2}, id="EP2_ETP2"
+            ),
+        ],
+    )
+    def test_cudagraph_alignment_with_fsdp(self, parallel_config):
+        """CUDA graph replay must produce numerically identical loss to eager FSDP execution.
+
+        Parametrized over parallelism configurations. For each config, runs one eager
+        baseline then verifies all CUDA graph scopes produce bit-identical losses.
+        """
+        SCOPES = [
+            [CudaGraphModule.attn],
+            [CudaGraphModule.attn, CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess],
+            [CudaGraphModule.moe_router],
+        ]
+        FSDP_COMMON = dict(
+            use_megatron_fsdp=True,
+            data_parallel_sharding_strategy="optim_grads_params",
+            init_model_with_meta_device=True,
+            ckpt_format="fsdp_dtensor",
+            gradient_accumulation_fusion=False,
+            fsdp_double_buffer=True,
+            fsdp_db_use_persist_buf_on_alloc_fail=True,
+            deterministic_mode=True,
+            # This test validates graph replay alignment. Keep parameters fixed so
+            # independent eager/graph runs are not failed by optimizer-update
+            # non-bitwise effects unrelated to CUDA graph capture.
+            lr=0.0,
+            min_lr=0.0,
+        )
+
+        def assert_outputs_match(case_name, outputs, reference_outputs, scope):
+            mismatch_step = None
+            mismatch_msg = None
+            for step, (output, ref_output) in enumerate(zip(outputs, reference_outputs)):
+                for debug_key in (
+                    "__debug_loss_sum",
+                ):
+                    debug_value = output.get(debug_key)
+                    ref_debug_value = ref_output.get(debug_key)
+                    if debug_value is None and ref_debug_value is None:
+                        continue
+                    if (
+                        torch.is_tensor(debug_value)
+                        and torch.is_tensor(ref_debug_value)
+                        and torch.equal(debug_value, ref_debug_value)
+                    ):
+                        continue
+                    mismatch_step = step
+                    mismatch_msg = (
+                        f"CUDA graph debug mismatch in {case_name} at step {step} "
+                        f"key={debug_key} "
+                        f"(rank={torch.distributed.get_rank()}, parallel={parallel_config}, "
+                        f"scope={[s.name for s in scope]}): "
+                        f"cuda_graph_debug={TestMegatronFSDPE2E._debug_values(output)}, "
+                        f"eager_debug={TestMegatronFSDPE2E._debug_values(ref_output)}"
+                    )
+                    break
+                if mismatch_msg is not None:
+                    break
+                loss = output["lm loss"]
+                ref_loss = ref_output["lm loss"]
+                if not torch.equal(loss, ref_loss):
+                    mismatch_step = step
+                    mismatch_msg = (
+                        f"CUDA graph loss mismatch in {case_name} at step {step} "
+                        f"(rank={torch.distributed.get_rank()}, parallel={parallel_config}, "
+                        f"scope={[s.name for s in scope]}): "
+                        f"cuda_graph={loss.item():.6f}, eager={ref_loss.item():.6f}"
+                        f", Compare = {compare_losses(loss.item(), ref_loss.item())}"
+                        f", cuda_graph_debug={TestMegatronFSDPE2E._debug_values(output)}"
+                        f", eager_debug={TestMegatronFSDPE2E._debug_values(ref_output)}"
+                    )
+                    break
+
+            any_mismatch = torch.tensor(
+                1 if mismatch_step is not None else 0,
+                dtype=torch.int32,
+                device=torch.cuda.current_device(),
+            )
+            torch.distributed.all_reduce(any_mismatch, op=torch.distributed.ReduceOp.MAX)
+            if any_mismatch.item():
+                assert mismatch_msg is not None, (
+                    f"CUDA graph loss mismatch on another rank in {case_name} "
+                    f"(parallel={parallel_config}, scope={[s.name for s in scope]})"
+                )
+                assert False, mismatch_msg
+
+        reference_outputs = TestMegatronFSDPE2E._training_loop(
+            **FSDP_COMMON,
+            **parallel_config,
+            debug_cudagraph_alignment=True,
+        )
+
+        for scope in SCOPES:
+            outputs = TestMegatronFSDPE2E._training_loop(
+                **FSDP_COMMON,
+                **parallel_config,
+                cuda_graph_impl="transformer_engine",
+                cuda_graph_modules=scope,
+                cuda_graph_warmup_steps=3,
+                debug_cudagraph_alignment=True,
+            )
+            assert_outputs_match("cuda_graph", outputs, reference_outputs, scope)
 
         gc.collect()
         torch.cuda.empty_cache()

@@ -19,13 +19,13 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.spec_utils import import_module
 
 from megatron.training.config import (
-    DistributedInitConfig, 
-    PretrainConfigContainer, 
-    SchedulerConfig, 
+    DistributedInitConfig,
+    PretrainConfigContainer,
+    SchedulerConfig,
     TokenizerConfig,
-    TrainingConfig, 
-    ValidationConfig, 
-    RNGConfig, 
+    TrainingConfig,
+    ValidationConfig,
+    RNGConfig,
     LoggerConfig,
     StragglerDetectionConfig,
     RerunStateMachineConfig, CheckpointConfig, ProfilingConfig
@@ -43,7 +43,7 @@ class ArgumentGroupFactory:
     This utility uses dataclass metadata including type annotations and docstrings to automatically
         infer the type, default, and other argparse keyword arguments.
 
-    You can override or supplement the automatically inferred argparse kwargs for any 
+    You can override or supplement the automatically inferred argparse kwargs for any
         dataclass field by providing an "argparse_meta" key in the field's metadata dict.
         The value should be a dict of kwargs that will be passed to ArgumentParser.add_argument().
         These metadata kwargs take precedence over the automatically inferred values.
@@ -72,13 +72,13 @@ class ArgumentGroupFactory:
         that require some customized or additional handling.
 
     Args:
-        src_cfg_class: The source dataclass type (not instance) whose fields will be 
-            converted into command-line arguments. Each field's type annotation determines 
-            the argument type, default values become argument defaults, and field-level 
+        src_cfg_class: The source dataclass type (not instance) whose fields will be
+            converted into command-line arguments. Each field's type annotation determines
+            the argument type, default values become argument defaults, and field-level
             docstrings are extracted to populate argument help text.
-        exclude: Optional list of attribute names from `src_cfg_class` to exclude from 
+        exclude: Optional list of attribute names from `src_cfg_class` to exclude from
             argument generation. Useful for omitting internal fields, computed properties,
-            or attributes that should be configured through other means. If None, all 
+            or attributes that should be configured through other means. If None, all
             dataclass fields will be converted to command-line arguments. Default: None.
     """
 
@@ -92,7 +92,7 @@ class ArgumentGroupFactory:
 
         Args:
             config_attr_name: dataclass attribute name
-            prefix: prefix string to add to the dataclass attribute name. e.g. 'no' for bool 
+            prefix: prefix string to add to the dataclass attribute name. e.g. 'no' for bool
                 settings that are default True. A hyphen is added after the prefix. Default: None
         """
         arg_name = config_attr_name
@@ -188,7 +188,7 @@ class ArgumentGroupFactory:
 
                 # add '--no-*' and '--disable-*' prefix if this is a store_false argument
                 if argparse_kwargs["action"] == "store_false":
-                    argparse_kwargs["arg_names"] = [self._format_arg_name(attribute.name, prefix="no"), self._format_arg_name(attribute.name, prefix="disable")] 
+                    argparse_kwargs["arg_names"] = [self._format_arg_name(attribute.name, prefix="no"), self._format_arg_name(attribute.name, prefix="disable")]
         except TypeInferenceError as e:
             if attr_argparse_meta is not None:
                 print(
@@ -200,7 +200,7 @@ class ArgumentGroupFactory:
             else:
                 raise e
 
-        # metadata provided by field takes precedence 
+        # metadata provided by field takes precedence
         if attr_argparse_meta is not None:
             argparse_kwargs.update(attr_argparse_meta)
 
@@ -368,7 +368,12 @@ def core_transformer_config_from_args(args, config_class=None):
         kw_args['kitchen_attention_backend'] = args.kitchen_attention_backend
 
     # Return config.
-    return config_class(**kw_args)
+    config = config_class(**kw_args)
+    # Megatron-FSDP is a distributed wrapper setting rather than a TransformerConfig
+    # dataclass field. Partial MoE CUDA graph needs to know it at runtime when
+    # deciding whether shared experts must stay outside the graph.
+    config.use_megatron_fsdp = getattr(args, 'use_megatron_fsdp', False)
+    return config
 
 
 def _default_config_from_args(cls: type, args: Namespace, return_instance: bool = True) -> Any:
@@ -430,7 +435,7 @@ def gpt_config_from_args(args: Namespace, config: TransformerConfig | None=None)
         kwargs["should_pad_vocab"] = True
 
     return GPTModelConfig(**kwargs)
-    
+
 
 def hybrid_config_from_args(args: Namespace, config: TransformerConfig | None=None) -> Any:
     """Create a HybridModelConfig from the appropriate values in the `args` Namespace."""

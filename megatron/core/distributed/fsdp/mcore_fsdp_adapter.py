@@ -189,6 +189,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 dist_index=self.megatron_fsdp_dist_index,
                 calculate_per_token_loss=config.calculate_per_token_loss,
                 init_model_with_meta_device=config.init_model_with_meta_device,
+                report_nan_in_param_grad=ddp_config.check_for_nan_in_grad,
                 # EP overlap schedule calls sub-modules directly instead of
                 # TransformerLayer.forward(), so fine-grained hooks are needed
                 # to manage _training_state and all-gather each sub-module's
@@ -216,6 +217,8 @@ class FullyShardedDataParallel(_BaseDataParallel):
         self.zero_grad_buffer = self.module.zero_grad_buffer
         self.broadcast_params = self.module.broadcast_params
         self.synchronize_param_gather = self.module.synchronize_param_gather
+        self._replace_param_with_raw_if_needed = self.module._replace_param_with_raw_if_needed
+        self._make_forward_pre_hook = self.module._make_forward_pre_hook
         self.module.state_dict_for_save_checkpoint = self.module.state_dict
         self.state_dict_for_save_checkpoint = self.state_dict
         self.module.config = config
