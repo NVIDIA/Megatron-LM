@@ -46,15 +46,28 @@ except ImportError:
 
 
 @pytest.mark.parametrize(
-    ("tp_size", "sp", "cp_size"),
-    [(1, False, 1), (2, False, 1), (2, True, 1), (1, False, 2), (2, False, 2), (2, True, 2)],
+    ("tp_size", "sp", "cp_size", "cp_comm_type"),
+    [
+        # cp_size=1: the CP path is inactive, so cp_comm_type choice is irrelevant.
+        # Cover the "all_gather" default and skip the "a2a" variants for brevity.
+        (1, False, 1, None),
+        (2, False, 1, None),
+        (2, True, 1, None),
+        # cp_size=2: exercise both CP paths.
+        (1, False, 2, "a2a"),
+        (2, False, 2, "a2a"),
+        (2, True, 2, "a2a"),
+        (1, False, 2, "all_gather"),
+        (2, False, 2, "all_gather"),
+        (2, True, 2, "all_gather"),
+    ],
 )
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
 @pytest.mark.internal
 class TestGatedDeltaNet:
 
     @pytest.fixture(scope='function', autouse=True)
-    def setup_method(self, tp_size, sp, cp_size):
+    def setup_method(self, tp_size, sp, cp_size, cp_comm_type):
         # Initialize parallel and random seed
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=tp_size,
@@ -65,6 +78,18 @@ class TestGatedDeltaNet:
         self.tp_size = tp_size
         self.cp_size = cp_size
         self.sp_size = tp_size if sp else 1
+        self.cp_comm_type = cp_comm_type
+        if self.cp_comm_type == "a2a":
+            self.cp_size_all_gather = 1
+            self.cp_size_a2a = self.cp_size
+        elif self.cp_comm_type == "all_gather":
+            self.cp_size_all_gather = self.cp_size
+            self.cp_size_a2a = 1
+        elif self.cp_size == 1:
+            self.cp_size_all_gather = 1
+            self.cp_size_a2a = 1
+        else:
+            raise ValueError(f"Invalid CP communication type: {self.cp_comm_type}")
 
         # Get TP and CP process groups from device mesh
         tp_group = parallel_state.get_tensor_model_parallel_group()
@@ -91,6 +116,7 @@ class TestGatedDeltaNet:
             context_parallel_size=cp_size,
             experimental_attention_variant="gated_delta_net",
             linear_attention_freq=[1],
+            linear_cp_comm_type=self.cp_comm_type,
             transformer_impl="transformer_engine",
         )
         gdn_submodules = get_experimental_attention_variant_module_spec(
@@ -149,9 +175,9 @@ class TestGatedDeltaNet:
         batch = 2
         seq_len = 16
 
-        num_v_heads_local = gdn.num_value_heads // gdn.tp_size // gdn.cp_size
+        num_v_heads_local = gdn.num_value_heads // gdn.tp_size // self.cp_size_a2a
 
-        qkv_last_dim = (2 * gdn.qk_dim_local_tp + gdn.v_dim_local_tp) // gdn.cp_size
+        qkv_last_dim = (2 * gdn.qk_dim_local_tp + gdn.v_dim_local_tp) // self.cp_size_a2a
         qkv = torch.randn(
             batch, seq_len, qkv_last_dim, device=torch.cuda.current_device(), dtype=torch.bfloat16
         )
@@ -183,7 +209,7 @@ class TestGatedDeltaNet:
         with torch._dynamo.config.patch(disable=True):
             query, key, value, gate_out, beta_out, alpha_out = (
                 gdn._prepare_qkv_for_gated_delta_rule(
-                    qkv, gate, beta, alpha, batch, seq_len, gdn.cp_size
+                    qkv, gate, beta, alpha, batch, seq_len, cp_size_a2a=self.cp_size_a2a
                 )
             )
 
@@ -211,6 +237,8 @@ class TestGatedDeltaNet:
     def test_gpu_forward_thd_correctness(self):
         if self.sp_size > 1:
             pytest.skip("Sequence parallel is not supported for this test case.")
+        if self.cp_size > 1 and self.cp_comm_type == "all_gather":
+            pytest.skip("All-gather CP is not supported for this test case.")
 
         atol, rtol = 3e-4, 3e-4
 
@@ -254,6 +282,8 @@ class TestGatedDeltaNet:
     def test_gpu_forward_thd_padding_correctness(self):
         if self.sp_size > 1:
             pytest.skip("Sequence parallel is not supported for this test case.")
+        if self.cp_size > 1 and self.cp_comm_type == "all_gather":
+            pytest.skip("All-gather CP is not supported for this test case.")
 
         atol, rtol = 3e-4, 3e-4
         sequence_length = 32
@@ -353,20 +383,24 @@ class TestGDNCuSeqlensResolve:
         with pytest.raises(ValueError, match="does not match"):
             mock_gdn._resolve_cu_seqlens(None, actual, 1008, "cu_seqlens_q", cp_size=1)
 
-
 @pytest.mark.parametrize("sequence_packing", [False, True])
 @pytest.mark.parametrize(
-    ("tp", "sp", "cp"),
+    ("tp", "sp", "cp", "cp_comm_type"),
     [
-        (4, False, 1),  # TP w/o SP
-        (4, True, 1),  # TP w/ SP
-        (1, False, 2),  # CP
-        (2, False, 2),  # TP w/o SP + CP
-        (2, True, 2),  # TP w/ SP + CP
+        (4, False, 1, None),  # TP w/o SP
+        (4, True, 1, None),  # TP w/ SP
+        (1, False, 2, "a2a"),  # A2A CP
+        (2, False, 2, "a2a"),  # TP w/o SP + A2A CP
+        (2, True, 2, "a2a"),  # TP w/ SP + A2A CP
+        (1, False, 2, "all_gather"),  # All-gather CP
+        (2, False, 2, "all_gather"),  # TP w/o SP + all-gather CP
+        (2, True, 2, "all_gather"),  # TP w/ SP + all-gather CP
     ],
 )
 @pytest.mark.skipif(not HAVE_FLA, reason="FLA is not installed.")
-def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, sequence_packing, tp, sp, cp):
+def test_parallel_gated_delta_net_correctness(
+    tmp_path_dist_ckpt, sequence_packing, tp, sp, cp, cp_comm_type
+):
     transformer_config = TransformerConfig(
         hidden_size=128,
         linear_conv_kernel_dim=2,
@@ -383,6 +417,7 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, sequence_packi
         bf16=True,
         experimental_attention_variant="gated_delta_net",
         linear_attention_freq=[1],
+        linear_cp_comm_type=cp_comm_type,
         transformer_impl="transformer_engine",
     )
 
@@ -390,10 +425,13 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, sequence_packi
         config=transformer_config, vp_stage=None, pp_rank=0
     )
 
-    if cp:
-        atol, rtol = 5e-3, 5e-3
+    cosine_similarity_threshold = None
+    if cp > 1:
+        atol, rtol = 2e-3, 1e-2
+        cosine_similarity_threshold = 0.9999
     else:
-        atol, rtol = 5e-4, 5e-4
+        atol, rtol = 2e-4, 2e-3
+        cosine_similarity_threshold = 0.99999
 
     _test_parallel_attention_correctness(
         transformer_config=transformer_config,
@@ -401,11 +439,12 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, sequence_packi
         tmp_path_dist_ckpt=tmp_path_dist_ckpt,
         atol=atol,
         rtol=rtol,
+        cosine_similarity_threshold=cosine_similarity_threshold,
         tp=tp,
         sp=sp,
         cp=cp,
         seed=123,
         sequence_length=256,
-        micro_batch_size=4,
+        micro_batch_size=1 if (cp_comm_type == "all_gather" and cp > 1) else 4,
         sequence_packing=sequence_packing,
     )
