@@ -844,7 +844,7 @@ class TestDSAQKNormResolution(_MLAQKNormTestBase):
 class TestMLADownProjFusion:
     """Tests `HybridStack._maybe_fuse_mla_down_proj`.
 
-    The method rewrites the MLA `ModuleSpec` on a copied
+    The method rewrites the MLA `ModuleSpec` in place on a deep-copied
     `HybridStackSubmodules` when `config.mla_down_proj_fusion=True`, swapping
     the self-attention module to `FusedMLASelfAttention` and collapsing the
     separate q/kv down projections into a single fused `linear_qkv_down_proj`
@@ -958,7 +958,7 @@ class TestMLADownProjFusion:
 
     def test_enabled_deep_copies_input_submodules(self):
         """The caller's submodules object must not be mutated – the method
-        copies the MLA spec before rewriting, so callers can safely reuse their spec.
+        deep-copies before rewriting, so callers can safely reuse their spec.
         """
         from megatron.core.transformer.multi_latent_attention import (
             FusedMLASelfAttention,
@@ -1014,10 +1014,12 @@ class TestMLADownProjFusion:
 
         result = self._call_fuse(submodules, mla_down_proj_fusion=True)
 
-        # Non-MLA specs are reused unchanged.
-        assert result.mamba_layer is original_mamba
-        assert result.attention_layer is original_attention
-        assert result.mlp_layer is original_mlp
+        # Equality via deep-copy means the returned specs compare as equal to
+        # the originals (dataclass equality) even though they are fresh
+        # objects.
+        assert result.mamba_layer == original_mamba
+        assert result.attention_layer == original_attention
+        assert result.mlp_layer == original_mlp
 
     def test_model_uses_fused_mla_when_enabled(self):
         """Integration: a full HybridModel built with the flag uses
