@@ -256,6 +256,31 @@ class TestFullyShardBasic:
         assert not torch.isnan(torch.tensor(loss)), "Loss is NaN"
         assert not torch.isinf(torch.tensor(loss)), "Loss is Inf"
 
+    def test_no_shard_forward_backward_finish_grad_sync(self):
+        """no_shard keeps full replicated buffers and all-reduces at grad sync."""
+        torch.manual_seed(42)
+        model = SimpleMLP(64).to(_device())
+        fully_shard(model, sharding_strategy="no_shard", enable_async_reduce_grad=False)
+
+        x = torch.randn(2, 64, device=_device())
+        loss = _forward_backward(model, x)
+        assert not torch.isnan(torch.tensor(loss)), "Loss is NaN"
+        model.finish_grad_sync()
+
+        for param_group in model._fsdp_param_groups:
+            assert param_group.model_weight_buffer is not None
+            assert not param_group.model_weight_buffer.is_distributed
+            assert param_group.main_grad_buffer is not None
+            assert not param_group.main_grad_buffer.is_distributed
+            for dist_grad in param_group.dist_grads:
+                if dist_grad is None:
+                    continue
+                local_grad = dist_grad._local_tensor
+                gathered = [torch.empty_like(local_grad) for _ in range(_world_size())]
+                torch.distributed.all_gather(gathered, local_grad)
+                for replica in gathered:
+                    torch.testing.assert_close(replica, local_grad)
+
     @pytest.mark.parametrize(
         "enable_unshard_prefetch,enable_async_reduce_grad",
         [(False, False), (False, True), (True, False), (True, True)],
