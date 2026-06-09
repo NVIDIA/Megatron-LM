@@ -892,10 +892,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # Construction order isn't part of the checkpoint, so we match by a tuple of
         # per-group config (``param_group_identifier_keys``) rather than by position.
 
-        # Sentinel for identifier keys absent from a group (e.g. optional ParamGroupOverride
-        # fields). Same sentinel everywhere → groups missing the same keys still match.
-        _PG_KEY_MISSING = "__mcore_pg_key_missing__"
-
         def make_needed_groups(param_group):
             needed_groups = []
             for key in param_group_identifier_keys:
@@ -905,7 +901,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 elif f"pre_{key}" in param_group:
                     value = param_group[f"pre_{key}"]
                 else:
-                    value = _PG_KEY_MISSING
+                    # Treat missing and explicit None identifier values as equivalent.
+                    value = None
                 needed_groups.append(value)
             return tuple(needed_groups)
 

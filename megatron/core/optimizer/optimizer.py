@@ -479,10 +479,6 @@ class MegatronOptimizer(ABC):
         Raises:
             ValueError: If parameter groups in state dict don't match current optimizer.
         """
-        # Sentinel for identifier keys absent from a group (e.g. optional ParamGroupOverride
-        # fields like ``start_wd``). Same sentinel everywhere → groups missing the same keys
-        # still match each other.
-        _PG_KEY_MISSING = "__mcore_pg_key_missing__"
 
         def _identifier_for(group: dict) -> tuple:
             out = []
@@ -493,7 +489,8 @@ class MegatronOptimizer(ABC):
                 elif f"pre_{key}" in group:
                     out.append(group[f"pre_{key}"])
                 else:
-                    out.append(_PG_KEY_MISSING)
+                    # Treat missing and explicit None identifier values as equivalent.
+                    out.append(None)
             return tuple(out)
 
         needed_groups = [_identifier_for(g) for g in current_groups]

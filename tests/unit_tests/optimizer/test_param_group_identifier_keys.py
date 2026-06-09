@@ -185,11 +185,11 @@ def test_filter_reorder_tolerates_missing_optional_keys():
     """Some identifier keys (``start_wd`` / ``end_wd`` / ``optimizer``) come from
     ``ParamGroupOverride`` and are only present on groups that explicitly
     override them. Default groups don't carry these keys at all, so the matcher
-    must use a sentinel for missing keys (rather than KeyError-ing). Two groups
+    must tolerate missing keys (rather than KeyError-ing). Two groups
     missing the same set of keys must remain matchable.
     """
     # Both groups have only the always-present keys; they should match by tuple
-    # of values + the same sentinel placeholder for missing keys.
+    # of values plus the same None placeholder for missing keys.
     current = [
         _make_pg(
             wd_mult=1.0,
@@ -214,6 +214,19 @@ def test_filter_reorder_tolerates_missing_optional_keys():
     ]
     reordered = MegatronOptimizer._filter_and_reorder_param_groups(current, saved)
     assert len(reordered) == 1
+    assert reordered[0]["_tag"] == "saved_match"
+
+
+def test_filter_reorder_treats_missing_and_none_identifier_values_as_same():
+    """A missing identifier key and an explicit ``None`` value use the same convention."""
+    common = dict(
+        wd_mult=1.0, lr_mult=1.0, is_expert_parallel=False, is_decoupled_lr=False, max_lr=1e-3
+    )
+    current = [_make_pg(**common, min_lr=None)]
+    saved = [_make_pg(**common, _tag="saved_match")]
+
+    reordered = MegatronOptimizer._filter_and_reorder_param_groups(current, saved)
+
     assert reordered[0]["_tag"] == "saved_match"
 
 

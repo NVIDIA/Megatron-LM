@@ -1009,13 +1009,13 @@ def preprocess_common_state_dict(common_state_dict):
             if "param_groups" not in inner_optimizer:
                 return
             param_groups = inner_optimizer["param_groups"]
-            # Tolerate identifier keys missing from a given param_group (e.g.
-            # ``start_wd`` / ``end_wd`` / ``optimizer`` are only present when
-            # explicitly overridden via ParamGroupOverride). Use a sentinel so
-            # the sort key is well-defined for groups that don't carry every
-            # identifier key.
-            _PG_KEY_MISSING = "__mcore_pg_key_missing__"
-            key_fn = lambda pg: [pg.get(key, _PG_KEY_MISSING) for key in param_group_identifier_keys]
+            # Treat missing and explicit None identifier values as equivalent.
+            # Wrap each component so None never compares directly with floats or strings.
+            def key_fn(pg):
+                return [
+                    (value is not None, value)
+                    for value in (pg.get(key) for key in param_group_identifier_keys)
+                ]
             param_groups.sort(key=key_fn)
             inner_optimizer["param_groups"] = param_groups
 
