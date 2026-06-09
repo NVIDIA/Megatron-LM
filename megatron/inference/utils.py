@@ -3,8 +3,7 @@
 import logging
 import warnings
 from argparse import ArgumentParser, Namespace
-from functools import partial
-from typing import Callable, Optional
+from typing import Literal, Optional
 
 import torch
 
@@ -25,6 +24,7 @@ from megatron.core.inference.quantization.utils import quantize_model_to_mxfp8
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.module import MegatronModule
@@ -34,17 +34,21 @@ from megatron.training import get_model as _get_model
 from megatron.training import get_tokenizer, get_wandb_writer
 from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args
 from megatron.training.checkpointing import load_checkpoint
-from megatron.training.models import (
-    GPTModelBuilder,
-    HybridModelBuilder,
-    ModelBuilder,
-)
-from model_provider import model_provider
+from megatron.training.models import GPTModelBuilder, HybridModelBuilder, ModelBuilder
+
+try:
+    from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
+
+    HAS_NVIDIA_MODELOPT = True
+except ImportError:
+    HAS_NVIDIA_MODELOPT = False
 
 logger = logging.getLogger(__name__)
 
 
-def get_model_builder(args: Namespace, provider: Optional[str] = None) -> ModelBuilder:
+def get_model_builder(
+    args: Namespace, provider: Optional[Literal["gpt", "hybrid", "mamba"]] = None
+) -> ModelBuilder:
     """Construct a :class:`ModelBuilder` for the requested model provider.
 
     Replaces the legacy ``gpt_builder`` / ``hybrid_builder`` function selector with
@@ -77,53 +81,23 @@ def get_model_builder(args: Namespace, provider: Optional[str] = None) -> ModelB
     raise ValueError(f"Invalid model provider {provider}")
 
 
-def builder_to_legacy_callable(builder: ModelBuilder) -> Callable:
-    """Adapt a :class:`ModelBuilder` to the legacy ``model_provider`` callable signature.
-
-    Routing through ``model_provider`` (from the top-level ``model_provider.py``)
-    preserves legacy hooks that are still on the function-style builder API
-    (e.g. ``args.modelopt_enabled`` swaps in ``modelopt_gpt_hybrid_builder`` and
-    ``args.record_memory_history`` registers the OOM observer) until those code
-    paths are migrated to the new builder API.
-
-    NOTE : If the args.record_history_memory and has_nvidia_modelopt are not needed, then can do a direct pass through. 
-
-
-
-    Intended usage::
-
-        builder = get_model_builder(args)
-        model = get_model(
-            partial(model_provider, builder_to_legacy_callable(builder)),
-            wrap_with_ddp=False,
-        )
-    """
-
-    def legacy_builder(
-        args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None
-    ):
-        return builder.build_model(
-            pg_collection=pg_collection,
-            pre_process=pre_process,
-            post_process=post_process,
-            vp_stage=vp_stage,
-        )
-
-    return legacy_builder
-
-
 def get_model_for_inference() -> MegatronModule:
     """Initialize model and load checkpoint for inference."""
 
     args = get_args()
 
-    builder = get_model_builder(args)
-
-    # Build model.
-    model = _get_model(
-        partial(model_provider, builder_to_legacy_callable(builder)),
-        wrap_with_ddp=False,
-    )
+    if HAS_NVIDIA_MODELOPT and getattr(args, "modelopt_enabled", False):
+        # ModelOpt path keeps the legacy callable-based builder because the
+        # modelopt hooks (custom layer specs, calibration, etc.) have not been
+        # ported to the new ``ModelBuilder`` API yet. ``_get_model`` also takes
+        # care of running the modelopt-checkpoint auto-detection side effect.
+        model = _get_model(modelopt_gpt_hybrid_builder, wrap_with_ddp=False)
+    else:
+        builder = get_model_builder(args)
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        model = builder.build_distributed_models(
+            pg_collection=pg_collection, wrap_with_ddp=False
+        )
 
     # Load checkpoint.
     assert args.load is not None
