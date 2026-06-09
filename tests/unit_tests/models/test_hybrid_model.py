@@ -842,7 +842,7 @@ class TestDSAQKNormResolution(_MLAQKNormTestBase):
 
 
 class TestMLADownProjFusion:
-    """Tests `HybridStack._maybe_fuse_mla_down_proj`.
+    """Tests `HybridStack._fuse_mla_down_proj`.
 
     The method rewrites the MLA `ModuleSpec` in place on a deep-copied
     `HybridStackSubmodules` when `config.mla_down_proj_fusion=True`, swapping
@@ -867,18 +867,17 @@ class TestMLADownProjFusion:
         return copy.deepcopy(hybrid_stack_spec.submodules)
 
     def _call_fuse(self, submodules, *, mla_down_proj_fusion):
-        """Invoke `_maybe_fuse_mla_down_proj` as an unbound method with a
-        minimal stub for `self`. The method only reads `self.config`, so we
-        can avoid constructing a full `HybridStack`.
+        """Invoke `_fuse_mla_down_proj` as an unbound method with a minimal
+        stub for `self`. The method only reads `self.config`, so we can avoid
+        constructing a full `HybridStack`.
         """
-        import types
-
         from megatron.core.models.hybrid.hybrid_block import HybridStack
 
-        stub = types.SimpleNamespace(
-            config=types.SimpleNamespace(mla_down_proj_fusion=mla_down_proj_fusion)
-        )
-        return HybridStack._maybe_fuse_mla_down_proj(stub, submodules)
+        stub = SimpleNamespace(config=SimpleNamespace(mla_down_proj_fusion=mla_down_proj_fusion))
+        # Mimic the call-site check in `HybridStack.__init__`.
+        if getattr(stub.config, "mla_down_proj_fusion", False):
+            submodules = HybridStack._fuse_mla_down_proj(stub, submodules)
+        return submodules
 
     def _build_model(self, pattern="M+-", **config_overrides):
         config_kwargs = dict(
@@ -911,17 +910,6 @@ class TestMLADownProjFusion:
         """Flag off: method returns the same object, no copying or rewriting."""
         submodules = self._fresh_submodules()
         result = self._call_fuse(submodules, mla_down_proj_fusion=False)
-        assert result is submodules
-
-    def test_missing_attr_treated_as_disabled(self):
-        """When the config lacks the attribute, `getattr(..., False)` disables fusion."""
-        import types
-
-        from megatron.core.models.hybrid.hybrid_block import HybridStack
-
-        submodules = self._fresh_submodules()
-        stub = types.SimpleNamespace(config=types.SimpleNamespace())
-        result = HybridStack._maybe_fuse_mla_down_proj(stub, submodules)
         assert result is submodules
 
     def test_enabled_rewrites_mla_spec(self):
