@@ -531,10 +531,10 @@ class TEGroupedMLP(MegatronModule):
         ) or getattr(self, "offload_moe_act", False)
         if fine_grained_activation_offloading:
             if not getattr(self, "offload_expert_fc1", False):
-                fc1_op.disable_cpu_offloading()
+                fc1_op.disable_activation_offloading()
             if not getattr(self, "offload_moe_act", False):
-                activation_op.disable_cpu_offloading()
-            fc2_op.disable_cpu_offloading()
+                activation_op.disable_activation_offloading()
+            fc2_op.disable_activation_offloading()
 
         # Emulate submodule pre-forward hooks
         ops.register_forward_pre_hook(self._make_fused_impl_pre_forward_hook())

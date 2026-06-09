@@ -358,8 +358,8 @@ def _make_fake_te_namespace():
     """Build a fake TE namespace with the activation classes _make_fused_ops uses."""
 
     class FakeCpuOffloadControl:
-        def disable_cpu_offloading(self, disabled=True):
-            self.cpu_offloading_disabled = disabled
+        def disable_activation_offloading(self, disabled=True):
+            self.activation_offloading = not disabled
 
     class FakeGroupedLinear(FakeCpuOffloadControl, torch.nn.Module):
         def __init__(
@@ -387,7 +387,7 @@ def _make_fake_te_namespace():
             self.single_grouped_weight = single_grouped_weight
             self.single_grouped_bias = single_grouped_bias
             self.delay_wgrad_compute = delay_wgrad_compute
-            self.cpu_offloading_disabled = False
+            self.activation_offloading = True
 
         def need_backward_dw(self):
             return False
@@ -397,7 +397,7 @@ def _make_fake_te_namespace():
             super().__init__()
             self.glu_interleave_size = glu_interleave_size
             self.activation_recompute_in_mlp = activation_recompute_in_mlp
-            self.cpu_offloading_disabled = False
+            self.activation_offloading = True
 
     class FakeScaledClampedQGeGLU(FakeCpuOffloadControl, torch.nn.Module):
         def __init__(self, glu_interleave_size, *, activation_recompute_in_mlp=False, limit=None):
@@ -405,13 +405,13 @@ def _make_fake_te_namespace():
             self.glu_interleave_size = glu_interleave_size
             self.activation_recompute_in_mlp = activation_recompute_in_mlp
             self.limit = limit
-            self.cpu_offloading_disabled = False
+            self.activation_offloading = True
 
     class FakeScaledSReLU(FakeCpuOffloadControl, torch.nn.Module):
         def __init__(self, *, activation_recompute_in_mlp=False):
             super().__init__()
             self.activation_recompute_in_mlp = activation_recompute_in_mlp
-            self.cpu_offloading_disabled = False
+            self.activation_offloading = True
 
     class FakeSequential(list):
         def register_forward_pre_hook(self, hook):
@@ -731,15 +731,15 @@ def test_make_fused_ops_attaches_single_grouped_bias_for_fc1(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("offload_expert_fc1", "offload_moe_act", "expected_disabled"),
+    ("offload_expert_fc1", "offload_moe_act", "expected_activation_offloading"),
     (
-        (True, False, (False, True, True)),
-        (False, True, (True, False, True)),
-        (True, True, (False, False, True)),
+        (True, False, (True, False, False)),
+        (False, True, (False, True, False)),
+        (True, True, (True, True, False)),
     ),
 )
-def test_make_fused_ops_configures_te_cpu_offload_opt_out(
-    monkeypatch, offload_expert_fc1, offload_moe_act, expected_disabled
+def test_make_fused_ops_configures_te_activation_offload_opt_out(
+    monkeypatch, offload_expert_fc1, offload_moe_act, expected_activation_offloading
 ):
     fake_te, FakeGroupedLinear = _make_fake_te_namespace()
     monkeypatch.setattr(experts_module, "te", fake_te)
@@ -772,7 +772,7 @@ def test_make_fused_ops_configures_te_cpu_offload_opt_out(
 
     ops = module._make_fused_ops()
 
-    assert tuple(op.cpu_offloading_disabled for op in ops) == expected_disabled
+    assert tuple(op.activation_offloading for op in ops) == expected_activation_offloading
 
 
 def test_backward_dw_dispatches_fused_children_in_fc2_then_fc1_order():
