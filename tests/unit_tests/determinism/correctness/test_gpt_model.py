@@ -40,6 +40,7 @@ def build_gpt(overrides, pre_process=True, post_process=True, vp_stage=None, **_
         pre_process=pre_process,
         post_process=post_process,
         vp_stage=vp_stage,
+        position_embedding_type="rope",
     ).cuda()
 
 
