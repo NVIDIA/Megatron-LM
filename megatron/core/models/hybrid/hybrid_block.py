@@ -7,7 +7,7 @@
 
 import copy
 from contextlib import nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Optional, Tuple, Union
 
 import torch
@@ -215,10 +215,8 @@ class HybridStack(MegatronModule):
 
     def _maybe_fuse_mla_down_proj(self, submodules: HybridStackSubmodules) -> HybridStackSubmodules:
         if getattr(self.config, "mla_down_proj_fusion", False):
-            # Do not deepcopy the original `submodules`, so its unrelated contents, such as
-            # `partial` functions, stay identical.
-            mla_spec = copy.deepcopy(submodules.mla_layer)
-            submodules = replace(submodules, mla_layer=mla_spec)
+            submodules = copy.deepcopy(submodules)
+            mla_spec = submodules.mla_layer
             # We always fuse the input layernorm because Hybrid always uses TransformerEngine.
             mla_spec.submodules.input_layernorm = IdentityOp
             mla_spec.submodules.self_attention.module = FusedMLASelfAttention
