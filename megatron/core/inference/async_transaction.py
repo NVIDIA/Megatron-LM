@@ -774,7 +774,6 @@ class AsyncDecodeTransaction:
         """Mark the transaction as no longer owning in-flight state."""
         if self.state == AsyncTxnState.RETIRED:
             return
-        self._wait_for_forward_done()
         self.retire_participants()
         self.state = AsyncTxnState.RETIRED
 

@@ -1876,7 +1876,7 @@ def test_async_decode_plan_and_transaction_participant_hooks_are_canonical():
 
 
 @pytest.mark.internal
-def test_async_transaction_terminal_lifecycle_is_idempotent_and_fenced():
+def test_async_transaction_terminal_lifecycle_fences_rollback_not_retire():
     events = []
 
     class _Event:
@@ -1950,7 +1950,6 @@ def test_async_transaction_terminal_lifecycle_is_idempotent_and_fenced():
         "forward_sync",
         ("rollback", 2),
         ("commit", 2),
-        "forward_sync",
         ("retire", 2),
     ]
     assert committed.state == AsyncTxnState.RETIRED
