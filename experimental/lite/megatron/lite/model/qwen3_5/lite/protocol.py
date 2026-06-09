@@ -11,6 +11,7 @@ import torch.nn as nn
 
 from megatron.lite.model.qwen3_5.config import Qwen35Config
 from megatron.lite.model.qwen3_5.lite.checkpoint import (
+    PLACEMENT_FN,
     export_hf_weights as _export_hf_weights_impl,
     load_hf_weights as _load_hf_weights_impl,
 )
@@ -206,8 +207,15 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
     optimizer_backend = "none"
     if impl_cfg.optimizer in {"mc", "mc_full"}:
         optimizer, finalize_grads = _build_mc_optimizer(chunks, model_cfg, impl_cfg, ps)
+        from megatron.lite.primitive.ckpt import attach_model_sharded_state_dict
         from megatron.lite.runtime.megatron_utils import register_training_hooks
 
+        attach_model_sharded_state_dict(
+            chunks,
+            ps,
+            get_placements=PLACEMENT_FN,
+            is_expert=is_expert_param,
+        )
         register_training_hooks(chunks, optimizer)
         optimizer_backend = "distopt"
     elif impl_cfg.optimizer == "fsdp2":

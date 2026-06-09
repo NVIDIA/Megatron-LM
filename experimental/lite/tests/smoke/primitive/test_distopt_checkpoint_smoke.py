@@ -9,6 +9,8 @@ import torch.nn as nn
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.transformer import TransformerConfig
+from megatron.lite.primitive.ckpt import attach_model_sharded_state_dict
+from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.handle import ModelHandle
 from tests.unit_tests.test_utilities import Utils
@@ -61,7 +63,20 @@ def _build_model_and_distopt():
         OptimizerConfig(optimizer="adam", lr=1.0e-3, bf16=True, use_distributed_optimizer=True),
         [wrapped],
     )
+    attach_model_sharded_state_dict([wrapped], _single_node_parallel_state())
     return wrapped, optimizer
+
+
+def _single_node_parallel_state() -> ParallelState:
+    rank = torch.distributed.get_rank()
+    world = torch.distributed.get_world_size()
+    return ParallelState(dp_size=world, dp_rank=rank, dp_cp_size=world, dp_cp_rank=rank)
+
+
+def _shared_tmp_path(tmp_path) -> str:
+    payload = [str(tmp_path) if torch.distributed.get_rank() == 0 else None]
+    torch.distributed.broadcast_object_list(payload, src=0)
+    return payload[0]
 
 
 def _train_step(model, optimizer, x: torch.Tensor):
@@ -99,6 +114,7 @@ def test_distopt_checkpoint_load_matches_uninterrupted_training_single_node(tmp_
 
     _train_step(model_for_ckpt, optimizer_for_ckpt, x0)
     _train_step(direct_model, direct_optimizer, x0)
+    checkpoint_dir = _shared_tmp_path(tmp_path)
 
     runtime.save_checkpoint(
         ModelHandle(
@@ -106,7 +122,7 @@ def test_distopt_checkpoint_load_matches_uninterrupted_training_single_node(tmp_
             optimizer=optimizer_for_ckpt,
             _extras={"model_chunks": [model_for_ckpt]},
         ),
-        str(tmp_path),
+        checkpoint_dir,
         step=1,
     )
     assert runtime.load_checkpoint(
@@ -115,7 +131,7 @@ def test_distopt_checkpoint_load_matches_uninterrupted_training_single_node(tmp_
             optimizer=loaded_optimizer,
             _extras={"model_chunks": [loaded_model]},
         ),
-        str(tmp_path),
+        checkpoint_dir,
     ) == 1
 
     _train_step(direct_model, direct_optimizer, x1)
