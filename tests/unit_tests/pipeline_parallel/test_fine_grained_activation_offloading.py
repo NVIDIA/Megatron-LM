@@ -26,6 +26,52 @@ DELTA = 20  # MiB
 CUDA_GRAPH_DELTA = 200  # MiB — Considering some CG overhead
 
 
+class _FakeCudaStream:
+    def wait_stream(self, stream):
+        pass
+
+
+class _FakeOffloadGroup:
+    def __init__(self, name, *, offloaded):
+        self._name = name
+        self._tensors = {"tensor": (object(),) if offloaded else torch.empty(0)}
+        self.recorded_reload = False
+
+    def push_tensor(self, tag, tensor):
+        self._tensors[tag] = tensor
+
+    def wait_offload_event(self, stream):
+        pass
+
+    def record_reload_event(self, stream):
+        self.recorded_reload = True
+
+
+def test_group_start_backward_consumes_current_noop_slot_before_reloading_next(monkeypatch):
+    """No-op reload slots should preserve cadence without delaying the next reload."""
+    from megatron.core.pipeline_parallel.fine_grained_activation_offload import ChunkOffloadHandler
+
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: _FakeCudaStream())
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+
+    handler = ChunkOffloadHandler.__new__(ChunkOffloadHandler)
+    handler.do_offload = True
+    handler.h2d_stream = _FakeCudaStream()
+    handler._reloading_group = []
+    handler.reload = lambda state: torch.empty(0)
+
+    next_group = _FakeOffloadGroup("next", offloaded=True)
+    current_group = _FakeOffloadGroup("current", offloaded=False)
+    handler._groups_to_reload = [next_group, current_group]
+
+    handler.on_group_start_backward(current_group)
+
+    assert current_group not in handler._groups_to_reload
+    assert next_group not in handler._groups_to_reload
+    assert handler._reloading_group == [next_group]
+    assert next_group.recorded_reload
+
+
 def _reset_cuda_memory() -> None:
     gc.collect()
     if torch.cuda.is_available():
@@ -46,6 +92,7 @@ def _build_gpt_model(
     offload_modules: Optional[List[str]],
     min_offloaded_tensor_size: int,
     is_mla: bool,
+    activation_offload_fraction: float = 1.0,
     enable_hyper_connections: bool = False,
     num_residual_streams: int = 4,
     mhc_recompute_layer_num: Optional[int] = None,
@@ -75,6 +122,7 @@ def _build_gpt_model(
         fine_grained_activation_offloading=fine_grained_activation_offloading,
         offload_modules=offload_modules,
         min_offloaded_tensor_size=min_offloaded_tensor_size,
+        activation_offload_fraction=activation_offload_fraction,
         # Hyper Connection settings
         enable_hyper_connections=enable_hyper_connections,
         num_residual_streams=num_residual_streams,
@@ -143,6 +191,15 @@ def _run_one_iter_and_capture(
         grads[name] = p.grad.detach().float().cpu() if p.grad is not None else None
 
     return logits.detach().float().cpu(), grads, peak_bytes
+
+
+def _capture_params_cpu(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
+    return {name: p.detach().cpu().clone() for name, p in model.named_parameters()}
+
+
+def _restore_params(model: torch.nn.Module, params: Dict[str, torch.Tensor]) -> None:
+    for name, p in model.named_parameters():
+        p.data.copy_(params[name].to(device=p.device, dtype=p.dtype))
 
 
 @pytest.mark.flaky_in_dev
@@ -313,6 +370,155 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
             print(
                 f"Rank {torch.distributed.get_rank()}: Saved {saved_mib:.2f}MiB, expected {expected_offload_mib:.2f}MiB"
             )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+def test_gpt_fine_grained_activation_offload_fraction_correctness_and_memory():
+    """
+    Verify activation_offload_fraction preserves numerics and still saves memory.
+
+    The fraction path leaves some groups on GPU but keeps no-op reload slots in
+    the backward cadence, so this test compares it against both a no-offload
+    baseline and full fine-grained activation offload.
+    """
+    os.environ.pop("NVTE_FUSED_ATTN", None)
+    os.environ.pop("NVTE_FLASH_ATTN", None)
+    os.environ.pop("NVTE_UNFUSED_ATTN", None)
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+
+    seed = 123
+    num_layers = 8
+    hidden_size = 1024
+    num_attention_heads = 8
+    vocab_size = 1024
+    seq_length = 1024
+    micro_batch_size = 2
+    num_experts = 4
+    offload_modules = ["core_attn", "attn_proj", "expert_fc1"]
+    device = torch.device("cuda")
+
+    input_ids, position_ids, attention_mask = _make_gpt_inputs(
+        seq_length=seq_length, micro_batch_size=micro_batch_size, device=device
+    )
+
+    def _build_case(enable_offload: bool, activation_offload_fraction: float = 1.0) -> GPTModel:
+        return _build_gpt_model(
+            seed=seed,
+            num_layers=num_layers,
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            vocab_size=vocab_size,
+            seq_length=seq_length,
+            num_experts=num_experts,
+            fine_grained_activation_offloading=enable_offload,
+            offload_modules=offload_modules if enable_offload else None,
+            min_offloaded_tensor_size=1024,
+            is_mla=False,
+            activation_offload_fraction=activation_offload_fraction,
+        ).cuda()
+
+    def _run_baseline():
+        off_interface.reset_instance()
+        model = _build_case(enable_offload=False)
+        model.train()
+        params = _capture_params_cpu(model)
+        _run_one_iter_and_capture(
+            model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            enable_offload_reset=False,
+        )
+        _reset_cuda_memory()
+        logits, grads, peak = _run_one_iter_and_capture(
+            model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            enable_offload_reset=False,
+        )
+        del model
+        _reset_cuda_memory()
+        return logits, grads, peak, params
+
+    def _run_offload_case(activation_offload_fraction: float, params: Dict[str, torch.Tensor]):
+        off_interface.reset_instance()
+        model = _build_case(
+            enable_offload=True, activation_offload_fraction=activation_offload_fraction
+        )
+        _restore_params(model, params)
+        model.train()
+        _run_one_iter_and_capture(
+            model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            enable_offload_reset=True,
+        )
+        off_interface.reset()
+
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            PipelineOffloadManager,
+        )
+
+        expected_bytes = PipelineOffloadManager.get_instance().offload_summary_total_bytes
+        _reset_cuda_memory()
+        logits, grads, peak = _run_one_iter_and_capture(
+            model,
+            input_ids=input_ids,
+            position_ids=position_ids,
+            attention_mask=attention_mask,
+            enable_offload_reset=True,
+        )
+        del model
+        _reset_cuda_memory()
+        return logits, grads, peak, expected_bytes
+
+    def _assert_matches_base(label, logits, grads, base_logits, base_grads):
+        assert torch.allclose(
+            logits, base_logits, rtol=1e-3, atol=1e-3
+        ), f"{label} logits mismatch: max_diff={torch.max(torch.abs(logits - base_logits))}"
+        assert set(grads.keys()) == set(base_grads.keys())
+        for name, gb in base_grads.items():
+            go = grads[name]
+            if gb is None or go is None:
+                assert gb is None and go is None, f"{label} grad None mismatch for {name}"
+                continue
+            assert torch.allclose(
+                go, gb, rtol=1e-3, atol=1e-3
+            ), f"{label} grad mismatch for {name}: max_diff={torch.max(torch.abs(go - gb))}"
+
+    try:
+        base_logits, base_grads, base_peak, params = _run_baseline()
+        half_logits, half_grads, half_peak, half_expected_bytes = _run_offload_case(0.5, params)
+        full_logits, full_grads, full_peak, full_expected_bytes = _run_offload_case(1.0, params)
+
+        _assert_matches_base("fraction=0.5", half_logits, half_grads, base_logits, base_grads)
+        _assert_matches_base("fraction=1.0", full_logits, full_grads, base_logits, base_grads)
+
+        assert 0 < half_expected_bytes < full_expected_bytes, (
+            f"Expected fraction=0.5 to offload a nonzero subset of the full case, "
+            f"but got half={half_expected_bytes} bytes, full={full_expected_bytes} bytes"
+        )
+
+        half_saved_mib = (base_peak - half_peak) / (1024**2)
+        full_saved_mib = (base_peak - full_peak) / (1024**2)
+        assert half_saved_mib > 0.0, (
+            f"Expected activation_offload_fraction=0.5 to reduce peak memory, "
+            f"but got saved={half_saved_mib:.2f}MiB "
+            f"(base={base_peak/(1024**2):.2f}MiB, half={half_peak/(1024**2):.2f}MiB)"
+        )
+        assert full_saved_mib + DELTA >= half_saved_mib, (
+            f"Expected full offload to save at least as much memory as fraction=0.5, "
+            f"but got full_saved={full_saved_mib:.2f}MiB, half_saved={half_saved_mib:.2f}MiB"
+        )
+        print(
+            f"Offload fraction memory: base={base_peak/(1024**2):.2f}MiB, "
+            f"half={half_peak/(1024**2):.2f}MiB, full={full_peak/(1024**2):.2f}MiB, "
+            f"half_saved={half_saved_mib:.2f}MiB, full_saved={full_saved_mib:.2f}MiB"
+        )
     finally:
         Utils.destroy_model_parallel()
 
