@@ -492,6 +492,15 @@ class AsyncPendingForwardUse:
     graph_request_count: int
 
 
+@dataclass(slots=True)
+class AsyncCoordinatorStepState:
+    """Per-step EP state owned by the coordinator."""
+
+    ep_step_begin_decision: object | None = None
+    ep_handoff_decision: object | None = None
+    handoff_decided: bool = False
+
+
 def resolve_async_pending_forward(
     pending: AsyncDecodeLayout,
     current: AsyncDecodeLayout,

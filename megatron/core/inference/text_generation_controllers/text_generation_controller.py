@@ -16,19 +16,9 @@ from torch.cuda.nvtx import range_pop, range_push
 from megatron.core import parallel_state
 from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.async_transaction import (
-    AsyncDecodeLayout,
-    AsyncDecodePlan,
-    AsyncDecodeTransaction,
-    AsyncEPParticipant,
-    AsyncLogprobMTPParticipant,
-    AsyncMambaStateParticipant,
-    AsyncPreparedDecodeState,
-    AsyncResourceParticipant,
     AsyncRowMapPolicy,
     AsyncSampleReadback,
-    AsyncSampleReadbackParticipant,
     AsyncSampleTicket,
-    AsyncTxnState,
     classify_async_eligibility,
 )
 from megatron.core.inference.communication_utils import (
@@ -1567,7 +1557,7 @@ class TextGenerationController:
             ),
         }
 
-    def _pending_async_transaction(self) -> Optional[AsyncDecodeTransaction]:
+    def _pending_async_transaction(self) -> object | None:
         """Return the active async transaction, if one owns pending state."""
         return self._get_async_decode_coordinator().pending_transaction()
 
@@ -1637,145 +1627,6 @@ class TextGenerationController:
         return context.request_ids[
             context.paused_request_count : context.total_request_count
         ].clone()
-
-    def _begin_async_step_transaction(
-        self,
-        cuda_graph_request_count: Optional[int],
-        prepared_state: Optional[AsyncPreparedDecodeState] = None,
-    ) -> AsyncDecodeTransaction:
-        """Create the transaction that owns the just-launched speculative forward."""
-        context = self.inference_wrapped_model.inference_context
-        pending_request_ids = (
-            prepared_state.plan.request_ids
-            if prepared_state is not None
-            else self._active_request_ids_cpu()
-        )
-        layout = AsyncDecodeLayout.from_prepared_context(
-            context,
-            request_ids=pending_request_ids,
-            padded_active_request_count=cuda_graph_request_count,
-            tokens_per_request=self.num_speculative_tokens + 1,
-        )
-        prepared_plan = (
-            prepared_state.plan.with_layout(layout)
-            if prepared_state is not None
-            else AsyncDecodePlan.from_layout(layout)
-        )
-        transaction = self._get_async_decode_coordinator().begin_transaction(
-            plan=prepared_plan,
-            state=AsyncTxnState.PREPARED,
-        )
-        return transaction
-
-    def _async_transaction_has_participant(
-        self, transaction: object | None, participant_type: type
-    ) -> bool:
-        """Return whether a transaction already owns a participant type."""
-        if hasattr(transaction, "has_participant"):
-            return transaction.has_participant(participant_type)
-        participants = getattr(transaction, "participants", ())
-        return any(isinstance(participant, participant_type) for participant in participants)
-
-    def _rollback_or_discard_async_transaction(
-        self,
-        transaction: object,
-        reason: str,
-        *,
-        release_fallback_resources: bool,
-    ) -> None:
-        """Rollback participant-owned resources or use legacy context cleanup."""
-        context = self.inference_wrapped_model.inference_context
-        if self._async_transaction_has_participant(transaction, AsyncResourceParticipant):
-            transaction.rollback(reason)
-            return
-        if release_fallback_resources:
-            context.release_deferred_async_resources()
-        transaction.discard(reason)
-
-    def _async_ep_participant_for_transaction(
-        self, transaction: object | None, *, create: bool
-    ) -> AsyncEPParticipant | None:
-        """Return or attach the EP participant owned by a transaction."""
-        if transaction is None:
-            return None
-        participants = getattr(transaction, "participants", None)
-        if participants is None:
-            return None
-        for participant in participants:
-            if isinstance(participant, AsyncEPParticipant):
-                return participant
-        if not create:
-            return None
-        participant = AsyncEPParticipant()
-        if hasattr(transaction, "add_participants"):
-            transaction.add_participants(participant)
-            transaction.prepare_participants()
-        else:
-            transaction.participants = (*transaction.participants, participant)
-            if hasattr(transaction, "plan") and transaction.plan is not None:
-                participant.prepare(transaction.plan)
-        return participant
-
-    def _record_ep_step_begin_decision(self, decision: EPStepBeginDecision) -> None:
-        """Attach EP step-begin state to the pending transaction lifecycle."""
-        return None
-
-    def _record_ep_handoff_decision(self, decision: EPAsyncHandoffDecision) -> None:
-        """Stage EP handoff state for the transaction that may be launched."""
-        return None
-
-    def _attach_async_transaction_participants(
-        self,
-        transaction: object,
-        *,
-        resources: object | None,
-        sample_ticket: object | None,
-    ) -> None:
-        """Attach launch-owned participant adapters to a real async transaction."""
-        if not hasattr(transaction, "participants") or not hasattr(
-            transaction, "prepare_participants"
-        ):
-            return
-
-        context = self.inference_wrapped_model.inference_context
-        participants = []
-        if getattr(context, "is_hybrid_model", False):
-            participants.append(AsyncMambaStateParticipant(context))
-        if isinstance(sample_ticket, AsyncSampleTicket):
-            participants.append(AsyncSampleReadbackParticipant(sample_ticket))
-
-        requires_logprobs = False
-        if getattr(self, "_async_logprob_requests_seen", False):
-            try:
-                requires_logprobs = self._active_requests_need_logprob_results()
-            except (AttributeError, KeyError):
-                requires_logprobs = True
-        requires_mtp = self.num_speculative_tokens > 0
-        if requires_logprobs or requires_mtp:
-            participants.append(
-                AsyncLogprobMTPParticipant(
-                    requires_logprobs=requires_logprobs, requires_mtp=requires_mtp
-                )
-            )
-
-        if resources is not None and hasattr(resources, "release_deferred"):
-            participants.append(AsyncResourceParticipant(resources, context))
-
-        if not participants:
-            return
-        if hasattr(transaction, "add_participants"):
-            transaction.add_participants(*participants)
-        else:
-            transaction.participants = (*transaction.participants, *participants)
-        transaction.prepare_participants()
-
-    def _pending_async_forward_decision(self, transaction: AsyncDecodeTransaction):
-        """Return the centralized pending-forward reuse decision."""
-        context = self.inference_wrapped_model.inference_context
-        return transaction.pending_forward_decision(
-            context,
-            row_map_policy=getattr(self, "_async_row_map_policy", AsyncRowMapPolicy.REUSE),
-        )
 
     def _pending_async_forward_row_status(self) -> tuple[bool, bool]:
         """Return whether the pending forward is reusable and whether row mapping is needed."""
@@ -2025,47 +1876,11 @@ class TextGenerationController:
         if not self._confirm_prepared_ep_async_handoff():
             return False, None, None
 
-        context = self.inference_wrapped_model.inference_context
-        coordinator = self._get_async_decode_coordinator()
-        prepared_state = coordinator.prepared_state()
-        coordinator.publish_prepared_state()
-        range_push("async_transfer_bookkeeping_to_gpu")
-        async_h2d_done_event = context.transfer_bookkeeping_to_gpu(
-            include_token_to_input_ids=False,
-            refresh_request_staging=False,
-            record_done_event=True,
-        )
-        range_pop()
-
         range_push("async_forward_launch")
-        next_input_ids, next_position_ids = context.current_input_and_position_ids()
-        self._dynamic_step_forward_logits(next_input_ids, next_position_ids)
-        self._async_forward_launch_count += 1
-        self._increment_async_counter("_async_launched_forward_count")
-        cuda_graph_request_count = (
-            context.padded_active_request_count if context.using_cuda_graph_this_step() else None
-        )
-        transaction = self._begin_async_step_transaction(
-            cuda_graph_request_count, prepared_state=prepared_state
-        )
-        if prepared_state is not None:
-            resources = prepared_state.resource_ledger
-            resources.in_flight = True
-            if hasattr(context, "register_active_async_ledger"):
-                context.register_active_async_ledger(resources)
-        else:
-            resources = context.mark_async_resources_in_flight()
-        self._attach_async_transaction_participants(
-            transaction, resources=resources, sample_ticket=sample_ticket
-        )
-        transaction.mark_launched(
-            sample_ticket=sample_ticket,
-            resources=resources,
-            h2d_done_event=async_h2d_done_event,
-        )
-        coordinator.consume_prepared_state()
-        range_pop()
-        return True, async_h2d_done_event, cuda_graph_request_count
+        try:
+            return self._get_async_decode_coordinator().launch_prepared(sample_ticket)
+        finally:
+            range_pop()
 
     def _async_scheduling_global_disabled_reason(self, *, allow_mtp: bool = False) -> Optional[str]:
         """Return non-step-local reasons async scheduling is disabled, or None."""

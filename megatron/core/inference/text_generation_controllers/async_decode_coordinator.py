@@ -1,18 +1,23 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from dataclasses import dataclass
 from typing import Protocol
 
 import torch
 from torch import Tensor
 
 from megatron.core.inference.async_transaction import (
+    AsyncCoordinatorStepState,
     AsyncDecodeLayout,
     AsyncDecodePlan,
     AsyncDecodeTransaction,
+    AsyncLogprobMTPParticipant,
+    AsyncMambaStateParticipant,
     AsyncPendingForwardUse,
     AsyncPreparedDecodeState,
+    AsyncResourceParticipant,
     AsyncRowMapPolicy,
+    AsyncSampleReadbackParticipant,
+    AsyncSampleTicket,
     AsyncTxnState,
 )
 from megatron.core.inference.ep_async_protocol import EPAsyncHandoffDecision, EPStepBeginDecision
@@ -160,15 +165,6 @@ class AsyncDecodeModelCallbacks(Protocol):
         ...
 
 
-@dataclass(slots=True)
-class AsyncCoordinatorStepState:
-    """Per-step EP state owned by the coordinator."""
-
-    ep_step_begin_decision: EPStepBeginDecision | None = None
-    ep_handoff_decision: EPAsyncHandoffDecision | None = None
-    handoff_decided: bool = False
-
-
 class AsyncDecodeCoordinator:
     """Coordinates async dynamic decode generation for a text generation controller."""
 
@@ -260,6 +256,39 @@ class AsyncDecodeCoordinator:
         state = self._prepared_state
         if state is not None:
             self._context_ops.publish_prepared_state(state)
+
+    def launch_prepared(
+        self, sample_ticket: object | None = None
+    ) -> tuple[bool, torch.cuda.Event | None, int | None]:
+        """Publish, transfer, launch, and register one prepared async transaction."""
+        state = self._prepared_state
+        if state is None:
+            return False, None, None
+
+        self._context_ops.publish_prepared_state(state)
+        h2d_done_event = self._context_ops.queue_h2d_transfer()
+        input_ids, position_ids = self._context_ops.current_input_and_position_ids()
+        self._model_callbacks.launch_prepared_forward(input_ids, position_ids)
+        self._diagnostics_ops.increment_counter("_async_forward_launch_count")
+        self._diagnostics_ops.increment_counter("_async_launched_forward_count")
+
+        transaction = self.begin_transaction(plan=state.plan, state=AsyncTxnState.PREPARED)
+        ledger = state.resource_ledger
+        ledger.in_flight = True
+        self._context_ops.register_active_ledger(ledger)
+        participants = self._build_transaction_participants(
+            resource_ledger=ledger, sample_ticket=sample_ticket
+        )
+        if participants:
+            transaction.add_participants(*participants)
+            transaction.prepare_participants()
+        transaction.mark_launched(
+            sample_ticket=sample_ticket,
+            resource_ledger=ledger,
+            h2d_done_event=h2d_done_event,
+        )
+        self._prepared_state = None
+        return True, h2d_done_event, state.plan.graph_shape.padded_active_request_count
 
     def copy_samples_to_prepared_inputs(
         self,
@@ -435,9 +464,35 @@ class AsyncDecodeCoordinator:
             self._context_ops.clear_active_ledger(ledger)
         self._prepared_state = None
 
-    def _build_transaction_participants(self) -> tuple[object, ...]:
-        """Compatibility placeholder for single participant construction."""
-        return ()
+    def _build_transaction_participants(
+        self, *, resource_ledger: object | None, sample_ticket: object | None
+    ) -> tuple[object, ...]:
+        """Build the participants for a launched transaction in one place."""
+        context = getattr(self._context_ops, "_context", None)
+        participants = []
+        if context is not None and getattr(context, "is_hybrid_model", False):
+            participants.append(AsyncMambaStateParticipant(context))
+        if isinstance(sample_ticket, AsyncSampleTicket):
+            participants.append(AsyncSampleReadbackParticipant(sample_ticket))
+
+        requires_logprobs = self._model_callbacks.requires_logprobs()
+        requires_mtp = self._model_callbacks.requires_mtp()
+        if requires_logprobs or requires_mtp:
+            participants.append(
+                AsyncLogprobMTPParticipant(
+                    requires_logprobs=requires_logprobs,
+                    requires_mtp=requires_mtp,
+                )
+            )
+
+        has_resource_work = bool(
+            getattr(resource_ledger, "reservation_count", 0)
+            or getattr(resource_ledger, "deferred_kv_blocks", ())
+            or getattr(resource_ledger, "deferred_mamba_slots", ())
+        )
+        if context is not None and has_resource_work and hasattr(resource_ledger, "release_deferred"):
+            participants.append(AsyncResourceParticipant(resource_ledger, context))
+        return tuple(participants)
 
     def diagnostics(self) -> object | None:
         """Return EP diagnostics through the write-only protocol boundary."""
@@ -629,7 +684,12 @@ class _ControllerModelCallbacks:
         return getattr(self._controller, "_async_row_map_policy", AsyncRowMapPolicy.REUSE)
 
     def requires_logprobs(self) -> bool:
-        return self._controller._active_requests_need_logprob_results()
+        if not getattr(self._controller, "_async_logprob_requests_seen", False):
+            return False
+        try:
+            return self._controller._active_requests_need_logprob_results()
+        except (AttributeError, KeyError):
+            return True
 
     def requires_mtp(self) -> bool:
         return self._controller.num_speculative_tokens > 0
