@@ -89,6 +89,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_msc_args(parser)
     parser = _add_kitchen_quantization_arguments(parser)
     parser = _add_sft_args(parser)
+    parser = _add_varlen_dataset_args(parser)
 
     parser = _add_fault_injector_args(parser)
 
@@ -266,12 +267,12 @@ def _normalize_cuda_graph_modules_args(args):
         args.cuda_graph_modules
     )
     validate_deprecated_cuda_graph_modules_migration_inputs(
-        deprecated_scopes,
-        args.cuda_graph_impl,
-        args.inference_cuda_graph_scope,
+        deprecated_scopes, args.cuda_graph_impl, args.inference_cuda_graph_scope
     )
     if used_full_scope:
-        warn_rank_0('full scope is deprecated. Use empty cuda_graph_modules to capture the whole layer.')
+        warn_rank_0(
+            'full scope is deprecated. Use empty cuda_graph_modules to capture the whole layer.'
+        )
 
     for scope, attr, value in deprecated_scopes:
         migration = get_deprecated_cuda_graph_modules_migration(
@@ -676,12 +677,10 @@ def validate_args(args, defaults={}):
             del args.external_cuda_graph
 
     if getattr(args, 'cuda_graph_scope_deprecated', None) is not None:
-        assert not args.cuda_graph_modules, (
-            "--cuda-graph-scope and --cuda-graph-modules cannot be used together."
-        )
-        warn_rank_0(
-            '--cuda-graph-scope is deprecated, use --cuda-graph-modules instead.'
-        )
+        assert (
+            not args.cuda_graph_modules
+        ), "--cuda-graph-scope and --cuda-graph-modules cannot be used together."
+        warn_rank_0('--cuda-graph-scope is deprecated, use --cuda-graph-modules instead.')
         args.cuda_graph_modules = args.cuda_graph_scope_deprecated
     del args.cuda_graph_scope_deprecated
 
@@ -689,10 +688,7 @@ def validate_args(args, defaults={}):
     # all subsequent validation sees fully-typed enum values.
     _normalize_cuda_graph_modules_args(args)
     _normalize_inference_cuda_graph_scope_arg(args)
-    assert (
-        args.inference_cuda_graph_scope
-        in ALLOWED_INFERENCE_SCOPES[args.cuda_graph_impl]
-    ), (
+    assert args.inference_cuda_graph_scope in ALLOWED_INFERENCE_SCOPES[args.cuda_graph_impl], (
         "Invalid inference CUDA graph scope "
         f"{args.inference_cuda_graph_scope.name!r} for "
         f"--cuda-graph-impl={args.cuda_graph_impl!r}."
@@ -1559,16 +1555,6 @@ def validate_args(args, defaults={}):
             f"to {args.data_parallel_size * args.context_parallel_size}."
         )
 
-    if args.sequence_packing_scheduler is not None:
-        if args.sequence_packing_scheduler == 'dp_balanced':
-            total_cp_ranks = args.context_parallel_size
-        else:
-            total_cp_ranks = args.data_parallel_size * args.context_parallel_size
-        assert total_cp_ranks * args.max_seqlen_per_dp_cp_rank >= args.seq_length, (
-            f'Packed sequence buffer size ({total_cp_ranks * args.max_seqlen_per_dp_cp_rank}) '
-            f'must be >= single sequence max length ({args.seq_length})'
-        )
-
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled
     if (
@@ -1696,6 +1682,55 @@ def validate_args(args, defaults={}):
         assert (
             args.use_megatron_fsdp
         ), "--ckpt-format fsdp_dtensor is only tested with Megatron FSDP."
+
+    # --use-varlen-dataset: independent of --sft. Cannot be combined with --sft
+    # because they are mutually-exclusive top-level dataset selectors that both
+    # drive the packed-sequence (THD) path.
+    if args.use_varlen_dataset:
+        assert not args.sft, (
+            "--use-varlen-dataset and --sft are mutually exclusive; both "
+            "select the packed-sequence dataset family. Pick one."
+        )
+        if args.varlen_sbhd_validation:
+            # ``--dynamic-context-parallel`` ⊥ ``--varlen-sbhd-validation`` is
+            # checked in ``GPTDatasetConfig.__post_init__``; only the
+            # scheduler check stays here, since ``sequence_packing_scheduler``
+            # is a training-framework flag not stored on the dataset config.
+            assert args.sequence_packing_scheduler is None, (
+                "--varlen-sbhd-validation does not use a sequence packing "
+                "scheduler; drop --sequence-packing-scheduler."
+            )
+            # SBHD validation is a real-data numerical-reference path only;
+            # MockVarlenDataset does not implement it.
+            assert not args.mock_data, (
+                "--varlen-sbhd-validation is not supported with --mock-data; "
+                "SBHD validation requires a real dataset."
+            )
+        else:
+            # VarlenDataset emits one unpacked sample per __getitem__; it
+            # relies on an upstream packing scheduler to group variable-length
+            # samples into THD batches. Auto-pick a default scheduler when
+            # the user did not request one explicitly:
+            #   * ``--dynamic-context-parallel`` is already wired to
+            #     ``default_dynamic_cp`` upstream (see the dynamic-cp block
+            #     earlier in ``validate_args``).
+            #   * Otherwise fall back to ``dp_balanced`` (static packing).
+            if args.sequence_packing_scheduler is None:
+                args.sequence_packing_scheduler = 'dp_balanced'
+
+    # Packed-sequence buffer-size check. Placed after all scheduler auto-select
+    # logic (dynamic-cp and --use-varlen-dataset both set the scheduler above)
+    # so it validates the final resolved scheduler; the varlen path picks its
+    # default after the earlier generic validation has run.
+    if args.sequence_packing_scheduler is not None:
+        if args.sequence_packing_scheduler == 'dp_balanced':
+            total_cp_ranks = args.context_parallel_size
+        else:
+            total_cp_ranks = args.data_parallel_size * args.context_parallel_size
+        assert total_cp_ranks * args.max_seqlen_per_dp_cp_rank >= args.seq_length, (
+            f'Packed sequence buffer size ({total_cp_ranks * args.max_seqlen_per_dp_cp_rank}) '
+            f'must be >= single sequence max length ({args.seq_length})'
+        )
 
     # Data blend checks
     assert (
@@ -2564,6 +2599,8 @@ def _add_network_size_args(parser):
         "actual_vocab_size",
         "fp8_param",
         "fp4_param",
+        # already generated by data args
+        "create_attention_mask_in_dataloader",
         # incompatible defaults in dataclass
         "gradient_accumulation_fusion",
         "overlap_p2p_comm",
@@ -4843,9 +4880,60 @@ def _add_sft_args(parser):
         '--sft-mock-dataset-config-json',
         type=str,
         default=None,
-        help='This config provides the necessary information for the mock dataset. You can either specify a CSV file that contains sequence lengths, where each line stores the length of a sequence, for example: {"mode":"file","path":"/path/to/file"}. Alternatively, you can specify a distribution (currently only supporting lognormal distribution) along with the required parameters, for example, {"mode":"distribution","type":"lognormal","min_seq_len":1024,"max_seq_len":2048,"mean_seq_len":1536,"lognormal_sigma":1.1}, where sigma controls the variability of the lognormal distribution. '
+        help='This config provides the necessary information for the mock dataset. '
+        'Accepts either an inline JSON literal or a path to a JSON file containing '
+        'the same schema. You can either specify a CSV file that contains sequence lengths, '
+        'where each line stores the length of a sequence, for example: '
+        '{"mode":"file","path":"/path/to/file"}. Alternatively, you can specify a distribution '
+        '(currently only supporting lognormal distribution) along with the required parameters, '
+        'for example, {"mode":"distribution","type":"lognormal","min_seq_len":1024,'
+        '"max_seq_len":2048,"mean_seq_len":1536,"lognormal_sigma":1.1}, where sigma controls '
+        'the variability of the lognormal distribution. '
         'If not specified and --mock-data is set, defaults to a lognormal distribution with '
         'min_seq_len=seq_length//2, max_seq_len=seq_length, mean_seq_len=seq_length*3//4, lognormal_sigma=1.1.',
+    )
+    return parser
+
+
+def _add_varlen_dataset_args(parser):
+    group = parser.add_argument_group(title='varlen dataset')
+    group.add_argument(
+        '--use-varlen-dataset',
+        action="store_true",
+        help='Train with VarlenDataset, a variable-length packed (THD) dataset '
+        'that consumes instruction-tuning data from a HuggingFace Hub repo id, '
+        'a local parquet file, or a local jsonl file. Schema (alpaca / sharegpt '
+        '/ openai-messages) is auto-detected from the dataset columns. '
+        'Mutually exclusive with --sft. Auto-picks a sequence packing '
+        'scheduler when none is given: ``dp_balanced`` by default, '
+        '``default_dynamic_cp`` when ``--dynamic-context-parallel`` is set. '
+        'Combine with --mock-data for a synthetic lognormal sequence-length '
+        'distribution; see --varlen-mock-dataset-config-json.',
+    )
+    group.add_argument(
+        '--varlen-sbhd-validation',
+        action="store_true",
+        help='Reference SBHD mode for THD numerical verification. When set, '
+        'VarlenDataset emits SBHD-style samples right-padded to '
+        '--seq-length (no cu_seqlens, no packing scheduler), so the run can '
+        'be compared against the THD path to validate correctness. '
+        'Incompatible with --dynamic-context-parallel and '
+        '--sequence-packing-scheduler.',
+    )
+    group.add_argument(
+        '--varlen-mock-dataset-config-json',
+        type=str,
+        default=None,
+        help='Mock-dataset config for --use-varlen-dataset --mock-data. '
+        'Accepts either an inline JSON literal or a path to a JSON file containing '
+        'the same schema as --sft-mock-dataset-config-json: either '
+        '{"mode":"file","path":"/path/to/lengths.csv"}, '
+        '{"mode":"distribution","type":"lognormal","min_seq_len":1024,'
+        '"max_seq_len":2048,"mean_seq_len":1536,"lognormal_sigma":1.1}, or '
+        '{"mode":"verification","data_path":"/prefix/of/IndexedDataset"}. '
+        'If not specified, defaults to a lognormal distribution with '
+        'min_seq_len=seq_length//2, max_seq_len=seq_length, '
+        'mean_seq_len=seq_length*3//4, lognormal_sigma=1.1.',
     )
     return parser
 

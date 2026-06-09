@@ -81,6 +81,15 @@ class TransformerConfig(ModelParallelConfig):
     which serves as an additional training objective.
     """
 
+    mtp_isolated_loss: bool = False
+    """If True, MTP loss only updates MTP module parameters. The MTP loss graph is
+    detached from the main decoder, shared embeddings, and output layer weights.
+
+    For online RL, keep ``labels=None`` so the main LM head returns logits for the
+    external RL loss. MTP auxiliary loss can still be trained by deriving its labels
+    from ``input_ids`` in the MTP loss path; this option isolates that auxiliary loss
+    from the main model parameters."""
+
     mtp_use_repeated_layer: bool = False
     """Use a single MTP layer repeatedly instead of multiple separate layers."""
 
@@ -1025,6 +1034,14 @@ class TransformerConfig(ModelParallelConfig):
     Backward compatibility: "full" is deprecated but kept for backward compatibility; it is
     transformed to an empty list in __post_init__. The deprecated values "full_iteration" and
     "full_iteration_inference" are also accepted and migrated to the new API in __post_init__."""
+
+    create_attention_mask_in_dataloader: bool = True
+    """Whether training data loaders create and pass an attention_mask tensor.
+
+    This mirrors the training argument of the same name so Transformer Engine CUDA graph capture
+    can preserve the actual forward signature. When disabled for causal/no-mask attention,
+    the graph capture path should not allocate a synthetic global-sequence attention mask.
+    """
 
     inference_cuda_graph_scope: Optional[InferenceCudaGraphScope] = field(
         default=None,
@@ -2258,11 +2275,6 @@ class TransformerConfig(ModelParallelConfig):
                         "use_te_activation_func must be False "
                         "when activation_func_clamp_value is not None for SwiGLU"
                     )
-                if self.use_transformer_engine_op_fuser:
-                    raise ValueError(
-                        "use_transformer_engine_op_fuser must be False "
-                        "when activation_func_clamp_value is not None for SwiGLU"
-                    )
 
         if self.apply_rope_fusion:
             if self.multi_latent_attention:
@@ -3053,7 +3065,12 @@ class MLATransformerConfig(TransformerConfig):
 
     def __post_init__(self):
         super().__post_init__()
-        if self.multi_latent_attention and self.apply_rope_fusion and self.rope_type != "yarn":
+        if (
+            self.multi_latent_attention
+            and self.apply_rope_fusion
+            and self.rope_type != "yarn"
+            and self.experimental_attention_variant != "dsv4_hybrid"
+        ):
             raise ValueError("apply_rope_fusion for MLA only works with YARN RoPE.")
 
         if self.attention_output_gate:
