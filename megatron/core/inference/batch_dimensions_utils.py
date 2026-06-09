@@ -272,8 +272,10 @@ class CUDAGraphBatchDimensionBuilder:
     and matching the best batch dimension for a given real batch dimension.
     """
 
-    # Constant for rounding token counts when generating CUDA graph batch dimensions
-    CUDA_GRAPH_ROUNDER = 2
+    # Legacy linear sizing rounds graph token counts the same way as the weekend branch.
+    LINEAR_CUDA_GRAPH_ROUNDER = 8
+    EXPONENTIAL_CUDA_GRAPH_ROUNDER = 2
+    CUDA_GRAPH_ROUNDER = LINEAR_CUDA_GRAPH_ROUNDER
 
     @staticmethod
     def _calculate_cuda_graph_token_counts(
@@ -286,16 +288,14 @@ class CUDAGraphBatchDimensionBuilder:
         Calculate CUDA graph token counts for a given configuration.
 
         Dispatches on `sizing_distribution`:
-          - EXPONENTIAL (default): halves from cuda_graph_max_tokens down to tp_size, log-spaced,
-            creates log2(max_tokens) graphs.
-          - LINEAR: small graphs [1, 2, 4] + range(8, 256, 8) + range(256, max+1, 16);
-            explicit-N path uses even 16-stride from 0 to max.
+          - LINEAR (default): weekend-compatible graph buckets.
+          - EXPONENTIAL: halves from cuda_graph_max_tokens down to tp_size, log-spaced.
 
         Args:
             tp_size: Tensor parallel size (for alignment)
             num_cuda_graphs: Number of CUDA graphs to generate (must be >= 1, or -1 to auto-size)
             cuda_graph_max_tokens: Maximum token count for CUDA graphs (must be > 0)
-            sizing_distribution: Distribution of cudagraph sizes. Defaults to EXPONENTIAL.
+            sizing_distribution: Distribution of cudagraph sizes. Defaults to LINEAR.
 
         Returns:
             List of token counts in descending order
@@ -308,7 +308,7 @@ class CUDAGraphBatchDimensionBuilder:
         from megatron.core.inference.config import CudaGraphSizingDistribution
 
         if sizing_distribution is None:
-            sizing_distribution = CudaGraphSizingDistribution.EXPONENTIAL
+            sizing_distribution = CudaGraphSizingDistribution.LINEAR
 
         if sizing_distribution == CudaGraphSizingDistribution.LINEAR:
             return CUDAGraphBatchDimensionBuilder._calculate_token_counts_linear(
@@ -337,18 +337,6 @@ class CUDAGraphBatchDimensionBuilder:
             cuda_graph_max_tokens > 0
         ), f"cuda_graph_max_tokens must be > 0, got {cuda_graph_max_tokens}"
 
-        rounder = CUDAGraphBatchDimensionBuilder.CUDA_GRAPH_ROUNDER
-
-        # Cuda graph step size.
-        cuda_graph_step_size = cuda_graph_max_tokens / num_cuda_graphs
-        cuda_graph_step_size = CUDAGraphBatchDimensionBuilder.CUDA_GRAPH_ROUNDER * int(
-            math.ceil(int(cuda_graph_step_size) / CUDAGraphBatchDimensionBuilder.CUDA_GRAPH_ROUNDER)
-        )
-        # Make sure divisible by TP size
-        cuda_graph_step_size = round_up_to_nearest_multiple(cuda_graph_step_size, tp_size)
-        # Ensure non-zero step size (can happen when max_tokens < num_cuda_graphs).
-        cuda_graph_step_size = max(cuda_graph_step_size, tp_size)
-
         # Round down cuda graph max tokens to be multiple of TP size
         cuda_graph_max_tokens = (cuda_graph_max_tokens // tp_size) * tp_size
 
@@ -358,6 +346,7 @@ class CUDAGraphBatchDimensionBuilder:
         # Exponentially decreasing token counts: halve from max_tokens until below the rounder floor
         # or num_cuda_graphs. Dedupe (the rounding/TP-alignment can collide for small values),
         # then sort descending.
+        rounder = CUDAGraphBatchDimensionBuilder.EXPONENTIAL_CUDA_GRAPH_ROUNDER
         sizes = set()
         val = cuda_graph_max_tokens
         for _ in range(num_cuda_graphs):
@@ -395,7 +384,7 @@ class CUDAGraphBatchDimensionBuilder:
         TP-aligned and deduped.
         For positive N, returns evenly-spaced sizes with step ~ max_tokens / N.
         """
-        rounder = CUDAGraphBatchDimensionBuilder.CUDA_GRAPH_ROUNDER
+        rounder = CUDAGraphBatchDimensionBuilder.LINEAR_CUDA_GRAPH_ROUNDER
 
         if num_cuda_graphs == -1:
             sizes = (
@@ -503,7 +492,7 @@ class CUDAGraphBatchDimensionBuilder:
             from megatron.core.inference.config import CudaGraphSizingDistribution
 
             if sizing_distribution is None:
-                sizing_distribution = CudaGraphSizingDistribution.EXPONENTIAL
+                sizing_distribution = CudaGraphSizingDistribution.LINEAR
 
             # Ensure valid num_cuda_graphs.
             if (
@@ -590,14 +579,12 @@ class CUDAGraphBatchDimensionBuilder:
         else:
             # Mixed prefill and decode mode.
             #
-            # Under EXPONENTIAL distribution (default): generate mixed CGs across a
-            # geometric P-grid {1, 2, 4, ..., max_requests}. This bounds the relative
-            # overhead per real batch (~2x P slack worst case) and is the structural fix
-            # that makes mixed CGs usable for real batches with P != fixed_P.
-            #
             # Under LINEAR distribution: use the legacy fixed P value
-            # (cuda_graph_mixed_prefill_request_count) — same single-P behavior main has
-            # today, for apples-to-apples benchmarking against vLLM-style configurations.
+            # (cuda_graph_mixed_prefill_request_count), matching the weekend branch.
+            #
+            # Under EXPONENTIAL distribution: generate mixed CGs across a
+            # geometric P-grid {1, 2, 4, ..., max_requests}. This bounds the relative
+            # overhead per real batch when explicitly enabled.
             if sizing_distribution == CudaGraphSizingDistribution.LINEAR:
                 p_values = [min(cuda_graph_mixed_prefill_request_count, max_requests)]
                 # In legacy mode, the prefill-only floor uses the fixed P value to match

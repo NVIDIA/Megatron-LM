@@ -18,6 +18,7 @@ from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
 from megatron.core.inference.config import (
+    CudaGraphSizingDistribution,
     InferenceConfig,
     KVCacheManagementMode,
     MambaInferenceStateConfig,
@@ -149,6 +150,9 @@ class DynamicEngineTestConfig:
     position_embedding_type: str = "learned_absolute"
     sampling_backend: str = 'torch'
     enable_async_scheduling: bool = False
+    cuda_graph_sizing_distribution: CudaGraphSizingDistribution = (
+        CudaGraphSizingDistribution.LINEAR
+    )
     termination_id: Optional[int] = None
     temperature: float = 1.0
     top_k: int = 0
@@ -309,6 +313,7 @@ class DynamicInferenceEngineTestBase:
                 num_speculative_tokens=test_config.num_speculative_tokens,
                 sampling_backend=test_config.sampling_backend,
                 enable_async_scheduling=test_config.enable_async_scheduling,
+                cuda_graph_sizing_distribution=test_config.cuda_graph_sizing_distribution,
             ),
         )
 
@@ -948,7 +953,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     def test_cuda_graph_token_counts(self, use_non_decode: bool) -> None:
         """Test initialization of `cuda_graph_token_counts` in dynamic context."""
 
-        # Exponential-decay graph distribution (halve from max down to tp_size).
+        # Explicit exponential graph distribution (halve from max down to tp_size).
         # decode-only path: cuda_graph_max_tokens = max_requests * (spec+1) = 80.
         # non-decode path: cuda_graph_max_tokens = self.max_tokens (DEFAULT 16384);
         # most large prefill sizes are filtered by is_valid because
@@ -982,6 +987,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                     num_cuda_graphs=num_cuda_graphs,
                     use_cuda_graphs_for_non_decode_steps=use_non_decode,
                     cuda_graph_all_prefills=use_non_decode,
+                    cuda_graph_sizing_distribution=CudaGraphSizingDistribution.EXPONENTIAL,
                 )
             )
             actual_cuda_graph_token_counts = env.engine.context.cuda_graph_token_counts
