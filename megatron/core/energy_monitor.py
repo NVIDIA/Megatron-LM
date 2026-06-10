@@ -58,6 +58,13 @@ class EnergyMonitor:
 
     def _get_energy(self) -> int:
         """Get current energy consumption from NVML."""
+        if self._handle is None:
+            # setup() was not called (energy monitoring disabled), so there is
+            # no NVML handle. pause()/resume() are still invoked unconditionally
+            # around checkpoint save; passing a null handle to NVML segfaults on
+            # some drivers (observed on GH200/aarch64) and is not catchable as an
+            # NVMLError. Skip the query in that case.
+            return self._last_energy
         try:
             return nvmlDeviceGetTotalEnergyConsumption(self._handle)
         except NVMLError:
