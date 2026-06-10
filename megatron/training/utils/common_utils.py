@@ -8,6 +8,7 @@ import warnings
 from contextlib import contextmanager
 from datetime import datetime
 from collections import defaultdict
+from typing import Optional
 
 import torch
 
@@ -234,29 +235,40 @@ def calc_dtensor_params_l2_norm(params):
     return total_norm_2.item() ** 0.5
 
 
-def average_losses_across_data_parallel_group(losses):
-    """Reduce a tensor of losses across all GPUs."""
+def average_losses_across_data_parallel_group(
+    losses, group: Optional[torch.distributed.ProcessGroup] = None
+):
+    """Reduce a tensor of losses across all GPUs.
+
+    group: data-parallel process group; defaults to mpu.get_data_parallel_group().
+    """
+    if group is None:
+        group = mpu.get_data_parallel_group()
     averaged_losses = torch.cat([loss.clone().detach().view(1) for loss in losses])
-    torch.distributed.all_reduce(averaged_losses, group=mpu.get_data_parallel_group())
-    averaged_losses = averaged_losses / mpu.get_data_parallel_group().size()
+    torch.distributed.all_reduce(averaged_losses, group=group)
+    averaged_losses = averaged_losses / group.size()
 
     return averaged_losses
 
 
-def reduce_max_stat_across_model_parallel_group(stat: float) -> float | None:
+def reduce_max_stat_across_model_parallel_group(
+    stat: float, group: Optional[torch.distributed.ProcessGroup] = None
+) -> float | None:
     """
     Ranks without an optimizer will have no grad_norm or num_zeros_in_grad stats.
     We need to ensure the logging and writer rank has those values.
     This function reduces a stat tensor across the model parallel group.
 
     We use an all_reduce max since the values have already been summed across optimizer ranks where possible
+
+    group: model-parallel process group; defaults to mpu.get_model_parallel_group().
     """
+    if group is None:
+        group = mpu.get_model_parallel_group()
     if stat is None:
         stat = -1.0
     stat = torch.tensor([stat], dtype=torch.float32, device=torch.cuda.current_device())
-    torch.distributed.all_reduce(
-        stat, op=torch.distributed.ReduceOp.MAX, group=mpu.get_model_parallel_group()
-    )
+    torch.distributed.all_reduce(stat, op=torch.distributed.ReduceOp.MAX, group=group)
     if stat.item() == -1.0:
         # No rank has a valid stat, so return None to indicate that it is None across all ranks.
         return None
@@ -264,18 +276,22 @@ def reduce_max_stat_across_model_parallel_group(stat: float) -> float | None:
         return stat.item()
 
 
-def logical_and_across_model_parallel_group(input: bool) -> bool:
+def logical_and_across_model_parallel_group(
+    input: bool, group: Optional[torch.distributed.ProcessGroup] = None
+) -> bool:
     """
     This function gathers a bool value across the model parallel group
+
+    group: model-parallel process group; defaults to mpu.get_model_parallel_group().
     """
+    if group is None:
+        group = mpu.get_model_parallel_group()
     if input is True:
         input = 1
     else:
         input = 0
     input = torch.tensor([input], dtype=torch.int, device=torch.cuda.current_device())
-    torch.distributed.all_reduce(
-        input, op=torch.distributed.ReduceOp.MIN, group=mpu.get_model_parallel_group()
-    )
+    torch.distributed.all_reduce(input, op=torch.distributed.ReduceOp.MIN, group=group)
     return bool(input.item())
 
 
