@@ -334,6 +334,14 @@ class MultiLatentAttention(Attention):
         if self.config.cache_mla_latents:
             self.prepare_for_absorption()
 
+        # Set the right cp group for dynamic-cp. Mirrors Attention.forward:
+        # downstream RoPE uses self.pg_collection.cp, which must point at this
+        # microbatch's dynamic CP group. Restored before every return.
+        _orig_cp_group = self.pg_collection.cp
+        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
+            assert packed_seq_params.cp_group is not None, "cp_group must be set in dynamic-cp mode"
+            self.pg_collection.cp = packed_seq_params.cp_group
+
         # =====================
         # Query, Key, and Value
         # =====================
@@ -465,6 +473,7 @@ class MultiLatentAttention(Attention):
                 output, name="attn_proj", forced_released_tensors=[core_attn_out]
             )
 
+        self.pg_collection.cp = _orig_cp_group
         return output, bias
 
 
@@ -671,12 +680,6 @@ class MLASelfAttention(MultiLatentAttention):
         assert (
             hidden_states.ndim == 3
         ), f"hidden_states should be 3D, [s, b, n*h], got {hidden_states.ndim}D"
-        if packed_seq_params is not None:
-            assert (
-                packed_seq_params.local_cp_size is None
-            ), "hybrid_context_parallel is not supported with MLA yet and is planned for future. \
-            Please disable hybrid_context_parallel."
-
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         # =========================================

@@ -58,8 +58,8 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     Set to 0 if sequence parallel is not enabled regardless of TP size.
     """
 
-    hybrid_context_parallel: bool = False
-    """Option to enable hybrid context parallelism. When setting this to True, 
+    dynamic_context_parallel: bool = False
+    """Option to enable dynamic context parallelism. When setting this to True, 
     each sample should be divisible by the data parallel size * context parallel size * 2.
     If sequence parallel is enabled, it should be divisible by the 
     data parallel size * context parallel size * sequence parallel size * 2.
@@ -76,6 +76,21 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     context_parallel_size: Optional[int] = None
     """The size of the context parallel group. Needed for padding in packed sequences."""
 
+    sft_mock_dataset_config_json: Optional[str] = None
+    """This config provides the necessary information for the mock dataset."""
+
+    varlen_mock_dataset_config_json: Optional[str] = None
+    """Mock-dataset config (same JSON schema as ``sft_mock_dataset_config_json``)
+    used by the ``--use-varlen-dataset`` path; kept separate so the varlen path
+    does not implicitly inherit SFT-specific knobs."""
+
+    varlen_sbhd_validation: bool = False
+    """When True, :class:`VarlenDataset.__getitem__` emits SBHD samples padded
+    to ``sequence_length`` (no ``cu_seqlens`` / ``original_seq_len`` /
+    ``padded_seq_len``), bypassing the packed-sequence path. Used to obtain a
+    SBHD reference run that mirrors the THD path's tokenization but skips all
+    packing — useful for THD numerical-correctness validation."""
+
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
         super().__post_init__()
@@ -85,6 +100,12 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
         assert self.reset_position_ids is not None
         assert self.reset_attention_mask is not None
         assert self.eod_mask_loss is not None
+
+        if self.varlen_sbhd_validation:
+            assert not self.dynamic_context_parallel, (
+                "--varlen-sbhd-validation is incompatible with "
+                "--dynamic-context-parallel (SBHD mode is not packed)."
+            )
 
         self.token_dtype_code = (
             None

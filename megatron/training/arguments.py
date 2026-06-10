@@ -90,6 +90,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_msc_args(parser)
     parser = _add_kitchen_quantization_arguments(parser)
     parser = _add_sft_args(parser)
+    parser = _add_varlen_dataset_args(parser)
 
     parser = _add_fault_injector_args(parser)
 
@@ -1215,13 +1216,6 @@ def validate_args(args, defaults={}):
     if args.rl_use_sequence_packing:
         args.consumed_train_bins = 0
 
-    # Support for variable sequence lengths across batches/microbatches.
-    # set it if the dataloader supports generation of variable sequence lengths
-    # across batches/microbatches. Due to additional communication overhead
-    # during pipeline parallelism, it should not be set if sequence length
-    # is constant during training.
-    args.variable_seq_lengths = False
-
     # Iteration-based training.
     # Skip these checks when skip_train is set: LR config is irrelevant.
     if args.train_iters and not args.skip_train:
@@ -1386,12 +1380,43 @@ def validate_args(args, defaults={}):
     if args.tp_comm_overlap:
         assert args.sequence_parallel == True, 'Tensor parallel communication/GEMM overlap can happen only when sequence parallelism is enabled'
 
-    if args.hybrid_context_parallel:
-        assert not args.pipeline_model_parallel_size > 1, 'Hybrid context parallelism not supported with pipeline parallelism'
-        assert not args.enable_cuda_graph, 'Hybrid context parallelism not supported with CUDA Graph'
-        assert not args.use_megatron_fsdp, 'Hybrid context parallelism not supported with Megatron FSDP'
-        assert args.dataloader_type == 'single', 'Hybrid context parallelism only supported with single dataloader type'
-        assert args.calculate_per_token_loss, 'Hybrid context parallelism must be used with --calculate-per-token-loss'
+    if args.dynamic_context_parallel:
+        assert (
+            not args.enable_cuda_graph
+        ), 'Dynamic context parallelism not supported with CUDA Graph'
+        assert (
+            not args.use_megatron_fsdp
+        ), 'Dynamic context parallelism not supported with Megatron FSDP'
+        assert (
+            args.dataloader_type == 'single'
+        ), 'Dynamic context parallelism only supported with single dataloader type'
+        assert (
+            args.calculate_per_token_loss
+        ), 'Dynamic context parallelism must be used with --calculate-per-token-loss'
+        if args.sequence_packing_scheduler is None:
+            args.sequence_packing_scheduler = 'default_dynamic_cp'
+        if args.sequence_packing_scheduler != 'default_dynamic_cp':
+            raise ValueError(
+                'Dynamic context parallelism requires '
+                'sequence_packing_scheduler=default_dynamic_cp'
+            )
+
+        dp_cp_size = args.data_parallel_size * args.context_parallel_size
+        assert args.min_dynamic_context_parallel_size <= dp_cp_size, (
+            f'min_dynamic_context_parallel_size ({args.min_dynamic_context_parallel_size}) '
+            f'must be <= dp_size * cp_size ({dp_cp_size})'
+        )
+
+        import warnings
+
+        warnings.warn(
+            f"Dynamic CP enabled: dp_size * context_parallel_size="
+            f"{args.data_parallel_size * args.context_parallel_size} "
+            f"will be used as the maximum dynamic CP group size. "
+            f"Dynamic CP groups will range from "
+            f"min_dynamic_context_parallel_size={args.min_dynamic_context_parallel_size} "
+            f"to {args.data_parallel_size * args.context_parallel_size}."
+        )
 
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled
@@ -1505,6 +1530,61 @@ def validate_args(args, defaults={}):
     # fsdp_dtensor checkpointing format checks.
     if args.ckpt_format == "fsdp_dtensor":
         assert args.use_megatron_fsdp, "--ckpt-format fsdp_dtensor is only tested with Megatron FSDP."
+
+    # --use-varlen-dataset: independent of --sft. Cannot be combined with --sft
+    # because they are mutually-exclusive top-level dataset selectors that both
+    # drive the packed-sequence (THD) path.
+    if args.use_varlen_dataset:
+        assert not args.sft, (
+            "--use-varlen-dataset and --sft are mutually exclusive; both "
+            "select the packed-sequence dataset family. Pick one."
+        )
+        if args.varlen_sbhd_validation:
+            # ``--dynamic-context-parallel`` ⊥ ``--varlen-sbhd-validation`` is
+            # checked in ``GPTDatasetConfig.__post_init__``; only the
+            # scheduler check stays here, since ``sequence_packing_scheduler``
+            # is a training-framework flag not stored on the dataset config.
+            assert args.sequence_packing_scheduler is None, (
+                "--varlen-sbhd-validation does not use a sequence packing "
+                "scheduler; drop --sequence-packing-scheduler."
+            )
+            # SBHD validation is a real-data numerical-reference path only;
+            # MockVarlenDataset does not implement it.
+            assert not args.mock_data, (
+                "--varlen-sbhd-validation is not supported with --mock-data; "
+                "SBHD validation requires a real dataset."
+            )
+        else:
+            # VarlenDataset emits one unpacked sample per __getitem__; it
+            # relies on an upstream packing scheduler to group variable-length
+            # samples into THD batches. Auto-pick a default scheduler when
+            # the user did not request one explicitly:
+            #   * ``--dynamic-context-parallel`` is already wired to
+            #     ``default_dynamic_cp`` upstream (see the dynamic-cp block
+            #     earlier in ``validate_args``).
+            #   * Otherwise fall back to ``dp_balanced`` (static packing).
+            if args.sequence_packing_scheduler is None:
+                args.sequence_packing_scheduler = 'dp_balanced'
+
+    # Packed-sequence buffer-size check. Placed after all scheduler auto-select
+    # logic (dynamic-cp and --use-varlen-dataset both set the scheduler above)
+    # so it validates the final resolved scheduler; the varlen path picks its
+    # default after the earlier generic validation has run.
+    if args.sequence_packing_scheduler is not None:
+        if args.sequence_packing_scheduler == 'dp_balanced':
+            total_cp_ranks = args.context_parallel_size
+        else:
+            total_cp_ranks = args.data_parallel_size * args.context_parallel_size
+        if args.max_seqlen_per_dp_cp_rank is None:
+            args.max_seqlen_per_dp_cp_rank = getattr(args, "max_seqlen_per_cp_rank", None)
+        if args.max_seqlen_per_dp_cp_rank is None:
+            args.max_seqlen_per_dp_cp_rank = (
+                args.seq_length + total_cp_ranks - 1
+            ) // total_cp_ranks
+        assert total_cp_ranks * args.max_seqlen_per_dp_cp_rank >= args.seq_length, (
+            f'Packed sequence buffer size ({total_cp_ranks * args.max_seqlen_per_dp_cp_rank}) '
+            f'must be >= single sequence max length ({args.seq_length})'
+        )
 
     # Data blend checks
     assert args.mock_data + \
@@ -3381,8 +3461,71 @@ def _add_kitchen_quantization_arguments(parser: argparse.ArgumentParser):
 def _add_sft_args(parser):
     group = parser.add_argument_group(title='sft')
     group.add_argument('--sft', action="store_true", help='Megatron SFT training')
-    group.add_argument('--sft-tokenizer-prompt-format', type=str, default="nemotron-h-aligned",
-                       help='SFT prompt format.')
+    group.add_argument(
+        '--sft-tokenizer-prompt-format',
+        type=str,
+        default="nemotron-h-aligned",
+        help='SFT prompt format.',
+    )
+    group.add_argument(
+        '--sft-mock-dataset-config-json',
+        type=str,
+        default=None,
+        help='This config provides the necessary information for the mock dataset. '
+        'Accepts either an inline JSON literal or a path to a JSON file containing '
+        'the same schema. You can either specify a CSV file that contains sequence lengths, '
+        'where each line stores the length of a sequence, for example: '
+        '{"mode":"file","path":"/path/to/file"}. Alternatively, you can specify a distribution '
+        '(currently only supporting lognormal distribution) along with the required parameters, '
+        'for example, {"mode":"distribution","type":"lognormal","min_seq_len":1024,'
+        '"max_seq_len":2048,"mean_seq_len":1536,"lognormal_sigma":1.1}, where sigma controls '
+        'the variability of the lognormal distribution. '
+        'If not specified and --mock-data is set, defaults to a lognormal distribution with '
+        'min_seq_len=seq_length//2, max_seq_len=seq_length, mean_seq_len=seq_length*3//4, lognormal_sigma=1.1.',
+    )
+    return parser
+
+
+def _add_varlen_dataset_args(parser):
+    group = parser.add_argument_group(title='varlen dataset')
+    group.add_argument(
+        '--use-varlen-dataset',
+        action="store_true",
+        help='Train with VarlenDataset, a variable-length packed (THD) dataset '
+        'that consumes instruction-tuning data from a HuggingFace Hub repo id, '
+        'a local parquet file, or a local jsonl file. Schema (alpaca / sharegpt '
+        '/ openai-messages) is auto-detected from the dataset columns. '
+        'Mutually exclusive with --sft. Auto-picks a sequence packing '
+        'scheduler when none is given: ``dp_balanced`` by default, '
+        '``default_dynamic_cp`` when ``--dynamic-context-parallel`` is set. '
+        'Combine with --mock-data for a synthetic lognormal sequence-length '
+        'distribution; see --varlen-mock-dataset-config-json.',
+    )
+    group.add_argument(
+        '--varlen-sbhd-validation',
+        action="store_true",
+        help='Reference SBHD mode for THD numerical verification. When set, '
+        'VarlenDataset emits SBHD-style samples right-padded to '
+        '--seq-length (no cu_seqlens, no packing scheduler), so the run can '
+        'be compared against the THD path to validate correctness. '
+        'Incompatible with --dynamic-context-parallel and '
+        '--sequence-packing-scheduler.',
+    )
+    group.add_argument(
+        '--varlen-mock-dataset-config-json',
+        type=str,
+        default=None,
+        help='Mock-dataset config for --use-varlen-dataset --mock-data. '
+        'Accepts either an inline JSON literal or a path to a JSON file containing '
+        'the same schema as --sft-mock-dataset-config-json: either '
+        '{"mode":"file","path":"/path/to/lengths.csv"}, '
+        '{"mode":"distribution","type":"lognormal","min_seq_len":1024,'
+        '"max_seq_len":2048,"mean_seq_len":1536,"lognormal_sigma":1.1}, or '
+        '{"mode":"verification","data_path":"/prefix/of/IndexedDataset"}. '
+        'If not specified, defaults to a lognormal distribution with '
+        'min_seq_len=seq_length//2, max_seq_len=seq_length, '
+        'mean_seq_len=seq_length*3//4, lognormal_sigma=1.1.',
+    )
     return parser
 
 

@@ -1791,21 +1791,22 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         """Forward."""
         if packed_seq_params is not None:
             # If Dynamic CP group is provided, update TE DPA CP group
-            if packed_seq_params.cp_group is not None:
-                self.cp_group = packed_seq_params.cp_group
-                super().set_context_parallel_group(
-                    self.cp_group,
-                    torch.distributed.get_process_group_ranks(self.cp_group),
-                    TEDotProductAttention.cp_stream,
-                    self.cp_comm_type,
-                )
-            # If cp_group is None but local_cp_size is provided,
-            # Indicates to turn off CP dynamically
-            elif packed_seq_params.local_cp_size is not None:
-                assert (
-                    packed_seq_params.local_cp_size == 1
-                ), "local_cp_size must be == 1 if provided without cp_group"
-                super().set_context_parallel_group(None, None, None, self.cp_comm_type)
+            if packed_seq_params.local_cp_size is not None:
+                if packed_seq_params.local_cp_size == 1:
+                    super().set_context_parallel_group(None, None, None, self.cp_comm_type)
+                else:
+                    assert (
+                        packed_seq_params.cp_group is not None
+                    ), "cp_group is not set in packed_seq_params for dynamic CP"
+                    self.cp_group = packed_seq_params.cp_group
+                    if TEDotProductAttention.cp_stream is None:
+                        TEDotProductAttention.cp_stream = torch.cuda.Stream()
+                    super().set_context_parallel_group(
+                        self.cp_group,
+                        torch.distributed.get_process_group_ranks(self.cp_group),
+                        TEDotProductAttention.cp_stream,
+                        self.cp_comm_type,
+                    )
             self.kept_packed_seq_params.discard("cp_group")
             self.kept_packed_seq_params.discard("local_cp_size")
 
@@ -3383,3 +3384,24 @@ try:
     from transformer_engine.pytorch.float8_tensor import Float8Tensor
 except ImportError:
     Float8Tensor = None
+
+
+def get_thd_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank):
+    """Get partitioned indices for THD format data in context parallel.
+
+    Args:
+        cu_seqlens: Cumulative sequence lengths tensor.
+        total_tokens: Total number of tokens.
+        cp_size: Context parallel world size.
+        cp_rank: Context parallel rank.
+
+    Returns:
+        Partitioned indices tensor.
+    """
+    assert is_te_min_version("1.10.0"), (
+        "Please update Transformer Engine to >= 1.10 to use "
+        "Context Parallel with THD format data"
+    )
+    import transformer_engine_torch as tex
+
+    return tex.thd_get_partitioned_indices(cu_seqlens, total_tokens, cp_size, cp_rank)

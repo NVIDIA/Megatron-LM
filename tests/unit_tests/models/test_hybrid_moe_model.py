@@ -300,8 +300,11 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "min_offloaded_tensor_size": 1024 * 1024,
     "offload_modules": [],
     "fine_grained_offloading_max_inflight_offloads": None,
+    "dynamic_context_parallel": False,
+    "min_dynamic_context_parallel_size": 1,
     "hybrid_context_parallel": False,
     "max_seqlen_per_dp_cp_rank": None,
+    "sequence_packing_scheduler": None,
     "inference_cuda_graph_scope": {
         "__objclass__": "megatron.core.transformer.enums.InferenceCudaGraphScope",
         "_name_": "none",
