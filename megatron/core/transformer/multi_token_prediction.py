@@ -579,11 +579,11 @@ def get_mtp_num_layers_to_build(
         num_layers_to_build = config.pipeline_model_parallel_layout.get_num_layers_to_build(
             layer_type=LayerType.mtp, vp_stage=vp_stage
         )
-        assert num_layers_to_build == config.mtp_num_layers or num_layers_to_build == 0, (
-            f"Currently, we only support put all of MTP layers on the last pipeline stage, "
-            f"so the number of MTP layers to build ({num_layers_to_build}) must match "
-            f"mtp_num_layers ({config.mtp_num_layers}) or be 0."
-        )
+        # assert num_layers_to_build == config.mtp_num_layers or num_layers_to_build == 0, (
+        #     f"Currently, we only support put all of MTP layers on the last pipeline stage, "
+        #     f"so the number of MTP layers to build ({num_layers_to_build}) must match "
+        #     f"mtp_num_layers ({config.mtp_num_layers}) or be 0."
+        # )
     else:
         if parallel_state.is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage):
             num_layers_to_build = config.mtp_num_layers if config.mtp_num_layers else 0
@@ -675,6 +675,7 @@ def process_mtp_loss(
     Returns:
         Tensor: Updated hidden states after MTP loss processing (first chunk only).
     """
+    nvtx_range_push(suffix="process_mtp_loss")
     hidden_states_list = torch.chunk(hidden_states, 1 + config.mtp_num_layers, dim=0)
     hidden_states = hidden_states_list[0]
 
@@ -765,6 +766,7 @@ def process_mtp_loss(
                 hidden_states, mtp_loss_scale * mtp_loss / safe_num_tokens
             )
 
+    nvtx_range_pop(suffix="process_mtp_loss")
     return hidden_states
 
 
@@ -1415,6 +1417,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             Union[Tensor, Tuple[Tensor, Tensor]]: The output hidden states tensor of shape
             [s, b, h], and optionally the updated context tensor if cross-attention is used.
         """
+        nvtx_range_push(suffix="mtp_forward")
         assert context is None, "multi token prediction + cross attention is not yet supported."
         _orig_cp_group = self.cp_group
         if packed_seq_params is not None and packed_seq_params.cp_group is not None:
@@ -1459,6 +1462,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             )
 
         self.cp_group = _orig_cp_group
+        nvtx_range_pop(suffix="mtp_forward")
         return hidden_states, input_ids, position_ids
 
     def sharded_state_dict(

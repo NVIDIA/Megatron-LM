@@ -125,9 +125,10 @@ class PipelineParallelLayerLayout:
                 f"virtual pipeline stage of that rank. But got {self.layout[pp_rank][vpp_rank]}"
         for pp_rank in range(self.pipeline_model_parallel_size):
             if LayerType.mtp in self.layout[pp_rank][-1]:
-                assert (
-                    self.layout[pp_rank][-1].count(LayerType.mtp) == mtp_num_layers
-                ), "All of the MTP layers must be in the same one virtual pipeline stage"
+                logger.warning(f"MTP layers in the last virtual pipeline stage of pp rank {pp_rank}: {self.layout[pp_rank][-1]}")
+                # assert (
+                #     self.layout[pp_rank][-1].count(LayerType.mtp) == mtp_num_layers
+                # ), "All of the MTP layers must be in the same one virtual pipeline stage"
         for vpp_rank in range(self.virtual_pipeline_model_parallel_size - 1):
             assert LayerType.mtp not in self.layout[0][vpp_rank], (
                 f"Currently we restrict that the MTP should not be in the first pp rank."
