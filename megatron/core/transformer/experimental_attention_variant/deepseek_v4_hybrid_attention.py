@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+
 from dataclasses import dataclass
 from typing import NoReturn, Optional, Union
 
@@ -19,11 +20,11 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.csa_cp_utils import (
-    DSV4_CP_PARTITION_PACKED_STREAM_TWO_CHUNK,
-    apply_thd_cp_chunks_rope_fused,
-    apply_thd_chunked_cp_rope_fused,
-    chunked_cp_partition,
-    exchange_chunked_left_boundary_tensor,
+    DSV4_CP_PARTITION_TWO_CHUNK,
+    apply_thd_cp_two_chunk_rope_fused,
+    apply_thd_cp_local_rope_fused,
+    two_chunk_cp_partition,
+    exchange_two_chunk_left_boundary_tensor,
     exchange_left_boundary_tensor,
     normalize_dsv4_cp_partition_mode,
 )
@@ -37,6 +38,7 @@ try:
     from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
 except Exception:
     fused_mla_rope_inplace = None
+
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TELinear, set_save_original_input
@@ -223,15 +225,15 @@ class DSv4HybridAttention(Attention):
         d_comp = max((8 if ratio == 4 else ratio for ratio in ratios), default=0)
         return max(self.config.csa_window_size, d_comp)
 
-    def _use_packed_stream_two_chunk_cp_partition(self) -> bool:
+    def _use_two_chunk_cp_partition(self) -> bool:
         mode = normalize_dsv4_cp_partition_mode(
             getattr(self.config, "dsv4_cp_partition_mode", None)
         )
-        return mode == DSV4_CP_PARTITION_PACKED_STREAM_TWO_CHUNK
+        return mode == DSV4_CP_PARTITION_TWO_CHUNK
 
-    def _packed_stream_two_chunk_cp_ranges(self, l_local: int):
+    def _two_chunk_cp_ranges(self, l_local: int):
         cp_group = self.pg_collection.cp
-        return chunked_cp_partition(l_local * cp_group.size(), cp_group.size(), cp_group.rank())
+        return two_chunk_cp_partition(l_local * cp_group.size(), cp_group.size(), cp_group.rank())
 
     def _exchange_cp_boundary_hidden(
         self, hidden_states: torch.Tensor, d_window: int
@@ -239,8 +241,8 @@ class DSv4HybridAttention(Attention):
         # Pass the full local buffer so the custom backward writes tail grads
         # directly instead of routing them through an outer SliceBackward copy.
         hidden_flat = hidden_states.view(hidden_states.shape[0], -1)
-        if self._use_packed_stream_two_chunk_cp_partition():
-            boundary_hidden = exchange_chunked_left_boundary_tensor(
+        if self._use_two_chunk_cp_partition():
+            boundary_hidden = exchange_two_chunk_left_boundary_tensor(
                 hidden_flat, d_window, self.pg_collection.cp
             )
             local_chunks = 2 if self.pg_collection.cp.size() > 1 else 1
@@ -259,11 +261,11 @@ class DSv4HybridAttention(Attention):
         packed_seq_params,
         l_local: int,
     ) -> torch.Tensor:
-        if self._use_packed_stream_two_chunk_cp_partition():
-            chunk_ranges = self._packed_stream_two_chunk_cp_ranges(l_local)
+        if self._use_two_chunk_cp_partition():
+            chunk_ranges = self._two_chunk_cp_ranges(l_local)
             if boundary_hidden.shape[0] % len(chunk_ranges) != 0:
                 raise RuntimeError(
-                    "DSv4 packed-stream two-chunk CP boundary projection got invalid boundary rows: "
+                    "DSv4 two-chunk CP boundary projection got invalid boundary rows: "
                     f"boundary={boundary_hidden.shape[0]}, chunks={len(chunk_ranges)}."
                 )
             d_window = boundary_hidden.shape[0] // len(chunk_ranges)
@@ -296,7 +298,7 @@ class DSv4HybridAttention(Attention):
         )
         cp_rank = self.pg_collection.cp.rank()
         if chunk_ranges is None:
-            boundary_key = apply_thd_chunked_cp_rope_fused(
+            boundary_key = apply_thd_cp_local_rope_fused(
                 boundary_kv.unsqueeze(-2),
                 rotary_pos_cos,
                 rotary_pos_sin,
@@ -311,7 +313,7 @@ class DSv4HybridAttention(Attention):
                 remove_interleaving=True,
             )
         else:
-            boundary_key = apply_thd_cp_chunks_rope_fused(
+            boundary_key = apply_thd_cp_two_chunk_rope_fused(
                 boundary_kv.unsqueeze(-2),
                 rotary_pos_cos,
                 rotary_pos_sin,
@@ -493,20 +495,20 @@ class DSv4HybridAttention(Attention):
             cp_rank = self.pg_collection.cp.rank()
             if rope_seqlen is None:
                 raise RuntimeError("DSv4 THD CP inverse RoPE requires max_seqlen_kv.")
-            if self._use_packed_stream_two_chunk_cp_partition():
-                core_attn_out = apply_thd_cp_chunks_rope_fused(
+            if self._use_two_chunk_cp_partition():
+                core_attn_out = apply_thd_cp_two_chunk_rope_fused(
                     core_attn_out,
                     rotary_pos_cos,
                     rotary_pos_sin,
                     nope_dim,
                     pos_dim,
                     cu_seqlens_kv,
-                    self._packed_stream_two_chunk_cp_ranges(core_attn_out.shape[0]),
+                    self._two_chunk_cp_ranges(core_attn_out.shape[0]),
                     inverse=True,
                     remove_interleaving=True,
                 )
             else:
-                core_attn_out = apply_thd_chunked_cp_rope_fused(
+                core_attn_out = apply_thd_cp_local_rope_fused(
                     core_attn_out,
                     rotary_pos_cos,
                     rotary_pos_sin,
@@ -792,9 +794,9 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     # rows, so CP uses a RoPE path that recovers the real sequence
                     # position from the global packed row.
                     assert packed_seq, "DSv4 CP fused RoPE expects THD packed sequence input."
-                    if self._use_packed_stream_two_chunk_cp_partition():
-                        chunk_ranges = self._packed_stream_two_chunk_cp_ranges(q.shape[0])
-                        query = apply_thd_cp_chunks_rope_fused(
+                    if self._use_two_chunk_cp_partition():
+                        chunk_ranges = self._two_chunk_cp_ranges(q.shape[0])
+                        query = apply_thd_cp_two_chunk_rope_fused(
                             q,
                             rotary_pos_cos,
                             rotary_pos_sin,
@@ -805,7 +807,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                             remove_interleaving=True,
                         )
                         kv = kv.unsqueeze(-2)
-                        kv = apply_thd_cp_chunks_rope_fused(
+                        kv = apply_thd_cp_two_chunk_rope_fused(
                             kv,
                             rotary_pos_cos,
                             rotary_pos_sin,
@@ -818,7 +820,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                         key = kv
                         value = kv
                         return query.contiguous(), key.contiguous(), value.contiguous()
-                    rope_fn = apply_thd_chunked_cp_rope_fused
+                    rope_fn = apply_thd_cp_local_rope_fused
                 else:
                     rope_fn = fused_mla_rope_inplace
                 query = rope_fn(

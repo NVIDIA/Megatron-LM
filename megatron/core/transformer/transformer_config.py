@@ -339,7 +339,7 @@ class TransformerConfig(ModelParallelConfig):
 
     dsv4_cp_partition_mode: str = "contiguous"
     """DSv4 CP token partition mode. Supported values are ``contiguous`` and
-    ``packed_stream_two_chunk``. The latter mirrors the global packed-token stream into
+    ``two_chunk``. The latter mirrors the global packed-token stream into
     two equal chunks per rank and is intended for single-long-sequence balance tests."""
 
     apply_dsa_kernel_fusion: bool = False

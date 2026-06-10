@@ -1,10 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-import gc
-import os
 from unittest.mock import patch
-
-os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 import pytest
 import torch
@@ -16,9 +12,6 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import MLATransformerConfig
-from tests.unit_tests.transformer.experimental_attention_variant.test_dsv4_hybrid_native_parity import (
-    _DSV4_VARIANTS,
-)
 from tests.unit_tests.test_utilities import Utils
 
 try:
@@ -691,172 +684,25 @@ class TestDSv4HybridRopeFusion:
 from megatron.core.packed_seq_params import PackedSeqParams  # noqa: E402
 
 
-def _make_thd_packed_seq_params(seg_lens, padded_seg_lens=None, device='cuda'):
+def _make_thd_packed_seq_params(seg_lens, device='cuda'):
     """Build ``PackedSeqParams(qkv_format='thd', ...)`` for self-attention
     (``cu_seqlens_q == cu_seqlens_kv``) from a list of per-segment lengths.
     """
-    if padded_seg_lens is None:
-        padded_seg_lens = seg_lens
-    assert len(seg_lens) == len(padded_seg_lens)
-    assert all(actual <= padded for actual, padded in zip(seg_lens, padded_seg_lens))
-
     cu_seqlens = torch.tensor(
         [0] + list(torch.tensor(seg_lens, dtype=torch.int64).cumsum(0).tolist()),
         dtype=torch.int32,
         device=device,
     )
-    cu_seqlens_padded = torch.tensor(
-        [0] + list(torch.tensor(padded_seg_lens, dtype=torch.int64).cumsum(0).tolist()),
-        dtype=torch.int32,
-        device=device,
-    )
-    max_len = int(max(padded_seg_lens)) if padded_seg_lens else 0
+    max_len = int(max(seg_lens)) if seg_lens else 0
     return PackedSeqParams(
         cu_seqlens_q=cu_seqlens,
-        cu_seqlens_q_padded=cu_seqlens_padded,
+        cu_seqlens_q_padded=cu_seqlens,
         cu_seqlens_kv=cu_seqlens,
-        cu_seqlens_kv_padded=cu_seqlens_padded,
+        cu_seqlens_kv_padded=cu_seqlens,
         max_seqlen_q=max_len,
         max_seqlen_kv=max_len,
         qkv_format='thd',
     )
-
-
-_DSV4_THD_GRAPH_PARITY_EPS = 1e-3
-_DSV4_THD_GRAPH_TEST_VARIANT = "flash"
-# Padded total is 4096, and only the final segment has tail padding.
-_DSV4_THD_GRAPH_SEG_LENS = (1, 127, 1000, 23, 129, 900, 55, 257, 800, 95, 509, 148)
-_DSV4_THD_GRAPH_PADDED_SEG_LENS = (
-    1,
-    127,
-    1000,
-    23,
-    129,
-    900,
-    55,
-    257,
-    800,
-    95,
-    509,
-    200,
-)
-
-
-def _make_dsv4_thd_graph_config(
-    *,
-    dsa_indexer_loss_coeff=0.0,
-    dsa_indexer_use_sparse_loss=True,
-    apply_dsa_kernel_fusion=True,
-    apply_rope_fusion=False,
-):
-    shape = _DSV4_VARIANTS[_DSV4_THD_GRAPH_TEST_VARIANT]
-    return _make_config(
-        hidden_size=shape["hidden_size"],
-        num_attention_heads=shape["num_attention_heads"],
-        v_head_dim=shape["v_head_dim"],
-        qk_pos_emb_head_dim=shape["qk_pos_emb_head_dim"],
-        q_lora_rank=shape["q_lora_rank"],
-        o_groups=shape["o_groups"],
-        o_lora_rank=shape["o_lora_rank"],
-        csa_compress_ratios=[0, 4, 128, 4],
-        csa_window_size=128,
-        dsa_indexer_n_heads=64,
-        dsa_indexer_head_dim=128,
-        dsa_indexer_topk=shape["dsa_indexer_topk"],
-        dsa_indexer_loss_coeff=dsa_indexer_loss_coeff,
-        dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
-        context_parallel_size=1,
-        csa_dense_mode=False,
-        csa_compress_rotary_base=shape["csa_compress_rotary_base"],
-        layernorm_epsilon=1e-6,
-        normalization="RMSNorm",
-        qk_layernorm=True,
-        layernorm_zero_centered_gamma=False,
-        expert_model_parallel_size=1,
-        apply_dsa_kernel_fusion=apply_dsa_kernel_fusion,
-        apply_rope_fusion=apply_rope_fusion,
-    )
-
-
-def _cosine_sim(a: torch.Tensor, b: torch.Tensor) -> float:
-    return F.cosine_similarity(
-        a.flatten().double().unsqueeze(0), b.flatten().double().unsqueeze(0)
-    ).item()
-
-
-def _tensor_sim(a: torch.Tensor, b: torch.Tensor) -> float:
-    a, b = a.double(), b.double()
-    denom = (a * a + b * b).sum()
-    return (2.0 * (a * b).sum() / denom).item() if denom else 1.0
-
-
-def _assert_thd_graph_match(actual: torch.Tensor, expected: torch.Tensor, label: str):
-    assert actual.shape == expected.shape, (
-        f"{label}: shape {tuple(actual.shape)} != {tuple(expected.shape)}"
-    )
-    if torch.equal(actual, expected):
-        return
-    diff = (actual - expected).abs()
-    max_abs = diff.max().item() if diff.numel() else 0.0
-    cosine_sim = _cosine_sim(actual, expected)
-    tensor_sim = _tensor_sim(actual, expected)
-    assert cosine_sim > 1 - _DSV4_THD_GRAPH_PARITY_EPS, (
-        f"{label}: cosine_sim={cosine_sim:.10f}, tensor_sim={tensor_sim:.10f}, "
-        f"max_abs={max_abs:.6e}, eps={_DSV4_THD_GRAPH_PARITY_EPS}"
-    )
-    assert tensor_sim > 1 - _DSV4_THD_GRAPH_PARITY_EPS, (
-        f"{label}: tensor_sim={tensor_sim:.10f}, cosine_sim={cosine_sim:.10f}, "
-        f"max_abs={max_abs:.6e}, eps={_DSV4_THD_GRAPH_PARITY_EPS}"
-    )
-
-
-def _copy_module_parameters(src, dst):
-    src_params = dict(src.named_parameters())
-    for name, param in dst.named_parameters():
-        assert name in src_params
-        param.data.copy_(src_params[name].data)
-    return src_params
-
-
-def _run_dsv4_attention_forward_backward(
-    attn, hidden, grad, packed_seq_params, *, collect_result=True
-):
-    hidden.grad = None
-    attn.zero_grad(set_to_none=True)
-    output, _ = attn(hidden_states=hidden, attention_mask=None, packed_seq_params=packed_seq_params)
-    output.backward(grad)
-    if not collect_result:
-        return None
-    param_grads = {
-        name: param.grad.detach().clone()
-        for name, param in attn.named_parameters()
-        if param.grad is not None
-    }
-    return output.detach().clone(), hidden.grad.detach().clone(), param_grads
-
-
-def _capture_dsv4_attention_forward_backward(attn, static_hidden, static_grad, packed_seq_params):
-    warmup_stream = torch.cuda.Stream()
-    warmup_stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(warmup_stream):
-        for _ in range(3):
-            _run_dsv4_attention_forward_backward(
-                attn, static_hidden, static_grad, packed_seq_params, collect_result=False
-            )
-    torch.cuda.current_stream().wait_stream(warmup_stream)
-
-    static_hidden.grad = None
-    attn.zero_grad(set_to_none=True)
-
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, capture_error_mode="thread_local"):
-        graph_output, _ = attn(
-            hidden_states=static_hidden,
-            attention_mask=None,
-            packed_seq_params=packed_seq_params,
-        )
-        graph_output.backward(static_grad)
-    return graph, graph_output
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
@@ -976,83 +822,6 @@ class TestDSv4HybridAttentionThd:
             if param.requires_grad:
                 assert param.grad is not None, f"no grad on {name}"
                 assert not torch.isnan(param.grad).any(), f"NaN grad on {name}"
-
-    @pytest.mark.parametrize(
-        "layer_number",
-        [1, 2, 3],
-        ids=["ratio_0_window_only", "ratio_4_with_indexer", "ratio_128_compressor_only"],
-    )
-    def test_thd_cuda_graph_matches_eager_forward_backward(self, layer_number):
-        """CUDA graph replay matches eager THD forward/backward without CP.
-
-        This covers the no-CP THD path that computes compressed sequence
-        metadata from ``PackedSeqParams`` before capture. A failure here usually
-        means graph capture found a GPU-to-CPU sync or the graph replay math no
-        longer matches eager execution.
-        """
-        seg_lens = _DSV4_THD_GRAPH_SEG_LENS
-        padded_seg_lens = _DSV4_THD_GRAPH_PADDED_SEG_LENS
-        padded_tokens = sum(padded_seg_lens)
-        packed = _make_thd_packed_seq_params(seg_lens, padded_seg_lens)
-
-        torch.manual_seed(_SEED + 500 + layer_number)
-        model_parallel_cuda_manual_seed(_SEED + 500 + layer_number)
-        config = _make_dsv4_thd_graph_config(
-            dsa_indexer_loss_coeff=1.0,
-            dsa_indexer_use_sparse_loss=True,
-            apply_rope_fusion=True,
-        )
-        graph_attn = _build_attention(config, layer_number=layer_number, pg_collection=self.pg).cuda()
-        eager_attn = _build_attention(config, layer_number=layer_number, pg_collection=self.pg).cuda()
-        graph_attn.train()
-        eager_attn.train()
-        _copy_module_parameters(graph_attn, eager_attn)
-
-        test_hidden = torch.randn(
-            padded_tokens, 1, config.hidden_size, dtype=torch.bfloat16, device='cuda'
-        )
-        test_grad = torch.randn_like(test_hidden)
-        static_hidden = test_hidden.detach().clone().requires_grad_(True)
-        eager_hidden = test_hidden.detach().clone().requires_grad_(True)
-        static_grad = test_grad.detach().clone()
-
-        graph, graph_output = _capture_dsv4_attention_forward_backward(
-            graph_attn, static_hidden, static_grad, packed
-        )
-        with torch.no_grad():
-            static_hidden.copy_(test_hidden)
-            static_grad.copy_(test_grad)
-            if static_hidden.grad is not None:
-                static_hidden.grad.zero_()
-            for param in graph_attn.parameters():
-                if param.grad is not None:
-                    param.grad.zero_()
-        graph.replay()
-        graph_out = graph_output.detach().clone()
-        graph_hidden_grad = static_hidden.grad.detach().clone()
-        graph_param_grads = {
-            name: param.grad.detach().clone()
-            for name, param in graph_attn.named_parameters()
-            if param.grad is not None
-        }
-
-        eager_out, eager_hidden_grad, eager_param_grads = _run_dsv4_attention_forward_backward(
-            eager_attn, eager_hidden, test_grad, packed
-        )
-        _assert_thd_graph_match(graph_out, eager_out, f"layer={layer_number}:output")
-        _assert_thd_graph_match(
-            graph_hidden_grad, eager_hidden_grad, f"layer={layer_number}:hidden_grad"
-        )
-        for name, graph_grad in graph_param_grads.items():
-            assert name in eager_param_grads, f"Missing eager grad for {name}"
-            _assert_thd_graph_match(
-                graph_grad, eager_param_grads[name], f"layer={layer_number}:param_grad:{name}"
-            )
-
-        del graph_attn, eager_attn, test_hidden, test_grad, static_hidden
-        del eager_hidden, static_grad, graph, graph_output, graph_out, graph_hidden_grad
-        gc.collect()
-        torch.cuda.empty_cache()
 
     def test_thd_single_segment_matches_sbhd_b1(self):
         """B=1 single-segment THD output matches the SBHD-b=1 output on

@@ -15,32 +15,26 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.csa_cp_utils import (
-    SINGLE_RANK_CP_GROUP,
-    DSV4_CP_PARTITION_PACKED_STREAM_TWO_CHUNK,
+    DSV4_CP_PARTITION_TWO_CHUNK,
     all_gather_fixed_cp_tensor,
-    apply_cp_compressed_rope_fused,
-    apply_thd_cp_chunks_rope_fused,
-    apply_thd_chunked_cp_rope_fused,
-    apply_thd_overlap_transform_fused,
-    build_chunked_compressor_prep_compact_fused,
-    build_chunked_cp_flat_idxs_for_indexer_loss_fused,
-    build_chunked_cp_flat_idxs_fused,
-    build_chunked_rank_major_compressed_metadata_fused,
+    apply_thd_cp_compressed_rope_fused,
+    apply_thd_cp_two_chunk_rope_fused,
+    apply_thd_cp_local_rope_fused,
+    build_two_chunk_compressor_prep_compact_fused,
+    build_two_chunk_cp_flat_idxs_for_indexer_loss_fused,
+    build_two_chunk_cp_flat_idxs_fused,
+    build_two_chunk_rank_major_compressed_metadata_fused,
     build_compressor_prep_compact_fused,
     build_cp_flat_idxs_for_indexer_loss_fused,
     build_cp_flat_idxs_fused,
     build_cp_indexer_topk_inputs_fused,
     build_global_compressed_cu_seqlens_fused,
     build_rank_major_compressed_metadata_fused,
-    can_use_csa_cp_fused_kernels,
-    chunked_cp_partition,
-    compute_chunked_cp_indexer_topk_logical_fused,
-    cp_group_rank,
-    cp_group_size,
+    two_chunk_cp_partition,
+    compute_two_chunk_cp_indexer_topk_logical_fused,
     normalize_dsv4_cp_partition_mode,
-    pack_chunked_cp_kv_full_fused,
+    pack_two_chunk_cp_kv_full_fused,
     pack_cp_kv_full_fused,
-    pad_indexer_topk_to_fixed_width_fused,
     repack_rank_major_compressed_to_seq_major_fused,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa import (
@@ -356,39 +350,6 @@ def cat_per_segment(
 # ---------------------------------------------------------------------------
 
 
-def apply_rope_at_positions(
-    x: torch.Tensor,
-    nope_dim: int,
-    pos_dim: int,
-    rotary_pos_emb_module: RotaryEmbedding,
-    config: TransformerConfig,
-    positions: torch.Tensor,
-    inverse: bool = False,
-    max_position: Optional[int] = None,
-) -> torch.Tensor:
-    """Apply DSv4 RoPE with explicit sequence-local positions."""
-    if x.shape[0] == 0:
-        return x
-    max_pos = max_position if max_position is not None else (
-        int(positions.max().item()) + 1 if positions.numel() > 0 else 0
-    )
-    # Explicit-position CP path prioritizes reference-grade parity over the
-    # fused MLA RoPE kernel's bf16 accumulation differences.
-    rope_result = rotary_pos_emb_module(max_pos, packed_seq=True, cp_group=SINGLE_RANK_CP_GROUP)
-    rotary_pos_emb = rope_result[0] if isinstance(rope_result, tuple) else rope_result
-    rotary_pos_emb = rotary_pos_emb.index_select(0, positions.to(torch.long))
-    return _apply_unfused_rope(
-        x,
-        rotary_pos_emb,
-        nope_dim,
-        pos_dim,
-        config,
-        cu_seqlens=None,
-        cp_group=SINGLE_RANK_CP_GROUP,
-        inverse=inverse,
-    )
-
-
 def _get_dsv4_cp_rope_cos_sin(
     rotary_pos_emb_module: RotaryEmbedding,
     max_position: int,
@@ -401,12 +362,11 @@ def _get_dsv4_cp_rope_cos_sin(
         int(max_position),
         dtype=dtype,
         packed_seq=True,
-        cp_group=SINGLE_RANK_CP_GROUP,
         mscale=1.0,
     )
 
 
-def apply_thd_chunked_cp_rope(
+def apply_thd_cp_local_rope(
     x: torch.Tensor,
     nope_dim: int,
     pos_dim: int,
@@ -425,7 +385,7 @@ def apply_thd_chunked_cp_rope(
 ) -> torch.Tensor:
     """Apply DSv4 THD CP RoPE without building explicit positions."""
     cos, sin = _get_dsv4_cp_rope_cos_sin(rotary_pos_emb_module, max_position, x.dtype)
-    return apply_thd_chunked_cp_rope_fused(
+    return apply_thd_cp_local_rope_fused(
         x,
         cos,
         sin,
@@ -444,7 +404,7 @@ def apply_thd_chunked_cp_rope(
     )
 
 
-def apply_cp_compressed_rope(
+def apply_thd_cp_compressed_rope(
     x: torch.Tensor,
     nope_dim: int,
     pos_dim: int,
@@ -456,7 +416,7 @@ def apply_cp_compressed_rope(
 ) -> torch.Tensor:
     """Apply DSv4 compressed-row RoPE from compressor group ids."""
     cos, sin = _get_dsv4_cp_rope_cos_sin(rotary_pos_emb_module, max_position, x.dtype)
-    return apply_cp_compressed_rope_fused(
+    return apply_thd_cp_compressed_rope_fused(
         x,
         cos,
         sin,
@@ -1027,20 +987,22 @@ class Compressor(MegatronModule):
         Input shape:  [total_comp, ratio, b, coff * head_dim]
         Output shape: [total_comp, 2 * ratio, b, head_dim]
         """
-        if can_use_csa_cp_fused_kernels(tensor, is_first_in_seg):
-            return apply_thd_overlap_transform_fused(
-                tensor, is_first_in_seg, self.head_dim, fill_value
-            )
-
-        n, ratio, b_dim, _ = tensor.size()
+        n_groups, ratio = tensor.shape[:2]
         d = self.head_dim
-        new_tensor = tensor.new_full((n, 2 * ratio, b_dim, d), fill_value)
-        new_tensor[:, ratio:] = tensor[:, :, :, d:]
-        # Previous group's first-half data — shift by 1 along dim-0.
-        prev_data = torch.roll(tensor[:, :, :, :d], shifts=1, dims=0)
-        # Zero-fill (or fill_value-fill) segment boundaries.
-        prev_data[is_first_in_seg] = fill_value
-        new_tensor[:, :ratio] = prev_data
+        new_tensor = tensor.new_full(
+            (n_groups, 2 * ratio) + tuple(tensor.shape[2:-1]) + (d,),
+            fill_value,
+        )
+        new_tensor[:, ratio:] = tensor[..., d:]
+        if n_groups > 1:
+            valid_prev = (~is_first_in_seg[1:n_groups]).view(
+                n_groups - 1, *([1] * (tensor.ndim - 1))
+            )
+            new_tensor[1:, :ratio] = torch.where(
+                valid_prev,
+                tensor[:-1, ..., :d],
+                new_tensor[1:, :ratio],
+            )
         return new_tensor
 
     def _gated_pool_one_segment(
@@ -1140,13 +1102,19 @@ class Compressor(MegatronModule):
             ``cu_seqlens_compressed[b+1] - cu_seqlens_compressed[b] = seqlen_b // ratio``.
         """
         ratio = self.compress_ratio
-        cp_group = self.pg_collection.cp if cp_group is None else cp_group
         device = x.device
         dtype = x.dtype
 
         if pre_grouped_compact_input:
             if fixed_total_comp is None:
                 raise RuntimeError("pre_grouped_compact_input requires fixed_total_comp.")
+            if rope_positions is None:
+                raise RuntimeError(
+                    "pre_grouped_compact_input requires rope_positions because CP compacted "
+                    "compressor rows are not in ordinary THD sequence order."
+                )
+            if max_seqlen_q is None:
+                raise RuntimeError("pre_grouped_compact_input requires max_seqlen_q for RoPE.")
             expected_rows = int(fixed_total_comp) * ratio
             if x.shape[0] != expected_rows:
                 raise RuntimeError(
@@ -1226,6 +1194,7 @@ class Compressor(MegatronModule):
 
         if rope_positions is None:
             # RoPE: applied in a single vectorized THD call.
+            cp_group = self.pg_collection.cp if cp_group is None else cp_group
             max_seqlen_rope = (max_seqlen_q // ratio) * ratio if max_seqlen_q is not None else None
             compressed_thd = _apply_rope(
                 compressed_thd,
@@ -1247,7 +1216,7 @@ class Compressor(MegatronModule):
                 )
             if max_seqlen_q is None:
                 raise RuntimeError("DSv4 THD CP compressed RoPE requires max_seqlen_q.")
-            compressed_thd = apply_cp_compressed_rope(
+            compressed_thd = apply_thd_cp_compressed_rope(
                 compressed_thd,
                 self.head_dim - self.qk_pos_emb_head_dim,
                 self.qk_pos_emb_head_dim,
@@ -1416,7 +1385,7 @@ class CSAIndexer(MegatronModule):
         q, _ = self.linear_wq_b(qr)
         q = q.reshape(sq, bsz, self.index_n_heads, self.index_head_dim).squeeze(1)
         if chunk_ranges is None:
-            q = apply_thd_chunked_cp_rope(
+            q = apply_thd_cp_local_rope(
                 q,
                 self.index_head_dim - self.qk_pos_emb_head_dim,
                 self.qk_pos_emb_head_dim,
@@ -1429,7 +1398,7 @@ class CSAIndexer(MegatronModule):
             )
         else:
             cos, sin = _get_dsv4_cp_rope_cos_sin(self.rotary_pos_emb, max_position, q.dtype)
-            q = apply_thd_cp_chunks_rope_fused(
+            q = apply_thd_cp_two_chunk_rope_fused(
                 q,
                 cos,
                 sin,
@@ -1843,7 +1812,7 @@ class CompressedSparseAttention(MegatronModule):
         offset: int,
         window_idxs: torch.Tensor,
     ) -> torch.Tensor:
-        """Path A: fused sparse attn with window or deterministic compressed indices."""
+        """Fused sparse attention with window or deterministic compressed indices."""
         sq, b, np, hn = query.size()
 
         nvtx_range_push("compressed_indices")
@@ -1874,7 +1843,7 @@ class CompressedSparseAttention(MegatronModule):
         window_idxs: torch.Tensor,
         packed_seq_params: Optional[PackedSeqParams],
     ) -> torch.Tensor:
-        """Path C: separate indexer forward (no loss) + fused sparse attn (compact)."""
+        """Separate indexer forward without loss, followed by fused sparse attention."""
         b = query.size(1)
 
         nvtx_range_push("compressed_indices")
@@ -1920,7 +1889,7 @@ class CompressedSparseAttention(MegatronModule):
         window_idxs: torch.Tensor,
         packed_seq_params: Optional[PackedSeqParams],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Path B: fused indexer (with loss) + fused sparse attn.
+        """Fused indexer loss and fused sparse attention.
 
         Returns ``(output, indexer_loss)``.
         """
@@ -2088,7 +2057,7 @@ class CompressedSparseAttention(MegatronModule):
                     )
                     if k_indexer is None:
                         raise RuntimeError(
-                            "CompressedSparseAttention THD unfused Path B requires "
+                            "CompressedSparseAttention THD unfused indexer-loss mode requires "
                             "at least one segment with compressed indexer K."
                         )
                     q_thd = q_indexer.squeeze(1)
@@ -2197,8 +2166,7 @@ class CompressedSparseAttention(MegatronModule):
         window_idxs: torch.Tensor,
         max_seqlen_q: int = 0,
     ) -> torch.Tensor:
-        """Path A (THD): fused sparse attn with window or deterministic
-        compressed indices.
+        """THD fused sparse attention with window or deterministic compressed indices.
 
         Returns ``(total_q, 1, np * hn)`` — the attention output.
         """
@@ -2248,7 +2216,7 @@ class CompressedSparseAttention(MegatronModule):
         max_seqlen_q: int,
         max_seqlen_kv: int,
     ) -> torch.Tensor:
-        """Path C (THD): separate indexer forward (no loss) + fused sparse attn (compact).
+        """THD separate indexer forward without loss, followed by fused sparse attention.
 
         Returns ``(total_q, 1, np * hn)`` — the attention output.
         """
@@ -2328,7 +2296,7 @@ class CompressedSparseAttention(MegatronModule):
         kv_full_thd: torch.Tensor,
         window_idxs: torch.Tensor,
     ) -> torch.Tensor:
-        """Path B (THD): fused indexer (with loss) + fused sparse attn.
+        """THD fused indexer loss and fused sparse attention.
 
         Returns ``(output, indexer_loss)`` where *output* is
         ``(total_q, 1, np * hn)``.
@@ -2343,7 +2311,7 @@ class CompressedSparseAttention(MegatronModule):
         )
         if k_indexer is None:
             raise RuntimeError(
-                "CompressedSparseAttention THD Path B requires at least "
+                "CompressedSparseAttention THD fused indexer-loss mode requires at least "
                 "one segment with compressed indexer K; got none. (Should "
                 "be unreachable when ``n_compressed_total > 0``.)"
             )
@@ -2401,8 +2369,8 @@ class CompressedSparseAttention(MegatronModule):
     ) -> torch.Tensor:
         """Static THD context-parallel path."""
         cp_group = self.pg_collection.cp
-        cp_size = cp_group_size(cp_group)
-        cp_rank = cp_group_rank(cp_group)
+        cp_size = 1 if cp_group is None else cp_group.size()
+        cp_rank = 0 if cp_group is None else cp_group.rank()
         if cp_size <= 1:
             return self._forward_thd(query, key, x, qr, packed_seq_params)
 
@@ -2426,20 +2394,20 @@ class CompressedSparseAttention(MegatronModule):
         cp_partition_mode = normalize_dsv4_cp_partition_mode(
             getattr(self.config, "dsv4_cp_partition_mode", None)
         )
-        use_chunked_cp_partition = (
-            cp_partition_mode == DSV4_CP_PARTITION_PACKED_STREAM_TWO_CHUNK
+        use_two_chunk_cp_partition = (
+            cp_partition_mode == DSV4_CP_PARTITION_TWO_CHUNK
         )
-        if use_chunked_cp_partition:
-            chunk_ranges = chunked_cp_partition(l_local * cp_size, cp_size, cp_rank)
+        if use_two_chunk_cp_partition:
+            chunk_ranges = two_chunk_cp_partition(l_local * cp_size, cp_size, cp_rank)
             chunk_lengths = [int(end) - int(start) for start, end in chunk_ranges]
             if sum(chunk_lengths) != l_local:
                 raise RuntimeError(
-                    "DSv4 packed-stream two-chunk CP partition must cover exactly L_local rows: "
+                    "DSv4 two-chunk CP partition must cover exactly L_local rows: "
                     f"chunks={chunk_lengths}, L_local={l_local}."
                 )
             if len(set(chunk_lengths)) != 1:
                 raise RuntimeError(
-                    "DSv4 packed-stream two-chunk CP partition expects equal-size chunks: "
+                    "DSv4 two-chunk CP partition expects equal-size chunks: "
                     f"chunk_lengths={chunk_lengths}."
                 )
             chunk_len = chunk_lengths[0]
@@ -2455,24 +2423,15 @@ class CompressedSparseAttention(MegatronModule):
                 "the hidden-only boundary exchange and boundary KV projection path."
             )
         boundary_kv = boundary_key.squeeze(-2).squeeze(1)
-        if use_chunked_cp_partition:
+        if use_two_chunk_cp_partition:
             if boundary_hidden.shape[0] % len(chunk_ranges) != 0:
                 raise RuntimeError(
-                    "DSv4 packed-stream two-chunk CP boundary rows must be divisible by chunk count: "
+                    "DSv4 two-chunk CP boundary rows must be divisible by chunk count: "
                     f"boundary={boundary_hidden.shape[0]}, chunks={len(chunk_ranges)}."
                 )
             d_window = boundary_hidden.shape[0] // len(chunk_ranges)
         else:
             d_window = boundary_hidden.shape[0]
-        use_cp_fused_layout = can_use_csa_cp_fused_kernels(
-            query, kv_local, boundary_kv, boundary_hidden, cu_seqlens_q
-        )
-        if not use_cp_fused_layout:
-            raise RuntimeError(
-                "DSv4 THD CP production path requires CUDA tensors and CuTeDSL CP layout kernels. "
-                "Use csa_cp_utils reference helpers directly in focused tests."
-            )
-
         compressed_rank_major = kv_local.new_empty((0, kv_local.shape[-1]))
         cu_seqlens_compressed = None
         seq_ids_rank_major = torch.empty((0,), dtype=torch.int32, device=device)
@@ -2494,7 +2453,7 @@ class CompressedSparseAttention(MegatronModule):
                 cu_seqlens_kv, self.compress_ratio
             )
             global_compressed_capacity = (l_local * cp_size) // self.compress_ratio
-            if use_chunked_cp_partition:
+            if use_two_chunk_cp_partition:
                 (
                     hidden_compact,
                     cu_compact,
@@ -2503,7 +2462,7 @@ class CompressedSparseAttention(MegatronModule):
                     _valid_local,
                     c_cap,
                     c_cap_per_chunk,
-                ) = build_chunked_compressor_prep_compact_fused(
+                ) = build_two_chunk_compressor_prep_compact_fused(
                     x,
                     boundary_hidden,
                     cu_seqlens_kv,
@@ -2531,9 +2490,9 @@ class CompressedSparseAttention(MegatronModule):
                     d_window,
                 )
                 c_cap_per_chunk = c_cap
-            if use_chunked_cp_partition:
+            if use_two_chunk_cp_partition:
                 seq_ids_rank_major, comp_ids_rank_major, valid_rank_major = (
-                    build_chunked_rank_major_compressed_metadata_fused(
+                    build_two_chunk_rank_major_compressed_metadata_fused(
                         cu_seqlens_kv,
                         cp_size,
                         chunk_len,
@@ -2551,7 +2510,6 @@ class CompressedSparseAttention(MegatronModule):
                         self.compress_ratio,
                         d_comp,
                         c_cap,
-                        device,
                     )
                 )
 
@@ -2579,7 +2537,7 @@ class CompressedSparseAttention(MegatronModule):
                         cp_size,
                         l_local,
                         max_seqlen_q,
-                        chunk_ranges=chunk_ranges if use_chunked_cp_partition else None,
+                        chunk_ranges=chunk_ranges if use_two_chunk_cp_partition else None,
                     )
                 )
 
@@ -2588,7 +2546,6 @@ class CompressedSparseAttention(MegatronModule):
                     indexer_hidden_compact,
                     cu_compact,
                     max_seqlen_q=max_seqlen_q,
-                    cp_group=SINGLE_RANK_CP_GROUP,
                     rope_positions=comp_ids_local,
                     fixed_total_comp=c_cap,
                     pre_grouped_compact_input=True,
@@ -2609,15 +2566,15 @@ class CompressedSparseAttention(MegatronModule):
                         comp_ids_rank_major,
                         valid_rank_major,
                         cu_seqlens_compressed,
-                        output_capacity=global_compressed_capacity,
+                        seq_major_rows=global_compressed_capacity,
                     )
                 )
                 max_seqlen_compressed_idx = max_seqlen_q // self.compress_ratio
                 topk_width = self.indexer.index_topk if max_seqlen_compressed_idx > 0 else 0
                 if topk_width == 0 or k_indexer_seq_major.shape[0] == 0:
                     indexer_topk_logical = None
-                elif use_chunked_cp_partition:
-                    indexer_topk_logical = compute_chunked_cp_indexer_topk_logical_fused(
+                elif use_two_chunk_cp_partition:
+                    indexer_topk_logical = compute_two_chunk_cp_indexer_topk_logical_fused(
                         q_indexer_cp,
                         weights_indexer_cp,
                         k_indexer_seq_major,
@@ -2674,16 +2631,18 @@ class CompressedSparseAttention(MegatronModule):
                             precomputed_seq_lens=seq_lens_topk,
                         )
                     if indexer_topk_logical.shape[-1] < topk_width:
-                        indexer_topk_logical = pad_indexer_topk_to_fixed_width_fused(
-                            indexer_topk_logical,
-                            topk_width,
+                        pad = torch.full(
+                            (l_local, topk_width - indexer_topk_logical.shape[-1]),
+                            -1,
+                            dtype=torch.int32,
+                            device=device,
                         )
+                        indexer_topk_logical = torch.cat([indexer_topk_logical, pad], dim=-1)
 
             compressed_kv_local, _ = self.compressor._forward_thd(
                 hidden_compact,
                 cu_compact,
                 max_seqlen_q=max_seqlen_q,
-                cp_group=SINGLE_RANK_CP_GROUP,
                 rope_positions=comp_ids_local,
                 fixed_total_comp=c_cap,
                 pre_grouped_compact_input=True,
@@ -2697,7 +2656,7 @@ class CompressedSparseAttention(MegatronModule):
             compressed_fixed = compressed_kv_local.squeeze(1)
             compressed_rank_major = all_gather_fixed_cp_tensor(compressed_fixed, cp_group)
             if (
-                use_chunked_cp_partition
+                use_two_chunk_cp_partition
                 and indexer_rank_by_seq_major is None
                 and cu_seqlens_compressed is not None
                 and compressed_rank_major.shape[0] > 0
@@ -2709,7 +2668,7 @@ class CompressedSparseAttention(MegatronModule):
                         comp_ids_rank_major,
                         valid_rank_major,
                         cu_seqlens_compressed,
-                        output_capacity=global_compressed_capacity,
+                        seq_major_rows=global_compressed_capacity,
                     )
                 )
 
@@ -2721,30 +2680,17 @@ class CompressedSparseAttention(MegatronModule):
         )
 
         shared_compressed_base = None
-        if use_chunked_cp_partition:
-            kv_full_thd, kv_full_offsets = pack_chunked_cp_kv_full_fused(
+        if use_two_chunk_cp_partition:
+            kv_full_thd, _ = pack_two_chunk_cp_kv_full_fused(
                 kv_local,
                 boundary_kv,
                 compressed_rank_major,
-                seq_ids_rank_major,
-                comp_ids_rank_major,
-                valid_rank_major,
                 cu_seqlens_kv,
                 chunk_ranges,
                 d_window,
-                self.compress_ratio,
-                rank_major_by_seq_major=indexer_rank_by_seq_major,
-                cu_seqlens_compressed=cu_seqlens_compressed,
             )
-            if (
-                self.compress_ratio > 1
-                and compressed_rank_major.shape[0] > 0
-                and indexer_rank_by_seq_major is not None
-                and cu_seqlens_compressed is not None
-            ):
-                shared_compressed_base = kv_full_thd.shape[0] - compressed_rank_major.shape[0]
+            shared_compressed_base = kv_full_thd.shape[0] - compressed_rank_major.shape[0]
         else:
-            kv_full_offsets = None
             kv_full_thd = pack_cp_kv_full_fused(
                 kv_local,
                 boundary_kv,
@@ -2761,13 +2707,12 @@ class CompressedSparseAttention(MegatronModule):
                 cu_seqlens_compressed=cu_seqlens_compressed,
             )
         if indexer_training_enabled:
-            if use_chunked_cp_partition:
+            if use_two_chunk_cp_partition:
                 topk_idxs, indexer_topk_rank_major = (
-                    build_chunked_cp_flat_idxs_for_indexer_loss_fused(
+                    build_two_chunk_cp_flat_idxs_for_indexer_loss_fused(
                         cu_seqlens_q,
                         cu_seqlens_compressed,
                         chunk_ranges,
-                        kv_full_offsets,
                         d_window,
                         self.window_size,
                         self.compress_ratio,
@@ -2836,11 +2781,10 @@ class CompressedSparseAttention(MegatronModule):
             if self.compress_ratio > 1 and indexer_topk_logical is None
             else 0
         )
-        if use_chunked_cp_partition:
-            topk_idxs, topk_length = build_chunked_cp_flat_idxs_fused(
+        if use_two_chunk_cp_partition:
+            topk_idxs, topk_length = build_two_chunk_cp_flat_idxs_fused(
                 cu_seqlens_q,
                 chunk_ranges,
-                kv_full_offsets,
                 d_window,
                 self.window_size,
                 self.compress_ratio,
@@ -2897,17 +2841,17 @@ class CompressedSparseAttention(MegatronModule):
 
         Performs common setup (shape validation, per-segment compression,
         full-KV layout construction, window indices) then dispatches to
-        one of three per-path helpers:
+        one of three branches:
 
         * :meth:`_forward_fused_no_indexer_thd` — window-only / window + all-compressed.
         * :meth:`_forward_fused_indexer_training_thd` — training + indexer + loss (returns
           directly with attached indexer loss).
         * :meth:`_forward_fused_indexer_inference_thd` — inference + indexer (no loss).
 
-        Paths A and C return ``compress_topk_idxs`` which are globalized
-        and fed to the fused/unfused sparse attention in Step 5 below.
+        The no-indexer-loss branches return ``compress_topk_idxs`` which are
+        globalized and fed to the fused/unfused sparse attention in Step 5 below.
         """
-        if cp_group_size(self.pg_collection.cp) > 1:
+        if self.pg_collection.cp is not None and self.pg_collection.cp.size() > 1:
             return self._forward_thd_cp(
                 query, key, x, qr, packed_seq_params, boundary_hidden, boundary_key
             )

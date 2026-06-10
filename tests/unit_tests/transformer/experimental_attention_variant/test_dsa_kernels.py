@@ -862,7 +862,7 @@ class TestDsaSparseAttn:
 
 
 # ---------------------------------------------------------------------------
-# fused_indexer_sparse_attn — Path B autograd Function (mocked)
+# fused_indexer_sparse_attn — fused indexer-loss autograd Function (mocked)
 # ---------------------------------------------------------------------------
 
 
@@ -1093,7 +1093,7 @@ def _install_full_dsa_mock_dense(
 
 
 class TestFusedIndexerSparseAttn:
-    """End-to-end numerical tests for the Path B autograd Function with all
+    """End-to-end numerical tests for the fused indexer-loss autograd Function with all
     underlying CUDA kernels mocked.
     """
 
@@ -1300,7 +1300,7 @@ class TestFusedIndexerSparseAttn:
 
 
 class TestDenseFusedIndexerSparseAttn:
-    """End-to-end tests for the dense-loss branch of Path B with all
+    """End-to-end tests for the dense indexer-loss branch with all
     underlying CUDA kernels mocked. Mirrors :class:`TestFusedIndexerSparseAttn`
     but exercises the ``sparse_loss=False`` code path through
     :class:`FusedIndexerSparseAttnFunc`.
@@ -2720,7 +2720,7 @@ class TestThdWrapperDispatchAndValidation:
 
 
 class TestRealKernelFusedIndexerSparseAttnThd:
-    """End-to-end parity for Path B in THD mode (both loss variants):
+    """End-to-end parity for fused indexer-loss sparse attention in THD mode:
     real cuDNN score-recompute + indexer-backward kernels + real FlashMLA,
     compared to the equivalent SBHD invocation on the same data with B=1.
 
@@ -2753,7 +2753,7 @@ class TestRealKernelFusedIndexerSparseAttnThd:
     def test_thd_single_segment_matches_sbhd_b1(self, sparse_loss, reset_lazy_kernel_state):
         """B=1 THD invocation should match the equivalent SBHD-b=1 call
         on the same input tensors (just reshaped), for both dense-loss
-        and sparse-loss Path B.
+        and the sparse indexer-loss variant.
         """
         _skip_if_real_kernels_unavailable(sm_min=10, need_flash_mla=True)
         s = self.SHAPES

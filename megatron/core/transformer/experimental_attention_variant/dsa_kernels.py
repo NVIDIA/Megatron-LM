@@ -15,9 +15,9 @@ package, but built on top of
 Public API (same shape as the old ``dsa_kernels`` package):
 
 * ``build_flat_topk_idxs`` / ``local_to_global_flat`` — index helpers.
-* ``dsa_sparse_attn`` — Path A / Path C step 2, differentiable sparse attention.
-* ``indexer_topk`` — Path C inference indexer scoring + top-K.
-* ``fused_indexer_sparse_attn`` — Path B training, fused indexer loss +
+* ``dsa_sparse_attn`` — differentiable sparse attention with precomputed indices.
+* ``indexer_topk`` — inference indexer scoring + top-K.
+* ``fused_indexer_sparse_attn`` — training fused indexer loss +
   sparse attention with shared backward.
 """
 
@@ -27,8 +27,6 @@ from typing import Optional, Tuple
 
 import torch
 from torch import Tensor
-
-from megatron.core.transformer.experimental_attention_variant import csa_cp_kernels
 
 # ---------------------------------------------------------------------------
 # Lazy kernel imports
@@ -320,7 +318,7 @@ def build_flat_topk_idxs(
 
 
 # ---------------------------------------------------------------------------
-# Path A + Path C step 2: differentiable sparse attention
+# Differentiable sparse attention with precomputed indices
 # ---------------------------------------------------------------------------
 
 
@@ -390,7 +388,7 @@ def dsa_sparse_attn(
     indexer_topk: int = 0,
     is_thd: bool = False,
 ) -> Tensor:
-    """Sparse attention (Path A / Path C step 2).
+    """Sparse attention with precomputed top-k indices.
 
     Two layouts:
 
@@ -413,7 +411,8 @@ def dsa_sparse_attn(
         softmax_scale: scalar float.
         topk_length: ``(rows,)`` int32 — optional compact fast-path. Must be
             ``None`` when ``indexer_topk > 0`` (FlashMLA constraint).
-        indexer_topk: int; ``0`` for Paths A/C, positive for Path B.
+        indexer_topk: int; ``0`` when no indexer columns are appended,
+            positive when fused indexer-loss columns are appended.
         is_thd: when True, treat ``query`` and ``kv`` as already-packed
             THD tensors and skip the SBHD reshape steps.
 
@@ -455,7 +454,7 @@ def dsa_sparse_attn(
 
 
 # ---------------------------------------------------------------------------
-# Path C inference: indexer scoring + top-K
+# Inference indexer scoring + top-K
 # ---------------------------------------------------------------------------
 
 
@@ -503,7 +502,7 @@ def _indexer_topk_core(
 
     Two internal entry points besides :func:`indexer_topk`:
 
-    * Path B's ``FusedIndexerSparseAttnFunc.forward`` calls this directly
+    * ``FusedIndexerSparseAttnFunc.forward`` calls this directly
       so the SBHD→BSHD permute can be performed once and reused across
       the indexer forward and the score-recompute backward kernels.
     """
@@ -597,36 +596,25 @@ def _indexer_topk_core(
         topk_indices = torch.cat([topk_indices, pad], dim=-1)
 
     if is_thd:
-        if csa_cp_kernels.can_use_cute_kernels(scores_flat, topk_indices):
-            if compute_topk_length:
-                topk_indices, topk_length = csa_cp_kernels.filter_indexer_topk_scores(
-                    scores_flat, topk_indices, output_width=output_topk
-                )
-            else:
-                topk_indices = csa_cp_kernels.filter_indexer_topk_scores_no_length(
-                    scores_flat, topk_indices, output_width=output_topk
-                )
-                topk_length = torch.empty((0,), dtype=torch.int32, device=device)
-        else:
-            safe_topk = topk_indices.clamp(min=0).to(torch.long)
-            selected_scores = torch.gather(scores_flat, dim=-1, index=safe_topk)
-            selected_valid = (topk_indices >= 0) & torch.isfinite(selected_scores)
-            topk_indices = torch.where(
-                selected_valid, topk_indices, torch.full_like(topk_indices, -1)
+        safe_topk = topk_indices.clamp(min=0, max=max(sk - 1, 0)).to(torch.long)
+        selected_scores = torch.gather(scores_flat, dim=-1, index=safe_topk)
+        selected_valid = (
+            (topk_indices >= 0) & (topk_indices < sk) & torch.isfinite(selected_scores)
+        )
+        topk_indices = topk_indices.masked_fill(~selected_valid, -1)
+        topk_length = (
+            (topk_indices >= 0).sum(dim=-1).int()
+            if compute_topk_length
+            else torch.empty((0,), dtype=torch.int32, device=device)
+        )
+        if output_topk > topk_indices.shape[-1]:
+            pad = torch.full(
+                (total_q, output_topk - topk_indices.shape[-1]),
+                -1,
+                dtype=torch.int32,
+                device=device,
             )
-            topk_length = (
-                (topk_indices >= 0).sum(dim=-1).int()
-                if compute_topk_length
-                else torch.empty((0,), dtype=torch.int32, device=device)
-            )
-            if output_topk > topk_indices.shape[-1]:
-                pad = torch.full(
-                    (total_q, output_topk - topk_indices.shape[-1]),
-                    -1,
-                    dtype=torch.int32,
-                    device=device,
-                )
-                topk_indices = torch.cat([topk_indices, pad], dim=-1)
+            topk_indices = torch.cat([topk_indices, pad], dim=-1)
     else:
         topk_length = (topk_indices >= 0).sum(dim=-1).int()  # (total_q,)
 
@@ -736,7 +724,7 @@ def indexer_topk(
 
 
 # ---------------------------------------------------------------------------
-# Path B: fused indexer + sparse attention (training)
+# Training fused indexer loss + sparse attention
 # ---------------------------------------------------------------------------
 
 
@@ -1022,7 +1010,7 @@ def _kl_loss_from_dense_scores(
 
 
 class FusedIndexerSparseAttnFunc(torch.autograd.Function):
-    """Path B: fused indexer (+KL loss) + sparse attention in one autograd.
+    """Fused indexer KL loss + sparse attention in one autograd.
 
     Differentiable w.r.t. ``query``, ``kv_full``, ``attn_sink``,
     ``q_indexer``, ``k_indexer``, ``weights``.
@@ -1484,7 +1472,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
 
 
 class PrecomputedIndexerSparseAttnFunc(torch.autograd.Function):
-    """Path B variant for CP-aware, precomputed indexer top-k.
+    """CP-aware fused sparse attention with precomputed indexer top-k.
 
     The caller owns CP-aware top-k selection. Sparse attention and
     indexer-loss backward still use FlashMLA / cuDNN DSA wrappers.
@@ -1719,7 +1707,7 @@ def fused_indexer_sparse_attn(
     max_seqlen_compressed_idx: Optional[int] = None,
     compressed_kv: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor]:
-    """Path B (training): fused indexer (+KL loss) + sparse attention.
+    """Training fused indexer KL loss + sparse attention.
 
     Layout is selected by ``cu_seqlens_q``:
 
