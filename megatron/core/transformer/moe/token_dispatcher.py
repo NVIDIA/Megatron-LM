@@ -1415,7 +1415,7 @@ class _NCCLEPManager(_DispatchManager):
         static receive-capacity buffer that TE ep_combine writes from.
     (5) combine(): TE ep_combine scatters expert outputs back to the original tokens.
 
-    The TE NCCL EP context (EpHandle + EpBuffer) and the process-wide bootstrap are created
+    The TE NCCL EP context (a single EpBuffer) and the process-wide bootstrap are created
     lazily on the first dispatch, when the local token count is known.
     """
 
@@ -1443,12 +1443,16 @@ class _NCCLEPManager(_DispatchManager):
         self.router_topk = router_topk
         self.num_experts = num_experts
         self.config = config
-        self.hidden_dim = config.hidden_size
+        # With MoE latent projections, the dispatcher operates on latent-dim tensors
+        # (fc1_latent_proj runs before dispatch; see moe_layer.py), so the EP buffers must be
+        # sized to the latent dim, not hidden_size.
+        self.hidden_dim = config.moe_latent_size or config.hidden_size
         # Per-expert packing alignment for the receive buffer (grouped-GEMM tile)
         self.alignment = get_align_size_for_quantization(config)
         self.rank_capacity_factor = config.moe_expert_rank_capacity_factor
         self.static_shape = config.moe_ncclep_static_shape
         self.skip_capacity_pad = config.moe_ncclep_skip_capacity_pad
+        self.use_symm_mem = config.moe_ncclep_use_symm_mem
         if self.skip_capacity_pad:
             if not self.static_shape:
                 raise ValueError(
@@ -1527,6 +1531,7 @@ class _NCCLEPManager(_DispatchManager):
             recv_capacity_per_rank=self._recv_capacity,
             hidden_dim=self.hidden_dim,
             num_sms=self.config.moe_ncclep_num_sms,
+            zero_copy=self.use_symm_mem,
         )
 
         def _context_factory() -> NcclEpContext:
@@ -1537,6 +1542,8 @@ class _NCCLEPManager(_DispatchManager):
                 hidden_dim=self.hidden_dim,
                 num_local_experts=self.num_local_experts,
                 alignment=self.alignment,
+                use_symm_mem=self.use_symm_mem,
+                ep_group=self.group,
             )
 
         self._pool = NcclEpContextPool(
