@@ -1,6 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 import signal
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Any, List, Literal, Optional
 
 from megatron.core.optimizer import (
@@ -234,14 +234,6 @@ class SchedulerConfig:
     weight_decay_incr_style: Literal["constant", "linear", "cosine"] = "constant"
     """Weight decay increment function."""
 
-    no_weight_decay_cond_type: Literal["qwen3_next"] | None = None
-    """Type of no weight decay condition. Choices:
-    None (default): param no weight decay if and only if it is 1D; or it is bias;
-    or it is embedding and embedding_init_method_std is not None.
-    "qwen3_next": In addition to the default rules, apply weight decay to qk
-    layernorm as a special case.
-    Equivalent to setting OptimizerConfig.apply_wd_to_qk_layernorm=True."""
-
     wd_incr_steps: int | None = field(init=False, default=None)
     """Number of samples to increment weight decay over. Calculated at runtime."""
 
@@ -279,20 +271,7 @@ class OptimizerConfigOverrideProvider:
             Mapping from ``ParamKey`` matchers to per-group optimizer overrides, or ``None``
             if no overrides are needed.
         """
-        optimizer_config = context.optimizer_config
-        no_weight_decay_cond_type = context.scheduler_config.no_weight_decay_cond_type
-
-        if no_weight_decay_cond_type is not None:
-            if no_weight_decay_cond_type != "qwen3_next":
-                raise ValueError(
-                    "Currently only None or `qwen3_next` is supported for "
-                    "scheduler_config.no_weight_decay_cond_type, unless you override "
-                    "OptimizerConfigOverrideProvider. "
-                    f"Got: {no_weight_decay_cond_type}"
-                )
-            optimizer_config = replace(optimizer_config, apply_wd_to_qk_layernorm=True)
-
-        config_overrides = get_standard_config_overrides(config=optimizer_config)
+        config_overrides = get_standard_config_overrides(config=context.optimizer_config)
         return config_overrides if config_overrides else None
 
 

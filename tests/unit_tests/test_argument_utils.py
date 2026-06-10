@@ -747,44 +747,6 @@ class TestOptimizerConfigOverrideProvider:
             for override in output_overrides
         )
 
-    def test_qwen3_next_condition_applies_weight_decay_to_qk_layernorm(self):
-        provider = OptimizerConfigOverrideProvider()
-        context = OptimizerConfigOverrideProviderContext(
-            scheduler_config=SchedulerConfig(no_weight_decay_cond_type="qwen3_next"),
-            optimizer_config=OptimizerConfig(optimizer="adam", lr=1e-3),
-            model=MagicMock(),
-        )
-
-        overrides = provider.build_config_overrides(context)
-
-        def has_no_wd(param, name):
-            return any(
-                override.get("wd_mult") == 0.0
-                for override in self._matching_overrides(overrides, param, name)
-            )
-
-        layernorm_param = self._param((8,))
-        q_layernorm_param = self._param((8,))
-
-        assert has_no_wd(layernorm_param, "decoder.layers.0.input_layernorm.weight")
-        assert not has_no_wd(
-            q_layernorm_param, "decoder.layers.0.self_attention.q_layernorm.weight"
-        )
-
-    def test_invalid_no_weight_decay_cond_type_error_points_to_provider_override(self):
-        provider = OptimizerConfigOverrideProvider()
-        context = OptimizerConfigOverrideProviderContext(
-            scheduler_config=SchedulerConfig(no_weight_decay_cond_type="custom"),
-            optimizer_config=OptimizerConfig(optimizer="adam", lr=1e-3),
-            model=MagicMock(),
-        )
-
-        with pytest.raises(
-            ValueError,
-            match="scheduler_config.no_weight_decay_cond_type.*OptimizerConfigOverrideProvider",
-        ):
-            provider.build_config_overrides(context)
-
 
 class TestPretrainContainerFromArgsStructure:
     """Test the top-level structure of the object returned by pretrain_cfg_container_from_args."""
