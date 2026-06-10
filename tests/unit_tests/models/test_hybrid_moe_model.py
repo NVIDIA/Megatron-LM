@@ -70,6 +70,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "cpu_offloading_weights": False,
     "cross_entropy_fusion_impl": "native",
     "cross_entropy_loss_fusion": True,
+    "create_attention_mask_in_dataloader": True,
     "csa_compress_ratios": None,
     "csa_compress_rotary_base": 40000.0,
     "csa_dense_mode": False,
@@ -78,6 +79,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "cuda_graph_retain_backward_graph": False,
     "cuda_graph_modules": [],
     "cuda_graph_use_single_mempool": True,
+    "cuda_graph_dynamic_microbatches": False,
+    "cuda_graph_num_microbatch_slots": None,
     "cuda_graph_scope": None,
     "cuda_graph_warmup_steps": 3,
     "deallocate_pipeline_outputs": True,
@@ -227,6 +230,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "mup_output_mult": 1.0,
     "mup_width_mult": 1.0,
     "mtp_hybrid_override_pattern": None,
+    "mtp_isolated_loss": False,
     "mtp_loss_scaling_factor": 0.1,
     "mtp_num_layers": None,
     "mtp_standalone": False,
@@ -276,6 +280,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "symmetric_ar_type": None,
     "tensor_model_parallel_size": 2,
     "test_mode": False,
+    "thd_max_num_seqs": 32,
     "timers": None,
     "tp_comm_atomic_ag": False,
     "tp_comm_atomic_rs": False,
@@ -339,6 +344,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_single_grouped_weight": False,
     "moe_single_grouped_bias": False,
     "head_wise_attn_gate": False,
+    "moe_hybridep_pad_variable_tokens": False,
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()

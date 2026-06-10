@@ -360,6 +360,11 @@ class DSv4HybridAttention(Attention):
             inference_context is None and inference_params is None
         ), "Inference is not supported for DSv4HybridAttention."
 
+        _orig_cp_group = self.pg_collection.cp
+        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
+            assert packed_seq_params.cp_group is not None, "cp_group must be set in dynamic-cp mode"
+            self.pg_collection.cp = packed_seq_params.cp_group
+
         cp_size = self.pg_collection.cp.size()
         qkv_format = packed_seq_params.qkv_format if packed_seq_params is not None else None
         if cp_size > 1 and qkv_format != 'thd':
@@ -543,6 +548,11 @@ class DSv4HybridAttention(Attention):
                 mla_rotary_interleaved=True,
                 inverse=True,
                 mla_output_remove_interleaving=True,
+                max_seqlen=(
+                    int(packed_seq_params.max_seqlen_kv)
+                    if packed_seq and packed_seq_params.max_seqlen_kv is not None
+                    else None
+                ),
             )
             if packed_seq:
                 rot_part = rot_part_out.unsqueeze(1)
@@ -569,6 +579,7 @@ class DSv4HybridAttention(Attention):
             output, bias = self.linear_proj(core_attn_out)
         output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
 
+        self.pg_collection.cp = _orig_cp_group
         return output, bias
 
 
@@ -681,12 +692,6 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         assert (
             hidden_states.ndim == 3
         ), f"hidden_states should be 3D, [s, b, n*h], got {hidden_states.ndim}D"
-        if packed_seq_params is not None:
-            assert (
-                packed_seq_params.local_cp_size is None
-            ), "dynamic_context_parallel is not supported with MLA yet and is planned for future. \
-            Please disable dynamic_context_parallel."
-
         assert (
             inference_context is None and inference_params is None
         ), "Inference is not supported for DSv4HybridSelfAttention."
@@ -875,6 +880,12 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
 
                 # RoPE and query (shared for wkv and latent)
                 # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
+                max_seqlen_q = (
+                    int(packed_seq_params.max_seqlen_q)
+                    if packed_seq_params is not None
+                    and packed_seq_params.max_seqlen_q is not None
+                    else None
+                )
                 q_pos_emb = apply_rotary_pos_emb(
                     q_pos_emb,
                     rotary_pos_emb,
@@ -884,6 +895,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     cp_group=self.pg_collection.cp,
                     mla_rotary_interleaved=True,
                     mla_output_remove_interleaving=True,
+                    max_seqlen=max_seqlen_q,
                 )
                 # query: [num_tokens, n, (qk_head_dim + v_head_dim)]
                 query = torch.cat([q_no_pe, q_pos_emb], dim=-1)
@@ -892,6 +904,12 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                 kv_no_pe, k_pos_emb = torch.split(kv, [kv.size(-1) - pos_dim, pos_dim], dim=-1)
 
                 # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
+                max_seqlen_kv = (
+                    int(packed_seq_params.max_seqlen_kv)
+                    if packed_seq_params is not None
+                    and packed_seq_params.max_seqlen_kv is not None
+                    else None
+                )
                 k_pos_emb = apply_rotary_pos_emb(
                     k_pos_emb,
                     rotary_pos_emb,
@@ -901,6 +919,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     cp_group=self.pg_collection.cp,
                     mla_rotary_interleaved=True,
                     mla_output_remove_interleaving=True,
+                    max_seqlen=max_seqlen_kv,
                 )
 
                 # Single head: key = value = [num_tokens, 1, v_head_dim]

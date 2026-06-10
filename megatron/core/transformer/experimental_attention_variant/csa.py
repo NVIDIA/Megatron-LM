@@ -465,7 +465,12 @@ def _stride_tables_per_segment(
     )
     valid = row_idx < cu_seqlens_compressed[-1]
     local_pos = row_idx - cu_seqlens_compressed[batch_ids]
-    gather_idx = torch.where(valid, local_pos * ratio, torch.zeros_like(local_pos))
+    table_len = tables[0].shape[0]
+    gather_idx = torch.where(
+        valid,
+        (local_pos * ratio).clamp(max=table_len - 1),
+        torch.zeros_like(local_pos),
+    )
 
     gather_idx_expanded = gather_idx.view(-1, *([1] * (tables[0].ndim - 1)))
     results = [torch.gather(t, 0, gather_idx_expanded.expand(-1, *t.shape[1:])) for t in tables]
@@ -1029,7 +1034,8 @@ class Compressor(MegatronModule):
             score_chunk = self._overlap_transform(score_chunk, fill_value=float("-inf"))
 
         # (n_compressed, b_dim, head_dim)
-        return (kv_chunk * torch.softmax(score_chunk, dim=1)).sum(dim=1)
+        weights = torch.softmax(score_chunk, dim=1, dtype=torch.float32).to(kv_chunk.dtype)
+        return (kv_chunk * weights).sum(dim=1)
 
     def _forward_sbhd(self, x: torch.Tensor) -> Optional[torch.Tensor]:
         """SBHD path. ``x`` is ``(sq, b, hidden_size)``; returns
@@ -1188,7 +1194,8 @@ class Compressor(MegatronModule):
 
         # Batched softmax + weighted sum — single kernel for all entries.
         # (total_comp, [2*]ratio, 1, [coff*]d)  →  (total_comp, 1, head_dim)
-        compressed_thd = (kv_grouped * torch.softmax(score_grouped, dim=1)).sum(dim=1)
+        weights = torch.softmax(score_grouped, dim=1, dtype=torch.float32).to(kv_grouped.dtype)
+        compressed_thd = (kv_grouped * weights).sum(dim=1)
 
         compressed_thd = self.norm(compressed_thd.to(dtype))
 

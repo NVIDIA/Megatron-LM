@@ -322,6 +322,16 @@ def build_flat_topk_idxs(
 # ---------------------------------------------------------------------------
 
 
+def _compact_topk_for_sparse_bwd(topk_idxs: Tensor, kv_rows: int) -> Tensor:
+    """Move valid top-k entries into the prefix expected by the DSA backward kernel."""
+    if topk_idxs.shape[-1] <= kv_rows:
+        return topk_idxs
+    sentinel = torch.iinfo(topk_idxs.dtype).max
+    compacted = torch.where(topk_idxs >= 0, topk_idxs, torch.full_like(topk_idxs, sentinel))
+    compacted, _ = torch.sort(compacted, dim=-1, stable=True)
+    return torch.where(compacted >= sentinel, torch.full_like(compacted, -1), compacted).contiguous()
+
+
 class SparseAttnFunc(torch.autograd.Function):
     """SM100 sparse attention fwd + bwd on flat tensors.
 
@@ -363,6 +373,7 @@ class SparseAttnFunc(torch.autograd.Function):
 
         q, kv, attn_sink, topk_idxs, out, lse = ctx.saved_tensors
 
+        topk_idxs_bwd = _compact_topk_for_sparse_bwd(topk_idxs, kv.shape[0])
         result = _DSA.sparse_attention_backward_wrapper(
             q,
             kv,
@@ -370,7 +381,7 @@ class SparseAttnFunc(torch.autograd.Function):
             dO,
             lse,
             attn_sink,
-            topk_idxs,
+            topk_idxs_bwd,
             softmax_scale=ctx.softmax_scale,
             topk_length=ctx.topk_length,
         )
@@ -1414,6 +1425,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             sq, b, skv = ctx.sq, ctx.b, ctx.skv
             dO_flat = grad_output.reshape(sq * b, np_, d_v)
 
+        global_idxs_bwd = _compact_topk_for_sparse_bwd(global_idxs, kv_flat.shape[0])
         attn_bwd = _DSA.sparse_attention_backward_wrapper(
             q_flat,
             kv_flat,
@@ -1421,7 +1433,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             dO_flat,
             lse,
             attn_sink,
-            global_idxs,
+            global_idxs_bwd,
             softmax_scale=ctx.softmax_scale,
             topk_length=None,
         )
@@ -1611,6 +1623,7 @@ class PrecomputedIndexerSparseAttnFunc(torch.autograd.Function):
 
         d_v = out_flat.shape[-1]
         dO_flat = grad_output.reshape(ctx.total_q, ctx.np_, d_v)
+        topk_idxs_bwd = _compact_topk_for_sparse_bwd(topk_idxs, kv_full.shape[0])
         attn_bwd = _DSA.sparse_attention_backward_wrapper(
             query,
             kv_full,
@@ -1618,7 +1631,7 @@ class PrecomputedIndexerSparseAttnFunc(torch.autograd.Function):
             dO_flat,
             lse,
             attn_sink,
-            topk_idxs,
+            topk_idxs_bwd,
             softmax_scale=ctx.softmax_scale,
             topk_length=None,
         )

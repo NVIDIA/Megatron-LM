@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
 import warnings
@@ -17,7 +17,7 @@ from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.pipeline_parallel.utils import is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import (
@@ -351,51 +351,66 @@ class MTPLossLoggingHelper:
 
     @staticmethod
     def save_loss_to_tracker(
-        loss: torch.Tensor,
+        loss_sum: torch.Tensor,
+        num_tokens: torch.Tensor,
         layer_number: int,
         num_layers: int,
         reduce_group: Optional[torch.distributed.ProcessGroup] = None,
         avg_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
-        """Save the mtp loss for logging.
+        """Save the mtp loss sum and token count for logging.
+
+        Stores raw sums so that the global per-token loss can be computed
+        correctly after all-reduce, even when token counts differ across
+        ranks (e.g. Dynamic CP) or microbatches.
+
         Args:
-            loss (torch.Tensor): The loss tensor.
+            loss_sum (torch.Tensor): Sum of per-element losses on this rank.
+            num_tokens (torch.Tensor): Number of valid tokens on this rank.
             layer_number (int): Layer index of the loss.
             num_layers (int): The number of total layers.
-            reduce_group (torch.distributed.ProcessGroup): The group for reducing the loss.
-            mean_group (torch.distributed.ProcessGroup): The group for averaging the loss.
+            reduce_group (torch.distributed.ProcessGroup): The group for sum-reducing losses.
+            avg_group (torch.distributed.ProcessGroup): The group for sum-reducing before averaging.
         """
-        # Skip mtp loss logging if layer_number is None.
         if layer_number is None:
             return
 
         tracker = MTPLossLoggingHelper.tracker
-        if "values" not in tracker:
-            tracker["values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
-        tracker["values"][layer_number] += loss.detach()
+        if "loss_sums" not in tracker:
+            tracker["loss_sums"] = torch.zeros(num_layers, device=torch.cuda.current_device())
+            tracker["num_tokens"] = torch.zeros(num_layers, device=torch.cuda.current_device())
+        tracker["loss_sums"][layer_number] += loss_sum.detach()
+        tracker["num_tokens"][layer_number] += num_tokens.detach()
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
 
     def clean_loss_in_tracker():
         """Clear the mtp losses."""
         tracker = MTPLossLoggingHelper.tracker
-        tracker["values"].zero_()
+        if "loss_sums" in tracker:
+            tracker["loss_sums"].zero_()
+            tracker["num_tokens"].zero_()
         tracker["reduce_group"] = None
         tracker["avg_group"] = None
 
     def reduce_loss_in_tracker():
-        """Collect and reduce the mtp losses across ranks."""
+        """Collect and reduce the mtp losses across ranks.
+
+        Packs loss sums and token counts into a single tensor for one
+        all-reduce, then computes per-token loss.  This produces correct
+        weighted-average results even when ranks hold different numbers
+        of tokens (e.g. Dynamic CP with variable CP sizes).
+        """
         tracker = MTPLossLoggingHelper.tracker
-        if "values" not in tracker:
+        if "loss_sums" not in tracker:
             return
-        values = tracker["values"]
-        # Reduce mtp losses across ranks.
-        if tracker.get('reduce_group') is not None:
-            torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
-        if tracker.get('avg_group') is not None:
-            torch.distributed.all_reduce(
-                values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
-            )
+        packed = torch.cat([tracker["loss_sums"], tracker["num_tokens"]])
+        for group_key in ('reduce_group', 'avg_group'):
+            group = tracker.get(group_key)
+            if group is not None:
+                torch.distributed.all_reduce(packed, group=group)
+        loss_sums, num_tokens = packed.chunk(2)
+        tracker["values"] = loss_sums / num_tokens.clamp(min=1)
 
     def track_mtp_metrics(loss_scale, iteration, writer, wandb_writer=None, total_loss_dict=None):
         """Track the Multi-Token Prediction (MTP) metrics for logging."""
@@ -640,7 +655,7 @@ class MTPLossAutoScaler(torch.autograd.Function):
 
 def process_mtp_loss(
     hidden_states: Tensor,
-    labels: Tensor,
+    labels: Optional[Tensor],
     loss_mask: Optional[Tensor],
     output_layer: Callable,
     output_weight: Optional[Tensor],
@@ -685,6 +700,23 @@ def process_mtp_loss(
     if loss_mask is None:
         loss_mask = torch.ones_like(mtp_labels)
 
+    output_weight_for_mtp = output_weight
+    output_layer_for_mtp = output_layer
+    if config.mtp_isolated_loss:
+        if output_weight_for_mtp is not None:
+            output_weight_for_mtp = output_weight_for_mtp.detach()
+        if isinstance(output_layer, torch.nn.Module):
+            output_layer_params = {
+                name: param.detach() for name, param in output_layer.named_parameters()
+            }
+            output_layer_buffers = dict(output_layer.named_buffers())
+            output_layer_state = {**output_layer_params, **output_layer_buffers}
+
+            def output_layer_for_mtp(input_: Tensor, **kwargs):
+                return torch.func.functional_call(
+                    output_layer, output_layer_state, args=(input_,), kwargs=kwargs
+                )
+
     # Store the original number of tokens before rolling for proper normalization
     # when calculate_per_token_loss is enabled. This ensures MTP gradients are
     # correctly scaled relative to the main loss gradients in finalize_model_grads.
@@ -701,17 +733,17 @@ def process_mtp_loss(
             loss_mask, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
         if fuse_linear_cross_entropy:
-            mtp_loss = output_layer(
+            mtp_loss = output_layer_for_mtp(
                 hidden_states_list[mtp_layer_number + 1],
-                weight=output_weight,
+                weight=output_weight_for_mtp,
                 runtime_gather_output=runtime_gather_output,
                 output_cross_entropy_loss=True,
                 labels=mtp_labels,
             )
         else:
-            mtp_logits, _ = output_layer(
+            mtp_logits, _ = output_layer_for_mtp(
                 hidden_states_list[mtp_layer_number + 1],
-                weight=output_weight,
+                weight=output_weight_for_mtp,
                 runtime_gather_output=runtime_gather_output,
             )
             if scale_logits_fn is not None:
@@ -719,12 +751,9 @@ def process_mtp_loss(
             mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
         mtp_loss = loss_mask * mtp_loss
         if is_training:
-            # Safe divide without sync: mask numerator when num_tokens==0, divide by clamp(min=1)
-            mtp_loss_for_log = (
-                torch.sum(mtp_loss) * (num_tokens > 0).to(mtp_loss.dtype)
-            ) / num_tokens.clamp(min=1)
             MTPLossLoggingHelper.save_loss_to_tracker(
-                mtp_loss_for_log,
+                torch.sum(mtp_loss),
+                num_tokens,
                 mtp_layer_number,
                 config.mtp_num_layers,
                 avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
@@ -974,23 +1003,18 @@ class MultiTokenPredictionLayer(MegatronModule):
                 sequence length, b is the batch size, and h is the hidden size.
             packed_seq_params (PackedSeqParams): Parameters for packed sequence processing.
         """
-        # Calc logits for the current Multi-Token Prediction (MTP) layers.
+        cp_group = resolve_cp_group(self.cp_group, packed_seq_params)
+
         input_ids, _ = roll_tensor(
-            input_ids,
-            shifts=-1,
-            dims=-1,
-            cp_group=self.cp_group,
-            packed_seq_params=packed_seq_params,
+            input_ids, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
         position_ids, _ = roll_tensor(
-            position_ids,
-            shifts=-1,
-            dims=-1,
-            cp_group=self.cp_group,
-            packed_seq_params=packed_seq_params,
+            position_ids, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
         # embedding
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
+        if self.config.mtp_isolated_loss:
+            decoder_input = decoder_input.detach()
 
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
 
@@ -1398,8 +1422,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         """
         assert context is None, "multi token prediction + cross attention is not yet supported."
         _orig_cp_group = self.cp_group
-        if packed_seq_params is not None and packed_seq_params.cp_group is not None:
-            self.cp_group = packed_seq_params.cp_group
+        self.cp_group = resolve_cp_group(self.cp_group, packed_seq_params)
         input_ids, position_ids, decoder_input, hidden_states = self._get_embeddings(
             input_ids=input_ids,
             position_ids=position_ids,
@@ -1724,6 +1747,11 @@ class MultiTokenPredictionBlock(MegatronModule):
             hidden_states = mhc_chunks[offset]
         else:
             hidden_states = hidden_states_list[offset]
+        if self.config.mtp_isolated_loss:
+            hidden_states = hidden_states.detach().requires_grad_(True)
+            hidden_states = make_viewless_tensor(
+                inp=hidden_states, requires_grad=True, keep_graph=False
+            )
         for iteration in range(self.config.mtp_num_layers):
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
             (hidden_states, input_ids, position_ids) = self.layers[layer_idx](

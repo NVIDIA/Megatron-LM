@@ -81,6 +81,15 @@ class TransformerConfig(ModelParallelConfig):
     which serves as an additional training objective.
     """
 
+    mtp_isolated_loss: bool = False
+    """If True, MTP loss only updates MTP module parameters. The MTP loss graph is
+    detached from the main decoder, shared embeddings, and output layer weights.
+
+    For online RL, keep ``labels=None`` so the main LM head returns logits for the
+    external RL loss. MTP auxiliary loss can still be trained by deriving its labels
+    from ``input_ids`` in the MTP loss path; this option isolates that auxiliary loss
+    from the main model parameters."""
+
     mtp_use_repeated_layer: bool = False
     """Use a single MTP layer repeatedly instead of multiple separate layers."""
 
@@ -871,6 +880,13 @@ class TransformerConfig(ModelParallelConfig):
     moe_permute_fusion_into_hybridep: bool = False
     """Fuse token rearrangement ops during token dispatching for HybridEP."""
 
+    moe_hybridep_pad_variable_tokens: bool = False
+    """Pad uneven local token counts to the HybridEP group maximum before dispatch.
+
+    This is needed when the frontend supplies locally packed THD inputs whose token counts
+    can differ across ranks, without using Megatron Core's sequence_packing_scheduler.
+    """
+
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
 
@@ -1024,6 +1040,14 @@ class TransformerConfig(ModelParallelConfig):
     transformed to an empty list in __post_init__. The deprecated values "full_iteration" and
     "full_iteration_inference" are also accepted and migrated to the new API in __post_init__."""
 
+    create_attention_mask_in_dataloader: bool = True
+    """Whether training data loaders create and pass an attention_mask tensor.
+
+    This mirrors the training argument of the same name so Transformer Engine CUDA graph capture
+    can preserve the actual forward signature. When disabled for causal/no-mask attention,
+    the graph capture path should not allocate a synthetic global-sequence attention mask.
+    """
+
     inference_cuda_graph_scope: Optional[InferenceCudaGraphScope] = field(
         default=None,
         metadata={
@@ -1054,6 +1078,29 @@ class TransformerConfig(ModelParallelConfig):
     migrated to cuda_graph_modules in __post_init__. Will be removed in a future release.
     CudaGraphScope instances deserialized from pre-refactor checkpoints are converted to their
     string names before normalization so existing CUDA_GRAPH_MODULES_DEPRECATIONS handles them."""
+
+    thd_max_num_seqs: int = 32
+    """Maximum number of packed sequences per microbatch in THD format. The packing
+    scheduler closes a pack as soon as it reaches this many sequences (in addition to
+    the existing token-budget condition). When CUDA Graph is enabled, cu_seqlens
+    tensors are padded to this size + 1.
+
+    Sizing guidance: choose a value that comfortably covers the worst-case packing,
+    roughly ceil(max_seqlen_per_dp_cp_rank * cp_size / min_seq_len_after_filter).
+    Setting it too small results in more microbatches with smaller packs (wasted
+    token budget); setting it too large just allocates a slightly larger cu_seqlens
+    buffer."""
+
+    cuda_graph_dynamic_microbatches: bool = False
+    """Enable CUDA graph slot reuse so the same captured graphs can be replayed for a dynamic
+    number of microbatches. This option is only meaningful for cuda_graph_impl=transformer_engine.
+    When enabled, capture builds a bounded number of graph slots and replay maps real
+    microbatch_id to slot_id by modulo."""
+
+    cuda_graph_num_microbatch_slots: Optional[int] = None
+    """Number of CUDA graph slots to capture per layer for dynamic microbatch replay.
+    If None, an automatic slot count is derived from the PP/VPP schedule topology.
+    If set, the provided value must be >= the automatically derived safe minimum."""
 
     ####################
     # Hyper-Connection Configuration
@@ -2256,11 +2303,6 @@ class TransformerConfig(ModelParallelConfig):
                         "use_te_activation_func must be False "
                         "when activation_func_clamp_value is not None for SwiGLU"
                     )
-                if self.use_transformer_engine_op_fuser:
-                    raise ValueError(
-                        "use_transformer_engine_op_fuser must be False "
-                        "when activation_func_clamp_value is not None for SwiGLU"
-                    )
 
         if self.apply_rope_fusion:
             if self.multi_latent_attention:
@@ -2613,6 +2655,23 @@ class TransformerConfig(ModelParallelConfig):
                         if CudaGraphModule.moe_preprocess not in self.cuda_graph_modules:
                             self.cuda_graph_modules.append(CudaGraphModule.moe_preprocess)
 
+                if self.cuda_graph_impl == "transformer_engine":
+                    if self.cuda_graph_dynamic_microbatches:
+                        if self.cuda_graph_num_microbatch_slots is not None:
+                            assert self.cuda_graph_num_microbatch_slots >= 1, (
+                                "cuda_graph_num_microbatch_slots must be >= 1 when "
+                                "cuda_graph_dynamic_microbatches is enabled."
+                            )
+                else:
+                    assert not self.cuda_graph_dynamic_microbatches, (
+                        "cuda_graph_dynamic_microbatches is only supported with "
+                        "cuda_graph_impl=transformer_engine."
+                    )
+                    assert self.cuda_graph_num_microbatch_slots is None, (
+                        "cuda_graph_num_microbatch_slots is only supported with "
+                        "cuda_graph_impl=transformer_engine."
+                    )
+
                 assert (
                     CudaGraphModule.moe not in self.cuda_graph_modules
                     or CudaGraphModule.moe_router not in self.cuda_graph_modules
@@ -2939,6 +2998,21 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.attention_backend == AttnBackend.flash
             ), "Batch invariant mode only supports FlashAttention"
+
+        if self.cuda_graph_impl != "none" and (
+            self.sequence_packing_scheduler is not None or self.dynamic_context_parallel
+        ):
+            assert self.pad_packed_seq_alignment is not None, (
+                "THD CUDA Graph requires --pad-packed-seq-alignment to be set."
+            )
+            assert (
+                self.pad_packed_seq_alignment == 0
+                or self.pad_packed_seq_alignment == self.max_seqlen_per_dp_cp_rank
+            ), (
+                "THD CUDA Graph requires --pad-packed-seq-alignment without a value "
+                "or --pad-packed-seq-alignment equal to max_seqlen_per_dp_cp_rank "
+                f"({self.max_seqlen_per_dp_cp_rank}), got {self.pad_packed_seq_alignment}."
+            )
 
         if self.sequence_packing_scheduler is not None:
             # Check TE version.

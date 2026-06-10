@@ -610,7 +610,7 @@ class TopKRouter(Router):
         if self.enable_expert_bias and torch.is_grad_enabled():
             with torch.no_grad():
                 if padding_mask is not None:
-                    routing_map = routing_map & (~padding_mask)
+                    routing_map = routing_map & (~padding_mask.reshape(-1)).unsqueeze(-1)
                 self.local_tokens_per_expert += routing_map.sum(dim=0)
 
     def _hash_routing(self, logits: torch.Tensor, input_ids: torch.Tensor):
@@ -641,6 +641,13 @@ class TopKRouter(Router):
         # and get flattened to [s*b, h]. Transpose to match.
         flat_ids = input_ids.T.reshape(-1)
         top_indices = self.tid2eid[flat_ids].long()  # [num_tokens, topk]
+        if (
+            self.config.moe_router_force_load_balancing
+            or self.config.moe_router_force_biased is not None
+        ):
+            # override top_indices with random topk indices
+            # logits in processed by apply_random_logits or apply_biased_logits
+            _, top_indices = torch.topk(logits, k=self.topk, dim=1)
 
         probs = scores.gather(1, top_indices)
         if self.score_function != "softmax":

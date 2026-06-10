@@ -20,7 +20,7 @@ from megatron.core.tensor_parallel.random import (
     model_parallel_cuda_manual_seed,
 )
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, _CudagraphGlobalRecord
-from megatron.core.transformer.enums import InferenceCudaGraphScope
+from megatron.core.transformer.enums import AttnMaskType, CudaGraphModule, InferenceCudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     HyperConnectionTransformerLayer,
@@ -123,6 +123,89 @@ class TestParallelTransformerLayer:
         assert hidden_states.shape[0] == sequence_length
         assert hidden_states.shape[1] == micro_batch_size
         assert hidden_states.shape[2] == config.hidden_size
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("1.10.0")),
+        reason="TE CUDA graph kwargs require TransformerEngine >= 1.10",
+    )
+    def test_te_cuda_graph_omits_absent_attention_mask(self):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=[CudaGraphModule.attn],
+            create_attention_mask_in_dataloader=False,
+        )
+        layer = TransformerLayer(config, get_gpt_layer_with_transformer_engine_submodules())
+
+        static_inputs = layer.get_layer_static_inputs(seq_length=32, micro_batch_size=1)
+        assert "attention_mask" not in static_inputs
+
+        hidden_states = torch.ones((32, 1, config.hidden_size), device="cuda")
+        _, cudagraph_kwargs = layer._get_te_cuda_graph_replay_args(
+            hidden_states, attention_mask=None
+        )
+        assert "attention_mask" not in cudagraph_kwargs
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("1.10.0")),
+        reason="TE CUDA graph kwargs require TransformerEngine >= 1.10",
+    )
+    def test_te_cuda_graph_keeps_configured_attention_mask(self):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=[CudaGraphModule.attn],
+            create_attention_mask_in_dataloader=True,
+        )
+        layer = TransformerLayer(config, get_gpt_layer_with_transformer_engine_submodules())
+
+        static_inputs = layer.get_layer_static_inputs(seq_length=32, micro_batch_size=1)
+        assert static_inputs["attention_mask"].shape == (1, 1, 32, 32)
+
+        hidden_states = torch.ones((32, 1, config.hidden_size), device="cuda")
+        _, cudagraph_kwargs = layer._get_te_cuda_graph_replay_args(
+            hidden_states, attention_mask=None
+        )
+        assert cudagraph_kwargs["attention_mask"].shape == (1, 1, 32, 32)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("1.10.0")),
+        reason="TE CUDA graph kwargs require TransformerEngine >= 1.10",
+    )
+    def test_te_cuda_graph_warns_when_omitting_padding_attention_mask(self, monkeypatch):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=[CudaGraphModule.attn],
+            create_attention_mask_in_dataloader=False,
+        )
+        layer = TransformerLayer(config, get_gpt_layer_with_transformer_engine_submodules())
+        layer.self_attention.attn_mask_type = AttnMaskType.padding
+
+        warning_messages = []
+        monkeypatch.setattr(
+            "megatron.core.transformer.transformer_layer.log_single_rank",
+            lambda _logger, _level, message: warning_messages.append(message),
+        )
+
+        static_inputs = layer.get_layer_static_inputs(seq_length=32, micro_batch_size=1)
+
+        assert "attention_mask" not in static_inputs
+        assert any(
+            "attn_mask_type=padding may require an explicit mask" in msg for msg in warning_messages
+        )
 
     def test_chunked_mlp(self):
         with torch.no_grad():
