@@ -48,6 +48,8 @@ class BridgeCommunicator:
 
     # Cache broadcast PGs to avoid creating duplicate NCCL communicators for identical rank sets.
     _broadcast_pg_cache: Dict[str, "torch.distributed.ProcessGroup"] = {}
+    # Cache bridge PGs (cross-grid leader<->leader P2P) keyed by sorted leader ranks.
+    _bridge_pg_cache: Dict[str, "torch.distributed.ProcessGroup"] = {}
 
     @classmethod
     def destroy_broadcast_pgs(cls):
@@ -56,6 +58,14 @@ class BridgeCommunicator:
             if pg is not None:
                 dist.destroy_process_group(pg)
         cls._broadcast_pg_cache.clear()
+
+    @classmethod
+    def destroy_bridge_pgs(cls):
+        """Destroy all cached bridge process groups."""
+        for pg in cls._bridge_pg_cache.values():
+            if pg is not None:
+                dist.destroy_process_group(pg)
+        cls._bridge_pg_cache.clear()
 
     def __init__(
         self,
@@ -154,6 +164,9 @@ class BridgeCommunicator:
             self.dest_grid, is_src=False
         )
 
+        bridge_ranks = sorted(set(self.src_tp_leaders) | set(self.dest_tp_leaders))
+        self.bridge_pg = self._get_or_create_bridge_pg(bridge_ranks)
+
         log_msg = (
             f"[Rank {self.current_rank}] "
             f"srcLeader={self.src_local_leader_rank} "
@@ -186,6 +199,15 @@ class BridgeCommunicator:
             pg, _ = dist.new_subgroups_by_enumeration(ranks_list, backend='nccl')
             cls._broadcast_pg_cache[cache_key] = pg
         return cls._broadcast_pg_cache[cache_key]
+
+    @classmethod
+    def _get_or_create_bridge_pg(cls, ranks: List[int]):
+        """Get or create a bridge PG, caching to avoid duplicate NCCL communicators."""
+        ranks = sorted(ranks)
+        cache_key = str(ranks)
+        if cache_key not in cls._bridge_pg_cache:
+            cls._bridge_pg_cache[cache_key] = dist.new_group(ranks, backend='nccl')
+        return cls._bridge_pg_cache[cache_key]
 
     def get_leader_rank(self, grid: HyperCommGrid, is_src: bool) -> List[int]:
         """Get the leader rank for a given grid and direction.
@@ -356,7 +378,7 @@ class BridgeCommunicator:
                         f"[Bridge Comunicator] [send_forward] Rank {self.current_rank} "
                         f"send to rank {dest_rank}"
                     )
-                    dist.send(tensor_split, dst=dest_rank)
+                    dist.send(tensor_split, dst=dest_rank, group=self.bridge_pg)
 
     def recv_forward(self) -> torch.Tensor:
         """Receive forward activation tensor.
@@ -399,7 +421,7 @@ class BridgeCommunicator:
                     dtype=self.comm_dtype,
                     requires_grad=True,
                 )
-                dist.recv(tensor_to_recv, src=src_rank)
+                dist.recv(tensor_to_recv, src=src_rank, group=self.bridge_pg)
                 logging.debug(
                     f"[Bridge Communicator] [receive_forward] Rank {self.current_rank} "
                     f"received tensor from src rank {src_rank} "
@@ -489,7 +511,7 @@ class BridgeCommunicator:
                         f"sending gradient to src rank {src_rank} "
                         f"shape {tensor_split.shape} sum {tensor_split.sum()}"
                     )
-                    dist.send(tensor_split, dst=src_rank)
+                    dist.send(tensor_split, dst=src_rank, group=self.bridge_pg)
 
     def recv_backward(self) -> torch.Tensor:
         """Receive backward gradient tensor.
@@ -528,7 +550,7 @@ class BridgeCommunicator:
                 grad_tensor = torch.empty(
                     grad_shape, device=torch.cuda.current_device(), dtype=self.comm_dtype
                 )
-                dist.recv(grad_tensor, src=dest_rank)
+                dist.recv(grad_tensor, src=dest_rank, group=self.bridge_pg)
                 logging.debug(
                     f"[Bridge Communicator] [receive_backward] Rank {self.current_rank} "
                     f"received gradient from dest rank {dest_rank} "
@@ -643,12 +665,14 @@ class BridgeCommunicator:
                     # Send activation
                     ops.append(
                         torch.distributed.P2POp(
-                            torch.distributed.isend, activation_split, dest_rank
+                            torch.distributed.isend, activation_split, dest_rank, self.bridge_pg
                         )
                     )
                     # Receive gradient
                     ops.append(
-                        torch.distributed.P2POp(torch.distributed.irecv, grad_tensor, dest_rank)
+                        torch.distributed.P2POp(
+                            torch.distributed.irecv, grad_tensor, dest_rank, self.bridge_pg
+                        )
                     )
 
                 logging.debug(
@@ -764,13 +788,15 @@ class BridgeCommunicator:
                 ):
                     # Send gradient
                     ops.append(
-                        torch.distributed.P2POp(torch.distributed.isend, gradient_split, src_rank)
+                        torch.distributed.P2POp(
+                            torch.distributed.isend, gradient_split, src_rank, self.bridge_pg
+                        )
                     )
 
                     # Receive activation
                     ops.append(
                         torch.distributed.P2POp(
-                            torch.distributed.irecv, activation_tensor, src_rank
+                            torch.distributed.irecv, activation_tensor, src_rank, self.bridge_pg
                         )
                     )
 
@@ -888,7 +914,7 @@ class BridgeCommunicator:
                     )
                     ops.append(
                         torch.distributed.P2POp(
-                            torch.distributed.isend, send_shape_tensor, dest_rank
+                            torch.distributed.isend, send_shape_tensor, dest_rank, self.bridge_pg
                         )
                     )
 
@@ -901,7 +927,7 @@ class BridgeCommunicator:
                     recv_grad_shape_tensors.append(grad_shape_tensor)
                     ops.append(
                         torch.distributed.P2POp(
-                            torch.distributed.irecv, grad_shape_tensor, dest_rank
+                            torch.distributed.irecv, grad_shape_tensor, dest_rank, self.bridge_pg
                         )
                     )
 
@@ -915,7 +941,7 @@ class BridgeCommunicator:
                     recv_forward_shape_tensors.append(forward_shape_tensor)
                     ops.append(
                         torch.distributed.P2POp(
-                            torch.distributed.irecv, forward_shape_tensor, src_rank
+                            torch.distributed.irecv, forward_shape_tensor, src_rank, self.bridge_pg
                         )
                     )
 
@@ -932,7 +958,7 @@ class BridgeCommunicator:
                     )
                     ops.append(
                         torch.distributed.P2POp(
-                            torch.distributed.isend, grad_shape_tensor, src_rank
+                            torch.distributed.isend, grad_shape_tensor, src_rank, self.bridge_pg
                         )
                     )
 
