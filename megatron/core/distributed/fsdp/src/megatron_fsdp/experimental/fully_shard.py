@@ -24,9 +24,11 @@ from torch import nn
 from torch.distributed import DeviceMesh
 
 from ..mixed_precision import MixedPrecisionPolicy
-from .dbuffer import DBuffer, MeshAxis, Partial, Placement, Replicate
+from .dbuffer import DBuffer
+from .placement import Partial, Placement, Replicate
 
 _CONTAINING_PARAMETER_GROUP_ATTR = "_mfsdp_parameter_group"
+MeshAxis = int | str
 
 
 @dataclasses.dataclass(frozen=True)
@@ -179,7 +181,7 @@ class ParameterGroup:
         unsharded_parameters: list[nn.Parameter] = []
         main_grad_dtype = self.main_grad.local_buffer.dtype if self.main_grad is not None else None
         for index, parameter in enumerate(parameters.values()):
-            parameter.data = self._unsharded_model_weight.get_tensor(index)
+            parameter.data = self._unsharded_model_weight.get_local_tensor(index)
             parameter.grad = None
             setattr(parameter, _CONTAINING_PARAMETER_GROUP_ATTR, self)
             unsharded_parameters.append(parameter)
