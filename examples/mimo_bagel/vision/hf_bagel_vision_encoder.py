@@ -137,15 +137,18 @@ class HFBagelVisionEncoderWrapper(torch.nn.Module):
         # if max_seqlen is not None:
         #     print("max_seqlen", max_seqlen)
 
-        packed_vit_token_embed = self.encoder(
-            packed_pixel_values=packed_vit_tokens,
-            packed_flattened_position_ids=packed_vit_position_ids,
-            cu_seqlens=cu_seqlens,
-            max_seqlen=max_seqlen,
-        )
+        use_autocast = packed_vit_tokens.is_cuda and encoder_dtype in (torch.float16, torch.bfloat16)
+        with torch.amp.autocast("cuda", enabled=use_autocast, dtype=encoder_dtype):
+            packed_vit_token_embed = self.encoder(
+                packed_pixel_values=packed_vit_tokens,
+                packed_flattened_position_ids=packed_vit_position_ids,
+                cu_seqlens=cu_seqlens,
+                max_seqlen=max_seqlen,
+            )
+        packed_vit_token_embed = packed_vit_token_embed.to(dtype=encoder_dtype)
         # print("after vit model forward, packed_vit_token_embed", packed_vit_token_embed.shape, packed_vit_token_embed.sum())
         if self.add_postion_embedding:
-            vit_token_pos_emb = self.vit_pos_embed(packed_vit_position_ids)
+            vit_token_pos_emb = self.vit_pos_embed(packed_vit_position_ids).to(dtype=encoder_dtype)
             # print("after vit pos embed forward, vit_token_pos_emb", vit_token_pos_emb.shape, vit_token_pos_emb.sum())
         # print("================================================")
         return [packed_vit_token_embed, vit_token_pos_emb] if self.add_postion_embedding else packed_vit_token_embed

@@ -104,6 +104,9 @@ def add_mimo_args(parser):
     group.add_argument('--mse-weight', type=float, default=1.0,
                        help='Weight applied to the diffusion MSE loss term '
                             '(matches original BAGEL --mse-weight, default 1.0).')
+    group.add_argument('--ce-loss-reweighting', action='store_true',
+                       help='Reweight CE by ce_loss_weights, matching original BAGEL '
+                            '--ce-loss-reweighting. Disabled by default.')
 
     # Bagel-specific args
     group.add_argument('--llm-path', type=str, default=None, help='Path to LLM checkpoint to load')
@@ -151,42 +154,48 @@ def get_batch(data_iterator: Iterator[Dict[str, Any]], pg_collection):
     # CP-aware FlexAttention reshape fails on later stages.
     #
     # The PackedDataset internally calls np.random.randn() (see
-    # bagel/data/dataset_base.py:429) for diffusion timesteps. Megatron's
-    # _set_random_seed seeds numpy with `seed + 100*pp_rank` (training/
-    # initialize.py:415), so PP siblings have *different* numpy state and
-    # would draw different timesteps. Re-seed numpy by dp_rank around the
-    # iterator step so PP siblings sample identical data, then restore the
-    # original state to keep dropout / other RNG uses unaffected.
+    # bagel/data/dataset_base.py:429) for diffusion timesteps. With PP=1,
+    # let the iterator consume RNG state naturally, matching the HF BAGEL
+    # loop. With PP>1, Megatron seeds numpy with `seed + 100*pp_rank`
+    # (training/initialize.py:415), so PP siblings would draw different
+    # timesteps. In that case only, re-seed numpy/random by DP rank around
+    # the iterator step so PP siblings sample identical data.
 
     tp_group = pg_collection.tp
     cp_group = pg_collection.cp
     tp_rank = torch.distributed.get_rank(tp_group)
     cp_rank = torch.distributed.get_rank(cp_group)
     cp_size = torch.distributed.get_world_size(cp_group)
+    pp_group = pg_collection.pp
+    pp_size = torch.distributed.get_world_size(pp_group)
 
     # Broadcast data - only get data on tensor parallel rank 0
     # data iterator is None on other tp ranks
     # TP Rank-0 reads next batch.
     if tp_rank == 0 and cp_rank == 0:
         try:
-            # PP-determinism: scope numpy / random state to a dp-rank-keyed
-            # seed for the duration of this iterator step.
-            import numpy as _np
-            import random as _random
-            _global_step = getattr(args, 'curr_iteration', 0) or 0
-            _data_seed = (
-                getattr(args, 'seed', 1234) + 7919 * _global_step
-                + 31 * torch.distributed.get_rank(pg_collection.dp)
-            )
-            _np_state = _np.random.get_state()
-            _py_state = _random.getstate()
-            _np.random.seed(_data_seed)
-            _random.seed(_data_seed)
-            try:
+            if pp_size == 1:
                 data = next(data_iterator)
-            finally:
-                _np.random.set_state(_np_state)
-                _random.setstate(_py_state)
+            else:
+                # PP-determinism: scope numpy / random state to a
+                # dp-rank-keyed seed for the duration of this iterator step.
+                import numpy as _np
+                import random as _random
+
+                _global_step = getattr(args, 'curr_iteration', 0) or 0
+                _data_seed = (
+                    getattr(args, 'seed', 1234) + 7919 * _global_step
+                    + 31 * torch.distributed.get_rank(pg_collection.dp)
+                )
+                _np_state = _np.random.get_state()
+                _py_state = _random.getstate()
+                _np.random.seed(_data_seed)
+                _random.seed(_data_seed)
+                try:
+                    data = next(data_iterator)
+                finally:
+                    _np.random.set_state(_np_state)
+                    _random.setstate(_py_state)
             has_data = torch.tensor([1], dtype=torch.uint8, device='cuda')
         except StopIteration:
             has_data = torch.tensor([0], dtype=torch.uint8, device='cuda')
@@ -283,13 +292,14 @@ def loss_func(ce_loss, loss_mask, mse_loss, mse_loss_mask):
     normalisation here; Megatron's ``/num_microbatches`` (gradient
     accumulation scaling) is preserved.
 
-    Reported metrics are deliberately split: ``lm loss`` is CE-only and
-    ``mse loss`` is MSE-only, each in sum-form so Megatron's
-    ``val[0]/val[1]`` reduction yields a clean global per-token quantity.
+    Reported metrics use Megatron's two-value ``[numerator, denominator]``
+    convention so training.py all-reduces them across DP/CP ranks and logs
+    a global average. This matches the stable 12691662 experiment where
+    ``ce`` and ``lm loss`` are the same scalar, ``mse`` and ``mse loss`` are
+    the same scalar, and ``loss = ce * ce_weight + mse * mse_weight``.
 
     Args:
-        ce_loss: per-rank-local weighted CE values (already multiplied by
-            loss_mask in mcore_bagel_llm), shape [N_local_valid] or None.
+        ce_loss: per-rank-local unweighted CE values, shape [N_local_valid] or None.
         loss_mask: per-rank-local CE loss-mask weights, shape [actual_lund].
         mse_loss: per-rank-local MSE per-token×channel values, shape
             [Lgen_local, vae_dim] or None.
@@ -301,6 +311,7 @@ def loss_func(ce_loss, loss_mask, mse_loss, mse_loss_mask):
     args = get_args()
     ce_weight  = getattr(args, 'ce_weight',  1.0)
     mse_weight = getattr(args, 'mse_weight', 1.0)
+    ce_loss_reweighting = getattr(args, 'ce_loss_reweighting', False)
 
     # Loss aggregation runs across the data-parallel + context-parallel group
     # (TP ranks compute identical losses, so they're not in the reduction).
@@ -312,29 +323,36 @@ def loss_func(ce_loss, loss_mask, mse_loss, mse_loss_mask):
 
     loss = torch.tensor(0.0, device='cuda')
 
-    # ── CE term: BAGEL-style global weighted-avg per-token CE × W ──────────
+    # ── CE term: match HF BAGEL's ce_loss_reweighting switch ──────────────
     ce_sum_local = torch.tensor(0.0, device='cuda')
-    ce_weight_sum_local = torch.tensor(0.0, device='cuda')
+    ce_denominator_local = torch.tensor(0.0, device='cuda')
+    ce_term = None
     if ce_loss is not None:
-        # ce_loss is already (per_token_ce * loss_mask) — see mcore_bagel_llm:258.
-        ce_sum_local = ce_loss.float().sum()
-        ce_weight_sum_local = loss_mask.view(-1).sum().to(torch.float)
+        ce_loss = ce_loss.float()
+        ce_weights = loss_mask.view(-1)[loss_mask.view(-1) > 0].to(torch.float)
+        if ce_loss_reweighting:
+            ce_sum_local = (ce_loss * ce_weights).sum()
+            ce_denominator_local = ce_weights.sum()
+        else:
+            ce_sum_local = ce_loss.sum()
+            ce_denominator_local = torch.tensor(ce_loss.numel(), dtype=torch.float, device='cuda')
 
-        ce_weight_sum_global = ce_weight_sum_local.clone()
+        ce_denominator_global = ce_denominator_local.clone()
         torch.distributed.all_reduce(
-            ce_weight_sum_global,
+            ce_denominator_global,
             op=torch.distributed.ReduceOp.SUM,
             group=dp_cp_group,
         )
-        # ce_term ≈ global_weighted_avg_per_token_CE × dp_cp_world_size.
+        # ce_term ≈ global HF-style CE × dp_cp_world_size.
         # FSDP mean-reduce of grads will divide by world_size, leaving the
-        # per-token average as the effective gradient signal.
-        ce_term = ce_sum_local * dp_cp_world_size / torch.clamp(ce_weight_sum_global, min=1.0)
+        # HF-style average as the effective gradient signal.
+        ce_term = ce_sum_local * dp_cp_world_size / torch.clamp(ce_denominator_global, min=1.0)
         loss = loss + ce_term * ce_weight
 
     # ── MSE term: BAGEL-style global per-token avg MSE × W ─────────────────
     mse_sum_local = torch.tensor(0.0, device='cuda')
     mse_tokens_local = torch.tensor(0.0, device='cuda')
+    mse_term = None
     if mse_loss is not None:
         mse_sum_local = mse_loss.float().mean(dim=-1).sum()
         mse_tokens_local = mse_loss_mask.sum().to(torch.float)
@@ -348,22 +366,29 @@ def loss_func(ce_loss, loss_mask, mse_loss, mse_loss_mask):
         mse_term = mse_sum_local * dp_cp_world_size / torch.clamp(mse_tokens_global, min=1.0)
         loss = loss + mse_term * mse_weight
 
-    # ── Reporting: separate CE-only and MSE-only metrics, each clean ──────
+    # Reporting: use Megatron's two-value metric path so logs/W&B show global
+    # DP/CP averages, matching the stable 12691662 experiment.
     metrics = {}
-    if ce_loss is not None:
-        metrics['lm loss'] = torch.cat(
-            [ce_sum_local.detach().view(1), ce_weight_sum_local.detach().view(1)]
-        )
-    if mse_loss is not None:
-        metrics['mse loss'] = torch.cat(
-            [mse_sum_local.detach().view(1), mse_tokens_local.detach().view(1)]
-        )
+    if ce_term is not None:
+        ce_report = torch.cat([ce_sum_local.detach().view(1), ce_denominator_local.detach().view(1)])
+        metrics['ce'] = ce_report
+
+    if mse_term is not None:
+        mse_report = torch.cat([mse_sum_local.detach().view(1), mse_tokens_local.detach().view(1)])
+        metrics['mse'] = mse_report
+
+    metrics['loss'] = torch.cat(
+        [
+            loss.detach().view(1),
+            torch.ones(1, dtype=loss.dtype, device=loss.device),
+        ]
+    )
 
     # num_tokens=1 makes Megatron's `output_tensor /= clamp(num_tokens, min=1)`
     # a no-op (we have already normalised). The /num_microbatches divide that
     # follows is the gradient-accumulation scaling — keep it.
     return (
-        loss.bfloat16(),
+        loss,
         torch.tensor(1, dtype=torch.int, device='cuda'),
         metrics,
     )
