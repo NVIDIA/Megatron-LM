@@ -658,11 +658,13 @@ class Attention(MegatronModule, ABC):
 
         block_table = None
         if inference_context.is_static_batching():
-            # Copy key and values.
+            # Static prefill still populates the cache for decode, but compute should keep the
+            # original key/value tensors because re-reading the cache slice can change strides.
             inference_key_memory[sequence_start:sequence_end, batch_start:batch_end, ...] = key
             inference_value_memory[sequence_start:sequence_end, batch_start:batch_end, ...] = value
-            key = inference_key_memory[:sequence_end, batch_start:batch_end, ...]
-            value = inference_value_memory[:sequence_end, batch_start:batch_end, ...]
+            if inference_context.sequence_len_offset > 0:
+                key = inference_key_memory[:sequence_end, batch_start:batch_end, ...]
+                value = inference_value_memory[:sequence_end, batch_start:batch_end, ...]
         else:
             pp_layer_offset = self._get_pp_layer_offset_for_inference()
 

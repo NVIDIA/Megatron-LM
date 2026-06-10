@@ -9,6 +9,8 @@ from packaging import version
 
 import megatron.core.parallel_state as parallel_state
 from megatron.core.hyper_comm_grid import HyperCommGrid
+from megatron.core.inference.contexts import StaticInferenceContext
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings.rope_utils import (
     get_pos_emb_on_this_cp_rank as get_tensor_on_this_cp_rank,
 )
@@ -41,6 +43,58 @@ try:
     HAVE_FUSED_QKV_ROPE = True
 except ImportError:
     HAVE_FUSED_QKV_ROPE = False
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for TE attention")
+@pytest.mark.skipif(not is_te_min_version("1.0.0"), reason="Transformer Engine is required")
+def test_static_prefill_flash_decode_matches_uncached_attention():
+    Utils.initialize_model_parallel(1, 1)
+    model_parallel_cuda_manual_seed(123)
+    try:
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=256,
+            num_attention_heads=4,
+            num_query_groups=4,
+            use_cpu_initialization=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            flash_decode=True,
+        )
+        attention = SelfAttention(
+            config,
+            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection(tp=None, cp=None),
+        ).cuda()
+        attention.eval()
+
+        sequence_length = 64
+        hidden_states = torch.randn(
+            sequence_length,
+            1,
+            config.hidden_size,
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+
+        with torch.no_grad():
+            expected_output, _ = attention(hidden_states, attention_mask=None)
+            inference_context = StaticInferenceContext(
+                max_batch_size=1, max_sequence_length=sequence_length
+            )
+            inference_context.enable_prefill_mode()
+            with InferenceMode.active():
+                actual_output, _ = attention(
+                    hidden_states, attention_mask=None, inference_context=inference_context
+                )
+
+        torch.testing.assert_close(actual_output, expected_output, rtol=0, atol=0)
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.parametrize("output_gate", [False, True])
