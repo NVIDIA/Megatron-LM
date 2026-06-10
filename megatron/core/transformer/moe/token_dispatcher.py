@@ -18,6 +18,7 @@ from megatron.core.tensor_parallel import (
 )
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.fused_a2a import (
+    HYBRIDEP_TOKEN_ALIGNMENT,
     fused_combine,
     fused_dispatch,
     hybrid_ep_combine,
@@ -489,6 +490,10 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
             self.cudagraph_attrs.append('shared_experts.gate_score')
         self.cudagraph_attrs.append('shared_experts.cached_fc1_input')
 
+    def _local_expert_chunk_sort_is_identity(self) -> bool:
+        """Return true when permutation 2 would only copy already grouped local chunks."""
+        return self.tp_size == 1 and self.ep_size == 1
+
     def preprocess(self, routing_map: torch.Tensor) -> torch.Tensor:
         """
         Preprocesses the token routing map for All-to-All communication and token permutation.
@@ -744,7 +749,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
             "before_permutation_2", self.tokens_per_expert
         )
-        if self.num_local_experts > 1:
+        if self.num_local_experts > 1 and not self._local_expert_chunk_sort_is_identity():
             if self.drop_and_pad:
                 global_input_tokens = (
                     global_input_tokens.view(
@@ -790,7 +795,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         parallel dimension.
         """
         # Unpermutation 2: Unsort tokens by local expert.
-        if self.num_local_experts > 1:
+        if self.num_local_experts > 1 and not self._local_expert_chunk_sort_is_identity():
             if self.drop_and_pad:
                 hidden_states = (
                     hidden_states.view(
@@ -1049,24 +1054,64 @@ class _HybridEPManager(_DispatchManager):
 
         self.moe_expert_rank_capacity_factor = self.config.moe_expert_rank_capacity_factor
         self.over_budget = torch.zeros(1, dtype=torch.bool, device='cuda')
+        # THD sequence packing can produce different token counts per rank.
+        # HybridEP dispatch expects equal per-rank input sizes, so metadata and
+        # hidden states are padded to the group-wide max and trimmed in combine.
+        self._original_num_tokens: Optional[int] = None
+        self._padded_num_tokens: Optional[int] = None
 
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         num_tokens = routing_map.shape[0]
-        self.routing_map = routing_map.reshape(num_tokens, self.num_experts)
-        self.token_probs = probs.reshape(num_tokens, self.num_experts)
+        self._original_num_tokens = num_tokens
+
+        padded_num_tokens = num_tokens
+        equalize_thd_token_counts = (
+            self.config.sequence_packing_scheduler is not None
+            or self.config.moe_hybridep_pad_variable_tokens
+        )
+        if equalize_thd_token_counts:
+            # Use the actual tp_ep max so all ranks in the MoE communication
+            # group pass the same token count to HybridEP.
+            max_num_tokens_across_ep = torch.tensor(
+                [num_tokens], device=routing_map.device, dtype=torch.long
+            )
+            torch.distributed.all_reduce(
+                max_num_tokens_across_ep, op=torch.distributed.ReduceOp.MAX, group=self.group
+            )
+            padded_num_tokens = int(max_num_tokens_across_ep.item())
+            padded_num_tokens += -padded_num_tokens % HYBRIDEP_TOKEN_ALIGNMENT
+        self._padded_num_tokens = padded_num_tokens
+
+        routing_map = routing_map.reshape(num_tokens, self.num_experts)
+        probs = probs.reshape(num_tokens, self.num_experts)
+        if equalize_thd_token_counts and padded_num_tokens > num_tokens:
+            pad_rows = padded_num_tokens - num_tokens
+            routing_map = torch.cat(
+                [routing_map, routing_map.new_zeros((pad_rows, self.num_experts))], dim=0
+            )
+            probs = torch.cat([probs, probs.new_zeros((pad_rows, self.num_experts))], dim=0)
+
+        self.routing_map = routing_map
+        self.token_probs = probs
 
         if self.moe_expert_rank_capacity_factor is not None:
             pad_multiple = get_align_size_for_quantization(self.config)
+            # Static upper bound on permuted tokens passed to HybridEP (dropless EP rank
+            # budget). Tokens above this budget are dropped inside HybridEP; dispatch then
+            # sets overflow_flag on the handle (accumulated in over_budget in dispatch()).
             budget = int(
-                routing_map.shape[0]
+                padded_num_tokens
                 * self.config.moe_router_topk
                 * self.moe_expert_rank_capacity_factor
             )
+            # Round budget up to pad_multiple (FP8/FP4/CUTLASS alignment for permute buffers).
             budget += -budget % pad_multiple
             self.num_permuted_tokens = budget
+        # else: num_permuted_tokens stays None; HybridEP sizes buffers dynamically (CPU sync
+        # in dispatch) and does not drop tokens or report overflow.
         # Compute the capacity for each expert at the drop_and_pad mode
         if self.drop_and_pad:
-            num_out_tokens = num_tokens * self.config.moe_router_topk
+            num_out_tokens = padded_num_tokens * self.config.moe_router_topk
             # Drop and pad the input to capacity.
             self.capacity = get_capacity(
                 num_tokens=num_out_tokens,
@@ -1095,6 +1140,11 @@ class _HybridEPManager(_DispatchManager):
             self.token_probs = self.token_probs.float()  # downcast or upcast
         if self.config.fp8 or self.config.fp4:
             self.pad_multiple = get_align_size_for_quantization(self.config)
+        if self._padded_num_tokens is not None and hidden_states.shape[0] < self._padded_num_tokens:
+            pad_rows = self._padded_num_tokens - hidden_states.shape[0]
+            hidden_states = torch.cat(
+                [hidden_states, hidden_states.new_zeros((pad_rows, hidden_states.shape[-1]))], dim=0
+            )
         dispatched_hidden, self.dispatched_probs, _, tokens_per_expert, self.handle = (
             hybrid_ep_dispatch(
                 x=hidden_states,
@@ -1113,12 +1163,16 @@ class _HybridEPManager(_DispatchManager):
             )
         )
         if self.moe_expert_rank_capacity_factor is not None:
-            over_budget = self.handle[-1] != 0  # this is overflow_flag
+            # Static-budget path only: handle[-1] is HybridEP overflow_flag when tokens were
+            # dropped because permuted count exceeded num_permuted_tokens from setup_metadata.
+            over_budget = self.handle[-1] != 0
             self.over_budget |= over_budget
+        # When capacity factor is None, skip overflow tracking (no token drops). Actual
+        # permuted size is resolved below via tokens_per_expert.sum() (CPU sync).
 
         if self.num_permuted_tokens is None:
             self.tokens_per_expert = tokens_per_expert.to(torch.int64)
-            # self.num_permuted_tokens is necessary to allocate the output tensor for permute
+            # num_permuted_tokens is necessary to allocate the output tensor for combine.
             self.num_permuted_tokens = self.tokens_per_expert.sum()
         if self.moe_expert_rank_capacity_factor is not None:
             self.tokens_per_expert = tokens_per_expert.to(torch.int64)
@@ -1137,12 +1191,20 @@ class _HybridEPManager(_DispatchManager):
             pad_multiple=self.pad_multiple,
             fused=self.config.moe_permute_fusion_into_hybridep,
         )
+        if (
+            self._padded_num_tokens is not None
+            and self._original_num_tokens is not None
+            and hidden_states.shape[0] > self._original_num_tokens
+        ):
+            hidden_states = hidden_states[: self._original_num_tokens]
         # Release the used handle/num_permuted_tokens which could change in each iteration.
         # For drop_and_pad mode, we don't need to reset the num_permuted_tokens and
         # num_dispatched_tokens, because their values never change.
         self.handle = None
         if not self.drop_and_pad:
             self.num_permuted_tokens = None
+        self._original_num_tokens = None
+        self._padded_num_tokens = None
         return hidden_states
 
     def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:

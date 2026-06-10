@@ -52,9 +52,12 @@ def get_buffer(group: torch.distributed.ProcessGroup, hidden_bytes: int):
         num_nvl_bytes = max(
             config.get_nvl_buffer_size_hint(hidden_bytes, group.size()), num_nvl_bytes
         )
-        num_rdma_bytes = max(
-            config.get_rdma_buffer_size_hint(hidden_bytes, group.size()), num_rdma_bytes
-        )
+        # Local-only EP groups do not need an RDMA buffer, and DeepEP builds
+        # without internode support may not expose RDMA size hints.
+        if group.size() > torch.cuda.device_count():
+            num_rdma_bytes = max(
+                config.get_rdma_buffer_size_hint(hidden_bytes, group.size()), num_rdma_bytes
+            )
 
     # Allocate buffer if not existed or not enough buffer
     # NOTES: the adaptive routing configuration of the network **must be off**
@@ -276,6 +279,9 @@ except ImportError:
 
 _hybrid_ep_buffer = None
 
+# HybridEP dispatch/combine kernels use 64-token chunks for their public APIs.
+HYBRIDEP_TOKEN_ALIGNMENT = 64
+
 
 def init_hybrid_ep_buffer(
     group: torch.distributed.ProcessGroup,
@@ -302,8 +308,8 @@ def init_hybrid_ep_buffer(
             Process group for HybridEP all-to-all communication.
         hidden_dim (int):
             Hidden dimension of the input tensor.
-        seq_len (int):
-            Maximum sequence length of the input tensor.
+        num_tokens (int):
+            Maximum token count of the input tensor.
         num_local_experts (int):
             Number of local experts.
         num_sms_dispatch_api (Optional[int]):
@@ -394,19 +400,6 @@ class HybridEPDispatch(torch.autograd.Function):
 
         if _hybrid_ep_buffer is None:
             num_tokens, hidden_dim = x.shape[-2:]
-
-            # --- Hardware Limit Guardrail ---
-            # DeepEP calculates tx_depth = 3 * num_tokens + 1.
-            # InfiniBand strictly asserts tx_depth < 65536.
-            tx_depth = 3 * num_tokens + 1
-            if tx_depth >= 65536:
-                raise ValueError(
-                    f"HybridEP RDMA Queue Pair depth ({tx_depth}) exceeds the InfiniBand "
-                    f"hardware limit of 65535. This occurs because the total tokens per rank "
-                    f"({num_tokens}) too high. Reduce sequence length or micro-batch size, "
-                    f"or increase Tensor Parallelism (TP) / Context Parallelism (CP) to reduce "
-                    f"the number of tokens processed per rank."
-                )
             fp8_dispatch = False  # Currently, we do not support fp8 dispatch
             init_hybrid_ep_buffer(
                 group,

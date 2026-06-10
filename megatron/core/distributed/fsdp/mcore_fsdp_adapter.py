@@ -68,6 +68,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
     _MODULE_TYPE_REGISTRY: Dict[str, set] = {
         "column": {
             "ColumnParallelLinear",
+            "LinearCrossEntropyModule",
             "TEColumnParallelLinear",
             "TELayerNormColumnParallelLinear",
             "TEColumnParallelGroupedLinear",
@@ -199,6 +200,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
                 enable_fine_grained_param_gather_hook=(
                     (config.fp8_recipe == "mxfp8" and ddp_config.fp8_param_gather)
                     or config.overlap_moe_expert_parallel_comm
+                    or self.ddp_config.megatron_fsdp_enable_fine_grained_param_gather
                 ),
                 enable_fine_grained_param_gather_backward_hook=(
                     config.overlap_moe_expert_parallel_comm
