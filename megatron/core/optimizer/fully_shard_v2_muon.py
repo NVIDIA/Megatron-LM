@@ -21,6 +21,8 @@ import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
 
+from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import copy_chunk_metadata
+
 from .emerging_optimizers import HAVE_EMERGING_OPTIMIZERS
 from .optimizer import MegatronOptimizer
 
@@ -67,12 +69,12 @@ class MuonGradPackage:
     def update_momentum(self, opt, coef):
         for param_idx in self.param_ids:
             grad = opt._main_grads[param_idx]
-            momentum = opt._momentum_buffers[param_idx]
             if grad is None:
                 continue
             grad_shard = grad.to_local().reshape(-1)
             if grad_shard.numel() == 0:
                 continue
+            momentum = opt._momentum_buffers[param_idx]
             momentum.mul_(coef).add_(grad_shard)
             if opt._nesterov:
                 torch.add(grad_shard, momentum, alpha=coef, out=grad_shard)
@@ -102,7 +104,7 @@ class MuonGradPackage:
                 full_grad = torch.empty(
                     main_weight.shape.numel(),
                     dtype=momentum.dtype,
-                    device=main_weight.device,
+                    device=momentum.device,
                 )
                 full_grads[param_idx] = full_grad
                 if this_size > 0:
@@ -237,6 +239,8 @@ class FullyShardV2Muon(torch.optim.Optimizer):
         grads: the gradient DTensor for each param, aligned 1:1 with the flattened
             params (asserted to be DTensors). This is the sole gradient source —
             replaces the old ParameterGroup back-reference path.
+        momentum_buffers: flat local momentum tensors owned by the outer Megatron
+            optimizer adapter and updated in-place by this inner optimizer.
         lr / momentum / nesterov / weight_decay: Muon update hyperparameters.
         num_ns_steps / coefficient_type / scale_mode / extra_scale_factor: NS +
             scaling config used by ``orthogonalize``.
@@ -249,6 +253,7 @@ class FullyShardV2Muon(torch.optim.Optimizer):
         self,
         params,
         grads,
+        momentum_buffers,
         *,
         lr: float,
         momentum: float = 0.95,
@@ -261,7 +266,19 @@ class FullyShardV2Muon(torch.optim.Optimizer):
         fp32_matmul_prec: str = "medium",
         tp_mode: str = "duplicated",
     ) -> None:
-        super().__init__(params, dict(lr=lr, weight_decay=weight_decay))
+        super().__init__(
+            params,
+            dict(
+                lr=lr,
+                momentum=momentum,
+                nesterov=nesterov,
+                weight_decay=weight_decay,
+                num_ns_steps=num_ns_steps,
+                coefficient_type=coefficient_type,
+                scale_mode=scale_mode,
+                extra_scale_factor=extra_scale_factor,
+            ),
+        )
 
         param_list = [param for group in self.param_groups for param in group["params"]]
         grad_list = list(grads)
@@ -273,9 +290,20 @@ class FullyShardV2Muon(torch.optim.Optimizer):
         assert all(
             grad is None or isinstance(grad, DTensor) for grad in grad_list
         ), "FullyShardV2Muon expects every grad to be a DTensor or None."
+        momentum_list = list(momentum_buffers)
+        assert len(momentum_list) == len(param_list), (
+            f"FullyShardV2Muon got {len(momentum_list)} momentum buffers for "
+            f"{len(param_list)} params."
+        )
+        for param_idx, (param, momentum_buffer) in enumerate(zip(param_list, momentum_list)):
+            assert momentum_buffer.numel() == param.to_local().numel(), (
+                f"Muon momentum buffer for param {param_idx} has {momentum_buffer.numel()} "
+                f"elements, expected {param.to_local().numel()}."
+            )
 
         self._main_weights = param_list
         self._main_grads = grad_list
+        self._momentum_buffers = momentum_list
 
         # Hyperparameters read by step() and MuonGradPackage methods.
         self._momentum_coef = momentum
@@ -294,13 +322,6 @@ class FullyShardV2Muon(torch.optim.Optimizer):
 
         self._shard_ranges = self._compute_shard_ranges()
         self._roots = self._assign_roots()
-
-        self._momentum_buffers = []
-        for param_idx, (main_weight, grad) in enumerate(zip(self._main_weights, self._main_grads)):
-            _offset, local_size = self._shard_ranges[param_idx][self._comm[param_idx][1]]
-            dtype = grad.dtype if grad is not None else main_weight.dtype
-            momentum_buffer = torch.zeros(local_size, dtype=dtype, device=main_weight.device)
-            self._momentum_buffers.append(momentum_buffer)
 
         self._ns_costs = [
             main_weight.shape.numel() * min(main_weight.shape)
@@ -519,14 +540,18 @@ class FullyShardV2MuonOptimizer(MegatronOptimizer):
 
         # Build the inner optimizer from the FSDP-v2 2D-matrix dist_params + their grad
         # DTensors. The inner optimizer orders params by communication need.
-        params, grads = [], []
+        params, grads, names = [], [], []
+        momentum_buffers, momentum_dtensors = [], []
+        seen_names = set()
         for chunk in self.model_chunks:
             root = chunk if isinstance(chunk, FSDPModule) else chunk.module
-            for m in root.modules():
+            for module_name, m in root.named_modules():
                 if not isinstance(m, FSDPModule):
                     continue
-                for param_group in m._fsdp_param_groups:
-                    for dist_param, dist_grad in zip(param_group.dist_params, param_group.dist_grads):
+                for param_names, param_group in m._named_param_groups:
+                    for param_name, dist_param, dist_grad in zip(
+                        param_names, param_group.dist_params, param_group.dist_grads
+                    ):
                         # filter by the param's global attrs only (rank-consistent); keep
                         # grad aligned even when None (empty shard) so collectives match
                         if dist_param.dim() == 2 and not getattr(
@@ -534,7 +559,37 @@ class FullyShardV2MuonOptimizer(MegatronOptimizer):
                         ):
                             params.append(dist_param)
                             grads.append(dist_grad)
-        super().__init__(FullyShardV2Muon(params, grads, **muon_hyperparams), config)
+                            full_name = (
+                                f"{module_name}.{param_name}" if module_name else param_name
+                            )
+                            if full_name in seen_names:
+                                raise ValueError(
+                                    f"Duplicate Muon parameter name for checkpointing: {full_name}"
+                                )
+                            dtype = dist_grad.dtype if dist_grad is not None else dist_param.dtype
+                            local_param = dist_param.to_local()
+                            local_momentum = torch.zeros(
+                                local_param.numel(), dtype=dtype, device=local_param.device
+                            )
+                            momentum_dtensor = DTensor.from_local(
+                                local_tensor=local_momentum.view(local_param.shape),
+                                device_mesh=dist_param.device_mesh,
+                                placements=dist_param.placements,
+                                run_check=False,
+                                shape=dist_param.shape,
+                                stride=dist_param.stride(),
+                            )
+                            copy_chunk_metadata(dist_param, momentum_dtensor)
+                            names.append(full_name)
+                            momentum_buffers.append(local_momentum)
+                            momentum_dtensors.append(momentum_dtensor)
+                            seen_names.add(full_name)
+        super().__init__(
+            FullyShardV2Muon(params, grads, momentum_buffers, **muon_hyperparams), config
+        )
+        self._param_names = names
+        self._momentum_buffers = momentum_buffers
+        self._momentum_dtensors = momentum_dtensors
         self.is_stub_optimizer = False
 
     # --- Excluded from the chained grad-norm / clip / zero-count machinery. ---
@@ -579,14 +634,102 @@ class FullyShardV2MuonOptimizer(MegatronOptimizer):
     def reload_model_params(self, state_dict=None):
         pass
 
+    def _param_name(self, param: torch.Tensor) -> str:
+        params = [p for group in self.optimizer.param_groups for p in group["params"]]
+        param_to_name = dict(zip(params, self._param_names))
+        assert param in param_to_name, f"Muon parameter {param} is not named."
+        return param_to_name[param]
+
+    def _param_groups_to_param2group_meta(self) -> dict[str, dict]:
+        param_to_group_meta = {}
+        for group in self.optimizer.param_groups:
+            group_meta = group.copy()
+            del group_meta["params"]
+            for param in group["params"]:
+                param_to_group_meta[self._param_name(param)] = group_meta
+        return param_to_group_meta
+
+    def _sync_hyperparams_from_state_dict(self, state_dict: dict):
+        param_groups = state_dict.get("param_groups")
+        if param_groups is None and "param_to_group_meta" in state_dict:
+            param_to_group_meta = state_dict["param_to_group_meta"]
+            param_groups = []
+            for group in self.optimizer.param_groups:
+                group_meta = None
+                for param in group["params"]:
+                    name = self._param_name(param)
+                    if name in param_to_group_meta:
+                        group_meta = param_to_group_meta[name]
+                        break
+                if group_meta is not None:
+                    param_groups.append(group_meta)
+        if not param_groups:
+            return
+
+        group = param_groups[0]
+        group = {key: value for key, value in group.items() if key != "params"}
+        self.optimizer.param_groups[0].update(group)
+        self.optimizer._momentum_coef = group.get("momentum", self.optimizer._momentum_coef)
+        self.optimizer._weight_decay = group.get("weight_decay", self.optimizer._weight_decay)
+        self.optimizer._nesterov = group.get("nesterov", self.optimizer._nesterov)
+        self.optimizer._num_ns_steps = group.get("num_ns_steps", self.optimizer._num_ns_steps)
+        self.optimizer._coefficient_type = group.get(
+            "coefficient_type", self.optimizer._coefficient_type
+        )
+        self.optimizer._scale_mode = group.get("scale_mode", self.optimizer._scale_mode)
+        self.optimizer._extra_scale_factor = group.get(
+            "extra_scale_factor", self.optimizer._extra_scale_factor
+        )
+
+    def _load_momentum_state(self, state: dict):
+        named = not all(isinstance(key, int) for key in state.keys())
+        for idx, momentum_buffer in enumerate(self._momentum_buffers):
+            key = self._param_names[idx] if named else idx
+            if key not in state:
+                momentum_buffer.zero_()
+                continue
+            loaded = state[key].get("momentum_buffer")
+            if loaded is None:
+                momentum_buffer.zero_()
+                continue
+            loaded_local = loaded.to_local() if isinstance(loaded, DTensor) else loaded
+            assert loaded_local.numel() == momentum_buffer.numel(), (
+                f"Loaded Muon momentum for param {idx} has {loaded_local.numel()} "
+                f"elements, expected {momentum_buffer.numel()}."
+            )
+            momentum_buffer.copy_(
+                loaded_local.reshape(-1).to(
+                    device=momentum_buffer.device, dtype=momentum_buffer.dtype
+                )
+            )
+
     def state_dict(self):
-        # TODO: checkpoint the sharded Muon momentum buffers.
-        return {}
+        param_groups = []
+        next_param_id = 0
+        for group in self.optimizer.param_groups:
+            group_state = {key: value for key, value in group.items() if key != "params"}
+            param_count = len(group["params"])
+            group_state["params"] = list(range(next_param_id, next_param_id + param_count))
+            next_param_id += param_count
+            param_groups.append(group_state)
+        return {
+            "state": {
+                idx: {"momentum_buffer": momentum}
+                for idx, momentum in enumerate(self._momentum_dtensors)
+            },
+            "param_groups": param_groups,
+        }
 
     def load_state_dict(self, state_dict):
-        # TODO: restore the sharded Muon momentum buffers.
-        pass
+        self._sync_hyperparams_from_state_dict(state_dict)
+        self._load_momentum_state(state_dict["state"])
 
     def sharded_state_dict(self, model_sharded_state_dict, is_loading: bool = False, **kwargs):
-        # TODO: sharded checkpoint support for the Muon momentum.
-        return {}
+        named_state = {
+            param_name: {"momentum_buffer": momentum}
+            for param_name, momentum in zip(self._param_names, self._momentum_dtensors)
+        }
+        return {
+            "state": named_state,
+            "param_to_group_meta": self._param_groups_to_param2group_meta(),
+        }
