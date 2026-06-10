@@ -92,6 +92,7 @@ class GatedDeltaNet(MegatronModule):
         use_qk_l2norm: bool = True,
         A_init_range: Tuple[float, float] = (1, 16),
         pg_collection: ProcessGroupCollection = None,
+        name: str | None = None,
         **kwargs,
     ):
         """
@@ -106,6 +107,7 @@ class GatedDeltaNet(MegatronModule):
             A_init_range: The initialization range for the attention weights.
             pg_collection: The required process groups to use for tensor model parallel and context
                 parallel.
+            name (str | None): module instance name passed top-down from its paranet module
         """
 
         if not HAVE_FLA:
@@ -182,6 +184,7 @@ class GatedDeltaNet(MegatronModule):
             is_expert=False,
             tp_comm_buffer_name="fc1",
             tp_group=self.pg_collection.tp,
+            name=(name + ".in_proj") if name is not None else None,
         )
 
         # Conv1d for QKV
@@ -254,6 +257,7 @@ class GatedDeltaNet(MegatronModule):
             is_expert=False,
             tp_comm_buffer_name="fc2",
             tp_group=self.pg_collection.tp,
+            name=(name + ".out_proj") if name is not None else None,
         )
 
         self.reset_parameters()
@@ -337,12 +341,14 @@ class GatedDeltaNet(MegatronModule):
                 packed_seq_params.cu_seqlens_q,
                 seq_len,
                 "cu_seqlens_q",
+                cp_size=self.cp_size,
             )
             cu_seqlens_kv = self._resolve_cu_seqlens(
                 packed_seq_params.cu_seqlens_kv_padded,
                 packed_seq_params.cu_seqlens_kv,
                 seq_len,
                 "cu_seqlens_kv",
+                cp_size=self.cp_size,
             )
             assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
                 "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
@@ -594,19 +600,28 @@ class GatedDeltaNet(MegatronModule):
         beta = beta.sigmoid()
         return g, beta
 
-    def _resolve_cu_seqlens(self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name):
+    def _resolve_cu_seqlens(
+        self, cu_seqlens_padded, cu_seqlens_actual, total_seq_len, name, cp_size: int = 1
+    ):
         """Resolve cu_seqlens for packed sequence all-to-all, handling alignment padding."""
         if cu_seqlens_padded is not None:
             cu_seqlens = cu_seqlens_padded
         else:
             cu_seqlens = cu_seqlens_actual
 
-        total_cu = cu_seqlens[-1].item()
+        total_cu = cu_seqlens[-1].cpu().item()
         if total_cu != total_seq_len:
             raise ValueError(
                 f"GDN: {name}[-1]={total_cu} does not match "
                 f"total_sequence_length={total_seq_len}. "
                 f"({cu_seqlens_padded=}, {cu_seqlens_actual=})."
+            )
+
+        seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        if (seq_lengths % cp_size != 0).any():
+            raise ValueError(
+                f"All per-sequence lengths in cu_seqlens must be divisible by cp_size={cp_size}, "
+                f"but got lengths: {seq_lengths.tolist()}"
             )
 
         return cu_seqlens
@@ -711,10 +726,11 @@ class GatedDeltaNet(MegatronModule):
 
 def _unpack_sequence(x, cu_seqlens, dim=1):
     unpacked_x = []
-    num_seqs = cu_seqlens.shape[0] - 1
+    cu_seqlens_list = cu_seqlens.tolist()
+    num_seqs = len(cu_seqlens_list) - 1
     for i in range(num_seqs):
-        idx_start = cu_seqlens[i].item()
-        idx_end = cu_seqlens[i + 1].item()
+        idx_start = cu_seqlens_list[i]
+        idx_end = cu_seqlens_list[i + 1]
         chunked_index = [slice(None)] * dim + [slice(idx_start, idx_end)]
         unpacked_x.append(x[tuple(chunked_index)])
     return unpacked_x

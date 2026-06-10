@@ -332,7 +332,11 @@ def reset_model_temporary_tensors(config: TransformerConfig, model: List[torch.n
                 module.reset_global_aux_loss_tracker()
 
 
-def _update_router_expert_bias(model: List[torch.nn.Module], config: TransformerConfig):
+def _update_router_expert_bias(
+    model: List[torch.nn.Module],
+    config: TransformerConfig,
+    tp_dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+):
     """
     Update the expert bias of the router for a global batch.
     This requires all-reduce of local_tokens_per_expert across TPxCPxDP ranks
@@ -358,7 +362,10 @@ def _update_router_expert_bias(model: List[torch.nn.Module], config: Transformer
     stacked_tokens_per_expert = torch.stack(tokens_per_expert_list, dim=0)
     stacked_expert_bias = torch.stack(expert_bias_list, dim=0)
     stacked_updated_expert_bias = get_updated_expert_bias(
-        stacked_tokens_per_expert, stacked_expert_bias, config.moe_router_bias_update_rate
+        stacked_tokens_per_expert,
+        stacked_expert_bias,
+        config.moe_router_bias_update_rate,
+        tp_dp_cp_group=tp_dp_cp_group,
     )
 
     for expert_bias, updated_expert_bias in zip(expert_bias_list, stacked_updated_expert_bias):
@@ -456,6 +463,7 @@ def finalize_model_grads(
     """
 
     config = get_model_config(model[0])
+    tp_dp_cp_group = None
     if pg_collection is not None:
         assert hasattr(pg_collection, 'tp')
         assert hasattr(pg_collection, 'pp')
@@ -474,6 +482,11 @@ def finalize_model_grads(
             "If you don't need pos_embd_group, you need to explicitly set it to None."
         )
         assert hasattr(pg_collection, 'dp_cp')
+        if config.moe_router_enable_expert_bias:
+            assert hasattr(pg_collection, 'tp_dp_cp') and pg_collection.tp_dp_cp is not None, (
+                "pg_collection must have tp_dp_cp when " "moe_router_enable_expert_bias is enabled."
+            )
+            tp_dp_cp_group = pg_collection.tp_dp_cp
         tp_group = pg_collection.tp
         pp_group = pg_collection.pp
         embd_group = pg_collection.embd
@@ -527,7 +540,11 @@ def finalize_model_grads(
         config.timers('embedding-grads-all-reduce').stop()
 
     if config.moe_router_enable_expert_bias:
-        _update_router_expert_bias(model, config)
+        if pg_collection is None:
+            tp_dp_cp_group = parallel_state.get_tensor_and_data_parallel_group(
+                with_context_parallel=True
+            )
+        _update_router_expert_bias(model, config, tp_dp_cp_group=tp_dp_cp_group)
 
     reset_model_temporary_tensors(config, model)
 
@@ -544,7 +561,10 @@ def finalize_model_grads(
 
         # all-reduce across DP ranks.
         torch.distributed.all_reduce(num_tokens, group=dp_cp_group)
+
+        # Clamp to avoid div-by-zero without a host-side branch on a device tensor,
+        # which would otherwise cause a sync that is illegal during CUDA graph capture.
+        safe_num_tokens = torch.clamp(num_tokens, min=1)
+        scaling = 1.0 / safe_num_tokens
         for model_chunk in model:
-            if num_tokens > 0:
-                scaling = 1.0 / num_tokens
-                model_chunk.scale_gradients(scaling)
+            model_chunk.scale_gradients(scaling)

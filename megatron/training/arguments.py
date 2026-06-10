@@ -155,11 +155,27 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
 
-    # Args to disable MSC
-    if not args.enable_msc:
+    # Args to enable MSC (opt-in: disabled by default)
+    if args.disable_msc_deprecated:
+        warn_rank_0(
+            '--disable-msc is deprecated and will be removed in a future release. '
+            'MSC is now disabled by default; pass --enable-msc to opt in.'
+        )
+        # Preserve legacy semantics: --disable-msc forces MSC off, even if
+        # --enable-msc was also passed.
+        args.enable_msc = False
+
+    if args.enable_msc:
+        MultiStorageClientFeature.enable()
+        if not MultiStorageClientFeature.is_enabled():
+            raise RuntimeError(
+                "--enable-msc was passed but the multistorageclient package is not "
+                "installed. Install it with `pip install multi-storage-client`."
+            )
+        warn_rank_0('The MSC feature is enabled.')
+    else:
         MultiStorageClientFeature.disable()
         assert MultiStorageClientFeature.is_enabled() is False
-        warn_rank_0('The MSC feature is disabled.')
 
     return args
 
@@ -1727,6 +1743,12 @@ def validate_args(args, defaults={}):
             total_cp_ranks = args.context_parallel_size
         else:
             total_cp_ranks = args.data_parallel_size * args.context_parallel_size
+        if args.max_seqlen_per_dp_cp_rank is None:
+            args.max_seqlen_per_dp_cp_rank = getattr(args, "max_seqlen_per_cp_rank", None)
+        if args.max_seqlen_per_dp_cp_rank is None:
+            args.max_seqlen_per_dp_cp_rank = (
+                args.seq_length + total_cp_ranks - 1
+            ) // total_cp_ranks
         assert total_cp_ranks * args.max_seqlen_per_dp_cp_rank >= args.seq_length, (
             f'Packed sequence buffer size ({total_cp_ranks * args.max_seqlen_per_dp_cp_rank}) '
             f'must be >= single sequence max length ({args.seq_length})'
@@ -1754,6 +1776,11 @@ def validate_args(args, defaults={}):
         assert all(
             token is not None for token in extra_tokens
         ), "FIM extra tokens should be specified."
+
+    assert not (args.cross_entropy_loss_fusion and args.cross_entropy_fusion_impl == 'te'), (
+        "Transformer Engine cross entropy loss fusion is disabled due to stability issues. "
+        "Use --cross-entropy-fusion-impl native, or omit --cross-entropy-loss-fusion."
+    )
 
     # Deterministic mode
     if args.deterministic_mode:
@@ -2559,6 +2586,25 @@ def _add_inference_args(parser):
         'Pause/unpause take effect as soon as the signal is delivered to a rank. '
         'Only safe when EP coordination is not required (e.g. ep_world_size == 1).',
     )
+    group.add_argument(
+        '--inference-cuda-graph-all-prefills',
+        action='store_true',
+        default=False,
+        help='Extend prefill/mixed CUDA graph capture up to `max_tokens`. '
+        'By default, all graphs are limited by the decode limit of '
+        '`max_requests * (num_speculative_tokens + 1)`.',
+    )
+    group.add_argument(
+        '--inference-dynamic-batching-cuda-graph-sizing-distribution',
+        type=str,
+        default='exponential',
+        choices=['exponential', 'linear'],
+        dest='inference_dynamic_batching_cuda_graph_sizing_distribution',
+        help='Spacing of CUDA graph token counts. "exponential" (default) '
+        'halves from cuda_graph_max_tokens down to tp_size, giving a '
+        'log-spaced distribution with bounded relative padding. '
+        '"linear" uses varying linear strides across the range.',
+    )
     return parser
 
 
@@ -2568,6 +2614,7 @@ def _add_network_size_args(parser):
         "timers",
         "finalize_model_grads_func",
         "grad_scale_func",
+        "mtp_grad_scale_func",
         "no_sync_func",
         "grad_sync_func",
         "param_sync_func",
@@ -4057,6 +4104,19 @@ def _add_distributed_args(parser):
                        This is quite useful for profiling memory usage of distributed training with just one GPU. \
                        Setting WORLD_SIZE and RANK to the specific values for target distribtued scale.',
     )
+    group.add_argument(
+        '--no-use-layer-wise-param-layout',
+        action='store_false',
+        dest='use_layer_wise_param_layout',
+        help='Opt out of the precomputed LayerWise param layout. When set, '
+        'falls back to the legacy LayerWise ping-pong path: all params '
+        '(including non-Muon embeddings, biases, layernorm) live in a single '
+        'LayerWise buffer and the optimizer uses the allgather_params() codepath. '
+        'The default (precomputed layout) routes non-Muon params through a '
+        'separate DistributedOptimizer with byte-level sharding, which is faster '
+        'and uses less padding but produces different bf16 reduction ordering '
+        'and so will not match legacy-path loss curves bit-for-bit.',
+    )
     return parser
 
 
@@ -4868,6 +4928,22 @@ def _add_experimental_args(parser):
         "be used for the gradient communication / reduction data-type. When using NCCL "
         "v2.27+, reduction is always computed in FP32 if using NCCL Symmetric kernels.",
     )
+    group.add_argument(
+        '--megatron-fsdp-enable-fine-grained-param-gather',
+        action='store_true',
+        default=False,
+        dest='megatron_fsdp_enable_fine_grained_param_gather',
+        help=(
+            'If set, enables fine-grained parameter gathering for Megatron-FSDP. '
+            'This allows greater overlap between parameter all-gather operations and '
+            'forward computation, at the cost of additional communication calls. '
+            'For MXFP8, this helps save memory during fine-grained activation '
+            'recomputation, because MXFP8 forward and backward passes use different '
+            'parameter representations (rowwise data for forward, colwise data for '
+            'backward). Only the rowwise parameters of modules involved in '
+            'recomputation will be unsharded.'
+        ),
+    )
 
     return parser
 
@@ -4875,11 +4951,20 @@ def _add_experimental_args(parser):
 def _add_msc_args(parser):
     group = parser.add_argument_group(title="msc")
     group.add_argument(
-        '--disable-msc',
-        default=True,
-        action='store_false',
+        '--enable-msc',
+        default=False,
+        action='store_true',
         dest='enable_msc',
-        help='Disable the usage of Multi-Storage Client (MSC) in Megatron Core.',
+        help='Enable the usage of Multi-Storage Client (MSC) in Megatron Core. '
+        'Disabled by default; pass this flag to opt in.',
+    )
+    group.add_argument(
+        '--disable-msc',
+        default=False,
+        action='store_true',
+        dest='disable_msc_deprecated',
+        help='[DEPRECATED] MSC is disabled by default; this flag is a no-op '
+        'and will be removed in a future release.',
     )
     return parser
 

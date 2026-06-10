@@ -12,6 +12,7 @@ from megatron.core.enums import ModelType
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_layer_with_transformer_engine_submodules,
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -36,11 +37,14 @@ from megatron.core.transformer.cuda_graphs import (
     _layer_is_graphable,
 )
 from megatron.core.transformer.enums import CudaGraphModule, CudaGraphScope, InferenceCudaGraphScope
-from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
+from megatron.core.transformer.module import GraphableMegatronModule
+from megatron.core.transformer.mlp import MLPSubmodules
+from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
+from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
+from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from megatron.training import arguments as training_arguments
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
@@ -597,10 +601,10 @@ class TestLLaVACudaGraph:
         )
 
         # Get layer specs
-        language_layer_spec = get_gpt_layer_with_transformer_engine_spec()
+        language_layer_submodules = get_gpt_layer_with_transformer_engine_submodules()
         vision_layer_spec = get_vit_layer_with_transformer_engine_spec()
-        assert isinstance(language_layer_spec.submodules, TransformerLayerSubmodules)
-        vision_projection_spec = deepcopy(language_layer_spec.submodules.mlp.submodules)
+        vision_projection_spec = deepcopy(get_submodules(language_layer_submodules.mlp))
+        assert isinstance(vision_projection_spec, MLPSubmodules)
 
         # Set vision model type
         vision_config.vision_model_type = "clip"
@@ -609,7 +613,9 @@ class TestLLaVACudaGraph:
         # Create LLaVA model with both encoder and decoder
         self.llava_model = LLaVAModel(
             language_transformer_config=language_config,
-            language_transformer_layer_spec=language_layer_spec,
+            language_transformer_layer_spec=ModuleSpec(
+                module=TransformerLayer, submodules=language_layer_submodules
+            ),
             language_vocab_size=8192,
             language_max_sequence_length=4096,
             vision_transformer_config=vision_config,
@@ -1622,6 +1628,49 @@ class TestInlineCaptureManager:
         assert (
             runner.num_warmup_steps == 0
         ), f"Expected 0 warmup steps (manager override), got {runner.num_warmup_steps}"
+
+
+class TestSkipFp8WeightUpdateTensor:
+    """Regression test for the TE 2.15 ``set_skip_fp8_weight_update_tensor`` removal."""
+
+    @staticmethod
+    def _read_skip_tensor():
+        from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+        getter = getattr(FP8GlobalStateManager, "get_skip_fp8_weight_update_tensor", None)
+        if getter is not None:
+            return getter()
+        return FP8GlobalStateManager.quantization_state.skip_fp8_weight_update_tensor
+
+    @staticmethod
+    def _reset_skip_tensor():
+        from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+        if "skip_fp8_weight_update_tensor" in vars(FP8GlobalStateManager):
+            FP8GlobalStateManager.skip_fp8_weight_update_tensor = None
+        qstate = getattr(FP8GlobalStateManager, "quantization_state", None)
+        if qstate is not None and hasattr(qstate, "skip_fp8_weight_update_tensor"):
+            qstate.skip_fp8_weight_update_tensor = None
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+    def test_sets_value_in_place(self):
+        """Helper writes the right value and reuses the same storage across calls."""
+        from megatron.core.transformer.cuda_graphs import _set_skip_fp8_weight_update_tensor
+
+        self._reset_skip_tensor()
+        try:
+            _set_skip_fp8_weight_update_tensor(True)
+            t = self._read_skip_tensor()
+            assert t.shape == (1,) and t.dtype == torch.float32 and t.is_cuda
+            assert t.item() == 1.0
+
+            # data_ptr must stay stable so captured cudagraphs read the same address.
+            ptr = t.data_ptr()
+            _set_skip_fp8_weight_update_tensor(False)
+            assert self._read_skip_tensor().data_ptr() == ptr
+            assert self._read_skip_tensor().item() == 0.0
+        finally:
+            self._reset_skip_tensor()
 
 
 if __name__ == "__main__":

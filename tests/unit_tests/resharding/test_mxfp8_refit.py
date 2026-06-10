@@ -128,6 +128,23 @@ class TestMXFP8ReshardTransform:
 # ===========================================================================
 
 
+def _pre_quantize_linear(model: torch.nn.Module) -> None:
+    """Replace every Linear's BF16 weight with an ``nn.Parameter`` wrapping a
+    Transformer-Engine MXFP8 tensor.  ``quantize_params_to_mxfp8`` accepts
+    inputs whose ``.data`` is a TEMXFP8Tensor; it does not accept plain BF16
+    ``nn.Parameter`` (production callers wrap weights via TE's ``fp8_param``
+    machinery before calling this function).
+    """
+    import transformer_engine_torch as tex
+    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
+
+    quantizer = MXFP8Quantizer(fp8_dtype=tex.DType.kFloat8E4M3, rowwise=True, columnwise=False)
+    for submodule in model.modules():
+        if isinstance(submodule, torch.nn.Linear):
+            te_mxfp8 = quantizer(submodule.weight.data)
+            submodule.weight = torch.nn.Parameter(te_mxfp8, requires_grad=False)
+
+
 class TestQuantizeParamsToMXFP8:
     """Tests for persistent buffer quantization (quantization/utils.py).
 
@@ -140,6 +157,7 @@ class TestQuantizeParamsToMXFP8:
         from megatron.core.inference.quantization.utils import quantize_params_to_mxfp8
 
         model = torch.nn.Linear(128, 64, bias=False).to(dtype=torch.bfloat16, device="cuda")
+        _pre_quantize_linear(model)
         buffers = quantize_params_to_mxfp8(model)
 
         assert "weight" in buffers
@@ -152,11 +170,13 @@ class TestQuantizeParamsToMXFP8:
         from megatron.core.inference.quantization.utils import quantize_params_to_mxfp8
 
         model = torch.nn.Linear(128, 64, bias=False).to(dtype=torch.bfloat16, device="cuda")
+        _pre_quantize_linear(model)
         buffers = quantize_params_to_mxfp8(model)
         data_ptr = buffers["weight"].data.data_ptr()
         scale_ptr = buffers["weight"].scale.data_ptr()
 
         model2 = torch.nn.Linear(128, 64, bias=False).to(dtype=torch.bfloat16, device="cuda")
+        _pre_quantize_linear(model2)
         quantize_params_to_mxfp8(model2, persistent_buffers=buffers)
 
         assert buffers["weight"].data.data_ptr() == data_ptr
@@ -170,6 +190,7 @@ class TestQuantizeParamsToMXFP8:
         model = torch.nn.Sequential(
             torch.nn.Linear(128, 64, bias=False), torch.nn.Linear(64, 32, bias=False)
         ).to(dtype=torch.bfloat16, device="cuda")
+        _pre_quantize_linear(model)
         buffers = quantize_params_to_mxfp8(model)
 
         assert "0.weight" in buffers and "1.weight" in buffers
