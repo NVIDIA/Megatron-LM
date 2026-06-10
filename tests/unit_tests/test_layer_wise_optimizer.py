@@ -59,6 +59,57 @@ class TinyModel(nn.Module):
         return self.fc1(x)
 
 
+class _FakeLayerwiseBucket:
+    def __init__(self, params):
+        self.params_list = params
+        self.params = set(params)
+        self.layerwise_params_list = None
+        self.layerwise_param_flat_sizes = None
+
+    def set_layerwise_params_list(self, layerwise_params_list):
+        self.layerwise_params_list = layerwise_params_list
+        self.layerwise_param_flat_sizes = [
+            sum(param.numel() for param in param_list) for param_list in layerwise_params_list
+        ]
+
+
+class _FakeBucketGroup:
+    def __init__(self, buckets):
+        self.buckets = buckets
+
+
+class _FakeModelChunk:
+    def __init__(self, bucket):
+        self.bucket_groups = [_FakeBucketGroup([bucket])]
+        self.expert_parallel_bucket_groups = []
+
+
+def test_set_bucket_layerwise_params_list_single_dp_rank():
+    """Single-DP-rank LayerWise buckets should still receive param lists.
+
+    Regression for #5203: shard_params() sets dp_cp_params_list to None when
+    dp_cp_size == 1, but set_bucket_layerwise_params_list() still needs to
+    initialize bucket.layerwise_params_list for the overlap param-gather path.
+    """
+    params = [
+        torch.nn.Parameter(torch.empty(4, 4)),
+        torch.nn.Parameter(torch.empty(2, 2)),
+    ]
+    for param in params:
+        param.is_managed_by_layer_wise_optimizer = True
+    bucket = _FakeLayerwiseBucket(params)
+
+    optimizer = object.__new__(LayerWiseDistributedOptimizer)
+    optimizer.pg_collection = ProcessGroupCollection(dp_cp=None, expt_dp=None)
+    optimizer.dp_cp_params_list = None
+    optimizer.expt_dp_params_list = None
+
+    optimizer.set_bucket_layerwise_params_list([_FakeModelChunk(bucket)])
+
+    assert bucket.layerwise_params_list == [params]
+    assert bucket.layerwise_param_flat_sizes == [sum(param.numel() for param in params)]
+
+
 @pytest.mark.skipif(
     int(os.getenv('WORLD_SIZE', '1')) == 1, reason="Multi-rank test requires WORLD_SIZE > 1"
 )
