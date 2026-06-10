@@ -105,7 +105,7 @@ def colocated_forward_backward_with_pp(
         if cached.get('packing_kwargs') is not None:
             forward_kwargs['packing_kwargs'] = cached['packing_kwargs']
         output_tensor, loss_mask = model(**forward_kwargs)
-        return output_tensor, partial(_loss_func, cached['loss_mask'])
+        return output_tensor, partial(_loss_func, loss_mask)
 
     # Swap in a capturing finalize so the inner PP schedule does not run DDP
     # grad sync before Phase 3 has produced encoder grads. The capture also

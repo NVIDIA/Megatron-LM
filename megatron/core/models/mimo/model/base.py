@@ -392,12 +392,14 @@ class MimoModel(MegatronModule):
         if self.role.mode == ModuleLayout.COLOCATED:
             if self.lm_has_pp and input_tensors is not None:
                 # PP>1 non-first stage: hidden states from P2P
-                lm_result = self._forward_language_module(
+                lm_result, loss_mask = self._forward_language_module(
                     input_ids,
                     position_ids,
                     attention_mask,
+                    loss_mask,
                     labels,
                     {MIMO_LANGUAGE_MODULE_KEY: input_tensors},
+                    packing_kwargs,
                 )
                 # Unwrap dict for P2P (schedule uses plain tensors, not dicts)
                 if isinstance(lm_result, dict):
