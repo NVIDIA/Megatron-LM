@@ -675,7 +675,8 @@ _TE_EP_MISSING_MSG = (
 
 
 def ensure_nccl_ep_bootstrapped(
-    ep_group, num_experts, max_tokens_per_rank, recv_capacity_per_rank, hidden_dim, num_sms=0
+    ep_group, num_experts, max_tokens_per_rank, recv_capacity_per_rank, hidden_dim, num_sms=0,
+    zero_copy=False,
 ):
     """Initialize the process-wide NCCL EP context once. Idempotent.
 
@@ -705,6 +706,7 @@ def ensure_nccl_ep_bootstrapped(
         recv_capacity_per_rank=recv_capacity_per_rank,
         hidden_dim=hidden_dim,
         max_num_sms=num_sms,
+        zero_copy=zero_copy,
     )
 
 
@@ -719,11 +721,11 @@ def nccl_ep_finalize():
 
 
 class NcclEpContext:
-    """Per-MoE-layer NCCL EP routing context: one TE ``EpHandle`` + one ``EpBuffer``.
+    """Per-MoE-layer NCCL EP routing context: one TE ``EpBuffer`` (routing handle_mem + payload slots).
 
-    Holds a single handle+buffer, which a forward overwrites in place. Under pipeline
+    Holds a single buffer, which a forward overwrites in place. Under pipeline
     parallelism (1F1B) several microbatches are in flight at once, so each in-flight execution
-    must use its own context -- a second forward on the same handle/buffer before the first's
+    must use its own context -- a second forward on the same buffer before the first's
     backward consumes it would corrupt that backward. Concurrent contexts are managed by
     :class:`NcclEpContextPool`; do not share one context across in-flight executions.
 
@@ -758,18 +760,18 @@ class NcclEpContext:
             raise RuntimeError(_TE_EP_MISSING_MSG)
         if use_symm_mem and ep_group is None:
             raise ValueError("NcclEpContext(use_symm_mem=True) requires ep_group.")
-        self.handle = te_ep.EpHandle(
+        # TE selects the symm-mem (zero-copy) payload path when an ep_group is passed (paired with
+        # ep_bootstrap(zero_copy=True)); ep_group=None gives the HBM staged-copy path.
+        self.buffer = te_ep.EpBuffer(
             top_k=top_k,
             max_tokens_per_rank=max_tokens_per_rank,
             recv_capacity_per_rank=recv_capacity_per_rank,
             hidden_dim=hidden_dim,
             num_local_experts=num_local_experts,
             alignment=alignment,
+            ep_group=ep_group if use_symm_mem else None,
             payload_dtype=payload_dtype,
         )
-        # TE selects the symm-mem (zero-copy) payload path when an ep_group is passed (paired with
-        # ep_bootstrap(zero_copy=True)); ep_group=None gives the HBM staged-copy path.
-        self.buffer = te_ep.EpBuffer(self.handle, ep_group=ep_group if use_symm_mem else None)
         self.state = "free"
         self.generation = 0
 
@@ -922,7 +924,7 @@ if HAVE_TE_EP:
             non-differentiable.
         """
         recv_tokens, dispatched_probs, tokens_per_expert = te_ep.ep_dispatch(
-            context.handle, context.buffer, tokens, topk_idx, topk_weights
+            context.buffer, tokens, topk_idx, topk_weights
         )
         return recv_tokens, tokens_per_expert, dispatched_probs
 
@@ -934,14 +936,14 @@ if HAVE_TE_EP:
             expert_out (torch.Tensor): Expert outputs ``[recv_capacity_per_rank, hidden]``,
                 already weighted.
             num_local_tokens (int): Rows of the result (local token count for this
-                forward). When None, TE uses ``handle.max_tokens_per_rank``.
+                forward). When None, TE uses ``buffer.max_tokens_per_rank``.
 
         Returns:
             torch.Tensor: ``[num_local_tokens, hidden]`` combined output, in local token
             order.
         """
         return te_ep.ep_combine(
-            context.handle, context.buffer, expert_out, num_local_tokens=num_local_tokens
+            context.buffer, expert_out, num_local_tokens=num_local_tokens
         )
 
 else:

@@ -885,6 +885,13 @@ class TransformerConfig(ModelParallelConfig):
     actual per-expert counts (sum < recv_capacity) over the full static buffer, avoiding the wasted
     slack GEMM -- but this requires CuTe DSL GEMM that consumes ragged per-expert counts"""
 
+    moe_ncclep_use_symm_mem: bool = False
+    """For the 'ncclep' flex dispatcher: use the NCCL symmetric-memory zero-copy IO path
+    (ep_bootstrap zero_copy + symm-mem-backed receive/combine buffers) instead of the default HBM
+    staged-copy path. Peers read combine inputs directly via symm-mem, avoiding the combine-side
+    staging copy. Requires the EP group to support symm-mem (intra-node NVLink domain). Defaults to
+    False."""
+
     moe_mlp_glu_interleave_size: Optional[int] = None
     """When set, GLU activations in the MoE grouped MLP layer will use a
     block interleaved format. Instead of interpreting the input tensor
