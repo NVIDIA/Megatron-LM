@@ -129,8 +129,7 @@ class TestCudaGraphConfigAndArguments:
 
     def test_local_impl_rejects_full_layer_graph_with_activation_offload(self):
         with pytest.raises(
-            AssertionError,
-            match="not supported with whole-layer CUDA graph capture",
+            AssertionError, match="not supported with whole-layer CUDA graph capture"
         ):
             _base_cuda_graph_config(
                 cuda_graph_impl='local',
