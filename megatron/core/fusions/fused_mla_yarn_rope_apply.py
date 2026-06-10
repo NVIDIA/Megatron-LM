@@ -45,6 +45,12 @@ def _get_thd_token_idx(cu_seqlens, pid_m, seq_num, cp_rank, cp_size):
             this_seq_len = cur_cum_seqlen - last_cum_seqlen
         last_cum_seqlen = cur_cum_seqlen
         seq_idx += 1
+    # Padding tokens beyond cu_seqlens[-1] (from THD CUDA-graph padding)
+    # never match any sequence, leaving token_idx == -1.  Clamp to 0 so
+    # the cos/sin table loads stay in-bounds; the wrong RoPE result is
+    # harmless because padding positions are excluded by loss_mask.
+    if token_idx == -1:
+        token_idx = tl.full((), 0, dtype=tl.int64)
     if cp_size > 1:
         if token_idx < this_seq_len // 2:
             token_idx = token_idx + cp_rank * this_seq_len // 2

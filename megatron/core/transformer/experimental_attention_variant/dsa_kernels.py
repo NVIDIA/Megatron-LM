@@ -1025,7 +1025,6 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         if is_thd:
             total_q = q_indexer.shape[0]
             idx_nh = q_indexer.shape[1]
-            n_comp = k_indexer.shape[0]
             np_, d = query.shape[1], query.shape[2]
 
             q_indexer_flat = q_indexer
@@ -1035,7 +1034,6 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             sq, b, np_, d = query.shape
             skv = kv_full.shape[0]
             idx_nh = q_indexer.shape[2]
-            n_comp = k_indexer.shape[0]
 
             q_indexer_flat = q_indexer.permute(1, 0, 2, 3).contiguous()
             k_indexer_flat = k_indexer.permute(1, 0, 2).contiguous()
@@ -1051,14 +1049,17 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         else:
             w_indexer_scaled = w_indexer
 
-        effective_topk = min(indexer_topk, n_comp)
-
         # ---- 2. Indexer scoring + top-K (with scores retained). ---------------
+        # Pass the original ``indexer_topk`` (not min(indexer_topk, n_comp)) so
+        # that the output is always padded to a fixed size.  flash_mla_sparse_fwd
+        # requires a consistent TopK dimension; _indexer_topk_core handles the
+        # case where sk < topk internally (selects min(topk, sk) values, then
+        # pads to topk with -1).
         topk_indices_cmp, _, indexer_scores = _indexer_topk_core(
             q_indexer_flat,
             k_indexer_flat,
             w_indexer_scaled,
-            effective_topk,
+            indexer_topk,
             ratio,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_kv=cu_seqlens_compressed_idx,
@@ -1081,7 +1082,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             )
             combined_local = torch.cat(
                 [compress_topk_idxs, window_idxs], dim=-1
-            )  # (total_q, eff_topk + win_topk)
+            )  # (total_q, indexer_topk + win_topk)
             global_idxs = local_to_global_flat(
                 combined_local,
                 batch_size=-1,
@@ -1109,7 +1110,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             softmax_scale,
             attn_sink=attn_sink,
             topk_length=None,
-            indexer_topk=effective_topk,
+            indexer_topk=indexer_topk,
         )
 
         # ---- 5. Derive predict from indexer_scores, compute target. ----------
@@ -1349,6 +1350,30 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             sq, b, skv = ctx.sq, ctx.b, ctx.skv
             dO_flat = grad_output.reshape(sq * b, np_, d_v)
 
+        # Workaround for cudnn DSA ``sparse_attention_backward_wrapper`` bug:
+        # the kernel's inner dKV-tile loop is bounded by
+        # ``ceil(max_seqlen_kv / block_tile)`` instead of
+        # ``ceil(topk_width / block_tile)``, silently dropping topk-axis
+        # tiles past column ``max_seqlen_kv``. Compact each row so all
+        # valid entries land in ``[0, max_seqlen_kv)``; the dropped tail
+        # becomes pure ``-1`` padding (already a no-op in the kernel).
+        # Math-equivalent because per-query softmax/sum are
+        # order-invariant — only the SET of valid indices matters, not
+        # their position within the row.
+        topk_width = global_idxs.shape[-1]
+        max_seqlen_kv = kv_flat.shape[0]
+        if topk_width > max_seqlen_kv:
+            sentinel = torch.iinfo(global_idxs.dtype).max
+            gi = torch.where(
+                global_idxs >= 0, global_idxs, torch.full_like(global_idxs, sentinel)
+            )
+            gi, _ = torch.sort(gi, dim=-1, stable=True)
+            global_idxs_bwd = torch.where(
+                gi >= sentinel, torch.full_like(gi, -1), gi
+            ).contiguous()
+        else:
+            global_idxs_bwd = global_idxs
+
         attn_bwd = _DSA.sparse_attention_backward_wrapper(
             q_flat,
             kv_flat,
@@ -1356,7 +1381,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             dO_flat,
             lse,
             attn_sink,
-            global_idxs,
+            global_idxs_bwd,
             softmax_scale=ctx.softmax_scale,
             topk_length=None,
         )

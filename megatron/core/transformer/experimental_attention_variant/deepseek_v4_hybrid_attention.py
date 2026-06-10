@@ -382,6 +382,11 @@ class DSv4HybridAttention(Attention):
                 mla_rotary_interleaved=True,
                 inverse=True,
                 mla_output_remove_interleaving=True,
+                max_seqlen=(
+                    int(packed_seq_params.max_seqlen_kv)
+                    if packed_seq and packed_seq_params.max_seqlen_kv is not None
+                    else None
+                ),
             )
             if packed_seq:
                 rot_part = rot_part_out.unsqueeze(1)
@@ -669,6 +674,12 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
 
                 # RoPE and query (shared for wkv and latent)
                 # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
+                _max_seqlen_q = (
+                    int(packed_seq_params.max_seqlen_q)
+                    if packed_seq_params is not None
+                    and packed_seq_params.max_seqlen_q is not None
+                    else None
+                )
                 q_pos_emb = apply_rotary_pos_emb(
                     q_pos_emb,
                     rotary_pos_emb,
@@ -678,6 +689,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     cp_group=self.pg_collection.cp,
                     mla_rotary_interleaved=True,
                     mla_output_remove_interleaving=True,
+                    max_seqlen=_max_seqlen_q,
                 )
                 # query: [num_tokens, n, (qk_head_dim + v_head_dim)]
                 query = torch.cat([q_no_pe, q_pos_emb], dim=-1)
@@ -686,6 +698,12 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                 kv_no_pe, k_pos_emb = torch.split(kv, [kv.size(-1) - pos_dim, pos_dim], dim=-1)
 
                 # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
+                _max_seqlen_kv = (
+                    int(packed_seq_params.max_seqlen_kv)
+                    if packed_seq_params is not None
+                    and packed_seq_params.max_seqlen_kv is not None
+                    else None
+                )
                 k_pos_emb = apply_rotary_pos_emb(
                     k_pos_emb,
                     rotary_pos_emb,
@@ -695,6 +713,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     cp_group=self.pg_collection.cp,
                     mla_rotary_interleaved=True,
                     mla_output_remove_interleaving=True,
+                    max_seqlen=_max_seqlen_kv,
                 )
 
                 # Single head: key = value = [num_tokens, 1, v_head_dim]
