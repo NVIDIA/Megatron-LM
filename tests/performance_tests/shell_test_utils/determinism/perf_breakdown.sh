@@ -1,6 +1,6 @@
 #!/bin/bash
 # Det-vs-nondet per-NVTX-range perf breakdown for pretrain_gpt.py.
-# Usage: bash scripts/determinism/perf_breakdown.sh /tmp/leaderboards /tmp/logs
+# Usage: bash tests/performance_tests/shell_test_utils/determinism/perf_breakdown.sh /tmp/leaderboards /tmp/logs
 # CUDA_DEVICE_MAX_CONNECTIONS=1 is required for TP>1 on pre-Blackwell.
 set -euo pipefail
 
