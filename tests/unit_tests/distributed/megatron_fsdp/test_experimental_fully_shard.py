@@ -285,7 +285,7 @@ def test_meta_parameters_initialize_with_reset_parameters(setup: DistributedSetu
     fully_shard(model, mesh=mesh, placements=_flat_placements())
 
     (group,) = model.parameter_groups()
-    full_weight = group.model_weight.allgather(0).get_tensor(0)
+    full_weight = group.model_weight.allgather(0).get_local_tensor(0)
     assert not full_weight.is_meta
     torch.testing.assert_close(full_weight, torch.full_like(full_weight, 3.0))
 
