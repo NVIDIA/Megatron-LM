@@ -25,13 +25,10 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
 from megatron.lite.model.qwen3_moe.common import is_expert_param
-from megatron.lite.model.qwen3_moe.lite.checkpoint import (
-    EXPERT_CLASSIFIER,
-    PLACEMENT_FN,
-    load_hf_weights as _load_hf_weights_impl,
-)
+from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
+from megatron.lite.model.qwen3_moe.lite.checkpoint import EXPERT_CLASSIFIER, PLACEMENT_FN
+from megatron.lite.model.qwen3_moe.lite.checkpoint import load_hf_weights as _load_hf_weights_impl
 from megatron.lite.model.qwen3_moe.lite.model import MTPLossAutoScaler, Qwen3MoEModel
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.modules.lora import (
@@ -44,6 +41,16 @@ from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
 from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
 
+__all__ = [
+    "EXPERT_CLASSIFIER",
+    "ImplConfig",
+    "PLACEMENT_FN",
+    "build_model",
+    "build_model_config",
+    "export_hf_weights",
+    "load_hf_weights",
+    "vocab_size",
+]
 
 # ---------------------------------------------------------------------------
 # ImplConfig
@@ -181,7 +188,8 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
         for i in range(vpp):
             chunks.append(
                 Qwen3MoEModel(model_cfg, ps, vpp=vpp, vpp_chunk_id=i, **model_kwargs)
-                .to(torch.bfloat16).cuda()
+                .to(torch.bfloat16)
+                .cuda()
             )
 
     # ── recompute ──
@@ -209,9 +217,7 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
     finalize_grads = None
     post_model_load_hook = None
     if impl_cfg.optimizer == "mc":
-        from megatron.lite.primitive.optimizers.megatron_wrap import (
-            build_mc_training_optimizer,
-        )
+        from megatron.lite.primitive.optimizers.megatron_wrap import build_mc_training_optimizer
 
         optimizer, finalize_grads = build_mc_training_optimizer(
             chunks,
@@ -225,10 +231,7 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
         from megatron.lite.primitive.ckpt import attach_model_sharded_state_dict
 
         attach_model_sharded_state_dict(
-            chunks,
-            ps,
-            get_placements=PLACEMENT_FN,
-            is_expert=is_expert_param,
+            chunks, ps, get_placements=PLACEMENT_FN, is_expert=is_expert_param
         )
         optimizer_backend = "distopt"
     elif impl_cfg.optimizer == "fsdp2":
@@ -236,9 +239,7 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
 
         def _post_model_load_hook():
             from megatron.lite.model.qwen3_moe.lite.model import TransformerLayer
-            from megatron.lite.primitive.optimizers.fsdp2 import (
-                build_fsdp2_training_optimizer,
-            )
+            from megatron.lite.primitive.optimizers.fsdp2 import build_fsdp2_training_optimizer
 
             return {
                 "optimizer": build_fsdp2_training_optimizer(
@@ -253,7 +254,7 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
                     # CE path reads head.col.linear.weight directly, and the
                     # embedding path is also driven from model.forward().
                     leaf_module_names=(),
-                ),
+                )
             }
 
         post_model_load_hook = _post_model_load_hook
@@ -293,10 +294,7 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
 
 
 def load_hf_weights(
-    chunk: nn.Module,
-    hf_path: str,
-    model_cfg: Qwen3MoEConfig,
-    ps: ParallelState,
+    chunk: nn.Module, hf_path: str, model_cfg: Qwen3MoEConfig, ps: ParallelState
 ) -> None:
     """Load HF pretrained weights into model chunk."""
     if not hf_path:
@@ -305,10 +303,7 @@ def load_hf_weights(
 
 
 def export_hf_weights(
-    chunks: list[nn.Module],
-    model_cfg: Qwen3MoEConfig,
-    ps: ParallelState,
-    **kwargs,
+    chunks: list[nn.Module], model_cfg: Qwen3MoEConfig, ps: ParallelState, **kwargs
 ):
     """Export HF weights from model chunks."""
     from megatron.lite.model.qwen3_moe.lite.checkpoint import export_hf_weights as _export

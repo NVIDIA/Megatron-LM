@@ -18,14 +18,14 @@ import inspect
 import torch
 import torch.nn as nn
 import transformer_engine.pytorch as te
+
 from megatron.core.models.common.embeddings.rope_utils import (  # pyright: ignore[reportMissingImports]
     _apply_rotary_pos_emb_bshd,
     _apply_rotary_pos_emb_thd,
 )
-from megatron.core.models.common.embeddings.rotary_pos_embedding import (  # pyright: ignore[reportMissingImports]
-    RotaryEmbedding as MCoreRotaryEmbedding,
+from megatron.core.models.common.embeddings.rotary_pos_embedding import (
+    RotaryEmbedding as MCoreRotaryEmbedding,  # pyright: ignore[reportMissingImports]
 )
-
 from megatron.lite.primitive.modules.gqa_utils import split_grouped_qkvg
 from megatron.lite.primitive.modules.lora import LinearLoRA, LoraConfig, normalize_lora_config
 from megatron.lite.primitive.modules.mrope import MultimodalRotaryEmbedding
@@ -38,9 +38,12 @@ from megatron.lite.primitive.utils import ensure_divisible
 # (Megatron-LM/megatron/core/extensions/transformer_engine.py:1501-1593).
 _KEPT_PSP_FIELDS = (
     "qkv_format",
-    "cu_seqlens_q", "cu_seqlens_kv",
-    "cu_seqlens_q_padded", "cu_seqlens_kv_padded",
-    "max_seqlen_q", "max_seqlen_kv",
+    "cu_seqlens_q",
+    "cu_seqlens_kv",
+    "cu_seqlens_q_padded",
+    "cu_seqlens_kv_padded",
+    "max_seqlen_q",
+    "max_seqlen_kv",
 )
 
 
@@ -50,8 +53,7 @@ def _callable_accepts_kwarg(fn, kwarg: str) -> bool:
     except (TypeError, ValueError):
         return False
     return any(
-        param.kind is inspect.Parameter.VAR_KEYWORD or param.name == kwarg
-        for param in parameters
+        param.kind is inspect.Parameter.VAR_KEYWORD or param.name == kwarg for param in parameters
     )
 
 
@@ -103,18 +105,24 @@ class GQAttention(nn.Module):
         # Mismatched order would put bucket boundaries in different places,
         # producing different per-rank fp32 master shard layouts and
         # non-bitwise step-1 divergence.
-        self.proj = RowParallelLinear(
-            num_attention_heads * head_dim, hidden_size, ps, bias=False,
-        )
+        self.proj = RowParallelLinear(num_attention_heads * head_dim, hidden_size, ps, bias=False)
         q_cols = num_attention_heads * (2 if output_gate else 1)
         qkv_size = (q_cols + 2 * num_key_value_heads) * head_dim
         self.qkv = ColumnParallelLinear(
-            hidden_size, qkv_size, ps,
-            bias=False, normalization="RMSNorm", eps=rms_norm_eps,
+            hidden_size,
+            qkv_size,
+            ps,
+            bias=False,
+            normalization="RMSNorm",
+            eps=rms_norm_eps,
             zero_centered_gamma=zero_centered_gamma,
         )
-        self.q_norm = te.RMSNorm(head_dim, eps=rms_norm_eps, zero_centered_gamma=zero_centered_gamma)
-        self.k_norm = te.RMSNorm(head_dim, eps=rms_norm_eps, zero_centered_gamma=zero_centered_gamma)
+        self.q_norm = te.RMSNorm(
+            head_dim, eps=rms_norm_eps, zero_centered_gamma=zero_centered_gamma
+        )
+        self.k_norm = te.RMSNorm(
+            head_dim, eps=rms_norm_eps, zero_centered_gamma=zero_centered_gamma
+        )
 
         lora = normalize_lora_config(lora_config)
         self.qkv_lora: LinearLoRA | None = None
@@ -169,9 +177,8 @@ class GQAttention(nn.Module):
                 rotary_base=rope_theta,
                 cp_group=ps.cp_group if ps.cp_size > 1 else None,
             )
-        self._rotary_accepts_packed_seq = (
-            self._mrope_section is None
-            and _callable_accepts_kwarg(self.rotary.forward, "packed_seq")
+        self._rotary_accepts_packed_seq = self._mrope_section is None and _callable_accepts_kwarg(
+            self.rotary.forward, "packed_seq"
         )
 
         cp_kwargs = {}
@@ -195,10 +202,7 @@ class GQAttention(nn.Module):
         )
 
     def forward(
-        self,
-        x: torch.Tensor,
-        position_ids: torch.Tensor | None = None,
-        packed_seq_params=None,
+        self, x: torch.Tensor, position_ids: torch.Tensor | None = None, packed_seq_params=None
     ) -> torch.Tensor:
         qkv = self.qkv(x)
         if self.qkv_lora is not None:
@@ -254,13 +258,19 @@ class GQAttention(nn.Module):
             else:
                 freqs = self.rotary(seq_len_for_rope)
             q = _apply_rotary_pos_emb_thd(
-                q, packed_seq_params.cu_seqlens_q, freqs,
-                rotary_interleaved=False, mscale=1.0,
+                q,
+                packed_seq_params.cu_seqlens_q,
+                freqs,
+                rotary_interleaved=False,
+                mscale=1.0,
                 cp_group=self.ps.cp_group,
             )
             k = _apply_rotary_pos_emb_thd(
-                k, packed_seq_params.cu_seqlens_kv, freqs,
-                rotary_interleaved=False, mscale=1.0,
+                k,
+                packed_seq_params.cu_seqlens_kv,
+                freqs,
+                rotary_interleaved=False,
+                mscale=1.0,
                 cp_group=self.ps.cp_group,
             )
         else:
@@ -281,7 +291,9 @@ class GQAttention(nn.Module):
                 if getattr(packed_seq_params, k, None) is not None
             }
             attn_out = self.core_attn(
-                q, k, v,
+                q,
+                k,
+                v,
                 core_attention_bias_type="no_bias",
                 attn_mask_type="padding_causal",
                 **psp_kwargs,

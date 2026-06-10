@@ -92,7 +92,4 @@ class MegatronLiteConfig:
         )
 
 
-__all__ = [
-    "MegatronLiteConfig",
-    "DebugConfig",
-]
+__all__ = ["MegatronLiteConfig", "DebugConfig"]

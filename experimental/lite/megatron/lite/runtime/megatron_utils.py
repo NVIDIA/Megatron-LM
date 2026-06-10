@@ -146,7 +146,9 @@ def offload_optimizer(optimizer) -> None:
     for _opt in _iter_opts(optimizer, ChainedOptimizer):
         if _opt.optimizer is not None:
             hdo = _opt.optimizer
-            if all(hasattr(hdo, a) for a in ("sub_optimizers", "inner_param_to_orig_param", "state")):
+            if all(
+                hasattr(hdo, a) for a in ("sub_optimizers", "inner_param_to_orig_param", "state")
+            ):
                 for sub_opt in hdo.sub_optimizers:
                     for param, state in sub_opt.state.items():
                         for k, v in state.items():
@@ -196,9 +198,7 @@ def _iter_opts(optimizer, chained_cls):
 
 
 def build_sharded_state_dict(
-    model_list: list,
-    optimizer: Any = None,
-    lr_scheduler: Any = None,
+    model_list: list, optimizer: Any = None, lr_scheduler: Any = None
 ) -> dict[str, Any]:
     """Build sharded state dict for model + optimizer + lr_scheduler.
 
@@ -212,9 +212,7 @@ def build_sharded_state_dict(
         sharded_state_dict.update(chunk_sd)
 
     if optimizer is not None:
-        opt_sd = optimizer.sharded_state_dict(
-            model_sharded_state_dict=sharded_state_dict,
-        )
+        opt_sd = optimizer.sharded_state_dict(model_sharded_state_dict=sharded_state_dict)
         sharded_state_dict.update(opt_sd)
 
     if lr_scheduler is not None:

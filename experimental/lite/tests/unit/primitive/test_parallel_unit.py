@@ -15,7 +15,6 @@ from megatron.lite.primitive.parallel import (
     zigzag_split_for_cp,
 )
 
-
 pytestmark = pytest.mark.mlite
 
 
@@ -62,11 +61,7 @@ def test_pp_layout_marks_stage_boundaries_and_vpp_chunks():
 
 def test_thd_roll_keeps_sequence_boundaries():
     cu_seqlens = torch.tensor([0, 4, 8], dtype=torch.int32)
-    rolled, token_sum = roll_packed_thd_left(
-        torch.arange(8),
-        cu_seqlens_padded=cu_seqlens,
-        dims=0,
-    )
+    rolled, token_sum = roll_packed_thd_left(torch.arange(8), cu_seqlens_padded=cu_seqlens, dims=0)
 
     assert torch.equal(rolled, torch.tensor([1, 2, 3, 0, 5, 6, 7, 0]))
     assert token_sum.item() == 24
@@ -77,11 +72,7 @@ def test_thd_cp_split_and_reconstruct_roundtrip():
     tensor = torch.arange(8)
     parts = [
         split_packed_to_cp_local(
-            tensor,
-            cu_seqlens_padded=cu_seqlens,
-            cp_size=2,
-            cp_rank=rank,
-            dim=0,
+            tensor, cu_seqlens_padded=cu_seqlens, cp_size=2, cp_rank=rank, dim=0
         )
         for rank in range(2)
     ]

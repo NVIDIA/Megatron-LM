@@ -5,7 +5,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-
 pytestmark = pytest.mark.mlite
 
 
@@ -35,10 +34,7 @@ def _router_and_parallel_state(monkeypatch):
 
 def _router_config():
     return SimpleNamespace(
-        hidden_size=4,
-        num_experts=4,
-        num_experts_per_tok=2,
-        router_aux_loss_coef=0.1,
+        hidden_size=4, num_experts=4, num_experts_per_tok=2, router_aux_loss_coef=0.1
     )
 
 
@@ -58,25 +54,14 @@ def test_gqa_split_grouped_qkvg_preserves_q_gate_kv_order():
     split_grouped_qkvg = _split_grouped_qkvg()
     qkv = torch.arange(24).reshape(1, 24)
 
-    query, gate, key, value = split_grouped_qkvg(
-        qkv,
-        num_heads=4,
-        num_kv_heads=2,
-        head_dim=2,
-    )
+    query, gate, key, value = split_grouped_qkvg(qkv, num_heads=4, num_kv_heads=2, head_dim=2)
 
     assert query.shape == (1, 4, 2)
     assert gate.shape == (1, 4, 2)
     assert key.shape == (1, 2, 2)
     assert value.shape == (1, 2, 2)
-    assert torch.equal(
-        query,
-        torch.tensor([[[0, 1], [2, 3], [12, 13], [14, 15]]]),
-    )
-    assert torch.equal(
-        gate,
-        torch.tensor([[[4, 5], [6, 7], [16, 17], [18, 19]]]),
-    )
+    assert torch.equal(query, torch.tensor([[[0, 1], [2, 3], [12, 13], [14, 15]]]))
+    assert torch.equal(gate, torch.tensor([[[4, 5], [6, 7], [16, 17], [18, 19]]]))
     assert torch.equal(key, torch.tensor([[[8, 9], [20, 21]]]))
     assert torch.equal(value, torch.tensor([[[10, 11], [22, 23]]]))
 

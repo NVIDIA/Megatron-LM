@@ -27,11 +27,7 @@ def local_grad_sq_sum(
             total = torch.zeros((), device=grad.device, dtype=dtype)
         total += grad.detach().to(dtype).pow(2).sum()
     if total is None:
-        return torch.zeros(
-            (),
-            device=default_device or torch.device("cpu"),
-            dtype=dtype,
-        )
+        return torch.zeros((), device=default_device or torch.device("cpu"), dtype=dtype)
     return total
 
 
@@ -219,11 +215,7 @@ class FP32AdamW:
                 exp_avg.mul_(beta1).add_(grad, alpha=1.0 - beta1)
                 exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
                 denom = exp_avg_sq.sqrt().div_(bias_correction2_sqrt).add_(self.eps)
-                master.addcdiv_(
-                    exp_avg.to(dtype=torch.float32),
-                    denom,
-                    value=-group_step_size,
-                )
+                master.addcdiv_(exp_avg.to(dtype=torch.float32), denom, value=-group_step_size)
                 self._copy_master_to_param(param, master)
 
     def _prepare_grad(self, grad: torch.Tensor, master: torch.Tensor) -> torch.Tensor:
@@ -334,27 +326,16 @@ def build_adamw_optimizer(
         raise ValueError(f"adamw_foreach must be True, False, or 'auto', got {foreach!r}.")
     if foreach is False:
         return torch.optim.AdamW(
-            param_groups,
-            lr=lr,
-            weight_decay=weight_decay,
-            betas=betas,
-            eps=eps,
-            foreach=False,
+            param_groups, lr=lr, weight_decay=weight_decay, betas=betas, eps=eps, foreach=False
         )
 
     dtensor_param_groups, tensor_param_groups = split_dtensor_and_tensor_param_groups(
-        param_groups,
-        default_weight_decay=weight_decay,
+        param_groups, default_weight_decay=weight_decay
     )
     split_param_groups = [group for group in (dtensor_param_groups, tensor_param_groups) if group]
     if foreach == "auto" and not dtensor_param_groups:
         return torch.optim.AdamW(
-            param_groups,
-            lr=lr,
-            weight_decay=weight_decay,
-            betas=betas,
-            eps=eps,
-            foreach=False,
+            param_groups, lr=lr, weight_decay=weight_decay, betas=betas, eps=eps, foreach=False
         )
     if len(split_param_groups) <= 1:
         return torch.optim.AdamW(
@@ -367,12 +348,7 @@ def build_adamw_optimizer(
         )
     return ChainedOptimizer(
         torch.optim.AdamW(
-            group,
-            lr=lr,
-            weight_decay=weight_decay,
-            betas=betas,
-            eps=eps,
-            foreach=True,
+            group, lr=lr, weight_decay=weight_decay, betas=betas, eps=eps, foreach=True
         )
         for group in split_param_groups
     )
@@ -389,11 +365,7 @@ def maybe_build_te_fused_adam_optimizer(
     opt,
     use_fp32_master: bool,
 ) -> Any | None:
-    if not get_bool_opt(
-        opt,
-        "fsdp2_use_te_fused_adam",
-        default=False,
-    ):
+    if not get_bool_opt(opt, "fsdp2_use_te_fused_adam", default=False):
         return None
     try:
         from transformer_engine.pytorch.optimizers.fused_adam import FusedAdam
@@ -402,9 +374,7 @@ def maybe_build_te_fused_adam_optimizer(
 
     all_param_list = list(all_params)
     master_weights = get_bool_opt(
-        opt,
-        "master_weights",
-        default=use_fp32_master and should_use_master_weights(all_param_list),
+        opt, "master_weights", default=use_fp32_master and should_use_master_weights(all_param_list)
     )
     kwargs = dict(
         lr=lr,
@@ -413,26 +383,10 @@ def maybe_build_te_fused_adam_optimizer(
         eps=eps,
         adam_w_mode=True,
         master_weights=master_weights,
-        master_weight_dtype=get_dtype_opt(
-            opt,
-            "master_weight_dtype",
-            default=torch.float32,
-        ),
-        store_param_remainders=get_bool_opt(
-            opt,
-            "store_param_remainders",
-            default=master_weights,
-        ),
-        exp_avg_dtype=get_dtype_opt(
-            opt,
-            "exp_avg_dtype",
-            default=torch.float32,
-        ),
-        exp_avg_sq_dtype=get_dtype_opt(
-            opt,
-            "exp_avg_sq_dtype",
-            default=torch.float32,
-        ),
+        master_weight_dtype=get_dtype_opt(opt, "master_weight_dtype", default=torch.float32),
+        store_param_remainders=get_bool_opt(opt, "store_param_remainders", default=master_weights),
+        exp_avg_dtype=get_dtype_opt(opt, "exp_avg_dtype", default=torch.float32),
+        exp_avg_sq_dtype=get_dtype_opt(opt, "exp_avg_sq_dtype", default=torch.float32),
     )
     return FusedAdam(param_groups, **filter_supported_kwargs(FusedAdam.__init__, kwargs))
 
@@ -462,12 +416,7 @@ def get_bool_opt(opt, attr: str, *, default: bool) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
-def get_dtype_opt(
-    opt,
-    attr: str,
-    *,
-    default: torch.dtype,
-) -> torch.dtype:
+def get_dtype_opt(opt, attr: str, *, default: torch.dtype) -> torch.dtype:
     value = get_opt_value(opt, attr)
     if value is None:
         return default
@@ -497,9 +446,7 @@ def get_opt_value(opt, attr: str):
 
 
 def normalize_param_groups(
-    params: Iterable[nn.Parameter] | Iterable[dict[str, Any]],
-    *,
-    default_weight_decay: float,
+    params: Iterable[nn.Parameter] | Iterable[dict[str, Any]], *, default_weight_decay: float
 ) -> list[dict[str, Any]]:
     items = list(params)
     if not items:
@@ -519,9 +466,7 @@ def normalize_param_groups(
 
 
 def split_dtensor_and_tensor_param_groups(
-    param_groups: Iterable[dict[str, Any]],
-    *,
-    default_weight_decay: float,
+    param_groups: Iterable[dict[str, Any]], *, default_weight_decay: float
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     dtensor_groups: list[dict[str, Any]] = []
     tensor_groups: list[dict[str, Any]] = []
@@ -557,9 +502,7 @@ def iter_torch_optimizers(optimizer: Any) -> Iterable[torch.optim.Optimizer]:
 
 
 def dtensor_from_local(
-    local_tensor: torch.Tensor,
-    device_mesh: Any,
-    placements: Any,
+    local_tensor: torch.Tensor, device_mesh: Any, placements: Any
 ) -> torch.Tensor:
     from torch.distributed.tensor import DTensor
 

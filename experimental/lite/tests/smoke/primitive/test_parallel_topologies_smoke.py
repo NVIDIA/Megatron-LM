@@ -9,13 +9,7 @@ import torch.distributed as dist
 
 from megatron.lite.primitive.parallel import init_parallel
 
-
-pytestmark = [
-    pytest.mark.mlite,
-    pytest.mark.smoke,
-    pytest.mark.gpu,
-    pytest.mark.distributed,
-]
+pytestmark = [pytest.mark.mlite, pytest.mark.smoke, pytest.mark.gpu, pytest.mark.distributed]
 
 
 @pytest.fixture(scope="module", autouse=True)

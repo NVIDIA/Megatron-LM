@@ -54,19 +54,13 @@ class MoELayer(nn.Module):
         super().__init__()
         # Match Qwen3-MoE's `load_balancing_type="none"` setting: no aux loss.
         self.router = TopKRouter(
-            config, ps,
-            router_bias_rate=router_bias_rate,
-            compute_aux_loss=False,
+            config, ps, router_bias_rate=router_bias_rate, compute_aux_loss=False
         )
         self.experts = Experts(
-            config,
-            ps,
-            fp8=fp8,
-            moe_act_recompute=moe_act_recompute,
-            lora_config=lora_config,
+            config, ps, fp8=fp8, moe_act_recompute=moe_act_recompute, lora_config=lora_config
         )
         self.dispatcher = TokenDispatcher(
-            config.num_experts, config.hidden_size, ps, use_deepep=use_deepep,
+            config.num_experts, config.hidden_size, ps, use_deepep=use_deepep
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -154,7 +148,8 @@ class TransformerLayer(nn.Module):
         )
         self.mlp_norm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.moe = MoELayer(
-            config, ps,
+            config,
+            ps,
             use_deepep=use_deepep,
             router_bias_rate=router_bias_rate,
             fp8=fp8,
@@ -163,10 +158,7 @@ class TransformerLayer(nn.Module):
         )
 
     def forward(
-        self,
-        x: torch.Tensor,
-        position_ids: torch.Tensor | None = None,
-        packed_seq_params=None,
+        self, x: torch.Tensor, position_ids: torch.Tensor | None = None, packed_seq_params=None
     ) -> torch.Tensor:
         residual = x
         h = self.attn(x, position_ids=position_ids, packed_seq_params=packed_seq_params)
@@ -228,11 +220,7 @@ class MultiTokenPredictionLayer(nn.Module):
         self.enorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hnorm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.eh_proj = VanillaColumnParallelLinear(
-            config.hidden_size * 2,
-            config.hidden_size,
-            ps,
-            sp=ps.tp_size > 1,
-            gather_output=True,
+            config.hidden_size * 2, config.hidden_size, ps, sp=ps.tp_size > 1, gather_output=True
         )
         self.transformer_layer = TransformerLayer(
             config,
@@ -256,17 +244,13 @@ class MultiTokenPredictionLayer(nn.Module):
         rotary_position_ids: torch.Tensor | None = None,
         packed_seq_params=None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        attention_position_ids = rotary_position_ids if rotary_position_ids is not None else position_ids
-        input_ids, _ = roll_packed_thd_left(
-            input_ids,
-            packed_seq_params=packed_seq_params,
-            dims=-1,
+        attention_position_ids = (
+            rotary_position_ids if rotary_position_ids is not None else position_ids
         )
+        input_ids, _ = roll_packed_thd_left(input_ids, packed_seq_params=packed_seq_params, dims=-1)
         if position_ids is not None:
             position_ids, _ = roll_packed_thd_left(
-                position_ids,
-                packed_seq_params=packed_seq_params,
-                dims=-1,
+                position_ids, packed_seq_params=packed_seq_params, dims=-1
             )
         decoder_input = self.embedding(input_ids)
         decoder_input = scatter_to_sequence_parallel(decoder_input, self.ps)
@@ -281,9 +265,7 @@ class MultiTokenPredictionLayer(nn.Module):
         hidden_states = self.eh_proj(hidden_states)
         hidden_states = scatter_to_sequence_parallel(hidden_states, self.ps)
         hidden_states = self.transformer_layer(
-            hidden_states,
-            position_ids=attention_position_ids,
-            packed_seq_params=packed_seq_params,
+            hidden_states, position_ids=attention_position_ids, packed_seq_params=packed_seq_params
         )
         hidden_states = self.final_layernorm(hidden_states)
         return hidden_states, input_ids, position_ids
@@ -354,7 +336,9 @@ class MultiTokenPredictionBlock(nn.Module):
 def _temperature_to_float(temperature: float | torch.Tensor) -> float:
     if isinstance(temperature, torch.Tensor):
         if temperature.numel() != 1:
-            raise ValueError("Megatron Lite fused/MTP SFT currently supports scalar temperature only.")
+            raise ValueError(
+                "Megatron Lite fused/MTP SFT currently supports scalar temperature only."
+            )
         return float(temperature.detach().float().item())
     return float(temperature)
 
@@ -384,9 +368,7 @@ class Qwen3MoEModel(nn.Module):
         self.mtp_enable_train = bool(mtp_enable and mtp_enable_train)
         self.mtp_loss_scaling_factor = config.mtp_loss_scaling_factor
         self._input_tensor: torch.Tensor | None = None
-        layout = build_pipeline_chunk_layout(
-            config.num_hidden_layers, ps, vpp, vpp_chunk_id,
-        )
+        layout = build_pipeline_chunk_layout(config.num_hidden_layers, ps, vpp, vpp_chunk_id)
         self.layer_indices = layout.layer_indices
         has_embed = layout.has_embed
         has_head = layout.has_head
@@ -403,7 +385,9 @@ class Qwen3MoEModel(nn.Module):
         self.layers = nn.ModuleList(
             [
                 TransformerLayer(
-                    config, ps, idx,
+                    config,
+                    ps,
+                    idx,
                     use_deepep=use_deepep,
                     router_bias_rate=router_bias_rate,
                     fp8=fp8,
@@ -579,14 +563,10 @@ class Qwen3MoEModel(nn.Module):
         mtp_loss_values = []
         for mtp_hidden in mtp_hidden_states:
             mtp_labels, _ = roll_packed_thd_left(
-                mtp_labels,
-                packed_seq_params=packed_seq_params,
-                dims=-1,
+                mtp_labels, packed_seq_params=packed_seq_params, dims=-1
             )
             mtp_loss_mask, num_tokens = roll_packed_thd_left(
-                mtp_loss_mask,
-                packed_seq_params=packed_seq_params,
-                dims=-1,
+                mtp_loss_mask, packed_seq_params=packed_seq_params, dims=-1
             )
             labels_sb = mtp_labels.transpose(0, 1).contiguous()
             mask_sb = mtp_loss_mask.transpose(0, 1).contiguous()
@@ -611,11 +591,16 @@ class Qwen3MoEModel(nn.Module):
             mtp_loss_values.append(token_loss.sum() / num_tokens)
 
             mtp_loss_scale = self.mtp_loss_scaling_factor / max(len(mtp_hidden_states), 1)
-            hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_scale * token_loss / num_tokens)
+            hidden_states = MTPLossAutoScaler.apply(
+                hidden_states, mtp_loss_scale * token_loss / num_tokens
+            )
 
         if not mtp_loss_values:
             return None
-        return hidden_states, torch.stack([loss.detach().float() for loss in mtp_loss_values]).mean()
+        return (
+            hidden_states,
+            torch.stack([loss.detach().float() for loss in mtp_loss_values]).mean(),
+        )
 
     def _head_weight_for_fused_ce(self, hidden_states: torch.Tensor) -> torch.Tensor:
         assert self.head is not None

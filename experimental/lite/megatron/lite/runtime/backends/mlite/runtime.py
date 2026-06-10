@@ -27,11 +27,7 @@ def _build_impl_cfg(proto, rt_cfg: MegatronLiteConfig):
         and impl_cfg_kwargs.get("attention_backend_override") is None
     ):
         impl_cfg_kwargs["attention_backend_override"] = rt_cfg.attention_backend_override
-    if (
-        "hf_path" in init_fields
-        and impl_cfg_kwargs.get("hf_path") in (None, "")
-        and rt_cfg.hf_path
-    ):
+    if "hf_path" in init_fields and impl_cfg_kwargs.get("hf_path") in (None, "") and rt_cfg.hf_path:
         impl_cfg_kwargs["hf_path"] = rt_cfg.hf_path
     # Thread the user-level OptimizerConfig so the protocol can pass it to
     # optimizer primitives without reading runtime internals.
@@ -111,7 +107,9 @@ def _checkpoint_module(model: Any) -> torch.nn.Module:
         return model
     if isinstance(model, list | tuple):
         return torch.nn.ModuleList(model)
-    raise TypeError(f"Checkpoint model must be an nn.Module or sequence of modules, got {type(model).__name__}.")
+    raise TypeError(
+        f"Checkpoint model must be an nn.Module or sequence of modules, got {type(model).__name__}."
+    )
 
 
 class MegatronLiteRuntime(RuntimeBase):
@@ -119,11 +117,20 @@ class MegatronLiteRuntime(RuntimeBase):
 
     def __init__(self, hf_path: str, cfg: MegatronLiteConfig | dict[str, Any]):
         self._hf_path = hf_path
-        self._cfg = cfg if isinstance(cfg, MegatronLiteConfig) else MegatronLiteConfig.from_dict(hf_path, cfg)
+        self._cfg = (
+            cfg
+            if isinstance(cfg, MegatronLiteConfig)
+            else MegatronLiteConfig.from_dict(hf_path, cfg)
+        )
 
     # ── build_model ──
 
-    def build_model(self, hf_path: str | None = None, cfg: MegatronLiteConfig | dict[str, Any] | None = None, **kwargs) -> ModelHandle:
+    def build_model(
+        self,
+        hf_path: str | None = None,
+        cfg: MegatronLiteConfig | dict[str, Any] | None = None,
+        **kwargs,
+    ) -> ModelHandle:
         if cfg is not None and isinstance(cfg, dict):
             rt_cfg = MegatronLiteConfig.from_dict(hf_path or self._hf_path, cfg)
         elif cfg is not None and isinstance(cfg, MegatronLiteConfig):
@@ -141,8 +148,7 @@ class MegatronLiteRuntime(RuntimeBase):
         proto = self._load_protocol(rt_cfg)
 
         _apply_attention_backend_env(
-            rt_cfg.attention_backend_override,
-            tag=f"{rt_cfg.model_name}:{rt_cfg.impl}",
+            rt_cfg.attention_backend_override, tag=f"{rt_cfg.model_name}:{rt_cfg.impl}"
         )
 
         # ── escape hatch: model takes over ──
@@ -233,9 +239,7 @@ class MegatronLiteRuntime(RuntimeBase):
 
         for fn_name in ("build_model_config", "build_model"):
             if not callable(getattr(proto, fn_name, None)):
-                raise ValueError(
-                    f"Protocol module {mod_path} missing required function: {fn_name}"
-                )
+                raise ValueError(f"Protocol module {mod_path} missing required function: {fn_name}")
         if not hasattr(proto, "ImplConfig"):
             raise ValueError(f"Protocol module {mod_path} missing ImplConfig class")
 
@@ -313,8 +317,13 @@ class MegatronLiteRuntime(RuntimeBase):
     # ── Memory ──
 
     def to(
-        self, handle: ModelHandle, device: str,
-        *, model: bool = True, optimizer: bool = True, grad: bool = True,
+        self,
+        handle: ModelHandle,
+        device: str,
+        *,
+        model: bool = True,
+        optimizer: bool = True,
+        grad: bool = True,
     ) -> None:
         model_chunks = handle._extras.get("model_chunks", [handle._model])
         from megatron.lite.runtime.megatron_utils import (
@@ -354,8 +363,13 @@ class MegatronLiteRuntime(RuntimeBase):
     # ── Training atoms ──
 
     def forward_backward(
-        self, handle: ModelHandle, data: Any, loss_fn: Callable | None,
-        *, num_microbatches: int = 1, forward_only: bool = False,
+        self,
+        handle: ModelHandle,
+        data: Any,
+        loss_fn: Callable | None,
+        *,
+        num_microbatches: int = 1,
+        forward_only: bool = False,
     ) -> ForwardResult:
         from megatron.lite.primitive.train_step import run_microbatch_loop
 
@@ -379,9 +393,7 @@ class MegatronLiteRuntime(RuntimeBase):
             first_batch = next(data_iter)
             data_iter = chain([first_batch], data_iter)
             tensor_shape = _infer_pipeline_tensor_shape(
-                first_batch,
-                handle._extras.get("model_cfg"),
-                ps,
+                first_batch, handle._extras.get("model_cfg"), ps
             )
             outputs = forward_backward_pipelining(
                 forward_step,
@@ -402,16 +414,15 @@ class MegatronLiteRuntime(RuntimeBase):
                 loss_float = float(loss_obj)
             else:
                 loss_float = 0.0
-            loss_t = torch.tensor(
-                [loss_float],
-                device="cuda",
-            )
+            loss_t = torch.tensor([loss_float], device="cuda")
             if ps.pp_group is not None and ps.pp_global_ranks is not None:
                 dist.broadcast(loss_t, src=ps.pp_global_ranks[-1], group=ps.pp_group)
             out = {"loss": loss_t.squeeze(0)}
         else:
             out = run_microbatch_loop(
-                handle._model, data_iter, num_microbatches,
+                handle._model,
+                data_iter,
+                num_microbatches,
                 forward_step,
                 optimizer=handle._optimizer if not forward_only else None,
                 dist_opt=not forward_only,
@@ -425,7 +436,11 @@ class MegatronLiteRuntime(RuntimeBase):
                 finalize_grads()
 
         loss_tensor = out.get("loss") if out else None
-        loss_val = loss_tensor.item() if isinstance(loss_tensor, torch.Tensor) else float(loss_tensor or 0.0)
+        loss_val = (
+            loss_tensor.item()
+            if isinstance(loss_tensor, torch.Tensor)
+            else float(loss_tensor or 0.0)
+        )
         metrics: dict = {"loss": loss_val}
         for m in out.get("_loss_fn_metrics", []) if out else []:
             for k, v in m.items():
@@ -521,10 +536,7 @@ def _checkpoint_model(handle: ModelHandle, *, use_dcp: bool):
 
 
 def _checkpoint_hooks(handle: ModelHandle):
-    from megatron.lite.primitive.protocols import (
-        default_expert_classifier,
-        default_placement_fn,
-    )
+    from megatron.lite.primitive.protocols import default_expert_classifier, default_placement_fn
 
     proto = handle._extras.get("protocol")
     return (

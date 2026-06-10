@@ -47,9 +47,7 @@ class BridgeConfig:
 
         parallel_src = cfg.get("parallel")
         parallel_data = (
-            pick_fields(ParallelConfig, parallel_src)
-            if isinstance(parallel_src, dict)
-            else {}
+            pick_fields(ParallelConfig, parallel_src) if isinstance(parallel_src, dict) else {}
         )
         parallel_data.update(pick_fields(ParallelConfig, cfg))
         parallel = ParallelConfig(**parallel_data)

@@ -7,11 +7,14 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 import transformer_engine.pytorch as te
-from megatron.core.jit import jit_fuser
 
+from megatron.core.jit import jit_fuser
 from megatron.lite.primitive.ops.gated_delta_rule import l2norm, torch_chunk_gated_delta_rule
 from megatron.lite.primitive.parallel import ColumnParallelLinear, ParallelState, RowParallelLinear
-from megatron.lite.primitive.parallel.cp import zigzag_reconstruct_from_cp_parts, zigzag_slice_for_cp
+from megatron.lite.primitive.parallel.cp import (
+    zigzag_reconstruct_from_cp_parts,
+    zigzag_slice_for_cp,
+)
 from megatron.lite.primitive.parallel.thd import (
     reconstruct_packed_from_cp_parts,
     split_packed_to_cp_local,
@@ -22,8 +25,8 @@ try:
     from fla.modules.convolution import (
         causal_conv1d as _fla_causal_conv1d,  # pyright: ignore[reportMissingImports]
     )
-    from fla.ops.gated_delta_rule import (  # pyright: ignore[reportMissingImports]
-        chunk_gated_delta_rule as _fla_chunk_gated_delta_rule,
+    from fla.ops.gated_delta_rule import (
+        chunk_gated_delta_rule as _fla_chunk_gated_delta_rule,  # pyright: ignore[reportMissingImports]
     )
 
     _HAS_FLA = True
@@ -87,10 +90,7 @@ class GatedDeltaNet(nn.Module):
         self.o_proj = RowParallelLinear(self.v_dim, hidden_size, ps, bias=False)
 
     def forward(
-        self,
-        x: torch.Tensor,
-        position_ids: torch.Tensor | None = None,
-        packed_seq_params=None,
+        self, x: torch.Tensor, position_ids: torch.Tensor | None = None, packed_seq_params=None
     ) -> torch.Tensor:
         del position_ids
         qkvzba = self.in_proj(x).transpose(0, 1).contiguous()
@@ -120,12 +120,7 @@ class GatedDeltaNet(nn.Module):
 
         qkv = self._causal_conv1d(qkv, seq_len, cu_seqlens=cu_seqlens)
         query, key, value, gate, beta, alpha = self._prepare_qkv(
-            qkv,
-            gate,
-            beta,
-            alpha,
-            batch,
-            seq_len,
+            qkv, gate, beta, alpha, batch, seq_len
         )
         g, beta = self._compute_g_and_beta(self.A_log, self.dt_bias, alpha, beta)
         out, _ = self._gated_delta_rule(
@@ -164,10 +159,7 @@ class GatedDeltaNet(nn.Module):
         if packed_seq_params is not None:
             cu_seqlens = self._packed_cu_seqlens(packed_seq_params)
             full = reconstruct_packed_from_cp_parts(
-                parts,
-                cu_seqlens_padded=cu_seqlens,
-                cp_size=self.ps.cp_size,
-                dim=1,
+                parts, cu_seqlens_padded=cu_seqlens, cp_size=self.ps.cp_size, dim=1
             )
             return full, ("packed", cu_seqlens)
         full = zigzag_reconstruct_from_cp_parts(parts, seq_dim=1)
@@ -188,11 +180,7 @@ class GatedDeltaNet(nn.Module):
         raise RuntimeError(f"Unknown CP restore kind: {kind!r}")
 
     def _causal_conv1d(
-        self,
-        qkv: torch.Tensor,
-        seq_len: int,
-        *,
-        cu_seqlens: torch.Tensor | None,
+        self, qkv: torch.Tensor, seq_len: int, *, cu_seqlens: torch.Tensor | None
     ) -> torch.Tensor:
         if cu_seqlens is None:
             qkv_t = qkv.transpose(1, 2).contiguous()

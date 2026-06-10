@@ -22,13 +22,12 @@ if str(_EXPERIMENTAL_LITE_ROOT) not in sys.path:
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(1, str(_REPO_ROOT))
 
+from examples.bench.results import StepTrace
+from examples.bench.session import PretrainSessionConfig, run_pretrain_session
 from megatron.lite.runtime import RuntimeConfig, create_runtime
 from megatron.lite.runtime.backends.bridge.config import BridgeConfig
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
 from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig
-
-from examples.bench.results import StepTrace
-from examples.bench.session import PretrainSessionConfig, run_pretrain_session
 
 
 @dataclass
@@ -146,9 +145,7 @@ def _make_mlite_model_config_hook(cfg: BenchCliConfig):
             if keep_experts <= 0 or keep_experts > old_num:
                 raise ValueError(f"keep_experts must be in [1, {old_num}], got {keep_experts}.")
             return replace(
-                model_cfg,
-                num_experts=keep_experts,
-                num_experts_per_tok=min(old_topk, keep_experts),
+                model_cfg, num_experts=keep_experts, num_experts_per_tok=min(old_topk, keep_experts)
             )
 
         hooks.append(keep_experts_hook)
@@ -162,7 +159,9 @@ def _make_mlite_model_config_hook(cfg: BenchCliConfig):
             if old_layers is None or layer_types is None:
                 raise ValueError("truncate_layers requires num_hidden_layers and layer_types.")
             if keep_layers <= 0 or keep_layers > old_layers:
-                raise ValueError(f"truncate_layers must be in [1, {old_layers}], got {keep_layers}.")
+                raise ValueError(
+                    f"truncate_layers must be in [1, {old_layers}], got {keep_layers}."
+                )
             return replace(
                 model_cfg,
                 num_hidden_layers=keep_layers,
@@ -223,7 +222,9 @@ def _make_bridge_post_init_hook(cfg: BenchCliConfig):
             if old_layers is None:
                 raise ValueError("truncate_layers requires HF config with num_hidden_layers.")
             if keep_layers <= 0 or keep_layers > old_layers:
-                raise ValueError(f"truncate_layers must be in [1, {old_layers}], got {keep_layers}.")
+                raise ValueError(
+                    f"truncate_layers must be in [1, {old_layers}], got {keep_layers}."
+                )
             hf_cfg.num_hidden_layers = keep_layers
             if hasattr(hf_cfg, "layer_types"):
                 hf_cfg.layer_types = list(hf_cfg.layer_types[:keep_layers])
@@ -291,8 +292,7 @@ def build_runtime_config(cfg: BenchCliConfig) -> RuntimeConfig:
             build_optimizer=not cfg.skip_optimizer_build,
             override_ddp_config=_json_mapping(cfg.override_ddp_json, name="override_ddp_json"),
             override_transformer_config=_json_mapping(
-                cfg.override_transformer_json,
-                name="override_transformer_json",
+                cfg.override_transformer_json, name="override_transformer_json"
             ),
             override_optimizer_config=optimizer_overrides,
             bridge_post_init=_make_bridge_post_init_hook(cfg),
@@ -377,10 +377,7 @@ def run(cfg: BenchCliConfig) -> dict[str, Any]:
     rt = create_runtime(rt_cfg)
     handle = rt.build_model()
     result = run_pretrain_session(
-        rt,
-        handle,
-        build_session_config(cfg),
-        step_reporter=_step_reporter,
+        rt, handle, build_session_config(cfg), step_reporter=_step_reporter
     )
     return result.to_dict()
 

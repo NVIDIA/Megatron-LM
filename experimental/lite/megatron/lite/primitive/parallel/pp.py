@@ -46,11 +46,7 @@ def build_pipeline_chunk_layout(
         layer_indices = list(range(start, start + layers_per_stage))
         has_embed = ps.pp_is_first
         has_head = ps.pp_is_last
-    return PipelineChunkLayout(
-        layer_indices=layer_indices,
-        has_embed=has_embed,
-        has_head=has_head,
-    )
+    return PipelineChunkLayout(layer_indices=layer_indices, has_embed=has_embed, has_head=has_head)
 
 
 __all__ = ["PipelineChunkLayout", "build_pipeline_chunk_layout"]

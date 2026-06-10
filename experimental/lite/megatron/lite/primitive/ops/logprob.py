@@ -7,7 +7,7 @@ import torch.distributed as dist
 
 
 def vocab_parallel_log_probs_from_logits(
-    logits: torch.Tensor, labels: torch.Tensor | None = None,
+    logits: torch.Tensor, labels: torch.Tensor | None = None
 ) -> torch.Tensor:
     """Compute log-probabilities from already materialized logits.
 
@@ -51,7 +51,7 @@ def vocab_parallel_entropy(logits: torch.Tensor, tp_group=None) -> torch.Tensor:
 
 
 def _align_labels_to_logits(
-    logits: torch.Tensor, labels: torch.Tensor,
+    logits: torch.Tensor, labels: torch.Tensor
 ) -> tuple[torch.Tensor, bool]:
     if logits.ndim != labels.ndim + 1:
         raise ValueError(
@@ -69,6 +69,4 @@ def _align_labels_to_logits(
     ):
         return labels.transpose(0, 1).contiguous(), True
 
-    raise ValueError(
-        f"Could not align labels {labels.shape} with logits {logits.shape}."
-    )
+    raise ValueError(f"Could not align labels {labels.shape} with logits {logits.shape}.")

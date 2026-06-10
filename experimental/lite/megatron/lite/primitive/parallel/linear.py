@@ -77,9 +77,7 @@ class _VanillaColParallelMatmulSP(torch.autograd.Function):
         if ws > 1:
             s_local = input_.shape[0]
             total_shape = (s_local * ws, *input_.shape[1:])
-            total_input = torch.empty(
-                total_shape, dtype=input_.dtype, device=input_.device,
-            )
+            total_input = torch.empty(total_shape, dtype=input_.dtype, device=input_.device)
             dist.all_gather_into_tensor(total_input, input_.contiguous(), group=tp_group)
         else:
             total_input = input_
@@ -96,13 +94,9 @@ class _VanillaColParallelMatmulSP(torch.autograd.Function):
         if ctx.tp_size > 1:
             out_shape = (ctx.local_s, *grad_input_full.shape[1:])
             grad_input = torch.empty(
-                out_shape,
-                dtype=grad_input_full.dtype,
-                device=grad_input_full.device,
+                out_shape, dtype=grad_input_full.dtype, device=grad_input_full.device
             )
-            dist.reduce_scatter_tensor(
-                grad_input, grad_input_full.contiguous(), group=ctx.tp_group,
-            )
+            dist.reduce_scatter_tensor(grad_input, grad_input_full.contiguous(), group=ctx.tp_group)
         else:
             grad_input = grad_input_full
         gi = grad_output.reshape(-1, grad_output.shape[-1])
@@ -124,22 +118,13 @@ class _VanillaColLinear(nn.Module):
     `sp=False`, input is assumed replicated and grad_input is all-reduced.
     """
 
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        ps: ParallelState,
-        *,
-        sp: bool = False,
-    ):
+    def __init__(self, in_features: int, out_features: int, ps: ParallelState, *, sp: bool = False):
         super().__init__()
         self.tp_group = ps.tp_group
         self.tp_size = ps.tp_size
         self.sp = sp
         local_out = ensure_divisible(out_features, ps.tp_size)
-        self.weight = nn.Parameter(
-            torch.empty(local_out, in_features, dtype=torch.bfloat16)
-        )
+        self.weight = nn.Parameter(torch.empty(local_out, in_features, dtype=torch.bfloat16))
         nn.init.xavier_uniform_(self.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -197,7 +182,9 @@ class ColumnParallelLinear(nn.Module):
         self.tp_rank = ps.tp_rank
         self.tp_group = ps.tp_group
         self.local_out = ensure_divisible(out_features, ps.tp_size)
-        self.use_sp = ps.tp_size > 1 and not gather_output if sequence_parallel is None else sequence_parallel
+        self.use_sp = (
+            ps.tp_size > 1 and not gather_output if sequence_parallel is None else sequence_parallel
+        )
         if normalization is not None:
             self.linear = te.LayerNormLinear(
                 in_features,
@@ -286,12 +273,7 @@ class VocabParallelEmbedding(nn.Module):
     """Embedding table split across TP on the vocab dimension."""
 
     def __init__(
-        self,
-        vocab_size: int,
-        hidden_size: int,
-        ps: ParallelState,
-        *,
-        deterministic: bool = False,
+        self, vocab_size: int, hidden_size: int, ps: ParallelState, *, deterministic: bool = False
     ):
         super().__init__()
         self.tp_size = ps.tp_size
@@ -347,8 +329,7 @@ class _ColForLMHead(nn.Module):
             # under bf16, producing ~3e-4 loss-level drift. Keep for future
             # FP8 / fused-norm paths.
             _wrapper = ColumnParallelLinear(
-                in_features, out_features, ps,
-                bias=False, gather_output=not sp,
+                in_features, out_features, ps, bias=False, gather_output=not sp
             )
             self.linear = _wrapper.linear
         else:
@@ -364,21 +345,14 @@ class VocabParallelOutput(nn.Module):
     """
 
     def __init__(
-        self,
-        vocab_size: int,
-        hidden_size: int,
-        ps: ParallelState,
-        *,
-        backend: str = "vanilla",
+        self, vocab_size: int, hidden_size: int, ps: ParallelState, *, backend: str = "vanilla"
     ):
         super().__init__()
         padded_vocab = pad_vocab_for_tp(vocab_size, ps.tp_size)
         # SP-aware head: when tp>1 we run on SP-sharded input (matches MC
         # GPTModel where final_layernorm runs on SP-sharded hiddens and
         # output_layer gathers internally + reduce-scatters on backward).
-        self.col = _ColForLMHead(
-            hidden_size, padded_vocab, ps, backend=backend, sp=ps.tp_size > 1,
-        )
+        self.col = _ColForLMHead(hidden_size, padded_vocab, ps, backend=backend, sp=ps.tp_size > 1)
         self.padded_vocab = padded_vocab
         self.local_vocab = padded_vocab // ps.tp_size
         self.vocab_size = vocab_size
@@ -393,7 +367,7 @@ class VocabParallelOutput(nn.Module):
             chunks = [torch.empty_like(logits) for _ in range(self.ps.tp_size)]
             dist.all_gather(chunks, logits, group=self.ps.tp_group)
             logits = torch.cat(chunks, dim=-1)
-        return logits[..., :self.vocab_size]
+        return logits[..., : self.vocab_size]
 
 
 class _AllGatherLastDim(torch.autograd.Function):
@@ -412,7 +386,7 @@ class _AllGatherLastDim(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         start = ctx.rank * ctx.local_dim
-        return grad_output[..., start:start + ctx.local_dim].contiguous(), None, None
+        return grad_output[..., start : start + ctx.local_dim].contiguous(), None, None
 
 
 class _ReduceFromTP(torch.autograd.Function):

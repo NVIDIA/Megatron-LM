@@ -22,13 +22,7 @@ from megatron.lite.runtime.contracts.config import ParallelConfig
 from megatron.lite.runtime.contracts.handle import ModelHandle
 from tests.unit_tests.test_utilities import Utils
 
-
-pytestmark = [
-    pytest.mark.mlite,
-    pytest.mark.smoke,
-    pytest.mark.gpu,
-    pytest.mark.distributed,
-]
+pytestmark = [pytest.mark.mlite, pytest.mark.smoke, pytest.mark.gpu, pytest.mark.distributed]
 
 
 class TinyDense(nn.Module):
@@ -70,8 +64,7 @@ def _single_node_cuda_distopt():
         pytest.skip("Megatron Lite smoke tests are capped at single-node 8 GPUs.")
 
     Utils.set_world_size(
-        int(os.environ.get("WORLD_SIZE", "1")),
-        int(os.environ.get("LOCAL_RANK", "0")),
+        int(os.environ.get("WORLD_SIZE", "1")), int(os.environ.get("LOCAL_RANK", "0"))
     )
     Utils.initialize_model_parallel()
     yield
@@ -82,12 +75,7 @@ def _global_tensor(shape: tuple[int, ...], offset: float) -> torch.Tensor:
     return torch.arange(offset, offset + int(torch.tensor(shape).prod().item())).reshape(shape)
 
 
-def _local_shard(
-    tensor: torch.Tensor,
-    dim: int,
-    rank: int,
-    size: int,
-) -> torch.Tensor:
+def _local_shard(tensor: torch.Tensor, dim: int, rank: int, size: int) -> torch.Tensor:
     if size <= 1:
         return tensor.clone()
     chunks = torch.chunk(tensor, size, dim=dim)
@@ -122,18 +110,11 @@ def _build_sharded_model_and_distopt(parallel: ParallelConfig):
         deterministic=False,
     )
     wrapped_chunks, optimizer = build_mc_stack(
-        [model],
-        model_cfg=model_cfg,
-        engine_cfg=engine_cfg,
-        ps=ps,
-        is_expert=_is_expert_param,
+        [model], model_cfg=model_cfg, engine_cfg=engine_cfg, ps=ps, is_expert=_is_expert_param
     )
     _seed_optimizer_state(optimizer)
     attach_model_sharded_state_dict(
-        wrapped_chunks,
-        ps,
-        get_placements=_topology_placements,
-        is_expert=_is_expert_param,
+        wrapped_chunks, ps, get_placements=_topology_placements, is_expert=_is_expert_param
     )
     return wrapped_chunks, optimizer, ps
 
@@ -172,8 +153,7 @@ def _distopt_handle(wrapped_chunks, optimizer, ps: ParallelState, parallel: Para
         _extras={
             "model_chunks": wrapped_chunks,
             "protocol": SimpleNamespace(
-                PLACEMENT_FN=_topology_placements,
-                EXPERT_CLASSIFIER=_is_expert_param,
+                PLACEMENT_FN=_topology_placements, EXPERT_CLASSIFIER=_is_expert_param
             ),
         },
     )
@@ -184,9 +164,7 @@ def _build_model_and_distopt():
     model = TinyDense().bfloat16().cuda()
     ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
     wrapped = DistributedDataParallel(
-        TransformerConfig(num_attention_heads=1, num_layers=1),
-        ddp_config,
-        model,
+        TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
     )
     optimizer = get_megatron_optimizer(
         OptimizerConfig(optimizer="adam", lr=1.0e-3, bf16=True, use_distributed_optimizer=True),
@@ -254,14 +232,17 @@ def test_distopt_checkpoint_load_matches_uninterrupted_training_single_node(tmp_
         checkpoint_dir,
         step=1,
     )
-    assert runtime.load_checkpoint(
-        ModelHandle(
-            model=loaded_model,
-            optimizer=loaded_optimizer,
-            _extras={"model_chunks": [loaded_model]},
-        ),
-        checkpoint_dir,
-    ) == 1
+    assert (
+        runtime.load_checkpoint(
+            ModelHandle(
+                model=loaded_model,
+                optimizer=loaded_optimizer,
+                _extras={"model_chunks": [loaded_model]},
+            ),
+            checkpoint_dir,
+        )
+        == 1
+    )
 
     _train_step(direct_model, direct_optimizer, x1)
     _train_step(loaded_model, loaded_optimizer, x1)
@@ -288,11 +269,14 @@ def test_distopt_checkpoint_reshards_from_pp_ep_to_tp_pp_ep_etp(tmp_path):
     )
 
     target_chunks, target_optimizer, target_ps = _build_sharded_model_and_distopt(target_parallel)
-    assert runtime.load_checkpoint(
-        _distopt_handle(target_chunks, target_optimizer, target_ps, target_parallel),
-        source_dir,
-        load_rng=False,
-    ) == 3
+    assert (
+        runtime.load_checkpoint(
+            _distopt_handle(target_chunks, target_optimizer, target_ps, target_parallel),
+            source_dir,
+            load_rng=False,
+        )
+        == 3
+    )
     runtime.save_checkpoint(
         _distopt_handle(target_chunks, target_optimizer, target_ps, target_parallel),
         reserialized_dir,

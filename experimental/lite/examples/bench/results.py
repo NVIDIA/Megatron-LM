@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-import math
 import json
+import math
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -127,11 +127,7 @@ def result_summary(artifact: dict[str, Any]) -> dict[str, Any]:
 
 
 def compare_step_traces(
-    baseline: dict[str, Any],
-    candidate: dict[str, Any],
-    *,
-    atol: float = 1e-4,
-    rtol: float = 1e-4,
+    baseline: dict[str, Any], candidate: dict[str, Any], *, atol: float = 1e-4, rtol: float = 1e-4
 ) -> dict[str, Any]:
     """Compare loss and grad-norm traces from two benchmark artifacts."""
     base_steps = baseline.get("result", {}).get("step_traces", [])
@@ -144,8 +140,7 @@ def compare_step_traces(
         cand = cand_steps[idx]
         max_loss_abs = max(max_loss_abs, abs(float(base["loss"]) - float(cand["loss"])))
         max_grad_norm_abs = max(
-            max_grad_norm_abs,
-            abs(float(base["grad_norm"]) - float(cand["grad_norm"])),
+            max_grad_norm_abs, abs(float(base["grad_norm"]) - float(cand["grad_norm"]))
         )
 
     lengths_match = sample_count == len(base_steps) == len(cand_steps)
@@ -154,9 +149,7 @@ def compare_step_traces(
         [abs(float(step["grad_norm"])) for step in base_steps[:sample_count]] + [0.0]
     )
     loss_passed = lengths_match and max_loss_abs <= atol + rtol * loss_ref_max
-    grad_norm_passed = (
-        lengths_match and max_grad_norm_abs <= atol + rtol * grad_norm_ref_max
-    )
+    grad_norm_passed = lengths_match and max_grad_norm_abs <= atol + rtol * grad_norm_ref_max
 
     return {
         "samples": sample_count,
@@ -171,8 +164,7 @@ def compare_step_traces(
 
 
 def compare_correctness_artifacts(
-    baseline: dict[str, Any],
-    candidate: dict[str, Any],
+    baseline: dict[str, Any], candidate: dict[str, Any]
 ) -> dict[str, Any]:
     """Strict bitwise comparison for deterministic correctness artifacts."""
     base_steps = baseline.get("steps", [])
@@ -211,13 +203,7 @@ def compare_correctness_artifacts(
         if math.isfinite(grad_abs):
             max_grad_norm_abs = max(max_grad_norm_abs, grad_abs)
 
-        for field in (
-            "loss",
-            "grad_norm",
-            "post_step_weights",
-            "update_successful",
-            "num_zeros",
-        ):
+        for field in ("loss", "grad_norm", "post_step_weights", "update_successful", "num_zeros"):
             if base.get(field) != cand.get(field):
                 mismatches.append({"step": idx, "field": field})
         if not _tensor_fingerprint_matches(base.get("logits"), cand.get("logits")):

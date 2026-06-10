@@ -43,12 +43,7 @@ class Runtime(ABC):
     # Model lifecycle
 
     @abstractmethod
-    def build_model(
-        self,
-        hf_path: str | None = None,
-        cfg: Any = None,
-        **kwargs,
-    ) -> ModelHandle:
+    def build_model(self, hf_path: str | None = None, cfg: Any = None, **kwargs) -> ModelHandle:
         """Build model state for this runtime.
 
         Implementations should default to the ``hf_path`` / ``backend_cfg``
@@ -123,9 +118,7 @@ class Runtime(ABC):
 
     # ── L2: RL Ready (覆盖即解锁) ───────────────────────────────
 
-    def export_weights(
-        self, handle: ModelHandle, **kwargs,
-    ) -> Iterator[tuple[str, torch.Tensor]]:
+    def export_weights(self, handle: ModelHandle, **kwargs) -> Iterator[tuple[str, torch.Tensor]]:
         """Iterate over (name, tensor) pairs for HF-compatible weight export.
 
         Required by RL frameworks to send weights to the inference engine.

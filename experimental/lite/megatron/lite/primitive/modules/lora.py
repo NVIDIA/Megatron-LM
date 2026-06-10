@@ -14,7 +14,6 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 _DEFAULT_TARGET_MODULES = ("linear_qkv", "linear_proj", "linear_fc1", "linear_fc2")
 _TARGET_ALIASES = {
     "qkv": "linear_qkv",
@@ -134,21 +133,13 @@ class _AllGatherSequence(torch.autograd.Function):
         world_size = dist.get_world_size(group)
         ctx.group = group
         ctx.local_seq = x.shape[0]
-        out = torch.empty(
-            (x.shape[0] * world_size, *x.shape[1:]),
-            dtype=x.dtype,
-            device=x.device,
-        )
+        out = torch.empty((x.shape[0] * world_size, *x.shape[1:]), dtype=x.dtype, device=x.device)
         dist.all_gather_into_tensor(out, x.contiguous(), group=group)
         return out
 
     @staticmethod
     def backward(ctx, grad: torch.Tensor):
-        out = torch.empty(
-            (ctx.local_seq, *grad.shape[1:]),
-            dtype=grad.dtype,
-            device=grad.device,
-        )
+        out = torch.empty((ctx.local_seq, *grad.shape[1:]), dtype=grad.dtype, device=grad.device)
         dist.reduce_scatter_tensor(out, grad.contiguous(), group=ctx.group)
         return out, None
 
@@ -158,23 +149,19 @@ class _ReduceScatterSequence(torch.autograd.Function):
     def forward(ctx, x: torch.Tensor, group) -> torch.Tensor:
         world_size = dist.get_world_size(group)
         if x.shape[0] % world_size != 0:
-            raise ValueError(f"Cannot reduce-scatter sequence dim {x.shape[0]} over TP={world_size}.")
+            raise ValueError(
+                f"Cannot reduce-scatter sequence dim {x.shape[0]} over TP={world_size}."
+            )
         ctx.group = group
         ctx.world_size = world_size
-        out = torch.empty(
-            (x.shape[0] // world_size, *x.shape[1:]),
-            dtype=x.dtype,
-            device=x.device,
-        )
+        out = torch.empty((x.shape[0] // world_size, *x.shape[1:]), dtype=x.dtype, device=x.device)
         dist.reduce_scatter_tensor(out, x.contiguous(), group=group)
         return out
 
     @staticmethod
     def backward(ctx, grad: torch.Tensor):
         out = torch.empty(
-            (grad.shape[0] * ctx.world_size, *grad.shape[1:]),
-            dtype=grad.dtype,
-            device=grad.device,
+            (grad.shape[0] * ctx.world_size, *grad.shape[1:]), dtype=grad.dtype, device=grad.device
         )
         dist.all_gather_into_tensor(out, grad.contiguous(), group=ctx.group)
         return out, None
@@ -195,9 +182,7 @@ class _ScatterSequence(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad: torch.Tensor):
         out = torch.empty(
-            (grad.shape[0] * ctx.world_size, *grad.shape[1:]),
-            dtype=grad.dtype,
-            device=grad.device,
+            (grad.shape[0] * ctx.world_size, *grad.shape[1:]), dtype=grad.dtype, device=grad.device
         )
         dist.all_gather_into_tensor(out, grad.contiguous(), group=ctx.group)
         return out, None, None
@@ -236,12 +221,12 @@ class _AllGatherLastDim(torch.autograd.Function):
         ctx.reduce_backward = bool(reduce_backward)
         flat = x.movedim(-1, 0).contiguous().view(ctx.local_width, -1)
         gathered = torch.empty(
-            (ctx.local_width * world_size, flat.shape[1]),
-            dtype=x.dtype,
-            device=x.device,
+            (ctx.local_width * world_size, flat.shape[1]), dtype=x.dtype, device=x.device
         )
         dist.all_gather_into_tensor(gathered, flat, group=group)
-        return gathered.view(ctx.local_width * world_size, *x.shape[:-1]).movedim(0, -1).contiguous()
+        return (
+            gathered.view(ctx.local_width * world_size, *x.shape[:-1]).movedim(0, -1).contiguous()
+        )
 
     @staticmethod
     def backward(ctx, grad: torch.Tensor):
@@ -264,7 +249,9 @@ class _SequenceParallelRankPartitionedLoRA(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x: torch.Tensor, lora_a: torch.Tensor, lora_b: torch.Tensor, scale: float, group):
+    def forward(
+        ctx, x: torch.Tensor, lora_a: torch.Tensor, lora_b: torch.Tensor, scale: float, group
+    ):
         world_size = dist.get_world_size(group) if group is not None else 1
         if world_size > 1:
             gathered = _all_gather_sequence_forward(x, group, world_size)
@@ -294,17 +281,23 @@ class _SequenceParallelRankPartitionedLoRA(torch.autograd.Function):
         hidden = _all_gather_last_dim_forward(hidden_local, group, world_size)
 
         grad_out_scaled = grad_out * ctx.scale
-        grad_b = grad_out_scaled.reshape(-1, grad_out_scaled.shape[-1]).t().matmul(
-            hidden.reshape(-1, hidden.shape[-1])
+        grad_b = (
+            grad_out_scaled.reshape(-1, grad_out_scaled.shape[-1])
+            .t()
+            .matmul(hidden.reshape(-1, hidden.shape[-1]))
         )
         grad_hidden = grad_out_scaled.matmul(lora_b)
         if world_size > 1:
-            grad_hidden_local = _split_last_dim(grad_hidden, dist.get_rank(group), ctx.local_rank_width)
+            grad_hidden_local = _split_last_dim(
+                grad_hidden, dist.get_rank(group), ctx.local_rank_width
+            )
             dist.all_reduce(grad_hidden_local, op=dist.ReduceOp.SUM, group=group)
         else:
             grad_hidden_local = grad_hidden
-        grad_a = grad_hidden_local.reshape(-1, grad_hidden_local.shape[-1]).t().matmul(
-            gathered.reshape(-1, gathered.shape[-1])
+        grad_a = (
+            grad_hidden_local.reshape(-1, grad_hidden_local.shape[-1])
+            .t()
+            .matmul(gathered.reshape(-1, gathered.shape[-1]))
         )
         grad_gathered = grad_hidden_local.matmul(lora_a)
         if world_size > 1:
@@ -315,21 +308,13 @@ class _SequenceParallelRankPartitionedLoRA(torch.autograd.Function):
 
 
 def _all_gather_sequence_forward(x: torch.Tensor, group, world_size: int) -> torch.Tensor:
-    out = torch.empty(
-        (x.shape[0] * world_size, *x.shape[1:]),
-        dtype=x.dtype,
-        device=x.device,
-    )
+    out = torch.empty((x.shape[0] * world_size, *x.shape[1:]), dtype=x.dtype, device=x.device)
     dist.all_gather_into_tensor(out, x.contiguous(), group=group)
     return out
 
 
 def _reduce_scatter_sequence_forward(x: torch.Tensor, group, local_seq: int) -> torch.Tensor:
-    out = torch.empty(
-        (local_seq, *x.shape[1:]),
-        dtype=x.dtype,
-        device=x.device,
-    )
+    out = torch.empty((local_seq, *x.shape[1:]), dtype=x.dtype, device=x.device)
     dist.reduce_scatter_tensor(out, x.contiguous(), group=group)
     return out
 
@@ -340,9 +325,7 @@ def _all_gather_last_dim_forward(x: torch.Tensor, group, world_size: int) -> tor
     local_width = x.shape[-1]
     flat = x.movedim(-1, 0).contiguous().view(local_width, -1)
     gathered = torch.empty(
-        (local_width * world_size, flat.shape[1]),
-        dtype=x.dtype,
-        device=x.device,
+        (local_width * world_size, flat.shape[1]), dtype=x.dtype, device=x.device
     )
     dist.all_gather_into_tensor(gathered, flat, group=group)
     return gathered.view(local_width * world_size, *x.shape[:-1]).movedim(0, -1).contiguous()
@@ -410,7 +393,9 @@ class LinearLoRA(nn.Module):
         self.row_parallel_output = bool(row_parallel_output)
         self.sequence_parallel_scatter_output = bool(sequence_parallel_scatter_output)
         if self.row_parallel_output and self.sequence_parallel_scatter_output:
-            raise ValueError("Use either row_parallel_output or sequence_parallel_scatter_output, not both.")
+            raise ValueError(
+                "Use either row_parallel_output or sequence_parallel_scatter_output, not both."
+            )
         self.tp_group = tp_group
         self.tp_rank = int(tp_rank)
         self.input_parallel_reduce = bool(input_parallel_reduce)
@@ -440,11 +425,7 @@ class LinearLoRA(nn.Module):
         nn.init.zeros_(self.lora_b)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if (
-            self.sequence_parallel_input
-            and self.rank_partitioned_a
-            and not self.training
-        ):
+        if self.sequence_parallel_input and self.rank_partitioned_a and not self.training:
             # Keep eval/inference on the simple path; the memory optimization
             # matters only when autograd needs to retain forward activations.
             pass
@@ -458,11 +439,7 @@ class LinearLoRA(nn.Module):
             and self.dropout_p == 0.0
         ):
             return _SequenceParallelRankPartitionedLoRA.apply(
-                x,
-                self.lora_a,
-                self.lora_b,
-                self.scale,
-                self.tp_group,
+                x, self.lora_a, self.lora_b, self.scale, self.tp_group
             )
         if self.sequence_parallel_input:
             x = _gather_sequence_parallel(x, self.tp_group)

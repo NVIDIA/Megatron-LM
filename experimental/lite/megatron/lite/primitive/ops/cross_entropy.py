@@ -38,9 +38,7 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         else:
             rank = 0
             world_size = 1
-        vocab_start_index, vocab_end_index = _vocab_range(
-            partition_vocab_size, rank, world_size,
-        )
+        vocab_start_index, vocab_end_index = _vocab_range(partition_vocab_size, rank, world_size)
 
         # Mask targets outside this partition's vocab range.
         target_mask = (target < vocab_start_index) | (target >= vocab_end_index)

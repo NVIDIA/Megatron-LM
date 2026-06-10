@@ -13,20 +13,14 @@ import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 
 def _ag_dim0(x: torch.Tensor, tp_size: int, group: dist.ProcessGroup) -> torch.Tensor:
     """AllGather on dim 0: [S/tp, B, H] → [S, B, H]."""
-    out = torch.empty(
-        tp_size * x.shape[0], x.shape[1], x.shape[2],
-        dtype=x.dtype, device=x.device,
-    )
+    out = torch.empty(tp_size * x.shape[0], x.shape[1], x.shape[2], dtype=x.dtype, device=x.device)
     dist.all_gather_into_tensor(out, x.contiguous(), group=group)
     return out
 
 
 def _rs_dim0(x: torch.Tensor, local_seq: int, group: dist.ProcessGroup) -> torch.Tensor:
     """ReduceScatter on dim 0: [S, B, H] → [S/tp, B, H]."""
-    out = torch.empty(
-        local_seq, x.shape[1], x.shape[2],
-        dtype=x.dtype, device=x.device,
-    )
+    out = torch.empty(local_seq, x.shape[1], x.shape[2], dtype=x.dtype, device=x.device)
     dist.reduce_scatter_tensor(out, x.contiguous(), group=group)
     return out
 
@@ -73,7 +67,7 @@ class AllGatherDim0ForNonSPConsumer(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad):
         start = ctx.tp_rank * ctx.local_seq
-        return grad[start:start + ctx.local_seq].contiguous(), None, None, None
+        return grad[start : start + ctx.local_seq].contiguous(), None, None, None
 
 
 class ScatterToSP(torch.autograd.Function):
@@ -85,16 +79,11 @@ class ScatterToSP(torch.autograd.Function):
         ctx.group = group
         local_seq = x.shape[0] // tp_size
         start = tp_rank * local_seq
-        return x[start:start + local_seq, :, :].contiguous()
+        return x[start : start + local_seq, :, :].contiguous()
 
     @staticmethod
     def backward(ctx, grad):
         return _ag_dim0(grad, ctx.tp_size, ctx.group), None, None, None
 
 
-__all__ = [
-    "AllGatherDim0",
-    "AllGatherDim0ForNonSPConsumer",
-    "ReduceScatterDim0",
-    "ScatterToSP",
-]
+__all__ = ["AllGatherDim0", "AllGatherDim0ForNonSPConsumer", "ReduceScatterDim0", "ScatterToSP"]

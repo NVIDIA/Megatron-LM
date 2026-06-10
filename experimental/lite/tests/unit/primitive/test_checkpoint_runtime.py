@@ -18,11 +18,7 @@ from megatron.lite.runtime.contracts.handle import ModelHandle
 class TinyMLP(nn.Module):
     def __init__(self):
         super().__init__()
-        self.layers = nn.Sequential(
-            nn.Linear(4, 8),
-            nn.GELU(),
-            nn.Linear(8, 2),
-        )
+        self.layers = nn.Sequential(nn.Linear(4, 8), nn.GELU(), nn.Linear(8, 2))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.layers(x)
@@ -44,9 +40,7 @@ def _clone_model_and_optimizer(model: nn.Module):
 
 def _assert_model_close(lhs: nn.Module, rhs: nn.Module):
     for (lhs_name, lhs_param), (rhs_name, rhs_param) in zip(
-        lhs.named_parameters(),
-        rhs.named_parameters(),
-        strict=True,
+        lhs.named_parameters(), rhs.named_parameters(), strict=True
     ):
         assert lhs_name == rhs_name
         torch.testing.assert_close(lhs_param, rhs_param, atol=0.0, rtol=0.0)
@@ -72,11 +66,14 @@ def test_runtime_local_checkpoint_load_matches_uninterrupted_training(tmp_path):
         use_dcp=False,
     )
 
-    assert runtime.load_checkpoint(
-        ModelHandle(model=loaded_model, optimizer=loaded_optimizer),
-        str(tmp_path),
-        use_dcp=False,
-    ) == 1
+    assert (
+        runtime.load_checkpoint(
+            ModelHandle(model=loaded_model, optimizer=loaded_optimizer),
+            str(tmp_path),
+            use_dcp=False,
+        )
+        == 1
+    )
 
     _step(direct_model, direct_optimizer, x1, y1)
     _step(loaded_model, loaded_optimizer, x1, y1)
@@ -132,21 +129,21 @@ def test_runtime_local_checkpoint_uses_optimizer_parameter_state_contract(tmp_pa
 
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
     runtime.save_checkpoint(
-        ModelHandle(model=model, optimizer=optimizer),
-        str(tmp_path),
-        step=7,
-        use_dcp=False,
+        ModelHandle(model=model, optimizer=optimizer), str(tmp_path), step=7, use_dcp=False
     )
 
     loaded_model = TinyMLP()
     loaded_optimizer = DistOptLike(torch.optim.AdamW(loaded_model.parameters(), lr=1.0e-3))
 
-    assert runtime.load_checkpoint(
-        ModelHandle(model=loaded_model, optimizer=loaded_optimizer),
-        str(tmp_path),
-        update_legacy_format=True,
-        use_dcp=False,
-    ) == 7
+    assert (
+        runtime.load_checkpoint(
+            ModelHandle(model=loaded_model, optimizer=loaded_optimizer),
+            str(tmp_path),
+            update_legacy_format=True,
+            use_dcp=False,
+        )
+        == 7
+    )
     assert loaded_optimizer.load_calls == 1
     assert loaded_optimizer.parameter_load_calls == 1
     assert loaded_optimizer.update_legacy_format is True
@@ -163,10 +160,7 @@ def test_runtime_local_checkpoint_restores_rng_state(tmp_path):
     torch.manual_seed(2031)
 
     runtime.save_checkpoint(
-        ModelHandle(model=model, optimizer=None),
-        str(tmp_path),
-        step=9,
-        use_dcp=False,
+        ModelHandle(model=model, optimizer=None), str(tmp_path), step=9, use_dcp=False
     )
 
     expected_python = random.random()
@@ -178,7 +172,9 @@ def test_runtime_local_checkpoint_restores_rng_state(tmp_path):
     torch.manual_seed(9999)
 
     assert (
-        runtime.load_checkpoint(ModelHandle(model=model, optimizer=None), str(tmp_path), use_dcp=False)
+        runtime.load_checkpoint(
+            ModelHandle(model=model, optimizer=None), str(tmp_path), use_dcp=False
+        )
         == 9
     )
     assert random.random() == expected_python
@@ -196,15 +192,14 @@ def test_runtime_local_checkpoint_uses_rank_specific_files_when_distributed(tmp_
         patch("megatron.lite.primitive.ckpt.dcp.dist.get_rank", return_value=3),
     ):
         runtime.save_checkpoint(
-            ModelHandle(model=model, optimizer=None),
-            str(tmp_path),
-            step=11,
-            use_dcp=False,
+            ModelHandle(model=model, optimizer=None), str(tmp_path), step=11, use_dcp=False
         )
         assert (tmp_path / "training_state_rank_00003.pt").exists()
         assert not (tmp_path / "training_state.pt").exists()
         assert (
-            runtime.load_checkpoint(ModelHandle(model=model, optimizer=None), str(tmp_path), use_dcp=False)
+            runtime.load_checkpoint(
+                ModelHandle(model=model, optimizer=None), str(tmp_path), use_dcp=False
+            )
             == 11
         )
 
@@ -214,13 +209,7 @@ def test_primitive_local_checkpoint_keeps_optimizer_checkpoints_local(tmp_path):
     optimizer = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
 
     with patch("megatron.lite.primitive.ckpt.dcp.dcp.save") as dcp_save_mock:
-        save_training_checkpoint(
-            model,
-            optimizer,
-            12,
-            str(tmp_path),
-            use_dcp=False,
-        )
+        save_training_checkpoint(model, optimizer, 12, str(tmp_path), use_dcp=False)
 
     dcp_save_mock.assert_not_called()
     assert (tmp_path / "training_state.pt").exists()
@@ -240,13 +229,7 @@ def test_primitive_explicit_dcp_saves_optimizer_rank_sidecar(tmp_path):
         patch("megatron.lite.primitive.ckpt.dcp.dcp.save") as dcp_save_mock,
     ):
         save_training_checkpoint(
-            model,
-            optimizer,
-            12,
-            str(tmp_path),
-            parallel,
-            object(),
-            use_dcp=True,
+            model, optimizer, 12, str(tmp_path), parallel, object(), use_dcp=True
         )
 
     dcp_save_mock.assert_called_once()
@@ -264,10 +247,7 @@ def test_runtime_dcp_checkpoint_threads_parallel_config_and_protocol_hooks(tmp_p
     def expert_classifier(name: str):
         return name.endswith("expert")
 
-    proto = SimpleNamespace(
-        PLACEMENT_FN=placement_fn,
-        EXPERT_CLASSIFIER=expert_classifier,
-    )
+    proto = SimpleNamespace(PLACEMENT_FN=placement_fn, EXPERT_CLASSIFIER=expert_classifier)
     handle = ModelHandle(
         model=[model],
         optimizer=None,
@@ -294,8 +274,7 @@ def test_runtime_dcp_checkpoint_threads_parallel_config_and_protocol_hooks(tmp_p
     assert save_kwargs["save_rng"] is True
 
     with patch(
-        "megatron.lite.primitive.ckpt.load_training_checkpoint",
-        return_value=13,
+        "megatron.lite.primitive.ckpt.load_training_checkpoint", return_value=13
     ) as load_mock:
         assert runtime.load_checkpoint(handle, str(tmp_path), use_dcp=True) == 13
 

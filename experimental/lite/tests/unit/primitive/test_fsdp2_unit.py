@@ -10,6 +10,7 @@ import torch.nn as nn
 
 from megatron.lite.primitive.optimizers.fsdp2 import (
     FSDP2Config,
+    FSDP2Optimizer,
     clip_grads_with_sharded_norm_,
     fsdp2_available,
 )
@@ -17,10 +18,10 @@ from megatron.lite.primitive.optimizers.fsdp2.adamw import build_adamw_optimizer
 from megatron.lite.primitive.optimizers.fsdp2.wrap import build_fsdp2_shard_placement_fn
 from megatron.lite.primitive.parallel.state import ParallelState
 
-
 pytestmark = pytest.mark.mlite
 
 fsdp2_wrap = importlib.import_module("megatron.lite.primitive.optimizers.fsdp2.wrap")
+fsdp2_optimizer = importlib.import_module("megatron.lite.primitive.optimizers.fsdp2.optimizer")
 
 
 class ToyBlock(nn.Module):
@@ -78,6 +79,25 @@ def test_fsdp2_config_normalizes_unit_and_leaf_modules():
     assert isinstance(fsdp2_available(), bool)
 
 
+def test_fsdp2_optimizer_offloads_dtensor_state_without_extra_knob(monkeypatch):
+    model = ToyModel()
+    torch_optimizer = torch.optim.AdamW(model.parameters(), lr=1.0e-3)
+    optimizer = FSDP2Optimizer(torch_optimizer, model.parameters())
+    calls: list[bool] = []
+
+    def fake_move_optimizer_state_to_cpu(_optimizer, _offloaded_state, *, include_dtensor_state):
+        calls.append(include_dtensor_state)
+
+    monkeypatch.setattr(
+        fsdp2_optimizer, "move_optimizer_state_to_cpu", fake_move_optimizer_state_to_cpu
+    )
+
+    optimizer.offload_state_to_cpu()
+
+    assert calls == [True]
+    assert not hasattr(optimizer, "optimizer_offload_dtensor_state")
+
+
 def test_fsdp2_shard_placement_prefers_first_divisible_dimension():
     placement_for_two = build_fsdp2_shard_placement_fn(2)
     placement_for_three = build_fsdp2_shard_placement_fn(3)
@@ -102,11 +122,7 @@ def test_fsdp2_rejects_non_module_unit_path():
 
 
 def test_wrap_fsdp2_requires_distributed_when_mesh_is_not_provided(monkeypatch):
-    monkeypatch.setattr(
-        fsdp2_wrap,
-        "_load_fully_shard",
-        lambda: lambda module, **kwargs: module,
-    )
+    monkeypatch.setattr(fsdp2_wrap, "_load_fully_shard", lambda: lambda module, **kwargs: module)
 
     with pytest.raises(RuntimeError, match="torch.distributed"):
         fsdp2_wrap.wrap_fsdp2(ToyModel(), ParallelState(), FSDP2Config())
@@ -153,10 +169,7 @@ def test_wrap_fsdp2_accepts_unit_module_import_paths(monkeypatch):
     fsdp2_wrap.wrap_fsdp2(
         model,
         ParallelState(),
-        FSDP2Config(
-            unit_modules=("torch.nn.modules.linear.Linear",),
-            wrap_root=False,
-        ),
+        FSDP2Config(unit_modules=("torch.nn.modules.linear.Linear",), wrap_root=False),
         mesh=SimpleNamespace(name="mesh"),
     )
 
@@ -165,13 +178,7 @@ def test_wrap_fsdp2_accepts_unit_module_import_paths(monkeypatch):
 
 def test_wrap_fsdp2_uses_container_order_without_nested_unit_duplicates(monkeypatch):
     model = nn.Module()
-    model.layers = nn.ModuleDict(
-        {
-            "10": NestedToyBlock(),
-            "2": ToyBlock(),
-            "11": ToyBlock(),
-        }
-    )
+    model.layers = nn.ModuleDict({"10": NestedToyBlock(), "2": ToyBlock(), "11": ToyBlock()})
     calls: list[nn.Module] = []
 
     def fake_fully_shard(module, **kwargs):
@@ -188,12 +195,7 @@ def test_wrap_fsdp2_uses_container_order_without_nested_unit_duplicates(monkeypa
         mesh=SimpleNamespace(name="mesh"),
     )
 
-    assert calls == [
-        model.layers["10"],
-        model.layers["2"],
-        model.layers["11"],
-        model,
-    ]
+    assert calls == [model.layers["10"], model.layers["2"], model.layers["11"], model]
     assert model.layers["10"]._fake_fsdp2_kwargs["reshard_after_forward"] is True
     assert not hasattr(model.layers["10"].inner, "_fake_fsdp2_kwargs")
     assert model.layers["11"]._fake_fsdp2_kwargs["reshard_after_forward"] is False
@@ -224,10 +226,7 @@ def test_wrap_fsdp2_configures_default_forward_prefetch(monkeypatch):
     fsdp2_wrap.wrap_fsdp2(
         model,
         ParallelState(),
-        FSDP2Config(
-            unit_modules=(ToyBlock,),
-            reshard_after_forward=True,
-        ),
+        FSDP2Config(unit_modules=(ToyBlock,), reshard_after_forward=True),
         mesh=SimpleNamespace(name="mesh"),
     )
 

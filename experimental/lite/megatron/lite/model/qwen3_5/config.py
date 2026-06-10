@@ -1,39 +1,42 @@
 """Qwen3.5 model configuration."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
 from megatron.lite.primitive.config import load_hf_config_dict
 
-_HF_FIELDS = frozenset({
-    "num_hidden_layers",
-    "hidden_size",
-    "num_attention_heads",
-    "num_key_value_heads",
-    "head_dim",
-    "vocab_size",
-    "rms_norm_eps",
-    "max_position_embeddings",
-    "router_aux_loss_coef",
-    "num_experts",
-    "num_experts_per_tok",
-    "moe_intermediate_size",
-    "shared_expert_intermediate_size",
-    "linear_num_key_heads",
-    "linear_key_head_dim",
-    "linear_num_value_heads",
-    "linear_value_head_dim",
-    "linear_conv_kernel_dim",
-    "layer_types",
-    "partial_rotary_factor",
-    "mrope_section",
-    "mtp_num_hidden_layers",
-    "mtp_use_dedicated_embeddings",
-    "num_nextn_predict_layers",
-    "mtp_loss_scaling_factor",
-    "mtp_use_repeated_layer",
-    "mtp_layer_types",
-})
+_HF_FIELDS = frozenset(
+    {
+        "num_hidden_layers",
+        "hidden_size",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "head_dim",
+        "vocab_size",
+        "rms_norm_eps",
+        "max_position_embeddings",
+        "router_aux_loss_coef",
+        "num_experts",
+        "num_experts_per_tok",
+        "moe_intermediate_size",
+        "shared_expert_intermediate_size",
+        "linear_num_key_heads",
+        "linear_key_head_dim",
+        "linear_num_value_heads",
+        "linear_value_head_dim",
+        "linear_conv_kernel_dim",
+        "layer_types",
+        "partial_rotary_factor",
+        "mrope_section",
+        "mtp_num_hidden_layers",
+        "mtp_use_dedicated_embeddings",
+        "num_nextn_predict_layers",
+        "mtp_loss_scaling_factor",
+        "mtp_use_repeated_layer",
+        "mtp_layer_types",
+    }
+)
 
 
 @dataclass
@@ -98,8 +101,8 @@ class Qwen35Config:
             and not self.mtp_layer_types
             and len(self.layer_types) == self.num_hidden_layers + self.num_nextn_predict_layers
         ):
-            self.mtp_layer_types = self.layer_types[self.num_hidden_layers:]
-            self.layer_types = self.layer_types[:self.num_hidden_layers]
+            self.mtp_layer_types = self.layer_types[self.num_hidden_layers :]
+            self.layer_types = self.layer_types[: self.num_hidden_layers]
         if self.num_nextn_predict_layers > 0 and not self.mtp_layer_types:
             self.mtp_layer_types = ["full_attention"] * self.num_nextn_predict_layers
         if len(self.layer_types) != self.num_hidden_layers:
@@ -107,7 +110,10 @@ class Qwen35Config:
                 f"len(layer_types)={len(self.layer_types)} != "
                 f"num_hidden_layers={self.num_hidden_layers}"
             )
-        if self.num_nextn_predict_layers > 0 and len(self.mtp_layer_types) != self.num_nextn_predict_layers:
+        if (
+            self.num_nextn_predict_layers > 0
+            and len(self.mtp_layer_types) != self.num_nextn_predict_layers
+        ):
             raise ValueError(
                 f"len(mtp_layer_types)={len(self.mtp_layer_types)} != "
                 f"num_nextn_predict_layers={self.num_nextn_predict_layers}"
@@ -121,7 +127,10 @@ class Qwen35Config:
             if not cond:
                 errors.append(msg)
 
-        _check(self.num_hidden_layers >= 1, f"num_hidden_layers must be >= 1, got {self.num_hidden_layers}")
+        _check(
+            self.num_hidden_layers >= 1,
+            f"num_hidden_layers must be >= 1, got {self.num_hidden_layers}",
+        )
         _check(
             self.num_nextn_predict_layers >= 0,
             f"num_nextn_predict_layers must be >= 0, got {self.num_nextn_predict_layers}",
@@ -134,7 +143,10 @@ class Qwen35Config:
         _check(self.hidden_size > 0, f"hidden_size must be > 0, got {self.hidden_size}")
         _check(self.head_dim > 0, f"head_dim must be > 0, got {self.head_dim}")
         _check(self.vocab_size > 0, f"vocab_size must be > 0, got {self.vocab_size}")
-        _check(self.num_attention_heads >= 1, f"num_attention_heads must be >= 1, got {self.num_attention_heads}")
+        _check(
+            self.num_attention_heads >= 1,
+            f"num_attention_heads must be >= 1, got {self.num_attention_heads}",
+        )
         _check(
             self.num_attention_heads % self.num_key_value_heads == 0,
             f"num_attention_heads({self.num_attention_heads}) must be divisible by "
@@ -146,15 +158,30 @@ class Qwen35Config:
             f"num_experts_per_tok({self.num_experts_per_tok}) must be in "
             f"[1, num_experts({self.num_experts})]",
         )
-        _check(self.moe_intermediate_size > 0, f"moe_intermediate_size must be > 0, got {self.moe_intermediate_size}")
+        _check(
+            self.moe_intermediate_size > 0,
+            f"moe_intermediate_size must be > 0, got {self.moe_intermediate_size}",
+        )
         _check(
             self.shared_expert_intermediate_size > 0,
             f"shared_expert_intermediate_size must be > 0, got {self.shared_expert_intermediate_size}",
         )
-        _check(self.linear_num_key_heads >= 1, f"linear_num_key_heads must be >= 1, got {self.linear_num_key_heads}")
-        _check(self.linear_key_head_dim > 0, f"linear_key_head_dim must be > 0, got {self.linear_key_head_dim}")
-        _check(self.linear_num_value_heads >= 1, f"linear_num_value_heads must be >= 1, got {self.linear_num_value_heads}")
-        _check(self.linear_value_head_dim > 0, f"linear_value_head_dim must be > 0, got {self.linear_value_head_dim}")
+        _check(
+            self.linear_num_key_heads >= 1,
+            f"linear_num_key_heads must be >= 1, got {self.linear_num_key_heads}",
+        )
+        _check(
+            self.linear_key_head_dim > 0,
+            f"linear_key_head_dim must be > 0, got {self.linear_key_head_dim}",
+        )
+        _check(
+            self.linear_num_value_heads >= 1,
+            f"linear_num_value_heads must be >= 1, got {self.linear_num_value_heads}",
+        )
+        _check(
+            self.linear_value_head_dim > 0,
+            f"linear_value_head_dim must be > 0, got {self.linear_value_head_dim}",
+        )
         _check(
             0.0 < self.partial_rotary_factor <= 1.0,
             f"partial_rotary_factor must be in (0, 1], got {self.partial_rotary_factor}",
@@ -177,7 +204,9 @@ class Qwen35Config:
         for i, lt in enumerate(self.layer_types):
             _check(lt in valid_types, f"layer_types[{i}] must be one of {valid_types}, got '{lt}'")
         for i, lt in enumerate(self.mtp_layer_types):
-            _check(lt in valid_types, f"mtp_layer_types[{i}] must be one of {valid_types}, got '{lt}'")
+            _check(
+                lt in valid_types, f"mtp_layer_types[{i}] must be one of {valid_types}, got '{lt}'"
+            )
 
         if errors:
             raise ValueError(
@@ -215,7 +244,9 @@ class Qwen35Config:
             if "mrope_section" not in kwargs and "mrope_section" in rp:
                 kwargs["mrope_section"] = list(rp["mrope_section"])
         if "head_dim" not in kwargs or kwargs.get("head_dim") is None:
-            kwargs["head_dim"] = kwargs.get("hidden_size", 2048) // kwargs.get("num_attention_heads", 16)
+            kwargs["head_dim"] = kwargs.get("hidden_size", 2048) // kwargs.get(
+                "num_attention_heads", 16
+            )
         if kwargs.get("num_nextn_predict_layers") is None:
             kwargs["num_nextn_predict_layers"] = 0
         kwargs.update(overrides)

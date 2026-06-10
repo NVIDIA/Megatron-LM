@@ -6,7 +6,6 @@ from megatron.lite.runtime import RuntimeConfig, create_runtime
 from megatron.lite.runtime.backends.mlite.config import DebugConfig, MegatronLiteConfig
 from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig
 
-
 pytestmark = pytest.mark.mlite
 
 
@@ -60,8 +59,7 @@ def test_mlite_config_from_dict_preserves_parallel_optimizer_and_impl_cfg():
 def test_mlite_config_rejects_num_microbatches_in_backend_config():
     with pytest.raises(ValueError, match="num_microbatches"):
         MegatronLiteConfig.from_dict(
-            "/models/qwen",
-            {"model_name": "qwen3_moe", "num_microbatches": 2},
+            "/models/qwen", {"model_name": "qwen3_moe", "num_microbatches": 2}
         )
 
 

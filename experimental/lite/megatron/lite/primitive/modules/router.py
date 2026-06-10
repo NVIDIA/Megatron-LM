@@ -13,13 +13,13 @@ from typing import TYPE_CHECKING
 import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
+
 from megatron.core.transformer.moe.moe_utils import (  # pyright: ignore[reportMissingImports]
     compute_routing_scores_for_aux_loss,
     router_gating_linear,
     switch_load_balancing_loss_func,
     topk_routing_with_score_function,
 )
-
 from megatron.lite.primitive.modules.moe import MoEAuxLossAutoScaler
 
 if TYPE_CHECKING:
@@ -27,19 +27,13 @@ if TYPE_CHECKING:
 
 
 def _ordered_topk_from_routing_map(
-    probs_dense: torch.Tensor,
-    routing_map: torch.Tensor,
-    topk: int,
+    probs_dense: torch.Tensor, routing_map: torch.Tensor, topk: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
     expert_ids = torch.arange(
-        probs_dense.size(-1),
-        device=probs_dense.device,
-        dtype=torch.long,
+        probs_dense.size(-1), device=probs_dense.device, dtype=torch.long
     ).expand_as(routing_map)
     masked_ids = torch.where(
-        routing_map,
-        expert_ids,
-        torch.full_like(expert_ids, probs_dense.size(-1)),
+        routing_map, expert_ids, torch.full_like(expert_ids, probs_dense.size(-1))
     )
     topk_indices = torch.sort(masked_ids, dim=-1).values[:, :topk]
     topk_scores = torch.gather(probs_dense, dim=-1, index=topk_indices)
@@ -77,9 +71,7 @@ class TopKRouter(nn.Module):
 
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
         self.register_buffer(
-            "expert_bias",
-            torch.zeros(config.num_experts, dtype=torch.float32),
-            persistent=False,
+            "expert_bias", torch.zeros(config.num_experts, dtype=torch.float32), persistent=False
         )
 
         self._aux_loss_group = ps.tp_group if ps.tp_size > 1 else None
@@ -107,27 +99,20 @@ class TopKRouter(nn.Module):
                 fused=False,
             )
             topk_scores, topk_indices = _ordered_topk_from_routing_map(
-                probs_dense,
-                routing_map,
-                self.topk,
+                probs_dense, routing_map, self.topk
             )
         if self.router_dtype is None:
             topk_scores = topk_scores.to(x.dtype)
 
         if self.compute_aux_loss and self.training and torch.is_grad_enabled():
             routing_map, aux_scores = compute_routing_scores_for_aux_loss(
-                logits,
-                self.topk,
-                score_function="softmax",
-                fused=self.moe_router_fusion,
+                logits, self.topk, score_function="softmax", fused=self.moe_router_fusion
             )
             tokens_per_expert = routing_map.sum(dim=0).to(torch.int64)
             total_num_tokens = num_tokens
             if self._aux_loss_group is not None:
                 dist.all_reduce(tokens_per_expert, group=self._aux_loss_group)
-                total_num_tokens = num_tokens * dist.get_world_size(
-                    group=self._aux_loss_group
-                )
+                total_num_tokens = num_tokens * dist.get_world_size(group=self._aux_loss_group)
             aux_loss = switch_load_balancing_loss_func(
                 aux_scores,
                 tokens_per_expert,
@@ -192,26 +177,19 @@ class SigmoidTopKRouter(nn.Module):
             fused=self.moe_router_fusion,
         )
         topk_scores, topk_indices = _ordered_topk_from_routing_map(
-            probs_dense,
-            routing_map,
-            self.topk,
+            probs_dense, routing_map, self.topk
         )
         topk_scores = topk_scores.to(logits.dtype)
 
         if self.compute_aux_loss and self.training and torch.is_grad_enabled():
             _, aux_scores = compute_routing_scores_for_aux_loss(
-                logits,
-                self.topk,
-                score_function="sigmoid",
-                fused=self.moe_router_fusion,
+                logits, self.topk, score_function="sigmoid", fused=self.moe_router_fusion
             )
             tokens_per_expert = routing_map.sum(dim=0).to(torch.int64)
             total_num_tokens = num_tokens
             if self._aux_loss_group is not None:
                 dist.all_reduce(tokens_per_expert, group=self._aux_loss_group)
-                total_num_tokens = num_tokens * dist.get_world_size(
-                    group=self._aux_loss_group
-                )
+                total_num_tokens = num_tokens * dist.get_world_size(group=self._aux_loss_group)
             aux_loss = switch_load_balancing_loss_func(
                 aux_scores,
                 tokens_per_expert,

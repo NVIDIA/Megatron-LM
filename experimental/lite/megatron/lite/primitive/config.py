@@ -50,7 +50,4 @@ def load_hf_config_dict(path_or_name: str) -> dict[str, Any]:
         raise ValueError(f"Failed to load config from '{path_or_name}': {e}") from e
 
 
-__all__ = [
-    "load_hf_config_dict",
-    "to_dataclass",
-]
+__all__ = ["load_hf_config_dict", "to_dataclass"]

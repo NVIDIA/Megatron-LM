@@ -90,17 +90,12 @@ def build_fsdp2_device_mesh(ps: ParallelState, config: FSDP2Config | None = None
     from torch.distributed import DeviceMesh
 
     return DeviceMesh.from_group(
-        group,
-        device_type=cfg.device_type,
-        mesh_dim_names=(cfg.mesh_dim_name,),
+        group, device_type=cfg.device_type, mesh_dim_names=(cfg.mesh_dim_name,)
     )
 
 
 def build_fsdp2_process_group_mesh(
-    group: dist.ProcessGroup,
-    *,
-    mesh_dim_name: str,
-    device_type: str = "cuda",
+    group: dist.ProcessGroup, *, mesh_dim_name: str, device_type: str = "cuda"
 ) -> Any:
     """Build a one-dimensional FSDP2 DeviceMesh from an explicit process group."""
 
@@ -115,11 +110,7 @@ def build_fsdp2_process_group_mesh(
 
     from torch.distributed import DeviceMesh
 
-    return DeviceMesh.from_group(
-        group,
-        device_type=device_type,
-        mesh_dim_names=(mesh_dim_name,),
-    )
+    return DeviceMesh.from_group(group, device_type=device_type, mesh_dim_names=(mesh_dim_name,))
 
 
 def build_fsdp2_shard_placement_fn(fsdp_size: int) -> Callable[[nn.Parameter], Any]:
@@ -181,8 +172,7 @@ def wrap_fsdp2(
     for idx, sub_module in enumerate(unit_modules):
         kwargs = dict(common_kwargs)
         _set_optional_reshard_after_forward(
-            kwargs,
-            _unit_reshard_after_forward(cfg, idx, len(unit_modules)),
+            kwargs, _unit_reshard_after_forward(cfg, idx, len(unit_modules))
         )
         fully_shard(sub_module, **kwargs)
         wrapped_units.append(sub_module)
@@ -263,9 +253,7 @@ def _warn_tp_not_recommended(ps: ParallelState) -> None:
 
 
 def promote_fsdp2_trainable_params_to_fp32(
-    model: nn.Module,
-    *,
-    ignored_params: set[nn.Parameter] | None = None,
+    model: nn.Module, *, ignored_params: set[nn.Parameter] | None = None
 ) -> int:
     """Promote FSDP2-owned trainable floating parameters to FP32 shards.
 
@@ -294,10 +282,7 @@ def promote_fsdp2_trainable_params_to_fp32(
 
 
 def set_fsdp2_requires_gradient_sync(
-    module: nn.Module,
-    requires_gradient_sync: bool,
-    *,
-    recurse: bool = True,
+    module: nn.Module, requires_gradient_sync: bool, *, recurse: bool = True
 ) -> int:
     """Set FSDP2 gradient sync state and return the number of touched roots."""
 
@@ -355,9 +340,7 @@ def _import_module_type(path: str) -> type[nn.Module]:
 
 
 def _iter_fsdp2_unit_modules(
-    root: nn.Module,
-    unit_types: tuple[type[nn.Module], ...],
-    leaf_module_names: tuple[str, ...],
+    root: nn.Module, unit_types: tuple[type[nn.Module], ...], leaf_module_names: tuple[str, ...]
 ) -> Iterable[nn.Module]:
     leaf_names = set(leaf_module_names)
     if not unit_types and not leaf_names:
@@ -398,17 +381,12 @@ def _module_has_trainable_param(module: nn.Module) -> bool:
 
 def _is_fsdp2_module(module: nn.Module) -> bool:
     return hasattr(module, "set_modules_to_forward_prefetch") and hasattr(
-        module,
-        "set_modules_to_backward_prefetch",
+        module, "set_modules_to_backward_prefetch"
     )
 
 
 def _apply_fsdp2_prefetch(
-    root: nn.Module,
-    wrapped_units: list[nn.Module],
-    *,
-    forward_depth: int,
-    backward_depth: int,
+    root: nn.Module, wrapped_units: list[nn.Module], *, forward_depth: int, backward_depth: int
 ) -> None:
     fsdp_units = [module for module in wrapped_units if _is_fsdp2_module(module)]
     fsdp_root = root if _is_fsdp2_module(root) else None
@@ -429,19 +407,14 @@ def _apply_fsdp2_prefetch(
                 fsdp_units[idx].set_modules_to_backward_prefetch(targets)
 
 
-def _unit_reshard_after_forward(
-    cfg: FSDP2Config,
-    idx: int,
-    total_units: int,
-) -> bool | int | None:
+def _unit_reshard_after_forward(cfg: FSDP2Config, idx: int, total_units: int) -> bool | int | None:
     if total_units > 0 and idx == total_units - 1:
         return cfg.last_unit_reshard_after_forward
     return cfg.reshard_after_forward
 
 
 def _set_optional_reshard_after_forward(
-    kwargs: dict[str, Any],
-    reshard_after_forward: bool | int | None,
+    kwargs: dict[str, Any], reshard_after_forward: bool | int | None
 ) -> None:
     if reshard_after_forward is not None:
         kwargs["reshard_after_forward"] = reshard_after_forward

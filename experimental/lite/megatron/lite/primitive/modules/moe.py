@@ -54,9 +54,7 @@ class _AllToAll(torch.autograd.Function):
         ctx.output_splits = output_splits
         ctx.group = group
         input_tensor = input_tensor.contiguous()
-        output = input_tensor.new_empty(
-            [sum(output_splits)] + list(input_tensor.shape[1:])
-        )
+        output = input_tensor.new_empty([sum(output_splits)] + list(input_tensor.shape[1:]))
         dist.all_to_all_single(
             output,
             input_tensor,
@@ -69,9 +67,7 @@ class _AllToAll(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         grad_output = grad_output.contiguous()
-        grad_input = grad_output.new_empty(
-            [sum(ctx.input_splits)] + list(grad_output.shape[1:])
-        )
+        grad_input = grad_output.new_empty([sum(ctx.input_splits)] + list(grad_output.shape[1:]))
         dist.all_to_all_single(
             grad_input,
             grad_output,
@@ -80,4 +76,3 @@ class _AllToAll(torch.autograd.Function):
             group=ctx.group,
         )
         return grad_input, None, None, None
-

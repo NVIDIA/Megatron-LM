@@ -7,7 +7,6 @@ from pathlib import Path
 
 import pytest
 
-
 LITE_ROOT = Path(__file__).resolve().parents[1]
 REPO_ROOT = Path(__file__).resolve().parents[3]
 VERL_EXAMPLE_ROOT = LITE_ROOT / "examples" / "verl"
@@ -28,10 +27,7 @@ def pytest_configure(config):
 
 def pytest_addoption(parser):
     parser.addoption(
-        "--mlite-smoke",
-        action="store_true",
-        default=False,
-        help="run Megatron Lite smoke tests",
+        "--mlite-smoke", action="store_true", default=False, help="run Megatron Lite smoke tests"
     )
 
 
@@ -58,9 +54,7 @@ def transformer_engine_import_stub(monkeypatch):
 
         class _UnavailableTE:
             def __init__(self, *args, **kwargs):
-                raise RuntimeError(
-                    "Transformer Engine is not installed in this test environment."
-                )
+                raise RuntimeError("Transformer Engine is not installed in this test environment.")
 
         root = types.ModuleType("transformer_engine")
         root.__version__ = "0.0.0"

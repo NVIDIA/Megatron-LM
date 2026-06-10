@@ -15,7 +15,6 @@ from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_s
 from megatron.lite.primitive.train_step import compute_and_clip_grad_norm, run_microbatch_loop
 from megatron.lite.primitive.utils import ensure_divisible
 
-
 pytestmark = pytest.mark.mlite
 
 
@@ -25,9 +24,7 @@ def test_vocab_parallel_cross_entropy_matches_torch_cross_entropy():
 
     loss = vocab_parallel_cross_entropy(logits, labels)
     expected = F.cross_entropy(
-        logits.float().reshape(-1, 5),
-        labels.reshape(-1),
-        reduction="none",
+        logits.float().reshape(-1, 5), labels.reshape(-1), reduction="none"
     ).view_as(labels)
 
     torch.testing.assert_close(loss, expected)
@@ -41,10 +38,13 @@ def test_logprob_selects_labels_in_batch_sequence_or_sequence_batch_layout():
     labels_bsh = torch.tensor([[0, 1], [2, 3], [1, 0]])
 
     selected = vocab_parallel_log_probs_from_logits(logits, labels_bsh)
-    expected = torch.log_softmax(logits.float(), dim=-1).gather(
-        -1,
-        labels_bsh.transpose(0, 1).unsqueeze(-1),
-    ).squeeze(-1).transpose(0, 1).contiguous()
+    expected = (
+        torch.log_softmax(logits.float(), dim=-1)
+        .gather(-1, labels_bsh.transpose(0, 1).unsqueeze(-1))
+        .squeeze(-1)
+        .transpose(0, 1)
+        .contiguous()
+    )
 
     torch.testing.assert_close(selected, expected)
     with pytest.raises(ValueError, match="Could not align"):
@@ -54,21 +54,11 @@ def test_logprob_selects_labels_in_batch_sequence_or_sequence_batch_layout():
 def test_linear_cross_entropy_fallback_matches_explicit_matmul():
     hidden = torch.tensor([[1.0, -2.0, 0.5], [0.25, 1.5, -0.5]])
     weight = torch.tensor(
-        [
-            [0.5, -1.0, 0.25],
-            [1.0, 0.0, -0.5],
-            [-0.5, 0.75, 1.0],
-            [0.25, 0.5, -1.5],
-        ]
+        [[0.5, -1.0, 0.25], [1.0, 0.0, -0.5], [-0.5, 0.75, 1.0], [0.25, 0.5, -1.5]]
     )
     labels = torch.tensor([0, 3])
 
-    log_probs, entropy = linear_cross_entropy(
-        hidden,
-        weight,
-        labels,
-        temperature=2.0,
-    )
+    log_probs, entropy = linear_cross_entropy(hidden, weight, labels, temperature=2.0)
     logits = hidden.matmul(weight.t()) / 2.0
     expected_loss = F.cross_entropy(logits, labels, reduction="none")
     expected_entropy = torch.distributions.Categorical(logits=logits).entropy()
@@ -190,12 +180,7 @@ def test_train_step_microbatch_loop_and_grad_clip_cpu_contract():
     assert model.weight.grad is not None
     assert torch.isfinite(model.weight.grad).all()
 
-    grad_norm = compute_and_clip_grad_norm(
-        model,
-        optimizer=None,
-        max_norm=0.25,
-        use_dist_opt=False,
-    )
+    grad_norm = compute_and_clip_grad_norm(model, optimizer=None, max_norm=0.25, use_dist_opt=False)
 
     assert torch.isfinite(grad_norm)
     assert model.weight.grad.norm() <= 0.25 + 1.0e-6

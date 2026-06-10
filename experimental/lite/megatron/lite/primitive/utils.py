@@ -22,8 +22,4 @@ def log_rank0(msg: str) -> None:
         print(f"[megatron.lite] {msg}", flush=True)
 
 
-__all__ = [
-    "build_fp8_recipe",
-    "ensure_divisible",
-    "log_rank0",
-]
+__all__ = ["build_fp8_recipe", "ensure_divisible", "log_rank0"]

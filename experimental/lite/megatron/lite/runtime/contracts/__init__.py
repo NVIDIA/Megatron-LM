@@ -12,8 +12,12 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from megatron.lite.runtime.backends.bridge.config import BridgeConfig
-    from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig, DebugConfig
-    from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig, RuntimeConfig
+    from megatron.lite.runtime.backends.mlite.config import DebugConfig, MegatronLiteConfig
+    from megatron.lite.runtime.contracts.config import (
+        OptimizerConfig,
+        ParallelConfig,
+        RuntimeConfig,
+    )
     from megatron.lite.runtime.contracts.data import (
         Batch,
         ForwardResult,

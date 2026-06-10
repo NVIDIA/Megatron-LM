@@ -58,8 +58,7 @@ def move_optimizer_state_to_cpu(
 
 
 def move_offloaded_optimizer_state_to_device(
-    optimizer: Any,
-    offloaded: dict[tuple[int, str], OffloadedStateEntry],
+    optimizer: Any, offloaded: dict[tuple[int, str], OffloadedStateEntry]
 ) -> None:
     if not offloaded:
         return
@@ -80,9 +79,7 @@ def move_offloaded_optimizer_state_to_device(
                     device_value = value.to(entry.device, non_blocking=True)
                     if entry.is_dtensor:
                         param_state[state_key] = dtensor_from_local(
-                            device_value,
-                            entry.device_mesh,
-                            entry.placements,
+                            device_value, entry.device_mesh, entry.placements
                         )
                     else:
                         param_state[state_key] = device_value

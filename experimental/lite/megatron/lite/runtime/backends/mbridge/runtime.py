@@ -13,10 +13,10 @@ import torch.distributed as dist
 from megatron.lite.runtime.backends.bridge.config import BridgeConfig
 from megatron.lite.runtime.backends.bridge.runtime import (
     BridgeRuntime,
-    _MpuParallelState,
     _build_lr_scheduler,
     _build_optimizer,
     _lower_transformer_overrides,
+    _MpuParallelState,
 )
 from megatron.lite.runtime.contracts.handle import ModelHandle
 from megatron.lite.runtime.megatron_utils import (
@@ -32,6 +32,7 @@ logger = logging.getLogger(__name__)
 def _build_mbridge(hf_path: str, cfg: BridgeConfig):
     """Build the legacy mbridge AutoBridge lazily from an HF model path."""
     from mbridge import AutoBridge
+
     from megatron.lite.primitive.deterministic import deterministic_requested
 
     bridge = AutoBridge.from_pretrained(hf_path, trust_remote_code=True)
@@ -48,8 +49,7 @@ def _build_mbridge(hf_path: str, cfg: BridgeConfig):
 
     if cfg.model_name == "qwen3_5":
         bridge.set_extra_args(
-            deterministic_mode=deterministic_requested(),
-            fused_single_qkv_rope=False,
+            deterministic_mode=deterministic_requested(), fused_single_qkv_rope=False
         )
 
     if callable(cfg.bridge_post_init):
@@ -79,10 +79,7 @@ class MBridgeRuntime(BridgeRuntime):
     """mbridge training backend using Megatron-Core optimizer state."""
 
     def build_model(
-        self,
-        hf_path: str | None = None,
-        cfg: BridgeConfig | dict[str, Any] | None = None,
-        **kwargs,
+        self, hf_path: str | None = None, cfg: BridgeConfig | dict[str, Any] | None = None, **kwargs
     ) -> ModelHandle:
         from megatron.core import parallel_state as mpu
         from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -126,9 +123,7 @@ class MBridgeRuntime(BridgeRuntime):
         ddp_config.update(rt_cfg.override_ddp_config)
 
         model_list = bridge.get_model(
-            model_type=ModelType.encoder_or_decoder,
-            wrap_with_ddp=True,
-            ddp_config=ddp_config,
+            model_type=ModelType.encoder_or_decoder, wrap_with_ddp=True, ddp_config=ddp_config
         )
         if rt_cfg.load_hf_weights:
             bridge.load_weights(model_list, hf_path, memory_efficient=True)
@@ -142,13 +137,7 @@ class MBridgeRuntime(BridgeRuntime):
         if self._offload_optimizer and optimizer is not None:
             offload_optimizer(optimizer)
 
-        logger.info(
-            "MBridgeRuntime: model built, tp=%d ep=%d pp=%d cp=%d",
-            p.tp,
-            p.ep,
-            p.pp,
-            p.cp,
-        )
+        logger.info("MBridgeRuntime: model built, tp=%d ep=%d pp=%d cp=%d", p.tp, p.ep, p.pp, p.cp)
 
         return ModelHandle(
             model=model_list[0],

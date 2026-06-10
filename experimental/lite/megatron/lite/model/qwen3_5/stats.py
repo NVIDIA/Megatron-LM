@@ -6,11 +6,7 @@ from megatron.lite.model.qwen3_5.config import Qwen35Config
 
 
 def num_floating_point_operations(
-    model_cfg: Qwen35Config,
-    *,
-    seq_len: int,
-    global_batch_size: int,
-    tp_size: int = 1,
+    model_cfg: Qwen35Config, *, seq_len: int, global_batch_size: int, tp_size: int = 1
 ) -> int | None:
     """Megatron-aligned FLOPs estimate for one training step."""
 
@@ -45,8 +41,12 @@ def num_floating_point_operations(
                 for i in range(num_hidden_layers)
             ]
 
-        num_full_attention_layers = sum(layer_type == "full_attention" for layer_type in layer_types)
-        num_linear_attention_layers = sum(layer_type == "linear_attention" for layer_type in layer_types)
+        num_full_attention_layers = sum(
+            layer_type == "full_attention" for layer_type in layer_types
+        )
+        num_linear_attention_layers = sum(
+            layer_type == "linear_attention" for layer_type in layer_types
+        )
         if num_full_attention_layers + num_linear_attention_layers != num_hidden_layers:
             return None
 
@@ -80,11 +80,15 @@ def num_floating_point_operations(
         linear_conv_kernel_dim = int(_get("linear_conv_kernel_dim"))
         qk_dim = linear_key_head_dim * linear_num_key_heads
         v_dim = linear_value_head_dim * linear_num_value_heads
-        linear_attention_flops = 6 * total_tokens * (
-            hidden_size * (2 * qk_dim + 2 * v_dim + 2 * linear_num_value_heads)
-            + linear_conv_kernel_dim * (2 * qk_dim + v_dim)
-            + linear_num_value_heads * (linear_value_head_dim**2) * 4
-            + hidden_size * v_dim
+        linear_attention_flops = (
+            6
+            * total_tokens
+            * (
+                hidden_size * (2 * qk_dim + 2 * v_dim + 2 * linear_num_value_heads)
+                + linear_conv_kernel_dim * (2 * qk_dim + v_dim)
+                + linear_num_value_heads * (linear_value_head_dim**2) * 4
+                + hidden_size * v_dim
+            )
         )
 
         moe_intermediate_size = int(_get("moe_intermediate_size"))
@@ -94,10 +98,7 @@ def num_floating_point_operations(
             18
             * total_tokens
             * hidden_size
-            * (
-                moe_intermediate_size * num_experts_per_tok
-                + shared_expert_intermediate_size
-            )
+            * (moe_intermediate_size * num_experts_per_tok + shared_expert_intermediate_size)
             * num_hidden_layers
         )
 
@@ -168,8 +169,7 @@ def activated_params(model_cfg: Qwen35Config) -> int | None:
         shared_expert_intermediate_size = int(_get("shared_expert_intermediate_size"))
         router = hidden_size * num_experts
         routed_expert = (
-            hidden_size * (2 * moe_intermediate_size)
-            + moe_intermediate_size * hidden_size
+            hidden_size * (2 * moe_intermediate_size) + moe_intermediate_size * hidden_size
         )
         shared_expert = (
             hidden_size * (2 * shared_expert_intermediate_size)

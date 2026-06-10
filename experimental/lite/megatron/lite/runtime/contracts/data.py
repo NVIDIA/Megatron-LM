@@ -40,10 +40,10 @@ class PackedBatch(Batch):
     ``cu_seqlens`` and ``position_ids`` are derived automatically.
     """
 
-    input_ids: torch.Tensor       # [total_tokens]
-    labels: torch.Tensor          # [total_tokens]
-    seq_lens: torch.Tensor        # [num_seqs]
-    loss_mask: torch.Tensor | None = None   # [total_tokens]
+    input_ids: torch.Tensor  # [total_tokens]
+    labels: torch.Tensor  # [total_tokens]
+    seq_lens: torch.Tensor  # [num_seqs]
+    loss_mask: torch.Tensor | None = None  # [total_tokens]
     position_ids: torch.Tensor | None = None  # [total_tokens], auto if None
     routed_experts: torch.Tensor | None = None
     extras: dict[str, Any] = field(default_factory=dict)
@@ -62,10 +62,12 @@ class PackedBatch(Batch):
     @property
     def cu_seqlens(self) -> torch.Tensor:
         """Cumulative sequence lengths for THD attention.  Shape ``[num_seqs+1]``."""
-        return torch.cat([
-            torch.zeros(1, dtype=torch.int32, device=self.seq_lens.device),
-            self.seq_lens.cumsum(0).to(torch.int32),
-        ])
+        return torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int32, device=self.seq_lens.device),
+                self.seq_lens.cumsum(0).to(torch.int32),
+            ]
+        )
 
     @property
     def total_tokens(self) -> int:
@@ -75,9 +77,9 @@ class PackedBatch(Batch):
         """Generate per-token position_ids from seq_lens."""
         if self.position_ids is not None:
             return self.position_ids
-        return torch.cat([
-            torch.arange(s, device=self.seq_lens.device) for s in self.seq_lens.tolist()
-        ])
+        return torch.cat(
+            [torch.arange(s, device=self.seq_lens.device) for s in self.seq_lens.tolist()]
+        )
 
 
 @dataclass(slots=True)
@@ -117,10 +119,4 @@ class ForwardResult:
     metrics: dict[str, Any] = field(default_factory=dict)
 
 
-__all__ = [
-    "Batch",
-    "ForwardResult",
-    "ModelOutputs",
-    "PackedBatch",
-    "TrainBatch",
-]
+__all__ = ["Batch", "ForwardResult", "ModelOutputs", "PackedBatch", "TrainBatch"]

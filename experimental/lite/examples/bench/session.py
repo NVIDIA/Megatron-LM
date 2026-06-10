@@ -116,7 +116,9 @@ def _resolve_model_stats(config: Any, proto: Any) -> Any | None:
     return proto
 
 
-def _resolve_step_flops(handle: ModelHandle, cfg: PretrainSessionConfig) -> tuple[int | None, int | None]:
+def _resolve_step_flops(
+    handle: ModelHandle, cfg: PretrainSessionConfig
+) -> tuple[int | None, int | None]:
     config = handle.config
     proto = handle._extras.get("protocol")
     model_stats = _resolve_model_stats(config, proto)
@@ -178,10 +180,7 @@ def run_pretrain_session(
             _sync(cfg.device)
             t0 = time.perf_counter()
             result = rt.forward_backward(
-                handle,
-                data_iter,
-                loss_fn=None,
-                num_microbatches=cfg.num_microbatches,
+                handle, data_iter, loss_fn=None, num_microbatches=cfg.num_microbatches
             )
             if cfg.no_optimizer:
                 grad_norm = 0.0

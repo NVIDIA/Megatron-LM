@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
 import json
-from pathlib import Path
 import sys
+from contextlib import nullcontext
+from pathlib import Path
 
 from megatron.lite.runtime.contracts.config import ParallelConfig
 from megatron.lite.runtime.contracts.data import ForwardResult
@@ -49,11 +49,7 @@ def test_bench_mlite_deterministic_mounts_native_vision_not_mbridge(monkeypatch)
     monkeypatch.setenv("MEGATRON_LITE_DETERMINISTIC", "1")
 
     runtime_cfg = build_runtime_config(
-        BenchCliConfig(
-            backend="mlite",
-            hf_path="/tmp/hf",
-            model_name="qwen3_5",
-        )
+        BenchCliConfig(backend="mlite", hf_path="/tmp/hf", model_name="qwen3_5")
     )
 
     impl_cfg = runtime_cfg.backend_cfg.impl_cfg
@@ -156,13 +152,7 @@ def test_pretrain_session_runs_with_fake_runtime_on_cpu():
         optimizer=object(),
         parallel_state=None,
         config=type(
-            "Cfg",
-            (),
-            {
-                "model_name": "fake",
-                "impl": "lite",
-                "parallel": ParallelConfig(),
-            },
+            "Cfg", (), {"model_name": "fake", "impl": "lite", "parallel": ParallelConfig()}
         )(),
         _extras={"optimizer_backend": "fake"},
     )
@@ -233,11 +223,7 @@ def test_bench_main_writes_output_json_only_on_rank_zero(tmp_path, monkeypatch):
 
 
 def test_result_artifact_summary_and_trace_compare(tmp_path):
-    from examples.bench.results import (
-        compare_step_traces,
-        load_result_artifact,
-        result_summary,
-    )
+    from examples.bench.results import compare_step_traces, load_result_artifact, result_summary
 
     baseline = {
         "summary": {
@@ -280,18 +266,10 @@ def test_result_trace_compare_reports_metric_level_failures():
     from examples.bench.results import compare_step_traces
 
     baseline = {
-        "result": {
-            "step_traces": [
-                {"step": 0, "loss": 1.0, "grad_norm": 2.0, "step_ms": 10.0},
-            ]
-        },
+        "result": {"step_traces": [{"step": 0, "loss": 1.0, "grad_norm": 2.0, "step_ms": 10.0}]}
     }
     candidate = {
-        "result": {
-            "step_traces": [
-                {"step": 0, "loss": 1.00001, "grad_norm": 3.0, "step_ms": 10.0},
-            ]
-        },
+        "result": {"step_traces": [{"step": 0, "loss": 1.00001, "grad_norm": 3.0, "step_ms": 10.0}]}
     }
 
     comparison = compare_step_traces(baseline, candidate, atol=1e-3, rtol=0.0)
@@ -308,10 +286,10 @@ def test_correctness_compare_requires_bitwise_fields():
         "eval_logits": {"sha256": "a", "shape": [1], "dtype": "torch.bfloat16"},
         "steps": [
             {
-                "loss": {"value": 1.0, "float_hex": 1.0.hex()},
+                "loss": {"value": 1.0, "float_hex": (1.0).hex()},
                 "logits": {"sha256": "b"},
                 "grad_fingerprint": {"sha256": "c", "tensor_count": 1},
-                "grad_norm": {"value": 2.0, "float_hex": 2.0.hex()},
+                "grad_norm": {"value": 2.0, "float_hex": (2.0).hex()},
                 "update_successful": True,
                 "num_zeros": 0,
                 "post_step_weights": {"sha256": "d", "tensor_count": 1},
@@ -322,7 +300,7 @@ def test_correctness_compare_requires_bitwise_fields():
 
     assert compare_correctness_artifacts(baseline, candidate)["passed"] is True
 
-    candidate["steps"][0]["grad_norm"] = {"value": 2.5, "float_hex": 2.5.hex()}
+    candidate["steps"][0]["grad_norm"] = {"value": 2.5, "float_hex": (2.5).hex()}
     comparison = compare_correctness_artifacts(baseline, candidate)
 
     assert comparison["passed"] is False

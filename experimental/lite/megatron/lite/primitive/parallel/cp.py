@@ -6,7 +6,7 @@ import torch
 
 
 def zigzag_split_for_cp(
-    tensor: torch.Tensor, cp_rank: int, cp_size: int, seq_dim: int = 1,
+    tensor: torch.Tensor, cp_rank: int, cp_size: int, seq_dim: int = 1
 ) -> torch.Tensor:
     """Split tensor along sequence dim using zigzag (striped) pattern for CP.
 
@@ -20,37 +20,33 @@ def zigzag_split_for_cp(
     if cp_size <= 1:
         return tensor
     seq_len = tensor.shape[seq_dim]
-    assert seq_len % (2 * cp_size) == 0, (
-        f"seq_len={seq_len} must be divisible by 2*cp_size={2 * cp_size}"
-    )
+    assert (
+        seq_len % (2 * cp_size) == 0
+    ), f"seq_len={seq_len} must be divisible by 2*cp_size={2 * cp_size}"
     shape = list(tensor.shape)
-    shape[seq_dim:seq_dim + 1] = [2 * cp_size, seq_len // (2 * cp_size)]
+    shape[seq_dim : seq_dim + 1] = [2 * cp_size, seq_len // (2 * cp_size)]
     tensor = tensor.view(*shape)
-    idx = torch.tensor(
-        [cp_rank, 2 * cp_size - cp_rank - 1],
-        dtype=torch.long, device=tensor.device,
-    )
+    idx = torch.tensor([cp_rank, 2 * cp_size - cp_rank - 1], dtype=torch.long, device=tensor.device)
     tensor = tensor.index_select(seq_dim, idx)
-    shape[seq_dim:seq_dim + 2] = [seq_len // cp_size]
+    shape[seq_dim : seq_dim + 2] = [seq_len // cp_size]
     return tensor.reshape(*shape)
 
 
 def zigzag_reconstruct_from_cp_parts(
-    parts: list[torch.Tensor] | tuple[torch.Tensor, ...],
-    seq_dim: int = 1,
+    parts: list[torch.Tensor] | tuple[torch.Tensor, ...], seq_dim: int = 1
 ) -> torch.Tensor:
     """Reconstruct a full sequence from per-rank zigzag CP shards."""
     cp_size = len(parts)
     if cp_size <= 1:
         return parts[0]
     local_len = parts[0].shape[seq_dim]
-    assert local_len % 2 == 0, (
-        f"local seq_len={local_len} must be divisible by 2 for zigzag CP reconstruction"
-    )
+    assert (
+        local_len % 2 == 0
+    ), f"local seq_len={local_len} must be divisible by 2 for zigzag CP reconstruction"
     for idx, part in enumerate(parts):
-        assert part.shape == parts[0].shape, (
-            f"CP part {idx} shape {tuple(part.shape)} != {tuple(parts[0].shape)}"
-        )
+        assert (
+            part.shape == parts[0].shape
+        ), f"CP part {idx} shape {tuple(part.shape)} != {tuple(parts[0].shape)}"
 
     chunk = local_len // 2
     full_len = local_len * cp_size
@@ -66,18 +62,15 @@ def zigzag_reconstruct_from_cp_parts(
 
 
 def zigzag_slice_for_cp(
-    tensor: torch.Tensor,
-    cp_rank: int,
-    cp_size: int,
-    seq_dim: int = 1,
+    tensor: torch.Tensor, cp_rank: int, cp_size: int, seq_dim: int = 1
 ) -> torch.Tensor:
     """Return one rank's zigzag CP shard from a full sequence tensor."""
     if cp_size <= 1:
         return tensor
     seq_len = tensor.shape[seq_dim]
-    assert seq_len % (2 * cp_size) == 0, (
-        f"seq_len={seq_len} must be divisible by 2*cp_size={2 * cp_size}"
-    )
+    assert (
+        seq_len % (2 * cp_size) == 0
+    ), f"seq_len={seq_len} must be divisible by 2*cp_size={2 * cp_size}"
     chunk = seq_len // (2 * cp_size)
     first = tensor.narrow(seq_dim, cp_rank * chunk, chunk)
     second_start = seq_len - (cp_rank + 1) * chunk
@@ -86,7 +79,7 @@ def zigzag_slice_for_cp(
 
 
 def zigzag_position_ids_for_cp(
-    seq_len: int, cp_rank: int, cp_size: int, device: torch.device,
+    seq_len: int, cp_rank: int, cp_size: int, device: torch.device
 ) -> torch.Tensor:
     """Return global position IDs for this CP rank under zigzag splitting.
 
@@ -131,16 +124,16 @@ def split_packed_for_cp(
         start = int(cu_seqlens[i].item())
         end = int(cu_seqlens[i + 1].item())
         seq_len = end - start
-        assert seq_len % (2 * cp_size) == 0, (
-            f"Sample {i} length {seq_len} not divisible by 2*cp_size={2 * cp_size}"
-        )
+        assert (
+            seq_len % (2 * cp_size) == 0
+        ), f"Sample {i} length {seq_len} not divisible by 2*cp_size={2 * cp_size}"
         chunk = seq_len // (2 * cp_size)
         c1 = start + cp_rank * chunk
         c2 = start + (2 * cp_size - cp_rank - 1) * chunk
-        ids_parts.append(input_ids[c1:c1 + chunk])
-        ids_parts.append(input_ids[c2:c2 + chunk])
-        pos_parts.append(position_ids[c1:c1 + chunk])
-        pos_parts.append(position_ids[c2:c2 + chunk])
+        ids_parts.append(input_ids[c1 : c1 + chunk])
+        ids_parts.append(input_ids[c2 : c2 + chunk])
+        pos_parts.append(position_ids[c1 : c1 + chunk])
+        pos_parts.append(position_ids[c2 : c2 + chunk])
         new_lengths.append(2 * chunk)
 
     new_ids = torch.cat(ids_parts)

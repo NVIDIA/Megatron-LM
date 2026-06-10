@@ -15,7 +15,6 @@ from megatron.lite.primitive.parallel.sp import (
 )
 from megatron.lite.primitive.parallel.state import ParallelState
 
-
 pytestmark = pytest.mark.mlite
 
 
@@ -35,8 +34,7 @@ def test_tp_vocab_embedding_and_output_single_rank_contract(transformer_engine_i
     embedding = VocabParallelEmbedding(5, 3, ps, deterministic=True)
     with torch.no_grad():
         values = torch.arange(embedding.local_vocab * 3, dtype=torch.float32).view(
-            embedding.local_vocab,
-            3,
+            embedding.local_vocab, 3
         )
         embedding.embedding.weight.copy_(values)
 
@@ -69,20 +67,10 @@ def test_cp_packed_split_handles_each_sample_independently():
     cu_seqlens = torch.tensor([0, 8, 16], dtype=torch.int32)
 
     rank0 = split_packed_for_cp(
-        input_ids,
-        position_ids,
-        cu_seqlens,
-        max_seqlen=8,
-        cp_rank=0,
-        cp_size=2,
+        input_ids, position_ids, cu_seqlens, max_seqlen=8, cp_rank=0, cp_size=2
     )
     rank1 = split_packed_for_cp(
-        input_ids,
-        position_ids,
-        cu_seqlens,
-        max_seqlen=8,
-        cp_rank=1,
-        cp_size=2,
+        input_ids, position_ids, cu_seqlens, max_seqlen=8, cp_rank=1, cp_size=2
     )
 
     torch.testing.assert_close(rank0[0], torch.tensor([0, 1, 6, 7, 8, 9, 14, 15]))
@@ -121,17 +109,12 @@ def test_ep_token_dispatcher_local_roundtrip_is_independent_of_deepep():
 
     ps = ParallelState(ep_size=1, ep_rank=0)
     dispatcher = TokenDispatcher(num_experts=3, hidden_size=2, ps=ps, use_deepep=False)
-    hidden = torch.tensor(
-        [[1.0, 10.0], [2.0, 20.0], [3.0, 30.0], [4.0, 40.0]],
-        requires_grad=True,
-    )
+    hidden = torch.tensor([[1.0, 10.0], [2.0, 20.0], [3.0, 30.0], [4.0, 40.0]], requires_grad=True)
     topk_indices = torch.tensor([[0], [2], [1], [2]])
     topk_scores = torch.ones(4, 1)
 
     dispatched, tokens_per_expert, dispatched_probs = dispatcher.dispatch(
-        hidden,
-        topk_scores,
-        topk_indices,
+        hidden, topk_scores, topk_indices
     )
     combined = dispatcher.combine(dispatched)
 

@@ -14,8 +14,8 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import transformer_engine.pytorch as te
-from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
 
+from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
 from megatron.lite.model.qwen3_5.config import Qwen35Config
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts
@@ -111,11 +111,7 @@ class SharedExpert(nn.Module):
             return self.linear(x)
 
     def __init__(
-        self,
-        config: Qwen35Config,
-        ps: ParallelState,
-        *,
-        use_plain_te_linear: bool = False,
+        self, config: Qwen35Config, ps: ParallelState, *, use_plain_te_linear: bool = False
     ):
         super().__init__()
         ffn = config.shared_expert_intermediate_size
@@ -179,16 +175,9 @@ class MoELayer(nn.Module):
         )
         self.experts = Experts(config, ps, fp8=fp8, moe_act_recompute=moe_act_recompute)
         self.dispatcher = TokenDispatcher(
-            config.num_experts,
-            config.hidden_size,
-            ps,
-            use_deepep=use_deepep,
+            config.num_experts, config.hidden_size, ps, use_deepep=use_deepep
         )
-        self.shared_expert = SharedExpert(
-            config,
-            ps,
-            use_plain_te_linear=shared_expert_plain_te,
-        )
+        self.shared_expert = SharedExpert(config, ps, use_plain_te_linear=shared_expert_plain_te)
         self.preserve_3d_graph = bool(preserve_3d_graph)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -276,9 +265,7 @@ class Qwen35Layer(nn.Module):
                 deterministic=deterministic,
             )
         self.mlp_norm = te.RMSNorm(
-            config.hidden_size,
-            eps=config.rms_norm_eps,
-            zero_centered_gamma=True,
+            config.hidden_size, eps=config.rms_norm_eps, zero_centered_gamma=True
         )
         self.moe = MoELayer(
             config,
@@ -293,10 +280,7 @@ class Qwen35Layer(nn.Module):
         )
 
     def forward(
-        self,
-        x: torch.Tensor,
-        position_ids: torch.Tensor | None = None,
-        packed_seq_params=None,
+        self, x: torch.Tensor, position_ids: torch.Tensor | None = None, packed_seq_params=None
     ) -> torch.Tensor:
         residual = x
         if self.full_attn is not None:
@@ -357,7 +341,9 @@ class Qwen35Model(nn.Module):
         self.mtp_loss_scaling_factor = config.mtp_loss_scaling_factor
         self._input_tensor: torch.Tensor | None = None
 
-        layout = build_pipeline_chunk_layout(config.num_hidden_layers, ps, train_config.vpp, vpp_chunk_id)
+        layout = build_pipeline_chunk_layout(
+            config.num_hidden_layers, ps, train_config.vpp, vpp_chunk_id
+        )
         self.layer_indices = layout.layer_indices
         has_embed = layout.has_embed
         has_head = layout.has_head
@@ -394,7 +380,9 @@ class Qwen35Model(nn.Module):
         self.norm: nn.Module | None = None
         self.head: VocabParallelOutput | None = None
         if has_head:
-            self.norm = te.RMSNorm(config.hidden_size, eps=config.rms_norm_eps, zero_centered_gamma=True)
+            self.norm = te.RMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps, zero_centered_gamma=True
+            )
             self.head = VocabParallelOutput(config.vocab_size, config.hidden_size, ps)
 
         self.mtp_embed: VocabParallelEmbedding | None = None
@@ -563,11 +551,11 @@ class Qwen35Model(nn.Module):
         mtp_loss_mask = loss_mask.clone()
         mtp_loss_values = []
         for mtp_hidden in mtp_hidden_states:
-            mtp_labels, _ = roll_packed_thd_left(mtp_labels, packed_seq_params=packed_seq_params, dims=-1)
+            mtp_labels, _ = roll_packed_thd_left(
+                mtp_labels, packed_seq_params=packed_seq_params, dims=-1
+            )
             mtp_loss_mask, num_tokens = roll_packed_thd_left(
-                mtp_loss_mask,
-                packed_seq_params=packed_seq_params,
-                dims=-1,
+                mtp_loss_mask, packed_seq_params=packed_seq_params, dims=-1
             )
             labels_sb = mtp_labels.transpose(0, 1).contiguous()
             mask_sb = mtp_loss_mask.transpose(0, 1).contiguous()
@@ -591,16 +579,23 @@ class Qwen35Model(nn.Module):
             num_tokens = num_tokens.to(dtype=token_loss.dtype).clamp_min(1.0)
             mtp_loss_values.append(token_loss.sum() / num_tokens)
             mtp_loss_scale = self.mtp_loss_scaling_factor / max(len(mtp_hidden_states), 1)
-            hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_scale * token_loss / num_tokens)
+            hidden_states = MTPLossAutoScaler.apply(
+                hidden_states, mtp_loss_scale * token_loss / num_tokens
+            )
 
         if not mtp_loss_values:
             return None
-        return hidden_states, torch.stack([loss.detach().float() for loss in mtp_loss_values]).mean()
+        return (
+            hidden_states,
+            torch.stack([loss.detach().float() for loss in mtp_loss_values]).mean(),
+        )
 
     def _head_weight_for_fused_ce(self, hidden_states: torch.Tensor) -> torch.Tensor:
         assert self.head is not None
         weight = self.head.col.linear.weight
-        return weight if weight.dtype == hidden_states.dtype else weight.to(dtype=hidden_states.dtype)
+        return (
+            weight if weight.dtype == hidden_states.dtype else weight.to(dtype=hidden_states.dtype)
+        )
 
 
 def _iter_auto_model_class_refs(hf_config) -> list[str]:
@@ -632,11 +627,7 @@ def _resolve_hf_vision_cls(hf_config, hf_path: str) -> type:
     errors: list[str] = []
     for class_ref in _iter_auto_model_class_refs(hf_config):
         try:
-            model_cls = get_class_from_dynamic_module(
-                class_ref,
-                hf_path,
-                trust_remote_code=True,
-            )
+            model_cls = get_class_from_dynamic_module(class_ref, hf_path, trust_remote_code=True)
         except Exception as exc:
             errors.append(f"{class_ref}: {exc}")
             continue

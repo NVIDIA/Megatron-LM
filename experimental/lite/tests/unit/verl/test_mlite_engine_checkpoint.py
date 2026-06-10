@@ -2,7 +2,6 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
 from verl_mlite.engine.config import MegatronLiteEngineConfig
 from verl_mlite.engine.mlite_engine import MegatronLiteEngine
 

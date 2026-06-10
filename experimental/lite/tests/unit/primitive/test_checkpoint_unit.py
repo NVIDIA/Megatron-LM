@@ -9,18 +9,13 @@ import torch.nn as nn
 from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.handle import ModelHandle
 
-
 pytestmark = pytest.mark.mlite
 
 
 class TinyMLP(nn.Module):
     def __init__(self):
         super().__init__()
-        self.layers = nn.Sequential(
-            nn.Linear(4, 8),
-            nn.GELU(),
-            nn.Linear(8, 2),
-        )
+        self.layers = nn.Sequential(nn.Linear(4, 8), nn.GELU(), nn.Linear(8, 2))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.layers(x)
@@ -42,9 +37,7 @@ def _clone_model_and_optimizer(model: nn.Module):
 
 def _assert_model_close(lhs: nn.Module, rhs: nn.Module):
     for (lhs_name, lhs_param), (rhs_name, rhs_param) in zip(
-        lhs.named_parameters(),
-        rhs.named_parameters(),
-        strict=True,
+        lhs.named_parameters(), rhs.named_parameters(), strict=True
     ):
         assert lhs_name == rhs_name
         torch.testing.assert_close(lhs_param, rhs_param, atol=0.0, rtol=0.0)
@@ -64,16 +57,12 @@ def test_runtime_checkpoint_load_matches_uninterrupted_training(tmp_path):
 
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
     ckpt_handle = ModelHandle(
-        model=ckpt_model,
-        optimizer=ckpt_optimizer,
-        _extras={"model_chunks": [ckpt_model]},
+        model=ckpt_model, optimizer=ckpt_optimizer, _extras={"model_chunks": [ckpt_model]}
     )
     runtime.save_checkpoint(ckpt_handle, str(tmp_path), step=1, use_dcp=False)
 
     loaded_handle = ModelHandle(
-        model=loaded_model,
-        optimizer=loaded_optimizer,
-        _extras={"model_chunks": [loaded_model]},
+        model=loaded_model, optimizer=loaded_optimizer, _extras={"model_chunks": [loaded_model]}
     )
     assert runtime.load_checkpoint(loaded_handle, str(tmp_path), use_dcp=False) == 1
 
@@ -138,9 +127,7 @@ def test_runtime_checkpoint_uses_optimizer_state_dict_contract(tmp_path):
     loaded_model = TinyMLP()
     loaded_optimizer = DistOptLike(torch.optim.AdamW(loaded_model.parameters(), lr=1.0e-3))
     loaded_handle = ModelHandle(
-        model=loaded_model,
-        optimizer=loaded_optimizer,
-        _extras={"model_chunks": [loaded_model]},
+        model=loaded_model, optimizer=loaded_optimizer, _extras={"model_chunks": [loaded_model]}
     )
 
     assert runtime.load_checkpoint(loaded_handle, str(tmp_path), use_dcp=False) == 7

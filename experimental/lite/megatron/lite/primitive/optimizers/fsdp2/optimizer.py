@@ -40,7 +40,6 @@ from megatron.lite.primitive.optimizers.fsdp2.wrap import (
 )
 from megatron.lite.primitive.parallel.state import ParallelState
 
-
 _DEFAULT_RESHARD_AFTER_FORWARD: bool | int | None = True
 _DEFAULT_WRAP_ROOT = True
 _DEFAULT_LEAF_MODULE_NAMES = ("embed", "head")
@@ -75,7 +74,6 @@ class FSDP2Optimizer:
         tp_replicated_grad_params: Iterable[nn.Parameter] | None = None,
         tp_replicated_grad_sync_group: dist.ProcessGroup | None = None,
         grad_norm_accum_dtype: str | torch.dtype = torch.float32,
-        optimizer_offload_dtensor_state: bool = True,
         param_names: dict[int, str] | None = None,
     ):
         self.optimizer = optimizer
@@ -98,11 +96,8 @@ class FSDP2Optimizer:
         )
         self.expert_sharded_grad_norm_group = expert_sharded_grad_norm_group
         self.tp_replicated_grad_params = list(tp_replicated_grad_params or ())
-        self._tp_replicated_grad_param_ids = {
-            id(param) for param in self.tp_replicated_grad_params
-        }
+        self._tp_replicated_grad_param_ids = {id(param) for param in self.tp_replicated_grad_params}
         self.tp_replicated_grad_sync_group = tp_replicated_grad_sync_group
-        self.optimizer_offload_dtensor_state = bool(optimizer_offload_dtensor_state)
         self._cpu_offloaded_state: dict[tuple[int, str], OffloadedStateEntry] = {}
         self.grad_sync_enabled = False
 
@@ -182,8 +177,7 @@ class FSDP2Optimizer:
             param for param in sharded_params if not has_dtensor_grad_or_param(param)
         ]
         total_sq = sharded_grad_sq_sum(
-            dtensor_sharded_params,
-            accum_dtype=self.grad_norm_accum_dtype,
+            dtensor_sharded_params, accum_dtype=self.grad_norm_accum_dtype
         )
         plain_sharded_sq = local_grad_sq_sum(
             plain_sharded_params,
@@ -198,11 +192,7 @@ class FSDP2Optimizer:
             and dist.is_initialized()
             and dist.get_world_size(plain_sharded_group) > 1
         ):
-            dist.all_reduce(
-                plain_sharded_sq,
-                op=dist.ReduceOp.SUM,
-                group=plain_sharded_group,
-            )
+            dist.all_reduce(plain_sharded_sq, op=dist.ReduceOp.SUM, group=plain_sharded_group)
         total_sq = total_sq.to(plain_sharded_sq.device) + plain_sharded_sq
         if (
             self.ps is not None
@@ -228,9 +218,7 @@ class FSDP2Optimizer:
             and dist.get_world_size(self.replicated_grad_norm_group) > 1
         ):
             dist.all_reduce(
-                replicated_sq,
-                op=dist.ReduceOp.SUM,
-                group=self.replicated_grad_norm_group,
+                replicated_sq, op=dist.ReduceOp.SUM, group=self.replicated_grad_norm_group
             )
 
         expert_sharded_sq = sharded_grad_sq_sum(
@@ -244,9 +232,7 @@ class FSDP2Optimizer:
             and dist.get_world_size(self.expert_sharded_grad_norm_group) > 1
         ):
             dist.all_reduce(
-                expert_sharded_sq,
-                op=dist.ReduceOp.SUM,
-                group=self.expert_sharded_grad_norm_group,
+                expert_sharded_sq, op=dist.ReduceOp.SUM, group=self.expert_sharded_grad_norm_group
             )
 
         total_sq = (
@@ -276,9 +262,7 @@ class FSDP2Optimizer:
 
     def offload_state_to_cpu(self) -> None:
         move_optimizer_state_to_cpu(
-            self.optimizer,
-            self._cpu_offloaded_state,
-            include_dtensor_state=self.optimizer_offload_dtensor_state,
+            self.optimizer, self._cpu_offloaded_state, include_dtensor_state=True
         )
 
     def load_state_to_device(self) -> None:
@@ -301,7 +285,6 @@ def build_fsdp2_adamw(
     tp_replicated_grad_sync_group: dist.ProcessGroup | None = None,
     grad_norm_accum_dtype: str | torch.dtype = torch.float32,
     adamw_foreach: bool | str = "auto",
-    optimizer_offload_dtensor_state: bool = True,
     use_fp32_master: bool = False,
     model_param_dtypes: dict[tuple[int, str], torch.dtype] | None = None,
 ) -> FSDP2Optimizer:
@@ -349,9 +332,6 @@ def build_fsdp2_adamw(
         tp_replicated_grad_params=tp_replicated_grad_params,
         tp_replicated_grad_sync_group=tp_replicated_grad_sync_group,
         grad_norm_accum_dtype=grad_norm_accum_dtype,
-        optimizer_offload_dtensor_state=(
-            optimizer_offload_dtensor_state or float(offload_fraction) > 0.0
-        ),
         param_names=param_names,
     )
 
@@ -384,10 +364,7 @@ def build_fsdp2_training_optimizer(
 
     expert_params = _collect_expert_params(model_chunks, ps, expert_classifier)
     expert_modules = _collect_expert_modules(
-        model_chunks,
-        ps,
-        expert_classifier,
-        expert_module_leaf_name=expert_module_leaf_name,
+        model_chunks, ps, expert_classifier, expert_module_leaf_name=expert_module_leaf_name
     )
     if expert_params and not expert_modules:
         raise RuntimeError("FSDP2 expert parameters were found but no expert module was found.")
@@ -409,25 +386,16 @@ def build_fsdp2_training_optimizer(
     effective_use_fp32_shards = (
         bool(use_fp32_shards)
         if use_fp32_shards is not None
-        else get_bool_opt(
-            opt,
-            "fsdp2_use_fp32_shards",
-            default=_DEFAULT_USE_FP32_SHARDS,
-        )
+        else get_bool_opt(opt, "fsdp2_use_fp32_shards", default=_DEFAULT_USE_FP32_SHARDS)
     )
     effective_use_fp32_master = (
         bool(use_fp32_master)
         if use_fp32_master is not None
-        else get_bool_opt(
-            opt,
-            "fsdp2_use_fp32_master",
-            default=_DEFAULT_USE_FP32_MASTER,
-        )
+        else get_bool_opt(opt, "fsdp2_use_fp32_master", default=_DEFAULT_USE_FP32_MASTER)
     )
 
     unit_reshard_after_forward = _fsdp2_unit_reshard_after_forward(
-        ps,
-        reshard_after_forward=reshard_after_forward,
+        ps, reshard_after_forward=reshard_after_forward
     )
     fsdp2_config = FSDP2Config(
         unit_modules=unit_modules,
@@ -436,14 +404,8 @@ def build_fsdp2_training_optimizer(
         last_unit_reshard_after_forward=unit_reshard_after_forward,
         root_reshard_after_forward=False,
         wrap_root=wrap_root,
-        forward_prefetch_depth=_fsdp2_prefetch_depth(
-            ps,
-            default_depth=forward_prefetch_depth,
-        ),
-        backward_prefetch_depth=_fsdp2_prefetch_depth(
-            ps,
-            default_depth=backward_prefetch_depth,
-        ),
+        forward_prefetch_depth=_fsdp2_prefetch_depth(ps, default_depth=forward_prefetch_depth),
+        backward_prefetch_depth=_fsdp2_prefetch_depth(ps, default_depth=backward_prefetch_depth),
         param_dtype=param_dtype,
         reduce_dtype=reduce_dtype,
     )
@@ -454,9 +416,7 @@ def build_fsdp2_training_optimizer(
     else:
         model_param_dtypes = {}
 
-    tp_replicated_grad_param_names = _collect_tp_replicated_grad_param_names(
-        model_chunks
-    )
+    tp_replicated_grad_param_names = _collect_tp_replicated_grad_param_names(model_chunks)
 
     dense_shard_placement_fn = build_fsdp2_shard_placement_fn(ps.dp_cp_size)
     expert_shard_placement_fn = build_fsdp2_shard_placement_fn(ps.expert_dp_size)
@@ -465,9 +425,7 @@ def build_fsdp2_training_optimizer(
         if ps.ep_dp_group is None:
             raise RuntimeError("FSDP2 expert sharding requires ParallelState.ep_dp_group.")
         expert_mesh = build_fsdp2_process_group_mesh(
-            ps.ep_dp_group,
-            mesh_dim_name="expert_dp",
-            device_type=fsdp2_config.device_type,
+            ps.ep_dp_group, mesh_dim_name="expert_dp", device_type=fsdp2_config.device_type
         )
         for module in expert_modules:
             wrap_fsdp2_module(
@@ -492,8 +450,7 @@ def build_fsdp2_training_optimizer(
         _restore_model_param_dtypes(model_chunks, model_param_dtypes)
 
     tp_replicated_grad_params = _collect_tp_replicated_grad_params(
-        model_chunks,
-        param_names=tp_replicated_grad_param_names,
+        model_chunks, param_names=tp_replicated_grad_param_names
     )
     return build_fsdp2_adamw(
         model_chunks,
@@ -501,8 +458,7 @@ def build_fsdp2_training_optimizer(
         ps,
         expert_sharded_grad_params=list(ignored_expert_params),
         expert_sharded_grad_scale=(
-            float(ps.expert_dp_size) / float(ps.dp_cp_size)
-            if ignored_expert_params else None
+            float(ps.expert_dp_size) / float(ps.dp_cp_size) if ignored_expert_params else None
         ),
         expert_sharded_grad_norm_group=ps.ep_group if ignored_expert_params else None,
         tp_replicated_grad_params=tp_replicated_grad_params,
@@ -515,9 +471,7 @@ def build_fsdp2_training_optimizer(
 
 
 def _collect_expert_params(
-    chunks: Iterable[nn.Module],
-    ps: ParallelState,
-    expert_classifier: Callable[[str], bool] | None,
+    chunks: Iterable[nn.Module], ps: ParallelState, expert_classifier: Callable[[str], bool] | None
 ) -> set[nn.Parameter]:
     if ps.ep_size <= 1 or expert_classifier is None:
         return set()
@@ -561,9 +515,7 @@ def _collect_module_params(modules: Iterable[nn.Module]) -> set[nn.Parameter]:
     return {param for module in modules for param in module.parameters()}
 
 
-def _collect_model_param_dtypes(
-    chunks: Iterable[nn.Module],
-) -> dict[tuple[int, str], torch.dtype]:
+def _collect_model_param_dtypes(chunks: Iterable[nn.Module]) -> dict[tuple[int, str], torch.dtype]:
     return {
         (chunk_idx, name): param.dtype
         for chunk_idx, chunk in enumerate(chunks)
@@ -573,8 +525,7 @@ def _collect_model_param_dtypes(
 
 
 def _restore_model_param_dtypes(
-    chunks: Iterable[nn.Module],
-    model_param_dtypes: dict[tuple[int, str], torch.dtype],
+    chunks: Iterable[nn.Module], model_param_dtypes: dict[tuple[int, str], torch.dtype]
 ) -> None:
     for chunk_idx, chunk in enumerate(chunks):
         for name, param in chunk.named_parameters():
@@ -583,9 +534,7 @@ def _restore_model_param_dtypes(
                 param._fsdp2_model_param_dtype = model_dtype
 
 
-def _collect_tp_replicated_grad_param_names(
-    chunks: Iterable[nn.Module],
-) -> list[tuple[int, str]]:
+def _collect_tp_replicated_grad_param_names(chunks: Iterable[nn.Module]) -> list[tuple[int, str]]:
     names: list[tuple[int, str]] = []
     for chunk_idx, chunk in enumerate(chunks):
         sp_param_ids = {id(param) for param in getattr(chunk, "sp_params", ())}
@@ -598,9 +547,7 @@ def _collect_tp_replicated_grad_param_names(
 
 
 def _collect_tp_replicated_grad_params(
-    chunks: Iterable[nn.Module],
-    *,
-    param_names: Iterable[tuple[int, str]] | None = None,
+    chunks: Iterable[nn.Module], *, param_names: Iterable[tuple[int, str]] | None = None
 ) -> list[nn.Parameter]:
     chunk_list = list(chunks)
     params: list[nn.Parameter] = []
@@ -626,9 +573,7 @@ def _collect_tp_replicated_grad_params(
 
 
 def _fsdp2_unit_reshard_after_forward(
-    ps: ParallelState,
-    *,
-    reshard_after_forward: bool | int | None,
+    ps: ParallelState, *, reshard_after_forward: bool | int | None
 ) -> bool | int | None:
     if ps.pp_size > 1:
         return False
@@ -685,19 +630,14 @@ def _build_adamw_param_groups(
 
 
 def _matches_megatron_no_weight_decay(
-    name: str,
-    param: nn.Parameter,
-    apply_wd_to_qk_layernorm: bool,
+    name: str, param: nn.Parameter, apply_wd_to_qk_layernorm: bool
 ) -> bool:
     if len(param.shape) != 1 and not name.endswith(".bias"):
         return False
     if not apply_wd_to_qk_layernorm:
         return True
     return not (
-        "q_layernorm." in name
-        or "k_layernorm." in name
-        or "q_norm." in name
-        or "k_norm." in name
+        "q_layernorm." in name or "k_layernorm." in name or "q_norm." in name or "k_norm." in name
     )
 
 
@@ -721,11 +661,7 @@ class FSDP2OptimizerBackend:
     def state_dict(self, optimizer: FSDP2Optimizer) -> dict:
         return optimizer.state_dict()
 
-    def load_state_dict(
-        self,
-        optimizer: FSDP2Optimizer,
-        state_dict: dict,
-    ) -> None:
+    def load_state_dict(self, optimizer: FSDP2Optimizer, state_dict: dict) -> None:
         optimizer.load_state_dict(state_dict)
 
 
