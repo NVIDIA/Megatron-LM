@@ -3,7 +3,7 @@
 '''
 WORLD_SIZE=1 LOCAL_RANK=0 python -m torch.distributed.run \
     --nproc_per_node=1 -m pytest \
-    tests/unit_tests/models/test_mimo_submodules.py -v
+    tests/unit_tests/models/mimo/test_mimo_submodules.py -v
 '''
 
 from typing import Any, Dict, List, Optional
