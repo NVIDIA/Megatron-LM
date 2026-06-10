@@ -14,7 +14,7 @@ from typing import Callable, Dict, Optional, Set, Tuple, Union
 
 import torch
 
-from megatron.core.msc_utils import MultiStorageClientFeature
+from megatron.core.msc_utils import maybe_msc
 from megatron.core.utils import log_single_rank
 
 from . import ShardedTensor
@@ -369,11 +369,7 @@ def save(
     from .strategies.fully_parallel import FullyParallelSaveStrategyWrapper
 
     if torch.distributed.get_rank() == 0:
-        if MultiStorageClientFeature.is_enabled():
-            msc = MultiStorageClientFeature.import_package()
-            checkpoint_dir_path = msc.Path(str(checkpoint_dir))
-        else:
-            checkpoint_dir_path = Path(checkpoint_dir)
+        checkpoint_dir_path = maybe_msc.Path(str(checkpoint_dir))
 
         if next(checkpoint_dir_path.iterdir(), None) is not None:
             # Don't throw exception here since this could cause a cascade of failures
