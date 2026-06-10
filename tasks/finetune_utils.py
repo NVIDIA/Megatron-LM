@@ -248,9 +248,6 @@ def finetune(train_valid_datasets_provider, model_provider,
     args = get_args()
     timers = get_timers()
 
-    assert args.rampup_batch_size is None, \
-        'batch size scaling is not supported for finetuning'
-
     # Train and validation data loaders.
     timers('train/valid/test dataset/dataloder', log_level=0).start()
     if args.epochs > 0:
