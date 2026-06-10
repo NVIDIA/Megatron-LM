@@ -70,6 +70,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "cpu_offloading_weights": False,
     "cross_entropy_fusion_impl": "native",
     "cross_entropy_loss_fusion": True,
+    "create_attention_mask_in_dataloader": True,
     "csa_compress_ratios": None,
     "csa_compress_rotary_base": 40000.0,
     "csa_dense_mode": False,
@@ -84,6 +85,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "defer_embedding_wgrad_compute": False,
     "delay_wgrad_compute": False,
     "dense_grouped_gemm": False,
+    "use_grouped_gemm_for_dense_mlp": False,
     "overlap_dispatch_backward_with_experts_wgrad": False,
     "deterministic_mode": False,
     "disable_bf16_reduced_precision_matmul": False,
@@ -121,6 +123,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "fp8_interval": 1,
     "fp8_margin": 0,
     "fp8_multi_head_attention": False,
+    "fp8_output_proj": False,
     "fp8_param": False,
     "fp8_quantizer_factory": None,
     "fp8_recipe": "delayed",
@@ -130,6 +133,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "gated_linear_unit": False,
     "glu_linear_offset": 0.0,
     "grad_scale_func": None,
+    "mtp_grad_scale_func": None,
     "grad_sync_func": None,
     "gradient_accumulation_fusion": True,
     "hetereogenous_dist_checkpoint": False,
@@ -340,6 +344,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_single_grouped_weight": False,
     "moe_single_grouped_bias": False,
     "head_wise_attn_gate": False,
+    "moe_hybridep_pad_variable_tokens": False,
 }
 # Fields to ignore entirely (ephemeral, environment-specific, very large).
 SKIP_FIELDS = set()
