@@ -21,6 +21,7 @@ from megatron.lite.primitive.optimizers.fsdp2.adamw import (
     local_grad_sq_sum,
 )
 from megatron.lite.primitive.optimizers.fsdp2.grad_clip import (
+    all_reduce_scalar_,
     clip_grads_with_sharded_norm_,
     resolve_torch_dtype,
     sharded_grad_sq_sum,
@@ -192,7 +193,7 @@ class FSDP2Optimizer:
             and dist.is_initialized()
             and dist.get_world_size(plain_sharded_group) > 1
         ):
-            dist.all_reduce(plain_sharded_sq, op=dist.ReduceOp.SUM, group=plain_sharded_group)
+            all_reduce_scalar_(plain_sharded_sq, op=dist.ReduceOp.SUM, group=plain_sharded_group)
         total_sq = total_sq.to(plain_sharded_sq.device) + plain_sharded_sq
         if (
             self.ps is not None
@@ -200,7 +201,7 @@ class FSDP2Optimizer:
             and dist.is_initialized()
             and dist.get_world_size(self.ps.tp_group) > 1
         ):
-            dist.all_reduce(total_sq, op=dist.ReduceOp.SUM, group=self.ps.tp_group)
+            all_reduce_scalar_(total_sq, op=dist.ReduceOp.SUM, group=self.ps.tp_group)
 
         tp_replicated_sq = sharded_grad_sq_sum(
             self.tp_replicated_grad_params,
@@ -217,7 +218,7 @@ class FSDP2Optimizer:
             and dist.is_initialized()
             and dist.get_world_size(self.replicated_grad_norm_group) > 1
         ):
-            dist.all_reduce(
+            all_reduce_scalar_(
                 replicated_sq, op=dist.ReduceOp.SUM, group=self.replicated_grad_norm_group
             )
 
@@ -231,8 +232,10 @@ class FSDP2Optimizer:
             and dist.is_initialized()
             and dist.get_world_size(self.expert_sharded_grad_norm_group) > 1
         ):
-            dist.all_reduce(
-                expert_sharded_sq, op=dist.ReduceOp.SUM, group=self.expert_sharded_grad_norm_group
+            all_reduce_scalar_(
+                expert_sharded_sq,
+                op=dist.ReduceOp.SUM,
+                group=self.expert_sharded_grad_norm_group,
             )
 
         total_sq = (
@@ -247,7 +250,7 @@ class FSDP2Optimizer:
             and dist.is_initialized()
             and dist.get_world_size(self.ps.pp_group) > 1
         ):
-            dist.all_reduce(total_sq, op=dist.ReduceOp.SUM, group=self.ps.pp_group)
+            all_reduce_scalar_(total_sq, op=dist.ReduceOp.SUM, group=self.ps.pp_group)
 
         grad_norm = total_sq.sqrt()
         if torch.isfinite(grad_norm):

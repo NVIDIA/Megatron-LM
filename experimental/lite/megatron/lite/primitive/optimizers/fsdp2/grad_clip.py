@@ -77,7 +77,7 @@ def sharded_grad_norm(
         raise ValueError(f"sharded_grad_norm supports norm_type=2.0 or inf, got {norm_type!r}.")
     sq_sum = sharded_grad_sq_sum(params, accum_dtype=accum_dtype, default_device=default_device)
     if pp_group is not None and dist.is_initialized() and dist.get_world_size(pp_group) > 1:
-        dist.all_reduce(sq_sum, op=dist.ReduceOp.SUM, group=pp_group)
+        all_reduce_scalar_(sq_sum, op=dist.ReduceOp.SUM, group=pp_group)
     return sq_sum.sqrt()
 
 
@@ -103,8 +103,22 @@ def sharded_grad_abs_max(
     if total is None:
         total = torch.zeros((), device=default_device or torch.device("cpu"), dtype=dtype)
     if pp_group is not None and dist.is_initialized() and dist.get_world_size(pp_group) > 1:
-        dist.all_reduce(total, op=dist.ReduceOp.MAX, group=pp_group)
+        all_reduce_scalar_(total, op=dist.ReduceOp.MAX, group=pp_group)
     return total
+
+
+def all_reduce_scalar_(
+    value: torch.Tensor,
+    *,
+    op: dist.ReduceOp,
+    group: dist.ProcessGroup,
+) -> None:
+    """All-reduce a scalar on a device compatible with the process group backend."""
+
+    reduced = _scalar_for_process_group(value, group)
+    dist.all_reduce(reduced, op=op, group=group)
+    if reduced is not value:
+        value.copy_(reduced.to(device=value.device, dtype=value.dtype))
 
 
 @torch.no_grad()
@@ -285,12 +299,33 @@ def _reduce_dtensor_scalar_(
         group = dtensor.device_mesh.get_group(mesh_dim)
         if dist.get_world_size(group) > 1:
             if scalar_all_reduce is None:
-                dist.all_reduce(value, op=op, group=group)
+                all_reduce_scalar_(value, op=op, group=group)
             else:
                 scalar_all_reduce(value, group, op)
 
 
+def _scalar_for_process_group(
+    value: torch.Tensor, group: dist.ProcessGroup
+) -> torch.Tensor:
+    backend = _process_group_backend(group)
+    if "nccl" in backend and value.device.type != "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("NCCL scalar all_reduce requires a CUDA tensor.")
+        return value.to(device=torch.device("cuda", torch.cuda.current_device()))
+    if "gloo" in backend and value.device.type != "cpu":
+        return value.to(device=torch.device("cpu"))
+    return value
+
+
+def _process_group_backend(group: dist.ProcessGroup) -> str:
+    try:
+        return str(dist.get_backend(group)).lower()
+    except (RuntimeError, ValueError, TypeError):
+        return ""
+
+
 __all__ = [
+    "all_reduce_scalar_",
     "clip_grads_with_sharded_norm_",
     "resolve_torch_dtype",
     "sharded_grad_abs_max",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from megatron.lite.primitive.optimizers.fsdp2.grad_clip import (
+    all_reduce_scalar_,
     clip_grads_with_sharded_norm_,
     resolve_torch_dtype,
     sharded_grad_abs_max,
@@ -33,6 +34,7 @@ __all__ = [
     "FSDP2Config",
     "FSDP2Optimizer",
     "FSDP2OptimizerBackend",
+    "all_reduce_scalar_",
     "build_fsdp2_adamw",
     "build_fsdp2_training_optimizer",
     "build_fsdp2_device_mesh",
