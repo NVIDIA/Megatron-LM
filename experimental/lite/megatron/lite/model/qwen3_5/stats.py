@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Model-level Qwen3.5 benchmark statistics."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Context/pipeline parallel sequence splitting utilities."""
 
 from __future__ import annotations

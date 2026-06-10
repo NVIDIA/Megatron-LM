@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """HF ↔ Megatron Lite weight conversion.
 
 Everything needed for HuggingFace safetensors ↔ Megatron Lite model conversion:

@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """FSDP2 optimizer adapter for Megatron Lite runtime contracts."""
 
 from __future__ import annotations

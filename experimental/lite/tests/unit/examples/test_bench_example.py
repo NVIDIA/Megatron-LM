@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Unit tests for the benchmark example."""
 
 from __future__ import annotations

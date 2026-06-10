@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Runtime backend backed by Megatron-Bridge."""
 
 from __future__ import annotations

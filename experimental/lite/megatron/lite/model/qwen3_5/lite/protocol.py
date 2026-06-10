@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Qwen3.5 lite impl — native model protocol for Megatron Lite runtime."""
 
 from __future__ import annotations

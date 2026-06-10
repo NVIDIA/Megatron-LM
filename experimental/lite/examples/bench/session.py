@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Small pretrain benchmark session composed from runtime atoms."""
 
 from __future__ import annotations

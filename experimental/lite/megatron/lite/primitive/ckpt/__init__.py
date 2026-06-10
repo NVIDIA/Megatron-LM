@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Checkpoint helpers."""
 
 from megatron.lite.primitive.ckpt.dcp import load_training_checkpoint, save_training_checkpoint

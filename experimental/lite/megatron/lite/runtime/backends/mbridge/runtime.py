@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Runtime backend backed by the legacy ``mbridge`` package."""
 
 from __future__ import annotations

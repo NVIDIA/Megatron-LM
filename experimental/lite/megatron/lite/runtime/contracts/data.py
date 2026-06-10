@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Data contracts — forward_backward input/output types."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Shared MoE utilities: _AllToAll and MoEAuxLossAutoScaler.
 
 Extracted from models/*/moe.py (Level 0 Option C — pure extraction, no behavior change).

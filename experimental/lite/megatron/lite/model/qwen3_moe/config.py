@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Qwen3MoE model configuration — pure architecture parameters.
 
 Like HuggingFace's model config: only describes the model architecture.

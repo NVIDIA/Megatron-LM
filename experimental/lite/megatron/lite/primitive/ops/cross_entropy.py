@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Vocab-parallel cross entropy loss (copied from Megatron-Core).
 
 Computes cross entropy when logits are split across TP ranks.

@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Benchmark example for Megatron Lite runtime backends."""
 
 from .results import RunResult, StepTrace

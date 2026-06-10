@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """External VERL engine backed by Megatron Lite runtime primitives."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Shared Qwen3MoE model helpers."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Optimizer state movement helpers for the FSDP2 primitive."""
 
 from __future__ import annotations

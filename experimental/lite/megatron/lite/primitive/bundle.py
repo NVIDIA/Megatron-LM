@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """ModelBundle — return type of protocol.build_model()."""
 
 from __future__ import annotations

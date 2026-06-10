@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """AdamW helpers for the FSDP2 optimizer primitive."""
 
 from __future__ import annotations

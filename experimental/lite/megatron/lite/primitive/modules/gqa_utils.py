@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Pure grouped-query attention helpers."""
 
 from __future__ import annotations

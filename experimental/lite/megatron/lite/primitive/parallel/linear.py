@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """TP-parallel linear layers and vocab-parallel embedding/output."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Top-level Megatron Lite package exports."""
 
 from __future__ import annotations

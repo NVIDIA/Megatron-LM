@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Native Qwen3MoE: TransformerLayer + Qwen3MoEModel.
 
 Attention and MoE come from primitive/modules; this file only

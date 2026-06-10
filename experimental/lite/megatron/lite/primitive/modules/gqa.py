@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Grouped Query Attention + Rotary Embedding (MC-atoms).
 
 Model-agnostic: takes explicit params instead of model-specific config.

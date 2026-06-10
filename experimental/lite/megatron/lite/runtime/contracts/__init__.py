@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Lazy re-export hub for ``megatron.lite.runtime.contracts``.
 
 This preserves imports like ``from megatron.lite.runtime.contracts import X`` while

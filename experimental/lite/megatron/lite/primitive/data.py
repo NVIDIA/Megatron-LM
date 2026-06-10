@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Batch generation utilities for Megatron Lite runtime."""
 
 from __future__ import annotations
