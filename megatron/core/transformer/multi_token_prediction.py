@@ -40,8 +40,9 @@ from megatron.core.utils import (
     is_torch_min_version,
     make_tp_sharded_tensor_for_checkpoint,
     make_viewless_tensor,
+    nvtx_range_pop,
+    nvtx_range_push,
 )
-
 if TYPE_CHECKING:
     from megatron.core.models.hybrid.hybrid_block import HybridStackSubmodules
 
@@ -676,6 +677,7 @@ def process_mtp_loss(
         Tensor: Updated hidden states after MTP loss processing (first chunk only).
     """
     nvtx_range_push(suffix="process_mtp_loss")
+    print(f"for debug, in process_mtp_loss, hidden_states shape: {hidden_states.shape}, config.mtp_num_layers: {config.mtp_num_layers}", flush=True)
     hidden_states_list = torch.chunk(hidden_states, 1 + config.mtp_num_layers, dim=0)
     hidden_states = hidden_states_list[0]
 
@@ -1779,6 +1781,7 @@ class MultiTokenPredictionBlock(MegatronModule):
 
         # concat the hidden states of all mtp layers
         hidden_states = torch.cat(hidden_states_list, dim=0)
+        print(f"for debug, in mtp block forward, hidden_states shape: {hidden_states.shape}, len(hidden_states_list): {len(hidden_states_list)}, hidden_states_list[0] shape: {hidden_states_list[0].shape}", flush=True)
         return hidden_states
 
     def sharded_state_dict(
