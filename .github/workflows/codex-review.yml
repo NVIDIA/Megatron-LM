@@ -26,6 +26,13 @@ jobs:
       REPO: ${{ github.repository }}
       PR_NUMBER: 5256
     steps:
+      - name: Create PR comment smoke test
+        run: |
+          BODY="Codex workflow smoke test: validating GITHUB_TOKEN can comment on PR #$PR_NUMBER. This comment will be deleted manually after validation."
+          COMMENT_ID=$(gh api repos/$REPO/issues/$PR_NUMBER/comments --method POST -f body="$BODY" --jq .id)
+          echo "comment_id=$COMMENT_ID" >> "$GITHUB_OUTPUT"
+          echo "Created smoke-test comment $COMMENT_ID on PR #$PR_NUMBER"
+
       - name: Run Codex API key smoke test
         uses: openai/codex-action@v1
         with:
@@ -37,13 +44,6 @@ jobs:
           prompt: |
             This is a GitHub Actions smoke test for Megatron-LM.
             Reply exactly: CODEX_API_KEY_SMOKE_OK
-
-      - name: Create and delete PR comment smoke test
-        run: |
-          BODY="Codex workflow smoke test: validating GITHUB_TOKEN can comment on PR #$PR_NUMBER. This comment will be deleted immediately."
-          COMMENT_ID=$(gh api repos/$REPO/issues/$PR_NUMBER/comments --method POST -f body="$BODY" --jq .id)
-          gh api repos/$REPO/issues/comments/$COMMENT_ID --method DELETE
-          echo "Created and deleted smoke-test comment $COMMENT_ID on PR #$PR_NUMBER"
 
   # Light review: quick pass for obvious bugs, typos, and test gaps
   # Trigger: /codex review
