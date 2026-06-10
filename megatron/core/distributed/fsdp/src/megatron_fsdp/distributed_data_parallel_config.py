@@ -179,7 +179,7 @@ class DistributedDataParallelConfig:
 
     megatron_fsdp_max_pool_double_buffer: bool = False
     """
-    Uses an asymmetrical MaxPoolAllocator that can be recycled across different
+    Builds a double buffer maxpool that can be recycled across asymmetric / hybrid
     FSDP units, instead of the symmetrical FixedPoolAllocator that requires exact
     parity between FSDP units, when using fsdp_double_buffer=True. Enables NCCL
     user buffer registration and CUDA graph replay for models with asymmetrical
@@ -196,3 +196,7 @@ class DistributedDataParallelConfig:
                     "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True is currently not supported "
                     "with nccl_ub due to compatibility issue with torch.cuda.MemPool API."
                 )
+
+        if megatron_fsdp_max_pool_double_buffer:
+            # MaxPoolAllocator is a type of double-buffer allocator.
+            fsdp_double_buffer = True

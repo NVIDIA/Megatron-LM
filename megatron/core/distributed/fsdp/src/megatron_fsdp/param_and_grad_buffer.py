@@ -2517,19 +2517,19 @@ class ParamAndGradBuffer:
                 if self.ddp_config.megatron_fsdp_max_pool_double_buffer
                 else FixedPoolAllocator
             )
-            self.weight_alloc =  FIXED_POOL_ALLOC_TYPE(
+            self.weight_alloc = FIXED_POOL_ALLOC_TYPE(
                 name="fsdp_params",
                 fsdp_param_groups=self.parameter_groups,
                 size=UB_BUFFER_NUM,
                 fallback_to_persistent_buffer=self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail,
             )
-            self.transpose_weight_alloc =  FIXED_POOL_ALLOC_TYPE(
+            self.transpose_weight_alloc = FIXED_POOL_ALLOC_TYPE(
                 name="fsdp_fp8_transpose_params",
                 fsdp_param_groups=self.parameter_groups,
                 size=UB_BUFFER_NUM,
                 fallback_to_persistent_buffer=self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail,
             )
-            self.main_grad_alloc =  FIXED_POOL_ALLOC_TYPE(
+            self.main_grad_alloc = FIXED_POOL_ALLOC_TYPE(
                 name="fsdp_grads",
                 fsdp_param_groups=self.parameter_groups,
                 size=UB_BUFFER_NUM,
@@ -2543,7 +2543,7 @@ class ParamAndGradBuffer:
                 # to leverage NCCL UBR for high-precision gradient reduction with
                 # low-precision gradient communication over DP-Outer for H(F)SDP.
                 # Otherwise, this allocator will never be used.
-                self.hsdp_grad_comm_alloc =  FIXED_POOL_ALLOC_TYPE(
+                self.hsdp_grad_comm_alloc = FIXED_POOL_ALLOC_TYPE(
                     name="hsdp_grad_comm",
                     fsdp_param_groups=self.parameter_groups,
                     size=UB_BUFFER_NUM,

@@ -123,6 +123,7 @@ if [ "${USE_MEGATRON_FSDP}" = 1 ]; then
         --use-nccl-ub
         --fsdp-double-buffer
         --fsdp-manual-registration
+        # --fsdp-db-use-persist-buf-on-alloc-fail
         # To enable HFSDP, DP full-sharding of the optimizer state with
         # hierarchical data parallelism (DP-Outer=2, DP-Inner=DP//2)...
         # --num-distributed-optimizer-instances 2
@@ -135,6 +136,9 @@ if [ "${USE_MEGATRON_FSDP}" = 1 ]; then
         # --use-precision-aware-optimizer
         # To use full-iteration CUDA graphs with Megatron-FSDP...
         # --cuda-graph-impl full_iteration
+        # To support double-buffering for hybrid architectures
+        # like Nemotron (Mamba + Attention + MoE)...
+        # --megatron-fsdp-max-pool-double-buffer
     )
 fi
 
