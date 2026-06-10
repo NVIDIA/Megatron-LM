@@ -7,8 +7,6 @@ Run with torchrun:
     torchrun --nproc_per_node=8 pytest test_mfsdp_uneven_dtensor.py -v
 """
 
-import os
-
 import pytest
 import torch
 import torch.distributed as dist
@@ -20,42 +18,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
     uneven_dtensor_to_full_tensor,
 )
 
-# ---------- Helper: distributed setup ----------
-
-
-@pytest.fixture(scope="module")
-def distributed_setup():
-    """Setup torch.distributed and CUDA device for torchrun + pytest."""
-    if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
-        pytest.skip("Not running under torchrun. Use torchrun to run this test file.")
-
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    local_rank = int(os.environ.get("LOCAL_RANK", rank))
-
-    if torch.cuda.is_available():
-        device_type = "cuda"
-        torch.cuda.set_device(local_rank)
-        device = torch.device(f"cuda:{local_rank}")
-        backend = "nccl"
-    else:
-        device_type = "cpu"
-        device = torch.device("cpu")
-        backend = "gloo"
-
-    if not dist.is_initialized():
-        dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
-
-    yield {
-        "rank": rank,
-        "world_size": world_size,
-        "local_rank": local_rank,
-        "device_type": device_type,
-        "device": device,
-    }
-
-    if dist.is_initialized():
-        dist.destroy_process_group()
+# `distributed_setup` fixture is provided by conftest.py in this directory.
 
 
 # ---------- Helper: broadcast-based global tensor creation ----------

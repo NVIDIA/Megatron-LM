@@ -1,0 +1,1685 @@
+{
+  "world_size": 8,
+  "rank": 1,
+  "mesh_dim_names": [
+    "dp_cp",
+    "tp"
+  ],
+  "mesh_shape": [
+    4,
+    2
+  ],
+  "params": [
+    {
+      "global_shape": [
+        35072,
+        8192
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)",
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        6432,
+        8192
+      ]
+    },
+    {
+      "global_shape": [
+        8192,
+        16384
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)",
+        "Shard(dim=1)"
+      ],
+      "local_shape": [
+        0,
+        8192
+      ]
+    },
+    {
+      "global_shape": [
+        32,
+        8192
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        9,
+        8192
+      ]
+    },
+    {
+      "global_shape": [
+        4096,
+        8192
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)",
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        8192
+      ]
+    },
+    {
+      "global_shape": [
+        16384,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)",
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        10240,
+        8192
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)",
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        1535,
+        8192
+      ]
+    },
+    {
+      "global_shape": [
+        8192,
+        10240
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)",
+        "Shard(dim=1)"
+      ],
+      "local_shape": [
+        0,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        35072,
+        8192
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)",
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        6432,
+        8192
+      ]
+    },
+    {
+      "global_shape": [
+        8192,
+        16384
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)",
+        "Shard(dim=1)"
+      ],
+      "local_shape": [
+        0,
+        8192
+      ]
+    },
+    {
+      "global_shape": [
+        32,
+        8192
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        9,
+        8192
+      ]
+    },
+    {
+      "global_shape": [
+        4096,
+        8192
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)",
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        8192
+      ]
+    },
+    {
+      "global_shape": [
+        16384,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)",
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        10240,
+        8192
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)",
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        1535,
+        8192
+      ]
+    },
+    {
+      "global_shape": [
+        8192,
+        10240
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)",
+        "Shard(dim=1)"
+      ],
+      "local_shape": [
+        0,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        35072,
+        8192
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)",
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        6432,
+        8192
+      ]
+    },
+    {
+      "global_shape": [
+        8192,
+        16384
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)",
+        "Shard(dim=1)"
+      ],
+      "local_shape": [
+        0,
+        8192
+      ]
+    },
+    {
+      "global_shape": [
+        32,
+        8192
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        9,
+        8192
+      ]
+    },
+    {
+      "global_shape": [
+        4096,
+        8192
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)",
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        8192
+      ]
+    },
+    {
+      "global_shape": [
+        16384,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)",
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        10240,
+        8192
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)",
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        1535,
+        8192
+      ]
+    },
+    {
+      "global_shape": [
+        8192,
+        10240
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)",
+        "Shard(dim=1)"
+      ],
+      "local_shape": [
+        0,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        35072,
+        8192
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)",
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        6432,
+        8192
+      ]
+    },
+    {
+      "global_shape": [
+        8192,
+        16384
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)",
+        "Shard(dim=1)"
+      ],
+      "local_shape": [
+        0,
+        8192
+      ]
+    },
+    {
+      "global_shape": [
+        32,
+        8192
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        9,
+        8192
+      ]
+    },
+    {
+      "global_shape": [
+        4096,
+        8192
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)",
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        8192
+      ]
+    },
+    {
+      "global_shape": [
+        16384,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)",
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        10240,
+        8192
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)",
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        1535,
+        8192
+      ]
+    },
+    {
+      "global_shape": [
+        8192,
+        10240
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)",
+        "Shard(dim=1)"
+      ],
+      "local_shape": [
+        0,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        35072,
+        8192
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)",
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        6432,
+        8192
+      ]
+    },
+    {
+      "global_shape": [
+        8192,
+        16384
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)",
+        "Shard(dim=1)"
+      ],
+      "local_shape": [
+        0,
+        8192
+      ]
+    },
+    {
+      "global_shape": [
+        8192,
+        8192
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)",
+        "Shard(dim=1)"
+      ],
+      "local_shape": [
+        0,
+        4096
+      ]
+    },
+    {
+      "global_shape": [
+        10240,
+        8192
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)",
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2304,
+        8192
+      ],
+      "is_qkv": true
+    },
+    {
+      "global_shape": [
+        32,
+        8192
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        9,
+        8192
+      ]
+    },
+    {
+      "global_shape": [
+        4096,
+        8192
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)",
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        8192
+      ]
+    },
+    {
+      "global_shape": [
+        16384,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)",
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        5120,
+        2048
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        0,
+        2048
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        2048,
+        5120
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        2048,
+        5120
+      ]
+    },
+    {
+      "global_shape": [
+        10240,
+        8192
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)",
+        "Shard(dim=0)"
+      ],
+      "local_shape": [
+        1535,
+        8192
+      ]
+    },
+    {
+      "global_shape": [
+        8192,
+        10240
+      ],
+      "dtype": "torch.float32",
+      "placements": [
+        "Shard(dim=0)",
+        "Shard(dim=1)"
+      ],
+      "local_shape": [
+        0,
+        5120
+      ]
+    }
+  ]
+}

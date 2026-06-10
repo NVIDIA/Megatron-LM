@@ -140,6 +140,7 @@ test = [
     "pytest-cov",
     "pytest-random-order",
     "pytest-asyncio",
+    "pytest-benchmark",
     "pygithub",
     "pydantic",
     "tensorboard",
