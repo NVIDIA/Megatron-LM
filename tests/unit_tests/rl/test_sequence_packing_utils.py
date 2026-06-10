@@ -98,13 +98,12 @@ def test_sequence_packing_basic():
     rewards = torch.tensor([1.0, 2.0, 3.0, 4.0])
 
     sequences_tensor = torch.stack(sequences)
-    packed_trajs, packed_position_ids, packed_attention_mask, packed_loss_mask, packing_info = (
-        packer.pack_sequences(sequences_tensor, generation_masks)
+    packed_trajs, packed_position_ids, packed_loss_mask, packing_info = packer.pack_sequences(
+        sequences_tensor, generation_masks
     )
 
     assert packed_trajs is not None
     assert packed_position_ids is not None
-    assert packed_attention_mask is not None
     assert packed_loss_mask is not None
     assert packing_info is not None
 
@@ -140,8 +139,8 @@ def test_sequence_packing_with_generation_masks():
     )
 
     padded_sequences_tensor = torch.stack(padded_sequences)
-    packed_trajs, packed_position_ids, packed_attention_mask, packed_loss_mask, packing_info = (
-        packer.pack_sequences(padded_sequences_tensor, generation_masks)
+    packed_trajs, packed_position_ids, packed_loss_mask, packing_info = packer.pack_sequences(
+        padded_sequences_tensor, generation_masks
     )
 
     assert packed_trajs.shape[0] == 1
@@ -162,16 +161,14 @@ def test_sequence_packing_empty_bins():
     )
     packed_position_ids = torch.tensor([[0, 1, 2, 3, 0, 0, 0, 0]])
     packed_loss_mask = torch.tensor([[1, 1, 1, 1, 0, 0, 0, 0]], dtype=torch.float)
-    packed_attention_mask = torch.ones(1, bin_size, bin_size)
 
-    empty_trajs, empty_position_ids, empty_loss_mask, empty_attention_mask, empty_packing_info = (
+    empty_trajs, empty_position_ids, empty_loss_mask, empty_packing_info = (
         sequence_packing_utils.create_empty_bins(
             num_empty_bins=num_empty_bins,
             bin_size=bin_size,
             packed_trajs=packed_trajs,
             packed_position_ids=packed_position_ids,
             packed_loss_mask=packed_loss_mask,
-            packed_attention_mask=packed_attention_mask,
             tokenizer=tokenizer,
         )
     )
@@ -220,8 +217,8 @@ def test_sequence_packing_integration():
     ]
 
     sequences_tensor = torch.stack(sequences)
-    packed_trajs, packed_position_ids, packed_attention_mask, packed_loss_mask, packing_info = (
-        packer.pack_sequences(sequences_tensor, generation_masks)
+    packed_trajs, packed_position_ids, packed_loss_mask, packing_info = packer.pack_sequences(
+        sequences_tensor, generation_masks
     )
 
     assert packed_trajs is not None
@@ -412,6 +409,85 @@ def test_compute_packed_inference_logprobs_stats_shape_mismatch():
     assert group_stats.mean_piold_to_inf_prob is None
 
 
+def test_packing_observability_metrics():
+    """Test various observability metrics related to sequence packing."""
+
+    # 4 sequences with known lengths packed into 2 bins of size 16.
+    # Bin 0 holds seqs 0 (len 5) and 1 (len 3) → 8 actual tokens
+    # Bin 1 holds seqs 2 (len 10) and 3 (len 4) → 14 actual tokens
+    seq_lengths = [5, 3, 10, 4]
+    packing_info = sequence_packing_utils.PackingInfo(
+        bin_seq_indices=[[0, 1], [2, 3]],
+        seq_starts={0: [0, 5], 1: [0, 10]},
+        seq_lengths=seq_lengths,
+        seq_to_bin_idx=[0, 0, 1, 1],
+        packing_algo='fifo',
+    )
+
+    num_bins, bin_size = 2, 16
+    packed_trajs = torch.zeros(num_bins, bin_size, dtype=torch.long)
+    ctx = sequence_packing_utils.PackingContext(
+        bin_size=bin_size,
+        packer=None,
+        packing_info=packing_info,
+        original_generation_masks=None,
+        original_trajs=None,
+        packed_trajs=packed_trajs,
+        packed_position_ids=None,
+        packed_loss_mask=None,
+    )
+
+    # actual tokens = sum of all seq_lengths referenced by bin_seq_indices
+    assert sequence_packing_utils.get_packing_actual_tokens(ctx) == 5 + 3 + 10 + 4
+
+    # compute tokens = num_bins * bin_size
+    assert sequence_packing_utils.get_packing_compute_tokens(ctx) == 2 * 16
+
+    # avg seq length = mean of seq_lengths
+    assert sequence_packing_utils.get_packing_avg_seq_length(ctx) == pytest.approx(22 / 4)
+
+    # efficiency = total_actual / (bins_per_rank * bin_size * num_ranks)
+    with patch('megatron.core.mpu.get_data_parallel_world_size', return_value=4):
+        eff = sequence_packing_utils.get_packing_efficiency(ctx)
+        # total_actual = sum(seq_lengths) = 22, capacity = 2 * 16 * 4 = 128
+        assert eff == pytest.approx(22 / 128)
+
+
+@pytest.mark.parametrize("num_sequences", [1, 10, 48, 49, 50])
+def test_cu_seqlens_size(num_sequences):
+    """Test that cu_seqlens always has a fixed size regardless of how many sequences are packed."""
+    max_sequences_per_bin = 50
+    bin_size = 1024
+
+    seq_len = bin_size // max_sequences_per_bin
+    seq_lengths = [seq_len] * num_sequences
+
+    packing_info = sequence_packing_utils.PackingInfo(
+        bin_seq_indices=[list(range(num_sequences))],
+        seq_starts={0: []},
+        seq_lengths=seq_lengths,
+        seq_to_bin_idx=[0] * num_sequences,
+        packing_algo='fifo',
+    )
+
+    params = sequence_packing_utils.create_packed_seq_params_for_bin(
+        packing_info=packing_info,
+        bin_idx=0,
+        bin_size=bin_size,
+        max_sequences_per_bin=max_sequences_per_bin,
+        device=torch.device('cpu'),
+    )
+
+    expected_size = max_sequences_per_bin + 2
+    assert params.cu_seqlens_q.shape[0] == expected_size, (
+        f"cu_seqlens_q has size {params.cu_seqlens_q.shape[0]} but expected {expected_size} "
+        f"for {num_sequences} sequences"
+    )
+    assert params.cu_seqlens_kv.shape[0] == expected_size
+    assert params.cu_seqlens_q[0] == 0
+    assert params.cu_seqlens_q[-1] == bin_size
+
+
 @pytest.mark.parametrize(
     "ratio,local_bins,world,expected_bs",
     [
@@ -433,12 +509,7 @@ def test_get_bins_bs_and_steps(ratio, local_bins, world, expected_bs):
     global_bs_in_seq = int(n_seqs * ratio)
 
     def side_eff(
-        rank,
-        rampup_batch_size,
-        global_batch_size,
-        micro_batch_size,
-        data_parallel_size,
-        decrease_batch_size_if_needed,
+        rank, global_batch_size, micro_batch_size, data_parallel_size, decrease_batch_size_if_needed
     ):
         # Inside of the get_microbatch_dataloader, we compute the batch size in bins.
         # We want to test this variable.
@@ -456,7 +527,6 @@ def test_get_bins_bs_and_steps(ratio, local_bins, world, expected_bs):
                     num_bins_this_rank=local_bins,
                     bin_seq_indices=[],
                     global_batch_size=global_bs_in_seq,
-                    rampup_batch_size=1,
                     micro_batch_size=1,
                     decrease_batch_size_if_needed=False,
                 )

@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import logging
 import os
 from typing import Optional, Tuple
@@ -8,6 +8,7 @@ from torch import Tensor
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
 try:
     from megatron.core.extensions.transformer_engine import te_parallel_cross_entropy
@@ -21,7 +22,7 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_last_stage,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.multi_token_prediction import tie_word_embeddings_state_dict
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -62,6 +63,20 @@ class LanguageModule(MegatronModule):
         self.embd_group = pg_collection.embd
         self.vp_stage = None
         self.vp_size = self.config.virtual_pipeline_model_parallel_size
+
+    def _setup_mtp_cuda_graphs(self):
+        """Wrap `compute_mtp_single_step` with a CudaGraphManager.
+
+        Must be called by subclasses after `self.mtp` is created.
+        """
+        if self.config.cuda_graph_impl == "local":
+            self._mtp_cudagraph_manager = CudaGraphManager(
+                self.config,
+                base_module=self,
+                function_name="compute_mtp_single_step",
+                need_backward=False,
+                inline_capture=True,
+            )
 
     def _is_in_embd_group(self):
         if self.embd_group is None:
@@ -144,8 +159,8 @@ class LanguageModule(MegatronModule):
                     labels = torch.as_strided(labels, labels.size(), (labels.size()[1], 1))
                     # Use is_cg_capturable=True for full iteration CUDA graphs to avoid torch.equal checks
                     is_cg_capturable = (
-                        hasattr(self.config, 'cuda_graph_scope')
-                        and CudaGraphScope.full_iteration in self.config.cuda_graph_scope
+                        hasattr(self.config, 'cuda_graph_impl')
+                        and self.config.cuda_graph_impl == "full_iteration"
                     )
                     if is_cg_capturable and not is_te_min_version("2.7.0"):
                         from megatron.core.utils import get_te_version
@@ -154,7 +169,7 @@ class LanguageModule(MegatronModule):
                         raise AssertionError(
                             f"CUDA graph compatible cross entropy requires TransformerEngine >= 2.7.0, "
                             f"but found version {current_version}. Please upgrade TransformerEngine "
-                            f"or set cuda_graph_scope to a value other than 'full_iteration'."
+                            f"or set cuda_graph_impl to a value other than 'full_iteration'."
                         )
 
                     loss = te_parallel_cross_entropy(
@@ -165,7 +180,9 @@ class LanguageModule(MegatronModule):
             elif self.config.cross_entropy_fusion_impl == 'native':
                 loss = fused_vocab_parallel_cross_entropy(logits, labels, self.pg_collection.tp)
         else:
-            loss = tensor_parallel.vocab_parallel_cross_entropy(logits, labels)
+            loss = tensor_parallel.vocab_parallel_cross_entropy(
+                logits, labels, tp_group=self.tp_group
+            )
 
         # [s b] => [b, s]
         loss = loss.transpose(0, 1).contiguous()
@@ -177,13 +194,44 @@ class LanguageModule(MegatronModule):
         This function initalizes word embeddings in the final stage when we are
         using pipeline parallelism and sharing word embeddings, and sets up param
         attributes on the embedding and output layers.
+
+        Parameter attributes set:
+        - `is_embedding_or_output_parameter`: True for embedding + output layer weights.
+          Used by decoupled_lr, Muon optimizer, and other Megatron features.
+        - `is_embedding_parameter`: True for MuP "embedding-class" parameters.
+          Used by MuP for table-8 style optimizer grouping (base LR/eps for vector-like params).
         """
 
-        # Set `is_embedding_or_output_parameter` attribute.
-        if self.pre_process:
+        # Mark embedding and output layer for decoupled_lr and other features.
+        # This is the original Megatron attribute used by decoupled_lr, Muon, FSDP, etc.
+        # Include MTP-stage embedding too: it is a duplicated copy of the pre_process
+        # embedding (kept in sync via cross-stage all-reduce). Without this tag, the
+        # LayerWise distributed optimizer routes it to its Muon-managed buffer and
+        # `_emit_bucket(shared_embedding=True)` replicates the (vocab x hidden) tensor
+        # across all dp_size shards, blowing up the chunk's buffer by ~8x.
+        if (self.pre_process or getattr(self, 'mtp_process', False)) and hasattr(self, 'embedding'):
             self.embedding.word_embeddings.weight.is_embedding_or_output_parameter = True
-        if self.post_process and self.output_layer.weight is not None:
+        if (
+            self.post_process
+            and hasattr(self, 'output_layer')
+            and self.output_layer.weight is not None
+        ):
             self.output_layer.weight.is_embedding_or_output_parameter = True
+
+        # Mark embedding-class parameters for MuP optimizer grouping.
+        # Under MuP table-8-style grouping, embeddings/output use base LR/eps while
+        # hidden matrix-like params use width-scaled LR/eps.
+        mtp_process = getattr(self, 'mtp_process', False)
+        if self.config.use_mup and (self.pre_process or mtp_process) and hasattr(self, 'embedding'):
+            for param in self.embedding.parameters():
+                param.is_embedding_parameter = True
+        if (
+            self.config.use_mup
+            and self.post_process
+            and hasattr(self, 'output_layer')
+            and self.output_layer.weight is not None
+        ):
+            self.output_layer.weight.is_embedding_parameter = True
 
         # If share_embeddings_and_output_weights is True, we need to maintain duplicated
         # embedding weights in post processing stage. If use Multi-Token Prediction (MTP),
@@ -223,6 +271,9 @@ class LanguageModule(MegatronModule):
             weight.data.fill_(0)
             weight.shared = True
             weight.shared_embedding = True
+            # Keep optimizer grouping consistent for tied embedding/output copies.
+            if self.config.use_mup:
+                weight.is_embedding_parameter = True
 
         # Parameters are shared between the word embeddings layers, and the
         # heads at the end of the model. In a pipelined setup with more than
@@ -255,6 +306,25 @@ class LanguageModule(MegatronModule):
             )
             LanguageModule.embedding_warning_printed = True
 
+    def _scale_logits(self, logits: Tensor) -> Tensor:
+        """Apply MuP output scaling to logits.
+
+        When MuP is enabled, scales logits by mup_output_mult (auto-set to 1/width_mult
+        if left at default) to keep output variance stable across widths.
+
+        Args:
+            logits (Tensor): Raw logits from the output layer.
+
+        Returns:
+            Tensor: Scaled logits if MuP is enabled and mup_output_mult != 1.0,
+                    otherwise unchanged logits.
+        """
+        if not self.config.use_mup:
+            return logits
+        if self.config.mup_output_mult != 1.0:
+            return logits * self.config.mup_output_mult
+        return logits
+
     def shared_embedding_or_output_weight(self) -> Tensor:
         """Gets the embedding weight or output logit weights when share embedding and output weights set to True
           or when use Multi-Token Prediction (MTP).
@@ -274,6 +344,55 @@ class LanguageModule(MegatronModule):
         elif self.post_process:
             return self.output_layer.weight
         return None
+
+    @torch.inference_mode()
+    def compute_mtp_single_step(
+        self,
+        hidden_states: Tensor,
+        next_token_ids: Tensor,
+        position_ids: Tensor,
+        depth: Optional[int] = None,
+        eager: bool = False,
+        cache_key=None,
+    ) -> tuple:
+        """Compute a single MTP depth for speculative decoding.
+
+        This is called after speculative token verification to compute MTP
+        predictions conditioned on verified tokens only.
+
+        Args:
+            hidden_states (Tensor): Hidden states at last accepted positions.
+            next_token_ids (Tensor): Correct next token IDs [1, N].
+            position_ids (Tensor): Position IDs for the next tokens [1, N].
+            depth (int, optional): MTP depth index. Only needed when `mtp_use_repeated_layer` is
+                False (each depth uses a distinct layer). Omit for repeated-layer models so that a
+                single CUDA graph can serve all depths.
+            eager, cache_key: The `CudaGraphManager` works by monkey-patching this argument onto the
+                function signature. Explictly including them removes the need for a monkey-patch,
+                and makes it straightforward to call the same method with and without eager mode.
+                These arguments are consumed by `CudaGraphManager`, if it exists.
+
+        Returns:
+            tuple: (new_hidden_states, logits [N, 1, vocab_size]).
+        """
+        # CudaGraphManager consumes these args, if it exists
+        del eager, cache_key
+        layer_idx = 0 if depth is None else depth
+        mtp_hidden = self.mtp.layers[layer_idx].forward_single_position(
+            hidden_states=hidden_states,
+            next_token_ids=next_token_ids,
+            position_ids=position_ids,
+            embedding=self.embedding,
+        )
+
+        output_weight = None
+        if self.share_embeddings_and_output_weights:
+            output_weight = self.shared_embedding_or_output_weight()
+
+        logits, _ = self.output_layer(mtp_hidden, weight=output_weight, runtime_gather_output=True)
+        logits = self._scale_logits(logits)
+
+        return mtp_hidden, logits
 
     def sharded_state_dict(
         self,

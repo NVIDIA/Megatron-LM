@@ -1,9 +1,10 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
+from __future__ import annotations
 
 import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Union
+from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 import torch
 from torch import Tensor
@@ -11,7 +12,10 @@ from torch import Tensor
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping, replace_prefix_for_sharding
+from megatron.core.enums import Fp8Recipe
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.backends import BackendSpecProvider, LocalSpecProvider
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_last_stage
@@ -19,6 +23,9 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import (
     gather_from_tensor_model_parallel_region,
     scatter_to_sequence_parallel_region,
+)
+from megatron.core.tensor_parallel.inference_layers import (
+    inference_all_gather_from_tensor_model_parallel_region,
 )
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.module import MegatronModule
@@ -34,6 +41,9 @@ from megatron.core.utils import (
     make_viewless_tensor,
 )
 
+if TYPE_CHECKING:
+    from megatron.core.models.hybrid.hybrid_block import HybridStackSubmodules
+
 if is_torch_min_version("1.13.0"):
     dist_all_gather_func = torch.distributed.all_gather_into_tensor
 else:
@@ -46,14 +56,12 @@ SUPPORTED_ATTN_MASK = [
     AttnMaskType.padding_causal,
 ]
 
-try:
-    import transformer_engine as te  # pylint: disable=unused-import
-
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
+else:
+    TESpecProvider = None
 
-    HAVE_TE = True
-except ImportError:
-    HAVE_TE = False
+from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 
 
 def tie_word_embeddings_state_dict(
@@ -142,7 +150,7 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
     from different sequences.
 
     Args:
-        tensor (Tensor): The input tensor to roll.
+        tensor (Tensor): The input tensor to roll. If None, returns (None, None).
         shifts (int): The shift of the tensor (typically -1 for MTP).
         dims (int): The dimension to roll (typically -1 for sequence dimension).
         cp_group (ProcessGroup): The context parallelism process group. If None or size=1,
@@ -152,6 +160,9 @@ def roll_tensor(tensor, shifts=-1, dims=-1, cp_group=None, packed_seq_params=Non
     Returns:
         tuple: (rolled_tensor, sum_of_rolled_tensor)
     """
+    if tensor is None:
+        return None, None
+
     # Handle packed sequences cases
     if packed_seq_params is not None:
         return _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group)
@@ -329,80 +340,216 @@ def _roll_tensor_packed_seq(tensor, shifts, dims, packed_seq_params, cp_group=No
 
 
 class MTPLossLoggingHelper:
-    """Helper class for logging MTP losses."""
+    """Helper class for logging MTP losses and acceptance rates."""
 
     tracker = {}
 
     @staticmethod
-    def save_loss_to_tracker(
+    def save_metrics_to_tracker(
         loss: torch.Tensor,
+        correct: torch.Tensor,
+        total: torch.Tensor,
         layer_number: int,
         num_layers: int,
-        reduce_group: Optional[torch.distributed.ProcessGroup] = None,
-        avg_group: Optional[torch.distributed.ProcessGroup] = None,
+        reduce_group: torch.distributed.ProcessGroup = None,
+        avg_group: torch.distributed.ProcessGroup = None,
     ):
-        """Save the mtp loss for logging.
+        """Save the mtp metrics (loss, correct, total) for logging.
+
         Args:
-            loss (torch.Tensor): The loss tensor.
+            loss (torch.Tensor): The normalized loss value for this MTP layer.
+            correct (torch.Tensor): Number of correct predictions.
+            total (torch.Tensor): Total number of predictions.
             layer_number (int): Layer index of the loss.
             num_layers (int): The number of total layers.
             reduce_group (torch.distributed.ProcessGroup): The group for reducing the loss.
-            mean_group (torch.distributed.ProcessGroup): The group for averaging the loss.
+            avg_group (torch.distributed.ProcessGroup): The group for averaging the loss.
         """
         # Skip mtp loss logging if layer_number is None.
         if layer_number is None:
             return
 
         tracker = MTPLossLoggingHelper.tracker
-        if "values" not in tracker:
-            tracker["values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
-        tracker["values"][layer_number] += loss.detach()
+        if "loss_values" not in tracker:
+            tracker["loss_values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
+        if "correct_values" not in tracker:
+            tracker["correct_values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
+        if "total_values" not in tracker:
+            tracker["total_values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
+
+        tracker["loss_values"][layer_number] += loss.detach()
+        tracker["correct_values"][layer_number] += correct.detach()
+        tracker["total_values"][layer_number] += total.detach()
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
 
-    def clean_loss_in_tracker():
-        """Clear the mtp losses."""
+    @staticmethod
+    def clean_metrics_in_tracker():
+        """Clear the mtp metrics."""
         tracker = MTPLossLoggingHelper.tracker
-        tracker["values"].zero_()
+        if "loss_values" in tracker:
+            tracker["loss_values"].zero_()
+        if "correct_values" in tracker:
+            tracker["correct_values"].zero_()
+        if "total_values" in tracker:
+            tracker["total_values"].zero_()
         tracker["reduce_group"] = None
         tracker["avg_group"] = None
 
-    def reduce_loss_in_tracker():
-        """Collect and reduce the mtp losses across ranks."""
+    @staticmethod
+    def reduce_metrics_in_tracker():
+        """Collect and reduce the mtp metrics across ranks."""
         tracker = MTPLossLoggingHelper.tracker
-        if "values" not in tracker:
+        if "loss_values" not in tracker:
             return
-        values = tracker["values"]
-        # Reduce mtp losses across ranks.
+
+        loss_values = tracker["loss_values"]
         if tracker.get('reduce_group') is not None:
-            torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
+            torch.distributed.all_reduce(loss_values, group=tracker.get('reduce_group'))
         if tracker.get('avg_group') is not None:
             torch.distributed.all_reduce(
-                values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
+                loss_values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
             )
 
+        for key in ["correct_values", "total_values"]:
+            if key not in tracker:
+                continue
+            values = tracker[key]
+            if tracker.get('reduce_group') is not None:
+                torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
+            if tracker.get('avg_group') is not None:
+                torch.distributed.all_reduce(
+                    values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.SUM
+                )
+
+    @staticmethod
     def track_mtp_metrics(loss_scale, iteration, writer, wandb_writer=None, total_loss_dict=None):
         """Track the Multi-Token Prediction (MTP) metrics for logging."""
-        MTPLossLoggingHelper.reduce_loss_in_tracker()
+        MTPLossLoggingHelper.reduce_metrics_in_tracker()
         tracker = MTPLossLoggingHelper.tracker
-        if "values" not in tracker:
+        if "loss_values" not in tracker:
             return
-        mtp_losses = tracker["values"] * loss_scale
+
+        mtp_losses = tracker["loss_values"] * loss_scale
+        mtp_corrects = tracker.get("correct_values", torch.zeros_like(mtp_losses))
+        mtp_totals = tracker.get("total_values", torch.ones_like(mtp_losses))
+
+        # Process-local logging state; cumulative rates intentionally reset after restart/resume.
+        if (
+            "cumulative_correct_values" not in tracker
+            or tracker["cumulative_correct_values"].shape != mtp_corrects.shape
+        ):
+            tracker["cumulative_correct_values"] = torch.zeros_like(mtp_corrects)
+        if (
+            "cumulative_total_values" not in tracker
+            or tracker["cumulative_total_values"].shape != mtp_totals.shape
+        ):
+            tracker["cumulative_total_values"] = torch.zeros_like(mtp_totals)
+
+        tracker["cumulative_correct_values"] += mtp_corrects
+        tracker["cumulative_total_values"] += mtp_totals
+        mtp_cumulative_corrects = tracker["cumulative_correct_values"]
+        mtp_cumulative_totals = tracker["cumulative_total_values"]
+
         mtp_num_layers = mtp_losses.shape[0]
         for i in range(mtp_num_layers):
-            name = f"mtp_{i + 1} loss"
-            loss = mtp_losses[i]
-            if total_loss_dict is not None:
-                if name in total_loss_dict:
-                    total_loss_dict[name] += loss
-                else:
-                    total_loss_dict[name] = loss
-            if writer is not None:
-                writer.add_scalar(name, loss, iteration)
-            if wandb_writer is not None:
-                wandb_writer.log({f"{name}": loss}, iteration)
+            loss_name = f"mtp_{i+1} loss"
+            step_acc_name = f"mtp_{i+1}_acceptance_rate"
+            cum_acc_name = f"mtp_{i+1}_cumulative_acceptance_rate"
 
-        MTPLossLoggingHelper.clean_loss_in_tracker()
+            loss = mtp_losses[i]
+            # Empty masks can leave no valid MTP positions, so clamp denominators to avoid NaNs.
+            step_rate = (mtp_corrects[i] / torch.clamp(mtp_totals[i], min=1)) * 100.0
+            cum_rate = (
+                mtp_cumulative_corrects[i] / torch.clamp(mtp_cumulative_totals[i], min=1)
+            ) * 100.0
+
+            if total_loss_dict is not None:
+                total_loss_dict[loss_name] = (
+                    total_loss_dict.get(loss_name, torch.zeros_like(loss)) + loss
+                )
+
+            if writer is not None:
+                writer.add_scalar(loss_name, loss, iteration)
+                writer.add_scalar(step_acc_name, step_rate, iteration)
+                writer.add_scalar(cum_acc_name, cum_rate, iteration)
+            if wandb_writer is not None:
+                wandb_writer.log({f"{loss_name}": loss}, iteration)
+                wandb_writer.log({f"{step_acc_name}": step_rate}, iteration)
+                wandb_writer.log({f"{cum_acc_name}": cum_rate}, iteration)
+
+        MTPLossLoggingHelper.clean_metrics_in_tracker()
+
+
+def _mtp_logits_are_vocab_sharded(
+    output_layer: Callable, runtime_gather_output: Optional[bool]
+) -> bool:
+    """Return whether MTP logits are still vocab-sharded across tensor-parallel ranks."""
+    if runtime_gather_output is not None:
+        return not runtime_gather_output
+    return not getattr(output_layer, "gather_output", False)
+
+
+def _vocab_parallel_argmax(
+    vocab_parallel_logits: Tensor, tp_group: torch.distributed.ProcessGroup, tp_size: int
+) -> Tensor:
+    """Return global argmax ids from logits sharded across the vocab dimension."""
+    vocab_shard_size = vocab_parallel_logits.size(-1)
+    local_max_vals, local_argmax = vocab_parallel_logits.max(dim=-1)  # [s, b], [s, b]
+
+    gathered_max_vals = [torch.empty_like(local_max_vals) for _ in range(tp_size)]
+    gathered_argmax = [torch.empty_like(local_argmax) for _ in range(tp_size)]
+    torch.distributed.all_gather(gathered_max_vals, local_max_vals, group=tp_group)
+    torch.distributed.all_gather(gathered_argmax, local_argmax, group=tp_group)
+
+    stacked_max_vals = torch.stack(gathered_max_vals, dim=0)
+    stacked_argmax = torch.stack(gathered_argmax, dim=0)
+    winning_rank = stacked_max_vals.argmax(dim=0)  # [s, b]
+    winning_local_argmax = torch.gather(stacked_argmax, 0, winning_rank.unsqueeze(0)).squeeze(
+        0
+    )  # [s, b]
+    return winning_rank * vocab_shard_size + winning_local_argmax  # [s, b]
+
+
+def _compute_mtp_acceptance_counts(
+    mtp_logits: Tensor,
+    mtp_labels: Tensor,
+    loss_mask: Tensor,
+    output_layer: Callable,
+    runtime_gather_output: Optional[bool],
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> tuple[Tensor, Tensor]:
+    """Compute MTP acceptance correct/total counts."""
+    with torch.no_grad():
+        logits_are_vocab_sharded = _mtp_logits_are_vocab_sharded(
+            output_layer, runtime_gather_output
+        )
+        if (
+            tp_group is None
+            and logits_are_vocab_sharded
+            and parallel_state.is_initialized()
+            and parallel_state.get_tensor_model_parallel_world_size() > 1
+        ):
+            raise ValueError(
+                "tp_group must be provided when computing MTP acceptance counts "
+                "from vocab-sharded logits under tensor model parallelism."
+            )
+        tp_size = torch.distributed.get_world_size(group=tp_group) if tp_group is not None else 1
+
+        # Apply TP rank offsets only when logits are vocab-sharded; gathered logits already
+        # contain global vocab ids in their last dimension.
+        if tp_group is not None and tp_size > 1 and logits_are_vocab_sharded:
+            preds = _vocab_parallel_argmax(mtp_logits, tp_group, tp_size)
+        else:
+            preds = torch.argmax(mtp_logits, dim=-1)  # [s, b]
+
+        labels_match = mtp_labels.transpose(0, 1).contiguous()  # [b, s] => [s, b]
+        mask_match = loss_mask.transpose(0, 1).contiguous()  # [b, s] => [s, b]
+        valid_positions = mask_match.bool()
+        correct = ((preds == labels_match) & valid_positions).sum().float()
+        total = valid_positions.sum().float()
+
+    return correct, total
 
 
 @dataclass
@@ -467,13 +614,16 @@ def get_mtp_layer_spec_for_backend(
 
 
 def mtp_on_this_rank(
-    config: TransformerConfig, ignore_virtual: Optional[bool] = True, vp_stage: Optional[int] = None
+    layout: PipelineParallelLayerLayout = None,
+    mtp_num_layers: Optional[int] = None,
+    ignore_virtual: Optional[bool] = True,
+    vp_stage: Optional[int] = None,
 ) -> bool:
     """
     Check if there is MTP on the current rank.
 
     Behavior:
-        - If a custom pipeline model parallel layout is provided in the config:
+        - If a custom pipeline model parallel layout is provided:
             - If virtual pipeline parallelism is enabled (and `ignore_virtual` is False), checks
               whether any MTP layers are present on this (pp_rank, vp_stage) pair.
             - Otherwise, checks all virtual pipeline ranks of the current pipeline rank. Returns
@@ -483,25 +633,24 @@ def mtp_on_this_rank(
     """
     mtp_on_this_rank = False
     pp_rank = parallel_state.get_pipeline_model_parallel_rank()
-    if config.pipeline_model_parallel_layout is not None:
+    if layout is not None:
         # with custom PP layout, we support put MTP layers on any pipeline stage
-        layout = config.pipeline_model_parallel_layout.layout
         if (
             not ignore_virtual
             and parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None
         ):
             assert vp_stage is not None, "vp_stage must be passed if virtual pipeline is enabled"
-            num_layers_to_build = layout[pp_rank][vp_stage].count(LayerType.mtp)
+            num_layers_to_build = layout.layout[pp_rank][vp_stage].count(LayerType.mtp)
             mtp_on_this_rank = num_layers_to_build > 0
         else:
-            for vpp_rank in range(len(layout[pp_rank])):
-                num_layers_to_build = layout[pp_rank][vpp_rank].count(LayerType.mtp)
+            for vpp_rank in range(len(layout.layout[pp_rank])):
+                num_layers_to_build = layout.layout[pp_rank][vpp_rank].count(LayerType.mtp)
                 if num_layers_to_build > 0:
                     mtp_on_this_rank = True
                     break
     else:
         # without custom PP layout, we only support put all of MTP layers on the last pipeline stage
-        if config.mtp_num_layers is not None:
+        if mtp_num_layers is not None:
             mtp_on_this_rank = parallel_state.is_pipeline_last_stage(
                 ignore_virtual=ignore_virtual, vp_stage=vp_stage
             )
@@ -619,7 +768,10 @@ def process_mtp_loss(
     compute_language_model_loss: Callable,
     config: TransformerConfig,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
     packed_seq_params: Optional[PackedSeqParams] = None,
+    scale_logits_fn: Optional[Callable[[Tensor], Tensor]] = None,
+    input_ids: Optional[Tensor] = None,
 ) -> Tensor:
     """Process Multi-Token Prediction (MTP) loss computation.
 
@@ -637,7 +789,14 @@ def process_mtp_loss(
         compute_language_model_loss (Callable): Method to compute language model loss.
         config (TransformerConfig): Model configuration containing mtp_num_layers etc.
         cp_group (Optional[ProcessGroup]): Context parallelism process group.
+        tp_group (Optional[ProcessGroup]): Tensor parallelism process group.
         packed_seq_params (Optional[PackedSeqParams]): Packed sequence parameters.
+        scale_logits_fn (Optional[Callable[[Tensor], Tensor]]): Optional function to
+            scale logits before loss computation (e.g., MuP output scaling).
+        input_ids (Optional[Tensor]): Input token IDs. Used to derive labels when
+            ``labels`` is None (e.g. RL training), by rolling left to match the SFT
+            label convention (``label[i] = input_id[i + 1]``). Ignored when ``labels``
+            is provided.
 
     Returns:
         Tensor: Updated hidden states after MTP loss processing (first chunk only).
@@ -645,12 +804,33 @@ def process_mtp_loss(
     hidden_states_list = torch.chunk(hidden_states, 1 + config.mtp_num_layers, dim=0)
     hidden_states = hidden_states_list[0]
 
+    # When labels are not provided (e.g. RL training), derive them from input_ids by
+    # rolling left so that label[i] = input_id[i + 1], matching the SFT label format.
+    derived_labels_from_input_ids = False
     if labels is None:
-        return hidden_states
+        if input_ids is None:
+            return hidden_states
+        labels, _ = roll_tensor(
+            input_ids, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
+        )
+        derived_labels_from_input_ids = True
+
+    if config.mtp_detach_heads:
+        if output_weight is not None:
+            output_weight = output_weight.detach()
+        else:
+            output_weight = output_layer.weight.detach()
 
     mtp_labels = labels.clone()
     if loss_mask is None:
         loss_mask = torch.ones_like(mtp_labels)
+    if derived_labels_from_input_ids:
+        # input_ids has no real token beyond the sequence window, so the last rolled-in
+        # label is fabricated (zeroed). Roll loss_mask in lockstep with the
+        # input_ids -> labels shift so that boundary position is masked.
+        loss_mask, _ = roll_tensor(
+            loss_mask, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
+        )
 
     # Store the original number of tokens before rolling for proper normalization
     # when calculate_per_token_loss is enabled. This ensures MTP gradients are
@@ -663,20 +843,31 @@ def process_mtp_loss(
             weight=output_weight,
             runtime_gather_output=runtime_gather_output,
         )
+        if scale_logits_fn is not None:
+            mtp_logits = scale_logits_fn(mtp_logits)
         mtp_labels, _ = roll_tensor(
             mtp_labels, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
         loss_mask, num_tokens = roll_tensor(
             loss_mask, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
+
         mtp_loss = compute_language_model_loss(mtp_labels, mtp_logits)
+
         mtp_loss = loss_mask * mtp_loss
+
         if is_training:
             mtp_loss_for_log = (
-                torch.sum(mtp_loss) / num_tokens if num_tokens > 0 else mtp_loss.new_tensor(0.0)
+                torch.sum(mtp_loss) * (num_tokens > 0).to(mtp_loss.dtype)
+            ) / num_tokens.clamp(min=1)
+            correct, total = _compute_mtp_acceptance_counts(
+                mtp_logits, mtp_labels, loss_mask, output_layer, runtime_gather_output, tp_group
             )
-            MTPLossLoggingHelper.save_loss_to_tracker(
+
+            MTPLossLoggingHelper.save_metrics_to_tracker(
                 mtp_loss_for_log,
+                correct,
+                total,
                 mtp_layer_number,
                 config.mtp_num_layers,
                 avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
@@ -730,41 +921,64 @@ class MultiTokenPredictionLayer(MegatronModule):
         layer_number: int = 1,
         vp_stage: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
-        # For Mamba path - pattern and submodules to build inner layers directly
+        # For hybrid path - pattern and submodules to build inner layers directly
         mtp_layer_pattern: Optional[str] = None,
-        mamba_submodules: Optional["MambaStackSubmodules"] = None,
+        hybrid_submodules: Optional[HybridStackSubmodules] = None,
+        mamba_submodules: Optional[HybridStackSubmodules] = None,
+        name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         super().__init__(config=config)
+        if mamba_submodules is not None:
+            if hybrid_submodules is not None:
+                raise ValueError(
+                    "Cannot specify both hybrid_submodules and mamba_submodules. "
+                    "mamba_submodules has been deprecated; use hybrid_submodules instead."
+                )
+            warnings.warn(
+                "mamba_submodules has been deprecated. Use hybrid_submodules instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            hybrid_submodules = mamba_submodules
         self.sequence_parallel = config.sequence_parallel
         self.submodules = submodules
         self.layer_number = layer_number + get_mtp_layer_offset(self.config, vp_stage)
         self.vp_stage = vp_stage
         self.cp_group = pg_collection.cp
+        self.tp_group = pg_collection.tp if pg_collection is not None else None
         self.mtp_layer_pattern = mtp_layer_pattern
 
         # Validate attention mask type if using transformer-based inner layers
         if self.submodules.mtp_model_layer is not None and hasattr(
             self.submodules.mtp_model_layer, 'submodules'
         ):
-            if hasattr(self.submodules.mtp_model_layer.submodules, 'attention_layer'):
-                self_attention_spec = self.submodules.mtp_model_layer.submodules.attention_layer
-                if self_attention_spec.submodules.self_attention is not None:
-                    self_attention_spec = self_attention_spec.submodules.self_attention
-                    attn_mask_type = self_attention_spec.params.get('attn_mask_type', '')
-                    assert attn_mask_type in SUPPORTED_ATTN_MASK, (
-                        f"Multi-Token Prediction (MTP) is not yet supported with "
-                        f"{attn_mask_type} attention mask type. "
-                        f"The supported attention mask types are {SUPPORTED_ATTN_MASK}."
-                    )
-            elif hasattr(self.submodules.mtp_model_layer.submodules, 'self_attention'):
-                self_attention_spec = self.submodules.mtp_model_layer.submodules.self_attention
-                if self_attention_spec is not None:
-                    attn_mask_type = self_attention_spec.params.get('attn_mask_type', '')
-                    assert attn_mask_type in SUPPORTED_ATTN_MASK, (
-                        f"Multi-Token Prediction (MTP) is not yet supported with "
-                        f"{attn_mask_type} attention mask type. "
-                        f"The supported attention mask types are {SUPPORTED_ATTN_MASK}."
-                    )
+            from megatron.core.models.hybrid.hybrid_block import HybridStackSubmodules
+            from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
+
+            layer_submodules = None
+            if isinstance(self.submodules.mtp_model_layer.submodules, HybridStackSubmodules):
+                attention_layer_spec = self.submodules.mtp_model_layer.submodules.attention_layer
+                if hasattr(attention_layer_spec, 'submodules'):
+                    assert isinstance(attention_layer_spec.submodules, TransformerLayerSubmodules)
+                    layer_submodules = attention_layer_spec.submodules
+            elif isinstance(self.submodules.mtp_model_layer.submodules, TransformerLayerSubmodules):
+                layer_submodules = self.submodules.mtp_model_layer.submodules
+            else:
+                raise ValueError(
+                    "Unsupported mtp_model_layer submodules type for attention mask validation."
+                )
+            if layer_submodules:
+                self_attention_spec = layer_submodules.self_attention
+                attn_mask_type = self_attention_spec.params.get('attn_mask_type', '')
+                assert attn_mask_type in SUPPORTED_ATTN_MASK, (
+                    f"Multi-Token Prediction (MTP) is not yet supported with "
+                    f"{attn_mask_type} attention mask type. "
+                    f"The supported attention mask types are {SUPPORTED_ATTN_MASK}."
+                )
 
         self.enorm = self.submodules.enorm(
             config=self.config,
@@ -794,23 +1008,28 @@ class MultiTokenPredictionLayer(MegatronModule):
             skip_bias_add=False,
             is_expert=False,
             tp_comm_buffer_name="mtp_eh_proj",
+            tp_group=pg_collection.tp if pg_collection is not None else None,
+            name=(name + ".eh_proj") if name is not None else None,
         )
 
         # Build inner layers: two possible paths
-        # 1. Mamba path: use MambaStack for hybrid pattern support
+        # 1. Hybrid path: use HybridStack for hybrid pattern support
         # 2. GPT path: single TransformerLayer
-        if mtp_layer_pattern is not None and mamba_submodules is not None:
-            from megatron.core.ssm.mamba_block import MambaStack
+        if mtp_layer_pattern is not None and hybrid_submodules is not None:
+            from megatron.core.models.hybrid.hybrid_block import HybridStack
+            from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
 
-            self.mtp_model_layer = MambaStack(
+            self.mtp_model_layer = HybridStack(
                 config=self.config,
-                submodules=mamba_submodules,
-                hybrid_override_pattern=mtp_layer_pattern,
+                submodules=hybrid_submodules,
+                layer_type_list=validate_segment_layers(mtp_layer_pattern),
+                pp_layer_offset=0,
                 pre_process=True,  # Always receives input from eh_proj
                 post_layer_norm=False,  # MTP has its own final_layernorm
                 post_process=True,  # MTP layer is self-contained
                 pg_collection=pg_collection,
                 is_mtp_layer=True,
+                name=(name + ".mtp_model_layer") if name is not None else None,
             )
         elif self.config.mtp_num_layers is not None:
             # GPT path: Uses the transformer block spec for MTP layer
@@ -823,6 +1042,8 @@ class MultiTokenPredictionLayer(MegatronModule):
                 vp_stage=self.vp_stage,
                 layer_number=self.layer_number,
                 is_mtp_layer=True,
+                pg_collection=pg_collection,
+                name=(name + ".mtp_model_layer") if name is not None else None,
             )
 
         self.final_layernorm = self.submodules.layer_norm(
@@ -839,6 +1060,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         embedding: Callable,
         hidden_states: torch.Tensor,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        padding_mask: Optional[torch.Tensor] = None,
     ):
         """
         Preprocesses input data for the Multi-Token Prediction (MTP) layers.
@@ -870,12 +1092,30 @@ class MultiTokenPredictionLayer(MegatronModule):
             cp_group=self.cp_group,
             packed_seq_params=packed_seq_params,
         )
+        if padding_mask is not None:
+            padding_mask, _ = roll_tensor(
+                padding_mask,
+                shifts=-1,
+                dims=-1,
+                cp_group=self.cp_group,
+                packed_seq_params=packed_seq_params,
+            )
         # embedding
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
 
-        hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
+        if self.config.mtp_detach_heads:
+            decoder_input = decoder_input.detach()
 
-        return input_ids, position_ids, decoder_input, hidden_states
+        hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
+        # make_viewless_tensor no-ops when hidden_states is not a view (_base is None),
+        # which happens after detach() with mtp_detach_heads. Activation
+        # checkpointing (CheckpointFunction.apply) requires at least one input tensor
+        # with requires_grad=True to produce a differentiable output, so we ensure it
+        # here to maintain gradient flow to MTP layer parameters.
+        if not hidden_states.requires_grad:
+            hidden_states.requires_grad_(True)
+
+        return input_ids, position_ids, padding_mask, decoder_input, hidden_states
 
     def _concat_embeddings(self, hidden_states: torch.Tensor, decoder_input: torch.Tensor):
         """
@@ -890,14 +1130,18 @@ class MultiTokenPredictionLayer(MegatronModule):
         hidden_states = torch.cat((decoder_input, hidden_states), -1)
         hidden_states, _ = self.eh_proj(hidden_states)
         # For tensor parallel we need to gather the tensor across the model-parallel
-        # ranks after the linear projection. This used to call
-        # `all_gather_last_dim_from_tensor_parallel_region`, but that utility reduces
-        # the gradient in backward pass and was therefore incorrect in this context.
-        # It has been replaced with the correct `gather_from_tensor_model_parallel_region`.
-        hidden_states = gather_from_tensor_model_parallel_region(hidden_states)
+        # ranks after the linear projection.
+        if InferenceMode.is_active():
+            hidden_states = inference_all_gather_from_tensor_model_parallel_region(
+                hidden_states, self.tp_group, self.config
+            )
+        else:
+            hidden_states = gather_from_tensor_model_parallel_region(
+                hidden_states, group=self.tp_group
+            )
         # For sequence parallel, scatter after linear_fc and before transformer layer.
         if self.sequence_parallel:
-            hidden_states = scatter_to_sequence_parallel_region(hidden_states)
+            hidden_states = scatter_to_sequence_parallel_region(hidden_states, group=self.tp_group)
         return hidden_states
 
     def _proj_and_transformer_layer(
@@ -905,6 +1149,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         hidden_states: Tensor,
         decoder_input: Tensor,
         attention_mask: Optional[torch.Tensor] = None,
+        padding_mask: Optional[torch.Tensor] = None,
         context: Optional[torch.Tensor] = None,
         context_mask: Optional[torch.Tensor] = None,
         rotary_pos_emb: Optional[torch.Tensor] = None,
@@ -945,6 +1190,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                     hidden_states = self.mtp_model_layer(
                         hidden_states=hidden_states,
                         attention_mask=attention_mask,
+                        padding_mask=padding_mask,
                         rotary_pos_emb=rotary_pos_emb,
                         inference_context=inference_params,
                         packed_seq_params=packed_seq_params,
@@ -963,6 +1209,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                         inference_params=inference_params,
                         packed_seq_params=packed_seq_params,
                         sequence_len_offset=sequence_len_offset,
+                        padding_mask=padding_mask,
                     )
 
         hidden_states = self._postprocess(hidden_states)
@@ -983,23 +1230,178 @@ class MultiTokenPredictionLayer(MegatronModule):
 
         return hidden_states
 
-    def _checkpointed_forward(self, forward_func, *args, **kwargs):
+    def forward_single_position(
+        self,
+        hidden_states: Tensor,
+        next_token_ids: Tensor,
+        position_ids: Tensor,
+        embedding: Callable,
+        attention_mask: Optional[Tensor] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[Tensor] = None,
+    ) -> Tensor:
+        """Forward for single positions without roll_tensor (speculative decoding).
+
+        Unlike the regular forward which rolls input_ids to get the next token's
+        embedding, this method directly takes the correct next_token_ids. This is
+        used in speculative decoding where the correct next token is known after
+        verification.
+
+        Args:
+            hidden_states (Tensor): Hidden states at positions of interest [N, B, H].
+            next_token_ids (Tensor): The correct next token IDs [B, N].
+            position_ids (Tensor): Position IDs for the next tokens [B, N].
+            embedding (Callable): The embedding module.
+
+        Returns:
+            Tensor: MTP hidden states [N, B, H].
+        """
+        decoder_input = embedding(input_ids=next_token_ids, position_ids=position_ids)
+        hidden_states = make_viewless_tensor(
+            inp=hidden_states, requires_grad=False, keep_graph=False
+        )
+        hidden_states = self._proj_and_transformer_layer(
+            hidden_states=hidden_states,
+            decoder_input=decoder_input,
+            attention_mask=attention_mask,
+            rotary_pos_emb=rotary_pos_emb,
+            rotary_pos_cos=rotary_pos_cos,
+            rotary_pos_sin=rotary_pos_sin,
+            packed_seq_params=packed_seq_params,
+            sequence_len_offset=sequence_len_offset,
+        )
+        return hidden_states
+
+    def _checkpointed_forward(
+        self,
+        hidden_states: Tensor,
+        decoder_input: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        padding_mask: Optional[Tensor] = None,
+        context: Optional[Tensor] = None,
+        context_mask: Optional[Tensor] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+        rotary_pos_cos: Optional[Tensor] = None,
+        rotary_pos_sin: Optional[Tensor] = None,
+        attention_bias: Optional[Tensor] = None,
+        inference_params: Optional[InferenceParams] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        sequence_len_offset: Optional[Tensor] = None,
+    ):
+        """Forward through ``_proj_and_transformer_layer`` with activation
+        recomputation.
+
+        Mirrors ``transformer_block._checkpointed_forward``:
+
+        * Non-tensor objects (``attention_bias``, ``inference_params``,
+          ``packed_seq_params``) are captured by the ``custom_forward``
+          closure; only tensor / ``None`` arguments flow positionally
+          through the underlying checkpoint primitive. This is required
+          by both backends: ``tensor_parallel.checkpoint`` because its
+          ``save_for_backward`` only accepts tensors and ``None``, and
+          ``te_checkpoint`` because its reentrant implementation only
+          tracks positional tensor inputs as checkpoint inputs (kwarg
+          tensors are not represented in the recompute backward path).
+        * Quantized recipes (fp8, fp4) route through ``te_checkpoint``;
+          everything else uses ``tensor_parallel.checkpoint``.
+        * Only ``fp8 + delayed scaling`` needs an outer quantization
+          context entered before ``te_checkpoint``; see the
+          ``outer_quantization_context`` block below.
+        """
+
+        def custom_forward(
+            hidden_states,
+            decoder_input,
+            attention_mask,
+            padding_mask,
+            context,
+            context_mask,
+            rotary_pos_emb,
+            rotary_pos_cos,
+            rotary_pos_sin,
+            sequence_len_offset,
+        ):
+            return self._proj_and_transformer_layer(
+                hidden_states=hidden_states,
+                decoder_input=decoder_input,
+                attention_mask=attention_mask,
+                padding_mask=padding_mask,
+                context=context,
+                context_mask=context_mask,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                attention_bias=attention_bias,
+                inference_params=inference_params,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+            )
+
+        # Decide the outer quantization context, matching
+        # ``transformer_block._checkpointed_forward``. Only ``fp8 + delayed
+        # scaling`` needs an active context at the ``te_checkpoint`` entry
+        # point: TE's ``_CheckpointFunction.forward`` samples
+        # ``FP8GlobalStateManager.is_fp8_enabled()`` there to gate the
+        # phase-1 amax-buffer stash that phase-2 backward looks up via
+        # ``global_fp8_buffer_pos_fwd_recompute``. With fp8 only entered
+        # *inside* ``_proj_and_transformer_layer``, TE samples fp8 as off,
+        # phase-1 skips the stash, and phase-2 raises ``KeyError``.
+        # Non-delayed fp8 recipes (MXFP8BlockScaling, Float8CurrentScaling)
+        # and fp4 (NVFP4BlockScaling) treat the stash/lookup as a noop, so
+        # the inner context entered inside ``_proj_and_transformer_layer``
+        # is sufficient.
+        if self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.delayed:
+            outer_quantization_context = get_fp8_context(self.config)
+        else:
+            outer_quantization_context = nullcontext()
+
         def checkpoint_handler():
             """Determines whether to use the `te_checkpoint` or `tensor_parallel.checkpoint`"""
-            if self.config.fp8:
+            # fp4 quantization is internally implemented via TE's
+            # ``fp8_autocast`` (see ``fp4_utils.get_fp4_context``), so
+            # quantized recompute on either fp8 or fp4 must go through
+            # ``te_checkpoint``. Matches ``transformer_block``'s policy.
+            if self.config.fp8 or self.config.fp4:
                 from megatron.core.extensions.transformer_engine import te_checkpoint
 
                 return te_checkpoint(
-                    forward_func,
+                    custom_forward,
                     self.config.distribute_saved_activations,
                     tensor_parallel.random.get_cuda_rng_tracker,
                     parallel_state.get_tensor_model_parallel_group(),
-                    *args,
-                    **kwargs,
+                    hidden_states,
+                    decoder_input,
+                    attention_mask,
+                    padding_mask,
+                    context,
+                    context_mask,
+                    rotary_pos_emb,
+                    rotary_pos_cos,
+                    rotary_pos_sin,
+                    sequence_len_offset,
                 )
             else:
+                # tensor_parallel.checkpoint stashes args via autograd's
+                # ``save_for_backward``, which only accepts tensors and ``None``.
+                # Pass tensor / ``None`` args positionally and capture the
+                # non-tensor objects (``attention_bias``, ``inference_params``,
+                # ``packed_seq_params``) via the ``custom_forward`` closure.
                 return tensor_parallel.checkpoint(
-                    forward_func, self.config.distribute_saved_activations, *args, *kwargs.values()
+                    custom_forward,
+                    self.config.distribute_saved_activations,
+                    hidden_states,
+                    decoder_input,
+                    attention_mask,
+                    padding_mask,
+                    context,
+                    context_mask,
+                    rotary_pos_emb,
+                    rotary_pos_cos,
+                    rotary_pos_sin,
+                    sequence_len_offset,
                 )
 
         if self.config.recompute_method == 'uniform':
@@ -1009,13 +1411,28 @@ class MultiTokenPredictionLayer(MegatronModule):
             assert (
                 self.config.recompute_num_layers == 1
             ), "recompute_num_layers must be 1 for MTP recompute"
-            outputs = checkpoint_handler()
+            with outer_quantization_context:
+                outputs = checkpoint_handler()
         elif self.config.recompute_method == 'block':
             # TODO: implement block-based recompute for MTP
             warnings.warn(
                 "recompute_method == 'block' is not supported for MTP yet." " Skipping recompute."
             )
-            outputs = forward_func(*args, **kwargs)
+            outputs = self._proj_and_transformer_layer(
+                hidden_states=hidden_states,
+                decoder_input=decoder_input,
+                attention_mask=attention_mask,
+                padding_mask=padding_mask,
+                context=context,
+                context_mask=context_mask,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                attention_bias=attention_bias,
+                inference_params=inference_params,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+            )
         else:
             raise ValueError("Invalid activation recompute method.")
 
@@ -1027,6 +1444,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         position_ids: Tensor,
         hidden_states: Tensor,
         attention_mask: Tensor,
+        padding_mask: Optional[Tensor] = None,
         context: Optional[Tensor] = None,
         context_mask: Optional[Tensor] = None,
         rotary_pos_emb: Optional[Tensor] = None,
@@ -1061,9 +1479,10 @@ class MultiTokenPredictionLayer(MegatronModule):
             [s, b, h], and optionally the updated context tensor if cross-attention is used.
         """
         assert context is None, "multi token prediction + cross attention is not yet supported."
-        input_ids, position_ids, decoder_input, hidden_states = self._get_embeddings(
+        input_ids, position_ids, padding_mask, decoder_input, hidden_states = self._get_embeddings(
             input_ids=input_ids,
             position_ids=position_ids,
+            padding_mask=padding_mask,
             embedding=embedding,
             hidden_states=hidden_states,
             packed_seq_params=packed_seq_params,
@@ -1071,10 +1490,10 @@ class MultiTokenPredictionLayer(MegatronModule):
 
         if self.config.recompute_granularity == 'full' and self.training:
             hidden_states = self._checkpointed_forward(
-                self._proj_and_transformer_layer,
                 hidden_states=hidden_states,
                 decoder_input=decoder_input,
                 attention_mask=attention_mask,
+                padding_mask=padding_mask,
                 context=context,
                 context_mask=context_mask,
                 rotary_pos_emb=rotary_pos_emb,
@@ -1090,6 +1509,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 hidden_states=hidden_states,
                 decoder_input=decoder_input,
                 attention_mask=attention_mask,
+                padding_mask=padding_mask,
                 context=context,
                 context_mask=context_mask,
                 rotary_pos_emb=rotary_pos_emb,
@@ -1101,7 +1521,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 sequence_len_offset=sequence_len_offset,
             )
 
-        return hidden_states, input_ids, position_ids
+        return hidden_states, input_ids, position_ids, padding_mask
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
@@ -1207,19 +1627,38 @@ class MultiTokenPredictionBlock(MegatronModule):
         spec: Union[TransformerBlockSubmodules, ModuleSpec],
         vp_stage: Optional[int] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
-        # New: For Mamba path with unified pattern syntax
+        # New: For hybrid path with unified pattern syntax
         mtp_layer_pattern: Optional[str] = None,
         mtp_num_depths: int = 0,
-        mamba_submodules: Optional["MambaStackSubmodules"] = None,
+        hybrid_submodules: Optional["HybridStackSubmodules"] = None,
+        mamba_submodules: Optional["HybridStackSubmodules"] = None,
+        name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         super().__init__(config=config)
+        if mamba_submodules is not None:
+            if hybrid_submodules is not None:
+                raise ValueError(
+                    "Cannot specify both hybrid_submodules and mamba_submodules. "
+                    "mamba_submodules has been deprecated; use hybrid_submodules instead."
+                )
+            warnings.warn(
+                "mamba_submodules has been deprecated. Use hybrid_submodules instead.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            hybrid_submodules = mamba_submodules
         self.submodules = _get_mtp_block_submodules(config, spec)
         self.mtp_loss_scaling_factor = config.mtp_loss_scaling_factor
         self.vp_stage = vp_stage
         self.mtp_layer_pattern = mtp_layer_pattern
         self.mtp_num_depths = mtp_num_depths
-        self.mamba_submodules = mamba_submodules
+        self.hybrid_submodules = hybrid_submodules
         self.mtp_use_repeated_layer = self.config.mtp_use_repeated_layer
+        self.name = name
 
         vp_size = config.virtual_pipeline_model_parallel_size
         assert is_vp_last_stage(vp_stage=vp_stage, vp_size=vp_size), (
@@ -1233,7 +1672,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         # to the roll_tensor function for proper boundary communication
         if pg_collection is None:
             # Use default MPU process groups if not provided
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['cp'])
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['cp', 'tp'])
         else:
             # Ensure the provided process groups include CP
             assert hasattr(
@@ -1262,10 +1701,13 @@ class MultiTokenPredictionBlock(MegatronModule):
                     vp_stage=self.vp_stage,
                     pg_collection=pg_collection,
                     mtp_layer_pattern=self.mtp_layer_pattern,
+                    name=(self.name + f".layers.{layer_number}") if self.name is not None else None,
                 )
             return module
 
-        def build_layer_with_pattern(layer_spec, layer_number, mtp_layer_pattern, mamba_submodules):
+        def build_layer_with_pattern(
+            layer_spec, layer_number, mtp_layer_pattern, hybrid_submodules
+        ):
             """Build layer using pattern-based approach (new Mamba path)."""
             fp8_init_context = get_fp8_context(self.config, is_init=True)
             with fp8_init_context:
@@ -1276,12 +1718,13 @@ class MultiTokenPredictionBlock(MegatronModule):
                     vp_stage=self.vp_stage,
                     pg_collection=pg_collection,
                     mtp_layer_pattern=mtp_layer_pattern,
-                    mamba_submodules=mamba_submodules,
+                    hybrid_submodules=hybrid_submodules,
+                    name=(self.name + f".layers.{layer_number}") if self.name is not None else None,
                 )
             return module
 
-        # New Mamba path: use mtp_layer_pattern and mamba_submodules
-        if self.mtp_layer_pattern is not None and self.mamba_submodules is not None:
+        # New Mamba path: use mtp_layer_pattern and hybrid_submodules
+        if self.mtp_layer_pattern is not None and self.hybrid_submodules is not None:
             if self.mtp_use_repeated_layer:
                 # Shared/repeated layer: build one layer, use it for all depths
                 layer_spec = self.submodules.layer_specs[0]
@@ -1289,7 +1732,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                     layer_spec,
                     layer_number=1,
                     mtp_layer_pattern=self.mtp_layer_pattern,
-                    mamba_submodules=self.mamba_submodules,
+                    hybrid_submodules=self.hybrid_submodules,
                 )
                 self.layers = torch.nn.ModuleList([shared_layer])
             else:
@@ -1302,7 +1745,7 @@ class MultiTokenPredictionBlock(MegatronModule):
                             ],
                             layer_number=i + 1,
                             mtp_layer_pattern=self.mtp_layer_pattern,
-                            mamba_submodules=self.mamba_submodules,
+                            hybrid_submodules=self.hybrid_submodules,
                         )
                         for i in range(num_depths)
                     ]
@@ -1333,6 +1776,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         position_ids: Tensor,
         hidden_states: Tensor,
         attention_mask: Tensor,
+        padding_mask: Optional[Tensor] = None,
         context: Optional[Tensor] = None,
         context_mask: Optional[Tensor] = None,
         rotary_pos_emb: Optional[Tensor] = None,
@@ -1361,13 +1805,18 @@ class MultiTokenPredictionBlock(MegatronModule):
         offset = get_mtp_layer_offset(self.config, self.vp_stage)
         hidden_states_list = list(torch.chunk(hidden_states, 1 + offset, dim=0))
         hidden_states = hidden_states_list[offset]
+
+        if self.config.mtp_detach_heads:
+            hidden_states = hidden_states.detach()
+
         for iteration in range(self.config.mtp_num_layers):
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
-            (hidden_states, input_ids, position_ids) = self.layers[layer_idx](
+            (hidden_states, input_ids, position_ids, padding_mask) = self.layers[layer_idx](
                 input_ids=input_ids,
                 position_ids=position_ids,
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
+                padding_mask=padding_mask,
                 inference_params=inference_params,
                 rotary_pos_emb=rotary_pos_emb,
                 rotary_pos_cos=rotary_pos_cos,
@@ -1401,7 +1850,7 @@ class MultiTokenPredictionBlock(MegatronModule):
             ShardedStateDict: A dictionary containing the sharded state of the multi
             token prediction module.
         """
-        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+        sharded_state_dict = {}
         layer_prefix = f'{prefix}layers.'
         for layer in self.layers:
             offset = get_mtp_layer_offset(self.config, self.vp_stage)

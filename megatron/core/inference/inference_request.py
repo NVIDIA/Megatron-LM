@@ -1,17 +1,19 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
+import hashlib
 import time
 import warnings
 from dataclasses import asdict, dataclass, field
 from enum import Enum, auto
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.tokenizers import MegatronTokenizer
-from megatron.core.utils import experimental_api
+from megatron.core.utils import experimental_api, nvtx_range_pop, nvtx_range_push
 
 
 def serialize_tensor(tensor: torch.Tensor) -> List:
@@ -23,12 +25,12 @@ def serialize_tensor(tensor: torch.Tensor) -> List:
     Returns:
         (List) Tensor as a list
     """
-    torch.cuda.nvtx.range_push("serialize_tensor")
+    nvtx_range_push("serialize_tensor")
 
     # simply convert tensor into a list
     tensor = tensor.cpu().tolist()
 
-    torch.cuda.nvtx.range_pop()
+    nvtx_range_pop("serialize_tensor")
     return tensor
 
 
@@ -45,6 +47,31 @@ def deserialize_tensor(tensor_as_list: List) -> torch.Tensor:
     return tensor
 
 
+def serialize_ndarray(arr: np.ndarray) -> dict:
+    """Serialize numpy array to a JSON-compatible dict."""
+    return {"data": arr.tolist(), "dtype": str(arr.dtype)}
+
+
+def deserialize_ndarray(obj: dict) -> np.ndarray:
+    """Deserialize numpy array from dict."""
+    return np.array(obj["data"], dtype=np.dtype(obj["dtype"]))
+
+
+def unwrap_serialized_tensors(serialized_request: dict) -> dict:
+    """Unwrap ("tensor", [...]) tuples produced by serialize() into plain lists.
+
+    Args:
+        serialized_request (dict): A dict produced by `serialize()`.
+
+    Returns:
+        dict: A shallow copy with tensor wrapper tuples replaced by their inner lists.
+    """
+    return {
+        k: v[1] if isinstance(v, (list, tuple)) and len(v) == 2 and v[0] == "tensor" else v
+        for k, v in serialized_request.items()
+    }
+
+
 # class syntax
 class Status(Enum):
     """Enum for status"""
@@ -54,6 +81,52 @@ class Status(Enum):
     ACTIVE_BUT_NOT_GENERATING_TOKENS = 3
     COMPLETED = 4
     FAILED = 5
+
+
+# =========================================================================
+# Hash computation for prefix caching
+# =========================================================================
+
+
+def compute_block_hashes_batched(prompt_tokens: torch.Tensor, block_size: int) -> List[int]:
+    """Compute SHA-256 based hashes for all complete blocks in a prompt.
+
+    Each block hash is computed as SHA-256(parent_digest || block_bytes), where
+    parent_digest chains from the previous block (starting from a zero digest).
+    This provides cryptographic collision resistance with no exploitable algebraic
+    structure.
+
+    Args:
+        prompt_tokens: All prompt token IDs, shape [seq_len].
+        block_size: Number of tokens per block.
+
+    Returns:
+        List of positive integer hash values in [1, 2^63-1], one per complete block.
+    """
+    num_complete_blocks = len(prompt_tokens) // block_size
+    if num_complete_blocks == 0:
+        return []
+
+    # Single GPU->CPU transfer, get contiguous bytes
+    tokens_cpu = prompt_tokens[: num_complete_blocks * block_size].to(torch.int64).cpu()
+    tokens_bytes = tokens_cpu.numpy().tobytes()
+    block_byte_size = block_size * tokens_cpu.element_size()  # 8 bytes per int64
+
+    hashes = []
+    parent_digest = b'\x00' * 32  # SHA-256 digest size
+
+    for i in range(num_complete_blocks):
+        block_bytes = tokens_bytes[i * block_byte_size : (i + 1) * block_byte_size]
+        digest = hashlib.sha256(parent_digest + block_bytes).digest()
+
+        # Map to positive int64 range [1, 2^63-1], avoiding sentinels -1 and 0
+        raw = int.from_bytes(digest[:8], byteorder='little', signed=False)
+        hash_val = (raw % (2**63 - 1)) + 1
+
+        hashes.append(hash_val)
+        parent_digest = digest  # Full 32-byte digest chains into next block
+
+    return hashes
 
 
 @dataclass(kw_only=True)
@@ -82,7 +155,7 @@ class InferenceRequest:
     prompt_top_n_logprobs: Optional[List[Dict[str, float]]] = None
     generated_top_n_logprobs: Optional[List[Dict[str, float]]] = None
     generated_length: Optional[int] = None
-    tpot: Optional[List[int]] = None
+    tpot: List[float] = field(default_factory=list)
 
     def __post_init__(self):
         if self.sampling_params is None and self.inference_parameters is not None:
@@ -109,9 +182,13 @@ class InferenceRequest:
             self.inference_parameters.serialize() if self.inference_parameters else None
         )
 
-        # Serialize tensors.
+        # Serialize tensors and numpy arrays.
         obj = {
-            k: (("tensor", serialize_tensor(v)) if isinstance(v, torch.Tensor) else v)
+            k: (
+                ("tensor", serialize_tensor(v))
+                if isinstance(v, torch.Tensor)
+                else ("ndarray", serialize_ndarray(v)) if isinstance(v, np.ndarray) else v
+            )
             for k, v in obj.items()
         }
         return obj
@@ -150,10 +227,12 @@ class InferenceRequest:
             else SamplingParams.deserialize(obj["inference_parameters"])
         )
 
-        # Deserialize tensors and sampling params.
+        # Deserialize tensors, numpy arrays, and sampling params.
         for k, v in obj.items():
             if isinstance(v, list) and len(v) == 2 and v[0] == "tensor":
                 setattr(self, k, deserialize_tensor(v[1]))
+            elif isinstance(v, list) and len(v) == 2 and v[0] == "ndarray":
+                setattr(self, k, deserialize_ndarray(v[1]))
 
 
 class DynamicInferenceEventType(Enum):
@@ -228,7 +307,7 @@ class DynamicInferenceEvent:
         Returns:
             dict: Full event dict.
         """
-        torch.cuda.nvtx.range_push("DynamicInferenceEvent.serialize")
+        nvtx_range_push("DynamicInferenceEvent.serialize")
         # do not use asdict(self) - it has very high CPU overheads
         # and if there are tensors, it will try to deepcopy them
         obj = self.__dict__.copy()
@@ -244,7 +323,7 @@ class DynamicInferenceEvent:
 
                 obj["payload"] = ContextErrorFactory.serialize(self.payload)
 
-        torch.cuda.nvtx.range_pop()
+        nvtx_range_pop("DynamicInferenceEvent.serialize")
         return obj
 
     @classmethod
@@ -287,17 +366,45 @@ class DynamicInferenceRequest(InferenceRequest):
     prompt_tokens: Optional[torch.Tensor] = None
     # remaining prompt tokens are used for chunked prefill
     remaining_prompt_tokens: Optional[torch.Tensor] = None
+    policy_epoch: Optional[list[tuple[int, int]]] = None
+    kv_cache_epoch: Optional[list[tuple[int, int]]] = None
     latency: Optional[float] = None
-    # routing_indices stores MoE routing decisions for all tokens generated so far.
-    # Shape: [total_tokens, num_layers, topk] - accumulated across all generation steps
-    routing_indices: Optional[torch.Tensor] = None
+    # routing_indices is reconstructed from per-block storage when a request finishes.
+    routing_indices: Optional[np.ndarray] = None
     finished_chunk_token_count: int = 0
     stop_word_ids: Optional[List[List[int]]] = None  # Tokenized stop words (populated internally)
+
+    # Prefix caching fields
+    block_size_tokens: Optional[int] = None  # Block size for hash computation
+    enable_prefix_caching: bool = False  # Whether prefix caching is enabled
+
+    # Computed field - not passed by caller
+    precomputed_block_hashes: List[int] = field(default_factory=list)
 
     def __post_init__(self):
         self.sampling_params = copy.deepcopy(self.sampling_params)
         if self.prompt_tokens is not None:
-            self.remaining_prompt_tokens = copy.deepcopy(self.prompt_tokens)
+            self.remaining_prompt_tokens = self.prompt_tokens
+
+        # Compute block hashes for prefix matching (skip if already provided, e.g. from `merge`).
+        if (
+            self.enable_prefix_caching
+            and self.block_size_tokens is not None
+            and self.prompt_tokens is not None
+            and not self.precomputed_block_hashes
+        ):
+            self._compute_block_hashes()
+
+    def _compute_block_hashes(self) -> None:
+        """Compute hashes for all complete blocks in the prompt.
+
+        After this call:
+        - precomputed_block_hashes is [] if prompt < block_size (no complete blocks)
+        - precomputed_block_hashes is [hash1, ...] for N complete blocks
+        """
+        self.precomputed_block_hashes = compute_block_hashes_batched(
+            self.prompt_tokens, self.block_size_tokens
+        )
 
     @property
     def remaining_prompt_length(self):
@@ -329,12 +436,12 @@ class DynamicInferenceRequest(InferenceRequest):
             (dict) A dictionary representation of the instance suitable for
                 serialization.
         """
-        torch.cuda.nvtx.range_push("DynamicInferenceRequest.serialize")
+        nvtx_range_push("DynamicInferenceRequest.serialize")
         obj = super().serialize()
         obj["events"] = [e.serialize() for e in self.events]
         obj.pop("event_add_engine", None)
 
-        # Sanity check routing_indices: Tensor [total_tokens - 1, num_layers, topk]
+        # Sanity check routing_indices: ndarray [total_tokens - 1, num_layers, topk]
         if self.routing_indices is not None:
             total_tokens = len(self.prompt_tokens) + len(self.generated_tokens)
             # the last generated token does not undergo a forward pass
@@ -344,7 +451,7 @@ class DynamicInferenceRequest(InferenceRequest):
                 f"total tokens {total_tokens-1}."
             )
 
-        torch.cuda.nvtx.range_pop()
+        nvtx_range_pop("DynamicInferenceRequest.serialize")
         return obj
 
     def _post_deserialize(self, obj):
@@ -369,26 +476,25 @@ class DynamicInferenceRequest(InferenceRequest):
                     "in its sampling_params. Defaulting to -1."
                 )
             sp.termination_id = -1
-        return [getattr(sp, field) for field, _, _ in self.get_metadata_types()]
+        return [getattr(sp, field) for field, _ in self.get_metadata_types()]
 
     @staticmethod
-    def get_metadata_types() -> List[Tuple[str, torch.dtype, bool]]:
-        """Keeps track of all request metadata names, dtypes, and target device.
+    def get_metadata_types() -> List[Tuple[str, torch.dtype]]:
+        """Keeps track of all request metadata names and dtypes.
 
         Returns:
-            List[Tuple[str, torch.dtype, bool]]: Mapping from metadata name to:
+            List[Tuple[str, torch.dtype]]: Mapping from metadata name to:
                 name (str) - The name of the metadata field.
                 dtype (torch.dtype) - The datatype of the metadata.
-                on_device (bool) - Whether the metadata lives on GPU (True) or CPU (False).
         """
         return [
-            ("temperature", torch.float32, False),  # CPU for torch sampling
-            ("top_k", torch.int32, False),  # CPU for torch sampling
-            ("top_p", torch.float32, False),  # CPU for torch sampling
-            ("termination_id", torch.int64, True),
-            ("return_log_probs", torch.bool, False),  # CPU for non-selective logprobs
-            ("skip_prompt_log_probs", torch.bool, False),  # CPU for non-selective logprobs
-            ("top_n_logprobs", torch.int32, False),  # CPU for torch sampling
+            ("temperature", torch.float32),
+            ("top_k", torch.int32),
+            ("top_p", torch.float32),
+            ("termination_id", torch.int64),
+            ("return_log_probs", torch.bool),
+            ("skip_prompt_log_probs", torch.bool),
+            ("top_n_logprobs", torch.int32),
         ]
 
     def add_event(
@@ -408,13 +514,41 @@ class DynamicInferenceRequest(InferenceRequest):
         """Add 'add_context' event - called when request is added to context for prefill."""
         return self.add_event(DynamicInferenceEventType.ADD_CONTEXT)
 
-    def add_event_generated_token(self, token: int):
+    def add_event_generated_token(
+        self,
+        token: int,
+        blocks_total: Optional[int] = None,
+        blocks_hashed_total: Optional[int] = None,
+        blocks_hashed_active: Optional[int] = None,
+        blocks_ref_count: Optional[int] = None,
+        pre_fwd_active_token_count: Optional[int] = None,
+        pre_fwd_step_count: Optional[int] = None,
+    ):
         """Add 'generated_token' event - records each generated token.
 
         Args:
             token (int): The token ID that was generated.
+            blocks_total (int): Total block capacity from allocator.
+            blocks_hashed_total (int): All allocated (hashed) blocks.
+            blocks_hashed_active (int): Blocks with ref_count > 0.
+            blocks_ref_count (int): Sum of block ref counts from allocator.
+            pre_fwd_active_token_count (int): Active token count before forward pass.
+            pre_fwd_step_count (int): Step count before forward pass.
         """
-        return self.add_event(DynamicInferenceEventType.GENERATED_TOKEN, {"token_id": token})
+        payload = {"token_id": token}
+        if blocks_total is not None:
+            payload["blocks_total"] = blocks_total
+        if blocks_hashed_total is not None:
+            payload["blocks_hashed_total"] = blocks_hashed_total
+        if blocks_hashed_active is not None:
+            payload["blocks_hashed_active"] = blocks_hashed_active
+        if blocks_ref_count is not None:
+            payload["blocks_ref_count"] = blocks_ref_count
+        if pre_fwd_active_token_count is not None:
+            payload["pre_fwd_active_token_count"] = pre_fwd_active_token_count
+        if pre_fwd_step_count is not None:
+            payload["pre_fwd_step_count"] = pre_fwd_step_count
+        return self.add_event(DynamicInferenceEventType.GENERATED_TOKEN, payload)
 
     def add_event_pause(self):
         """Add 'pause' event."""
@@ -501,6 +635,13 @@ class DynamicInferenceRequestRecord:
 
         old_request = self[-1]
 
+        # Carry forward policy_epoch as-is.
+        policy_epoch = old_request.policy_epoch
+
+        # Reset kv_cache_epoch to None: the KV cache is recomputed fresh after checkpoint;
+        # the engine's stamping logic will initialize a new stamp record with the recompute epoch.
+        kv_cache_epoch = None
+
         # New prompt (concatenate prompt + generated tokens).
         new_prompt_tokens = torch.cat(
             (
@@ -530,6 +671,8 @@ class DynamicInferenceRequestRecord:
             request_id=old_request.request_id,
             prompt_tokens=new_prompt_tokens,
             sampling_params=new_sampling_params,
+            policy_epoch=policy_epoch,
+            kv_cache_epoch=kv_cache_epoch,
         )
         # Preserve event_add_engine from old request if it exists, otherwise set it.
         # This ensures TTFT calculation works correctly for evicted/resumed requests.
@@ -558,13 +701,17 @@ class DynamicInferenceRequestRecord:
         prompt_tokens = self.requests[0].prompt_tokens
         prompt_text = self.requests[0].prompt
         routing_indices = None
-        if self.requests[0].routing_indices is not None:
-            routing_indices = torch.cat([r.routing_indices for r in self.requests])
+        routing_parts = [r.routing_indices for r in self.requests if r.routing_indices is not None]
+        if routing_parts:
+            routing_indices = np.concatenate(routing_parts)
         generated_tokens = merge_lists("generated_tokens")
         try:
             generated_text = "".join(r.generated_text for r in self.requests)
         except TypeError as e:  # generally means r.generated_text is None
             generated_text = None
+
+        policy_epoch = self.requests[-1].policy_epoch
+        kv_cache_epoch = self.requests[-1].kv_cache_epoch
 
         # Merged request.
         request = DynamicInferenceRequest(
@@ -579,12 +726,17 @@ class DynamicInferenceRequestRecord:
             generated_log_probs=merge_lists("generated_log_probs"),
             generated_top_n_logprobs=merge_lists("generated_top_n_logprobs"),
             sampling_params=self.requests[0].sampling_params,
+            policy_epoch=policy_epoch,
+            kv_cache_epoch=kv_cache_epoch,
             ttft=self.requests[0].ttft,
             tpot=merge_lists("tpot"),
             status=self.requests[-1].status,
             latency=self.latency,
             events=merge_lists("events"),
             routing_indices=routing_indices,
+            block_size_tokens=self.requests[0].block_size_tokens,
+            enable_prefix_caching=self.requests[0].enable_prefix_caching,
+            precomputed_block_hashes=self.requests[0].precomputed_block_hashes,
         )
 
         return request
@@ -596,10 +748,10 @@ class DynamicInferenceRequestRecord:
             (dict) A dictionary representation of the instance suitable for
                 serialization.
         """
-        torch.cuda.nvtx.range_push("DynamicInferenceRequestRecord.serialize")
+        nvtx_range_push("DynamicInferenceRequestRecord.serialize")
         obj = self.__dict__.copy()  # shallow dict copy
         obj["requests"] = [r.serialize() for r in obj["requests"]]
-        torch.cuda.nvtx.range_pop()
+        nvtx_range_pop("DynamicInferenceRequestRecord.serialize")
         return obj
 
     @classmethod

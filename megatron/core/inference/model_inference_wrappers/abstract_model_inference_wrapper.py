@@ -62,7 +62,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
         self.pp_group = pg_collection.pp
         self.tp_size = torch.distributed.get_world_size(self.tp_group)
 
-        if self.config.fp8 is not None:
+        if self.config.fp8 is not None and self.config.transformer_impl != "inference_optimized":
             self.model = prepare_model_for_fp8_inference(self.model)
 
         # TODO(ksanthanam): Add support for fp4
@@ -125,23 +125,6 @@ class AbstractModelInferenceWrapper(abc.ABC):
             inference_context=self.inference_context,
             runtime_gather_output=True,  # Inference should always gather the logits
         )
-
-    @torch.no_grad()
-    def dummy_forward(self):
-        """Run a dummy forward pass through the model, with a single token.
-        Use-case: Used in EP on ranks which do not have any work, but are needed
-        for the all-to-all communication."""
-        # we use num_dummy_tokens equal to tensor model parallel size
-        # so that the dummy forward pass will work with sequence parallel
-        num_dummy_tokens = self.tp_size
-        tokens = torch.zeros(
-            (1, num_dummy_tokens), dtype=torch.long, device=torch.cuda.current_device()
-        )
-        position_ids = torch.zeros(
-            (1, num_dummy_tokens), dtype=torch.long, device=torch.cuda.current_device()
-        )
-        attention_mask = None
-        return self.model(tokens, position_ids, attention_mask)
 
     def _get_batch_size_and_seq_len(
         self, tokens: torch.Tensor, recv_buffer_seq_len: Optional[int] = None

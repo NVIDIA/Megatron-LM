@@ -6,6 +6,10 @@ Double buffer management for NVSHMEM symmetric memory.
 Manages send and receive buffers with double-buffering for pipelined communication.
 """
 
+from ..compat import ensure_nvshmem_compat
+
+ensure_nvshmem_compat()
+
 try:
     import nvshmem.core.interop.torch
 

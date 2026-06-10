@@ -14,11 +14,16 @@ import torch
 import megatron.core.utils as util
 import megatron.training.utils as training_util
 from megatron.core import config
+from megatron.core._rank_utils import safe_get_world_size
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_layer_with_transformer_engine_submodules,
+)
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
+from megatron.core.transformer.spec_utils import get_submodules
+from megatron.training.utils.common_utils import get_local_rank_preinit
 from tests.unit_tests.test_utilities import Utils
 
 success_string = "hello,world"
@@ -161,17 +166,19 @@ def test_nvtx_decorator():
     # Track function execution
     execution_tracker = {'decorated': False, 'decorated_with_message': False}
 
-    # Create decorated functions
+    # Decorate while NVTX is disabled (the common import-time scenario).
+    # The _nvtx_enabled flag must be checked at call time, not decoration time.
+    util.configure_nvtx_profiling(False)
+
     @util.nvtx_decorator()
     def nvtx_decorated_function():
         execution_tracker['decorated'] = True
 
-    @util.nvtx_decorator(message="test_nvtx_decorator", color="red")
+    @util.nvtx_decorator(message="test_nvtx_decorator")
     def nvtx_decorated_function_with_message():
         execution_tracker['decorated_with_message'] = True
 
-    # Test with NVTX disabled
-    util.configure_nvtx_profiling(False)
+    # Call with NVTX disabled — should still execute the wrapped function
     nvtx_decorated_function()
     nvtx_decorated_function_with_message()
     assert all(execution_tracker.values())
@@ -179,8 +186,17 @@ def test_nvtx_decorator():
     # Reset tracker
     execution_tracker = {'decorated': False, 'decorated_with_message': False}
 
-    # Test with NVTX enabled
+    # Enable NVTX *after* decoration — should pick up the new flag value
     util.configure_nvtx_profiling(True)
+    nvtx_decorated_function()
+    nvtx_decorated_function_with_message()
+    assert all(execution_tracker.values())
+
+    # Reset tracker
+    execution_tracker = {'decorated': False, 'decorated_with_message': False}
+
+    # Disable NVTX again — should respect the toggled flag
+    util.configure_nvtx_profiling(False)
     nvtx_decorated_function()
     nvtx_decorated_function_with_message()
     assert all(execution_tracker.values())
@@ -313,12 +329,11 @@ def test_param_norm_moe(use_distributed_optimizer: bool):
         add_bias_linear=False,
         bf16=True,
     )
-    transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-        num_experts=2, moe_grouped_gemm=True
+    submodules = get_submodules(
+        get_gpt_layer_with_transformer_engine_submodules(num_experts=2, moe_grouped_gemm=True).mlp
     )
-    model = MoELayer(transformer_config, transformer_layer_spec.submodules.mlp.submodules).to(
-        device='cuda'
-    )
+    assert isinstance(submodules, MoESubmodules)
+    model = MoELayer(transformer_config, submodules).to(device='cuda')
     model.requires_grad_(True)
     # Initialize the model with all 1.0 for weights.
     for param in model.parameters():
@@ -457,3 +472,74 @@ def test_straggler_detector():
     util.StragglerDetector._configured = False
     # Teardown.
     _deinit_distributed()
+
+
+class TestGetWorldSizeSafe:
+    """Test get_world_size_safe function."""
+
+    @patch("torch.distributed.is_initialized")
+    @patch("torch.distributed.get_world_size")
+    def test_initialized_torch_distributed(self, mock_get_world_size, mock_is_initialized):
+        """Test get_world_size_safe when torch.distributed is initialized."""
+        mock_is_initialized.return_value = True
+        mock_get_world_size.return_value = 4
+
+        result = safe_get_world_size()
+
+        assert result == 4
+        mock_is_initialized.assert_called_once()
+        mock_get_world_size.assert_called_once()
+
+    @patch("torch.distributed.is_initialized")
+    @patch.dict(os.environ, {"WORLD_SIZE": "8"})
+    def test_uninitialized_torch_distributed_with_env_var(self, mock_is_initialized):
+        """Test get_world_size_safe when torch.distributed is not initialized but WORLD_SIZE env var exists."""
+        mock_is_initialized.return_value = False
+
+        result = safe_get_world_size()
+
+        assert result == 8
+        mock_is_initialized.assert_called_once()
+
+    @patch("torch.distributed.is_initialized")
+    @patch.dict(os.environ, {}, clear=True)
+    def test_uninitialized_torch_distributed_no_env_var(self, mock_is_initialized):
+        """Test get_world_size_safe when torch.distributed is not initialized and no WORLD_SIZE env var."""
+        mock_is_initialized.return_value = False
+
+        result = safe_get_world_size()
+
+        assert result == 1
+        mock_is_initialized.assert_called_once()
+
+    @patch("torch.distributed.is_initialized")
+    @patch.dict(os.environ, {"WORLD_SIZE": "invalid"})
+    def test_invalid_world_size_env_var(self, mock_is_initialized):
+        """Test get_world_size_safe with invalid WORLD_SIZE environment variable."""
+        mock_is_initialized.return_value = False
+
+        with pytest.raises(ValueError):
+            safe_get_world_size()
+
+
+class TestGetLocalRankPreinit:
+    """Test get_local_rank_preinit function."""
+
+    @patch.dict(os.environ, {"LOCAL_RANK": "3"}, clear=True)
+    def test_uses_local_rank_env_var(self):
+        assert get_local_rank_preinit() == 3
+
+    @patch.dict(
+        os.environ, {"LOCAL_RANK": "2", "SLURM_NTASKS": "8", "SLURM_LOCALID": "5"}, clear=True
+    )
+    def test_local_rank_takes_precedence_over_slurm(self):
+        assert get_local_rank_preinit() == 2
+
+    @patch.dict(os.environ, {"SLURM_NTASKS": "8", "SLURM_LOCALID": "6"}, clear=True)
+    def test_falls_back_to_slurm_localid(self):
+        assert get_local_rank_preinit() == 6
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_defaults_to_zero_with_warning(self):
+        with pytest.warns(UserWarning, match="Could not determine local rank"):
+            assert get_local_rank_preinit() == 0

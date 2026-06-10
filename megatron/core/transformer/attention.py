@@ -11,7 +11,9 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.jit import jit_fuser
 from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
@@ -33,8 +35,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.transformer.torch_norm import LayerNormBuilder
+from megatron.core.transformer.torch_norm import L2Norm, LayerNormBuilder
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     deprecate_inference_params,
@@ -51,7 +52,7 @@ from megatron.core.utils import (
 from ..models.common.embeddings.yarn_rotary_pos_embedding import (
     _yarn_get_concentration_factor_from_config,
 )
-from .enums import AttnMaskType, CudaGraphScope
+from .enums import AttnMaskType
 from .transformer_config import TransformerConfig
 
 try:
@@ -81,6 +82,13 @@ if not HAVE_FA3:
         pass
 
 try:
+    from flash_attn.cute import flash_attn_varlen_func as flash_attn4_varlen_func
+
+    HAVE_FA4 = True
+except ImportError:
+    HAVE_FA4 = False
+
+try:
     from flash_mla import flash_mla_with_kvcache, get_mla_metadata
 
     HAVE_FMLA = True
@@ -97,18 +105,15 @@ except:
     flash_attn_varlen_func = None
     flash_attn_with_kvcache = None
 
-try:
-    import transformer_engine  # pylint: disable=unused-import
-
-    HAVE_TE = True
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
         SplitAlongDim,
         TELinear,
+        TENorm,
         set_save_original_input,
     )
-except ImportError:
-    HAVE_TE = False
-    SplitAlongDim, TELinear, set_save_original_input = None, None, None
+else:
+    SplitAlongDim, TELinear, TENorm, set_save_original_input = None, None, None, None
 
 try:
     from transformer_engine.pytorch.attention.rope import apply_fused_qkv_rotary_pos_emb
@@ -118,8 +123,8 @@ except ImportError:
     HAVE_FUSED_QKV_ROPE = False
 
 
-class LinearQkv(Protocol):
-    """Protocol for linear_qkv modules."""
+class LinearQkvInterface(Protocol):
+    """Interface for linear_qkv modules."""
 
     def forward(self, input: Tensor, /) -> tuple[Tensor, object]:
         """Applies linear_qkv."""
@@ -147,13 +152,13 @@ class LinearQkvBuilder(Protocol):
         is_expert: bool,
         tp_comm_buffer_name: str,
         tp_group: torch.distributed.ProcessGroup | None = None,
-    ) -> LinearQkv: ...
+    ) -> LinearQkvInterface: ...
 
 
-class LinearLayer(Protocol):
-    """Protocol for linear_q and linear_kv modules."""
+class LinearInterface(Protocol):
+    """Interface for linear_q and linear_kv modules."""
 
-    def forward(self, input: Tensor, /) -> Tuple[Tensor, object]:
+    def forward(self, input: Tensor, /) -> tuple[Tensor, object]:
         """Applies linear_q/linear_kv."""
         ...
 
@@ -173,23 +178,23 @@ class LinearLayerBuilder(Protocol):
         bias: bool,
         skip_bias_add: bool,
         is_expert: bool,
-    ) -> LinearLayer: ...
+    ) -> LinearInterface: ...
 
 
-class CoreAttention(Protocol):
-    """Protocol for core_attention modules."""
+class CoreAttentionInterface(Protocol):
+    """Interface for core_attention modules."""
 
     def forward(
         self,
         query: Tensor,
         key: Tensor,
         value: Tensor,
-        attention_mask: Optional[Tensor],
+        attention_mask: Tensor | None,
         /,
         *,
         attn_mask_type: AttnMaskType,
-        attention_bias: Optional[Tensor],
-        packed_seq_params: Optional[PackedSeqParams],
+        attention_bias: Tensor | None,
+        packed_seq_params: PackedSeqParams | None,
     ) -> Tensor:
         """Applies dot product attention."""
         ...
@@ -205,10 +210,42 @@ class CoreAttentionBuilder(Protocol):
         layer_number: int,
         attn_mask_type: AttnMaskType,
         attention_type: str,
-        cp_comm_type: Optional[str],
-        softmax_scale: Optional[float],
-        pg_collection: Optional[ProcessGroupCollection],
-    ) -> CoreAttention: ...
+        cp_comm_type: str | None,
+        softmax_scale: float | None,
+        pg_collection: ProcessGroupCollection | None,
+    ) -> CoreAttentionInterface: ...
+
+
+class LinearProjInterface(Protocol):
+    """Interface for linear_proj modules."""
+
+    def forward(self, hidden_states: Tensor, /) -> tuple[Tensor, Tensor | None]:
+        """Applies the linear projection to the output of the core attention."""
+        ...
+
+    def backward_dw(self) -> None:
+        """Computes weight gradients of output projection layer."""
+        ...
+
+
+class LinearProjBuilder(Protocol):
+    """Protocol for building linear_proj layers."""
+
+    def __call__(
+        self,
+        query_projection_size: int,
+        hidden_size: int,
+        /,
+        *,
+        config: TransformerConfig,
+        init_method: Callable[[torch.Tensor], None],
+        bias: bool,
+        input_is_parallel: bool,
+        skip_bias_add: bool,
+        is_expert: bool,
+        tp_comm_buffer_name: str,
+        tp_group: torch.distributed.ProcessGroup | None,
+    ) -> LinearProjInterface: ...
 
 
 @dataclass
@@ -219,7 +256,7 @@ class SelfAttentionSubmodules:
 
     linear_qkv: LinearQkvBuilder
     core_attention: CoreAttentionBuilder
-    linear_proj: Union[ModuleSpec, type] = None
+    linear_proj: LinearProjBuilder
     q_layernorm: LayerNormBuilder | None = None
     k_layernorm: LayerNormBuilder | None = None
 
@@ -233,7 +270,7 @@ class CrossAttentionSubmodules:
     linear_q: LinearLayerBuilder
     linear_kv: LinearLayerBuilder
     core_attention: CoreAttentionBuilder
-    linear_proj: Union[ModuleSpec, type] = None
+    linear_proj: LinearProjBuilder
 
 
 class Attention(MegatronModule, ABC):
@@ -252,11 +289,18 @@ class Attention(MegatronModule, ABC):
         attention_type: str,
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
+        pp_layer_offset: Optional[int] = None,
+        name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         super().__init__(config=config)
 
         self.config = config
         self.layer_number = layer_number
+        self._pp_layer_offset = pp_layer_offset
 
         self.attn_mask_type = attn_mask_type
         self.attention_type = attention_type
@@ -347,18 +391,18 @@ class Attention(MegatronModule, ABC):
         )
 
         # Output.
-        self.linear_proj = build_module(
-            submodules.linear_proj,
+        self.linear_proj = submodules.linear_proj(
             self.query_projection_size,
             self.config.hidden_size,
             config=self.config,
-            init_method=self.config.output_layer_init_method,
+            init_method=not_none(self.config.output_layer_init_method),
             bias=self.config.add_bias_linear,
             input_is_parallel=True,
             skip_bias_add=True,
             is_expert=False,
             tp_comm_buffer_name='proj',
             tp_group=self.pg_collection.tp,
+            name=(name + ".linear_proj") if name is not None else None,
         )
 
         if (
@@ -399,7 +443,7 @@ class Attention(MegatronModule, ABC):
             attention_mask = inputs[3]
             attn_mask_type = inputs[5]
             attn_mask_type = AttnMaskType(attn_mask_type.item())
-            output_ = apply_module(self.core_attention)(
+            output_ = self._run_core_attention(
                 query,
                 key,
                 value,
@@ -419,6 +463,29 @@ class Attention(MegatronModule, ABC):
 
         return hidden_states
 
+    def _run_core_attention(
+        self,
+        query,
+        key,
+        value,
+        attention_mask,
+        attn_mask_type=None,
+        attention_bias=None,
+        packed_seq_params=None,
+        **extra_kwargs,
+    ):
+        """Run the configured core attention module."""
+        return apply_module(self.core_attention)(
+            query,
+            key,
+            value,
+            attention_mask,
+            attn_mask_type=attn_mask_type,
+            attention_bias=attention_bias,
+            packed_seq_params=packed_seq_params,
+            **extra_kwargs,
+        )
+
     def _allocate_memory(self, inference_max_sequence_length, batch_size, dim, dtype):
         """Allocate memory to store kv cache during inference."""
 
@@ -432,7 +499,16 @@ class Attention(MegatronModule, ABC):
         )
 
     def _get_pp_layer_offset_for_inference(self):
-        """Return the pipeline parallel layer offset for inference."""
+        """Return the pipeline parallel layer offset for inference.
+
+        When pp_layer_offset was explicitly provided (e.g. by MambaBlock for
+        hybrid models using --hybrid-layer-pattern with fVPP), use that value
+        directly.  Otherwise fall back to the standard computation which assumes
+        uniform layer distribution across pipeline stages.
+        """
+        if self._pp_layer_offset is not None:
+            return self._pp_layer_offset
+
         assert (
             self.config.virtual_pipeline_model_parallel_size is None
         ), "Virtual pipeline parallelism is not supported for inference"
@@ -608,8 +684,10 @@ class Attention(MegatronModule, ABC):
                 self.layer_number - pp_layer_offset, key, value
             )
 
-            _, max_seqlen_q = inference_context.cu_query_lengths()
-            if getattr(self.config, "cache_mla_latents", None) and max_seqlen_q > 1:
+            if (
+                getattr(self.config, "cache_mla_latents", None)
+                and not inference_context.is_decode_only()
+            ):
                 # Doing unabsorbed MLA Attention with cached mla latents (prefill/mixed mode)
                 kv_cache, _, block_table = inference_context.key_value_cache(
                     self.layer_number - pp_layer_offset
@@ -794,7 +872,21 @@ class Attention(MegatronModule, ABC):
                 softmax_scale = self.softmax_scale
             else:
                 softmax_scale = q.shape[-1] ** -0.5
-            if HAVE_FA3:
+            if HAVE_FA4:
+                output_total, _ = flash_attn4_varlen_func(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens_q=cu_seqlens_q,
+                    max_seqlen_q=max_seqlen_q,
+                    max_seqlen_k=max_seqlen_k,
+                    seqused_k=seqlens_k,
+                    page_table=block_table,
+                    softmax_scale=softmax_scale,
+                    causal=True,
+                    num_splits=1,
+                )
+            elif HAVE_FA3:
                 # TODO(ksanthanam): Replace with call to flash_attn_varlen_func once
                 # it accepts block_table
                 output_total = self._flash_attention_3_forward_wrapper(
@@ -826,12 +918,21 @@ class Attention(MegatronModule, ABC):
                 )
             output_total = output_total.unsqueeze(1)
         else:  # decode only
+            # For speculative decoding, q arrives as (B*S, 1, H, D) where S is
+            # the number of tokens per request. Reshape to (B, S, H, D) so the
+            # decode kernel sees batch=num_requests and seqlen_q=tokens_per_request.
+            num_requests = seqlens_k.shape[0]
+            tokens_per_request = q.shape[0] // num_requests
+            q = q.reshape(num_requests, tokens_per_request, q.shape[2], q.shape[3])
+
             # If using MLA we use the FlashMLA kernel
-            if isinstance(self.config, MLATransformerConfig):
+            # The `softmax_scale` attribute check is to find out whether this is an MLA layer or
+            # standard Attention.
+            if isinstance(self.config, MLATransformerConfig) and hasattr(self, "softmax_scale"):
                 softmax_scale = self.softmax_scale
 
                 num_heads_k = 1  # Only a single head for MLA Flash
-                seq_len_q = 1  # Sequence length is 1 for decode
+                seq_len_q = tokens_per_request
                 num_heads_q = self.num_attention_heads_per_partition
                 num_heads_per_head_k = seq_len_q * num_heads_q // num_heads_k
 
@@ -855,22 +956,53 @@ class Attention(MegatronModule, ABC):
                     causal=True,
                 )
             else:
-                flash_attn_args = {
-                    "q": q,
-                    "k_cache": k,
-                    "v_cache": v,
-                    "cache_seqlens": seqlens_k,
-                    "causal": True,
-                    "page_table" if HAVE_FA3 else "block_table": block_table,
-                    "num_splits": 0 if not self.batch_invariant_mode else 1,
-                }
-                if HAVE_FA3:
-                    output_total = flash_attn3_with_kvcache(**flash_attn_args)
+                if HAVE_FA4:
+                    if getattr(self, "softmax_scale", None) is not None:
+                        softmax_scale = self.softmax_scale
+                    else:
+                        softmax_scale = q.shape[-1] ** -0.5
+                    # Reshape q from (B, S, H, D) to (B*S, H, D) for varlen interface
+                    q_varlen = q.reshape(-1, q.shape[-2], q.shape[-1])
+                    output_total, _ = flash_attn4_varlen_func(
+                        q_varlen,
+                        k,
+                        v,
+                        cu_seqlens_q=cu_seqlens_q,
+                        max_seqlen_q=tokens_per_request,
+                        max_seqlen_k=max_seqlen_k,
+                        seqused_k=seqlens_k,
+                        page_table=block_table,
+                        softmax_scale=softmax_scale,
+                        causal=True,
+                        num_splits=1,
+                    )
+                    # Reshape back to (B, S, H, D)
+                    output_total = output_total.reshape(
+                        num_requests, tokens_per_request, *output_total.shape[1:]
+                    )
                 else:
-                    assert (
-                        not self.batch_invariant_mode
-                    ), "Batch invariant mode is not supported for flash attention 2"
-                    output_total = flash_attn_with_kvcache(**flash_attn_args)
+                    flash_attn_args = {
+                        "q": q,
+                        "k_cache": k,
+                        "v_cache": v,
+                        "cache_seqlens": seqlens_k,
+                        "causal": True,
+                        "page_table" if HAVE_FA3 else "block_table": block_table,
+                        "num_splits": 0 if not self.batch_invariant_mode else 1,
+                    }
+                    if HAVE_FA3:
+                        output_total = flash_attn3_with_kvcache(**flash_attn_args)
+                    else:
+                        assert (
+                            not self.batch_invariant_mode
+                        ), "Batch invariant mode is not supported for flash attention 2"
+                        output_total = flash_attn_with_kvcache(**flash_attn_args)
+
+            # Reshape back to (B*S, 1, H, D) for consistent output shape.
+            output_total = output_total.reshape(
+                num_requests * tokens_per_request, 1, *output_total.shape[2:]
+            )
+
         return output_total
 
     def forward(
@@ -888,7 +1020,7 @@ class Attention(MegatronModule, ABC):
         sequence_len_offset: Optional[int] = None,
         *,
         inference_params: Optional[BaseInferenceContext] = None,
-    ) -> tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor | None]:
         """
         Perform a forward pass through the attention module.
 
@@ -924,18 +1056,20 @@ class Attention(MegatronModule, ABC):
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         if inference_context and inference_context.is_dynamic_batching():
-            assert HAVE_FA3 or is_fa_min_version(
-                "2.7.3"
+            assert (
+                HAVE_FA4 or HAVE_FA3 or is_fa_min_version("2.7.3")
             ), "flash attn verion v2.7.3 and above is required for dynamic batching."
 
         # hidden_states: [sq, b, h]
-        is_inference_mode = inference_context is not None and not self.training
+        is_inference_mode = InferenceMode.is_active()
         # is_using_flash_decode - True is we are using the static inference engine with flash decode
         is_using_flash_decode = is_inference_mode and self.config.flash_decode
         # is_using_flashinfer_rope - True if we are using the dynamic inference engine
         # with flashinfer fused rope
-        is_using_flashinfer_rope = is_inference_mode and (
-            not inference_context.is_static_batching()
+        is_using_flashinfer_rope = (
+            is_inference_mode
+            and inference_context is not None
+            and not inference_context.is_static_batching()
             and inference_context.use_flashinfer_fused_rope
         )
         if is_using_flash_decode or is_using_flashinfer_rope:
@@ -1013,7 +1147,7 @@ class Attention(MegatronModule, ABC):
         in_decode_mode = (
             inference_context is not None
             and inference_context.is_decode_only()
-            and not self.training
+            and InferenceMode.is_active()
         )
 
         # This branch only runs in the decode phase of flash decoding and returns after the linear
@@ -1038,13 +1172,12 @@ class Attention(MegatronModule, ABC):
             )
             out = output.transpose(0, 1).contiguous()
             context_layer = out.view(out.size(0), out.size(1), -1)
-            output, bias = self.linear_proj(context_layer)
+            output, bias = apply_module(self.linear_proj)(context_layer)
             return output, bias
 
         if (
             in_decode_mode
             and self.config.cuda_graph_impl == "local"
-            and CudaGraphScope.full_iteration not in self.config.cuda_graph_scope
             and inference_context.is_static_batching()
         ):
             raise ValueError(f"CUDA graphs must use flash decode with static batching!")
@@ -1206,7 +1339,7 @@ class Attention(MegatronModule, ABC):
         # =================
         nvtx_range_push(suffix="linear_proj")
         with off_interface(self.offload_attn_proj, core_attn_out, "attn_proj") as core_attn_out:
-            output, bias = self.linear_proj(core_attn_out)
+            output, bias = apply_module(self.linear_proj)(core_attn_out)
         if self.offload_attn_proj:
             output = off_interface.group_commit(
                 output, name="attn_proj", forced_released_tensors=[core_attn_out]
@@ -1251,7 +1384,13 @@ class SelfAttention(Attention):
         attn_mask_type: AttnMaskType = AttnMaskType.padding,
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
+        pp_layer_offset: Optional[int] = None,
+        name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         super().__init__(
             config=config,
             submodules=submodules,
@@ -1260,6 +1399,8 @@ class SelfAttention(Attention):
             attention_type="self",
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
+            pp_layer_offset=pp_layer_offset,
+            name=name,
         )
 
         self.linear_qkv_out_dim = self.query_projection_size + 2 * self.kv_projection_size
@@ -1276,25 +1417,54 @@ class SelfAttention(Attention):
             is_expert=False,
             tp_comm_buffer_name='qkv',
             tp_group=self.pg_collection.tp,
+            name=(name + ".linear_qkv") if name is not None else None,
         )
 
-        if submodules.q_layernorm is not None:
-            self.q_layernorm = submodules.q_layernorm(
-                hidden_size=self.hidden_size_per_attention_head,
-                config=self.config,
-                eps=self.config.layernorm_epsilon,
-            )
+        # Resolve which norm class to use for Q and K.
+        # Config selects the default norm class; spec overrides if set.
+        if self.config.qk_l2_norm:
+            q_norm_cls = submodules.q_layernorm or L2Norm
+            k_norm_cls = submodules.k_layernorm or L2Norm
+        elif self.config.qk_layernorm:
+            # TODO(yuzhongw, janpabloe): Support local backend.
+            q_norm_cls = submodules.q_layernorm or TENorm
+            k_norm_cls = submodules.k_layernorm or TENorm
+            if q_norm_cls is None or k_norm_cls is None:
+                raise ValueError(
+                    "qk_layernorm requires Transformer Engine (for TENorm) or "
+                    "q_layernorm/k_layernorm set in the spec."
+                )
         else:
-            self.q_layernorm = None
+            if submodules.q_layernorm not in (None, IdentityOp):
+                raise ValueError(
+                    f"spec sets q_layernorm={submodules.q_layernorm} but "
+                    "qk_layernorm/qk_l2_norm are disabled"
+                )
+            if submodules.k_layernorm not in (None, IdentityOp):
+                raise ValueError(
+                    f"spec sets k_layernorm={submodules.k_layernorm} but "
+                    "qk_layernorm/qk_l2_norm are disabled"
+                )
+            q_norm_cls = k_norm_cls = None
 
-        if submodules.k_layernorm is not None:
-            self.k_layernorm = submodules.k_layernorm(
+        self.q_layernorm = (
+            q_norm_cls(
                 hidden_size=self.hidden_size_per_attention_head,
                 config=self.config,
                 eps=self.config.layernorm_epsilon,
             )
-        else:
-            self.k_layernorm = None
+            if q_norm_cls is not None
+            else None
+        )
+        self.k_layernorm = (
+            k_norm_cls(
+                hidden_size=self.hidden_size_per_attention_head,
+                config=self.config,
+                eps=self.config.layernorm_epsilon,
+            )
+            if k_norm_cls is not None
+            else None
+        )
 
     def run_realtime_tests(self):
         """Performs a consistency check.
@@ -1407,8 +1577,10 @@ class SelfAttention(Attention):
             # 4. Further index into query to get only the q_heads that this rank is
             #    responsible for (e.g., q1).
             # The block of code below performs steps 1 and 2.
-            mixed_qkv = all_gather_last_dim_from_tensor_parallel_region(mixed_qkv)
-            idx = get_tensor_model_parallel_rank() // (
+            mixed_qkv = all_gather_last_dim_from_tensor_parallel_region(
+                mixed_qkv, group=self.pg_collection.tp
+            )
+            idx = get_pg_rank(self.pg_collection.tp) // (
                 self.world_size // self.config.num_query_groups
             )
             size = mixed_qkv.size()[-1] // self.config.num_query_groups
@@ -1465,7 +1637,7 @@ class SelfAttention(Attention):
             # query above corresponds to (num_q_heads / num_kv_heads) q_heads.
             # Index appropriately into query to get (num_q_heads / tp_size) q_heads.
             # This is step 4 in the list of steps above.
-            idx = get_tensor_model_parallel_rank() % (
+            idx = get_pg_rank(self.pg_collection.tp) % (
                 self.world_size // self.config.num_query_groups
             )
             size = self.num_attention_heads_per_partition // (
@@ -1485,6 +1657,14 @@ class SelfAttention(Attention):
         if output_gate:
             # Gate [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
             gate = gate.reshape(*gate.shape[:2], -1, self.hidden_size_per_attention_head)
+            if self.config.num_query_groups < self.world_size:
+                idx = get_tensor_model_parallel_rank() % (
+                    self.world_size // self.config.num_query_groups
+                )
+                size = self.num_attention_heads_per_partition // (
+                    self.world_size // self.config.num_query_groups
+                )
+                gate = gate[:, :, idx * size : (idx + 1) * size, :]
             return query, key, value, gate
 
         return query, key, value
@@ -1621,7 +1801,12 @@ class CrossAttention(Attention):
         attn_mask_type: AttnMaskType = AttnMaskType.padding,
         cp_comm_type: str | None = None,
         pg_collection: ProcessGroupCollection | None = None,
+        name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         super().__init__(
             config=config,
             submodules=submodules,
@@ -1630,6 +1815,7 @@ class CrossAttention(Attention):
             attention_type="cross",
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
+            name=name,
         )
 
         if self.config.num_query_groups != self.config.num_attention_heads:
@@ -1645,6 +1831,7 @@ class CrossAttention(Attention):
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
             is_expert=False,
+            name=(name + ".linear_q") if name is not None else None,
         )
 
         self.linear_kv = submodules.linear_kv(
@@ -1656,6 +1843,7 @@ class CrossAttention(Attention):
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
             is_expert=False,
+            name=(name + ".linear_kv") if name is not None else None,
         )
 
     def get_query_key_value_tensors(

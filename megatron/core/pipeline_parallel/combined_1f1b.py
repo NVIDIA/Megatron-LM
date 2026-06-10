@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
 from contextlib import nullcontext
@@ -6,13 +6,30 @@ from typing import List, Union
 
 import torch
 
+from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import find_megatron_fsdp
 from megatron.core.enums import Fp8Recipe
 from megatron.core.fp8_utils import get_fp8_context
-from megatron.core.pipeline_parallel.utils import AbstractSchedulePlan, ScheduleNode, set_streams
+from megatron.core.pipeline_parallel.utils import (
+    AbstractSchedulePlan,
+    ScheduleNode,
+    get_comp_stream,
+    set_streams,
+)
 from megatron.core.utils import get_attr_wrapped_model
 
 # Types
 Shape = Union[List[int], torch.Size]
+
+
+def _release_tensor_storage(tensors):
+    """Release tensor storage after all backward users are done."""
+    if tensors is None:
+        return
+
+    for tensor in tensors:
+        if isinstance(tensor, torch.Tensor) and tensor.is_cuda:
+            tensor.record_stream(torch.cuda.current_stream())
+            tensor.untyped_storage().resize_(0)
 
 
 def combined_1f1b_schedule_for_no_pipelining(
@@ -47,7 +64,15 @@ def combined_1f1b_schedule_for_no_pipelining(
     Phases 4: 4th microbatch backward
     """
 
-    set_streams()
+    set_streams(high_priority=config.high_priority_a2a_comm_stream)
+    fsdp_wrapper = find_megatron_fsdp(model)
+
+    if fsdp_wrapper is not None:
+        # The overlap schedule bypasses MegatronFSDP.forward(), which normally
+        # swaps distributed (optimizer-managed) parameters back to raw parameters.
+        # We must do this explicitly before the schedule accesses layers directly.
+        fsdp_wrapper._replace_param_with_raw_if_needed()
+
     # The forward step for the first microbatch is executed alone, no a2a overlapping
     output_tensor, num_tokens, _ = combined_forward_backward_step(
         forward_step_func,
@@ -88,6 +113,7 @@ def combined_1f1b_schedule_for_no_pipelining(
                 checkpoint_activations_microbatch=None,
                 is_first_microbatch=check_first_val_step((i + 1) == 0),
                 current_microbatch=(i + 1),
+                fsdp_wrapper=fsdp_wrapper,
             )
     total_num_tokens += num_tokens
     # The backward step for the last microbatch is executed alone, no a2a overlapping
@@ -104,6 +130,7 @@ def combined_1f1b_schedule_for_no_pipelining(
         output_tensor,  # b_output_tensor
         output_tensor_grad,  # b_output_tensor_grad
         config,
+        fsdp_wrapper=fsdp_wrapper,
     )
     return forward_data_store, total_num_tokens
 
@@ -173,7 +200,19 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
                 # backward_step_helper_postprocess()
     """
 
-    set_streams()
+    set_streams(high_priority=config.high_priority_a2a_comm_stream)
+
+    # Interleaved pipeline with FSDP(optim_grads_params) is not yet supported:
+    # _replace_param_with_raw_if_needed() and root pre/post_backward() are not
+    # handled for multi-chunk models in this path.
+    if isinstance(model, (list, tuple)):
+        for m in model:
+            assert find_megatron_fsdp(m) is None, (
+                "EP overlap 1F1B with FSDP is not supported for interleaved "
+                "pipeline parallelism (virtual_pipeline_model_parallel_size > 1). "
+                "Use pipeline_model_parallel_size=1 or disable FSDP."
+            )
+
     # forward prepare
     f_model_chunk_id = None
     f_microbatch_id = None
@@ -226,10 +265,15 @@ def combined_1f1b_schedule_for_interleaved_pipelining(
     if f_model_chunk_id is not None:
         forward_step_helper_postprocess(f_model_chunk_id, output_tensor, num_tokens)
     # backward post process
-    if b_model_chunk_id:
+    if b_model_chunk_id is not None:
         # The same as the backward_step_helper
         backward_step_helper_postprocess(b_virtual_microbatch_id)
-        if input_tensor is not None:
+        # Verify backward grad: if backward microbatch received activation from upstream
+        # (b_input_tensor is not None), input_tensor_grad must be produced.
+        # Note: the original assert used forward's input_tensor, which is incorrect when
+        # forward and backward are on different VP stages (backward has chunk reversal:
+        # model_chunk_id = num_chunks - id - 1), causing false failures in interleaved PP.
+        if b_input_tensor is not None:
             assert input_tensor_grad is not None
     return output_tensor, input_tensor_grad
 
@@ -256,6 +300,7 @@ def combined_forward_backward_step(
     is_first_microbatch=False,
     current_microbatch=None,
     encoder_decoder_xattn=False,
+    fsdp_wrapper=None,
 ):
     """Merged forward and backward step for combined 1f1b scheduler.
 
@@ -300,6 +345,9 @@ def combined_forward_backward_step(
     ), "checkpoint_activations_microbatch is not supported for overlap_moe_expert_parallel_comm"
 
     from .schedules import set_current_microbatch
+
+    if fsdp_wrapper is not None and b_model is not None:
+        fsdp_wrapper.pre_backward()
 
     if f_model is not None and config.timers is not None:
         config.timers('forward-compute', log_level=2).start()
@@ -346,9 +394,29 @@ def combined_forward_backward_step(
                 f_schedule_plan, AbstractSchedulePlan
             ), "first output of forward_step_func must be one instance of AbstractSchedulePlan"
 
+        # Wire per-layer FSDP parameter release callbacks.  The EP overlap
+        # schedule bypasses normal FSDP forward/backward hooks, so we release
+        # each layer's all-gathered parameters explicitly after its compute.
+        # Only needed for optim_grads_params strategy (where params are sharded).
+        forward_fsdp_wrapper = find_megatron_fsdp(f_model)
+        if (
+            forward_fsdp_wrapper is not None
+            and forward_fsdp_wrapper.ddp_config.data_parallel_sharding_strategy
+            == "optim_grads_params"
+        ):
+            for i in range(f_schedule_plan.num_layers()):
+                layer_plan = f_schedule_plan.get_layer(i)
+                # Validation workaround: disable per-layer forward reshard in EP-overlap
+                # schedule to avoid releasing weights before the matching backward consumes them.
+                layer_plan.set_fsdp_reshard_hooks(
+                    forward_fsdp_wrapper.post_forward_release_module,
+                    forward_fsdp_wrapper.post_backward_release_module,
+                )
+
     # backward preprocess, the same as the backward_step()
     unwrap_input_tensor_grad = False
     b_schedule_plan = None
+    loss_node_inputs_to_release = None
     if b_model is not None:
         # Retain the grad on the input_tensor.
         if not isinstance(b_input_tensor, list):
@@ -376,6 +444,8 @@ def combined_forward_backward_step(
             # Backward pass for loss function
             torch.autograd.backward(b_output_tensor[0], grad_tensors=b_output_tensor_grad[0])
             b_output_tensor_grad[0] = loss_node.get_grad()
+            loss_node_inputs_to_release = loss_node.inputs
+            loss_node._release_state()
 
     # If fp8_recipe is delayed, wrap the entire pass with get_fp8_context(),
     # otherwise do nothing extra at the outer level
@@ -398,6 +468,7 @@ def combined_forward_backward_step(
             post_forward=post_forward,
             post_backward=post_backward,
         )
+    _release_tensor_storage(loss_node_inputs_to_release)
 
     # forward post process
     num_tokens = None
@@ -405,7 +476,7 @@ def combined_forward_backward_step(
         from megatron.core.pipeline_parallel.schedules import forward_step_calc_loss
 
         loss_node = ScheduleNode(
-            loss_func, torch.cuda.current_stream(), f_schedule_plan.event, name="loss_func"
+            loss_func, get_comp_stream, f_schedule_plan.event, name="loss_func"
         )
         loss_func = loss_node.forward
         output_tensor, num_tokens = forward_step_calc_loss(
@@ -440,5 +511,8 @@ def combined_forward_backward_step(
 
         if unwrap_input_tensor_grad:
             input_tensor_grad = input_tensor_grad[0]
+
+    if fsdp_wrapper is not None and b_model is not None:
+        fsdp_wrapper.post_backward()
 
     return output_tensor, num_tokens, input_tensor_grad
