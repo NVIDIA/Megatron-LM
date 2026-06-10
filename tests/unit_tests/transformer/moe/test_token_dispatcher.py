@@ -1,6 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-import copy
 import dataclasses
 import math
 from types import SimpleNamespace
@@ -16,9 +15,10 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
-from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
 from megatron.core.transformer.moe.moe_utils import get_capacity
 from megatron.core.transformer.moe.token_dispatcher import MoETokenDispatcher
+from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
@@ -145,21 +145,23 @@ class MoEModelTestContainer:
             add_bias_linear=kwargs.get("add_bias_linear", False),
             moe_permute_fusion=kwargs.get("moe_permute_fusion", False),
             moe_flex_dispatcher_backend=kwargs.get("moe_flex_dispatcher_backend", None),
+            calculate_per_token_loss=kwargs.get("calculate_per_token_loss", False),
         )
 
         # init moe layer
         self.moe_layer = self.new_moe_layer()
 
     def new_moe_layer(self, **kargs):
-        submodules = get_gpt_layer_local_submodules(
-            num_experts=self.config.num_moe_experts, moe_grouped_gemm=self.config.moe_grouped_gemm
+        submodules = get_submodules(
+            get_gpt_layer_local_submodules(
+                num_experts=self.config.num_moe_experts,
+                moe_grouped_gemm=self.config.moe_grouped_gemm,
+            ).mlp
         )
+        assert isinstance(submodules, MoESubmodules)
         new_config = dataclasses.replace(self.config, **kargs)
-        moe_layer = (
-            MoELayer(new_config, submodules.mlp.submodules, layer_number=0)
-            .cuda()
-            .to(dtype=self.test_dtype)
-        )
+        moe_layer = MoELayer(new_config, submodules).cuda().to(dtype=self.test_dtype)
+        moe_layer.set_layer_number(0)
         return moe_layer
 
     def __del__(self):

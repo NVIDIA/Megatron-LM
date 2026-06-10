@@ -69,7 +69,9 @@ class DSv4HybridAttention(Attention):
         attention_type: str,
         cp_comm_type: Optional[str] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        pp_layer_offset: Optional[int] = None,
         is_mtp_layer: bool = False,
+        name: str | None = None,
     ) -> None:
 
         super().__init__(
@@ -79,7 +81,9 @@ class DSv4HybridAttention(Attention):
             attention_type=attention_type,
             attn_mask_type=attn_mask_type,
             pg_collection=pg_collection,
+            pp_layer_offset=pp_layer_offset,
             is_mtp_layer=is_mtp_layer,
+            name=name,
         )
         self.config: MLATransformerConfig
 
@@ -245,6 +249,15 @@ class DSv4HybridAttention(Attention):
             inference_context is None and inference_params is None
         ), "Inference is not supported for DSv4HybridAttention."
 
+        # Set the right cp group for dynamic-cp. Mirrors Attention.forward:
+        # both QKV RoPE and the post-attention inverse RoPE use
+        # self.pg_collection.cp, which must point at this microbatch's dynamic
+        # CP group. Restored before every return.
+        _orig_cp_group = self.pg_collection.cp
+        if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
+            assert packed_seq_params.cp_group is not None, "cp_group must be set in dynamic-cp mode"
+            self.pg_collection.cp = packed_seq_params.cp_group
+
         # =====================
         # Query, Key, and Value
         # =====================
@@ -384,6 +397,7 @@ class DSv4HybridAttention(Attention):
             output, bias = self.linear_proj(core_attn_out)
         output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
 
+        self.pg_collection.cp = _orig_cp_group
         return output, bias
 
 
@@ -402,7 +416,9 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         attn_mask_type=AttnMaskType.padding,
         cp_comm_type: Optional[str] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        pp_layer_offset: Optional[int] = None,
         is_mtp_layer: bool = False,
+        name: str | None = None,
     ):
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -415,7 +431,9 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             attention_type="self",
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
+            pp_layer_offset=pp_layer_offset,
             is_mtp_layer=is_mtp_layer,
+            name=name,
         )
 
         q_down_proj_kwargs = {}
@@ -436,6 +454,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             tp_comm_buffer_name='q_down_proj',
             skip_weight_param_allocation=False,
             tp_group=None,
+            name=(name + ".linear_q_down_proj") if name is not None else None,
             **q_down_proj_kwargs,
         )
 
@@ -451,6 +470,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             is_expert=False,
             tp_comm_buffer_name='q_up_proj',
             tp_group=pg_collection.tp,
+            name=(name + ".linear_q_up_proj") if name is not None else None,
         )
 
         self.linear_kv_proj = build_module(
@@ -465,6 +485,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             is_expert=False,
             tp_comm_buffer_name='kv_up_proj',
             tp_group=pg_collection.tp,
+            name=(name + ".linear_kv_proj") if name is not None else None,
         )
         self.kv_layernorm = submodules.kv_layernorm(
             hidden_size=self.config.v_head_dim,
@@ -496,11 +517,6 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         assert (
             hidden_states.ndim == 3
         ), f"hidden_states should be 3D, [s, b, n*h], got {hidden_states.ndim}D"
-        if packed_seq_params is not None:
-            assert (
-                packed_seq_params.local_cp_size is None
-            ), "dynamic_context_parallel is not supported with MLA yet and is planned for future. \
-            Please disable dynamic_context_parallel."
 
         assert (
             inference_context is None and inference_params is None
