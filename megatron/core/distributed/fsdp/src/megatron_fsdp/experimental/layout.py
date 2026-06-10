@@ -173,6 +173,8 @@ class GlobalLayout:
 
         @dataclasses.dataclass(frozen=True)
         class TensorRange:
+            """Contiguous global element range occupied by one logical tensor."""
+
             start: int
             end: int
             tensor_id: int
