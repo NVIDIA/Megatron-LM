@@ -242,6 +242,7 @@ class TransformerMoTBlock(GraphableMegatronModule, MegatronModule):
                     self.config.cpu_offloading_activations,
                     self.config.cpu_offloading_weights,
                     self.config.cpu_offloading_double_buffering,
+                    self.config.cpu_offloading_retain_pinned_cpu_buffers,
                 )
             )
             self.config._cpu_offloading_context = (
@@ -965,7 +966,6 @@ def get_mot_layer_spec(
         use_te=use_te,
         num_experts=num_experts,
         moe_grouped_gemm=moe_grouped_gemm,
-        moe_use_legacy_grouped_gemm=False,
         use_te_op_fuser=False, # TODO: support TE op fuser for MoE
     )
 
@@ -988,4 +988,3 @@ def get_mot_layer_spec(
         mlp_bda=get_bias_dropout_add,
     )
     return ModuleSpec(module=MoTTransformerLayer, submodules=layer_submodules)
-
