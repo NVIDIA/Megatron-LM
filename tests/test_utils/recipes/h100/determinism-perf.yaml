@@ -4,7 +4,7 @@ maintainers: [mcore]
 loggers: [stdout]
 spec:
   name: "determinism_perf_{environment}_{platforms}"
-  model: unit-tests
+  model: gpt
   nodes: 1
   build: mcore-pyt-{environment}
   gpus: 8
@@ -24,7 +24,7 @@ spec:
   script: |-
     set -euo pipefail
     cd /opt/megatron-lm
-    bash scripts/determinism/perf_breakdown.sh \
+    bash tests/performance_tests/shell_test_utils/determinism/perf_breakdown.sh \
       "{assets_dir}/logs/perf-leaderboards" \
       "{assets_dir}/logs"
 
