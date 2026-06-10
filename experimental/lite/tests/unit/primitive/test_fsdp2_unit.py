@@ -6,11 +6,13 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 from megatron.lite.primitive.optimizers.fsdp2 import (
     FSDP2Config,
     FSDP2Optimizer,
+    all_reduce_scalar_,
     clip_grads_with_sharded_norm_,
     fsdp2_available,
 )
@@ -22,6 +24,7 @@ pytestmark = pytest.mark.mlite
 
 fsdp2_wrap = importlib.import_module("megatron.lite.primitive.optimizers.fsdp2.wrap")
 fsdp2_optimizer = importlib.import_module("megatron.lite.primitive.optimizers.fsdp2.optimizer")
+fsdp2_grad_clip = importlib.import_module("megatron.lite.primitive.optimizers.fsdp2.grad_clip")
 
 
 class ToyBlock(nn.Module):
@@ -286,6 +289,85 @@ def test_clip_grads_with_sharded_norm_scales_cpu_grads_once():
     scale = 6.5 / (13.0 + 1.0e-6)
     torch.testing.assert_close(p0.grad, torch.tensor([3.0, 4.0]) * scale)
     torch.testing.assert_close(p1.grad, torch.tensor([0.0, 12.0]) * scale)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for NCCL scalar test.")
+def test_all_reduce_scalar_moves_cpu_value_to_nccl_device(monkeypatch):
+    group = object()
+    reduced_devices: list[str] = []
+
+    def fake_all_reduce(value, *, op, group):
+        assert group is fake_all_reduce.group
+        assert op == dist.ReduceOp.SUM
+        reduced_devices.append(value.device.type)
+        value.add_(5.0)
+
+    fake_all_reduce.group = group
+    monkeypatch.setattr(fsdp2_grad_clip.dist, "get_backend", lambda _group: "nccl")
+    monkeypatch.setattr(fsdp2_grad_clip.dist, "all_reduce", fake_all_reduce)
+
+    value = torch.tensor(7.0)
+    all_reduce_scalar_(value, op=dist.ReduceOp.SUM, group=group)
+
+    assert reduced_devices == ["cuda"]
+    assert value.device.type == "cpu"
+    torch.testing.assert_close(value, torch.tensor(12.0))
+
+
+def test_fsdp2_optimizer_uses_scalar_all_reduce_for_all_norm_groups(monkeypatch):
+    groups = SimpleNamespace(
+        dp_cp=object(),
+        tp=object(),
+        replicated=object(),
+        expert=object(),
+        pp=object(),
+    )
+    reduced_groups: list[object] = []
+
+    def fake_all_reduce_scalar(value, *, op, group):
+        assert value.ndim == 0
+        assert op == dist.ReduceOp.SUM
+        reduced_groups.append(group)
+
+    monkeypatch.setattr(fsdp2_optimizer, "all_reduce_scalar_", fake_all_reduce_scalar)
+    monkeypatch.setattr(fsdp2_optimizer.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(fsdp2_optimizer.dist, "get_world_size", lambda _group: 2)
+
+    sharded = nn.Parameter(torch.tensor([1.0]))
+    replicated = nn.Parameter(torch.tensor([1.0]))
+    expert = nn.Parameter(torch.tensor([1.0]))
+    tp_replicated = nn.Parameter(torch.tensor([1.0]))
+    sharded.grad = torch.tensor([2.0])
+    replicated.grad = torch.tensor([3.0])
+    expert.grad = torch.tensor([4.0])
+    tp_replicated.grad = torch.tensor([5.0])
+
+    optimizer = FSDP2Optimizer(
+        torch.optim.SGD([sharded, replicated, expert, tp_replicated], lr=0.0),
+        [sharded, replicated, expert, tp_replicated],
+        ParallelState(
+            dp_cp_group=groups.dp_cp,
+            tp_group=groups.tp,
+            pp_group=groups.pp,
+        ),
+        clip_grad=100.0,
+        replicated_grad_params=[replicated],
+        replicated_grad_norm_group=groups.replicated,
+        expert_sharded_grad_params=[expert],
+        expert_sharded_grad_norm_group=groups.expert,
+        tp_replicated_grad_params=[tp_replicated],
+    )
+
+    assert optimizer.clip_grad_norm() == pytest.approx(
+        (2.0**2 + 3.0**2 + 4.0**2 + 5.0**2) ** 0.5
+    )
+    assert reduced_groups == [
+        groups.dp_cp,
+        groups.tp,
+        groups.replicated,
+        groups.expert,
+        groups.pp,
+    ]
 
 
 def test_fp32_adamw_state_dict_roundtrip_cpu():

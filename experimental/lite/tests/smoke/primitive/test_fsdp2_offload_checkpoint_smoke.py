@@ -138,7 +138,7 @@ def _optimizer_state_devices(optimizer) -> set[str]:
 
 def _local_named_params(model: nn.Module) -> dict[str, torch.Tensor]:
     return {
-        name: to_local_tensor(param.detach()).cpu().float().clone()
+        name: to_local_tensor(param.detach()).cpu().clone()
         for name, param in model.named_parameters()
     }
 
@@ -150,7 +150,11 @@ def _train_step(model: nn.Module, optimizer, x: torch.Tensor, target: torch.Tens
     success, grad_norm, _ = optimizer.step()
     assert success
     assert torch.isfinite(torch.tensor(grad_norm))
-    return loss.detach()
+    return loss.detach(), float(grad_norm)
+
+
+def _assert_grad_norm_exact(lhs: float, rhs: float) -> None:
+    assert lhs == rhs
 
 
 def _assert_local_params_close(lhs: nn.Module, rhs: nn.Module):
@@ -181,23 +185,36 @@ def test_fsdp2_runtime_model_and_optimizer_offload_roundtrip_single_node():
     assert _optimizer_state_devices(optimizer) == {"cuda"}
 
 
-@pytest.mark.xfail(
-    int(os.environ.get("WORLD_SIZE", "1")) > 1,
-    reason="MLite FSDP2 offload_fraction multi-rank grad clipping is covered by a follow-up bugfix PR.",
-    strict=True,
-)
-def test_fsdp2_offload_fraction_keeps_optimizer_update_state_on_cpu_single_node():
-    model, ps = _build_fsdp2_model()
-    optimizer = _build_optimizer(model, ps, offload_fraction=1.0)
+def test_fsdp2_offload_fraction_matches_non_offloaded_grad_clip_single_node():
+    if dist.get_world_size() < 2:
+        pytest.skip(
+            "multi-rank FSDP2 grad clipping equivalence requires WORLD_SIZE > 1."
+        )
 
-    assert _optimizer_state_devices(optimizer) == {"cpu"}
+    baseline_model, baseline_ps = _build_fsdp2_model()
+    baseline_optimizer = _build_optimizer(
+        baseline_model, baseline_ps, offload_fraction=0.0
+    )
+    offload_model, offload_ps = _build_fsdp2_model()
+    offload_optimizer = _build_optimizer(
+        offload_model, offload_ps, offload_fraction=1.0
+    )
 
+    assert _optimizer_state_devices(baseline_optimizer) == {"cuda"}
+    assert _optimizer_state_devices(offload_optimizer) == {"cpu"}
+
+    torch.manual_seed(4321)
     x = torch.randn(4, 8, device="cuda", dtype=torch.bfloat16)
     target = torch.randn(4, 4, device="cuda", dtype=torch.bfloat16)
-    _train_step(model, optimizer, x, target)
+    _loss, baseline_grad_norm = _train_step(
+        baseline_model, baseline_optimizer, x, target
+    )
+    _loss, offload_grad_norm = _train_step(offload_model, offload_optimizer, x, target)
 
-    assert _local_param_devices(model) == {"cuda"}
-    assert _optimizer_state_devices(optimizer) == {"cpu"}
+    _assert_grad_norm_exact(offload_grad_norm, baseline_grad_norm)
+    _assert_local_params_close(offload_model, baseline_model)
+    assert _local_param_devices(offload_model) == {"cuda"}
+    assert _optimizer_state_devices(offload_optimizer) == {"cpu"}
 
 
 def test_fsdp2_checkpoint_load_matches_uninterrupted_training_single_node(tmp_path):
