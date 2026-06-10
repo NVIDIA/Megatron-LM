@@ -16,6 +16,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer impor
     Partial,
     Replicate,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.layout import GlobalLayout
 
 
 def _same_tensors_on_all_ranks(device: torch.device) -> list[torch.Tensor]:
@@ -29,6 +30,12 @@ def _same_tensors_on_all_ranks(device: torch.device) -> list[torch.Tensor]:
 def _assert_dbuffer_local_tensors_close(buffer: DBuffer, expected: Iterable[torch.Tensor]) -> None:
     for index, tensor in enumerate(expected):
         torch.testing.assert_close(buffer.get_local_tensor(index), tensor)
+
+
+def test_dbuffer_layout_rejects_0d_tensor_shapes():
+    """DBuffer layout does not silently reinterpret scalar tensors as dim-0 rows."""
+    with pytest.raises(ValueError, match="0D tensor shapes"):
+        GlobalLayout.build([torch.Size(())], dp_size=1)
 
 
 @pytest.mark.distributed
