@@ -484,7 +484,7 @@ def is_flashinfer_min_version(version, check_equality=True):
         return False
     if check_equality:
         return flashinfer_version >= PkgVersion(version)
-    return flashinver_version > PkgVersion(version)
+    return flashinfer_version > PkgVersion(version)
 
 
 def accepts_parameter(func: Callable, name: str) -> bool:
