@@ -45,6 +45,58 @@ class GlobalLayout:
     tensor_to_offset: tuple[int, ...]
     size: int
 
+    def __post_init__(self) -> None:
+        """Validate tensor offsets are row-aligned, in bounds, and non-overlapping."""
+
+        @dataclasses.dataclass(frozen=True)
+        class TensorRange:
+            start: int
+            end: int
+            tensor_id: int
+
+        if self.size < 0:
+            raise AssertionError(f"Global layout size {self.size} is negative.")
+        if len(self.tensor_shapes) != len(self.tensor_to_offset):
+            raise AssertionError(
+                "Global layout has mismatched tensor shapes and offsets: "
+                f"{len(self.tensor_shapes)} shapes and {len(self.tensor_to_offset)} offsets."
+            )
+
+        tensor_ranges: list[TensorRange] = []
+        for tensor_id, (shape, start) in enumerate(
+            zip(self.tensor_shapes, self.tensor_to_offset, strict=True)
+        ):
+            if start < 0:
+                raise AssertionError(f"Tensor {tensor_id} offset {start} is negative.")
+
+            row_size = _non_leading_numel(shape)
+            if row_size <= 0:
+                raise AssertionError(f"Tensor {tensor_id} has invalid row size {row_size}.")
+            if start % row_size != 0:
+                raise AssertionError(
+                    f"Tensor {tensor_id} offset {start} is not aligned to row size {row_size}."
+                )
+
+            end = start + shape.numel()
+            if end > self.size:
+                raise AssertionError(
+                    f"Tensor {tensor_id} range [{start}, {end}) exceeds "
+                    f"layout size {self.size}."
+                )
+            tensor_ranges.append(TensorRange(start, end, tensor_id))
+
+        previous_range: TensorRange | None = None
+        for current_range in sorted(tensor_ranges, key=lambda tensor_range: tensor_range.start):
+            if previous_range is not None and current_range.start < previous_range.end:
+                raise AssertionError(
+                    "Global layout tensors overlap: "
+                    f"tensor {previous_range.tensor_id} "
+                    f"[{previous_range.start}, {previous_range.end}) and "
+                    f"tensor {current_range.tensor_id} "
+                    f"[{current_range.start}, {current_range.end})."
+                )
+            previous_range = current_range
+
     def get_local_range(self, mesh: DeviceMesh, placements: Iterable[Placement]) -> tuple[int, int]:
         """Return this rank's local element offset and length for ``placements``."""
         offset = 0
@@ -130,7 +182,8 @@ def _compute_layout(shapes: Iterable[Shape], dp_size: int) -> GlobalLayout:
 
     # chunk_size is the packing unit. Since every tensor row size divides it,
     # DP shard boundaries that are multiples of chunk_size avoid splitting dim-0 rows.
-    tensor_to_offset: list[int | None] = [None] * len(tensor_shapes)
+    UNASSIGNED_OFFSET = -1
+    tensor_to_offset: list[int] = [UNASSIGNED_OFFSET] * len(tensor_shapes)
     fragment_items = []
     regular_items = []
     for tensor_id, shape in enumerate(tensor_shapes):
@@ -201,17 +254,10 @@ def _compute_layout(shapes: Iterable[Shape], dp_size: int) -> GlobalLayout:
         tensor_to_offset[frag_id] = next_offset
         next_offset += frag_shape.numel()
 
-    if any(offset is None for offset in tensor_to_offset):
-        raise AssertionError(f"Incomplete DBuffer layout for shapes {tensor_shapes}.")
-
-    resolved_tensor_to_offset = tuple(offset for offset in tensor_to_offset if offset is not None)
-    for shape, offset in zip(tensor_shapes, resolved_tensor_to_offset, strict=True):
-        row_size = _non_leading_numel(shape)
-        if offset % row_size != 0:
-            raise AssertionError(f"Tensor offset {offset} is not aligned to row size {row_size}.")
-    size = _pad_to_multiple(next_offset, chunk_size * dp_size)
     return GlobalLayout(
-        tensor_shapes=tensor_shapes, tensor_to_offset=resolved_tensor_to_offset, size=size
+        tensor_shapes=tensor_shapes,
+        tensor_to_offset=tuple(tensor_to_offset),
+        size=_pad_to_multiple(next_offset, chunk_size * dp_size),
     )
 
 
