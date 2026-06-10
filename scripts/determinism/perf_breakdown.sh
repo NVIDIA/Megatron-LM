@@ -1,16 +1,7 @@
 #!/bin/bash
 # Det-vs-nondet per-NVTX-range perf breakdown for pretrain_gpt.py.
-#
-# Wraps ``pretrain_gpt.py`` twice (nondet baseline + det) under nsys via the
-# generic ``run_nsys_breakdown.sh`` driver, then joins the two CSVs into a
-# side-by-side leaderboard. This script holds the pretrain command so the
-# CI recipe yaml stays small and the experiment is reproducible locally:
-#
-#   bash scripts/determinism/perf_breakdown.sh /tmp/leaderboards /tmp/logs
-#
-# CUDA_DEVICE_MAX_CONNECTIONS=1 is Megatron's pre-existing requirement for
-# TP>1 on pre-Blackwell (asserted at arguments.py:1321 before
-# --deterministic-mode takes effect).
+# Usage: bash scripts/determinism/perf_breakdown.sh /tmp/leaderboards /tmp/logs
+# CUDA_DEVICE_MAX_CONNECTIONS=1 is required for TP>1 on pre-Blackwell.
 set -euo pipefail
 
 OUT="${1:?usage: $0 LEADERBOARD_DIR LOG_DIR}"
@@ -19,6 +10,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export LOG_DIR
+
+# Clear stale per-rank logs from prior runs (torchrun never overwrites).
+rm -rf "$LOG_DIR/torchrun-det" "$LOG_DIR/torchrun-nondet"
 
 bash "$SCRIPT_DIR/run_nsys_breakdown.sh" "$OUT" -- \
   bash -c '
@@ -29,11 +23,11 @@ bash "$SCRIPT_DIR/run_nsys_breakdown.sh" "$OUT" -- \
       --redirects "3" \
       --nproc_per_node 8 \
       pretrain_gpt.py \
-        --num-layers 2 \
-        --hidden-size 512 \
-        --num-attention-heads 4 \
-        --seq-length 128 \
-        --max-position-embeddings 128 \
+        --num-layers 4 \
+        --hidden-size 1024 \
+        --num-attention-heads 16 \
+        --seq-length 256 \
+        --max-position-embeddings 256 \
         --micro-batch-size 2 \
         --global-batch-size 16 \
         --train-iters 8 \
@@ -61,6 +55,7 @@ bash "$SCRIPT_DIR/run_nsys_breakdown.sh" "$OUT" -- \
         --no-load-rng \
         $([ "$DETERMINISM_PERF_MODE" = det ] && echo --deterministic-mode) \
         --profile \
-        --profile-step-start 4 \
+        --nvtx-ranges \
+        --profile-step-start 5 \
         --profile-step-end 7
   '

@@ -1,34 +1,12 @@
 #!/bin/bash
-# Run any Python entry point twice and capture per-NVTX-range CUDA time
-# under nsys, then print a side-by-side comparison. The two passes are
-# distinguished only by the ``DETERMINISM_PERF_MODE=det|nondet`` env var
-# we export per iteration — YOUR entry point is responsible for branching
-# on that env var (e.g. conditionally setting --deterministic-mode). If
-# the entry point ignores the env var, both passes execute identically
-# and the leaderboard delta is just measurement noise.
-#
-# The entry point MUST call cudaProfilerStart/Stop around the iters to
-# measure (Megatron's --profile flag does this).
-#
-# Usage:
-#   bash run_nsys_breakdown.sh OUTDIR -- <command-that-reads-DETERMINISM_PERF_MODE>
-#
-# Example (uses bash -c to re-evaluate the env var per pass):
-#   bash run_nsys_breakdown.sh /tmp/out -- \
-#     bash -c 'uv run python -m torch.distributed.run --nproc-per-node 8 \
-#       pretrain_gpt.py \
-#         $([ "$DETERMINISM_PERF_MODE" = det ] && echo --deterministic-mode) \
-#         --profile --profile-step-start 4 --profile-step-end 7 <other args ...>'
-#
-# For a recipe-driven CI invocation, see
-# tests/test_utils/recipes/h100/determinism-perf.yaml which inlines its
-# own per-mode loop (cleaner than the bash -c indirection above).
+# Wrap a Python entry point under nsys twice (det + nondet) and print the
+# per-NVTX-range diff. Entry point reads DETERMINISM_PERF_MODE and must call
+# cudaProfilerStart/Stop (Megatron's --profile flag handles this).
+# Usage: bash run_nsys_breakdown.sh OUTDIR -- CMD...
 set -euo pipefail
 OUT_ARG="${1:?usage: $0 OUTDIR -- CMD...}"; shift
 [ "${1:-}" = "--" ] || { echo "expected --"; exit 64; }; shift
-# mkdir before realpath — ``realpath`` on a non-existent path errors out
-# under ``set -e``; the CI passes ``{assets_dir}/logs/perf-leaderboards``
-# which doesn't exist yet at first invocation.
+# mkdir before realpath: realpath fails on missing path under ``set -e``.
 mkdir -p "$OUT_ARG"
 OUT=$(realpath "$OUT_ARG")
 
@@ -40,4 +18,5 @@ for MODE in det nondet; do
   nsys stats --force-export=true --report nvtx_sum --format csv "$OUT/nsys-$MODE.nsys-rep" > "$OUT/nsys-$MODE.csv"
 done
 
-python "$(dirname "$0")/print_nsys_leaderboard.py" "$OUT"
+# LOG_DIR (if set by caller) enables the step-time regression check.
+python "$(dirname "$0")/print_nsys_leaderboard.py" "$OUT" ${LOG_DIR:+"$LOG_DIR"}
