@@ -1030,8 +1030,7 @@ def test_get_megatron_optimizer_custom_process_groups_validation():
         )
 
 
-@pytest.mark.parametrize("use_distributed_optimizer", [True])
-def test_mixed_precision_param_index_map(use_distributed_optimizer: bool):
+def test_mixed_precision_param_index_map():
     """
     Test that model_param_group_index_map stays synchronized after parameter reordering.
 
@@ -1069,61 +1068,55 @@ def test_mixed_precision_param_index_map(use_distributed_optimizer: bool):
     model.requires_grad_(True)
 
     # Wrap with DDP
-    ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=use_distributed_optimizer)
+    ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
     model = DistributedDataParallel(
         TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
     )
 
     # Create optimizer with distributed optimizer enabled
-    optimizer_config = OptimizerConfig(
-        optimizer='adam', bf16=True, use_distributed_optimizer=use_distributed_optimizer
-    )
+    optimizer_config = OptimizerConfig(optimizer='adam', bf16=True, use_distributed_optimizer=True)
     optim = get_megatron_optimizer(optimizer_config, [model])
 
     # Access the underlying distributed optimizer
-    if use_distributed_optimizer:
-        dist_optim = optim.optimizer
+    dist_optim = optim.optimizer
 
-        # Verify that model_param_group_index_map is correctly synchronized
-        # After the fix, the map should reflect the reordered parameters
-        for model_param in dist_optim.model_param_group_index_map.keys():
-            group_index, group_order = dist_optim.model_param_group_index_map[model_param]
+    # Verify that model_param_group_index_map is correctly synchronized
+    # After the fix, the map should reflect the reordered parameters
+    for model_param in dist_optim.model_param_group_index_map.keys():
+        group_index, group_order = dist_optim.model_param_group_index_map[model_param]
 
-            # Verify the index points to a valid parameter
-            assert group_index < len(
-                dist_optim.optimizer.param_groups
-            ), f"group_index {group_index} out of range"
-            assert group_order < len(
-                dist_optim.optimizer.param_groups[group_index]["params"]
-            ), f"group_order {group_order} out of range for group {group_index}"
+        # Verify the index points to a valid parameter
+        assert group_index < len(
+            dist_optim.optimizer.param_groups
+        ), f"group_index {group_index} out of range"
+        assert group_order < len(
+            dist_optim.optimizer.param_groups[group_index]["params"]
+        ), f"group_order {group_order} out of range for group {group_index}"
 
-            # Get the corresponding optimizer parameter
-            opt_param = dist_optim.optimizer.param_groups[group_index]["params"][group_order]
+        # Get the corresponding optimizer parameter
+        opt_param = dist_optim.optimizer.param_groups[group_index]["params"][group_order]
 
-            # Verify the sizes match (this would fail before the fix)
-            model_param_range = dist_optim._get_model_param_range_map(model_param)
-            param_range = model_param_range["param"]
-            assert param_range.size == opt_param.numel(), (
-                f"Size mismatch: model param range size {param_range.size} "
-                f"!= optimizer param size {opt_param.numel()}"
-            )
+        # Verify the sizes match (this would fail before the fix)
+        model_param_range = dist_optim._get_model_param_range_map(model_param)
+        param_range = model_param_range["param"]
+        assert param_range.size == opt_param.numel(), (
+            f"Size mismatch: model param range size {param_range.size} "
+            f"!= optimizer param size {opt_param.numel()}"
+        )
 
-        # Run a forward/backward pass to populate optimizer state
-        input_data = torch.randn(8, 100, dtype=torch.bfloat16, device='cuda')
-        output = model(input_data)
-        loss = output.sum()
-        loss.backward()
-        optim.step()
+    # Run a forward/backward pass to populate optimizer state
+    input_data = torch.randn(8, 100, dtype=torch.bfloat16, device='cuda')
+    output = model(input_data)
+    loss = output.sum()
+    loss.backward()
+    optim.step()
 
-        # Test get_parameter_state_dp_zero (the function that was failing in issue #2777)
-        # This should work without size mismatch errors
-        try:
-            state_dict = dist_optim.get_parameter_state_dp_zero()
-            # Verify state_dict was created successfully
-            if rank == 0 or state_dict is not None:
-                assert state_dict is not None, "Failed to get parameter state"
-                assert 'buckets_coalesced' in state_dict, "Missing expected keys in state dict"
-        except RuntimeError as e:
-            pytest.fail(f"get_parameter_state_dp_zero failed with error: {e}")
+    # Test get_parameter_state_dp_zero (the function that was failing in issue #2777).
+    # This should work without size mismatch errors. The state is gathered on
+    # data-parallel rank 0 only.
+    state_dict = dist_optim.get_parameter_state_dp_zero()
+    if rank == 0:
+        assert state_dict is not None, "Failed to get parameter state"
+        assert 'buckets_coalesced' in state_dict, "Missing expected keys in state dict"
 
     _deinit_distributed()
