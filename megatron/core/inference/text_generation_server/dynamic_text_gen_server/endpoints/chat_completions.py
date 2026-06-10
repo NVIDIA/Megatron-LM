@@ -317,21 +317,6 @@ def _sanitize_tools_for_template(tools):
     return sanitized
 
 
-def _reconstruct_reasoning_content(messages: list[dict]) -> list[dict]:
-    """Reconstruct <think> tags from reasoning_content fields on assistant messages.
-
-    For parity with vLLM, assistant messages may carry reasoning in the reasoning_content field.
-    Before applying the chat template, we must inline those tags back into content.
-    """
-    for message in messages:
-        if message.get("role") != "assistant":
-            continue
-        reasoning_content = message.pop("reasoning_content", None)
-        if reasoning_content is not None:
-            content = message.get("content") or ""
-            message["content"] = f"<think>{reasoning_content}</think>{content}"
-    return messages
-
 
 def _replace_prefix_tokens(
     eos_token_id,
@@ -454,7 +439,6 @@ try:
         if not isinstance(messages, list):
             return Response("'messages' must be a list", status=400)
         template_messages = _sanitize_messages_for_template(messages)
-        template_messages = _reconstruct_reasoning_content(template_messages)
         template_tools = _sanitize_tools_for_template(tools)
 
         try:
@@ -584,6 +568,7 @@ try:
                     prompt_tokens = [tokenizer.bos] + prompt_tokens
 
             max_tokens = req.get("max_completion_tokens", None) or req.get("max_tokens", None)
+            ignore_eos = bool(req.get("ignore_eos", False))
 
             sampling_params = SamplingParams(
                 temperature=temperature,
@@ -594,6 +579,7 @@ try:
                 num_tokens_to_generate=(int(max_tokens) if max_tokens is not None else None),
                 skip_prompt_log_probs=skip_prompt_log_probs,
                 add_BOS=add_BOS,
+                termination_id=-1 if ignore_eos else None,
             )
         except ValueError as e:
             return Response(f"Invalid sampling parameter: {e}", status=400)
