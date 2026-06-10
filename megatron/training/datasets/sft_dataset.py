@@ -1,9 +1,9 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
 import atexit
-from collections import Counter
 import math
-from typing import Any, Dict, Optional, List, Union
+from collections import Counter
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -40,9 +40,7 @@ class SFTLowLevelDataset:
         try:
             from datasets import load_dataset
         except ImportError:
-            raise ImportError(
-                "SFTDataset currently requires datasets library to be installed"
-            )
+            raise ImportError("SFTDataset currently requires datasets library to be installed")
         self.dataset = load_dataset("json", data_files=dataset_path, split="all")
 
     def __len__(self) -> int:
@@ -87,25 +85,29 @@ class SFTDataset(MegatronDataset):
                     split_conversations.append(current)
                 current = [msg]  # Then start the new conversation
             else:
-                current.append(msg) # Continue accumulating the current conversation
+                current.append(msg)  # Continue accumulating the current conversation
         if current:  # Store any remaining conversation
             split_conversations.append(current)
         return split_conversations
 
     def _calculate_padding_divisor(self) -> int:
         """
-            Calculate the divisor used for sequence padding.
-            tp_pad = tp_size * 2 if tp_size > 1 else 1
-            cp_pad = cp_size * 2 if cp_size > 1 else 1
-            cp_pad = cp_pad * dp_size if dynamic_cp else cp_pad
-            divisor = cp_pad * tp_pad
+        Calculate the divisor used for sequence padding.
+        tp_pad = tp_size * 2 if tp_size > 1 else 1
+        cp_pad = cp_size * 2 if cp_size > 1 else 1
+        cp_pad = cp_pad * dp_size if dynamic_cp else cp_pad
+        divisor = cp_pad * tp_pad
         """
         if self.config.dynamic_context_parallel:
             # Dynamic CP: consider both CP and DP
             cp_pad = self.config.data_parallel_size * self.config.context_parallel_size * 2
         else:
             # Standard CP: only consider CP
-            cp_pad = self.config.context_parallel_size * 2 if self.config.context_parallel_size > 1 else 1
+            cp_pad = (
+                self.config.context_parallel_size * 2
+                if self.config.context_parallel_size > 1
+                else 1
+            )
         tp_pad = self.config.sequence_parallel_size if self.config.sequence_parallel_size > 0 else 1
         divisor = cp_pad * tp_pad
         # TODO(tailaim): do we need to pad for FP8 execution?
@@ -123,7 +125,7 @@ class SFTDataset(MegatronDataset):
         def extend_with_padding(tokens, targets, positions, pad_len):
             tokens.extend([pad] * pad_len)
             targets.extend([pad] * pad_len)
-            positions.extend(range(positions[-1]+1, positions[-1]+1+pad_len))
+            positions.extend(range(positions[-1] + 1, positions[-1] + 1 + pad_len))
 
         pack_tokens = []
         pack_targets = []
@@ -140,7 +142,6 @@ class SFTDataset(MegatronDataset):
 
             tokens_list = tokens.tolist()
             targets_list = targets.tolist()
-
 
             pack_tokens.extend(tokens_list)
             pack_targets.extend(targets_list)
@@ -167,7 +168,7 @@ class SFTDataset(MegatronDataset):
                 pack_targets = pack_targets[:max_body]
                 pack_tokens.append(pad)
                 pack_targets.append(pad)
-                pack_positions = pack_positions[:pack_length+1]
+                pack_positions = pack_positions[: pack_length + 1]
                 # Note len({pack_tokens, pack_targets, pack_positions}) should be pack_length + 1
                 cu_seqlens[-1] = len(pack_tokens) - 1
                 break
@@ -184,8 +185,8 @@ class SFTDataset(MegatronDataset):
         assert len(pack_positions) == pack_length + 1
 
         # Align and convert to tensors
-        input_ids    = torch.tensor(pack_tokens[:-1],  dtype=torch.int64)
-        labels       = torch.tensor(pack_targets[1:], dtype=torch.int64)
+        input_ids = torch.tensor(pack_tokens[:-1], dtype=torch.int64)
+        labels = torch.tensor(pack_targets[1:], dtype=torch.int64)
         position_ids = torch.tensor(pack_positions[:-1], dtype=torch.int64)
 
         # Loss mask.
@@ -269,13 +270,15 @@ class MockSFTLowLevelDataset:
                 self.size, mean_seq_len, lognormal_sigma, min_seq_len, max_seq_len
             )
         else:
-            raise ValueError(f"Unsupported mode '{mode}', must be 'file', 'distribution', or 'verification'")
-        
-    def generate_lognormal_samples(self, size, mean, sigma, min_seq_len, max_seq_len):   
+            raise ValueError(
+                f"Unsupported mode '{mode}', must be 'file', 'distribution', or 'verification'"
+            )
+
+    def generate_lognormal_samples(self, size, mean, sigma, min_seq_len, max_seq_len):
         mu = np.log(mean) - sigma**2 / 2
         samples = np.random.lognormal(mu, sigma, size)
         samples = np.clip(samples, min_seq_len, max_seq_len)
-        return samples.astype(int)   
+        return samples.astype(int)
 
     def __len__(self) -> int:
         return self.size
@@ -327,13 +330,13 @@ class MockSFTDataset(SFTDataset):
     def build_low_level_dataset(dataset_path: str, config: GPTDatasetConfig) -> LowLevelDataset:
         if config.sft_mock_dataset_config_json is None:
             mock_config = {
-                    "mode": "distribution",
-                    "type": "lognormal",
-                    "min_seq_len": config.sequence_length // 2,
-                    "max_seq_len": config.sequence_length,
-                    "mean_seq_len": config.sequence_length // 4 * 3,
-                    "lognormal_sigma": 1.1,
-                }
+                "mode": "distribution",
+                "type": "lognormal",
+                "min_seq_len": config.sequence_length // 2,
+                "max_seq_len": config.sequence_length,
+                "mean_seq_len": config.sequence_length // 4 * 3,
+                "lognormal_sigma": 1.1,
+            }
         else:
             mock_config = load_json_arg(config.sft_mock_dataset_config_json)
         return MockSFTLowLevelDataset(**mock_config)
@@ -359,23 +362,23 @@ class MockSFTDataset(SFTDataset):
             # SBHD format: single padded sequence without cu_seqlens.
             # Long sequences are truncated to pack_length tokens (including EOD).
             if len(tokens_list) >= pack_length + 1:
-                tokens_list = tokens_list[:pack_length - 1] + [eod]
+                tokens_list = tokens_list[: pack_length - 1] + [eod]
             # Pad to pack_length + 1 (offset by 1 for input/label split).
             pad_len = pack_length + 1 - len(tokens_list)
             if pad_len > 0:
                 tokens_list = tokens_list + [pad] * pad_len
             assert len(tokens_list) == pack_length + 1
-            input_ids    = torch.tensor(tokens_list[:-1], dtype=torch.int64)
-            labels       = torch.tensor(tokens_list[1:],  dtype=torch.int64)
+            input_ids = torch.tensor(tokens_list[:-1], dtype=torch.int64)
+            labels = torch.tensor(tokens_list[1:], dtype=torch.int64)
             # Position IDs are sequential across the entire sequence including padding,
             # matching GPTDataset behavior for standard (non-packed) training.
             position_ids = torch.arange(pack_length, dtype=torch.int64)
             loss_mask = torch.ones(pack_length, dtype=torch.float32)
             loss_mask[labels == pad] = 0.0
             return {
-                'tokens':       input_ids,
-                'labels':       labels,
-                'loss_mask':    loss_mask,
+                'tokens': input_ids,
+                'labels': labels,
+                'loss_mask': loss_mask,
                 'position_ids': position_ids,
             }
 
@@ -389,8 +392,8 @@ class MockSFTDataset(SFTDataset):
 
         # Truncate if sequence exceeds pack_length + 1 (need +1 for shift).
         if len(pack_tokens) > pack_length + 1:
-            pack_tokens = pack_tokens[:pack_length - 1] + [eod, pad]
-            pack_positions = pack_positions[:pack_length + 1]
+            pack_tokens = pack_tokens[: pack_length - 1] + [eod, pad]
+            pack_positions = pack_positions[: pack_length + 1]
 
         # Pad to pad_granularity alignment (tp * cp * 2).
         # We need final length (after shift) to be divisible by pad_granularity.

@@ -66,12 +66,8 @@ from megatron.training.datasets.sft_dataset import (
 from megatron.training.datasets.utils import load_json_arg
 
 # Field-name synonyms (probed in order; first non-empty wins).
-_INSTRUCTION_FIELDS: Tuple[str, ...] = (
-    "instruction", "prompt", "query", "question",
-)
-_OUTPUT_FIELDS: Tuple[str, ...] = (
-    "output", "response", "completion", "answer",
-)
+_INSTRUCTION_FIELDS: Tuple[str, ...] = ("instruction", "prompt", "query", "question")
+_OUTPUT_FIELDS: Tuple[str, ...] = ("output", "response", "completion", "answer")
 # Supplementary user-turn context: Stanford Alpaca's "input", Dolly's "context".
 _EXTRA_INPUT_FIELDS: Tuple[str, ...] = ("input", "context")
 
@@ -108,9 +104,7 @@ def _looks_like_hf_id(path: str) -> bool:
     return "/" in path
 
 
-def _first_present(
-    sample: Dict[str, Any], fields: Iterable[str]
-) -> Optional[str]:
+def _first_present(sample: Dict[str, Any], fields: Iterable[str]) -> Optional[str]:
     """Return the first non-empty string value among the given fields, or None."""
     for f in fields:
         v = sample.get(f)
@@ -118,8 +112,7 @@ def _first_present(
             continue
         if not isinstance(v, str):
             raise ValueError(
-                f"VarlenDataset: field '{f}' must be a string, "
-                f"got {type(v).__name__}."
+                f"VarlenDataset: field '{f}' must be a string, " f"got {type(v).__name__}."
             )
         return v
     return None
@@ -143,9 +136,7 @@ def _alpaca_to_messages(sample: Dict[str, Any]) -> List[Dict[str, str]]:
     instruction = _first_present(sample, _INSTRUCTION_FIELDS) or ""
     extra_input = _first_present(sample, _EXTRA_INPUT_FIELDS) or ""
     output = _first_present(sample, _OUTPUT_FIELDS) or ""
-    user_content = (
-        f"{instruction}\n\n{extra_input}" if extra_input else instruction
-    )
+    user_content = f"{instruction}\n\n{extra_input}" if extra_input else instruction
     return [
         {"role": "system", "content": ""},
         {"role": "user", "content": user_content},
@@ -207,9 +198,7 @@ def _raw_text_loader(sample: Dict[str, Any]) -> str:
     return text
 
 
-def _select_converter(
-    column_names: List[str],
-) -> Tuple[Callable[[Dict[str, Any]], Any], str]:
+def _select_converter(column_names: List[str]) -> Tuple[Callable[[Dict[str, Any]], Any], str]:
     """Pick a sample converter based on dataset column names.
 
     Priority (most explicit first): openai-messages > sharegpt > alpaca/dolly
@@ -268,16 +257,13 @@ class VarlenLowLevelDataset(SFTLowLevelDataset):
             from datasets import Dataset, load_dataset
         except ImportError as exc:
             raise ImportError(
-                "VarlenDataset requires the `datasets` library "
-                "(pip install datasets)."
+                "VarlenDataset requires the `datasets` library " "(pip install datasets)."
             ) from exc
 
         if _looks_like_hf_id(dataset_path):
             self.dataset = load_dataset(dataset_path, split="train")
         elif dataset_path.endswith(".parquet"):
-            self.dataset = load_dataset(
-                "parquet", data_files=dataset_path, split="all"
-            )
+            self.dataset = load_dataset("parquet", data_files=dataset_path, split="all")
         else:
             try:
                 import pandas as pd
@@ -289,9 +275,7 @@ class VarlenLowLevelDataset(SFTLowLevelDataset):
             df = pd.read_json(dataset_path, lines=True)
             self.dataset = Dataset.from_pandas(df, preserve_index=False)
 
-        self._converter, self._schema_name = _select_converter(
-            list(self.dataset.column_names)
-        )
+        self._converter, self._schema_name = _select_converter(list(self.dataset.column_names))
 
     @property
     def schema_name(self) -> str:
@@ -342,9 +326,7 @@ class VarlenDataset(SFTDataset):
         return len(low_level_dataset)
 
     @staticmethod
-    def build_low_level_dataset(
-        dataset_path: str, config: GPTDatasetConfig
-    ) -> LowLevelDataset:
+    def build_low_level_dataset(dataset_path: str, config: GPTDatasetConfig) -> LowLevelDataset:
         return VarlenLowLevelDataset(dataset_path)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
@@ -356,9 +338,9 @@ class VarlenDataset(SFTDataset):
         # for loss because loss_mask zeros pad positions out.
         eod = tokenizer.eod
         pad = tokenizer.pad if tokenizer.pad is not None else eod
-        assert eod is not None, (
-            "VarlenDataset requires the tokenizer to expose an EOD/EOS token id."
-        )
+        assert (
+            eod is not None
+        ), "VarlenDataset requires the tokenizer to expose an EOD/EOS token id."
 
         # 1. Pull a single item from the low-level dataset. For SFT schemas
         #    (alpaca / sharegpt / openai-messages) this is a messages list;
@@ -487,9 +469,7 @@ class MockVarlenDataset(MockSFTDataset):
     """
 
     @staticmethod
-    def build_low_level_dataset(
-        dataset_path: str, config: GPTDatasetConfig
-    ) -> LowLevelDataset:
+    def build_low_level_dataset(dataset_path: str, config: GPTDatasetConfig) -> LowLevelDataset:
         if config.varlen_mock_dataset_config_json is None:
             mock_config = {
                 "mode": "distribution",
