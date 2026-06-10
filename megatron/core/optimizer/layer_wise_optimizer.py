@@ -599,13 +599,20 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
                 for bucket in group.buckets:
                     if not _bucket_is_managed_by_layer_wise_optimizer(bucket):
                         continue
-                    bucket_params_list = [[] for _ in range(get_pg_size(self.pg_collection.dp_cp))]
-                    for bucket_list, full_params_list in zip(
-                        bucket_params_list, self.dp_cp_params_list
-                    ):
-                        for param in full_params_list:
-                            if param in bucket.params:
-                                bucket_list.append(param)
+                    if self.dp_cp_params_list is not None:
+                        bucket_params_list = [
+                            [] for _ in range(get_pg_size(self.pg_collection.dp_cp))
+                        ]
+                        for bucket_list, full_params_list in zip(
+                            bucket_params_list, self.dp_cp_params_list
+                        ):
+                            for param in full_params_list:
+                                if param in bucket.params:
+                                    bucket_list.append(param)
+                    else:
+                        # dp_cp_size == 1: single rank owns all params, no
+                        # all-gather needed but data structures must be initialized.
+                        bucket_params_list = [list(bucket.params_list)]
                     bucket.set_layerwise_params_list(bucket_params_list)
             # Do the same for expert parallel bucket groups.
             for group in model_chunk.expert_parallel_bucket_groups:
