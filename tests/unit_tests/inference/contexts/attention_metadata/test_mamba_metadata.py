@@ -4,29 +4,29 @@ import pytest
 import torch
 
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
-from megatron.core.inference.contexts.attention_context.mamba_metadata import MambaMetadata
+from megatron.core.inference.contexts.attention_context.mamba_metadata import SSMMetadata
 
 
 class TestMambaMetadata:
 
     @pytest.fixture
     def metadata_context(self):
-        """Fixture to initialize MambaMetadata with standard constraints."""
+        """Fixture to initialize SSMMetadata with standard constraints."""
         max_requests = 16
         max_tokens = 2048
-        metadata = MambaMetadata(max_requests=max_requests, max_tokens=max_tokens)
+        metadata = SSMMetadata(max_requests=max_requests, max_tokens=max_tokens)
 
         # Manually allocate some slots to simulate a running state.
-        # We assume request_id i maps to mamba_slot i for simplicity in assertions.
+        # We assume request_id i maps to ssm_slot i for simplicity in assertions.
         for i in range(max_requests):
-            metadata.request_to_mamba_state_idx[i] = i
+            metadata.request_to_ssm_state_idx[i] = i
 
         yield metadata
         metadata.reset()
 
     def _run_update_test(
         self,
-        metadata: MambaMetadata,
+        metadata: SSMMetadata,
         req_seq_lengths: list[int],
         num_decode_requests: int,
         padded_dims: InferenceBatchDimensions,
@@ -36,7 +36,7 @@ class TestMambaMetadata:
         Helper to construct inputs and run update().
 
         Args:
-            metadata: The MambaMetadata instance.
+            metadata: The SSMMetadata instance.
             req_seq_lengths: List of sequence lengths for all active requests.
                              Order must be [decode_requests..., prefill_requests...].
             num_decode_requests: Number of requests in req_seq_lengths that are in the decode phase.
@@ -54,7 +54,7 @@ class TestMambaMetadata:
         )
 
         # Assuming 1:1 mapping (req_id i -> slot i)
-        active_mamba_indices = torch.arange(
+        active_ssm_indices = torch.arange(
             num_active_requests, dtype=torch.int32, device=metadata.device
         )
 
@@ -71,7 +71,7 @@ class TestMambaMetadata:
         token_to_req_tensor = torch.tensor(token_to_req, dtype=torch.int32, device=metadata.device)
 
         metadata.update(
-            active_mamba_indices=active_mamba_indices,
+            active_ssm_indices=active_ssm_indices,
             token_to_request_idx=token_to_req_tensor,
             cu_seqlens=cu_seqlens_tensor,
             batch_dimensions=real_dims,
@@ -79,7 +79,7 @@ class TestMambaMetadata:
             enable_chunked_prefill=enable_chunked_prefill,
         )
 
-        return real_dims, active_mamba_indices
+        return real_dims, active_ssm_indices
 
     # -------------------------------------------------------------------------
     # Scenario 1: Decode Only
@@ -472,8 +472,8 @@ class TestMambaMetadata:
             token_to_req, dtype=torch.int32, device=metadata_context.device
         )
 
-        # Active mamba slots matching the absolute request IDs
-        active_mamba_indices = torch.tensor(
+        # Active ssm slots matching the absolute request IDs
+        active_ssm_indices = torch.tensor(
             [2, 3], dtype=torch.int32, device=metadata_context.device
         )
 
@@ -483,7 +483,7 @@ class TestMambaMetadata:
         dims = InferenceBatchDimensions(token_count=30, prefill_req_count=2, decode_req_count=0)
 
         metadata_context.update(
-            active_mamba_indices=active_mamba_indices,
+            active_ssm_indices=active_ssm_indices,
             token_to_request_idx=token_to_req_tensor,
             cu_seqlens=cu_seqlens,
             batch_dimensions=dims,

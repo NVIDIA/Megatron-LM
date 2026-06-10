@@ -461,7 +461,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
 
         if in_inference_mode and inference_context is not None:
             if inference_context.is_dynamic_batching():
-                return self._dynamic_inference(hidden_states, inference_context)
+                return self.ssm_dynamic_inference(hidden_states, inference_context)
             else:
                 assert inference_context.is_static_batching()
                 assert not self.config.sequence_parallel
@@ -490,104 +490,6 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
 
         return out, out_bias
 
-    def _dynamic_inference(self, hidden_states: torch.Tensor, context: DynamicInferenceContext):
-        """
-        Executes dynamic inference by separating decode and prefill requests and
-        running them independently.
-        """
-        sequence_packing_available, reason_for_no_sequence_packing = (
-            _check_mamba_sequence_packing_support(for_inference_not_training=True)
-        )
-        assert sequence_packing_available, reason_for_no_sequence_packing
-
-        # Grab standard states
-        conv_state, ssm_state = context.ssm_states_cache(self.layer_number - self.pp_layer_offset)
-
-        # Fetch intermediate states for speculative decoding
-        # (just buffers, existing data is overwritten)
-        int_conv_state = None
-        int_ssm_state = None
-        if context.num_speculative_tokens > 0:
-            int_conv_state, int_ssm_state = context.ssm_states_cache(
-                self.layer_number - self.pp_layer_offset, intermediate=True
-            )
-
-        padded_dims = context.padded_batch_dimensions
-        token_count = padded_dims.token_count
-        decode_req_count = padded_dims.decode_req_count
-        prefill_req_count = padded_dims.prefill_req_count
-
-        # Input projection
-        zxBCdt, _ = self.in_proj(hidden_states)
-
-        y_decode = None
-        y_prefill = None
-
-        # Decode
-        if decode_req_count > 0:
-            # For mixed batch, the decode tokens are at the start of zxBCdt
-            seq_len = 1 + context.num_speculative_tokens
-            decode_token_count = decode_req_count * seq_len
-
-            zxBCdt_decode = zxBCdt[:decode_token_count] if prefill_req_count > 0 else zxBCdt
-
-            # Reshape from [N*S, 1, d] to [N, S, d] for the 3D Triton kernels
-            zxBCdt_decode = zxBCdt_decode.squeeze(1).view(decode_req_count, seq_len, -1)
-
-            y_decode = self._ssm_decode(
-                zxBCdt_decode,
-                conv_state,
-                ssm_state,
-                batch_indices=context.ssm_metadata.batch_indices_decode,
-                intermediate_conv_state=int_conv_state,
-                intermediate_ssm_state=int_ssm_state,
-            )
-
-            # Flatten back to [N*S, 1, d] to match merge logic
-            y_decode = y_decode.view(decode_token_count, 1, -1)
-
-        # Prefill
-        if prefill_req_count > 0:
-            if decode_req_count > 0:
-                # If mixed, slice the prefill portion out of zxBCdt
-                zxBCdt_prefill = torch.empty_like(zxBCdt)
-                tensor_get_slice_after(
-                    zxBCdt,
-                    zxBCdt_prefill,
-                    context.ssm_metadata.device_decode_prefill,
-                    check_bounds=False,
-                )
-            else:
-                zxBCdt_prefill = zxBCdt
-
-            y_prefill = self._ssm_prefill(zxBCdt_prefill, conv_state, ssm_state, context)
-
-        # Merge decode and prefill results if necessary
-        if y_decode is not None and y_prefill is not None:
-            y = torch.empty(
-                [token_count, 1, y_prefill.shape[-1]],
-                dtype=y_prefill.dtype,
-                device=y_prefill.device,
-            )
-            tensor_merge(
-                y_decode, y_prefill, context.ssm_metadata.device_decode_prefill, output_tensor=y
-            )
-        elif y_decode is not None:
-            y = y_decode
-        elif y_prefill is not None:
-            y = y_prefill
-        else:
-            raise RuntimeError("Dynamic inference called with 0 decode and 0 prefill requests")
-
-        # Clear the outputs for padding tokens when using quantization scales
-        # to avoid corrupting amax calculations
-        if is_using_quantization_scales(self.config):
-            y[context.padding_slice] = 0.0
-
-        # Output projection
-        out, out_bias = self.out_proj(y)
-
-        return out, out_bias
 
 
     def _decode(
@@ -721,6 +623,10 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
         conv_seq_start = None
 
         if context is not None:
+            sequence_packing_available, reason = _check_mamba_sequence_packing_support(
+                for_inference_not_training=True
+            )
+            assert sequence_packing_available, reason
             assert self.cp.cp_size == 1, (
                 "Context parallel is not supported for MambaMixer dynamic inference prefill"
             )
@@ -1183,23 +1089,6 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
             y = self.norm(y, z)
 
         return y
-
-    # ------------------------------------------------------------------
-    # SSMDynamicInferenceMixin hooks.
-    #
-    # These implement the minimal-viable dynamic-batching path via the
-    # shared mixin interface. MambaMixer.forward continues to use the
-    # fully-optimised _dynamic_inference override (which additionally
-    # supports speculative decoding, prefix caching, and CUDA-graph
-    # capture). The hooks below make MambaMixer a valid linear-attention
-    # backend for callers that go through ssm_dynamic_inference.
-    # ------------------------------------------------------------------
-    def _ssm_in_projection(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        proj, _ = self.in_proj(hidden_states)
-        return proj
-
-    def _ssm_out_projection(self, y: torch.Tensor):
-        return self.out_proj(y)
 
     def mamba_state_shapes_per_request(self) -> Tuple[Tuple[int], Tuple[int]]:
         """Returns the Mamba conv and ssm states shapes per request."""

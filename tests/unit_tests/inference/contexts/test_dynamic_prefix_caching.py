@@ -112,7 +112,7 @@ class PrefixCachingTestBase:
     @staticmethod
     def _mamba_allocate_and_register(ctx, bids):
         """Allocate Mamba cache slots and register hashes for a list of block IDs."""
-        msa = ctx.mamba_slot_allocator
+        msa = ctx.ssm_slot_allocator
         alloc = ctx.kv_block_allocator
         slots = msa.allocate_slots_batch(bids)
         bid_tensor = torch.tensor(bids, dtype=torch.int64, device=alloc.block_hashes.device)
@@ -617,37 +617,37 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         bs = ctx.block_size_tokens
 
         # allocated when prefix_caching_mamba_gb is set
-        assert ctx.mamba_slot_allocator.max_slots > 0
-        assert ctx.mamba_slot_allocator.conv_states is not None
-        assert ctx.mamba_slot_allocator.free_count == ctx.mamba_slot_allocator.max_slots
+        assert ctx.ssm_slot_allocator.max_slots > 0
+        assert ctx.ssm_slot_allocator.conv_states is not None
+        assert ctx.ssm_slot_allocator.free_count == ctx.ssm_slot_allocator.max_slots
 
         # not allocated when None
         ctx_none = self._mctx(prefix_caching_mamba_gb=None)
-        assert ctx_none.mamba_slot_allocator is None
+        assert ctx_none.ssm_slot_allocator is None
 
         # store and restore round-trips
         prompt = self._prompt(bs * 2)
         req = self._req(ctx, prompt.clone())
         ctx.add_request(req)
         block_id = ctx.request_to_kv_block_ids[0][0].item()
-        slot = ctx.mamba_slot_allocator.allocate_slots_batch([block_id])[0]
-        for layer_idx in range(ctx.num_mamba_layers):
-            ssm = torch.ones_like(ctx.mamba_slot_allocator.ssm_states[layer_idx, slot]) * (
+        slot = ctx.ssm_slot_allocator.allocate_slots_batch([block_id])[0]
+        for layer_idx in range(ctx.num_ssm_layers):
+            ssm = torch.ones_like(ctx.ssm_slot_allocator.ssm_states[layer_idx, slot]) * (
                 layer_idx + 1
             )
-            conv = torch.ones_like(ctx.mamba_slot_allocator.conv_states[layer_idx, slot]) * (
+            conv = torch.ones_like(ctx.ssm_slot_allocator.conv_states[layer_idx, slot]) * (
                 layer_idx + 10
             )
-            ctx.mamba_slot_allocator.store_from_tensors(block_id, layer_idx, ssm, conv)
-        assert ctx.mamba_slot_allocator.has_state(block_id)
+            ctx.ssm_slot_allocator.store_from_tensors(block_id, layer_idx, ssm, conv)
+        assert ctx.ssm_slot_allocator.has_state(block_id)
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         ctx.add_request(req2)
-        assert ctx.mamba_slot_allocator.restore_to_live(1, block_id)
-        mamba_idx = ctx.mamba_metadata.request_to_mamba_state_idx[1].item()
-        for layer_idx in range(ctx.num_mamba_layers):
+        assert ctx.ssm_slot_allocator.restore_to_live(1, block_id)
+        mamba_idx = ctx.ssm_metadata.request_to_ssm_state_idx[1].item()
+        for layer_idx in range(ctx.num_ssm_layers):
             assert torch.allclose(
-                ctx.mamba_ssm_states[layer_idx, mamba_idx],
-                torch.ones_like(ctx.mamba_ssm_states[layer_idx, mamba_idx]) * (layer_idx + 1),
+                ctx.ssm_recurrent_states[layer_idx, mamba_idx],
+                torch.ones_like(ctx.ssm_recurrent_states[layer_idx, mamba_idx]) * (layer_idx + 1),
             )
 
         # invalidate frees slot
@@ -655,20 +655,20 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         p3 = self._prompt(bs * 2)
         ctx3.add_request(self._req(ctx3, p3.clone()))
         bid3 = ctx3.request_to_kv_block_ids[0][0].item()
-        ctx3.mamba_slot_allocator.allocate_slots_batch([bid3])
-        assert ctx3.mamba_slot_allocator.has_state(bid3)
-        free_before = ctx3.mamba_slot_allocator.free_count
-        ctx3.mamba_slot_allocator.invalidate_block(bid3)
+        ctx3.ssm_slot_allocator.allocate_slots_batch([bid3])
+        assert ctx3.ssm_slot_allocator.has_state(bid3)
+        free_before = ctx3.ssm_slot_allocator.free_count
+        ctx3.ssm_slot_allocator.invalidate_block(bid3)
         assert (
-            not ctx3.mamba_slot_allocator.has_state(bid3)
-            and ctx3.mamba_slot_allocator.free_count == free_before + 1
+            not ctx3.ssm_slot_allocator.has_state(bid3)
+            and ctx3.ssm_slot_allocator.free_count == free_before + 1
         )
 
         # slot reuse for same block
         ctx4 = self._mctx()
         ctx4.add_request(self._req(ctx4, self._prompt(bs * 2)))
         bid4 = ctx4.request_to_kv_block_ids[0][0].item()
-        s1, s2 = ctx4.mamba_slot_allocator.allocate_slots_batch([bid4, bid4])
+        s1, s2 = ctx4.ssm_slot_allocator.allocate_slots_batch([bid4, bid4])
         assert s1 == s2
 
         # two-map hash design: kv and mamba maps are independent
@@ -676,7 +676,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         alloc5 = ctx5.kv_block_allocator
         p5 = self._prompt(bs * 3)
         ctx5.add_request(self._req(ctx5, p5.clone()))
-        msa5 = ctx5.mamba_slot_allocator
+        msa5 = ctx5.ssm_slot_allocator
         assert len(alloc5.kv_hash_to_block_id) == 3 and len(msa5.hash_to_block_id) == 0
         self._mamba_allocate_and_register(ctx5, self._block_ids(ctx5, 0, 3)[:2])
         assert len(alloc5.kv_hash_to_block_id) == 3 and len(msa5.hash_to_block_id) == 2
@@ -686,7 +686,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         alloc6 = ctx6.kv_block_allocator
         p6 = self._prompt(bs * 4)
         ctx6.add_request(self._req(ctx6, p6.clone()))
-        msa6 = ctx6.mamba_slot_allocator
+        msa6 = ctx6.ssm_slot_allocator
         self._mamba_allocate_and_register(ctx6, self._block_ids(ctx6, 0, 4)[:2])
         engine6 = _StubEngine(ctx6)
         assert engine6._find_mamba_match_count(self._req(ctx6, p6.clone(), request_id=2)) == 2
@@ -704,18 +704,18 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         ctx8 = self._mctx()
         ctx8.add_request(self._req(ctx8, self._prompt(bs * 3)))
         bids8 = self._block_ids(ctx8, 0, 3)
-        initial_free = ctx8.mamba_slot_allocator.free_count
-        ctx8.mamba_slot_allocator.allocate_slots_batch(bids8)
-        assert ctx8.mamba_slot_allocator.free_count == initial_free - 3
-        ctx8.mamba_slot_allocator.invalidate_block(bids8[0])
+        initial_free = ctx8.ssm_slot_allocator.free_count
+        ctx8.ssm_slot_allocator.allocate_slots_batch(bids8)
+        assert ctx8.ssm_slot_allocator.free_count == initial_free - 3
+        ctx8.ssm_slot_allocator.invalidate_block(bids8[0])
         assert (
-            ctx8.mamba_slot_allocator.free_count == initial_free - 2
-            and not ctx8.mamba_slot_allocator.has_state(bids8[0])
+            ctx8.ssm_slot_allocator.free_count == initial_free - 2
+            and not ctx8.ssm_slot_allocator.has_state(bids8[0])
         )
-        ctx8.mamba_slot_allocator.allocate_slots_batch([bids8[0]])
+        ctx8.ssm_slot_allocator.allocate_slots_batch([bids8[0]])
         assert (
-            ctx8.mamba_slot_allocator.free_count == initial_free - 3
-            and ctx8.mamba_slot_allocator.has_state(bids8[0])
+            ctx8.ssm_slot_allocator.free_count == initial_free - 3
+            and ctx8.ssm_slot_allocator.has_state(bids8[0])
         )
 
     @pytest.mark.internal
@@ -724,7 +724,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         ctx = self._mctx()
         bs = ctx.block_size_tokens
         alloc = ctx.kv_block_allocator
-        msa = ctx.mamba_slot_allocator
+        msa = ctx.ssm_slot_allocator
         prompt = self._prompt(bs * 3)
         ctx.add_request(self._req(ctx, prompt.clone()))
         self._mamba_allocate_and_register(ctx, self._block_ids(ctx, 0, 3)[:1])
@@ -768,7 +768,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         # KV eviction invalidates mamba
         ctx5 = self._mctx(prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO)
         alloc5 = ctx5.kv_block_allocator
-        msa5 = ctx5.mamba_slot_allocator
+        msa5 = ctx5.ssm_slot_allocator
         p5 = self._prompt(bs * 2)
         ctx5.add_request(self._req(ctx5, p5.clone()))
         bid5 = ctx5.request_to_kv_block_ids[0][0].item()
@@ -786,7 +786,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         ctx = self._mctx(block_size_tokens=bs)
         prompt = self._prompt(bs * 4)
         ctx.add_request(self._req(ctx, prompt.clone()))
-        msa = ctx.mamba_slot_allocator
+        msa = ctx.ssm_slot_allocator
         self._mamba_allocate_and_register(ctx, self._block_ids(ctx, 0, 4)[:2])
         req2 = self._req(ctx, prompt.clone(), request_id=2)
         req2._mamba_num_matched_blocks = 2
@@ -815,7 +815,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         prompt_len = bs * 3 + bs // 2
         p2 = self._prompt(prompt_len)
         ctx2.add_request(self._req(ctx2, p2.clone()))
-        msa2 = ctx2.mamba_slot_allocator
+        msa2 = ctx2.ssm_slot_allocator
         self._mamba_allocate_and_register(ctx2, self._block_ids(ctx2, 0, 3)[:2])
         req2b = self._req(ctx2, p2.clone(), request_id=2)
         req2b._mamba_num_matched_blocks = 2
@@ -837,31 +837,31 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         # Deferred Mamba ops execute during transfer.
         ctx3.initialize_attention_state()
         ctx3.transfer_bookkeeping_to_gpu()
-        assert ctx3.mamba_slot_allocator._eos_cache_block_id_cpu[1].item() >= 0
+        assert ctx3.ssm_slot_allocator._eos_cache_block_id_cpu[1].item() >= 0
 
         # intermediate output buffers are pre-allocated
         ctx4 = self._mctx()
-        msa4 = ctx4.mamba_slot_allocator
-        assert msa4.intermediate_ssm_out.shape[0] == ctx4.num_mamba_layers
-        assert msa4.intermediate_conv_out.shape[0] == ctx4.num_mamba_layers
+        msa4 = ctx4.ssm_slot_allocator
+        assert msa4.intermediate_ssm_out.shape[0] == ctx4.num_ssm_layers
+        assert msa4.intermediate_conv_out.shape[0] == ctx4.num_ssm_layers
         assert msa4.intermediate_ssm_out.shape[1] == msa4.max_intermediate_count
 
         # store_from_live copies all layers
         ctx5 = self._mctx()
-        msa5 = ctx5.mamba_slot_allocator
+        msa5 = ctx5.ssm_slot_allocator
         p5 = self._prompt(ctx5.block_size_tokens * 2)
         ctx5.add_request(self._req(ctx5, p5.clone()))
         bid5 = ctx5.request_to_kv_block_ids[0][0].item()
         slot5 = msa5.allocate_slots_batch([bid5])[0]
-        mamba_idx = ctx5.mamba_metadata.request_to_mamba_state_idx[0].item()
-        for layer in range(ctx5.num_mamba_layers):
-            ctx5.mamba_conv_states[layer, mamba_idx] = layer + 1.0
-            ctx5.mamba_ssm_states[layer, mamba_idx] = layer + 100.0
+        mamba_idx = ctx5.ssm_metadata.request_to_ssm_state_idx[0].item()
+        for layer in range(ctx5.num_ssm_layers):
+            ctx5.ssm_conv_states[layer, mamba_idx] = layer + 1.0
+            ctx5.ssm_recurrent_states[layer, mamba_idx] = layer + 100.0
         msa5.store_from_live_batch([slot5], [0])
-        for layer in range(ctx5.num_mamba_layers):
+        for layer in range(ctx5.num_ssm_layers):
             assert torch.allclose(
-                ctx5.mamba_slot_allocator.conv_states[layer, slot5],
-                torch.full_like(ctx5.mamba_slot_allocator.conv_states[layer, slot5], layer + 1.0),
+                ctx5.ssm_slot_allocator.conv_states[layer, slot5],
+                torch.full_like(ctx5.ssm_slot_allocator.conv_states[layer, slot5], layer + 1.0),
             )
 
 
@@ -898,7 +898,7 @@ class TestMixedCachedAndFreshPrefill(PrefixCachingTestBase):
             block_ids_0 = self._block_ids(ctx, 0, 2)
             for bid in block_ids_0:
                 bh = ctx.kv_block_allocator.block_hashes[bid].item()
-                ctx.mamba_slot_allocator.register_block_hashes_batch([bid], [bh])
+                ctx.ssm_slot_allocator.register_block_hashes_batch([bid], [bh])
 
         ctx.request_kv_length_offsets[0] += prompt_len
         ctx.request_query_lengths[0] = 1
@@ -979,7 +979,7 @@ class TestMambaSlotAllocator(PrefixCachingTestBase):
     def test_allocate_slots_batch(self):
         ctx = self._mctx()
         bs = ctx.block_size_tokens
-        msa = ctx.mamba_slot_allocator
+        msa = ctx.ssm_slot_allocator
 
         # Basic batch: allocate 3 new slots, verify unique slots and mappings
         prompt = self._prompt(bs * 4)
@@ -1004,7 +1004,7 @@ class TestMambaSlotAllocator(PrefixCachingTestBase):
         ctx2 = self._mctx()
         ctx2.add_request(self._req(ctx2, self._prompt(bs * 2)))
         bid_new = self._block_ids(ctx2, 0, 1)[0]
-        msa2 = ctx2.mamba_slot_allocator
+        msa2 = ctx2.ssm_slot_allocator
         free_before2 = msa2.free_count
         dup_slots = msa2.allocate_slots_batch([bid_new, bid_new])
         assert dup_slots[0] == dup_slots[1]
@@ -1014,7 +1014,7 @@ class TestMambaSlotAllocator(PrefixCachingTestBase):
         ctx3 = self._mctx()
         ctx3.add_request(self._req(ctx3, self._prompt(bs * 3)))
         bids3 = self._block_ids(ctx3, 0, 3)
-        msa3 = ctx3.mamba_slot_allocator
+        msa3 = ctx3.ssm_slot_allocator
         pre_slot = msa3.allocate_slots_batch([bids3[0]])[0]
         free_before3 = msa3.free_count
         mixed_slots = msa3.allocate_slots_batch(bids3)
@@ -1023,7 +1023,7 @@ class TestMambaSlotAllocator(PrefixCachingTestBase):
 
         # Eviction: exhaust free pool, verify eviction fires and returns valid slots
         ctx4 = self._mctx(prefix_caching_mamba_gb=0.001)
-        msa4 = ctx4.mamba_slot_allocator
+        msa4 = ctx4.ssm_slot_allocator
         total_slots = msa4.max_slots
         ctx4.add_request(self._req(ctx4, self._prompt(bs * 4)))
         bids4 = self._block_ids(ctx4, 0, 4)
@@ -1047,9 +1047,9 @@ class TestMambaSlotAllocator(PrefixCachingTestBase):
     def test_commit_intermediate_states_batched(self):
         ctx = self._mctx(block_size_tokens=256)
         bs = ctx.block_size_tokens
-        msa = ctx.mamba_slot_allocator
+        msa = ctx.ssm_slot_allocator
         alloc = ctx.kv_block_allocator
-        metadata = ctx.mamba_metadata
+        metadata = ctx.ssm_metadata
 
         # Set up context with a prefill request that has block-aligned prompt
         prompt = self._prompt(bs * 3)
@@ -1065,7 +1065,7 @@ class TestMambaSlotAllocator(PrefixCachingTestBase):
         ctx_idx = prefill_start  # first prefill request
 
         # Write known patterns to intermediate output buffers
-        for layer in range(ctx.num_mamba_layers):
+        for layer in range(ctx.num_ssm_layers):
             msa.intermediate_ssm_out[layer, 0] = layer + 1.0
             msa.intermediate_conv_out[layer, 0] = layer + 100.0
 
@@ -1085,10 +1085,10 @@ class TestMambaSlotAllocator(PrefixCachingTestBase):
         msa._eos_cache_block_id_cpu[ctx_idx] = eos_bid
 
         # Write known patterns to live mamba state for EOS copy
-        mamba_idx = metadata.request_to_mamba_state_idx[ctx_idx].item()
-        for layer in range(ctx.num_mamba_layers):
-            ctx.mamba_conv_states[layer, mamba_idx] = layer + 200.0
-            ctx.mamba_ssm_states[layer, mamba_idx] = layer + 300.0
+        mamba_idx = metadata.request_to_ssm_state_idx[ctx_idx].item()
+        for layer in range(ctx.num_ssm_layers):
+            ctx.ssm_conv_states[layer, mamba_idx] = layer + 200.0
+            ctx.ssm_recurrent_states[layer, mamba_idx] = layer + 300.0
 
         # Call the batched commit
         msa.commit_intermediate_states()
@@ -1096,7 +1096,7 @@ class TestMambaSlotAllocator(PrefixCachingTestBase):
         # Verify intermediate state was copied to correct slot
         slot0 = msa.block_to_slot[bid0].item()
         assert slot0 >= 0
-        for layer in range(ctx.num_mamba_layers):
+        for layer in range(ctx.num_ssm_layers):
             assert torch.allclose(
                 msa.ssm_states[layer, slot0],
                 torch.full_like(msa.ssm_states[layer, slot0], layer + 1.0),
@@ -1109,7 +1109,7 @@ class TestMambaSlotAllocator(PrefixCachingTestBase):
         # Verify EOS state was copied from live buffer
         eos_slot = msa.block_to_slot[eos_bid].item()
         assert eos_slot >= 0
-        for layer in range(ctx.num_mamba_layers):
+        for layer in range(ctx.num_ssm_layers):
             assert torch.allclose(
                 msa.conv_states[layer, eos_slot],
                 torch.full_like(msa.conv_states[layer, eos_slot], layer + 200.0),

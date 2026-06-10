@@ -25,16 +25,20 @@ variant-specific work to a small set of hooks. New linear-attention variants
 should subclass this mixin and implement the four ``_ssm_*`` hooks rather than
 re-deriving the decode/prefill bookkeeping.
 
-MVP scope: this path deliberately does not yet cover speculative decoding,
-Mamba prefix caching, chunked prefill, or CUDA-graph capture. Those are layered
-on top of the same hooks incrementally; ``MambaMixer`` keeps its own fully
-optimized override for now. See ``GatedDeltaProductMixer`` for the first
-adopter.
+Speculative decoding is supported by the shared orchestration: the decode path
+reshapes tokens into ``[batch, seq_len, d]``, fetches intermediate state buffers
+from the context, and passes them to ``_ssm_decode``. Variants that do not yet
+support speculative decoding should assert ``batch_size == 1 or seq_len == 1``
+(or equivalent) inside their ``_ssm_decode`` implementation.
+
+Chunked prefill and prefix caching are handled entirely inside ``_ssm_prefill``
+via ``context.ssm_metadata`` and ``context.ssm_slot_allocator``; the mixin
+orchestration is unaware of them.
 """
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -43,6 +47,7 @@ from megatron.core.inference.contexts.attention_context.triton.tensor_ops import
     tensor_get_slice_after,
     tensor_merge,
 )
+from megatron.core.utils import is_using_quantization_scales
 
 
 class SSMDynamicInferenceMixin:
@@ -52,28 +57,32 @@ class SSMDynamicInferenceMixin:
     # ------------------------------------------------------------------
     # Hooks implemented by concrete mixers.
     # ------------------------------------------------------------------
-    def _ssm_in_projection(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Project packed ``[token_count, 1, d_model]`` input to the mixer's
-        internal projection layout ``[token_count, 1, proj_dim]``."""
-        raise NotImplementedError
-
     def _ssm_decode(
         self,
         proj: torch.Tensor,
         conv_state: torch.Tensor,
         ssm_state: torch.Tensor,
         batch_indices: torch.Tensor,
+        intermediate_conv_state: Optional[torch.Tensor] = None,
+        intermediate_ssm_state: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run the single-token-per-request decode kernels.
 
         Args:
-            proj: ``[decode_token_count, 1, proj_dim]`` projected decode tokens.
+            proj: ``[decode_req_count, seq_len, proj_dim]`` projected decode tokens,
+                where ``seq_len = 1 + num_speculative_tokens``.
             conv_state: ``[num_slots, conv_channels, d_conv]`` conv state cache.
             ssm_state: ``[num_slots, *ssm_shape]`` SSM state cache.
             batch_indices: ``[decode_req_count]`` slot index per decode request
                 (``-1`` marks padding slots).
+            intermediate_conv_state: Optional buffer for storing conv states at
+                intermediate sequence steps (speculative decoding).
+            intermediate_ssm_state: Optional buffer for storing SSM states at
+                intermediate sequence steps (speculative decoding).
 
-        Returns ``[decode_token_count, 1, d_inner]``; updates state in place.
+        Returns ``[decode_req_count, seq_len, d_inner]``; updates state in place.
+        Variants that do not yet support speculative decoding should assert
+        ``seq_len == 1`` inside their implementation.
         """
         raise NotImplementedError
 
@@ -100,29 +109,25 @@ class SSMDynamicInferenceMixin:
         """
         raise NotImplementedError
 
-    def _ssm_out_projection(self, y: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Apply the output projection to the merged ``[token_count, 1, d_inner]``
-        activation, returning ``(out, out_bias)``."""
-        raise NotImplementedError
-
     # ------------------------------------------------------------------
     # Shared orchestration.
     # ------------------------------------------------------------------
     def ssm_dynamic_inference(
         self, hidden_states: torch.Tensor, context: DynamicInferenceContext
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Execute one dynamic inference step for a linear-attention mixer.
-
-        Mirrors the decode/prefill split that ``MambaMixer._dynamic_inference``
-        performs, but is kernel-agnostic: the actual recurrences happen inside
-        the ``_ssm_decode`` / ``_ssm_prefill`` hooks.
-        """
-        # The dynamic context lays the conv/ssm state slabs out per *mamba*
-        # layer index; GDP-style layers register as Mamba layers, so the same
-        # accessor and layer_map apply.
+        """Execute one dynamic inference step for a linear-attention mixer."""
         conv_state, ssm_state = context.ssm_states_cache(
             self.layer_number - self.pp_layer_offset
         )
+
+        # Fetch intermediate state buffers for speculative decoding.
+        # These are pre-allocated output buffers; existing data is overwritten.
+        int_conv_state = None
+        int_ssm_state = None
+        if context.num_speculative_tokens > 0:
+            int_conv_state, int_ssm_state = context.ssm_states_cache(
+                self.layer_number - self.pp_layer_offset, intermediate=True
+            )
 
         padded_dims = context.padded_batch_dimensions
         token_count = padded_dims.token_count
@@ -131,23 +136,28 @@ class SSMDynamicInferenceMixin:
         metadata = context.ssm_metadata
 
         # Input projection over the full packed batch.
-        proj = self._ssm_in_projection(hidden_states)
+        proj, _ = self.in_proj(hidden_states)
 
         y_decode = None
         y_prefill = None
 
         # --- Decode partition (placed first in the packed batch) ---------
         if decode_req_count > 0:
-            # MVP: exactly one token per decode request (no speculative tokens).
-            assert context.num_speculative_tokens == 0, (
-                "Linear-attention dynamic inference MVP does not support "
-                "speculative decoding yet."
-            )
-            decode_token_count = decode_req_count
+            seq_len = 1 + context.num_speculative_tokens
+            decode_token_count = decode_req_count * seq_len
             proj_decode = proj[:decode_token_count] if prefill_req_count > 0 else proj
+            # Reshape from [N*S, 1, d] to [N, S, d] for the decode kernels.
+            proj_decode = proj_decode.squeeze(1).view(decode_req_count, seq_len, -1)
             y_decode = self._ssm_decode(
-                proj_decode, conv_state, ssm_state, metadata.batch_indices_decode
+                proj_decode,
+                conv_state,
+                ssm_state,
+                metadata.batch_indices_decode,
+                intermediate_conv_state=int_conv_state,
+                intermediate_ssm_state=int_ssm_state,
             )
+            # Flatten back to [N*S, 1, d] to match the merge logic.
+            y_decode = y_decode.view(decode_token_count, 1, -1)
 
         # --- Prefill partition -------------------------------------------
         if prefill_req_count > 0:
@@ -180,4 +190,8 @@ class SSMDynamicInferenceMixin:
                 "Dynamic inference called with 0 decode and 0 prefill requests"
             )
 
-        return self._ssm_out_projection(y)
+        # Zero padding positions to avoid corrupting quantization amax calculations.
+        if is_using_quantization_scales(self.config):
+            y[context.padding_slice] = 0.0
+
+        return self.out_proj(y)

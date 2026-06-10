@@ -1535,7 +1535,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert 3 not in active_ids
 
         # Store the Mamba state tensor idx for request 2
-        req2_mamba_idx = ctx.mamba_metadata.request_to_mamba_state_idx[req2_idx].item()
+        req2_mamba_idx = ctx.ssm_metadata.request_to_ssm_state_idx[req2_idx].item()
 
         # Verify that the active token count is the maximum token count
         assert ctx.active_token_count == 52
@@ -1549,7 +1549,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
         # Verify that request 2 is still the first prefill request
         assert ctx.request_ids.tolist().index(2) == 1
-        assert ctx.mamba_metadata.request_to_mamba_state_idx[1] == req2_mamba_idx
+        assert ctx.ssm_metadata.request_to_ssm_state_idx[1] == req2_mamba_idx
 
         # Verify that request 1 is running decode
         active_ids = ctx.request_ids[: ctx.total_request_count].tolist()
@@ -1578,7 +1578,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
         # Verify that request 2 is still the first prefill request
         assert ctx.request_ids.tolist().index(2) == 1
-        assert ctx.mamba_metadata.request_to_mamba_state_idx[1] == req2_mamba_idx
+        assert ctx.ssm_metadata.request_to_ssm_state_idx[1] == req2_mamba_idx
 
         # Run step 5
         env.engine.step_modern()
@@ -1592,7 +1592,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
         # Verify that request 2 is still the first prefill request
         assert ctx.request_ids.tolist().index(2) == 0
-        assert ctx.mamba_metadata.request_to_mamba_state_idx[0] == req2_mamba_idx
+        assert ctx.ssm_metadata.request_to_ssm_state_idx[0] == req2_mamba_idx
 
         # Verify that request 3 is now scheduled as the chunked prefill request
         active_ids = ctx.request_ids[: ctx.total_request_count].tolist()
@@ -1603,7 +1603,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert req3_idx == 1
 
         # Store the Mamba state tensor idx for request 3
-        req3_mamba_idx = ctx.mamba_metadata.request_to_mamba_state_idx[req3_idx].item()
+        req3_mamba_idx = ctx.ssm_metadata.request_to_ssm_state_idx[req3_idx].item()
 
         # Run step 6
         env.engine.step_modern()
@@ -1618,7 +1618,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         # Verify that request 3 is now the first prefill request
         req3_idx = ctx.request_ids.tolist().index(3)
         assert req3_idx == 0
-        assert ctx.mamba_metadata.request_to_mamba_state_idx[0] == req3_mamba_idx
+        assert ctx.ssm_metadata.request_to_ssm_state_idx[0] == req3_mamba_idx
 
         # Run step 7
         env.engine.step_modern()
@@ -4686,7 +4686,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         the correct number of tokens.
 
         Two requests run simultaneously to exercise batched rewind indexing
-        where mamba_metadata.request_to_mamba_state_idx differs per request.
+        where ssm_metadata.request_to_ssm_state_idx differs per request.
         """
         skip_if_mamba_sequence_packing_not_available("hybrid")
 

@@ -1080,13 +1080,13 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         )
 
         if is_hybrid_model:
-            ctx.mamba_metadata.request_to_mamba_state_idx[:2] = torch.tensor(
+            ctx.ssm_metadata.request_to_ssm_state_idx[:2] = torch.tensor(
                 [0, 1], dtype=torch.int32, device=context_device
             )
-            ctx.mamba_ssm_states.zero_()
-            ctx.mamba_intermediate_ssm_states.fill_(99)
-            ctx.mamba_conv_states.zero_()
-            ctx.mamba_intermediate_conv_states.fill_(77)
+            ctx.ssm_recurrent_states.zero_()
+            ctx.ssm_intermediate_recurrent_states.fill_(99)
+            ctx.ssm_conv_states.zero_()
+            ctx.ssm_intermediate_conv_states.fill_(77)
 
         # Mock accepted token counts: Req 0 accepts 1 (rejects 2), Req 1 accepts 0 (rejects 3)
         self.text_generation_controller._init_mtp_sampling_tensors()
@@ -1123,10 +1123,10 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
         if is_hybrid_model:
             # Check Mamba state was restored from intermediate cache based on accepted counts
-            assert torch.all(ctx.mamba_ssm_states[:, 0] == 99)  # Req 0 accepted 1, loaded index 1
-            assert torch.all(ctx.mamba_ssm_states[:, 1] == 99)  # Req 1 accepted 0, loaded index 0
-            assert torch.all(ctx.mamba_conv_states[:, 0] == 77)  # Req 0 accepted 1, loaded index 1
-            assert torch.all(ctx.mamba_conv_states[:, 1] == 77)  # Req 1 accepted 0, loaded index 0
+            assert torch.all(ctx.ssm_recurrent_states[:, 0] == 99)  # Req 0 accepted 1, loaded index 1
+            assert torch.all(ctx.ssm_recurrent_states[:, 1] == 99)  # Req 1 accepted 0, loaded index 0
+            assert torch.all(ctx.ssm_conv_states[:, 0] == 77)  # Req 0 accepted 1, loaded index 1
+            assert torch.all(ctx.ssm_conv_states[:, 1] == 77)  # Req 1 accepted 0, loaded index 0
 
     @pytest.mark.internal
     def test_rewind_kv_cache_stale_padding_is_safe(self):
