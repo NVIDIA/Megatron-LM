@@ -19,7 +19,7 @@
 #   PROFILE: set to 1 to enable Nsight Systems profiling (default: 0)
 #   PROFILE_STEP_START/PROFILE_STEP_END: profiled iteration window (default: 4-5)
 
-# example script:
+# example script: 
 # DRY_RUN=0 MODEL_VARIANT=proxy USE_PACKED_SEQUENCE=1  bash ./examples/multimodal_dev/scripts/run_qwen35_vl.sh
 
 set -euo pipefail
