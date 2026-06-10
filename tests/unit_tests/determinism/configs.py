@@ -102,7 +102,7 @@ GPT_CONFIGS = [
     # ``llama-like``  — grouped-query attention, RMSNorm, gated linear unit
     #                   (Llama / modern-decoder family).
     # Perf coverage (det vs nondet breakdown) lives outside this file —
-    # ``scripts/determinism/run_nsys_breakdown.sh`` wraps the actual training
+    # ``tests/performance_tests/shell_test_utils/determinism/run_nsys_breakdown.sh`` wraps the actual training
     # entry point under ``nsys profile``. There is no pytest-side perf cell.
     pytest.param({}, id="gpt-like"),
     pytest.param(
