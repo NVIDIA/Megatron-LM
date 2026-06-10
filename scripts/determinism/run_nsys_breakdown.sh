@@ -24,9 +24,13 @@
 # tests/test_utils/recipes/h100/determinism-perf.yaml which inlines its
 # own per-mode loop (cleaner than the bash -c indirection above).
 set -euo pipefail
-OUT=$(realpath "${1:?usage: $0 OUTDIR -- CMD...}"); shift
+OUT_ARG="${1:?usage: $0 OUTDIR -- CMD...}"; shift
 [ "${1:-}" = "--" ] || { echo "expected --"; exit 64; }; shift
-mkdir -p "$OUT"
+# mkdir before realpath — ``realpath`` on a non-existent path errors out
+# under ``set -e``; the CI passes ``{assets_dir}/logs/perf-leaderboards``
+# which doesn't exist yet at first invocation.
+mkdir -p "$OUT_ARG"
+OUT=$(realpath "$OUT_ARG")
 
 for MODE in det nondet; do
   DETERMINISM_PERF_MODE=$MODE \
