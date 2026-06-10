@@ -1,0 +1,98 @@
+# Inference functional test: GPT-OSS-20B with sliding-window + sink attention (SWA).
+
+ENV_VARS:
+  CUDA_DEVICE_MAX_CONNECTIONS: 1
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
+  NCCL_ALGO: Ring
+  CUBLAS_WORKSPACE_CONFIG: :4096:8
+  HF_HOME: ${DATA_PATH}/hf_home
+
+TEST_TYPE: frozen-start
+MODE: inference
+
+MODEL_ARGS:
+  --use-mcore-models: true
+  --transformer-impl: transformer_engine
+  --distributed-backend: nccl
+
+  # Tokenizer & checkpoint
+  --tokenizer-type: HuggingFaceTokenizer
+  --tokenizer-model: unsloth/gpt-oss-20b-BF16
+  --load: ${CHECKPOINT_LOAD_PATH}/model/openai_gpt-oss-20b/v1
+  --auto-detect-ckpt-format: true
+  --ckpt-format: torch_dist
+  --no-load-optim: true
+  --no-use-tokenizer-model-from-checkpoint-args: true
+  --dist-ckpt-strictness: log_unexpected
+  --inference-ckpt-non-strict: true
+
+  # Parallelism — must match converted checkpoint (TP2 * PP2 * EP2 = 8 GPUs)
+  --tensor-model-parallel-size: 2
+  --pipeline-model-parallel-size: 2
+  --expert-model-parallel-size: 2
+  --expert-tensor-parallel-size: 1
+  --moe-token-dispatcher-type: alltoall
+  --moe-grouped-gemm: true
+
+  # GPT-OSS-20B architecture (matches converted checkpoint)
+  --num-layers: 24
+  --hidden-size: 2880
+  --ffn-hidden-size: 2880
+  --num-attention-heads: 64
+  --group-query-attention: true
+  --num-query-groups: 8
+  --kv-channels: 64
+  --num-experts: 32
+  --moe-ffn-hidden-size: 2880
+  --moe-router-topk: 4
+  --moe-router-dtype: fp32
+  --moe-router-score-function: softmax
+  --moe-router-load-balancing-type: aux_loss
+  --moe-aux-loss-coeff: 0.0
+  --untie-embeddings-and-output-weights: true
+  --disable-bias-linear: true
+  --normalization: RMSNorm
+  --position-embedding-type: yarn
+  --rotary-base: 150000
+  --rotary-percent: 1.0
+  --rotary-scaling-factor: 32.0
+  --quick-geglu: true
+  --glu-linear-offset: 1.0
+  --activation-func-clamp-value: 7.0
+  --softmax-type: learnable
+  --window-size: 127,0
+  --window-attn-skip-freq: 2
+  --padded-vocab-size: 201088
+  --make-vocab-size-divisible-by: 128
+  --seq-length: 4096
+  --max-position-embeddings: 40960
+  --no-rope-fusion: true
+  --no-masked-softmax-fusion: true
+
+  --bf16: true
+  --attention-backend: flash
+  --deterministic-mode: true
+  --micro-batch-size: 1
+
+  # Dynamic inference engine
+  --max-tokens-to-oom: 3600000
+  --inference-max-seq-length: 4096
+  --inference-dynamic-batching-buffer-size-gb: 20
+  --incoming-requests-per-step: 4
+  --inference-repeat-n: 2
+  --inference-logging-step-interval: 1
+  --log-interval: 1
+  --timing-log-level: 0
+
+  # Sampling
+  --temperature: 1.0
+  --top_k: 1
+  --return-log-probs: true
+  --num-tokens-to-generate: 16
+
+  --output-path: ${INFERENCE_OUTPUT_PATH}
+  --prompts: "The capital of France is"
+
+METRICS:
+  - "generated_tokens"
+  - "logprobs"

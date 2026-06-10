@@ -29,6 +29,14 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
             config = core_transformer_config_from_yaml(args, "language_model")
         else:
             config = core_transformer_config_from_args(args)
+    if args.position_embedding_type == 'yarn':
+        config.yarn_rotary_scaling_factor = args.rotary_scaling_factor
+        config.yarn_original_max_position_embeddings = 4096
+        config.yarn_beta_fast = 32.0
+        config.yarn_beta_slow = 1.0
+        config.yarn_mscale = args.mscale
+        config.yarn_mscale_all_dim = args.mscale_all_dim
+        config.yarn_correction_range_round_to_int = False
     if args.spec is not None:
         transformer_layer_spec = import_module(args.spec)
     else:
