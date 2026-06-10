@@ -20,7 +20,6 @@ from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.dot_product_attention import DotProductAttention
-from megatron.core.transformer.flex_attention import FlexAttention
 from megatron.core.transformer.mlp import MLPSubmodules, TEActivationFunctionBuilder
 from megatron.core.transformer.moe.experts import GroupedMLPSubmodules, SequentialMLP, TEGroupedMLP
 from megatron.core.transformer.moe.moe_layer import ExpertsBuilder
@@ -77,6 +76,10 @@ class TESpecProvider(BackendSpecProvider):
 
     def core_attention(self) -> type:
         """Which module to use for attention"""
+        if self.use_flex_attention:
+            from megatron.core.models.bagel.flex_attention import FlexAttention
+
+            return FlexAttention
         if self.fallback_to_eager_attn:
             return DotProductAttention
         return TEDotProductAttention
