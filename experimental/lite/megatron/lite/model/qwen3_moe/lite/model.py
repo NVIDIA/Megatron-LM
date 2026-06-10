@@ -390,6 +390,9 @@ class Qwen3MoEModel(nn.Module):
         self.layer_indices = layout.layer_indices
         has_embed = layout.has_embed
         has_head = layout.has_head
+        self.pre_process = has_embed
+        self.post_process = has_head
+        self.share_embeddings_and_output_weights = False
 
         self.embed: VocabParallelEmbedding | None = None
         if has_embed:
