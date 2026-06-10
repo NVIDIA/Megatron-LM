@@ -262,6 +262,8 @@ class BagelMCoreModel(GPTModel):
         # Always compute CE so output_layer participates in backward (FSDP correctness).
         # labels/loss_mask are always tensors from the dataloader; zero loss_mask means
         # CE contributes 0 to loss but output_layer.weight is still in the autograd graph.
+        # Return raw per-token CE here. The training loss function applies
+        # ce_loss_weights only when --ce-loss-reweighting is enabled, matching HF BAGEL.
         actual_Lund = len(packed_seq_params.local_und_token_indexes)
         mask = loss_mask > 0
         logits_hidden_states = last_hidden_state[:actual_Lund][mask]
@@ -273,9 +275,9 @@ class BagelMCoreModel(GPTModel):
         # across the TP group instead of plain F.cross_entropy.
         tp_size = torch.distributed.get_world_size(self.pg_collection.tp)
         if tp_size > 1:
-            ce = vocab_parallel_cross_entropy(logits, labels[mask]) * loss_mask[mask]
+            ce = vocab_parallel_cross_entropy(logits, labels[mask])
         else:
-            ce = F.cross_entropy(logits, labels[mask], reduction="none") * loss_mask[mask]
+            ce = F.cross_entropy(logits, labels[mask], reduction="none")
 
         return dict(last_hidden_state=last_hidden_state, ce=ce,
                     packed_seq_params=packed_seq_params_for_decoder)
