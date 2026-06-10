@@ -42,7 +42,6 @@ from megatron.core.distributed.distributed_data_parallel_config import Distribut
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
-from megatron.core.transformer.transformer_mot_layer import MoTTransformerLayer
 from megatron.core.utils import is_te_min_version, log_single_rank
 
 try:
@@ -58,6 +57,12 @@ except ImportError as import_megatron_fsdp_error:
     HAVE_MEGATRON_FSDP = False
 
 logger = logging.getLogger(__name__)
+
+
+def _get_default_fsdp_unit_modules() -> List[torch.nn.Module]:
+    from megatron.core.models.bagel.transformer_mot_layer import MoTTransformerLayer
+
+    return [TransformerLayer, MoTTransformerLayer]
 
 
 class FullyShardedDataParallel(_BaseDataParallel):
@@ -153,7 +158,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             self.fsdp_unit_modules = fsdp_unit_modules
         else:
             if self.ddp_config.data_parallel_sharding_strategy == "optim_grads_params":
-                self.fsdp_unit_modules = [TransformerLayer, MoTTransformerLayer]
+                self.fsdp_unit_modules = _get_default_fsdp_unit_modules()
             else:
                 self.fsdp_unit_modules = []
 
