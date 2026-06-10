@@ -232,31 +232,28 @@ class P2PCommunicator:
                 group=self.pp_group,
             )
         else:
-            ops = []
-            if send_prev_shape_tensor is not None:
-                send_prev_op = torch.distributed.P2POp(
-                    torch.distributed.isend, send_prev_shape_tensor, self.prev_rank, self.pp_group
-                )
-                ops.append(send_prev_op)
-            if recv_prev_shape_tensor is not None:
-                recv_prev_op = torch.distributed.P2POp(
-                    torch.distributed.irecv, recv_prev_shape_tensor, self.prev_rank, self.pp_group
-                )
-                ops.append(recv_prev_op)
-            if send_next_shape_tensor is not None:
-                send_next_op = torch.distributed.P2POp(
-                    torch.distributed.isend, send_next_shape_tensor, self.next_rank, self.pp_group
-                )
-                ops.append(send_next_op)
-            if recv_next_shape_tensor is not None:
-                recv_next_op = torch.distributed.P2POp(
-                    torch.distributed.irecv, recv_next_shape_tensor, self.next_rank, self.pp_group
-                )
-                ops.append(recv_next_op)
-            if len(ops) > 0:
-                reqs = torch.distributed.batch_isend_irecv(ops)
-                for req in reqs:
-                    req.wait()
+            # The shape exchange must use _p2p_ops (point-to-point isend/irecv)
+            # rather than batch_isend_irecv. batch_isend_irecv issues a single
+            # tagless NCCL group; when the pipeline-parallel group has size 2,
+            # prev_rank == next_rank (a single physical peer), so the two sends and
+            # two recvs all target the same peer and pair FIFO by enqueue order.
+            # Both ranks build ops in the same fixed order but hold opposite
+            # prev/next roles, so recv_prev_shape and recv_next_shape get silently
+            # crossed. _p2p_ops handles size 2 by routing the two directions over
+            # separate communicators (the group.WORLD trick) plus even/odd ordering,
+            # and is correct for size >= 4 (prev != next). The shape tensors are
+            # tiny (3,), so not batching them costs nothing.
+            reqs = _p2p_ops(
+                tensor_send_prev=send_prev_shape_tensor,
+                tensor_recv_prev=recv_prev_shape_tensor,
+                tensor_send_next=send_next_shape_tensor,
+                tensor_recv_next=recv_next_shape_tensor,
+                group=self.pp_group,
+                prev_pipeline_rank=self.prev_rank,
+                next_pipeline_rank=self.next_rank,
+            )
+            for req in reqs.values():
+                req.wait()
 
             # To protect against race condition when using batch_isend_irecv().
             # should take this out once the bug with batch_isend_irecv is resolved.
@@ -371,19 +368,26 @@ class P2PCommunicator:
                 return []
 
             p2p_func = _ring_exchange_wrapper
-        elif config.batch_p2p_comm:
+        elif config.batch_p2p_comm and self.pp_group.size() > 2:
             assert wait_on_reqs
             p2p_func = _batched_p2p_ops
         else:
+            # At pipeline-parallel group size 2, prev_rank == next_rank, so a
+            # bidirectional exchange posts two sends + two recvs to the same peer.
+            # Only _p2p_ops pairs these correctly (separate communicators); the
+            # batched path would FIFO-cross them, mismatching the (now-correct)
+            # shape exchange. Force _p2p_ops at size 2.
             p2p_func = _p2p_ops
 
         pp_group = self.pp_group
         next_rank = self.next_rank
         prev_rank = self.prev_rank
 
-        if config.use_ring_exchange_p2p or config.batch_p2p_comm:
+        if config.use_ring_exchange_p2p or (config.batch_p2p_comm and self.pp_group.size() > 2):
             reqs = []
         else:
+            # At size 2 the batched path is bypassed in favor of _p2p_ops (see
+            # the p2p_func dispatch above), which returns a dict of requests.
             reqs = {}
 
         tensor_recv_prev = None
