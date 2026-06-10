@@ -920,7 +920,7 @@ def get_start_time_from_progress_log():
     def _get_field(string, type):
         return type(string.split(': ')[1])
 
-    with open_file(progress_log_filename, 'r') as f:
+    with maybe_msc.open(progress_log_filename, 'r') as f:
         for line in f:
             line = line.strip()
             line_tokens = line.split('\t')
