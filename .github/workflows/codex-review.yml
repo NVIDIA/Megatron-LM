@@ -3,8 +3,46 @@ name: Codex Code Review
 on:
   issue_comment:
     types: [created]
+  push:
+    branches:
+      - pull-request/5256
 
 jobs:
+  # Temporary smoke test for PR #5256. This validates the NVIDIA repository secret
+  # and GITHUB_TOKEN comment permissions before the issue_comment workflow lands on main.
+  smoke-test:
+    name: Codex Smoke Test
+    if: |
+      github.event_name == 'push' &&
+      github.repository == 'NVIDIA/Megatron-LM' &&
+      github.ref == 'refs/heads/pull-request/5256'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      PR_NUMBER: 5256
+    steps:
+      - name: Run Codex API key smoke test
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          responses-api-endpoint: "https://inference-api.nvidia.com/v1/responses"
+          model: "azure/openai/gpt-5.5"
+          sandbox: read-only
+          prompt: |
+            This is a GitHub Actions smoke test for Megatron-LM.
+            Reply exactly: CODEX_API_KEY_SMOKE_OK
+
+      - name: Create and delete PR comment smoke test
+        run: |
+          BODY="Codex workflow smoke test: validating GITHUB_TOKEN can comment on PR #$PR_NUMBER. This comment will be deleted immediately."
+          COMMENT_ID=$(gh api repos/$REPO/issues/$PR_NUMBER/comments --method POST -f body="$BODY" --jq .id)
+          gh api repos/$REPO/issues/comments/$COMMENT_ID --method DELETE
+          echo "Created and deleted smoke-test comment $COMMENT_ID on PR #$PR_NUMBER"
+
   # Light review: quick pass for obvious bugs, typos, and test gaps
   # Trigger: /codex review
   light-review:
