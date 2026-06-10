@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@ import logging
 from contextlib import contextmanager
 from enum import Enum, auto
 from functools import partial
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -101,6 +101,54 @@ def setup_delayed_wgrad_acc_hook(module, grad_acc_func):
     for param in module.parameters():
         if getattr(param, 'skip_backward_post_hook', False):
             param.post_wgrad_grad_acc_hook = partial(grad_acc_func, [param])
+
+
+def _get_shared_expert_stream():
+    if not torch.cuda.is_available():
+        return None
+    try:
+        from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
+
+        return SharedExpertMLP.stream
+    except Exception:
+        return None
+
+
+def _is_shared_expert_param(param_to_name: Dict[torch.nn.Parameter, str], param):
+    param_name = param_to_name.get(param, "")
+    return ".shared_experts." in f".{param_name}."
+
+
+def _run_shared_expert_grad_processing_on_default_stream(
+    param_to_name: Dict[torch.nn.Parameter, str],
+    param_list: List[torch.nn.Parameter],
+    process_fn: Callable[[], None],
+) -> Optional[Tuple[torch.cuda.Stream, torch.cuda.Stream]]:
+    """Run shared expert FSDP grad handling on the default stream when needed.
+
+    Shared expert backward can complete on the shared expert stream. Grad accumulation and
+    reduce-scatter readiness are consumed by the FSDP default-stream path, so bridge from the
+    producing stream to the default stream before processing these parameters.
+    """
+    if not torch.cuda.is_available():
+        return None
+
+    if _get_shared_expert_stream() is None:
+        return None
+
+    if not any(_is_shared_expert_param(param_to_name, param) for param in param_list):
+        return None
+
+    current_stream = torch.cuda.current_stream()
+    default_stream = torch.cuda.default_stream(current_stream.device)
+    if current_stream.cuda_stream == default_stream.cuda_stream:
+        return None
+
+    default_stream.wait_stream(current_stream)
+    with torch.cuda.stream(default_stream):
+        process_fn()
+    current_stream.wait_stream(default_stream)
+    return current_stream, default_stream
 
 
 class MegatronFSDP(torch.nn.Module):
@@ -698,32 +746,43 @@ class MegatronFSDP(torch.nn.Module):
             if not param_list:
                 return
 
-            for param in param_list:
-                _grad_acc(param)
+            def _process_post_backward_gradients_impl():
+                for param in param_list:
+                    _grad_acc(param)
 
-            grad_reduce_every_bprop = self.data_parallel_sharding_strategy in [
-                "optim_grads",
-                "optim_grads_params",
-            ]
-            is_last_microbatch = getattr(self, "is_last_microbatch", False)
+                grad_reduce_every_bprop = self.data_parallel_sharding_strategy in [
+                    "optim_grads",
+                    "optim_grads_params",
+                ]
+                is_last_microbatch = getattr(self, "is_last_microbatch", False)
 
-            if grad_reduce_every_bprop or is_last_microbatch or self.model_auto_sync:
-                # Launch asynchronous reduce-scatter of gradients before the optimizer
-                # step. This requires a later call to finish_grad_sync() to wait for
-                # completion.
-                self.grad_reduce_pipeline.reduce_gradients(
-                    param_list,
-                    suggested_queue_capacity=self.suggested_RS_queue_capacity,
-                    outer_fsdp_group_grad_reduce=(
-                        # HSDP all-reduce or HFSDP reduce-scatter on the DP-Outer PG.
-                        self.dist_index.use_hybrid_fsdp
-                        and (is_last_microbatch or self.model_auto_sync)
-                    ),
+                if grad_reduce_every_bprop or is_last_microbatch or self.model_auto_sync:
+                    # Launch asynchronous reduce-scatter of gradients before the optimizer
+                    # step. This requires a later call to finish_grad_sync() to wait for
+                    # completion.
+                    self.grad_reduce_pipeline.reduce_gradients(
+                        param_list,
+                        suggested_queue_capacity=self.suggested_RS_queue_capacity,
+                        outer_fsdp_group_grad_reduce=(
+                            # HSDP all-reduce or HFSDP reduce-scatter on the DP-Outer PG.
+                            self.dist_index.use_hybrid_fsdp
+                            and (is_last_microbatch or self.model_auto_sync)
+                        ),
+                    )
+
+                # Mark parameters as processed.
+                for param in param_list:
+                    self._params_require_handle_grad.discard(param)
+
+            if (
+                _run_shared_expert_grad_processing_on_default_stream(
+                    self.param_to_name, param_list, _process_post_backward_gradients_impl
                 )
+                is not None
+            ):
+                return
 
-            # Mark parameters as processed.
-            for param in param_list:
-                self._params_require_handle_grad.discard(param)
+            _process_post_backward_gradients_impl()
 
         @torch.compiler.disable
         def _pre_forward_param_unshard(module: nn.Module, *unused):
