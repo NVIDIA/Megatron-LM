@@ -21,7 +21,7 @@ from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFac
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_context_parallel import (
     _all_to_all_cp2hp,
@@ -56,6 +56,12 @@ except ImportError:
     HAVE_FLA = False
 
 logger = logging.getLogger(__name__)
+
+# Triton's autotune key for causal_conv1d includes cdiv(total_tokens, 1024).
+# Dynamic CP causes total_tokens to vary per microbatch, triggering repeated
+# autotuning.  Aligning to this boundary collapses most variations into a
+# small number of buckets.
+_CONV_PAD_ALIGNMENT = 4096
 
 
 @dataclass
@@ -139,6 +145,22 @@ class GatedDeltaNet(MegatronModule):
         self.v_dim = self.value_head_dim * self.num_value_heads
         self.qk_dim_local_tp = self.qk_dim // self.tp_size
         self.v_dim_local_tp = self.v_dim // self.tp_size
+
+        # GDN uses head-parallel CP: each CP rank handles a slice of heads.
+        # The static cp_size (== max dynamic cp_size) must evenly divide the
+        # per-TP head counts so that every possible runtime cp_size also divides.
+        num_key_heads_per_tp = self.num_key_heads // self.tp_size
+        num_value_heads_per_tp = self.num_value_heads // self.tp_size
+        assert num_key_heads_per_tp % self.cp_size == 0, (
+            f"GDN head-parallel CP requires the static (max) cp_size ({self.cp_size}) "
+            f"to evenly divide num_key_heads per TP rank ({num_key_heads_per_tp}); "
+            f"all runtime dynamic cp_size values divide the static one and so will also divide."
+        )
+        assert num_value_heads_per_tp % self.cp_size == 0, (
+            f"GDN head-parallel CP requires the static (max) cp_size ({self.cp_size}) "
+            f"to evenly divide num_value_heads per TP rank ({num_value_heads_per_tp}); "
+            f"all runtime dynamic cp_size values divide the static one and so will also divide."
+        )
 
         # Input projection (hidden_states -> q, k, v, gate, beta, alpha)
         # TODO: for now, output gate is forced for GDN.
@@ -297,8 +319,11 @@ class GatedDeltaNet(MegatronModule):
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
+        cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+        cp_size = cp_group.size()
+
         seq_len, batch, _ = hidden_states.shape
-        seq_len = seq_len * self.sp_size * self.cp_size
+        seq_len = seq_len * self.sp_size * cp_size
 
         if inference_context is not None:
             assert (
@@ -348,7 +373,7 @@ class GatedDeltaNet(MegatronModule):
         nvtx_range_pop(suffix="in_proj")
 
         # CP All to All: CP to HP
-        if self.cp_size > 1:
+        if cp_size > 1:
             # # Pre-permute head dim so a single unsectioned a2a is equivalent to per-section a2a.
             head_perm = _build_head_perm_for_split_sections(
                 (
@@ -359,7 +384,7 @@ class GatedDeltaNet(MegatronModule):
                     self.num_value_heads // self.tp_size,
                     self.num_value_heads // self.tp_size,
                 ),
-                self.pg_collection.cp.size(),
+                cp_size,
                 torch.cuda.current_device(),
             )
             qkvzba = qkvzba.index_select(-1, head_perm)
@@ -368,21 +393,19 @@ class GatedDeltaNet(MegatronModule):
                 qkvzba,
                 seq_dim=0,
                 head_dim=-1,
-                cp_group=self.pg_collection.cp,
+                cp_group=cp_group,
                 undo_attention_load_balancing=False,
             )
-            if self.cp_size > 1:
+            if cp_size > 1:
                 # Permute at the seq dim so that a single unsectioned a2a
                 # is equivalent to per-sequence a2a.
                 # This also folds the ``_undo_attention_load_balancing`` step.
                 thd_cp_a2a_idx, thd_cp_a2a_inv = _build_thd_cp_a2a_perm(
-                    cu_seqlens_q, self.cp_size, seq_len
+                    cu_seqlens_q, cp_size, seq_len
                 )
                 qkvzba = qkvzba.index_select(0, thd_cp_a2a_idx)
         else:
-            qkvzba = tensor_a2a_cp2hp(
-                qkvzba, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
-            )
+            qkvzba = tensor_a2a_cp2hp(qkvzba, seq_dim=0, head_dim=-1, cp_group=cp_group)
 
         # Transpose: s b x --> b s x
         # From sbhd to bshd format
@@ -392,10 +415,10 @@ class GatedDeltaNet(MegatronModule):
         qkv, gate, beta, alpha = torch.split(
             qkvzba,
             [
-                (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // self.cp_size,
-                self.v_dim_local_tp // self.cp_size,
-                self.num_value_heads // self.tp_size // self.cp_size,
-                self.num_value_heads // self.tp_size // self.cp_size,
+                (self.qk_dim_local_tp * 2 + self.v_dim_local_tp) // cp_size,
+                self.v_dim_local_tp // cp_size,
+                self.num_value_heads // self.tp_size // cp_size,
+                self.num_value_heads // self.tp_size // cp_size,
             ],
             dim=-1,
         )
@@ -412,16 +435,13 @@ class GatedDeltaNet(MegatronModule):
             self.v_dim_local_tp,
         ]
         conv1d_weight = get_parameter_local_cp(
-            self.conv1d.weight,
-            dim=0,
-            cp_group=self.pg_collection.cp,
-            split_sections=qkv_channels_split_sections,
+            self.conv1d.weight, dim=0, cp_group=cp_group, split_sections=qkv_channels_split_sections
         )
         conv1d_bias = (
             get_parameter_local_cp(
                 self.conv1d.bias,
                 dim=0,
-                cp_group=self.pg_collection.cp,
+                cp_group=cp_group,
                 split_sections=qkv_channels_split_sections,
             )
             if self.conv_bias
@@ -436,36 +456,47 @@ class GatedDeltaNet(MegatronModule):
                 stride=self.conv1d.stride,
                 padding=self.conv1d.padding,
                 dilation=self.conv1d.dilation,
-                groups=self.conv_dim_local_tp // self.cp_size,
+                groups=self.conv_dim_local_tp // cp_size,
             )
             qkv = self.act_fn(conv_out[..., :seq_len])
             qkv = qkv.transpose(1, 2)  # b, d, s -> b, s, d
         else:
             assert self.activation in ["silu", "swish"]
+            _orig_seq = qkv.shape[1]
+            _pad_n = -_orig_seq % _CONV_PAD_ALIGNMENT
+            _conv_input = qkv
+            _conv_cu_seqlens = cu_seqlens_q
+            if _pad_n > 0:
+                _conv_input = torch.nn.functional.pad(qkv, (0, 0, 0, _pad_n))
+                # cu_seqlens_q is None in non-packed-sequence mode; only the
+                # last-segment offset needs to grow to cover the padding tail.
+                if cu_seqlens_q is not None:
+                    _conv_cu_seqlens = cu_seqlens_q.clone()
+                    _conv_cu_seqlens[-1] += _pad_n
             qkv, _ = causal_conv1d(
-                x=qkv,  # FLA conv1d accepts [b, s, d] format input
+                x=_conv_input,  # FLA conv1d accepts [b, s, d] format input
                 weight=conv1d_weight.squeeze(1),  # d, 1, w -> d, w
                 bias=conv1d_bias,
                 activation=self.activation,
                 initial_state=None,
                 output_final_state=False,
-                cu_seqlens=cu_seqlens_q,
+                cu_seqlens=_conv_cu_seqlens,
             )
+            if _pad_n > 0:
+                qkv = qkv[:, :_orig_seq, :]
         nvtx_range_pop(suffix="conv1d")
 
         # Prepare QKV tensors (split, reshape, L2 norm, repeat_interleave, contiguous)
         nvtx_range_push(suffix="prepare_qkv_for_gated_delta_rule")
         query, key, value, gate, beta, alpha = self._prepare_qkv_for_gated_delta_rule(
-            qkv, gate, beta, alpha, batch, seq_len
+            qkv, gate, beta, alpha, batch, seq_len, cp_size
         )
         nvtx_range_pop(suffix="prepare_qkv_for_gated_delta_rule")
 
         # Calculate g and beta
         nvtx_range_push(suffix="g_and_beta")
-        A_log_local_cp = get_parameter_local_cp(self.A_log, dim=0, cp_group=self.pg_collection.cp)
-        dt_bias_local_cp = get_parameter_local_cp(
-            self.dt_bias, dim=0, cp_group=self.pg_collection.cp
-        )
+        A_log_local_cp = get_parameter_local_cp(self.A_log, dim=0, cp_group=cp_group)
+        dt_bias_local_cp = get_parameter_local_cp(self.dt_bias, dim=0, cp_group=cp_group)
         g, beta = self._compute_g_and_beta(A_log_local_cp, dt_bias_local_cp, alpha, beta)
         nvtx_range_pop(suffix="g_and_beta")
 
@@ -496,19 +527,17 @@ class GatedDeltaNet(MegatronModule):
 
             # CP all to all: HP to CP
             if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
-                if self.cp_size > 1:
+                if cp_size > 1:
                     norm_out_hp = norm_out_hp.index_select(0, thd_cp_a2a_inv)
                 norm_out = tensor_a2a_hp2cp(
                     norm_out_hp,
                     seq_dim=0,
                     head_dim=-1,
-                    cp_group=self.pg_collection.cp,
+                    cp_group=cp_group,
                     redo_attention_load_balancing=False,
                 )
             else:
-                norm_out = tensor_a2a_hp2cp(
-                    norm_out_hp, seq_dim=0, head_dim=-1, cp_group=self.pg_collection.cp
-                )
+                norm_out = tensor_a2a_hp2cp(norm_out_hp, seq_dim=0, head_dim=-1, cp_group=cp_group)
 
             return norm_out
 
@@ -541,16 +570,14 @@ class GatedDeltaNet(MegatronModule):
         return y
 
     @jit_fuser
-    def _prepare_qkv_for_gated_delta_rule(self, qkv, gate, beta, alpha, batch, seq_len):
+    def _prepare_qkv_for_gated_delta_rule(self, qkv, gate, beta, alpha, batch, seq_len, cp_size):
         """
         Prepare query, key, value, gate, beta, alpha tensors for gated delta rule.
         Fuses split, reshape, L2 norm, repeat_interleave, and contiguous operations.
         """
         # Split qkv into query_key and value
         query_key, value = torch.split(
-            qkv,
-            [2 * self.qk_dim_local_tp // self.cp_size, self.v_dim_local_tp // self.cp_size],
-            dim=-1,
+            qkv, [2 * self.qk_dim_local_tp // cp_size, self.v_dim_local_tp // cp_size], dim=-1
         )
 
         # Reshape query_key and value
@@ -562,8 +589,7 @@ class GatedDeltaNet(MegatronModule):
             query_key = l2norm(query_key.contiguous())
 
         # Split query and key
-        split_size = self.qk_dim_local_tp // self.key_head_dim // self.cp_size
-        query, key = torch.split(query_key, [split_size, split_size], dim=2)
+        query, key = query_key.chunk(2, dim=2)
 
         # Expand query and key if needed (grouped query attention)
         if self.num_value_heads // self.num_key_heads > 1:

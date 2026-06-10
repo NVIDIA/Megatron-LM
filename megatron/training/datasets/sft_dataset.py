@@ -88,6 +88,30 @@ class SFTDataset(MegatronDataset):
             split_conversations.append(current)
         return split_conversations
 
+    def _calculate_padding_divisor(self) -> int:
+        """
+        Calculate the divisor used for sequence padding.
+        tp_pad = tp_size * 2 if tp_size > 1 else 1
+        cp_pad = cp_size * 2 if cp_size > 1 else 1
+        cp_pad = cp_pad * dp_size if dynamic_cp else cp_pad
+        divisor = cp_pad * tp_pad
+        """
+        if self.config.dynamic_context_parallel:
+            # Dynamic CP: consider both CP and DP
+            cp_pad = self.config.data_parallel_size * self.config.context_parallel_size * 2
+        else:
+            # Standard CP: only consider CP
+            cp_pad = (
+                self.config.context_parallel_size * 2
+                if self.config.context_parallel_size > 1
+                else 1
+            )
+        tp_pad = self.config.sequence_parallel_size if self.config.sequence_parallel_size > 0 else 1
+        divisor = cp_pad * tp_pad
+        # TODO(tailaim): do we need to pad for FP8 execution?
+        # divisor = ((divisor + 15) // 16) * 16
+        return divisor
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
 
         tokenizer = self.config.tokenizer
@@ -124,12 +148,11 @@ class SFTDataset(MegatronDataset):
             assert not self.config.reset_position_ids
             pack_positions.extend(range(len(tokens_list)))
 
-            if self.config.context_parallel_size > 1:
-                pad_granularity = self.config.context_parallel_size * 2
-                mod_token_count = len(pack_tokens) % pad_granularity
-                if mod_token_count != 0:
-                    pad_len = pad_granularity - mod_token_count
-                    extend_with_padding(pack_tokens, pack_targets, pack_positions, pad_len)
+            pad_granularity = self._calculate_padding_divisor()
+            mod_token_count = len(pack_tokens) % pad_granularity
+            if mod_token_count != 0:
+                pad_len = pad_granularity - mod_token_count
+                extend_with_padding(pack_tokens, pack_targets, pack_positions, pad_len)
 
             # TODO(duncan): Consider also padding to multiple of number of tokens here. This might
             # be needed for efficiency (and potentially set via command-line argument).

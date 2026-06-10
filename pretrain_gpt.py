@@ -26,13 +26,14 @@ import torch
 from gpt_builders import gpt_builder
 from megatron.core import mpu
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
+from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequence_packing
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_group,
-    get_hybrid_data_context_parallel_groups,
+    get_dynamic_data_context_parallel_groups,
 )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
@@ -54,7 +55,7 @@ from megatron.training import (
     print_rank_0,
     set_startup_timestamps,
 )
-from megatron.training.argument_utils import pretrain_cfg_container_from_args, gpt_config_from_args
+from megatron.training.argument_utils import gpt_config_from_args, pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.datasets.sft_dataset import SFTDataset
@@ -86,7 +87,21 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     is_sft = args.sft
     create_attention_mask_in_dataloader = args.create_attention_mask_in_dataloader
     mtp_on_this_rank = mtp_on_this_rank_func(layout=config.pipeline_model_parallel_layout, mtp_num_layers=config.mtp_num_layers, ignore_virtual=False, vp_stage=vp_stage)
-    is_hybrid_cp = args.hybrid_context_parallel
+    is_hybrid_cp = args.dynamic_context_parallel
+
+    if args.sequence_packing_scheduler is not None:
+        # Sequence-packing (THD) scheduler path: the wrapped data iterator
+        # emits packed micro-batches; this helper broadcasts them across TP,
+        # slices for (dynamic) CP, and returns
+        # (tokens, labels, loss_mask, attention_mask, position_ids,
+        # packed_seq_params) with a ready-made PackedSeqParams.
+        return get_batch_on_this_rank_for_sequence_packing(
+            data_iterator,
+            vpp_size=config.virtual_pipeline_model_parallel_size,
+            mtp_on_this_rank=mtp_on_this_rank,
+            vp_stage=vp_stage,
+            dynamic_cp=args.dynamic_context_parallel,
+        )
 
     if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank and not is_sft:
         return [None for _ in BATCH_KEYS]
@@ -103,7 +118,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         assert is_sft
         return None, batch['cu_seqlens'], batch['cu_seqlens_padded'], None, None, None, None, batch['max_seqlen'], None, None
     
-    batch = get_batch_on_this_cp_rank(batch, is_hybrid_cp=is_hybrid_cp, cp_group=get_context_parallel_group(), hybrid_cp_group_func=get_hybrid_data_context_parallel_groups)
+    batch = get_batch_on_this_cp_rank(batch, is_hybrid_cp=is_hybrid_cp, cp_group=get_context_parallel_group(), hybrid_cp_group_func=get_dynamic_data_context_parallel_groups)
 
     # Return values in BATCH_KEYS order so callers can unpack into the fixed
     # names regardless of any provenance fields wrappers like BlendedDataset
@@ -196,6 +211,14 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
     global stimer
     with stimer(bdata=True):
         vp_stage = get_attr_wrapped_model(model, "vp_stage")
+        batch_values = get_batch(data_iterator, vp_stage)
+
+    if args.sequence_packing_scheduler is not None:
+        # Sequence-packing scheduler path: get_batch already returns a
+        # ready-made PackedSeqParams via
+        # get_batch_on_this_rank_for_sequence_packing.
+        tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = batch_values
+    else:
         (
             attention_mask,
             cu_seqlens,
@@ -207,30 +230,30 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
             max_seqlen,
             position_ids,
             tokens,
-        ) = get_batch(data_iterator, vp_stage)
+        ) = batch_values
 
-    packed_seq_params = None
-    if cu_seqlens is not None:
-        # cu_seqlens / cu_seqlens_padded carry the dataloader's batch dim (1, n).
-        # PackedSeqParams (and TE attention) expect 1-D, so squeeze before use.
-        cu_seqlens = cu_seqlens[0]
-        if cu_seqlens_padded is not None:
-            cu_seqlens_padded = cu_seqlens_padded[0]
-        # Use real (unpadded) cu_seqlens to feed the FLOPs accounting: varlen
-        # attention only computes work for real tokens within each chunk.
-        update_seqlen_stats_from_cu_seqlens(cu_seqlens)
-        cu_seqlens_for_params = cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens # TODO(asolergi-nv): Currently there is a bug forcing cu_seqlens to be cu_seqlens_padded
-        packed_seq_params = PackedSeqParams(
-            qkv_format="thd",
-            cu_seqlens_q=cu_seqlens_for_params,
-            cu_seqlens_kv=cu_seqlens_for_params,
-            cu_seqlens_q_padded=cu_seqlens_padded,
-            cu_seqlens_kv_padded=cu_seqlens_padded,
-            max_seqlen_q=int(max_seqlen.item()),
-            max_seqlen_kv=int(max_seqlen.item()),
-            local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
-            cp_group=hybrid_cp_group,
-        )
+        packed_seq_params = None
+        if cu_seqlens is not None:
+            # cu_seqlens / cu_seqlens_padded carry the dataloader's batch dim (1, n).
+            # PackedSeqParams (and TE attention) expect 1-D, so squeeze before use.
+            cu_seqlens = cu_seqlens[0]
+            if cu_seqlens_padded is not None:
+                cu_seqlens_padded = cu_seqlens_padded[0]
+            # Use real (unpadded) cu_seqlens to feed the FLOPs accounting: varlen
+            # attention only computes work for real tokens within each chunk.
+            update_seqlen_stats_from_cu_seqlens(cu_seqlens)
+            cu_seqlens_for_params = cu_seqlens_padded if cu_seqlens_padded is not None else cu_seqlens # TODO(asolergi-nv): Currently there is a bug forcing cu_seqlens to be cu_seqlens_padded
+            packed_seq_params = PackedSeqParams(
+                qkv_format="thd",
+                cu_seqlens_q=cu_seqlens_for_params,
+                cu_seqlens_kv=cu_seqlens_for_params,
+                cu_seqlens_q_padded=cu_seqlens_padded,
+                cu_seqlens_kv_padded=cu_seqlens_padded,
+                max_seqlen_q=int(max_seqlen.item()),
+                max_seqlen_kv=int(max_seqlen.item()),
+                local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
+                cp_group=hybrid_cp_group,
+            )
 
     timers('batch-generator').stop()
 
@@ -302,7 +325,7 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         "context_parallel_size": args.context_parallel_size,
         "data_parallel_size": args.data_parallel_size,
         "sequence_parallel_size": args.tensor_model_parallel_size * args.sequence_parallel,
-        "hybrid_context_parallel": args.hybrid_context_parallel,
+        "dynamic_context_parallel": args.dynamic_context_parallel,
     }
 
     # add FIM args to the config

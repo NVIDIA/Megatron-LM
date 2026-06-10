@@ -2388,7 +2388,7 @@ class TransformerConfig(ModelParallelConfig):
                         "full-iteration CUDA graphs"
                     )
 
-        if self.moe_token_dispatcher_type in ["allgather"]:
+        if self.num_moe_experts is not None and self.moe_token_dispatcher_type in ["allgather"]:
             if self.variable_seq_lengths is True:
                 raise ValueError(
                     f"Token dispatcher type: {self.moe_token_dispatcher_type} does not support "
@@ -2581,6 +2581,40 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.attention_backend == AttnBackend.flash
             ), "Batch invariant mode only supports FlashAttention"
+
+        if self.sequence_packing_scheduler is not None:
+            # Check TE version.
+            if not HAVE_PACKAGING:
+                raise ImportError(
+                    "packaging is not installed. Please install it with `pip install packaging`."
+                )
+            # TODO: remove this after we fix the convergence issue with TE < 2.9.
+            if not (
+                is_te_min_version("2.9.0") or get_te_version() == PkgVersion("2.9.0.dev0+5b3092a")
+            ):
+                raise ValueError(
+                    "SFT sequence packing requires Transformer Engine >= 2.9.0 "
+                    f"but got {get_te_version()} (TE < 2.9.0 may have convergence issues)."
+                )
+
+            # Needed for passing variable sequences between pp stages.
+            self.variable_seq_lengths = True
+
+            if self.num_moe_experts is not None:
+                assert self.moe_token_dispatcher_type in ("alltoall", "flex"), (
+                    f"sequence_packing only supports moe_token_dispatcher_type in "
+                    f"('alltoall', 'flex'), got '{self.moe_token_dispatcher_type}'"
+                )
+
+            supported_schedulers = ['dp_balanced', 'default_dynamic_cp']
+            if (
+                self.sequence_packing_scheduler is not None
+                and self.sequence_packing_scheduler not in supported_schedulers
+            ):
+                raise ValueError(
+                    f"Unsupported scheduler: {self.sequence_packing_scheduler}. "
+                    f"Available schedulers: {supported_schedulers}"
+                )
 
 
 @dataclass

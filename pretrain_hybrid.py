@@ -31,7 +31,7 @@ from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_group,
-    get_hybrid_data_context_parallel_groups,
+    get_dynamic_data_context_parallel_groups,
 )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
@@ -85,7 +85,7 @@ def get_batch(data_iterator, vp_stage=None):
     is_sft = args.sft
     create_attention_mask_in_dataloader = args.create_attention_mask_in_dataloader
     mtp_on_this_rank = mtp_on_this_rank_func(layout=config.pipeline_model_parallel_layout, mtp_num_layers=config.mtp_num_layers, ignore_virtual=False, vp_stage=vp_stage)
-    is_hybrid_cp = args.hybrid_context_parallel
+    is_dynamic_cp = args.dynamic_context_parallel
 
     if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank and not is_sft:
         return [None for _ in BATCH_KEYS]
@@ -96,13 +96,13 @@ def get_batch(data_iterator, vp_stage=None):
         for key in BATCH_KEYS:
             batch[key] = batch[key].cuda(non_blocking=True) if key in batch and batch[key] is not None else None
 
-    batch = get_batch_on_this_tp_rank(batch, broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(), broadcast_group=mpu.get_tensor_model_parallel_group(), is_sft=is_sft, is_hybrid_cp=is_hybrid_cp, create_attention_mask_in_dataloader=create_attention_mask_in_dataloader, cp_size=cp_size, tp_rank=tp_rank, micro_batch_size=args.micro_batch_size, seq_length=args.seq_length, mtp_on_this_rank=mtp_on_this_rank, pipeline_model_parallel_size=args.pipeline_model_parallel_size, is_pipeline_first_stage=mpu.is_pipeline_first_stage(), is_pipeline_last_stage=mpu.is_pipeline_last_stage())
+    batch = get_batch_on_this_tp_rank(batch, broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(), broadcast_group=mpu.get_tensor_model_parallel_group(), is_sft=is_sft, is_hybrid_cp=is_dynamic_cp, create_attention_mask_in_dataloader=create_attention_mask_in_dataloader, cp_size=cp_size, tp_rank=tp_rank, micro_batch_size=args.micro_batch_size, seq_length=args.seq_length, mtp_on_this_rank=mtp_on_this_rank, pipeline_model_parallel_size=args.pipeline_model_parallel_size, is_pipeline_first_stage=mpu.is_pipeline_first_stage(), is_pipeline_last_stage=mpu.is_pipeline_last_stage())
 
     if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:
         assert is_sft
         return None, batch['cu_seqlens'], batch['cu_seqlens_padded'], None, None, None, None, batch['max_seqlen'], None, None
 
-    batch = get_batch_on_this_cp_rank(batch, is_hybrid_cp=is_hybrid_cp, cp_group=get_context_parallel_group(), hybrid_cp_group_func=get_hybrid_data_context_parallel_groups)
+    batch = get_batch_on_this_cp_rank(batch, is_hybrid_cp=is_dynamic_cp, cp_group=get_context_parallel_group(), hybrid_cp_group_func=get_dynamic_data_context_parallel_groups)
 
     # Return values in BATCH_KEYS order so callers can unpack into the fixed
     # names regardless of any provenance fields wrappers like BlendedDataset
@@ -294,7 +294,7 @@ def core_gpt_dataset_config_from_args(args: Any) -> GPTDatasetConfig:
         context_parallel_size=args.context_parallel_size,
         data_parallel_size=args.data_parallel_size,
         sequence_parallel_size=args.tensor_model_parallel_size * args.sequence_parallel,
-        hybrid_context_parallel=args.hybrid_context_parallel,
+        dynamic_context_parallel=args.dynamic_context_parallel,
     )
 
 
