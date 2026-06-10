@@ -95,12 +95,7 @@ def test_bridge_builds_mcore_ddp_config_object(monkeypatch):
     )
 
     ddp_config = _build_ddp_config(
-        BridgeConfig(
-            override_ddp_config={
-                "overlap_grad_reduce": True,
-                "bucket_size": 1024,
-            }
-        )
+        BridgeConfig(override_ddp_config={"overlap_grad_reduce": True, "bucket_size": 1024})
     )
 
     assert isinstance(ddp_config, _FakeDDPConfig)
@@ -165,10 +160,20 @@ def test_bridge_registers_qwen35_moe_compat_aliases(monkeypatch):
     common_utils_mod = types.SimpleNamespace(extract_expert_number_from_param=lambda name: 0)
     gpt_mod = types.SimpleNamespace(GPTModel=object)
 
-    monkeypatch.setitem(sys.modules, "megatron.bridge.models.conversion", types.SimpleNamespace(model_bridge=model_bridge))
-    monkeypatch.setitem(sys.modules, "megatron.bridge.models.conversion.mapping_registry", mapping_registry_mod)
-    monkeypatch.setitem(sys.modules, "megatron.bridge.models.conversion.param_mapping", param_mapping_mod)
-    monkeypatch.setitem(sys.modules, "megatron.bridge.models.qwen.qwen3_next_bridge", qwen_bridge_mod)
+    monkeypatch.setitem(
+        sys.modules,
+        "megatron.bridge.models.conversion",
+        types.SimpleNamespace(model_bridge=model_bridge),
+    )
+    monkeypatch.setitem(
+        sys.modules, "megatron.bridge.models.conversion.mapping_registry", mapping_registry_mod
+    )
+    monkeypatch.setitem(
+        sys.modules, "megatron.bridge.models.conversion.param_mapping", param_mapping_mod
+    )
+    monkeypatch.setitem(
+        sys.modules, "megatron.bridge.models.qwen.qwen3_next_bridge", qwen_bridge_mod
+    )
     monkeypatch.setitem(sys.modules, "megatron.bridge.utils.common_utils", common_utils_mod)
     monkeypatch.setitem(sys.modules, "megatron.core.models.gpt.gpt_model", gpt_mod)
 

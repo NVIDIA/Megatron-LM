@@ -76,29 +76,17 @@ def fixed_batches(
 
 
 def infinite_batches(
-    vocab_size: int,
-    seq_len: int,
-    batch_size: int = 1,
-    device: str = "cuda",
-    seed: int = 42,
+    vocab_size: int, seq_len: int, batch_size: int = 1, device: str = "cuda", seed: int = 42
 ):
     """Infinite deterministic batch generator (for throughput benchmarks)."""
     g = torch.Generator(device=device).manual_seed(seed)
     while True:
         yield {
             "input_ids": torch.randint(
-                0,
-                vocab_size,
-                (batch_size, seq_len),
-                device=device,
-                generator=g,
+                0, vocab_size, (batch_size, seq_len), device=device, generator=g
             ),
             "labels": torch.randint(
-                0,
-                vocab_size,
-                (batch_size, seq_len),
-                device=device,
-                generator=g,
+                0, vocab_size, (batch_size, seq_len), device=device, generator=g
             ),
         }
 
@@ -125,7 +113,9 @@ def infinite_batches_thd(
     split via zigzag striping. position_ids stay FULL because lite's RoPE
     (is_thd_format=False) auto-slices emb internally, same as BSH path.
     """
-    from megatron.core.packed_seq_params import PackedSeqParams  # pyright: ignore[reportMissingImports]  # noqa: I001
+    from megatron.core.packed_seq_params import (  # pyright: ignore[reportMissingImports]  # noqa: I001
+        PackedSeqParams,
+    )
 
     if cp_size < 1:
         raise ValueError(f"cp_size must be >= 1, got {cp_size}")
@@ -172,9 +162,9 @@ def infinite_batches_thd(
             ids_cp = zigzag_split_for_cp(ids_padded, cp_rank, cp_size, seq_dim=0)
             lbl_cp = zigzag_split_for_cp(lbl_padded, cp_rank, cp_size, seq_dim=0)
             yield {
-                "input_ids": ids_cp.unsqueeze(0),   # (1, T/cp)
-                "labels": lbl_cp.unsqueeze(0),       # (1, T/cp)
-                "position_ids": position_ids,         # FULL (3, 1, T)
+                "input_ids": ids_cp.unsqueeze(0),  # (1, T/cp)
+                "labels": lbl_cp.unsqueeze(0),  # (1, T/cp)
+                "position_ids": position_ids,  # FULL (3, 1, T)
                 "packed_seq_params": packed_seq_params,
             }
     else:
@@ -204,8 +194,4 @@ def infinite_batches_thd(
             }
 
 
-__all__ = [
-    "fixed_batches",
-    "infinite_batches",
-    "infinite_batches_thd",
-]
+__all__ = ["fixed_batches", "infinite_batches", "infinite_batches_thd"]

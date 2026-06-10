@@ -21,13 +21,7 @@ from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.config import ParallelConfig
 from megatron.lite.runtime.contracts.handle import ModelHandle
 
-
-pytestmark = [
-    pytest.mark.mlite,
-    pytest.mark.smoke,
-    pytest.mark.gpu,
-    pytest.mark.distributed,
-]
+pytestmark = [pytest.mark.mlite, pytest.mark.smoke, pytest.mark.gpu, pytest.mark.distributed]
 
 
 class TinyUnit(nn.Module):
@@ -171,10 +165,7 @@ def test_fsdp2_runtime_model_and_optimizer_offload_roundtrip_single_node():
     model, ps = _build_fsdp2_model()
     optimizer = _build_optimizer(model, ps, offload_fraction=0.0)
     handle = ModelHandle(
-        model=model,
-        optimizer=optimizer,
-        parallel_state=ps,
-        _extras={"model_chunks": [model]},
+        model=model, optimizer=optimizer, parallel_state=ps, _extras={"model_chunks": [model]}
     )
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
 
@@ -239,16 +230,19 @@ def test_fsdp2_checkpoint_load_matches_uninterrupted_training_single_node(tmp_pa
         checkpoint_dir,
         step=1,
     )
-    assert runtime.load_checkpoint(
-        ModelHandle(
-            model=loaded_model,
-            optimizer=loaded_optimizer,
-            parallel_state=loaded_ps,
-            config=_checkpoint_config(),
-            _extras={"model_chunks": [loaded_model]},
-        ),
-        checkpoint_dir,
-    ) == 1
+    assert (
+        runtime.load_checkpoint(
+            ModelHandle(
+                model=loaded_model,
+                optimizer=loaded_optimizer,
+                parallel_state=loaded_ps,
+                config=_checkpoint_config(),
+                _extras={"model_chunks": [loaded_model]},
+            ),
+            checkpoint_dir,
+        )
+        == 1
+    )
 
     _train_step(direct_model, direct_optimizer, x1, y1)
     _train_step(loaded_model, loaded_optimizer, x1, y1)

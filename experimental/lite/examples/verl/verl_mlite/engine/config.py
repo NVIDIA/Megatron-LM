@@ -33,6 +33,8 @@ class MegatronLiteEngineConfig(EngineConfig):
     def __post_init__(self) -> None:
         super().__post_init__()
         if self.strategy != "mlite":
-            raise ValueError(f"MegatronLiteEngineConfig expects strategy='mlite', got {self.strategy!r}")
+            raise ValueError(
+                f"MegatronLiteEngineConfig expects strategy='mlite', got {self.strategy!r}"
+            )
         if self.custom_backend_module:
             importlib.import_module(self.custom_backend_module)

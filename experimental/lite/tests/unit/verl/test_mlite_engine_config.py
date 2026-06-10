@@ -28,15 +28,11 @@ def _optimizer_config(**override_optimizer_config) -> SimpleNamespace:
 
 
 def _engine(
-    *,
-    engine_config: MegatronLiteEngineConfig,
-    optimizer_config: SimpleNamespace | None = None,
+    *, engine_config: MegatronLiteEngineConfig, optimizer_config: SimpleNamespace | None = None
 ) -> MegatronLiteEngine:
     return MegatronLiteEngine(
         model_config=SimpleNamespace(
-            local_path="/tmp/qwen35",
-            hf_config={"model_type": "qwen3_5_moe"},
-            mtp=None,
+            local_path="/tmp/qwen35", hf_config={"model_type": "qwen3_5_moe"}, mtp=None
         ),
         engine_config=engine_config,
         optimizer_config=optimizer_config or _optimizer_config(),
@@ -54,8 +50,7 @@ def test_optimizer_offload_enables_full_optimizer_state_offload_by_default() -> 
     engine = _engine(
         engine_config=_engine_config(optimizer_offload=True),
         optimizer_config=_optimizer_config(
-            use_precision_aware_optimizer=True,
-            decoupled_weight_decay=True,
+            use_precision_aware_optimizer=True, decoupled_weight_decay=True
         ),
     )
 
@@ -101,7 +96,7 @@ def test_mlite_config_threads_rl_parallel_and_impl_settings() -> None:
             optimizer_offload=True,
             attention_backend_override="flash",
             impl_cfg={"use_thd": True, "deterministic": False},
-        ),
+        )
     )
 
     config = engine._build_mlite_config()

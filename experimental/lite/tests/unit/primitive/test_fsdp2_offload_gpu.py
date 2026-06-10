@@ -125,10 +125,7 @@ def test_fsdp2_runtime_model_and_optimizer_offload_roundtrip_single_gpu():
     model, ps = _build_fsdp2_model()
     optimizer = _build_optimizer(model, ps, offload_fraction=0.0)
     handle = ModelHandle(
-        model=model,
-        optimizer=optimizer,
-        parallel_state=ps,
-        _extras={"model_chunks": [model]},
+        model=model, optimizer=optimizer, parallel_state=ps, _extras={"model_chunks": [model]}
     )
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
 

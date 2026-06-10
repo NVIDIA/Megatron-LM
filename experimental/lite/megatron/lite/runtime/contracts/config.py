@@ -11,6 +11,7 @@ def pick_fields(cls, src: dict[str, Any]) -> dict[str, Any]:
     """Extract fields of dataclass *cls* that exist in *src*."""
     return {f.name: src[f.name] for f in dc_fields(cls) if f.name in src}
 
+
 if TYPE_CHECKING:
     from megatron.lite.runtime.backends.bridge.config import BridgeConfig
     from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
@@ -76,13 +77,7 @@ class RuntimeConfig:
 
     backend: str = "mlite"
     hf_path: str = ""
-    backend_cfg: MegatronLiteConfig | BridgeConfig | dict[str, Any] = field(
-        default_factory=dict
-    )
+    backend_cfg: MegatronLiteConfig | BridgeConfig | dict[str, Any] = field(default_factory=dict)
 
 
-__all__ = [
-    "OptimizerConfig",
-    "ParallelConfig",
-    "RuntimeConfig",
-]
+__all__ = ["OptimizerConfig", "ParallelConfig", "RuntimeConfig"]

@@ -61,12 +61,7 @@ def save_training_checkpoint(
         ckpt_path = os.path.join(path, f"step_{step}")
         os.makedirs(ckpt_path, exist_ok=True)
         _save_distopt_checkpoint(
-            model,
-            optimizer,
-            step,
-            ckpt_path,
-            save_model=save_model,
-            save_optimizer=save_optimizer,
+            model, optimizer, step, ckpt_path, save_model=save_model, save_optimizer=save_optimizer
         )
         if save_rng:
             _save_rng_sidecar(ckpt_path)
@@ -83,11 +78,7 @@ def save_training_checkpoint(
         for name, param in model.named_parameters():
             placements = get_placements(name)
             mesh = expert_mesh if is_expert(name) else dense_mesh
-            state_dict[f"model.{name}"] = _dcp_tensor_from_param(
-                param,
-                mesh,
-                placements,
-            )
+            state_dict[f"model.{name}"] = _dcp_tensor_from_param(param, mesh, placements)
 
     ckpt_path = os.path.join(path, f"step_{step}")
     os.makedirs(ckpt_path, exist_ok=True)
@@ -128,11 +119,7 @@ def load_training_checkpoint(
     ckpt_path = _resolve_step_checkpoint_path(path)
     if _supports_distopt_distckpt(model, optimizer):
         step = _load_distopt_checkpoint(
-            model,
-            optimizer,
-            ckpt_path,
-            load_model=load_model,
-            load_optimizer=load_optimizer,
+            model, optimizer, ckpt_path, load_model=load_model, load_optimizer=load_optimizer
         )
         if load_rng:
             _load_rng_sidecar(ckpt_path)
@@ -150,11 +137,7 @@ def load_training_checkpoint(
         for name, param in model.named_parameters():
             placements = get_placements(name)
             mesh = expert_mesh if is_expert(name) else dense_mesh
-            state_dict[f"model.{name}"] = _empty_dcp_tensor_like_param(
-                param,
-                mesh,
-                placements,
-            )
+            state_dict[f"model.{name}"] = _empty_dcp_tensor_like_param(param, mesh, placements)
 
     dcp.load(state_dict, checkpoint_id=ckpt_path)
 
@@ -181,8 +164,7 @@ def _resolve_step_checkpoint_path(path: str) -> str:
         return path
 
     step_dirs = sorted(
-        [d for d in os.listdir(path) if d.startswith("step_")],
-        key=lambda d: int(d.split("_")[1]),
+        [d for d in os.listdir(path) if d.startswith("step_")], key=lambda d: int(d.split("_")[1])
     )
     if step_dirs:
         return os.path.join(path, step_dirs[-1])
@@ -207,12 +189,7 @@ def _save_distopt_checkpoint(
     from megatron.lite.primitive.ckpt.distckpt import save_distopt_checkpoint
 
     save_distopt_checkpoint(
-        model,
-        optimizer,
-        step,
-        path,
-        save_model=save_model,
-        save_optimizer=save_optimizer,
+        model, optimizer, step, path, save_model=save_model, save_optimizer=save_optimizer
     )
 
 
@@ -227,11 +204,7 @@ def _load_distopt_checkpoint(
     from megatron.lite.primitive.ckpt.distckpt import load_distopt_checkpoint
 
     return load_distopt_checkpoint(
-        model,
-        optimizer,
-        path,
-        load_model=load_model,
-        load_optimizer=load_optimizer,
+        model, optimizer, path, load_model=load_model, load_optimizer=load_optimizer
     )
 
 
@@ -299,9 +272,7 @@ def _dcp_tensor_from_param(param: torch.Tensor, mesh: DeviceMesh, placements: li
 
 
 def _empty_dcp_tensor_like_param(
-    param: torch.Tensor,
-    mesh: DeviceMesh,
-    placements: list,
+    param: torch.Tensor, mesh: DeviceMesh, placements: list
 ) -> DTensor:
     if _is_dtensor_like(param):
         return _dtensor_from_dtensor_like_param(param, torch.empty_like(_to_local_tensor(param)))
@@ -320,10 +291,7 @@ def _dtensor_from_dtensor_like_param(param: torch.Tensor, local_tensor: torch.Te
 
 def _copy_tensor_(target: torch.Tensor, src: torch.Tensor) -> None:
     local_target = _to_local_tensor(target)
-    local_src = _to_local_tensor(src).to(
-        device=local_target.device,
-        dtype=local_target.dtype,
-    )
+    local_src = _to_local_tensor(src).to(device=local_target.device, dtype=local_target.dtype)
     if isinstance(local_target, torch.Tensor) and local_target is not target:
         local_target.copy_(local_src)
     else:
@@ -559,6 +527,7 @@ def _build_meshes(config):
 def log_rank0(msg: str) -> None:
     if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
         print(f"[megatron.lite] {msg}", flush=True)
+
 
 # ======================================================================
 # QKV / FC1 canonicalize for DCP (interleaved-TP ↔ canonical layout)

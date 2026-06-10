@@ -1,4 +1,5 @@
 """Qwen3.5 lite impl — native model protocol for Megatron Lite runtime."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -10,15 +11,24 @@ import torch
 import torch.nn as nn
 
 from megatron.lite.model.qwen3_5.config import Qwen35Config
-from megatron.lite.model.qwen3_5.lite.checkpoint import (
-    PLACEMENT_FN,
-    export_hf_weights as _export_hf_weights_impl,
-    load_hf_weights as _load_hf_weights_impl,
-)
+from megatron.lite.model.qwen3_5.lite.checkpoint import EXPERT_CLASSIFIER, PLACEMENT_FN
+from megatron.lite.model.qwen3_5.lite.checkpoint import export_hf_weights as _export_hf_weights_impl
+from megatron.lite.model.qwen3_5.lite.checkpoint import load_hf_weights as _load_hf_weights_impl
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
 from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
+
+__all__ = [
+    "EXPERT_CLASSIFIER",
+    "ImplConfig",
+    "PLACEMENT_FN",
+    "build_model",
+    "build_model_config",
+    "export_hf_weights",
+    "load_hf_weights",
+    "vocab_size",
+]
 
 
 def is_expert_param(name: str) -> bool:
@@ -54,10 +64,10 @@ def _full_attn_module(layer, name: str):
 
 MODULE_MAP = {
     "core_attn": lambda layer: _full_attn_module(layer, "core_attn"),
-    "experts":   lambda layer: layer.moe.experts,
-    "moe":       lambda layer: layer.moe,
-    "router":    lambda layer: layer.moe.router,
-    "mlp_norm":  lambda layer: layer.mlp_norm,
+    "experts": lambda layer: layer.moe.experts,
+    "moe": lambda layer: layer.moe,
+    "router": lambda layer: layer.moe.router,
+    "mlp_norm": lambda layer: layer.mlp_norm,
     "attn_proj": lambda layer: _full_attn_module(layer, "proj"),
     "linear_attn": lambda layer: layer.linear_attn,
 }
@@ -76,10 +86,7 @@ def build_model_config(source: str | Path | dict, **overrides) -> Qwen35Config:
 
 
 def _forward_step(model: nn.Module, batch: dict) -> dict:
-    kwargs: dict[str, Any] = {
-        "input_ids": batch["input_ids"],
-        "labels": batch["labels"],
-    }
+    kwargs: dict[str, Any] = {"input_ids": batch["input_ids"], "labels": batch["labels"]}
     if "position_ids" in batch:
         kwargs["position_ids"] = batch["position_ids"]
     if "packed_seq_params" in batch:
@@ -93,9 +100,7 @@ def _forward_step(model: nn.Module, batch: dict) -> dict:
 
 
 def _make_aux_loss_hook():
-    from megatron.lite.primitive.modules.moe import (
-        MoEAuxLossAutoScaler,
-    )
+    from megatron.lite.primitive.modules.moe import MoEAuxLossAutoScaler
     from megatron.lite.primitive.modules.mtp import MTPLossAutoScaler
 
     def hook(scale: torch.Tensor) -> None:
@@ -106,9 +111,7 @@ def _make_aux_loss_hook():
 
 
 def _build_mc_optimizer(chunks, model_cfg: Qwen35Config, impl_cfg: ImplConfig, ps: ParallelState):
-    from megatron.lite.primitive.optimizers.megatron_wrap import (
-        build_mc_training_optimizer,
-    )
+    from megatron.lite.primitive.optimizers.megatron_wrap import build_mc_training_optimizer
 
     return build_mc_training_optimizer(
         chunks,
@@ -172,20 +175,10 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
     )
 
     if vpp is None:
-        chunks = [
-            Qwen35Model(model_cfg, train_cfg, ps, **model_kwargs)
-            .to(torch.bfloat16)
-            .cuda()
-        ]
+        chunks = [Qwen35Model(model_cfg, train_cfg, ps, **model_kwargs).to(torch.bfloat16).cuda()]
     else:
         chunks = [
-            Qwen35Model(
-                model_cfg,
-                train_cfg,
-                ps,
-                vpp_chunk_id=i,
-                **model_kwargs,
-            )
+            Qwen35Model(model_cfg, train_cfg, ps, vpp_chunk_id=i, **model_kwargs)
             .to(torch.bfloat16)
             .cuda()
             for i in range(vpp)
@@ -211,10 +204,7 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
         from megatron.lite.runtime.megatron_utils import register_training_hooks
 
         attach_model_sharded_state_dict(
-            chunks,
-            ps,
-            get_placements=PLACEMENT_FN,
-            is_expert=is_expert_param,
+            chunks, ps, get_placements=PLACEMENT_FN, is_expert=is_expert_param
         )
         register_training_hooks(chunks, optimizer)
         optimizer_backend = "distopt"
@@ -223,9 +213,7 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
 
         def _post_model_load_hook():
             from megatron.lite.model.qwen3_5.lite.model import Qwen35Layer
-            from megatron.lite.primitive.optimizers.fsdp2 import (
-                build_fsdp2_training_optimizer,
-            )
+            from megatron.lite.primitive.optimizers.fsdp2 import build_fsdp2_training_optimizer
 
             return {
                 "optimizer": build_fsdp2_training_optimizer(
@@ -237,7 +225,7 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
                     deterministic=deterministic,
                     vpp=impl_cfg.parallel.vpp,
                     leaf_module_names=(),
-                ),
+                )
             }
 
         post_model_load_hook = _post_model_load_hook
@@ -268,10 +256,7 @@ def load_hf_weights(
 
 
 def export_hf_weights(
-    chunks: list[nn.Module],
-    model_cfg: Qwen35Config,
-    ps: ParallelState,
-    **kwargs,
+    chunks: list[nn.Module], model_cfg: Qwen35Config, ps: ParallelState, **kwargs
 ):
     yield from _export_hf_weights_impl(chunks, model_cfg, ps, **kwargs)
 

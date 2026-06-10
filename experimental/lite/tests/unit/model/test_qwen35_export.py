@@ -6,8 +6,8 @@ import torch.nn as nn
 from megatron.lite.model.qwen3_5.config import Qwen35Config
 from megatron.lite.model.qwen3_5.lite.checkpoint import (
     Qwen35WeightSpec,
-    _merge_gate_up_tp_shards,
     _merge_full_attn_qkvg,
+    _merge_gate_up_tp_shards,
     _merge_linear_attn_conv1d_tp_shards,
     _merge_linear_attn_in_proj_tp_shards,
     export_hf_weights,
@@ -39,13 +39,7 @@ def _tiny_config() -> Qwen35Config:
 
 def _single_rank_parallel_state() -> SimpleNamespace:
     return SimpleNamespace(
-        pp_size=1,
-        tp_size=1,
-        tp_group=None,
-        ep_size=1,
-        ep_group=None,
-        etp_size=1,
-        etp_group=None,
+        pp_size=1, tp_size=1, tp_group=None, ep_size=1, ep_group=None, etp_size=1, etp_group=None
     )
 
 
@@ -95,13 +89,11 @@ def test_qwen35_export_dtype_cast_is_opt_in() -> None:
             rows = config.moe_intermediate_size * 2
             for expert_idx in range(config.num_experts):
                 tensor = torch.arange(rows * config.hidden_size, dtype=torch.float32).reshape(
-                    rows,
-                    config.hidden_size,
+                    rows, config.hidden_size
                 )
                 tensor = tensor + expert_idx * 1000
                 self.layers[0].moe.experts.fc1.register_parameter(
-                    f"weight{expert_idx}",
-                    nn.Parameter(tensor),
+                    f"weight{expert_idx}", nn.Parameter(tensor)
                 )
 
     cfg = _tiny_config()
@@ -109,18 +101,19 @@ def test_qwen35_export_dtype_cast_is_opt_in() -> None:
 
     default_export = dict(export_hf_weights(model, cfg, _single_rank_parallel_state()))
     bf16_export = dict(
-        export_hf_weights(
-            model,
-            cfg,
-            _single_rank_parallel_state(),
-            export_dtype="bfloat16",
-        )
+        export_hf_weights(model, cfg, _single_rank_parallel_state(), export_dtype="bfloat16")
     )
 
     assert default_export["model.language_model.norm.weight"].dtype == torch.float32
     assert bf16_export["model.language_model.norm.weight"].dtype == torch.bfloat16
-    assert default_export["model.language_model.layers.0.mlp.experts.gate_up_proj"].dtype == torch.float32
-    assert bf16_export["model.language_model.layers.0.mlp.experts.gate_up_proj"].dtype == torch.bfloat16
+    assert (
+        default_export["model.language_model.layers.0.mlp.experts.gate_up_proj"].dtype
+        == torch.float32
+    )
+    assert (
+        bf16_export["model.language_model.layers.0.mlp.experts.gate_up_proj"].dtype
+        == torch.bfloat16
+    )
 
 
 def test_qwen35_export_preserves_runtime_parameter_dtype_by_default() -> None:
@@ -136,13 +129,11 @@ def test_qwen35_export_preserves_runtime_parameter_dtype_by_default() -> None:
             rows = config.moe_intermediate_size * 2
             for expert_idx in range(config.num_experts):
                 tensor = torch.arange(rows * config.hidden_size, dtype=torch.bfloat16).reshape(
-                    rows,
-                    config.hidden_size,
+                    rows, config.hidden_size
                 )
                 tensor = tensor + expert_idx * 1000
                 self.layers[0].moe.experts.fc1.register_parameter(
-                    f"weight{expert_idx}",
-                    nn.Parameter(tensor),
+                    f"weight{expert_idx}", nn.Parameter(tensor)
                 )
 
     cfg = _tiny_config()
@@ -151,7 +142,9 @@ def test_qwen35_export_preserves_runtime_parameter_dtype_by_default() -> None:
     exported = dict(export_hf_weights(model, cfg, _single_rank_parallel_state()))
 
     assert exported["model.language_model.norm.weight"].dtype == torch.bfloat16
-    assert exported["model.language_model.layers.0.mlp.experts.gate_up_proj"].dtype == torch.bfloat16
+    assert (
+        exported["model.language_model.layers.0.mlp.experts.gate_up_proj"].dtype == torch.bfloat16
+    )
 
 
 def test_qwen35_export_batches_ep_expert_gather(monkeypatch) -> None:
@@ -166,13 +159,11 @@ def test_qwen35_export_batches_ep_expert_gather(monkeypatch) -> None:
             rows = config.moe_intermediate_size * 2
             for local_idx in range(config.num_experts // 2):
                 tensor = torch.arange(rows * config.hidden_size, dtype=torch.bfloat16).reshape(
-                    rows,
-                    config.hidden_size,
+                    rows, config.hidden_size
                 )
                 tensor = tensor + local_idx * 1000
                 self.layers[0].moe.experts.fc1.register_parameter(
-                    f"weight{local_idx}",
-                    nn.Parameter(tensor),
+                    f"weight{local_idx}", nn.Parameter(tensor)
                 )
 
     cfg = _tiny_config()
@@ -194,10 +185,7 @@ def test_qwen35_export_batches_ep_expert_gather(monkeypatch) -> None:
         outputs[0].copy_(tensor)
         outputs[1].copy_(tensor + 2000)
 
-    monkeypatch.setattr(
-        "megatron.lite.primitive.ckpt.hf_weights.dist.all_gather",
-        fake_all_gather,
-    )
+    monkeypatch.setattr("megatron.lite.primitive.ckpt.hf_weights.dist.all_gather", fake_all_gather)
 
     exported = dict(export_hf_weights(model, cfg, ps))
 
@@ -208,18 +196,10 @@ def test_qwen35_export_batches_ep_expert_gather(monkeypatch) -> None:
         model.layers[0].moe.experts.fc1.weight1.detach(),
     ]
     expected = torch.stack(
-        [
-            local_tensors[0],
-            local_tensors[1],
-            local_tensors[0] + 2000,
-            local_tensors[1] + 2000,
-        ],
+        [local_tensors[0], local_tensors[1], local_tensors[0] + 2000, local_tensors[1] + 2000],
         dim=0,
     )
-    assert torch.equal(
-        exported["model.language_model.layers.0.mlp.experts.gate_up_proj"],
-        expected,
-    )
+    assert torch.equal(exported["model.language_model.layers.0.mlp.experts.gate_up_proj"], expected)
 
 
 def test_qwen35_export_uses_packed_expert_group_names(monkeypatch) -> None:
@@ -234,13 +214,11 @@ def test_qwen35_export_uses_packed_expert_group_names(monkeypatch) -> None:
             rows = config.moe_intermediate_size * 2
             for expert_idx in range(config.num_experts):
                 tensor = torch.arange(rows * config.hidden_size, dtype=torch.bfloat16).reshape(
-                    rows,
-                    config.hidden_size,
+                    rows, config.hidden_size
                 )
                 tensor = tensor + expert_idx * 1000
                 self.layers[0].moe.experts.fc1.register_parameter(
-                    f"weight{expert_idx}",
-                    nn.Parameter(tensor),
+                    f"weight{expert_idx}", nn.Parameter(tensor)
                 )
 
     cfg = _tiny_config()
@@ -272,8 +250,7 @@ def test_qwen35_export_rank0_only_still_participates_in_ep_gather(monkeypatch) -
             for local_idx in range(config.num_experts // 2):
                 tensor = torch.zeros(rows, config.hidden_size, dtype=torch.bfloat16) + local_idx
                 self.layers[0].moe.experts.fc1.register_parameter(
-                    f"weight{local_idx}",
-                    nn.Parameter(tensor),
+                    f"weight{local_idx}", nn.Parameter(tensor)
                 )
 
     cfg = _tiny_config()
@@ -296,10 +273,7 @@ def test_qwen35_export_rank0_only_still_participates_in_ep_gather(monkeypatch) -
 
     monkeypatch.setattr("megatron.lite.primitive.ckpt.hf_weights.dist.is_initialized", lambda: True)
     monkeypatch.setattr("megatron.lite.primitive.ckpt.hf_weights.dist.get_rank", lambda: 1)
-    monkeypatch.setattr(
-        "megatron.lite.primitive.ckpt.hf_weights.dist.all_gather",
-        fake_all_gather,
-    )
+    monkeypatch.setattr("megatron.lite.primitive.ckpt.hf_weights.dist.all_gather", fake_all_gather)
 
     exported = list(export_hf_weights(TinyQwen35Module(cfg), cfg, ps, rank0_only=True))
 
@@ -332,23 +306,13 @@ def test_qwen35_export_unpacks_full_attention_q_gate() -> None:
     cfg = _tiny_config()
     spec = Qwen35WeightSpec(cfg)
     hidden = cfg.hidden_size
-    q_gate = torch.arange(
-        cfg.num_attention_heads * 2 * cfg.head_dim * hidden,
-    ).reshape(-1, hidden)
+    q_gate = torch.arange(cfg.num_attention_heads * 2 * cfg.head_dim * hidden).reshape(-1, hidden)
     key = torch.arange(
-        q_gate.numel(),
-        q_gate.numel() + cfg.num_key_value_heads * cfg.head_dim * hidden,
-    ).reshape(
-        -1,
-        hidden,
-    )
+        q_gate.numel(), q_gate.numel() + cfg.num_key_value_heads * cfg.head_dim * hidden
+    ).reshape(-1, hidden)
     value = torch.arange(
-        key[-1, -1] + 1,
-        key[-1, -1] + 1 + cfg.num_key_value_heads * cfg.head_dim * hidden,
-    ).reshape(
-        -1,
-        hidden,
-    )
+        key[-1, -1] + 1, key[-1, -1] + 1 + cfg.num_key_value_heads * cfg.head_dim * hidden
+    ).reshape(-1, hidden)
 
     packed = _merge_full_attn_qkvg(q_gate, key, value, cfg=cfg)
     exported = dict(spec.native_to_hf("layers.0.full_attn.qkv.linear.weight", packed))
@@ -405,19 +369,14 @@ def test_qwen35_export_reorders_linear_attention_tp_shards_before_hf_split() -> 
         torch.arange(200, 200 + v_dim * hidden).reshape(v_dim, hidden),
         torch.arange(300, 300 + v_dim * hidden).reshape(v_dim, hidden),
         torch.arange(400, 400 + cfg.linear_num_value_heads * hidden).reshape(
-            cfg.linear_num_value_heads,
-            hidden,
+            cfg.linear_num_value_heads, hidden
         ),
         torch.arange(500, 500 + cfg.linear_num_value_heads * hidden).reshape(
-            cfg.linear_num_value_heads,
-            hidden,
+            cfg.linear_num_value_heads, hidden
         ),
     ]
     full = torch.cat(parts, dim=0)
-    shards = [
-        torch.cat([part.chunk(2, dim=0)[rank] for part in parts], dim=0)
-        for rank in range(2)
-    ]
+    shards = [torch.cat([part.chunk(2, dim=0)[rank] for part in parts], dim=0) for rank in range(2)]
 
     merged = _merge_linear_attn_in_proj_tp_shards(shards, cfg=cfg)
 
@@ -431,25 +390,17 @@ def test_qwen35_export_reorders_linear_attention_conv1d_tp_shards() -> None:
     trailing = (1, cfg.linear_conv_kernel_dim)
     parts = [
         torch.arange(0, qk_dim * trailing[0] * trailing[1], dtype=torch.float32).reshape(
-            qk_dim,
-            *trailing,
+            qk_dim, *trailing
         ),
-        torch.arange(
-            100,
-            100 + qk_dim * trailing[0] * trailing[1],
-            dtype=torch.float32,
-        ).reshape(qk_dim, *trailing),
-        torch.arange(
-            200,
-            200 + v_dim * trailing[0] * trailing[1],
-            dtype=torch.float32,
-        ).reshape(v_dim, *trailing),
+        torch.arange(100, 100 + qk_dim * trailing[0] * trailing[1], dtype=torch.float32).reshape(
+            qk_dim, *trailing
+        ),
+        torch.arange(200, 200 + v_dim * trailing[0] * trailing[1], dtype=torch.float32).reshape(
+            v_dim, *trailing
+        ),
     ]
     full = torch.cat(parts, dim=0)
-    shards = [
-        torch.cat([part.chunk(2, dim=0)[rank] for part in parts], dim=0)
-        for rank in range(2)
-    ]
+    shards = [torch.cat([part.chunk(2, dim=0)[rank] for part in parts], dim=0) for rank in range(2)]
 
     merged = _merge_linear_attn_conv1d_tp_shards(shards, cfg=cfg)
 
@@ -464,8 +415,7 @@ def test_qwen35_export_uses_mbridge_conv1d_tp_gather(monkeypatch) -> None:
             self.layers[0].linear_attn = nn.Module()
             self.layers[0].linear_attn.conv1d = nn.Module()
             self.layers[0].linear_attn.conv1d.register_parameter(
-                "weight",
-                nn.Parameter(local_shard.clone()),
+                "weight", nn.Parameter(local_shard.clone())
             )
 
     cfg = _tiny_config()
@@ -474,25 +424,17 @@ def test_qwen35_export_uses_mbridge_conv1d_tp_gather(monkeypatch) -> None:
     trailing = (1, cfg.linear_conv_kernel_dim)
     parts = [
         torch.arange(0, qk_dim * trailing[0] * trailing[1], dtype=torch.float32).reshape(
-            qk_dim,
-            *trailing,
+            qk_dim, *trailing
         ),
-        torch.arange(
-            100,
-            100 + qk_dim * trailing[0] * trailing[1],
-            dtype=torch.float32,
-        ).reshape(qk_dim, *trailing),
-        torch.arange(
-            200,
-            200 + v_dim * trailing[0] * trailing[1],
-            dtype=torch.float32,
-        ).reshape(v_dim, *trailing),
+        torch.arange(100, 100 + qk_dim * trailing[0] * trailing[1], dtype=torch.float32).reshape(
+            qk_dim, *trailing
+        ),
+        torch.arange(200, 200 + v_dim * trailing[0] * trailing[1], dtype=torch.float32).reshape(
+            v_dim, *trailing
+        ),
     ]
     full = torch.cat(parts, dim=0)
-    shards = [
-        torch.cat([part.chunk(2, dim=0)[rank] for part in parts], dim=0)
-        for rank in range(2)
-    ]
+    shards = [torch.cat([part.chunk(2, dim=0)[rank] for part in parts], dim=0) for rank in range(2)]
     ps = SimpleNamespace(
         pp_size=1,
         tp_size=2,
@@ -511,18 +453,14 @@ def test_qwen35_export_uses_mbridge_conv1d_tp_gather(monkeypatch) -> None:
         outputs[1].copy_(shards[1])
 
     monkeypatch.setattr(
-        "megatron.lite.model.qwen3_5.lite.checkpoint.dist.all_gather",
-        fake_all_gather,
+        "megatron.lite.model.qwen3_5.lite.checkpoint.dist.all_gather", fake_all_gather
     )
 
     exported = dict(export_hf_weights(TinyQwen35Module(shards[0]), cfg, ps))
 
     assert len(gather_calls) == 1
     assert torch.equal(gather_calls[0], shards[0])
-    assert torch.equal(
-        exported["model.language_model.layers.0.linear_attn.conv1d.weight"],
-        full,
-    )
+    assert torch.equal(exported["model.language_model.layers.0.linear_attn.conv1d.weight"], full)
 
 
 def test_qwen35_export_reorders_shared_expert_gate_up_tp_shards() -> None:
@@ -548,17 +486,16 @@ def test_qwen35_export_restores_zero_centered_linear_attention_norm() -> None:
 
     assert set(exported) == {"model.language_model.layers.0.linear_attn.norm.weight"}
     assert torch.equal(
-        exported["model.language_model.layers.0.linear_attn.norm.weight"],
-        tensor + 1,
+        exported["model.language_model.layers.0.linear_attn.norm.weight"], tensor + 1
     )
 
 
 def test_qwen35_export_maps_shared_expert_to_hf_checkpoint_names() -> None:
     cfg = _tiny_config()
     spec = Qwen35WeightSpec(cfg)
-    tensor = torch.arange(
-        cfg.shared_expert_intermediate_size * 2 * cfg.hidden_size,
-    ).reshape(-1, cfg.hidden_size)
+    tensor = torch.arange(cfg.shared_expert_intermediate_size * 2 * cfg.hidden_size).reshape(
+        -1, cfg.hidden_size
+    )
 
     exported = dict(spec.native_to_hf("layers.0.moe.shared_expert.gate_up.linear.weight", tensor))
 
@@ -568,21 +505,19 @@ def test_qwen35_export_maps_shared_expert_to_hf_checkpoint_names() -> None:
     }
     gate, up = tensor.chunk(2, dim=0)
     assert torch.equal(
-        exported["model.language_model.layers.0.mlp.shared_expert.gate_proj.weight"],
-        gate,
+        exported["model.language_model.layers.0.mlp.shared_expert.gate_proj.weight"], gate
     )
     assert torch.equal(
-        exported["model.language_model.layers.0.mlp.shared_expert.up_proj.weight"],
-        up,
+        exported["model.language_model.layers.0.mlp.shared_expert.up_proj.weight"], up
     )
 
 
 def test_qwen35_export_packs_base_expert_fc1_to_hf_gate_up_proj() -> None:
     cfg = _tiny_config()
     spec = Qwen35WeightSpec(cfg)
-    base = torch.arange(
-        cfg.moe_intermediate_size * 2 * cfg.hidden_size,
-    ).reshape(-1, cfg.hidden_size)
+    base = torch.arange(cfg.moe_intermediate_size * 2 * cfg.hidden_size).reshape(
+        -1, cfg.hidden_size
+    )
 
     exported = {}
     expert_tensors = []
@@ -611,8 +546,7 @@ def test_qwen35_export_matches_mbridge_qwen35_moe_packed_expert_contract() -> No
     ]
     fc2_tensors = [
         torch.arange(cfg.hidden_size * cfg.moe_intermediate_size, dtype=torch.bfloat16).reshape(
-            cfg.hidden_size,
-            cfg.moe_intermediate_size,
+            cfg.hidden_size, cfg.moe_intermediate_size
         )
         + expert_idx * 1000
         for expert_idx in range(cfg.num_experts)
@@ -652,28 +586,27 @@ def test_qwen35_export_vllm_target_uses_runtime_prefix_and_packed_expert_names()
     assert set(exported_embed) == {"language_model.model.embed_tokens.weight"}
     assert set(exported_norm) == {"language_model.model.norm.weight"}
     assert set(exported_head) == {"language_model.lm_head.weight"}
-    assert set(exported_mlp_norm) == {"language_model.model.layers.0.post_attention_layernorm.weight"}
+    assert set(exported_mlp_norm) == {
+        "language_model.model.layers.0.post_attention_layernorm.weight"
+    }
     assert torch.equal(exported_embed["language_model.model.embed_tokens.weight"], dense)
     assert torch.equal(exported_norm["language_model.model.norm.weight"], dense)
     assert torch.equal(exported_head["language_model.lm_head.weight"], dense)
     assert torch.equal(
-        exported_mlp_norm["language_model.model.layers.0.post_attention_layernorm.weight"],
-        dense,
+        exported_mlp_norm["language_model.model.layers.0.post_attention_layernorm.weight"], dense
     )
 
     fc1_tensors = [
-        torch.arange(
-            cfg.moe_intermediate_size * 2 * cfg.hidden_size,
-            dtype=torch.bfloat16,
-        ).reshape(-1, cfg.hidden_size)
+        torch.arange(cfg.moe_intermediate_size * 2 * cfg.hidden_size, dtype=torch.bfloat16).reshape(
+            -1, cfg.hidden_size
+        )
         + expert_idx * 1000
         for expert_idx in range(cfg.num_experts)
     ]
     fc2_tensors = [
-        torch.arange(
-            cfg.hidden_size * cfg.moe_intermediate_size,
-            dtype=torch.bfloat16,
-        ).reshape(cfg.hidden_size, cfg.moe_intermediate_size)
+        torch.arange(cfg.hidden_size * cfg.moe_intermediate_size, dtype=torch.bfloat16).reshape(
+            cfg.hidden_size, cfg.moe_intermediate_size
+        )
         + expert_idx * 2000
         for expert_idx in range(cfg.num_experts)
     ]
@@ -713,35 +646,24 @@ def test_qwen35_export_vllm_target_packs_experts_with_runtime_prefix() -> None:
             rows = config.moe_intermediate_size * 2
             for expert_idx in range(config.num_experts):
                 fc1 = torch.arange(rows * config.hidden_size, dtype=torch.bfloat16).reshape(
-                    rows,
-                    config.hidden_size,
+                    rows, config.hidden_size
                 )
                 fc1 = fc1 + expert_idx * 1000
                 fc2 = torch.arange(
-                    config.hidden_size * config.moe_intermediate_size,
-                    dtype=torch.bfloat16,
+                    config.hidden_size * config.moe_intermediate_size, dtype=torch.bfloat16
                 ).reshape(config.hidden_size, config.moe_intermediate_size)
                 fc2 = fc2 + expert_idx * 2000
                 self.layers[0].moe.experts.fc1.register_parameter(
-                    f"weight{expert_idx}",
-                    nn.Parameter(fc1),
+                    f"weight{expert_idx}", nn.Parameter(fc1)
                 )
                 self.layers[0].moe.experts.fc2.register_parameter(
-                    f"weight{expert_idx}",
-                    nn.Parameter(fc2),
+                    f"weight{expert_idx}", nn.Parameter(fc2)
                 )
 
     cfg = _tiny_config()
     model = TinyQwen35Module(cfg)
 
-    exported = dict(
-        export_hf_weights(
-            model,
-            cfg,
-            _single_rank_parallel_state(),
-            target="vllm",
-        )
-    )
+    exported = dict(export_hf_weights(model, cfg, _single_rank_parallel_state(), target="vllm"))
 
     assert "model.language_model.layers.0.mlp.experts.gate_up_proj" not in exported
     assert "model.language_model.layers.0.mlp.experts.down_proj" not in exported
@@ -773,9 +695,9 @@ def test_qwen35_export_vllm_target_packs_experts_with_runtime_prefix() -> None:
 def test_qwen35_export_packs_base_expert_fc2_and_expert_metadata() -> None:
     cfg = _tiny_config()
     spec = Qwen35WeightSpec(cfg)
-    base = torch.arange(
-        cfg.hidden_size * cfg.moe_intermediate_size,
-    ).reshape(cfg.hidden_size, cfg.moe_intermediate_size)
+    base = torch.arange(cfg.hidden_size * cfg.moe_intermediate_size).reshape(
+        cfg.hidden_size, cfg.moe_intermediate_size
+    )
     native_name = "layers.0.moe.experts.fc2.weight2"
 
     exported = {}

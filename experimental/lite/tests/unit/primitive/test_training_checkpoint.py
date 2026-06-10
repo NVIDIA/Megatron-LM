@@ -111,10 +111,7 @@ def test_distopt_checkpoint_dispatches_to_mcore_distckpt(monkeypatch, tmp_path) 
         saved["checkpoint_dir"] = checkpoint_dir
         saved["kwargs"] = kwargs
 
-    monkeypatch.setattr(
-        "megatron.lite.primitive.ckpt.distckpt.dist_checkpointing.save",
-        fake_save,
-    )
+    monkeypatch.setattr("megatron.lite.primitive.ckpt.distckpt.dist_checkpointing.save", fake_save)
 
     dcp.save_training_checkpoint(model, optimizer, 5, str(tmp_path), use_dcp=True)
 
@@ -150,14 +147,10 @@ def test_distopt_checkpoint_offsets_cover_tp_pp_ep_etp_topology() -> None:
     )
 
     dense_offsets, dense_replica = _rank_offsets_and_replica_id(
-        [Replicate(), Replicate(), Replicate(), Shard(0)],
-        ps,
-        expert=False,
+        [Replicate(), Replicate(), Replicate(), Shard(0)], ps, expert=False
     )
     expert_offsets, expert_replica = _rank_offsets_and_replica_id(
-        [Replicate(), Replicate(), Shard(0), Shard(0)],
-        ps,
-        expert=True,
+        [Replicate(), Replicate(), Shard(0), Shard(0)], ps, expert=True
     )
 
     assert dense_offsets == ((0, 1, 2),)
@@ -169,14 +162,10 @@ def test_distopt_checkpoint_offsets_cover_tp_pp_ep_etp_topology() -> None:
 def test_distopt_replica_id_groups_sharded_axes_by_placement() -> None:
     placements = [Replicate(), Replicate(), Replicate(), Shard(0)]
     rank_offsets0, replica_id0 = _rank_offsets_and_replica_id(
-        placements,
-        ParallelState(tp_size=2, tp_rank=0),
-        expert=False,
+        placements, ParallelState(tp_size=2, tp_rank=0), expert=False
     )
     rank_offsets1, replica_id1 = _rank_offsets_and_replica_id(
-        placements,
-        ParallelState(tp_size=2, tp_rank=1),
-        expert=False,
+        placements, ParallelState(tp_size=2, tp_rank=1), expert=False
     )
 
     assert rank_offsets0 == ((0, 0, 2),)
@@ -219,8 +208,7 @@ def test_distopt_pp_rank_one_model_keys_survive_torch_dist_main_replica_filter()
 
     model_sd = _model_sharded_state_dict(model)
     filtered_sd, _flat_mapping, _rename_mapping = _replace_state_dict_keys_with_sharded_keys(
-        model_sd,
-        keep_only_main_replica=True,
+        model_sd, keep_only_main_replica=True
     )
 
     assert set(filtered_sd) == {"model_pp1.weight", "model_pp1.bias"}
@@ -271,10 +259,7 @@ def test_distopt_checkpoint_loads_from_mcore_distckpt(monkeypatch, tmp_path) -> 
             "optimizer": {"loaded": True},
         }
 
-    monkeypatch.setattr(
-        "megatron.lite.primitive.ckpt.distckpt.dist_checkpointing.load",
-        fake_load,
-    )
+    monkeypatch.setattr("megatron.lite.primitive.ckpt.distckpt.dist_checkpointing.load", fake_load)
 
     step = dcp.load_training_checkpoint(model, optimizer, str(tmp_path / "step_5"), use_dcp=True)
 
@@ -289,8 +274,7 @@ def test_distopt_step_sync_traverses_multi_optimizer_chain_without_optimizer_pro
     class FakeTorchOptimizer:
         def __init__(self, steps):
             self.state = {
-                object(): {"step": torch.tensor(step, dtype=torch.int64)}
-                for step in steps
+                object(): {"step": torch.tensor(step, dtype=torch.int64)} for step in steps
             }
 
     class FakeDistOpt:
@@ -316,7 +300,9 @@ def test_distopt_step_sync_traverses_multi_optimizer_chain_without_optimizer_pro
         assert steps == [max(steps)] * len(steps)
 
 
-def test_runtime_checkpoint_api_passes_current_training_checkpoint_signature(monkeypatch, tmp_path) -> None:
+def test_runtime_checkpoint_api_passes_current_training_checkpoint_signature(
+    monkeypatch, tmp_path
+) -> None:
     calls = {}
 
     def fake_save(model, optimizer, step, path, config, ps, **kwargs):
@@ -342,17 +328,10 @@ def test_runtime_checkpoint_api_passes_current_training_checkpoint_signature(mon
     )
 
     runtime.save_checkpoint(
-        handle,
-        str(tmp_path),
-        global_step=7,
-        save_model=True,
-        save_optimizer=False,
+        handle, str(tmp_path), global_step=7, save_model=True, save_optimizer=False
     )
     loaded_step = runtime.load_checkpoint(
-        handle,
-        str(tmp_path),
-        load_model=False,
-        load_optimizer=True,
+        handle, str(tmp_path), load_model=False, load_optimizer=True
     )
 
     assert calls["save"] == (

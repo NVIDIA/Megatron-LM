@@ -6,7 +6,11 @@ from typing import TYPE_CHECKING
 
 import torch  # pyright: ignore[reportMissingImports]
 
-from megatron.lite.primitive.ops.sp_ops import AllGatherDim0, AllGatherDim0ForNonSPConsumer, ScatterToSP
+from megatron.lite.primitive.ops.sp_ops import (
+    AllGatherDim0,
+    AllGatherDim0ForNonSPConsumer,
+    ScatterToSP,
+)
 
 if TYPE_CHECKING:
     from megatron.lite.primitive.parallel.state import ParallelState

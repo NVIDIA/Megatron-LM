@@ -1,2 +1,1 @@
 """Megatron Lite examples package."""
-

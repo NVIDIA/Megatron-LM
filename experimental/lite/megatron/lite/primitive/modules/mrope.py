@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+
 from megatron.core.models.common.embeddings.rope_utils import (  # pyright: ignore[reportMissingImports]
     get_pos_emb_on_this_cp_rank,
 )
@@ -25,9 +26,7 @@ class MultimodalRotaryEmbedding(nn.Module):
     ):
         super().__init__()
         dim = int(kv_channels * rotary_percent)
-        inv_freq = 1.0 / (
-            rotary_base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)
-        )
+        inv_freq = 1.0 / (rotary_base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.cp_group = cp_group
 
@@ -40,11 +39,7 @@ class MultimodalRotaryEmbedding(nn.Module):
         return freqs_t
 
     def forward(
-        self,
-        position_ids: torch.Tensor,
-        mrope_section: list[int],
-        *,
-        packed_seq: bool = False,
+        self, position_ids: torch.Tensor, mrope_section: list[int], *, packed_seq: bool = False
     ) -> torch.Tensor:
         seq = position_ids.to(device=self.inv_freq.device)
         inv_freq = self.inv_freq.float()
@@ -54,10 +49,6 @@ class MultimodalRotaryEmbedding(nn.Module):
         freqs = self._apply_interleaved_mrope(freqs, mrope_section)
         emb = torch.cat((freqs, freqs), dim=-1)
         emb = emb[..., None, :].transpose(0, 1).contiguous()
-        if (
-            not packed_seq
-            and self.cp_group is not None
-            and dist.get_world_size(self.cp_group) > 1
-        ):
+        if not packed_seq and self.cp_group is not None and dist.get_world_size(self.cp_group) > 1:
             emb = get_pos_emb_on_this_cp_rank(emb, 0, self.cp_group)
         return emb

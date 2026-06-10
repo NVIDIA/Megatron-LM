@@ -62,8 +62,7 @@ def torch_chunk_gated_delta_rule(
     g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size)
 
     mask = torch.triu(
-        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
-        diagonal=0,
+        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0
     )
     g = g.cumsum(dim=-1)
     decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
@@ -83,8 +82,7 @@ def torch_chunk_gated_delta_rule(
     )
     core_attn_out = torch.zeros_like(value)
     mask = torch.triu(
-        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
-        diagonal=1,
+        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1
     )
 
     for i in range(0, total_sequence_length // chunk_size):
@@ -96,17 +94,13 @@ def torch_chunk_gated_delta_rule(
         core_attn_out[:, :, i] = attn_inter + attn @ v_new
         last_recurrent_state = (
             last_recurrent_state * g[:, :, i, -1, None, None].exp()
-            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2)
-            @ v_new
+            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
         )
 
     if not output_final_state:
         last_recurrent_state = None
     core_attn_out = core_attn_out.reshape(
-        core_attn_out.shape[0],
-        core_attn_out.shape[1],
-        -1,
-        core_attn_out.shape[-1],
+        core_attn_out.shape[0], core_attn_out.shape[1], -1, core_attn_out.shape[-1]
     )
     core_attn_out = core_attn_out[:, :, :sequence_length]
     core_attn_out = core_attn_out.transpose(1, 2).contiguous().to(initial_dtype)

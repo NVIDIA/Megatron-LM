@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
 import hashlib
 import json
 import os
 import struct
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -71,7 +71,9 @@ def _hash_tensor(tensor: torch.Tensor | None) -> dict[str, Any] | None:
         "sha256": hashlib.sha256(raw).hexdigest(),
     }
     if as_bf16 is not None:
-        result["sha256_as_bf16"] = hashlib.sha256(as_bf16.view(torch.uint8).numpy().tobytes()).hexdigest()
+        result["sha256_as_bf16"] = hashlib.sha256(
+            as_bf16.view(torch.uint8).numpy().tobytes()
+        ).hexdigest()
     if summary is not None:
         flat = summary.reshape(-1)
         result["summary"] = {
@@ -109,11 +111,7 @@ def _record_activation_probe(
     tensor_hooks: list[Any] | None = None,
 ) -> None:
     tensor = _first_tensor(output)
-    record = {
-        "name": name,
-        "found": True,
-        "tensor": _hash_tensor(tensor),
-    }
+    record = {"name": name, "found": True, "tensor": _hash_tensor(tensor)}
     if record_grad:
         record["grad"] = None
         record["grad_found"] = isinstance(tensor, torch.Tensor) and tensor.requires_grad
@@ -132,7 +130,11 @@ def _resolve_probe_module(modules: dict[str, Any], name: str) -> tuple[str, Any]
     module = modules.get(name)
     if module is not None:
         return name, module
-    matches = [(candidate_name, candidate) for candidate_name, candidate in modules.items() if candidate_name.endswith(f".{name}")]
+    matches = [
+        (candidate_name, candidate)
+        for candidate_name, candidate in modules.items()
+        if candidate_name.endswith(f".{name}")
+    ]
     if len(matches) == 1:
         return matches[0]
     return None
@@ -181,11 +183,7 @@ def _activation_probe_context(handle, probe_names: list[str], *, record_grad: bo
                     return _original(*args, **kwargs)
                 output = _original(*args, **kwargs)
                 _record_activation_probe(
-                    records,
-                    _probe_name,
-                    output,
-                    record_grad=record_grad,
-                    tensor_hooks=tensor_hooks,
+                    records, _probe_name, output, record_grad=record_grad, tensor_hooks=tensor_hooks
                 )
                 records[-1]["resolved_name"] = f"{_resolved_name}::{_method_name}"
                 records[-1]["module_type"] = _module_type
@@ -205,25 +203,19 @@ def _activation_probe_context(handle, probe_names: list[str], *, record_grad: bo
 
             def _pre_hook(_module, args, probe_name=name, resolved_probe_name=resolved_name):
                 _record_activation_probe(
-                    records,
-                    probe_name,
-                    args,
-                    record_grad=record_grad,
-                    tensor_hooks=tensor_hooks,
+                    records, probe_name, args, record_grad=record_grad, tensor_hooks=tensor_hooks
                 )
                 records[-1]["resolved_name"] = f"{resolved_probe_name}:input"
-                records[-1]["module_type"] = type(_module).__module__ + "." + type(_module).__qualname__
+                records[-1]["module_type"] = (
+                    type(_module).__module__ + "." + type(_module).__qualname__
+                )
 
             hooks.append(module.register_forward_pre_hook(_pre_hook))
             continue
 
         def _hook(_module, _args, output, probe_name=name, resolved_probe_name=resolved_name):
             _record_activation_probe(
-                records,
-                probe_name,
-                output,
-                record_grad=record_grad,
-                tensor_hooks=tensor_hooks,
+                records, probe_name, output, record_grad=record_grad, tensor_hooks=tensor_hooks
             )
             records[-1]["resolved_name"] = resolved_probe_name
             records[-1]["module_type"] = type(_module).__module__ + "." + type(_module).__qualname__
@@ -381,10 +373,7 @@ def run_backend(
                 rt.zero_grad(handle)
                 _sync(session_cfg.device)
                 result = rt.forward_backward(
-                    handle,
-                    data_iter,
-                    loss_fn=None,
-                    num_microbatches=session_cfg.num_microbatches,
+                    handle, data_iter, loss_fn=None, num_microbatches=session_cfg.num_microbatches
                 )
                 _sync(session_cfg.device)
                 logits = _hash_tensor(result.model_output.vocab_parallel_logits)
@@ -497,8 +486,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     ns = _parser().parse_args(argv)
     if ns.command == "compare":
         result = compare_correctness_artifacts(
-            load_result_artifact(ns.baseline),
-            load_result_artifact(ns.candidate),
+            load_result_artifact(ns.baseline), load_result_artifact(ns.candidate)
         )
         text = json.dumps(result, indent=2, sort_keys=True)
         print(text, flush=True)
@@ -508,7 +496,9 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
             raise SystemExit(1)
         return result
 
-    cfg = BenchCliConfig(**{k: v for k, v in vars(ns).items() if k in BenchCliConfig.__dataclass_fields__})
+    cfg = BenchCliConfig(
+        **{k: v for k, v in vars(ns).items() if k in BenchCliConfig.__dataclass_fields__}
+    )
     artifact = run_backend(
         cfg,
         hash_weights=not ns.skip_weight_hash,

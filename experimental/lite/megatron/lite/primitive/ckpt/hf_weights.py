@@ -22,6 +22,7 @@ import torch.nn as nn
 from safetensors import safe_open
 from safetensors.torch import save_file as _safe_save
 
+
 @runtime_checkable
 class HFWeights(Protocol):
     """Protocol for HF ↔ Megatron Lite weight conversion.
@@ -37,7 +38,9 @@ class HFWeights(Protocol):
         """Convert HF tensors → single Megatron Lite tensor (e.g. merge QKV)."""
         ...
 
-    def native_to_hf(self, native_name: str, tensor: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
+    def native_to_hf(
+        self, native_name: str, tensor: torch.Tensor
+    ) -> list[tuple[str, torch.Tensor]]:
         """Convert Megatron Lite tensor → [(hf_name, hf_tensor)] (e.g. split QKV back)."""
         ...
 
@@ -116,9 +119,7 @@ def unwrap_model(model: nn.Module) -> nn.Module:
 
 
 def save_safetensors(
-    tensors: dict[str, torch.Tensor],
-    path: str,
-    filename: str = "model.safetensors",
+    tensors: dict[str, torch.Tensor], path: str, filename: str = "model.safetensors"
 ) -> None:
     os.makedirs(path, exist_ok=True)
     _safe_save(tensors, os.path.join(path, filename))
@@ -163,12 +164,7 @@ def split_dim(tensor: torch.Tensor, rank: int, world: int, dim: int = 0) -> torc
 
 
 def split_qkv(
-    tensor: torch.Tensor,
-    rank: int,
-    world: int,
-    num_q_heads: int,
-    num_kv_heads: int,
-    head_dim: int,
+    tensor: torch.Tensor, rank: int, world: int, num_q_heads: int, num_kv_heads: int, head_dim: int
 ) -> torch.Tensor:
     """TP-shard a fused [Q, K, V] weight, splitting Q/K/V heads independently.
 
@@ -180,8 +176,8 @@ def split_qkv(
     q_size = num_q_heads * head_dim
     kv_size = num_kv_heads * head_dim
     q = tensor[:q_size]
-    k = tensor[q_size:q_size + kv_size]
-    v = tensor[q_size + kv_size:]
+    k = tensor[q_size : q_size + kv_size]
+    v = tensor[q_size + kv_size :]
     q_shard = q.chunk(world, dim=0)[rank]
     k_shard = k.chunk(world, dim=0)[rank]
     v_shard = v.chunk(world, dim=0)[rank]
@@ -198,7 +194,7 @@ def split_gate_up(tensor: torch.Tensor, rank: int, world: int) -> torch.Tensor:
 
 
 def allgather_concat(
-    tensor: torch.Tensor, world_size: int, group: dist.ProcessGroup | None, dim: int,
+    tensor: torch.Tensor, world_size: int, group: dist.ProcessGroup | None, dim: int
 ) -> torch.Tensor:
     gathered = [torch.empty_like(tensor) for _ in range(world_size)]
     dist.all_gather(gathered, tensor.contiguous(), group=group)
@@ -241,9 +237,7 @@ def to_global_layer_name(name: str, layer_map: dict[int, int]) -> str:
     return re.sub(r"layers\.(\d+)\.", _replace, name)
 
 
-def gather_gate_up(
-    tensor: torch.Tensor, world_size: int, group: dist.ProcessGroup,
-) -> torch.Tensor:
+def gather_gate_up(tensor: torch.Tensor, world_size: int, group: dist.ProcessGroup) -> torch.Tensor:
     ffn_local = tensor.shape[0] // 2
     gate_full = allgather_concat(tensor[:ffn_local], world_size, group, dim=0)
     up_full = allgather_concat(tensor[ffn_local:], world_size, group, dim=0)
@@ -256,12 +250,7 @@ def gather_gate_up(
 
 
 def load_hf_weights(
-    model: nn.Module,
-    hf_path: str,
-    spec: HFWeights,
-    ps,
-    *,
-    vocab_size: int | None = None,
+    model: nn.Module, hf_path: str, spec: HFWeights, ps, *, vocab_size: int | None = None
 ) -> None:
     """Load HF safetensors into a Megatron Lite model using HFWeights.
 
@@ -305,14 +294,7 @@ def load_hf_weights(
         expert_gid = spec.expert_global_id(mapped)
         if expert_gid is not None:
             _load_expert_weight(
-                mapped,
-                hf_names,
-                reader,
-                spec,
-                ps,
-                loaded,
-                expert_gid,
-                expert_shard,
+                mapped, hf_names, reader, spec, ps, loaded, expert_gid, expert_shard
             )
             continue
 
@@ -326,7 +308,9 @@ def load_hf_weights(
                 if vocab_size is not None and ("embed" in mapped or "head" in mapped):
                     padded = pad_vocab_for_tp(vocab_size, ps.tp_size)
                     if tensor.size(0) < padded:
-                        pad = torch.zeros(padded - tensor.size(0), *tensor.shape[1:], dtype=tensor.dtype)
+                        pad = torch.zeros(
+                            padded - tensor.size(0), *tensor.shape[1:], dtype=tensor.dtype
+                        )
                         tensor = torch.cat([tensor, pad], dim=0)
                 qkv = spec.qkv_spec(mapped) if hasattr(spec, "qkv_spec") else None
                 if qkv is not None:
@@ -368,7 +352,9 @@ def _load_expert_weight(native_name, hf_names, reader, spec, ps, loaded, expert_
             else:
                 tensor = split_dim(tensor, ps.etp_rank, ps.etp_size, dim=split_d)
 
-    loaded[spec.expert_local_name(native_name, expert_gid - local_start)] = tensor.to(dtype=torch.bfloat16)
+    loaded[spec.expert_local_name(native_name, expert_gid - local_start)] = tensor.to(
+        dtype=torch.bfloat16
+    )
 
 
 def _resolve_param_name(name: str, state_dict: dict) -> str | None:
@@ -436,7 +422,9 @@ def export_hf_weights(
                 exported_params += 1
                 if not rank0_only or rank == 0:
                     for native_name, gathered_tensor in gathered_one.items():
-                        if vocab_size is not None and ("embed" in native_name or "head" in native_name):
+                        if vocab_size is not None and (
+                            "embed" in native_name or "head" in native_name
+                        ):
                             gathered_tensor = gathered_tensor[:vocab_size]
                         for hf_name, hf_tensor in spec.native_to_hf(native_name, gathered_tensor):
                             yield hf_name, _cast_export_tensor(hf_tensor, resolved_export_dtype)
@@ -514,7 +502,7 @@ def _gather_dense(name: str, tensor: torch.Tensor, spec: HFWeights, ps) -> torch
 
 
 def _gather_expert(
-    name: str, tensor: torch.Tensor, spec: HFWeights, ps, out: dict[str, torch.Tensor],
+    name: str, tensor: torch.Tensor, spec: HFWeights, ps, out: dict[str, torch.Tensor]
 ) -> None:
     """Gather an expert param across ETP + EP."""
     tensor = _gather_expert_etp(name, tensor, spec, ps)
@@ -549,10 +537,7 @@ def _expert_group_key(name: str) -> str:
 
 
 def _gather_expert_group(
-    entries: list[tuple[int, str, torch.Tensor]],
-    spec: HFWeights,
-    ps,
-    out: dict[str, torch.Tensor],
+    entries: list[tuple[int, str, torch.Tensor]], spec: HFWeights, ps, out: dict[str, torch.Tensor]
 ) -> None:
     """Gather local experts in one EP collective per layer/kind."""
     prepared = [
@@ -565,8 +550,7 @@ def _gather_expert_group(
         if packed_name is not None:
             if ps.ep_size <= 1 or ps.ep_group is None:
                 out[packed_name] = torch.stack(
-                    [tensor.contiguous() for _, _, tensor in prepared],
-                    dim=0,
+                    [tensor.contiguous() for _, _, tensor in prepared], dim=0
                 ).cpu()
                 return
 

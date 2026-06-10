@@ -33,9 +33,7 @@ class Qwen3MoEConfig:
     num_nextn_predict_layers: int = 0
     mtp_loss_scaling_factor: float = 0.1
     mtp_use_repeated_layer: bool = False
-    layer_types: list[str] = field(
-        default_factory=lambda: ["full_attention"] * 48
-    )
+    layer_types: list[str] = field(default_factory=lambda: ["full_attention"] * 48)
 
     def __post_init__(self):
         self._validate()
@@ -72,10 +70,7 @@ class Qwen3MoEConfig:
         )
         valid_types = {"full_attention"}
         for i, lt in enumerate(self.layer_types):
-            _check(
-                lt in valid_types,
-                f"layer_types[{i}] must be one of {valid_types}, got '{lt}'",
-            )
+            _check(lt in valid_types, f"layer_types[{i}] must be one of {valid_types}, got '{lt}'")
 
         if errors:
             raise ValueError(
@@ -116,8 +111,6 @@ class Qwen3MoEConfig:
             kwargs["num_nextn_predict_layers"] = 0
 
         if "layer_types" not in kwargs:
-            kwargs["layer_types"] = ["full_attention"] * kwargs.get(
-                "num_hidden_layers", 48
-            )
+            kwargs["layer_types"] = ["full_attention"] * kwargs.get("num_hidden_layers", 48)
         kwargs.update(overrides)
         return cls(**kwargs)

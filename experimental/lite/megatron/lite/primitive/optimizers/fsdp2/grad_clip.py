@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import math
-from numbers import Number
 from collections import defaultdict
 from collections.abc import Callable, Iterable
+from numbers import Number
 from typing import Any
 
 import torch
@@ -24,8 +24,9 @@ def sharded_grad_sq_sum(
     accum_dtype: str | torch.dtype = torch.float32,
     default_device: torch.device | None = None,
     chunk_size_numel: int = 0,
-    scalar_all_reduce: Callable[[torch.Tensor, dist.ProcessGroup, dist.ReduceOp], None]
-    | None = None,
+    scalar_all_reduce: (
+        Callable[[torch.Tensor, dist.ProcessGroup, dist.ReduceOp], None] | None
+    ) = None,
 ) -> torch.Tensor:
     """Return global L2 grad squared-sum for Tensor/DTensor parameters.
 
@@ -39,18 +40,11 @@ def sharded_grad_sq_sum(
     groups = _group_grads(params)
     total: torch.Tensor | None = None
     for group in groups.values():
-        local_sq = _group_local_sq_sum(
-            group,
-            dtype=dtype,
-            chunk_size_numel=chunk_size_numel,
-        )
+        local_sq = _group_local_sq_sum(group, dtype=dtype, chunk_size_numel=chunk_size_numel)
         meta = group[0][2]
         if meta is not None and not _has_partial_placement(meta) and dist.is_initialized():
             _reduce_dtensor_scalar_(
-                local_sq,
-                meta,
-                op=dist.ReduceOp.SUM,
-                scalar_all_reduce=scalar_all_reduce,
+                local_sq, meta, op=dist.ReduceOp.SUM, scalar_all_reduce=scalar_all_reduce
             )
         total = local_sq if total is None else total.to(local_sq.device) + local_sq
 
@@ -76,19 +70,12 @@ def sharded_grad_norm(
 
     if math.isinf(float(norm_type)):
         total = sharded_grad_abs_max(
-            params,
-            pp_group=pp_group,
-            accum_dtype=accum_dtype,
-            default_device=default_device,
+            params, pp_group=pp_group, accum_dtype=accum_dtype, default_device=default_device
         )
         return total
     if float(norm_type) != 2.0:
         raise ValueError(f"sharded_grad_norm supports norm_type=2.0 or inf, got {norm_type!r}.")
-    sq_sum = sharded_grad_sq_sum(
-        params,
-        accum_dtype=accum_dtype,
-        default_device=default_device,
-    )
+    sq_sum = sharded_grad_sq_sum(params, accum_dtype=accum_dtype, default_device=default_device)
     if pp_group is not None and dist.is_initialized() and dist.get_world_size(pp_group) > 1:
         dist.all_reduce(sq_sum, op=dist.ReduceOp.SUM, group=pp_group)
     return sq_sum.sqrt()
@@ -122,9 +109,7 @@ def sharded_grad_abs_max(
 
 @torch.no_grad()
 def clip_grads_with_sharded_norm_(
-    params: Iterable[nn.Parameter],
-    max_norm: float,
-    total_norm: torch.Tensor | float,
+    params: Iterable[nn.Parameter], max_norm: float, total_norm: torch.Tensor | float
 ) -> None:
     """Scale gradients in-place using a precomputed global norm."""
 
@@ -165,8 +150,8 @@ def resolve_torch_dtype(dtype: str | torch.dtype) -> torch.dtype:
 def _group_grads(
     params: Iterable[nn.Parameter],
 ) -> dict[tuple[Any, ...], list[tuple[nn.Parameter, torch.Tensor, Any | None]]]:
-    groups: dict[tuple[Any, ...], list[tuple[nn.Parameter, torch.Tensor, Any | None]]] = defaultdict(
-        list
+    groups: dict[tuple[Any, ...], list[tuple[nn.Parameter, torch.Tensor, Any | None]]] = (
+        defaultdict(list)
     )
     for param in params:
         grad = param.grad
@@ -195,19 +180,12 @@ def _group_local_sq_sum(
     total = torch.zeros((), device=device, dtype=dtype)
     for _param, grad, meta in group:
         local_grad = _local_grad(grad, meta)
-        total += _tensor_sq_sum(
-            local_grad.detach(),
-            dtype=dtype,
-            chunk_size_numel=chunk_size_numel,
-        )
+        total += _tensor_sq_sum(local_grad.detach(), dtype=dtype, chunk_size_numel=chunk_size_numel)
     return total
 
 
 def _tensor_sq_sum(
-    tensor: torch.Tensor,
-    *,
-    dtype: torch.dtype,
-    chunk_size_numel: int = 0,
+    tensor: torch.Tensor, *, dtype: torch.dtype, chunk_size_numel: int = 0
 ) -> torch.Tensor:
     if chunk_size_numel <= 0 or tensor.numel() <= chunk_size_numel:
         return tensor.to(dtype).pow(2).sum()
@@ -223,9 +201,7 @@ def _tensor_sq_sum(
 
 
 def _group_local_abs_max(
-    group: list[tuple[nn.Parameter, torch.Tensor, Any | None]],
-    *,
-    dtype: torch.dtype,
+    group: list[tuple[nn.Parameter, torch.Tensor, Any | None]], *, dtype: torch.dtype
 ) -> torch.Tensor:
     device = _local_grad(group[0][1], group[0][2]).device
     total = torch.zeros((), device=device, dtype=dtype)
@@ -299,8 +275,9 @@ def _reduce_dtensor_scalar_(
     dtensor: Any,
     *,
     op: dist.ReduceOp,
-    scalar_all_reduce: Callable[[torch.Tensor, dist.ProcessGroup, dist.ReduceOp], None]
-    | None = None,
+    scalar_all_reduce: (
+        Callable[[torch.Tensor, dist.ProcessGroup, dist.ReduceOp], None] | None
+    ) = None,
 ) -> None:
     for mesh_dim, placement in enumerate(dtensor.placements):
         if _is_replicate_placement(placement):

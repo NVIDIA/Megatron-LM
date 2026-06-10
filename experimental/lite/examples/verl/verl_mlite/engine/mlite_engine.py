@@ -7,21 +7,7 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-from megatron.lite.model import resolve_model_type_from_hf
-from megatron.lite.primitive.ckpt import load_training_checkpoint, save_training_checkpoint
-from megatron.lite.primitive.parallel import pack_nested_thd, unpack_packed_thd_to_nested
-from megatron.lite.primitive.protocols import default_expert_classifier, default_placement_fn
-from megatron.lite.runtime import create_runtime
-from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
-from megatron.lite.runtime.contracts.config import (
-    OptimizerConfig as MegatronLiteOptimizerConfig,
-)
-from megatron.lite.runtime.contracts.config import (
-    ParallelConfig,
-    RuntimeConfig,
-)
 from tensordict import TensorDict
-
 from verl.trainer.config import CheckpointConfig
 from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
@@ -29,6 +15,15 @@ from verl.utils.device import get_device_id, get_device_name
 from verl.workers.config import HFModelConfig, OptimizerConfig
 from verl.workers.engine.base import BaseEngine, BaseEngineCtx, EngineRegistry
 from verl.workers.engine.utils import postprocess_batch_func, prepare_micro_batches
+
+from megatron.lite.model import resolve_model_type_from_hf
+from megatron.lite.primitive.ckpt import load_training_checkpoint, save_training_checkpoint
+from megatron.lite.primitive.parallel import pack_nested_thd, unpack_packed_thd_to_nested
+from megatron.lite.primitive.protocols import default_expert_classifier, default_placement_fn
+from megatron.lite.runtime import create_runtime
+from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
+from megatron.lite.runtime.contracts.config import OptimizerConfig as MegatronLiteOptimizerConfig
+from megatron.lite.runtime.contracts.config import ParallelConfig, RuntimeConfig
 
 from .config import MegatronLiteEngineConfig
 
@@ -165,7 +160,9 @@ class MegatronLiteEngine(BaseEngine):
         self.module = self._extract_primary_module()
 
         if self.handle._optimizer is not None and self.handle._lr_scheduler is None:
-            self.handle._lr_scheduler = _build_lr_scheduler(self.handle._optimizer, self._mlite_config.optimizer)
+            self.handle._lr_scheduler = _build_lr_scheduler(
+                self.handle._optimizer, self._mlite_config.optimizer
+            )
 
         self.to(
             device="cpu",
@@ -198,11 +195,17 @@ class MegatronLiteEngine(BaseEngine):
             return self.handle._optimizer.param_groups[0]["lr"]
         return 0.0
 
-    def forward_backward_batch(self, data: TensorDict, loss_function, forward_only: bool = False) -> dict[str, Any]:
+    def forward_backward_batch(
+        self, data: TensorDict, loss_function, forward_only: bool = False
+    ) -> dict[str, Any]:
         self._require_initialized()
-        pad_mode = tu.get_non_tensor_data(data=data, key="pad_mode", default=DatasetPadMode.NO_PADDING)
+        pad_mode = tu.get_non_tensor_data(
+            data=data, key="pad_mode", default=DatasetPadMode.NO_PADDING
+        )
         if pad_mode != DatasetPadMode.NO_PADDING:
-            raise NotImplementedError("MegatronLiteEngine only supports pad_mode=no_padding for now.")
+            raise NotImplementedError(
+                "MegatronLiteEngine only supports pad_mode=no_padding for now."
+            )
 
         tu.assign_non_tensor(data, sp_size=self.engine_config.cp)
 
@@ -217,9 +220,7 @@ class MegatronLiteEngine(BaseEngine):
         tu.assign_non_tensor(data, dp_size=self.get_data_parallel_size())
 
         micro_batches, indices = prepare_micro_batches(
-            data=data,
-            dp_group=self.get_data_parallel_group(),
-            same_micro_num_in_dp=True,
+            data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
         )
 
         if self._use_runtime_forward_backward():
@@ -255,9 +256,7 @@ class MegatronLiteEngine(BaseEngine):
                 )
 
                 model_output = self._build_verl_model_output(
-                    raw_output=raw_output,
-                    micro_batch=micro_batch,
-                    inputs=model_inputs,
+                    raw_output=raw_output, micro_batch=micro_batch, inputs=model_inputs
                 )
 
                 if loss_function is not None:
@@ -280,11 +279,7 @@ class MegatronLiteEngine(BaseEngine):
                 loss.backward()
 
             outputs.append(
-                {
-                    "model_output": model_output,
-                    "loss": loss.detach().item(),
-                    "metrics": metrics,
-                }
+                {"model_output": model_output, "loss": loss.detach().item(), "metrics": metrics}
             )
 
         if not forward_only:
@@ -313,7 +308,9 @@ class MegatronLiteEngine(BaseEngine):
     def get_data_parallel_size(self):
         if self.handle is None:
             world_size = dist.get_world_size() if dist.is_initialized() else 1
-            return world_size // (self.engine_config.tp * self.engine_config.cp * self.engine_config.pp)
+            return world_size // (
+                self.engine_config.tp * self.engine_config.cp * self.engine_config.pp
+            )
         return self.handle.dp_size
 
     def get_data_parallel_rank(self):
@@ -357,7 +354,9 @@ class MegatronLiteEngine(BaseEngine):
         save_optimizer = save_contents is None or "optimizer" in save_contents
         if not save_model and not save_optimizer:
             if self._rank == 0:
-                print(f"Skipping Megatron Lite checkpoint save at step {global_step}: save_contents={save_contents}")
+                print(
+                    f"Skipping Megatron Lite checkpoint save at step {global_step}: save_contents={save_contents}"
+                )
             if dist.is_initialized():
                 dist.barrier()
             return
@@ -382,7 +381,10 @@ class MegatronLiteEngine(BaseEngine):
                 save_optimizer=save_optimizer,
             )
             if self.handle._lr_scheduler is not None and self._rank == 0:
-                torch.save(self.handle._lr_scheduler.state_dict(), os.path.join(local_path, _LR_SCHEDULER_STATE))
+                torch.save(
+                    self.handle._lr_scheduler.state_dict(),
+                    os.path.join(local_path, _LR_SCHEDULER_STATE),
+                )
             if dist.is_initialized():
                 dist.barrier()
         finally:
@@ -467,7 +469,9 @@ class MegatronLiteEngine(BaseEngine):
     def _build_impl_cfg(self) -> dict[str, Any]:
         impl_cfg = dict(self.engine_config.impl_cfg)
         if impl_cfg.get("use_thd", True) is not True:
-            raise ValueError("MegatronLiteEngine supports only THD/no-padding SFT; set engine.impl_cfg.use_thd=True.")
+            raise ValueError(
+                "MegatronLiteEngine supports only THD/no-padding SFT; set engine.impl_cfg.use_thd=True."
+            )
         impl_cfg["use_thd"] = True
         mtp_cfg = getattr(self.model_config, "mtp", None)
         if mtp_cfg is not None:
@@ -476,7 +480,9 @@ class MegatronLiteEngine(BaseEngine):
             impl_cfg["mtp_enable"] = mtp_enable
             impl_cfg["mtp_enable_train"] = mtp_enable_train
             impl_cfg["mtp_detach_encoder"] = bool(getattr(mtp_cfg, "detach_encoder", False))
-            impl_cfg["mtp_loss_scaling_factor"] = float(getattr(mtp_cfg, "mtp_loss_scaling_factor", 0.1))
+            impl_cfg["mtp_loss_scaling_factor"] = float(
+                getattr(mtp_cfg, "mtp_loss_scaling_factor", 0.1)
+            )
         if self.engine_config.full_determinism:
             impl_cfg.setdefault("deterministic", True)
         if self.engine_config.forward_only:
@@ -487,7 +493,9 @@ class MegatronLiteEngine(BaseEngine):
         optimizer_name = self._normalize_optimizer_name(self.optimizer_config)
         betas = tuple(getattr(self.optimizer_config, "betas", (0.9, 0.999)))
         override = getattr(self.optimizer_config, "override_optimizer_config", {}) or {}
-        offload_fraction = override.get("offload_fraction", override.get("optimizer_offload_fraction"))
+        offload_fraction = override.get(
+            "offload_fraction", override.get("optimizer_offload_fraction")
+        )
         if offload_fraction is None and override.get("optimizer_cpu_offload"):
             offload_fraction = 1.0
         if offload_fraction is None and self.is_optimizer_offload_enabled:
@@ -514,13 +522,13 @@ class MegatronLiteEngine(BaseEngine):
             lr_warmup_init=getattr(self.optimizer_config, "lr_warmup_init", 0.0),
             lr_decay_steps=getattr(self.optimizer_config, "lr_decay_steps", None),
             lr_decay_style=lr_decay_style,
-            weight_decay_incr_style=getattr(self.optimizer_config, "weight_decay_incr_style", "constant"),
+            weight_decay_incr_style=getattr(
+                self.optimizer_config, "weight_decay_incr_style", "constant"
+            ),
             lr_wsd_decay_style=getattr(self.optimizer_config, "lr_wsd_decay_style", "exponential"),
             lr_wsd_decay_steps=getattr(self.optimizer_config, "lr_wsd_decay_steps", None),
             use_checkpoint_opt_param_scheduler=getattr(
-                self.optimizer_config,
-                "use_checkpoint_opt_param_scheduler",
-                False,
+                self.optimizer_config, "use_checkpoint_opt_param_scheduler", False
             ),
             adam_beta1=betas[0],
             adam_beta2=betas[1],
@@ -536,7 +544,9 @@ class MegatronLiteEngine(BaseEngine):
         lower = str(optimizer_name).lower()
         if "adam" in lower:
             return "adam"
-        raise ValueError(f"MegatronLiteEngine only supports Adam-style optimizers today, got {optimizer_name!r}")
+        raise ValueError(
+            f"MegatronLiteEngine only supports Adam-style optimizers today, got {optimizer_name!r}"
+        )
 
     def _extract_primary_module(self):
         model = self.handle._model
@@ -565,7 +575,9 @@ class MegatronLiteEngine(BaseEngine):
         num_micro_batches = len(micro_batches)
         batch_num_tokens = tu.get_non_tensor_data(data=data, key="batch_num_tokens", default=None)
         if batch_num_tokens is None:
-            raise ValueError("MegatronLiteEngine PP/CP SFT requires batch_num_tokens for VERL-compatible loss scaling.")
+            raise ValueError(
+                "MegatronLiteEngine PP/CP SFT requires batch_num_tokens for VERL-compatible loss scaling."
+            )
         if batch_num_tokens <= 0:
             raise ValueError(f"batch_num_tokens must be positive, got {batch_num_tokens}.")
         loss_scale = self.get_data_parallel_size() * num_micro_batches / float(batch_num_tokens)
@@ -614,7 +626,9 @@ class MegatronLiteEngine(BaseEngine):
     def _make_model_inputs(self, micro_batch: TensorDict) -> dict[str, torch.Tensor]:
         input_ids = micro_batch["input_ids"]
         if not getattr(input_ids, "is_nested", False):
-            raise NotImplementedError("MegatronLiteEngine supports only nested no-padding THD batches.")
+            raise NotImplementedError(
+                "MegatronLiteEngine supports only nested no-padding THD batches."
+            )
 
         ps = self.handle._parallel_state
         loss_mask = self._loss_mask_for_packing(micro_batch, input_ids)
@@ -630,9 +644,7 @@ class MegatronLiteEngine(BaseEngine):
             roll_loss_mask=True,
         )
         use_fused_kernels = tu.get_non_tensor_data(
-            data=micro_batch,
-            key="use_fused_kernels",
-            default=self.engine_config.use_fused_kernels,
+            data=micro_batch, key="use_fused_kernels", default=self.engine_config.use_fused_kernels
         )
 
         return {
@@ -644,11 +656,15 @@ class MegatronLiteEngine(BaseEngine):
             "packed_batch": packed_batch,
             "temperature": self._scalar_temperature(micro_batch),
             "use_fused_kernels": use_fused_kernels,
-            "calculate_entropy": tu.get_non_tensor_data(data=micro_batch, key="calculate_entropy", default=False),
+            "calculate_entropy": tu.get_non_tensor_data(
+                data=micro_batch, key="calculate_entropy", default=False
+            ),
         }
 
     @staticmethod
-    def _loss_mask_for_packing(micro_batch: TensorDict, input_ids: torch.Tensor) -> torch.Tensor | None:
+    def _loss_mask_for_packing(
+        micro_batch: TensorDict, input_ids: torch.Tensor
+    ) -> torch.Tensor | None:
         if "loss_mask" not in micro_batch.keys():
             return None
 
@@ -693,9 +709,7 @@ class MegatronLiteEngine(BaseEngine):
             micro_batch = runtime_batch["_verl_micro_batch"]
             inputs = runtime_batch["_verl_inputs"]
             model_output = self._build_verl_model_output(
-                raw_output=raw_output,
-                micro_batch=micro_batch,
-                inputs=inputs,
+                raw_output=raw_output, micro_batch=micro_batch, inputs=inputs
             )
             raw_output["_verl_model_output"] = model_output
             if loss_function is not None:
@@ -742,12 +756,18 @@ class MegatronLiteEngine(BaseEngine):
         temperature = micro_batch["temperature"]
         if not isinstance(temperature, torch.Tensor):
             return float(temperature)
-        values = temperature.values() if getattr(temperature, "is_nested", False) else temperature.reshape(-1)
+        values = (
+            temperature.values()
+            if getattr(temperature, "is_nested", False)
+            else temperature.reshape(-1)
+        )
         if values.numel() == 0:
             return 1.0
         first = values[0].detach()
         if not torch.all(values.detach() == first).item():
-            raise NotImplementedError("MegatronLiteEngine currently supports scalar temperature only.")
+            raise NotImplementedError(
+                "MegatronLiteEngine currently supports scalar temperature only."
+            )
         return float(first.float().item())
 
     def _checkpoint_hooks(self):

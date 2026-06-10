@@ -33,7 +33,9 @@ def _patch_transformers_rope_ignore_keys() -> None:
                 if isinstance(ignore_keys, list):
                     kwargs["ignore_keys"] = set(ignore_keys)
                 elif ignore_keys is not None and not isinstance(ignore_keys, set):
-                    if isinstance(ignore_keys, Iterable) and not isinstance(ignore_keys, (str, bytes)):
+                    if isinstance(ignore_keys, Iterable) and not isinstance(
+                        ignore_keys, (str, bytes)
+                    ):
                         kwargs["ignore_keys"] = set(ignore_keys)
                 return check_received_keys(*args, **kwargs)
 

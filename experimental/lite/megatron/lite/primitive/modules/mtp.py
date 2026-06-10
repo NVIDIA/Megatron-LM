@@ -58,18 +58,10 @@ class MTPDecoderLayer(nn.Module):
         self.enorm = te.RMSNorm(hidden_size, eps=rms_norm_eps, zero_centered_gamma=True)
         self.hnorm = te.RMSNorm(hidden_size, eps=rms_norm_eps, zero_centered_gamma=True)
         self.eh_proj = VanillaColumnParallelLinear(
-            hidden_size * 2,
-            hidden_size,
-            ps,
-            sp=ps.tp_size > 1,
-            gather_output=True,
+            hidden_size * 2, hidden_size, ps, sp=ps.tp_size > 1, gather_output=True
         )
         self.transformer_layer = transformer_layer
-        self.final_layernorm = te.RMSNorm(
-            hidden_size,
-            eps=rms_norm_eps,
-            zero_centered_gamma=True,
-        )
+        self.final_layernorm = te.RMSNorm(hidden_size, eps=rms_norm_eps, zero_centered_gamma=True)
 
     def forward(
         self,
@@ -80,10 +72,14 @@ class MTPDecoderLayer(nn.Module):
         rotary_position_ids: torch.Tensor | None = None,
         packed_seq_params=None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        attention_position_ids = rotary_position_ids if rotary_position_ids is not None else position_ids
+        attention_position_ids = (
+            rotary_position_ids if rotary_position_ids is not None else position_ids
+        )
         input_ids, _ = roll_packed_thd_left(input_ids, packed_seq_params=packed_seq_params, dims=-1)
         if position_ids is not None:
-            position_ids, _ = roll_packed_thd_left(position_ids, packed_seq_params=packed_seq_params, dims=-1)
+            position_ids, _ = roll_packed_thd_left(
+                position_ids, packed_seq_params=packed_seq_params, dims=-1
+            )
         decoder_input = scatter_to_sequence_parallel(self.embedding(input_ids), self.ps)
         if self.detach_encoder:
             decoder_input = decoder_input.detach()
@@ -93,9 +89,7 @@ class MTPDecoderLayer(nn.Module):
         hidden_states = torch.cat((decoder_input, hidden_states), dim=-1)
         hidden_states = scatter_to_sequence_parallel(self.eh_proj(hidden_states), self.ps)
         hidden_states = self.transformer_layer(
-            hidden_states,
-            position_ids=attention_position_ids,
-            packed_seq_params=packed_seq_params,
+            hidden_states, position_ids=attention_position_ids, packed_seq_params=packed_seq_params
         )
         hidden_states = self.final_layernorm(hidden_states)
         return hidden_states, input_ids, position_ids

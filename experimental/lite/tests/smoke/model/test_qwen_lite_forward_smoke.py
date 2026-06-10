@@ -7,13 +7,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-
-pytestmark = [
-    pytest.mark.mlite,
-    pytest.mark.smoke,
-    pytest.mark.gpu,
-    pytest.mark.distributed,
-]
+pytestmark = [pytest.mark.mlite, pytest.mark.smoke, pytest.mark.gpu, pytest.mark.distributed]
 
 
 def _qwen3_symbols():
@@ -117,9 +111,7 @@ def _assert_loss_and_backward(output: dict, model: torch.nn.Module):
     assert torch.isfinite(loss)
     loss.backward()
     grad_params = [
-        param
-        for param in model.parameters()
-        if param.requires_grad and param.grad is not None
+        param for param in model.parameters() if param.requires_grad and param.grad is not None
     ]
     assert grad_params
     assert all(torch.isfinite(param.grad.detach().float()).all() for param in grad_params)

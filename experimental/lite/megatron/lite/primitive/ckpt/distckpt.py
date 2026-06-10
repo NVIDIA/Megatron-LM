@@ -21,7 +21,6 @@ from megatron.lite.primitive.protocols import (
     default_placement_fn,
 )
 
-
 _DISTOPT_METADATA = {
     "distrib_optim_sharding_type": "fully_reshardable",
     "distrib_optim_fully_reshardable_mem_efficient": False,
@@ -40,8 +39,7 @@ def attach_model_sharded_state_dict(
 
     for chunk in model_chunks:
         chunk.sharded_state_dict = MethodType(  # type: ignore[method-assign]
-            _build_bound_sharded_state_dict(ps, get_placements, is_expert),
-            chunk,
+            _build_bound_sharded_state_dict(ps, get_placements, is_expert), chunk
         )
         chunk._mlite_distopt_sharded_state_dict = True  # type: ignore[attr-defined]
         chunk._mlite_distopt_parallel_state = ps  # type: ignore[attr-defined]
@@ -80,8 +78,7 @@ def save_distopt_checkpoint(
         patches = _patch_empty_native_optimizer_state_dicts(optimizer, fallback_step=step)
         try:
             state_dict["optimizer"] = optimizer.sharded_state_dict(
-                _single_or_all_model_state(model_sd),
-                metadata=_DISTOPT_METADATA,
+                _single_or_all_model_state(model_sd), metadata=_DISTOPT_METADATA
             )
         finally:
             _restore_state_dict_patches(patches)
@@ -111,9 +108,7 @@ def load_distopt_checkpoint(
         patches = _patch_empty_native_optimizer_state_dicts(optimizer, fallback_step=0)
         try:
             load_sd["optimizer"] = optimizer.sharded_state_dict(
-                _single_or_all_model_state(model_sd),
-                is_loading=True,
-                metadata=_DISTOPT_METADATA,
+                _single_or_all_model_state(model_sd), is_loading=True, metadata=_DISTOPT_METADATA
             )
         finally:
             _restore_state_dict_patches(patches)
@@ -156,9 +151,7 @@ def _synchronize_native_optimizer_steps(optimizer: Any) -> None:
 
 
 def _patch_empty_native_optimizer_state_dicts(
-    optimizer: Any,
-    *,
-    fallback_step: int,
+    optimizer: Any, *, fallback_step: int
 ) -> list[tuple[Any, Any]]:
     patches: list[tuple[Any, Any]] = []
     for distopt in _iter_distributed_optimizers(optimizer):
@@ -169,9 +162,7 @@ def _patch_empty_native_optimizer_state_dicts(
         original_state_dict = distopt.state_dict
 
         def patched_state_dict(
-            original_state_dict=original_state_dict,
-            distopt=distopt,
-            fallback_step=fallback_step,
+            original_state_dict=original_state_dict, distopt=distopt, fallback_step=fallback_step
         ):
             try:
                 return original_state_dict()
@@ -194,10 +185,7 @@ def _patch_native_optimizer_step_load(optimizer: Any) -> list[tuple[Any, Any]]:
         original_set_state = distopt._set_main_param_and_optimizer_states
 
         def patched_set_state(
-            model_param,
-            tensors,
-            distopt=distopt,
-            original_set_state=original_set_state,
+            model_param, tensors, distopt=distopt, original_set_state=original_set_state
         ):
             removed_step = _pop_optimizer_step_for_model_param(distopt, model_param, tensors)
             try:
@@ -218,9 +206,7 @@ def _restore_set_state_patches(patches: list[tuple[Any, Any]]) -> None:
 
 
 def _pop_optimizer_step_for_model_param(
-    distopt: Any,
-    model_param,
-    tensors: dict[str, Any],
+    distopt: Any, model_param, tensors: dict[str, Any]
 ) -> tuple[MutableMapping, Any] | None:
     if "step" in tensors:
         return None
@@ -325,9 +311,7 @@ def _step_like(reference: Any, value: int) -> Any:
 
 
 def _build_bound_sharded_state_dict(
-    ps: ParallelState,
-    get_placements: PlacementFn,
-    is_expert: ExpertClassifierFn,
+    ps: ParallelState, get_placements: PlacementFn, is_expert: ExpertClassifierFn
 ) -> Callable:
     def sharded_state_dict(
         self,
@@ -390,19 +374,12 @@ def _make_sharded_tensor(
 ) -> ShardedTensor:
     rank_offsets, replica_id = _rank_offsets_and_replica_id(placements, ps, expert=expert)
     return ShardedTensor.from_rank_offsets(
-        key,
-        tensor,
-        *sharded_offsets,
-        *rank_offsets,
-        replica_id=replica_id,
+        key, tensor, *sharded_offsets, *rank_offsets, replica_id=replica_id
     )
 
 
 def _rank_offsets_and_replica_id(
-    placements: list,
-    ps: ParallelState,
-    *,
-    expert: bool,
+    placements: list, ps: ParallelState, *, expert: bool
 ) -> tuple[tuple[tuple[int, int, int], ...], tuple[int, ...]]:
     ranks, sizes = _mesh_ranks_and_sizes(ps, expert=expert)
     axis_fragments: dict[int, tuple[int, int]] = {}
@@ -431,11 +408,7 @@ def _replica_id(placements: list, ps: ParallelState, *, expert: bool) -> tuple[i
         if _placement_is_sharded(placements, 1) or _placement_is_sharded(placements, 2)
         else ps.dp_cp_rank
     )
-    return (
-        0,
-        _replica_axis_rank(placements, 3, ps.tp_rank),
-        int(dp_cp_rank),
-    )
+    return (0, _replica_axis_rank(placements, 3, ps.tp_rank), int(dp_cp_rank))
 
 
 def _replica_axis_rank(placements: list, axis: int, rank: int) -> int:
@@ -474,8 +447,7 @@ def _model_sharded_state_dict(model: nn.Module | Iterable[nn.Module]) -> dict[st
     ps = _chunk_parallel_state(chunks[0]) if chunks else None
     return {
         _model_chunk_key(ps, idx, len(chunks)): _chunk_sharded_state_dict(
-            chunk,
-            _model_chunk_sharded_key_prefix(ps, idx, len(chunks)),
+            chunk, _model_chunk_sharded_key_prefix(ps, idx, len(chunks))
         )
         for idx, chunk in enumerate(chunks)
     }
@@ -520,7 +492,9 @@ def _single_or_all_model_state(model_sd: dict[str, Any]) -> dict[str, Any]:
     return model_sd
 
 
-def _load_model_state_dict(model: nn.Module | Iterable[nn.Module], state_dict: dict[str, Any]) -> None:
+def _load_model_state_dict(
+    model: nn.Module | Iterable[nn.Module], state_dict: dict[str, Any]
+) -> None:
     chunks = _model_chunks(model)
     if len(chunks) == 1 and "model" in state_dict:
         _wrapped_module(chunks[0]).load_state_dict(state_dict["model"], strict=False)

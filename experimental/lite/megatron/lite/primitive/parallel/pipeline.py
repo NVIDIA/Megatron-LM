@@ -139,7 +139,9 @@ def _batch_input_ids(batch):
     return input_ids
 
 
-def _apply_external_loss(out: dict, batch, loss_fn) -> tuple[torch.Tensor, dict] | tuple[None, None]:
+def _apply_external_loss(
+    out: dict, batch, loss_fn
+) -> tuple[torch.Tensor, dict] | tuple[None, None]:
     if loss_fn is None:
         return None, None
     loss, metrics = loss_fn(out, batch)
@@ -195,14 +197,7 @@ def _no_pipeline(
 
 
 def _forward_only_no_pipeline(
-    forward_step_fn,
-    model,
-    data_iter,
-    config,
-    ps,
-    *,
-    pre_forward_hook=None,
-    loss_fn=None,
+    forward_step_fn, model, data_iter, config, ps, *, pre_forward_hook=None, loss_fn=None
 ):
     num_microbatches = _num_microbatches_from_config(config, ps)
     del ps
@@ -400,9 +395,7 @@ def _deallocate_output_tensor(tensor: torch.Tensor | None) -> None:
 # Interleaved 1F1B (VPP) Schedule
 # ══════════════════════════════════════════════════════════════════════
 def _build_schedule_table(
-    num_microbatches: int,
-    num_chunks: int,
-    group_size: int,
+    num_microbatches: int, num_chunks: int, group_size: int
 ) -> list[tuple[int, int]]:
     """Build (microbatch_id, model_chunk_id) table for VPP scheduling."""
     table: list[tuple[int, int]] = []
@@ -554,9 +547,7 @@ def _run_pipeline_chunk_forward(
         _apply_external_loss(out, batch, loss_fn)
         return out
     return model(
-        hidden_states=input_tensor,
-        position_ids=position_ids,
-        packed_seq_params=packed_seq_params,
+        hidden_states=input_tensor, position_ids=position_ids, packed_seq_params=packed_seq_params
     )
 
 
@@ -670,7 +661,9 @@ def _interleaved_1f1b_schedule(
     for mb_id in range(num_microbatches):
         batch = next(data_iter)
         _set_aux_loss_scale(pre_forward_hook, num_microbatches)
-        saved: dict[int, tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, dict]] = {}
+        saved: dict[
+            int, tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, dict]
+        ] = {}
         pending_activation: torch.Tensor | None = None
 
         # Forward in true virtual-stage order:

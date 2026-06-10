@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import os
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -16,13 +16,8 @@ from megatron.lite.runtime.backends.mlite.runtime import (
     _apply_attention_backend_env,
     _build_impl_cfg,
 )
-from megatron.lite.runtime.contracts.config import (
-    OptimizerConfig,
-    ParallelConfig,
-    RuntimeConfig,
-)
+from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig, RuntimeConfig
 from megatron.lite.runtime.contracts.handle import ModelHandle
-
 
 pytestmark = pytest.mark.mlite
 
@@ -39,12 +34,7 @@ def test_runtime_config_accepts_mlite_backend_cfg():
     cfg = RuntimeConfig(
         backend="mlite",
         hf_path="/models/Qwen3",
-        backend_cfg={
-            "model_name": "qwen3",
-            "impl": "lite",
-            "tp": 2,
-            "ep": 4,
-        },
+        backend_cfg={"model_name": "qwen3", "impl": "lite", "tp": 2, "ep": 4},
     )
 
     assert cfg.backend == "mlite"
@@ -54,8 +44,7 @@ def test_runtime_config_accepts_mlite_backend_cfg():
 
 def test_mlite_config_defaults_and_parallel_fields():
     cfg = MegatronLiteConfig(
-        model_name="qwen3_moe",
-        parallel=ParallelConfig(tp=4, etp=1, ep=8, pp=2, vpp=2, cp=2),
+        model_name="qwen3_moe", parallel=ParallelConfig(tp=4, etp=1, ep=8, pp=2, vpp=2, cp=2)
     )
 
     assert cfg.model_name == "qwen3_moe"
@@ -92,8 +81,8 @@ def test_mlite_config_from_dict_accepts_optimizer_override_config():
                 "override_optimizer_config": {
                     "fsdp2_use_fp32_master": False,
                     "offload_fraction": 1.0,
-                },
-            },
+                }
+            }
         },
     )
 
@@ -106,12 +95,7 @@ def test_mlite_config_from_dict_accepts_optimizer_override_config():
 def test_mlite_config_from_dict_rejects_num_microbatches():
     with pytest.raises(ValueError, match="num_microbatches"):
         MegatronLiteConfig.from_dict(
-            "/models/Qwen3",
-            {
-                "model_name": "qwen3",
-                "tp": 4,
-                "num_microbatches": 2,
-            },
+            "/models/Qwen3", {"model_name": "qwen3", "tp": 4, "num_microbatches": 2}
         )
 
 
@@ -126,9 +110,7 @@ class _FakeImplConfig:
 def test_build_impl_cfg_backfills_top_level_hf_path_and_runtime_fields():
     proto = type("Proto", (), {"ImplConfig": _FakeImplConfig})
     cfg = MegatronLiteConfig(
-        model_name="qwen3",
-        hf_path="/models/top",
-        attention_backend_override="local",
+        model_name="qwen3", hf_path="/models/top", attention_backend_override="local"
     )
 
     impl_cfg = _build_impl_cfg(proto, cfg)
@@ -142,9 +124,7 @@ def test_build_impl_cfg_backfills_top_level_hf_path_and_runtime_fields():
 def test_build_impl_cfg_preserves_explicit_impl_hf_path():
     proto = type("Proto", (), {"ImplConfig": _FakeImplConfig})
     cfg = MegatronLiteConfig(
-        model_name="qwen3",
-        hf_path="/models/top",
-        impl_cfg={"hf_path": "/models/impl"},
+        model_name="qwen3", hf_path="/models/top", impl_cfg={"hf_path": "/models/impl"}
     )
 
     impl_cfg = _build_impl_cfg(proto, cfg)
@@ -193,11 +173,7 @@ class HookedOptimizer:
 
 def test_runtime_to_prefers_optimizer_specific_offload_hooks():
     optimizer = HookedOptimizer()
-    handle = ModelHandle(
-        model=nn.Linear(2, 2),
-        optimizer=optimizer,
-        _extras={"model_chunks": []},
-    )
+    handle = ModelHandle(model=nn.Linear(2, 2), optimizer=optimizer, _extras={"model_chunks": []})
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
 
     runtime.to(handle, "cpu", model=False, optimizer=True, grad=False)
@@ -230,11 +206,7 @@ def test_model_handle_dp_from_parallel_state():
 def test_model_handle_cp_range_and_config_properties():
     cfg = {"tp": 8, "ep": 4}
     default_handle = ModelHandle(model=MagicMock())
-    configured_handle = ModelHandle(
-        model=MagicMock(),
-        config=cfg,
-        _extras={"cp_range": (1, 8)},
-    )
+    configured_handle = ModelHandle(model=MagicMock(), config=cfg, _extras={"cp_range": (1, 8)})
 
     assert default_handle.cp_range == (1, 1)
     assert configured_handle.cp_range == (1, 8)
@@ -248,9 +220,7 @@ def test_runtime_dispatch_creates_mlite_backend():
 
         runtime = create_runtime(
             RuntimeConfig(
-                backend="mlite",
-                hf_path="/models/test",
-                backend_cfg={"model_name": "qwen3"},
+                backend="mlite", hf_path="/models/test", backend_cfg={"model_name": "qwen3"}
             )
         )
 
@@ -279,13 +249,7 @@ def _run_verl_sft_dry_run(script: Path, tmp_path: Path, **env_overrides: str) ->
         "ETP_SIZE": "1",
         **env_overrides,
     }
-    completed = subprocess.run(
-        [str(script)],
-        env=env,
-        text=True,
-        capture_output=True,
-        check=True,
-    )
+    completed = subprocess.run([str(script)], env=env, text=True, capture_output=True, check=True)
     return completed.stdout
 
 
@@ -322,10 +286,7 @@ def test_verl_sft_script_does_not_emit_optimizer_state_offload_when_disabled(tmp
     )
 
     command = _run_verl_sft_dry_run(
-        script,
-        tmp_path,
-        PARAM_OFFLOAD="False",
-        OPTIMIZER_OFFLOAD="False",
+        script, tmp_path, PARAM_OFFLOAD="False", OPTIMIZER_OFFLOAD="False"
     )
 
     assert "engine.param_offload=False" in command

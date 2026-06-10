@@ -13,19 +13,11 @@ from megatron.lite.primitive.modules.lora import (
     trainable_param_stats,
 )
 
-
 pytestmark = pytest.mark.mlite
 
 
 def test_lora_config_aliases_and_trainable_param_accounting():
-    cfg = normalize_lora_config(
-        {
-            "enabled": True,
-            "rank": 2,
-            "alpha": 6,
-            "targets": ["qkv", "fc2"],
-        }
-    )
+    cfg = normalize_lora_config({"enabled": True, "rank": 2, "alpha": 6, "targets": ["qkv", "fc2"]})
 
     assert cfg.enabled
     assert cfg.scale == 3.0
@@ -78,10 +70,7 @@ def test_grouped_lora_respects_per_expert_splits():
     x = torch.tensor([[2.0, 9.0], [4.0, 1.0], [6.0, 3.0]])
     output = layer(x, [1, 2])
 
-    torch.testing.assert_close(
-        output,
-        torch.tensor([[4.0, 6.0], [5.0, 7.0], [15.0, 21.0]]),
-    )
+    torch.testing.assert_close(output, torch.tensor([[4.0, 6.0], [5.0, 7.0], [15.0, 21.0]]))
     with pytest.raises(ValueError, match="expected 2 splits"):
         layer(x, [3])
 
@@ -102,10 +91,7 @@ def test_mrope_interleaves_text_height_and_width_sections():
 
     base = torch.arange(3 * 2 * 6, dtype=torch.float32).reshape(3, 2, 6)
 
-    interleaved = MultimodalRotaryEmbedding._apply_interleaved_mrope(
-        base,
-        mrope_section=[1, 1, 1],
-    )
+    interleaved = MultimodalRotaryEmbedding._apply_interleaved_mrope(base, mrope_section=[1, 1, 1])
 
     expected = base[0].clone()
     expected[..., 1] = base[1, ..., 1]
@@ -135,12 +121,7 @@ def test_gated_delta_static_helpers_are_finite_and_shape_stable(transformer_engi
     alpha = torch.tensor([[[0.0, 1.0], [-1.0, 2.0]]])
     beta = torch.tensor([[[0.0, 2.0], [-2.0, 4.0]]])
 
-    g, beta_sigmoid = GatedDeltaNet._compute_g_and_beta(
-        torch.zeros(2),
-        torch.ones(2),
-        alpha,
-        beta,
-    )
+    g, beta_sigmoid = GatedDeltaNet._compute_g_and_beta(torch.zeros(2), torch.ones(2), alpha, beta)
 
     assert g.shape == alpha.shape
     assert beta_sigmoid.shape == beta.shape

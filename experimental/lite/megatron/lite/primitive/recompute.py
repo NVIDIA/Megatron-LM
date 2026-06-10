@@ -65,7 +65,9 @@ class _CheckpointWithoutOutputFn(torch.autograd.Function):
             ctx.cuda_rng_state = torch.cuda.get_rng_state()
 
         ctx.tensor_indices = [i for i, a in enumerate(args) if isinstance(a, torch.Tensor)]
-        ctx.non_tensor_args = [(i, a) for i, a in enumerate(args) if not isinstance(a, torch.Tensor)]
+        ctx.non_tensor_args = [
+            (i, a) for i, a in enumerate(args) if not isinstance(a, torch.Tensor)
+        ]
         ctx.num_args = len(args)
         ctx.save_for_backward(*[a for a in args if isinstance(a, torch.Tensor)])
 
@@ -204,16 +206,10 @@ def apply_recompute(
                 if mod_name in module_map:
                     submod = module_map[mod_name](layer)
                     if submod is not None:
-                        wrap_checkpoint(
-                            submod, preserve_rng_state=mod_name not in no_rng,
-                        )
+                        wrap_checkpoint(submod, preserve_rng_state=mod_name not in no_rng)
 
 
-def apply_offload(
-    layers: nn.ModuleList,
-    module_names: list[str],
-    module_map: ModuleMap,
-) -> None:
+def apply_offload(layers: nn.ModuleList, module_names: list[str], module_map: ModuleMap) -> None:
     """Wrap specified sub-modules with activation offloading to CPU."""
     if not module_names:
         return
@@ -241,7 +237,7 @@ class CheckpointFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(
-        ctx: Any, run_function: Callable, preserve_rng_state: bool, *args: torch.Tensor,
+        ctx: Any, run_function: Callable, preserve_rng_state: bool, *args: torch.Tensor
     ) -> Any:
         ctx.run_function = run_function
         ctx.preserve_rng_state = preserve_rng_state
@@ -302,9 +298,7 @@ class CheckpointFunction(torch.autograd.Function):
         if outputs_with_grad:
             torch.autograd.backward(outputs_with_grad, grad_for_outputs)
 
-        grads = tuple(
-            inp.grad if isinstance(inp, torch.Tensor) else None for inp in detached
-        )
+        grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else None for inp in detached)
         # None for run_function, None for preserve_rng_state, then grads for each input.
         return (None, None) + grads
 
@@ -327,14 +321,17 @@ def wrap_checkpoint(module: nn.Module, *, preserve_rng_state: bool = True) -> No
                     for r, s in zip(_routers, saved, strict=False):
                         r.expert_bias.copy_(s)
                 return original_forward(*a, **kw)
+
         else:
             _fwd = original_forward
 
         # CheckpointFunction.apply only accepts positional tensor args.
         # Wrap kwargs into the function closure.
         if kwargs:
+
             def _fn(*a):
                 return _fwd(*a, **kwargs)
+
         else:
             _fn = _fwd
 
@@ -349,7 +346,7 @@ def wrap_offload(module: nn.Module) -> None:
 
     def _offloaded_forward(*args, **kwargs):
         return torch.utils.checkpoint.checkpoint(
-            original_forward, *args, use_reentrant=False, **kwargs,
+            original_forward, *args, use_reentrant=False, **kwargs
         )
 
     module.forward = _offloaded_forward

@@ -53,11 +53,7 @@ def _weighted_swiglu(y, weights):
 def _swiglu_back(g, y):
     y_1, y_2 = torch.chunk(y, 2, -1)
     return torch.cat(
-        (
-            g * torch.sigmoid(y_1) * (1 + y_1 * (1 - torch.sigmoid(y_1))) * y_2,
-            g * F.silu(y_1),
-        ),
-        -1,
+        (g * torch.sigmoid(y_1) * (1 + y_1 * (1 - torch.sigmoid(y_1))) * y_2, g * F.silu(y_1)), -1
     )
 
 
@@ -96,9 +92,7 @@ def weighted_bias_swiglu_impl(input, bias, weights, fp8_input_store=False):
     if bias is not None:
         raise NotImplementedError("Bias is not supported for weighted swiglu fusion")
     output = _WeightedSwiGLUFunction.apply(input, weights, fp8_input_store)
-    return output if len(ori_shape) == 2 else output.view(
-        ori_shape[0], ori_shape[1], -1,
-    )
+    return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)
 
 
 def swiglu_with_probs(y: torch.Tensor, probs: torch.Tensor | None) -> torch.Tensor:
@@ -214,10 +208,7 @@ class Experts(nn.Module):
                     [
                         x,
                         torch.zeros(
-                            max_len - etp_real_len,
-                            x.shape[1],
-                            dtype=x.dtype,
-                            device=x.device,
+                            max_len - etp_real_len, x.shape[1], dtype=x.dtype, device=x.device
                         ),
                     ],
                     dim=0,
@@ -227,9 +218,7 @@ class Experts(nn.Module):
                         [
                             permuted_probs,
                             torch.zeros(
-                                max_len - etp_real_len,
-                                dtype=permuted_probs.dtype,
-                                device=x.device,
+                                max_len - etp_real_len, dtype=permuted_probs.dtype, device=x.device
                             ),
                         ],
                         dim=0,
@@ -280,10 +269,10 @@ class Experts(nn.Module):
             probs_pad = torch.zeros(total_padded, device=device, dtype=permuted_probs.dtype)
         src_off, dst_off = 0, 0
         for real, pad in zip(m_splits, padded, strict=True):
-            x_pad[dst_off:dst_off + real] = x[src_off:src_off + real]
-            mask[dst_off:dst_off + real] = True
+            x_pad[dst_off : dst_off + real] = x[src_off : src_off + real]
+            mask[dst_off : dst_off + real] = True
             if probs_pad is not None:
-                probs_pad[dst_off:dst_off + real] = permuted_probs[src_off:src_off + real]
+                probs_pad[dst_off : dst_off + real] = permuted_probs[src_off : src_off + real]
             src_off += real
             dst_off += pad
         return x_pad, probs_pad, padded, mask

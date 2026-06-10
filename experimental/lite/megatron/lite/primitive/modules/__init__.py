@@ -18,10 +18,7 @@ _EXPORTS = {
     "TokenDispatcher": ("megatron.lite.primitive.modules.dispatcher", "TokenDispatcher"),
     "TopKRouter": ("megatron.lite.primitive.modules.router", "TopKRouter"),
     "_AllToAll": ("megatron.lite.primitive.modules.moe", "_AllToAll"),
-    "split_grouped_qkvg": (
-        "megatron.lite.primitive.modules.gqa_utils",
-        "split_grouped_qkvg",
-    ),
+    "split_grouped_qkvg": ("megatron.lite.primitive.modules.gqa_utils", "split_grouped_qkvg"),
 }
 
 
@@ -36,6 +33,7 @@ def __getattr__(name: str):
     value = getattr(module, attr_name)
     globals()[name] = value
     return value
+
 
 __all__ = [
     "Experts",

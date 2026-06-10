@@ -2,19 +2,13 @@ from __future__ import annotations
 
 import pytest
 
-from megatron.lite.primitive.optimizers.megatron_wrap import (
-    validate_mc_config,
-    validate_mc_session,
-)
+from megatron.lite.primitive.optimizers.megatron_wrap import validate_mc_config, validate_mc_session
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
 from megatron.lite.runtime.contracts.config import ParallelConfig
 
 
 def _engine_cfg(*, model_name: str, pp: int = 1, vpp: int = 1) -> MegatronLiteConfig:
-    return MegatronLiteConfig(
-        model_name=model_name,
-        parallel=ParallelConfig(pp=pp, vpp=vpp),
-    )
+    return MegatronLiteConfig(model_name=model_name, parallel=ParallelConfig(pp=pp, vpp=vpp))
 
 
 def test_dist_opt_validation_accepts_model_agnostic_config():

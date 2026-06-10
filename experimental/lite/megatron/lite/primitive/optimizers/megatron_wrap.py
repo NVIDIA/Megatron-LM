@@ -16,9 +16,7 @@ def validate_mc_config(engine_cfg) -> None:
     """Validate dist_opt constraints owned by this optimizer primitive."""
     p = engine_cfg.parallel
     if p.vpp > 1 and p.pp == 1:
-        raise ValueError(
-            "dist_opt requires pp>1 when vpp>1."
-        )
+        raise ValueError("dist_opt requires pp>1 when vpp>1.")
 
 
 # Legacy alias — kept for compat shim path
@@ -35,13 +33,7 @@ def _ensure_mc_mpu_parallel_state(engine_cfg) -> None:
     from megatron.core import parallel_state as mpu  # pyright: ignore[reportMissingImports]
 
     p = engine_cfg.parallel
-    expected = (
-        int(p.tp),
-        int(p.ep),
-        _effective_etp(p),
-        int(p.pp),
-        int(p.cp),
-    )
+    expected = (int(p.tp), int(p.ep), _effective_etp(p), int(p.pp), int(p.cp))
     if mpu.is_initialized():
         current = (
             int(mpu.get_tensor_model_parallel_world_size()),
@@ -76,8 +68,8 @@ def build_mc_optimizer_config(opt, *, override_optimizer_config: dict[str, Any] 
     Works on either `runtime.contracts.config.OptimizerConfig` (real dataclass)
     or a `SimpleNamespace` with the same field names (legacy lite path).
     """
-    from megatron.core.optimizer.optimizer_config import (  # pyright: ignore[reportMissingImports]
-        OptimizerConfig as MCOptimizerConfig,
+    from megatron.core.optimizer.optimizer_config import (
+        OptimizerConfig as MCOptimizerConfig,  # pyright: ignore[reportMissingImports]
     )
 
     offload = getattr(opt, "offload_fraction", None) or 0.0
@@ -159,9 +151,7 @@ def build_mc_stack(
         wrapped_chunks = list(model_chunks)
     else:
         ddp_config = DistributedDataParallelConfig(
-            use_distributed_optimizer=True,
-            overlap_grad_reduce=False,
-            grad_reduce_in_fp32=True,
+            use_distributed_optimizer=True, overlap_grad_reduce=False, grad_reduce_in_fp32=True
         )
         wrapped_chunks = []
         for chunk_idx, chunk in enumerate(model_chunks):
@@ -188,10 +178,7 @@ def build_mc_stack(
     # groups. Long term, this primitive should always pass its own
     # `pg_collection`.
     if skip_ddp_wrap or use_mpu_groups:
-        optimizer = get_megatron_optimizer(
-            config=opt_config,
-            model_chunks=wrapped_chunks,
-        )
+        optimizer = get_megatron_optimizer(config=opt_config, model_chunks=wrapped_chunks)
         optimizer._mc_pg_collection = None  # pyright: ignore[reportAttributeAccessIssue]
     else:
         optimizer = get_megatron_optimizer(
@@ -292,7 +279,7 @@ def _build_transformer_config(model_cfg, engine_cfg):
 
 
 def _mark_mc_parallel_attrs(
-    model: nn.Module, is_expert_param: ExpertClassifierFn, *, tp_size: int,
+    model: nn.Module, is_expert_param: ExpertClassifierFn, *, tp_size: int
 ) -> None:
     """Mark per-param MC metadata (allreduce / tensor_model_parallel / sequence_parallel).
 
@@ -329,6 +316,7 @@ def _mark_mc_parallel_attrs(
 
 def _build_pg_collection(ps, engine_cfg):
     import torch.distributed as dist  # pyright: ignore[reportMissingImports]
+
     from megatron.core.process_groups_config import ProcessGroupCollection
 
     if ps.pp_group is None:
@@ -349,7 +337,9 @@ def _build_pg_collection(ps, engine_cfg):
         if rank == singleton_rank:
             singleton_group = group
     if singleton_group is None:
-        raise RuntimeError("Failed to construct singleton process group for optional MC reductions.")
+        raise RuntimeError(
+            "Failed to construct singleton process group for optional MC reductions."
+        )
 
     if engine_cfg.parallel.pp == 1:
         mp_group = ps.tp_group

@@ -13,13 +13,7 @@ from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig
 from megatron.lite.runtime.contracts.handle import ModelHandle
 
-
-pytestmark = [
-    pytest.mark.mlite,
-    pytest.mark.smoke,
-    pytest.mark.gpu,
-    pytest.mark.distributed,
-]
+pytestmark = [pytest.mark.mlite, pytest.mark.smoke, pytest.mark.gpu, pytest.mark.distributed]
 
 
 def _qwen3_moe_symbols():
@@ -97,22 +91,21 @@ def _build_handle(model_seed: int) -> ModelHandle:
         parallel=parallel,
         optimizer="mc",
         optimizer_config=OptimizerConfig(
-            optimizer="adam",
-            lr=1.0e-3,
-            weight_decay=0.0,
-            clip_grad=1.0,
+            optimizer="adam", lr=1.0e-3, weight_decay=0.0, clip_grad=1.0
         ),
         use_deepep=False,
         deterministic=True,
     )
     bundle = protocol.build_model(model_cfg, impl_cfg=impl_cfg)
     extras = dict(bundle.extras)
-    extras.update({
-        "model_chunks": bundle.chunks,
-        "forward_step": bundle.forward_step,
-        "finalize_grads": bundle.finalize_grads,
-        "protocol": protocol,
-    })
+    extras.update(
+        {
+            "model_chunks": bundle.chunks,
+            "forward_step": bundle.forward_step,
+            "finalize_grads": bundle.finalize_grads,
+            "protocol": protocol,
+        }
+    )
     return ModelHandle(
         model=bundle.chunks,
         optimizer=bundle.optimizer,
