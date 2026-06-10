@@ -368,6 +368,15 @@ def _post_backward_final_callback(root_state, root_module):
 
 ## ZeRO-1 and ZeRO-2 Workflow
 
+### No-Shard (`no_shard`)
+
+1. Forward and backward read replicated `model_weight_buffer`; no parameter
+   all-gather is needed beyond the normal buffer rebind.
+2. Backward accumulates local full gradients across micro-batches. Post-backward
+   reduction skips `no_shard`, matching ZeRO-1's delayed-sync behavior.
+3. `finish_grad_sync()` performs one delayed full-buffer all-reduce for each
+   `no_shard` grad buffer. The optimizer consumes replicated DTensor grads.
+
 `optim` and `optim_grads` keep compute weights replicated but still expose
 optimizer-facing DTensor shards through `dist_params`.
 

@@ -120,13 +120,13 @@ def _build_groups(strategy):
 def _flags(s):
     """Return (has_model_weight_buf, has_grad_buf, weight_distributed, grad_distributed).
 
-    - has_model_weight_buf: whether model_weight_buffer is created (False for no_shard)
+    - has_model_weight_buf: model_weight_buffer is created for all supported strategies
     - has_grad_buf: always True when requires_grad, across all strategies
     - weight_distributed: only True for optim_grads_params (full FSDP)
     - grad_distributed: True for optim_grads and optim_grads_params
     """
     return {
-        "no_shard": (False, True, False, False),
+        "no_shard": (True, True, False, False),
         "optim": (True, True, False, False),
         "optim_grads": (True, True, False, True),
         "optim_grads_params": (True, True, True, True),
@@ -167,9 +167,10 @@ class Ref:
 
 @pytest.mark.parametrize("strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"])
 def test_init_buffers(strategy):
-    if strategy != "optim_grads_params":
+    if strategy not in ("no_shard", "optim_grads_params"):
         pytest.skip(
-            f"Only optim_grads_params strategy creates distributed buffers, skipping {strategy} test."
+            "This test currently covers no_shard and optim_grads_params, "
+            f"skipping {strategy}."
         )
 
     groups, originals, dp_group, rank, ws, device = _build_groups(strategy)
@@ -193,10 +194,6 @@ def test_init_buffers(strategy):
                 else:
                     expected = p.flatten()
                 assert torch.equal(item, expected)
-        else:
-            # no_shard: model_weight_buffer should not exist
-            assert pg.model_weight_buffer is None
-
         # -- main_grad_buffer --
         if pg.requires_grad:
             assert pg.main_grad_buffer is not None
@@ -214,9 +211,10 @@ def test_init_buffers(strategy):
 
 @pytest.mark.parametrize("strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"])
 def test_unshard_reshard(strategy):
-    if strategy != "optim_grads_params":
+    if strategy not in ("no_shard", "optim_grads_params"):
         pytest.skip(
-            f"Only optim_grads_params strategy creates distributed buffers, skipping {strategy} test."
+            "This test currently covers no_shard and optim_grads_params, "
+            f"skipping {strategy}."
         )
 
     groups, originals, dp_group, rank, ws, device = _build_groups(strategy)
@@ -224,9 +222,7 @@ def test_unshard_reshard(strategy):
 
     for pg, orig in zip(groups, originals):
         wbuf = pg.model_weight_buffer
-        if wbuf is None:
-            # no_shard: nothing to unshard
-            continue
+        assert wbuf is not None
 
         shard_before = wbuf.data.clone()
         unsharded = wbuf.unshard()
@@ -258,9 +254,10 @@ def test_unshard_reshard(strategy):
 
 @pytest.mark.parametrize("strategy", ["no_shard", "optim", "optim_grads", "optim_grads_params"])
 def test_reduce_grad(strategy):
-    if strategy != "optim_grads_params":
+    if strategy not in ("no_shard", "optim_grads_params"):
         pytest.skip(
-            f"Only optim_grads_params strategy creates distributed buffers, skipping {strategy} test."
+            "This test currently covers no_shard and optim_grads_params, "
+            f"skipping {strategy}."
         )
 
     groups, _, dp_group, rank, ws, device = _build_groups(strategy)

@@ -12,9 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# FSDP v2 currently supports ZeRO-1/2/3 strategies (`optim`,
-# `optim_grads`, and `optim_grads_params`). `no_shard` is not implemented in
-# this path yet.
+# FSDP v2 currently supports `no_shard` plus ZeRO-1/2/3 strategies (`optim`,
+# `optim_grads`, and `optim_grads_params`).
 
 from ..uneven_dtensor import (
     gather_and_compute_chunk_metadata,
