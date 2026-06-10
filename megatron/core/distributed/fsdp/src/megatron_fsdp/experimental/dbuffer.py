@@ -31,6 +31,13 @@ Shape: TypeAlias = torch.Size | Iterable[int]
 
 
 @dataclasses.dataclass(frozen=True)
+class _OwnedRange:
+    numel: int
+    tensor_relative_offset: int
+    buffer_relative_offset: int
+
+
+@dataclasses.dataclass(frozen=True)
 class GlobalLayout:
     """Global tensor layout in element coordinates."""
 
@@ -248,6 +255,24 @@ class DBuffer:
         """Device of the local buffer."""
         return self.local_buffer.device
 
+    def _get_owned_range(self, tensor_index: int) -> _OwnedRange | None:
+        """Return this buffer's owned range for logical tensor ``tensor_index``."""
+        tensor_start = self.layout.tensor_to_offset[tensor_index]
+        tensor_end = tensor_start + self.layout.tensor_shapes[tensor_index].numel()
+        buffer_start = self.offset
+        buffer_end = self.offset + self.local_buffer.numel()
+
+        overlap_start = max(tensor_start, buffer_start)
+        overlap_end = min(tensor_end, buffer_end)
+        if overlap_start >= overlap_end:
+            return None
+
+        return _OwnedRange(
+            numel=overlap_end - overlap_start,
+            tensor_relative_offset=overlap_start - tensor_start,
+            buffer_relative_offset=overlap_start - buffer_start,
+        )
+
     @classmethod
     def from_local(
         cls,
@@ -328,24 +353,19 @@ class DBuffer:
             dtype=dtype,
             device=mesh.device_type,
         )
-        local_start = buffer.offset
-        local_end = local_start + buffer.local_buffer.numel()
         # Only logical tensor ranges are initialized. Padding and layout gaps are not
         # observable through get_local_tensor() and can remain unspecified.
-        for tensor, tensor_start in zip(tensors, buffer.layout.tensor_to_offset, strict=True):
-            tensor_end = tensor_start + tensor.numel()
-            overlap_start = max(local_start, tensor_start)
-            overlap_end = min(local_end, tensor_end)
-            if overlap_start >= overlap_end:
+        for index, tensor in enumerate(tensors):
+            owned_range = buffer._get_owned_range(index)
+            if owned_range is None:
                 continue
 
-            overlap_numel = overlap_end - overlap_start
-            source_offset = overlap_start - tensor_start
-            destination_offset = overlap_start - local_start
-            source_slice = tensor.view(-1).narrow(0, source_offset, overlap_numel)
-            buffer.local_buffer.narrow(0, destination_offset, overlap_numel).copy_(
-                source_slice.to(buffer.device)
+            source_slice = tensor.view(-1).narrow(
+                0, owned_range.tensor_relative_offset, owned_range.numel
             )
+            buffer.local_buffer.narrow(
+                0, owned_range.buffer_relative_offset, owned_range.numel
+            ).copy_(source_slice)
         return buffer
 
     def _create_or_validate_out(
@@ -530,27 +550,21 @@ class DBuffer:
         non-leading dimensions and only changes the leading dimension.
         """
         shape = self.layout.tensor_shapes[index]
-        offset = self.layout.tensor_to_offset[index]
-        numel = shape.numel()
-
-        tensor_start = offset
-        tensor_end = offset + numel
-        overlap_start = max(tensor_start, self.offset)
-        overlap_end = min(tensor_end, self.offset + self.local_buffer.numel())
+        owned_range = self._get_owned_range(index)
 
         row_size = _non_leading_numel(shape)
-        if overlap_end <= overlap_start:
+        if owned_range is None:
             empty_shape = torch.Size((0, *shape[1:]))
             return torch.empty(empty_shape, dtype=self.dtype, device=self.device)
 
-        local_numel = overlap_end - overlap_start
-        local_buffer_offset = overlap_start - self.offset
-        if (overlap_start - tensor_start) % row_size != 0 or local_numel % row_size != 0:
+        if owned_range.tensor_relative_offset % row_size != 0 or owned_range.numel % row_size != 0:
             raise RuntimeError(
                 f"Local tensor shard for tensor {index} does not preserve dim-0 boundaries."
             )
-        local_shape = torch.Size((local_numel // row_size, *shape[1:]))
-        return self.local_buffer.narrow(0, local_buffer_offset, local_numel).view(local_shape)
+        local_shape = torch.Size((owned_range.numel // row_size, *shape[1:]))
+        return self.local_buffer.narrow(
+            0, owned_range.buffer_relative_offset, owned_range.numel
+        ).view(local_shape)
 
     def get_dtensor(self, index: int) -> DTensor:
         """Return logical tensor ``index`` as a DTensor."""
