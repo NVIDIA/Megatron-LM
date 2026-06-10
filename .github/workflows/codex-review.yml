@@ -3,9 +3,6 @@ name: Codex Code Review
 on:
   issue_comment:
     types: [created]
-  push:
-    branches:
-      - pull-request/5256
 
 jobs:
   # Light review: quick pass for obvious bugs, typos, and test gaps
@@ -13,12 +10,9 @@ jobs:
   light-review:
     name: Codex Light Review
     if: |
-      (github.event_name == 'issue_comment' &&
-        github.event.issue.pull_request &&
-        contains(github.event.comment.body, '/codex review')) ||
-      (github.event_name == 'push' &&
-        github.repository == 'NVIDIA/Megatron-LM' &&
-        github.ref == 'refs/heads/pull-request/5256')
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, '/codex review')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -27,7 +21,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
-      PR_NUMBER: ${{ github.event_name == 'push' && '4923' || github.event.issue.number }}
+      PR_NUMBER: ${{ github.event.issue.number }}
     steps:
       - name: Get PR head commit
         id: get-pr-head-commit
@@ -41,7 +35,6 @@ jobs:
           ref: ${{ steps.get-pr-head-commit.outputs.sha }}
 
       - name: React to trigger comment
-        if: github.event_name == 'issue_comment'
         run: |
           gh api repos/$REPO/issues/comments/${{ github.event.comment.id }}/reactions \
             --method POST \
@@ -57,7 +50,6 @@ jobs:
           responses-api-endpoint: "https://inference-api.nvidia.com/v1/responses"
           model: "azure/openai/gpt-5.5"
           sandbox: danger-full-access
-          allow-bot-users: copy-pr-bot
           prompt: |
             REPO: ${{ env.REPO }}
             PR NUMBER: ${{ env.PR_NUMBER }}
