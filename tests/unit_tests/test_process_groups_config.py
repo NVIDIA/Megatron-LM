@@ -90,6 +90,20 @@ class TestProcessGroupsConfig:
         assert f"tp({tp_size})" in repr_str
         assert f"pp({pp_size})" in repr_str
 
+    def test_repr_with_list_process_groups(self, mocker):
+        """Test __repr__ handles list-typed process groups like hcp."""
+        mock_pg1 = mocker.Mock(spec=dist.ProcessGroup)
+        mock_pg1.size.return_value = 2
+        mock_pg2 = mocker.Mock(spec=dist.ProcessGroup)
+        mock_pg2.size.return_value = 4
+
+        model_pgs = ProcessGroupCollection()
+        model_pgs.hcp = [mock_pg1, mock_pg2]
+
+        repr_str = repr(model_pgs)
+        assert "ProcessGroupCollection(" in repr_str
+        assert "hcp([2, 4])" in repr_str
+
 
 class TestPGConfigDefaultInitialization:
 

@@ -22,7 +22,7 @@ export NCCL_IB_QPS_PER_CONNECTION=4
 export TRITON_CACHE_DIR="./triton-cache/"
 export TRITON_CACHE_MANAGER="megatron.core.ssm.triton_cache_manager:ParallelFileCacheManager"
 
-torchrun $DISTRIBUTED_ARGS ../../tools/run_mamba_text_generation_server.py \
+torchrun $DISTRIBUTED_ARGS ../../tools/run_hybrid_text_generation_server.py \
        --tensor-model-parallel-size 1  \
        --pipeline-model-parallel-size 1  \
        --untie-embeddings-and-output-weights \
@@ -46,5 +46,5 @@ torchrun $DISTRIBUTED_ARGS ../../tools/run_mamba_text_generation_server.py \
        --bf16  \
        --micro-batch-size 1  \
        --use-mcore-models \
-       --spec megatron.core.models.mamba.mamba_layer_specs mamba_stack_spec \
+       --spec megatron.core.models.hybrid.hybrid_layer_specs hybrid_stack_spec \
        --seed 42

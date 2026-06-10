@@ -46,6 +46,13 @@ except (ImportError, ModuleNotFoundError):
     HAVE_TE = False
 
 
+try:
+    _torch_version = PkgVersion(torch.__version__)
+except Exception:
+    # This is a WAR for building docs, where torch is not actually imported
+    _torch_version = PkgVersion("0.0.0")
+
+
 _MODEL_PARALLEL_RNG_TRACKER_NAME = "model-parallel-rng"
 
 
@@ -78,6 +85,13 @@ def is_te_min_version(vers, check_equality=True):
     return te_version > PkgVersion(vers)
 
 
+def is_torch_min_version(version, check_equality=True):
+    """Check if minimum version of `torch` is installed."""
+    if check_equality:
+        return _torch_version >= PkgVersion(version)
+    return _torch_version > PkgVersion(version)
+
+
 def is_submodule(module, parent_module, strict=True):
     """
     Check if a module is a submodule of another module.
@@ -89,6 +103,23 @@ def is_submodule(module, parent_module, strict=True):
         if m is module:
             return True
     return False
+
+
+def find_megatron_fsdp(model):
+    """Walk the model wrapper chain to find a MegatronFSDP instance, if any."""
+    # Lazy import to avoid a circular import: megatron_fsdp.py transitively imports
+    # this module during its own initialization, so a top-level import of
+    # MegatronFSDP here would fail with a partially-initialized module error.
+    try:
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.megatron_fsdp import MegatronFSDP
+    except (ImportError, ModuleNotFoundError):
+        return None
+    m = model
+    while m is not None:
+        if isinstance(m, MegatronFSDP):
+            return m
+        m = getattr(m, 'module', None)
+    return None
 
 
 def get_mesh_names(
@@ -516,10 +547,6 @@ class FSDPDistributedIndex:
         self.hsdp_outer_dp_shard = hsdp_outer_dp_shard
         self.expt_device_mesh = expt_device_mesh
 
-        # Handling the situation where M-Core MoE EP=1
-        if self.expt_device_mesh is None:
-            self.expt_device_mesh = device_mesh
-
         # Hybrid FSDP Process Groups
         # Retrieve the FSDP process group from the DeviceMesh.
         self.fsdp_group = (
@@ -826,6 +853,10 @@ def get_mcore_tensor_parallel_partition_dim(param: torch.Tensor) -> Optional[int
             return 0
         elif param._tensor_parallel_mode == "row":
             return 1
+    if getattr(param, "tensor_model_parallel", False):
+        partition_dim = getattr(param, "partition_dim", None)
+        if partition_dim is not None and partition_dim >= 0:
+            return int(partition_dim)
     return None
 
 
