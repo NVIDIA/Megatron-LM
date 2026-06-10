@@ -54,6 +54,8 @@ set -exo pipefail
 # Extract settings from params file
 TEST_TYPE=$(cat $TRAINING_PARAMS_PATH |
     /usr/local/bin/yq '.TEST_TYPE')
+TEST_EVALUATION=$(cat $TRAINING_PARAMS_PATH |
+    /usr/local/bin/yq '.TEST_EVALUATION // "pass"')
 ENABLE_LIGHTWEIGHT_MODE=$(cat $TRAINING_PARAMS_PATH |
     /usr/local/bin/yq '.ENV_VARS.ENABLE_LIGHTWEIGHT_MODE // "false"')
 N_REPEAT=$(cat $TRAINING_PARAMS_PATH |
@@ -63,6 +65,7 @@ MODE=$(cat $TRAINING_PARAMS_PATH |
 
 MODES=("pretraining" "inference")
 TEST_TYPES=("regular" "ckpt-resume" "frozen-resume" "frozen-start" "checkpoint-consistency" "release")
+TEST_EVALUATION_TYPES=("pass" "xpass")
 
 if [[ "$TEST_TYPE" == "release" ]]; then
     export ONE_LOGGER_JOB_CATEGORY=production
@@ -132,7 +135,90 @@ SKIP_PYTEST=$(cat $TRAINING_PARAMS_PATH |
 
 export RECORD_CHECKPOINTS=${RECORD_CHECKPOINTS:-"false"}
 
-NODE_RANK=${SLURM_NODEID:-${SLURM_NODEID:-0}}
+NODE_RANK=${SLURM_NODEID:-${NODE_RANK:-0}}
+NUM_NODES=${NUM_NODES:-${SLURM_NNODES:-1}}
+RUN_CI_BARRIER_TIMEOUT=${RUN_CI_BARRIER_TIMEOUT:-900}
+RUN_CI_BARRIER_ID=${RUN_CI_BARRIER_ID:-${SLURM_JOB_ID:-${CI_JOB_ID:-default}}}
+RUN_CI_BARRIER_DIR=${RUN_CI_BARRIER_DIR:-$OUTPUT_PATH/.run_ci_barriers/$RUN_CI_BARRIER_ID}
+mkdir -p "$RUN_CI_BARRIER_DIR"
+
+wait_for_all_nodes() {
+    local barrier_name=$1
+
+    if ((NUM_NODES <= 1)); then
+        return 0
+    fi
+
+    local barrier_dir="$RUN_CI_BARRIER_DIR/$barrier_name"
+    mkdir -p "$barrier_dir"
+    touch "$barrier_dir/node_${NODE_RANK}"
+
+    local start_time
+    start_time=$(date +%s)
+
+    while true; do
+        local node_count
+        node_count=$(find "$barrier_dir" -maxdepth 1 -type f -name 'node_*' | wc -l)
+        node_count=${node_count//[[:space:]]/}
+
+        if ((node_count >= NUM_NODES)); then
+            return 0
+        fi
+
+        local current_time
+        current_time=$(date +%s)
+        if ((current_time - start_time > RUN_CI_BARRIER_TIMEOUT)); then
+            echo "Timed out waiting for barrier $barrier_name. Saw $node_count/$NUM_NODES nodes."
+            find "$barrier_dir" -maxdepth 1 -type f -name 'node_*' -print || true
+            return 1
+        fi
+
+        sleep 1
+    done
+}
+
+sync_training_exit_code() {
+    local phase_name=$1
+    local status_dir="$RUN_CI_BARRIER_DIR/${phase_name}_status"
+    mkdir -p "$status_dir"
+    printf "%s\n" "${TRAINING_EXIT_CODE:-0}" >"$status_dir/node_${NODE_RANK}"
+
+    if ! wait_for_all_nodes "${phase_name}_status"; then
+        return 1
+    fi
+
+    local status_file
+    for status_file in "$status_dir"/node_*; do
+        local node_status
+        node_status=$(cat "$status_file")
+        if [[ "$node_status" -ne 0 ]]; then
+            echo "Node training phase $phase_name failed with exit code $node_status in $status_file."
+            return 1
+        fi
+    done
+
+    return 0
+}
+
+run_training_phase() {
+    local phase_name=$1
+
+    if ((NUM_NODES > 1)); then
+        export RUN_CI_PHASE_INDEX=$(((REPEAT - 1) * 10 + RUN_NUMBER))
+    else
+        unset RUN_CI_PHASE_INDEX
+    fi
+
+    wait_for_all_nodes "${phase_name}_start"
+
+    bash $ROOT_DIR/tests/functional_tests/shell_test_utils/_run_training.sh || TRAINING_EXIT_CODE=$?
+
+    if ! sync_training_exit_code "$phase_name"; then
+        TRAINING_EXIT_CODE=1
+    fi
+
+    wait_for_all_nodes "${phase_name}_end"
+}
 
 for i in $(seq 1 $N_REPEAT); do
     # Move TB logs into a repeat-specific directory
@@ -140,6 +226,14 @@ for i in $(seq 1 $N_REPEAT); do
     FILE=$(basename "$_TENSORBOARD_PATH")
     export TENSORBOARD_PATH=$DIR/$i/$FILE
     mkdir -p $(dirname $TENSORBOARD_PATH)
+    # Per-repeat base; for ckpt-resume / frozen-resume tests each training
+    # phase writes to its own ${_REPEAT_TENSORBOARD_PATH}/run_N subdir so the
+    # analyzer can read by explicit path rather than guessing phase from
+    # mtime-sorted glob order.
+    _REPEAT_TENSORBOARD_PATH=$TENSORBOARD_PATH
+    export REPEAT=$i
+
+    wait_for_all_nodes "repeat_${REPEAT}_start"
 
     if [[ $i -gt 1 ]]; then
         rm -rf $CHECKPOINT_SAVE_PATH/* || true
@@ -149,11 +243,6 @@ for i in $(seq 1 $N_REPEAT); do
 
     # First run never loads from a checkpoint
     export RUN_NUMBER=1
-    DIR=$(dirname "$_TENSORBOARD_PATH")
-    FILE=$(basename "$_TENSORBOARD_PATH")
-    export TENSORBOARD_PATH=$DIR/$i/$FILE
-    mkdir -p $(dirname $TENSORBOARD_PATH)
-    export REPEAT=$i
     export CHECKPOINT_SAVE_PATH=$_CHECKPOINT_SAVE_PATH
     export TRAINING_EXIT_CODE=0
     declare -a ITER_CHECKPOINT_DIRS=()  # for the grad-test check if we're doing it
@@ -200,15 +289,21 @@ for i in $(seq 1 $N_REPEAT); do
             mkdir -p $ITER_CHECKPOINT_SAVE_PATH
 
             # Save a checkpoint for this run
-            GPUS_PER_NODE=$N_GPUS KEY=$KEY CHECKPOINT_SAVE_PATH=$ITER_CHECKPOINT_SAVE_PATH \
-            bash $ROOT_DIR/tests/functional_tests/shell_test_utils/_run_training.sh || TRAINING_EXIT_CODE=$?
+            export GPUS_PER_NODE=$N_GPUS
+            export KEY
+            export CHECKPOINT_SAVE_PATH=$ITER_CHECKPOINT_SAVE_PATH
+            run_training_phase "repeat_${REPEAT}_run_${RUN_NUMBER}"
 
             # TODO find out the final iter and put that at the end rather than hardcoding 1
             ITER_CHECKPOINT_DIRS+=("$ITER_CHECKPOINT_SAVE_PATH/iter_0000001")
         done
     else
         # The standard single-run test that otherwise runs
-        bash $ROOT_DIR/tests/functional_tests/shell_test_utils/_run_training.sh || TRAINING_EXIT_CODE=$?
+        if [[ "$TEST_TYPE" == "ckpt-resume" || "$TEST_TYPE" == "frozen-resume" ]]; then
+            export TENSORBOARD_PATH="$_REPEAT_TENSORBOARD_PATH/run_${RUN_NUMBER}"
+            mkdir -p "$TENSORBOARD_PATH"
+        fi
+        run_training_phase "repeat_${REPEAT}_run_${RUN_NUMBER}"
     fi
 
     if [[ "$TEST_TYPE" = "frozen-resume" && -z "$(ls -A "$_CHECKPOINT_LOAD_PATH" 2>/dev/null)" ]]; then
@@ -230,7 +325,9 @@ for i in $(seq 1 $N_REPEAT); do
         echo $((TRAIN_ITERS / 2)) >$CHECKPOINT_LOAD_PATH/latest_checkpointed_iteration.txt
 
         export RUN_NUMBER=2
-        bash $ROOT_DIR/tests/functional_tests/shell_test_utils/_run_training.sh || TRAINING_EXIT_CODE=$?
+        export TENSORBOARD_PATH="$_REPEAT_TENSORBOARD_PATH/run_${RUN_NUMBER}"
+        mkdir -p "$TENSORBOARD_PATH"
+        run_training_phase "repeat_${REPEAT}_run_${RUN_NUMBER}"
     fi
 
     if [[ "$TEST_TYPE" == "frozen-resume" && "$TRAINING_EXIT_CODE" -eq 0 ]]; then
@@ -240,13 +337,34 @@ for i in $(seq 1 $N_REPEAT); do
         export CHECKPOINT_SAVE_PATH=/tmp/checkpoints/
 
         export RUN_NUMBER=2
-        bash $ROOT_DIR/tests/functional_tests/shell_test_utils/_run_training.sh || TRAINING_EXIT_CODE=$?
+        export TENSORBOARD_PATH="$_REPEAT_TENSORBOARD_PATH/run_${RUN_NUMBER}"
+        mkdir -p "$TENSORBOARD_PATH"
+        run_training_phase "repeat_${REPEAT}_run_${RUN_NUMBER}"
 
         export CHECKPOINT_SAVE_PATH=$_CHECKPOINT_SAVE_PATH
         if [[ $NODE_RANK -eq 0 ]]; then
             rm -rf "$CHECKPOINT_SAVE_PATH/iter_0000$TRAIN_ITERS"
         fi
         echo $((TRAIN_ITERS / 2)) >$CHECKPOINT_SAVE_PATH/latest_checkpointed_iteration.txt
+    fi
+
+    # Release tests span multiple SLURM windows via checkpoint resume.
+    # Only compare against golden values once training has reached the
+    # configured exit interval; otherwise a partial-trajectory window
+    # would false-positive-fail the goldens check and block the
+    # orchestration's resumable retrigger.
+    if [[ "$TEST_TYPE" == "release" ]]; then
+        TRACKER_FILE="$CHECKPOINT_SAVE_PATH/latest_checkpointed_iteration.txt"
+        LATEST_ITER=0
+        if [[ -f "$TRACKER_FILE" ]]; then
+            LATEST_ITER=$(tr -d '[:space:]' <"$TRACKER_FILE" 2>/dev/null || echo 0)
+            [[ "$LATEST_ITER" =~ ^[0-9]+$ ]] || LATEST_ITER=0
+        fi
+        if (( LATEST_ITER < TRAIN_ITERS )); then
+            echo "Release intermediate window: latest checkpointed iter $LATEST_ITER < $TRAIN_ITERS; skipping golden-value comparison so the orchestration can resume."
+            continue
+        fi
+        echo "Release run reached iter $LATEST_ITER >= $TRAIN_ITERS; running golden-value comparison."
     fi
 
     if [[ ${RECORD_CHECKPOINTS} == "true" ]]; then
@@ -266,8 +384,13 @@ for i in $(seq 1 $N_REPEAT); do
         # Read test values from Tensorboard for non-inference tests.
         # Inference tests will load from JSON instead.
         if [[ "$MODE" == "pretraining" ]]; then
+            if [[ "$TEST_TYPE" == "ckpt-resume" || "$TEST_TYPE" == "frozen-resume" ]]; then
+                FIRST_RUN_TENSORBOARD_PATH="$_REPEAT_TENSORBOARD_PATH/run_1"
+            else
+                FIRST_RUN_TENSORBOARD_PATH="$TENSORBOARD_PATH"
+            fi
             uv run --no-sync python $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
-                --logs-dir $TENSORBOARD_PATH \
+                --logs-dir $FIRST_RUN_TENSORBOARD_PATH \
                 --train-iters $TRAIN_ITERS \
                 --output-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
                 "${EXTRACT_ARGS[@]}"
@@ -277,11 +400,19 @@ for i in $(seq 1 $N_REPEAT); do
     # Maybe run tests
     if [[ ${SKIP_PYTEST:-0} == 1 ]]; then
         echo Skipping Pytest checks.
+        if [[ "$TEST_EVALUATION" == "xpass" && "$TRAINING_EXIT_CODE" -ne 0 ]]; then
+            echo "Training failed as expected. Marking test as success."
+            exit 0
+        fi
         exit ${TRAINING_EXIT_CODE}
     fi
 
     if [[ ! " ${TEST_TYPES[*]} " =~ " ${TEST_TYPE} " ]]; then
         echo "Test type $TEST_TYPE not yet implemented."
+    fi
+
+    if [[ ! " ${TEST_EVALUATION_TYPES[*]} " =~ " ${TEST_EVALUATION} " ]]; then
+        echo "Test type $TEST_EVALUATION not yet implemented."
     fi
 
     if [[ ! " ${MODES[*]} " =~ " ${MODE} " ]]; then
@@ -311,10 +442,9 @@ for i in $(seq 1 $N_REPEAT); do
 
                 if [[ "$TEST_TYPE" == "ckpt-resume" || "$TEST_TYPE" == "frozen-resume" ]]; then
                     uv run --no-sync python $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
-                        --logs-dir $TENSORBOARD_PATH \
+                        --logs-dir "$_REPEAT_TENSORBOARD_PATH/run_2" \
                         --train-iters $TRAIN_ITERS \
                         --output-path "${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH .json)_2nd.json" \
-                        --is-second-run \
                         "${EXTRACT_ARGS[@]}"
                             
                     echo "Running pytest 1st vs 2nd run comparison"
@@ -358,10 +488,9 @@ for i in $(seq 1 $N_REPEAT); do
         fi
 
         # Abort if training failed
-        if [[ "$TRAINING_EXIT_CODE" -ne 0 && "$TEST_TYPE" != "release" ]]; then
+        if [[ "$TRAINING_EXIT_CODE" -ne 0 && "$TEST_TYPE" != "release" && "$TEST_EVALUATION" != "xpass" ]]; then
             echo "Training failed. Aborting."
             exit 1
         fi
     fi
 done
-

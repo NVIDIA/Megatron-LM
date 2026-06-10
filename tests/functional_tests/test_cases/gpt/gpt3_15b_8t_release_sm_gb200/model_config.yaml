@@ -25,10 +25,11 @@ MODEL_ARGS:
   --disable-bias-linear: true
   --micro-batch-size: 4
   --step-batch-size-schedule: "0:384 200B:768 400B:1152"
+  --eval-global-batch-size: 1152
   --train-samples: 19531250
   --manual-gc: true
   --cross-entropy-loss-fusion: true
-  --cross-entropy-fusion-impl: te
+  --cross-entropy-fusion-impl: native
   # Transformer Engine args
   --transformer-impl: transformer_engine
   # Data args

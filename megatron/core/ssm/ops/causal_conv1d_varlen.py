@@ -13,13 +13,17 @@ import triton.language as tl
 from megatron.core.ssm.ops.determinism import autotune_configs
 
 
+# Two block-dim regimes:
+#   1. vLLM-style: small BLOCK_T, large BLOCK_C, pipelined. Many small programs maximize
+#      GPU occupancy, BLOCK_C=256 fully fills HBM transactions, sequence-pure programs
+#      avoid in-block boundary branching. Usually wins at moderate-to-large conv_dim.
+#   2. Large-block fallback: bigger tiles, fewer programs. Can win for small conv_dim
+#      where vLLM's regime over-parallelizes, or when launch overhead dominates.
 @triton.autotune(
     configs=autotune_configs(
         [
-            triton.Config({"BLOCK_T": 128, "BLOCK_C": 64}, num_warps=4),
+            triton.Config({"BLOCK_T": 8, "BLOCK_C": 256}, num_warps=4, num_stages=2),
             triton.Config({"BLOCK_T": 128, "BLOCK_C": 128}, num_warps=4),
-            triton.Config({"BLOCK_T": 256, "BLOCK_C": 64}, num_warps=4),
-            triton.Config({"BLOCK_T": 256, "BLOCK_C": 128}, num_warps=8),
         ]
     ),
     key=["conv_dim"],

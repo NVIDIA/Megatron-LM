@@ -1,0 +1,55 @@
+type: basic
+format_version: 1
+maintainers: [mcore]
+loggers: [stdout]
+spec:
+  name: '{test_case}_{platforms}'
+  model: cleanup
+  build: mcore-pyt-{environment}
+  nodes: 1
+  gpus: 0
+  n_repeat: 1
+  platforms: dgx_h100
+  script_setup: |
+    echo "Cleanup workload — no setup required."
+  script: |-
+    set -euo pipefail
+
+    THRESHOLD_DAYS=28
+
+    # CLEANUP_PATHS: newline-separated base directories. For each base dir,
+    # the recipe deletes immediate child directories whose names match
+    # `weekly-*` or `release-*` and whose mtime is older than
+    # THRESHOLD_DAYS. The pattern match is the safety boundary — nothing
+    # outside those two name prefixes is touched.
+    if [[ -z "${{CLEANUP_PATHS:-}}" ]]; then
+        echo "CLEANUP_PATHS env var not set; nothing to do."
+        exit 0
+    fi
+
+    echo "Base dirs (top-level only):"
+    printf '%s\n' "$CLEANUP_PATHS" | sed 's/^/  - /'
+    echo "Match patterns: weekly-* release-*"
+    echo "Threshold: $THRESHOLD_DAYS days"
+
+    while IFS= read -r path; do
+        [[ -z "$path" ]] && continue
+        if [[ "$path" == "/" || ! -d "$path" ]]; then
+            echo "Skipping unsafe or missing path: $path"
+            continue
+        fi
+        echo "--- Deleting weekly-*/release-* dirs older than $THRESHOLD_DAYS days under $path ---"
+        find "$path" -mindepth 1 -maxdepth 1 -type d \
+            \( -name 'weekly-*' -o -name 'release-*' \) \
+            -mtime +$THRESHOLD_DAYS -print0 \
+          | xargs -0 -r rm -rf
+    done <<<"$CLEANUP_PATHS"
+
+    echo "Cleanup complete."
+
+products:
+  - test_case: [cleanup_old_artifacts]
+    products:
+      - environment: [dev]
+        scope: [cleanup]
+        platforms: [dgx_a100, dgx_h100, dgx_gb200]

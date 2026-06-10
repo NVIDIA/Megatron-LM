@@ -17,6 +17,7 @@ import torch
 
 from megatron.core.activations import squared_relu
 from megatron.core.inference.communication.torch_symm_triton import are_tensors_nvls_eligible
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.transformer.enums import AttnBackend, InferenceCudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version, is_torch_min_version
@@ -163,7 +164,6 @@ class TestInferenceTopKRouter:
         )
 
         # Training mode: get routing_map (sparse) and extract top expert indices
-        router.train()
         _, routing_map = router(input_tensor.clone())
         # routing_map is [num_tokens, num_experts] bool
         training_experts = set()
@@ -173,8 +173,8 @@ class TestInferenceTopKRouter:
                 training_experts.add((i, e.item()))
 
         # Inference mode: get top_indices (dense)
-        router.eval()
-        _, top_indices = router(input_tensor.clone())
+        with InferenceMode.active():
+            _, top_indices = router(input_tensor.clone())
 
         inference_experts = set()
         for i in range(num_tokens):

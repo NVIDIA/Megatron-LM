@@ -122,7 +122,7 @@ The following flags are general performance flags that can help to achieve highe
 --moe-router-fusion
 --moe-permute-fusion
 --cross-entropy-loss-fusion
---cross-entropy-fusion-impl te
+--cross-entropy-fusion-impl native
 
 ## Communication optimization
 --use-distributed-optimizer

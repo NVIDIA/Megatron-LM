@@ -155,6 +155,12 @@ def get_args():
         default=False,
         help='Whether or not to allow PreTrainedTokenizer to execute remote code',
     )
+    group.add_argument(
+        "--pad-vocab-size",
+        action="store_true",
+        default=False,
+        help='Whether to pad vocab size of the model automatically if padded_vocab_size is not provided.',
+    )
 
     group = parser.add_argument_group(title='output data')
     group.add_argument(

@@ -519,9 +519,6 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         rank_token_offset = self._rank_token_offset()
         ep_max_tokens = self._ep_max_tokens()
 
-        # Cap AGV CTAs when overlapping the shared expert so the AGV does not
-        # starve the shared-expert GEMMs running on the side stream.
-        agv_kwargs = {"max_num_blocks": 16} if self.shared_experts is not None else {}
         multimem_all_gatherv_3tensor(
             agv_h["tensor"],
             agv_r["tensor"],
@@ -535,7 +532,6 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
             rank_token_offset=rank_token_offset,
             ep_max_tokens=ep_max_tokens,
             per_rank_max_tokens=per_rank_max,
-            **agv_kwargs,
         )
 
         topk = probs.shape[1]

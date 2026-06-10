@@ -1,0 +1,28 @@
+# Inference perf test: nanov3 3B hybrid MoE checkpoint, TP=1 PP=1 EP=8 (8 GPUs).
+#
+# Mirrors tests/functional_tests/test_cases/hybrid/hybrid_dynamic_inference_tp1_ep8_nanov3_chunked_prefill
+# but configured for throughput benchmarking (no static prompt, no offline generate).
+# Uses gsm8k prompts — both the mamba state path and the MoE router/dispatcher
+# are content-sensitive, so synthetic "hello "*N tokens give misleading numbers.
+
+MODEL: hybrid_nanov3_3b
+TP: 1
+PP: 1
+DP: 1
+EP: 8
+DATASET: gsm8k
+NUM_OUTPUT_TOKENS: 128
+NUM_WARMUP_ITERS: 2
+NUM_TIMED_ITERS: 5
+BATCH_SIZES:
+  - 1
+  - 8
+  - 32
+  - 128
+TOLERANCE_PCT: 10
+METRICS:
+  - throughput_tok_per_sec
+  - avg_latency_ms
+  - p50_latency_ms
+  - p99_latency_ms
+  - tpot_ms_per_tok

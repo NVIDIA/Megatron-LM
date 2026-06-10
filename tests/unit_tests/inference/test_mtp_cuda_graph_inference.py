@@ -399,7 +399,6 @@ class TestMTPCudaGraphInference:
             )
 
             ctrl.num_speculative_tokens = num_spec
-            ctrl.num_mtp_heads = num_spec
             ctrl._init_mtp_sampling_tensors()
             ctrl._mtp_token_ids_buf.zero_()
             ctrl._mtp_position_ids_buf.zero_()
@@ -496,7 +495,6 @@ class TestMTPCudaGraphInference:
                 )
 
                 ctrl.num_speculative_tokens = num_spec
-                ctrl.num_mtp_heads = num_spec
                 ctrl._init_mtp_sampling_tensors()
                 ctrl._mtp_token_ids_buf.zero_()
                 ctrl._mtp_position_ids_buf.zero_()

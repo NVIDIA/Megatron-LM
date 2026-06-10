@@ -396,6 +396,11 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
     config.microbatch_group_size_per_vp_stage = pp
     config.virtual_pipeline_model_parallel_size = vpp
     config.sequence_packing_scheduler = scheduler_type
+    # wrap_data_iterator -> mtp_on_this_rank reads these two config fields.
+    # A real TransformerConfig defaults both to None when MTP is unused, so
+    # mirror that here (this test does not exercise MTP).
+    config.pipeline_model_parallel_layout = None
+    config.mtp_num_layers = None
     if is_dynamic_cp:
         config.min_dynamic_context_parallel_size = 1
 
@@ -412,7 +417,11 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
 
     num_micro_batches_old = global_batch_size // micro_batch_size // dp_size
 
-    if is_tp_first and (is_pp_first or is_pp_last):
+    # In packed-sequence mode is_dataset_built_on_rank returns True for every
+    # PP stage on TP rank 0 (not just first/last), so all PP stages — including
+    # middle ones — own a data_iterator and run the scheduler. Middle stages
+    # later strip their samples down to metadata only.
+    if is_tp_first:
         # Seed torch RNG so CP siblings produce identical token values
         torch.manual_seed(42 + dp_rank)
         torch.cuda.manual_seed(42 + dp_rank)
@@ -431,7 +440,10 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
             elif is_pp_last:
                 data_iterator = [None for _ in range(vpp - 1)] + [data_iterator]
             else:
-                data_iterator = [None for _ in range(vpp)]
+                # Middle PP stage: no VPP sub-stage needs full data, but the
+                # scheduler still needs an iterator (slot 0) to derive the
+                # microbatch count and per-stage metadata.
+                data_iterator = [data_iterator] + [None for _ in range(vpp - 1)]
     try:
         # Call the function under test
         (
@@ -465,6 +477,16 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
             batch_keys = ["cu_seqlens", "max_seqlen", "cu_seqlens_padded"]
             if is_dynamic_cp:
                 batch_keys.append("local_cp_size")
+            # Per-stage data field stripping (see data_schedule.py): the first PP
+            # stage keeps tokens/position_ids, the last PP stage keeps labels/
+            # loss_mask. When pp==1 a single stage is both first and last, so it
+            # keeps all four. Middle stages carry metadata only.
+            stage_data_keys = []
+            if is_pp_first:
+                stage_data_keys += ["tokens", "position_ids"]
+            if is_pp_last:
+                stage_data_keys += ["labels", "loss_mask"]
+
             if vpp is not None and vpp > 1:
                 # check metadata for all stages (save batches to avoid re-consuming iterators)
                 all_stage_batches = []
@@ -476,21 +498,22 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
                 # check for first or last stage on first or last pp rank
                 if is_pp_first_or_last:
                     batch_all = all_stage_batches[0] if is_pp_first else all_stage_batches[-1]
-                    batch_keys += ["tokens", "position_ids", "labels", "loss_mask"]
-                    _check_batch(batch_all, batch_keys)
+                    _check_batch(batch_all, batch_keys + stage_data_keys)
             else:
                 # non-VPP: single iterator
                 batch_all = [next(new_data_iterator) for _ in range(num_micro_batches)]
-                if is_pp_first_or_last:
-                    batch_keys += ["tokens", "position_ids", "labels", "loss_mask"]
-                _check_batch(batch_all, batch_keys)
+                _check_batch(batch_all, batch_keys + stage_data_keys)
 
-            # CHECK TOKEN SUM ON FIRST OR LAST PP RANK
+            # CHECK TOKEN SUM ON FIRST PP RANK
             # Note: data_iterator is consumed by wrap_data_iterator, new_data_iterator is consumed above.
             # Use `samples` for before-wrap, reuse `batch_all` from the check above for after-wrap.
             # Skip for VPP: microbatch alignment may pad/duplicate samples,
             # changing the total token count.
-            if is_pp_first_or_last and (vpp is None or vpp <= 1):
+            # Only the first PP stage is checked: with per-stage data stripping the
+            # last PP stage (when pp>1) keeps labels/loss_mask and no longer carries
+            # 'tokens'. The dp/dp_cp all-reduce groups are disjoint per PP rank, so
+            # running this on the first PP stage alone is collective-safe.
+            if is_pp_first and (vpp is None or vpp <= 1):
                 dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
                 cp_size = parallel_state.get_context_parallel_world_size()
                 cp_group = parallel_state.get_context_parallel_group()

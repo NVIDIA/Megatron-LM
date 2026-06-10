@@ -8,7 +8,7 @@ import logging
 from collections import ChainMap
 from dataclasses import replace
 from logging import getLogger
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import torch
 import torch.nn.functional
@@ -256,6 +256,26 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         }
 
     @classmethod
+    def _filter_gbuf_range_map(
+        cls, gbuf_range_map: Dict, optimizer_params: Set[torch.nn.Parameter]
+    ) -> Dict:
+        """Filter grad-buffer range maps to the params owned by this optimizer instance."""
+        return {
+            dtype: [
+                {
+                    **range_map,
+                    "param_map": {
+                        param: param_range
+                        for param, param_range in range_map["param_map"].items()
+                        if param in optimizer_params
+                    },
+                }
+                for range_map in range_maps
+            ]
+            for dtype, range_maps in gbuf_range_map.items()
+        }
+
+    @classmethod
     def _build_model_param_gbuf_map(
         cls, gbuf_ranges: List[Dict]
     ) -> Dict[torch.nn.Parameter, Tuple]:
@@ -383,7 +403,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         cls._is_distopt_quantized_param(model_param)
                         and config.fp8_recipe != "delayed"
                     ) or is_nvfp4tensor(model_param):
-                        # MXFP8Tensor, BlockwiseQTensor, NVFP4Tensor don't support view(-1)
+                        # MXFP8Tensor, BlockwiseQTensor, grouped quantized tensors, and NVFP4Tensor
+                        # don't support view(-1).
                         shard_model_param = None
                     else:
                         shard_model_param = model_param.detach().view(-1)[
@@ -701,6 +722,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for model_idx, buffers in self.per_model_buffers.items():
             self.per_model_bucket_groups[model_idx] = partition_buckets(buffers)
 
+        optimizer_params = {
+            param for param_group in self.optimizer.param_groups for param in param_group['params']
+        }
         self.gbuf_ranges = []
         self.per_bucket_numel = []
         self.per_bucket_numel_unpadded = []
@@ -720,7 +744,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     ]
                 }
             )
-            self.gbuf_ranges.append(self._build_gbuf_range_map(buffer))
+            self.gbuf_ranges.append(
+                self._filter_gbuf_range_map(self._build_gbuf_range_map(buffer), optimizer_params)
+            )
         self.model_param_gbuf_map = self._build_model_param_gbuf_map(self.gbuf_ranges)
 
         # Add main_param field to each parameter. We will use this fp32 copy to compute
@@ -2998,6 +3024,34 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         copy_group_params(self.model_float16_groups, self.shard_fp32_from_float16_groups)
         copy_group_params(self.model_fp32_groups, self.shard_fp32_groups)
 
+    def start_param_sync_for_bucket_group_subset(self) -> None:
+        """Trigger ``start_param_sync`` on DistOpt-managed bucket groups only.
+
+        Walks each model chunk's DDP bucket groups and skips those tagged
+        ``is_managed_by_layer_wise_optimizer=True`` (so a sibling
+        :class:`LayerWiseDistributedOptimizer` does not double-sync the same
+        buckets). When no LayerWise tagging is present every bucket group is
+        included — matching the previous ``model_chunk.start_param_sync()``
+        behaviour. Uses :meth:`DistributedDataParallel._start_bucket_group_param_sync`
+        so FP8 post-all-gather processing (and MXFP8 copy) still runs.
+        """
+        # Deferred import: layer_wise_optimizer's compute_full_param_layout
+        # lazily imports DistributedOptimizer, so importing the helper at
+        # module load here would create a cycle.
+        from .layer_wise_optimizer import _bucket_is_managed_by_layer_wise_optimizer
+
+        for model_chunk in self.model_chunks:
+            for bucket_group in (
+                model_chunk.bucket_groups + model_chunk.expert_parallel_bucket_groups
+            ):
+                if not bucket_group.buckets:
+                    continue
+                if _bucket_is_managed_by_layer_wise_optimizer(
+                    bucket_group.buckets[0], default_for_untagged=False
+                ):
+                    continue
+                model_chunk._start_bucket_group_param_sync(bucket_group, force_sync=False)
+
     @torch.no_grad()
     def step_with_ready_grads(self) -> bool:
         """Step the optimizer with ready gradients, return successful.
@@ -3025,8 +3079,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # the first all-gather is launched asynchronously in the next optimizer.zero_grad()
             # call and subsequent all-gathers are launched in the forward pre-hook.
             if should_sync_params:
-                for model_chunk in self.model_chunks:
-                    model_chunk.start_param_sync()
+                # Only sync DistOpt-managed bucket groups so a sibling
+                # LayerWiseDistributedOptimizer's own ``start_param_sync`` call
+                # is not duplicated for the same buckets.
+                self.start_param_sync_for_bucket_group_subset()
         if timers is not None and (self.ddp_config.use_megatron_fsdp or should_sync_params):
             timers('params-all-gather').stop()
 

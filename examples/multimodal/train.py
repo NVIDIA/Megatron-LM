@@ -26,9 +26,9 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     is_pipeline_last_stage,
 )
-from megatron.core.utils import nvtx_range_pop, nvtx_range_push
+from megatron.core.utils import get_batch_on_this_cp_rank, nvtx_range_pop, nvtx_range_push
 from megatron.training import get_args, get_timers, get_tokenizer, pretrain
-from megatron.training.utils import get_batch_on_this_cp_rank, is_last_rank
+from megatron.training.utils import is_last_rank
 
 
 def get_batch(data_iterator, image_token_index, img_seq_len):

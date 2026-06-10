@@ -68,6 +68,27 @@ def get_hf_model_type(model_path):
             "please install it with `pip install transformers`"
         )
 
+    # Parakeet is a special case: its model id may be `nemo://...`, which
+    # AutoConfig cannot resolve, so detect it from the prefix. Require the
+    # `nemo://` or `hf://` scheme so unrelated local paths that happen to
+    # contain "parakeet" (e.g. a user directory) don't get misrouted.
+    lowered = model_path.lower()
+    if lowered.startswith(("nemo://", "hf://")):
+        model_id = lowered.split("://", 1)[1]
+        # Match a path segment whose name begins with "parakeet" (e.g.
+        # `nvidia/parakeet-tdt-0.6b-v2`). Substring-anywhere matches like
+        # `myparakeet-clone` are intentionally rejected.
+        if any(seg.startswith("parakeet") for seg in model_id.split("/")):
+            return "parakeet"
+        # Any other `nemo://` model can't be resolved by AutoConfig below;
+        # raise a clear error rather than letting `split("hf://")[1]` raise
+        # an IndexError with no context.
+        if lowered.startswith("nemo://"):
+            raise NotImplementedError(
+                f"nemo:// scheme is currently only supported for parakeet models, "
+                f"got {model_path}"
+            )
+
     hf_config = AutoConfig.from_pretrained(model_path.split("hf://")[1])
     model_type = hf_config.architectures[0].lower()
 
@@ -91,6 +112,10 @@ def build_hf_model(config, model_path):
         from megatron.core.models.huggingface.clip_model import SiglipHuggingFaceModel
 
         model = SiglipHuggingFaceModel(config)
+    elif "parakeet" in model_type:
+        from megatron.core.models.huggingface.fastconformer_model import ParakeetHuggingFaceModel
+
+        model = ParakeetHuggingFaceModel(config)
     else:
         raise NotImplementedError(f"unsupported huggingface model {config.hf_config}")
 

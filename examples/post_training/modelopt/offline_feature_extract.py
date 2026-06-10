@@ -12,11 +12,12 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.
 
 from examples.post_training.modelopt.finetune import SFTDataset
 from megatron.core import mpu
+from megatron.core.utils import unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.training import get_args, get_model, get_tokenizer, initialize_megatron
-from megatron.training.utils import print_rank_0, unwrap_model
+from megatron.training.utils import print_rank_0
 from model_provider import model_provider
 
 

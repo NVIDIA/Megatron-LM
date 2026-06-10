@@ -19,22 +19,32 @@ bash examples/megatron_fsdp/train_llama3_8b_fsdp_h100_fp8.sh
 # With real data
 bash examples/megatron_fsdp/train_llama3_8b_fsdp_h100_fp8.sh \
     checkpoints/llama3_8b_fsdp_fp8 \
-    tensorboard_logs/llama3_8b_fsdp_fp8 \
+    /path/to/data_prefix \
     /path/to/tokenizer \
-    /path/to/data_prefix
+    nsys_profiles/llama3_8b_fsdp_fp8 \
+    tensorboard_logs/llama3_8b_fsdp_fp8
+
+# With Nsight Systems profiling (steps 4–6 on rank 0)
+NSYS_PROFILE=1 bash examples/megatron_fsdp/train_llama3_8b_fsdp_h100_fp8.sh
+
+# Without uv (use the ambient `python`)
+USE_UV=0 bash examples/megatron_fsdp/train_llama3_8b_fsdp_h100_fp8.sh
 ```
 
 | Positional Argument | Default | Description |
 |---------------------|---------|-------------|
-| `$1` — Checkpoint path | `checkpoints/llama3_8b_fsdp_fp8` | Directory for saving and loading checkpoints. |
-| `$2` — TensorBoard path | `tensorboard_logs/llama3_8b_fsdp_fp8` | Directory for TensorBoard logs. |
+| `$1` — Checkpoint Path | `checkpoints/llama3_8b_fsdp_fp8` | Directory for saving and loading checkpoints. |
+| `$2` — Data Path | `MOCK` | Data prefix for training data, or `MOCK` for mock data. |
 | `$3` — Tokenizer | `MOCK` | Path to a tokenizer model, or `MOCK` for `NullTokenizer`. |
-| `$4` — Data path | `MOCK` | Data prefix for training data, or `MOCK` for mock data. |
+| `$4` — NSight Profiling Path | `nsys_profiles/llama3_8b_fsdp_fp8` | Output path (without extension) for the `.nsys-rep` file when `NSYS_PROFILE=1`. |
+| `$5` — TensorBoard Path | `tensorboard_logs/llama3_8b_fsdp_fp8` | Directory for TensorBoard logs. |
 
 #### Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `USE_UV` | `1` | Set to `1` to launch via `uv run` (project venv). Set to `0` to use the ambient `python`. |
+| `NSYS_PROFILE` | `0` | Set to `1` to wrap the launch in `nsys profile`. Captures steps 4–6 on rank 0 via `--capture-range=cudaProfilerApi`, with CUDA graph node tracing and CUDA memory usage enabled. Output goes to the path in `$4`. |
 | `USE_MEGATRON_FSDP` | `1` | Set to `1` to enable Megatron-FSDP. Set to `0` to train with standard DDP. |
 | `SHARDING_STRATEGY` | `optim_grads_params` | FSDP sharding strategy (ZeRO-3). Options: `no_shard`, `optim`, `optim_grads`, `optim_grads_params`. |
 | `OUTER_SHARDING_STRATEGY` | `no_shard` | DP-Outer sharding strategy for HSDP/HFSDP. Options: `no_shard`, `optim`. |
@@ -49,6 +59,7 @@ bash examples/megatron_fsdp/train_llama3_8b_fsdp_h100_fp8.sh \
 - **Precision**: FP8 (hybrid format) with BF16 training and BF16 gradient reduction
 - **Batch size**: micro-batch=1, global-batch=128, sequence length=8192
 - **Optimizations**: NCCL user buffers, FSDP double buffering, manual registration, meta-device initialization, per-token loss, overlapped grad-reduce and param-gather
+- **Launch**: `[uv run] [nsys profile ...] python -m torch.distributed.run ... pretrain_gpt.py ...` — the `uv run` and `nsys profile` prefixes are toggled by `USE_UV` and `NSYS_PROFILE` respectively.
 
 ---
 

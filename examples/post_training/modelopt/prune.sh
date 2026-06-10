@@ -15,42 +15,16 @@ MLM_DEFAULT_ARGS="
     --distributed-timeout-minutes 30 \
     --finetune --auto-detect-ckpt-format \
     --no-gradient-accumulation-fusion \
-    --export-te-mcore-model
+    --export-default-te-spec
 "
 
-# Pruning target arguments - set these environment variables to enable pruning
-# Example: export TARGET_HIDDEN_SIZE=3072 TARGET_FFN_HIDDEN_SIZE=9216
-# Example: export LAYERS_TO_DROP="1 5 10"
-
-# Define pruning argument mappings: "env_var:cli_arg"
-# List of environment variables we want to check for pruning CLI args
-PRUNE_ENV_VARS=(
-    TARGET_FFN_HIDDEN_SIZE
-    TARGET_HIDDEN_SIZE
-    TARGET_NUM_ATTENTION_HEADS
-    TARGET_NUM_QUERY_GROUPS
-    TARGET_MAMBA_NUM_HEADS
-    TARGET_MAMBA_HEAD_DIM
-    TARGET_NUM_MOE_EXPERTS
-    TARGET_MOE_FFN_HIDDEN_SIZE
-    TARGET_MOE_SHARED_EXPERT_INTERMEDIATE_SIZE
-    TARGET_NUM_LAYERS
-    LAYERS_TO_DROP
-)
-
-# Build arguments from environment variables (TARGET_NUM_LAYERS -> --target-num-layers, etc.)
-PRUNE_ARGS=${PRUNE_ARGS:-""}
-for env_var in "${PRUNE_ENV_VARS[@]}"; do
-    if [ ! -z "${!env_var}" ]; then
-        # prepend --, convert to lowercase, replace _ with -
-        cli_arg="--$(echo "${env_var}" | tr '[:upper:]' '[:lower:]' | tr '_' '-')"
-        PRUNE_ARGS="${PRUNE_ARGS} ${cli_arg} ${!env_var}"
-    fi
-done
-
-if [ -z "${PRUNE_ARGS}" ]; then
-    printf "${MLM_WARNING} No pruning arguments specified. Set TARGET_* or LAYERS_TO_DROP environment variables.\n"
-fi
+# Pruning configuration is supplied via MLM_EXTRA_ARGS. At minimum, pass
+# --prune-export-config '<json>' (required by prune.py). Example:
+#   MLM_EXTRA_ARGS='--prune-export-config {"hidden_size":3072,"ffn_hidden_size":9216}' ./prune.sh ...
+# Optionally add --prune-intermediate-ckpt <dir> to cache scores for re-runs.
+# Supported hparams: hidden_size, ffn_hidden_size, num_attention_heads, num_query_groups,
+#   mamba_num_heads, mamba_head_dim, num_moe_experts, moe_ffn_hidden_size,
+#   moe_shared_expert_intermediate_size, num_layers.
 
 if [ -z ${MLM_MODEL_SAVE} ]; then
     MLM_MODEL_SAVE=${MLM_WORK_DIR}/${MLM_MODEL_CFG}_pruned
@@ -74,5 +48,4 @@ ${LAUNCH_SCRIPT} ${SCRIPT_DIR}/prune.py \
     --tokenizer-model ${TOKENIZER_MODEL} \
     --save ${MLM_MODEL_SAVE} \
     --references "${MLM_REF_LABEL}" \
-    ${PRUNE_ARGS} \
     ${MLM_DEFAULT_ARGS} ${MLM_EXTRA_ARGS}

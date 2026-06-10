@@ -15,6 +15,7 @@ from megatron.core.optimizer.emerging_optimizers import (
     HAVE_EMERGING_OPTIMIZERS,
     TensorParallelAdaptiveMuon,
     TensorParallelMuon,
+    _get_qkv_split_shapes,
     get_supported_coefficient_types,
     validate_coefficient_type,
 )
@@ -63,6 +64,22 @@ class Net(nn.Module):
 # ===========================================================================
 # Muon optimizer tests
 # ===========================================================================
+
+
+def test_muon_qkv_split_shapes():
+    config = TransformerConfig(
+        num_layers=1, hidden_size=1024, num_attention_heads=16, num_query_groups=8
+    )
+    gated_config = TransformerConfig(
+        num_layers=1,
+        hidden_size=1024,
+        num_attention_heads=16,
+        num_query_groups=8,
+        attention_output_gate=True,
+    )
+
+    assert _get_qkv_split_shapes(config) == [128, 64, 64]
+    assert _get_qkv_split_shapes(gated_config) == [128, 128, 64, 64]
 
 
 def test_muon_optimizer_smoke():
@@ -152,6 +169,30 @@ class TestMuonOptimizerMultiRank:
         return DistributedDataParallel(
             TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
         )
+
+    def create_ddp_model_for_layerwise(self, model, use_param_layout=False):
+        """Wrap model in DDP for layer-wise distributed optimizer tests.
+
+        Args:
+            model: Model to wrap.
+            use_param_layout: If True, supply DDP a precomputed shard-aligned
+                ``full_param_layout`` (turns on ``ddp_config.use_distributed_optimizer=True``
+                + ``start_param_sync``). If False (default), build DDP without a layout
+                so ``LayerWiseDistributedOptimizer`` syncs via the legacy
+                flatten / ``all_gather_v`` / unflatten ``allgather_params()`` codepath.
+        """
+        if use_param_layout:
+            from megatron.training.training import wrap_model_chunks_with_ddp
+
+            ddp_config = DistributedDataParallelConfig()
+            wrapped = wrap_model_chunks_with_ddp(
+                [model],
+                TransformerConfig(num_attention_heads=1, num_layers=1),
+                ddp_config,
+                use_layer_wise_distributed_optimizer=True,
+            )
+            return wrapped[0]
+        return self.create_ddp_model(model)
 
     def test_get_megatron_optimizer_smoke(self):
         """Smoke test for get_megatron_optimizer function."""
@@ -258,7 +299,7 @@ class TestMuonOptimizerMultiRank:
         """Test get_megatron_optimizer with layer-wise distributed optimizer."""
         model = Net().bfloat16().cuda()
         model.requires_grad_(True)
-        model = self.create_ddp_model(model)
+        model = self.create_ddp_model_for_layerwise(model)
 
         optimizer_config = OptimizerConfig(
             optimizer='muon',
@@ -302,7 +343,7 @@ class TestMuonOptimizerMultiRank:
         """Test get_megatron_muon_optimizer with backward compatible layer-wise distributed optimizer."""
         model = Net().bfloat16().cuda()
         model.requires_grad_(True)
-        model = self.create_ddp_model(model)
+        model = self.create_ddp_model_for_layerwise(model)
 
         optimizer_config = OptimizerConfig(
             optimizer='muon',

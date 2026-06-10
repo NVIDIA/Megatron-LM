@@ -61,6 +61,7 @@ DOCKER_BUILDKIT=1 docker build \
     --builder=container \
     --build-arg JET_API_VERSION=$JET_API_VERSION \
     --build-arg FROM_IMAGE_NAME=$BASE_IMAGE \
+    --build-arg IMAGE_TYPE=$IMAGE_TYPE \
     --provenance=false \
     --push \
     --progress plain \

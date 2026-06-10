@@ -13,13 +13,13 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.
 import modelopt.torch.export as mtex
 import torch
 
+from megatron.core.utils import unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.checkpointing import load_modelopt_checkpoint
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.training import get_args, get_model
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.initialize import initialize_megatron
-from megatron.training.utils import unwrap_model
 from model_provider import model_provider
 
 warnings.filterwarnings('ignore')

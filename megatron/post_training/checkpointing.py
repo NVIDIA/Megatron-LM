@@ -9,10 +9,11 @@ import torch.nn as nn
 from modelopt.torch.opt.plugins import restore_sharded_modelopt_state
 
 from megatron.core import dist_checkpointing
-from megatron.core.utils import get_torch_version, is_torch_min_version
+from megatron.core.utils import get_torch_version, is_torch_min_version, unwrap_model
 from megatron.training import get_args
 from megatron.training.checkpointing import _load_base_checkpoint, load_checkpoint
-from megatron.training.utils import print_rank_0, unwrap_model
+from megatron.training.utils import print_rank_0
+
 from .utils import print_distributed_quant_summary
 
 logger = logging.getLogger(__name__)
