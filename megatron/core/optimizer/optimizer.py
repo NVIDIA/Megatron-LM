@@ -215,21 +215,19 @@ class MegatronOptimizer(ABC):
                 grads_for_norm.append(grad)
         return grads_for_norm
 
-    def get_main_grads_for_grad_norm(self) -> List[torch.Tensor]:
-        """Get gradients for the default/main gradient norm."""
-        params = self.get_parameters()
-        return self._filter_grads_for_norm(
-            params,
-            param_filter=lambda p: not _is_separate_grad_norm_group(_get_param_grad_norm_group(p)),
-        )
+    def get_grads_for_grad_norm(self, grad_norm_group: Optional[str] = None) -> List[torch.Tensor]:
+        """Get gradients for norm computation.
 
-    def get_grads_for_grad_norm_group(self, grad_norm_group: str) -> List[torch.Tensor]:
-        """Get gradients from parameters in a named gradient-norm group."""
-        _validate_grad_norm_group(grad_norm_group)
-        params = self.get_parameters()
-        return self._filter_grads_for_norm(
-            params, param_filter=lambda p: _get_param_grad_norm_group(p) == grad_norm_group
-        )
+        When grad_norm_group is None, returns gradients for the main norm, excluding
+        parameters that belong to a registered separate grad-norm group.
+        When grad_norm_group is given, returns only gradients from that group.
+        """
+        if grad_norm_group is not None:
+            _validate_grad_norm_group(grad_norm_group)
+            param_filter = lambda p: _get_param_grad_norm_group(p) == grad_norm_group
+        else:
+            param_filter = lambda p: not _is_separate_grad_norm_group(_get_param_grad_norm_group(p))
+        return self._filter_grads_for_norm(self.get_parameters(), param_filter=param_filter)
 
     def has_grad_norm_group(self, grad_norm_group: str) -> bool:
         """Whether any rank in this optimizer's grad-stats group owns grouped params.
@@ -292,7 +290,7 @@ class MegatronOptimizer(ABC):
     @torch.no_grad()
     def get_grad_norm(self):
         """Compute and return grad norm."""
-        grads_for_norm = self.get_main_grads_for_grad_norm()
+        grads_for_norm = self.get_grads_for_grad_norm()
         total_norm = get_grad_norm_fp32(
             grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
         )
@@ -304,7 +302,7 @@ class MegatronOptimizer(ABC):
         self.grad_norms_by_group = {}
         for grad_norm_group in SEPARATE_GRAD_NORM_GROUPS:
             if self.has_grad_norm_group(grad_norm_group):
-                grouped_grads = self.get_grads_for_grad_norm_group(grad_norm_group)
+                grouped_grads = self.get_grads_for_grad_norm(grad_norm_group)
                 group_grad_norm = get_grad_norm_fp32(
                     grouped_grads, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
                 )
@@ -320,7 +318,7 @@ class MegatronOptimizer(ABC):
         self.grad_norms_by_group = {}
         params = self.get_parameters()
         if params:
-            grads_for_norm = self.get_main_grads_for_grad_norm()
+            grads_for_norm = self.get_grads_for_grad_norm()
         else:
             grads_for_norm = []
         grad_norm = get_grad_norm_fp32(
@@ -1534,7 +1532,7 @@ class ChainedOptimizer(MegatronOptimizer):
         if self.grads_states_parallel_group_is_shared():
             grads_for_norm = []
             for optimizer in self.chained_optimizers:
-                grads_for_norm += optimizer.get_main_grads_for_grad_norm()
+                grads_for_norm += optimizer.get_grads_for_grad_norm()
             grad_norm = get_grad_norm_fp32(
                 grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
             )
@@ -1595,14 +1593,14 @@ class ChainedOptimizer(MegatronOptimizer):
         if self.grads_states_parallel_group_is_shared():
             grouped_grads = []
             for optimizer in self.chained_optimizers:
-                grouped_grads += optimizer.get_grads_for_grad_norm_group(grad_norm_group)
+                grouped_grads += optimizer.get_grads_for_grad_norm(grad_norm_group)
             return get_grad_norm_fp32(
                 grouped_grads, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
             )
         else:
             group_norms = []
             for optimizer in self.chained_optimizers:
-                grouped_grads = optimizer.get_grads_for_grad_norm_group(grad_norm_group)
+                grouped_grads = optimizer.get_grads_for_grad_norm(grad_norm_group)
                 norm = get_grad_norm_fp32(
                     grouped_grads,
                     grad_stats_parallel_group=optimizer.get_grad_stats_parallel_group(),

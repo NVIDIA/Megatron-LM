@@ -392,7 +392,7 @@ def test_chained_optimizer_reports_unsuccessful_when_grad_norm_skipped():
         def has_grad_norm_group(self, grad_norm_group):
             return False
 
-        def get_grads_for_grad_norm_group(self, grad_norm_group):
+        def get_grads_for_grad_norm(self, grad_norm_group=None):
             return []
 
         def step_with_ready_grads(self):
@@ -454,7 +454,7 @@ def test_chained_optimizer_does_not_skip_update_for_large_mtp_grads():
         def has_grad_norm_group(self, grad_norm_group):
             return True
 
-        def get_grads_for_grad_norm_group(self, grad_norm_group):
+        def get_grads_for_grad_norm(self, grad_norm_group=None):
             return [self.mtp_param.grad]
 
         def step_with_ready_grads(self):
@@ -495,8 +495,7 @@ def test_mtp_grad_separation():
         """Minimal mock of MegatronOptimizer for testing grad filtering."""
 
         _filter_grads_for_norm = MegatronOptimizer._filter_grads_for_norm
-        get_main_grads_for_grad_norm = MegatronOptimizer.get_main_grads_for_grad_norm
-        get_grads_for_grad_norm_group = MegatronOptimizer.get_grads_for_grad_norm_group
+        get_grads_for_grad_norm = MegatronOptimizer.get_grads_for_grad_norm
 
         def __init__(self, params):
             self.params = list(params)
@@ -520,8 +519,8 @@ def test_mtp_grad_separation():
 
         mock_opt = MockOptimizer(all_params)
 
-        main_grads = mock_opt.get_main_grads_for_grad_norm()
-        mtp_grads = mock_opt.get_grads_for_grad_norm_group('mtp')
+        main_grads = mock_opt.get_grads_for_grad_norm()
+        mtp_grads = mock_opt.get_grads_for_grad_norm('mtp')
 
         assert len(main_grads) == 2
         assert len(mtp_grads) == 2
@@ -541,8 +540,7 @@ def test_mtp_grad_separation_no_mtp_params():
 
     class MockOptimizer:
         _filter_grads_for_norm = MegatronOptimizer._filter_grads_for_norm
-        get_main_grads_for_grad_norm = MegatronOptimizer.get_main_grads_for_grad_norm
-        get_grads_for_grad_norm_group = MegatronOptimizer.get_grads_for_grad_norm_group
+        get_grads_for_grad_norm = MegatronOptimizer.get_grads_for_grad_norm
 
         def __init__(self, params):
             self.params = list(params)
@@ -559,8 +557,8 @@ def test_mtp_grad_separation_no_mtp_params():
 
         mock_opt = MockOptimizer(params)
 
-        main_grads = mock_opt.get_main_grads_for_grad_norm()
-        mtp_grads = mock_opt.get_grads_for_grad_norm_group('mtp')
+        main_grads = mock_opt.get_grads_for_grad_norm()
+        mtp_grads = mock_opt.get_grads_for_grad_norm('mtp')
 
         assert len(main_grads) == 3
         assert len(mtp_grads) == 0
@@ -574,7 +572,7 @@ def test_unregistered_grad_norm_group_raises():
 
     class MockOptimizer:
         _filter_grads_for_norm = MegatronOptimizer._filter_grads_for_norm
-        get_main_grads_for_grad_norm = MegatronOptimizer.get_main_grads_for_grad_norm
+        get_grads_for_grad_norm = MegatronOptimizer.get_grads_for_grad_norm
 
         def __init__(self, params):
             self.params = list(params)
@@ -588,7 +586,7 @@ def test_unregistered_grad_norm_group_raises():
     param.grad = torch.randn_like(param)
 
     with pytest.raises(ValueError, match="Unknown grad_norm_group"):
-        MockOptimizer([param]).get_main_grads_for_grad_norm()
+        MockOptimizer([param]).get_grads_for_grad_norm()
 
 
 def test_has_grad_norm_group():
@@ -625,8 +623,7 @@ def test_mtp_grad_clipping_uses_separate_norms():
 
     class MockOptimizer:
         _filter_grads_for_norm = MegatronOptimizer._filter_grads_for_norm
-        get_main_grads_for_grad_norm = MegatronOptimizer.get_main_grads_for_grad_norm
-        get_grads_for_grad_norm_group = MegatronOptimizer.get_grads_for_grad_norm_group
+        get_grads_for_grad_norm = MegatronOptimizer.get_grads_for_grad_norm
         get_grad_stats_parallel_group = MegatronOptimizer.get_grad_stats_parallel_group
         has_grad_norm_group = MegatronOptimizer.has_grad_norm_group
         _compute_grad_norms_by_group = MegatronOptimizer._compute_grad_norms_by_group

@@ -704,12 +704,19 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # similar to dist opt, always aggregate globally
         grads_for_norm = []
         for optimizer in self.chained_optimizers:
-            grads_for_norm += optimizer.get_main_grads_for_grad_norm()
+            grads_for_norm += optimizer.get_grads_for_grad_norm()
         grad_norm = get_grad_norm_fp32(grads_for_norm, grad_stats_parallel_group=None)
         return grad_norm
 
     def has_grad_norm_group(self, grad_norm_group: str) -> bool:
-        """Whether any global rank owns params for a registered grad-norm group."""
+        """Whether any global rank owns params for a registered grad-norm group.
+
+        Overrides ChainedOptimizer to use a single global all-reduce (group=None),
+        matching the scope of get_grad_norm and _get_grad_norm_for_group which also
+        reduce globally. All LayerWise grad-stats reductions are global (identical to
+        DistributedOptimizer's pattern), so the existence check must be too — using
+        a per-sub-optimizer group here would create a collective mismatch.
+        """
         _validate_grad_norm_group(grad_norm_group)
         if getattr(self, '_has_grad_norm_group_cache', None) is None:
             self._has_grad_norm_group_cache = {}
@@ -733,7 +740,7 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # similar to dist opt, always aggregate globally
         grads_for_norm = []
         for optimizer in self.chained_optimizers:
-            grads_for_norm += optimizer.get_grads_for_grad_norm_group(grad_norm_group)
+            grads_for_norm += optimizer.get_grads_for_grad_norm(grad_norm_group)
         grad_norm = get_grad_norm_fp32(grads_for_norm, grad_stats_parallel_group=None)
         return grad_norm
 
