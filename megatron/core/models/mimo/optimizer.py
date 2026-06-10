@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 import torch
 
 from megatron.core.dist_checkpointing.mapping import ShardedObject
+from megatron.core.dist_checkpointing.utils import add_prefix_for_sharding
 from megatron.core.optimizer.clip_grads import clip_grad_by_total_norm_fp32
 from megatron.core.optimizer.optimizer import MegatronOptimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
@@ -119,7 +120,26 @@ class MimoOptimizer(MegatronOptimizer):
         return torch.tensor([1.0], dtype=torch.float32, device="cuda")
 
     def count_zeros(self) -> int:
-        return sum(opt.count_zeros() for opt in self._active_optimizers)
+        """Count zero gradients globally across all modules via all_reduce MAX.
+
+        Mirrors ``get_grad_norm``: each module optimizer's ``count_zeros`` already
+        SUM-reduces over its own grad-stats group, so the count is identical across
+        all ranks that own the module but is ``0`` on ranks where the module is
+        inactive. A plain local ``sum`` over ``self._active_optimizers`` therefore
+        returns a *different* value on encoder ranks vs. language-model ranks in
+        non-colocated mode. Indexing each module into its own slot and taking a
+        cross-rank MAX recovers every module's true count on every rank, so the
+        summed total is consistent everywhere.
+        """
+        num_modules = len(self.module_infos)
+        zeros_by_module = torch.zeros(num_modules, device="cuda", dtype=torch.float32)
+
+        for i, (name, info) in enumerate(sorted(self.module_infos.items())):
+            if info.is_active and info.optimizer:
+                zeros_by_module[i] = float(info.optimizer.count_zeros())
+
+        torch.distributed.all_reduce(zeros_by_module, op=torch.distributed.ReduceOp.MAX)
+        return int(zeros_by_module.sum().item())
 
     @property
     def param_groups(self) -> List[dict]:
@@ -178,6 +198,21 @@ class MimoOptimizer(MegatronOptimizer):
                     _extract_param_groups(sub_sd, name, suffix, replica_id)
                     _extract_param_state_sharding_type(sub_sd, name, suffix, replica_id)
                     _extract_grad_scaler(sub_sd, name, suffix, replica_id)
+
+                # Namespace every internal ShardedBase key with the submodule name.
+                # DistributedOptimizer.sharded_state_dict emits regular optimizer
+                # state (param_groups, step, ...) as ShardedObjects keyed by
+                # `optimizer.distributed.dp_group_idx_{model_parallel_rank}.*`. In
+                # non-colocated mode each module has its own model-parallel group, so
+                # both the encoder and the language model produce model_parallel_rank 0
+                # and therefore identical keys for different data on disjoint ranks --
+                # a global key collision. Prefixing with the module name disambiguates
+                # them. The prefix renames the `.key` of every ShardedBase in the module
+                # sub-dict (the param-state tensors and the extracted param_groups/
+                # grad_scaler objects alike); it is applied symmetrically on save and
+                # load, and the `_restore_*` helpers match on dict key (not `.key`), so
+                # restore is unaffected.
+                add_prefix_for_sharding(module_sd, f'mimo.{name}.')
 
                 sharded_state[name] = module_sd
             else:
@@ -314,53 +349,126 @@ def _get_replica_id(pg_collection: Optional[ProcessGroupCollection]) -> tuple:
     return (pg_collection.tp.rank(), pg_collection.pp.rank(), pg_collection.dp.rank())
 
 
+def _module_has_trainable_parameters(module) -> bool:
+    """Return whether this rank owns any trainable parameters for a module."""
+    return module is not None and any(param.requires_grad for param in module.parameters())
+
+
+def _module_has_any_trainable_parameters(module, pg_collection: ProcessGroupCollection) -> bool:
+    """Return whether any rank in the module optimizer group has trainable parameters.
+
+    Without this cross-rank check, `get_mimo_optimizer` would call
+    `get_megatron_optimizer` on a module whose params are all frozen on every
+    rank (e.g. the language model under stage1 = ``--freeze-vit --freeze-lm``),
+    producing a placeholder optimizer that breaks downstream setup. Pattern
+    from NVIDIA/Megatron-LM#4790.
+    """
+    local_has_params = torch.tensor(
+        [int(_module_has_trainable_parameters(module))],
+        device=torch.cuda.current_device(),
+        dtype=torch.int,
+    )
+    torch.distributed.all_reduce(
+        local_has_params, op=torch.distributed.ReduceOp.MAX, group=pg_collection.intra_dist_opt
+    )
+    return bool(local_has_params.item())
+
+
+#: Name of the optional grid rank-view that holds the expert (MoE) factorization.
+EXPERT_VIEW = "expert"
+
+
 def _get_pg_collection_for_optimizer(grid) -> ProcessGroupCollection:
     """Create ProcessGroupCollection from HyperCommGrid for optimizer use.
 
-    Only fetches process groups required by the optimizer. Assumes all groups
-    are pre-created in the grid via grid.create_pg() - does not create any new groups.
+    Only fetches process groups required by the optimizer. Assumes all groups are
+    pre-created in the grid via ``grid.create_pg()`` - this function does not create
+    any new groups.
 
-    The following groups must be pre-created in the grid before calling this function:
+    Dense vs. expert factorization
+    ------------------------------
+    The optimizer needs two different partitions of the same ranks:
+
+    - The *dense* (attention/MLP) parameters are partitioned by the base grid's
+      ``tp``/``cp``/``pp``/``dp`` dimensions and replicated over any expert axis.
+    - The *expert* (MoE) parameters use a separate factorization
+      (``expt_tp``/``ep``/``expt_dp``/``pp``) over the *same* ranks. For a true
+      heterogeneous grid this is a distinct rank-view registered with
+      ``grid.register_view("expert", ...)``, so the expert groups must be read from
+      that view (``grid.get_pg(..., view="expert")``) rather than from the base
+      grid's (degenerate) ``ep`` dim. ``pp`` is declared a *shared* dim of that view,
+      so the expert ``[expt_tp, ep, pp]`` group reuses the base ``pp`` ranks and the
+      optimizer's ``pg.pp`` (base) group stays consistent with the expert view.
+
+    The caller is responsible for registering and creating the ``"expert"`` view
+    groups (out of scope here). When no ``"expert"`` view is registered (e.g. a
+    colocated single-view grid), the expert groups fall back to the base view.
+
+    .. note::
+       ``intra_dist_opt`` is narrowed to the dense ``["tp","cp","dp","pp"]`` axes so
+       dense gradient statistics are not SUM-counted ``ep`` times. This is correct for
+       MIMO submodules whose parameters are all dense (the only configuration today).
+       MoE submodule parameters would need their grad-stats group to span the expert
+       (``ep``) axis instead; that case is not yet handled here.
+
+    Pre-created groups (base view):
         grid.create_pg(["dp"])
         grid.create_pg(["dp", "cp"])
         grid.create_pg(["tp"])
         grid.create_pg(["pp"])
         grid.create_pg(["tp", "pp"])
-        grid.create_pg(["tp", "ep", "pp"])
-        grid.create_pg(["dp", "ep"])
-        grid.create_pg(["tp", "cp", "ep", "pp", "dp"])
+        grid.create_pg(["tp", "cp", "dp", "pp"])
+    Pre-created groups (expert view, when registered):
+        grid.register_view("expert", ..., shared_dims=["pp"])
+        grid.create_pg(["expt_tp", "ep", "pp"], view="expert")
+        grid.create_pg(["expt_dp"], view="expert")
 
     Args:
         grid: HyperCommGrid with pre-created process groups.
 
     Returns:
         ProcessGroupCollection containing optimizer-required groups:
-        - dp: Data parallel group
-        - dp_cp: Data parallel with context parallel
+        - dp / dp_cp / intra_dp_cp: (intra) data-parallel groups
         - tp: Tensor parallel group
-        - mp: Model parallel group (tp × pp)
-        - tp_ep_pp: Expert tensor-model-pipeline group
-        - expt_dp: Expert data parallel group
+        - pp: Pipeline parallel group
+        - mp: Model parallel group (tp x pp)
+        - tp_ep_pp / expt_dp / intra_expt_dp: expert model- and data-parallel groups
+        - intra_dist_opt: distributed-optimizer grad-stats group (dense dims only)
     """
     pg = ProcessGroupCollection()
 
-    # Core groups needed by optimizer and checkpointing
+    # Dense groups (base view).
     pg.dp = grid.get_pg("dp")
     pg.dp_cp = grid.get_pg(["dp", "cp"])
+    # With a single distributed-optimizer instance the intra/full DP groups coincide.
+    pg.intra_dp_cp = pg.dp_cp
     pg.tp = grid.get_pg("tp")
     pg.pp = grid.get_pg("pp")
     pg.mp = grid.get_pg(["tp", "pp"])
 
-    # Expert groups
-    pg.tp_ep_pp = grid.get_pg(["tp", "ep", "pp"])
-    pg.expt_dp = grid.get_pg(["dp", "ep"])
+    # Expert groups. Read them from the registered "expert" view when present so a
+    # genuine MoE factorization (expt_tp/ep/expt_dp/pp) is honored; otherwise fall back
+    # to the base view for colocated single-view grids. ``get_pg(..., view="expert")``
+    # raises ``KeyError`` when the view is absent, so catch that to drive the fallback.
+    try:
+        # ``pp`` is a shared dim of the expert view, so this [expt_tp, ep, pp] group
+        # reuses the base ``pp`` ranks; ``pg.pp`` above (base) stays consistent.
+        pg.tp_ep_pp = grid.get_pg(["expt_tp", "ep", "pp"], view=EXPERT_VIEW)
+        pg.expt_dp = grid.get_pg(["expt_dp"], view=EXPERT_VIEW)
+    except KeyError:
+        pg.tp_ep_pp = grid.get_pg(["tp", "ep", "pp"])
+        pg.expt_dp = grid.get_pg(["dp", "ep"])
+    pg.intra_expt_dp = pg.expt_dp
 
-    # Distributed optimizer grad stats group: must span all dimensions so grad norm
-    # and found-inf all-reduces see every unique gradient shard. TP/PP/EP ranks hold
-    # different parameters, DP ranks hold different optimizer shards after reduce-scatter.
-    # This mirrors standard Megatron's intra_distributed_optimizer_instance_group which
-    # spans the full world when num_distributed_optimizer_instances == 1.
-    pg.intra_dist_opt = grid.get_pg(["tp", "cp", "ep", "pp", "dp"])
+    # Distributed-optimizer grad-stats group. ``get_grad_norm_fp32`` /
+    # ``count_zeros_fp32`` SUM-reduce over this group, so it must contain exactly the
+    # ranks that hold *unique* dense gradient shards: tp/cp/pp partition the
+    # parameters and dp holds distinct optimizer shards after reduce-scatter. It must
+    # NOT include the expert ``ep`` axis: dense parameters are replicated across ``ep``
+    # in a heterogeneous grid (where ``ep`` is an independent dimension rather than a
+    # sub-partition of ``dp``), so including it would SUM each dense contribution
+    # ``ep_size`` times and inflate the grad norm / zero count.
+    pg.intra_dist_opt = grid.get_pg(["tp", "cp", "dp", "pp"])
 
     return pg
 
@@ -388,7 +496,16 @@ def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> Mimo
             else:
                 module = mimo_model.modality_submodules[module_name]
 
-            if module is not None:
+            # Skip the optimizer build when no rank in this module's
+            # intra-dist-opt group has any trainable parameters (e.g. the
+            # language model under stage1 = `--freeze-vit --freeze-lm`).
+            # Leaving `optimizer = None` lets `MimoOptimizer.is_stub_optimizer`
+            # handle the branch correctly, instead of constructing a
+            # placeholder DistributedOptimizer that breaks downstream setup.
+            module_has_trainable_params = _module_has_any_trainable_parameters(
+                module, pg_collection
+            )
+            if module is not None and module_has_trainable_params:
                 assert (
                     not hasattr(module, 'ddp_config')
                     or module.ddp_config is None
