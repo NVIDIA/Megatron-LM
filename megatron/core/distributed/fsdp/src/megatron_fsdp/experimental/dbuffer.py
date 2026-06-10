@@ -83,19 +83,39 @@ def _compute_layout(shapes: Iterable[Shape], dp_size: int) -> GlobalLayout:
 
     This is a DBuffer-specific reimplementation of
     ``param_and_grad_buffer.build_data_parallel_buffer_index``. It keeps only
-    the global offset construction and final DP-LCM padding; DBuffer derives
-    rank-local slices later through DTensor placements.
+    the global offset construction and final padding so each rank-local shard
+    size is a multiple of ``chunk_size``; DBuffer derives rank-local slices
+    later through DTensor placements.
 
     The computed layout is compatible with Flat, TensorAtomic, and BlockAtomic,
     even though the latter two are not implemented.
+
+    ``chunk_size`` is the least common multiple of each tensor's row size
+    (``shape[1:].numel()``). For example, with shapes P0=(2, 6), P1=(4, 4),
+    P2=(4, 4), P3=(1, 2), P4=(1, 6), ``chunk_size = LCM(6, 4, 4, 2, 6) = 12``
+    and a 5-rank DP layout has equal-size rank shards:
+
+    ```
+    rank 0 [ 0, 12): | P0 row 0              | P0 row 1               |
+    rank 1 [12, 24): | P1 row 0      | P1 row 1      | P1 row 2       |
+    rank 2 [24, 36): | P1 row 3      | P3    | gap   | P2 row 0       |
+    rank 3 [36, 48): | P2 row 1      | P2 row 2      | P2 row 3       |
+    rank 4 [48, 60): | P4                    | pad                    |
+    ```
+
+    The diagram uses four character columns per element; segment widths are
+    proportional. Every chunk boundary is aligned to each tensor's row size,
+    so each DP shard owns full rows even when fragments fill regular-tensor
+    padding gaps.
 
     Args:
         shapes: Logical tensor shapes in tensor-id order.
         dp_size: Data-parallel shard count for this global layout.
 
     Returns:
-        Global layout with element offsets and size padded to a multiple of
-        ``LCM(shape[1:].numel()) * dp_size``.
+        Global layout with row-aligned tensor offsets and a total size padded
+        to a multiple of ``chunk_size * dp_size``, so every rank-local shard
+        length is a multiple of ``chunk_size``.
     """
     if dp_size <= 0:
         raise ValueError(f"DP size must be positive, got {dp_size}.")
@@ -108,8 +128,8 @@ def _compute_layout(shapes: Iterable[Shape], dp_size: int) -> GlobalLayout:
             raise ValueError(f"Cannot compute a layout for zero-sized non-leading dims: {shape}.")
         chunk_size = math.lcm(chunk_size, non_leading_numel)
 
-    # The LCM part is the packing grid. Since every row size divides this grid,
-    # DP shard boundaries that are multiples of the grid avoid splitting dim-0 rows.
+    # chunk_size is the packing unit. Since every tensor row size divides it,
+    # DP shard boundaries that are multiples of chunk_size avoid splitting dim-0 rows.
     tensor_to_offset: list[int | None] = [None] * len(tensor_shapes)
     fragment_items = []
     regular_items = []
@@ -120,7 +140,7 @@ def _compute_layout(shapes: Iterable[Shape], dp_size: int) -> GlobalLayout:
             regular_items.append((tensor_id, shape))
 
     # Regular tensors anchor the layout. Fragments are held back to fill padding
-    # gaps left by regular tensors whose sizes are not exact multiples of the grid.
+    # gaps left by regular tensors whose sizes are not exact multiples of chunk_size.
     fragment_items.sort(key=lambda id_shape: id_shape[1].numel(), reverse=True)
 
     next_offset = 0
@@ -139,8 +159,9 @@ def _compute_layout(shapes: Iterable[Shape], dp_size: int) -> GlobalLayout:
         remainder = tensor_numel % chunk_size
 
         # Try to pair this non-divisible regular tensor with a conjugate regular
-        # tensor whose remainder fits in the same LCM part. The conjugate starts
-        # in the gap and then continues with full LCM parts after this one.
+        # tensor whose remainder fits in the same chunk_size interval. The
+        # conjugate starts in the gap and then continues with full chunk_size
+        # intervals after this one.
         conjugate_item = None
         for candidate_item in regular_items[:]:
             _, candidate_shape = candidate_item
