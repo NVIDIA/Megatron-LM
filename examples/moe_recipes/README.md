@@ -57,6 +57,21 @@ This directory contains self-contained MoE training recipes. Each YAML file incl
       <td>DeepEP; EP overlap</td>
     </tr>
     <tr>
+      <td rowspan="2">DeepSeek-V4 Flash</td>
+      <td><a href="deepseek_v4_flash/gb200/mxfp8_SL4K_128GPU_TP1PP2EP64.yaml">GB200 MXFP8</a></td>
+      <td>128</td>
+      <td>1/1/64/1/1</td>
+      <td>1/2048/4096</td>
+      <td>DSv4 hybrid attention; Hyper-Connections; HybridEP; offload</td>
+    </tr>
+    <tr>
+      <td><a href="deepseek_v4_flash/gb300/mxfp8_SL4K_128GPU_TP1PP1EP64.yaml">GB300 MXFP8</a></td>
+      <td>128</td>
+      <td>1/1/64/1/1</td>
+      <td>2/2048/4096</td>
+      <td>DSv4 hybrid attention; Hyper-Connections; HybridEP; offload</td>
+    </tr>
+    <tr>
       <td rowspan="4">Qwen3-235B-A22B</td>
       <td><a href="qwen3_235b/gb200/mxfp8_128GPU_TP1PP1EP64_paged_stash_fullcg_overlap.yaml">GB200 MXFP8 full CG</a></td>
       <td>128</td>
