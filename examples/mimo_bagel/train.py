@@ -28,6 +28,8 @@ from utils.data_helpers import broadcast_nested_data_batch, shard_data_for_cp, g
 
 from megatron.core.enums import ModelType
 from megatron.training import get_args, pretrain
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.arguments import parse_and_validate_args
 
 _MODEL_PROVIDERS = {
     # "mock": model_provider_mock_vlm_single_encoder,
@@ -577,11 +579,14 @@ def forward_step(data_iterator, model):
     if tracker is not None:
         tracker.step_and_log(data_batch)
 
-    # Per-component CUDA timer: flush one iteration's worth of measurements.
-    # Only target ranks (0, 24 by default) synchronize and print; others
-    # silently discard pending events. See utils/comp_timer.py.
-    from examples.mimo_bagel.utils.comp_timer import get_comp_timer
-    get_comp_timer().log_iter(rank=rank)
+    # Per-component CUDA timer is optional; some benchmark checkouts do not
+    # include utils/comp_timer.py.
+    try:
+        from examples.mimo_bagel.utils.comp_timer import get_comp_timer
+    except ModuleNotFoundError:
+        get_comp_timer = None
+    if get_comp_timer is not None:
+        get_comp_timer().log_iter(rank=rank)
 
     # Return output and loss function
     return ce_loss, partial(loss_func,  loss_mask=loss_mask, mse_loss=mse_loss, mse_loss_mask=mse_loss_mask)
@@ -713,14 +718,15 @@ if __name__ == "__main__":
                 module=module,
                 fsdp_unit_modules=fsdp_unit_modules,
                 **kwargs,
-            )
+    )
 
     megatron.training.training.megatron_FSDP = BagelFullyShardedDataParallel
+    args = parse_and_validate_args(args_defaults={}, extra_args_provider=add_mimo_args)
+    full_config = pretrain_cfg_container_from_args(args)
     pretrain(
+        full_config,
         train_valid_test_datasets_provider,
         model_provider,
         ModelType.encoder_or_decoder,
         forward_step,
-        args_defaults={},
-        extra_args_provider=add_mimo_args,
     )

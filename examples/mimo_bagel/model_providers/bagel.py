@@ -8,6 +8,7 @@ This provider assembles a MIMO model that consists of:
 """
 
 import copy
+import json
 import os
 from typing import Dict, Optional
 
@@ -39,6 +40,16 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from bagel.modeling.bagel import Qwen2Config, SiglipVisionConfig, BagelConfig
 
 from examples.mimo_bagel.diffusion.diffusion_wrapper import build_diffusion_wrapper
+
+
+def _load_siglip_vision_config(vit_path: str) -> SiglipVisionConfig:
+    config_path = os.path.join(vit_path, "config.json")
+    if os.path.isfile(config_path):
+        with open(config_path, "r", encoding="utf-8") as f:
+            config_dict = json.load(f)
+        if isinstance(config_dict.get("vit_config"), dict):
+            return SiglipVisionConfig.from_dict(config_dict["vit_config"])
+    return SiglipVisionConfig.from_pretrained(vit_path)
 
 
 def _register_te_groups_for_subtree(
@@ -186,7 +197,7 @@ def model_provider_bagel(
     else:
         print("llm_path", llm_path, "vit_path", vit_path)
         llm_config = Qwen2Config.from_pretrained(llm_path)
-        vit_config = SiglipVisionConfig.from_pretrained(vit_path)
+        vit_config = _load_siglip_vision_config(vit_path)
     llm_config.layer_module = decoder_layer_module
     # vit_config.num_hidden_layers = vit_config.num_hidden_layers + 1 + model_args.vit_select_layer
     vit_config.num_hidden_layers = vit_config.num_hidden_layers + 1 - 2
