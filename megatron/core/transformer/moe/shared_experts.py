@@ -186,6 +186,12 @@ class SharedExpertMLP(MLP):
                 self.__class__.stream = torch.cuda.Stream()
             self.stream = self.__class__.stream
 
+            # Shared expert backward may produce parameter gradients on the shared stream.
+            # Megatron FSDP uses this marker to bridge post-backward grad handling back to the
+            # default stream without depending on MoE module names.
+            for param in self.parameters():
+                param._fsdp_grad_process_on_default_stream = True
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Forward function"""
         output, _ = super().forward(hidden_states)
