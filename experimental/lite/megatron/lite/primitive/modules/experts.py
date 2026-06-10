@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """MoE expert compute: SwiGLU fusions, _AllReduceETP, and Experts."""
 
 from __future__ import annotations

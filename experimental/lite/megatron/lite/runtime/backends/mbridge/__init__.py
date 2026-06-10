@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """mbridge backend for the Megatron Lite runtime API."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Megatron-Core utilities aligned with VERL's megatron_utils.
 
 All functions here are ported from VERL and could theoretically be replaced

@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Qwen3MoE WeightSpec — name mapping + format conversion.
 
 Orchestration (TP scatter, EP sharding, PP remap) lives in

@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Small compatibility patches for dependency-version gaps in examples."""
 
 from __future__ import annotations

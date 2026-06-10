@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Benchmark MLite and reference runtime backends.
 
 Run from the Megatron-LM repo root after adding ``experimental/lite`` to

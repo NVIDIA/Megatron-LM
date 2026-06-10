@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """FSDP2 primitive surface."""
 
 from __future__ import annotations

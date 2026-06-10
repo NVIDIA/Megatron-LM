@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Token dispatcher: AllToAll and DeepEP dispatch/combine."""
 
 from __future__ import annotations

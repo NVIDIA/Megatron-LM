@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Deterministic computation utilities for bitwise reproducible experiments."""
 
 from __future__ import annotations

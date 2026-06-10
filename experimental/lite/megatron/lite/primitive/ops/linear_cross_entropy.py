@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Linear + vocab-parallel cross entropy helpers.
 
 The fast path delegates to VERL's Triton-backed fused kernel when available.

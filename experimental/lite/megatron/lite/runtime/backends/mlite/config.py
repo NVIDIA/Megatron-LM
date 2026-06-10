@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Megatron Lite backend configuration."""
 
 from __future__ import annotations

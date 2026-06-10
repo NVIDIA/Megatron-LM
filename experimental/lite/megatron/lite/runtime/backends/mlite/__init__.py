@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Megatron Lite backend — Megatron Lite's own training engine."""
 
 from __future__ import annotations

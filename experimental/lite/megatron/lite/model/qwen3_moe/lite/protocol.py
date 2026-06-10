@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Qwen3MoE lite impl — model protocol for Megatron Lite runtime.
 
 This file is the reference implementation of the Megatron Lite model protocol.

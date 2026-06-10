@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """
 DCP (Distributed Checkpoint) framework for training checkpoints.
 

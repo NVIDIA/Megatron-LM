@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """LoRA helpers for Megatron Lite native model implementations.
 
 This module is intentionally narrow: it supports the Qwen3-MoE lite path's

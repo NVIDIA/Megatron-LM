@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """MoE router implementations: TopKRouter (softmax) and SigmoidTopKRouter.
 
 Internals call the atomic free functions in Megatron-Core's

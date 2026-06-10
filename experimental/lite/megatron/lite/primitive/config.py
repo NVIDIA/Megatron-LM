@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Configuration utilities.
 
 Model-specific configs live under `megatron.lite/models/*/config.py`

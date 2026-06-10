@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Pipeline parallel: 1F1B schedule with correct backward handling."""
 
 from __future__ import annotations

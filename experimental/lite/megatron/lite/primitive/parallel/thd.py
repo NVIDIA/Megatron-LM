@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Packed sequence helpers for variable-length (THD) attention."""
 
 from __future__ import annotations

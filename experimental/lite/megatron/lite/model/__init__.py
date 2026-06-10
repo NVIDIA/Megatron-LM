@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Public model-registry helpers for Megatron Lite."""
 
 from megatron.lite.model.registry import (

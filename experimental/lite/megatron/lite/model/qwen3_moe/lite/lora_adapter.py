@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """PEFT adapter import/export for Qwen3-MoE lite native LoRA."""
 
 from __future__ import annotations

@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Probability-first primitives for Megatron Lite phase 1."""
 
 from __future__ import annotations

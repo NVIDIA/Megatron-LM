@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Config objects for the Verl MLite Megatron Lite engine."""
 
 from __future__ import annotations

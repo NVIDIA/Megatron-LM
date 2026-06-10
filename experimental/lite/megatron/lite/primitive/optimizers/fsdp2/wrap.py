@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """PyTorch FSDP2 wrapping primitive.
 
 This module is intentionally independent from Megatron Lite model and runtime

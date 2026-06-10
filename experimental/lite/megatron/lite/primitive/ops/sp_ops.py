@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Sequence-parallel autograd primitives for non-TE layers (embedding, scatter/gather).
 
 AllGather/ReduceScatter operate on the sequence dimension (dim 0) with layout
