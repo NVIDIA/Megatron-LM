@@ -60,7 +60,7 @@ _seen_checkpoints_cnt = 0
 _seen_tr_iters_cnt = 0
 _curr_eval_iter_idx = 0
 
-_NUM_WARMUP_ITERS = 1
+_NUM_WARMUP_ITERS = 1  # Will be set by --ft-num-warmup-iters (default: 5)
 _MIN_ITERS_FOR_STEP_TIMEOUT_UPDATE = 16
 
 
@@ -105,7 +105,10 @@ def setup() -> None:
     global _is_calculating_timeouts
     _is_calculating_timeouts = args.calc_ft_timeouts
 
-    cli.init_workload_monitoring()
+    global _NUM_WARMUP_ITERS
+    _NUM_WARMUP_ITERS = args.ft_num_warmup_iters
+
+    cli.init_workload_monitoring(num_warmup_iters=_NUM_WARMUP_ITERS)
     _load_state_if_exists()
     if os.environ.get("RANK") == "0":
         print(f"FT: initialized. Timeouts={cli.section_timeouts}", flush=True)

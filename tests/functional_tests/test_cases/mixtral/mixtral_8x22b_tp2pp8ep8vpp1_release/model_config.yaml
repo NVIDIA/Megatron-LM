@@ -6,6 +6,7 @@ ENV_VARS:
   NCCL_NVLS_ENABLE: 0
   NON_DETERMINSTIC_RESULTS: 1
 TEST_TYPE: "release"
+LAUNCHER: ft_launcher
 MODEL_ARGS:
   # Distributed args
   --distributed-timeout-minutes: 60
@@ -92,6 +93,7 @@ MODEL_ARGS:
   --log-interval: 1
   --tensorboard-dir: ${TENSORBOARD_PATH}
   --wandb-project: megatron-core-release-runs
+  --wandb-entity: adlr
   --wandb-exp-name: ${WANDB_EXPERIMENT}
   --wandb-save-dir: ${WANDB_SAVE_PATH}
   # Add mixed precision args

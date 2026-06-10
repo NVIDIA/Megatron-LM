@@ -1,8 +1,11 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
+from functools import partial
+
 import torch
 
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
-from megatron.core.ssm.mamba_block import MambaStack, MambaStackSubmodules
+from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
 from megatron.core.ssm.mlp_layer import MLPLayer
@@ -16,7 +19,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.typed_torch import not_none
 
-try:
+if HAVE_TE:
     from megatron.core.extensions.transformer_engine import (
         TEColumnParallelLinear,
         TEDotProductAttention,
@@ -24,9 +27,7 @@ try:
         TENorm,
         TERowParallelLinear,
     )
-
-    HAVE_TE = True
-except ImportError:
+else:
     (
         TEColumnParallelLinear,
         TEDotProductAttention,
@@ -34,7 +35,6 @@ except ImportError:
         TENorm,
         TERowParallelLinear,
     ) = (None, None, None, None, None)
-    HAVE_TE = False
 
 try:
     import apex
@@ -77,7 +77,7 @@ def get_layer_spec(is_vit, normalization) -> ModuleSpec:
     return ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
-            input_layernorm=norm,
+            input_layernorm=not_none(norm),
             self_attention=ModuleSpec(
                 module=SelfAttention,
                 params={"attn_mask_type": attn_mask_type},
@@ -90,7 +90,7 @@ def get_layer_spec(is_vit, normalization) -> ModuleSpec:
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
-            pre_mlp_layernorm=norm,
+            pre_mlp_layernorm=not_none(norm),
             mlp=mlp,
             mlp_bda=get_bias_dropout_add,
         ),
@@ -114,7 +114,7 @@ def get_layer_spec_te(is_vit=False, padding=False) -> ModuleSpec:
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=not_none(TELayerNormColumnParallelLinear),
                     core_attention=not_none(TEDotProductAttention),
-                    linear_proj=TERowParallelLinear,
+                    linear_proj=not_none(TERowParallelLinear),
                     q_layernorm=IdentityOp,
                     k_layernorm=IdentityOp,
                 ),
@@ -127,15 +127,15 @@ def get_layer_spec_te(is_vit=False, padding=False) -> ModuleSpec:
     )
 
 
-def get_mamba_layer_spec_te(padding=False) -> ModuleSpec:
+def get_hybrid_layer_spec_te(padding=False) -> ModuleSpec:
     attn_mask_type = AttnMaskType.causal
     # Padding mask is needed for e.g. Context Parallel.
     if padding:
         attn_mask_type = AttnMaskType.padding_causal
 
     return ModuleSpec(
-        module=MambaStack,
-        submodules=MambaStackSubmodules(
+        module=HybridStack,
+        submodules=HybridStackSubmodules(
             mamba_layer=ModuleSpec(
                 module=MambaLayer,
                 submodules=MambaLayerSubmodules(
@@ -160,7 +160,7 @@ def get_mamba_layer_spec_te(padding=False) -> ModuleSpec:
                         submodules=SelfAttentionSubmodules(
                             linear_qkv=not_none(TELayerNormColumnParallelLinear),
                             core_attention=not_none(TEDotProductAttention),
-                            linear_proj=TERowParallelLinear,
+                            linear_proj=not_none(TERowParallelLinear),
                         ),
                     ),
                     self_attn_bda=get_bias_dropout_add,
@@ -172,11 +172,11 @@ def get_mamba_layer_spec_te(padding=False) -> ModuleSpec:
             mlp_layer=ModuleSpec(
                 module=MLPLayer,
                 submodules=TransformerLayerSubmodules(
-                    mlp=ModuleSpec(
-                        module=MLP,
+                    mlp=partial(
+                        MLP.as_mlp_submodule,
                         submodules=MLPSubmodules(
-                            linear_fc1=TELayerNormColumnParallelLinear,
-                            linear_fc2=TERowParallelLinear,
+                            linear_fc1=not_none(TELayerNormColumnParallelLinear),
+                            linear_fc2=not_none(TERowParallelLinear),
                         ),
                     ),
                     mlp_bda=get_bias_dropout_add,
@@ -186,21 +186,22 @@ def get_mamba_layer_spec_te(padding=False) -> ModuleSpec:
     )
 
 
-def get_mlp_module_spec(use_te: bool = True) -> ModuleSpec:
+def get_mlp_module_spec(use_te: bool = True):
     # Dense MLP w/ or w/o TE modules.
-    return ModuleSpec(
-        module=MLP,
+    return partial(
+        MLP.as_mlp_submodule,
         submodules=MLPSubmodules(
-            linear_fc1=TEColumnParallelLinear if use_te else ColumnParallelLinear,
-            linear_fc2=TERowParallelLinear if use_te else RowParallelLinear,
+            linear_fc1=not_none(TEColumnParallelLinear) if use_te else ColumnParallelLinear,
+            linear_fc2=not_none(TERowParallelLinear) if use_te else RowParallelLinear,
         ),
     )
 
 
-def get_norm_mlp_module_spec_te() -> ModuleSpec:
-    return ModuleSpec(
-        module=MLP,
+def get_norm_mlp_module_spec_te():
+    return partial(
+        MLP.as_mlp_submodule,
         submodules=MLPSubmodules(
-            linear_fc1=TELayerNormColumnParallelLinear, linear_fc2=TERowParallelLinear
+            linear_fc1=not_none(TELayerNormColumnParallelLinear),
+            linear_fc2=not_none(TERowParallelLinear),
         ),
     )

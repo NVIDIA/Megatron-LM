@@ -1,10 +1,19 @@
+<!---
+   Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
+   NVIDIA CORPORATION and its licensors retain all intellectual property
+   and proprietary rights in and to this software, related documentation
+   and any modifications thereto. Any use, reproduction, disclosure or
+   distribution of this software and related documentation without an express
+   license agreement from NVIDIA CORPORATION is strictly prohibited.
+-->
+
 # Contributing to Megatron-LM
 
 This document outlines the processes and policies for issues and pull requests by non-NVIDIA contributors to the Megatron-LM GitHub repository.
 
 Everyone is welcome to contribute to the project! We recently migrated from using an internal repo to doing all development directly from the GitHub repository.
 
-When contributing it is important to ensure that changes are in line with the project direction. Small changes to fix bugs are welcomed and appreciated. If proposing large architectural changes or changes for stylistic reasons open an issue first so we can discuss it.
+When contributing it is important to ensure that changes are in line with the project direction. Small changes to fix bugs are welcomed and appreciated. **If proposing large architectural changes or changes for stylistic reasons open an issue first so we can discuss it.**
 
 ## Issue policy
 
@@ -46,16 +55,16 @@ You should receive a response within 2 business days.
 
 ### I need help, who should I ping?
 
-Use [@mcore-oncall](https://github.com/orgs/NVIDIA/teams/mcore-oncall).
+Use @NVIDIA/mcore-oncall.
 
 ### If my issue or PR isn't getting attention, what should I do?
 
-After 2 business days, tag the user [@mcore-oncall](https://github.com/orgs/NVIDIA/teams/mcore-oncall).
+After 2 business days, tag the user @NVIDIA/mcore-oncall.
 
 ### Is there a policy for issues and PRs that haven't been touched in X days? Should they be closed?
 
 Yes, we have a bot that will mark untouched PRs as "stale" after 60 days.
 
-We have a long backlog of issues and PRs dating back years. We are trying to triage these now by working backwards. Older issues we believe may still be relevant may recieve a request to re-test them with the latest code. If there's no response they may be closed. Again, if you they should be re-opened then just respond with a comment to that effect.
+We have a long backlog of issues and PRs dating back years. We are trying to triage these now by working backwards. Older issues we believe may still be relevant may receive a request to re-test them with the latest code. If there's no response they may be closed. Again, if you they should be re-opened then just respond with a comment to that effect.
 
 Thank you!

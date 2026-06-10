@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,17 @@ def experimental(request):
 def pytest_sessionfinish(session, exitstatus):
     if exitstatus == 5:
         session.exitstatus = 0
+
+
+@pytest.fixture(scope="session", autouse=True)
+def cleanup():
+    yield
+    if torch.distributed.is_initialized():
+        try:
+            torch.distributed.barrier()
+        except Exception:
+            return
+        torch.distributed.destroy_process_group()
 
 
 @pytest.fixture(scope="function", autouse=True)
@@ -74,7 +86,7 @@ def ensure_test_data():
 
         try:
             # Download assets to /opt/data
-            download_and_extract_asset(assets_dir=str(data_path))
+            download_and_extract_asset(assets_dir=data_path)
 
             print("Test data downloaded successfully.")
 

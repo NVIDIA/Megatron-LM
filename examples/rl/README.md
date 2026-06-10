@@ -94,7 +94,7 @@ MODEL_OPTIONS="\
   --ckpt-format torch \
   --seq-length $MAX_SEQ_LENGTH \
   --inference-max-seq-length $MAX_SEQ_LENGTH \
-  --inference-max-batch-size $MAX_INFERENCE_BS \
+  --inference-max-requests $MAX_INFERENCE_BS \
   --pretrained-checkpoint $CHECKPOINT \
   --untie-embeddings-and-output-weights \
   --disable-bias-linear \
@@ -172,7 +172,6 @@ torchrun \
     --save $CHECKPOINT_DIR \
     --load $CHECKPOINT_DIR \
     --tensorboard-dir $TB_DIR \
-    --langrl-inference-server-type inplace_megatron \
     --seed $SEED \
     --sequence-parallel \
     --finetune \

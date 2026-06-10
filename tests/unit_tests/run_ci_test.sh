@@ -117,7 +117,7 @@ export BUCKET
 IGNORE_ARGS=()
 while IFS= read -r line; do
     [[ -n "$line" ]] && IGNORE_ARGS+=("$line")
-done < <(python tests/unit_tests/find_test_cases.py "$BUCKET")
+done < <(python tests/unit_tests/find_test_cases.py "$BUCKET" "h100")
 
 echo "------ARGUMENTS for SLURM ---"
 MASTER_ADDR=${MASTER_ADDR:-localhost}
@@ -148,14 +148,14 @@ for i in $(seq $UNIT_TEST_REPEAT); do
         --data-file=.coverage.unit_tests \
         --source=megatron/core \
         -m pytest \
-        -xvs \
+        -vs \
         ${IGNORE_ARGS[@]} \
         -m "'not experimental and ${MARKER_ARG}'" $(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||'))
     eval "$CMD"
 
     if [[ "$TAG" == "latest" ]]; then
         CMD=$(echo uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} -m pytest \
-            -xvs \
+            -vs \
             --experimental \
              ${IGNORE_ARGS[@]} \
             -m "'experimental and ${MARKER_ARG}'" $(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||'))

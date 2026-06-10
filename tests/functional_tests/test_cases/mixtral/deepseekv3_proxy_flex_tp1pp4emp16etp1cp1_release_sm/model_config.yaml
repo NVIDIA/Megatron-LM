@@ -13,13 +13,15 @@ ENV_VARS:
   NON_DETERMINSTIC_RESULTS: 1
   NVSHMEM_IB_ENABLE_IBGDA: 0
   CUDA_DEVICE_MAX_CONNECTIONS: 1
+  NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN: 8
 TEST_TYPE: "release"
+LAUNCHER: ft_launcher
 MODEL_ARGS:
   # Distributed args
   --distributed-timeout-minutes: 60
   --tensor-model-parallel-size: 2
   --pipeline-model-parallel-size: 4
-  --pipeline-model-parallel-layout: Et*2\\|\\(tt\\|\\)*5t\\|tmL # Et*2|(tt|)*5t|tmL
+  --pipeline-model-parallel-layout: Et*2|(tt|)*5t|tmL
   --expert-model-parallel-size: 16
   --context-parallel-size: 1
   --expert-tensor-parallel-size: 1
@@ -38,7 +40,7 @@ MODEL_ARGS:
   --exit-duration-in-mins: 220
   --no-check-for-nan-in-loss-and-grad: true
   --cross-entropy-loss-fusion: true
-  --cross-entropy-fusion-impl: te
+  --cross-entropy-fusion-impl: native
   --manual-gc: true
   --manual-gc-interval: 10
 
@@ -99,7 +101,7 @@ MODEL_ARGS:
   --moe-router-load-balancing-type: seq_aux_loss
   --moe-router-topk: 8
   --moe-token-dispatcher-type: flex
-  --moe-enable-deepep: true
+  --moe-flex-dispatcher-backend: hybridep
   --moe-router-pre-softmax: true
   --moe-grouped-gemm: true
   --moe-aux-loss-coeff: 1e-4
@@ -132,8 +134,8 @@ MODEL_ARGS:
     # Add checkpointing args
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}
-  --save-interval: 500
-  --save-retain-interval: 10000
+  --save-interval: 250
+  --save-retain-interval: 5000
   --dist-ckpt-strictness: log_all
 
   # Add initialization args
@@ -150,6 +152,7 @@ MODEL_ARGS:
   --logging-level: 40
   --tensorboard-dir: ${TENSORBOARD_PATH}
   --wandb-project: megatron-core-release-runs
+  --wandb-entity: adlr
   --wandb-exp-name: ${WANDB_EXPERIMENT}
   --wandb-save-dir: ${WANDB_SAVE_PATH}
 

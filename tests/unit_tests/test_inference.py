@@ -11,19 +11,24 @@ pytest.importorskip("flask")
 pytest.importorskip("flask_restful")
 
 from megatron.core.inference.text_generation_server import MegatronServer
-from megatron.training import tokenizer
+from megatron.core.tokenizers import MegatronTokenizer
 from tests.unit_tests.inference.engines.test_static_engine import StaticInferenceEngineTestHarness
-from tests.unit_tests.test_tokenizer import GPT2_VOCAB_SIZE, gpt2_tiktok_vocab
 from tests.unit_tests.test_utilities import Utils
 
 
 @pytest.fixture(scope="module")
-def gpt2_tiktoken_tokenizer(gpt2_tiktok_vocab):
-    return tokenizer.build_tokenizer(gpt2_tiktok_vocab)
+def gpt2_tiktoken_tokenizer():
+    return MegatronTokenizer.from_pretrained(
+        tokenizer_path="/opt/data/tokenizers/tiktoken/tiktoken.vocab.json",
+        vocab_size=131072,
+        num_special_tokens=1000,
+        pattern="v1",
+    )
 
 
 @pytest.fixture(scope="module")
 def static_inference_engine(gpt2_tiktoken_tokenizer):
+    Utils.initialize_model_parallel()
     engine_wrapper = StaticInferenceEngineTestHarness()
     engine_wrapper.setup_engine(vocab_size=gpt2_tiktoken_tokenizer.vocab_size, legacy=True)
 
@@ -59,8 +64,6 @@ def client(app):
     'megatron.core.inference.text_generation_server.text_generation_server.send_do_generate'
 )
 def test_generations_endpoint(mock_send_do_generate, client, gpt2_tiktoken_tokenizer):
-    Utils.initialize_distributed()
-
     prompts = ["twinkle twinkle little star, how I wonder what you are"]
     request_data = {"prompts": prompts, "tokens_to_generate": 10, "logprobs": True}
 
@@ -86,8 +89,6 @@ def test_generations_endpoint(mock_send_do_generate, client, gpt2_tiktoken_token
     "megatron.core.inference.text_generation_server.endpoints.completions.send_do_generate"
 )
 def test_completions_endpoint(mock_send_do_generate, client, gpt2_tiktoken_tokenizer):
-    Utils.initialize_distributed()
-
     twinkle = ("twinkle twinkle little star,", " how I wonder what you are")
     request_data = {"prompt": twinkle[0] + twinkle[1], "max_tokens": 0, "logprobs": 5, "echo": True}
 

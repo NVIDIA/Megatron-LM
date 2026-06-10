@@ -19,6 +19,7 @@ from torchvision.transforms import Compose, Resize, ToPILImage
 from megatron.inference.text_generation.api import generate_and_post_process
 from megatron.inference.text_generation.forward_step import ForwardStep
 from megatron.training import get_args, get_model, print_rank_0
+from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
 from pretrain_vlm import model_provider
@@ -187,9 +188,9 @@ class VLMForwardStep(ForwardStep):
         # Update the sequence length offset by the number of image tokens.
         num_tokens = tokens.size(1)
         if num_tokens > 1:
-            self.inference_context.sequence_len_offset += self.inference_context.key_value_memory_dict[
-                "image_tokens_count"
-            ]
+            self.inference_context.sequence_len_offset += (
+                self.inference_context.key_value_memory_dict["image_tokens_count"]
+            )
 
         return logits
 
@@ -199,7 +200,8 @@ def main():
 
     logging.getLogger(__name__).warning("Models using pipeline parallelism are not supported yet.")
 
-    initialize_megatron(extra_args_provider=add_text_generation_args)
+    parse_and_validate_args(extra_args_provider=add_text_generation_args)
+    initialize_megatron()
 
     # Set up model and load checkpoint.
     model = get_model(model_provider, wrap_with_ddp=False)

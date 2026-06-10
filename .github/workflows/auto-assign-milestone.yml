@@ -13,7 +13,6 @@ permissions:
 jobs:
   assign-milestone:
     runs-on: ubuntu-latest
-    environment: nemo-ci
     if: github.repository == 'NVIDIA/Megatron-LM'
     steps:
       - name: Get PR info

@@ -249,7 +249,10 @@ class GPTFIMDataset(GPTDataset):
         """
         if self.np_rng.binomial(1, fim_rate):  # sample bernoulli dist
 
-            contents = tokenizer._tokenizer.ids_to_text(sample)
+            # Use remove_special_tokens=True so character-level boundaries and re-tokenization
+            # are consistent; otherwise ids_to_text(..., None) keeps special tokens when
+            # include_special_tokens=True, changing contents and breaking e.g. split_sample.
+            contents = tokenizer._tokenizer.ids_to_text(sample, remove_special_tokens=True)
 
             # Do not apply FIM if the sample starts with no_fim_prefix
             if no_fim_prefix is not None and contents.startswith(no_fim_prefix):

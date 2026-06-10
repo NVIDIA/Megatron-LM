@@ -50,9 +50,6 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     object_storage_cache_path: Optional[str] = None
     """Path for caching indices for s3 or msc dataloading."""
 
-    context_parallel_size: int = 1
-    """Option to enable context parallelism"""
-
     data_parallel_size: int = 1
     """Option to enable data parallelism"""
 
@@ -61,8 +58,8 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     Set to 0 if sequence parallel is not enabled regardless of TP size.
     """
 
-    hybrid_context_parallel: bool = False
-    """Option to enable hybrid context parallelism. When setting this to True, 
+    dynamic_context_parallel: bool = False
+    """Option to enable dynamic context parallelism. When setting this to True, 
     each sample should be divisible by the data parallel size * context parallel size * 2.
     If sequence parallel is enabled, it should be divisible by the 
     data parallel size * context parallel size * sequence parallel size * 2.
@@ -79,6 +76,21 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     context_parallel_size: Optional[int] = None
     """The size of the context parallel group. Needed for padding in packed sequences."""
 
+    sft_mock_dataset_config_json: Optional[str] = None
+    """This config provides the necessary information for the mock dataset."""
+
+    varlen_mock_dataset_config_json: Optional[str] = None
+    """Mock-dataset config (same JSON schema as ``sft_mock_dataset_config_json``)
+    used by the ``--use-varlen-dataset`` path; kept separate so the varlen path
+    does not implicitly inherit SFT-specific knobs."""
+
+    varlen_sbhd_validation: bool = False
+    """When True, :class:`VarlenDataset.__getitem__` emits SBHD samples padded
+    to ``sequence_length`` (no ``cu_seqlens`` / ``original_seq_len`` /
+    ``padded_seq_len``), bypassing the packed-sequence path. Used to obtain a
+    SBHD reference run that mirrors the THD path's tokenization but skips all
+    packing — useful for THD numerical-correctness validation."""
+
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
         super().__post_init__()
@@ -88,6 +100,12 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
         assert self.reset_position_ids is not None
         assert self.reset_attention_mask is not None
         assert self.eod_mask_loss is not None
+
+        if self.varlen_sbhd_validation:
+            assert not self.dynamic_context_parallel, (
+                "--varlen-sbhd-validation is incompatible with "
+                "--dynamic-context-parallel (SBHD mode is not packed)."
+            )
 
         self.token_dtype_code = (
             None
@@ -340,7 +358,7 @@ class GPTDataset(MegatronDataset):
             sample_parts.append(
                 self.dataset.get(
                     self.document_index[doc_index_beg],
-                    offset=doc_index_beg_offset,
+                    offset=int(doc_index_beg_offset),
                     length=doc_index_end_offset
                     - doc_index_beg_offset
                     + self.config.add_extra_token_to_sequence,
@@ -361,7 +379,7 @@ class GPTDataset(MegatronDataset):
                     else doc_index_end_offset + self.config.add_extra_token_to_sequence
                 )
                 sample_parts.append(
-                    self.dataset.get(self.document_index[i], offset=offset, length=length)
+                    self.dataset.get(self.document_index[i], offset=int(offset), length=length)
                 )
         assert len(document_ids) == len(
             sample_parts
@@ -801,10 +819,11 @@ class MockGPTLowLevelDataset:
     """The hard-coded number of samples to generate"""
 
     max_sequence_length: int = 4096
-    """The hard-coded max sequence length to generate"""
+    """The hard-coded max sequence length of the random generated sequences"""
 
     def __init__(self, tokenizer: MegatronTokenizerBase) -> None:
-        self.tokenizer = tokenizer
+        self.vocab_size = tokenizer.vocab_size
+        self.eod_token = tokenizer.eod
         rng = numpy.random.default_rng(seed=self.seed)
         self.sequence_lengths = rng.integers(
             low=1, high=self.max_sequence_length, size=self.size, dtype=numpy.int32
@@ -816,7 +835,7 @@ class MockGPTLowLevelDataset:
     def __getitem__(self, idx: int) -> numpy.number:
         length = self.sequence_lengths[idx]
         sample = numpy.int64(
-            numpy.concatenate([numpy.arange(length - 1) + 1, [self.tokenizer.eod]])
+            numpy.concatenate([(numpy.arange(length - 1) + 1) % self.vocab_size, [self.eod_token]])
         )
         return sample
 

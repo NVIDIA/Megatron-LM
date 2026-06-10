@@ -13,7 +13,7 @@ import torch
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
 from megatron.core.datasets.utils import compile_helpers
-from megatron.training.tokenizer.tokenizer import _NullTokenizer
+from megatron.core.tokenizers import MegatronTokenizer
 from tests.unit_tests.test_utilities import Utils
 
 _MOCK_VOCAB_SIZE = 8192
@@ -37,7 +37,9 @@ def test_mock_gpt_dataset():
     else:
         compile_helpers()
 
-    tokenizer = _NullTokenizer(vocab_size=_MOCK_VOCAB_SIZE)
+    tokenizer = MegatronTokenizer.from_pretrained(
+        metadata_path={"library": "null-text"}, vocab_size=_MOCK_VOCAB_SIZE
+    )
 
     config = GPTDatasetConfig(
         random_seed=1234,

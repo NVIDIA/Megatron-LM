@@ -169,9 +169,12 @@ class GraphableMegatronModule(MegatronModule):
 
         # Enable cuda graphs.
         if config.cuda_graph_impl == "local":
-            from megatron.core.transformer.cuda_graphs import CudaGraphManager
+            if hasattr(self, "create_mcore_cudagraph_manager"):
+                self.create_mcore_cudagraph_manager(config)
+            else:
+                from megatron.core.transformer.cuda_graphs import CudaGraphManager
 
-            self.cudagraph_manager = CudaGraphManager(config, vp_stage=vp_stage)
+                self.cudagraph_manager = CudaGraphManager(config)
         elif config.cuda_graph_impl == "transformer_engine":
             # List to store CUDA graphs. A list of `N` CUDA graphs for this layer where N is
             # the number of microbatches. Multiple CUDA graphs per layer is required to support
@@ -315,6 +318,15 @@ class GraphableMegatronModule(MegatronModule):
 
         cudagraph_kwargs = kwargs.copy()
         cudagraph_kwargs['is_first_microbatch'] = getattr(self, 'current_microbatch', 0) == 0
+        if self.config.fine_grained_activation_offloading and getattr(
+            self, 'offload_module_in_cuda_graph', False
+        ):
+            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+                FineGrainedActivationOffloadingInterface as off_interface,
+            )
+
+            cudagraph_kwargs['cuda_graph_stream'] = off_interface.cuda_graph_stream()
+            cudagraph_kwargs['cuda_graph_event'] = off_interface.cuda_graph_event()
         return cudagraph_args, cudagraph_kwargs
 
     def _should_call_local_cudagraph(self, *args, **kwargs):
@@ -336,11 +348,7 @@ class GraphableMegatronModule(MegatronModule):
         )
 
     def __call__(self, *args, **kwargs):
-
         if self._should_call_local_cudagraph(*args, **kwargs):
-            # Set the is_first_microbatch flag for weight caching
-            current_microbatch = getattr(self, 'current_microbatch', 0)
-            self.cudagraph_manager.set_is_first_microbatch(current_microbatch == 0)
             return self.cudagraph_manager(self, args, kwargs)
         elif self._should_call_te_cudagraph(*args, **kwargs):
             if not self.cuda_graphs:

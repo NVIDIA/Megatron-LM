@@ -1,5 +1,6 @@
 ENV_VARS:
   CUDA_DEVICE_MAX_CONNECTIONS: 1
+  THROUGHPUT_START_STEP: 1
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
   NCCL_ALGO: Ring
   CUBLAS_WORKSPACE_CONFIG: :4096:8
@@ -89,12 +90,11 @@ MODEL_ARGS:
   --mock-data: true
   --max-tokens-to-oom: 3600000
   --inference-max-seq-length: 256
-  --langrl-inference-server-type: inplace_megatron
   --calculate-per-token-loss: true
   --rl-use-sequence-packing: true
   --rl-sequence-packing-algo: fifo
   --rl-offload-optimizer-during-inference: true
-  --rl-parallel-generation-tasks: 1
+  --rl-num-parallel-generations: 2
   --cuda-graph-impl: local
   --micro-batch-size: 1
   --global-batch-size: 4
@@ -129,3 +129,11 @@ MODEL_ARGS:
   --tensorboard-dir: ${TENSORBOARD_PATH}
   --straggler-minmax-count: 16
   --empty-unused-memory-level: 2
+
+METRICS:
+  - "iteration-time"
+  - "lm loss"
+  - "num-zeros"
+  - "mem-allocated-bytes"
+  - "mem-max-allocated-bytes"
+

@@ -1,0 +1,1526 @@
+# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+import copy
+import gc
+import random
+
+import numpy as np
+import pytest
+import torch
+from packaging import version
+from torch import testing
+from torch.testing import assert_close
+
+import megatron.core.parallel_state as mpu
+from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed.finalize_model_grads import finalize_model_grads
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import HAVE_TE_MXFP8TENSOR
+from megatron.core.fp8_utils import HAVE_TE
+from megatron.core.full_cuda_graph import FullCudaGraphWrapper, StaticBufferLoader
+from megatron.core.hyper_comm_grid import HyperCommGrid
+from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.optimizer import OptimizerConfig
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.mamba_layer import MambaLayer
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.utils import is_te_min_version, is_torch_min_version
+from tests.unit_tests.distributed.megatron_fsdp.utils import (
+    make_gpt_mock_data_iterator,
+    make_moe_args_model_and_optimizer,
+    pretrain_forward_backward,
+    set_manual_seed,
+)
+from tests.unit_tests.test_utilities import Utils
+
+
+# Test model for testing FSDP
+class TestModel(torch.nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super().__init__()
+        self.linear1 = torch.nn.Linear(input_dim, input_dim * 4)
+        self.activation = torch.nn.ReLU()
+        self.linear2 = torch.nn.Linear(input_dim * 4, output_dim)
+
+    def forward(self, x):
+        x = self.linear1(x)
+        x = self.activation(x)
+        x = self.linear2(x)
+        return x
+
+
+# Test model with uniform shaped weights for testing FSDP
+class TestModelUniform(torch.nn.Module):
+    def __init__(self, hidden_dim):
+        super().__init__()
+        self.linear1 = torch.nn.Linear(hidden_dim, hidden_dim)
+        self.linear2 = torch.nn.Linear(hidden_dim, hidden_dim)
+        self.linear3 = torch.nn.Linear(hidden_dim, hidden_dim)
+        self.linear4 = torch.nn.Linear(hidden_dim, hidden_dim)
+        self.activation = torch.nn.ReLU()
+
+    def forward(self, x):
+        x = self.linear1(x)
+        x = self.activation(x)
+        x = self.linear2(x)
+        x = self.activation(x)
+        x = self.linear3(x)
+        x = self.activation(x)
+        x = self.linear4(x)
+        return x
+
+
+def setup_seed(seed):
+    random.seed(seed)  # Set Python's built-in random seed
+    np.random.seed(seed)  # Set NumPy's random seed
+    torch.manual_seed(seed)  # Set PyTorch's CPU seed
+    torch.cuda.manual_seed(seed)  # Set PyTorch's GPU seed (if using CUDA)
+    torch.cuda.manual_seed_all(seed)  # Set seed for all GPUs
+    torch.backends.cudnn.deterministic = True  # Ensure deterministic behavior
+    torch.backends.cudnn.benchmark = False  # Disable auto-tuner for reproducibility
+
+
+class TestFullyShardedDataParallel:
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel()
+
+    @classmethod
+    def teardown_class(cls):
+        Utils.destroy_model_parallel()
+
+    def _build_fsdp_model(
+        self,
+        grad_reduce_in_fp32=False,
+        main_params_dtype=torch.float32,
+        main_grads_dtype=None,
+        grad_comm_dtype=None,
+    ):
+        """Helper to construct a FullyShardedDataParallel with the given dtype args."""
+        fsdp_config = DistributedDataParallelConfig(
+            data_parallel_sharding_strategy="optim_grads_params",
+            overlap_grad_reduce=True,
+            overlap_param_gather=True,
+            bucket_size=10000,
+            use_megatron_fsdp=True,
+            grad_reduce_in_fp32=grad_reduce_in_fp32,
+            megatron_fsdp_main_params_dtype=main_params_dtype,
+            megatron_fsdp_main_grads_dtype=main_grads_dtype,
+            megatron_fsdp_grad_comm_dtype=grad_comm_dtype,
+        )
+        model = TestModel(input_dim=13, output_dim=17).cuda()
+        transformer_config = TransformerConfig(
+            num_attention_heads=1, num_layers=1, context_parallel_size=1
+        )
+        fsdp_model = FullyShardedDataParallel(
+            config=transformer_config,
+            ddp_config=fsdp_config,
+            module=model,
+            fsdp_unit_modules=[torch.nn.Linear],
+        )
+        return fsdp_model
+
+    def test_fsdp_mp_policy_with_default_args(self):
+        """Test that FullyShardedDataParallel with default dtype args produces the expected policy."""
+        if not is_torch_min_version("2.4.0"):
+            pytest.skip("Megatron FSDP requires torch >= 2.4.0")
+
+        fsdp_model = self._build_fsdp_model()
+        assert fsdp_model.mp_policy.main_params_dtype == torch.float32
+        assert fsdp_model.mp_policy.main_grads_dtype is None
+        assert fsdp_model.mp_policy.grad_comm_dtype is None
+
+    @pytest.mark.parametrize(
+        ("main_params_dtype", "main_grads_dtype", "grad_comm_dtype"),
+        [
+            (torch.bfloat16, None, None),
+            (torch.float16, torch.float32, None),
+            (torch.float32, torch.bfloat16, torch.bfloat16),
+            (None, None, None),
+        ],
+    )
+    def test_fsdp_mp_policy_with_custom_dtypes(
+        self, main_params_dtype, main_grads_dtype, grad_comm_dtype
+    ):
+        """Test that FullyShardedDataParallel forwards custom dtypes to mp_policy correctly."""
+        if not is_torch_min_version("2.4.0"):
+            pytest.skip("Megatron FSDP requires torch >= 2.4.0")
+
+        fsdp_model = self._build_fsdp_model(
+            main_params_dtype=main_params_dtype,
+            main_grads_dtype=main_grads_dtype,
+            grad_comm_dtype=grad_comm_dtype,
+        )
+        assert fsdp_model.mp_policy.main_params_dtype == main_params_dtype
+        assert fsdp_model.mp_policy.main_grads_dtype == main_grads_dtype
+        assert fsdp_model.mp_policy.grad_comm_dtype == grad_comm_dtype
+
+    def test_fsdp_mp_policy_grad_reduce_in_fp32_overrides_dtypes(self):
+        """Test that grad_reduce_in_fp32=True forces main_grads and grad_comm to fp32."""
+        if not is_torch_min_version("2.4.0"):
+            pytest.skip("Megatron FSDP requires torch >= 2.4.0")
+
+        fsdp_model = self._build_fsdp_model(
+            grad_reduce_in_fp32=True,
+            main_params_dtype=torch.bfloat16,
+            main_grads_dtype=torch.bfloat16,
+            grad_comm_dtype=torch.float16,
+        )
+        assert fsdp_model.mp_policy.main_params_dtype == torch.bfloat16
+        assert fsdp_model.mp_policy.main_grads_dtype == torch.float32
+        assert fsdp_model.mp_policy.grad_comm_dtype == torch.float32
+
+    def test_fsdp_mp_policy_grad_reduce_in_fp32_disabled_preserves_dtypes(self):
+        """Test that grad_reduce_in_fp32=False preserves the user-specified grads/comm dtypes."""
+        if not is_torch_min_version("2.4.0"):
+            pytest.skip("Megatron FSDP requires torch >= 2.4.0")
+
+        fsdp_model = self._build_fsdp_model(
+            grad_reduce_in_fp32=False,
+            main_params_dtype=torch.bfloat16,
+            main_grads_dtype=torch.bfloat16,
+            grad_comm_dtype=torch.float16,
+        )
+        assert fsdp_model.mp_policy.main_params_dtype == torch.bfloat16
+        assert fsdp_model.mp_policy.main_grads_dtype == torch.bfloat16
+        assert fsdp_model.mp_policy.grad_comm_dtype == torch.float16
+
+    @pytest.mark.skipif(
+        version.parse(torch.__version__) < version.parse('2.3.0'),
+        reason="Device mesh feature requires PyTorch 2.3 or later",
+    )
+    @pytest.mark.parametrize("dp_size", [2, 8])  # Test with 2 or 8 GPUs
+    def test_fsdp_with_process_groups(self, dp_size):
+        """Test that FSDP works correctly with different process group configurations."""
+        if not is_torch_min_version("2.4.0"):
+            pytest.skip("Megatron FSDP requires torch >= 2.4.0")
+
+        # Initialize torch.distributed if not already initialized
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend='nccl')
+
+        # Skip test if we don't have enough GPUs
+        world_size = torch.distributed.get_world_size()
+        if world_size != dp_size:
+            pytest.skip(f"This test requires {dp_size} GPUs, but only {world_size} are available")
+
+        # Create HyperCommGrid with dp dimension
+        grid = HyperCommGrid([dp_size], ["dp"])
+
+        # Create process groups config with ONLY dp group
+        pg_collection = ProcessGroupCollection()
+
+        pg_collection.dp = grid.create_pg("dp")
+        pg_collection.dp_cp = pg_collection.dp
+
+        # Simple model config
+        input_dim = 13
+        output_dim = 17
+
+        # Setup FSDP config - using optim_grads_params for full sharding test
+        fsdp_config = DistributedDataParallelConfig(
+            data_parallel_sharding_strategy="optim_grads_params",
+            overlap_grad_reduce=True,
+            overlap_param_gather=True,
+            bucket_size=10000,
+            use_megatron_fsdp=True,
+        )
+
+        # Create two identical models
+        model1 = TestModel(input_dim=input_dim, output_dim=output_dim).cuda()
+        model2 = TestModel(input_dim=input_dim, output_dim=output_dim).cuda()
+
+        # Ensure identical weights
+        for p1, p2 in zip(model1.parameters(), model2.parameters()):
+            p2.data.copy_(p1.data)
+
+        transformer_config = TransformerConfig(
+            num_attention_heads=1, num_layers=1, context_parallel_size=1  # Explicitly set CP=1
+        )
+        fsdp_model1 = FullyShardedDataParallel(
+            config=transformer_config,
+            ddp_config=fsdp_config,
+            module=model1,
+            fsdp_unit_modules=[torch.nn.Linear],
+        )
+
+        # Wrap second model with explicit process groups
+        fsdp_model2 = FullyShardedDataParallel(
+            config=transformer_config,
+            ddp_config=fsdp_config,
+            module=model2,
+            pg_collection=pg_collection,
+            fsdp_unit_modules=[torch.nn.Linear],
+        )
+
+        # Create optimizer config
+        lr = 3
+        optimizer_config = OptimizerConfig(optimizer="adam", lr=lr)
+        grad_scaler = None
+
+        optimizer1 = DistributedOptimizer(
+            optimizer=None,
+            config=optimizer_config,
+            grad_scaler=grad_scaler,
+            init_state_fn=None,
+            model_chunks=[fsdp_model1],
+            per_model_buffers={0: [fsdp_model1.param_and_grad_buffer]},
+            data_parallel_group=fsdp_model1.megatron_fsdp_dist_index.get_dp_group(),
+            data_parallel_group_gloo=None,
+            data_parallel_group_idx=0,
+            distributed_optimizer_instance_id=0,
+        )
+
+        optimizer2 = DistributedOptimizer(
+            optimizer=None,
+            config=optimizer_config,
+            grad_scaler=grad_scaler,
+            init_state_fn=None,
+            model_chunks=[fsdp_model2],
+            per_model_buffers={0: [fsdp_model2.param_and_grad_buffer]},
+            data_parallel_group=fsdp_model2.megatron_fsdp_dist_index.get_dp_group(),
+            data_parallel_group_gloo=None,
+            data_parallel_group_idx=0,
+            distributed_optimizer_instance_id=1,
+        )
+
+        # Create identical inputs
+        batch_size = 2
+        input_data = torch.randint(0, 10, (batch_size, input_dim), device='cuda', dtype=torch.long)
+        input_data = input_data.float()
+        input_data.requires_grad = True
+
+        def loss_fn(output, _):
+            return output.sum()
+
+        def train_step(model, optimizer, inputs):
+            inputs_clone = inputs.clone().detach().requires_grad_(True)
+            optimizer.zero_grad()
+            outputs = model(inputs_clone)
+            loss = loss_fn(outputs, None)
+            loss.backward()
+            optimizer.step()
+            return outputs, loss
+
+        out1, loss1 = train_step(fsdp_model1, optimizer1, input_data)
+        out2, loss2 = train_step(fsdp_model2, optimizer2, input_data)
+
+        testing.assert_close(out1, out2, rtol=0, atol=0)
+        testing.assert_close(loss1, loss2, rtol=0, atol=0)
+
+        fsdp_model1.stop_communication()
+        fsdp_model2.stop_communication()
+
+        # Check parameters after optimization step
+        for (name1, param1), (_, param2) in zip(
+            fsdp_model1.named_parameters(), fsdp_model2.named_parameters()
+        ):
+            testing.assert_close(
+                param1._local_tensor,
+                param2._local_tensor,
+                rtol=0,
+                atol=0,
+                msg=f"Parameters for {name1} don't match",
+            )
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    def test_fsdp_expt_device_mesh(self):
+        """Test that expt_device_mesh is None for dense models and not None for MoE models."""
+        if not is_torch_min_version("2.4.0"):
+            pytest.skip("Megatron FSDP requires torch >= 2.4.0")
+
+        fsdp_config = DistributedDataParallelConfig(
+            data_parallel_sharding_strategy="optim_grads_params",
+            overlap_grad_reduce=True,
+            overlap_param_gather=True,
+            bucket_size=10000,
+            use_megatron_fsdp=True,
+        )
+        input_dim, output_dim = 13, 17
+
+        # Dense model: expt_device_mesh should not be built without MoE config
+        dense_config = TransformerConfig(
+            num_attention_heads=1, num_layers=1, context_parallel_size=1
+        )
+        dense_model = TestModel(input_dim=input_dim, output_dim=output_dim).cuda()
+        fsdp_dense = FullyShardedDataParallel(
+            config=dense_config,
+            ddp_config=fsdp_config,
+            module=dense_model,
+            fsdp_unit_modules=[torch.nn.Linear],
+        )
+        assert (
+            fsdp_dense.megatron_fsdp_dist_index.expt_device_mesh is None
+        ), "Dense model: expt_device_mesh should be None"
+        fsdp_dense.stop_communication()
+
+        # MoE model: expt_device_mesh should be built when num_moe_experts is set
+        moe_config = TransformerConfig(
+            num_attention_heads=1, num_layers=1, context_parallel_size=1, num_moe_experts=4
+        )
+        moe_model = TestModel(input_dim=input_dim, output_dim=output_dim).cuda()
+        fsdp_moe = FullyShardedDataParallel(
+            config=moe_config,
+            ddp_config=fsdp_config,
+            module=moe_model,
+            fsdp_unit_modules=[torch.nn.Linear],
+        )
+        assert (
+            fsdp_moe.megatron_fsdp_dist_index.expt_device_mesh is not None
+        ), "MoE model: expt_device_mesh should not be None"
+        fsdp_moe.stop_communication()
+
+    def test_fsdp_db_persist_buf_on_alloc_fail(self):
+        """When ``fsdp_double_buffer=True`` and
+        ``fsdp_db_use_persist_buf_on_alloc_fail=True``, asymmetric (non-double-
+        buffered) FSDP unit buckets must be persistently allocated in the
+        ``GlobalMemoryBuffer`` for weights, transpose weights, and main grads,
+        and must remain there after a full training step (i.e. they must NEVER
+        be freed nor fall through to the dynamic backup allocator).
+
+        ``TestModel`` has two ``Linear`` layers of different sizes, so with
+        ``fsdp_unit_modules=[torch.nn.Linear]`` only one FSDP unit fits in the
+        fixed double-buffer pool and the other becomes an "outlier" that
+        exercises the persistent fallback path.
+        """
+        if not is_torch_min_version("2.4.0"):
+            pytest.skip("Megatron FSDP requires torch >= 2.4.0")
+
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.param_and_grad_buffer import (
+            FixedPoolAllocator,
+        )
+        from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import get_global_memory_buffer
+
+        fsdp_config = DistributedDataParallelConfig(
+            data_parallel_sharding_strategy="optim_grads_params",
+            overlap_grad_reduce=True,
+            overlap_param_gather=True,
+            bucket_size=10000,
+            use_megatron_fsdp=True,
+            fsdp_double_buffer=True,
+            fsdp_db_use_persist_buf_on_alloc_fail=True,
+        )
+
+        input_dim, output_dim = 13, 17
+        model = TestModel(input_dim=input_dim, output_dim=output_dim).cuda()
+        transformer_config = TransformerConfig(
+            num_attention_heads=1, num_layers=1, context_parallel_size=1
+        )
+        fsdp_model = FullyShardedDataParallel(
+            config=transformer_config,
+            ddp_config=fsdp_config,
+            module=model,
+            fsdp_unit_modules=[torch.nn.Linear],
+        )
+
+        pgb = fsdp_model.param_and_grad_buffer
+
+        # All three temp allocators should be FixedPoolAllocators when
+        # fsdp_double_buffer=True, otherwise this test wouldn't be exercising
+        # the right code path.
+        assert isinstance(pgb.weight_alloc, FixedPoolAllocator)
+        assert isinstance(pgb.transpose_weight_alloc, FixedPoolAllocator)
+        assert isinstance(pgb.main_grad_alloc, FixedPoolAllocator)
+
+        # Sanity-check that TestModel produced at least one outlier FSDP unit
+        # (i.e. an FSDP unit that does NOT fit in the fixed double-buffer pool
+        # and therefore must take the persistent fallback path).
+        all_unit_ids = set(pgb.weight_alloc.fsdp_unit_buckets.keys())
+        db_unit_ids = set(pgb.weight_alloc.fsdp_double_buffer_units)
+        outlier_unit_ids = all_unit_ids - db_unit_ids
+        assert len(outlier_unit_ids) > 0, (
+            "TestModel should produce at least one asymmetric FSDP unit so "
+            "that the persistent fallback path is exercised."
+        )
+
+        # Run one full training step: forward + backward + optimizer step.
+        optimizer_config = OptimizerConfig(optimizer="adam", lr=1e-3)
+        optimizer = DistributedOptimizer(
+            optimizer=None,
+            config=optimizer_config,
+            grad_scaler=None,
+            init_state_fn=None,
+            model_chunks=[fsdp_model],
+            per_model_buffers={0: [fsdp_model.param_and_grad_buffer]},
+            data_parallel_group=fsdp_model.megatron_fsdp_dist_index.get_dp_group(),
+            data_parallel_group_gloo=None,
+            data_parallel_group_idx=0,
+            distributed_optimizer_instance_id=0,
+        )
+
+        inputs = torch.randn(2, input_dim, device="cuda", requires_grad=True)
+        optimizer.zero_grad()
+        out = fsdp_model(inputs)
+        out.sum().backward()
+        optimizer.step()
+        torch.cuda.synchronize()
+        fsdp_model.stop_communication()
+
+        gmb_buffer = get_global_memory_buffer().buffer
+        for alloc_attr in ("weight_alloc", "main_grad_alloc"):
+            alloc = getattr(pgb, alloc_attr)
+            persistent_keys = [
+                k for k in gmb_buffer if k[0].startswith(f"{alloc.name}_not_fit_in_fixed_pool_")
+            ]
+            assert len(persistent_keys) > 0, (
+                f"Expected persistent buffer(s) for outlier FSDP unit(s) "
+                f"under {alloc_attr} (name='{alloc.name}'), but none were "
+                f"found in the GlobalMemoryBuffer after a training step."
+            )
+
+        for alloc_attr in ("weight_alloc", "transpose_weight_alloc", "main_grad_alloc"):
+            alloc = getattr(pgb, alloc_attr)
+            assert len(alloc.backup_allocator.buckets) == 0, (
+                f"{alloc_attr} must never delegate to the dynamic backup "
+                f"allocator when fsdp_db_use_persist_buf_on_alloc_fail=True, "
+                f"but found bucket(s) {list(alloc.backup_allocator.buckets)}."
+            )
+
+    # Testing fsdp_double_buffer with and without nccl_ub
+    @pytest.mark.parametrize(
+        ("dp_size", "nccl_ub", "fsdp_double_buffer", "fsdp_manual_registration"),
+        [(8, False, True, False), (8, True, True, False), (8, True, True, True)],
+    )
+    def test_fsdp_user_buffer_registration(
+        self, dp_size, nccl_ub, fsdp_double_buffer, fsdp_manual_registration
+    ):
+        """Test that FSDP works correctly with user buffer registration.
+        This test compares the training results of the baseline fsdp with the target fsdp config.
+        Baseline fsdp: nccl_ub=False, fsdp_double_buffer=False, fsdp_manual_registration=False
+        Target fsdp: nccl_ub=[True, False], fsdp_double_buffer=[True, False], fsdp_manual_registration=[True, False]
+        """
+        if not is_torch_min_version("2.4.0"):
+            pytest.skip("Megatron FSDP requires torch >= 2.4.0")
+
+        # Skip nccl_ub=True cases if PyTorch version is less than 2.7.0
+        if nccl_ub and version.parse(torch.__version__) < version.parse('2.7.0'):
+            pytest.skip("nccl_ub requires PyTorch 2.7.0 or later")
+
+        # Initialize torch.distributed if not already initialized
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend='nccl')
+
+        # Skip test if we don't have enough GPUs
+        world_size = torch.distributed.get_world_size()
+        if world_size != dp_size:
+            pytest.skip(f"This test requires {dp_size} GPUs, but only {world_size} are available")
+
+        # Create HyperCommGrid with dp dimension
+        grid = HyperCommGrid([dp_size], ["dp"])
+
+        # Create process groups config with ONLY dp group
+        pg_collection = ProcessGroupCollection()
+
+        pg_collection.dp = grid.create_pg("dp")
+
+        # Model config
+        hidden_dim = 16
+
+        # Setup FSDP config - baseline fsdp config
+        baseline_fsdp_config = DistributedDataParallelConfig(
+            data_parallel_sharding_strategy="optim_grads_params",
+            overlap_grad_reduce=True,
+            overlap_param_gather=True,
+            bucket_size=10000,
+            use_megatron_fsdp=True,
+            nccl_ub=False,
+            fsdp_double_buffer=False,
+            fsdp_manual_registration=False,
+        )
+
+        # Setup FSDP config - target fsdp config
+        target_fsdp_config = DistributedDataParallelConfig(
+            data_parallel_sharding_strategy="optim_grads_params",
+            overlap_grad_reduce=True,
+            overlap_param_gather=True,
+            bucket_size=10000,
+            use_megatron_fsdp=True,
+            nccl_ub=nccl_ub,
+            fsdp_double_buffer=fsdp_double_buffer,
+            fsdp_manual_registration=fsdp_manual_registration,
+        )
+
+        # Create two identical models
+        model1 = TestModelUniform(hidden_dim=hidden_dim).cuda()
+        model2 = TestModelUniform(hidden_dim=hidden_dim).cuda()
+
+        # Ensure identical weights
+        for p1, p2 in zip(model1.parameters(), model2.parameters()):
+            p2.data.copy_(p1.data)
+
+        transformer_config = TransformerConfig(
+            num_attention_heads=1, num_layers=1, context_parallel_size=1  # Explicitly set CP=1
+        )
+        baseline_fsdp_model = FullyShardedDataParallel(
+            config=transformer_config,
+            ddp_config=baseline_fsdp_config,
+            module=model1,
+            fsdp_unit_modules=[torch.nn.Linear],
+        )
+
+        target_fsdp_model = FullyShardedDataParallel(
+            config=transformer_config,
+            ddp_config=target_fsdp_config,
+            module=model2,
+            fsdp_unit_modules=[torch.nn.Linear],
+        )
+
+        # Create optimizer config
+        lr = 3
+        optimizer_config = OptimizerConfig(optimizer="adam", lr=lr)
+        grad_scaler = None
+
+        optimizer1 = DistributedOptimizer(
+            optimizer=None,
+            config=optimizer_config,
+            grad_scaler=grad_scaler,
+            init_state_fn=None,
+            model_chunks=[baseline_fsdp_model],
+            per_model_buffers={0: [baseline_fsdp_model.param_and_grad_buffer]},
+            data_parallel_group=baseline_fsdp_model.megatron_fsdp_dist_index.get_dp_group(),
+            data_parallel_group_gloo=None,
+            data_parallel_group_idx=0,
+            distributed_optimizer_instance_id=0,
+        )
+
+        optimizer2 = DistributedOptimizer(
+            optimizer=None,
+            config=optimizer_config,
+            grad_scaler=grad_scaler,
+            init_state_fn=None,
+            model_chunks=[target_fsdp_model],
+            per_model_buffers={0: [target_fsdp_model.param_and_grad_buffer]},
+            data_parallel_group=target_fsdp_model.megatron_fsdp_dist_index.get_dp_group(),
+            data_parallel_group_gloo=None,
+            data_parallel_group_idx=0,
+            distributed_optimizer_instance_id=1,
+        )
+
+        # Create identical inputs
+        batch_size = 2
+        input_data = torch.randint(0, 10, (batch_size, hidden_dim), device='cuda', dtype=torch.long)
+        input_data = input_data.float()
+        input_data.requires_grad = True
+
+        def loss_fn(output, _):
+            return output.sum()
+
+        def train_step(model, optimizer, inputs):
+            inputs_clone = inputs.clone().detach().requires_grad_(True)
+            optimizer.zero_grad()
+            outputs = model(inputs_clone)
+            loss = loss_fn(outputs, None)
+            loss.backward()
+            optimizer.step()
+            return outputs, loss
+
+        out1, loss1 = train_step(baseline_fsdp_model, optimizer1, input_data)
+        out2, loss2 = train_step(target_fsdp_model, optimizer2, input_data)
+
+        # In case of manual registration, we need to manually register the buffer
+        # And proceed one more step to check the results
+        if fsdp_manual_registration:
+            out1, loss1 = train_step(baseline_fsdp_model, optimizer1, input_data)
+            target_fsdp_model.param_and_grad_buffer.manual_buffer_registration()
+            out2, loss2 = train_step(target_fsdp_model, optimizer2, input_data)
+
+        testing.assert_close(out1, out2, rtol=0, atol=0)
+        testing.assert_close(loss1, loss2, rtol=0, atol=0)
+
+        # Check parameters after optimization step
+        baseline_fsdp_model.stop_communication()
+        target_fsdp_model.stop_communication()
+        for (name1, param1), (_, param2) in zip(
+            baseline_fsdp_model.named_parameters(), target_fsdp_model.named_parameters()
+        ):
+            testing.assert_close(
+                param1._local_tensor,
+                param2._local_tensor,
+                rtol=0,
+                atol=0,
+                msg=f"Parameters for {name1} don't match",
+            )
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    @classmethod
+    def hsdp_one_step_test(cls, num_fsdp_group):
+        if not is_torch_min_version("2.4.0"):
+            pytest.skip("Megatron FSDP requires torch >= 2.4.0")
+
+        setup_seed(42)  # Ensure reproducibility
+        Utils.initialize_model_parallel(num_distributed_optimizer_instances=num_fsdp_group)
+
+        try:
+            # Create two identical models
+            input_dim = 13
+            output_dim = 17
+            model = TestModel(input_dim=input_dim, output_dim=output_dim).cuda()
+
+            # Setup FSDP config - using optim_grads_params for full sharding test
+            fsdp_config = DistributedDataParallelConfig(
+                data_parallel_sharding_strategy="optim_grads_params",
+                overlap_grad_reduce=True,
+                overlap_param_gather=True,
+                bucket_size=10000,
+                use_megatron_fsdp=True,
+                num_distributed_optimizer_instances=num_fsdp_group,
+            )
+
+            # Wrap first model with default process groups
+            transformer_config = TransformerConfig(
+                num_attention_heads=1, num_layers=1, context_parallel_size=1  # Explicitly set CP=1
+            )
+            fsdp_model = FullyShardedDataParallel(
+                config=transformer_config,
+                ddp_config=fsdp_config,
+                module=model,
+                fsdp_unit_modules=[torch.nn.Linear],
+            )
+            fsdp_model.is_last_microbatch = True  # Set to True for testing
+
+            # Create optimizer config
+            lr = 3
+            optimizer_config = OptimizerConfig(optimizer="adam", lr=lr)
+            grad_scaler = None
+
+            if num_fsdp_group > 1:
+                distributed_optimizer_instance_id = torch.distributed.get_rank(
+                    mpu.get_inter_distributed_optimizer_instance_group()
+                )
+            else:
+                distributed_optimizer_instance_id = 0
+
+            distopt = DistributedOptimizer(
+                optimizer=None,
+                config=optimizer_config,
+                grad_scaler=grad_scaler,
+                init_state_fn=None,
+                model_chunks=[fsdp_model],
+                per_model_buffers={0: [fsdp_model.param_and_grad_buffer]},
+                data_parallel_group=fsdp_model.megatron_fsdp_dist_index.get_dp_group(),
+                data_parallel_group_gloo=None,
+                data_parallel_group_idx=0,
+                distributed_optimizer_instance_id=distributed_optimizer_instance_id,
+            )
+
+            # Create identical inputs
+            batch_size = 2
+            input_data = torch.randint(
+                0, 10, (batch_size, input_dim), device='cuda', dtype=torch.long
+            )
+            input_data = input_data.float()
+            input_data.requires_grad = True
+
+            def loss_fn(output, _):
+                return output.sum()
+
+            def train_step(model, optimizer, inputs):
+                inputs_clone = inputs.clone().detach().requires_grad_(True)
+                optimizer.zero_grad()
+                outputs = model(inputs_clone)
+                loss = loss_fn(outputs, None)
+                loss.backward()
+                optimizer.step()
+                return outputs, loss
+
+            out, loss = train_step(fsdp_model, distopt, input_data)
+            fsdp_model.stop_communication()
+
+            return out, loss, fsdp_model.named_parameters()
+        finally:
+            Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("num_fsdp_group", [2])
+    @pytest.mark.skipif(
+        torch.cuda.device_count() % 2 == 0, reason="This test requires an odd number of GPUs"
+    )
+    def test_fsdp_with_hybrid_sharding(self, num_fsdp_group):
+        """Test that FSDP works correctly with hybrid sharding."""
+        out1, loss1, named_params1 = self.hsdp_one_step_test(num_fsdp_group)
+        out2, loss2, named_params2 = self.hsdp_one_step_test(1)
+
+        testing.assert_close(out1, out2, rtol=0, atol=0)
+        testing.assert_close(loss1, loss2, rtol=0, atol=0)
+
+        for (name1, param1), (name2, param2) in zip(named_params1, named_params2):
+            if param1.grad is None:
+                continue  # Skip if no gradient
+            testing.assert_close(
+                param1.grad._local_tensor,
+                param2.grad._local_tensor,
+                rtol=0,
+                atol=0,
+                msg=f"Parameter gradients for {name1} and {name2} don't match",
+            )
+
+
+@pytest.fixture(scope="class")
+def ref_cache():
+    """
+    Shared read/write cache for an class.
+    Keys: arbitrary strings, values: anything (tensors, dicts, etc.).
+    """
+    return {}
+
+
+class TestMegatronFSDPE2E:
+
+    @staticmethod
+    def _training_loop(seed=42, **kwargs):
+        """
+        Run a small deterministic (optional) training loop using a mocked MoE/GPT model and optimizer.
+        This helper initializes model-parallel state, creates a model and optimizer via
+        make_moe_args_model_and_optimizer, constructs a mock GPT data iterator, and runs
+        NUM_TRAINING_STEPS iterations of forward/backward/optimization. Losses from each
+        training step are collected and returned.
+        Args:
+            seed (int, optional): RNG seed for reproducibility. Default: 42.
+            **kwargs: Configuration overrides (all optional). Recognized keys:
+                - vocab_size (int): Vocabulary size for the mock model. Default: 100.
+                - seq_length (int): Sequence length used for the mock data. Default: 128.
+                - micro_batch_size (int): Per-microbatch size. Default: 2.
+                - global_batch_size (int): Global batch size across data-parallel ranks. Default: 32.
+                - train_iters (int): Number of training iterations to run. Default: 20.
+                - tensor_model_parallel_size (int): Tensor model parallel world size. Default: 1.
+                - pipeline_model_parallel_size (int): Pipeline model parallel world size. Default: 1.
+                - num_layers_per_virtual_pipeline_stage (int or None): Virtual pipeline configuration.
+                - expert_model_parallel_size (int): Expert model parallel size for MoE. Default: 1.
+                - expert_tensor_parallel_size (int): Expert tensor parallel size for MoE. Default: 1.
+                - num_distributed_optimizer_instances (int): Number of distributed optimizer instances. Default: 1.
+        Returns:
+            list: A list of length train_iters containing the per-step language-model loss values
+            (the value appended from output[-1] each iteration). Loss objects are returned as produced
+            by the training utilities (typically tensors or scalars).
+        Side effects:
+            - Calls Utils.initialize_model_parallel(...) and Utils.destroy_model_parallel().
+            - Sets global RNG state via set_manual_seed(seed).
+            - Constructs models/optimizers via make_moe_args_model_and_optimizer and a data iterator
+              via make_gpt_mock_data_iterator.
+            - Runs optimizer.zero_grad(), pretrain_forward_backward(...), and optim.step() repeatedly.
+            - Calculates the number of micro-batches per step as:
+                global_batch_size // micro_batch_size // data_parallel_world_size.
+              This requires that global_batch_size be divisible by micro_batch_size * data_parallel_world_size.
+        Raises:
+            ValueError: If batch-size arithmetic or other setup assumptions (e.g., divisibility) are violated.
+        """
+        # Configuration parameters with defaults
+        VOCAB_SIZE = kwargs.get("vocab_size", 100)
+        MAX_SEQ_LEN = kwargs.get("seq_length", 128)
+        MICRO_BATCH_SIZE = kwargs.get("micro_batch_size", 2)
+        GLOBAL_BATCH_SIZE = kwargs.get("global_batch_size", 32)
+        NUM_TRAINING_STEPS = kwargs.get("train_iters", 20)
+        TP = kwargs.get("tensor_model_parallel_size", 1)
+        PP = kwargs.get("pipeline_model_parallel_size", 1)
+        VPP = kwargs.get("num_layers_per_virtual_pipeline_stage", None)
+        EP = kwargs.get("expert_model_parallel_size", 1)
+        ETP = kwargs.get("expert_tensor_parallel_size", 1)
+        OUTER_DP = kwargs.get("num_distributed_optimizer_instances", 1)
+
+        # Initialize model parallel groups
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=TP,
+            pipeline_model_parallel_size=PP,
+            expert_model_parallel_size=EP,
+            expert_tensor_parallel_size=ETP,
+            num_distributed_optimizer_instances=OUTER_DP,
+        )
+        DP_GROUP = mpu.get_data_parallel_group()
+
+        # Set manual seed for reproducibility
+        set_manual_seed(seed)
+
+        # Create model and optimizer
+        model_chunks, optim = make_moe_args_model_and_optimizer(
+            ut_filename="test_mcore_fully_sharded_data_parallel.py",
+            micro_batch_size=MICRO_BATCH_SIZE,
+            global_batch_size=GLOBAL_BATCH_SIZE,
+            vocab_size=VOCAB_SIZE,
+            padded_vocab_size=VOCAB_SIZE,
+            seq_length=MAX_SEQ_LEN,
+            sequence_parallel=TP > 1,
+            tensor_model_parallel_size=TP,
+            pipeline_model_parallel_size=PP,
+            num_layers_per_virtual_pipeline_stage=VPP,
+            train_iters=NUM_TRAINING_STEPS,
+            **kwargs,
+        )
+        megatron_fsdp_te_fused_adam = kwargs.get("use_megatron_fsdp", False) and kwargs.get(
+            "use_precision_aware_optimizer", False
+        )
+        if megatron_fsdp_te_fused_adam:
+            assert (
+                not optim.optimizer.master_weights
+            ), "Megatron-FSDP should not use FusedAdam master weights."
+            assert (
+                optim.optimizer.use_decoupled_grad
+            ), "Megatron-FSDP should be using a decoupled gradient with FusedAdam."
+            assert model_chunks[
+                0
+            ].module.param_and_grad_buffer.use_decoupled_grad, (
+                "Megatron-FSDP is installing gradients into param.decoupled_grad."
+            )
+
+        # Prepare data iterator
+        data_iterator = make_gpt_mock_data_iterator(
+            dp_group=DP_GROUP,
+            vocab_size=VOCAB_SIZE,
+            sequence_length=MAX_SEQ_LEN,
+            batch_size=MICRO_BATCH_SIZE,
+            num_samples=GLOBAL_BATCH_SIZE * NUM_TRAINING_STEPS,
+        )
+
+        outputs = []
+
+        # Training loop
+        for _ in range(NUM_TRAINING_STEPS):
+            optim.zero_grad()
+            output = pretrain_forward_backward(
+                model=model_chunks,
+                data_iterator=data_iterator,
+                sequence_length=MAX_SEQ_LEN,
+                micro_batch_size=MICRO_BATCH_SIZE,
+                num_micro_batches=GLOBAL_BATCH_SIZE // MICRO_BATCH_SIZE // DP_GROUP.size(),
+            )
+            # Check that at least one non-null / non-zero gradient
+            # exists when using Megatron-FSDP.
+            if kwargs.get("use_megatron_fsdp", False):
+                grad_attr = "decoupled_grad" if megatron_fsdp_te_fused_adam else "grad"
+                assert any(
+                    [
+                        getattr(p, grad_attr, None) is not None
+                        and getattr(p, grad_attr, None)._local_tensor.any()
+                        for p in model_chunks[0].parameters()
+                    ]
+                ), f"[Megatron-FSDP] Missing gradient in Parameter.{grad_attr}..."
+            optim.step()
+
+            # Collect loss
+            outputs.append(output[-1])
+
+        Utils.destroy_model_parallel()
+
+        return outputs
+
+    @pytest.mark.flaky_in_dev
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.4.0"), reason="Test needs to be updated for torch >= 2.4.0"
+    )
+    @pytest.mark.parametrize(
+        "nd_topology",
+        [
+            pytest.param({"TP": 2}, id="TP2"),
+            pytest.param({"EP": 2, "ETP": 2}, id="EP2_ETP2"),
+            pytest.param({"OUTER_DP": 2, "EP": 2}, id="OUTER_DP2_EP2"),
+        ],
+    )
+    @pytest.mark.parametrize(
+        "spec_configs",
+        [
+            pytest.param(
+                dict(
+                    data_parallel_sharding_strategy="optim_grads_params",
+                    fsdp_double_buffer=True,
+                    fp8_recipe="mxfp8",
+                    fp8="e4m3",
+                    fp8_param_gather=True,
+                    bf16=True,
+                    num_distributed_optimizer_instances=2,
+                    outer_dp_sharding_strategy="optim",
+                ),
+                id="optim_grads_params_mxfp8_double_buffer",
+            ),
+            pytest.param(
+                dict(
+                    data_parallel_sharding_strategy="optim_grads_params",
+                    fsdp_double_buffer=True,
+                    recompute_granularity="full",
+                    recompute_method="uniform",
+                    recompute_num_layers=1,
+                ),
+                id="optim_grads_params_double_buffer",
+            ),
+            pytest.param(
+                dict(
+                    data_parallel_sharding_strategy="optim_grads_params",
+                    megatron_fsdp_main_params_dtype=torch.float32,
+                    use_precision_aware_optimizer=True,
+                    fp8="hybrid",
+                    fp8_recipe="delayed",
+                    fp8_param_gather=True,
+                    bf16=True,
+                ),
+                id="optim_grads_params_fused_adam_e2e",
+            ),
+            pytest.param(
+                dict(
+                    data_parallel_sharding_strategy="optim_grads_params", fsdp_double_buffer=False
+                ),
+                id="optim_grads_params_no_double_buffer",
+            ),
+            pytest.param(
+                dict(data_parallel_sharding_strategy="optim_grads", fsdp_double_buffer=True),
+                id="optim_grads_no_double_buffer",
+            ),
+            pytest.param(
+                dict(data_parallel_sharding_strategy="optim", fsdp_double_buffer=False),
+                id="optim_double_buffer",
+            ),
+            pytest.param(
+                dict(data_parallel_sharding_strategy="no_shard", fsdp_double_buffer=False),
+                id="no_shard",
+            ),
+        ],
+    )
+    def test_compatible_with_nd_parallel(self, ref_cache, nd_topology, spec_configs):
+        if spec_configs.get("fp8_recipe") == "mxfp8" and (
+            torch.cuda.get_device_capability()[0] < 10 or not HAVE_TE_MXFP8TENSOR
+        ):
+            pytest.skip("Requires PyTorch & CUDA device with TE MXFP8Tensor support")
+
+        nd_topology_str = "_".join([f"{k}{v}" for k, v in nd_topology.items()])
+        if nd_topology_str not in ref_cache:
+            distopt_spec_configs = copy.deepcopy(spec_configs)
+            distopt_spec_configs["fp8_param_gather"] = False
+            ref_cache[nd_topology_str] = TestMegatronFSDPE2E._training_loop(
+                use_distributed_optimizer=True, **distopt_spec_configs
+            )
+
+        fsdp_sharding_strategy = spec_configs["data_parallel_sharding_strategy"]
+        # no_shard is incompatible with meta device initialization. See fully_shard.py:326.
+        init_model_with_meta_device = fsdp_sharding_strategy != "no_shard"
+
+        outputs = TestMegatronFSDPE2E._training_loop(
+            use_megatron_fsdp=True,
+            init_model_with_meta_device=init_model_with_meta_device,
+            ckpt_format="fsdp_dtensor",
+            gradient_accumulation_fusion=False,
+            **spec_configs,
+        )
+        reference_outputs = ref_cache[nd_topology_str]
+
+        if torch.distributed.get_rank() == 0:
+            for step, (output, ref_output) in enumerate(zip(outputs, reference_outputs)):
+                loss = output["lm loss"]
+                ref_loss = ref_output["lm loss"]
+                assert_close(
+                    loss,
+                    ref_loss,
+                    atol=0,
+                    rtol=0.05,
+                    msg=(
+                        f"Loss mismatch at step {step}, FSDP Loss = {loss.item()}, "
+                        f"Reference Loss = {ref_loss.item()}"
+                        f", Compare = {compare_losses(loss.item(), ref_loss.item())}"
+                    ),
+                )
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+
+    @staticmethod
+    def _reset_full_cuda_graph_static_state():
+        """Reset class-level state on FullCudaGraphWrapper / StaticBufferLoader
+        so a test that uses the wrapper does not see leftovers from a previous
+        test in this process."""
+        FullCudaGraphWrapper.curr_iteration = {'training': 0, 'validation': 0}
+        FullCudaGraphWrapper.cuda_graph = {'training': None, 'validation': None}
+        FullCudaGraphWrapper.result = {'training': None, 'validation': None}
+        StaticBufferLoader.static_buffers = {'training': [], 'validation': []}
+
+    @staticmethod
+    def _reset_cuda_rng_tracker():
+        """Force a fresh CUDA RNG tracker on the next initialize_rng_tracker
+        call. A prior test in this process may have created a non-cudagraphable
+        tracker (states stored as Tensors); without a reset, the cuda-graph
+        path would later feed those Tensors into ``Generator.graphsafe_set_state``
+        and raise ``TypeError: expected a Generator, but got Tensor``."""
+        from megatron.core.tensor_parallel import random as _tp_random
+
+        _tp_random._CUDA_RNG_STATE_TRACKER = None
+        _tp_random._CUDA_RNG_STATE_TRACKER_INITIALIZED = False
+
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.4.0"), reason="Test needs to be updated for torch >= 2.4.0"
+    )
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("1.5.0")),
+        reason=(
+            "TransformerEngine FusedAdam and RNG tracker required for "
+            "full-iteration CUDA graphability with Megatron-FSDP."
+        ),
+    )
+    @pytest.mark.parametrize(
+        "extra_overrides",
+        [
+            pytest.param({}, id="fsdp"),
+            pytest.param(
+                dict(num_distributed_optimizer_instances=2, outer_dp_sharding_strategy="optim"),
+                id="hsdp_optim_outer_dp2",
+            ),
+        ],
+    )
+    def test_full_iteration_cuda_graph_e2e(self, extra_overrides):
+        """
+        End-to-end test for Megatron-FSDP + full-iteration CUDA graph.
+
+        Variants:
+          * ``fsdp``: pure FSDP (single distributed-optimizer instance).
+          * ``hsdp_optim_outer_dp2``: Hybrid FSDP with two outer DP groups,
+            outer-DP sharding strategy ``optim``.
+
+        Asserts:
+          1. ``FullCudaGraphWrapper.cuda_graph['training']`` is populated by
+             the end of training (i.e. capture happened).
+          2. Decoupled gradients are globally present before every
+             ``optimizer.step``.
+          3. Loss decreases across the run.
+        """
+        import argparse
+        import os
+        from functools import partial
+
+        from torch.optim.optimizer import register_optimizer_step_pre_hook
+
+        import pretrain_gpt as _pretrain_gpt
+        from megatron.core.enums import ModelType
+        from megatron.core.rerun_state_machine import destroy_rerun_state_machine
+        from megatron.core.transformer.enums import CudaGraphScope
+        from megatron.training import pretrain
+        from megatron.training.argument_utils import pretrain_cfg_container_from_args
+        from megatron.training.arguments import add_megatron_arguments, validate_args
+        from megatron.training.global_vars import set_global_variables, unset_global_variables
+
+        # Because we are using pretrain() to test, destroy the entire global state
+        # before calling pretrain() for the next test case.
+        TestMegatronFSDPE2E._reset_full_cuda_graph_static_state()
+        TestMegatronFSDPE2E._reset_cuda_rng_tracker()
+        mpu.destroy_model_parallel()
+        unset_global_variables()
+        destroy_rerun_state_machine()
+        for _v in ("NVTE_FLASH_ATTN", "NVTE_FUSED_ATTN", "NVTE_UNFUSED_ATTN"):
+            os.environ.pop(_v, None)
+
+        # Minimal setup for Megatron-FSDP and CUDA graphs.
+        arg_overrides = dict(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            seq_length=256,
+            max_position_embeddings=256,
+            micro_batch_size=1,
+            global_batch_size=8,
+            train_iters=8,
+            lr=1e-4,
+            mock_data=True,
+            tokenizer_type="NullTokenizer",
+            vocab_size=256,
+            bf16=True,
+            use_megatron_fsdp=True,
+            ckpt_format="fsdp_dtensor",
+            use_precision_aware_optimizer=True,
+            cuda_graph_impl="full_iteration",
+            check_for_nan_in_loss_and_grad=False,
+            eval_iters=0,
+            eval_interval=8,
+            **extra_overrides,
+        )
+
+        # Test loss and gradients when using full-iter CG with FSDP.
+        losses: list[torch.Tensor] = []
+        grads_present_steps: list[bool] = []
+
+        orig_forward_step = _pretrain_gpt.forward_step
+
+        def wrapped_forward_step(*args, **kwargs):
+            output_tensor, loss_func_partial = orig_forward_step(*args, **kwargs)
+
+            def wrapped_loss(*la, **lk):
+                ret = loss_func_partial(*la, **lk)
+                try:
+                    if isinstance(ret, tuple) and len(ret) >= 1:
+                        report = ret[-1] if isinstance(ret[-1], dict) else None
+                        if report and "lm loss" in report:
+                            val = report["lm loss"]
+                            if isinstance(val, torch.Tensor):
+                                if val.numel() >= 2:
+                                    loss_sum, num_toks = val[0], val[1]
+                                    per_token = loss_sum / num_toks.clamp(min=1)
+                                    losses.append(per_token.detach().clone())
+                                else:
+                                    losses.append(val.detach().clone())
+                except Exception:
+                    pass
+                return ret
+
+            return output_tensor, wrapped_loss
+
+        # Pre-step hook on every Optimizer.step — verify decoupled grads are
+        # visible before the optimizer reads them. With Megatron-FSDP +
+        # precision-aware optimizer the FusedAdam reads from
+        # ``param.decoupled_grad``.
+        def pre_step_hook(optimizer, args_, kwargs_):
+            local_present = any(
+                getattr(p, "decoupled_grad", None) is not None
+                and (
+                    getattr(p, "decoupled_grad")._local_tensor
+                    if hasattr(getattr(p, "decoupled_grad"), "_local_tensor")
+                    else getattr(p, "decoupled_grad")
+                )
+                .count_nonzero()
+                .item()
+                > 0
+                for group in optimizer.param_groups
+                for p in group["params"]
+            )
+            gathered = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(gathered, local_present)
+            grads_present_steps.append(any(gathered))
+
+        hook_handle = register_optimizer_step_pre_hook(pre_step_hook)
+        cuda_graph_was_captured = False
+
+        try:
+            # Setup argument overrides for FSDP <> CG test.
+            parser = argparse.ArgumentParser(allow_abbrev=False)
+            add_megatron_arguments(parser)
+            parser.set_defaults(**arg_overrides)
+            args = parser.parse_args([])
+            args._is_global_batch_size_explicitly_specified = args.global_batch_size is not None
+            args.rank = int(os.getenv("RANK", "0"))
+            args.world_size = int(os.getenv("WORLD_SIZE", "1"))
+            validate_args(args)
+            set_global_variables(args)
+            cfg = pretrain_cfg_container_from_args(args)
+
+            from gpt_builders import gpt_builder
+            from model_provider import model_provider
+
+            pretrain(
+                cfg,
+                _pretrain_gpt.train_valid_test_datasets_provider,
+                partial(model_provider, gpt_builder),
+                ModelType.encoder_or_decoder,
+                wrapped_forward_step,
+                get_embedding_ranks=_pretrain_gpt.get_embedding_ranks,
+            )
+            # Validate CUDA graph was captured and thus replayed.
+            cuda_graph_was_captured = FullCudaGraphWrapper.cuda_graph.get("training") is not None
+        finally:
+            hook_handle.remove()
+            TestMegatronFSDPE2E._reset_full_cuda_graph_static_state()
+            TestMegatronFSDPE2E._reset_cuda_rng_tracker()
+            mpu.destroy_model_parallel()
+            unset_global_variables()
+            destroy_rerun_state_machine()
+
+        # ---- Assertions ----
+        assert cuda_graph_was_captured, (
+            "FullCudaGraphWrapper did not capture a training CUDA graph "
+            "during pretrain(). Capture either failed silently or the "
+            "wrapper was not engaged."
+        )
+
+        assert len(grads_present_steps) > 0, (
+            "Optimizer pre-step hook never fired — pretrain() did not run "
+            "any optimizer.step calls."
+        )
+        assert all(grads_present_steps), (
+            f"Decoupled gradients were missing on at least one "
+            f"optimizer.step call. Per-step presence trace: "
+            f"{grads_present_steps}"
+        )
+
+        finite_losses = [float(l) for l in losses if torch.isfinite(l).all()]
+        assert len(finite_losses) >= 2, (
+            f"Need at least two finite loss observations to check "
+            f"convergence; got {len(finite_losses)}: {finite_losses}"
+        )
+        assert finite_losses[-1] < finite_losses[0], (
+            f"Loss did not decrease across {len(finite_losses)} steps: "
+            f"first={finite_losses[0]:.6f}, last={finite_losses[-1]:.6f}, "
+            f"trace={finite_losses}"
+        )
+
+
+def compare_losses(loss_a: float, loss_b: float, reference: str = "b"):
+    """
+    Compare two loss values with absolute and relative differences.
+
+    Parameters
+    ----------
+    loss_a : float
+        First loss value (e.g., baseline model).
+    loss_b : float
+        Second loss value (e.g., new model).
+    reference : {"a", "b"}, default "b"
+        Which loss to treat as the reference when computing the
+        relative difference. If "b", relative diff is vs loss_b;
+        if "a", vs loss_a.
+
+    Returns
+    -------
+    dict with keys:
+        "abs_diff" : float
+            |loss_a - loss_b|
+        "rel_diff" : float
+            |loss_a - loss_b| / reference_loss
+        "better" : str
+            "a" if loss_a < loss_b, "b" if loss_b < loss_a, "equal" otherwise.
+    """
+    abs_diff = abs(loss_a - loss_b)
+
+    if reference == "a":
+        ref = loss_a
+    else:
+        ref = loss_b
+
+    if ref == 0:
+        rel_diff = float("inf")  # or None, depending on your preference
+    else:
+        rel_diff = abs_diff / ref
+
+    if loss_a < loss_b:
+        better = "a"
+    elif loss_b < loss_a:
+        better = "b"
+    else:
+        better = "equal"
+
+    return {"abs_diff": abs_diff, "rel_diff": rel_diff, "better": better}
+
+
+class TestFsdpNonUnitBucketPreservation:
+    """Regression test for the non-FSDP-unit bucket preservation fix.
+
+    Non-FSDP-unit buckets must remain persistently allocated: cross-module
+    readers (e.g. MambaMixer.forward, which reads self.conv1d.weight as a
+    raw tensor via causal_conv1d_fn(weight=...) instead of self.conv1d(...))
+    can dereference them at any time. Before the fix, AllGatherPipeline.reset()
+    freed every bucket's gather scratch — including the non-unit one — and
+    because nn.Module.__call__ is never invoked on conv1d, no hook ever fires
+    to refresh conv1d.weight's wbuf.data (set_param_data=True) afterwards.
+    The next forward then dereferences freed storage.
+
+    A small bucket_size is required so conv1d.weight lands in a different
+    non-unit bucket from MambaMixer's recurse=False params (A_log/D/dt_bias);
+    otherwise MambaMixer's own pre-forward hook gathers the shared bucket
+    and incidentally refreshes conv1d.weight, masking the bug.
+    """
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel()
+
+    @classmethod
+    def teardown_class(cls):
+        Utils.destroy_model_parallel()
+
+    def test_non_unit_bucket_preserved_across_param_sync(self):
+        if not is_torch_min_version("2.4.0"):
+            pytest.skip("Megatron FSDP requires torch >= 2.4.0")
+        if Utils.world_size != 2:
+            pytest.skip("Requires exactly 2 GPUs (DP=2).")
+        pytest.importorskip("mamba_ssm")
+        pytest.importorskip("causal_conv1d")
+        pytest.importorskip("einops")
+
+        from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+        from megatron.core.ssm.mamba_layer import MambaLayer
+        from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+        from megatron.core.transformer.transformer_layer import TransformerLayer
+
+        # MambaMixer's __init__ reads the 'model-parallel-rng' tracker.
+        model_parallel_cuda_manual_seed(0)
+
+        # HIDDEN=256 is the floor: mamba's d_inner = 2*HIDDEN = 512, nheads =
+        # d_inner / mamba_head_dim(64) = 8, and nheads % mamba_num_groups(8) == 0.
+        HIDDEN = 256
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=HIDDEN,
+            num_attention_heads=4,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            normalization="RMSNorm",
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+
+        class HybridStack(torch.nn.Module):
+            def __init__(self, config, pg_collection):
+                super().__init__()
+                self.attn_layer = TransformerLayer(
+                    config=config,
+                    submodules=hybrid_stack_spec.submodules.attention_layer.submodules,
+                    layer_number=1,
+                    pg_collection=pg_collection,
+                    add_layer_offset=False,
+                )
+                self.mamba_layer = MambaLayer(
+                    config=config,
+                    submodules=hybrid_stack_spec.submodules.mamba_layer.submodules,
+                    layer_number=2,
+                    pg_collection=pg_collection,
+                )
+
+            def forward(self, hidden_states):
+                h, _ = self.attn_layer(hidden_states=hidden_states, attention_mask=None)
+                return self.mamba_layer(hidden_states=h)
+
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
+        model = HybridStack(config, pg_collection).cuda().to(torch.bfloat16)
+
+        # bucket_size=4096 forces conv1d.weight into a separate non-unit bucket
+        # from MambaMixer's recurse=False params; fsdp_unit_modules=[TransformerLayer]
+        # matches the production default in mcore_fsdp_adapter.py.
+        fsdp_model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                data_parallel_sharding_strategy="optim_grads_params",
+                overlap_grad_reduce=True,
+                overlap_param_gather=True,
+                bucket_size=4096,
+                use_megatron_fsdp=True,
+            ),
+            module=model,
+            fsdp_unit_modules=[TransformerLayer],
+        )
+
+        # Guard against future bucketing changes silently masking the bug.
+        non_unit_buckets = [
+            pg
+            for pg in fsdp_model.param_and_grad_buffer.parameter_groups
+            if pg.fsdp_unit_id is None
+        ]
+        assert len(non_unit_buckets) >= 2, (
+            f"Expected non-unit params to split across multiple buckets, "
+            f"got {len(non_unit_buckets)}. bucket_size may be too large."
+        )
+
+        x = torch.randn(64, 2, HIDDEN, device="cuda", dtype=torch.bfloat16)
+        out = fsdp_model(x)
+        out.sum().backward()
+        # Mirrors what the pipeline schedule does after backward: finalize_model_grads
+        # calls fsdp_model.finish_grad_sync(), which calls synchronize_param_gather()
+        # (because overlap_param_gather=True), which calls AllGatherPipeline.reset() —
+        # the buggy entry point that frees non-unit buckets.
+        finalize_model_grads([fsdp_model])
+        fsdp_model(x)
+
+        # Surface any deferred CUDA errors before teardown.
+        torch.cuda.synchronize()
+
+
+class TestFsdpMambaConvParamGather:
+    """Regression repro for Mamba fused conv params under Megatron FSDP.
+
+    The fused causal-conv path reads conv weight and bias views inside
+    MambaMixer.forward. Those parameters must therefore be shallow MambaMixer
+    parameters so the existing non-unit module pre-forward hook gathers them.
+    This test makes that dependency deterministic by disabling AG prefetch before
+    the first forward.
+    """
+
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel()
+
+    @classmethod
+    def teardown_class(cls):
+        Utils.destroy_model_parallel()
+
+    def test_mamba_fused_conv_param_without_prefetch(self):
+        if not is_torch_min_version("2.4.0"):
+            pytest.skip("Megatron FSDP requires torch >= 2.4.0")
+        if Utils.world_size < 2:
+            pytest.skip("Requires at least 2 GPUs (DP>=2).")
+
+        # MambaMixer's __init__ reads the 'model-parallel-rng' tracker.
+        model_parallel_cuda_manual_seed(0)
+
+        # HIDDEN=256 is the floor: d_inner = 2 * HIDDEN, nheads = d_inner / 64,
+        # and nheads must be divisible by the default mamba_num_groups=8.
+        HIDDEN = 256
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=HIDDEN,
+            num_attention_heads=4,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            normalization="RMSNorm",
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+        )
+
+        class HybridStack(torch.nn.Module):
+            def __init__(self, config, pg_collection):
+                super().__init__()
+                self.attn_layer = TransformerLayer(
+                    config=config,
+                    submodules=hybrid_stack_spec.submodules.attention_layer.submodules,
+                    layer_number=1,
+                    pg_collection=pg_collection,
+                    add_layer_offset=False,
+                )
+                self.mamba_layer = MambaLayer(
+                    config=config,
+                    submodules=hybrid_stack_spec.submodules.mamba_layer.submodules,
+                    layer_number=2,
+                    pg_collection=pg_collection,
+                )
+
+            def forward(self, hidden_states):
+                h, _ = self.attn_layer(hidden_states=hidden_states, attention_mask=None)
+                return self.mamba_layer(hidden_states=h)
+
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
+        model = HybridStack(config, pg_collection).cuda().to(torch.bfloat16)
+        mixer_state = model.mamba_layer.mixer.state_dict()
+        assert "conv1d_weight" in mixer_state
+        assert not hasattr(model.mamba_layer.mixer, "conv1d")
+
+        fsdp_model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                data_parallel_sharding_strategy="optim_grads_params",
+                overlap_grad_reduce=True,
+                overlap_param_gather=True,
+                bucket_size=4096,
+                use_megatron_fsdp=True,
+            ),
+            module=model,
+            fsdp_unit_modules=[TransformerLayer],
+        )
+
+        non_unit_buckets = [
+            pg
+            for pg in fsdp_model.param_and_grad_buffer.parameter_groups
+            if pg.fsdp_unit_id is None
+        ]
+        assert len(non_unit_buckets) >= 2, (
+            "Expected non-unit params to split across multiple buckets; "
+            "bucket_size may be too large and could mask this repro."
+        )
+        conv_weight = fsdp_model.module.raw_param["mamba_layer.mixer.conv1d_weight"]
+        conv_bucket_id = fsdp_model.param_and_grad_buffer.param_to_param_group[conv_weight]
+        assert (
+            fsdp_model.param_and_grad_buffer.parameter_groups[conv_bucket_id].fsdp_unit_id is None
+        ), "conv1d_weight should be a shallow non-unit MambaMixer parameter."
+
+        # Disabling prefetch isolates the fused conv path: the forward cannot
+        # incidentally gather conv1d_weight from an earlier module hook.
+        x = torch.randn(64, 2, HIDDEN, device="cuda", dtype=torch.bfloat16)
+        fsdp_model.module.suggested_AG_prefetch_size = 0
+        fsdp_model(x)
+
+        # Surface any deferred CUDA errors before teardown.
+        torch.cuda.synchronize()

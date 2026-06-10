@@ -8,10 +8,11 @@ from functools import partial
 import torch
 
 from gpt_builders import gpt_builder
-from mamba_builders import mamba_builder
+from hybrid_builders import hybrid_builder
 from megatron.core import mpu
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import is_pipeline_last_stage
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import StragglerDetector
@@ -21,11 +22,12 @@ from megatron.rl.rl_utils import (
     get_rl_runtime_state,
     load_packed_data_by_index,
 )
-from megatron.training import get_args, get_timers, pretrain, print_rank_0
-from megatron.training.arguments import core_transformer_config_from_args
-from model_provider import model_provider
-
 from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
+from megatron.training import get_args, get_timers, pretrain, print_rank_0
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
+from megatron.training.utils import is_hybrid_model
+from model_provider import model_provider
 
 stimer = StragglerDetector()
 
@@ -222,7 +224,11 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
             seq_lengths,
             seq_indices,
             packed_seq_params,
-        ) = load_packed_data_by_index(bin_tensor.item(), runtime_state.packing_context, args.rl_inference_logprobs_is_correction)
+        ) = load_packed_data_by_index(
+            bin_tensor.item(),
+            runtime_state.packing_context,
+            args.rl_inference_logprobs_is_correction,
+        )
 
         runtime_state.increment_sequences(len(seq_indices))
     else:
@@ -258,10 +264,22 @@ def forward_step(data_iterator, model: GPTModel, loss_only: bool = False):
     model_to_use = model[0] if isinstance(model, list) else model
 
     if packed_seq_params is None:
-        packed_seq_params = get_default_packed_seq_params(
-            seq_length=tokens.shape[1],
-            device=tokens.device,
-        )
+        if args.rl_use_sequence_packing:
+            packed_seq_params = get_default_packed_seq_params(
+                seq_length=tokens.shape[1],
+                max_sequences_per_bin=args.rl_sequence_packing_max_sequences_per_bin,
+                device=tokens.device,
+            )
+        else:
+            cu_seqlens = torch.tensor([0, tokens.shape[1]], dtype=torch.int32, device=tokens.device)
+            packed_seq_params = PackedSeqParams(
+                qkv_format='thd',
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_kv=cu_seqlens,
+                max_seqlen_q=tokens.shape[1],
+                max_seqlen_kv=tokens.shape[1],
+                total_tokens=tokens.shape[1],
+            )
 
     # Clear RoPE cache to avoid inference tensor errors
     try:
@@ -369,14 +387,16 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
 
 if __name__ == "__main__":
 
+    from megatron.inference.utils import add_inference_args
+
     # Temporary for transition to core datasets
     train_valid_test_datasets_provider.is_distributed = True
 
     def _model_builder(
         args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None
     ):
-        if getattr(args, "is_hybrid_model", False):
-            return mamba_builder(
+        if is_hybrid_model(args):
+            return hybrid_builder(
                 args,
                 pre_process,
                 post_process,
@@ -394,10 +414,12 @@ if __name__ == "__main__":
                 pg_collection=pg_collection,
             )
 
+    args = parse_and_validate_args(extra_args_provider=add_inference_args, args_defaults={})
+    full_config = pretrain_cfg_container_from_args(args)
     pretrain(
+        full_config,
         None,  # we don't need to build any datasets for RL training
         partial(model_provider, _model_builder),
         ModelType.encoder_or_decoder,
         forward_step,
-        args_defaults={},
     )

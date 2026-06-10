@@ -1,8 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import warnings
-from dataclasses import dataclass
-from typing import Callable, ContextManager, Optional
+from dataclasses import dataclass, field
+from typing import Callable, ContextManager, Literal, Optional
 
 import torch
 
@@ -23,7 +23,7 @@ class ModelParallelConfig:
     tensor_model_parallel_size: int = 1
     """Intra-layer model parallelism. Splits tensors across GPU ranks."""
 
-    pipeline_model_parallel_comm_backend: Optional[str] = None
+    pipeline_model_parallel_comm_backend: Optional[Literal["nccl", "ucc"]] = None
     """Configuring backend option of pipeline parallel communication (e.g., nccl, ucc)
        If None, the default backend will be used.
     """
@@ -62,36 +62,52 @@ class ModelParallelConfig:
     can handle without overflowing the memory. Typically, a good starting point is to set this
     to maximum sequence length / context parallel size.
     This is used to calculate the number and length of sub-samples assigned to 
-    each rank when using hybrid_context_parallel.
+    each rank when sequence_packing_scheduler is not None.
     """
 
-    hybrid_context_parallel: bool = False
+    dynamic_context_parallel: bool = False
     """
-    If true, enables hybrid context parallel. This is used to balance the workload of 
+    If true, enables dynamic context parallel. This is used to balance the workload of 
     each CP rank when we use packed samples with variable sequence lengths.
-    Please set max_seqlen_per_dp_cp_rank when using hybrid_context_parallel.
+    Dynamic CP forms variable-sized CP groups from the DPxCP ranks dynamically.
+    Please set max_seqlen_per_dp_cp_rank.
+    """
+
+    min_dynamic_context_parallel_size: int = 1
+    """Minimum CP group size for dynamic context parallel. Default 1 (no CP).
+    The maximum is dp_size * context_parallel_size (the full DPxCP group)."""
+
+    hybrid_context_parallel: bool = False
+    """Deprecated. Use ``dynamic_context_parallel`` instead."""
+
+    sequence_packing_scheduler: Optional[Literal['dp_balanced', 'default_dynamic_cp']] = None
+    """
+    Scheduler for sequence packing and dynamic context parallel.
+    dp_balanced: DP-balanced scheduler for sequence packing.
+    default_dynamic_cp: Dynamic-CP scheduler for packed sequence balancing.
     """
 
     expert_model_parallel_size: int = 1
     """Distributes Moe Experts across sub data parallel dimension."""
 
     expert_tensor_parallel_size: Optional[int] = None
-    """Intra-layer tensor model parallelsm for expert layer. Splits tensors across GPU ranks."""
-
-    moe_extended_tp: bool = False
-    """NOTE: Deprecated from MCore v0.10. This flag is ignored.
-      Its functionality is replaced by expert_tensor_parallel_size.
+    """Intra-layer tensor model parallelism for expert layer. Splits tensors across GPU ranks.
+       Default is None, which will be set to the value of tensor_model_parallel_size.
     """
 
     ###################
     # Initialization
     ###################
-    perform_initialization: bool = True
-    """If true, weights are initialized. This option can be useful when you know you are going to
+    perform_initialization: bool = field(
+        default=True, metadata={"argparse_meta": {"arg_names": ["--no-initialization"]}}
+    )
+    """Controls weights initialization. This option can be useful when you know you are going to
        load values from a checkpoint.
     """
 
-    use_cpu_initialization: bool = False
+    use_cpu_initialization: bool = field(
+        default=False, metadata={"argparse_meta": {"default": None}}
+    )
     """When set to False, we initialize the weights directly on the GPU. CPU initialization is the
        same regardless of tensor model parallelism, but GPU initialization is not. Transferring
        weights from CPU to GPU can take a significant amount of time for large models.
@@ -121,6 +137,12 @@ class ModelParallelConfig:
     grad_scale_func: Optional[Callable] = None
     """If using loss scaling, this function should take the loss and return the scaled loss. If
        None, no function is called on the loss.
+    """
+
+    mtp_grad_scale_func: Optional[Callable] = None
+    """If using loss scaling for MTP (Multi-Token Prediction), this function should return the
+       scalar or size-1 scale value for MTP loss. The value is converted to the output tensor
+       device. If None, falls back to grad_scale_func with torch.ones(1).
     """
 
     no_sync_func: Optional[Callable] = None
@@ -170,11 +192,11 @@ class ModelParallelConfig:
        must turn off gradient accumulation fusion.
     """
 
-    async_tensor_model_parallel_allreduce: bool = False
-    """NOTE: Deprecated. This flag is ignored."""
-
-    use_te_rng_tracker: bool = False
+    use_te_rng_tracker: bool = field(
+        default=False, metadata={"argparse_meta": {"arg_names": ["--te-rng-tracker"]}}
+    )
     """If true, uses RNG state tracker in TransformerEngine if exists.
+    Required for CUDA graphs support.
     """
 
     tp_comm_overlap: bool = False
@@ -184,22 +206,22 @@ class ModelParallelConfig:
     """
 
     tp_comm_bulk_wgrad: bool = True
-    """If true, allows All-Gather overlap with Bprop activation gradient GEMM. Don't care if
+    """Controls All-Gather overlap with Bprop activation gradient GEMM. Don't care if
        tp_comm_overlap is False.
     """
 
     tp_comm_bulk_dgrad: bool = True
-    """If true, allows Reduce-Scatter overlap with Bprop weight gradient GEMM. Don't care if
+    """Controls Reduce-Scatter overlap with Bprop weight gradient GEMM. Don't care if
        tp_comm_overlap is False.
     """
 
     tp_comm_overlap_ag: bool = True
-    """If true, allows All-Gather overlap with GEMM by pipelining the GEMM and All-Gather.
+    """Controls All-Gather overlap with GEMM by pipelining the GEMM and All-Gather.
        Don't care if tp_comm_overlap is False.
     """
 
     tp_comm_overlap_rs: bool = True
-    """If true, allows Reduce-Scatter overlap with GEMM by pipelining the GEMM and Reduce-Scatter.
+    """Controls Reduce-Scatter overlap with GEMM by pipelining the GEMM and Reduce-Scatter.
        Don't care if tp_comm_overlap is False.
     """
 
@@ -210,7 +232,7 @@ class ModelParallelConfig:
 
     tp_comm_split_ag: bool = True
     """Deprecated from TransformerEngine v1.6.0.
-       If true, allows All-Gather overlap with Fprop GEMM by pipelining the GEMM and All-Gather
+       Controls All-Gather overlap with Fprop GEMM by pipelining the GEMM and All-Gather
        splits. Don't care if tp_comm_overlap is False.
     """
 
@@ -222,7 +244,7 @@ class ModelParallelConfig:
 
     tp_comm_split_rs: bool = True
     """Deprecated from TransformerEngine v1.6.0.
-       If true, allows Reduce-Scatter overlap with Fprop GEMM by pipelining the GEMM and
+       Controls Reduce-Scatter overlap with Fprop GEMM by pipelining the GEMM and
        Reduce-Scatter splits. Don't care if tp_comm_overlap is False.
     """
 
@@ -237,9 +259,14 @@ class ModelParallelConfig:
        Defaults to False.
     """
 
-    cross_entropy_fusion_impl: str = 'native'
-    """If 'native', MCore based CE loss fusion is used, if 'te', Parallel CE loss
-       from Transformer Engine library is used. Defaults to 'native'.
+    cross_entropy_fusion_impl: Literal['native', 'te', 'linear'] = 'native'
+    """
+    Specifies the implementation of cross-entropy loss fusion.
+
+    Options:
+    - 'native': Uses MCore-based cross-entropy loss fusion (default).
+    - 'te': Uses the parallel cross-entropy loss implementation from the Transformer Engine library.
+    - 'linear': Uses a linear-cross-entropy fusion approach.
     """
 
     tp_comm_overlap_disable_qkv: bool = False
@@ -252,10 +279,8 @@ class ModelParallelConfig:
        If true, the AllGather -> Gemm overlap for FC1 layer of MLP gets disabled
     """
 
-    tp_comm_bootstrap_backend: str = 'nccl'
-    """
-       Set the bootstrapping backend out of 'nccl', 'mpi', and 'gloo'
-    """
+    tp_comm_bootstrap_backend: Literal['nccl', 'mpi', 'gloo'] = 'nccl'
+    """Set the bootstrapping backend of Tensor parallel communications."""
 
     overlap_moe_expert_parallel_comm: bool = False
     """Overlap EP A2A communications with independent computations of different micro-batches
@@ -264,6 +289,15 @@ class ModelParallelConfig:
 
     delay_wgrad_compute: bool = False
     """Delay the weight gradient computation to improve batch-level communication overlapping"""
+
+    overlap_dispatch_backward_with_experts_wgrad: bool = False
+    """Delay the weight gradient computation for TE Grouped GEMM MoE experts.
+    When enabled with FSDP, the expert weight gradients are computed on a separate
+    CUDA stream after the data gradients finish, allowing overlap of wgrad compute
+    with EP A2A communication. The FSDP gradient reduce-scatter for
+    expert parameters is deferred until the delayed wgrad computation completes.
+    This requires transformer_engine with GroupedLinear support (TE >= 2.3.0).
+    """
 
     ep_overlap_early_attn_memory_release: bool = False
     """Enable early memory release of attention activations during EP overlap.
@@ -327,13 +361,21 @@ class ModelParallelConfig:
        Defaults to 0, which means all micro-batches are deferred.
     """
 
-    overlap_p2p_comm_warmup_flush: bool = False
+    overlap_p2p_comm_warmup_flush: bool = field(
+        default=False,
+        metadata={"argparse_meta": {"arg_names": ["--overlap-p2p-communication-warmup-flush"]}},
+    )
     """If true, overlap communication and computation in warm up and flush phase.
        Only valid when overlap_p2p_comm is True and batch_p2p_comm is False. 
        Defaults to False.
     """
 
-    microbatch_group_size_per_vp_stage: Optional[int] = None
+    microbatch_group_size_per_vp_stage: Optional[int] = field(
+        default=None,
+        metadata={
+            "argparse_meta": {"arg_names": ["--microbatch-group-size-per-virtual-pipeline-stage"]}
+        },
+    )
     """This value specifies the number of micro-batches that are executed 
        at a time for a given virtual stage (both forward and backward).
        Default (in __post_init__() method below) to pipeline_parallel_size 
@@ -377,11 +419,19 @@ class ModelParallelConfig:
     cpu_offloading_double_buffering: bool = False
     """If True, enables double buffering across layers while reloading activations from CPU."""
 
+    cpu_offloading_retain_pinned_cpu_buffers: bool = False
+    """If True, the pinned CPU buffers are retained after offloading and reused for the
+       next iteration. It is useful for cuda graphs capture.
+    """
+
     ###################
     # Timing
     ###################
-    barrier_with_L1_time: bool = True
-    """If true, use barrier with level 1 time measurements. It is up to the user to make sure
+    barrier_with_L1_time: bool = field(
+        default=True,
+        metadata={"argparse_meta": {"arg_names": ["--no-barrier-with-level-1-timing"]}},
+    )
+    """Controls barrier with level 1 time measurements. It is up to the user to make sure
        calling barrier with their timers will not result in hangs. This can happen if for example
        the user adds a level 1 timer that is not called by all ranks.
     """
@@ -391,6 +441,34 @@ class ModelParallelConfig:
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
         details.
         """
+        if self.hybrid_context_parallel:
+            warnings.warn(
+                "hybrid_context_parallel is deprecated and will be removed in a future release. "
+                "Use dynamic_context_parallel instead.",
+                DeprecationWarning,
+            )
+            if self.dynamic_context_parallel:
+                raise ValueError(
+                    "Cannot set both hybrid_context_parallel and dynamic_context_parallel. "
+                    "Please use dynamic_context_parallel only."
+                )
+            self.dynamic_context_parallel = True
+
+        if self.dynamic_context_parallel:
+            if self.sequence_packing_scheduler is None:
+                self.sequence_packing_scheduler = 'default_dynamic_cp'
+            if self.sequence_packing_scheduler != 'default_dynamic_cp':
+                raise ValueError(
+                    'Dynamic context parallelism requires '
+                    'sequence_packing_scheduler=default_dynamic_cp'
+                )
+
+            if self.min_dynamic_context_parallel_size < 1:
+                raise ValueError(
+                    f"min_dynamic_context_parallel_size must be >= 1, "
+                    f"got {self.min_dynamic_context_parallel_size}"
+                )
+
         if self.sequence_parallel:
             if self.tensor_model_parallel_size <= 1:
                 raise ValueError("Cannot use sequence parallelism without tensor parallelism")
@@ -406,6 +484,15 @@ class ModelParallelConfig:
 
         if self.autocast_dtype is None:
             self.autocast_dtype = self.params_dtype
+
+        if self.cross_entropy_loss_fusion and self.cross_entropy_fusion_impl == 'te':
+            warnings.warn(
+                "Transformer Engine cross entropy loss fusion has known stability issues. "
+                "Megatron-LM training args validation rejects this combination by default. "
+                "Use cross_entropy_fusion_impl='native', or disable cross_entropy_loss_fusion.",
+                UserWarning,
+                stacklevel=2,
+            )
 
         if self.defer_embedding_wgrad_compute and self.pipeline_model_parallel_size == 1:
             raise ValueError(

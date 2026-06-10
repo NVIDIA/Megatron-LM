@@ -1,42 +1,16 @@
 # Megatron Core MoE
 
-Megatron Core MoE is a production-ready framework for training large-scale Mixture-of-Experts models, providing the foundational architecture, performance optimizations, and best practices that guide MoE framework development across the industry.
-
-## Table of Contents
-
-- [What's New](#whats-new)
-- [Overview of MCore MoE Supported Features and Architectures](#overview-of-mcore-moe-supported-features-and-architectures)
-- [Quick Start Guide](#quick-start-guide)
-  - [Basic MoE Training](#basic-moe-training-in-megatron-lm)
-  - [Pre-defined Configs for Popular Models](#use-the-pre-defined-config-to-train-the-popular-moe-models)
-  - [General Performance Tips](#general-performance-tips)
-- [Best Practices for High Performance MoE Training](#best-practices-to-achieve-high-performance-on-moe-training)
-  - [Step 1: Find Feasible Parallel Mapping](#step-1-find-the-feasible-parallel-mapping-under-the-memory-capacity-of-the-gpu)
-  - [Step 2: Select Optimal Parallelism Strategy](#step-2-select-optimal-parallelism-strategy)
-  - [Step 3: Enable Performance Features](#step-3-enable-performance-features-based-on-profiling-bottlenecks)
-- [Feature Documentation](#feature-documentation)
-  - [Router and Load Balancing](#router-and-load-balancing)
-  - [Token Dispatching](#token-dispatching)
-  - [Upcycling](#upcycling)
-- [Training Optimizations](#training-optimizations)
-  - [MoE Parallel Folding](#moe-parallel-folding)
-  - [Memory Optimization](#memory-optimization)
-  - [Communication Optimization](#communication-optimization)
-  - [Compute Optimization](#compute-optimization)
-  - [FP8 Training](#fp8-training)
-  - [CUDA Graph](#cuda-graph)
-- [MoE Arguments Reference](#moe-arguments-reference)
-- [Examples](#examples)
-- [Contributing](#contributing)
-- [Citation](#citation)
+Megatron Core MoE is a production-ready stack for training large-scale Mixture-of-Experts models, built on the Megatron Core framework. It provides foundational architecture, performance optimizations, and best practices that guide MoE development across the industry.
 
 ## What's New
-For latest features and architectures, please refer to the [MCore dev roadmap](https://github.com/NVIDIA/Megatron-LM/issues/1729).
+For the latest features and architectures, please refer to the [MCore dev roadmap](https://github.com/NVIDIA/Megatron-LM/issues/1729).
 
 ### 🔥 [MCore dev] (2026/01)
-- 🚀 Pipeline-aware fine-grained activation offloading 
+- 🚀 Pipeline-aware fine-grained activation offloading
 - 🚀 Qwen3-Next model support
+- 🚀 DeepSeek-V3.2 model support
 - 🚀 Muon and Layer-wise distributed optimizer
+- 🚀 CUDA Graph support with fine-grained scopes
 
 ### 🔥 [MCore v0.15] (2025/11)
 - 🚀 Add HybridEP backend to Flex Dispatcher(GB200, B200, H100 supported)
@@ -118,9 +92,9 @@ For latest features and architectures, please refer to the [MCore dev roadmap](h
 To train a top-2 MoE model with 8 experts and auxiliary loss, add the following arguments to your megatron training script:
 
 ```bash
-## Set MoE Hidden site
+## Set MoE hidden size
 --num-experts 8
---moe-shared-expert-intermediate-size: 2048
+--moe-shared-expert-intermediate-size 2048
 ## Set router config
 --moe-router-load-balancing-type aux_loss
 --moe-router-topk 2
@@ -148,7 +122,7 @@ The following flags are general performance flags that can help to achieve highe
 --moe-router-fusion
 --moe-permute-fusion
 --cross-entropy-loss-fusion
---cross-entropy-fusion-impl te
+--cross-entropy-fusion-impl native
 
 ## Communication optimization
 --use-distributed-optimizer
@@ -285,7 +259,7 @@ After establishing a working parallel configuration, profile your training to id
 | Optimization | Config |
 |--------------|--------|
 | Disable Python GC | `--manual-gc --manual-gc-interval 100` |
-| Enable CUDA Graphs | `--cuda-graph-impl transformer_engine --cuda-graph-scope attn moe_router moe_preprocess` |
+| Enable CUDA Graphs | `--cuda-graph-impl transformer_engine --cuda-graph-modules attn moe_router moe_preprocess` |
 | Reduce kernel launches | Decrease TP size or increase micro-batch size |
 
 #### Computation Bottleneck
@@ -386,7 +360,7 @@ Memory optimization is critical for large-scale MoE training, as MoE models main
 | Optimization | Description | Config |
 |--------------|-------------|--------|
 | **Fine-grained Recomputation** | Selectively recomputes specific modules (e.g., `mla_up_proj`, `layernorm`, `moe_act`) instead of full layers | `--recompute-granularity selective --recompute-modules mla_up_proj layernorm moe_act` |
-| **Fine-grained Activation Offloading** | Offloads activations to CPU memory, overlapping D2H/H2D transfers with computation | See `docs/source/api-guide/fine_grained_activation_offloading.md` |
+| **Fine-grained Activation Offloading** | Offloads activations to CPU memory, overlapping D2H/H2D transfers with computation | See `docs/user-guide/features/fine_grained_activation_offloading.md` |
 | **Precision-aware Optimizer** | Stores optimizer states (exp_avg, exp_avg_sq) in BF16 instead of FP32, reducing optimizer memory by 50% | `--use-precision-aware-optimizer --exp-avg-dtype bf16 --exp-avg-sq-dtype bf16` |
 | **Optimizer Offloading** | Offloads optimizer states to CPU memory. | `--optimizer-cpu-offload` |
 
@@ -415,7 +389,7 @@ Unlike recomputation (which trades compute for memory), offloading trades **GPU-
 --offload-modules expert_fc1 moe_act # Choices: attn_norm, core_attn, attn_proj, mlp_norm, expert_fc1, moe_act
 ```
 
-For more details, see `docs/source/api-guide/fine_grained_activation_offloading.md`
+For more details, see `docs/user-guide/features/fine_grained_activation_offloading.md`
 
 ### Communication Optimization
 
@@ -480,9 +454,11 @@ FP8 training provides benefits across all three performance walls:
 
 | Wall | FP8 Benefit | Impact |
 |------|-------------|--------|
-| **Compute** | Faster Tensor Core GEMMs | FP8 ops on Hopper/Blackwell are faster than BF16 |
 | **Memory** | 50% activation reduction | Stores linear layer inputs in FP8 instead of BF16 |
+| **Memory** | Eliminate BF16 weight copies | Native FP8 casts directly from FP32 to FP8 |
+| **Communication** | 50% EP dispatch volume | Dispatches tokens in FP8 instead of BF16 |
 | **Communication** | 50% parameter all-gather | With FP8 primary weights (except MXFP8) |
+| **Compute** | Faster Tensor Core GEMMs | FP8 ops on Hopper/Blackwell are faster than BF16 |
 
 #### FP8 Recipes
 
@@ -523,14 +499,19 @@ FP8 training provides benefits across all three performance walls:
 
 
 ### CUDA Graph
-CUDA Graph functionality can be enabled through the `--cuda-graph-impl` option. There are two implementations:
+CUDA Graph functionality can be enabled through the `--cuda-graph-impl` option. There are three implementations:
 
-1. `--cuda-graph-impl=local`: Captures cuda graphs using the MCore-internal cuda graph manager.
-2. `--cuda-graph-impl=transformer_engine`: Captures cuda graphs using the TE `make_graphed_callables()` interface.
+1. `--cuda-graph-impl=local`: Captures per-layer cuda graphs using the MCore-internal cuda graph manager.
+2. `--cuda-graph-impl=transformer_engine`: Captures per-layer cuda graphs using the TE `make_graphed_callables()` interface.
+3. `--cuda-graph-impl=full_iteration`: Captures the whole training/evaluation forward-backward iteration as a single cuda graph.
+
+For inference, CUDA graph scope is controlled separately with
+`--inference-cuda-graph-scope=layer|block` together with
+`--cuda-graph-impl=local`.
 
 To use `--cuda-graph-impl=transformer_engine`, the user should call related methods `TECudaGraphHelper.create_cudagraphs()` and `TECudaGraphHelper.cuda_graph_set_manual_hooks()` in the training script. Please refer to the usage in `megatron/training/training.py`.
 
-For MoE models, certain configurations may prevent CUDA Graph capture of MoE layers. Specifically, when `--moe-expert-capacity-factor` and `--moe-pad-expert-input-to-capacity` are not set, the resulting dynamic shapes make MoE layers uncapturable. In such cases, you can still leverage CUDA Graphs for the attention layers (operations in `TransformerLayer._forward_attention()`) by setting `--cuda-graph-scope=attn`, while leaving the MoE layers (operations in `TransformerLayer._forward_mlp()`) unmodified. See the argument description for more usage of `--cuda-graph-scope`.
+For MoE models, certain configurations may prevent CUDA Graph capture of MoE layers. Specifically, when `--moe-expert-capacity-factor` and `--moe-pad-expert-input-to-capacity` are not set, the resulting dynamic shapes make MoE layers uncapturable. In such cases, you can still leverage CUDA Graphs for the attention layers (operations in `TransformerLayer._forward_attention()`) by setting `--cuda-graph-modules=attn`, while leaving the MoE layers (operations in `TransformerLayer._forward_mlp()`) unmodified. See the argument description for more usage of `--cuda-graph-modules`.
 
 ## MoE Arguments Reference
 ### Core Arguments
@@ -539,7 +520,7 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 | --num-experts | Number of Experts in MoE | None |
 | --expert-model-parallel-size | Degree of expert model parallelism | 1 |
 | --moe-ffn-hidden-size | MoE FFN hidden size | FFN hidden size of the dense model |
-| --expert-tensor-parallel-size | Expert layer tensor parallelism | Same as TP(Recommeded to set to 1 for fine-grained MoE models) |
+| --expert-tensor-parallel-size | Expert layer tensor parallelism | Same as TP(Recommended to set to 1 for fine-grained MoE models) |
 | --moe-layer-freq | MoE layer frequency pattern | 1 |
 
 ### Router Arguments
@@ -711,37 +692,18 @@ torchrun ${DISTRIBUTED_ARGS[@]} pretrain_gpt.py \
 
 ## Contributing
 
-We welcome contributions! Please see [CONTRIBUTING.md](../../../../CONTRIBUTING.md) for guidelines.
+We welcome contributions! Please see [CONTRIBUTING.md](https://github.com/NVIDIA/Megatron-LM/blob/main/CONTRIBUTING.md) for guidelines.
 
 ## Support
 
 - GitHub Issues: [Report bugs or request features](https://github.com/NVIDIA/Megatron-LM/issues)
 - Documentation: [Full documentation](https://docs.nvidia.com/megatron-core/developer-guide/latest/index.html)
+- Performance: [Latest MoE training performance summary](https://docs.nvidia.com/nemo/megatron-bridge/latest/performance-summary.html)
 
-## Tuning Guide of Parallel Mappings
-For a specific model, the best parallel mapping varies based on the model architecture, trained sequence length, and the hardware platform.
-Here we provide some general rules to get better performance:
-1. Keep the model parallelism size as small as possible.
-    - For large language models, model parallelism is often required to prevent OOM, but it adds communication overhead.
-    - With distributed optimizer, master weights and optimizer states are sharded across DP ranks with slight communication overhead.
-    - Reduce model parallelism size and increase data parallelism size when there is available GPU memory.
-2. Ensure the EPxTP communication stays within the NVLink domain.
-    - Communications of EP and TP should remain within the NVLink domain as much as possible, as both are communication-intensive.
-    - If the model is too large and requires scaling across multiple nodes, consider PP before TP and EP. See item 3 for details.
-3. Use Pipeline Parallelism to scale the model further.
-    - Enable Virtual Pipeline Parallelism (VPP) to reduce PP bubbles when PP size >= 2 by setting `num_layers_per_virtual_pipeline_stage`.
-    - VPP size tuning: the legal values of vpp_size are all common divisors of num_layers/pp_size. For example, num_layers=24 and pp_size=4 gives vpp_size in {1, 2, 3, 6}.
-4. Prefer EP over TP for the expert layer when possible:
-    - TP saves more memory than EP, but EP can achieve better GEMM efficiency and less communication overhead than TP.
-    - If EP size increases to the number of experts, local token permutation/un-permutation for expert computation is omitted.
-    - In practice, EP8TP1 is better than EP4TP2 for 8x7B.
-5. Enable Context Parallelism for long-context training.
-    - The efficiency of CP largely depends on whether its communication can be overlapped with computation.
-    - Empirically, use CP when sequence length >= 8K.
 
 ## Citation
 
-If you use Megatron-Core MoE in your research, please cite:
+If you use Megatron Core MoE in your research, please cite:
 
 ```bibtex
 

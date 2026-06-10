@@ -10,7 +10,9 @@ import torch
 # pylint: disable=unused-import
 from torch.utils import cpp_extension
 
-from megatron.core.utils import is_torch_min_version
+from megatron.core.utils import is_torch_min_version, log_single_rank
+
+logger = logging.getLogger(__name__)
 
 # MCORE NCCL Allocator copies and modifies the APEX NCCL allocator.
 # The original APEX NCCL allocator is available at:
@@ -153,7 +155,7 @@ def init() -> None:
     # Disables the use of the tensor register allocator hook
     os.environ["TORCH_NCCL_USE_TENSOR_REGISTER_ALLOCATOR_HOOK"] = "0"
     _build_nccl_allocator()
-    logging.info(f"[MCORE][NCCL_ALLOCATOR] Initialized NCCL Allocator")
+    log_single_rank(logger, logging.INFO, "[MCORE][NCCL_ALLOCATOR] Initialized NCCL Allocator")
 
 
 # register_mem_pool/deregister_mem_pool are used for manual (de)registration of the memory pool.
@@ -169,9 +171,11 @@ def register_mem_pool(pool, group, symmetric=True):
             backend.register_mem_pool(pool, symm=symmetric)
         except TypeError:
             # Older PyTorch/APIs without 'symm' keyword.
-            logging.warning(
-                f"[MCORE][NCCL_ALLOCATOR] Failed in symmetric registration."
-                f"Falling back to registration api without 'symm' keyword!!"
+            log_single_rank(
+                logger,
+                logging.WARNING,
+                "[MCORE][NCCL_ALLOCATOR] Failed in symmetric registration. "
+                "Falling back to registration api without 'symm' keyword!!",
             )
             backend.register_mem_pool(pool)
     else:
@@ -230,9 +234,11 @@ class nccl_mem:
                     backend.deregister_mem_pool(self.pool)
                 except RuntimeError:
                     desc = getattr(self.group, "group_desc", None)
-                    logging.warning(
+                    log_single_rank(
+                        logger,
+                        logging.WARNING,
                         f"[MCORE][NCCL_ALLOCATOR] Failed to deregister mem pool from"
-                        f"{repr(self.group)}({desc}) group!!"
+                        f"{repr(self.group)}({desc}) group!!",
                     )
 
     def __exit__(self, *args):
@@ -246,18 +252,22 @@ class nccl_mem:
                         backend.register_mem_pool(self.pool, symm=self.symmetric)
                     except TypeError:
                         # Older PyTorch/APIs without 'symm' keyword.
-                        logging.warning(
-                            f"[MCORE][NCCL_ALLOCATOR] Failed in symmetric registration."
-                            f"Falling back to non-symmetric registration!!"
+                        log_single_rank(
+                            logger,
+                            logging.WARNING,
+                            "[MCORE][NCCL_ALLOCATOR] Failed in symmetric registration. "
+                            "Falling back to non-symmetric registration!!",
                         )
                         backend.register_mem_pool(self.pool)
                 else:
                     backend.register_mem_pool(self.pool)
             except RuntimeError:
                 desc = getattr(self.group, "group_desc", None)
-                logging.warning(
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
                     f"[MCORE][NCCL_ALLOCATOR] Failed to register mem pool to"
-                    f"{repr(self.group)}({desc}) group!!"
+                    f"{repr(self.group)}({desc}) group!!",
                 )
 
         self.mem_context.__exit__(*args)
@@ -315,9 +325,11 @@ class MultiGroupMemPoolAllocator:
                     backend.deregister_mem_pool(self.pool)
                 except RuntimeError:
                     desc = getattr(group, "group_desc", None)
-                    logging.warning(
+                    log_single_rank(
+                        logger,
+                        logging.WARNING,
                         f"[MCORE][MultiGroupMemPoolAllocator] Failed to deregister mem pool from"
-                        f"{repr(group)}({desc}) group!!"
+                        f"{repr(group)}({desc}) group!!",
                     )
 
     def __exit__(self, *args):
@@ -331,18 +343,23 @@ class MultiGroupMemPoolAllocator:
                         backend.register_mem_pool(self.pool, symm=self.symmetric)
                     except TypeError:
                         # Older PyTorch/APIs without 'symm' keyword.
-                        logging.warning(
-                            f"[MCORE][MultiGroupMemPoolAllocator] Failed in symmetric registration."
-                            f"Falling back to non-symmetric registration!!"
+                        log_single_rank(
+                            logger,
+                            logging.WARNING,
+                            "[MCORE][MultiGroupMemPoolAllocator] "
+                            "Failed in symmetric registration. "
+                            "Falling back to non-symmetric registration!!",
                         )
                         backend.register_mem_pool(self.pool)
                 else:
                     backend.register_mem_pool(self.pool)
             except RuntimeError:
                 desc = getattr(group, "group_desc", None)
-                logging.warning(
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
                     f"[MCORE][MultiGroupMemPoolAllocator] Failed to register mem pool to"
-                    f"{repr(group)}({desc}) group!!"
+                    f"{repr(group)}({desc}) group!!",
                 )
         self.mem_context.__exit__(*args)
 

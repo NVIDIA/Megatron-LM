@@ -74,6 +74,29 @@ class RouterReplay:
         """Clear the global list of router replay instances to prevent memory leaks."""
         RouterReplay.global_router_replay_instances.clear()
 
+    @staticmethod
+    def set_global_static_buffers(static_buffer: torch.Tensor):
+        """Sets static buffers for all router instances from a combined buffer.
+
+        Args:
+            static_buffer: Tensor of shape [max_tokens, num_layers, topk].
+                          Each layer's RouterReplay gets a slice [:, layer_idx, :].
+        """
+        num_layers = len(RouterReplay.global_router_replay_instances)
+        assert static_buffer.shape[1] == num_layers, (
+            f"Buffer has {static_buffer.shape[1]} layers but there are "
+            f"{num_layers} RouterReplay instances."
+        )
+        for layer_idx, router_instance in enumerate(RouterReplay.global_router_replay_instances):
+            # Each layer gets a view of shape [max_tokens, topk]
+            router_instance.set_static_buffer(static_buffer[:, layer_idx, :])
+
+    @staticmethod
+    def clear_global_static_buffers():
+        """Clears static buffers from all router instances."""
+        for router in RouterReplay.global_router_replay_instances:
+            router.clear_static_buffer()
+
     def __init__(self):
         """Initializes a RouterReplay instance for a specific layer."""
         self.target_topk_idx: Optional[torch.Tensor] = None  # Target topk indices for replay
@@ -84,6 +107,7 @@ class RouterReplay:
         self.replay_backward_list: List[torch.Tensor] = (
             []
         )  # List of tensors for backward pass replay
+        self.static_buffer: Optional[torch.Tensor] = None  # Static buffer for CUDA graph
         RouterReplay.global_router_replay_instances.append(self)
 
     def set_target_indices(self, topk_indices: torch.Tensor):
@@ -94,10 +118,6 @@ class RouterReplay:
     def get_recorded_indices(self) -> Optional[torch.Tensor]:
         """Returns the recorded topk indices."""
         return self.recorded_topk_idx
-
-    def record_indices(self, topk_indices: torch.Tensor):
-        """Records the topk indices."""
-        self.recorded_topk_idx = topk_indices
 
     def clear_indices(self):
         """Clears the recorded and target topk indices."""
@@ -159,3 +179,29 @@ class RouterReplay:
             return probs, top_indices
         else:
             return default_compute_topk(scores, topk, num_groups, group_topk)
+
+    def set_static_buffer(self, buffer: torch.Tensor):
+        """Sets a static buffer for CUDA graph compatible recording.
+
+        Args:
+            buffer: Tensor of shape [max_tokens, topk] to copy routing indices into.
+        """
+        self.static_buffer = buffer
+
+    def clear_static_buffer(self):
+        """Clears the static buffer."""
+        self.static_buffer = None
+
+    def record_indices(self, topk_indices: torch.Tensor):
+        """Records the topk indices.
+
+        If a static buffer is set (for CUDA graph compatibility), copies into it.
+        Otherwise, just stores the tensor reference.
+        """
+        if self.static_buffer is not None:
+            # Copy into static buffer for CUDA graph compatibility.
+            num_tokens = topk_indices.shape[0]
+            self.static_buffer[:num_tokens].copy_(topk_indices)
+            self.recorded_topk_idx = self.static_buffer[:num_tokens]
+        else:
+            self.recorded_topk_idx = topk_indices

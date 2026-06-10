@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 
 
 def add_modelopt_args(parser):
@@ -10,8 +10,9 @@ def add_modelopt_args(parser):
         "--export-model-type",
         type=str,
         default="GPTModel",
-        choices=["GPTModel", "MambaModel"],
-        help="Model type to use in model_provider.",
+        choices=["GPTModel", "HybridModel", "MambaModel"],
+        help='Model type to use in model_provider. Use "HybridModel" for hybrid models '
+        '(formerly MambaModel). "MambaModel" is accepted for backward compatibility but deprecated.',
     )
     group.add_argument(
         "--export-legacy-megatron",
@@ -21,7 +22,17 @@ def add_modelopt_args(parser):
     group.add_argument(
         "--export-te-mcore-model",
         action="store_true",
-        help="Export a megatron-core transformer-engine checkpoint.",
+        help="Indicate the source checkpoint uses the fused Transformer-Engine mcore layer spec "
+        "(where layernorms are fused into linear layers). Enables state_dict key remapping so the "
+        "TE checkpoint can be loaded into the local ModelOpt spec for PTQ/export, and saved back "
+        "in TE-compatible format. Mutually exclusive with --export-default-te-spec.",
+    )
+    group.add_argument(
+        "--export-default-te-spec",
+        action="store_true",
+        help="Use the full Transformer-Engine layer spec for model building. "
+        "This builds the model with TELayerNormColumnParallelLinear, TERowParallelLinear, "
+        "TEGroupedMLP, TEDotProductAttention, etc., matching the canonical TE specs.",
     )
     group.add_argument(
         "--export-force-local-attention",
@@ -51,23 +62,15 @@ def add_modelopt_args(parser):
     )
     # Knowledge Distillation
     group.add_argument(
-        '--export-kd-cfg',
+        '--export-kd-teacher-load',
         type=str,
-        default=None,
-        help='Path to distillation configuration yaml file.',
+        help='Path to checkpoint to load as distillation teacher. (Enables distillation mode automatically)',
     )
-
     group.add_argument(
-        '--teacher-model-config',
+        '--export-kd-teacher-model-config',
         type=str,
         default=None,
         help='Path to teacher model config for distillation. If not provided, defaults to ${export_kd_teacher_load}/model_config.yaml.',
-    )
-
-    group.add_argument(
-        '--export-kd-teacher-load',
-        type=str,
-        help='Path to checkpoint to load as distillation teacher.',
     )
     group.add_argument(
         '--export-kd-teacher-ckpt-format',
@@ -76,13 +79,22 @@ def add_modelopt_args(parser):
         choices=['torch', 'torch_dist', 'torch_dcp'],
         help="Checkpoint format of teacher model, if different from student's.",
     )
+    group.add_argument(
+        '--export-kd-cfg',
+        type=str,
+        default=None,
+        help='Path to distillation configuration yaml file, in order to use non-default settings.',
+    )
 
     # Finetuning
     group.add_argument(
         "--finetune-hf-dataset", type=str, default=None, help="HF dataset used for finetuning."
     )
     group.add_argument(
-        "--finetune-data-split", type=str, default="train", help="HF dataset split used for finetuning."
+        "--finetune-data-split",
+        type=str,
+        default="train",
+        help="HF dataset split used for finetuning.",
     )
 
     # Special model architecture option
@@ -116,7 +128,7 @@ def add_modelopt_args(parser):
         '--enable-gpt-oss',
         action="store_true",
         help='Enable GPT-OSS mode with YaRN RoPE configuration. When enabled, automatically '
-             'configures all YaRN parameters with GPT-OSS defaults.',
+        'configures all YaRN parameters with GPT-OSS defaults.',
     )
 
     return parser

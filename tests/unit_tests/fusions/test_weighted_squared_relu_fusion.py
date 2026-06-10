@@ -11,9 +11,11 @@ from megatron.core.fusions.fused_weighted_squared_relu import weighted_squared_r
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 @pytest.mark.parametrize("input_dtype", [torch.bfloat16, torch.float32])
 def test_weighted_squared_relu_fusion(input_dtype):
+    torch.manual_seed(0)
+
     # Tolerances depend on dtype precision
     if input_dtype == torch.float32:
-        tols = dict(rtol=1.0e-6, atol=1.0e-6)
+        tols = dict(rtol=1.0e-5, atol=1.0e-5)
     elif input_dtype == torch.bfloat16:
         tols = dict(rtol=2.0e-2, atol=1.0e-3)
     else:

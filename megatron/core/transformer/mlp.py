@@ -1,10 +1,10 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+from __future__ import annotations
 
-import gc
-import logging
 import warnings
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Optional, Protocol, cast
 
 import numpy as np
 import torch
@@ -23,9 +23,11 @@ from megatron.core.fusions.fused_bias_geglu import (
 )
 from megatron.core.fusions.fused_bias_gelu import bias_gelu_impl
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.utils import cat_with_oom_fallback, sharded_state_dict_default
+from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
     get_tensor_model_parallel_group_if_none,
     nvtx_range_pop,
@@ -40,10 +42,93 @@ except ImportError:
     HAVE_TE = False
 
 
-logger = logging.getLogger(__name__)
+class LinearFc1Interface(Protocol):
+    """Interface for linear_fc1 module in MLP."""
+
+    def forward(self, hidden_states: torch.Tensor, /) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Forward method for linear_fc1 module."""
+        ...
+
+    def backward_dw(self) -> None:
+        """Backward method for linear_fc1 module."""
+        ...
 
 
-# pylint: disable=missing-class-docstring
+class LinearFc1Builder(Protocol):
+    """Protocol describing how to build a linear_fc1 layer in MLP."""
+
+    def __call__(
+        self,
+        input_size: int,
+        output_size: int,
+        /,
+        *,
+        config: TransformerConfig,
+        init_method: Callable[[torch.Tensor], None],
+        gather_output: bool,
+        bias: bool,
+        skip_bias_add: bool,
+        is_expert: bool,
+        tp_comm_buffer_name: str | None,
+        tp_group: torch.distributed.ProcessGroup | None,
+        stride: int = 1,
+        name: str | None = None,
+    ) -> LinearFc1Interface:
+        """Builds a linear_fc1 layer for MLP."""
+        ...
+
+
+class TEActivationFunctionInterface(Protocol):
+    """Interface for activation_function module in MLP."""
+
+    def forward(self, input_: torch.Tensor, /) -> torch.Tensor:
+        """Forward method for activation_function module."""
+        ...
+
+
+class TEActivationFunctionBuilder(Protocol):
+    """Protocol for activation_function module in MLP."""
+
+    def __call__(self, *, config: TransformerConfig) -> TEActivationFunctionInterface:
+        """Builds an activation function module for MLP."""
+        ...
+
+
+class LinearFc2Interface(Protocol):
+    """Interface for linear_fc2 module in MLP."""
+
+    def forward(self, hidden_states: torch.Tensor, /) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Forward method for linear_fc2 module."""
+        ...
+
+    def backward_dw(self) -> None:
+        """Backward method for linear_fc2 module."""
+        ...
+
+
+class LinearFc2Builder(Protocol):
+    """Protocol describing how to build a linear_fc2 layer in MLP."""
+
+    def __call__(
+        self,
+        input_size: int,
+        output_size: int,
+        /,
+        *,
+        config: TransformerConfig,
+        init_method: Callable[[torch.Tensor], None],
+        bias: bool,
+        input_is_parallel: bool,
+        skip_bias_add: bool,
+        is_expert: bool,
+        tp_comm_buffer_name: str | None,
+        tp_group: torch.distributed.ProcessGroup | None,
+        name: str | None = None,
+    ) -> LinearFc2Interface:
+        """Builds a linear_fc2 layer for MLP."""
+        ...
+
+
 @dataclass
 class MLPSubmodules:
     """
@@ -51,9 +136,14 @@ class MLPSubmodules:
     including  linear fc1, activation function, linear fc2.
     """
 
-    linear_fc1: Union[ModuleSpec, type] = None
-    activation_func: Union[ModuleSpec, type] = None
-    linear_fc2: Union[ModuleSpec, type] = None
+    linear_fc1: LinearFc1Builder
+
+    linear_fc2: LinearFc2Builder
+
+    activation_func: TEActivationFunctionBuilder | None = None
+    """
+    Builder for an activation function module; only used if config.use_te_activation_func is True.
+    """
 
 
 class MLP(MegatronModule):
@@ -81,7 +171,12 @@ class MLP(MegatronModule):
         input_size: Optional[int] = None,
         ffn_hidden_size: Optional[int] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its paranet module
+        """
         super().__init__(config=config)
 
         self.config: TransformerConfig = config
@@ -98,7 +193,7 @@ class MLP(MegatronModule):
                 DeprecationWarning,
                 stacklevel=2,
             )
-            ffn_hidden_size = self.config.ffn_hidden_size
+            ffn_hidden_size = not_none(self.config.ffn_hidden_size)
 
         # If this is a gated linear unit we double the output width
         # see https://arxiv.org/pdf/2002.05202.pdf
@@ -107,6 +202,10 @@ class MLP(MegatronModule):
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
             fc1_stride = 2
+            if self.config.use_kitchen:
+                # Kitchen Linear doesn't support stride != 1.
+                # Weight resharding across TP sizes will have aforementioned problems.
+                fc1_stride = 1
         else:
             fc1_stride = 1
 
@@ -114,12 +213,11 @@ class MLP(MegatronModule):
         # shared_experts.
         use_latent_size = (self.config.moe_latent_size is not None) and is_expert
 
-        self.linear_fc1 = build_module(
-            submodules.linear_fc1,
-            self.input_size if not use_latent_size else self.config.moe_latent_size,
+        self.linear_fc1 = submodules.linear_fc1(
+            self.input_size if not use_latent_size else not_none(self.config.moe_latent_size),
             ffn_hidden_size,
             config=self.config,
-            init_method=self.config.init_method,
+            init_method=not_none(self.config.init_method),
             gather_output=False,
             bias=self.config.add_bias_linear,
             skip_bias_add=True,
@@ -127,32 +225,37 @@ class MLP(MegatronModule):
             tp_comm_buffer_name="fc1",
             tp_group=tp_group,
             stride=fc1_stride,
+            name=(name + ".linear_fc1") if name is not None else None,
         )
 
         if self.config.use_te_activation_func and not (submodules.activation_func is None):
-            self.activation_func = build_module(submodules.activation_func, config=self.config)
+            self.activation_func = apply_module(submodules.activation_func(config=self.config))
         else:
             self.activation_func = self.config.activation_func
 
-        self.linear_fc2 = build_module(
-            submodules.linear_fc2,
-            self.config.ffn_hidden_size,
-            self.config.hidden_size if not use_latent_size else self.config.moe_latent_size,
+        self.linear_fc2 = submodules.linear_fc2(
+            not_none(self.config.ffn_hidden_size),
+            not_none(
+                self.config.hidden_size if not use_latent_size else self.config.moe_latent_size
+            ),
             config=self.config,
-            init_method=self.config.output_layer_init_method,
+            init_method=not_none(self.config.output_layer_init_method),
             bias=self.config.add_bias_linear,
             input_is_parallel=True,
             skip_bias_add=True,
             is_expert=is_expert,
             tp_comm_buffer_name="fc2",
             tp_group=tp_group,
+            name=(name + ".linear_fc2") if name is not None else None,
         )
 
-    def forward(self, hidden_states, per_token_scale=None, **kwargs):
+    def forward(
+        self, hidden_states: torch.Tensor, per_token_scale: torch.Tensor | None = None, **kwargs
+    ):
         """Perform the forward pass through the MLP block."""
         # [s, b, 4 * h/p]
         nvtx_range_push(suffix="linear_fc1")
-        intermediate_parallel, bias_parallel = self.linear_fc1(hidden_states)
+        intermediate_parallel, bias_parallel = apply_module(self.linear_fc1)(hidden_states)
         nvtx_range_pop(suffix="linear_fc1")
 
         nvtx_range_push(suffix="activation")
@@ -204,6 +307,7 @@ class MLP(MegatronModule):
                         self.config.cpu_offloading
                         and self.config.cpu_offloading_activations
                         and HAVE_TE,
+                        self.config.activation_func_clamp_value,
                     )
                 else:
                     raise ValueError("Only support fusion of gelu and swiglu")
@@ -234,7 +338,9 @@ class MLP(MegatronModule):
         # [s, b, h]
         nvtx_range_push(suffix="linear_fc2")
 
-        output, output_bias = self.linear_fc2(intermediate_parallel)
+        output, output_bias = apply_module(self.linear_fc2)(
+            cast(torch.Tensor, intermediate_parallel)
+        )
         nvtx_range_pop(suffix="linear_fc2")
 
         if per_token_scale is not None and output_bias is not None:
@@ -253,7 +359,9 @@ class MLP(MegatronModule):
         sharded_state_dict = {}
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         for name, module in self._modules.items():
-            sub_sd = module.sharded_state_dict(f"{prefix}{name}.", sharded_offsets, metadata)
+            sub_sd = sharded_state_dict_default(
+                module, f"{prefix}{name}.", sharded_offsets, metadata
+            )
             if self.config.gated_linear_unit and name == "linear_fc1":
                 for k, v in sub_sd.items():
                     if k in (f"{prefix}{name}.weight", f"{prefix}{name}.bias"):
@@ -266,6 +374,33 @@ class MLP(MegatronModule):
     def backward_dw(self):
         self.linear_fc2.backward_dw()
         self.linear_fc1.backward_dw()
+
+    @classmethod
+    def as_mlp_submodule(
+        cls,
+        submodules: MLPSubmodules,
+        config: TransformerConfig,
+        pg_collection: ProcessGroupCollection,
+        is_mtp_layer: bool,
+        is_expert: bool = False,
+        input_size: int | None = None,
+        ffn_hidden_size: int | None = None,
+        name: str | None = None,
+    ) -> MLP:
+        """Helper function to build an MLP as a TransformerLayer's mlp submodule."""
+        del is_mtp_layer
+        assert hasattr(
+            pg_collection, 'tp'
+        ), 'TP process group is required for MLP in TransformerLayer'
+        return cls(
+            config=config,
+            submodules=submodules,
+            tp_group=pg_collection.tp,
+            is_expert=is_expert,
+            input_size=input_size,
+            ffn_hidden_size=ffn_hidden_size,
+            name=name,
+        )
 
 
 # pylint: disable=missing-function-docstring
@@ -328,25 +463,11 @@ def apply_swiglu_sharded_factory(
             ),
         ]
 
-    def sh_ten_merge_fn(sub_state_dict):
-        with torch.no_grad():
-            try:
-                return torch.cat(sub_state_dict)
-            except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
-                logger.warning(
-                    f"CUDA OutOfMemoryError encountered during tensors merging."
-                    f" Switching to CPU merge. (Error: {e})"
-                )
-                merged_sub_state_dict = torch.cat([t.cpu() for t in sub_state_dict])
-                gc.collect()
-                torch.cuda.empty_cache()
-                return merged_sub_state_dict
-
     return ShardedTensorFactory(
         original_sh_ten.key,
         original_sh_ten.data,
         sh_ten_build_fn,
-        sh_ten_merge_fn,
+        cat_with_oom_fallback,
         original_sh_ten.replica_id,
         flattened_range=original_sh_ten.flattened_range,
     )

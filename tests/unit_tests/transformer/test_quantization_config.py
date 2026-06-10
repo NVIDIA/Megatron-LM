@@ -7,28 +7,20 @@ import pytest
 from megatron.core.quantization.quant_config import GlobMatcher, MatchContext, RecipeConfig
 
 try:
-    import nvidia_kitchen  # type: ignore[import-not-found]
-    from nvidia_kitchen.config import (  # type: ignore[import-not-found]
+    from megatron.core.extensions.kitchen import (
+        HAVE_KITCHEN,
         AutogradFunctionImplementation,
-        QuantizeRecipe,
-        get_qlinear_params_from_predefined,
-    )
-    from nvidia_kitchen.config_attention_recipe import (  # type: ignore[import-not-found]
-        QuantizeRecipeAttnBMM,
-        get_qattention_params_from_predefined,
-    )
-    from nvidia_kitchen.config_fa_recipe import (  # type: ignore[import-not-found]
-        get_qfa_params_from_recipe_name,
-    )
-
-    from megatron.core.extensions.kitchen import (  # type: ignore[import-not-found]
         QAttentionParamsConfigSchema,
         QFlashAttentionParamsConfigSchema,
         QLinearParamsConfigSchema,
+        QuantizeRecipe,
+        QuantizeRecipeAttnBMM,
+        get_qattention_params_from_predefined,
+        get_qfa_params_from_recipe_name,
+        get_qlinear_params_from_predefined,
     )
 
-    HAVE_KITCHEN = True
-except ImportError as e:
+except ImportError:
     HAVE_KITCHEN = False
 
 
