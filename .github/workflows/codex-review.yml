@@ -32,6 +32,7 @@ jobs:
           responses-api-endpoint: "https://inference-api.nvidia.com/v1/responses"
           model: "azure/openai/gpt-5.5"
           sandbox: read-only
+          allow-bot-users: copy-pr-bot
           prompt: |
             This is a GitHub Actions smoke test for Megatron-LM.
             Reply exactly: CODEX_API_KEY_SMOKE_OK
