@@ -236,6 +236,14 @@ def get_modelopt_torch_quantization_config():
     # Weight Only Quantization
     if args.weight_only:
         mtq_config["quant_cfg"].append({"quantizer_name": "*input_quantizer", "enable": False})
+
+    if os.environ.get("MODELOPT_SYNC_EXPERT_WEIGHT_AMAX", "0") == "1":
+        algorithm = mtq_config.get("algorithm", "max")
+        if isinstance(algorithm, str):
+            mtq_config["algorithm"] = {"method": algorithm, "sync_expert_weight_amax": True}
+        elif isinstance(algorithm, dict):
+            mtq_config["algorithm"]["sync_expert_weight_amax"] = True
+
     return mtq_config
 
 
