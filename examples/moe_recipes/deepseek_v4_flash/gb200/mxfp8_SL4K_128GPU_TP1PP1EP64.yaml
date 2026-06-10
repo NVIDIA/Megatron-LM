@@ -5,26 +5,7 @@ DEPENDENCIES:
     # IMAGE_NAME: dsv4-gb200-torch2604
     #
     # DeepSeek-V4 training container for GB200 (arm64).
-    # Source: gitlab arch_moe_exploration/megatron-lm gitlab/dsv4 branch,
-    #         dsv4_e2e_guide/Dockerfile (commit cd4ffe7d).
     #
-    # Adds on top of gb200-torch2603:
-    #   - PyTorch 26.04 base
-    #   - TE @ 01aef4fc (release_v2.9 + CPU & quantization opts)
-    #   - HybridEP @ 1b8f4679
-    #   - flash-attn-4==4.0.0b4, nvidia-cutlass-dsl==4.4.2, nvidia-mathdx==25.1.1
-    #   - Fast Hadamard Transform (for DSA indexer)
-    #   - Emerging-Optimizers (Muon)
-    #   - FlashMLA nv_dev branch (dsa_kernels)
-    #   - cudnn_frontend devtech/dsa branch (hybrid attention kernels)
-    #
-    # Prebuilt image:
-    #   gitlab-master.nvidia.com/hongxiaob/containers/megatron_pytorch:mcore-moe-pytorch26.04-20260430-te01aef4f-hybridep1b8f467-dsa-arm
-    #
-    # BUILD NOTE: requires a local ./cudnn_frontend/ directory cloned from
-    #   ssh://git@gitlab-master.nvidia.com:12051/cudnn/cudnn_frontend.git @ devtech/dsa.
-    # This is internal-only and cannot be cloned anonymously inside the build,
-    # so the build context must include it.
 
     FROM nvcr.io/nvidia/pytorch:26.04-py3 AS base
 
@@ -54,7 +35,7 @@ DEPENDENCIES:
         setuptools==69.5.1 nvidia-cutlass-dsl==4.5.2
 
     # TransformerEngine pinned to release_v2.9-based commit with CPU/quantization fixes
-    ARG TE_COMMIT="01aef4fc721bd12fd09cd56d53a314aee1b953d6"
+    ARG TE_COMMIT="3bca93857a9103ee7869d57c464936547573860a"
     RUN pip install --no-cache-dir flash-attn-4==4.0.0b4 nvidia-mathdx==25.1.1 && \
         unset PIP_CONSTRAINT && \
         NVTE_CUDA_ARCHS="100a;103a" NVTE_BUILD_THREADS_PER_JOB=8 NVTE_FRAMEWORK=pytorch \
@@ -89,13 +70,10 @@ DEPENDENCIES:
         CXXFLAGS="-I/usr/local/cuda/include/cccl" \
         pip install --no-build-isolation .
 
-    # cudnn_frontend devtech/dsa branch — pre-cloned into build context
-    # Clone with: git clone ssh://git@gitlab-master.nvidia.com:12051/cudnn/cudnn_frontend.git && \
-    #             cd cudnn_frontend && git checkout devtech/dsa
-    COPY ./cudnn_frontend/ /opt/cudnn_frontend/
-    RUN cd /opt/cudnn_frontend/ && \
-        pip install --no-build-isolation .
-    RUN pip install --force-reinstall 'nvidia-cutlass-dsl[cu13]==4.5.2'
+    # cudnn_frontend
+    RUN pip install apache-tvm-ffi && \
+        pip install --force-reinstall --no-deps --no-build-isolation git+https://github.com/NVIDIA/cudnn-frontend.git && \
+        pip install --force-reinstall 'nvidia-cutlass-dsl[cu13]==4.5.2'
 
     RUN unset PIP_CONSTRAINT && \
         pip install --no-cache-dir nvidia-resiliency-ext==0.6.0
