@@ -2031,6 +2031,7 @@ def _add_network_size_args(parser):
         "output_layer_init_method",
         "embedding_init_method",
         "activation_func",
+        "experimental_attention_variant_loss_scale_func",
         # types affect docstring
         "pipeline_model_parallel_layout",
         "window_size",
