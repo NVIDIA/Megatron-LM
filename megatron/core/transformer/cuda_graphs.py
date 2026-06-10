@@ -765,32 +765,12 @@ class _CudagraphReplayNode(torch.autograd.Function):
         for param, grad_added in runner.groundtruth_grad_added_to_main_grad.items():
             param.grad_added_to_main_grad = grad_added
 
-        # Fire DDP grad-ready hooks for GTP params whose main_grad.add_ was
-        # captured in this runner's bwd_graph. DDP's autograd hook returns
-        # early under is_graph_capturing and doesn't re-run from Python at
-        # replay, so trigger it explicitly here to let DDP RS overlap with
-        # the rest of backward. See _compute_finalized_during_bwd_capture
-        # for how the set is built.
-        #
-        # Fire on rs_stream (GRAPHED chain, GTP group) — the stream that
-        # ran the captured main_grad.add_(wgrad_rs). Stream FIFO orders the
-        # hook (check_grads' grad_data.norm and DDP-RS preEvent record)
-        # after that write. wait_event(bwd_phase2_completion_event) is
-        # defensive against future Phase 2 work on other sub-streams.
-        # main_stream stays unblocked so the next runner can start in
-        # parallel.
-        if runner.gtp_remat and runner.finalized_during_bwd_capture:
-            # Partition by (chain, group): dense vs EGTP use different NCCL
-            # comms / rs_streams. Fire each hook on the rs_stream that ran
-            # its captured wgrad-RS so FIFO orders DDP-RS after that write.
-            dense_group = parallel_state.get_generalized_tensor_parallel_remat_group()
-            expert_group = parallel_state.get_expert_generalized_tensor_parallel_remat_group()
-            params_by_group = defaultdict(list)
-            for param in runner.finalized_during_bwd_capture:
-                is_expert = not getattr(param, 'allreduce', True)
-                params_by_group[expert_group if is_expert else dense_group].append(param)
-            for group, params in params_by_group.items():
-                gtp_rs_stream = get_rs_stream(GTPChain.GRAPHED.value, group)
+        # DDP's grad-ready hook is silenced during capture and not re-fired at replay, so fire it
+        # here to let DDP RS overlap backward. Fire on each param's rs_stream (the one that ran its
+        # captured main_grad.add_) so FIFO orders DDP-RS after that write; wait_event guards
+        # cross-substream Phase 2. Plan precomputed in create_bwd_graph; main_stream stays free.
+        if runner.gtp_remat:
+            for gtp_rs_stream, params in runner._gtp_finalize_hook_plan:
                 gtp_rs_stream.wait_event(runner.bwd_phase2_completion_event)
                 with torch.cuda.stream(gtp_rs_stream):
                     for param in params:
@@ -861,6 +841,8 @@ class _CudaGraphRunner(torch.nn.Module):
         # graph.  Used in Graphed.backward's post-replay hook loop to fire DDP hooks only in the
         # graph whose replay populates main_grad.
         self.finalized_during_bwd_capture = []
+        # (rs_stream, params) DDP grad-ready hook plan; built in create_bwd_graph.
+        self._gtp_finalize_hook_plan = []
 
         self.grad_enabled = need_backward and torch.is_grad_enabled()
         self.func = super(MegatronModule, self.base_module).__call__ if func is None else func
@@ -887,12 +869,11 @@ class _CudaGraphRunner(torch.nn.Module):
             self.fp4_runtime_enabled = None
             self.gtp_remat = self.base_module.config.generalized_tensor_parallel_remat_size > 1
 
-            # Ensure internal warmup (inside create_fwd_graph) has >= 2 steps
-            # for GTP: 1st builds chain + tickets, 2nd exercises prefetch path.
             if self.gtp_remat:
+                # Ensure internal warmup (inside create_fwd_graph) has >= 2 steps
+                # for GTP: 1st builds chain + tickets, 2nd exercises prefetch path.
                 self.num_warmup_steps = max(self.num_warmup_steps, 2)
 
-            if self.gtp_remat:
                 self.use_stream = True
                 self.stream = torch.cuda.Stream()
                 self.fwd_completion_event = torch.cuda.Event(external=True, interprocess=True)
@@ -1290,19 +1271,6 @@ class _CudaGraphRunner(torch.nn.Module):
         # to 0 when activation checkpointing is used. See [interaction with recompute].
         global bwd_buffer_reuse_ref_count
 
-        # Tag cross-graph chain-tail GTP params: those whose prev_w lives in
-        # another runner's params_to_backprop. Read by TE's wgrad_reduce_scatter
-        # cascade and wait_async_comms to split the captured RS wait/add across
-        # producer and consumer graphs (avoids cross-capture cudaStreamWaitEvent
-        # on c10d Work.postEvent).
-        if self.gtp_remat:
-            pset = {id(p) for p in self.params_to_backprop}
-            for p in self.params_to_backprop:
-                if not getattr(p, 'is_gtp', False):
-                    continue
-                prev_w = getattr(p, "prev_w", None)
-                p._is_cross_graph_tail = prev_w is not None and id(prev_w) not in pset
-
         assert self.grad_enabled
         self.bwd_graph = torch.cuda.CUDAGraph()
 
@@ -1334,8 +1302,6 @@ class _CudaGraphRunner(torch.nn.Module):
                     out_grad = _CudagraphGlobalRecord.tensor_reuse_pool.get(o)
                 out_grad.requires_grad = True
             self.static_grad_outputs.append(out_grad)
-
-        torch.cuda.synchronize()
 
         # Freeze GC, to speed up capture time ~15-20x.
         if FREEZE_GC:
@@ -1410,6 +1376,21 @@ class _CudaGraphRunner(torch.nn.Module):
         self.finalized_during_bwd_capture = (
             self._compute_finalized_during_bwd_capture() if self.gtp_remat else []
         )
+
+        # Precompute the (rs_stream, params) DDP grad-ready hook plan once — it's
+        # replay-invariant — so Graphed.backward avoids per-replay group lookups.
+        self._gtp_finalize_hook_plan = []
+        if self.gtp_remat and self.finalized_during_bwd_capture:
+            dense_group = parallel_state.get_generalized_tensor_parallel_remat_group()
+            expert_group = parallel_state.get_expert_generalized_tensor_parallel_remat_group()
+            params_by_group = defaultdict(list)
+            for param in self.finalized_during_bwd_capture:
+                is_expert = not getattr(param, 'allreduce', True)
+                params_by_group[expert_group if is_expert else dense_group].append(param)
+            self._gtp_finalize_hook_plan = [
+                (get_rs_stream(GTPChain.GRAPHED.value, group), params)
+                for group, params in params_by_group.items()
+            ]
 
         # Constructs a tuple suitable for returning from Graphed.backward:
         # Pads out the actually-needed grads with Nones in gradient slots for inputs

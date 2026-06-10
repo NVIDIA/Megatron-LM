@@ -255,24 +255,24 @@ def get_rs_stream(chain_id: str = GTPChain.GRAPHED.value, group=None) -> torch.c
     return _RS_STREAMS[key]
 
 
-def get_all_ag_streams() -> list:
-    """All AG streams created so far, across chains and groups."""
-    return list(_AG_STREAMS.values())
+def wait_gtp_grads_on_current_stream() -> None:
+    """Fence the current stream against all GTP backward grad work before the DP gradient sync.
 
+    Drains in-flight AG/RS on the side streams (eager expert backward may still be writing
+    main_grad) and waits on each CUDA-graph runner's captured dense-GTP bwd Phase 2
+    (main_grad.add_) completion event. No-op when GTP is inactive (empty streams / events).
+    """
+    wait_async_comms()
+    cur = torch.cuda.current_stream()
+    for s in _AG_STREAMS.values():
+        cur.wait_stream(s)
+    for s in _RS_STREAMS.values():
+        cur.wait_stream(s)
+    # Local import: cuda_graphs imports this module, so a module-level import would be circular.
+    from megatron.core.transformer.cuda_graphs import get_gtp_phase2_completion_events
 
-def get_all_rs_streams() -> list:
-    """All RS streams created so far, across chains and groups."""
-    return list(_RS_STREAMS.values())
-
-
-def get_ag_streams_for_chain(chain_id: str) -> list:
-    """AG streams for one chain (all groups that chain has touched)."""
-    return [s for k, s in _AG_STREAMS.items() if k[0] == chain_id]
-
-
-def get_rs_streams_for_chain(chain_id: str) -> list:
-    """RS streams for one chain (all groups that chain has touched)."""
-    return [s for k, s in _RS_STREAMS.items() if k[0] == chain_id]
+    for evt in get_gtp_phase2_completion_events():
+        cur.wait_event(evt)
 
 
 # NOTE: Coalesced amax reduction across the GTP group is deferred to a follow-up
