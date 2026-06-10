@@ -333,13 +333,13 @@ class MambaSlotAllocator:
         slot_tensor = torch.tensor(slots, dtype=torch.int64, device=device)
         # Lookup mamba indices from CPU bookkeeping, then move to GPU for state copy.
         req_tensor_cpu = torch.tensor(request_indices, dtype=torch.int64)
-        mamba_indices = self.context.mamba_metadata.request_to_mamba_state_idx[
+        mamba_indices = self.context.ssm_metadata.request_to_ssm_state_idx[
             req_tensor_cpu
         ].tolist()
         mamba_idx_tensor = torch.tensor(mamba_indices, dtype=torch.int64, device=device)
         # Fancy-indexed copy (2 kernel launches instead of 2E)
-        self.conv_states[:, slot_tensor] = self.context.mamba_conv_states[:, mamba_idx_tensor]
-        self.ssm_states[:, slot_tensor] = self.context.mamba_ssm_states[:, mamba_idx_tensor]
+        self.conv_states[:, slot_tensor] = self.context.ssm_conv_states[:, mamba_idx_tensor]
+        self.ssm_states[:, slot_tensor] = self.context.ssm_recurrent_states[:, mamba_idx_tensor]
 
     def restore_to_live(self, request_idx: int, block_id: int) -> bool:
         """Copy all layers from cache slot to live request state.
@@ -354,9 +354,9 @@ class MambaSlotAllocator:
         slot = self.block_to_slot[block_id].item()
         if slot < 0:
             return False
-        mamba_idx = self.context.mamba_metadata.request_to_mamba_state_idx[request_idx].item()
-        self.context.mamba_conv_states[:, mamba_idx].copy_(self.conv_states[:, slot])
-        self.context.mamba_ssm_states[:, mamba_idx].copy_(self.ssm_states[:, slot])
+        mamba_idx = self.context.ssm_metadata.request_to_ssm_state_idx[request_idx].item()
+        self.context.ssm_conv_states[:, mamba_idx].copy_(self.conv_states[:, slot])
+        self.context.ssm_recurrent_states[:, mamba_idx].copy_(self.ssm_states[:, slot])
         return True
 
     # =========================================================================
@@ -532,7 +532,7 @@ class MambaSlotAllocator:
             intermediate_bids + eos_bids in that order.
         """
         ctx = self.context
-        metadata = ctx.mamba_metadata
+        metadata = ctx.ssm_metadata
         prefill_count = ctx.batch_dimensions.prefill_req_count
         if prefill_count == 0:
             self._clear_intermediate_state()

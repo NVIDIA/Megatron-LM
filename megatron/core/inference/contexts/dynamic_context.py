@@ -43,7 +43,7 @@ from megatron.core.utils import deprecate_args
 from megatron.core.utils import divide as core_divide
 from megatron.core.utils import get_pg_rank, get_pg_size, internal_api
 
-from .attention_context.mamba_metadata import MambaMetadata
+from .attention_context.mamba_metadata import SSMMetadata
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
 from .base_context import BaseInferenceContext
 from .gpu_view import ContextGPUView
@@ -338,11 +338,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         mamba_inference_state_config = inference_config.mamba_inference_state_config
         self.is_hybrid_model = mamba_inference_state_config is not None
         if self.is_hybrid_model:
-            self.mamba_conv_states_shape = mamba_inference_state_config.conv_states_shape
-            self.mamba_ssm_states_shape = mamba_inference_state_config.ssm_states_shape
-            self.mamba_conv_states_dtype = mamba_inference_state_config.conv_states_dtype
-            self.mamba_ssm_states_dtype = mamba_inference_state_config.ssm_states_dtype
-            self.mamba_chunk_size = mamba_inference_state_config.mamba_chunk_size
+            self.ssm_conv_states_shape = mamba_inference_state_config.conv_states_shape
+            self.ssm_recurrent_states_shape = mamba_inference_state_config.ssm_states_shape
+            self.ssm_conv_states_dtype = mamba_inference_state_config.conv_states_dtype
+            self.ssm_recurrent_states_dtype = mamba_inference_state_config.ssm_states_dtype
+            self.ssm_chunk_size = mamba_inference_state_config.mamba_chunk_size
 
             # For hybrid models, the layer map converts the global layer index to the
             # corresponding attention layer index or Mamba layer index depending on the
@@ -357,7 +357,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 raise NotImplementedError("GDN layers are not supported for inference.")
 
             self.num_attention_layers = len(attention_layer_map) + len(dsa_layer_map)
-            self.num_mamba_layers = len(mamba_layer_map)
+            self.num_ssm_layers = len(mamba_layer_map)
             self.layer_map = attention_layer_map | dsa_layer_map | mamba_layer_map
         else:
             # The layer map is the identity function for pure Transformer models.
@@ -380,8 +380,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.num_attention_layers = get_num_layers_to_build(
                 model_config, vp_stage=None, pp_rank=pp_rank
             )
-            self.num_mamba_layers = 0
-            (self.mamba_conv_states_shape, self.mamba_ssm_states_shape) = (None, None)
+            self.num_ssm_layers = 0
+            (self.ssm_conv_states_shape, self.ssm_recurrent_states_shape) = (None, None)
             self.layer_map = {i: i for i in range(self.num_attention_layers)}
 
         if self.num_attention_layers == 0:
@@ -415,19 +415,19 @@ class DynamicInferenceContext(BaseInferenceContext):
         mamba_states_memory_per_request = 0
         if self.is_hybrid_model:
             mamba_states_memory_per_request += (
-                math.prod(self.mamba_conv_states_shape) * self.mamba_conv_states_dtype.itemsize
+                math.prod(self.ssm_conv_states_shape) * self.ssm_conv_states_dtype.itemsize
             )
             mamba_states_memory_per_request += (
-                math.prod(self.mamba_ssm_states_shape) * self.mamba_ssm_states_dtype.itemsize
+                math.prod(self.ssm_recurrent_states_shape) * self.ssm_recurrent_states_dtype.itemsize
             )
-            mamba_states_memory_per_request *= self.num_mamba_layers
+            mamba_states_memory_per_request *= self.num_ssm_layers
             if self.num_speculative_tokens > 0:
                 # Add memory for intermediate conv and SSM states
                 intermediate_memory_per_request = (
-                    math.prod(self.mamba_conv_states_shape) * self.mamba_conv_states_dtype.itemsize
-                    + math.prod(self.mamba_ssm_states_shape) * self.mamba_ssm_states_dtype.itemsize
+                    math.prod(self.ssm_conv_states_shape) * self.ssm_conv_states_dtype.itemsize
+                    + math.prod(self.ssm_recurrent_states_shape) * self.ssm_recurrent_states_dtype.itemsize
                 )
-                intermediate_memory_per_request *= self.num_mamba_layers
+                intermediate_memory_per_request *= self.num_ssm_layers
                 intermediate_memory_per_request *= self.num_speculative_tokens + 1
                 mamba_states_memory_per_request += intermediate_memory_per_request
 
@@ -721,22 +721,22 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         if self.is_hybrid_model:
             mamba_conv_bytes = (
-                math.prod(self.mamba_conv_states_shape)
-                * self.mamba_conv_states_dtype.itemsize
-                * self.num_mamba_layers
+                math.prod(self.ssm_conv_states_shape)
+                * self.ssm_conv_states_dtype.itemsize
+                * self.num_ssm_layers
             )
             mamba_ssm_bytes = (
-                math.prod(self.mamba_ssm_states_shape)
-                * self.mamba_ssm_states_dtype.itemsize
-                * self.num_mamba_layers
+                math.prod(self.ssm_recurrent_states_shape)
+                * self.ssm_recurrent_states_dtype.itemsize
+                * self.num_ssm_layers
             )
             mamba_bytes_per_req = mamba_conv_bytes + mamba_ssm_bytes
             mamba_total_bytes = mamba_bytes_per_req * self.max_requests
             log_lines += [
                 f"  Mamba states:",
-                f"    num_mamba_layers:      {self.num_mamba_layers}",
-                f"    conv_state_shape:      {self.mamba_conv_states_shape}",
-                f"    ssm_state_shape:       {self.mamba_ssm_states_shape}",
+                f"    num_ssm_layers:        {self.num_ssm_layers}",
+                f"    conv_state_shape:      {self.ssm_conv_states_shape}",
+                f"    ssm_state_shape:       {self.ssm_recurrent_states_shape}",
                 f"    per_request:           {get_mem_size_str(mamba_bytes_per_req)}",
                 f"    total ({self.max_requests} requests):  {get_mem_size_str(mamba_total_bytes)}",
             ]
@@ -805,61 +805,61 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.memory_buffer, device="cpu"
             ).pin_memory()
 
-    def _allocate_mamba_states(self):
+    def _allocate_ssm_states(self):
         """Allocate Mamba states for hybrid models."""
         if self.is_hybrid_model:
-            self.mamba_metadata = MambaMetadata(
+            self.ssm_metadata = SSMMetadata(
                 max_requests=self.max_requests,
                 max_tokens=self.max_tokens,
-                mamba_chunk_size=self.mamba_chunk_size,
-                d_conv=self.mamba_conv_states_shape[-1],
+                ssm_chunk_size=self.ssm_chunk_size,
+                d_conv=self.ssm_conv_states_shape[-1],
             )
             # Bind the unified CPU/GPU buffers so the per-step Mamba metadata
             # fields ride along with the single coalesced H2D in
             # transfer_bookkeeping_to_gpu().
-            self.mamba_metadata.bind_cpu_buffers(
+            self.ssm_metadata.bind_cpu_buffers(
                 {
-                    "batch_indices_decode": self._cpu_mamba_batch_indices_decode,
-                    "batch_indices_prefill": self._cpu_mamba_batch_indices_prefill,
-                    "seq_idx": self._cpu_mamba_seq_idx,
-                    "cu_seqlens": self._cpu_mamba_cu_seqlens,
-                    "cu_chunk_seqlens": self._cpu_mamba_cu_chunk_seqlens,
-                    "last_chunk_indices": self._cpu_mamba_last_chunk_indices,
-                    "seq_idx_for_varlen": self._cpu_mamba_seq_idx_for_varlen,
-                    "conv_seq_idx": self._cpu_mamba_conv_seq_idx,
-                    "conv_seq_start": self._cpu_mamba_conv_seq_start,
+                    "batch_indices_decode": self._cpu_ssm_batch_indices_decode,
+                    "batch_indices_prefill": self._cpu_ssm_batch_indices_prefill,
+                    "seq_idx": self._cpu_ssm_seq_idx,
+                    "cu_seqlens": self._cpu_ssm_cu_seqlens,
+                    "cu_chunk_seqlens": self._cpu_ssm_cu_chunk_seqlens,
+                    "last_chunk_indices": self._cpu_ssm_last_chunk_indices,
+                    "seq_idx_for_varlen": self._cpu_ssm_seq_idx_for_varlen,
+                    "conv_seq_idx": self._cpu_ssm_conv_seq_idx,
+                    "conv_seq_start": self._cpu_ssm_conv_seq_start,
                 }
             )
-            self.mamba_metadata.bind_gpu_buffers(self.gpu_view)
-            self.mamba_conv_states = torch.empty(
-                (self.num_mamba_layers, self.max_requests) + self.mamba_conv_states_shape,
-                dtype=self.mamba_conv_states_dtype,
+            self.ssm_metadata.bind_gpu_buffers(self.gpu_view)
+            self.ssm_conv_states = torch.empty(
+                (self.num_ssm_layers, self.max_requests) + self.ssm_conv_states_shape,
+                dtype=self.ssm_conv_states_dtype,
                 device=torch.cuda.current_device(),
             )
-            self.mamba_ssm_states = torch.empty(
-                (self.num_mamba_layers, self.max_requests) + self.mamba_ssm_states_shape,
-                dtype=self.mamba_ssm_states_dtype,
+            self.ssm_recurrent_states = torch.empty(
+                (self.num_ssm_layers, self.max_requests) + self.ssm_recurrent_states_shape,
+                dtype=self.ssm_recurrent_states_dtype,
                 device=torch.cuda.current_device(),
             )
             if self.num_speculative_tokens > 0:
-                self.mamba_intermediate_conv_states = torch.empty(
+                self.ssm_intermediate_conv_states = torch.empty(
                     (
-                        self.num_mamba_layers,
+                        self.num_ssm_layers,
                         self.max_requests,
                         self.num_speculative_tokens + 1,
-                        *self.mamba_conv_states_shape,
+                        *self.ssm_conv_states_shape,
                     ),
-                    dtype=self.mamba_conv_states_dtype,
+                    dtype=self.ssm_conv_states_dtype,
                     device=torch.cuda.current_device(),
                 )
-                self.mamba_intermediate_ssm_states = torch.empty(
+                self.ssm_intermediate_recurrent_states = torch.empty(
                     (
-                        self.num_mamba_layers,
+                        self.num_ssm_layers,
                         self.max_requests,
                         self.num_speculative_tokens + 1,
-                        *self.mamba_ssm_states_shape,
+                        *self.ssm_recurrent_states_shape,
                     ),
-                    dtype=self.mamba_ssm_states_dtype,
+                    dtype=self.ssm_recurrent_states_dtype,
                     device=torch.cuda.current_device(),
                 )
             if (
@@ -867,29 +867,29 @@ class DynamicInferenceContext(BaseInferenceContext):
                 and not self._uses_torch_memory_saver
             ):
                 assert self.unified_memory_level == 0
-                self._offloadable_tensor_names.add("mamba_conv_states")
-                self._offloadable_cpu_backups["mamba_conv_states"] = torch.empty_like(
-                    self.mamba_conv_states, device="cpu"
+                self._offloadable_tensor_names.add("ssm_conv_states")
+                self._offloadable_cpu_backups["ssm_conv_states"] = torch.empty_like(
+                    self.ssm_conv_states, device="cpu"
                 ).pin_memory()
-                self._offloadable_tensor_names.add("mamba_ssm_states")
-                self._offloadable_cpu_backups["mamba_ssm_states"] = torch.empty_like(
-                    self.mamba_ssm_states, device="cpu"
+                self._offloadable_tensor_names.add("ssm_recurrent_states")
+                self._offloadable_cpu_backups["ssm_recurrent_states"] = torch.empty_like(
+                    self.ssm_recurrent_states, device="cpu"
                 ).pin_memory()
                 if self.num_speculative_tokens > 0:
-                    self._offloadable_tensor_names.add("mamba_intermediate_conv_states")
-                    self._offloadable_cpu_backups["mamba_intermediate_conv_states"] = (
+                    self._offloadable_tensor_names.add("ssm_intermediate_conv_states")
+                    self._offloadable_cpu_backups["ssm_intermediate_conv_states"] = (
                         torch.empty_like(
-                            self.mamba_intermediate_conv_states, device="cpu"
+                            self.ssm_intermediate_conv_states, device="cpu"
                         ).pin_memory()
                     )
-                    self._offloadable_tensor_names.add("mamba_intermediate_ssm_states")
-                    self._offloadable_cpu_backups["mamba_intermediate_ssm_states"] = (
+                    self._offloadable_tensor_names.add("ssm_intermediate_recurrent_states")
+                    self._offloadable_cpu_backups["ssm_intermediate_recurrent_states"] = (
                         torch.empty_like(
-                            self.mamba_intermediate_ssm_states, device="cpu"
+                            self.ssm_intermediate_recurrent_states, device="cpu"
                         ).pin_memory()
                     )
         else:
-            self.mamba_metadata = None
+            self.ssm_metadata = None
 
     def initialize_all_tensors(self) -> None:
         """Allocate all GPU state during initial construction."""
@@ -997,7 +997,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         _mha_kv_seq_lengths_bytes = self.max_requests * 4
         _mha_cu_kv_seq_lengths_bytes = (self.max_requests + 1) * 4
         _mha_block_table_bytes = self.max_requests * self.max_kv_block_count * 4
-        _pre_mamba_bytes = (
+        _pre_ssm_bytes = (
             3 * _tok_int64_bytes
             + 3 * _tok_int32_bytes
             + 7 * _req_4byte_bytes
@@ -1007,46 +1007,46 @@ class DynamicInferenceContext(BaseInferenceContext):
             + _mha_cu_kv_seq_lengths_bytes
             + _mha_block_table_bytes
         )
-        # Mamba section (hybrid models only). Must match the MambaMetadata
+        # SSM section (hybrid models only). Must match the SSMMetadata
         # shapes (mirrors the layout documented in ContextGPUView).
         # batch_indices_decode is int64; all other fields are int32.
         if self.is_hybrid_model:
             # mamba_batch_indices_decode is int64; pad to 8-byte alignment.
-            _mamba_align_pad = (8 - _pre_mamba_bytes % 8) % 8
-            self._max_mamba_chunks = self.max_tokens // self.mamba_chunk_size + self.max_requests
-            _mamba_batch_indices_decode_bytes = self.max_requests * 8
-            _mamba_batch_indices_prefill_bytes = self.max_requests * 4
-            _mamba_seq_idx_bytes = self.max_tokens * 4
-            _mamba_cu_seqlens_bytes = (self.max_requests + 1) * 4
-            _mamba_cu_chunk_seqlens_bytes = (self._max_mamba_chunks + 1) * 4
-            _mamba_last_chunk_indices_bytes = self.max_requests * 4
-            _mamba_seq_idx_for_varlen_bytes = self._max_mamba_chunks * 4
-            _mamba_conv_seq_idx_bytes = self.max_tokens * 4
-            _mamba_conv_seq_start_bytes = self.max_tokens * 4
+            _ssm_align_pad = (8 - _pre_ssm_bytes % 8) % 8
+            self._max_ssm_chunks = self.max_tokens // self.ssm_chunk_size + self.max_requests
+            _ssm_batch_indices_decode_bytes = self.max_requests * 8
+            _ssm_batch_indices_prefill_bytes = self.max_requests * 4
+            _ssm_seq_idx_bytes = self.max_tokens * 4
+            _ssm_cu_seqlens_bytes = (self.max_requests + 1) * 4
+            _ssm_cu_chunk_seqlens_bytes = (self._max_ssm_chunks + 1) * 4
+            _ssm_last_chunk_indices_bytes = self.max_requests * 4
+            _ssm_seq_idx_for_varlen_bytes = self._max_ssm_chunks * 4
+            _ssm_conv_seq_idx_bytes = self.max_tokens * 4
+            _ssm_conv_seq_start_bytes = self.max_tokens * 4
         else:
-            _mamba_align_pad = 0
-            self._max_mamba_chunks = 0
-            _mamba_batch_indices_decode_bytes = 0
-            _mamba_batch_indices_prefill_bytes = 0
-            _mamba_seq_idx_bytes = 0
-            _mamba_cu_seqlens_bytes = 0
-            _mamba_cu_chunk_seqlens_bytes = 0
-            _mamba_last_chunk_indices_bytes = 0
-            _mamba_seq_idx_for_varlen_bytes = 0
-            _mamba_conv_seq_idx_bytes = 0
-            _mamba_conv_seq_start_bytes = 0
+            _ssm_align_pad = 0
+            self._max_ssm_chunks = 0
+            _ssm_batch_indices_decode_bytes = 0
+            _ssm_batch_indices_prefill_bytes = 0
+            _ssm_seq_idx_bytes = 0
+            _ssm_cu_seqlens_bytes = 0
+            _ssm_cu_chunk_seqlens_bytes = 0
+            _ssm_last_chunk_indices_bytes = 0
+            _ssm_seq_idx_for_varlen_bytes = 0
+            _ssm_conv_seq_idx_bytes = 0
+            _ssm_conv_seq_start_bytes = 0
         _total_bytes = (
-            _pre_mamba_bytes
-            + _mamba_align_pad
-            + _mamba_batch_indices_decode_bytes
-            + _mamba_batch_indices_prefill_bytes
-            + _mamba_seq_idx_bytes
-            + _mamba_cu_seqlens_bytes
-            + _mamba_cu_chunk_seqlens_bytes
-            + _mamba_last_chunk_indices_bytes
-            + _mamba_seq_idx_for_varlen_bytes
-            + _mamba_conv_seq_idx_bytes
-            + _mamba_conv_seq_start_bytes
+            _pre_ssm_bytes
+            + _ssm_align_pad
+            + _ssm_batch_indices_decode_bytes
+            + _ssm_batch_indices_prefill_bytes
+            + _ssm_seq_idx_bytes
+            + _ssm_cu_seqlens_bytes
+            + _ssm_cu_chunk_seqlens_bytes
+            + _ssm_last_chunk_indices_bytes
+            + _ssm_seq_idx_for_varlen_bytes
+            + _ssm_conv_seq_idx_bytes
+            + _ssm_conv_seq_start_bytes
         )
         self._cpu_bookkeeping_buf = torch.empty(
             _total_bytes, dtype=torch.uint8, device='cpu', pin_memory=True
@@ -1164,48 +1164,48 @@ class DynamicInferenceContext(BaseInferenceContext):
         _off += _mha_block_table_bytes
 
         # Mamba varlen metadata views (hybrid models only). Populated per step
-        # by MambaMetadata.compute_cpu_metadata(); transferred as part of the
+        # by SSMMetadata.compute_cpu_metadata(); transferred as part of the
         # single coalesced H2D in transfer_bookkeeping_to_gpu().
         if self.is_hybrid_model:
-            _off += _mamba_align_pad
-            self._cpu_mamba_batch_indices_decode = self._cpu_bookkeeping_buf[
-                _off : _off + _mamba_batch_indices_decode_bytes
+            _off += _ssm_align_pad
+            self._cpu_ssm_batch_indices_decode = self._cpu_bookkeeping_buf[
+                _off : _off + _ssm_batch_indices_decode_bytes
             ].view(torch.int64)
-            _off += _mamba_batch_indices_decode_bytes
-            self._cpu_mamba_batch_indices_prefill = self._cpu_bookkeeping_buf[
-                _off : _off + _mamba_batch_indices_prefill_bytes
+            _off += _ssm_batch_indices_decode_bytes
+            self._cpu_ssm_batch_indices_prefill = self._cpu_bookkeeping_buf[
+                _off : _off + _ssm_batch_indices_prefill_bytes
             ].view(torch.int32)
-            _off += _mamba_batch_indices_prefill_bytes
-            self._cpu_mamba_seq_idx = (
-                self._cpu_bookkeeping_buf[_off : _off + _mamba_seq_idx_bytes]
+            _off += _ssm_batch_indices_prefill_bytes
+            self._cpu_ssm_seq_idx = (
+                self._cpu_bookkeeping_buf[_off : _off + _ssm_seq_idx_bytes]
                 .view(torch.int32)
                 .view(1, self.max_tokens)
             )
-            _off += _mamba_seq_idx_bytes
-            self._cpu_mamba_cu_seqlens = self._cpu_bookkeeping_buf[
-                _off : _off + _mamba_cu_seqlens_bytes
+            _off += _ssm_seq_idx_bytes
+            self._cpu_ssm_cu_seqlens = self._cpu_bookkeeping_buf[
+                _off : _off + _ssm_cu_seqlens_bytes
             ].view(torch.int32)
-            _off += _mamba_cu_seqlens_bytes
-            self._cpu_mamba_cu_chunk_seqlens = self._cpu_bookkeeping_buf[
-                _off : _off + _mamba_cu_chunk_seqlens_bytes
+            _off += _ssm_cu_seqlens_bytes
+            self._cpu_ssm_cu_chunk_seqlens = self._cpu_bookkeeping_buf[
+                _off : _off + _ssm_cu_chunk_seqlens_bytes
             ].view(torch.int32)
-            _off += _mamba_cu_chunk_seqlens_bytes
-            self._cpu_mamba_last_chunk_indices = self._cpu_bookkeeping_buf[
-                _off : _off + _mamba_last_chunk_indices_bytes
+            _off += _ssm_cu_chunk_seqlens_bytes
+            self._cpu_ssm_last_chunk_indices = self._cpu_bookkeeping_buf[
+                _off : _off + _ssm_last_chunk_indices_bytes
             ].view(torch.int32)
-            _off += _mamba_last_chunk_indices_bytes
-            self._cpu_mamba_seq_idx_for_varlen = self._cpu_bookkeeping_buf[
-                _off : _off + _mamba_seq_idx_for_varlen_bytes
+            _off += _ssm_last_chunk_indices_bytes
+            self._cpu_ssm_seq_idx_for_varlen = self._cpu_bookkeeping_buf[
+                _off : _off + _ssm_seq_idx_for_varlen_bytes
             ].view(torch.int32)
-            _off += _mamba_seq_idx_for_varlen_bytes
-            self._cpu_mamba_conv_seq_idx = self._cpu_bookkeeping_buf[
-                _off : _off + _mamba_conv_seq_idx_bytes
+            _off += _ssm_seq_idx_for_varlen_bytes
+            self._cpu_ssm_conv_seq_idx = self._cpu_bookkeeping_buf[
+                _off : _off + _ssm_conv_seq_idx_bytes
             ].view(torch.int32)
-            _off += _mamba_conv_seq_idx_bytes
-            self._cpu_mamba_conv_seq_start = self._cpu_bookkeeping_buf[
-                _off : _off + _mamba_conv_seq_start_bytes
+            _off += _ssm_conv_seq_idx_bytes
+            self._cpu_ssm_conv_seq_start = self._cpu_bookkeeping_buf[
+                _off : _off + _ssm_conv_seq_start_bytes
             ].view(torch.int32)
-            _off += _mamba_conv_seq_start_bytes
+            _off += _ssm_conv_seq_start_bytes
 
         assert _off == _total_bytes, f"layout bug: wrote {_off} of {_total_bytes} bytes"
 
@@ -1216,7 +1216,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_tokens=self.max_tokens,
             max_kv_blocks=self.max_kv_block_count,
             device=torch.cuda.current_device(),
-            max_mamba_chunks=self._max_mamba_chunks,
+            max_mamba_chunks=self._max_ssm_chunks,
         )
 
         # Cache of (input_ids_view, pos_ids_view) keyed by num_tokens. Instead of slicing and
@@ -1233,8 +1233,8 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Deferred Mamba GPU operations.  Populated by add_request() /
         # update_requests() (CPU phase), executed by transfer_bookkeeping_to_gpu().
-        self._pending_mamba_zeros: list = []
-        self._pending_mamba_restores: list = []
+        self._pending_ssm_zeros: list = []
+        self._pending_ssm_restores: list = []
 
         # Allocate large non-graphed buffers.
         need_static_addr = (
@@ -1253,17 +1253,17 @@ class DynamicInferenceContext(BaseInferenceContext):
             self._uses_torch_memory_saver = True
         with ctx_manager:
             self._allocate_memory_buffer()
-            self._allocate_mamba_states()
+            self._allocate_ssm_states()
 
         # Allocate Mamba prefix cache if configured
-        self.mamba_slot_allocator: Optional[MambaSlotAllocator] = None
+        self.ssm_slot_allocator: Optional[MambaSlotAllocator] = None
         if (
             self.is_hybrid_model
             and self.config.prefix_caching_mamba_gb is not None
             and self.config.prefix_caching_mamba_gb > 0
             and self.config.enable_prefix_caching
         ):
-            self._allocate_mamba_cache(self.config.prefix_caching_mamba_gb)
+            self._allocate_ssm_cache(self.config.prefix_caching_mamba_gb)
 
         # Reset tensor-related metadata.
         self.reset_metadata()
@@ -1560,7 +1560,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.active_attn_metadata["mha_metadata"].state_data["block_table"],
             )
 
-    def mamba_states_cache(
+    def ssm_states_cache(
         self, layer_number: int, intermediate: bool = False
     ) -> Tuple[Tensor, Tensor]:
         """Returns the Mamba state tensors for the given layer."""
@@ -1568,11 +1568,11 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         mamba_layer_number = self.layer_map[layer_number - 1]
         if intermediate:
-            conv_state = self.mamba_intermediate_conv_states[mamba_layer_number]
-            ssm_state = self.mamba_intermediate_ssm_states[mamba_layer_number]
+            conv_state = self.ssm_intermediate_conv_states[mamba_layer_number]
+            ssm_state = self.ssm_intermediate_recurrent_states[mamba_layer_number]
         else:
-            conv_state = self.mamba_conv_states[mamba_layer_number]
-            ssm_state = self.mamba_ssm_states[mamba_layer_number]
+            conv_state = self.ssm_conv_states[mamba_layer_number]
+            ssm_state = self.ssm_recurrent_states[mamba_layer_number]
 
         return (conv_state, ssm_state)
 
@@ -1580,7 +1580,7 @@ class DynamicInferenceContext(BaseInferenceContext):
     # Mamba prefix cache infrastructure
     # =========================================================================
 
-    def _allocate_mamba_cache(self, mamba_gb: float) -> None:
+    def _allocate_ssm_cache(self, mamba_gb: float) -> None:
         """Allocate the Mamba state cache for prefix caching.
 
         Args:
@@ -1588,9 +1588,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         import math as _math
 
-        conv_size = _math.prod(self.mamba_conv_states_shape) * self.mamba_conv_states_dtype.itemsize
-        ssm_size = _math.prod(self.mamba_ssm_states_shape) * self.mamba_ssm_states_dtype.itemsize
-        per_slot_bytes = self.num_mamba_layers * (conv_size + ssm_size)
+        conv_size = _math.prod(self.ssm_conv_states_shape) * self.ssm_conv_states_dtype.itemsize
+        ssm_size = _math.prod(self.ssm_recurrent_states_shape) * self.ssm_recurrent_states_dtype.itemsize
+        per_slot_bytes = self.num_ssm_layers * (conv_size + ssm_size)
         total_bytes = int(mamba_gb * 1024**3)
         max_slots = total_bytes // per_slot_bytes
         if max_slots < 1:
@@ -1602,17 +1602,17 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
             return
 
-        self.mamba_slot_allocator = MambaSlotAllocator(
+        self.ssm_slot_allocator = MambaSlotAllocator(
             context=self,
             max_slots=max_slots,
-            num_mamba_layers=self.num_mamba_layers,
-            conv_states_shape=self.mamba_conv_states_shape,
-            ssm_states_shape=self.mamba_ssm_states_shape,
-            conv_states_dtype=self.mamba_conv_states_dtype,
-            ssm_states_dtype=self.mamba_ssm_states_dtype,
+            num_mamba_layers=self.num_ssm_layers,
+            conv_states_shape=self.ssm_conv_states_shape,
+            ssm_states_shape=self.ssm_recurrent_states_shape,
+            conv_states_dtype=self.ssm_conv_states_dtype,
+            ssm_states_dtype=self.ssm_recurrent_states_dtype,
         )
         self.kv_block_allocator.on_blocks_deregistered = (
-            self.mamba_slot_allocator.on_kv_blocks_deregistered
+            self.ssm_slot_allocator.on_kv_blocks_deregistered
         )
 
         logging.info(
@@ -1762,12 +1762,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.active_attn_metadata = None
 
         if self.is_hybrid_model:
-            self.mamba_metadata.reset_varlen_metadata()
+            self.ssm_metadata.reset_varlen_metadata()
 
-    def reset_mamba_state(self) -> None:
+    def reset_ssm_state(self) -> None:
         """Reset state used within Mamba layers."""
         if self.is_hybrid_model:
-            self.mamba_metadata.reset()
+            self.ssm_metadata.reset()
 
     def add_dummy_requests_parallel(
         self, requests: Sequence[DynamicInferenceRequest], *, count_as_prefill: bool = True
@@ -1894,13 +1894,13 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         if self.is_hybrid_model:
             for logical_idx, request_idx in enumerate(range(start_request_idx, end_request_idx)):
-                mamba_idx = self.mamba_metadata.allocate_slot()
-                if mamba_idx is None:
+                ssm_idx = self.ssm_metadata.allocate_slot()
+                if ssm_idx is None:
                     raise ContextOverflowError(
                         requests[logical_idx].request_id, "No Mamba slots available"
                     )
-                self._pending_mamba_zeros.append(mamba_idx)
-                self.mamba_metadata.request_to_mamba_state_idx[request_idx] = mamba_idx
+                self._pending_ssm_zeros.append(ssm_idx)
+                self.ssm_metadata.request_to_ssm_state_idx[request_idx] = ssm_idx
 
         self.active_token_count = token_end
         self.total_request_count = end_request_idx
@@ -2036,8 +2036,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
 
             # 5. Mamba state: allocate slots for dummy requests.
-            self.mamba_metadata.request_to_mamba_state_idx[0:N] = (
-                self.mamba_metadata.batch_allocate_slots(N)
+            self.ssm_metadata.request_to_ssm_state_idx[0:N] = (
+                self.ssm_metadata.batch_allocate_slots(N)
             )
 
     def initialize_attention_state(
@@ -2058,7 +2058,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         """
         # Launch deferred Mamba GPU ops first (state zeroing/restore) so they
         # overlap with the CPU work below.  These are non-blocking GPU kernels.
-        self._execute_pending_mamba_ops()
+        self._execute_pending_ssm_ops()
 
         self.is_creating_cuda_graphs = construct_graph_dimensions is not None
         assert not (
@@ -2259,12 +2259,12 @@ class DynamicInferenceContext(BaseInferenceContext):
             # slices here; H2D transfer happens in transfer_bookkeeping_to_gpu().
             intermediate_offsets_gpu = None
             intermediate_counts_gpu = None
-            if self.mamba_slot_allocator is not None:
+            if self.ssm_slot_allocator is not None:
                 intermediate_offsets_gpu, intermediate_counts_gpu = (
-                    self.mamba_slot_allocator.get_intermediate_cpu_data()
+                    self.ssm_slot_allocator.get_intermediate_cpu_data()
                 )
-            self._pending_mamba_transfer = self.mamba_metadata.compute_cpu_metadata(
-                active_mamba_indices=self.mamba_metadata.request_to_mamba_state_idx[active_slice],
+            self._pending_ssm_transfer = self.ssm_metadata.compute_cpu_metadata(
+                active_ssm_indices=self.ssm_metadata.request_to_ssm_state_idx[active_slice],
                 token_to_request_idx=self.token_to_request_idx[: self.active_token_count],
                 cpu_cu_query=self._cpu_mha_cu_query_seq_lengths,
                 batch_dimensions=attn_dimensions,
@@ -2290,7 +2290,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # The earlier call at the top drained ops queued by add_request() before
         # this function ran; this call covers ops queued during the function.
         # No-op when the queue is already empty (regular non-warmup steps).
-        self._execute_pending_mamba_ops()
+        self._execute_pending_ssm_ops()
 
         # Run the H2D transfer here so callers that bypass the controller
         # (e.g. unit tests that call `model.forward()` directly after
@@ -2299,29 +2299,29 @@ class DynamicInferenceContext(BaseInferenceContext):
         # explicitly; that second call is a cheap idempotent re-copy.
         self.transfer_bookkeeping_to_gpu()
 
-    def _execute_pending_mamba_ops(self) -> None:
+    def _execute_pending_ssm_ops(self) -> None:
         """Execute Mamba GPU operations deferred from add_request() / update_requests().
 
         This runs at the start of initialize_attention_state() so that all GPU
         Mamba state is correct before the forward pass.
         """
-        if not (self._pending_mamba_restores or self._pending_mamba_zeros):
+        if not (self._pending_ssm_restores or self._pending_ssm_zeros):
             return
 
         # Restore cached Mamba state to live buffers.  On failure, fall back to zeroing.
-        for request_idx, block_id, mamba_idx in self._pending_mamba_restores:
-            restored = self.mamba_slot_allocator.restore_to_live(request_idx, block_id)
+        for request_idx, block_id, ssm_idx in self._pending_ssm_restores:
+            restored = self.ssm_slot_allocator.restore_to_live(request_idx, block_id)
             if not restored:
-                self._pending_mamba_zeros.append(mamba_idx)
-        self._pending_mamba_restores.clear()
+                self._pending_ssm_zeros.append(ssm_idx)
+        self._pending_ssm_restores.clear()
 
         # Batch-zero newly allocated Mamba slots.
-        if self._pending_mamba_zeros:
-            device = self.mamba_conv_states.device
-            indices = torch.tensor(self._pending_mamba_zeros, dtype=torch.long, device=device)
-            self.mamba_conv_states[:, indices] = 0.0
-            self.mamba_ssm_states[:, indices] = 0.0
-            self._pending_mamba_zeros.clear()
+        if self._pending_ssm_zeros:
+            device = self.ssm_conv_states.device
+            indices = torch.tensor(self._pending_ssm_zeros, dtype=torch.long, device=device)
+            self.ssm_conv_states[:, indices] = 0.0
+            self.ssm_recurrent_states[:, indices] = 0.0
+            self._pending_ssm_zeros.clear()
 
     def transfer_bookkeeping_to_gpu(self) -> None:
         """Batch transfer CPU bookkeeping state to GPU staging buffers.
@@ -2379,9 +2379,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         # bytes. Nothing else to do here for MHA.
 
         # Mamba metadata: copy pre-computed CPU tensors to GPU buffers.
-        if hasattr(self, '_pending_mamba_transfer') and self._pending_mamba_transfer is not None:
-            self.mamba_metadata.load_from_cpu(self._pending_mamba_transfer)
-            self._pending_mamba_transfer = None
+        if hasattr(self, '_pending_ssm_transfer') and self._pending_ssm_transfer is not None:
+            self.ssm_metadata.load_from_cpu(self._pending_ssm_transfer)
+            self._pending_ssm_transfer = None
 
     def reset_tensors(self) -> None:
         """Fill all bookkeeping tensors with sentinel values."""
@@ -2434,7 +2434,7 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Reset attention, mamba, and block allocator state.
         self.reset_attention_state()
-        self.reset_mamba_state()
+        self.reset_ssm_state()
         self.kv_block_allocator.reset()
         self.request_to_kv_block_ids.fill_(-1)
 
@@ -2468,8 +2468,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.prefix_cache_lru_clock = 0
 
         # Reset Mamba cache state
-        if self.mamba_slot_allocator is not None:
-            self.mamba_slot_allocator.reset()
+        if self.ssm_slot_allocator is not None:
+            self.ssm_slot_allocator.reset()
 
     def current_input_and_position_ids(
         self, *, num_warmup_tokens: Optional[int] = None
@@ -2602,7 +2602,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Hybrid models with Mamba caching: skip based on Mamba match count.
         # Only applies to the first chunk (finished == 0); continuation chunks
         # already had Mamba state restored during the first chunk.
-        if self.is_hybrid_model and self.mamba_slot_allocator is not None and finished == 0:
+        if self.is_hybrid_model and self.ssm_slot_allocator is not None and finished == 0:
             num_mamba_matched = getattr(req, '_mamba_num_matched_blocks', 0)
             assert (
                 num_mamba_matched <= num_matched
@@ -2611,7 +2611,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 raw_skip = num_mamba_matched * self.block_size_tokens
                 if raw_skip >= prefill_chunk_length:
                     # Back off to previous block with cached Mamba state
-                    mamba_map = self.mamba_slot_allocator.hash_to_block_id
+                    mamba_map = self.ssm_slot_allocator.hash_to_block_id
                     backed_off_blocks = 0
                     for j in range(num_mamba_matched - 2, -1, -1):
                         if req.precomputed_block_hashes[j] in mamba_map:
@@ -2886,27 +2886,27 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         if self.is_hybrid_model and req.finished_chunk_token_count == 0:
             # Allocate a slot for Mamba states
-            mamba_idx = self.mamba_metadata.allocate_slot()
-            if mamba_idx is None:
+            ssm_idx = self.ssm_metadata.allocate_slot()
+            if ssm_idx is None:
                 raise ContextOverflowError(req.request_id, "No Mamba slots available")
-            self.mamba_metadata.request_to_mamba_state_idx[self.total_request_count] = mamba_idx
+            self.ssm_metadata.request_to_ssm_state_idx[self.total_request_count] = ssm_idx
 
             # Restore Mamba state from the block corresponding to prefix_skip_tokens
             restore_block_count = prefix_skip_tokens // self.block_size_tokens
-            if restore_block_count > 0 and self.mamba_slot_allocator is not None:
+            if restore_block_count > 0 and self.ssm_slot_allocator is not None:
                 restore_block_id = matched_block_ids[restore_block_count - 1]
-                self._pending_mamba_restores.append(
-                    (self.total_request_count, restore_block_id, mamba_idx)
+                self._pending_ssm_restores.append(
+                    (self.total_request_count, restore_block_id, ssm_idx)
                 )
             else:
-                self._pending_mamba_zeros.append(mamba_idx)
+                self._pending_ssm_zeros.append(ssm_idx)
 
             # compute_and_store_offsets sets both CPU state (hash_to_block_id,
             # _eos_cache_block_id_gpu) and GPU staging buffers.  Runs immediately
             # because commit_intermediate_states() reads the CPU state after the
             # forward pass.
-            if self.mamba_slot_allocator is not None:
-                self.mamba_slot_allocator.compute_and_store_offsets(
+            if self.ssm_slot_allocator is not None:
+                self.ssm_slot_allocator.compute_and_store_offsets(
                     req,
                     current_id,
                     prefix_skip_tokens,
@@ -2946,8 +2946,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             metadata_tensor[dst_idxs] = metadata_tensor[src_idxs]
 
         if self.is_hybrid_model:
-            self.mamba_metadata.request_to_mamba_state_idx[dst_idxs] = (
-                self.mamba_metadata.request_to_mamba_state_idx[src_idxs]
+            self.ssm_metadata.request_to_ssm_state_idx[dst_idxs] = (
+                self.ssm_metadata.request_to_ssm_state_idx[src_idxs]
             )
 
     def _swap_book_keeping_tensors(
@@ -2978,7 +2978,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             tensor_swap(metadata_tensor, src_idxs, dst_idxs)
 
         if self.is_hybrid_model:
-            tensor_swap(self.mamba_metadata.request_to_mamba_state_idx, src_idxs, dst_idxs)
+            tensor_swap(self.ssm_metadata.request_to_ssm_state_idx, src_idxs, dst_idxs)
 
     def get_index_of_chunked_prefill_request(self, safe: bool = True) -> int:
         """
@@ -3026,11 +3026,11 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Free Mamba slots.
         if self.is_hybrid_model:
-            self.mamba_metadata.free_slots(request_indexes)
+            self.ssm_metadata.free_slots(request_indexes)
 
         # Clear intermediate offset entries for released requests (CPU writes).
-        if self.mamba_slot_allocator is not None:
-            sa = self.mamba_slot_allocator
+        if self.ssm_slot_allocator is not None:
+            sa = self.ssm_slot_allocator
             sa._intermediate_counts_cpu[request_indexes] = 0
             sa._intermediate_offsets_cpu[request_indexes] = 0
             sa._intermediate_block_ids_cpu[request_indexes] = -1
@@ -3229,7 +3229,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         self.request_to_kv_block_ids[evict_slice] = -1
         if self.is_hybrid_model:
-            self.mamba_metadata.request_to_mamba_state_idx[evict_slice] = -1
+            self.ssm_metadata.request_to_ssm_state_idx[evict_slice] = -1
 
         return evict_request_ids
 
@@ -3337,7 +3337,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.active_token_count = 0
 
             # Reset Mamba state.
-            self.reset_mamba_state()
+            self.reset_ssm_state()
             return
 
         # 3. Concatenate the paused tokens to the active tokens if present.
@@ -3384,7 +3384,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 # Reset chunk ids for recently moved requests.
                 self.request_to_kv_block_ids[active_idxs_on_right] = -1
                 if self.is_hybrid_model:
-                    self.mamba_metadata.request_to_mamba_state_idx[active_idxs_on_right] = -1
+                    self.ssm_metadata.request_to_ssm_state_idx[active_idxs_on_right] = -1
 
         # 5. We identify requests that require a new block and add them to the paused requests (i.e move them left) :-
         #       a) Put requests that have filled their current block and  require a new one in a pause state temporarily

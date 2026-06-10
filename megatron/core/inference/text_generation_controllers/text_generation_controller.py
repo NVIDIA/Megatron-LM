@@ -711,24 +711,24 @@ class TextGenerationController:
             # don't need to re-upload prefill_status for the Mamba kernels.
             prefill_status_gpu = context.gpu_view.request_in_prefill_status[:active_request_count]
             accepted_counts_gpu = self._accepted_token_counts_per_request[:active_request_count]
-            mamba_state_idx = context.mamba_metadata.request_to_mamba_state_idx[
+            mamba_state_idx = context.ssm_metadata.request_to_ssm_state_idx[
                 active_request_slice
             ].to(cuda_device, non_blocking=True)
             mamba_state_selective_copy(
-                intermediate_states=context.mamba_intermediate_conv_states,
-                current_states=context.mamba_conv_states,
+                intermediate_states=context.ssm_intermediate_conv_states,
+                current_states=context.ssm_conv_states,
                 prefill_status=prefill_status_gpu,
                 state_idx=mamba_state_idx,
                 accepted_counts=accepted_counts_gpu,
-                num_layers=context.num_mamba_layers,
+                num_layers=context.num_ssm_layers,
             )
             mamba_state_selective_copy(
-                intermediate_states=context.mamba_intermediate_ssm_states,
-                current_states=context.mamba_ssm_states,
+                intermediate_states=context.ssm_intermediate_recurrent_states,
+                current_states=context.ssm_recurrent_states,
                 prefill_status=prefill_status_gpu,
                 state_idx=mamba_state_idx,
                 accepted_counts=accepted_counts_gpu,
-                num_layers=context.num_mamba_layers,
+                num_layers=context.num_ssm_layers,
             )
 
         return blocks_to_release, remove_mask
@@ -1742,8 +1742,8 @@ class TextGenerationController:
             # may swap request indices. The Python lists tracking EOS block IDs
             # and intermediate offsets are not swapped along with tensors, so
             # commit must run while indices are still valid.
-            if context.is_hybrid_model and context.mamba_slot_allocator is not None:
-                context.mamba_slot_allocator.commit_intermediate_states()
+            if context.is_hybrid_model and context.ssm_slot_allocator is not None:
+                context.ssm_slot_allocator.commit_intermediate_states()
 
             # Collect flat routing indices and scatter them into per-block storage.
             # Must be done before update_requests while token-to-block mappings are valid.

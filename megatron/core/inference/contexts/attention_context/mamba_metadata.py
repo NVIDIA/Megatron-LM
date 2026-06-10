@@ -10,11 +10,11 @@ from megatron.core.inference.contexts.mamba_slot_allocator import (
 )
 
 
-class MambaMetadata:
+class SSMMetadata:
     """Manages the metadata tensors required for Mamba layers during inference."""
 
     def __init__(
-        self, max_requests: int, max_tokens: int, mamba_chunk_size: int = 128, d_conv: int = 0
+        self, max_requests: int, max_tokens: int, ssm_chunk_size: int = 128, d_conv: int = 0
     ):
         """
         Initializes the Mamba slot allocator.
@@ -22,21 +22,21 @@ class MambaMetadata:
         Args:
             max_requests (int): The maximum number of concurrent requests.
             max_tokens (int): The maximum number of tokens.
-            mamba_chunk_size (int): The chunk size used by the Mamba SSM Triton kernels.
-            d_conv (int): Convolution window size (from mamba_conv_states_shape[-1]).
+            ssm_chunk_size (int): The chunk size used by the Mamba SSM Triton kernels.
+            d_conv (int): Convolution window size (from ssm_conv_states_shape[-1]).
                 Used for vectorized conv state extraction at intermediate offsets.
         """
         self.max_requests = max_requests
         self.max_tokens = max_tokens
-        self.mamba_chunk_size = mamba_chunk_size
+        self.ssm_chunk_size = ssm_chunk_size
         self.d_conv = d_conv
         self.device = torch.cuda.current_device()
 
         # Maximum possible chunks across all batch configurations
-        self.max_chunks = max_tokens // mamba_chunk_size + max_requests
+        self.max_chunks = max_tokens // ssm_chunk_size + max_requests
 
         # Map from requests to slots in the static Mamba state buffer (CPU for bookkeeping).
-        self.request_to_mamba_state_idx = torch.full(
+        self.request_to_ssm_state_idx = torch.full(
             (self.max_requests,), -1, dtype=torch.int32, device='cpu'
         )
 
@@ -86,10 +86,10 @@ class MambaMetadata:
         self._conv_seq_start_buffer = torch.zeros(max_tokens, dtype=torch.int32, device=self.device)
 
         # Allocator for Mamba state slots (CPU for bookkeeping).
-        self.mamba_state_free_slots = torch.arange(
+        self.ssm_state_free_slots = torch.arange(
             self.max_requests, dtype=torch.int32, device='cpu'
         )
-        self.mamba_state_free_slot_count = self.max_requests
+        self.ssm_state_free_slot_count = self.max_requests
 
         # Intermediate state extraction buffers (CUDA graph compatible)
         # Each prefill request can produce up to 3 intermediate offsets
@@ -112,7 +112,7 @@ class MambaMetadata:
         # by DynamicInferenceContext so that the per-step Mamba metadata fields
         # ride along with the single coalesced H2D in transfer_bookkeeping_to_gpu.
         # The legacy update() path above keeps using the standalone _*_buffer
-        # tensors (exercised only by unit tests that construct MambaMetadata
+        # tensors (exercised only by unit tests that construct SSMMetadata
         # without a context).
         self._cpu_bufs = None
         self._gpu_view = None
@@ -137,15 +137,15 @@ class MambaMetadata:
         """
         Resets all Mamba states and frees all allocated slots.
         """
-        self.request_to_mamba_state_idx.fill_(-1)
+        self.request_to_ssm_state_idx.fill_(-1)
 
         self.reset_varlen_metadata()
 
         # Re-initialize the free slot pool
-        self.mamba_state_free_slots = torch.arange(
+        self.ssm_state_free_slots = torch.arange(
             self.max_requests, dtype=torch.int32, device='cpu'
         )
-        self.mamba_state_free_slot_count = self.max_requests
+        self.ssm_state_free_slot_count = self.max_requests
 
     def reset_varlen_metadata(self) -> None:
         """Resets varlen metadata."""
@@ -174,7 +174,7 @@ class MambaMetadata:
 
     def update(
         self,
-        active_mamba_indices: torch.Tensor,
+        active_ssm_indices: torch.Tensor,
         token_to_request_idx: torch.Tensor,
         cu_seqlens: torch.Tensor,
         batch_dimensions: InferenceBatchDimensions,
@@ -188,7 +188,7 @@ class MambaMetadata:
         of currently active requests.
 
         Args:
-            active_mamba_indices (Tensor): Tensor containing the Mamba slot indices
+            active_ssm_indices (Tensor): Tensor containing the Mamba slot indices
                                            for active requests.
             token_to_request_idx (Tensor): Map from token index to request index.
             cu_seqlens (Tensor): Cumulative sequence lengths.
@@ -209,7 +209,7 @@ class MambaMetadata:
         if padded_decode_count > 0:
             # Update decode indices
             self._batch_indices_decode_buffer[:real_decode_count].copy_(
-                active_mamba_indices[:real_decode_count]
+                active_ssm_indices[:real_decode_count]
             )
             if padded_decode_count > real_decode_count:
                 self._batch_indices_decode_buffer[real_decode_count:padded_decode_count] = -1
@@ -220,7 +220,7 @@ class MambaMetadata:
             if real_prefill_count > 0:
                 prefill_start_idx = real_decode_count
                 self._batch_indices_prefill_buffer[:real_prefill_count].copy_(
-                    active_mamba_indices[prefill_start_idx : prefill_start_idx + real_prefill_count]
+                    active_ssm_indices[prefill_start_idx : prefill_start_idx + real_prefill_count]
                 )
 
             if padded_prefill_count > real_prefill_count:
@@ -277,10 +277,10 @@ class MambaMetadata:
 
             # Build cu_chunk_seqlens, last_chunk_indices, seq_idx_for_varlen.
             # Covers all padded sequences (real + padding). Each sequence is
-            # subdivided into chunks of at most mamba_chunk_size tokens. Zero-length
+            # subdivided into chunks of at most ssm_chunk_size tokens. Zero-length
             # sequences get a single zero-length chunk.
             cu_seqlens_all = self._cu_seqlens_buffer[: padded_prefill_count + 1].tolist()
-            chunk_size = self.mamba_chunk_size
+            chunk_size = self.ssm_chunk_size
             chunk_boundaries = [0]
             last_chunk_idx_list = []
             chunk_to_seq_list = []
@@ -386,7 +386,7 @@ class MambaMetadata:
                 :meth:`update`; the coalesced production path passes the
                 shared ``ContextGPUView.mamba_cu_seqlens`` view.
         """
-        chunk_size = self.mamba_chunk_size
+        chunk_size = self.ssm_chunk_size
         max_count = padded_prefill_count * MAX_INTERMEDIATE_OFFSETS_PER_REQUEST
         if cu_seqlens_gpu is None:
             cu_seqlens_gpu = self._cu_seqlens_buffer
@@ -474,7 +474,7 @@ class MambaMetadata:
 
     def compute_cpu_metadata(
         self,
-        active_mamba_indices: torch.Tensor,
+        active_ssm_indices: torch.Tensor,
         token_to_request_idx: torch.Tensor,
         cpu_cu_query: torch.Tensor,
         batch_dimensions: InferenceBatchDimensions,
@@ -492,7 +492,7 @@ class MambaMetadata:
         tensors, which :meth:`load_from_cpu` consumes after the H2D.
 
         Args:
-            active_mamba_indices: CPU tensor of Mamba slot indices for active requests.
+            active_ssm_indices: CPU tensor of Mamba slot indices for active requests.
             token_to_request_idx: CPU tensor mapping tokens to request indices.
             cpu_cu_query: CPU cumulative query lengths from MHA metadata computation.
             batch_dimensions: Dimensions of the current batch.
@@ -509,7 +509,7 @@ class MambaMetadata:
         padded_decode_count = padded_batch_dimensions.decode_req_count
         padded_prefill_count = padded_batch_dimensions.prefill_req_count
         padded_token_count = padded_batch_dimensions.token_count
-        chunk_size = self.mamba_chunk_size
+        chunk_size = self.ssm_chunk_size
 
         result = {
             "padded_decode_count": padded_decode_count,
@@ -521,7 +521,7 @@ class MambaMetadata:
 
         # Decode batch indices (write into pinned view; padded slots = -1).
         if padded_decode_count > 0:
-            bufs['batch_indices_decode'][:real_decode_count] = active_mamba_indices[
+            bufs['batch_indices_decode'][:real_decode_count] = active_ssm_indices[
                 :real_decode_count
             ]
             if padded_decode_count > real_decode_count:
@@ -531,7 +531,7 @@ class MambaMetadata:
         if padded_prefill_count > 0:
             if real_prefill_count > 0:
                 start = real_decode_count
-                bufs['batch_indices_prefill'][:real_prefill_count] = active_mamba_indices[
+                bufs['batch_indices_prefill'][:real_prefill_count] = active_ssm_indices[
                     start : start + real_prefill_count
                 ]
             if padded_prefill_count > real_prefill_count:
@@ -698,14 +698,14 @@ class MambaMetadata:
             int: The index of the allocated slot.
             Returns None if no slots are available.
         """
-        if self.mamba_state_free_slot_count == 0:
+        if self.ssm_state_free_slot_count == 0:
             return None
 
         # Get a free slot
-        self.mamba_state_free_slot_count -= 1
-        mamba_idx = self.mamba_state_free_slots[self.mamba_state_free_slot_count]
+        self.ssm_state_free_slot_count -= 1
+        ssm_idx = self.ssm_state_free_slots[self.ssm_state_free_slot_count]
 
-        return mamba_idx
+        return ssm_idx
 
     def batch_allocate_slots(self, num_slots: int) -> Optional[torch.Tensor]:
         """
@@ -715,16 +715,16 @@ class MambaMetadata:
             torch.Tensor: The indices of the allocated slots.
             Returns None if not enough slots are available.
         """
-        if self.mamba_state_free_slot_count < num_slots:
+        if self.ssm_state_free_slot_count < num_slots:
             return None
 
         # Get free slots
-        self.mamba_state_free_slot_count -= num_slots
-        mamba_idx = self.mamba_state_free_slots[
-            self.mamba_state_free_slot_count : self.mamba_state_free_slot_count + num_slots
+        self.ssm_state_free_slot_count -= num_slots
+        ssm_idx = self.ssm_state_free_slots[
+            self.ssm_state_free_slot_count : self.ssm_state_free_slot_count + num_slots
         ]
 
-        return mamba_idx
+        return ssm_idx
 
     def free_slots(self, request_indices: torch.Tensor) -> None:
         """
@@ -734,18 +734,18 @@ class MambaMetadata:
             request_indices (Tensor): A 1D tensor of request indices to free.
         """
         # Get the Mamba state indices for finished requests
-        mamba_indices_to_free = self.request_to_mamba_state_idx[request_indices]
+        ssm_indices_to_free = self.request_to_ssm_state_idx[request_indices]
 
         # Filter out any invalid indices (e.g., -1)
-        mamba_indices_to_free = mamba_indices_to_free[mamba_indices_to_free != -1]
-        num_to_free = len(mamba_indices_to_free)
+        ssm_indices_to_free = ssm_indices_to_free[ssm_indices_to_free != -1]
+        num_to_free = len(ssm_indices_to_free)
 
         if num_to_free > 0:
             # Add the freed indices back to the free slot pool
-            start_idx = self.mamba_state_free_slot_count
+            start_idx = self.ssm_state_free_slot_count
             end_idx = start_idx + num_to_free
-            self.mamba_state_free_slots[start_idx:end_idx] = mamba_indices_to_free
-            self.mamba_state_free_slot_count = end_idx
+            self.ssm_state_free_slots[start_idx:end_idx] = ssm_indices_to_free
+            self.ssm_state_free_slot_count = end_idx
 
         # Invalidate the Mamba state index for the finished requests
-        self.request_to_mamba_state_idx[request_indices] = -1
+        self.request_to_ssm_state_idx[request_indices] = -1

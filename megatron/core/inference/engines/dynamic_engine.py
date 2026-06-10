@@ -1546,7 +1546,7 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         if not req.precomputed_block_hashes:
             return 0
-        mamba_map = self.context.mamba_slot_allocator.hash_to_block_id
+        mamba_map = self.context.ssm_slot_allocator.hash_to_block_id
         for i in range(len(req.precomputed_block_hashes) - 1, -1, -1):
             if req.precomputed_block_hashes[i] in mamba_map:
                 return i + 1
@@ -1577,7 +1577,7 @@ class DynamicInferenceEngine(AbstractEngine):
         mamba_caching_enabled = (
             prefix_caching_enabled
             and self.context.is_hybrid_model
-            and self.context.mamba_slot_allocator is not None
+            and self.context.ssm_slot_allocator is not None
         )
         if prefix_caching_enabled:
             pending_block_hashes = set()
@@ -1643,7 +1643,7 @@ class DynamicInferenceEngine(AbstractEngine):
         mamba_caching_enabled = (
             prefix_caching_enabled
             and self.context.is_hybrid_model
-            and self.context.mamba_slot_allocator is not None
+            and self.context.ssm_slot_allocator is not None
         )
         if prefix_caching_enabled:
             pending_block_hashes = set()
