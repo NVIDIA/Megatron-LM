@@ -9,49 +9,9 @@ import, before any cuBLAS / TE call inside a test module.
 """
 
 import random
-from contextlib import contextmanager
 
 import numpy as np
 import torch
-
-from megatron.core.timers import Timer
-
-
-class _Elapsed:
-    """Simple holder so ``with cuda_timer() as t:`` users can read
-    ``t.elapsed_ms`` after the block."""
-
-    def __init__(self) -> None:
-        self.elapsed_ms: float = 0.0
-
-
-@contextmanager
-def cuda_timer(name: str = "cuda_timer"):
-    """CUDA-synchronised wall-clock timer as a Python context manager.
-
-    Wraps ``megatron.core.timers.Timer`` (the same primitive Megatron training
-    uses for step timing) — ``.start()`` and ``.stop()`` both call
-    ``torch.cuda.synchronize()`` so the measured window is properly bracketed
-    even when GPU work is queued asynchronously.
-
-    Usage:
-        with cuda_timer("my-step") as t:
-            ... gpu work ...
-        # t.elapsed_ms is the elapsed wall time in milliseconds.
-    """
-    # NOTE: do NOT call ``Timer.elapsed(reset=False)`` — its restart-if-running
-    # branch (megatron/core/timers.py:208-209) issues an extra
-    # ``cuda.synchronize`` and leaves the discarded Timer in ``_started=True``,
-    # inflating measurement asymmetrically across the fwd/bwd/opt blocks.
-    timer = Timer(name)
-    box = _Elapsed()
-    timer.start()
-    try:
-        yield box
-    finally:
-        timer.stop()
-        box.elapsed_ms = timer.elapsed(reset=False) * 1000.0
-
 
 try:
     # Public-by-import helper used by PyTorch's own test_cuda.py to convert
@@ -354,32 +314,3 @@ def maybe_fsdp_wrap(model: torch.nn.Module, parallelism: dict) -> torch.nn.Modul
     return FullyShardedDataParallel(
         config=config, ddp_config=ddp_config, module=model, pg_collection=pg_collection
     )
-
-
-def make_forward_step_func(make_inputs_dict, autocast_dtype: torch.dtype = torch.bfloat16):
-    """Return a ``forward_step_func`` suitable for ``get_forward_backward_func``.
-
-    ``make_inputs_dict`` is a no-arg callable producing the kwargs dict for
-    ``model(...)`` for the *current* microbatch. The loss is ``logits.pow(2).mean()``
-    so the determinism check has a non-trivial gradient signal.
-    """
-
-    def forward_step(data_iterator, model):
-        batch = next(data_iterator)
-        with torch.autocast("cuda", dtype=autocast_dtype):
-            output = model(**batch)
-
-        def loss_func(output_tensor):
-            loss = output_tensor.float().pow(2).mean()
-            return loss, {"loss": loss.detach().clone()}
-
-        return output, loss_func
-
-    return forward_step
-
-
-def infinite_iter(make_inputs_dict):
-    """Yield ``make_inputs_dict()`` forever — used as ``data_iterator`` for
-    ``get_forward_backward_func``."""
-    while True:
-        yield make_inputs_dict()
