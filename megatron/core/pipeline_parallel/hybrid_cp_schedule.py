@@ -545,9 +545,15 @@ def hybrid_context_parallel_forward_backward(
             )
             sample["local_cp_size"] = torch.tensor(partner_cp_size, dtype=torch.int32)
             new_data_iterator = RerunDataIterator(iter([sample]))
-            return new_data_iterator
         else:
-            return None
+            partner_cp_size = 0
+            new_data_iterator = None
+
+        partner_cp_size_tensor = torch.tensor(
+            [partner_cp_size], dtype=torch.int32, device=torch.cuda.current_device()
+        )
+        _broadcast(partner_cp_size_tensor)
+        return new_data_iterator, int(partner_cp_size_tensor.item())
 
     # We get data once per global batch and schedule the sub-samples.
     # TODO(pmannan): Should we wrap the data_iterator here instead of the training.py file?
@@ -579,7 +585,7 @@ def hybrid_context_parallel_forward_backward(
             sample_ids_this_group = sample_id_groups[j][hdp_rank] if is_first_tp_rank else None
             for i in range(num_samples_this_group[j]):
                 # Call forward step for each sub-sample
-                new_data_iterator = _get_new_data_iterator(i, j)
+                new_data_iterator, cp_group_size = _get_new_data_iterator(i, j)
                 # TODO: Find the usage of current_microbatch and is_first_microbatch and
                 # how that may affect my usage.
                 output_tensor, num_tokens = forward_step(
@@ -590,7 +596,8 @@ def hybrid_context_parallel_forward_backward(
                     input_tensor,
                     forward_data_store,
                     config,
-                    collect_non_loss_data,
+                    cp_group_size=cp_group_size,
+                    collect_non_loss_data=collect_non_loss_data,
                     is_first_microbatch=check_first_val_step(
                         first_val_step, forward_only, current_microbatch == 0
                     ),
@@ -599,9 +606,7 @@ def hybrid_context_parallel_forward_backward(
                 current_microbatch += 1
                 total_num_tokens += num_tokens.item()
                 if not forward_only:
-                    backward_step(
-                        input_tensor, output_tensor, output_tensor_grad, model_type, config
-                    )
+                    backward_step(input_tensor, output_tensor, output_tensor_grad, config)
 
             # Create a barrier at end of each group.
             # This barrier ensures that all ranks are prepared to change assigned CP group sizes and
@@ -614,7 +619,7 @@ def hybrid_context_parallel_forward_backward(
     with no_sync_func():
         sample_ids_this_group = sample_id_groups[-1][hdp_rank] if is_first_tp_rank else None
         for i in range(num_samples_this_group[-1] - 1):
-            new_data_iterator = _get_new_data_iterator(i, -1)
+            new_data_iterator, cp_group_size = _get_new_data_iterator(i, -1)
             # Call forward step for each sub-sample
             output_tensor, num_tokens = forward_step(
                 forward_step_func,
@@ -624,7 +629,8 @@ def hybrid_context_parallel_forward_backward(
                 input_tensor,
                 forward_data_store,
                 config,
-                collect_non_loss_data,
+                cp_group_size=cp_group_size,
+                collect_non_loss_data=collect_non_loss_data,
                 is_first_microbatch=check_first_val_step(
                     first_val_step, forward_only, current_microbatch == 0
                 ),
@@ -633,11 +639,11 @@ def hybrid_context_parallel_forward_backward(
             current_microbatch += 1
             total_num_tokens += num_tokens.item()
             if not forward_only:
-                backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+                backward_step(input_tensor, output_tensor, output_tensor_grad, config)
 
     # The last sub-sample of the last group of the last microbatch is
     # run out of the context handler.
-    new_data_iterator = _get_new_data_iterator(-1, -1)
+    new_data_iterator, cp_group_size = _get_new_data_iterator(-1, -1)
     # Call forward step for each sub-sample
     output_tensor, num_tokens = forward_step(
         forward_step_func,
@@ -647,7 +653,8 @@ def hybrid_context_parallel_forward_backward(
         input_tensor,
         forward_data_store,
         config,
-        collect_non_loss_data,
+        cp_group_size=cp_group_size,
+        collect_non_loss_data=collect_non_loss_data,
         is_first_microbatch=check_first_val_step(
             first_val_step, forward_only, current_microbatch == 0
         ),
@@ -655,6 +662,6 @@ def hybrid_context_parallel_forward_backward(
     )
     total_num_tokens += num_tokens.item()
     if not forward_only:
-        backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config)
+        backward_step(input_tensor, output_tensor, output_tensor_grad, config)
 
     return forward_data_store, total_num_tokens
