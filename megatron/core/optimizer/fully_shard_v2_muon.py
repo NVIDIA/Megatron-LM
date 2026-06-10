@@ -197,8 +197,8 @@ class FullyShardV2Muon(torch.optim.Optimizer):
             packages = list(by_group.values())
         self._packages = [list(p) for p in packages]
 
-        # Precompute the static per-package isend/irecv plan; step() only fires the P2Ps.
-        self._gather_plans, self._scatter_plans = self._build_comm_plans()
+        # Precompute the static per-package NS and P2P plans; step() only fires the P2Ps.
+        self._ns_plans, self._gather_plans, self._scatter_plans = self._build_plans()
 
     def _compute_shard_ranges(self):
         """Compute, per param, each DP rank's (flat_offset, size) within the full param.
@@ -279,35 +279,24 @@ class FullyShardV2Muon(torch.optim.Optimizer):
                 load[best] += ns_cost
         return roots
 
-    def _build_comm_plans(self):
-        """Precompute the STATIC isend/irecv plan per package; step() just fires the P2Ps,
-        which read/write the grad / full-grad / orth tensors directly (no pack, no alloc —
-        split-root full grads are preallocated in __init__).
+    def _build_plans(self):
+        """Precompute per-package NS order and P2P send/recv lists.
 
-        Both ends walk params in ``package`` order so same-(sender, receiver) P2Ps pair
-        up, and each plan is the symmetric {group, send, recv}.
-          1. gather — route each rank's grad shard to that param's root:
-             - root == this rank, SPLIT: irecv the OTHER holders' shards into the
-               preallocated full grad (Phase 1 wrote our own segment).
-             - root == this rank, SINGLE holder: no P2P — the grad shard already IS the
-               full grad.
-             - else we hold a shard: isend it to the root.
-          2. scatter — the inverse: isend each OTHER holder's shard out of the orth, irecv
-             our shard into the grad. Our own shard is read straight from the orth by
-             Phase 3b, never touching the grad.
+        NS plan splits rooted grads so comm-free NS covers exposed comm:
 
-        Returns (gather_plans, scatter_plans), parallel to self._packages; each a dict:
-          gather:  group,
-                   rooted = [param_idx],                     # params rooted on this rank
-                   send = [(param_idx, root)],                # isend grad.to_local() -> root
-                   recv = [(param_idx, src, offset, size)],   # irecv src shard -> full_grad[offset:]
-          scatter: group,
-                   send = [(param_idx, dst, offset, size)],   # isend orth[offset:] -> dst
-                   recv = [(param_idx, root)],                # irecv -> grad.to_local()
-        _issue_gather returns the rooted full-grad views along with the in-flight
-        P2P works; the views become valid after the works complete.
+            issue gather(i + 1)
+            NS(pre_comm)        # overlaps gather(i); single-holder grads
+            wait gather(i)
+            NS(wait_comm)       # depends on gather(i); split-root grads
+            issue scatter(i)
+            NS(post_comm)       # overlaps scatter(i); single-holder grads
+
+        Gather routes local post-momentum shards to each param's root, e.g.
+        ``send=(param_idx, root)`` or ``recv=(param_idx, src, offset, size)``.
+        Scatter is the reverse: roots send orth shards to non-root holders, while
+        the root reads its own orth shard locally.
         """
-        gather_plans, scatter_plans = [], []
+        ns_plans, gather_plans, scatter_plans = [], [], []
         for package in self._packages:
             group, this_rank, world_size = self._comm[package[0]]
 
@@ -327,7 +316,25 @@ class FullyShardV2Muon(torch.optim.Optimizer):
                     # single holder: grad shard already is the full grad -> no P2P
                 elif ranges[this_rank][1] > 0:
                     send.append((param_idx, root))
-            gather_plans.append({"group": group, "rooted": rooted, "send": send, "recv": recv})
+            comm_free_rooted, wait_comm_rooted = [], []
+            for param_idx in rooted:
+                shape = self._main_weights[param_idx].shape
+                full_grad = self._full_grads.get(param_idx, self._managed[param_idx][3])
+                full_grad = full_grad.view(shape)
+                if param_idx in self._full_grads:
+                    wait_comm_rooted.append((param_idx, full_grad))
+                else:
+                    comm_free_rooted.append((param_idx, full_grad))
+
+            split = (len(comm_free_rooted) + 1) // 2
+            ns_plans.append(
+                {
+                    "pre_comm": comm_free_rooted[:split],
+                    "wait_comm": wait_comm_rooted,
+                    "post_comm": comm_free_rooted[split:],
+                }
+            )
+            gather_plans.append({"group": group, "send": send, "recv": recv})
 
             # ---- scatter: each root's orth shard -> its OTHER holders (inverse of gather);
             #      the root's own shard is read straight from the orth by Phase 3b ----
@@ -344,18 +351,13 @@ class FullyShardV2Muon(torch.optim.Optimizer):
                 elif ranges[this_rank][1] > 0:
                     recv.append((param_idx, root))
             scatter_plans.append({"group": group, "send": send, "recv": recv})
-        return gather_plans, scatter_plans
+        return ns_plans, gather_plans, scatter_plans
 
     @torch.no_grad()
     def _issue_gather(self, p):
-        """Fire the package's gather P2Ps and return rooted full-grad views + Works."""
+        """Fire the package's gather P2Ps and return Works."""
         plan = self._gather_plans[p]
         group = plan["group"]
-        full_grads = {}
-        for param_idx in plan["rooted"]:
-            shape = self._main_weights[param_idx].shape
-            full_grad = self._full_grads.get(param_idx, self._managed[param_idx][3])
-            full_grads[param_idx] = full_grad.view(shape)
 
         ops = []
         for param_idx, root in plan["send"]:
@@ -368,7 +370,7 @@ class FullyShardV2Muon(torch.optim.Optimizer):
                 torch.distributed.irecv,
                 self._full_grads[param_idx].reshape(-1)[offset : offset + size], src, group=group,
             ))
-        return full_grads, torch.distributed.batch_isend_irecv(ops) if ops else []
+        return torch.distributed.batch_isend_irecv(ops) if ops else []
 
     @torch.no_grad()
     def _issue_scatter(self, p, orths):
@@ -448,21 +450,31 @@ class FullyShardV2Muon(torch.optim.Optimizer):
         num_packages = len(self._packages)
         scatter_reqs = []  # in-flight scatter Works per package
         owned_orths = {}   # param_idx -> full orth this rank rooted (read by Phase 3b)
-        gather_work = self._issue_gather(0) if num_packages else None
+        gather_reqs_by_package = [[] for _ in range(num_packages)]
+        if num_packages:
+            gather_reqs_by_package[0] = self._issue_gather(0)
         for i in range(num_packages):
-            next_gather_work = self._issue_gather(i + 1) if i + 1 < num_packages else None
-            full_grads, gather_reqs = gather_work
-            for req in gather_reqs:
-                req.wait()
+            if i + 1 < num_packages:
+                gather_reqs_by_package[i + 1] = self._issue_gather(i + 1)
+            ns_plan = self._ns_plans[i]
             orths = {
                 param_idx: self.orthogonalize(self._main_weights[param_idx], full_grad).to(
                     full_grad.dtype
                 )
-                for param_idx, full_grad in full_grads.items()
+                for param_idx, full_grad in ns_plan["pre_comm"]
             }
+            for req in gather_reqs_by_package[i]:
+                req.wait()
+            for param_idx, full_grad in ns_plan["wait_comm"]:
+                orths[param_idx] = self.orthogonalize(
+                    self._main_weights[param_idx], full_grad
+                ).to(full_grad.dtype)
             owned_orths.update(orths)
             scatter_reqs.append(self._issue_scatter(i, orths))
-            gather_work = next_gather_work
+            for param_idx, full_grad in ns_plan["post_comm"]:
+                owned_orths[param_idx] = self.orthogonalize(
+                    self._main_weights[param_idx], full_grad
+                ).to(full_grad.dtype)
 
         # Drain scatters: each non-root holder now has its orth shard irecv'd into its grad.
         for reqs in scatter_reqs:
