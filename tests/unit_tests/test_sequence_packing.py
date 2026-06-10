@@ -330,6 +330,29 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp, loc
         unset_global_variables()
 
 
+def test_packed_sequence_vpp_builds_data_only_on_boundary_chunks(monkeypatch):
+    """Packed VPP should not build full data iterators for non-boundary VP chunks."""
+
+    import pretrain_gpt
+
+    args = SimpleNamespace(virtual_pipeline_model_parallel_size=2)
+    config = SimpleNamespace()
+
+    monkeypatch.setattr(pretrain_gpt, "get_args", lambda: args)
+    monkeypatch.setattr(pretrain_gpt, "core_transformer_config_from_args", lambda _: config)
+    monkeypatch.setattr(pretrain_gpt.parallel_state, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(pretrain_gpt, "mtp_on_this_rank", lambda *_, **__: False)
+    monkeypatch.setattr(
+        pretrain_gpt, "is_first_or_last_pipeline_stage", lambda vp_stage: vp_stage == 1
+    )
+
+    assert not pretrain_gpt.is_dataset_built_on_rank(vp_stage=0, is_packed_sequence=True)
+    assert pretrain_gpt.is_dataset_built_on_rank(vp_stage=1, is_packed_sequence=True)
+
+    args.virtual_pipeline_model_parallel_size = None
+    assert pretrain_gpt.is_dataset_built_on_rank(vp_stage=0, is_packed_sequence=True)
+
+
 @pytest.mark.parametrize(
     ("tp", "pp", "cp", "vpp", "scheduler_type"),
     [

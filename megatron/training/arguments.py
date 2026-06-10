@@ -1751,6 +1751,29 @@ def validate_args(args, defaults={}):
 
         torch.use_deterministic_algorithms(True)
 
+    # Auto-derive cuda_graph_num_microbatch_slots for local+chunk dynamic-microbatch graphs when
+    # the user does not pass it, so the feature works without manual slot tuning. The slot count
+    # must cover the per-chunk in-flight (forward-issued, backward-pending) microbatch count of the
+    # 1F1B(+VPP) schedule -- a pure-topology quantity, independent of the runtime microbatch count.
+    # pp * vpp is a safe, rank-invariant upper bound usable at arg time (parallel_state is not yet
+    # initialized here). NOTE: this can over-provision by ~vpp x; for tighter memory, compute the
+    # exact value post-parallel-init via build_chunk_cuda_graph_slot_plan_from_schedule(...)
+    # .num_slots_per_chunk (all-reduced MAX over the PP group) at a collective-safe point.
+    if (
+        getattr(args, 'cuda_graph_impl', None) == 'local'
+        and getattr(args, 'cuda_graph_granularity', None) == 'chunk'
+        and getattr(args, 'cuda_graph_dynamic_microbatches', False)
+        and getattr(args, 'cuda_graph_num_microbatch_slots', None) is None
+    ):
+        _vpp = args.virtual_pipeline_model_parallel_size or 1
+        args.cuda_graph_num_microbatch_slots = args.pipeline_model_parallel_size * _vpp
+        print(
+            f"[cuda-graph] cuda_graph_num_microbatch_slots auto-set to "
+            f"{args.cuda_graph_num_microbatch_slots} (pp={args.pipeline_model_parallel_size}, "
+            f"vpp={_vpp}); pass --cuda-graph-num-microbatch-slots to override.",
+            flush=True,
+        )
+
     # Update the printed args to reflect that `apply_query_key_layer_scaling` also controls `attention_softmax_in_fp32`
     if args.apply_query_key_layer_scaling:
         args.attention_softmax_in_fp32 = True

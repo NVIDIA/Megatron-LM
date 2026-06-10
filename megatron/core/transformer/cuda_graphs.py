@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import time
+import weakref
 from collections import defaultdict
 from contextlib import nullcontext
 from copy import deepcopy
@@ -15,11 +16,12 @@ from enum import Enum
 from functools import partial
 from itertools import chain, zip_longest
 from math import ceil
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch.utils._pytree import tree_map as tree_map_pyt
 
+from megatron.core import parallel_state
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
@@ -28,11 +30,20 @@ from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
     is_checkpointing,
 )
+from megatron.core.transformer.chunk_cuda_graphs import (
+    ChunkCudaGraphRuntimeSlots,
+    build_chunk_cuda_graph_slot_plan,
+    build_chunk_cuda_graph_slot_plan_from_schedule,
+    get_cuda_graph_schedule_stage_order,
+    get_cuda_graph_schedule_stage_order_from_counts,
+    get_probe_num_microbatches_for_dynamic_slots,
+)
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
     get_attr_wrapped_model,
+    get_model_config,
     get_torch_version,
     is_te_min_version,
     log_on_each_pipeline_stage,
@@ -67,6 +78,163 @@ except:
 _IS_GRAPH_CAPTURING = False
 _IS_GRAPH_WARMUP = False
 logger = logging.getLogger(__name__)
+
+
+def _iter_module_tree(module):
+    """Return ``module.modules()`` when available, otherwise an empty iterator."""
+    modules = getattr(module, "modules", None)
+    return modules() if callable(modules) else ()
+
+
+def _iter_module_buffers(module):
+    """Return ``module.buffers()`` when available, otherwise an empty iterator."""
+    buffers = getattr(module, "buffers", None)
+    return buffers() if callable(buffers) else ()
+
+
+def _iter_module_parameters(module):
+    """Return ``module.parameters()`` when available, otherwise an empty iterator."""
+    parameters = getattr(module, "parameters", None)
+    return parameters() if callable(parameters) else ()
+
+
+def _snapshot_moe_metrics_tracker(moe_metrics_tracker):
+    """Snapshot MoE metrics so graph warmup/capture does not affect step logging."""
+    from megatron.core.transformer.moe.moe_logging import MetricEntry
+
+    return {
+        name: MetricEntry(
+            values=entry.values.clone(),
+            reduce_group=entry.reduce_group,
+            avg_group=entry.avg_group,
+            needs_dp_avg=entry.needs_dp_avg,
+        )
+        for name, entry in moe_metrics_tracker.metrics.items()
+    }
+
+
+def _restore_moe_metrics_tracker(moe_metrics_tracker, cached_moe_metrics):
+    """Restore MoE metrics after CUDA graph capture warmup."""
+    from megatron.core.transformer.moe.moe_logging import MetricEntry
+
+    for name in list(moe_metrics_tracker.metrics.keys()):
+        if name not in cached_moe_metrics:
+            del moe_metrics_tracker.metrics[name]
+
+    for name, cached_entry in cached_moe_metrics.items():
+        if name not in moe_metrics_tracker.metrics:
+            moe_metrics_tracker.metrics[name] = MetricEntry(
+                values=cached_entry.values.clone(),
+                reduce_group=cached_entry.reduce_group,
+                avg_group=cached_entry.avg_group,
+                needs_dp_avg=cached_entry.needs_dp_avg,
+            )
+            continue
+
+        entry = moe_metrics_tracker.metrics[name]
+        if (
+            entry.values.shape != cached_entry.values.shape
+            or entry.values.dtype != cached_entry.values.dtype
+            or entry.values.device != cached_entry.values.device
+        ):
+            entry.values = cached_entry.values.clone()
+        else:
+            entry.values.copy_(cached_entry.values)
+        entry.reduce_group = cached_entry.reduce_group
+        entry.avg_group = cached_entry.avg_group
+        entry.needs_dp_avg = cached_entry.needs_dp_avg
+
+
+def _snapshot_cuda_rng_states():
+    """Snapshot CUDA RNG states that graph warmup/capture may advance."""
+    cuda_rng_state = torch.cuda.get_rng_state()
+    tracker_rng_states = {}
+    for name, state in get_all_rng_states().items():
+        if torch.is_tensor(state):
+            tracker_rng_states[name] = ("tensor", state.clone())
+        elif hasattr(state, "get_state"):
+            tracker_rng_states[name] = ("generator", state.get_state())
+    return cuda_rng_state, tracker_rng_states
+
+
+def _restore_cuda_rng_states(rng_state):
+    """Restore CUDA RNG states captured by ``_snapshot_cuda_rng_states``."""
+    cuda_rng_state, tracker_rng_states = rng_state
+    torch.cuda.set_rng_state(cuda_rng_state)
+    current_tracker_states = get_all_rng_states()
+    for name, (state_type, state) in tracker_rng_states.items():
+        if name not in current_tracker_states:
+            continue
+        current_state = current_tracker_states[name]
+        if state_type == "tensor":
+            current_state.copy_(state)
+        elif state_type == "generator":
+            current_state.set_state(state)
+
+
+def _snapshot_module_grad_state(module):
+    """Snapshot parameter gradient state that graph warmup/capture may mutate."""
+    grad_state = []
+    for param in _iter_module_parameters(module):
+        had_main_grad = hasattr(param, "main_grad")
+        main_grad = getattr(param, "main_grad", None)
+        param_grad = param.grad
+        grad_added = getattr(param, "grad_added_to_main_grad", None)
+        grad_state.append(
+            (
+                param,
+                main_grad.clone() if torch.is_tensor(main_grad) else None,
+                main_grad is None,
+                had_main_grad,
+                param_grad.clone() if torch.is_tensor(param_grad) else None,
+                param_grad is None,
+                grad_added,
+                hasattr(param, "grad_added_to_main_grad"),
+            )
+        )
+    return grad_state
+
+
+def _restore_module_grad_state(grad_state):
+    """Restore parameter gradient state captured by ``_snapshot_module_grad_state``."""
+    for (
+        param,
+        main_grad_backup,
+        main_grad_was_none,
+        had_main_grad,
+        grad_backup,
+        grad_was_none,
+        grad_added_backup,
+        had_grad_added,
+    ) in grad_state:
+        if had_main_grad:
+            main_grad = getattr(param, "main_grad", None)
+            if main_grad_was_none:
+                param.main_grad = None
+            elif torch.is_tensor(main_grad):
+                main_grad.copy_(main_grad_backup)
+            else:
+                param.main_grad = main_grad_backup.clone()
+        elif hasattr(param, "main_grad"):
+            delattr(param, "main_grad")
+
+        if grad_was_none:
+            param.grad = None
+        elif torch.is_tensor(param.grad):
+            param.grad.copy_(grad_backup)
+        else:
+            param.grad = grad_backup.clone()
+
+        if had_grad_added:
+            param.grad_added_to_main_grad = grad_added_backup
+        elif hasattr(param, "grad_added_to_main_grad"):
+            delattr(param, "grad_added_to_main_grad")
+
+
+def _make_local_chunk_dry_run_grad_outputs(out_tensors):
+    """Use nonzero output grads so dry-run backward records the real compute path."""
+    return tuple(torch.ones_like(tensor) for tensor in out_tensors)
+
 
 # Freeze GC during capture.
 # TODO (@lmcafee): remove all freeze-GC code once most users are on PyTorch 2.9+.
@@ -200,6 +368,14 @@ class TensorReusePool:
         self.tensor_strong_refs_dataptrs.add(out.data_ptr())
         return out
 
+    def allocate(self, meta: ArgMetadata):
+        """Allocate a new owned buffer without making it available for reuse."""
+        assert isinstance(meta, ArgMetadata)
+        out = meta.zeros_like()
+        self.tensor_strong_refs.append(out)
+        self.tensor_strong_refs_dataptrs.add(out.data_ptr())
+        return out
+
 
 def tree_map(func, tree):
     """
@@ -218,6 +394,20 @@ def tree_map(func, tree):
         return func(arg)
 
     return tree_map_pyt(wrapper, tree)
+
+
+def _clone_cuda_graph_dry_run_tree(tree):
+    """Clone tensor leaves so dry-run graph recording cannot mutate live schedule tensors."""
+
+    def clone_value(value):
+        if not torch.is_tensor(value):
+            return value
+        cloned = value.detach().clone()
+        if value.requires_grad and (cloned.is_floating_point() or cloned.is_complex()):
+            cloned.requires_grad_(True)
+        return cloned
+
+    return tree_map(clone_value, tree)
 
 
 def _check_supported_type(meta):
@@ -273,6 +463,35 @@ def _determine_if_first_last_layer_of_this_vp_chunk(base_module):
         base_module.layer_number in first_layer_numbers,
         base_module.layer_number in last_layer_numbers,
     )
+
+
+def _infer_local_chunk_model_chunk_id(base_module):
+    """Infer a TransformerBlock's local VPP chunk id for local chunk CUDA graphs."""
+    if hasattr(base_module, "cuda_graph_model_chunk_id"):
+        return base_module.cuda_graph_model_chunk_id
+
+    vp_size = base_module.config.virtual_pipeline_model_parallel_size or 1
+    if vp_size == 1:
+        return 0
+
+    layers = getattr(base_module, "layers", None)
+    if not layers:
+        return None
+    first_layer = layers[0]
+    layer_number = getattr(first_layer, "layer_number", None)
+    if layer_number is None:
+        return None
+
+    # import modules here to avoid a circular import
+    from megatron.core.transformer.transformer_block import get_num_layers_to_build
+    from megatron.core.transformer.transformer_layer import get_transformer_layer_offset
+
+    for vp_stage in range(vp_size):
+        layer_offset = get_transformer_layer_offset(base_module.config, vp_stage=vp_stage)
+        num_layers_to_build = get_num_layers_to_build(base_module.config, vp_stage=vp_stage)
+        if layer_offset < layer_number <= layer_offset + num_layers_to_build:
+            return vp_stage
+    return None
 
 
 def _clone_nested_tensors(value: Any) -> Any:
@@ -366,7 +585,7 @@ class _CudagraphGlobalRecord:
             for g in cls.cudagraph_record:
                 base_module = g[0].base_module
                 has_te_modules = has_te_modules or any(
-                    [isinstance(m, TransformerEngineBaseModule) for m in base_module.modules()]
+                    [isinstance(m, TransformerEngineBaseModule) for m in _iter_module_tree(base_module)]
                 )
 
         progress_bar = enumerate(cls.cudagraph_record)
@@ -394,6 +613,7 @@ class _CudagraphGlobalRecord:
         gc.collect()
         torch.cuda.empty_cache()
 
+        rng_state = _snapshot_cuda_rng_states()
         _set_capture_start()
         if has_te_modules:
             te_set_capture_start()
@@ -401,6 +621,8 @@ class _CudagraphGlobalRecord:
         global bwd_buffer_reuse_ref_count, fwd_buffer_reuse_ref_count
 
         def format_mem_bytes(mem_bytes):
+            if mem_bytes < 0:
+                return "-" + format_mem_bytes(-mem_bytes)
             for power, suffix in [(4, "tb"), (3, "gb"), (2, "mb"), (1, "kb"), (0, "bytes")]:
                 suffix_bytes = 1024**power
                 if mem_bytes >= suffix_bytes:
@@ -426,6 +648,7 @@ class _CudagraphGlobalRecord:
             else:
                 assert fwd_buffer_reuse_ref_count == 0
                 runner.create_bwd_graph()
+        _restore_cuda_rng_states(rng_state)
 
         # Memory usage.
         time_end = time.time()
@@ -475,6 +698,149 @@ class _CudagraphGlobalRecord:
         return capture_stats
 
 
+def _prepare_local_chunk_cuda_graph_capture_for_requested_slots():
+    """Prepare local chunk graph capture when explicit dynamic slots exceed warmup slots.
+
+    Capturing a shorter runtime order and synthesizing metadata for missing slots is not
+    equivalent to capturing the longer 1F1B order. When possible, run a dummy max-slot eager
+    pass to let the normal forward/backward record nodes populate graph creation records in the
+    requested schedule order. If the dry-run path is unsupported, fall back to deferring until the
+    requested cache-key set appears in real execution.
+    """
+    if _CudagraphGlobalRecord.cudagraph_created:
+        return False
+
+    managers = [
+        manager
+        for manager in list(CudaGraphManager.active_managers)
+        if manager.needs_local_chunk_max_slot_dry_run()
+    ]
+    if not managers:
+        return False
+
+    for manager in list(CudaGraphManager.active_managers):
+        manager.reset_local_chunk_graph_recording()
+    _CudagraphGlobalRecord.cudagraph_record = []
+
+    if len(managers) == 1 and managers[0].record_local_chunk_max_slot_dry_run():
+        return False
+    if _record_local_chunk_multi_manager_max_slot_dry_run(managers):
+        return False
+
+    should_defer = False
+    for manager in managers:
+        should_defer = manager.should_defer_local_chunk_capture() or should_defer
+    return True
+
+
+def _record_local_chunk_multi_manager_max_slot_dry_run(missing_managers):
+    """Record max-slot local chunk graphs for VPP managers in real schedule order."""
+    if len(missing_managers) <= 1:
+        return False
+
+    requested_slots_set = {
+        manager._local_chunk_dynamic_requested_slots() for manager in missing_managers
+    }
+    if len(requested_slots_set) != 1:
+        return False
+    requested_slots = requested_slots_set.pop()
+    if requested_slots is None:
+        return False
+
+    managers_by_chunk = {}
+    for manager in list(CudaGraphManager.active_managers):
+        if manager._local_chunk_dynamic_requested_slots() != requested_slots:
+            continue
+        template_runner = manager._get_local_chunk_template_runner()
+        if template_runner is None:
+            continue
+        if template_runner.fp8_enabled or template_runner.fp4_enabled:
+            log_single_rank(
+                logger,
+                logging.INFO,
+                "Skipping local chunk multi-manager max-slot dry-run capture for FP8/FP4; "
+                "falling back to deferred real-order capture.",
+            )
+            return False
+        chunk_id = _infer_local_chunk_model_chunk_id(template_runner.base_module)
+        if chunk_id is None or chunk_id in managers_by_chunk:
+            return False
+        managers_by_chunk[chunk_id] = manager
+
+    if not managers_by_chunk:
+        return False
+    num_model_chunks = max(managers_by_chunk) + 1
+    if num_model_chunks <= 1:
+        return False
+    if set(managers_by_chunk) != set(range(num_model_chunks)):
+        return False
+
+    event_source = managers_by_chunk[0]
+    events = event_source._get_local_chunk_dry_run_slot_schedule_events(
+        requested_slots, num_model_chunks
+    )
+    used_slots_by_chunk = defaultdict(set)
+    for _op_type, chunk_id, _microbatch_id, slot_id in events:
+        used_slots_by_chunk[chunk_id].add(slot_id)
+
+    for chunk_id, manager in managers_by_chunk.items():
+        manager.reset_local_chunk_graph_recording()
+        for slot in sorted(used_slots_by_chunk[chunk_id]):
+            manager._ensure_local_chunk_runner_for_slot(slot)
+
+    dry_run_states = [
+        (manager, manager._snapshot_local_chunk_dry_run_state())
+        for manager in managers_by_chunk.values()
+    ]
+    outputs_by_chunk_slot = {}
+    try:
+        for op_type, chunk_id, microbatch_id, slot_id in events:
+            manager = managers_by_chunk[chunk_id]
+            cache_key = ("chunk", int(slot_id))
+            runner = manager.custom_cudagraphs_lookup_table[cache_key]
+            assert runner is not None, f"Missing local chunk runner for {cache_key}."
+
+            output_key = (chunk_id, microbatch_id)
+            if op_type == "forward":
+                args, kwargs = runner.clone_dry_run_inputs()
+                out = manager(runner.base_module, args, kwargs, cache_key=cache_key)
+                outputs_by_chunk_slot[output_key] = (runner, args, kwargs, out)
+                continue
+
+            runner, args, kwargs, out = outputs_by_chunk_slot.pop(output_key)
+            out_tensors = tuple(
+                tensor
+                for tensor in runner.get_tensors(out, check_types=False)
+                if tensor.requires_grad
+            )
+            input_tensors = tuple(
+                tensor
+                for tensor in runner.get_tensors(args, kwargs, check_types=False)
+                if tensor.requires_grad
+            )
+            assert out_tensors, "Local chunk dry-run output must require grad."
+            assert input_tensors, "Local chunk dry-run input must require grad."
+            torch.autograd.grad(
+                outputs=out_tensors,
+                inputs=input_tensors,
+                grad_outputs=_make_local_chunk_dry_run_grad_outputs(out_tensors),
+                only_inputs=True,
+                allow_unused=True,
+            )
+    finally:
+        outputs_by_chunk_slot.clear()
+        for manager, dry_run_state in reversed(dry_run_states):
+            manager._restore_local_chunk_dry_run_state(dry_run_state)
+
+    log_single_rank(
+        logger,
+        logging.INFO,
+        "Recorded local chunk CUDA graph multi-manager max-slot dry-run order: "
+        f"requested_slots={requested_slots}, chunks={num_model_chunks}, events={len(events)}.",
+    )
+    return True
+
+
 def create_cudagraphs():
     """Should be called at the end of each schedule function,
     (e.g. forward_backward_pipelining_with_interleaving) in
@@ -485,6 +851,8 @@ def create_cudagraphs():
     to be created in execution order, which allows multiple cudagraphs to share a single
     memory pool, minimizing cudagraph memory usage."""
 
+    if _prepare_local_chunk_cuda_graph_capture_for_requested_slots():
+        return None
     return _CudagraphGlobalRecord.create_cudagraphs()
 
 
@@ -557,6 +925,77 @@ class _CudagraphRecordNode(torch.autograd.Function):
         return None, grads
 
 
+def _collect_runner_forward_inputs_to_save(runner, inputs):
+    """Return user inputs whose storage is reused by the forward graph input surface."""
+    need_copy_inputs = []
+    for user_input, cudagraph_input in zip(inputs, runner.fwd_graph_input_surface):
+        if (
+            hasattr(cudagraph_input, "can_skip_replay_copy")
+            and cudagraph_input.can_skip_replay_copy
+        ):
+            need_copy_inputs.append(user_input)
+            assert user_input.data_ptr() == cudagraph_input.data_ptr()
+    return need_copy_inputs
+
+
+def _copy_runner_forward_inputs_for_replay(runner, inputs):
+    """Copy user inputs into a runner's static forward graph input buffers."""
+    need_copy_inputs = []
+    for user_input, cudagraph_input in zip(inputs, runner.fwd_graph_input_surface):
+        if (
+            hasattr(cudagraph_input, "can_skip_replay_copy")
+            and cudagraph_input.can_skip_replay_copy
+        ):
+            need_copy_inputs.append(user_input)
+            assert user_input.data_ptr() == cudagraph_input.data_ptr()
+        else:
+            if user_input.data_ptr() != cudagraph_input.data_ptr():
+                cudagraph_input.copy_(user_input)
+    return need_copy_inputs
+
+
+def _normalize_local_chunk_1f1b_grad_outputs(runner, grad_outputs):
+    """Return grad outputs in the exact tuple shape expected by ``runner``.
+
+    Pipeline code passes either a single tensor/None or a list of output grads. The local CUDA
+    graph runner stores a tuple parallel to all tensor outputs, including ``None`` entries for
+    outputs that do not require grad. Combined 1F1B replay only supports the explicit tensor-grad
+    case for now; loss-scalar ``None`` grads are intentionally left to the separate backward graph.
+    """
+    if isinstance(grad_outputs, list):
+        grad_outputs = tuple(grad_outputs)
+    elif isinstance(grad_outputs, tuple):
+        grad_outputs = tuple(grad_outputs)
+    else:
+        grad_outputs = (grad_outputs,)
+
+    if len(grad_outputs) == len(runner.static_grad_outputs):
+        normalized = grad_outputs
+    else:
+        provided_iter = iter(grad_outputs)
+        normalized_list = []
+        try:
+            for static_grad_output in runner.static_grad_outputs:
+                if static_grad_output is None:
+                    normalized_list.append(None)
+                else:
+                    normalized_list.append(next(provided_iter))
+        except StopIteration:
+            return None
+        if any(True for _ in provided_iter):
+            return None
+        normalized = tuple(normalized_list)
+
+    for grad_output, static_grad_output in zip(normalized, runner.static_grad_outputs):
+        if static_grad_output is None:
+            if grad_output is not None:
+                return None
+            continue
+        if not torch.is_tensor(grad_output):
+            return None
+    return tuple(normalized)
+
+
 class _CudagraphReplayNode(torch.autograd.Function):
     """Replays the runner's cudagraphs with autograd. Handles copying data into/out of the
     cudagraph io and fp8/fp4 if used."""
@@ -576,24 +1015,14 @@ class _CudagraphReplayNode(torch.autograd.Function):
         ), "Fwd cudagraph received a different number of tensors than what it was graphed with!"
 
         # Copy new data into fwd graph input buffer
-        need_copy_inputs = []
-        for user_input, cudagraph_input in zip(inputs, runner.fwd_graph_input_surface):
-            if (
-                hasattr(cudagraph_input, "can_skip_replay_copy")
-                and cudagraph_input.can_skip_replay_copy
-            ):
-                need_copy_inputs.append(user_input)
-                assert user_input.data_ptr() == cudagraph_input.data_ptr()
-            else:
-                if user_input.data_ptr() != cudagraph_input.data_ptr():
-                    cudagraph_input.copy_(user_input)
+        need_copy_inputs = _copy_runner_forward_inputs_for_replay(runner, inputs)
 
         ctx.runner = runner
         ctx.save_for_backward(*need_copy_inputs)
 
         if runner.fp8_enabled or runner.fp4_enabled:
             if isinstance(FP8GlobalStateManager.get_fp8_recipe(), te.common.recipe.DelayedScaling):
-                for m in runner.base_module.modules():
+                for m in _iter_module_tree(runner.base_module):
                     if isinstance(m, TransformerEngineBaseModule):
                         m.fp8_meta["fp8_group"] = FP8GlobalStateManager.get_fp8_group()
                         m.fp8_meta["recipe"] = FP8GlobalStateManager.get_fp8_recipe()
@@ -702,6 +1131,14 @@ class _CudaGraphRunner(torch.nn.Module):
         self.bwd_graph_recorded = False
         self.cudagraph_created = False
         self.status = _GraphStatus.FWD_READY
+        self.cuda_graph_cache_key = None
+        self.manager = None
+        self.recorded_fwd_graph = None
+        self.disable_tensor_reuse_pool = False
+        self.dry_run_fwd_graph_input_args = _clone_cuda_graph_dry_run_tree(fwd_graph_input_args)
+        self.dry_run_fwd_graph_input_kwargs = _clone_cuda_graph_dry_run_tree(
+            fwd_graph_input_kwargs
+        )
 
         self.fuse_wgrad_accumulation = False
         self.backward_retain_grad = False
@@ -735,6 +1172,9 @@ class _CudaGraphRunner(torch.nn.Module):
             self.fp4_enabled = self.base_module.config.fp4 is not None
             self.fp8_runtime_enabled = None
             self.fp4_runtime_enabled = None
+            self.disable_tensor_reuse_pool = _is_local_chunk_dynamic_microbatch_config(
+                self.base_module.config
+            )
 
             if self.fp8_enabled:
                 self.fp8_recipe = FP8GlobalStateManager.get_fp8_recipe()
@@ -745,6 +1185,19 @@ class _CudaGraphRunner(torch.nn.Module):
 
                 self.fp4_recipe = get_fp4_recipe(self.base_module.config)
                 FP8GlobalStateManager.set_skip_fp8_weight_update_tensor(False)
+
+    def clone_dry_run_inputs(self):
+        """Return fresh input clones for max-slot dry-run graph recording."""
+        return (
+            _clone_cuda_graph_dry_run_tree(self.dry_run_fwd_graph_input_args),
+            _clone_cuda_graph_dry_run_tree(self.dry_run_fwd_graph_input_kwargs),
+        )
+
+    def _get_static_cudagraph_buffer(self, meta):
+        """Return a static graph buffer, optionally bypassing cross-graph buffer reuse."""
+        if self.disable_tensor_reuse_pool:
+            return _CudagraphGlobalRecord.tensor_reuse_pool.allocate(meta)
+        return _CudagraphGlobalRecord.tensor_reuse_pool.get(meta)
 
     def __str__(self):
         return "%s; hid %s" % (
@@ -787,7 +1240,7 @@ class _CudaGraphRunner(torch.nn.Module):
                 stack.extend(f for f, _ in fn.next_functions if f)
 
         # Return module params that were found in the graph, preserving original order
-        return tuple(p for p in self.base_module.parameters() if id(p) in p_ids)
+        return tuple(p for p in _iter_module_parameters(self.base_module) if id(p) in p_ids)
 
     def create_fwd_graph(self, args, kwargs, outputs=None, clone_inputs=True):
         """Create a fwd cudagraph for this runner. Should be called inside
@@ -808,12 +1261,10 @@ class _CudaGraphRunner(torch.nn.Module):
 
         if self.training and torch.is_grad_enabled():
             buffer_backup = []
-            for buf in self.base_module.buffers():
+            for buf in _iter_module_buffers(self.base_module):
                 buffer_backup.append(buf.clone())
 
-            grad_backup = []
-            for param in self.base_module.parameters():
-                grad_backup.append(param.main_grad.clone() if hasattr(param, "main_grad") else None)
+            grad_backup = _snapshot_module_grad_state(self.base_module)
 
             saved_fp8_tensors = None
             if self.fp8_enabled:
@@ -830,16 +1281,14 @@ class _CudaGraphRunner(torch.nn.Module):
                     raise ValueError("FP4 requires TE >= 2.7.0.dev0 for NVFP4BlockScaling support.")
 
         # cache the moe aux loss if needed, which is accumulated inside the forward pass
-        from megatron.core.transformer.transformer_layer import MoETransformerLayer
+        from megatron.core.transformer.moe.moe_layer import MoELayer
 
-        is_moe = isinstance(self.base_module, MoETransformerLayer)
+        is_moe = any(isinstance(module, MoELayer) for module in _iter_module_tree(self.base_module))
         if is_moe:
             from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 
             moe_metrics_tracker = get_moe_metrics_tracker()
-            cached_aux_losses = {}
-            for name, entry in moe_metrics_tracker.metrics.items():
-                cached_aux_losses[name] = entry.values.clone()
+            cached_moe_metrics = _snapshot_moe_metrics_tracker(moe_metrics_tracker)
 
         self.fwd_graph = torch.cuda.CUDAGraph()
 
@@ -882,7 +1331,7 @@ class _CudaGraphRunner(torch.nn.Module):
                     fwd_buffer_reuse_ref_count -= 1
             else:
                 # need to provide a fresh buffer from the reuse pool
-                buf = _CudagraphGlobalRecord.tensor_reuse_pool.get(ten)
+                buf = self._get_static_cudagraph_buffer(ten)
                 can_skip_replay_copy = False
 
             buf = buf.detach().requires_grad_(ten.requires_grad)
@@ -897,7 +1346,7 @@ class _CudaGraphRunner(torch.nn.Module):
                     and ten.cg_buffer_metadata.input_use_count > 1
                     and ten.cg_buffer_metadata.fwd_cudagraph_buffer is None
                 ):
-                    buf = _CudagraphGlobalRecord.tensor_reuse_pool.get(ten)
+                    buf = self._get_static_cudagraph_buffer(ten)
                     buf.cg_buffer_metadata = deepcopy(ten.cg_buffer_metadata)
                     buf.cg_buffer_metadata.capture_reuse_count = (
                         ten.cg_buffer_metadata.input_use_count
@@ -987,6 +1436,8 @@ class _CudaGraphRunner(torch.nn.Module):
             assert hasattr(o, "cg_buffer_metadata") and o.cg_buffer_metadata.is_cudagraph_output
 
             if (
+                not self.disable_tensor_reuse_pool
+                and
                 o.cg_buffer_metadata.is_cudagraph_input
                 and o.cg_buffer_metadata.fwd_cudagraph_buffer is None
             ):
@@ -1012,20 +1463,14 @@ class _CudaGraphRunner(torch.nn.Module):
             if self.fp8_enabled:
                 restore_fp8_tensors([self.base_module], saved_fp8_tensors)
             # restore cached grads
-            for main_grad_copy, param in zip(grad_backup, self.base_module.parameters()):
-                if main_grad_copy is not None:
-                    param.main_grad.copy_(main_grad_copy)
+            _restore_module_grad_state(grad_backup)
 
             # restore cached buffers
-            for buf_copy, buf in zip(buffer_backup, self.base_module.buffers()):
+            for buf_copy, buf in zip(buffer_backup, _iter_module_buffers(self.base_module)):
                 buf.copy_(buf_copy)
 
         if is_moe:
-            for name, cached_values in cached_aux_losses.items():
-                assert (
-                    name in moe_metrics_tracker.metrics
-                ), "cached metrics must be found in the tracker."
-                moe_metrics_tracker.metrics[name].values.copy_(cached_values)
+            _restore_moe_metrics_tracker(moe_metrics_tracker, cached_moe_metrics)
 
     def create_bwd_graph(self):
         """Create a bwd cudagraph for this runner. Should be called inside
@@ -1063,7 +1508,7 @@ class _CudaGraphRunner(torch.nn.Module):
                     out_grad.cg_buffer_metadata.capture_reuse_count -= 1
                     bwd_buffer_reuse_ref_count -= 1
                 else:
-                    out_grad = _CudagraphGlobalRecord.tensor_reuse_pool.get(o)
+                    out_grad = self._get_static_cudagraph_buffer(o)
                 out_grad.requires_grad = True
             self.static_grad_outputs.append(out_grad)
 
@@ -1071,7 +1516,10 @@ class _CudaGraphRunner(torch.nn.Module):
         if FREEZE_GC:
             gc.freeze()
 
-        with torch.cuda.graph(self.bwd_graph, pool=self.mempool):
+        grad_backup = _snapshot_module_grad_state(self.base_module)
+        with torch.cuda.graph(
+            self.bwd_graph, pool=self.mempool, capture_error_mode="thread_local"
+        ):
             grad_inputs = torch.autograd.grad(
                 outputs=tuple(o for o in self.fwd_graph_output_surface if o.requires_grad),
                 inputs=tuple(i for i in self.fwd_graph_input_surface if i.requires_grad),
@@ -1094,7 +1542,10 @@ class _CudaGraphRunner(torch.nn.Module):
             if input_tensor.requires_grad:
                 input_grad = grad_inputs.pop(0)
                 input_grad.cg_buffer_metadata = deepcopy(input_tensor.cg_buffer_metadata)
-                if input_tensor.cg_buffer_metadata.is_cudagraph_output:
+                if (
+                    not self.disable_tensor_reuse_pool
+                    and input_tensor.cg_buffer_metadata.is_cudagraph_output
+                ):
                     if input_tensor.cg_buffer_metadata.bwd_cudagraph_buffer is None:
                         input_tensor.cg_buffer_metadata.bwd_cudagraph_buffer = input_grad
                         input_grad.cg_buffer_metadata.capture_reuse_count += 1
@@ -1115,6 +1566,8 @@ class _CudaGraphRunner(torch.nn.Module):
                 if hasattr(param, "grad_added_to_main_grad"):
                     self.groundtruth_grad_added_to_main_grad[param] = param.grad_added_to_main_grad
 
+        _restore_module_grad_state(grad_backup)
+
         # After backward pass grad_output buffers are no longer used and returned to the pool
         for ten in self.static_grad_outputs:
             if torch.is_tensor(ten):
@@ -1132,7 +1585,7 @@ class _CudaGraphRunner(torch.nn.Module):
                     _CudagraphGlobalRecord.tensor_reuse_pool.insert(ten)
 
         # now weakref everything
-        if HAVE_TE_GRAPHS:
+        if HAVE_TE_GRAPHS and not self.disable_tensor_reuse_pool:
 
             def replace_with_weak_ref(arg):
                 if not torch.is_tensor(arg):
@@ -1248,6 +1701,7 @@ class _CudaGraphRunner(torch.nn.Module):
             m_args = tree_map(_replace_with_meta, args)
             m_kwargs = tree_map(_replace_with_meta, kwargs)
             m_out = tree_map(_replace_with_meta, out)
+            self.recorded_fwd_graph = (m_args, m_kwargs, m_out)
             _CudagraphGlobalRecord.record_fwd_graph(self, m_args, m_kwargs, m_out)
 
             if HAVE_TE_GRAPHS:
@@ -1414,6 +1868,7 @@ class CudaGraphManager(torch.nn.Module):
 
     """A global mempool for when 'cuda_graph_use_single_mempool' is used."""
     global_mempool = None
+    active_managers = weakref.WeakSet()
 
     def __init__(
         self,
@@ -1438,6 +1893,8 @@ class CudaGraphManager(torch.nn.Module):
         """
         self._inline_capture = inline_capture
         self._num_warmup_steps = num_warmup_steps
+        self.config = config
+        CudaGraphManager.active_managers.add(self)
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.pg_collection = pg_collection
@@ -1498,6 +1955,28 @@ class CudaGraphManager(torch.nn.Module):
             # capture, so change to a side stream.
             torch.cuda.set_stream(torch.cuda.Stream())
 
+    def _create_runner(self, megatron_module, args, kwargs, cache_key=None):
+        """Create and register a CUDA graph runner owned by this manager."""
+        mempool = CudaGraphManager.global_mempool
+        if _is_local_chunk_dynamic_microbatch_config(self.config):
+            # Dynamic local chunk graph replay can use only a subset of the recorded runners in a
+            # different order when the runtime microbatch count changes. Keep graph pools isolated
+            # until shared-pool replay with topology-minimal slots is proven safe.
+            mempool = torch.cuda.graph_pool_handle()
+        runner = _CudaGraphRunner(
+            megatron_module,
+            mempool,
+            args,
+            kwargs,
+            self.func,
+            self.need_backward,
+        )
+        if self._num_warmup_steps is not None:
+            runner.num_warmup_steps = self._num_warmup_steps
+        runner.manager = self
+        runner.cuda_graph_cache_key = cache_key
+        return runner
+
     def call_ddp_preforward_hook(self, module):
         """Call any DDP pre-forward hooks which are used to launch async data parallel
         param gather. Any other pre-forward hooks are not allowed."""
@@ -1523,6 +2002,14 @@ class CudaGraphManager(torch.nn.Module):
         if reuse_cudagraphs:
             if cache_key is not None:
                 runner = self.custom_cudagraphs_lookup_table[cache_key]
+                if runner is not None:
+                    mismatch_errors = runner.get_mismatch_errors(args, kwargs)
+                    if mismatch_errors:
+                        error_msg = (
+                            f"CUDA graph argument mismatch for cache key {cache_key}:\n"
+                            + "\n".join(mismatch_errors)
+                        )
+                        raise AssertionError(error_msg)
             else:
                 # Todo: For training, we could also cache runners based on input shape.
                 # If autograd is currently disabled, it doesnt matter if a runner was created
@@ -1548,16 +2035,7 @@ class CudaGraphManager(torch.nn.Module):
                         f"existing runners. Use `get_mismatch_errors` to debug mismatches."
                     )
                 else:
-                    runner = _CudaGraphRunner(
-                        megatron_module,
-                        CudaGraphManager.global_mempool,
-                        args,
-                        kwargs,
-                        self.func,
-                        self.need_backward,
-                    )
-                    if self._num_warmup_steps is not None:
-                        runner.num_warmup_steps = self._num_warmup_steps
+                    runner = self._create_runner(megatron_module, args, kwargs, cache_key)
                     self.cudagraph_runners.append(runner)
                     if cache_key is not None:
                         self.custom_cudagraphs_lookup_table[cache_key] = runner
@@ -1568,19 +2046,353 @@ class CudaGraphManager(torch.nn.Module):
                 assert runner.status == _GraphStatus.FWD_READY
                 self.cudagraph_runners = self.cudagraph_runners[1:] + self.cudagraph_runners[:1]
             else:
-                runner = _CudaGraphRunner(
-                    megatron_module,
-                    CudaGraphManager.global_mempool,
-                    args,
-                    kwargs,
-                    self.func,
-                    self.need_backward,
-                )
+                runner = self._create_runner(megatron_module, args, kwargs)
                 self.cudagraph_runners.append(runner)
 
         return runner
 
-    def __call__(self, megatron_module, args, kwargs, cache_key=None):
+    def _local_chunk_dynamic_requested_slots(self):
+        """Return requested local chunk slot count, or None when this manager is not in that mode."""
+        config = self.config
+        if (
+            config.cuda_graph_impl == "local"
+            and getattr(config, 'cuda_graph_granularity', 'layer') == "chunk"
+            and config.cuda_graph_dynamic_microbatches
+            and config.cuda_graph_num_microbatch_slots is not None
+        ):
+            return config.cuda_graph_num_microbatch_slots
+        return None
+
+    def _get_recorded_local_chunk_slots(self):
+        """Return local chunk cache-key slots recorded by this manager."""
+        existing_slots = []
+        for cache_key, runner in self.custom_cudagraphs_lookup_table.items():
+            if (
+                runner is not None
+                and isinstance(cache_key, tuple)
+                and len(cache_key) == 2
+                and cache_key[0] == "chunk"
+            ):
+                existing_slots.append(cache_key[1])
+        return existing_slots
+
+    def has_missing_local_chunk_requested_slots(self):
+        """Return whether explicit local chunk max-slot capture is missing recorded slots."""
+        requested_slots = self._local_chunk_dynamic_requested_slots()
+        if requested_slots is None:
+            return False
+
+        existing_slots = self._get_recorded_local_chunk_slots()
+        if not existing_slots:
+            return False
+
+        max_existing_slot = max(existing_slots)
+        assert requested_slots > max_existing_slot, (
+            "cuda_graph_num_microbatch_slots must cover all local chunk graph cache keys "
+            f"recorded during the capture iteration: requested={requested_slots}, "
+            f"required>={max_existing_slot + 1}"
+        )
+        return len(set(existing_slots)) < requested_slots
+
+    def _get_local_chunk_probe_num_microbatches(self, requested_slots, num_model_chunks=1):
+        """Return the probe microbatch count used for max-slot dynamic capture."""
+        group_size = self.config.microbatch_group_size_per_vp_stage
+        if group_size is None:
+            group_size = getattr(self.config, 'pipeline_model_parallel_size', None)
+        if group_size is None:
+            group_size = parallel_state.get_pipeline_model_parallel_world_size()
+        pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
+        probe_num_microbatches = get_probe_num_microbatches_for_dynamic_slots(
+            pipeline_parallel_size,
+            num_model_chunks,
+            group_size,
+            self.config.overlap_moe_expert_parallel_comm,
+        )
+        return max(requested_slots, probe_num_microbatches)
+
+    def needs_local_chunk_max_slot_dry_run(self, num_model_chunks=1):
+        """Return whether local chunk capture should use the probe schedule dry-run."""
+        requested_slots = self._local_chunk_dynamic_requested_slots()
+        if requested_slots is None:
+            return False
+        existing_slots = self._get_recorded_local_chunk_slots()
+        if not existing_slots:
+            return False
+        if self.has_missing_local_chunk_requested_slots():
+            return True
+        return self._get_local_chunk_probe_num_microbatches(
+            requested_slots, num_model_chunks
+        ) > get_num_microbatches()
+
+    def should_defer_local_chunk_capture(self):
+        """Return whether explicit local chunk max-slot capture should wait for more slots."""
+        if not self.has_missing_local_chunk_requested_slots():
+            return False
+
+        existing_slots = self._get_recorded_local_chunk_slots()
+        requested_slots = self._local_chunk_dynamic_requested_slots()
+
+        log_single_rank(
+            logger,
+            logging.INFO,
+            "Deferring local chunk CUDA graph capture until requested dynamic slots are "
+            f"observed: observed={len(set(existing_slots))}, "
+            f"requested={requested_slots}.",
+        )
+        return True
+
+    def reset_local_chunk_graph_recording(self):
+        """Reset local chunk runner recording state after a deferred capture attempt."""
+        requested_slots = self._local_chunk_dynamic_requested_slots()
+        if requested_slots is None:
+            return
+
+        for runner in self.custom_cudagraphs_lookup_table.values():
+            if runner is None:
+                continue
+            runner.fwd_graph_recorded = False
+            runner.bwd_graph_recorded = False
+            runner.recorded_fwd_graph = None
+            runner.status = _GraphStatus.FWD_READY
+
+    def _get_local_chunk_template_runner(self):
+        """Return an existing local chunk runner to clone dry-run inputs from."""
+        for cache_key in sorted(self.custom_cudagraphs_lookup_table):
+            runner = self.custom_cudagraphs_lookup_table[cache_key]
+            if (
+                runner is not None
+                and isinstance(cache_key, tuple)
+                and len(cache_key) == 2
+                and cache_key[0] == "chunk"
+            ):
+                return runner
+        return None
+
+    def _ensure_local_chunk_runner_for_slot(self, slot):
+        """Ensure a runner exists for a local chunk dry-run slot."""
+        cache_key = ("chunk", int(slot))
+        runner = self.custom_cudagraphs_lookup_table[cache_key]
+        if runner is not None:
+            return runner
+
+        template_runner = self._get_local_chunk_template_runner()
+        assert (
+            template_runner is not None
+        ), "Cannot create local chunk dry-run slot without template."
+        args, kwargs = template_runner.clone_dry_run_inputs()
+        runner = self._create_runner(template_runner.base_module, args, kwargs, cache_key)
+        self.cudagraph_runners.append(runner)
+        self.custom_cudagraphs_lookup_table[cache_key] = runner
+        return runner
+
+    def _get_local_chunk_dry_run_schedule_events(self, requested_slots, num_model_chunks=1):
+        """Return schedule-ordered events for max-slot local chunk dry-run."""
+        return [
+            (op_type, chunk_id, microbatch_id)
+            for op_type, chunk_id, microbatch_id, _slot_id in (
+                self._get_local_chunk_dry_run_slot_schedule_events(
+                    requested_slots,
+                    num_model_chunks,
+                    probe_num_microbatches=requested_slots,
+                )
+            )
+        ]
+
+    def _get_local_chunk_dry_run_slot_schedule_events(
+        self, requested_slots, num_model_chunks=1, probe_num_microbatches=None
+    ):
+        """Return schedule-ordered dry-run events annotated with reusable slot ids."""
+        from megatron.core.pipeline_parallel.schedules import (
+            get_pp_rank_microbatches,
+            get_schedule_table,
+        )
+
+        if probe_num_microbatches is None:
+            probe_num_microbatches = self._get_local_chunk_probe_num_microbatches(
+                requested_slots, num_model_chunks
+            )
+        group_size = self.config.microbatch_group_size_per_vp_stage
+        if group_size is None:
+            group_size = getattr(self.config, 'pipeline_model_parallel_size', None)
+        if group_size is None:
+            group_size = parallel_state.get_pipeline_model_parallel_world_size()
+        _, _, num_warmup_microbatches, _ = get_pp_rank_microbatches(
+            probe_num_microbatches,
+            num_model_chunks,
+            group_size,
+            forward_only=False,
+            overlap_moe_expert_parallel_comm=self.config.overlap_moe_expert_parallel_comm,
+        )
+        schedule_table = get_schedule_table(probe_num_microbatches, num_model_chunks, group_size)
+        stage_order = get_cuda_graph_schedule_stage_order_from_counts(
+            num_warmup_microbatches, len(schedule_table)
+        )
+        slot_plan = build_chunk_cuda_graph_slot_plan_from_schedule(
+            num_warmup_microbatches,
+            num_model_chunks,
+            schedule_table,
+            stage_order,
+        )
+        assert all(num_slots <= requested_slots for num_slots in slot_plan.num_slots_per_chunk), (
+            "cuda_graph_num_microbatch_slots is smaller than the topology-required local chunk "
+            f"graph slots: requested={requested_slots}, "
+            f"required_per_chunk={slot_plan.num_slots_per_chunk}"
+        )
+        return [
+            (op_type, chunk_id, microbatch_id, slot_id)
+            for op_type, chunk_id, microbatch_id, slot_id in zip(
+                slot_plan.op_types, slot_plan.chunk_ids, slot_plan.microbatch_ids, slot_plan.slot_ids
+            )
+            if op_type in ("forward", "backward")
+        ]
+
+    def _get_local_chunk_dry_run_events(self, requested_slots):
+        """Return forward/backward microbatch events for max-slot local chunk dry-run."""
+        return [
+            (op_type, microbatch_id)
+            for op_type, _chunk_id, microbatch_id in self._get_local_chunk_dry_run_schedule_events(
+                requested_slots
+            )
+        ]
+
+    def _snapshot_local_chunk_dry_run_state(self):
+        """Snapshot mutable state that dry-run graph recording may perturb."""
+        template_runner = self._get_local_chunk_template_runner()
+        assert template_runner is not None
+        module = template_runner.base_module
+        buffer_backups = [(buf, buf.detach().clone()) for buf in module.buffers()]
+        grad_backups = _snapshot_module_grad_state(module)
+        cuda_rng_state = torch.cuda.get_rng_state()
+        tracker_rng_states = {}
+        for name, state in get_all_rng_states().items():
+            if torch.is_tensor(state):
+                tracker_rng_states[name] = ("tensor", state.clone())
+            elif hasattr(state, "get_state"):
+                tracker_rng_states[name] = ("generator", state.get_state())
+
+        from megatron.core.transformer.moe.moe_layer import MoELayer
+
+        moe_metrics_tracker = None
+        cached_moe_metrics = None
+        if any(isinstance(submodule, MoELayer) for submodule in module.modules()):
+            from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
+
+            moe_metrics_tracker = get_moe_metrics_tracker()
+            cached_moe_metrics = _snapshot_moe_metrics_tracker(moe_metrics_tracker)
+
+        return (
+            module,
+            buffer_backups,
+            grad_backups,
+            cuda_rng_state,
+            tracker_rng_states,
+            moe_metrics_tracker,
+            cached_moe_metrics,
+        )
+
+    @staticmethod
+    def _restore_local_chunk_dry_run_state(state):
+        """Restore mutable state after dry-run graph recording."""
+        (
+            _module,
+            buffer_backups,
+            grad_backups,
+            cuda_rng_state,
+            tracker_rng_states,
+            moe_metrics_tracker,
+            cached_moe_metrics,
+        ) = state
+        for buf, buf_backup in buffer_backups:
+            buf.copy_(buf_backup)
+        _restore_module_grad_state(grad_backups)
+        torch.cuda.set_rng_state(cuda_rng_state)
+        current_tracker_states = get_all_rng_states()
+        for name, (state_type, state) in tracker_rng_states.items():
+            if name not in current_tracker_states:
+                continue
+            current_state = current_tracker_states[name]
+            if state_type == "tensor":
+                current_state.copy_(state)
+            elif state_type == "generator":
+                current_state.set_state(state)
+        if moe_metrics_tracker is not None:
+            _restore_moe_metrics_tracker(moe_metrics_tracker, cached_moe_metrics)
+
+    def record_local_chunk_max_slot_dry_run(self):
+        """Record local chunk graphs in max-slot 1F1B order using dummy eager execution."""
+        requested_slots = self._local_chunk_dynamic_requested_slots()
+        if requested_slots is None or not self.needs_local_chunk_max_slot_dry_run():
+            return False
+
+        template_runner = self._get_local_chunk_template_runner()
+        if template_runner is None:
+            return False
+        if template_runner.fp8_enabled or template_runner.fp4_enabled:
+            log_single_rank(
+                logger,
+                logging.INFO,
+                "Skipping local chunk max-slot dry-run capture for FP8/FP4; falling back to "
+                "deferred real-order capture.",
+            )
+            return False
+
+        events = self._get_local_chunk_dry_run_slot_schedule_events(requested_slots)
+        self.reset_local_chunk_graph_recording()
+        for slot in sorted({slot_id for _op_type, _chunk_id, _microbatch_id, slot_id in events}):
+            self._ensure_local_chunk_runner_for_slot(slot)
+        dry_run_state = self._snapshot_local_chunk_dry_run_state()
+        outputs_by_slot = {}
+        try:
+            for op_type, _chunk_id, microbatch_id, slot_id in events:
+                cache_key = ("chunk", int(slot_id))
+                runner = self.custom_cudagraphs_lookup_table[cache_key]
+                assert runner is not None, f"Missing local chunk runner for {cache_key}."
+
+                if op_type == "forward":
+                    args, kwargs = runner.clone_dry_run_inputs()
+                    out = self(runner.base_module, args, kwargs, cache_key=cache_key)
+                    outputs_by_slot[microbatch_id] = (runner, args, kwargs, out)
+                    continue
+
+                runner, args, kwargs, out = outputs_by_slot.pop(microbatch_id)
+                out_tensors = tuple(
+                    tensor
+                    for tensor in runner.get_tensors(out, check_types=False)
+                    if tensor.requires_grad
+                )
+                input_tensors = tuple(
+                    tensor
+                    for tensor in runner.get_tensors(args, kwargs, check_types=False)
+                    if tensor.requires_grad
+                )
+                assert out_tensors, "Local chunk dry-run output must require grad."
+                assert input_tensors, "Local chunk dry-run input must require grad."
+                torch.autograd.grad(
+                    outputs=out_tensors,
+                    inputs=input_tensors,
+                    grad_outputs=_make_local_chunk_dry_run_grad_outputs(out_tensors),
+                    only_inputs=True,
+                    allow_unused=True,
+                )
+        finally:
+            outputs_by_slot.clear()
+            self._restore_local_chunk_dry_run_state(dry_run_state)
+
+        log_single_rank(
+            logger,
+            logging.INFO,
+            "Recorded local chunk CUDA graph max-slot dry-run order: "
+            f"requested_slots={requested_slots}, events={len(events)}.",
+        )
+        return True
+
+    def __call__(
+        self,
+        megatron_module,
+        args,
+        kwargs,
+        cache_key=None,
+    ):
         """Calls the forward pass of the cudagraphed module.
 
         Args:
@@ -1613,7 +2425,11 @@ class CudaGraphManager(torch.nn.Module):
                     self.call_ddp_preforward_hook(module)
 
             runner = self.get_cudagraph_runner(
-                megatron_module, args, kwargs, self.reuse_cudagraphs, cache_key=cache_key
+                megatron_module,
+                args,
+                kwargs,
+                self.reuse_cudagraphs or cache_key is not None,
+                cache_key=cache_key,
             )
             out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
         else:
@@ -1667,7 +2483,11 @@ class CudaGraphManager(torch.nn.Module):
                 out = runner.replay_graph_capture(self.is_first_microbatch, args, kwargs)
             elif self.training or is_in_checkpoint_fwd:
                 runner = self.get_cudagraph_runner(
-                    megatron_module, args, kwargs, self.reuse_cudagraphs
+                    megatron_module,
+                    args,
+                    kwargs,
+                    self.reuse_cudagraphs or cache_key is not None,
+                    cache_key=cache_key,
                 )
                 out = runner.record_graph_capture(args, kwargs)
             else:
@@ -1807,25 +2627,34 @@ class TECudaGraphHelper:
                     f'No valid layer in model chunk {chunk_number}.',
                 )
             else:
-                num_decoder_layers = len(chunk_with_decoder.decoder.layers)
-                if hasattr(chunk_with_decoder, 'mtp'):
-                    num_mtp_layers = len(chunk_with_decoder.mtp.layers)
-                else:
+                if self.config.cuda_graph_granularity == "chunk":
+                    num_decoder_layers = len(chunk_with_decoder.decoder.layers)
                     num_mtp_layers = 0
-                num_graphable_layers = 0
-                callables, callables_is_mtp = [], []
-                for layer_number in range(num_decoder_layers):
-                    layer = chunk_with_decoder.decoder.layers[layer_number]
-                    if _layer_is_graphable(layer, self.config):
-                        num_graphable_layers += 1
-                        callables.append(layer)
+                    callables, callables_is_mtp = [], []
+                    if _layer_is_graphable(chunk_with_decoder.decoder, self.config):
+                        callables.append(chunk_with_decoder.decoder)
                         callables_is_mtp.append(False)
-                for layer_number in range(num_mtp_layers):
-                    layer = chunk_with_decoder.mtp.layers[layer_number].mtp_model_layer
-                    if _layer_is_graphable(layer, self.config):
-                        num_graphable_layers += 1
-                        callables.append(layer)
-                        callables_is_mtp.append(True)
+                    num_graphable_layers = len(callables)
+                else:
+                    num_decoder_layers = len(chunk_with_decoder.decoder.layers)
+                    if hasattr(chunk_with_decoder, 'mtp'):
+                        num_mtp_layers = len(chunk_with_decoder.mtp.layers)
+                    else:
+                        num_mtp_layers = 0
+                    num_graphable_layers = 0
+                    callables, callables_is_mtp = [], []
+                    for layer_number in range(num_decoder_layers):
+                        layer = chunk_with_decoder.decoder.layers[layer_number]
+                        if _layer_is_graphable(layer, self.config):
+                            num_graphable_layers += 1
+                            callables.append(layer)
+                            callables_is_mtp.append(False)
+                    for layer_number in range(num_mtp_layers):
+                        layer = chunk_with_decoder.mtp.layers[layer_number].mtp_model_layer
+                        if _layer_is_graphable(layer, self.config):
+                            num_graphable_layers += 1
+                            callables.append(layer)
+                            callables_is_mtp.append(True)
                 log_on_each_pipeline_stage(
                     logger=logger,
                     tp_group=self.tp_group,
@@ -1944,11 +2773,13 @@ class TECudaGraphHelper:
 
         def _get_layer_static_inputs(layer, chunk_of_the_layer):
             """
-            Get the static inputs for a layer.
+            Get the static inputs for a layer or a whole TransformerBlock chunk.
             """
-            assert layer in chunk_of_the_layer.decoder.layers or any(
-                layer is mtp_layer.mtp_model_layer for mtp_layer in chunk_of_the_layer.mtp.layers
-            ), "Layer is not in the chunk"
+            is_chunk_callable = layer is getattr(chunk_of_the_layer, "decoder", None)
+            mtp_layers = getattr(getattr(chunk_of_the_layer, "mtp", None), "layers", [])
+            assert is_chunk_callable or layer in chunk_of_the_layer.decoder.layers or any(
+                layer is mtp_layer.mtp_model_layer for mtp_layer in mtp_layers
+            ), "Callable is not in the chunk"
 
             def get_rotary_pos_emb(transformer_module, transformer_input):
                 if (
@@ -1975,9 +2806,10 @@ class TECudaGraphHelper:
                 )
 
             from megatron.core.transformer.identity_op import IdentityOp
+            from megatron.core.transformer.transformer_block import TransformerBlock
             from megatron.core.transformer.transformer_layer import TransformerLayer
 
-            contains_self_attn = (
+            layer_contains_self_attn = (
                 isinstance(layer, TransformerLayer)
                 and not isinstance(layer.self_attention, IdentityOp)
                 and (
@@ -1985,6 +2817,12 @@ class TECudaGraphHelper:
                     or CudaGraphModule.attn in self.config.cuda_graph_modules
                 )
             )
+            chunk_contains_self_attn = isinstance(layer, TransformerBlock) and any(
+                isinstance(block_layer, TransformerLayer)
+                and not isinstance(block_layer.self_attention, IdentityOp)
+                for block_layer in layer.layers
+            )
+            contains_self_attn = layer_contains_self_attn or chunk_contains_self_attn
 
             _sample_kwargs = {}
             if is_te_min_version("1.10.0"):
@@ -2206,6 +3044,18 @@ class TECudaGraphHelper:
         )
         return max(1, max(max_outstanding, default=1))
 
+    @staticmethod
+    def _get_schedule_stage_order_from_order(order):
+        """Classify a PP/VPP schedule order into warmup, steady, and cooldown entries.
+
+        Warmup is the forward-only prefix before the first backward. Cooldown is the
+        backward-only suffix after the last forward. Entries between those boundaries are steady
+        1F1B work. Non-integer entries such as delayed wgrad sub-steps inherit the stage from
+        their order position so future stage-aware graph grouping can keep them adjacent to the
+        surrounding schedule work.
+        """
+        return list(get_cuda_graph_schedule_stage_order(order))
+
     def _get_probe_num_microbatches_for_dynamic_slots(self):
         """Return a topology-only probe microbatch count for slot inference."""
         pipeline_parallel_size = parallel_state.get_pipeline_model_parallel_world_size()
@@ -2276,24 +3126,26 @@ class TECudaGraphHelper:
                     auto_num_slots_tensor, op=torch.distributed.ReduceOp.MAX, group=pp_group
                 )
                 auto_num_slots = int(auto_num_slots_tensor.item())
+            runtime_num_microbatches = get_num_microbatches()
             requested_num_slots = self.config.cuda_graph_num_microbatch_slots
             if requested_num_slots is not None:
-                assert requested_num_slots >= auto_num_slots, (
-                    "cuda_graph_num_microbatch_slots is smaller than the minimum safe number "
-                    f"of slots for the current PP/VPP topology: requested={requested_num_slots}, "
-                    f"required>={auto_num_slots}"
+                assert requested_num_slots >= runtime_num_microbatches, (
+                    "cuda_graph_num_microbatch_slots must be at least the current runtime "
+                    "microbatch count because TE graph capture order must cover every "
+                    f"replayable microbatch: requested={requested_num_slots}, "
+                    f"runtime={runtime_num_microbatches}"
                 )
                 self.num_microbatches = requested_num_slots
             else:
-                self.num_microbatches = auto_num_slots
+                self.num_microbatches = runtime_num_microbatches
             log_on_each_pipeline_stage(
                 logger=logger,
                 tp_group=None,
                 dp_cp_group=None,
                 level=logging.INFO,
-                msg=f'Rank {torch.distributed.get_rank()}: dynamic CUDA graph slots enabled. '
-                f'runtime_num_microbatches={get_num_microbatches()}, '
-                f'auto_num_slots={auto_num_slots}, '
+                msg=f'Rank {torch.distributed.get_rank()}: dynamic CUDA graph microbatches '
+                f'enabled. runtime_num_microbatches={runtime_num_microbatches}, '
+                f'min_inflight_slots={auto_num_slots}, '
                 f'capture_num_microbatches={self.num_microbatches}',
             )
         else:
@@ -2349,6 +3201,37 @@ class TECudaGraphHelper:
                 f'ORDER after overlap_moe_expert_parallel_comm {order}',
             )
 
+        self.cuda_graph_schedule_stage_order = get_cuda_graph_schedule_stage_order_from_counts(
+            num_warmup_microbatches, len(schedule_table)
+        )
+        if len(self.cuda_graph_schedule_stage_order) != len(order):
+            self.cuda_graph_schedule_stage_order = self._get_schedule_stage_order_from_order(order)
+        self.cuda_graph_chunk_slot_plan = None
+        if self.config.cuda_graph_granularity == "chunk":
+            if chunk_id_list is None:
+                self.cuda_graph_chunk_slot_plan = build_chunk_cuda_graph_slot_plan_from_schedule(
+                    num_warmup_microbatches,
+                    self.num_model_chunks,
+                    schedule_table,
+                    self.cuda_graph_schedule_stage_order,
+                )
+            else:
+                self.cuda_graph_chunk_slot_plan = build_chunk_cuda_graph_slot_plan(
+                    order, self.num_model_chunks, self.cuda_graph_schedule_stage_order
+                )
+            for chunk_idx, callables in enumerate(self.callables_per_chunk):
+                for callable in callables:
+                    callable.cuda_graph_chunk_slot_plan = self.cuda_graph_chunk_slot_plan
+                    callable.cuda_graph_model_chunk_id = chunk_idx
+        log_on_each_pipeline_stage(
+            logger=logger,
+            tp_group=self.tp_group,
+            dp_cp_group=self.dp_cp_group,
+            level=logging.DEBUG,
+            msg=f'Rank {torch.distributed.get_rank()}: '
+            f'SCHEDULE STAGES {self.cuda_graph_schedule_stage_order}',
+        )
+
         # Generate sample arguments and keyword arguments for capturing.
         sample_args, sample_kwargs = self._get_sample_arguments(order, chunk_id_list)
 
@@ -2377,9 +3260,12 @@ class TECudaGraphHelper:
                 # Starting from TE 2.6.0, make_graphed_callables() accepts different number
                 # of layers per chunk.
                 kwargs['_num_layers_per_chunk'] = self.num_layers_per_chunk
-            if is_te_min_version("2.7.0"):
+            if is_te_min_version("2.7.0") and not self._should_use_dynamic_microbatch_slots():
                 # Starting from TE 2.7.0, make_graphed_callables() optimizes the graph memory usage
                 # by reusing input/output data buffers between graphs.
+                # Dynamic microbatch runs may replay only a subset of the captured graphs when a
+                # later iteration has fewer microbatches. Keep buffer ownership conservative until
+                # TE reuse is validated for that subset replay case.
                 kwargs['_reuse_graph_input_output_buffers'] = True
 
             if sample_kwargs:
@@ -2731,6 +3617,200 @@ def get_overlap_moe_expert_parallel_comm_order(order, num_layers_per_chunk, capt
 # ---------------------------------------------------------------------------
 
 
+def _is_local_chunk_dynamic_microbatch_config(config):
+    """Return whether config should use Megatron-owned runtime chunk graph slots."""
+    return bool(
+        getattr(config, "cuda_graph_impl", None) == "local"
+        and getattr(config, "cuda_graph_granularity", "layer") == "chunk"
+        and getattr(config, "cuda_graph_dynamic_microbatches", False)
+    )
+
+
+def _normalize_chunk_cuda_graph_slot_counts(num_slots_per_chunk, num_model_chunks):
+    """Normalize an int/list slot count into one entry per model chunk."""
+    if isinstance(num_slots_per_chunk, int):
+        num_slots_per_chunk = (num_slots_per_chunk,) * num_model_chunks
+    else:
+        num_slots_per_chunk = tuple(num_slots_per_chunk)
+
+    assert len(num_slots_per_chunk) == num_model_chunks, (
+        "num_slots_per_chunk must have one entry per model chunk: "
+        f"got {num_slots_per_chunk}, num_model_chunks={num_model_chunks}"
+    )
+    assert all(num_slots >= 1 for num_slots in num_slots_per_chunk), (
+        f"num_slots_per_chunk must all be >= 1, got {num_slots_per_chunk}"
+    )
+    return num_slots_per_chunk
+
+
+def _infer_non_interleaved_chunk_cuda_graph_slot_counts(
+    num_microbatches, num_warmup_microbatches
+):
+    """Infer per-rank live slot count for a non-interleaved 1F1B schedule."""
+    schedule_table = tuple((microbatch_id, 0) for microbatch_id in range(num_microbatches))
+    slot_plan = build_chunk_cuda_graph_slot_plan_from_schedule(
+        num_warmup_microbatches,
+        1,
+        schedule_table,
+    )
+    return slot_plan.num_slots_per_chunk
+
+
+def _set_decoder_chunk_cuda_graph_slot_metadata(
+    model_with_decoder, slot, op_type, forward_slot, backward_slot
+):
+    """Set active chunk CUDA graph slot metadata on a decoder and its layers."""
+    decoder = model_with_decoder.decoder
+    decoder.cuda_graph_current_slot = slot
+    decoder.cuda_graph_current_op = op_type
+    decoder.cuda_graph_forward_slot = forward_slot
+    decoder.cuda_graph_backward_slot = backward_slot
+
+    for layer in decoder.layers:
+        layer.cuda_graph_current_slot = decoder.cuda_graph_current_slot
+        layer.cuda_graph_current_op = decoder.cuda_graph_current_op
+        layer.cuda_graph_forward_slot = decoder.cuda_graph_forward_slot
+        layer.cuda_graph_backward_slot = decoder.cuda_graph_backward_slot
+
+    if hasattr(model_with_decoder, 'mtp'):
+        for layer in model_with_decoder.mtp.layers:
+            assert hasattr(
+                layer, 'mtp_model_layer'
+            ), f"MTP layer {layer} must have 'mtp_model_layer' attribute"
+            layer.mtp_model_layer.cuda_graph_current_slot = decoder.cuda_graph_current_slot
+            layer.mtp_model_layer.cuda_graph_current_op = decoder.cuda_graph_current_op
+            layer.mtp_model_layer.cuda_graph_forward_slot = decoder.cuda_graph_forward_slot
+            layer.mtp_model_layer.cuda_graph_backward_slot = decoder.cuda_graph_backward_slot
+
+
+def _get_model_with_decoder(model):
+    """Return the wrapped model object that owns a decoder, or None."""
+    try:
+        return get_attr_wrapped_model(
+            model, "decoder", allow_none=False, return_model_obj=True
+        )
+    except RuntimeError:
+        return None
+
+
+def reset_chunk_cuda_graph_runtime_slots(
+    model,
+    num_slots_per_chunk=None,
+    num_microbatches=None,
+    num_model_chunks=1,
+    num_warmup_microbatches=None,
+    schedule_table=None,
+):
+    """Reset local chunk graph runtime slots for one forward-backward iteration."""
+    models = model if isinstance(model, list) else [model]
+    if not models:
+        return
+
+    config = get_model_config(models[0])
+    if not _is_local_chunk_dynamic_microbatch_config(config):
+        return
+
+    num_model_chunks = len(models) if len(models) > 1 else int(num_model_chunks)
+    requested_slots = getattr(config, "cuda_graph_num_microbatch_slots", None)
+    if num_slots_per_chunk is None:
+        if schedule_table is not None:
+            assert num_warmup_microbatches is not None
+            slot_plan = build_chunk_cuda_graph_slot_plan_from_schedule(
+                num_warmup_microbatches,
+                num_model_chunks,
+                schedule_table,
+            )
+            num_slots_per_chunk = slot_plan.num_slots_per_chunk
+        else:
+            assert num_microbatches is not None and num_warmup_microbatches is not None
+            num_slots_per_chunk = _infer_non_interleaved_chunk_cuda_graph_slot_counts(
+                num_microbatches,
+                num_warmup_microbatches,
+            )
+        if requested_slots is not None:
+            assert all(num_slots <= requested_slots for num_slots in num_slots_per_chunk), (
+                "cuda_graph_num_microbatch_slots is smaller than the topology-required local "
+                f"chunk graph slots: requested={requested_slots}, "
+                f"required_per_chunk={num_slots_per_chunk}"
+            )
+    num_slots_per_chunk = _normalize_chunk_cuda_graph_slot_counts(
+        num_slots_per_chunk, num_model_chunks
+    )
+
+    for model_chunk_id, model_chunk in enumerate(models):
+        model_with_decoder = _get_model_with_decoder(model_chunk)
+        if model_with_decoder is None:
+            continue
+        num_slots = num_slots_per_chunk[model_chunk_id if len(models) > 1 else 0]
+        runtime_slots = getattr(model_with_decoder.decoder, 'cuda_graph_runtime_slots', None)
+        if runtime_slots is None or runtime_slots.num_slots != num_slots:
+            runtime_slots = ChunkCudaGraphRuntimeSlots(num_slots)
+            model_with_decoder.decoder.cuda_graph_runtime_slots = runtime_slots
+        else:
+            runtime_slots.reset()
+        _set_decoder_chunk_cuda_graph_slot_metadata(
+            model_with_decoder,
+            slot=None,
+            op_type=None,
+            forward_slot=None,
+            backward_slot=None,
+        )
+
+
+def _set_chunk_cuda_graph_slot(model, microbatch_id, forward):
+    """Set the active Megatron-owned chunk CUDA graph slot metadata."""
+    model_with_decoder = _get_model_with_decoder(model)
+    if model_with_decoder is None:
+        return
+
+    decoder = model_with_decoder.decoder
+    chunk_slot_plan = getattr(decoder, 'cuda_graph_chunk_slot_plan', None)
+    runtime_slots = getattr(decoder, 'cuda_graph_runtime_slots', None)
+    if chunk_slot_plan is None and runtime_slots is None:
+        return
+
+    decoder_config = getattr(decoder, 'config', None)
+    if decoder_config is None:
+        decoder_config = get_model_config(model_with_decoder)
+    use_runtime_slots = runtime_slots is not None and _is_local_chunk_dynamic_microbatch_config(
+        decoder_config
+    )
+    if use_runtime_slots or chunk_slot_plan is None:
+        assert runtime_slots is not None, "Chunk CUDA graph runtime slots must be initialized."
+        if forward:
+            slot = runtime_slots.forward(microbatch_id)
+            op_type = "forward"
+        else:
+            slot = runtime_slots.backward(microbatch_id)
+            op_type = "backward"
+        forward_slot = slot
+        backward_slot = slot
+    else:
+        chunk_id = getattr(decoder, 'cuda_graph_model_chunk_id', 0)
+        if forward:
+            slot = chunk_slot_plan.get_forward_slot(chunk_id, microbatch_id)
+            op_type = "forward"
+        else:
+            slot = chunk_slot_plan.get_backward_slot(chunk_id, microbatch_id)
+            op_type = "backward"
+
+        forward_slot = chunk_slot_plan.get_forward_slot(chunk_id, microbatch_id)
+        backward_slot = chunk_slot_plan.get_backward_slot(chunk_id, microbatch_id)
+
+    _set_decoder_chunk_cuda_graph_slot_metadata(
+        model_with_decoder,
+        slot=slot,
+        op_type=op_type,
+        forward_slot=forward_slot,
+        backward_slot=backward_slot,
+    )
+
+
+def set_current_cuda_graph_slot(model, microbatch_id, forward=True):
+    """Set active chunk CUDA graph slot metadata without changing TE microbatch index."""
+    _set_chunk_cuda_graph_slot(model, microbatch_id, forward)
+
+
 def set_current_microbatch(model, microbatch_id):
     """Set the current microbatch on all layers that use TE CUDA graph replay.
 
@@ -2747,6 +3827,8 @@ def set_current_microbatch(model, microbatch_id):
     except RuntimeError:
         decoder_exists = False
     if decoder_exists and model_with_decoder is not None:
+        model_with_decoder.decoder.current_microbatch = microbatch_id
+        _set_chunk_cuda_graph_slot(model, microbatch_id, forward=True)
         for layer in model_with_decoder.decoder.layers:
             layer.current_microbatch = microbatch_id
         if hasattr(model_with_decoder, 'mtp'):

@@ -273,6 +273,8 @@ def _get_block_submodules(
 class TransformerBlock(GraphableMegatronModule, MegatronModule):
     """Transformer class."""
 
+    is_cuda_graph_chunk_callable = True
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -433,6 +435,137 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 and has_final_layernorm_in_this_stage
                 and self.post_layer_norm
             )
+
+    def get_layer_static_inputs(self, seq_length, micro_batch_size):
+        """Get static inputs for chunk-wise CUDA graph capture.
+
+        The method name matches the existing per-layer helper so TECudaGraphHelper can use the
+        same capture-input plumbing for layer and chunk granularity.
+        """
+        context_parallel_size = self.config.context_parallel_size
+        sequence_parallel = self.config.sequence_parallel
+        tensor_model_parallel_size = self.config.tensor_model_parallel_size
+
+        if self._is_thd_cuda_graph():
+            assert (
+                self.config.max_seqlen_per_dp_cp_rank is not None
+            ), "max_seqlen_per_dp_cp_rank must be set when using THD format with CUDA Graph."
+            slen_full = self.config.max_seqlen_per_dp_cp_rank
+            batch = 1
+        else:
+            slen_full = seq_length // context_parallel_size
+            batch = micro_batch_size
+        slen_per_cptp = slen_full // tensor_model_parallel_size if sequence_parallel else slen_full
+
+        if self.config.bf16:
+            dtype = torch.bfloat16
+        elif self.config.fp16:
+            dtype = torch.float16
+        else:
+            dtype = torch.float32
+
+        static_inputs = {
+            "hidden_states": torch.ones(
+                (slen_per_cptp, batch, self.config.hidden_size),
+                dtype=dtype,
+                requires_grad=True,
+                device=torch.cuda.current_device(),
+            )
+        }
+
+        if self._is_thd_cuda_graph():
+            max_T = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
+            max_num_seqs = self.config.thd_max_num_seqs
+            cu_seqlens = torch.zeros(
+                max_num_seqs + 1, dtype=torch.int32, device=torch.cuda.current_device()
+            )
+            cu_seqlens[1:] = max_T
+            static_inputs["cu_seqlens_q"] = cu_seqlens
+            static_inputs["cu_seqlens_kv"] = cu_seqlens.clone()
+            static_inputs["cu_seqlens_q_padded"] = cu_seqlens.clone()
+            static_inputs["cu_seqlens_kv_padded"] = cu_seqlens.clone()
+
+            slen_for_mask = self.config.max_seqlen_per_dp_cp_rank
+            if self.config.sequence_parallel:
+                slen_for_mask //= self.config.tensor_model_parallel_size
+            static_inputs["padding_mask"] = torch.ones(
+                1, slen_for_mask, dtype=torch.bool, device=torch.cuda.current_device()
+            )
+        else:
+            static_inputs["attention_mask"] = (
+                ~(torch.tril(torch.ones((slen_full, seq_length))).bool())
+                .to(torch.cuda.current_device())
+                .reshape(1, 1, slen_full, seq_length)
+                .tile(micro_batch_size, 1, 1, 1)
+            )
+
+        if self.config.moe_n_hash_layers > 0:
+            for layer in self.layers:
+                if (
+                    getattr(layer, "is_moe_layer", False)
+                    and getattr(layer.mlp.router, "is_hash_layer", False)
+                ):
+                    static_inputs["input_ids"] = torch.zeros(
+                        (micro_batch_size, seq_length),
+                        dtype=torch.long,
+                        device=torch.cuda.current_device(),
+                    )
+                    break
+        return static_inputs
+
+    @staticmethod
+    def _decompose_packed_seq_params_to_kwargs(kwargs):
+        """Decompose PackedSeqParams into tensor kwargs for chunk-wise CUDA graph replay."""
+        packed_seq_params = kwargs.pop('packed_seq_params', None)
+        if packed_seq_params is None:
+            return
+        kwargs['cu_seqlens_q'] = packed_seq_params.cu_seqlens_q
+        kwargs['cu_seqlens_kv'] = packed_seq_params.cu_seqlens_kv
+        kwargs['cu_seqlens_q_padded'] = packed_seq_params.cu_seqlens_q_padded
+        kwargs['cu_seqlens_kv_padded'] = packed_seq_params.cu_seqlens_kv_padded
+
+    def _reconstruct_packed_seq_params_from_kwargs(self, kwargs):
+        """Reconstruct PackedSeqParams from tensor kwargs for chunk-wise CUDA graph capture."""
+        if 'cu_seqlens_q' not in kwargs:
+            return
+        max_seqlen = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
+        kwargs['packed_seq_params'] = PackedSeqParams(
+            qkv_format='thd',
+            cu_seqlens_q=kwargs.pop('cu_seqlens_q'),
+            cu_seqlens_kv=kwargs.pop('cu_seqlens_kv'),
+            cu_seqlens_q_padded=kwargs.pop('cu_seqlens_q_padded'),
+            cu_seqlens_kv_padded=kwargs.pop('cu_seqlens_kv_padded'),
+            max_seqlen_q=max_seqlen,
+            max_seqlen_kv=max_seqlen,
+        )
+
+    def _prepare_pipeline_input_for_chunk_cuda_graph(self, args, kwargs):
+        """Use the real PP input tensor before TE sees chunk graph inputs.
+
+        Non-first PP stages call TransformerBlock.forward(hidden_states=None) and rely on
+        forward() to switch to self.input_tensor. Chunk-level TE graph replay has to provide
+        tensors to TE before forward() runs, so mirror that pipeline behavior here.
+        """
+        kwargs = kwargs.copy()
+        if self.pre_process:
+            return args, kwargs, args[0] if args else kwargs.get('hidden_states', None)
+
+        if args:
+            args = list(args)
+            if args[0] is None:
+                args[0] = self.input_tensor
+            hidden_states = args[0]
+            args = tuple(args)
+        else:
+            if kwargs.get('hidden_states', None) is None:
+                kwargs['hidden_states'] = self.input_tensor
+            hidden_states = kwargs['hidden_states']
+
+        assert hidden_states is not None, (
+            "Chunk-wise CUDA graph on a non-pre-process PP stage requires "
+            "TransformerBlock.input_tensor to be set before replay/capture."
+        )
+        return args, kwargs, hidden_states
 
     def _setup_fused_tp_communication(self):
         """Setup fused TP communication for all layers.
@@ -638,9 +771,17 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
         Check if we should call the local cudagraph path.
         """
         if (
+            self.training
+            and self.config.cuda_graph_impl == "local"
+            and getattr(self.config, 'cuda_graph_granularity', 'layer') == "chunk"
+            and hasattr(self, 'cudagraph_manager')
+        ):
+            return True
+
+        if (
             not self.training
             and hasattr(self, 'cudagraph_manager')
-            and kwargs['attention_mask'] is None
+            and kwargs.get('attention_mask') is None
             and (
                 kwargs.get('inference_context') is not None
                 or kwargs.get('inference_params') is not None
@@ -656,8 +797,57 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 return True
         return False
 
+    def _get_local_chunk_cuda_graph_cache_key(self):
+        """Return a stable runner key for local chunk CUDA graphs under PP."""
+        if not (
+            self.training
+            and self.config.cuda_graph_impl == "local"
+            and getattr(self.config, 'cuda_graph_granularity', 'layer') == "chunk"
+            and hasattr(self, 'cudagraph_manager')
+            and not getattr(self.cudagraph_manager, 'reuse_cudagraphs', False)
+        ):
+            return None
+
+        slot = getattr(self, 'cuda_graph_forward_slot', None)
+        if slot is None and getattr(self.config, 'cuda_graph_dynamic_microbatches', False):
+            raise AssertionError(
+                "Dynamic local chunk CUDA graph requires an active runtime slot before forward."
+            )
+        if slot is None:
+            slot = getattr(self, 'current_microbatch', None)
+        if slot is None:
+            return None
+        return ("chunk", int(slot))
+
+    @staticmethod
+    def _make_local_chunk_output_pipeline_safe(output):
+        """Return graph outputs through fresh viewless tensor objects for PP schedules."""
+
+        def make_output_viewless(out):
+            if torch.is_tensor(out):
+                out = torch.as_strided(out, out.size(), out.stride(), out.storage_offset())
+                return make_viewless_tensor(
+                    inp=out, requires_grad=out.requires_grad, keep_graph=True
+                )
+            return out
+
+        if isinstance(output, tuple):
+            return tuple(make_output_viewless(out) for out in output)
+        return make_output_viewless(output)
+
     def __call__(self, *args, **kwargs):
         if self._should_call_local_cudagraph(*args, **kwargs):
+            if self.training:
+                args, kwargs, _ = self._prepare_pipeline_input_for_chunk_cuda_graph(args, kwargs)
+                output = self.cudagraph_manager(
+                    self,
+                    args,
+                    kwargs,
+                    cache_key=self._get_local_chunk_cuda_graph_cache_key(),
+                )
+                if isinstance(output, tuple) and len(output) == 1:
+                    output = output[0]
+                return self._make_local_chunk_output_pipeline_safe(output)
             kwargs['hidden_states'] = (
                 kwargs['hidden_states'].unwrap()
                 if isinstance(kwargs['hidden_states'], WrappedTensor)
@@ -709,7 +899,7 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
     def forward(
         self,
         hidden_states: Union[Tensor, WrappedTensor],
-        attention_mask: Optional[Tensor],
+        attention_mask: Optional[Tensor] = None,
         context: Optional[Tensor] = None,
         context_mask: Optional[Tensor] = None,
         rotary_pos_emb: Optional[Tensor] = None,
@@ -797,7 +987,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
 
         if not self.pre_process:
             # See set_input_tensor()
-            hidden_states = self.input_tensor
+            if not (
+                self.config.cuda_graph_impl == "local"
+                and getattr(self.config, 'cuda_graph_granularity', 'layer') == "chunk"
+                and hidden_states is not None
+            ):
+                hidden_states = self.input_tensor
 
         # Viewless tensor.
         # - We only need to create a viewless tensor in the case of micro batch

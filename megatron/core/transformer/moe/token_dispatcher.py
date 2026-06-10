@@ -51,6 +51,68 @@ logger = logging.getLogger(__name__)
 """
 
 
+def _get_static_hybridep_thd_num_tokens(config: TransformerConfig) -> Optional[int]:
+    """Return the static per-rank HybridEP token count for THD CUDA graphs."""
+    if config.sequence_packing_scheduler is None or config.cuda_graph_impl == "none":
+        return None
+    if config.max_seqlen_per_dp_cp_rank is None:
+        raise ValueError(
+            "max_seqlen_per_dp_cp_rank must be set when using THD sequence packing, "
+            "HybridEP, and CUDA graphs."
+        )
+
+    num_tokens = config.max_seqlen_per_dp_cp_rank
+    if config.sequence_parallel:
+        tp_size = config.tensor_model_parallel_size
+        if num_tokens % tp_size != 0:
+            raise ValueError(
+                "max_seqlen_per_dp_cp_rank must be divisible by tensor_model_parallel_size "
+                "when using THD sequence packing, sequence parallelism, HybridEP, "
+                f"and CUDA graphs; got {num_tokens=} and {tp_size=}."
+            )
+        num_tokens //= tp_size
+
+    return num_tokens + (-num_tokens % HYBRIDEP_TOKEN_ALIGNMENT)
+
+
+def _pad_tokens_per_expert_to_num_permuted_tokens(
+    tokens_per_expert: torch.Tensor, num_permuted_tokens: int
+) -> torch.Tensor:
+    """Return expert split sizes whose sum matches the pre-sized HybridEP buffer."""
+    actual_num_tokens = tokens_per_expert.sum()
+    delta = num_permuted_tokens - actual_num_tokens
+
+    pad_last = torch.zeros_like(tokens_per_expert)
+    pad_last[-1] = delta
+    padded_tokens_per_expert = tokens_per_expert + pad_last
+
+    # If the fixed budget was too small, the pass will be discarded by the
+    # over-budget rerun path. Still provide shape-valid split sizes so expert
+    # compute can finish and the runner can observe the overflow flag.
+    overflow_tokens_per_expert = torch.zeros_like(tokens_per_expert)
+    overflow_tokens_per_expert[-1] = actual_num_tokens + delta
+    return torch.where(delta >= 0, padded_tokens_per_expert, overflow_tokens_per_expert)
+
+
+def _zero_hybridep_padding(
+    hidden_states: torch.Tensor, probs: torch.Tensor, actual_num_tokens: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Zero the unused tail in a pre-sized HybridEP expert buffer."""
+    hidden_states = _zero_hybridep_hidden_padding(hidden_states, actual_num_tokens)
+    probs = _zero_hybridep_hidden_padding(probs, actual_num_tokens)
+    return hidden_states, probs
+
+
+def _zero_hybridep_hidden_padding(
+    hidden_states: torch.Tensor, actual_num_tokens: torch.Tensor
+) -> torch.Tensor:
+    """Zero the unused tail in a pre-sized HybridEP hidden-state buffer."""
+    token_ids = torch.arange(hidden_states.shape[0], device=hidden_states.device)
+    padding_mask = token_ids >= actual_num_tokens
+    padding_mask = padding_mask.view((-1,) + (1,) * (hidden_states.dim() - 1))
+    return hidden_states.masked_fill(padding_mask, 0)
+
+
 class MoETokenDispatcher:
     """
     MoE Token Dispatcher
@@ -1055,15 +1117,27 @@ class _HybridEPManager(_DispatchManager):
         # hidden states are padded to the group-wide max and trimmed in combine.
         self._original_num_tokens: Optional[int] = None
         self._padded_num_tokens: Optional[int] = None
+        self._actual_num_permuted_tokens: Optional[torch.Tensor] = None
 
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         num_tokens = routing_map.shape[0]
         self._original_num_tokens = num_tokens
 
         padded_num_tokens = num_tokens
-        if self.config.sequence_packing_scheduler is not None:
+        static_thd_num_tokens = _get_static_hybridep_thd_num_tokens(self.config)
+        if static_thd_num_tokens is not None:
+            if num_tokens > static_thd_num_tokens:
+                raise ValueError(
+                    "HybridEP received more THD tokens than the CUDA graph static capacity: "
+                    f"{num_tokens=} > {static_thd_num_tokens=}. Increase "
+                    "max_seqlen_per_dp_cp_rank or fix the upstream THD padding contract."
+                )
+            padded_num_tokens = static_thd_num_tokens
+        elif self.config.sequence_packing_scheduler is not None:
             # Use the actual tp_ep max so all ranks in the MoE communication
-            # group pass the same token count to HybridEP.
+            # group pass the same token count to HybridEP. This eager fallback
+            # intentionally uses runtime collective/CPU metadata and is not
+            # selected for CUDA graph runs.
             max_num_tokens_across_ep = torch.tensor(
                 [num_tokens], device=routing_map.device, dtype=torch.long
             )
@@ -1076,7 +1150,7 @@ class _HybridEPManager(_DispatchManager):
 
         routing_map = routing_map.reshape(num_tokens, self.num_experts)
         probs = probs.reshape(num_tokens, self.num_experts)
-        if self.config.sequence_packing_scheduler is not None and padded_num_tokens > num_tokens:
+        if padded_num_tokens > num_tokens:
             pad_rows = padded_num_tokens - num_tokens
             routing_map = torch.cat(
                 [routing_map, routing_map.new_zeros((pad_rows, self.num_experts))], dim=0
@@ -1152,12 +1226,19 @@ class _HybridEPManager(_DispatchManager):
             over_budget = self.handle[-1] != 0  # this is overflow_flag
             self.over_budget |= over_budget
 
+        actual_tokens_per_expert = tokens_per_expert.to(torch.int64)
         if self.num_permuted_tokens is None:
-            self.tokens_per_expert = tokens_per_expert.to(torch.int64)
+            self.tokens_per_expert = actual_tokens_per_expert
             # self.num_permuted_tokens is necessary to allocate the output tensor for permute
             self.num_permuted_tokens = self.tokens_per_expert.sum()
         if self.moe_expert_rank_capacity_factor is not None:
-            self.tokens_per_expert = tokens_per_expert.to(torch.int64)
+            dispatched_hidden, self.dispatched_probs = _zero_hybridep_padding(
+                dispatched_hidden, self.dispatched_probs, actual_tokens_per_expert.sum()
+            )
+            self._actual_num_permuted_tokens = actual_tokens_per_expert.sum()
+            self.tokens_per_expert = _pad_tokens_per_expert_to_num_permuted_tokens(
+                actual_tokens_per_expert, self.num_permuted_tokens
+            )
         return dispatched_hidden
 
     def combine(
@@ -1166,6 +1247,13 @@ class _HybridEPManager(_DispatchManager):
         async_finish: bool = True,
         allocate_on_comm_stream: bool = True,
     ) -> torch.Tensor:
+        if (
+            self.moe_expert_rank_capacity_factor is not None
+            and self._actual_num_permuted_tokens is not None
+        ):
+            hidden_states = _zero_hybridep_hidden_padding(
+                hidden_states, self._actual_num_permuted_tokens
+            )
         hidden_states = hybrid_ep_combine(
             x=hidden_states,
             handle=self.handle,
@@ -1187,6 +1275,7 @@ class _HybridEPManager(_DispatchManager):
             self.num_permuted_tokens = None
         self._original_num_tokens = None
         self._padded_num_tokens = None
+        self._actual_num_permuted_tokens = None
         return hidden_states
 
     def get_permuted_hidden_states_by_experts(self, hidden_states: torch.Tensor) -> torch.Tensor:

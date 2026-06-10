@@ -78,6 +78,58 @@ else:
     ) = (None, None, None, None, None, None)
 
 
+def _mla_thd_asym_pad_needed(parallel_attention, query, value):
+    """Whether THD MLA must pad V up to the query head dim (square) before core attention.
+
+    Historically the THD fused-attention kernel required head_dim_qk == head_dim_v, so V was
+    zero-padded to the query head dim. Modern cuDNN/TE supports the native asymmetric MLA dims
+    (e.g. DeepSeek-V3/Moonlight head_dim_qk=192, head_dim_v=128); there the pad is unnecessary and
+    actually harmful (it produces 192/192, which has no THD backend). So probe the backend for the
+    native asymmetric dims and only pad when no backend supports them. Cached per module; any probe
+    failure falls back to the legacy always-pad behavior.
+    """
+    cached = getattr(parallel_attention, "_mla_thd_vpad_needed", None)
+    if cached is not None:
+        return cached
+    needed = True  # safe default: legacy pad-to-square behavior
+    try:
+        import os as _os
+
+        from transformer_engine.pytorch.attention.dot_product_attention.utils import (
+            AttentionParams,
+            get_attention_backend,
+        )
+
+        cfg = parallel_attention.config
+        cp_size = getattr(cfg, "context_parallel_size", 1) or 1
+        params = AttentionParams(
+            qkv_dtype=query.dtype,
+            qkv_layout="thd_thd_thd",
+            num_heads=cfg.num_attention_heads,
+            num_gqa_groups=cfg.num_attention_heads,
+            max_seqlen_q=1024,
+            max_seqlen_kv=1024,
+            head_dim_qk=query.shape[-1],
+            head_dim_v=value.shape[-1],
+            attn_mask_type="padding_causal",
+            window_size=(-1, 0),
+            attention_dropout=cfg.attention_dropout,
+            pad_between_seqs=True,
+            context_parallel=cp_size > 1,
+            cp_size=cp_size,
+            deterministic=int(_os.getenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "1")) == 0,
+            is_training=parallel_attention.training,
+        )
+        r = get_attention_backend(params)
+        # r = (use_flash, flash_backend, use_fused, fused_backend, use_unfused, available)
+        asym_supported = bool(r[0] or r[2] or r[4])
+        needed = not asym_supported
+    except Exception:
+        needed = True
+    parallel_attention._mla_thd_vpad_needed = needed
+    return needed
+
+
 def _prepare_mla_core_attention_value(parallel_attention, query, value, packed_seq_params):
     """Prepare value tensor for MLA core attention THD execution."""
     orig_v_dim = value.shape[-1] if value is not None else None
@@ -88,6 +140,8 @@ def _prepare_mla_core_attention_value(parallel_attention, query, value, packed_s
         and parallel_attention.config.experimental_attention_variant is None
         and value is not None
         and query.shape[-1] != orig_v_dim
+        # Only pad when the native asymmetric dims have no attention backend (legacy kernels).
+        and _mla_thd_asym_pad_needed(parallel_attention, query, value)
     )
     if need_v_pad:
         value = F.pad(value, [0, query.shape[-1] - orig_v_dim])

@@ -18,7 +18,12 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.moe_utils import get_capacity
-from megatron.core.transformer.moe.token_dispatcher import MoETokenDispatcher
+from megatron.core.transformer.moe.token_dispatcher import (
+    MoETokenDispatcher,
+    _get_static_hybridep_thd_num_tokens,
+    _pad_tokens_per_expert_to_num_permuted_tokens,
+    _zero_hybridep_padding,
+)
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
@@ -83,6 +88,98 @@ def test_set_cudagraph_attr_supports_nested_paths():
     dispatcher.set_cudagraph_attr("_comm_manager.routing_map", routing_map)
 
     assert dispatcher._comm_manager.routing_map is routing_map
+
+
+def _make_hybridep_thd_config(**kwargs):
+    defaults = dict(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        ffn_hidden_size=512,
+        add_bias_linear=False,
+        num_moe_experts=4,
+        moe_token_dispatcher_type="flex",
+        moe_flex_dispatcher_backend="hybridep",
+        expert_tensor_parallel_size=1,
+        sequence_packing_scheduler="dp_balanced",
+        max_seqlen_per_dp_cp_rank=1024,
+        pad_packed_seq_alignment=0,
+        cuda_graph_impl="local",
+        cuda_graph_modules=[],
+    )
+    defaults.update(kwargs)
+    return TransformerConfig(**defaults)
+
+
+def test_static_hybridep_thd_num_tokens_uses_full_local_capacity_without_sp():
+    config = _make_hybridep_thd_config(
+        max_seqlen_per_dp_cp_rank=1000,
+        tensor_model_parallel_size=2,
+        sequence_parallel=False,
+    )
+
+    assert _get_static_hybridep_thd_num_tokens(config) == 1024
+
+
+def test_static_hybridep_thd_num_tokens_uses_sequence_parallel_capacity():
+    config = _make_hybridep_thd_config(
+        max_seqlen_per_dp_cp_rank=1000,
+        tensor_model_parallel_size=2,
+        sequence_parallel=True,
+    )
+
+    assert _get_static_hybridep_thd_num_tokens(config) == 512
+
+
+def test_static_hybridep_thd_num_tokens_disabled_without_cuda_graph():
+    config = _make_hybridep_thd_config(cuda_graph_impl="none")
+
+    assert _get_static_hybridep_thd_num_tokens(config) is None
+
+
+def test_static_hybridep_thd_num_tokens_requires_sp_divisibility():
+    config = _make_hybridep_thd_config(
+        max_seqlen_per_dp_cp_rank=1001,
+        tensor_model_parallel_size=2,
+        sequence_parallel=True,
+    )
+
+    with pytest.raises(ValueError, match="divisible"):
+        _get_static_hybridep_thd_num_tokens(config)
+
+
+def test_hybridep_capacity_factor_pads_expert_splits_to_budget():
+    tokens_per_expert = torch.tensor([2, 3, 5], dtype=torch.int64)
+
+    padded_tokens_per_expert = _pad_tokens_per_expert_to_num_permuted_tokens(
+        tokens_per_expert, num_permuted_tokens=16
+    )
+
+    assert padded_tokens_per_expert.tolist() == [2, 3, 11]
+
+
+def test_hybridep_capacity_factor_overbudget_split_is_shape_valid():
+    tokens_per_expert = torch.tensor([7, 8, 9], dtype=torch.int64)
+
+    padded_tokens_per_expert = _pad_tokens_per_expert_to_num_permuted_tokens(
+        tokens_per_expert, num_permuted_tokens=16
+    )
+
+    assert padded_tokens_per_expert.tolist() == [0, 0, 16]
+
+
+def test_hybridep_capacity_factor_zeroes_expert_buffer_tail():
+    hidden_states = torch.ones(5, 2)
+    probs = torch.ones(5)
+
+    hidden_states, probs = _zero_hybridep_padding(
+        hidden_states, probs, actual_num_tokens=torch.tensor(3)
+    )
+
+    assert torch.equal(hidden_states[:3], torch.ones(3, 2))
+    assert torch.equal(probs[:3], torch.ones(3))
+    assert torch.equal(hidden_states[3:], torch.zeros(2, 2))
+    assert torch.equal(probs[3:], torch.zeros(2))
 
 
 class MoEModelTestContainer:

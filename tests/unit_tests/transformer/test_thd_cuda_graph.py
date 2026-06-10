@@ -19,6 +19,7 @@ cuda_graph_impl=none and cuda_graph_impl=transformer_engine, then compares
 the per-iteration loss / grad_norm lines. They must be exactly equal.
 """
 
+import json
 import os
 import re
 import subprocess
@@ -32,11 +33,20 @@ from megatron.core.packed_seq_params import (
     pad_sequence_for_thd,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.moe.fused_a2a import HAVE_HYBRIDEP
+from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.test_utilities import Utils
 
-os.environ.setdefault('NVTE_ALLOW_NONDETERMINISTIC_ALGO', '0')
+# cuDNN 9.22 has no *deterministic* fused-attention backend for THD packed-sequence inputs
+# (including the MLA asymmetric qk/v dims used here, e.g. Moonlight qk=192/v=128). With the
+# strict NVTE_ALLOW_NONDETERMINISTIC_ALGO=0 every backend is disabled and attention raises
+# "No dot product attention backend". Allow non-deterministic algos: the no-graph vs graph
+# runs are still bitwise identical because shapes, seed and CUBLAS_WORKSPACE_CONFIG are fixed
+# (the selected algo is deterministic in practice).
+os.environ.setdefault('NVTE_ALLOW_NONDETERMINISTIC_ALGO', '1')
+os.environ.setdefault('NVTE_CUTEDSL_FUSED_GROUPED_MLP', '1')
 os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
 
 
@@ -242,6 +252,125 @@ class TestDecomposeReconstruct:
         assert set(kw.keys()) == keys
 
 
+class TestChunkWiseStaticInputs:
+
+    def setup_method(self):
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1)
+
+    def teardown_method(self):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_transformer_block_static_inputs_use_thd_tensors(self):
+        """Chunk-wise THD capture uses packed-sequence tensors instead of attention_mask."""
+        from megatron.core.models.gpt.gpt_layer_specs import (
+            get_gpt_layer_with_transformer_engine_spec,
+        )
+
+        max_seqlen = 128
+        max_num_seqs = 8
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=256,
+            num_attention_heads=4,
+            ffn_hidden_size=1024,
+            max_seqlen_per_dp_cp_rank=max_seqlen,
+            thd_max_num_seqs=max_num_seqs,
+            sequence_packing_scheduler="dp_balanced",
+            moe_token_dispatcher_type="alltoall",
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_granularity="chunk",
+            cuda_graph_modules=[],
+            bf16=True,
+        )
+
+        model_parallel_cuda_manual_seed(42)
+        block = (
+            TransformerBlock(config, get_gpt_layer_with_transformer_engine_spec())
+            .cuda()
+            .bfloat16()
+        )
+        static_inputs = block.get_layer_static_inputs(seq_length=max_seqlen, micro_batch_size=4)
+
+        assert static_inputs["hidden_states"].shape == (max_seqlen, 1, 256)
+        assert static_inputs["hidden_states"].dtype == torch.bfloat16
+        assert "attention_mask" not in static_inputs
+        for key in (
+            "cu_seqlens_q",
+            "cu_seqlens_kv",
+            "cu_seqlens_q_padded",
+            "cu_seqlens_kv_padded",
+        ):
+            assert static_inputs[key].shape == (max_num_seqs + 1,)
+            assert static_inputs[key].dtype == torch.int32
+        assert static_inputs["padding_mask"].shape == (1, max_seqlen)
+        assert static_inputs["padding_mask"].dtype == torch.bool
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_chunk_replay_uses_pipeline_input_tensor_when_hidden_is_none(self, monkeypatch):
+        """PP non-first stages pass hidden_states=None; chunk replay must use input_tensor."""
+        from megatron.core.models.gpt.gpt_layer_specs import (
+            get_gpt_layer_with_transformer_engine_spec,
+        )
+        from megatron.core.transformer.module import GraphableMegatronModule
+
+        max_seqlen = 128
+        max_num_seqs = 8
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=256,
+            num_attention_heads=4,
+            ffn_hidden_size=1024,
+            max_seqlen_per_dp_cp_rank=max_seqlen,
+            thd_max_num_seqs=max_num_seqs,
+            sequence_packing_scheduler="dp_balanced",
+            moe_token_dispatcher_type="alltoall",
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_granularity="chunk",
+            cuda_graph_modules=[],
+            bf16=True,
+        )
+
+        model_parallel_cuda_manual_seed(42)
+        block = (
+            TransformerBlock(
+                config,
+                get_gpt_layer_with_transformer_engine_spec(),
+                pre_process=False,
+            )
+            .cuda()
+            .bfloat16()
+        )
+        runtime_hidden = torch.randn(max_seqlen, 1, 256, device="cuda", dtype=torch.bfloat16)
+        block.set_input_tensor(runtime_hidden)
+        psp = _make_psp([64, 32])
+        padding_mask = torch.zeros(1, max_seqlen, dtype=torch.bool, device="cuda")
+        captured = {}
+
+        def fake_base_replay(self, *args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+            return kwargs["hidden_states"]
+
+        monkeypatch.setattr(GraphableMegatronModule, "_te_cuda_graph_replay", fake_base_replay)
+
+        out = block._te_cuda_graph_replay(
+            hidden_states=None,
+            attention_mask=None,
+            inference_context=None,
+            packed_seq_params=psp,
+            padding_mask=padding_mask,
+        )
+
+        assert out is runtime_hidden
+        assert captured["kwargs"]["hidden_states"] is runtime_hidden
+        assert "packed_seq_params" not in captured["kwargs"]
+        assert captured["kwargs"]["cu_seqlens_q"] is psp.cu_seqlens_q
+        assert captured["kwargs"]["padding_mask"] is padding_mask
+
+
 # =============================================================================
 # 3. E2E no-graph vs graph bitwise loss/grad_norm match
 #    Subprocess-launches `torchrun pretrain_gpt.py` -- same recipe as
@@ -423,8 +552,13 @@ def _run_pretrain(model_args, cuda_graph_args, master_port):
     """Subprocess-launch `torchrun pretrain_gpt.py` once and capture stdout."""
     env = os.environ.copy()
     env["PYTHONPATH"] = str(_REPO_ROOT) + ":" + env.get("PYTHONPATH", "")
+    env["PATH"] = "/usr/bin:/usr/local/bin:" + env.get("PATH", "")
     env["CUDA_DEVICE_MAX_CONNECTIONS"] = "1"
-    env["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "0"
+    # See module-level note: cuDNN 9.22 has no deterministic THD fused-attention backend for
+    # the MLA dims used here, so =0 leaves no usable backend. =1 still yields bitwise-identical
+    # no-graph vs graph metrics (shapes/seed/CUBLAS_WORKSPACE_CONFIG are fixed).
+    env["NVTE_ALLOW_NONDETERMINISTIC_ALGO"] = "1"
+    env["NVTE_CUTEDSL_FUSED_GROUPED_MLP"] = "1"
     env["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
     env["NCCL_ALGO"] = "^NVLS"
     # Strip any inherited torchrun env so this subprocess starts a fresh group.
@@ -468,6 +602,111 @@ def _run_pretrain(model_args, cuda_graph_args, master_port):
         cmd, cwd=_REPO_ROOT, env=env, capture_output=True, text=True, timeout=900
     )
     return result
+
+
+def _replace_arg(args, flag, value):
+    args = list(args)
+    try:
+        idx = args.index(flag)
+    except ValueError:
+        args.extend([flag, value])
+    else:
+        args[idx + 1] = value
+    return args
+
+
+def _remove_arg_pair(args, flag):
+    args = list(args)
+    while flag in args:
+        idx = args.index(flag)
+        del args[idx : idx + 2]
+    return args
+
+
+def _reduced_moonlight_vpp_hybridep_args():
+    sft_json = json.dumps(
+        {
+            "mode": "distribution",
+            "type": "lognormal",
+            "min_seq_len": 128,
+            "max_seq_len": 512,
+            "mean_seq_len": 256,
+            "lognormal_sigma": 0.8,
+        }
+    )
+    args = list(_COMMON_ARGS)
+    args = _replace_arg(args, "--seq-length", "512")
+    args = _replace_arg(args, "--attention-dropout", "0.1")
+    args = _replace_arg(args, "--hidden-dropout", "0.1")
+    args = _replace_arg(args, "--lr-warmup-iters", "0")
+    args = _replace_arg(args, "--sft-mock-dataset-config-json", sft_json)
+    args = _remove_arg_pair(args, "--global-batch-size")
+    args = _remove_arg_pair(args, "--train-iters")
+    args.extend(
+        [
+            "--step-batch-size-schedule",
+            "0:4 2048:6",
+            "--train-samples",
+            "10",
+            "--lr-decay-samples",
+            "10",
+            "--eval-global-batch-size",
+            "4",
+            "--num-layers",
+            "4",
+            "--hidden-size",
+            "512",
+            "--ffn-hidden-size",
+            "2048",
+            "--num-attention-heads",
+            "8",
+            "--num-layers-per-virtual-pipeline-stage",
+            "1",
+            "--expert-model-parallel-size",
+            "4",
+            "--expert-tensor-parallel-size",
+            "1",
+            "--multi-latent-attention",
+            "--kv-lora-rank",
+            "32",
+            "--qk-head-dim",
+            "64",
+            "--qk-pos-emb-head-dim",
+            "64",
+            "--v-head-dim",
+            "64",
+            "--num-experts",
+            "8",
+            "--moe-ffn-hidden-size",
+            "512",
+            "--moe-router-topk",
+            "2",
+            "--moe-shared-expert-intermediate-size",
+            "512",
+            "--moe-layer-freq",
+            "([0]+[1]*3)",
+            "--moe-token-dispatcher-type",
+            "flex",
+            "--moe-flex-dispatcher-backend",
+            "hybridep",
+            "--moe-router-dtype",
+            "fp32",
+            "--moe-router-load-balancing-type",
+            "aux_loss",
+            "--moe-aux-loss-coeff",
+            "0.001",
+            "--moe-expert-capacity-factor",
+            "1.0",
+            "--moe-pad-expert-input-to-capacity",
+            "--normalization",
+            "RMSNorm",
+            "--norm-epsilon",
+            "1e-5",
+            "--vocab-size",
+            "8192",
+        ]
+    )
+    return args
 
 
 _ITER_START_RE = re.compile(r"iteration\s+(\d+)/\s*\d+ \|")
@@ -560,3 +799,88 @@ class TestE2EBitwise:
         # Bitwise compare per iteration.
         for i, (a, b) in enumerate(zip(metrics_eager, metrics_graph)):
             assert a == b, f"[{model_name}] iter {i+1} differs:\n" f"  eager: {a}\n" f"  graph: {b}"
+
+
+
+def _moonlight_hybridep_paged_stash_args():
+    """Full Moonlight + HybridEP + paged stash (validated on GB200 / SM100).
+
+    ``_MOONLIGHT_ARGS`` already selects the flex / HybridEP dispatcher; this
+    appends the sync-free grouped-MLP + paged-stash flags exercised by the
+    chunk-wise local capture under paged stash.
+    """
+    return _MOONLIGHT_ARGS + [
+        "--moe-grouped-gemm",
+        "--use-transformer-engine-op-fuser",
+        "--moe-mlp-glu-interleave-size",
+        "32",
+        "--moe-expert-rank-capacity-factor",
+        "4.0",
+        "--moe-paged-stash",
+        "--moe-paged-stash-buffer-size-factor-cuda",
+        "4.0",
+        "--moe-paged-stash-buffer-size-factor-cpu",
+        "0.0",
+    ]
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(torch.cuda.device_count() < 8, reason="requires 8 GPUs")
+@pytest.mark.skipif(not HAVE_HYBRIDEP, reason="HybridEP is not available")
+class TestE2ELocalChunkHybridEP:
+    """SM-aware end-to-end bitwise check for the local F/B-split chunk graph.
+
+    The MoE path is selected by GPU compute capability so each platform runs the
+    configuration it was validated on:
+      * SM100 / Blackwell -> HybridEP + paged stash (slot count auto-inferred)
+      * SM90  / Hopper     -> HybridEP + drop-and-pad
+
+    Compares no-graph vs ``--cuda-graph-impl local --cuda-graph-granularity chunk``
+    and asserts the per-iteration metrics are bitwise identical.
+    """
+
+    def test_no_graph_vs_local_chunk_graph(self):
+        major = torch.cuda.get_device_capability()[0]
+        graph_args = [
+            "--cuda-graph-impl",
+            "local",
+            "--cuda-graph-granularity",
+            "chunk",
+            "--cuda-graph-dynamic-microbatches",
+        ]
+        if major >= 10:  # Blackwell / SM100: paged stash, slot count auto-inferred
+            model_args = _moonlight_hybridep_paged_stash_args()
+            label = "sm100-local-chunk-hybridep-paged-stash"
+        elif major == 9:  # Hopper / SM90: drop-and-pad
+            model_args = _reduced_moonlight_vpp_hybridep_args()
+            label = "sm90-local-chunk-hybridep-drop-pad"
+            graph_args += ["--cuda-graph-num-microbatch-slots", "4"]
+        else:
+            pytest.skip(
+                f"SM{major}0 not covered by this e2e; expect SM90 (drop-and-pad) "
+                "or SM100 (paged-stash)."
+            )
+
+        r1 = _run_pretrain(model_args, cuda_graph_args=[], master_port=29672)
+        assert r1.returncode == 0, (
+            f"[{label}] noGraph pretrain failed (rc={r1.returncode})\n"
+            f"--- stdout (tail) ---\n{r1.stdout[-4000:]}\n"
+            f"--- stderr (tail) ---\n{r1.stderr[-2000:]}"
+        )
+        r2 = _run_pretrain(model_args, cuda_graph_args=graph_args, master_port=29673)
+        assert r2.returncode == 0, (
+            f"[{label}] localChunk pretrain failed (rc={r2.returncode})\n"
+            f"--- stdout (tail) ---\n{r2.stdout[-4000:]}\n"
+            f"--- stderr (tail) ---\n{r2.stderr[-2000:]}"
+        )
+
+        metrics_eager = _extract_metrics(r1.stdout)
+        metrics_graph = _extract_metrics(r2.stdout)
+        assert len(metrics_eager) >= 1, (
+            f"[{label}] noGraph produced no metric lines\n"
+            f"--- stdout (tail) ---\n{r1.stdout[-2000:]}"
+        )
+        assert metrics_eager == metrics_graph, (
+            f"[{label}] metrics differ:\n  eager: {metrics_eager}\n  graph: {metrics_graph}"
+        )

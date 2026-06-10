@@ -1014,6 +1014,12 @@ class TransformerConfig(ModelParallelConfig):
     transformed to an empty list in __post_init__. The deprecated values "full_iteration" and
     "full_iteration_inference" are also accepted and migrated to the new API in __post_init__."""
 
+    cuda_graph_granularity: Literal['layer', 'chunk'] = "layer"
+    """Controls training CUDA graph ownership for per-module CUDA graphs.
+    "layer": existing per-layer graph ownership.
+    "chunk": capture one graph per local TransformerBlock/model chunk and microbatch slot.
+    Chunk graphs require empty cuda_graph_modules and keep pipeline scheduling outside the graph."""
+
     inference_cuda_graph_scope: Optional[InferenceCudaGraphScope] = field(
         default=None,
         metadata={
@@ -1058,15 +1064,17 @@ class TransformerConfig(ModelParallelConfig):
     buffer."""
 
     cuda_graph_dynamic_microbatches: bool = False
-    """Enable CUDA graph slot reuse so the same captured graphs can be replayed for a dynamic
-    number of microbatches. This option is only meaningful for cuda_graph_impl=transformer_engine.
-    When enabled, capture builds a bounded number of graph slots and replay maps real
-    microbatch_id to slot_id by modulo."""
+    """Allow CUDA graph replay when the runtime number of microbatches can vary across
+    iterations. This option is supported for cuda_graph_impl=transformer_engine and for
+    cuda_graph_impl=local with cuda_graph_granularity=chunk. Transformer Engine capture still
+    builds graph slots for replayable microbatch ids. Megatron-owned local chunk capture reuses
+    graph slots by in-flight activation lifetime."""
 
     cuda_graph_num_microbatch_slots: Optional[int] = None
-    """Number of CUDA graph slots to capture per layer for dynamic microbatch replay.
-    If None, an automatic slot count is derived from the PP/VPP schedule topology.
-    If set, the provided value must be >= the automatically derived safe minimum."""
+    """Number of CUDA graph slots to capture per layer/chunk for dynamic microbatch replay.
+    For transformer_engine graph capture this must cover the maximum runtime microbatch count.
+    For cuda_graph_impl=local with cuda_graph_granularity=chunk, this is the per-chunk in-flight
+    slot count and may be smaller than the total runtime microbatch count."""
 
     ####################
     # Hyper-Connection Configuration
@@ -2574,6 +2582,20 @@ class TransformerConfig(ModelParallelConfig):
             if self.cpu_offloading and self.cuda_graph_impl != "full_iteration":
                 raise ValueError("CUDA graphs not supported with CPU offloading.")
 
+            assert self.cuda_graph_granularity in (
+                "layer",
+                "chunk",
+            ), f"Invalid cuda_graph_granularity: {self.cuda_graph_granularity}"
+            if self.cuda_graph_granularity == "chunk":
+                assert self.cuda_graph_impl == "local", (
+                    "chunk CUDA graph granularity is only supported with "
+                    "cuda_graph_impl='local'."
+                )
+                assert not self.cuda_graph_modules, (
+                    "chunk CUDA graph granularity captures the whole chunk and requires "
+                    "empty cuda_graph_modules."
+                )
+
             # Check cuda graph scopes for per-layer implementations.
             if self.cuda_graph_impl in ("local", "transformer_engine"):
                 if self.cuda_graph_impl == "local":
@@ -2595,14 +2617,32 @@ class TransformerConfig(ModelParallelConfig):
                                 "cuda_graph_num_microbatch_slots must be >= 1 when "
                                 "cuda_graph_dynamic_microbatches is enabled."
                             )
-                else:
+                elif self.cuda_graph_impl == "local":
+                    if self.cuda_graph_dynamic_microbatches:
+                        assert self.cuda_graph_granularity == "chunk", (
+                            "cuda_graph_dynamic_microbatches with cuda_graph_impl=local requires "
+                            "cuda_graph_granularity=chunk."
+                        )
+                        if self.cuda_graph_num_microbatch_slots is not None:
+                            assert self.cuda_graph_num_microbatch_slots >= 1, (
+                                "cuda_graph_num_microbatch_slots must be >= 1 when "
+                                "cuda_graph_dynamic_microbatches is enabled."
+                            )
+                    else:
+                        assert self.cuda_graph_num_microbatch_slots is None, (
+                            "cuda_graph_num_microbatch_slots requires "
+                            "cuda_graph_dynamic_microbatches when cuda_graph_impl=local."
+                        )
+                elif self.cuda_graph_impl != "full_iteration":
                     assert not self.cuda_graph_dynamic_microbatches, (
                         "cuda_graph_dynamic_microbatches is only supported with "
-                        "cuda_graph_impl=transformer_engine."
+                        "cuda_graph_impl=transformer_engine or with cuda_graph_impl=local and "
+                        "cuda_graph_granularity=chunk."
                     )
                     assert self.cuda_graph_num_microbatch_slots is None, (
                         "cuda_graph_num_microbatch_slots is only supported with "
-                        "cuda_graph_impl=transformer_engine."
+                        "cuda_graph_impl=transformer_engine or with cuda_graph_impl=local and "
+                        "cuda_graph_granularity=chunk."
                     )
 
                 assert (
@@ -2713,6 +2753,12 @@ class TransformerConfig(ModelParallelConfig):
                         "fine_grained_offloading_max_inflight_offloads must be set when using "
                         "fine-grained activation offloading with full-iteration CUDA graphs "
                     )
+
+            if self.cuda_graph_granularity == "chunk":
+                assert not self.overlap_moe_expert_parallel_comm, (
+                    "Phase 1 chunk CUDA graph granularity does not support "
+                    "overlap_moe_expert_parallel_comm. Use layer granularity or full_iteration."
+                )
 
         if self.moe_token_dispatcher_type in ["allgather"]:
             if self.variable_seq_lengths is True:
