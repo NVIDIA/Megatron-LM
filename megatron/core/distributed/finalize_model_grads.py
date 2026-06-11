@@ -445,14 +445,9 @@ _allreduce_layernorm_grads = _allreduce_non_tensor_model_parallel_grads
 def _allreduce_replicated_grads_over_gtp_group(model: List[torch.nn.Module]):
     """SUM NON-GTP (replicated) param grads over the gtp / egtp group.
 
-    DDP reduces every param over the gtp-EXCLUDED replicate DP group with the standard 1/full
-    (= 1/(replicate*gtp)) scaling. The gtp axis is completed elsewhere:
-    GTP-sharded weights by their reduce-scatter SUM; the replicated (non-GTP) params here, by a
-    SUM all-reduce over the gtp (dense) / egtp (expert) group. SUM (not AVG) because DDP already
-    applied 1/full — summing the gtp copies of the partially-reduced grad yields the full sum,
-    times 1/full = the mean over the full DP*GTP domain. Mirror of
-    :func:`_allreduce_non_tensor_model_parallel_grads`, over the gtp axis. No-op when GTP is
-    inactive (gtp/egtp group size <= 1).
+    DDP already reduced these params over the gtp-EXCLUDED replicate group with 1/full scaling,
+    leaving them 1/gtp short. SUM (not AVG) over the gtp/egtp group recovers the full mean.
+    No-op when GTP is inactive (gtp/egtp group size <= 1).
     """
     gtp_group = parallel_state.get_generalized_tensor_parallel_remat_group(check_initialized=False)
     egtp_group = parallel_state.get_expert_generalized_tensor_parallel_remat_group(
@@ -576,8 +571,7 @@ def finalize_model_grads(
             barrier=config.barrier_with_L1_time
         )
     _allreduce_non_tensor_model_parallel_grads(model, config, tp_group)
-    # Complete the gtp-axis reduction for replicated (non-GTP) params, whose DDP reduction
-    # covered only the gtp-EXCLUDED replicate DP group (no-op when GTP is inactive).
+    # Complete the gtp-axis reduction for replicated (non-GTP) params (no-op when GTP inactive).
     _allreduce_replicated_grads_over_gtp_group(model)
     if config.timers is not None:
         config.timers('non-tensor-parallel-grads-all-reduce').stop()

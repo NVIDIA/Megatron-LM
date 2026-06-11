@@ -146,11 +146,9 @@ class MegatronOptimizer(ABC):
         the parameter is not a replica due to tensor model parallelism, and
         the parameter is not a GTP/EGTP duplicate.
 
-        The dist-opt shards non-GTP (replicated) params over the gtp/egtp-EXCLUDED replicate
-        group while the grad_stats group (intra_dist_opt_group) spans the full world *including*
-        the gtp/egtp axis. So non-GTP params are replicated across that axis and only rank 0 of
-        it should contribute, else the norm is inflated by gtp (dense) / egtp (expert).
-        GTP-sharded params hold unique shards across gtp/egtp and are kept on every rank.
+        The grad_stats group spans the full world including the gtp/egtp axis, so replicated
+        (non-GTP) params are kept only on rank 0 of that axis (else the norm inflates by
+        gtp/egtp); GTP-sharded params hold unique shards and are kept on every rank.
         """
         params = self.get_parameters()
         grads_for_norm = []
@@ -233,14 +231,18 @@ class MegatronOptimizer(ABC):
     def get_grad_norm(self):
         """Compute and return grad norm."""
         grads_for_norm = self.get_main_grads_for_grad_norm()
-        return get_grad_norm_fp32(
+        total_norm = get_grad_norm_fp32(
             grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
         )
+        return total_norm
 
     def clip_grad_norm(self, clip_grad: float) -> float:
         """Compute and return grad norm, also clip grads."""
         params = self.get_parameters()
-        grads_for_norm = self.get_main_grads_for_grad_norm() if params else []
+        if params:
+            grads_for_norm = self.get_main_grads_for_grad_norm()
+        else:
+            grads_for_norm = []
         grad_norm = get_grad_norm_fp32(
             grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
         )

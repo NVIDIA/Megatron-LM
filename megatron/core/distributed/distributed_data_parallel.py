@@ -97,14 +97,10 @@ class DistributedDataParallel(_BaseDataParallel):
         self.intra_expt_dp_with_egtp_group = process_group_dict.get(
             'intra_expt_dp_with_egtp_group', self.intra_expt_dp_group
         )
-        # DDP treats GTP shards as ordinary params reduced over the replicate (gtp/egtp-
-        # EXCLUDED) DP group — the *_with_gtp groups, which alias the regular DP groups when GTP
-        # is inactive — with the standard 1/full scaling and no gtp-specific buffers or factor.
-        # The gtp axis is completed elsewhere: GTP shards by their reduce-scatter sum; replicated
-        # (non-GTP) params by a SUM all-reduce in finalize_model_grads. This is correct because
-        # the non-averaged scaling is 1/full = 1/(replicate*gtp), so SUM-over-replicate (DDP) +
-        # SUM-over-gtp (RS or finalize) * (1/full) = mean over the full DP*GTP domain.
-        # GTP is "active" when those replicate groups are strictly smaller than the full DP groups.
+        # GTP shards reduce like ordinary params over the *_with_gtp (replicate) group with the
+        # standard 1/full scaling; the gtp axis is completed elsewhere (RS for shards, finalize
+        # SUM all-reduce for replicated params) — see finalize_model_grads. GTP is "active" when
+        # the replicate groups are strictly smaller than the full DP groups.
         gtp_active = (
             self.dp_cp_with_gtp_group.size() != self.dp_cp_group.size()
             or self.expt_dp_with_egtp_group.size() != self.expt_dp_group.size()
@@ -151,9 +147,6 @@ class DistributedDataParallel(_BaseDataParallel):
 
             param.grad_added_to_main_grad = False
             param_to_name[param] = name
-            # GTP shards own their 1/gtp via the GTP reduce-scatter; DDP reduces every param
-            # (incl. GTP/EGTP shards) over the gtp/egtp-EXCLUDED replicate group like ordinary
-            # params. Dense-vs-expert grouping happens below via buffer_key.is_expert_parallel.
             all_params.append(param)
 
         # Group parameters by (param_dtype, grad_dtype, is_expert_parallel).
@@ -245,15 +238,10 @@ class DistributedDataParallel(_BaseDataParallel):
         self.buffers = []
         self.expert_parallel_buffers = []
         pg_collection = ProcessGroupCollection(tp=self.tp_group, dp_cp=self.dp_cp_group)
-        # Grad RS uses a per-distopt-instance partial group. Cross-instance sync runs separately
-        # via inter_dist_opt_group during optim.step(); reducing cross-instance grads
-        # here would mix independent data slices.
         for buffer_key, (params, param_indices) in buffer_groups.items():
             if buffer_key.is_expert_parallel:
-                # Every expert param (incl. EGTP shards) reduces over the EGTP-peer-EXCLUDED
-                # replicate group; the egtp axis is handled by GTP's reduce-scatter (shards) or
-                # the finalize all-reduce (replicated params). Aliases the full expert-DP group
-                # when EGTP is inactive.
+                # Expert params (incl. EGTP shards) reduce over the egtp-EXCLUDED replicate group
+                # (aliases the full expert-DP group when EGTP is inactive).
                 data_parallel_group = self.intra_expt_dp_with_egtp_group
                 scaling_factor = expert_gradient_scaling_factor
             else:
@@ -280,9 +268,8 @@ class DistributedDataParallel(_BaseDataParallel):
                 else:
                     assert scaling_factor == target_gradient_scaling_factor
 
-            # With GTP active, a caller-provided full_param_layout is sized for the FULL (gtp-
-            # inclusive) DP group, but the merged buffer reduces/shards over the REPLICATE group,
-            # so ignore it and recompute the layout with the replicate-group size below.
+            # With GTP active, a caller-provided full_param_layout is sized for the full DP group,
+            # not the replicate group the buffer shards over, so recompute it below.
             if full_param_layout is not None and not gtp_active:
                 param_layout = full_param_layout.layouts.get(buffer_key)
             elif self.ddp_config.use_distributed_optimizer:
@@ -340,14 +327,6 @@ class DistributedDataParallel(_BaseDataParallel):
                 self.ddp_config.reduce_scatter_with_fp32_accumulation
             ),
         )
-        # Flat view across the bucket-group lists; used wherever callers need to iterate every
-        # bucket group regardless of dense / expert-parallel category. The per-category lists
-        # above are kept for code paths that need per-category state (e.g. one
-        # communication_stream per category).
-        self.all_bucket_groups = self.bucket_groups + self.expert_parallel_bucket_groups
-        # Same flat-view convenience for the underlying buffers (lifecycle ops
-        # like reset/offload/reload iterate over every buffer once).
-        self.all_buffers = self.buffers + self.expert_parallel_buffers
 
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             assert (
@@ -392,10 +371,11 @@ class DistributedDataParallel(_BaseDataParallel):
                     bucket_groups[i].previous_grad_reduce_bucket_group = bucket_groups[i - 1]
 
         # Create map from param to bucket group, used in pre_hook.
-        for bucket_group in self.all_bucket_groups:
-            for bucket in bucket_group.buckets:
-                for param in bucket.params_list:
-                    self.param_to_bucket_group[param] = bucket_group
+        for bucket_groups in [self.bucket_groups, self.expert_parallel_bucket_groups]:
+            for bucket_group in bucket_groups:
+                for bucket in bucket_group.buckets:
+                    for param in bucket.params_list:
+                        self.param_to_bucket_group[param] = bucket_group
 
         # Delete references to weight_tensor if they exist since we don't want two parameter copies
         # if we re-mapped parameters (which happens when we use the distributed optimizer).
@@ -528,10 +508,8 @@ class DistributedDataParallel(_BaseDataParallel):
             if param in self.param_to_bucket_group:
                 assert param.requires_grad
                 if self.ddp_config.overlap_grad_reduce:
-                    # GTP params may legitimately have grad=None: TE's
-                    # wgrad_reduce_scatter returns None for async RS and writes
-                    # the wgrad straight into param.main_grad. Skip the assertion
-                    # for GTPShardedParam — otherwise it fires every iter.
+                    # GTP params legitimately have grad=None (async RS writes wgrad straight
+                    # into main_grad), so skip the assertion for them.
                     if not getattr(param, 'is_gtp', False):
                         assert (
                             param.grad is not None
@@ -554,12 +532,12 @@ class DistributedDataParallel(_BaseDataParallel):
         """
         Context manager that turns off gradient synchronization.
         """
-        for bucket_group in self.all_bucket_groups:
+        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.is_last_microbatch = False
         try:
             yield
         finally:
-            for bucket_group in self.all_bucket_groups:
+            for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
                 bucket_group.is_last_microbatch = True
 
     def _start_bucket_group_param_sync(
@@ -599,7 +577,7 @@ class DistributedDataParallel(_BaseDataParallel):
             if self.overlap_param_gather_with_optimizer_step and not force_dispatch:
                 return
 
-        for bucket_group in self.all_bucket_groups:
+        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             self._start_bucket_group_param_sync(bucket_group, force_sync=force_sync)
 
     def start_grad_sync(self, *unused):
@@ -611,7 +589,7 @@ class DistributedDataParallel(_BaseDataParallel):
         calls. When overlap_grad_reduce is set to False, calls synchronous
         communication ops.
         """
-        for bucket_group in self.all_bucket_groups:
+        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.start_grad_sync()
 
     def finish_grad_sync(self, force_all_reduce: Optional[bool] = False):
@@ -623,17 +601,17 @@ class DistributedDataParallel(_BaseDataParallel):
         calls to complete. When overlap_grad_reduce is set to False, calls synchronous
         communication ops.
         """
-        for bucket_group in self.all_bucket_groups:
+        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.finish_grad_sync(force_all_reduce=force_all_reduce)
 
     def free_overlap_buffers(self):
         """Free overlap param-gather GPU buffers across all bucket groups."""
-        for bucket_group in self.all_bucket_groups:
+        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.free_overlap_buffers()
 
     def scale_gradients(self, scaling_factor: float):
         """Scale all gradients inside the buffers by `scaling_factor`."""
-        for buffer in self.all_buffers:
+        for buffer in self.buffers + self.expert_parallel_buffers:
             buffer.scale_gradients(scaling_factor)
 
     def zero_grad_buffer(self):
@@ -647,9 +625,9 @@ class DistributedDataParallel(_BaseDataParallel):
             # to True, and there will be a double-GA.
             for param in self.params_with_grad:
                 param.grad_added_to_main_grad = False
-        for buffer in self.all_buffers:
+        for buffer in self.buffers + self.expert_parallel_buffers:
             buffer.reset()
-        for bucket_group in self.all_bucket_groups:
+        for bucket_group in self.bucket_groups + self.expert_parallel_bucket_groups:
             bucket_group.reset()
 
     def broadcast_params(self):
@@ -660,9 +638,8 @@ class DistributedDataParallel(_BaseDataParallel):
             is_expert_parallel = not getattr(param, 'allreduce', True)
             is_gtp = getattr(param, 'is_gtp', False)
 
-            # GTPShardedParam holds a unique 1/N shard per (E)GTP peer; broadcast must
-            # exclude those peers and reach the FULL cross-instance group (one-shot
-            # init/load sync, unlike the per-instance grad-RS groups above).
+            # Each (E)GTP peer holds a distinct 1/N shard, so broadcast over the (E)GTP-EXCLUDED
+            # group — else rank-0's shard would clobber the others.
             if is_expert_parallel:
                 data_parallel_group = self.expt_dp_with_egtp_group if is_gtp else self.expt_dp_group
             else:
@@ -688,7 +665,7 @@ class DistributedDataParallel(_BaseDataParallel):
         if synchronize:
             torch.cuda.synchronize()
 
-        for buffer in self.all_buffers:
+        for buffer in self.buffers + self.expert_parallel_buffers:
             buffer.offload_to_cpu(move_params=False, move_grads=True)
 
         if empty_cache:
@@ -705,7 +682,7 @@ class DistributedDataParallel(_BaseDataParallel):
         Args:
             synchronize: Whether to call torch.cuda.synchronize() after allocation.
         """
-        for buffer in self.all_buffers:
+        for buffer in self.buffers + self.expert_parallel_buffers:
             buffer.reload_from_cpu(move_params=False, move_grads=True)
 
         if synchronize:

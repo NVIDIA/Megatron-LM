@@ -431,10 +431,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         )
                         if hasattr(model_param, 'shared'):
                             shard_main_param.shared = model_param.shared
-                        # Propagate GTP/expert tags so get_main_grads_for_grad_norm (which reads
-                        # the master shard params) can classify them. Without is_gtp, GTP shards
-                        # are mis-seen as replicated non-GTP params and dropped by the gtp-rank
-                        # dedup, under-counting the grad-norm by ~1/gtp.
+                        # Tag the master shards so get_main_grads_for_grad_norm dedups them
+                        # correctly (is_gtp: shard vs replicated; allreduce: dense/expert axis).
+                        # Without these, GTP shards are dropped and the grad-norm under-counts.
                         for _gtp_attr in ('is_gtp', 'allreduce'):
                             if hasattr(model_param, _gtp_attr):
                                 setattr(

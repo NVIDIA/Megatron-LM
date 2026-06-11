@@ -1034,12 +1034,9 @@ def get_megatron_optimizer(
     intra_expt_dp_group_gloo = process_groups_dict['intra_expt_dp_group_gloo']
     intra_dist_opt_group = process_groups_dict['intra_dist_opt_group']
 
-    # GTP (Generalized Tensor Parallelism, world = TP*GTP*CP*DP): GTP/EGTP params shard their
-    # optimizer state over the same replicate (gtp/egtp-EXCLUDED) DP group as non-GTP params (DDP
-    # merged them into the dense/expert buffers), so they fold into the main / expert optimizers.
-    # The *_with_gtp replicate groups alias the full DP groups when GTP is inactive, so the main /
-    # expert dist-opts can always shard over them. GTP is "active" when those replicate groups are
-    # strictly smaller than the full DP groups (it does not support the Gloo optimizer-state path).
+    # GTP/EGTP params fold into the main / expert optimizers, sharding their optimizer state over
+    # the *_with_gtp (gtp/egtp-EXCLUDED) replicate group — which aliases the full DP group when GTP
+    # is inactive. GTP is "active" when that group is strictly smaller (no Gloo state path then).
     gtp_active = (
         intra_dp_cp_with_gtp_group.size() != intra_dp_cp_group.size()
         or intra_expt_dp_with_egtp_group.size() != intra_expt_dp_group.size()
