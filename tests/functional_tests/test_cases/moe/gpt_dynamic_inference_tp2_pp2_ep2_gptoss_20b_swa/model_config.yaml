@@ -56,6 +56,12 @@ MODEL_ARGS:
   --rotary-base: 150000
   --rotary-percent: 1.0
   --rotary-scaling-factor: 32.0
+  --yarn-original-max-position-embeddings: 4096
+  --yarn-beta-fast: 32.0
+  --yarn-beta-slow: 1.0
+  --mscale: 1.0
+  --mscale-all-dim: 0.0
+  --no-yarn-correction-range-round-to-int: true
   --quick-geglu: true
   --glu-linear-offset: 1.0
   --activation-func-clamp-value: 7.0
