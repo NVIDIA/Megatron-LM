@@ -84,8 +84,11 @@ class ModelParallelConfig:
     """
     Scheduler for sequence packing and dynamic context parallel.
     dp_balanced: DP-balanced scheduler for sequence packing.
-    default_dynamic_cp: Dynamic-CP scheduler for packed sequence balancing.
+    default_dynamic_cp: Packing-aware dynamic-CP scheduler for packed sequence balancing.
     """
+
+    dynamic_cp_scheduler_delta: float = 0.05
+    """Slack tolerance for the packing-aware dynamic CP scheduler workload cap."""
 
     expert_model_parallel_size: int = 1
     """Distributes Moe Experts across sub data parallel dimension."""

@@ -11,12 +11,9 @@ from megatron.core.datasets.data_schedule_utils import (
     broadcast_tensor,
     build_packed_microbatches,
     create_data_iterator,
-    dcp_get_total_workload,
-    dcp_gpus_needed,
-    dcp_make_buckets_equal,
     get_batch_and_global_seqlens,
     get_cp_slice_for_thd,
-    next_hdp_group,
+    next_hdp_group_packing_aware,
     reroute_samples_to_dcp_ranks,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -353,12 +350,13 @@ class DefaultDynamicCPScheduler(DpBalancedScheduler):
     Dynamic CP scheduler that balances workload across variable CP sizes.
     """
 
-    def __init__(self, *args, min_cp_size=1, **kwargs):
+    def __init__(self, *args, min_cp_size=1, workload_cap_delta=0.05, **kwargs):
         super().__init__(*args, **kwargs)
         self.is_dynamic_cp = True
         self.max_seq_len_per_rank = self.max_seqlen_per_dp_cp_rank
         self.total_hdp_gpus = self.dp_size * self.cp_size
         self.min_cp_size = min_cp_size
+        self.workload_cap_delta = workload_cap_delta
 
     def get_groups_and_subsamples(self, sample_id_seqlens):
         """
@@ -367,28 +365,18 @@ class DefaultDynamicCPScheduler(DpBalancedScheduler):
         """
         mslpr = self.max_seq_len_per_rank
         min_cp = self.min_cp_size
-        workload_fn = lambda seq_len, cp_size=None: dcp_get_total_workload(
-            seq_len, mslpr, cp_size, min_cp
-        )
-        gpus_fn = lambda seq_len: dcp_gpus_needed(seq_len, mslpr, min_cp)
-        buckets_fn = lambda sample_seqlens, compute_est: dcp_make_buckets_equal(
-            sample_seqlens, compute_est, mslpr, min_cp
-        )
 
-        groups = []
         sample_id_groups = []
         sample_id_seqlens = sorted(sample_id_seqlens, key=lambda x: x[1], reverse=True)
+
         while sample_id_seqlens:
-            mb, sample_id_seqlens, exec_times, sample_ids = next_hdp_group(
+            _, sample_id_seqlens, _, sample_ids = next_hdp_group_packing_aware(
                 sample_id_seqlens,
-                workload_fn,
                 self.total_hdp_gpus,
-                gpus_needed_fn=gpus_fn,
-                make_buckets_equal_fn=buckets_fn,
                 max_seq_len_per_rank=mslpr,
-                get_total_workload_fn=workload_fn,
+                min_cp_size=min_cp,
+                delta=self.workload_cap_delta,
             )
-            groups.append(mb)
             sample_id_groups.append(sample_ids)
 
         if (
@@ -449,6 +437,9 @@ def wrap_data_iterator(
     scheduler_kwargs = {}
     if scheduler_type == 'default_dynamic_cp':
         scheduler_kwargs['min_cp_size'] = config.min_dynamic_context_parallel_size
+        scheduler_kwargs['workload_cap_delta'] = getattr(
+            config, 'dynamic_cp_scheduler_delta', 0.05
+        )
 
     scheduler = scheduler_map[scheduler_type](
         config.max_seqlen_per_dp_cp_rank,
