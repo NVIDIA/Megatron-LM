@@ -30,7 +30,7 @@ from megatron.core.models.mimo.optimizer import (
 )
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.process_groups_config import ProcessGroupCollection
-from tests.unit_tests.models.test_mimo_1f1b_schedule import (
+from tests.unit_tests.models.mimo.test_mimo_1f1b_schedule import (
     create_all_embedding_groups,
     create_hypercomm_grid,
     destroy_all_grids,
