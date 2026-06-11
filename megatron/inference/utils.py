@@ -7,14 +7,6 @@ from typing import Literal, Optional
 
 import torch
 
-from megatron.core.inference.config import (
-    CudaGraphSizingDistribution,
-    InferenceConfig,
-    KVCacheManagementMode,
-    MambaInferenceStateConfig,
-    PrefixCachingCoordinatorPolicy,
-    PrefixCachingEvictionPolicy,
-)
 from megatron.core.inference.contexts import DynamicInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
@@ -28,7 +20,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.utils import get_attr_wrapped_model, log_single_rank, unwrap_model
+from megatron.core.utils import log_single_rank, unwrap_model
 from megatron.training import get_args
 from megatron.training import get_model as _get_model
 from megatron.training import get_tokenizer, get_wandb_writer
@@ -327,47 +319,20 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
 
 
 def get_inference_config_from_model_and_args(model: MegatronModule, args):
-    """Returns a `InferenceConfig` constructed from the model and command line arguments."""
+    """Returns an `InferenceConfig` constructed from the model and command line arguments.
 
-    # Max sequence length.
-    position_embedding_type = get_attr_wrapped_model(model, "position_embedding_type")
-    model_max_seq_len = get_attr_wrapped_model(model, "max_sequence_length")
-    inf_max_seq_len = args.inference_max_seq_length
-    max_batch_size = args.inference_dynamic_batching_max_requests
+    Delegates to ``InferenceSetupConfig.to_inference_config`` so the declarative
+    ``InferenceSetupConfig`` (built from args) is the single source of truth for translating
+    inference args into the runtime engine ``InferenceConfig``.
+    """
+    from megatron.training.argument_utils import inference_cfg_from_args
 
-    if position_embedding_type == "learned_absolute":
-        # When using absolute position embeddings, it is critical that the
-        # context's `max_sequence_length` is less than or equal to the model's
-        # `max_sequence_length`. Otherwise, the context's `position_ids` will
-        # contain ids greater than the dimension of the position embedding
-        # tensor, which will result in an index error.
-        if inf_max_seq_len:
-            max_sequence_length = min(model_max_seq_len, inf_max_seq_len)
-        else:
-            max_sequence_length = model_max_seq_len
-        assert max_batch_size is None or max_batch_size <= model_max_seq_len
-    else:
-        max_sequence_length = inf_max_seq_len
-    if args.inference_dynamic_batching_max_requests is not None:
-        max_sequence_length = max(max_sequence_length, max_batch_size)
-
-    mamba_inference_state_config = MambaInferenceStateConfig.from_model(
-        model,
-        conv_states_dtype=args.mamba_inference_conv_states_dtype,
-        ssm_states_dtype=args.mamba_inference_ssm_states_dtype,
-    )
-    pg_collection = get_attr_wrapped_model(model, "pg_collection")
-
-    # Get inference logging configuration from args
-    log_inference_wandb = args.inference_wandb_logging
-    inference_logging_step_interval = args.inference_logging_step_interval
-
-    # Get metrics writer if logging is enabled and on the logging rank
-    # Use the same rank convention as training (last rank logs)
+    # Get metrics writer if logging is enabled and on the logging rank.
+    # Use the same rank convention as training (last rank logs).
     metrics_writer = None
     if (
-        inference_logging_step_interval > 0
-        and log_inference_wandb
+        args.inference_logging_step_interval > 0
+        and args.inference_wandb_logging
         and args.rank == (args.world_size - 1)
     ):
         metrics_writer = get_wandb_writer()
@@ -379,47 +344,16 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
                 "wandb module is available. Inference logging will be disabled.",
             )
 
-    return InferenceConfig(
-        verbose=True,
-        block_size_tokens=args.inference_dynamic_batching_block_size,
-        buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
-        paused_buffer_size_gb=args.inference_dynamic_batching_paused_buffer_size_gb,
-        mamba_memory_ratio=args.inference_dynamic_batching_mamba_memory_ratio,
-        num_cuda_graphs=(
-            args.inference_dynamic_batching_num_cuda_graphs
-            if args.inference_cuda_graph_scope != InferenceCudaGraphScope.none
-            else None
-        ),
-        max_requests=args.inference_dynamic_batching_max_requests,
-        max_tokens=args.inference_dynamic_batching_max_tokens,
-        unified_memory_level=args.inference_dynamic_batching_unified_memory_level,
-        kv_cache_management_mode=KVCacheManagementMode(args.rl_kv_cache_management_mode),
-        cuda_graph_mixed_prefill_count=args.inference_dynamic_batching_cuda_graph_mixed_prefill_count,  # pylint: disable=line-too-long
-        cuda_graph_sizing_distribution=CudaGraphSizingDistribution(
-            args.inference_dynamic_batching_cuda_graph_sizing_distribution
-        ),
-        use_cuda_graphs_for_non_decode_steps=not args.decode_only_cuda_graphs,
-        cuda_graph_all_prefills=args.inference_cuda_graph_all_prefills,
+    setup_cfg = inference_cfg_from_args(args)
+    return setup_cfg.to_inference_config(
+        model,
+        return_log_probs=args.return_log_probs,
+        kv_cache_management_mode=args.rl_kv_cache_management_mode,
         static_kv_memory_pointers=args.rl_persist_cuda_graphs,
-        max_sequence_length=max_sequence_length,
-        mamba_inference_state_config=mamba_inference_state_config,
-        pg_collection=pg_collection,
         use_flashinfer_fused_rope=args.use_flashinfer_fused_rope,
-        materialize_only_last_token_logits=not (args.return_log_probs and not args.skip_prompt_log_probs),
-        track_generated_token_events=args.inference_dynamic_batching_track_generated_token_events,
-        track_paused_request_events=args.inference_dynamic_batching_track_paused_request_events,
-        enable_chunked_prefill=args.enable_chunked_prefill,
-        enable_prefix_caching=args.inference_dynamic_batching_enable_prefix_caching,
-        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy(args.inference_dynamic_batching_prefix_caching_eviction_policy),
-        prefix_caching_coordinator_policy=PrefixCachingCoordinatorPolicy(args.inference_dynamic_batching_prefix_caching_coordinator_policy),
-        prefix_caching_routing_alpha=getattr(args, 'inference_dynamic_batching_prefix_caching_routing_alpha', 0.5),
-        prefix_caching_mamba_gb=getattr(args, 'inference_dynamic_batching_prefix_caching_mamba_gb', None),
+        enable_cuda_graphs=(args.inference_cuda_graph_scope != InferenceCudaGraphScope.none),
+        skip_prompt_log_probs=args.skip_prompt_log_probs,
         metrics_writer=metrics_writer,
-        logging_step_interval=args.inference_logging_step_interval,
-        num_speculative_tokens=args.num_speculative_tokens,
-        use_synchronous_zmq_collectives=args.inference_use_synchronous_zmq_collectives,
-        disable_ep_consensus=args.inference_disable_ep_consensus,
-        sampling_backend=args.inference_dynamic_batching_sampling_backend,
     )
 
 
