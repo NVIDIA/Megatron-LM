@@ -199,7 +199,7 @@ class SSMSlotAllocator:
         candidate_ids = torch.nonzero(candidates, as_tuple=True)[0]
 
         if candidate_ids.numel() < num_needed:
-            raise RuntimeError("No evictable linear attention cache slots available")
+            raise RuntimeError("No evictable SSM cache slots available")
 
         # Pick oldest blocks by timestamp (LRU) or first N (REF_ZERO)
         if self.context.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
@@ -293,11 +293,11 @@ class SSMSlotAllocator:
             hashes_to_delete: Set of hashes being deregistered (excludes -1).
         """
         if self.hash_to_block_id:
-            la_keys = hashes_to_delete & self.hash_to_block_id.keys()
-            if la_keys:
+            ssm_keys = hashes_to_delete & self.hash_to_block_id.keys()
+            if ssm_keys:
                 from collections import deque
 
-                deque(map(self.hash_to_block_id.pop, la_keys), maxlen=0)
+                deque(map(self.hash_to_block_id.pop, ssm_keys), maxlen=0)
                 self._invalidate_blocks_batch(block_ids_list)
 
     # =========================================================================
@@ -311,12 +311,12 @@ class SSMSlotAllocator:
 
         Args:
             block_id: The KV block ID.
-            layer_idx: The linear attention layer index.
+            layer_idx: The SSM layer index.
             ssm_state: SSM state tensor to store.
             conv_state: Conv state tensor to store.
         """
         slot = self.block_to_slot[block_id].item()
-        assert slot >= 0, f"Block {block_id} has no linear attention cache slot"
+        assert slot >= 0, f"Block {block_id} has no SSM cache slot"
         self.recurrent_states[layer_idx, slot].copy_(ssm_state)
         self.conv_states[layer_idx, slot].copy_(conv_state)
 

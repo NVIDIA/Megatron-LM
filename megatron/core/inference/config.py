@@ -105,7 +105,7 @@ class PrefixCachingCoordinatorPolicy(str, Enum):
 
 
 class KVCacheManagementMode(str, Enum):
-    """Mode for handling large tensors (KV cache, Mamba states) during suspend/resume."""
+    """Mode for handling large tensors (KV cache, SSM states) during suspend/resume."""
 
     PERSIST = "persist"
     """Do not deallocate and reallocate large tensors; keep them on GPU."""
@@ -142,7 +142,7 @@ class InferenceConfig:
     """
 
     # =================================
-    # KV cache and Mamba states config
+    # KV cache and SSM states config
     # =================================
     block_size_tokens: int = 256
     """Size of KV cache block size."""
@@ -168,7 +168,7 @@ class InferenceConfig:
 
     ssm_memory_ratio: Optional[float] = None
     """
-    Percentage of memory buffer to allocate for Mamba states. If not specified, allocates Mamba
+    Percentage of memory buffer to allocate for SSM states. If not specified, allocates SSM
     state tensors for each KV cache block. Only used for hybrid models.
     """
 
@@ -242,7 +242,7 @@ class InferenceConfig:
 
     static_kv_memory_pointers: bool = False
     """
-    Whether the KV cache (and Mamba states) will reside at the same memory addresses
+    Whether the KV cache (and SSM states) will reside at the same memory addresses
     after suspend/resume as before. When True, CUDA graphs that reference these buffers
     remain valid across suspend/resume cycles and do not need to be recaptured.
     Requires either UVM or `torch_memory_saver` when `kv_cache_management_mode` is not PERSIST.
@@ -305,9 +305,9 @@ class InferenceConfig:
     """
 
     prefix_caching_ssm_gb: Optional[float] = None
-    """GPU memory budget (in GB) for the Mamba state cache used by prefix caching
-    on hybrid models. Each cache slot stores SSM and conv states for all Mamba layers
-    at a single block boundary. When set, Mamba states at KV divergence and last-aligned
+    """GPU memory budget (in GB) for the SSM state cache used by prefix caching
+    on hybrid models. Each cache slot stores recurrent and conv states for all SSM layers
+    at a single block boundary. When set, SSM states at KV divergence and last-aligned
     block boundaries are cached and reused across requests with matching prefixes."""
 
     # =================================

@@ -457,7 +457,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
         in_inference_mode = InferenceMode.is_active()
 
         _, batch, dim = hidden_states.shape
-        conv_state, ssm_state = None, None
+        conv_state, recurrent_state = None, None
 
         if in_inference_mode and inference_context is not None:
             if inference_context.is_dynamic_batching():
@@ -465,10 +465,10 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
             else:
                 assert inference_context.is_static_batching()
                 assert not self.config.sequence_parallel
-                conv_state, ssm_state = self._get_states_from_cache(inference_context, batch)
+                conv_state, recurrent_state = self._get_states_from_cache(inference_context, batch)
                 if inference_context.seqlen_offset > 0:
                     # The states are updated inplace
-                    out, out_bias = self._decode(hidden_states, conv_state, ssm_state)
+                    out, out_bias = self._decode(hidden_states, conv_state, recurrent_state)
                     return out, out_bias
 
         zxBCdt, _ = self.in_proj(hidden_states)
@@ -481,9 +481,9 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
                 "Training with packed sequences is not supported "
                 "in the non-memory-efficient code path."
             )
-            y = self._ssm_prefill(zxBCdt, conv_state=conv_state, ssm_state=ssm_state)
+            y = self._ssm_prefill(zxBCdt, conv_state=conv_state, recurrent_state=recurrent_state)
         else:
-            assert ssm_state is None
+            assert recurrent_state is None
             y = self._ssm_training(zxBCdt, packed_seq_params)
 
         out, out_bias = self.out_proj(y)
@@ -493,7 +493,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
 
 
     def _decode(
-        self, hidden_states, conv_state, ssm_state, batch_indices: Optional[torch.Tensor] = None
+        self, hidden_states, conv_state, recurrent_state, batch_indices: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Performs inference step for decoding."""
         # assert self.ngroups_local_tp == 1, "Only support ngroups=1 for inference for now"
@@ -514,7 +514,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
         assert self.cp.cp_size == 1, "Context parallel not supported for Mamba inferenece decode"
 
         y = self._ssm_decode(
-            zxBCdt, conv_state=conv_state, ssm_state=ssm_state, batch_indices=batch_indices
+            zxBCdt, conv_state=conv_state, recurrent_state=recurrent_state, batch_indices=batch_indices
         )
 
         # Restore sequence length as first dimension
@@ -582,7 +582,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
         self,
         zxBCdt: torch.Tensor,
         conv_state: Optional[torch.Tensor],
-        ssm_state: Optional[torch.Tensor],
+        recurrent_state: Optional[torch.Tensor],
         context: Optional[DynamicInferenceContext] = None,
     ) -> torch.Tensor:
         """
@@ -597,7 +597,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
             zxBCdt: The input tensor of shape (l, b, d), which is a concatenation of
                 z, x, B, C, and dt projections.
             conv_state: The convolution state tensor for inference.
-            ssm_state: The selective scan state tensor for inference.
+            recurrent_state: The selective scan state tensor for inference.
             context: Optional dynamic inference context. When provided, all varlen
                 metadata (cu_seqlens, seq_idx, batch_indices, intermediate state
                 buffers, etc.) is sourced from here.
@@ -764,7 +764,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
 
         if is_dynamic_batching:
             # Unified varlen SSM path: all prefill requests through single kernel call
-            initial_ssm_state = ssm_state[batch_indices]
+            initial_recurrent_state = recurrent_state[batch_indices]
 
             x = x.squeeze(0)
             dt = dt.squeeze(0)
@@ -820,12 +820,12 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
                 ),
                 z=z if not self.rmsnorm else None,
                 dt_bias=self.cp.get_dt_bias().float(),
-                initial_states=initial_ssm_state,
+                initial_states=initial_recurrent_state,
                 return_intermediate_states=False,
                 intermediate_chunk_indices=intermediate_chunk_indices,
                 dt_softplus=True,
                 dt_limit=(0.0, float("inf")),
-                state_dtype=ssm_state.dtype,
+                state_dtype=recurrent_state.dtype,
             )
 
             if intermediate_chunk_indices is not None:
@@ -837,7 +837,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
             y = y.unsqueeze(0)
             z = z.unsqueeze(0)
 
-            tensor_masked_update(ssm_state, batch_indices, ssm_varlen_states)
+            tensor_masked_update(recurrent_state, batch_indices, ssm_varlen_states)
 
             # Write intermediate states to pre-allocated output buffers
             # All tensor ops, no Python loops, fully CUDA graph compatible.
@@ -860,7 +860,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
                 # [n, conv_dim, d_conv]
         else:
             # Non-dynamic-batching path (static batching)
-            initial_ssm_state = None
+            initial_recurrent_state = None
             y = mamba_chunk_scan_combined(
                 x,
                 dt,
@@ -876,13 +876,13 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
                 z=z if not self.rmsnorm else None,
                 dt_bias=self.cp.get_dt_bias().float(),
                 dt_softplus=True,
-                return_final_states=ssm_state is not None,
-                initial_states=initial_ssm_state,
+                return_final_states=recurrent_state is not None,
+                initial_states=initial_recurrent_state,
             )
 
-            if ssm_state is not None:
+            if recurrent_state is not None:
                 y, last_state = y
-                ssm_state.copy_(last_state)
+                recurrent_state.copy_(last_state)
 
         y = rearrange(y, "b l h p -> l b (h p)").contiguous()
         y = self.cp.post_conv_ssm(y)
@@ -924,7 +924,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
         self,
         zxBCdt: torch.Tensor,
         conv_state: torch.Tensor,
-        ssm_state: torch.Tensor,
+        recurrent_state: torch.Tensor,
         batch_indices: Optional[torch.Tensor] = None,
         intermediate_conv_state: Optional[torch.Tensor] = None,
         intermediate_recurrent_state: Optional[torch.Tensor] = None,
@@ -937,7 +937,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
                 z, x, B, C, and dt projections.
                 s is the sequence length (1 + num_speculative_tokens).
             conv_state: The convolution state tensor for inference.
-            ssm_state: The selective scan state tensor for inference.
+            recurrent_state: The selective scan state tensor for inference.
             batch_indices: A map from batch id to position in the Mamba state tensors.
             intermediate_conv_state: Optional buffer for storing conv state at each
                 sequence step (for speculative decoding rollback).
@@ -1029,14 +1029,14 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
                 dA = torch.exp(torch.einsum("bd,dn->bdn", dt, A))
 
                 dB_x = torch.einsum("bd,bdn,bd->bdn", dt, B, x)
-                ssm_state.copy_(
-                    ssm_state * rearrange(dA, "b (h p) n -> b h p n", p=self.headdim)
+                recurrent_state.copy_(
+                    recurrent_state * rearrange(dA, "b (h p) n -> b h p n", p=self.headdim)
                     + rearrange(dB_x, "b (h p) n -> b h p n", p=self.headdim)
                 )
 
                 y = torch.einsum(
                     "bdn,bdn->bd",
-                    rearrange(ssm_state.to(dtype), "b h p n -> b (h p) n", p=self.headdim),
+                    rearrange(recurrent_state.to(dtype), "b h p n -> b (h p) n", p=self.headdim),
                     C,
                 )
                 y = y + D.to(dtype) * x
@@ -1048,8 +1048,8 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
                 dA = torch.exp(dt * A)
                 x = rearrange(x, "b (h p) -> b h p", p=self.headdim)
                 dBx = torch.einsum("bh,bn,bhp->bhpn", dt, B, x)
-                ssm_state.copy_(ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
-                y = torch.einsum("bhpn,bn->bhp", ssm_state.to(dtype), C)
+                recurrent_state.copy_(recurrent_state * rearrange(dA, "b h -> b h 1 1") + dBx)
+                y = torch.einsum("bhpn,bn->bhp", recurrent_state.to(dtype), C)
                 y = y + rearrange(self.D.to(dtype), "h -> h 1") * x
                 y = rearrange(y, "b h p -> b (h p)")
                 if not self.rmsnorm:
@@ -1070,7 +1070,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
                 z = rearrange(z, "b s (h p) -> b s h p", p=self.headdim)
 
             y = selective_state_update(
-                ssm_state,
+                recurrent_state,
                 x_reshaped,
                 dt,
                 A,
@@ -1090,7 +1090,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
 
         return y
 
-    def ssm_state_shapes_per_request(self) -> Tuple[Tuple[int], Tuple[int]]:
+    def recurrent_state_shapes_per_request(self) -> Tuple[Tuple[int], Tuple[int]]:
         """Returns the conv and recurrent states shapes per request."""
         conv_states_shape = (self.conv1d_weight.shape[0], self.d_conv)
         recurrent_states_shape = (self.nheads_local_tp, self.headdim, self.d_state)
@@ -1114,27 +1114,27 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
             self.layer_number not in inference_context.key_value_memory_dict
             or batch_size != self.cached_batch_size
         ):
-            conv_state_shape, ssm_state_shape = self.ssm_state_shapes_per_request()
+            conv_state_shape, recurrent_state_shape = self.recurrent_state_shapes_per_request()
             conv_state = torch.zeros(
                 batch_size,
                 *conv_state_shape,
                 device=self.conv1d_weight.device,
                 dtype=self.conv1d_weight.dtype,
             )
-            ssm_state = torch.zeros(
+            recurrent_state = torch.zeros(
                 batch_size,
-                *ssm_state_shape,
+                *recurrent_state_shape,
                 device=self.in_proj.weight.device,
                 dtype=self.in_proj.weight.dtype,
             )
-            inference_context.key_value_memory_dict[self.layer_number] = (conv_state, ssm_state)
+            inference_context.key_value_memory_dict[self.layer_number] = (conv_state, recurrent_state)
             self.cached_batch_size = batch_size
         else:
-            conv_state, ssm_state = inference_context.key_value_memory_dict[self.layer_number]
+            conv_state, recurrent_state = inference_context.key_value_memory_dict[self.layer_number]
             if inference_context.sequence_len_offset == 0:
                 conv_state.zero_()
-                ssm_state.zero_()
-        return conv_state, ssm_state
+                recurrent_state.zero_()
+        return conv_state, recurrent_state
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
         """Provide a sharded state dictionary for distributed checkpointing."""

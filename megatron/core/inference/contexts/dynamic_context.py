@@ -334,7 +334,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # CPU, avoiding a per-step NCCL AllReduce kernel on the compute stream.
         self._ep_zmq_communicator = None
 
-        # Mamba states.
+        # SSM states.
         ssm_inference_state_config = inference_config.ssm_inference_state_config
         self.is_hybrid_model = ssm_inference_state_config is not None
         if self.is_hybrid_model:
@@ -345,9 +345,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.ssm_chunk_size = ssm_inference_state_config.ssm_chunk_size
 
             # For hybrid models, the layer map converts the global layer index to the
-            # corresponding attention layer index or Mamba layer index depending on the
+            # corresponding attention layer index or SSM layer index depending on the
             # layer type.
-            attention_layer_map, dsa_layer_map, gdn_layer_map, mamba_layer_map = (
+            attention_layer_map, dsa_layer_map, gdn_layer_map, ssm_layer_map = (
                 operator.itemgetter(
                     Symbols.ATTENTION, Symbols.DS_ATTENTION, Symbols.GDN, Symbols.MAMBA
                 )(get_layer_maps_from_layer_type_list(ssm_inference_state_config.layer_type_list))
@@ -357,8 +357,8 @@ class DynamicInferenceContext(BaseInferenceContext):
                 raise NotImplementedError("GDN layers are not supported for inference.")
 
             self.num_attention_layers = len(attention_layer_map) + len(dsa_layer_map)
-            self.num_ssm_layers = len(mamba_layer_map)
-            self.layer_map = attention_layer_map | dsa_layer_map | mamba_layer_map
+            self.num_ssm_layers = len(ssm_layer_map)
+            self.layer_map = attention_layer_map | dsa_layer_map | ssm_layer_map
         else:
             # The layer map is the identity function for pure Transformer models.
             # Use the same per-PP-rank layer count as TransformerBlock (handles
@@ -412,15 +412,15 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
         assert self.block_size_bytes > 0
 
-        mamba_states_memory_per_request = 0
+        ssm_states_memory_per_request = 0
         if self.is_hybrid_model:
-            mamba_states_memory_per_request += (
+            ssm_states_memory_per_request += (
                 math.prod(self.ssm_conv_states_shape) * self.ssm_conv_states_dtype.itemsize
             )
-            mamba_states_memory_per_request += (
+            ssm_states_memory_per_request += (
                 math.prod(self.ssm_recurrent_states_shape) * self.ssm_recurrent_states_dtype.itemsize
             )
-            mamba_states_memory_per_request *= self.num_ssm_layers
+            ssm_states_memory_per_request *= self.num_ssm_layers
             if self.num_speculative_tokens > 0:
                 # Add memory for intermediate conv and SSM states
                 intermediate_memory_per_request = (
@@ -429,7 +429,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 )
                 intermediate_memory_per_request *= self.num_ssm_layers
                 intermediate_memory_per_request *= self.num_speculative_tokens + 1
-                mamba_states_memory_per_request += intermediate_memory_per_request
+                ssm_states_memory_per_request += intermediate_memory_per_request
 
         # Unified memory and general tensor management.
         self.unified_memory_level = inference_config.unified_memory_level
@@ -480,7 +480,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             # Calculate total memory before partition
             total_memory = buffer_size_bytes + paused_buffer_size_bytes
             ssm_memory_bytes = total_memory * ssm_memory_ratio
-            ssm_max_requests = int(ssm_memory_bytes // mamba_states_memory_per_request)
+            ssm_max_requests = int(ssm_memory_bytes // ssm_states_memory_per_request)
 
             # Reduce buffer sizes for KV cache
             buffer_size_bytes = int(buffer_size_bytes * (1.0 - ssm_memory_ratio))
@@ -490,18 +490,18 @@ class DynamicInferenceContext(BaseInferenceContext):
             block_count = max(2, block_count)  # need >= 1 active block + 1 dummy block
             paused_block_count = paused_buffer_size_bytes // self.block_size_bytes
         elif self.is_hybrid_model and inference_config.max_requests is not None:
-            # Auto-derive mamba/KV split from max_requests. Allocate exactly enough
-            # mamba memory for max_requests, and give the rest to KV cache blocks.
+            # Auto-derive SSM/KV split from max_requests. Allocate exactly enough
+            # SSM memory for max_requests, and give the rest to KV cache blocks.
             total_memory = buffer_size_bytes + paused_buffer_size_bytes
-            ssm_memory_needed = inference_config.max_requests * mamba_states_memory_per_request
+            ssm_memory_needed = inference_config.max_requests * ssm_states_memory_per_request
             assert ssm_memory_needed < total_memory, (
-                f"Not enough memory for {inference_config.max_requests} mamba requests. "
-                f"Need {ssm_memory_needed / 1024**3:.2f} GB for mamba states, "
+                f"Not enough memory for {inference_config.max_requests} SSM requests. "
+                f"Need {ssm_memory_needed / 1024**3:.2f} GB for SSM states, "
                 f"but total buffer is {total_memory / 1024**3:.2f} GB."
             )
             ssm_max_requests = inference_config.max_requests
 
-            # Subtract mamba memory proportionally from active and paused buffers.
+            # Subtract SSM memory proportionally from active and paused buffers.
             ssm_memory_ratio = ssm_memory_needed / total_memory
             buffer_size_bytes = int(buffer_size_bytes * (1.0 - ssm_memory_ratio))
             paused_buffer_size_bytes = int(paused_buffer_size_bytes * (1.0 - ssm_memory_ratio))
@@ -511,11 +511,11 @@ class DynamicInferenceContext(BaseInferenceContext):
             paused_block_count = paused_buffer_size_bytes // self.block_size_bytes
         else:
             block_count = buffer_size_bytes // (
-                self.block_size_bytes + mamba_states_memory_per_request
+                self.block_size_bytes + ssm_states_memory_per_request
             )
             block_count = max(2, block_count)  # need >= 1 active block + 1 dummy block
             paused_block_count = paused_buffer_size_bytes // (
-                self.block_size_bytes + mamba_states_memory_per_request
+                self.block_size_bytes + ssm_states_memory_per_request
             )
 
         # If using pipeline parallelism synchronize the total block count in case the
@@ -568,7 +568,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             # Maximize compute utilization by defaulting to 1 block per request.
             self.max_requests = self.kv_block_allocator.total_count - 1  # -1 for dummy block
 
-            # Adjust max_requests for Mamba memory constraints if necessary
+            # Adjust max_requests for SSM memory constraints if necessary
             if self.is_hybrid_model and ssm_max_requests < self.max_requests:
                 self.max_requests = int(ssm_max_requests)
 
@@ -720,33 +720,33 @@ class DynamicInferenceContext(BaseInferenceContext):
         ]
 
         if self.is_hybrid_model:
-            mamba_conv_bytes = (
+            ssm_conv_bytes = (
                 math.prod(self.ssm_conv_states_shape)
                 * self.ssm_conv_states_dtype.itemsize
                 * self.num_ssm_layers
             )
-            mamba_ssm_bytes = (
+            ssm_recurrent_bytes = (
                 math.prod(self.ssm_recurrent_states_shape)
                 * self.ssm_recurrent_states_dtype.itemsize
                 * self.num_ssm_layers
             )
-            mamba_bytes_per_req = mamba_conv_bytes + mamba_ssm_bytes
-            mamba_total_bytes = mamba_bytes_per_req * self.max_requests
+            ssm_bytes_per_req = ssm_conv_bytes + ssm_recurrent_bytes
+            ssm_total_bytes = ssm_bytes_per_req * self.max_requests
             log_lines += [
-                f"  Mamba states:",
+                f"  SSM states:",
                 f"    num_ssm_layers:        {self.num_ssm_layers}",
                 f"    conv_state_shape:      {self.ssm_conv_states_shape}",
                 f"    ssm_state_shape:       {self.ssm_recurrent_states_shape}",
-                f"    per_request:           {get_mem_size_str(mamba_bytes_per_req)}",
-                f"    total ({self.max_requests} requests):  {get_mem_size_str(mamba_total_bytes)}",
+                f"    per_request:           {get_mem_size_str(ssm_bytes_per_req)}",
+                f"    total ({self.max_requests} requests):  {get_mem_size_str(ssm_total_bytes)}",
             ]
 
             if self.num_speculative_tokens > 0:
                 spec_multiplier = self.num_speculative_tokens + 1
-                spec_bytes_per_req = mamba_bytes_per_req * spec_multiplier
+                spec_bytes_per_req = ssm_bytes_per_req * spec_multiplier
                 spec_total_bytes = spec_bytes_per_req * self.max_requests
                 log_lines += [
-                    f"  Mamba speculative buffers (num_speculative_tokens={self.num_speculative_tokens}):",
+                    f"  SSM speculative buffers (num_speculative_tokens={self.num_speculative_tokens}):",
                     f"    per_request:           {get_mem_size_str(spec_bytes_per_req)}",
                     f"    total ({self.max_requests} requests):  {get_mem_size_str(spec_total_bytes)}",
                 ]
@@ -758,12 +758,12 @@ class DynamicInferenceContext(BaseInferenceContext):
                 and prefix_caching_ssm_gb > 0
             ):
                 prefix_cache_bytes = int(prefix_caching_ssm_gb * 1024**3)
-                prefix_cache_slots = prefix_cache_bytes // mamba_bytes_per_req
+                prefix_cache_slots = prefix_cache_bytes // ssm_bytes_per_req
                 log_lines += [
-                    f"  Mamba prefix cache:",
+                    f"  SSM prefix cache:",
                     f"    budget:                {get_mem_size_str(prefix_cache_bytes)}",
                     f"    slots:                 {prefix_cache_slots}",
-                    f"    per_slot:              {get_mem_size_str(mamba_bytes_per_req)}",
+                    f"    per_slot:              {get_mem_size_str(ssm_bytes_per_req)}",
                 ]
 
         if inference_config._verbose and torch.distributed.get_rank() == 0:
@@ -806,7 +806,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             ).pin_memory()
 
     def _allocate_ssm_states(self):
-        """Allocate Mamba states for hybrid models."""
+        """Allocate SSM states for hybrid models."""
         if self.is_hybrid_model:
             self.ssm_metadata = SSMMetadata(
                 max_requests=self.max_requests,
@@ -814,7 +814,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 ssm_chunk_size=self.ssm_chunk_size,
                 d_conv=self.ssm_conv_states_shape[-1],
             )
-            # Bind the unified CPU/GPU buffers so the per-step Mamba metadata
+            # Bind the unified CPU/GPU buffers so the per-step SSM metadata
             # fields ride along with the single coalesced H2D in
             # transfer_bookkeeping_to_gpu().
             self.ssm_metadata.bind_cpu_buffers(
@@ -1011,7 +1011,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # shapes (mirrors the layout documented in ContextGPUView).
         # batch_indices_decode is int64; all other fields are int32.
         if self.is_hybrid_model:
-            # mamba_batch_indices_decode is int64; pad to 8-byte alignment.
+            # ssm_batch_indices_decode is int64; pad to 8-byte alignment.
             _ssm_align_pad = (8 - _pre_ssm_bytes % 8) % 8
             self._max_ssm_chunks = self.max_tokens // self.ssm_chunk_size + self.max_requests
             _ssm_batch_indices_decode_bytes = self.max_requests * 8
@@ -1163,7 +1163,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
         _off += _mha_block_table_bytes
 
-        # Mamba varlen metadata views (hybrid models only). Populated per step
+        # SSM varlen metadata views (hybrid models only). Populated per step
         # by SSMMetadata.compute_cpu_metadata(); transferred as part of the
         # single coalesced H2D in transfer_bookkeeping_to_gpu().
         if self.is_hybrid_model:
@@ -1231,7 +1231,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.graph_attn_metadata["mha_metadata"].bind_gpu_buffers(self.gpu_view)
         self.non_graph_attn_metadata["mha_metadata"].bind_gpu_buffers(self.gpu_view)
 
-        # Deferred Mamba GPU operations.  Populated by add_request() /
+        # Deferred SSM GPU operations.  Populated by add_request() /
         # update_requests() (CPU phase), executed by transfer_bookkeeping_to_gpu().
         self._pending_ssm_zeros: list = []
         self._pending_ssm_restores: list = []
@@ -1255,7 +1255,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self._allocate_memory_buffer()
             self._allocate_ssm_states()
 
-        # Allocate Mamba prefix cache if configured
+        # Allocate SSM prefix cache if configured
         self.ssm_slot_allocator: Optional[SSMSlotAllocator] = None
         if (
             self.is_hybrid_model
@@ -1269,7 +1269,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.reset_metadata()
 
     def reinitialize_inference_state_buffers(self):
-        """Restore large tensors (KV cache, Mamba states) after a suspend.
+        """Restore large tensors (KV cache, SSM states) after a suspend.
 
         Called by the engine during `resume()`. Initial allocation is in `initialize_all_tensors()`.
         """
@@ -1306,7 +1306,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.initialize_all_tensors()
 
     def deallocate_inference_state_buffers(self):
-        """Deallocate large tensors (KV cache, Mamba states) during suspend.
+        """Deallocate large tensors (KV cache, SSM states) during suspend.
 
         Called by the engine during `suspend()`. Mirror to `reinitialize_inference_state_buffers()`.
         """
@@ -1563,41 +1563,41 @@ class DynamicInferenceContext(BaseInferenceContext):
     def ssm_states_cache(
         self, layer_number: int, intermediate: bool = False
     ) -> Tuple[Tensor, Tensor]:
-        """Returns the Mamba state tensors for the given layer."""
-        assert self.is_hybrid_model, "Only hybrid models have Mamba state tensors"
+        """Returns the SSM state tensors for the given layer."""
+        assert self.is_hybrid_model, "Only hybrid models have SSM state tensors"
 
-        mamba_layer_number = self.layer_map[layer_number - 1]
+        ssm_layer_number = self.layer_map[layer_number - 1]
         if intermediate:
-            conv_state = self.ssm_intermediate_conv_states[mamba_layer_number]
-            ssm_state = self.ssm_intermediate_recurrent_states[mamba_layer_number]
+            conv_state = self.ssm_intermediate_conv_states[ssm_layer_number]
+            ssm_state = self.ssm_intermediate_recurrent_states[ssm_layer_number]
         else:
-            conv_state = self.ssm_conv_states[mamba_layer_number]
-            ssm_state = self.ssm_recurrent_states[mamba_layer_number]
+            conv_state = self.ssm_conv_states[ssm_layer_number]
+            ssm_state = self.ssm_recurrent_states[ssm_layer_number]
 
         return (conv_state, ssm_state)
 
     # =========================================================================
-    # Mamba prefix cache infrastructure
+    # SSM prefix cache infrastructure
     # =========================================================================
 
-    def _allocate_ssm_cache(self, mamba_gb: float) -> None:
-        """Allocate the Mamba state cache for prefix caching.
+    def _allocate_ssm_cache(self, ssm_gb: float) -> None:
+        """Allocate the SSM state cache for prefix caching.
 
         Args:
-            mamba_gb: GPU memory budget in GB for the cache.
+            ssm_gb: GPU memory budget in GB for the cache.
         """
         import math as _math
 
         conv_size = _math.prod(self.ssm_conv_states_shape) * self.ssm_conv_states_dtype.itemsize
         ssm_size = _math.prod(self.ssm_recurrent_states_shape) * self.ssm_recurrent_states_dtype.itemsize
         per_slot_bytes = self.num_ssm_layers * (conv_size + ssm_size)
-        total_bytes = int(mamba_gb * 1024**3)
+        total_bytes = int(ssm_gb * 1024**3)
         max_slots = total_bytes // per_slot_bytes
         if max_slots < 1:
             logging.warning(
-                "Mamba cache budget (%.3f GB) too small for even 1 slot "
-                "(need %.3f GB per slot). Mamba caching disabled.",
-                mamba_gb,
+                "SSM cache budget (%.3f GB) too small for even 1 slot "
+                "(need %.3f GB per slot). SSM caching disabled.",
+                ssm_gb,
                 per_slot_bytes / 1024**3,
             )
             return
@@ -1616,7 +1616,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         logging.info(
-            "Mamba prefix cache: %d slots (%.3f GB), per-slot %.1f KB",
+            "SSM prefix cache: %d slots (%.3f GB), per-slot %.1f KB",
             max_slots,
             max_slots * per_slot_bytes / 1024**3,
             per_slot_bytes / 1024,
@@ -1765,7 +1765,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.ssm_metadata.reset_varlen_metadata()
 
     def reset_ssm_state(self) -> None:
-        """Reset state used within Mamba layers."""
+        """Reset state used within SSM layers."""
         if self.is_hybrid_model:
             self.ssm_metadata.reset()
 
@@ -1897,7 +1897,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 ssm_idx = self.ssm_metadata.allocate_slot()
                 if ssm_idx is None:
                     raise ContextOverflowError(
-                        requests[logical_idx].request_id, "No Mamba slots available"
+                        requests[logical_idx].request_id, "No SSM slots available"
                     )
                 self._pending_ssm_zeros.append(ssm_idx)
                 self.ssm_metadata.request_to_ssm_state_idx[request_idx] = ssm_idx
@@ -2024,7 +2024,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         if self.is_hybrid_model:
-            # 4. token_to_request_idx: needed by mamba_metadata.update() for hybrid models.
+            # 4. token_to_request_idx: needed by ssm_metadata.update() for hybrid models.
             self.token_to_request_idx[0:T] = torch.repeat_interleave(
                 torch.arange(
                     0,
@@ -2035,7 +2035,7 @@ class DynamicInferenceContext(BaseInferenceContext):
                 self.request_query_lengths[0:N],
             )
 
-            # 5. Mamba state: allocate slots for dummy requests.
+            # 5. SSM state: allocate slots for dummy requests.
             self.ssm_metadata.request_to_ssm_state_idx[0:N] = (
                 self.ssm_metadata.batch_allocate_slots(N)
             )
@@ -2056,7 +2056,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         Return:
             None.
         """
-        # Launch deferred Mamba GPU ops first (state zeroing/restore) so they
+        # Launch deferred SSM GPU ops first (state zeroing/restore) so they
         # overlap with the CPU work below.  These are non-blocking GPU kernels.
         self._execute_pending_ssm_ops()
 
@@ -2253,7 +2253,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         if self.is_hybrid_model:
-            # Mamba metadata update is deferred to transfer_bookkeeping_to_gpu()
+            # SSM metadata update is deferred to transfer_bookkeeping_to_gpu()
             # because it writes to GPU buffers. Store the parameters here.
             # intermediate_offsets_gpu / intermediate_counts_gpu get the CPU-side
             # slices here; H2D transfer happens in transfer_bookkeeping_to_gpu().
@@ -2285,7 +2285,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         if self._nccl_ep_dispatcher:
             NCCLAllGatherDispatcher._use_allgather_v = not self.using_cuda_graph_this_step()
 
-        # Flush any Mamba ops queued by add_dummy_requests_for_cudagraph_capture
+        # Flush any SSM ops queued by add_dummy_requests_for_cudagraph_capture
         # (warmup) or add_dummy_requests_for_expert_parallel_step (EP dummy step).
         # The earlier call at the top drained ops queued by add_request() before
         # this function ran; this call covers ops queued during the function.
@@ -2300,22 +2300,22 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.transfer_bookkeeping_to_gpu()
 
     def _execute_pending_ssm_ops(self) -> None:
-        """Execute Mamba GPU operations deferred from add_request() / update_requests().
+        """Execute SSM GPU operations deferred from add_request() / update_requests().
 
         This runs at the start of initialize_attention_state() so that all GPU
-        Mamba state is correct before the forward pass.
+        SSM state is correct before the forward pass.
         """
         if not (self._pending_ssm_restores or self._pending_ssm_zeros):
             return
 
-        # Restore cached Mamba state to live buffers.  On failure, fall back to zeroing.
+        # Restore cached SSM state to live buffers.  On failure, fall back to zeroing.
         for request_idx, block_id, ssm_idx in self._pending_ssm_restores:
             restored = self.ssm_slot_allocator.restore_to_live(request_idx, block_id)
             if not restored:
                 self._pending_ssm_zeros.append(ssm_idx)
         self._pending_ssm_restores.clear()
 
-        # Batch-zero newly allocated Mamba slots.
+        # Batch-zero newly allocated SSM slots.
         if self._pending_ssm_zeros:
             device = self.ssm_conv_states.device
             indices = torch.tensor(self._pending_ssm_zeros, dtype=torch.long, device=device)
@@ -2378,7 +2378,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # initialize_attention_state(); the H2D above populates the underlying
         # bytes. Nothing else to do here for MHA.
 
-        # Mamba metadata: copy pre-computed CPU tensors to GPU buffers.
+        # SSM metadata: copy pre-computed CPU tensors to GPU buffers.
         if hasattr(self, '_pending_ssm_transfer') and self._pending_ssm_transfer is not None:
             self.ssm_metadata.load_from_cpu(self._pending_ssm_transfer)
             self._pending_ssm_transfer = None
@@ -2410,7 +2410,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.token_to_local_position_within_kv_block.fill_(0)
 
     def reset_metadata(self) -> None:
-        """Reset all bookkeeping state: counters, block allocator, attention/mamba state.
+        """Reset all bookkeeping state: counters, block allocator, attention/SSM state.
 
         This must be called after ``initialize_all_tensors()`` and after any
         suspend/resume cycle to bring the context back to a clean state.
@@ -2432,7 +2432,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.paused_tokens = None
         self.paused_speculative_tokens = None
 
-        # Reset attention, mamba, and block allocator state.
+        # Reset attention, SSM, and block allocator state.
         self.reset_attention_state()
         self.reset_ssm_state()
         self.kv_block_allocator.reset()
@@ -2467,7 +2467,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.step_count = 0
         self.prefix_cache_lru_clock = 0
 
-        # Reset Mamba cache state
+        # Reset SSM cache state
         if self.ssm_slot_allocator is not None:
             self.ssm_slot_allocator.reset()
 
@@ -2599,22 +2599,22 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             prefix_skip_tokens = 0
 
-        # Hybrid models with Mamba caching: skip based on Mamba match count.
+        # Hybrid models with SSM caching: skip based on SSM match count.
         # Only applies to the first chunk (finished == 0); continuation chunks
-        # already had Mamba state restored during the first chunk.
+        # already had SSM state restored during the first chunk.
         if self.is_hybrid_model and self.ssm_slot_allocator is not None and finished == 0:
-            num_mamba_matched = getattr(req, '_mamba_num_matched_blocks', 0)
+            num_ssm_matched = getattr(req, '_ssm_num_matched_blocks', 0)
             assert (
-                num_mamba_matched <= num_matched
-            ), f"Mamba match ({num_mamba_matched}) > KV match ({num_matched})"
-            if num_mamba_matched > 0 and block_aligned:
-                raw_skip = num_mamba_matched * self.block_size_tokens
+                num_ssm_matched <= num_matched
+            ), f"SSM match ({num_ssm_matched}) > KV match ({num_matched})"
+            if num_ssm_matched > 0 and block_aligned:
+                raw_skip = num_ssm_matched * self.block_size_tokens
                 if raw_skip >= prefill_chunk_length:
-                    # Back off to previous block with cached Mamba state
-                    mamba_map = self.ssm_slot_allocator.hash_to_block_id
+                    # Back off to previous block with cached SSM state
+                    ssm_map = self.ssm_slot_allocator.hash_to_block_id
                     backed_off_blocks = 0
-                    for j in range(num_mamba_matched - 2, -1, -1):
-                        if req.precomputed_block_hashes[j] in mamba_map:
+                    for j in range(num_ssm_matched - 2, -1, -1):
+                        if req.precomputed_block_hashes[j] in ssm_map:
                             backed_off_blocks = j + 1
                             break
                     prefix_skip_tokens = backed_off_blocks * self.block_size_tokens
@@ -2652,7 +2652,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         Check if the request can be added to the context.
         """
         # Note that for hybrid models checking the total request count is sufficient
-        # because we allocate a single set of Mamba state tensors for each request
+        # because we allocate a single set of SSM state tensors for each request
         request_can_be_added = (
             self.total_request_count < self.max_requests and self.paused_request_count == 0
         )
@@ -2885,13 +2885,13 @@ class DynamicInferenceContext(BaseInferenceContext):
             _register_range(already_allocated_blocks + num_matched_blocks, num_complete_blocks)
 
         if self.is_hybrid_model and req.finished_chunk_token_count == 0:
-            # Allocate a slot for Mamba states
+            # Allocate a slot for SSM states
             ssm_idx = self.ssm_metadata.allocate_slot()
             if ssm_idx is None:
-                raise ContextOverflowError(req.request_id, "No Mamba slots available")
+                raise ContextOverflowError(req.request_id, "No SSM slots available")
             self.ssm_metadata.request_to_ssm_state_idx[self.total_request_count] = ssm_idx
 
-            # Restore Mamba state from the block corresponding to prefix_skip_tokens
+            # Restore SSM state from the block corresponding to prefix_skip_tokens
             restore_block_count = prefix_skip_tokens // self.block_size_tokens
             if restore_block_count > 0 and self.ssm_slot_allocator is not None:
                 restore_block_id = matched_block_ids[restore_block_count - 1]
@@ -3024,7 +3024,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # tensor.
         self.request_to_kv_block_ids[request_indexes] = -1
 
-        # Free Mamba slots.
+        # Free SSM slots.
         if self.is_hybrid_model:
             self.ssm_metadata.free_slots(request_indexes)
 
@@ -3336,7 +3336,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.total_request_count = 0
             self.active_token_count = 0
 
-            # Reset Mamba state.
+            # Reset SSM state.
             self.reset_ssm_state()
             return
 

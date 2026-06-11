@@ -122,7 +122,7 @@ class ContextGPUView:
         # Zero-initialized so pre-transfer reads see zeros (matches prior semantics).
         self._buf = torch.zeros(total_bytes, dtype=torch.uint8, device=device)
 
-        # Token-level tensors (consumed by embedding, RoPE, KV append, Mamba).
+        # Token-level tensors (consumed by embedding, RoPE, KV append, SSM).
         off = 0
         self.token_to_input_ids = self._buf[off : off + tok_int64_bytes].view(torch.long)
         off += tok_int64_bytes
@@ -186,7 +186,7 @@ class ContextGPUView:
 
         # SSM varlen metadata (hybrid models only). Each GPU view matches a
         # pinned CPU view in DynamicInferenceContext._cpu_bookkeeping_buf; the
-        # per-step coalesced H2D copy covers both MHA and Mamba alongside the
+        # per-step coalesced H2D copy covers both MHA and SSM alongside the
         # token/request bookkeeping.
         if max_ssm_chunks > 0:
             off += ssm_align_pad

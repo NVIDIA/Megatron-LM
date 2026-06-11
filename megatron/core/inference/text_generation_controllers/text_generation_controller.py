@@ -62,7 +62,7 @@ from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensi
 from megatron.core.inference.sampling import FlashInferSampling, Sampling, TorchSampling
 from megatron.core.inference.text_generation_controllers.mtp_utils_pytorch import rewind_kv_cache
 from megatron.core.inference.text_generation_controllers.mtp_utils_triton import (
-    mamba_state_selective_copy,
+    ssm_state_selective_copy,
     prepare_next_forward_pass,
     verify_speculative_tokens,
 )
@@ -673,7 +673,7 @@ class TextGenerationController:
         After forward pass with speculative tokens, some tokens may be rejected.
         This function "rewinds" the KV cache bookkeeping to reflect only the
         accepted tokens. The core bookkeeping rewind runs on CPU (mutating the
-        CPU source-of-truth tensors in place); the Mamba hybrid-model state
+        CPU source-of-truth tensors in place); the SSM hybrid-model state
         update stays on GPU because it operates on GPU-resident state buffers.
 
         Returns (blocks_to_release, remove_mask) for the caller to release blocks
@@ -702,31 +702,31 @@ class TextGenerationController:
             num_active_requests=active_request_count,
         )
 
-        # Mamba speculative rewind stays on GPU because it mutates GPU-resident
+        # SSM speculative rewind stays on GPU because it mutates GPU-resident
         # SSM/conv state that the next forward pass reads directly.
         if context.is_hybrid_model:
             cuda_device = torch.cuda.current_device()
             # gpu_view.request_in_prefill_status was uploaded by this step's
             # coalesced H2D and mirrors the active-slice CPU values, so we
-            # don't need to re-upload prefill_status for the Mamba kernels.
+            # don't need to re-upload prefill_status for the SSM kernels.
             prefill_status_gpu = context.gpu_view.request_in_prefill_status[:active_request_count]
             accepted_counts_gpu = self._accepted_token_counts_per_request[:active_request_count]
-            mamba_state_idx = context.ssm_metadata.request_to_ssm_state_idx[
+            ssm_state_idx = context.ssm_metadata.request_to_ssm_state_idx[
                 active_request_slice
             ].to(cuda_device, non_blocking=True)
-            mamba_state_selective_copy(
+            ssm_state_selective_copy(
                 intermediate_states=context.ssm_intermediate_conv_states,
                 current_states=context.ssm_conv_states,
                 prefill_status=prefill_status_gpu,
-                state_idx=mamba_state_idx,
+                state_idx=ssm_state_idx,
                 accepted_counts=accepted_counts_gpu,
                 num_layers=context.num_ssm_layers,
             )
-            mamba_state_selective_copy(
+            ssm_state_selective_copy(
                 intermediate_states=context.ssm_intermediate_recurrent_states,
                 current_states=context.ssm_recurrent_states,
                 prefill_status=prefill_status_gpu,
-                state_idx=mamba_state_idx,
+                state_idx=ssm_state_idx,
                 accepted_counts=accepted_counts_gpu,
                 num_layers=context.num_ssm_layers,
             )
@@ -1738,7 +1738,7 @@ class TextGenerationController:
             range_push("forward_pass")
             self._dynamic_step_forward_logits(input_ids, position_ids)
 
-            # Commit Mamba intermediate states before update_requests, which
+            # Commit SSM intermediate states before update_requests, which
             # may swap request indices. The Python lists tracking EOS block IDs
             # and intermediate offsets are not swapped along with tensors, so
             # commit must run while indices are still valid.
