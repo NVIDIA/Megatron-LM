@@ -348,6 +348,43 @@ class TestAsyncSchedulingControllerHelpers:
             == "speculative_tokens"
         )
 
+    def test_async_scheduling_filter_and_compact_drops_prior_finished_rows(self):
+        controller, context, _ = self._make_async_eligibility_controller()
+        context.total_request_count = 2
+        context.request_ids = torch.tensor([10, 11], dtype=torch.int32, device='cpu')
+        context._async_prior_finished_active_mask = torch.tensor([True, False], device='cpu')
+        context.filter_async_finished_request_rows.side_effect = lambda result: {
+            **result,
+            "active_request_ids": torch.tensor([11], device='cpu'),
+            "sample": torch.tensor([101], device='cpu'),
+            "finished_request_ids": torch.tensor([], dtype=torch.int32, device='cpu'),
+        }
+        context.compact_async_finished_request_rows.side_effect = (
+            lambda next_tokens: next_tokens.copy_(torch.tensor([101, 101], device='cpu'))
+        )
+        prepared_update = {
+            "active_requests_mask": torch.tensor([0, 1], device='cpu'),
+            "new_tokens": torch.tensor([100, 101], device='cpu'),
+            "new_speculative_tokens": None,
+        }
+        request_bookkeeping = {
+            "active_request_ids": torch.tensor([10, 11], device='cpu'),
+            "sample": torch.tensor([100, 101], device='cpu'),
+            "finished_request_ids": torch.tensor([10], device='cpu'),
+        }
+
+        filtered_update, filtered_bookkeeping = (
+            controller._filter_and_compact_async_scheduling_update(
+                prepared_update, request_bookkeeping
+            )
+        )
+
+        assert filtered_update["active_requests_mask"].tolist() == [1]
+        assert filtered_update["new_tokens"].tolist() == [101]
+        assert filtered_bookkeeping["active_request_ids"].tolist() == [11]
+        assert filtered_bookkeeping["sample"].tolist() == [101]
+        assert filtered_bookkeeping["finished_request_ids"].numel() == 0
+
     def test_serial_async_scheduling_call_order(self):
         controller, context, _ = self._make_async_eligibility_controller()
         events = []
@@ -416,6 +453,78 @@ class TestAsyncSchedulingControllerHelpers:
             "current_stream",
         ):
             assert primitive not in helper_source
+
+
+class TestAsyncSchedulingDenseGreedyParity(TextGenerationControllerTestBase):
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+
+    @classmethod
+    def teardown_class(cls):
+        Utils.destroy_model_parallel()
+
+    def teardown_method(self, method):
+        InferenceMode.unset_active()
+
+    def _run_dense_greedy_dynamic_generation(self, enable_async_scheduling: bool):
+        if not is_fa_min_version("2.7.3"):
+            pytest.skip(reason="Need latest flash attn for dynamic batching")
+
+        torch.manual_seed(1234)
+        torch.cuda.manual_seed_all(1234)
+        self.setup_model(
+            dtype=torch.bfloat16,
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            static=False,
+            batch_size=2,
+            materialize_only_last_token_logits=True,
+            max_requests=4,
+        )
+        context = self.text_generation_controller.inference_wrapped_model.inference_context
+        context.config.enable_async_scheduling = enable_async_scheduling
+
+        requests = [
+            DynamicInferenceRequest(
+                request_id=0,
+                prompt_tokens=torch.tensor(
+                    [1, 2], dtype=torch.long, device=torch.cuda.current_device()
+                ),
+                sampling_params=SamplingParams(
+                    top_k=1, num_tokens_to_generate=3, termination_id=-1
+                ),
+            ),
+            DynamicInferenceRequest(
+                request_id=1,
+                prompt_tokens=torch.tensor(
+                    [3, 4], dtype=torch.long, device=torch.cuda.current_device()
+                ),
+                sampling_params=SamplingParams(
+                    top_k=1, num_tokens_to_generate=3, termination_id=-1
+                ),
+            ),
+        ]
+        for request in requests:
+            context.add_request(request)
+
+        generated_tokens = {0: [], 1: []}
+        while context.has_unfinished_requests():
+            result = self.text_generation_controller.generate_output_tokens_dynamic_batch()
+            for request_id, token in zip(
+                result["active_request_ids"].tolist(), result["sample"].tolist()
+            ):
+                generated_tokens[int(request_id)].append(int(token))
+
+        return generated_tokens
+
+    def test_async_scheduling_matches_sync_dense_greedy_decode(self):
+        sync_tokens = self._run_dense_greedy_dynamic_generation(enable_async_scheduling=False)
+        async_tokens = self._run_dense_greedy_dynamic_generation(enable_async_scheduling=True)
+
+        assert async_tokens == sync_tokens
 
 
 class TestTextGenerationController(TextGenerationControllerTestBase):
