@@ -206,6 +206,7 @@ EVAL_AND_LOGGING_ARGS=(
     --eval-interval 100
     --save-interval 1000
     --log-throughput
+    --logging-level 20
     --distributed-timeout-minutes 60
     --save "$CHECKPOINT_PATH"
     --load "$CHECKPOINT_PATH" 
@@ -219,6 +220,8 @@ if [ "${NSYS_PROFILE}" = 1 ]; then
         --profile-step-start 8
         --profile-step-end 12
         --profile-ranks 0
+        --record-memory-history
+        --memory-snapshot-path "${NSYS_PROFILE_PATH}/torch_memprof_node${SLURM_NODEID}_rank${SLURM_PROCID}.pickle"
     )
     PROFILE_CMD=(
         nsys profile
