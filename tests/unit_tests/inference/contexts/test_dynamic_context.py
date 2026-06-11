@@ -687,6 +687,117 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
+    def test_filter_async_finished_request_rows(self):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=None,
+        )
+        dynamic_context.total_request_count = 3
+        dynamic_context.request_ids[:3] = torch.tensor([10, 11, 12], device='cpu')
+        dynamic_context.record_async_finished_request_rows(torch.tensor([False, True, False]))
+
+        filtered = dynamic_context.filter_async_finished_request_rows(
+            {
+                "active_request_ids": torch.tensor([10, 11, 12], device='cpu'),
+                "sample": torch.tensor([100, 101, 102], device='cpu'),
+                "log_probs": [[1.0], [2.0], [3.0]],
+                "top_n_logprobs": {0: "keep-0", 1: "drop-1", 2: "keep-2"},
+                "finished_request_ids": torch.tensor([11, 99], device='cpu'),
+                "finished_routing_block_ids": {11: [1, 2], 99: [3]},
+            }
+        )
+
+        assert filtered["active_request_ids"].tolist() == [10, 12]
+        assert filtered["sample"].tolist() == [100, 102]
+        assert filtered["log_probs"] == [[1.0], [3.0]]
+        assert filtered["top_n_logprobs"] == {0: "keep-0", 1: "keep-2"}
+        assert filtered["finished_request_ids"].tolist() == [99]
+        assert filtered["finished_routing_block_ids"] == {99: [3]}
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_compact_async_finished_request_rows(self):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=None,
+        )
+        dynamic_context.total_request_count = 4
+        dynamic_context.request_ids[:4] = torch.tensor([10, 11, 12, 13], device='cpu')
+        next_tokens = torch.tensor([100, 101, 102, 103], device='cpu')
+        dynamic_context.record_async_finished_request_rows(
+            torch.tensor([False, True, False, True])
+        )
+
+        dynamic_context.compact_async_finished_request_rows(next_tokens=next_tokens)
+
+        assert not dynamic_context.has_async_finished_request_rows()
+        assert dynamic_context.total_request_count == 2
+        assert dynamic_context.active_token_count == 2
+        assert dynamic_context.request_ids[:4].tolist() == [10, 12, -1, -1]
+        assert next_tokens[:2].tolist() == [100, 102]
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_compact_async_finished_request_rows_all_finished(self):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=None,
+        )
+        dynamic_context.total_request_count = 2
+        dynamic_context.request_ids[:2] = torch.tensor([10, 11], device='cpu')
+        dynamic_context.active_token_count = 2
+        dynamic_context.record_async_finished_request_rows(torch.tensor([True, True]))
+
+        dynamic_context.compact_async_finished_request_rows()
+
+        assert not dynamic_context.has_async_finished_request_rows()
+        assert dynamic_context.total_request_count == 0
+        assert dynamic_context.active_token_count == 0
+        assert dynamic_context.request_ids[:2].tolist() == [-1, -1]
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_async_finished_request_rows_avoid_duplicate_or_row_map_state(self):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=None,
+        )
+        dynamic_context.total_request_count = 2
+        dynamic_context.request_ids[:2] = torch.tensor([10, 11], device='cpu')
+        dynamic_context.record_async_finished_request_rows(torch.tensor([True, False]))
+
+        with pytest.raises(AssertionError):
+            dynamic_context.record_async_finished_request_rows(torch.tensor([False, True]))
+
+        state_names = vars(dynamic_context).keys()
+        assert not any("row_map" in name or "row_mapping" in name for name in state_names)
+
+    @pytest.mark.internal
+    @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_update_request(self, is_hybrid_model: bool):
 

@@ -279,6 +279,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Engine step counter (used for logging, metrics, and event tracking)
         self.step_count = 0
 
+        # Minimal async-shaped decode state. This tracks only active rows that
+        # finished in the previous bookkeep phase and must be filtered before
+        # the next compaction.
+        self._async_prior_finished_active_mask = None
+        self._async_prior_finished_request_ids = None
+
         self.cache_mla_latent = (
             isinstance(model_config, MLATransformerConfig) and model_config.cache_mla_latents
         )
@@ -2431,6 +2437,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.padded_active_request_count = 0
         self.paused_tokens = None
         self.paused_speculative_tokens = None
+        self.clear_async_finished_request_rows()
 
         # Reset attention, mamba, and block allocator state.
         self.reset_attention_state()
@@ -2921,6 +2928,139 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.total_request_count += 1
         self.num_prefill_requests += 1
 
+    def clear_async_finished_request_rows(self) -> None:
+        """Clear pending async-shaped finish filtering and compaction state."""
+        self._async_prior_finished_active_mask = None
+        self._async_prior_finished_request_ids = None
+
+    def has_async_finished_request_rows(self) -> bool:
+        """Return whether there are prior-finished active rows awaiting compaction."""
+        return self._async_prior_finished_active_mask is not None
+
+    def record_async_finished_request_rows(self, finished_active_mask: Tensor) -> None:
+        """Record active rows that finished and must be compacted after the next sample."""
+        if self.has_async_finished_request_rows():
+            raise AssertionError("prior async finished rows must be compacted before recording more")
+
+        if finished_active_mask.is_cuda:
+            finished_active_mask = finished_active_mask.cpu()
+        finished_active_mask = finished_active_mask.bool()
+        assert finished_active_mask.dim() == 1
+
+        if not finished_active_mask.any():
+            self.clear_async_finished_request_rows()
+            return
+
+        active_request_count = self.total_request_count - self.paused_request_count
+        assert finished_active_mask.numel() == active_request_count
+
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+        self._async_prior_finished_active_mask = finished_active_mask.clone()
+        self._async_prior_finished_request_ids = self.request_ids[active_slice][
+            finished_active_mask
+        ].clone()
+
+    def filter_async_finished_request_rows(self, step_result: Dict) -> Dict:
+        """Filter rows that already finished in the previous async-shaped bookkeep."""
+        finished_mask = self._async_prior_finished_active_mask
+        if finished_mask is None:
+            return step_result
+
+        keep_mask = ~finished_mask
+        filtered_result = dict(step_result)
+        prior_finished_ids = self._async_prior_finished_request_ids
+
+        for key in ("active_request_ids", "sample", "accepted_tokens"):
+            value = filtered_result.get(key)
+            if isinstance(value, torch.Tensor) and value.shape[:1] == finished_mask.shape:
+                filtered_result[key] = value[keep_mask.to(value.device)]
+
+        log_probs = filtered_result.get("log_probs")
+        if isinstance(log_probs, list) and len(log_probs) == finished_mask.numel():
+            filtered_result["log_probs"] = [
+                value for value, keep in zip(log_probs, keep_mask.tolist()) if keep
+            ]
+
+        top_n_logprobs = filtered_result.get("top_n_logprobs")
+        if isinstance(top_n_logprobs, dict):
+            old_to_new_idx = torch.full((finished_mask.numel(),), -1, dtype=torch.long)
+            old_to_new_idx[keep_mask] = torch.arange(keep_mask.sum().item(), dtype=torch.long)
+            filtered_result["top_n_logprobs"] = {
+                int(old_to_new_idx[int(req_idx)].item()): value
+                for req_idx, value in top_n_logprobs.items()
+                if int(req_idx) < finished_mask.numel() and keep_mask[int(req_idx)]
+            }
+
+        if prior_finished_ids is not None:
+            finished_request_ids = filtered_result.get("finished_request_ids")
+            if isinstance(finished_request_ids, torch.Tensor) and finished_request_ids.numel() > 0:
+                duplicate_finished = torch.isin(finished_request_ids.cpu(), prior_finished_ids)
+                filtered_result["finished_request_ids"] = finished_request_ids[
+                    ~duplicate_finished.to(finished_request_ids.device)
+                ]
+
+            finished_routing_block_ids = filtered_result.get("finished_routing_block_ids")
+            if isinstance(finished_routing_block_ids, dict):
+                prior_finished_id_set = set(prior_finished_ids.tolist())
+                filtered_result["finished_routing_block_ids"] = {
+                    request_id: block_ids
+                    for request_id, block_ids in finished_routing_block_ids.items()
+                    if request_id not in prior_finished_id_set
+                }
+
+        return filtered_result
+
+    def compact_async_finished_request_rows(
+        self,
+        next_tokens: Optional[Tensor] = None,
+        new_speculative_tokens: Optional[Tensor] = None,
+    ) -> None:
+        """Compact active rows after their prior-finished samples have been filtered."""
+        finished_mask = self._async_prior_finished_active_mask
+        if finished_mask is None:
+            return
+
+        keep_mask = ~finished_mask
+        active_request_count = finished_mask.numel()
+        remaining_request_count = keep_mask.sum().item()
+        active_start = self.paused_request_count
+        active_end = active_start + active_request_count
+        assert active_end <= self.total_request_count
+
+        if remaining_request_count == 0:
+            self.total_request_count = self.paused_request_count
+            self.active_token_count = 0
+            self.request_to_kv_block_ids[active_start:active_end] = -1
+            self.request_ids[active_start:active_end] = -1
+            if self.is_hybrid_model:
+                self.mamba_metadata.request_to_mamba_state_idx[active_start:active_end] = -1
+                if self.paused_request_count == 0:
+                    self.reset_mamba_state()
+            self.clear_async_finished_request_rows()
+            return
+
+        src_idxs = torch.nonzero(keep_mask, as_tuple=True)[0] + active_start
+        dst_idxs = torch.arange(
+            active_start, active_start + remaining_request_count, device='cpu'
+        )
+        if not torch.equal(src_idxs, dst_idxs):
+            self._move_book_keeping_tensors(
+                src_idxs=src_idxs,
+                dst_idxs=dst_idxs,
+                next_tokens=next_tokens,
+                new_speculative_tokens=new_speculative_tokens,
+            )
+
+        new_active_end = active_start + remaining_request_count
+        self.total_request_count = new_active_end
+        self.active_token_count = remaining_request_count * (1 + self.num_speculative_tokens)
+        self.request_to_kv_block_ids[new_active_end:active_end] = -1
+        self.request_ids[new_active_end:active_end] = -1
+        if self.is_hybrid_model:
+            self.mamba_metadata.request_to_mamba_state_idx[new_active_end:active_end] = -1
+
+        self.clear_async_finished_request_rows()
+
     def _move_book_keeping_tensors(
         self, src_idxs, dst_idxs, next_tokens, new_speculative_tokens=None
     ):
@@ -2934,7 +3074,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_query_lengths[dst_idxs] = self.request_query_lengths[src_idxs]
         self.request_output_lengths[dst_idxs] = self.request_output_lengths[src_idxs]
         self.request_ids[dst_idxs] = self.request_ids[src_idxs]
-        next_tokens[dst_idxs] = next_tokens[src_idxs]  # num tokens sames as num samples
+        if next_tokens is not None:
+            next_tokens[dst_idxs] = next_tokens[src_idxs]  # num tokens sames as num samples
         if new_speculative_tokens is not None:
             new_speculative_tokens[:, dst_idxs] = new_speculative_tokens[:, src_idxs]
         self.request_to_kv_block_ids[dst_idxs] = self.request_to_kv_block_ids[src_idxs]
