@@ -541,6 +541,33 @@ def mtp_on_this_rank(
     return mtp_on_this_rank
 
 
+def loss_on_this_rank(
+    config: TransformerConfig, ignore_virtual: Optional[bool] = True, vp_stage: Optional[int] = None
+) -> bool:
+    """Check if there is a loss (output) layer on the current rank.
+
+    With a custom pipeline layout, any stage containing ``LayerType.loss`` is a loss stage
+    (and must build the output layer + run the loss path). Without a custom layout, only the
+    last pipeline stage is a loss stage.
+    """
+    if config.pipeline_model_parallel_layout is None:
+        return parallel_state.is_pipeline_last_stage(
+            ignore_virtual=ignore_virtual, vp_stage=vp_stage
+        )
+
+    layout = config.pipeline_model_parallel_layout.layout
+    pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+    if (
+        not ignore_virtual
+        and parallel_state.get_virtual_pipeline_model_parallel_world_size() is not None
+    ):
+        assert vp_stage is not None, "vp_stage must be passed if virtual pipeline is enabled"
+        return layout[pp_rank][vp_stage].count(LayerType.loss) > 0
+    return any(
+        stage.count(LayerType.loss) > 0 for stage in layout[pp_rank]
+    )
+
+
 def get_mtp_ranks(pp_ranks: List[int], config: TransformerConfig) -> List[int]:
     """Get the ranks of the MTP layers."""
     mtp_ranks = set()
@@ -577,14 +604,12 @@ def get_mtp_num_layers_to_build(
     """Get the number of MTP layers to build."""
     if config.pipeline_model_parallel_layout is not None:
         # If we have a custom PP layout, get the number of mtp layers in the layout array.
+        # With MTP standalone the MTP layers may be split across several pipeline stages, so
+        # num_layers_to_build is whatever the layout assigns to this stage (no longer required
+        # to equal mtp_num_layers).
         num_layers_to_build = config.pipeline_model_parallel_layout.get_num_layers_to_build(
             layer_type=LayerType.mtp, vp_stage=vp_stage
         )
-        # assert num_layers_to_build == config.mtp_num_layers or num_layers_to_build == 0, (
-        #     f"Currently, we only support put all of MTP layers on the last pipeline stage, "
-        #     f"so the number of MTP layers to build ({num_layers_to_build}) must match "
-        #     f"mtp_num_layers ({config.mtp_num_layers}) or be 0."
-        # )
     else:
         if parallel_state.is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage):
             num_layers_to_build = config.mtp_num_layers if config.mtp_num_layers else 0
@@ -677,7 +702,6 @@ def process_mtp_loss(
         Tensor: Updated hidden states after MTP loss processing (first chunk only).
     """
     nvtx_range_push(suffix="process_mtp_loss")
-    print(f"for debug, in process_mtp_loss, hidden_states shape: {hidden_states.shape}, config.mtp_num_layers: {config.mtp_num_layers}", flush=True)
     hidden_states_list = torch.chunk(hidden_states, 1 + config.mtp_num_layers, dim=0)
     hidden_states = hidden_states_list[0]
 
@@ -1742,7 +1766,6 @@ class MultiTokenPredictionBlock(MegatronModule):
         """
         # get hidden states from previous mtp stages
         offset = get_mtp_layer_offset(self.config, self.vp_stage)
-        print(f"for debug, in mtp block forward, offset: {offset}", flush=True)
         hidden_states_list = list(torch.chunk(hidden_states, 1 + offset, dim=0))
         if mhc_multistream is not None:
             # mHC mode: use multi-stream for MTP depth input, contracted for loss list.
@@ -1755,8 +1778,9 @@ class MultiTokenPredictionBlock(MegatronModule):
             hidden_states = make_viewless_tensor(
                 inp=hidden_states, requires_grad=True, keep_graph=False
             )
-        # for iteration in range(self.config.mtp_num_layers):
-        print(f"for debug, in mtp block forward, len(self.layers): {len(self.layers)}, self.config.mtp_num_layers: {self.config.mtp_num_layers}", flush=True)
+        # Standalone MTP: each pipeline stage builds only the MTP layers assigned to it,
+        # so iterate over the locally-built layers (len(self.layers)) rather than the global
+        # mtp_num_layers.
         for iteration in range(len(self.layers)):
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
             (hidden_states, input_ids, position_ids) = self.layers[layer_idx](
@@ -1784,7 +1808,6 @@ class MultiTokenPredictionBlock(MegatronModule):
 
         # concat the hidden states of all mtp layers
         hidden_states = torch.cat(hidden_states_list, dim=0)
-        print(f"for debug, in mtp block forward, hidden_states shape: {hidden_states.shape}, len(hidden_states_list): {len(hidden_states_list)}, hidden_states_list[0] shape: {hidden_states_list[0].shape}", flush=True)
         return hidden_states
 
     def sharded_state_dict(

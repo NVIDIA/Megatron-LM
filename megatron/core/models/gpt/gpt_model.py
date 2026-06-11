@@ -29,6 +29,7 @@ from megatron.core.transformer.linear_cross_entropy import LinearCrossEntropyMod
 from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_handler
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
+    loss_on_this_rank,
     mtp_on_this_rank,
     process_mtp_loss,
 )
@@ -148,6 +149,24 @@ class GPTModel(LanguageModule):
             self.config, ignore_virtual=False, vp_stage=vp_stage
         )
 
+        # Loss-stage resolution (MTP loss split, see specs/mtp_loss_split.md).
+        # A "loss stage" is any pipeline stage that owns one or more output+loss computations.
+        # With a custom layout the loss may be split across multiple stages; otherwise the loss
+        # stage is exactly the last pipeline stage (== post_process). `is_final_loss_stage` is the
+        # stage that owns chunk 0 (the main model) and therefore produces the main logits/loss.
+        self.is_loss_stage = loss_on_this_rank(
+            self.config, ignore_virtual=False, vp_stage=vp_stage
+        )
+        if self.config.pipeline_model_parallel_layout is not None and self.is_loss_stage:
+            self.loss_chunk_indices, self.is_final_loss_stage = (
+                self.config.pipeline_model_parallel_layout.get_loss_chunk_assignment(
+                    self.config.mtp_num_layers, vp_stage=vp_stage
+                )
+            )
+        else:
+            self.loss_chunk_indices = None
+            self.is_final_loss_stage = self.post_process
+
         self.fuse_linear_cross_entropy = (
             self.config.cross_entropy_loss_fusion
             and self.config.cross_entropy_fusion_impl == "linear"
@@ -233,8 +252,10 @@ class GPTModel(LanguageModule):
 
             self._setup_mtp_cuda_graphs()
 
-        # Output
-        if self.post_process:
+        # Output. Build the output layer on every loss stage (not just the last PP stage): with
+        # MTP loss split, non-final loss stages also need the output projection to compute their
+        # share of the logits/loss.
+        if self.post_process or self.is_loss_stage:
 
             if self.config.defer_embedding_wgrad_compute:
                 # The embedding activation buffer preserves a reference to the input activations
@@ -270,7 +291,7 @@ class GPTModel(LanguageModule):
                 tp_group=self.pg_collection.tp,
             )
 
-        if self.pre_process or self.post_process or self.mtp_process:
+        if self.pre_process or self.post_process or self.mtp_process or self.is_loss_stage:
             self.setup_embeddings_and_output_layer()
 
         if has_config_logger_enabled(self.config):

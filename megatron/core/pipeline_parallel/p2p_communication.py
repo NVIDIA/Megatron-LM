@@ -318,14 +318,11 @@ class P2PCommunicator:
         config = self.config
         tensor_recv_prev_func = None
         tensor_recv_next_func = None
-        print(f"for debug, start p2p_communicate, config.variable_seq_lengths: {config.variable_seq_lengths}, config.mtp_standalone: {config.mtp_standalone}", flush=True)
 
         if config.variable_seq_lengths or config.mtp_standalone:
-            print(f"for debug, start to communicate shapes", flush=True)
             recv_prev_shape, recv_next_shape = self._communicate_shapes(
                 tensor_send_next, tensor_send_prev, recv_prev, recv_next
             )
-            print(f"for debug, end to communicate shapes, recv_prev_shape: {recv_prev_shape}, recv_next_shape: {recv_next_shape}", flush=True)
         else:
             recv_prev_shape = tensor_shape
             recv_next_shape = tensor_shape
@@ -421,7 +418,6 @@ class P2PCommunicator:
             # User should assert that we have a modern enough PyTorch to not need this
             torch.cuda.synchronize()
 
-        print(f"for debug, end p2p_communicate", flush=True)
         return tensor_recv_prev, tensor_recv_next, reqs
 
     @nvtx_decorator()

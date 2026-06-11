@@ -800,12 +800,9 @@ def get_gpt_mtp_block_spec_for_backend(
     if not config.mtp_use_repeated_layer:
         offset = get_mtp_layer_offset(config, vp_stage=vp_stage)
         # Split the MTP layer specs to only include the layers that are built in this
-        # pipeline stage.
+        # pipeline stage. With MTP standalone the layers may span multiple stages, so this
+        # stage builds just its [offset, offset + num_layers_to_build) slice.
         mtp_layer_specs = mtp_layer_specs[offset : offset + num_layers_to_build]
-        # if len(mtp_layer_specs) > 0:
-        #     assert (
-        #         len(mtp_layer_specs) == config.mtp_num_layers
-        #     ), f"All MTP layers must reside in the same pipeline stage"
 
     if len(mtp_layer_specs) > 0:
         mtp_block_spec = MultiTokenPredictionBlockSubmodules(layer_specs=mtp_layer_specs)
