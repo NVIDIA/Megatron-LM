@@ -815,6 +815,12 @@ def process_mtp_loss(
         )
         derived_labels_from_input_ids = True
 
+    if config.mtp_detach_heads:
+        if output_weight is not None:
+            output_weight = output_weight.detach()
+        else:
+            output_weight = output_layer.weight.detach()
+
     mtp_labels = labels.clone()
     if loss_mask is None:
         loss_mask = torch.ones_like(mtp_labels)
@@ -1097,7 +1103,17 @@ class MultiTokenPredictionLayer(MegatronModule):
         # embedding
         decoder_input = embedding(input_ids=input_ids, position_ids=position_ids)
 
+        if self.config.mtp_detach_heads:
+            decoder_input = decoder_input.detach()
+
         hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
+        # make_viewless_tensor no-ops when hidden_states is not a view (_base is None),
+        # which happens after detach() with mtp_detach_heads. Activation
+        # checkpointing (CheckpointFunction.apply) requires at least one input tensor
+        # with requires_grad=True to produce a differentiable output, so we ensure it
+        # here to maintain gradient flow to MTP layer parameters.
+        if not hidden_states.requires_grad:
+            hidden_states.requires_grad_(True)
 
         return input_ids, position_ids, padding_mask, decoder_input, hidden_states
 
@@ -1789,6 +1805,10 @@ class MultiTokenPredictionBlock(MegatronModule):
         offset = get_mtp_layer_offset(self.config, self.vp_stage)
         hidden_states_list = list(torch.chunk(hidden_states, 1 + offset, dim=0))
         hidden_states = hidden_states_list[offset]
+
+        if self.config.mtp_detach_heads:
+            hidden_states = hidden_states.detach()
+
         for iteration in range(self.config.mtp_num_layers):
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
             (hidden_states, input_ids, position_ids, padding_mask) = self.layers[layer_idx](
