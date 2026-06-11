@@ -1435,19 +1435,16 @@ class _DeepepV2Manager(_DeepepManager):
             )
 
     def _get_buffer(self, hidden_states: torch.Tensor):
-        self.buffer = get_elastic_buffer(
+        buffer = get_elastic_buffer(
             self.group,
             num_max_tokens_per_rank=hidden_states.shape[0],
             hidden=hidden_states.shape[1],
             num_topk=self.token_indices.shape[1],
         )
-        return self.buffer
-
-    def _get_num_sms(self):
-        """Resolve DeepEP v2 SM count using ElasticBuffer's analytical default when unset."""
         if self.num_sms is None or self.num_sms == 0:
-            return self.buffer.get_theoretical_num_sms(self.num_experts, self.router_topk)
-        return self.num_sms
+            self.num_sms = buffer.get_theoretical_num_sms(self.num_experts, self.router_topk)
+        self.buffer = buffer
+        return buffer
 
     def dispatch(
         self,
@@ -1472,7 +1469,7 @@ class _DeepepV2Manager(_DeepepManager):
                 self.num_experts,
                 num_max_tokens_per_rank=hidden_states.shape[0],
                 expert_alignment=1,
-                num_sms=self._get_num_sms(),
+                num_sms=self.num_sms,
                 async_finish=async_finish,
                 allocate_on_comm_stream=allocate_on_comm_stream,
             )
@@ -1494,7 +1491,7 @@ class _DeepepV2Manager(_DeepepManager):
             self.buffer,
             hidden_states,
             self.handle,
-            num_sms=self._get_num_sms(),
+            num_sms=self.num_sms,
             async_finish=async_finish,
             allocate_on_comm_stream=allocate_on_comm_stream,
         )
