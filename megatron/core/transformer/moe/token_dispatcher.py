@@ -1180,14 +1180,7 @@ class _HybridEPManager(_DispatchManager):
                     "HybridEP returned fewer dispatched probs than hidden states: "
                     f"{self.dispatched_probs.shape[0]} < {dispatched_hidden.shape[0]}"
                 )
-            if self.num_permuted_tokens is None:
-                raise RuntimeError(
-                    "HybridEP returned padded dispatched probs without a static token budget: "
-                    f"probs={self.dispatched_probs.shape[0]}, hidden={dispatched_hidden.shape[0]}"
-                )
-            pad_rows = self.dispatched_probs.shape[0] - dispatched_hidden.shape[0]
-            hidden_padding = dispatched_hidden.new_zeros((pad_rows, dispatched_hidden.shape[-1]))
-            dispatched_hidden = torch.cat((dispatched_hidden, hidden_padding), dim=0)
+            self.dispatched_probs = self.dispatched_probs[: dispatched_hidden.shape[0]]
         if self.moe_expert_rank_capacity_factor is not None:
             # Static-budget path only: handle[-1] is HybridEP overflow_flag when tokens were
             # dropped because permuted count exceeded num_permuted_tokens from setup_metadata.
