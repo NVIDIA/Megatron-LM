@@ -429,16 +429,20 @@ class LanguageModule(MegatronModule):
                 tp_group=self.tp_group,
                 dp_cp_group=metadata['dp_cp_group'],
             )
+        # The output_layer also lives on non-final loss stages when the MTP loss is split, so
+        # apply the same checkpoint handling there (keeps the replicated output_layer.weight's
+        # sharded-tensor metadata consistent across all loss stages).
+        is_output_layer_stage = self.post_process or getattr(self, 'is_loss_stage', False)
         if self.share_embeddings_and_output_weights:
             self.tie_embeddings_and_output_weights_state_dict(
                 sharded_state_dict, output_layer_weight_key, first_stage_word_emb_key, metadata
             )
-        elif self.post_process:
+        elif is_output_layer_stage:
             # Make sure the output layer follows the embeddings padding logic
             sharded_state_dict[output_layer_weight_key].allow_shape_mismatch = True
 
         # Regardless of sharing the output weights with embeddings, we must handle the bias padding
-        if self.post_process and output_layer_bias_key in sharded_state_dict:
+        if is_output_layer_stage and output_layer_bias_key in sharded_state_dict:
             sharded_state_dict[output_layer_bias_key].allow_shape_mismatch = True
 
         return sharded_state_dict
