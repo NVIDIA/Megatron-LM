@@ -2882,6 +2882,34 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     for i, tensor in enumerate(split_tensors):
                         state_dict_flat[f"{key_prefix}{indexed_suffixes[i]}"] = tensor
 
+    @staticmethod
+    def _synthesize_state_dict_params_for_model(state_dict_flat, model_chunk):
+        """Let modules materialize runtime params before optimizer state-dict matching.
+
+        This covers modules whose runtime parameter is assembled from multiple checkpoint
+        tensors. Normal model loading can handle this in _load_from_state_dict(), but
+        reload_model_params(state_dict=...) matches optimizer master params directly by name.
+        """
+        for module_name, module in model_chunk.named_modules():
+            synthesize = getattr(module, '_synthesize_fused_qkv_down_weight', None)
+            if not callable(synthesize):
+                continue
+
+            clean_name = module_name
+            while clean_name.startswith("module."):
+                clean_name = clean_name[len("module.") :]
+
+            module_prefix = f"{clean_name}." if clean_name else ""
+            synthesize(state_dict_flat, module_prefix)
+
+            q_weight_suffix = f"{module_prefix}linear_q_down_proj.weight"
+            for state_key in list(state_dict_flat.keys()):
+                if not state_key.endswith(q_weight_suffix):
+                    continue
+                key_prefix = state_key[: len(state_key) - len(q_weight_suffix)]
+                if key_prefix:
+                    synthesize(state_dict_flat, f"{key_prefix}{module_prefix}")
+
     def _build_model_param_to_state_dict_param_map(self, state_dict):
         """Create a map from model params to tensors in state_dict based on their names."""
         state_dict_list = []
@@ -2904,6 +2932,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         model_param_to_state_dict_param_map = {}
         for chunk_idx, model_chunk in enumerate(self.model_chunks):
             self._normalize_state_dict_for_grouped_params(state_dict_list[chunk_idx], model_chunk)
+            self._synthesize_state_dict_params_for_model(state_dict_list[chunk_idx], model_chunk)
             names_in_state_dict = set(state_dict_list[chunk_idx].keys())
             for name, model_param in model_chunk.named_parameters():
                 while name.startswith("module."):

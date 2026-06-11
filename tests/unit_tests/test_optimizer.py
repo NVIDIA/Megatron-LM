@@ -23,6 +23,7 @@ from megatron.core.optimizer import (
     get_megatron_optimizer,
     get_standard_config_overrides,
 )
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.optimizer_param_scheduler import ParamGroupOverride
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
@@ -804,6 +805,33 @@ def test_optimizer_reload_model_params():
             torch.testing.assert_close(
                 main_param, torch.empty_like(main_param).fill_(3.0), atol=0, rtol=0
             )
+
+
+def test_distributed_optimizer_synthesizes_fused_qkv_down_weight_for_state_dict_matching():
+    from megatron.core.transformer.multi_latent_attention import FusedMLASelfAttention
+
+    class FakeFusedMLA(nn.Module):
+        _synthesize_fused_qkv_down_weight = FusedMLASelfAttention._synthesize_fused_qkv_down_weight
+
+    model = nn.Module()
+    model.decoder = nn.Module()
+    model.decoder.layers = nn.ModuleList([nn.Module()])
+    model.decoder.layers[0].self_attention = FakeFusedMLA()
+
+    prefix = "module.decoder.layers.0.self_attention."
+    q_key = f"{prefix}linear_q_down_proj.weight"
+    kv_key = f"{prefix}linear_kv_down_proj.weight"
+    fused_key = f"{prefix}linear_qkv_down_proj.weight"
+    q_weight = torch.ones(2, 3)
+    kv_weight = torch.full((4, 3), 2.0)
+    state_dict = {q_key: q_weight, kv_key: kv_weight}
+
+    DistributedOptimizer._synthesize_state_dict_params_for_model(state_dict, model)
+
+    assert fused_key in state_dict
+    assert q_key not in state_dict
+    assert kv_key not in state_dict
+    torch.testing.assert_close(state_dict[fused_key], torch.cat([q_weight, kv_weight], dim=0))
 
 
 @pytest.mark.skipif(
