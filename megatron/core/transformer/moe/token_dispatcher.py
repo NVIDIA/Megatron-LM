@@ -1216,7 +1216,7 @@ class _DeepepManager(_DispatchManager):
                 "DeepEP is not installed. Please install DeepEP package from "
                 "https://github.com/deepseek-ai/deepep."
             )
-        set_deepep_num_sms(config.moe_deepep_num_sms)
+        set_deepep_num_sms(20 if config.moe_deepep_num_sms is None else config.moe_deepep_num_sms)
 
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         num_tokens = routing_map.shape[0]
@@ -1443,6 +1443,12 @@ class _DeepepV2Manager(_DeepepManager):
         )
         return self.buffer
 
+    def _get_num_sms(self):
+        """Resolve DeepEP v2 SM count using ElasticBuffer's analytical default when unset."""
+        if self.num_sms is None or self.num_sms == 0:
+            return self.buffer.get_theoretical_num_sms(self.num_experts, self.router_topk)
+        return self.num_sms
+
     def dispatch(
         self,
         hidden_states: torch.Tensor,
@@ -1466,7 +1472,7 @@ class _DeepepV2Manager(_DeepepManager):
                 self.num_experts,
                 num_max_tokens_per_rank=hidden_states.shape[0],
                 expert_alignment=1,
-                num_sms=self.num_sms,
+                num_sms=self._get_num_sms(),
                 async_finish=async_finish,
                 allocate_on_comm_stream=allocate_on_comm_stream,
             )
@@ -1488,7 +1494,7 @@ class _DeepepV2Manager(_DeepepManager):
             self.buffer,
             hidden_states,
             self.handle,
-            num_sms=self.num_sms,
+            num_sms=self._get_num_sms(),
             async_finish=async_finish,
             allocate_on_comm_stream=allocate_on_comm_stream,
         )
