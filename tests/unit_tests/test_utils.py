@@ -554,3 +554,64 @@ class TestGetLocalRankPreinit:
     def test_defaults_to_zero_with_warning(self):
         with pytest.warns(UserWarning, match="Could not determine local rank"):
             assert get_local_rank_preinit() == 0
+
+
+class TestSingleGroupReductionHelpers:
+    """The optional ``group=`` on the reduction helpers, exercised with a HyperCommGrid-derived
+    process group (no ``parallel_state`` init — the MIMO use case) plus a default→mpu fallback."""
+
+    @staticmethod
+    def _ranks(group):
+        return torch.distributed.get_process_group_ranks(group)
+
+    def test_explicit_grid_group(self):
+        """Helpers reduce correctly over a group built from a HyperCommGrid, no parallel_state."""
+        from megatron.core.hyper_comm_grid import HyperCommGrid
+        from megatron.training.utils.common_utils import (
+            average_losses_across_data_parallel_group,
+            logical_and_across_model_parallel_group,
+            reduce_max_stat_across_model_parallel_group,
+        )
+
+        Utils.initialize_distributed()  # torch.distributed only; NOT initialize_model_parallel
+        world = torch.distributed.get_world_size()
+        rank = torch.distributed.get_rank()
+        # tp=2 over the world: "tp" groups stand in for a model-parallel group, "dp" for data.
+        grid = HyperCommGrid([2, world // 2], ["tp", "dp"], backend="nccl")
+        grid.create_pg(["tp"])
+        grid.create_pg(["dp"])
+        mp_group, dp_group = grid.get_pg("tp"), grid.get_pg("dp")
+        mp_ranks, dp_ranks = self._ranks(mp_group), self._ranks(dp_group)
+        try:
+            # reduce_max: MAX over the grid mp group.
+            assert reduce_max_stat_across_model_parallel_group(
+                float(rank), group=mp_group
+            ) == float(max(mp_ranks))
+
+            # logical_and: True iff every member is True (only the lowest mp rank passes True).
+            flag = rank == min(mp_ranks)
+            expected_and = all(r == min(mp_ranks) for r in mp_ranks)
+            assert logical_and_across_model_parallel_group(flag, group=mp_group) is expected_and
+
+            # average: SUM-then-divide over the grid dp group -> mean of member ranks.
+            loss = torch.tensor(float(rank), device=torch.cuda.current_device())
+            out = average_losses_across_data_parallel_group([loss], group=dp_group)
+            torch.testing.assert_close(
+                out.cpu(), torch.tensor([sum(dp_ranks) / len(dp_ranks)], dtype=torch.float32)
+            )
+        finally:
+            grid.destroy()
+
+    def test_default_falls_back_to_mpu(self):
+        """With no ``group=``, helpers read the mpu global (back-compat for non-MIMO callers)."""
+        from megatron.core import parallel_state as mpu
+        from megatron.training.utils.common_utils import reduce_max_stat_across_model_parallel_group
+
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+        rank = torch.distributed.get_rank()
+        explicit = reduce_max_stat_across_model_parallel_group(
+            float(rank), group=mpu.get_model_parallel_group()
+        )
+        default = reduce_max_stat_across_model_parallel_group(float(rank))
+        assert default == explicit
+        Utils.destroy_model_parallel()
