@@ -423,7 +423,7 @@ class DeepepV2Combine(torch.autograd.Function):
         )
         if ctx.async_finish:
             event.current_stream_wait()
-        return None, grad_x, None, None, None, None, None
+        return None, grad_x, None, None, None, None
 
 
 if HAVE_DEEP_EP_V2:
