@@ -24,7 +24,7 @@ from torch.distributed import DeviceMesh
 from torch.distributed.tensor import DTensor
 
 from .layout import GlobalLayout, Shape, non_leading_numel
-from .placement import Flat, Partial, Placement, Replicate, validate_placements
+from .placement import Flat, Partial, Placement, Replicate
 
 
 @dataclasses.dataclass(frozen=True)
@@ -39,6 +39,20 @@ def _validate_mesh_axis(mesh: DeviceMesh, axis: int) -> None:
         raise TypeError(f"Mesh axis must be an int, got {type(axis).__name__}.")
     if axis < 0 or axis >= mesh.ndim:
         raise ValueError(f"Mesh axis {axis} is out of bounds for mesh ndim {mesh.ndim}.")
+
+
+def _validate_placements(placements: Iterable[Placement]) -> None:
+    seen_flat = False
+    for placement in placements:
+        if not isinstance(placement, (Replicate, Partial, Flat)):
+            raise TypeError(f"Unsupported DBuffer placement: {placement!r}.")
+        if isinstance(placement, Flat):
+            seen_flat = True
+        elif seen_flat:
+            raise ValueError(
+                "Flat placements must be a suffix of the placement list so each "
+                "local buffer is a contiguous global-buffer range."
+            )
 
 
 class DBuffer:
@@ -81,7 +95,7 @@ class DBuffer:
             raise ValueError(
                 f"Expected {mesh.ndim} placements for device mesh, got {len(placements)}."
             )
-        validate_placements(placements)
+        _validate_placements(placements)
 
         self.mesh = mesh
         self.placements = placements
@@ -146,7 +160,7 @@ class DBuffer:
             raise ValueError(
                 f"Expected {mesh.ndim} placements for device mesh, got {len(placements)}."
             )
-        validate_placements(placements)
+        _validate_placements(placements)
         if local_buffer.dim() != 1:
             raise ValueError("local_buffer must be a flat 1D tensor.")
         if not local_buffer.is_contiguous():
@@ -255,7 +269,7 @@ class DBuffer:
                 f"Expected {self.mesh.ndim} placements for device mesh, got "
                 f"{len(new_placements)}."
             )
-        validate_placements(new_placements)
+        _validate_placements(new_placements)
 
         changed_axis: int | None = None
         for axis, (old_placement, new_placement) in enumerate(
@@ -303,7 +317,7 @@ class DBuffer:
 
         placements = list(self.placements)
         placements[mesh_axis] = Replicate()
-        validate_placements(placements)
+        _validate_placements(placements)
         out = self._create_or_validate_out(placements, out)
         dist.all_gather_into_tensor(
             output_tensor=out.local_buffer,
@@ -343,7 +357,7 @@ class DBuffer:
 
         placements = list(self.placements)
         placements[axis] = new_placement
-        validate_placements(placements)
+        _validate_placements(placements)
         out = self._create_or_validate_out(placements, out)
         dist.reduce_scatter_tensor(
             output=out.local_buffer,
@@ -366,7 +380,7 @@ class DBuffer:
 
         placements = list(self.placements)
         placements[axis] = new_placement
-        validate_placements(placements)
+        _validate_placements(placements)
 
         if out is None:
             destination_offset, destination_numel = self.layout.get_local_range(

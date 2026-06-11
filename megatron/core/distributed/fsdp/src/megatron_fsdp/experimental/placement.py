@@ -30,7 +30,6 @@ sharded        ``Replicate``  ``allgather()``
 """
 
 import dataclasses
-from collections.abc import Iterable
 
 import torch.distributed as dist
 
@@ -54,22 +53,3 @@ class Partial(Placement):
 @dataclasses.dataclass(frozen=True)
 class Flat(Placement):
     """Flat per-unit dim-0 sharded local buffer placement."""
-
-
-def _validate_placement(placement: Placement) -> None:
-    if not isinstance(placement, (Replicate, Partial, Flat)):
-        raise TypeError(f"Unsupported DBuffer placement: {placement!r}.")
-
-
-def validate_placements(placements: Iterable[Placement]) -> None:
-    """Validate DBuffer placements form a supported contiguous local layout."""
-    seen_flat = False
-    for placement in placements:
-        _validate_placement(placement)
-        if isinstance(placement, Flat):
-            seen_flat = True
-        elif seen_flat:
-            raise ValueError(
-                "Flat placements must be a suffix of the placement list so each "
-                "local buffer is a contiguous global-buffer range."
-            )
