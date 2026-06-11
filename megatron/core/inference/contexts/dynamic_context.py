@@ -36,6 +36,7 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.moe.token_dispatcher_inference import (
+    InferenceAllGatherDispatcherBase,
     NCCLAllGatherDispatcher,
     NVLSAllGatherVDispatcher,
 )
@@ -684,7 +685,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             # EP=1 with nvls: skip symmetric memory init (requires NVLink between
             # multiple GPUs) and just initialize the shared valid_tokens scalar.
-            NCCLAllGatherDispatcher.allocate_buffers()
+            InferenceAllGatherDispatcherBase.allocate_valid_tokens_tensor()
 
         # Deal with chunked prefill
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
