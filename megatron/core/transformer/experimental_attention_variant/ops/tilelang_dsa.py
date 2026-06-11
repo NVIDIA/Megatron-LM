@@ -71,20 +71,24 @@ def _get_scratch_buffer(
     return buf
 
 
+def _sanitize_fused_topk_indices(
+    topk_indices: torch.Tensor, starts: torch.Tensor, ends: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Mask fused indexer outputs to valid row-wise [start, end) key bounds."""
+    starts_for_cmp = starts.to(device=topk_indices.device, dtype=topk_indices.dtype).unsqueeze(-1)
+    ends_for_cmp = ends.to(device=topk_indices.device, dtype=topk_indices.dtype).unsqueeze(-1)
+    valid = (topk_indices >= starts_for_cmp) & (topk_indices < ends_for_cmp)
+    return topk_indices.masked_fill(~valid, -1), valid
+
+
 def _sanitize_fused_topk_outputs(
     topk_indices: torch.Tensor,
     starts: torch.Tensor,
     ends: torch.Tensor,
     topk_scores: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-    """Mask fused indexer outputs to valid row-wise [start, end) key bounds."""
-    idx_i64 = topk_indices.to(dtype=torch.int64)
-    starts_i64 = starts.to(device=idx_i64.device, dtype=torch.int64).unsqueeze(-1)
-    ends_i64 = ends.to(device=idx_i64.device, dtype=torch.int64).unsqueeze(-1)
-    valid = (idx_i64 >= starts_i64) & (idx_i64 < ends_i64)
-    sanitized_indices = idx_i64.masked_fill(~valid, -1)
-    if topk_indices.dtype != torch.int64:
-        sanitized_indices = sanitized_indices.to(dtype=topk_indices.dtype)
+    """Mask fused indexer outputs and optional scores to row-wise key bounds."""
+    sanitized_indices, valid = _sanitize_fused_topk_indices(topk_indices, starts, ends)
     if topk_scores is not None:
         topk_scores = topk_scores.masked_fill(~valid, float("-inf"))
     return sanitized_indices, topk_scores
@@ -129,7 +133,7 @@ def fused_qk_topk_lighting(
                 topk_indices=None,
                 use_relu=use_relu,
             )
-            topk_indices, _ = _sanitize_fused_topk_outputs(
+            topk_indices, _ = _sanitize_fused_topk_indices(
                 topk_indices=topk_indices, starts=starts[start:end], ends=ends[start:end]
             )
             if topk_out is None:
@@ -173,6 +177,7 @@ def _compute_topk_target_chunk_sum(
         h1 = min(h0 + head_chunk_size, np)
         h_chunk = h1 - h0
         q_chunk = query_h[h0:h1, s0:s1, :]
+        q_chunk_float = q_chunk.float()
 
         if key_shared is None:
             key_chunk = key_per_head[h0:h1]
@@ -198,17 +203,15 @@ def _compute_topk_target_chunk_sum(
 
             if key_shared is not None:
                 key_sel = key_shared.index_select(0, idx_topk.reshape(-1)).view(s_len, t1 - t0, hn)
-                logits = (
-                    torch.einsum('hsd,skd->hsk', q_chunk.float(), key_sel.float()) * softmax_scale
-                )
+                logits = torch.einsum('hsd,skd->hsk', q_chunk_float, key_sel.float())
+                logits = logits * softmax_scale
             else:
                 flat_idx = idx_topk.unsqueeze(0) + head_offsets
                 key_sel = flat_keys.index_select(0, flat_idx.reshape(-1)).view(
                     h_chunk, s_len, t1 - t0, hn
                 )
-                logits = (q_chunk.float().unsqueeze(2) * key_sel.float()).sum(
-                    dim=-1
-                ) * softmax_scale
+                logits = (q_chunk_float.unsqueeze(2) * key_sel.float()).sum(dim=-1)
+                logits = logits * softmax_scale
 
             logits = logits.masked_fill(~valid_topk_chunk.unsqueeze(0), float("-inf"))
             chunk_max = logits.max(dim=-1).values
@@ -228,17 +231,15 @@ def _compute_topk_target_chunk_sum(
 
             if key_shared is not None:
                 key_sel = key_shared.index_select(0, idx_topk.reshape(-1)).view(s_len, t1 - t0, hn)
-                logits = (
-                    torch.einsum('hsd,skd->hsk', q_chunk.float(), key_sel.float()) * softmax_scale
-                )
+                logits = torch.einsum('hsd,skd->hsk', q_chunk_float, key_sel.float())
+                logits = logits * softmax_scale
             else:
                 flat_idx = idx_topk.unsqueeze(0) + head_offsets
                 key_sel = flat_keys.index_select(0, flat_idx.reshape(-1)).view(
                     h_chunk, s_len, t1 - t0, hn
                 )
-                logits = (q_chunk.float().unsqueeze(2) * key_sel.float()).sum(
-                    dim=-1
-                ) * softmax_scale
+                logits = (q_chunk_float.unsqueeze(2) * key_sel.float()).sum(dim=-1)
+                logits = logits * softmax_scale
 
             logits = logits.masked_fill(~valid_topk_chunk.unsqueeze(0), float("-inf"))
             probs = torch.exp(logits - stable_m.unsqueeze(-1)) * inv_l.unsqueeze(-1)
@@ -252,24 +253,45 @@ def _compute_sparse_topk_kl_chunk(
 ) -> torch.Tensor:
     """Compute KL(target || index) sum for one [s_chunk, topk] chunk."""
     index_logits_chunk = index_logits_chunk.to(dtype=torch.float32, device=target_chunk.device)
-    index_logits_chunk = index_logits_chunk.masked_fill(~valid_seq, float("-inf"))
-    no_valid_rows = ~valid_seq.any(dim=-1, keepdim=True)
-    if no_valid_rows.any():
-        index_logits_chunk = index_logits_chunk.masked_fill(
-            no_valid_rows.expand_as(index_logits_chunk), 0.0
+    target_chunk = target_chunk.to(dtype=torch.float32, device=index_logits_chunk.device)
+    with torch.no_grad():
+        index_scores_chunk = dsa_masking.masked_softmax(
+            index_logits_chunk.detach(), valid_seq, dim=-1
         )
-    index_scores_chunk = torch.nn.functional.softmax(
-        index_logits_chunk, dim=-1, dtype=torch.float32
-    )
-    kl_chunk = target_chunk * (
-        torch.log(target_chunk + 1e-10) - torch.log(index_scores_chunk + 1e-10)
-    )
-    return kl_chunk.sum()
+        kl_value = (
+            (
+                target_chunk
+                * (
+                    torch.log(target_chunk.clamp_min(1e-10))
+                    - torch.log(index_scores_chunk.clamp_min(1e-10))
+                )
+            )
+            .masked_fill(~valid_seq, 0.0)
+            .sum()
+        )
+        grad_logits = (index_scores_chunk - target_chunk).masked_fill(~valid_seq, 0.0)
+    index_logits_for_grad = index_logits_chunk.masked_fill(~valid_seq, 0.0)
+    grad_surrogate = (index_logits_for_grad * grad_logits).sum()
+    return grad_surrogate + (kl_value - grad_surrogate).detach()
 
 
-def _normalize_topk_target_chunk(target_chunk: torch.Tensor) -> torch.Tensor:
-    """Normalize target probability mass over top-k support."""
-    return target_chunk / target_chunk.sum(dim=-1, keepdim=True).clamp_min(1e-10)
+def _normalize_topk_target_chunk_(target_chunk: torch.Tensor) -> torch.Tensor:
+    """Normalize target probability mass over top-k support in place."""
+    return target_chunk.div_(target_chunk.sum(dim=-1, keepdim=True).clamp_min(1e-10))
+
+
+def _accumulate_topk_kl_chunk(
+    *,
+    target_chunk: torch.Tensor,
+    index_logits_chunk: torch.Tensor,
+    valid_seq: torch.Tensor,
+    kl_sum: torch.Tensor,
+) -> torch.Tensor:
+    """Normalize one target chunk and accumulate its sparse KL contribution."""
+    normalized_target = _normalize_topk_target_chunk_(target_chunk)
+    return kl_sum + _compute_sparse_topk_kl_chunk(
+        target_chunk=normalized_target, index_logits_chunk=index_logits_chunk, valid_seq=valid_seq
+    )
 
 
 def _stage_topk_target_chunk(
@@ -312,11 +334,11 @@ def _consume_pending_topk_kl_chunk(
         return kl_sum, pending_handle, pending_target_chunk, pending_index_logits, pending_valid_seq
     if pending_handle is not None:
         pending_handle.wait()
-    normalized_target = _normalize_topk_target_chunk(pending_target_chunk)
-    kl_sum = kl_sum + _compute_sparse_topk_kl_chunk(
-        target_chunk=normalized_target,
+    kl_sum = _accumulate_topk_kl_chunk(
+        target_chunk=pending_target_chunk,
         index_logits_chunk=pending_index_logits,
         valid_seq=pending_valid_seq,
+        kl_sum=kl_sum,
     )
     return kl_sum, None, None, None, None
 
@@ -503,11 +525,9 @@ def fused_qk_topk_lighting_with_streaming_sparse_kl(
                 index_logits_chunk = topk_scores[rel_start:rel_end]
                 if query_valid_rows is not None:
                     row_valid = query_valid_rows[bi, abs_start:abs_end]
-                    if not row_valid.any():
-                        continue
-                    target_chunk = target_chunk[row_valid]
-                    index_logits_chunk = index_logits_chunk[row_valid]
-                    valid_seq = valid_seq[row_valid]
+                    row_valid_2d = row_valid.unsqueeze(-1)
+                    target_chunk = target_chunk * row_valid_2d.to(dtype=target_chunk.dtype)
+                    valid_seq = valid_seq & row_valid_2d
                 (
                     kl_sum,
                     chunk_id,
