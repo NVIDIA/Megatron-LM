@@ -471,6 +471,65 @@ def test_layer_input_offloading_requires_uniform_full_recompute():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+def test_backward_commit_prefetches_next_reload_before_group_start(monkeypatch):
+    """Backward commit should prefetch the next group before group-start backward runs."""
+    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+        ChunkOffloadHandler,
+        OffloadTensorGroup,
+        PipelineOffloadManager,
+    )
+
+    PipelineOffloadManager.reset_instance()
+    mgr = PipelineOffloadManager.get_instance()
+    handler = ChunkOffloadHandler(0, mgr.cpu_tensor_pool)
+    handler.is_warmup = False
+    mgr._cur_backward_chunk = handler
+
+    reloading_group = OffloadTensorGroup("layer_input")
+    handler._reloading_group.append(reloading_group)
+    events = []
+
+    monkeypatch.setattr(
+        reloading_group, "wait_reload_event", lambda stream: events.append("wait-current")
+    )
+    monkeypatch.setattr(handler, "bulk_reload", lambda: events.append("prefetch-next"))
+
+    handler.on_group_commit_backward("layer_input")
+    assert events == ["wait-current", "prefetch-next"]
+
+    handler.on_group_start_backward()
+    assert events == ["wait-current", "prefetch-next"]
+
+    PipelineOffloadManager.reset_instance()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+def test_warmup_keeps_reload_on_group_start_backward(monkeypatch):
+    """Warmup must not prefetch from commit because no offload margin exists yet."""
+    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+        ChunkOffloadHandler,
+        PipelineOffloadManager,
+    )
+
+    PipelineOffloadManager.reset_instance()
+    mgr = PipelineOffloadManager.get_instance()
+    handler = ChunkOffloadHandler(0, mgr.cpu_tensor_pool)
+    handler.is_warmup = True
+    mgr._cur_backward_chunk = handler
+
+    events = []
+    monkeypatch.setattr(handler, "bulk_reload", lambda: events.append("reload"))
+
+    handler.on_group_commit_backward("layer_input")
+    assert events == []
+
+    handler.on_group_start_backward()
+    assert events == ["reload"]
+
+    PipelineOffloadManager.reset_instance()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
 @pytest.mark.skipif(
     not (HAVE_TE and is_te_min_version("1.5.0")),
     reason="TE checkpoint patch requires Transformer Engine 1.5.0+.",

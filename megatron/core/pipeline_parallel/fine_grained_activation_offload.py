@@ -1155,6 +1155,11 @@ class ChunkOffloadHandler:
                     reloading_group.wait_reload_event(torch.cuda.current_stream())
                     self._reloading_group.remove(reloading_group)
                     break
+        if not self.is_warmup:
+            # Launch the next reload before this checkpointed layer starts its
+            # recompute/backward work, so H2D can overlap with the current layer.
+            self.h2d_stream.wait_stream(torch.cuda.current_stream())
+            self.bulk_reload()
 
     def on_group_start_forward(self, name, max_offloaded_tensors=None):
         """
@@ -1183,14 +1188,20 @@ class ChunkOffloadHandler:
     def on_group_start_backward(self):
         """
         Called at the start of a layer group's backward pass.
-        Triggers reloading of tensors from CPU.
+        Kept as the backward-side counterpart of group_start. Reloads are
+        launched from group_commit backward so they can overlap with this
+        layer's recompute/backward compute.
         """
         if not self.do_offload:
             return
         debug_rank(f"--on_group_start_backward {self}")
-        # Wait for compute to finish before starting reload
-        self.h2d_stream.wait_stream(torch.cuda.current_stream())
-        self.bulk_reload()
+        if self.is_warmup:
+            # During warmup, offload margins have not been applied yet, so the
+            # first backward group may itself need reload. Preserve the original
+            # just-in-time reload path until post_warmup_callback marks the
+            # no-offload margin groups.
+            self.h2d_stream.wait_stream(torch.cuda.current_stream())
+            self.bulk_reload()
 
 
 def fine_grained_offloading_disable_offload():
