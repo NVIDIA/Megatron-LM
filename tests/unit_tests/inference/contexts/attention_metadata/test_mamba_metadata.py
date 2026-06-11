@@ -473,9 +473,7 @@ class TestMambaMetadata:
         )
 
         # Active ssm slots matching the absolute request IDs
-        active_ssm_indices = torch.tensor(
-            [2, 3], dtype=torch.int32, device=metadata_context.device
-        )
+        active_ssm_indices = torch.tensor([2, 3], dtype=torch.int32, device=metadata_context.device)
 
         # cu_seqlens is always local to the active slice passed in
         cu_seqlens = torch.tensor([0, 10, 30], dtype=torch.int32, device=metadata_context.device)

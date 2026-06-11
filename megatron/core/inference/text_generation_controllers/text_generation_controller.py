@@ -62,8 +62,8 @@ from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensi
 from megatron.core.inference.sampling import FlashInferSampling, Sampling, TorchSampling
 from megatron.core.inference.text_generation_controllers.mtp_utils_pytorch import rewind_kv_cache
 from megatron.core.inference.text_generation_controllers.mtp_utils_triton import (
-    ssm_state_selective_copy,
     prepare_next_forward_pass,
+    ssm_state_selective_copy,
     verify_speculative_tokens,
 )
 
@@ -711,9 +711,9 @@ class TextGenerationController:
             # don't need to re-upload prefill_status for the SSM kernels.
             prefill_status_gpu = context.gpu_view.request_in_prefill_status[:active_request_count]
             accepted_counts_gpu = self._accepted_token_counts_per_request[:active_request_count]
-            ssm_state_idx = context.ssm_metadata.request_to_ssm_state_idx[
-                active_request_slice
-            ].to(cuda_device, non_blocking=True)
+            ssm_state_idx = context.ssm_metadata.request_to_ssm_state_idx[active_request_slice].to(
+                cuda_device, non_blocking=True
+            )
             ssm_state_selective_copy(
                 intermediate_states=context.ssm_intermediate_conv_states,
                 current_states=context.ssm_conv_states,

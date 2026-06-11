@@ -1820,9 +1820,7 @@ class TestDynamicContext:
 
         # Verify that the chunked request was correctly pulled to the boundary (index 1)
         assert dynamic_context.request_ids[1].item() == 999
-        assert (
-            dynamic_context.ssm_metadata.request_to_ssm_state_idx[1].item() == mamba_slot_before
-        )
+        assert dynamic_context.ssm_metadata.request_to_ssm_state_idx[1].item() == mamba_slot_before
         assert dynamic_context.request_to_kv_block_ids[1, 0].item() == kv_block_before
 
         # Ensure the old index 2 was properly swapped during the pull
@@ -1837,9 +1835,7 @@ class TestDynamicContext:
         # Verify state at index 1 is active and its previous Mamba slot and KV blocks were inherited
         assert dynamic_context.total_request_count == 2
         assert dynamic_context.request_ids[1].item() == 999
-        assert (
-            dynamic_context.ssm_metadata.request_to_ssm_state_idx[1].item() == mamba_slot_before
-        )
+        assert dynamic_context.ssm_metadata.request_to_ssm_state_idx[1].item() == mamba_slot_before
         assert dynamic_context.request_to_kv_block_ids[1, 0].item() == kv_block_before
 
     @pytest.mark.internal

@@ -19,9 +19,7 @@ from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
 from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
-    tensor_get_slice_after,
     tensor_masked_update,
-    tensor_merge,
 )
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -42,7 +40,6 @@ from megatron.core.utils import (
     deprecate_inference_params,
     is_causal_conv1d_min_version,
     is_mamba_min_version,
-    is_using_quantization_scales,
     log_single_rank,
 )
 
@@ -490,10 +487,12 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
 
         return out, out_bias
 
-
-
     def _decode(
-        self, hidden_states, conv_state, recurrent_state, batch_indices: Optional[torch.Tensor] = None
+        self,
+        hidden_states,
+        conv_state,
+        recurrent_state,
+        batch_indices: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Performs inference step for decoding."""
         # assert self.ngroups_local_tp == 1, "Only support ngroups=1 for inference for now"
@@ -514,7 +513,10 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
         assert self.cp.cp_size == 1, "Context parallel not supported for Mamba inferenece decode"
 
         y = self._ssm_decode(
-            zxBCdt, conv_state=conv_state, recurrent_state=recurrent_state, batch_indices=batch_indices
+            zxBCdt,
+            conv_state=conv_state,
+            recurrent_state=recurrent_state,
+            batch_indices=batch_indices,
         )
 
         # Restore sequence length as first dimension
@@ -627,9 +629,9 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
                 for_inference_not_training=True
             )
             assert sequence_packing_available, reason
-            assert self.cp.cp_size == 1, (
-                "Context parallel is not supported for MambaMixer dynamic inference prefill"
-            )
+            assert (
+                self.cp.cp_size == 1
+            ), "Context parallel is not supported for MambaMixer dynamic inference prefill"
             metadata = context.ssm_metadata
             slot_allocator = context.ssm_slot_allocator
             seq_idx = metadata.seq_idx
@@ -647,7 +649,9 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
             conv_seq_start = metadata.conv_seq_start
             if slot_allocator is not None:
                 mamba_layer_idx = context.layer_map[self.layer_number - self.pp_layer_offset - 1]
-                intermediate_recurrent_out = slot_allocator.intermediate_recurrent_out[mamba_layer_idx]
+                intermediate_recurrent_out = slot_allocator.intermediate_recurrent_out[
+                    mamba_layer_idx
+                ]
                 intermediate_conv_out = slot_allocator.intermediate_conv_out[mamba_layer_idx]
 
         is_dynamic_batching = seq_idx is not None
@@ -1127,7 +1131,10 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
                 device=self.in_proj.weight.device,
                 dtype=self.in_proj.weight.dtype,
             )
-            inference_context.key_value_memory_dict[self.layer_number] = (conv_state, recurrent_state)
+            inference_context.key_value_memory_dict[self.layer_number] = (
+                conv_state,
+                recurrent_state,
+            )
             self.cached_batch_size = batch_size
         else:
             conv_state, recurrent_state = inference_context.key_value_memory_dict[self.layer_number]

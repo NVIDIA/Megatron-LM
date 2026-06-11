@@ -178,17 +178,13 @@ class SSMDynamicInferenceMixin:
                 dtype=y_prefill.dtype,
                 device=y_prefill.device,
             )
-            tensor_merge(
-                y_decode, y_prefill, metadata.device_decode_prefill, output_tensor=y
-            )
+            tensor_merge(y_decode, y_prefill, metadata.device_decode_prefill, output_tensor=y)
         elif y_decode is not None:
             y = y_decode
         elif y_prefill is not None:
             y = y_prefill
         else:
-            raise RuntimeError(
-                "Dynamic inference called with 0 decode and 0 prefill requests"
-            )
+            raise RuntimeError("Dynamic inference called with 0 decode and 0 prefill requests")
 
         # Zero padding positions to avoid corrupting quantization amax calculations.
         if is_using_quantization_scales(self.config):

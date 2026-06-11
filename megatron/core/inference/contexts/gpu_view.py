@@ -208,17 +208,15 @@ class ContextGPUView:
                 torch.int32
             )
             off += ssm_cu_chunk_seqlens_bytes
-            self.ssm_last_chunk_indices = self._buf[
-                off : off + ssm_last_chunk_indices_bytes
-            ].view(torch.int32)
-            off += ssm_last_chunk_indices_bytes
-            self.ssm_seq_idx_for_varlen = self._buf[
-                off : off + ssm_seq_idx_for_varlen_bytes
-            ].view(torch.int32)
-            off += ssm_seq_idx_for_varlen_bytes
-            self.ssm_conv_seq_idx = self._buf[off : off + ssm_conv_seq_idx_bytes].view(
+            self.ssm_last_chunk_indices = self._buf[off : off + ssm_last_chunk_indices_bytes].view(
                 torch.int32
             )
+            off += ssm_last_chunk_indices_bytes
+            self.ssm_seq_idx_for_varlen = self._buf[off : off + ssm_seq_idx_for_varlen_bytes].view(
+                torch.int32
+            )
+            off += ssm_seq_idx_for_varlen_bytes
+            self.ssm_conv_seq_idx = self._buf[off : off + ssm_conv_seq_idx_bytes].view(torch.int32)
             off += ssm_conv_seq_idx_bytes
             self.ssm_conv_seq_start = self._buf[off : off + ssm_conv_seq_start_bytes].view(
                 torch.int32

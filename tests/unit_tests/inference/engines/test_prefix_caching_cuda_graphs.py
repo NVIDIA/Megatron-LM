@@ -22,8 +22,8 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.inference.config import (
     InferenceConfig,
-    SSMInferenceStateConfig,
     PrefixCachingEvictionPolicy,
+    SSMInferenceStateConfig,
 )
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine

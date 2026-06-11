@@ -1123,8 +1123,12 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
 
         if is_hybrid_model:
             # Check Mamba state was restored from intermediate cache based on accepted counts
-            assert torch.all(ctx.ssm_recurrent_states[:, 0] == 99)  # Req 0 accepted 1, loaded index 1
-            assert torch.all(ctx.ssm_recurrent_states[:, 1] == 99)  # Req 1 accepted 0, loaded index 0
+            assert torch.all(
+                ctx.ssm_recurrent_states[:, 0] == 99
+            )  # Req 0 accepted 1, loaded index 1
+            assert torch.all(
+                ctx.ssm_recurrent_states[:, 1] == 99
+            )  # Req 1 accepted 0, loaded index 0
             assert torch.all(ctx.ssm_conv_states[:, 0] == 77)  # Req 0 accepted 1, loaded index 1
             assert torch.all(ctx.ssm_conv_states[:, 1] == 77)  # Req 1 accepted 0, loaded index 0
 

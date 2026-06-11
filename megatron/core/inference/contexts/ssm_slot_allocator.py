@@ -333,9 +333,7 @@ class SSMSlotAllocator:
         slot_tensor = torch.tensor(slots, dtype=torch.int64, device=device)
         # Lookup SSM indices from CPU bookkeeping, then move to GPU for state copy.
         req_tensor_cpu = torch.tensor(request_indices, dtype=torch.int64)
-        ssm_indices = self.context.ssm_metadata.request_to_ssm_state_idx[
-            req_tensor_cpu
-        ].tolist()
+        ssm_indices = self.context.ssm_metadata.request_to_ssm_state_idx[req_tensor_cpu].tolist()
         ssm_idx_tensor = torch.tensor(ssm_indices, dtype=torch.int64, device=device)
         # Fancy-indexed copy (2 kernel launches instead of 2E)
         self.conv_states[:, slot_tensor] = self.context.ssm_conv_states[:, ssm_idx_tensor]

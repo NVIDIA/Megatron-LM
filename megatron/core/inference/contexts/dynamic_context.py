@@ -43,13 +43,13 @@ from megatron.core.utils import deprecate_args
 from megatron.core.utils import divide as core_divide
 from megatron.core.utils import get_pg_rank, get_pg_size, internal_api
 
-from .attention_context.ssm_metadata import SSMMetadata
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
+from .attention_context.ssm_metadata import SSMMetadata
 from .base_context import BaseInferenceContext
 from .gpu_view import ContextGPUView
 from .kv_block_allocator import KVBlockAllocator
-from .ssm_slot_allocator import SSMSlotAllocator
 from .routing_metadata import RoutingMetadata
+from .ssm_slot_allocator import SSMSlotAllocator
 
 try:
     from .fused_kv_append_kernel import triton_append_key_value_cache
@@ -347,11 +347,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             # For hybrid models, the layer map converts the global layer index to the
             # corresponding attention layer index or SSM layer index depending on the
             # layer type.
-            attention_layer_map, dsa_layer_map, gdn_layer_map, ssm_layer_map = (
-                operator.itemgetter(
-                    Symbols.ATTENTION, Symbols.DS_ATTENTION, Symbols.GDN, Symbols.MAMBA
-                )(get_layer_maps_from_layer_type_list(ssm_inference_state_config.layer_type_list))
-            )
+            attention_layer_map, dsa_layer_map, gdn_layer_map, ssm_layer_map = operator.itemgetter(
+                Symbols.ATTENTION, Symbols.DS_ATTENTION, Symbols.GDN, Symbols.MAMBA
+            )(get_layer_maps_from_layer_type_list(ssm_inference_state_config.layer_type_list))
 
             if len(gdn_layer_map) > 0:
                 raise NotImplementedError("GDN layers are not supported for inference.")
@@ -418,14 +416,16 @@ class DynamicInferenceContext(BaseInferenceContext):
                 math.prod(self.ssm_conv_states_shape) * self.ssm_conv_states_dtype.itemsize
             )
             ssm_states_memory_per_request += (
-                math.prod(self.ssm_recurrent_states_shape) * self.ssm_recurrent_states_dtype.itemsize
+                math.prod(self.ssm_recurrent_states_shape)
+                * self.ssm_recurrent_states_dtype.itemsize
             )
             ssm_states_memory_per_request *= self.num_ssm_layers
             if self.num_speculative_tokens > 0:
                 # Add memory for intermediate conv and SSM states
                 intermediate_memory_per_request = (
                     math.prod(self.ssm_conv_states_shape) * self.ssm_conv_states_dtype.itemsize
-                    + math.prod(self.ssm_recurrent_states_shape) * self.ssm_recurrent_states_dtype.itemsize
+                    + math.prod(self.ssm_recurrent_states_shape)
+                    * self.ssm_recurrent_states_dtype.itemsize
                 )
                 intermediate_memory_per_request *= self.num_ssm_layers
                 intermediate_memory_per_request *= self.num_speculative_tokens + 1
@@ -1589,7 +1589,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         import math as _math
 
         conv_size = _math.prod(self.ssm_conv_states_shape) * self.ssm_conv_states_dtype.itemsize
-        ssm_size = _math.prod(self.ssm_recurrent_states_shape) * self.ssm_recurrent_states_dtype.itemsize
+        ssm_size = (
+            _math.prod(self.ssm_recurrent_states_shape) * self.ssm_recurrent_states_dtype.itemsize
+        )
         per_slot_bytes = self.num_ssm_layers * (conv_size + ssm_size)
         total_bytes = int(ssm_gb * 1024**3)
         max_slots = total_bytes // per_slot_bytes

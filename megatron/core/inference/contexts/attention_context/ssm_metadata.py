@@ -5,9 +5,7 @@ from typing import Optional
 import torch
 
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
-from megatron.core.inference.contexts.ssm_slot_allocator import (
-    MAX_INTERMEDIATE_OFFSETS_PER_REQUEST,
-)
+from megatron.core.inference.contexts.ssm_slot_allocator import MAX_INTERMEDIATE_OFFSETS_PER_REQUEST
 
 
 class SSMMetadata:
@@ -86,9 +84,7 @@ class SSMMetadata:
         self._conv_seq_start_buffer = torch.zeros(max_tokens, dtype=torch.int32, device=self.device)
 
         # Free-slot pool for SSM state slots (CPU for bookkeeping).
-        self.ssm_state_free_slots = torch.arange(
-            self.max_requests, dtype=torch.int32, device='cpu'
-        )
+        self.ssm_state_free_slots = torch.arange(self.max_requests, dtype=torch.int32, device='cpu')
         self.ssm_state_free_slot_count = self.max_requests
 
         # Intermediate state extraction buffers (CUDA graph compatible)
@@ -142,9 +138,7 @@ class SSMMetadata:
         self.reset_varlen_metadata()
 
         # Re-initialize the free slot pool
-        self.ssm_state_free_slots = torch.arange(
-            self.max_requests, dtype=torch.int32, device='cpu'
-        )
+        self.ssm_state_free_slots = torch.arange(self.max_requests, dtype=torch.int32, device='cpu')
         self.ssm_state_free_slot_count = self.max_requests
 
     def reset_varlen_metadata(self) -> None:

@@ -41,8 +41,8 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.inference.config import (
     InferenceConfig,
-    SSMInferenceStateConfig,
     PrefixCachingEvictionPolicy,
+    SSMInferenceStateConfig,
 )
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine
@@ -600,9 +600,7 @@ class TestMambaPrefixCachingE2E:
         # E: seed request
         req_E = _run_one(0, prompts[0])
         h_E0 = req_E.precomputed_block_hashes[0]
-        assert (
-            h_E0 in ctx.ssm_slot_allocator.hash_to_block_id and h_E0 in alloc.kv_hash_to_block_id
-        )
+        assert h_E0 in ctx.ssm_slot_allocator.hash_to_block_id and h_E0 in alloc.kv_hash_to_block_id
         assert len(ctx.ssm_slot_allocator.hash_to_block_id) == 1 and alloc.total_avail == 1
 
         # F: disjoint prefix, forces eviction of E's cached block
