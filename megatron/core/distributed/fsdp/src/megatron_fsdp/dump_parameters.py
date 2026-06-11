@@ -17,7 +17,7 @@
 Useful for replaying optimizer steps in tests/microbenchmarks without
 re-running the model. The dump captures everything needed to reconstruct
 the parameter layout: global/local shape, per-param mesh, placements,
-chunk offsets, and Megatron attributes (TP partition, QKV, M-FSDP name).
+chunk offsets, and Megatron-FSDP attributes (M-FSDP name, QKV flag).
 
 Optimizer-agnostic: works with any PyTorch optimizer whose params are
 DTensors managed by Megatron-FSDP.
@@ -60,8 +60,7 @@ def dump_optimizer_parameters(
     # Group hyperparameters (lr, betas, weight_decay, ...) are intentionally
     # not recorded — callers that care should pass them via `extra_meta`.
     groups = [
-        {"params": [_dump_param(p, optimizer.state.get(p, {})) for p in group["params"]]}
-        for group in optimizer.param_groups
+        {"params": [_dump_param(p) for p in group["params"]]} for group in optimizer.param_groups
     ]
     spec: dict[str, Any] = {"world_size": world_size, "rank": rank, "groups": groups}
     if extra_meta is not None:
@@ -79,34 +78,21 @@ def dump_optimizer_parameters(
         logger.info("Optimizer inputs dumped to %s (and rank-N siblings)", rank_out)
 
 
-def _dump_param(p: DTensor, state: dict[str, Any]) -> dict[str, Any]:
+def _dump_param(p: DTensor) -> dict[str, Any]:
     """Convert one optimizer param to a JSON-serializable dict."""
     local = p.to_local()
     mesh = p.device_mesh
-    info: dict[str, Any] = {
+    return {
         "name": _param_name(p),
         "global_shape": tuple(int(s) for s in p.shape),
         "dtype": str(p.dtype),
         "is_qkv": _is_qkv(p),
-        "partition_dim": getattr(p, "partition_dim", None),
-        "tensor_model_parallel": getattr(p, "tensor_model_parallel", None),
         "local_shape": tuple(int(s) for s in local.shape),
         "local_offsets": _local_offsets(local),
         "mesh_shape": tuple(int(s) for s in mesh.shape),
         "mesh_dim_names": list(mesh.mesh_dim_names) if mesh.mesh_dim_names else None,
         "placements": [repr(pl) for pl in p.placements],
     }
-
-    mom = state.get("momentum_buffer")
-    if mom is not None:
-        info["momentum_dtype"] = str(mom.dtype)
-        mom_local = mom.to_local() if isinstance(mom, DTensor) else mom
-        info["momentum_local_shape"] = tuple(int(s) for s in mom_local.shape)
-    else:
-        info["momentum_dtype"] = None
-        info["momentum_local_shape"] = None
-
-    return info
 
 
 def _param_name(p: torch.Tensor) -> str | None:
