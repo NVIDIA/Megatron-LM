@@ -390,6 +390,13 @@ class MTPLossLoggingHelper:
         if "values" not in tracker:
             return
         values = tracker["values"]
+        # MTP loss split: each loss stage only filled the per-layer entries it owns. Sum across
+        # the loss group so every loss stage (including the logging stage) holds all per-layer
+        # MTP losses. Only loss-group members reach here (others have no tracker values), so this
+        # collective is symmetric. No-op for the default single-loss-stage case (group size 1).
+        loss_group = parallel_state.get_loss_group(check_initialized=False)
+        if loss_group is not None and torch.distributed.get_world_size(loss_group) > 1:
+            torch.distributed.all_reduce(values, group=loss_group)
         # Reduce mtp losses across ranks.
         if tracker.get('reduce_group') is not None:
             torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))

@@ -275,6 +275,45 @@ def _allreduce_position_embedding_grads(
     )
 
 
+def _allreduce_output_layer_grads_across_loss_group(
+    model: List[torch.nn.Module], config: TransformerConfig
+):
+    """All-reduce output_layer grads across the loss group (MTP loss split).
+
+    When the loss is split across multiple pipeline stages (see specs/mtp_loss_split.md), every
+    loss stage holds a replica of the output_layer and computes loss only for its share of the
+    MTP/main chunks. Summing their gradients across the loss group reconstructs the gradient the
+    single (un-split) output_layer would have received, keeping the replicas identical after the
+    optimizer step.
+    """
+    loss_group = parallel_state.get_loss_group(check_initialized=False)
+    if loss_group is None or get_pg_size(loss_group) <= 1:
+        return
+    if torch.distributed.get_rank() not in torch.distributed.get_process_group_ranks(loss_group):
+        return
+
+    for model_chunk in model:
+        ddp_config = model_chunk.ddp_config
+        # Unwrap DDP/Float16 wrappers via an attribute present on every GPTModel chunk.
+        model_module = get_attr_wrapped_model(model_chunk, 'pre_process', return_model_obj=True)
+        if not getattr(model_module, 'is_loss_stage', False):
+            continue
+        output_layer = getattr(model_module, 'output_layer', None)
+        weight = getattr(output_layer, 'weight', None) if output_layer is not None else None
+        if weight is None:
+            continue
+
+        grad_attr = _get_main_grad_attr(weight)
+        orig_grad = getattr(weight, grad_attr)
+        if ddp_config.use_megatron_fsdp:
+            orig_grad = orig_grad._local_tensor if orig_grad is not None else None
+        grad = _unshard_if_dtensor(orig_grad)
+        if grad is None:
+            continue
+        torch.distributed.all_reduce(grad, group=loss_group)
+        setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
+
+
 def _allreduce_router_grads(model: List[torch.nn.Module], config: TransformerConfig):
     """
     All-reduce router grads.
@@ -522,6 +561,10 @@ def finalize_model_grads(
         )
     _allreduce_word_embedding_grads(model, config, embd_group, pp_group)
     _allreduce_position_embedding_grads(model, config, pos_emb_group, pp_group)
+
+    # All-reduce output_layer grads across the loss group (MTP loss split): keep the replicated
+    # output_layer on each loss stage in sync.
+    _allreduce_output_layer_grads_across_loss_group(model, config)
 
     if config.timers is not None:
         config.timers('embedding-grads-all-reduce').stop()

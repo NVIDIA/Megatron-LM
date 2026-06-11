@@ -333,6 +333,10 @@ class GPTModel(LanguageModule):
         if not self.is_final_loss_stage:
             with torch.no_grad():
                 weight.data.zero_()
+            # Mark the non-final replica as shared so grad-norm / param-norm count this logical
+            # weight only once (on the final loss stage), mirroring tied word-embedding handling.
+            # The gradient itself is still synced across the loss group and updated on every copy.
+            weight.shared = True
         weight.data = weight.data.cuda()
         torch.distributed.all_reduce(weight.data, group=loss_group)
 
