@@ -55,10 +55,7 @@ def test_resolve_workload_local_image_sources_uses_build_source_image():
 
     assert len(sources) == 1
     assert sources[0].build == "mcore-pyt-dev"
-    assert (
-        sources[0].source_image
-        == "gitlab-master.nvidia.com/adlr/megatron-lm/mcore_ci_dev:12345"
-    )
+    assert sources[0].source_image == "gitlab-master.nvidia.com/adlr/megatron-lm/mcore_ci_dev:12345"
     assert sources[0].local_path == "/lustre/enroot/mcore-pyt-dev-dgx_h100-12345.sqsh"
 
 

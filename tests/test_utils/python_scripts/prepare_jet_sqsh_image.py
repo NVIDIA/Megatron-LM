@@ -54,10 +54,7 @@ def submit_prepare_workload(
     partition: Optional[str],
     time_limit: int,
 ) -> jetclient.JETPipeline:
-    cluster_config = {
-        "account": account,
-        "srun_additional_flags": {"container_save": local_path},
-    }
+    cluster_config = {"account": account, "srun_additional_flags": {"container_save": local_path}}
     if partition is not None:
         cluster_config["partition"] = partition
 
@@ -70,9 +67,7 @@ def submit_prepare_workload(
                 workloads=[
                     jetclient.JETWorkloadManifest(
                         **build_prepare_workload(
-                            source_image=source_image,
-                            local_path=local_path,
-                            time_limit=time_limit,
+                            source_image=source_image, local_path=local_path, time_limit=time_limit
                         )
                     )
                 ],
