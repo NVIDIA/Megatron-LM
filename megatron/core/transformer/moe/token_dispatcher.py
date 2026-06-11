@@ -1186,7 +1186,10 @@ class _HybridEPManager(_DispatchManager):
             self.tokens_per_expert = tokens_per_expert.to(torch.int64)
             # num_permuted_tokens is necessary to allocate the output tensor for combine.
             self.num_permuted_tokens = self.tokens_per_expert.sum()
-        if self.moe_expert_rank_capacity_factor is not None:
+        if (
+            self.moe_expert_rank_capacity_factor is not None
+            or self.config.cuda_graph_impl == "full_iteration"
+        ):
             self.tokens_per_expert = tokens_per_expert.to(torch.int64)
         return dispatched_hidden
 
