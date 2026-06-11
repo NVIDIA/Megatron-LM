@@ -671,6 +671,30 @@ if HAVE_TE:
 
         return fp8_context
 
+    def get_fp8_disabled_context(config: TransformerConfig, is_init: bool = False):
+        """Return a context manager that forces high-precision execution.
+
+        Use this around the construction or forward pass of submodules that must stay in
+        high precision (BF16/FP32) while the enclosing layer is built or run under an
+        FP8/FP4 quantization context (e.g. the DeepSeek V4 CSA compressor and indexer).
+
+        Arguments:
+            config (TransformerConfig): Configuration object.
+            is_init (bool): Whether the context is used for module initialization
+                (overrides fp8_model_init) or for the forward pass (overrides fp8_autocast).
+
+        Returns:
+            A context manager that disables any enclosing TE quantization context, or
+            nullcontext() when no quantization is configured.
+        """
+        if is_init:
+            if not (config.fp8_param or config.fp4_param):
+                return nullcontext()
+            return transformer_engine.pytorch.fp8_model_init(enabled=False)
+        if not (config.fp8 or config.fp4):
+            return nullcontext()
+        return transformer_engine.pytorch.fp8_autocast(enabled=False)
+
 else:
 
     def get_fp8_recipe(config: TransformerConfig):
@@ -679,6 +703,10 @@ else:
 
     def get_fp8_context(config: TransformerConfig, layer_no: int = -1, is_init: bool = False):
         """Returns dummy fp8 context manager since TE is not available."""
+        return nullcontext()
+
+    def get_fp8_disabled_context(config: TransformerConfig, is_init: bool = False):
+        """Returns dummy context manager since TE is not available."""
         return nullcontext()
 
 
