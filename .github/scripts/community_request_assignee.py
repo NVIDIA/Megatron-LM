@@ -70,6 +70,7 @@ class AssignmentPlan:
     relevant_paths: list[str]
     issue_type: str = "unknown"
     context: str = ""
+    assignment_source: str = "claude"
     rejected_candidate: str | None = None
     rejected_candidate_confidence: float | None = None
     rejected_candidate_reason: str = ""
@@ -219,7 +220,9 @@ def analysis_slack_context(analysis: dict) -> str:
 
 
 def analysis_potential_assignee(analysis: dict) -> str | None:
-    return normalize_login(analysis.get("potential_assignee")) or normalize_login(analysis.get("assignee"))
+    return normalize_login(analysis.get("potential_assignee")) or normalize_login(
+        analysis.get("assignee")
+    )
 
 
 def analysis_potential_assignee_reason(analysis: dict) -> str:
@@ -227,6 +230,28 @@ def analysis_potential_assignee_reason(analysis: dict) -> str:
     if not isinstance(reason, str):
         return ""
     return reason.strip()
+
+
+def apply_requested_assignee_override(analysis: dict) -> dict:
+    requested_assignee = normalize_login(os.environ.get("REQUESTED_ASSIGNEE"))
+    if not requested_assignee:
+        return analysis
+
+    overridden = dict(analysis)
+    manual_note = "Assignee was requested explicitly by /claude assign."
+    rationale = analysis.get("rationale", "")
+    if isinstance(rationale, str) and rationale.strip():
+        overridden["rationale"] = f"{manual_note} {rationale.strip()}"
+    else:
+        overridden["rationale"] = manual_note
+
+    overridden["assignee"] = requested_assignee
+    overridden["potential_assignee"] = requested_assignee
+    overridden["potential_assignee_reason"] = manual_note
+    overridden["confidence"] = 1.0
+    overridden["fallback_to_oncall"] = False
+    overridden["_requested_assignee"] = requested_assignee
+    return overridden
 
 
 def check_assignable(issue: IssueContext, login: str) -> bool:
@@ -281,17 +306,24 @@ def candidate_rejection_reason(analysis: dict, candidate: str, allowed_assignees
     if bool(analysis.get("fallback_to_oncall", False)):
         return "the analysis requested on-call fallback"
 
-    return analysis_potential_assignee_reason(analysis) or "the analysis did not select them for assignment"
+    return (
+        analysis_potential_assignee_reason(analysis)
+        or "the analysis did not select them for assignment"
+    )
 
 
-def select_candidate_assignee(analysis: dict, issue: IssueContext, allowed_assignees: set[str]) -> CandidateDecision:
+def select_candidate_assignee(
+    analysis: dict, issue: IssueContext, allowed_assignees: set[str]
+) -> CandidateDecision:
     potential_candidate = analysis_potential_assignee(analysis)
     if bool(analysis.get("fallback_to_oncall", False)):
         if potential_candidate:
             return CandidateDecision(
                 assignee=None,
                 rejected_candidate=potential_candidate,
-                rejected_reason=candidate_rejection_reason(analysis, potential_candidate, allowed_assignees),
+                rejected_reason=candidate_rejection_reason(
+                    analysis, potential_candidate, allowed_assignees
+                ),
             )
         return CandidateDecision(assignee=None)
 
@@ -301,7 +333,9 @@ def select_candidate_assignee(analysis: dict, issue: IssueContext, allowed_assig
             return CandidateDecision(
                 assignee=None,
                 rejected_candidate=potential_candidate,
-                rejected_reason=candidate_rejection_reason(analysis, potential_candidate, allowed_assignees),
+                rejected_reason=candidate_rejection_reason(
+                    analysis, potential_candidate, allowed_assignees
+                ),
             )
         return CandidateDecision(assignee=None)
 
@@ -358,6 +392,7 @@ def create_assignment_plan(analysis: dict, issue: IssueContext) -> AssignmentPla
     relevant_paths = analysis_relevant_paths(analysis)
     issue_type = analysis_issue_type(analysis)
     context = analysis_slack_context(analysis)
+    assignment_source = "manual" if analysis.get("_requested_assignee") else "claude"
     allowed_assignees = get_allowed_assignees(issue.owner)
     candidate_decision = select_candidate_assignee(analysis, issue, allowed_assignees)
 
@@ -371,19 +406,25 @@ def create_assignment_plan(analysis: dict, issue: IssueContext) -> AssignmentPla
             relevant_paths=relevant_paths,
             issue_type=issue_type,
             context=context,
+            assignment_source=assignment_source,
         )
 
-    candidate_login = normalize_login(analysis.get("assignee")) or analysis_potential_assignee(analysis)
+    candidate_login = normalize_login(analysis.get("assignee")) or analysis_potential_assignee(
+        analysis
+    )
     if candidate_login:
         print(
             f"Falling back to {ACTIVE_ONCALL_TEAM_SLUG}; candidate was "
             f"{candidate_login} with confidence {confidence:.2f}"
         )
     else:
-        print(f"Falling back to {ACTIVE_ONCALL_TEAM_SLUG}; Claude did not provide a usable candidate")
+        print(
+            f"Falling back to {ACTIVE_ONCALL_TEAM_SLUG}; Claude did not provide a usable candidate"
+        )
 
     oncall_members = [
-        member for member in human_members(get_team_members(issue.owner, ACTIVE_ONCALL_TEAM_SLUG))
+        member
+        for member in human_members(get_team_members(issue.owner, ACTIVE_ONCALL_TEAM_SLUG))
         if member in allowed_assignees
     ]
     assignable_oncall = [member for member in oncall_members if check_assignable(issue, member)]
@@ -397,6 +438,7 @@ def create_assignment_plan(analysis: dict, issue: IssueContext) -> AssignmentPla
         relevant_paths=relevant_paths,
         issue_type=issue_type,
         context=context,
+        assignment_source=assignment_source,
         rejected_candidate=candidate_decision.rejected_candidate,
         rejected_candidate_confidence=confidence if candidate_decision.rejected_candidate else None,
         rejected_candidate_reason=candidate_decision.rejected_reason,
@@ -495,14 +537,22 @@ def build_slack_message(issue: IssueContext, plan: AssignmentPlan) -> str:
         if plan.rejected_candidate_confidence is not None:
             rejected_candidate_context += f" (confidence: {plan.rejected_candidate_confidence:.2f})"
         if plan.rejected_candidate_reason:
-            rejected_candidate_context += f". Not assigned because {plan.rejected_candidate_reason}."
+            rejected_candidate_context += (
+                f". Not assigned because {plan.rejected_candidate_reason}."
+            )
         rejected_candidate_context += "\n"
 
     oncall_mention = f"<!subteam^{MCORE_ONCALL_SLACK_USERGROUP_ID}|mcore-oncall>"
     if plan.mode == "candidate":
+        assignment_sentence = (
+            "I determined that you are the best individual to answer this community issue."
+        )
+        if plan.assignment_source == "manual":
+            assignment_sentence = "I was asked to assign this community issue to you."
+
         return (
             f"I (Megatron Issue Bot) have assigned you to the newly created community issue: <{issue.url}|{issue.url}>.\n\n"
-            "I determined that you are the best individual to answer this community issue.\n\n"
+            f"{assignment_sentence}\n\n"
             f"Context from my analysis:\n{context}\n\n"
             "Please take action at your earliest convenience, at latest within 1 business day. "
             "If I made a mistake or if you are unsure how to proceed, please reach out to "
@@ -522,7 +572,9 @@ def build_slack_message(issue: IssueContext, plan: AssignmentPlan) -> str:
     )
 
 
-def send_slack_notifications(issue: IssueContext, plan: AssignmentPlan, dry_run: bool, require_slack: bool) -> None:
+def send_slack_notifications(
+    issue: IssueContext, plan: AssignmentPlan, dry_run: bool, require_slack: bool
+) -> None:
     if not plan.notify_users:
         print("No users to notify in Slack")
         if require_slack:
@@ -549,7 +601,9 @@ def send_slack_notifications(issue: IssueContext, plan: AssignmentPlan, dry_run:
 
         conversation = slack_client.conversations_open(users=slack_user_id)
         channel_id = conversation["channel"]["id"]
-        slack_client.chat_postMessage(channel=channel_id, text=message, unfurl_links=False, unfurl_media=False)
+        slack_client.chat_postMessage(
+            channel=channel_id, text=message, unfurl_links=False, unfurl_media=False
+        )
 
     if missing_users:
         print("Could not send Slack notifications to: " + ", ".join(missing_users))
@@ -559,7 +613,7 @@ def send_slack_notifications(issue: IssueContext, plan: AssignmentPlan, dry_run:
 
 def run(dry_run: bool = False, require_slack: bool = True) -> AssignmentPlan:
     issue = get_issue_context()
-    analysis = parse_analysis(get_required_env("ANALYSIS_JSON"))
+    analysis = apply_requested_assignee_override(parse_analysis(get_required_env("ANALYSIS_JSON")))
     plan = create_assignment_plan(analysis, issue)
 
     assign_issue(issue, plan.assignees, dry_run=dry_run)
@@ -569,8 +623,12 @@ def run(dry_run: bool = False, require_slack: bool = True) -> AssignmentPlan:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Assign and notify owners for community-request issues")
-    parser.add_argument("--dry-run", action="store_true", help="Print actions without writing to GitHub or Slack")
+    parser = argparse.ArgumentParser(
+        description="Assign and notify owners for community-request issues"
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Print actions without writing to GitHub or Slack"
+    )
     parser.add_argument(
         "--allow-missing-slack",
         action="store_true",

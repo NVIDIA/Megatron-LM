@@ -108,6 +108,38 @@ def test_create_assignment_plan_accepts_topic_mapped_other_candidate(monkeypatch
     assert plan.issue_type == "other"
 
 
+def test_requested_assignee_override_uses_manual_candidate(monkeypatch):
+    module = load_assignee_module()
+    issue = make_issue(module, number=130, title="Manual assignment")
+
+    monkeypatch.setenv("REQUESTED_ASSIGNEE", "@bob")
+    monkeypatch.setattr(module, "check_assignable", lambda issue, login: True)
+    monkeypatch.setattr(
+        module,
+        "get_team_members",
+        lambda org, team_slug: (
+            {"alice", "bob"} if team_slug == module.ASSIGNEE_ALLOWED_TEAM_SLUG else set()
+        ),
+    )
+
+    analysis = module.apply_requested_assignee_override(
+        make_analysis(
+            assignee="alice",
+            confidence=0.20,
+            fallback_to_oncall=True,
+            rationale="Claude was unsure who should own this.",
+        )
+    )
+    plan = module.create_assignment_plan(analysis, issue)
+
+    assert plan.mode == "candidate"
+    assert plan.assignees == ["bob"]
+    assert plan.notify_users == ["bob"]
+    assert plan.confidence == 1.0
+    assert plan.assignment_source == "manual"
+    assert plan.rationale.startswith("Assignee was requested explicitly by /claude assign.")
+
+
 def test_create_assignment_plan_rejects_non_engineer_candidate(monkeypatch):
     module = load_assignee_module()
     issue = make_issue(module, number=124, title="Feature request")
@@ -227,6 +259,27 @@ def test_build_slack_message_includes_candidate_context():
         in message
     )
     assert "<!subteam^S0A7B4U1T3P|mcore-oncall>" in message
+
+
+def test_build_slack_message_uses_manual_assignment_wording():
+    module = load_assignee_module()
+    issue = make_issue(module, number=131, title="Manual assignment")
+    plan = module.AssignmentPlan(
+        mode="candidate",
+        assignees=["bob"],
+        notify_users=["bob"],
+        confidence=1.0,
+        rationale="Assignee was requested explicitly by /claude assign.",
+        relevant_paths=[],
+        issue_type="other",
+        context="The issue was manually assigned for follow-up.",
+        assignment_source="manual",
+    )
+
+    message = module.build_slack_message(issue, plan)
+
+    assert "I was asked to assign this community issue to you." in message
+    assert "I determined that you are the best individual" not in message
 
 
 def test_build_slack_message_includes_oncall_uncertainty_context():
