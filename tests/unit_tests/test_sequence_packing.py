@@ -17,6 +17,18 @@ from megatron.training.global_vars import unset_global_variables
 from tests.unit_tests.test_utilities import Utils
 
 
+class _MockCPGroup:
+    def __init__(self, size, rank):
+        self._size = size
+        self._rank = rank
+
+    def size(self):
+        return self._size
+
+    def rank(self):
+        return self._rank
+
+
 class MockVariableLengthSequencePackingDataIterator:
     """
     Mock data iterator for testing get_batch_on_this_rank_for_sequence_packing.
@@ -108,6 +120,37 @@ class MockVariableLengthSequencePackingDataIterator:
             )
 
         return batch
+
+
+def test_dsv4_thd_cp_slice_uses_static_partition_total():
+    from megatron.core.datasets.data_schedule_utils import get_cp_slice_for_thd
+    from megatron.core.transformer.experimental_attention_variant.csa_cp_utils import (
+        DSV4_CP_PARTITION_CONTIGUOUS,
+    )
+
+    batch = {
+        "tokens": torch.arange(8, dtype=torch.int64),
+        "position_ids": torch.arange(8, dtype=torch.int64),
+        "labels": torch.arange(100, 108, dtype=torch.int64),
+        "loss_mask": torch.ones(8, dtype=torch.float32),
+        "cu_seqlens": torch.tensor([0, 8], dtype=torch.int32),
+        "cu_seqlens_padded": torch.tensor([0, 8], dtype=torch.int32),
+        "max_seqlen": torch.tensor([8], dtype=torch.int32),
+    }
+
+    get_cp_slice_for_thd(
+        batch,
+        _MockCPGroup(size=4, rank=2),
+        csa_cp_partition_mode=DSV4_CP_PARTITION_CONTIGUOUS,
+        partition_total_tokens=16,
+    )
+
+    assert torch.equal(batch["tokens"], torch.zeros(4, dtype=torch.int64))
+    assert torch.equal(batch["position_ids"], torch.zeros(4, dtype=torch.int64))
+    assert torch.equal(batch["labels"], torch.zeros(4, dtype=torch.int64))
+    assert torch.equal(batch["loss_mask"], torch.zeros(4, dtype=torch.float32))
+    assert torch.equal(batch["cu_seqlens"], torch.tensor([0, 8], dtype=torch.int32))
+    assert torch.equal(batch["cu_seqlens_padded"], torch.tensor([0, 8], dtype=torch.int32))
 
 
 def _gather_tensor_from_tp_group(tensor):

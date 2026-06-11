@@ -842,20 +842,63 @@ if _CUTE_AVAILABLE:
         )
 
     # Kernel contract:
-    #   rank_major: compressed rows in rank-major order, shape (rows, row_width).
+    #   rank_by_seq_major: int32 output reverse map, shape (total_seq_major_rows,).
+    #   Initializes the reverse map before the deterministic rank-map build.
+    @cute.kernel
+    def _repack_compressed_kv_init_rank_map_kernel(
+        rank_major_by_seq_major: cute.Tensor,
+        seq_major_rows: cutlass.Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        linear = bidx * 128 + tidx
+        if linear < seq_major_rows:
+            rank_major_by_seq_major[linear] = -1
+
+    # Kernel contract:
     #   seq_ids/comp_ids/valid: rank-major metadata, shape (rows,).
     #   cu_compressed: int32 compressed sequence prefixes, shape (n_seq + 1,).
-    #   out: seq-major compressed rows, shape (total_seq_major_rows, row_width).
     #   rank_by_seq_major: int32 output reverse map, shape (total_seq_major_rows,).
-    #   Copies each valid rank-major row into seq-major position
-    #   cu_compressed[seq_id] + comp_id and records the reverse map.
+    #   Builds a deterministic seq-major -> rank-major map. Multiple rank-major
+    #   candidates can describe the same compressed group near CP chunk
+    #   boundaries, so the kernel selects the greatest rank-major row with
+    #   atomic max instead of racing concurrent value writes.
     @cute.kernel
-    def _repack_compressed_kv_to_seq_major_kernel(
-        compressed_rank_major: cute.Tensor,
+    def _repack_compressed_kv_rank_map_kernel(
         seq_ids_rank_major: cute.Tensor,
         comp_ids_rank_major: cute.Tensor,
         valid_rank_major: cute.Tensor,
         cu_seqlens_compressed: cute.Tensor,
+        rank_major_by_seq_major: cute.Tensor,
+        rank_major_rows: cutlass.Int32,
+        seq_major_rows: cutlass.Int32,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        bidx, _, _ = cute.arch.block_idx()
+        rank_row = bidx * 128 + tidx
+        if rank_row < rank_major_rows and valid_rank_major[rank_row] == 1:
+            seq = seq_ids_rank_major[rank_row]
+            comp = comp_ids_rank_major[rank_row]
+            seq_major = cu_seqlens_compressed[seq] + comp
+            if seq_major >= 0 and seq_major < seq_major_rows:
+                rank_map_ptr = rank_major_by_seq_major.iterator + seq_major
+                cute.arch.atomic_max(
+                    rank_map_ptr.llvm_ptr,
+                    rank_row,
+                    sem="relaxed",
+                    scope="gpu",
+                )
+
+    # Kernel contract:
+    #   rank_major: compressed rows in rank-major order, shape (rows, row_width).
+    #   rank_by_seq_major: deterministic reverse map built by
+    #   _repack_compressed_kv_rank_map_kernel.
+    #   out: seq-major compressed rows, shape (total_seq_major_rows, row_width).
+    #   Gathers selected rank-major rows into seq-major order and zero-fills
+    #   rows with no valid compressed group.
+    @cute.kernel
+    def _repack_compressed_kv_to_seq_major_kernel(
+        compressed_rank_major: cute.Tensor,
         compressed_seq_major: cute.Tensor,
         rank_major_by_seq_major: cute.Tensor,
         rank_major_rows: cutlass.Int32,
@@ -870,33 +913,64 @@ if _CUTE_AVAILABLE:
         if linear < seq_major_rows * row_width:
             row = linear // row_width
             col = linear - row * row_width
-            compressed_seq_major[row, col] = cutlass.Float32(0.0).to(
-                compressed_seq_major.element_type
-            )
-        if linear < seq_major_rows:
-            rank_major_by_seq_major[linear] = -1
+            rank_row = rank_major_by_seq_major[row]
+            value = cutlass.Float32(0.0).to(compressed_seq_major.element_type)
+            if rank_row >= 0 and rank_row < rank_major_rows:
+                value = compressed_rank_major[rank_row, col]
+            compressed_seq_major[row, col] = value
 
-        if linear < rank_major_rows * row_width:
-            rank_row = linear // row_width
-            col = linear - rank_row * row_width
-            if valid_rank_major[rank_row] == 1:
-                seq = seq_ids_rank_major[rank_row]
-                comp = comp_ids_rank_major[rank_row]
-                seq_major = cu_seqlens_compressed[seq] + comp
-                if seq_major >= 0 and seq_major < seq_major_rows:
-                    compressed_seq_major[seq_major, col] = compressed_rank_major[rank_row, col]
-                    if col == 0:
-                        rank_major_by_seq_major[seq_major] = rank_row
-
-    # Launch contract for _repack_compressed_kv_to_seq_major_kernel.
-    #   total_work is rank-major rows * row_width.
+    # Launch contract for _repack_compressed_kv_init_rank_map_kernel.
+    #   launch_work is seq-major rows.
     @cute.jit
-    def _repack_compressed_kv_to_seq_major_launch(
-        compressed_rank_major: cute.Tensor,
+    def _repack_compressed_kv_init_rank_map_launch(
+        rank_major_by_seq_major: cute.Tensor,
+        seq_major_rows: cutlass.Int32,
+        launch_work: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        _launch_1d(
+            _repack_compressed_kv_init_rank_map_kernel,
+            "dsv4_cp_repack_compressed_kv_init_rank_map",
+            (rank_major_by_seq_major, seq_major_rows),
+            launch_work,
+            stream,
+        )
+
+    # Launch contract for _repack_compressed_kv_rank_map_kernel.
+    #   launch_work is rank-major rows.
+    @cute.jit
+    def _repack_compressed_kv_rank_map_launch(
         seq_ids_rank_major: cute.Tensor,
         comp_ids_rank_major: cute.Tensor,
         valid_rank_major: cute.Tensor,
         cu_seqlens_compressed: cute.Tensor,
+        rank_major_by_seq_major: cute.Tensor,
+        rank_major_rows: cutlass.Int32,
+        seq_major_rows: cutlass.Int32,
+        launch_work: cutlass.Int32,
+        stream: cuda.CUstream,
+    ):
+        _launch_1d(
+            _repack_compressed_kv_rank_map_kernel,
+            "dsv4_cp_repack_compressed_kv_rank_map",
+            (
+                seq_ids_rank_major,
+                comp_ids_rank_major,
+                valid_rank_major,
+                cu_seqlens_compressed,
+                rank_major_by_seq_major,
+                rank_major_rows,
+                seq_major_rows,
+            ),
+            launch_work,
+            stream,
+        )
+
+    # Launch contract for _repack_compressed_kv_to_seq_major_kernel.
+    #   total_work is seq-major rows * row_width.
+    @cute.jit
+    def _repack_compressed_kv_to_seq_major_launch(
+        compressed_rank_major: cute.Tensor,
         compressed_seq_major: cute.Tensor,
         rank_major_by_seq_major: cute.Tensor,
         rank_major_rows: cutlass.Int32,
@@ -910,10 +984,6 @@ if _CUTE_AVAILABLE:
             "dsv4_cp_repack_compressed_kv_to_seq_major",
             (
                 compressed_rank_major,
-                seq_ids_rank_major,
-                comp_ids_rank_major,
-                valid_rank_major,
-                cu_seqlens_compressed,
                 compressed_seq_major,
                 rank_major_by_seq_major,
                 rank_major_rows,
@@ -956,52 +1026,57 @@ if _CUTE_AVAILABLE:
             rank_slot = row - rank * c_cap_per_rank
             slot = rank_slot
             rank_start = rank * chunk_len
+            row_is_padding = False
             if two_chunk != 0:
                 local_chunk = rank_slot // c_cap_per_chunk
-                slot = rank_slot - local_chunk * c_cap_per_chunk
-                chunk_id = rank
-                if local_chunk != 0:
-                    chunk_id = cp_size * 2 - 1 - rank
-                rank_start = chunk_id * chunk_len
+                if local_chunk >= 2:
+                    row_is_padding = True
+                else:
+                    slot = rank_slot - local_chunk * c_cap_per_chunk
+                    chunk_id = rank
+                    if local_chunk != 0:
+                        chunk_id = cp_size * 2 - 1 - rank
+                    rank_start = chunk_id * chunk_len
             rank_end = rank_start + chunk_len
 
             seq_ids[row] = -1
             comp_ids[row] = -1
             valid[row] = False
 
-            running = 0
-            for seq in range(n_seq):
-                seq_start = cu_seqlens[seq]
-                seq_end = cu_seqlens[seq + 1]
-                local_seq_start = seq_start
-                if local_seq_start < rank_start:
-                    local_seq_start = rank_start
-                local_seq_end = seq_end
-                if local_seq_end > rank_end:
-                    local_seq_end = rank_end
+            if not row_is_padding:
+                running = 0
+                for seq in range(n_seq):
+                    seq_start = cu_seqlens[seq]
+                    seq_end = cu_seqlens[seq + 1]
+                    local_seq_start = seq_start
+                    if local_seq_start < rank_start:
+                        local_seq_start = rank_start
+                    local_seq_end = seq_end
+                    if local_seq_end > rank_end:
+                        local_seq_end = rank_end
 
-                if local_seq_start < local_seq_end:
-                    n_full_groups = (seq_end - seq_start) // ratio
-                    first_numer = rank_start - d_comp - seq_start
-                    if first_numer < 0:
-                        first_numer = 0
-                    first_group = 0
-                    if first_numer > 0:
-                        first_group = (first_numer + ratio - 1) // ratio
-                    stop_group = (local_seq_end - seq_start) // ratio
-                    if stop_group > n_full_groups:
-                        stop_group = n_full_groups
-                    group_count = stop_group - first_group
-                    if group_count < 0:
-                        group_count = 0
+                    if local_seq_start < local_seq_end:
+                        n_full_groups = (seq_end - seq_start) // ratio
+                        first_numer = rank_start - d_comp - seq_start
+                        if first_numer < 0:
+                            first_numer = 0
+                        first_group = 0
+                        if first_numer > 0:
+                            first_group = (first_numer + ratio - 1) // ratio
+                        stop_group = (local_seq_end - seq_start) // ratio
+                        if stop_group > n_full_groups:
+                            stop_group = n_full_groups
+                        group_count = stop_group - first_group
+                        if group_count < 0:
+                            group_count = 0
 
-                    if slot >= running and slot < running + group_count:
-                        comp_id = first_group + slot - running
-                        group_end = seq_start + (comp_id + 1) * ratio
-                        seq_ids[row] = seq
-                        comp_ids[row] = comp_id
-                        valid[row] = group_end - 1 >= rank_start and group_end - 1 < rank_end
-                    running = running + group_count
+                        if slot >= running and slot < running + group_count:
+                            comp_id = first_group + slot - running
+                            group_end = seq_start + (comp_id + 1) * ratio
+                            seq_ids[row] = seq
+                            comp_ids[row] = comp_id
+                            valid[row] = group_end - 1 >= rank_start and group_end - 1 < rank_end
+                        running = running + group_count
 
     # Launch contract for _build_compressed_row_metadata_kernel.
     #   two_chunk selects one contiguous chunk per rank or two chunks
@@ -1312,6 +1387,13 @@ if _CUTE_AVAILABLE:
                         topk_value = seq_offset + window_start_for_q - seq_window_start + col
                     elif col < length:
                         topk_value = seq_offset + seq_window_len + col - window_count
+                elif total_width > 0:
+                    # Fused DSA sparse attention expects at least one KV id per
+                    # query row. Padded THD rows carry zero loss gradient, so a
+                    # dummy in-range id is enough to keep the kernel contract.
+                    length = 1
+                    if col == 0:
+                        topk_value = 0
 
                 topk_idxs[row, col] = topk_value
                 if col == 0:
@@ -1434,6 +1516,10 @@ if _CUTE_AVAILABLE:
                                 topk_idxs[row, write_col] = seq_offset + seq_window_len + comp_id
                                 write_col = write_col + 1
                 topk_length[row] = write_col
+            elif total_width > 0:
+                # Same padding-row contract as the parallel dense path above.
+                topk_idxs[row, 0] = 0
+                topk_length[row] = 1
 
     # Launch contract for _build_attention_indices_kernel.
     #   Supports contiguous and two-chunk CP. total_work is
@@ -2441,19 +2527,32 @@ def repack_compressed_kv_to_seq_major(
     )
     rank_major_rows = compressed_rank_major.shape[0]
     row_width = math.prod(compressed_rank_major.shape[1:])
-    total_work = max(seq_major_rows * row_width, rank_major_rows * row_width, seq_major_rows)
+    map_work = int(rank_major_rows)
+    gather_work = int(seq_major_rows) * int(row_width)
     _run_compiled_launch(
-        _repack_compressed_kv_to_seq_major_launch,
+        _repack_compressed_kv_init_rank_map_launch,
+        (rank_major_by_seq_major,),
+        (seq_major_rows, max(1, seq_major_rows)),
+    )
+    _run_compiled_launch(
+        _repack_compressed_kv_rank_map_launch,
         (
-            compressed_rank_major.reshape(rank_major_rows, row_width),
             seq_ids_rank_major,
             comp_ids_rank_major,
             valid_rank_major,
             cu_seqlens_compressed,
+            rank_major_by_seq_major,
+        ),
+        (rank_major_rows, seq_major_rows, max(1, map_work)),
+    )
+    _run_compiled_launch(
+        _repack_compressed_kv_to_seq_major_launch,
+        (
+            compressed_rank_major.reshape(rank_major_rows, row_width),
             compressed_seq_major.reshape(seq_major_rows, row_width),
             rank_major_by_seq_major,
         ),
-        (rank_major_rows, seq_major_rows, row_width, total_work),
+        (rank_major_rows, seq_major_rows, row_width, max(1, gather_work)),
         key_arg_indices=(2,),
         static_arg_indices=(2,),
     )

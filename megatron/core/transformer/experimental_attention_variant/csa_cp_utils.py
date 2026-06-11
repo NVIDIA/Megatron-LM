@@ -7,6 +7,7 @@ communication, fixed-shape collectives, and the typed wrappers used by CSA/DSv4
 attention modules.
 """
 
+import math
 from typing import Optional, Sequence, Tuple
 
 import torch
@@ -72,6 +73,51 @@ def local_kv_cp_chunk_ranges(
     d_window = boundary_rows // len(local_ranges)
     boundary_ranges = tuple((int(start) - d_window, int(start)) for start, _ in local_ranges)
     return boundary_ranges + local_ranges
+
+
+def _compressed_group_capacity(rows: int, ratio: int, d_comp: int) -> int:
+    """Return compressed group capacity with row alignment for TE FP8 linear inputs."""
+    c_cap = (int(rows) + int(d_comp)) // int(ratio)
+    group_alignment = 32 // math.gcd(32, int(ratio))
+    return ((c_cap + group_alignment - 1) // group_alignment) * group_alignment
+
+
+def thd_cp_local_row_indices(
+    partition_mode: Optional[str],
+    padded_total_rows: int,
+    cp_size: int,
+    cp_rank: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return global THD row indices selected by this CP rank.
+
+    ``padded_total_rows`` is the final padded packed-token length. The output is
+    an int64 tensor of shape ``(padded_total_rows / cp_size,)``. Its row order is
+    exactly the order expected by ``local_q_cp_chunk_ranges`` for the selected
+    CSA CP partition mode.
+    """
+    padded_total_rows = int(padded_total_rows)
+    cp_size, cp_rank = int(cp_size), int(cp_rank)
+    if padded_total_rows <= 0:
+        raise RuntimeError(f"padded_total_rows must be positive, got {padded_total_rows}.")
+    if cp_size < 1 or cp_rank < 0 or cp_rank >= cp_size:
+        raise RuntimeError(f"Invalid CP rank/size: cp_rank={cp_rank}, cp_size={cp_size}.")
+    if padded_total_rows % cp_size != 0:
+        raise RuntimeError(
+            "DSv4 THD CP partition expects padded_total_rows divisible by cp_size: "
+            f"padded_total_rows={padded_total_rows}, cp_size={cp_size}."
+        )
+
+    local_rows = padded_total_rows // cp_size
+    return torch.cat(
+        [
+            torch.arange(start, end, dtype=torch.long, device=device)
+            for start, end in local_q_cp_chunk_ranges(
+                partition_mode, local_rows=local_rows, cp_size=cp_size, cp_rank=cp_rank
+            )
+        ],
+        dim=0,
+    )
 
 
 def _normalize_row_ranges(
@@ -408,6 +454,7 @@ def build_cp_rank_major_compressed_metadata_fused(
     if len(chunk_ranges) == 2:
         _, chunk_len, _ = _two_chunk_layout(chunk_ranges, "DSv4 two-chunk compressed metadata")
         c_cap_per_chunk = (chunk_len + int(d_comp)) // int(ratio)
+        c_cap_per_rank = _compressed_group_capacity(2 * chunk_len, ratio, 2 * d_comp)
         return csa_cp_kernels.build_compressed_row_metadata(
             cu_seqlens,
             int(cp_size),
@@ -415,11 +462,11 @@ def build_cp_rank_major_compressed_metadata_fused(
             ratio,
             d_comp,
             c_cap_per_chunk,
-            c_cap_per_rank=2 * int(c_cap_per_chunk),
+            c_cap_per_rank=c_cap_per_rank,
             use_two_chunk=True,
         )
     _, _, l_local = _normalize_row_ranges(chunk_ranges, "DSv4 CP compressed metadata")
-    c_cap = (l_local + int(d_comp)) // int(ratio)
+    c_cap = _compressed_group_capacity(l_local, ratio, d_comp)
     return csa_cp_kernels.build_compressed_row_metadata(
         cu_seqlens, int(cp_size), l_local, ratio, d_comp, c_cap
     )
@@ -468,7 +515,11 @@ def build_cp_compressor_prep_compact_fused(
 
     parts = []
     for row_start, rows, boundary_start, global_start in chunk_specs:
-        c_cap = (int(rows) + int(d_comp)) // int(ratio)
+        c_cap = (
+            (int(rows) + int(d_comp)) // int(ratio)
+            if two_chunk
+            else _compressed_group_capacity(rows, ratio, d_comp)
+        )
         parts.append(
             csa_cp_kernels.CompressorInputCompact.apply(
                 hidden_local.narrow(0, row_start, rows),
@@ -485,6 +536,28 @@ def build_cp_compressor_prep_compact_fused(
     if not two_chunk:
         return parts[0]
     hidden_parts, cu_parts, seq_parts, comp_parts, valid_parts = zip(*parts)
+    target_c_cap = _compressed_group_capacity(l_local, ratio, len(chunk_ranges) * d_comp)
+    current_c_cap = sum(part.shape[0] for part in comp_parts)
+    if current_c_cap > target_c_cap:
+        raise RuntimeError(
+            "DSv4 two-chunk compressor-prep produced more groups than its aligned capacity: "
+            f"current={current_c_cap}, capacity={target_c_cap}."
+        )
+    if current_c_cap < target_c_cap:
+        pad_groups = target_c_cap - current_c_cap
+        hidden_pad_rows = pad_groups * int(ratio)
+        hidden_parts = hidden_parts + (
+            hidden_local.new_zeros((hidden_pad_rows,) + tuple(hidden_local.shape[1:])),
+        )
+        seq_parts = seq_parts + (
+            torch.full((pad_groups,), -1, dtype=torch.int32, device=hidden_local.device),
+        )
+        comp_parts = comp_parts + (
+            torch.full((pad_groups,), -1, dtype=torch.int32, device=hidden_local.device),
+        )
+        valid_parts = valid_parts + (
+            torch.zeros((pad_groups,), dtype=torch.bool, device=hidden_local.device),
+        )
     cu_deltas = sum(cu[1:] - cu[:-1] for cu in cu_parts)
     cu_compact = torch.cat(
         (

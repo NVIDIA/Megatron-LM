@@ -29,6 +29,7 @@ from megatron.core.transformer.experimental_attention_variant.csa_cp_utils impor
     local_q_cp_chunk_ranges,
     compute_cp_indexer_topk_logical_fused,
     repack_rank_major_compressed_to_seq_major_fused,
+    thd_cp_local_row_indices,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_kernels import indexer_topk
 from tests.unit_tests.test_utilities import Utils
@@ -322,42 +323,11 @@ def _copy_module_parameters(src, dst):
     return src_params
 
 
-def _make_contiguous_cp_partition_indices(padded_total_tokens, cp_size, device='cuda'):
-    assert padded_total_tokens % cp_size == 0
-    local_tokens = padded_total_tokens // cp_size
-    return tuple(
-        torch.arange(
-            rank * local_tokens,
-            (rank + 1) * local_tokens,
-            device=device,
-            dtype=torch.long,
-        )
-        for rank in range(cp_size)
-    )
-
-
-def _make_two_chunk_cp_partition_indices(padded_total_tokens, cp_size, device='cuda'):
-    assert padded_total_tokens % (2 * cp_size) == 0
-    local_rows = padded_total_tokens // cp_size
-    return tuple(
-        torch.cat(
-            [
-                torch.arange(start, end, device=device, dtype=torch.long)
-                for start, end in local_q_cp_chunk_ranges(
-                    DSV4_CP_PARTITION_TWO_CHUNK, local_rows, cp_size, rank
-                )
-            ],
-            dim=0,
-        )
-        for rank in range(cp_size)
-    )
-
-
 def _make_cp_partition_indices(partition_mode, padded_total_tokens, cp_size, device='cuda'):
-    if partition_mode == DSV4_CP_PARTITION_TWO_CHUNK:
-        return _make_two_chunk_cp_partition_indices(padded_total_tokens, cp_size, device=device)
-    assert partition_mode == DSV4_CP_PARTITION_CONTIGUOUS
-    return _make_contiguous_cp_partition_indices(padded_total_tokens, cp_size, device=device)
+    return tuple(
+        thd_cp_local_row_indices(partition_mode, padded_total_tokens, cp_size, rank, device)
+        for rank in range(cp_size)
+    )
 
 
 def _make_ragged_cp_case(partition_mode, cp_size, cp_rank):
@@ -1034,7 +1004,9 @@ class TestDSv4HybridAttentionTHDCP:
             boundary_hidden,
             hidden_compact,
             cu_compact,
+            _seq_ids_local,
             comp_ids_local,
+            _valid_local,
             k_local,
             k_rank_major,
             seq_ids,
@@ -1074,12 +1046,12 @@ class TestDSv4HybridAttentionTHDCP:
         Captures the DSv4 attention layer's CP-local forward and backward
         graph, replays it with fresh static-buffer contents, and compares the
         local output, hidden grad, and parameter grads against an eager module
-        with identical weights. The fused sparse-attn/indexer forward kernels
-        are deterministic, so fused output must match bitwise. Fused backward
-        uses atomic adds inside the sparse-attn/indexer kernels, so accumulation
-        order can vary and backward uses strict similarity plus elementwise
-        ``assert_close`` gates. The unfused sparse-attn/indexer path is
+        with identical weights. The unfused sparse-attn/indexer path is
         deterministic and must match bitwise for both forward and backward.
+        Fused forward kernels are deterministic and must also match bitwise.
+        Fused backward paths use strict similarity plus elementwise
+        ``assert_close`` gates because their expected difference is atomic
+        accumulation order.
         """
         context = nullcontext() if fused else _deterministic_torch_algorithms()
         mode = "fused" if fused else "unfused"
@@ -1143,16 +1115,13 @@ class TestDSv4HybridAttentionTHDCP:
             )
             torch.cuda.synchronize()
             assert graph_param_grads.keys() == eager_param_grads.keys()
-            # Fused forward kernels are deterministic, so graph replay must
-            # match eager output bitwise. Fused backward uses atomic adds in the
-            # sparse-attn/indexer kernels, so its accumulation order can differ.
-            _assert_cp_graph_bitwise_match(
-                graph_out, eager_out, f"layer={layer_number}:{mode}:{partition_mode}:output"
+            output_label = f"layer={layer_number}:{mode}:{partition_mode}:output"
+            _assert_cp_graph_bitwise_match(graph_out, eager_out, output_label)
+            bwd_match_fn = (
+                _assert_cp_graph_fused_backward_match
+                if fused
+                else _assert_cp_graph_bitwise_match
             )
-            if fused:
-                bwd_match_fn = _assert_cp_graph_fused_backward_match
-            else:
-                bwd_match_fn = _assert_cp_graph_bitwise_match
             bwd_match_fn(
                 graph_hidden_grad,
                 eager_hidden_grad,

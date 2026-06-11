@@ -2565,6 +2565,7 @@ def training_log(
             total_loss_dict=total_loss_dict,
             num_layers=args.num_layers + (args.mtp_num_layers or 0),
             csa_compress_ratios=args.csa_compress_ratios,
+            preserve_groups=args.cuda_graph_impl != "none",
         )
 
     # Dump memory snapshot and print metrics to stdout.

@@ -594,6 +594,9 @@ def _indexer_topk_core(
         pad = torch.full((total_q, topk - topk_k), -1, dtype=torch.int32, device=device)
         topk_indices = torch.cat([topk_indices, pad], dim=-1)
 
+    row_valid = (topk_indices >= 0) & (topk_indices < seq_lens.unsqueeze(1))
+    topk_indices = topk_indices.masked_fill(~row_valid, -1)
+
     if is_thd:
         safe_topk = topk_indices.clamp(min=0, max=max(sk - 1, 0)).to(torch.long)
         selected_scores = torch.gather(scores_flat, dim=-1, index=safe_topk)

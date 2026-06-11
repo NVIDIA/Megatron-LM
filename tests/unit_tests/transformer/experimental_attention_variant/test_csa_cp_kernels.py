@@ -218,6 +218,8 @@ def _native_build_compressed_row_metadata(
         chunk_id = rank
         if use_two_chunk:
             local_chunk = rank_slot // c_cap_per_chunk
+            if local_chunk >= 2:
+                continue
             slot = rank_slot - local_chunk * c_cap_per_chunk
             chunk_id = rank if local_chunk == 0 else cp_size * 2 - 1 - rank
         rank_start = chunk_id * chunk_len
@@ -762,10 +764,10 @@ def test_thd_full_kv_pack_matches_native_forward_backward_and_reports_bandwidth(
 
 def test_repack_compressed_kv_to_seq_major_matches_native_and_reports_bandwidth():
     _require_cute_cuda()
-    rank_major = torch.arange(6 * 4, dtype=torch.bfloat16, device="cuda").reshape(6, 4)
-    seq_ids = torch.tensor([0, 1, 0, -1, 1, 2], dtype=torch.int32, device="cuda")
-    comp_ids = torch.tensor([0, 0, 1, -1, 1, 0], dtype=torch.int32, device="cuda")
-    valid = torch.tensor([True, True, True, False, True, True], device="cuda")
+    rank_major = torch.arange(8 * 4, dtype=torch.bfloat16, device="cuda").reshape(8, 4)
+    seq_ids = torch.tensor([0, 1, 0, -1, 1, 2, 1, 1], dtype=torch.int32, device="cuda")
+    comp_ids = torch.tensor([0, 0, 1, -1, 1, 0, 1, 1], dtype=torch.int32, device="cuda")
+    valid = torch.tensor([True, True, True, False, True, True, True, True], device="cuda")
     cu_comp = torch.tensor([0, 2, 4, 5], dtype=torch.int32, device="cuda")
     ref = _native_repack_compressed_kv_to_seq_major(
         rank_major, seq_ids, comp_ids, valid, cu_comp, 5
@@ -811,7 +813,7 @@ def test_build_compressed_row_metadata_matches_native_and_reports_bandwidth():
     ratio = 4
     d_comp = 8
     c_cap_per_chunk = 4
-    c_cap_per_rank = 8
+    c_cap_per_rank = 10
     ref = _native_build_compressed_row_metadata(
         cu, cp_size, chunk_len, ratio, d_comp, c_cap_per_chunk, c_cap_per_rank, True
     )
@@ -913,6 +915,15 @@ def test_build_attention_indices_matches_native_and_reports_bandwidth():
     expected_len = torch.tensor([4, 1, 3], dtype=torch.int32, device="cuda")
     assert torch.equal(fused[0], expected_topk)
     assert torch.equal(fused[1], expected_len)
+
+    padded = csa_cp_kernels.build_attention_indices(
+        torch.tensor([0, 8], dtype=torch.int32, device="cuda"), 0, 10, 2, 2, 0, 0
+    )
+    # Padded THD query rows still need one in-range dummy KV id for fused DSA.
+    assert torch.equal(
+        padded[0][8:10], torch.tensor([[0, -1], [0, -1]], dtype=torch.int32, device="cuda")
+    )
+    assert torch.equal(padded[1][8:10], torch.tensor([1, 1], dtype=torch.int32, device="cuda"))
 
     bench_l_local = 4096
     bench_window = 128

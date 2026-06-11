@@ -80,13 +80,15 @@ class DSAIndexerLossLoggingHelper:
         tracker["avg_group"] = avg_group
 
     @staticmethod
-    def clean_loss_in_tracker():
+    def clean_loss_in_tracker(preserve_groups: bool = False):
         """Clear the indexer losses."""
         tracker = DSAIndexerLossLoggingHelper.tracker
+        reduce_group = tracker.get("reduce_group") if preserve_groups else None
+        avg_group = tracker.get("avg_group") if preserve_groups else None
         if "values" in tracker:
             tracker["values"].zero_()
-        tracker["reduce_group"] = None
-        tracker["avg_group"] = None
+        tracker["reduce_group"] = reduce_group
+        tracker["avg_group"] = avg_group
 
     @staticmethod
     def reduce_loss_in_tracker(num_layers: Optional[int] = None):
@@ -134,6 +136,7 @@ class DSAIndexerLossLoggingHelper:
         per_layer_logging: bool = False,
         num_layers: Optional[int] = None,
         csa_compress_ratios: Optional[List[int]] = None,
+        preserve_groups: bool = False,
     ):
         """Track the sparse attention indexer metrics for logging.
 
@@ -183,7 +186,7 @@ class DSAIndexerLossLoggingHelper:
         if wandb_writer is not None:
             wandb_writer.log({"indexer loss": avg_indexer_loss}, iteration)
 
-        DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
+        DSAIndexerLossLoggingHelper.clean_loss_in_tracker(preserve_groups=preserve_groups)
 
 
 def compute_dsa_indexer_loss(

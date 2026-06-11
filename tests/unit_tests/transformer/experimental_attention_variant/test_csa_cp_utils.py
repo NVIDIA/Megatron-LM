@@ -10,6 +10,7 @@ from megatron.core.transformer.experimental_attention_variant.csa_cp_utils impor
     exchange_cp_boundary_hidden,
     local_kv_cp_chunk_ranges,
     local_q_cp_chunk_ranges,
+    thd_cp_local_row_indices,
 )
 
 
@@ -88,6 +89,29 @@ def test_cp_chunk_ranges_match_partition_mode():
             cp_size=4,
             cp_rank=0,
         )
+
+
+def test_thd_cp_local_row_indices_match_chunk_ranges():
+    """Validate THD batch row selection for each CSA CP partition mode.
+
+    Expected: data loading selects the same global packed-token rows that the
+    attention layer later uses for RoPE, boundary exchange, and index lowering.
+    """
+    assert torch.equal(
+        thd_cp_local_row_indices(DSV4_CP_PARTITION_CONTIGUOUS, 16, 4, 2, torch.device("cpu")),
+        torch.tensor([8, 9, 10, 11]),
+    )
+    assert torch.equal(
+        thd_cp_local_row_indices(DSV4_CP_PARTITION_TWO_CHUNK, 16, 4, 0, torch.device("cpu")),
+        torch.tensor([0, 1, 14, 15]),
+    )
+    assert torch.equal(
+        thd_cp_local_row_indices(DSV4_CP_PARTITION_TWO_CHUNK, 16, 4, 3, torch.device("cpu")),
+        torch.tensor([6, 7, 8, 9]),
+    )
+
+    with pytest.raises(RuntimeError, match="divisible by cp_size"):
+        thd_cp_local_row_indices(DSV4_CP_PARTITION_CONTIGUOUS, 15, 4, 0, torch.device("cpu"))
 
 
 def test_boundary_exchange_single_rank_returns_zero_boundary_and_zero_grad():

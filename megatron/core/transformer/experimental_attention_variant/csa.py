@@ -2377,6 +2377,7 @@ class CompressedSparseAttention(MegatronModule):
                     loss=indexer_loss,
                     layer_number=self.layer_number,
                     num_layers=self.config.num_layers + (self.config.mtp_num_layers or 0),
+                    reduce_group=cp_group,
                 )
             output = DSAIndexerLossAutoScaler.apply(output, indexer_loss)
             return output.unsqueeze(1)
