@@ -76,6 +76,10 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     context_parallel_size: Optional[int] = None
     """The size of the context parallel group. Needed for padding in packed sequences."""
 
+    pack_sequences: bool = False
+    """When True, return cu_seqlens marking document boundaries within each sample so
+    that attention is restricted to individual documents."""
+
     def __post_init__(self) -> None:
         """Do asserts and set fields post init"""
         super().__post_init__()
@@ -233,9 +237,9 @@ class GPTDataset(MegatronDataset):
         """
         if idx is None:
             # Batch padding sequence so the index does not matter
-            text, _ = self._query_document_sample_shuffle_indices(0)
+            text, _, document_lengths = self._query_document_sample_shuffle_indices(0)
         else:
-            text, _ = self._query_document_sample_shuffle_indices(idx)
+            text, _, document_lengths = self._query_document_sample_shuffle_indices(idx)
 
         text = torch.from_numpy(text).long()
         if self.config.add_extra_token_to_sequence:
@@ -279,8 +283,38 @@ class GPTDataset(MegatronDataset):
         if idx is None:
             loss_mask = torch.zeros_like(loss_mask)
 
-        if self.config.create_attention_mask:
-            return {
+        if self.config.pack_sequences:
+            # document_lengths come from _query_document_sample_shuffle_indices
+            # which fetches sequence_length + add_extra_token_to_sequence tokens
+            # total. The extra token is appended to the last document part (used
+            # to produce the shifted labels), so subtract it before computing
+            # cu_seqlens which should index into the sequence_length-sized tokens
+            # tensor.
+            if self.config.add_extra_token_to_sequence:
+                document_lengths[-1] -= 1
+            cu_seqlens = torch.tensor(
+                numpy.cumsum([0] + document_lengths), dtype=torch.int32
+            )
+
+            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+
+            # Reset position IDs per document.
+            position_ids = position_ids.clone()
+            for i in range(1, cu_seqlens.numel()):
+                start = cu_seqlens[i - 1].item()
+                end = cu_seqlens[i].item()
+                position_ids[start:end] = torch.arange(end - start, dtype=torch.long)
+
+            result = {
+                "tokens": tokens,
+                "labels": labels,
+                "loss_mask": loss_mask,
+                "position_ids": position_ids,
+                "cu_seqlens": cu_seqlens,
+                "max_seqlen": max_seqlen,
+            }
+        elif self.config.create_attention_mask:
+            result = {
                 "tokens": tokens,
                 "labels": labels,
                 "attention_mask": attention_mask,
@@ -288,23 +322,26 @@ class GPTDataset(MegatronDataset):
                 "position_ids": position_ids,
             }
         else:
-            return {
+            result = {
                 "tokens": tokens,
                 "labels": labels,
                 "loss_mask": loss_mask,
                 "position_ids": position_ids,
             }
 
+        return result
+
     def _query_document_sample_shuffle_indices(
         self, idx: int
-    ) -> Tuple[numpy.ndarray, numpy.ndarray]:
+    ) -> Tuple[numpy.ndarray, numpy.ndarray, list]:
         """Get the text (token ids) and document ids for a given index
 
         Args:
             idx (int): The index into the dataset
 
         Returns:
-            Tuple[numpy.ndarray, numpy.ndarray]: The text ids and document ids
+            Tuple[numpy.ndarray, numpy.ndarray, list]: The text ids, document ids,
+                and per-document token counts (before any padding).
         """
         if self.shuffle_index is None:
             # NOTE(asolergi-nv): Lazy memmap the indexes
@@ -366,6 +403,8 @@ class GPTDataset(MegatronDataset):
 
         length = sum(map(len, sample_parts))
 
+        document_lengths = [len(p) for p in sample_parts]
+
         # Pad the sample if necessary
         if length < (self.config.sequence_length + self.config.add_extra_token_to_sequence):
             sample_parts.append(
@@ -376,6 +415,7 @@ class GPTDataset(MegatronDataset):
         return (
             numpy.concatenate(sample_parts, dtype=numpy.int64),
             numpy.array(document_ids, dtype=numpy.int64),
+            document_lengths,
         )
 
     def _build_document_sample_shuffle_indices(
