@@ -37,8 +37,8 @@ class ContextGPUView:
         #   fields, then int32 request fields, then int32 MHA fields, then
         #   int32 Mamba fields (hybrid models only; omitted when
         #   max_mamba_chunks == 0).
-        tok_int64_bytes = max_tokens * 8  # 2 fields of int64 = 8 bytes/elem
-        tok_int32_bytes = max_tokens * 4  # 4 fields of int32 = 4 bytes/elem
+        tok_int64_bytes = max_tokens * 8  # 3 fields of int64 = 8 bytes/elem
+        tok_int32_bytes = max_tokens * 4  # 3 fields of int32 = 4 bytes/elem
         # Request-level fields are all 4 bytes wide. 3 int32 (in_prefill_status,
         # query_lengths, kv_length_offsets) + 1 int32 (top_k) + 2 float32
         # (temperature, top_p) + 1 int32 (active_request_last_token_idxs) = 7 fields.
@@ -59,8 +59,8 @@ class ContextGPUView:
         mha_cu_kv_seq_lengths_bytes = (max_bs + 1) * 4
         mha_block_table_bytes = max_bs * max_kv_blocks * 4
 
-        # Mamba section: 10 int32 fields, only present for hybrid models.
-        #   mamba_batch_indices_decode       int32 (max_bs,)
+        # Mamba section, only present for hybrid models.
+        #   mamba_batch_indices_decode       int64 (max_bs,)
         #   mamba_batch_indices_decode_write int32 (max_bs,)
         #   mamba_batch_indices_prefill      int32 (max_bs,)
         #   mamba_seq_idx                 int32 (1, max_tokens)
@@ -70,8 +70,22 @@ class ContextGPUView:
         #   mamba_seq_idx_for_varlen      int32 (max_mamba_chunks,)
         #   mamba_conv_seq_idx            int32 (max_tokens,)
         #   mamba_conv_seq_start          int32 (max_tokens,)
+        # Bytes before the Mamba section (needed to compute alignment padding).
+        pre_mamba_bytes = (
+            3 * tok_int64_bytes
+            + 3 * tok_int32_bytes
+            + 7 * req_4byte_bytes
+            + mha_query_lengths_bytes
+            + mha_cu_query_seq_lengths_bytes
+            + mha_kv_seq_lengths_bytes
+            + mha_cu_kv_seq_lengths_bytes
+            + mha_block_table_bytes
+        )
+
         if max_mamba_chunks > 0:
-            mamba_batch_indices_decode_bytes = max_bs * 4
+            # mamba_batch_indices_decode is int64; pad to 8-byte alignment.
+            mamba_align_pad = (8 - pre_mamba_bytes % 8) % 8
+            mamba_batch_indices_decode_bytes = max_bs * 8
             mamba_batch_indices_decode_write_bytes = max_bs * 4
             mamba_batch_indices_prefill_bytes = max_bs * 4
             mamba_seq_idx_bytes = max_tokens * 4
@@ -82,6 +96,7 @@ class ContextGPUView:
             mamba_conv_seq_idx_bytes = max_tokens * 4
             mamba_conv_seq_start_bytes = max_tokens * 4
         else:
+            mamba_align_pad = 0
             mamba_batch_indices_decode_bytes = 0
             mamba_batch_indices_decode_write_bytes = 0
             mamba_batch_indices_prefill_bytes = 0
@@ -94,14 +109,8 @@ class ContextGPUView:
             mamba_conv_seq_start_bytes = 0
 
         total_bytes = (
-            2 * tok_int64_bytes
-            + 4 * tok_int32_bytes
-            + 7 * req_4byte_bytes
-            + mha_query_lengths_bytes
-            + mha_cu_query_seq_lengths_bytes
-            + mha_kv_seq_lengths_bytes
-            + mha_cu_kv_seq_lengths_bytes
-            + mha_block_table_bytes
+            pre_mamba_bytes
+            + mamba_align_pad
             + mamba_batch_indices_decode_bytes
             + mamba_batch_indices_decode_write_bytes
             + mamba_batch_indices_prefill_bytes
@@ -123,8 +132,8 @@ class ContextGPUView:
         off += tok_int64_bytes
         self.token_to_pos_ids = self._buf[off : off + tok_int64_bytes].view(torch.long)
         off += tok_int64_bytes
-        self.token_to_block_idx = self._buf[off : off + tok_int32_bytes].view(torch.int32)
-        off += tok_int32_bytes
+        self.token_to_block_idx = self._buf[off : off + tok_int64_bytes].view(torch.int64)
+        off += tok_int64_bytes
         self.token_to_local_position_within_kv_block = self._buf[off : off + tok_int32_bytes].view(
             torch.int32
         )
@@ -184,9 +193,10 @@ class ContextGPUView:
         # per-step coalesced H2D copy covers both MHA and Mamba alongside the
         # token/request bookkeeping.
         if max_mamba_chunks > 0:
+            off += mamba_align_pad
             self.mamba_batch_indices_decode = self._buf[
                 off : off + mamba_batch_indices_decode_bytes
-            ].view(torch.int32)
+            ].view(torch.int64)
             off += mamba_batch_indices_decode_bytes
             self.mamba_batch_indices_decode_write = self._buf[
                 off : off + mamba_batch_indices_decode_write_bytes

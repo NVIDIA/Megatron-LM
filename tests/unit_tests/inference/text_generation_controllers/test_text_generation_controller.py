@@ -1065,6 +1065,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         self.setup_model(
             torch.float32,
             static=False,
+            mtp_num_layers=3,
             num_speculative_tokens=3,
             block_size_tokens=4,
             max_requests=16,
@@ -1249,11 +1250,14 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         (top_k > 1, top_p > 0) by flattening 3D MTP logits for torch.multinomial."""
         num_spec = 3
         self.setup_model(
-            torch.float32, static=False, num_speculative_tokens=num_spec, max_requests=2
+            torch.float32,
+            static=False,
+            num_speculative_tokens=num_spec,
+            mtp_num_layers=num_spec,
+            max_requests=2,
         )
 
         # Enable speculative decoding
-        self.text_generation_controller.num_speculative_tokens = num_spec
         ctx = self.text_generation_controller.inference_wrapped_model.inference_context
         ctx.total_request_count = 2
         ctx.paused_request_count = 0
@@ -1308,6 +1312,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             block_size_tokens=4,
             enable_prefix_caching=True,
             max_requests=16,
+            mtp_num_layers=2,
         )
 
         ctx = self.text_generation_controller.inference_wrapped_model.inference_context
@@ -1357,6 +1362,7 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
             num_speculative_tokens=3,
             block_size_tokens=4,
             max_requests=16,
+            mtp_num_layers=3,
         )
 
         ctx = self.text_generation_controller.inference_wrapped_model.inference_context
@@ -1407,7 +1413,6 @@ class TestTextGenerationController(TextGenerationControllerTestBase):
         )
 
         self.text_generation_controller.num_speculative_tokens = 2
-        self.text_generation_controller.num_mtp_heads = 2
         ctx = self.text_generation_controller.inference_wrapped_model.inference_context
         ctx.total_request_count = 2
         ctx.paused_request_count = 0

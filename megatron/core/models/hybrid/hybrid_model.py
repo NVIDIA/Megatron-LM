@@ -40,6 +40,18 @@ from megatron.core.utils import (
 logger = logging.getLogger(__name__)
 
 
+def _hybrid_logging_pg_kwargs(pg_collection: ProcessGroupCollection) -> dict:
+    tp_group = getattr(pg_collection, 'tp', None)
+    dp_cp_group = getattr(pg_collection, 'dp_cp', None)
+    if (tp_group is None) != (dp_cp_group is None):
+        raise ValueError(
+            "pg_collection.tp and pg_collection.dp_cp must both be set or both be unset."
+        )
+    if tp_group is None:
+        return {}
+    return {'tp_group': tp_group, 'dp_cp_group': dp_cp_group}
+
+
 class HybridModel(LanguageModule, GraphableMegatronModule):
     """Hybrid language model.
 
@@ -188,12 +200,15 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         self.mtp_pattern = parsed.mtp_pattern
         self.mtp_num_depths = parsed.mtp_num_depths
 
+        logging_pg_kwargs = _hybrid_logging_pg_kwargs(self.pg_collection)
+
         layer_type_list, layer_offset = select_pipeline_segment(
             parsed.main_pattern or '',
             self.pg_collection.pp,
             vp_stage,
             first_stage_layers=self.config.num_layers_in_first_pipeline_stage,
             last_stage_layers=self.config.num_layers_in_last_pipeline_stage,
+            **logging_pg_kwargs,
         )
 
         # Determine if MTP is needed (based on pattern parsing)
@@ -541,6 +556,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             if in_inference_mode or is_spec_decode:
                 self._decoder_hidden_states_cache = hidden_states
             else:
+                # For RL (labels is None), process_mtp_loss derives labels from
+                # input_ids to match the SFT label format.
                 hidden_states = process_mtp_loss(
                     hidden_states=hidden_states,
                     labels=labels,
@@ -552,8 +569,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     compute_language_model_loss=self.compute_language_model_loss,
                     config=self.config,
                     cp_group=self.pg_collection.cp,
+                    tp_group=self.tp_group,
                     packed_seq_params=packed_seq_params,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
+                    input_ids=input_ids,
                 )
         sequence_parallel_override = False
         if (

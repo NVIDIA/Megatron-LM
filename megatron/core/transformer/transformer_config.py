@@ -81,6 +81,11 @@ class TransformerConfig(ModelParallelConfig):
     mtp_use_repeated_layer: bool = False
     """Use a single MTP layer repeatedly instead of multiple separate layers."""
 
+    mtp_detach_heads: bool = False
+    """If True, detach MTP head inputs from the main model graph.
+    This prevents MTP loss gradients from flowing back to the main model,
+    only training the MTP heads themselves."""
+
     mtp_hybrid_override_pattern: Optional[str] = None
     """DEPRECATED: Use unified hybrid_layer_pattern instead.
     Legacy argument for loading old checkpoints.
@@ -499,7 +504,8 @@ class TransformerConfig(ModelParallelConfig):
 
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
-    choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe", "shared_experts".
+    choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
+    "shared_experts", "gdn_norm_out".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -508,7 +514,8 @@ class TransformerConfig(ModelParallelConfig):
     "mlp": recompute the dense MLP submodule.
     "moe": recompute the MoE layer.
     "shared_experts": recompute the shared experts in the MoE layer.
-    "moe_act", "layernorm", and "mla_up_proj" use output-discarding checkpointing,
+    "gdn_norm_out": recompute the GatedDeltaNet output norm and HP-to-CP all-to-all.
+    "moe_act", "layernorm", "mla_up_proj", and "gdn_norm_out" use output-discarding checkpointing,
     "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
     """
 
@@ -562,6 +569,11 @@ class TransformerConfig(ModelParallelConfig):
     fp8_wgrad: bool = True
     """When set to False, override FP8 config options and do the wgrad computation
     in higher precision."""
+
+    fp8_output_proj: bool = False
+    """If True, run the LM-head output projection with a TE ColumnParallelLinear
+    under the MXFP8 autocast context. Only active when fp8=True and
+    fp8_recipe='mxfp8'."""
 
     fp8_dot_product_attention: bool = False
     """When set to True, use the FP8 implementation of Dot Product Attention."""
@@ -1292,6 +1304,14 @@ class TransformerConfig(ModelParallelConfig):
         if self.fp8_param and not self.fp8:
             raise ValueError("fp8_param must be used together with fp8 mode.")
 
+        if self.fp8_output_proj:
+            if not self.fp8:
+                raise ValueError("fp8_output_proj must be used together with fp8 mode.")
+            if self.fp8_recipe != Fp8Recipe.mxfp8:
+                raise ValueError(
+                    f"fp8_output_proj requires fp8_recipe='mxfp8', got " f"'{self.fp8_recipe}'."
+                )
+
         # FP4 validation
         if self.fp4_param and not self.fp4:
             raise ValueError("fp4_param must be used together with fp4 mode.")
@@ -1580,6 +1600,7 @@ class TransformerConfig(ModelParallelConfig):
                     "mlp",
                     "moe",
                     "shared_experts",
+                    "gdn_norm_out",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
@@ -1596,6 +1617,15 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "mla_up_proj in recompute_modules is only supported with "
                     "multi_latent_attention."
+                )
+
+            if (
+                "gdn_norm_out" in self.recompute_modules
+                and self.experimental_attention_variant != "gated_delta_net"
+            ):
+                raise ValueError(
+                    "gdn_norm_out in recompute_modules is only supported with "
+                    "experimental_attention_variant='gated_delta_net'."
                 )
 
             if "core_attn" in self.recompute_modules:

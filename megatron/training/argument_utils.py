@@ -19,18 +19,18 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.spec_utils import import_module
 
 from megatron.training.config import (
-    DistributedInitConfig, 
-    PretrainConfigContainer, 
-    SchedulerConfig, 
+    DistributedInitConfig,
+    PretrainConfigContainer,
+    SchedulerConfig,
     TokenizerConfig,
-    TrainingConfig, 
-    ValidationConfig, 
-    RNGConfig, 
+    TrainingConfig,
+    ValidationConfig,
+    RNGConfig,
     LoggerConfig,
     StragglerDetectionConfig,
     RerunStateMachineConfig, CheckpointConfig, ProfilingConfig
 )
-from megatron.training.models.hybrid import HybridModelConfig
+from megatron.training.models import HybridModelConfig, GPTModelConfig
 # TODO: support arg renames
 
 class TypeInferenceError(Exception):
@@ -43,7 +43,7 @@ class ArgumentGroupFactory:
     This utility uses dataclass metadata including type annotations and docstrings to automatically
         infer the type, default, and other argparse keyword arguments.
 
-    You can override or supplement the automatically inferred argparse kwargs for any 
+    You can override or supplement the automatically inferred argparse kwargs for any
         dataclass field by providing an "argparse_meta" key in the field's metadata dict.
         The value should be a dict of kwargs that will be passed to ArgumentParser.add_argument().
         These metadata kwargs take precedence over the automatically inferred values.
@@ -72,13 +72,13 @@ class ArgumentGroupFactory:
         that require some customized or additional handling.
 
     Args:
-        src_cfg_class: The source dataclass type (not instance) whose fields will be 
-            converted into command-line arguments. Each field's type annotation determines 
-            the argument type, default values become argument defaults, and field-level 
+        src_cfg_class: The source dataclass type (not instance) whose fields will be
+            converted into command-line arguments. Each field's type annotation determines
+            the argument type, default values become argument defaults, and field-level
             docstrings are extracted to populate argument help text.
-        exclude: Optional list of attribute names from `src_cfg_class` to exclude from 
+        exclude: Optional list of attribute names from `src_cfg_class` to exclude from
             argument generation. Useful for omitting internal fields, computed properties,
-            or attributes that should be configured through other means. If None, all 
+            or attributes that should be configured through other means. If None, all
             dataclass fields will be converted to command-line arguments. Default: None.
     """
 
@@ -92,7 +92,7 @@ class ArgumentGroupFactory:
 
         Args:
             config_attr_name: dataclass attribute name
-            prefix: prefix string to add to the dataclass attribute name. e.g. 'no' for bool 
+            prefix: prefix string to add to the dataclass attribute name. e.g. 'no' for bool
                 settings that are default True. A hyphen is added after the prefix. Default: None
         """
         arg_name = config_attr_name
@@ -188,7 +188,7 @@ class ArgumentGroupFactory:
 
                 # add '--no-*' and '--disable-*' prefix if this is a store_false argument
                 if argparse_kwargs["action"] == "store_false":
-                    argparse_kwargs["arg_names"] = [self._format_arg_name(attribute.name, prefix="no"), self._format_arg_name(attribute.name, prefix="disable")] 
+                    argparse_kwargs["arg_names"] = [self._format_arg_name(attribute.name, prefix="no"), self._format_arg_name(attribute.name, prefix="disable")]
         except TypeInferenceError as e:
             if attr_argparse_meta is not None:
                 print(
@@ -200,7 +200,7 @@ class ArgumentGroupFactory:
             else:
                 raise e
 
-        # metadata provided by field takes precedence 
+        # metadata provided by field takes precedence
         if attr_argparse_meta is not None:
             argparse_kwargs.update(attr_argparse_meta)
 
@@ -388,6 +388,50 @@ def _default_config_from_args(cls: type, args: Namespace, return_instance: bool 
         return kwargs
 
 
+def gpt_config_from_args(args: Namespace, config: TransformerConfig | None=None) -> Any:
+    """Create a GPTModelConfig from the appropriate values in the `args` Namespace."""
+
+    kwargs = {}
+    if config is None:
+        if args.yaml_cfg is not None:
+            from megatron.training.yaml_arguments import core_transformer_config_from_yaml
+
+            transformer_cfg = core_transformer_config_from_yaml(args, "language_model")
+        else:
+            transformer_cfg = core_transformer_config_from_args(args)
+    else:
+        transformer_cfg = config
+    kwargs["transformer"] = transformer_cfg
+
+    if args.spec is not None:
+        kwargs["transformer_layer_spec"] = import_module(args.spec)
+
+
+    kwargs["fp16_lm_cross_entropy"] = args.fp16_lm_cross_entropy
+    kwargs["position_embedding_type"] = args.position_embedding_type
+    kwargs["rotary_percent"] = args.rotary_percent
+    kwargs["rotary_base"] = args.rotary_base
+    kwargs["make_vocab_size_divisible_by"] = args.make_vocab_size_divisible_by
+    kwargs["rope_scaling"] = args.use_rope_scaling
+
+    kwargs["seq_len_interpolation_factor"] = args.rotary_seq_len_interpolation_factor
+    kwargs["seq_length"] = args.max_position_embeddings
+    kwargs["share_embeddings_and_output_weights"] = not args.untie_embeddings_and_output_weights
+
+    # GPTModelConfig supports either automatically padding vocab size or using exact provided
+    # vocab size via "should_pad_vocab" to support loading third-party checkpoints. Here,
+    # that is just mapped to settings in args appropriately.
+    if args.padded_vocab_size is not None:
+        kwargs["vocab_size"] = args.padded_vocab_size
+        kwargs["should_pad_vocab"] = False
+    else:
+        assert args.vocab_size is not None, "Either --padded-vocab-size or --vocab-size must be specified."
+        kwargs["vocab_size"] = args.vocab_size
+        kwargs["should_pad_vocab"] = True
+
+    return GPTModelConfig(**kwargs)
+
+
 def hybrid_config_from_args(args: Namespace, config: TransformerConfig | None=None) -> Any:
     """Create a HybridModelConfig from the appropriate values in the `args` Namespace."""
 
@@ -417,11 +461,13 @@ def hybrid_config_from_args(args: Namespace, config: TransformerConfig | None=No
     kwargs["seq_length"] = args.max_position_embeddings
     kwargs["share_embeddings_and_output_weights"] = not args.untie_embeddings_and_output_weights
 
+    # HybridModelConfig supports either automatically padding vocab size or using exact provided
+    # vocab size via "should_pad_vocab" to support loading third-party checkpoints. Here,
+    # that is just mapped to settings in args appropriately.
     if args.padded_vocab_size is not None:
         kwargs["vocab_size"] = args.padded_vocab_size
+        kwargs["should_pad_vocab"] = False
     else:
-        # Megatron-Bridge uses an explicit setting "should_pad_vocab" so that 
-        # when converting model configs from HF, we can set a vocab size and disable padding. 
         assert args.vocab_size is not None, "Either --padded-vocab-size or --vocab-size must be specified."
         kwargs["vocab_size"] = args.vocab_size
         kwargs["should_pad_vocab"] = True

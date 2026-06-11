@@ -40,7 +40,6 @@ MANDATORY_VARS=(
     "CHECKPOINT_LOAD_PATH"
     "DATA_PATH"
     "DATA_CACHE_PATH"
-    "ENABLE_LIGHTWEIGHT_MODE"
 )
 for mandatory_var in "${MANDATORY_VARS[@]}"; do
     if [[ -z "${!mandatory_var}" ]]; then
@@ -56,8 +55,14 @@ TEST_TYPE=$(cat $TRAINING_PARAMS_PATH |
     /usr/local/bin/yq '.TEST_TYPE')
 TEST_EVALUATION=$(cat $TRAINING_PARAMS_PATH |
     /usr/local/bin/yq '.TEST_EVALUATION // "pass"')
-ENABLE_LIGHTWEIGHT_MODE=$(cat $TRAINING_PARAMS_PATH |
+CONFIG_LIGHTWEIGHT_MODE=$(cat $TRAINING_PARAMS_PATH |
     /usr/local/bin/yq '.ENV_VARS.ENABLE_LIGHTWEIGHT_MODE // "false"')
+ENV_LIGHTWEIGHT_MODE="${ENABLE_LIGHTWEIGHT_MODE:-false}"
+if [[ "$ENV_LIGHTWEIGHT_MODE" == "true" || "$CONFIG_LIGHTWEIGHT_MODE" == "true" ]]; then
+    export ENABLE_LIGHTWEIGHT_MODE=true
+else
+    export ENABLE_LIGHTWEIGHT_MODE=false
+fi
 N_REPEAT=$(cat $TRAINING_PARAMS_PATH |
     /usr/local/bin/yq '.ENV_VARS.N_REPEAT // "'$N_REPEAT'"')
 MODE=$(cat $TRAINING_PARAMS_PATH |
@@ -226,6 +231,11 @@ for i in $(seq 1 $N_REPEAT); do
     FILE=$(basename "$_TENSORBOARD_PATH")
     export TENSORBOARD_PATH=$DIR/$i/$FILE
     mkdir -p $(dirname $TENSORBOARD_PATH)
+    # Per-repeat base; for ckpt-resume / frozen-resume tests each training
+    # phase writes to its own ${_REPEAT_TENSORBOARD_PATH}/run_N subdir so the
+    # analyzer can read by explicit path rather than guessing phase from
+    # mtime-sorted glob order.
+    _REPEAT_TENSORBOARD_PATH=$TENSORBOARD_PATH
     export REPEAT=$i
 
     wait_for_all_nodes "repeat_${REPEAT}_start"
@@ -294,6 +304,10 @@ for i in $(seq 1 $N_REPEAT); do
         done
     else
         # The standard single-run test that otherwise runs
+        if [[ "$TEST_TYPE" == "ckpt-resume" || "$TEST_TYPE" == "frozen-resume" ]]; then
+            export TENSORBOARD_PATH="$_REPEAT_TENSORBOARD_PATH/run_${RUN_NUMBER}"
+            mkdir -p "$TENSORBOARD_PATH"
+        fi
         run_training_phase "repeat_${REPEAT}_run_${RUN_NUMBER}"
     fi
 
@@ -316,6 +330,8 @@ for i in $(seq 1 $N_REPEAT); do
         echo $((TRAIN_ITERS / 2)) >$CHECKPOINT_LOAD_PATH/latest_checkpointed_iteration.txt
 
         export RUN_NUMBER=2
+        export TENSORBOARD_PATH="$_REPEAT_TENSORBOARD_PATH/run_${RUN_NUMBER}"
+        mkdir -p "$TENSORBOARD_PATH"
         run_training_phase "repeat_${REPEAT}_run_${RUN_NUMBER}"
     fi
 
@@ -326,6 +342,8 @@ for i in $(seq 1 $N_REPEAT); do
         export CHECKPOINT_SAVE_PATH=/tmp/checkpoints/
 
         export RUN_NUMBER=2
+        export TENSORBOARD_PATH="$_REPEAT_TENSORBOARD_PATH/run_${RUN_NUMBER}"
+        mkdir -p "$TENSORBOARD_PATH"
         run_training_phase "repeat_${REPEAT}_run_${RUN_NUMBER}"
 
         export CHECKPOINT_SAVE_PATH=$_CHECKPOINT_SAVE_PATH
@@ -371,8 +389,13 @@ for i in $(seq 1 $N_REPEAT); do
         # Read test values from Tensorboard for non-inference tests.
         # Inference tests will load from JSON instead.
         if [[ "$MODE" == "pretraining" ]]; then
+            if [[ "$TEST_TYPE" == "ckpt-resume" || "$TEST_TYPE" == "frozen-resume" ]]; then
+                FIRST_RUN_TENSORBOARD_PATH="$_REPEAT_TENSORBOARD_PATH/run_1"
+            else
+                FIRST_RUN_TENSORBOARD_PATH="$TENSORBOARD_PATH"
+            fi
             uv run --no-sync python $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
-                --logs-dir $TENSORBOARD_PATH \
+                --logs-dir $FIRST_RUN_TENSORBOARD_PATH \
                 --train-iters $TRAIN_ITERS \
                 --output-path ${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH) \
                 "${EXTRACT_ARGS[@]}"
@@ -424,10 +447,9 @@ for i in $(seq 1 $N_REPEAT); do
 
                 if [[ "$TEST_TYPE" == "ckpt-resume" || "$TEST_TYPE" == "frozen-resume" ]]; then
                     uv run --no-sync python $ROOT_DIR/tests/functional_tests/python_test_utils/get_test_results_from_tensorboard_logs.py \
-                        --logs-dir $TENSORBOARD_PATH \
+                        --logs-dir "$_REPEAT_TENSORBOARD_PATH/run_2" \
                         --train-iters $TRAIN_ITERS \
                         --output-path "${OUTPUT_PATH}/$(basename $GOLDEN_VALUES_PATH .json)_2nd.json" \
-                        --is-second-run \
                         "${EXTRACT_ARGS[@]}"
                             
                     echo "Running pytest 1st vs 2nd run comparison"

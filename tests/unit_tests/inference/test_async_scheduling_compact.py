@@ -523,15 +523,16 @@ async def test_reused_pending_forward_prepares_next_step_before_sampling(monkeyp
     )
     controller._should_collect_dynamic_sampling_bookkeeping = lambda **_kwargs: False
     controller._try_prepare_async_decode_before_sampling = lambda: events.append("precheck") or True
-    controller._dynamic_step_sample_logits_to_next_input_ids = (
-        lambda: events.extend(["sample", "copy"])
+    controller._dynamic_step_sample_logits_to_next_input_ids = lambda: events.extend(
+        ["sample", "copy"]
     )
     controller._try_prepare_async_decode_after_sampling = lambda: pytest.fail(
         "reused non-row-mapped forward should prepare before sampling"
     )
-    controller._async_transfer_samples_to_cpu = (
-        lambda count: events.append(("d2h", count))
-        or (torch.tensor([4, 5], dtype=torch.int64), None, SimpleNamespace(synchronize=lambda: None))
+    controller._async_transfer_samples_to_cpu = lambda count: events.append(("d2h", count)) or (
+        torch.tensor([4, 5], dtype=torch.int64),
+        None,
+        SimpleNamespace(synchronize=lambda: None),
     )
     controller._confirm_prepared_ep_async_handoff = lambda: False
     controller._ensure_ep_async_handoff_decided = lambda **_kwargs: events.append("ep_done")
@@ -577,7 +578,9 @@ async def test_reused_pending_forward_falls_back_after_sampling_when_presampling
         row_indices=None, row_mapped=False
     )
     controller._should_collect_dynamic_sampling_bookkeeping = lambda **_kwargs: False
-    controller._try_prepare_async_decode_before_sampling = lambda: events.append("precheck") or False
+    controller._try_prepare_async_decode_before_sampling = (
+        lambda: events.append("precheck") or False
+    )
     controller._dynamic_step_sample_logits = lambda **_kwargs: events.append("sample")
     controller._try_prepare_async_decode_after_sampling = (
         lambda: events.append("prepare_after") or True
@@ -585,9 +588,10 @@ async def test_reused_pending_forward_falls_back_after_sampling_when_presampling
     controller._copy_sampled_decode_tokens_to_next_input_ids = lambda count: events.append(
         "copy" if count == 2 else ("copy", count)
     )
-    controller._async_transfer_samples_to_cpu = (
-        lambda count: events.append(("d2h", count))
-        or (torch.tensor([4, 5], dtype=torch.int64), None, SimpleNamespace(synchronize=lambda: None))
+    controller._async_transfer_samples_to_cpu = lambda count: events.append(("d2h", count)) or (
+        torch.tensor([4, 5], dtype=torch.int64),
+        None,
+        SimpleNamespace(synchronize=lambda: None),
     )
     controller._confirm_prepared_ep_async_handoff = lambda: False
     controller._ensure_ep_async_handoff_decided = lambda **_kwargs: events.append("ep_done")
@@ -595,9 +599,7 @@ async def test_reused_pending_forward_falls_back_after_sampling_when_presampling
     result = await controller.async_generate_output_tokens_dynamic_batch(skip_bookkeeping=True)
 
     ordering = [
-        event
-        for event in events
-        if event in ("precheck", "sample", "prepare_after", "copy")
+        event for event in events if event in ("precheck", "sample", "prepare_after", "copy")
     ]
     assert ordering == ["precheck", "sample", "prepare_after", "copy"]
     assert ("d2h", 2) in events
@@ -661,24 +663,24 @@ async def test_prepare_async_decode_before_sampling_steady_state_ordering(monkey
     controller._async_scheduling_disabled_reason = lambda **_kwargs: None
     controller._record_async_eligibility_result = lambda _reason: None
     controller._record_async_disable_reason = lambda reason: events.append(("disable", reason))
-    controller._decide_ep_async_handoff = (
-        lambda **_kwargs: events.append("handoff")
-        or EPAsyncHandoffDecision(
-            step_id=0,
-            has_real_work=True,
-            launch_async_forward=True,
-            skip_async_forward=False,
-            any_launch_request=True,
-            any_skip_request=False,
-        )
+    controller._decide_ep_async_handoff = lambda **_kwargs: events.append(
+        "handoff"
+    ) or EPAsyncHandoffDecision(
+        step_id=0,
+        has_real_work=True,
+        launch_async_forward=True,
+        skip_async_forward=False,
+        any_launch_request=True,
+        any_skip_request=False,
     )
     controller._should_collect_dynamic_sampling_bookkeeping = lambda **_kwargs: False
-    controller._dynamic_step_sample_logits_to_next_input_ids = (
-        lambda: events.extend(["sample", "copy"])
+    controller._dynamic_step_sample_logits_to_next_input_ids = lambda: events.extend(
+        ["sample", "copy"]
     )
-    controller._async_transfer_samples_to_cpu = (
-        lambda count: events.append(("d2h", count))
-        or (torch.tensor([4, 5], dtype=torch.int64), None, SimpleNamespace(synchronize=lambda: None))
+    controller._async_transfer_samples_to_cpu = lambda count: events.append(("d2h", count)) or (
+        torch.tensor([4, 5], dtype=torch.int64),
+        None,
+        SimpleNamespace(synchronize=lambda: None),
     )
     controller._confirm_prepared_ep_async_handoff = lambda: True
     controller._record_async_pending_forward_requests = lambda _count: events.append("record")
@@ -755,24 +757,23 @@ async def test_prepare_async_decode_before_sampling_unsafe_fallback_ordering(mon
     controller._async_scheduling_disabled_reason = lambda **_kwargs: None
     controller._record_async_eligibility_result = lambda _reason: None
     controller._record_async_disable_reason = lambda reason: events.append(("disable", reason))
-    controller._decide_ep_async_handoff = (
-        lambda **_kwargs: EPAsyncHandoffDecision(
-            step_id=0,
-            has_real_work=True,
-            launch_async_forward=True,
-            skip_async_forward=False,
-            any_launch_request=True,
-            any_skip_request=False,
-        )
+    controller._decide_ep_async_handoff = lambda **_kwargs: EPAsyncHandoffDecision(
+        step_id=0,
+        has_real_work=True,
+        launch_async_forward=True,
+        skip_async_forward=False,
+        any_launch_request=True,
+        any_skip_request=False,
     )
     controller._should_collect_dynamic_sampling_bookkeeping = lambda **_kwargs: False
     controller._dynamic_step_sample_logits = lambda **_kwargs: events.append("sample")
     controller._copy_sampled_decode_tokens_to_next_input_ids = lambda count: events.append(
         ("copy", count)
     )
-    controller._async_transfer_samples_to_cpu = (
-        lambda count: events.append(("d2h", count))
-        or (torch.tensor([4, 5], dtype=torch.int64), None, SimpleNamespace(synchronize=lambda: None))
+    controller._async_transfer_samples_to_cpu = lambda count: events.append(("d2h", count)) or (
+        torch.tensor([4, 5], dtype=torch.int64),
+        None,
+        SimpleNamespace(synchronize=lambda: None),
     )
     controller._confirm_prepared_ep_async_handoff = lambda: True
     controller._record_async_pending_forward_requests = lambda _count: events.append("record")
@@ -1111,9 +1112,7 @@ def test_prepare_async_decode_before_sampling_deferral_is_not_disable_reason(mon
     controller._async_eligibility_pass_count = 0
     events = []
     controller._async_scheduling_disabled_reason = lambda **_kwargs: None
-    controller._decide_ep_async_handoff = lambda **kwargs: events.append(
-        ("handoff", kwargs)
-    )
+    controller._decide_ep_async_handoff = lambda **kwargs: events.append(("handoff", kwargs))
     context.prepare_async_decode_next_step = (
         lambda **kwargs: events.append(("prepare", kwargs)) or False
     )
@@ -1140,10 +1139,9 @@ def test_prepare_async_decode_before_sampling_keeps_hybrid_fast_path(monkeypatch
     controller._record_async_eligibility_result = lambda reason: events.append(
         ("eligibility", reason)
     )
-    controller._decide_ep_async_handoff = (
-        lambda **kwargs: events.append(("handoff", kwargs))
-        or SimpleNamespace(launch_async_forward=True)
-    )
+    controller._decide_ep_async_handoff = lambda **kwargs: events.append(
+        ("handoff", kwargs)
+    ) or SimpleNamespace(launch_async_forward=True)
     context.prepare_async_decode_next_step = (
         lambda **kwargs: events.append(("prepare", kwargs)) or True
     )
@@ -1509,9 +1507,7 @@ class _MambaMetadataWithFreeRecording:
 @pytest.mark.internal
 def test_async_pending_resources_are_quarantined_until_forward_retires():
     context = object.__new__(DynamicInferenceContext)
-    context.request_to_kv_block_ids = torch.tensor(
-        [[10, 11, -1], [12, -1, -1]], dtype=torch.int32
-    )
+    context.request_to_kv_block_ids = torch.tensor([[10, 11, -1], [12, -1, -1]], dtype=torch.int32)
     context.is_hybrid_model = False
     context.mamba_slot_allocator = None
     context.kv_block_allocator = _ReleaseRecordingAllocator()
@@ -1538,9 +1534,7 @@ def test_async_pending_resources_are_quarantined_until_forward_retires():
 @pytest.mark.internal
 def test_async_pending_forward_defers_mamba_slot_free_until_forward_retires():
     context = object.__new__(DynamicInferenceContext)
-    context.request_to_kv_block_ids = torch.tensor(
-        [[10, 11, -1], [12, -1, -1]], dtype=torch.int32
-    )
+    context.request_to_kv_block_ids = torch.tensor([[10, 11, -1], [12, -1, -1]], dtype=torch.int32)
     context.is_hybrid_model = True
     context.mamba_metadata = _MambaMetadataWithFreeRecording(slots=[3, 5], banks=[0, 1])
     context.mamba_slot_allocator = None
@@ -1833,7 +1827,9 @@ def test_row_mapped_greedy_sampling_writes_tokens_in_current_request_order():
     controller._sampled_mtp_tokens_cuda = None
     controller.num_speculative_tokens = 0
 
-    controller._dynamic_step_sample_logits_greedy_to_next_input_ids(row_indices=torch.tensor([2, 0]))
+    controller._dynamic_step_sample_logits_greedy_to_next_input_ids(
+        row_indices=torch.tensor([2, 0])
+    )
 
     assert controller._sampled_tokens_cuda.tolist() == [3, 1]
     assert next_input_ids.tolist() == [3, 1]

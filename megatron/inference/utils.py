@@ -9,6 +9,7 @@ import torch
 from gpt_builders import gpt_builder
 from hybrid_builders import hybrid_builder
 from megatron.core.inference.config import (
+    CudaGraphSizingDistribution,
     InferenceConfig,
     KVCacheManagementMode,
     MambaInferenceStateConfig,
@@ -356,6 +357,9 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         unified_memory_level=args.inference_dynamic_batching_unified_memory_level,
         kv_cache_management_mode=KVCacheManagementMode(args.rl_kv_cache_management_mode),
         cuda_graph_mixed_prefill_count=args.inference_dynamic_batching_cuda_graph_mixed_prefill_count,  # pylint: disable=line-too-long
+        cuda_graph_sizing_distribution=CudaGraphSizingDistribution(
+            args.inference_dynamic_batching_cuda_graph_sizing_distribution
+        ),
         use_cuda_graphs_for_non_decode_steps=not args.decode_only_cuda_graphs,
         cuda_graph_all_prefills=args.inference_cuda_graph_all_prefills,
         static_kv_memory_pointers=args.rl_persist_cuda_graphs,

@@ -874,11 +874,7 @@ class TestDynamicContext:
         assert dynamic_context.copy_async_prepared_decode_input_ids_from_samples(
             sampled_tokens, None, num_speculative_tokens=0
         )
-        assert dynamic_context.gpu_view.token_to_input_ids[:3].cpu().tolist() == [
-            100,
-            101,
-            102,
-        ]
+        assert dynamic_context.gpu_view.token_to_input_ids[:3].cpu().tolist() == [100, 101, 102]
 
         dynamic_context.publish_async_prepared_decode_plan()
 
@@ -2082,10 +2078,16 @@ class TestDynamicContext:
             num_speculative_tokens=num_speculative_tokens,
         )
 
-        smallest = min(ctx.cuda_graph_batch_dimensions_list)
+        # The fast path is decode-only by construction, so pick the smallest decode-only batch_dim.
+        # With the geometric grid for mixed cudagraphs, the global min may now be a P=1 mixed shape
+        # when num_speculative_tokens > 0 makes decode-only token_count > 1)
+        smallest = min(
+            batchdim
+            for batchdim in ctx.cuda_graph_batch_dimensions_list
+            if batchdim.prefill_req_count == 0
+        )
         N = smallest.decode_req_count
         T = smallest.token_count  # N * (num_speculative_tokens + 1)
-        assert smallest.prefill_req_count == 0, "smallest graph must be decode-only"
 
         # --- slow path (reference) ---
         ctx.add_dummy_requests_for_cudagraph_capture(smallest)
