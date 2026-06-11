@@ -69,7 +69,9 @@ class DSv4HybridAttention(Attention):
         attention_type: str,
         cp_comm_type: Optional[str] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        pp_layer_offset: Optional[int] = None,
         is_mtp_layer: bool = False,
+        name: str | None = None,
     ) -> None:
 
         super().__init__(
@@ -79,7 +81,9 @@ class DSv4HybridAttention(Attention):
             attention_type=attention_type,
             attn_mask_type=attn_mask_type,
             pg_collection=pg_collection,
+            pp_layer_offset=pp_layer_offset,
             is_mtp_layer=is_mtp_layer,
+            name=name,
         )
         self.config: MLATransformerConfig
 
@@ -412,7 +416,9 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         attn_mask_type=AttnMaskType.padding,
         cp_comm_type: Optional[str] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        pp_layer_offset: Optional[int] = None,
         is_mtp_layer: bool = False,
+        name: str | None = None,
     ):
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -425,7 +431,9 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             attention_type="self",
             cp_comm_type=cp_comm_type,
             pg_collection=pg_collection,
+            pp_layer_offset=pp_layer_offset,
             is_mtp_layer=is_mtp_layer,
+            name=name,
         )
 
         q_down_proj_kwargs = {}
@@ -446,6 +454,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             tp_comm_buffer_name='q_down_proj',
             skip_weight_param_allocation=False,
             tp_group=None,
+            name=(name + ".linear_q_down_proj") if name is not None else None,
             **q_down_proj_kwargs,
         )
 
@@ -461,6 +470,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             is_expert=False,
             tp_comm_buffer_name='q_up_proj',
             tp_group=pg_collection.tp,
+            name=(name + ".linear_q_up_proj") if name is not None else None,
         )
 
         self.linear_kv_proj = build_module(
@@ -475,6 +485,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             is_expert=False,
             tp_comm_buffer_name='kv_up_proj',
             tp_group=pg_collection.tp,
+            name=(name + ".linear_kv_proj") if name is not None else None,
         )
         self.kv_layernorm = submodules.kv_layernorm(
             hidden_size=self.config.v_head_dim,

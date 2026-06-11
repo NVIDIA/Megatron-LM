@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import gc
 import os
@@ -106,6 +106,19 @@ def _make_gpt_inputs(
     return input_ids, position_ids, attention_mask
 
 
+def _capture_params(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
+    params: Dict[str, torch.Tensor] = {}
+    for name, p in model.named_parameters():
+        params[name] = p.detach().cpu().clone()
+    return params
+
+
+def _restore_params(model: torch.nn.Module, params: Dict[str, torch.Tensor]) -> None:
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            p.copy_(params[name].to(device=p.device, dtype=p.dtype))
+
+
 def _run_one_iter_and_capture(
     model: GPTModel,
     *,
@@ -126,9 +139,12 @@ def _run_one_iter_and_capture(
     if enable_offload_reset:
         off_interface.reset()
 
-    # for p in model.parameters():
-    #     if p.grad is not None:
-    #         p.grad = None
+    # Keep warmup-created grad buffers resident so the peak-memory check still
+    # compares the steady-state allocator footprint, but remove accumulated
+    # warmup values before capturing correctness grads.
+    for p in model.parameters():
+        if p.grad is not None:
+            p.grad.zero_()
 
     torch.cuda.reset_peak_memory_stats()
     logits = model(input_ids=input_ids, position_ids=position_ids, attention_mask=attention_mask)
@@ -145,7 +161,6 @@ def _run_one_iter_and_capture(
     return logits.detach().float().cpu(), grads, peak_bytes
 
 
-@pytest.mark.flaky_in_dev
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
 @pytest.mark.parametrize(
     "is_moe, is_mla, offload_modules",
@@ -213,6 +228,7 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
             is_mla=is_mla,
         ).cuda()
         base_model.train()
+        base_params = _capture_params(base_model)
 
         # Warmup baseline once for allocator stability
         _run_one_iter_and_capture(
@@ -248,6 +264,7 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
             min_offloaded_tensor_size=1024,  # force offloading for UT determinism
             is_mla=is_mla,
         ).cuda()
+        _restore_params(off_model, base_params)
         off_model.train()
 
         # Warmup 1 iter to populate cached chunks, then reset to finish warmup bookkeeping.
@@ -317,7 +334,6 @@ def test_gpt_fine_grained_activation_offloading_correctness_and_memory(
         Utils.destroy_model_parallel()
 
 
-@pytest.mark.flaky_in_dev
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
 @pytest.mark.skipif(
     not is_te_min_version("1.9.0.dev0"),
