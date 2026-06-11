@@ -112,6 +112,7 @@ def destroy_all_grids():
     _active_grids.clear()
     _embedding_pg_cache.clear()
     BridgeCommunicator.destroy_broadcast_pgs()
+    BridgeCommunicator.destroy_bridge_pgs()
 
 
 def get_pg_collection(grid):
@@ -250,7 +251,7 @@ def get_language_model_spec(
         pipeline_dtype=pipeline_dtype,
         bf16=bf16,
         cross_entropy_loss_fusion=True,
-        cross_entropy_fusion_impl='te',
+        cross_entropy_fusion_impl='native',
         calculate_per_token_loss=per_token_loss,
         **extra_kwargs,
     )
