@@ -349,7 +349,7 @@ class DeepepV2Dispatch(torch.autograd.Function):
 
         ctx.buffer = buffer
         ctx.handle = handle
-        ctx.num_sms = num_sms
+        ctx.num_sms = handle.num_sms
         ctx.async_finish = async_finish
         ctx.allocate_on_comm_stream = allocate_on_comm_stream
         tokens_per_expert = torch.tensor(handle.num_recv_tokens_per_expert_list)
@@ -399,7 +399,7 @@ class DeepepV2Combine(torch.autograd.Function):
 
         ctx.buffer = buffer
         ctx.handle = handle
-        ctx.num_sms = num_sms
+        ctx.num_sms = handle.num_sms if num_sms == 0 else num_sms
         ctx.async_finish = async_finish
         ctx.allocate_on_comm_stream = allocate_on_comm_stream
         return combined_x, combined_token_probs
