@@ -805,8 +805,14 @@ def fwd_fused_indexer_loss_naive_thd(
             pg_collection,
             calculate_per_token_loss,
         )
-        # topk_indices_b: (1, seqlen_q_b, topk) — local-per-segment.
-        topk_indices_thd[q_start:q_end] = topk_indices_b.squeeze(0).int()
+        # topk_indices_b: (1, seqlen_q_b, topk_seg) where
+        # ``topk_seg = min(topk, seqlen_k_b)``. Real segments with
+        # ``seqlen_k_b < topk`` produce a narrower slice; write only
+        # those columns and leave the trailing ``[topk_seg:topk]``
+        # range at the buffer's initial -1 sentinel so the downstream
+        # post-filter in csa.py marks them invalid.
+        topk_seg = topk_indices_b.shape[-1]
+        topk_indices_thd[q_start:q_end, :topk_seg] = topk_indices_b.squeeze(0).int()
         weighted_losses.append(loss_b * seqlen_q_b)
 
     if weighted_losses:
@@ -868,7 +874,13 @@ def bwd_fused_indexer_loss_naive_thd(
         k_b = k[k_start:k_end].unsqueeze(1)
         query_b = query[q_start:q_end].unsqueeze(1)
         key_b = key[k_start:k_end].unsqueeze(1)
-        topk_b = topk_indices_thd[q_start:q_end].unsqueeze(0).long()
+        # Slice to ``min(topk_global, seqlen_k_b)`` so segments whose
+        # K count is shorter than the global topk don't feed -1
+        # sentinels (the buffer's initial value) into the inner
+        # ``bwd_fused_indexer_loss_naive``'s ``scatter_(-1, ..., 0)``,
+        # which would OOB. The forward writes only this many columns.
+        topk_seg = min(topk_indices_thd.shape[-1], seqlen_k_b)
+        topk_b = topk_indices_thd[q_start:q_end, :topk_seg].unsqueeze(0).long()
         mask_b = _build_causal_mask_seg(seqlen_q_b, seqlen_k_b, ratio, device)
 
         # Scale grad_loss by (seqlen_q_b / total_q) so the per-seg
