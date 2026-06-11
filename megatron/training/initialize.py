@@ -339,6 +339,25 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
         if mpu.model_parallel_is_initialized():
             print("model parallel is already initialized")
         else:
+            # When the loss is split across multiple pipeline stages (MTP loss split), build a
+            # loss group over those stages so their replicated output_layer weights stay in sync.
+            get_loss_ranks = None
+            if args.pipeline_model_parallel_layout is not None:
+                from megatron.core.transformer.pipeline_parallel_layer_layout import (
+                    PipelineParallelLayerLayout,
+                )
+
+                _loss_layout = PipelineParallelLayerLayout.from_str(
+                    args.pipeline_model_parallel_layout, args.pipeline_model_parallel_size
+                )
+                if _loss_layout.is_loss_split():
+                    _loss_pp_indices = sorted(
+                        {pp for pp, _vp, _cnt in _loss_layout.get_loss_stages()}
+                    )
+
+                    def get_loss_ranks(pp_ranks):
+                        return [pp_ranks[i] for i in _loss_pp_indices]
+
             mpu.initialize_model_parallel(
                 args.tensor_model_parallel_size,
                 args.pipeline_model_parallel_size,
@@ -357,6 +376,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 order='tp-cp-ep-dp-pp' if not args.use_tp_pp_dp_mapping else 'tp-cp-ep-pp-dp',
                 get_embedding_ranks=get_embedding_ranks,
                 get_position_embedding_ranks=get_position_embedding_ranks,
+                get_loss_ranks=get_loss_ranks,
                 create_gloo_process_groups=args.use_gloo_process_groups,
                 high_priority_stream_groups=args.high_priority_stream_groups,
                 sharp_enabled_group=args.sharp_enabled_group,

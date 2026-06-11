@@ -677,11 +677,27 @@ def process_mtp_loss(
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
     packed_seq_params: Optional[PackedSeqParams] = None,
     scale_logits_fn: Optional[Callable[[Tensor], Tensor]] = None,
+    owned_chunk_indices: Optional[List[int]] = None,
+    is_final_loss_stage: bool = True,
 ) -> Tensor:
     """Process Multi-Token Prediction (MTP) loss computation.
 
-    This is a standalone function that handles MTP loss computation. It's used on the
-    post_process rank to split concatenated hidden states and compute MTP losses.
+    This is a standalone function that handles MTP loss computation. It runs on every loss stage.
+
+    The incoming ``hidden_states`` is the concatenation ``[main, mtp_0, ..., mtp_k]`` along dim 0,
+    where ``k = max(owned_chunk_indices)`` (earlier loss stages have already peeled off and
+    computed loss for the higher-index chunks). This stage computes loss only for the chunks in
+    ``owned_chunk_indices`` (index 0 = the main model, handled by the caller's output layer; the
+    MTP chunks j>=1 correspond to ``mtp_layer_number = j - 1``). The label/loss-mask roll is
+    cumulative, so the loop advances the roll on every MTP layer even when this stage does not own
+    that chunk.
+
+    Return value:
+        - final loss stage (owns chunk 0): the main chunk, to be projected by the caller's
+          output layer for the main logits/loss.
+        - non-final loss stage: the low-index prefix ``[main, ...]`` that downstream loss stages
+          still need, forwarded along the pipeline. The MTP losses this stage computed are
+          injected into the backward pass via ``MTPLossAutoScaler`` on the returned tensor.
 
     Args:
         hidden_states (Tensor): Hidden states tensor (concatenated with MTP outputs).
@@ -702,11 +718,28 @@ def process_mtp_loss(
         Tensor: Updated hidden states after MTP loss processing (first chunk only).
     """
     nvtx_range_push(suffix="process_mtp_loss")
-    hidden_states_list = torch.chunk(hidden_states, 1 + config.mtp_num_layers, dim=0)
-    hidden_states = hidden_states_list[0]
+
+    # Chunks present at this stage are [0 .. max(owned)] (downstream loss stages get the lower
+    # prefix). Default (no split): own every chunk -> identical to the legacy single-stage path.
+    if owned_chunk_indices is None:
+        owned_chunk_indices = list(range(1 + config.mtp_num_layers))
+    num_recv_chunks = max(owned_chunk_indices) + 1
+    hidden_states_list = torch.chunk(hidden_states, num_recv_chunks, dim=0)
+
+    # Tensor this stage returns: the main chunk on the final loss stage (projected by the main
+    # output layer downstream), else the low-index prefix that downstream loss stages still need.
+    if is_final_loss_stage:
+        out_hidden_states = hidden_states_list[0]
+    else:
+        prefix_end = min(owned_chunk_indices)
+        out_hidden_states = torch.cat(hidden_states_list[:prefix_end], dim=0)
 
     if labels is None:
-        return hidden_states
+        nvtx_range_pop(suffix="process_mtp_loss")
+        return out_hidden_states
+
+    # MTP layer numbers this stage owns (chunk index 0 is the main model, handled by the caller).
+    owned_mtp_layer_numbers = {idx - 1 for idx in owned_chunk_indices if idx >= 1}
 
     mtp_labels = labels.clone()
     if loss_mask is None:
@@ -738,12 +771,16 @@ def process_mtp_loss(
         config.cross_entropy_loss_fusion and config.cross_entropy_fusion_impl == "linear"
     )
     for mtp_layer_number in range(config.mtp_num_layers):
+        # Roll on every layer to keep the cumulative roll count correct, even for chunks this
+        # stage does not own.
         mtp_labels, _ = roll_tensor(
             mtp_labels, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
         loss_mask, num_tokens = roll_tensor(
             loss_mask, shifts=-1, dims=-1, cp_group=cp_group, packed_seq_params=packed_seq_params
         )
+        if mtp_layer_number not in owned_mtp_layer_numbers:
+            continue
         if fuse_linear_cross_entropy:
             mtp_loss = output_layer_for_mtp(
                 hidden_states_list[mtp_layer_number + 1],
@@ -785,15 +822,23 @@ def process_mtp_loss(
             mtp_loss_normalized = (
                 mtp_loss_scale * mtp_loss * (original_num_tokens / num_tokens_safe)
             )
-            hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_normalized)
+            out_hidden_states = MTPLossAutoScaler.apply(out_hidden_states, mtp_loss_normalized)
         else:
             safe_num_tokens = num_tokens.clamp(min=1)
-            hidden_states = MTPLossAutoScaler.apply(
-                hidden_states, mtp_loss_scale * mtp_loss / safe_num_tokens
+            out_hidden_states = MTPLossAutoScaler.apply(
+                out_hidden_states, mtp_loss_scale * mtp_loss / safe_num_tokens
             )
 
     nvtx_range_pop(suffix="process_mtp_loss")
-    return hidden_states
+    if not is_final_loss_stage:
+        # This tensor is forwarded as the pipeline output. MTPLossAutoScaler.apply returns an
+        # alias of its input (out._base is not None), which trips deallocate_output_tensor's
+        # "counter-productive to free a view of another tensor" assertion. Make it viewless while
+        # keeping the autograd graph so the MTP-loss backward still fires.
+        out_hidden_states = make_viewless_tensor(
+            inp=out_hidden_states, requires_grad=True, keep_graph=True
+        )
+    return out_hidden_states
 
 
 class MultiTokenPredictionLayer(MegatronModule):

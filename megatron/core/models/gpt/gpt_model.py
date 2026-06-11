@@ -6,7 +6,7 @@ from typing import Dict, Literal, Optional
 import torch
 from torch import Tensor
 
-from megatron.core import tensor_parallel
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.inference.contexts import BaseInferenceContext
@@ -294,6 +294,11 @@ class GPTModel(LanguageModule):
         if self.pre_process or self.post_process or self.mtp_process or self.is_loss_stage:
             self.setup_embeddings_and_output_layer()
 
+        # When the loss is split across multiple pipeline stages, the output_layer is replicated
+        # on each loss stage. Make the replicas identical at init by all-reducing from the final
+        # loss stage so every stage projects logits with the same weights.
+        self._sync_output_layer_across_loss_group()
+
         if has_config_logger_enabled(self.config):
             log_config_to_disk(
                 self.config, self.state_dict(), prefix=f'{type(self).__name__}_init_ckpt'
@@ -302,6 +307,34 @@ class GPTModel(LanguageModule):
             if hasattr(module, 'finish_init'):
                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
                 module.finish_init(quant_config)
+
+    def _sync_output_layer_across_loss_group(self) -> None:
+        """Make the replicated output_layer weights identical across split-loss stages.
+
+        With MTP loss split the output_layer is built on every loss stage. To keep them a single
+        logical weight, the non-final loss stages zero their freshly-initialized copy and the
+        whole loss group all-reduces, leaving every stage holding the final loss stage's weights.
+        The per-step gradient all-reduce that keeps them in sync lives in finalize_model_grads
+        (Step D-2). No-op for the default single-loss-stage case (loss group of size 1).
+        """
+        if not getattr(self, 'is_loss_stage', False):
+            return
+        layout = self.config.pipeline_model_parallel_layout
+        if layout is None or not layout.is_loss_split():
+            return
+        if not torch.distributed.is_initialized() or self.config.init_model_with_meta_device:
+            return
+        loss_group = parallel_state.get_loss_group(check_initialized=False)
+        if loss_group is None or torch.distributed.get_world_size(loss_group) <= 1:
+            return
+        weight = self.output_layer.weight
+        if weight is None:
+            return
+        if not self.is_final_loss_stage:
+            with torch.no_grad():
+                weight.data.zero_()
+        weight.data = weight.data.cuda()
+        torch.distributed.all_reduce(weight.data, group=loss_group)
 
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.
@@ -674,7 +707,9 @@ class GPTModel(LanguageModule):
                 **(extra_block_kwargs or {}),
             )
 
-        if not self.post_process:
+        # Loss stages (which may not be the last PP stage when the MTP loss is split) run the
+        # loss path; pure middle stages just forward their hidden states.
+        if not self.post_process and not self.is_loss_stage:
             return hidden_states
 
         if self.config.mtp_num_layers:
@@ -685,6 +720,8 @@ class GPTModel(LanguageModule):
                 self._decoder_hidden_states_cache = hidden_states
             else:
                 # In training/eval, use the utility function for processing MTP loss/scaling.
+                # On a non-final loss stage this returns the low-index prefix to forward
+                # downstream; on the final stage it returns the main chunk for the output layer.
                 hidden_states = process_mtp_loss(
                     hidden_states=hidden_states,
                     labels=labels,
@@ -698,7 +735,18 @@ class GPTModel(LanguageModule):
                     cp_group=self.pg_collection.cp,
                     packed_seq_params=packed_seq_params,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
+                    owned_chunk_indices=self.loss_chunk_indices,
+                    is_final_loss_stage=self.is_final_loss_stage,
                 )
+
+        # A non-final loss stage only computes its share of the MTP loss (injected into backward
+        # via MTPLossAutoScaler inside process_mtp_loss) and forwards the remaining hidden-state
+        # chunks downstream. The main logits/loss are produced only on the final loss stage.
+        if self.is_loss_stage and not self.is_final_loss_stage:
+            return hidden_states
+        if not self.post_process:
+            return hidden_states
+
         sequence_parallel_override = False
 
         if in_inference_mode and inference_context.config.materialize_only_last_token_logits:

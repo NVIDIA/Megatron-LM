@@ -36,6 +36,9 @@ _MODEL_PARALLEL_GROUP = None
 _EMBEDDING_GROUP = None
 # Position embedding group.
 _POSITION_EMBEDDING_GROUP = None
+# Loss group: the pipeline stages that compute output+loss when the loss is split across
+# multiple stages (MTP loss split). Used to keep their replicated output_layer weights in sync.
+_LOSS_GROUP = None
 # Data parallel group that the current rank belongs to.
 _DATA_PARALLEL_GROUP = None
 _DATA_PARALLEL_GROUP_GLOO = None
@@ -84,6 +87,9 @@ _MPU_PIPELINE_MODEL_PARALLEL_RANK = None
 
 # A list of ranks that have a copy of the embedding.
 _EMBEDDING_GLOBAL_RANKS = None
+
+# A list of ranks in the loss group (split-loss output_layer replicas).
+_LOSS_GLOBAL_RANKS = None
 
 # A list of ranks that have a copy of the position embedding.
 _POSITION_EMBEDDING_GLOBAL_RANKS = None
@@ -534,6 +540,12 @@ def default_position_embedding_ranks(pp_ranks):
     return [pp_ranks[0]]
 
 
+def default_loss_ranks(pp_ranks):
+    """Return the default ranks that compute output+loss.
+    For most models, this is only the last pipeline stage."""
+    return [pp_ranks[-1]]
+
+
 def overwrite_nccl_comm_cfgs(nccl_comm_cfgs, pg_name, key_value_pair):
     """Overwrite the nccl_comm_cfgs for the given pg_name with the given key_value_pair."""
     if pg_name not in nccl_comm_cfgs:
@@ -560,6 +572,7 @@ def initialize_model_parallel(
     order: str = "tp-cp-ep-dp-pp",
     get_embedding_ranks: Optional[Callable[[List[int], Optional[int]], List[int]]] = None,
     get_position_embedding_ranks: Optional[Callable[[List[int], Optional[int]], List[int]]] = None,
+    get_loss_ranks: Optional[Callable[[List[int]], List[int]]] = None,
     create_gloo_process_groups: bool = True,
     high_priority_stream_groups: Optional[List[str]] = None,
     sharp_enabled_group: Optional[str] = None,
@@ -722,6 +735,9 @@ def initialize_model_parallel(
 
     if get_position_embedding_ranks is None:
         get_position_embedding_ranks = default_position_embedding_ranks
+
+    if get_loss_ranks is None:
+        get_loss_ranks = default_loss_ranks
 
     # Get world size and rank. Ensure some consistencies.
     assert torch.distributed.is_initialized()
@@ -1039,6 +1055,9 @@ def initialize_model_parallel(
     global _POSITION_EMBEDDING_GROUP
     global _POSITION_EMBEDDING_GLOBAL_RANKS
     assert _POSITION_EMBEDDING_GROUP is None, "position embedding group is already initialized"
+    global _LOSS_GROUP
+    global _LOSS_GLOBAL_RANKS
+    assert _LOSS_GROUP is None, "loss group is already initialized"
     if pipeline_model_parallel_comm_backend == "ucc":
         # The UCC backend provides two key benefits:
         # 1) Achieves better bandwidth utilization than NCCL when using InfiniBand links.
@@ -1141,6 +1160,21 @@ def initialize_model_parallel(
         if rank in position_embedding_ranks:
             _POSITION_EMBEDDING_GROUP = group
             _POSITION_EMBEDDING_GLOBAL_RANKS = position_embedding_ranks
+
+        # Loss group: stages that compute output+loss when the loss is split (MTP loss split).
+        # Created symmetrically on every rank (collective), so the all-reduce that keeps the
+        # replicated output_layer weights in sync is well-defined. For the default (single loss
+        # stage) this group has size 1 and the sync all-reduce is a no-op.
+        loss_ranks = get_loss_ranks(ranks)
+        group = create_group(
+            loss_ranks,
+            timeout=timeout,
+            pg_options=get_nccl_options("embd", nccl_comm_cfgs),
+            group_desc="LOSS_GROUP",
+        )
+        if rank in loss_ranks:
+            _LOSS_GROUP = group
+            _LOSS_GLOBAL_RANKS = loss_ranks
 
     # Build the tensor + data parallel groups.
     global _TENSOR_AND_DATA_PARALLEL_GROUP
@@ -1554,6 +1588,22 @@ def get_embedding_group(check_initialized=True):
     if check_initialized:
         assert _EMBEDDING_GROUP is not None, "embedding group is not initialized"
     return _EMBEDDING_GROUP
+
+
+def get_loss_group(check_initialized=True):
+    """Get the loss group the caller rank belongs to (split-loss output_layer replicas).
+
+    Returns None on ranks that are not loss stages. For the default single-loss-stage case the
+    group has size 1.
+    """
+    if check_initialized:
+        assert _LOSS_GROUP is not None, "loss group is not initialized"
+    return _LOSS_GROUP
+
+
+def get_loss_global_ranks():
+    """Return the global ranks that constitute the caller's loss group (or None)."""
+    return _LOSS_GLOBAL_RANKS
 
 
 def get_position_embedding_group(check_initialized=True):
@@ -2138,6 +2188,12 @@ def destroy_model_parallel():
 
     global _POSITION_EMBEDDING_GLOBAL_RANKS
     _POSITION_EMBEDDING_GLOBAL_RANKS = None
+
+    global _LOSS_GROUP
+    _LOSS_GROUP = None
+
+    global _LOSS_GLOBAL_RANKS
+    _LOSS_GLOBAL_RANKS = None
 
     global _TENSOR_AND_DATA_PARALLEL_GROUP
     _TENSOR_AND_DATA_PARALLEL_GROUP = None

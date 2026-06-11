@@ -33,7 +33,11 @@ from megatron.core.models.gpt import GPTModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
-from megatron.core.transformer.multi_token_prediction import get_mtp_ranks, mtp_on_this_rank
+from megatron.core.transformer.multi_token_prediction import (
+    get_mtp_ranks,
+    loss_on_this_rank,
+    mtp_on_this_rank,
+)
 from megatron.core.utils import (
     StragglerDetector,
     get_attr_wrapped_model,
@@ -137,7 +141,10 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
     if (
         not is_first_or_last_pipeline_stage(vp_stage)
         and not is_packed_sequence
-        and ((not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)))
+        and (not mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))
+        # Split-loss stages (MTP loss split) also need labels/loss_mask to compute their
+        # share of the MTP loss, even when they are not the last pipeline stage.
+        and (not loss_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage))
     ):
         return None, None, None, None, None, None
 
@@ -306,8 +313,10 @@ def is_dataset_built_on_rank(vp_stage=None, is_packed_sequence=False):
         return False
     elif is_packed_sequence:
         return True
-    return is_first_or_last_pipeline_stage(vp_stage) or mtp_on_this_rank(
-        config, ignore_virtual=False, vp_stage=vp_stage
+    return (
+        is_first_or_last_pipeline_stage(vp_stage)
+        or mtp_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
+        or loss_on_this_rank(config, ignore_virtual=False, vp_stage=vp_stage)
     )
 
 
