@@ -102,7 +102,11 @@ class PipelineParallelLayerLayout:
         assert (
             self.flatten_layout.count(LayerType.embedding) == 1
         ), "Embedding must be specified exactly once"
-        assert self.flatten_layout.count(LayerType.loss) == 1, "Loss must be specified exactly once"
+        # 新方案: 允许多个 loss 层 (rank6/rank7 双 loss, 按 MTP 拼接维切分各自算一半).
+        # 仍要求至少 1 个 loss, 且最后一层必须是 loss (见上方 flatten_layout[-1] 检查).
+        assert (
+            self.flatten_layout.count(LayerType.loss) >= 1
+        ), "At least one loss layer must be specified"
         assert self.flatten_layout.count(LayerType.decoder) == num_layers, (
             f"Number of decoder layers {self.flatten_layout.count(LayerType.decoder)}"
             f"must match num_layers {num_layers}"

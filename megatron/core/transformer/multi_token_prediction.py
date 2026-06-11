@@ -1743,17 +1743,6 @@ class MultiTokenPredictionBlock(MegatronModule):
         # get hidden states from previous mtp stages
         offset = get_mtp_layer_offset(self.config, self.vp_stage)
         print(f"for debug, in mtp block forward, offset: {offset}", flush=True)
-        # hard code for pp8ep1, mtp=3, mtp split.
-        rank = torch.distributed.get_rank()
-        if rank == 4:
-            offset = 0
-        elif rank == 5:
-            offset = 1
-        elif rank == 6:
-            offset = 2
-        else:
-            offset = 0
-        print(f"for debug, in mtp block forward, after hard code, rank: {rank}, offset: {offset}", flush=True)
         hidden_states_list = list(torch.chunk(hidden_states, 1 + offset, dim=0))
         if mhc_multistream is not None:
             # mHC mode: use multi-stream for MTP depth input, contracted for loss list.
