@@ -160,6 +160,7 @@ def start_text_gen_server(
         logger.warning("Text gen server processes are already running.")
         return
 
+    # The caller may pass in a socket it has already bound ahead of time.
     if sock is not None:
         bound_port = sock.getsockname()[1]
         if bound_port == 0:
