@@ -440,6 +440,19 @@ class LanguageModule(MegatronModule):
         elif is_output_layer_stage:
             # Make sure the output layer follows the embeddings padding logic
             sharded_state_dict[output_layer_weight_key].allow_shape_mismatch = True
+            # MTP loss split: the output_layer is replicated across loss stages. Give the
+            # non-final replica a distinct replica_id (PP-replica slot = 1, mirroring the tied
+            # word embedding) so dist-checkpoint treats it as a replica of the final stage's copy
+            # rather than a second writer for the same shard. The distributed-optimizer state
+            # inherits this replica_id from the model param, so this fixes both weight and optim.
+            if getattr(self, 'is_loss_stage', False) and not getattr(
+                self, 'is_final_loss_stage', True
+            ):
+                sharded_state_dict[output_layer_weight_key].replica_id = (
+                    1,
+                    0,
+                    parallel_state.get_data_parallel_rank(with_context_parallel=True),
+                )
 
         # Regardless of sharing the output weights with embeddings, we must handle the bias padding
         if is_output_layer_stage and output_layer_bias_key in sharded_state_dict:
