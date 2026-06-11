@@ -61,7 +61,7 @@ from packaging import version
 
 import megatron.core.pipeline_parallel.schedules as schedule
 from megatron.core.distributed import DistributedDataParallelConfig
-from megatron.core.distributed.finalize_model_grads import finalize_model_grads
+from megatron.core.models.mimo._finalize import finalize_mimo_grads
 from megatron.core.models.mimo.colocated_schedule import colocated_forward_backward_with_pp
 from megatron.core.models.mimo.optimizer import get_mimo_optimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
@@ -202,59 +202,21 @@ def _wire_training_hooks(mimo_model, language_pg, vision_pg, llm_grid=None):
     """
 
     no_sync_func = build_no_sync_func(mimo_model)
-    pp_group = llm_grid.get_pg("pp") if llm_grid is not None else None
 
     def finalize_grads_func(model_list, num_tokens, force_all_reduce=False, **kwargs):
-        # Schedule passes the per-rank sum-across-microbatches of what the
-        # loss_func returned. Because loss_func runs only on the LLM side,
-        # this is the LLM-local token count.
-        assert num_tokens is not None, (
-            "finalize_grads_func expects calculate_per_token_loss=True on the "
-            "TransformerConfig so the schedule forwards total_num_tokens; got None."
+        # Delegate to the production colocated finalize helper. This both
+        # exercises finalize_mimo_grads against the oracle (any divergence
+        # surfaces as a weight/grad mismatch) and keeps a single source of
+        # truth for the heterogeneous-DP grad-scaling story. The helper sources
+        # the LLM PP group from ``language_pg.pp``; the PP>1 cases below confirm
+        # that matches ``llm_grid.get_pg('pp')``.
+        finalize_mimo_grads(
+            mimo_model,
+            num_tokens,
+            language_pg=language_pg,
+            vision_pg=vision_pg,
+            force_all_reduce=force_all_reduce,
         )
-
-        # PP>1: only the last LLM PP stage emits a non-zero num_tokens
-        # from the loss_func. Broadcast to earlier stages so every rank
-        # holds the same value before the DP all-reduce below.
-        if pp_group is not None and pp_group.size() > 1:
-            last_rank = dist.get_global_rank(pp_group, pp_group.size() - 1)
-            dist.broadcast(num_tokens, src=last_rank, group=pp_group)
-
-        # Phase 1: lift the all-reduce. After this, every rank (including
-        # encoder-only replicas) has N_global = total non-padded tokens in
-        # the global batch.
-        llm_dp_pg = language_pg.dp_cp if language_pg.dp_cp is not None else language_pg.dp
-        dist.all_reduce(num_tokens, group=llm_dp_pg, op=dist.ReduceOp.SUM)
-        n_global = num_tokens.item()
-
-        # Phase 2: per-side DDP finish without built-in num_tokens scaling.
-        # Forward ``force_all_reduce`` so PP grad-sync semantics (if ever
-        # exercised here) aren't silently dropped.
-        if mimo_model.language_model is not None:
-            finalize_model_grads(
-                [mimo_model.language_model],
-                num_tokens=None,
-                pg_collection=language_pg,
-                force_all_reduce=force_all_reduce,
-            )
-        for submodule in mimo_model.modality_submodules.values():
-            if submodule is not None:
-                finalize_model_grads(
-                    [submodule],
-                    num_tokens=None,
-                    pg_collection=vision_pg,
-                    force_all_reduce=force_all_reduce,
-                )
-
-        # Phase 3: uniform divide by N_global. Guard div-by-zero for the
-        # degenerate fully-masked batch.
-        if n_global > 0:
-            inv = 1.0 / n_global
-            if mimo_model.language_model is not None:
-                mimo_model.language_model.scale_gradients(inv)
-            for submodule in mimo_model.modality_submodules.values():
-                if submodule is not None:
-                    submodule.scale_gradients(inv)
 
     mimo_model.config.no_sync_func = no_sync_func
     mimo_model.config.finalize_model_grads_func = finalize_grads_func

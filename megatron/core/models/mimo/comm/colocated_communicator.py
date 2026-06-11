@@ -139,6 +139,18 @@ class ColocatedBridgeCommunicator:
                     raise ValueError(
                         f"{name} CP must be 1 for ColocatedBridgeCommunicator, got {cp_size}"
                     )
+            # ep / expt_dp interleave into the get_rank_enum group ordering exactly
+            # like cp, so a value > 1 would conflate the DP index in _build_rank_mappings
+            # and silently build wrong fan-in/fan-out gather groups (wrong-batch gather
+            # or NCCL hang). Reject them explicitly rather than corrupt rank mappings.
+            for forbidden in ('ep', 'expt_dp'):
+                if forbidden in grid.dim_names:
+                    sz = grid.shape[grid.dim_names.index(forbidden)]
+                    if sz != 1:
+                        raise ValueError(
+                            f"{name} {forbidden} must be 1 for "
+                            f"ColocatedBridgeCommunicator, got {sz}"
+                        )
         if 'pp' in self.src_grid.dim_names:
             src_pp = self.src_grid.shape[self.src_grid.dim_names.index('pp')]
             if src_pp != 1:

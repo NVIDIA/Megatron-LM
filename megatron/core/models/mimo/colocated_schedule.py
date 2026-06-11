@@ -141,12 +141,27 @@ def colocated_forward_backward_with_pp(
     # captured force_all_reduce so callers requesting that semantics
     # (e.g. final-microbatch sync with overlap_grad_reduce) get it.
     if not forward_only and original_finalize is not None:
-        original_finalize(
-            [mimo_model],
-            capture.num_tokens,
-            pg_collection=schedule_kwargs.get('pg_collection'),
-            force_all_reduce=capture.force_all_reduce,
-        )
+        try:
+            original_finalize(
+                [mimo_model],
+                capture.num_tokens,
+                pg_collection=schedule_kwargs.get('pg_collection'),
+                force_all_reduce=capture.force_all_reduce,
+            )
+        except AttributeError as exc:
+            # The stock finalize_model_grads iterates `model_chunk.finish_grad_sync()`
+            # / `.scale_gradients()`, which a bare MimoModel does not implement, and it
+            # takes a single pg_collection while the encoder/LLM submodules are separate
+            # DDPs over different DP groups. Fail fast with guidance instead of a cryptic
+            # AttributeError.
+            raise RuntimeError(
+                "colocated_forward_backward_with_pp: config.finalize_model_grads_func "
+                "cannot finalize a MimoModel. MimoModel is not a DistributedDataParallel "
+                "and its encoder/LLM submodules are separately DDP-wrapped over different "
+                "DP groups, so the stock finalize_model_grads fails. Wire a MimoModel-aware "
+                "finalize — megatron.core.models.mimo._finalize.finalize_mimo_grads — into "
+                "config.finalize_model_grads_func."
+            ) from exc
 
     return losses
 
@@ -282,17 +297,37 @@ def _build_lm_microbatches(
     """
     fan_out_scale, fan_out_slot = _fan_out_slot(encoder_grid, llm_grid)
 
+    def _narrow_on_dim(tensor, dim):
+        """Narrow ``tensor`` to this LLM-DP rank's fan-out slot along ``dim``."""
+        bs = tensor.shape[dim]
+        if bs % fan_out_scale != 0:
+            raise ValueError(
+                f"Fan-out narrowing: tensor batch={bs} (dim {dim}) not divisible "
+                f"by scale={fan_out_scale}."
+            )
+        ss = bs // fan_out_scale
+        sl = [slice(None)] * tensor.ndim
+        sl[dim] = slice(fan_out_slot * ss, (fan_out_slot + 1) * ss)
+        return tensor[tuple(sl)].contiguous()
+
     def _maybe_narrow(tensor):
         """Narrow a batch-dim-0 tensor to this LLM-DP rank's fan-out slot."""
         if fan_out_scale == 1 or tensor is None or not isinstance(tensor, torch.Tensor):
             return tensor
-        bs = tensor.shape[0]
-        if bs % fan_out_scale != 0:
-            raise ValueError(
-                f"Fan-out narrowing: tensor batch={bs} not divisible by " f"scale={fan_out_scale}."
-            )
-        ss = bs // fan_out_scale
-        return tensor[fan_out_slot * ss : (fan_out_slot + 1) * ss].contiguous()
+        return _narrow_on_dim(tensor, 0)
+
+    def _maybe_narrow_position_ids(tensor):
+        """Narrow ``position_ids`` to the fan-out slot on its BATCH dim.
+
+        ``position_ids`` is 2D ``[batch, seq]`` (batch dim 0) or, for
+        multimodal RoPE, 3D ``[rope_dim, batch, seq]`` (batch dim 1, consumed
+        that way at ``MimoModel.get_text_embeddings``). The generic dim-0
+        narrowing would slice ``rope_dim`` for the 3D layout, so select the
+        batch dim explicitly.
+        """
+        if fan_out_scale == 1 or tensor is None or not isinstance(tensor, torch.Tensor):
+            return tensor
+        return _narrow_on_dim(tensor, 1 if tensor.ndim == 3 else 0)
 
     def _maybe_narrow_attn(tensor, ref_batch):
         """Narrow ``attention_mask`` only when its dim-0 matches the input batch.
@@ -318,11 +353,25 @@ def _build_lm_microbatches(
     def _passthrough(batch_idx):
         b = all_batches[batch_idx]
         input_ids = b.get('input_ids')
+        if fan_out_scale > 1 and b.get('packing_kwargs') is not None:
+            # packing_kwargs (cu_seqlens / num_samples / max_seqlen) describes the
+            # full encoder-DP batch, but input_ids/labels/... are narrowed to this
+            # LLM-DP slot below. Slicing the data without recomputing the THD
+            # offsets would desync packed-sequence attention (cu_seqlens would
+            # index past the narrowed token count). Reject loudly instead of
+            # silently corrupting; equal-DP and fan-in are unaffected.
+            raise NotImplementedError(
+                "Colocated fan-out (llm_dp > enc_dp) with sequence packing is not "
+                "supported: packing_kwargs cu_seqlens/num_samples describe the full "
+                "encoder-DP batch but input_ids are narrowed to this LLM-DP slot. "
+                "Use equal or fan-in DP, or extend _passthrough to recompute "
+                "per-slot cu_seqlens."
+            )
         return {
             'input_ids': _maybe_narrow(input_ids),
             'labels': _maybe_narrow(b.get('labels')),
             'loss_mask': _maybe_narrow(b.get('loss_mask')),
-            'position_ids': _maybe_narrow(b.get('position_ids')),
+            'position_ids': _maybe_narrow_position_ids(b.get('position_ids')),
             'attention_mask': _maybe_narrow_attn(b.get('attention_mask'), input_ids),
             'packing_kwargs': b.get('packing_kwargs'),
         }
@@ -361,12 +410,15 @@ def _broadcast_encoder_grad(detached_full, enc_out, pp_group, is_pp_first):
     src = dist.get_global_rank(pp_group, 0)
     for key in enc_out:
         if is_pp_first:
-            if detached_full[key].grad is None:
-                raise RuntimeError(
-                    f"No encoder gradient on PP stage 0 for '{key}'; "
-                    f"Phase 2 LLM backward did not populate detached_full.grad."
-                )
-            dist.broadcast(detached_full[key].grad, src=src, group=pp_group)
+            grad = detached_full[key].grad
+            if grad is None:
+                # A microbatch that contributed no loss (e.g. fully-masked
+                # loss_mask) leaves .grad unpopulated on stage 0. Broadcast
+                # zeros rather than raising: a one-sided raise here would leave
+                # stages 1+ blocked in the matching collective below (NCCL hang).
+                grad = torch.zeros_like(detached_full[key])
+                detached_full[key].grad = grad
+            dist.broadcast(grad, src=src, group=pp_group)
         else:
             grad = torch.empty_like(detached_full[key])
             dist.broadcast(grad, src=src, group=pp_group)
@@ -383,8 +435,9 @@ def _loss_func(loss_mask, output_tensor):
     form is also safe for standard per-microbatch-mean configs.
     """
     if output_tensor is None:
-        zero_loss = torch.tensor(0.0, device='cuda', requires_grad=True)
-        zero_count = torch.tensor(0, device='cuda', dtype=torch.int)
+        device = loss_mask.device if isinstance(loss_mask, torch.Tensor) else 'cuda'
+        zero_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        zero_count = torch.tensor(0, device=device, dtype=torch.int)
         return zero_loss, zero_count, {'loss_reduced': 0.0}
     masked = output_tensor.float() * loss_mask.float()
     local_sum = masked.sum()
@@ -417,14 +470,29 @@ class _CapturingFinalize:
 
 @contextmanager
 def _deferred_finalize(config):
-    """Suppress the PP schedule's end-of-run DDP grad sync; yield the
-    original finalize and a capture object so callers can invoke the
-    original (with the captured ``num_tokens``) once after Phase 3.
+    """Suppress the PP schedule's in-pipeline DDP grad reduction; yield the
+    original finalize and a capture object so callers can invoke the original
+    (with the captured ``num_tokens``) once after Phase 3.
+
+    Deferral must neutralize BOTH grad-sync hooks the inner 1F1B schedule may
+    fire, not just ``finalize_model_grads_func``:
+
+    * ``finalize_model_grads_func`` — swapped for a capturing no-op.
+    * ``grad_sync_func`` — set to ``None``. With ``overlap_grad_reduce=True`` /
+      the distributed optimizer (production sets ``config.grad_sync_func =
+      start_grad_sync``), the inner schedule launches async LLM DP
+      reduce-scatter during Phase 2, BEFORE Phase 3 produces encoder grads.
+      That would reduce LLM grads on a buffer the encoder backward then writes
+      into, racing the single post-Phase-3 finalize. Setting it to ``None``
+      keeps all grads un-reduced until that finalize owns the reduction.
     """
     original = config.finalize_model_grads_func
+    original_grad_sync = config.grad_sync_func
     capture = _CapturingFinalize()
     config.finalize_model_grads_func = capture
+    config.grad_sync_func = None
     try:
         yield original, capture
     finally:
         config.finalize_model_grads_func = original
+        config.grad_sync_func = original_grad_sync
