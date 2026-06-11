@@ -1775,20 +1775,60 @@ class TextGenerationController:
             ]
         return prepared_update, request_bookkeeping
 
-    def _async_scheduling_can_run_basic_step(self) -> bool:
-        """Return whether the serial async-shaped path can run for this step."""
+    def _get_async_scheduling_fallback_reason(
+        self, prepared_update: Optional[Dict] = None
+    ) -> Optional[str]:
+        """Return why async-shaped scheduling must fall back, or None if eligible."""
         context = self.inference_wrapped_model.inference_context
+        model_config = self.model_config
         active_slice = slice(context.paused_request_count, context.total_request_count)
-        return (
-            context.config.enable_async_scheduling
-            and not self.num_speculative_tokens
-            and context.paused_request_count == 0
-            and context.num_prefill_requests == 0
-            and not context.is_hybrid_model
-            and self._get_stop_word_finished_ids_callback is None
-            and not context.request_metadata["return_log_probs"][active_slice].any()
-            and not (context.request_metadata["top_n_logprobs"][active_slice] > 0).any()
-        )
+        active_request_count = context.total_request_count - context.paused_request_count
+
+        if not context.config.enable_async_scheduling:
+            return "disabled"
+        if getattr(context, "async_scheduling_has_waiting_requests", False):
+            return "waiting_requests"
+        if getattr(context, "async_scheduling_has_stop_word_requests", False):
+            return "stop_words"
+        if self.num_speculative_tokens > 0:
+            return "speculative_tokens"
+        if getattr(model_config, "mtp_num_layers", None):
+            return "mtp_model"
+        if context.is_hybrid_model or getattr(model_config, "is_hybrid_model", False):
+            return "hybrid_or_mamba"
+        if getattr(model_config, "num_moe_experts", None) is not None:
+            return "moe"
+        if getattr(model_config, "expert_model_parallel_size", 1) > 1:
+            return "expert_parallel"
+        if context.expert_model_parallel_group is not None:
+            return "expert_parallel"
+        if context.paused_request_count != 0:
+            return "paused_requests"
+        if context.num_prefill_requests != 0:
+            return "prefill"
+        if context.is_chunked_prefill_enabled() or context.chunked_prefill_request_id != -1:
+            return "chunked_prefill"
+        if prepared_update is not None and prepared_update["new_speculative_tokens"] is not None:
+            return "speculative_tokens"
+        if active_request_count == 0:
+            return None
+        if context.request_metadata["return_log_probs"][active_slice].any().item():
+            return "log_probs"
+        if (context.request_metadata["top_n_logprobs"][active_slice] > 0).any().item():
+            return "top_n_logprobs"
+        if not (context.request_metadata["top_k"][active_slice] == 1).all().item():
+            return "non_greedy_sampling"
+        if (context.request_metadata["top_p"][active_slice] > 0.0).any().item():
+            return "non_greedy_sampling"
+
+        block_boundary_threshold = self.inference_wrapped_model.inference_context.block_size_tokens
+        block_boundary_threshold -= 1 + self.num_speculative_tokens
+        if (
+            context.request_last_kv_block_offset[active_slice] >= block_boundary_threshold
+        ).any().item():
+            return "kv_block_boundary"
+
+        return None
 
     def _async_scheduling_sample_prepare_forward_bookkeep(self) -> Tuple[Dict, Dict]:
         """Run sample(N) -> prepare(N+1) -> forward(N+1) -> bookkeep(N)."""
@@ -1803,7 +1843,12 @@ class TextGenerationController:
 
         active_requests_mask = prepared_update["active_requests_mask"]
         assert active_requests_mask is not None
-        if active_requests_mask.numel() == 0 or (active_requests_mask == 0).all():
+        fallback_reason = self._get_async_scheduling_fallback_reason(prepared_update)
+        if (
+            active_requests_mask.numel() == 0
+            or (active_requests_mask == 0).all()
+            or fallback_reason is not None
+        ):
             range_push("update_requests")
             update_result = context.update_requests_bookkeep(prepared_update)
             range_pop()
@@ -1819,7 +1864,10 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
 
-        if not self._async_scheduling_can_run_basic_step():
+        if (
+            not self._async_schedule_forward_primed
+            and self._get_async_scheduling_fallback_reason() is not None
+        ):
             return None
         if context.active_token_count == 0 and active_request_count == 0:
             self._async_schedule_forward_primed = False
