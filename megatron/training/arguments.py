@@ -1863,6 +1863,9 @@ def _add_inference_args(parser):
     group.add_argument('--inference-dynamic-batching',
                        action='store_true', default=False,
                        help='Enable dynamic batching mode.')
+    group.add_argument('--inference-dynamic-batching-async-scheduling',
+                       action='store_true', default=False,
+                       help='Enable async-shaped dynamic decode scheduling.')
     group.add_argument('--inference-dynamic-batching-buffer-size-gb',
                        type=float, default=40.,
                        help='Amount of on-GPU memory allocated for the KV cache. '
