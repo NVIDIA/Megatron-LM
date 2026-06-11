@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Portions of this code are from DeepSeek DeepEP project
 # Copyright (c) 2025 DeepSeek
 # Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
