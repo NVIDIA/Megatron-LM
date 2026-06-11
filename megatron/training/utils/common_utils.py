@@ -41,6 +41,7 @@ from megatron.core.transformer.module import param_is_not_shared
 from megatron.core.utils import (
     get_batch_on_this_cp_rank,
     get_data_parallel_group_if_dtensor,
+    is_torch_min_version,
     to_local_if_dtensor,
     unwrap_model,
 )
@@ -276,6 +277,45 @@ def logical_and_across_model_parallel_group(input: bool) -> bool:
     return bool(input.item())
 
 
+def _supports_nccl_memory_stats():
+    """Return whether this PyTorch version may expose NCCL backend memory stats."""
+    try:
+        return is_torch_min_version("2.12.0")
+    except Exception:
+        return False
+
+
+def _get_nccl_memory_stats():
+    """Return NCCL communicator memory stats in bytes, if the runtime exposes them."""
+    if not _supports_nccl_memory_stats():
+        return None
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        return None
+    if not torch.cuda.is_available():
+        return None
+
+    try:
+        device = torch.device("cuda", torch.cuda.current_device())
+        backend = torch.distributed.distributed_c10d._get_default_group()._get_backend(device)
+        if getattr(backend, "_get_backend_name", lambda: None)() != "nccl":
+            return None
+
+        return getattr(backend, "memory_stats", lambda: None)()
+    except Exception:
+        return None
+
+
+def _format_nccl_memory_stats(nccl_memory_stats, mega_bytes):
+    """Format NCCL total memory for appending to report_memory output."""
+    if not nccl_memory_stats:
+        return ""
+
+    total = nccl_memory_stats.get("total")
+    if total is None:
+        return ""
+    return f" | nccl memory (MB): total: {total / mega_bytes:.2f}"
+
+
 def report_memory(name):
     """Simple GPU memory report."""
     args = get_args()
@@ -287,6 +327,7 @@ def report_memory(name):
     string += f" | max reserved: {torch.cuda.max_memory_reserved() / mega_bytes:.2f}"
     if args.log_device_memory_used:
         string += f" | total device memory used: {torch.cuda.device_memory_used() / mega_bytes:.2f}"
+    string += _format_nccl_memory_stats(_get_nccl_memory_stats(), mega_bytes)
     if mpu.get_data_parallel_rank() == 0:
         print("[Rank {}] {}".format(torch.distributed.get_rank(), string), flush=True)
 
@@ -545,9 +586,9 @@ def get_batch_on_this_tp_rank(data_iterator, mtp_on_this_rank: bool = False):
 
         def _broadcast_cu_seqlens(cu_seqlens):
             if getattr(args, 'cuda_graph_impl', 'none') == 'full_iteration':
-                assert cu_seqlens is None, (
-                    "cu_seqlens is not supported with cuda_graph_impl=full_iteration"
-                )
+                assert (
+                    cu_seqlens is None
+                ), "cu_seqlens is not supported with cuda_graph_impl=full_iteration"
                 return
             dev = torch.cuda.current_device()
             n = 0 if cu_seqlens is None else int(cu_seqlens.numel())
