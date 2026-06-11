@@ -102,7 +102,7 @@ class ConfigContainerBase:
             raise FileNotFoundError(f"YAML file not found: {yaml_path}")
 
         with maybe_msc.open(yaml_path, "r") as f:
-                config_dict = yaml.safe_load(f)
+            config_dict = yaml.safe_load(f)
 
         # Convert to OmegaConf first for better compatibility with instantiate
         conf = OmegaConf.create(config_dict)
