@@ -692,6 +692,29 @@ class TEGroupedMLP(MegatronModule):
             )
         return permuted_probs[: permuted_local_hidden_states.shape[0]]
 
+    def _trim_hybridep_static_budget_padding(
+        self,
+        permuted_local_hidden_states: torch.Tensor,
+        permuted_probs: torch.Tensor,
+        actual_num_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Trim HybridEP static-budget hidden/prob padding before expert GroupedLinear."""
+        if actual_num_tokens >= permuted_local_hidden_states.shape[0]:
+            return permuted_local_hidden_states, permuted_probs
+        is_hybridep_full_cg = (
+            self.config.cuda_graph_impl == "full_iteration"
+            and self.config.moe_token_dispatcher_type == "flex"
+            and self.config.moe_flex_dispatcher_backend == "hybridep"
+        )
+        if not is_hybridep_full_cg:
+            raise RuntimeError(
+                "Mismatched MoE expert token rows: "
+                f"hidden={permuted_local_hidden_states.shape[0]}, actual={actual_num_tokens}"
+            )
+        permuted_local_hidden_states = permuted_local_hidden_states[:actual_num_tokens]
+        permuted_probs = permuted_probs[:actual_num_tokens]
+        return permuted_local_hidden_states, permuted_probs
+
     def _tokens_per_expert_to_device(self, tokens_per_expert, device: torch.device) -> torch.Tensor:
         """Move CPU expert counts to GPU using pinned host memory for CUDA graph capture."""
         if self.config.cuda_graph_impl == "none":
@@ -743,6 +766,9 @@ class TEGroupedMLP(MegatronModule):
         # Apply padding if needed
         unpadded_tokens_per_expert = None
         tokens_per_expert: list[int] = tokens_per_expert.tolist()
+        permuted_local_hidden_states, permuted_probs = self._trim_hybridep_static_budget_padding(
+            permuted_local_hidden_states, permuted_probs, sum(tokens_per_expert)
+        )
         permuted_probs = self._align_hybridep_static_budget_probs(
             permuted_local_hidden_states, permuted_probs
         )
