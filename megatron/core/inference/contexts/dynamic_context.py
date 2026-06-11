@@ -3238,7 +3238,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         active_requests_mask: Tensor,
         new_tokens: Tensor,
         new_speculative_tokens: Tensor = None,
-    ) -> Tensor:
+    ) -> Optional[Dict[str, Optional[Tensor]]]:
         """Update context state after calling engine.step().
 
         This method is responsible for:
@@ -3278,11 +3278,20 @@ class DynamicInferenceContext(BaseInferenceContext):
                 (num_speculative_tokens, active_request_length)
 
         Return:
-            (Tensor) Newly paused request IDs.
+            (dict) Request lifecycle IDs, or None if all requests finished.
         """
-        # 1. The active token mask tells us which requests are still active and which are completed
-        # active_request_count -> This corresponds to requests that have not reached EOD or max length
-        # finished_request_count are requests that have reached the termination criterion
+        prepared_update = self.update_requests_prepare(
+            active_requests_mask, new_tokens, new_speculative_tokens
+        )
+        return self.update_requests_bookkeep(prepared_update)
+
+    def update_requests_prepare(
+        self,
+        active_requests_mask: Tensor,
+        new_tokens: Tensor,
+        new_speculative_tokens: Tensor = None,
+    ) -> Dict[str, Optional[Tensor]]:
+        """Prepare sampled request update tensors for CPU bookkeeping."""
 
         # Ensure all inputs are on CPU for bookkeeping operations.
         if active_requests_mask.is_cuda:
@@ -3291,6 +3300,27 @@ class DynamicInferenceContext(BaseInferenceContext):
             new_tokens = new_tokens.cpu()
         if new_speculative_tokens is not None and new_speculative_tokens.is_cuda:
             new_speculative_tokens = new_speculative_tokens.cpu()
+
+        return {
+            "active_requests_mask": active_requests_mask,
+            "new_tokens": new_tokens,
+            "new_speculative_tokens": new_speculative_tokens,
+        }
+
+    def update_requests_bookkeep(
+        self, prepared_update: Dict[str, Optional[Tensor]]
+    ) -> Optional[Dict[str, Optional[Tensor]]]:
+        """Apply request lifecycle bookkeeping from a prepared update."""
+
+        active_requests_mask = prepared_update["active_requests_mask"]
+        new_tokens = prepared_update["new_tokens"]
+        new_speculative_tokens = prepared_update["new_speculative_tokens"]
+        assert active_requests_mask is not None
+        assert new_tokens is not None
+
+        # 1. The active token mask tells us which requests are still active and which are completed
+        # active_request_count -> This corresponds to requests that have not reached EOD or max length
+        # finished_request_count are requests that have reached the termination criterion
 
         self.num_prefill_requests = 0  # all turns to decode
         # All request that were in prefill become decode requests.
