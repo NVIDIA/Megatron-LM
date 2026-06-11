@@ -555,10 +555,12 @@ try:
 
         # --- 2. Parse Sampling Params ---
         try:
-            temperature = float(req.get("temperature", 1.0))
-            top_p = float(req.get("top_p", 1.0))
-            top_k = int(req.get("top_k", 0))
-            n = int(req.get("n", 1))  # Number of choices to generate
+            _temperature = req.get("temperature")
+            temperature = float(1.0 if _temperature is None else _temperature)
+            _top_p = req.get("top_p")
+            top_p = float(1.0 if _top_p is None else _top_p)
+            top_k = int(req.get("top_k") or 0)
+            n = int(req.get("n") or 1)  # Number of choices to generate
 
             if temperature == 0.0:
                 top_k = 1
@@ -566,7 +568,7 @@ try:
 
             # Check for 'logprobs' (bool) and 'top_logprobs' (int)
             return_log_probs = bool(req.get("logprobs", False))
-            top_n_logprobs = int(req.get("top_logprobs", 0)) if return_log_probs else 0
+            top_n_logprobs = int(req.get("top_logprobs") or 0) if return_log_probs else 0
             skip_prompt_log_probs = bool(req.get("skip_prompt_log_probs", True))
             add_BOS = bool(req.get("add_BOS", False))
 
