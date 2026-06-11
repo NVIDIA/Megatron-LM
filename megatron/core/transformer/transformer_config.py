@@ -379,6 +379,9 @@ class TransformerConfig(ModelParallelConfig):
     linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
 
+    pre_gated_delta_rule_impl: Literal["unfused", "fused_streamed", "fused_mega"] = "unfused"
+    """Pre-gated-delta-rule implementation for GatedDeltaNet."""
+
     ####################
     # initialization
     ####################
@@ -557,7 +560,7 @@ class TransformerConfig(ModelParallelConfig):
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
-             "shared_experts", "mhc".
+             "shared_experts", "mhc", "gdn_norm_out".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -569,8 +572,9 @@ class TransformerConfig(ModelParallelConfig):
     "mhc": recompute HyperConnection intermediate activations via
             CheckpointWithoutOutput + CheckpointManager. Requires
             enable_hyper_connections=True. Cannot be used with "mlp".
-    "moe_act", "layernorm", "mla_up_proj", and "mhc" use output-discarding checkpointing,
-    "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
+    "gdn_norm_out": recompute the GatedDeltaNet output norm and HP-to-CP all-to-all.
+    "moe_act", "layernorm", "mla_up_proj", "mhc", and "gdn_norm_out" use output-discarding
+    checkpointing, "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
     """
 
     ####################
@@ -1425,6 +1429,21 @@ class TransformerConfig(ModelParallelConfig):
             self.experimental_attention_variant = self.linear_attention_type
             self.linear_attention_type = None
 
+        valid_pre_gdr_impls = ("unfused", "fused_streamed", "fused_mega")
+        if self.pre_gated_delta_rule_impl not in valid_pre_gdr_impls:
+            raise ValueError(
+                "pre_gated_delta_rule_impl must be one of "
+                f"{valid_pre_gdr_impls}, got {self.pre_gated_delta_rule_impl!r}."
+            )
+        if (
+            self.pre_gated_delta_rule_impl != "unfused"
+            and self.experimental_attention_variant != "gated_delta_net"
+        ):
+            raise ValueError(
+                "pre_gated_delta_rule_impl can select a fused path only when "
+                "experimental_attention_variant='gated_delta_net'."
+            )
+
         if self.experimental_attention_variant in ["gated_delta_net"]:
             assert (
                 self.linear_attention_freq is not None
@@ -1859,6 +1878,8 @@ class TransformerConfig(ModelParallelConfig):
                     "moe",
                     "shared_experts",
                     "mhc",
+                    "gdn_norm_out",
+                    "gdn_qkv",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
@@ -1875,6 +1896,24 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "mla_up_proj in recompute_modules is only supported with "
                     "multi_latent_attention."
+                )
+
+            if (
+                "gdn_norm_out" in self.recompute_modules
+                and self.experimental_attention_variant != "gated_delta_net"
+            ):
+                raise ValueError(
+                    "gdn_norm_out in recompute_modules is only supported with "
+                    "experimental_attention_variant='gated_delta_net'."
+                )
+
+            if (
+                "gdn_qkv" in self.recompute_modules
+                and self.experimental_attention_variant != "gated_delta_net"
+            ):
+                raise ValueError(
+                    "gdn_qkv in recompute_modules is only supported with "
+                    "experimental_attention_variant='gated_delta_net'."
                 )
 
             if "core_attn" in self.recompute_modules:
@@ -2314,7 +2353,18 @@ class TransformerConfig(ModelParallelConfig):
                     "It is experimental and may change in future versions."
                 )
             else:
-                if self.rotary_interleaved:
+                fused_mrope_available = False
+                # Triton fused mRoPE supports split-half RoPE only. Keep rotary_interleaved
+                # configs on the TE validation path so the TE >= 2.3 check still applies.
+                if self.mrope_section is not None and not self.rotary_interleaved:
+                    try:
+                        from megatron.core.fusions.fused_mrope import is_fused_mrope_available
+
+                        fused_mrope_available = is_fused_mrope_available()
+                    except ImportError:
+                        fused_mrope_available = False
+
+                if self.rotary_interleaved and not fused_mrope_available:
                     if not is_te_min_version("2.3.0"):
                         raise ValueError(
                             "rotary_interleaved does not work with apply_rope_fusion for "
@@ -2326,9 +2376,14 @@ class TransformerConfig(ModelParallelConfig):
                     fused_apply_rotary_pos_emb_thd,
                 )
 
-                if fused_apply_rotary_pos_emb is None and fused_apply_rotary_pos_emb_thd is None:
+                if (
+                    fused_apply_rotary_pos_emb is None
+                    and fused_apply_rotary_pos_emb_thd is None
+                    and not fused_mrope_available
+                ):
                     raise ValueError(
-                        "apply_rope_fusion is not available. Please install TE >= 1.4."
+                        "apply_rope_fusion is not available. Please install TE >= 1.4 "
+                        "or Triton for fused mRoPE."
                     )
 
         if self.fused_single_qkv_rope:

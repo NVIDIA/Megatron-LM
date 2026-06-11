@@ -28,6 +28,8 @@ from megatron.core.utils import (
     is_te_min_version,
     is_torch_min_version,
     make_sharded_tensor_for_checkpoint,
+    nvtx_range_pop,
+    nvtx_range_push,
 )
 
 if HAVE_TE:
@@ -188,11 +190,13 @@ class SharedExpertMLP(MLP):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Forward function"""
+        nvtx_range_push("SharedExpert.forward")
         output, _ = super().forward(hidden_states)
         if self.use_shared_expert_gate:
             logits = torch.nn.functional.linear(hidden_states, self.gate_weight)
             gate_score = torch.nn.functional.sigmoid(logits)
             output = output * gate_score
+        nvtx_range_pop("SharedExpert.forward")
         return output
 
     def _reset_parameters(self):
@@ -238,6 +242,7 @@ class SharedExpertMLP(MLP):
         if wait_current_stream:
             self.wait_current_stream()
         with torch.cuda.stream(self.stream):
+            nvtx_range_push("SharedExpert.pre_forward_comm")
             if self.use_shared_expert_gate:
                 logits = torch.nn.functional.linear(input, self.gate_weight)
                 self.gate_score = torch.nn.functional.sigmoid(logits)
@@ -250,6 +255,7 @@ class SharedExpertMLP(MLP):
                     input, group=self.tp_group
                 )
             set_tensor_grad_fn_sequence_sr(self.cached_fc1_input, torch.iinfo(torch.int).max)
+            nvtx_range_pop("SharedExpert.pre_forward_comm")
 
     @overlap_state_check(
         SharedExpertState.PRE_FORWARD_COMM_DONE, SharedExpertState.FC1_FORWARD_DONE
@@ -261,6 +267,7 @@ class SharedExpertMLP(MLP):
         It is only useful when --moe-shared-expert-overlap is set and may be changed.
         """
         with torch.cuda.stream(self.stream):
+            nvtx_range_push("SharedExpert.linear_fc1_forward_and_act")
             # [s, b, 4 * h/p]
             intermediate_parallel, bias_parallel = apply_module(self.linear_fc1)(
                 self.cached_fc1_input
@@ -308,6 +315,7 @@ class SharedExpertMLP(MLP):
                     intermediate_parallel = self.activation_func(intermediate_parallel)
 
             self.cached_fc2_input = intermediate_parallel
+            nvtx_range_pop("SharedExpert.linear_fc1_forward_and_act")
         # Tensor sequence number is used to control the backward order.
         # Decrease the sequence number of the expert output to make the comm launched first
         # in the backward order.
@@ -327,9 +335,11 @@ class SharedExpertMLP(MLP):
         if overlapped_comm_output is not None:
             set_tensor_grad_fn_sequence_sr(overlapped_comm_output, torch.iinfo(torch.int).max)
         with torch.cuda.stream(self.stream):
+            nvtx_range_push("SharedExpert.linear_fc2_forward")
             # [s, b, h]
             self.cached_fc2_output, _ = apply_module(self.linear_fc2)(self.cached_fc2_input)
             self.cached_fc2_input = None
+            nvtx_range_pop("SharedExpert.linear_fc2_forward")
 
     @overlap_state_check(
         SharedExpertState.FC2_FORWARD_DONE, SharedExpertState.POST_FORWARD_COMM_DONE
@@ -341,6 +351,7 @@ class SharedExpertMLP(MLP):
         It is only useful when --moe-shared-expert-overlap is set and may be changed.
         """
         with torch.cuda.stream(self.stream):
+            nvtx_range_push("SharedExpert.post_forward_comm")
             if self.config.sequence_parallel:
                 self.cached_output = reduce_scatter_to_sequence_parallel_region(
                     self.cached_fc2_output, group=self.tp_group
@@ -351,6 +362,7 @@ class SharedExpertMLP(MLP):
                 )
             self.cached_fc2_output = None
             set_tensor_grad_fn_sequence_sr(self.cached_output, torch.iinfo(torch.int).max)
+            nvtx_range_pop("SharedExpert.post_forward_comm")
 
     @overlap_state_check(SharedExpertState.POST_FORWARD_COMM_DONE, SharedExpertState.IDLE)
     def get_output(self):
@@ -360,6 +372,7 @@ class SharedExpertMLP(MLP):
         It is only useful when --moe-shared-expert-overlap is set and may be changed.
         """
         with torch.cuda.stream(self.stream):
+            nvtx_range_push("SharedExpert.get_output")
             if self.use_shared_expert_gate:
                 assert self.gate_score is not None
                 output = self.cached_output * self.gate_score
@@ -367,6 +380,7 @@ class SharedExpertMLP(MLP):
             else:
                 output = self.cached_output
             self.cached_output = None
+            nvtx_range_pop("SharedExpert.get_output")
         torch.cuda.current_stream().wait_stream(self.stream)
         return output
 

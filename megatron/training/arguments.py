@@ -1638,7 +1638,7 @@ def validate_args(args, defaults={}):
     # Legacy RoPE arguments
     if args.use_rotary_position_embeddings:
         args.position_embedding_type = 'rope'
-    if args.position_embedding_type != 'rope':
+    if args.position_embedding_type not in ('rope', 'mrope'):
         args.apply_rope_fusion = False
 
     # Would just need to add 'NoPE' as a position_embedding_type to support this, but for now
@@ -4680,6 +4680,10 @@ def _add_mla_args(parser):
 
 def _add_experimental_attention_variant_args(parser):
     group = parser.add_argument_group(title="experimental_attention_variant")
+    # NOTE: --pre-gated-delta-rule-impl is auto-generated from the
+    # TransformerConfig.pre_gated_delta_rule_impl field by ArgumentGroupFactory
+    # (see _add_transformer_engine_args / build_group), so it must NOT be
+    # registered manually here — doing so raises an argparse conflict.
     # Linear attention
     group.add_argument(
         '--linear-attention-freq',

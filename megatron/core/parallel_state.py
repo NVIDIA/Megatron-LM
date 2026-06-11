@@ -154,6 +154,12 @@ def get_nccl_options(pg_name, nccl_comm_cfgs):
         nccl_comm_cfgs (dict): nccl communicator configurations
     When an option (e.g., max_ctas) is not found in the config, use the NCCL default setting.
     """
+    # The fake distributed backend (--fake-process-group) cannot accept
+    # ProcessGroupNCCL.Options; PyTorch's FakeProcessGroup._create_internal
+    # rejects them with a TypeError. Return None so callers create the
+    # fake sub-groups without NCCL-specific options.
+    if torch.distributed.is_initialized() and torch.distributed.get_backend() == "fake":
+        return None
     if pg_name in nccl_comm_cfgs:
         # When fields in nccl_options.config are not specified, NCCL applies default settings.
         # The default values for Hopper GPUs are as follows:

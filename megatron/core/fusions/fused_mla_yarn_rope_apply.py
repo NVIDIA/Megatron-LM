@@ -41,12 +41,17 @@ def _get_thd_token_idx(cu_seqlens, pid_m, seq_num, cp_rank, cp_size):
         last_cum_seqlen = cur_cum_seqlen
         seq_idx += 1
     if cp_size > 1:
-        if token_idx < this_seq_len // 2:
-            token_idx = token_idx + cp_rank * this_seq_len // 2
+        first_cp_seg = (this_seq_len + 1) // 2
+        second_cp_seg = this_seq_len // 2
+        if token_idx < first_cp_seg:
+            token_idx = token_idx + cp_rank * first_cp_seg
         else:
-            token_idx = (token_idx - this_seq_len // 2) + (
-                2 * cp_size - cp_rank - 1
-            ) * this_seq_len // 2
+            token_idx = (
+                token_idx
+                - first_cp_seg
+                + cp_size * first_cp_seg
+                + (cp_size - cp_rank - 1) * second_cp_seg
+            )
     return token_idx
 
 
