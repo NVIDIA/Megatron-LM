@@ -171,7 +171,7 @@ fi
 # ── Launch the inference server in the background ─────────────────────────────
 
 MASTER_ADDR=${MASTER_ADDR:-localhost}
-MASTER_PORT=${MASTER_PORT:-6000}
+MASTER_PORT=${MASTER_PORT:-29500}
 SERVER_PORT=${SERVER_PORT:-5000}
 SERVER_LOG="$SERVER_LOG_DIR/server.log"
 
