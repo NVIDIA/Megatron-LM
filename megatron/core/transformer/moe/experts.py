@@ -608,6 +608,10 @@ class TEGroupedMLP(MegatronModule):
     ) -> torch.Tensor:
         """Forward pass using Transformer Engine operation fuser API."""
 
+        permuted_probs = self._align_hybridep_static_budget_probs(
+            permuted_local_hidden_states, permuted_probs
+        )
+
         # Construct fused impl if needed
         # Note: We initialize during the first forward pass in case
         # the params are modified after the constructor.
@@ -670,6 +674,24 @@ class TEGroupedMLP(MegatronModule):
             output = paged_stash_group_commit(output, name="grouped_mlp")
         return output
 
+    def _align_hybridep_static_budget_probs(
+        self, permuted_local_hidden_states: torch.Tensor, permuted_probs: torch.Tensor
+    ) -> torch.Tensor:
+        """Trim HybridEP static-budget probability padding to the dispatched token rows."""
+        if permuted_probs is None or permuted_probs.shape[0] == permuted_local_hidden_states.shape[0]:
+            return permuted_probs
+        is_hybridep_full_cg = (
+            self.config.cuda_graph_impl == "full_iteration"
+            and self.config.moe_token_dispatcher_type == "flex"
+            and self.config.moe_flex_dispatcher_backend == "hybridep"
+        )
+        if not is_hybridep_full_cg or permuted_probs.shape[0] < permuted_local_hidden_states.shape[0]:
+            raise RuntimeError(
+                "Mismatched MoE dispatched token/probability rows: "
+                f"hidden={permuted_local_hidden_states.shape[0]}, probs={permuted_probs.shape[0]}"
+            )
+        return permuted_probs[: permuted_local_hidden_states.shape[0]]
+
     def _tokens_per_expert_to_device(self, tokens_per_expert, device: torch.device) -> torch.Tensor:
         """Move CPU expert counts to GPU using pinned host memory for CUDA graph capture."""
         if self.config.cuda_graph_impl == "none":
@@ -721,6 +743,9 @@ class TEGroupedMLP(MegatronModule):
         # Apply padding if needed
         unpadded_tokens_per_expert = None
         tokens_per_expert: list[int] = tokens_per_expert.tolist()
+        permuted_probs = self._align_hybridep_static_budget_probs(
+            permuted_local_hidden_states, permuted_probs
+        )
         permuted_probs = permuted_probs.unsqueeze(-1)
         if skip_routed_expert_padding(self.config):
             pass
