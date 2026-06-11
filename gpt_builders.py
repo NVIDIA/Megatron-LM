@@ -26,28 +26,27 @@ def _apply_yarn_config_from_args(config, args) -> None:
     """Populate YaRN fields on config from args when not already set.
 
     Preserves values already present on ``config`` (e.g. from YAML or a caller-
-    supplied config) and allows optional CLI overrides via ``getattr``.
+    supplied config). YaRN-specific hyperparameters must be supplied via CLI
+    when ``position_embedding_type == 'yarn'`` (see functional test configs).
     """
     if args.position_embedding_type != 'yarn':
         return
 
     def _set_if_missing(attr: str, value) -> None:
+        if value is None:
+            return
         if not hasattr(config, attr):
             setattr(config, attr, value)
 
     _set_if_missing('yarn_rotary_scaling_factor', args.rotary_scaling_factor)
     _set_if_missing(
-        'yarn_original_max_position_embeddings',
-        getattr(args, 'yarn_original_max_position_embeddings', 4096),
+        'yarn_original_max_position_embeddings', args.yarn_original_max_position_embeddings
     )
-    _set_if_missing('yarn_beta_fast', getattr(args, 'yarn_beta_fast', 32.0))
-    _set_if_missing('yarn_beta_slow', getattr(args, 'yarn_beta_slow', 1.0))
+    _set_if_missing('yarn_beta_fast', args.yarn_beta_fast)
+    _set_if_missing('yarn_beta_slow', args.yarn_beta_slow)
     _set_if_missing('yarn_mscale', args.mscale)
     _set_if_missing('yarn_mscale_all_dim', args.mscale_all_dim)
-    _set_if_missing(
-        'yarn_correction_range_round_to_int',
-        getattr(args, 'yarn_correction_range_round_to_int', False),
-    )
+    _set_if_missing('yarn_correction_range_round_to_int', args.yarn_correction_range_round_to_int)
 
 
 def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
