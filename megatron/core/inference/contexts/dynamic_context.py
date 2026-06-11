@@ -284,6 +284,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         # the next compaction.
         self._async_prior_finished_active_mask = None
         self._async_prior_finished_request_ids = None
+        self.async_scheduling_has_waiting_requests = False
+        self.async_scheduling_has_stop_word_requests = False
 
         self.cache_mla_latent = (
             isinstance(model_config, MLATransformerConfig) and model_config.cache_mla_latents
@@ -2438,6 +2440,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.paused_tokens = None
         self.paused_speculative_tokens = None
         self.clear_async_finished_request_rows()
+        self.async_scheduling_has_waiting_requests = False
+        self.async_scheduling_has_stop_word_requests = False
 
         # Reset attention, mamba, and block allocator state.
         self.reset_attention_state()

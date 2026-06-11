@@ -189,11 +189,169 @@ class TextGenerationControllerTestBase:
 
 
 class TestAsyncSchedulingControllerHelpers:
-    def test_serial_async_scheduling_call_order(self):
+    def _make_async_eligibility_controller(self):
         controller = object.__new__(TextGenerationController)
+        context = mock.Mock()
+        context.config.enable_async_scheduling = True
+        context.async_scheduling_has_waiting_requests = False
+        context.async_scheduling_has_stop_word_requests = False
+        context.total_request_count = 2
+        context.paused_request_count = 0
+        context.num_prefill_requests = 0
+        context.is_hybrid_model = False
+        context.expert_model_parallel_group = None
+        context.chunked_prefill_request_id = -1
+        context.is_chunked_prefill_enabled.return_value = False
+        context.block_size_tokens = 128
+        context.request_last_kv_block_offset = torch.tensor([1, 2], device='cpu')
+        context.request_metadata = {
+            "temperature": torch.tensor([1.0, 1.0], device='cpu'),
+            "top_k": torch.tensor([1, 1], dtype=torch.int32, device='cpu'),
+            "top_p": torch.tensor([0.0, 0.0], device='cpu'),
+            "return_log_probs": torch.tensor([False, False], device='cpu'),
+            "top_n_logprobs": torch.tensor([0, 0], dtype=torch.int32, device='cpu'),
+        }
+
+        model_config = mock.Mock()
+        model_config.mtp_num_layers = None
+        model_config.is_hybrid_model = False
+        model_config.num_moe_experts = None
+        model_config.expert_model_parallel_size = 1
+
+        controller.inference_wrapped_model = mock.Mock(inference_context=context)
+        controller.model_config = model_config
+        controller.num_speculative_tokens = 0
+        return controller, context, model_config
+
+    def test_async_scheduling_eligibility_allows_dense_greedy_decode(self):
+        controller, _, _ = self._make_async_eligibility_controller()
+
+        assert controller._get_async_scheduling_fallback_reason() is None
+
+    @pytest.mark.parametrize(
+        ("reason", "mutator"),
+        [
+            (
+                "disabled",
+                lambda _controller, context, _model_config: setattr(
+                    context.config, "enable_async_scheduling", False
+                ),
+            ),
+            (
+                "waiting_requests",
+                lambda _controller, context, _model_config: setattr(
+                    context, "async_scheduling_has_waiting_requests", True
+                ),
+            ),
+            (
+                "stop_words",
+                lambda _controller, context, _model_config: setattr(
+                    context, "async_scheduling_has_stop_word_requests", True
+                ),
+            ),
+            (
+                "speculative_tokens",
+                lambda controller, _context, _model_config: setattr(
+                    controller, "num_speculative_tokens", 1
+                ),
+            ),
+            (
+                "mtp_model",
+                lambda _controller, _context, model_config: setattr(
+                    model_config, "mtp_num_layers", 1
+                ),
+            ),
+            (
+                "hybrid_or_mamba",
+                lambda _controller, context, _model_config: setattr(
+                    context, "is_hybrid_model", True
+                ),
+            ),
+            (
+                "moe",
+                lambda _controller, _context, model_config: setattr(
+                    model_config, "num_moe_experts", 8
+                ),
+            ),
+            (
+                "expert_parallel",
+                lambda _controller, _context, model_config: setattr(
+                    model_config, "expert_model_parallel_size", 2
+                ),
+            ),
+            (
+                "paused_requests",
+                lambda _controller, context, _model_config: setattr(
+                    context, "paused_request_count", 1
+                ),
+            ),
+            (
+                "prefill",
+                lambda _controller, context, _model_config: setattr(
+                    context, "num_prefill_requests", 1
+                ),
+            ),
+            (
+                "chunked_prefill",
+                lambda _controller, context, _model_config: setattr(
+                    context.is_chunked_prefill_enabled, "return_value", True
+                ),
+            ),
+            (
+                "log_probs",
+                lambda _controller, context, _model_config: context.request_metadata[
+                    "return_log_probs"
+                ].fill_(True),
+            ),
+            (
+                "top_n_logprobs",
+                lambda _controller, context, _model_config: context.request_metadata[
+                    "top_n_logprobs"
+                ].fill_(1),
+            ),
+            (
+                "non_greedy_sampling",
+                lambda _controller, context, _model_config: context.request_metadata[
+                    "top_k"
+                ].fill_(0),
+            ),
+            (
+                "non_greedy_sampling",
+                lambda _controller, context, _model_config: context.request_metadata[
+                    "top_p"
+                ].fill_(0.5),
+            ),
+            (
+                "kv_block_boundary",
+                lambda _controller, context, _model_config: context.request_last_kv_block_offset.fill_(
+                    127
+                ),
+            ),
+        ],
+    )
+    def test_async_scheduling_fallback_reasons(self, reason, mutator):
+        controller, context, model_config = self._make_async_eligibility_controller()
+        mutator(controller, context, model_config)
+
+        assert controller._get_async_scheduling_fallback_reason() == reason
+
+    def test_async_scheduling_fallback_for_speculative_prepared_update(self):
+        controller, _, _ = self._make_async_eligibility_controller()
+        prepared_update = {
+            "active_requests_mask": torch.tensor([1, 1], device='cpu'),
+            "new_tokens": torch.tensor([10, 11], device='cpu'),
+            "new_speculative_tokens": torch.tensor([[12, 13]], device='cpu'),
+        }
+
+        assert (
+            controller._get_async_scheduling_fallback_reason(prepared_update)
+            == "speculative_tokens"
+        )
+
+    def test_serial_async_scheduling_call_order(self):
+        controller, context, _ = self._make_async_eligibility_controller()
         events = []
 
-        context = mock.Mock()
         context._async_prior_finished_active_mask = None
         context.prepare_async_next_forward.side_effect = lambda _: events.append(
             "update_requests_prepare"
@@ -205,7 +363,6 @@ class TestAsyncSchedulingControllerHelpers:
             "evict_request_ids": None,
         }
 
-        controller.inference_wrapped_model = mock.Mock(inference_context=context)
         controller._async_schedule_forward_primed = True
         controller._async_schedule_primed_cuda_graph_request_count = None
         controller._dynamic_step_sample_logits = mock.Mock(side_effect=lambda: events.append("sample"))
@@ -247,6 +404,7 @@ class TestAsyncSchedulingControllerHelpers:
                 "_async_scheduling_sample_prepare_forward_bookkeep",
                 "_async_scheduling_prepare_forward_bookkeep",
                 "_dynamic_step_forward_for_async_scheduling",
+                "_get_async_scheduling_fallback_reason",
             )
         )
 
