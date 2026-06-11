@@ -3449,7 +3449,10 @@ class DynamicInferenceContext(BaseInferenceContext):
         }
 
     def update_requests_bookkeep(
-        self, prepared_update: Dict[str, Optional[Tensor]]
+        self,
+        prepared_update: Dict[str, Optional[Tensor]],
+        *,
+        delay_finished_compaction: bool = False,
     ) -> Optional[Dict[str, Optional[Tensor]]]:
         """Apply request lifecycle bookkeeping from a prepared update."""
 
@@ -3458,6 +3461,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         new_speculative_tokens = prepared_update["new_speculative_tokens"]
         assert active_requests_mask is not None
         assert new_tokens is not None
+
+        if delay_finished_compaction:
+            return self._update_requests_bookkeep_delayed_finish_only(active_requests_mask)
 
         # 1. The active token mask tells us which requests are still active and which are completed
         # active_request_count -> This corresponds to requests that have not reached EOD or max length
@@ -3859,6 +3865,69 @@ class DynamicInferenceContext(BaseInferenceContext):
         return {
             "newly_paused_request_ids": newly_paused_request_ids,
             "evict_request_ids": evict_request_ids,
+        }
+
+    def prepare_async_next_forward(self, prepared_update: Dict[str, Optional[Tensor]]) -> None:
+        """Prepare decode-only token bookkeeping for the next async-shaped forward."""
+        active_requests_mask = prepared_update["active_requests_mask"]
+        new_tokens = prepared_update["new_tokens"]
+        new_speculative_tokens = prepared_update["new_speculative_tokens"]
+        assert active_requests_mask is not None
+        assert new_tokens is not None
+        assert new_speculative_tokens is None
+        assert self.paused_request_count == 0
+
+        active_request_count = active_requests_mask.numel()
+        assert active_request_count == self.total_request_count
+
+        self.num_prefill_requests = 0
+        active_slice = slice(self.paused_request_count, self.total_request_count)
+        self.request_in_prefill_status_tensor[active_slice] = 0
+        self.reset_attention_state()
+
+        self.request_kv_length_offsets[active_slice].add_(self.request_query_lengths[active_slice])
+        self.request_query_lengths[active_slice].fill_(1)
+
+        old_offsets = self.request_last_kv_block_offset[active_slice].clone()
+        self.request_last_kv_block_offset[active_slice] = (
+            old_offsets + 1
+        ) % self.block_size_tokens
+
+        self.active_token_count = active_request_count
+        self.token_to_input_ids[:active_request_count] = new_tokens
+        self.token_to_pos_ids[:active_request_count] = self.request_kv_length_offsets[active_slice]
+        self.token_to_request_idx[:active_request_count] = torch.arange(
+            self.paused_request_count, self.total_request_count, device='cpu'
+        )
+        self.token_to_position_in_request[:active_request_count] = self.token_to_pos_ids[
+            :active_request_count
+        ]
+        self.token_to_local_position_within_kv_block[:active_request_count] = (
+            self.token_to_pos_ids[:active_request_count] % self.block_size_tokens
+        )
+        self.token_to_block_idx[:active_request_count] = self.request_last_kv_block_id[
+            active_slice
+        ]
+
+    def _update_requests_bookkeep_delayed_finish_only(
+        self, active_requests_mask: Tensor
+    ) -> Dict[str, Optional[Tensor]]:
+        """Release finished requests but delay row compaction for async-shaped decode."""
+        assert self.paused_request_count == 0
+        active_request_count = (active_requests_mask == 1).sum().item()
+        finished_request_count = (active_requests_mask == 0).sum().item()
+        assert active_request_count + finished_request_count == self.total_request_count
+
+        if finished_request_count > 0:
+            finished_idxs = torch.nonzero(active_requests_mask == 0, as_tuple=True)[0]
+            self.release_memory_blocks_from_request_indexes(finished_idxs)
+            self.record_async_finished_request_rows(active_requests_mask == 0)
+        else:
+            self.clear_async_finished_request_rows()
+
+        return {
+            "newly_paused_request_ids": None,
+            "evict_request_ids": None,
         }
 
     def calculate_log_probs(

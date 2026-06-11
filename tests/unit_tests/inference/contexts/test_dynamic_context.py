@@ -775,6 +775,71 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
+    def test_prepare_async_next_forward_decode_tokens(self):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=None,
+        )
+        dynamic_context.total_request_count = 2
+        dynamic_context.request_ids[:2] = torch.tensor([10, 11], device='cpu')
+        dynamic_context.request_query_lengths[:2] = 1
+        dynamic_context.request_kv_length_offsets[:2] = torch.tensor([5, 6], device='cpu')
+        dynamic_context.request_last_kv_block_offset[:2] = torch.tensor([5, 6], device='cpu')
+        dynamic_context.request_last_kv_block_id[:2] = torch.tensor([20, 21], device='cpu')
+        prepared_update = dynamic_context.update_requests_prepare(
+            active_requests_mask=torch.tensor([1, 1], device='cpu'),
+            new_tokens=torch.tensor([100, 101], device='cpu'),
+        )
+
+        dynamic_context.prepare_async_next_forward(prepared_update)
+
+        assert dynamic_context.active_token_count == 2
+        assert dynamic_context.token_to_input_ids[:2].tolist() == [100, 101]
+        assert dynamic_context.token_to_pos_ids[:2].tolist() == [6, 7]
+        assert dynamic_context.token_to_request_idx[:2].tolist() == [0, 1]
+        assert dynamic_context.token_to_block_idx[:2].tolist() == [20, 21]
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_update_requests_bookkeep_delayed_finish_only_records_without_compacting(self):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=None,
+        )
+        dynamic_context.total_request_count = 2
+        dynamic_context.request_ids[:2] = torch.tensor([10, 11], device='cpu')
+        dynamic_context.request_kv_block_counts[:2] = 1
+        new_block_ids = dynamic_context.kv_block_allocator.allocate_memory_blocks(2)
+        dynamic_context.request_to_kv_block_ids[:2, 0] = new_block_ids
+        prepared_update = dynamic_context.update_requests_prepare(
+            active_requests_mask=torch.tensor([0, 1], device='cpu'),
+            new_tokens=torch.tensor([100, 101], device='cpu'),
+        )
+
+        update_result = dynamic_context.update_requests_bookkeep(
+            prepared_update, delay_finished_compaction=True
+        )
+
+        assert update_result == {"newly_paused_request_ids": None, "evict_request_ids": None}
+        assert dynamic_context.has_async_finished_request_rows()
+        assert dynamic_context.total_request_count == 2
+        assert dynamic_context.request_ids[:2].tolist() == [10, 11]
+        assert dynamic_context.request_to_kv_block_ids[0, 0] == -1
+
+    @pytest.mark.internal
+    @rounder_override(64)
     def test_async_finished_request_rows_avoid_duplicate_or_row_map_state(self):
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
