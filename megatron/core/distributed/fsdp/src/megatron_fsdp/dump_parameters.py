@@ -17,7 +17,7 @@
 Useful for replaying optimizer steps in tests/microbenchmarks without
 re-running the model. The dump captures everything needed to reconstruct
 the parameter layout: global/local shape, per-param mesh, placements,
-chunk offsets, and Megatron-FSDP attributes (M-FSDP name, QKV flag).
+and Megatron-FSDP attributes (M-FSDP name, QKV flag).
 
 Optimizer-agnostic: works with any PyTorch optimizer whose params are
 DTensors managed by Megatron-FSDP.
@@ -88,7 +88,6 @@ def _dump_param(p: DTensor) -> dict[str, Any]:
         "dtype": str(p.dtype),
         "is_qkv": _is_qkv(p),
         "local_shape": tuple(int(s) for s in local.shape),
-        "local_offsets": _local_offsets(local),
         "mesh_shape": tuple(int(s) for s in mesh.shape),
         "mesh_dim_names": list(mesh.mesh_dim_names) if mesh.mesh_dim_names else None,
         "placements": [repr(pl) for pl in p.placements],
@@ -109,17 +108,3 @@ def _is_qkv(p: torch.Tensor) -> bool:
     return bool(getattr(p, "is_qkv", False)) or bool(
         getattr(getattr(p, "orig_param", None), "is_qkv", False)
     )
-
-
-def _local_offsets(local: torch.Tensor) -> tuple[int, ...] | None:
-    """Read chunk offsets from `local.__create_chunk_list__()` if present."""
-    fn = getattr(local, "__create_chunk_list__", None)
-    if fn is None:
-        return None
-    try:
-        chunks = fn()
-    except Exception:
-        return None
-    if not chunks:
-        return None
-    return tuple(int(o) for o in chunks[0].offsets)
