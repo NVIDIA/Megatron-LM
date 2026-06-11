@@ -15,6 +15,7 @@ from typing import Callable, Dict, Optional, Set, Tuple, Union
 import torch
 
 from megatron.core.msc_utils import MultiStorageClientFeature
+from megatron.core.perfetto_trace import trace_region
 from megatron.core.utils import log_single_rank
 
 from . import ShardedTensor
@@ -50,7 +51,7 @@ CkptShardedMetadata = Dict[str, Union[ShardedTensor, ShardedObject]]
 
 _CONTENT_METADATA_KEY = 'content_metadata'
 
-
+@trace_region("load")
 def load(
     sharded_state_dict: ShardedStateDict,
     checkpoint_dir: str,
@@ -119,8 +120,8 @@ def load(
     #   2. When using delayed scaling, this loading process writes an extra value into the global
     #      amax_history buffer of Transformer Engine, which is undesirable.
     force_all_tensors_to_non_fp8(sharded_state_dict)
-
-    common_state_dict = load_common(checkpoint_dir)
+    with trace_region("load_common"):
+        common_state_dict = load_common(checkpoint_dir)
 
     sharded_state_dict, nonpersistent_state_dict, sh_ten_factories = load_preprocess(
         sharded_state_dict
@@ -135,18 +136,21 @@ def load(
     local_metadata, global_metadata = None, None
     strict = parse_strict_flag(strict)
     if StrictHandling.requires_explicit_ckpt_mismatch_check(strict):
-        ckpt_sharded_metadata = load_sharded_metadata(str(checkpoint_dir), sharded_strategy)
+        with trace_region("load_sharded_metadata"):
+            ckpt_sharded_metadata = load_sharded_metadata(str(checkpoint_dir), sharded_strategy)
     if validate_access_integrity or StrictHandling.requires_global_app_metadata(strict):
-        local_metadata, global_metadata = determine_global_metadata(sharded_state_dict)
+        with trace_region("determine_global_metadata"):
+            local_metadata, global_metadata = determine_global_metadata(sharded_state_dict)
 
-    sharded_state_dict, missing_keys, unexpected_keys = validate_integrity_and_strict_load(
-        sharded_state_dict,
-        strict,
-        validate_access_integrity,
-        local_metadata,
-        global_metadata,
-        ckpt_sharded_metadata,
-    )
+    with trace_region("validate_integrity_and_strict_load"):
+        sharded_state_dict, missing_keys, unexpected_keys = validate_integrity_and_strict_load(
+            sharded_state_dict,
+            strict,
+            validate_access_integrity,
+            local_metadata,
+            global_metadata,
+            ckpt_sharded_metadata,
+        )
 
     ckpt_args = common_state_dict.get("args")
     async_strategy = (
@@ -154,7 +158,9 @@ def load(
         if getattr(ckpt_args, "async_save", False)
         else "mcore"
     )
-    loaded_state_dict = sharded_strategy.load(sharded_state_dict, checkpoint_dir, async_strategy)
+
+    with trace_region("sharded_strategy.load"):
+        loaded_state_dict = sharded_strategy.load(sharded_state_dict, checkpoint_dir, async_strategy)
 
     merge(common_state_dict, loaded_state_dict)
 

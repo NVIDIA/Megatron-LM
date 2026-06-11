@@ -95,17 +95,68 @@ class TestGPTModelReconfiguration:
             'singleton_local_shards',
             'src_layer_spec_fn',
             'dst_layer_spec_fn',
+            'replicate_local_replicas',
         ),
         [
-            (False, 'tp-dp-pp', 'tp-dp-pp', (2, 4), (4, 2), True, gpt_te_spec, gpt_te_spec),
-            (False, 'tp-pp-dp', 'tp-pp-dp', (1, 8), (8, 1), False, gpt_te_spec, gpt_te_spec),
-            (True, 'tp-dp-pp', 'tp-pp-dp', (2, 1), (1, 8), True, gpt_te_spec, gpt_te_spec),
-            (False, 'tp-dp-pp', 'tp-dp-pp', (1, 1), (2, 2), True, gpt_te_spec, gpt_te_spec),
-            (True, 'tp-pp-dp', 'tp-pp-dp', (2, 1), (1, 8), False, gpt_local_spec, gpt_local_spec),
-            (False, 'tp-dp-pp', 'tp-pp-dp', (1, 1), (2, 4), False, gpt_te_spec, gpt_local_spec),
-            (True, 'tp-dp-pp', 'tp-dp-pp', (2, 4), (4, 2), True, gpt_local_spec, gpt_te_spec),
-            (False, 'tp-pp-dp', 'tp-pp-dp', (2, 1), (1, 8), False, gpt_te_spec, gpt_local_spec),
-            (False, 'tp-dp-pp', 'tp-pp-dp', (2, 4), (2, 4), True, gpt_local_spec, gpt_local_spec),
+            (False, 'tp-dp-pp', 'tp-dp-pp', (2, 4), (4, 2), True, gpt_te_spec, gpt_te_spec, False),
+            (False, 'tp-pp-dp', 'tp-pp-dp', (1, 8), (8, 1), False, gpt_te_spec, gpt_te_spec, False),
+            (True, 'tp-dp-pp', 'tp-pp-dp', (2, 1), (1, 8), True, gpt_te_spec, gpt_te_spec, False),
+            (False, 'tp-dp-pp', 'tp-dp-pp', (1, 1), (2, 2), True, gpt_te_spec, gpt_te_spec, False),
+            (
+                True,
+                'tp-pp-dp',
+                'tp-pp-dp',
+                (2, 1),
+                (1, 8),
+                False,
+                gpt_local_spec,
+                gpt_local_spec,
+                False,
+            ),
+            (
+                False,
+                'tp-dp-pp',
+                'tp-pp-dp',
+                (1, 1),
+                (2, 4),
+                False,
+                gpt_te_spec,
+                gpt_local_spec,
+                False,
+            ),
+            (
+                True,
+                'tp-dp-pp',
+                'tp-dp-pp',
+                (2, 4),
+                (4, 2),
+                True,
+                gpt_local_spec,
+                gpt_te_spec,
+                False,
+            ),
+            (
+                False,
+                'tp-pp-dp',
+                'tp-pp-dp',
+                (2, 1),
+                (1, 8),
+                False,
+                gpt_te_spec,
+                gpt_local_spec,
+                False,
+            ),
+            (
+                False,
+                'tp-dp-pp',
+                'tp-pp-dp',
+                (2, 4),
+                (2, 4),
+                True,
+                gpt_local_spec,
+                gpt_local_spec,
+                False,
+            ),
             (
                 False,
                 'tp-dp-pp',
@@ -115,6 +166,7 @@ class TestGPTModelReconfiguration:
                 False,
                 gpt_te_spec,
                 _gpt_te_spec_op_fuser,
+                False,
             ),
             (
                 False,
@@ -125,7 +177,27 @@ class TestGPTModelReconfiguration:
                 False,
                 _gpt_te_spec_op_fuser,
                 gpt_te_spec,
+                False,
             ),
+            # ----- replicate_local_replicas coverage -----
+            # The flag only runs through the FP wrappers, so the cases
+            # below are all use_fpsl=True. Both the local and TE specs
+            # are exercised so we cover the two RMSNorm variants. Each
+            # case asserts the same load-correctness invariant the
+            # baselines check (equal plain state dicts after a reload-
+            # and-resave round trip).
+            (
+                True,
+                'tp-dp-pp',
+                'tp-dp-pp',
+                (2, 4),
+                (4, 2),
+                True,
+                gpt_local_spec,
+                gpt_local_spec,
+                True,
+            ),
+            (True, 'tp-dp-pp', 'tp-dp-pp', (2, 4), (4, 2), False, gpt_te_spec, gpt_te_spec, True),
         ],
     )
     def test_parallel_reconfiguration_e2e(
@@ -139,6 +211,7 @@ class TestGPTModelReconfiguration:
         load_order: str,
         store_order: str,
         singleton_local_shards: bool,
+        replicate_local_replicas: bool,
     ):
         """Test model saving and loading with different TP/PP"""
         if src_layer_spec_fn is None or dst_layer_spec_fn is None:
@@ -155,6 +228,7 @@ class TestGPTModelReconfiguration:
             load_order,
             store_order,
             metadata={'singleton_local_shards': singleton_local_shards},
+            replicate_local_replicas=replicate_local_replicas,
         )
 
     def test_state_dict_comparison(self, tmp_path_dist_ckpt):

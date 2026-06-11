@@ -33,6 +33,7 @@ from megatron.core.parallel_state import (
     get_context_parallel_group,
     get_hybrid_data_context_parallel_groups,
 )
+from megatron.core.perfetto_trace import trace_region
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.multi_token_prediction import (
@@ -305,7 +306,8 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
         train_val_test_num_samples : A list containing the number of samples in train test and validation.
     """
     args = get_args()
-    config = core_gpt_dataset_config_from_args(args)
+    with trace_region("core_gpt_dataset_config_from_args"):
+        config = core_gpt_dataset_config_from_args(args)
 
     is_packed_sequence = False
     if args.sft:
@@ -319,12 +321,13 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
 
     print_rank_0("> building train, validation, and test datasets for GPT ...")
 
-    train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
-        dataset_type,
-        train_val_test_num_samples,
-        partial(is_dataset_built_on_rank, vp_stage=vp_stage, is_packed_sequence=is_packed_sequence),
-        config
-    ).build()
+    with trace_region("BlendedMegatronDatasetBuilder.build"):
+        train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
+            dataset_type,
+            train_val_test_num_samples,
+            partial(is_dataset_built_on_rank, vp_stage=vp_stage, is_packed_sequence=is_packed_sequence),
+            config
+        ).build()
 
     print_rank_0("> finished creating GPT datasets ...")
 

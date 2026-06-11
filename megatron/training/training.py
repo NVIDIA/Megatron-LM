@@ -133,6 +133,7 @@ except ImportError:
     has_nvidia_modelopt = False
 
 from megatron.core import mpu, nccl_allocator, tensor_parallel
+from megatron.core.perfetto_trace import trace_region
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import (
     DistributedDataParallelConfig,
@@ -1325,28 +1326,30 @@ def pretrain(
     # Data stuff.
     app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
     timers('train/valid/test-data-iterators-setup', log_level=0).start(barrier=True)
-    if args.virtual_pipeline_model_parallel_size is not None:
-        train_data_iterator = []
-        valid_data_iterator = []
-        test_data_iterator = []
-        for vp_stage in range(len(model)):
-            dataset_provider_parameters = inspect.signature(train_valid_test_dataset_provider).parameters
-            assert "vp_stage" in dataset_provider_parameters, \
-                "vp_stage must be a kwarg in train_valid_test_dataset_provider when using virtual pipeline parallelism"
-            vp_stage_train_valid_test_dataset_provider = \
-                functools.partial(train_valid_test_dataset_provider, vp_stage=vp_stage)
-            if getattr(train_valid_test_dataset_provider, 'is_distributed', False):
-                vp_stage_train_valid_test_dataset_provider.is_distributed = True
-            iterators = build_train_valid_test_data_iterators(
-                vp_stage_train_valid_test_dataset_provider
+    with trace_region("setup_data_iterators"):
+        if args.virtual_pipeline_model_parallel_size is not None:
+            train_data_iterator = []
+            valid_data_iterator = []
+            test_data_iterator = []
+            for vp_stage in range(len(model)):
+                dataset_provider_parameters = inspect.signature(train_valid_test_dataset_provider).parameters
+                assert "vp_stage" in dataset_provider_parameters, \
+                    "vp_stage must be a kwarg in train_valid_test_dataset_provider when using virtual pipeline parallelism"
+                vp_stage_train_valid_test_dataset_provider = \
+                    functools.partial(train_valid_test_dataset_provider, vp_stage=vp_stage)
+                if getattr(train_valid_test_dataset_provider, 'is_distributed', False):
+                    vp_stage_train_valid_test_dataset_provider.is_distributed = True
+                with trace_region(f"build_data_iterators_vp_stage_{vp_stage}"):
+                    iterators = build_train_valid_test_data_iterators(
+                        vp_stage_train_valid_test_dataset_provider
+                    )
+                train_data_iterator.append(iterators[0])
+                valid_data_iterator.append(iterators[1])
+                test_data_iterator.append(iterators[2])
+        else:
+            train_data_iterator, valid_data_iterator, test_data_iterator = (
+                build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
             )
-            train_data_iterator.append(iterators[0])
-            valid_data_iterator.append(iterators[1])
-            test_data_iterator.append(iterators[2])
-    else:
-        train_data_iterator, valid_data_iterator, test_data_iterator = (
-            build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
-        )
     timers('train/valid/test-data-iterators-setup').stop()
     print_datetime('after dataloaders are built')
     app_metrics['app_build_dataiters_finish_time'] = one_logger_utils.get_timestamp_in_ms()
@@ -2059,6 +2062,10 @@ def setup_model_and_optimizer(
                 'load_checkpoint_time': timers('load-checkpoint').active_time(),
             }
         )
+        if args.exit_after_loading_ckpt:
+            print_rank_0('Checkpoint successfully loaded. Exiting due to --exit-after-loading-ckpt.')
+            torch.distributed.barrier()
+            exit()
     else:
         args.iteration = 0
         args.num_floating_point_operations_so_far = 0
@@ -2796,34 +2803,41 @@ def save_checkpoint_and_time(
     timer_key = 'save-checkpoint-non-persistent' if non_persistent_ckpt else 'save-checkpoint'
     timers(timer_key, log_level=0).start(barrier=True)
 
-    # Log E2E metrics before save-checkpoint
-    one_logger_utils.track_e2e_metrics()
-    # Free overlap param-gather buffers and release cached GPU memory so
-    # that the async checkpoint worker process has enough GPU headroom for
-    # D2H tensor transfers.
-    for model_chunk in model:
-        if hasattr(model_chunk, 'free_overlap_buffers'):
-            model_chunk.free_overlap_buffers()
-    torch.cuda.empty_cache()
+    # Mark the full span measured by the 'save-checkpoint' timer started just
+    # above (with barrier=True). This region covers the pre-save buffer free +
+    # empty_cache AND the save_checkpoint() call, so it is directly comparable
+    # to the printed `save-checkpoint` timer (the only delta is the stop-barrier
+    # straggler wait, which lives inside timers(...).stop(barrier=True) below).
+    with trace_region("save_checkpoint_and_time"):
+        # Log E2E metrics before save-checkpoint
+        one_logger_utils.track_e2e_metrics()
+        # Free overlap param-gather buffers and release cached GPU memory so
+        # that the async checkpoint worker process has enough GPU headroom for
+        # D2H tensor transfers.
+        with trace_region("pre_save_free_memory"):
+            for model_chunk in model:
+                if hasattr(model_chunk, 'free_overlap_buffers'):
+                    model_chunk.free_overlap_buffers()
+            torch.cuda.empty_cache()
 
-    global num_checkpoints_memory_reported, MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
-    should_report_memory = num_checkpoints_memory_reported < MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
+        global num_checkpoints_memory_reported, MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
+        should_report_memory = num_checkpoints_memory_reported < MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
 
-    if should_report_memory:
-        # Track memory before checkpoint save.
-        report_memory(f"(before save_checkpoint for iteration {iteration})")
-    # Save checkpoint.
-    save_checkpoint(
-        iteration,
-        model,
-        optimizer,
-        opt_param_scheduler,
-        num_floating_point_operations_so_far,
-        checkpointing_context,
-        non_persistent_ckpt=non_persistent_ckpt,
-        train_data_iterator=train_data_iterator,
-        preprocess_common_state_dict_fn=preprocess_common_state_dict,
-    )
+        if should_report_memory:
+            # Track memory before checkpoint save.
+            report_memory(f"(before save_checkpoint for iteration {iteration})")
+        # Save checkpoint.
+        save_checkpoint(
+            iteration,
+            model,
+            optimizer,
+            opt_param_scheduler,
+            num_floating_point_operations_so_far,
+            checkpointing_context,
+            non_persistent_ckpt=non_persistent_ckpt,
+            train_data_iterator=train_data_iterator,
+            preprocess_common_state_dict_fn=preprocess_common_state_dict,
+        )
     
     # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.
     timers(timer_key).stop(barrier=True)
@@ -4216,25 +4230,29 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
 
         else:
             # Build datasets.
-            train_ds, valid_ds, test_ds = build_train_valid_test_datasets(build_train_valid_test_datasets_provider)
+            with trace_region("build_datasets"):
+                train_ds, valid_ds, test_ds = build_train_valid_test_datasets(build_train_valid_test_datasets_provider)
             valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
-            if args.skip_train:
-                train_dataloader = None
-            else:
-                train_dataloader = build_pretraining_data_loader(train_ds, consumed_train_samples_in_current_phase)
-            valid_dataloaders = []
-            for valid_d in valid_ds:
-                if args.skip_train or args.full_validation:
-                    valid_dataloaders.append(build_pretraining_data_loader(valid_d, 0))
+            with trace_region("build_dataloader:train"):
+                if args.skip_train:
+                    train_dataloader = None
                 else:
-                    if args.multiple_validation_sets:
-                        # TODO(bnorick): for multiple validation sets without full validation, args.consumed_valid_samples is not
-                        # correct and needs to be calculated/set per validation set
-                        raise NotImplementedError("--multiple-validation-sets currently requires --full-validation")
-                    valid_dataloaders.append(build_pretraining_data_loader(valid_d, args.consumed_valid_samples))
-            if not args.multiple_validation_sets:
-                assert len(valid_dataloaders) == 1
-            test_dataloader = build_pretraining_data_loader(test_ds, 0)
+                    train_dataloader = build_pretraining_data_loader(train_ds, consumed_train_samples_in_current_phase)
+            with trace_region("build_dataloader:valid"):
+                valid_dataloaders = []
+                for valid_d in valid_ds:
+                    if args.skip_train or args.full_validation:
+                        valid_dataloaders.append(build_pretraining_data_loader(valid_d, 0))
+                    else:
+                        if args.multiple_validation_sets:
+                            # TODO(bnorick): for multiple validation sets without full validation, args.consumed_valid_samples is not
+                            # correct and needs to be calculated/set per validation set
+                            raise NotImplementedError("--multiple-validation-sets currently requires --full-validation")
+                        valid_dataloaders.append(build_pretraining_data_loader(valid_d, args.consumed_valid_samples))
+                if not args.multiple_validation_sets:
+                    assert len(valid_dataloaders) == 1
+            with trace_region("build_dataloader:test"):
+                test_dataloader = build_pretraining_data_loader(test_ds, 0)
             do_train = train_dataloader is not None and (args.skip_train or args.train_iters > 0)
             do_valid = valid_dataloaders is not None and (args.full_validation or args.eval_iters > 0)
             do_test = test_dataloader is not None and (args.full_validation or args.eval_iters > 0)
@@ -4245,7 +4263,8 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     else:
         flags = torch.tensor([0, 0, 0], dtype=torch.long, device='cuda')
 
-    torch.distributed.broadcast(flags, 0)
+    with trace_region("broadcast_dataloader_flags"):
+        torch.distributed.broadcast(flags, 0)
 
     args.do_train = getattr(args, "do_train", False) or flags[0].item()
     args.do_valid = getattr(args, "do_valid", False) or flags[1].item()
@@ -4259,9 +4278,10 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
     args = get_args()
 
     # Build loaders.
-    train_dataloader, valid_dataloaders, test_dataloader = build_train_valid_test_data_loaders(
-        build_train_valid_test_datasets_provider
-    )
+    with trace_region("build_data_loaders"):
+        train_dataloader, valid_dataloaders, test_dataloader = build_train_valid_test_data_loaders(
+            build_train_valid_test_datasets_provider
+        )
 
     # Build iterators.
     dl_type = args.dataloader_type
@@ -4282,57 +4302,58 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
         else:
             raise RuntimeError("unexpected dataloader type")
 
-    if train_dataloader is not None:
-        train_data_iterator = _get_iterator(dl_type, train_dataloader)
-    else:
-        train_data_iterator = None
+    with trace_region("build_data_iterators"):
+        if train_dataloader is not None:
+            train_data_iterator = _get_iterator(dl_type, train_dataloader)
+        else:
+            train_data_iterator = None
 
-    if valid_dataloaders is not None:
-        # when using full validation, we need to override eval iters with the
-        # MAX length across DP ranks so all ranks run the same number of steps
-        if args.full_validation:
-            if args.multiple_validation_sets:
-                if valid_dataloaders[0] is None:
-                    args.eval_iters = [None] * len(valid_dataloaders)
+        if valid_dataloaders is not None:
+            # when using full validation, we need to override eval iters with the
+            # MAX length across DP ranks so all ranks run the same number of steps
+            if args.full_validation:
+                if args.multiple_validation_sets:
+                    if valid_dataloaders[0] is None:
+                        args.eval_iters = [None] * len(valid_dataloaders)
+                    else:
+                        local_eval_iters = [len(dl) for dl in valid_dataloaders]
+                        eval_iters_tensor = torch.tensor(local_eval_iters, dtype=torch.long, device='cuda')
+                        torch.distributed.all_reduce(
+                            eval_iters_tensor,
+                            op=torch.distributed.ReduceOp.MAX,
+                            group=mpu.get_data_parallel_group(with_context_parallel=True),
+                        )
+                        args.eval_iters = eval_iters_tensor.tolist()
                 else:
-                    local_eval_iters = [len(dl) for dl in valid_dataloaders]
-                    eval_iters_tensor = torch.tensor(local_eval_iters, dtype=torch.long, device='cuda')
+                    local_eval_iters = len(valid_dataloaders[0])
+                    eval_iters_tensor = torch.tensor([local_eval_iters], dtype=torch.long, device='cuda')
                     torch.distributed.all_reduce(
                         eval_iters_tensor,
                         op=torch.distributed.ReduceOp.MAX,
                         group=mpu.get_data_parallel_group(with_context_parallel=True),
                     )
-                    args.eval_iters = eval_iters_tensor.tolist()
-            else:
-                local_eval_iters = len(valid_dataloaders[0])
-                eval_iters_tensor = torch.tensor([local_eval_iters], dtype=torch.long, device='cuda')
-                torch.distributed.all_reduce(
-                    eval_iters_tensor,
-                    op=torch.distributed.ReduceOp.MAX,
-                    group=mpu.get_data_parallel_group(with_context_parallel=True),
-                )
-                args.eval_iters = eval_iters_tensor.item()
+                    args.eval_iters = eval_iters_tensor.item()
 
-        if args.multiple_validation_sets:
-            if valid_dataloaders[0] is None:
-                valid_data_iterators = [None] * len(valid_dataloaders)
-            else:
+            if args.multiple_validation_sets:
+                if valid_dataloaders[0] is None:
+                    valid_data_iterators = [None] * len(valid_dataloaders)
+                else:
+                    valid_dl_type = "cyclic" if args.full_validation else dl_type
+                    valid_data_iterators = [
+                        _get_iterator(valid_dl_type, dl) for dl in valid_dataloaders
+                    ]
+            elif valid_dataloaders[0] is not None:
                 valid_dl_type = "cyclic" if args.full_validation else dl_type
-                valid_data_iterators = [
-                    _get_iterator(valid_dl_type, dl) for dl in valid_dataloaders
-                ]
-        elif valid_dataloaders[0] is not None:
-            valid_dl_type = "cyclic" if args.full_validation else dl_type
-            valid_data_iterators = _get_iterator(valid_dl_type, valid_dataloaders[0])
+                valid_data_iterators = _get_iterator(valid_dl_type, valid_dataloaders[0])
+            else:
+                valid_data_iterators = None
         else:
             valid_data_iterators = None
-    else:
-        valid_data_iterators = None
 
-    if test_dataloader is not None:
-        test_data_iterator = _get_iterator(dl_type, test_dataloader)
-    else:
-        test_data_iterator = None
+        if test_dataloader is not None:
+            test_data_iterator = _get_iterator(dl_type, test_dataloader)
+        else:
+            test_data_iterator = None
 
     return train_data_iterator, valid_data_iterators, test_data_iterator
 

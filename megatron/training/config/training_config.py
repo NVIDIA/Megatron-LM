@@ -540,6 +540,30 @@ class CheckpointConfig:
     "ep_dp": Expert data parallel process group.
     """
 
+    exit_after_loading_ckpt: bool = False
+    """If set, exit the program after loading from a checkpoint. Useful for testing checkpoint loading."""
+
+    ckpt_fully_parallel_save_replicate_local: bool = False
+    """If True, the fully-parallel save additionally writes a per-rank shadow
+    copy of every replica that this rank holds inside the parallelization
+    group. The metadata records each copy under a ``__shadow_<rank>__<fqn>``
+    key pointing at the rank's own ``__<rank>_*.distcp`` file, so at load
+    time every rank can read its tensors from its own file (no cross-reads).
+    Trades extra checkpoint storage (~``parallelization_group_size`` x for
+    replicated parameters) for read-side locality at scale. Pair with
+    ``ckpt_fully_parallel_load_replicate_local`` to take advantage at load
+    time. Default: False.
+    """
+
+    ckpt_fully_parallel_load_replicate_local: bool = False
+    """If True, the load redirects every requested FQN whose
+    ``__shadow_<rank>__<fqn>`` exists in the metadata to the rank's local
+    shadow entry — eliminating cross-reads at load time. Has no effect when
+    the checkpoint was saved without
+    ``ckpt_fully_parallel_save_replicate_local`` (no shadow keys are
+    present, so there is nothing to redirect). Default: False.
+    """
+
     ckpt_assume_constant_structure: bool = False
     """Assume the checkpoint structure is constant across saves to enable optimizations."""
 
