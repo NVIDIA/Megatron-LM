@@ -8,8 +8,8 @@ import torch
 
 from megatron.core.transformer.experimental_attention_variant import csa_cp_kernels
 
-# This file guards only DSv4 CP layout/metadata kernels: kernels that avoid
-# GPU-CPU sync or dynamic output shapes in the CP path.
+# This file guards only DSv4 CP layout/metadata kernels. Layer-level CUDA graph
+# tests guard graph capture/replay behavior.
 
 
 def _require_cute_cuda():

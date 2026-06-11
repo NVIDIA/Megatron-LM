@@ -15,9 +15,9 @@ package, but built on top of
 Public API (same shape as the old ``dsa_kernels`` package):
 
 * ``build_flat_topk_idxs`` / ``local_to_global_flat`` — index helpers.
-* ``dsa_sparse_attn`` — differentiable sparse attention with precomputed indices.
-* ``indexer_topk`` — inference indexer scoring + top-K.
-* ``fused_indexer_sparse_attn`` — training fused indexer loss +
+* ``dsa_sparse_attn`` — Path A / Path C step 2, differentiable sparse attention.
+* ``indexer_topk`` — Path C inference indexer scoring + top-K.
+* ``fused_indexer_sparse_attn`` — Path B training, fused indexer loss +
   sparse attention with shared backward.
 """
 
@@ -307,8 +307,9 @@ def build_flat_topk_idxs(
             res = _DSA.compactify_wrapper(global_idxs)
             global_idxs, topk_length_flat = res["indices"], res["topk_length"]
         else:
-            # CPU reference branch for unit tests that exercise this helper
-            # without CUDA. Production callers go through the CUDA path above.
+            # CPU fallback so the unit tests that exercise this helper without
+            # CUDA still work. Production callers always go through the CUDA
+            # path above.
             valid_mask = global_idxs >= 0
             sorted_indices = valid_mask.int().argsort(dim=-1, descending=True, stable=True)
             global_idxs = global_idxs.gather(-1, sorted_indices)
@@ -318,7 +319,7 @@ def build_flat_topk_idxs(
 
 
 # ---------------------------------------------------------------------------
-# Differentiable sparse attention with precomputed indices
+# Path A + Path C step 2: differentiable sparse attention
 # ---------------------------------------------------------------------------
 
 
@@ -329,7 +330,9 @@ def _compact_topk_for_sparse_bwd(topk_idxs: Tensor, kv_rows: int) -> Tensor:
     sentinel = torch.iinfo(topk_idxs.dtype).max
     compacted = torch.where(topk_idxs >= 0, topk_idxs, torch.full_like(topk_idxs, sentinel))
     compacted, _ = torch.sort(compacted, dim=-1, stable=True)
-    return torch.where(compacted >= sentinel, torch.full_like(compacted, -1), compacted).contiguous()
+    return torch.where(
+        compacted >= sentinel, torch.full_like(compacted, -1), compacted
+    ).contiguous()
 
 
 class SparseAttnFunc(torch.autograd.Function):
@@ -399,7 +402,7 @@ def dsa_sparse_attn(
     indexer_topk: int = 0,
     is_thd: bool = False,
 ) -> Tensor:
-    """Sparse attention with precomputed top-k indices.
+    """Sparse attention (Path A / Path C step 2).
 
     Two layouts:
 
@@ -422,8 +425,7 @@ def dsa_sparse_attn(
         softmax_scale: scalar float.
         topk_length: ``(rows,)`` int32 — optional compact fast-path. Must be
             ``None`` when ``indexer_topk > 0`` (FlashMLA constraint).
-        indexer_topk: int; ``0`` when no indexer columns are appended,
-            positive when fused indexer-loss columns are appended.
+        indexer_topk: int; ``0`` for Paths A/C, positive for Path B.
         is_thd: when True, treat ``query`` and ``kv`` as already-packed
             THD tensors and skip the SBHD reshape steps.
 
@@ -465,7 +467,7 @@ def dsa_sparse_attn(
 
 
 # ---------------------------------------------------------------------------
-# Inference indexer scoring + top-K
+# Path C inference: indexer scoring + top-K
 # ---------------------------------------------------------------------------
 
 
@@ -480,16 +482,14 @@ def _indexer_topk_core(
     cu_seqlens_kv: Optional[Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_kv: Optional[int] = None,
-    fixed_topk_width: Optional[int] = None,
-    compute_topk_length: bool = True,
-    precomputed_seq_lens: Optional[Tensor] = None,
+    visible_k_lengths: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Layout-agnostic core for :func:`indexer_topk`.
 
     Wraps cuDNN Frontend's CuTe-DSL indexer-forward kernel.
-    The pipeline is indexer forward, per-row valid lengths, radix top-K, optional
-    fixed-width output padding, and optionally ``topk_length``. Selected by
-    ``cu_seqlens_q``.
+    The pipeline (forward → per-row valid lengths → radix top-K → pad-to-``topk`` → ``topk_length``)
+    is the same for both layouts; only the input shape glue, valid-length derivation,
+    and output reshape differ. Selected by ``cu_seqlens_q``.
 
     BSHD layout (``cu_seqlens_q is None``):
         q: ``(b, sq, idx_nh, idx_hd)`` bf16, C-contiguous.
@@ -513,7 +513,7 @@ def _indexer_topk_core(
 
     Two internal entry points besides :func:`indexer_topk`:
 
-    * ``FusedIndexerSparseAttnFunc.forward`` calls this directly
+    * Path B's ``FusedIndexerSparseAttnFunc.forward`` calls this directly
       so the SBHD→BSHD permute can be performed once and reused across
       the indexer forward and the score-recompute backward kernels.
     """
@@ -548,27 +548,22 @@ def _indexer_topk_core(
         sk = int(max_seqlen_kv)
         total_q = q.shape[0]
 
-        if precomputed_seq_lens is not None:
-            if precomputed_seq_lens.shape[0] != total_q:
+        if visible_k_lengths is not None:
+            if visible_k_lengths.shape[0] != total_q:
                 raise ValueError(
-                    "precomputed_seq_lens must have one entry per THD query row: "
-                    f"got={precomputed_seq_lens.shape[0]}, expected={total_q}."
+                    "visible_k_lengths must have one entry per THD query row: "
+                    f"got={visible_k_lengths.shape[0]}, expected={total_q}."
                 )
-            if precomputed_seq_lens.dtype != torch.int32:
-                raise ValueError(
-                    f"precomputed_seq_lens must be int32, got {precomputed_seq_lens.dtype}."
-                )
-            if precomputed_seq_lens.device != device:
-                raise ValueError(
-                    "precomputed_seq_lens must be on the same device as q_indexer."
-                )
-            seq_lens = precomputed_seq_lens
+            if visible_k_lengths.dtype != torch.int32:
+                raise ValueError(f"visible_k_lengths must be int32, got {visible_k_lengths.dtype}.")
+            if visible_k_lengths.device != device:
+                raise ValueError("visible_k_lengths must be on the same device as q_indexer.")
+            seq_lens = visible_k_lengths
         else:
             # The indexer kernel has already applied the causal mask using
-            # cu_seqlens_q/cu_seqlens_k.  In CP, Q and K sequence lengths can
-            # differ for a split sequence piece, which represents a trapezoid
-            # causal mask.  Let top-k scan the whole visible K segment and filter
-            # the kernel-masked ``-inf`` entries after selection.
+            # cu_seqlens_q/cu_seqlens_k. If Q and K lengths differ, the mask is
+            # trapezoidal; scan the visible K segment and filter kernel-masked
+            # ``-inf`` entries after selection.
             row_batch_ids = batch_of_row(cu_seqlens_q, total_q=total_q)
             seqlen_kv_per_row = (cu_seqlens_kv[1:] - cu_seqlens_kv[:-1])[row_batch_ids]
             seq_lens = seqlen_kv_per_row.to(torch.int32).contiguous()
@@ -595,14 +590,7 @@ def _indexer_topk_core(
     )
     topk_indices = tk_result["indices"]  # (total_q, topk_k) int32
 
-    output_topk = int(fixed_topk_width) if fixed_topk_width is not None else topk
-    if output_topk < topk_k:
-        raise ValueError(
-            "fixed_topk_width must be greater than or equal to the computed top-k width: "
-            f"fixed={output_topk}, computed={topk_k}."
-        )
-
-    if fixed_topk_width is None and topk_k < topk:
+    if topk_k < topk:
         pad = torch.full((total_q, topk - topk_k), -1, dtype=torch.int32, device=device)
         topk_indices = torch.cat([topk_indices, pad], dim=-1)
 
@@ -613,19 +601,7 @@ def _indexer_topk_core(
             (topk_indices >= 0) & (topk_indices < sk) & torch.isfinite(selected_scores)
         )
         topk_indices = topk_indices.masked_fill(~selected_valid, -1)
-        topk_length = (
-            (topk_indices >= 0).sum(dim=-1).int()
-            if compute_topk_length
-            else torch.empty((0,), dtype=torch.int32, device=device)
-        )
-        if output_topk > topk_indices.shape[-1]:
-            pad = torch.full(
-                (total_q, output_topk - topk_indices.shape[-1]),
-                -1,
-                dtype=torch.int32,
-                device=device,
-            )
-            topk_indices = torch.cat([topk_indices, pad], dim=-1)
+        topk_length = (topk_indices >= 0).sum(dim=-1).int()
     else:
         topk_length = (topk_indices >= 0).sum(dim=-1).int()  # (total_q,)
 
@@ -647,9 +623,7 @@ def indexer_topk(
     cu_seqlens_kv: Optional[Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     max_seqlen_kv: Optional[int] = None,
-    fixed_topk_width: Optional[int] = None,
-    compute_topk_length: bool = True,
-    precomputed_seq_lens: Optional[Tensor] = None,
+    visible_k_lengths: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor]:
     """Score + top-K selection for inference (no KL loss, no backward).
 
@@ -671,15 +645,9 @@ def indexer_topk(
         cu_seqlens_kv: THD only — ``(B+1,)`` int32 CUDA cumulative KV lens.
         max_seqlen_q: THD only — per-batch max Q length.
         max_seqlen_kv: THD only — per-batch max KV length.
-        fixed_topk_width: THD only — optional static output width. CP callers
-            use this to fuse score filtering and fixed-width padding into one
-            CuTeDSL kernel while keeping the radix top-K visible width smaller.
-        compute_topk_length: THD only — set ``False`` when the caller only
-            consumes the fixed-width top-k ids. In that case ``topk_length`` is
-            returned as an empty int32 CUDA sentinel.
-        precomputed_seq_lens: THD only — optional ``(total_q,)`` int32 CUDA
+        visible_k_lengths: THD only — optional ``(total_q,)`` int32 CUDA
             tensor with the per-row visible K length for the radix top-K wrapper.
-            CP callers pass this from the layout kernel to avoid rebuilding the
+            Callers pass this from a layout kernel to avoid rebuilding the
             same metadata with generic PyTorch indexing during CUDA graph replay.
 
     Returns:
@@ -694,12 +662,8 @@ def indexer_topk(
             "indexer_topk THD mode requires cu_seqlens_q, cu_seqlens_kv, "
             "max_seqlen_q, and max_seqlen_kv to all be supplied."
         )
-    if fixed_topk_width is not None and not is_thd:
-        raise ValueError("fixed_topk_width is only supported in THD mode.")
-    if not compute_topk_length and not is_thd:
-        raise ValueError("compute_topk_length=False is only supported in THD mode.")
-    if precomputed_seq_lens is not None and not is_thd:
-        raise ValueError("precomputed_seq_lens is only supported in THD mode.")
+    if not is_thd and visible_k_lengths is not None:
+        raise ValueError("visible_k_lengths is only supported in THD mode.")
 
     # ``indexer_softmax_scale`` is applied via the
     # ``relu(c·x) = c·relu(x)`` trick (the cudnn kernel does the relu),
@@ -727,15 +691,13 @@ def indexer_topk(
         cu_seqlens_kv=cu_seqlens_kv,
         max_seqlen_q=int(max_seqlen_q) if max_seqlen_q is not None else None,
         max_seqlen_kv=int(max_seqlen_kv) if max_seqlen_kv is not None else None,
-        fixed_topk_width=fixed_topk_width,
-        compute_topk_length=compute_topk_length,
-        precomputed_seq_lens=precomputed_seq_lens,
+        visible_k_lengths=visible_k_lengths,
     )
     return topk_indices, topk_length
 
 
 # ---------------------------------------------------------------------------
-# Training fused indexer loss + sparse attention
+# Path B: fused indexer + sparse attention (training)
 # ---------------------------------------------------------------------------
 
 
@@ -1021,7 +983,7 @@ def _kl_loss_from_dense_scores(
 
 
 class FusedIndexerSparseAttnFunc(torch.autograd.Function):
-    """Fused indexer KL loss + sparse attention in one autograd.
+    """Path B: fused indexer (+KL loss) + sparse attention in one autograd.
 
     Differentiable w.r.t. ``query``, ``kv_full``, ``attn_sink``,
     ``q_indexer``, ``k_indexer``, ``weights``.
@@ -1103,7 +1065,6 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         if is_thd:
             total_q = q_indexer.shape[0]
             idx_nh = q_indexer.shape[1]
-            n_comp = k_indexer.shape[0]
             np_, d = query.shape[1], query.shape[2]
 
             q_indexer_flat = q_indexer
@@ -1113,7 +1074,6 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             sq, b, np_, d = query.shape
             skv = kv_full.shape[0]
             idx_nh = q_indexer.shape[2]
-            n_comp = k_indexer.shape[0]
 
             q_indexer_flat = q_indexer.permute(1, 0, 2, 3).contiguous()
             k_indexer_flat = k_indexer.permute(1, 0, 2).contiguous()
@@ -1130,6 +1090,11 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             w_indexer_scaled = w_indexer
 
         # ---- 2. Indexer scoring + top-K (with scores retained). ---------------
+        # Pass the original ``indexer_topk`` so the output is always padded
+        # to a fixed size. flash_mla_sparse_fwd
+        # requires a consistent TopK dimension; _indexer_topk_core handles the
+        # case where sk < topk internally (selects min(topk, sk) values, then
+        # pads to topk with -1).
         topk_indices_cmp, _, indexer_scores = _indexer_topk_core(
             q_indexer_flat,
             k_indexer_flat,
@@ -1157,7 +1122,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             )
             combined_local = torch.cat(
                 [compress_topk_idxs, window_idxs], dim=-1
-            )  # (total_q, eff_topk + win_topk)
+            )  # (total_q, indexer_topk + win_topk)
             global_idxs = local_to_global_flat(
                 combined_local,
                 batch_size=-1,
@@ -1483,11 +1448,11 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
         )
 
 
-class PrecomputedIndexerSparseAttnFunc(torch.autograd.Function):
-    """CP-aware fused sparse attention with precomputed indexer top-k.
+class FusedIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
+    """Sparse attention with caller-supplied indexer top-k.
 
-    The caller owns CP-aware top-k selection. Sparse attention and
-    indexer-loss backward still use FlashMLA / cuDNN DSA wrappers.
+    The caller owns top-k selection. Sparse attention and indexer-loss
+    backward still use FlashMLA / cuDNN DSA wrappers.
     """
 
     @staticmethod
@@ -1510,7 +1475,7 @@ class PrecomputedIndexerSparseAttnFunc(torch.autograd.Function):
     ) -> Tuple[Tensor, Tensor]:
         _ensure_dsa_namespace()
 
-        total_q, np_, d = query.shape
+        total_q, np_ = query.shape[:2]
         idx_nh, idx_hd = q_indexer.shape[1], q_indexer.shape[2]
         total_comp = k_indexer.shape[0]
         indexer_topk = indexer_topk_idxs.shape[-1]
@@ -1525,7 +1490,7 @@ class PrecomputedIndexerSparseAttnFunc(torch.autograd.Function):
             indexer_topk=indexer_topk,
         )
         if lse_indexer is None:
-            raise RuntimeError("Precomputed indexer sparse attention requires lse_indexer.")
+            raise RuntimeError("Indexer sparse attention from top-k requires lse_indexer.")
 
         if indexer_softmax_scale != 1.0:
             weights_scaled = (weights.float() * indexer_softmax_scale).to(weights.dtype)
@@ -1550,24 +1515,17 @@ class PrecomputedIndexerSparseAttnFunc(torch.autograd.Function):
         )
 
         raw_local_loss = _kl_loss_from_target_predict(
-            target,
-            predict,
-            indexer_topk_idxs,
-            loss_coeff,
-            calculate_per_token_loss=True,
+            target, predict, indexer_topk_idxs, loss_coeff, calculate_per_token_loss=True
         )
         if calculate_per_token_loss:
             indexer_loss = raw_local_loss
             bwd_loss_coeff = loss_coeff * total_q
         else:
             if global_query_rows <= 0:
-                raise RuntimeError(
-                    f"global_query_rows must be positive, got {global_query_rows}."
-                )
+                raise RuntimeError(f"global_query_rows must be positive, got {global_query_rows}.")
             indexer_loss = raw_local_loss / float(global_query_rows)
             bwd_loss_coeff = loss_coeff * float(total_q) / float(global_query_rows)
 
-        unit_grad_loss = torch.ones((), device=query.device, dtype=torch.float32)
         if loss_coeff > 0:
             ig = _DSA.indexer_backward_wrapper(
                 q_indexer.view(1, total_q, idx_nh, idx_hd),
@@ -1578,16 +1536,16 @@ class PrecomputedIndexerSparseAttnFunc(torch.autograd.Function):
                 indexer_topk_idxs.view(1, total_q, indexer_topk),
                 sm_scale=indexer_softmax_scale,
                 loss_coeff=bwd_loss_coeff,
-                grad_loss=unit_grad_loss,
+                grad_loss=torch.ones((), device=query.device, dtype=torch.float32),
                 block_I=128,
             )
-            precomputed_grad_q_indexer = ig["d_index_q"].view(total_q, idx_nh, idx_hd)
-            precomputed_grad_k_indexer = ig["d_index_k"].view(total_comp, idx_hd)
-            precomputed_grad_weights = ig["d_weights"].view(total_q, idx_nh)
+            saved_grad_q_indexer = ig["d_index_q"].view(total_q, idx_nh, idx_hd)
+            saved_grad_k_indexer = ig["d_index_k"].view(total_comp, idx_hd)
+            saved_grad_weights = ig["d_weights"].view(total_q, idx_nh)
         else:
-            precomputed_grad_q_indexer = torch.zeros_like(q_indexer)
-            precomputed_grad_k_indexer = torch.zeros_like(k_indexer)
-            precomputed_grad_weights = torch.zeros_like(weights)
+            saved_grad_q_indexer = torch.zeros_like(q_indexer)
+            saved_grad_k_indexer = torch.zeros_like(k_indexer)
+            saved_grad_weights = torch.zeros_like(weights)
 
         ctx.save_for_backward(
             query,
@@ -1596,13 +1554,11 @@ class PrecomputedIndexerSparseAttnFunc(torch.autograd.Function):
             topk_idxs,
             out_flat,
             lse,
-            precomputed_grad_q_indexer,
-            precomputed_grad_k_indexer,
-            precomputed_grad_weights,
+            saved_grad_q_indexer,
+            saved_grad_k_indexer,
+            saved_grad_weights,
         )
         ctx.softmax_scale = softmax_scale
-        ctx.np_ = np_
-        ctx.total_q = total_q
 
         return out_flat.reshape(total_q, np_ * out_flat.shape[-1]), indexer_loss
 
@@ -1616,13 +1572,12 @@ class PrecomputedIndexerSparseAttnFunc(torch.autograd.Function):
             topk_idxs,
             out_flat,
             lse,
-            precomputed_grad_q_indexer,
-            precomputed_grad_k_indexer,
-            precomputed_grad_weights,
+            saved_grad_q_indexer,
+            saved_grad_k_indexer,
+            saved_grad_weights,
         ) = ctx.saved_tensors
 
-        d_v = out_flat.shape[-1]
-        dO_flat = grad_output.reshape(ctx.total_q, ctx.np_, d_v)
+        dO_flat = grad_output.reshape(query.shape[0], query.shape[1], out_flat.shape[-1])
         topk_idxs_bwd = _compact_topk_for_sparse_bwd(topk_idxs, kv_full.shape[0])
         attn_bwd = _DSA.sparse_attention_backward_wrapper(
             query,
@@ -1635,22 +1590,14 @@ class PrecomputedIndexerSparseAttnFunc(torch.autograd.Function):
             softmax_scale=ctx.softmax_scale,
             topk_length=None,
         )
-        grad_query = attn_bwd["dq"]
-        grad_kv_full = attn_bwd["dkv"]
-        d_sink = attn_bwd["d_sink"]
-
-        grad_q_indexer = precomputed_grad_q_indexer * grad_loss
-        grad_k_indexer = precomputed_grad_k_indexer * grad_loss
-        grad_weights = precomputed_grad_weights * grad_loss
-
         return (
-            grad_query,
-            grad_kv_full,
-            d_sink,
+            attn_bwd["dq"],
+            attn_bwd["dkv"],
+            attn_bwd["d_sink"],
             None,
-            grad_q_indexer,
-            grad_k_indexer,
-            grad_weights,
+            saved_grad_q_indexer * grad_loss,
+            saved_grad_k_indexer * grad_loss,
+            saved_grad_weights * grad_loss,
             None,
             None,
             None,
@@ -1659,40 +1606,6 @@ class PrecomputedIndexerSparseAttnFunc(torch.autograd.Function):
             None,
             None,
         )
-
-
-def fused_precomputed_indexer_sparse_attn(
-    query: Tensor,
-    kv_full: Tensor,
-    attn_sink: Tensor,
-    topk_idxs: Tensor,
-    q_indexer: Tensor,
-    k_indexer: Tensor,
-    weights: Tensor,
-    indexer_topk_idxs: Tensor,
-    compressed_kv: Tensor,
-    softmax_scale: float,
-    indexer_softmax_scale: float,
-    loss_coeff: float,
-    calculate_per_token_loss: bool,
-    global_query_rows: int,
-) -> Tuple[Tensor, Tensor]:
-    return PrecomputedIndexerSparseAttnFunc.apply(
-        query,
-        kv_full,
-        attn_sink,
-        topk_idxs,
-        q_indexer,
-        k_indexer,
-        weights,
-        indexer_topk_idxs,
-        compressed_kv,
-        softmax_scale,
-        indexer_softmax_scale,
-        loss_coeff,
-        calculate_per_token_loss,
-        global_query_rows,
-    )
 
 
 def fused_indexer_sparse_attn(
@@ -1720,7 +1633,7 @@ def fused_indexer_sparse_attn(
     max_seqlen_compressed_idx: Optional[int] = None,
     compressed_kv: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor]:
-    """Training fused indexer KL loss + sparse attention.
+    """Path B (training): fused indexer (+KL loss) + sparse attention.
 
     Layout is selected by ``cu_seqlens_q``:
 
@@ -1841,5 +1754,4 @@ __all__ = [
     "dsa_sparse_attn",
     "indexer_topk",
     "fused_indexer_sparse_attn",
-    "fused_precomputed_indexer_sparse_attn",
 ]

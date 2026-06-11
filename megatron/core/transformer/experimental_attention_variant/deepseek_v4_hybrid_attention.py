@@ -19,15 +19,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.transformer.experimental_attention_variant.csa_cp_utils import (
-    DSV4_CP_PARTITION_TWO_CHUNK,
-    apply_thd_cp_two_chunk_rope_fused,
-    apply_thd_cp_local_rope_fused,
-    two_chunk_cp_partition,
-    exchange_two_chunk_left_boundary_tensor,
-    exchange_left_boundary_tensor,
-    normalize_dsv4_cp_partition_mode,
-)
+from megatron.core.transformer.experimental_attention_variant import csa_cp_utils as cp_utils
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import MLATransformerConfig
@@ -220,112 +212,6 @@ class DSv4HybridAttention(Attention):
             # the quantized tensor.
             set_save_original_input(self.linear_proj)
 
-    def _dsv4_cp_boundary_window(self) -> int:
-        ratios = [ratio for ratio in self.config.csa_compress_ratios if ratio and ratio > 1]
-        d_comp = max((8 if ratio == 4 else ratio for ratio in ratios), default=0)
-        return max(self.config.csa_window_size, d_comp)
-
-    def _use_two_chunk_cp_partition(self) -> bool:
-        mode = normalize_dsv4_cp_partition_mode(
-            getattr(self.config, "dsv4_cp_partition_mode", None)
-        )
-        return mode == DSV4_CP_PARTITION_TWO_CHUNK
-
-    def _two_chunk_cp_ranges(self, l_local: int):
-        cp_group = self.pg_collection.cp
-        return two_chunk_cp_partition(l_local * cp_group.size(), cp_group.size(), cp_group.rank())
-
-    def _exchange_cp_boundary_hidden(
-        self, hidden_states: torch.Tensor, d_window: int
-    ) -> torch.Tensor:
-        # Pass the full local buffer so the custom backward writes tail grads
-        # directly instead of routing them through an outer SliceBackward copy.
-        hidden_flat = hidden_states.view(hidden_states.shape[0], -1)
-        if self._use_two_chunk_cp_partition():
-            boundary_hidden = exchange_two_chunk_left_boundary_tensor(
-                hidden_flat, d_window, self.pg_collection.cp
-            )
-            local_chunks = 2 if self.pg_collection.cp.size() > 1 else 1
-        else:
-            boundary_hidden = exchange_left_boundary_tensor(
-                hidden_flat, d_window, self.pg_collection.cp
-            )
-            local_chunks = 1
-        return boundary_hidden.reshape(
-            (local_chunks * d_window,) + tuple(hidden_states.shape[1:])
-        )
-
-    def _project_cp_boundary_key(
-        self,
-        boundary_hidden: torch.Tensor,
-        packed_seq_params,
-        l_local: int,
-    ) -> torch.Tensor:
-        if self._use_two_chunk_cp_partition():
-            chunk_ranges = self._two_chunk_cp_ranges(l_local)
-            if boundary_hidden.shape[0] % len(chunk_ranges) != 0:
-                raise RuntimeError(
-                    "DSv4 two-chunk CP boundary projection got invalid boundary rows: "
-                    f"boundary={boundary_hidden.shape[0]}, chunks={len(chunk_ranges)}."
-                )
-            d_window = boundary_hidden.shape[0] // len(chunk_ranges)
-            boundary_ranges = tuple((int(start) - d_window, int(start)) for start, _ in chunk_ranges)
-        else:
-            chunk_ranges = None
-            d_window = boundary_hidden.shape[0]
-            boundary_ranges = None
-        if d_window > l_local:
-            raise RuntimeError(
-                "DSv4 THD CP boundary projection requires D_window <= L_local: "
-                f"D_window={d_window}, L_local={l_local}"
-            )
-        hidden_2d = boundary_hidden.squeeze(1)
-        boundary_kv, _ = self.linear_kv_proj(hidden_2d)
-        boundary_kv = self.kv_layernorm(boundary_kv)
-        cu_seqlens_q = (
-            packed_seq_params.cu_seqlens_q_padded
-            if packed_seq_params.cu_seqlens_q_padded is not None
-            else packed_seq_params.cu_seqlens_q
-        )
-        max_seqlen_q = packed_seq_params.max_seqlen_q
-        if max_seqlen_q is None:
-            raise RuntimeError("DSv4 THD CP boundary RoPE requires max_seqlen_q.")
-        rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb.get_cached_cos_sin(
-            int(max_seqlen_q),
-            dtype=boundary_kv.dtype,
-            packed_seq=True,
-            mscale=1.0,
-        )
-        cp_rank = self.pg_collection.cp.rank()
-        if chunk_ranges is None:
-            boundary_key = apply_thd_cp_local_rope_fused(
-                boundary_kv.unsqueeze(-2),
-                rotary_pos_cos,
-                rotary_pos_sin,
-                self.config.qk_head_dim,
-                self.config.qk_pos_emb_head_dim,
-                cu_seqlens_q,
-                cp_rank=cp_rank,
-                cp_size=self.pg_collection.cp.size(),
-                row_offset=-d_window,
-                chunk_len=l_local,
-                clamp_to_valid_token=True,
-                remove_interleaving=True,
-            )
-        else:
-            boundary_key = apply_thd_cp_two_chunk_rope_fused(
-                boundary_kv.unsqueeze(-2),
-                rotary_pos_cos,
-                rotary_pos_sin,
-                self.config.qk_head_dim,
-                self.config.qk_pos_emb_head_dim,
-                cu_seqlens_q,
-                boundary_ranges,
-                clamp_to_valid_token=True,
-                remove_interleaving=True,
-            )
-        return boundary_key.contiguous()
-
     def forward(
         self,
         hidden_states,
@@ -360,6 +246,10 @@ class DSv4HybridAttention(Attention):
             inference_context is None and inference_params is None
         ), "Inference is not supported for DSv4HybridAttention."
 
+        # Set the right cp group for dynamic-cp. Mirrors Attention.forward:
+        # both QKV RoPE and the post-attention inverse RoPE use
+        # self.pg_collection.cp, which must point at this microbatch's dynamic
+        # CP group. Restored before every return.
         _orig_cp_group = self.pg_collection.cp
         if packed_seq_params is not None and packed_seq_params.local_cp_size is not None:
             assert packed_seq_params.cp_group is not None, "cp_group must be set in dynamic-cp mode"
@@ -372,37 +262,35 @@ class DSv4HybridAttention(Attention):
                 "DSv4 context parallel support requires THD packed sequence input; "
                 f"got cp_size={cp_size}, qkv_format={qkv_format!r}."
             )
-        use_thd_cp = cp_size > 1 and qkv_format == 'thd'
 
         boundary_hidden = None
-        boundary_key = None
-        d_window = None
-        if use_thd_cp:
-            d_window = self._dsv4_cp_boundary_window()
-            l_local = hidden_states.shape[0]
+        if cp_size > 1:
+            boundary_hidden = cp_utils.exchange_cp_boundary_hidden(
+                hidden_states,
+                self.config.csa_compress_ratios,
+                self.config.csa_window_size,
+                self.config.csa_cp_partition_mode,
+                self.pg_collection.cp,
+            )
 
         # =====================
         # Query, Key, and Value
         # =====================
         # Get the query, key and value tensors based on the type of attention -
         # self or cross attn.
-        query, key, value, q_compressed, kv_compressed = self.get_query_key_value_tensors(
+        query, key, value, q_compressed, _, boundary_kv = self.get_query_key_value_tensors(
             hidden_states,
             key_value_states,
             position_ids,
             packed_seq_params,
             inference_context=inference_context,
+            boundary_hidden=boundary_hidden,
         )
-        # TODO: Currently, TE can only accept contiguous tensors for MLA.
+
+        # TODO: Currently, TE can only accept contiguous tensors for MLA
         query = query.contiguous()
         key = key.contiguous()
         value = value.contiguous()
-
-        if use_thd_cp:
-            boundary_hidden = self._exchange_cp_boundary_hidden(hidden_states, d_window)
-            boundary_key = self._project_cp_boundary_key(
-                boundary_hidden, packed_seq_params, l_local
-            )
 
         # ==================================
         # core attention computation
@@ -421,10 +309,13 @@ class DSv4HybridAttention(Attention):
                 x=hidden_states,
                 qr=q_compressed,
                 boundary_hidden=boundary_hidden,
-                boundary_key=boundary_key,
+                boundary_kv=boundary_kv,
             )
+        forced_released_tensors = [query, key, value]
+        if boundary_kv is not None:
+            forced_released_tensors.append(boundary_kv)
         core_attn_out = core_attn_manager.group_offload(
-            core_attn_out, forced_released_tensors=[query, key, value]
+            core_attn_out, forced_released_tensors=forced_released_tensors
         )
 
         if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
@@ -462,7 +353,6 @@ class DSv4HybridAttention(Attention):
         mscale = 1.0
         rotary_pos_cos = None
         rotary_pos_sin = None
-        use_contiguous_thd_cp = packed_seq and self.pg_collection.cp.size() > 1
         if self.config.apply_rope_fusion:
             # ``mscale=1.0`` strips yarn's concentration factor from the
             # cached cos/sin so the fused kernel matches the unfused
@@ -479,52 +369,41 @@ class DSv4HybridAttention(Attention):
             rotary_pos_emb, _ = self.rotary_pos_emb(rope_seqlen, packed_seq=packed_seq)
         else:
             rotary_pos_emb = self.rotary_pos_emb(rope_seqlen, packed_seq=packed_seq)
-        if self.config.apply_rope_fusion and not use_contiguous_thd_cp:
-            if packed_seq:
-                core_attn_out = core_attn_out.squeeze(1)
-            core_attn_out = fused_mla_rope_inplace(
-                core_attn_out,
-                rotary_pos_cos,
-                rotary_pos_sin,
-                nope_dim,
-                pos_dim,
-                cu_seqlens_kv,
-                self.pg_collection.cp.rank(),
-                self.pg_collection.cp.size(),
-                inverse=True,
-                remove_interleaving=True,
-            )
-            if packed_seq:
-                core_attn_out = core_attn_out.unsqueeze(1)
-        elif use_contiguous_thd_cp:
-            cp_rank = self.pg_collection.cp.rank()
-            if rope_seqlen is None:
-                raise RuntimeError("DSv4 THD CP inverse RoPE requires max_seqlen_kv.")
-            if self._use_two_chunk_cp_partition():
-                core_attn_out = apply_thd_cp_two_chunk_rope_fused(
+        if self.config.apply_rope_fusion:
+            if cp_size > 1:
+                if rope_seqlen is None:
+                    raise RuntimeError("DSv4 THD CP inverse RoPE requires max_seqlen_kv.")
+                chunk_ranges = cp_utils.local_q_cp_chunk_ranges(
+                    self.config.csa_cp_partition_mode,
+                    core_attn_out.shape[0],
+                    cp_size,
+                    self.pg_collection.cp.rank(),
+                )
+                core_attn_out = cp_utils.apply_thd_cp_local_rope_fused(
                     core_attn_out,
                     rotary_pos_cos,
                     rotary_pos_sin,
                     nope_dim,
                     pos_dim,
                     cu_seqlens_kv,
-                    self._two_chunk_cp_ranges(core_attn_out.shape[0]),
+                    chunk_ranges,
                     inverse=True,
-                    remove_interleaving=True,
                 )
             else:
-                core_attn_out = apply_thd_cp_local_rope_fused(
+                if packed_seq:
+                    core_attn_out = core_attn_out.squeeze(1)
+                core_attn_out = fused_mla_rope_inplace(
                     core_attn_out,
                     rotary_pos_cos,
                     rotary_pos_sin,
                     nope_dim,
                     pos_dim,
                     cu_seqlens_kv,
-                    cp_rank,
-                    self.pg_collection.cp.size(),
                     inverse=True,
                     remove_interleaving=True,
                 )
+                if packed_seq:
+                    core_attn_out = core_attn_out.unsqueeze(1)
         else:
             content_part, rot_part = torch.split(
                 core_attn_out, [core_attn_out.size(-1) - pos_dim, pos_dim], dim=-1
@@ -536,13 +415,11 @@ class DSv4HybridAttention(Attention):
                 rot_part_in = rot_part.squeeze(1)
             else:
                 rot_part_in = rot_part
-            rotary_pos_emb_out = rotary_pos_emb
-            cu_seqlens_kv_rope = cu_seqlens_kv
             rot_part_out = apply_rotary_pos_emb(
                 rot_part_in,
-                rotary_pos_emb_out,
+                rotary_pos_emb,
                 self.config,
-                cu_seqlens=cu_seqlens_kv_rope,
+                cu_seqlens=cu_seqlens_kv,
                 mscale=mscale,
                 cp_group=self.pg_collection.cp,
                 mla_rotary_interleaved=True,
@@ -683,6 +560,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         inference_context=None,
         *,
         inference_params=None,
+        boundary_hidden=None,
     ):
         """
         Derives `query`, `key` and `value` tensors from `hidden_states`.
@@ -692,6 +570,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         assert (
             hidden_states.ndim == 3
         ), f"hidden_states should be 3D, [s, b, n*h], got {hidden_states.ndim}D"
+
         assert (
             inference_context is None and inference_params is None
         ), "Inference is not supported for DSv4HybridSelfAttention."
@@ -747,6 +626,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         q_compressed, _ = self.linear_q_down_proj(hidden_states)
 
         kv_compressed = hidden_states
+        boundary_kv_compressed = boundary_hidden
         k_pos_emb = None
 
         if packed_seq_params is not None:
@@ -755,6 +635,8 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             # So we need to reshape qkv from [t, 1, h, d] to [t, h, d].
             q_compressed = q_compressed.squeeze(1)
             kv_compressed = kv_compressed.squeeze(1)
+            if boundary_kv_compressed is not None:
+                boundary_kv_compressed = boundary_kv_compressed.squeeze(1)
 
         # =========================================
         # Apply norm
@@ -768,7 +650,9 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
         # QKV up projection and RoPE apply
         # =========================================
 
-        def qkv_up_proj_and_rope_apply(q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb):
+        def qkv_up_proj_and_rope_apply(
+            q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb, boundary_kv_compressed
+        ):
             """
             Apply the up projection and RoPE to the query and key.
             When sequence packing enabled, the input tensors adopt a packed shape of [t, ...];
@@ -783,78 +667,91 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             q = q.view(*q.size()[:-1], self.num_attention_heads_per_partition, self.q_head_dim)
             q = _q_rms_norm(q, self.config.layernorm_epsilon)
 
-            kv, _ = self.linear_kv_proj(kv_compressed)
+            boundary_rows = 0
+            if boundary_kv_compressed is not None:
+                boundary_rows = boundary_kv_compressed.shape[0]
+                kv_projection_input = torch.cat([boundary_kv_compressed, kv_compressed], dim=0)
+            else:
+                kv_projection_input = kv_compressed
+
+            kv, _ = self.linear_kv_proj(kv_projection_input)
             kv = self.kv_layernorm(kv)
+            boundary_kv = None
 
             # [num_tokens, qk_pos_emb_head_dim] -> [num_tokens, 1, qk_pos_emb_head_dim]
             if k_pos_emb is not None:
                 k_pos_emb = torch.unsqueeze(k_pos_emb, -2)
 
+            cp_size = self.pg_collection.cp.size()
             if self.config.apply_rope_fusion:
-                cp_rank = self.pg_collection.cp.rank()
-                cp_size = self.pg_collection.cp.size()
                 if cp_size > 1:
-                    # With CP, this rank's local rows may start in the middle of a
-                    # packed sequence. The regular fused MLA RoPE only sees local
-                    # rows, so CP uses a RoPE path that recovers the real sequence
-                    # position from the global packed row.
+                    cp_rank = self.pg_collection.cp.rank()
+                    # CP local rows may start mid-sequence; use global THD ranges for RoPE.
                     assert packed_seq, "DSv4 CP fused RoPE expects THD packed sequence input."
-                    if self._use_two_chunk_cp_partition():
-                        chunk_ranges = self._two_chunk_cp_ranges(q.shape[0])
-                        query = apply_thd_cp_two_chunk_rope_fused(
-                            q,
-                            rotary_pos_cos,
-                            rotary_pos_sin,
-                            self.config.qk_head_dim,
-                            self.config.qk_pos_emb_head_dim,
-                            cu_seqlens_q,
-                            chunk_ranges,
-                            remove_interleaving=True,
+                    chunk_ranges = cp_utils.local_q_cp_chunk_ranges(
+                        self.config.csa_cp_partition_mode,
+                        q.shape[0],
+                        cp_size,
+                        cp_rank,
+                    )
+                    query = cp_utils.apply_thd_cp_local_rope_fused(
+                        q,
+                        rotary_pos_cos,
+                        rotary_pos_sin,
+                        self.config.qk_head_dim,
+                        self.config.qk_pos_emb_head_dim,
+                        cu_seqlens_q,
+                        chunk_ranges,
+                    )
+                    kv_chunk_ranges = (
+                        cp_utils.local_kv_cp_chunk_ranges(
+                            self.config.csa_cp_partition_mode,
+                            kv_compressed.shape[0],
+                            boundary_rows,
+                            cp_size,
+                            cp_rank,
                         )
-                        kv = kv.unsqueeze(-2)
-                        kv = apply_thd_cp_two_chunk_rope_fused(
-                            kv,
-                            rotary_pos_cos,
-                            rotary_pos_sin,
-                            self.config.qk_head_dim,
-                            self.config.qk_pos_emb_head_dim,
-                            cu_seqlens_q,
-                            chunk_ranges,
-                            remove_interleaving=True,
-                        )
-                        key = kv
-                        value = kv
-                        return query.contiguous(), key.contiguous(), value.contiguous()
-                    rope_fn = apply_thd_cp_local_rope_fused
+                        if boundary_rows
+                        else chunk_ranges
+                    )
+                    kv = kv.unsqueeze(-2)
+                    kv = cp_utils.apply_thd_cp_local_rope_fused(
+                        kv,
+                        rotary_pos_cos,
+                        rotary_pos_sin,
+                        self.config.qk_head_dim,
+                        self.config.qk_pos_emb_head_dim,
+                        cu_seqlens_q,
+                        kv_chunk_ranges,
+                        clamp_to_valid_token=bool(boundary_rows),
+                    )
+                    if boundary_rows:
+                        boundary_kv = kv[:boundary_rows]
+                        kv = kv[boundary_rows:]
                 else:
-                    rope_fn = fused_mla_rope_inplace
-                query = rope_fn(
-                    q,
-                    rotary_pos_cos,
-                    rotary_pos_sin,
-                    self.config.qk_head_dim,
-                    self.config.qk_pos_emb_head_dim,
-                    cu_seqlens_q,
-                    cp_rank,
-                    cp_size,
-                    remove_interleaving=True,
-                )
-                kv = kv.unsqueeze(-2)
-                kv = rope_fn(
-                    kv,
-                    rotary_pos_cos,
-                    rotary_pos_sin,
-                    self.config.qk_head_dim,
-                    self.config.qk_pos_emb_head_dim,
-                    cu_seqlens_q,
-                    cp_rank,
-                    cp_size,
-                    remove_interleaving=True,
-                )
+                    query = fused_mla_rope_inplace(
+                        q,
+                        rotary_pos_cos,
+                        rotary_pos_sin,
+                        self.config.qk_head_dim,
+                        self.config.qk_pos_emb_head_dim,
+                        cu_seqlens_q,
+                        remove_interleaving=True,
+                    )
+                    kv = kv.unsqueeze(-2)
+                    kv = fused_mla_rope_inplace(
+                        kv,
+                        rotary_pos_cos,
+                        rotary_pos_sin,
+                        self.config.qk_head_dim,
+                        self.config.qk_pos_emb_head_dim,
+                        cu_seqlens_q,
+                        remove_interleaving=True,
+                    )
                 key = kv
                 value = kv
             else:
-                if packed_seq and self.pg_collection.cp.size() > 1:
+                if packed_seq and cp_size > 1:
                     raise RuntimeError(
                         "DSv4 THD CP requires apply_rope_fusion=True; "
                         "the unfused THD CP RoPE path is not implemented."
@@ -880,7 +777,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
 
                 # RoPE and query (shared for wkv and latent)
                 # q_pos_emb: [num_tokens, n, qk_pos_emb_head_dim]
-                max_seqlen_q = (
+                _max_seqlen_q = (
                     int(packed_seq_params.max_seqlen_q)
                     if packed_seq_params is not None
                     and packed_seq_params.max_seqlen_q is not None
@@ -895,7 +792,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     cp_group=self.pg_collection.cp,
                     mla_rotary_interleaved=True,
                     mla_output_remove_interleaving=True,
-                    max_seqlen=max_seqlen_q,
+                    max_seqlen=_max_seqlen_q,
                 )
                 # query: [num_tokens, n, (qk_head_dim + v_head_dim)]
                 query = torch.cat([q_no_pe, q_pos_emb], dim=-1)
@@ -904,7 +801,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                 kv_no_pe, k_pos_emb = torch.split(kv, [kv.size(-1) - pos_dim, pos_dim], dim=-1)
 
                 # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
-                max_seqlen_kv = (
+                _max_seqlen_kv = (
                     int(packed_seq_params.max_seqlen_kv)
                     if packed_seq_params is not None
                     and packed_seq_params.max_seqlen_kv is not None
@@ -919,7 +816,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     cp_group=self.pg_collection.cp,
                     mla_rotary_interleaved=True,
                     mla_output_remove_interleaving=True,
-                    max_seqlen=max_seqlen_kv,
+                    max_seqlen=_max_seqlen_kv,
                 )
 
                 # Single head: key = value = [num_tokens, 1, v_head_dim]
@@ -930,21 +827,28 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
             query = query.contiguous()
             key = key.contiguous()
             value = value.contiguous()
+            if boundary_kv is not None:
+                boundary_kv = boundary_kv.contiguous()
 
-            return query, key, value
+            return query, key, value, boundary_kv
 
         if self.recompute_up_proj:
             quantization = self.config.fp8 or self.config.fp4
             self.qkv_up_checkpoint = tensor_parallel.CheckpointWithoutOutput(fp8=quantization)
-            query, key, value = self.qkv_up_checkpoint.checkpoint(
-                qkv_up_proj_and_rope_apply, q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
+            query, key, value, boundary_kv = self.qkv_up_checkpoint.checkpoint(
+                qkv_up_proj_and_rope_apply,
+                q_compressed,
+                kv_compressed,
+                k_pos_emb,
+                rotary_pos_emb,
+                boundary_kv_compressed,
             )
         else:
-            query, key, value = qkv_up_proj_and_rope_apply(
-                q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb
+            query, key, value, boundary_kv = qkv_up_proj_and_rope_apply(
+                q_compressed, kv_compressed, k_pos_emb, rotary_pos_emb, boundary_kv_compressed
             )
 
-        return query, key, value, q_compressed, kv_compressed
+        return query, key, value, q_compressed, kv_compressed, boundary_kv
 
     def backward_dw(self) -> NoReturn:
         """Execute weight gradient computation"""

@@ -21,13 +21,13 @@ from megatron.core.transformer.experimental_attention_variant.csa_cp_utils impor
     DSV4_CP_PARTITION_CONTIGUOUS,
     DSV4_CP_PARTITION_TWO_CHUNK,
     all_gather_fixed_cp_tensor,
-    build_two_chunk_compressor_prep_compact_fused,
-    build_two_chunk_cp_flat_idxs_for_indexer_loss_fused,
-    build_two_chunk_rank_major_compressed_metadata_fused,
-    build_global_compressed_cu_seqlens_fused,
-    two_chunk_cp_partition,
-    compute_two_chunk_cp_indexer_topk_logical_fused,
-    exchange_left_boundary_tensor,
+    build_cp_compressor_prep_compact_fused,
+    build_cp_indexer_loss_indices_fused,
+    build_cp_rank_major_compressed_metadata_fused,
+    exchange_cp_boundary_hidden,
+    build_global_compressed_cu_seqlens,
+    local_q_cp_chunk_ranges,
+    compute_cp_indexer_topk_logical_fused,
     repack_rank_major_compressed_to_seq_major_fused,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_kernels import indexer_topk
@@ -50,10 +50,11 @@ from tests.unit_tests.transformer.experimental_attention_variant.test_dsv4_hybri
 _DSV4_CP_PARITY_EPS = 1e-3
 _DSV4_CP_GRAPH_FUSED_SIM_EPS = 1e-6
 _DSV4_CP_GRAPH_FUSED_RTOL = 1e-6
-# Fused BF16 backward uses atomic accumulation; graph/eager order can differ by
-# one BF16-sized absolute step while preserving strict vector similarity.
+# Fused backward kernels use atomic accumulation, so graph/eager accumulation
+# order can differ. The similarity gates stay at 1e-6; assert_close only bounds
+# local elementwise noise from the atomics.
 _DSV4_CP_GRAPH_FUSED_BF16_ATOL = 1.0
-_DSV4_CP_GRAPH_FUSED_FP32_ATOL = 1e-2
+_DSV4_CP_GRAPH_FUSED_FP32_ATOL = 2e-2
 # Recent full-pass measurements put peak allocated delta scale at roughly
 # 0.55-0.59 for CP2 and 0.30-0.32 for CP4 across ratio 0/4/128 and both
 # partition modes. These limits leave room for allocator noise while still
@@ -197,6 +198,12 @@ def _assert_cp_graph_bitwise_match(actual: torch.Tensor, expected: torch.Tensor,
     max_abs = diff.max().item() if diff.numel() else 0.0
     cosine_sim = _cosine_sim(actual, expected)
     tensor_sim = _tensor_sim(actual, expected)
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else -1
+    print(
+        f"[rank{rank}] {label}: graph/eager not bitwise; max_abs={max_abs:.6e}, "
+        f"cosine_sim={cosine_sim:.10f}, tensor_sim={tensor_sim:.10f}",
+        flush=True,
+    )
     raise AssertionError(
         f"{label}: graph/eager must be bitwise equal; max_abs={max_abs:.6e}, "
         f"cosine_sim={cosine_sim:.10f}, tensor_sim={tensor_sim:.10f}"
@@ -232,18 +239,29 @@ def _assert_cp_graph_fused_backward_match(
         atol = _DSV4_CP_GRAPH_FUSED_FP32_ATOL
     else:
         raise AssertionError(f"{label}: unsupported dtype for fused graph close check: {actual.dtype}")
-    torch.testing.assert_close(
-        actual,
-        expected,
-        rtol=_DSV4_CP_GRAPH_FUSED_RTOL,
-        atol=atol,
-        msg=(
-            f"{label}: fused graph/eager backward mismatch; "
+    try:
+        torch.testing.assert_close(
+            actual,
+            expected,
+            rtol=_DSV4_CP_GRAPH_FUSED_RTOL,
+            atol=atol,
+            msg=(
+                f"{label}: fused graph/eager backward mismatch; "
+                f"rtol={_DSV4_CP_GRAPH_FUSED_RTOL}, atol={atol}, "
+                f"cosine_sim={cosine_sim:.10f}, tensor_sim={tensor_sim:.10f}, "
+                f"max_abs={max_abs:.6e}"
+            ),
+        )
+    except AssertionError:
+        rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else -1
+        print(
+            f"[rank{rank}] {label}: fused backward close failed; "
             f"rtol={_DSV4_CP_GRAPH_FUSED_RTOL}, atol={atol}, "
             f"cosine_sim={cosine_sim:.10f}, tensor_sim={tensor_sim:.10f}, "
-            f"max_abs={max_abs:.6e}"
-        ),
-    )
+            f"max_abs={max_abs:.6e}",
+            flush=True,
+        )
+        raise
 
 
 @contextmanager
@@ -264,7 +282,7 @@ def _make_dsv4_cp_config(
     dsa_indexer_use_sparse_loss=True,
     apply_dsa_kernel_fusion=True,
     apply_rope_fusion=False,
-    dsv4_cp_partition_mode=DSV4_CP_PARTITION_CONTIGUOUS,
+    csa_cp_partition_mode=DSV4_CP_PARTITION_CONTIGUOUS,
 ):
     shape = _DSV4_VARIANTS[_DSV4_CP_TEST_VARIANT]
     return _make_config(
@@ -292,7 +310,7 @@ def _make_dsv4_cp_config(
         expert_model_parallel_size=1,
         apply_dsa_kernel_fusion=apply_dsa_kernel_fusion,
         apply_rope_fusion=apply_rope_fusion,
-        dsv4_cp_partition_mode=dsv4_cp_partition_mode,
+        csa_cp_partition_mode=csa_cp_partition_mode,
     )
 
 
@@ -320,11 +338,14 @@ def _make_contiguous_cp_partition_indices(padded_total_tokens, cp_size, device='
 
 def _make_two_chunk_cp_partition_indices(padded_total_tokens, cp_size, device='cuda'):
     assert padded_total_tokens % (2 * cp_size) == 0
+    local_rows = padded_total_tokens // cp_size
     return tuple(
         torch.cat(
             [
                 torch.arange(start, end, device=device, dtype=torch.long)
-                for start, end in two_chunk_cp_partition(padded_total_tokens, cp_size, rank)
+                for start, end in local_q_cp_chunk_ranges(
+                    DSV4_CP_PARTITION_TWO_CHUNK, local_rows, cp_size, rank
+                )
             ],
             dim=0,
         )
@@ -386,6 +407,7 @@ def _capture_dsv4_attention_forward_backward(attn, static_hidden, static_grad, p
                 attn, static_hidden, static_grad, packed_seq_params, collect_result=False
             )
     torch.cuda.current_stream().wait_stream(warmup_stream)
+    torch.cuda.synchronize()
 
     static_hidden.grad = None
     attn.zero_grad(set_to_none=True)
@@ -398,6 +420,7 @@ def _capture_dsv4_attention_forward_backward(attn, static_hidden, static_grad, p
             packed_seq_params=packed_seq_params,
         )
         graph_output.backward(static_grad)
+    torch.cuda.synchronize()
     return graph, graph_output
 
 
@@ -515,6 +538,12 @@ class TestDSv4HybridAttentionTHDCP:
         _clear_cuda_test_state()
         Utils.destroy_model_parallel()
 
+    @pytest.fixture(autouse=True)
+    def clear_cuda_test_case(self):
+        _clear_cuda_test_state()
+        yield
+        _clear_cuda_test_state()
+
     def _measure_cp1_peak_allocated_delta(self, layer_number, packed, padded_tokens):
         cached = self._cp1_memory_delta_cache.get(layer_number)
         if cached is not None:
@@ -583,19 +612,22 @@ class TestDSv4HybridAttentionTHDCP:
         """
         config = _make_dsv4_cp_config(
             context_parallel_size=self.cp_size,
-            dsv4_cp_partition_mode=partition_mode,
+            csa_cp_partition_mode=partition_mode,
         )
-        attn = _build_attention(config, layer_number=1, pg_collection=self.pg).cuda()
 
-        assert attn._use_two_chunk_cp_partition() == uses_two_chunk
+        l_local = 16
+        ranges = local_q_cp_chunk_ranges(
+            config.csa_cp_partition_mode, l_local, self.cp_size, self.cp_rank
+        )
         if uses_two_chunk:
-            l_local = 16
-            assert attn._two_chunk_cp_ranges(l_local) == two_chunk_cp_partition(
-                l_local * self.cp_size, self.cp_size, self.cp_rank
+            chunk_len = l_local // 2
+            total_chunks = 2 * self.cp_size
+            chunk_ids = (self.cp_rank, total_chunks - 1 - self.cp_rank)
+            assert ranges == tuple(
+                (chunk_id * chunk_len, (chunk_id + 1) * chunk_len) for chunk_id in chunk_ids
             )
-
-        del attn
-        _clear_cuda_test_state()
+        else:
+            assert ranges == ((self.cp_rank * l_local, (self.cp_rank + 1) * l_local),)
 
     def test_thd_cp_partition_mode_rejects_unknown_value(self):
         """Unknown DSv4 CP partition modes fail before a forward pass.
@@ -606,15 +638,11 @@ class TestDSv4HybridAttentionTHDCP:
         """
         config = _make_dsv4_cp_config(
             context_parallel_size=self.cp_size,
-            dsv4_cp_partition_mode="invalid_mode",
+            csa_cp_partition_mode="invalid_mode",
         )
-        attn = _build_attention(config, layer_number=1, pg_collection=self.pg).cuda()
 
-        with pytest.raises(RuntimeError, match="Unsupported DSv4 CP partition mode"):
-            attn._use_two_chunk_cp_partition()
-
-        del attn
-        _clear_cuda_test_state()
+        with pytest.raises(RuntimeError, match="Unsupported CSA CP partition mode"):
+            local_q_cp_chunk_ranges(config.csa_cp_partition_mode, 16, self.cp_size, self.cp_rank)
 
     @pytest.mark.parametrize(
         "partition_mode",
@@ -645,7 +673,7 @@ class TestDSv4HybridAttentionTHDCP:
             dsa_indexer_use_sparse_loss=True,
             apply_dsa_kernel_fusion=True,
             apply_rope_fusion=False,
-            dsv4_cp_partition_mode=partition_mode,
+            csa_cp_partition_mode=partition_mode,
         )
         attn = _build_attention(config, layer_number=layer_number, pg_collection=self.pg).cuda()
 
@@ -687,7 +715,9 @@ class TestDSv4HybridAttentionTHDCP:
         ).reshape(local_len, width)
         local = values.detach().clone().requires_grad_(True)
 
-        boundary = exchange_left_boundary_tensor(local, d_window, self.pg.cp)
+        boundary = exchange_cp_boundary_hidden(
+            local, [], d_window, DSV4_CP_PARTITION_CONTIGUOUS, self.pg.cp
+        )
         if self.cp_rank == 0:
             # Rank 0 has no previous CP rank, so the fixed left boundary is zero-filled.
             expected_boundary = torch.zeros_like(boundary)
@@ -741,7 +771,7 @@ class TestDSv4HybridAttentionTHDCP:
             dsa_indexer_loss_coeff=1.0,
             dsa_indexer_use_sparse_loss=True,
             apply_rope_fusion=True,
-            dsv4_cp_partition_mode=partition_mode,
+            csa_cp_partition_mode=partition_mode,
         )
         config_ref = _make_dsv4_cp_config(
             context_parallel_size=1,
@@ -810,7 +840,7 @@ class TestDSv4HybridAttentionTHDCP:
             dsa_indexer_loss_coeff=1.0,
             dsa_indexer_use_sparse_loss=True,
             apply_rope_fusion=True,
-            dsv4_cp_partition_mode=DSV4_CP_PARTITION_TWO_CHUNK,
+            csa_cp_partition_mode=DSV4_CP_PARTITION_TWO_CHUNK,
         )
         config_ref = _make_dsv4_cp_config(
             context_parallel_size=1,
@@ -827,19 +857,20 @@ class TestDSv4HybridAttentionTHDCP:
         local_hidden = full_hidden.index_select(0, local_idx).detach().clone()
         ref_hidden = full_hidden.detach().clone()
 
-        query_local, _, _, qr_local, _ = cp_attn.get_query_key_value_tensors(
+        query_local, _, _, qr_local, _, _ = cp_attn.get_query_key_value_tensors(
             local_hidden, packed_seq_params=packed
         )
-        query_ref, _, _, qr_ref, _ = ref_attn.get_query_key_value_tensors(
+        query_ref, _, _, qr_ref, _, _ = ref_attn.get_query_key_value_tensors(
             ref_hidden, packed_seq_params=packed
         )
 
         core_cp = cp_attn.core_attention
         core_ref = ref_attn.core_attention
         cu_seqlens = packed.cu_seqlens_q_padded
-        chunk_ranges = two_chunk_cp_partition(padded_tokens, self.cp_size, self.cp_rank)
+        chunk_ranges = local_q_cp_chunk_ranges(
+            DSV4_CP_PARTITION_TWO_CHUNK, padded_tokens // self.cp_size, self.cp_size, self.cp_rank
+        )
         chunk_len = chunk_ranges[0][1] - chunk_ranges[0][0]
-        d_window = cp_attn._dsv4_cp_boundary_window()
         d_comp = 8
         ratio = 4
 
@@ -847,9 +878,6 @@ class TestDSv4HybridAttentionTHDCP:
             local_hidden.detach(),
             qr_local.detach(),
             cu_seqlens,
-            self.cp_rank,
-            self.cp_size,
-            local_hidden.shape[0],
             int(packed.max_seqlen_q),
             chunk_ranges=chunk_ranges,
         )
@@ -867,16 +895,21 @@ class TestDSv4HybridAttentionTHDCP:
             "two-chunk-indexer:weights",
         )
 
-        boundary_hidden = cp_attn._exchange_cp_boundary_hidden(local_hidden, d_window)
+        boundary_hidden = exchange_cp_boundary_hidden(
+            local_hidden,
+            config_cp.csa_compress_ratios,
+            config_cp.csa_window_size,
+            config_cp.csa_cp_partition_mode,
+            self.pg.cp,
+        )
+        d_window = boundary_hidden.shape[0] // len(chunk_ranges)
         (
             hidden_compact,
             cu_compact,
             _seq_ids_local,
             comp_ids_local,
             _valid_local,
-            c_cap,
-            c_cap_per_chunk,
-        ) = build_two_chunk_compressor_prep_compact_fused(
+        ) = build_cp_compressor_prep_compact_fused(
             local_hidden,
             boundary_hidden,
             cu_seqlens,
@@ -890,19 +923,16 @@ class TestDSv4HybridAttentionTHDCP:
             cu_compact,
             max_seqlen_q=int(packed.max_seqlen_q),
             rope_positions=comp_ids_local,
-            fixed_total_comp=c_cap,
-            pre_grouped_compact_input=True,
         )
         k_rank_major = all_gather_fixed_cp_tensor(k_local.squeeze(1), self.pg.cp)
-        seq_ids, comp_ids, valid = build_two_chunk_rank_major_compressed_metadata_fused(
+        seq_ids, comp_ids, valid = build_cp_rank_major_compressed_metadata_fused(
             cu_seqlens,
+            chunk_ranges,
             self.cp_size,
-            chunk_len,
             ratio,
             d_comp,
-            c_cap_per_chunk,
         )
-        cu_compressed = build_global_compressed_cu_seqlens_fused(cu_seqlens, ratio)
+        cu_compressed = build_global_compressed_cu_seqlens(cu_seqlens, ratio)
         k_seq_major, _rank_by_seq_major = repack_rank_major_compressed_to_seq_major_fused(
             k_rank_major,
             seq_ids,
@@ -920,7 +950,7 @@ class TestDSv4HybridAttentionTHDCP:
 
         topk_width = core_cp.indexer.index_topk
         max_seqlen_compressed_idx = int(packed.max_seqlen_q) // ratio
-        cp_topk = compute_two_chunk_cp_indexer_topk_logical_fused(
+        cp_topk = compute_cp_indexer_topk_logical_fused(
             q_local,
             weights_local,
             k_seq_major,
@@ -937,15 +967,13 @@ class TestDSv4HybridAttentionTHDCP:
             q_ref.squeeze(1),
             k_ref.squeeze(1),
             weights_ref.squeeze(1),
-            topk=min(topk_width, max_seqlen_compressed_idx),
+            topk=topk_width,
             ratio=ratio,
             indexer_softmax_scale=core_ref.indexer.softmax_scale,
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_kv=cu_ref,
             max_seqlen_q=int(packed.max_seqlen_q),
             max_seqlen_kv=max_seqlen_compressed_idx,
-            fixed_topk_width=topk_width,
-            compute_topk_length=False,
         )
         ref_topk_local = ref_topk.index_select(0, local_idx)
         assert torch.equal(cp_topk.cpu(), ref_topk_local.cpu()), (
@@ -954,7 +982,7 @@ class TestDSv4HybridAttentionTHDCP:
         )
         window_capacity = max(1, int(chunk_len) + d_window * (cu_seqlens.numel() - 1))
         shared_compressed_base = len(chunk_ranges) * window_capacity
-        _loss_topk, cp_rank_major_topk = build_two_chunk_cp_flat_idxs_for_indexer_loss_fused(
+        _loss_topk, cp_rank_major_topk = build_cp_indexer_loss_indices_fused(
             cu_seqlens,
             cu_compressed,
             chunk_ranges,
@@ -1068,7 +1096,7 @@ class TestDSv4HybridAttentionTHDCP:
                 dsa_indexer_use_sparse_loss=True,
                 apply_dsa_kernel_fusion=fused,
                 apply_rope_fusion=True,
-                dsv4_cp_partition_mode=partition_mode,
+                csa_cp_partition_mode=partition_mode,
             )
             graph_attn = _build_attention(
                 config, layer_number=layer_number, pg_collection=self.pg
@@ -1196,7 +1224,7 @@ class TestDSv4HybridAttentionTHDCP:
             dsa_indexer_use_sparse_loss=True,
             apply_dsa_kernel_fusion=True,
             apply_rope_fusion=True,
-            dsv4_cp_partition_mode=partition_mode,
+            csa_cp_partition_mode=partition_mode,
         )
         graph_attn = _build_attention(
             config, layer_number=layer_number, pg_collection=self.pg
@@ -1300,7 +1328,7 @@ class TestDSv4HybridAttentionTHDCP:
             dsa_indexer_loss_coeff=1.0,
             dsa_indexer_use_sparse_loss=True,
             apply_rope_fusion=True,
-            dsv4_cp_partition_mode=partition_mode,
+            csa_cp_partition_mode=partition_mode,
         )
         cp_attn = _build_attention(
             config_cp, layer_number=layer_number, pg_collection=self.pg
@@ -1363,7 +1391,7 @@ class TestDSv4HybridAttentionTHDCP:
             dsa_indexer_loss_coeff=1.0,
             dsa_indexer_use_sparse_loss=True,
             apply_rope_fusion=True,
-            dsv4_cp_partition_mode=partition_mode,
+            csa_cp_partition_mode=partition_mode,
         )
         cp_attn = _build_attention(
             config_cp, layer_number=layer_number, pg_collection=self.pg

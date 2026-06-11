@@ -1729,11 +1729,11 @@ class TestCompressedSparseAttentionThd:
         packed = _make_packed_seq_params_thd(seg_lens)
         return query, key, value, x, qr, packed
 
-    # ---- Deterministic compressed indices (compress_ratio=128, indexer disabled) ----
+    # ---- Path A (compress_ratio=128: indexer disabled, all-compressed) ----
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_thd_path_a_forward(self):
-        """THD deterministic compressed indices: compress_ratio=128, indexer=None, attend to
+        """Path A (THD): compress_ratio=128 → indexer=None → attend to
         ALL compressed positions per segment via ``get_compress_topk_idxs_thd``.
         """
         compress_ratio = 128
@@ -1758,7 +1758,7 @@ class TestCompressedSparseAttentionThd:
         assert output.shape == (total, 1, np_ * self.config.v_head_dim)
         assert not torch.isnan(output).any()
 
-    # ---- Fused indexer-loss training (compress_ratio=4): fused x sparse/dense x force_unfused ----
+    # ---- Path B (compress_ratio=4, training): fused × sparse/dense × force_unfused ----
 
     @pytest.mark.parametrize(
         "sparse_loss, force_unfused_dsa",
@@ -1772,7 +1772,7 @@ class TestCompressedSparseAttentionThd:
     )
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_thd_path_b_training_forward_backward(self, sparse_loss, force_unfused_dsa):
-        """THD fused indexer-loss training: all three supported combos exercise
+        """Path B (THD training): all three supported combos exercise
         the indexer + KL-loss path with grad flow through Q/K/x/qr.
         """
         # Set the sparse-loss config flag (read inside _forward_thd).
@@ -1820,12 +1820,12 @@ class TestCompressedSparseAttentionThd:
                 assert not torch.isnan(p.grad).any(), f"param {name} grad has NaN"
         assert seen_any_param_grad, "no CSA param received a gradient"
 
-    # ---- Indexer inference without loss (compress_ratio=4): fused x force_unfused ----
+    # ---- Path C (compress_ratio=4, inference): fused × force_unfused ----
 
     @pytest.mark.parametrize("force_unfused_dsa", [False, True], ids=['fused', 'force_unfused'])
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_thd_path_c_inference_forward(self, force_unfused_dsa):
-        """THD indexer inference without loss: indexer top-K plus sparse attention.
+        """Path C (THD inference): indexer top-K + sparse attn, no loss.
         Both the cuDNN fused path and the PyTorch-ref force_unfused path
         produce a well-formed output.
         """
