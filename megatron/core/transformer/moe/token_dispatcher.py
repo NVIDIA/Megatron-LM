@@ -1043,6 +1043,9 @@ class _HybridEPManager(_DispatchManager):
         self.token_probs: Optional[torch.Tensor] = None
         # Handle used for combine operation
         self.handle = None
+        # Handles captured by full-iteration CUDA graphs must remain alive for
+        # later graph replays. They can wrap non-tensor backend resources.
+        self._cuda_graph_handles = []
         # Used for padding the output for each expert
         self.pad_multiple = None
 
@@ -1200,6 +1203,9 @@ class _HybridEPManager(_DispatchManager):
         # Release the used handle/num_permuted_tokens which could change in each iteration.
         # For drop_and_pad mode, we don't need to reset the num_permuted_tokens and
         # num_dispatched_tokens, because their values never change.
+        is_current_stream_capturing = getattr(torch.cuda, "is_current_stream_capturing", None)
+        if is_current_stream_capturing is not None and is_current_stream_capturing():
+            self._cuda_graph_handles.append(self.handle)
         self.handle = None
         if not self.drop_and_pad:
             self.num_permuted_tokens = None

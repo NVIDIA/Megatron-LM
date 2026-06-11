@@ -4,6 +4,8 @@
 
 import gc
 import logging
+import os
+from contextlib import contextmanager
 
 import torch
 
@@ -16,6 +18,47 @@ logger = logging.getLogger(__name__)
 # tools/debug_cuda_graph_pool_memory*.py).
 _shared_graph_pool = None
 _shared_capture_stream = None
+
+
+def _env_flag(name):
+    """Return True when an environment flag is set to a truthy value."""
+    return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
+
+
+def _print_rank0(message):
+    """Print a full-CG progress marker that is not hidden by logging level."""
+    try:
+        distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
+        rank = torch.distributed.get_rank() if distributed else 0
+    except RuntimeError:
+        rank = 0
+    if rank == 0:
+        print(f"[full_cuda_graph] {message}", flush=True)
+
+
+def _synchronize_fsdp_param_gathers(model):
+    """Drain Megatron-FSDP parameter all-gathers before full-iteration capture."""
+    seen = set()
+    synchronized = 0
+    stack = list(model) if isinstance(model, (list, tuple)) else [model]
+    while stack:
+        module = stack.pop()
+        if module is None:
+            continue
+        module_id = id(module)
+        if module_id in seen:
+            continue
+        seen.add(module_id)
+
+        synchronize_param_gather = getattr(module, "synchronize_param_gather", None)
+        if callable(synchronize_param_gather):
+            synchronize_param_gather()
+            synchronized += 1
+
+        modules = getattr(module, "modules", None)
+        if callable(modules):
+            stack.extend(child for child in modules() if id(child) not in seen)
+    return synchronized
 
 
 def get_shared_capture_stream():
@@ -50,6 +93,58 @@ def get_graph_pool(use_single_mempool):
     if use_single_mempool:
         return get_shared_graph_pool()
     return torch.cuda.graph_pool_handle()
+
+
+def _use_pytorch_stale_stream_fix():
+    """Whether to let PyTorch redirect stale autograd streams during graph capture."""
+    requested = _env_flag("MEGATRON_FULL_CG_USE_PYTORCH_STALE_STREAM_FIX")
+    if not requested:
+        return False
+
+    graph_api = getattr(torch.autograd, "graph", None)
+    setter = getattr(graph_api, "set_override_stale_capture_stream", None)
+    if setter is None:
+        message = (
+            "MEGATRON_FULL_CG_USE_PYTORCH_STALE_STREAM_FIX=1 was requested, "
+            "but this PyTorch build does not provide "
+            "torch.autograd.graph.set_override_stale_capture_stream."
+        )
+        if _env_flag("MEGATRON_FULL_CG_REQUIRE_PYTORCH_STALE_STREAM_FIX"):
+            raise RuntimeError(message)
+        message = f"{message} Falling back to Megatron's capture-stream warmup workaround."
+        logger.warning(message)
+        _print_rank0(message)
+        return False
+    return True
+
+
+@contextmanager
+def _override_stale_capture_stream(enabled):
+    """Temporarily enable PyTorch's stale stream override when available."""
+    if not enabled:
+        yield
+        return
+
+    graph_api = getattr(torch.autograd, "graph", None)
+    setter = getattr(graph_api, "set_override_stale_capture_stream", None)
+    if setter is None:
+        logger.warning(
+            "MEGATRON_FULL_CG_USE_PYTORCH_STALE_STREAM_FIX=1 was requested, "
+            "but this PyTorch build does not provide "
+            "torch.autograd.graph.set_override_stale_capture_stream."
+        )
+        yield
+        return
+
+    getter = getattr(torch._C, "_get_override_stale_capture_stream", None)
+    if getter is None:
+        getter = getattr(torch._C, "_override_stale_capture_stream", None)
+    prior = getter() if getter is not None else False
+    setter(True)
+    try:
+        yield
+    finally:
+        setter(prior)
 
 
 # The below functions traverse through nested data structures (tuples, lists, dicts)
@@ -147,6 +242,17 @@ class FullCudaGraphWrapper:
         self.static_loader = StaticBufferLoader()
         self.cuda_graph_warmup_steps = cuda_graph_warmup_steps
         self.use_single_mempool = use_single_mempool
+        self.use_pytorch_stale_stream_fix = _use_pytorch_stale_stream_fix()
+
+    def _forward_backward_on_capture_stream(self, *args, **kwargs):
+        """Run eager warmup on the same stream that will later be captured."""
+        capture_stream = get_shared_capture_stream()
+        current_stream = torch.cuda.current_stream()
+        capture_stream.wait_stream(current_stream)
+        with torch.cuda.stream(capture_stream):
+            result = self.forward_backward_func(*args, **kwargs)
+        current_stream.wait_stream(capture_stream)
+        return result
 
     def data_read(self, data_iterator, model, training, num_microbatches):
         """Read all microbatch inputs from Dataloader and copy to static buffers."""
@@ -199,39 +305,74 @@ class FullCudaGraphWrapper:
         num_microbatches = kwargs['num_microbatches']
 
         training = not kwargs['forward_only']
+        training_str = 'training' if training else 'validation'
+        curr_iteration = self.curr_iter(training_str)
+        capture_iteration = curr_iteration == self.cuda_graph_warmup_steps
         data_iterator = kwargs['data_iterator']
+        if capture_iteration:
+            _print_rank0(
+                f"{training_str} iteration {curr_iteration}: data_read start "
+                f"(use_pytorch_stale_stream_fix={self.use_pytorch_stale_stream_fix})"
+            )
         data_list = self.data_read(data_iterator, model, training, num_microbatches)
         kwargs['data_iterator'] = data_list
 
-        training_str = 'training' if training else 'validation'
-        curr_iteration = self.curr_iter(training_str)
-        if curr_iteration == self.cuda_graph_warmup_steps:
+        if capture_iteration:
+            _print_rank0(f"{training_str} iteration {curr_iteration}: FSDP param gather sync start")
+            synchronized = _synchronize_fsdp_param_gathers(model)
+            torch.cuda.synchronize()
+            _print_rank0(
+                f"{training_str} iteration {curr_iteration}: "
+                f"FSDP param gather sync done ({synchronized} modules)"
+            )
             logger.info(f'Capture CUDA graph for {training_str}!!!')
+            _print_rank0(f"{training_str} iteration {curr_iteration}: pre-capture barrier start")
             torch.distributed.barrier()
+            _print_rank0(f"{training_str} iteration {curr_iteration}: pre-capture barrier done")
             assert FullCudaGraphWrapper.cuda_graph[training_str] is None
+            # Drop eager warmup outputs before capture. Replacing them from inside the
+            # capture context can release tensors while CUDA stream capture is active.
+            FullCudaGraphWrapper.result[training_str] = None
+            gc.collect()
+            torch.cuda.empty_cache()
+            _print_rank0(f"{training_str} iteration {curr_iteration}: graph object init start")
             FullCudaGraphWrapper.cuda_graph[training_str] = torch.cuda.CUDAGraph()
             for _, state in get_all_rng_states().items():
                 FullCudaGraphWrapper.cuda_graph[training_str].register_generator_state(state)
             torch.cuda.synchronize()
             capture_stream = get_shared_capture_stream()
-            with torch.cuda.graph(
-                FullCudaGraphWrapper.cuda_graph[training_str],
-                stream=capture_stream,
-                pool=get_graph_pool(self.use_single_mempool),
-                capture_error_mode="thread_local",
-            ):
-                FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(
-                    *args, **kwargs
-                )
+            captured_result = None
+            _print_rank0(f"{training_str} iteration {curr_iteration}: torch.cuda.graph enter")
+            # Keep warmup and capture on one stream. FSDP/DTensor backward can also run
+            # cleanup from autograd worker threads; relaxed mode keeps those releases from
+            # invalidating PyTorch allocator state during stream capture.
+            with _override_stale_capture_stream(self.use_pytorch_stale_stream_fix):
+                with torch.autograd.set_multithreading_enabled(False):
+                    with torch.cuda.graph(
+                        FullCudaGraphWrapper.cuda_graph[training_str],
+                        stream=capture_stream,
+                        pool=get_graph_pool(self.use_single_mempool),
+                        capture_error_mode="relaxed",
+                    ):
+                        captured_result = self.forward_backward_func(*args, **kwargs)
+            _print_rank0(f"{training_str} iteration {curr_iteration}: capture body done")
+            FullCudaGraphWrapper.result[training_str] = captured_result
             torch.cuda.synchronize()
+            _print_rank0(f"{training_str} iteration {curr_iteration}: post-capture barrier start")
             torch.distributed.barrier()
+            _print_rank0(f"{training_str} iteration {curr_iteration}: CUDA graph capture done")
             logger.info(f'CUDA graph capture done for {training_str}!!!')
         if FullCudaGraphWrapper.cuda_graph[training_str] is None:
-            FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(*args, **kwargs)
+            if self.use_pytorch_stale_stream_fix:
+                result = self.forward_backward_func(*args, **kwargs)
+            else:
+                result = self._forward_backward_on_capture_stream(*args, **kwargs)
         else:
             FullCudaGraphWrapper.cuda_graph[training_str].replay()
+            torch.cuda.current_stream().wait_stream(get_shared_capture_stream())
+            result = FullCudaGraphWrapper.result[training_str]
         self.next_iter(training_str)
-        return FullCudaGraphWrapper.result[training_str]
+        return result
 
     def curr_iter(self, stage):
         """Return current training/validation iteration."""

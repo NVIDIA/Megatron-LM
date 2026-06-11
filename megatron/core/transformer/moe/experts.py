@@ -631,8 +631,8 @@ class TEGroupedMLP(MegatronModule):
                 permuted_probs.unsqueeze(-1), unpadded_tokens_per_expert
             )
             permuted_probs = permuted_probs.squeeze(-1)
-            tokens_per_expert = torch.tensor(
-                tokens_per_expert, dtype=torch.int, device=permuted_probs.device
+            tokens_per_expert = self._tokens_per_expert_to_device(
+                tokens_per_expert, permuted_probs.device
             )
         # if the number of tokens is 0, pad the hidden states to 256
 
@@ -669,6 +669,19 @@ class TEGroupedMLP(MegatronModule):
         if self.config.moe_paged_stash:
             output = paged_stash_group_commit(output, name="grouped_mlp")
         return output
+
+    def _tokens_per_expert_to_device(self, tokens_per_expert, device: torch.device) -> torch.Tensor:
+        """Move CPU expert counts to GPU using pinned host memory for CUDA graph capture."""
+        if self.config.cuda_graph_impl == "none":
+            return torch.tensor(tokens_per_expert, dtype=torch.int, device=device)
+
+        num_experts = len(tokens_per_expert)
+        pinned_counts = getattr(self, "_pinned_tokens_per_expert", None)
+        if pinned_counts is None or pinned_counts.numel() != num_experts:
+            pinned_counts = torch.empty(num_experts, dtype=torch.int, device="cpu", pin_memory=True)
+            self._pinned_tokens_per_expert = pinned_counts
+        pinned_counts.copy_(torch.as_tensor(tokens_per_expert, dtype=torch.int))
+        return pinned_counts.to(device=device, non_blocking=True)
 
     @staticmethod
     def _remove_glu_interleaving(x: torch.Tensor, interleave_size: int) -> torch.Tensor:
