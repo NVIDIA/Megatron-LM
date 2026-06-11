@@ -576,6 +576,25 @@ def test_te_checkpoint_resizes_fgao_reloaded_input(monkeypatch):
     assert resize_calls and resize_calls[-1] == 1
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+def test_reloaded_tensor_mark_survives_lost_python_attr():
+    """Storage-key fallback catches reloaded tensors when Tensor attrs are not preserved."""
+    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+        clear_reloaded_tensor_marks,
+        consume_reloaded_tensor_mark,
+        mark_reloaded_tensor,
+    )
+
+    clear_reloaded_tensor_marks()
+    x = torch.empty(16, device="cuda")
+    mark_reloaded_tensor(x)
+    delattr(x, "_mcore_fgao_reloaded")
+    detached = x.detach()
+
+    assert consume_reloaded_tensor_mark(detached)
+    assert not consume_reloaded_tensor_mark(detached)
+
+
 @pytest.mark.flaky_in_dev
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
 @pytest.mark.skipif(

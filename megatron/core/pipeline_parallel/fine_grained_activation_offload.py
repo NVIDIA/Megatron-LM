@@ -10,6 +10,7 @@ from torch.autograd.graph import saved_tensors_hooks
 # CPU offload implementation for pipeline parallelism
 DEBUG = False
 DEBUG_RANK = 0
+_RELOADED_TENSOR_STORAGE_KEYS = set()
 
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
@@ -29,16 +30,32 @@ def mark_reloaded_tensor(tensor: torch.Tensor) -> None:
     """Track GPU tensors reloaded by FGAO across saved-tensor unpack boundaries."""
     if tensor.is_cuda:
         tensor._mcore_fgao_reloaded = True
+        _RELOADED_TENSOR_STORAGE_KEYS.add(_reloaded_tensor_storage_key(tensor))
 
 
 def consume_reloaded_tensor_mark(tensor: torch.Tensor) -> bool:
     """Return True once for tensors reloaded by FGAO."""
     if not tensor.is_cuda:
         return False
-    if not getattr(tensor, "_mcore_fgao_reloaded", False):
+    storage_key = _reloaded_tensor_storage_key(tensor)
+    marked_by_attr = getattr(tensor, "_mcore_fgao_reloaded", False)
+    marked_by_storage = storage_key in _RELOADED_TENSOR_STORAGE_KEYS
+    if not marked_by_attr and not marked_by_storage:
         return False
     tensor._mcore_fgao_reloaded = False
+    _RELOADED_TENSOR_STORAGE_KEYS.discard(storage_key)
     return True
+
+
+def clear_reloaded_tensor_marks() -> None:
+    """Drop stale FGAO reload marks at iteration/reset boundaries."""
+    _RELOADED_TENSOR_STORAGE_KEYS.clear()
+
+
+def _reloaded_tensor_storage_key(tensor: torch.Tensor) -> Tuple[int, int]:
+    """Identify a CUDA storage across Tensor wrapper boundaries."""
+    storage = tensor.untyped_storage()
+    return (tensor.get_device(), getattr(storage, "_cdata", storage.data_ptr()))
 
 
 def print_offload_summary_table(total_offload_bytes: Dict[str, int]):
@@ -895,6 +912,7 @@ class ChunkOffloadHandler:
         self._offload_pending_by_name.clear()
         for group in self.offload_groups:
             group._reloaded_tensor_tags.clear()
+        clear_reloaded_tensor_marks()
 
     def find_group_with_name(
         self, groups: list[OffloadTensorGroup], name: str, start_index: int = 0
