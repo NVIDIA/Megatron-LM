@@ -315,10 +315,10 @@ class P2PCommunicator:
 
         """
 
-        print(f"for debug, start p2p_communicate", flush=True)
         config = self.config
         tensor_recv_prev_func = None
         tensor_recv_next_func = None
+        print(f"for debug, start p2p_communicate, config.variable_seq_lengths: {config.variable_seq_lengths}, config.mtp_standalone: {config.mtp_standalone}", flush=True)
 
         if config.variable_seq_lengths or config.mtp_standalone:
             print(f"for debug, start to communicate shapes", flush=True)

@@ -1754,7 +1754,9 @@ class MultiTokenPredictionBlock(MegatronModule):
             hidden_states = make_viewless_tensor(
                 inp=hidden_states, requires_grad=True, keep_graph=False
             )
-        for iteration in range(self.config.mtp_num_layers):
+        # for iteration in range(self.config.mtp_num_layers):
+        print(f"for debug, in mtp block forward, len(self.layers): {len(self.layers)}, self.config.mtp_num_layers: {self.config.mtp_num_layers}", flush=True)
+        for iteration in range(len(self.layers)):
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
             (hidden_states, input_ids, position_ids) = self.layers[layer_idx](
                 input_ids=input_ids,
