@@ -8,6 +8,7 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 
+from megatron.core.fp8_utils import get_fp8_disabled_context
 from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
 from megatron.core.models.common.embeddings import RotaryEmbedding, apply_rotary_pos_emb
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -26,7 +27,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa_kernels import
     fused_indexer_sparse_attn,
     indexer_topk,
 )
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
@@ -283,7 +284,12 @@ class Compressor(MegatronModule):
         rotate: bool = False,
         rotary_pos_emb: nn.Module = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        name: str | None = None,
     ) -> None:
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its parent module
+        """
         super().__init__(config=config)
 
         if pg_collection is None:
@@ -301,36 +307,39 @@ class Compressor(MegatronModule):
 
         proj_out_dim = self.coff * head_dim
 
-        self.linear_wkv = build_module(
-            submodules.linear_wkv,
-            config.hidden_size,
-            proj_out_dim,
-            config=config,
-            init_method=config.init_method,
-            bias=False,
-            skip_bias_add=False,
-            skip_weight_param_allocation=False,
-            parallel_mode="duplicated",
-        )
+        with get_fp8_disabled_context(config, is_init=True):
+            self.linear_wkv = build_module(
+                submodules.linear_wkv,
+                config.hidden_size,
+                proj_out_dim,
+                config=config,
+                init_method=config.init_method,
+                bias=False,
+                skip_bias_add=False,
+                skip_weight_param_allocation=False,
+                parallel_mode="duplicated",
+                name=(name + ".linear_wkv") if name is not None else None,
+            )
 
-        self.linear_wgate = build_module(
-            submodules.linear_wgate,
-            config.hidden_size,
-            proj_out_dim,
-            config=config,
-            init_method=config.init_method,
-            bias=False,
-            skip_bias_add=False,
-            skip_weight_param_allocation=False,
-            parallel_mode="duplicated",
-        )
+            self.linear_wgate = build_module(
+                submodules.linear_wgate,
+                config.hidden_size,
+                proj_out_dim,
+                config=config,
+                init_method=config.init_method,
+                bias=False,
+                skip_bias_add=False,
+                skip_weight_param_allocation=False,
+                parallel_mode="duplicated",
+                name=(name + ".linear_wgate") if name is not None else None,
+            )
 
-        # keep to high precision
+        # keep to high precision (FP32 in the reference DeepSeek V4 checkpoint)
         _ape = torch.empty(
             compress_ratio, proj_out_dim, device=torch.cuda.current_device(), dtype=torch.float32
         )
         config.init_method(_ape)
-        self.ape = nn.Parameter(_ape)
+        self.ape = mark_keep_in_fp32(nn.Parameter(_ape))
 
         norm_config = copy.copy(config)
         norm_config.normalization = "RMSNorm"
@@ -369,8 +378,10 @@ class Compressor(MegatronModule):
             nvtx_range_pop("compressor")
             return None
 
-        kv, _ = self.linear_wkv(x)  # [sq, b, coff * head_dim]
-        score, _ = self.linear_wgate(x)  # [sq, b, coff * head_dim]
+        # Run the compressor GEMMs in high precision (BF16) even under FP8 training.
+        with get_fp8_disabled_context(self.config):
+            kv, _ = self.linear_wkv(x)  # [sq, b, coff * head_dim]
+            score, _ = self.linear_wgate(x)  # [sq, b, coff * head_dim]
 
         cutoff = (sq // ratio) * ratio
         if cutoff < sq:
@@ -441,7 +452,12 @@ class CSAIndexer(MegatronModule):
         compress_ratio: int,
         rotary_pos_emb: nn.Module = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        name: str | None = None,
     ) -> None:
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its parent module
+        """
         super().__init__(config=config)
 
         if pg_collection is None:
@@ -463,31 +479,37 @@ class CSAIndexer(MegatronModule):
 
         self.rotary_pos_emb = rotary_pos_emb
 
-        # Q projection
-        self.linear_wq_b = build_module(
-            submodules.linear_wq_b,
-            self.q_lora_rank,
-            self.index_n_heads * self.index_head_dim,
-            config=config,
-            init_method=config.init_method,
-            bias=False,
-            skip_bias_add=False,
-            skip_weight_param_allocation=False,
-            parallel_mode="duplicated",
-        )
+        # The indexer weights stay in BF16 even under FP8 training (the reference
+        # DeepSeek V4 checkpoint keeps them in BF16), so build them outside any
+        # enclosing fp8_model_init context.
+        with get_fp8_disabled_context(config, is_init=True):
+            # Q projection
+            self.linear_wq_b = build_module(
+                submodules.linear_wq_b,
+                self.q_lora_rank,
+                self.index_n_heads * self.index_head_dim,
+                config=config,
+                init_method=config.init_method,
+                bias=False,
+                skip_bias_add=False,
+                skip_weight_param_allocation=False,
+                parallel_mode="duplicated",
+                name=(name + ".linear_wq_b") if name is not None else None,
+            )
 
-        # Weights projection
-        self.linear_weights_proj = build_module(
-            submodules.linear_weights_proj,
-            self.hidden_size,
-            self.index_n_heads,
-            config=config,
-            init_method=config.init_method,
-            bias=False,
-            skip_bias_add=False,
-            skip_weight_param_allocation=False,
-            parallel_mode="duplicated",
-        )
+            # Weights projection
+            self.linear_weights_proj = build_module(
+                submodules.linear_weights_proj,
+                self.hidden_size,
+                self.index_n_heads,
+                config=config,
+                init_method=config.init_method,
+                bias=False,
+                skip_bias_add=False,
+                skip_weight_param_allocation=False,
+                parallel_mode="duplicated",
+                name=(name + ".linear_weights_proj") if name is not None else None,
+            )
 
         # Own compressor (smaller head_dim, with Hadamard rotation)
         self.compressor = build_module(
@@ -498,6 +520,7 @@ class CSAIndexer(MegatronModule):
             rotate=True,
             rotary_pos_emb=rotary_pos_emb,
             pg_collection=pg_collection,
+            name=(name + ".compressor") if name is not None else None,
         )
 
     def forward_before_topk(
@@ -509,7 +532,9 @@ class CSAIndexer(MegatronModule):
         sq, bsz, _ = x.size()
 
         # Q path
-        q, _ = self.linear_wq_b(qr)  # [sq, b, n_heads * head_dim]
+        # Run the indexer GEMMs in high precision (BF16) even under FP8 training.
+        with get_fp8_disabled_context(self.config):
+            q, _ = self.linear_wq_b(qr)  # [sq, b, n_heads * head_dim]
         q = q.reshape(sq, bsz, self.index_n_heads, self.index_head_dim)
         q = _apply_rope(
             q,
@@ -526,7 +551,8 @@ class CSAIndexer(MegatronModule):
         # K path: own compressor
         k = self.compressor(x)  # [sq//ratio, b, index_head_dim]
 
-        weights, _ = self.linear_weights_proj(x)  # [sq, b, n_heads]
+        with get_fp8_disabled_context(self.config):
+            weights, _ = self.linear_weights_proj(x)  # [sq, b, n_heads]
         weights = weights * (self.index_n_heads**-0.5)
 
         nvtx_range_pop("indexer_before_topk")
@@ -592,7 +618,12 @@ class CompressedSparseAttention(MegatronModule):
         rotary_pos_emb: nn.Module = None,
         compress_ratio: int = 0,
         is_mtp_layer: bool = False,
+        name: str | None = None,
     ):
+        """
+        Args:
+            name (str | None): module instance name passed top-down from its parent module
+        """
         super().__init__(config=config)
 
         if pg_collection is None:
@@ -614,8 +645,11 @@ class CompressedSparseAttention(MegatronModule):
 
         self.apply_dsa_kernel_fusion = config.apply_dsa_kernel_fusion
 
-        # Learnable attention sink per head
-        self.attn_sink = nn.Parameter(torch.zeros(self.n_local_heads, dtype=torch.float32))
+        # Learnable attention sink per head, kept in high precision
+        # (FP32 in the reference DeepSeek V4 checkpoint)
+        self.attn_sink = mark_keep_in_fp32(
+            nn.Parameter(torch.zeros(self.n_local_heads, dtype=torch.float32))
+        )
 
         # Conditionally build Compressor (ratio > 1). ratio == 0 is window-only ('W'): not built.
         if self.compress_ratio > 1 and submodules.compressor is not None:
@@ -627,6 +661,7 @@ class CompressedSparseAttention(MegatronModule):
                 rotate=False,
                 rotary_pos_emb=rotary_pos_emb,
                 pg_collection=pg_collection,
+                name=(name + ".compressor") if name is not None else None,
             )
         else:
             self.compressor = None
@@ -643,6 +678,7 @@ class CompressedSparseAttention(MegatronModule):
                 compress_ratio=self.compress_ratio,
                 rotary_pos_emb=rotary_pos_emb,
                 pg_collection=pg_collection,
+                name=(name + ".indexer") if name is not None else None,
             )
         else:
             self.indexer = None
