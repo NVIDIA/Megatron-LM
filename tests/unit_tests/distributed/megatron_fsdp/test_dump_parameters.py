@@ -9,7 +9,6 @@ Run with torchrun:
 import json
 import pathlib
 
-import pytest
 import torch
 import torch.distributed as dist
 from torch.distributed._tensor import Replicate, Shard, distribute_tensor
@@ -97,13 +96,21 @@ def test_dump_optimizer_parameters_plain_tensor(distributed_setup, tmp_path: pat
     assert p["placements"] is None
 
 
-def test_dump_optimizer_parameters_rejects_multi_group(
-    distributed_setup, tmp_path: pathlib.Path
-) -> None:
-    """Multi-param-group optimizers raise — the dump assumes a single group."""
+def test_dump_optimizer_parameters_multi_group(distributed_setup, tmp_path: pathlib.Path) -> None:
+    """Multi-param-group optimizers (e.g., Megatron's wd/no-wd split): all
+    params flatten into a single `params` list."""
     _ensure_process_group(distributed_setup)
     a = torch.randn(2, 2, requires_grad=True, device=distributed_setup.device)
-    b = torch.randn(2, 2, requires_grad=True, device=distributed_setup.device)
-    optimizer = torch.optim.SGD([{"params": [a]}, {"params": [b]}], lr=0.01)
-    with pytest.raises(ValueError, match="exactly one parameter group"):
-        dump_optimizer_parameters(optimizer, tmp_path / "rejects.json")
+    b = torch.randn(3, 3, requires_grad=True, device=distributed_setup.device)
+    optimizer = torch.optim.SGD(
+        [{"params": [a], "weight_decay": 0.1}, {"params": [b], "weight_decay": 0.0}], lr=0.01
+    )
+
+    out_path = tmp_path / "multi.json"
+    dump_optimizer_parameters(optimizer, out_path)
+
+    written = out_path.with_suffix(f".rank{distributed_setup.rank}.json")
+    spec = json.loads(written.read_text())
+    assert len(spec["params"]) == 2
+    assert spec["params"][0]["global_shape"] == [2, 2]
+    assert spec["params"][1]["global_shape"] == [3, 3]

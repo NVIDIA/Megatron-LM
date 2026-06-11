@@ -55,21 +55,17 @@ def dump_optimizer_parameters(
             the `extra` key. Useful for caller-specific knobs (e.g.,
             optimizer hyperparameters not captured by `param_groups`).
     """
-    if len(optimizer.param_groups) != 1:
-        raise ValueError(
-            f"dump_optimizer_parameters expects exactly one parameter group; "
-            f"got {len(optimizer.param_groups)}."
-        )
-
     rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
 
+    # Flatten all param groups into a single list — group hyperparameters
+    # (lr, betas, ...) are intentionally not recorded; only per-param sharding
+    # metadata is.
+    all_params = [p for group in optimizer.param_groups for p in group["params"]]
     spec: dict[str, Any] = {
         "world_size": world_size,
         "rank": rank,
-        "params": [
-            _dump_param(p, optimizer.state.get(p, {})) for p in optimizer.param_groups[0]["params"]
-        ],
+        "params": [_dump_param(p, optimizer.state.get(p, {})) for p in all_params],
     }
     if extra_meta is not None:
         spec["extra"] = extra_meta
