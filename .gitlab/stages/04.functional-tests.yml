@@ -66,6 +66,11 @@ functional:configure:
         RELEASE_ARGS=()
       fi
     - |
+      WORKLOAD_IMAGE_ARGS=()
+      if [[ -n "${FUNCTIONAL_TEST_WORKLOAD_LOCAL_IMAGE_PATH:-}" ]]; then
+        WORKLOAD_IMAGE_ARGS+=("--workload-local-image-path ${FUNCTIONAL_TEST_WORKLOAD_LOCAL_IMAGE_PATH}")
+      fi
+    - |
       # NOTE: $FUNCTIONAL_TEST_SCOPE is supplied by external scheduled-pipeline
       # configurations and uses the GitLab-side legacy values: `mr`, `mr-slim`,
       # `nightly`, `weekly`, `unit-tests`, `release`.
@@ -88,6 +93,7 @@ functional:configure:
         "--slurm-account ${CI_SLURM_ACCOUNT}"
         "--no-enable-warmup"
       )
+      ARGS+=("${WORKLOAD_IMAGE_ARGS[@]}")
     - |
       SMOKE_ARGS=(
         "--scope L0-smoke"
@@ -102,6 +108,7 @@ functional:configure:
         "--slurm-account ${CI_SLURM_ACCOUNT}"
         "--no-enable-warmup"
       )
+      SMOKE_ARGS+=("${WORKLOAD_IMAGE_ARGS[@]}")
     - |
       export PYTHONPATH=$(pwd)
       python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
