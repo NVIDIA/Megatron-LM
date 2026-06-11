@@ -14,11 +14,14 @@
 
 
 from collections import OrderedDict
+from dataclasses import dataclass
 from typing import List
 
 import torch
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor
+
+from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import copy_chunk_metadata
 
 from .emerging_optimizers import HAVE_EMERGING_OPTIMIZERS
 from .optimizer import MegatronOptimizer
@@ -55,8 +58,180 @@ def _vanilla_muon_scale(rows: int, cols: int) -> float:
     return max(1.0, rows / cols) ** 0.5
 
 
+@dataclass
+class MuonGradPackage:
+    """Static Muon package over aligned main-weight / grad / momentum indices."""
+
+    param_ids: List[int]
+    has_comm: bool
+
+    @torch.no_grad()
+    def update_momentum(self, opt, coef):
+        for param_idx in self.param_ids:
+            grad = opt._main_grads[param_idx]
+            if grad is None:
+                continue
+            grad_shard = grad.to_local().reshape(-1)
+            if grad_shard.numel() == 0:
+                continue
+            momentum = opt._momentum_buffers[param_idx]
+            momentum.mul_(coef).add_(grad_shard)
+            if opt._nesterov:
+                torch.add(grad_shard, momentum, alpha=coef, out=grad_shard)
+
+    @torch.no_grad()
+    def issue_gather(self, opt, full_grads):
+        """Gather this package's NS input shards to each param root."""
+        if not self.has_comm:
+            return []
+
+        group, this_rank, world_size = opt._comm[self.param_ids[0]]
+        ops = []
+        for param_idx in self.param_ids:
+            root = opt._roots[param_idx]
+            ranges = opt._shard_ranges[param_idx]
+            this_offset, this_size = ranges[this_rank]
+            ns_input_shard = None
+            if this_size > 0:
+                if opt._nesterov:
+                    ns_input_shard = opt._main_grads[param_idx].to_local().reshape(-1)
+                else:
+                    ns_input_shard = opt._momentum_buffers[param_idx]
+
+            if root == this_rank:
+                main_weight = opt._main_weights[param_idx]
+                momentum = opt._momentum_buffers[param_idx]
+                full_grad = torch.empty(
+                    main_weight.shape.numel(),
+                    dtype=momentum.dtype,
+                    device=momentum.device,
+                )
+                full_grads[param_idx] = full_grad
+                if this_size > 0:
+                    full_grad[this_offset : this_offset + this_size].copy_(ns_input_shard)
+                for src in range(world_size):
+                    offset, size = ranges[src]
+                    if size == 0 or src == this_rank:
+                        continue
+                    ops.append(
+                        dist.P2POp(
+                            dist.irecv,
+                            full_grad[offset : offset + size],
+                            dist.get_global_rank(group, src),
+                            group=group,
+                        )
+                    )
+            elif this_size > 0:
+                ops.append(
+                    dist.P2POp(
+                        dist.isend,
+                        ns_input_shard,
+                        dist.get_global_rank(group, root),
+                        group=group,
+                    )
+                )
+        return dist.batch_isend_irecv(ops) if ops else []
+
+    @torch.no_grad()
+    def finish_gather(self, requests):
+        for request in requests:
+            request.wait()
+
+    @torch.no_grad()
+    def orthogonalize(self, opt, requests, full_grads):
+        self.finish_gather(requests)
+        orths = {}
+        for param_idx in self.param_ids:
+            if opt._roots[param_idx] != opt._comm[param_idx][1]:
+                continue
+            if param_idx in full_grads:
+                full_grad = full_grads.pop(param_idx)
+            elif opt._nesterov:
+                full_grad = opt._main_grads[param_idx].to_local().reshape(-1)
+            else:
+                full_grad = opt._momentum_buffers[param_idx]
+            full_grad = full_grad.view(opt._main_weights[param_idx].shape)
+
+            grad = full_grad.to(torch.float32)
+            if HAVE_EMERGING_OPTIMIZERS:
+                orth = newton_schulz_tp(
+                    grad,
+                    steps=opt._num_ns_steps,
+                    coefficient_type=opt._coefficient_type,
+                    tp_group=None,
+                    partition_dim=None,
+                    tp_mode="duplicated",
+                )
+                scale = get_muon_scale_factor(
+                    grad.size(-2), grad.size(-1), mode=opt._scale_mode
+                )
+            else:
+                orth = _vanilla_newton_schulz(grad, steps=opt._num_ns_steps)
+                scale = _vanilla_muon_scale(grad.size(-2), grad.size(-1))
+            orths[param_idx] = (orth * (scale * opt._extra_scale_factor)).to(full_grad.dtype)
+        return orths
+
+    @torch.no_grad()
+    def issue_scatter(self, opt, orths):
+        """Scatter this package's orthogonalized shards from each param root."""
+        if not self.has_comm:
+            return []
+
+        group, this_rank, world_size = opt._comm[self.param_ids[0]]
+        ops = []
+        for param_idx in self.param_ids:
+            root = opt._roots[param_idx]
+            ranges = opt._shard_ranges[param_idx]
+            if root == this_rank:
+                orth = orths[param_idx].reshape(-1)
+                for dst in range(world_size):
+                    offset, size = ranges[dst]
+                    if size == 0 or dst == this_rank:
+                        continue
+                    ops.append(
+                        dist.P2POp(
+                            dist.isend,
+                            orth[offset : offset + size],
+                            dist.get_global_rank(group, dst),
+                            group=group,
+                        )
+                    )
+            elif ranges[this_rank][1] > 0:
+                ops.append(
+                    dist.P2POp(
+                        dist.irecv,
+                        opt._main_grads[param_idx].to_local().reshape(-1),
+                        dist.get_global_rank(group, root),
+                        group=group,
+                    )
+                )
+        return dist.batch_isend_irecv(ops) if ops else []
+
+    @torch.no_grad()
+    def finish_scatter(self, requests):
+        for request in requests:
+            request.wait()
+
+
 class FullyShardV2Muon(torch.optim.Optimizer):
     """Single-root distributed Muon for Megatron-FSDP v2 (a torch optimizer).
+
+    Initialization:
+      1. Layout: compute each rank's flat shard range for every parameter.
+      2. Root selection: assign each parameter's Newton-Schulz work to one rank.
+         The greedy policy balances estimated NS cost while preferring ranks that
+         already hold the shard.
+      3. Package construction: group communicating params by DP group and sort by
+         NS cost. No-comm params are split around communication packages to cover
+         the first gather and final scatter.
+
+    Step:
+      1. Momentum: update local momentum shards; Nesterov writes the NS input into
+         the local grad shard.
+      2. Gather: send NS input shards to each parameter's root rank.
+      3. Orthogonalize: root ranks run Newton-Schulz and keep full orth updates.
+      4. Scatter: roots send orthogonalized shards back to shard owners.
+      5. Apply: each rank updates its local optimizer-weight shard.
 
     Args:
         params: optimizer-facing params — all assumed to be FSDP-v2 ``dist_param``
@@ -64,21 +239,21 @@ class FullyShardV2Muon(torch.optim.Optimizer):
         grads: the gradient DTensor for each param, aligned 1:1 with the flattened
             params (asserted to be DTensors). This is the sole gradient source —
             replaces the old ParameterGroup back-reference path.
+        momentum_buffers: flat local momentum tensors owned by the outer Megatron
+            optimizer adapter and updated in-place by this inner optimizer.
         lr / momentum / nesterov / weight_decay: Muon update hyperparameters.
         num_ns_steps / coefficient_type / scale_mode / extra_scale_factor: NS +
             scaling config used by ``orthogonalize``.
-        fp32_matmul_prec / tp_mode: reserved for the Phase-2 tensor-parallel NS path
-            (currently TP size 1; accepted and ignored).
-        packages: list of param-index lists grouping params for batched P2P (one
-            batch_isend_irecv per package; packages pipeline so a package's gather
-            overlaps the previous package's NS). Every package must share one dp_group.
-            None -> one package per dp_group.
+        fp32_matmul_prec / tp_mode: reserved for the future tensor-parallel NS path
+            (currently TP size 1; accepted and ignored). Params are grouped into
+            communication and no-communication packages after root assignment.
     """
 
     def __init__(
         self,
         params,
         grads,
+        momentum_buffers,
         *,
         lr: float,
         momentum: float = 0.95,
@@ -90,37 +265,54 @@ class FullyShardV2Muon(torch.optim.Optimizer):
         extra_scale_factor: float = 1.0,
         fp32_matmul_prec: str = "medium",
         tp_mode: str = "duplicated",
-        packages=None,
     ) -> None:
-        super().__init__(params, dict(lr=lr, weight_decay=weight_decay))
-
-        flat_params = [param for group in self.param_groups for param in group["params"]]
-        assert all(
-            isinstance(p, DTensor) for p in flat_params
-        ), "FullyShardV2Muon expects every param to be a DTensor (FSDP-v2 dist_param)."
-        # grads align 1:1 with params; each a Shard(0) DTensor, or None if our shard is empty.
-        assert all(
-            g is None or isinstance(g, DTensor) for g in grads
-        ), "FullyShardV2Muon expects every grad to be a DTensor or None."
-        assert len(grads) == len(flat_params), (
-            f"grads ({len(grads)}) must align 1:1 with params ({len(flat_params)})."
+        super().__init__(
+            params,
+            dict(
+                lr=lr,
+                momentum=momentum,
+                nesterov=nesterov,
+                weight_decay=weight_decay,
+                num_ns_steps=num_ns_steps,
+                coefficient_type=coefficient_type,
+                scale_mode=scale_mode,
+                extra_scale_factor=extra_scale_factor,
+            ),
         )
-        self._main_grads = list(grads)
 
-        # Muon hyperparameters. lr is NOT stored — it lives in param_groups[0]["lr"]
-        # (where the LR scheduler writes), read in step().
+        param_list = [param for group in self.param_groups for param in group["params"]]
+        grad_list = list(grads)
+        if not param_list:
+            raise ValueError("FullyShardV2Muon got no parameters to manage.")
+        assert all(
+            isinstance(param, DTensor) for param in param_list
+        ), "FullyShardV2Muon expects every param to be a DTensor (FSDP-v2 dist_param)."
+        assert all(
+            grad is None or isinstance(grad, DTensor) for grad in grad_list
+        ), "FullyShardV2Muon expects every grad to be a DTensor or None."
+        momentum_list = list(momentum_buffers)
+        assert len(momentum_list) == len(param_list), (
+            f"FullyShardV2Muon got {len(momentum_list)} momentum buffers for "
+            f"{len(param_list)} params."
+        )
+        for param_idx, (param, momentum_buffer) in enumerate(zip(param_list, momentum_list)):
+            assert momentum_buffer.numel() == param.to_local().numel(), (
+                f"Muon momentum buffer for param {param_idx} has {momentum_buffer.numel()} "
+                f"elements, expected {param.to_local().numel()}."
+            )
+
+        self._main_weights = param_list
+        self._main_grads = grad_list
+        self._momentum_buffers = momentum_list
+
+        # Hyperparameters read by step() and MuonGradPackage methods.
         self._momentum_coef = momentum
-        self._nesterov = nesterov
         self._weight_decay = weight_decay
-        # NS + scaling config for orthogonalize().
+        self._nesterov = nesterov
         self._num_ns_steps = num_ns_steps
         self._coefficient_type = coefficient_type
         self._scale_mode = scale_mode
         self._extra_scale_factor = extra_scale_factor
-
-        if not flat_params:
-            raise ValueError("FullyShardV2Muon got no parameters to manage.")
-        self._main_weights = list(flat_params)
 
         # Per param: (dp_group, this rank's rank within it, that group's world size).
         self._comm = []
@@ -128,77 +320,16 @@ class FullyShardV2Muon(torch.optim.Optimizer):
             group = main_weight.device_mesh.get_group()
             self._comm.append((group, dist.get_rank(group), dist.get_world_size(group)))
 
-        # Per-rank (flat_offset, size) of each param + a load-balanced NS root
-        # (layout-only, so identical on every rank).
         self._shard_ranges = self._compute_shard_ranges()
         self._roots = self._assign_roots()
 
-        # Persistent full-grad buffer per SPLIT param rooted here (the root assembles its
-        # shards for NS). Single-holder params need none — their grad shard already IS the
-        # full grad.
-        self._full_grads = {}
-        for i, main_weight in enumerate(self._main_weights):
-            _group, this_rank, _world_size = self._comm[i]
-            if self._roots[i] != this_rank:
-                continue
-            holders = [r for r, (_offset, size) in enumerate(self._shard_ranges[i]) if size > 0]
-            if len(holders) <= 1:
-                continue
-            grad = self._main_grads[i]
-            dtype = grad.dtype if grad is not None else main_weight.dtype
-            self._full_grads[i] = torch.empty(
-                main_weight.shape.numel(), dtype=dtype, device=main_weight.device
-            )
-
-        # Each entry: (master weight, grad or None, momentum, post_momentum_shard).
-        # post_momentum_shard is this rank's momentum-adjusted gradient slice, written by
-        # Phase 1 and read by gather in its FINAL location (no copy). nesterov: a fresh
-        # grad+coef*m, into the split root's full-grad slice or the grad shard (momentum
-        # separate). non-nesterov: == m, so it aliases momentum (which for a split root
-        # lives in the full-grad slice).
-        self._managed = []
-        for i in range(len(self._main_weights)):
-            main_weight = self._main_weights[i]
-            grad = self._main_grads[i]
-            _group, this_rank, _world_size = self._comm[i]
-            this_offset, this_size = self._shard_ranges[i][this_rank]
-            dtype = grad.dtype if grad is not None else main_weight.dtype
-            # this rank's slice inside the preallocated full grad (split root only, else None)
-            grad_slice = (
-                self._full_grads[i].reshape(-1)[this_offset : this_offset + this_size]
-                if i in self._full_grads
-                else None
-            )
-            if self._nesterov:
-                momentum = torch.zeros(this_size, dtype=dtype, device=main_weight.device)
-                post_momentum_shard = grad_slice if grad_slice is not None else (
-                    grad.to_local().reshape(-1) if grad is not None else None
-                )
-            elif grad_slice is not None:  # split root: momentum lives in the full grad
-                momentum = grad_slice
-                momentum.zero_()
-                post_momentum_shard = momentum
-            else:
-                momentum = torch.zeros(this_size, dtype=dtype, device=main_weight.device)
-                post_momentum_shard = momentum
-            self._managed.append((main_weight, grad, momentum, post_momentum_shard))
-
-        # `packages`: list of param-index lists (into self._main_weights). Each package
-        # does ONE batched isend/irecv; packages pipeline (package i+1's gather overlaps
-        # package i's NS). Every package must share one dp_group. The wrapper passes one
-        # package per FSDPModule (== layer), so layers pipeline:
-        #     packages = [[0, 1, 2], [3, 4, 5]]   # layer 0 | layer 1
-        # Default (None): one package per dp_group, e.g. dense vs expert params:
-        #     packages = [[0, 1, 3], [2, 4]]      # dp-group | edp-group; no intra-group pipeline
-        if packages is None:
-            by_group = OrderedDict()
-            for param_idx in range(len(self._main_weights)):
-                by_group.setdefault(self._comm[param_idx][0], []).append(param_idx)
-            packages = list(by_group.values())
-        self._packages = [list(p) for p in packages]
-
-        # Precompute the static per-package NS and P2P plans; step() only fires the P2Ps.
-        self._ns_plans, self._gather_plans, self._scatter_plans = self._build_plans()
+        self._ns_costs = [
+            main_weight.shape.numel() * min(main_weight.shape)
+            if len(main_weight.shape) == 2
+            else 0
+            for main_weight in self._main_weights
+        ]
+        self._packages = self._build_packages()
 
     def _compute_shard_ranges(self):
         """Compute, per param, each DP rank's (flat_offset, size) within the full param.
@@ -238,18 +369,18 @@ class FullyShardV2Muon(torch.optim.Optimizer):
         """Assign each param an NS root rank, load-balancing NS work per dp_group.
 
         Steps:
-          1. group params by dp_group; track each rank's NS load (cost ~ numel*min(dim));
-          2. pin single-holder params to their only holder (zero gather/scatter) and add
-             their cost to that rank's load;
-          3. assign split params heaviest-first (LPT) to the least-loaded holder (ties:
-             the holder with more of this param's data, then lowest rank).
+          1. group params by dp_group and estimate each param's NS cost;
+          2. compute the average NS target load for the group;
+          3. assign params heaviest-first, preferring no-comm roots until their
+             ranks reach the target, then allowing remote roots for balance.
 
         Deterministic + identical on every rank (depends only on shard layout).
 
         Example (world_size=2):
-            param A: single holder {0}, cost 100  -> root 0          (load [100,   0])
-            param B: split {0,1},       cost 300  -> root 1 (idler)  (load [100, 300])
-            param C: split {0,1},       cost 200  -> root 0          (load [300, 300])
+            target load = 400
+            param A: single holder {0}, cost 300  -> root 0          (load [300,   0])
+            param B: single holder {0}, cost 300  -> root 0          (load [600,   0])
+            param C: split {0,1},       cost 200  -> root 1          (load [600, 200])
         """
         params_by_group = OrderedDict()
         for param_idx in range(len(self._main_weights)):
@@ -258,164 +389,82 @@ class FullyShardV2Muon(torch.optim.Optimizer):
         for _group, param_indices in params_by_group.items():
             world_size = self._comm[param_indices[0]][2]
             load = [0] * world_size
-            split = []
+            work = []
             for param_idx in param_indices:
-                holders = [
-                    rank
-                    for rank, (_offset, size) in enumerate(self._shard_ranges[param_idx])
-                    if size > 0
-                ]
                 shape = self._main_weights[param_idx].shape
                 ns_cost = shape.numel() * min(shape) if len(shape) == 2 else 0
-                if len(holders) == 1:
-                    roots[param_idx] = holders[0]
-                    load[holders[0]] += ns_cost
-                elif len(holders) > 1:
-                    split.append((ns_cost, param_idx, holders))
-            for ns_cost, param_idx, holders in sorted(split, key=lambda e: (-e[0], e[1])):
+                work.append((ns_cost, param_idx))
+            target_load = sum(ns_cost for ns_cost, _param_idx in work) / world_size
+            for ns_cost, param_idx in sorted(work, key=lambda e: (-e[0], e[1])):
                 ranges = self._shard_ranges[param_idx]
-                best = min(holders, key=lambda rank: (load[rank], -ranges[rank][1], rank))
+                param_numel = self._main_weights[param_idx].shape.numel()
+                full_holders = [
+                    rank for rank, (_offset, size) in enumerate(ranges) if size == param_numel
+                ]
+                holders = [rank for rank, (_offset, size) in enumerate(ranges) if size > 0]
+
+                # Prefer no-comm full holders until they reach the average target.
+                # For split params, prefer shard holders under target before using
+                # a non-holder; larger local shards win ties to limit traffic.
+                candidates = [rank for rank in full_holders if load[rank] < target_load]
+                if not candidates:
+                    candidates = [rank for rank in holders if load[rank] < target_load]
+                if not candidates:
+                    candidates = range(world_size)
+
+                best = min(candidates, key=lambda rank: (load[rank], -ranges[rank][1], rank))
                 roots[param_idx] = best
                 load[best] += ns_cost
         return roots
 
-    def _build_plans(self):
-        """Precompute per-package NS order and P2P send/recv lists.
-
-        NS plan splits rooted grads so comm-free NS covers exposed comm:
-
-            issue gather(i + 1)
-            NS(pre_comm)        # overlaps gather(i); single-holder grads
-            wait gather(i)
-            NS(wait_comm)       # depends on gather(i); split-root grads
-            issue scatter(i)
-            NS(post_comm)       # overlaps scatter(i); single-holder grads
-
-        Gather routes local post-momentum shards to each param's root, e.g.
-        ``send=(param_idx, root)`` or ``recv=(param_idx, src, offset, size)``.
-        Scatter is the reverse: roots send orth shards to non-root holders, while
-        the root reads its own orth shard locally.
-        """
-        ns_plans, gather_plans, scatter_plans = [], [], []
-        for package in self._packages:
-            group, this_rank, world_size = self._comm[package[0]]
-
-            # ---- gather: each rank's grad shard -> that param's root ----
-            rooted, send, recv = [], [], []
-            for param_idx in package:
-                root = self._roots[param_idx]
-                ranges = self._shard_ranges[param_idx]
-                if root == this_rank:
-                    rooted.append(param_idx)
-                    if param_idx in self._full_grads:  # split: assemble from other holders
-                        for src in range(world_size):
-                            offset, size = ranges[src]
-                            if size == 0 or src == this_rank:  # own segment came from Phase 1
-                                continue
-                            recv.append((param_idx, src, offset, size))
-                    # single holder: grad shard already is the full grad -> no P2P
-                elif ranges[this_rank][1] > 0:
-                    send.append((param_idx, root))
-            comm_free_rooted, wait_comm_rooted = [], []
-            for param_idx in rooted:
-                shape = self._main_weights[param_idx].shape
-                full_grad = self._full_grads.get(param_idx, self._managed[param_idx][3])
-                full_grad = full_grad.view(shape)
-                if param_idx in self._full_grads:
-                    wait_comm_rooted.append((param_idx, full_grad))
-                else:
-                    comm_free_rooted.append((param_idx, full_grad))
-
-            split = (len(comm_free_rooted) + 1) // 2
-            ns_plans.append(
-                {
-                    "pre_comm": comm_free_rooted[:split],
-                    "wait_comm": wait_comm_rooted,
-                    "post_comm": comm_free_rooted[split:],
-                }
+    def _build_packages(self, package_size=4):
+        """Build static Muon packages from the assigned roots."""
+        ns_costs = self._ns_costs
+        comm_params, comm_free_params = [], []
+        for param_idx in range(len(self._main_weights)):
+            root = self._roots[param_idx]
+            has_comm = any(
+                rank != root
+                for rank, (_offset, size) in enumerate(self._shard_ranges[param_idx])
+                if size > 0
             )
-            gather_plans.append({"group": group, "send": send, "recv": recv})
+            (comm_params if has_comm else comm_free_params).append(param_idx)
 
-            # ---- scatter: each root's orth shard -> its OTHER holders (inverse of gather);
-            #      the root's own shard is read straight from the orth by Phase 3b ----
-            send, recv = [], []
-            for param_idx in package:
-                root = self._roots[param_idx]
-                ranges = self._shard_ranges[param_idx]
-                if root == this_rank:
-                    for dst in range(world_size):
-                        offset, size = ranges[dst]
-                        if size == 0 or dst == this_rank:  # own shard: used directly, not sent
-                            continue
-                        send.append((param_idx, dst, offset, size))
-                elif ranges[this_rank][1] > 0:
-                    recv.append((param_idx, root))
-            scatter_plans.append({"group": group, "send": send, "recv": recv})
-        return ns_plans, gather_plans, scatter_plans
+        comm_params_by_group = OrderedDict()
+        for param_idx in comm_params:
+            comm_params_by_group.setdefault(self._comm[param_idx][0], []).append(param_idx)
 
-    @torch.no_grad()
-    def _issue_gather(self, p):
-        """Fire the package's gather P2Ps and return Works."""
-        plan = self._gather_plans[p]
-        group = plan["group"]
+        comm_packages = []
+        for params_in_group in comm_params_by_group.values():
+            params_in_group.sort(key=lambda param_idx: (-ns_costs[param_idx], param_idx))
+            for start in range(0, len(params_in_group), package_size):
+                comm_packages.append(
+                    MuonGradPackage(
+                        param_ids=params_in_group[start : start + package_size],
+                        has_comm=True,
+                    )
+                )
 
-        ops = []
-        for param_idx, root in plan["send"]:
-            post_momentum_shard = self._managed[param_idx][3]
-            ops.append(torch.distributed.P2POp(
-                torch.distributed.isend, post_momentum_shard, root, group=group,
-            ))
-        for param_idx, src, offset, size in plan["recv"]:
-            ops.append(torch.distributed.P2POp(
-                torch.distributed.irecv,
-                self._full_grads[param_idx].reshape(-1)[offset : offset + size], src, group=group,
-            ))
-        return torch.distributed.batch_isend_irecv(ops) if ops else []
-
-    @torch.no_grad()
-    def _issue_scatter(self, p, orths):
-        """Fire the package's scatter P2Ps: isend each remote holder's shard out of the
-        orth, irecv our shards into the grad. (The root's own shard is read straight from
-        the orth by Phase 3b, never round-tripping the grad.) Returns the in-flight Works.
-        The isend source ``orths`` is kept alive by the caller's ``owned_orths``."""
-        plan = self._scatter_plans[p]
-        group = plan["group"]
-        ops = []
-        for param_idx, dst, offset, size in plan["send"]:
-            ops.append(torch.distributed.P2POp(
-                torch.distributed.isend,
-                orths[param_idx].reshape(-1)[offset : offset + size], dst, group=group,
-            ))
-        for param_idx, root in plan["recv"]:
-            ops.append(torch.distributed.P2POp(
-                torch.distributed.irecv,
-                self._main_grads[param_idx].to_local().reshape(-1), root, group=group,
-            ))
-        return torch.distributed.batch_isend_irecv(ops) if ops else []
-
-    @torch.no_grad()
-    def orthogonalize(self, param, grad: torch.Tensor) -> torch.Tensor:
-        """Newton-Schulz orthogonalize + Muon spectral scale of a 2D gradient.
-
-        Uses emerging_optimizers' production NS when available, else the built-in
-        vanilla NS fallback. (Phase 1 runs the non-TP path; ``param`` is accepted
-        for parity with the eventual TP / QKV-split path.)
-        """
-        g = grad.to(torch.float32)
-        if HAVE_EMERGING_OPTIMIZERS:
-            orth = newton_schulz_tp(
-                g,
-                steps=self._num_ns_steps,
-                coefficient_type=self._coefficient_type,
-                tp_group=None,
-                partition_dim=None,
-                tp_mode="duplicated",
+        no_comm_packages = [
+            MuonGradPackage(
+                param_ids=comm_free_params[start : start + package_size],
+                has_comm=False,
             )
-            scale = get_muon_scale_factor(g.size(-2), g.size(-1), mode=self._scale_mode)
-        else:
-            orth = _vanilla_newton_schulz(g, steps=self._num_ns_steps)
-            scale = _vanilla_muon_scale(g.size(-2), g.size(-1))
-        return orth * (scale * self._extra_scale_factor)
+            for start in range(0, len(comm_free_params), package_size)
+        ]
+
+        # Put no-comm NS on both sides of the communication packages so it can
+        # cover the first gather and the final scatter.
+        prefix_target = sum(ns_costs[param_idx] for param_idx in comm_free_params) / 2
+        split = 0
+        prefix_cost = 0
+        while split < len(no_comm_packages) and (split == 0 or prefix_cost < prefix_target):
+            prefix_cost += sum(
+                ns_costs[param_idx] for param_idx in no_comm_packages[split].param_ids
+            )
+            split += 1
+
+        return no_comm_packages[:split] + comm_packages + no_comm_packages[split:]
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -425,65 +474,40 @@ class FullyShardV2Muon(torch.optim.Optimizer):
         its root; (3) root orthogonalizes (NS); (4) scatter the orthogonalized shards
         back; (5) decoupled-WD update of this rank's master shard.
 
-        Gather/scatter are batched per package (one async batch_isend_irecv each, directly
-        into/out of the grad and full-grad tensors) and pipelined: package i+1's gather is
-        fired before package i's NS, so the P2Ps overlap the NS GEMMs.
+        Gather/scatter use one batched P2P call per communication package. No-comm
+        packages are placed before and after the communicating packages so their NS
+        can cover the first gather and final scatter.
         """
         assert closure is None, "FullyShardV2Muon does not support a closure."
         lr = self.param_groups[0]["lr"]  # set by the LR scheduler
-        items = self._managed
+        gather_reqs = [[] for _ in range(len(self._packages))]
+        full_grads = {}
 
-        # Phase 1: momentum on each rank's grad shard. nesterov also writes the look-ahead
-        # grad+coef*m into post_momentum_shard; non-nesterov's == m (already aliased).
+        # Phase 1: update local momentum. Communication packages launch their
+        # gather immediately after their shards are ready, overlapping the rest of
+        # momentum work and the no-comm NS prefix.
         coef = self._momentum_coef
-        for _main_weight, grad, momentum, post_momentum_shard in items:
-            if grad is None:
-                continue
-            grad_shard = grad.to_local().reshape(-1)
-            if grad_shard.numel() == 0:
-                continue
-            momentum.mul_(coef).add_(grad_shard)
-            if self._nesterov:
-                torch.add(grad_shard, momentum, alpha=coef, out=post_momentum_shard)
+        for package_idx, package in enumerate(self._packages):
+            package.update_momentum(self, coef)
+            gather_reqs[package_idx] = package.issue_gather(self, full_grads)
 
-        # Phase 2/3: per-package gather -> NS -> scatter, pipelined (gather i+1 before NS i).
-        num_packages = len(self._packages)
-        scatter_reqs = []  # in-flight scatter Works per package
+        # Phase 2: consume packages in NS order, run root NS, then launch package
+        # scatter for the orthogonalized shards.
+        scatter_reqs = []  # in-flight scatter requests per communication package
         owned_orths = {}   # param_idx -> full orth this rank rooted (read by Phase 3b)
-        gather_reqs_by_package = [[] for _ in range(num_packages)]
-        if num_packages:
-            gather_reqs_by_package[0] = self._issue_gather(0)
-        for i in range(num_packages):
-            if i + 1 < num_packages:
-                gather_reqs_by_package[i + 1] = self._issue_gather(i + 1)
-            ns_plan = self._ns_plans[i]
-            orths = {
-                param_idx: self.orthogonalize(self._main_weights[param_idx], full_grad).to(
-                    full_grad.dtype
-                )
-                for param_idx, full_grad in ns_plan["pre_comm"]
-            }
-            for req in gather_reqs_by_package[i]:
-                req.wait()
-            for param_idx, full_grad in ns_plan["wait_comm"]:
-                orths[param_idx] = self.orthogonalize(
-                    self._main_weights[param_idx], full_grad
-                ).to(full_grad.dtype)
+
+        for package_idx, package in enumerate(self._packages):
+            orths = package.orthogonalize(self, gather_reqs[package_idx], full_grads)
             owned_orths.update(orths)
-            scatter_reqs.append(self._issue_scatter(i, orths))
-            for param_idx, full_grad in ns_plan["post_comm"]:
-                owned_orths[param_idx] = self.orthogonalize(
-                    self._main_weights[param_idx], full_grad
-                ).to(full_grad.dtype)
+            if package.has_comm:
+                scatter_reqs.append((package, package.issue_scatter(self, orths)))
 
-        # Drain scatters: each non-root holder now has its orth shard irecv'd into its grad.
-        for reqs in scatter_reqs:
-            for req in reqs:
-                req.wait()
+        # Phase 3a: drain scatters before reading remote orth shards from grad.
+        for package, requests in scatter_reqs:
+            package.finish_scatter(requests)
 
-        # Phase 3b: decoupled-WD master update from each rank's orth shard — the root reads
-        # its own segment from the orth it computed, other holders read scatter's grad.
-        for param_idx, (main_weight, grad, _momentum, _post_momentum_shard) in enumerate(items):
+        # Phase 3b: apply decoupled-WD update from each rank's orth shard.
+        for param_idx, (main_weight, grad) in enumerate(zip(self._main_weights, self._main_grads)):
             if grad is None:
                 continue
             weight_shard = main_weight.to_local().reshape(-1)
@@ -515,30 +539,57 @@ class FullyShardV2MuonOptimizer(MegatronOptimizer):
         from megatron.core.distributed.fsdp.src.megatron_fsdp.v2 import FSDPModule
 
         # Build the inner optimizer from the FSDP-v2 2D-matrix dist_params + their grad
-        # DTensors, one package per FSDPModule (== layer) so each layer's gather pipelines
-        # with the next layer's NS (a package shares one dp_group, as the P2P needs).
-        params, grads, packages = [], [], []
+        # DTensors. The inner optimizer orders params by communication need.
+        params, grads, names = [], [], []
+        momentum_buffers, momentum_dtensors = [], []
+        seen_names = set()
         for chunk in self.model_chunks:
             root = chunk if isinstance(chunk, FSDPModule) else chunk.module
-            for m in root.modules():
+            for module_name, m in root.named_modules():
                 if not isinstance(m, FSDPModule):
                     continue
-                package = []
-                for param_group in m._fsdp_param_groups:
-                    for dist_param, dist_grad in zip(param_group.dist_params, param_group.dist_grads):
+                for param_names, param_group in m._named_param_groups:
+                    for param_name, dist_param, dist_grad in zip(
+                        param_names, param_group.dist_params, param_group.dist_grads
+                    ):
                         # filter by the param's global attrs only (rank-consistent); keep
                         # grad aligned even when None (empty shard) so collectives match
                         if dist_param.dim() == 2 and not getattr(
                             dist_param, "is_embedding_or_output_parameter", False
                         ):
-                            package.append(len(params))
                             params.append(dist_param)
                             grads.append(dist_grad)
-                if package:
-                    packages.append(package)
+                            full_name = (
+                                f"{module_name}.{param_name}" if module_name else param_name
+                            )
+                            if full_name in seen_names:
+                                raise ValueError(
+                                    f"Duplicate Muon parameter name for checkpointing: {full_name}"
+                                )
+                            dtype = dist_grad.dtype if dist_grad is not None else dist_param.dtype
+                            local_param = dist_param.to_local()
+                            local_momentum = torch.zeros(
+                                local_param.numel(), dtype=dtype, device=local_param.device
+                            )
+                            momentum_dtensor = DTensor.from_local(
+                                local_tensor=local_momentum.view(local_param.shape),
+                                device_mesh=dist_param.device_mesh,
+                                placements=dist_param.placements,
+                                run_check=False,
+                                shape=dist_param.shape,
+                                stride=dist_param.stride(),
+                            )
+                            copy_chunk_metadata(dist_param, momentum_dtensor)
+                            names.append(full_name)
+                            momentum_buffers.append(local_momentum)
+                            momentum_dtensors.append(momentum_dtensor)
+                            seen_names.add(full_name)
         super().__init__(
-            FullyShardV2Muon(params, grads, packages=packages, **muon_hyperparams), config
+            FullyShardV2Muon(params, grads, momentum_buffers, **muon_hyperparams), config
         )
+        self._param_names = names
+        self._momentum_buffers = momentum_buffers
+        self._momentum_dtensors = momentum_dtensors
         self.is_stub_optimizer = False
 
     # --- Excluded from the chained grad-norm / clip / zero-count machinery. ---
@@ -583,14 +634,102 @@ class FullyShardV2MuonOptimizer(MegatronOptimizer):
     def reload_model_params(self, state_dict=None):
         pass
 
+    def _param_name(self, param: torch.Tensor) -> str:
+        params = [p for group in self.optimizer.param_groups for p in group["params"]]
+        param_to_name = dict(zip(params, self._param_names))
+        assert param in param_to_name, f"Muon parameter {param} is not named."
+        return param_to_name[param]
+
+    def _param_groups_to_param2group_meta(self) -> dict[str, dict]:
+        param_to_group_meta = {}
+        for group in self.optimizer.param_groups:
+            group_meta = group.copy()
+            del group_meta["params"]
+            for param in group["params"]:
+                param_to_group_meta[self._param_name(param)] = group_meta
+        return param_to_group_meta
+
+    def _sync_hyperparams_from_state_dict(self, state_dict: dict):
+        param_groups = state_dict.get("param_groups")
+        if param_groups is None and "param_to_group_meta" in state_dict:
+            param_to_group_meta = state_dict["param_to_group_meta"]
+            param_groups = []
+            for group in self.optimizer.param_groups:
+                group_meta = None
+                for param in group["params"]:
+                    name = self._param_name(param)
+                    if name in param_to_group_meta:
+                        group_meta = param_to_group_meta[name]
+                        break
+                if group_meta is not None:
+                    param_groups.append(group_meta)
+        if not param_groups:
+            return
+
+        group = param_groups[0]
+        group = {key: value for key, value in group.items() if key != "params"}
+        self.optimizer.param_groups[0].update(group)
+        self.optimizer._momentum_coef = group.get("momentum", self.optimizer._momentum_coef)
+        self.optimizer._weight_decay = group.get("weight_decay", self.optimizer._weight_decay)
+        self.optimizer._nesterov = group.get("nesterov", self.optimizer._nesterov)
+        self.optimizer._num_ns_steps = group.get("num_ns_steps", self.optimizer._num_ns_steps)
+        self.optimizer._coefficient_type = group.get(
+            "coefficient_type", self.optimizer._coefficient_type
+        )
+        self.optimizer._scale_mode = group.get("scale_mode", self.optimizer._scale_mode)
+        self.optimizer._extra_scale_factor = group.get(
+            "extra_scale_factor", self.optimizer._extra_scale_factor
+        )
+
+    def _load_momentum_state(self, state: dict):
+        named = not all(isinstance(key, int) for key in state.keys())
+        for idx, momentum_buffer in enumerate(self._momentum_buffers):
+            key = self._param_names[idx] if named else idx
+            if key not in state:
+                momentum_buffer.zero_()
+                continue
+            loaded = state[key].get("momentum_buffer")
+            if loaded is None:
+                momentum_buffer.zero_()
+                continue
+            loaded_local = loaded.to_local() if isinstance(loaded, DTensor) else loaded
+            assert loaded_local.numel() == momentum_buffer.numel(), (
+                f"Loaded Muon momentum for param {idx} has {loaded_local.numel()} "
+                f"elements, expected {momentum_buffer.numel()}."
+            )
+            momentum_buffer.copy_(
+                loaded_local.reshape(-1).to(
+                    device=momentum_buffer.device, dtype=momentum_buffer.dtype
+                )
+            )
+
     def state_dict(self):
-        # TODO: checkpoint the sharded Muon momentum buffers.
-        return {}
+        param_groups = []
+        next_param_id = 0
+        for group in self.optimizer.param_groups:
+            group_state = {key: value for key, value in group.items() if key != "params"}
+            param_count = len(group["params"])
+            group_state["params"] = list(range(next_param_id, next_param_id + param_count))
+            next_param_id += param_count
+            param_groups.append(group_state)
+        return {
+            "state": {
+                idx: {"momentum_buffer": momentum}
+                for idx, momentum in enumerate(self._momentum_dtensors)
+            },
+            "param_groups": param_groups,
+        }
 
     def load_state_dict(self, state_dict):
-        # TODO: restore the sharded Muon momentum buffers.
-        pass
+        self._sync_hyperparams_from_state_dict(state_dict)
+        self._load_momentum_state(state_dict["state"])
 
     def sharded_state_dict(self, model_sharded_state_dict, is_loading: bool = False, **kwargs):
-        # TODO: sharded checkpoint support for the Muon momentum.
-        return {}
+        named_state = {
+            param_name: {"momentum_buffer": momentum}
+            for param_name, momentum in zip(self._param_names, self._momentum_dtensors)
+        }
+        return {
+            "state": named_state,
+            "param_to_group_meta": self._param_groups_to_param2group_meta(),
+        }
