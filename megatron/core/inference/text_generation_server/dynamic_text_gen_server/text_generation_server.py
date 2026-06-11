@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
 import logging
@@ -150,6 +150,7 @@ def start_text_gen_server(
     verbose: bool = False,
     num_replicas: int = 4,
     hostname: Optional[str] = None,
+    sock: Optional[socket.socket] = None,
 ):
     """Start the text generation server."""
     global _SERVER_PROCESSES
@@ -159,18 +160,28 @@ def start_text_gen_server(
         logger.warning("Text gen server processes are already running.")
         return
 
-    _SHARED_SOCKET = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    _SHARED_SOCKET.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if sock is not None:
+        bound_port = sock.getsockname()[1]
+        if bound_port == 0:
+            raise ValueError(
+                "socket must be bound to a real port before being passed to start_text_gen_server"
+            )
+        _SHARED_SOCKET = sock
+        server_port = bound_port
+        _SHARED_SOCKET.setblocking(False)
+    else:
+        _SHARED_SOCKET = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        _SHARED_SOCKET.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-    if hasattr(socket, 'SO_REUSEPORT'):
-        try:
-            _SHARED_SOCKET.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        except OSError:
-            pass
+        if hasattr(socket, 'SO_REUSEPORT'):
+            try:
+                _SHARED_SOCKET.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            except OSError:
+                pass
 
-    bind_address = hostname if hostname is not None else "0.0.0.0"
-    _SHARED_SOCKET.bind((bind_address, server_port))
-    _SHARED_SOCKET.setblocking(False)
+        bind_address = hostname if hostname is not None else "0.0.0.0"
+        _SHARED_SOCKET.bind((bind_address, server_port))
+        _SHARED_SOCKET.setblocking(False)
 
     _SHARED_SOCKET.set_inheritable(True)
     fd = _SHARED_SOCKET.fileno()
