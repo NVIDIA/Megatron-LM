@@ -59,12 +59,19 @@ class MaybeMultiStorageClient:
     """
     Helper class to use MultiStorageClient
     """
-    def path_isdir(self, path, strict:bool = True):
+
+    def path_isdir(self, path, strict: bool = True):
+        """
+        Check if a path is an existing directory.
+        :param path: path to check
+        :param strict: if True, use only committed metadata for MSC
+        """
         if MultiStorageClientFeature.is_enabled():
             pkg = MultiStorageClientFeature.import_package()
             return pkg.os.path.isdir(path, strict=strict)
         else:
             import os
+
             return os.path.isdir(path)
 
     def __getattr__(self, name):
