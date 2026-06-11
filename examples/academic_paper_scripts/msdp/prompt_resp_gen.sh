@@ -11,7 +11,7 @@ DISTRIBUTED_ARGS="--nproc_per_node $WORLD_SIZE \
                   --nnodes 1 \
                   --node_rank 0 \
                   --master_addr localhost \
-                  --master_port 6000"
+                  --master_port 29500"
 
 CHECKPOINT_PATH=<PATH_OF_LANGUAGE_MODEL> (e.g., /357m)
 VOCAB_PATH=<PATH_OF_VOCAB_FILE> (e.g., /gpt2-vocab.json)
