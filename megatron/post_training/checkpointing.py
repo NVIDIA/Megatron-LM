@@ -1,15 +1,22 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import logging
+import os
 from pathlib import Path
-from typing import Optional, Tuple, Union
+from typing import Any, Optional, Tuple, Union
 
+import modelopt
 import modelopt.torch.opt as mto
 import torch.nn as nn
-from modelopt.torch.opt.plugins import restore_sharded_modelopt_state
+from modelopt.torch.opt.plugins import (
+    _load_extra_state_from_sharded_checkpoint,
+    restore_sharded_modelopt_state as restore_sharded_modelopt_state_legacy,
+)
+
 
 from megatron.core import dist_checkpointing
 from megatron.core.utils import get_torch_version, is_torch_min_version, unwrap_model
+from megatron.core.dist_checkpointing.serialization import _legacy_common_state_exists
 from megatron.training import get_args
 from megatron.training.checkpointing import _load_base_checkpoint, load_checkpoint
 from megatron.training.utils import print_rank_0
@@ -123,7 +130,10 @@ def load_modelopt_state(model: nn.Module, load_dir: Optional[str] = None) -> Non
         if sharded_load_dir is None:
             print_rank_0("No sharded checkpoint found. Skipping loading modelopt_state.")
             return
-        restore_sharded_modelopt_state([model], sharded_load_dir)
+        if _legacy_common_state_exists(f"{sharded_load_dir}/modelopt_state"):
+            restore_sharded_modelopt_state_legacy([model], sharded_load_dir)
+        else:
+            restore_sharded_modelopt_state([model], sharded_load_dir)
 
 
 def load_modelopt_checkpoint(
@@ -195,3 +205,27 @@ def load_modelopt_checkpoint(
         print_distributed_quant_summary(unwrapped_model[0])
     else:
         _ = load_checkpoint(model, optimizer, opt_param_scheduler, strict=strict, load_arg=load_arg)
+
+
+def restore_sharded_modelopt_state(model: list[nn.Module], checkpoint_name: str | Path) -> None:
+    """Temporary function. Copy of modelopt.torch.opt.plugins.restore_sharded_modelopt_state.
+    Will be removed once modelopt.torch.opt.plugins.restore_sharded_modelopt_state is up to date.
+    """
+    if len(model) > 1:
+        raise ValueError("sharded_modelopt_state does not support virtual pipeline parallel!")
+
+    modelopt_checkpoint_name = f"{checkpoint_name}/modelopt_state"
+
+    # Early return if the model already has a modelopt_state or the checkpoint does not exist.
+    if not os.path.exists(modelopt_checkpoint_name) or mto.ModeloptStateManager.is_converted(
+        model[0]
+    ):
+        return
+
+    common_modelopt_state = dist_checkpointing.load_common_state_dict(modelopt_checkpoint_name)
+    modelopt_load_version = common_modelopt_state["modelopt_version"]
+
+    print(f"nvidia-modelopt ckpt/inst version: {modelopt_load_version}/{modelopt.__version__}")
+
+    model[0] = mto.restore_from_modelopt_state(model[0], common_modelopt_state)
+    _load_extra_state_from_sharded_checkpoint(model[0], checkpoint_name)
