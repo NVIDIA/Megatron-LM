@@ -802,7 +802,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
                     chunk_starts = cu_chunk_seqlens[:-1]
                     seq_idx_for_varlen = seq_idx[0, chunk_starts].contiguous()
 
-            ssm_varlen_result = mamba_chunk_scan_combined_varlen(
+            recurrent_varlen_result = mamba_chunk_scan_combined_varlen(
                 x=x,
                 dt=dt,
                 A=A,
@@ -829,15 +829,15 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
             )
 
             if intermediate_chunk_indices is not None:
-                ssm_varlen_states, intermediate_recurrent_states = ssm_varlen_result
+                recurrent_varlen_states, intermediate_recurrent_states = recurrent_varlen_result
             else:
-                ssm_varlen_states = ssm_varlen_result
+                recurrent_varlen_states = recurrent_varlen_result
                 intermediate_recurrent_states = None
 
             y = y.unsqueeze(0)
             z = z.unsqueeze(0)
 
-            tensor_masked_update(recurrent_state, batch_indices, ssm_varlen_states)
+            tensor_masked_update(recurrent_state, batch_indices, recurrent_varlen_states)
 
             # Write intermediate states to pre-allocated output buffers
             # All tensor ops, no Python loops, fully CUDA graph compatible.
@@ -938,10 +938,10 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
                 s is the sequence length (1 + num_speculative_tokens).
             conv_state: The convolution state tensor for inference.
             recurrent_state: The selective scan state tensor for inference.
-            batch_indices: A map from batch id to position in the Mamba state tensors.
+            batch_indices: A map from batch id to position in the recurrent state tensors.
             intermediate_conv_state: Optional buffer for storing conv state at each
                 sequence step (for speculative decoding rollback).
-            intermediate_recurrent_state: Optional buffer for storing SSM state at each
+            intermediate_recurrent_state: Optional buffer for storing recurrent state at each
                 sequence step (for speculative decoding rollback).
 
         Returns:

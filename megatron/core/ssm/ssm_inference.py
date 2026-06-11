@@ -11,7 +11,7 @@ growing KV cache. Mamba was the first; Gated Delta Net / Gated Delta Product
 All of these variants share an *identical* request-level control flow for the
 dynamic inference engine:
 
-    1. Fetch this layer's (conv_state, ssm_state) slabs from the context.
+    1. Fetch this layer's (conv_state, recurrent_state) slabs from the context.
     2. Project the packed input.
     3. Split the packed batch into a decode partition (1 token per request,
        placed first) and a prefill partition (variable length, placed after).
@@ -61,10 +61,10 @@ class SSMDynamicInferenceMixin:
         self,
         proj: torch.Tensor,
         conv_state: torch.Tensor,
-        ssm_state: torch.Tensor,
+        recurrent_state: torch.Tensor,
         batch_indices: torch.Tensor,
         intermediate_conv_state: Optional[torch.Tensor] = None,
-        intermediate_ssm_state: Optional[torch.Tensor] = None,
+        intermediate_recurrent_state: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Run the single-token-per-request decode kernels.
 
@@ -72,12 +72,12 @@ class SSMDynamicInferenceMixin:
             proj: ``[decode_req_count, seq_len, proj_dim]`` projected decode tokens,
                 where ``seq_len = 1 + num_speculative_tokens``.
             conv_state: ``[num_slots, conv_channels, d_conv]`` conv state cache.
-            ssm_state: ``[num_slots, *ssm_shape]`` SSM state cache.
+            recurrent_state: ``[num_slots, *ssm_shape]`` SSM state cache.
             batch_indices: ``[decode_req_count]`` slot index per decode request
                 (``-1`` marks padding slots).
             intermediate_conv_state: Optional buffer for storing conv states at
                 intermediate sequence steps (speculative decoding).
-            intermediate_ssm_state: Optional buffer for storing SSM states at
+            intermediate_recurrent_state: Optional buffer for storing SSM states at
                 intermediate sequence steps (speculative decoding).
 
         Returns ``[decode_req_count, seq_len, d_inner]``; updates state in place.
@@ -90,7 +90,7 @@ class SSMDynamicInferenceMixin:
         self,
         proj: torch.Tensor,
         conv_state: torch.Tensor,
-        ssm_state: torch.Tensor,
+        recurrent_state: torch.Tensor,
         context: DynamicInferenceContext | None = None,
     ) -> torch.Tensor:
         """Run the variable-length prefill kernels for all prefill requests.
@@ -116,16 +116,16 @@ class SSMDynamicInferenceMixin:
         self, hidden_states: torch.Tensor, context: DynamicInferenceContext
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Execute one dynamic inference step for a linear-attention mixer."""
-        conv_state, ssm_state = context.ssm_states_cache(
+        conv_state, recurrent_state = context.ssm_states_cache(
             self.layer_number - self.pp_layer_offset
         )
 
         # Fetch intermediate state buffers for speculative decoding.
         # These are pre-allocated output buffers; existing data is overwritten.
         int_conv_state = None
-        int_ssm_state = None
+        int_recurrent_state = None
         if context.num_speculative_tokens > 0:
-            int_conv_state, int_ssm_state = context.ssm_states_cache(
+            int_conv_state, int_recurrent_state = context.ssm_states_cache(
                 self.layer_number - self.pp_layer_offset, intermediate=True
             )
 
@@ -151,10 +151,10 @@ class SSMDynamicInferenceMixin:
             y_decode = self._ssm_decode(
                 proj_decode,
                 conv_state,
-                ssm_state,
+                recurrent_state,
                 metadata.batch_indices_decode,
                 intermediate_conv_state=int_conv_state,
-                intermediate_ssm_state=int_ssm_state,
+                intermediate_recurrent_state=int_recurrent_state,
             )
             # Flatten back to [N*S, 1, d] to match the merge logic.
             y_decode = y_decode.view(decode_token_count, 1, -1)
@@ -169,7 +169,7 @@ class SSMDynamicInferenceMixin:
                 )
             else:
                 proj_prefill = proj
-            y_prefill = self._ssm_prefill(proj_prefill, conv_state, ssm_state, context)
+            y_prefill = self._ssm_prefill(proj_prefill, conv_state, recurrent_state, context)
 
         # --- Merge back into packed token order --------------------------
         if y_decode is not None and y_prefill is not None:

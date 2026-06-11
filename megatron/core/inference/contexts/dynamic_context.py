@@ -1569,12 +1569,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         ssm_layer_number = self.layer_map[layer_number - 1]
         if intermediate:
             conv_state = self.ssm_intermediate_conv_states[ssm_layer_number]
-            ssm_state = self.ssm_intermediate_recurrent_states[ssm_layer_number]
+            recurrent_state = self.ssm_intermediate_recurrent_states[ssm_layer_number]
         else:
             conv_state = self.ssm_conv_states[ssm_layer_number]
-            ssm_state = self.ssm_recurrent_states[ssm_layer_number]
+            recurrent_state = self.ssm_recurrent_states[ssm_layer_number]
 
-        return (conv_state, ssm_state)
+        return (conv_state, recurrent_state)
 
     # =========================================================================
     # SSM prefix cache infrastructure
