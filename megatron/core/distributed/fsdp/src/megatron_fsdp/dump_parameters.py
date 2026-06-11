@@ -58,15 +58,14 @@ def dump_optimizer_parameters(
     rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
 
-    # Flatten all param groups into a single list — group hyperparameters
-    # (lr, betas, ...) are intentionally not recorded; only per-param sharding
-    # metadata is.
-    all_params = [p for group in optimizer.param_groups for p in group["params"]]
-    spec: dict[str, Any] = {
-        "world_size": world_size,
-        "rank": rank,
-        "params": [_dump_param(p, optimizer.state.get(p, {})) for p in all_params],
-    }
+    # Preserve param-group structure (no hyperparameters; just the partition).
+    # Group hyperparameters (lr, betas, weight_decay, ...) are intentionally
+    # not recorded — callers that care should pass them via `extra_meta`.
+    groups = [
+        {"params": [_dump_param(p, optimizer.state.get(p, {})) for p in group["params"]]}
+        for group in optimizer.param_groups
+    ]
+    spec: dict[str, Any] = {"world_size": world_size, "rank": rank, "groups": groups}
     if extra_meta is not None:
         spec["extra"] = extra_meta
 

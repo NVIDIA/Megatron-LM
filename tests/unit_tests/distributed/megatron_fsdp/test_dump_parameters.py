@@ -54,9 +54,10 @@ def test_dump_optimizer_parameters_dtensor(distributed_setup, tmp_path: pathlib.
     assert spec["world_size"] == distributed_setup.world_size
     assert spec["rank"] == distributed_setup.rank
     assert spec["extra"] == {"note": "hello"}
-    assert len(spec["params"]) == 2
+    assert len(spec["groups"]) == 1
+    assert len(spec["groups"][0]["params"]) == 2
 
-    p_sharded, p_replicated = spec["params"]
+    p_sharded, p_replicated = spec["groups"][0]["params"]
 
     assert p_sharded["global_shape"] == [distributed_setup.world_size * 4, 8]
     assert p_sharded["local_shape"] == [4, 8]
@@ -88,7 +89,7 @@ def test_dump_optimizer_parameters_plain_tensor(distributed_setup, tmp_path: pat
     written = out_path.with_suffix(f".rank{distributed_setup.rank}.json")
     assert written.exists()
     spec = json.loads(written.read_text())
-    p = spec["params"][0]
+    p = spec["groups"][0]["params"][0]
     assert p["global_shape"] == [4, 5]
     assert p["local_shape"] == [4, 5]
     assert p["mesh_shape"] is None
@@ -97,8 +98,8 @@ def test_dump_optimizer_parameters_plain_tensor(distributed_setup, tmp_path: pat
 
 
 def test_dump_optimizer_parameters_multi_group(distributed_setup, tmp_path: pathlib.Path) -> None:
-    """Multi-param-group optimizers (e.g., Megatron's wd/no-wd split): all
-    params flatten into a single `params` list."""
+    """Multi-param-group optimizers (e.g., Megatron's wd/no-wd split):
+    structure is preserved in `groups`, no hyperparameters recorded."""
     _ensure_process_group(distributed_setup)
     a = torch.randn(2, 2, requires_grad=True, device=distributed_setup.device)
     b = torch.randn(3, 3, requires_grad=True, device=distributed_setup.device)
@@ -111,6 +112,11 @@ def test_dump_optimizer_parameters_multi_group(distributed_setup, tmp_path: path
 
     written = out_path.with_suffix(f".rank{distributed_setup.rank}.json")
     spec = json.loads(written.read_text())
-    assert len(spec["params"]) == 2
-    assert spec["params"][0]["global_shape"] == [2, 2]
-    assert spec["params"][1]["global_shape"] == [3, 3]
+    assert len(spec["groups"]) == 2
+    assert len(spec["groups"][0]["params"]) == 1
+    assert len(spec["groups"][1]["params"]) == 1
+    assert spec["groups"][0]["params"][0]["global_shape"] == [2, 2]
+    assert spec["groups"][1]["params"][0]["global_shape"] == [3, 3]
+    # Group hyperparameters (weight_decay, lr) are intentionally not recorded.
+    assert "weight_decay" not in spec["groups"][0]
+    assert "lr" not in spec["groups"][0]
