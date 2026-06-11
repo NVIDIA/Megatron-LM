@@ -774,6 +774,7 @@ def _get_megatron_emerging_optimizer(
     if config.fp16:
         raise ValueError('emerging optimizer with fp16 is not supported.')
 
+    uses_explicit_pg_collection = pg_collection is not None
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
@@ -795,7 +796,12 @@ def _get_megatron_emerging_optimizer(
 
     # Build param groups and bucket by (optimizer_name, is_expert_parallel).
     # Layer-wise distributed optimizer handles expert params internally so we skip that split.
-    all_param_groups = _get_param_groups(model_chunks, config, config_overrides)
+    param_group_process_group = (
+        getattr(pg_collection, 'intra_dist_opt', None) if uses_explicit_pg_collection else None
+    )
+    all_param_groups = _get_param_groups(
+        model_chunks, config, config_overrides, process_group=param_group_process_group
+    )
     grouped_param_groups = defaultdict(list)
     for group in all_param_groups:
         opt_name = group.get('optimizer', eopt_name)
@@ -972,7 +978,6 @@ def get_megatron_optimizer(
     use_gloo_process_groups: bool = True,
     pg_collection: Optional[ProcessGroupCollection] = None,
     dump_param_to_param_group_map: Optional[str] = None,
-    param_group_process_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> MegatronOptimizer:
     """Retrieve the Megatron optimizer for model chunks.
 
@@ -1036,6 +1041,7 @@ def get_megatron_optimizer(
     intra_dp_cp_group_gloo = process_groups_dict['intra_dp_cp_group_gloo']
     intra_expt_dp_group_gloo = process_groups_dict['intra_expt_dp_group_gloo']
     intra_dist_opt_group = process_groups_dict['intra_dist_opt_group']
+    param_group_process_group = intra_dist_opt_group if pg_collection is not None else None
 
     model_parallel_rank = get_pg_rank(mp_group)
 
