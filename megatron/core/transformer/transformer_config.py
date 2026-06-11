@@ -557,7 +557,7 @@ class TransformerConfig(ModelParallelConfig):
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
-             "shared_experts", "mhc".
+             "shared_experts", "mhc", "gdn_norm_out".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -569,8 +569,9 @@ class TransformerConfig(ModelParallelConfig):
     "mhc": recompute HyperConnection intermediate activations via
             CheckpointWithoutOutput + CheckpointManager. Requires
             enable_hyper_connections=True. Cannot be used with "mlp".
-    "moe_act", "layernorm", "mla_up_proj", and "mhc" use output-discarding checkpointing,
-    "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
+    "gdn_norm_out": recompute the GatedDeltaNet output norm and HP-to-CP all-to-all.
+    "moe_act", "layernorm", "mla_up_proj", "mhc", and "gdn_norm_out" use output-discarding
+    checkpointing, "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
     """
 
     ####################
@@ -1859,6 +1860,8 @@ class TransformerConfig(ModelParallelConfig):
                     "moe",
                     "shared_experts",
                     "mhc",
+                    "gdn_norm_out",
+                    "gdn_qkv",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
@@ -1875,6 +1878,24 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "mla_up_proj in recompute_modules is only supported with "
                     "multi_latent_attention."
+                )
+
+            if (
+                "gdn_norm_out" in self.recompute_modules
+                and self.experimental_attention_variant != "gated_delta_net"
+            ):
+                raise ValueError(
+                    "gdn_norm_out in recompute_modules is only supported with "
+                    "experimental_attention_variant='gated_delta_net'."
+                )
+
+            if (
+                "gdn_qkv" in self.recompute_modules
+                and self.experimental_attention_variant != "gated_delta_net"
+            ):
+                raise ValueError(
+                    "gdn_qkv in recompute_modules is only supported with "
+                    "experimental_attention_variant='gated_delta_net'."
                 )
 
             if "core_attn" in self.recompute_modules:
