@@ -14,7 +14,7 @@ import torch
 from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
-from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
+from megatron.core.inference.config import InferenceConfig, SSMInferenceStateConfig
 from megatron.core.inference.contexts import DynamicInferenceContext, StaticInferenceContext
 from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
 from megatron.core.inference.inference_request import (
@@ -110,7 +110,7 @@ class TextGenerationControllerTestBase:
         if dtype == torch.bfloat16:
             transformer_config.bf16 = True
 
-        mamba_inference_state_config = None
+        ssm_inference_state_config = None
         if hybrid_layer_pattern:
             model = HybridModel(
                 config=transformer_config,
@@ -122,7 +122,7 @@ class TextGenerationControllerTestBase:
                 pre_process=parallel_state.is_pipeline_first_stage(),
                 post_process=parallel_state.is_pipeline_last_stage(),
             ).cuda()
-            mamba_inference_state_config = MambaInferenceStateConfig.from_model(model)
+            ssm_inference_state_config = SSMInferenceStateConfig.from_model(model)
         else:
             layer_spec = get_gpt_layer_local_spec()
 
@@ -165,7 +165,7 @@ class TextGenerationControllerTestBase:
                     block_size_tokens=block_size_tokens,
                     enable_prefix_caching=enable_prefix_caching,
                     max_requests=max_requests,
-                    mamba_inference_state_config=mamba_inference_state_config,
+                    ssm_inference_state_config=ssm_inference_state_config,
                     sampling_backend=sampling_backend,
                 ),
             )

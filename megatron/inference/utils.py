@@ -12,7 +12,7 @@ from megatron.core.inference.config import (
     CudaGraphSizingDistribution,
     InferenceConfig,
     KVCacheManagementMode,
-    MambaInferenceStateConfig,
+    SSMInferenceStateConfig,
     PrefixCachingCoordinatorPolicy,
     PrefixCachingEvictionPolicy,
 )
@@ -313,10 +313,10 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
     if args.inference_dynamic_batching_max_requests is not None:
         max_sequence_length = max(max_sequence_length, max_batch_size)
 
-    mamba_inference_state_config = MambaInferenceStateConfig.from_model(
+    ssm_inference_state_config = SSMInferenceStateConfig.from_model(
         model,
-        conv_states_dtype=args.mamba_inference_conv_states_dtype,
-        ssm_states_dtype=args.mamba_inference_ssm_states_dtype,
+        conv_states_dtype=args.ssm_inference_conv_states_dtype,
+        ssm_states_dtype=args.ssm_inference_recurrent_states_dtype,
     )
     pg_collection = get_attr_wrapped_model(model, "pg_collection")
 
@@ -346,7 +346,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         block_size_tokens=args.inference_dynamic_batching_block_size,
         buffer_size_gb=args.inference_dynamic_batching_buffer_size_gb,
         paused_buffer_size_gb=args.inference_dynamic_batching_paused_buffer_size_gb,
-        mamba_memory_ratio=args.inference_dynamic_batching_mamba_memory_ratio,
+        ssm_memory_ratio=args.inference_dynamic_batching_ssm_memory_ratio,
         num_cuda_graphs=(
             args.inference_dynamic_batching_num_cuda_graphs
             if args.inference_cuda_graph_scope != InferenceCudaGraphScope.none
@@ -364,7 +364,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         cuda_graph_all_prefills=args.inference_cuda_graph_all_prefills,
         static_kv_memory_pointers=args.rl_persist_cuda_graphs,
         max_sequence_length=max_sequence_length,
-        mamba_inference_state_config=mamba_inference_state_config,
+        ssm_inference_state_config=ssm_inference_state_config,
         pg_collection=pg_collection,
         use_flashinfer_fused_rope=args.use_flashinfer_fused_rope,
         materialize_only_last_token_logits=(not args.return_log_probs),
@@ -375,7 +375,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         prefix_caching_eviction_policy=PrefixCachingEvictionPolicy(args.inference_dynamic_batching_prefix_caching_eviction_policy),
         prefix_caching_coordinator_policy=PrefixCachingCoordinatorPolicy(args.inference_dynamic_batching_prefix_caching_coordinator_policy),
         prefix_caching_routing_alpha=getattr(args, 'inference_dynamic_batching_prefix_caching_routing_alpha', 0.5),
-        prefix_caching_mamba_gb=getattr(args, 'inference_dynamic_batching_prefix_caching_mamba_gb', None),
+        prefix_caching_ssm_gb=getattr(args, 'inference_dynamic_batching_prefix_caching_ssm_gb', None),
         metrics_writer=metrics_writer,
         logging_step_interval=args.inference_logging_step_interval,
         num_speculative_tokens=args.num_speculative_tokens,

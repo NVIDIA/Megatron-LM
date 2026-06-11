@@ -208,14 +208,14 @@ class HybridStack(MegatronModule):
         forward_step_func"""
         self.input_tensor = input_tensor
 
-    def mamba_state_shapes_per_request(self) -> Optional[Tuple[Tuple[int], Tuple[int]]]:
+    def ssm_state_shapes_per_request(self) -> Optional[Tuple[Tuple[int], Tuple[int]]]:
         """
         Returns the Mamba conv and ssm states shapes per input sequence
         if this block contains Mamba layers (this may not be the case with PP > 1).
         """
         for layer_type, layer in zip(self.layer_type_list, self.layers):
             if layer_type == LayerSymbols.MAMBA:
-                return layer.mamba_state_shapes_per_request()
+                return layer.ssm_state_shapes_per_request()
         return None
 
     def forward(

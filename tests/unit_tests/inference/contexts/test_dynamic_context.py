@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
+from megatron.core.inference.config import InferenceConfig, SSMInferenceStateConfig
 from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
     RequestOverflowError,
@@ -83,7 +83,7 @@ class TestDynamicContext:
                 layer_type_list = [Symbols.MAMBA, Symbols.MLP, Symbols.ATTENTION, Symbols.MLP]
             mamba_conv_states_shape = (544, 4)
             mamba_ssm_states_shape = (8, 64, 16)
-            mamba_inference_state_config = MambaInferenceStateConfig(
+            ssm_inference_state_config = SSMInferenceStateConfig(
                 layer_type_list,
                 mamba_conv_states_shape,
                 mamba_ssm_states_shape,
@@ -91,7 +91,7 @@ class TestDynamicContext:
                 params_dtype,
             )
         else:
-            mamba_inference_state_config = None
+            ssm_inference_state_config = None
 
         dynamic_context = DynamicInferenceContext(
             model_config=TransformerConfig(
@@ -111,7 +111,7 @@ class TestDynamicContext:
                 block_size_tokens=block_size_tokens,
                 max_tokens=max_tokens,
                 num_speculative_tokens=num_speculative_tokens,
-                mamba_inference_state_config=mamba_inference_state_config,
+                ssm_inference_state_config=ssm_inference_state_config,
                 use_flashinfer_fused_rope=None,  # default to using flash-infer if available
                 # this is for compatibility with the LTS environment
                 unified_memory_level=0,  # unit tests currently broken with UVM
@@ -1319,7 +1319,7 @@ class TestDynamicContext:
         params_dtype = torch.float32
 
         if rank == 0:
-            mamba_inference_state_config = MambaInferenceStateConfig(
+            ssm_inference_state_config = SSMInferenceStateConfig(
                 [Symbols.MAMBA] + [Symbols.ATTENTION] * 4,
                 mamba_conv_states_shape,
                 mamba_ssm_states_shape,
@@ -1327,7 +1327,7 @@ class TestDynamicContext:
                 params_dtype,
             )
         else:
-            mamba_inference_state_config = MambaInferenceStateConfig(
+            ssm_inference_state_config = SSMInferenceStateConfig(
                 [Symbols.MAMBA] * 4 + [Symbols.ATTENTION],
                 mamba_conv_states_shape,
                 mamba_ssm_states_shape,
@@ -1433,9 +1433,9 @@ class TestDynamicContext:
     @pytest.mark.internal
     @pytest.mark.parametrize("ratio", [0.2, 0.4, 0.6, 0.8])
     @rounder_override(64)
-    def test_mamba_memory_ratio_allocation(self, ratio):
+    def test_ssm_memory_ratio_allocation(self, ratio):
         """
-        Test that max_requests and block counts are partitioned correctly by mamba_memory_ratio.
+        Test that max_requests and block counts are partitioned correctly by ssm_memory_ratio.
         """
 
         buffer_gb = 0.05
@@ -1448,7 +1448,7 @@ class TestDynamicContext:
         layer_type_list = [Symbols.MAMBA, Symbols.ATTENTION]
         mamba_conv_states_shape = (544, 4)
         mamba_ssm_states_shape = (8, 64, 16)
-        mamba_config = MambaInferenceStateConfig(
+        ssm_config = SSMInferenceStateConfig(
             layer_type_list,
             mamba_conv_states_shape,
             mamba_ssm_states_shape,
@@ -1469,8 +1469,8 @@ class TestDynamicContext:
                 paused_buffer_size_gb=paused_gb,
                 block_size_tokens=block_size,
                 max_tokens=2048,
-                mamba_inference_state_config=mamba_config,
-                mamba_memory_ratio=ratio,
+                ssm_inference_state_config=ssm_config,
+                ssm_memory_ratio=ratio,
                 unified_memory_level=0,
             ),
         )
@@ -1515,7 +1515,7 @@ class TestDynamicContext:
     @pytest.mark.parametrize("max_requests", [1, 4, 64])
     def test_hybrid_max_requests_auto_derives_mamba_split(self, max_requests):
         """
-        When max_requests is set on a hybrid model without mamba_memory_ratio,
+        When max_requests is set on a hybrid model without ssm_memory_ratio,
         mamba memory should be allocated for exactly max_requests slots, with
         the remaining memory going to KV cache blocks.
         """
@@ -1530,7 +1530,7 @@ class TestDynamicContext:
         layer_type_list = [Symbols.MAMBA, Symbols.ATTENTION]
         mamba_conv_states_shape = (544, 4)
         mamba_ssm_states_shape = (8, 64, 16)
-        mamba_config = MambaInferenceStateConfig(
+        ssm_config = SSMInferenceStateConfig(
             layer_type_list,
             mamba_conv_states_shape,
             mamba_ssm_states_shape,
@@ -1551,7 +1551,7 @@ class TestDynamicContext:
                 paused_buffer_size_gb=paused_gb,
                 block_size_tokens=block_size,
                 max_tokens=2048,
-                mamba_inference_state_config=mamba_config,
+                ssm_inference_state_config=ssm_config,
                 max_requests=max_requests,
                 unified_memory_level=0,
             ),
@@ -1595,7 +1595,7 @@ class TestDynamicContext:
                     paused_buffer_size_gb=paused_gb,
                     block_size_tokens=block_size,
                     max_tokens=2048,
-                    mamba_inference_state_config=mamba_config,
+                    ssm_inference_state_config=ssm_config,
                     max_requests=64,
                     unified_memory_level=0,
                 ),

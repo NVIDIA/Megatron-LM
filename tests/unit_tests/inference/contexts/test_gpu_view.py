@@ -26,18 +26,18 @@ REQUEST_VIEWS_INT32 = (
     "active_request_last_token_idxs",
 )
 REQUEST_VIEWS_FLOAT32 = ("temperature", "top_p")
-MAMBA_VIEWS_INT64 = ("mamba_batch_indices_decode",)
-MAMBA_VIEWS_INT32 = (
-    "mamba_batch_indices_prefill",
-    "mamba_seq_idx",
-    "mamba_cu_seqlens",
-    "mamba_cu_chunk_seqlens",
-    "mamba_last_chunk_indices",
-    "mamba_seq_idx_for_varlen",
-    "mamba_conv_seq_idx",
-    "mamba_conv_seq_start",
+SSM_VIEWS_INT64 = ("ssm_batch_indices_decode",)
+SSM_VIEWS_INT32 = (
+    "ssm_batch_indices_prefill",
+    "ssm_seq_idx",
+    "ssm_cu_seqlens",
+    "ssm_cu_chunk_seqlens",
+    "ssm_last_chunk_indices",
+    "ssm_seq_idx_for_varlen",
+    "ssm_conv_seq_idx",
+    "ssm_conv_seq_start",
 )
-MAMBA_VIEWS = MAMBA_VIEWS_INT64 + MAMBA_VIEWS_INT32
+SSM_VIEWS = SSM_VIEWS_INT64 + SSM_VIEWS_INT32
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ContextGPUView allocates CUDA tensors")
@@ -84,12 +84,12 @@ class TestContextGPUView:
         assert v.mha_block_table.shape == (MAX_REQUESTS, MAX_KV_BLOCKS)
         # Mamba views: all None or all tensors.
         if max_mamba_chunks == 0:
-            for name in MAMBA_VIEWS:
+            for name in SSM_VIEWS:
                 assert getattr(v, name) is None
         else:
-            for name in MAMBA_VIEWS_INT64:
+            for name in SSM_VIEWS_INT64:
                 assert getattr(v, name) is not None
                 assert getattr(v, name).dtype == torch.int64
-            for name in MAMBA_VIEWS_INT32:
+            for name in SSM_VIEWS_INT32:
                 assert getattr(v, name) is not None
                 assert getattr(v, name).dtype == torch.int32

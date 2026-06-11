@@ -36,10 +36,10 @@ class PrefixCachingTestBase:
         Utils.destroy_model_parallel()
 
     @staticmethod
-    def _mamba_config():
-        from megatron.core.inference.config import MambaInferenceStateConfig
+    def _ssm_config():
+        from megatron.core.inference.config import SSMInferenceStateConfig
 
-        return MambaInferenceStateConfig(
+        return SSMInferenceStateConfig(
             layer_type_list=["*", "M", "*", "M"],
             conv_states_shape=(4, 8),
             ssm_states_shape=(4, 16),
@@ -57,8 +57,8 @@ class PrefixCachingTestBase:
         enable_prefix_caching=True,
         max_tokens=None,
         prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
-        mamba_config=None,
-        prefix_caching_mamba_gb=None,
+        ssm_config=None,
+        prefix_caching_ssm_gb=None,
     ):
         DynamicInferenceContext.ROUNDER = rounder
         DynamicInferenceContext.TOKEN_ROUNDER = rounder
@@ -80,12 +80,12 @@ class PrefixCachingTestBase:
             paused_buffer_size_gb=0.2 * buffer_size_gb,
             block_size_tokens=block_size_tokens,
             max_tokens=max_tokens,
-            mamba_inference_state_config=mamba_config,
+            ssm_inference_state_config=ssm_config,
             use_flashinfer_fused_rope=None,
             unified_memory_level=0,
             enable_prefix_caching=enable_prefix_caching,
             prefix_caching_eviction_policy=prefix_caching_eviction_policy,
-            prefix_caching_mamba_gb=prefix_caching_mamba_gb,
+            prefix_caching_ssm_gb=prefix_caching_ssm_gb,
         )
         return DynamicInferenceContext(
             model_config=transformer_config, inference_config=inference_config
@@ -574,8 +574,8 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
 
     def _mctx(self, **kwargs):
         defaults = dict(
-            mamba_config=self._mamba_config(),
-            prefix_caching_mamba_gb=0.01,
+            ssm_config=self._ssm_config(),
+            prefix_caching_ssm_gb=0.01,
             block_size_tokens=256,
             max_sequence_length=4096,
         )
@@ -585,7 +585,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
     @pytest.mark.internal
     def test_hybrid_memory_only(self):
         # hybrid model: no prefill skipping, but blocks reused for memory savings
-        ctx = self._ctx(mamba_config=self._mamba_config())
+        ctx = self._ctx(ssm_config=self._ssm_config())
         bs = ctx.block_size_tokens
         alloc = ctx.kv_block_allocator
         prompt = self._prompt(bs * 3)
@@ -616,13 +616,13 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         ctx = self._mctx()
         bs = ctx.block_size_tokens
 
-        # allocated when prefix_caching_mamba_gb is set
+        # allocated when prefix_caching_ssm_gb is set
         assert ctx.ssm_slot_allocator.max_slots > 0
         assert ctx.ssm_slot_allocator.conv_states is not None
         assert ctx.ssm_slot_allocator.free_count == ctx.ssm_slot_allocator.max_slots
 
         # not allocated when None
-        ctx_none = self._mctx(prefix_caching_mamba_gb=None)
+        ctx_none = self._mctx(prefix_caching_ssm_gb=None)
         assert ctx_none.ssm_slot_allocator is None
 
         # store and restore round-trips
@@ -878,8 +878,8 @@ class TestMixedCachedAndFreshPrefill(PrefixCachingTestBase):
             ctx = self._ctx(block_size_tokens=32)
         else:
             ctx = self._ctx(
-                mamba_config=self._mamba_config(),
-                prefix_caching_mamba_gb=0.01,
+                ssm_config=self._ssm_config(),
+                prefix_caching_ssm_gb=0.01,
                 block_size_tokens=256,
                 max_sequence_length=4096,
             )
@@ -963,12 +963,12 @@ class TestMixedCachedAndFreshPrefill(PrefixCachingTestBase):
         assert len(log_probs_list[4]) == fresh_ql
 
 
-class TestMambaSlotAllocator(PrefixCachingTestBase):
+class TestSSMSlotAllocator(PrefixCachingTestBase):
 
     def _mctx(self, **kwargs):
         defaults = dict(
-            mamba_config=self._mamba_config(),
-            prefix_caching_mamba_gb=0.01,
+            ssm_config=self._ssm_config(),
+            prefix_caching_ssm_gb=0.01,
             block_size_tokens=256,
             max_sequence_length=4096,
         )
@@ -1022,7 +1022,7 @@ class TestMambaSlotAllocator(PrefixCachingTestBase):
         assert msa3.free_count == free_before3 - 2  # only 2 new
 
         # Eviction: exhaust free pool, verify eviction fires and returns valid slots
-        ctx4 = self._mctx(prefix_caching_mamba_gb=0.001)
+        ctx4 = self._mctx(prefix_caching_ssm_gb=0.001)
         msa4 = ctx4.ssm_slot_allocator
         total_slots = msa4.max_slots
         ctx4.add_request(self._req(ctx4, self._prompt(bs * 4)))

@@ -20,7 +20,7 @@ from megatron.core import parallel_state
 from megatron.core.inference.config import (
     InferenceConfig,
     KVCacheManagementMode,
-    MambaInferenceStateConfig,
+    SSMInferenceStateConfig,
 )
 from megatron.core.inference.contexts.dynamic_context import (
     ActiveRequestCountOverflowError,
@@ -264,7 +264,7 @@ class DynamicInferenceEngineTestBase:
         test_config: DynamicEngineTestConfig,
         transformer_config: TransformerConfig,
         requests: List[DynamicInferenceRequest],
-        mamba_inference_state_config: Optional[MambaInferenceStateConfig] = None,
+        ssm_inference_state_config: Optional[SSMInferenceStateConfig] = None,
     ):
         """The inference context manages the KV cache and other inference state."""
 
@@ -283,7 +283,7 @@ class DynamicInferenceEngineTestBase:
                 block_size_tokens=test_config.context_block_size_tokens,
                 max_requests=test_config.context_max_requests,
                 max_tokens=test_config.context_max_tokens,
-                mamba_inference_state_config=mamba_inference_state_config,
+                ssm_inference_state_config=ssm_inference_state_config,
                 materialize_only_last_token_logits=test_config.materialize_only_last_token_logits,
                 kv_cache_management_mode=KVCacheManagementMode(
                     test_config.kv_cache_management_mode
@@ -474,14 +474,14 @@ class DynamicInferenceEngineTestBase:
 
         model.eval()
 
-        mamba_inference_state_config = MambaInferenceStateConfig.from_model(model)
+        ssm_inference_state_config = SSMInferenceStateConfig.from_model(model)
 
         # Inference context.
         inference_context = cls._build_inference_context(
             test_config=test_config,
             transformer_config=transformer_config,
             requests=requests,
-            mamba_inference_state_config=mamba_inference_state_config,
+            ssm_inference_state_config=ssm_inference_state_config,
         )
 
         # Inference model wrapper.
@@ -5002,7 +5002,7 @@ class TestChunkedPrefillCudaGraphs:
     def _build_engine(self, model, enable_chunked_prefill, num_cuda_graphs, context_max_tokens):
         """Build an engine with the given chunked prefill / CUDA graph config."""
         set_rounder(4)
-        mamba_config = MambaInferenceStateConfig.from_model(model)
+        ssm_config = SSMInferenceStateConfig.from_model(model)
 
         inference_config_kwargs = dict(
             max_sequence_length=CHUNKED_CG_MAX_SEQ_LEN,
@@ -5017,8 +5017,8 @@ class TestChunkedPrefillCudaGraphs:
             max_requests=128,
             sampling_backend='torch',
         )
-        if mamba_config is not None:
-            inference_config_kwargs.update(mamba_inference_state_config=mamba_config)
+        if ssm_config is not None:
+            inference_config_kwargs.update(ssm_inference_state_config=ssm_config)
         context = DynamicInferenceContext(
             model_config=model.config, inference_config=InferenceConfig(**inference_config_kwargs)
         )

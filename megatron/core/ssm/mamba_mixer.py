@@ -1090,7 +1090,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
 
         return y
 
-    def mamba_state_shapes_per_request(self) -> Tuple[Tuple[int], Tuple[int]]:
+    def ssm_state_shapes_per_request(self) -> Tuple[Tuple[int], Tuple[int]]:
         """Returns the Mamba conv and ssm states shapes per request."""
         conv_states_shape = (self.conv1d_weight.shape[0], self.d_conv)
         ssm_states_shape = (self.nheads_local_tp, self.headdim, self.d_state)
@@ -1114,7 +1114,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
             self.layer_number not in inference_context.key_value_memory_dict
             or batch_size != self.cached_batch_size
         ):
-            conv_state_shape, ssm_state_shape = self.mamba_state_shapes_per_request()
+            conv_state_shape, ssm_state_shape = self.ssm_state_shapes_per_request()
             conv_state = torch.zeros(
                 batch_size,
                 *conv_state_shape,

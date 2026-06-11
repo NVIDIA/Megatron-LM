@@ -48,7 +48,7 @@ from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMet
 from .base_context import BaseInferenceContext
 from .gpu_view import ContextGPUView
 from .kv_block_allocator import KVBlockAllocator
-from .mamba_slot_allocator import MambaSlotAllocator
+from .ssm_slot_allocator import SSMSlotAllocator
 from .routing_metadata import RoutingMetadata
 
 try:
@@ -90,7 +90,7 @@ DEPRECATED_ARGS = [
     "qk_pos_emb_head_dim",
     "num_cuda_graphs",
     "materialize_only_last_token_logits",
-    "mamba_inference_state_config",
+    "ssm_inference_state_config",
     "use_cuda_graphs_for_non_decode_steps",
     "use_flashinfer_fused_rope",
     "unified_memory_level",
@@ -335,14 +335,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         self._ep_zmq_communicator = None
 
         # Mamba states.
-        mamba_inference_state_config = inference_config.mamba_inference_state_config
-        self.is_hybrid_model = mamba_inference_state_config is not None
+        ssm_inference_state_config = inference_config.ssm_inference_state_config
+        self.is_hybrid_model = ssm_inference_state_config is not None
         if self.is_hybrid_model:
-            self.ssm_conv_states_shape = mamba_inference_state_config.conv_states_shape
-            self.ssm_recurrent_states_shape = mamba_inference_state_config.ssm_states_shape
-            self.ssm_conv_states_dtype = mamba_inference_state_config.conv_states_dtype
-            self.ssm_recurrent_states_dtype = mamba_inference_state_config.ssm_states_dtype
-            self.ssm_chunk_size = mamba_inference_state_config.mamba_chunk_size
+            self.ssm_conv_states_shape = ssm_inference_state_config.conv_states_shape
+            self.ssm_recurrent_states_shape = ssm_inference_state_config.ssm_states_shape
+            self.ssm_conv_states_dtype = ssm_inference_state_config.conv_states_dtype
+            self.ssm_recurrent_states_dtype = ssm_inference_state_config.ssm_states_dtype
+            self.ssm_chunk_size = ssm_inference_state_config.ssm_chunk_size
 
             # For hybrid models, the layer map converts the global layer index to the
             # corresponding attention layer index or Mamba layer index depending on the
@@ -350,7 +350,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             attention_layer_map, dsa_layer_map, gdn_layer_map, mamba_layer_map = (
                 operator.itemgetter(
                     Symbols.ATTENTION, Symbols.DS_ATTENTION, Symbols.GDN, Symbols.MAMBA
-                )(get_layer_maps_from_layer_type_list(mamba_inference_state_config.layer_type_list))
+                )(get_layer_maps_from_layer_type_list(ssm_inference_state_config.layer_type_list))
             )
 
             if len(gdn_layer_map) > 0:
@@ -471,20 +471,20 @@ class DynamicInferenceContext(BaseInferenceContext):
             else int(inference_config.paused_buffer_size_gb * 1024**3)
         )
 
-        mamba_max_requests = float('inf')
+        ssm_max_requests = float('inf')
 
-        if (mamba_memory_ratio := inference_config.mamba_memory_ratio) is not None:
+        if (ssm_memory_ratio := inference_config.ssm_memory_ratio) is not None:
             assert self.is_hybrid_model
-            assert mamba_memory_ratio > 0 and mamba_memory_ratio < 1
+            assert ssm_memory_ratio > 0 and ssm_memory_ratio < 1
 
             # Calculate total memory before partition
             total_memory = buffer_size_bytes + paused_buffer_size_bytes
-            mamba_memory_bytes = total_memory * mamba_memory_ratio
-            mamba_max_requests = int(mamba_memory_bytes // mamba_states_memory_per_request)
+            ssm_memory_bytes = total_memory * ssm_memory_ratio
+            ssm_max_requests = int(ssm_memory_bytes // mamba_states_memory_per_request)
 
             # Reduce buffer sizes for KV cache
-            buffer_size_bytes = int(buffer_size_bytes * (1.0 - mamba_memory_ratio))
-            paused_buffer_size_bytes = int(paused_buffer_size_bytes * (1.0 - mamba_memory_ratio))
+            buffer_size_bytes = int(buffer_size_bytes * (1.0 - ssm_memory_ratio))
+            paused_buffer_size_bytes = int(paused_buffer_size_bytes * (1.0 - ssm_memory_ratio))
 
             block_count = buffer_size_bytes // self.block_size_bytes
             block_count = max(2, block_count)  # need >= 1 active block + 1 dummy block
@@ -493,18 +493,18 @@ class DynamicInferenceContext(BaseInferenceContext):
             # Auto-derive mamba/KV split from max_requests. Allocate exactly enough
             # mamba memory for max_requests, and give the rest to KV cache blocks.
             total_memory = buffer_size_bytes + paused_buffer_size_bytes
-            mamba_memory_needed = inference_config.max_requests * mamba_states_memory_per_request
-            assert mamba_memory_needed < total_memory, (
+            ssm_memory_needed = inference_config.max_requests * mamba_states_memory_per_request
+            assert ssm_memory_needed < total_memory, (
                 f"Not enough memory for {inference_config.max_requests} mamba requests. "
-                f"Need {mamba_memory_needed / 1024**3:.2f} GB for mamba states, "
+                f"Need {ssm_memory_needed / 1024**3:.2f} GB for mamba states, "
                 f"but total buffer is {total_memory / 1024**3:.2f} GB."
             )
-            mamba_max_requests = inference_config.max_requests
+            ssm_max_requests = inference_config.max_requests
 
             # Subtract mamba memory proportionally from active and paused buffers.
-            mamba_memory_ratio = mamba_memory_needed / total_memory
-            buffer_size_bytes = int(buffer_size_bytes * (1.0 - mamba_memory_ratio))
-            paused_buffer_size_bytes = int(paused_buffer_size_bytes * (1.0 - mamba_memory_ratio))
+            ssm_memory_ratio = ssm_memory_needed / total_memory
+            buffer_size_bytes = int(buffer_size_bytes * (1.0 - ssm_memory_ratio))
+            paused_buffer_size_bytes = int(paused_buffer_size_bytes * (1.0 - ssm_memory_ratio))
 
             block_count = buffer_size_bytes // self.block_size_bytes
             block_count = max(2, block_count)  # need >= 1 active block + 1 dummy block
@@ -569,8 +569,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.max_requests = self.kv_block_allocator.total_count - 1  # -1 for dummy block
 
             # Adjust max_requests for Mamba memory constraints if necessary
-            if self.is_hybrid_model and mamba_max_requests < self.max_requests:
-                self.max_requests = int(mamba_max_requests)
+            if self.is_hybrid_model and ssm_max_requests < self.max_requests:
+                self.max_requests = int(ssm_max_requests)
 
             self.max_requests = self.max_requests // tp_size * tp_size
             self.max_requests = self.max_requests // self.REQUEST_ROUNDER * self.REQUEST_ROUNDER
@@ -751,13 +751,13 @@ class DynamicInferenceContext(BaseInferenceContext):
                     f"    total ({self.max_requests} requests):  {get_mem_size_str(spec_total_bytes)}",
                 ]
 
-            prefix_caching_mamba_gb = inference_config.prefix_caching_mamba_gb
+            prefix_caching_ssm_gb = inference_config.prefix_caching_ssm_gb
             if (
                 inference_config.enable_prefix_caching
-                and prefix_caching_mamba_gb is not None
-                and prefix_caching_mamba_gb > 0
+                and prefix_caching_ssm_gb is not None
+                and prefix_caching_ssm_gb > 0
             ):
-                prefix_cache_bytes = int(prefix_caching_mamba_gb * 1024**3)
+                prefix_cache_bytes = int(prefix_caching_ssm_gb * 1024**3)
                 prefix_cache_slots = prefix_cache_bytes // mamba_bytes_per_req
                 log_lines += [
                     f"  Mamba prefix cache:",
@@ -1216,7 +1216,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_tokens=self.max_tokens,
             max_kv_blocks=self.max_kv_block_count,
             device=torch.cuda.current_device(),
-            max_mamba_chunks=self._max_ssm_chunks,
+            max_ssm_chunks=self._max_ssm_chunks,
         )
 
         # Cache of (input_ids_view, pos_ids_view) keyed by num_tokens. Instead of slicing and
@@ -1256,14 +1256,14 @@ class DynamicInferenceContext(BaseInferenceContext):
             self._allocate_ssm_states()
 
         # Allocate Mamba prefix cache if configured
-        self.ssm_slot_allocator: Optional[MambaSlotAllocator] = None
+        self.ssm_slot_allocator: Optional[SSMSlotAllocator] = None
         if (
             self.is_hybrid_model
-            and self.config.prefix_caching_mamba_gb is not None
-            and self.config.prefix_caching_mamba_gb > 0
+            and self.config.prefix_caching_ssm_gb is not None
+            and self.config.prefix_caching_ssm_gb > 0
             and self.config.enable_prefix_caching
         ):
-            self._allocate_ssm_cache(self.config.prefix_caching_mamba_gb)
+            self._allocate_ssm_cache(self.config.prefix_caching_ssm_gb)
 
         # Reset tensor-related metadata.
         self.reset_metadata()
@@ -1602,10 +1602,10 @@ class DynamicInferenceContext(BaseInferenceContext):
             )
             return
 
-        self.ssm_slot_allocator = MambaSlotAllocator(
+        self.ssm_slot_allocator = SSMSlotAllocator(
             context=self,
             max_slots=max_slots,
-            num_mamba_layers=self.num_ssm_layers,
+            num_ssm_layers=self.num_ssm_layers,
             conv_states_shape=self.ssm_conv_states_shape,
             ssm_states_shape=self.ssm_recurrent_states_shape,
             conv_states_dtype=self.ssm_conv_states_dtype,

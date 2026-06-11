@@ -16,17 +16,17 @@ if TYPE_CHECKING:
 MAX_INTERMEDIATE_OFFSETS_PER_REQUEST = 3
 
 
-class MambaSlotAllocator:
-    """Manages Mamba state caching for prefix caching in hybrid models.
+class SSMSlotAllocator:
+    """Manages SSM state caching for prefix caching in hybrid models.
 
-    Owns the Mamba cache slot pool, block-to-slot mappings, hash-to-block
+    Owns the SSM state cache slot pool, block-to-slot mappings, hash-to-block
     mapping, and intermediate state tracking. Accesses KV allocator state
     (ref counts, timestamps, block hashes) via the parent context.
 
     Args:
         context: The DynamicInferenceContext that owns this allocator.
         max_slots: Maximum number of cache slots.
-        num_mamba_layers: Number of Mamba layers in the model.
+        num_ssm_layers: Number of SSM layers in the model.
         conv_states_shape: Shape of per-slot conv state (excluding layer/slot dims).
         ssm_states_shape: Shape of per-slot SSM state (excluding layer/slot dims).
         conv_states_dtype: Dtype for conv state tensors.
@@ -37,7 +37,7 @@ class MambaSlotAllocator:
         self,
         context: "DynamicInferenceContext",
         max_slots: int,
-        num_mamba_layers: int,
+        num_ssm_layers: int,
         conv_states_shape: tuple,
         ssm_states_shape: tuple,
         conv_states_dtype: torch.dtype,
@@ -45,7 +45,7 @@ class MambaSlotAllocator:
     ):
         self.context = context
         self.max_slots = max_slots
-        self.num_mamba_layers = num_mamba_layers
+        self.num_ssm_layers = num_ssm_layers
 
         gpu_device = torch.cuda.current_device()
         num_blocks = context.kv_block_allocator.total_count
@@ -58,19 +58,19 @@ class MambaSlotAllocator:
         self.free_slots = torch.arange(max_slots, dtype=torch.int32, device='cpu')
         self.free_count = max_slots
 
-        # State tensors (GPU - accessed by Mamba CUDA kernels).
+        # State tensors (GPU - accessed by SSM CUDA kernels).
         self.conv_states = torch.zeros(
-            (num_mamba_layers, max_slots) + conv_states_shape,
+            (num_ssm_layers, max_slots) + conv_states_shape,
             dtype=conv_states_dtype,
             device=gpu_device,
         )
         self.ssm_states = torch.zeros(
-            (num_mamba_layers, max_slots) + ssm_states_shape,
+            (num_ssm_layers, max_slots) + ssm_states_shape,
             dtype=ssm_states_dtype,
             device=gpu_device,
         )
 
-        # Hash-to-block mapping: only blocks with cached Mamba state
+        # Hash-to-block mapping: only blocks with cached SSM state
         self.hash_to_block_id: Dict[int, int] = {}
 
         # Per-request intermediate state storage.
@@ -103,12 +103,12 @@ class MambaSlotAllocator:
         # Pre-allocated output buffers for CUDA graph compatible extraction (GPU).
         self.max_intermediate_count = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * context.max_requests
         self.intermediate_ssm_out = torch.zeros(
-            (num_mamba_layers, self.max_intermediate_count) + ssm_states_shape,
+            (num_ssm_layers, self.max_intermediate_count) + ssm_states_shape,
             dtype=ssm_states_dtype,
             device=gpu_device,
         )
         self.intermediate_conv_out = torch.zeros(
-            (num_mamba_layers, self.max_intermediate_count) + conv_states_shape,
+            (num_ssm_layers, self.max_intermediate_count) + conv_states_shape,
             dtype=conv_states_dtype,
             device=gpu_device,
         )
@@ -118,7 +118,7 @@ class MambaSlotAllocator:
     # =========================================================================
 
     def allocate_slots_batch(self, block_ids: list) -> list:
-        """Get free Mamba cache slots for multiple blocks, evicting if necessary.
+        """Get free SSM cache slots for multiple blocks, evicting if necessary.
 
         Handles deduplication: if the same block_id appears multiple times,
         only one slot is allocated and all occurrences get the same slot.
@@ -181,7 +181,7 @@ class MambaSlotAllocator:
         return result
 
     def _evict_lru_slots_batch(self, num_needed: int) -> list:
-        """Evict the least recently used Mamba cache slots.
+        """Evict the least recently used SSM cache slots.
 
         Does NOT return slots to the free pool — caller takes ownership.
 
@@ -192,14 +192,14 @@ class MambaSlotAllocator:
             List of freed slot indices.
         """
         kv_alloc = self.context.kv_block_allocator
-        # Find blocks that have mamba slots and ref_count == 0
+        # Find blocks that have SSM slots and ref_count == 0
         has_slot_mask = self.block_to_slot[: kv_alloc.total_count] >= 0
         ref_zero_mask = kv_alloc.block_ref_counts[: kv_alloc.total_count] == 0
         candidates = has_slot_mask & ref_zero_mask
         candidate_ids = torch.nonzero(candidates, as_tuple=True)[0]
 
         if candidate_ids.numel() < num_needed:
-            raise RuntimeError("No evictable Mamba cache slots available")
+            raise RuntimeError("No evictable linear attention cache slots available")
 
         # Pick oldest blocks by timestamp (LRU) or first N (REF_ZERO)
         if self.context.prefix_caching_eviction_policy == PrefixCachingEvictionPolicy.LRU:
@@ -237,7 +237,7 @@ class MambaSlotAllocator:
         return self.block_to_slot[block_id].item()
 
     def has_state(self, block_id: int) -> bool:
-        """Check if a block has cached Mamba state."""
+        """Check if a block has cached SSM state."""
         return self.block_to_slot[block_id].item() >= 0
 
     # =========================================================================
@@ -284,7 +284,7 @@ class MambaSlotAllocator:
         self.free_count += n
 
     def on_kv_blocks_deregistered(self, block_ids_list: list, hashes_to_delete: set) -> None:
-        """Handle KV block deregistration by cleaning up Mamba state.
+        """Handle KV block deregistration by cleaning up SSM state.
 
         Called by KVBlockAllocator._deregister_blocks via callback.
 
@@ -293,11 +293,11 @@ class MambaSlotAllocator:
             hashes_to_delete: Set of hashes being deregistered (excludes -1).
         """
         if self.hash_to_block_id:
-            mamba_keys = hashes_to_delete & self.hash_to_block_id.keys()
-            if mamba_keys:
+            la_keys = hashes_to_delete & self.hash_to_block_id.keys()
+            if la_keys:
                 from collections import deque
 
-                deque(map(self.hash_to_block_id.pop, mamba_keys), maxlen=0)
+                deque(map(self.hash_to_block_id.pop, la_keys), maxlen=0)
                 self._invalidate_blocks_batch(block_ids_list)
 
     # =========================================================================
@@ -311,12 +311,12 @@ class MambaSlotAllocator:
 
         Args:
             block_id: The KV block ID.
-            layer_idx: The Mamba layer index.
+            layer_idx: The linear attention layer index.
             ssm_state: SSM state tensor to store.
             conv_state: Conv state tensor to store.
         """
         slot = self.block_to_slot[block_id].item()
-        assert slot >= 0, f"Block {block_id} has no Mamba cache slot"
+        assert slot >= 0, f"Block {block_id} has no linear attention cache slot"
         self.ssm_states[layer_idx, slot].copy_(ssm_state)
         self.conv_states[layer_idx, slot].copy_(conv_state)
 
@@ -331,15 +331,15 @@ class MambaSlotAllocator:
             return
         device = self.conv_states.device
         slot_tensor = torch.tensor(slots, dtype=torch.int64, device=device)
-        # Lookup mamba indices from CPU bookkeeping, then move to GPU for state copy.
+        # Lookup SSM indices from CPU bookkeeping, then move to GPU for state copy.
         req_tensor_cpu = torch.tensor(request_indices, dtype=torch.int64)
-        mamba_indices = self.context.ssm_metadata.request_to_ssm_state_idx[
+        ssm_indices = self.context.ssm_metadata.request_to_ssm_state_idx[
             req_tensor_cpu
         ].tolist()
-        mamba_idx_tensor = torch.tensor(mamba_indices, dtype=torch.int64, device=device)
+        ssm_idx_tensor = torch.tensor(ssm_indices, dtype=torch.int64, device=device)
         # Fancy-indexed copy (2 kernel launches instead of 2E)
-        self.conv_states[:, slot_tensor] = self.context.ssm_conv_states[:, mamba_idx_tensor]
-        self.ssm_states[:, slot_tensor] = self.context.ssm_recurrent_states[:, mamba_idx_tensor]
+        self.conv_states[:, slot_tensor] = self.context.ssm_conv_states[:, ssm_idx_tensor]
+        self.ssm_states[:, slot_tensor] = self.context.ssm_recurrent_states[:, ssm_idx_tensor]
 
     def restore_to_live(self, request_idx: int, block_id: int) -> bool:
         """Copy all layers from cache slot to live request state.
@@ -354,9 +354,9 @@ class MambaSlotAllocator:
         slot = self.block_to_slot[block_id].item()
         if slot < 0:
             return False
-        mamba_idx = self.context.ssm_metadata.request_to_ssm_state_idx[request_idx].item()
-        self.context.ssm_conv_states[:, mamba_idx].copy_(self.conv_states[:, slot])
-        self.context.ssm_recurrent_states[:, mamba_idx].copy_(self.ssm_states[:, slot])
+        ssm_idx = self.context.ssm_metadata.request_to_ssm_state_idx[request_idx].item()
+        self.context.ssm_conv_states[:, ssm_idx].copy_(self.conv_states[:, slot])
+        self.context.ssm_recurrent_states[:, ssm_idx].copy_(self.ssm_states[:, slot])
         return True
 
     # =========================================================================
@@ -364,7 +364,7 @@ class MambaSlotAllocator:
     # =========================================================================
 
     def register_block_hashes_batch(self, block_ids: list, hashes: list) -> None:
-        """Register multiple blocks as having cached Mamba state.
+        """Register multiple blocks as having cached SSM state.
 
         Only registers entries where hash > 0.
 
@@ -395,7 +395,7 @@ class MambaSlotAllocator:
         Args:
             req: The inference request.
             current_id: Context request index.
-            skip_tokens: Number of tokens being skipped (mamba match).
+            skip_tokens: Number of tokens being skipped (SSM state match).
             prefill_chunk_length: Total prefill chunk length before skipping.
             num_matched_blocks: Number of KV-matched blocks.
             matched_block_ids: List of matched KV block IDs.
@@ -414,13 +414,13 @@ class MambaSlotAllocator:
         penultimate_abs = (overall_required_blocks - 1) * ctx.block_size_tokens
         penultimate_rel = penultimate_abs - skip_tokens
 
-        # Determine mamba_chunk_size from mamba config (128 is the standard SSM kernel chunk size)
-        mamba_chunk_size = 128
+        # 128 is the standard SSM kernel chunk size
+        ssm_chunk_size = 128
 
-        # Build offset list: include if > 0, < seq_len, and % mamba_chunk_size == 0
+        # Build offset list: include if > 0, < seq_len, and % ssm_chunk_size == 0
         offsets_set = set()
         for offset in [kv_div_rel, last_aligned_rel, penultimate_rel]:
-            if offset > 0 and offset < seq_len and offset % mamba_chunk_size == 0:
+            if offset > 0 and offset < seq_len and offset % ssm_chunk_size == 0:
                 offsets_set.add(offset)
 
         offsets = sorted(offsets_set)
@@ -478,7 +478,7 @@ class MambaSlotAllocator:
         return offsets, counts
 
     def transfer_intermediate_to_gpu(self, prefill_start: int, prefill_count: int):
-        """Copy intermediate offsets/counts slice from CPU to GPU for Mamba kernels.
+        """Copy intermediate offsets/counts slice from CPU to GPU for SSM kernels.
 
         Returns the GPU tensor views for the forward-pass kernels to consume.
         """
