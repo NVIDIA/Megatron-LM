@@ -20,9 +20,7 @@ the parameter layout: global/local shape, per-param mesh, placements,
 chunk offsets, and Megatron attributes (TP partition, QKV, M-FSDP name).
 
 Optimizer-agnostic: works with any PyTorch optimizer whose params are
-DTensors managed by Megatron-FSDP. Plain (non-DTensor) params are also
-handled — they're dumped with `local_shape == global_shape` and the
-mesh/placements fields set to None.
+DTensors managed by Megatron-FSDP.
 """
 
 import json
@@ -81,8 +79,10 @@ def dump_optimizer_parameters(
         logger.info("Optimizer inputs dumped to %s (and rank-N siblings)", rank_out)
 
 
-def _dump_param(p: torch.Tensor, state: dict[str, Any]) -> dict[str, Any]:
+def _dump_param(p: DTensor, state: dict[str, Any]) -> dict[str, Any]:
     """Convert one optimizer param to a JSON-serializable dict."""
+    local = p.to_local()
+    mesh = p.device_mesh
     info: dict[str, Any] = {
         "name": _param_name(p),
         "global_shape": tuple(int(s) for s in p.shape),
@@ -90,22 +90,12 @@ def _dump_param(p: torch.Tensor, state: dict[str, Any]) -> dict[str, Any]:
         "is_qkv": _is_qkv(p),
         "partition_dim": getattr(p, "partition_dim", None),
         "tensor_model_parallel": getattr(p, "tensor_model_parallel", None),
+        "local_shape": tuple(int(s) for s in local.shape),
+        "local_offsets": _local_offsets(local),
+        "mesh_shape": tuple(int(s) for s in mesh.shape),
+        "mesh_dim_names": list(mesh.mesh_dim_names) if mesh.mesh_dim_names else None,
+        "placements": [repr(pl) for pl in p.placements],
     }
-
-    if isinstance(p, DTensor):
-        local = p.to_local()
-        mesh = p.device_mesh
-        info["local_shape"] = tuple(int(s) for s in local.shape)
-        info["local_offsets"] = _local_offsets(local)
-        info["mesh_shape"] = tuple(int(s) for s in mesh.shape)
-        info["mesh_dim_names"] = list(mesh.mesh_dim_names) if mesh.mesh_dim_names else None
-        info["placements"] = [repr(pl) for pl in p.placements]
-    else:
-        info["local_shape"] = tuple(int(s) for s in p.shape)
-        info["local_offsets"] = None
-        info["mesh_shape"] = None
-        info["mesh_dim_names"] = None
-        info["placements"] = None
 
     mom = state.get("momentum_buffer")
     if mom is not None:
