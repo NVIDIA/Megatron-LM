@@ -21,6 +21,14 @@ This directory contains self-contained MoE training recipes. Each YAML file incl
   </thead>
   <tbody>
     <tr>
+      <td>DeepSeek-V4-Flash</td>
+      <td><a href="deepseek_v4_flash/gb200/mxfp8_SL4K_128GPU_TP1PP1EP64.yaml">GB200 MXFP8</a></td>
+      <td>128</td>
+      <td>1/1/64/1/1</td>
+      <td>1/2048/4096</td>
+      <td>BSHD; paged stash; full CG; HybridEP</td>
+    </tr>
+    <tr>
       <td rowspan="5">DeepSeek-V3</td>
       <td><a href="deepseek_v3/b200/mxfp8_256GPU_TP1PP8EP32.yaml">B200 MXFP8</a></td>
       <td>256</td>
