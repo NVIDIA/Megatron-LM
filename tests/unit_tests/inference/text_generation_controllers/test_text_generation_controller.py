@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
+import inspect
 import os
 import random
 import string
@@ -185,6 +186,78 @@ class TextGenerationControllerTestBase:
         # Mirror what StaticInferenceEngine/DynamicInferenceEngine do at engine start:
         # the model is being driven by an inference workload, so InferenceMode is active.
         InferenceMode.set_active()
+
+
+class TestAsyncSchedulingControllerHelpers:
+    def test_serial_async_scheduling_call_order(self):
+        controller = object.__new__(TextGenerationController)
+        events = []
+
+        context = mock.Mock()
+        context._async_prior_finished_active_mask = None
+        context.prepare_async_next_forward.side_effect = lambda _: events.append(
+            "update_requests_prepare"
+        )
+        context.update_requests_bookkeep.side_effect = lambda *_args, **_kwargs: events.append(
+            "update_requests_bookkeep"
+        ) or {
+            "newly_paused_request_ids": None,
+            "evict_request_ids": None,
+        }
+
+        controller.inference_wrapped_model = mock.Mock(inference_context=context)
+        controller._async_schedule_forward_primed = True
+        controller._async_schedule_primed_cuda_graph_request_count = None
+        controller._dynamic_step_sample_logits = mock.Mock(side_effect=lambda: events.append("sample"))
+        controller._dynamic_step_context_prepare_bookkeeping = mock.Mock(
+            side_effect=lambda: (
+                {
+                    "active_requests_mask": torch.tensor([1], device='cpu'),
+                    "new_tokens": torch.tensor([7], device='cpu'),
+                    "new_speculative_tokens": None,
+                },
+                {"active_request_ids": torch.tensor([3], device='cpu')},
+            )
+        )
+        controller._dynamic_step_forward_for_async_scheduling = mock.Mock(
+            side_effect=lambda: events.append("forward") or None
+        )
+
+        with mock.patch(
+            "megatron.core.inference.text_generation_controllers.text_generation_controller.range_push"
+        ), mock.patch(
+            "megatron.core.inference.text_generation_controllers.text_generation_controller.range_pop"
+        ):
+            controller._async_scheduling_sample_prepare_forward_bookkeep()
+
+        assert events == [
+            "sample",
+            "update_requests_prepare",
+            "forward",
+            "update_requests_bookkeep",
+        ]
+        _, kwargs = context.update_requests_bookkeep.call_args
+        assert kwargs["delay_finished_compaction"]
+
+    def test_async_scheduling_helpers_do_not_use_overlap_primitives(self):
+        helper_source = "\n".join(
+            inspect.getsource(getattr(TextGenerationController, name))
+            for name in (
+                "_try_async_generate_output_tokens_dynamic_batch",
+                "_async_scheduling_sample_prepare_forward_bookkeep",
+                "_async_scheduling_prepare_forward_bookkeep",
+                "_dynamic_step_forward_for_async_scheduling",
+            )
+        )
+
+        for primitive in (
+            "torch.cuda.Event",
+            "torch.cuda.Stream",
+            "record_event",
+            "wait_event",
+            "current_stream",
+        ):
+            assert primitive not in helper_source
 
 
 class TestTextGenerationController(TextGenerationControllerTestBase):
