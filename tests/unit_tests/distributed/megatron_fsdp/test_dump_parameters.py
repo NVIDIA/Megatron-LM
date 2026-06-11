@@ -1,5 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-"""Unit tests for `megatron_fsdp.dump_parameters.dump_optimizer_parameters`.
+"""Unit tests for `megatron.core.distributed.dump_parameters.dump_optimizer_parameters`.
 
 Run with torchrun:
     torchrun --nproc_per_node=4 -m pytest test_dump_parameters.py -v
@@ -13,9 +13,7 @@ import torch
 from torch.distributed._tensor import Replicate, Shard, distribute_tensor
 from torch.distributed.device_mesh import init_device_mesh
 
-from megatron.core.distributed.fsdp.src.megatron_fsdp.dump_parameters import (
-    dump_optimizer_parameters,
-)
+from megatron.core.distributed.dump_parameters import dump_optimizer_parameters
 
 
 def _build_mesh(distributed_setup):
