@@ -17,7 +17,7 @@
 Useful for replaying optimizer steps in tests/microbenchmarks without
 re-running the model. The dump captures everything needed to reconstruct
 the parameter layout: global/local shape, per-param mesh, placements,
-dtype, and the QKV flag.
+dtype, the QKV flag, and (best-effort) the M-FSDP param name.
 
 Optimizer-agnostic: works with any PyTorch optimizer whose params are
 DTensors managed by Megatron-FSDP.
@@ -83,6 +83,7 @@ def _dump_param(p: DTensor) -> dict[str, Any]:
     local = p.to_local()
     mesh = p.device_mesh
     return {
+        "name": _param_name(p),
         "global_shape": tuple(int(s) for s in p.shape),
         "dtype": str(p.dtype),
         "is_qkv": _is_qkv(p),
@@ -91,6 +92,23 @@ def _dump_param(p: DTensor) -> dict[str, Any]:
         "mesh_dim_names": list(mesh.mesh_dim_names) if mesh.mesh_dim_names else None,
         "placements": [repr(pl) for pl in p.placements],
     }
+
+
+def _param_name(p: torch.Tensor) -> str | None:
+    """Best-effort lookup for the M-FSDP-attached param name; None when unset.
+
+    M-FSDP tags model parameters with `megatron_fsdp_param_name`. FSDP-unit
+    wrappers expose the original via `.orig_param`. With Megatron's
+    `DistributedOptimizer` the optimizer holds shadow fp32 main_params that
+    carry neither attribute — in that case there's nothing to resolve.
+    """
+    name = getattr(p, "megatron_fsdp_param_name", None)
+    if name is not None:
+        return name
+    orig = getattr(p, "orig_param", None)
+    if orig is None:
+        return None
+    return getattr(orig, "megatron_fsdp_param_name", None)
 
 
 def _is_qkv(p: torch.Tensor) -> bool:
