@@ -15,7 +15,8 @@
 """Experimental Megatron-FSDP implementation."""
 
 from .dbuffer import DBuffer
-from .fully_shard import FsdpModule, fully_shard
+from .fsdp_module import FsdpModule
+from .fully_shard import fully_shard
 from .parameter_group import ParameterGroup
 from .placement import Flat, Partial, Placement, Placements, Replicate
 
