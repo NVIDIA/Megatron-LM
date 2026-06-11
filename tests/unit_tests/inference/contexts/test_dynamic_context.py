@@ -653,6 +653,41 @@ class TestDynamicContext:
     @pytest.mark.internal
     @rounder_override(64)
     @pytest.mark.parametrize("is_hybrid_model", [False, True])
+    def test_update_requests_split_all_finished(self, is_hybrid_model: bool):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=None,
+            is_hybrid_model=is_hybrid_model,
+        )
+
+        active_requests_mask = torch.tensor([0, 0, 0], device='cpu')
+        dynamic_context.paused_request_count = 0
+        dynamic_context.total_request_count = 3
+        dynamic_context.request_kv_block_counts[0:3] = 1
+        new_block_ids = dynamic_context.kv_block_allocator.allocate_memory_blocks(3)
+        dynamic_context.request_to_kv_block_ids[0:3, 0] = new_block_ids
+
+        if is_hybrid_model:
+            dynamic_context.mamba_conv_states[:, 0:3, :, :].fill_(1.0)
+            dynamic_context.mamba_ssm_states[:, 0:3, :, :, :].fill_(1.0)
+
+        prepared_update = dynamic_context.update_requests_prepare(
+            active_requests_mask=active_requests_mask, new_tokens=torch.tensor([0, 1, 2])
+        )
+        update_result = dynamic_context.update_requests_bookkeep(prepared_update)
+
+        assert update_result is None
+        assert dynamic_context.total_request_count == 0
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    @pytest.mark.parametrize("is_hybrid_model", [False, True])
     def test_update_request(self, is_hybrid_model: bool):
 
         dynamic_context = self._get_dynamic_context(
