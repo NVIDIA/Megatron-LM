@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
-from megatron.core.inference.contexts.attention_context.mamba_metadata import SSMMetadata
+from megatron.core.inference.contexts.attention_context.ssm_metadata import SSMMetadata
 
 
 class TestMambaMetadata:
