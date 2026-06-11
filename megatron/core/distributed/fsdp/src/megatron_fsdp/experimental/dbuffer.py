@@ -42,6 +42,7 @@ def _validate_mesh_axis(mesh: DeviceMesh, axis: int) -> None:
 
 
 def _validate_placements(placements: Iterable[Placement]) -> None:
+    """Validate DBuffer placements form a supported contiguous local layout."""
     seen_flat = False
     for placement in placements:
         if not isinstance(placement, (Replicate, Partial, Flat)):
