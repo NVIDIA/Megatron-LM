@@ -1174,6 +1174,8 @@ class _HybridEPManager(_DispatchManager):
                 num_sms_preprocessing_api=self.config.moe_hybridep_num_sms_preprocessing,
             )
         )
+        if self.dispatched_probs.shape[0] != dispatched_hidden.shape[0]:
+            self.dispatched_probs = self.dispatched_probs[: dispatched_hidden.shape[0]]
         if self.moe_expert_rank_capacity_factor is not None:
             # Static-budget path only: handle[-1] is HybridEP overflow_flag when tokens were
             # dropped because permuted count exceeded num_permuted_tokens from setup_metadata.
