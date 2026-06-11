@@ -1771,7 +1771,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             # latency-bound.
             if ddp_config.bucket_size is None:
                 ddp_config.bucket_size = max(
-                    40000000, 1000000 * mpu.get_data_parallel_world_size(with_context_parallel=True)
+                    40000000, 1000000 * get_pg_size(pg_collection.dp_cp)
                 )
             # Set bucket_size to infinity if overlap_grad_reduce is False.
             if not ddp_config.overlap_grad_reduce:
@@ -1780,7 +1780,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         # Compute per-chunk bucket sizes / disable_bucketing flags. Bucketing is
         # disabled for non-first chunks, when overlap_param_gather_with_optimizer_step
         # is on, or for non-zero pipeline-parallel ranks.
-        pp_rank = mpu.get_pipeline_model_parallel_rank()
+        pp_rank = get_pg_rank(pg_collection.pp)
         per_chunk_disable_bucketing = [
             (chunk_idx > 0) or args.overlap_param_gather_with_optimizer_step
             for chunk_idx in range(len(model))
