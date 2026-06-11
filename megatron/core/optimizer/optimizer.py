@@ -95,6 +95,39 @@ def _multi_tensor_copy_this_to_that(
 
 
 param_group_identifier_keys = ('wd_mult', 'lr_mult', 'is_expert_parallel', 'is_decoupled_lr')
+MTP_GRAD_NORM_GROUP = 'mtp'
+GRAD_NORM_GROUP_ATTR = 'grad_norm_group'
+SEPARATE_GRAD_NORM_GROUPS = (MTP_GRAD_NORM_GROUP,)
+
+
+def _get_param_grad_norm_group(param: torch.nn.Parameter) -> Optional[str]:
+    """Return the separate gradient-norm group for a parameter, if any."""
+    return getattr(param, GRAD_NORM_GROUP_ATTR, None)
+
+
+def _validate_grad_norm_group(grad_norm_group: str) -> None:
+    """Raise if the grad-norm group is not registered for separate clipping."""
+    if grad_norm_group not in SEPARATE_GRAD_NORM_GROUPS:
+        raise ValueError(
+            f"Unknown grad_norm_group '{grad_norm_group}'. Register it in "
+            "SEPARATE_GRAD_NORM_GROUPS before tagging parameters with it."
+        )
+
+
+def _is_separate_grad_norm_group(grad_norm_group: Optional[str]) -> bool:
+    """Return whether the optimizer computes a separate norm for this group."""
+    if grad_norm_group is None:
+        return False
+    _validate_grad_norm_group(grad_norm_group)
+    return True
+
+
+def copy_optimizer_param_metadata(destination: torch.Tensor, source: torch.Tensor) -> None:
+    """Copy optimizer-relevant metadata when creating param views/copies."""
+    if hasattr(source, 'shared'):
+        destination.shared = source.shared
+    if hasattr(source, GRAD_NORM_GROUP_ATTR):
+        setattr(destination, GRAD_NORM_GROUP_ATTR, getattr(source, GRAD_NORM_GROUP_ATTR))
 
 
 class MegatronOptimizer(ABC):
@@ -137,19 +170,24 @@ class MegatronOptimizer(ABC):
                     params.append(param)
         return params
 
-    def get_main_grads_for_grad_norm(self) -> List[torch.Tensor]:
-        """Collects gradients for norm calculation, filtering duplicates.
+    def _filter_grads_for_norm(
+        self,
+        params: List[torch.nn.Parameter],
+        param_filter: Optional[Callable[[torch.nn.Parameter], bool]] = None,
+    ) -> List[torch.Tensor]:
+        """Filter parameter gradients for norm computation.
 
-        This method filters parameters based on whether the gradient is not None,
-        the parameter is not shared (to avoid double-counting gradients), and
-        the parameter is not a replica due to tensor model parallelism.
-
-        Returns:
-            List[torch.Tensor]: A list of gradient tensors filtered for norm calculation.
+        Filter parameters based on:
+          - param_filter predicate, when provided.
+          - grad should not be None.
+          - parameter should not be shared (i.e., grads shouldn't be double counted while
+            computing norms).
+          - should not be a replica due to tensor model parallelism.
         """
-        params = self.get_parameters()
         grads_for_norm = []
         for param in params:
+            if param_filter is not None and not param_filter(param):
+                continue
             if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8 or (
                 # Megatron-FSDP always uses decoupled_grad with FusedAdam.
                 self.config.use_precision_aware_optimizer
@@ -175,8 +213,49 @@ class MegatronOptimizer(ABC):
             )
             if grad_not_none and is_not_shared and is_not_tp_duplicate:
                 grads_for_norm.append(grad)
-
         return grads_for_norm
+
+    def get_grads_for_grad_norm(self, grad_norm_group: Optional[str] = None) -> List[torch.Tensor]:
+        """Get gradients for norm computation.
+
+        When grad_norm_group is None, returns gradients for the main norm, excluding
+        parameters that belong to a registered separate grad-norm group.
+        When grad_norm_group is given, returns only gradients from that group.
+        """
+        if grad_norm_group is not None:
+            _validate_grad_norm_group(grad_norm_group)
+            param_filter = lambda p: _get_param_grad_norm_group(p) == grad_norm_group
+        else:
+            param_filter = lambda p: not _is_separate_grad_norm_group(_get_param_grad_norm_group(p))
+        return self._filter_grads_for_norm(self.get_parameters(), param_filter=param_filter)
+
+    def has_grad_norm_group(self, grad_norm_group: str) -> bool:
+        """Whether any rank in this optimizer's grad-stats group owns grouped params.
+
+        Gradient-norm groups are tagged once at model construction and never
+        change, so the answer is computed with a single global reduction the
+        first time and cached thereafter. Gating the group-specific grad-norm
+        collectives on a *globally consistent* flag is what keeps
+        the per-step reductions balanced across ranks -- a rank may locally own
+        no shard for the group while a peer does -- while avoiding an extra empty
+        all-reduce on every step of the common case.
+        """
+        _validate_grad_norm_group(grad_norm_group)
+        if getattr(self, '_has_grad_norm_group_cache', None) is None:
+            self._has_grad_norm_group_cache = {}
+        cache = self._has_grad_norm_group_cache
+        if grad_norm_group not in cache:
+            local = False
+            for param in self.get_parameters():
+                param_grad_norm_group = _get_param_grad_norm_group(param)
+                if _is_separate_grad_norm_group(param_grad_norm_group):
+                    local = local or param_grad_norm_group == grad_norm_group
+            flag = torch.tensor([1 if local else 0], dtype=torch.int, device='cuda')
+            torch.distributed.all_reduce(
+                flag, op=torch.distributed.ReduceOp.MAX, group=self.get_grad_stats_parallel_group()
+            )
+            cache[grad_norm_group] = bool(flag.item() > 0)
+        return cache[grad_norm_group]
 
     def get_grad_stats_parallel_group(self) -> torch.distributed.ProcessGroup:
         """Process group for reducing gradient statistics (num_zeros & norm).
@@ -211,36 +290,77 @@ class MegatronOptimizer(ABC):
     @torch.no_grad()
     def get_grad_norm(self):
         """Compute and return grad norm."""
-        grads_for_norm = self.get_main_grads_for_grad_norm()
+        grads_for_norm = self.get_grads_for_grad_norm()
         total_norm = get_grad_norm_fp32(
             grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
         )
         return total_norm
 
+    @torch.no_grad()
+    def _compute_grad_norms_by_group(self) -> Dict[str, float]:
+        """Compute gradient norms for registered separate grad-norm groups."""
+        self.grad_norms_by_group = {}
+        for grad_norm_group in SEPARATE_GRAD_NORM_GROUPS:
+            if self.has_grad_norm_group(grad_norm_group):
+                grouped_grads = self.get_grads_for_grad_norm(grad_norm_group)
+                group_grad_norm = get_grad_norm_fp32(
+                    grouped_grads, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
+                )
+                self.grad_norms_by_group[grad_norm_group] = group_grad_norm
+        return self.grad_norms_by_group
+
     def clip_grad_norm(self, clip_grad: float) -> float:
-        """Compute and return grad norm, also clip grads."""
+        """Compute and return grad norm, also clip grads.
+
+        Parameters in a registered grad_norm_group are excluded from the main gradient
+        norm and clipped independently using their group norm.
+        """
+        self.grad_norms_by_group = {}
         params = self.get_parameters()
         if params:
-            grads_for_norm = self.get_main_grads_for_grad_norm()
+            grads_for_norm = self.get_grads_for_grad_norm()
         else:
             grads_for_norm = []
         grad_norm = get_grad_norm_fp32(
             grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
         )
 
-        if params:
-            clip_grad_by_total_norm_fp32(
-                params,
-                clip_grad,
-                grad_norm,
-                # Decoupled Grad
-                use_decoupled_grad=self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
-                or (
+        if clip_grad > 0.0 and params:
+            # Only reduce group grad norms when clipping can use them.
+            self._compute_grad_norms_by_group()
+
+            def use_decoupled_grad(param_list):
+                return self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8 or (
                     # Megatron-FSDP always uses decoupled_grad with FusedAdam.
                     self.config.use_precision_aware_optimizer
-                    and getattr(params[0], "__fsdp_param__", False)
-                ),
-            )
+                    and getattr(param_list[0], "__fsdp_param__", False)
+                )
+
+            main_params = []
+            params_by_grad_norm_group = {}
+            for p in params:
+                grad_norm_group = _get_param_grad_norm_group(p)
+                if _is_separate_grad_norm_group(grad_norm_group):
+                    params_by_grad_norm_group.setdefault(grad_norm_group, []).append(p)
+                else:
+                    main_params.append(p)
+            if main_params:
+                clip_grad_by_total_norm_fp32(
+                    main_params,
+                    clip_grad,
+                    grad_norm,
+                    use_decoupled_grad=use_decoupled_grad(main_params),
+                )
+            for grad_norm_group, grouped_params in params_by_grad_norm_group.items():
+                group_grad_norm = self.grad_norms_by_group.get(grad_norm_group)
+                if group_grad_norm is None:
+                    continue
+                clip_grad_by_total_norm_fp32(
+                    grouped_params,
+                    clip_grad,
+                    group_grad_norm,
+                    use_decoupled_grad=use_decoupled_grad(grouped_params),
+                )
         return grad_norm
 
     def count_zeros(self) -> float:
@@ -620,6 +740,7 @@ class MixedPrecisionOptimizer(MegatronOptimizer):
     @torch.no_grad()
     def step(self):
         timers = self.config.timers
+        self.grad_norms_by_group = {}
 
         found_inf_flag = self.prepare_grads()
         if found_inf_flag:
@@ -702,8 +823,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                             main_param = param.detach().clone().float()
                             # Copy tensor model parallel attributes.
                             tensor_parallel.copy_tensor_model_parallel_attributes(main_param, param)
-                            if hasattr(param, 'shared'):
-                                main_param.shared = param.shared
+                            copy_optimizer_param_metadata(main_param, param)
                             # Replace the optimizer params with the new fp32 copy.
                             param_group['params'][i] = main_param
 
@@ -990,6 +1110,7 @@ class FP32Optimizer(MegatronOptimizer):
         """Clip gradients (if needed) and step the base optimizer.
         Always return successful since there is no overflow."""
         timers = self.config.timers
+        self.grad_norms_by_group = {}
 
         found_inf_flag = self.prepare_grads()
         if found_inf_flag:
@@ -1411,7 +1532,7 @@ class ChainedOptimizer(MegatronOptimizer):
         if self.grads_states_parallel_group_is_shared():
             grads_for_norm = []
             for optimizer in self.chained_optimizers:
-                grads_for_norm += optimizer.get_main_grads_for_grad_norm()
+                grads_for_norm += optimizer.get_grads_for_grad_norm()
             grad_norm = get_grad_norm_fp32(
                 grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
             )
@@ -1447,15 +1568,78 @@ class ChainedOptimizer(MegatronOptimizer):
                 )
             return num_zeros_in_grad
 
+    def has_grad_norm_group(self, grad_norm_group: str) -> bool:
+        """Whether any chained optimizer owns params for a gradient-norm group.
+
+        Aggregates each sub-optimizer's globally-consistent flag; the per-optimizer
+        reductions run over each sub-optimizer's own grad-stats group, so this is
+        safe in both the shared- and non-shared-group cases.
+        """
+        _validate_grad_norm_group(grad_norm_group)
+        if getattr(self, '_has_grad_norm_group_cache', None) is None:
+            self._has_grad_norm_group_cache = {}
+        cache = self._has_grad_norm_group_cache
+        if grad_norm_group not in cache:
+            cache[grad_norm_group] = any(
+                optimizer.has_grad_norm_group(grad_norm_group)
+                for optimizer in self.chained_optimizers
+            )
+        return cache[grad_norm_group]
+
+    @torch.no_grad()
+    def _get_grad_norm_for_group(self, grad_norm_group: str):
+        """Compute gradient norm for a named parameter group."""
+        _validate_grad_norm_group(grad_norm_group)
+        if self.grads_states_parallel_group_is_shared():
+            grouped_grads = []
+            for optimizer in self.chained_optimizers:
+                grouped_grads += optimizer.get_grads_for_grad_norm(grad_norm_group)
+            return get_grad_norm_fp32(
+                grouped_grads, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
+            )
+        else:
+            group_norms = []
+            for optimizer in self.chained_optimizers:
+                grouped_grads = optimizer.get_grads_for_grad_norm(grad_norm_group)
+                norm = get_grad_norm_fp32(
+                    grouped_grads,
+                    grad_stats_parallel_group=optimizer.get_grad_stats_parallel_group(),
+                )
+                group_norms.append(norm if norm else 0.0)
+            return math.sqrt(sum([x**2 for x in group_norms]))
+
+    @torch.no_grad()
+    def _compute_grad_norms_by_group(self) -> Dict[str, float]:
+        """Compute gradient norms for registered separate grad-norm groups."""
+        self.grad_norms_by_group = {}
+        for grad_norm_group in SEPARATE_GRAD_NORM_GROUPS:
+            if self.has_grad_norm_group(grad_norm_group):
+                group_grad_norm = self._get_grad_norm_for_group(grad_norm_group)
+                self.grad_norms_by_group[grad_norm_group] = group_grad_norm
+        return self.grad_norms_by_group
+
     @torch.no_grad()
     def step(self):
-        """ChainedOptimizer will step all optimizers one by one."""
+        """ChainedOptimizer will step all optimizers one by one.
+
+        Parameters in a registered grad_norm_group are excluded from the main gradient
+        norm and clipped independently using their group norm.
+        """
+        self.grad_norms_by_group = {}
         found_inf_flag = self.prepare_grads()
         if found_inf_flag:
             return False, None, None
 
         grad_norm = self.get_grad_norm()
         should_skip_update = False
+
+        should_clip = any(
+            not (hasattr(optimizer, 'is_stub_optimizer') and optimizer.is_stub_optimizer)
+            and optimizer.config.clip_grad > 0.0
+            for optimizer in self.chained_optimizers
+        )
+        if should_clip:
+            self._compute_grad_norms_by_group()
 
         # Clip gradients.
         for optimizer in self.chained_optimizers:
@@ -1464,22 +1648,46 @@ class ChainedOptimizer(MegatronOptimizer):
             parameters = optimizer.get_parameters()
             if len(parameters) == 0:
                 continue
-            if optimizer.config.clip_grad > 0.0:
-                clip_grad_by_total_norm_fp32(
-                    parameters,
-                    max_norm=optimizer.config.clip_grad,
-                    total_norm=grad_norm,
-                    use_decoupled_grad=(
-                        optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
-                        or (
-                            # Megatron-FSDP always uses decoupled_grad with FusedAdam.
-                            self.config.use_precision_aware_optimizer
-                            and getattr(parameters[0], "__fsdp_param__", False)
-                        )
-                    ),
-                )
 
-            if grad_norm > optimizer.config.grad_norm_skip_threshold:
+            use_fsdp_decoupled_grad = (
+                # Megatron-FSDP always uses decoupled_grad with FusedAdam.
+                optimizer.config.use_precision_aware_optimizer
+                and getattr(parameters[0], "__fsdp_param__", False)
+            )
+            use_decoupled_grad = (
+                optimizer.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8
+                or use_fsdp_decoupled_grad
+            )
+
+            main_params = []
+            params_by_grad_norm_group = {}
+            for p in parameters:
+                grad_norm_group = _get_param_grad_norm_group(p)
+                if _is_separate_grad_norm_group(grad_norm_group):
+                    params_by_grad_norm_group.setdefault(grad_norm_group, []).append(p)
+                else:
+                    main_params.append(p)
+
+            if optimizer.config.clip_grad > 0.0:
+                if main_params:
+                    clip_grad_by_total_norm_fp32(
+                        main_params,
+                        max_norm=optimizer.config.clip_grad,
+                        total_norm=grad_norm,
+                        use_decoupled_grad=use_decoupled_grad,
+                    )
+                for grad_norm_group, grouped_params in params_by_grad_norm_group.items():
+                    group_grad_norm = self.grad_norms_by_group.get(grad_norm_group)
+                    if group_grad_norm is None:
+                        continue
+                    clip_grad_by_total_norm_fp32(
+                        grouped_params,
+                        max_norm=optimizer.config.clip_grad,
+                        total_norm=group_grad_norm,
+                        use_decoupled_grad=use_decoupled_grad,
+                    )
+
+            if grad_norm > optimizer.config.grad_norm_skip_threshold and main_params:
                 log_single_rank(
                     logger, logging.INFO, "skipping grad norm because it's too large %s", grad_norm
                 )
