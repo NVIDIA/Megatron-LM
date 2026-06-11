@@ -70,6 +70,15 @@ BASE_PATH = pathlib.Path(__file__).parent.resolve()
     help="Run one job as dependency to others as to warm up cache",
 )
 @click.option(
+    "--skip-local-image-prepare",
+    is_flag=True,
+    show_default=True,
+    required=False,
+    type=bool,
+    default=False,
+    help="Use workload-local-image-path without generating a child-pipeline prepare_sqsh_image job.",
+)
+@click.option(
     "--cadence",
     required=False,
     type=str,
@@ -100,6 +109,7 @@ def main(
     wandb_experiment: Optional[str] = None,
     enable_lightweight_mode: bool = False,
     enable_warmup: Optional[bool] = None,
+    skip_local_image_prepare: bool = False,
     cadence: Optional[str] = None,
 ):
     # Treat empty string as "no cadence filter" so callers can wire shell
@@ -161,7 +171,11 @@ def main(
 
     else:
         list_of_test_cases = sorted(list_of_test_cases, key=lambda x: x["spec"]["model"])
-        prepare_job_name = "prepare_sqsh_image" if workload_local_image_path is not None else None
+        prepare_job_name = (
+            "prepare_sqsh_image"
+            if workload_local_image_path is not None and not skip_local_image_prepare
+            else None
+        )
         model_stages = sorted(
             list(set([test_case["spec"]["model"] for test_case in list_of_test_cases]))
         )

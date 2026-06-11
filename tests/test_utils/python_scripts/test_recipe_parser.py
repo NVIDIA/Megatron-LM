@@ -60,5 +60,7 @@ def test_resolve_workload_local_image_sources_uses_build_source_image():
 
 
 def test_resolve_local_image_prepare_cluster_uses_same_site_cpu_cluster():
+    assert recipe_parser.resolve_local_image_prepare_cluster("dgxa100_dracooci") == "cpu_dracooci"
     assert recipe_parser.resolve_local_image_prepare_cluster("dgxh100_coreweave") == "cpu_coreweave"
+    assert recipe_parser.resolve_local_image_prepare_cluster("dgxgb200_oci-hsg") == "cpu_oci-hsg"
     assert recipe_parser.resolve_local_image_prepare_cluster("cpu_coreweave") == "cpu_coreweave"
