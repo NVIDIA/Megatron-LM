@@ -1994,7 +1994,10 @@ def setup_model_and_optimizer(
         # of optimizer class. See `megatron_fsdp.dump_parameters` for the schema.
         dump_path = os.environ.get("DUMP_OPTIMIZER_PARAMETERS_OUTPUT")
         if dump_path:
-            dump_optimizer_parameters(optimizer, dump_path)
+            # `MegatronOptimizer` wraps an inner `torch.optim.Optimizer` and
+            # exposes it at `.optimizer`. Unwrap so the helper receives a
+            # real `torch.optim.Optimizer` (matches its type signature).
+            dump_optimizer_parameters(optimizer.optimizer, dump_path)
 
     one_logger and one_logger.log_metrics({"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()})
 
