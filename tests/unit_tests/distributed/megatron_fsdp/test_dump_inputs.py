@@ -6,8 +6,6 @@ Run with torchrun:
     torchrun --nproc_per_node=2 -m pytest test_dump_inputs.py -v
 """
 
-from __future__ import annotations
-
 import json
 import pathlib
 

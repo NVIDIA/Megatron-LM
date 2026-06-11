@@ -25,8 +25,6 @@ handled — they're dumped with `local_shape == global_shape` and the
 mesh/placements fields set to None.
 """
 
-from __future__ import annotations
-
 import json
 import logging
 import os
