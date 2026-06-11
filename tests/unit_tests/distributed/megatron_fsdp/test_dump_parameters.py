@@ -83,10 +83,10 @@ def test_dump_optimizer_parameters_plain_tensor(distributed_setup, tmp_path: pat
     param = torch.randn(4, 5, requires_grad=True, device=distributed_setup.device)
     optimizer = torch.optim.SGD([param], lr=0.01)
 
-    out_path = tmp_path / f"plain_rank{distributed_setup.rank}.json"
+    out_path = tmp_path / "plain.json"
     dump_optimizer_parameters(optimizer, out_path)
 
-    written = out_path.parent / f"{out_path.name}.rank{distributed_setup.rank}.json"
+    written = out_path.with_suffix(f".rank{distributed_setup.rank}.json")
     assert written.exists()
     spec = json.loads(written.read_text())
     p = spec["params"][0]
