@@ -339,9 +339,9 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.is_hybrid_model = ssm_inference_state_config is not None
         if self.is_hybrid_model:
             self.ssm_conv_states_shape = ssm_inference_state_config.conv_states_shape
-            self.ssm_recurrent_states_shape = ssm_inference_state_config.ssm_states_shape
+            self.ssm_recurrent_states_shape = ssm_inference_state_config.recurrent_states_shape
             self.ssm_conv_states_dtype = ssm_inference_state_config.conv_states_dtype
-            self.ssm_recurrent_states_dtype = ssm_inference_state_config.ssm_states_dtype
+            self.ssm_recurrent_states_dtype = ssm_inference_state_config.recurrent_states_dtype
             self.ssm_chunk_size = ssm_inference_state_config.ssm_chunk_size
 
             # For hybrid models, the layer map converts the global layer index to the
@@ -1607,9 +1607,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             max_slots=max_slots,
             num_ssm_layers=self.num_ssm_layers,
             conv_states_shape=self.ssm_conv_states_shape,
-            ssm_states_shape=self.ssm_recurrent_states_shape,
+            recurrent_states_shape=self.ssm_recurrent_states_shape,
             conv_states_dtype=self.ssm_conv_states_dtype,
-            ssm_states_dtype=self.ssm_recurrent_states_dtype,
+            recurrent_states_dtype=self.ssm_recurrent_states_dtype,
         )
         self.kv_block_allocator.on_blocks_deregistered = (
             self.ssm_slot_allocator.on_kv_blocks_deregistered

@@ -28,9 +28,9 @@ class SSMSlotAllocator:
         max_slots: Maximum number of cache slots.
         num_ssm_layers: Number of SSM layers in the model.
         conv_states_shape: Shape of per-slot conv state (excluding layer/slot dims).
-        ssm_states_shape: Shape of per-slot SSM state (excluding layer/slot dims).
+        recurrent_states_shape: Shape of per-slot recurrent state (excluding layer/slot dims).
         conv_states_dtype: Dtype for conv state tensors.
-        ssm_states_dtype: Dtype for SSM state tensors.
+        recurrent_states_dtype: Dtype for recurrent state tensors.
     """
 
     def __init__(
@@ -39,9 +39,9 @@ class SSMSlotAllocator:
         max_slots: int,
         num_ssm_layers: int,
         conv_states_shape: tuple,
-        ssm_states_shape: tuple,
+        recurrent_states_shape: tuple,
         conv_states_dtype: torch.dtype,
-        ssm_states_dtype: torch.dtype,
+        recurrent_states_dtype: torch.dtype,
     ):
         self.context = context
         self.max_slots = max_slots
@@ -64,9 +64,9 @@ class SSMSlotAllocator:
             dtype=conv_states_dtype,
             device=gpu_device,
         )
-        self.ssm_states = torch.zeros(
-            (num_ssm_layers, max_slots) + ssm_states_shape,
-            dtype=ssm_states_dtype,
+        self.recurrent_states = torch.zeros(
+            (num_ssm_layers, max_slots) + recurrent_states_shape,
+            dtype=recurrent_states_dtype,
             device=gpu_device,
         )
 
@@ -102,9 +102,9 @@ class SSMSlotAllocator:
 
         # Pre-allocated output buffers for CUDA graph compatible extraction (GPU).
         self.max_intermediate_count = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * context.max_requests
-        self.intermediate_ssm_out = torch.zeros(
-            (num_ssm_layers, self.max_intermediate_count) + ssm_states_shape,
-            dtype=ssm_states_dtype,
+        self.intermediate_recurrent_out = torch.zeros(
+            (num_ssm_layers, self.max_intermediate_count) + recurrent_states_shape,
+            dtype=recurrent_states_dtype,
             device=gpu_device,
         )
         self.intermediate_conv_out = torch.zeros(
@@ -317,7 +317,7 @@ class SSMSlotAllocator:
         """
         slot = self.block_to_slot[block_id].item()
         assert slot >= 0, f"Block {block_id} has no linear attention cache slot"
-        self.ssm_states[layer_idx, slot].copy_(ssm_state)
+        self.recurrent_states[layer_idx, slot].copy_(ssm_state)
         self.conv_states[layer_idx, slot].copy_(conv_state)
 
     def store_from_live_batch(self, slots: list, request_indices: list) -> None:
@@ -339,7 +339,7 @@ class SSMSlotAllocator:
         ssm_idx_tensor = torch.tensor(ssm_indices, dtype=torch.int64, device=device)
         # Fancy-indexed copy (2 kernel launches instead of 2E)
         self.conv_states[:, slot_tensor] = self.context.ssm_conv_states[:, ssm_idx_tensor]
-        self.ssm_states[:, slot_tensor] = self.context.ssm_recurrent_states[:, ssm_idx_tensor]
+        self.recurrent_states[:, slot_tensor] = self.context.ssm_recurrent_states[:, ssm_idx_tensor]
 
     def restore_to_live(self, request_idx: int, block_id: int) -> bool:
         """Copy all layers from cache slot to live request state.
@@ -356,7 +356,7 @@ class SSMSlotAllocator:
             return False
         ssm_idx = self.context.ssm_metadata.request_to_ssm_state_idx[request_idx].item()
         self.context.ssm_conv_states[:, ssm_idx].copy_(self.conv_states[:, slot])
-        self.context.ssm_recurrent_states[:, ssm_idx].copy_(self.ssm_states[:, slot])
+        self.context.ssm_recurrent_states[:, ssm_idx].copy_(self.recurrent_states[:, slot])
         return True
 
     # =========================================================================
@@ -591,15 +591,15 @@ class SSMSlotAllocator:
         Uses fancy-indexed GPU D2D copy (2 kernel launches instead of 2N).
 
         Args:
-            src_offsets: Source indices into intermediate_ssm_out/intermediate_conv_out.
+            src_offsets: Source indices into intermediate_recurrent_out/intermediate_conv_out.
             slots: Destination cache slot indices.
         """
         if not src_offsets:
             return
-        device = self.ssm_states.device
+        device = self.recurrent_states.device
         src_idx = torch.tensor(src_offsets, dtype=torch.int64, device=device)
         dst_idx = torch.tensor(slots, dtype=torch.int64, device=device)
-        self.ssm_states[:, dst_idx] = self.intermediate_ssm_out[:, src_idx]
+        self.recurrent_states[:, dst_idx] = self.intermediate_recurrent_out[:, src_idx]
         self.conv_states[:, dst_idx] = self.intermediate_conv_out[:, src_idx]
 
     def _clear_intermediate_state(self) -> None:
@@ -628,7 +628,7 @@ class SSMSlotAllocator:
         self.free_slots = torch.arange(self.max_slots, dtype=torch.int32, device='cpu')
         self.free_count = self.max_slots
         self.hash_to_block_id.clear()
-        self.intermediate_ssm_out.zero_()
+        self.intermediate_recurrent_out.zero_()
         self.intermediate_conv_out.zero_()
         self._intermediate_offsets_cpu.fill_(0)
         self._intermediate_counts_cpu.fill_(0)

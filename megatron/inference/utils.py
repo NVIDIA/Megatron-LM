@@ -316,7 +316,7 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
     ssm_inference_state_config = SSMInferenceStateConfig.from_model(
         model,
         conv_states_dtype=args.ssm_inference_conv_states_dtype,
-        ssm_states_dtype=args.ssm_inference_recurrent_states_dtype,
+        recurrent_states_dtype=args.ssm_inference_recurrent_states_dtype,
     )
     pg_collection = get_attr_wrapped_model(model, "pg_collection")
 

@@ -14,30 +14,30 @@ from megatron.core.utils import get_attr_wrapped_model
 @dataclass
 class SSMInferenceStateConfig:
     """
-    Config for initializing Mamba model inference state tensors.
+    Config for initializing SSM model inference state tensors.
 
     Note that we maintain separate metadata for decode, regular prefill, and
-    chunked prefill requests because the Mamba kernels do not yet support mixing
+    chunked prefill requests because the SSM kernels do not yet support mixing
     these. Once the kernels have been updated we can simplify this code.
     """
 
     layer_type_list: List[str]
     """
-    A list of strings that indicates the layer type (Mamba / Attention / MLP) for each layer.
+    A list of strings that indicates the layer type (SSM / Attention / MLP) for each layer.
     See `megatron/core/models/hybrid/hybrid_layer_allocation.py` for the list of symbols.
     """
 
     conv_states_shape: Tuple[int]
-    """Mamba conv states shape per request."""
+    """Conv states shape per request."""
 
-    ssm_states_shape: Tuple[int]
-    """Mamba SSM states shape per request."""
+    recurrent_states_shape: Tuple[int]
+    """Recurrent states shape per request."""
 
     conv_states_dtype: torch.dtype
-    """The dtype to use for the Mamba conv state tensor. Defaults to the model dtype."""
+    """The dtype to use for the conv state tensor. Defaults to the model dtype."""
 
-    ssm_states_dtype: torch.dtype
-    """The dtype to use for the Mamba SSM state tensor. Defaults to the model dtype."""
+    recurrent_states_dtype: torch.dtype
+    """The dtype to use for the recurrent state tensor. Defaults to the model dtype."""
 
     ssm_chunk_size: int = 128
     """The chunk size used by the SSM Triton kernels."""
@@ -47,9 +47,9 @@ class SSMInferenceStateConfig:
         cls,
         model: MegatronModule,
         conv_states_dtype: Optional[torch.dtype] = None,
-        ssm_states_dtype: Optional[torch.dtype] = None,
+        recurrent_states_dtype: Optional[torch.dtype] = None,
     ) -> Optional["SSMInferenceStateConfig"]:
-        """Returns Mamba inference state config from the model if it is a hybrid model."""
+        """Returns SSM inference state config from the model if it is a hybrid model."""
         from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 
         decoder = get_attr_wrapped_model(model, "decoder")
@@ -60,8 +60,8 @@ class SSMInferenceStateConfig:
             )
             if conv_states_dtype is None:
                 conv_states_dtype = model.config.params_dtype
-            if ssm_states_dtype is None:
-                ssm_states_dtype = model.config.params_dtype
+            if recurrent_states_dtype is None:
+                recurrent_states_dtype = model.config.params_dtype
             ssm_chunk_size = 128
             for layer_type, layer in zip(decoder.layer_type_list, decoder.layers):
                 if layer_type == Symbols.MAMBA and hasattr(layer, 'mixer'):
@@ -70,9 +70,9 @@ class SSMInferenceStateConfig:
             return cls(
                 layer_type_list=layer_type_list,
                 conv_states_shape=ssm_conv_states_shape,
-                ssm_states_shape=ssm_recurrent_states_shape,
+                recurrent_states_shape=ssm_recurrent_states_shape,
                 conv_states_dtype=conv_states_dtype,
-                ssm_states_dtype=ssm_states_dtype,
+                recurrent_states_dtype=recurrent_states_dtype,
                 ssm_chunk_size=ssm_chunk_size,
             )
         return None

@@ -611,7 +611,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
         batch_indices = None
         intermediate_chunk_indices = None
         intermediate_abs_positions = None
-        intermediate_ssm_out = None
+        intermediate_recurrent_out = None
         intermediate_conv_out = None
         conv_gather_offsets = None
         cu_chunk_seqlens = None
@@ -647,7 +647,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
             conv_seq_start = metadata.conv_seq_start
             if slot_allocator is not None:
                 mamba_layer_idx = context.layer_map[self.layer_number - self.pp_layer_offset - 1]
-                intermediate_ssm_out = slot_allocator.intermediate_ssm_out[mamba_layer_idx]
+                intermediate_recurrent_out = slot_allocator.intermediate_recurrent_out[mamba_layer_idx]
                 intermediate_conv_out = slot_allocator.intermediate_conv_out[mamba_layer_idx]
 
         is_dynamic_batching = seq_idx is not None
@@ -829,10 +829,10 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
             )
 
             if intermediate_chunk_indices is not None:
-                ssm_varlen_states, intermediate_ssm_states = ssm_varlen_result
+                ssm_varlen_states, intermediate_recurrent_states = ssm_varlen_result
             else:
                 ssm_varlen_states = ssm_varlen_result
-                intermediate_ssm_states = None
+                intermediate_recurrent_states = None
 
             y = y.unsqueeze(0)
             z = z.unsqueeze(0)
@@ -844,9 +844,9 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
             # The destination buffers are sized to the global max_intermediate_count
             # but we only fill the per-graph-bucket prefix; readers consult
             # per_request_intermediate_counts to know the real count.
-            if intermediate_chunk_indices is not None and intermediate_ssm_out is not None:
-                n = intermediate_ssm_states.shape[0]
-                intermediate_ssm_out[:n].copy_(intermediate_ssm_states)
+            if intermediate_chunk_indices is not None and intermediate_recurrent_out is not None:
+                n = intermediate_recurrent_states.shape[0]
+                intermediate_recurrent_out[:n].copy_(intermediate_recurrent_states)
 
                 # Vectorized conv state extraction
                 # conv_gather_offsets: [d_conv] = [-d_conv, ..., -1]
@@ -927,7 +927,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
         ssm_state: torch.Tensor,
         batch_indices: Optional[torch.Tensor] = None,
         intermediate_conv_state: Optional[torch.Tensor] = None,
-        intermediate_ssm_state: Optional[torch.Tensor] = None,
+        intermediate_recurrent_state: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Performs SSM computation for inference decode step.
@@ -941,7 +941,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
             batch_indices: A map from batch id to position in the Mamba state tensors.
             intermediate_conv_state: Optional buffer for storing conv state at each
                 sequence step (for speculative decoding rollback).
-            intermediate_ssm_state: Optional buffer for storing SSM state at each
+            intermediate_recurrent_state: Optional buffer for storing SSM state at each
                 sequence step (for speculative decoding rollback).
 
         Returns:
@@ -1081,7 +1081,7 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
                 dt_bias=dt_bias,
                 dt_softplus=True,
                 state_batch_indices=batch_indices,
-                intermediate_ssm_states=intermediate_ssm_state,  # SSM only
+                intermediate_recurrent_states=intermediate_recurrent_state,  # SSM only
             )
             y = rearrange(y, "b s h p -> b s (h p)")
 
@@ -1091,10 +1091,10 @@ class MambaMixer(SSMDynamicInferenceMixin, MegatronModule):
         return y
 
     def ssm_state_shapes_per_request(self) -> Tuple[Tuple[int], Tuple[int]]:
-        """Returns the Mamba conv and ssm states shapes per request."""
+        """Returns the conv and recurrent states shapes per request."""
         conv_states_shape = (self.conv1d_weight.shape[0], self.d_conv)
-        ssm_states_shape = (self.nheads_local_tp, self.headdim, self.d_state)
-        return (conv_states_shape, ssm_states_shape)
+        recurrent_states_shape = (self.nheads_local_tp, self.headdim, self.d_state)
+        return (conv_states_shape, recurrent_states_shape)
 
     def _get_states_from_cache(self, inference_context, batch_size, *, inference_params=None):
         """Initializes or retrieves the SSM state tensors from the cache.

@@ -294,7 +294,7 @@ def selective_state_update(
     dt_bias=None,
     dt_softplus=False,
     state_batch_indices=None,
-    intermediate_ssm_states=None,
+    intermediate_recurrent_states=None,
 ):
     """
     Argument:
@@ -308,7 +308,7 @@ def selective_state_update(
         D: (dim,) or (nheads, dim)
         z: Matches x
         dt_bias: (dim,) or (nheads, dim)
-        intermediate_ssm_states: Optional buffer of shape (batch, seqlen, nheads, dim, dstate)
+        intermediate_recurrent_states: Optional buffer of shape (batch, seqlen, nheads, dim, dstate)
                                  or (batch, seqlen, dim, dstate)
     Return:
         out: shape matches x
@@ -353,20 +353,20 @@ def selective_state_update(
         dt_bias = dt_bias.unsqueeze(0)
 
     # Set up Intermediate State standardization
-    if intermediate_ssm_states is not None:
-        if not has_heads and intermediate_ssm_states.dim() == 4:
-            intermediate_ssm_states = intermediate_ssm_states.unsqueeze(
+    if intermediate_recurrent_states is not None:
+        if not has_heads and intermediate_recurrent_states.dim() == 4:
+            intermediate_recurrent_states = intermediate_recurrent_states.unsqueeze(
                 2
             )  # (batch, seqlen, 1, dim, dstate)
         int_state_strides = (
-            intermediate_ssm_states.stride(0),
-            intermediate_ssm_states.stride(1),
-            intermediate_ssm_states.stride(2),
-            intermediate_ssm_states.stride(3),
-            intermediate_ssm_states.stride(4),
+            intermediate_recurrent_states.stride(0),
+            intermediate_recurrent_states.stride(1),
+            intermediate_recurrent_states.stride(2),
+            intermediate_recurrent_states.stride(3),
+            intermediate_recurrent_states.stride(4),
         )
     else:
-        intermediate_ssm_states = x  # Dummy pointer
+        intermediate_recurrent_states = x  # Dummy pointer
         int_state_strides = (0, 0, 0, 0, 0)
 
     batch, seq_len, nheads, dim = x.shape
@@ -417,7 +417,7 @@ def selective_state_update(
             z,
             out,
             state_batch_indices,
-            intermediate_ssm_states,
+            intermediate_recurrent_states,
             batch,
             seq_len,
             nheads,

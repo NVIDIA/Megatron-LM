@@ -42,9 +42,9 @@ class PrefixCachingTestBase:
         return SSMInferenceStateConfig(
             layer_type_list=["*", "M", "*", "M"],
             conv_states_shape=(4, 8),
-            ssm_states_shape=(4, 16),
+            recurrent_states_shape=(4, 16),
             conv_states_dtype=torch.float32,
-            ssm_states_dtype=torch.float32,
+            recurrent_states_dtype=torch.float32,
         )
 
     def _ctx(
@@ -632,7 +632,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         block_id = ctx.request_to_kv_block_ids[0][0].item()
         slot = ctx.ssm_slot_allocator.allocate_slots_batch([block_id])[0]
         for layer_idx in range(ctx.num_ssm_layers):
-            ssm = torch.ones_like(ctx.ssm_slot_allocator.ssm_states[layer_idx, slot]) * (
+            ssm = torch.ones_like(ctx.ssm_slot_allocator.recurrent_states[layer_idx, slot]) * (
                 layer_idx + 1
             )
             conv = torch.ones_like(ctx.ssm_slot_allocator.conv_states[layer_idx, slot]) * (
@@ -842,9 +842,9 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         # intermediate output buffers are pre-allocated
         ctx4 = self._mctx()
         msa4 = ctx4.ssm_slot_allocator
-        assert msa4.intermediate_ssm_out.shape[0] == ctx4.num_ssm_layers
+        assert msa4.intermediate_recurrent_out.shape[0] == ctx4.num_ssm_layers
         assert msa4.intermediate_conv_out.shape[0] == ctx4.num_ssm_layers
-        assert msa4.intermediate_ssm_out.shape[1] == msa4.max_intermediate_count
+        assert msa4.intermediate_recurrent_out.shape[1] == msa4.max_intermediate_count
 
         # store_from_live copies all layers
         ctx5 = self._mctx()
@@ -1066,7 +1066,7 @@ class TestSSMSlotAllocator(PrefixCachingTestBase):
 
         # Write known patterns to intermediate output buffers
         for layer in range(ctx.num_ssm_layers):
-            msa.intermediate_ssm_out[layer, 0] = layer + 1.0
+            msa.intermediate_recurrent_out[layer, 0] = layer + 1.0
             msa.intermediate_conv_out[layer, 0] = layer + 100.0
 
         # Set up intermediate offsets: 1 intermediate at src_offset=0
