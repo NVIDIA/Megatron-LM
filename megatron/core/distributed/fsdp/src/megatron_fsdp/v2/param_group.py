@@ -194,6 +194,10 @@ class ParameterGroup:
             ):
                 _free_storage(tensor)
 
+        for weight_buffer in (self.model_weight_buffer, self.transpose_weight_buffer):
+            if weight_buffer is not None and not weight_buffer.is_distributed:
+                weight_buffer._bind_buffer_to_params(weight_buffer.data)
+
         # Create gradient buffer
         if self.requires_grad:
             main_grads_dtype = self.mp_policy.main_grads_dtype_for_param(self.params[0])

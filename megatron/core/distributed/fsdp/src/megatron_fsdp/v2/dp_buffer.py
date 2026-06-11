@@ -420,6 +420,8 @@ class DataParallelBuffer:
         assert data.dtype == self.dtype, f"dtype mismatch: {data.dtype} vs {self.dtype}"
         assert data.numel() == self.data_size, f"size mismatch: {data.numel()} vs {self.data_size}"
         self.data = data
+        if self.buffer_role in ("model_weight", "transpose_weight") and not self.is_distributed:
+            self.data._dirty = False
 
     def check_no_local_overlap(self, label: str = "") -> bool:
         """
