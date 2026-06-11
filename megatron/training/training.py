@@ -1985,6 +1985,19 @@ def setup_model_and_optimizer(
         )
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
+        # Optional: dump per-rank optimizer parameter sharding for fixture capture.
+        # Gated by `DUMP_OPTIMIZER_PARAMETERS_OUTPUT` env var; each rank writes a
+        # JSON snapshot under that path. Optimizer-agnostic — fires regardless
+        # of optimizer class. See `megatron_fsdp.dump_parameters` for the schema.
+        _dump_path = os.environ.get("DUMP_OPTIMIZER_PARAMETERS_OUTPUT")
+        if _dump_path:
+            from megatron.core.distributed.fsdp.src.megatron_fsdp.dump_parameters import (
+                dump_optimizer_parameters,
+            )
+
+            inner = getattr(optimizer, "optimizer", optimizer)
+            dump_optimizer_parameters(inner, _dump_path)
+
     one_logger and one_logger.log_metrics({"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()})
 
     if args.moe_use_upcycling:
