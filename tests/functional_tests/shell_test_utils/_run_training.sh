@@ -148,9 +148,22 @@ else
     # Split into array while preserving quotes
     eval "TRAINING_PARAMS_ARRAY=($TRAINING_PARAMS_FROM_CONFIG)"
     if [[ -n "${SLURM_JOB_END_TIME:-}" && -n "${SLURM_JOB_START_TIME:-}" ]]; then
+        # Leave a buffer before SLURM kills the job so training can exit
+        # gracefully. For normal (long) windows this is window - 15 min. For
+        # short windows (e.g. L0-smoke with a tight --time-limit) a flat 15 min
+        # buffer would go negative and make training exit after a single step,
+        # so fall back to 80% of the window with a 1-minute floor.
+        WINDOW_MIN=$((($SLURM_JOB_END_TIME - $SLURM_JOB_START_TIME) / 60))
+        BUFFER_MIN=15
+        if ((WINDOW_MIN > BUFFER_MIN)); then
+            EXIT_DURATION_MIN=$((WINDOW_MIN - BUFFER_MIN))
+        else
+            EXIT_DURATION_MIN=$((WINDOW_MIN * 4 / 5))
+            ((EXIT_DURATION_MIN < 1)) && EXIT_DURATION_MIN=1
+        fi
         PARAMS=(
             "--exit-duration-in-mins"
-            $((($SLURM_JOB_END_TIME - $SLURM_JOB_START_TIME) / 60 - 15))
+            "$EXIT_DURATION_MIN"
         )
     fi
 fi
@@ -170,7 +183,7 @@ MASTER_ADDR=${MASTER_ADDR:-localhost}
 MASTER_PORT=${MASTER_PORT:-6000}
 NUM_NODES=${NUM_NODES:-${SLURM_NNODES:-1}}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
-NODE_RANK=${SLURM_NODEID:-${SLURM_NODEID:-0}}
+NODE_RANK=${SLURM_NODEID:-${NODE_RANK:-0}}
 LAST_RANK=$((GPUS_PER_NODE - 1))
 export LOG_DIR=$OUTPUT_PATH/logs/$REPEAT
 mkdir -p $LOG_DIR

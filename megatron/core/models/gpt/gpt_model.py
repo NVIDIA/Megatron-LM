@@ -9,6 +9,8 @@ from torch import Tensor
 from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.extensions.transformer_engine import TELMHeadColumnParallelLinear
+from megatron.core.fp8_utils import is_mxfp8_output_proj_active
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings import YarnRotaryEmbedding
@@ -26,6 +28,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer.enums import ModelType
+from megatron.core.transformer.moe.paged_stash import paged_stash_init_chunk_handler
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionBlock,
     mtp_on_this_rank,
@@ -247,7 +250,12 @@ class GPTModel(LanguageModule):
                 self.embedding_activation_buffer = None
                 self.grad_output_buffer = None
 
-            self.output_layer = tensor_parallel.ColumnParallelLinear(
+            output_layer_cls = (
+                TELMHeadColumnParallelLinear
+                if is_mxfp8_output_proj_active(config)
+                else tensor_parallel.ColumnParallelLinear
+            )
+            self.output_layer = output_layer_cls(
                 config.hidden_size,
                 self.vocab_size,
                 config=config,
@@ -482,6 +490,12 @@ class GPTModel(LanguageModule):
                     off_interface.mark_not_offloadable(param)
             self.disable_param_offloading = False
 
+    def preprocess_for_paged_stash(self):
+        """Preprocess for paged stash."""
+        return paged_stash_init_chunk_handler(
+            vp_size=self.config.virtual_pipeline_model_parallel_size, vp_stage=self.vp_stage
+        )
+
     def forward(
         self,
         input_ids: Tensor,
@@ -519,6 +533,9 @@ class GPTModel(LanguageModule):
         """
         if self.config.fine_grained_activation_offloading:
             self.preprocess_for_fine_grained_offloading()
+
+        if self.config.moe_paged_stash:
+            self.preprocess_for_paged_stash()
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
@@ -665,8 +682,10 @@ class GPTModel(LanguageModule):
                     compute_language_model_loss=self.compute_language_model_loss,
                     config=self.config,
                     cp_group=self.pg_collection.cp,
+                    tp_group=self.tp_group,
                     packed_seq_params=packed_seq_params,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
+                    input_ids=input_ids,
                 )
         sequence_parallel_override = False
 
@@ -803,6 +822,8 @@ class GPTModel(LanguageModule):
 
         if self.config.fine_grained_activation_offloading:
             self.preprocess_for_fine_grained_offloading()
+        if self.config.moe_paged_stash:
+            self.preprocess_for_paged_stash()
 
         from ..common.model_chunk_schedule_plan import TransformerModelChunkSchedulePlan
 

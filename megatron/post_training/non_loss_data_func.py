@@ -2,10 +2,10 @@
 
 import torch
 
+from megatron.core.utils import unwrap_model
 from megatron.post_training.generate import simple_speculative_generate
 from megatron.post_training.utils import get_mtbench_chat_data
 from megatron.training import get_tokenizer
-from megatron.training.utils import unwrap_model
 
 
 def report_draft_acceptance_length(model, osl: int = 64, draft_steps: int = 7):
