@@ -8,11 +8,8 @@ from typing import Optional, Tuple, Union
 import modelopt
 import modelopt.torch.opt as mto
 import torch.nn as nn
-from modelopt.torch.opt.plugins import (
-    _load_extra_state_from_sharded_checkpoint,
-    restore_sharded_modelopt_state as restore_sharded_modelopt_state_legacy,
-)
-
+from modelopt.torch.opt.plugins import restore_sharded_modelopt_state as restore_sharded_modelopt_state_legacy
+from modelopt.torch.opt.plugins.mcore_dist_checkpointing import _load_extra_state_from_sharded_checkpoint
 
 from megatron.core import dist_checkpointing
 from megatron.core.utils import get_torch_version, is_torch_min_version, unwrap_model
