@@ -38,7 +38,7 @@ from torch.distributed.tensor import DTensor
 logger = logging.getLogger(__name__)
 
 
-def dump_optimizer_inputs(
+def dump_optimizer_parameters(
     optimizer: torch.optim.Optimizer,
     out_path: str | os.PathLike,
     extra_meta: dict[str, Any] | None = None,
@@ -57,7 +57,7 @@ def dump_optimizer_inputs(
     """
     if len(optimizer.param_groups) != 1:
         raise ValueError(
-            f"dump_optimizer_inputs expects exactly one parameter group; "
+            f"dump_optimizer_parameters expects exactly one parameter group; "
             f"got {len(optimizer.param_groups)}."
         )
 

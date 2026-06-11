@@ -1,9 +1,9 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-"""Unit tests for `megatron_fsdp.dump_inputs.dump_optimizer_inputs`.
+"""Unit tests for `megatron_fsdp.dump_parameters.dump_optimizer_parameters`.
 
 Run with torchrun:
-    torchrun --nproc_per_node=4 -m pytest test_dump_inputs.py -v
-    torchrun --nproc_per_node=2 -m pytest test_dump_inputs.py -v
+    torchrun --nproc_per_node=4 -m pytest test_dump_parameters.py -v
+    torchrun --nproc_per_node=2 -m pytest test_dump_parameters.py -v
 """
 
 import json
@@ -15,7 +15,9 @@ import torch.distributed as dist
 from torch.distributed._tensor import Replicate, Shard, distribute_tensor
 from torch.distributed.device_mesh import init_device_mesh
 
-from megatron.core.distributed.fsdp.src.megatron_fsdp.dump_inputs import dump_optimizer_inputs
+from megatron.core.distributed.fsdp.src.megatron_fsdp.dump_parameters import (
+    dump_optimizer_parameters,
+)
 
 
 def _ensure_process_group(distributed_setup) -> None:
@@ -28,7 +30,7 @@ def _ensure_process_group(distributed_setup) -> None:
     )
 
 
-def test_dump_optimizer_inputs_dtensor(distributed_setup, tmp_path: pathlib.Path) -> None:
+def test_dump_optimizer_parameters_dtensor(distributed_setup, tmp_path: pathlib.Path) -> None:
     """Dump captures per-param mesh, placements, local/global shape, dtype, attrs."""
     _ensure_process_group(distributed_setup)
     mesh = init_device_mesh(
@@ -44,7 +46,7 @@ def test_dump_optimizer_inputs_dtensor(distributed_setup, tmp_path: pathlib.Path
     optimizer = torch.optim.SGD([sharded, replicated], lr=0.1, momentum=0.9)
 
     out_path = tmp_path / "dump.json"
-    dump_optimizer_inputs(optimizer, out_path, extra_meta={"note": "hello"})
+    dump_optimizer_parameters(optimizer, out_path, extra_meta={"note": "hello"})
 
     written = out_path.with_suffix(f".rank{distributed_setup.rank}.json")
     assert written.exists(), f"per-rank dump file missing: {written}"
@@ -74,7 +76,7 @@ def test_dump_optimizer_inputs_dtensor(distributed_setup, tmp_path: pathlib.Path
     assert p_replicated["is_qkv"] is False
 
 
-def test_dump_optimizer_inputs_plain_tensor(distributed_setup, tmp_path: pathlib.Path) -> None:
+def test_dump_optimizer_parameters_plain_tensor(distributed_setup, tmp_path: pathlib.Path) -> None:
     """Plain (non-DTensor) params: local_shape == global_shape, mesh fields are None."""
     _ensure_process_group(distributed_setup)
 
@@ -82,7 +84,7 @@ def test_dump_optimizer_inputs_plain_tensor(distributed_setup, tmp_path: pathlib
     optimizer = torch.optim.SGD([param], lr=0.01)
 
     out_path = tmp_path / f"plain_rank{distributed_setup.rank}.json"
-    dump_optimizer_inputs(optimizer, out_path)
+    dump_optimizer_parameters(optimizer, out_path)
 
     written = out_path.parent / f"{out_path.name}.rank{distributed_setup.rank}.json"
     assert written.exists()
@@ -95,7 +97,7 @@ def test_dump_optimizer_inputs_plain_tensor(distributed_setup, tmp_path: pathlib
     assert p["placements"] is None
 
 
-def test_dump_optimizer_inputs_rejects_multi_group(
+def test_dump_optimizer_parameters_rejects_multi_group(
     distributed_setup, tmp_path: pathlib.Path
 ) -> None:
     """Multi-param-group optimizers raise — the dump assumes a single group."""
@@ -104,4 +106,4 @@ def test_dump_optimizer_inputs_rejects_multi_group(
     b = torch.randn(2, 2, requires_grad=True, device=distributed_setup.device)
     optimizer = torch.optim.SGD([{"params": [a]}, {"params": [b]}], lr=0.01)
     with pytest.raises(ValueError, match="exactly one parameter group"):
-        dump_optimizer_inputs(optimizer, tmp_path / "rejects.json")
+        dump_optimizer_parameters(optimizer, tmp_path / "rejects.json")
