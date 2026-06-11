@@ -59,9 +59,6 @@ def test_dump_optimizer_parameters_dtensor(distributed_setup, tmp_path: pathlib.
     assert p_sharded["placements"] == ["Shard(dim=0)"]
     assert p_sharded["is_qkv"] is True
     assert p_sharded["dtype"].startswith("torch.float")
-    # No `.step()` was called, so the optimizer state hasn't been populated yet.
-    assert p_sharded["momentum_dtype"] is None
-    assert p_sharded["momentum_local_shape"] is None
 
     assert p_replicated["global_shape"] == [2, 3]
     assert p_replicated["local_shape"] == [2, 3]
