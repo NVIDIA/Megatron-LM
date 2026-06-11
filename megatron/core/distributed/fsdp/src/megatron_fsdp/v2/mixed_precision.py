@@ -614,12 +614,14 @@ class MixedPrecisionPolicy:
                 fp8_params, main_params, start_offsets, data_parallel_group, model_param_shards
             )
 
-        # Mark the model weights dirty so FSDP knows to all-gather them before
-        # the forward or backward pass.
-        if not model_weight_buffer.is_distributed:
-            model_weight_buffer.data._dirty = True
-        if transpose_weight_buffer is not None and not transpose_weight_buffer.is_distributed:
-            transpose_weight_buffer.data._dirty = True
+        # ZeRO-1/2 refresh only this rank's slice; gather before next compute.
+        def mark_dirty(buffer):
+            if buffer is not None and not buffer.is_distributed:
+                buffer.data._dirty = True
+
+        if model_weight_buffer.sharding_strategy != "no_shard":
+            mark_dirty(model_weight_buffer)
+            mark_dirty(transpose_weight_buffer)
 
 
 def is_fp8_param(tensor: torch.Tensor) -> bool:
