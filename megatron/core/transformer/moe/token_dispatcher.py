@@ -1110,6 +1110,15 @@ class _HybridEPManager(_DispatchManager):
             # Round budget up to pad_multiple (FP8/FP4/CUTLASS alignment for permute buffers).
             budget += -budget % pad_multiple
             self.num_permuted_tokens = budget
+        elif self.config.cuda_graph_impl == "full_iteration":
+            # Full-iteration CUDA graph capture cannot safely use HybridEP's dynamic
+            # permuted-token sizing path because it reads a GPU-produced size back to host.
+            # Use the same static-budget shape as capacity-factor mode, without requiring
+            # the TE op-fuser that is incompatible with fine-grained activation offload.
+            pad_multiple = get_align_size_for_quantization(self.config)
+            budget = int(padded_num_tokens * self.config.moe_router_topk * 1.2)
+            budget += -budget % pad_multiple
+            self.num_permuted_tokens = budget
         # else: num_permuted_tokens stays None; HybridEP sizes buffers dynamically (CPU sync
         # in dispatch) and does not drop tokens or report overflow.
         # Compute the capacity for each expert at the drop_and_pad mode
