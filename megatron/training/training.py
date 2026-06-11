@@ -141,6 +141,9 @@ from megatron.core.distributed import (
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallel as megatron_FSDP,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.dump_parameters import (
+    dump_optimizer_parameters,
+)
 from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
@@ -1989,14 +1992,9 @@ def setup_model_and_optimizer(
         # Gated by `DUMP_OPTIMIZER_PARAMETERS_OUTPUT` env var; each rank writes a
         # JSON snapshot under that path. Optimizer-agnostic — fires regardless
         # of optimizer class. See `megatron_fsdp.dump_parameters` for the schema.
-        _dump_path = os.environ.get("DUMP_OPTIMIZER_PARAMETERS_OUTPUT")
-        if _dump_path:
-            from megatron.core.distributed.fsdp.src.megatron_fsdp.dump_parameters import (
-                dump_optimizer_parameters,
-            )
-
-            inner = getattr(optimizer, "optimizer", optimizer)
-            dump_optimizer_parameters(inner, _dump_path)
+        dump_path = os.environ.get("DUMP_OPTIMIZER_PARAMETERS_OUTPUT")
+        if dump_path:
+            dump_optimizer_parameters(optimizer, dump_path)
 
     one_logger and one_logger.log_metrics({"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()})
 
