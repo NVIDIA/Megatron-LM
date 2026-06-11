@@ -888,21 +888,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         #   the ordering of parameters within its flattened parameter state
         #   list.
         def make_needed_groups(param_group):
-            needed_groups = []
-            for key in param_group_identifier_keys:
-                # NeMo changes these variable names from `lr_mult` and `wd_mult`
-                # to `pre_lr_mult` and `pre_wd_mult`, so we need to check both.
-                if key in param_group:
-                    pass
-                elif f"pre_{key}" in param_group:
-                    key = f"pre_{key}"
-                else:
-                    raise ValueError(
-                        f"Key {key} (or pre_{key}) not found in param_group {param_group}."
-                    )
-                needed_groups.append(param_group[key])
-            needed_groups = tuple(needed_groups)
-            return needed_groups
+            return tuple(param_group[key] for key in param_group_identifier_keys)
 
         param_groups_map = {}
         for param_group in state_dict["optimizer"]["param_groups"]:

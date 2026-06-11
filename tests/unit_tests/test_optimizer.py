@@ -83,6 +83,7 @@ def test_get_param_groups_no_overrides(mock_get_world_size):
         'params',
         'is_expert_parallel',
         'default_config',
+        'param_group_name',
         'wd_mult',
         'lr_mult',
         'is_decoupled_lr',
@@ -92,6 +93,7 @@ def test_get_param_groups_no_overrides(mock_get_world_size):
     assert pg0['params'] == list(net.parameters())
     assert pg0['is_expert_parallel'] == False
     assert pg0['default_config'] == True
+    assert pg0['param_group_name'] == '__default__'
     assert pg0['wd_mult'] == 1.0
     assert pg0['lr_mult'] == 1.0
     assert pg0['is_decoupled_lr'] == False
@@ -168,7 +170,14 @@ def test_get_param_groups_multiple_matches(mock_get_world_size):
     check_config_overrides_consistency(opt_config, config_overrides)
     param_groups2 = _get_param_groups([net], opt_config, config_overrides)
     assert len(param_groups) == 2
-    assert param_groups == param_groups2
+    # `param_group_name` differs by how the matching ParamKeys are spelled
+    # (two keys joined with '+' vs. one combined key with ';'), so compare
+    # everything else for semantic equivalence.
+    assert len(param_groups) == len(param_groups2)
+    for g1, g2 in zip(param_groups, param_groups2):
+        assert {k: v for k, v in g1.items() if k != 'param_group_name'} == {
+            k: v for k, v in g2.items() if k != 'param_group_name'
+        }
 
 
 @patch('torch.distributed.get_world_size', return_value=1)

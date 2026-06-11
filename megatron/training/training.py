@@ -1009,7 +1009,7 @@ def preprocess_common_state_dict(common_state_dict):
             if "param_groups" not in inner_optimizer:
                 return
             param_groups = inner_optimizer["param_groups"]
-            key_fn = lambda pg: [pg[key] for key in param_group_identifier_keys]
+            key_fn = lambda pg: tuple(str(pg[key]) for key in param_group_identifier_keys)
             param_groups.sort(key=key_fn)
             inner_optimizer["param_groups"] = param_groups
 
