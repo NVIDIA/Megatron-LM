@@ -142,6 +142,56 @@ class TestGatedDeltaNet:
             output.dtype == hidden_states.dtype
         ), f"Output dtype {output.dtype=} mismatch with {hidden_states.dtype=}"
 
+    def test_selective_recompute_gdn(self):
+        """Whole-module 'gdn' recompute must match the non-recompute forward and gradients.
+
+        The same module/input is run twice (recompute off, then on); the forward output and
+        all parameter / input gradients must agree within bf16 tolerance.
+        """
+        gdn = self.gdn
+        gdn.train()
+
+        micro_batch_size = 2
+        seq_length = 64
+        torch.manual_seed(1234)
+        base_input = torch.randn(
+            (seq_length // self.sp_size // self.cp_size, micro_batch_size, gdn.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+
+        def run(recompute):
+            gdn.recompute_gdn = recompute
+            gdn.zero_grad(set_to_none=True)
+            hidden_states = base_input.clone().detach().requires_grad_(True)
+            output, _ = gdn(hidden_states, None)
+            output.float().square().mean().backward()
+            param_grads = {
+                name: param.grad.detach().clone()
+                for name, param in gdn.named_parameters()
+                if param.grad is not None
+            }
+            return output.detach().clone(), hidden_states.grad.detach().clone(), param_grads
+
+        try:
+            out_ref, dinput_ref, pgrad_ref = run(recompute=False)
+            out_rc, dinput_rc, pgrad_rc = run(recompute=True)
+        finally:
+            gdn.recompute_gdn = False
+
+        torch.testing.assert_close(out_rc, out_ref, rtol=1e-2, atol=1e-2)
+        torch.testing.assert_close(dinput_rc, dinput_ref, rtol=1e-2, atol=1e-2)
+        assert pgrad_ref.keys() == pgrad_rc.keys(), "recompute changed the set of grad params"
+        assert len(pgrad_ref) > 0, "expected at least one parameter gradient"
+        for name in pgrad_ref:
+            torch.testing.assert_close(
+                pgrad_rc[name],
+                pgrad_ref[name],
+                rtol=1e-2,
+                atol=1e-2,
+                msg=lambda m, n=name: f"gradient mismatch for parameter '{n}': {m}",
+            )
+
     def test_jit_compiled_helpers(self):
         import torch._dynamo
 

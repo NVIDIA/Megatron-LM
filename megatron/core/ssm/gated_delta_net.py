@@ -14,6 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
+from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
 from megatron.core.fp8_utils import get_fp8_align_size
@@ -260,6 +261,13 @@ class GatedDeltaNet(MegatronModule):
             name=(name + ".out_proj") if name is not None else None,
         )
 
+        # Whole-module recompute: when "gdn" is in recompute_modules (selective granularity),
+        # the entire GatedDeltaNet compute is wrapped in a normal checkpoint and recomputed
+        # in the backward pass.
+        self.recompute_gdn = False
+        if self.config.recompute_granularity == "selective" and self.config.recompute_modules:
+            self.recompute_gdn = "gdn" in self.config.recompute_modules
+
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -363,6 +371,43 @@ class GatedDeltaNet(MegatronModule):
             cu_seqlens_q = None
             cu_seqlens_kv = None
 
+        if self.recompute_gdn and self.training:
+            # Selective full-module recompute ("gdn"): run the whole GDN compute under a
+            # normal checkpoint so its activations are dropped and recomputed in backward.
+            # Only the input tensor is passed to checkpoint(); the non-tensor arguments are
+            # bound via closure because tensor_parallel.checkpoint saves its positional args
+            # with save_for_backward, which only accepts tensors.
+            def _checkpointed_compute(hidden_states):
+                return self._forward_compute(
+                    hidden_states,
+                    batch,
+                    seq_len,
+                    cp_size,
+                    cp_group,
+                    cu_seqlens_q,
+                    packed_seq_params,
+                )
+
+            out, out_bias = tensor_parallel.checkpoint(_checkpointed_compute, False, hidden_states)
+        else:
+            out, out_bias = self._forward_compute(
+                hidden_states, batch, seq_len, cp_size, cp_group, cu_seqlens_q, packed_seq_params
+            )
+
+        return out, out_bias
+
+    def _forward_compute(
+        self, hidden_states, batch, seq_len, cp_size, cp_group, cu_seqlens_q, packed_seq_params
+    ):
+        """Core GDN computation (in_proj -> conv1d -> gated_delta_rule -> gated norm -> out_proj).
+
+        Extracted from ``forward`` so the entire module can be wrapped in a recompute
+        checkpoint when ``recompute_modules`` contains ``"gdn"`` (selective full-module
+        recompute, normal checkpointing).
+
+        Returns:
+            Tuple of (output, output_bias).
+        """
         # Input projection
         nvtx_range_push(suffix="in_proj")
         qkvzba, _ = self.in_proj(hidden_states)
