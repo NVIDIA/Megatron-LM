@@ -394,6 +394,11 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         )
                         if hasattr(model_param, 'shared'):
                             shard_model_param.shared = model_param.shared
+                        for _gtp_attr in ('is_gtp', 'allreduce'):
+                            if hasattr(model_param, _gtp_attr):
+                                setattr(
+                                    shard_model_param, _gtp_attr, getattr(model_param, _gtp_attr)
+                                )
 
                     # Generate main param.
                     if not config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
@@ -426,6 +431,15 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         )
                         if hasattr(model_param, 'shared'):
                             shard_main_param.shared = model_param.shared
+                        # Propagate GTP/expert tags so get_main_grads_for_grad_norm (which reads
+                        # the master shard params) can classify them. Without is_gtp, GTP shards
+                        # are mis-seen as replicated non-GTP params and dropped by the gtp-rank
+                        # dedup, under-counting the grad-norm by ~1/gtp.
+                        for _gtp_attr in ('is_gtp', 'allreduce'):
+                            if hasattr(model_param, _gtp_attr):
+                                setattr(
+                                    shard_main_param, _gtp_attr, getattr(model_param, _gtp_attr)
+                                )
                     else:
                         # When using precision-aware optimizer, main params are held by FusedAdam.
                         shard_main_param = None
@@ -449,6 +463,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     )
                     if hasattr(model_param, 'shared'):
                         shard_model_param.shared = model_param.shared
+                    for _gtp_attr in ('is_gtp', 'allreduce'):
+                        if hasattr(model_param, _gtp_attr):
+                            setattr(shard_model_param, _gtp_attr, getattr(model_param, _gtp_attr))
 
                 else:
                     raise TypeError(

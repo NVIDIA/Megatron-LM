@@ -356,6 +356,8 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 args.virtual_pipeline_model_parallel_size,
                 pipeline_model_parallel_comm_backend=args.pipeline_model_parallel_comm_backend,
                 use_sharp=args.use_sharp,
+                # GTP/EGTP require world_size divisible by TP*PP*CP*GTP (and the expert grid
+                # by ETP*EP*PP*EGTP). Inactive when the remat sizes are 1.
                 gtp_remat_size=args.generalized_tensor_parallel_remat_size,
                 expert_gtp_remat_size=args.expert_generalized_tensor_parallel_remat_size,
                 context_parallel_size=args.context_parallel_size,

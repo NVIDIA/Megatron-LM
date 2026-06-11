@@ -144,26 +144,16 @@ class MegatronOptimizer(ABC):
         This method filters parameters based on whether the gradient is not None,
         the parameter is not shared (to avoid double-counting gradients),
         the parameter is not a replica due to tensor model parallelism, and
-        the parameter is not be a GTP duplicate (non-GTP params are identical across GTP peers;
-            only GTP rank 0 should contribute to avoid over-counting).
+        the parameter is not a GTP/EGTP duplicate.
 
-        Returns all filtered grads as a single list (for backward compatibility).
-        Use get_main_grads_for_grad_norm_split() to get GTP and non-GTP grads separately.
-        """
-        non_gtp_grads, gtp_grads = self.get_main_grads_for_grad_norm_split()
-        return non_gtp_grads + gtp_grads
-
-    def get_main_grads_for_grad_norm_split(self) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-        """
-        Get main_grads split into (non_gtp_grads, gtp_grads).
-
-        GTP grads may need an extra GTP/EGTP reduction that differs from the
-        optimizer's grad_stats_parallel_group, so callers that compute norms
-        need them separated.
+        The dist-opt shards non-GTP (replicated) params over the gtp/egtp-EXCLUDED replicate
+        group while the grad_stats group (intra_dist_opt_group) spans the full world *including*
+        the gtp/egtp axis. So non-GTP params are replicated across that axis and only rank 0 of
+        it should contribute, else the norm is inflated by gtp (dense) / egtp (expert).
+        GTP-sharded params hold unique shards across gtp/egtp and are kept on every rank.
         """
         params = self.get_parameters()
-        non_gtp_grads = []
-        gtp_grads = []
+        grads_for_norm = []
         gtp_rank = parallel_state.get_generalized_tensor_parallel_remat_rank()
         egtp_rank = parallel_state.get_expert_generalized_tensor_parallel_remat_rank()
         for param in params:
@@ -198,20 +188,16 @@ class MegatronOptimizer(ABC):
                 )
             )
 
-            # GTP-duplicate filter: only needed for non-distributed optimizer.
+            # GTP/EGTP-duplicate filter: keep gtp/egtp-sharded params on every rank; count
+            # replicated (non-GTP) params only once (rank 0 of the gtp/egtp axis). When GTP is
+            # inactive gtp_rank/egtp_rank are 0, so this keeps every param.
             is_expert = not getattr(param, 'allreduce', True)
-            if hasattr(self, 'ddp_config') and self.ddp_config.use_distributed_optimizer:
-                is_not_gtp_duplicate = True
-            else:
-                is_not_gtp_duplicate = is_gtp_param or (egtp_rank if is_expert else gtp_rank) == 0
+            is_not_gtp_duplicate = is_gtp_param or (egtp_rank if is_expert else gtp_rank) == 0
 
             if grad_not_none and is_not_shared and is_not_tp_duplicate and is_not_gtp_duplicate:
-                if is_gtp_param:
-                    gtp_grads.append(grad)
-                else:
-                    non_gtp_grads.append(grad)
+                grads_for_norm.append(grad)
 
-        return non_gtp_grads, gtp_grads
+        return grads_for_norm
 
     def get_grad_stats_parallel_group(self) -> torch.distributed.ProcessGroup:
         """Process group for reducing gradient statistics (num_zeros & norm).
@@ -243,59 +229,21 @@ class MegatronOptimizer(ABC):
         """Step the optimizer with ready gradients, return successful."""
         return True
 
-    def _compute_grad_norm_with_gtp(self, non_gtp_grads, gtp_grads):
-        """Compute grad norm handling GTP grads that may need extra GTP/EGTP reduction.
-
-        For MoE optimizers, grad_stats_parallel_group = TP×EP×PP which does NOT
-        include EGTP. MoE-GTP grads need an extra EGTP reduction.
-        For dense-GTP optimizers, grad_stats_parallel_group = TP×PP×GTP which
-        already includes GTP, so no extra reduction is needed.
-        """
-        grad_stats_group = self.get_grad_stats_parallel_group()
-
-        if not gtp_grads:
-            return get_grad_norm_fp32(non_gtp_grads, grad_stats_parallel_group=grad_stats_group)
-
-        # Check if this optimizer handles expert params that need EGTP reduction.
-        # The model_parallel group for dense/GTP optimizers = TP×PP×GTP (includes GTP),
-        # but for MoE optimizers = TP×EP×PP (does NOT include EGTP).
-        egtp_world_size = parallel_state.get_expert_generalized_tensor_parallel_remat_world_size()
-        is_expert_optimizer = any(not getattr(p, 'allreduce', True) for p in self.get_parameters())
-        needs_egtp_reduce = is_expert_optimizer and egtp_world_size > 1
-
-        if not needs_egtp_reduce:
-            # Dense/GTP optimizer: grad_stats_group already covers GTP.
-            return get_grad_norm_fp32(
-                non_gtp_grads + gtp_grads, grad_stats_parallel_group=grad_stats_group
-            )
-
-        # MoE optimizer with EGTP: compute GTP norm separately, add EGTP reduction.
-        non_gtp_norm = get_grad_norm_fp32(non_gtp_grads, grad_stats_parallel_group=grad_stats_group)
-        gtp_norm = get_grad_norm_fp32(gtp_grads, grad_stats_parallel_group=grad_stats_group)
-        # get_grad_norm_fp32 returns a float. We need to do the EGTP reduction on GPU.
-        gtp_norm_2 = torch.tensor([gtp_norm**2], dtype=torch.float, device='cuda')
-        torch.distributed.all_reduce(
-            gtp_norm_2,
-            op=torch.distributed.ReduceOp.SUM,
-            group=parallel_state.get_expert_generalized_tensor_parallel_remat_group(),
-        )
-        total_norm_2 = non_gtp_norm**2 + gtp_norm_2.item()
-        return total_norm_2**0.5
-
     @torch.no_grad()
     def get_grad_norm(self):
         """Compute and return grad norm."""
-        non_gtp_grads, gtp_grads = self.get_main_grads_for_grad_norm_split()
-        return self._compute_grad_norm_with_gtp(non_gtp_grads, gtp_grads)
+        grads_for_norm = self.get_main_grads_for_grad_norm()
+        return get_grad_norm_fp32(
+            grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
+        )
 
     def clip_grad_norm(self, clip_grad: float) -> float:
         """Compute and return grad norm, also clip grads."""
         params = self.get_parameters()
-        if params:
-            non_gtp_grads, gtp_grads = self.get_main_grads_for_grad_norm_split()
-        else:
-            non_gtp_grads, gtp_grads = [], []
-        grad_norm = self._compute_grad_norm_with_gtp(non_gtp_grads, gtp_grads)
+        grads_for_norm = self.get_main_grads_for_grad_norm() if params else []
+        grad_norm = get_grad_norm_fp32(
+            grads_for_norm, grad_stats_parallel_group=self.get_grad_stats_parallel_group()
+        )
 
         if params:
             clip_grad_by_total_norm_fp32(

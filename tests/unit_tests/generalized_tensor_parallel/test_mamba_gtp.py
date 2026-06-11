@@ -71,9 +71,9 @@ def _worker_mamba_gtp_correctness(rank, world_size, port):
     # Nemotron3-Super Proxy Mamba hyperparameters.
     # in_proj_out = 2*8192 + 2*8*128 + 128 = 18560; 18560/4 = 4640, 4640%16 = 0 (MXFP8-aligned).
     HIDDEN = 4096
-    NHEADS = 128       # mamba_num_heads; d_inner = nheads * headdim = 128 * 64 = 8192
-    NGROUPS = 8        # mamba_num_groups (default)
-    D_STATE = 128      # mamba_state_dim (default)
+    NHEADS = 128  # mamba_num_heads; d_inner = nheads * headdim = 128 * 64 = 8192
+    NGROUPS = 8  # mamba_num_groups (default)
+    D_STATE = 128  # mamba_state_dim (default)
     NUM_LAYERS = 2
     SEQ = 32
     BATCH = 1
@@ -105,8 +105,7 @@ def _worker_mamba_gtp_correctness(rank, world_size, port):
             mixer=ModuleSpec(
                 module=MambaMixer,
                 submodules=MambaMixerSubmodules(
-                    in_proj=TELayerNormColumnParallelLinear,
-                    out_proj=TERowParallelLinear,
+                    in_proj=TELayerNormColumnParallelLinear, out_proj=TERowParallelLinear
                 ),
             ),
             mamba_bda=get_bias_dropout_add,
@@ -199,7 +198,7 @@ def _worker_mamba_gtp_correctness(rank, world_size, port):
         full = saved_weights[name]
         if isinstance(p, GTPShardedParam):
             shard_size = p.shape[0]
-            p.data.copy_(full[gtp_rank * shard_size: (gtp_rank + 1) * shard_size])
+            p.data.copy_(full[gtp_rank * shard_size : (gtp_rank + 1) * shard_size])
         else:
             p.data.copy_(full)
 

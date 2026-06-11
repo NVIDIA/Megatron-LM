@@ -204,10 +204,10 @@ TransformerEngine owns the linear primitives (`Linear` / `LayerNormLinear` / `La
 
 #### What the flags do under the hood
 
-1. `parallel_state.initialize_model_parallel(...)` builds two new groups: `_GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP` (size = `--generalized-tensor-parallel-remat-size`) and `_EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP` (size = `--expert-generalized-tensor-parallel-remat-size`), plus the corresponding DP-with-GTP carve-outs (`_DATA_PARALLEL_GROUP_WITH_GTP`, `_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP`).
+1. `parallel_state.initialize_model_parallel(...)` treats GTP/EGTP as **first-class orthogonal axes** (`world_size = TP*GTP*CP*DP`, and the expert grid `= ETP*EP*PP*EGTP*expert_dp`). It builds the shard groups `_GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP` (size = `--generalized-tensor-parallel-remat-size`) and `_EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP` (size = `--expert-generalized-tensor-parallel-remat-size`), plus the gtp/egtp-EXCLUDED replicate DP groups (`_DATA_PARALLEL_GROUP_WITH_GTP`, `_EXPERT_DATA_PARALLEL_GROUP_WITH_GTP`) that DDP and the optimizer shard over. These `*_with_gtp` groups alias the regular DP groups when GTP is inactive (remat size 1).
 2. Megatron's `extensions/transformer_engine.py` reads `pg_collection.gtp` / `pg_collection.expt_gtp` and forwards them as the `gtp_group=` kwarg to `te.Linear` / `te.LayerNormLinear` / `te.GroupedLinear`. TE's `module/base.py` calls back into `megatron.experimental.gtp` via the hook registry (`register_gtp_hooks`) to slice each weight at `reset_parameters` time.
-3. DDP carves out GTP shards into a separate bucket pool (`gtp_buffer_groups`) reduced over `intra_dp_cp_with_gtp_group` rather than full DP — the wgrad RS already reduced over the GTP axis. See §3.2 for the full 4-bucket layout.
-4. Optimizer state is sharded across the same `with_gtp` subgroup; clip-by-global-norm sums squared norms over `model_parallel × with_gtp` so the reduction count matches the actual replica count.
+3. DDP treats GTP shards as ordinary params: they go into the same dense / expert buffers as everything else, reduced over the gtp/egtp-EXCLUDED replicate group (`intra_dp_cp_with_gtp_group` / `intra_expt_dp_with_egtp_group`) with the standard `1/full` scaling. The gtp axis is completed elsewhere — GTP shards by their reduce-scatter sum, replicated (non-GTP) params by a SUM all-reduce in `finalize_model_grads`. See §3.2.
+4. Optimizer state is sharded over the same replicate group; clip-by-global-norm reduces squared norms over the dist-opt grad-stats group, which spans the full world (including the gtp/egtp axis), with replicated non-GTP params counted once per gtp/egtp axis to avoid over-counting.
 5. `classify_gtp_chains(model)` runs once after model build (in `training.py`'s `get_model`) and wires each `GTPShardedParam` into a `GRAPHED` or `UNGRAPHED` prefetch chain based on the active `cuda_graph_modules`.
 
 #### Buffer / memory management
@@ -268,23 +268,60 @@ Under **full-iteration CUDA graphs** the recompute-forward is captured; `wait_as
 
 ### 3.2 DDP buckets with (E)GTP
 
-![DDP parameter bucketing with (E)GTP](images/0527_ddp_param_bucketing.png)
+![DDP + (E)GTP interaction with the distributed optimizer](images/0611_ddp_egtp_orthogonal_bucketing.png)
 
-DDP carves parameters into **four buckets** based on two orthogonal axes — `is_expert_parallel` (MoE tag) × `isinstance(param, GTPShardedParam)` (GTP shard tag). Each bucket reduces over a *different* process group, because the (E)GTP wgrad RS has already reduced grads over the corresponding axis and reducing again would double-count. The diagram above shows the four buckets, their typical membership, and the reduce-scatter group each one targets.
+<!-- Editable source: diagrams/0611_ddp_egtp_orthogonal_bucketing.drawio
+     Export to images/0611_ddp_egtp_orthogonal_bucketing.png via the draw.io desktop CLI:
+       drawio -x -f png -e -b 10 -o megatron/experimental/gtp/images/0611_ddp_egtp_orthogonal_bucketing.png \
+              diagrams/0611_ddp_egtp_orthogonal_bucketing.drawio -->
 
+**(E)GTP is *super loosely coupled* to DDP and the distributed optimizer — they stay completely GTP-agnostic.** GTP is just another sub-axis of the rank grid (`world = TP×GTP×CP×DP`); a GTP-sharded weight rides the *exact same* code path as an ordinary param. There are **no** GTP/EGTP-specific buffers, optimizers, gradient-scaling factors, or bucket groups. The entire DDP/DistOpt stack touches GTP in only **two** narrow places:
 
-**`broadcast_params`** (the post-init parameter sync) uses a parallel selection:
+1. **finalize SUM all-reduce** (`_allreduce_replicated_grads_over_gtp_group`) — completes the gtp axis for *replicated* (non-GTP) params; a no-op when GTP is inactive.
+2. **`is_gtp` / `allreduce` tags** propagated onto the optimizer's master shards — consumed only by the grad-norm dedup filter.
 
-| Param class       | Broadcast group                                                                       |
-|-------------------|---------------------------------------------------------------------------------------|
-| non-GTP, dense    | `dp_cp_group` (full DP-CP)                                                            |
-| GTP, dense        | `dp_cp_with_gtp_group` (full — includes GTP peers across distopt instances)           |
-| non-GTP, expert   | `expt_dp_group` (full expert DP)                                                      |
-| EGTP, expert      | `expt_dp_with_egtp_group` (full — includes EGTP peers across distopt instances)       |
+Everything else — bucketing, the reduce-scatter/all-reduce schedule and its overlap, master-state sharding, grad clipping, the checkpoint format — is unchanged and unaware of GTP.
 
-For GTP-sharded params the broadcast group encodes **two** orthogonal decisions:
+**Why this matters:**
 
-- **`_with_gtp_` in the name → excludes (E)GTP peers.** Each (E)GTP rank holds a distinct 1/N shard of the same `GTPShardedParam`. If GTP peers were in the same broadcast group, rank-0's shard would overwrite every other peer's distinct shard. The `_with_gtp_` carve-out keeps the broadcast scoped to ranks that hold the *same* shard.
-- **No `intra_` prefix → cross-distopt-instance ("full") group.** Broadcast is a one-shot init/load sync, so it must reach every distopt instance to keep replicas consistent. The `intra_*` per-instance variants are reserved for grad RS, where each instance reduces its own grads independently.
+- **Free reuse of a mature stack.** GTP inherits DDP's bucketing + comm/compute overlap, the distributed optimizer's fp32-master + Adam-moment sharding, grad-norm/clip, and the existing checkpoint format — no parallel re-implementation to write or maintain (contrast FSDP, which replaces all of these).
+- **Orthogonal composability.** Because GTP is a rank-grid sub-axis cut like TP (along `out_features`), it composes with TP/EP/CP/PP and the DistOpt the same way TP does — no special nesting logic.
+- **Zero-cost when off.** With GTP disabled the `*_with_gtp` groups alias the regular DP groups and both hooks become no-ops, so non-GTP runs hit byte-identical behavior — GTP can be toggled without forking the DDP/optimizer code paths.
+- **Small, auditable surface.** Two hooks is the whole integration contract, which is what makes the correctness argument below tractable.
 
-**Buffer caching.** The per-bucket buffer lists are concatenated once at init into a single flat view for fast iteration in the grad-reduction hot path. Multi-instance distopt is supported via additional per-instance carve-outs of the with-(E)GTP groups in `parallel_state.py`.
+DDP groups parameters into **two buffers** by `is_expert_parallel` (MoE tag) — a dense buffer and an expert buffer. GTP/EGTP shards are **merged into** these buffers like ordinary params (no separate GTP/EGTP buckets): they reduce over the gtp/egtp-EXCLUDED replicate group (`intra_dp_cp_with_gtp_group` for dense, `intra_expt_dp_with_egtp_group` for expert) with the standard `1/full = 1/(replicate*gtp)` scaling.
+
+Why this is correct — the gtp axis is completed in two complementary ways, so it is summed exactly once:
+
+- **GTP-sharded weights**: each rank already holds the gtp-summed shard via the (E)GTP wgrad reduce-scatter, then DDP sums over the replicate group → `sum-over-(gtp×replicate) / full = mean`.
+- **Replicated (non-GTP) params** (LayerNorm γ/β, biases, router, …): DDP sums only over the replicate group, leaving them `1/gtp` short; `finalize_model_grads._allreduce_replicated_grads_over_gtp_group` then does a SUM all-reduce over the gtp (dense) / egtp (expert) group to recover the full mean. SUM (not AVG) because the `1/full` DDP scaling already applied.
+
+**`broadcast_params`** (the one-shot init/load param sync) selects the group by `is_gtp`: GTP shards broadcast over the gtp-excluded `*_with_gtp` group (`dp_cp_with_gtp_group` / `expt_dp_with_egtp_group`), everything else over the regular DP group (`dp_cp_group` / `expt_dp_group`). Excluding (E)GTP peers is essential — each peer holds a distinct 1/N shard of the same `GTPShardedParam`, so a shared group would let rank-0's shard clobber the others. The non-`intra_` ("full") groups are used here so the sync reaches every distopt instance.
+
+**Buffer caching.** The per-buffer lists are concatenated once at init into a single flat view for fast iteration in the grad-reduction hot path.
+
+> **Single distopt instance with GTP.** GTP currently requires `num_distributed_optimizer_instances == 1` (asserted in `parallel_state.py`): partial-distopt sharding of the data domain would need gtp-aware sizing. The dist-opt grad-stats group is therefore the full world.
+
+## 4. Testing
+
+**Whenever you add or change a GTP/EGTP feature, run the GTP unit-test suite below as a sanity check before opening a PR.** These tests exercise the full TE↔Mcore path (weight gather/RS, DDP, distributed optimizer, finalize, grad-norm) and catch silent-correctness regressions that don't surface as crashes.
+
+```bash
+# 4 GPUs; uses the custom TransformerEngine and force-enables GTP.
+export MEGATRON_GTP_FORCE_ENABLE=1
+export TE_PATH=/path/to/TransformerEngine        # the GTP-enabled TE build
+export PYTHONPATH="${TE_PATH}:${PYTHONPATH}"
+torchrun --nproc-per-node 4 -m pytest tests/unit_tests/generalized_tensor_parallel/ -v
+```
+
+| Test file | What it guards |
+|-----------|----------------|
+| `test_gtp.py` | Core GTP shard/gather + DDP bucket alignment. |
+| `test_attention_gtp.py` | GTP on attention linears, loss parity vs no-GTP. |
+| `test_mamba_gtp.py` | GTP on Mamba projection weights. |
+| `test_tp_gtp.py` | GTP composed with tensor parallelism (`tp_group × gtp_group`). |
+| `test_moe_egtp.py` | EGTP on MoE routed-expert weights. |
+| `test_gtp_loss_correctness.py` | End-to-end: GTP per-step loss trajectory matches a no-GTP baseline. |
+| `test_gtp_grad_correctness.py` | Gradient + dist-opt + grad-norm numeric parity vs a DP baseline at replicate (DP) > 1. |
+
+All tests require ≥ 4 GPUs and the GTP-enabled TransformerEngine; they self-skip when those are unavailable. A green run (skips for unmet hardware/config are acceptable) is the minimum bar for any GTP change.

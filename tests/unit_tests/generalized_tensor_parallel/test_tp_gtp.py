@@ -122,7 +122,9 @@ def _worker_column_correctness(rank, world_size, port, tp_size, gtp_size):
     out_f = tp_size * gtp_size * 32  # per-rank shard = 32 rows
     dtype = torch.bfloat16
 
-    layer = _make_gtp_linear(in_f, out_f, gtp_group, dtype, parallel_mode="column", tp_group=tp_group)
+    layer = _make_gtp_linear(
+        in_f, out_f, gtp_group, dtype, parallel_mode="column", tp_group=tp_group
+    )
 
     # All-gather GTP shards → TP-local full weight [out_f/tp_size, in_f]
     shard = layer.weight.data.clone()

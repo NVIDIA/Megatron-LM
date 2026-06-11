@@ -97,6 +97,23 @@ class DistributedDataParallel(_BaseDataParallel):
         self.intra_expt_dp_with_egtp_group = process_group_dict.get(
             'intra_expt_dp_with_egtp_group', self.intra_expt_dp_group
         )
+        # DDP treats GTP shards as ordinary params reduced over the replicate (gtp/egtp-
+        # EXCLUDED) DP group — the *_with_gtp groups, which alias the regular DP groups when GTP
+        # is inactive — with the standard 1/full scaling and no gtp-specific buffers or factor.
+        # The gtp axis is completed elsewhere: GTP shards by their reduce-scatter sum; replicated
+        # (non-GTP) params by a SUM all-reduce in finalize_model_grads. This is correct because
+        # the non-averaged scaling is 1/full = 1/(replicate*gtp), so SUM-over-replicate (DDP) +
+        # SUM-over-gtp (RS or finalize) * (1/full) = mean over the full DP*GTP domain.
+        # GTP is "active" when those replicate groups are strictly smaller than the full DP groups.
+        gtp_active = (
+            self.dp_cp_with_gtp_group.size() != self.dp_cp_group.size()
+            or self.expt_dp_with_egtp_group.size() != self.expt_dp_group.size()
+        )
+        if gtp_active and self.ddp_config.average_in_collective:
+            raise NotImplementedError(
+                "Orthogonal GTP currently supports average_in_collective=False (the default); "
+                "averaged collectives would need per-buffer 1/gtp scaling."
+            )
         self.tp_group = process_group_dict['tp_group']
         self.pp_group = process_group_dict['pp_group']
         self.ep_group = process_group_dict['ep_group']
@@ -124,8 +141,6 @@ class DistributedDataParallel(_BaseDataParallel):
         param_to_name = {}
         self.params_with_grad = []
         all_params = []
-        gtp_params = []
-        egtp_params = []
         for name, param in self.module.named_parameters():
             if not param.requires_grad:
                 continue
@@ -136,35 +151,13 @@ class DistributedDataParallel(_BaseDataParallel):
 
             param.grad_added_to_main_grad = False
             param_to_name[param] = name
-            # GTPShardedParam comes in two flavors. Both need the GTP-peer-excluded RS
-            # group because GTP's bwd already RS'd over the (E)GTP axis:
-            #   - dense GTP   (allreduce=True ) → gtp_params  → intra_dp_cp_with_gtp_group
-            #   - expert GTP  (allreduce=False) → egtp_params → intra_expt_dp_with_egtp_group
-            # Non-GTP expert params (biases, LayerNorms inside experts, etc.) are
-            # REPLICATED across EGTP peers and stay in all_params — their expert branch
-            # reduces over the FULL intra_expt_dp_group at line 263.
-            is_gtp_shard = getattr(param, 'is_gtp', False)
-            is_expert = not getattr(param, 'allreduce', True)
-            if is_gtp_shard and not is_expert:
-                gtp_params.append(param)
-            elif is_gtp_shard and is_expert:
-                egtp_params.append(param)
-            else:
-                all_params.append(param)
+            # GTP shards own their 1/gtp via the GTP reduce-scatter; DDP reduces every param
+            # (incl. GTP/EGTP shards) over the gtp/egtp-EXCLUDED replicate group like ordinary
+            # params. Dense-vs-expert grouping happens below via buffer_key.is_expert_parallel.
+            all_params.append(param)
 
-        # Group parameters by (param_dtype, grad_dtype, is_expert_parallel). (E)GTP
-        # params are grouped into separate buffer sets (RS groups chosen below).
+        # Group parameters by (param_dtype, grad_dtype, is_expert_parallel).
         buffer_groups = group_params_for_buffers(all_params, self.ddp_config.grad_reduce_in_fp32)
-        gtp_buffer_groups = (
-            group_params_for_buffers(gtp_params, self.ddp_config.grad_reduce_in_fp32)
-            if gtp_params
-            else {}
-        )
-        egtp_buffer_groups = (
-            group_params_for_buffers(egtp_params, self.ddp_config.grad_reduce_in_fp32)
-            if egtp_params
-            else {}
-        )
 
         # Auto-compute layouts when using distributed optimizer but no layout was provided.
         # This maintains backward compatibility for callers that create DDP directly
@@ -180,29 +173,27 @@ class DistributedDataParallel(_BaseDataParallel):
             )
             from ..optimizer.distrib_optimizer import DistributedOptimizer
 
+            # Buffers reduce/shard over the gtp/egtp-EXCLUDED replicate group, so the layout
+            # padding uses the replicate group sizes (these alias the full DP groups when GTP is
+            # inactive).
+            dp_layout_size = self.intra_dp_cp_with_gtp_group.size()
+            edp_layout_size = self.intra_expt_dp_with_egtp_group.size()
             full_param_layout = DistributedOptimizer.compute_full_param_layout(
                 all_params,
                 self.bucket_size,
-                self.intra_dp_cp_group.size(),
+                dp_layout_size,
                 self.ddp_config,
-                expert_data_parallel_world_size=self.intra_expt_dp_group.size(),
+                expert_data_parallel_world_size=edp_layout_size,
             )
 
         # When a full_param_layout is provided, verify that the grouping is consistent
         # with the layout (same buffer keys, same params per key, same param_indices).
-        # (E)GTP shares a BufferKey with non-GTP params of the same dtype, so keys that
-        # also appear in the gtp/egtp groups diverge from the caller's (non-carved)
-        # layout — skip those, and skip the exact key-set check when any carve-out ran.
         if full_param_layout is not None:
-            carved_keys = set(gtp_buffer_groups.keys()) | set(egtp_buffer_groups.keys())
-            if not carved_keys:
-                assert set(buffer_groups.keys()) == set(full_param_layout.layouts.keys()), (
-                    f"Buffer keys from param grouping {set(buffer_groups.keys())} do not match "
-                    f"full_param_layout keys {set(full_param_layout.layouts.keys())}"
-                )
+            assert set(buffer_groups.keys()) == set(full_param_layout.layouts.keys()), (
+                f"Buffer keys from param grouping {set(buffer_groups.keys())} do not match "
+                f"full_param_layout keys {set(full_param_layout.layouts.keys())}"
+            )
             for buffer_key, (params, param_indices) in buffer_groups.items():
-                if buffer_key in carved_keys:
-                    continue
                 layout = full_param_layout.layouts[buffer_key]
                 assert set(params) == set(
                     layout.param_index_map.keys()
@@ -220,8 +211,6 @@ class DistributedDataParallel(_BaseDataParallel):
             ), "Cannot average in collective when calculating per-token loss!"
             gradient_scaling_factor = 1.0
             expert_gradient_scaling_factor = 1.0
-            gtp_gradient_scaling_factor = 1.0
-            egtp_gradient_scaling_factor = 1.0
         else:
             # The goal is to scale reduced gradients by 1/dp_size.
             # This can be achieved in two ways:
@@ -246,43 +235,31 @@ class DistributedDataParallel(_BaseDataParallel):
             if self.ddp_config.average_in_collective:
                 gradient_scaling_factor = 1.0
                 expert_gradient_scaling_factor = self.expt_dp_group.size() / self.dp_cp_group.size()
-                # (E)GTP pre-scale = (collective_size) / dp_cp_size so post-collective
-                # grad lands at 1/dp_cp_size. Each divisor must reference the same group
-                # the RS fires on (lines 341 for GTP, 372 for EGTP).
-                gtp_gradient_scaling_factor = (
-                    self.intra_dp_cp_with_gtp_group.size() / self.dp_cp_group.size()
-                )
-                egtp_gradient_scaling_factor = (
-                    self.intra_expt_dp_with_egtp_group.size() / self.dp_cp_group.size()
-                )
             else:
                 data_parallel_world_size = self.dp_cp_group.size()
 
                 gradient_scaling_factor = 1.0 / data_parallel_world_size
                 expert_gradient_scaling_factor = 1.0 / data_parallel_world_size
-                gtp_gradient_scaling_factor = 1.0 / data_parallel_world_size
-                egtp_gradient_scaling_factor = 1.0 / data_parallel_world_size
 
         # Allocate buffers for each group.
         self.buffers = []
         self.expert_parallel_buffers = []
-        self.gtp_buffers = []
-        self.egtp_buffers = []
         pg_collection = ProcessGroupCollection(tp=self.tp_group, dp_cp=self.dp_cp_group)
-        # Grad RS for every buffer (expert / dense non-GTP here, dense GTP at line 328)
-        # uses a per-distopt-instance partial group. Cross-instance sync runs separately
+        # Grad RS uses a per-distopt-instance partial group. Cross-instance sync runs separately
         # via inter_dist_opt_group during optim.step(); reducing cross-instance grads
         # here would mix independent data slices.
         for buffer_key, (params, param_indices) in buffer_groups.items():
             if buffer_key.is_expert_parallel:
-                # Non-GTP expert params (biases, expert-scoped LayerNorms, etc.) are
-                # replicated across EGTP peers, so reduce over the FULL intra_expt_dp
-                # group (includes EGTP peers). EGTP-sharded routed experts are carved
-                # into egtp_buffer_groups below and use the EGTP-peer-excluded group.
-                data_parallel_group = self.intra_expt_dp_group
+                # Every expert param (incl. EGTP shards) reduces over the EGTP-peer-EXCLUDED
+                # replicate group; the egtp axis is handled by GTP's reduce-scatter (shards) or
+                # the finalize all-reduce (replicated params). Aliases the full expert-DP group
+                # when EGTP is inactive.
+                data_parallel_group = self.intra_expt_dp_with_egtp_group
                 scaling_factor = expert_gradient_scaling_factor
             else:
-                data_parallel_group = self.intra_dp_cp_group
+                # Dense params (incl. GTP shards) reduce over the gtp-EXCLUDED replicate group
+                # (aliases the full DP group when GTP is inactive).
+                data_parallel_group = self.intra_dp_cp_with_gtp_group
                 scaling_factor = gradient_scaling_factor
 
             if not config.calculate_per_token_loss:
@@ -303,9 +280,10 @@ class DistributedDataParallel(_BaseDataParallel):
                 else:
                     assert scaling_factor == target_gradient_scaling_factor
 
-            # With GTP: full_param_layout contains stray GTP entries not in this buffer,
-            # so recompute a fresh padded layout to avoid KeyErrors and bucket misalignment.
-            if full_param_layout is not None and not gtp_params:
+            # With GTP active, a caller-provided full_param_layout is sized for the FULL (gtp-
+            # inclusive) DP group, but the merged buffer reduces/shards over the REPLICATE group,
+            # so ignore it and recompute the layout with the replicate-group size below.
+            if full_param_layout is not None and not gtp_active:
                 param_layout = full_param_layout.layouts.get(buffer_key)
             elif self.ddp_config.use_distributed_optimizer:
                 from ..optimizer.distrib_optimizer import DistributedOptimizer
@@ -339,75 +317,6 @@ class DistributedDataParallel(_BaseDataParallel):
             else:
                 self.buffers.append(buffer)
 
-        # GTP-sharded params have already been RS'd over the GTP axis by GTP itself,
-        # so DDP must use the GTP-peer-excluded group here. full_param_layout is not
-        # applied to GTP buffers (GTP manages its own sharding).
-        for buffer_key, (params, param_indices) in gtp_buffer_groups.items():
-            params_with_names = [(p, param_to_name[p]) for p in params]
-            if self.ddp_config.use_distributed_optimizer:
-                # Pad bucket ends to intra_dp_cp_with_gtp_group.size() for dist-opt alignment.
-                from ..optimizer.distrib_optimizer import DistributedOptimizer
-
-                gtp_layout = DistributedOptimizer._compute_per_buffer_param_layout(
-                    params,
-                    self.bucket_size,
-                    self.intra_dp_cp_with_gtp_group.size(),
-                    self.ddp_config,
-                    param_indices,
-                )
-            else:
-                gtp_layout = None
-            buffer = _ParamAndGradBuffer(
-                self.ddp_config,
-                buffer_key.param_dtype,
-                buffer_key.grad_dtype,
-                params_with_names,
-                self.intra_dp_cp_with_gtp_group,
-                self.bucket_size,
-                param_to_name,
-                gtp_gradient_scaling_factor,
-                param_indices,
-                self.ddp_config.nccl_ub,
-                pg_collection,
-                param_layout=gtp_layout,
-            )
-            self.gtp_buffers.append(buffer)
-
-        # EGTP-sharded routed experts: same story as dense GTP but on the expert side —
-        # their grads were RS'd over the EGTP axis by GTP, so the DP reduction here must
-        # exclude EGTP peers (intra_expt_dp_with_egtp_group) and use the matching
-        # egtp_gradient_scaling_factor (numerator = collective size). Non-GTP expert
-        # params took the full intra_expt_dp_group branch above.
-        for buffer_key, (params, param_indices) in egtp_buffer_groups.items():
-            params_with_names = [(p, param_to_name[p]) for p in params]
-            if self.ddp_config.use_distributed_optimizer:
-                from ..optimizer.distrib_optimizer import DistributedOptimizer
-
-                egtp_layout = DistributedOptimizer._compute_per_buffer_param_layout(
-                    params,
-                    self.bucket_size,
-                    self.intra_expt_dp_with_egtp_group.size(),
-                    self.ddp_config,
-                    param_indices,
-                )
-            else:
-                egtp_layout = None
-            buffer = _ParamAndGradBuffer(
-                self.ddp_config,
-                buffer_key.param_dtype,
-                buffer_key.grad_dtype,
-                params_with_names,
-                self.intra_expt_dp_with_egtp_group,
-                self.bucket_size,
-                param_to_name,
-                egtp_gradient_scaling_factor,
-                param_indices,
-                self.ddp_config.nccl_ub,
-                pg_collection,
-                param_layout=egtp_layout,
-            )
-            self.egtp_buffers.append(buffer)
-
         # In some scenarios, we want to put buckets from different buffers into a group so that
         # their communication can be aggregated. For example, when there are both fp8 buffers
         # and bf16 buffers in the model and vpp is enabled, each model chunk will have an fp8
@@ -431,47 +340,20 @@ class DistributedDataParallel(_BaseDataParallel):
                 self.ddp_config.reduce_scatter_with_fp32_accumulation
             ),
         )
-        self.gtp_bucket_groups = partition_buckets(
-            self.gtp_buffers,
-            force_single_bucket_group=disable_bucketing,
-            reduce_scatter_with_fp32_accumulation=(
-                self.ddp_config.reduce_scatter_with_fp32_accumulation
-            ),
-        )
-        self.egtp_bucket_groups = partition_buckets(
-            self.egtp_buffers,
-            force_single_bucket_group=disable_bucketing,
-            reduce_scatter_with_fp32_accumulation=(
-                self.ddp_config.reduce_scatter_with_fp32_accumulation
-            ),
-        )
-        # Flat view across all four bucket-group lists; used wherever
-        # callers need to iterate every bucket group regardless of dense /
-        # expert-parallel / GTP / EGTP category. The per-category lists above are
-        # kept for code paths that need per-category state (e.g. one
+        # Flat view across the bucket-group lists; used wherever callers need to iterate every
+        # bucket group regardless of dense / expert-parallel category. The per-category lists
+        # above are kept for code paths that need per-category state (e.g. one
         # communication_stream per category).
-        self.all_bucket_groups = (
-            self.bucket_groups
-            + self.expert_parallel_bucket_groups
-            + self.gtp_bucket_groups
-            + self.egtp_bucket_groups
-        )
+        self.all_bucket_groups = self.bucket_groups + self.expert_parallel_bucket_groups
         # Same flat-view convenience for the underlying buffers (lifecycle ops
         # like reset/offload/reload iterate over every buffer once).
-        self.all_buffers = (
-            self.buffers + self.expert_parallel_buffers + self.gtp_buffers + self.egtp_buffers
-        )
+        self.all_buffers = self.buffers + self.expert_parallel_buffers
 
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             assert (
                 self.ddp_config.use_distributed_optimizer
             ), 'Partial DistOpt cannot be used without DistOpt'
-            for bucket_groups in [
-                self.bucket_groups,
-                self.expert_parallel_bucket_groups,
-                self.gtp_bucket_groups,
-                self.egtp_bucket_groups,
-            ]:
+            for bucket_groups in [self.bucket_groups, self.expert_parallel_bucket_groups]:
                 communication_stream = torch.cuda.Stream(device=torch.cuda.current_device())
                 for bucket_group in bucket_groups:
                     bucket_group.inter_distributed_optimizer_instance_group = (
@@ -485,12 +367,7 @@ class DistributedDataParallel(_BaseDataParallel):
         # layer-wise optimizer cases; the latter sets overlap_param_gather=True
         # without use_distributed_optimizer.
         if self.ddp_config.overlap_param_gather:
-            for bucket_groups in [
-                self.bucket_groups,
-                self.expert_parallel_bucket_groups,
-                self.gtp_bucket_groups,
-                self.egtp_bucket_groups,
-            ]:
+            for bucket_groups in [self.bucket_groups, self.expert_parallel_bucket_groups]:
                 num_bucket_groups = len(bucket_groups)
                 for i in range(1, num_bucket_groups):
                     bucket_groups[num_bucket_groups - i].next_param_gather_bucket_group = (

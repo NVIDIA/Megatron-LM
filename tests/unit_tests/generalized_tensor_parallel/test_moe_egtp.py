@@ -105,9 +105,7 @@ def _worker_moe_egtp_correctness(rank, world_size, port):
         )
 
     def make_moe_layer(config, pg_collection):
-        moe_spec = get_moe_module_spec(
-            use_te=True, num_experts=NUM_EXPERTS, moe_grouped_gemm=True
-        )
+        moe_spec = get_moe_module_spec(use_te=True, num_experts=NUM_EXPERTS, moe_grouped_gemm=True)
         return moe_spec(config, layer_number=1, pg_collection=pg_collection)
 
     def run_step(layer, x):
@@ -147,17 +145,21 @@ def _worker_moe_egtp_correctness(rank, world_size, port):
 
     # Collect the full expert weight table so Phase 2 can restore identical init weights.
     # EP=4: each rank holds 2 experts; all-gather gives every rank the complete [8, dim, ...] table.
-    local_fc1 = torch.stack([
-        dict(layer.named_parameters())[f'experts.linear_fc1.weight{i}'].data
-        for i in range(num_local_experts_baseline)
-    ])  # [2, FFN_HIDDEN, HIDDEN]
+    local_fc1 = torch.stack(
+        [
+            dict(layer.named_parameters())[f'experts.linear_fc1.weight{i}'].data
+            for i in range(num_local_experts_baseline)
+        ]
+    )  # [2, FFN_HIDDEN, HIDDEN]
     global_fc1 = torch.zeros(NUM_EXPERTS, FFN_HIDDEN, HIDDEN, dtype=dtype, device='cuda')
     dist.all_gather_into_tensor(global_fc1, local_fc1, group=ep_group)
 
-    local_fc2 = torch.stack([
-        dict(layer.named_parameters())[f'experts.linear_fc2.weight{i}'].data
-        for i in range(num_local_experts_baseline)
-    ])  # [2, HIDDEN, FFN_HIDDEN]
+    local_fc2 = torch.stack(
+        [
+            dict(layer.named_parameters())[f'experts.linear_fc2.weight{i}'].data
+            for i in range(num_local_experts_baseline)
+        ]
+    )  # [2, HIDDEN, FFN_HIDDEN]
     global_fc2 = torch.zeros(NUM_EXPERTS, HIDDEN, FFN_HIDDEN, dtype=dtype, device='cuda')
     dist.all_gather_into_tensor(global_fc2, local_fc2, group=ep_group)
 
@@ -220,16 +222,16 @@ def _worker_moe_egtp_correctness(rank, world_size, port):
     # Restore weights from saved global tables.
     # Expert local index j → global expert id = ep_rank_egtp * num_local_experts_egtp + j.
     fc1_shard = FFN_HIDDEN // egtp_size  # 2688/2 = 1344
-    fc2_shard = HIDDEN // egtp_size      # 4096/2 = 2048
+    fc2_shard = HIDDEN // egtp_size  # 4096/2 = 2048
     for name, p in layer_egtp.named_parameters():
         if 'linear_fc1.weight' in name:
             j = int(name.rsplit('weight', 1)[1])
             gid = ep_rank_egtp * num_local_experts_egtp + j
-            p.data.copy_(global_fc1[gid, egtp_rank * fc1_shard: (egtp_rank + 1) * fc1_shard])
+            p.data.copy_(global_fc1[gid, egtp_rank * fc1_shard : (egtp_rank + 1) * fc1_shard])
         elif 'linear_fc2.weight' in name:
             j = int(name.rsplit('weight', 1)[1])
             gid = ep_rank_egtp * num_local_experts_egtp + j
-            p.data.copy_(global_fc2[gid, egtp_rank * fc2_shard: (egtp_rank + 1) * fc2_shard])
+            p.data.copy_(global_fc2[gid, egtp_rank * fc2_shard : (egtp_rank + 1) * fc2_shard])
         elif name in non_expert_weights:
             p.data.copy_(non_expert_weights[name])
 

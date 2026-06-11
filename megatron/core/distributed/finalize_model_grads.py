@@ -442,6 +442,56 @@ maintain for legacy tests. We can remove this proxy in mcore 0.14.
 _allreduce_layernorm_grads = _allreduce_non_tensor_model_parallel_grads
 
 
+def _allreduce_replicated_grads_over_gtp_group(model: List[torch.nn.Module]):
+    """SUM NON-GTP (replicated) param grads over the gtp / egtp group.
+
+    DDP reduces every param over the gtp-EXCLUDED replicate DP group with the standard 1/full
+    (= 1/(replicate*gtp)) scaling. The gtp axis is completed elsewhere:
+    GTP-sharded weights by their reduce-scatter SUM; the replicated (non-GTP) params here, by a
+    SUM all-reduce over the gtp (dense) / egtp (expert) group. SUM (not AVG) because DDP already
+    applied 1/full — summing the gtp copies of the partially-reduced grad yields the full sum,
+    times 1/full = the mean over the full DP*GTP domain. Mirror of
+    :func:`_allreduce_non_tensor_model_parallel_grads`, over the gtp axis. No-op when GTP is
+    inactive (gtp/egtp group size <= 1).
+    """
+    gtp_group = parallel_state.get_generalized_tensor_parallel_remat_group(check_initialized=False)
+    egtp_group = parallel_state.get_expert_generalized_tensor_parallel_remat_group(
+        check_initialized=False
+    )
+
+    dense_params, dense_grads = [], []
+    expert_params, expert_grads = [], []
+    for model_chunk in model:
+        for name, param in get_attr_wrapped_model(model_chunk, 'named_parameters')():
+            if not param.requires_grad or getattr(param, 'is_gtp', False):
+                continue  # GTP-sharded params: their gtp axis is handled by the RS-mean.
+            grad_attr = _get_main_grad_attr(param)
+            grad = getattr(param, grad_attr, None)
+            if grad is None:
+                continue
+            grad = _unshard_if_dtensor(grad)
+            if getattr(param, 'allreduce', True):
+                dense_params.append(param)
+                dense_grads.append(grad.data)
+            else:
+                expert_params.append(param)
+                expert_grads.append(grad.data)
+
+    for params, grads, group in (
+        (dense_params, dense_grads, gtp_group),
+        (expert_params, expert_grads, egtp_group),
+    ):
+        if not grads or group is None or group.size() <= 1:
+            continue
+        coalesced = _flatten_dense_tensors(grads)
+        torch.distributed.all_reduce(coalesced, op=torch.distributed.ReduceOp.SUM, group=group)
+        for param, buf, synced in zip(params, grads, _unflatten_dense_tensors(coalesced, grads)):
+            buf.copy_(synced)
+            grad_attr = _get_main_grad_attr(param)
+            orig_grad = getattr(param, grad_attr)
+            setattr(param, grad_attr, _reshard_if_dtensor(buf, orig_grad))
+
+
 def finalize_model_grads(
     model: List[torch.nn.Module],
     num_tokens: Optional[torch.Tensor] = None,
@@ -526,6 +576,9 @@ def finalize_model_grads(
             barrier=config.barrier_with_L1_time
         )
     _allreduce_non_tensor_model_parallel_grads(model, config, tp_group)
+    # Complete the gtp-axis reduction for replicated (non-GTP) params, whose DDP reduction
+    # covered only the gtp-EXCLUDED replicate DP group (no-op when GTP is inactive).
+    _allreduce_replicated_grads_over_gtp_group(model)
     if config.timers is not None:
         config.timers('non-tensor-parallel-grads-all-reduce').stop()
 

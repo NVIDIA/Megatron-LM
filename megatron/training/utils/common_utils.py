@@ -167,7 +167,10 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
         torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM, group=group)
 
     # --- Sharded optimizer DP reductions (each category uses its own group) ---
-    _sum_reduce(sharded_norm_2, mpu.get_data_parallel_group(with_context_parallel=True))
+    # Reduce over the gtp-EXCLUDED replicate group: the model-parallel reduce below already
+    # spans the gtp axis, so a gtp-inclusive group here would over-count by gtp. No-op for
+    # non-GTP runs (the with_gtp group aliases the regular DP group).
+    _sum_reduce(sharded_norm_2, mpu.get_data_parallel_group(with_context_parallel=True, with_gtp=True))
     _sum_reduce(gtp_sharded_norm_2, mpu.get_data_parallel_group(with_context_parallel=True, with_gtp=True))
     _sum_reduce(moe_sharded_norm_2, mpu.get_expert_data_parallel_group())
     _sum_reduce(moe_gtp_sharded_norm_2, mpu.get_expert_data_parallel_group(with_gtp=True))
