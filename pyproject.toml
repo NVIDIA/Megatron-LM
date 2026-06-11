@@ -125,7 +125,7 @@ te = [
 ]
 
 ssm = [
-    "mamba-ssm~=2.2",
+    "mamba-ssm @ git+https://github.com/state-spaces/mamba.git@0048fbf2e7b2f214dcbe703ea3dec2b9647595e1",
     "causal-conv1d~=1.5",
 ]
 

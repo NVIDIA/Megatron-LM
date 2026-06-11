@@ -208,6 +208,7 @@ class MambaMixer(MegatronModule):
         assert pg_collection is not None, "pg_collection must be provided for MambaMixer"
         self.pg_collection = pg_collection
         self.use_mem_eff_path = self.config.use_mamba_mem_eff_path
+        self.mamba_training_ssm_states_dtype = config.mamba_training_ssm_states_dtype
         self.d_state = self.config.mamba_state_dim
         self.headdim = self.config.mamba_head_dim
         self.ngroups = self.config.mamba_num_groups
@@ -740,6 +741,11 @@ class MambaMixer(MegatronModule):
             ngroups=self.cp.ngroups_local_tpcp,
             norm_before_gate=self.norm_before_gate,
             seq_idx=seq_idx,
+            **(
+                {"state_dtype": self.mamba_training_ssm_states_dtype}
+                if self.mamba_training_ssm_states_dtype is not None
+                else {}
+            ),
         )
 
         y = rearrange(y, "b l d -> l b d").contiguous()
@@ -1033,6 +1039,11 @@ class MambaMixer(MegatronModule):
                 dt_softplus=True,
                 return_final_states=ssm_state is not None,
                 initial_states=initial_ssm_state,
+                **(
+                    {"state_dtype": self.mamba_training_ssm_states_dtype}
+                    if self.mamba_training_ssm_states_dtype is not None
+                    else {}
+                ),
             )
 
             if ssm_state is not None:
