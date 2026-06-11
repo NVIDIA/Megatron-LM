@@ -22,6 +22,34 @@ from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 
 
+def _apply_yarn_config_from_args(config, args) -> None:
+    """Populate YaRN fields on config from args when not already set.
+
+    Preserves values already present on ``config`` (e.g. from YAML or a caller-
+    supplied config) and allows optional CLI overrides via ``getattr``.
+    """
+    if args.position_embedding_type != 'yarn':
+        return
+
+    def _set_if_missing(attr: str, value) -> None:
+        if not hasattr(config, attr):
+            setattr(config, attr, value)
+
+    _set_if_missing('yarn_rotary_scaling_factor', args.rotary_scaling_factor)
+    _set_if_missing(
+        'yarn_original_max_position_embeddings',
+        getattr(args, 'yarn_original_max_position_embeddings', 4096),
+    )
+    _set_if_missing('yarn_beta_fast', getattr(args, 'yarn_beta_fast', 32.0))
+    _set_if_missing('yarn_beta_slow', getattr(args, 'yarn_beta_slow', 1.0))
+    _set_if_missing('yarn_mscale', args.mscale)
+    _set_if_missing('yarn_mscale_all_dim', args.mscale_all_dim)
+    _set_if_missing(
+        'yarn_correction_range_round_to_int',
+        getattr(args, 'yarn_correction_range_round_to_int', False),
+    )
+
+
 def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_collection=None):
     print_rank_0('building GPT model ...')
     if config is None:
@@ -29,24 +57,15 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
             config = core_transformer_config_from_yaml(args, "language_model")
         else:
             config = core_transformer_config_from_args(args)
-    if args.position_embedding_type == 'yarn':
-        config.yarn_rotary_scaling_factor = args.rotary_scaling_factor
-        config.yarn_original_max_position_embeddings = 4096
-        config.yarn_beta_fast = 32.0
-        config.yarn_beta_slow = 1.0
-        config.yarn_mscale = args.mscale
-        config.yarn_mscale_all_dim = args.mscale_all_dim
-        config.yarn_correction_range_round_to_int = False
+    _apply_yarn_config_from_args(config, args)
     if args.spec is not None:
         transformer_layer_spec = import_module(args.spec)
     else:
         use_te = args.transformer_impl == "transformer_engine"
 
         if args.experimental_attention_variant is not None:
-            transformer_layer_spec = (
-                get_transformer_block_with_experimental_attention_variant_spec(
-                    config=config, vp_stage=vp_stage
-                )
+            transformer_layer_spec = get_transformer_block_with_experimental_attention_variant_spec(
+                config=config, vp_stage=vp_stage
             )
         elif args.num_experts:
             # Define the decoder block spec
@@ -76,8 +95,8 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
         else:
             # Define the decoder block spec
             if args.experimental_attention_variant is not None:
-                decoder_layer_specs = get_transformer_layer_with_experimental_attention_variant_spec(
-                    config=config
+                decoder_layer_specs = (
+                    get_transformer_layer_with_experimental_attention_variant_spec(config=config)
                 )
             else:
                 decoder_layer_specs = get_gpt_decoder_layer_specs(
@@ -90,10 +109,7 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
             transformer_layer_spec_for_mtp = decoder_layer_specs[-1]
         # Use spec of the last layer in decoder block as spec of the transformer layer in MTP
         mtp_block_spec = get_gpt_mtp_block_spec(
-            config,
-            transformer_layer_spec_for_mtp,
-            use_transformer_engine=use_te,
-            vp_stage=vp_stage,
+            config, transformer_layer_spec_for_mtp, use_transformer_engine=use_te, vp_stage=vp_stage
         )
 
     model = GPTModel(
@@ -145,9 +161,7 @@ def _get_transformer_layer_spec(use_te, config):
         )
     elif config.transformer_impl == "inference_optimized":
         return get_gpt_layer_with_inference_spec(
-            config.qk_layernorm,
-            config.multi_latent_attention,
-            qk_l2_norm=config.qk_l2_norm,
+            config.qk_layernorm, config.multi_latent_attention, qk_l2_norm=config.qk_l2_norm
         )
     else:
         return get_gpt_layer_local_spec(

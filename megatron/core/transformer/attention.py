@@ -809,11 +809,13 @@ class Attention(MegatronModule, ABC):
                 f"softmax_type={self.config.softmax_type!r} requires a "
                 f"softmax_offset tensor on core_attention but none was found."
             )
-            offset = torch.zeros(
-                self.num_attention_heads_per_partition,
-                device=torch.cuda.current_device(),
-                dtype=self.config.params_dtype,
-            )
+            if not hasattr(self, "_inference_zero_softmax_offset"):
+                self._inference_zero_softmax_offset = torch.zeros(
+                    self.num_attention_heads_per_partition,
+                    device=torch.cuda.current_device(),
+                    dtype=self.config.params_dtype,
+                )
+            offset = self._inference_zero_softmax_offset
         return offset
 
     @staticmethod
@@ -950,9 +952,10 @@ class Attention(MegatronModule, ABC):
         # the build (some return (out, lse), others
         # (out, q, k, v, out_padded, lse, p)). We probe by tensor rank because
         # softmax_lse is always 2D (num_heads, total_q).
+        num_heads = q.shape[-2]
         softmax_lse = None
         for item in unused:
-            if isinstance(item, torch.Tensor) and item.dim() == 2:
+            if isinstance(item, torch.Tensor) and item.dim() == 2 and item.shape[0] == num_heads:
                 softmax_lse = item
                 break
         assert softmax_lse is not None, (
@@ -1202,14 +1205,12 @@ class Attention(MegatronModule, ABC):
                         # FA2/FA3 *_with_kvcache return (out, softmax_lse) when
                         # return_softmax_lse=True.
                         output_total, softmax_lse = kvcache_ret
-                    else:
-                        output_total = kvcache_ret
-                        softmax_lse = None
-                    if need_lse:
                         # output_total: (B, S, H, D); softmax_lse: (B, H, S)
                         output_total = self._apply_sink_softmax_correction_bshd(
                             output_total, softmax_lse, softmax_offset
                         )
+                    else:
+                        output_total = kvcache_ret
 
             # Reshape back to (B*S, 1, H, D) for consistent output shape.
             output_total = output_total.reshape(
