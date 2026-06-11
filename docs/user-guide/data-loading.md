@@ -72,6 +72,8 @@ If your later training job does not set `--global-batch-size`, or you are prepar
 
 This keeps the prepared cache aligned with the sample counts expected by training.
 
+> **Unsupported configurations:** `tools/prepare_cache.py` does not support `--mock-data`, `--sft`, `--fim-data`, or `--step-batch-size-schedule`. Using any of these will cause the script to exit with an error.
+
 ### Step 3: Optionally pre-build per-dataset metadata
 
 When blending many datasets, generate the `--per-dataset-sequences-path` JSON ahead of time to avoid one metadata read per file prefix at startup:

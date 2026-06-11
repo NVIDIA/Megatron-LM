@@ -50,11 +50,19 @@ jobs:
           trigger_phrase: "/claude review"
           show_full_output: true
           claude_args: |
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr review:*)"
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr review:*),Read"
             --model "claude-opus-4-6"
           prompt: |
             REPO: ${{ env.REPO }}
             PR NUMBER: ${{ env.PR_NUMBER }}
+
+            Mandatory workflow — never skip or reorder:
+            1. Read the PR diff first (gh pr diff).
+            2. Based on the changed files and areas, identify relevant skills from skills/<name>/SKILL.md.
+               Common skill names: build-and-dependency, testing, cicd, linting-and-formatting, run-on-slurm,
+               nightly-sync, create-issue, respond-to-issue, split-pr, onboard-gb200-1node-tests.
+            3. Read the SKILL.md files for all relevant areas using the Read tool.
+            4. Only then perform the review using the skill context.
 
             You are doing a light code review. Keep it concise and actionable.
 
@@ -65,6 +73,13 @@ jobs:
               - If the PR adds a new feature or significant functionality without corresponding tests, suggest adding tests
               - If the PR fixes a bug that was not caught by an existing unit test, suggest adding a regression test to prevent recurrence
             - Outdated or inaccurate documentation affected by the changes
+            - New direct global process group access in `megatron/core` production code
+              - Flag added calls to `parallel_state.get_*_group()` or directly imported
+                `get_*_group()` helpers unless they are in `parallel_state.py`,
+                `process_groups_config.py`, initialization/bootstrap code that materializes a
+                `ProcessGroupCollection`, tests, docs, or an explicitly documented migration fallback
+              - Prefer passing a `ProcessGroupCollection` or explicit
+                `torch.distributed.ProcessGroup` from the caller
 
             Do NOT comment on:
             - Style preferences or formatting
@@ -134,12 +149,20 @@ jobs:
           trigger_phrase: "/claude strict-review"
           show_full_output: true
           claude_args: |
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr review:*),Bash(git diff:*),Bash(git show:*),Bash(git log:*)"
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr review:*),Bash(git diff:*),Bash(git show:*),Bash(git log:*),Read"
             --model "claude-opus-4-6"
           prompt: |
             REPO: ${{ env.REPO }}
             PR NUMBER: ${{ env.PR_NUMBER }}
             BASE REF: origin/${{ steps.pr-info.outputs.base_ref }}
+
+            Mandatory workflow — never skip or reorder:
+            1. Read the PR diff first (gh pr diff).
+            2. Based on the changed files and areas, identify relevant skills from skills/<name>/SKILL.md.
+               Common skill names: build-and-dependency, testing, cicd, linting-and-formatting, run-on-slurm,
+               nightly-sync, create-issue, respond-to-issue, split-pr, onboard-gb200-1node-tests.
+            3. Read the SKILL.md files for all relevant areas using the Read tool.
+            4. Only then perform the review using the skill context.
 
             You are performing a strict, comprehensive code review on a **Megatron-LM** Pull Request.
             Megatron-LM is NVIDIA's large-scale distributed training framework for LLMs.
@@ -195,6 +218,18 @@ jobs:
             - **Default value changes**: Changed defaults for training hyperparameters or parallelism settings — silently alters behavior for users relying on defaults
             - **API contract changes**: Changed function signatures, return types, or side effects in megatron/core/ without backward-compat shim
             - **Model architecture changes**: Altered layer ordering, initialization, or normalization placement — existing pretrained weights become incompatible
+
+            ### Megatron Core Process Group Usage
+            - In `megatron/core` production code, treat new direct reads of global process groups
+              from `parallel_state` as review findings unless they are clearly compatibility-only.
+            - Flag added calls to `parallel_state.get_*_group()` or directly imported
+              `get_*_group()` helpers when the surrounding code could instead receive a
+              `ProcessGroupCollection` or explicit `torch.distributed.ProcessGroup` from its caller.
+            - Do not flag `megatron/core/parallel_state.py`, `megatron/core/process_groups_config.py`,
+              tests, docs, initialization/bootstrap code that materializes a `ProcessGroupCollection`
+              from MPU globals, or explicitly documented migration fallbacks.
+            - This guidance is advisory and targets Megatron Core library code; do not apply it to
+              `megatron/training` or other training-loop code unless the PR opts into that migration.
 
             ### Mandatory Check: Unused New Variables / Arguments
             - For each changed file, list newly added identifiers (function args, config fields, locals).

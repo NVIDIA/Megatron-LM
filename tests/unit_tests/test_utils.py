@@ -14,13 +14,16 @@ import torch
 import megatron.core.utils as util
 import megatron.training.utils as training_util
 from megatron.core import config
+from megatron.core._rank_utils import safe_get_world_size
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.moe.moe_layer import MoELayer
+from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
+from megatron.core.transformer.spec_utils import get_submodules
+from megatron.training.utils.common_utils import get_local_rank_preinit
 from tests.unit_tests.test_utilities import Utils
 
 success_string = "hello,world"
@@ -326,12 +329,11 @@ def test_param_norm_moe(use_distributed_optimizer: bool):
         add_bias_linear=False,
         bf16=True,
     )
-    model = MoELayer(
-        transformer_config,
-        get_gpt_layer_with_transformer_engine_submodules(
-            num_experts=2, moe_grouped_gemm=True
-        ).mlp.submodules,
-    ).to(device='cuda')
+    submodules = get_submodules(
+        get_gpt_layer_with_transformer_engine_submodules(num_experts=2, moe_grouped_gemm=True).mlp
+    )
+    assert isinstance(submodules, MoESubmodules)
+    model = MoELayer(transformer_config, submodules).to(device='cuda')
     model.requires_grad_(True)
     # Initialize the model with all 1.0 for weights.
     for param in model.parameters():
@@ -470,3 +472,135 @@ def test_straggler_detector():
     util.StragglerDetector._configured = False
     # Teardown.
     _deinit_distributed()
+
+
+class TestGetWorldSizeSafe:
+    """Test get_world_size_safe function."""
+
+    @patch("torch.distributed.is_initialized")
+    @patch("torch.distributed.get_world_size")
+    def test_initialized_torch_distributed(self, mock_get_world_size, mock_is_initialized):
+        """Test get_world_size_safe when torch.distributed is initialized."""
+        mock_is_initialized.return_value = True
+        mock_get_world_size.return_value = 4
+
+        result = safe_get_world_size()
+
+        assert result == 4
+        mock_is_initialized.assert_called_once()
+        mock_get_world_size.assert_called_once()
+
+    @patch("torch.distributed.is_initialized")
+    @patch.dict(os.environ, {"WORLD_SIZE": "8"})
+    def test_uninitialized_torch_distributed_with_env_var(self, mock_is_initialized):
+        """Test get_world_size_safe when torch.distributed is not initialized but WORLD_SIZE env var exists."""
+        mock_is_initialized.return_value = False
+
+        result = safe_get_world_size()
+
+        assert result == 8
+        mock_is_initialized.assert_called_once()
+
+    @patch("torch.distributed.is_initialized")
+    @patch.dict(os.environ, {}, clear=True)
+    def test_uninitialized_torch_distributed_no_env_var(self, mock_is_initialized):
+        """Test get_world_size_safe when torch.distributed is not initialized and no WORLD_SIZE env var."""
+        mock_is_initialized.return_value = False
+
+        result = safe_get_world_size()
+
+        assert result == 1
+        mock_is_initialized.assert_called_once()
+
+    @patch("torch.distributed.is_initialized")
+    @patch.dict(os.environ, {"WORLD_SIZE": "invalid"})
+    def test_invalid_world_size_env_var(self, mock_is_initialized):
+        """Test get_world_size_safe with invalid WORLD_SIZE environment variable."""
+        mock_is_initialized.return_value = False
+
+        with pytest.raises(ValueError):
+            safe_get_world_size()
+
+
+class TestGetLocalRankPreinit:
+    """Test get_local_rank_preinit function."""
+
+    @patch.dict(os.environ, {"LOCAL_RANK": "3"}, clear=True)
+    def test_uses_local_rank_env_var(self):
+        assert get_local_rank_preinit() == 3
+
+    @patch.dict(
+        os.environ, {"LOCAL_RANK": "2", "SLURM_NTASKS": "8", "SLURM_LOCALID": "5"}, clear=True
+    )
+    def test_local_rank_takes_precedence_over_slurm(self):
+        assert get_local_rank_preinit() == 2
+
+    @patch.dict(os.environ, {"SLURM_NTASKS": "8", "SLURM_LOCALID": "6"}, clear=True)
+    def test_falls_back_to_slurm_localid(self):
+        assert get_local_rank_preinit() == 6
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_defaults_to_zero_with_warning(self):
+        with pytest.warns(UserWarning, match="Could not determine local rank"):
+            assert get_local_rank_preinit() == 0
+
+
+class TestSingleGroupReductionHelpers:
+    """The optional ``group=`` on the reduction helpers, exercised with a HyperCommGrid-derived
+    process group (no ``parallel_state`` init — the MIMO use case) plus a default→mpu fallback."""
+
+    @staticmethod
+    def _ranks(group):
+        return torch.distributed.get_process_group_ranks(group)
+
+    def test_explicit_grid_group(self):
+        """Helpers reduce correctly over a group built from a HyperCommGrid, no parallel_state."""
+        from megatron.core.hyper_comm_grid import HyperCommGrid
+        from megatron.training.utils.common_utils import (
+            average_losses_across_data_parallel_group,
+            logical_and_across_model_parallel_group,
+            reduce_max_stat_across_model_parallel_group,
+        )
+
+        Utils.initialize_distributed()  # torch.distributed only; NOT initialize_model_parallel
+        world = torch.distributed.get_world_size()
+        rank = torch.distributed.get_rank()
+        # tp=2 over the world: "tp" groups stand in for a model-parallel group, "dp" for data.
+        grid = HyperCommGrid([2, world // 2], ["tp", "dp"], backend="nccl")
+        grid.create_pg(["tp"])
+        grid.create_pg(["dp"])
+        mp_group, dp_group = grid.get_pg("tp"), grid.get_pg("dp")
+        mp_ranks, dp_ranks = self._ranks(mp_group), self._ranks(dp_group)
+        try:
+            # reduce_max: MAX over the grid mp group.
+            assert reduce_max_stat_across_model_parallel_group(
+                float(rank), group=mp_group
+            ) == float(max(mp_ranks))
+
+            # logical_and: True iff every member is True (only the lowest mp rank passes True).
+            flag = rank == min(mp_ranks)
+            expected_and = all(r == min(mp_ranks) for r in mp_ranks)
+            assert logical_and_across_model_parallel_group(flag, group=mp_group) is expected_and
+
+            # average: SUM-then-divide over the grid dp group -> mean of member ranks.
+            loss = torch.tensor(float(rank), device=torch.cuda.current_device())
+            out = average_losses_across_data_parallel_group([loss], group=dp_group)
+            torch.testing.assert_close(
+                out.cpu(), torch.tensor([sum(dp_ranks) / len(dp_ranks)], dtype=torch.float32)
+            )
+        finally:
+            grid.destroy()
+
+    def test_default_falls_back_to_mpu(self):
+        """With no ``group=``, helpers read the mpu global (back-compat for non-MIMO callers)."""
+        from megatron.core import parallel_state as mpu
+        from megatron.training.utils.common_utils import reduce_max_stat_across_model_parallel_group
+
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+        rank = torch.distributed.get_rank()
+        explicit = reduce_max_stat_across_model_parallel_group(
+            float(rank), group=mpu.get_model_parallel_group()
+        )
+        default = reduce_max_stat_across_model_parallel_group(float(rank))
+        assert default == explicit
+        Utils.destroy_model_parallel()

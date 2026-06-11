@@ -117,4 +117,20 @@ html_extra_path = ["project.json", "versions1.json"]
 linkcheck_ignore = [
     ".*github\\.com.*",
     ".*githubusercontent\\.com.*",
+    "http://localhost.*",
+]
+linkcheck_retries = 10
+linkcheck_rate_limit_timeout = 600
+linkcheck_workers = 1
+
+# PyTorch docs use a JS-rendered frontend; anchor IDs are injected at runtime
+# and are not present in the static HTML that linkcheck fetches.
+linkcheck_anchors_ignore_for_url = [
+    r"https://docs\.pytorch\.org/.*",
+]
+
+# PyTorch docs anchor IDs change between stable versions; verify the page
+# loads but skip anchor validation to avoid spurious failures on redirects.
+linkcheck_anchors_ignore_for_url = [
+    "https://docs.pytorch.org/.*",
 ]
