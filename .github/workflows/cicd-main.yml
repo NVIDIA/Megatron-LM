@@ -716,6 +716,8 @@ jobs:
       PIP_DISABLE_PIP_VERSION_CHECK: 1
       PIP_NO_PYTHON_VERSION_WARNING: 1
       PIP_ROOT_USER_ACTION: ignore
+      PIP_DEFAULT_TIMEOUT: 120
+      PIP_RETRIES: 5
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -865,6 +867,8 @@ jobs:
       PIP_DISABLE_PIP_VERSION_CHECK: 1
       PIP_NO_PYTHON_VERSION_WARNING: 1
       PIP_ROOT_USER_ACTION: ignore
+      PIP_DEFAULT_TIMEOUT: 120
+      PIP_RETRIES: 5
     if: |
       !cancelled()
       && needs.cicd-integration-gate.outputs.should_run == 'true'
@@ -962,6 +966,8 @@ jobs:
       PIP_DISABLE_PIP_VERSION_CHECK: 1
       PIP_NO_PYTHON_VERSION_WARNING: 1
       PIP_ROOT_USER_ACTION: ignore
+      PIP_DEFAULT_TIMEOUT: 120
+      PIP_RETRIES: 5
     if: |
       !cancelled()
       && needs.cicd-integration-gate.outputs.should_run == 'true'
@@ -1236,3 +1242,10 @@ jobs:
       - name: Taint node for cleanup
         shell: bash
         run: taint-node.sh
+
+  DCO_merge_group:
+    name: DCO
+    if: github.event_name == 'merge_group'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "The real DCO check happens on PRs only. This is a placeholder for the merge queue to keep the DCO check as a required status check."

@@ -127,6 +127,9 @@ runs:
         export PYTHONPATH=$(pwd)
         export NEMORUN_HOME=$(pwd)
         export NCCL_DEBUG=INFO
+        export PIP_DEFAULT_TIMEOUT=120
+        export PIP_RETRIES=5
+        export UV_HTTP_TIMEOUT=120
         uv venv .venv
         uv cache clean
         uv sync --no-cache --only-group test
@@ -169,6 +172,9 @@ runs:
 
         export PYTHONPATH=$(pwd)
         export NEMORUN_HOME=$(pwd)
+        export PIP_DEFAULT_TIMEOUT=120
+        export PIP_RETRIES=5
+        export UV_HTTP_TIMEOUT=120
         uv venv .venv
         uv cache clean
         uv sync --no-cache --only-group test
