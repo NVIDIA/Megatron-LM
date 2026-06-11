@@ -1,15 +1,15 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""End-to-end test for Mamba prefix caching with a real hybrid model.
+"""End-to-end test for SSM prefix caching with a real hybrid model.
 
-This test exercises the 4 key indices within a Mamba prefill:
+This test exercises the 4 key indices within an SSM prefill:
 
-  1. num_mamba_matched — how many blocks have cached Mamba state.
+  1. num_ssm_matched — how many blocks have cached SSM state.
      Determines how many tokens the prefill can skip.
 
   2. num_kv_matched — how many KV blocks are shared with prior
-     requests. Can exceed num_mamba_matched, since KV blocks are
-     always registered for every completed block, while Mamba
+     requests. Can exceed num_ssm_matched, since KV blocks are
+     always registered for every completed block, while SSM
      state is only cached at divergence and last-aligned blocks.
 
   3. last_aligned_block — the last full-block boundary in the
@@ -275,7 +275,7 @@ class TestMambaPrefixCachingE2E:
         if step == 1:
             for g in range(G):
                 r = reqs_by_group[g]
-                assert r[0]._mamba_num_matched_blocks == 0, f"step 1 group {g}"
+                assert r[0]._ssm_num_matched_blocks == 0, f"step 1 group {g}"
                 assert r[0].precomputed_block_hashes[0] in ctx.ssm_slot_allocator.hash_to_block_id
             assert len(ctx.ssm_slot_allocator.hash_to_block_id) == G
             assert step_prefill == G * 300, f"step 1: expected {G * 300}, got {step_prefill}"
@@ -287,7 +287,7 @@ class TestMambaPrefixCachingE2E:
         elif step == 2:
             for g in range(G):
                 r = reqs_by_group[g]
-                assert r[1]._mamba_num_matched_blocks == 1, f"step 2 group {g}"
+                assert r[1]._ssm_num_matched_blocks == 1, f"step 2 group {g}"
                 assert r[1].precomputed_block_hashes[2] in ctx.ssm_slot_allocator.hash_to_block_id
             assert len(ctx.ssm_slot_allocator.hash_to_block_id) == G * 2
             assert step_prefill == G * 544, f"step 2: expected {G * 544}, got {step_prefill}"
@@ -299,8 +299,8 @@ class TestMambaPrefixCachingE2E:
         elif step == 3:
             for g in range(G):
                 r = reqs_by_group[g]
-                assert r[2]._mamba_num_matched_blocks == 1, f"step 3 group {g} req 2"
-                assert r[4]._mamba_num_matched_blocks == 3, f"step 3 group {g} req 4"
+                assert r[2]._ssm_num_matched_blocks == 1, f"step 3 group {g} req 2"
+                assert r[4]._ssm_num_matched_blocks == 3, f"step 3 group {g} req 4"
                 assert r[2].precomputed_block_hashes[1] in ctx.ssm_slot_allocator.hash_to_block_id
                 assert r[2].precomputed_block_hashes[2] in ctx.ssm_slot_allocator.hash_to_block_id
                 assert r[4].precomputed_block_hashes[3] in ctx.ssm_slot_allocator.hash_to_block_id
@@ -316,7 +316,7 @@ class TestMambaPrefixCachingE2E:
         elif step == 4:
             for g in range(G):
                 r = reqs_by_group[g]
-                assert r[3]._mamba_num_matched_blocks == 2, f"step 4 group {g}"
+                assert r[3]._ssm_num_matched_blocks == 2, f"step 4 group {g}"
                 assert r[3].precomputed_block_hashes[2] in ctx.ssm_slot_allocator.hash_to_block_id
                 h0 = r[0].precomputed_block_hashes[0]
                 h1 = r[1].precomputed_block_hashes[1]
@@ -512,7 +512,7 @@ class TestMambaPrefixCachingE2E:
                 finished[merged.request_id] = list(merged.generated_tokens)
 
             if step == 1:
-                assert reqs[0]._mamba_num_matched_blocks == 0, f"step 1"
+                assert reqs[0]._ssm_num_matched_blocks == 0, f"step 1"
                 assert len(ctx.ssm_slot_allocator.hash_to_block_id) == 1
                 assert (
                     reqs[0].precomputed_block_hashes[0] in ctx.ssm_slot_allocator.hash_to_block_id
@@ -521,8 +521,8 @@ class TestMambaPrefixCachingE2E:
             elif step == 2:
                 # B: 1 mamba match but raw_skip >= chunk_length, back off to 0 blocks, full recompute (256)
                 # C: 1 mamba match, skip 256, effective 256
-                assert reqs[1]._mamba_num_matched_blocks == 1, f"step 2 B"
-                assert reqs[2]._mamba_num_matched_blocks == 1, f"step 2 C"
+                assert reqs[1]._ssm_num_matched_blocks == 1, f"step 2 B"
+                assert reqs[2]._ssm_num_matched_blocks == 1, f"step 2 C"
                 assert len(ctx.ssm_slot_allocator.hash_to_block_id) == 2
                 assert (
                     reqs[2].precomputed_block_hashes[1] in ctx.ssm_slot_allocator.hash_to_block_id
@@ -530,7 +530,7 @@ class TestMambaPrefixCachingE2E:
                 assert step_prefill == 512  # B=256 (back-off recompute) + C=256
             elif step == 3:
                 # D: 2 mamba matches, raw_skip >= chunk_length, back off to block 0, skip 256, effective 256
-                assert reqs[3]._mamba_num_matched_blocks == 2, f"step 3 D"
+                assert reqs[3]._ssm_num_matched_blocks == 2, f"step 3 D"
                 assert len(ctx.ssm_slot_allocator.hash_to_block_id) == 2
                 assert step_prefill == 256
 
@@ -616,6 +616,6 @@ class TestMambaPrefixCachingE2E:
 
         # G: identical to E, but E's state was evicted
         req_G = _run_one(2, prompts[2])
-        assert req_G._mamba_num_matched_blocks == 0
+        assert req_G._ssm_num_matched_blocks == 0
         assert h_E0 in ctx.ssm_slot_allocator.hash_to_block_id
         assert finished[0] == finished[2]

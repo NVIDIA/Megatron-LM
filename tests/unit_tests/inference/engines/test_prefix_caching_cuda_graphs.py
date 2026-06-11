@@ -517,10 +517,10 @@ class TestHybridChunkedPrefillIntermediateState:
         while test_engine.has_unfinished_requests():
             collect_finished(test_engine.step_modern())
 
-        # Verify Mamba state was restored for req2 (prefix-cached).
+        # Verify SSM state was restored for req2 (prefix-cached).
         assert (
-            req2._mamba_num_matched_blocks == 1
-        ), f"req2 should have 1 Mamba match, got {req2._mamba_num_matched_blocks}"
+            req2._ssm_num_matched_blocks == 1
+        ), f"req2 should have 1 SSM match, got {req2._ssm_num_matched_blocks}"
 
         # Verify prefix caching saved prefill tokens.
         assert ctx.lifetime_prefill_token_count < (300 + 800 + 300), (

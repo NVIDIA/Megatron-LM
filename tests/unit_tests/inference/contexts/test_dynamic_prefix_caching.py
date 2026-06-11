@@ -681,7 +681,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         self._mamba_allocate_and_register(ctx5, self._block_ids(ctx5, 0, 3)[:2])
         assert len(alloc5.kv_hash_to_block_id) == 3 and len(msa5.hash_to_block_id) == 2
 
-        # find_mamba_match_count
+        # find_ssm_match_count
         ctx6 = self._mctx()
         alloc6 = ctx6.kv_block_allocator
         p6 = self._prompt(bs * 4)
@@ -689,12 +689,12 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         msa6 = ctx6.ssm_slot_allocator
         self._mamba_allocate_and_register(ctx6, self._block_ids(ctx6, 0, 4)[:2])
         engine6 = _StubEngine(ctx6)
-        assert engine6._find_mamba_match_count(self._req(ctx6, p6.clone(), request_id=2)) == 2
+        assert engine6._find_ssm_match_count(self._req(ctx6, p6.clone(), request_id=2)) == 2
         # no match when no mamba hashes registered
         ctx7 = self._mctx()
         ctx7.add_request(self._req(ctx7, self._prompt(bs * 3)))
         assert (
-            _StubEngine(ctx7)._find_mamba_match_count(
+            _StubEngine(ctx7)._find_ssm_match_count(
                 self._req(ctx7, self._prompt(bs * 3), request_id=2)
             )
             == 0
@@ -729,7 +729,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         ctx.add_request(self._req(ctx, prompt.clone()))
         self._mamba_allocate_and_register(ctx, self._block_ids(ctx, 0, 3)[:1])
         req2 = self._req(ctx, prompt.clone(), request_id=2)
-        req2._mamba_num_matched_blocks = 1
+        req2._ssm_num_matched_blocks = 1
         (matched, _, _, _, prefix_skip, eff_chunk) = ctx._compute_prefix_match(req2, len(prompt))
         assert len(matched) == 3 and prefix_skip == bs and eff_chunk == len(prompt) - bs
 
@@ -738,7 +738,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         p2 = self._prompt(bs * 3)
         ctx2.add_request(self._req(ctx2, p2.clone()))
         req2b = self._req(ctx2, p2.clone(), request_id=2)
-        req2b._mamba_num_matched_blocks = 0
+        req2b._ssm_num_matched_blocks = 0
         (m2, _, _, _, ps2, ec2) = ctx2._compute_prefix_match(req2b, len(p2))
         assert len(m2) == 3 and ps2 == 0 and ec2 == len(p2)
 
@@ -748,7 +748,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         ctx3.add_request(self._req(ctx3, p3.clone()))
         self._mamba_allocate_and_register(ctx3, self._block_ids(ctx3, 0, 3))
         req3 = self._req(ctx3, p3.clone(), request_id=2)
-        req3._mamba_num_matched_blocks = 3
+        req3._ssm_num_matched_blocks = 3
         (m3, _, _, _, ps3, ec3) = ctx3._compute_prefix_match(req3, len(p3))
         assert len(m3) == 3 and ps3 == 2 * bs and ec3 == bs
 
@@ -789,7 +789,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         msa = ctx.ssm_slot_allocator
         self._mamba_allocate_and_register(ctx, self._block_ids(ctx, 0, 4)[:2])
         req2 = self._req(ctx, prompt.clone(), request_id=2)
-        req2._mamba_num_matched_blocks = 2
+        req2._ssm_num_matched_blocks = 2
         (matched, _, _, overall, prefix_skip, _) = ctx._compute_prefix_match(req2, len(prompt))
         # Copy block IDs to slot 1 so compute_and_store_offsets can resolve EOS block
         ctx.request_to_kv_block_ids[1] = ctx.request_to_kv_block_ids[0]
@@ -818,7 +818,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         msa2 = ctx2.ssm_slot_allocator
         self._mamba_allocate_and_register(ctx2, self._block_ids(ctx2, 0, 3)[:2])
         req2b = self._req(ctx2, p2.clone(), request_id=2)
-        req2b._mamba_num_matched_blocks = 2
+        req2b._ssm_num_matched_blocks = 2
         ctx2.add_request(req2b)
         count2 = msa2._intermediate_counts_cpu[1].item()
         if count2 > 0:
@@ -832,7 +832,7 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
         p3 = self._prompt(bs * 3)
         ctx3.add_request(self._req(ctx3, p3.clone()))
         req3 = self._req(ctx3, p3.clone(), request_id=2)
-        req3._mamba_num_matched_blocks = 0
+        req3._ssm_num_matched_blocks = 0
         ctx3.add_request(req3)
         # Deferred Mamba ops execute during transfer.
         ctx3.initialize_attention_state()
@@ -915,10 +915,10 @@ class TestMixedCachedAndFreshPrefill(PrefixCachingTestBase):
         req4 = self._req(ctx, self._prompt(prompt_len, offset=40), request_id=5)
 
         if model_type == "hybrid":
-            req1._mamba_num_matched_blocks = 2
-            req2._mamba_num_matched_blocks = 0
-            req3._mamba_num_matched_blocks = 2
-            req4._mamba_num_matched_blocks = 0
+            req1._ssm_num_matched_blocks = 2
+            req2._ssm_num_matched_blocks = 0
+            req3._ssm_num_matched_blocks = 2
+            req4._ssm_num_matched_blocks = 0
 
         for r in [req1, req2, req3, req4]:
             ctx.add_request(r)
@@ -1054,7 +1054,7 @@ class TestSSMSlotAllocator(PrefixCachingTestBase):
         # Set up context with a prefill request that has block-aligned prompt
         prompt = self._prompt(bs * 3)
         req = self._req(ctx, prompt.clone())
-        req._mamba_num_matched_blocks = 0
+        req._ssm_num_matched_blocks = 0
         ctx.add_request(req)
 
         # initialize_attention_state sets batch_dimensions and mamba metadata
@@ -1098,8 +1098,8 @@ class TestSSMSlotAllocator(PrefixCachingTestBase):
         assert slot0 >= 0
         for layer in range(ctx.num_ssm_layers):
             assert torch.allclose(
-                msa.ssm_states[layer, slot0],
-                torch.full_like(msa.ssm_states[layer, slot0], layer + 1.0),
+                msa.recurrent_states[layer, slot0],
+                torch.full_like(msa.recurrent_states[layer, slot0], layer + 1.0),
             )
             assert torch.allclose(
                 msa.conv_states[layer, slot0],
@@ -1115,8 +1115,8 @@ class TestSSMSlotAllocator(PrefixCachingTestBase):
                 torch.full_like(msa.conv_states[layer, eos_slot], layer + 200.0),
             )
             assert torch.allclose(
-                msa.ssm_states[layer, eos_slot],
-                torch.full_like(msa.ssm_states[layer, eos_slot], layer + 300.0),
+                msa.recurrent_states[layer, eos_slot],
+                torch.full_like(msa.recurrent_states[layer, eos_slot], layer + 300.0),
             )
 
         # Verify hash_to_block_id updated for valid hashes

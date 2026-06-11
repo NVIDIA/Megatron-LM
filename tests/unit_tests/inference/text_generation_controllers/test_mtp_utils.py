@@ -11,7 +11,7 @@ import pytest
 import torch
 
 from megatron.core.inference.text_generation_controllers.mtp_utils_pytorch import (
-    mamba_state_selective_copy as mamba_state_selective_copy_pytorch,
+    ssm_state_selective_copy as ssm_state_selective_copy_pytorch,
 )
 from megatron.core.inference.text_generation_controllers.mtp_utils_pytorch import (
     prepare_next_forward_pass as prepare_next_forward_pass_pytorch,
@@ -23,7 +23,7 @@ from megatron.core.inference.text_generation_controllers.mtp_utils_pytorch impor
     verify_speculative_tokens as verify_speculative_tokens_pytorch,
 )
 from megatron.core.inference.text_generation_controllers.mtp_utils_triton import (
-    mamba_state_selective_copy,
+    ssm_state_selective_copy,
     prepare_next_forward_pass,
     rewind_kv_cache,
     verify_speculative_tokens,
@@ -520,7 +520,7 @@ class TestPrepareNextForwardPass:
 
 
 class TestMambaStateSelectiveCopy:
-    """Tests for the mamba_state_selective_copy Triton kernel."""
+    """Tests for the ssm_state_selective_copy Triton kernel."""
 
     @pytest.mark.parametrize("num_requests", [1, 4, 8])
     @pytest.mark.parametrize("num_layers", [1, 3])
@@ -538,10 +538,10 @@ class TestMambaStateSelectiveCopy:
         state_idx = torch.arange(N, device=DEVICE, dtype=torch.int64)
         accepted_counts = torch.randint(0, S, (N,), device=DEVICE, dtype=torch.int64)
 
-        mamba_state_selective_copy_pytorch(
+        ssm_state_selective_copy_pytorch(
             intermediate, current_ref, prefill_status, state_idx, accepted_counts, num_layers
         )
-        mamba_state_selective_copy(
+        ssm_state_selective_copy(
             intermediate, current_tri, prefill_status, state_idx, accepted_counts, num_layers
         )
 
@@ -563,10 +563,10 @@ class TestMambaStateSelectiveCopy:
         state_idx = torch.arange(N, device=DEVICE, dtype=torch.int64)
         accepted_counts = torch.tensor([1, 0, 2, 0], device=DEVICE, dtype=torch.int64)
 
-        mamba_state_selective_copy_pytorch(
+        ssm_state_selective_copy_pytorch(
             intermediate, current_ref, prefill_status, state_idx, accepted_counts, num_layers
         )
-        mamba_state_selective_copy(
+        ssm_state_selective_copy(
             intermediate, current_tri, prefill_status, state_idx, accepted_counts, num_layers
         )
 
@@ -594,10 +594,10 @@ class TestMambaStateSelectiveCopy:
         state_idx = torch.tensor([1, 4, 0], device=DEVICE, dtype=torch.int64)
         accepted_counts = torch.tensor([2, 0, 1], device=DEVICE, dtype=torch.int64)
 
-        mamba_state_selective_copy_pytorch(
+        ssm_state_selective_copy_pytorch(
             intermediate, current_ref, prefill_status, state_idx, accepted_counts, num_layers
         )
-        mamba_state_selective_copy(
+        ssm_state_selective_copy(
             intermediate, current_tri, prefill_status, state_idx, accepted_counts, num_layers
         )
 
@@ -611,7 +611,7 @@ class TestMambaStateSelectiveCopy:
         current = torch.randn(num_layers, 4, *state_shape, device=DEVICE)
         current_before = current.clone()
 
-        mamba_state_selective_copy(
+        ssm_state_selective_copy(
             intermediate,
             current,
             torch.empty(0, dtype=torch.int32, device=DEVICE),
