@@ -554,6 +554,11 @@ class DataParallelBuffer:
         """
         full_buffer = self.fetch_buffer(as_shard=False)
 
+        if not self.is_distributed and not getattr(full_buffer, "_dirty", False):
+            if bind_params:
+                self._bind_buffer_to_params(full_buffer)
+            return full_buffer
+
         sm = self.buffer_index.shard_meta
         shard_buffer = self.data[sm.local_data_index : sm.local_data_index + sm.size]
         torch.distributed.all_gather_into_tensor(
