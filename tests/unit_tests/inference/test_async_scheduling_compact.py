@@ -904,7 +904,7 @@ def _make_async_gate_controller(active_request_count=2):
     )
     controller.model_is_pipeline_parallel = False
     controller.num_speculative_tokens = 0
-    controller._num_mtp_depths = 0
+    controller.num_mtp_depths = 0
     controller._sampling_backend = "torch"
     controller._async_admission_barrier_requested = False
     controller._async_prepare_deferred_until_after_sampling = False
@@ -961,10 +961,10 @@ def test_async_scheduling_disabled_reason_matrix(case, expected):
         controller.model_is_pipeline_parallel = True
     elif case == "mtp_presampling":
         controller.num_speculative_tokens = 2
-        controller._num_mtp_depths = 2
+        controller.num_mtp_depths = 2
     elif case == "mtp_depth_mismatch":
         controller.num_speculative_tokens = 2
-        controller._num_mtp_depths = 1
+        controller.num_mtp_depths = 1
         allow_mtp = True
     elif case == "flashinfer":
         controller._sampling_backend = "flashinfer"
@@ -979,7 +979,7 @@ def test_async_scheduling_disabled_reason_matrix(case, expected):
         controller._async_admission_barrier_requested = True
     elif case == "stride_mismatch":
         controller.num_speculative_tokens = 1
-        controller._num_mtp_depths = 1
+        controller.num_mtp_depths = 1
         allow_mtp = True
 
     assert controller._async_scheduling_disabled_reason(allow_mtp=allow_mtp) == expected

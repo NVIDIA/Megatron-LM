@@ -2224,7 +2224,7 @@ class TextGenerationController:
             return "pipeline parallel is unsupported"
         if self.num_speculative_tokens != 0 and not allow_mtp:
             return "mtp pre-sampling graph is unsupported"
-        if self.num_speculative_tokens != 0 and self._num_mtp_depths != self.num_speculative_tokens:
+        if self.num_speculative_tokens != 0 and self.num_mtp_depths != self.num_speculative_tokens:
             return "not enough mtp heads"
         if self._sampling_backend != "torch":
             return "sampling backend is unsupported"
