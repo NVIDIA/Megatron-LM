@@ -368,9 +368,9 @@ def read_metadata(tracker_filename):
     return max_iter, release
 
 
-def get_rng_state(ckpt_format: str, tp_group: torch.distributed.ProcessGroup, pp_group: torch.distributed.ProcessGroup, rng_config=None) -> Union[List[Dict[str, Any]], ShardedObject]:
+def get_rng_state(ckpt_format: str, tp_group: torch.distributed.ProcessGroup, pp_group: torch.distributed.ProcessGroup) -> Union[List[Dict[str, Any]], ShardedObject]:
     """Collect rng state across data parallel ranks."""
-    args = get_args() if not rng_config else rng_config
+    args = get_args()
     rng_state = {
         'random_rng_state': random.getstate(),
         'np_rng_state': np.random.get_state(),
@@ -492,29 +492,9 @@ def save_grads(save_dir, state_dict, iteration, grad_label):
                  f"from iteration {iteration:7d}")
 
 
-def save_checkpoint(
-    iteration,
-    model,
-    optimizer,
-    opt_param_scheduler,
-    num_floating_point_operations_so_far,
-    checkpointing_context=None,
-    pipeline_rank=None,
-    expert_rank=None,
-    tensor_rank=None,
-    pipeline_parallel=None,
-    expert_parallel=None,
-    non_persistent_ckpt=False,
-    train_data_iterator=None,
-    preprocess_common_state_dict_fn=None,
-    release=False,
-    tp_group: Optional[torch.distributed.ProcessGroup] = None,
-    pp_group: Optional[torch.distributed.ProcessGroup] = None,
-    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
-    checkpoint_config=None,
-    rng_config=None,
-    logger_config=None,
-):
+def save_checkpoint(iteration, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far,
+                    checkpointing_context=None, pipeline_rank=None, expert_rank=None, tensor_rank=None, pipeline_parallel=None, expert_parallel=None, non_persistent_ckpt=False,
+                    train_data_iterator=None, preprocess_common_state_dict_fn = None, release=False, tp_group: Optional[torch.distributed.ProcessGroup] = None, pp_group: Optional[torch.distributed.ProcessGroup] = None, dp_cp_group: Optional[torch.distributed.ProcessGroup] = None):
     """Save a model, optimizer and optionally dataloader checkpoint.
 
     Checkpointing context is used to persist some checkpointing state
@@ -533,14 +513,7 @@ def save_checkpoint(
         dp_cp_group: Data parallel + context parallel group (default: None, falls back to mpu API)
     """
     start_ckpt = time()
-    if checkpoint_config:
-        args = checkpoint_config
-        checkpoint_config.use_dist_ckpt = True
-        checkpoint_config.use_distributed_optimizer = True
-        checkpoint_config.log_progress = logger_config.log_progress
-
-    else:
-        args = get_args()
+    args = get_args()
 
     if args.async_save and not is_empty_async_queue():
         print_rank_0('WARNING: Starting a checkpoint save before previous has finished. Consider increasing the checkpoint interval.')
@@ -584,7 +557,7 @@ def save_checkpoint(
     if tp_group is None and pp_group is None:
         tp_group = mpu.get_tensor_model_parallel_group()
         pp_group = mpu.get_pipeline_model_parallel_group()
-    rng_state = get_rng_state(args.ckpt_format, tp_group, pp_group, rng_config=rng_config)
+    rng_state = get_rng_state(args.ckpt_format, tp_group, pp_group)
 
     # Collect rerun state across all ranks
     rerun_state_machine = get_rerun_state_machine()
