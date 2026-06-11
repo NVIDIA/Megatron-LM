@@ -55,13 +55,9 @@ def test_dump_optimizer_inputs_dtensor(distributed_setup, tmp_path: pathlib.Path
     assert spec["world_size"] == distributed_setup.world_size
     assert spec["rank"] == distributed_setup.rank
     assert spec["extra"] == {"note": "hello"}
-    assert len(spec["groups"]) == 1
-    group = spec["groups"][0]
-    assert group["lr"] == pytest.approx(0.1)
-    assert group["momentum"] == pytest.approx(0.9)
-    assert len(group["params"]) == 2
+    assert len(spec["params"]) == 2
 
-    p_sharded, p_replicated = group["params"]
+    p_sharded, p_replicated = spec["params"]
 
     assert p_sharded["global_shape"] == [distributed_setup.world_size * 4, 8]
     assert p_sharded["local_shape"] == [4, 8]
@@ -93,9 +89,21 @@ def test_dump_optimizer_inputs_plain_tensor(distributed_setup, tmp_path: pathlib
     written = out_path.parent / f"{out_path.name}.rank{distributed_setup.rank}.json"
     assert written.exists()
     spec = json.loads(written.read_text())
-    p = spec["groups"][0]["params"][0]
+    p = spec["params"][0]
     assert p["global_shape"] == [4, 5]
     assert p["local_shape"] == [4, 5]
     assert p["mesh_shape"] is None
     assert p["mesh_dim_names"] is None
     assert p["placements"] is None
+
+
+def test_dump_optimizer_inputs_rejects_multi_group(
+    distributed_setup, tmp_path: pathlib.Path
+) -> None:
+    """Multi-param-group optimizers raise — the dump assumes a single group."""
+    _ensure_process_group(distributed_setup)
+    a = torch.randn(2, 2, requires_grad=True, device=distributed_setup.device)
+    b = torch.randn(2, 2, requires_grad=True, device=distributed_setup.device)
+    optimizer = torch.optim.SGD([{"params": [a]}, {"params": [b]}], lr=0.01)
+    with pytest.raises(ValueError, match="exactly one parameter group"):
+        dump_optimizer_inputs(optimizer, tmp_path / "rejects.json")

@@ -57,13 +57,21 @@ def dump_optimizer_inputs(
             the `extra` key. Useful for caller-specific knobs (e.g.,
             optimizer hyperparameters not captured by `param_groups`).
     """
+    if len(optimizer.param_groups) != 1:
+        raise ValueError(
+            f"dump_optimizer_inputs expects exactly one parameter group; "
+            f"got {len(optimizer.param_groups)}."
+        )
+
     rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
     world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
 
     spec: dict[str, Any] = {
         "world_size": world_size,
         "rank": rank,
-        "groups": [_dump_param_group(g, optimizer.state) for g in optimizer.param_groups],
+        "params": [
+            _dump_param(p, optimizer.state.get(p, {})) for p in optimizer.param_groups[0]["params"]
+        ],
     }
     if extra_meta is not None:
         spec["extra"] = extra_meta
@@ -78,13 +86,6 @@ def dump_optimizer_inputs(
     rank_out.write_text(json.dumps(spec, indent=2))
     if rank == 0:
         logger.info("Optimizer inputs dumped to %s (and rank-N siblings)", rank_out)
-
-
-def _dump_param_group(group: dict[str, Any], state: dict[Any, dict[str, Any]]) -> dict[str, Any]:
-    """Convert one param group to a JSON-serializable dict."""
-    out: dict[str, Any] = {k: v for k, v in group.items() if k != "params" and _is_jsonable(v)}
-    out["params"] = [_dump_param(p, state.get(p, {})) for p in group["params"]]
-    return out
 
 
 def _dump_param(p: torch.Tensor, state: dict[str, Any]) -> dict[str, Any]:
@@ -153,12 +154,3 @@ def _local_offsets(local: torch.Tensor) -> tuple[int, ...] | None:
     if not chunks:
         return None
     return tuple(int(o) for o in chunks[0].offsets)
-
-
-def _is_jsonable(v: Any) -> bool:
-    """Best-effort check that ``v`` can be json.dumps()'d."""
-    try:
-        json.dumps(v)
-    except (TypeError, ValueError):
-        return False
-    return True
