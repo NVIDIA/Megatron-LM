@@ -259,8 +259,21 @@ def ensure_context_parallel_rng_tracker_states(
     source_state = fallback_state
     if source_state is None:
         source_state = states.get(_DATA_PARALLEL_RNG_TRACKER_NAME)
-    if source_state is None:
-        return states
+        if source_state is not None:
+            logging.getLogger(__name__).warning(
+                "No fallback_state provided to backfill '%s' RNG tracker state; "
+                "falling back to '%s' state instead.",
+                _CONTEXT_PARALLEL_RNG_TRACKER_NAME,
+                _DATA_PARALLEL_RNG_TRACKER_NAME,
+            )
+        else:
+            logging.getLogger(__name__).warning(
+                "Could not backfill '%s' RNG tracker state: neither fallback_state nor "
+                "'%s' state is available. Skipping.",
+                _CONTEXT_PARALLEL_RNG_TRACKER_NAME,
+                _DATA_PARALLEL_RNG_TRACKER_NAME,
+            )
+            return states
 
     states = dict(states)
     states[_CONTEXT_PARALLEL_RNG_TRACKER_NAME] = clone_cuda_rng_state(source_state)

@@ -23,6 +23,7 @@ import numpy as np
 import torch
 from torch.distributed.checkpoint import FileSystemReader, default_planner
 
+
 from megatron.core import dist_checkpointing, mpu, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject
 from megatron.core.dist_checkpointing.strategies.async_utils import _disable_gc
@@ -1986,47 +1987,35 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, load_arg='load', 
                     rng_state = rng_state[mpu.get_data_parallel_rank()]
                 else:
                     rng_state = rng_state[0]
-                random.setstate(rng_state['random_rng_state'])
-                np.random.set_state(rng_state['np_rng_state'])
-                torch.set_rng_state(rng_state['torch_rng_state'])
-                torch.cuda.set_rng_state(rng_state['cuda_rng_state'])
-                # Check for empty states array
-                if not rng_state['rng_tracker_states']:
-                    raise KeyError
-                converted_cuda_rng_state = tensor_parallel.convert_cuda_rng_state(
-                    rng_state['cuda_rng_state'], to_graphable=graph_safe_rng
-                )
-                rng_tracker_states = {
-                    k: tensor_parallel.convert_cuda_rng_state(v, to_graphable=graph_safe_rng)
-                    for k, v in rng_state['rng_tracker_states'].items()
-                }
-                rng_tracker_states = tensor_parallel.ensure_context_parallel_rng_tracker_states(
-                    rng_tracker_states, fallback_state=converted_cuda_rng_state
-                )
-                rng_tracker_states = tensor_parallel.ensure_model_and_context_parallel_rng_tracker_states(
-                    rng_tracker_states
-                )
             else:  # backward compatability
-                random.setstate(state_dict['random_rng_state'])
-                np.random.set_state(state_dict['np_rng_state'])
-                torch.set_rng_state(state_dict['torch_rng_state'])
-                torch.cuda.set_rng_state(state_dict['cuda_rng_state'])
-                # Check for empty states array
-                if not state_dict['rng_tracker_states']:
-                    raise KeyError
-                converted_cuda_rng_state = tensor_parallel.convert_cuda_rng_state(
-                    state_dict['cuda_rng_state'], to_graphable=graph_safe_rng
-                )
-                rng_tracker_states = {
-                    k: tensor_parallel.convert_cuda_rng_state(v, to_graphable=graph_safe_rng)
-                    for k, v in state_dict['rng_tracker_states'].items()
-                }
-                rng_tracker_states = tensor_parallel.ensure_context_parallel_rng_tracker_states(
-                    rng_tracker_states, fallback_state=converted_cuda_rng_state
-                )
-                rng_tracker_states = tensor_parallel.ensure_model_and_context_parallel_rng_tracker_states(
-                    rng_tracker_states
-                )
+                rng_state = state_dict
+            random.setstate(rng_state['random_rng_state'])
+            np.random.set_state(rng_state['np_rng_state'])
+            torch.set_rng_state(rng_state['torch_rng_state'])
+            torch.cuda.set_rng_state(rng_state['cuda_rng_state'])
+            # Check for empty states array
+            if not rng_state['rng_tracker_states']:
+                raise KeyError
+            # Convert the main CUDA RNG state to the format expected by the tracker
+            # (graph-safe Generator or plain Tensor).  This is used as the last-resort
+            # fallback when backfilling the context-parallel tracker state for older
+            # checkpoints that lack both 'context-parallel-rng' and 'data-parallel-rng'
+            # keys inside rng_tracker_states.
+            converted_cuda_rng_state = tensor_parallel.convert_cuda_rng_state(
+                rng_state['cuda_rng_state'], to_graphable=graph_safe_rng
+            )
+            rng_tracker_states = {
+                k: tensor_parallel.convert_cuda_rng_state(v, to_graphable=graph_safe_rng)
+                for k, v in rng_state['rng_tracker_states'].items()
+            }
+            # Backfill missing CP / TPxCP tracker states for backward compatibility
+            # with checkpoints saved before these states were introduced.
+            rng_tracker_states = tensor_parallel.ensure_context_parallel_rng_tracker_states(
+                rng_tracker_states, fallback_state=converted_cuda_rng_state
+            )
+            rng_tracker_states = tensor_parallel.ensure_model_and_context_parallel_rng_tracker_states(
+                rng_tracker_states
+            )
             cuda_rng_tracker.set_states(rng_tracker_states)
         except KeyError:
             print_rank_0('Unable to load rng state from checkpoint {}. '
