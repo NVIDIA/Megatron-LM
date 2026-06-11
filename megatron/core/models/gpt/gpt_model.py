@@ -299,6 +299,18 @@ class GPTModel(LanguageModule):
         # loss stage so every stage projects logits with the same weights.
         self._sync_output_layer_across_loss_group()
 
+        # Give the replicated output_layer its own grad bucket (like the tied word embedding) so
+        # its distributed-optimizer sharding is identical across loss stages — required for a
+        # consistent distributed checkpoint. Set on every loss stage so all replicas align.
+        if (
+            self.is_loss_stage
+            and self.config.pipeline_model_parallel_layout is not None
+            and self.config.pipeline_model_parallel_layout.is_loss_split()
+            and getattr(self, 'output_layer', None) is not None
+            and self.output_layer.weight is not None
+        ):
+            self.output_layer.weight.shared_output_layer = True
+
         if has_config_logger_enabled(self.config):
             log_config_to_disk(
                 self.config, self.state_dict(), prefix=f'{type(self).__name__}_init_ckpt'

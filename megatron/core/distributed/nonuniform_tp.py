@@ -251,7 +251,9 @@ def _compute_ntp_per_buffer_param_layout(
     """Compute a buffer layout that includes side_grad storage for healthy core ranks."""
 
     def _does_param_require_new_bucket(param):
-        return getattr(param, "shared_embedding", False)
+        return getattr(param, "shared_embedding", False) or getattr(
+            param, "shared_output_layer", False
+        )
 
     param_index_map = {}
     side_grad_index_map = {}
@@ -831,7 +833,10 @@ def _compute_default_per_buffer_param_layout(
     """Compute the default DDP layout locally so generic buffer code is untouched."""
 
     def _does_param_require_new_bucket(param):
-        return getattr(param, "shared_embedding", False) and ddp_config.use_distributed_optimizer
+        return (
+            getattr(param, "shared_embedding", False)
+            or getattr(param, "shared_output_layer", False)
+        ) and ddp_config.use_distributed_optimizer
 
     param_index_map = {}
     bucket_indices = []

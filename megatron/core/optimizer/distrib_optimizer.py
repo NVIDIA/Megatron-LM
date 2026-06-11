@@ -505,7 +505,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         """
 
         def _does_param_require_new_bucket(param):
-            return getattr(param, "shared_embedding", False)
+            # Params replicated across pipeline stages (tied word embedding, or the split-loss
+            # output_layer) must each occupy their own bucket so their distributed-optimizer
+            # sharding is identical across the replicas — required for consistent dist-checkpoint.
+            return getattr(param, "shared_embedding", False) or getattr(
+                param, "shared_output_layer", False
+            )
 
         param_index_map = {}
         bucket_indices = []
