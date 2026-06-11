@@ -23,6 +23,19 @@ megatron/core/transformer/fsdp_dtensor_checkpoint.py @NVIDIA/core-adlr @NVIDIA/c
 megatron/core/dist_checkpointing/ @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/dist-checkpointing
 
 megatron/core/optimizer/distrib_optimizer.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/dist-optimizer
+megatron/core/optimizer/layer_wise_optimizer.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/dist-optimizer
+megatron/core/optimizer/param_layout.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/dist-optimizer
+
+megatron/core/optimizer/__init__.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/mcore-optimizer
+megatron/core/optimizer/clip_grads.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/mcore-optimizer
+megatron/core/optimizer/grad_scaler.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/mcore-optimizer
+megatron/core/optimizer/optimizer_config.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/mcore-optimizer
+megatron/core/optimizer/optimizer_cuda_graph.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/mcore-optimizer
+megatron/core/optimizer/optimizer.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/mcore-optimizer
+
+megatron/core/optimizer/emerging_optimizers.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/mcore-emerging-optimizers
+megatron/core/optimizer/muon.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/mcore-emerging-optimizers
+megatron/core/optimizer/qk_clip.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/mcore-emerging-optimizers @NVIDIA/transformer
 
 megatron/core/inference/modelopt_support @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/post-training
 
