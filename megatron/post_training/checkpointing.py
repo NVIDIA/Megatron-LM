@@ -3,7 +3,7 @@
 import logging
 import os
 from pathlib import Path
-from typing import Any, Optional, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import modelopt
 import modelopt.torch.opt as mto
