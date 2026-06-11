@@ -1285,7 +1285,10 @@ class _DeepepManager(_DispatchManager):
                 "DeepEP is not installed. Please install DeepEP package from "
                 "https://github.com/deepseek-ai/deepep."
             )
-        set_deepep_num_sms(20 if config.moe_deepep_num_sms is None else config.moe_deepep_num_sms)
+        if config.moe_deepep_num_sms is None:
+            set_deepep_num_sms(20)
+        else:
+            set_deepep_num_sms(config.moe_deepep_num_sms)
 
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         num_tokens = routing_map.shape[0]
@@ -1490,7 +1493,10 @@ class _DeepepV2Manager(_DeepepManager):
         self.router_dtype = config.moe_router_dtype
         self.capacity_factor = config.moe_expert_capacity_factor
         self.permute_fusion = config.moe_permute_fusion
-        self.num_sms = config.moe_deepep_num_sms
+        if config.moe_deepep_num_sms is None:
+            self.num_sms = 0
+        else:
+            self.num_sms = config.moe_deepep_num_sms
 
         self.token_indices: Optional[torch.Tensor] = None
         self.token_probs: Optional[torch.Tensor] = None
@@ -1504,16 +1510,13 @@ class _DeepepV2Manager(_DeepepManager):
             )
 
     def _get_buffer(self, hidden_states: torch.Tensor):
-        buffer = get_elastic_buffer(
+        self.buffer = get_elastic_buffer(
             self.group,
             num_max_tokens_per_rank=hidden_states.shape[0],
             hidden=hidden_states.shape[1],
             num_topk=self.token_indices.shape[1],
         )
-        if self.num_sms is None or self.num_sms == 0:
-            self.num_sms = buffer.get_theoretical_num_sms(self.num_experts, self.router_topk)
-        self.buffer = buffer
-        return buffer
+        return self.buffer
 
     def dispatch(
         self,
