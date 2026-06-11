@@ -780,6 +780,7 @@ class TEGroupedMLP(MegatronModule):
             forced_released_tensors=[permuted_local_hidden_states],
             delay_offload=self.config.delay_offload_until_cuda_graph,
         )
+        permuted_probs = self._align_hybridep_static_budget_probs(fc1_output, permuted_probs)
 
         def bias_act_func(intermediate_parallel, bias_parallel, permuted_probs):
 
