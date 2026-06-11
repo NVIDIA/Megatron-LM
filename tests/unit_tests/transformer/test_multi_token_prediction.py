@@ -1,13 +1,11 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
 import sys
 import types
-from types import SimpleNamespace
 
 import pytest
 import torch
-import torch.nn.functional as F
 from torch import Tensor
 
 from megatron.core.enums import ModelType
@@ -55,40 +53,6 @@ else:
 _SEED = 42
 
 
-class _TestOutputLayer(torch.nn.Module):
-    def __init__(self, hidden_size, vocab_size):
-        super().__init__()
-        self.weight = torch.nn.Parameter(torch.randn(vocab_size, hidden_size))
-
-    def forward(
-        self,
-        input_,
-        weight=None,
-        runtime_gather_output=None,
-        output_cross_entropy_loss=False,
-        labels=None,
-    ):
-        del runtime_gather_output
-        weight = self.weight if weight is None else weight
-        logits = torch.matmul(input_, weight.t())
-        if output_cross_entropy_loss:
-            logits = logits.transpose(0, 1).contiguous()
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)), labels.reshape(-1), reduction='none'
-            )
-            return loss.view_as(labels)
-        return logits, None
-
-
-class _ScaleMTPLayer(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.scale = torch.nn.Parameter(torch.tensor(2.0))
-
-    def forward(self, input_ids, position_ids, hidden_states, padding_mask=None, **_kwargs):
-        return hidden_states * self.scale, input_ids, position_ids, padding_mask
-
-
 class TestMultiTokenPredictionLayer:
     def setup_method(self, method):
         os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
@@ -118,6 +82,34 @@ class TestMultiTokenPredictionLayer:
             config=config, spec=transformer_layer_spec, use_transformer_engine=use_te
         )
         return config, mtp_block_spec
+
+    def test_mtp_detach_heads_config(self):
+        """Test that mtp_detach_heads config defaults to False."""
+        config = TransformerConfig(
+            num_layers=4, hidden_size=64, num_attention_heads=8, use_cpu_initialization=True
+        )
+        assert config.mtp_detach_heads is False
+
+    def test_constructor_with_detach_heads(self):
+        """Test construction of MTP module with mtp_detach_heads=True."""
+        torch.manual_seed(_SEED)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+        config = TransformerConfig(
+            mtp_num_layers=2,
+            num_layers=4,
+            hidden_size=64,
+            num_attention_heads=8,
+            use_cpu_initialization=True,
+            mtp_detach_heads=True,
+        )
+        transformer_layer_spec = get_gpt_layer_local_spec()
+        mtp_block_spec = get_gpt_mtp_block_spec(
+            config=config, spec=transformer_layer_spec, use_transformer_engine=False
+        )
+        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+
+        assert isinstance(mtp, MultiTokenPredictionBlock)
+        assert mtp.config.mtp_detach_heads is True
 
     @pytest.mark.parametrize(('tp'), [(1), (2), (4)])
     def test_constructor_local(self, tp):
@@ -265,104 +257,191 @@ class TestMultiTokenPredictionLayer:
         assert torch.equal(seen["padding_mask"], expected_padding_mask)
         assert torch.equal(returned_padding_mask, expected_padding_mask)
 
-
-class TestProcessMTPLoss:
-    def test_isolated_loss_detaches_encoder_hidden_states(self):
-        """MTP isolated loss should not update the main decoder hidden states."""
-
+    def test_get_embeddings_detaches_decoder_input(self):
+        """With mtp_detach_heads=True, _get_embeddings detaches decoder_input (severing
+        gradient flow to the shared embedding) while still returning a hidden_states
+        tensor that requires grad so MTP layer params and activation checkpointing work."""
         torch.manual_seed(_SEED)
-        seq_length = 4
-        micro_batch_size = 2
-        hidden_size = 8
-        input_ids = torch.arange(seq_length).repeat(micro_batch_size, 1)
-        position_ids = torch.arange(seq_length).repeat(micro_batch_size, 1)
+        config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=1)
+        config.mtp_detach_heads = True
+        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+        mtp_layer = mtp.layers[0]
 
-        for isolated_loss in (False, True):
-            config = TransformerConfig(
-                num_layers=1,
-                hidden_size=hidden_size,
-                num_attention_heads=1,
-                mtp_num_layers=1,
-                mtp_loss_scaling_factor=1.0,
-                mtp_isolated_loss=isolated_loss,
-            )
-            mtp_layer = _ScaleMTPLayer()
-            mtp_block = SimpleNamespace(
-                config=config, vp_stage=None, mtp_use_repeated_layer=False, layers=[mtp_layer]
-            )
-            hidden_states = torch.randn(
-                seq_length, micro_batch_size, hidden_size, requires_grad=True
-            )
+        seq_len = 4
+        batch_size = 2
+        input_ids = torch.tensor([[1, 2, 3, 0], [4, 5, 0, 0]], dtype=torch.int64)
+        position_ids = torch.arange(seq_len, dtype=torch.int64).repeat(batch_size, 1)
+        # hidden_states arrives without requires_grad (it is detached upstream by the block).
+        hidden_states = torch.randn(seq_len, batch_size, config.hidden_size)
+        emb_weight = torch.nn.Parameter(torch.randn(seq_len, batch_size, config.hidden_size))
 
-            output = MultiTokenPredictionBlock.forward(
-                mtp_block,
-                input_ids=input_ids,
-                position_ids=position_ids,
-                hidden_states=hidden_states,
-                attention_mask=None,
-            )
-            mtp_output = output[seq_length:]
-            mtp_output.sum().backward()
+        def fake_embedding(input_ids, position_ids):
+            return emb_weight.clone()
 
-            assert mtp_layer.scale.grad is not None
-            if isolated_loss:
-                assert hidden_states.grad is None or torch.count_nonzero(hidden_states.grad) == 0
-            else:
-                assert hidden_states.grad is not None
-                assert torch.count_nonzero(hidden_states.grad) > 0
+        _, _, _, decoder_input, returned_hidden_states = mtp_layer._get_embeddings(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            embedding=fake_embedding,
+            hidden_states=hidden_states,
+            packed_seq_params=None,
+        )
 
-    def test_isolated_loss_detaches_output_layer(self):
-        """MTP isolated loss should not update output layer weights."""
+        # decoder_input is detached from the embedding graph.
+        assert decoder_input.requires_grad is False
+        assert decoder_input.grad_fn is None
+        # hidden_states is still marked requires_grad so checkpointing and the MTP
+        # layer parameters keep a differentiable path.
+        assert returned_hidden_states.requires_grad is True
+
+    @pytest.mark.parametrize("detach_heads", [False, True])
+    def test_forward_detach_heads_gradient_flow(self, monkeypatch, detach_heads):
+        """Block-level check of mtp_detach_heads: with the flag on, MTP gradients must
+        not reach the main-model hidden_states or the shared embedding, while the MTP
+        layer parameters still receive gradients."""
+        torch.manual_seed(_SEED)
+        config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=1)
+        config.mtp_detach_heads = detach_heads
+        # Runs on GPU because _concat_embeddings exercises the (fused) norm and
+        # projection kernels; the rest of the MTP transformer layer is stubbed out.
+        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec).cuda()
+
+        # Replace each MTP transformer layer with an identity so the test isolates
+        # gradient flow to the detach logic (not the attention kernels). Must be an
+        # nn.Module since it is assigned as a child module of the layer.
+        class _IdentityMTPLayer(torch.nn.Module):
+            def forward(self, hidden_states, **kwargs):
+                return hidden_states, None
+
+        for layer in mtp.layers:
+            monkeypatch.setattr(layer, "mtp_model_layer", _IdentityMTPLayer())
+
+        seq_len = 4
+        batch_size = 2
+        input_ids = torch.tensor([[1, 2, 3, 0], [4, 5, 0, 0]], dtype=torch.int64).cuda()
+        position_ids = torch.arange(seq_len, dtype=torch.int64).repeat(batch_size, 1).cuda()
+        attention_mask = torch.ones((batch_size, 1, seq_len, seq_len), dtype=torch.bool).cuda()
+        hidden_states = torch.randn(
+            seq_len, batch_size, config.hidden_size, device="cuda", requires_grad=True
+        )
+        emb_weight = torch.nn.Parameter(
+            torch.randn(seq_len, batch_size, config.hidden_size, device="cuda")
+        )
+
+        def fake_embedding(input_ids, position_ids):
+            return emb_weight.clone()
+
+        output = mtp.forward(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            embedding=fake_embedding,
+        )
+
+        # forward concatenates [main_hidden_states, mtp_out_0, mtp_out_1] along dim 0;
+        # back-propagate only from the MTP outputs to mimic the MTP loss path.
+        mtp_outputs = output[seq_len:]
+        mtp_outputs.sum().backward()
+
+        # MTP layer parameters always receive gradients.
+        for layer in mtp.layers:
+            assert layer.enorm.weight.grad is not None
+            assert layer.hnorm.weight.grad is not None
+            assert layer.eh_proj.weight.grad is not None
+
+        if detach_heads:
+            # Gradients must not reach the main model or the shared embedding.
+            # The returned block output still includes the original hidden-state
+            # chunk, so autograd may allocate a zero grad for it through cat().
+            if hidden_states.grad is not None:
+                torch.testing.assert_close(hidden_states.grad, torch.zeros_like(hidden_states))
+            assert emb_weight.grad is None
+        else:
+            assert hidden_states.grad is not None
+            assert emb_weight.grad is not None
+
+    @pytest.mark.parametrize("detach_heads", [False, True])
+    @pytest.mark.parametrize("provide_output_weight", [False, True])
+    @pytest.mark.parametrize("fuse_linear_cross_entropy", [False, True])
+    def test_process_mtp_loss_detaches_output_weight(
+        self, detach_heads, provide_output_weight, fuse_linear_cross_entropy
+    ):
+        """process_mtp_loss must detach the output-head weight when mtp_detach_heads=True
+        so the MTP loss does not update the (shared) output projection weight."""
+        torch.manual_seed(_SEED)
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+        config = TransformerConfig(
+            mtp_num_layers=2,
+            num_layers=4,
+            hidden_size=64,
+            num_attention_heads=8,
+            use_cpu_initialization=True,
+            mtp_detach_heads=detach_heads,
+        )
+        config.cross_entropy_loss_fusion = fuse_linear_cross_entropy
+        config.cross_entropy_fusion_impl = "linear" if fuse_linear_cross_entropy else "native"
+
+        seq_len = 4
+        batch_size = 2
+        vocab_size = 16
+        # hidden_states is the concatenation [main, mtp_0, mtp_1] along the sequence dim;
+        # requires_grad so the returned tensor stays in the autograd graph for backward.
+        hidden_states = torch.randn(
+            (1 + config.mtp_num_layers) * seq_len,
+            batch_size,
+            config.hidden_size,
+            requires_grad=True,
+        )
+        labels = torch.randint(0, vocab_size, (batch_size, seq_len))
+        loss_mask = torch.ones(batch_size, seq_len)
+        explicit_output_weight = torch.nn.Parameter(torch.randn(vocab_size, config.hidden_size))
+
+        class _OutputLayer(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.randn(vocab_size, config.hidden_size))
+
+            def forward(
+                self,
+                hidden,
+                weight=None,
+                runtime_gather_output=None,
+                output_cross_entropy_loss=False,
+                labels=None,
+            ):
+                del runtime_gather_output, labels
+                weight = self.weight if weight is None else weight
+                # hidden: [s, b, h] -> logits: [s, b, vocab]
+                logits = torch.matmul(hidden, weight.t())
+                if output_cross_entropy_loss:
+                    return logits.sum(dim=-1).transpose(0, 1)
+                return logits, None
+
+        output_layer = _OutputLayer()
+        output_weight = explicit_output_weight if provide_output_weight else None
+        weight_to_check = explicit_output_weight if provide_output_weight else output_layer.weight
 
         def compute_language_model_loss(labels, logits):
-            logits = logits.transpose(0, 1).contiguous()
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)), labels.reshape(-1), reduction='none'
-            )
-            return loss.view_as(labels)
+            # per-token loss of shape [b, s] that depends on logits (hence output_weight).
+            return logits.sum(dim=-1).transpose(0, 1)
 
-        torch.manual_seed(_SEED)
-        seq_length = 4
-        micro_batch_size = 2
-        hidden_size = 8
-        vocab_size = 16
-        labels = torch.randint(vocab_size, (micro_batch_size, seq_length))
-        loss_mask = torch.ones_like(labels, dtype=torch.float32)
+        result = process_mtp_loss(
+            hidden_states=hidden_states,
+            labels=labels,
+            loss_mask=loss_mask,
+            output_layer=output_layer,
+            output_weight=output_weight,
+            runtime_gather_output=None,
+            is_training=False,
+            compute_language_model_loss=compute_language_model_loss,
+            config=config,
+        )
+        result.sum().backward()
 
-        for isolated_loss in (False, True):
-            config = TransformerConfig(
-                num_layers=1,
-                hidden_size=hidden_size,
-                num_attention_heads=1,
-                mtp_num_layers=1,
-                mtp_loss_scaling_factor=1.0,
-                mtp_isolated_loss=isolated_loss,
-            )
-            output_layer = _TestOutputLayer(hidden_size, vocab_size)
-            hidden_states = torch.randn(
-                seq_length * (1 + config.mtp_num_layers),
-                micro_batch_size,
-                hidden_size,
-                requires_grad=True,
-            )
-
-            output = process_mtp_loss(
-                hidden_states=hidden_states,
-                labels=labels,
-                loss_mask=loss_mask,
-                output_layer=output_layer,
-                output_weight=None,
-                runtime_gather_output=False,
-                is_training=False,
-                compute_language_model_loss=compute_language_model_loss,
-                config=config,
-            )
-            output.sum().backward()
-
-            if isolated_loss:
-                assert output_layer.weight.grad is None
-            else:
-                assert output_layer.weight.grad is not None
+        if detach_heads:
+            assert weight_to_check.grad is None
+        else:
+            assert weight_to_check.grad is not None
 
 
 class TestMultiTokenPrediction:
