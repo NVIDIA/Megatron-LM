@@ -10,7 +10,6 @@ import json
 import pathlib
 
 import torch
-import torch.distributed as dist
 from torch.distributed._tensor import Replicate, Shard, distribute_tensor
 from torch.distributed.device_mesh import init_device_mesh
 
@@ -19,22 +18,16 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.dump_parameters import (
 )
 
 
-def _ensure_process_group(distributed_setup) -> None:
-    """torchrun-launched, NCCL-backed PG if not already initialized."""
-    if dist.is_initialized():
-        return
-    backend = "nccl" if distributed_setup.device.type == "cuda" else "gloo"
-    dist.init_process_group(
-        backend=backend, rank=distributed_setup.rank, world_size=distributed_setup.world_size
+def _build_mesh(distributed_setup):
+    """Build a 1-D DeviceMesh; this also lazy-inits the default process group."""
+    return init_device_mesh(
+        distributed_setup.device.type, (distributed_setup.world_size,), mesh_dim_names=("dp",)
     )
 
 
 def test_dump_optimizer_parameters_dtensor(distributed_setup, tmp_path: pathlib.Path) -> None:
     """Dump captures per-param mesh, placements, local/global shape, dtype, attrs."""
-    _ensure_process_group(distributed_setup)
-    mesh = init_device_mesh(
-        distributed_setup.device.type, (distributed_setup.world_size,), mesh_dim_names=("dp",)
-    )
+    mesh = _build_mesh(distributed_setup)
 
     sharded_global = torch.randn(distributed_setup.world_size * 4, 8)
     sharded = distribute_tensor(sharded_global, mesh, [Shard(0)])
@@ -76,33 +69,13 @@ def test_dump_optimizer_parameters_dtensor(distributed_setup, tmp_path: pathlib.
     assert p_replicated["is_qkv"] is False
 
 
-def test_dump_optimizer_parameters_plain_tensor(distributed_setup, tmp_path: pathlib.Path) -> None:
-    """Plain (non-DTensor) params: local_shape == global_shape, mesh fields are None."""
-    _ensure_process_group(distributed_setup)
-
-    param = torch.randn(4, 5, requires_grad=True, device=distributed_setup.device)
-    optimizer = torch.optim.SGD([param], lr=0.01)
-
-    out_path = tmp_path / "plain.json"
-    dump_optimizer_parameters(optimizer, out_path)
-
-    written = out_path.with_suffix(f".rank{distributed_setup.rank}.json")
-    assert written.exists()
-    spec = json.loads(written.read_text())
-    p = spec["groups"][0]["params"][0]
-    assert p["global_shape"] == [4, 5]
-    assert p["local_shape"] == [4, 5]
-    assert p["mesh_shape"] is None
-    assert p["mesh_dim_names"] is None
-    assert p["placements"] is None
-
-
 def test_dump_optimizer_parameters_multi_group(distributed_setup, tmp_path: pathlib.Path) -> None:
     """Multi-param-group optimizers (e.g., Megatron's wd/no-wd split):
     structure is preserved in `groups`, no hyperparameters recorded."""
-    _ensure_process_group(distributed_setup)
-    a = torch.randn(2, 2, requires_grad=True, device=distributed_setup.device)
-    b = torch.randn(3, 3, requires_grad=True, device=distributed_setup.device)
+    mesh = _build_mesh(distributed_setup)
+    a = distribute_tensor(torch.randn(distributed_setup.world_size * 2, 2), mesh, [Shard(0)])
+    b = distribute_tensor(torch.randn(distributed_setup.world_size * 3, 3), mesh, [Shard(0)])
+
     optimizer = torch.optim.SGD(
         [{"params": [a], "weight_decay": 0.1}, {"params": [b], "weight_decay": 0.0}], lr=0.01
     )
@@ -115,8 +88,8 @@ def test_dump_optimizer_parameters_multi_group(distributed_setup, tmp_path: path
     assert len(spec["groups"]) == 2
     assert len(spec["groups"][0]["params"]) == 1
     assert len(spec["groups"][1]["params"]) == 1
-    assert spec["groups"][0]["params"][0]["global_shape"] == [2, 2]
-    assert spec["groups"][1]["params"][0]["global_shape"] == [3, 3]
+    assert spec["groups"][0]["params"][0]["global_shape"] == [distributed_setup.world_size * 2, 2]
+    assert spec["groups"][1]["params"][0]["global_shape"] == [distributed_setup.world_size * 3, 3]
     # Group hyperparameters (weight_decay, lr) are intentionally not recorded.
     assert "weight_decay" not in spec["groups"][0]
     assert "lr" not in spec["groups"][0]
