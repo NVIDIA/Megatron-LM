@@ -373,12 +373,12 @@ class TestSchedulerDeferralInteraction:
         req = _make_request()
         candidate = _get_cudagraph(64, 1, 0)
 
-        # Snapshot engine state, fire repeated misses, verify nothing else changed.
         before_state = (
             engine.context.active_token_count,
             engine.context.num_prefill_requests,
             engine.context.num_decode_requests,
         )
+        # Fire 20 consecutive misses to increment the wait counter and verify nothing else changed.
         for _ in range(20):
             assert engine._cg_admission_check(req, candidate) is False
         after_state = (
@@ -417,7 +417,8 @@ class TestSchedulerDeferralInteraction:
             token_count=8, prefill_req_count=0, decode_req_count=1
         )
 
-        # Iterate the "scheduler". Each iteration: try both, record outcomes.
+        # Simulate 3 scheduler iterations, each incrementing req_blocked's wait counter
+        # while req_admittable is admitted every step.
         results = []
         for step in range(3):
             blocked_admit = engine._cg_admission_check(req_blocked, blocked_candidate)
@@ -451,19 +452,37 @@ _CHUNKED_PREFILL_CG_CASES = [
     # - No CG match         -> eager fallback: result is max_chunk, not a deferral
     pytest.param(
         # Fresh batch, large budget — gating active, CG match at 256.
-        0, 0, 0, 300, False, False, 256,
+        0,
+        0,
+        0,
+        300,
+        False,
+        False,
+        256,
         id="new_request_cg_match",
     ),
     pytest.param(
         # Budget below the smallest CG (min token_count=2) — no match.
         # Chunked prefill falls back to eager: uses max_chunk=1, not deferred.
-        0, 0, 0, 1, False, False, 1,
+        0,
+        0,
+        0,
+        1,
+        False,
+        False,
+        1,
         id="new_request_no_cg_match_eager_fallback",
     ),
     pytest.param(
         # Continuing chunked prefill: gating is bypassed regardless of CG coverage.
         # Expected result equals max_chunk.
-        50, 1, 0, 100, False, True, 100,
+        50,
+        1,
+        0,
+        100,
+        False,
+        True,
+        100,
         id="continuing_chunked_prefill_gating_skipped",
     ),
 ]
