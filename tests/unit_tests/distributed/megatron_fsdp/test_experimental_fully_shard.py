@@ -3,13 +3,9 @@
 """Unit tests for the minimal Megatron-FSDP path."""
 
 import logging
-import os
-from collections.abc import Iterator
-from dataclasses import dataclass
 
 import pytest
 import torch
-import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
@@ -22,37 +18,6 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 
 logger = logging.getLogger(__name__)
-
-
-@dataclass(frozen=True)
-class DistributedSetup:
-    """Per-rank distributed test setup."""
-
-    rank: int
-    world_size: int
-    device: torch.device
-
-
-@pytest.fixture(scope="module")
-def setup() -> Iterator[DistributedSetup]:
-    """Read torchrun rank state and set up this rank's local device."""
-    if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
-        pytest.skip("Not running under torchrun.")
-
-    rank = int(os.environ["RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    local_rank = int(os.environ.get("LOCAL_RANK", rank))
-
-    if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank)
-        device = torch.device(f"cuda:{local_rank}")
-    else:
-        device = torch.device("cpu")
-
-    yield DistributedSetup(rank=rank, world_size=world_size, device=device)
-
-    if dist.is_initialized():
-        dist.destroy_process_group()
 
 
 class TinyModel(nn.Module):
@@ -113,18 +78,6 @@ class NonLeafViewModel(nn.Module):
         return SaveNonLeafWeightView.apply(x, weight_view)
 
 
-class ConstantMetaModel(nn.Module):
-    """Model whose meta parameter is initialized by reset_parameters()."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.empty(4, 4, device="meta"))
-
-    def reset_parameters(self) -> None:
-        """Initialize the weight to a deterministic value."""
-        self.weight.fill_(3.0)
-
-
 def _flat_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()])
 
@@ -134,15 +87,18 @@ def _mb(num_bytes: int) -> str:
 
 
 @pytest.mark.distributed
-def test_fully_shard_losses_match_baseline(setup: DistributedSetup):
+def test_fully_shard_losses_match_baseline(distributed_setup):
     """Minimal per-module FSDP training should match single-rank SGD."""
-    if setup.world_size < 2:
+    rank = distributed_setup.rank
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
         pytest.skip("This test requires at least 2 ranks.")
 
-    mesh = init_device_mesh(setup.device.type, (setup.world_size,))
+    mesh = init_device_mesh(device.type, (world_size,))
     torch.manual_seed(1234)
-    baseline = TinyModel().to(setup.device)
-    model = TinyModel().to(setup.device)
+    baseline = TinyModel().to(device)
+    model = TinyModel().to(device)
     model.load_state_dict(baseline.state_dict())
 
     fully_shard(model.fc1, mesh=mesh, placements=_flat_placements())
@@ -150,8 +106,8 @@ def test_fully_shard_losses_match_baseline(setup: DistributedSetup):
     baseline_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
 
-    x = torch.randn(3, 8, device=setup.device)
-    target = torch.randn(3, 4, device=setup.device)
+    x = torch.randn(3, 8, device=device)
+    target = torch.randn(3, 4, device=device)
 
     for step in range(5):
         baseline_optimizer.zero_grad()
@@ -161,7 +117,7 @@ def test_fully_shard_losses_match_baseline(setup: DistributedSetup):
         loss = torch.nn.functional.mse_loss(model(x), target)
         logger.info(
             "FSDP train parity: rank=%s, step=%s, baseline_loss=%s, sharded_loss=%s",
-            setup.rank,
+            rank,
             step,
             baseline_loss.item(),
             loss.item(),
@@ -175,13 +131,15 @@ def test_fully_shard_losses_match_baseline(setup: DistributedSetup):
 
 
 @pytest.mark.distributed
-def test_nested_fully_shard_excludes_child_owned_parameters(setup: DistributedSetup):
+def test_nested_fully_shard_excludes_child_owned_parameters(distributed_setup):
     """An outer FSDP unit owns direct parameters but not nested child-unit parameters."""
-    if setup.world_size < 2:
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
         pytest.skip("This test requires at least 2 ranks.")
 
-    mesh = init_device_mesh(setup.device.type, (setup.world_size,))
-    model = NestedModel().to(setup.device)
+    mesh = init_device_mesh(device.type, (world_size,))
+    model = NestedModel().to(device)
 
     fully_shard(model.inner, mesh=mesh, placements=_flat_placements())
     fully_shard(model, mesh=mesh, placements=_flat_placements())
@@ -196,13 +154,15 @@ def test_nested_fully_shard_excludes_child_owned_parameters(setup: DistributedSe
 
 
 @pytest.mark.distributed
-def test_frozen_parameter_group_does_not_allocate_main_grad(setup: DistributedSetup):
+def test_frozen_parameter_group_does_not_allocate_main_grad(distributed_setup):
     """A non-trainable parameter group should not allocate persistent main gradients."""
-    if setup.world_size < 2:
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
         pytest.skip("This test requires at least 2 ranks.")
 
-    mesh = init_device_mesh(setup.device.type, (setup.world_size,))
-    model = nn.Linear(4, 4, bias=False).to(setup.device)
+    mesh = init_device_mesh(device.type, (world_size,))
+    model = nn.Linear(4, 4, bias=False).to(device)
     model.weight.requires_grad_(False)
 
     fully_shard(model, mesh=mesh, placements=_flat_placements())
@@ -215,36 +175,41 @@ def test_frozen_parameter_group_does_not_allocate_main_grad(setup: DistributedSe
 pytest.mark.distributed
 
 
-def test_backward_averages_across_dp_and_accumulates_across_calls(setup: DistributedSetup):
+def test_backward_averages_across_dp_and_accumulates_across_calls(distributed_setup):
     """Each backward averages over DP ranks; repeated backwards accumulate by summing."""
-    if setup.world_size < 2:
+    rank = distributed_setup.rank
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
         pytest.skip("This test requires at least 2 ranks.")
 
-    mesh = init_device_mesh(setup.device.type, (setup.world_size,))
-    model = nn.Linear(1, setup.world_size, bias=False).to(setup.device)
+    mesh = init_device_mesh(device.type, (world_size,))
+    model = nn.Linear(1, world_size, bias=False).to(device)
     with torch.no_grad():
         model.weight.fill_(1.0)
 
     fully_shard(model, mesh=mesh, placements=_flat_placements())
 
-    x = torch.full((1, 1), float(setup.rank + 1), device=setup.device)
+    x = torch.full((1, 1), float(rank + 1), device=device)
     model(x).sum().backward()
     model(x).sum().backward()
 
     assert isinstance(model.weight.grad, DTensor)
     local_grad = model.weight.grad.to_local()
-    expected = torch.full_like(local_grad, float(setup.world_size + 1))
+    expected = torch.full_like(local_grad, float(world_size + 1))
     torch.testing.assert_close(local_grad, expected, rtol=0, atol=0)
 
 
 @pytest.mark.distributed
-def test_next_forward_uses_optimizer_updated_weights(setup: DistributedSetup):
+def test_next_forward_uses_optimizer_updated_weights(distributed_setup):
     """The next forward should observe weights updated by the previous optimizer step."""
-    if setup.world_size < 2:
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
         pytest.skip("This test requires at least 2 ranks.")
 
-    mesh = init_device_mesh(setup.device.type, (setup.world_size,))
-    model = nn.Linear(1, setup.world_size, bias=False, dtype=torch.bfloat16).to(setup.device)
+    mesh = init_device_mesh(device.type, (world_size,))
+    model = nn.Linear(1, world_size, bias=False, dtype=torch.bfloat16).to(device)
     with torch.no_grad():
         model.weight.fill_(1.0)
 
@@ -257,7 +222,7 @@ def test_next_forward_uses_optimizer_updated_weights(setup: DistributedSetup):
     # SGD's foreach/fused CUDA paths require matching parameter and gradient dtypes.
     # Use the scalar path to exercise FP32 main weights with default BF16 main grads.
     optimizer = torch.optim.SGD(model.parameters(), lr=0.25, foreach=False)
-    x = torch.ones(1, 1, device=setup.device, dtype=torch.bfloat16)
+    x = torch.ones(1, 1, device=device, dtype=torch.bfloat16)
 
     def train_iteration() -> torch.Tensor:
         optimizer.zero_grad(set_to_none=True)
@@ -274,34 +239,41 @@ def test_next_forward_uses_optimizer_updated_weights(setup: DistributedSetup):
 
 
 @pytest.mark.distributed
-def test_meta_parameters_initialize_with_reset_parameters(setup: DistributedSetup):
-    """Meta parameters should be replaced by sharded DTensors and initialized in place."""
-    if setup.world_size < 2:
+def test_cpu_initialized_parameters_shard_to_mesh_device(distributed_setup):
+    """CPU-initialized parameters should be sharded with their real values."""
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
         pytest.skip("This test requires at least 2 ranks.")
 
-    mesh = init_device_mesh(setup.device.type, (setup.world_size,))
-    model = ConstantMetaModel()
+    mesh = init_device_mesh(device.type, (world_size,))
+    model = nn.Linear(4, 4, bias=False)
+    with torch.no_grad():
+        model.weight.fill_(3.0)
+    expected_weight = model.weight.detach().to(device)
 
     fully_shard(model, mesh=mesh, placements=_flat_placements())
 
     (group,) = model.parameter_groups()
     full_weight = group.model_weight.allgather(0).get_local_tensor(0)
-    assert not full_weight.is_meta
-    torch.testing.assert_close(full_weight, torch.full_like(full_weight, 3.0))
+    assert full_weight.device.type == device.type
+    torch.testing.assert_close(full_weight, expected_weight)
 
 
 @pytest.mark.distributed
-def test_non_leaf_parameter_view_survives_storage_resize(setup: DistributedSetup):
+def test_non_leaf_parameter_view_survives_storage_resize(distributed_setup):
     """A non-leaf parameter view saved for backward should survive full-storage resize."""
-    if setup.world_size < 2:
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
         pytest.skip("This test requires at least 2 ranks.")
 
-    mesh = init_device_mesh(setup.device.type, (setup.world_size,))
-    model = NonLeafViewModel().to(setup.device)
+    mesh = init_device_mesh(device.type, (world_size,))
+    model = NonLeafViewModel().to(device)
     fully_shard(model, mesh=mesh, placements=_flat_placements())
 
     group = model.parameter_groups()[0]
-    x = torch.randn(8, device=setup.device, requires_grad=True)
+    x = torch.randn(8, device=device, requires_grad=True)
     loss = model(x).sum()
 
     assert group._unsharded_model_weight is not None
@@ -315,14 +287,17 @@ def test_non_leaf_parameter_view_survives_storage_resize(setup: DistributedSetup
 
 
 @pytest.mark.distributed
-def test_fully_shard_reduces_peak_training_memory(setup: DistributedSetup):
+def test_fully_shard_reduces_peak_training_memory(distributed_setup):
     """Per-layer FSDP should reduce peak CUDA memory during training."""
-    if setup.world_size < 2:
+    rank = distributed_setup.rank
+    world_size = distributed_setup.world_size
+    device = distributed_setup.device
+    if world_size < 2:
         pytest.skip("This test requires at least 2 ranks.")
-    if setup.device.type != "cuda":
+    if device.type != "cuda":
         pytest.skip("Peak memory verification requires CUDA.")
 
-    mesh = init_device_mesh(setup.device.type, (setup.world_size,))
+    mesh = init_device_mesh(device.type, (world_size,))
     dim = 1024
     layers = 16
     batch = 8
@@ -337,14 +312,14 @@ def test_fully_shard_reduces_peak_training_memory(setup: DistributedSetup):
 
     torch.manual_seed(4321)
     baseline = nn.Sequential(*[nn.Linear(dim, dim, dtype=dtype) for _ in range(layers)]).to(
-        setup.device
+        device
     )
     baseline_optimizer = torch.optim.AdamW(baseline.parameters(), lr=0.01)
-    x = torch.randn(batch, dim, device=setup.device, dtype=dtype)
-    torch.cuda.reset_peak_memory_stats(setup.device)
+    x = torch.randn(batch, dim, device=device, dtype=dtype)
+    torch.cuda.reset_peak_memory_stats(device)
     train_steps(baseline, baseline_optimizer, x)
-    torch.cuda.synchronize(setup.device)
-    baseline_peak = torch.cuda.max_memory_allocated(setup.device)
+    torch.cuda.synchronize(device)
+    baseline_peak = torch.cuda.max_memory_allocated(device)
 
     del baseline_optimizer
     del baseline
@@ -353,7 +328,7 @@ def test_fully_shard_reduces_peak_training_memory(setup: DistributedSetup):
 
     torch.manual_seed(4321)
     model = nn.Sequential(*[nn.Linear(dim, dim, dtype=dtype) for _ in range(layers)]).to(
-        setup.device
+        device
     )
     for layer in model:
         fully_shard(
@@ -367,14 +342,14 @@ def test_fully_shard_reduces_peak_training_memory(setup: DistributedSetup):
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)
     torch.cuda.empty_cache()
 
-    x = torch.randn(batch, dim, device=setup.device, dtype=dtype)
-    torch.cuda.reset_peak_memory_stats(setup.device)
+    x = torch.randn(batch, dim, device=device, dtype=dtype)
+    torch.cuda.reset_peak_memory_stats(device)
     train_steps(model, optimizer, x)
-    torch.cuda.synchronize(setup.device)
-    sharded_peak = torch.cuda.max_memory_allocated(setup.device)
+    torch.cuda.synchronize(device)
+    sharded_peak = torch.cuda.max_memory_allocated(device)
     logger.info(
         "FSDP peak memory: rank=%s, baseline=%s, sharded=%s",
-        setup.rank,
+        rank,
         _mb(baseline_peak),
         _mb(sharded_peak),
     )
