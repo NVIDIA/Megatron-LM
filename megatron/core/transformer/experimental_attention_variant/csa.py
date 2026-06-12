@@ -479,25 +479,25 @@ class CSAIndexer(MegatronModule):
 
         self.rotary_pos_emb = rotary_pos_emb
 
-        # The indexer weights stay in BF16 even under FP8 training (the reference
-        # DeepSeek V4 checkpoint keeps them in BF16), so build them outside any
+        # Q projection (FP8 in the reference DeepSeek V4 checkpoint, so it is built
+        # inside the enclosing fp8_model_init context like the other FP8 weights)
+        self.linear_wq_b = build_module(
+            submodules.linear_wq_b,
+            self.q_lora_rank,
+            self.index_n_heads * self.index_head_dim,
+            config=config,
+            init_method=config.init_method,
+            bias=False,
+            skip_bias_add=False,
+            skip_weight_param_allocation=False,
+            parallel_mode="duplicated",
+            name=(name + ".linear_wq_b") if name is not None else None,
+        )
+
+        # Weights projection stays in BF16 even under FP8 training (the reference
+        # DeepSeek V4 checkpoint keeps it in BF16), so build it outside any
         # enclosing fp8_model_init context.
         with get_fp8_disabled_context(config, is_init=True):
-            # Q projection
-            self.linear_wq_b = build_module(
-                submodules.linear_wq_b,
-                self.q_lora_rank,
-                self.index_n_heads * self.index_head_dim,
-                config=config,
-                init_method=config.init_method,
-                bias=False,
-                skip_bias_add=False,
-                skip_weight_param_allocation=False,
-                parallel_mode="duplicated",
-                name=(name + ".linear_wq_b") if name is not None else None,
-            )
-
-            # Weights projection
             self.linear_weights_proj = build_module(
                 submodules.linear_weights_proj,
                 self.hidden_size,
@@ -531,10 +531,8 @@ class CSAIndexer(MegatronModule):
 
         sq, bsz, _ = x.size()
 
-        # Q path
-        # Run the indexer GEMMs in high precision (BF16) even under FP8 training.
-        with get_fp8_disabled_context(self.config):
-            q, _ = self.linear_wq_b(qr)  # [sq, b, n_heads * head_dim]
+        # Q path (runs in FP8 under FP8 training, like the other FP8 GEMMs)
+        q, _ = self.linear_wq_b(qr)  # [sq, b, n_heads * head_dim]
         q = q.reshape(sq, bsz, self.index_n_heads, self.index_head_dim)
         q = _apply_rope(
             q,
