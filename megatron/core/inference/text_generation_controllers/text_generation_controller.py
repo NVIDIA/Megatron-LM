@@ -1733,14 +1733,30 @@ class TextGenerationController:
         return cuda_graph_request_count
 
     def _async_scheduling_prepare_forward_bookkeep(
-        self, prepared_update: Dict
-    ) -> Dict[str, Optional[Tensor]]:
+        self, prepared_update: Dict, request_bookkeeping: Dict, *, run_forward: bool = True
+    ) -> Tuple[Dict, Dict[str, Optional[Tensor]]]:
         """Run prepare(N+1) -> forward(N+1) -> bookkeep(N) serially."""
         context = self.inference_wrapped_model.inference_context
 
         range_push("update_requests_prepare")
-        context.update_requests_prepare(**prepared_update)
+        prepared_update, request_bookkeeping = context.update_requests_prepare(
+            **prepared_update, request_bookkeeping=request_bookkeeping
+        )
         range_pop()
+
+        active_requests_mask = prepared_update["active_requests_mask"]
+        assert active_requests_mask is not None
+        if (
+            not run_forward
+            or active_requests_mask.numel() == 0
+            or (active_requests_mask == 0).all()
+        ):
+            range_push("update_requests_bookkeep")
+            update_result = context.update_requests_bookkeep(prepared_update)
+            range_pop()
+            self._async_schedule_forward_primed = False
+            self._async_schedule_primed_cuda_graph_request_count = None
+            return request_bookkeeping, update_result or {}
 
         self._async_schedule_primed_cuda_graph_request_count = (
             self._dynamic_step_forward_for_async_scheduling()
@@ -1753,32 +1769,7 @@ class TextGenerationController:
         range_pop()
 
         self._async_schedule_forward_primed = True
-        return update_result or {}
-
-    def _filter_and_compact_async_scheduling_update(
-        self, prepared_update: Dict, request_bookkeeping: Dict
-    ) -> Tuple[Dict, Dict]:
-        """Drop prior-finished rows from the current sample and compact the context."""
-        context = self.inference_wrapped_model.inference_context
-        pending_finished_rows = context.pending_async_finished_rows()
-        if pending_finished_rows is None:
-            return prepared_update, request_bookkeeping
-
-        finished_mask = pending_finished_rows.active_mask
-        keep_mask = ~finished_mask
-        request_bookkeeping = context.filter_async_finished_request_rows(request_bookkeeping)
-        context.compact_async_finished_request_rows(next_tokens=prepared_update["new_tokens"])
-
-        prepared_update = dict(prepared_update)
-        prepared_update["active_requests_mask"] = prepared_update["active_requests_mask"][
-            keep_mask
-        ]
-        prepared_update["new_tokens"] = prepared_update["new_tokens"][: keep_mask.sum().item()]
-        if prepared_update["new_speculative_tokens"] is not None:
-            prepared_update["new_speculative_tokens"] = prepared_update["new_speculative_tokens"][
-                :, keep_mask
-            ]
-        return prepared_update, request_bookkeeping
+        return request_bookkeeping, update_result or {}
 
     def _get_async_scheduling_fallback_reason(
         self, prepared_update: Optional[Dict] = None
@@ -1842,27 +1833,25 @@ class TextGenerationController:
         self._dynamic_step_sample_logits()
         range_pop()
         prepared_update, request_bookkeeping = self._dynamic_step_context_prepare_bookkeeping()
-        prepared_update, request_bookkeeping = self._filter_and_compact_async_scheduling_update(
-            prepared_update, request_bookkeeping
-        )
 
-        active_requests_mask = prepared_update["active_requests_mask"]
-        assert active_requests_mask is not None
         fallback_reason = self._get_async_scheduling_fallback_reason(prepared_update)
-        if (
-            active_requests_mask.numel() == 0
-            or (active_requests_mask == 0).all()
-            or fallback_reason is not None
-        ):
-            range_push("update_requests")
-            update_result = context.update_requests_bookkeep(prepared_update)
-            if update_result is not None:
-                context.update_requests_prepare(**prepared_update)
-            range_pop()
-            self._async_schedule_forward_primed = False
-            self._async_schedule_primed_cuda_graph_request_count = None
+        if fallback_reason is not None:
+            if context.has_async_finished_request_rows():
+                request_bookkeeping, update_result = self._async_scheduling_prepare_forward_bookkeep(
+                    prepared_update, request_bookkeeping, run_forward=False
+                )
+            else:
+                range_push("update_requests")
+                update_result = context.update_requests_bookkeep(prepared_update)
+                if update_result is not None:
+                    context.update_requests_prepare(**prepared_update)
+                range_pop()
+                self._async_schedule_forward_primed = False
+                self._async_schedule_primed_cuda_graph_request_count = None
         else:
-            update_result = self._async_scheduling_prepare_forward_bookkeep(prepared_update)
+            request_bookkeeping, update_result = self._async_scheduling_prepare_forward_bookkeep(
+                prepared_update, request_bookkeeping
+            )
 
         return request_bookkeeping, update_result or {}
 

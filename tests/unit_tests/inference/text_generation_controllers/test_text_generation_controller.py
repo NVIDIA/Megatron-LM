@@ -19,7 +19,6 @@ from megatron.core.inference.config import InferenceConfig, MambaInferenceStateC
 from megatron.core.inference.contexts import DynamicInferenceContext, StaticInferenceContext
 from megatron.core.inference.contexts.dynamic_context import (
     MaxSequenceLengthOverflowError,
-    PendingAsyncFinishedRows,
 )
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
@@ -206,6 +205,7 @@ class TestAsyncSchedulingControllerHelpers:
         context.chunked_prefill_request_id = -1
         context.is_chunked_prefill_enabled.return_value = False
         context.pending_async_finished_rows.return_value = None
+        context.has_async_finished_request_rows.return_value = False
         context.block_size_tokens = 128
         context.request_last_kv_block_offset = torch.tensor([1, 2], device='cpu')
         context.request_metadata = {
@@ -352,23 +352,8 @@ class TestAsyncSchedulingControllerHelpers:
             == "speculative_tokens"
         )
 
-    def test_async_scheduling_filter_and_compact_drops_prior_finished_rows(self):
+    def test_async_scheduling_prepare_uses_context_adjusted_bookkeeping(self):
         controller, context, _ = self._make_async_eligibility_controller()
-        context.total_request_count = 2
-        context.request_ids = torch.tensor([10, 11], dtype=torch.int32, device='cpu')
-        context.pending_async_finished_rows.return_value = PendingAsyncFinishedRows(
-            active_mask=torch.tensor([True, False], device='cpu'),
-            request_ids=torch.tensor([10], dtype=torch.int32, device='cpu'),
-        )
-        context.filter_async_finished_request_rows.side_effect = lambda result: {
-            **result,
-            "active_request_ids": torch.tensor([11], device='cpu'),
-            "sample": torch.tensor([101], device='cpu'),
-            "finished_request_ids": torch.tensor([], dtype=torch.int32, device='cpu'),
-        }
-        context.compact_async_finished_request_rows.side_effect = (
-            lambda next_tokens: next_tokens.copy_(torch.tensor([101, 101], device='cpu'))
-        )
         prepared_update = {
             "active_requests_mask": torch.tensor([0, 1], device='cpu'),
             "new_tokens": torch.tensor([100, 101], device='cpu'),
@@ -379,26 +364,52 @@ class TestAsyncSchedulingControllerHelpers:
             "sample": torch.tensor([100, 101], device='cpu'),
             "finished_request_ids": torch.tensor([10], device='cpu'),
         }
+        filtered_update = {
+            "active_requests_mask": torch.tensor([1], device='cpu'),
+            "new_tokens": torch.tensor([101], device='cpu'),
+            "new_speculative_tokens": None,
+        }
+        filtered_bookkeeping = {
+            "active_request_ids": torch.tensor([11], device='cpu'),
+            "sample": torch.tensor([101], device='cpu'),
+            "finished_request_ids": torch.tensor([], dtype=torch.int32, device='cpu'),
+        }
+        context.update_requests_prepare.return_value = (filtered_update, filtered_bookkeeping)
+        context.update_requests_bookkeep.return_value = {
+            "newly_paused_request_ids": None,
+            "evict_request_ids": None,
+        }
+        controller._dynamic_step_forward_for_async_scheduling = mock.Mock(return_value=None)
 
-        filtered_update, filtered_bookkeeping = (
-            controller._filter_and_compact_async_scheduling_update(
-                prepared_update, request_bookkeeping
-            )
+        actual_bookkeeping, update_result = controller._async_scheduling_prepare_forward_bookkeep(
+            prepared_update, request_bookkeeping
         )
 
-        assert filtered_update["active_requests_mask"].tolist() == [1]
-        assert filtered_update["new_tokens"].tolist() == [101]
-        assert filtered_bookkeeping["active_request_ids"].tolist() == [11]
-        assert filtered_bookkeeping["sample"].tolist() == [101]
-        assert filtered_bookkeeping["finished_request_ids"].numel() == 0
+        context.update_requests_prepare.assert_called_once_with(
+            **prepared_update, request_bookkeeping=request_bookkeeping
+        )
+        context.update_requests_bookkeep.assert_called_once_with(
+            filtered_update, delay_finished_compaction=True
+        )
+        assert actual_bookkeeping is filtered_bookkeeping
+        assert update_result == {"newly_paused_request_ids": None, "evict_request_ids": None}
 
     def test_serial_async_scheduling_call_order(self):
         controller, context, _ = self._make_async_eligibility_controller()
         events = []
 
-        context.update_requests_prepare.side_effect = lambda **_: events.append(
-            "update_requests_prepare"
-        )
+        def prepare_side_effect(**kwargs):
+            events.append("update_requests_prepare")
+            return (
+                {
+                    "active_requests_mask": kwargs["active_requests_mask"],
+                    "new_tokens": kwargs["new_tokens"],
+                    "new_speculative_tokens": kwargs["new_speculative_tokens"],
+                },
+                kwargs["request_bookkeeping"],
+            )
+
+        context.update_requests_prepare.side_effect = prepare_side_effect
         context.update_requests_bookkeep.side_effect = lambda *_args, **_kwargs: events.append(
             "update_requests_bookkeep"
         ) or {

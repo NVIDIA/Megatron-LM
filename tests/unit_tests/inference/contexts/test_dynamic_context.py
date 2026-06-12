@@ -818,6 +818,47 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
+    def test_update_requests_prepare_consumes_pending_async_finished_rows(self):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=None,
+        )
+        dynamic_context.total_request_count = 3
+        dynamic_context.request_ids[:3] = torch.tensor([10, 11, 12], device='cpu')
+        dynamic_context.request_query_lengths[:3] = 1
+        dynamic_context.request_kv_length_offsets[:3] = torch.tensor([5, 6, 7], device='cpu')
+        dynamic_context.request_last_kv_block_offset[:3] = torch.tensor([5, 6, 7], device='cpu')
+        dynamic_context.request_last_kv_block_id[:3] = torch.tensor([20, 21, 22], device='cpu')
+        dynamic_context.record_async_finished_request_rows(torch.tensor([False, True, False]))
+
+        prepared_update, filtered_bookkeeping = dynamic_context.update_requests_prepare(
+            active_requests_mask=torch.tensor([1, 1, 0], device='cpu'),
+            new_tokens=torch.tensor([100, 101, 102], device='cpu'),
+            request_bookkeeping={
+                "active_request_ids": torch.tensor([10, 11, 12], device='cpu'),
+                "sample": torch.tensor([100, 101, 102], device='cpu'),
+                "finished_request_ids": torch.tensor([11, 12], device='cpu'),
+            },
+        )
+
+        assert not dynamic_context.has_async_finished_request_rows()
+        assert dynamic_context.request_ids[:3].tolist() == [10, 12, -1]
+        assert prepared_update["active_requests_mask"].tolist() == [1, 0]
+        assert prepared_update["new_tokens"].tolist() == [100, 102]
+        assert filtered_bookkeeping["active_request_ids"].tolist() == [10, 12]
+        assert filtered_bookkeeping["sample"].tolist() == [100, 102]
+        assert filtered_bookkeeping["finished_request_ids"].tolist() == [12]
+        assert dynamic_context.token_to_input_ids[:2].tolist() == [100, 102]
+        assert dynamic_context.token_to_request_idx[:2].tolist() == [0, 1]
+
+    @pytest.mark.internal
+    @rounder_override(64)
     def test_update_requests_prepare_decode_tokens(self):
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,

@@ -6,7 +6,7 @@ import operator
 import warnings
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import torch  # type: ignore
 import torch.nn.functional as F  # type: ignore
@@ -3091,6 +3091,41 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         self.clear_async_finished_request_rows()
 
+    def _consume_async_finished_request_rows_for_prepare(
+        self,
+        prepared_update: Dict[str, Optional[Tensor]],
+        request_bookkeeping: Optional[Dict],
+    ) -> Tuple[Dict[str, Optional[Tensor]], Optional[Dict]]:
+        """Consume pending async-finished rows before preparing the next forward."""
+        pending_finished_rows = self.pending_async_finished_rows()
+        if pending_finished_rows is None:
+            return prepared_update, request_bookkeeping
+
+        finished_mask = pending_finished_rows.active_mask
+        keep_mask = ~finished_mask
+        remaining_request_count = keep_mask.sum().item()
+        filtered_bookkeeping = (
+            self.filter_async_finished_request_rows(request_bookkeeping)
+            if request_bookkeeping is not None
+            else None
+        )
+
+        self.compact_async_finished_request_rows(
+            next_tokens=prepared_update["new_tokens"],
+            new_speculative_tokens=prepared_update["new_speculative_tokens"],
+        )
+
+        prepared_update = dict(prepared_update)
+        prepared_update["active_requests_mask"] = prepared_update["active_requests_mask"][
+            keep_mask
+        ]
+        prepared_update["new_tokens"] = prepared_update["new_tokens"][:remaining_request_count]
+        if prepared_update["new_speculative_tokens"] is not None:
+            prepared_update["new_speculative_tokens"] = prepared_update[
+                "new_speculative_tokens"
+            ][:, :remaining_request_count]
+        return prepared_update, filtered_bookkeeping
+
     def _move_book_keeping_tensors(
         self, src_idxs, dst_idxs, next_tokens, new_speculative_tokens=None
     ):
@@ -3412,7 +3447,8 @@ class DynamicInferenceContext(BaseInferenceContext):
         new_tokens: Tensor,
         new_speculative_tokens: Tensor = None,
         prev_last_block_ids: Optional[Tensor] = None,
-    ) -> Dict[str, Optional[Tensor]]:
+        request_bookkeeping: Optional[Dict] = None,
+    ) -> Union[Dict[str, Optional[Tensor]], Tuple[Dict[str, Optional[Tensor]], Dict]]:
         """Speculatively prepare token bookkeeping for the next forward."""
 
         # Ensure all inputs are on CPU for bookkeeping operations.
@@ -3429,11 +3465,18 @@ class DynamicInferenceContext(BaseInferenceContext):
             "new_speculative_tokens": new_speculative_tokens,
             "prev_last_block_ids": prev_last_block_ids,
         }
+        prepared_update, request_bookkeeping = self._consume_async_finished_request_rows_for_prepare(
+            prepared_update, request_bookkeeping
+        )
+        new_tokens = prepared_update["new_tokens"]
+        new_speculative_tokens = prepared_update["new_speculative_tokens"]
 
         self.num_prefill_requests = 0
         active_request_count = self.total_request_count - self.paused_request_count
         if active_request_count == 0:
             self.active_token_count = 0
+            if request_bookkeeping is not None:
+                return prepared_update, request_bookkeeping
             return prepared_update
 
         active_slice = slice(self.paused_request_count, self.total_request_count)
@@ -3566,6 +3609,8 @@ class DynamicInferenceContext(BaseInferenceContext):
             # Convert back to 1d tensor
             self.token_to_block_idx[: self.active_token_count] = block_idx.flatten()
 
+        if request_bookkeeping is not None:
+            return prepared_update, request_bookkeeping
         return prepared_update
 
     def update_requests_bookkeep(
