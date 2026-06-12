@@ -1451,23 +1451,22 @@ class _NCCLEPManager(_DispatchManager):
         self.alignment = get_align_size_for_quantization(config)
         self.rank_capacity_factor = config.moe_expert_rank_capacity_factor
         self.static_shape = config.moe_ncclep_static_shape
-        self.skip_capacity_pad = config.moe_ncclep_skip_capacity_pad
         self.use_symm_mem = config.moe_ncclep_use_symm_mem
-        if self.skip_capacity_pad:
-            if not self.static_shape:
-                raise ValueError(
-                    "moe_ncclep_skip_capacity_pad=True requires moe_ncclep_static_shape=True (it "
-                    "only applies to the full static receive buffer)."
-                )
-            # CUTEDSL grouped-GEMM is required to process when tokens per expert sum <= budget
+        if self.static_shape:
             if torch.cuda.get_device_capability()[0] < 10:
                 raise ValueError(
-                    "moe_ncclep_skip_capacity_pad=True requires an sm100+ (Blackwell or later) GPU "
-                    "with a CuTe DSL grouped GEMM; leave it False on older GPUs."
+                    "moe_ncclep_static_shape=True requires an sm100+ (Blackwell or later) GPU with "
+                    "a CuTe DSL / device-offset grouped GEMM; leave it False (dynamic shape) on "
+                    "older GPUs."
+                )
+            if not (config.use_transformer_engine_op_fuser or config.moe_grouped_gemm):
+                raise ValueError(
+                    "moe_ncclep_static_shape=True requires the fused grouped GEMM; enable "
+                    "use_transformer_engine_op_fuser (or moe_grouped_gemm)."
                 )
             if int(os.environ.get("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "0")) <= 0:
                 raise ValueError(
-                    "moe_ncclep_skip_capacity_pad=True requires the CuTe DSL grouped GEMM; set "
+                    "moe_ncclep_static_shape=True requires the CuTe DSL grouped GEMM; set "
                     "NVTE_CUTEDSL_FUSED_GROUPED_MLP=1 (the expert grouped GEMM must consume ragged "
                     "per-expert counts on device)."
                 )
@@ -1581,19 +1580,12 @@ class _NCCLEPManager(_DispatchManager):
         recv_tokens, tokens_per_expert, dispatched_probs = nccl_ep_dispatch(
             lease.ctx, hidden_states, topk_idx, topk_weights
         )
-        # Return the context to the pool once its last consumer finishes. With grad enabled the
-        # last consumer is this execution's backward, so release on the dispatch-input grad hook
-        # Under no_grad, e.g. the discarded original pass of an activation-checkpointed layer,
-        # no backward will run, so release at combine (end of forward) instead.
         if torch.is_grad_enabled() and hidden_states.requires_grad:
             self._arm_release_on_backward(lease, hidden_states)
         else:
+            # we are inside of activation checkpointing, do not need to save for backward
             lease.release_at_combine = True
         self.tokens_per_expert = tokens_per_expert.to(torch.int64)
-        if self.static_shape and not self.skip_capacity_pad:
-            # Absorb the slack into the last expert so sum(counts) == recv_capacity
-            # This does not break cuda graph
-            self.tokens_per_expert[-1] += self._recv_capacity - self.tokens_per_expert.sum()
         self.dispatched_probs = dispatched_probs
         return recv_tokens
 
