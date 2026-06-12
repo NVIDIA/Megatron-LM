@@ -81,26 +81,23 @@ class DistributedDataParallel(_BaseDataParallel):
         # Assign all required process groups
         self.dp_group = process_group_dict['dp_group']
         self.dp_cp_group = process_group_dict['dp_cp_group']
-        self.intra_dp_cp_group = process_group_dict['intra_dp_cp_group']
         self.expt_dp_group = process_group_dict['expt_dp_group']
-        self.intra_expt_dp_group = process_group_dict['intra_expt_dp_group']
-        # GTP-aware DP subgroups (fall back to non-GTP variants when GTP is off):
-        #   *_with_gtp_group         : full cross-instance, GTP peers excluded (broadcast)
-        #   intra_*_with_gtp_group   : per-distopt-instance partial, GTP peers excluded (grad RS)
-        self.dp_cp_with_gtp_group = process_group_dict.get('dp_cp_with_gtp_group', self.dp_cp_group)
-        self.intra_dp_cp_with_gtp_group = process_group_dict.get(
-            'intra_dp_cp_with_gtp_group', self.intra_dp_cp_group
+        # DDP reduces every bucket over the GTP/EGTP-EXCLUDED replicate group (the gtp axis is
+        # completed separately by the RS + finalize all-reduce), so the intra groups DDP shards
+        # over ARE the *_with_gtp variants. They alias the regular intra groups when GTP is off.
+        self.intra_dp_cp_group = process_group_dict.get(
+            'intra_dp_cp_with_gtp_group', process_group_dict['intra_dp_cp_group']
         )
+        self.intra_expt_dp_group = process_group_dict.get(
+            'intra_expt_dp_with_egtp_group', process_group_dict['intra_expt_dp_group']
+        )
+        # Full cross-instance, GTP-peer-EXCLUDED groups for broadcast_params (init-time weight
+        # sync must reach all true replicas). Fall back to the full DP groups when GTP is off.
+        self.dp_cp_with_gtp_group = process_group_dict.get('dp_cp_with_gtp_group', self.dp_cp_group)
         self.expt_dp_with_egtp_group = process_group_dict.get(
             'expt_dp_with_egtp_group', self.expt_dp_group
         )
-        self.intra_expt_dp_with_egtp_group = process_group_dict.get(
-            'intra_expt_dp_with_egtp_group', self.intra_expt_dp_group
-        )
-        # GTP shards reduce like ordinary params over the *_with_gtp (replicate) group with the
-        # standard 1/full scaling; the gtp axis is completed elsewhere (RS for shards, finalize
-        # SUM all-reduce for replicated params) — see finalize_model_grads. GTP is "active" when
-        # the replicate groups are strictly smaller than the full DP groups.
+        # GTP is "active" when the replicate groups are strictly smaller than the full DP groups.
         gtp_active = (
             self.dp_cp_with_gtp_group.size() != self.dp_cp_group.size()
             or self.expt_dp_with_egtp_group.size() != self.expt_dp_group.size()
@@ -166,17 +163,12 @@ class DistributedDataParallel(_BaseDataParallel):
             )
             from ..optimizer.distrib_optimizer import DistributedOptimizer
 
-            # Buffers reduce/shard over the gtp/egtp-EXCLUDED replicate group, so the layout
-            # padding uses the replicate group sizes (these alias the full DP groups when GTP is
-            # inactive).
-            dp_layout_size = self.intra_dp_cp_with_gtp_group.size()
-            edp_layout_size = self.intra_expt_dp_with_egtp_group.size()
             full_param_layout = DistributedOptimizer.compute_full_param_layout(
                 all_params,
                 self.bucket_size,
-                dp_layout_size,
+                self.intra_dp_cp_group.size(),
                 self.ddp_config,
-                expert_data_parallel_world_size=edp_layout_size,
+                expert_data_parallel_world_size=self.intra_expt_dp_group.size(),
             )
 
         # When a full_param_layout is provided, verify that the grouping is consistent
@@ -240,14 +232,10 @@ class DistributedDataParallel(_BaseDataParallel):
         pg_collection = ProcessGroupCollection(tp=self.tp_group, dp_cp=self.dp_cp_group)
         for buffer_key, (params, param_indices) in buffer_groups.items():
             if buffer_key.is_expert_parallel:
-                # Expert params (incl. EGTP shards) reduce over the egtp-EXCLUDED replicate group
-                # (aliases the full expert-DP group when EGTP is inactive).
-                data_parallel_group = self.intra_expt_dp_with_egtp_group
+                data_parallel_group = self.intra_expt_dp_group
                 scaling_factor = expert_gradient_scaling_factor
             else:
-                # Dense params (incl. GTP shards) reduce over the gtp-EXCLUDED replicate group
-                # (aliases the full DP group when GTP is inactive).
-                data_parallel_group = self.intra_dp_cp_with_gtp_group
+                data_parallel_group = self.intra_dp_cp_group
                 scaling_factor = gradient_scaling_factor
 
             if not config.calculate_per_token_loss:
