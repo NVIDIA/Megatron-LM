@@ -81,11 +81,6 @@ class ParameterGroup:
         self.dtype = first_parameter.dtype
         self.requires_grad = first_parameter.requires_grad
         for name, parameter in parameters.items():
-            if parameter.is_meta:
-                raise ValueError(
-                    f"Expected parameter {name!r} to be materialized before "
-                    "ParameterGroup construction."
-                )
             if parameter.dtype != self.dtype:
                 raise ValueError(
                     f"Expected parameter {name!r} to have dtype {self.dtype}, "
@@ -110,7 +105,7 @@ class ParameterGroup:
             placements=[Replicate()] * self.mesh.ndim,
             tensor_shapes=tensor_shapes,
             dtype=self.dtype,
-            device=self.main_weight.local_buffer.device,
+            device=self.main_weight.device,
         )
         if main_weight_dtype == self.dtype and main_weight_placements == model_weight_placements:
             self.model_weight = self.main_weight
@@ -120,7 +115,7 @@ class ParameterGroup:
                 placements=model_weight_placements,
                 tensor_shapes=tensor_shapes,
                 dtype=self.dtype,
-                device=self.main_weight.local_buffer.device,
+                device=self.main_weight.device,
             )
 
         self.main_grad = None
@@ -131,7 +126,7 @@ class ParameterGroup:
                 placements=main_grad_placements,
                 tensor_shapes=self.main_weight.layout.tensor_shapes,
                 dtype=grad_dtype,
-                device=self.main_weight.local_buffer.device,
+                device=self.main_weight.device,
             )
             assert self.main_grad.layout == self.main_weight.layout, (
                 "main_grad is built from main_weight tensor shapes on the same mesh, "
@@ -147,7 +142,7 @@ class ParameterGroup:
 
         sharded_parameters: list[nn.Parameter] = []
         unsharded_parameters: list[nn.Parameter] = []
-        main_grad_dtype = self.main_grad.local_buffer.dtype if self.main_grad is not None else None
+        main_grad_dtype = self.main_grad.dtype if self.main_grad is not None else None
         for index, parameter in enumerate(parameters.values()):
             parameter.data = self._unsharded_model_weight.get_local_tensor(index)
             parameter.grad = None
@@ -183,13 +178,12 @@ class ParameterGroup:
         if self.main_weight is self.model_weight:
             return
 
-        self.main_weight.cast(self.model_weight.local_buffer.dtype).redistribute(
+        self.main_weight.cast(self.model_weight.dtype).redistribute(
             self.model_weight.placements, out=self.model_weight
         )
 
     def unshard_parameters(self) -> None:
         """Install full parameters for local compute."""
-        self.sync_model_weight_from_main_weight()
         self._unsharded_model_weight.reallocate_storage()
         # This buffer backs unsharded Parameters whose views may be saved by autograd.
         # Materializing FSDP-managed storage should not look like a user mutation.
@@ -238,7 +232,7 @@ class ParameterGroup:
         has_sharded_grads = has_grad(self.sharded_parameters)
         can_reduce_into_main_grad = (
             not has_sharded_grads
-            and partial_grad.local_buffer.dtype == self.main_grad.local_buffer.dtype
+            and partial_grad.dtype == self.main_grad.dtype
         )
         if can_reduce_into_main_grad:
             partial_grad.redistribute(self.main_grad.placements, out=self.main_grad)
