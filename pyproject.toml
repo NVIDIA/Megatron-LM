@@ -126,7 +126,8 @@ te = [
 ]
 
 ssm = [
-    "mamba-ssm~=2.2",
+    # TODO: Bump this hash before merging this branch.
+    "mamba-ssm @ git+https://github.com/state-spaces/mamba.git@b3cae1baee273b6617b9b1dffa52c75703b4ced0",
     "causal-conv1d~=1.5",
 ]
 
