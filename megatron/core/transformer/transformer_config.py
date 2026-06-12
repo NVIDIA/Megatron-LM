@@ -30,6 +30,7 @@ from megatron.core.transformer.pipeline_parallel_layer_layout import PipelinePar
 # FusedA2AConfig is a lightweight dataclass with no heavy dependencies — safe to import directly.
 from megatron.core.transformer.moe.fused_a2a_config import FusedA2AConfig
 
+from .._rank_utils import log_single_rank
 from ..fusions.fused_bias_geglu import quick_gelu
 from ..model_parallel_config import ModelParallelConfig
 from ..utils import (
