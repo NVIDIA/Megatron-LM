@@ -240,9 +240,7 @@ class TestFp32ResidualTELayerNormLinear:
             (sequence_length, micro_batch_size, self.transformer_config.hidden_size),
             dtype=torch.float32,
         ).cuda()
-        attention_mask = torch.ones(
-            (micro_batch_size, 1, 1, sequence_length), dtype=bool
-        ).cuda()
+        attention_mask = torch.ones((micro_batch_size, 1, 1, sequence_length), dtype=bool).cuda()
 
         output, bias = self.parallel_attention(hidden_states, attention_mask)
 
