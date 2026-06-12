@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import CheckpointManager
 
 
+# dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
 @torch.compile
 def _sinkhorn_iterations(input_logits: Tensor, num_iterations: int, eps: float) -> Tensor:
     row_max = input_logits.max(dim=-1, keepdim=True).values
@@ -59,12 +60,14 @@ def native_sinkhorn(input_logits: Tensor, num_iterations: int, eps: float = 1e-6
     return SinkhornKnopp.apply(input_logits, num_iterations, eps)
 
 
+# dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
 @torch.compile
 def native_h_aggregate(x: Tensor, h_pre: Tensor) -> Tensor:
     """Native n-stream weighted aggregation: out = sum_j(h_pre_j * x_j)."""
     return (x * h_pre.unsqueeze(-1)).sum(dim=2)
 
 
+# dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
 @torch.compile
 def native_h_post_bda(
     h_res: Tensor, original_residual: Tensor, h_post: Tensor, x: Tensor, bias: Optional[Tensor]
@@ -81,6 +84,7 @@ def native_h_post_bda(
     return x_expanded + mixed
 
 
+# dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
 @torch.compile
 def native_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tuple[Tensor, Tensor]:
     """Native fused projection + RMS normalization."""
@@ -92,6 +96,7 @@ def native_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tuple[Tenso
     return proj, r
 
 
+# dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
 @torch.compile
 def learned_output_contract(
     hidden_states: Tensor, head_fn: Tensor, base: Tensor, scale: Tensor, n: int, eps: float
@@ -211,6 +216,7 @@ class HyperConnectionModule(MegatronModule):
         proj, r = self._proj_rms_op(x_2d, self.mapping_proj.weight, self.norm_eps)
         return proj.view(s, b, -1), r.view(s, b, 1)
 
+    # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
     @torch.compile
     def _compute_h(self, proj: Tensor, r: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         """
@@ -268,6 +274,7 @@ class HyperConnectionModule(MegatronModule):
 
         return h_pre, h_post, h_res
 
+    # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
     @torch.compile
     def _apply_h_post(self, x: Tensor, h_post: Tensor) -> Tensor:
         """
@@ -367,6 +374,7 @@ class HyperConnectionModule(MegatronModule):
         x_streams = x.view(s, b, self.n, C)
         return self._h_aggregate_op(x_streams, h_pre)
 
+    # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
     @torch.compile
     def apply_h_res(self, h_res: Tensor, residual: Tensor) -> Tensor:
         """
