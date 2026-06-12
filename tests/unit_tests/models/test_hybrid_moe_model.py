@@ -16,6 +16,7 @@ from megatron.core.num_microbatches_calculator import destroy_num_microbatches_c
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.moe.moe_logging import destroy_moe_metrics_tracker
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
 from megatron.training.global_vars import (
     destroy_global_vars,
@@ -113,6 +114,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "fp8_interval": 1,
     "fp8_margin": 0,
     "fp8_multi_head_attention": False,
+    "fp8_output_proj": False,
     "fp8_param": False,
     "fp8_quantizer_factory": None,
     "fp8_recipe": "delayed",
@@ -122,6 +124,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "gated_linear_unit": False,
     "glu_linear_offset": 0.0,
     "grad_scale_func": None,
+    "mtp_grad_scale_func": None,
     "grad_sync_func": None,
     "gradient_accumulation_fusion": True,
     "hetereogenous_dist_checkpoint": False,
@@ -213,6 +216,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "mup_embedding_mult": 1.0,
     "mup_output_mult": 1.0,
     "mup_width_mult": 1.0,
+    "mtp_detach_heads": False,
     "mtp_hybrid_override_pattern": None,
     "mtp_loss_scaling_factor": 0.1,
     "mtp_num_layers": None,
@@ -509,6 +513,7 @@ class TestHybridMoEModel:
     def setup_method(self, method):
 
         os.environ['CUDA_DEVICE_MAX_CONNECTIONS'] = '1'
+        destroy_moe_metrics_tracker()
         args = self.create_test_args()
         set_args(args)
 

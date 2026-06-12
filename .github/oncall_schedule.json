@@ -1,17 +1,5 @@
 [
     {
-        "user": "ilml",
-        "date": "2026-05-20"
-    },
-    {
-        "user": "wujingyue",
-        "date": "2026-05-27"
-    },
-    {
-        "user": "Connor-XY",
-        "date": "2026-06-03"
-    },
-    {
         "user": "guihong-nv",
         "date": "2026-06-10"
     },
@@ -46,5 +34,17 @@
     {
         "user": "asolergi-nv",
         "date": "2026-08-05"
+    },
+    {
+        "user": "dimapihtar",
+        "date": "2026-08-12"
+    },
+    {
+        "user": "guihong-nv",
+        "date": "2026-08-19"
+    },
+    {
+        "user": "ilml",
+        "date": "2026-08-26"
     }
 ]
