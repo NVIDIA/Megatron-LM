@@ -136,6 +136,8 @@ def checkpointed_forward(
             if (start + layer_offset) in extract_layer_indices:
                 intermediate_hidden_states.append(hidden_states)
 
+    skip_final_recompute = getattr(self.config, "skip_final_recompute", False)
+
     if self.config.recompute_method == 'uniform':
         # Uniformly divide the total number of layers and checkpoint
         # the input activation of each divided chunk.
@@ -144,7 +146,10 @@ def checkpointed_forward(
             chunk_end = min(
                 layer_idx + self.config.recompute_num_layers, self.num_layers_per_pipeline_rank
             )
-            chunk_runner(layer_idx, chunk_end, True)
+            use_checkpoint = not (
+                skip_final_recompute and chunk_end == self.num_layers_per_pipeline_rank
+            )
+            chunk_runner(layer_idx, chunk_end, use_checkpoint)
             layer_idx += self.config.recompute_num_layers
     elif self.config.recompute_method == 'block':
         # Checkpoint the input activation of only a set number of individual
@@ -160,6 +165,12 @@ def checkpointed_forward(
                 layer_idx >= recompute_skip_num_layers
                 and layer_idx < self.config.recompute_num_layers + recompute_skip_num_layers
             )
+            if use_checkpoint and skip_final_recompute:
+                recompute_end = min(
+                    self.config.recompute_num_layers + recompute_skip_num_layers,
+                    self.num_layers_per_pipeline_rank,
+                )
+                use_checkpoint = layer_idx < recompute_end - 1
             chunk_runner(layer_idx, layer_idx + 1, use_checkpoint)
     else:
         raise ValueError("Invalid activation recompute method.")
