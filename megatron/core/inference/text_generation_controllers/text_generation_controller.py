@@ -1756,10 +1756,11 @@ class TextGenerationController:
     ) -> Tuple[Dict, Dict]:
         """Drop prior-finished rows from the current sample and compact the context."""
         context = self.inference_wrapped_model.inference_context
-        finished_mask = context._async_prior_finished_active_mask
-        if finished_mask is None:
+        pending_finished_rows = context.pending_async_finished_rows()
+        if pending_finished_rows is None:
             return prepared_update, request_bookkeeping
 
+        finished_mask = pending_finished_rows.active_mask
         keep_mask = ~finished_mask
         request_bookkeeping = context.filter_async_finished_request_rows(request_bookkeeping)
         context.compact_async_finished_request_rows(next_tokens=prepared_update["new_tokens"])

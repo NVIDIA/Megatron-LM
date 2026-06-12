@@ -898,11 +898,18 @@ class TestDynamicContext:
         dynamic_context.total_request_count = 2
         dynamic_context.request_ids[:2] = torch.tensor([10, 11], device='cpu')
         dynamic_context.record_async_finished_request_rows(torch.tensor([True, False]))
+        pending_finished_rows = dynamic_context.pending_async_finished_rows()
 
         with pytest.raises(AssertionError):
             dynamic_context.record_async_finished_request_rows(torch.tensor([False, True]))
 
+        assert pending_finished_rows is not None
+        assert pending_finished_rows.active_mask.tolist() == [True, False]
+        assert pending_finished_rows.request_ids.tolist() == [10]
         state_names = vars(dynamic_context).keys()
+        assert "_pending_async_finished_rows" in state_names
+        assert "_async_prior_finished_active_mask" not in state_names
+        assert "_async_prior_finished_request_ids" not in state_names
         assert not any("row_map" in name or "row_mapping" in name for name in state_names)
 
     @pytest.mark.internal
