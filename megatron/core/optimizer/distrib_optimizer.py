@@ -2929,10 +2929,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         the model params. This copy does not make use of the grad buffer as
         an intermediary.
         """
-        if isinstance(self.optimizer, HybridDeviceOptimizer):
-            self.optimizer.update_fp32_param_by_new_param()
-            return
-
         if self.ddp_config.use_megatron_fsdp:
             raise NotImplementedError(
                 "Megatron-FSDP does not implement a model-to-main parameter update."
@@ -2982,6 +2978,17 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         # Copy model groups to shard groups.
         copy_group_params(self.model_float16_groups, self.shard_fp32_from_float16_groups)
         copy_group_params(self.model_fp32_groups, self.shard_fp32_groups)
+
+        # The copies above only refresh the FP32 shard master params. When CPU
+        # offloading is enabled, the underlying HybridDeviceOptimizer keeps
+        # additional CPU clones and FP32 working copies of those master params
+        # that the sub-optimizers actually step against; they are not reached
+        # by the copies above and would otherwise retain their stale (often
+        # random-initialized) values. Re-seed them from the freshly updated
+        # master params so the next optimizer step operates on the loaded
+        # weights instead of stale init.
+        if isinstance(self.optimizer, HybridDeviceOptimizer):
+            self.optimizer.reload_model_params()
 
     def start_param_sync_for_bucket_group_subset(self) -> None:
         """Trigger ``start_param_sync`` on DistOpt-managed bucket groups only.
