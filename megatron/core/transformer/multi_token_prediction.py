@@ -2042,6 +2042,7 @@ class MultiTokenPredictionBlock(MegatronModule):
         extra_block_kwargs: Optional[dict] = None,
         embedding=None,
         mhc_multistream: Optional[Tensor] = None,
+        loss_mask: Optional[Tensor] = None,
     ) -> Tensor:
         """
         Perform the forward pass through all of the MTP modules.
@@ -2054,6 +2055,12 @@ class MultiTokenPredictionBlock(MegatronModule):
                 multi-stream decoder output [s, b, n*h] used as input to MTP depths.
             attention_mask (Tensor): Boolean tensor of shape [1, 1, s, s] for masking
                 self-attention.
+            padding_mask (Tensor, optional): Padding mask for MoE routing.
+            loss_mask (Tensor, optional): Loss mask of shape [bsz, seq_length] used to
+                derive the MTP-shifted padding mask for MoE routing. When provided
+                alongside padding_mask, the MTP padding mask is derived from the rolled
+                loss_mask (mtp_loss_mask == 0) at each depth, ensuring that positions
+                invalidated by MTP rolling are correctly excluded from routing.
 
         Returns:
             (Tensor): The mtp loss tensor of shape [b, s].
@@ -2071,14 +2078,36 @@ class MultiTokenPredictionBlock(MegatronModule):
         if self.config.mtp_detach_heads:
             hidden_states = hidden_states.detach()
 
+        # Derive MTP-shifted padding mask from loss_mask for correct MoE routing.
+        # MTP rolls input_ids/position_ids to condition on token i+1 and predicts i+2,
+        # so the padding mask must reflect which positions are valid after rolling.
+        # Blindly rolling padding_mask is incorrect because roll_tensor fills boundaries
+        # with 0, which would mark new boundary positions as valid (False in padding_mask
+        # convention). Instead, derive it from the rolled loss_mask where 0 = invalid.
+        cp_group = resolve_cp_group(self.cp_group, packed_seq_params)
+        mtp_loss_mask = loss_mask.clone() if loss_mask is not None else None
+
         for iteration in range(self.config.mtp_num_layers):
+            # Compute MTP-shifted padding mask for this depth
+            if mtp_loss_mask is not None and padding_mask is not None:
+                mtp_loss_mask, _ = roll_tensor(
+                    mtp_loss_mask,
+                    shifts=-1,
+                    dims=-1,
+                    cp_group=cp_group,
+                    packed_seq_params=packed_seq_params,
+                )
+                mtp_padding_mask = mtp_loss_mask == 0
+            else:
+                mtp_padding_mask = padding_mask
+
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
             (hidden_states, input_ids, position_ids, padding_mask) = self.layers[layer_idx](
                 input_ids=input_ids,
                 position_ids=position_ids,
                 hidden_states=hidden_states,
                 attention_mask=attention_mask,
-                padding_mask=padding_mask,
+                padding_mask=mtp_padding_mask,
                 inference_params=inference_params,
                 rotary_pos_emb=rotary_pos_emb,
                 rotary_pos_cos=rotary_pos_cos,
