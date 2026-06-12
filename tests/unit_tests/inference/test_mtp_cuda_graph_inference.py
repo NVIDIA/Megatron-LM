@@ -1278,3 +1278,107 @@ class TestMTPBlockScopeCudaGraph:
                 f"(scope={inference_cuda_graph_scope})"
             )
             assert context.mtp_decoder_hidden_states.shape[-1] == self.HIDDEN_SIZE
+
+    @torch.inference_mode()
+    def test_mtp_forward_with_runtime_tokens_below_max(self):
+        """Block-scope MTP forward is correct when runtime tokens < ``max_tokens``.
+
+        The decoder hidden-states buffer is pre-allocated to the worst-case
+        ``(max_tokens, 1, hidden_size)`` so the block CUDA graph can write into a
+        fixed GPU address, but a real decode step only fills the ``[:n]`` prefix
+        (``n = active_request_count`` rows, far below ``max_tokens``).
+
+        This verifies two things in one shot:
+        1. **No shape issues** — the controller gathers ``[:n]`` rows from the
+           ``max_tokens``-sized buffer and the downstream MTP layer forward runs
+           without any shape mismatch.
+        2. **Forward correctness** — the unused buffer tail does not leak into the
+           computation. The tail is poisoned with NaN; the sampled MTP tokens must
+           still match a reference run against an exactly ``(n, 1, H)``-sized
+           buffer (and stay finite/in-range). If the MTP forward read past the
+           valid prefix, the NaNs would change the result.
+        """
+        engine = self._build_engine(inference_cuda_graph_scope='block')
+        ctrl = engine.controller
+        context = engine.context
+
+        num_spec = ctrl.num_speculative_tokens
+        assert num_spec > 0 and ctrl.num_mtp_depths > 0
+
+        # The block-scope buffer is sized to the worst case; pick an active count
+        # that is comfortably below capacity to exercise the partial-fill path.
+        active_request_count = 3
+        assert active_request_count < context.max_tokens
+
+        buffer = context.mtp_decoder_hidden_states
+        assert buffer is not None
+        assert buffer.shape == (context.max_tokens, 1, self.HIDDEN_SIZE)
+
+        # Deterministic hidden states for the valid prefix, shared by both runs.
+        torch.manual_seed(42)
+        prefix_hidden = torch.randn(
+            active_request_count, 1, self.HIDDEN_SIZE, device='cuda', dtype=torch.bfloat16
+        )
+
+        def _run_eager_mtp(decoder_hidden_states):
+            """Set up decode state and run eager MTP, returning sampled tokens."""
+            context.reset()
+            context.total_request_count = active_request_count
+            context.paused_request_count = 0
+            context.request_kv_length_offsets[:active_request_count] = torch.arange(
+                active_request_count, dtype=torch.int32, device='cuda'
+            )
+            context.request_query_lengths[:active_request_count] = torch.ones(
+                active_request_count, dtype=torch.int32, device='cuda'
+            )
+
+            ctrl.num_speculative_tokens = num_spec
+            ctrl._init_mtp_sampling_tensors()
+            ctrl._mtp_token_ids_buf.zero_()
+            ctrl._mtp_position_ids_buf.zero_()
+            ctrl._sampled_tokens_cuda[:active_request_count] = torch.remainder(
+                torch.arange(active_request_count, device='cuda'), self.VOCAB_SIZE
+            )
+
+            # Eager path (no CUDA graph, no SP padding for TP=1).
+            ctrl._mtp_resolved_padded_count = None
+            context._using_cuda_graph_this_step = False
+
+            context.mtp_decoder_hidden_states = decoder_hidden_states
+            ctrl._last_accepted_seq_indices = torch.arange(active_request_count, device='cuda')
+
+            # Greedy sampling for all active requests.
+            context.active_request_metadata["temperature"][:active_request_count] = 1.0
+            context.active_request_metadata["top_k"][:active_request_count] = 1
+            context.active_request_metadata["top_p"][:active_request_count] = 0.0
+
+            ctrl._compute_serial_mtp_and_sample()
+
+            return [
+                ctrl._sampled_mtp_tokens_cuda[d, :active_request_count].clone()
+                for d in range(ctrl.num_mtp_depths)
+            ]
+
+        # Run 1: max_tokens-sized buffer with only the [:n] prefix valid; poison
+        # the unused tail with NaN so any over-read corrupts the result.
+        buffer.fill_(float('nan'))
+        buffer[:active_request_count].copy_(prefix_hidden)
+        oversized_tokens = _run_eager_mtp(buffer)
+
+        # Run 2: reference buffer sized exactly to the runtime token count.
+        exact_buffer = prefix_hidden.clone()
+        reference_tokens = _run_eager_mtp(exact_buffer)
+
+        for depth in range(ctrl.num_mtp_depths):
+            sampled = oversized_tokens[depth]
+            assert sampled.shape == (active_request_count,), (
+                f"depth={depth}: expected shape ({active_request_count},), "
+                f"got {tuple(sampled.shape)}"
+            )
+            assert sampled.dtype == torch.int64
+            assert torch.all(sampled >= 0) and torch.all(sampled < self.VOCAB_SIZE)
+            assert torch.equal(sampled, reference_tokens[depth]), (
+                f"depth={depth}: MTP tokens from the max_tokens-sized buffer "
+                f"{sampled.tolist()} != reference {reference_tokens[depth].tolist()}; "
+                "the unused buffer tail leaked into the MTP forward"
+            )
