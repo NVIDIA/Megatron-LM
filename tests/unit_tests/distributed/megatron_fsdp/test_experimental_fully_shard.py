@@ -113,18 +113,6 @@ class NonLeafViewModel(nn.Module):
         return SaveNonLeafWeightView.apply(x, weight_view)
 
 
-class ConstantMetaModel(nn.Module):
-    """Model whose meta parameter is initialized by reset_parameters()."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.empty(4, 4, device="meta"))
-
-    def reset_parameters(self) -> None:
-        """Initialize the weight to a deterministic value."""
-        self.weight.fill_(3.0)
-
-
 def _flat_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()])
 
@@ -274,20 +262,23 @@ def test_next_forward_uses_optimizer_updated_weights(setup: DistributedSetup):
 
 
 @pytest.mark.distributed
-def test_meta_parameters_initialize_with_reset_parameters(setup: DistributedSetup):
-    """Meta parameters should be replaced by sharded DTensors and initialized in place."""
+def test_cpu_initialized_parameters_shard_to_mesh_device(setup: DistributedSetup):
+    """CPU-initialized parameters should be sharded with their real values."""
     if setup.world_size < 2:
         pytest.skip("This test requires at least 2 ranks.")
 
     mesh = init_device_mesh(setup.device.type, (setup.world_size,))
-    model = ConstantMetaModel()
+    model = nn.Linear(4, 4, bias=False)
+    with torch.no_grad():
+        model.weight.fill_(3.0)
+    expected_weight = model.weight.detach().to(setup.device)
 
     fully_shard(model, mesh=mesh, placements=_flat_placements())
 
     (group,) = model.parameter_groups()
     full_weight = group.model_weight.allgather(0).get_local_tensor(0)
-    assert not full_weight.is_meta
-    torch.testing.assert_close(full_weight, torch.full_like(full_weight, 3.0))
+    assert full_weight.device.type == setup.device.type
+    torch.testing.assert_close(full_weight, expected_weight)
 
 
 @pytest.mark.distributed
