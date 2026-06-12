@@ -1081,6 +1081,24 @@ class TransformerConfig(ModelParallelConfig):
     CudaGraphScope instances deserialized from pre-refactor checkpoints are converted to their
     string names before normalization so existing CUDA_GRAPH_MODULES_DEPRECATIONS handles them."""
 
+    thd_max_num_seqs: int = 32
+    """Maximum number of THD sequence entries per microbatch, including any dummy
+    sequence appended for a padding tail. The dp_balanced packing scheduler reserves
+    that dummy slot when THD padding appends one. When CUDA Graph is enabled, cu_seqlens
+    tensors are padded to this size + 1.
+
+    Sizing guidance: choose a value that comfortably covers the worst-case packing,
+    roughly ceil(max_seqlen_per_dp_cp_rank * cp_size / min_seq_len_after_filter).
+    Setting it too small results in more microbatches with smaller packs (wasted
+    token budget); setting it too large just allocates a slightly larger cu_seqlens
+    buffer."""
+
+    cuda_graph_dynamic_microbatches: bool = False
+    """Enable CUDA graph slot reuse so the same captured graphs can be replayed for a dynamic
+    number of microbatches. This option is only meaningful for cuda_graph_impl=transformer_engine.
+    When enabled, capture builds a bounded number of graph slots and replay maps real
+    microbatch_id to slot_id by modulo."""
+
     ####################
     # Hyper-Connection Configuration
     ####################
@@ -1427,6 +1445,12 @@ class TransformerConfig(ModelParallelConfig):
             ), f"linear_attention_freq must be set for linear attention."
 
             if self.experimental_attention_variant == "gated_delta_net":
+                if self.pad_packed_seq_alignment is not None:
+                    assert self.pad_packed_seq_by_appending_dummy_seq, (
+                        "gated_delta_net with pad_packed_seq_alignment requires "
+                        "pad_packed_seq_by_appending_dummy_seq."
+                    )
+
                 # Check required parameters
                 assert (
                     self.linear_conv_kernel_dim is not None
@@ -2654,6 +2678,12 @@ class TransformerConfig(ModelParallelConfig):
                         if CudaGraphModule.moe_preprocess not in self.cuda_graph_modules:
                             self.cuda_graph_modules.append(CudaGraphModule.moe_preprocess)
 
+                if self.cuda_graph_impl != "transformer_engine":
+                    assert not self.cuda_graph_dynamic_microbatches, (
+                        "cuda_graph_dynamic_microbatches is only supported with "
+                        "cuda_graph_impl=transformer_engine."
+                    )
+
                 assert (
                     CudaGraphModule.moe not in self.cuda_graph_modules
                     or CudaGraphModule.moe_router not in self.cuda_graph_modules
@@ -2980,6 +3010,21 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.attention_backend == AttnBackend.flash
             ), "Batch invariant mode only supports FlashAttention"
+
+        if self.cuda_graph_impl != "none" and (
+            self.sequence_packing_scheduler is not None or self.dynamic_context_parallel
+        ):
+            assert (
+                self.pad_packed_seq_alignment is not None
+            ), "THD CUDA Graph requires --pad-packed-seq-alignment to be set."
+            assert (
+                self.pad_packed_seq_alignment == "max"
+                or self.pad_packed_seq_alignment == self.max_seqlen_per_dp_cp_rank
+            ), (
+                "THD CUDA Graph requires --pad-packed-seq-alignment='max' "
+                "or --pad-packed-seq-alignment equal to max_seqlen_per_dp_cp_rank "
+                f"({self.max_seqlen_per_dp_cp_rank}), got {self.pad_packed_seq_alignment}."
+            )
 
         if self.sequence_packing_scheduler is not None:
             # Check TE version.
