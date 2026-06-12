@@ -6,18 +6,26 @@ import logging
 import os
 from collections.abc import Iterator
 from dataclasses import dataclass
+from typing import cast
 
 import pytest
 import torch
 import torch.distributed as dist
 from torch import nn
+from torch.distributed import DeviceMesh
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor
+from torch.profiler import ProfilerActivity, profile
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Flat,
     Placements,
     fully_shard,
+)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.fully_shard import (
+    DelayedRelease,
+    FsdpContext,
+    FsdpModule,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 
@@ -38,21 +46,33 @@ def setup() -> Iterator[DistributedSetup]:
     """Read torchrun rank state and set up this rank's local device."""
     if "RANK" not in os.environ or "WORLD_SIZE" not in os.environ:
         pytest.skip("Not running under torchrun.")
+    if not torch.cuda.is_available():
+        pytest.skip("Experimental FSDP tests require CUDA.")
 
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     local_rank = int(os.environ.get("LOCAL_RANK", rank))
 
-    if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank)
-        device = torch.device(f"cuda:{local_rank}")
-    else:
-        device = torch.device("cpu")
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
+
+    if not dist.is_initialized():
+        dist.init_process_group(backend="nccl")
 
     yield DistributedSetup(rank=rank, world_size=world_size, device=device)
 
+
+@pytest.fixture(autouse=True)
+def synchronize_before_test(setup: DistributedSetup) -> Iterator[None]:
+    """Keep distributed tests aligned when previous tests left async CUDA work queued."""
+    if setup.device.type == "cuda":
+        torch.cuda.synchronize(setup.device)
     if dist.is_initialized():
-        dist.destroy_process_group()
+        if setup.device.type == "cuda":
+            dist.barrier(device_ids=[setup.device.index])
+        else:
+            dist.barrier()
+    yield
 
 
 class TinyModel(nn.Module):
@@ -80,6 +100,26 @@ class NestedModel(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run the nested model."""
         return self.inner(x) + self.bias
+
+
+class MultiChildModel(nn.Module):
+    """Model with direct parameters and multiple child FSDP units."""
+
+    def __init__(
+        self, dim: int = 4, num_children: int = 3, dtype: torch.dtype | None = None
+    ) -> None:
+        super().__init__()
+        self.bias = nn.Parameter(torch.ones(dim, dtype=dtype))
+        self.layers = nn.ModuleList(
+            [nn.Linear(dim, dim, bias=False, dtype=dtype) for _ in range(num_children)]
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Run through every child layer with a root-owned bias."""
+        x = x + self.bias
+        for layer in self.layers:
+            x = torch.relu(layer(x))
+        return x
 
 
 class SaveNonLeafWeightView(torch.autograd.Function):
@@ -131,6 +171,51 @@ def _flat_placements() -> Placements:
 
 def _mb(num_bytes: int) -> str:
     return f"{num_bytes / 1024**2:.2f} MB"
+
+
+def _unsharded_storage_nbytes(module: nn.Module) -> int:
+    return sum(
+        group._unsharded_model_weight.local_buffer.untyped_storage().nbytes()
+        for group in module.parameter_groups()
+    )
+
+
+def _set_unsharded_grads(module: nn.Module) -> None:
+    for group in module.parameter_groups():
+        for parameter in group.unsharded_parameters:
+            parameter.grad = torch.ones_like(parameter)
+
+
+def _fully_shard_children_then_parent(
+    model: MultiChildModel, mesh: DeviceMesh, placements: Placements
+) -> None:
+    for layer in model.layers:
+        fully_shard(layer, mesh=mesh, placements=placements)
+    fully_shard(model, mesh=mesh, placements=placements)
+    model._lazy_init_context()
+
+
+def _require_context(module: FsdpModule) -> FsdpContext:
+    context = module._context
+    assert context is not None
+    return context
+
+
+def _run_training_iteration(model: MultiChildModel, x: torch.Tensor) -> torch.Tensor:
+    model.zero_grad(set_to_none=True)
+    if x.grad is not None:
+        x.grad = None
+    output = model(x)
+    loss = output.float().square().mean()
+    loss.backward()
+    return loss
+
+
+def _events_overlap(first, second) -> bool:
+    return (
+        first.time_range.start < second.time_range.end
+        and second.time_range.start < first.time_range.end
+    )
 
 
 @pytest.mark.distributed
@@ -193,6 +278,285 @@ def test_nested_fully_shard_excludes_child_owned_parameters(setup: DistributedSe
 
     assert inner_names == ["weight"]
     assert outer_names == ["bias"]
+
+
+@pytest.mark.distributed
+def test_child_then_parent_share_one_context(setup: DistributedSetup):
+    """A parent FSDP unit should lazily create one context for its subtree."""
+    if setup.world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(setup.device.type, (setup.world_size,))
+    model = NestedModel().to(setup.device)
+
+    fully_shard(model.inner, mesh=mesh, placements=_flat_placements())
+    assert model.inner._context is None
+    fully_shard(model, mesh=mesh, placements=_flat_placements())
+    assert model._context is None
+    assert model.inner._context is None
+
+    model._lazy_init_context()
+    context = _require_context(model)
+
+    assert model.inner._context is context
+    assert context.is_root_module(model)
+    assert not context.is_root_module(model.inner)
+
+
+@pytest.mark.distributed
+def test_two_child_subtrees_then_parent_collapse_to_one_context(setup: DistributedSetup):
+    """Sharding a parent should lazily assign one context across child subtrees."""
+    if setup.world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(setup.device.type, (setup.world_size,))
+    model = MultiChildModel(dim=4, num_children=2).to(setup.device)
+
+    fully_shard(model.layers[0], mesh=mesh, placements=_flat_placements())
+    fully_shard(model.layers[1], mesh=mesh, placements=_flat_placements())
+
+    assert model.layers[0]._context is None
+    assert model.layers[1]._context is None
+
+    fully_shard(model, mesh=mesh, placements=_flat_placements())
+    model._lazy_init_context()
+    context = _require_context(model)
+
+    assert model.layers[0]._context is context
+    assert model.layers[1]._context is context
+
+
+@pytest.mark.distributed
+def test_sibling_roots_without_parent_keep_separate_contexts(setup: DistributedSetup):
+    """Independent FSDP roots should not share runtime scheduling state."""
+    if setup.world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(setup.device.type, (setup.world_size,))
+    model = MultiChildModel(dim=4, num_children=2).to(setup.device)
+
+    fully_shard(model.layers[0], mesh=mesh, placements=_flat_placements())
+    fully_shard(model.layers[1], mesh=mesh, placements=_flat_placements())
+
+    assert model.layers[0]._context is None
+    assert model.layers[1]._context is None
+
+    model.layers[0]._lazy_init_context()
+    model.layers[1]._lazy_init_context()
+    first_context = _require_context(model.layers[0])
+    second_context = _require_context(model.layers[1])
+
+    assert first_context is not second_context
+    assert first_context.is_root_module(model.layers[0])
+    assert second_context.is_root_module(model.layers[1])
+
+
+@pytest.mark.distributed
+def test_only_parent_is_root_in_shared_context(setup: DistributedSetup):
+    """Only the outermost FSDP unit should be root in a shared context."""
+    if setup.world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(setup.device.type, (setup.world_size,))
+    model = MultiChildModel(dim=4, num_children=1).to(setup.device)
+    _fully_shard_children_then_parent(model, mesh, _flat_placements())
+    context = _require_context(model)
+
+    assert context.is_root_module(model)
+    assert not context.is_root_module(model.layers[0])
+
+
+@pytest.mark.distributed
+def test_normal_pre_unshard_drain_retains_release_delay_minus_one(setup: DistributedSetup):
+    """Normal pre-unshard should keep only the newest queued delayed release."""
+    if setup.world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(setup.device.type, (setup.world_size,))
+    model = MultiChildModel(dim=8, num_children=3).to(setup.device)
+    _fully_shard_children_then_parent(model, mesh, _flat_placements())
+    context = _require_context(model)
+
+    model.layers[0].pre_forward()
+    first_storage_nbytes = _unsharded_storage_nbytes(model.layers[0])
+    model.layers[0].post_forward()
+    assert first_storage_nbytes > 0
+    assert _unsharded_storage_nbytes(model.layers[0]) == first_storage_nbytes
+    assert len(context.delayed_releases) == 1
+
+    model.layers[1].pre_forward()
+    model.layers[1].post_forward()
+    assert len(context.delayed_releases) == context.release_delay
+
+    model.layers[2].pre_forward()
+
+    assert len(context.delayed_releases) == context.release_delay - 1
+    assert _unsharded_storage_nbytes(model.layers[0]) == 0
+    assert _unsharded_storage_nbytes(model.layers[1]) > 0
+    assert _unsharded_storage_nbytes(model.layers[2]) > 0
+
+    model.layers[2].post_forward()
+    context.drain_delayed_releases(target_length=0)
+
+
+@pytest.mark.distributed
+def test_root_post_forward_drains_delayed_releases_to_zero(setup: DistributedSetup):
+    """Root post-forward should release every queued unsharded storage."""
+    if setup.world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(setup.device.type, (setup.world_size,))
+    model = MultiChildModel(dim=8, num_children=2).to(setup.device)
+    _fully_shard_children_then_parent(model, mesh, _flat_placements())
+    context = _require_context(model)
+
+    for layer in model.layers:
+        layer.pre_forward()
+        layer.post_forward()
+    assert len(context.delayed_releases) == context.release_delay
+
+    model.pre_forward()
+    model.post_forward()
+
+    assert len(context.delayed_releases) == 0
+    assert _unsharded_storage_nbytes(model) == 0
+    assert all(_unsharded_storage_nbytes(layer) == 0 for layer in model.layers)
+
+
+@pytest.mark.distributed
+def test_root_post_backward_drains_delayed_releases_to_zero(setup: DistributedSetup):
+    """Root post-backward should release every queued unsharded storage."""
+    if setup.world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+
+    mesh = init_device_mesh(setup.device.type, (setup.world_size,))
+    model = MultiChildModel(dim=8, num_children=1).to(setup.device)
+    _fully_shard_children_then_parent(model, mesh, _flat_placements())
+    context = _require_context(model)
+    layer = model.layers[0]
+
+    layer.pre_backward()
+    _set_unsharded_grads(layer)
+    layer.post_backward()
+    assert len(context.delayed_releases) == 1
+    assert _unsharded_storage_nbytes(layer) > 0
+
+    model.pre_backward()
+    _set_unsharded_grads(model)
+    model.post_backward()
+
+    assert len(context.delayed_releases) == 0
+    assert _unsharded_storage_nbytes(model) == 0
+    assert _unsharded_storage_nbytes(layer) == 0
+
+
+@pytest.mark.distributed
+def test_delayed_release_waits_on_recorded_cuda_event(setup: DistributedSetup):
+    """Delayed release should be stream-ordered after its recorded consumer event."""
+    if setup.device.type != "cuda":
+        pytest.skip("CUDA event ordering verification requires CUDA.")
+    if not hasattr(torch.cuda, "_sleep"):
+        pytest.skip("CUDA sleep kernel is unavailable in this PyTorch build.")
+
+    context = FsdpContext(setup.device)
+    producer_stream = torch.cuda.Stream(device=setup.device)
+    release_event: torch.cuda.Event | None = None
+
+    class ReleaseRecorder:
+        def release_unsharded_storage(self) -> None:
+            nonlocal release_event
+            release_event = torch.cuda.current_stream(setup.device).record_event()
+
+    with torch.cuda.stream(producer_stream):
+        torch.cuda._sleep(50_000_000)
+        consumer_event = producer_stream.record_event()
+
+    context.delayed_releases.append(
+        DelayedRelease(consumer_event=consumer_event, module=cast(FsdpModule, ReleaseRecorder()))
+    )
+    context.drain_delayed_releases(target_length=0)
+
+    assert release_event is not None
+    release_event.synchronize()
+    assert consumer_event.query()
+
+
+@pytest.mark.distributed
+def test_fully_sharded_root_with_child_units_overlaps_all_gather_and_compute(
+    setup: DistributedSetup,
+):
+    """A shared root context should let child collectives overlap GEMM compute."""
+    if setup.world_size < 2:
+        pytest.skip("This test requires at least 2 ranks.")
+    if setup.device.type != "cuda":
+        pytest.skip("CUDA profiler verification requires CUDA.")
+
+    mesh = init_device_mesh(setup.device.type, (setup.world_size,))
+    dim = 4096
+    dtype = torch.bfloat16
+    model = MultiChildModel(dim=dim, num_children=4, dtype=dtype).to(setup.device)
+    placements = _flat_placements()
+    policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
+    for layer in model.layers:
+        fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
+    fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
+    assert model._context is None
+    assert all(layer._context is None for layer in model.layers)
+
+    x = torch.randn(4096, dim, device=setup.device, dtype=dtype, requires_grad=True)
+
+    _run_training_iteration(model, x)
+    torch.cuda.synchronize(setup.device)
+    context = _require_context(model)
+    assert context.is_root_module(model)
+    assert all(layer._context is context for layer in model.layers)
+    assert all(not context.is_root_module(layer) for layer in model.layers)
+
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], acc_events=True) as prof:
+        _run_training_iteration(model, x)
+        prof.step()
+    torch.cuda.synchronize(setup.device)
+
+    cuda_events = [event for event in prof.events() if event.device_type.name == "CUDA"]
+    all_gather_events = [
+        event
+        for event in cuda_events
+        if "nccl" in event.name.lower() and "allgather" in event.name.lower()
+    ]
+    reduce_scatter_events = [
+        event
+        for event in cuda_events
+        if "nccl" in event.name.lower()
+        and ("reducescatter" in event.name.lower() or "reduce_scatter" in event.name.lower())
+    ]
+    compute_events = [
+        event
+        for event in cuda_events
+        if any(token in event.name.lower() for token in ("gemm", "cutlass", "cublas"))
+    ]
+    assert all_gather_events, [event.name for event in cuda_events]
+    assert reduce_scatter_events, [event.name for event in cuda_events]
+    assert compute_events, [event.name for event in cuda_events]
+
+    all_gather_streams = {event.device_resource_id for event in all_gather_events}
+    reduce_scatter_streams = {event.device_resource_id for event in reduce_scatter_events}
+    compute_streams = {event.device_resource_id for event in compute_events}
+    assert len(all_gather_streams) == 1
+    assert len(reduce_scatter_streams) == 1
+    assert all_gather_streams.isdisjoint(compute_streams)
+    assert reduce_scatter_streams.isdisjoint(compute_streams)
+    assert reduce_scatter_streams.isdisjoint(all_gather_streams)
+
+    assert any(
+        _events_overlap(all_gather_event, compute_event)
+        for all_gather_event in all_gather_events
+        for compute_event in compute_events
+    )
+    assert any(
+        _events_overlap(reduce_scatter_event, compute_event)
+        for reduce_scatter_event in reduce_scatter_events
+        for compute_event in compute_events
+    )
 
 
 @pytest.mark.distributed

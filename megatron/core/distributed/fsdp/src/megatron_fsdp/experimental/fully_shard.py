@@ -18,8 +18,10 @@ from torch import nn
 from torch.distributed import DeviceMesh
 
 from ..mixed_precision import MixedPrecisionPolicy
-from .fsdp_module import FsdpModule
+from .fsdp_module import DelayedRelease, FsdpContext, FsdpModule
 from .placement import Placements
+
+__all__ = ["DelayedRelease", "FsdpContext", "FsdpModule", "fully_shard"]
 
 
 def fully_shard(
