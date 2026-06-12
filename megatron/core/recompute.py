@@ -50,10 +50,27 @@ def checkpointed_forward(
         extract_layer_indices = set()
     intermediate_hidden_states: List[Tensor] = []
 
+    # Wrap non-dual RoPE to tuple to unify custom_forward interface.
+    is_dual_rope = isinstance(rotary_pos_emb, (tuple, list))
+    assert not is_dual_rope or len(rotary_pos_emb) == 2, "Dual RoPE input length is not equal to 2"
+    rotary_pos_emb = rotary_pos_emb if is_dual_rope else (None, rotary_pos_emb)
+
     def custom(start: int, end: int):
         def custom_forward(
-            hidden_states, attention_mask, context, context_mask, rotary_pos_emb, padding_mask=None
+            hidden_states,
+            attention_mask,
+            context,
+            context_mask,
+            rotary_pos_emb_local,
+            rotary_pos_emb_global,
+            padding_mask=None,
         ):
+            rotary_pos_emb = (
+                rotary_pos_emb_global
+                if rotary_pos_emb_local is None
+                else (rotary_pos_emb_local, rotary_pos_emb_global)
+            )
+
             for index in range(start, end):
                 # Use self.layers[index] (not self._get_layer) so this
                 # function works for both TransformerBlock and HybridStack.
@@ -108,7 +125,8 @@ def checkpointed_forward(
     def chunk_runner(start: int, end: int, use_checkpoint: bool):
         nonlocal hidden_states, context
         cf = custom(start, end)
-        args = (hidden_states, attention_mask, context, context_mask, rotary_pos_emb, padding_mask)
+        # Unpack the RoPE tuple as torch cannot save tuples for backward pass.
+        args = (hidden_states, attention_mask, context, context_mask, *rotary_pos_emb, padding_mask)
         if use_checkpoint:
             # Precision-aware activation checkpoint: TE under FP8/FP4,
             # tensor_parallel under BF16/FP16/FP32.
