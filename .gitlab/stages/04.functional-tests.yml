@@ -66,7 +66,12 @@ functional:configure:
         RELEASE_ARGS=()
       fi
     - |
-      WORKLOAD_LOCAL_IMAGE_PATH="${FUNCTIONAL_TEST_WORKLOAD_LOCAL_IMAGE_PATH:-/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_mcore/mcore_ci/{build}-{platforms}-{container_tag}.sqsh}"
+      DEFAULT_WORKLOAD_LOCAL_IMAGE_PATH='/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_mcore/mcore_ci/{build}-{platforms}-{container_tag}.sqsh'
+      if [[ -n "${FUNCTIONAL_TEST_WORKLOAD_LOCAL_IMAGE_PATH:-}" ]]; then
+        WORKLOAD_LOCAL_IMAGE_PATH="${FUNCTIONAL_TEST_WORKLOAD_LOCAL_IMAGE_PATH}"
+      else
+        WORKLOAD_LOCAL_IMAGE_PATH="${DEFAULT_WORKLOAD_LOCAL_IMAGE_PATH}"
+      fi
       LOCAL_WORKLOAD_IMAGE_ARGS=(
         "--workload-local-image-path ${WORKLOAD_LOCAL_IMAGE_PATH}"
         "--skip-local-image-prepare"
@@ -285,7 +290,12 @@ functional:smoke-gb200:
   script:
     - set -x
     - |
-      WORKLOAD_LOCAL_IMAGE_PATH="${FUNCTIONAL_TEST_WORKLOAD_LOCAL_IMAGE_PATH:-/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_mcore/mcore_ci/{build}-{platforms}-{container_tag}.sqsh}"
+      DEFAULT_WORKLOAD_LOCAL_IMAGE_PATH='/lustre/fsw/portfolios/coreai/projects/coreai_dlalgo_mcore/mcore_ci/{build}-{platforms}-{container_tag}.sqsh'
+      if [[ -n "${FUNCTIONAL_TEST_WORKLOAD_LOCAL_IMAGE_PATH:-}" ]]; then
+        WORKLOAD_LOCAL_IMAGE_PATH="${FUNCTIONAL_TEST_WORKLOAD_LOCAL_IMAGE_PATH}"
+      else
+        WORKLOAD_LOCAL_IMAGE_PATH="${DEFAULT_WORKLOAD_LOCAL_IMAGE_PATH}"
+      fi
       case "$SQSH_PLATFORM" in
         dgx_a100)
           SQSH_CLUSTER=$([[ "$CLUSTER_A100" != "" ]] && echo "$CLUSTER_A100" || echo "$DEFAULT_A100_CLUSTER")
