@@ -450,6 +450,7 @@ class TestDynamicContext:
         assert dynamic_context.total_request_count == 1
         assert dynamic_context.active_token_count == context_length
         assert dynamic_context.request_ids[0] == 0
+        assert not dynamic_context.request_has_stop_words[0]
         assert torch.all(dynamic_context.request_ids[1:] == -1)
         assert dynamic_context.request_query_lengths[0] == context_length
         assert dynamic_context.request_kv_length_offsets[0] == 0
@@ -722,6 +723,38 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
+    def test_add_request_tracks_stop_word_eligibility_flag(self):
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.float32,
+            num_layers=4,
+            kv_channels=8,
+            num_attention_heads=2,
+            max_sequence_length=512,
+            buffer_size_gb=0.03,
+            block_size_tokens=128,
+            max_tokens=None,
+        )
+
+        dynamic_context.add_request(
+            DynamicInferenceRequest(
+                request_id=10,
+                prompt_tokens=torch.arange(0, 4, dtype=torch.long, device='cpu'),
+                sampling_params=SamplingParams(num_tokens_to_generate=4),
+                stop_word_ids=[[7]],
+            )
+        )
+        dynamic_context.add_request(
+            DynamicInferenceRequest(
+                request_id=11,
+                prompt_tokens=torch.arange(4, 8, dtype=torch.long, device='cpu'),
+                sampling_params=SamplingParams(num_tokens_to_generate=4),
+            )
+        )
+
+        assert dynamic_context.request_has_stop_words[:2].tolist() == [True, False]
+
+    @pytest.mark.internal
+    @rounder_override(64)
     def test_compact_async_finished_request_rows(self):
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -735,6 +768,9 @@ class TestDynamicContext:
         )
         dynamic_context.total_request_count = 4
         dynamic_context.request_ids[:4] = torch.tensor([10, 11, 12, 13], device='cpu')
+        dynamic_context.request_has_stop_words[:4] = torch.tensor(
+            [False, True, True, False], device='cpu'
+        )
         next_tokens = torch.tensor([100, 101, 102, 103], device='cpu')
         dynamic_context.record_async_finished_request_rows(
             torch.tensor([False, True, False, True])
@@ -746,6 +782,12 @@ class TestDynamicContext:
         assert dynamic_context.total_request_count == 2
         assert dynamic_context.active_token_count == 2
         assert dynamic_context.request_ids[:4].tolist() == [10, 12, -1, -1]
+        assert dynamic_context.request_has_stop_words[:4].tolist() == [
+            False,
+            True,
+            False,
+            False,
+        ]
         assert next_tokens[:2].tolist() == [100, 102]
 
     @pytest.mark.internal
@@ -763,6 +805,7 @@ class TestDynamicContext:
         )
         dynamic_context.total_request_count = 2
         dynamic_context.request_ids[:2] = torch.tensor([10, 11], device='cpu')
+        dynamic_context.request_has_stop_words[:2] = torch.tensor([True, False], device='cpu')
         dynamic_context.active_token_count = 2
         dynamic_context.record_async_finished_request_rows(torch.tensor([True, True]))
 
@@ -772,6 +815,7 @@ class TestDynamicContext:
         assert dynamic_context.total_request_count == 0
         assert dynamic_context.active_token_count == 0
         assert dynamic_context.request_ids[:2].tolist() == [-1, -1]
+        assert dynamic_context.request_has_stop_words[:2].tolist() == [False, False]
 
     @pytest.mark.internal
     @rounder_override(64)

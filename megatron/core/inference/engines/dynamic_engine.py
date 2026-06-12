@@ -1752,6 +1752,14 @@ class DynamicInferenceEngine(AbstractEngine):
             else:
                 self.waiting_request_ids.extendleft(reversed(pending_request_ids))
 
+    def _update_async_scheduling_eligibility_state(self) -> None:
+        """Update context flags used by async-shaped scheduling eligibility checks."""
+        active_slice = slice(self.context.paused_request_count, self.context.total_request_count)
+        self.context.async_scheduling_has_waiting_requests = len(self.waiting_request_ids) > 0
+        self.context.async_scheduling_has_stop_word_requests = self.context.request_has_stop_words[
+            active_slice
+        ].any().item()
+
     async def async_forward(self) -> Tuple[Dict, Dict, float]:
         """Uses `asyncio` for continuous generation.
         Sleeps when no requests are available, until new requests have been added.
@@ -1770,15 +1778,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         # schedule requests
         self.schedule_waiting_requests()
-        active_request_ids = self.context.request_ids[
-            self.context.paused_request_count : self.context.total_request_count
-        ].tolist()
-        self.context.async_scheduling_has_waiting_requests = len(self.waiting_request_ids) > 0
-        self.context.async_scheduling_has_stop_word_requests = any(
-            getattr(self.requests.get(int(request_id)), "stop_word_ids", None)
-            for request_id in active_request_ids
-            if int(request_id) != -1
-        )
+        self._update_async_scheduling_eligibility_state()
 
         # The print block (async_bookkeep) and metrics block both fire on this
         # condition after step_count is incremented. Predict it up-front so we
