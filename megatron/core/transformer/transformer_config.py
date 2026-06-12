@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 import math
@@ -10,21 +10,8 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
-from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.quantization.quant_config import RecipeConfig
-from megatron.core.transformer.cuda_graph_config import (
-    ALLOWED_INFERENCE_SCOPES,
-    get_deprecated_cuda_graph_modules_migration,
-    normalize_cuda_graph_modules,
-    normalize_inference_cuda_graph_scope,
-    validate_deprecated_cuda_graph_modules_migration_inputs,
-)
-from megatron.core.transformer.enums import (
-    AttnBackend,
-    CudaGraphModule,
-    CudaGraphScope,
-    InferenceCudaGraphScope,
-)
+from megatron.core.transformer.enums import AttnBackend, CudaGraphScope
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 
 from .._rank_utils import log_single_rank
@@ -467,10 +454,6 @@ class TransformerConfig(ModelParallelConfig):
     fused_residual_rmsnorm: bool = False
     """If True, fuses residual connection and RMSNorm backward pass when TE is used."""
 
-    use_transformer_engine_op_fuser: bool = False
-    """If True, submodules may use Transformer Engine's operation fuser
-    API to enable advanced fusions."""
-
     ####################
     # activation recomputation
     ####################
@@ -505,7 +488,7 @@ class TransformerConfig(ModelParallelConfig):
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
-    "shared_experts", "gdn_norm_out".
+             "shared_experts", "gdn_norm_out", "mhc".
     default: ["core_attn"].
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
@@ -515,7 +498,11 @@ class TransformerConfig(ModelParallelConfig):
     "moe": recompute the MoE layer.
     "shared_experts": recompute the shared experts in the MoE layer.
     "gdn_norm_out": recompute the GatedDeltaNet output norm and HP-to-CP all-to-all.
-    "moe_act", "layernorm", "mla_up_proj", and "gdn_norm_out" use output-discarding checkpointing,
+    "mhc": recompute HyperConnection intermediate activations via
+            CheckpointWithoutOutput + CheckpointWithoutOutputManager. Requires
+            enable_hyper_connections=True. Cannot be used with "mlp".
+    "moe_act", "layernorm", "mla_up_proj", "gdn_norm_out", and "mhc" use
+    output-discarding checkpointing,
     "core_attn", "mlp", "moe", and "shared_experts" use normal checkpointing.
     """
 
@@ -628,10 +615,6 @@ class TransformerConfig(ModelParallelConfig):
     fp4_quantizer_factory: Optional[str] = None
     """Python import path to a callable quantizer factory, e.g., package.module.quantizer_factory.
     Required when fp4_recipe is custom."""
-
-    high_priority_a2a_comm_stream: bool = False
-    """If True, the communication stream created by set_streams for combined 1f1b
-    a2a overlap is created with CUDA high priority."""
 
     ####################
     # MoE related
@@ -770,16 +753,6 @@ class TransformerConfig(ModelParallelConfig):
     GEMM feature introduced since CUTLASS 2.8 (https://github.com/fanshiqing/grouped_gemm).
     """
 
-    moe_single_grouped_weight: bool = False
-    """When using TE GroupedLinear for MoE experts, store expert weights as a single grouped
-    parameter via Transformer Engine's `GroupedTensor`. Requires ``moe_grouped_gemm=True``.
-    """
-
-    moe_single_grouped_bias: bool = False
-    """When using TE GroupedLinear for MoE experts, store expert biases as a single grouped
-    parameter via Transformer Engine's `GroupedTensor`. Requires ``moe_grouped_gemm=True``
-    and ``add_bias_linear=True``."""
-
     moe_aux_loss_coeff: Union[float, List[float]] = 0.0
     """Scaling coefficient for the aux loss. A starting value of 1e-2 is recommended.
     If a list of load balancing types is provided for `moe_router_load_balancing_type`,
@@ -807,9 +780,6 @@ class TransformerConfig(ModelParallelConfig):
     """[Experimental] The backend to use for flex token dispatcher. The default is "deepep".
     Options are "deepep" and "hybridep". Currently only "hybridep" backend supports 
     the MNNVL case."""
-
-    moe_permute_fusion_into_hybridep: bool = False
-    """Fuse token rearrangement ops during token dispatching for HybridEP."""
 
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
@@ -931,69 +901,79 @@ class TransformerConfig(ModelParallelConfig):
     """DEPRECATED and replaced by cuda_graph_impl.
     When set to true, TransformerLayer layers are swapped with user provided CUDA graphs."""
 
-    cuda_graph_impl: Literal['none', 'local', 'transformer_engine', 'full_iteration'] = "none"
+    cuda_graph_impl: Literal['none', 'local', 'transformer_engine'] = "none"
     """Determines the CUDA graph capture implementation.
     "none": no CUDA graph.
-    "local": MCore CUDA graph implementation. During training, graphable modules own per-layer
-    CUDA graphs controlled by cuda_graph_modules. During inference, graph ownership is controlled
-    separately by inference_cuda_graph_scope.
-    "transformer_engine": Transformer Engine CUDA graph implementation. During training, TE
-    make_graphed_callables() creates per-layer CUDA graphs controlled by cuda_graph_modules.
-    Inference CUDA graphs are not supported; inference_cuda_graph_scope must be "none".
-    "full_iteration": full-iteration CUDA graph implementation for the training iteration
-    (1 CUDA graph for the whole forward-backward path excluding the optimizer step). Inference
-    CUDA graphs are not supported; inference_cuda_graph_scope must be "none".
-    cuda_graph_modules has no effect when cuda_graph_impl="none" and must be empty when
-    cuda_graph_impl="full_iteration"."""
+    "local": capture the CUDA graph using MCore local implementation. Either partial CUDA graph
+    (1/many CUDA graph per layer) or full iteration CUDA graph (1 CUDA graph for whole iteration
+    excluding optimizer) is enabled.
+    "transformer_engine": capture the CUDA graph using TE make_graphed_callables()."""
 
-    cuda_graph_modules: Union[str, CudaGraphModule, List[str], List[CudaGraphModule]] = "full"
-    """Selects training capture coverage within per-layer CUDA graphs (local and
-    transformer_engine implementations).
-    Valid values are "attn", "mlp", "moe", "moe_router", "moe_preprocess", and "mamba":
-    "attn": captures operations in TransformerLayer._forward_attention().
-    "mlp": captures operations in TransformerLayer._forward_mlp() for a dense layer.
-    "moe": captures operations in TransformerLayer._forward_mlp() for a MoE layer.
-    "moe_router": captures operations in TransformerLayer._forward_mlp() up to MoELayer.router(),
-    including the shared experts if they are not overlapped with EP comm.
-    "moe_preprocess": captures operations in MoELayer.preprocess(). Must be used together with
-    "moe_router".
-    "mamba": captures the mamba layer.
-    An empty list means capturing the whole Transformer layer.
-    This field is meaningless when cuda_graph_impl="full_iteration" and must be empty.
-    Backward compatibility: "full" is deprecated but kept for backward compatibility; it is
-    transformed to an empty list in __post_init__. The deprecated values "full_iteration" and
-    "full_iteration_inference" are also accepted and migrated to the new API in __post_init__."""
+    cuda_graph_scope: Union[str, CudaGraphScope, List[str], List[CudaGraphScope]] = "full"
+    """Determines the CUDA graphs capturing scope.
+    When cuda_graph_impl is set to "transformer_engine", valid values are "attn", "mlp", "moe",
+    "moe_router", "moe_preprocess", "mamba". "full" or an empty list means the full layer. "full"
+    is actually deprecated, but for backward compatibility, we still use "full" as the default
+    value. It will be transformed to an empty list in __post_init__.
+    When cuda_graph_impl is set to "local", "full_iteration" can be specified as cuda_graph_scope
+    to enable whole iteration CUDA graph. All other values enable layerwise CUDA graph."""
 
-    inference_cuda_graph_scope: Optional[InferenceCudaGraphScope] = field(
-        default=None,
-        metadata={
-            "argparse_meta": {
-                "type": str,
-                "choices": [scope.name for scope in InferenceCudaGraphScope],
-            }
-        },
-    )
-    """Controls the CUDA graph scope during inference.
-    When unset, the effective default is derived from cuda_graph_impl:
-    "local" -> "layer", all other impls -> "none".
-    "none": inference runs in eager mode (no CUDA graphs).
-    "layer": inference graphs are owned at the module/layer boundary, e.g. TransformerLayer or
-    MambaLayer.
-    "block": inference graphs are owned by the enclosing block, e.g. TransformerBlock or
-    HybridBlock.
-    Currently supported combinations are:
-    cuda_graph_impl="local" -> "layer" or "block";
-    all other cuda_graph_impl values -> "none"."""
+    ####################
+    # Hyper-Connection Configuration
+    ####################
+    enable_hyper_connections: bool = False
+    """Enable mHC residual connections."""
 
-    cuda_graph_scope: Optional[
-        Union[
-            str, CudaGraphModule, CudaGraphScope, List[Union[str, CudaGraphModule, CudaGraphScope]]
-        ]
-    ] = None
-    """Deprecated: renamed to cuda_graph_modules. Accepted for backward compatibility and
-    migrated to cuda_graph_modules in __post_init__. Will be removed in a future release.
-    CudaGraphScope instances deserialized from pre-refactor checkpoints are converted to their
-    string names before normalization so existing CUDA_GRAPH_MODULES_DEPRECATIONS handles them."""
+    num_residual_streams: int = 4
+    """Number of residual streams (n in paper).
+
+    Within each hyper-connection transformer block, hidden states are expanded
+    from [s, b, C] to [s, b, n*C], so activation memory in the block scales
+    roughly linearly with this value.
+    """
+
+    mhc_sinkhorn_iterations: int = 20
+    """Number of Sinkhorn-Knopp iterations for doubly stochastic projection.
+
+    20 is a conservative default that converges robustly across all tested
+    configurations. For typical small ``num_residual_streams`` (n=4, giving 4×4
+    matrices), 8–10 iterations are usually sufficient and reduce per-layer
+    Sinkhorn cost. Tune downward only after verifying convergence quality on
+    the target model."""
+
+    mhc_init_gating_factor: float = 0.01
+    """Initial value of Gating Factor (alpha in paper)."""
+
+    use_fused_mhc: bool = False
+    """Use cuTile fused kernels for mHC operations.
+
+    When True, attempts to replace the reference mHC modules (SinkhornKnopp,
+    H_aggregate, H_post_bda, ProjRms) with fused cuda.tile (cuTile) autograd
+    functions for better performance on supported GPUs.  Requires cuTile to be
+    installed; if cuTile is unavailable the flag is silently reset to False and
+    a warning is emitted.
+    """
+
+    mhc_recompute_layer_num: Optional[int] = None
+    """Number of layers per MHC recompute block.
+
+    When set, every `mhc_recompute_layer_num` layers form a recompute block. The last layer
+    in each recompute block (i.e., layer_number % mhc_recompute_layer_num == 0 or the final
+    layer in the transformer block) will:
+    - NOT checkpoint its final MLP BDA
+    - Register the unified recompute hook on its MLP BDA output
+    - A new CheckpointWithoutOutputManager is created for subsequent layers
+
+    If None, all layers in the transformer block share a single recompute block.
+
+    Memory/compute tradeoff: a single ``CheckpointWithoutOutputManager`` retains references to every
+    per-sublayer ``CheckpointWithoutOutput`` until its unified backward hook fires.
+    Smaller blocks (e.g. 4) recompute more frequently but hold fewer checkpoint contexts
+    simultaneously; larger blocks (or ``None``) save recompute overhead at the cost of
+    holding more contexts at peak. As a starting point, try
+    ``mhc_recompute_layer_num=4`` for deep stacks and tune based on observed peak memory.
+
+    Must be a positive integer when set."""
 
     ####################
     # miscellaneous
@@ -1047,14 +1027,16 @@ class TransformerConfig(ModelParallelConfig):
     inference_disable_triton_nvls_kernels: bool = False
     """ If true, disables the use of Triton NVLS kernels during inference. """
 
-    inference_grouped_gemm_backend: Literal['flashinfer', 'torch', 'vllm'] = "vllm"
+    inference_grouped_gemm_backend: Literal['auto', 'torch', 'te'] = "auto"
     """Specifies the backend to use for grouped GEMM operations during inference.
     Options:
-    - 'flashinfer': Uses FlashInfer cutlass_fused_moe. Not compatible with MXFP8.
-    - 'torch': Uses torch.nn.functional.grouped_mm (mcore_fused_moe with Triton kernels).
-      Supports both BF16 and MXFP8.
-    - 'vllm': Uses vLLM's Triton fused MoE kernel (BF16). Avoids physical token
-      permutation via indirect addressing.
+    - 'auto': Uses FlashInfer for CUDA-graphed iterations (requires flashinfer-python),
+      and torch.nn.functional.grouped_mm for non-CUDA-graphed iterations (falls back to TE
+      if unavailable). Note: the heuristic for choosing backends in 'auto' mode may change
+      in future releases.
+    - 'torch': Uses torch.nn.functional.grouped_mm. For CUDA-graphed iterations, uses
+      mcore_fused_moe (permute/unpermute + grouped_mm with Triton kernels).
+    - 'te': Uses TE GroupedGEMM only. Not supported with CUDA graphs.
     """
 
     inference_moe_disable_fused_quant_kernels: bool = False
@@ -1062,14 +1044,6 @@ class TransformerConfig(ModelParallelConfig):
     MXFP8 quantization + swizzle into a single kernel launch. Only applies when
     fp8_recipe='mxfp8'. Set to True to disable fusion and use separate kernel
     launches (useful for debugging)."""
-
-    inference_moe_token_dispatcher_type: Literal['nccl', 'nvls'] = 'nvls'
-    """Token dispatcher to use for MoE expert parallelism during inference.
-    - 'nccl': AllGather/ReduceScatter via NCCL. Fixed token counts per rank; requires
-      decode-only CUDA graphs (forced automatically).
-    - 'nvls': Variable-count AllGather-V/ReduceScatter-V via NVLS multimem kernels.
-      Requires Hopper+ GPUs with NVLink and symmetric memory. Default.
-    Only applies when transformer_impl='inference_optimized' and EP > 1."""
 
     mrope_section: Optional[List[int]] = None
     """ Multimodal rope section is for channel dimension of temporal, height and width
@@ -1099,9 +1073,6 @@ class TransformerConfig(ModelParallelConfig):
     mlp_chunks_for_prefill: int = 1
     """The number of chunks along the sequence dimension to use for MLP computation
     during prefill."""
-    mlp_chunks_for_training: int = 1
-    """The number of chunks along the sequence dimension to use for MLP computation
-    during training."""
 
     heterogeneous_block_specs: bool = False
     """Whether to use heterogeneous block specs (nemotron-nas architecture)."""
@@ -1351,10 +1322,13 @@ class TransformerConfig(ModelParallelConfig):
                     "to avoid costly dtype conversions during decode."
                 )
 
-            if self.gated_linear_unit:
+            if self.gated_linear_unit and self.cuda_graph_impl == "local":
                 raise ValueError(
-                    "--transformer-impl='inference_optimized' does not yet support "
-                    "gated linear units (SwiGLU/GeGLU)."
+                    "--transformer-impl='inference_optimized' does not yet support CUDA graphs "
+                    "with gated linear units (SwiGLU/GeGLU) due to differences in weight "
+                    "layouts between the FlashInfer kernel and mcore. Either disable CUDA "
+                    "graphs (--cuda-graph-impl=none) or use a non-gated activation "
+                    "(e.g. squared_relu)."
                 )
 
             if self.fp8 == "mxfp8":
@@ -1365,33 +1339,18 @@ class TransformerConfig(ModelParallelConfig):
                         "Please set --fp8-param-gather."
                     )
 
-            try:
-                self.inference_grouped_gemm_backend = InferenceGroupedGemmBackend(
-                    self.inference_grouped_gemm_backend
-                )
-            except ValueError:
-                raise ValueError(
-                    f"inference_grouped_gemm_backend must be 'flashinfer', 'torch', or 'vllm', "
-                    f"got '{self.inference_grouped_gemm_backend}'"
-                )
+            assert self.inference_grouped_gemm_backend in ('auto', 'torch', 'te'), (
+                f"inference_grouped_gemm_backend must be 'auto', 'torch', or 'te', "
+                f"got '{self.inference_grouped_gemm_backend}'"
+            )
 
-            if (
-                self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
-                and self.fp8 == "mxfp8"
-            ):
-                raise ValueError(
-                    "FlashInfer is not compatible with MXFP8 quantization. "
-                    "Set inference_grouped_gemm_backend to 'torch'."
-                )
-
-            if (
-                self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.VLLM
-                and self.fp8 == "mxfp8"
-            ):
-                raise ValueError(
-                    "vLLM Triton fused MoE only supports BF16. "
-                    "Set inference_grouped_gemm_backend to 'torch' for MXFP8."
-                )
+            if self.cuda_graph_impl == "local":
+                if self.inference_grouped_gemm_backend == "te":
+                    raise ValueError(
+                        "TE GroupedGEMM is not supported with CUDA graphs. Please set "
+                        "inference_grouped_gemm_backend to 'auto' or 'torch', or disable "
+                        "CUDA graphs (--cuda-graph-impl=none)."
+                    )
 
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
             raise ValueError("num_moe_experts must be non-negative.")
@@ -1417,32 +1376,6 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_ffn_hidden_size is set but num_moe_experts is None. "
                     "Please set num_moe_experts or remove moe_ffn_hidden_size."
                 )
-
-        if self.moe_single_grouped_weight or self.moe_single_grouped_bias:
-            if not self.moe_grouped_gemm:
-                raise ValueError(
-                    "moe_single_grouped_weight and moe_single_grouped_bias require "
-                    "moe_grouped_gemm=True."
-                )
-            if not is_te_min_version("2.14.0"):
-                raise ValueError(
-                    "moe_single_grouped_weight and moe_single_grouped_bias require "
-                    f"transformer-engine>=2.14.0, but your version is {get_te_version()}."
-                )
-        if self.moe_single_grouped_weight:
-            # The dist-optimizer's quantized-param shard path on the single-grouped-weight
-            # storage is only validated for fp8 mode with the mxfp8 recipe today; other
-            # combinations have a known numerical issue tracked in upstream PR
-            # NVIDIA/Megatron-LM#4621. Reject at construction time so users don't silently
-            # train on a broken numerical path. (moe_single_grouped_bias is not gated:
-            # biases aren't quantized, so they don't enter the buggy code path.)
-            if self.fp4 or not self.fp8 or self.fp8_recipe != Fp8Recipe.mxfp8:
-                raise ValueError(
-                    "moe_single_grouped_weight is currently supported only with fp8 mode "
-                    "and fp8_recipe='mxfp8'."
-                )
-        if self.moe_single_grouped_bias and not self.add_bias_linear:
-            raise ValueError("moe_single_grouped_bias requires add_bias_linear=True.")
 
         if self.moe_enable_deepep:
             if self.moe_token_dispatcher_type != "flex":
@@ -1601,6 +1534,7 @@ class TransformerConfig(ModelParallelConfig):
                     "moe",
                     "shared_experts",
                     "gdn_norm_out",
+                    "mhc",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
@@ -1671,6 +1605,116 @@ class TransformerConfig(ModelParallelConfig):
             self.recompute_granularity = "selective"
             if "moe" not in self.recompute_modules:
                 self.recompute_modules.append("moe")
+
+        if self.enable_hyper_connections and self.num_residual_streams < 2:
+            raise ValueError(
+                "num_residual_streams must be >= 2 when hyper connections are enabled."
+            )
+
+        # Validation for "mhc" in recompute_modules
+        if self.recompute_granularity == "selective" and "mhc" in self.recompute_modules:
+            if not self.enable_hyper_connections:
+                raise ValueError(
+                    "'mhc' in recompute_modules requires enable_hyper_connections=True."
+                )
+            if "mlp" in self.recompute_modules:
+                raise ValueError(
+                    "'mhc' and 'mlp' in recompute_modules cannot be used together. "
+                    "They use different checkpoint mechanisms that may conflict."
+                )
+            if self.mhc_recompute_layer_num is not None and (
+                isinstance(self.mhc_recompute_layer_num, bool)
+                or not isinstance(self.mhc_recompute_layer_num, int)
+                or self.mhc_recompute_layer_num < 1
+            ):
+                raise ValueError(
+                    "mhc_recompute_layer_num must be a positive integer when "
+                    "'mhc' is in recompute_modules."
+                )
+            if self.fine_grained_activation_offloading:
+                raise ValueError(
+                    "'mhc' in recompute_modules is incompatible with "
+                    "fine_grained_activation_offloading. The mHC recompute hook fires "
+                    "before the offloading backward chunk is initialized, causing "
+                    "tensor_pop on a None chunk. Disable one of them."
+                )
+
+        if self.enable_hyper_connections and self.recompute_granularity == "full":
+            raise ValueError(
+                "enable_hyper_connections is not yet compatible with full activation "
+                "recompute. Use selective recompute with 'mhc' in recompute_modules "
+                "or disable activation recompute."
+            )
+        if (
+            self.enable_hyper_connections
+            and self.recompute_granularity == "selective"
+            and "mhc" not in self.recompute_modules
+        ):
+            warnings.warn(
+                "HyperConnections are enabled but 'mhc' is not in "
+                "recompute_modules with selective recompute. Consider adding 'mhc' to "
+                "recompute_modules with selective recompute to reduce activation memory."
+            )
+
+        # Validation for use_fused_mhc
+        if self.use_fused_mhc:
+            if not self.enable_hyper_connections:
+                raise ValueError("use_fused_mhc requires enable_hyper_connections=True.")
+            try:
+                from megatron.core.fusions.fused_mhc_kernels import is_cutile_available
+
+                if not is_cutile_available():
+                    warnings.warn(
+                        "use_fused_mhc is enabled but cuda.tile (cuTile) is not installed. "
+                        "Falling back to reference mHC implementations.",
+                        UserWarning,
+                    )
+                    self.use_fused_mhc = False
+            except ImportError:
+                warnings.warn(
+                    "use_fused_mhc is enabled but fused_mhc_kernels module could not be "
+                    "imported. Falling back to reference mHC implementations.",
+                    UserWarning,
+                )
+                self.use_fused_mhc = False
+            fused_proj_dim = self.num_residual_streams**2 + 2 * self.num_residual_streams
+            if self.use_fused_mhc and fused_proj_dim > 256:
+                raise ValueError(
+                    "use_fused_mhc supports num_residual_streams values whose "
+                    "n^2 + 2n projection dimension is <= 256. Disable use_fused_mhc "
+                    "or choose fewer residual streams."
+                )
+
+        # Validation for hyper_connections with MTP
+        if self.enable_hyper_connections and self.mtp_num_layers is not None:
+            raise ValueError(
+                "enable_hyper_connections is not compatible with Multi-Token Prediction (MTP). "
+                "Please disable MTP (set mtp_num_layers=None) when using hyper connections."
+            )
+
+        if self.enable_hyper_connections and self.inference_fuse_tp_communication:
+            raise ValueError(
+                "enable_hyper_connections is not compatible with "
+                "inference_fuse_tp_communication. The fused inference TP path assumes "
+                "single-stream residual tensors."
+            )
+
+        if self.enable_hyper_connections and (self.num_moe_experts or 0) > 0:
+            raise ValueError(
+                "enable_hyper_connections is not yet supported with MoE layers. "
+                "Disable MoE (set num_moe_experts=None or 0) or disable mHC."
+            )
+
+        if self.enable_hyper_connections:
+            if self.mhc_sinkhorn_iterations < 1:
+                raise ValueError(
+                    f"mhc_sinkhorn_iterations must be >= 1; got " f"{self.mhc_sinkhorn_iterations}."
+                )
+            if self.mhc_init_gating_factor < 0:
+                raise ValueError(
+                    f"mhc_init_gating_factor must be non-negative; got "
+                    f"{self.mhc_init_gating_factor}."
+                )
 
         if self.fine_grained_activation_offloading:
             assert (
@@ -2173,149 +2217,103 @@ class TransformerConfig(ModelParallelConfig):
                 )
                 self.cuda_graph_impl = "transformer_engine"
 
-        if self.cuda_graph_scope is not None:
-            assert self.cuda_graph_modules in (
-                "full",
-                None,
-                [],
-            ), "cuda_graph_scope and cuda_graph_modules cannot be set together."
-            warnings.warn(
-                "cuda_graph_scope is deprecated, use cuda_graph_modules instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-
-            # CudaGraphScope is preserved as a standalone class (not an alias of CudaGraphModule)
-            # so pre-refactor checkpoint values deserialize with the correct member identity.
-            # Convert to string names here so normalize_cuda_graph_modules handles them uniformly.
-            def _scope_to_str(s):
-                return s.name if isinstance(s, CudaGraphScope) else s
-
-            scope = self.cuda_graph_scope
-            if isinstance(scope, list):
-                self.cuda_graph_modules = [_scope_to_str(s) for s in scope]
+        if self.cuda_graph_scope is None:
+            self.cuda_graph_scope = []
+        elif not isinstance(self.cuda_graph_scope, list):
+            if isinstance(self.cuda_graph_scope, CudaGraphScope):
+                self.cuda_graph_scope = [self.cuda_graph_scope]
             else:
-                self.cuda_graph_modules = _scope_to_str(scope)
-            self.cuda_graph_scope = None
-
-        normalized_scopes, deprecated_scopes, used_full_scope = normalize_cuda_graph_modules(
-            self.cuda_graph_modules
-        )
-        validate_deprecated_cuda_graph_modules_migration_inputs(
-            deprecated_scopes, self.cuda_graph_impl, self.inference_cuda_graph_scope
-        )
-        if used_full_scope:
-            warnings.warn(
-                "full scope is deprecated. "
-                "Use empty cuda_graph_modules to capture the whole layer."
-            )
-        for scope, attr, value in deprecated_scopes:
-            migration = get_deprecated_cuda_graph_modules_migration(
-                scope, attr, value, self.cuda_graph_impl
-            )
-            if migration is None:
-                warnings.warn(
-                    f"cuda_graph_modules '{scope}' is deprecated and has no effect when "
-                    "cuda_graph_impl='none'. Use cuda_graph_impl='local' with "
-                    "inference_cuda_graph_scope='block' to enable inference CUDA graphs.",
-                    DeprecationWarning,
-                    stacklevel=2,
+                assert isinstance(self.cuda_graph_scope, str), (
+                    "cuda_graph_scope must be a string that can be converted to a list of "
+                    f"CudaGraphScope, got {self.cuda_graph_scope}."
                 )
-                continue
-            migration_attr, migration_value = migration
-            warnings.warn(
-                f"cuda_graph_modules '{scope}' is deprecated. "
-                f"Use {migration_attr}={migration_value!r} instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            setattr(self, migration_attr, migration_value)
-        self.cuda_graph_modules = normalized_scopes
+                self.cuda_graph_scope = self.cuda_graph_scope.split(',')
+        if all(isinstance(scope, str) for scope in self.cuda_graph_scope):
+            # Backward compatibility for "full" scope. Now we use an empty list instead.
+            if "full" in self.cuda_graph_scope:
+                assert self.cuda_graph_scope == [
+                    "full"
+                ], "full scope cannot be used with other scopes."
+                warnings.warn(
+                    "full scope is deprecated. "
+                    "Use empty cuda_graph_scope to capture the whole layer."
+                )
+                self.cuda_graph_scope = []
+            else:
+                self.cuda_graph_scope = [CudaGraphScope[scope] for scope in self.cuda_graph_scope]
         assert all(
-            isinstance(scope, CudaGraphModule) for scope in self.cuda_graph_modules
-        ), f"cuda_graph_modules must be a list of CudaGraphModule, got {self.cuda_graph_modules}."
-
-        assert self.cuda_graph_impl in [
-            "none",
-            "transformer_engine",
-            "local",
-            "full_iteration",
-        ], f"Invalid cuda graph implementation: {self.cuda_graph_impl}"
-
-        self.inference_cuda_graph_scope = normalize_inference_cuda_graph_scope(
-            self.inference_cuda_graph_scope, self.cuda_graph_impl
-        )
-
-        assert self.inference_cuda_graph_scope in ALLOWED_INFERENCE_SCOPES[self.cuda_graph_impl], (
-            "Invalid inference CUDA graph scope "
-            f"{self.inference_cuda_graph_scope.name!r} for cuda_graph_impl="
-            f"{self.cuda_graph_impl!r}."
-        )
-        assert not (
-            self.cuda_graph_impl == "full_iteration" and self.cuda_graph_modules
-        ), 'cuda_graph_modules must be empty when cuda_graph_impl="full_iteration".'
+            isinstance(scope, CudaGraphScope) for scope in self.cuda_graph_scope
+        ), f"cuda_graph_scope must be a list of CudaGraphScope, got {self.cuda_graph_scope}."
 
         if self.cuda_graph_impl != "none":
+            assert self.cuda_graph_impl in [
+                "transformer_engine",
+                "local",
+            ], f"Invalid cuda graph implementation: {self.cuda_graph_impl}"
 
-            if self.cpu_offloading and self.cuda_graph_impl != "full_iteration":
+            if self.cpu_offloading and self.cuda_graph_scope != [CudaGraphScope.full_iteration]:
                 raise ValueError("CUDA graphs not supported with CPU offloading.")
 
-            # Check cuda graph scopes for per-layer implementations.
-            if self.cuda_graph_impl in ("local", "transformer_engine"):
-                if self.cuda_graph_impl == "local":
-                    # local impl doesn't currently distinguish between moe_preprocess or moe_router
-                    # so just set both if either is specified.
-                    if (
-                        CudaGraphModule.moe_router in self.cuda_graph_modules
-                        or CudaGraphModule.moe_preprocess in self.cuda_graph_modules
-                    ):
-                        if CudaGraphModule.moe_router not in self.cuda_graph_modules:
-                            self.cuda_graph_modules.append(CudaGraphModule.moe_router)
-                        if CudaGraphModule.moe_preprocess not in self.cuda_graph_modules:
-                            self.cuda_graph_modules.append(CudaGraphModule.moe_preprocess)
+            if self.cuda_graph_impl == "local":
+                # local impl doesn't currently distinguish between moe_preproocess or moe_router
+                # so just set both if either is specified.
+                if (
+                    CudaGraphScope.moe_router in self.cuda_graph_scope
+                    or CudaGraphScope.moe_preprocess in self.cuda_graph_scope
+                ):
+                    if CudaGraphScope.moe_router not in self.cuda_graph_scope:
+                        self.cuda_graph_scope.append(CudaGraphScope.moe_router)
+                    if CudaGraphScope.moe_preprocess not in self.cuda_graph_scope:
+                        self.cuda_graph_scope.append(CudaGraphScope.moe_preprocess)
 
+            # Check cuda graph scopes
+            if self.cuda_graph_impl == "transformer_engine":
+                assert CudaGraphScope.full_iteration not in self.cuda_graph_scope, (
+                    "To use full iteration cuda graph, please use "
+                    "cuda_graph_impl=local instead of cuda_graph_impl=transformer_engine."
+                )
+            assert (
+                CudaGraphScope.moe not in self.cuda_graph_scope
+                or CudaGraphScope.moe_router not in self.cuda_graph_scope
+            ), 'cuda_graph_scope must not contain both moe and moe_router.'
+            if CudaGraphScope.moe_preprocess in self.cuda_graph_scope:
                 assert (
-                    CudaGraphModule.moe not in self.cuda_graph_modules
-                    or CudaGraphModule.moe_router not in self.cuda_graph_modules
-                ), 'cuda_graph_modules must not contain both moe and moe_router.'
-                if CudaGraphModule.moe_preprocess in self.cuda_graph_modules:
+                    CudaGraphScope.moe_router in self.cuda_graph_scope
+                ), 'moe_preprocess cuda graph is only supported with moe_router cuda graph.'
+            if self.num_moe_experts is None or self.num_moe_experts <= 1:
+                assert (
+                    CudaGraphScope.moe not in self.cuda_graph_scope
+                    and CudaGraphScope.moe_router not in self.cuda_graph_scope
+                ), 'moe cuda graph is only supported for MoE.'
+            else:
+                if self.moe_layer_freq == 1 or (
+                    isinstance(self.moe_layer_freq, list) and 0 not in self.moe_layer_freq
+                ):
+                    assert CudaGraphScope.mlp not in self.cuda_graph_scope, (
+                        'mlp cuda graph is only supported for dense layers, '
+                        'but not found in the model.'
+                    )
+                if (
+                    self.moe_expert_capacity_factor is None
+                    or not self.moe_pad_expert_input_to_capacity
+                ):
                     assert (
-                        CudaGraphModule.moe_router in self.cuda_graph_modules
-                    ), 'moe_preprocess cuda graph is only supported with moe_router cuda graph.'
-                if self.num_moe_experts is None or self.num_moe_experts <= 1:
-                    assert (
-                        CudaGraphModule.moe not in self.cuda_graph_modules
-                        and CudaGraphModule.moe_router not in self.cuda_graph_modules
-                    ), 'moe cuda graph is only supported for MoE.'
-                else:
-                    if self.moe_layer_freq == 1 or (
-                        isinstance(self.moe_layer_freq, list) and 0 not in self.moe_layer_freq
+                        CudaGraphScope.moe not in self.cuda_graph_scope
+                    ), 'moe cuda graph is only supported with drop-padding MoE.'
+                    if self.moe_token_dispatcher_type == 'alltoall' and (
+                        self.moe_expert_capacity_factor is not None
+                        or self.moe_router_padding_for_fp8
                     ):
-                        assert CudaGraphModule.mlp not in self.cuda_graph_modules, (
-                            'mlp cuda graph is only supported for dense layers, '
-                            'but not found in the model.'
+                        assert CudaGraphScope.moe_preprocess not in self.cuda_graph_scope, (
+                            'moe_preprocess cuda graph is not supported when there are '
+                            'DtoH copies and synchronizations in the preprocess step.'
                         )
-                    if (
-                        self.moe_expert_capacity_factor is None
-                        or not self.moe_pad_expert_input_to_capacity
-                    ):
-                        assert (
-                            CudaGraphModule.moe not in self.cuda_graph_modules
-                        ), 'moe cuda graph is only supported with drop-padding MoE.'
-                        if self.moe_token_dispatcher_type == 'alltoall' and (
-                            self.moe_expert_capacity_factor is not None
-                            or self.moe_router_padding_for_fp8
-                        ):
-                            assert CudaGraphModule.moe_preprocess not in self.cuda_graph_modules, (
-                                'moe_preprocess cuda graph is not supported when there are '
-                                'DtoH copies and synchronizations in the preprocess step.'
-                            )
 
             if self.recompute_granularity:
                 if self.recompute_granularity != "selective":
-                    assert (
-                        self.cuda_graph_impl == "full_iteration"
-                    ), "full recompute is only supported with full iteration CUDA graph."
+                    assert self.cuda_graph_scope == [
+                        CudaGraphScope.full_iteration
+                    ], "full recompute is only supported with full iteration CUDA graph."
                 else:
                     # The recompute module should be inside or outside of the graph scope.
                     # Recompute module coverring graph scope is not allowed.
@@ -2324,43 +2322,36 @@ class TransformerConfig(ModelParallelConfig):
                         and "moe" in self.recompute_modules
                     ):
                         assert (
-                            CudaGraphModule.moe_router not in self.cuda_graph_modules
+                            CudaGraphScope.moe_router not in self.cuda_graph_scope
                         ), "moe recompute is not supported with moe_router CUDA graph with: "
                         "--cuda-graph-impl transformer_engine."
 
                     # Graphed recompute module doesn't accept random number.
-                    # full_cudagraph means either full_iteration impl or an empty per-layer scope
-                    # (which captures the whole layer).
-                    if self.cuda_graph_impl == "full_iteration" or not self.cuda_graph_modules:
+                    if (
+                        not self.cuda_graph_scope
+                        or CudaGraphScope.full_iteration in self.cuda_graph_scope
+                    ):
                         full_cudagraph = True
                     else:
                         full_cudagraph = False
                     if self.attention_dropout != 0.0:
                         assert (
-                            not full_cudagraph
-                            and CudaGraphModule.attn not in self.cuda_graph_modules
+                            not full_cudagraph and CudaGraphScope.attn not in self.cuda_graph_scope
                         ) or "core_attn" not in self.recompute_modules, (
                             "attention dropout is not supported with graphed attention "
                             "recomputation."
                         )
                     if self.hidden_dropout != 0.0:
                         assert (
-                            (
-                                not full_cudagraph
-                                and CudaGraphModule.mlp not in self.cuda_graph_modules
-                            )
+                            (not full_cudagraph and CudaGraphScope.mlp not in self.cuda_graph_scope)
                             or "mlp" not in self.recompute_modules
                         ) and (
-                            (
-                                not full_cudagraph
-                                and CudaGraphModule.moe not in self.cuda_graph_modules
-                            )
+                            (not full_cudagraph and CudaGraphScope.moe not in self.cuda_graph_scope)
                             or "moe" not in self.recompute_modules
                         ), "hidden dropout is not supported with graphed MLP/MoE recomputation."
                     if self.moe_input_jitter_eps is not None:
                         assert (
-                            not full_cudagraph
-                            and CudaGraphModule.moe not in self.cuda_graph_modules
+                            not full_cudagraph and CudaGraphScope.moe not in self.cuda_graph_scope
                         ) or "moe" not in self.recompute_modules, (
                             "moe_input_jitter_eps is not supported with graphed moe recomputation."
                         )
