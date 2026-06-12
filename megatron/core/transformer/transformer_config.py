@@ -94,12 +94,6 @@ def _validate_dsa_kernel_backend_dependencies(dsa_kernel_backend: str) -> None:
             f"dsa_kernel_backend={dsa_kernel_backend} requires a CUDA device, "
             "but none is available."
         )
-    sm = torch.cuda.get_device_capability()
-    if sm[0] < 10:
-        raise ValueError(
-            f"dsa_kernel_backend={dsa_kernel_backend} requires SM100+ (Blackwell or later), "
-            f"but current device has compute capability {sm[0]}.{sm[1]}."
-        )
 
     missing = []
     if dsa_kernel_backend == "tilelang":

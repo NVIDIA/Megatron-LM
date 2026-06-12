@@ -689,6 +689,46 @@ class AbsorbedMLASelfAttention(Attention):
         v_up_weight = kv_up_weight[:, self.config.qk_head_dim :, :]
         return k_up_weight, v_up_weight
 
+    def _combine_split_kv_up_weights(
+        self, k_up_weight: torch.Tensor, v_up_weight: torch.Tensor
+    ) -> torch.Tensor:
+        """Combine pre-refactor split K/V up-projection weights into the new layout."""
+        num_heads = self.num_attention_heads_per_partition
+        qk_head_dim = self.config.qk_head_dim
+        v_head_dim = self.config.v_head_dim
+        kv_lora_rank = self.config.kv_lora_rank
+
+        k_up_weight = k_up_weight.view(num_heads, qk_head_dim, kv_lora_rank)
+        v_up_weight = v_up_weight.view(num_heads, v_head_dim, kv_lora_rank)
+        return (
+            torch.cat((k_up_weight, v_up_weight), dim=1)
+            .contiguous()
+            .view(num_heads * (qk_head_dim + v_head_dim), kv_lora_rank)
+        )
+
+    def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
+        """Load checkpoints saved with either combined or split K/V up-projection weights."""
+        combined_key = f"{prefix}linear_kv_up_proj.weight"
+        k_up_key = f"{prefix}linear_k_up_proj.weight"
+        v_up_key = f"{prefix}linear_v_up_proj.weight"
+        if combined_key not in state_dict and k_up_key in state_dict and v_up_key in state_dict:
+            state_dict[combined_key] = self._combine_split_kv_up_weights(
+                state_dict.pop(k_up_key), state_dict.pop(v_up_key)
+            )
+
+        combined_extra_state_key = f"{prefix}linear_kv_up_proj._extra_state"
+        k_up_extra_state_key = f"{prefix}linear_k_up_proj._extra_state"
+        v_up_extra_state_key = f"{prefix}linear_v_up_proj._extra_state"
+        if k_up_extra_state_key in state_dict or v_up_extra_state_key in state_dict:
+            k_extra_state = state_dict.pop(k_up_extra_state_key, None)
+            v_extra_state = state_dict.pop(v_up_extra_state_key, None)
+            if combined_extra_state_key not in state_dict:
+                state_dict[combined_extra_state_key] = (
+                    k_extra_state if k_extra_state is not None else v_extra_state
+                )
+
+        super()._load_from_state_dict(state_dict, prefix, *args, **kwargs)
+
     def _checkpointed_attention_forward(
         self,
         q_absorbed,

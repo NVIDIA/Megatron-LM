@@ -421,12 +421,19 @@ def compute_dsa_indexer_loss(
         index_scores = dsa_masking.apply_starts_ends_mask_to_scores(
             index_scores, varlen_starts, varlen_ends, key_positions
         )
+        base_valid_mask = (
+            dsa_masking.build_valid_mask_from_starts_ends(varlen_starts, varlen_ends, key_positions)
+            .unsqueeze(0)
+            .expand(b, sq, sk)
+        )
     else:
-        _, attn_score_mask, _, _ = dsa_masking.prepare_additive_mask(
+        _, attn_score_mask, index_score_mask, base_valid_mask = dsa_masking.prepare_additive_mask(
             mask, sq=sq, sk=sk, b=b, device=attention_scores.device
         )
         # [b, np, sq, sk] + [1/b, 1, sq, sk] -> [b, np, sq, sk]
         attention_scores += attn_score_mask
+        # [b, sq, sk] + [1/b, sq, sk] -> [b, sq, sk]
+        index_scores += index_score_mask
 
     # index_mask [b, sq, sk]
     index_mask = torch.full(
@@ -439,11 +446,17 @@ def compute_dsa_indexer_loss(
         attention_scores += index_mask.view(b, 1, sq, sk)
         # [b, sq, sk] + [b, sq, sk] -> [b, sq, sk]
         index_scores += index_mask
+        index_valid_mask = base_valid_mask & (index_mask == 0)
+    else:
+        index_valid_mask = base_valid_mask
+    attention_valid_mask = index_valid_mask if sparse_loss else base_valid_mask
 
     # [b, np, sq, sk] -> [b, np, sq, sk]
-    attention_scores = torch.nn.functional.softmax(attention_scores, dim=-1, dtype=torch.float32)
+    attention_scores = dsa_masking.masked_softmax(
+        attention_scores.float(), attention_valid_mask.unsqueeze(1).expand(b, np, sq, sk), dim=-1
+    )
     # [b, sq, sk] -> [b, sq, sk]
-    index_scores = torch.nn.functional.softmax(index_scores, dim=-1, dtype=torch.float32)
+    index_scores = dsa_masking.masked_softmax(index_scores.float(), index_valid_mask, dim=-1)
 
     # Sum attention scores across heads.
     # [batch, heads, seqlen_q, seqlen_k] -> [batch, seqlen_q, seqlen_k]
@@ -453,7 +466,9 @@ def compute_dsa_indexer_loss(
         torch.distributed.all_reduce(attention_scores.contiguous(), group=pg_collection.tp)
     # L1 normalize target on the last dimension. Doesn't use abs() because attention_scores are
     # obtained from softmax so they are already non-negative.
-    attention_scores = attention_scores / attention_scores.sum(dim=-1, keepdim=True)
+    attention_scores = attention_scores / attention_scores.sum(dim=-1, keepdim=True).clamp_min(
+        1e-10
+    )
 
     # Compute KL divergence: KL(target || index) = target(x) * log(target(x) / index(x))
     # kl_per_element [b, sq, sk]
@@ -714,14 +729,21 @@ def bwd_fused_indexer_loss_naive(
         # [b, sq, sk] + [b, sq, sk] -> [b, sq, sk]
         index_scores = index_scores + index_mask
 
-    # Compute softmax for both
-    attention_scores_softmax = torch.nn.functional.softmax(
-        attention_scores, dim=-1, dtype=torch.float32
+    # Compute softmax for both.
+    if sparse_loss:
+        index_valid_mask = base_valid_mask & (index_mask == 0)
+    else:
+        index_valid_mask = base_valid_mask
+    attention_valid_mask = index_valid_mask if sparse_loss else base_valid_mask
+    attention_scores_softmax = dsa_masking.masked_softmax(
+        attention_scores.float(), attention_valid_mask.unsqueeze(1).expand(b, np, sq, sk), dim=-1
     )
     # Free attention_scores immediately
     del attention_scores
 
-    index_scores_softmax = torch.nn.functional.softmax(index_scores, dim=-1, dtype=torch.float32)
+    index_scores_softmax = dsa_masking.masked_softmax(
+        index_scores.float(), index_valid_mask, dim=-1
+    )
     # Free index_scores - no longer needed after softmax
     del index_scores
 
@@ -737,7 +759,7 @@ def bwd_fused_indexer_loss_naive(
     # L1 normalize
     attention_scores_normalized = attention_scores_sum / attention_scores_sum.sum(
         dim=-1, keepdim=True
-    )
+    ).clamp_min(1e-10)
     # Free attention_scores_sum - no longer needed after normalization
     del attention_scores_sum
 
@@ -784,7 +806,6 @@ def bwd_fused_indexer_loss_naive(
     # Zero out gradients for masked positions.
     if sparse_loss:
         # Also apply index mask - only topk positions are valid.
-        index_valid_mask = index_mask == 0  # [b, sq, sk]
         del index_mask
         valid_mask = base_valid_mask & index_valid_mask  # [b, sq, sk]
         del index_valid_mask
@@ -1606,8 +1627,10 @@ class DSAttention(MegatronModule):
         packed_thd = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
         packed_query_positions = None
         kv_reorder_idx = None
+        single_packed_thd_sequence = False
         if packed_thd and cp_size > 1:
             cu_seqlens_q, cu_seqlens_kv = dsa_layout.get_packed_qk_cu_seqlens(packed_seq_params)
+            single_packed_thd_sequence = cu_seqlens_q.numel() == 2 and cu_seqlens_kv.numel() == 2
             packed_query_positions, kv_reorder_idx = (
                 dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
                     cu_seqlens_q=cu_seqlens_q,
@@ -1615,6 +1638,8 @@ class DSAttention(MegatronModule):
                     cp_size=cp_size,
                     cp_rank=cp_rank,
                     device=query.device,
+                    local_output_size=sq,
+                    global_output_size=sq * cp_size,
                 )
             )
         elif cp_size > 1:
@@ -1686,6 +1711,15 @@ class DSAttention(MegatronModule):
             packed_seq_params, b=b, sq=sq, device=query.device
         )
         use_fused_kernels = dsa_kernels.use_fused_dsa_kernels(self.config)
+        sparse_indexer_loss = self.config.dsa_indexer_use_sparse_loss
+        use_local_indexer_varlen = (
+            packed_thd
+            and cp_size > 1
+            and single_packed_thd_sequence
+            and attn_mask_type == AttnMaskType.causal
+            and varlen_starts is not None
+            and varlen_ends is not None
+        )
         indexer_reduce_group = (
             cp_group if cp_size > 1 and self.config.calculate_per_token_loss else None
         )
@@ -1707,7 +1741,30 @@ class DSAttention(MegatronModule):
                     )
                 k = k.index_select(0, kv_reorder_idx)
 
-        sparse_indexer_loss = self.config.dsa_indexer_use_sparse_loss
+        def compute_indexer_loss_with_reference_path():
+            key_for_loss = key.detach()
+            if absorbed_mla and key_for_loss.size(2) == 1 and query.size(2) > 1:
+                key_for_loss = key_for_loss.expand(-1, -1, query.size(2), -1)
+            return FusedDSAIndexerLoss.apply(
+                q,
+                weights,
+                k,
+                query.detach(),
+                key_for_loss,
+                self.softmax_scale,
+                self.indexer.index_topk,
+                indexer_loss_coeff,
+                float_mask,
+                sparse_indexer_loss,
+                self.indexer.pg_collection,
+                varlen_starts,
+                varlen_ends,
+                key_positions,
+                query_valid_rows,
+                self.config.calculate_per_token_loss,
+                self.config.dsa_indexer_scoring_relu,
+            )
+
         fused_output = None
         if use_fused_kernels:
             fused_output = dsa_kernels.run_fused_dsa_attention(
@@ -1731,7 +1788,9 @@ class DSAttention(MegatronModule):
                 varlen_starts=varlen_starts,
                 varlen_ends=varlen_ends,
                 key_positions=key_positions,
+                query_valid_rows=query_valid_rows,
                 use_relu=self.config.dsa_indexer_scoring_relu,
+                use_local_indexer_varlen=use_local_indexer_varlen,
             )
         if fused_output is not None:
             output, indexer_loss = fused_output
@@ -1792,28 +1851,7 @@ class DSAttention(MegatronModule):
                     topk_indices, indexer_loss = fused_topk_with_loss
 
             if topk_indices is None or indexer_loss is None:
-                key_for_loss = key.detach()
-                if absorbed_mla and key_for_loss.size(2) == 1 and query.size(2) > 1:
-                    key_for_loss = key_for_loss.expand(-1, -1, query.size(2), -1)
-                topk_indices, indexer_loss = FusedDSAIndexerLoss.apply(
-                    q,
-                    weights,
-                    k,
-                    query.detach(),
-                    key_for_loss,
-                    self.softmax_scale,
-                    self.indexer.index_topk,
-                    indexer_loss_coeff,
-                    float_mask,
-                    sparse_indexer_loss,
-                    self.indexer.pg_collection,
-                    varlen_starts,
-                    varlen_ends,
-                    key_positions,
-                    query_valid_rows,
-                    self.config.calculate_per_token_loss,
-                    self.config.dsa_indexer_scoring_relu,
-                )
+                topk_indices, indexer_loss = compute_indexer_loss_with_reference_path()
 
             # Save indexer loss for logging.
             if indexer_loss_coeff > 0:
