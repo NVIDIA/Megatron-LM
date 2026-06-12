@@ -951,6 +951,9 @@ class DynamicInferenceContext(BaseInferenceContext):
             device='cpu',
             pin_memory=True,
         )
+        self.request_has_stop_words = torch.zeros(
+            self.max_requests, dtype=torch.bool, device='cpu', pin_memory=True
+        )
 
         # Track request metadata. Backed by pinned CPU memory: bookkeeping is
         # CPU-resident; GPU consumers read from the active-slice mirror in
@@ -2404,6 +2407,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_last_kv_block_offset.fill_(0)
         self.request_to_kv_block_ids.fill_(-1)
         self.request_in_prefill_status_tensor.fill_(-1)
+        self.request_has_stop_words.fill_(False)
 
         # Reset request metadata.
         for metadata_tensor in self.request_metadata.values():
@@ -2442,6 +2446,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.clear_async_finished_request_rows()
         self.async_scheduling_has_waiting_requests = False
         self.async_scheduling_has_stop_word_requests = False
+        self.request_has_stop_words.fill_(False)
 
         # Reset attention, mamba, and block allocator state.
         self.reset_attention_state()
@@ -2797,6 +2802,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             raise TokenOverflowError(req.request_id)
 
         self.request_ids[current_id] = req.request_id
+        self.request_has_stop_words[current_id] = bool(req.stop_word_ids)
 
         # Handle request metadata.
         assert (
@@ -3036,6 +3042,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             self.active_token_count = 0
             self.request_to_kv_block_ids[active_start:active_end] = -1
             self.request_ids[active_start:active_end] = -1
+            self.request_has_stop_words[active_start:active_end] = False
             if self.is_hybrid_model:
                 self.mamba_metadata.request_to_mamba_state_idx[active_start:active_end] = -1
                 if self.paused_request_count == 0:
@@ -3060,6 +3067,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.active_token_count = remaining_request_count * (1 + self.num_speculative_tokens)
         self.request_to_kv_block_ids[new_active_end:active_end] = -1
         self.request_ids[new_active_end:active_end] = -1
+        self.request_has_stop_words[new_active_end:active_end] = False
         if self.is_hybrid_model:
             self.mamba_metadata.request_to_mamba_state_idx[new_active_end:active_end] = -1
 
@@ -3078,6 +3086,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.request_query_lengths[dst_idxs] = self.request_query_lengths[src_idxs]
         self.request_output_lengths[dst_idxs] = self.request_output_lengths[src_idxs]
         self.request_ids[dst_idxs] = self.request_ids[src_idxs]
+        self.request_has_stop_words[dst_idxs] = self.request_has_stop_words[src_idxs]
         if next_tokens is not None:
             next_tokens[dst_idxs] = next_tokens[src_idxs]  # num tokens sames as num samples
         if new_speculative_tokens is not None:
@@ -3106,6 +3115,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         tensor_swap(self.request_in_prefill_status_tensor, src_idxs, dst_idxs)
         tensor_swap(self.request_output_lengths, src_idxs, dst_idxs)
         tensor_swap(self.request_ids, src_idxs, dst_idxs)
+        tensor_swap(self.request_has_stop_words, src_idxs, dst_idxs)
         tensor_swap(self.request_to_kv_block_ids, src_idxs, dst_idxs)
         tensor_swap(self.request_kv_block_counts, src_idxs, dst_idxs)
         tensor_swap(self.request_last_kv_block_id, src_idxs, dst_idxs)
