@@ -678,10 +678,9 @@ class TestDynamicContext:
             dynamic_context.mamba_conv_states[:, 0:3, :, :].fill_(1.0)
             dynamic_context.mamba_ssm_states[:, 0:3, :, :, :].fill_(1.0)
 
-        prepared_update = dynamic_context.update_requests_prepare(
+        update_result = dynamic_context.update_requests(
             active_requests_mask=active_requests_mask, new_tokens=torch.tensor([0, 1, 2])
         )
-        update_result = dynamic_context.update_requests_bookkeep(prepared_update)
 
         assert update_result is None
         assert dynamic_context.total_request_count == 0
@@ -819,7 +818,7 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
-    def test_prepare_async_next_forward_decode_tokens(self):
+    def test_update_requests_prepare_decode_tokens(self):
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
             num_layers=4,
@@ -836,12 +835,10 @@ class TestDynamicContext:
         dynamic_context.request_kv_length_offsets[:2] = torch.tensor([5, 6], device='cpu')
         dynamic_context.request_last_kv_block_offset[:2] = torch.tensor([5, 6], device='cpu')
         dynamic_context.request_last_kv_block_id[:2] = torch.tensor([20, 21], device='cpu')
-        prepared_update = dynamic_context.update_requests_prepare(
+        dynamic_context.update_requests_prepare(
             active_requests_mask=torch.tensor([1, 1], device='cpu'),
             new_tokens=torch.tensor([100, 101], device='cpu'),
         )
-
-        dynamic_context.prepare_async_next_forward(prepared_update)
 
         assert dynamic_context.active_token_count == 2
         assert dynamic_context.token_to_input_ids[:2].tolist() == [100, 101]
