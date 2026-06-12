@@ -81,9 +81,32 @@ class DistributedDataParallel(_BaseDataParallel):
         # Assign all required process groups
         self.dp_group = process_group_dict['dp_group']
         self.dp_cp_group = process_group_dict['dp_cp_group']
-        self.intra_dp_cp_group = process_group_dict['intra_dp_cp_group']
         self.expt_dp_group = process_group_dict['expt_dp_group']
-        self.intra_expt_dp_group = process_group_dict['intra_expt_dp_group']
+        # DDP reduces every bucket over the GTP/EGTP-EXCLUDED replicate group (the gtp axis is
+        # completed separately by the RS + finalize all-reduce), so the intra groups DDP shards
+        # over ARE the *_with_gtp variants. They alias the regular intra groups when GTP is off.
+        self.intra_dp_cp_group = process_group_dict.get(
+            'intra_dp_cp_with_gtp_group', process_group_dict['intra_dp_cp_group']
+        )
+        self.intra_expt_dp_group = process_group_dict.get(
+            'intra_expt_dp_with_egtp_group', process_group_dict['intra_expt_dp_group']
+        )
+        # Full cross-instance, GTP-peer-EXCLUDED groups for broadcast_params (init-time weight
+        # sync must reach all true replicas). Fall back to the full DP groups when GTP is off.
+        self.dp_cp_with_gtp_group = process_group_dict.get('dp_cp_with_gtp_group', self.dp_cp_group)
+        self.expt_dp_with_egtp_group = process_group_dict.get(
+            'expt_dp_with_egtp_group', self.expt_dp_group
+        )
+        # GTP is "active" when the replicate groups are strictly smaller than the full DP groups.
+        gtp_active = (
+            self.dp_cp_with_gtp_group.size() != self.dp_cp_group.size()
+            or self.expt_dp_with_egtp_group.size() != self.expt_dp_group.size()
+        )
+        if gtp_active and self.ddp_config.average_in_collective:
+            raise NotImplementedError(
+                "Orthogonal GTP currently supports average_in_collective=False (the default); "
+                "averaged collectives would need per-buffer 1/gtp scaling."
+            )
         self.tp_group = process_group_dict['tp_group']
         self.pp_group = process_group_dict['pp_group']
         self.ep_group = process_group_dict['ep_group']
@@ -460,9 +483,12 @@ class DistributedDataParallel(_BaseDataParallel):
             if param in self.param_to_bucket_group:
                 assert param.requires_grad
                 if self.ddp_config.overlap_grad_reduce:
-                    assert (
-                        param.grad is not None
-                    ), 'param.grad being None is not safe when overlap_grad_reduce is True'
+                    # GTP params legitimately have grad=None (async RS writes wgrad straight
+                    # into main_grad), so skip the assertion for them.
+                    if not getattr(param, 'is_gtp', False):
+                        assert (
+                            param.grad is not None
+                        ), 'param.grad being None is not safe when overlap_grad_reduce is True'
                 if param.grad is not None and (
                     not param.grad_added_to_main_grad or getattr(param, 'zero_out_wgrad', False)
                 ):
@@ -585,11 +611,14 @@ class DistributedDataParallel(_BaseDataParallel):
         """
         for param in self.module.parameters():
             is_expert_parallel = not getattr(param, 'allreduce', True)
+            is_gtp = getattr(param, 'is_gtp', False)
 
+            # Each (E)GTP peer holds a distinct 1/N shard, so broadcast over the (E)GTP-EXCLUDED
+            # group — else rank-0's shard would clobber the others.
             if is_expert_parallel:
-                data_parallel_group = self.expt_dp_group
+                data_parallel_group = self.expt_dp_with_egtp_group if is_gtp else self.expt_dp_group
             else:
-                data_parallel_group = self.dp_cp_group
+                data_parallel_group = self.dp_cp_with_gtp_group if is_gtp else self.dp_cp_group
             torch.distributed.broadcast(
                 param.data,
                 src=torch.distributed.get_global_rank(data_parallel_group, 0),

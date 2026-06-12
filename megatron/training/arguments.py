@@ -1432,6 +1432,63 @@ def validate_args(args, defaults={}):
         if args.expert_model_parallel_size  > 1 and 'ep_dp' not in args.high_priority_stream_groups:
             args.high_priority_stream_groups.append('ep_dp')
 
+
+    if args.generalized_tensor_parallel_remat_size > 1 or args.expert_generalized_tensor_parallel_remat_size > 1:
+        gtp_size = args.generalized_tensor_parallel_remat_size
+        egtp_size = args.expert_generalized_tensor_parallel_remat_size
+        if get_device_arch_version() >= 10:
+            # Setting GTP communication groups for high priority streams for Blackwell and later
+            # architectures. Assigning high priority to communication streams ensures that
+            # communication kernels are scheduled with higher priority, minimizing the exposed
+            # communication when it is overlapped with other computation kernels.
+            if 'gtp' not in args.high_priority_stream_groups:
+                args.high_priority_stream_groups.append('gtp')
+                warn_rank_0("Setting 'gtp' group for high priority streams.")
+            if egtp_size > 1 and 'expt_gtp' not in args.high_priority_stream_groups:
+                args.high_priority_stream_groups.append('expt_gtp')
+                warn_rank_0("Setting 'expt_gtp' group for high priority streams.")
+
+            # Sanity check for 'CUDA_GRAPHS_USE_NODE_PRIORITY'.
+            if args.cuda_graph_impl != "none":
+                assert os.environ.get('CUDA_GRAPHS_USE_NODE_PRIORITY') == "1", \
+                    'GTP requires CUDA_GRAPHS_USE_NODE_PRIORITY=1 to make sure fine-grained GTP ' \
+                    'comms can be well overlapped with GEMMs when CudaGraph is enabled for ' \
+                    'Blackwell and later architecture.'
+
+        # Sanity check for 'NCCL_PROTO'.
+        if os.environ.get('NCCL_PROTO', '').lower() == "simple":
+            warn_rank_0(
+                "Generally GTP prefers 'NCCL_PROTO=LL128 or LL' while get 'NCCL_PROTO=simple', "
+                "force setting NCCL_PROTO=Simple might introduce bad perf."
+            )
+
+        assert args.ckpt_format in ('torch', 'torch_dist'), (
+            f"GTP supports only --ckpt-format 'torch' (legacy) or 'torch_dist', got "
+            f"'{args.ckpt_format}'."
+        )
+        assert not (
+            getattr(args, 'dist_ckpt_optim_fully_reshardable', False)
+            and getattr(args, 'distrib_optim_fully_reshardable_mem_efficient', False)
+        ), (
+            "GTP does not support the distributed-optimizer fully-reshardable + "
+            "mem-efficient checkpoint mode. Disable "
+            "--distrib-optim-fully-reshardable-mem-efficient (or "
+            "--dist-ckpt-optim-fully-reshardable)."
+        )
+
+        # Propagate --fp8-param-gather into GTPConfig: enables optimizer-side
+        # FP32->FP8 cast for GTP shards, so the forward skips BF16->FP8.
+        if getattr(args, 'fp8_param_gather', False):
+            from megatron.experimental.gtp import update_gtp_config
+
+            update_gtp_config(fp8_param_gather=True)
+            warn_rank_0(
+                "GTP + --fp8-param-gather: setting "
+                "GTPConfig.fp8_param_gather=True (optimizer step "
+                "pre-quantizes GTP shards, skipping the per-forward "
+                "BF16->FP8 cast)."
+            )
+
     # Disable bias gelu fusion if we are disabling bias altogether
     if not args.add_bias_linear:
         args.bias_gelu_fusion = False

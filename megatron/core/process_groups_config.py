@@ -117,6 +117,12 @@ class ProcessGroupCollection:
     # Separate dp_cp communicator for param all-gather (AG/RS overlap)
     dp_cp_ag: torch.distributed.ProcessGroup = field(init=False)
 
+    # _GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP
+    gtp: torch.distributed.ProcessGroup = field(init=False)
+
+    # _EXPERT_GENERALIZED_TENSOR_PARALLEL_REMAT_GROUP
+    expt_gtp: torch.distributed.ProcessGroup = field(init=False)
+
     # MoE layers need expt_dp group for sharded state dict
     # we need this workaround until distributed checkpoint is refactored
     # to have sharded_state_dict can take the PG and pass it down
@@ -146,19 +152,27 @@ class ProcessGroupCollection:
             else:
                 raise ValueError(f"Unknown attribute: {key}")
 
+    def __getattr__(self, name: str):
+        # Return None for any declared field that was not set during partial construction
+        # (e.g. when use_mpu_process_groups is called with a subset of required_pgs).
+        if name in {f.name for f in fields(self.__class__)}:
+            return None
+        raise AttributeError(f"'ProcessGroupCollection' object has no attribute '{name}'")
+
     def __repr__(self):
         """Return a concise representation showing which process groups exist and their sizes."""
         active_pgs = []
         for field_info in fields(self):
-            if hasattr(self, field_info.name):
-                pg = getattr(self, field_info.name)
-                if pg is None:
-                    active_pgs.append(f"{field_info.name}(None)")
-                elif isinstance(pg, list):
-                    sizes = [g.size() for g in pg]
-                    active_pgs.append(f"{field_info.name}({sizes})")
-                else:
-                    active_pgs.append(f"{field_info.name}({pg.size()})")
+            if field_info.name not in vars(self):
+                continue
+            pg = getattr(self, field_info.name)
+            if pg is None:
+                continue
+            elif isinstance(pg, list):
+                sizes = [g.size() for g in pg]
+                active_pgs.append(f"{field_info.name}({sizes})")
+            else:
+                active_pgs.append(f"{field_info.name}({pg.size()})")
         return (
             f"ProcessGroupCollection({', '.join(active_pgs)})"
             if active_pgs
@@ -247,6 +261,13 @@ class ProcessGroupCollection:
                 check_initialized=False,
                 with_context_parallel=True,
             ),
+            'gtp': partial(
+                parallel_state.get_generalized_tensor_parallel_remat_group, check_initialized=False
+            ),
+            'expt_gtp': partial(
+                parallel_state.get_expert_generalized_tensor_parallel_remat_group,
+                check_initialized=False,
+            ),
         }
 
         assert all(
@@ -293,6 +314,9 @@ class ProcessGroupCollection:
 
         if pg_collection is None:
             # Use parallel_state groups
+            # Dense (non-GTP) params use with_gtp=False (full DP group) to maximize
+            # optimizer state sharding. GTP params use with_gtp=True (smaller group)
+            # since GTP's reduce-scatter already handled the GTP dimension.
             dp_group = parallel_state.get_data_parallel_group(
                 with_context_parallel=False, partial_data_parallel=False
             )
@@ -302,10 +326,20 @@ class ProcessGroupCollection:
             intra_dp_cp_group = parallel_state.get_data_parallel_group(
                 with_context_parallel=True, partial_data_parallel=True
             )
+            intra_dp_cp_with_gtp_group = parallel_state.get_data_parallel_group(
+                with_context_parallel=True, with_gtp=True, partial_data_parallel=True
+            )
+            dp_cp_with_gtp_group = parallel_state.get_data_parallel_group(
+                with_context_parallel=True, with_gtp=True
+            )
             expt_dp_group = parallel_state.get_expert_data_parallel_group()
             intra_expt_dp_group = parallel_state.get_expert_data_parallel_group(
                 partial_expert_data_parallel=True
             )
+            intra_expt_dp_with_egtp_group = parallel_state.get_expert_data_parallel_group(
+                with_gtp=True, partial_expert_data_parallel=True
+            )
+            expt_dp_with_egtp_group = parallel_state.get_expert_data_parallel_group(with_gtp=True)
             intra_dist_opt_group = parallel_state.get_intra_distributed_optimizer_instance_group()
 
             # Gloo groups
@@ -338,9 +372,10 @@ class ProcessGroupCollection:
 
         else:
             # Use provided process group collection with validation and fallbacks
+            pg_set = vars(pg_collection)
 
             # 1. dp group - this is always required
-            if not hasattr(pg_collection, 'dp'):
+            if 'dp' not in pg_set:
                 raise ValueError("dp process group is required but not provided in pg_collection")
             dp_group = pg_collection.dp
 
@@ -360,7 +395,7 @@ class ProcessGroupCollection:
                     )
 
             # 3. Handle expert data parallel group
-            if not hasattr(pg_collection, 'expt_dp'):
+            if 'expt_dp' not in pg_set:
                 raise ValueError(
                     "expt_dp process group is required but not provided in pg_collection. "
                     "Please explicitly set it to None if you don't need it."
@@ -381,10 +416,10 @@ class ProcessGroupCollection:
                 else:
                     # With multiple optimizer instances, both groups must be provided
                     if not (
-                        hasattr(pg_collection, 'intra_dp_cp')
-                        and hasattr(pg_collection, 'intra_expt_dp')
-                        and hasattr(pg_collection, 'inter_dist_opt')
-                        and hasattr(pg_collection, 'intra_dist_opt')
+                        'intra_dp_cp' in pg_set
+                        and 'intra_expt_dp' in pg_set
+                        and 'inter_dist_opt' in pg_set
+                        and 'intra_dist_opt' in pg_set
                     ):
                         raise ValueError(
                             "intra_dp_cp, intra_expt_dp, inter_dist_opt, and intra_dist_opt "
@@ -396,7 +431,7 @@ class ProcessGroupCollection:
                     inter_dist_opt_group = pg_collection.inter_dist_opt
 
                 if ddp_config.use_distributed_optimizer:
-                    if not hasattr(pg_collection, 'intra_dist_opt'):
+                    if 'intra_dist_opt' not in pg_set:
                         raise ValueError(
                             "intra_dist_opt process group is required but not provided in "
                             "pg_collection. Please explicitly set it to None if you don't need it."
@@ -412,7 +447,7 @@ class ProcessGroupCollection:
                 intra_dist_opt_group = None
 
             # 5. Model communication groups
-            if not hasattr(pg_collection, 'mp'):
+            if 'mp' not in pg_set:
                 raise ValueError(
                     "mp process group is required but not provided in pg_collection. "
                     "Please explicitly set it to None if you don't need it."
@@ -420,12 +455,34 @@ class ProcessGroupCollection:
             mp_group = pg_collection.mp
 
             # Expert tensor-model-pipeline group for MoE
-            if not hasattr(pg_collection, 'tp_ep_pp'):
+            if 'tp_ep_pp' not in pg_set:
                 raise ValueError(
                     "tp_ep_pp process group is required but not provided in pg_collection. "
                     "Please explicitly set it to None if you don't need it."
                 )
             expt_tp_pp_group = pg_collection.tp_ep_pp
+
+            # 6. GTP with_gtp groups — partial (per-distopt-instance) and full
+            #    (cross-instance). Fall back to the non-GTP variants when not provided.
+            if hasattr(pg_collection, 'intra_dp_cp_with_gtp'):
+                intra_dp_cp_with_gtp_group = pg_collection.intra_dp_cp_with_gtp
+            else:
+                intra_dp_cp_with_gtp_group = intra_dp_cp_group
+            if hasattr(pg_collection, 'dp_cp_with_gtp'):
+                dp_cp_with_gtp_group = pg_collection.dp_cp_with_gtp
+            else:
+                dp_cp_with_gtp_group = dp_cp_group
+
+            # 7. EGTP groups — partial (per-distopt-instance) and full
+            #    (cross-instance). Fall back to the non-EGTP variants when not provided.
+            if hasattr(pg_collection, 'intra_expt_dp_with_egtp'):
+                intra_expt_dp_with_egtp_group = pg_collection.intra_expt_dp_with_egtp
+            else:
+                intra_expt_dp_with_egtp_group = intra_expt_dp_group
+            if hasattr(pg_collection, 'expt_dp_with_egtp'):
+                expt_dp_with_egtp_group = pg_collection.expt_dp_with_egtp
+            else:
+                expt_dp_with_egtp_group = expt_dp_group
 
             # Gloo groups - not supported when pg_collection is provided
             if use_gloo_process_groups:
@@ -439,9 +496,13 @@ class ProcessGroupCollection:
         return {
             'dp_group': dp_group,
             'dp_cp_group': dp_cp_group,
+            'dp_cp_with_gtp_group': dp_cp_with_gtp_group,
             'intra_dp_cp_group': intra_dp_cp_group,
+            'intra_dp_cp_with_gtp_group': intra_dp_cp_with_gtp_group,
             'expt_dp_group': expt_dp_group,
+            'expt_dp_with_egtp_group': expt_dp_with_egtp_group,
             'intra_expt_dp_group': intra_expt_dp_group,
+            'intra_expt_dp_with_egtp_group': intra_expt_dp_with_egtp_group,
             'mp_group': mp_group,
             'expt_tp_pp_group': expt_tp_pp_group,
             'inter_dist_opt_group': inter_dist_opt_group,
@@ -487,8 +548,14 @@ class ProcessGroupCollection:
                     with_context_parallel=True, partial_data_parallel=True
                 ),
                 'expt_dp_group': parallel_state.get_expert_data_parallel_group(),
+                'expt_dp_with_egtp_group': parallel_state.get_expert_data_parallel_group(
+                    with_gtp=True
+                ),
                 'intra_expt_dp_group': parallel_state.get_expert_data_parallel_group(
                     partial_expert_data_parallel=True
+                ),
+                'intra_expt_dp_with_egtp_group': parallel_state.get_expert_data_parallel_group(
+                    with_gtp=True, partial_expert_data_parallel=True
                 ),
                 'tp_group': parallel_state.get_tensor_model_parallel_group(),
                 'pp_group': parallel_state.get_pipeline_model_parallel_group(),
@@ -503,13 +570,20 @@ class ProcessGroupCollection:
                     if ddp_config.use_distributed_optimizer
                     else None
                 ),
+                'intra_dp_cp_with_gtp_group': parallel_state.get_data_parallel_group(
+                    with_context_parallel=True, with_gtp=True, partial_data_parallel=True
+                ),
+                'dp_cp_with_gtp_group': parallel_state.get_data_parallel_group(
+                    with_context_parallel=True, with_gtp=True
+                ),
             }
         else:
             # Use provided process group collection with validation and fallbacks
             result = {}
+            pg_set = vars(pg_collection)
 
             # 1. dp group - this is always required
-            if not hasattr(pg_collection, 'dp'):
+            if 'dp' not in pg_set:
                 raise ValueError("dp process group is required but not provided in pg_collection")
             result['dp_group'] = pg_collection.dp
 
@@ -550,9 +624,9 @@ class ProcessGroupCollection:
             else:
                 # With multiple optimizer instances, groups must be provided
                 if not (
-                    hasattr(pg_collection, 'intra_dp_cp')
-                    and hasattr(pg_collection, 'intra_expt_dp')
-                    and hasattr(pg_collection, 'inter_dist_opt')
+                    'intra_dp_cp' in pg_set
+                    and 'intra_expt_dp' in pg_set
+                    and 'inter_dist_opt' in pg_set
                 ):
                     raise ValueError(
                         "intra_dp_cp, intra_expt_dp, and inter_dist_opt "
@@ -564,19 +638,37 @@ class ProcessGroupCollection:
                 result['inter_dist_opt_group'] = pg_collection.inter_dist_opt
 
             # 5. Model parallel groups (DDP-specific: tp, pp, ep instead of mp, expt_tp_pp)
-            if not all(
-                [
-                    hasattr(pg_collection, 'tp'),
-                    hasattr(pg_collection, 'pp'),
-                    hasattr(pg_collection, 'ep'),
-                ]
-            ):
+            if not all(['tp' in pg_set, 'pp' in pg_set, 'ep' in pg_set]):
                 raise ValueError(
                     "tp, pp and ep process groups are required but not provided in pg_collection"
                 )
             result['tp_group'] = pg_collection.tp
             result['pp_group'] = pg_collection.pp
             result['ep_group'] = pg_collection.ep
+
+            # 6. GTP partial group (fallback to intra_dp_cp if not provided)
+            if hasattr(pg_collection, 'intra_dp_cp_with_gtp'):
+                result['intra_dp_cp_with_gtp_group'] = pg_collection.intra_dp_cp_with_gtp
+            else:
+                result['intra_dp_cp_with_gtp_group'] = result['intra_dp_cp_group']
+
+            # 7. EGTP partial group (fallback to intra_expt_dp if not provided)
+            if hasattr(pg_collection, 'intra_expt_dp_with_egtp'):
+                result['intra_expt_dp_with_egtp_group'] = pg_collection.intra_expt_dp_with_egtp
+            else:
+                result['intra_expt_dp_with_egtp_group'] = result['intra_expt_dp_group']
+
+            # 8. Full (cross-instance) with-GTP-excluded variants for callers that need to
+            # reach ALL true weight replicas (e.g., broadcast_params at init). Fall back
+            # to the corresponding non-GTP-excluded full group when not provided.
+            if hasattr(pg_collection, 'dp_cp_with_gtp'):
+                result['dp_cp_with_gtp_group'] = pg_collection.dp_cp_with_gtp
+            else:
+                result['dp_cp_with_gtp_group'] = result['dp_cp_group']
+            if hasattr(pg_collection, 'expt_dp_with_egtp'):
+                result['expt_dp_with_egtp_group'] = pg_collection.expt_dp_with_egtp
+            else:
+                result['expt_dp_with_egtp_group'] = result['expt_dp_group']
 
             return result
 

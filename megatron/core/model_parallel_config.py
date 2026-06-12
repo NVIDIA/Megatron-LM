@@ -20,6 +20,15 @@ class ModelParallelConfig:
     tensor_model_parallel_size: int = 1
     """Intra-layer model parallelism. Splits tensors across GPU ranks."""
 
+    generalized_tensor_parallel_remat_size: int = 1
+    """Generalized tensor parallelism with weight rematerialization. Shards model weights
+       across GPU ranks along ``out_features``; each weight is rematerialized independently
+       (per-weight, not per-layer) via async all-gather on every forward AND backward pass.
+       Carved out of the data-parallel axis, so increasing this size shrinks per-rank weight
+       memory and shrinks the outer DP that contributes the per-rank batch. Placed right
+       after tensor parallelism in the parallelism ordering.
+    """
+
     pipeline_model_parallel_comm_backend: Optional[Literal["nccl", "ucc"]] = None
     """Configuring backend option of pipeline parallel communication (e.g., nccl, ucc)
        If None, the default backend will be used.
@@ -71,6 +80,14 @@ class ModelParallelConfig:
 
     expert_model_parallel_size: int = 1
     """Distributes Moe Experts across sub data parallel dimension."""
+
+    expert_generalized_tensor_parallel_remat_size: int = 1
+    """Generalized tensor parallelism with weight rematerialization, for expert layers. Shards
+       expert weights across GPU ranks along ``out_features``; each expert weight is
+       rematerialized independently (per-weight, not per-layer) via async all-gather on every
+       forward AND backward pass. Independent from the decoder's
+       ``generalized_tensor_parallel_remat_size``.
+    """
 
     expert_tensor_parallel_size: Optional[int] = None
     """Intra-layer tensor model parallelism for expert layer. Splits tensors across GPU ranks.

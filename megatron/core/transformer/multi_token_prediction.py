@@ -1010,6 +1010,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             tp_comm_buffer_name="mtp_eh_proj",
             tp_group=pg_collection.tp if pg_collection is not None else None,
             name=(name + ".eh_proj") if name is not None else None,
+            gtp_group=pg_collection.gtp if pg_collection is not None else None,
         )
 
         # Build inner layers: two possible paths

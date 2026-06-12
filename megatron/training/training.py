@@ -1583,10 +1583,13 @@ def wrap_model_chunks_with_ddp(
         else:
             compute_layout = None
         if compute_layout is not None:
+            # Size the layout for the replicate (gtp/egtp-EXCLUDED) DP group the DDP buffer
+            # actually shards over, so DDP can use it directly without recomputing. with_gtp
+            # aliases the regular DP group when GTP is inactive.
             data_parallel_world_size = mpu.get_data_parallel_world_size(
-                with_context_parallel=True
+                with_context_parallel=True, with_gtp=True
             )
-            expert_data_parallel_world_size = mpu.get_expert_data_parallel_world_size()
+            expert_data_parallel_world_size = mpu.get_expert_data_parallel_world_size(with_gtp=True)
             for i, (chunk, bucket_size) in enumerate(zip(model_chunks, bucket_sizes)):
                 all_params = [p for p in chunk.parameters() if p.requires_grad]
                 per_chunk_layouts[i] = compute_layout(
@@ -1651,6 +1654,20 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             # For distillation ckpts without ModelOpt state
             args.modelopt_enabled = True
 
+    # Configure GTP padding alignment based on quantization recipe before model construction.
+    if (
+        getattr(args, 'generalized_tensor_parallel_remat_size', 1) > 1
+        or getattr(args, 'expert_generalized_tensor_parallel_remat_size', 1) > 1
+    ):
+        from megatron.experimental.gtp import update_gtp_config
+
+        if getattr(args, 'fp4', None) is not None:
+            update_gtp_config(pad_for_alignment=16)
+        elif getattr(args, 'fp8_recipe', None) == 'mxfp8':
+            update_gtp_config(pad_for_alignment=32, coalesce_amax_allreduce=False)
+        elif getattr(args, 'fp8', None) is not None:
+            update_gtp_config(pad_for_alignment=16)
+
     # Build model.
     def build_model():
         if (
@@ -1698,6 +1715,35 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
 
     if not isinstance(model, list):
         model = [model]
+
+    # Classify each GTP param into its prefetch chain (GRAPHED vs UNGRAPHED)
+    # from args.cuda_graph_modules + moe_shared_expert_overlap. Must run after
+    # model build, before the first forward (which lazily builds chain links).
+    if (
+        getattr(args, 'generalized_tensor_parallel_remat_size', 1) > 1
+        or getattr(args, 'expert_generalized_tensor_parallel_remat_size', 1) > 1
+    ):
+        from megatron.experimental.gtp import (
+            GTP_CONFIG,
+            classify_gtp_chains,
+            set_cuda_graph_modules,
+            tag_gtp_params_with_names,
+        )
+
+        _raw_modules = getattr(args, 'cuda_graph_modules', None) or []
+        _cg_modules = {getattr(s, 'name', str(s)) for s in _raw_modules} if _raw_modules else None
+        _mse_overlap = getattr(args, 'moe_shared_expert_overlap', False)
+        # cuda_graph_impl lets the classifier tell "CG disabled" from "full-iteration /
+        # graph-every-layer" — both have empty cuda_graph_modules.
+        set_cuda_graph_modules(
+            _cg_modules,
+            moe_shared_expert_overlap=_mse_overlap,
+            cuda_graph_impl=getattr(args, 'cuda_graph_impl', 'none'),
+        )
+        for model_module in model:
+            tag_gtp_params_with_names(model_module)
+            classify_gtp_chains(model_module)
+        print_rank_0(f"GTP enabled. {GTP_CONFIG}")
 
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these

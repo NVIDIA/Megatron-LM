@@ -183,6 +183,7 @@ class MegatronOptimizer(ABC):
           - parameter should not be shared (i.e., grads shouldn't be double counted while
             computing norms).
           - should not be a replica due to tensor model parallelism.
+          - should not be a replica due to (expert) generalized tensor parallelism.
         """
         grads_for_norm = []
         for param in params:
@@ -211,7 +212,9 @@ class MegatronOptimizer(ABC):
             is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(
                 param, getattr(self, 'tp_group', None)
             )
-            if grad_not_none and is_not_shared and is_not_tp_duplicate:
+            is_not_gtp_duplicate = tensor_parallel.param_is_not_gtp_duplicate(param)
+
+            if grad_not_none and is_not_shared and is_not_tp_duplicate and is_not_gtp_duplicate:
                 grads_for_norm.append(grad)
         return grads_for_norm
 
@@ -823,6 +826,7 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                             main_param = param.detach().clone().float()
                             # Copy tensor model parallel attributes.
                             tensor_parallel.copy_tensor_model_parallel_attributes(main_param, param)
+                            tensor_parallel.copy_gtp_attributes(main_param, param)
                             copy_optimizer_param_metadata(main_param, param)
                             # Replace the optimizer params with the new fp32 copy.
                             param_group['params'][i] = main_param

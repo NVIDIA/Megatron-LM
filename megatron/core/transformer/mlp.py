@@ -172,6 +172,7 @@ class MLP(MegatronModule):
         ffn_hidden_size: Optional[int] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,
+        gtp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         """
         Args:
@@ -224,6 +225,7 @@ class MLP(MegatronModule):
             is_expert=is_expert,
             tp_comm_buffer_name="fc1",
             tp_group=tp_group,
+            gtp_group=gtp_group,
             stride=fc1_stride,
             name=(name + ".linear_fc1") if name is not None else None,
         )
@@ -247,6 +249,7 @@ class MLP(MegatronModule):
             tp_comm_buffer_name="fc2",
             tp_group=tp_group,
             name=(name + ".linear_fc2") if name is not None else None,
+            gtp_group=gtp_group,
         )
 
     def forward(
@@ -391,10 +394,23 @@ class MLP(MegatronModule):
         assert hasattr(
             pg_collection, 'tp'
         ), 'TP process group is required for MLP in TransformerLayer'
+
+        # Forward gtp_group so fc1/fc2 shard their weights (like attention / shared_experts).
+        # Only the non-fused MLP honors GTP; the TE op-fused variants (_make_fused_impl) build
+        # GEMMs straight from the weights without all-gathering shards, so fail fast on that combo.
+        gtp_group = getattr(pg_collection, 'gtp', None)
+        if hasattr(cls, '_make_fused_impl'):
+            assert gtp_group is None or gtp_group.size() == 1, (
+                f"{cls.__name__}: GTP sharding of the dense MLP is not supported with the "
+                "TE fused MLP / GroupedLinear path (_make_fused_impl ignores GTP shards). "
+                "Use the non-fused MLP submodule, or do not enable GTP for dense MLP layers."
+            )
+            gtp_group = None
         return cls(
             config=config,
             submodules=submodules,
             tp_group=pg_collection.tp,
+            gtp_group=gtp_group,
             is_expert=is_expert,
             input_size=input_size,
             ffn_hidden_size=ffn_hidden_size,

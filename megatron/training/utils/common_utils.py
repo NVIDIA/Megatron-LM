@@ -49,6 +49,35 @@ from megatron.core.utils import (
 from megatron.core.transformer.module import param_is_not_shared
 
 
+
+def _compute_norm_2(params_list):
+    """Compute squared L2 norm of a list of tensors. Returns a CUDA scalar."""
+    if len(params_list) > 0:
+        dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
+        norm, _ = multi_tensor_applier(
+            multi_tensor_l2norm, dummy_overflow_buf, [params_list], False,
+        )
+        return norm * norm
+    return torch.zeros((1,), dtype=torch.float32, device='cuda')
+
+
+def _get_param_data(param, force_create_fp32_copy, bf16):
+    """Extract the appropriate data tensor from a param for norm computation.
+
+    Returns (data_tensor, is_sharded) where is_sharded indicates the param has
+    a sharded main_param from the distributed optimizer.
+    """
+    if bf16:
+        if not force_create_fp32_copy and hasattr(param, 'main_param'):
+            if getattr(param, 'main_param_sharded', False):
+                if param.main_param is not None:
+                    return param.main_param, True
+                return None, True
+            return param.main_param, False
+        return param.data.float(), False
+    return param.data, False
+
+
 def calc_params_l2_norm(model, force_create_fp32_copy=False):
     """Calculate l2 norm of parameters"""
     args = get_args()
@@ -71,129 +100,106 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
 
         return calc_dtensor_params_l2_norm(params)
 
-    # Seperate moe and dense params
-    params_data = []
-    moe_params_data = []
-    sharded_params_data = []
-    data_parallel_group = None
+    # 8 buckets: 4 categories × (non-sharded, sharded optimizer main_param).
+    # Each category needs different reduction groups.
+    params_data = []                # Dense, non-sharded
+    sharded_params_data = []        # Dense, sharded → reduce over dp_cp
+    gtp_params_data = []            # GTP, non-sharded
+    gtp_sharded_params_data = []    # GTP, sharded → reduce over dp_cp_with_gtp
+    moe_params_data = []            # MoE, non-sharded
+    moe_sharded_params_data = []    # MoE, sharded → reduce over expert_dp
+    moe_gtp_params_data = []        # MoE-GTP, non-sharded
+    moe_gtp_sharded_params_data = []  # MoE-GTP, sharded → reduce over expert_dp_with_gtp
+
+    gtp_rank = mpu.get_generalized_tensor_parallel_remat_rank()
+    egtp_rank = mpu.get_expert_generalized_tensor_parallel_remat_rank()
 
     for model_chunk in model:
         for param in model_chunk.parameters():
-            data_parallel_group = get_data_parallel_group_if_dtensor(param, data_parallel_group)
-            is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param)
-            if not is_not_tp_duplicate:
+            is_gtp = getattr(param, 'is_gtp', False)
+
+            # Filter TP duplicates. GTP params are always unique across TP ranks
+            # so skip this check for them.
+            if not is_gtp and not param_is_not_tensor_parallel_duplicate(param):
                 continue
-            assert is_not_tp_duplicate
-            if not getattr(param, 'allreduce', True):
+            is_expert = not getattr(param, 'allreduce', True)
+
+            # Filter GTP duplicates: non-GTP params are replicated across GTP ranks.
+            if is_expert:
+                if not is_gtp and egtp_rank != 0:
+                    continue
+            else:
+                if not is_gtp and gtp_rank != 0:
+                    continue
+
+            # Route to the correct bucket.
+            if is_expert:
                 assert param_is_not_shared(param)
                 param = to_local_if_dtensor(param)
-                if args.bf16:
-                    if not force_create_fp32_copy and hasattr(param, 'main_param'):
-                        if getattr(param, 'main_param_sharded', False):
-                            if param.main_param is not None:
-                                sharded_params_data.append(param.main_param)
-                        else:
-                            moe_params_data.append(param.main_param)
-                    else:
-                        # Fallback to original logic of making a fp32 copy of the
-                        # parameter if `.main_param` attribute is not available.
-                        moe_params_data.append(param.data.float())
+                data, is_sharded = _get_param_data(param, force_create_fp32_copy, args.bf16)
+                if data is None:
+                    continue
+                if is_gtp:
+                    (moe_gtp_sharded_params_data if is_sharded else moe_gtp_params_data).append(data)
                 else:
-                    moe_params_data.append(param.data)
+                    (moe_sharded_params_data if is_sharded else moe_params_data).append(data)
             else:
                 if param_is_not_shared(param):
                     param = to_local_if_dtensor(param)
-                    if args.bf16:
-                        if not force_create_fp32_copy and hasattr(param, 'main_param'):
-                            if getattr(param, 'main_param_sharded', False):
-                                if param.main_param is not None:
-                                    sharded_params_data.append(param.main_param)
-                            else:
-                                params_data.append(param.main_param)
-                        else:
-                            # Fallback to original logic of making a fp32 copy of the
-                            # parameter if `.main_param` attribute is not available.
-                            params_data.append(param.data.float())
+                    data, is_sharded = _get_param_data(param, force_create_fp32_copy, args.bf16)
+                    if data is None:
+                        continue
+                    if is_gtp:
+                        (gtp_sharded_params_data if is_sharded else gtp_params_data).append(data)
                     else:
-                        params_data.append(param.data)
+                        (sharded_params_data if is_sharded else params_data).append(data)
 
-    # Calculate norm.
-    dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
-    if len(params_data) > 0:
-        norm, _ = multi_tensor_applier(
-            multi_tensor_l2norm, dummy_overflow_buf, [params_data], False  # no per-parameter norm.
-        )
-        norm_2 = norm * norm
-    else:
-        norm_2 = torch.zeros((1,), dtype=torch.float32, device='cuda')
+    # --- Compute local norm^2 for each bucket ---
+    params_norm_2 = _compute_norm_2(params_data)
+    sharded_norm_2 = _compute_norm_2(sharded_params_data)
+    gtp_norm_2 = _compute_norm_2(gtp_params_data)
+    gtp_sharded_norm_2 = _compute_norm_2(gtp_sharded_params_data)
+    moe_norm_2 = _compute_norm_2(moe_params_data)
+    moe_sharded_norm_2 = _compute_norm_2(moe_sharded_params_data)
+    moe_gtp_norm_2 = _compute_norm_2(moe_gtp_params_data)
+    moe_gtp_sharded_norm_2 = _compute_norm_2(moe_gtp_sharded_params_data)
 
-    if data_parallel_group is not None:
-        torch.distributed.all_reduce(
-            norm_2, op=torch.distributed.ReduceOp.SUM, group=data_parallel_group
-        )
+    def _sum_reduce(tensor, group):
+        torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM, group=group)
 
-    # Add norm contribution from params with sharded main_params. These norms need to be
-    # accumulated across the DP group since the main parameters are sharded because
-    # of distributed optimizer.
-    if len(sharded_params_data) > 0:
-        dummy_overflow_buf = torch.tensor([0], dtype=torch.int, device='cuda')
-        sharded_norm, _ = multi_tensor_applier(
-            multi_tensor_l2norm,
-            dummy_overflow_buf,
-            [sharded_params_data],
-            False,  # no per-parameter norm.
-        )
-        sharded_norm_2 = sharded_norm * sharded_norm
-    else:
-        sharded_norm_2 = torch.zeros((1,), dtype=torch.float32, device='cuda')
-    # Sum over all DP groups, including CP since distributed optimizer state is
-    # sharded jointly over DP+CP.
-    torch.distributed.all_reduce(
-        sharded_norm_2,
-        op=torch.distributed.ReduceOp.SUM,
-        group=mpu.get_data_parallel_group(with_context_parallel=True)
-    )
-    norm_2 += sharded_norm_2
+    # --- Sharded optimizer DP reductions (each category uses its own group) ---
+    # Reduce over the gtp-EXCLUDED replicate group: the model-parallel reduce below already
+    # spans the gtp axis, so a gtp-inclusive group here would over-count by gtp. No-op for
+    # non-GTP runs (the with_gtp group aliases the regular DP group).
+    _sum_reduce(sharded_norm_2, mpu.get_data_parallel_group(with_context_parallel=True, with_gtp=True))
+    _sum_reduce(gtp_sharded_norm_2, mpu.get_data_parallel_group(with_context_parallel=True, with_gtp=True))
+    _sum_reduce(moe_sharded_norm_2, mpu.get_expert_data_parallel_group())
+    _sum_reduce(moe_gtp_sharded_norm_2, mpu.get_expert_data_parallel_group(with_gtp=True))
 
-    # Add norm contribution from expert layers in MoEs.
-    if len(moe_params_data) > 0:
-        moe_norm, _ = multi_tensor_applier(
-            multi_tensor_l2norm,
-            dummy_overflow_buf,
-            [moe_params_data],
-            False,  # no per-parameter norm.
-        )
-        moe_norm_2 = moe_norm * moe_norm
+    # --- Combine dense + GTP norms ---
+    # model_parallel group = TP×PP×GTP, so GTP reduction is implicit.
+    norm_2 = params_norm_2 + sharded_norm_2 + gtp_norm_2 + gtp_sharded_norm_2
 
-    # Account for MoE norm even if current rank doesn't have any expert params to prevent
-    # hang in models with un-even numbers of MoE layers.
-    # See details in https://gitlab-master.nvidia.com/ADLR/megatron-lm/-/issues/409
-    else:
-        moe_norm_2 = torch.zeros_like(norm_2)
+    # --- Combine MoE + MoE-GTP norms ---
+    # expert_model_parallel = TP×EP×PP (does NOT include EGTP), so we need
+    # an explicit EGTP reduction for MoE-GTP before the model-parallel reduce.
+    moe_gtp_combined_norm_2 = moe_gtp_norm_2 + moe_gtp_sharded_norm_2
+    _sum_reduce(moe_gtp_combined_norm_2, mpu.get_expert_generalized_tensor_parallel_remat_group())
+    moe_total_norm_2 = moe_norm_2 + moe_sharded_norm_2 + moe_gtp_combined_norm_2
 
-    # Reduce norm across model parallel groups (dense and expert).
-    # Dense params should sum across all model-parallel GPUs (tensor + pipeline).
+    # --- Model-parallel reductions ---
     dense_reduce_group = mpu.get_model_parallel_group()
-    ranks_in_dense_reduce_group = torch.distributed.get_process_group_ranks(dense_reduce_group)
-    # Expert params should sum across all model-parallel GPUs (expert + tensor + pipeline).
     expert_reduce_group = mpu.get_expert_tensor_model_pipeline_parallel_group()
+    ranks_in_dense_reduce_group = torch.distributed.get_process_group_ranks(dense_reduce_group)
     ranks_in_expert_reduce_group = torch.distributed.get_process_group_ranks(expert_reduce_group)
 
-    # If dense and expert reduce groups are the same, sum then reduce.
     if ranks_in_dense_reduce_group == ranks_in_expert_reduce_group:
-        norm_2 += moe_norm_2
-        torch.distributed.all_reduce(
-            norm_2, op=torch.distributed.ReduceOp.SUM, group=dense_reduce_group
-        )
-    # If dense and expert reduce groups are different, reduce then sum.
+        norm_2 += moe_total_norm_2
+        _sum_reduce(norm_2, dense_reduce_group)
     else:
-        torch.distributed.all_reduce(
-            norm_2, op=torch.distributed.ReduceOp.SUM, group=dense_reduce_group
-        )
-        torch.distributed.all_reduce(
-            moe_norm_2, op=torch.distributed.ReduceOp.SUM, group=expert_reduce_group
-        )
-        norm_2 += moe_norm_2
+        _sum_reduce(norm_2, dense_reduce_group)
+        _sum_reduce(moe_total_norm_2, expert_reduce_group)
+        norm_2 += moe_total_norm_2
 
     return norm_2.item() ** 0.5
 

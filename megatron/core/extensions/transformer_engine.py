@@ -381,6 +381,23 @@ def condition_init_method(config, init_method):
     return init_method if config.perform_initialization else (lambda w: None)
 
 
+def _maybe_setup_gtp(module, gtp_group, extra_kwargs):
+    """Wire an active GTP group (size > 1) into TE's extra_kwargs and set module.gtp_size.
+
+    No-op when GTP is inactive (gtp_group is None or size 1), so module.gtp_size stays unset.
+    """
+    if gtp_group is None or gtp_group.size() <= 1:
+        return
+    from megatron.experimental.gtp import HAVE_GTP
+
+    assert HAVE_GTP, (
+        "GTP requires TransformerEngine >= 2.17. "
+        "Set MEGATRON_GTP_FORCE_ENABLE=1 to bypass for custom TE builds."
+    )
+    module.gtp_size = get_pg_size(gtp_group)
+    extra_kwargs["gtp_group"] = gtp_group if torch.distributed.is_initialized() else None
+
+
 def split_te_layernorm_column_parallel_linear(
     fused_layer,
     config,
@@ -762,6 +779,7 @@ class TELinear(te.pytorch.Linear):
         symmetric_ar_type: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,
+        gtp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         """
         Args:
@@ -895,6 +913,7 @@ class TELinear(te.pytorch.Linear):
             self.te_quant_params, torch.is_grad_enabled()
         )
 
+        _maybe_setup_gtp(self, gtp_group, extra_kwargs)
         with init_quant_context:
             super().__init__(
                 in_features=input_size,
@@ -1004,6 +1023,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         skip_weight_param_allocation: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        gtp_group: Optional[torch.distributed.ProcessGroup] = None,
         stride: int = 1,
         name: str | None = None,
     ):
@@ -1101,6 +1121,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             ), "Must have at least TE version 2.3 or higher to use symmetric memory all reduce"
             extra_kwargs["symmetric_ar_type"] = self.config.symmetric_ar_type
 
+        _maybe_setup_gtp(self, gtp_group, extra_kwargs)
         self.stride = stride
 
         self.te_quant_params: Optional[TEQuantizationParams] = None
@@ -1216,7 +1237,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             f"in_features={self.in_features}, "
             f"out_features={self.out_features}, "
             f"bias={self.use_bias}, "
-            f"TP={self.tp_size}"
+            f"TP={self.tp_size}" + (f", GTP={self.gtp_size}" if hasattr(self, "gtp_size") else "")
         )
 
     def backward_dw(self):
@@ -1243,6 +1264,7 @@ class TEColumnParallelLinear(TELinear):
         skip_weight_param_allocation: bool = False,
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
+        gtp_group: Optional[torch.distributed.ProcessGroup] = None,
         stride: int = 1,
         name: str | None = None,
     ):
@@ -1282,6 +1304,7 @@ class TEColumnParallelLinear(TELinear):
             symmetric_ar_type=config.symmetric_ar_type,
             tp_group=tp_group,
             name=name,
+            gtp_group=gtp_group,
         )
 
         # Set proper partition_stride
@@ -1332,7 +1355,7 @@ class TEColumnParallelLinear(TELinear):
             f"in_features={self.in_features}, "
             f"out_features={self.out_features}, "
             f"bias={self.use_bias}, "
-            f"TP={self.tp_size}"
+            f"TP={self.tp_size}" + (f", GTP={self.gtp_size}" if hasattr(self, "gtp_size") else "")
         )
 
     def backward_dw(self):
@@ -1488,6 +1511,7 @@ class TERowParallelLinear(TELinear):
         tp_comm_buffer_name: Optional[str] = None,
         tp_group: Optional[torch.distributed.ProcessGroup] = None,
         name: str | None = None,
+        gtp_group: Optional[torch.distributed.ProcessGroup] = None,
     ):
         """
         Args:
@@ -1525,6 +1549,7 @@ class TERowParallelLinear(TELinear):
             symmetric_ar_type=config.symmetric_ar_type,
             tp_group=tp_group,
             name=name,
+            gtp_group=gtp_group,
         )
         if config.use_cpu_initialization:
             world_size = get_pg_size(tp_group)
@@ -1571,7 +1596,7 @@ class TERowParallelLinear(TELinear):
             f"in_features={self.in_features}, "
             f"out_features={self.out_features}, "
             f"bias={self.use_bias}, "
-            f"TP={self.tp_size}"
+            f"TP={self.tp_size}" + (f", GTP={self.gtp_size}" if hasattr(self, "gtp_size") else "")
         )
 
     def backward_dw(self):
@@ -1973,6 +1998,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             self._tp_group = tp_group
             tp_size = get_pg_size(tp_group)
             tp_group_for_te = tp_group
+            gtp_group = pg_collection.expt_gtp
 
             self.explicit_expert_comm = is_expert and (tp_size > 1 or self.expert_parallel)
 
@@ -1992,6 +2018,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 tp_size = 1
                 tp_group_for_te = None
 
+            _maybe_setup_gtp(self, gtp_group, extra_kwargs)
             if is_te_min_version("2.14.0"):
                 extra_kwargs["single_grouped_weight"] = getattr(
                     config, "moe_single_grouped_weight", False
@@ -2390,6 +2417,16 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
             """
             if self.delay_wgrad_compute:
                 super().backward_dw()
+
+        def __repr__(self):
+            gtp_str = f", GTP={self.gtp_size}" if hasattr(self, "gtp_size") else ""
+            return (
+                f"{type(self).__name__}(per expert(["
+                f"in={self.in_features}, out={self.out_features}]) "
+                f"X num_gemms={self.num_gemms}, "
+                f"bias={self.use_bias}, TP={self.tp_size}"
+                f"{gtp_str})"
+            )
 
     class TEColumnParallelGroupedLinear(TEGroupedLinear):
         """
