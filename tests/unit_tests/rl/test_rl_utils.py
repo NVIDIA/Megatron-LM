@@ -167,123 +167,140 @@ class TestRLUtils:
         return args
 
     @pytest.mark.parametrize(
-        "rl_generation_batch_size, grpo_prompts_per_step, expected_enforce_order",
-        [
-            pytest.param(1, 1, False, id="group-submit-group-consume"),
-            pytest.param(1, 8, True, id="group-submit-batch-consume"),
-            pytest.param(4, 8, True, id="batch-submit-batch-consume"),
-        ],
-    )
-    def test_rl_generation_batch_size_validation(
-        self, rl_generation_batch_size, grpo_prompts_per_step, expected_enforce_order
-    ):
-        args = self.create_test_args(
-            perform_rl_step=True,
-            rl_partial_rollouts=True,
-            rl_generation_batch_size=rl_generation_batch_size,
-            grpo_prompts_per_step=grpo_prompts_per_step,
-        )
-
-        assert args.rl_enforce_generation_order is expected_enforce_order
-        assert args.rl_generation_batch_size == rl_generation_batch_size
-
-    @pytest.mark.parametrize(
-        "rl_submission_granularity, rl_consumption_granularity, "
-        "rl_generation_batch_size, grpo_prompts_per_step, "
-        "expected_generation_batch_size, expected_enforce_order, expected_warning",
+        "overrides, expected, expected_warning",
         [
             pytest.param(
-                RLRolloutGranularity.ROLLOUT,
-                RLRolloutGranularity.BATCH,
+                {"rl_generation_batch_size": 1, "grpo_prompts_per_step": 1},
+                {"rl_generation_batch_size": 1, "rl_enforce_generation_order": False},
                 None,
-                8,
-                1,
-                True,
+                id="legacy-group-submit-group-consume",
+            ),
+            pytest.param(
+                {"rl_generation_batch_size": 1, "grpo_prompts_per_step": 8},
+                {"rl_generation_batch_size": 1, "rl_enforce_generation_order": True},
+                None,
+                id="legacy-group-submit-batch-consume",
+            ),
+            pytest.param(
+                {"rl_generation_batch_size": 4, "grpo_prompts_per_step": 8},
+                {"rl_generation_batch_size": 4, "rl_enforce_generation_order": True},
+                None,
+                id="legacy-batch-submit-batch-consume",
+            ),
+            pytest.param(
+                {
+                    "rl_submission_granularity": RLRolloutGranularity.ROLLOUT,
+                    "rl_consumption_granularity": RLRolloutGranularity.BATCH,
+                    "grpo_prompts_per_step": 8,
+                },
+                {"rl_generation_batch_size": 1, "rl_enforce_generation_order": True},
                 None,
                 id="rollout-submit-batch-consume",
             ),
             pytest.param(
-                RLRolloutGranularity.ROLLOUT,
-                RLRolloutGranularity.GROUP,
-                None,
-                8,
-                1,
-                False,
+                {
+                    "rl_submission_granularity": RLRolloutGranularity.ROLLOUT,
+                    "rl_consumption_granularity": RLRolloutGranularity.GROUP,
+                    "grpo_prompts_per_step": 8,
+                },
+                {"rl_generation_batch_size": 1, "rl_enforce_generation_order": False},
                 None,
                 id="rollout-submit-group-consume",
             ),
             pytest.param(
-                RLRolloutGranularity.ROLLOUT,
-                RLRolloutGranularity.BATCH,
-                4,
-                8,
-                4,
-                True,
+                {
+                    "rl_submission_granularity": RLRolloutGranularity.ROLLOUT,
+                    "rl_consumption_granularity": RLRolloutGranularity.BATCH,
+                    "rl_generation_batch_size": 4,
+                    "grpo_prompts_per_step": 8,
+                },
+                {"rl_generation_batch_size": 4, "rl_enforce_generation_order": True},
                 None,
                 id="rollout-submission-keeps-generation-batch-size",
             ),
             pytest.param(
-                RLRolloutGranularity.BATCH,
-                RLRolloutGranularity.BATCH,
-                None,
-                8,
-                8,
-                True,
+                {
+                    "rl_submission_granularity": RLRolloutGranularity.BATCH,
+                    "rl_consumption_granularity": RLRolloutGranularity.BATCH,
+                    "grpo_prompts_per_step": 8,
+                },
+                {"rl_generation_batch_size": 8, "rl_enforce_generation_order": True},
                 None,
                 id="batch-submit-batch-consume",
             ),
             pytest.param(
-                RLRolloutGranularity.GROUP,
-                RLRolloutGranularity.BATCH,
-                None,
-                8,
-                1,
-                True,
+                {
+                    "rl_submission_granularity": RLRolloutGranularity.GROUP,
+                    "rl_consumption_granularity": RLRolloutGranularity.BATCH,
+                    "grpo_prompts_per_step": 8,
+                },
+                {"rl_generation_batch_size": 1, "rl_enforce_generation_order": True},
                 None,
                 id="group-submit-batch-consume",
             ),
             pytest.param(
-                RLRolloutGranularity.GROUP,
-                RLRolloutGranularity.GROUP,
-                None,
-                8,
-                1,
-                False,
+                {
+                    "rl_submission_granularity": RLRolloutGranularity.GROUP,
+                    "rl_consumption_granularity": RLRolloutGranularity.GROUP,
+                    "grpo_prompts_per_step": 8,
+                },
+                {"rl_generation_batch_size": 1, "rl_enforce_generation_order": False},
                 None,
                 id="group-submit-group-consume",
             ),
             pytest.param(
-                RLRolloutGranularity.GROUP,
-                RLRolloutGranularity.BATCH,
-                4,
-                8,
-                1,
-                True,
+                {
+                    "rl_submission_granularity": RLRolloutGranularity.GROUP,
+                    "rl_consumption_granularity": RLRolloutGranularity.BATCH,
+                    "rl_generation_batch_size": 4,
+                    "grpo_prompts_per_step": 8,
+                },
+                {"rl_generation_batch_size": 1, "rl_enforce_generation_order": True},
                 "overrides --rl-generation-batch-size",
                 id="group-submission-overrides-generation-batch-size",
             ),
             pytest.param(
-                RLRolloutGranularity.BATCH,
-                RLRolloutGranularity.BATCH,
-                1,
-                8,
-                8,
-                True,
+                {
+                    "rl_submission_granularity": RLRolloutGranularity.BATCH,
+                    "rl_consumption_granularity": RLRolloutGranularity.BATCH,
+                    "rl_generation_batch_size": 1,
+                    "grpo_prompts_per_step": 8,
+                },
+                {"rl_generation_batch_size": 8, "rl_enforce_generation_order": True},
                 "overrides --rl-generation-batch-size",
                 id="batch-submission-overrides-generation-batch-size",
             ),
+            pytest.param(
+                {"grpo_group_size": 4, "rl_num_parallel_generations": 12},
+                {"rl_parallel_generation_tasks": 3},
+                None,
+                id="num-parallel-generations-group-slots",
+            ),
+            pytest.param(
+                {
+                    "rl_submission_granularity": RLRolloutGranularity.ROLLOUT,
+                    "grpo_group_size": 4,
+                    "rl_num_parallel_generations": 10,
+                },
+                {"rl_parallel_generation_tasks": 10},
+                None,
+                id="num-parallel-generations-rollout-slots",
+            ),
+            pytest.param(
+                {
+                    "rl_submission_granularity": RLRolloutGranularity.ROLLOUT,
+                    "grpo_group_size": 4,
+                    "grpo_prompts_per_step": 8,
+                    "rl_generation_batch_size": 2,
+                    "rl_num_parallel_generation_batches": 3,
+                },
+                {"rl_parallel_generation_tasks": 24},
+                None,
+                id="num-parallel-generation-batches-rollout-slots",
+            ),
         ],
     )
-    def test_rl_explicit_granularity_validation(
-        self,
-        rl_submission_granularity,
-        rl_consumption_granularity,
-        rl_generation_batch_size,
-        grpo_prompts_per_step,
-        expected_generation_batch_size,
-        expected_enforce_order,
-        expected_warning,
-    ):
+    def test_rl_granularity_validation(self, overrides, expected, expected_warning):
         context = (
             pytest.warns(UserWarning, match=expected_warning)
             if expected_warning
@@ -293,124 +310,23 @@ class TestRLUtils:
             args = self.create_test_args(
                 perform_rl_step=True,
                 rl_partial_rollouts=True,
-                rl_submission_granularity=rl_submission_granularity,
-                rl_consumption_granularity=rl_consumption_granularity,
-                rl_generation_batch_size=rl_generation_batch_size,
-                grpo_prompts_per_step=grpo_prompts_per_step,
+                **overrides,
             )
 
-        assert args.rl_generation_batch_size == expected_generation_batch_size
-        assert args.rl_enforce_generation_order is expected_enforce_order
-
-    def test_rl_rollout_submission_granularity_requires_partial_rollouts(self):
-        with pytest.raises(
-            AssertionError, match="requires streaming grouped rollouts"
-        ):
-            self.create_test_args(
-                perform_rl_step=True,
-                rl_partial_rollouts=False,
-                rl_submission_granularity=RLRolloutGranularity.ROLLOUT,
-            )
-
-    def test_rl_num_parallel_generations_keeps_existing_group_slot_behavior(self):
-        args = self.create_test_args(
-            perform_rl_step=True,
-            rl_partial_rollouts=True,
-            grpo_group_size=4,
-            rl_num_parallel_generations=12,
-        )
-
-        assert args.rl_parallel_generation_tasks == 3
-
-    def test_rl_rollout_submission_granularity_uses_rollout_slots(self):
-        args = self.create_test_args(
-            perform_rl_step=True,
-            rl_partial_rollouts=True,
-            rl_submission_granularity=RLRolloutGranularity.ROLLOUT,
-            grpo_group_size=4,
-            rl_num_parallel_generations=10,
-        )
-
-        assert args.rl_parallel_generation_tasks == 10
-
-    def test_rl_rollout_submission_granularity_expands_generation_batches_by_group_size(self):
-        args = self.create_test_args(
-            perform_rl_step=True,
-            rl_partial_rollouts=True,
-            rl_submission_granularity=RLRolloutGranularity.ROLLOUT,
-            grpo_group_size=4,
-            grpo_prompts_per_step=8,
-            rl_generation_batch_size=2,
-            rl_num_parallel_generation_batches=3,
-        )
-
-        assert args.rl_parallel_generation_tasks == 24
-
-    def test_rl_consumption_granularity_batch_keeps_enforced_order(self):
-        args = self.create_test_args(
-            perform_rl_step=True,
-            rl_partial_rollouts=True,
-            rl_submission_granularity=RLRolloutGranularity.ROLLOUT,
-            rl_consumption_granularity=RLRolloutGranularity.BATCH,
-            grpo_prompts_per_step=8,
-            rl_generation_batch_size=1,
-        )
-
-        assert args.rl_enforce_generation_order is True
-
-    def test_rl_consumption_granularity_group_relaxes_enforced_order(self):
-        args = self.create_test_args(
-            perform_rl_step=True,
-            rl_partial_rollouts=True,
-            rl_submission_granularity=RLRolloutGranularity.ROLLOUT,
-            rl_consumption_granularity=RLRolloutGranularity.GROUP,
-            grpo_prompts_per_step=8,
-            rl_generation_batch_size=1,
-        )
-
-        assert args.rl_enforce_generation_order is False
-
-    def test_rl_consumption_granularity_group_rejects_batch_submission(self):
-        with pytest.raises(AssertionError, match="does not support batch submission"):
-            self.create_test_args(
-                perform_rl_step=True,
-                rl_partial_rollouts=True,
-                rl_consumption_granularity=RLRolloutGranularity.GROUP,
-                rl_generation_batch_size=4,
-                grpo_prompts_per_step=8,
-            )
-
-    @pytest.mark.parametrize(
-        "rl_generation_batch_size, grpo_prompts_per_step, error",
-        [
-            pytest.param(
-                4,
-                10,
-                "must be divisible by --rl-generation-batch-size",
-                id="partial-generation-batch",
-            ),
-            pytest.param(
-                0,
-                8,
-                "--rl-generation-batch-size must be positive",
-                id="nonpositive-generation-batch",
-            ),
-        ],
-    )
-    def test_rl_generation_batch_size_validation_errors(
-        self, rl_generation_batch_size, grpo_prompts_per_step, error
-    ):
-        with pytest.raises(AssertionError, match=error):
-            self.create_test_args(
-                perform_rl_step=True,
-                rl_partial_rollouts=True,
-                rl_generation_batch_size=rl_generation_batch_size,
-                grpo_prompts_per_step=grpo_prompts_per_step,
-            )
+        for key, value in expected.items():
+            assert getattr(args, key) == value
 
     @pytest.mark.parametrize(
         "overrides, error",
         [
+            pytest.param(
+                {
+                    "rl_partial_rollouts": False,
+                    "rl_submission_granularity": RLRolloutGranularity.ROLLOUT,
+                },
+                "requires streaming grouped rollouts",
+                id="rollout-submission-requires-partial-rollouts",
+            ),
             pytest.param(
                 {
                     "rl_partial_rollouts": True,
@@ -448,9 +364,27 @@ class TestRLUtils:
                 "does not support batch submission",
                 id="group-consume-rejects-batch-submission",
             ),
+            pytest.param(
+                {
+                    "rl_partial_rollouts": True,
+                    "rl_generation_batch_size": 4,
+                    "grpo_prompts_per_step": 10,
+                },
+                "must be divisible by --rl-generation-batch-size",
+                id="partial-generation-batch",
+            ),
+            pytest.param(
+                {
+                    "rl_partial_rollouts": True,
+                    "rl_generation_batch_size": 0,
+                    "grpo_prompts_per_step": 8,
+                },
+                "--rl-generation-batch-size must be positive",
+                id="nonpositive-generation-batch",
+            ),
         ],
     )
-    def test_rl_explicit_granularity_validation_errors(self, overrides, error):
+    def test_rl_granularity_validation_errors(self, overrides, error):
         with pytest.raises(AssertionError, match=error):
             self.create_test_args(
                 perform_rl_step=True,
