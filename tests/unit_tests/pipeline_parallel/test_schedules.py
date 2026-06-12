@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -76,6 +77,120 @@ def test_deallocate_output_tensor():
     out = torch.tensor([[1, 2, 3], [4, 5, 6]])
     schedule.deallocate_output_tensor(out)
     assert out.nelement() == 6
+
+
+@pytest.mark.parametrize("calculate_per_token_loss,expected_scale", [(False, 6.0), (True, 3.0)])
+def test_dsa_indexer_loss_scale_matches_schedule_cp_scaling(
+    calculate_per_token_loss, expected_scale
+):
+    from megatron.core.transformer.experimental_attention_variant.dsa import (
+        DSAIndexerLossAutoScaler,
+    )
+
+    config = SimpleNamespace(
+        calculate_per_token_loss=calculate_per_token_loss,
+        experimental_attention_variant_loss_scale_func=DSAIndexerLossAutoScaler.set_loss_scale,
+        experimental_attention_variant='dsa',
+        grad_scale_func=lambda tensor: tensor * 3.0,
+        num_moe_experts=None,
+        mtp_num_layers=None,
+        timers=None,
+    )
+    forward_data_store = []
+
+    def loss_func(output_tensor):
+        return output_tensor.clone(), torch.tensor(4), {'loss_reduced': output_tensor.detach()}
+
+    DSAIndexerLossAutoScaler.main_loss_backward_scale = None
+    schedule.forward_step_calc_loss(
+        model=None,
+        output_tensor=torch.tensor(8.0),
+        loss_func=loss_func,
+        config=config,
+        vp_stage=None,
+        collect_non_loss_data=False,
+        num_microbatches=2,
+        forward_data_store=forward_data_store,
+        cp_group_size=4,
+        is_last_stage=True,
+    )
+
+    torch.testing.assert_close(
+        DSAIndexerLossAutoScaler.main_loss_backward_scale, torch.tensor([expected_scale])
+    )
+
+
+def test_dsa_indexer_loss_scale_accepts_dict_output_tensor():
+    from megatron.core.transformer.experimental_attention_variant.dsa import (
+        DSAIndexerLossAutoScaler,
+    )
+
+    config = SimpleNamespace(
+        calculate_per_token_loss=True,
+        experimental_attention_variant_loss_scale_func=DSAIndexerLossAutoScaler.set_loss_scale,
+        experimental_attention_variant='dsa',
+        grad_scale_func=lambda tensor: tensor * 5.0,
+        num_moe_experts=None,
+        mtp_num_layers=None,
+        timers=None,
+    )
+
+    forward_data_store = []
+
+    DSAIndexerLossAutoScaler.main_loss_backward_scale = None
+    schedule.forward_step_calc_loss(
+        model=None,
+        output_tensor={'loss': torch.tensor(8.0)},
+        loss_func=None,
+        config=config,
+        vp_stage=None,
+        collect_non_loss_data=False,
+        num_microbatches=2,
+        forward_data_store=forward_data_store,
+        cp_group_size=4,
+        is_last_stage=True,
+    )
+
+    assert len(forward_data_store) == 1
+    torch.testing.assert_close(forward_data_store[0]['loss'], torch.tensor(8.0))
+    torch.testing.assert_close(
+        DSAIndexerLossAutoScaler.main_loss_backward_scale, torch.tensor([5.0])
+    )
+
+
+def test_dsa_indexer_loss_scale_defaults_from_variant_without_mutating_config():
+    from megatron.core.transformer.experimental_attention_variant.dsa import (
+        DSAIndexerLossAutoScaler,
+    )
+
+    config = SimpleNamespace(
+        calculate_per_token_loss=True,
+        experimental_attention_variant_loss_scale_func=None,
+        experimental_attention_variant='dsa',
+        grad_scale_func=lambda tensor: tensor * 7.0,
+        num_moe_experts=None,
+        mtp_num_layers=None,
+        timers=None,
+    )
+
+    DSAIndexerLossAutoScaler.main_loss_backward_scale = None
+    schedule.forward_step_calc_loss(
+        model=None,
+        output_tensor=torch.tensor(8.0),
+        loss_func=None,
+        config=config,
+        vp_stage=None,
+        collect_non_loss_data=False,
+        num_microbatches=2,
+        forward_data_store=[],
+        cp_group_size=4,
+        is_last_stage=True,
+    )
+
+    assert config.experimental_attention_variant_loss_scale_func is None
+    torch.testing.assert_close(
+        DSAIndexerLossAutoScaler.main_loss_backward_scale, torch.tensor([7.0])
+    )
 
 
 @pytest.mark.internal
