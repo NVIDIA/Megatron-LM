@@ -1,0 +1,40 @@
+# Transformer module (attention, mlp, moe, layers, blocks, cuda_graphs).
+#
+# Test imports traced:
+#   fp8_param           → transformer.cuda_graphs
+#   pipeline_parallel   → transformer.enums, config, block, multi_token_prediction
+#   models              → transformer.config, enums, mlp, module, spec_utils
+#   ckpt*               → transformer.config, spec_utils, block, enums, mlp, moe.*
+#   transformer*        → transformer.* (heavily)
+#   distributed_fsdp    → transformer.TransformerConfig, MegatronModule, moe.moe_layer
+#   distributed         → transformer.TransformerConfig, MegatronModule
+#   a2a_overlap         → transformer modules
+#   export              → transformer.transformer_config
+#   extension           → transformer
+#   fusions             → transformer
+#   resharding          → transformer.cuda_graphs
+#   rl                  → transformer
+#   ssm                 → transformer.*
+#   tensor_parallel     → transformer.transformer_config
+#   core_unit           → test_imports.py, test_muon_optimizer.py
+test_buckets:
+  - fp8_param
+  - pipeline_parallel
+  - models
+  - ckpt
+  - ckpt_optimizer
+  - ckpt_models
+  - ckpt_moe_experts
+  - transformer
+  - transformer_moe
+  - distributed
+  - distributed_fsdp
+  - a2a_overlap
+  - export
+  - extension
+  - fusions
+  - resharding
+  - rl
+  - ssm
+  - tensor_parallel
+  - core_unit

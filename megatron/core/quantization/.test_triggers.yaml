@@ -1,0 +1,11 @@
+# Quantization module (quant_config, utils).
+#
+# Test imports traced:
+#   transformer*  → quantization.quant_config (GlobMatcher, RecipeConfig)
+#   models        → quantization.quant_config (MatchContext, RecipeConfig)
+#   extension     → quantization (test_kitchen_sdpa.py)
+test_buckets:
+  - transformer
+  - transformer_moe
+  - models
+  - extension

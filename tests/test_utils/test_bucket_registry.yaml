@@ -1,0 +1,52 @@
+# =============================================================================
+# Test Bucket Registry
+# =============================================================================
+#
+# Maps logical bucket names to actual test_case glob patterns from
+# tests/test_utils/recipes/h100/unit-tests.yaml (and gb200/unit-tests.yaml).
+#
+# These bucket names are referenced by .test_triggers.yaml files distributed
+# across the repository.  The consuming CI script uses this registry to
+# translate bucket names into the concrete test_case values it passes to
+# run_ci_test.sh --bucket.
+#
+# Special values recognised in .test_triggers.yaml files:
+#   ALL  - run every bucket listed here
+#   NONE - run no buckets (documentation-only changes)
+#
+# NOTE: Some buckets are supersets of others (e.g. ckpt includes ckpt_optimizer,
+# distributed includes distributed_fsdp).  The CI script should deduplicate
+# test files when multiple overlapping buckets are triggered.
+# =============================================================================
+
+buckets:
+  # --- Existing named buckets ---
+  model_configs:     "tests/unit_tests/test_model_configs.py"
+  fp8_param:         "tests/unit_tests/test_fp8_param.py"
+  pipeline_parallel: "tests/unit_tests/pipeline_parallel/**/*.py"
+  models:            "tests/unit_tests/models/**/*.py"
+  data:              "tests/unit_tests/data/**/*.py"
+  ckpt:              "tests/unit_tests/dist_checkpointing/**/*.py"
+  ckpt_optimizer:    "tests/unit_tests/dist_checkpointing/test_optimizer.py"
+  ckpt_models:       "tests/unit_tests/dist_checkpointing/models/**/*.py"
+  ckpt_moe_experts:  "tests/unit_tests/dist_checkpointing/models/test_moe_experts.py"
+  transformer:       "tests/unit_tests/transformer/**/*.py"
+  transformer_moe:   "tests/unit_tests/transformer/moe/**/*.py"
+  distributed:       "tests/unit_tests/distributed/**/*.py"
+  distributed_fsdp:  "tests/unit_tests/distributed/megatron_fsdp/**/*.py"
+
+  # --- Granular buckets (formerly lumped into catch_all) ---
+  a2a_overlap:       "tests/unit_tests/a2a_overlap/**/*.py"
+  export:            "tests/unit_tests/export/**/*.py"
+  extension:         "tests/unit_tests/extension/**/*.py"
+  fusions:           "tests/unit_tests/fusions/**/*.py"
+  inference:         "tests/unit_tests/inference/**/*.py"
+  optimizer:         "tests/unit_tests/optimizer/**/*.py"
+  post_training:     "tests/unit_tests/post_training/**/*.py"
+  resharding:        "tests/unit_tests/resharding/**/*.py"
+  rl:                "tests/unit_tests/rl/**/*.py"
+  ssm:               "tests/unit_tests/ssm/**/*.py"
+  tensor_parallel:   "tests/unit_tests/tensor_parallel/**/*.py"
+  tokenizers:        "tests/unit_tests/tokenizers/**/*.py"
+  utils:             "tests/unit_tests/utils/**/*.py"
+  core_unit:         "tests/unit_tests/test_*.py"

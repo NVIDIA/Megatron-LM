@@ -1,0 +1,17 @@
+# Pipeline parallel module (schedules, p2p_communication, utils).
+#
+# Test imports traced:
+#   pipeline_parallel → pipeline_parallel.* (schedules, p2p, bridge, etc.)
+#   transformer*      → pipeline_parallel.schedules (set_current_microbatch)
+#   distributed_fsdp  → pipeline_parallel.schedules
+#   a2a_overlap       → pipeline_parallel utilities
+#   export            → pipeline_parallel.schedules (get_forward_backward_func)
+#   rl                → pipeline_parallel
+test_buckets:
+  - pipeline_parallel
+  - transformer
+  - transformer_moe
+  - distributed_fsdp
+  - a2a_overlap
+  - export
+  - rl
