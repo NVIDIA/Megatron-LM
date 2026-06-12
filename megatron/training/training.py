@@ -190,7 +190,7 @@ try:
 except ImportError:
     HAVE_FSDP2 = False
 
-from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper
+from megatron.core.datasets.data_schedule import HybridCPDataLoaderWrapper, wrap_data_iterator
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
@@ -202,7 +202,7 @@ from megatron.core.parallel_state import (
     destroy_global_memory_buffer,
     destroy_model_parallel,
     get_context_parallel_group,
-    get_hybrid_data_context_parallel_groups,
+    get_dynamic_data_context_parallel_groups,
     update_pg_timeout,
 )
 from megatron.core.rerun_state_machine import (
@@ -2155,7 +2155,7 @@ def dummy_train_step(data_iterator):
                 batch,
                 is_hybrid_cp=is_hybrid_cp,
                 cp_group=get_context_parallel_group(),
-                hybrid_cp_group_func=get_hybrid_data_context_parallel_groups,
+                hybrid_cp_group_func=get_dynamic_data_context_parallel_groups,
             )
 
 
@@ -2228,11 +2228,24 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             enable_tokens_per_expert_logging(model, args.save)
         if save_dgrads_in_this_iteration:
             enable_dgrad_logging(model, args.save)
+        if config.sequence_packing_scheduler is not None:
+            # Dynamic-CP / sequence packing (dev feature): produce the per-step packed
+            # iterator and recompute num_microbatches. wrap_data_iterator returns a
+            # RerunDataIterator-compatible iterator so the rerun-state-machine validation
+            # in should_run_forward_backward() above continues to hold.
+            (
+                data_iterator,
+                num_microbatches,
+                _,
+                _,
+            ) = wrap_data_iterator(data_iterator, config, get_num_microbatches())
+        else:
+            num_microbatches = get_num_microbatches()
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
             model=model,
-            num_microbatches=get_num_microbatches(),
+            num_microbatches=num_microbatches,
             seq_length=args.seq_length,
             micro_batch_size=args.micro_batch_size,
             decoder_seq_length=args.decoder_seq_length,
@@ -2588,7 +2601,10 @@ def training_log(
 
     # Log MTP metrics.
     if args.mtp_num_layers is not None:
-        mtp_loss_scale = 1 / get_num_microbatches()
+        # MTP tracker stores raw loss sums and token counts, so after reduction
+        # tracker["values"] already equals the per-token loss (loss_sum / num_tokens)
+        # aggregated across all ranks and microbatches. No further scaling needed.
+        mtp_loss_scale = 1.0
         MTPLossLoggingHelper.track_mtp_metrics(
             mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
         )
@@ -2602,6 +2618,8 @@ def training_log(
             writer=writer,
             wandb_writer=wandb_writer,
             total_loss_dict=total_loss_dict,
+            num_layers=args.num_layers + (args.mtp_num_layers or 0),
+            csa_compress_ratios=args.csa_compress_ratios,
         )
 
     # Dump memory snapshot and print metrics to stdout.
@@ -3175,9 +3193,6 @@ def train(
 
     energy_monitor = get_energy_monitor()
     one_logger = get_one_logger()
-
-    if args.dynamic_context_parallel:
-        train_data_iterator = iter(HybridCPDataLoaderWrapper(train_data_iterator, config))
 
     if args.run_workload_inspector_server:
         try:
