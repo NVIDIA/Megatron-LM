@@ -217,8 +217,12 @@ class DistributedDataParallelConfig:
 
     megatron_fsdp_prefetch_recompute_forward_weights: bool = False
     """If set to True, Megatron-FSDP prefetches rowwise weights needed by activation
-      recomputation during backward before prefetching backward transpose weights. This
-      also caches parameter bucket views to reduce repeated Python-side view setup.
+      recomputation during backward before prefetching backward transpose weights.
+    """
+
+    megatron_fsdp_cache_param_bucket_views: bool = False
+    """If set to True, Megatron-FSDP caches parameter bucket views to reduce repeated
+      Python-side view setup when attaching module parameters to all-gather buckets.
     """
 
     megatron_fsdp_cuda_graph_mode: bool = False
@@ -258,6 +262,11 @@ class DistributedDataParallelConfig:
                 "megatron_fsdp_prefetch_recompute_forward_weights is only supported with "
                 "data_parallel_sharding_strategy='optim_grads_params'."
             )
+
+        if self.megatron_fsdp_cache_param_bucket_views:
+            assert (
+                self.use_megatron_fsdp
+            ), "megatron_fsdp_cache_param_bucket_views requires use_megatron_fsdp."
 
         if self.nccl_ub and not is_torch_min_version("2.11.0a0"):
             if 'expandable_segments:True' in os.getenv('PYTORCH_CUDA_ALLOC_CONF', '').split(','):

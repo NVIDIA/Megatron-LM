@@ -1297,6 +1297,9 @@ def validate_args(args, defaults={}):
         assert not args.megatron_fsdp_prefetch_recompute_forward_weights, (
             "--megatron-fsdp-prefetch-recompute-forward-weights requires " "--use-megatron-fsdp."
         )
+        assert not args.megatron_fsdp_cache_param_bucket_views, (
+            "--megatron-fsdp-cache-param-bucket-views requires " "--use-megatron-fsdp."
+        )
 
     if args.nccl_ub and args.use_megatron_fsdp:
         # In Megatron-LM, required implementation for manual registration is already provided.
@@ -4906,8 +4909,17 @@ def _add_experimental_args(parser):
         help=(
             'If set, Megatron-FSDP prefetches rowwise weights needed by activation '
             'recomputation during backward before prefetching backward transpose '
-            'weights. This also caches parameter bucket views to reduce repeated '
-            'Python-side view setup.'
+            'weights.'
+        ),
+    )
+    group.add_argument(
+        '--megatron-fsdp-cache-param-bucket-views',
+        action='store_true',
+        default=False,
+        dest='megatron_fsdp_cache_param_bucket_views',
+        help=(
+            'If set, Megatron-FSDP caches parameter bucket views to reduce repeated '
+            'Python-side view setup when attaching module parameters to all-gather buckets.'
         ),
     )
     group.add_argument(

@@ -157,8 +157,12 @@ class DistributedDataParallelConfig:
 
     megatron_fsdp_prefetch_recompute_forward_weights: bool = False
     """If set to True, Megatron-FSDP prefetches rowwise weights needed by activation
-      recomputation during backward before prefetching backward transpose weights. This
-      also caches parameter bucket views to reduce repeated Python-side view setup.
+      recomputation during backward before prefetching backward transpose weights.
+    """
+
+    megatron_fsdp_cache_param_bucket_views: bool = False
+    """If set to True, Megatron-FSDP caches parameter bucket views to reduce repeated
+      Python-side view setup when attaching module parameters to all-gather buckets.
     """
 
     megatron_fsdp_cuda_graph_mode: bool = False
