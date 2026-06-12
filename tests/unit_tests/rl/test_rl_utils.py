@@ -346,6 +346,40 @@ class TestRLUtils:
 
         assert args.rl_parallel_generation_tasks == 24
 
+    def test_rl_consumption_granularity_batch_keeps_enforced_order(self):
+        args = self.create_test_args(
+            perform_rl_step=True,
+            rl_partial_rollouts=True,
+            rl_submission_granularity=RLRolloutGranularity.ROLLOUT,
+            rl_consumption_granularity=RLRolloutGranularity.BATCH,
+            grpo_prompts_per_step=8,
+            rl_generation_batch_size=1,
+        )
+
+        assert args.rl_enforce_generation_order is True
+
+    def test_rl_consumption_granularity_group_relaxes_enforced_order(self):
+        args = self.create_test_args(
+            perform_rl_step=True,
+            rl_partial_rollouts=True,
+            rl_submission_granularity=RLRolloutGranularity.ROLLOUT,
+            rl_consumption_granularity=RLRolloutGranularity.GROUP,
+            grpo_prompts_per_step=8,
+            rl_generation_batch_size=1,
+        )
+
+        assert args.rl_enforce_generation_order is False
+
+    def test_rl_consumption_granularity_group_rejects_batch_submission(self):
+        with pytest.raises(AssertionError, match="does not support batch submission"):
+            self.create_test_args(
+                perform_rl_step=True,
+                rl_partial_rollouts=True,
+                rl_consumption_granularity=RLRolloutGranularity.GROUP,
+                rl_generation_batch_size=4,
+                grpo_prompts_per_step=8,
+            )
+
     @pytest.mark.parametrize(
         "rl_generation_batch_size, grpo_prompts_per_step, error",
         [
