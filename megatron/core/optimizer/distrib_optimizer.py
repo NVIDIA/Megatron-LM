@@ -397,6 +397,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         tensor_parallel.copy_tensor_model_parallel_attributes(
                             shard_model_param, model_param
                         )
+                        tensor_parallel.copy_gtp_attributes(shard_model_param, model_param)
                         copy_optimizer_param_metadata(shard_model_param, model_param)
 
                     # Generate main param.
@@ -428,6 +429,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         tensor_parallel.copy_tensor_model_parallel_attributes(
                             shard_main_param, model_param
                         )
+                        tensor_parallel.copy_gtp_attributes(shard_main_param, model_param)
                         copy_optimizer_param_metadata(shard_main_param, model_param)
                     else:
                         # When using precision-aware optimizer, main params are held by FusedAdam.
@@ -450,6 +452,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     tensor_parallel.copy_tensor_model_parallel_attributes(
                         shard_model_param, model_param
                     )
+                    tensor_parallel.copy_gtp_attributes(shard_model_param, model_param)
                     copy_optimizer_param_metadata(shard_model_param, model_param)
 
                 else:

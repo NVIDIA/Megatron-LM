@@ -378,6 +378,12 @@ def _gtp_slice_one_param(param, gtp_group, *, name="<unnamed>"):
     shard = tensor[gtp_rank * shard_size : (gtp_rank + 1) * shard_size]
     gtp_shard = GTPShardedParam(shard.clone())
     gtp_shard.pad_length = pad_length
+    # Preserve the source weight's tensor-model-parallel attributes (dropped when wrapping
+    # into GTPShardedParam). GTP only shards TP-parallel linears, so this keeps the param
+    # correctly classified by param_is_not_tensor_parallel_duplicate without GTP-specific code.
+    from megatron.core.tensor_parallel import copy_tensor_model_parallel_attributes
+
+    copy_tensor_model_parallel_attributes(gtp_shard, param)
     return gtp_shard
 
 

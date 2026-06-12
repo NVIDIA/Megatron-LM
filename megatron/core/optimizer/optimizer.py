@@ -37,7 +37,6 @@ except ImportError:
         multi_tensor_applier = local_multi_tensor_applier
         multi_tensor_scale_impl = local_multi_tensor_scale
 
-
 from .. import parallel_state, tensor_parallel
 from ..config_logger import has_config_logger_enabled, log_config_to_disk
 from ..dist_checkpointing.mapping import ShardedStateDict
@@ -129,12 +128,6 @@ def copy_optimizer_param_metadata(destination: torch.Tensor, source: torch.Tenso
         destination.shared = source.shared
     if hasattr(source, GRAD_NORM_GROUP_ATTR):
         setattr(destination, GRAD_NORM_GROUP_ATTR, getattr(source, GRAD_NORM_GROUP_ATTR))
-    # GTP/expert tags so get_main_grads_for_grad_norm dedups the shards correctly
-    # (is_gtp: shard vs replicated; allreduce: dense/expert axis). Without these, GTP
-    # shards are dropped and the grad-norm under-counts.
-    for attr in ('is_gtp', 'allreduce'):
-        if hasattr(source, attr):
-            setattr(destination, attr, getattr(source, attr))
 
 
 class MegatronOptimizer(ABC):
@@ -193,8 +186,6 @@ class MegatronOptimizer(ABC):
           - should not be a replica due to (expert) generalized tensor parallelism.
         """
         grads_for_norm = []
-        gtp_rank = parallel_state.get_generalized_tensor_parallel_remat_rank()
-        egtp_rank = parallel_state.get_expert_generalized_tensor_parallel_remat_rank()
         for param in params:
             if param_filter is not None and not param_filter(param):
                 continue
@@ -218,22 +209,10 @@ class MegatronOptimizer(ABC):
                 grad = param.grad
             grad_not_none = grad is not None
             is_not_shared = param_is_not_shared(param)
-
-            is_gtp_param = getattr(param, 'is_gtp', False)
-
-            # GTP params are always unique across TP ranks (tensor_model_parallel
-            # attribute is lost during wrap_gtp_sharded_tensor), so skip TP filter.
-            is_not_tp_duplicate = is_gtp_param or (
-                tensor_parallel.param_is_not_tensor_parallel_duplicate(
-                    param, getattr(self, 'tp_group', None)
-                )
+            is_not_tp_duplicate = tensor_parallel.param_is_not_tensor_parallel_duplicate(
+                param, getattr(self, 'tp_group', None)
             )
-
-            # GTP/EGTP-duplicate filter: keep gtp/egtp-sharded params on every rank; count
-            # replicated (non-GTP) params only once (rank 0 of the gtp/egtp axis). When GTP is
-            # inactive gtp_rank/egtp_rank are 0, so this keeps every param.
-            is_expert = not getattr(param, 'allreduce', True)
-            is_not_gtp_duplicate = is_gtp_param or (egtp_rank if is_expert else gtp_rank) == 0
+            is_not_gtp_duplicate = tensor_parallel.param_is_not_gtp_duplicate(param)
 
             if grad_not_none and is_not_shared and is_not_tp_duplicate and is_not_gtp_duplicate:
                 grads_for_norm.append(grad)
@@ -390,7 +369,6 @@ class MegatronOptimizer(ABC):
     def count_zeros(self) -> float:
         """Count number of zeros in model's gradients."""
         params = self.get_parameters()
-        use_dist_opt = hasattr(self, 'ddp_config') and self.ddp_config.use_distributed_optimizer
         return count_zeros_fp32(
             params,
             grad_stats_parallel_group=self.get_grad_stats_parallel_group(),
@@ -401,7 +379,6 @@ class MegatronOptimizer(ABC):
                 and getattr(params[0], "__fsdp_param__", False)
             ),
             tp_group=getattr(self, 'tp_group', None),
-            use_distributed_optimizer=use_dist_opt,
         )
 
     @abstractmethod
@@ -847,11 +824,9 @@ class Float16OptimizerWithFloat16Params(MixedPrecisionOptimizer):
                             float16_params_this_group.append(param)
                             # Create a copy
                             main_param = param.detach().clone().float()
-                            main_param.is_gtp = getattr(param, 'is_gtp', False)
-                            # Mirror expert-tag for GTP-aware dedup (egtp_rank vs gtp_rank).
-                            main_param.allreduce = getattr(param, 'allreduce', True)
                             # Copy tensor model parallel attributes.
                             tensor_parallel.copy_tensor_model_parallel_attributes(main_param, param)
+                            tensor_parallel.copy_gtp_attributes(main_param, param)
                             copy_optimizer_param_metadata(main_param, param)
                             # Replace the optimizer params with the new fp32 copy.
                             param_group['params'][i] = main_param

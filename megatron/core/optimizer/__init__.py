@@ -347,13 +347,12 @@ def _get_param_groups(
                 param_override = None
 
             is_expert_parallel = not getattr(param, 'allreduce', True)
-            is_gtp = getattr(param, 'is_gtp', False)
 
             # Create config_tuple that is hash-able, and has a consistent ordering of the keys.
             param_override_tuple: tuple[tuple[str, Any], ...] | None = (
                 param_group_override_to_tuple(param_override)
             )
-            key = (param_override_tuple, is_expert_parallel, is_gtp)
+            key = (param_override_tuple, is_expert_parallel)
             if key not in params_map:
                 params_map[key] = []
             params_map[key].append(param)
@@ -372,7 +371,7 @@ def _get_param_groups(
     param_groups = []
     # Sort keys, None first.
     for key in sorted(params_key, key=lambda x: (x[0] is not None, x[0])):
-        param_override_tuple, is_expert_parallel, is_gtp = key
+        param_override_tuple, is_expert_parallel = key
         params = params_map[key] if key in params_map else []
         if param_override_tuple is None:
             param_override: ParamGroupOverride = {}
@@ -405,7 +404,6 @@ def _get_param_groups(
         param_group = {
             'params': params,
             'is_expert_parallel': is_expert_parallel,
-            'is_gtp': is_gtp,
             'default_config': uses_default_lr_schedule,
             **default_config,
             **param_override,  # keep **param_override last so that users can override other fields.
@@ -1170,7 +1168,7 @@ def get_megatron_optimizer(
     # Expert params (incl. EGTP shards): reduce over the egtp-EXCLUDED replicate group
     # (intra_expt_dp_with_egtp_group, which aliases the full expert-DP group when EGTP is
     # inactive). Backed by expert_parallel_buffers in DDP.
-    expert_param_groups, expert_buffers = _get_param_groups_and_buffers(
+    moe_param_groups, moe_buffers = _get_param_groups_and_buffers(
         model_chunks,
         model_chunk_offset=0,
         config=config,
@@ -1179,12 +1177,12 @@ def get_megatron_optimizer(
         buffer_name='expert_parallel_buffers',
     )
     if dump_param_to_param_group_map is not None:
-        for param_group in expert_param_groups:
+        for param_group in moe_param_groups:
             for param in param_group["params"]:
                 param_name = get_global_unique_param_name(model_chunks, param)
                 param_to_param_group[param_name] = param_group_id
             param_group_id += 1
-    if len(expert_param_groups) > 0:
+    if len(moe_param_groups) > 0:
         expt_model_parallel_rank = get_pg_rank(expt_tp_pp_group)
         # Pass Gloo process groups into optimizer only if needed. GTP shards over the
         # egtp-EXCLUDED replicate group (no Gloo path for it yet), matching the dense side.
@@ -1196,8 +1194,8 @@ def get_megatron_optimizer(
             _get_megatron_optimizer_based_on_param_groups(
                 config=config,
                 model_chunks=model_chunks,
-                param_groups=expert_param_groups,
-                per_model_buffers=expert_buffers,
+                param_groups=moe_param_groups,
+                per_model_buffers=moe_buffers,
                 model_parallel_group=expt_tp_pp_group,
                 data_parallel_group=main_expt_dp_group,
                 data_parallel_group_gloo=expt_data_parallel_group_gloo,

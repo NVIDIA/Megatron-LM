@@ -47,8 +47,7 @@ except ImportError:
         multi_tensor_scale_tensor_impl = None
 
 
-from .. import parallel_state
-from ..tensor_parallel import param_is_not_tensor_parallel_duplicate
+from ..tensor_parallel import param_is_not_gtp_duplicate, param_is_not_tensor_parallel_duplicate
 from ..transformer.module import param_is_not_shared
 from ..utils import get_data_parallel_group_if_dtensor, to_local_if_dtensor
 
@@ -202,15 +201,14 @@ def count_zeros_fp32(
     grad_stats_parallel_group: torch.distributed.ProcessGroup,
     use_decoupled_grad: bool = False,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
-    use_distributed_optimizer: bool = False,
 ) -> float:
     """Counts the number of zero values in the gradients of the given parameters.
 
     The count is performed in FP32. This method filters parameters to ensure
     gradients are not double-counted by checking if the gradient is not None,
-    the parameter is not shared, and the parameter is not a replica due
-    to tensor model parallelism. It also handles parameters managed by
-    Megatron FSDP specifically.
+    the parameter is not shared, and the parameter is not a replica due to
+    tensor model parallelism or (expert) generalized tensor parallelism. It also
+    handles parameters managed by Megatron FSDP specifically.
 
     Args:
         parameters (Union[List[torch.Tensor], torch.Tensor]): An iterable of
@@ -222,9 +220,6 @@ def count_zeros_fp32(
             Defaults to False.
         tp_group (ProcessGroup, optional): TP group for the TP-duplicate filter.
             Defaults to the default TP group.
-        use_distributed_optimizer (bool, optional): True when params are per-rank
-            sharded slices (skip GTP dedup); False when replicated (keep dedup,
-            else zeros get counted gtp_size times). Defaults to False.
 
     Returns:
         float: The total number of zeros in the gradients across the process group.
@@ -237,12 +232,10 @@ def count_zeros_fp32(
     #   - grad should not be none
     #   - parameter should not be shared
     #   - should not be a replica due to tensor model parallelism
-    #   - should not be a GTP duplicate (non-GTP params identical across GTP peers)
+    #   - should not be a replica due to (expert) generalized tensor parallelism
     total_num_zeros = torch.zeros(1, dtype=torch.int64, device='cuda')
     data_parallel_group = None
     use_megatron_fsdp = False
-    gtp_rank = parallel_state.get_generalized_tensor_parallel_remat_rank()
-    egtp_rank = parallel_state.get_expert_generalized_tensor_parallel_remat_rank()
     for param in parameters:
         grad_attr = "decoupled_grad" if use_decoupled_grad else "grad"
         grad_not_none = hasattr(param, grad_attr) and getattr(param, grad_attr) is not None
@@ -255,23 +248,8 @@ def count_zeros_fp32(
             total_num_zeros += num_zeros
             continue
         is_not_shared = param_is_not_shared(param)
-
-        is_gtp_param = getattr(param, 'is_gtp', False)
-        is_expert = not getattr(param, 'allreduce', True)
-
-        # GTP params lose the tensor_model_parallel attribute during sharding,
-        # so they're always unique across TP ranks — skip the TP-duplicate filter.
-        is_not_tp_duplicate = is_gtp_param or param_is_not_tensor_parallel_duplicate(
-            param, tp_group=tp_group
-        )
-
-        # GTP-duplicate filter: only needed for non-distributed optimizer.
-        # Expert params are replicated across the EGTP axis (not the GTP axis),
-        # so use egtp_rank for expert dedup and gtp_rank for dense dedup.
-        if use_distributed_optimizer:
-            is_not_gtp_duplicate = True
-        else:
-            is_not_gtp_duplicate = is_gtp_param or (egtp_rank if is_expert else gtp_rank) == 0
+        is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(param, tp_group=tp_group)
+        is_not_gtp_duplicate = param_is_not_gtp_duplicate(param)
         if grad_not_none and is_not_shared and is_not_tp_duplicate and is_not_gtp_duplicate:
             grad_obj = getattr(param, grad_attr)
             data_parallel_group = get_data_parallel_group_if_dtensor(grad_obj, data_parallel_group)

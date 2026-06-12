@@ -486,10 +486,8 @@ class RankGenerator(object):
         self.dp = dp
         self.pp = pp
         self.cp = cp
-        # gtp shards weights 1/gtp (ZeRO-3) AND carries distinct data per rank (like DP),
-        # so it is a genuine factor of world_size. ``gtp=1`` (the default) makes it a
-        # size-1 identity dim, so world_size and all rank groups are unchanged for
-        # non-GTP callers.
+        # gtp is a genuine world_size factor; gtp=1 (default) is a size-1 identity dim,
+        # leaving world_size and all rank groups unchanged for non-GTP callers.
         self.gtp = gtp
         self.rank_offset = rank_offset
         self.world_size = tp * dp * pp * cp * ep * gtp
@@ -554,19 +552,7 @@ class RankGenerator(object):
         return ranks
 
     def get_gtp_ranks(self, gtp_size: int):
-        """Get the generalized-tensor-parallel (GTP) weight-sharding groups.
-
-        GTP is ZeRO-3-style weight sharding: a weight is sharded ``1/gtp_size`` across the
-        group and its gradient is reduce-scattered over that same group. The shard groups
-        are simply ``get_ranks('gtp')`` (which returns singleton groups when
-        ``gtp_size == 1``).
-
-        Args:
-            gtp_size (int): number of weight shards per GTP group (``gtp_remat_size``).
-
-        Returns:
-            List[List[int]]: the GTP groups, each a list of ``gtp_size`` global ranks.
-        """
+        """Get the GTP weight-sharding groups (singletons when ``gtp_size == 1``)."""
         assert (
             self.gtp == gtp_size
         ), f"gtp axis size ({self.gtp}) != requested gtp_size ({gtp_size})"
@@ -798,6 +784,14 @@ def initialize_model_parallel(
     world_size: int = (
         local_world_size if local_world_size is not None else torch.distributed.get_world_size()
     )
+
+    # GTP requires a single distributed-optimizer instance: partial-distopt sharding of the
+    # data domain would need gtp-aware sizing. Assert early so all group builds below can
+    # assume one instance when GTP/EGTP is active.
+    assert not (
+        (gtp_remat_size > 1 or expert_gtp_remat_size > 1)
+        and num_distributed_optimizer_instances > 1
+    ), "GTP with num_distributed_optimizer_instances > 1 is not yet supported."
 
     # gtp counts toward model_size (it consumes its own ranks and carries distinct data),
     # so data_parallel_size becomes the gtp-EXCLUDED replicate degree.
@@ -1105,26 +1099,9 @@ def initialize_model_parallel(
             if rank in dp_cp_ranks:
                 _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP = group
 
-            if num_distributed_optimizer_instances > 1:
-                assert len(dp_cp_ranks) % num_distributed_optimizer_instances == 0, (
-                    f"replicate DP-CP size ({len(dp_cp_ranks)}) must be divisible by "
-                    f"num_distributed_optimizer_instances ({num_distributed_optimizer_instances})"
-                )
-                intra_partial_size = len(dp_cp_ranks) // num_distributed_optimizer_instances
-                for i in range(num_distributed_optimizer_instances):
-                    chunk = dp_cp_ranks[i * intra_partial_size : (i + 1) * intra_partial_size]
-                    intra_group = create_group(
-                        chunk,
-                        timeout=timeout,
-                        pg_options=get_nccl_options("intra_dp_cp_gtp", nccl_comm_cfgs),
-                        group_desc="INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP",
-                    )
-                    if rank in chunk:
-                        _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP = intra_group
-        if num_distributed_optimizer_instances == 1:
-            _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP = (
-                _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP
-            )
+        # GTP requires a single distributed-optimizer instance (asserted above), so the
+        # per-instance partial group is just the full replicate group.
+        _INTRA_PARTIAL_DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP = _DATA_PARALLEL_GROUP_WITH_CP_WITH_GTP
     else:
         # GTP inactive (gtp_remat_size == 1): the replicate groups alias the regular DP groups.
         _DATA_PARALLEL_GROUP_WITH_GTP = _DATA_PARALLEL_GROUP
@@ -1162,53 +1139,21 @@ def initialize_model_parallel(
             if rank in ranks:
                 _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS = hierarchical_groups
 
-    # Build the model-parallel groups.
-    # Model parallel includes TP, GTP, and PP. Since GTP overlaps with CP-DP (not in the
-    # RankGenerator), we build model parallel groups by merging 'tp-pp' groups across GTP peers.
+    # Build the model-parallel groups (TP × GTP × PP). gtp is a RankGenerator axis, so the
+    # 'tp-pp-gtp' token spans it directly; with gtp=1 it reduces to the plain tp-pp groups.
     global _MODEL_PARALLEL_GROUP
     global _MODEL_PARALLEL_GLOBAL_RANKS
     assert _MODEL_PARALLEL_GROUP is None, 'model parallel group is already initialized'
-    if gtp_remat_size == 1:
-        # No GTP — model parallel is just tp-pp
-        for ranks in decoder_rank_generator.get_ranks('tp-pp'):
-            group = create_group(
-                ranks,
-                timeout=timeout,
-                pg_options=get_nccl_options("mp", nccl_comm_cfgs),
-                group_desc="MODEL_PARALLEL_GROUP",
-            )
-            if rank in ranks:
-                _MODEL_PARALLEL_GROUP = group
-                _MODEL_PARALLEL_GLOBAL_RANKS = ranks
-    else:
-        # With GTP: merge tp-pp groups across GTP peers.
-        # Build a mapping from each rank to its tp-pp group.
-        tp_pp_groups = decoder_rank_generator.get_ranks('tp-pp')
-        rank_to_tp_pp = {}
-        for tp_pp_ranks in tp_pp_groups:
-            for r in tp_pp_ranks:
-                rank_to_tp_pp[r] = tp_pp_ranks
-
-        # For each set of GTP peers, union their tp-pp groups to form model parallel groups.
-        model_parallel_groups_set = set()
-        for gtp_ranks in decoder_rank_generator.get_gtp_ranks(gtp_remat_size):
-            # Merge tp-pp groups of all GTP peers
-            mp_ranks = []
-            for gtp_r in gtp_ranks:
-                mp_ranks.extend(rank_to_tp_pp[gtp_r])
-            mp_ranks = sorted(set(mp_ranks))
-            mp_key = tuple(mp_ranks)
-            if mp_key not in model_parallel_groups_set:
-                model_parallel_groups_set.add(mp_key)
-                group = create_group(
-                    list(mp_ranks),
-                    timeout=timeout,
-                    pg_options=get_nccl_options("mp", nccl_comm_cfgs),
-                    group_desc="MODEL_PARALLEL_GROUP",
-                )
-                if rank in mp_ranks:
-                    _MODEL_PARALLEL_GROUP = group
-                    _MODEL_PARALLEL_GLOBAL_RANKS = list(mp_ranks)
+    for ranks in decoder_rank_generator.get_ranks('tp-pp-gtp'):
+        group = create_group(
+            ranks,
+            timeout=timeout,
+            pg_options=get_nccl_options("mp", nccl_comm_cfgs),
+            group_desc="MODEL_PARALLEL_GROUP",
+        )
+        if rank in ranks:
+            _MODEL_PARALLEL_GROUP = group
+            _MODEL_PARALLEL_GLOBAL_RANKS = ranks
 
     # Build the tensor model-parallel groups.
     global _TENSOR_MODEL_PARALLEL_GROUP
@@ -1490,13 +1435,6 @@ def initialize_model_parallel(
     # FULL (egtp-inclusive) expert data-parallel token (mirrors dp_full_token). Expert
     # generator has cp=1, so the expert data domain spans gtp explicitly ('gtp-dp').
     expert_dp_full_token = "gtp-dp"
-    assert not (
-        (gtp_remat_size > 1 or expert_gtp_remat_size > 1)
-        and num_distributed_optimizer_instances > 1
-    ), (
-        "GTP with num_distributed_optimizer_instances > 1 is not yet supported "
-        "(partial-distopt sharding of the data domain needs gtp-aware sizing)."
-    )
     for ranks in expert_decoder_rank_generator.get_ranks(expert_dp_full_token):
         group = create_group(
             ranks,

@@ -381,6 +381,23 @@ def condition_init_method(config, init_method):
     return init_method if config.perform_initialization else (lambda w: None)
 
 
+def _maybe_setup_gtp(module, gtp_group, extra_kwargs):
+    """Wire an active GTP group (size > 1) into TE's extra_kwargs and set module.gtp_size.
+
+    No-op when GTP is inactive (gtp_group is None or size 1), so module.gtp_size stays unset.
+    """
+    if gtp_group is None or gtp_group.size() <= 1:
+        return
+    from megatron.experimental.gtp import HAVE_GTP
+
+    assert HAVE_GTP, (
+        "GTP requires TransformerEngine >= 2.17. "
+        "Set MEGATRON_GTP_FORCE_ENABLE=1 to bypass for custom TE builds."
+    )
+    module.gtp_size = get_pg_size(gtp_group)
+    extra_kwargs["gtp_group"] = gtp_group if torch.distributed.is_initialized() else None
+
+
 def split_te_layernorm_column_parallel_linear(
     fused_layer,
     config,
@@ -896,15 +913,7 @@ class TELinear(te.pytorch.Linear):
             self.te_quant_params, torch.is_grad_enabled()
         )
 
-        if gtp_group is not None and gtp_group.size() > 1:
-            from megatron.experimental.gtp import HAVE_GTP
-
-            assert HAVE_GTP, (
-                "GTP requires TransformerEngine >= 2.17. "
-                "Set MEGATRON_GTP_FORCE_ENABLE=1 to bypass for custom TE builds."
-            )
-            self.gtp_size = get_pg_size(gtp_group) if gtp_group is not None else 1
-            extra_kwargs["gtp_group"] = gtp_group if torch.distributed.is_initialized() else None
+        _maybe_setup_gtp(self, gtp_group, extra_kwargs)
         with init_quant_context:
             super().__init__(
                 in_features=input_size,
@@ -1112,16 +1121,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             ), "Must have at least TE version 2.3 or higher to use symmetric memory all reduce"
             extra_kwargs["symmetric_ar_type"] = self.config.symmetric_ar_type
 
-        if gtp_group is not None and gtp_group.size() > 1:
-            from megatron.experimental.gtp import HAVE_GTP
-
-            assert HAVE_GTP, (
-                "GTP requires TransformerEngine >= 2.17. "
-                "Set MEGATRON_GTP_FORCE_ENABLE=1 to bypass for custom TE builds."
-            )
-            self.gtp_size = get_pg_size(gtp_group) if gtp_group is not None else 1
-            extra_kwargs["gtp_group"] = gtp_group if torch.distributed.is_initialized() else None
-
+        _maybe_setup_gtp(self, gtp_group, extra_kwargs)
         self.stride = stride
 
         self.te_quant_params: Optional[TEQuantizationParams] = None
@@ -2018,17 +2018,7 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 tp_size = 1
                 tp_group_for_te = None
 
-            if gtp_group is not None and gtp_group.size() > 1:
-                from megatron.experimental.gtp import HAVE_GTP
-
-                assert HAVE_GTP, (
-                    "GTP requires TransformerEngine >= 2.17. "
-                    "Set MEGATRON_GTP_FORCE_ENABLE=1 to bypass for custom TE builds."
-                )
-                self.gtp_size = get_pg_size(gtp_group) if gtp_group is not None else 1
-                extra_kwargs["gtp_group"] = (
-                    gtp_group if torch.distributed.is_initialized() else None
-                )
+            _maybe_setup_gtp(self, gtp_group, extra_kwargs)
             if is_te_min_version("2.14.0"):
                 extra_kwargs["single_grouped_weight"] = getattr(
                     config, "moe_single_grouped_weight", False

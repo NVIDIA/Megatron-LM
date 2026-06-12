@@ -16,6 +16,8 @@ from typing_extensions import override
 
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.parallel_state import (
+    get_expert_generalized_tensor_parallel_remat_rank,
+    get_generalized_tensor_parallel_remat_rank,
     get_global_memory_buffer,
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -99,6 +101,29 @@ def param_is_not_tensor_parallel_duplicate(param, tp_group=None):
         return tp_group.rank() == 0
     # Fallback to legacy global state (back-compat).
     return get_tensor_model_parallel_rank() == 0
+
+
+def copy_gtp_attributes(destination, source):
+    """Copy the GTP dedup tags (is_gtp, allreduce) onto a param view/copy, so the optimizer's
+    master shards stay classifiable by param_is_not_gtp_duplicate."""
+    for attr in ("is_gtp", "allreduce"):
+        if hasattr(source, attr):
+            setattr(destination, attr, getattr(source, attr))
+
+
+def param_is_not_gtp_duplicate(param):
+    """Returns true if the param's grad should be counted once across the GTP/EGTP axis.
+
+    GTP/EGTP shards are unique per peer (always kept); replicated params are counted only on
+    rank 0 of the gtp/egtp axis (else counted gtp/egtp times). When GTP is off the rank is 0,
+    so every param is kept.
+    """
+    if getattr(param, "is_gtp", False):
+        return True
+    is_expert = not getattr(param, "allreduce", True)
+    if is_expert:
+        return get_expert_generalized_tensor_parallel_remat_rank() == 0
+    return get_generalized_tensor_parallel_remat_rank() == 0
 
 
 def set_tensor_model_parallel_attributes(tensor, is_parallel, dim, stride):
