@@ -8,7 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import nvtx_decorator
 
@@ -159,6 +159,11 @@ class HyperConnectionModule(MegatronModule):
 
         # Static bias terms
         self.bias = nn.Parameter(torch.zeros(self.n * self.n + 2 * self.n))
+        mark_keep_in_fp32(self.mapping_proj.weight)
+        mark_keep_in_fp32(self.alpha_pre)
+        mark_keep_in_fp32(self.alpha_post)
+        mark_keep_in_fp32(self.alpha_res)
+        mark_keep_in_fp32(self.bias)
         self.norm_eps = 1e-6
 
         # Choose implementation: fused cuTile kernels vs reference modules.
@@ -208,7 +213,8 @@ class HyperConnectionModule(MegatronModule):
         """
         s, b, nC = x.shape
         x_2d = x.reshape(s * b, nC)
-        proj, r = self._proj_rms_op(x_2d, self.mapping_proj.weight, self.norm_eps)
+        weight = self.mapping_proj.weight.to(x_2d.dtype)
+        proj, r = self._proj_rms_op(x_2d, weight, self.norm_eps)
         return proj.view(s, b, -1), r.view(s, b, 1)
 
     @torch.compile
@@ -233,7 +239,8 @@ class HyperConnectionModule(MegatronModule):
             ],
             dim=-1,
         )
-        h = r * proj * alpha_ + self.bias
+
+        h = r * proj * alpha_.to(proj.dtype) + self.bias.to(proj.dtype)
         # H_pre = σ(α_pre * (θ_pre @ x̃) + b_pre)
         h_pre = h[..., : self.n].sigmoid()  # [s, b, n]
 

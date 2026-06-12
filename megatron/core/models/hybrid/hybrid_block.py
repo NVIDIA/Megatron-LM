@@ -31,7 +31,11 @@ from megatron.core.transformer.hyper_connection import (
     learned_output_contract,
 )
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.transformer.module import (
+    MegatronModule,
+    convert_module_to_dtype_except_fp32_marked,
+    mark_keep_in_fp32,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import (
@@ -84,7 +88,7 @@ class HyperConnectionHybridLayer(MegatronModule):
         self.layer_number = layer.layer_number
         self.hyper_connection = HyperConnectionModule(config=config, layer_number=self.layer_number)
         if config.params_dtype is not None:
-            self.hyper_connection.to(dtype=config.params_dtype)
+            convert_module_to_dtype_except_fp32_marked(self.hyper_connection, config.params_dtype)
         if hasattr(layer, 'tp_group'):
             self.tp_group = layer.tp_group
 
@@ -375,9 +379,9 @@ class HybridStack(MegatronModule):
         if self.config.enable_hyper_connections and self.post_process:
             hc_mult = self.config.num_residual_streams
             hc_dim = self.config.hidden_size * hc_mult
-            self.hc_head_fn = nn.Parameter(torch.randn(hc_mult, hc_dim))
-            self.hc_head_base = nn.Parameter(torch.zeros(hc_mult))
-            self.hc_head_scale = nn.Parameter(torch.ones(1))
+            self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
+            self.hc_head_base = mark_keep_in_fp32(nn.Parameter(torch.zeros(hc_mult)))
+            self.hc_head_scale = mark_keep_in_fp32(nn.Parameter(torch.ones(1)))
             nn.init.xavier_uniform_(self.hc_head_fn)
             if self.config.sequence_parallel:
                 setattr(self.hc_head_fn, 'sequence_parallel', True)
