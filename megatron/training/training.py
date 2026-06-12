@@ -1777,7 +1777,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             # latency-bound.
             if ddp_config.bucket_size is None:
                 ddp_config.bucket_size = max(
-                    40000000, 1000000 * mpu.get_data_parallel_world_size(with_context_parallel=True)
+                    40000000, 1000000 * get_pg_size(pg_collection.dp_cp)
                 )
             # Set bucket_size to infinity if overlap_grad_reduce is False.
             if not ddp_config.overlap_grad_reduce:
@@ -1786,7 +1786,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         # Compute per-chunk bucket sizes / disable_bucketing flags. Bucketing is
         # disabled for non-first chunks, when overlap_param_gather_with_optimizer_step
         # is on, or for non-zero pipeline-parallel ranks.
-        pp_rank = mpu.get_pipeline_model_parallel_rank()
+        pp_rank = get_pg_rank(pg_collection.pp)
         per_chunk_disable_bucketing = [
             (chunk_idx > 0) or args.overlap_param_gather_with_optimizer_step
             for chunk_idx in range(len(model))
@@ -2165,8 +2165,12 @@ def dummy_train_step(data_iterator):
             )
 
 
-def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None):
-    """Single training step."""
+def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_scheduler, config, forward_backward_func, iteration=None, pg_collection: Optional[ProcessGroupCollection] = None):
+    """Single training step.
+
+    pg_collection: optional per-module :class:`ProcessGroupCollection`; None uses the mpu globals,
+        otherwise it must define mp, pp, and dp_cp.
+    """
     args = get_args()
     timers = get_timers()
 
@@ -2304,14 +2308,25 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     if save_params_in_this_iteration:
         _save_state_dict(attr_name="data", label="params")
 
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    for _required in ("mp", "pp", "dp_cp"):
+        assert getattr(pg_collection, _required, None) is not None, (
+            f"pg_collection passed to train_step must define {_required}"
+        )
+    mp_group = pg_collection.mp
+    dp_cp_group = pg_collection.dp_cp
+    is_last_stage = is_pp_last_stage(pg_collection.pp)
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
     # so we must gather across mp ranks
-    update_successful = logical_and_across_model_parallel_group(update_successful)
+    update_successful = logical_and_across_model_parallel_group(update_successful, group=mp_group)
     # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
     # so we must gather across mp ranks
-    grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm)
+    grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm, group=mp_group)
     if args.log_num_zeros_in_grad:
-        num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(num_zeros_in_grad)
+        num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(
+            num_zeros_in_grad, group=mp_group
+        )
 
     # Vision momentum.
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
@@ -2330,20 +2345,16 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     if args.empty_unused_memory_level >= 2:
         torch.cuda.empty_cache()
 
-    if mpu.is_pipeline_last_stage(ignore_virtual=True):
+    if is_last_stage:
         # Average loss across microbatches.
         loss_reduced = {}
-
         for key in losses_reduced[0].keys():
             val = [x[key].view(-1) for x in losses_reduced]
             if val[0].numel() == 2:
                 # there is one dict per microbatch. in new reporting, we average
                 # over the total number of tokens across the global batch.
                 val = torch.vstack(val).sum(dim=0)
-                torch.distributed.all_reduce(
-                    val,
-                    group=mpu.get_data_parallel_group(with_context_parallel=True)
-                )
+                torch.distributed.all_reduce(val, group=dp_cp_group)
                 loss_reduced[key] = val[0] / val[1]
             elif val[0].numel() == 1:
                 # legacy behavior, we average over the number of microbatches
@@ -2804,13 +2815,6 @@ def save_checkpoint_and_time(
 
     # Log E2E metrics before save-checkpoint
     one_logger_utils.track_e2e_metrics()
-    # Free overlap param-gather buffers and release cached GPU memory so
-    # that the async checkpoint worker process has enough GPU headroom for
-    # D2H tensor transfers.
-    for model_chunk in model:
-        if hasattr(model_chunk, 'free_overlap_buffers'):
-            model_chunk.free_overlap_buffers()
-    torch.cuda.empty_cache()
 
     global num_checkpoints_memory_reported, MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
     should_report_memory = num_checkpoints_memory_reported < MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
