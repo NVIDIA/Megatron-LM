@@ -485,7 +485,7 @@ def test_delayed_release_waits_on_recorded_cuda_event(setup: DistributedSetup):
 def test_fully_sharded_root_with_child_units_overlaps_all_gather_and_compute(
     setup: DistributedSetup,
 ):
-    """A shared root context should let child all-gathers overlap GEMM compute."""
+    """A shared root context should let child collectives overlap GEMM compute."""
     if setup.world_size < 2:
         pytest.skip("This test requires at least 2 ranks.")
     if setup.device.type != "cuda":
@@ -523,22 +523,38 @@ def test_fully_sharded_root_with_child_units_overlaps_all_gather_and_compute(
         for event in cuda_events
         if "nccl" in event.name.lower() and "allgather" in event.name.lower()
     ]
+    reduce_scatter_events = [
+        event
+        for event in cuda_events
+        if "nccl" in event.name.lower()
+        and ("reducescatter" in event.name.lower() or "reduce_scatter" in event.name.lower())
+    ]
     compute_events = [
         event
         for event in cuda_events
         if any(token in event.name.lower() for token in ("gemm", "cutlass", "cublas"))
     ]
     assert all_gather_events, [event.name for event in cuda_events]
+    assert reduce_scatter_events, [event.name for event in cuda_events]
     assert compute_events, [event.name for event in cuda_events]
 
     all_gather_streams = {event.device_resource_id for event in all_gather_events}
+    reduce_scatter_streams = {event.device_resource_id for event in reduce_scatter_events}
     compute_streams = {event.device_resource_id for event in compute_events}
     assert len(all_gather_streams) == 1
+    assert len(reduce_scatter_streams) == 1
     assert all_gather_streams.isdisjoint(compute_streams)
+    assert reduce_scatter_streams.isdisjoint(compute_streams)
+    assert reduce_scatter_streams.isdisjoint(all_gather_streams)
 
     assert any(
         _events_overlap(all_gather_event, compute_event)
         for all_gather_event in all_gather_events
+        for compute_event in compute_events
+    )
+    assert any(
+        _events_overlap(reduce_scatter_event, compute_event)
+        for reduce_scatter_event in reduce_scatter_events
         for compute_event in compute_events
     )
 

@@ -149,6 +149,44 @@ class DBuffer:
             buffer_relative_offset=overlap_start - buffer_start,
         )
 
+    def copy_tensors_(self, tensors: Iterable[torch.Tensor]) -> None:
+        """Copy full local tensor values into this DBuffer's local range."""
+        tensors = tuple(
+            (
+                tensor.to(self.local_buffer.device)
+                if tensor.device != self.local_buffer.device and not tensor.is_meta
+                else tensor
+            )
+            .detach()
+            .contiguous()
+            for tensor in tensors
+        )
+        if len(tensors) != len(self.layout.tensor_shapes):
+            raise ValueError(
+                f"Expected {len(self.layout.tensor_shapes)} tensors, got {len(tensors)}."
+            )
+        for tensor, expected_shape in zip(tensors, self.layout.tensor_shapes, strict=True):
+            if tensor.shape != expected_shape:
+                raise ValueError(f"Expected tensor shape {expected_shape}, got {tensor.shape}.")
+            if tensor.dtype != self.local_buffer.dtype or tensor.device != self.local_buffer.device:
+                raise ValueError(
+                    "All tensors copied into a DBuffer must match the buffer dtype and device."
+                )
+
+        # Only logical tensor ranges are initialized. Padding and layout gaps are not
+        # observable through get_local_tensor() and can remain unspecified.
+        for index, tensor in enumerate(tensors):
+            owned_range = self._get_owned_range(index)
+            if owned_range is None:
+                continue
+
+            source_slice = tensor.view(-1).narrow(
+                0, owned_range.tensor_relative_offset, owned_range.numel
+            )
+            self.local_buffer.narrow(
+                0, owned_range.buffer_relative_offset, owned_range.numel
+            ).copy_(source_slice)
+
     @classmethod
     def from_local(
         cls,
@@ -229,19 +267,7 @@ class DBuffer:
             dtype=dtype,
             device=mesh.device_type,
         )
-        # Only logical tensor ranges are initialized. Padding and layout gaps are not
-        # observable through get_local_tensor() and can remain unspecified.
-        for index, tensor in enumerate(tensors):
-            owned_range = buffer._get_owned_range(index)
-            if owned_range is None:
-                continue
-
-            source_slice = tensor.view(-1).narrow(
-                0, owned_range.tensor_relative_offset, owned_range.numel
-            )
-            buffer.local_buffer.narrow(
-                0, owned_range.buffer_relative_offset, owned_range.numel
-            ).copy_(source_slice)
+        buffer.copy_tensors_(tensors)
         return buffer
 
     def _create_or_validate_out(
