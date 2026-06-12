@@ -115,7 +115,27 @@ class MoEMetricsTracker:
             avg_group: Process group for average-reduction.
             needs_dp_avg: Whether to average across DP ranks after other reductions.
         """
-        if layer_number is None:
+        if layer_number < 1 or layer_number > num_layers:
+            raise ValueError(f"layer_number {layer_number} out of range [1, {num_layers}]")
+        
+        # Record metric
+        if name not in self._metrics:
+            # Initialize a float tensor on the current GPU, of size (num_layers,)
+            self._metrics[name] = MetricEntry(
+                values=torch.zeros(num_layers, dtype=torch.float, device=torch.cuda.current_device()),
+                reduce_group=reduce_group,
+                avg_group=avg_group,
+                needs_dp_avg=needs_dp_avg,
+            )
+        
+        # Ensure the incoming value is a detached, contiguous float tensor on GPU
+        if not isinstance(value, torch.Tensor):
+            value = torch.tensor(value, dtype=torch.float, device=torch.cuda.current_device())
+        else:
+            value = value.detach().contiguous().to(dtype=torch.float, device=torch.cuda.current_device())
+        
+        idx = layer_number - 1
+        self._metrics[name].values[idx] += value is None:
             return
 
         if name not in self._metrics:
