@@ -34,8 +34,9 @@ from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphS
 from megatron.core.transformer.module import Float16Module
 from megatron.rl import rl_utils
 from megatron.rl.agent.api import TokenRollout
+from megatron.rl.rollout_granularity import RLRolloutGranularity
 from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
-from megatron.training.arguments import RLRolloutGranularity, parse_args, validate_args
+from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
 from tests.unit_tests.test_utilities import Utils
 
@@ -192,6 +193,36 @@ class TestRLUtils:
         "expected_generation_batch_size, expected_enforce_order, expected_warning",
         [
             pytest.param(
+                RLRolloutGranularity.ROLLOUT,
+                RLRolloutGranularity.BATCH,
+                None,
+                8,
+                1,
+                True,
+                None,
+                id="rollout-submit-batch-consume",
+            ),
+            pytest.param(
+                RLRolloutGranularity.ROLLOUT,
+                RLRolloutGranularity.GROUP,
+                None,
+                8,
+                1,
+                False,
+                None,
+                id="rollout-submit-group-consume",
+            ),
+            pytest.param(
+                RLRolloutGranularity.ROLLOUT,
+                RLRolloutGranularity.BATCH,
+                4,
+                8,
+                4,
+                True,
+                None,
+                id="rollout-submission-keeps-generation-batch-size",
+            ),
+            pytest.param(
                 RLRolloutGranularity.BATCH,
                 RLRolloutGranularity.BATCH,
                 None,
@@ -271,6 +302,50 @@ class TestRLUtils:
         assert args.rl_generation_batch_size == expected_generation_batch_size
         assert args.rl_enforce_generation_order is expected_enforce_order
 
+    def test_rl_rollout_submission_granularity_requires_partial_rollouts(self):
+        with pytest.raises(
+            AssertionError, match="requires streaming grouped rollouts"
+        ):
+            self.create_test_args(
+                perform_rl_step=True,
+                rl_partial_rollouts=False,
+                rl_submission_granularity=RLRolloutGranularity.ROLLOUT,
+            )
+
+    def test_rl_num_parallel_generations_keeps_existing_group_slot_behavior(self):
+        args = self.create_test_args(
+            perform_rl_step=True,
+            rl_partial_rollouts=True,
+            grpo_group_size=4,
+            rl_num_parallel_generations=12,
+        )
+
+        assert args.rl_parallel_generation_tasks == 3
+
+    def test_rl_rollout_submission_granularity_uses_rollout_slots(self):
+        args = self.create_test_args(
+            perform_rl_step=True,
+            rl_partial_rollouts=True,
+            rl_submission_granularity=RLRolloutGranularity.ROLLOUT,
+            grpo_group_size=4,
+            rl_num_parallel_generations=10,
+        )
+
+        assert args.rl_parallel_generation_tasks == 10
+
+    def test_rl_rollout_submission_granularity_expands_generation_batches_by_group_size(self):
+        args = self.create_test_args(
+            perform_rl_step=True,
+            rl_partial_rollouts=True,
+            rl_submission_granularity=RLRolloutGranularity.ROLLOUT,
+            grpo_group_size=4,
+            grpo_prompts_per_step=8,
+            rl_generation_batch_size=2,
+            rl_num_parallel_generation_batches=3,
+        )
+
+        assert args.rl_parallel_generation_tasks == 24
+
     @pytest.mark.parametrize(
         "rl_generation_batch_size, grpo_prompts_per_step, error",
         [
@@ -320,6 +395,14 @@ class TestRLUtils:
                 },
                 "require --rl-partial-rollouts",
                 id="explicit-granularity-requires-partial-rollouts",
+            ),
+            pytest.param(
+                {
+                    "rl_partial_rollouts": True,
+                    "rl_consumption_granularity": RLRolloutGranularity.ROLLOUT,
+                },
+                "--rl-consumption-granularity R is not supported",
+                id="rollout-consumption-not-supported",
             ),
             pytest.param(
                 {
