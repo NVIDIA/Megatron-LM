@@ -212,8 +212,11 @@ class HyperConnectionModule(MegatronModule):
             x: [s, b, n*C] - n-stream hidden states
         """
         s, b, nC = x.shape
-        x_2d = x.reshape(s * b, nC)
-        weight = self.mapping_proj.weight.to(x_2d.dtype)
+        # The mHC mapping computation runs in FP32: the parameters are kept in
+        # FP32 and the activations are upcast here, then compute_mappings casts
+        # the bounded mixing weights back to the activation dtype.
+        x_2d = x.reshape(s * b, nC).to(torch.float32)
+        weight = self.mapping_proj.weight.to(torch.float32)
         proj, r = self._proj_rms_op(x_2d, weight, self.norm_eps)
         return proj.view(s, b, -1), r.view(s, b, 1)
 
@@ -240,7 +243,7 @@ class HyperConnectionModule(MegatronModule):
             dim=-1,
         )
 
-        h = r * proj * alpha_.to(proj.dtype) + self.bias.to(proj.dtype)
+        h = r * proj * alpha_ + self.bias
         # H_pre = σ(α_pre * (θ_pre @ x̃) + b_pre)
         h_pre = h[..., : self.n].sigmoid()  # [s, b, n]
 
@@ -273,7 +276,11 @@ class HyperConnectionModule(MegatronModule):
             h_res.view(s, b, self.n, self.n), self.sinkhorn_iterations, self.norm_eps
         )  # [s, b, n, n]
 
-        return h_pre, h_post, h_res
+        # The mixing weights are bounded (sigmoid outputs / doubly stochastic
+        # matrix), so after the FP32 computation they are safe to apply to the
+        # streams in the activation dtype.
+        dtype = x.dtype
+        return h_pre.to(dtype), h_post.to(dtype), h_res.to(dtype)
 
     @torch.compile
     def _apply_h_post(self, x: Tensor, h_post: Tensor) -> Tensor:
