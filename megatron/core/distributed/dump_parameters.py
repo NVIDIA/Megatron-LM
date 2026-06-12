@@ -53,8 +53,8 @@ def dump_optimizer_parameters(
             the `extra` key. Useful for caller-specific knobs (e.g.,
             optimizer hyperparameters not captured by `param_groups`).
     """
-    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
-    world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
 
     # Preserve param-group structure (no hyperparameters; just the partition).
     # Group hyperparameters (lr, betas, weight_decay, ...) are intentionally
