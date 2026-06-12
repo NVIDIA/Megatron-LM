@@ -131,7 +131,11 @@ def get_cp_positions_from_layout(
 
 
 def build_packed_allgather_cp_local_positions(
-    cu_seqlens: torch.Tensor, cp_size: int, cp_rank: int, device: torch.device
+    cu_seqlens: torch.Tensor,
+    cp_size: int,
+    cp_rank: int,
+    device: torch.device,
+    output_size: Optional[int] = None,
 ) -> torch.Tensor:
     """Build local packed-token positions for one CP rank under zigzag THD sharding.
 
@@ -139,43 +143,61 @@ def build_packed_allgather_cp_local_positions(
     each packed sequence is padded to a multiple of ``2 * cp_size`` and each rank
     receives the rank-local front chunk followed by the mirrored back chunk.
     """
-    cu_seqlens_i64 = cu_seqlens.to(dtype=torch.int64)
+    cu_seqlens_i64 = cu_seqlens.to(device=device, dtype=torch.int64)
     if cp_size <= 1:
-        return torch.arange(int(cu_seqlens_i64[-1].item()), dtype=torch.int64, device=device)
+        if output_size is None:
+            output_size = int(cu_seqlens_i64[-1].item())
+        return torch.arange(output_size, dtype=torch.int64, device=device)
 
-    positions = []
-    cu_seqlens_list = cu_seqlens_i64.tolist()
-    for seq_start, seq_end in zip(cu_seqlens_list[:-1], cu_seqlens_list[1:]):
-        seq_len = seq_end - seq_start
-        if seq_len == 0:
-            continue
-        if seq_len % cp_size != 0:
+    seq_starts = cu_seqlens_i64[:-1]
+    seq_ends = cu_seqlens_i64[1:]
+    seq_lens = seq_ends - seq_starts
+    nonzero = seq_lens > 0
+    seq_starts = seq_starts[nonzero]
+    seq_ends = seq_ends[nonzero]
+    seq_lens = seq_lens[nonzero]
+    if seq_lens.numel() == 0:
+        return torch.empty(0, dtype=torch.int64, device=device)
+
+    if cu_seqlens_i64.device.type == "cpu":
+        bad_divisible = seq_lens[seq_lens % cp_size != 0]
+        if bad_divisible.numel() > 0:
             raise ValueError(
                 "Packed DSA CP expects per-sequence padded lengths divisible by cp_size, got "
-                f"seq_len={seq_len}, cp_size={cp_size}"
+                f"seq_len={int(bad_divisible[0].item())}, cp_size={cp_size}"
             )
-        local_seq_len = seq_len // cp_size
-        if local_seq_len % 2 != 0:
+        bad_local = seq_lens[(seq_lens // cp_size) % 2 != 0]
+        if bad_local.numel() > 0:
+            seq_len = int(bad_local[0].item())
             raise ValueError(
                 "Packed DSA CP expects per-rank packed sequence lengths divisible by 2, got "
-                f"local_seq_len={local_seq_len}, seq_len={seq_len}, cp_size={cp_size}"
+                f"local_seq_len={seq_len // cp_size}, seq_len={seq_len}, cp_size={cp_size}"
             )
-        half_seq_len = local_seq_len // 2
-        if half_seq_len == 0:
-            continue
 
-        front_start = seq_start + cp_rank * half_seq_len
-        back_end = seq_end - cp_rank * half_seq_len
-        back_start = back_end - half_seq_len
+    half_seq_lens = (seq_lens // cp_size) // 2
+    front_starts = seq_starts + cp_rank * half_seq_lens
+    back_starts = seq_ends - (cp_rank + 1) * half_seq_lens
+    segment_starts = torch.stack((front_starts, back_starts), dim=1).reshape(-1)
+    segment_lens = torch.stack((half_seq_lens, half_seq_lens), dim=1).reshape(-1)
+    nonempty_segments = segment_lens > 0
+    segment_starts = segment_starts[nonempty_segments]
+    segment_lens = segment_lens[nonempty_segments]
 
-        positions.append(
-            torch.arange(front_start, front_start + half_seq_len, dtype=torch.int64, device=device)
-        )
-        positions.append(torch.arange(back_start, back_end, dtype=torch.int64, device=device))
-
-    if not positions:
+    if output_size is None:
+        output_size = int(segment_lens.sum().item())
+    if output_size == 0:
         return torch.empty(0, dtype=torch.int64, device=device)
-    return torch.cat(positions, dim=0)
+
+    segment_ids = torch.repeat_interleave(
+        torch.arange(segment_lens.numel(), dtype=torch.int64, device=device),
+        segment_lens,
+        output_size=output_size,
+    )
+    segment_offsets = torch.arange(output_size, dtype=torch.int64, device=device)
+    segment_offsets -= torch.repeat_interleave(
+        torch.cumsum(segment_lens, dim=0) - segment_lens, segment_lens, output_size=output_size
+    )
+    return segment_starts.index_select(0, segment_ids) + segment_offsets
 
 
 def build_packed_allgather_cp_query_positions_and_key_reorder(
@@ -184,6 +206,8 @@ def build_packed_allgather_cp_query_positions_and_key_reorder(
     cp_size: int,
     cp_rank: int,
     device: torch.device,
+    local_output_size: Optional[int] = None,
+    global_output_size: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Build packed-query positions and gathered-KV reorder index for allgather CP.
 
@@ -194,14 +218,21 @@ def build_packed_allgather_cp_query_positions_and_key_reorder(
     to global packed order, matching the Slime GLM5 implementation semantics.
     """
     query_positions = build_packed_allgather_cp_local_positions(
-        cu_seqlens_q, cp_size, cp_rank, device
+        cu_seqlens_q, cp_size, cp_rank, device, output_size=local_output_size
     )
     gathered_key_positions = [
-        build_packed_allgather_cp_local_positions(cu_seqlens_kv, cp_size, rank, device)
+        build_packed_allgather_cp_local_positions(
+            cu_seqlens_kv, cp_size, rank, device, output_size=local_output_size
+        )
         for rank in range(cp_size)
     ]
     gathered_key_positions = torch.cat(gathered_key_positions, dim=0)
     key_reorder_idx = torch.argsort(gathered_key_positions)
+    if global_output_size is not None and key_reorder_idx.numel() != global_output_size:
+        raise RuntimeError(
+            f"Packed DSA CP key reorder length mismatch: got {key_reorder_idx.numel()}, "
+            f"expected {global_output_size}"
+        )
     return query_positions, key_reorder_idx
 
 

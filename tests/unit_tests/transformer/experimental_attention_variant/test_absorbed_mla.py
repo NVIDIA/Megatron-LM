@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import random
+from types import SimpleNamespace
 from typing import List, Optional, Tuple
 
 import pytest
@@ -274,6 +275,49 @@ def test_checkpointed_attention_forward_captures_metadata(monkeypatch):
     assert all(arg is not packed_seq_params for arg in checkpoint_args)
     assert all(arg is not None for arg in checkpoint_args)
     assert output is hidden_states
+
+
+def test_load_from_state_dict_combines_split_kv_up_projection(monkeypatch):
+    """Pre-refactor split K/V up-projection checkpoints should load into the combined layout."""
+
+    dummy_attention = object.__new__(AbsorbedMLASelfAttention)
+    dummy_attention.num_attention_heads_per_partition = 2
+    dummy_attention.config = SimpleNamespace(qk_head_dim=2, v_head_dim=3, kv_lora_rank=4)
+
+    prefix = "self_attention."
+    k_weight = torch.arange(2 * 2 * 4, dtype=torch.float32).view(2 * 2, 4)
+    v_weight = torch.arange(2 * 3 * 4, dtype=torch.float32).view(2 * 3, 4)
+    state_dict = {
+        f"{prefix}linear_k_up_proj.weight": k_weight.clone(),
+        f"{prefix}linear_v_up_proj.weight": v_weight.clone(),
+        f"{prefix}linear_k_up_proj._extra_state": torch.empty(0),
+        f"{prefix}linear_v_up_proj._extra_state": torch.empty(0),
+    }
+    captured_state_dict = {}
+
+    def fake_super_load(self, state_dict, *args, **kwargs):
+        del self, args, kwargs
+        captured_state_dict.update(state_dict)
+
+    monkeypatch.setattr(absorbed_mla_module.Attention, "_load_from_state_dict", fake_super_load)
+
+    AbsorbedMLASelfAttention._load_from_state_dict(
+        dummy_attention, state_dict, prefix, {}, True, [], [], []
+    )
+
+    expected_weight = (
+        torch.cat((k_weight.view(2, 2, 4), v_weight.view(2, 3, 4)), dim=1)
+        .contiguous()
+        .view(2 * (2 + 3), 4)
+    )
+    torch.testing.assert_close(
+        captured_state_dict[f"{prefix}linear_kv_up_proj.weight"], expected_weight
+    )
+    assert f"{prefix}linear_k_up_proj.weight" not in captured_state_dict
+    assert f"{prefix}linear_v_up_proj.weight" not in captured_state_dict
+    assert f"{prefix}linear_kv_up_proj._extra_state" in captured_state_dict
+    assert f"{prefix}linear_k_up_proj._extra_state" not in captured_state_dict
+    assert f"{prefix}linear_v_up_proj._extra_state" not in captured_state_dict
 
 
 @pytest.mark.parametrize("tp_cp", [[1, 1], [2, 1], [1, 2], [2, 2]])
