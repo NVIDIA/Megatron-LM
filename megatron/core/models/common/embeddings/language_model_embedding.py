@@ -116,8 +116,17 @@ class LanguageModelEmbedding(MegatronModule):
             embeddings = word_embeddings
 
         if not self.reduce_scatter_embeddings:
-            # Data format change to avoid explicit tranposes : [b s h] --> [s b h].
-            embeddings = embeddings.transpose(0, 1).contiguous()
+            # Data format change [b s h] -> [s b h]. The transformer block convention is
+            # [s b h] so converting once here means downstream layers do not transpose again.
+            # Optimization: a contiguous [1, s, h] can be re-viewed as a contiguous
+            # [s, 1, h] via squeeze/unsqueeze (as strides (H, H, 1) satisfy contiguity for the new
+            # shape) with no kernel needed. Dynamic batching always produces batch_size=1 (requests
+            # are packed along the sequence dim), so this fast path is hit per inference step.
+            # Falls through to a materializing copy for non-contiguous or batch>1 inputs.
+            if embeddings.size(0) == 1 and embeddings.is_contiguous():
+                embeddings = embeddings.squeeze(0).unsqueeze(1)
+            else:
+                embeddings = embeddings.transpose(0, 1).contiguous()
 
         if tokentype_ids is not None:
             assert self.tokentype_embeddings is not None
