@@ -18,7 +18,7 @@ from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.cuda_graphs import is_graph_capturing, is_graph_warmup
+from megatron.core.transformer.cuda_graphs import is_graph_capturing, is_graph_warmup, make_weakref
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope, LayerType
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
@@ -1494,6 +1494,7 @@ class MoETransformerLayer(TransformerLayer):
                 obj, name = self._resolve_token_dispatcher_attr(attr_name)
                 attr = getattr(obj, name)
                 if torch.is_tensor(attr):
+                    attr.is_from_global_mempool = True
                     self.token_dispatcher_attrs[attr_name] = attr
 
         return residual, *router_outputs
@@ -1527,21 +1528,16 @@ class MoETransformerLayer(TransformerLayer):
 
         """
 
-        # Restore token dispatcher attributes. During graph warmup, the router capture leaves these
-        # attrs pointing into cudagraph pool memory; restoring them here ensures the postprocess
-        # graph captures with valid pointers.
-        self._restore_token_dispatcher_attrs()
-
         self.mlp.fwd_execution_map = "postprocess"
         output = apply_module(self.mlp)(None, intermediate_tensors=(output, shared_expert_output))
         out = self._forward_post_mlp((output, mlp_bias), residual)
 
         if is_graph_capturing() and not is_graph_warmup():
-            from transformer_engine.pytorch.utils import make_weak_ref
             for attr_name, attr in self.token_dispatcher_attrs.items():
                 obj, name = self._resolve_token_dispatcher_attr(attr_name)
-                setattr(obj, name, make_weak_ref(attr))
-                self.token_dispatcher_attrs[attr_name] = make_weak_ref(attr)
+                make_weakref(getattr(obj, name), inplace=False)
+                make_weakref(self.token_dispatcher_attrs[attr_name], inplace=False)
+
         return out
 
 

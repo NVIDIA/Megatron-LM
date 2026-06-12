@@ -182,13 +182,14 @@ class ArgMetadata:
             *self.shape, dtype=self.dtype, device=self.device, requires_grad=self.requires_grad
         )
 
-def alloc_tensor_from_global_mempool(meta):
+def alloc_tensor_from_graph_mempool(meta: ArgMetadata):
     torch._C._cuda_beginAllocateCurrentThreadToPool(
         torch.cuda.current_device(), 
         CudaGraphManager.global_mempool,
     )
     out = meta.zeros_like()
     out.is_from_global_mempool = True
+    out.requires_grad_(meta.requires_grad)
 
     torch._C._cuda_endAllocateToPool(
         torch.cuda.current_device(), 
@@ -306,6 +307,50 @@ def _ensure_generator_state_is_cudagraph_safe(gen: torch.Generator) -> torch.Gen
             gen.set_state(cloned_state)
 
     return gen
+
+
+def make_weakref(ten, inplace=True):
+    if not HAVE_TE_GRAPHS or not torch.is_tensor(ten):
+        return ten
+    # Weak refs replace tensors with raw-pointer wrappers that do not hold a storage
+    # reference.  Only graph mempool tensors in the graph mempool (e.g. a previous layer's
+    # output reused as this graph's input) are safe to weak-ref since their memory is
+    # driver-pinned with stable addresses. Everything else, including, stray tensors
+    # from dataclass __post_init__ side-effects (e.g. seq_idx created by
+    # PackedSeqParams.__post_init__ during dataclasses.replace inside the tree_map) must
+    # retain strong refs, or it will cause a use-after-free on replay that manifests as a
+    # segfault under memory pressure.
+    if not hasattr(ten, "is_from_global_mempool") or not ten.is_from_global_mempool:
+        return ten
+
+    try:
+        wr = make_weak_ref(ten)
+    except RuntimeError:
+        # Fallback to keeping a strong reference. There is a known bug where some
+        # dtypes (e.g. torch.float64) are not mapped to a representation in
+        # transformer_engine/pytorch/utils.py.
+        if torch.distributed.get_rank() == 0:
+            logger.warning(
+                f"Could not create weak ref for tensor with dtype {arg.dtype}; "
+                f"keeping strong ref with a potential memory overhead."
+            )
+
+    if inplace:
+        ten.data = wr
+        return ten
+    return wr
+
+
+def create_strong_ref(ten):
+    ref = ten.detach()
+    if hasattr(ten, "is_from_global_mempool"):
+        ref.is_from_global_mempool = ten.is_from_global_mempool
+    if hasattr(ten, "cg_buffer_metadata"):
+        ref.cg_buffer_metadata = deepcopy(ten.cg_buffer_metadata)
+    if hasattr(ten, "can_skip_replay_copy"):
+        ref.can_skip_replay_copy = ten.can_skip_replay_copy
+    ref.requires_grad_(ten.requires_grad)
+    return ref
 
 
 fwd_buffer_reuse_ref_count = 0
@@ -756,46 +801,6 @@ class _CudaGraphRunner(torch.nn.Module):
         # Return module params that were found in the graph, preserving original order
         return tuple(p for p in self.base_module.parameters() if id(p) in p_ids)
 
-    def weakref(self, ten):
-        if not HAVE_TE_GRAPHS or not torch.is_tensor(ten):
-            return ten
-        # Weak refs replace tensors with raw-pointer wrappers that do not hold a storage
-        # reference.  Only graph mempool tensors in the graph mempool (e.g. a previous layer's
-        # output reused as this graph's input) are safe to weak-ref since their memory is
-        # driver-pinned with stable addresses. Everything else, including, stray tensors
-        # from dataclass __post_init__ side-effects (e.g. seq_idx created by
-        # PackedSeqParams.__post_init__ during dataclasses.replace inside the tree_map) must
-        # retain strong refs, or it will cause a use-after-free on replay that manifests as a
-        # segfault under memory pressure.
-        if not hasattr(ten, "is_from_global_mempool") or not ten.is_from_global_mempool:
-            return ten
-
-        try:
-            wr = make_weak_ref(ten)
-            ten.data = wr
-        except RuntimeError:
-            # Fallback to keeping a strong reference. There is a known bug where some
-            # dtypes (e.g. torch.float64) are not mapped to a representation in
-            # transformer_engine/pytorch/utils.py.
-            if torch.distributed.get_rank() == 0:
-                logger.warning(
-                    f"Could not create weak ref for tensor with dtype {arg.dtype}; "
-                    f"keeping strong ref with a potential memory overhead."
-                )
-
-        return ten
-
-    def create_strong_ref(self, ten):
-        ref = ten.detach()
-        if hasattr(ten, "is_from_global_mempool"):
-            ref.is_from_global_mempool = ten.is_from_global_mempool
-        if hasattr(ten, "cg_buffer_metadata"):
-            ref.cg_buffer_metadata = deepcopy(ten.cg_buffer_metadata)
-        if hasattr(ten, "can_skip_replay_copy"):
-            ref.can_skip_replay_copy = ten.can_skip_replay_copy
-        ref.requires_grad_(ten.requires_grad)
-        return ref
-
     def create_fwd_graph(self, args, kwargs, outputs=None, clone_inputs=True):
         """Create a fwd cudagraph for this runner. Should be called inside
         'create_cudagraphs()'."""
@@ -888,11 +893,9 @@ class _CudaGraphRunner(torch.nn.Module):
                     args_to_clear_buffers.append(ten)
             else:
                 # need to provide a fresh buffer from the pool
-                buf = alloc_tensor_from_global_mempool(ten)
+                buf = alloc_tensor_from_graph_mempool(ten)
                 can_skip_replay_copy = False
 
-            buf = buf.detach().requires_grad_(ten.requires_grad)
-            buf.is_from_global_mempool = True
             buf.can_skip_replay_copy = can_skip_replay_copy
             return buf
 
@@ -904,7 +907,7 @@ class _CudaGraphRunner(torch.nn.Module):
                     and ten.cg_buffer_metadata.input_use_count > 1
                     and ten.cg_buffer_metadata.fwd_cudagraph_buffer is None
                 ):
-                    buf = alloc_tensor_from_global_mempool(ten)
+                    buf = alloc_tensor_from_graph_mempool(ten)
                     buf.cg_buffer_metadata = deepcopy(ten.cg_buffer_metadata)
                     buf.cg_buffer_metadata.capture_reuse_count = (
                         ten.cg_buffer_metadata.input_use_count
@@ -1004,7 +1007,7 @@ class _CudaGraphRunner(torch.nn.Module):
                 o.cg_buffer_metadata.is_cudagraph_input
                 and o.cg_buffer_metadata.fwd_cudagraph_buffer is None
             ):
-                buf = self.create_strong_ref(fwd_graph_out)
+                buf = create_strong_ref(fwd_graph_out)
                 buf.cg_buffer_metadata.capture_reuse_count = (
                     o.cg_buffer_metadata.cudagraph_reuse_ref_count
                 )
@@ -1018,11 +1021,11 @@ class _CudaGraphRunner(torch.nn.Module):
                 however the graphed module must output at least one tensor, 
                 so that a corresponding backward node may be registered in the autograd graph."""
 
-            self.fwd_graph_input_surface = tree_map(self.weakref, self.fwd_graph_input_surface)
-            self.fwd_graph_input_args = tree_map(self.weakref, self.fwd_graph_input_args)
-            self.fwd_graph_input_kwargs = tree_map(self.weakref, self.fwd_graph_input_kwargs)
-            self.fwd_graph_outputs = tree_map(self.weakref, self.fwd_graph_outputs)
-            self.fwd_graph_output_surface = tree_map(self.weakref, self.fwd_graph_output_surface)
+            self.fwd_graph_input_surface = tree_map(make_weakref, self.fwd_graph_input_surface)
+            self.fwd_graph_input_args = tree_map(make_weakref, self.fwd_graph_input_args)
+            self.fwd_graph_input_kwargs = tree_map(make_weakref, self.fwd_graph_input_kwargs)
+            self.fwd_graph_outputs = tree_map(make_weakref, self.fwd_graph_outputs)
+            self.fwd_graph_output_surface = tree_map(make_weakref, self.fwd_graph_output_surface)
 
             self.params_to_backprop = self.get_connected_params(fwd_graph_outputs)
             self.num_dgrads = len(self.fwd_graph_input_surface)
@@ -1080,8 +1083,7 @@ class _CudaGraphRunner(torch.nn.Module):
                     args_to_clear_buffers.append(o)
                     out_grad.cg_buffer_metadata.capture_reuse_count -= 1
                 else:
-                    out_grad = alloc_tensor_from_global_mempool(o)
-                out_grad.requires_grad = True
+                    out_grad = alloc_tensor_from_graph_mempool(o)
             self.static_grad_outputs.append(out_grad)
 
         # Freeze GC, to speed up capture time ~15-20x.
@@ -1126,7 +1128,7 @@ class _CudaGraphRunner(torch.nn.Module):
 
                 if input_tensor.cg_buffer_metadata.is_cudagraph_output \
                     and input_tensor.cg_buffer_metadata.bwd_cudagraph_buffer is None:
-                        buf = self.create_strong_ref(input_grad)
+                        buf = create_strong_ref(input_grad)
                         input_tensor.cg_buffer_metadata.bwd_cudagraph_buffer = buf
                         buf.cg_buffer_metadata.capture_reuse_count += 1
                         bwd_buffer_reuse_ref_count += 1
@@ -1144,8 +1146,8 @@ class _CudaGraphRunner(torch.nn.Module):
 
         # It is safe to weakref static_grad_inputs as any inuse input grads have a strong ref
         # stored in 'bwd_cudagraph_buffer'
-        self.static_grad_inputs = tree_map(self.weakref, self.static_grad_inputs)
-        self.static_grad_outputs = tree_map(self.weakref, self.static_grad_outputs)
+        self.static_grad_inputs = tree_map(make_weakref, self.static_grad_inputs)
+        self.static_grad_outputs = tree_map(make_weakref, self.static_grad_outputs)
 
         delattr(self, "args")
         delattr(self, "kwargs")
