@@ -376,6 +376,12 @@ class OptimizerConfig:
     clip_grad: float = 1.0
     """Gradient clipping based on global L2 norm."""
 
+    grad_norm_skip_threshold: float = float('inf')
+    """Skip gradient update if the gradient norm exceeds this threshold.
+
+    Disabled by default. Set a finite value to enable skip-on-large-grad behavior.
+    """
+
     log_num_zeros_in_grad: bool = False
     """If true, calculate and log the number of zeros in gradient."""
 
@@ -419,6 +425,12 @@ class OptimizerConfig:
                     "Setting --reuse-grad-buf-for-mxfp8-param-ag and --fp8-param-gather is "
                     "recommended for mxfp8 training."
                 )
+
+        if self.reuse_grad_buf_for_mxfp8_param_ag and self.overlap_param_gather_with_optimizer_step:
+            raise ValueError(
+                "overlap_param_gather_with_optimizer_step is not supported with "
+                "reuse_grad_buf_for_mxfp8_param_ag."
+            )
 
         if self.use_precision_aware_optimizer:
             assert (

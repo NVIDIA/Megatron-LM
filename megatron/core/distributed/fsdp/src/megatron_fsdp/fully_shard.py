@@ -93,6 +93,7 @@ def fully_shard_model(
     enable_fine_grained_param_gather: bool = False,
     prefetch_recompute_forward_weights: bool = False,
     use_decoupled_grad: bool = False,
+    cuda_graph_mode: bool = False,
 ) -> torch.nn.Module:
     """
     Fully-shard the model for Megatron-FSDP. This wraps the model in a MegatronFSDP
@@ -259,6 +260,17 @@ def fully_shard_model(
             If true, reduced gradients are installed into `Parameter.decoupled_grad` instead
             of `Parameter.grad`. Defaults to False.
 
+        cuda_graph_mode (bool):
+            If true, Megatron-FSDP will practice CUDA graph-safe operations, such as
+            not dereferencing `param.grad` after the optimizer step to preserve references
+            for CUDA graph replay. Can affect memory utilization in some cases, such as
+            when the gradient shard is not a view of the Megatron-FSDP sharded gradient
+            buffer, so `FusedAdam(use_decoupled_grad=True) + use_decoupled_grad=True` or
+            setting `megatron_fsdp_main_params_dtype == megatron_fsdp_main_grads_dtype`
+            is recommended to avoid casting the gradient to the parameter precision and
+            creating a casted-copy of the gradient shard that cannot be dereferenced due
+            to replay. Defaults to False.
+
     Returns:
         model (MegatronFSDP): The wrapped Megatron-FSDP model configured for FSDP.
     """
@@ -366,6 +378,7 @@ def fully_shard_model(
         disable_symmetric_registration=disable_symmetric_registration,
         megatron_fsdp_prefetch_recompute_forward_weights=prefetch_recompute_forward_weights,
         megatron_fsdp_use_decoupled_grad=use_decoupled_grad,
+        megatron_fsdp_cuda_graph_mode=cuda_graph_mode,
     )
 
     # Create FSDPDistributedIndex.
@@ -673,6 +686,7 @@ def fully_shard(
     enable_fine_grained_param_gather: bool = False,
     prefetch_recompute_forward_weights: bool = False,
     use_decoupled_grad: bool = False,
+    cuda_graph_mode: bool = False,
 ) -> tuple[MegatronFSDP, torch.optim.Optimizer]:
     """
     Fully shard the model and the optimizer for Megatron-FSDP.
@@ -725,6 +739,7 @@ def fully_shard(
         enable_fine_grained_param_gather=enable_fine_grained_param_gather,
         prefetch_recompute_forward_weights=prefetch_recompute_forward_weights,
         use_decoupled_grad=use_decoupled_grad,
+        cuda_graph_mode=cuda_graph_mode,
     )
 
     # Extend optimizer methods to support Megatron-FSDP operations.
