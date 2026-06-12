@@ -724,7 +724,7 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
 
         # Fallback allocator used if the fixed pool allocator cannot fulfill a request.
         self.fallback_to_persistent_buffer = fallback_to_persistent_buffer
-        self.backup_allocator = TemporaryBucketAllocator()
+        self.backup_allocator = StorageResizeBasedBucketAllocator()
 
     def _is_two_bucket_group_equal(self, group_a, group_b):
         # Check if two bucket groups are equivalent in dtype and size.
@@ -906,7 +906,7 @@ class DataParallelBuffer:
             # Build the data parallel buffer index, which contains information
             # on where each parameter / gradient tensor will be stored in this
             # distributed buffer.
-            (self.item_index_map, self.bucket_index, self.shard_bucket_index) = (
+            self.item_index_map, self.bucket_index, self.shard_bucket_index = (
                 build_data_parallel_buffer_index(
                     [to_local_if_dtensor(p).shape for p in self.params],
                     self.dp_rank,
@@ -1767,7 +1767,7 @@ class ParamAndGradBuffer:
                         )
 
         # Get the parameter groups.
-        (self.parameter_groups, self.param_to_param_group, self.bucket_to_bucket_group) = (
+        self.parameter_groups, self.param_to_param_group, self.bucket_to_bucket_group = (
             _get_parameter_groups(module, bucketing_policy, meta_device_init_fp8_params)
         )
         self._init_each_parameter_group_buffers(meta_device_init_fp8_params)
@@ -2685,18 +2685,23 @@ class ParamAndGradBuffer:
                 p._item_id = item_id
 
                 def main_grad_getter(p):
+                    # Get gradient buffer and item ID.
+                    gbuf = p._gbuf
+                    item_id = p._item_id
+                    # Need to free a bucket for the incoming bucket if double-buffering.
+                    p._megatron_fsdp_model.grad_reduce_pipeline._enforce_double_buffer_limit(
+                        [gbuf.bucket_id]
+                    )
                     # Make sure main_grad memory is allocated when initially accessed.
                     # When gradients are sharded, we can pre-allocate a communication
                     # bucket to avoid casting to a communication data-type. Otherwise,
                     # return the item backed by the main gradient buffer required to
                     # support un-sharded gradient accumulation at high precision.
-                    bucket = p._gbuf.fetch_bucket(
+                    bucket = gbuf.fetch_bucket(
                         dtype=(
                             self.mp_policy.grad_comm_dtype if p._gbuf.is_data_distributed else None
                         )
                     )
-                    gbuf = p._gbuf
-                    item_id = p._item_id
                     # View it as p.shape so you can insert the param.grad into
                     # the bucket seamlessly.
                     return gbuf.get_item_from_bucket(bucket, item_id).view(
@@ -2909,6 +2914,7 @@ class ParamAndGradBuffer:
                             "is_embedding_or_output_parameter",
                             "is_embedding_parameter",
                             "_tensor_parallel_mode",
+                            "_megatron_fsdp_model",
                         ]:
                             if hasattr(orig_param, attr_name):
                                 setattr(param, attr_name, getattr(orig_param, attr_name))
@@ -3393,13 +3399,15 @@ class BucketStatus(Enum):
 
     Attributes:
         EMPTY (int): The bucket is empty and not in use.
+        PRESERVED (int): The bucket storage is retained but not ready for use.
         COMMUNICATING (int): The bucket is currently being used for communication.
         READY_TO_USE (int): The bucket is filled with data and ready for use.
     """
 
     EMPTY = 1
-    COMMUNICATING = 2
-    READY_TO_USE = 3
+    PRESERVED = 2
+    COMMUNICATING = 3
+    READY_TO_USE = 4
 
 
 class GradReducePipeline:
@@ -3556,7 +3564,7 @@ class GradReducePipeline:
         for _, _, bucket_id in reversed(self.grad_reduce_queue):
             fsdp_unit_id = param_groups[bucket_id].fsdp_unit_id
             double_buf_units.add(fsdp_unit_id)
-            if len(double_buf_units) > 1:
+            if len(double_buf_units) > 2:
                 keep_n -= 1
 
         with torch.cuda.stream(self.rs_stream):
@@ -3921,8 +3929,14 @@ class AllGatherPipeline:
         """Return the number of buckets."""
         return self.buffer.num_buckets
 
-    def reset(self):
-        """Reset the pipeline state."""
+    def reset(self, preserve_non_fsdp_units: bool = True):
+        """Reset the pipeline state.
+
+        Non-FSDP-unit buckets are preserved by default because their params may
+        be read across module boundaries. Setting preserve_non_fsdp_units=False
+        releases all bucket storage and is intended only for debugging when the
+        model will not be reused.
+        """
         if len(self.param_gather_event_map) > 0:
             warnings.warn(
                 (
@@ -3932,14 +3946,28 @@ class AllGatherPipeline:
                 UserWarning,
             )
             while len(self.param_gather_event_map) > 0:
-                (bucket_id, bwd) = next(iter(self.param_gather_event_map))
+                bucket_id, bwd = next(iter(self.param_gather_event_map))
                 self.wait_bucket_ready(bucket_id, bwd)
+
         for bucket_id in range(self.num_buckets):
+            is_unit_bucket = self.buffer.parameter_groups[bucket_id].fsdp_unit_id is not None
             for bwd in [False, True]:
-                self.bucket_can_be_released[self.get_bucket_key(bucket_id, bwd)] = True
+                bucket_key = self.get_bucket_key(bucket_id, bwd)
+                # If preserve_non_fsdp_units is set, then do not release buckets
+                # associated with FSDP non-units. Instead, mark the bucket as PRESERVED
+                # (not NEW) so a later all-gather refreshes preserved non-unit bucket
+                # storage in place.
+                if preserve_non_fsdp_units and not is_unit_bucket:
+                    self.bucket_status[bucket_key] = BucketStatus.PRESERVED
+                else:
+                    self.bucket_can_be_released[bucket_key] = True
         self.recycle_unused_buckets()
 
-        assert all([status is BucketStatus.EMPTY for status in self.bucket_status.values()]), (
+        expected_statuses = (BucketStatus.EMPTY,)
+        if preserve_non_fsdp_units:
+            expected_statuses += (BucketStatus.PRESERVED,)
+
+        assert all(status in expected_statuses for status in self.bucket_status.values()), (
             f"There are still working buckets, it is not safe to reset. "
             f"bucket_status: {self.bucket_status}."
         )
@@ -4067,11 +4095,13 @@ class AllGatherPipeline:
                 ag_buckets = list(sorted(set(ag_buckets)))
                 bucket_id = next_bucket_id(ag_buckets)
 
-        # Only all-gather on buckets that have not been allocated yet.
+        # Only all-gather on buckets that have not been allocated yet or whose
+        # persistent storage was preserved but is not ready for use.
         ag_buckets = [
             bucket_id
             for bucket_id in ag_buckets
-            if self.bucket_status[self.get_bucket_key(bucket_id, bwd)] == BucketStatus.EMPTY
+            if self.bucket_status[self.get_bucket_key(bucket_id, bwd)]
+            in (BucketStatus.EMPTY, BucketStatus.PRESERVED)
         ]
         if len(ag_buckets) == 0:
             return
@@ -4145,12 +4175,13 @@ class AllGatherPipeline:
         if self.bucket_status[bucket_key] == BucketStatus.READY_TO_USE:
             # Already ready to use.
             return
-        if self.bucket_status[bucket_key] == BucketStatus.EMPTY:
+        if self.bucket_status[bucket_key] in (BucketStatus.EMPTY, BucketStatus.PRESERVED):
             if empty_ok:
                 return
-            # Bucket shouldn't be empty, this implies that the bucket
-            # was not allocated or NCCL operations are not complete.
-            raise ValueError(f"Bucket {bucket_id} is empty.")
+            # Bucket should not be empty or merely preserved here; this implies that
+            # the bucket was not allocated, was not made ready for use, or NCCL
+            # operations are not complete.
+            raise ValueError(f"Bucket {bucket_id} is {self.bucket_status[bucket_key].name}.")
 
         # Wait for asynchronous / overlapped NCCL operations to complete.
         param_gather_event, mark_bucket_ready_to_use = self.param_gather_event_map.pop(bucket_key)
@@ -4241,7 +4272,10 @@ class AllGatherPipeline:
         bucket_key = self.get_bucket_key(bucket_id, bwd)
 
         self.bucket_can_be_released[bucket_key] = False
-        if self.bucket_status[bucket_key] != BucketStatus.EMPTY:
+        if self.bucket_status[bucket_key] in (
+            BucketStatus.COMMUNICATING,
+            BucketStatus.READY_TO_USE,
+        ):
             return
 
         self.bucket_status[bucket_key] = BucketStatus.COMMUNICATING

@@ -47,7 +47,7 @@ weights — a single Adam step is enough to detect.
 Run with::
 
     uv run python -m torch.distributed.run --nproc_per_node=8 \\
-        -m pytest tests/unit_tests/models/test_mimo_colocated_correctness.py -v -s
+        -m pytest tests/unit_tests/models/mimo/test_mimo_colocated_correctness.py -v -s
 """
 
 import os
@@ -65,7 +65,7 @@ from megatron.core.models.mimo.optimizer import get_mimo_optimizer
 from megatron.core.optimizer.optimizer_config import OptimizerConfig
 from megatron.core.transformer.enums import ModelType
 from megatron.core.utils import unwrap_model
-from tests.unit_tests.models.test_mimo_1f1b_schedule import (
+from tests.unit_tests.models.mimo.test_mimo_1f1b_schedule import (
     build_no_sync_func,
     create_all_embedding_groups,
     create_hypercomm_grid,
