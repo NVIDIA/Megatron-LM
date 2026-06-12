@@ -566,7 +566,6 @@ def _make_fused_impl_support_module(
     module.tp_group = SimpleNamespace(size=lambda: 1)
     module.offload_expert_fc1 = False
     module.offload_moe_act = False
-    module.offload_fused_group_mlp = False
     common = dict(
         device="cuda",
         dtype=torch.bfloat16,
@@ -630,76 +629,6 @@ def test_is_fused_impl_supported_requires_scaled_srelu_op(monkeypatch):
     )
 
     assert module._is_fused_impl_supported() is False
-
-
-@pytest.mark.parametrize("offload_attr", ("offload_expert_fc1", "offload_moe_act"))
-def test_is_fused_impl_supported_rejects_partial_moe_offload(monkeypatch, offload_attr):
-    fake_te, FakeGroupedLinear = _make_fake_te_namespace()
-    monkeypatch.setattr(experts_module, "te", fake_te)
-    monkeypatch.setattr(experts_module, "HAVE_TE", True)
-    monkeypatch.setattr(experts_module, "is_te_min_version", lambda _: True)
-    _install_fake_te_ops_modules(monkeypatch, fake_te)
-
-    module = _make_fused_impl_support_module(
-        FakeGroupedLinear, activation_func=F.silu, gated_linear_unit=True
-    )
-    setattr(module, offload_attr, True)
-
-    assert module._is_fused_impl_supported() is False
-
-
-def test_is_fused_impl_supported_allows_fused_group_mlp_offload(monkeypatch):
-    fake_te, FakeGroupedLinear = _make_fake_te_namespace()
-    monkeypatch.setattr(experts_module, "te", fake_te)
-    monkeypatch.setattr(experts_module, "HAVE_TE", True)
-    monkeypatch.setattr(experts_module, "is_te_min_version", lambda _: True)
-    _install_fake_te_ops_modules(monkeypatch, fake_te)
-
-    module = _make_fused_impl_support_module(
-        FakeGroupedLinear, activation_func=F.silu, gated_linear_unit=True
-    )
-    module.offload_fused_group_mlp = True
-
-    assert module._is_fused_impl_supported() is True
-
-
-def test_transformer_config_allows_fused_group_mlp_offload_module():
-    config = TransformerConfig(
-        num_layers=1,
-        hidden_size=64,
-        num_attention_heads=4,
-        fine_grained_activation_offloading=True,
-        offload_modules=["fused_group_mlp"],
-        use_transformer_engine_op_fuser=True,
-        cuda_graph_impl="transformer_engine",
-    )
-
-    assert config.offload_modules == ["fused_group_mlp"]
-
-
-def test_transformer_config_rejects_fused_group_mlp_without_op_fuser():
-    with pytest.raises(ValueError, match="fused_group_mlp requires"):
-        TransformerConfig(
-            num_layers=1,
-            hidden_size=64,
-            num_attention_heads=4,
-            fine_grained_activation_offloading=True,
-            offload_modules=["fused_group_mlp"],
-            cuda_graph_impl="transformer_engine",
-        )
-
-
-def test_transformer_config_rejects_mixed_fused_group_mlp_and_partial_moe_offload():
-    with pytest.raises(ValueError, match="cannot be combined"):
-        TransformerConfig(
-            num_layers=1,
-            hidden_size=64,
-            num_attention_heads=4,
-            fine_grained_activation_offloading=True,
-            offload_modules=["fused_group_mlp", "expert_fc1"],
-            use_transformer_engine_op_fuser=True,
-            cuda_graph_impl="transformer_engine",
-        )
 
 
 def test_make_fused_ops_attaches_single_grouped_bias_for_fc1(monkeypatch):
