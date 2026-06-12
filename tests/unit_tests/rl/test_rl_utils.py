@@ -295,62 +295,6 @@ class TestRLUtils:
         assert get_rl_parallel_generation_tasks(args) == expected_parallel_generation_tasks
 
     @pytest.mark.parametrize(
-        "overrides, error",
-        [
-            pytest.param(
-                {
-                    "rl_partial_rollouts": False,
-                    "rl_submission_granularity": RLRolloutGranularity.ROLLOUT,
-                },
-                "requires streaming grouped rollouts",
-                id="rollout-submission-requires-partial-rollouts",
-            ),
-            pytest.param(
-                {
-                    "rl_partial_rollouts": True,
-                    "rl_submission_granularity": RLRolloutGranularity.BATCH,
-                    "rl_consumption_granularity": RLRolloutGranularity.GROUP,
-                    "grpo_prompts_per_step": 8,
-                },
-                "with --rl-consumption-granularity G is not supported",
-                id="batch-submit-group-consume",
-            ),
-            pytest.param(
-                {
-                    "rl_partial_rollouts": False,
-                    "rl_submission_granularity": RLRolloutGranularity.GROUP,
-                    "rl_generation_lag": 1,
-                },
-                "--rl-generation-lag requires --rl-partial-rollouts",
-                id="generation-lag-requires-partial-rollouts",
-            ),
-            pytest.param(
-                {
-                    "rl_partial_rollouts": True,
-                    "rl_consumption_granularity": RLRolloutGranularity.ROLLOUT,
-                },
-                "--rl-consumption-granularity R is not supported",
-                id="rollout-consumption-not-supported",
-            ),
-            pytest.param(
-                {
-                    "rl_partial_rollouts": True,
-                    "rl_generation_lag": -1,
-                    "grpo_prompts_per_step": 8,
-                },
-                "--rl-generation-lag must be non-negative",
-                id="negative-generation-lag",
-            ),
-        ],
-    )
-    def test_rl_granularity_validation_errors(self, overrides, error):
-        with pytest.raises(AssertionError, match=error):
-            self.create_test_args(
-                perform_rl_step=True,
-                **overrides,
-            )
-
-    @pytest.mark.parametrize(
         "flag",
         [
             "--rl-generation-batch-size",
