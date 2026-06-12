@@ -1,16 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.import functools
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import functools
 import importlib
@@ -271,6 +259,9 @@ class MegatronFSDP(torch.nn.Module):
         self.enable_fine_grained_param_gather_hook = enable_fine_grained_param_gather_hook
         self.enable_fine_grained_param_gather_backward_hook = (
             enable_fine_grained_param_gather_backward_hook
+        )
+        self.prefetch_recompute_forward_weights = (
+            self.ddp_config.megatron_fsdp_prefetch_recompute_forward_weights
         )
         self.report_nan_in_param_grad = report_nan_in_param_grad
 
@@ -879,9 +870,29 @@ class MegatronFSDP(torch.nn.Module):
                 param_list = list(module.parameters(recurse=False))
 
             # All-gather / unshard the module parameters before the backward pass.
-            self.all_gather_and_wait_parameters_ready(
-                param_list, prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER, bwd=True
-            )
+            if self.prefetch_recompute_forward_weights:
+                self.all_gather_and_wait_parameters_ready(
+                    param_list,
+                    prefetch=False,
+                    prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER,
+                    bwd=True,
+                )
+                self.all_gather_and_wait_parameters_ready(
+                    param_list,
+                    prefetch=True,
+                    prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER,
+                    bwd=False,
+                )
+                self.all_gather_and_wait_parameters_ready(
+                    param_list,
+                    prefetch=True,
+                    prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER,
+                    bwd=True,
+                )
+            else:
+                self.all_gather_and_wait_parameters_ready(
+                    param_list, prefetch_order=PrefetchOrder.BACKWARD_PASS_ORDER, bwd=True
+                )
 
         self._root_pre_backward_hook_issued = False
 
