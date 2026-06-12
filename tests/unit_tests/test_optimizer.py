@@ -82,7 +82,6 @@ def test_get_param_groups_no_overrides(mock_get_world_size):
     assert pg0.keys() == {
         'params',
         'is_expert_parallel',
-        'is_gtp',
         'default_config',
         'wd_mult',
         'lr_mult',

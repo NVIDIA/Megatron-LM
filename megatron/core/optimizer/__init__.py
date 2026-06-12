@@ -1048,9 +1048,12 @@ def get_megatron_optimizer(
     # GTP/EGTP params fold into the main / expert optimizers, sharding their optimizer state over
     # the *_with_gtp (gtp/egtp-EXCLUDED) replicate group — which aliases the full DP group when GTP
     # is inactive. GTP is "active" when that group is strictly smaller (no Gloo state path then).
-    gtp_active = (
-        intra_dp_cp_with_gtp_group.size() != intra_dp_cp_group.size()
-        or intra_expt_dp_with_egtp_group.size() != intra_expt_dp_group.size()
+    # A None group means the axis is unused (e.g. no expert parallelism) → not active.
+    def _gtp_active_for(sub, full):
+        return sub is not None and full is not None and sub.size() != full.size()
+
+    gtp_active = _gtp_active_for(intra_dp_cp_with_gtp_group, intra_dp_cp_group) or _gtp_active_for(
+        intra_expt_dp_with_egtp_group, intra_expt_dp_group
     )
     main_dp_group = intra_dp_cp_with_gtp_group
     main_dp_group_gloo = None if gtp_active else intra_dp_cp_group_gloo
