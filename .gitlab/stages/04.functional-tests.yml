@@ -99,6 +99,36 @@ functional:configure:
         "--no-enable-warmup"
       )
     - |
+      SMOKE_ARGS=(
+        "--scope L0-smoke"
+        "--n-repeat 1"
+        "--time-limit 540"
+        "--enable-lightweight-mode"
+        "--test-cases all"
+        "--container-image ${UTILITY_IMAGE}"
+        "--container-tag ${CI_PIPELINE_ID}"
+        "--dependent-job functional:configure"
+        "--record-checkpoints false"
+        "--slurm-account ${CI_SLURM_ACCOUNT}"
+        "--no-enable-warmup"
+      )
+    - |
+      export PYTHONPATH=$(pwd)
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+        ${SMOKE_ARGS[@]} \
+        --environment dev \
+        --platform dgx_h100 \
+        --cluster $H100_CLUSTER \
+        --output-path "functional-smoke-h100-job.yaml"
+    - |
+      export PYTHONPATH=$(pwd)
+      python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
+        ${SMOKE_ARGS[@]} \
+        --environment dev \
+        --platform dgx_gb200 \
+        --cluster $GB200_CLUSTER \
+        --output-path "functional-smoke-gb200-job.yaml"
+    - |
       export PYTHONPATH=$(pwd)
       python tests/test_utils/python_scripts/generate_jet_trigger_job.py \
         ${COMMON_ARGS[@]} \
@@ -160,6 +190,8 @@ functional:configure:
         ${RELEASE_ARGS[@]}
   artifacts:
     paths:
+      - functional-smoke-h100-job.yaml
+      - functional-smoke-gb200-job.yaml
       - functional-test-job-lts-A100.yaml
       - functional-test-job-lts-H100.yaml
       - functional-test-job-dev-A100.yaml
@@ -191,6 +223,41 @@ functional:configure:
 
   inherit:
     variables: true
+
+.functional_smoke_rules:
+  stage: functional_tests
+  rules:
+    - if: $BUILD == "no"
+      when: never
+    - if: $FUNCTIONAL_TEST == "yes" && $FUNCTIONAL_TEST_SCOPE =~ /^(mr|nightly|weekly|release)$/
+      when: on_success
+    - when: never
+
+# Reuses `.functional_run` (needs, trigger strategy, variables, inherit) and
+# only overrides what is smoke-specific: the smoke rules, the generated smoke
+# artifact, and the fixed H100 cluster. `.functional_smoke_rules` is listed last
+# so its rules win over `.functional_run`'s inherited `.functional_tests_rules`.
+functional:smoke-h100:
+  extends: [.functional_run, .functional_smoke_rules]
+  trigger:
+    include:
+      - artifact: functional-smoke-h100-job.yaml
+        job: functional:configure
+    strategy: depend
+  variables:
+    CLUSTER: H100
+
+# GB200 counterpart of functional:smoke-h100. Same lightweight L0-smoke recipe set,
+# generated for the dgx_gb200 platform, gating the GB200 functional runs.
+functional:smoke-gb200:
+  extends: [.functional_run, .functional_smoke_rules]
+  trigger:
+    include:
+      - artifact: functional-smoke-gb200-job.yaml
+        job: functional:configure
+    strategy: depend
+  variables:
+    CLUSTER: GB200
 
 # Prune artifacts older than 14 days from the JET assets/artifacts roots on
 # each cluster. Gated on release/weekly scope so it does not run on every MR
@@ -281,6 +348,8 @@ functional:run_lts_dgx_a100:
   needs:
     - functional:configure
     - test:build_image
+    - job: functional:smoke-h100
+      optional: true
     - job: functional:cleanup_dgx_a100
       optional: true
   variables:
@@ -293,6 +362,8 @@ functional:run_lts_dgx_h100:
   needs:
     - functional:configure
     - test:build_image
+    - job: functional:smoke-h100
+      optional: true
     - job: functional:cleanup_dgx_h100
       optional: true
   variables:
@@ -305,6 +376,8 @@ functional:run_lts_dgx_gb200:
   needs:
     - functional:configure
     - test:build_image
+    - job: functional:smoke-gb200
+      optional: true
     - job: functional:cleanup_dgx_gb200
       optional: true
   variables:
@@ -316,6 +389,8 @@ functional:run_dev_dgx_a100:
   needs:
     - functional:configure
     - test:build_image
+    - job: functional:smoke-h100
+      optional: true
     - job: functional:cleanup_dgx_a100
       optional: true
   variables:
@@ -327,6 +402,8 @@ functional:run_dev_dgx_h100:
   needs:
     - functional:configure
     - test:build_image
+    - job: functional:smoke-h100
+      optional: true
     - job: functional:cleanup_dgx_h100
       optional: true
   variables:
@@ -338,6 +415,8 @@ functional:run_dev_dgx_gb200:
   needs:
     - functional:configure
     - test:build_image
+    - job: functional:smoke-gb200
+      optional: true
     - job: functional:cleanup_dgx_gb200
       optional: true
   variables:

@@ -26,6 +26,11 @@ ALLOWED_CADENCE_VALUES = set(DEFAULT_CADENCE) | {"weekly"}
 # row tagged `scope: [L1]` match the same tier. A literal `mr` tag or filter
 # means a GitLab-only extra and resolves to the single tier `L2`. The slim PR
 # sets (`mr-slim`, `mr-github-slim`) both map to `L0`.
+#
+# L-tier vocabulary (cost class, ascending): `L0` (slim PR) < `L1` (full PR /
+# merge queue) < `L2` (GitLab MR extra) < `L3` (nightly) < `L4` (weekly).
+# `L0-smoke` is a sub-L0 tier for fast lightweight smoke tests; it passes
+# through verbatim and GitLab selects it via `--scope L0-smoke`.
 LEGACY_SCOPE_ALIASES = {
     "mr-slim": ("L0", None),
     "mr-github-slim": ("L0", None),
