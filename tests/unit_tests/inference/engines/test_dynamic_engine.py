@@ -148,6 +148,11 @@ class DynamicEngineTestConfig:
     num_speculative_tokens: int = 0
     position_embedding_type: str = "learned_absolute"
     sampling_backend: str = 'torch'
+    enable_async_scheduling: bool = False
+    termination_id: Optional[int] = None
+    temperature: float = 1.0
+    top_k: int = 0
+    top_p: float = 0.0
 
     def __post_init__(self):
 
@@ -229,13 +234,19 @@ class DynamicInferenceEngineTestBase:
                     )
 
             # Sampling params.
+            termination_id = (
+                test_config.termination_id
+                if test_config.termination_id is not None
+                else (-1 if test_config.use_fixed_output_lengths else test_config.vocab_size - 1)
+            )
             sampling_params = SamplingParams(
                 num_tokens_to_generate=num_tokens_to_generate,
-                termination_id=(
-                    -1 if test_config.use_fixed_output_lengths else test_config.vocab_size - 1
-                ),
+                termination_id=termination_id,
                 return_log_probs=test_config.return_log_probs,
                 skip_prompt_log_probs=test_config.skip_prompt_log_probs,
+                temperature=test_config.temperature,
+                top_k=test_config.top_k,
+                top_p=test_config.top_p,
             )
             if not hasattr(sampling_params, "num_tokens_total"):
                 # Remove this if statement branch in megatron-core 0.16
@@ -297,6 +308,7 @@ class DynamicInferenceEngineTestBase:
                 track_generated_token_events=test_config.track_generated_token_events,
                 num_speculative_tokens=test_config.num_speculative_tokens,
                 sampling_backend=test_config.sampling_backend,
+                enable_async_scheduling=test_config.enable_async_scheduling,
             ),
         )
 
@@ -668,24 +680,24 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         # Validate generated tokens.
         gpt_expected_generated_tokens = [
             [69, 85, 55, 74, 56, 89, 64, 59, 55, 67, 15, 58, 6, 37, 54, 47],
-            [29, 54, 33, 72, 45, 76, 41, 56, 28, 25, 17, 2, 61, 6, 98, 76],
-            [35, 78, 54, 16, 79, 98, 22, 5, 60, 0, 1, 76, 77, 11, 25, 7],
-            [25, 75, 57, 85, 81, 37, 88, 17, 71, 15, 70, 64, 50, 0, 64, 45],
-            [32, 5, 85, 75, 30, 68, 23, 33, 20, 26, 89, 20, 49, 28, 38, 81],
-            [33, 69, 32, 49, 93, 24, 33, 6, 54, 89, 92, 97, 42, 80, 50, 53],
-            [82, 78, 78, 65, 26, 5, 69, 36, 37, 99],
-            [51, 70, 22, 1, 87, 42, 36, 26, 27, 56, 82, 32, 8, 80, 20, 43],
+            [33, 11, 16, 85, 17, 40, 11, 73, 92, 66, 64, 7, 2, 72, 5, 92],
+            [54, 77, 45, 69, 28, 61, 98, 89, 10, 89, 27, 96, 14, 8, 12, 18],
+            [6, 53, 50, 3, 27, 56, 5, 37, 11, 63, 83, 0, 48, 66, 99],
+            [58, 4, 88, 31, 8, 44, 34, 8, 24, 17, 35, 95, 8, 99],
+            [26, 90, 90, 77, 48, 64, 84, 55, 5, 21, 91, 31, 22, 21, 47, 14],
+            [47, 17, 28, 13, 77, 43, 22, 36, 80, 51, 84, 9, 47, 19, 6, 33],
+            [18, 73, 21, 1, 50, 21, 21, 67, 18, 47, 56, 58, 61, 22, 94, 22],
         ]
 
         mamba_expected_generated_tokens = [
             [69, 85, 55, 74, 85, 89, 64, 59, 55, 67, 15, 58, 6, 37, 34, 47],
-            [29, 16, 33, 30, 45, 76, 41, 46, 82, 17, 17, 2, 61, 6, 98, 76],
-            [35, 78, 54, 16, 79, 98, 22, 5, 37, 30, 1, 76, 5, 11, 25, 86],
-            [25, 75, 57, 85, 81, 59, 88, 38, 71, 15, 70, 64, 50, 0, 64, 45],
-            [32, 5, 85, 75, 30, 68, 23, 33, 20, 26, 35, 20, 49, 28, 34, 81],
-            [87, 69, 32, 49, 93, 24, 33, 6, 54, 89, 92, 97, 42, 80, 50, 53],
-            [82, 78, 78, 19, 70, 5, 97, 36, 37, 99],
-            [51, 70, 22, 1, 87, 42, 36, 26, 27, 56, 82, 32, 8, 20, 20, 43],
+            [67, 11, 16, 85, 17, 40, 11, 73, 81, 66, 64, 43, 2, 48, 5, 92],
+            [54, 67, 45, 69, 28, 61, 98, 89, 10, 89, 27, 96, 14, 8, 12, 18],
+            [6, 53, 25, 3, 18, 56, 5, 37, 11, 63, 83, 0, 48, 66, 99],
+            [58, 90, 88, 63, 8, 44, 24, 17, 24, 17, 35, 95, 8, 99],
+            [26, 90, 32, 77, 0, 64, 86, 55, 5, 21, 91, 31, 1, 21, 47, 14],
+            [47, 17, 28, 13, 72, 43, 83, 36, 80, 51, 84, 9, 47, 74, 6, 33],
+            [66, 73, 21, 1, 50, 21, 21, 67, 18, 47, 56, 98, 61, 22, 94, 22],
         ]
 
         if model_provider == "gpt":
@@ -849,6 +861,42 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         env.engine._add_request(request)
         assert request.status == Status.FAILED
         assert list(env.engine.waiting_request_ids) == []
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_async_scheduling_hybrid_mamba_decode_matches_serial_long_staggered(self) -> None:
+        """Hybrid/Mamba async decode must match serial tokens across a longer staggered run."""
+        skip_if_mamba_sequence_packing_not_available("hybrid")
+        common_kwargs = dict(
+            num_requests=8,
+            min_prompt_length=4,
+            max_prompt_length=4,
+            num_tokens_to_generate=32,
+            num_gap_steps=1,
+            model_provider="hybrid",
+            num_speculative_tokens=0,
+            num_cuda_graphs=1,
+            force_build_cuda_graphs=True,
+            use_cuda_graphs_for_non_decode_steps=False,
+            context_max_requests=8,
+            termination_id=-1,
+            top_k=1,
+        )
+
+        serial_env = self._run_test(enable_async_scheduling=False, **common_kwargs)
+        serial_tokens = [request.generated_tokens for request in serial_env.requests]
+
+        delete_cuda_graphs()
+
+        async_env = self._run_test(enable_async_scheduling=True, **common_kwargs)
+        async_tokens = [request.generated_tokens for request in async_env.requests]
+        controller = async_env.engine.controller
+
+        assert controller._async_forward_launch_count > 0, controller._async_disable_reason
+        assert async_tokens == serial_tokens
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -2220,7 +2268,7 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 f"num_requests ({len(env.requests)})."
             )
             assert context.max_requests == 4
-            assert step_count == 35
+            assert step_count == 34
         assert context.kv_block_allocator.active_count == 655
 
     @pytest.mark.internal

@@ -223,7 +223,7 @@ class InferenceConfig:
     """
     How CUDA graph token counts are spaced. EXPONENTIAL (default) halves from
     `cuda_graph_max_tokens` down to `tp_size` (log-spaced, ~log2(max_tokens) graphs).
-    LINEAR uses a range of linear strides (includes small graphs + mid-range linearity + 
+    LINEAR uses a range of linear strides (includes small graphs + mid-range linearity +
     a bigger step size at the top end).
     """
 
@@ -277,6 +277,9 @@ class InferenceConfig:
 
     num_speculative_tokens: int = 0
     """The number of speculative tokens to generate for decode steps."""
+
+    enable_async_scheduling: bool = False
+    """Whether to speculatively launch eligible decode-only forward passes."""
 
     enable_prefix_caching: bool = False
     """Whether to enable prefix caching for KV cache block sharing."""

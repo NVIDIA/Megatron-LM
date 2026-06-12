@@ -100,6 +100,7 @@ class TestMambaMetadata:
 
         expected_decode = torch.arange(4, dtype=torch.int32, device=metadata_context.device)
         assert torch.equal(metadata_context.batch_indices_decode, expected_decode)
+        assert torch.equal(metadata_context.batch_indices_decode_write, expected_decode)
 
         assert metadata_context.batch_indices_prefill is None
         assert metadata_context.device_decode_prefill is None
@@ -124,9 +125,33 @@ class TestMambaMetadata:
             [0, 1, -1, -1], dtype=torch.int32, device=metadata_context.device
         )
         assert torch.equal(metadata_context.batch_indices_decode, expected_decode)
+        assert torch.equal(metadata_context.batch_indices_decode_write, expected_decode)
 
         assert metadata_context.batch_indices_prefill is None
         assert metadata_context.device_decode_prefill is None
+
+    @pytest.mark.internal
+    def test_update_decode_write_indices_can_target_candidate_bank(self, metadata_context):
+        """Decode reads can come from committed banks while writes target candidate banks."""
+        padded_dims = InferenceBatchDimensions(
+            token_count=4, prefill_req_count=0, decode_req_count=4
+        )
+        real_dims = InferenceBatchDimensions(token_count=2, prefill_req_count=0, decode_req_count=2)
+        read_indices = torch.tensor([4, 9], dtype=torch.int32, device=metadata_context.device)
+        write_indices = torch.tensor([5, 8], dtype=torch.int32, device=metadata_context.device)
+
+        metadata_context.update(
+            active_mamba_indices=read_indices,
+            active_mamba_write_indices=write_indices,
+            token_to_request_idx=torch.arange(2, dtype=torch.int32, device=metadata_context.device),
+            cu_seqlens=torch.arange(3, dtype=torch.int32, device=metadata_context.device),
+            batch_dimensions=real_dims,
+            padded_batch_dimensions=padded_dims,
+            enable_chunked_prefill=False,
+        )
+
+        assert metadata_context.batch_indices_decode.tolist() == [4, 9, -1, -1]
+        assert metadata_context.batch_indices_decode_write.tolist() == [5, 8, -1, -1]
 
     @pytest.mark.internal
     def test_update_chunked_enabled_no_prefill_reqs(self, metadata_context):
