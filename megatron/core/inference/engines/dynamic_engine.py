@@ -1180,9 +1180,10 @@ class DynamicInferenceEngine(AbstractEngine):
         # Pre-compute step-level block stats (before the per-request loop)
         if self.track_generated_token_events:
             blocks_allocated = block_allocator.total_count - block_allocator.total_avail
-            if block_allocator.enable_prefix_caching:
-                blocks_hashed_active = int((block_allocator.block_ref_counts > 0).sum().item())
-                blocks_ref_count = block_allocator.block_ref_counts.sum().item()
+            pc_state = block_allocator.pc_state
+            if pc_state is not None:
+                blocks_hashed_active = int((pc_state.block_ref_counts > 0).sum().item())
+                blocks_ref_count = pc_state.block_ref_counts.sum().item()
             else:
                 blocks_hashed_active = blocks_allocated
                 blocks_ref_count = None
@@ -1248,7 +1249,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     first_token_event = None
                     if self.track_generated_token_events:
                         for token in tokens:
-                            if block_allocator.enable_prefix_caching:
+                            if block_allocator.pc_state is not None:
                                 event = request.add_event_generated_token(
                                     token,
                                     blocks_total=block_allocator.total_count,
@@ -1539,18 +1540,15 @@ class DynamicInferenceEngine(AbstractEngine):
     def _find_mamba_match_count(self, req: DynamicInferenceRequest) -> int:
         """Find farthest block with cached Mamba state by iterating from the end.
 
-        Not all blocks have Mamba state cached in mamba_hash_to_block_id,
-        only divergence and last-aligned blocks do. Iterating from the end
-        finds the farthest block with cached state, which is the only one
+        Not all blocks have Mamba state cached, only divergence and
+        last-aligned blocks do. The farthest cached block is the only one
         needed for restore since Mamba state is cumulative.
         """
         if not req.precomputed_block_hashes:
             return 0
-        mamba_map = self.context.mamba_slot_allocator.hash_to_block_id
-        for i in range(len(req.precomputed_block_hashes) - 1, -1, -1):
-            if req.precomputed_block_hashes[i] in mamba_map:
-                return i + 1
-        return 0
+        return self.context.prefix_cache_registry.match_mamba_farthest(
+            req.precomputed_block_hashes
+        )
 
     def schedule_waiting_requests(self):
         """Tries to schedule any requests in the waiting pool."""
@@ -1608,7 +1606,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Add these hashes to pending.
                 if prefix_caching_enabled:
                     for block_hash in req.precomputed_block_hashes:
-                        if block_hash not in self.context.kv_block_allocator.kv_hash_to_block_id:
+                        if block_hash not in self.context.prefix_cache_registry.kv_hash_to_block_id:
                             pending_block_hashes.add(block_hash)
                 self.context.add_request(req)
                 self._loop.call_soon_threadsafe(
@@ -1692,7 +1690,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         for block_hash in req.precomputed_block_hashes:
                             if (
                                 block_hash
-                                not in self.context.kv_block_allocator.kv_hash_to_block_id
+                                not in self.context.prefix_cache_registry.kv_hash_to_block_id
                             ):
                                 pending_block_hashes.add(block_hash)
                     self.context.chunked_prefill_request_id = -1
@@ -1712,7 +1710,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         for block_hash in req.precomputed_block_hashes:
                             if (
                                 block_hash
-                                not in self.context.kv_block_allocator.kv_hash_to_block_id
+                                not in self.context.prefix_cache_registry.kv_hash_to_block_id
                             ):
                                 pending_block_hashes.add(block_hash)
                     prefill_chunk_length = self.context.max_tokens - self.context.active_token_count
