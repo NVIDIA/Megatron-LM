@@ -375,6 +375,9 @@ class TransformerConfig(ModelParallelConfig):
     linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
 
+    gdn_conv_pad_alignment: Optional[int] = None
+    """When set, pad packed GDN causal-conv inputs to this token alignment."""
+
     ####################
     # initialization
     ####################
@@ -982,6 +985,17 @@ class TransformerConfig(ModelParallelConfig):
     and P2P communications in high-level CP groups (e.g., via IBLink).
     """
 
+    linear_cp_comm_type: Optional[str] = "all_gather"
+    """Inter-gpu communication type for context parallelism in linear-attention layers
+    (e.g. Gated Delta Net). Independent of `cp_comm_type`, which only controls standard attention.
+    Can be "a2a" or "all_gather":
+    "a2a": Scatter heads across the CP group (Ulysses-style); each rank runs the linear-attention
+    kernel on the full sequence for a shard of heads. Correct but memory-heavy.
+    "all_gather": Keep the sequence sharded across CP ranks and use CP-aware linear kernels
+    (chunk_gated_delta_rule + causal_conv1d with a CP context). Cheaper memory footprint; requires
+    a chunk-level reshuffle when the input is in Megatron's zigzag load-balanced layout.
+    """
+
     ##################
     # Cuda Graphs
     ##################
@@ -1447,6 +1461,11 @@ class TransformerConfig(ModelParallelConfig):
                     f"linear_num_value_heads ({self.linear_num_value_heads}) must be a multiple of "
                     f"linear_num_key_heads ({self.linear_num_key_heads})."
                 )
+                if self.gdn_conv_pad_alignment is not None:
+                    assert self.gdn_conv_pad_alignment > 0, (
+                        f"gdn_conv_pad_alignment must be positive when set, "
+                        f"got {self.gdn_conv_pad_alignment}."
+                    )
 
             # Check tensor parallelism compatibility
             tp_cp_size = self.tensor_model_parallel_size * self.context_parallel_size
@@ -1458,6 +1477,11 @@ class TransformerConfig(ModelParallelConfig):
                 f"{self.linear_num_value_heads=} must be a multiple of "
                 f"({self.tensor_model_parallel_size=} * {self.context_parallel_size=})."
             )
+            if self.context_parallel_size > 1:
+                assert self.linear_cp_comm_type in ("a2a", "all_gather"), (
+                    f"linear_cp_comm_type must be one of 'a2a' or 'all_gather', "
+                    f"got {self.linear_cp_comm_type!r}."
+                )
         elif self.experimental_attention_variant == "dsa":
             pass
         elif self.experimental_attention_variant == "dsv4_hybrid":
