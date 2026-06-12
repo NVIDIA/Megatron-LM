@@ -1,17 +1,17 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from megatron.core.models.gpt import GPTModel
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_decoder_block_spec,
-    get_gpt_layer_local_spec,
-    get_gpt_layer_with_transformer_engine_spec,
-    get_gpt_layer_with_inference_spec,
-    get_gpt_mtp_block_spec,
-    get_gpt_decoder_layer_specs,
-)
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_transformer_block_with_experimental_attention_variant_spec,
     get_transformer_layer_with_experimental_attention_variant_spec,
+)
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_decoder_block_spec,
+    get_gpt_decoder_layer_specs,
+    get_gpt_layer_local_spec,
+    get_gpt_layer_with_inference_spec,
+    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
     get_gpt_heterogeneous_layer_spec,
@@ -35,10 +35,8 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
         use_te = args.transformer_impl == "transformer_engine"
 
         if args.experimental_attention_variant is not None:
-            transformer_layer_spec = (
-                get_transformer_block_with_experimental_attention_variant_spec(
-                    config=config, vp_stage=vp_stage
-                )
+            transformer_layer_spec = get_transformer_block_with_experimental_attention_variant_spec(
+                config=config, vp_stage=vp_stage
             )
         elif args.num_experts:
             # Define the decoder block spec
@@ -82,10 +80,7 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
             transformer_layer_spec_for_mtp = decoder_layer_specs[-1]
         # Use spec of the last layer in decoder block as spec of the transformer layer in MTP
         mtp_block_spec = get_gpt_mtp_block_spec(
-            config,
-            transformer_layer_spec_for_mtp,
-            use_transformer_engine=use_te,
-            vp_stage=vp_stage,
+            config, transformer_layer_spec_for_mtp, use_transformer_engine=use_te, vp_stage=vp_stage
         )
 
     model = GPTModel(
@@ -134,12 +129,11 @@ def _get_transformer_layer_spec(use_te, config):
             kitchen_attention_backend=config.kitchen_attention_backend,
             mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
             use_grouped_gemm_for_dense_mlp=config.use_grouped_gemm_for_dense_mlp,
+            enable_hyper_connection=config.enable_hyper_connections,
         )
     elif config.transformer_impl == "inference_optimized":
         return get_gpt_layer_with_inference_spec(
-            config.qk_layernorm,
-            config.multi_latent_attention,
-            qk_l2_norm=config.qk_l2_norm,
+            config.qk_layernorm, config.multi_latent_attention, qk_l2_norm=config.qk_l2_norm
         )
     else:
         return get_gpt_layer_local_spec(
@@ -152,4 +146,5 @@ def _get_transformer_layer_spec(use_te, config):
             use_kitchen=config.use_kitchen,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            enable_hyper_connection=config.enable_hyper_connections,
         )
