@@ -35,6 +35,7 @@ from ...server.api import (
     RemoteGroupedRolloutRequest,
     RemoteRolloutRequest,
 )
+from ...rollout_granularity import RLRolloutGranularity
 from .. import agent
 from ..api import EnvironmentServer, InferenceServer, RemoteEvaluationRequest, RemoteRolloutRequest
 
@@ -116,7 +117,11 @@ class FastAPIEnvServer(EnvironmentServer):
         rollouts = [ContrastiveRollout.model_validate(r) for r in response.json()]
         return rollouts
 
-    async def group_rollout(self, request: GroupedRolloutRequest):
+    async def group_rollout(
+        self,
+        request: GroupedRolloutRequest,
+        submission_gate: asyncio.Semaphore | None = None,
+    ):
         assert (
             False
         ), "Calling group_rollout on FastAPIEnvServer is not supported, use get_grouped_rollouts"
@@ -127,6 +132,9 @@ class FastAPIEnvServer(EnvironmentServer):
         assert isinstance(
             request.inference_interface, InferenceServer
         ), "Rollout requests to remote server must contain an InferenceServer object"
+        assert (
+            request.submission_granularity != RLRolloutGranularity.ROLLOUT
+        ), "FastAPIEnvServer does not support rollout submission granularity"
         assert not request.streaming, "FastAPIEnvServer does not support group rollout streaming"
         payload = request.model_dump()
         payload["inference_interface"] = request.inference_interface.model_dump()

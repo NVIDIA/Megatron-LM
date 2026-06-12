@@ -153,7 +153,11 @@ class WeightedMultiTask(
 
         return final_counts
 
-    async def group_rollout(self, request: GroupedRolloutRequest) -> list[Rollout]:
+    async def group_rollout(
+        self,
+        request: GroupedRolloutRequest,
+        submission_gate: asyncio.Semaphore | None = None,
+    ) -> list[Rollout]:
         raise NotImplementedError(
             "WeightedMultiTask is a collection of tasks and therefore doesn't implement this method directly. Use get_grouped_rollouts instead to generate grouped rollouts."
         )
@@ -208,6 +212,7 @@ class WeightedMultiTask(
                     validation=request.validation,
                     generation_args=request.generation_args,
                     filter_groups_with_same_reward=request.filter_groups_with_same_reward,
+                    submission_granularity=request.submission_granularity,
                 )
                 generators.append(agent.get_grouped_rollouts(agent_request))
             else:
