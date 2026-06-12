@@ -516,15 +516,14 @@ class GatedDeltaNet(MegatronModule):
         kernel_batch = batch
         kernel_seq_len = seq_len_post_a2a
         if cp_size_all_gather > 1 and packed_seq_params is None and batch > 1:
-            # FLA CP kernels require a single batch dimension. Treat regular
-            # SBHD micro-batch samples as packed sequences while preserving the
-            # original output layout after the kernel.
-            kernel_batch = 1
-            kernel_seq_len = batch * seq_len_post_a2a
-            qkv = qkv.reshape(kernel_batch, kernel_seq_len, -1)
-            gate = gate.reshape(kernel_batch, kernel_seq_len, -1, self.value_head_dim)
-            beta = beta.reshape(kernel_batch, kernel_seq_len, -1)
-            alpha = alpha.reshape(kernel_batch, kernel_seq_len, -1)
+            # TODO: If additional gated delta rule backends are added, handle this
+            # SBHD + all-gather CP + batch>1 case per backend instead of
+            # unconditionally rejecting it.
+            raise ValueError(
+                "GDN all-gather CP with SBHD inputs currently requires micro_batch_size == 1 "
+                "because the FLA gated delta rule backend requires a single batch dimension "
+                "when cp_context is used. Use packed THD input or micro_batch_size=1."
+            )
 
         # Convolution on qkv
         nvtx_range_push(suffix="conv1d")

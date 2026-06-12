@@ -142,7 +142,9 @@ class TestGatedDeltaNet:
     def test_gpu_forward(self):
         gdn = self.gdn
 
-        micro_batch_size = 2
+        micro_batch_size = (
+            1 if self.cp_comm_type == "all_gather" and self.cp_size > 1 else 2
+        )
         seq_length = 64
         hidden_states = torch.ones(
             (seq_length // self.sp_size // self.cp_size, micro_batch_size, gdn.config.hidden_size),
@@ -168,11 +170,30 @@ class TestGatedDeltaNet:
             output.dtype == hidden_states.dtype
         ), f"Output dtype {output.dtype=} mismatch with {hidden_states.dtype=}"
 
+    def test_gpu_forward_rejects_sbhd_all_gather_cp_batch_gt_one(self):
+        if not (self.cp_comm_type == "all_gather" and self.cp_size > 1):
+            pytest.skip("Only all-gather CP with CP>1 uses the FLA CP batch guard.")
+
+        gdn = self.gdn
+
+        micro_batch_size = 2
+        seq_length = 64
+        hidden_states = torch.ones(
+            (seq_length // self.sp_size // self.cp_size, micro_batch_size, gdn.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+
+        with pytest.raises(ValueError, match="requires micro_batch_size == 1"):
+            gdn(hidden_states, None)
+
     def test_gpu_forward_rejects_sbhd_conv_padding(self):
         gdn = self.gdn
         gdn.config.gdn_conv_pad_alignment = 4096
 
-        micro_batch_size = 2
+        micro_batch_size = (
+            1 if self.cp_comm_type == "all_gather" and self.cp_size > 1 else 2
+        )
         seq_length = 64
         hidden_states = torch.ones(
             (seq_length // self.sp_size // self.cp_size, micro_batch_size, gdn.config.hidden_size),
