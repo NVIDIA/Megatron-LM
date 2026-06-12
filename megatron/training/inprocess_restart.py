@@ -150,15 +150,19 @@ def maybe_wrap_for_inprocess_restart(pretrain):
     return pretrain, store
 
 
-def maybe_force_nccl_backend_init(device_id):
+def force_nccl_backend_init(device_id: torch.device) -> None:
+    """Force NCCL backend initialization for in-process restart compatibility.
 
-    args = get_args()
+    The nvidia-resiliency-ext in-process restart uses destroy_process_group to
+    terminate the NCCL backend, which does not terminate NCCL kernels if the NCCL
+    backend wasn't fully initialized before additional distributed subgroups are created.
 
-    # Inprocess uses destroy_process_group to terminate NCCL backend, which
-    # does not terminate NCCL kernels if NCCL backend wasn't fully initialized
-    # before additional distributed subgroups are created. This forces initialization
-    # of the NCCL backend.
-    if args.inprocess_restart:
-        tensor = torch.ones(128, device=device_id)
-        torch.distributed.all_reduce(tensor)
-        torch.cuda.synchronize()
+    This function forces full initialization of the NCCL backend by performing
+    a simple all_reduce operation.
+
+    Args:
+        device_id: CUDA device ID to use for the dummy tensor operation
+    """
+    tensor = torch.ones(128, device=device_id)
+    torch.distributed.all_reduce(tensor)
+    torch.cuda.synchronize()
