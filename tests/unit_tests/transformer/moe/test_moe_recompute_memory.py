@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """CUDA memory regression test for MoE full recompute activation cleanup.
 
 Verifies that explicit deletion of intermediate tensors in unpermute()
