@@ -71,6 +71,10 @@ def test_chunk_offload_handler_respects_tensor_offloading_activation_opt_out():
     tensor = torch.empty(1024, device="cuda")
     assert handler.tensor_need_offloading_checker(tensor)
 
+    tensor._TE_do_not_offload = True
+    assert not handler.tensor_need_offloading_checker(tensor)
+
+    tensor = torch.empty(1024, device="cuda")
     tensor.offloading_activation = False
     assert not handler.tensor_need_offloading_checker(tensor)
 
