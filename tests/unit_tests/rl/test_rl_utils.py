@@ -424,13 +424,11 @@ class TestRLUtils:
         )
 
         rollouts = [[r1, r2] for _ in range(dp)]
-        try:
-            rl_utils.prepare_data_for_update(
-                [model], {}, rollouts, tokenizer, sequence_packing=False, is_correction=False
-            )
-        except AssertionError as e:
-            # We expect trajectories to come padded there.
-            assert str(e).startswith('Rollout is not the correct length')
+        # Short trajectories without a trailing eod are valid multi-turn turn
+        # boundaries (e.g. a tool-call stop) and must be accepted and padded.
+        rl_utils.prepare_data_for_update(
+            [model], {}, rollouts, tokenizer, sequence_packing=False, is_correction=False
+        )
 
         r1 = TokenRollout(
             trajectory=torch.tensor([[1, 2, 3, tokenizer.eod]], dtype=torch.float).cuda(),
@@ -514,9 +512,14 @@ class TestRLUtils:
         )
 
         rollouts = [r1, r2, r3]
+        turn_units = [
+            (rollout, turn_idx)
+            for rollout in rollouts
+            for turn_idx in range(len(rollout.trajectory))
+        ]
 
         trajs, genmask, inference_logprobs = rl_utils.prepare_trajectories(
-            rollouts,
+            turn_units,
             tokenizer,
             seq_length,
             sequence_packing=use_sequence_packing,
