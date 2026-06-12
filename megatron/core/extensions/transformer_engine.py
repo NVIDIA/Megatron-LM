@@ -3028,7 +3028,11 @@ class TEDelayedScaling(te.common.recipe.DelayedScaling):
         if get_te_version() < PkgVersion("1.8.0"):
             extra_kwargs["interval"] = config.fp8_interval
         elif config.fp8_interval != 1:
-            warnings.warn("fp8_interval is deprecated and ignored from Transformer-Engine v1.8.0.", DeprecationWarning, stacklevel=2)
+            warnings.warn(
+                "fp8_interval is deprecated and ignored from Transformer-Engine v1.8.0.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
 
         super().__init__(
             margin=config.fp8_margin,

@@ -440,7 +440,6 @@ class ModelParallelConfig:
                 "Megatron-LM training args validation rejects this combination by default. "
                 "Use cross_entropy_fusion_impl='native', or disable cross_entropy_loss_fusion.",
                 UserWarning,
-                stacklevel=2,
             )
 
         if self.defer_embedding_wgrad_compute and self.pipeline_model_parallel_size == 1:
@@ -462,8 +461,7 @@ class ModelParallelConfig:
             if self.sequence_parallel is False:
                 warnings.warn(
                     "When using expert parallelism and tensor parallelism for training, "
-                    "sequence parallelism must be used",
-                    stacklevel=2,
+                    "sequence parallelism must be used"
                 )
 
         if self.microbatch_group_size_per_vp_stage is None:

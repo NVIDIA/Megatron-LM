@@ -4449,7 +4449,7 @@ def override_sharded_param_methods_with_safety_checks(params, all_gather_pipelin
                     warnings.warn(
                         "The parameter may be sharded by Megatron-FSDP, "
                         "no actual 'to' operation is performed.",
-                        stacklevel=3,
+                        stacklevel=2,
                     )
                     return torch.empty([])
                 return to_function(*args, **kwargs)
@@ -4464,7 +4464,7 @@ def override_sharded_param_methods_with_safety_checks(params, all_gather_pipelin
                     warnings.warn(
                         "The parameter may be sharded by Megatron-FSDP, "
                         "no actual 'cpu' operation is performed.",
-                        stacklevel=3,
+                        stacklevel=2,
                     )
                     return torch.empty([], device="cpu")
                 return cpu_function(*args, **kwargs)

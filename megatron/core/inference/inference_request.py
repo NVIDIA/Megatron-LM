@@ -163,7 +163,6 @@ class InferenceRequest:
                 "`inference_parameters` renamed to `sampling_params`, and the "
                 "previous name will be removed in Mcore 0.14.",
                 DeprecationWarning,
-                stacklevel=2,
             )
             self.sampling_params = self.inference_parameters
 

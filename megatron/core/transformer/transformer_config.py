@@ -1398,7 +1398,7 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.num_moe_experts is not None and self.moe_ffn_hidden_size is None:
             self.moe_ffn_hidden_size = self.ffn_hidden_size
-            warnings.warn("moe_ffn_hidden_size is not set, using ffn_hidden_size instead.", stacklevel=2)
+            warnings.warn("moe_ffn_hidden_size is not set, using ffn_hidden_size instead.")
 
         if self.num_moe_experts is None and self.moe_ffn_hidden_size is not None:
             is_mixed_model = (
@@ -1409,8 +1409,7 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_ffn_hidden_size is set but num_moe_experts is None. "
                     "This is expected for dense layers in a mixed dense/MoE model "
                     "(moe_layer_freq indicates some layers remain dense). "
-                    "moe_ffn_hidden_size will be ignored for this layer.",
-                    stacklevel=2,
+                    "moe_ffn_hidden_size will be ignored for this layer."
                 )
                 self.moe_ffn_hidden_size = None
             else:
@@ -1455,7 +1454,6 @@ class TransformerConfig(ModelParallelConfig):
                 "moe_enable_deepep is deprecated."
                 "Please use --moe-flex-dispatcher-backend=deepep instead.",
                 DeprecationWarning,
-                stacklevel=2,
             )
 
         if self.moe_token_dispatcher_type == "flex":
@@ -1636,8 +1634,7 @@ class TransformerConfig(ModelParallelConfig):
                     "If you are using transformer_engine as the transformer implementation, "
                     "the core_attn is from transformer_engine and may be the fused version. "
                     "For fused attention, you have no need to set 'core_attn' to recompute. "
-                    "Please check that the core_attn recompute is really needed.",
-                    stacklevel=2,
+                    "Please check that the core_attn recompute is really needed."
                 )
 
             if "shared_experts" in self.recompute_modules:
@@ -1668,7 +1665,6 @@ class TransformerConfig(ModelParallelConfig):
                 "--moe-layer-recompute is deprecated. "
                 "Use --recompute-granularity selective --recompute-modules moe_layer instead.",
                 DeprecationWarning,
-                stacklevel=2,
             )
             if self.recompute_granularity == "full":
                 raise ValueError(
@@ -1965,8 +1961,7 @@ class TransformerConfig(ModelParallelConfig):
             if self.multi_latent_attention:
                 warnings.warn(
                     "apply_rope_fusion for multi-latent attention only supports training. "
-                    "It is experimental and may change in future versions.",
-                    stacklevel=2,
+                    "It is experimental and may change in future versions."
                 )
             else:
                 if self.rotary_interleaved:
@@ -2027,7 +2022,6 @@ class TransformerConfig(ModelParallelConfig):
                     + overridden_init_methods_text
                     + f" {verb} set. This may break MuP initialization assumptions.",
                     UserWarning,
-                    stacklevel=2,
                 )
 
         # Set the embedding init method.
@@ -2112,7 +2106,6 @@ class TransformerConfig(ModelParallelConfig):
                 "--moe-router-padding-for-fp8 is going to be deprecated. "
                 "Use --moe-router-padding-for-quantization instead.",
                 DeprecationWarning,
-                stacklevel=2,
             )
             self.moe_router_padding_for_quantization = True
 
@@ -2162,7 +2155,6 @@ class TransformerConfig(ModelParallelConfig):
                 "moe_router_topk_limited_devices is deprecated. Use moe_router_group_topk and "
                 "moe_router_num_groups instead.",
                 DeprecationWarning,
-                stacklevel=2,
             )
             self.moe_router_group_topk = self.moe_router_topk_limited_devices
             self.moe_router_num_groups = self.expert_model_parallel_size
@@ -2176,14 +2168,16 @@ class TransformerConfig(ModelParallelConfig):
             ), "enable_cuda_graph and external_cuda_graph cannot be enabled at the same time."
 
             if self.enable_cuda_graph:
-                warnings.warn('enable_cuda_graph is deprecated, use cuda_graph_impl=local instead.', DeprecationWarning, stacklevel=2)
+                warnings.warn(
+                    'enable_cuda_graph is deprecated, use cuda_graph_impl=local instead.',
+                    DeprecationWarning,
+                )
                 self.cuda_graph_impl = "local"
             if self.external_cuda_graph:
                 warnings.warn(
                     'external_cuda_graph is deprecated, '
                     'use cuda_graph_impl=transformer_engine instead.',
                     DeprecationWarning,
-                    stacklevel=2,
                 )
                 self.cuda_graph_impl = "transformer_engine"
 
@@ -2196,7 +2190,6 @@ class TransformerConfig(ModelParallelConfig):
             warnings.warn(
                 "cuda_graph_scope is deprecated, use cuda_graph_modules instead.",
                 DeprecationWarning,
-                stacklevel=2,
             )
 
             # CudaGraphScope is preserved as a standalone class (not an alias of CudaGraphModule)
@@ -2223,7 +2216,6 @@ class TransformerConfig(ModelParallelConfig):
                 "full scope is deprecated. "
                 "Use empty cuda_graph_modules to capture the whole layer.",
                 DeprecationWarning,
-                stacklevel=2,
             )
         for scope, attr, value in deprecated_scopes:
             migration = get_deprecated_cuda_graph_modules_migration(
@@ -2235,7 +2227,6 @@ class TransformerConfig(ModelParallelConfig):
                     "cuda_graph_impl='none'. Use cuda_graph_impl='local' with "
                     "inference_cuda_graph_scope='block' to enable inference CUDA graphs.",
                     DeprecationWarning,
-                    stacklevel=2,
                 )
                 continue
             migration_attr, migration_value = migration
@@ -2243,7 +2234,6 @@ class TransformerConfig(ModelParallelConfig):
                 f"cuda_graph_modules '{scope}' is deprecated. "
                 f"Use {migration_attr}={migration_value!r} instead.",
                 DeprecationWarning,
-                stacklevel=2,
             )
             setattr(self, migration_attr, migration_value)
         self.cuda_graph_modules = normalized_scopes
@@ -2536,8 +2526,7 @@ class TransformerConfig(ModelParallelConfig):
         ):
             warnings.warn(
                 "Using a large number of experts (e.g. >=32) without fp32 routing. "
-                "Consider enabling moe_router_dtype for better numerical stability.",
-                stacklevel=2,
+                "Consider enabling moe_router_dtype for better numerical stability."
             )
         if self.symmetric_ar_type is not None:
             if not HAVE_PACKAGING:

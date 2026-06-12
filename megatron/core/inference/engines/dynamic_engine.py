@@ -1044,7 +1044,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 warnings.warn(
                     f"Request {request_id} requested num_tokens_to_generate={requested_tokens} "
                     f"which exceeds the maximum sequence length of the engine. "
-                    f"Clamping num_tokens_to_generate to {remaining_tokens}."
+                    f"Clamping num_tokens_to_generate to {remaining_tokens}.",
+                    stacklevel=2,
                 )
 
         if len(request.prompt_tokens) > self.context.max_tokens and not self.enable_chunked_prefill:

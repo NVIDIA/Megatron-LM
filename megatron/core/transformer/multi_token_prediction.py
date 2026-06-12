@@ -1417,7 +1417,7 @@ class MultiTokenPredictionLayer(MegatronModule):
             # TODO: implement block-based recompute for MTP
             warnings.warn(
                 "recompute_method == 'block' is not supported for MTP yet." " Skipping recompute.",
-                stacklevel=3,
+                stacklevel=2,
             )
             outputs = self._proj_and_transformer_layer(
                 hidden_states=hidden_states,
