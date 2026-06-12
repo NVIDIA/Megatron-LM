@@ -64,19 +64,13 @@ def test_chunk_offload_handler_skips_non_offloadable_tensor_types():
     assert handler.tensor_pop(fake_tensor) is fake_tensor
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="CUDA is required for offloadability checks."
-)
-def test_chunk_offload_handler_respects_tensor_offload_opt_out_flags():
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offload check.")
+def test_chunk_offload_handler_respects_tensor_offloading_activation_opt_out():
     handler = _make_chunk_handler_for_offload_checker()
 
     tensor = torch.empty(1024, device="cuda")
     assert handler.tensor_need_offloading_checker(tensor)
 
-    tensor._TE_do_not_offload = True
-    assert not handler.tensor_need_offloading_checker(tensor)
-
-    tensor = torch.empty(1024, device="cuda")
     tensor.offloading_activation = False
     assert not handler.tensor_need_offloading_checker(tensor)
 

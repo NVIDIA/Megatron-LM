@@ -345,7 +345,7 @@ class OffloadTensorGroup:
         # Using memory pool is for the compatibility with cuda graph.
         # Shapes of tensors for MoE activation offload groups are not known in advance,
         # so we do not use CPU pool for them.
-        if name in ("expert_fc1", "moe_act", "expert_fc1_moe_act", "fused_group_mlp"):
+        if name in ("expert_fc1", "moe_act", "fused_group_mlp"):
             self.use_cpu_pool = False
         else:
             self.use_cpu_pool = True
@@ -900,8 +900,6 @@ class ChunkOffloadHandler:
             f"tensor_need_offloading_checker {getattr(tensor, 'offloading_activation', None)}"
         )
         if not self._can_manage_tensor_for_offload(tensor):
-            return False
-        if getattr(tensor, "_TE_do_not_offload", False):
             return False
         if tensor.numel() < self.min_offloaded_tensor_size:
             return False
