@@ -59,6 +59,12 @@ except ImportError as import_megatron_fsdp_error:
 logger = logging.getLogger(__name__)
 
 
+def _get_default_fsdp_unit_modules() -> List[torch.nn.Module]:
+    from megatron.core.models.bagel.transformer_mot_layer import MoTTransformerLayer
+
+    return [TransformerLayer, MoTTransformerLayer]
+
+
 class FullyShardedDataParallel(_BaseDataParallel):
     """
     Fully Sharded Data Parallel (FSDP) wrapper for the Megatron model.
@@ -152,7 +158,7 @@ class FullyShardedDataParallel(_BaseDataParallel):
             self.fsdp_unit_modules = fsdp_unit_modules
         else:
             if self.ddp_config.data_parallel_sharding_strategy == "optim_grads_params":
-                self.fsdp_unit_modules = [TransformerLayer]
+                self.fsdp_unit_modules = _get_default_fsdp_unit_modules()
             else:
                 self.fsdp_unit_modules = []
 

@@ -37,10 +37,11 @@ class _TENormWithResidual:
 class TESpecProvider(BackendSpecProvider):
     """A protocol for providing the submodules used in Spec building."""
 
-    def __init__(self, fallback_to_eager_attn: bool = False):
+    def __init__(self, fallback_to_eager_attn: bool = False, use_flex_attention: bool = False):
         super().__init__()
-        self.fallback_to_eager_attn = fallback_to_eager_attn
-
+        self.fallback_to_eager_attn = fallback_to_eager_attn    
+        self.use_flex_attention = use_flex_attention
+        
     def linear(self) -> type:
         """Which linear module TE backend uses"""
         return TELinear
@@ -75,6 +76,10 @@ class TESpecProvider(BackendSpecProvider):
 
     def core_attention(self) -> type:
         """Which module to use for attention"""
+        if self.use_flex_attention:
+            from megatron.core.models.bagel.flex_attention import FlexAttention
+
+            return FlexAttention
         if self.fallback_to_eager_attn:
             return DotProductAttention
         return TEDotProductAttention
