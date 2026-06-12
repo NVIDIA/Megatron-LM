@@ -89,6 +89,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_msc_args(parser)
     parser = _add_kitchen_quantization_arguments(parser)
     parser = _add_sft_args(parser)
+    parser = _add_varlen_dataset_args(parser)
 
     parser = _add_fault_injector_args(parser)
 
@@ -154,11 +155,27 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
 
-    # Args to disable MSC
-    if not args.enable_msc:
+    # Args to enable MSC (opt-in: disabled by default)
+    if args.disable_msc_deprecated:
+        warn_rank_0(
+            '--disable-msc is deprecated and will be removed in a future release. '
+            'MSC is now disabled by default; pass --enable-msc to opt in.'
+        )
+        # Preserve legacy semantics: --disable-msc forces MSC off, even if
+        # --enable-msc was also passed.
+        args.enable_msc = False
+
+    if args.enable_msc:
+        MultiStorageClientFeature.enable()
+        if not MultiStorageClientFeature.is_enabled():
+            raise RuntimeError(
+                "--enable-msc was passed but the multistorageclient package is not "
+                "installed. Install it with `pip install multi-storage-client`."
+            )
+        warn_rank_0('The MSC feature is enabled.')
+    else:
         MultiStorageClientFeature.disable()
         assert MultiStorageClientFeature.is_enabled() is False
-        warn_rank_0('The MSC feature is disabled.')
 
     return args
 
@@ -1554,16 +1571,6 @@ def validate_args(args, defaults={}):
             f"to {args.data_parallel_size * args.context_parallel_size}."
         )
 
-    if args.sequence_packing_scheduler is not None:
-        if args.sequence_packing_scheduler == 'dp_balanced':
-            total_cp_ranks = args.context_parallel_size
-        else:
-            total_cp_ranks = args.data_parallel_size * args.context_parallel_size
-        assert total_cp_ranks * args.max_seqlen_per_dp_cp_rank >= args.seq_length, (
-            f'Packed sequence buffer size ({total_cp_ranks * args.max_seqlen_per_dp_cp_rank}) '
-            f'must be >= single sequence max length ({args.seq_length})'
-        )
-
     # disable async_tensor_model_parallel_allreduce when
     # model parallel memory optimization is enabled
     if (
@@ -1692,6 +1699,61 @@ def validate_args(args, defaults={}):
             args.use_megatron_fsdp
         ), "--ckpt-format fsdp_dtensor is only tested with Megatron FSDP."
 
+    # --use-varlen-dataset: independent of --sft. Cannot be combined with --sft
+    # because they are mutually-exclusive top-level dataset selectors that both
+    # drive the packed-sequence (THD) path.
+    if args.use_varlen_dataset:
+        assert not args.sft, (
+            "--use-varlen-dataset and --sft are mutually exclusive; both "
+            "select the packed-sequence dataset family. Pick one."
+        )
+        if args.varlen_sbhd_validation:
+            # ``--dynamic-context-parallel`` ⊥ ``--varlen-sbhd-validation`` is
+            # checked in ``GPTDatasetConfig.__post_init__``; only the
+            # scheduler check stays here, since ``sequence_packing_scheduler``
+            # is a training-framework flag not stored on the dataset config.
+            assert args.sequence_packing_scheduler is None, (
+                "--varlen-sbhd-validation does not use a sequence packing "
+                "scheduler; drop --sequence-packing-scheduler."
+            )
+            # SBHD validation is a real-data numerical-reference path only;
+            # MockVarlenDataset does not implement it.
+            assert not args.mock_data, (
+                "--varlen-sbhd-validation is not supported with --mock-data; "
+                "SBHD validation requires a real dataset."
+            )
+        else:
+            # VarlenDataset emits one unpacked sample per __getitem__; it
+            # relies on an upstream packing scheduler to group variable-length
+            # samples into THD batches. Auto-pick a default scheduler when
+            # the user did not request one explicitly:
+            #   * ``--dynamic-context-parallel`` is already wired to
+            #     ``default_dynamic_cp`` upstream (see the dynamic-cp block
+            #     earlier in ``validate_args``).
+            #   * Otherwise fall back to ``dp_balanced`` (static packing).
+            if args.sequence_packing_scheduler is None:
+                args.sequence_packing_scheduler = 'dp_balanced'
+
+    # Packed-sequence buffer-size check. Placed after all scheduler auto-select
+    # logic (dynamic-cp and --use-varlen-dataset both set the scheduler above)
+    # so it validates the final resolved scheduler; the varlen path picks its
+    # default after the earlier generic validation has run.
+    if args.sequence_packing_scheduler is not None:
+        if args.sequence_packing_scheduler == 'dp_balanced':
+            total_cp_ranks = args.context_parallel_size
+        else:
+            total_cp_ranks = args.data_parallel_size * args.context_parallel_size
+        if args.max_seqlen_per_dp_cp_rank is None:
+            args.max_seqlen_per_dp_cp_rank = getattr(args, "max_seqlen_per_cp_rank", None)
+        if args.max_seqlen_per_dp_cp_rank is None:
+            args.max_seqlen_per_dp_cp_rank = (
+                args.seq_length + total_cp_ranks - 1
+            ) // total_cp_ranks
+        assert total_cp_ranks * args.max_seqlen_per_dp_cp_rank >= args.seq_length, (
+            f'Packed sequence buffer size ({total_cp_ranks * args.max_seqlen_per_dp_cp_rank}) '
+            f'must be >= single sequence max length ({args.seq_length})'
+        )
+
     # Data blend checks
     assert (
         args.mock_data
@@ -1714,6 +1776,11 @@ def validate_args(args, defaults={}):
         assert all(
             token is not None for token in extra_tokens
         ), "FIM extra tokens should be specified."
+
+    assert not (args.cross_entropy_loss_fusion and args.cross_entropy_fusion_impl == 'te'), (
+        "Transformer Engine cross entropy loss fusion is disabled due to stability issues. "
+        "Use --cross-entropy-fusion-impl native, or omit --cross-entropy-loss-fusion."
+    )
 
     # Deterministic mode
     if args.deterministic_mode:
@@ -2476,6 +2543,25 @@ def _add_inference_args(parser):
         'Pause/unpause take effect as soon as the signal is delivered to a rank. '
         'Only safe when EP coordination is not required (e.g. ep_world_size == 1).',
     )
+    group.add_argument(
+        '--inference-cuda-graph-all-prefills',
+        action='store_true',
+        default=False,
+        help='Extend prefill/mixed CUDA graph capture up to `max_tokens`. '
+        'By default, all graphs are limited by the decode limit of '
+        '`max_requests * (num_speculative_tokens + 1)`.',
+    )
+    group.add_argument(
+        '--inference-dynamic-batching-cuda-graph-sizing-distribution',
+        type=str,
+        default='exponential',
+        choices=['exponential', 'linear'],
+        dest='inference_dynamic_batching_cuda_graph_sizing_distribution',
+        help='Spacing of CUDA graph token counts. "exponential" (default) '
+        'halves from cuda_graph_max_tokens down to tp_size, giving a '
+        'log-spaced distribution with bounded relative padding. '
+        '"linear" uses varying linear strides across the range.',
+    )
     return parser
 
 
@@ -2485,6 +2571,7 @@ def _add_network_size_args(parser):
         "timers",
         "finalize_model_grads_func",
         "grad_scale_func",
+        "mtp_grad_scale_func",
         "no_sync_func",
         "grad_sync_func",
         "param_sync_func",
@@ -3974,6 +4061,19 @@ def _add_distributed_args(parser):
                        This is quite useful for profiling memory usage of distributed training with just one GPU. \
                        Setting WORLD_SIZE and RANK to the specific values for target distribtued scale.',
     )
+    group.add_argument(
+        '--no-use-layer-wise-param-layout',
+        action='store_false',
+        dest='use_layer_wise_param_layout',
+        help='Opt out of the precomputed LayerWise param layout. When set, '
+        'falls back to the legacy LayerWise ping-pong path: all params '
+        '(including non-Muon embeddings, biases, layernorm) live in a single '
+        'LayerWise buffer and the optimizer uses the allgather_params() codepath. '
+        'The default (precomputed layout) routes non-Muon params through a '
+        'separate DistributedOptimizer with byte-level sharding, which is faster '
+        'and uses less padding but produces different bf16 reduction ordering '
+        'and so will not match legacy-path loss curves bit-for-bit.',
+    )
     return parser
 
 
@@ -4780,6 +4880,22 @@ def _add_experimental_args(parser):
         "be used for the gradient communication / reduction data-type. When using NCCL "
         "v2.27+, reduction is always computed in FP32 if using NCCL Symmetric kernels.",
     )
+    group.add_argument(
+        '--megatron-fsdp-enable-fine-grained-param-gather',
+        action='store_true',
+        default=False,
+        dest='megatron_fsdp_enable_fine_grained_param_gather',
+        help=(
+            'If set, enables fine-grained parameter gathering for Megatron-FSDP. '
+            'This allows greater overlap between parameter all-gather operations and '
+            'forward computation, at the cost of additional communication calls. '
+            'For MXFP8, this helps save memory during fine-grained activation '
+            'recomputation, because MXFP8 forward and backward passes use different '
+            'parameter representations (rowwise data for forward, colwise data for '
+            'backward). Only the rowwise parameters of modules involved in '
+            'recomputation will be unsharded.'
+        ),
+    )
 
     return parser
 
@@ -4787,11 +4903,20 @@ def _add_experimental_args(parser):
 def _add_msc_args(parser):
     group = parser.add_argument_group(title="msc")
     group.add_argument(
-        '--disable-msc',
-        default=True,
-        action='store_false',
+        '--enable-msc',
+        default=False,
+        action='store_true',
         dest='enable_msc',
-        help='Disable the usage of Multi-Storage Client (MSC) in Megatron Core.',
+        help='Enable the usage of Multi-Storage Client (MSC) in Megatron Core. '
+        'Disabled by default; pass this flag to opt in.',
+    )
+    group.add_argument(
+        '--disable-msc',
+        default=False,
+        action='store_true',
+        dest='disable_msc_deprecated',
+        help='[DEPRECATED] MSC is disabled by default; this flag is a no-op '
+        'and will be removed in a future release.',
     )
     return parser
 
@@ -4840,9 +4965,60 @@ def _add_sft_args(parser):
         '--sft-mock-dataset-config-json',
         type=str,
         default=None,
-        help='This config provides the necessary information for the mock dataset. You can either specify a CSV file that contains sequence lengths, where each line stores the length of a sequence, for example: {"mode":"file","path":"/path/to/file"}. Alternatively, you can specify a distribution (currently only supporting lognormal distribution) along with the required parameters, for example, {"mode":"distribution","type":"lognormal","min_seq_len":1024,"max_seq_len":2048,"mean_seq_len":1536,"lognormal_sigma":1.1}, where sigma controls the variability of the lognormal distribution. '
+        help='This config provides the necessary information for the mock dataset. '
+        'Accepts either an inline JSON literal or a path to a JSON file containing '
+        'the same schema. You can either specify a CSV file that contains sequence lengths, '
+        'where each line stores the length of a sequence, for example: '
+        '{"mode":"file","path":"/path/to/file"}. Alternatively, you can specify a distribution '
+        '(currently only supporting lognormal distribution) along with the required parameters, '
+        'for example, {"mode":"distribution","type":"lognormal","min_seq_len":1024,'
+        '"max_seq_len":2048,"mean_seq_len":1536,"lognormal_sigma":1.1}, where sigma controls '
+        'the variability of the lognormal distribution. '
         'If not specified and --mock-data is set, defaults to a lognormal distribution with '
         'min_seq_len=seq_length//2, max_seq_len=seq_length, mean_seq_len=seq_length*3//4, lognormal_sigma=1.1.',
+    )
+    return parser
+
+
+def _add_varlen_dataset_args(parser):
+    group = parser.add_argument_group(title='varlen dataset')
+    group.add_argument(
+        '--use-varlen-dataset',
+        action="store_true",
+        help='Train with VarlenDataset, a variable-length packed (THD) dataset '
+        'that consumes instruction-tuning data from a HuggingFace Hub repo id, '
+        'a local parquet file, or a local jsonl file. Schema (alpaca / sharegpt '
+        '/ openai-messages) is auto-detected from the dataset columns. '
+        'Mutually exclusive with --sft. Auto-picks a sequence packing '
+        'scheduler when none is given: ``dp_balanced`` by default, '
+        '``default_dynamic_cp`` when ``--dynamic-context-parallel`` is set. '
+        'Combine with --mock-data for a synthetic lognormal sequence-length '
+        'distribution; see --varlen-mock-dataset-config-json.',
+    )
+    group.add_argument(
+        '--varlen-sbhd-validation',
+        action="store_true",
+        help='Reference SBHD mode for THD numerical verification. When set, '
+        'VarlenDataset emits SBHD-style samples right-padded to '
+        '--seq-length (no cu_seqlens, no packing scheduler), so the run can '
+        'be compared against the THD path to validate correctness. '
+        'Incompatible with --dynamic-context-parallel and '
+        '--sequence-packing-scheduler.',
+    )
+    group.add_argument(
+        '--varlen-mock-dataset-config-json',
+        type=str,
+        default=None,
+        help='Mock-dataset config for --use-varlen-dataset --mock-data. '
+        'Accepts either an inline JSON literal or a path to a JSON file containing '
+        'the same schema as --sft-mock-dataset-config-json: either '
+        '{"mode":"file","path":"/path/to/lengths.csv"}, '
+        '{"mode":"distribution","type":"lognormal","min_seq_len":1024,'
+        '"max_seq_len":2048,"mean_seq_len":1536,"lognormal_sigma":1.1}, or '
+        '{"mode":"verification","data_path":"/prefix/of/IndexedDataset"}. '
+        'If not specified, defaults to a lognormal distribution with '
+        'min_seq_len=seq_length//2, max_seq_len=seq_length, '
+        'mean_seq_len=seq_length*3//4, lognormal_sigma=1.1.',
     )
     return parser
 

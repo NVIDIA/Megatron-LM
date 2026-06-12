@@ -1,0 +1,25 @@
+_target_: verl_mlite.engine.config.MegatronLiteEngineConfig
+
+strategy: mlite
+custom_backend_module: verl_mlite.engine.mlite_engine
+param_offload: false
+optimizer_offload: false
+grad_offload: false
+forward_only: false
+dtype: bfloat16
+export_dtype: bfloat16
+
+model_name: auto
+impl: lite
+
+tp: 1
+etp: null
+ep: 1
+pp: 1
+vpp: 1
+cp: 1
+
+attention_backend_override: flash
+router_aux_loss_coef: null
+impl_cfg:
+  use_thd: true
