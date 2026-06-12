@@ -595,6 +595,21 @@ def test_reloaded_tensor_mark_survives_lost_python_attr():
     assert not consume_reloaded_tensor_mark(detached)
 
 
+def test_collect_checkpoint_input_grads_clears_leaf_grad():
+    """Checkpoint input grads are returned without keeping leaf .grad references."""
+    from megatron.core.extensions import transformer_engine as te_ext
+
+    x = torch.ones(4, requires_grad=True)
+    grad = torch.full_like(x, 2.0)
+    x.grad = grad
+
+    grads = te_ext._collect_checkpoint_input_grads((x, None))
+
+    assert grads[0] is grad
+    assert grads[1] is None
+    assert x.grad is None
+
+
 @pytest.mark.flaky_in_dev
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
 @pytest.mark.skipif(

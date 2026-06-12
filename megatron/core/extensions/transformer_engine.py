@@ -2823,6 +2823,18 @@ def _resize_fgao_checkpoint_inputs(detached_inputs):
         inp._mcore_fgao_resize_after_backward = False
 
 
+def _collect_checkpoint_input_grads(detached_inputs):
+    """Return leaf input grads and clear the temporary ``.grad`` references."""
+    grads = []
+    for inp in detached_inputs:
+        if torch.is_tensor(inp):
+            grads.append(inp.grad)
+            inp.grad = None
+        else:
+            grads.append(None)
+    return tuple(grads)
+
+
 def _install_te_checkpoint_fgao_resize_patch():
     """Patch TE reentrant checkpoint to resize FGAO-reloaded inputs after nested backward."""
     global _TE_CHECKPOINT_FGAO_RESIZE_PATCHED
@@ -2911,9 +2923,7 @@ def _install_te_checkpoint_fgao_resize_patch():
             )
 
         torch.autograd.backward(outputs_with_grad, args_with_grad)
-        grads = tuple(
-            inp.grad if isinstance(inp, torch.Tensor) else None for inp in detached_inputs
-        )
+        grads = _collect_checkpoint_input_grads(detached_inputs)
         _resize_fgao_checkpoint_inputs(detached_inputs)
         return (None, None, None, None, None, None) + grads
 
