@@ -214,8 +214,10 @@ class GroupedRolloutGenerator(Agent, ABC):
         )
         submitted_groups = 0
 
-        # num_groups controls how many groups each worker generates and yields together.
-        # When it's 1, the semaphore is a no-op.
+        # num_groups controls how many groups each worker submits together. When
+        # it is 1, groups are submitted eagerly and independently. If
+        # enforce_order is enabled, completion-order results are buffered and
+        # yielded in original submission order.
         groups_per_worker = request.num_groups
         if groups_per_worker > 1:
             assert not request.filter_groups_with_same_reward, \
@@ -257,7 +259,10 @@ class GroupedRolloutGenerator(Agent, ABC):
                         for i in range(groups_per_worker)
                     ])
                 else:
-                    if not await generate_and_enqueue(batch_id, 0):
+                    if request.enforce_order:
+                        while not await generate_and_enqueue(batch_id, 0):
+                            pass
+                    elif not await generate_and_enqueue(batch_id, 0):
                         submitted_groups -= groups_per_worker
                         submission_gate.release()
 
