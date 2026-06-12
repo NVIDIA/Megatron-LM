@@ -17,21 +17,15 @@
 import argparse
 import json
 import os
-import re
 import sys
 from dataclasses import dataclass
+
+from github_slack_utils import get_slack_client, get_slack_user_id, get_user_email
 
 try:
     import requests
 except ImportError:  # pragma: no cover - workflow installs requests.
     requests = None
-
-try:
-    from slack_sdk import WebClient
-    from slack_sdk.errors import SlackApiError
-except ImportError:  # pragma: no cover - workflow installs slack-sdk.
-    WebClient = None
-    SlackApiError = Exception
 
 
 GITHUB_API_URL = "https://api.github.com"
@@ -41,9 +35,6 @@ MCORE_ONCALL_SLACK_USERGROUP_ID = "S0A7B4U1T3P"
 CONFIDENCE_THRESHOLD = 0.75
 MAX_SLACK_CONTEXT_CHARS = 1200
 SERVICE_ACCOUNT_LOGINS = {"svcnvidia-nemo-ci"}
-
-_email_cache = {}
-_slack_id_cache = {}
 
 
 @dataclass(frozen=True)
@@ -443,89 +434,6 @@ def create_assignment_plan(analysis: dict, issue: IssueContext) -> AssignmentPla
         rejected_candidate_confidence=confidence if candidate_decision.rejected_candidate else None,
         rejected_candidate_reason=candidate_decision.rejected_reason,
     )
-
-
-def get_user_email(username: str) -> str:
-    """Get user's email from GitHub, preferring @nvidia.com addresses."""
-
-    if username in _email_cache:
-        return _email_cache[username]
-
-    public_email = None
-
-    try:
-        user_data = request_json("GET", f"{GITHUB_API_URL}/users/{username}")
-        email = user_data.get("email") if user_data else None
-        if email and not email.endswith("@users.noreply.github.com"):
-            if email.endswith("@nvidia.com"):
-                _email_cache[username] = email
-                return email
-            public_email = email
-
-        repo_env = os.environ.get("GITHUB_REPOSITORY", "NVIDIA/Megatron-LM")
-        commits = request_json(
-            "GET", f"{GITHUB_API_URL}/repos/{repo_env}/commits?author={username}&per_page=10"
-        )
-        for commit in commits or []:
-            commit_data = commit.get("commit", {})
-            author_data = commit_data.get("author", {})
-            email = author_data.get("email")
-            if email and not email.endswith("@users.noreply.github.com"):
-                if email.endswith("@nvidia.com"):
-                    _email_cache[username] = email
-                    return email
-                if public_email is None:
-                    public_email = email
-
-            signoff_matches = re.findall(
-                r"Signed-off-by:.*<([^>]+@nvidia\.com)>", commit_data.get("message", "")
-            )
-            if signoff_matches:
-                _email_cache[username] = signoff_matches[0]
-                return signoff_matches[0]
-
-    except SystemExit:
-        raise
-    except Exception as exc:  # pragma: no cover - defensive API fallback.
-        print(f"Warning: Could not get email for {username}: {exc}")
-
-    fallback = public_email or f"{username}@users.noreply.github.com"
-    _email_cache[username] = fallback
-    return fallback
-
-
-def get_slack_client(require_slack: bool):
-    slack_token = os.environ.get("SLACK_TOKEN")
-    if not slack_token:
-        if require_slack:
-            print("Error: SLACK_TOKEN is required to notify the assignee")
-            sys.exit(1)
-        print("Slack token not configured, skipping Slack notification")
-        return None
-
-    if WebClient is None:
-        print("Error: slack-sdk is not installed")
-        sys.exit(1)
-
-    return WebClient(token=slack_token)
-
-
-def get_slack_user_id(slack_client, email: str) -> str | None:
-    if not slack_client:
-        return None
-
-    if email in _slack_id_cache:
-        return _slack_id_cache[email]
-
-    try:
-        response = slack_client.users_lookupByEmail(email=email)
-        user_id = response["user"]["id"]
-        _slack_id_cache[email] = user_id
-        return user_id
-    except SlackApiError as exc:
-        print(f"Warning: Could not find Slack user for {email}: {exc.response['error']}")
-        _slack_id_cache[email] = None
-        return None
 
 
 def build_slack_message(issue: IssueContext, plan: AssignmentPlan) -> str:

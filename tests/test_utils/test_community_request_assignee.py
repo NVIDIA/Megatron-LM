@@ -1,13 +1,15 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 
 import importlib.util
+import sys
 from pathlib import Path
 
 
 def load_assignee_module():
-    module_path = (
-        Path(__file__).parents[2] / ".github" / "scripts" / "community_request_assignee.py"
-    )
+    scripts_dir = Path(__file__).parents[2] / ".github" / "scripts"
+    module_path = scripts_dir / "community_request_assignee.py"
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
     spec = importlib.util.spec_from_file_location("community_request_assignee", module_path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
