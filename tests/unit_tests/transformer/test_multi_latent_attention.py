@@ -1768,6 +1768,36 @@ class TestFusedMLAGradientFlow:
         assert hidden_states.grad is not None
 
 
+def test_fused_mla_training_hooks_use_fused_down_projection(monkeypatch):
+    """Training hooks should use fused q/kv down projection attributes."""
+
+    class LinearWithDelayedWgrad:
+        def __init__(self, name):
+            self.name = name
+
+        def backward_dw(self):
+            calls.append(self.name)
+
+    calls = []
+    fused = FusedMLASelfAttention.__new__(FusedMLASelfAttention)
+    fused.linear_kv_up_proj = LinearWithDelayedWgrad("kv_up")
+    fused.linear_qkv_down_proj = LinearWithDelayedWgrad("qkv_down")
+    fused.linear_q_up_proj = LinearWithDelayedWgrad("q_up")
+    fused.linear_proj = LinearWithDelayedWgrad("out")
+
+    fused.backward_dw()
+
+    assert calls == ["kv_up", "qkv_down", "q_up", "out"]
+
+    saved_inputs = []
+    mla_module = __import__(FusedMLASelfAttention.__module__, fromlist=["set_save_original_input"])
+    monkeypatch.setattr(mla_module, "set_save_original_input", saved_inputs.append)
+
+    fused.set_for_recompute_input_layernorm()
+
+    assert saved_inputs == [fused.linear_qkv_down_proj]
+
+
 class TestFusedMLALoadFromStateDict:
 
     @pytest.fixture(scope='function', autouse=True)
