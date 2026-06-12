@@ -34,7 +34,7 @@ from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphS
 from megatron.core.transformer.module import Float16Module
 from megatron.rl import rl_utils
 from megatron.rl.agent.api import TokenRollout
-from megatron.rl.rollout_granularity import RLRolloutGranularity
+from megatron.rl.rollout_granularity import RLRolloutGranularity, get_rl_parallel_generation_tasks
 from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
@@ -167,56 +167,45 @@ class TestRLUtils:
         return args
 
     @pytest.mark.parametrize(
-        "overrides, expected, expected_warning",
+        "overrides, expected, expected_parallel_generation_tasks",
         [
             pytest.param(
-                {"rl_generation_batch_size": 1, "grpo_prompts_per_step": 1},
-                {"rl_generation_batch_size": 1, "rl_enforce_generation_order": False},
-                None,
-                id="legacy-group-submit-group-consume",
-            ),
-            pytest.param(
-                {"rl_generation_batch_size": 1, "grpo_prompts_per_step": 8},
-                {"rl_generation_batch_size": 1, "rl_enforce_generation_order": True},
-                None,
-                id="legacy-group-submit-batch-consume",
-            ),
-            pytest.param(
-                {"rl_generation_batch_size": 4, "grpo_prompts_per_step": 8},
-                {"rl_generation_batch_size": 4, "rl_enforce_generation_order": True},
-                None,
-                id="legacy-batch-submit-batch-consume",
+                {"grpo_prompts_per_step": 8},
+                {
+                    "rl_submission_granularity": RLRolloutGranularity.GROUP,
+                    "rl_consumption_granularity": RLRolloutGranularity.BATCH,
+                    "rl_generation_lag": 0,
+                },
+                8,
+                id="default-group-submit-batch-consume",
             ),
             pytest.param(
                 {
                     "rl_submission_granularity": RLRolloutGranularity.ROLLOUT,
                     "rl_consumption_granularity": RLRolloutGranularity.BATCH,
+                    "grpo_group_size": 4,
                     "grpo_prompts_per_step": 8,
                 },
-                {"rl_generation_batch_size": 1, "rl_enforce_generation_order": True},
-                None,
+                {
+                    "rl_submission_granularity": RLRolloutGranularity.ROLLOUT,
+                    "rl_consumption_granularity": RLRolloutGranularity.BATCH,
+                },
+                32,
                 id="rollout-submit-batch-consume",
             ),
             pytest.param(
                 {
                     "rl_submission_granularity": RLRolloutGranularity.ROLLOUT,
                     "rl_consumption_granularity": RLRolloutGranularity.GROUP,
+                    "grpo_group_size": 4,
                     "grpo_prompts_per_step": 8,
                 },
-                {"rl_generation_batch_size": 1, "rl_enforce_generation_order": False},
-                None,
-                id="rollout-submit-group-consume",
-            ),
-            pytest.param(
                 {
                     "rl_submission_granularity": RLRolloutGranularity.ROLLOUT,
-                    "rl_consumption_granularity": RLRolloutGranularity.BATCH,
-                    "rl_generation_batch_size": 4,
-                    "grpo_prompts_per_step": 8,
+                    "rl_consumption_granularity": RLRolloutGranularity.GROUP,
                 },
-                {"rl_generation_batch_size": 4, "rl_enforce_generation_order": True},
-                None,
-                id="rollout-submission-keeps-generation-batch-size",
+                32,
+                id="rollout-submit-group-consume",
             ),
             pytest.param(
                 {
@@ -224,8 +213,11 @@ class TestRLUtils:
                     "rl_consumption_granularity": RLRolloutGranularity.BATCH,
                     "grpo_prompts_per_step": 8,
                 },
-                {"rl_generation_batch_size": 8, "rl_enforce_generation_order": True},
-                None,
+                {
+                    "rl_submission_granularity": RLRolloutGranularity.BATCH,
+                    "rl_consumption_granularity": RLRolloutGranularity.BATCH,
+                },
+                8,
                 id="batch-submit-batch-consume",
             ),
             pytest.param(
@@ -234,8 +226,11 @@ class TestRLUtils:
                     "rl_consumption_granularity": RLRolloutGranularity.BATCH,
                     "grpo_prompts_per_step": 8,
                 },
-                {"rl_generation_batch_size": 1, "rl_enforce_generation_order": True},
-                None,
+                {
+                    "rl_submission_granularity": RLRolloutGranularity.GROUP,
+                    "rl_consumption_granularity": RLRolloutGranularity.BATCH,
+                },
+                8,
                 id="group-submit-batch-consume",
             ),
             pytest.param(
@@ -244,77 +239,60 @@ class TestRLUtils:
                     "rl_consumption_granularity": RLRolloutGranularity.GROUP,
                     "grpo_prompts_per_step": 8,
                 },
-                {"rl_generation_batch_size": 1, "rl_enforce_generation_order": False},
-                None,
+                {
+                    "rl_submission_granularity": RLRolloutGranularity.GROUP,
+                    "rl_consumption_granularity": RLRolloutGranularity.GROUP,
+                },
+                8,
                 id="group-submit-group-consume",
             ),
             pytest.param(
                 {
                     "rl_submission_granularity": RLRolloutGranularity.GROUP,
                     "rl_consumption_granularity": RLRolloutGranularity.BATCH,
-                    "rl_generation_batch_size": 4,
+                    "rl_generation_lag": 2,
                     "grpo_prompts_per_step": 8,
                 },
-                {"rl_generation_batch_size": 1, "rl_enforce_generation_order": True},
-                "overrides --rl-generation-batch-size",
-                id="group-submission-overrides-generation-batch-size",
+                {"rl_generation_lag": 2},
+                24,
+                id="generation-lag-group-slots",
             ),
             pytest.param(
                 {
                     "rl_submission_granularity": RLRolloutGranularity.BATCH,
                     "rl_consumption_granularity": RLRolloutGranularity.BATCH,
-                    "rl_generation_batch_size": 1,
+                    "rl_generation_lag": 2,
                     "grpo_prompts_per_step": 8,
                 },
-                {"rl_generation_batch_size": 8, "rl_enforce_generation_order": True},
-                "overrides --rl-generation-batch-size",
-                id="batch-submission-overrides-generation-batch-size",
-            ),
-            pytest.param(
-                {"grpo_group_size": 4, "rl_num_parallel_generations": 12},
-                {"rl_parallel_generation_tasks": 3},
-                None,
-                id="num-parallel-generations-group-slots",
+                {"rl_generation_lag": 2},
+                24,
+                id="generation-lag-batch-slots",
             ),
             pytest.param(
                 {
                     "rl_submission_granularity": RLRolloutGranularity.ROLLOUT,
-                    "grpo_group_size": 4,
-                    "rl_num_parallel_generations": 10,
-                },
-                {"rl_parallel_generation_tasks": 10},
-                None,
-                id="num-parallel-generations-rollout-slots",
-            ),
-            pytest.param(
-                {
-                    "rl_submission_granularity": RLRolloutGranularity.ROLLOUT,
+                    "rl_consumption_granularity": RLRolloutGranularity.BATCH,
+                    "rl_generation_lag": 2,
                     "grpo_group_size": 4,
                     "grpo_prompts_per_step": 8,
-                    "rl_generation_batch_size": 2,
-                    "rl_num_parallel_generation_batches": 3,
                 },
-                {"rl_parallel_generation_tasks": 24},
-                None,
-                id="num-parallel-generation-batches-rollout-slots",
+                {"rl_generation_lag": 2},
+                96,
+                id="generation-lag-rollout-slots",
             ),
         ],
     )
-    def test_rl_granularity_validation(self, overrides, expected, expected_warning):
-        context = (
-            pytest.warns(UserWarning, match=expected_warning)
-            if expected_warning
-            else nullcontext()
+    def test_rl_granularity_validation(self, overrides, expected, expected_parallel_generation_tasks):
+        args = self.create_test_args(
+            perform_rl_step=True,
+            rl_partial_rollouts=True,
+            **overrides,
         )
-        with context:
-            args = self.create_test_args(
-                perform_rl_step=True,
-                rl_partial_rollouts=True,
-                **overrides,
-            )
 
         for key, value in expected.items():
             assert getattr(args, key) == value
+        assert not hasattr(args, "rl_parallel_generation_tasks")
+        assert get_rl_parallel_generation_tasks(args) == expected_parallel_generation_tasks
 
     @pytest.mark.parametrize(
         "overrides, error",
@@ -341,10 +319,10 @@ class TestRLUtils:
                 {
                     "rl_partial_rollouts": False,
                     "rl_submission_granularity": RLRolloutGranularity.GROUP,
-                    "rl_consumption_granularity": RLRolloutGranularity.BATCH,
+                    "rl_generation_lag": 1,
                 },
-                "require --rl-partial-rollouts",
-                id="explicit-granularity-requires-partial-rollouts",
+                "--rl-generation-lag requires --rl-partial-rollouts",
+                id="generation-lag-requires-partial-rollouts",
             ),
             pytest.param(
                 {
@@ -357,30 +335,11 @@ class TestRLUtils:
             pytest.param(
                 {
                     "rl_partial_rollouts": True,
-                    "rl_consumption_granularity": RLRolloutGranularity.GROUP,
-                    "rl_generation_batch_size": 4,
+                    "rl_generation_lag": -1,
                     "grpo_prompts_per_step": 8,
                 },
-                "does not support batch submission",
-                id="group-consume-rejects-batch-submission",
-            ),
-            pytest.param(
-                {
-                    "rl_partial_rollouts": True,
-                    "rl_generation_batch_size": 4,
-                    "grpo_prompts_per_step": 10,
-                },
-                "must be divisible by --rl-generation-batch-size",
-                id="partial-generation-batch",
-            ),
-            pytest.param(
-                {
-                    "rl_partial_rollouts": True,
-                    "rl_generation_batch_size": 0,
-                    "grpo_prompts_per_step": 8,
-                },
-                "--rl-generation-batch-size must be positive",
-                id="nonpositive-generation-batch",
+                "--rl-generation-lag must be non-negative",
+                id="negative-generation-lag",
             ),
         ],
     )
@@ -390,6 +349,29 @@ class TestRLUtils:
                 perform_rl_step=True,
                 **overrides,
             )
+
+    @pytest.mark.parametrize(
+        "flag",
+        [
+            "--rl-generation-batch-size",
+            "--rl-num-parallel-generations",
+            "--rl-num-parallel-generation-batches",
+            "--rl-parallel-generation-tasks",
+        ],
+    )
+    def test_removed_rl_generation_flags_are_rejected(self, monkeypatch, flag):
+        monkeypatch.setattr("sys.argv", ["test", flag, "1"])
+        with pytest.raises(SystemExit):
+            parse_args(ignore_unknown_args=False)
+
+    @pytest.mark.parametrize(
+        "flag",
+        ["--rl-submission-granularity", "--rl-consumption-granularity"],
+    )
+    def test_rl_granularity_choices_reject_unknown_value(self, monkeypatch, flag):
+        monkeypatch.setattr("sys.argv", ["test", flag, "X"])
+        with pytest.raises(SystemExit):
+            parse_args(ignore_unknown_args=False)
 
     def _patch_rl_inference_mode_deps(self, monkeypatch, args):
         interface = MagicMock()

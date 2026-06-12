@@ -196,7 +196,9 @@ class WeightedMultiTask(
 
         # Create tasks for each agent with non-zero groups
         generators = []
-        for agent, num_groups, pgt in zip(self.agents, agent_groups, agent_pgts, strict=True):
+        for agent, num_groups, pgt in zip(
+            self.agents, agent_groups, agent_pgts, strict=True
+        ):
             if num_groups > 0:
                 if not isinstance(agent, GroupedRolloutGenerator):
                     raise TypeError(
@@ -206,13 +208,13 @@ class WeightedMultiTask(
                 agent_request = GroupedRolloutRequest(
                     num_groups=num_groups,
                     streaming=request.streaming,
-                    enforce_order=request.enforce_order,
                     rollouts_per_group=request.rollouts_per_group,
                     inference_interface=request.inference_interface,
                     validation=request.validation,
                     generation_args=request.generation_args,
                     filter_groups_with_same_reward=request.filter_groups_with_same_reward,
                     submission_granularity=request.submission_granularity,
+                    consumption_granularity=request.consumption_granularity,
                 )
                 generators.append(agent.get_grouped_rollouts(agent_request))
             else:

@@ -43,12 +43,6 @@ from megatron.training.argument_utils import ArgumentGroupFactory, core_transfor
 
 
 
-def _normalize_rl_rollout_granularity(value):
-    if value is None or isinstance(value, RLRolloutGranularity):
-        return value
-    return RLRolloutGranularity(value)
-
-
 def add_megatron_arguments(parser: argparse.ArgumentParser):
     """"Add Megatron-LM arguments to the given parser."""
 
@@ -509,117 +503,22 @@ def validate_args(args, defaults={}):
                         "installed. See https://github.com/fzyzcjy/torch_memory_saver."
                     )
 
-        # Resolve deprecated --rl-parallel-generation-tasks -> --rl-num-parallel-generations.
-        assert args.rl_num_parallel_generations is None \
-            or args.rl_parallel_generation_tasks is None, \
-            "Cannot specify both --rl-num-parallel-generations and " \
-            "--rl-parallel-generation-tasks. Use --rl-num-parallel-generations " \
-            "(--rl-parallel-generation-tasks is deprecated)."
-        if args.rl_parallel_generation_tasks is not None:
-            print_rank_0(
-                "WARNING: --rl-parallel-generation-tasks is deprecated, "
-                "use --rl-num-parallel-generations instead.")
-            args.rl_num_parallel_generations = (
-                args.rl_parallel_generation_tasks * args.grpo_group_size)
-
-        args.rl_submission_granularity = _normalize_rl_rollout_granularity(
-            args.rl_submission_granularity
-        )
-        args.rl_consumption_granularity = _normalize_rl_rollout_granularity(
-            args.rl_consumption_granularity
-        )
         submit_rollouts_at_rollout_granularity = (
             args.rl_submission_granularity == RLRolloutGranularity.ROLLOUT
         )
+        if args.rl_generation_lag > 0:
+            assert args.rl_partial_rollouts, \
+                "--rl-generation-lag requires --rl-partial-rollouts."
         if submit_rollouts_at_rollout_granularity:
             assert (
                 args.rl_partial_rollouts
             ), "Rollout submission granularity requires streaming grouped rollouts."
-
-        explicit_granularity = (
-            args.rl_submission_granularity is not None
-            or args.rl_consumption_granularity is not None
-        )
-        if explicit_granularity:
-            assert args.rl_partial_rollouts, \
-                "--rl-submission-granularity and --rl-consumption-granularity " \
-                "require --rl-partial-rollouts."
         assert args.rl_consumption_granularity != RLRolloutGranularity.ROLLOUT, \
             "--rl-consumption-granularity R is not currently supported."
         assert not (
             args.rl_submission_granularity == RLRolloutGranularity.BATCH
             and args.rl_consumption_granularity == RLRolloutGranularity.GROUP
         ), "--rl-submission-granularity B with --rl-consumption-granularity G is not supported."
-
-        if args.rl_submission_granularity == RLRolloutGranularity.GROUP:
-            if args.rl_generation_batch_size not in (None, 1):
-                warn_rank_0(
-                    f"--rl-submission-granularity G overrides --rl-generation-batch-size "
-                    f"({args.rl_generation_batch_size}) with 1."
-                )
-            args.rl_generation_batch_size = 1
-        elif args.rl_submission_granularity == RLRolloutGranularity.BATCH:
-            if args.rl_generation_batch_size not in (None, args.grpo_prompts_per_step):
-                warn_rank_0(
-                    f"--rl-submission-granularity B overrides --rl-generation-batch-size "
-                    f"({args.rl_generation_batch_size}) with --grpo-prompts-per-step "
-                    f"({args.grpo_prompts_per_step})."
-                )
-            args.rl_generation_batch_size = args.grpo_prompts_per_step
-
-        # Resolve --rl-num-parallel-generations / --rl-num-parallel-generation-batches.
-        assert args.rl_num_parallel_generations is None \
-            or args.rl_num_parallel_generation_batches is None, \
-            "--rl-num-parallel-generations and --rl-num-parallel-generation-batches " \
-            "are mutually exclusive."
-        if args.rl_num_parallel_generations is not None:
-            assert args.rl_partial_rollouts, \
-                "--rl-num-parallel-generations requires --rl-partial-rollouts."
-            if submit_rollouts_at_rollout_granularity:
-                args.rl_parallel_generation_tasks = args.rl_num_parallel_generations
-            else:
-                assert args.rl_num_parallel_generations % args.grpo_group_size == 0, \
-                    f"--rl-num-parallel-generations ({args.rl_num_parallel_generations}) " \
-                    f"must be divisible by --grpo-group-size ({args.grpo_group_size})."
-                args.rl_parallel_generation_tasks = (
-                    args.rl_num_parallel_generations // args.grpo_group_size)
-            if args.rl_generation_batch_size is None:
-                args.rl_generation_batch_size = 1
-        elif args.rl_num_parallel_generation_batches is not None:
-            assert args.rl_partial_rollouts, \
-                "--rl-num-parallel-generation-batches requires --rl-partial-rollouts."
-            if args.rl_generation_batch_size is None:
-                args.rl_generation_batch_size = args.grpo_prompts_per_step
-            args.rl_parallel_generation_tasks = (
-                args.rl_num_parallel_generation_batches * args.rl_generation_batch_size)
-            if submit_rollouts_at_rollout_granularity:
-                args.rl_parallel_generation_tasks *= args.grpo_group_size
-        else:
-            if args.rl_generation_batch_size is None:
-                args.rl_generation_batch_size = 1
-            args.rl_parallel_generation_tasks = 512
-
-        assert args.rl_generation_batch_size > 0, \
-            f"--rl-generation-batch-size must be positive, got {args.rl_generation_batch_size}."
-        if args.rl_partial_rollouts:
-            assert not (
-                args.rl_consumption_granularity == RLRolloutGranularity.GROUP
-                and args.rl_generation_batch_size > 1
-            ), "--rl-consumption-granularity G does not support batch submission."
-            assert args.grpo_prompts_per_step % args.rl_generation_batch_size == 0, \
-                f"--grpo-prompts-per-step ({args.grpo_prompts_per_step}) must be divisible by " \
-                f"--rl-generation-batch-size ({args.rl_generation_batch_size})."
-
-        # Derive enforce_order after all resolution is complete.
-        if args.rl_consumption_granularity == RLRolloutGranularity.BATCH:
-            args.rl_enforce_generation_order = True
-        elif args.rl_consumption_granularity == RLRolloutGranularity.GROUP:
-            args.rl_enforce_generation_order = False
-        else:
-            args.rl_enforce_generation_order = (
-                args.rl_generation_batch_size > 1
-                or (args.rl_partial_rollouts and args.grpo_prompts_per_step > 1)
-            )
 
         args.grpo_samples_per_iteration = args.grpo_prompts_per_step * args.grpo_group_size
 
@@ -2483,40 +2382,25 @@ def _add_rl_args(parser):
                        help="Number of GRPO groups (G in the paper).")
     group.add_argument('--grpo-group-size', type=int, default=2,
                        help="Number of samples per a GRPO group.")
-    group.add_argument('--rl-num-parallel-generations', type=int, default=None,
-                       help='Number of rollouts being generated by the inference engine simultaneously. '
-                            'Internally divided by grpo_group_size unless '
-                            '--rl-submission-granularity R is set. '
-                            'Requires --rl-partial-rollouts. '
-                            'Mutually exclusive with --rl-num-parallel-generation-batches.')
-    group.add_argument('--rl-num-parallel-generation-batches', type=int, default=None,
-                       help='Number of generation batches in flight. '
-                            'Set to L+1 to allow for L steps of staleness between the inference and training policies. '
-                            'Each batch contains grpo_prompts_per_step groups by default. '
-                            'Requires --rl-partial-rollouts. '
-                            'Mutually exclusive with --rl-num-parallel-generations.')
-    group.add_argument('--rl-generation-batch-size', type=int, default=None,
-                       help='Number of rollout groups submitted together for generation. '
-                            'Set to 1 to submit rollout groups independently. '
-                            'The trainer still collects grpo_prompts_per_step groups '
-                            'before preparing data. '
-                            'Defaults to grpo_prompts_per_step when '
-                            '--rl-num-parallel-generation-batches is set.')
-    group.add_argument('--rl-submission-granularity', type=RLRolloutGranularity, default=None,
+    group.add_argument('--rl-generation-lag', type=int, default=0,
+                       help='Number of trainer batches of rollout generation lag to allow. '
+                            'The number of in-flight trainer batches is this value plus one. '
+                            'Requires --rl-partial-rollouts when greater than 0.')
+    group.add_argument('--rl-submission-granularity', type=RLRolloutGranularity,
+                       default=RLRolloutGranularity.BATCH,
                        choices=list(RLRolloutGranularity),
                        help='Granularity for submitting rollout generation work. '
                             'R submits individual rollouts independently while still yielding '
                             'complete rollout groups to training. '
                             'G submits one rollout group at a time. '
-                            'B submits grpo_prompts_per_step rollout groups together. '
-                            'Requires --rl-partial-rollouts. Overrides '
-                            '--rl-generation-batch-size when set to G or B.')
-    group.add_argument('--rl-consumption-granularity', type=RLRolloutGranularity, default=None,
-                       choices=[RLRolloutGranularity.GROUP, RLRolloutGranularity.BATCH],
+                            'B submits grpo_prompts_per_step rollout groups together.')
+    group.add_argument('--rl-consumption-granularity', type=RLRolloutGranularity,
+                       default=RLRolloutGranularity.BATCH,
+                       choices=list(RLRolloutGranularity),
                        help='Granularity for consuming generated rollout groups. '
                             'G consumes groups as they complete. '
-                            'B consumes groups in submission/batch order. '
-                            'Requires --rl-partial-rollouts.')
+                            'B consumes complete trainer batches in submission order. '
+                            'R is not currently supported.')
     group.add_argument('--grpo-iterations', type=int, default=2,
                        help="Number of iterations per a GRPO implementation.")
     # As in DAPO, we keep upper/lower eps different.
@@ -2554,8 +2438,7 @@ def _add_rl_args(parser):
                        help='Allow inference to continue generating rollouts while training updates '
                             'the policy weights. This enables off-policy training where rollouts may '
                             'be generated with a stale version of the policy. Use '
-                            '--rl-num-parallel-generations or --rl-num-parallel-generation-batches '
-                            'to control the degree of staleness.')
+                            '--rl-generation-lag to control the degree of staleness.')
     group.add_argument('--rl-inference-logprobs-is-correction', action=argparse.BooleanOptionalAction, type=bool, default=False,
                        help='If set, use inference logprobs in importance sampling correction of the loss.')
     group.add_argument('--rl-importance-sampling-truncation-coef', type=float, default=None,
@@ -2628,8 +2511,6 @@ def _add_rl_args(parser):
                        help='If set, verify that the model weights were correctly transferred by comparing forward pass outputs on'
                        'the first swap of model weights.')
 
-    group.add_argument('--rl-parallel-generation-tasks', type=int, default=None,
-                       help='Deprecated: use --rl-num-parallel-generations instead.')
     group.add_argument('--rl-skip-bos-token', action=argparse.BooleanOptionalAction, type=bool, default=False,
                         help='Skip BOS token at the beginning of the sequences. Default is False.')
     group.add_argument('--rl-profile', action='store_true', default=False,

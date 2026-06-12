@@ -3,7 +3,6 @@
 import asyncio
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterable
 from typing import Generic, TypeVar
 
 import numpy as np
@@ -34,13 +33,7 @@ class RolloutRequest(Request):
 
 
 class GroupedRolloutRequest(Request):
-    """Request to agent to generate grouped Rollouts.
-
-    num_groups controls how many RolloutGroup objects are submitted together.
-    The trainer consumes grpo_prompts_per_step yielded groups per rollout
-    collection. When enforce_order is true, yielded groups preserve submission
-    order even if generation completes out of order.
-    """
+    """Request to agent to generate grouped Rollouts."""
 
     num_groups: int
     rollouts_per_group: int
@@ -48,8 +41,8 @@ class GroupedRolloutRequest(Request):
     validation: bool = False
     filter_groups_with_same_reward: bool = False
     streaming: bool = False
-    enforce_order: bool = False
-    submission_granularity: RLRolloutGranularity | None = None
+    submission_granularity: RLRolloutGranularity = RLRolloutGranularity.BATCH
+    consumption_granularity: RLRolloutGranularity = RLRolloutGranularity.BATCH
 
 
 class Rollout(AgentBaseModel):
@@ -222,6 +215,15 @@ class GroupedRolloutGenerator(Agent, ABC):
         submit_at_rollout_granularity = (
             request.submission_granularity == RLRolloutGranularity.ROLLOUT
         )
+        consume_at_batch_granularity = (
+            request.consumption_granularity == RLRolloutGranularity.BATCH
+        )
+        assert request.consumption_granularity != RLRolloutGranularity.ROLLOUT, \
+            "Rollout consumption granularity is not currently supported."
+        assert not (
+            request.submission_granularity == RLRolloutGranularity.BATCH
+            and request.consumption_granularity == RLRolloutGranularity.GROUP
+        ), "Batch submission with group consumption is not supported."
 
         # When streaming, use buffer_size to create backpressure
         # for balanced generation in a multi-task setting.
@@ -231,8 +233,8 @@ class GroupedRolloutGenerator(Agent, ABC):
         submitted_groups = 0
 
         # num_groups controls how many groups each worker submits together. When
-        # it is 1, groups are submitted eagerly and independently. If
-        # enforce_order is enabled, completion-order results are buffered and
+        # it is 1, groups are submitted eagerly and independently. If batch
+        # consumption is enabled, completion-order results are buffered and
         # yielded in original submission order.
         groups_per_worker = request.num_groups
         if groups_per_worker > 1:
@@ -288,7 +290,7 @@ class GroupedRolloutGenerator(Agent, ABC):
                         for i in range(groups_per_worker)
                     ])
                 else:
-                    if request.enforce_order:
+                    if consume_at_batch_granularity:
                         while not await generate_and_enqueue(batch_id, 0):
                             pass
                     elif not await generate_and_enqueue(batch_id, 0):
@@ -313,8 +315,8 @@ class GroupedRolloutGenerator(Agent, ABC):
                     group = await grouped_rollouts.get()
                 except asyncio_QueueShutDown:
                     break
-                if request.enforce_order:
-                    # Accumulate groups and enforce submission order across batches.
+                if consume_at_batch_granularity:
+                    # Accumulate groups and consume complete trainer batches in submission order.
                     pending.setdefault(group.batch_id, []).append(group)
                     while (l := len(pending.get(next_batch_id, []))) >= groups_per_worker:
                         assert l == groups_per_worker
