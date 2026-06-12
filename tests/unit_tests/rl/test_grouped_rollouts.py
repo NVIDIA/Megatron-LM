@@ -77,7 +77,14 @@ class TestGroupedRollouts:
         "case",
         [
             pytest.param(
-                {"num_slow_calls": 0, "streaming": False, "num_groups": 8, "expected_count": 8},
+                {
+                    "num_slow_calls": 0,
+                    "streaming": False,
+                    "num_groups": 8,
+                    "expected_count": 8,
+                    "expected_batch_ids": [0] * 8,
+                    "expected_index_in_batch": list(range(8)),
+                },
                 id="non_batched",
             ),
             pytest.param(
@@ -89,6 +96,8 @@ class TestGroupedRollouts:
                     "num_slow_calls": 4,
                     "streaming": True,
                     "num_groups": 2,
+                    "submission_granularity": RLRolloutGranularity.BATCH,
+                    "consumption_granularity": RLRolloutGranularity.BATCH,
                     "expected_count": 8,
                     "expected_batch_ids": [0, 0, 1, 1, 2, 2, 3, 3],
                     "expected_index_in_batch": [0, 1, 0, 1, 0, 1, 0, 1],
@@ -105,7 +114,8 @@ class TestGroupedRollouts:
                     "streaming": True,
                     "num_groups": 1,
                     "expected_count": 8,
-                    "enforce_order": False,
+                    "submission_granularity": RLRolloutGranularity.GROUP,
+                    "consumption_granularity": RLRolloutGranularity.GROUP,
                     "expected_trajectory_prefix": [f"t{i}" for i in range(4, 8)],
                 },
                 id="group_submit_group_consume_completion_order",
@@ -116,7 +126,8 @@ class TestGroupedRollouts:
                     "streaming": True,
                     "num_groups": 1,
                     "expected_count": 8,
-                    "enforce_order": True,
+                    "submission_granularity": RLRolloutGranularity.GROUP,
+                    "consumption_granularity": RLRolloutGranularity.BATCH,
                     "expected_batch_ids": list(range(8)),
                     "expected_index_in_batch": [0] * 8,
                     "expected_trajectories": [f"t{i}" for i in range(8)],
@@ -131,6 +142,7 @@ class TestGroupedRollouts:
                     "parallel_generation_tasks": 2,
                     "expected_count": 2,
                     "submission_granularity": RLRolloutGranularity.ROLLOUT,
+                    "consumption_granularity": RLRolloutGranularity.BATCH,
                     "expected_submission_gate_seen": True,
                     "expected_max_active_rollouts": 2,
                 },
@@ -143,9 +155,9 @@ class TestGroupedRollouts:
                     "rollouts_per_group": 2,
                     "parallel_generation_tasks": 2,
                     "expected_count": 1,
-                    "enforce_order": True,
                     "filter_groups_with_same_reward": True,
                     "submission_granularity": RLRolloutGranularity.ROLLOUT,
+                    "consumption_granularity": RLRolloutGranularity.BATCH,
                     "same_reward_calls": {0},
                     "expected_batch_ids": [0],
                     "expected_index_in_batch": [0],
@@ -168,9 +180,13 @@ class TestGroupedRollouts:
             rollouts_per_group=case.get("rollouts_per_group", 1),
             inference_interface=MagicMock(spec=ReturnsRaw),
             streaming=case["streaming"],
-            enforce_order=case.get("enforce_order", case["num_groups"] > 1),
             filter_groups_with_same_reward=case.get("filter_groups_with_same_reward", False),
-            submission_granularity=case.get("submission_granularity"),
+            submission_granularity=case.get(
+                "submission_granularity", RLRolloutGranularity.GROUP
+            ),
+            consumption_granularity=case.get(
+                "consumption_granularity", RLRolloutGranularity.BATCH
+            ),
         )
 
         async def collect_groups():
@@ -186,17 +202,7 @@ class TestGroupedRollouts:
         else:
             groups = await collect_groups()
 
-        has_order_expectations = any(
-            key in case
-            for key in (
-                "expected_batch_ids",
-                "expected_index_in_batch",
-                "expected_trajectory_prefix",
-                "expected_trajectories",
-            )
-        )
-        if not has_order_expectations:
-            assert len(groups) == case["expected_count"]
+        assert len(groups) == case["expected_count"]
         if "expected_batch_ids" in case:
             assert [g.batch_id for g in groups] == case["expected_batch_ids"]
         if "expected_index_in_batch" in case:
@@ -240,8 +246,8 @@ class TestGroupedRollouts:
             rollouts_per_group=1,
             inference_interface=MagicMock(spec=ReturnsRaw),
             streaming=False,
-            enforce_order=False,
             submission_granularity=RLRolloutGranularity.GROUP,
+            consumption_granularity=RLRolloutGranularity.GROUP,
         )
         groups = []
         async for group in mt.get_grouped_rollouts(request):
@@ -253,6 +259,6 @@ class TestGroupedRollouts:
         assert sorted(env_ids) == ["a", "a", "a", "b"]
         for sub_req in captured:
             assert sub_req.num_groups in (1, 3)  # distributed proportionally by weight
-            assert sub_req.enforce_order == request.enforce_order
             assert sub_req.streaming == request.streaming
             assert sub_req.submission_granularity == request.submission_granularity
+            assert sub_req.consumption_granularity == request.consumption_granularity
