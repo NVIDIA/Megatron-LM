@@ -7,6 +7,8 @@ import torch
 
 from megatron.core.inference.config import PrefixCachingEvictionPolicy
 from megatron.core.inference.contexts.kv_block_allocator import KVBlockAllocator
+from megatron.core.inference.contexts.prefix_cache_block_state import PrefixCacheBlockState
+from megatron.core.inference.contexts.prefix_cache_registry import PrefixCacheRegistry
 
 TOTAL_COUNT = 10
 PAUSED_COUNT = 2
@@ -30,6 +32,8 @@ def _make_context(
         total_request_count=total_request_count,
         request_kv_block_counts=request_kv_block_counts,
         request_to_kv_block_ids=request_to_kv_block_ids,
+        prefix_cache_lru_clock=0,
+        prefix_cache_registry=PrefixCacheRegistry(),
     )
 
 
@@ -111,55 +115,62 @@ def test_block_usage_counts_no_prefix_caching(
     [(PrefixCachingEvictionPolicy.LRU, True), (PrefixCachingEvictionPolicy.REF_ZERO, False)],
 )
 def test_prefix_caching_state_layout(policy, expect_timestamps):
-    """Prefix-caching mode allocates block_hashes (initially -1) and ref_counts
-    (initially 0). LRU policy also allocates timestamps; REF_ZERO does not."""
+    """PrefixCacheBlockState allocates block_hashes (initially -1) and ref_counts
+    (initially 0). LRU policy also allocates timestamps; REF_ZERO does not. The
+    hash dict lives on the context's PrefixCacheRegistry, not the allocator."""
+    ctx = _make_context()
     a = KVBlockAllocator(
-        _make_context(),
+        ctx,
         total_count=8,
         paused_count=2,
-        enable_prefix_caching=True,
-        prefix_caching_eviction_policy=policy,
+        pc_state=PrefixCacheBlockState(total_count=8, eviction_policy=policy),
     )
-    assert (a.block_hashes == -1).all().item()
-    assert (a.block_ref_counts == 0).all().item()
-    assert a.kv_hash_to_block_id == {}
-    assert hasattr(a, "block_timestamps") is expect_timestamps
+    assert (a.pc_state.block_hashes == -1).all().item()
+    assert (a.pc_state.block_ref_counts == 0).all().item()
+    assert ctx.prefix_cache_registry.kv_hash_to_block_id == {}
+    assert (a.pc_state.block_timestamps is not None) is expect_timestamps
 
 
 def test_prefix_caching_allocate_and_hash_registration():
-    """allocate_memory_blocks initialises ref_count=1; register_kv_block_hashes
-    populates both block_hashes[] and the kv_hash_to_block_id dict; the
-    `is_memory_available` short-circuit returns False under REF_ZERO when
-    the free pool can't satisfy and no cached blocks are evictable."""
+    """allocate_memory_blocks initialises ref_count=1; stamp_block_hashes +
+    registry.register_kv populate both the per-block shadow (block_hashes[]) and
+    the kv_hash_to_block_id dict; the `is_memory_available` short-circuit returns
+    False under REF_ZERO when the free pool can't satisfy and no cached blocks are
+    evictable."""
+    ctx = _make_context()
     a = KVBlockAllocator(
-        _make_context(),
+        ctx,
         total_count=8,
         paused_count=2,
-        enable_prefix_caching=True,
-        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO,
+        pc_state=PrefixCacheBlockState(
+            total_count=8, eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO
+        ),
     )
 
     # Newly allocated blocks have ref_count == 1.
     ids = a.allocate_memory_blocks(2)
-    assert (a.block_ref_counts[ids] == 1).all().item()
+    assert (a.pc_state.block_ref_counts[ids] == 1).all().item()
 
-    # Hash registration populates both the tensor and the dict.
-    a.register_kv_block_hashes(block_ids=[1, 3], block_hashes=[111, 333])
-    assert a.block_hashes[1].item() == 111
-    assert a.block_hashes[3].item() == 333
-    assert a.kv_hash_to_block_id == {111: 1, 333: 3}
+    # Hash registration stamps the per-block shadow and the registry dict.
+    a.pc_state.stamp_block_hashes(block_ids=[1, 3], block_hashes=[111, 333])
+    ctx.prefix_cache_registry.register_kv(block_ids=[1, 3], hashes=[111, 333])
+    assert a.pc_state.block_hashes[1].item() == 111
+    assert a.pc_state.block_hashes[3].item() == 333
+    assert ctx.prefix_cache_registry.kv_hash_to_block_id == {111: 1, 333: 3}
 
     # Empty inputs are a no-op (avoids zero-element tensor construction).
-    a.register_kv_block_hashes(block_ids=[], block_hashes=[])
-    assert a.kv_hash_to_block_id == {111: 1, 333: 3}
+    a.pc_state.stamp_block_hashes(block_ids=[], block_hashes=[])
+    ctx.prefix_cache_registry.register_kv(block_ids=[], hashes=[])
+    assert ctx.prefix_cache_registry.kv_hash_to_block_id == {111: 1, 333: 3}
 
     # REF_ZERO has no eviction path when the free pool is short.
     small = KVBlockAllocator(
         _make_context(),
         total_count=4,
         paused_count=1,
-        enable_prefix_caching=True,
-        prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO,
+        pc_state=PrefixCacheBlockState(
+            total_count=4, eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO
+        ),
     )
     assert small.is_memory_available(5) is False
 
@@ -186,6 +197,13 @@ def test_block_usage_counts_with_prefix_caching(
         total_request_count=total,
         request_to_kv_block_ids=request_to_kv,
     )
-    a = KVBlockAllocator(ctx, total_count=TOTAL_COUNT, paused_count=3, enable_prefix_caching=True)
+    a = KVBlockAllocator(
+        ctx,
+        total_count=TOTAL_COUNT,
+        paused_count=3,
+        pc_state=PrefixCacheBlockState(
+            total_count=TOTAL_COUNT, eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO
+        ),
+    )
     assert a.get_active_used() == expected_active
     assert a.get_paused_used() == expected_paused

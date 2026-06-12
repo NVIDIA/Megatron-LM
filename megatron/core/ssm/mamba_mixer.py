@@ -631,15 +631,16 @@ class MambaMixer(MegatronModule):
         # Output y is initialized to zeros in _ssm_prefill so padding
         # positions remain zero (safe for RMSNorm and downstream ops).
 
-        # Prepare intermediate extraction buffers (always passed, CUDA graph compat)
-        slot_allocator = context.mamba_slot_allocator
+        # Prepare intermediate extraction buffers (always passed, CUDA graph compat).
+        # Buffers live on the metadata and are non-None only when this is a
+        # PrefixCachedMambaMetadata; the base class declares them as None.
         intermediate_chunk_indices = metadata.intermediate_chunk_indices
         intermediate_abs_positions = metadata.intermediate_abs_positions
         intermediate_ssm_out = None
         intermediate_conv_out = None
-        if slot_allocator is not None and mamba_layer_idx is not None:
-            intermediate_ssm_out = slot_allocator.intermediate_ssm_out[mamba_layer_idx]
-            intermediate_conv_out = slot_allocator.intermediate_conv_out[mamba_layer_idx]
+        if metadata.intermediate_ssm_out is not None and mamba_layer_idx is not None:
+            intermediate_ssm_out = metadata.intermediate_ssm_out[mamba_layer_idx]
+            intermediate_conv_out = metadata.intermediate_conv_out[mamba_layer_idx]
 
         y_prefill = self._ssm_prefill(
             zxBCdt,
