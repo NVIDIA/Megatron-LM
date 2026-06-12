@@ -61,7 +61,7 @@ def get_inference_engine(args: Namespace, model: MegatronModule) -> AbstractEngi
 
     tokenizer = get_tokenizer()
 
-    inference_context = StaticInferenceContext(args.inference_max_requests, args.inference_max_sequence_length)
+    inference_context = StaticInferenceContext(args.inference_max_requests, args.inference_max_seq_length)
     inference_wrapped_model = GPTInferenceWrapper(
         model, inference_context
     )
