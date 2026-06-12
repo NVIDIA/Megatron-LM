@@ -1,21 +1,32 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 # Note: --ckpt-format torch_dist has tests in tests/unit_tests/dist_checkpointing.
 import os
+import pytest
+import torch
+import torch.distributed.checkpoint
 from types import SimpleNamespace
 from typing import Optional
 from unittest import mock
 
-import pytest
-import torch
-import torch.distributed.checkpoint
-
 from megatron.core.distributed import DistributedDataParallelConfig
-from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
+    FullyShardedDataParallel,
+    _get_rng_state_dict,
+    _load_rng_state_dict,
+)
 from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
     unset_num_microbatches_calculator,
 )
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import (
+    convert_cuda_rng_state,
+    get_context_parallel_rng_tracker_name,
+    get_cuda_rng_tracker,
+    get_model_and_context_parallel_rng_tracker_name,
+    get_model_parallel_rng_tracker_name,
+    is_graph_safe_cuda_rng_tracker,
+    model_parallel_cuda_manual_seed,
+)
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_torch_min_version
@@ -302,6 +313,150 @@ def test_load_checkpoint(
 
         assert new_optimizer.state_dict() == optimizer.state_dict()
         assert new_opt_param_scheduler.state_dict() == opt_param_scheduler.state_dict()
+
+
+def test_load_checkpoint_backfills_model_and_context_rng_state(
+    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt
+):
+    """Old checkpoints without the TPxCP tracker should still load successfully."""
+    args = create_ckpt_load_args
+    args.ckpt_format = "torch"
+    args.use_distributed_optimizer = True
+    args.use_dist_ckpt = False
+
+    with TempNamedDir(
+        tmp_path_dist_ckpt / "test_load_checkpoint_backfills_model_and_context_rng_state", sync=True
+    ) as ckpt_dir:
+        args.load = ckpt_dir
+        args.save = ckpt_dir
+        set_args(args)
+
+        iteration = 123
+        config = TransformerConfig(num_layers=1, kv_channels=1)
+        model = MockModel(config)
+        optimizer = MockState({"optimizer": "optimizer_state"})
+        opt_param_scheduler = MockState({"opt_param_scheduler": "scheduler_state"})
+
+        save_checkpoint(iteration, [model], optimizer, opt_param_scheduler, 456)
+
+        checkpoint_path = ckpt_dir / "iter_0000123" / "mp_rank_00" / "model_optim_rng.pt"
+        state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        legacy_rng_state = state_dict["rng_state"][0]
+        legacy_tracker_states = legacy_rng_state["rng_tracker_states"]
+        legacy_tracker_states.pop(get_context_parallel_rng_tracker_name(), None)
+        legacy_tracker_states.pop(get_model_and_context_parallel_rng_tracker_name(), None)
+        torch.save(state_dict, checkpoint_path)
+
+        new_model = MockModel(config)
+        new_optimizer = MockState({"optimizer": "dummy1"})
+        new_opt_param_scheduler = MockState({"opt_param_scheduler": "dummy2"})
+
+        load_checkpoint([new_model], new_optimizer, new_opt_param_scheduler, strict=True)
+
+        tracker_states = get_cuda_rng_tracker().get_states()
+        assert get_context_parallel_rng_tracker_name() in tracker_states
+        assert get_model_parallel_rng_tracker_name() in tracker_states
+        assert get_model_and_context_parallel_rng_tracker_name() in tracker_states
+        assert torch.equal(
+            tracker_states[get_context_parallel_rng_tracker_name()],
+            legacy_rng_state["cuda_rng_state"],
+        )
+        assert torch.equal(
+            tracker_states[get_model_parallel_rng_tracker_name()],
+            tracker_states[get_model_and_context_parallel_rng_tracker_name()],
+        )
+
+
+def test_load_checkpoint_backfills_model_and_context_rng_state_from_legacy_top_level_format(
+    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt
+):
+    """Legacy top-level RNG checkpoints should also backfill the TPxCP tracker."""
+    args = create_ckpt_load_args
+    args.ckpt_format = "torch"
+    args.use_distributed_optimizer = True
+    args.use_dist_ckpt = False
+
+    with TempNamedDir(
+        tmp_path_dist_ckpt
+        / "test_load_checkpoint_backfills_model_and_context_rng_state_from_legacy_top_level_format",
+        sync=True,
+    ) as ckpt_dir:
+        args.load = ckpt_dir
+        args.save = ckpt_dir
+        set_args(args)
+
+        iteration = 123
+        config = TransformerConfig(num_layers=1, kv_channels=1)
+        model = MockModel(config)
+        optimizer = MockState({"optimizer": "optimizer_state"})
+        opt_param_scheduler = MockState({"opt_param_scheduler": "scheduler_state"})
+
+        save_checkpoint(iteration, [model], optimizer, opt_param_scheduler, 456)
+
+        checkpoint_path = ckpt_dir / "iter_0000123" / "mp_rank_00" / "model_optim_rng.pt"
+        state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        legacy_rng_state = state_dict.pop("rng_state")[0]
+        legacy_tracker_states = dict(legacy_rng_state["rng_tracker_states"])
+        legacy_tracker_states.pop(get_context_parallel_rng_tracker_name(), None)
+        legacy_tracker_states.pop(get_model_and_context_parallel_rng_tracker_name(), None)
+        state_dict["random_rng_state"] = legacy_rng_state["random_rng_state"]
+        state_dict["np_rng_state"] = legacy_rng_state["np_rng_state"]
+        state_dict["torch_rng_state"] = legacy_rng_state["torch_rng_state"]
+        state_dict["cuda_rng_state"] = legacy_rng_state["cuda_rng_state"]
+        state_dict["rng_tracker_states"] = legacy_tracker_states
+        torch.save(state_dict, checkpoint_path)
+
+        new_model = MockModel(config)
+        new_optimizer = MockState({"optimizer": "dummy1"})
+        new_opt_param_scheduler = MockState({"opt_param_scheduler": "dummy2"})
+
+        load_checkpoint([new_model], new_optimizer, new_opt_param_scheduler, strict=True)
+
+        tracker_states = get_cuda_rng_tracker().get_states()
+        assert get_context_parallel_rng_tracker_name() in tracker_states
+        assert get_model_parallel_rng_tracker_name() in tracker_states
+        assert get_model_and_context_parallel_rng_tracker_name() in tracker_states
+        assert torch.equal(
+            tracker_states[get_context_parallel_rng_tracker_name()],
+            legacy_rng_state["cuda_rng_state"],
+        )
+        assert torch.equal(
+            tracker_states[get_model_parallel_rng_tracker_name()],
+            tracker_states[get_model_and_context_parallel_rng_tracker_name()],
+        )
+
+
+@pytest.mark.skipif(Utils.world_size < 1, reason="requires distributed initialization")
+def test_fsdp_load_rng_state_dict_backfills_context_and_model_context_trackers(init_model_parallel):
+    model_parallel_cuda_manual_seed(777, force_reset_rng=True)
+    rng_state_dict = _get_rng_state_dict()
+    rng_state_dict["rng_tracker_states"] = dict(rng_state_dict["rng_tracker_states"])
+    rng_state_dict["rng_tracker_states"].pop(get_context_parallel_rng_tracker_name(), None)
+    rng_state_dict["rng_tracker_states"].pop(get_model_and_context_parallel_rng_tracker_name(), None)
+
+    model_parallel_cuda_manual_seed(888, force_reset_rng=True)
+    _load_rng_state_dict(rng_state_dict)
+
+    tracker_states = get_cuda_rng_tracker().get_states()
+    expected_context_state = convert_cuda_rng_state(
+        rng_state_dict["cuda_rng_state"],
+        to_graphable=is_graph_safe_cuda_rng_tracker(get_cuda_rng_tracker()),
+    )
+
+    assert get_context_parallel_rng_tracker_name() in tracker_states
+    assert get_model_parallel_rng_tracker_name() in tracker_states
+    assert get_model_and_context_parallel_rng_tracker_name() in tracker_states
+    assert torch.equal(
+        tracker_states[get_context_parallel_rng_tracker_name()], expected_context_state
+    )
+    assert torch.equal(
+        tracker_states[get_model_parallel_rng_tracker_name()],
+        tracker_states[get_model_and_context_parallel_rng_tracker_name()],
+    )
+    assert (
+        tracker_states[get_model_parallel_rng_tracker_name()]
+        is not tracker_states[get_model_and_context_parallel_rng_tracker_name()]
+    )
 
 
 def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, create_ckpt_load_args):

@@ -6,13 +6,18 @@ from typing import Literal, Tuple
 
 import pytest
 import torch
+from contextlib import nullcontext
+from unittest.mock import MagicMock
 
 from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.quantization.utils import get_quant_config_or_none
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.tensor_parallel.random import (
+    get_model_and_context_parallel_rng_tracker_name,
+    model_parallel_cuda_manual_seed,
+)
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.module import MegatronModule
@@ -27,8 +32,6 @@ try:
     )
 
 except ImportError:
-    from unittest.mock import MagicMock
-
     HAVE_KITCHEN = False
     KitchenDotProductAttention = MagicMock()
     KitchenFlashAttention = MagicMock()
@@ -40,8 +43,6 @@ if HAVE_TE:
 
     from megatron.core.extensions.transformer_engine import TEDotProductAttention
 else:
-    from unittest.mock import MagicMock
-
     TEDotProductAttention = MagicMock()
     dot_product_attention = MagicMock()
 
@@ -482,3 +483,156 @@ def test_kitchen_flash_attention_implementations(
         k_grad_error=k_grad_error,
         v_grad_error=v_grad_error,
     )
+
+
+@pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine required.")
+def test_te_attention_dropout_ctx_uses_tpxcp_tracker_when_sp_disabled(monkeypatch):
+    tracker_names = []
+
+    class FakeTracker:
+        def is_initialized(self):
+            return True
+
+        def fork(self, name):
+            tracker_names.append(name)
+            return nullcontext()
+
+    def fake_te_init(self, *args, **kwargs):
+        torch.nn.Module.__init__(self)
+        self.flash_attention = MagicMock(attention_dropout_ctx=None)
+        self.fused_attention = MagicMock(attention_dropout_ctx=None)
+        self.unfused_attention = MagicMock(attention_dropout_ctx=None)
+
+    monkeypatch.setattr(
+        "megatron.core.extensions.transformer_engine.get_cuda_rng_tracker",
+        lambda: FakeTracker(),
+    )
+    monkeypatch.setattr(
+        "transformer_engine.pytorch.DotProductAttention.__init__",
+        fake_te_init,
+    )
+
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=64,
+        num_attention_heads=8,
+        use_cpu_initialization=False,
+        sequence_parallel=False,
+        tensor_model_parallel_size=1,
+    )
+    attention = TEDotProductAttention(
+        config,
+        layer_number=1,
+        attn_mask_type=AttnMaskType.causal,
+        attention_type="self",
+        attention_dropout=0.1,
+        softmax_scale=1.0,
+        pg_collection=pg_collection,
+    )
+
+    with attention.flash_attention.attention_dropout_ctx():
+        pass
+
+    assert tracker_names == [get_model_and_context_parallel_rng_tracker_name()]
+
+
+@pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine required.")
+def test_te_attention_backends_share_overridden_dropout_ctx(monkeypatch):
+    class FakeTracker:
+        def is_initialized(self):
+            return True
+
+        def fork(self, name):
+            return nullcontext()
+
+    def fake_te_init(self, *args, **kwargs):
+        torch.nn.Module.__init__(self)
+        self.flash_attention = MagicMock(attention_dropout_ctx=None)
+        self.fused_attention = MagicMock(attention_dropout_ctx=None)
+        self.unfused_attention = MagicMock(attention_dropout_ctx=None)
+
+    monkeypatch.setattr(
+        "megatron.core.extensions.transformer_engine.get_cuda_rng_tracker",
+        lambda: FakeTracker(),
+    )
+    monkeypatch.setattr(
+        "transformer_engine.pytorch.DotProductAttention.__init__",
+        fake_te_init,
+    )
+
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=64,
+        num_attention_heads=8,
+        use_cpu_initialization=False,
+        sequence_parallel=False,
+        tensor_model_parallel_size=1,
+    )
+    attention = TEDotProductAttention(
+        config,
+        layer_number=1,
+        attn_mask_type=AttnMaskType.causal,
+        attention_type="self",
+        attention_dropout=0.1,
+        softmax_scale=1.0,
+        pg_collection=pg_collection,
+    )
+
+    assigned_ctx = attention.flash_attention.attention_dropout_ctx
+    assert assigned_ctx is not None
+    assert assigned_ctx is attention.fused_attention.attention_dropout_ctx
+    assert assigned_ctx is attention.unfused_attention.attention_dropout_ctx
+
+
+@pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine required.")
+def test_te_attention_does_not_override_dropout_ctx_when_sequence_parallel_enabled(monkeypatch):
+    tracker_names = []
+
+    class FakeTracker:
+        def is_initialized(self):
+            return True
+
+        def fork(self, name):
+            tracker_names.append(name)
+            return nullcontext()
+
+    def fake_te_init(self, *args, **kwargs):
+        torch.nn.Module.__init__(self)
+        default_ctx = MagicMock(side_effect=nullcontext)
+        self.flash_attention = MagicMock(attention_dropout_ctx=default_ctx)
+        self.fused_attention = MagicMock(attention_dropout_ctx=default_ctx)
+        self.unfused_attention = MagicMock(attention_dropout_ctx=default_ctx)
+
+    monkeypatch.setattr(
+        "megatron.core.extensions.transformer_engine.get_cuda_rng_tracker",
+        lambda: FakeTracker(),
+    )
+    monkeypatch.setattr(
+        "transformer_engine.pytorch.DotProductAttention.__init__",
+        fake_te_init,
+    )
+
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=64,
+        num_attention_heads=8,
+        use_cpu_initialization=False,
+        sequence_parallel=True,
+        tensor_model_parallel_size=2,
+    )
+    attention = TEDotProductAttention(
+        config,
+        layer_number=1,
+        attn_mask_type=AttnMaskType.causal,
+        attention_type="self",
+        attention_dropout=0.1,
+        softmax_scale=1.0,
+        pg_collection=pg_collection,
+    )
+
+    with attention.flash_attention.attention_dropout_ctx():
+        pass
+
+    assert tracker_names == []
+    assert attention.flash_attention.attention_dropout_ctx is attention.fused_attention.attention_dropout_ctx
+    assert attention.flash_attention.attention_dropout_ctx is attention.unfused_attention.attention_dropout_ctx

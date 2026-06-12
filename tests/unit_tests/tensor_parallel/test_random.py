@@ -1,14 +1,24 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from unittest import mock
+
 import pytest
 import torch
+from contextlib import contextmanager
 
+
+from megatron.core import parallel_state
 from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutput,
     CudaRNGStatesTracker,
     checkpoint,
     convert_cuda_rng_state,
+    ensure_context_parallel_rng_tracker_states,
+    ensure_model_and_context_parallel_rng_tracker_states,
+    get_context_parallel_rng_tracker_name,
     get_cuda_rng_tracker,
+    get_model_and_context_parallel_rng_tracker_name,
+    get_model_parallel_rng_tracker_name,
     model_parallel_cuda_manual_seed,
 )
 from tests.unit_tests.test_utilities import Utils
@@ -186,6 +196,45 @@ def test_model_parallel_cuda_manual_seed():
     Utils.destroy_model_parallel()
 
 
+@mock.patch("megatron.core.tensor_parallel.random.get_context_parallel_rank", return_value=1)
+@mock.patch("megatron.core.tensor_parallel.random.get_context_parallel_world_size", return_value=2)
+@mock.patch("megatron.core.tensor_parallel.random.get_tensor_and_context_parallel_rank", return_value=3)
+def test_cp_only_and_tpxcp_tracker_seed_semantics(
+    mock_tpcp_rank, mock_cp_world_size, mock_cp_rank
+):
+    Utils.initialize_model_parallel(4, 1)
+    model_parallel_cuda_manual_seed(123, force_reset_rng=True)
+    tracker_states = get_cuda_rng_tracker().get_states()
+    assert get_context_parallel_rng_tracker_name() in tracker_states
+    assert get_model_and_context_parallel_rng_tracker_name() in tracker_states
+
+    expected_context_seed = 123 + 2718 + 2048 + 1
+    expected_tpcp_seed = 123 + 2718 + 4 + 3
+
+    expected_context_tracker = CudaRNGStatesTracker()
+    expected_context_tracker.add(get_context_parallel_rng_tracker_name(), expected_context_seed)
+    expected_tpcp_tracker = CudaRNGStatesTracker()
+    expected_tpcp_tracker.add(get_model_and_context_parallel_rng_tracker_name(), expected_tpcp_seed)
+
+    assert torch.equal(
+        tracker_states[get_context_parallel_rng_tracker_name()],
+        expected_context_tracker.get_states()[get_context_parallel_rng_tracker_name()],
+    )
+    assert torch.equal(
+        tracker_states[get_model_and_context_parallel_rng_tracker_name()],
+        expected_tpcp_tracker.get_states()[get_model_and_context_parallel_rng_tracker_name()],
+    )
+    Utils.destroy_model_parallel()
+
+
+def test_ensure_context_parallel_rng_tracker_states_uses_data_parallel_fallback():
+    source_tracker = CudaRNGStatesTracker()
+    source_tracker.add("data-parallel-rng", 456)
+    states = ensure_context_parallel_rng_tracker_states(source_tracker.get_states())
+    assert get_context_parallel_rng_tracker_name() in states
+    assert torch.equal(states[get_context_parallel_rng_tracker_name()], states["data-parallel-rng"])
+
+
 def test_checkpoint():
     def test_forward(*input):
         return input[0] + input[1]
@@ -296,3 +345,134 @@ def test_checkpoint_without_output_view_sharing_regression():
         assert torch.allclose(weight1.grad, weight2.grad)
     finally:
         Utils.destroy_model_parallel()
+
+
+@contextmanager
+def _rng_context_from_config(sequence_parallel, context_parallel_size):
+    if sequence_parallel:
+        with get_cuda_rng_tracker().fork(get_model_and_context_parallel_rng_tracker_name()):
+            yield
+    elif context_parallel_size > 1:
+        with get_cuda_rng_tracker().fork(get_context_parallel_rng_tracker_name()):
+            yield
+    else:
+        yield
+
+
+@pytest.mark.skipif(Utils.world_size < 4, reason="requires at least 4 ranks for tp=2 and cp=2")
+def test_checkpoint_recompute_preserves_context_parallel_rng_behavior():
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2, context_parallel_size=2)
+    try:
+        def dropout_forward(input_, sequence_parallel=False):
+            with _rng_context_from_config(sequence_parallel, context_parallel_size=2):
+                return torch.nn.functional.dropout(input_, p=0.5, training=True)
+
+        input_plain = torch.full((8, 4), 4.0, device="cuda", requires_grad=True)
+        input_ckpt = input_plain.detach().clone().requires_grad_(True)
+
+        model_parallel_cuda_manual_seed(999, force_reset_rng=True)
+        plain_output = dropout_forward(input_plain)
+
+        model_parallel_cuda_manual_seed(999, force_reset_rng=True)
+        ckpt_output = checkpoint(lambda x: dropout_forward(x), False, input_ckpt)
+
+        torch.testing.assert_close(plain_output, ckpt_output)
+
+        grad = torch.ones_like(plain_output)
+        plain_output.backward(grad)
+        ckpt_output.backward(grad)
+        torch.testing.assert_close(input_plain.grad, input_ckpt.grad)
+
+        dropout_mask = plain_output.eq(0).cpu()
+        payload = {
+            "cp_rank": parallel_state.get_context_parallel_rank(),
+            "mask": dropout_mask,
+        }
+        gathered = [None for _ in range(torch.distributed.get_world_size())]
+        torch.distributed.all_gather_object(gathered, payload)
+
+        masks_by_cp_rank = {}
+        for item in gathered:
+            masks_by_cp_rank.setdefault(item["cp_rank"], []).append(item["mask"])
+
+        for masks in masks_by_cp_rank.values():
+            reference = masks[0]
+            for mask in masks[1:]:
+                assert torch.equal(reference, mask)
+
+        cp_ranks = sorted(masks_by_cp_rank)
+        assert len(cp_ranks) == 2
+        assert not torch.equal(
+            masks_by_cp_rank[cp_ranks[0]][0],
+            masks_by_cp_rank[cp_ranks[1]][0],
+        )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(Utils.world_size < 4, reason="requires at least 4 ranks for tp=2 and cp=2")
+def test_checkpoint_recompute_preserves_model_and_context_parallel_rng_behavior():
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2, context_parallel_size=2)
+    try:
+        def dropout_forward(input_):
+            with _rng_context_from_config(sequence_parallel=True, context_parallel_size=2):
+                return torch.nn.functional.dropout(input_, p=0.5, training=True)
+
+        input_plain = torch.full((8, 4), 4.0, device="cuda", requires_grad=True)
+        input_ckpt = input_plain.detach().clone().requires_grad_(True)
+
+        model_parallel_cuda_manual_seed(1001, force_reset_rng=True)
+        plain_output = dropout_forward(input_plain)
+
+        model_parallel_cuda_manual_seed(1001, force_reset_rng=True)
+        ckpt_output = checkpoint(lambda x: dropout_forward(x), False, input_ckpt)
+
+        torch.testing.assert_close(plain_output, ckpt_output)
+
+        grad = torch.ones_like(plain_output)
+        plain_output.backward(grad)
+        ckpt_output.backward(grad)
+        torch.testing.assert_close(input_plain.grad, input_ckpt.grad)
+
+        dropout_mask = plain_output.eq(0).cpu()
+        payload = {
+            "cp_rank": parallel_state.get_context_parallel_rank(),
+            "tp_rank": parallel_state.get_tensor_model_parallel_rank(),
+            "mask": dropout_mask,
+        }
+        gathered = [None for _ in range(torch.distributed.get_world_size())]
+        torch.distributed.all_gather_object(gathered, payload)
+
+        masks_by_rank = {(item["cp_rank"], item["tp_rank"]): item["mask"] for item in gathered}
+        assert len(masks_by_rank) == 4
+
+        for cp_rank in range(2):
+            assert not torch.equal(masks_by_rank[(cp_rank, 0)], masks_by_rank[(cp_rank, 1)])
+
+        for tp_rank in range(2):
+            assert not torch.equal(masks_by_rank[(0, tp_rank)], masks_by_rank[(1, tp_rank)])
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def test_ensure_model_and_context_parallel_rng_tracker_states_clones_model_parallel_state():
+    source_tracker = CudaRNGStatesTracker()
+    source_tracker.add(get_model_parallel_rng_tracker_name(), 789)
+    source_state = source_tracker.get_states()[get_model_parallel_rng_tracker_name()]
+
+    states = ensure_model_and_context_parallel_rng_tracker_states(source_tracker.get_states())
+    assert get_model_and_context_parallel_rng_tracker_name() in states
+    assert torch.equal(states[get_model_and_context_parallel_rng_tracker_name()], source_state)
+    assert states[get_model_and_context_parallel_rng_tracker_name()] is not source_state
+
+    existing_target = CudaRNGStatesTracker()
+    existing_target.add(get_model_and_context_parallel_rng_tracker_name(), 321)
+    expected_target_state = existing_target.get_states()[get_model_and_context_parallel_rng_tracker_name()]
+    states_with_target = {
+        get_model_parallel_rng_tracker_name(): source_state,
+        get_model_and_context_parallel_rng_tracker_name(): expected_target_state,
+    }
+    preserved_states = ensure_model_and_context_parallel_rng_tracker_states(states_with_target)
+    assert (
+        preserved_states[get_model_and_context_parallel_rng_tracker_name()] is expected_target_state
+    )

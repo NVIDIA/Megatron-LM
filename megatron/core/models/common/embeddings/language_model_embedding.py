@@ -146,7 +146,14 @@ class LanguageModelEmbedding(MegatronModule):
             # Has a small runtime cost (~0.5%).
             if self.config.clone_scatter_output_in_embedding and self.scatter_to_sequence_parallel:
                 embeddings = embeddings.clone()
-            with tensor_parallel.get_cuda_rng_tracker().fork():
+            with tensor_parallel.get_cuda_rng_tracker().fork(
+                tensor_parallel.get_model_and_context_parallel_rng_tracker_name()
+            ):
+                embeddings = self.embedding_dropout(embeddings)
+        elif self.config.context_parallel_size > 1:
+            with tensor_parallel.get_cuda_rng_tracker().fork(
+                tensor_parallel.get_context_parallel_rng_tracker_name()
+            ):
                 embeddings = self.embedding_dropout(embeddings)
         else:
             embeddings = self.embedding_dropout(embeddings)
