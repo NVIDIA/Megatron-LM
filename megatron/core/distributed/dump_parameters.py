@@ -37,9 +37,7 @@ logger = logging.getLogger(__name__)
 
 
 def dump_optimizer_parameters(
-    optimizer: torch.optim.Optimizer,
-    out_path: str | os.PathLike,
-    extra_meta: dict[str, Any] | None = None,
+    optimizer: torch.optim.Optimizer, out_path: str | os.PathLike
 ) -> None:
     """Write a per-rank JSON snapshot of `optimizer`'s parameter sharding.
 
@@ -49,22 +47,17 @@ def dump_optimizer_parameters(
     Args:
         optimizer: any PyTorch optimizer over DTensor params.
         out_path: output path; rank suffix is added.
-        extra_meta: optional dict merged into the top-level JSON under
-            the `extra` key. Useful for caller-specific knobs (e.g.,
-            optimizer hyperparameters not captured by `param_groups`).
     """
     rank = dist.get_rank()
     world_size = dist.get_world_size()
 
     # Preserve param-group structure (no hyperparameters; just the partition).
     # Group hyperparameters (lr, betas, weight_decay, ...) are intentionally
-    # not recorded — callers that care should pass them via `extra_meta`.
+    # not recorded — callers that need them can write a sidecar file.
     groups = [
         {"params": [_dump_param(p) for p in group["params"]]} for group in optimizer.param_groups
     ]
     spec: dict[str, Any] = {"world_size": world_size, "rank": rank, "groups": groups}
-    if extra_meta is not None:
-        spec["extra"] = extra_meta
 
     out = pathlib.Path(out_path)
     rank_out = (
