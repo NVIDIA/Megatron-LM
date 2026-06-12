@@ -36,7 +36,7 @@ def test_dump_optimizer_parameters_dtensor(distributed_setup, tmp_path: pathlib.
     optimizer = torch.optim.SGD([sharded, replicated], lr=0.1, momentum=0.9)
 
     out_path = tmp_path / "dump.json"
-    dump_optimizer_parameters(optimizer, out_path, extra_meta={"note": "hello"})
+    dump_optimizer_parameters(optimizer, out_path)
 
     written = out_path.with_suffix(f".rank{distributed_setup.rank}.json")
     assert written.exists(), f"per-rank dump file missing: {written}"
@@ -44,7 +44,6 @@ def test_dump_optimizer_parameters_dtensor(distributed_setup, tmp_path: pathlib.
 
     assert spec["world_size"] == distributed_setup.world_size
     assert spec["rank"] == distributed_setup.rank
-    assert spec["extra"] == {"note": "hello"}
     assert len(spec["groups"]) == 1
     assert len(spec["groups"][0]["params"]) == 2
 
