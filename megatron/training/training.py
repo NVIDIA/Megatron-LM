@@ -1584,17 +1584,17 @@ def wrap_model_chunks_with_ddp(
         else:
             compute_layout = None
         if compute_layout is not None:
-            if pg_collection is not None:
-                # Source DP world sizes from the explicit pg_collection.
-                data_parallel_world_size = get_pg_size(pg_collection.dp_cp)
-                expert_data_parallel_world_size = get_pg_size(
-                    getattr(pg_collection, "expt_dp", None)
-                )
-            else:
-                data_parallel_world_size = mpu.get_data_parallel_world_size(
-                    with_context_parallel=True
-                )
-                expert_data_parallel_world_size = mpu.get_expert_data_parallel_world_size()
+            layout_pgs = (
+                pg_collection
+                if pg_collection is not None
+                else ProcessGroupCollection.use_mpu_process_groups()
+            )
+            assert layout_pgs.dp_cp is not None, (
+                "wrap_model_chunks_with_ddp requires a dp_cp process group to size "
+                "the distributed-optimizer parameter layout"
+            )
+            data_parallel_world_size = get_pg_size(layout_pgs.dp_cp)
+            expert_data_parallel_world_size = get_pg_size(getattr(layout_pgs, "expt_dp", None))
             for i, (chunk, bucket_size) in enumerate(zip(model_chunks, bucket_sizes)):
                 all_params = [p for p in chunk.parameters() if p.requires_grad]
                 per_chunk_layouts[i] = compute_layout(

@@ -3,8 +3,9 @@
 """Tests for ``wrap_model_chunks_with_ddp`` pg_collection threading.
 
 These cover the training-loop helper directly (not the MIMO models), verifying
-that an explicit ``pg_collection`` is forwarded to standard ``DistributedDataParallel``
-so a caller without ``parallel_state`` globals can reuse the helper.
+that an explicit ``pg_collection`` built from a ``HyperCommGrid`` (no
+``parallel_state`` globals) is forwarded to standard ``DistributedDataParallel``,
+and that the default ``pg_collection=None`` path still falls back to MPU groups.
 """
 
 import pytest
@@ -13,6 +14,7 @@ import torch.nn as nn
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -37,20 +39,24 @@ def _config():
     return TransformerConfig(num_attention_heads=1, num_layers=1)
 
 
-class TestWrapModelChunksWithDDP:
-    def teardown_method(self, method):
-        Utils.destroy_model_parallel()
+class TestExplicitPgCollection:
+    """Drive the helper with a HyperCommGrid-derived pgc, no parallel_state."""
 
     def test_explicit_pg_collection_forwarded_to_ddp(self):
-        """An explicit pg_collection is forwarded to standard DDP."""
         from megatron.training.training import wrap_model_chunks_with_ddp
 
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        Utils.initialize_distributed()  # torch.distributed only, no model-parallel state
+        # One pure-DP grid over the 8 ranks; tp/pp/ep are size-1 (no model parallelism).
+        grid = HyperCommGrid([1, 1, 1, 8], ["tp", "pp", "ep", "dp"], backend="nccl")
+        dp = grid.create_pg("dp")
+        pg_collection = ProcessGroupCollection(
+            tp=grid.create_pg("tp"),
+            pp=grid.create_pg("pp"),
+            ep=grid.create_pg("ep"),
+            dp=dp,
+            dp_cp=dp,
+            expt_dp=dp,
         )
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        pg_collection.dp_cp = parallel_state.get_data_parallel_group(with_context_parallel=True)
-        pg_collection.expt_dp = parallel_state.get_expert_data_parallel_group()
 
         ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
         wrapped = wrap_model_chunks_with_ddp(
@@ -59,11 +65,18 @@ class TestWrapModelChunksWithDDP:
 
         chunk = wrapped[0]
         assert isinstance(chunk, DistributedDataParallel)
-        # The DDP was constructed against the explicit pgc's dp_cp group.
-        assert chunk.dp_cp_group is pg_collection.dp_cp
+        # DDP was constructed against the grid-derived dp_cp group, not parallel_state.
+        assert chunk.dp_cp_group is dp
+        grid.destroy()
+
+
+class TestDefaultPath:
+    """Isolated back-compat check: pg_collection=None falls back to MPU globals."""
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
 
     def test_default_path_uses_mpu(self):
-        """With pg_collection=None the helper still wraps via mpu globals."""
         from megatron.training.training import wrap_model_chunks_with_ddp
 
         Utils.initialize_model_parallel(
