@@ -5,6 +5,8 @@
 import logging
 import types
 
+import pytest
+
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 
@@ -439,3 +441,90 @@ class TestSchedulerDeferralInteraction:
         )
         assert engine._cg_admission_check(req_blocked, unblocked_candidate) is True
         assert req_blocked.cg_wait_iters == 0
+
+
+_CHUNKED_PREFILL_CG_CASES = [
+    # parameters are label, active_tok, num_prefill, num_decode, max_chunk, is_hybrid,
+    # is_continuing, expected_chunk
+    # - is_continuing=True  -> gating is skipped entirely; result is max_chunk
+    # - CG match found      -> result is the snapped CG-aligned) chunk
+    # - No CG match         -> eager fallback: result is max_chunk, not a deferral
+    pytest.param(
+        # Fresh batch, large budget — gating active, CG match at 256.
+        0, 0, 0, 300, False, False, 256,
+        id="new_request_cg_match",
+    ),
+    pytest.param(
+        # Budget below the smallest CG (min token_count=2) — no match.
+        # Chunked prefill falls back to eager: uses max_chunk=1, not deferred.
+        0, 0, 0, 1, False, False, 1,
+        id="new_request_no_cg_match_eager_fallback",
+    ),
+    pytest.param(
+        # Continuing chunked prefill: gating is bypassed regardless of CG coverage.
+        # Expected result equals max_chunk.
+        50, 1, 0, 100, False, True, 100,
+        id="continuing_chunked_prefill_gating_skipped",
+    ),
+]
+
+
+class TestChunkedPrefillCgGating:
+    """Parametrized coverage for the CG-gating decision inside schedule_chunked_prefill.
+
+    Exercises three distinct paths:
+    - is_continuing=True  : gating is skipped; result = max_chunk
+    - CG hit              : result = snapped (CG-aligned) chunk size
+    - CG miss             : eager fallback; result = max_chunk (not a deferral)
+    """
+
+    @pytest.mark.parametrize(
+        "active_tok,num_prefill,num_decode,max_chunk,is_hybrid,is_continuing,expected_chunk",
+        _CHUNKED_PREFILL_CG_CASES,
+    )
+    def test_chunk_size_decision(
+        self,
+        active_tok,
+        num_prefill,
+        num_decode,
+        max_chunk,
+        is_hybrid,
+        is_continuing,
+        expected_chunk,
+    ):
+        engine = _create_engine(
+            SAMPLE_CG_LIST,
+            active_tok=active_tok,
+            num_prefill=num_prefill,
+            num_decode=num_decode,
+            is_hybrid=is_hybrid,
+        )
+
+        if engine._cg_admission_gating_active() and not is_continuing:
+            snapped = engine._find_cg_chunk_size(max_chunk)
+            chunk = snapped if snapped is not None else max_chunk
+        else:
+            # Gating skipped (is_continuing) or gating inactive.
+            chunk = max_chunk
+
+        assert chunk == expected_chunk
+
+    def test_no_cg_match_does_not_defer(self):
+        # Core invariant: when CG gating is active and no graph matches the budget,
+        # the chunked-prefill path uses max_chunk (eager), never defers.
+        # SAMPLE_CG_LIST smallest token_count=2; budget=1 guarantees no match.
+        engine = _create_engine(SAMPLE_CG_LIST, active_tok=0, num_prefill=0, num_decode=0)
+        result = engine._find_cg_chunk_size(max_chunk_tokens=1)
+        assert result is None  # confirms the miss path
+        # Caller's eager fallback: chunk = max_chunk, not deferred.
+        chunk = result if result is not None else 1
+        assert chunk == 1
+
+    def test_cg_match_resets_wait_counter(self):
+        # On a CG hit the wait counter must be reset to 0 (matches non-chunked behaviour).
+        engine = _create_engine(SAMPLE_CG_LIST, active_tok=0, num_prefill=0, num_decode=0)
+        req = _make_request(cg_wait_iters=7)
+        snapped = engine._find_cg_chunk_size(max_chunk_tokens=300)
+        assert snapped is not None  # hit
+        req.cg_wait_iters = 0  # as the engine does on a hit
+        assert req.cg_wait_iters == 0

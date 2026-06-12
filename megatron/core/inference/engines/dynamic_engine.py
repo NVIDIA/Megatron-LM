@@ -1796,14 +1796,10 @@ class DynamicInferenceEngine(AbstractEngine):
                 # Skip CG gating for the continuation of an in-flight chunked prefill:
                 # the request is already mid-flight, deferring it would deadlock progress.
                 if self._cg_admission_gating_active() and not is_continuing_chunked_prefill:
-                    # Snap chunk size to the largest captured-CG boundary within budget,
-                    # or defer if no shape covers any chunk in the budget.
+                    # Snap chunk size to the largest captured-CG boundary within budget.
+                    # Fall back to eager (max_chunk) if no CG shape covers the budget.
                     snapped_chunk = self._find_cg_chunk_size(max_chunk)
-                    if snapped_chunk is None:
-                        self._register_cg_wait(req)
-                        can_schedule = False
-                        break
-                    prefill_chunk_length = snapped_chunk
+                    prefill_chunk_length = snapped_chunk if snapped_chunk is not None else max_chunk
                     req.cg_wait_iters = 0
                 else:
                     prefill_chunk_length = max_chunk
