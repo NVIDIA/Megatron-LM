@@ -5,6 +5,7 @@ import dataclasses
 import pytest
 import torch
 
+import megatron.core.transformer.moe.moe_utils as moe_utils
 from megatron.core import parallel_state
 from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
 from megatron.core.tensor_parallel.random import (
@@ -15,6 +16,8 @@ from megatron.core.transformer.moe.moe_utils import (
     clear_aux_losses_tracker,
     get_default_pg_collection,
     get_moe_layer_wise_logging_tracker,
+    get_tokens_per_expert_and_token_count,
+    switch_load_balancing_loss_func,
 )
 from megatron.core.transformer.moe.router import TopKRouter
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -37,6 +40,105 @@ try:
     )
 except Exception:  # pragma: no cover - defensive
     HAVE_ROUTER_FUSION = False
+
+
+def test_switch_load_balancing_loss_accepts_tensor_total_num_tokens_unfused():
+    probs = torch.tensor(
+        [[0.8, 0.2, 0.0, 0.0], [0.1, 0.7, 0.2, 0.0], [0.4, 0.0, 0.1, 0.5]],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    tokens_per_expert = torch.tensor([2, 2, 1, 1], dtype=torch.float32)
+    total_num_tokens = torch.tensor(3, dtype=torch.int64)
+
+    loss_with_tensor_count = switch_load_balancing_loss_func(
+        probs=probs,
+        tokens_per_expert=tokens_per_expert,
+        total_num_tokens=total_num_tokens,
+        topk=2,
+        num_experts=4,
+        moe_aux_loss_coeff=0.1,
+        fused=False,
+    )
+    loss_with_int_count = switch_load_balancing_loss_func(
+        probs=probs,
+        tokens_per_expert=tokens_per_expert,
+        total_num_tokens=3,
+        topk=2,
+        num_experts=4,
+        moe_aux_loss_coeff=0.1,
+        fused=False,
+    )
+
+    torch.testing.assert_close(loss_with_tensor_count, loss_with_int_count)
+    grad_tensor = torch.autograd.grad(loss_with_tensor_count, probs, retain_graph=True)[0]
+    grad_int = torch.autograd.grad(loss_with_int_count, probs)[0]
+    torch.testing.assert_close(grad_tensor, grad_int)
+
+
+def test_switch_load_balancing_loss_converts_tensor_total_num_tokens_for_fused(monkeypatch):
+    seen = {}
+
+    def fake_fused_moe_aux_loss(
+        probs, tokens_per_expert, total_num_tokens, topk, num_experts, coeff
+    ):
+        seen["total_num_tokens"] = total_num_tokens
+        assert isinstance(total_num_tokens, int)
+        return probs.new_tensor(0.25)
+
+    monkeypatch.setattr(moe_utils, "HAVE_TE", True)
+    monkeypatch.setattr(moe_utils, "fused_moe_aux_loss", fake_fused_moe_aux_loss)
+
+    loss = switch_load_balancing_loss_func(
+        probs=torch.ones(3, 4),
+        tokens_per_expert=torch.tensor([2, 2, 1, 1], dtype=torch.float32),
+        total_num_tokens=torch.tensor(3, dtype=torch.int64),
+        topk=2,
+        num_experts=4,
+        moe_aux_loss_coeff=0.1,
+        fused=True,
+    )
+
+    assert seen["total_num_tokens"] == 3
+    torch.testing.assert_close(loss, torch.tensor(0.25))
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or Utils.world_size < 2,
+    reason="Requires CUDA and at least 2 distributed ranks",
+)
+def test_total_num_tokens_exact_with_uneven_cp_tokens():
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=1,
+        context_parallel_size=2,
+    )
+    try:
+        pg_collection = get_default_pg_collection()
+        cp_rank = pg_collection.cp.rank()
+        topk = 2
+        num_experts = 4
+        local_num_tokens = cp_rank + 1
+
+        routing_map = torch.zeros(
+            (local_num_tokens, num_experts), dtype=torch.bool, device="cuda"
+        )
+        routing_map[:, 0] = True
+        routing_map[:, 1] = True
+
+        _, local_tokens, total_tokens = get_tokens_per_expert_and_token_count(
+            routing_map=routing_map,
+            topk=topk,
+            reduce_groups=[pg_collection.tp, pg_collection.cp],
+        )
+
+        expected_total = torch.tensor(3, dtype=torch.int64, device="cuda")
+        assert local_tokens == local_num_tokens
+        assert total_tokens.shape == torch.Size([])
+        torch.testing.assert_close(total_tokens, expected_total)
+    finally:
+        Utils.destroy_model_parallel()
 
 
 class AuxlossTestContainer(MoEModelTestContainer):

@@ -58,7 +58,7 @@ else:
 def switch_load_balancing_loss_func(
     probs: torch.Tensor,
     tokens_per_expert: torch.Tensor,
-    total_num_tokens: int,
+    total_num_tokens: Union[int, torch.Tensor],
     topk: int,
     num_experts: int,
     moe_aux_loss_coeff: float,
@@ -108,7 +108,7 @@ def switch_load_balancing_loss_func(
                               Shape in [num_tokens, num_experts].
         tokens_per_expert (torch.Tensor): Number of tokens assigned to each expert in the batch.
                                           Shape in [num_experts]
-        total_num_tokens (int): Total number of tokens in the batch.
+        total_num_tokens (int or torch.Tensor): Total number of tokens in the batch.
         topk (int): The number of experts selected for each token.
         num_experts (int): The number of experts.
         moe_aux_loss_coeff (float): The coefficient for the auxiliary loss.
@@ -129,6 +129,12 @@ def switch_load_balancing_loss_func(
     if fused:
         if not HAVE_TE or fused_moe_aux_loss is None:
             raise ValueError("fused_moe_aux_loss is not available. Please install TE >= 2.7.0.")
+        if isinstance(total_num_tokens, torch.Tensor):
+            if total_num_tokens.numel() != 1:
+                raise ValueError("total_num_tokens must be a scalar tensor when using fused aux loss.")
+            # TE's fused aux-loss API expects a Python int. Keep tensor counts on-device for
+            # the unfused path, and only synchronize here when the fused kernel requires it.
+            total_num_tokens = int(total_num_tokens.item())
         return fused_moe_aux_loss(
             probs=probs,
             tokens_per_expert=tokens_per_expert,
@@ -225,23 +231,42 @@ def get_capacity(
 
 def get_tokens_per_expert_and_token_count(
     routing_map: torch.Tensor,
-    reduce_group: torch.distributed.ProcessGroup,
+    reduce_group: torch.distributed.ProcessGroup = None,
     topk: int = None,
     with_padding_mask: bool = False,
+    reduce_groups: List[torch.distributed.ProcessGroup] = None,
 ) -> torch.Tensor:
     """
-    Compute global_tokens_per_expert, local_num_tokens and total_num_tokens with padding mask.
+    Compute global_tokens_per_expert, local_num_tokens and total_num_tokens.
+
+    Args:
+        reduce_group: Single process group for all-reduce (backward compat).
+        reduce_groups: List of process groups for sequential all-reduce
+            (e.g. [tp_group, cp_group] to replace a single tp_cp_group).
+            This enables dynamic context parallelism where the CP group changes per batch.
     """
+    if reduce_groups is None:
+        assert reduce_group is not None, "Either reduce_group or reduce_groups must be provided"
+        reduce_groups = [reduce_group]
+    assert topk is not None, "topk is required to compute exact token counts from routing_map"
+
     local_tokens_per_expert = routing_map.sum(dim=0)
-    global_tokens_per_expert = reduce_from_tensor_model_parallel_region(
-        local_tokens_per_expert, reduce_group
-    )
+    global_tokens_per_expert = local_tokens_per_expert
+    for group in reduce_groups:
+        global_tokens_per_expert = reduce_from_tensor_model_parallel_region(
+            global_tokens_per_expert, group
+        )
+
     if with_padding_mask:
         local_num_tokens = local_tokens_per_expert.sum() / topk
-        total_num_tokens = global_tokens_per_expert.sum() / topk
     else:
         local_num_tokens = routing_map.shape[0]
-        total_num_tokens = local_num_tokens * reduce_group.size()
+
+    # thd can produce different token counts across ranks, so
+    # group_size * local_num_tokens is not exact. Derive the total from the
+    # reduced routing counts instead; this uses the same reduce domain as
+    # global_tokens_per_expert and avoids a device-to-host sync on the unfused path.
+    total_num_tokens = torch.div(global_tokens_per_expert.sum(), topk, rounding_mode='floor')
     return global_tokens_per_expert, local_num_tokens, total_num_tokens
 
 
