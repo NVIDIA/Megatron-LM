@@ -19,6 +19,7 @@ fine_grained_activation_offloading
 moe
 context_parallel
 megatron_fsdp
+mtp_loss_split
 dist_optimizer
 optimizer_cpu_offload
 paged_stash
