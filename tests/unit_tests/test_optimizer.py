@@ -71,7 +71,8 @@ class Net(nn.Module):
 
 @patch('torch.distributed.get_world_size', return_value=1)
 @patch(
-    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+    'torch.distributed.all_gather_object',
+    lambda output_list, obj, group=None: output_list.__setitem__(0, obj),
 )
 def test_get_param_groups_no_overrides(mock_get_world_size):
     net = Net()
@@ -101,7 +102,8 @@ def test_get_param_groups_no_overrides(mock_get_world_size):
 
 @patch('torch.distributed.get_world_size', return_value=1)
 @patch(
-    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+    'torch.distributed.all_gather_object',
+    lambda output_list, obj, group=None: output_list.__setitem__(0, obj),
 )
 def test_get_param_groups_default_overrides(mock_get_world_size):
     """Test that the default overrides are applied to the parameter groups."""
@@ -118,7 +120,8 @@ def test_get_param_groups_default_overrides(mock_get_world_size):
 
 @patch('torch.distributed.get_world_size', return_value=1)
 @patch(
-    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+    'torch.distributed.all_gather_object',
+    lambda output_list, obj, group=None: output_list.__setitem__(0, obj),
 )
 def test_get_param_groups_with_overrides(mock_get_world_size):
     net = Net()
@@ -143,7 +146,8 @@ def test_get_param_groups_with_overrides(mock_get_world_size):
 
 @patch('torch.distributed.get_world_size', return_value=1)
 @patch(
-    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+    'torch.distributed.all_gather_object',
+    lambda output_list, obj, group=None: output_list.__setitem__(0, obj),
 )
 def test_get_param_groups_multiple_matches(mock_get_world_size):
     net = Net()
@@ -173,7 +177,8 @@ def test_get_param_groups_multiple_matches(mock_get_world_size):
 
 @patch('torch.distributed.get_world_size', return_value=1)
 @patch(
-    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+    'torch.distributed.all_gather_object',
+    lambda output_list, obj, group=None: output_list.__setitem__(0, obj),
 )
 def test_get_param_groups_overlapping_matches(mock_get_world_size):
     """In this test, we see if we can have two matches that create three param groups."""
@@ -213,7 +218,8 @@ def test_get_param_groups_overlapping_matches(mock_get_world_size):
 
 @patch('torch.distributed.get_world_size', return_value=1)
 @patch(
-    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+    'torch.distributed.all_gather_object',
+    lambda output_list, obj, group=None: output_list.__setitem__(0, obj),
 )
 def test_get_param_groups_with_standard_config_overrides(apply_wd_to_qk_layernorm: bool):
     """In this test, we see if the standard config overrides are applied correctly."""
@@ -249,7 +255,8 @@ def test_get_param_groups_with_standard_config_overrides(apply_wd_to_qk_layernor
 
 @patch('torch.distributed.get_world_size', return_value=1)
 @patch(
-    'torch.distributed.all_gather_object', lambda output_list, obj: output_list.__setitem__(0, obj)
+    'torch.distributed.all_gather_object',
+    lambda output_list, obj, group=None: output_list.__setitem__(0, obj),
 )
 def test_get_param_groups_appling_wd_to_qk_layernorm(apply_wd_to_qk_layernorm: bool):
     """In this test, we see if the `apply_wd_to_qk_layernorm` config is applied correctly."""
