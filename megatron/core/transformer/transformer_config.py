@@ -1701,9 +1701,7 @@ class TransformerConfig(ModelParallelConfig):
                 )
             if "fused_group_mlp" in self.offload_modules:
                 if not self.use_transformer_engine_op_fuser:
-                    raise ValueError(
-                        "fused_group_mlp requires use_transformer_engine_op_fuser."
-                    )
+                    raise ValueError("fused_group_mlp requires use_transformer_engine_op_fuser.")
                 moe_partial_offload = {"expert_fc1", "moe_act"} & set(self.offload_modules)
                 if moe_partial_offload:
                     raise ValueError(
