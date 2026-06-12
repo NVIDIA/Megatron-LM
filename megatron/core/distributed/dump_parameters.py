@@ -102,13 +102,9 @@ def _param_name(p: torch.Tensor) -> str | None:
     `DistributedOptimizer` the optimizer holds shadow fp32 main_params that
     carry neither attribute — in that case there's nothing to resolve.
     """
-    name = getattr(p, "megatron_fsdp_param_name", None)
-    if name is not None:
+    if name := getattr(p, "megatron_fsdp_param_name", None):
         return name
-    orig = getattr(p, "orig_param", None)
-    if orig is None:
-        return None
-    return getattr(orig, "megatron_fsdp_param_name", None)
+    return getattr(getattr(p, "orig_param", None), "megatron_fsdp_param_name", None)
 
 
 def _is_qkv(p: torch.Tensor) -> bool:
