@@ -244,16 +244,16 @@ def count_zeros_fp32(
     gtp_rank = parallel_state.get_generalized_tensor_parallel_remat_rank()
     egtp_rank = parallel_state.get_expert_generalized_tensor_parallel_remat_rank()
     for param in parameters:
-        if getattr(param, "__fsdp_param__", False) and param.grad is not None:
-            # If the parameter is managed by Megatron FSDP, we need to handle it differently.
+        grad_attr = "decoupled_grad" if use_decoupled_grad else "grad"
+        grad_not_none = hasattr(param, grad_attr) and getattr(param, grad_attr) is not None
+        if getattr(param, "__fsdp_param__", False) and grad_not_none:
+            # If the parameter is managed by Megatron FSDP, the gradient is
+            # an FSDP-sharded DTensor, and we should use the local shard.
             use_megatron_fsdp = True
-            grad = param.grad._local_tensor
+            grad = getattr(param, grad_attr)._local_tensor
             num_zeros = grad.numel() - torch.count_nonzero(grad)
             total_num_zeros += num_zeros
             continue
-
-        grad_attr = "decoupled_grad" if use_decoupled_grad else "grad"
-        grad_not_none = hasattr(param, grad_attr) and getattr(param, grad_attr) is not None
         is_not_shared = param_is_not_shared(param)
 
         is_gtp_param = getattr(param, 'is_gtp', False)
@@ -280,6 +280,8 @@ def count_zeros_fp32(
             total_num_zeros = num_zeros + total_num_zeros
 
     if use_megatron_fsdp and data_parallel_group is not None:
+        # Megatron-FSDP does not need to all-reduce the gradient across DP,
+        # as FSDP has already handled the DP reduction during BWD.
         raise ValueError(
             "Unexpected use of Megatron FSDP with data parallel group. "
             "Please ensure that the parameters are properly managed by Megatron FSDP."

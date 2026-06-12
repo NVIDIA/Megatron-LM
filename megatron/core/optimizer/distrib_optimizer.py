@@ -57,7 +57,12 @@ from ..fp8_utils import dequantize_fp8_tensor, is_float8tensor, quantize_param_s
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
-from .optimizer import MixedPrecisionOptimizer, _zero_grad_group_helper, param_group_identifier_keys
+from .optimizer import (
+    MixedPrecisionOptimizer,
+    _zero_grad_group_helper,
+    copy_optimizer_param_metadata,
+    param_group_identifier_keys,
+)
 from .optimizer_config import OptimizerConfig
 from .param_layout import FullParamLayout, PerBufferParamLayout, pad_bucket_end, pad_param_start
 
@@ -392,13 +397,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         tensor_parallel.copy_tensor_model_parallel_attributes(
                             shard_model_param, model_param
                         )
-                        if hasattr(model_param, 'shared'):
-                            shard_model_param.shared = model_param.shared
-                        for _gtp_attr in ('is_gtp', 'allreduce'):
-                            if hasattr(model_param, _gtp_attr):
-                                setattr(
-                                    shard_model_param, _gtp_attr, getattr(model_param, _gtp_attr)
-                                )
+                        copy_optimizer_param_metadata(shard_model_param, model_param)
 
                     # Generate main param.
                     if not config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
@@ -429,16 +428,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         tensor_parallel.copy_tensor_model_parallel_attributes(
                             shard_main_param, model_param
                         )
-                        if hasattr(model_param, 'shared'):
-                            shard_main_param.shared = model_param.shared
-                        # Tag the master shards so get_main_grads_for_grad_norm dedups them
-                        # correctly (is_gtp: shard vs replicated; allreduce: dense/expert axis).
-                        # Without these, GTP shards are dropped and the grad-norm under-counts.
-                        for _gtp_attr in ('is_gtp', 'allreduce'):
-                            if hasattr(model_param, _gtp_attr):
-                                setattr(
-                                    shard_main_param, _gtp_attr, getattr(model_param, _gtp_attr)
-                                )
+                        copy_optimizer_param_metadata(shard_main_param, model_param)
                     else:
                         # When using precision-aware optimizer, main params are held by FusedAdam.
                         shard_main_param = None
@@ -460,11 +450,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     tensor_parallel.copy_tensor_model_parallel_attributes(
                         shard_model_param, model_param
                     )
-                    if hasattr(model_param, 'shared'):
-                        shard_model_param.shared = model_param.shared
-                    for _gtp_attr in ('is_gtp', 'allreduce'):
-                        if hasattr(model_param, _gtp_attr):
-                            setattr(shard_model_param, _gtp_attr, getattr(model_param, _gtp_attr))
+                    copy_optimizer_param_metadata(shard_model_param, model_param)
 
                 else:
                     raise TypeError(

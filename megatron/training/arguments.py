@@ -1582,6 +1582,13 @@ def validate_args(args, defaults={}):
         assert args.fim_spm_rate, "--fim-spm-rate should be specified."
         assert all(token is not None for token in extra_tokens), "FIM extra tokens should be specified."
 
+    assert not (
+        args.cross_entropy_loss_fusion and args.cross_entropy_fusion_impl == 'te'
+    ), (
+        "Transformer Engine cross entropy loss fusion is disabled due to stability issues. "
+        "Use --cross-entropy-fusion-impl native, or omit --cross-entropy-loss-fusion."
+    )
+
     # Deterministic mode
     if args.deterministic_mode:
         assert not args.use_flash_attn, "Flash attention can not be used in deterministic mode."
@@ -2026,6 +2033,14 @@ def _add_inference_args(parser):
     group.add_argument('--inference-dynamic-batching-cuda-graph-mixed-prefill-count',
                        type=int, default=16,
                        help='Number of mixed prefill requests to capture in a cuda graph.')
+    group.add_argument('--inference-dynamic-batching-cuda-graph-sizing-distribution',
+                       type=str, default='exponential',
+                       choices=['exponential', 'linear'],
+                       dest='inference_dynamic_batching_cuda_graph_sizing_distribution',
+                       help='Spacing of CUDA graph token counts. "exponential" (default) '
+                            'halves from cuda_graph_max_tokens down to tp_size, giving a '
+                            'log-spaced distribution with bounded relative padding. '
+                            '"linear" uses varying linear strides across the range.')
     group.add_argument('--inference-dynamic-batching-sampling-backend',
                        type=str, default='torch',
                        choices=['torch', 'flashinfer'],
@@ -2064,6 +2079,7 @@ def _add_network_size_args(parser):
         "timers",
         "finalize_model_grads_func",
         "grad_scale_func",
+        "mtp_grad_scale_func",
         "no_sync_func",
         "grad_sync_func",
         "param_sync_func",
