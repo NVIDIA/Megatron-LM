@@ -1432,6 +1432,10 @@ class FusedMLASelfAttention(MLASelfAttention):
 
         return sharded_state_dict
 
+    def _synthetic_state_dict_key_suffixes(self):
+        """Return source checkpoint keys used to locate this module in a state dict."""
+        return ("linear_q_down_proj.weight",)
+
     def _synthesize_fused_qkv_down_weight(self, state_dict, prefix):
         """Materialize fused qkv-down weight from old separate q/kv checkpoint keys."""
         q_key = f"{prefix}linear_q_down_proj.weight"
