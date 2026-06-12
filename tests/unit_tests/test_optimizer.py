@@ -15,6 +15,9 @@ from transformer_engine.pytorch.fp8 import fp8_autocast
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import (
     ChainedOptimizer,
+    Float16OptimizerWithFloat16Params,
+    FP32Optimizer,
+    MegatronOptimizer,
     OptimizerConfig,
     ParamKey,
     ParamPredicate,
@@ -67,6 +70,70 @@ class Net(nn.Module):
         x = F.relu(self.fc2(x))
         x = self.fc3(x)
         return x
+
+
+class _FakeOptimizer:
+    def __init__(self, state_dict):
+        self._state_dict = state_dict
+        self.param_groups = state_dict['param_groups']
+
+    def state_dict(self):
+        return self._state_dict
+
+
+def _step_tensor():
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    return torch.tensor(7, device=device)
+
+
+def test_checkpoint_common_step_copies_tensor_to_cpu():
+    step = _step_tensor()
+
+    checkpoint_step = MegatronOptimizer._checkpoint_common_step(step)
+
+    assert torch.is_tensor(checkpoint_step)
+    assert checkpoint_step.device.type == 'cpu'
+    assert checkpoint_step.item() == step.item()
+    if step.device.type == 'cpu':
+        assert checkpoint_step.data_ptr() != step.data_ptr()
+
+
+def test_fp32_optimizer_sharded_state_dict_keeps_common_step_on_cpu():
+    optimizer_state_dict = {
+        'state': {0: {'step': _step_tensor()}},
+        'param_groups': [{'params': [0]}],
+    }
+    optimizer = FP32Optimizer.__new__(FP32Optimizer)
+    optimizer.optimizer = _FakeOptimizer(optimizer_state_dict)
+    expected_step = optimizer_state_dict['state'][0]['step'].item()
+
+    sharded_state_dict = FP32Optimizer.sharded_state_dict(optimizer, {})
+
+    common_step = sharded_state_dict['state']['common_step']
+    assert common_step.device.type == 'cpu'
+    assert common_step.item() == expected_step
+
+
+def test_float16_optimizer_sharded_state_dict_keeps_common_step_on_cpu():
+    optimizer_state_dict = {
+        'optimizer': {
+            'state': {0: {'step': _step_tensor()}},
+            'param_groups': [{'params': [0]}],
+        },
+        'fp32_from_fp16_params': [[]],
+    }
+    optimizer = Float16OptimizerWithFloat16Params.__new__(Float16OptimizerWithFloat16Params)
+    optimizer.optimizer = _FakeOptimizer(optimizer_state_dict['optimizer'])
+    optimizer.float16_groups = [[]]
+    optimizer.fp32_from_float16_groups = optimizer_state_dict['fp32_from_fp16_params']
+    optimizer.grad_scaler = None
+    expected_step = optimizer_state_dict['optimizer']['state'][0]['step'].item()
+
+    sharded_state_dict = Float16OptimizerWithFloat16Params.sharded_state_dict(optimizer, {})
+
+    common_step = sharded_state_dict['optimizer']['state']['common_step']
+    assert common_step.device.type == 'cpu'
+    assert common_step.item() == expected_step
 
 
 @patch('torch.distributed.get_world_size', return_value=1)
