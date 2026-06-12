@@ -257,6 +257,7 @@ class TestMegatronFSDPE2E:
                     overlap_grad_reduce=True,
                     use_megatron_fsdp_v2=True,
                     gradient_accumulation_fusion=True,
+                    fsdp_trace_pool=True,
                 ),
                 id="optim_grads_params_double_buffer",
             ),

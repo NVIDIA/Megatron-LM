@@ -142,6 +142,15 @@ class DistributedDataParallelConfig:
       This option will be automatically set to True when nccl_ub=True.
     """
 
+    fsdp_trace_pool: bool = False
+    """If true, use TracePoolAllocator for Megatron FSDP v2 communication buffers
+      instead of the default StorageFreeingBucketAllocator.  The TracePoolAllocator
+      traces the first micro-batch to build a static key-to-address plan, providing
+      stable buffer addresses required for CUDA graph capture.  This flag only takes
+      effect in the Megatron FSDP v2 path.  In the v1 path, use ``fsdp_double_buffer``
+      for FixedPoolAllocator-based double buffering.
+    """
+
     fsdp_db_use_persist_buf_on_alloc_fail: bool = False
     """Whether to fall back to persistent buffer when a bucket does not
        fit FSDP double buffer size. If true, FSDP will use the persistently 

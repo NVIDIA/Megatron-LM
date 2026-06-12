@@ -272,6 +272,7 @@ def test_dist_muon_matches_reference(strategy, nesterov, mesh_case, shapes):
         mesh=mesh,
         sharding_strategy=strategy,
     )
+    pg._init_dist_grads()
     # Pass only the 2D-matrix dist_params + their grad DTensors (in production the
     # FullyShardV2MuonOptimizer wrapper does this filtering). The 1D bias is excluded,
     # so the optimizer never touches it. grad DTensors may be None on ranks whose shard

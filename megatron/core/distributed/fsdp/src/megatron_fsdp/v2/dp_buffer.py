@@ -19,7 +19,7 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-from .allocator import BucketAllocator, TemporaryBucketAllocator
+from .allocator import BucketAllocator, TemporaryBucketAllocator, _free_storage
 from .mixed_precision import MixedPrecisionPolicy
 from .utils import ParamGroupIdx
 
@@ -423,6 +423,45 @@ class DataParallelBuffer:
         if self.buffer_role in ("model_weight", "transpose_weight") and not self.is_distributed:
             self.data._dirty = False
 
+    # ------------------------------------------------------------------ #
+    #  CPU offload
+    # ------------------------------------------------------------------ #
+
+    def _is_on_cpu(self) -> bool:
+        """True if ``self.data`` is resident on CPU."""
+        return self.data is not None and self.data.device.type == "cpu"
+
+    def _ensure_data_on_gpu(self) -> bool:
+        """Move ``self.data`` to GPU if currently on CPU.
+
+        Returns True if a move happened (caller must rebuild dist views).
+        """
+        if not self._is_on_cpu():
+            return False
+        self.data = self.data.to(self.device, non_blocking=True)
+        return True
+
+    def _move_data_to(
+        self,
+        target_device: torch.device,
+        pin_memory: bool = False,
+        non_blocking: bool = True,
+    ) -> None:
+        """Move ``self.data`` to *target_device*, optionally using pinned memory.
+
+        Caller must call ``ParameterGroup._rebuild_dist_views()`` afterwards
+        because ``dist_params._local_tensor`` views share ``self.data`` Storage.
+        """
+        if self.data is None or self.data.device == target_device:
+            return
+        if target_device.type == "cpu" and pin_memory:
+            cpu_data = torch.empty(self.data.shape, dtype=self.data.dtype, pin_memory=True)
+            cpu_data.copy_(self.data, non_blocking=non_blocking)
+            _free_storage(self.data)
+            self.data = cpu_data
+        else:
+            self.data = self.data.to(target_device, non_blocking=non_blocking)
+
     def check_no_local_overlap(self, label: str = "") -> bool:
         """
         Runtime check: verify no two items' local slices overlap within ``self.data``.
@@ -648,6 +687,9 @@ class DataParallelBuffer:
         If grad_comm_dtype differs from self.dtype, communicate with a temporary
         casted tensor and cast the reduced result back before accumulation.
         """
+        if self.sharding_strategy in ("no_shard", "optim"):
+            overwrite_grad = True
+
         grad_comm_dtype = grad_comm_dtype or self.dtype
 
         if self.gradient_scaling_factor in (None, 1.0):
@@ -681,10 +723,6 @@ class DataParallelBuffer:
             # accumulated into ``local_grad_shard`` for gradient accumulation.
             input_buffer = self.fetch_buffer()
             output_offset = sm.bucket_data_index
-            if overwrite_grad:
-                accumulate_output = False
-            else:
-                accumulate_output = True
             if input_buffer.is_cuda:
                 # Keep temporary reduce-scatter buffers tied to the stream that uses them.
                 input_buffer.record_stream(torch.cuda.current_stream())
@@ -695,8 +733,6 @@ class DataParallelBuffer:
             # slice instead of accumulating into a separate shard buffer.
             input_buffer = self.data
             output_offset = sm.local_data_index
-            accumulate_output = False
-            overwrite_grad = False
 
         comm_input = (
             input_buffer if grad_comm_dtype == self.dtype else input_buffer.to(grad_comm_dtype)
@@ -709,12 +745,14 @@ class DataParallelBuffer:
             output=reduced_grad_shard, input=comm_input, group=self.dp_group, op=op
         )
 
+        # If the reduced shard is already in the local grad buffer, skip copy/accumulation.
+        if local_grad_shard.data_ptr() == reduced_grad_shard.data_ptr():
+            return
+
         if overwrite_grad:
             local_grad_shard.copy_(reduced_grad_shard)
-        elif accumulate_output:
+        else:
             local_grad_shard += reduced_grad_shard
-        elif grad_comm_dtype != self.dtype:
-            local_grad_shard.copy_(reduced_grad_shard)
 
 
 def check_all_fsdp_buffers(module) -> bool:
