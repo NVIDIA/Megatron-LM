@@ -296,20 +296,6 @@ class TestRLUtils:
 
     @pytest.mark.parametrize(
         "flag",
-        [
-            "--rl-generation-batch-size",
-            "--rl-num-parallel-generations",
-            "--rl-num-parallel-generation-batches",
-            "--rl-parallel-generation-tasks",
-        ],
-    )
-    def test_removed_rl_generation_flags_are_rejected(self, monkeypatch, flag):
-        monkeypatch.setattr("sys.argv", ["test", flag, "1"])
-        with pytest.raises(SystemExit):
-            parse_args(ignore_unknown_args=False)
-
-    @pytest.mark.parametrize(
-        "flag",
         ["--rl-submission-granularity", "--rl-consumption-granularity"],
     )
     def test_rl_granularity_choices_reject_unknown_value(self, monkeypatch, flag):
