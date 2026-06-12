@@ -208,14 +208,6 @@ class MoETokenDispatcher:
         self.shared_experts = shared_experts
         self.use_nccl_stream = True
 
-    def _shared_expert_prepost_in_dispatcher(self) -> bool:
-        """Whether dispatcher owns full-hidden shared-expert pre/post handling.
-
-        Latent MoE keeps shared-expert FC launches in the dispatcher for overlap,
-        but the layer owns pre-comm and final add because dispatcher tensors are latent-dim.
-        """
-        return self.shared_experts is not None and self.config.moe_latent_size is None
-
 
 class MoEAllGatherTokenDispatcher(MoETokenDispatcher):
     """
@@ -636,8 +628,8 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
                 self.routing_map = pad_routing_map(self.routing_map, pad_multiple)
         self.tokens_per_expert = self.preprocess(self.routing_map)
 
-        if self._shared_expert_prepost_in_dispatcher():
-            self.shared_experts.pre_forward_comm(hidden_states.view(self.hidden_shape))
+        if self.shared_experts is not None:
+            self.shared_experts.pre_forward_comm()
 
         # Permutation 1: input to AlltoAll input
         self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
@@ -881,11 +873,6 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         # Reshape the output tensor
         output = output.view(self.hidden_shape)
 
-        # Add shared experts output. Latent MoE still launches shared-expert FCs in
-        # this dispatcher, but MoELayer adds the result after fc2_latent_proj.
-        if self._shared_expert_prepost_in_dispatcher():
-            shared_expert_output = self.shared_experts.get_output()
-            output += shared_expert_output
         return output
 
     def _maybe_update_cuda_sync_point(self, point: str):
@@ -1537,8 +1524,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             hidden_states, async_finish, allocate_on_comm_stream
         )
         if self.shared_experts is not None:
-            if self._shared_expert_prepost_in_dispatcher():
-                self.shared_experts.pre_forward_comm(hidden_states, wait_current_stream=False)
+            self.shared_experts.pre_forward_comm(wait_current_stream=False)
             self.shared_experts.linear_fc1_forward_and_act(dispatched_hidden_states)
 
         return dispatched_hidden_states, self._comm_manager.dispatched_probs
@@ -1611,8 +1597,6 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         if self.shared_experts is not None:
             self.shared_experts.linear_fc2_forward(hidden_states)
             self.shared_experts.post_forward_comm()
-            if self._shared_expert_prepost_in_dispatcher():
-                hidden_states += self.shared_experts.get_output()
         return hidden_states.view(self.hidden_shape)
 
     def check_over_budget(self):

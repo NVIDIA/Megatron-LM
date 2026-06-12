@@ -343,6 +343,9 @@ class MoELayer(BaseMoELayer):
             )
             if self.shared_expert_overlap:
                 self.token_dispatcher.set_shared_experts(self.shared_experts)
+        # Inference-only: side-stream shared-expert output for latent-MoE + NVLS overlap
+        # (preprocess launches on SharedExpertMLP.stream; postprocess joins+adds).
+        self._latent_shared_expert_output: Optional[torch.Tensor] = None
 
         # Inference-optimized mode setup
         if config.transformer_impl == "inference_optimized":
@@ -420,9 +423,6 @@ class MoELayer(BaseMoELayer):
             # skip its own internal launch+add.
             if self.config.moe_latent_size:
                 self._inference_token_dispatcher._external_shared_expert_launch = True
-        # Inference only: side-stream shared-expert output for latent-MoE + NVLS overlap
-        # (preprocess launches on SharedExpertMLP.stream; postprocess joins+adds).
-        self._latent_shared_expert_output: Optional[torch.Tensor] = None
 
     def setup_delayed_wgrad_for_dispatch_backward_overlap(self):
         """Initializes CUDA events and streams for overlapping expert
@@ -453,21 +453,26 @@ class MoELayer(BaseMoELayer):
         This method preprocesses the hidden states and routing probabilities for the token
         dispatcher.
         """
-        # Latent MoE dispatchers see latent-dim tensors, while shared experts must
-        # use full hidden states. Keep only the full-hidden pre-comm here; the
-        # shared-expert fc1/fc2 launches stay in the dispatcher so they still overlap
+        # Latent MoE dispatchers see latent-dim tensors, while shared experts must use full
+        # hidden states. Register the full-hidden input here (before fc1_latent_proj); the
+        # dispatcher launches pre_forward_comm() and the fc1/fc2 GEMMs so they still overlap
         # token dispatch/combine communication.
-        if self._uses_latent_shared_expert_dispatch_overlap():
-            self.shared_experts.pre_forward_comm(hidden_states)
-        elif (
+        if (
             self.config.moe_latent_size
             and self.shared_expert_overlap
             and isinstance(self.token_dispatcher, NVLSAllGatherVDispatcher)
         ):
+            # Latent MoE with the NVLS dispatcher runs the whole shared expert on a side stream
+            # (separate from the dispatcher fc1/fc2 pipeline) and joins it back in postprocess.
             stream = SharedExpertMLP.stream
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
                 self._latent_shared_expert_output = apply_module(self.shared_experts)(hidden_states)
+        elif self._shared_expert_overlap_via_dispatcher():
+            # Register the full-hidden input here, before any latent projection; the token
+            # dispatcher launches pre_forward_comm(). This unifies the latent and non-latent
+            # shared-expert overlap paths: input capture at the layer, comm launch in dispatcher.
+            self.shared_experts.register_input(hidden_states)
         # Project the hidden_states from hidden dimension down to latent dimension.
         if self.config.moe_latent_size:
             hidden_states, _ = self.fc1_latent_proj(hidden_states)
@@ -476,11 +481,16 @@ class MoELayer(BaseMoELayer):
         )
         return hidden_states, probs
 
-    def _uses_latent_shared_expert_dispatch_overlap(self) -> bool:
-        """Whether latent shared experts are still scheduled inside dispatcher overlap windows."""
+    def _shared_expert_overlap_via_dispatcher(self) -> bool:
+        """Whether the shared expert runs the dispatcher-driven overlap pipeline.
+
+        True for both latent and non-latent MoE on the AllToAll/Flex dispatchers: the MoE layer
+        registers the full-hidden input and adds the final output, while the dispatcher launches
+        the comm and fc1/fc2. Excludes the NVLS-latent path, which runs the whole shared expert
+        on a side stream separately.
+        """
         return (
-            self.config.moe_latent_size is not None
-            and self.shared_expert_overlap
+            self.shared_expert_overlap
             and self.use_shared_expert
             and isinstance(
                 self.token_dispatcher, (MoEAlltoAllTokenDispatcher, MoEFlexTokenDispatcher)
@@ -576,21 +586,23 @@ class MoELayer(BaseMoELayer):
         if self.config.moe_latent_size:
             output, _ = self.fc2_latent_proj(output)
 
+        if shared_expert_output is None:
+            if self._latent_shared_expert_output is not None:
+                # This codepath is for inference-only shared-expert overlap of latent MoEs.
+                # Must happen post-fc2_latent_proj so dimensions match.
+                torch.cuda.current_stream().wait_stream(SharedExpertMLP.stream)
+                shared_expert_output = self._latent_shared_expert_output
+                self._latent_shared_expert_output = None
+            elif self._shared_expert_overlap_via_dispatcher():
+                # Overlapped shared expert: the dispatcher launched fc1/fc2/post-comm; add the
+                # result here at the layer. For latent MoE this must happen after fc2_latent_proj so
+                # the dimensions match; for non-latent there is no projection in between.
+                # get_output() itself waits on the side stream, so this is safe regardless of where
+                # it is added.
+                shared_expert_output = self.shared_experts.get_output()
+
         if shared_expert_output is not None:
             output = output + shared_expert_output
-        elif (
-            isinstance(self.token_dispatcher, NVLSAllGatherVDispatcher)
-            and self._latent_shared_expert_output is not None
-        ):
-            # This codepath is for inference-only shared-expert overlap of latent MoEs.
-            # Must happen post-fc2_latent_proj so dimensions match.
-            torch.cuda.current_stream().wait_stream(SharedExpertMLP.stream)
-            output = output + self._latent_shared_expert_output
-            self._latent_shared_expert_output = None
-        elif self._uses_latent_shared_expert_dispatch_overlap():
-            # Dispatcher has already launched fc2/post-comm during token combine.
-            # Join and add only after routed expert output is projected back to hidden dim.
-            output = output + self.shared_experts.get_output()
         return output
 
     def router_and_preprocess(self, hidden_states: torch.Tensor):

@@ -86,11 +86,9 @@ class TestSharedExperts:
         assert moe_layer_no_overlap.shared_experts is not None
         assert moe_layer_no_overlap.token_dispatcher.shared_experts is None
 
-        if moe_layer_overlap.config.moe_latent_size is None:
-            assert moe_layer_overlap.token_dispatcher._shared_expert_prepost_in_dispatcher()
-        else:
-            assert moe_layer_overlap._uses_latent_shared_expert_dispatch_overlap()
-            assert not moe_layer_overlap.token_dispatcher._shared_expert_prepost_in_dispatcher()
+        # Shared-expert overlap always registers the input and adds the output at the MoE layer
+        # (latent and non-latent alike); the dispatcher only launches the comm and fc1/fc2.
+        assert moe_layer_overlap._shared_expert_overlap_via_dispatcher()
 
         # Create a dummy input tensor.
         hidden_states = torch.randn(
