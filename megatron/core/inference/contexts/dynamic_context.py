@@ -3406,58 +3406,6 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         return evict_request_ids
 
-    def update_requests(
-        self,
-        active_requests_mask: Tensor,
-        new_tokens: Tensor,
-        new_speculative_tokens: Tensor = None,
-    ) -> Optional[Dict[str, Optional[Tensor]]]:
-        """Update context state after calling engine.step().
-
-        This method is responsible for:
-        - Update prefill requests to decode requests.
-        - Persist decode requests as decode requests.
-        - Terminate requests by length or termination id.
-
-        *Note*: All bookkeeping tensors (i.e., `self.request_*`) are laid out
-        contiguously, with a conceptual division between paused requests on the
-        'left' (or, lower indices) and active requests in the 'middle' (or, middle
-        indices) and completed requests on the 'right' (or, higher indices). The integers
-        `paused_request_count` and `total_request_count`  are used to track the boundaries
-        between these request groups.
-        - 0:paused_request_count -> paused requests
-        - paused_request_count:total_request_count -> active requests
-        - total_request_count:max_requests -> completed requests are moved here.
-        The reason for maintaining contiguous tensors rather than multiple
-        smaller (e.g., per-group or per-request) tensors is for both 1) speed
-        (avoid unnecessary tensor allocations), and 2) compatibility with the
-        Flash Attention kernels, which packed contiguous tensors.
-
-        The following happens in this code :
-        1. The active token mask tells us which requests are still active and which are completed
-        2. If no paused requests are present and no active requests we release all memory and reset.
-        3. Concatenate the paused tokens to the active tokens
-        4. For the finished requests we release memory blocks and move them to the right
-        5. We identify requests that require a new block and add them to the paused requests (i.e move them left)
-        6. Resume paused requests & evict overflowing paused requests.
-        7. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
-        8. We make relevant changes to the token bookkeeping tensors
-
-        Args:
-            active_requests_mask (Tensor): 1D Mask tensor marking active requests. (Active request length)
-            new_tokens (Tensor): Newly sampled tokens, with one token per active request. (Active request length)
-            new_speculative_tokens (Tensor): Newly sampled speculative tokens,
-                with num_speculative tokens per active request.
-                (num_speculative_tokens, active_request_length)
-
-        Return:
-            (dict) Request lifecycle IDs, or None if all requests finished.
-        """
-        prepared_update = self.update_requests_prepare(
-            active_requests_mask, new_tokens, new_speculative_tokens
-        )
-        return self.update_requests_bookkeep(prepared_update)
-
     def update_requests_prepare(
         self,
         active_requests_mask: Tensor,
@@ -3898,6 +3846,58 @@ class DynamicInferenceContext(BaseInferenceContext):
             "newly_paused_request_ids": newly_paused_request_ids,
             "evict_request_ids": evict_request_ids,
         }
+
+    def update_requests(
+        self,
+        active_requests_mask: Tensor,
+        new_tokens: Tensor,
+        new_speculative_tokens: Tensor = None,
+    ) -> Optional[Dict[str, Optional[Tensor]]]:
+        """Update context state after calling engine.step().
+
+        This method is responsible for:
+        - Update prefill requests to decode requests.
+        - Persist decode requests as decode requests.
+        - Terminate requests by length or termination id.
+
+        *Note*: All bookkeeping tensors (i.e., `self.request_*`) are laid out
+        contiguously, with a conceptual division between paused requests on the
+        'left' (or, lower indices) and active requests in the 'middle' (or, middle
+        indices) and completed requests on the 'right' (or, higher indices). The integers
+        `paused_request_count` and `total_request_count`  are used to track the boundaries
+        between these request groups.
+        - 0:paused_request_count -> paused requests
+        - paused_request_count:total_request_count -> active requests
+        - total_request_count:max_requests -> completed requests are moved here.
+        The reason for maintaining contiguous tensors rather than multiple
+        smaller (e.g., per-group or per-request) tensors is for both 1) speed
+        (avoid unnecessary tensor allocations), and 2) compatibility with the
+        Flash Attention kernels, which packed contiguous tensors.
+
+        The following happens in this code :
+        1. The active token mask tells us which requests are still active and which are completed
+        2. If no paused requests are present and no active requests we release all memory and reset.
+        3. Concatenate the paused tokens to the active tokens
+        4. For the finished requests we release memory blocks and move them to the right
+        5. We identify requests that require a new block and add them to the paused requests (i.e move them left)
+        6. Resume paused requests & evict overflowing paused requests.
+        7. We make changes to the request book keeping tesnsors and setup the tokens for next iteration
+        8. We make relevant changes to the token bookkeeping tensors
+
+        Args:
+            active_requests_mask (Tensor): 1D Mask tensor marking active requests. (Active request length)
+            new_tokens (Tensor): Newly sampled tokens, with one token per active request. (Active request length)
+            new_speculative_tokens (Tensor): Newly sampled speculative tokens,
+                with num_speculative tokens per active request.
+                (num_speculative_tokens, active_request_length)
+
+        Return:
+            (dict) Request lifecycle IDs, or None if all requests finished.
+        """
+        prepared_update = self.update_requests_prepare(
+            active_requests_mask, new_tokens, new_speculative_tokens
+        )
+        return self.update_requests_bookkeep(prepared_update)
 
     def prepare_async_next_forward(self, prepared_update: Dict[str, Optional[Tensor]]) -> None:
         """Prepare decode-only token bookkeeping for the next async-shaped forward."""
