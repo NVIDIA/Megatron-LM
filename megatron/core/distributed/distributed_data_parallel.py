@@ -268,22 +268,9 @@ class DistributedDataParallel(_BaseDataParallel):
                 else:
                     assert scaling_factor == target_gradient_scaling_factor
 
-            # With GTP active, a caller-provided full_param_layout is sized for the full DP group,
-            # not the replicate group the buffer shards over, so recompute it below.
-            if full_param_layout is not None and not gtp_active:
-                param_layout = full_param_layout.layouts.get(buffer_key)
-            elif self.ddp_config.use_distributed_optimizer:
-                from ..optimizer.distrib_optimizer import DistributedOptimizer
-
-                param_layout = DistributedOptimizer._compute_per_buffer_param_layout(
-                    params,
-                    self.bucket_size,
-                    data_parallel_group.size(),
-                    self.ddp_config,
-                    param_indices,
-                )
-            else:
-                param_layout = None
+            param_layout = (
+                full_param_layout.layouts.get(buffer_key) if full_param_layout is not None else None
+            )
             params_with_names = [(p, param_to_name[p]) for p in params]
             buffer = _ParamAndGradBuffer(
                 self.ddp_config,

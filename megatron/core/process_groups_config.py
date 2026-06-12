@@ -646,19 +646,19 @@ class ProcessGroupCollection:
             result['pp_group'] = pg_collection.pp
             result['ep_group'] = pg_collection.ep
 
-            # GTP group (fallback to intra_dp_cp if not provided)
+            # 6. GTP partial group (fallback to intra_dp_cp if not provided)
             if hasattr(pg_collection, 'intra_dp_cp_with_gtp'):
                 result['intra_dp_cp_with_gtp_group'] = pg_collection.intra_dp_cp_with_gtp
             else:
                 result['intra_dp_cp_with_gtp_group'] = result['intra_dp_cp_group']
 
-            # EGTP group (fallback to intra_expt_dp if not provided)
+            # 7. EGTP partial group (fallback to intra_expt_dp if not provided)
             if hasattr(pg_collection, 'intra_expt_dp_with_egtp'):
                 result['intra_expt_dp_with_egtp_group'] = pg_collection.intra_expt_dp_with_egtp
             else:
                 result['intra_expt_dp_with_egtp_group'] = result['intra_expt_dp_group']
 
-            # Full (cross-instance) with-GTP-excluded variants for callers that need to
+            # 8. Full (cross-instance) with-GTP-excluded variants for callers that need to
             # reach ALL true weight replicas (e.g., broadcast_params at init). Fall back
             # to the corresponding non-GTP-excluded full group when not provided.
             if hasattr(pg_collection, 'dp_cp_with_gtp'):
