@@ -17,7 +17,10 @@ from transformer_engine.pytorch.fp8 import check_fp8_support
 from megatron.core import parallel_state
 from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
 from megatron.core.inference.contexts import DynamicInferenceContext, StaticInferenceContext
-from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
+from megatron.core.inference.contexts.dynamic_context import (
+    MaxSequenceLengthOverflowError,
+    PendingAsyncFinishedRows,
+)
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
     InferenceRequest,
@@ -202,6 +205,7 @@ class TestAsyncSchedulingControllerHelpers:
         context.expert_model_parallel_group = None
         context.chunked_prefill_request_id = -1
         context.is_chunked_prefill_enabled.return_value = False
+        context.pending_async_finished_rows.return_value = None
         context.block_size_tokens = 128
         context.request_last_kv_block_offset = torch.tensor([1, 2], device='cpu')
         context.request_metadata = {
@@ -352,7 +356,10 @@ class TestAsyncSchedulingControllerHelpers:
         controller, context, _ = self._make_async_eligibility_controller()
         context.total_request_count = 2
         context.request_ids = torch.tensor([10, 11], dtype=torch.int32, device='cpu')
-        context._async_prior_finished_active_mask = torch.tensor([True, False], device='cpu')
+        context.pending_async_finished_rows.return_value = PendingAsyncFinishedRows(
+            active_mask=torch.tensor([True, False], device='cpu'),
+            request_ids=torch.tensor([10], dtype=torch.int32, device='cpu'),
+        )
         context.filter_async_finished_request_rows.side_effect = lambda result: {
             **result,
             "active_request_ids": torch.tensor([11], device='cpu'),
@@ -389,7 +396,6 @@ class TestAsyncSchedulingControllerHelpers:
         controller, context, _ = self._make_async_eligibility_controller()
         events = []
 
-        context._async_prior_finished_active_mask = None
         context.prepare_async_next_forward.side_effect = lambda _: events.append(
             "update_requests_prepare"
         )

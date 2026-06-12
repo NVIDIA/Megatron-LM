@@ -5,6 +5,7 @@ import math
 import operator
 import warnings
 from contextlib import nullcontext
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch  # type: ignore
@@ -121,6 +122,19 @@ class ContextOverflowError(Exception):
         self.request_id = request_id
         self.message = message
         self.is_transient = is_transient
+
+
+@dataclass(frozen=True)
+class PendingAsyncFinishedRows:
+    """Finished active rows awaiting async-shaped filtering and compaction."""
+
+    active_mask: Tensor
+    request_ids: Tensor
+
+    def __post_init__(self) -> None:
+        assert self.active_mask.dtype == torch.bool
+        assert self.active_mask.dim() == 1
+        assert self.request_ids.dim() == 1
 
 
 class RequestOverflowError(ContextOverflowError):
@@ -282,8 +296,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # Minimal async-shaped decode state. This tracks only active rows that
         # finished in the previous bookkeep phase and must be filtered before
         # the next compaction.
-        self._async_prior_finished_active_mask = None
-        self._async_prior_finished_request_ids = None
+        self._pending_async_finished_rows: Optional[PendingAsyncFinishedRows] = None
         self.async_scheduling_has_waiting_requests = False
         self.async_scheduling_has_stop_word_requests = False
 
@@ -2940,12 +2953,15 @@ class DynamicInferenceContext(BaseInferenceContext):
 
     def clear_async_finished_request_rows(self) -> None:
         """Clear pending async-shaped finish filtering and compaction state."""
-        self._async_prior_finished_active_mask = None
-        self._async_prior_finished_request_ids = None
+        self._pending_async_finished_rows = None
 
     def has_async_finished_request_rows(self) -> bool:
         """Return whether there are prior-finished active rows awaiting compaction."""
-        return self._async_prior_finished_active_mask is not None
+        return self._pending_async_finished_rows is not None
+
+    def pending_async_finished_rows(self) -> Optional[PendingAsyncFinishedRows]:
+        """Return pending async-shaped finished rows awaiting compaction."""
+        return self._pending_async_finished_rows
 
     def record_async_finished_request_rows(self, finished_active_mask: Tensor) -> None:
         """Record active rows that finished and must be compacted after the next sample."""
@@ -2965,20 +2981,21 @@ class DynamicInferenceContext(BaseInferenceContext):
         assert finished_active_mask.numel() == active_request_count
 
         active_slice = slice(self.paused_request_count, self.total_request_count)
-        self._async_prior_finished_active_mask = finished_active_mask.clone()
-        self._async_prior_finished_request_ids = self.request_ids[active_slice][
-            finished_active_mask
-        ].clone()
+        self._pending_async_finished_rows = PendingAsyncFinishedRows(
+            active_mask=finished_active_mask.clone(),
+            request_ids=self.request_ids[active_slice][finished_active_mask].clone(),
+        )
 
     def filter_async_finished_request_rows(self, step_result: Dict) -> Dict:
         """Filter rows that already finished in the previous async-shaped bookkeep."""
-        finished_mask = self._async_prior_finished_active_mask
-        if finished_mask is None:
+        pending_finished_rows = self.pending_async_finished_rows()
+        if pending_finished_rows is None:
             return step_result
 
+        finished_mask = pending_finished_rows.active_mask
         keep_mask = ~finished_mask
         filtered_result = dict(step_result)
-        prior_finished_ids = self._async_prior_finished_request_ids
+        prior_finished_ids = pending_finished_rows.request_ids
 
         for key in ("active_request_ids", "sample", "accepted_tokens"):
             value = filtered_result.get(key)
@@ -3026,10 +3043,11 @@ class DynamicInferenceContext(BaseInferenceContext):
         new_speculative_tokens: Optional[Tensor] = None,
     ) -> None:
         """Compact active rows after their prior-finished samples have been filtered."""
-        finished_mask = self._async_prior_finished_active_mask
-        if finished_mask is None:
+        pending_finished_rows = self.pending_async_finished_rows()
+        if pending_finished_rows is None:
             return
 
+        finished_mask = pending_finished_rows.active_mask
         keep_mask = ~finished_mask
         active_request_count = finished_mask.numel()
         remaining_request_count = keep_mask.sum().item()
