@@ -1,6 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Literal, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -26,6 +26,7 @@ class PackedSeqParams:
     cp_group: dist.ProcessGroup = None
     total_tokens: int = None
     seq_idx: Tensor = None
+    pad_between_seqs: Optional[bool] = None
 
     def __post_init__(self):
         """Pre-compute seq_idx for Mamba mixer CUDA graph compatibility.
@@ -127,9 +128,50 @@ def _pad_cu_seqlens(cu_seqlens: Optional[Tensor], target_entries: int) -> Option
     return padded
 
 
+def _append_dummy_seq(cu_seqlens: Optional[Tensor], dummy_end: int) -> Optional[Tensor]:
+    """Append a dummy sequence boundary to a cu_seqlens tensor.
+
+    ``dummy_end`` is the padded target length. Appending it to both
+    ``cu_seqlens_*`` and ``cu_seqlens_*_padded`` represents the post-pack
+    alignment tail as an ordinary dummy sequence. That keeps every token row
+    covered by THD metadata without enabling TE's pad-between-sequences mode.
+    """
+    if cu_seqlens is None:
+        return None
+
+    dummy = torch.full((1,), int(dummy_end), dtype=cu_seqlens.dtype, device=cu_seqlens.device)
+    return torch.cat((cu_seqlens, dummy), dim=0)
+
+
 def _round_up_to_alignment(value: int, alignment: int) -> int:
     assert alignment > 0, f"Packed sequence padding alignment must be > 0, got {alignment}."
     return ((value + alignment - 1) // alignment) * alignment
+
+
+def get_thd_padding_kwargs(
+    pad_packed_seq_alignment: Union[int, Literal["max"]],
+    max_seqlen_per_dp_cp_rank: Optional[int],
+    thd_max_num_seqs: Optional[int],
+    cuda_graph_static: bool,
+) -> Tuple[Optional[int], Optional[int], Optional[int]]:
+    """Resolve ``pad_sequence_for_thd`` kwargs from the training config.
+
+    ``--pad-packed-seq-alignment`` has two forms:
+
+    - ``max`` pads token-like tensors to ``max_seqlen_per_dp_cp_rank``;
+    - a positive value pads token-like tensors to a multiple of that value.
+
+    Padding cu_seqlens to ``thd_max_num_seqs + 1`` is a CUDA Graph static-input
+    requirement. Eager pad-to-max should preserve sequence metadata so kernels
+    continue to see the real packed sequence boundaries.
+    """
+    if cuda_graph_static:
+        return None, int(max_seqlen_per_dp_cp_rank), thd_max_num_seqs
+
+    if pad_packed_seq_alignment == "max":
+        return None, int(max_seqlen_per_dp_cp_rank), None
+
+    return int(pad_packed_seq_alignment), None, None
 
 
 def _resolve_thd_padding_lengths(
@@ -140,27 +182,19 @@ def _resolve_thd_padding_lengths(
     packed_seq_params: PackedSeqParams,
     target_len: Optional[int],
     alignment: Optional[int],
-) -> Tuple[int, int, int, int, torch.device, bool]:
-    """Resolve local/global THD padding lengths without changing tensors."""
+) -> Tuple[int, int, int, int, torch.device]:
+    """Resolve local/global THD padding lengths without changing tensors.
 
-    actual_T = None
-    mask_device = None
-    for candidate in (tokens, labels, loss_mask, position_ids):
-        if candidate is not None:
-            actual_T = candidate.shape[-1]
-            mask_device = candidate.device
-            break
-    actual_T_is_local = actual_T is not None
-    if actual_T is None:
-        assert packed_seq_params.cu_seqlens_q is not None, (
-            "packed_seq_params.cu_seqlens_q must be available to derive padding_mask "
-            "when tokens/labels/loss_mask/position_ids are all None."
-        )
-        actual_T = int(packed_seq_params.cu_seqlens_q[-1].item())
-        mask_device = packed_seq_params.cu_seqlens_q.device
+    Returns:
+        local_actual_T: Current rank's token-like tensor length.
+        global_actual_T: Global packed length represented by THD metadata.
+        local_target_len: Current rank's padded token-like tensor length.
+        global_target_len: Global padded endpoint represented by THD metadata.
+        mask_device: Device used to build the returned padding mask.
+    """
 
+    # Resolve the CP geometry used to translate local lengths to global endpoints.
     from megatron.core import parallel_state
-
     cp_size = (
         packed_seq_params.local_cp_size
         if packed_seq_params.local_cp_size is not None
@@ -168,59 +202,79 @@ def _resolve_thd_padding_lengths(
     )
     cp_rank = parallel_state.get_context_parallel_rank() if cp_size > 1 else 0
 
-    if target_len is None:
-        assert alignment is not None, "Either target_len or alignment must be provided."
-        global_target_len = _round_up_to_alignment(int(actual_T), alignment)
-    else:
-        global_target_len = int(target_len) * cp_size
+    # Find the first token-like tensor that carries this rank's local length.
+    local_tensor_T = None
+    mask_device = None
+    for candidate in (tokens, labels, loss_mask, position_ids):
+        if candidate is not None:
+            local_tensor_T = int(candidate.shape[-1])
+            mask_device = candidate.device
+            break
 
+    # Prefer THD metadata for the global packed length when it is available.
+    has_local_tensor = local_tensor_T is not None
+    if packed_seq_params.cu_seqlens_q is not None:
+        global_actual_T = int(packed_seq_params.cu_seqlens_q[-1].item())
+        if mask_device is None:
+            mask_device = packed_seq_params.cu_seqlens_q.device
+    else:
+        assert has_local_tensor, (
+            "packed_seq_params.cu_seqlens_q must be available to derive padding_mask "
+            "when tokens/labels/loss_mask/position_ids are all None."
+        )
+        global_actual_T = local_tensor_T * cp_size
+
+    # Tensor path: use the already-sliced local shape and scale to the global endpoint.
+    if has_local_tensor:
+        local_actual_T = local_tensor_T
+        local_target_len = (
+            int(target_len)
+            if target_len is not None
+            else _round_up_to_alignment(local_actual_T, alignment)
+        )
+        global_target_len = local_target_len * cp_size
+        return local_actual_T, global_actual_T, local_target_len, global_target_len, mask_device
+
+    # Metadata-only path: resolve the global padded endpoint first.
+    global_target_len = (
+        int(target_len) * cp_size
+        if target_len is not None
+        else _round_up_to_alignment(global_actual_T, alignment)
+    )
+
+    # Under CP, ask TE which packed rows this rank would receive.
     if cp_size > 1:
         from megatron.core.extensions.transformer_engine import get_thd_partitioned_indices
 
-        if actual_T_is_local:
-            local_actual_T = int(actual_T)
-            local_target_len = (
-                int(target_len)
-                if target_len is not None
-                else _round_up_to_alignment(local_actual_T, alignment)
-            )
-        else:
-            local_actual_T = int(
-                get_thd_partitioned_indices(
-                    (
-                        packed_seq_params.cu_seqlens_q_padded
-                        if packed_seq_params.cu_seqlens_q_padded is not None
-                        else packed_seq_params.cu_seqlens_q
-                    ),
-                    int(actual_T),
-                    cp_size,
-                    cp_rank,
-                ).numel()
-            )
-            local_target_len = int(
-                get_thd_partitioned_indices(
-                    (
-                        packed_seq_params.cu_seqlens_q_padded
-                        if packed_seq_params.cu_seqlens_q_padded is not None
-                        else packed_seq_params.cu_seqlens_q
-                    ),
-                    global_target_len,
-                    cp_size,
-                    cp_rank,
-                ).numel()
-            )
+        partition_cu_seqlens = (
+            packed_seq_params.cu_seqlens_q_padded
+            if packed_seq_params.cu_seqlens_q_padded is not None
+            else packed_seq_params.cu_seqlens_q
+        )
+        # The number of selected rows is this rank's local actual length.
+        local_actual_T = int(
+            get_thd_partitioned_indices(
+                partition_cu_seqlens,
+                global_actual_T,
+                cp_size,
+                cp_rank,
+            ).numel()
+        )
+        # Do the same for the padded endpoint; THD CP is not simple equal split.
+        local_target_len = int(
+            get_thd_partitioned_indices(
+                partition_cu_seqlens,
+                global_target_len,
+                cp_size,
+                cp_rank,
+            ).numel()
+        )
     else:
-        local_actual_T = int(actual_T)
+        # Without CP, local and global metadata lengths are identical.
+        local_actual_T = global_actual_T
         local_target_len = global_target_len
 
-    return (
-        int(actual_T),
-        local_actual_T,
-        local_target_len,
-        global_target_len,
-        mask_device,
-        actual_T_is_local,
-    )
+    return local_actual_T, global_actual_T, local_target_len, global_target_len, mask_device
 
 
 def pad_sequence_for_thd(
@@ -232,6 +286,7 @@ def pad_sequence_for_thd(
     alignment: Optional[int] = None,
     target_len: Optional[int] = None,
     max_num_seqs: Optional[int] = None,
+    pad_by_appending_dummy_seq: bool = True,
 ) -> Tuple[
     Optional[Tensor],
     Optional[Tensor],
@@ -243,9 +298,37 @@ def pad_sequence_for_thd(
     """Pad packed THD tensors after packing.
 
     This appends padding tokens to token-like tensors and returns a padding mask
-    for MoE auxiliary-loss/routing paths. When ``max_num_seqs`` is provided, the
-    four cu_seqlens tensors are also padded to ``max_num_seqs + 1`` entries;
-    this is required by CUDA Graph replay because those tensors are graph inputs.
+    for MoE auxiliary-loss/routing paths.
+
+    Args:
+        tokens: Packed token tensor with sequence length on the last dimension,
+            or None on pipeline stages that do not own tokens.
+        labels: Packed label tensor with sequence length on the last dimension,
+            or None.
+        loss_mask: Packed loss mask tensor with sequence length on the last
+            dimension, or None.
+        position_ids: Packed position id tensor with sequence length on the
+            last dimension, or None.
+        packed_seq_params: THD metadata for the packed batch.
+        alignment: If set, round each CP-local token-like tensor length up to
+            this multiple. Exactly one of ``alignment`` and ``target_len`` must
+            be provided.
+        target_len: If set, pad token-like tensors to this CP-local length.
+            Exactly one of ``alignment`` and ``target_len`` must be provided.
+        max_num_seqs: If set, pad cu_seqlens tensors to
+            ``max_num_seqs + 1`` entries for static CUDA Graph inputs.
+        pad_by_appending_dummy_seq: If true, represent the post-pack padding
+            tail as an extra dummy sequence in cu_seqlens metadata.
+
+    Notes:
+        - THD CP slicing is defined by Transformer Engine. On metadata-only
+          stages, Megatron asks TE which packed rows this CP rank would receive
+          and uses that row count as the local length instead of assuming equal
+          division by CP size.
+        - When ``pad_by_appending_dummy_seq`` is true, the padding tail is also
+          represented as an ordinary dummy sequence in cu_seqlens metadata.
+        - ``max_num_seqs`` pads all four cu_seqlens tensors; this is required
+          by CUDA Graph replay because those tensors are graph inputs.
 
     Returns:
         Padded (tokens, labels, loss_mask, position_ids, packed_seq_params, padding_mask)
@@ -255,7 +338,7 @@ def pad_sequence_for_thd(
         "Exactly one of alignment or target_len must be provided for THD padding."
     )
 
-    actual_T, local_actual_T, local_target_len, global_target_len, mask_device, _ = (
+    local_actual_T, global_actual_T, local_target_len, global_target_len, mask_device = (
         _resolve_thd_padding_lengths(
             tokens,
             labels,
@@ -267,7 +350,8 @@ def pad_sequence_for_thd(
         )
     )
 
-    if actual_T is not None and packed_seq_params.cu_seqlens_q is not None:
+    # Reject individual packed sequences that cannot fit the resolved target.
+    if packed_seq_params.cu_seqlens_q is not None:
         _cu = packed_seq_params.cu_seqlens_q
         _individual_lens = _cu[1:] - _cu[:-1]
         _max_individual = int(_individual_lens.max().item()) if _individual_lens.numel() > 0 else 0
@@ -277,45 +361,60 @@ def pad_sequence_for_thd(
             f"or filter out overlong requests."
         )
 
+    # Pad token-like tensors to the CP-local target length.
     tokens = _pad_seq_tensor(tokens, local_target_len)
     labels = _pad_seq_tensor(labels, local_target_len)
     loss_mask = _pad_seq_tensor(loss_mask, local_target_len)
     position_ids = _pad_seq_tensor(position_ids, local_target_len)
 
+    # Copy THD metadata before optionally appending/padding sequence boundaries.
+    cu_seqlens_q = packed_seq_params.cu_seqlens_q
+    cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
+    cu_seqlens_q_padded = packed_seq_params.cu_seqlens_q_padded
+    cu_seqlens_kv_padded = packed_seq_params.cu_seqlens_kv_padded
+
+    # Represent post-pack padding as a dummy sequence when requested.
     target_cu_entries = None if max_num_seqs is None else max_num_seqs + 1
+    has_dummy_padding_seq = pad_by_appending_dummy_seq and global_target_len > global_actual_T
+    dummy_seq_len = global_target_len - global_actual_T if has_dummy_padding_seq else 0
+
+    if has_dummy_padding_seq:
+        cu_seqlens_q = _append_dummy_seq(cu_seqlens_q, global_target_len)
+        cu_seqlens_kv = _append_dummy_seq(cu_seqlens_kv, global_target_len)
+        cu_seqlens_q_padded = _append_dummy_seq(cu_seqlens_q_padded, global_target_len)
+        cu_seqlens_kv_padded = _append_dummy_seq(cu_seqlens_kv_padded, global_target_len)
+
+    # Pad cu_seqlens entry counts for static CUDA Graph inputs.
+    if target_cu_entries is not None:
+        cu_seqlens_q = _pad_cu_seqlens(cu_seqlens_q, target_cu_entries)
+        cu_seqlens_kv = _pad_cu_seqlens(cu_seqlens_kv, target_cu_entries)
+        cu_seqlens_q_padded = _pad_cu_seqlens(cu_seqlens_q_padded, target_cu_entries)
+        cu_seqlens_kv_padded = _pad_cu_seqlens(cu_seqlens_kv_padded, target_cu_entries)
+
+    # Rebuild PackedSeqParams with the padded tensor and metadata shapes.
     padded_params = PackedSeqParams(
         qkv_format=packed_seq_params.qkv_format,
-        cu_seqlens_q=(
-            packed_seq_params.cu_seqlens_q
-            if target_cu_entries is None
-            else _pad_cu_seqlens(packed_seq_params.cu_seqlens_q, target_cu_entries)
-        ),
-        cu_seqlens_kv=(
-            packed_seq_params.cu_seqlens_kv
-            if target_cu_entries is None
-            else _pad_cu_seqlens(packed_seq_params.cu_seqlens_kv, target_cu_entries)
-        ),
-        cu_seqlens_q_padded=(
-            packed_seq_params.cu_seqlens_q_padded
-            if target_cu_entries is None
-            else _pad_cu_seqlens(packed_seq_params.cu_seqlens_q_padded, target_cu_entries)
-        ),
-        cu_seqlens_kv_padded=(
-            packed_seq_params.cu_seqlens_kv_padded
-            if target_cu_entries is None
-            else _pad_cu_seqlens(packed_seq_params.cu_seqlens_kv_padded, target_cu_entries)
-        ),
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_kv=cu_seqlens_kv,
+        cu_seqlens_q_padded=cu_seqlens_q_padded,
+        cu_seqlens_kv_padded=cu_seqlens_kv_padded,
         max_seqlen_q=(
-            global_target_len if target_cu_entries is not None else packed_seq_params.max_seqlen_q
+            global_target_len
+            if target_cu_entries is not None
+            else max(packed_seq_params.max_seqlen_q, dummy_seq_len)
         ),
         max_seqlen_kv=(
-            global_target_len if target_cu_entries is not None else packed_seq_params.max_seqlen_kv
+            global_target_len
+            if target_cu_entries is not None
+            else max(packed_seq_params.max_seqlen_kv, dummy_seq_len)
         ),
         local_cp_size=packed_seq_params.local_cp_size,
         cp_group=packed_seq_params.cp_group,
         total_tokens=local_target_len if target_cu_entries is None else None,
+        pad_between_seqs=False if has_dummy_padding_seq else packed_seq_params.pad_between_seqs,
     )
 
+    # True marks padded local token slots for routing/loss paths.
     padding_mask = torch.arange(local_target_len, device=mask_device).unsqueeze(0) >= local_actual_T
 
     return tokens, labels, loss_mask, position_ids, padded_params, padding_mask

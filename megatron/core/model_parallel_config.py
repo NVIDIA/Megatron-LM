@@ -2,11 +2,26 @@
 
 import warnings
 from dataclasses import dataclass, field
-from typing import Callable, ContextManager, Literal, Optional
+from typing import Callable, ContextManager, Literal, Optional, Union
 
 import torch
 
 from megatron.core.utils import experimental_api
+
+
+def _parse_pad_packed_seq_alignment(value):
+    """Parse THD packed-sequence padding alignment.
+
+    Accepts ``"max"`` or a positive integer alignment.
+    """
+    if value == "max":
+        return value
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "pad_packed_seq_alignment must be 'max' or a positive integer alignment."
+        ) from exc
 
 
 @dataclass
@@ -87,23 +102,29 @@ class ModelParallelConfig:
     default_dynamic_cp: Dynamic-CP scheduler for packed sequence balancing.
     """
 
-    pad_packed_seq_alignment: Optional[int] = field(
+    pad_packed_seq_alignment: Optional[Union[int, Literal["max"]]] = field(
         default=None,
         metadata={
             "argparse_meta": {
                 "arg_names": ["--pad-packed-seq-alignment"],
-                "nargs": "?",
-                "const": 0,
-                "type": int,
+                "type": _parse_pad_packed_seq_alignment,
             }
         },
     )
     """Pad THD packed sequence tensors after packing.
 
-    If set without a value, the caller chooses a static target; the standard THD
-    training paths use max_seqlen_per_dp_cp_rank and pad cu_seqlens tensors to
-    thd_max_num_seqs + 1 entries. If set to a positive integer N, token-like
-    tensors are padded to a multiple of N and cu_seqlens metadata is preserved.
+    If set to ``max``, token-like tensors are padded to
+    max_seqlen_per_dp_cp_rank. If set to a positive integer N, token-like
+    tensors are padded to a multiple of N.
+    """
+
+    pad_packed_seq_by_appending_dummy_seq: bool = True
+    """Represent a THD packed-sequence padding tail by appending a dummy sequence.
+
+    When disabled, token-like tensors are still padded according to
+    pad_packed_seq_alignment, but cu_seqlens sequence boundaries are not extended
+    for the padding tail. CUDA Graph static-input padding may still pad the
+    cu_seqlens tensors to thd_max_num_seqs + 1 entries.
     """
 
     expert_model_parallel_size: int = 1
@@ -489,12 +510,27 @@ class ModelParallelConfig:
                 )
 
         if self.pad_packed_seq_alignment is not None:
-            if self.pad_packed_seq_alignment < 0:
+            self.pad_packed_seq_alignment = _parse_pad_packed_seq_alignment(
+                self.pad_packed_seq_alignment
+            )
+            if self.max_seqlen_per_dp_cp_rank is None:
                 raise ValueError(
-                    "pad_packed_seq_alignment must be >= 0. Use the flag without a value "
-                    "to let the caller choose a static target, or pass a positive integer "
-                    "alignment."
+                    "max_seqlen_per_dp_cp_rank must be set when pad_packed_seq_alignment "
+                    "is enabled."
                 )
+            if self.pad_packed_seq_alignment != "max":
+                if self.pad_packed_seq_alignment <= 0:
+                    raise ValueError(
+                        "pad_packed_seq_alignment must be 'max' or a positive integer "
+                        "alignment."
+                    )
+                if self.pad_packed_seq_alignment > self.max_seqlen_per_dp_cp_rank:
+                    raise ValueError(
+                        "pad_packed_seq_alignment must not exceed "
+                        "max_seqlen_per_dp_cp_rank "
+                        f"({self.max_seqlen_per_dp_cp_rank}), got "
+                        f"{self.pad_packed_seq_alignment}."
+                    )
 
         if self.sequence_parallel:
             if self.tensor_model_parallel_size <= 1:

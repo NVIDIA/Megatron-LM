@@ -30,7 +30,11 @@ from megatron.core.datasets.data_schedule import get_batch_on_this_rank_for_sequ
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
-from megatron.core.packed_seq_params import PackedSeqParams, pad_sequence_for_thd
+from megatron.core.packed_seq_params import (
+    PackedSeqParams,
+    get_thd_padding_kwargs,
+    pad_sequence_for_thd,
+)
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.multi_token_prediction import get_mtp_ranks, mtp_on_this_rank
@@ -199,23 +203,12 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
         labels = batch.get('labels', None)
         loss_mask = batch.get('loss_mask', None)
         position_ids = batch.get('position_ids', None)
-        cuda_graph_static = config.cuda_graph_impl != "none"
-        static_target = (
-            config.pad_packed_seq_alignment == 0
-            and config.max_seqlen_per_dp_cp_rank is not None
+        alignment, target_len, max_num_seqs = get_thd_padding_kwargs(
+            config.pad_packed_seq_alignment,
+            config.max_seqlen_per_dp_cp_rank,
+            config.thd_max_num_seqs,
+            config.cuda_graph_impl != "none",
         )
-        if cuda_graph_static or static_target:
-            target_len = config.max_seqlen_per_dp_cp_rank
-            max_num_seqs = config.thd_max_num_seqs
-            alignment = None
-        else:
-            target_len = None
-            max_num_seqs = None
-            alignment = (
-                int(max_seqlen[0].item())
-                if config.pad_packed_seq_alignment == 0
-                else config.pad_packed_seq_alignment
-            )
         tokens, labels, loss_mask, position_ids, packed_seq_params, padding_mask = (
             pad_sequence_for_thd(
                 tokens,
@@ -226,6 +219,7 @@ def get_batch(data_iterator, vp_stage: Optional[int] = None):
                 alignment=alignment,
                 target_len=target_len,
                 max_num_seqs=max_num_seqs,
+                pad_by_appending_dummy_seq=config.pad_packed_seq_by_appending_dummy_seq,
             )
         )
         if 'tokens' in batch:

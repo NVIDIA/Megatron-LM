@@ -19,7 +19,11 @@ from megatron.core.datasets.data_schedule_utils import (
     next_hdp_group,
     reroute_samples_to_dcp_ranks,
 )
-from megatron.core.packed_seq_params import PackedSeqParams, pad_sequence_for_thd
+from megatron.core.packed_seq_params import (
+    PackedSeqParams,
+    get_thd_padding_kwargs,
+    pad_sequence_for_thd,
+)
 from megatron.core.pipeline_parallel.hybrid_cp_schedule import BalancedCPScheduler
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.multi_token_prediction import mtp_on_this_rank
@@ -43,9 +47,9 @@ class BasePackingScheduler:
             dp_size: The data parallel size.
             microbatch_group_size_per_vp_stage: The microbatch group size per virtual
             pipeline stage, only used when enabling VPP, otherwise None.
-            max_num_seqs: Optional cap on the number of packed sequences per
-            microbatch. When set, the scheduler closes a pack as soon as it
-            reaches this many sequences in addition to the token-budget condition.
+            max_num_seqs: Optional cap on the number of real packed sequences
+            per microbatch. This excludes any dummy sequence later appended for
+            THD padding.
         """
         self.max_seqlen_per_dp_cp_rank = max_seqlen_per_dp_cp_rank
         self.cp_size = cp_size
@@ -415,6 +419,36 @@ scheduler_map: Dict[str, Type[BasePackingScheduler]] = {
 }
 
 
+def _get_scheduler_max_real_num_seqs(config) -> Optional[int]:
+    """Return the scheduler cap for real THD sequences.
+
+    ``thd_max_num_seqs`` is the final static THD capacity, including the
+    optional dummy sequence appended for a padding tail. The dp_balanced
+    scheduler only packs real sequences, so reserve one slot when dummy-tail
+    padding is enabled.
+    """
+    max_num_seqs = getattr(config, 'thd_max_num_seqs', None)
+    if max_num_seqs is None:
+        return None
+
+    max_num_seqs = int(max_num_seqs)
+    if max_num_seqs < 1:
+        raise ValueError(f"thd_max_num_seqs must be >= 1, got {max_num_seqs}.")
+
+    if (
+        getattr(config, 'pad_packed_seq_alignment', None) is not None
+        and getattr(config, 'pad_packed_seq_by_appending_dummy_seq', True)
+    ):
+        if max_num_seqs < 2:
+            raise ValueError(
+                "thd_max_num_seqs must be >= 2 when THD padding appends a dummy "
+                "sequence, because thd_max_num_seqs includes that dummy sequence."
+            )
+        return max_num_seqs - 1
+
+    return max_num_seqs
+
+
 def wrap_data_iterator(
     data_iterator, config, num_microbatches, pg_collection: Optional[ProcessGroupCollection] = None
 ):
@@ -457,6 +491,12 @@ def wrap_data_iterator(
     if scheduler_type == 'default_dynamic_cp':
         scheduler_kwargs['min_cp_size'] = config.min_dynamic_context_parallel_size
 
+    scheduler_max_num_seqs = (
+        _get_scheduler_max_real_num_seqs(config)
+        if scheduler_type == 'dp_balanced'
+        else getattr(config, 'thd_max_num_seqs', None)
+    )
+
     scheduler = scheduler_map[scheduler_type](
         config.max_seqlen_per_dp_cp_rank,
         cp_size,
@@ -466,7 +506,7 @@ def wrap_data_iterator(
             if config.virtual_pipeline_model_parallel_size is None
             else config.microbatch_group_size_per_vp_stage
         ),
-        max_num_seqs=getattr(config, 'thd_max_num_seqs', None),
+        max_num_seqs=scheduler_max_num_seqs,
         **scheduler_kwargs,
     )
 
@@ -688,6 +728,7 @@ def get_batch_on_this_rank_for_sequence_packing(
         max_seqlen_kv=max_seqlen,
         local_cp_size=local_cp_size,
         cp_group=cp_group,
+        pad_between_seqs=False,
     )
 
     # Pad the already-packed THD tensors at the end when requested. CUDA Graph
@@ -697,18 +738,12 @@ def get_batch_on_this_rank_for_sequence_packing(
         getattr(config, 'pad_packed_seq_alignment', None) if config is not None else None
     )
     if pad_alignment is not None and packed_seq_params is not None:
-        cuda_graph_static = getattr(config, 'cuda_graph_impl', 'none') != 'none'
-        static_target = (
-            pad_alignment == 0 and getattr(config, 'max_seqlen_per_dp_cp_rank', None) is not None
+        alignment, target_len, max_num_seqs = get_thd_padding_kwargs(
+            pad_alignment,
+            getattr(config, 'max_seqlen_per_dp_cp_rank', None),
+            getattr(config, 'thd_max_num_seqs', None),
+            getattr(config, 'cuda_graph_impl', 'none') != 'none',
         )
-        if cuda_graph_static or static_target:
-            target_len = config.max_seqlen_per_dp_cp_rank
-            max_num_seqs = config.thd_max_num_seqs
-            alignment = None
-        else:
-            target_len = None
-            max_num_seqs = None
-            alignment = max_seqlen if pad_alignment == 0 else pad_alignment
         tokens, labels, loss_mask, position_ids, packed_seq_params, padding_mask = (
             pad_sequence_for_thd(
                 tokens,
@@ -719,6 +754,9 @@ def get_batch_on_this_rank_for_sequence_packing(
                 alignment=alignment,
                 target_len=target_len,
                 max_num_seqs=max_num_seqs,
+                pad_by_appending_dummy_seq=getattr(
+                    config, 'pad_packed_seq_by_appending_dummy_seq', True
+                ),
             )
         )
 

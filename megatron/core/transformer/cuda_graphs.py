@@ -2301,16 +2301,7 @@ class TECudaGraphHelper:
                     auto_num_slots_tensor, op=torch.distributed.ReduceOp.MAX, group=pp_group
                 )
                 auto_num_slots = int(auto_num_slots_tensor.item())
-            requested_num_slots = self.config.cuda_graph_num_microbatch_slots
-            if requested_num_slots is not None:
-                assert requested_num_slots >= auto_num_slots, (
-                    "cuda_graph_num_microbatch_slots is smaller than the minimum safe number "
-                    f"of slots for the current PP/VPP topology: requested={requested_num_slots}, "
-                    f"required>={auto_num_slots}"
-                )
-                self.num_microbatches = requested_num_slots
-            else:
-                self.num_microbatches = auto_num_slots
+            self.num_microbatches = auto_num_slots
             log_on_each_pipeline_stage(
                 logger=logger,
                 tp_group=None,

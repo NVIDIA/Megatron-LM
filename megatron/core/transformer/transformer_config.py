@@ -1082,9 +1082,9 @@ class TransformerConfig(ModelParallelConfig):
     string names before normalization so existing CUDA_GRAPH_MODULES_DEPRECATIONS handles them."""
 
     thd_max_num_seqs: int = 32
-    """Maximum number of packed sequences per microbatch in THD format. The packing
-    scheduler closes a pack as soon as it reaches this many sequences (in addition to
-    the existing token-budget condition). When CUDA Graph is enabled, cu_seqlens
+    """Maximum number of THD sequence entries per microbatch, including any dummy
+    sequence appended for a padding tail. The dp_balanced packing scheduler reserves
+    that dummy slot when THD padding appends one. When CUDA Graph is enabled, cu_seqlens
     tensors are padded to this size + 1.
 
     Sizing guidance: choose a value that comfortably covers the worst-case packing,
@@ -1098,11 +1098,6 @@ class TransformerConfig(ModelParallelConfig):
     number of microbatches. This option is only meaningful for cuda_graph_impl=transformer_engine.
     When enabled, capture builds a bounded number of graph slots and replay maps real
     microbatch_id to slot_id by modulo."""
-
-    cuda_graph_num_microbatch_slots: Optional[int] = None
-    """Number of CUDA graph slots to capture per layer for dynamic microbatch replay.
-    If None, an automatic slot count is derived from the PP/VPP schedule topology.
-    If set, the provided value must be >= the automatically derived safe minimum."""
 
     ####################
     # Hyper-Connection Configuration
@@ -1450,6 +1445,12 @@ class TransformerConfig(ModelParallelConfig):
             ), f"linear_attention_freq must be set for linear attention."
 
             if self.experimental_attention_variant == "gated_delta_net":
+                if self.pad_packed_seq_alignment is not None:
+                    assert self.pad_packed_seq_by_appending_dummy_seq, (
+                        "gated_delta_net with pad_packed_seq_alignment requires "
+                        "pad_packed_seq_by_appending_dummy_seq."
+                    )
+
                 # Check required parameters
                 assert (
                     self.linear_conv_kernel_dim is not None
@@ -2677,20 +2678,9 @@ class TransformerConfig(ModelParallelConfig):
                         if CudaGraphModule.moe_preprocess not in self.cuda_graph_modules:
                             self.cuda_graph_modules.append(CudaGraphModule.moe_preprocess)
 
-                if self.cuda_graph_impl == "transformer_engine":
-                    if self.cuda_graph_dynamic_microbatches:
-                        if self.cuda_graph_num_microbatch_slots is not None:
-                            assert self.cuda_graph_num_microbatch_slots >= 1, (
-                                "cuda_graph_num_microbatch_slots must be >= 1 when "
-                                "cuda_graph_dynamic_microbatches is enabled."
-                            )
-                else:
+                if self.cuda_graph_impl != "transformer_engine":
                     assert not self.cuda_graph_dynamic_microbatches, (
                         "cuda_graph_dynamic_microbatches is only supported with "
-                        "cuda_graph_impl=transformer_engine."
-                    )
-                    assert self.cuda_graph_num_microbatch_slots is None, (
-                        "cuda_graph_num_microbatch_slots is only supported with "
                         "cuda_graph_impl=transformer_engine."
                     )
 
@@ -3028,10 +3018,10 @@ class TransformerConfig(ModelParallelConfig):
                 "THD CUDA Graph requires --pad-packed-seq-alignment to be set."
             )
             assert (
-                self.pad_packed_seq_alignment == 0
+                self.pad_packed_seq_alignment == "max"
                 or self.pad_packed_seq_alignment == self.max_seqlen_per_dp_cp_rank
             ), (
-                "THD CUDA Graph requires --pad-packed-seq-alignment without a value "
+                "THD CUDA Graph requires --pad-packed-seq-alignment='max' "
                 "or --pad-packed-seq-alignment equal to max_seqlen_per_dp_cp_rank "
                 f"({self.max_seqlen_per_dp_cp_rank}), got {self.pad_packed_seq_alignment}."
             )

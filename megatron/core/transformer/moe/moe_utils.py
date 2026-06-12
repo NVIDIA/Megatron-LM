@@ -58,7 +58,7 @@ else:
 def switch_load_balancing_loss_func(
     probs: torch.Tensor,
     tokens_per_expert: torch.Tensor,
-    total_num_tokens: int,
+    total_num_tokens: Union[int, torch.Tensor],
     topk: int,
     num_experts: int,
     moe_aux_loss_coeff: float,
@@ -108,7 +108,7 @@ def switch_load_balancing_loss_func(
                               Shape in [num_tokens, num_experts].
         tokens_per_expert (torch.Tensor): Number of tokens assigned to each expert in the batch.
                                           Shape in [num_experts]
-        total_num_tokens (int): Total number of tokens in the batch.
+        total_num_tokens (int or torch.Tensor): Total number of tokens in the batch.
         topk (int): The number of experts selected for each token.
         num_experts (int): The number of experts.
         moe_aux_loss_coeff (float): The coefficient for the auxiliary loss.
@@ -228,7 +228,7 @@ def get_tokens_per_expert_and_token_count(
     reduce_group: torch.distributed.ProcessGroup,
     topk: int = None,
     with_padding_mask: bool = False,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, Union[int, torch.Tensor], Union[int, torch.Tensor]]:
     """
     Compute global_tokens_per_expert, local_num_tokens and total_num_tokens with padding mask.
     """
@@ -237,8 +237,8 @@ def get_tokens_per_expert_and_token_count(
         local_tokens_per_expert, reduce_group
     )
     if with_padding_mask:
-        local_num_tokens = local_tokens_per_expert.sum() / topk
-        total_num_tokens = global_tokens_per_expert.sum() / topk
+        local_num_tokens = local_tokens_per_expert.sum() // topk
+        total_num_tokens = global_tokens_per_expert.sum() // topk
     else:
         local_num_tokens = routing_map.shape[0]
         total_num_tokens = local_num_tokens * reduce_group.size()
