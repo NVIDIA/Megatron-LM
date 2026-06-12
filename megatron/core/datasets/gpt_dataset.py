@@ -292,6 +292,12 @@ class GPTDataset(MegatronDataset):
             # tensor.
             if self.config.add_extra_token_to_sequence:
                 document_lengths[-1] -= 1
+            # If the sample was padded (e.g., the last validation sample),
+            # fold the padding into the last document so cu_seqlens[-1]
+            # equals sequence_length.
+            shortfall = self.config.sequence_length - sum(document_lengths)
+            if shortfall > 0:
+                document_lengths[-1] += shortfall
             cu_seqlens = torch.tensor(
                 numpy.cumsum([0] + document_lengths), dtype=torch.int32
             )
