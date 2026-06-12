@@ -957,6 +957,17 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
                 mlp_output_with_bias[0]
             )
 
+        # Non-overlap path: free the shared-expert output (consumed by the MoE postprocess add) and
+        # recompute it from mlp_output_with_bias[0], after the pre_mlp_norm recompute above so the
+        # layernorm input is restored first. (A2A overlap uses the fine-grained callables instead.)
+        if self.is_moe_layer:
+            shared_experts_checkpoint = getattr(self.mlp, "shared_experts_checkpoint", None)
+            if shared_experts_checkpoint is not None:
+                shared_experts_checkpoint.discard_output_and_register_recompute(
+                    mlp_output_with_bias[0]
+                )
+                self.mlp.shared_experts_checkpoint = None
+
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
         nvtx_range_push(suffix="mlp_bda")

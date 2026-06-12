@@ -255,6 +255,14 @@ class MoELayer(BaseMoELayer):
             config.recompute_granularity == 'selective'
             and "shared_experts" in config.recompute_modules
         )
+        # Recompute the shared-expert output in backward instead of keeping it; the caller frees it
+        # and registers the recompute hook in the correct order. Off under MoE cudagraph partial
+        # capture, where the output is a graph output that must keep its storage.
+        self.shared_experts_recompute_discard_output = self.shared_experts_recompute and not bool(
+            getattr(config, "cuda_graph_modules", None)
+        )
+        # Active CheckpointWithoutOutput handed to the caller for discard + hook (None otherwise).
+        self.shared_experts_checkpoint = None
 
         self.tp_group = pg_collection.tp
         self.tp_ep_group = pg_collection.tp_ep
@@ -534,7 +542,17 @@ class MoELayer(BaseMoELayer):
         shared_expert_output = None
         if self.use_shared_expert and not self.shared_expert_overlap:
             # Compute the shared expert separately when not overlapped with communication.
-            if self.shared_experts_recompute:
+            if self.shared_experts_recompute_discard_output and self.training:
+                # Discard-output recompute: the output is freed later and regenerated from a grad
+                # hook (CheckpointWithoutOutput handles fp8/fp4 via its fp8 flag).
+                self.shared_experts_checkpoint = tensor_parallel.CheckpointWithoutOutput(
+                    fp8=(self.config.fp8 or self.config.fp4)
+                )
+                shared_expert_output = self.shared_experts_checkpoint.checkpoint(
+                    apply_module(self.shared_experts), hidden_states
+                )
+            elif self.shared_experts_recompute:
+                # Standard checkpoint fallback: keep the output, recompute only the intermediates.
                 if self.config.fp8 or self.config.fp4:
                     shared_expert_output = te_checkpoint(
                         apply_module(self.shared_experts),
