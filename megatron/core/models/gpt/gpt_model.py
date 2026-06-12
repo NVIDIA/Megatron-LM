@@ -682,6 +682,7 @@ class GPTModel(LanguageModule):
                 sequence_len_offset=sequence_len_offset,
                 padding_mask=padding_mask,
                 embedding=self.embedding,
+                loss_mask=loss_mask,
                 **(extra_block_kwargs or {}),
             )
 
