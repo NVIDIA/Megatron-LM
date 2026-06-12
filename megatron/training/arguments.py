@@ -4,6 +4,7 @@
 
 import argparse
 import dataclasses
+from enum import Enum
 import json
 import os
 from pathlib import Path
@@ -53,6 +54,23 @@ from megatron.core.quantization.utils import (
 )
 
 from megatron.training.argument_utils import ArgumentGroupFactory, core_transformer_config_from_args
+
+
+class RLRolloutGranularity(str, Enum):
+    """Granularity for RL rollout submission or consumption."""
+
+    GROUP = 'G'
+    BATCH = 'B'
+
+    def __str__(self):
+        return self.value
+
+
+def _normalize_rl_rollout_granularity(value):
+    if value is None or isinstance(value, RLRolloutGranularity):
+        return value
+    return RLRolloutGranularity(value)
+
 
 def add_megatron_arguments(parser: argparse.ArgumentParser):
     """"Add Megatron-LM arguments to the given parser."""
@@ -526,6 +544,42 @@ def validate_args(args, defaults={}):
             args.rl_num_parallel_generations = (
                 args.rl_parallel_generation_tasks * args.grpo_group_size)
 
+        args.rl_submission_granularity = _normalize_rl_rollout_granularity(
+            args.rl_submission_granularity
+        )
+        args.rl_consumption_granularity = _normalize_rl_rollout_granularity(
+            args.rl_consumption_granularity
+        )
+
+        explicit_granularity = (
+            args.rl_submission_granularity is not None
+            or args.rl_consumption_granularity is not None
+        )
+        if explicit_granularity:
+            assert args.rl_partial_rollouts, \
+                "--rl-submission-granularity and --rl-consumption-granularity " \
+                "require --rl-partial-rollouts."
+        assert not (
+            args.rl_submission_granularity == RLRolloutGranularity.BATCH
+            and args.rl_consumption_granularity == RLRolloutGranularity.GROUP
+        ), "--rl-submission-granularity B with --rl-consumption-granularity G is not supported."
+
+        if args.rl_submission_granularity == RLRolloutGranularity.GROUP:
+            if args.rl_generation_batch_size not in (None, 1):
+                warn_rank_0(
+                    f"--rl-submission-granularity G overrides --rl-generation-batch-size "
+                    f"({args.rl_generation_batch_size}) with 1."
+                )
+            args.rl_generation_batch_size = 1
+        elif args.rl_submission_granularity == RLRolloutGranularity.BATCH:
+            if args.rl_generation_batch_size not in (None, args.grpo_prompts_per_step):
+                warn_rank_0(
+                    f"--rl-submission-granularity B overrides --rl-generation-batch-size "
+                    f"({args.rl_generation_batch_size}) with --grpo-prompts-per-step "
+                    f"({args.grpo_prompts_per_step})."
+                )
+            args.rl_generation_batch_size = args.grpo_prompts_per_step
+
         # Resolve --rl-num-parallel-generations / --rl-num-parallel-generation-batches.
         assert args.rl_num_parallel_generations is None \
             or args.rl_num_parallel_generation_batches is None, \
@@ -553,8 +607,27 @@ def validate_args(args, defaults={}):
                 args.rl_generation_batch_size = 1
             args.rl_parallel_generation_tasks = 512
 
+        if args.rl_partial_rollouts:
+            assert args.rl_generation_batch_size > 0, \
+                "--rl-generation-batch-size must be positive."
+            assert not (
+                args.rl_consumption_granularity == RLRolloutGranularity.GROUP
+                and args.rl_generation_batch_size > 1
+            ), "--rl-consumption-granularity G does not support batch submission."
+            assert args.grpo_prompts_per_step % args.rl_generation_batch_size == 0, \
+                f"--grpo-prompts-per-step ({args.grpo_prompts_per_step}) must be divisible by " \
+                f"--rl-generation-batch-size ({args.rl_generation_batch_size})."
+
         # Derive enforce_order after all resolution is complete.
-        args.rl_enforce_generation_order = (args.rl_generation_batch_size > 1)
+        if args.rl_consumption_granularity == RLRolloutGranularity.BATCH:
+            args.rl_enforce_generation_order = True
+        elif args.rl_consumption_granularity == RLRolloutGranularity.GROUP:
+            args.rl_enforce_generation_order = False
+        else:
+            args.rl_enforce_generation_order = (
+                args.rl_generation_batch_size > 1
+                or (args.rl_partial_rollouts and args.grpo_prompts_per_step > 1)
+            )
 
         args.grpo_samples_per_iteration = args.grpo_prompts_per_step * args.grpo_group_size
 
@@ -1141,7 +1214,7 @@ def validate_args(args, defaults={}):
 
         assert args.ckpt_format == "fsdp_dtensor", \
             "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
-    
+
         if args.nccl_ub:
             # In Megatron-LM, required implementation for manual registration is already provided.
             # So we enable the manual registration by default when nccl-ub and use_megatron_fsdp is set.
@@ -1156,7 +1229,7 @@ def validate_args(args, defaults={}):
 
     if args.fsdp_manual_registration:
         assert args.use_megatron_fsdp, "FSDP manual registration is only supported with Megatron FSDP."
-        assert args.nccl_ub, "FSDP manual registration is only supported with --nccl-ub argument."      
+        assert args.nccl_ub, "FSDP manual registration is only supported with --nccl-ub argument."
 
     # Parameters dtype.
     args.params_dtype = torch.float
@@ -1756,10 +1829,10 @@ def validate_args(args, defaults={}):
     assert not (
         args.cuda_graph_impl == "full_iteration" and args.cuda_graph_modules
     ), '--cuda-graph-modules must be empty when --cuda-graph-impl=full_iteration.'
-    
+
     if args.multi_latent_attention:
         assert not args.group_query_attention, "Group query attention is mutually exclusive with multi latent attention."
-        
+
     if args.mla_down_proj_fusion:
         assert args.multi_latent_attention, "--mla-down-proj-fusion requires --multi-latent-attention"
 
@@ -2393,9 +2466,25 @@ def _add_rl_args(parser):
                             'Requires --rl-partial-rollouts. '
                             'Mutually exclusive with --rl-num-parallel-generations.')
     group.add_argument('--rl-generation-batch-size', type=int, default=None,
-                       help='Override the number of groups per generation batch. '
+                       help='Number of rollout groups submitted together for generation. '
+                            'Set to 1 to submit rollout groups independently. '
+                            'The trainer still collects grpo_prompts_per_step groups '
+                            'before preparing data. '
                             'Defaults to grpo_prompts_per_step when '
                             '--rl-num-parallel-generation-batches is set.')
+    group.add_argument('--rl-submission-granularity', type=RLRolloutGranularity, default=None,
+                       choices=list(RLRolloutGranularity),
+                       help='Granularity for submitting rollout generation work. '
+                            'G submits one rollout group at a time. '
+                            'B submits grpo_prompts_per_step rollout groups together. '
+                            'Requires --rl-partial-rollouts. Overrides '
+                            '--rl-generation-batch-size when set.')
+    group.add_argument('--rl-consumption-granularity', type=RLRolloutGranularity, default=None,
+                       choices=list(RLRolloutGranularity),
+                       help='Granularity for consuming generated rollout groups. '
+                            'G consumes groups as they complete. '
+                            'B consumes groups in submission/batch order. '
+                            'Requires --rl-partial-rollouts.')
     group.add_argument('--grpo-iterations', type=int, default=2,
                        help="Number of iterations per a GRPO implementation.")
     # As in DAPO, we keep upper/lower eps different.
@@ -2452,7 +2541,7 @@ def _add_rl_args(parser):
                        default=False,
                        help='If set, do not toggle CUDA graphs on/off between inference and training phases.')
     group.add_argument('--rl-inference-tensor-model-parallel-size', type=int, default=None,
-                       help='Degree of tensor model parallelism for inference for RL.')     
+                       help='Degree of tensor model parallelism for inference for RL.')
     group.add_argument(
         '--rl-inference-pipeline-model-parallel-size',
         type=int,

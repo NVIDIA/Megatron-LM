@@ -50,34 +50,105 @@ class TestGroupedRollouts:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "num_slow_calls, streaming, num_groups, expected_count, expected_batch_ids",
+        "case",
         [
-            pytest.param(0, False, 8, 8, None, id="non_batched"),
-            pytest.param(0, False, 4, 4, None, id="non_streaming_fewer_than_parallel"),
-            pytest.param(4, True, 2, 8, [0, 0, 1, 1, 2, 2, 3, 3], id="batched_submission_order"),
-            pytest.param(0, True, 1, 10, None, id="streaming"),
+            pytest.param(
+                {"num_slow_calls": 0, "streaming": False, "num_groups": 8, "expected_count": 8},
+                id="non_batched",
+            ),
+            pytest.param(
+                {"num_slow_calls": 0, "streaming": False, "num_groups": 4, "expected_count": 4},
+                id="non_streaming_fewer_than_parallel",
+            ),
+            pytest.param(
+                {
+                    "num_slow_calls": 4,
+                    "streaming": True,
+                    "num_groups": 2,
+                    "expected_count": 8,
+                    "expected_batch_ids": [0, 0, 1, 1, 2, 2, 3, 3],
+                    "expected_index_in_batch": [0, 1, 0, 1, 0, 1, 0, 1],
+                },
+                id="batched_submission_order",
+            ),
+            pytest.param(
+                {"num_slow_calls": 0, "streaming": True, "num_groups": 1, "expected_count": 10},
+                id="streaming",
+            ),
+            pytest.param(
+                {
+                    "num_slow_calls": 4,
+                    "streaming": True,
+                    "num_groups": 1,
+                    "expected_count": 8,
+                    "enforce_order": False,
+                    "expected_trajectory_prefix": [f"t{i}" for i in range(4, 8)],
+                },
+                id="group_submit_group_consume_completion_order",
+            ),
+            pytest.param(
+                {
+                    "num_slow_calls": 4,
+                    "streaming": True,
+                    "num_groups": 1,
+                    "expected_count": 8,
+                    "enforce_order": True,
+                    "expected_batch_ids": list(range(8)),
+                    "expected_index_in_batch": [0] * 8,
+                    "expected_trajectories": [f"t{i}" for i in range(8)],
+                },
+                id="group_submit_batch_consume_submission_order",
+            ),
         ],
     )
-    async def test_get_grouped_rollouts(
-        self, num_slow_calls, streaming, num_groups, expected_count, expected_batch_ids
-    ):
-        gen = MockGenerator(parallel_generation_tasks=8, num_slow_calls=num_slow_calls)
-        request = GroupedRolloutRequest(
-            num_groups=num_groups,
-            rollouts_per_group=1,
-            inference_interface=MagicMock(spec=ReturnsRaw),
-            streaming=streaming,
-            enforce_order=num_groups > 1,
+    async def test_get_grouped_rollouts(self, case):
+        gen = MockGenerator(
+            parallel_generation_tasks=case.get("parallel_generation_tasks", 8),
+            num_slow_calls=case.get("num_slow_calls", 0),
         )
-        groups = []
-        async for group in gen.get_grouped_rollouts(request):
-            groups.append(group)
-            if request.streaming and len(groups) >= expected_count:
-                break
 
-        assert len(groups) == expected_count
-        if expected_batch_ids is not None:
-            assert [g.batch_id for g in groups] == expected_batch_ids
+        request = GroupedRolloutRequest(
+            num_groups=case["num_groups"],
+            rollouts_per_group=case.get("rollouts_per_group", 1),
+            inference_interface=MagicMock(spec=ReturnsRaw),
+            streaming=case["streaming"],
+            enforce_order=case.get("enforce_order", case["num_groups"] > 1),
+            filter_groups_with_same_reward=case.get("filter_groups_with_same_reward", False),
+        )
+
+        async def collect_groups():
+            groups = []
+            async for group in gen.get_grouped_rollouts(request):
+                groups.append(group)
+                if request.streaming and len(groups) >= case["expected_count"]:
+                    break
+            return groups
+
+        if "timeout" in case:
+            groups = await asyncio.wait_for(collect_groups(), timeout=case["timeout"])
+        else:
+            groups = await collect_groups()
+
+        has_order_expectations = any(
+            key in case
+            for key in (
+                "expected_batch_ids",
+                "expected_index_in_batch",
+                "expected_trajectory_prefix",
+                "expected_trajectories",
+            )
+        )
+        if not has_order_expectations:
+            assert len(groups) == case["expected_count"]
+        if "expected_batch_ids" in case:
+            assert [g.batch_id for g in groups] == case["expected_batch_ids"]
+        if "expected_index_in_batch" in case:
+            assert [g.index_in_batch for g in groups] == case["expected_index_in_batch"]
+        if "expected_trajectory_prefix" in case:
+            expected = case["expected_trajectory_prefix"]
+            assert [group[0].trajectory[0] for group in groups[: len(expected)]] == expected
+        if "expected_trajectories" in case:
+            assert [group[0].trajectory[0] for group in groups] == case["expected_trajectories"]
 
     @pytest.mark.asyncio
     async def test_weighted_multi_task(self):
