@@ -44,7 +44,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.inference.utils import Counter, InferenceMode, await_process_call
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
+from megatron.core.transformer.cuda_graphs import CudaGraphManager, delete_cuda_graphs
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
 from megatron.core.utils import (
@@ -133,11 +133,40 @@ class EngineSuspendedError(Exception):
 
 def format_mem_bytes(mem_bytes):
     """Convert a byte count to a human-readable string in tb, gb, mb, kb, or bytes."""
+    if mem_bytes < 0:
+        return "-" + format_mem_bytes(-mem_bytes)
     for power, suffix in [(4, "tb"), (3, "gb"), (2, "mb"), (1, "kb"), (0, "bytes")]:
         suffix_bytes = 1024**power
         if mem_bytes >= suffix_bytes:
             return "%.1f %s" % (mem_bytes / suffix_bytes, suffix)
     return "%d bytes" % mem_bytes
+
+
+def _cuda_graph_mempool_bytes() -> Tuple[int, int]:
+    """Return (reserved, allocated) bytes belonging to the global CUDA graph mempool.
+
+    PyTorch's `torch.cuda.memory_stats()` reports process-wide totals that mix in
+    every other allocation (KV cache, NCCL workspaces, layer scratch). To isolate
+    growth caused by graph capture, we walk `torch.cuda.memory_snapshot()` and
+    filter segments by their `segment_pool_id` against the graph pool handle.
+    Returns (0, 0) if the pool hasn't been created yet.
+    """
+    pool_id = CudaGraphManager.global_mempool
+    if pool_id is None:
+        return 0, 0
+    reserved = 0
+    allocated = 0
+    for seg in torch.cuda.memory_snapshot():
+        seg_pool_id = (
+            seg.get("segment_pool_id")
+            or seg.get("private_pool_id")
+            or seg.get("pool_id")
+            or seg.get("pool")
+        )
+        if seg_pool_id == pool_id:
+            reserved += seg.get("total_size", 0)
+            allocated += seg.get("allocated_size", 0)
+    return reserved, allocated
 
 
 @dataclass(kw_only=True)
@@ -212,8 +241,8 @@ class DynamicInferenceEngine(AbstractEngine):
         if self.num_speculative_tokens > 0:
             assert (
                 model_config.mtp_use_repeated_layer
-                or self.num_speculative_tokens <= self.controller.num_mtp_heads
-            ), f"Number of speculative tokens {self.num_speculative_tokens} must be less than or equal to number of MTP heads {self.controller.num_mtp_heads}"
+                or self.num_speculative_tokens <= model_config.mtp_num_layers
+            ), f"Number of speculative tokens {self.num_speculative_tokens} must be less than or equal to number of MTP layers {model_config.mtp_num_layers}"
         self.track_paused_request_events = inference_config.track_paused_request_events
         self.track_generated_token_events = inference_config.track_generated_token_events
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
@@ -300,9 +329,15 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self.resume_request_ids = None
 
-        # Speculative decoding acceptance tracking.
-        self._spec_tokens_proposed = 0
-        self._spec_tokens_accepted = 0
+        # Speculative decoding acceptance tracking (per-position).
+        # Each tensor has length num_speculative_tokens; index i tracks position i+1
+        # (i.e. the i-th draft token proposed by the MTP head).
+        self._spec_tokens_proposed_per_pos = torch.zeros(
+            self.num_speculative_tokens, dtype=torch.int64
+        )
+        self._spec_tokens_accepted_per_pos = torch.zeros(
+            self.num_speculative_tokens, dtype=torch.int64
+        )
         self._spec_steps = 0
 
         # Prefix caching tracking.
@@ -347,6 +382,13 @@ class DynamicInferenceEngine(AbstractEngine):
         time_start = time.time()
         mem_stats_start = torch.cuda.memory_stats()
 
+        # Snapshot of process-wide stats for the "total memory used by capture" summary.
+        start_proc_reserved = mem_stats_start["reserved_bytes.all.current"]
+        start_proc_alloc = mem_stats_start["allocated_bytes.all.current"]
+
+        # Pool-scoped baselines for the per-iteration deltas.
+        prev_pool_reserved, prev_pool_alloc = _cuda_graph_mempool_bytes()
+
         logging.info("> dynamic_engine.py: building cuda graphs for ")
         for graph in context.cuda_graph_batch_dimensions_list:
             logging.info(graph)
@@ -358,7 +400,7 @@ class DynamicInferenceEngine(AbstractEngine):
         # decoder graphs within the same loop rather than in a separate pass.
         unwrapped = unwrap_model(controller.inference_wrapped_model.model)
         mtp_warmup_enabled = (
-            controller.num_mtp_heads > 0
+            controller.num_mtp_depths > 0
             and (controller.num_speculative_tokens or 0) > 0
             and hasattr(unwrapped, 'mtp')
         )
@@ -366,7 +408,7 @@ class DynamicInferenceEngine(AbstractEngine):
             tp_size = get_pg_size(controller.inference_wrapped_model.tp_group)
             sp_enabled = model_config.sequence_parallel and tp_size > 1
             mtp_pass_depth = not unwrapped.mtp.mtp_use_repeated_layer
-            mtp_warmup_depths = range(controller._num_mtp_depths) if mtp_pass_depth else [None]
+            mtp_warmup_depths = range(controller.num_mtp_depths) if mtp_pass_depth else [None]
             mtp_seen_batch_sizes = set()
 
         tbar = enumerate(context.cuda_graph_batch_dimensions_list)
@@ -427,27 +469,43 @@ class DynamicInferenceEngine(AbstractEngine):
 
                 context.reset()
 
+            # Per-iteration memory accounting, scoped to the CUDA-graph mempool.
+            # This isolates pool growth from process-wide scratch churn (KV cache,
+            # NCCL workspaces, etc.) that pollutes `torch.cuda.memory_stats()`.
+            pool_reserved, pool_alloc = _cuda_graph_mempool_bytes()
+            logging.info(
+                "  [graph %d/%d] %s | pool reserved=%s (Δiter=%s) " "pool allocated=%s (Δiter=%s)",
+                tbar_idx + 1,
+                len(context.cuda_graph_batch_dimensions_list),
+                cuda_graph_batch_dimension,
+                format_mem_bytes(pool_reserved),
+                format_mem_bytes(pool_reserved - prev_pool_reserved),
+                format_mem_bytes(pool_alloc),
+                format_mem_bytes(pool_alloc - prev_pool_alloc),
+            )
+            prev_pool_reserved, prev_pool_alloc = pool_reserved, pool_alloc
+
         if mtp_warmup_enabled and mtp_seen_batch_sizes:
             logging.info("> MTP CUDA graph warmup: %d batch size(s)", len(mtp_seen_batch_sizes))
 
         # Memory usage.
         time_end = time.time()
         mem_stats_end = torch.cuda.memory_stats()
+        final_pool_reserved, final_pool_alloc = _cuda_graph_mempool_bytes()
         capture_stats = {
             "time": time_end - time_start,
-            "allocated_bytes": (
-                mem_stats_end["allocated_bytes.all.current"]
-                - mem_stats_start["allocated_bytes.all.current"]
-            ),
-            "reserved_bytes": (
-                mem_stats_end["reserved_bytes.all.current"]
-                - mem_stats_start["reserved_bytes.all.current"]
-            ),
+            "allocated_bytes": (mem_stats_end["allocated_bytes.all.current"] - start_proc_alloc),
+            "reserved_bytes": (mem_stats_end["reserved_bytes.all.current"] - start_proc_reserved),
+            "pool_reserved_bytes": final_pool_reserved,
+            "pool_allocated_bytes": final_pool_alloc,
         }
         logging.info(
-            "> built cuda graph(s) in %.2f sec, with total memory usage: "
-            "allocated %s, reserved %s.",
+            "> built cuda graph(s) in %.2f sec. "
+            "Mempool: reserved %s, allocated %s. "
+            "Process-wide delta: allocated %s, reserved %s.",
             capture_stats["time"],
+            format_mem_bytes(capture_stats["pool_reserved_bytes"]),
+            format_mem_bytes(capture_stats["pool_allocated_bytes"]),
             format_mem_bytes(capture_stats["allocated_bytes"]),
             format_mem_bytes(capture_stats["reserved_bytes"]),
         )
@@ -973,12 +1031,21 @@ class DynamicInferenceEngine(AbstractEngine):
                 eod = -1
             request.sampling_params.termination_id = eod
 
-        if (
-            len(request.prompt_tokens) + request.sampling_params.num_tokens_to_generate
-            > self.context.max_sequence_length
-        ) or (request.sampling_params.num_tokens_to_generate < 0):
+        # Clamp large `num_tokens_to_generate` instead of rejecting the request.
+        # This is included for compatibility with other frameworks.
+        remaining_tokens = self.context.max_sequence_length - len(request.prompt_tokens)
+        if request.sampling_params.num_tokens_to_generate < 0 or remaining_tokens < 0:
             request.status = Status.FAILED
             request.add_event_error_nontransient(MaxSequenceLengthOverflowError(request_id))
+        elif request.sampling_params.num_tokens_to_generate > remaining_tokens:
+            requested_tokens = request.sampling_params.num_tokens_to_generate
+            request.sampling_params.num_tokens_to_generate = remaining_tokens
+            if self.rank == 0:
+                warnings.warn(
+                    f"Request {request_id} requested num_tokens_to_generate={requested_tokens} "
+                    f"which exceeds the maximum sequence length of the engine. "
+                    f"Clamping num_tokens_to_generate to {remaining_tokens}."
+                )
 
         if len(request.prompt_tokens) > self.context.max_tokens and not self.enable_chunked_prefill:
             request.status = Status.FAILED
@@ -1150,6 +1217,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 tokens = accepted_tokens + tokens
 
             num_stop_word_trim = 0
+            is_prefill = len(request.generated_tokens) == 0
             if request_id != self.context.chunked_prefill_request_id:
                 # Skip appending token for requests being finished due to stop words
                 # (they already have their final token from the previous step)
@@ -1161,12 +1229,21 @@ class DynamicInferenceEngine(AbstractEngine):
                     keep = request.sampling_params.num_tokens_to_generate - len(
                         request.generated_tokens
                     )
+                    num_tokens_before_trim = len(tokens)
                     tokens = tokens[:keep]
-                    # Trim log probs / top-n to match so the counts stay in sync.
-                    if request_log_probs is not None:
-                        request_log_probs = request_log_probs[:keep]
-                    if top_n_logprobs is not None and req_idx in top_n_logprobs:
-                        top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:keep]
+                    # Drop only the excess *trailing* log probs / top-n so the counts stay
+                    # in sync. We must trim from the end, not the front: on a prefill step
+                    # request_log_probs covers the whole prompt and is laid out as
+                    # [<prompt log probs...>, <sampled token log prob>], so front-slicing
+                    # (e.g. [:keep] with keep == 0 when num_tokens_to_generate == 0) would
+                    # discard the prompt log probs that echo+logprobs requests need. In a
+                    # decode step all entries are generated, so trailing == front-equivalent.
+                    num_dropped = num_tokens_before_trim - len(tokens)
+                    if num_dropped > 0:
+                        if request_log_probs is not None:
+                            request_log_probs = request_log_probs[:-num_dropped]
+                        if top_n_logprobs is not None and req_idx in top_n_logprobs:
+                            top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_dropped]
                 if request_id not in self.stop_word_being_finished_ids:
                     is_first_token = len(request.generated_tokens) == 0
                     request.generated_tokens += tokens
@@ -1194,7 +1271,7 @@ class DynamicInferenceEngine(AbstractEngine):
                                 )
                             if first_token_event is None:
                                 first_token_event = event
-                    if is_first_token:
+                    if is_first_token and tokens:
                         if not self.track_generated_token_events:
                             first_token_event = DynamicInferenceEvent(
                                 type=DynamicInferenceEventType.GENERATED_TOKEN,
@@ -1207,7 +1284,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     # non-logging steps (async_forward skips the event sync),
                     # so gate the update to keep the metric a truthful sparse
                     # sample instead of polluting it with zeros.
-                    if step_time > 0:
+                    if step_time > 0 and tokens:
                         per_token_step_time = step_time / len(tokens)
                         request.tpot.extend([per_token_step_time] * len(tokens))
 
@@ -1220,13 +1297,21 @@ class DynamicInferenceEngine(AbstractEngine):
                     request
                 )
 
-                # Track acceptance statistics for logging.
-                if len(request.generated_tokens) > 0 and self.num_speculative_tokens > 0:
+                # Track per-position acceptance statistics for logging.
+                # Skip prefill requests: MTP heads only propose speculative tokens
+                # for decode requests, so counting prefill requests would inflate
+                # the denominator and artificially deflate the acceptance rate.
+                if (
+                    not is_prefill
+                    and len(request.generated_tokens) > 0
+                    and self.num_speculative_tokens > 0
+                ):
                     actual_proposed = max(0, self.num_speculative_tokens - num_stop_word_trim)
-                    actual_accepted = max(0, len(accepted_tokens) - num_stop_word_trim)
-
-                    self._spec_tokens_proposed += actual_proposed
-                    self._spec_tokens_accepted += actual_accepted
+                    self._spec_tokens_proposed_per_pos[:actual_proposed] += 1
+                    accepted_t = torch.tensor(accepted_tokens_list[:actual_proposed])
+                    self._spec_tokens_accepted_per_pos[:actual_proposed] += (
+                        accepted_t != -1
+                    ).long()
 
                 if request_id in finished_request_ids:
                     # Reconstruct routing from per-block storage before popping.
@@ -1893,13 +1978,24 @@ class DynamicInferenceEngine(AbstractEngine):
                 else:
                     metrics[f'inference/{key}'] = value
 
-            # Add speculative decoding acceptance metrics.
-            if self.num_speculative_tokens > 0 and self._spec_tokens_proposed > 0:
-                acceptance_rate = self._spec_tokens_accepted / self._spec_tokens_proposed
+            # Add speculative decoding acceptance metrics (aggregate + per-position).
+            total_proposed = sum(self._spec_tokens_proposed_per_pos)
+            total_accepted = sum(self._spec_tokens_accepted_per_pos)
+            if self.num_speculative_tokens > 0 and total_proposed > 0:
+                acceptance_rate = total_accepted / total_proposed
                 metrics['inference/spec_decode_acceptance_rate'] = float(acceptance_rate * 100.0)
-                metrics['inference/spec_decode_tokens_proposed'] = int(self._spec_tokens_proposed)
-                metrics['inference/spec_decode_tokens_accepted'] = int(self._spec_tokens_accepted)
+                metrics['inference/spec_decode_tokens_proposed'] = int(total_proposed)
+                metrics['inference/spec_decode_tokens_accepted'] = int(total_accepted)
                 metrics['inference/spec_decode_num_steps'] = int(self._spec_steps)
+                for pos in range(self.num_speculative_tokens):
+                    if self._spec_tokens_proposed_per_pos[pos] > 0:
+                        pos_rate = (
+                            self._spec_tokens_accepted_per_pos[pos]
+                            / self._spec_tokens_proposed_per_pos[pos]
+                        )
+                        metrics[f'inference/spec_decode_acceptance_rate_pos{pos + 1}'] = float(
+                            pos_rate * 100.0
+                        )
 
             # Add prefix caching metrics.
             if self.context.enable_prefix_caching and self._prefix_cache_hits > 0:
@@ -1961,33 +2057,34 @@ class DynamicInferenceEngine(AbstractEngine):
                     mem["reserved_bytes.all.current"] / (1024**3),
                 )
             )
-            if self.num_speculative_tokens > 0 and self._spec_tokens_proposed > 0:
-                spec_rate = self._spec_tokens_accepted / self._spec_tokens_proposed * 100.0
-                output_str += " ... spec: accept %.1f%% (%d/%d in %d steps)" % (
+            total_proposed = sum(self._spec_tokens_proposed_per_pos)
+            total_accepted = sum(self._spec_tokens_accepted_per_pos)
+            if self.num_speculative_tokens > 0 and total_proposed > 0:
+                spec_rate = total_accepted / total_proposed * 100.0
+                per_pos_rates = []
+                for pos in range(self.num_speculative_tokens):
+                    if self._spec_tokens_proposed_per_pos[pos] > 0:
+                        pos_rate = (
+                            self._spec_tokens_accepted_per_pos[pos]
+                            / self._spec_tokens_proposed_per_pos[pos]
+                            * 100.0
+                        )
+                        per_pos_rates.append("t%d=%.1f%%" % (pos + 1, pos_rate))
+                output_str += " ... spec (cumul): accept %.1f%% (%d/%d in %d steps) [%s]" % (
                     spec_rate,
-                    self._spec_tokens_accepted,
-                    self._spec_tokens_proposed,
+                    total_accepted,
+                    total_proposed,
                     self._spec_steps,
+                    ", ".join(per_pos_rates),
                 )
             if self.context.enable_prefix_caching and self._prefix_cache_hits > 0:
-                output_str += " ... prefix cache: %d hits, %d blocks matched" % (
+                output_str += " ... prefix cache (cumul): %d hits, %d blocks matched" % (
                     self._prefix_cache_hits,
                     self._prefix_cache_blocks_matched,
                 )
             if context_state["is_decode_only"]:
                 output_str = f"\033[94m{output_str}\033[0m"
             logging.info(output_str)
-
-            # Reset speculative decoding accumulators after both wandb and console logging.
-            if self.num_speculative_tokens > 0:
-                self._spec_tokens_proposed = 0
-                self._spec_tokens_accepted = 0
-                self._spec_steps = 0
-
-            # Reset prefix caching accumulators after both wandb and console logging.
-            if self.context.enable_prefix_caching:
-                self._prefix_cache_hits = 0
-                self._prefix_cache_blocks_matched = 0
 
         nvtx_range_pop("console_logging")
 

@@ -724,7 +724,7 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
 
         # Fallback allocator used if the fixed pool allocator cannot fulfill a request.
         self.fallback_to_persistent_buffer = fallback_to_persistent_buffer
-        self.backup_allocator = TemporaryBucketAllocator()
+        self.backup_allocator = StorageResizeBasedBucketAllocator()
 
     def _is_two_bucket_group_equal(self, group_a, group_b):
         # Check if two bucket groups are equivalent in dtype and size.
@@ -906,7 +906,7 @@ class DataParallelBuffer:
             # Build the data parallel buffer index, which contains information
             # on where each parameter / gradient tensor will be stored in this
             # distributed buffer.
-            (self.item_index_map, self.bucket_index, self.shard_bucket_index) = (
+            self.item_index_map, self.bucket_index, self.shard_bucket_index = (
                 build_data_parallel_buffer_index(
                     [to_local_if_dtensor(p).shape for p in self.params],
                     self.dp_rank,
@@ -1767,7 +1767,7 @@ class ParamAndGradBuffer:
                         )
 
         # Get the parameter groups.
-        (self.parameter_groups, self.param_to_param_group, self.bucket_to_bucket_group) = (
+        self.parameter_groups, self.param_to_param_group, self.bucket_to_bucket_group = (
             _get_parameter_groups(module, bucketing_policy, meta_device_init_fp8_params)
         )
         self._init_each_parameter_group_buffers(meta_device_init_fp8_params)
@@ -2685,18 +2685,23 @@ class ParamAndGradBuffer:
                 p._item_id = item_id
 
                 def main_grad_getter(p):
+                    # Get gradient buffer and item ID.
+                    gbuf = p._gbuf
+                    item_id = p._item_id
+                    # Need to free a bucket for the incoming bucket if double-buffering.
+                    p._megatron_fsdp_model.grad_reduce_pipeline._enforce_double_buffer_limit(
+                        [gbuf.bucket_id]
+                    )
                     # Make sure main_grad memory is allocated when initially accessed.
                     # When gradients are sharded, we can pre-allocate a communication
                     # bucket to avoid casting to a communication data-type. Otherwise,
                     # return the item backed by the main gradient buffer required to
                     # support un-sharded gradient accumulation at high precision.
-                    bucket = p._gbuf.fetch_bucket(
+                    bucket = gbuf.fetch_bucket(
                         dtype=(
                             self.mp_policy.grad_comm_dtype if p._gbuf.is_data_distributed else None
                         )
                     )
-                    gbuf = p._gbuf
-                    item_id = p._item_id
                     # View it as p.shape so you can insert the param.grad into
                     # the bucket seamlessly.
                     return gbuf.get_item_from_bucket(bucket, item_id).view(
@@ -2909,6 +2914,7 @@ class ParamAndGradBuffer:
                             "is_embedding_or_output_parameter",
                             "is_embedding_parameter",
                             "_tensor_parallel_mode",
+                            "_megatron_fsdp_model",
                         ]:
                             if hasattr(orig_param, attr_name):
                                 setattr(param, attr_name, getattr(orig_param, attr_name))
@@ -3558,7 +3564,7 @@ class GradReducePipeline:
         for _, _, bucket_id in reversed(self.grad_reduce_queue):
             fsdp_unit_id = param_groups[bucket_id].fsdp_unit_id
             double_buf_units.add(fsdp_unit_id)
-            if len(double_buf_units) > 1:
+            if len(double_buf_units) > 2:
                 keep_n -= 1
 
         with torch.cuda.stream(self.rs_stream):
@@ -3941,7 +3947,7 @@ class AllGatherPipeline:
                 stacklevel=2,
             )
             while len(self.param_gather_event_map) > 0:
-                (bucket_id, bwd) = next(iter(self.param_gather_event_map))
+                bucket_id, bwd = next(iter(self.param_gather_event_map))
                 self.wait_bucket_ready(bucket_id, bwd)
 
         for bucket_id in range(self.num_buckets):
