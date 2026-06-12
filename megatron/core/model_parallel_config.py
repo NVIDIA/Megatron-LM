@@ -521,8 +521,7 @@ class ModelParallelConfig:
             if self.pad_packed_seq_alignment != "max":
                 if self.pad_packed_seq_alignment <= 0:
                     raise ValueError(
-                        "pad_packed_seq_alignment must be 'max' or a positive integer "
-                        "alignment."
+                        "pad_packed_seq_alignment must be 'max' or a positive integer " "alignment."
                     )
                 if self.pad_packed_seq_alignment > self.max_seqlen_per_dp_cp_rank:
                     raise ValueError(

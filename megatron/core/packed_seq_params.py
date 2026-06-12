@@ -195,6 +195,7 @@ def _resolve_thd_padding_lengths(
 
     # Resolve the CP geometry used to translate local lengths to global endpoints.
     from megatron.core import parallel_state
+
     cp_size = (
         packed_seq_params.local_cp_size
         if packed_seq_params.local_cp_size is not None
@@ -254,19 +255,13 @@ def _resolve_thd_padding_lengths(
         # The number of selected rows is this rank's local actual length.
         local_actual_T = int(
             get_thd_partitioned_indices(
-                partition_cu_seqlens,
-                global_actual_T,
-                cp_size,
-                cp_rank,
+                partition_cu_seqlens, global_actual_T, cp_size, cp_rank
             ).numel()
         )
         # Do the same for the padded endpoint; THD CP is not simple equal split.
         local_target_len = int(
             get_thd_partitioned_indices(
-                partition_cu_seqlens,
-                global_target_len,
-                cp_size,
-                cp_rank,
+                partition_cu_seqlens, global_target_len, cp_size, cp_rank
             ).numel()
         )
     else:
@@ -334,9 +329,9 @@ def pad_sequence_for_thd(
         Padded (tokens, labels, loss_mask, position_ids, packed_seq_params, padding_mask)
         padding_mask: [1, target] bool tensor, True at padding positions.
     """
-    assert (alignment is None) != (target_len is None), (
-        "Exactly one of alignment or target_len must be provided for THD padding."
-    )
+    assert (alignment is None) != (
+        target_len is None
+    ), "Exactly one of alignment or target_len must be provided for THD padding."
 
     local_actual_T, global_actual_T, local_target_len, global_target_len, mask_device = (
         _resolve_thd_padding_lengths(

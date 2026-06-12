@@ -435,9 +435,8 @@ def _get_scheduler_max_real_num_seqs(config) -> Optional[int]:
     if max_num_seqs < 1:
         raise ValueError(f"thd_max_num_seqs must be >= 1, got {max_num_seqs}.")
 
-    if (
-        getattr(config, 'pad_packed_seq_alignment', None) is not None
-        and getattr(config, 'pad_packed_seq_by_appending_dummy_seq', True)
+    if getattr(config, 'pad_packed_seq_alignment', None) is not None and getattr(
+        config, 'pad_packed_seq_by_appending_dummy_seq', True
     ):
         if max_num_seqs < 2:
             raise ValueError(

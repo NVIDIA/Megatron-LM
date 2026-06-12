@@ -100,10 +100,7 @@ def _build_layer(H, nh, nkv, ffn, max_seqlen, max_num_seqs, tp=1, sp=False):
 
 
 @pytest.mark.internal
-@pytest.mark.parametrize(
-    "cuda_graph_static,expected_max_num_seqs",
-    [(False, None), (True, 32)],
-)
+@pytest.mark.parametrize("cuda_graph_static,expected_max_num_seqs", [(False, None), (True, 32)])
 def test_pad_to_max_resolves_padding_kwargs(cuda_graph_static, expected_max_num_seqs):
     alignment, target_len, max_num_seqs = get_thd_padding_kwargs(
         pad_packed_seq_alignment="max",
@@ -210,18 +207,12 @@ class TestResolveThdPaddingLengths:
             )
         )
 
-        assert (local_actual, global_actual, local_target, global_target) == (
-            80,
-            140,
-            128,
-            256,
-        )
+        assert (local_actual, global_actual, local_target, global_target) == (80, 140, 128, 256)
         assert mask_device == tokens.device
 
     @pytest.mark.internal
     @pytest.mark.parametrize(
-        "alignment,target_len,expected_global_target",
-        [(128, None, 256), (None, 128, 256)],
+        "alignment,target_len,expected_global_target", [(128, None, 256), (None, 128, 256)]
     )
     @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires at least 2 GPUs")
     def test_cp_no_tensor_partitions_actual_and_target_lengths(
@@ -246,13 +237,7 @@ class TestResolveThdPaddingLengths:
 
         local_actual, global_actual, local_target, global_target, mask_device = (
             _resolve_thd_padding_lengths(
-                None,
-                None,
-                None,
-                None,
-                psp,
-                target_len=target_len,
-                alignment=alignment,
+                None, None, None, None, psp, target_len=target_len, alignment=alignment
             )
         )
 
@@ -286,10 +271,7 @@ class TestPadSequenceForThd:
         assert p_tok.shape == (1, 128)
         expected = torch.cat((orig, torch.tensor([128], dtype=orig.dtype, device=orig.device)))
         assert torch.equal(p.cu_seqlens_q, expected)
-        assert torch.equal(
-            p.cu_seqlens_q_padded,
-            expected,
-        )
+        assert torch.equal(p.cu_seqlens_q_padded, expected)
         assert p.pad_between_seqs is False
         assert mask.shape == (1, 128)
         assert not mask[0, :total_T].any() and mask[0, total_T:].all()
@@ -387,9 +369,7 @@ class TestPadSequenceForThd:
         ):
             assert cu.shape[0] == max_num_seqs + 1
         expected_cu = torch.tensor(
-            [0, 100, 150, 180, 256, 256, 256, 256, 256],
-            dtype=torch.int32,
-            device="cuda",
+            [0, 100, 150, 180, 256, 256, 256, 256, 256], dtype=torch.int32, device="cuda"
         )
         assert torch.equal(p_params.cu_seqlens_q, expected_cu)
         assert torch.equal(p_params.cu_seqlens_kv, expected_cu)
@@ -432,10 +412,7 @@ class TestPadSequenceForThd:
             (orig_cu, torch.tensor([target_len], dtype=orig_cu.dtype, device=orig_cu.device))
         )
         assert torch.equal(p_params.cu_seqlens_q, expected)
-        assert torch.equal(
-            p_params.cu_seqlens_q_padded,
-            expected,
-        )
+        assert torch.equal(p_params.cu_seqlens_q_padded, expected)
         assert p_params.cu_seqlens_q.shape[0] == orig_cu.shape[0] + 1
         assert p_params.max_seqlen_q == target_len - total_T
         assert p_params.max_seqlen_kv == target_len - total_T
@@ -722,17 +699,9 @@ _QWEN3_ARGS = _COMMON_ARGS + [
     "hybridep",
 ]
 
-_ATTN_CUDA_GRAPH_ARGS = [
-    "--cuda-graph-impl",
-    "transformer_engine",
-    "--cuda-graph-modules",
-    "attn",
-]
+_ATTN_CUDA_GRAPH_ARGS = ["--cuda-graph-impl", "transformer_engine", "--cuda-graph-modules", "attn"]
 
-_MOE_CUDA_GRAPH_ARGS = _ATTN_CUDA_GRAPH_ARGS + [
-    "moe_preprocess",
-    "moe_router",
-]
+_MOE_CUDA_GRAPH_ARGS = _ATTN_CUDA_GRAPH_ARGS + ["moe_preprocess", "moe_router"]
 
 
 def _run_pretrain(model_args, cuda_graph_args, master_port):
@@ -854,11 +823,7 @@ class TestE2EBitwise:
         )
 
         # CUDA graph capture.
-        r2 = _run_pretrain(
-            model_args,
-            cuda_graph_args=cuda_graph_args,
-            master_port=base_port + 1,
-        )
+        r2 = _run_pretrain(model_args, cuda_graph_args=cuda_graph_args, master_port=base_port + 1)
         assert r2.returncode == 0, (
             f"[{model_name}] cudaGraph pretrain failed (rc={r2.returncode})\n"
             f"--- stdout (tail) ---\n{r2.stdout[-4000:]}\n"

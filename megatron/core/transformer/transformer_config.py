@@ -3014,9 +3014,9 @@ class TransformerConfig(ModelParallelConfig):
         if self.cuda_graph_impl != "none" and (
             self.sequence_packing_scheduler is not None or self.dynamic_context_parallel
         ):
-            assert self.pad_packed_seq_alignment is not None, (
-                "THD CUDA Graph requires --pad-packed-seq-alignment to be set."
-            )
+            assert (
+                self.pad_packed_seq_alignment is not None
+            ), "THD CUDA Graph requires --pad-packed-seq-alignment to be set."
             assert (
                 self.pad_packed_seq_alignment == "max"
                 or self.pad_packed_seq_alignment == self.max_seqlen_per_dp_cp_rank
