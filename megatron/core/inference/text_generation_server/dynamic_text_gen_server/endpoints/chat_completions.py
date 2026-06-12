@@ -343,12 +343,14 @@ def _replace_prefix_tokens(
     from the previous generation (rather than the ones from the chat template application)."""
 
     # Strip the EOS from the previous turn token ids if it exists
-    if previous_turn_token_ids[-1] == eos_token_id:
+    if previous_turn_token_ids and previous_turn_token_ids[-1] == eos_token_id:
         previous_turn_token_ids = previous_turn_token_ids[:-1]
 
     # Find the last EOS token id in the previous turn token ids
     last_eos_token_id_index = len(retokeenized_previous_turn_token_ids) - 1
-    for i in reversed(range(len(retokeenized_previous_turn_token_ids))):
+    # Note that the current conversation stat may be shorter than the previous conversation state.
+    scan_len = min(len(retokeenized_previous_turn_token_ids), len(current_turn_token_ids))
+    for i in reversed(range(scan_len)):
         if current_turn_token_ids[i] == eos_token_id:
             last_eos_token_id_index = i
             break
