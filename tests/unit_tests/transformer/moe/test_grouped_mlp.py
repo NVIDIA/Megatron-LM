@@ -357,11 +357,7 @@ def test_make_fused_ops_handles_single_grouped_weight_for_fc1(monkeypatch):
 def _make_fake_te_namespace():
     """Build a fake TE namespace with the activation classes _make_fused_ops uses."""
 
-    class FakeCpuOffloadControl:
-        def set_activation_offloading(self, enabled):
-            self.activation_offloading = enabled
-
-    class FakeGroupedLinear(FakeCpuOffloadControl, torch.nn.Module):
+    class FakeGroupedLinear(torch.nn.Module):
         def __init__(
             self,
             num_gemms,
@@ -387,31 +383,27 @@ def _make_fake_te_namespace():
             self.single_grouped_weight = single_grouped_weight
             self.single_grouped_bias = single_grouped_bias
             self.delay_wgrad_compute = delay_wgrad_compute
-            self.activation_offloading = True
 
         def need_backward_dw(self):
             return False
 
-    class FakeScaledSwiGLU(FakeCpuOffloadControl, torch.nn.Module):
+    class FakeScaledSwiGLU(torch.nn.Module):
         def __init__(self, glu_interleave_size, *, activation_recompute_in_mlp=False):
             super().__init__()
             self.glu_interleave_size = glu_interleave_size
             self.activation_recompute_in_mlp = activation_recompute_in_mlp
-            self.activation_offloading = True
 
-    class FakeScaledClampedQGeGLU(FakeCpuOffloadControl, torch.nn.Module):
+    class FakeScaledClampedQGeGLU(torch.nn.Module):
         def __init__(self, glu_interleave_size, *, activation_recompute_in_mlp=False, limit=None):
             super().__init__()
             self.glu_interleave_size = glu_interleave_size
             self.activation_recompute_in_mlp = activation_recompute_in_mlp
             self.limit = limit
-            self.activation_offloading = True
 
-    class FakeScaledSReLU(FakeCpuOffloadControl, torch.nn.Module):
+    class FakeScaledSReLU(torch.nn.Module):
         def __init__(self, *, activation_recompute_in_mlp=False):
             super().__init__()
             self.activation_recompute_in_mlp = activation_recompute_in_mlp
-            self.activation_offloading = True
 
     class FakeSequential(list):
         def register_forward_pre_hook(self, hook):
@@ -574,6 +566,7 @@ def _make_fused_impl_support_module(
     module.tp_group = SimpleNamespace(size=lambda: 1)
     module.offload_expert_fc1 = False
     module.offload_moe_act = False
+    module.offload_fused_group_mlp = False
     common = dict(
         device="cuda",
         dtype=torch.bfloat16,
@@ -639,56 +632,74 @@ def test_is_fused_impl_supported_requires_scaled_srelu_op(monkeypatch):
     assert module._is_fused_impl_supported() is False
 
 
-def test_fused_grouped_mlp_activation_offload_requires_te_217(monkeypatch):
-    import megatron.core.extensions.transformer_engine as te_ext
-
-    checked_versions = []
-
-    def fake_is_te_min_version(version):
-        checked_versions.append(version)
-        return False
-
-    monkeypatch.setattr(te_ext, "HAVE_TE", True)
-    monkeypatch.setattr(te_ext, "is_te_min_version", fake_is_te_min_version)
-
-    assert te_ext.fused_grouped_mlp_activation_offload_supported() is False
-    assert checked_versions == ["2.17"]
-
-
-def test_fused_grouped_mlp_activation_offload_requires_te_opt_out_api(monkeypatch):
-    import megatron.core.extensions.transformer_engine as te_ext
-
-    class FakeGroupedLinearWithoutOptOut:
-        pass
-
-    fake_te = SimpleNamespace(
-        pytorch=SimpleNamespace(
-            ops=SimpleNamespace(GroupedLinear=FakeGroupedLinearWithoutOptOut)
-        )
-    )
-    monkeypatch.setattr(te_ext, "te", fake_te)
-    monkeypatch.setattr(te_ext, "HAVE_TE", True)
-    monkeypatch.setattr(te_ext, "is_te_min_version", lambda _: True)
-
-    assert te_ext.fused_grouped_mlp_activation_offload_supported() is False
-
-
-def test_is_fused_impl_supported_rejects_offload_without_te_217(monkeypatch):
+@pytest.mark.parametrize("offload_attr", ("offload_expert_fc1", "offload_moe_act"))
+def test_is_fused_impl_supported_rejects_partial_moe_offload(monkeypatch, offload_attr):
     fake_te, FakeGroupedLinear = _make_fake_te_namespace()
     monkeypatch.setattr(experts_module, "te", fake_te)
     monkeypatch.setattr(experts_module, "HAVE_TE", True)
     monkeypatch.setattr(experts_module, "is_te_min_version", lambda _: True)
-    monkeypatch.setattr(
-        experts_module, "fused_grouped_mlp_activation_offload_supported", lambda: False
-    )
     _install_fake_te_ops_modules(monkeypatch, fake_te)
 
     module = _make_fused_impl_support_module(
         FakeGroupedLinear, activation_func=F.silu, gated_linear_unit=True
     )
-    module.offload_expert_fc1 = True
+    setattr(module, offload_attr, True)
 
     assert module._is_fused_impl_supported() is False
+
+
+def test_is_fused_impl_supported_allows_fused_group_mlp_offload(monkeypatch):
+    fake_te, FakeGroupedLinear = _make_fake_te_namespace()
+    monkeypatch.setattr(experts_module, "te", fake_te)
+    monkeypatch.setattr(experts_module, "HAVE_TE", True)
+    monkeypatch.setattr(experts_module, "is_te_min_version", lambda _: True)
+    _install_fake_te_ops_modules(monkeypatch, fake_te)
+
+    module = _make_fused_impl_support_module(
+        FakeGroupedLinear, activation_func=F.silu, gated_linear_unit=True
+    )
+    module.offload_fused_group_mlp = True
+
+    assert module._is_fused_impl_supported() is True
+
+
+def test_transformer_config_allows_fused_group_mlp_offload_module():
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=64,
+        num_attention_heads=4,
+        fine_grained_activation_offloading=True,
+        offload_modules=["fused_group_mlp"],
+        use_transformer_engine_op_fuser=True,
+        cuda_graph_impl="transformer_engine",
+    )
+
+    assert config.offload_modules == ["fused_group_mlp"]
+
+
+def test_transformer_config_rejects_fused_group_mlp_without_op_fuser():
+    with pytest.raises(ValueError, match="fused_group_mlp requires"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            fine_grained_activation_offloading=True,
+            offload_modules=["fused_group_mlp"],
+            cuda_graph_impl="transformer_engine",
+        )
+
+
+def test_transformer_config_rejects_mixed_fused_group_mlp_and_partial_moe_offload():
+    with pytest.raises(ValueError, match="cannot be combined"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            fine_grained_activation_offloading=True,
+            offload_modules=["fused_group_mlp", "expert_fc1"],
+            use_transformer_engine_op_fuser=True,
+            cuda_graph_impl="transformer_engine",
+        )
 
 
 def test_make_fused_ops_attaches_single_grouped_bias_for_fc1(monkeypatch):
@@ -728,51 +739,6 @@ def test_make_fused_ops_attaches_single_grouped_bias_for_fc1(monkeypatch):
     assert not hasattr(
         ops[0], "bias0"
     ), "bias should not be split into bias{idx} when single_grouped_bias=True"
-
-
-@pytest.mark.parametrize(
-    ("offload_expert_fc1", "offload_moe_act", "expected_activation_offloading"),
-    (
-        (True, False, (True, False, False)),
-        (False, True, (False, True, False)),
-        (True, True, (True, True, False)),
-    ),
-)
-def test_make_fused_ops_configures_te_activation_offload_opt_out(
-    monkeypatch, offload_expert_fc1, offload_moe_act, expected_activation_offloading
-):
-    fake_te, FakeGroupedLinear = _make_fake_te_namespace()
-    monkeypatch.setattr(experts_module, "te", fake_te)
-
-    module = TEGroupedMLP.__new__(TEGroupedMLP)
-    torch.nn.Module.__init__(module)
-    module.config = SimpleNamespace(
-        moe_mlp_glu_interleave_size=2,
-        delay_wgrad_compute=False,
-        activation_func_clamp_value=None,
-        activation_func=F.silu,
-        gated_linear_unit=True,
-    )
-    module.activation_func = F.silu
-    module.activation_recompute = False
-    module.offload_expert_fc1 = offload_expert_fc1
-    module.offload_moe_act = offload_moe_act
-    common = dict(
-        device="cuda",
-        dtype=torch.bfloat16,
-        accumulate_into_main_grad=False,
-        single_grouped_weight=False,
-    )
-    module.linear_fc1 = FakeGroupedLinear(2, 4, 8, bias=False, **common)
-    module.linear_fc2 = FakeGroupedLinear(2, 8, 4, bias=False, **common)
-    module.linear_fc1.weight0 = torch.nn.Parameter(torch.ones(8, 4))
-    module.linear_fc1.weight1 = torch.nn.Parameter(torch.ones(8, 4))
-    module.linear_fc2.weight0 = torch.nn.Parameter(torch.ones(4, 8))
-    module.linear_fc2.weight1 = torch.nn.Parameter(torch.ones(4, 8))
-
-    ops = module._make_fused_ops()
-
-    assert tuple(op.activation_offloading for op in ops) == expected_activation_offloading
 
 
 def test_backward_dw_dispatches_fused_children_in_fc2_then_fc1_order():

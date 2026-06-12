@@ -343,9 +343,9 @@ class OffloadTensorGroup:
         self.total_offload_bytes = 0
         self.total_tensor_count = 0
         # Using memory pool is for the compatibility with cuda graph.
-        # Shapes of tensors for expert_fc1 and moe_act are not known in advance,
+        # Shapes of tensors for MoE activation offload groups are not known in advance,
         # so we do not use CPU pool for them.
-        if name in ("expert_fc1", "moe_act", "expert_fc1_moe_act"):
+        if name in ("expert_fc1", "moe_act", "expert_fc1_moe_act", "fused_group_mlp"):
             self.use_cpu_pool = False
         else:
             self.use_cpu_pool = True
