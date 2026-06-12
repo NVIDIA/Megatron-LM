@@ -88,6 +88,7 @@ class TestLocalCheckpointing:
         mock_args.no_save_optim = False
         mock_args.no_save_rng = True
         mock_args.use_torch_fsdp2 = use_torch_fsdp2
+        mock_args.dist_ckpt_use_dtensor_format = False
         # Test save_local
         state_dict = generate_state_dict(
             mock_args,
@@ -186,6 +187,7 @@ class TestLocalCheckpointing:
             mock_args.non_persistent_local_ckpt_algo = algo
             mock_args.async_save = async_save
             mock_args.ckpt_fully_parallel_save = True  # ensure proper sharding_type is set
+            mock_args.dist_ckpt_use_dtensor_format = False
             checkpointing_context = {
                 'local_checkpoint_manager': LocalCheckpointManager(local_ckpt_dir)
             }
@@ -292,6 +294,7 @@ class TestLocalCheckpointing:
                 mock_args.non_persistent_local_ckpt_algo = algo
                 mock_args.async_save = async_save
                 mock_args.ckpt_fully_parallel_save = True  # ensure proper sharding_type is set
+                mock_args.dist_ckpt_use_dtensor_format = False
                 checkpointing_context = {
                     'local_checkpoint_manager': LocalCheckpointManager(local_ckpt_dir)
                 }

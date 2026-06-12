@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """ Strategies using PyTorch distributed.checkpoint as an underlying format. """
+import dataclasses
 import inspect
 import io
 import os
@@ -8,6 +9,7 @@ import pickle
 import warnings
 from collections import defaultdict
 from contextlib import contextmanager
+from dataclasses import dataclass
 from itertools import product
 from logging import getLogger
 from pathlib import Path
@@ -39,7 +41,7 @@ from torch.distributed.checkpoint.metadata import Metadata
 from torch.distributed.checkpoint.planner_helpers import _create_write_items
 
 from ..core import CheckpointingException
-from ..dict_utils import nested_values
+from ..dict_utils import dict_list_map_inplace, nested_values
 from ..mapping import (
     ShardedBase,
     ShardedObject,
@@ -403,6 +405,153 @@ def _restore_dict_types(x: Union[dict, list, Any], keys_template: Union[dict, li
             _restore_dict_types(x_val, templ_val)
 
 
+def convert_state_dict_to_dcp_compatible(sharded_state_dict: ShardedStateDict) -> StateDict:
+    """Converts ShardedTensor-based state dict to DTensor-based state dict."""
+    num_dtensors = 0
+
+    def sh_ten_to_dtensor(x: Union[ShardedTensor, Any]) -> Union[Any, DTensor]:
+        """Converts ShardedTensor to DTensor."""
+        nonlocal num_dtensors
+
+        if isinstance(x, ShardedTensor):
+            x = x.to_dtensor()
+            num_dtensors += 1
+        elif isinstance(x, ShardedObject):
+            if not all(dim_size == 1 for dim_size in x.global_shape):
+                # Non-trivially-sharded ShardedObjects (e.g. rerun_state_machine with
+                # global_shape=(world_size,)) cannot be represented as DTensors.
+                logger.warning(
+                    f"ShardedObject '{x.key}' has non-trivial global_shape {x.global_shape}. "
+                    "Only coordinator rank's data will be saved in DTensor format."
+                )
+        return x
+
+    dict_list_map_inplace(sh_ten_to_dtensor, sharded_state_dict)
+    logger.info(f"Num of converted ShardedTensors to DTensors: {num_dtensors}")
+    return sharded_state_dict
+
+
+def unwrap_dtensors_and_sh_ten(state_dict: StateDict) -> StateDict:
+    """ """
+
+    def dtensor_to_ten(x: Union[DTensor, Any]) -> Union[Any, torch.Tensor]:
+        if isinstance(x, DTensor):
+            x = x.to_local()
+        elif isinstance(x, CheckpointableShardedTensor):
+            x = x._sh_ten.data
+        elif isinstance(x, ShardedObject):
+            x = x.data
+        return x
+
+    dict_list_map_inplace(dtensor_to_ten, state_dict)
+    return state_dict
+
+
+@dataclass
+class PlaceholderValue:
+    """ """
+
+    key: str
+
+
+def inject_placeholders(
+    sharded_state_dict: ShardedStateDict, keep_only_main_replica: bool = False
+) -> Dict[str, Any]:
+    """Replaces values in state dict with ValuePlaceholders.
+
+    Extracts all values from a given state dict to a flat dict, injecting
+    placeholders instead to allow later recovery with `fill_placeholders`.
+
+    Keys in the returned dict are the on-disk DCP FQNs: `x.key` for ShardedTensor
+    / DTensor, and `x.unique_key` (i.e. `key + "/shard_<offset>_<shape>"`) for
+    ShardedObject. This matches the MCore async save convention
+    (`_replace_state_dict_keys_with_sharded_keys`, which keys ShardedObjects by
+    `unique_key`), so checkpoints produced by either save path use the same
+    on-disk FQN format and either path can load the other's checkpoint.
+
+    When `keep_only_main_replica=True`, non-main-replica ShardedObjects are
+    replaced with placeholders but not added to the extracted values, so each
+    FQN gets written by exactly one rank. DTensors are not filtered because
+    their placements (e.g. `Replicate`) already dedup on save.
+    """
+    # TODO: in order to handle arbitrary DTensors (without `.key` attribute)
+    #  an additional step computing FQNs might be needed (`traverse_state_dict`?)
+    #  which computes DTensor.key
+    extracted_values = {}
+
+    def _fqn(x: Union[ShardedBase, DTensor]) -> str:
+        return x.unique_key if isinstance(x, ShardedObject) else x.key
+
+    def _replace_with_placeholder(x: Union[ShardedBase, DTensor]):
+        if isinstance(x, DTensor):
+            if not hasattr(x, 'key'):
+                raise NotImplementedError(f'DTensors currently require `key` attribute, got: {x}')
+        elif not isinstance(x, ShardedBase):
+            raise RuntimeError(f'Unexpected type {x} during placeholders injection')
+
+        fqn = _fqn(x)
+
+        # On save we only emit one BYTE_IO write per FQN. ShardedObjects are
+        # serialized via pickle (DCP's BYTE_IO path), which has no placement-level
+        # deduplication like DTensor has, so multiple ranks emitting the same
+        # FQN would trip DCP's `assert item.index.fqn not in md` in the global
+        # plan. Filtering to main replica here mirrors the regular MCore save
+        # path (`_replace_state_dict_keys_with_sharded_keys(keep_only_main_replica=True)`).
+        if (
+            keep_only_main_replica
+            and isinstance(x, ShardedObject)
+            and not is_main_replica(x.replica_id)
+        ):
+            return PlaceholderValue(fqn)
+
+        if fqn in extracted_values:
+            raise RuntimeError(f'Duplicated sharded key encountered: {fqn}')
+        extracted_values[fqn] = x
+        return PlaceholderValue(fqn)
+
+    dict_list_map_inplace(_replace_with_placeholder, sharded_state_dict)
+    return extracted_values
+
+
+def fill_placeholders(sharded_state_dict: ShardedStateDict, loaded_values: Dict[str, Any]) -> None:
+    """Inverse of `inject_placeholders`."""
+
+    def _fill_placeholder(x: PlaceholderValue):
+        assert isinstance(x, PlaceholderValue)
+        return loaded_values[x.key]
+
+    dict_list_map_inplace(_fill_placeholder, sharded_state_dict)
+
+
+class DTensorFormatSavePlanner(DefaultSavePlanner):
+    """Save planner for the DTensor checkpoint format.
+
+    `DefaultSavePlanner.create_local_plan` only emits write items for
+    `ShardedTensor` on non-coordinator ranks — non-tensor objects (which DCP
+    serializes via BYTE_IO) are only written by rank 0. That silently drops
+    rank-unique ShardedObjects produced by `DistributedOptimizer`, e.g.
+    `chained_<i>.optimizer.distributed.dp_group_idx_<rank>.optimizer`, which
+    surface as "Missing key in checkpoint state_dict" on load.
+
+    This planner emits a write item for every value in `state_dict` on every
+    rank. The caller is expected to have filtered to main replicas via
+    `inject_placeholders(..., keep_only_main_replica=True)` so each BYTE_IO
+    FQN is unique across ranks, avoiding DCP's
+    `assert item.index.fqn not in md` in the global plan.
+    """
+
+    def create_local_plan(self) -> SavePlan:
+        """Emit a write item for every value on every rank."""
+        write_items = []
+        for fqn, obj in self.state_dict.items():
+            write_items += _create_write_items(fqn, obj)
+        plan = SavePlan(items=write_items)
+        if self.flatten_state_dict:
+            plan = dataclasses.replace(plan, planner_data=self.mappings)
+        self.plan = plan
+        return self.plan
+
+
 class MCoreSavePlanner(DefaultSavePlanner):
     """Differs with the default planner by saving BytesIO objects on all ranks.
 
@@ -649,11 +798,41 @@ class TorchDistSaveShardedStrategy:
 
         self.validated_loaded_metadata_reuse = False
 
-    def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
-        """Sync save always uses the built-in implementation."""
-        async_request = self.async_save(sharded_state_dict, checkpoint_dir, async_strategy="mcore")
-        async_request.execute_sync()
-        del async_request
+    def save(
+        self,
+        sharded_state_dict: ShardedStateDict,
+        checkpoint_dir: Path,
+        use_dtensor_format: bool = False,
+    ):
+        """Each async strategy can be trivially used as a sync strategy."""
+        if use_dtensor_format:
+            # `inject_placeholders` returns a *flat* dict keyed by each ShardedBase/DTensor's
+            # `.key`. Saving that flat dict directly makes DCP record FQNs that are equal to
+            # mcore `.key` strings, which is what `_determine_missing_and_unexpected_keys`
+            # compares against on load. Wrapping the dict under a per-PP-stage key (e.g.
+            # `{"pp0": ...}`) would diverge the FQNs from mcore `.key`s and break reshard
+            # tests (the on-disk metadata would carry the `pp<rank>.` prefix while the
+            # in-memory `sharded_state_dict` would not), causing validation to flag every
+            # key as unexpected and `adjust_non_strict_load` to prune the whole state dict.
+            # Keys are already globally unique (model params include layer indices; optimizer
+            # ShardedObjects include `dp_group_idx_<rank>`), so no extra wrapping is needed.
+            #
+            # `keep_only_main_replica=True` mirrors the regular MCore save so each BYTE_IO
+            # FQN is emitted by exactly one rank. The custom `DTensorFormatSavePlanner` then
+            # emits write items for every value on every rank so rank-unique ShardedObjects
+            # (e.g. per-rank optimizer state) survive the save — they're dropped by DCP's
+            # default planner, which only writes BYTE_IO on the coordinator.
+            values_to_save = inject_placeholders(sharded_state_dict, keep_only_main_replica=True)
+            values_to_save = convert_state_dict_to_dcp_compatible(values_to_save)
+            return torch.distributed.checkpoint.save(
+                values_to_save, checkpoint_id=checkpoint_dir, planner=DTensorFormatSavePlanner()
+            )
+        else:
+            async_request = self.async_save(
+                sharded_state_dict, checkpoint_dir, async_strategy="mcore"
+            )
+            async_request.execute_sync()
+            del async_request
 
     def async_save(
         self,
@@ -860,6 +1039,7 @@ class TorchDistLoadShardedStrategy:
         sharded_state_dict: ShardedStateDict,
         checkpoint_dir: Path,
         async_strategy: str = "mcore",
+        use_dtensor_format: bool = False,
     ) -> StateDict:
         """Translates MCore ShardedTensors to PyT ShardedTensors & loads from PyT Distributed fmt.
 
@@ -870,6 +1050,27 @@ class TorchDistLoadShardedStrategy:
 
         Returns: loaded state dict
         """
+        if use_dtensor_format:
+            # Mirror the save side: pass DCP a flat dict keyed by mcore `.key`. DCP's
+            # metadata FQNs were written that way, so the lookup matches. After DCP load
+            # populates the DTensors (which alias the original ShardedTensor `.data`),
+            # `fill_placeholders` restores the user-visible nested structure and
+            # `unwrap_dtensors_and_sh_ten` collapses DTensors back to local tensors.
+            #
+            # Unlike save, load does not filter to main replicas: every rank needs to
+            # request its keys (including replicated ones), and DCP fans the single
+            # on-disk entry out to all requesters.
+            values_to_load = inject_placeholders(sharded_state_dict)
+            values_to_load = convert_state_dict_to_dcp_compatible(values_to_load)
+
+            torch.distributed.checkpoint.load(
+                state_dict=values_to_load, checkpoint_id=checkpoint_dir
+            )
+            fill_placeholders(sharded_state_dict, values_to_load)
+            unwrap_dtensors_and_sh_ten(sharded_state_dict)
+
+            return sharded_state_dict
+
         flexible_shape_sharded_tensors = [
             sh_ten
             for sh_ten in nested_values(sharded_state_dict)
@@ -946,7 +1147,13 @@ class TorchDistLoadShardedStrategy:
         for metadata_key, storage_metadata in metadata.state_dict_metadata.items():
             if not isinstance(storage_metadata, BytesStorageMetadata):
                 continue
-            sh_obj = ShardedObject.empty_from_unique_key(metadata_key)
+            # Both the DTensor-format save and the mcore async save write
+            # ShardedObjects under "<key>/shard_<offset>_<shape>" (the
+            # `ShardedObject.unique_key`). `empty_from_key` handles legacy
+            # plain-key entries as well: it parses the unique-key form when a "/"
+            # is present and otherwise returns a default ShardedObject keyed by
+            # the raw path.
+            sh_obj = ShardedObject.empty_from_key(metadata_key)
             sharded_metadata[sh_obj.unique_key] = sh_obj
 
         sharded_metadata.update(self.load_tensors_metadata(checkpoint_dir, metadata))

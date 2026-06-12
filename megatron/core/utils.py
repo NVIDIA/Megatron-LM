@@ -34,8 +34,10 @@ from megatron.core._rank_utils import log_single_rank
 from megatron.core.package_info import __version__ as mcore_version
 
 try:
+    from torch.distributed import DeviceMesh, get_process_group_ranks
     from torch.distributed._tensor import DTensor
-    from torch.distributed.tensor.placement_types import Shard
+    from torch.distributed.distributed_c10d import _get_group_tag
+    from torch.distributed.tensor.placement_types import Replicate, Shard
 
     HAVE_DTENSOR = True
 except ImportError:
@@ -929,7 +931,7 @@ def make_tp_sharded_tensor_for_checkpoint(
     # Pop group parameters from kwargs
     tp_group = kwargs.pop('tp_group', None)
     dp_cp_group = kwargs.pop('dp_cp_group', None)
-
+    use_dtensor_format = kwargs.pop('use_dtensor_format', False)
     prepend_axis_num = len(prepend_offsets)
 
     new_offsets = []
@@ -965,6 +967,23 @@ def make_tp_sharded_tensor_for_checkpoint(
     if replica_id is None:
         replica_id = (0, 0, dp_replica_id)
 
+    if use_dtensor_format:
+        if prepend_axis_num > 0:
+            raise ValueError(
+                "Prepend-style expert sharding is not supported in DTensor format. "
+                "Use singleton_local_shards=True for expert sharding. "
+                f"Got prepend_offsets={prepend_offsets}"
+            )
+
+        is_expert = _is_expert_tp_group(tp_group)
+        placements, device_mesh = get_dtensor_metadata(
+            tp=True, tp_axis=tp_axis, is_expert=is_expert
+        )
+
+        kwargs.update(
+            dict(dtensor_ckpt_device_mesh=device_mesh, dtensor_ckpt_placements=placements)
+        )
+
     return ShardedTensor.from_rank_offsets(
         key,
         tensor,
@@ -974,6 +993,21 @@ def make_tp_sharded_tensor_for_checkpoint(
         prepend_axis_num=prepend_axis_num,
         **kwargs,
     )
+
+
+def _is_expert_tp_group(tp_group):
+    """Returns True iff ``tp_group`` is the expert tensor parallel group.
+
+    Used by the checkpoint helpers to decide whether to build DTensor metadata
+    from the expert (ETP / expert-DP) parallel groups instead of the global TP /
+    DP groups. Returns False when the expert groups are not initialized (i.e.
+    the model is not MoE), so non-MoE training keeps the existing behavior.
+    """
+    try:
+        expert_tp_group = parallel_state.get_expert_tensor_parallel_group(check_initialized=False)
+    except (RuntimeError, AssertionError):
+        return False
+    return expert_tp_group is not None and tp_group is expert_tp_group
 
 
 def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_id=None, **kwargs):
@@ -994,7 +1028,7 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
     # Pop group parameters from kwargs
     tp_group = kwargs.pop('tp_group', None)
     dp_cp_group = kwargs.pop('dp_cp_group', None)
-
+    use_dtensor_format = kwargs.pop('use_dtensor_format', False)
     prepend_axis_num = len(prepend_offsets)
 
     new_offsets = []
@@ -1017,6 +1051,14 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
 
     if replica_id is None:
         replica_id = (0, get_pg_rank(tp_group), dp_replica_id)
+
+    if use_dtensor_format:
+        is_expert = _is_expert_tp_group(tp_group)
+        placements, device_mesh = get_dtensor_metadata(is_expert=is_expert)
+
+        kwargs.update(
+            dict(dtensor_ckpt_device_mesh=device_mesh, dtensor_ckpt_placements=placements)
+        )
 
     return ShardedTensor.from_rank_offsets(
         key,
@@ -2862,3 +2904,82 @@ def deprecate_inference_params(inference_context, inference_params):
         )
         return inference_params
     return inference_context
+
+
+def get_dtensor_metadata(tp: bool = False, tp_axis: int = None, is_expert: bool = False):
+    """Generates placements and device mesh for DTensor.
+
+    When ``is_expert`` is True, the mesh is built from the expert parallel groups
+    (ETP for the TP axis and expert-DP for the DP axis) instead of the global
+    TP/DP groups. MoE expert weights only live on the ETP x expert-DP subgroup
+    of the world, so using the global groups gives a mesh size that exceeds the
+    set of ranks that actually own the tensor, and the save planner reports
+    "invalid fill" / "Failed to validate global plan" because the union of
+    chunks covers only ``etp_size / tp_size`` of the expected global volume.
+    """
+    if tp:
+        if is_expert:
+            tp_group_for_mesh = parallel_state.get_expert_tensor_parallel_group()
+            dp_group_for_mesh = parallel_state.get_expert_data_parallel_group()
+            tp_size = tp_group_for_mesh.size()
+            dp_size = dp_group_for_mesh.size()
+            tp_ranks = get_process_group_ranks(tp_group_for_mesh)
+            dp_ranks = get_process_group_ranks(dp_group_for_mesh)
+            # No combined ETP x expert-DP group exists in parallel_state, so the
+            # mesh tensor is constructed locally. With ``_init_backend=False`` the
+            # values are only used to locate the current rank's mesh coordinate;
+            # collectives go through ``_dim_group_infos`` set below. Positions
+            # outside the current rank's row/column are filled with values
+            # outside ``[0, world_size)`` so ``(mesh == current_rank)`` resolves
+            # to a single position.
+            current_rank = torch.distributed.get_rank()
+            current_tp_idx = tp_ranks.index(current_rank)
+            current_dp_idx = dp_ranks.index(current_rank)
+            world_size = torch.distributed.get_world_size()
+            with torch.device("cpu"):
+                mesh = (
+                    torch.arange(world_size, world_size + tp_size * dp_size, dtype=torch.int)
+                    .reshape(tp_size, dp_size)
+                    .contiguous()
+                )
+                mesh[current_tp_idx, current_dp_idx] = current_rank
+        else:
+            tp_size = parallel_state.get_tensor_model_parallel_world_size()
+            dp_size = parallel_state.get_data_parallel_world_size(with_context_parallel=True)
+            tp_group_for_mesh = parallel_state.get_tensor_model_parallel_group()
+            dp_group_for_mesh = parallel_state.get_data_parallel_group(with_context_parallel=True)
+            process_group = parallel_state.get_tensor_and_data_parallel_group(
+                with_context_parallel=True
+            )
+            with torch.device("cpu"):
+                group_ranks = get_process_group_ranks(process_group)
+                # Megatron ranks within tp+dp group are ordered: dp_rank * tp_size + tp_rank.
+                # Reshape as (dp_size, tp_size) then transpose to get (tp_size, dp_size) mesh
+                # where row=tp_rank and col=dp_rank, matching mesh_dim_names=('tp', 'dp').
+                mesh = (
+                    torch.tensor(group_ranks, dtype=torch.int).view(dp_size, tp_size).T.contiguous()
+                )
+            tp_ranks = get_process_group_ranks(tp_group_for_mesh)
+            dp_ranks = get_process_group_ranks(dp_group_for_mesh)
+        device_mesh = DeviceMesh("cuda", mesh, mesh_dim_names=('tp', 'dp'), _init_backend=False)
+        device_mesh._dim_group_infos = [
+            (_get_group_tag(tp_group_for_mesh), tp_ranks, tp_group_for_mesh.group_name),
+            (_get_group_tag(dp_group_for_mesh), dp_ranks, dp_group_for_mesh.group_name),
+        ]
+        placements = [Shard(tp_axis), Replicate()]
+    else:
+        if is_expert:
+            process_group = parallel_state.get_expert_data_parallel_group()
+        else:
+            process_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        mesh_shape = (process_group.size(),)
+        with torch.device("cpu"):
+            group_ranks = get_process_group_ranks(process_group)
+            mesh = torch.tensor(group_ranks, dtype=torch.int).view(mesh_shape)
+        device_mesh = DeviceMesh("cuda", mesh, mesh_dim_names=('dp',), _init_backend=False)
+        device_mesh._dim_group_infos = [
+            (_get_group_tag(process_group), group_ranks, process_group.group_name)
+        ]
+        placements = [Replicate()]
+
+    return placements, device_mesh

@@ -119,6 +119,7 @@ def create_args():
     args.swiglu = True
     args.num_experts = 1
     args.verify_integrity = False
+    args.dist_ckpt_use_dtensor_format = False
 
     yield args
 
