@@ -2310,7 +2310,18 @@ class TransformerConfig(ModelParallelConfig):
                     "It is experimental and may change in future versions."
                 )
             else:
-                if self.rotary_interleaved:
+                fused_mrope_available = False
+                # Triton fused mRoPE supports split-half RoPE only. Keep rotary_interleaved
+                # configs on the TE validation path so the TE >= 2.3 check still applies.
+                if self.mrope_section is not None and not self.rotary_interleaved:
+                    try:
+                        from megatron.core.fusions.fused_mrope import is_fused_mrope_available
+
+                        fused_mrope_available = is_fused_mrope_available()
+                    except ImportError:
+                        fused_mrope_available = False
+
+                if self.rotary_interleaved and not fused_mrope_available:
                     if not is_te_min_version("2.3.0"):
                         raise ValueError(
                             "rotary_interleaved does not work with apply_rope_fusion for "
@@ -2322,9 +2333,14 @@ class TransformerConfig(ModelParallelConfig):
                     fused_apply_rotary_pos_emb_thd,
                 )
 
-                if fused_apply_rotary_pos_emb is None and fused_apply_rotary_pos_emb_thd is None:
+                if (
+                    fused_apply_rotary_pos_emb is None
+                    and fused_apply_rotary_pos_emb_thd is None
+                    and not fused_mrope_available
+                ):
                     raise ValueError(
-                        "apply_rope_fusion is not available. Please install TE >= 1.4."
+                        "apply_rope_fusion is not available. Please install TE >= 1.4 "
+                        "or Triton for fused mRoPE."
                     )
 
         if self.fused_single_qkv_rope:
