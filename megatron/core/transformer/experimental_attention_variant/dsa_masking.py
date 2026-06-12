@@ -21,6 +21,8 @@ __all__ = [
     "gather_sparse_topk_validity_and_bias",
     "generate_varlen_mask_params",
     "generate_varlen_mask_params_for_positions",
+    "masked_softmax",
+    "masked_softmax_inplace",
     "normalize_query_valid_rows",
     "normalize_varlen_bounds",
     "prepare_additive_mask",
@@ -286,6 +288,48 @@ def scatter_topk_into_index_mask(
                 index_mask[b_idx, q_idx, k_idx] = 0.0
         else:
             index_mask[:, s0:s1].scatter_(-1, idx_chunk, 0.0)
+
+
+def masked_softmax_inplace(
+    logits: torch.Tensor, valid_mask: torch.Tensor, *, dim: int = -1, eps: float = 1e-10
+) -> torch.Tensor:
+    """Convert logits to probabilities in place while zeroing invalid entries."""
+    if not logits.is_floating_point():
+        raise TypeError("masked_softmax_inplace expects a floating-point tensor")
+    if logits.shape != valid_mask.shape:
+        raise ValueError("logits and valid_mask must have the same shape")
+
+    logits.masked_fill_(~valid_mask, torch.finfo(logits.dtype).min)
+    row_has_valid = valid_mask.any(dim=dim, keepdim=True)
+    row_max = logits.max(dim=dim, keepdim=True).values
+    row_max = torch.where(row_has_valid, row_max, torch.zeros_like(row_max))
+
+    logits.sub_(row_max)
+    logits.exp_()
+    logits.masked_fill_(~valid_mask, 0.0)
+    logits.div_(logits.sum(dim=dim, keepdim=True).clamp_min(eps))
+    logits.masked_fill_(~valid_mask, 0.0)
+    return logits
+
+
+def masked_softmax(
+    logits: torch.Tensor, valid_mask: torch.Tensor, *, dim: int = -1, eps: float = 1e-10
+) -> torch.Tensor:
+    """Convert logits to probabilities while zeroing invalid entries."""
+    if not logits.is_floating_point():
+        raise TypeError("masked_softmax expects a floating-point tensor")
+    if logits.shape != valid_mask.shape:
+        raise ValueError("logits and valid_mask must have the same shape")
+
+    masked_logits = logits.masked_fill(~valid_mask, torch.finfo(logits.dtype).min)
+    row_has_valid = valid_mask.any(dim=dim, keepdim=True)
+    row_max = masked_logits.max(dim=dim, keepdim=True).values
+    row_max = torch.where(row_has_valid, row_max, torch.zeros_like(row_max))
+
+    probs = torch.exp(masked_logits - row_max)
+    probs = probs.masked_fill(~valid_mask, 0.0)
+    probs = probs / probs.sum(dim=dim, keepdim=True).clamp_min(eps)
+    return probs.masked_fill(~valid_mask, 0.0)
 
 
 def normalize_query_valid_rows(
