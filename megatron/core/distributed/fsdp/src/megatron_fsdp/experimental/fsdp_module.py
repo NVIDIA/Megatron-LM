@@ -31,13 +31,13 @@ class FsdpModule:
 
     _parameter_groups: tuple[ParameterGroup, ...]
     _ready_grad_parameters: set[nn.Parameter]
-    num_training_parameters: int
+    _num_training_parameters: int
 
     def __init__(
         self, mesh: DeviceMesh, placements: Placements, mixed_precision_policy: MixedPrecisionPolicy
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module."""
-        owned_parameters = _materialize_and_collect_owned_parameters(self, _mesh_device(mesh))
+        owned_parameters = _collect_owned_parameters(self)
         axis_indices = tuple(_axis_index(mesh, axis) for axis in placements.dp_axes)
         assert axis_indices == tuple(
             range(mesh.ndim)
@@ -54,7 +54,7 @@ class FsdpModule:
         ]
         self._parameter_groups = tuple(parameter_groups)
         self._ready_grad_parameters = set()
-        self.num_training_parameters = sum(
+        self._num_training_parameters = sum(
             len(group.sharded_parameters) for group in self._parameter_groups if group.requires_grad
         )
         self._register_hooks()
@@ -77,7 +77,7 @@ class FsdpModule:
     def _make_grad_hook(self, parameter: nn.Parameter) -> Callable[[nn.Parameter], None]:
         def grad_hook(_parameter: nn.Parameter) -> None:
             self._ready_grad_parameters.add(parameter)
-            if len(self._ready_grad_parameters) == self.num_training_parameters:
+            if len(self._ready_grad_parameters) == self._num_training_parameters:
                 self.post_backward()
 
         return grad_hook
@@ -86,6 +86,7 @@ class FsdpModule:
         """Prepare full parameters for forward compute."""
         self._ready_grad_parameters.clear()
         for group in self._parameter_groups:
+            group.sync_model_weight_from_main_weight()
             group.unshard_parameters()
 
     def post_forward(self) -> None:
@@ -126,39 +127,11 @@ def _axis_index(mesh: DeviceMesh, axis: MeshAxis) -> int:
     return dim_names.index(axis)
 
 
-def _mesh_device(mesh: DeviceMesh) -> torch.device:
-    if mesh.device_type == "cuda":
-        return torch.device("cuda", torch.cuda.current_device())
-    return torch.device(mesh.device_type)
-
-
-def _materialize_and_collect_owned_parameters(
-    root_module: nn.Module, device: torch.device
-) -> dict[str, nn.Parameter]:
+def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]:
     parameters: dict[str, nn.Parameter] = {}
 
     def visit(submodule: nn.Module, submodule_fqn: str) -> None:
         direct_parameters = list(submodule.named_parameters(recurse=False))
-
-        if any(parameter.is_meta for _, parameter in direct_parameters):
-            if any(not parameter.is_meta for _, parameter in direct_parameters):
-                raise ValueError(
-                    f"Module {submodule_fqn!r} mixes meta and non-meta direct parameters. "
-                    "Initialize all direct parameters on meta or none of them."
-                )
-            submodule.to_empty(device=device, recurse=False)
-            with torch.no_grad():
-                if hasattr(submodule, "reset_parameters"):
-                    submodule.reset_parameters()
-                elif hasattr(submodule, "_reset_parameters"):
-                    submodule._reset_parameters()
-                else:
-                    raise ValueError(
-                        f"Module {submodule_fqn!r} does not have "
-                        "reset_parameters or _reset_parameters."
-                    )
-            # Module.to_empty may replace Parameters, so collect direct parameters again.
-            direct_parameters = list(submodule.named_parameters(recurse=False))
 
         for local_parameter_name, parameter in direct_parameters:
             parameter_fqn = (
