@@ -1080,3 +1080,60 @@ class TestApplyRope:
             f"ratio={ratio} stride mismatch: "
             f"max abs diff = {(out_comp - out_ref).abs().max().item():.3e}"
         )
+
+class TestCSAHighPrecisionParams:
+    """The compressor ``ape`` and attention ``attn_sink`` parameters must stay in FP32
+    (the reference DeepSeek V4 checkpoint stores them in FP32), even after the model is
+    converted to BF16/FP16 by ``Float16Module``."""
+
+    @pytest.fixture(scope='class', autouse=True)
+    def setup_method(self, request):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        torch.manual_seed(123)
+        model_parallel_cuda_manual_seed(123)
+
+        cls = request.cls
+        cls.config = _make_mla_config(csa_compress_ratios=[4, 4, 4, 4])
+        cls.pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+
+        from megatron.core.models.common.embeddings import RotaryEmbedding
+
+        cls.rotary_pos_emb = RotaryEmbedding(
+            cls.config.qk_pos_emb_head_dim,
+            rotary_percent=cls.config.rotary_percent,
+            rotary_base=cls.config.rotary_base,
+            cp_group=cls.pg_collection.cp,
+        )
+
+        yield
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_ape_and_attn_sink_stay_fp32_after_bf16_conversion(self):
+        from megatron.core.transformer.module import Float16Module
+
+        csa = CompressedSparseAttention(
+            config=self.config,
+            submodules=_make_csa_submodules(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            attention_type='self',
+            pg_collection=self.pg_collection,
+            rotary_pos_emb=self.rotary_pos_emb,
+            compress_ratio=4,
+            name="decoder.layers.0.self_attention.core_attention",
+        )
+
+        assert csa.attn_sink.dtype == torch.float32
+        assert csa.compressor.ape.dtype == torch.float32
+        assert csa.indexer.compressor.ape.dtype == torch.float32
+
+        bf16_module = Float16Module(config=self.config, module=csa)
+
+        assert bf16_module.module.attn_sink.dtype == torch.float32
+        assert bf16_module.module.compressor.ape.dtype == torch.float32
+        assert bf16_module.module.indexer.compressor.ape.dtype == torch.float32
+        assert bf16_module.module.compressor.linear_wkv.weight.dtype == torch.bfloat16
+        assert bf16_module.module.compressor.linear_wgate.weight.dtype == torch.bfloat16
