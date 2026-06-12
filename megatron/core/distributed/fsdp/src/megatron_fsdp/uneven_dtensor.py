@@ -624,15 +624,44 @@ def get_state_dict(
     submodules: Optional[set[nn.Module]] = None,
     options: Optional["StateDictOptions"] = None,
 ) -> tuple[dict[str, "ValueType"], "OptimizerStateType"]:
-    """Produce model and optimizer state dicts with uneven DTensor preprocessing."""
+    """Produce model and optimizer state dicts with uneven DTensor preprocessing.
+
+    PyTorch's ``get_state_dict`` clones every DTensor, so the returned
+    tensors lack ``__create_chunk_list__`` / ``__create_write_items__``.
+    Instead of recomputing metadata via ``all_gather_object``, we copy it
+    from the model's ``dist_params`` (which carry metadata from FSDP init)
+    to the corresponding state-dict entries — a zero-collective operation.
+    """
     for param in model.parameters():
         assert isinstance(param, DTensor), "Expected all parameters to be DTensors"
 
     model_state_dict, optimizer_state_dict = _get_state_dict(
         model=model, optimizers=optimizers, submodules=submodules, options=options
     )
-    preprocess_state_dict_for_uneven_dtensor(model_state_dict)
-    preprocess_state_dict_for_uneven_dtensor(optimizer_state_dict)
+
+    # Build FQN → model DTensor mapping (dist_params carry chunk metadata).
+    param_by_fqn: dict[str, DTensor] = {}
+    for fqn, p in model.named_parameters():
+        if isinstance(p, DTensor) and hasattr(p._local_tensor, "__create_chunk_list__"):
+            param_by_fqn[fqn] = p
+
+    # Copy chunk metadata into model state-dict entries.
+    for fqn, dt in model_state_dict.items():
+        if isinstance(dt, DTensor) and not hasattr(dt._local_tensor, "__create_chunk_list__"):
+            src = param_by_fqn.get(fqn)
+            if src is not None:
+                copy_chunk_metadata(src, dt)
+
+    # Copy chunk metadata into optimizer state-dict entries.
+    optim_state = optimizer_state_dict.get("state", {})
+    for fqn, state_tensors in optim_state.items():
+        src = param_by_fqn.get(fqn)
+        if src is None:
+            continue
+        for key, dt in state_tensors.items():
+            if isinstance(dt, DTensor) and not hasattr(dt._local_tensor, "__create_chunk_list__"):
+                copy_chunk_metadata(src, dt)
+
     return model_state_dict, optimizer_state_dict
 
 

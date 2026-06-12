@@ -198,8 +198,7 @@ def test_init_buffers(strategy):
         if pg.requires_grad:
             assert pg.main_grad_buffer is not None
             assert pg.main_grad_buffer.is_distributed == g_dist
-            # Grad buffer must be zero-initialized
-            assert torch.all(pg.main_grad_buffer.data == 0)
+            assert pg.main_grad_buffer.data is None  # lazy init
 
     torch.distributed.barrier()
 
@@ -264,6 +263,7 @@ def test_reduce_grad(strategy):
     _, _, _, g_dist = _flags(strategy)
 
     for pg in groups:
+        pg._init_dist_grads()  # lazily allocate grad buffer and dist_grads list
         gbuf = pg.main_grad_buffer
         if gbuf is None:
             # uint8 group has requires_grad=False, so no grad buffer

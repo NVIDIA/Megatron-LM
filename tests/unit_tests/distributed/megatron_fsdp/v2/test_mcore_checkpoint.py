@@ -406,8 +406,8 @@ class TestMegatronFsdpV2Checkpoint:
             # ---- MFSDP v2 → MFSDP v2 (round-trip) ----
             pytest.param(
                 "v2",
-                dict(data_parallel_sharding_strategy="optim_grads_params"),
-                dict(data_parallel_sharding_strategy="optim_grads_params"),
+                dict(data_parallel_sharding_strategy="optim_grads_params", fsdp_trace_pool=True),
+                dict(data_parallel_sharding_strategy="optim_grads_params", fsdp_trace_pool=True),
                 id="v2_rt_optim_grads_params",
             ),
             pytest.param(

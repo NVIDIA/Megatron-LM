@@ -60,6 +60,9 @@ def _register_forward_pre_hook(fsdp_module: FSDPModule, fine_grained: bool = Fal
             fsdp_module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=True)
         fsdp_module.unshard(async_op=ctx.enable_unshard_prefetch, bwd_pass=False)
 
+        for param_group in fsdp_module._fsdp_param_groups:
+            param_group._maybe_free_grad_data()
+
         # ---- CUDA graph capture (once per compatible module) --------------
         if (
             hook_module is fsdp_module
@@ -226,7 +229,8 @@ def _register_backward_pre_hook(module: FSDPModule):
                     # overwrite instead.
                     setattr(param, "overwrite_main_grad", True)
             if param_group.main_grad_buffer is not None:
-                param_group.main_grad_buffer.unshard()
+                param_group._init_dist_grads()
+                param_group.main_grad_buffer.fetch_buffer()
 
     module._mfsdp_backward_pre_hook = create_custom_backward_hook(
         module, custom_backward_handler=pre_backward_hook
