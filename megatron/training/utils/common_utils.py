@@ -12,7 +12,7 @@ from typing import Optional
 
 import torch
 
-from megatron.core.msc_utils import open_file
+from megatron.core.msc_utils import open_file, MultiStorageClientFeature
 from megatron.core._rank_utils import safe_get_rank as _safe_get_rank
 from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
 
@@ -616,3 +616,19 @@ def get_local_rank_preinit() -> int:
 
     warnings.warn("Could not determine local rank from LOCAL_RANK or SLURM_LOCALID. Defaulting to local rank 0.")
     return 0
+
+
+def file_exists(path: str) -> bool:
+    """Check if a file exists.
+
+    Args:
+        path: The path to the file. Can be a local path or an MSC URL.
+
+    Returns:
+        True if the file exists, False otherwise.
+    """
+    if MultiStorageClientFeature.is_enabled():
+        msc = MultiStorageClientFeature.import_package()
+        return msc.os.path.exists(path)
+    else:
+        return os.path.exists(path)
