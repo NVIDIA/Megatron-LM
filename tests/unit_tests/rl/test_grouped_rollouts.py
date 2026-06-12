@@ -342,6 +342,7 @@ class TestGroupedRollouts:
 
     @pytest.mark.asyncio
     async def test_rollout_submit_unordered_yields_completion_order(self):
+        """R-submit/G-consume yields complete groups as soon as each group finishes."""
         gen = RecordingRewardOnlyAgent(parallel_generation_tasks=2)
         request = GroupedRolloutRequest(
             num_groups=1,
@@ -354,6 +355,7 @@ class TestGroupedRollouts:
 
         groups = await collect_groups(gen, request, 2)
 
+        assert [len(group) for group in groups] == [2, 2]
         assert [group_prompt(group) for group in groups] == ["prompt-1", "prompt-0"]
 
     @pytest.mark.asyncio

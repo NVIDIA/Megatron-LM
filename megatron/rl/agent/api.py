@@ -34,7 +34,13 @@ class RolloutRequest(Request):
 
 
 class GroupedRolloutRequest(Request):
-    """Request to agent to generate grouped Rollouts."""
+    """Request to agent to generate grouped Rollouts.
+
+    num_groups controls how many RolloutGroup objects are submitted together.
+    The trainer consumes grpo_prompts_per_step yielded groups per rollout
+    collection. When enforce_order is true, yielded groups preserve submission
+    order even if generation completes out of order.
+    """
 
     num_groups: int
     rollouts_per_group: int
