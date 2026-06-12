@@ -81,6 +81,11 @@ class ParameterGroup:
         self.dtype = first_parameter.dtype
         self.requires_grad = first_parameter.requires_grad
         for name, parameter in parameters.items():
+            if parameter.is_meta:
+                raise ValueError(
+                    f"Expected parameter {name!r} to be materialized before "
+                    "ParameterGroup construction."
+                )
             if parameter.dtype != self.dtype:
                 raise ValueError(
                     f"Expected parameter {name!r} to have dtype {self.dtype}, "
