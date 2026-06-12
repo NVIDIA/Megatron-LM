@@ -396,7 +396,7 @@ class TestAsyncSchedulingControllerHelpers:
         controller, context, _ = self._make_async_eligibility_controller()
         events = []
 
-        context.prepare_async_next_forward.side_effect = lambda _: events.append(
+        context.update_requests_prepare.side_effect = lambda **_: events.append(
             "update_requests_prepare"
         )
         context.update_requests_bookkeep.side_effect = lambda *_args, **_kwargs: events.append(

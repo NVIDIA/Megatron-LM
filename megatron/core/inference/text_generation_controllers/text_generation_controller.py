@@ -1676,9 +1676,11 @@ class TextGenerationController:
         new_sample_copy = sampled_tokens_cpu.clone()
         range_pop()
 
-        prepared_update = context.update_requests_prepare(
-            active_request_mask, new_sample_copy, sampled_mtp_tokens_cpu
-        )
+        prepared_update = {
+            "active_requests_mask": active_request_mask,
+            "new_tokens": new_sample_copy,
+            "new_speculative_tokens": sampled_mtp_tokens_cpu,
+        }
         request_bookkeeping = {
             "active_request_ids": active_request_ids,
             "finished_request_ids": finished_request_ids,
@@ -1698,6 +1700,8 @@ class TextGenerationController:
 
         range_push("update_requests")
         update_result = context.update_requests_bookkeep(prepared_update)
+        if update_result is not None:
+            context.update_requests_prepare(**prepared_update)
         range_pop()
 
         return {
@@ -1735,7 +1739,7 @@ class TextGenerationController:
         context = self.inference_wrapped_model.inference_context
 
         range_push("update_requests_prepare")
-        context.prepare_async_next_forward(prepared_update)
+        context.update_requests_prepare(**prepared_update)
         range_pop()
 
         self._async_schedule_primed_cuda_graph_request_count = (
@@ -1852,6 +1856,8 @@ class TextGenerationController:
         ):
             range_push("update_requests")
             update_result = context.update_requests_bookkeep(prepared_update)
+            if update_result is not None:
+                context.update_requests_prepare(**prepared_update)
             range_pop()
             self._async_schedule_forward_primed = False
             self._async_schedule_primed_cuda_graph_request_count = None
