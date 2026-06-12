@@ -52,9 +52,12 @@ def get_buffer(group: torch.distributed.ProcessGroup, hidden_bytes: int):
         num_nvl_bytes = max(
             config.get_nvl_buffer_size_hint(hidden_bytes, group.size()), num_nvl_bytes
         )
-        num_rdma_bytes = max(
-            config.get_rdma_buffer_size_hint(hidden_bytes, group.size()), num_rdma_bytes
-        )
+        # Local-only EP groups do not need an RDMA buffer, and DeepEP builds
+        # without internode support may not expose RDMA size hints.
+        if group.size() > torch.cuda.device_count():
+            num_rdma_bytes = max(
+                config.get_rdma_buffer_size_hint(hidden_bytes, group.size()), num_rdma_bytes
+            )
 
     # Allocate buffer if not existed or not enough buffer
     # NOTES: the adaptive routing configuration of the network **must be off**
@@ -275,6 +278,9 @@ except ImportError:
     HAVE_HYBRIDEP = False
 
 _hybrid_ep_buffer = None
+
+# HybridEP dispatch/combine kernels use 64-token chunks for their public APIs.
+HYBRIDEP_TOKEN_ALIGNMENT = 64
 
 
 def init_hybrid_ep_buffer(
