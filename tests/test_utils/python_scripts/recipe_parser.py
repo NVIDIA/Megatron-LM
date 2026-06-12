@@ -116,6 +116,17 @@ def resolve_cluster_config(cluster: str) -> str:
     raise ValueError(f"Unknown cluster {cluster} provided.")
 
 
+def resolve_local_image_prepare_cluster(cluster: str) -> str:
+    """Pick a same-site CPU cluster to create a local SquashFS image when possible."""
+    prepare_clusters = {
+        "dgxh100_eos": "cpu_eos",
+        "dgxh100_coreweave": "cpu_coreweave",
+        "dgxa100_dracooci": "cpu_dracooci",
+        "dgxgb200_oci-hsg": "cpu_oci-hsg",
+    }
+    return prepare_clusters.get(cluster, cluster)
+
+
 def flatten_products(workload_manifest: dotdict) -> dotdict:
     """Flattens a nested dict of products"""
     flattened_products = []
@@ -360,6 +371,89 @@ def filter_by_test_cases(workload_manifests: List[dotdict], test_cases: str) -> 
     return workload_manifests
 
 
+def _format_image_source_value(template: str, workload: dotdict, container_tag: str) -> str:
+    format_values = dict(workload.spec)
+    format_values["container_tag"] = container_tag
+    try:
+        return template.format(**format_values)
+    except KeyError as exc:
+        missing_key = exc.args[0]
+        raise ValueError(
+            f"Unknown image source template field {missing_key!r} in {template!r}. "
+            f"Available fields: {sorted(format_values)}"
+        ) from exc
+
+
+def _apply_local_image_source(
+    workload: dotdict, container_tag: str, workload_local_image_path: Optional[str]
+) -> None:
+    if workload_local_image_path is None:
+        return
+
+    local_path = _format_image_source_value(workload_local_image_path, workload, container_tag)
+    workload.spec.pop("build", None)
+    workload.spec["image_source"] = {"local_path": local_path}
+
+
+def resolve_workload_local_image_sources(
+    container_tag: str,
+    workload_local_image_path: str,
+    tag: Optional[str] = None,
+    environment: Optional[str] = None,
+    platform: Optional[str] = None,
+    test_cases: str = "all",
+    scope: Optional[str] = None,
+    model: Optional[str] = None,
+    test_case: Optional[str] = None,
+    container_image: Optional[str] = None,
+    cadence: Optional[str] = None,
+) -> List[dotdict]:
+    """Resolve source Docker images and destination SquashFS paths for selected workloads."""
+    workloads = load_workloads(
+        container_tag=container_tag,
+        tag=tag,
+        environment=environment,
+        platform=platform,
+        test_cases=test_cases,
+        scope=scope,
+        model=model,
+        test_case=test_case,
+        container_image=container_image,
+        cadence=cadence,
+    )
+    build_workloads = {
+        workload.spec["name"]: workload for workload in workloads if workload.type == "build"
+    }
+
+    local_image_sources: List[dotdict] = []
+    seen = set()
+    for workload in workloads:
+        if workload.type == "build":
+            continue
+
+        build_name = workload.spec["build"]
+        if build_name not in build_workloads:
+            raise ValueError(f"Build workload {build_name!r} was not loaded for {workload.spec}")
+
+        local_path = _format_image_source_value(workload_local_image_path, workload, container_tag)
+        source_image = build_workloads[build_name].spec["source"]["image"]
+        source_key = (source_image, local_path)
+        if source_key in seen:
+            continue
+
+        seen.add(source_key)
+        local_image_sources.append(
+            dotdict(
+                build=build_name,
+                source_image=source_image,
+                local_path=local_path,
+                workload=workload.spec["name"],
+            )
+        )
+
+    return local_image_sources
+
+
 def load_workloads(
     container_tag: str,
     n_repeat: int = 1,
@@ -372,6 +466,7 @@ def load_workloads(
     model: Optional[str] = None,
     test_case: Optional[str] = None,
     container_image: Optional[str] = None,
+    workload_local_image_path: Optional[str] = None,
     record_checkpoints: Optional[str] = None,
     cadence: Optional[str] = None,
 ) -> List[dotdict]:
@@ -415,13 +510,20 @@ def load_workloads(
         return []
 
     for workload in list(workloads):
-        for build_workload in build_workloads:
-            if (
-                workload.spec["build"] == build_workload.spec["name"]
-            ) and build_workload not in workloads:
-                container_image = container_image or build_workload.spec["source"]["image"]
-                build_workload.spec["source"]["image"] = f"{container_image}:{container_tag}"
-                workloads.append(build_workload)
+        if workload_local_image_path is not None:
+            _apply_local_image_source(
+                workload=workload,
+                container_tag=container_tag,
+                workload_local_image_path=workload_local_image_path,
+            )
+        else:
+            for build_workload in build_workloads:
+                if (
+                    workload.spec["build"] == build_workload.spec["name"]
+                ) and build_workload not in workloads:
+                    container_image = container_image or build_workload.spec["source"]["image"]
+                    build_workload.spec["source"]["image"] = f"{container_image}:{container_tag}"
+                    workloads.append(build_workload)
 
         workload.spec["n_repeat"] = n_repeat
         workload.spec["time_limit"] = time_limit
