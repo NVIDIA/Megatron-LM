@@ -11,7 +11,7 @@ from transformer_engine.pytorch.fp8 import check_fp8_support
 
 from megatron.core import parallel_state
 from megatron.core.hyper_comm_grid import HyperCommGrid
-from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
+from megatron.core.inference.config import InferenceConfig, SSMInferenceStateConfig
 from megatron.core.inference.contexts import BaseInferenceContext, StaticInferenceContext
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.inference_request import DynamicInferenceRequest
@@ -504,7 +504,7 @@ class TestHybridWithDynamicInference:
         self.model.eval()
         config = self.model.config
 
-        mamba_inference_state_config = MambaInferenceStateConfig.from_model(self.model.module)
+        ssm_inference_state_config = SSMInferenceStateConfig.from_model(self.model.module)
 
         inference_context = DynamicInferenceContext(
             model_config=self.model.config,
@@ -513,7 +513,7 @@ class TestHybridWithDynamicInference:
                 buffer_size_gb=1.0,
                 block_size_tokens=256,
                 materialize_only_last_token_logits=False,
-                mamba_inference_state_config=mamba_inference_state_config,
+                ssm_inference_state_config=ssm_inference_state_config,
             ),
         )
 
