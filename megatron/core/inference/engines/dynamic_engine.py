@@ -1692,9 +1692,9 @@ class DynamicInferenceEngine(AbstractEngine):
         return None
 
     def _register_cg_wait(self, req) -> None:
-        """Track a deferred admission attempt and emit a starvation warning at the threshold.
+        """Track a deferred admission attempt and throw a starvation warning at the threshold.
 
-        Decode is bounded by the number of decode steps, so deferring is bounded in practice.
+        Decode is bounded by the number of decode steps.
         Persistent waits past `_cg_admission_warn_after` consecutive steps signal a problem.
         """
         req.cg_wait_iters += 1
