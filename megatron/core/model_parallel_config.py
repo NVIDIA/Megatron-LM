@@ -1,7 +1,8 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from dataclasses import dataclass
-from typing import Callable, ContextManager, Optional
+import warnings
+from dataclasses import dataclass, field
+from typing import Callable, ContextManager, Literal, Optional
 
 import torch
 
@@ -18,6 +19,11 @@ class ModelParallelConfig:
     ###################
     tensor_model_parallel_size: int = 1
     """Intra-layer model parallelism. Splits tensors across GPU ranks."""
+
+    pipeline_model_parallel_comm_backend: Optional[Literal["nccl", "ucc"]] = None
+    """Configuring backend option of pipeline parallel communication (e.g., nccl, ucc)
+       If None, the default backend will be used.
+    """
 
     pipeline_model_parallel_size: int = 1
     """Inter-layer model parallelism. Splits transformer layers across GPU ranks."""
@@ -39,25 +45,51 @@ class ModelParallelConfig:
     context_parallel_size: int = 1
     """Splits network input along sequence dimension across GPU ranks."""
 
+    hierarchical_context_parallel_sizes: Optional[list[int]] = None
+    """Degrees of the hierarchical context parallelism. Users should provide a list to specify 
+       the sizes for different levels. Taking the a2a+p2p cp comm type as example, it contains
+       groups of two levels, so the first value of the list indicates the group size of the a2a
+       communication type, and the second value indicates the group size of the p2p communication
+       type.
+    """
+
+    max_seqlen_per_dp_cp_rank: Optional[int] = None
+    """
+    Maximum sequence length per DPxCP rank. This is the maximum sequence length each rank
+    can handle without overflowing the memory. Typically, a good starting point is to set this
+    to maximum sequence length / context parallel size.
+    This is used to calculate the number and length of sub-samples assigned to 
+    each rank when using hybrid_context_parallel.
+    """
+
+    hybrid_context_parallel: bool = False
+    """
+    If true, enables hybrid context parallel. This is used to balance the workload of 
+    each CP rank when we use packed samples with variable sequence lengths.
+    Please set max_seqlen_per_dp_cp_rank when using hybrid_context_parallel.
+    """
+
     expert_model_parallel_size: int = 1
     """Distributes Moe Experts across sub data parallel dimension."""
 
-    moe_extended_tp: bool = False
-    """Alternative parallelization strategy for expert parallelism. Instead of distributing experts
-       across expert_model_parallel_size, each expert is sharded along extendended tensor parallel
-       domain (tensor_model_paralle_size * expert_model_parallel_size). It avoids the load balancing
-       problem with MOE training.
+    expert_tensor_parallel_size: Optional[int] = None
+    """Intra-layer tensor model parallelism for expert layer. Splits tensors across GPU ranks.
+       Default is None, which will be set to the value of tensor_model_parallel_size.
     """
 
     ###################
     # Initialization
     ###################
-    perform_initialization: bool = True
-    """If true, weights are initialized. This option can be useful when you know you are going to
+    perform_initialization: bool = field(
+        default=True, metadata={"argparse_meta": {"arg_names": ["--no-initialization"]}}
+    )
+    """Controls weights initialization. This option can be useful when you know you are going to
        load values from a checkpoint.
     """
 
-    use_cpu_initialization: bool = False
+    use_cpu_initialization: bool = field(
+        default=False, metadata={"argparse_meta": {"default": None}}
+    )
     """When set to False, we initialize the weights directly on the GPU. CPU initialization is the
        same regardless of tensor model parallelism, but GPU initialization is not. Transferring
        weights from CPU to GPU can take a significant amount of time for large models.
@@ -75,33 +107,39 @@ class ModelParallelConfig:
     params_dtype: torch.dtype = torch.float32
     """dtype used when intializing the weights."""
 
-    timers: Callable = None
+    timers: Optional[Callable] = None
     """Timers object to call for various timing functions. See megatron.core.timers.Timers"""
 
-    finalize_model_grads_func: Callable = None
+    finalize_model_grads_func: Optional[Callable] = None
     """Function that finalizes gradients on all workers. Could include ensuring that grads are
        all-reduced across data parallelism, pipeline parallelism, and sequence parallelism
        dimensions.
     """
 
-    grad_scale_func: Callable = None
+    grad_scale_func: Optional[Callable] = None
     """If using loss scaling, this function should take the loss and return the scaled loss. If
        None, no function is called on the loss.
     """
 
-    no_sync_func: Callable = None
+    mtp_grad_scale_func: Optional[Callable] = None
+    """If using loss scaling for MTP (Multi-Token Prediction), this function should return the
+       scalar or size-1 scale value for MTP loss. The value is converted to the output tensor
+       device. If None, falls back to grad_scale_func with torch.ones(1).
+    """
+
+    no_sync_func: Optional[Callable] = None
     """Function that creates a context that suppresses asynchronous data-parallel communication. If
        the model is an instance of core.distributed.DistributedDataParallel, the default is to use
        core.distributed.DistributedDataParallel.no_sync.
     """
 
-    grad_sync_func: Callable = None
+    grad_sync_func: Optional[Callable] = None
     """Function that launches asynchronous gradient reductions (e.g. distributed optimizer gradient
        reduce-scatters). The function should take one argument: an iterable of parameters whose
        gradients are to be synchronized.
     """
 
-    param_sync_func: Callable = None
+    param_sync_func: Optional[Callable] = None
     """Function that launches asynchronous parameter synchronizations (e.g. distributed optimizer
        parameter all-gathers). The function should take one argument: an iterable of parameters to
        be synchronized.
@@ -114,7 +152,7 @@ class ModelParallelConfig:
     enable_autocast: bool = False
     """If true runs the forward step function inside torch.autocast context."""
 
-    autocast_dtype: torch.dtype = None
+    autocast_dtype: Optional[torch.dtype] = None
     """dtype to pass to torch.amp.autocast when enabled. If None, is set to pipeline_dtype."""
 
     num_microbatches_with_partial_activation_checkpoints: Optional[int] = None
@@ -136,11 +174,11 @@ class ModelParallelConfig:
        must turn off gradient accumulation fusion.
     """
 
-    async_tensor_model_parallel_allreduce: bool = False
-    """NOTE: Deprecated. This flag is ignored."""
-
-    use_te_rng_tracker: bool = False
+    use_te_rng_tracker: bool = field(
+        default=False, metadata={"argparse_meta": {"arg_names": ["--te-rng-tracker"]}}
+    )
     """If true, uses RNG state tracker in TransformerEngine if exists.
+    Required for CUDA graphs support.
     """
 
     tp_comm_overlap: bool = False
@@ -150,22 +188,22 @@ class ModelParallelConfig:
     """
 
     tp_comm_bulk_wgrad: bool = True
-    """If true, allows All-Gather overlap with Bprop activation gradient GEMM. Don't care if
+    """Controls All-Gather overlap with Bprop activation gradient GEMM. Don't care if
        tp_comm_overlap is False.
     """
 
     tp_comm_bulk_dgrad: bool = True
-    """If true, allows Reduce-Scatter overlap with Bprop weight gradient GEMM. Don't care if
+    """Controls Reduce-Scatter overlap with Bprop weight gradient GEMM. Don't care if
        tp_comm_overlap is False.
     """
 
     tp_comm_overlap_ag: bool = True
-    """If true, allows All-Gather overlap with GEMM by pipelining the GEMM and All-Gather.
+    """Controls All-Gather overlap with GEMM by pipelining the GEMM and All-Gather.
        Don't care if tp_comm_overlap is False.
     """
 
     tp_comm_overlap_rs: bool = True
-    """If true, allows Reduce-Scatter overlap with GEMM by pipelining the GEMM and Reduce-Scatter.
+    """Controls Reduce-Scatter overlap with GEMM by pipelining the GEMM and Reduce-Scatter.
        Don't care if tp_comm_overlap is False.
     """
 
@@ -176,19 +214,19 @@ class ModelParallelConfig:
 
     tp_comm_split_ag: bool = True
     """Deprecated from TransformerEngine v1.6.0.
-       If true, allows All-Gather overlap with Fprop GEMM by pipelining the GEMM and All-Gather
+       Controls All-Gather overlap with Fprop GEMM by pipelining the GEMM and All-Gather
        splits. Don't care if tp_comm_overlap is False.
     """
 
     tp_comm_atomic_ag: bool = False
     """Deprecated from TransformerEngine v1.6.0.
-        If true, allows All-Gather overlap with Fprop GEMM by pipelining the GEMM and All-Gather both
-       done atomically. Don't care if tp_comm_overlap is False.
+       If true, allows All-Gather overlap with Fprop GEMM by pipelining the GEMM and All-Gather
+       both done atomically. Don't care if tp_comm_overlap is False.
     """
 
     tp_comm_split_rs: bool = True
     """Deprecated from TransformerEngine v1.6.0.
-       If true, allows Reduce-Scatter overlap with Fprop GEMM by pipelining the GEMM and
+       Controls Reduce-Scatter overlap with Fprop GEMM by pipelining the GEMM and
        Reduce-Scatter splits. Don't care if tp_comm_overlap is False.
     """
 
@@ -203,6 +241,11 @@ class ModelParallelConfig:
        Defaults to False.
     """
 
+    cross_entropy_fusion_impl: Literal['native', 'te'] = 'native'
+    """If 'native', MCore based CE loss fusion is used, if 'te', Parallel CE loss
+       from Transformer Engine library is used. Defaults to 'native'.
+    """
+
     tp_comm_overlap_disable_qkv: bool = False
     """
        If true, the AllGather -> Gemm overlap for QKV gets disabled
@@ -211,6 +254,39 @@ class ModelParallelConfig:
     tp_comm_overlap_disable_fc1: bool = False
     """
        If true, the AllGather -> Gemm overlap for FC1 layer of MLP gets disabled
+    """
+
+    tp_comm_bootstrap_backend: Literal['nccl', 'mpi', 'gloo'] = 'nccl'
+    """Set the bootstrapping backend of Tensor parallel communications."""
+
+    overlap_moe_expert_parallel_comm: bool = False
+    """Overlap EP A2A communications with independent computations of different micro-batches
+    in 1f1b phase of pipelining or non-pipelining schedule.
+    """
+
+    delay_wgrad_compute: bool = False
+    """Delay the weight gradient computation to improve batch-level communication overlapping"""
+
+    overlap_dispatch_backward_with_experts_wgrad: bool = False
+    """Delay the weight gradient computation for TE Grouped GEMM MoE experts.
+    When enabled with FSDP, the expert weight gradients are computed on a separate
+    CUDA stream after the data gradients finish, allowing overlap of wgrad compute
+    with EP A2A communication. The FSDP gradient reduce-scatter for
+    expert parameters is deferred until the delayed wgrad computation completes.
+    This requires transformer_engine with GroupedLinear support (TE >= 2.3.0).
+    """
+
+    ep_overlap_early_attn_memory_release: bool = False
+    """Enable early memory release of attention activations during EP overlap.
+    EP overlap can increase peak memory usage when the overlapped forward module allocates 
+    more memory than what is freed by the backward module. This flag addresses this by 
+    reordering the attention backward pass to occur earlier in the schedule.
+    Specifically:
+    - Without this flag: attn_bwd executes after moe_combine_fwd
+    - With this flag: attn_bwd executes before mlp_fwd
+    The earlier execution releases attention activations sooner, reducing peak memory.
+    Note: This may impact performance as moe_combine_fwd and moe_dispatch_bwd become 
+    exposed (not overlapped with other computation).
     """
 
     ###################
@@ -257,14 +333,43 @@ class ModelParallelConfig:
 
     wgrad_deferral_limit: int = 0
     """This value tunes the number of micro-batches for which the embedding weight gradient compute
-       needs to be deferred to pipeline flush, this argument is invalid if `defer_embedding_wgrad_compute` is False.
+       needs to be deferred to pipeline flush, this argument is invalid if
+       `defer_embedding_wgrad_compute` is False.
        Defaults to 0, which means all micro-batches are deferred.
     """
 
-    pipeline_model_parallel_split_rank: Optional[int] = None
-    """If int, rank where encoder and decoder should be split in cases where the model has both an
-       encoder and decoder (e.g., T5). Ignored if None.
+    overlap_p2p_comm_warmup_flush: bool = field(
+        default=False,
+        metadata={"argparse_meta": {"arg_names": ["--overlap-p2p-communication-warmup-flush"]}},
+    )
+    """If true, overlap communication and computation in warm up and flush phase.
+       Only valid when overlap_p2p_comm is True and batch_p2p_comm is False. 
+       Defaults to False.
     """
+
+    microbatch_group_size_per_vp_stage: Optional[int] = field(
+        default=None,
+        metadata={
+            "argparse_meta": {"arg_names": ["--microbatch-group-size-per-virtual-pipeline-stage"]}
+        },
+    )
+    """This value specifies the number of micro-batches that are executed 
+       at a time for a given virtual stage (both forward and backward).
+       Default (in __post_init__() method below) to pipeline_parallel_size 
+       which specifies a depth-first schedule.
+       Example: for PP=2 VP=2, when microbatch_group_size_per_vp_stage=2, 
+       num_microbatches = 4, we have 
+       rank 0 | 0 1 0 1 2 3 2 3
+       rank 1 |   0 1 0 1 2 3 2 3
+       When microbatch_group_size_per_vp_stage=3, num_microbatches = 5, 
+       we have
+       rank 0 | 0 1 2 0 1 2 3 4 3 4 
+       rank 1 |   0 1 2 0 1 2 3 4 3 4
+    """
+
+    mtp_standalone: bool = False
+    """This will be set automatically according to the pipeline layout, 
+    and will be set to True if MTP is in a separate vpp stage."""
 
     ###################
     # CPU Offloading
@@ -275,33 +380,50 @@ class ModelParallelConfig:
     cpu_offloading_num_layers: int = 0
     """Tells the number of transformer layers for which activations has to be offloaded."""
 
-    _cpu_offloading_context: ContextManager = (
-        None  # Used for internal use only, not to be set by the user. TODO: Need to move to the 'right' place when possible.
+    _cpu_offloading_context: Optional[ContextManager] = (
+        None
+        # Used for internal use only, not to be set by a user.
+        # TODO: Need to move to the 'right' place when possible.
     )
     """For internal use only, do not set."""
 
     cpu_offloading_activations: bool = True
     """If True, offloads the activations to CPU."""
 
-    cpu_offloading_weights: bool = True
+    cpu_offloading_weights: bool = False
     """If True, offloads the weights to CPU."""
+
+    cpu_offloading_double_buffering: bool = False
+    """If True, enables double buffering across layers while reloading activations from CPU."""
+
+    cpu_offloading_retain_pinned_cpu_buffers: bool = False
+    """If True, the pinned CPU buffers are retained after offloading and reused for the
+       next iteration. It is useful for cuda graphs capture.
+    """
 
     ###################
     # Timing
     ###################
-    barrier_with_L1_time: bool = True
-    """If true, use barrier with level 1 time measurements. It is up to the user to make sure
+    barrier_with_L1_time: bool = field(
+        default=True,
+        metadata={"argparse_meta": {"arg_names": ["--no-barrier-with-level-1-timing"]}},
+    )
+    """Controls barrier with level 1 time measurements. It is up to the user to make sure
        calling barrier with their timers will not result in hangs. This can happen if for example
        the user adds a level 1 timer that is not called by all ranks.
     """
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
-        See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more details.
+        See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
+        details.
         """
         if self.sequence_parallel:
             if self.tensor_model_parallel_size <= 1:
-                raise ValueError("Can not use sequence paralllelism without tensor parallelism")
+                raise ValueError("Cannot use sequence parallelism without tensor parallelism")
+
+        if self.expert_tensor_parallel_size is None:
+            self.expert_tensor_parallel_size = self.tensor_model_parallel_size
 
         if self.pipeline_model_parallel_size > 1:
             if self.pipeline_dtype is None:
@@ -311,6 +433,15 @@ class ModelParallelConfig:
 
         if self.autocast_dtype is None:
             self.autocast_dtype = self.params_dtype
+
+        if self.cross_entropy_loss_fusion and self.cross_entropy_fusion_impl == 'te':
+            warnings.warn(
+                "Transformer Engine cross entropy loss fusion has known stability issues. "
+                "Megatron-LM training args validation rejects this combination by default. "
+                "Use cross_entropy_fusion_impl='native', or disable cross_entropy_loss_fusion.",
+                UserWarning,
+                stacklevel=2,
+            )
 
         if self.defer_embedding_wgrad_compute and self.pipeline_model_parallel_size == 1:
             raise ValueError(
@@ -324,11 +455,22 @@ class ModelParallelConfig:
 
         if self.defer_embedding_wgrad_compute and self.wgrad_deferral_limit < 0:
             raise ValueError(
-                "Wgrad deferral limit should be greater than or equal to 0 when this optimization is enabled!"
+                "Wgrad deferral limit should be greater than or equal to 0 when it is enabled!"
             )
 
         if self.expert_model_parallel_size > 1 and self.tensor_model_parallel_size > 1:
             if self.sequence_parallel is False:
+                warnings.warn(
+                    "When using expert parallelism and tensor parallelism for training, "
+                    "sequence parallelism must be used"
+                )
+
+        if self.microbatch_group_size_per_vp_stage is None:
+            self.microbatch_group_size_per_vp_stage = self.pipeline_model_parallel_size
+
+        if self.overlap_p2p_comm_warmup_flush:
+            if not self.overlap_p2p_comm or self.batch_p2p_comm:
                 raise ValueError(
-                    "When using expert parallelism and tensor parallelism, sequence parallelism must be used"
+                    "Pipeline parallel communication overlapping in warmup and flush is only "
+                    "compatible with overlap_p2p_comm but not batch_p2p_comm."
                 )

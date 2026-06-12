@@ -4,7 +4,24 @@ build
 .coverage_*
 *.egg-info
 *~
+*.swp
 slurm*
 logs
 .vscode
 local/
+.gitmodules
+wandb/
+onelogger.log
+onelogger.err
+.venv
+runs/
+/test_cases/
+**/dist/
+
+# Sphinx documentation
+docs/_build
+docs/apidocs
+
+# Git worktrees
+.worktrees/
+.claude/worktrees/

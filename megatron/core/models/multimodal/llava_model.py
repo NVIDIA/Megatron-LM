@@ -1,20 +1,56 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 import logging
 from collections import namedtuple
 from functools import partial
-from typing import List
+from typing import List, Optional
 
 import torch
 
-from megatron.core import InferenceParams, parallel_state
+from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
+from megatron.core.extensions.transformer_engine import HAVE_TE
+from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.gpt import GPTModel
-from megatron.core.models.vision.clip_vit_model import CLIPViTModel
+from megatron.core.models.hybrid.hybrid_model import HybridModel
+from megatron.core.models.multimodal.context_parallel import (
+    gather_from_context_parallel_ranks_dynamic_res,
+    split_to_context_parallel_ranks_dynamic_res,
+)
+from megatron.core.models.vision.clip_vit_model import CLIPViTModel, get_num_image_embeddings
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
+from megatron.core.models.vision.radio import RADIOViTModel
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
+from megatron.core.transformer.attention import SelfAttentionSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import make_viewless_tensor
+from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
+from megatron.core.utils import deprecate_inference_params, is_te_min_version, log_single_rank
+
+if HAVE_TE:
+    from megatron.core.extensions.transformer_engine import TEDotProductAttention
+
+    try:
+        import transformer_engine_torch as tex
+
+        HAVE_TEX = True
+    except ImportError:
+        tex = None
+        HAVE_TEX = False
+else:
+    TEDotProductAttention = None
+    tex = None
+    HAVE_TEX = False
+
+
+IGNORE_INDEX = -100  # ID for labels that should be ignored.
+# Image token index can be tokenizer dependent so the default value does not work in all cases.
+DEFAULT_IMAGE_TOKEN_INDEX = -200
+DEFAULT_SOUND_TOKEN_INDEX = -300
+IMAGE_TOKEN = "<image>"
+VIDEO_TOKEN = "<video>"
+SOUND_TOKEN = "<so_embedding>"
 
 
 # Note: This is under development and may be missing features.
@@ -23,29 +59,39 @@ class LLaVAModel(MegatronModule):
 
     Args:
         language_transformer_config (TransformerConfig): Transformer config for the language model.
-        language_transformer_layer_spec (ModuleSpec): Specifies module to use for transformer layers of the language model.
+        language_transformer_layer_spec (ModuleSpec): Language model spec.
         language_vocab_size (int): Language model vocabulary size.
-        language_max_sequence_length (int): Language model maximum sequence length. This is used for positional embedding.
+        language_max_sequence_length (int): Language model maximum sequence length.
         vision_transformer_config (TransformerConfig): Transformer config for the vision model.
-        vision_transformer_layer_spec (ModuleSpec): Specifies module to use for transformer layers of the vision model.
-        drop_vision_class_token (bool): Drop vision class token(s) before input to the language model.
-        vision_projection_config (TransformerConfig): Config for the projection from vision model outputs to language model inputs.
-        vision_projection_layer_spec (ModuleSpec): Specifies the module to use for the vision projection.
-        vision_projection_type (str): Type of the vision projection to use. Default is a 2-layer MLP.
-        allow_missing_vision_projection_checkpoint (bool): Allow vision projection weights to be missing when loading a checkpoint. Default False.
-        parallel_output (bool): Do not gather the outputs, keep them split across tensor parallel ranks. This is typically True for training and False for inference.
-        language_position_embedding_type (str): Position embedding type to use in the language model. Default learned absolute.
-        language_rotary_percent (float): Percent of rotary dimension to use for rotary position embeddings in the language model. Defaults to 1.0.
-        pre_process (bool): Include the embedding layer in the gpt decoder (used with pipeline parallelism). Defaults to True.
-        post_process (bool): Include an output layer and a layernorm in the gpt decoder (used with pipeline parallelism). Defaults to True.
-        add_encoder (bool): Construct the encoder module (used with pipeline parallelism). Defaults to True. When we use pipelining, the encoder
-            will live on only a subset of the pipeline stages (specifically, only the first stage).
-        add_decoder (bool): Construct the decoder module (used with pipeline parallelism). Defaults to True. When we use pipelining, the decoder
-            will live on only a subset of the pipeline stages (specifically, every stage after the first one).
-        img_h (int): The height of each image that the ViT will see.
-        img_w (int): The width of each image that the ViT will see.
-        patch_dim (int): The size of each patch side.
-        img_embedding_idx (int): Index in the language_embeddings tensor where image_embeddings should be inserted. Defaults to 0.
+        vision_transformer_layer_spec (ModuleSpec): Vision model spec.
+        drop_vision_class_token (bool): Drop vision class token(s) before the language model.
+        vision_projection_config (TransformerConfig): Vision projection config.
+        vision_projection_layer_spec (ModuleSpec): Vision projection spec.
+        vision_projection_type (str): Type of the vision projection. Default: 2-layer MLP.
+        allow_missing_vision_projection_checkpoint (bool): Allow vision projection weights to be
+            missing when loading a checkpoint. Default False.
+        parallel_output (bool): Keep outputs split across tensor parallel ranks.
+            This is typically True for training and False for inference.
+        share_embeddings_and_output_weights (bool): Input embedding and output layer share weights.
+        language_position_embedding_type (str): Language model position embedding type.
+        language_rotary_percent (float): RoPE percent. Defaults to 1.0.
+        pre_process (bool): Include embedding layer in the decoder (used with pipeline parallel).
+        post_process (bool): Include output layer in the decoder (used with pipeline parallel).
+        add_encoder (bool): Construct the encoder (used with pipeline parallel).
+            When we use pipelining, the encoder will live on only the first stage
+        add_decoder (bool): Construct the decoder (used with pipeline parallel).
+            When we use pipelining, the decoder will live on every stage after the first one.
+        img_h (int): Input image height.
+        img_w (int): Input image width.
+        patch_dim (int): The size of each image patch side.
+        language_rotary_base (int): RoPE base.
+        language_rope_scaling (bool): Toggle RoPE scaling.
+        language_rope_scaling_factor (float): RoPE scaling factor. Defaults to 8.
+        image_token_index (int): Token ID for image token such as <image>.
+        pixel_shuffle (bool): Enable pixel shuffle.
+        tile_tags (list): Optional tile tags.
+        pg_collection (ProcessGroupCollection): Model communication process groups.
+        vp_stage (int): Virtual pipeline stage.
     """
 
     def __init__(
@@ -62,6 +108,7 @@ class LLaVAModel(MegatronModule):
         vision_projection_type: str = "mlp",
         allow_missing_vision_projection_checkpoint: bool = False,
         parallel_output: bool = True,
+        share_embeddings_and_output_weights: bool = False,
         language_position_embedding_type: str = 'learned_absolute',
         language_rotary_percent: float = 1.0,
         pre_process: bool = True,
@@ -72,67 +119,276 @@ class LLaVAModel(MegatronModule):
         img_w: int = 336,
         patch_dim: int = 14,
         language_rotary_base: int = 10000,
-        img_embedding_idx: int = 0,
+        language_rope_scaling: bool = False,
+        language_rope_scaling_factor: float = 8.0,
+        hybrid_layer_pattern: str = None,
+        fp16_lm_cross_entropy: bool = False,
+        image_token_index: int = DEFAULT_IMAGE_TOKEN_INDEX,
+        pixel_shuffle: bool = False,
+        tile_tags: Optional[list] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+        max_num_tiles: int = 0,
+        tokenizer_type: str = "",
+        vp_stage: Optional[int] = None,
+        use_vision_backbone_fp8_arch: bool = False,
+        dynamic_resolution: bool = False,
+        sound_model: Optional[torch.nn.Module] = None,
+        sound_projection: Optional[torch.nn.Module] = None,
+        sound_token_index: int = DEFAULT_SOUND_TOKEN_INDEX,
+        radio_force_eval_mode: bool = False,
+        radio_force_cpe_eval_mode: bool = False,
+        radio_interpolate_only_cpe: bool = False,
+        radio_cpe_aspect_ratio_select: bool = False,
+        radio_disable_cpe: bool = False,
+        temporal_patch_dim: int = 1,
+        separate_video_embedder: bool = False,
+        temporal_ckpt_compat: bool = False,
     ) -> None:
         super().__init__(config=language_transformer_config)
 
         if has_config_logger_enabled(language_transformer_config):
             log_config_to_disk(language_transformer_config, locals(), prefix=type(self).__name__)
 
-        logging.getLogger(__name__).warning(
-            "LLaVA model is under development and may be missing features."
+        log_single_rank(
+            logging.getLogger(__name__),
+            logging.WARNING,
+            "LLaVA is work in progress. Features are missing and methods can change.",
         )
 
         self.pre_process = pre_process
         self.post_process = post_process
         self.add_encoder = add_encoder
         self.add_decoder = add_decoder
-        self.img_embedding_idx = img_embedding_idx
+        self.vp_stage = vp_stage
 
         self.encoder_hidden_state = None
         self.vision_model = None
         self.vision_projection = None
         self.language_model = None
+        self.sound_model = sound_model
+        self.sound_projection = sound_projection
+        self.sound_token_index = sound_token_index
+        self.dynamic_resolution = dynamic_resolution
+        self.radio_force_eval_mode = radio_force_eval_mode
+        self.radio_force_cpe_eval_mode = radio_force_cpe_eval_mode
+        self.radio_interpolate_only_cpe = radio_interpolate_only_cpe
+        self.radio_cpe_aspect_ratio_select = radio_cpe_aspect_ratio_select
+        self.radio_disable_cpe = radio_disable_cpe
+        self.temporal_patch_dim = temporal_patch_dim
+        self.separate_video_embedder = separate_video_embedder
+        self.temporal_ckpt_compat = temporal_ckpt_compat
+
+        if pg_collection is None:
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        self.pg_collection = pg_collection
+
+        language_model_type = getattr(language_transformer_config, "language_model_type", "")
+        self.sequence_parallel_lm = language_transformer_config.sequence_parallel
+        self.tp_comm_overlap_lm = language_transformer_config.tp_comm_overlap
+        self.context_parallel_lm = language_transformer_config.context_parallel_size
+        if self.sequence_parallel_lm or self.context_parallel_lm > 1:
+            if not language_model_type.startswith(
+                'nemotron5-hybrid'
+            ) and not language_model_type.startswith('nemotron6-moe'):
+                assert isinstance(
+                    language_transformer_layer_spec.submodules, TransformerLayerSubmodules
+                )
+                assert isinstance(
+                    language_transformer_layer_spec.submodules.self_attention.submodules,
+                    SelfAttentionSubmodules,
+                )
+                attn_submodules = (
+                    language_transformer_layer_spec.submodules.self_attention.submodules
+                )
+                assert (
+                    attn_submodules.core_attention == TEDotProductAttention and HAVE_TE
+                ), "Sequence/Context Parallelism is supported only with TE DotProductAttention."
+            if self.context_parallel_lm > 1:
+                self.cp_group = self.pg_collection.cp
+                assert (
+                    self.cp_group.size() == self.context_parallel_lm
+                ), "CP Group size should match the Language Model CP size"
+                assert is_te_min_version(
+                    "1.10.0"
+                ), "Context Parallelism in LLaVA requires TE v1.10 or higher"
+            else:
+                self.cp_group = None
+        self.tensor_model_parallel_size_lm = language_transformer_config.tensor_model_parallel_size
 
         # This attribute is needed to check if an all-reduce is required
         # on the word embeddings inside `finalize_model_grads._allreduce_word_embedding_grads`.
-        self.share_embeddings_and_output_weights = False
+        self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
+
         if self.add_decoder:
-            self.language_model = GPTModel(
-                config=language_transformer_config,
-                transformer_layer_spec=language_transformer_layer_spec,
-                vocab_size=language_vocab_size,
-                max_sequence_length=language_max_sequence_length,
-                parallel_output=parallel_output,
-                position_embedding_type=language_position_embedding_type,
-                rotary_percent=language_rotary_percent,
-                pre_process=self.pre_process,
-                post_process=self.post_process,
-                rotary_base=language_rotary_base,
-            )
-            self.share_embeddings_and_output_weights = (
-                self.language_model.share_embeddings_and_output_weights
+            if language_model_type.startswith('nemotron5-hybrid') or language_model_type.startswith(
+                'nemotron6-moe'
+            ):
+                self.language_model = HybridModel(
+                    config=language_transformer_config,
+                    hybrid_stack_spec=language_transformer_layer_spec,
+                    vocab_size=language_vocab_size,
+                    max_sequence_length=language_max_sequence_length,
+                    parallel_output=parallel_output,
+                    position_embedding_type=language_position_embedding_type,
+                    pre_process=self.pre_process,
+                    hybrid_layer_pattern=hybrid_layer_pattern,
+                    post_process=self.post_process,
+                    rotary_percent=language_rotary_percent,
+                    rotary_base=language_rotary_base,
+                    fp16_lm_cross_entropy=fp16_lm_cross_entropy,
+                    scatter_embedding_sequence_parallel=False,
+                    share_embeddings_and_output_weights=share_embeddings_and_output_weights,
+                    pg_collection=self.pg_collection,
+                )
+            else:
+                self.language_model = GPTModel(
+                    config=language_transformer_config,
+                    transformer_layer_spec=language_transformer_layer_spec,
+                    vocab_size=language_vocab_size,
+                    max_sequence_length=language_max_sequence_length,
+                    parallel_output=parallel_output,
+                    position_embedding_type=language_position_embedding_type,
+                    rotary_percent=language_rotary_percent,
+                    pre_process=self.pre_process,
+                    post_process=self.post_process,
+                    rotary_base=language_rotary_base,
+                    rope_scaling=language_rope_scaling,
+                    rope_scaling_factor=language_rope_scaling_factor,
+                    scatter_embedding_sequence_parallel=False,
+                    share_embeddings_and_output_weights=share_embeddings_and_output_weights,
+                    pg_collection=self.pg_collection,
+                    vp_stage=self.vp_stage,
+                )
+
+            self._language_max_sequence_length = language_max_sequence_length
+            self._language_is_pipeline_parallel = (
+                language_transformer_config.pipeline_model_parallel_size > 1
             )
 
-        if self.add_encoder:
-            self.vision_model = CLIPViTModel(
-                vision_transformer_config,
-                vision_transformer_layer_spec,
-                img_h=img_h,
-                img_w=img_w,
-                patch_dim=patch_dim,
+            # Newer Transformer Engine versions add _extra_state keys in state_dict when using FP8.
+            # Older models may not have _extra_state and can be ignored.
+            self.language_model.register_load_state_dict_post_hook(
+                _load_state_dict_hook_ignore_extra_state
             )
+
+        class_token_len = 1
+        if self.add_encoder:
             self._drop_vision_class_token = drop_vision_class_token
+            add_class_token = True
+            if vision_transformer_config.vision_model_type.startswith(
+                ("clip", "siglip", "internvit")
+            ):
+                if vision_transformer_config.vision_model_type == "siglip":
+                    class_token_len = 0
+                    add_class_token = False
+                    error_msg = (
+                        "Siglip does not support vision class token, "
+                        "set disable-vision-class-token to False."
+                    )
+                    assert not self._drop_vision_class_token, error_msg
+                self.vision_model = CLIPViTModel(
+                    vision_transformer_config,
+                    vision_transformer_layer_spec,
+                    img_h=img_h,
+                    img_w=img_w,
+                    class_token_len=class_token_len,
+                    patch_dim=patch_dim,
+                    model_subtype=vision_transformer_config.vision_model_type,
+                    add_class_token=add_class_token,
+                    pg_collection=self.pg_collection,
+                    vp_stage=self.vp_stage,
+                )
+            elif vision_transformer_config.vision_model_type in ("radio", "radio-g", "cradio-g"):
+                # TODO: should refactor into model code itself?
+                max_img_h = 0
+                max_img_w = 0
+                embedder_bias = False
+                ln_post_impl = None
+                use_mask_token = False
+
+                if vision_transformer_config.vision_model_type == "radio":
+                    max_img_h = 2048
+                    max_img_w = 2048
+                elif vision_transformer_config.vision_model_type == "radio-g":
+                    max_img_h = 1792
+                    max_img_w = 1792
+                    embedder_bias = True
+                    from megatron.core.extensions.transformer_engine import TENorm
+
+                    ln_post_impl = TENorm
+                    use_mask_token = True
+                elif vision_transformer_config.vision_model_type == "cradio-g":
+                    max_img_h = 2048
+                    max_img_w = 2048
+
+                # Use config value if set (e.g. by provider), otherwise model-specific defaults
+                _default_ctl = {"radio": 8, "radio-g": 5, "cradio-g": 8}.get(
+                    vision_transformer_config.vision_model_type, 8
+                )
+                class_token_len = getattr(
+                    vision_transformer_config, "class_token_len", _default_ctl
+                )
+
+                if vision_transformer_config.fp8 or use_vision_backbone_fp8_arch:
+                    class_token_len = 32 if vision_transformer_config.fp8_recipe == "mxfp8" else 16
+
+                self.vision_model = RADIOViTModel(
+                    vision_transformer_config,
+                    vision_transformer_layer_spec,
+                    ln_post_impl=ln_post_impl,
+                    img_h=img_h,
+                    img_w=img_w,
+                    max_img_h=max_img_h,
+                    max_img_w=max_img_w,
+                    class_token_len=class_token_len,
+                    patch_dim=patch_dim,
+                    add_class_token=add_class_token,
+                    embedder_bias=embedder_bias,
+                    dynamic_resolution=dynamic_resolution,
+                    use_mask_token=use_mask_token,
+                    force_eval_mode=radio_force_eval_mode,
+                    force_cpe_eval_mode=radio_force_cpe_eval_mode,
+                    interpolate_only_cpe=radio_interpolate_only_cpe,
+                    cpe_aspect_ratio_select=radio_cpe_aspect_ratio_select,
+                    has_cpe=not radio_disable_cpe,
+                    temporal_patch_dim=temporal_patch_dim,
+                    separate_video_embedder=separate_video_embedder,
+                    temporal_ckpt_compat=temporal_ckpt_compat,
+                    pg_collection=self.pg_collection,
+                    vp_stage=self.vp_stage,
+                )
+            elif vision_transformer_config.vision_model_type.startswith("hf://"):
+                from megatron.core.models.huggingface.module import build_hf_model
+
+                self.vision_model = build_hf_model(
+                    vision_transformer_config, vision_transformer_config.vision_model_type
+                )
+            else:
+                raise ValueError(
+                    "Vision model "
+                    f"{vision_transformer_config.vision_model_type} is not "
+                    "supported."
+                )
+
+            self.vision_model.register_load_state_dict_post_hook(
+                _load_state_dict_hook_ignore_extra_state
+            )
+
+            vision_projection_input_size = vision_transformer_config.hidden_size
+            vision_projection_input_size *= 4 if pixel_shuffle else 1
+
             # Map (intermediate) vision model outputs to the language model input dimension.
             self.vision_projection = MultimodalProjector(
                 vision_projection_config,
                 vision_projection_layer_spec,
                 vision_projection_type,
-                vision_transformer_config.hidden_size,  # input size to the projection.
+                vision_projection_input_size,
+                tp_group=self.pg_collection.tp,
             )
-            # This allows ignoring missing weights for the vision projection during checkpoint loading.
-            # This should be disabled by default but can be enabled if your checkpoint contains pretrained
-            # vision and language models but not the projection from vision model outputs to language model inputs.
+            # Ignore missing weights for the vision projection during checkpoint loading.
+            # This should be disabled by default but can be enabled if your checkpoint contains
+            # pretrained vision and language models but not the projection from vision model
+            # outputs to language model inputs.
             if allow_missing_vision_projection_checkpoint:
                 vision_projection_param_names = [
                     f"vision_projection.{name}"
@@ -142,6 +398,28 @@ class LLaVAModel(MegatronModule):
                     partial(_load_state_dict_hook_ignore_param_names, vision_projection_param_names)
                 )
 
+            self.vision_projection.register_load_state_dict_post_hook(
+                _load_state_dict_hook_ignore_extra_state
+            )
+
+        self.img_seq_len = get_num_image_embeddings(
+            img_h,
+            img_w,
+            patch_dim,
+            vision_transformer_config.vision_model_type,
+            drop_vision_class_token,
+            class_token_len,
+            pixel_shuffle,
+            tile_tags is not None,  # Tile tags enabled/disabled.
+            max_num_tiles,
+            tokenizer_type,
+        )
+
+        self.image_token_index = image_token_index
+        self._pixel_shuffle = pixel_shuffle
+        self._tile_tags = tile_tags
+        self._max_num_tiles = max_num_tiles
+
     def shared_embedding_or_output_weight(self):
         """This is a convenience method to surface the language model's word embeddings, which is
         necessary for `finalize_model_grads._allreduce_word_embedding_grads`."""
@@ -150,6 +428,7 @@ class LLaVAModel(MegatronModule):
         return None
 
     def set_input_tensor(self, input_tensor) -> None:
+        """Set model chunk input tensor."""
         # This is usually handled in schedules.py but some inference code still
         # gives us non-lists or None
         if not isinstance(input_tensor, list):
@@ -166,16 +445,23 @@ class LLaVAModel(MegatronModule):
             self.language_model.set_input_tensor(input_tensor[0])
 
     def freeze(
-        self, freeze_language_model: bool, freeze_vision_model: bool, freeze_vision_projection: bool
+        self,
+        freeze_language_model: bool,
+        freeze_vision_model: bool,
+        freeze_vision_projection: bool,
+        freeze_sound_model: bool = False,
+        freeze_sound_projection: bool = False,
     ):
         """Freeze model modules.
 
-        Make specific modules non-trainable by setting requires_grad to False for the module's parameters.
+        Make specific modules non-trainable by setting requires_grad to False.
 
         Args:
             freeze_language_model (bool): Freeze the language model module.
             freeze_vision_model (bool): Freeze the vision model module.
             freeze_vision_projection (bool): Freeze the vision projection module.
+            freeze_sound_model (bool): Freeze the sound model module.
+            freeze_sound_projection (bool): Freeze the sound projection module.
         """
         modules = []
         if freeze_language_model and self.language_model is not None:
@@ -184,10 +470,462 @@ class LLaVAModel(MegatronModule):
             modules.append(self.vision_model)
         if freeze_vision_projection and self.vision_projection is not None:
             modules.append(self.vision_projection)
+        if freeze_sound_model and self.sound_model is not None:
+            modules.append(self.sound_model)
+        if freeze_sound_projection and self.sound_projection is not None:
+            modules.append(self.sound_projection)
 
         for module in modules:
             for param in module.parameters():
                 param.requires_grad = False
+
+    def _preprocess_data(
+        self,
+        image_embeddings,
+        language_embeddings,
+        input_ids,
+        loss_mask,
+        labels,
+        use_inference_kv_cache,
+        inference_context,
+        image_token_index,
+        num_image_tiles,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
+        is_packed_dynamic_res: bool = False,
+        sound_embeddings: Optional[torch.Tensor] = None,
+        sound_embeddings_len: Optional[torch.Tensor] = None,
+        sound_timestamps: Optional[torch.Tensor] = None,
+    ):
+        """Preprocess input data before input to language model.
+
+        This function is adopted from
+        https://github.com/huggingface/transformers/blob/85817d98fb60977c97e3014196a462b732d2ed1a/src/transformers/models/llava_next/modeling_llava_next.py#L409
+        for our input data conventions.
+
+        image_token_index = -200 indicates the image position in the input_ids = [0, 1, -200, 2, 3]
+        and labels = [1, -200, 2, 3, 4], for example.
+        We want to replace the image position (-200) with image_embeddings and return the following:
+        - final_embeddings = [0, 1, image_embeddings, 2, 3],
+        - final_labels = [1, -100, 2, 3, 4]
+        - final_loss_mask = [1, 0, 0, 1, 1]
+
+        This function handles samples without images (text-only sample). It also handles samples
+        with images that are split into multiples tiles.
+
+        If pipeline parallelism is not used, then self.pre_process and self.post_process
+        are both True and we update both input embeddings, labels and loss masks (if available).
+
+        If pipeline parallelism is used, then we do the following
+        - the first language model chunk has self.pre_process = True and
+          self.post_process = False. We update input embeddings.
+        - the middle language model chunk(s) has self.pre_process = False and
+          self.post_process = False. We don't need to update anything.
+        - the last language model chunk has self.pre_process = False and
+          self.post_process = True. We update labels and loss mask.
+
+        TODO: This function should adjust the attention mask too.
+        Currently, we assume the language model uses a causal mask.
+
+        Returns:
+            final_embedding (torch.Tensor): image and text embeddings [combined_seq_len, b, h] if
+                context_parallel_lm == 1 else [b, combined_seq_len, h].
+            final_labels (torch.Tensor): labels for image and text positions [b, combined_seq_len].
+            final_loss_mask (torch.Tensor): loss mask [b, combined_seq_len].
+        """
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        assert self.add_decoder, "input text preprocessing is only needed for the language model"
+
+        # No pre- or postprocessing needed.
+        # With pipeline parallel > 2, this means a chunk in the middle of the model.
+        if not self.pre_process and not self.post_process:
+            return None, None, None
+
+        # If using the inference KV cache, the image tokens are already computed.
+        if use_inference_kv_cache:
+            return language_embeddings, loss_mask, labels
+
+        # Packed dynamic-res path: each image's token count is in num_image_tiles (one entry
+        # per image) and there is exactly 1 embedding per "tile", so img_seq_len collapses to 1.
+        img_seq_len = 1 if is_packed_dynamic_res else self.img_seq_len
+        batch_size, text_seq_len = input_ids.shape
+
+        has_labels = labels is not None
+        if has_labels:
+            assert (
+                labels.shape == loss_mask.shape
+            ), f"mismatching labels shape {labels.shape} and loss mask shape {loss_mask.shape}"
+
+        # Create indices for new text and label positions.
+        with torch.no_grad():
+            image_token_mask = input_ids == image_token_index
+            num_images_per_sample = torch.sum(image_token_mask, dim=-1)
+
+            # Number of tiles per sample.
+            num_image_tiles_batch = num_image_tiles.split(num_images_per_sample.tolist(), dim=0)
+            num_image_tiles_batch = torch.tensor(
+                [x.sum() for x in num_image_tiles_batch], device=input_ids.device
+            )
+
+            # Sequence length for each sample is the image sequence length multiplied by
+            # the number of tiles for that image, minus image token indices,
+            # plus text sequence length.
+            seq_lens = num_image_tiles_batch * img_seq_len - num_images_per_sample + text_seq_len
+            max_seq_len = seq_lens.max()
+            # Pipeline parallel expects fixed input size. Check if we need to pad.
+            if (
+                self._language_is_pipeline_parallel
+                and max_seq_len < self._language_max_sequence_length
+                and inference_context is None
+            ):
+                max_seq_len = self._language_max_sequence_length
+
+            batch_indices, non_image_indices = torch.where(image_token_mask != True)
+
+            # New position ids for the text tokens, shifted by the image sequence length.
+            # E.g. for input_ids = [-200, 1, 2, 3] and img_seq_len = 576, we get
+            # new_position_ids = [576, 577, 578, 579]. text_position_ids are then [577, 578, 579].
+            image_token_mask_lens = image_token_mask.int().clone()
+            # -1 is for the removed image token index.
+            image_token_mask_lens[image_token_mask] = num_image_tiles * img_seq_len - 1
+            # +1 is needed here for the cumulative sum. -1 is adjusting for zero-based indexing.
+            new_position_ids = torch.cumsum((image_token_mask_lens + 1), dim=-1) - 1
+            text_position_ids = new_position_ids[batch_indices, non_image_indices]
+
+            label_batch_indices = None  # dummy value to pass formatting
+            # Labels are shifted to left by one.
+            # So, shift text position ids and non-image indices to left by one.
+            label_batch_indices = None
+            if has_labels:
+                label_text_position_ids = text_position_ids - 1
+                valid_label_text_position_ids = label_text_position_ids >= 0
+                label_text_position_ids = label_text_position_ids[valid_label_text_position_ids]
+
+                label_batch_indices = batch_indices[valid_label_text_position_ids]
+
+                label_non_image_indices = non_image_indices - 1
+                valid_label_non_image_indices = label_non_image_indices >= 0
+                label_non_image_indices = label_non_image_indices[valid_label_non_image_indices]
+
+            # Create a mask for the image embedding positions.
+            images_mask = torch.full(
+                (batch_size, max_seq_len), True, dtype=torch.bool, device=input_ids.device
+            )
+            # No images in the text positions.
+            images_mask[batch_indices, text_position_ids] = False
+            # Samples can have different amount of images tokens.
+            # new_position_ids[:, -1] gives the last text position id for each sample.
+            # Padding is needed when the number of image tokens differs.
+            first_padding_idx = new_position_ids[:, -1] + 1
+            images_mask[
+                torch.arange(max_seq_len, device=first_padding_idx.device).repeat(batch_size, 1)
+                >= first_padding_idx.unsqueeze(1)
+            ] = False
+
+        # Create the final input embedding (if this is the first language model stage).
+        final_embedding = None
+        if self.pre_process:
+            embed_dim = language_embeddings.shape[-1]
+            final_embedding = torch.zeros(
+                batch_size,
+                max_seq_len,
+                embed_dim,
+                dtype=language_embeddings.dtype,
+                device=language_embeddings.device,
+            )
+
+            # Put text embeddings to the text positions in the result tensor.
+            final_embedding[batch_indices, text_position_ids] = language_embeddings[
+                batch_indices, non_image_indices
+            ]
+
+            # Put image embeddings to image positions.
+            # NOTE: FSDP can hang with text-only samples so we use a workaround to run a dummy image
+            # through the vision model and then zero-out the impact of the output here.
+            if num_image_tiles.shape[0] == 0 and image_embeddings.shape[0] > 0:
+                assert images_mask.sum() == 0 and getattr(
+                    self.vision_model, "_is_fsdp_managed_module", False
+                ), "expected FSDP and dummy image"
+                final_embedding[:1, :1, :1] += 0 * image_embeddings[:1, :1, :1]
+            else:
+                final_embedding[images_mask] = (
+                    image_embeddings.permute(1, 0, 2).reshape(-1, embed_dim).contiguous()
+                )
+
+            # Replace sound token positions with sound embeddings.
+            if sound_embeddings is not None:
+                sound_mask = input_ids == self.sound_token_index
+                if sound_mask.any():
+                    sound_batch_indices, sound_token_indices = torch.where(sound_mask)
+                    sound_new_position_ids = new_position_ids[
+                        sound_batch_indices, sound_token_indices
+                    ]
+                    if self.sound_model is not None and getattr(
+                        getattr(self.sound_model, "config", None),
+                        "sound_pad_to_clip_duration",
+                        False,
+                    ):
+                        flat_sound = sound_embeddings.permute(1, 0, 2).reshape(-1, embed_dim)
+                    else:
+                        flat_sound = torch.cat(
+                            [
+                                se[:sel]
+                                for se, sel in zip(
+                                    sound_embeddings.permute(1, 0, 2), sound_embeddings_len
+                                )
+                            ],
+                            dim=0,
+                        )
+                    final_embedding[sound_batch_indices, sound_new_position_ids] = (
+                        flat_sound.reshape(-1, embed_dim)
+                    )
+
+        # Create the final labels and loss mask (if this is the last language model stage).
+        final_labels, final_loss_mask = None, None
+        if self.post_process and has_labels:
+            final_labels = torch.full(
+                (batch_size, max_seq_len), IGNORE_INDEX, dtype=labels.dtype, device=labels.device
+            )
+            final_loss_mask = torch.full(
+                (batch_size, max_seq_len), 0, dtype=loss_mask.dtype, device=loss_mask.device
+            )
+
+            # Put text labels and loss mask to the text positions.
+            final_labels[label_batch_indices, label_text_position_ids] = labels[
+                label_batch_indices, label_non_image_indices
+            ]
+
+            final_loss_mask[batch_indices, text_position_ids] = loss_mask[
+                batch_indices, non_image_indices
+            ]
+
+            # For labels, pick the last label index that got dropped by the shift to left.
+            label_extra_text_position_ids = seq_lens - 1
+            batch_range = torch.arange(len(label_extra_text_position_ids))
+            final_labels[batch_range, label_extra_text_position_ids] = labels[batch_range, -1]
+
+            # Loss mask the image positions.
+            final_loss_mask[images_mask] = 0
+
+            # Loss mask last text position just before an image
+            # so that text token does not need to predict the first image token.
+            batch_image_indices, image_indices = torch.where(image_token_mask)
+            # Indices just before image tokens. If it's -1, skip it.
+            before_image_indices = image_indices - 1
+            valid = before_image_indices >= 0
+            valid_batch_image_indices = batch_image_indices[valid]
+            valid_before_image_indices = before_image_indices[valid]
+            # Map those indices those position ids.
+            valid_before_image_indices = new_position_ids[
+                valid_batch_image_indices, valid_before_image_indices
+            ]
+
+            final_loss_mask[valid_batch_image_indices, valid_before_image_indices] = 0
+
+        if final_embedding is not None and final_labels is not None:
+            assert (
+                final_embedding.shape[:2] == final_labels.shape == final_loss_mask.shape
+            ), "unexpected shapes after data preprocessing"
+
+        if final_embedding is not None:
+            # Truncate if exceeding the language model's max sequence length.
+            if final_embedding.shape[1] > self._language_max_sequence_length:
+                final_embedding = final_embedding[:, : self._language_max_sequence_length]
+            # Transpose to [s,b,h] only if not using CP because CP Sharding expects seq in dim=1
+            if self.context_parallel_lm == 1:
+                final_embedding = final_embedding.transpose(1, 0).contiguous()
+
+        truncate_labels = (
+            final_labels is not None and final_labels.shape[1] > self._language_max_sequence_length
+        )
+        if truncate_labels:
+            final_labels = final_labels[:, : self._language_max_sequence_length]
+            final_loss_mask = final_loss_mask[:, : self._language_max_sequence_length]
+
+        return final_embedding, final_labels, final_loss_mask
+
+    def _process_embedding_token_parallel(
+        self, combined_embeddings, new_labels, new_loss_mask, packed_seq_params
+    ):
+        """Processes the input data for model parallelism support.
+
+        When using sequence parallelism (SP) or context parallelism (CP), the sequence is sharded
+        across different GPUs. This function performs the sharding and distributes the sequence
+        across GPUs for SP and CP
+
+        Context Parallelism is a feature that helps improve memory efficiency for
+        long sequence training by distributing sequence across CP ranks.
+        It requires token length to be divisible by (CP size *2) to ensure proper load balance.
+
+        Sequence Parallelism is a feature that helps improve memory efficiency for
+        long sequence training by distributing sequence across TP ranks.
+        It requires token length to be divisible by TP size.
+
+        Returns:
+            combined_embeddings (torch.Tensor): image and text embeddings combined and distributed.
+            new_labels (torch.Tensor): Distributed labels for image and text positions.
+            new_loss_mask (torch.Tensor): Distributed loss mask.
+            packed_seq_params (PackedSeqParams): Dict with padded token information.
+
+        """
+
+        # No pre or post processing needed with PP middle chunks.
+        if not self.pre_process and not self.post_process:
+            return combined_embeddings, new_labels, new_loss_mask, packed_seq_params
+
+        shard_factor = seq_dim = None
+        if self.pre_process:
+            if self.context_parallel_lm > 1 and self.sequence_parallel_lm:
+                shard_factor = self.tensor_model_parallel_size_lm * self.context_parallel_lm * 2
+                seq_dim = 1
+            elif self.context_parallel_lm > 1:
+                shard_factor = self.context_parallel_lm * 2
+                seq_dim = 1
+            elif self.sequence_parallel_lm:
+                shard_factor = self.tensor_model_parallel_size_lm
+                seq_dim = 0
+
+            # Pad combined sequence to be divisible by shard_factor.
+            # VLM combined embeddings (text + vision tokens) may not align naturally.
+            seq_len = combined_embeddings.shape[seq_dim]
+            remainder = seq_len % shard_factor
+            if remainder != 0:
+                pad_len = shard_factor - remainder
+                if seq_dim == 0:  # [seq, batch, hidden]
+                    pad_shape = (pad_len, *combined_embeddings.shape[1:])
+                    combined_embeddings = torch.cat(
+                        [
+                            combined_embeddings,
+                            torch.zeros(
+                                pad_shape,
+                                dtype=combined_embeddings.dtype,
+                                device=combined_embeddings.device,
+                            ),
+                        ],
+                        dim=0,
+                    )
+                    if new_labels is not None:
+                        new_labels = torch.nn.functional.pad(new_labels, (0, pad_len), value=-100)
+                    if new_loss_mask is not None:
+                        new_loss_mask = torch.nn.functional.pad(
+                            new_loss_mask, (0, pad_len), value=0
+                        )
+                else:  # [batch, seq, hidden]
+                    pad_shape = (
+                        combined_embeddings.shape[0],
+                        pad_len,
+                        *combined_embeddings.shape[2:],
+                    )
+                    combined_embeddings = torch.cat(
+                        [
+                            combined_embeddings,
+                            torch.zeros(
+                                pad_shape,
+                                dtype=combined_embeddings.dtype,
+                                device=combined_embeddings.device,
+                            ),
+                        ],
+                        dim=1,
+                    )
+                    if new_labels is not None:
+                        new_labels = torch.nn.functional.pad(new_labels, (0, pad_len), value=-100)
+                    if new_loss_mask is not None:
+                        new_loss_mask = torch.nn.functional.pad(
+                            new_loss_mask, (0, pad_len), value=0
+                        )
+
+            assert (
+                combined_embeddings.shape[seq_dim] % shard_factor == 0
+            ), f"Sequence length should be divisible by {shard_factor} for \
+                Sequence/Context parallelism"
+            if self.sequence_parallel_lm and self.tp_comm_overlap_lm:
+                assert (
+                    combined_embeddings.shape[seq_dim] == self._language_max_sequence_length
+                ), f"TP Comm overlap either requires Vision+Text token length \
+                == language_max_sequence_length"
+
+        if self.context_parallel_lm > 1:
+            batch = dict()
+            if self.pre_process:
+                batch["combined_embeddings"] = combined_embeddings
+            if self.post_process:
+                batch["new_labels"] = new_labels
+                batch["new_loss_mask"] = new_loss_mask
+            # Distribute sequence across CP ranks
+            if packed_seq_params is None or packed_seq_params.qkv_format == 'sbhd':
+                from megatron.core.parallel_state import get_context_parallel_group
+                from megatron.core.utils import get_batch_on_this_cp_rank
+
+                batch = get_batch_on_this_cp_rank(
+                    batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+                )
+            else:
+                assert HAVE_TEX and is_te_min_version(
+                    "1.10.0"
+                ), "Please update Transformer Engine to >= 1.10 to use \
+                    Context Parallel with THD format data"
+                index = tex.thd_get_partitioned_indices(
+                    packed_seq_params.cu_seqlens_q_padded,
+                    batch[next(iter(batch))].size(1),
+                    self.cp_group.size(),
+                    self.cp_group.rank(),
+                )
+                for key, data in batch.items():
+                    batch[key] = data.index_select(1, index)
+
+            if self.pre_process:
+                combined_embeddings = batch["combined_embeddings"]  # [B, S/CP, H]
+                combined_embeddings = combined_embeddings.transpose(
+                    1, 0
+                ).contiguous()  # [B,S/CP,H] -> [S/CP,B,H]
+            if self.post_process:
+                new_labels = batch["new_labels"]
+                new_loss_mask = batch["new_loss_mask"]
+
+        if self.sequence_parallel_lm and self.pre_process:
+            combined_embeddings = tensor_parallel.scatter_to_sequence_parallel_region(
+                combined_embeddings
+            )  # [S/(CP*TP),B,H]
+
+        return combined_embeddings, new_labels, new_loss_mask, packed_seq_params
+
+    def _apply_tile_tagging(self, image_embeddings, num_image_tiles):
+        """Apply tile tagging.
+
+        The image embeddings of multiple tiles are prepended with tile tags such as <tile_1>.
+        This implements the method used in NVLM https://arxiv.org/pdf/2409.11402.
+
+        Args:
+            image_embeddings (torch.Tensor): [img_seq_len, num_tiles, h_language].
+            num_image_tiles (torch.Tensor): Number of tiles for each input image [num_images].
+
+        Returns:
+            torch.Tensor: Tile tags prepended to image embeddings.
+                [tile_seq_len (=5) + img_seq_len, num_tiles, h_language]
+        """
+        assert (
+            num_image_tiles.shape[0] == 1 and len(num_image_tiles) == 1
+        ), "multiple input images are not supported yet."
+
+        num_tiles = num_image_tiles[0].item()
+        tile_tags = self._tile_tags[: num_tiles - 1] + [self._tile_tags[-1]]
+
+        # [num_tiles, tile_seq_len (=5)]
+        tile_tag_input_ids = torch.tensor(
+            tile_tags, dtype=torch.int64, device=num_image_tiles.device
+        )
+
+        # [tile_seq_len, num_tiles, h_language]
+        tile_tag_embeds = self.language_model.embedding(tile_tag_input_ids, position_ids=None)
+
+        # [num_tiles, dim] should be the same same
+        assert tile_tag_embeds.shape[1:] == image_embeddings.shape[1:]
+
+        image_embeddings = torch.cat([tile_tag_embeds, image_embeddings])
+
+        return image_embeddings  # [tile_seq_len + img_seq_len, num_tiles, h_language]
 
     def forward(
         self,
@@ -195,83 +933,349 @@ class LLaVAModel(MegatronModule):
         input_ids: torch.Tensor,
         position_ids: torch.Tensor,
         attention_mask: torch.Tensor,
-        labels: torch.Tensor = None,
-        inference_params: InferenceParams = None,
+        labels: Optional[torch.Tensor] = None,
+        loss_mask: Optional[torch.Tensor] = None,
+        inference_context: Optional[BaseInferenceContext] = None,
+        num_image_tiles: Optional[List[int]] = None,
+        image_token_index: Optional[int] = None,
+        runtime_gather_output: Optional[bool] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        vision_packed_seq_params: Optional[PackedSeqParams] = None,
+        sound_clips: Optional[torch.Tensor] = None,
+        sound_length: Optional[torch.Tensor] = None,
+        sound_timestamps: Optional[torch.Tensor] = None,
+        num_sound_clips: Optional[torch.Tensor] = None,
+        imgs_sizes: Optional[torch.Tensor] = None,
+        num_frames: Optional[List[int]] = None,
+        *,
+        inference_params: Optional[BaseInferenceContext] = None,
     ) -> torch.Tensor:
         """Forward function of the LLaVA model.
 
         Args:
-            images (torch.Tensor): input image of shape [batch, img_h, img_w].
+            images (torch.Tensor): input images of shape [num_tiles, img_h, img_w].
+                num_tiles means the number of image tiles in this batch.
+                num_tiles = 0 if the batch doesn't contain images.
             input_ids (torch.Tensor): input text ids [batch, text_seq_len].
             position_ids (torch.Tensor): input text position ids [batch, text_seq_len].
-            attention_mask (torch.Tensor): attention mask for the language model [batch, 1, combined_seq_len, combined_seq_len].
+            attention_mask (torch.Tensor): Language model attention mask
+                [batch, 1, 1, combined_seq_len]. NOTE: attention_mask is typically None and
+                attn_mask_type in layer specs determines the attention mask used.
             labels (torch.Tensor): Optional target text labels [batch, combined_seq_len].
-            inference_params (InferenceParams): Inference-time parameters including KV cache.
+            loss_mask (torch.Tensor): Text loss mask [batch, text_seq_len].
+            inference_context (BaseInferenceContext): Inference-time parameters including KV cache.
+            num_image_tiles (list of int): Number of tiles per image. Default 1 tile per image.
+            image_token_index (int): ID for input images. Default None means `image_token_index`
+                arg in the constructor will be used.
+            runtime_gather_output (bool): Gather output at runtime. Default None means
+                `parallel_output` arg in the constructor will be used.
+            packed_seq_params (PackedSeqParams): 1) If using sequence packing, must contain
+                subsample length information. 2) If using SP/CP with padding mask type,
+                must contain padded token information.
+
         Returns:
-            output (torch.Tensor): Loss of shape [b, s] if labels are provided, otherwise logits of shape [b, s, vocab_size].
+            output (torch.Tensor): Loss of shape [b, s] if labels are provided,
+                otherwise logits of shape [b, s, vocab_size].
+            loss_mask (torch.Tensor): Loss mask expanded to combined sequence length. Shape [b, s].
         """
-        use_inference_kv_cache = (
-            inference_params is not None
-            and "image_tokens_count" in inference_params.key_value_memory_dict
+
+        inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        use_inference_kv_cache = inference_context is not None and (
+            "image_tokens_count" in inference_context.key_value_memory_dict
+            or "sound_tokens_count" in inference_context.key_value_memory_dict
         )
-        # If running inference, we can skip image token computation if they were computed already earlier for this sample.
+        has_images = images is not None and images.shape[0] > 0
+        is_packed_dynamic_res = False
+
+        # If running inference, we can skip image token computation
+        # if they were computed already earlier for this sample.
         if use_inference_kv_cache:
             image_embeddings = None
-        elif self.add_encoder:
-            image_embeddings = self.vision_model(images)  # [b, img_seq_len, h_vision]
-            if self._drop_vision_class_token:
-                image_embeddings = image_embeddings[:, self.vision_model.class_token_len :, :]
-            # contiguous() call required as `permute` can sparsify the tensor and this breaks pipelining
+        elif self.add_encoder and not has_images:
+            # If no images provided, use an empty image embeddings tensor.
+            image_embeddings = torch.tensor([], dtype=images.dtype, device=images.device).reshape(
+                0, 0, 0
+            )
+        elif self.add_encoder and has_images:
+            use_temporal = (
+                self.temporal_patch_dim > 1 and imgs_sizes is not None and num_frames is not None
+            )
+            is_packed_dynamic_res = False
+            if use_temporal:
+                # CP-aware vision split: each rank processes only its share of
+                # frames/tubelets. Embeddings are gathered back to global shape
+                # below so that the text-token merge sees the full image set.
+                num_padded_imgs = 0
+                if self.context_parallel_lm > 1 and vision_packed_seq_params is not None:
+                    (
+                        images,
+                        imgs_sizes,
+                        vision_packed_seq_params,
+                        _has_pad_img,
+                        num_padded_imgs,
+                        local_num_frames,
+                    ) = split_to_context_parallel_ranks_dynamic_res(
+                        images,
+                        imgs_sizes,
+                        vision_packed_seq_params,
+                        fp8_enabled=False,
+                        fp8_recipe=getattr(self.config, "fp8_recipe", None),
+                        patch_dim=self.vision_model.patch_dim,
+                        num_frames=num_frames,
+                        temporal_patch_size=self.temporal_patch_dim,
+                    )
+                    if local_num_frames is not None:
+                        num_frames = local_num_frames
+
+                vision_out = self.vision_model(
+                    images,
+                    imgs_sizes=imgs_sizes,
+                    packed_seq_params=vision_packed_seq_params,
+                    num_frames=num_frames,
+                )
+                image_embeddings, post_imgs_sizes, post_num_frames = vision_out
+                # Split packed output back to per-tubelet chunks and stack.
+                # RADIO in dynamic-resolution mode with add_class_token=True interleaves
+                # class_token_len tokens before each image's patches, so per-chunk length
+                # is (patches + class_token_len) until we strip the class tokens below.
+                sizes_iter = (
+                    [tuple(sz) for sz in post_imgs_sizes.tolist()]
+                    if torch.is_tensor(post_imgs_sizes)
+                    else list(post_imgs_sizes)
+                )
+                patch_counts = [
+                    (h // self.vision_model.patch_dim) * (w // self.vision_model.patch_dim)
+                    for h, w in sizes_iter
+                ]
+                ct_len = (
+                    self.vision_model.class_token_len
+                    if getattr(self.vision_model, "add_class_token", False)
+                    else 0
+                )
+                seq_lens = [p + ct_len for p in patch_counts]
+                chunks = torch.split(image_embeddings.squeeze(0), seq_lens, dim=0)
+                if self._drop_vision_class_token and ct_len > 0:
+                    chunks = [c[ct_len:] for c in chunks]
+                image_embeddings = torch.stack(chunks)  # [num_tubelets, patches, h_vision]
+
+                # Gather per-rank tubelet embeddings back to the full set so the
+                # downstream text-token merge (which sees all image tokens) finds a
+                # matching number of tiles on every rank.
+                if self.context_parallel_lm > 1 and vision_packed_seq_params is not None:
+                    image_embeddings = gather_from_context_parallel_ranks_dynamic_res(
+                        image_embeddings, num_padded_imgs
+                    )
+
+                # After temporal grouping each tubelet is one "tile" for LLaVAModel's
+                # _preprocess_data; one entry per post-grouping image (images have 1 frame,
+                # videos contribute ceil(nf/T) tubelets).
+                num_image_tiles = torch.ones(
+                    image_embeddings.shape[0], dtype=torch.int, device=image_embeddings.device
+                )
+            else:
+                # Packed dynamic-resolution image path: imgs_sizes carries per-image
+                # (H, W) so RADIO returns a packed [1, sum(patches_i+ct_len), h_vision].
+                # We must split per-image, strip class tokens, pixel-shuffle each chunk
+                # with its own (ps_h, ps_w), then reassemble.
+                is_packed_dynamic_res = (
+                    imgs_sizes is not None
+                    and vision_packed_seq_params is not None
+                    and imgs_sizes.shape[0] > 0
+                )
+                if is_packed_dynamic_res:
+                    image_embeddings = self.vision_model(
+                        images, imgs_sizes=imgs_sizes, packed_seq_params=vision_packed_seq_params
+                    )  # [1, sum(patches_i + ct_len), h_vision]
+                    P = int(self.vision_model.patch_dim)
+                    sizes = (
+                        [tuple(sz) for sz in imgs_sizes.tolist()]
+                        if torch.is_tensor(imgs_sizes)
+                        else list(imgs_sizes)
+                    )
+                    patch_counts = [(int(h) // P) * (int(w) // P) for h, w in sizes]
+                    ct_len = (
+                        self.vision_model.class_token_len
+                        if getattr(self.vision_model, "add_class_token", False)
+                        else 0
+                    )
+                    seq_lens = [p + ct_len for p in patch_counts]
+                    chunks = torch.split(image_embeddings.squeeze(0), seq_lens, dim=0)
+                    if self._drop_vision_class_token and ct_len > 0:
+                        chunks = [c[ct_len:] for c in chunks]
+
+                    if self._pixel_shuffle:
+                        shuffled_chunks = []
+                        for chunk, (h, w) in zip(chunks, sizes):
+                            ps_h, ps_w = int(h) // P, int(w) // P
+                            chunk_b = chunk.unsqueeze(0)  # [1, patches_i, h_vision]
+                            shuffled = pixel_shuffle(chunk_b, h=ps_h, w=ps_w)
+                            shuffled_chunks.append(shuffled.squeeze(0))
+                        cat = torch.cat(shuffled_chunks, dim=0)
+                    else:
+                        cat = torch.cat(list(chunks), dim=0)
+                    image_embeddings = cat.unsqueeze(0).contiguous()
+                    _tile_counts = [p // 4 if self._pixel_shuffle else p for p in patch_counts]
+                    num_image_tiles = torch.tensor(
+                        _tile_counts, dtype=torch.int, device=image_embeddings.device
+                    )
+                else:
+                    if getattr(self, "dynamic_resolution", False) or imgs_sizes is not None:
+                        image_embeddings = self.vision_model(
+                            images,
+                            imgs_sizes=imgs_sizes,
+                            packed_seq_params=vision_packed_seq_params,
+                        )
+                    else:
+                        image_embeddings = self.vision_model(
+                            images
+                        )  # [num_tiles, img_seq_len, h_vision]
+                    if self._drop_vision_class_token:
+                        image_embeddings = image_embeddings[
+                            :, self.vision_model.class_token_len :, :
+                        ]
+
+            # Packed dynamic-res path already pixel-shuffled per-image above; skip outer call.
+            # For the single-image (non-packed) case pass h/w from imgs_sizes if available.
+            skip_outer_pixel_shuffle = (not use_temporal) and is_packed_dynamic_res
+            if self._pixel_shuffle and not skip_outer_pixel_shuffle:
+                ps_h = ps_w = None
+                if (
+                    imgs_sizes is not None
+                    and image_embeddings.shape[0] == 1
+                    and imgs_sizes.shape[0] == 1
+                ):
+                    H = int(imgs_sizes[0, 0].item())
+                    W = int(imgs_sizes[0, 1].item())
+                    P = int(self.vision_model.patch_dim)
+                    ps_h, ps_w = H // P, W // P
+                    if ps_h * ps_w != image_embeddings.shape[1]:
+                        ps_h = ps_w = None
+                image_embeddings = pixel_shuffle(
+                    image_embeddings, h=ps_h, w=ps_w
+                )  # [num_tiles, img_seq_len_shuffled, h_vision_shuffled]
+
+            # contiguous() required as `permute` can sparsify the tensor and this breaks pipelining
             image_embeddings = image_embeddings.permute(
                 1, 0, 2
-            ).contiguous()  # [img_seq_len, b, h_vision]
+            ).contiguous()  # [img_seq_len, num_tiles, h_vision]
+
             # map vision model output size to language model input size.
             image_embeddings = self.vision_projection(
                 image_embeddings
-            )  # [img_seq_len, b, h_vision]
+            )  # [img_seq_len, num_tiles, h_language]
 
-            # If running inference, the language model KV cache will be updated for image token positions.
-            # Here we store the image tokens sequence length, which can be used as an offset to the KV cache later.
-            if inference_params is not None:
-                inference_params.key_value_memory_dict["image_tokens_count"] = (
-                    image_embeddings.shape[0]
+            # Apply tile tagging if enabled and an image token is present.
+            if self._tile_tags is not None and torch.any(input_ids == self.image_token_index):
+                image_embeddings = self._apply_tile_tagging(image_embeddings, num_image_tiles)
+
+            # TODO: Support batched inference.
+            # In inference, the language model KV cache will be updated for image token positions.
+            # Store the image tokens sequence length to be used as an offset to the KV cache later.
+            if inference_context is not None:
+                inference_context.key_value_memory_dict["image_tokens_count"] = (
+                    image_embeddings.shape[0] * image_embeddings.shape[1]
                 )
         else:
             image_embeddings = self.encoder_hidden_state
 
-        if not self.add_decoder:
-            return image_embeddings
+        # Sound processing.
+        #
+        # The data path may pass a ``[1, 1]`` zero tensor as a "no sound this batch"
+        # sentinel (so the field is always a tensor, simplifying collation). Treat
+        # that sentinel as if ``sound_clips`` were ``None`` to avoid running the
+        # sound encoder on a dummy. The ``.item()`` call below is a deliberate
+        # CUDA sync but only runs in the sentinel-shaped case.
+        has_sounds = sound_clips is not None and sound_clips.numel() > 0
+        if has_sounds and sound_clips.shape == torch.Size([1, 1]):
+            has_sounds = sound_clips[0, 0].item() != 0
 
+        if use_inference_kv_cache:
+            sound_embeddings = None
+            sound_embeddings_len = None
+        elif self.add_encoder and not has_sounds:
+            if sound_clips is not None:
+                device = sound_clips.device
+                dtype = sound_clips.dtype
+            else:
+                device = torch.cuda.current_device()
+                dtype = torch.float32
+            sound_embeddings = torch.tensor([], dtype=dtype, device=device).reshape(0, 0, 0)
+            sound_embeddings_len = torch.tensor([], dtype=torch.long, device=device).reshape(0)
+        elif self.add_encoder and has_sounds:
+            sound_embeddings, sound_embeddings_len = self.sound_model(sound_clips, sound_length)
+            sound_embeddings = sound_embeddings.permute(1, 0, 2).contiguous()
+            sound_embeddings = self.sound_projection(sound_embeddings).contiguous()
+
+            if inference_context is not None:
+                inference_context.key_value_memory_dict["sound_tokens_count"] = (
+                    sound_embeddings.shape[1]
+                )
+        else:
+            sound_embeddings = self.encoder_hidden_state
+            sound_embeddings_len = None
+
+        if not self.add_decoder:
+            return image_embeddings, loss_mask
+
+        language_embeddings = None
         if self.pre_process:
+            input_ids_text = input_ids.clone()
+            input_ids_text[input_ids_text == self.image_token_index] = 0
+            # Note: This adds absolute position embedding but not RoPE.
+            # Each image is counted as one position.
+            # RoPE is added in language_model forward. Each image embedding is one position.
             language_embeddings = self.language_model.embedding(
-                input_ids=input_ids, position_ids=position_ids
+                input_ids=input_ids_text, position_ids=position_ids
             )  # [text_seq_len, b, h_language]
 
-            # If running inference, we can skip image token computation if they were computed already earlier for this sample.
-            if use_inference_kv_cache:
-                combined_embeddings = language_embeddings
-            else:
-                combined_embeddings = torch.cat(
-                    [
-                        language_embeddings[: self.img_embedding_idx],
-                        image_embeddings,
-                        language_embeddings[self.img_embedding_idx :],
-                    ],
-                    dim=0,
-                )  # [combined_seq_len, b, h_language]
-        else:
-            combined_embeddings = None
+            language_embeddings = language_embeddings.transpose(
+                1, 0
+            ).contiguous()  # [b, text_seq_len, h_language]
+
+        # Assume 1 tile per image if the number of tiles is not provided.
+        if num_image_tiles is None and images is not None:
+            num_image_tiles = torch.ones(images.shape[0], dtype=torch.int, device=input_ids.device)
+
+        # if context_parallel_lm == 1:
+        #   [combined_seq_len, b, h_language], [b, combined_seq_len], [b, combined_seq_len]
+        # else:
+        #   [b, combined_seq_len, h_language], [b, combined_seq_len], [b, combined_seq_len]
+        combined_embeddings, new_labels, new_loss_mask = self._preprocess_data(
+            image_embeddings,
+            language_embeddings,
+            input_ids,
+            loss_mask,
+            labels,
+            use_inference_kv_cache,
+            inference_context,
+            image_token_index if image_token_index is not None else self.image_token_index,
+            num_image_tiles,
+            is_packed_dynamic_res=is_packed_dynamic_res,
+            sound_embeddings=sound_embeddings,
+            sound_embeddings_len=sound_embeddings_len,
+            sound_timestamps=sound_timestamps,
+        )  # [combined_seq_len, b, h_language], [b, combined_seq_len], [b, combined_seq_len]
+
+        if self.context_parallel_lm > 1 or self.sequence_parallel_lm:
+            combined_embeddings, new_labels, new_loss_mask, packed_seq_params = (
+                self._process_embedding_token_parallel(
+                    combined_embeddings, new_labels, new_loss_mask, packed_seq_params
+                )
+            )
 
         output = self.language_model(
             input_ids=None,
             position_ids=None,
             attention_mask=attention_mask,
             decoder_input=combined_embeddings,
-            labels=labels,
-            inference_params=inference_params,
+            labels=new_labels,
+            inference_context=inference_context,
+            runtime_gather_output=runtime_gather_output,
+            packed_seq_params=packed_seq_params,
         )
 
-        return output
+        return output, new_loss_mask
 
 
 def _load_state_dict_hook_ignore_param_names(
@@ -281,14 +1285,14 @@ def _load_state_dict_hook_ignore_param_names(
 
     By default, this should not be used to avoid accidentally missing weights in checkpoint loading.
 
-    Example use case: Use this for the vision projection if you want to load a checkpoint that contains vision and language model weights
-    but not the vision projection weights.
+    Example use case: Use this if you want to load a checkpoint that contains vision and language
+    model weights but not the vision projection weights.
 
     Args:
-        param_names (list of str): Parameter names allowed to be missing when calling load_state_dict.
-        module (torch.nn.Module): The torch module this hook applies to. Unused here but required by the torch API.
-        incompatible_keys (namedtuple): Namedtuple with fields missing_keys and unexpected_keys, which collect the missing and unexpected
-            keys when calling load_state_dict on this torch module, respectively.
+        param_names (list str): Parameter names allowed to be missing when calling load_state_dict.
+        module (torch.nn.Module): The torch module this hook applies to. Required by the torch API.
+        incompatible_keys (namedtuple): Namedtuple with fields missing_keys and unexpected_keys,
+            which collect the missing and unexpected keys, respectively.
     """
     for param_name in param_names:
         if param_name in incompatible_keys.missing_keys:
@@ -296,3 +1300,67 @@ def _load_state_dict_hook_ignore_param_names(
                 f"{param_name} being removed from incompatible_keys.missing_keys in LlavaModel"
             )
             incompatible_keys.missing_keys.remove(param_name)
+
+
+def _load_state_dict_hook_ignore_extra_state(
+    module: torch.nn.Module, incompatible_keys: namedtuple
+):
+    """Hook to ignore Transformer Engine _extra_state used for FP8.
+
+    This is for backwards-compatibility. Newer TE versions add _extra_state keys to the state dict,
+    while older models might not have those keys. Those keys can be ignored when not using FP8.
+
+    Args:
+        module (torch.nn.Module): The torch module this hook applies to. Required by the torch API.
+        incompatible_keys (namedtuple): Namedtuple with fields missing_keys and unexpected_keys,
+            which collect the missing and unexpected keys, respectively.
+    """
+    for name, keys in incompatible_keys._asdict().items():
+        for key in keys[::-1]:
+            if "extra_state" in key:
+                logging.getLogger(__name__).warning(
+                    f"_extra_state key {key} being removed from {name}"
+                )
+                keys.remove(key)
+
+
+# pylint: disable-next=line-too-long
+# Based on https://github.com/OpenGVLab/InternVL/blob/c7c5af1a8930b4862afe8ed14672307082ef61fa/internvl_chat/internvl/model/internvl_chat/modeling_internvl_chat.py#L218
+# Copyright (c) 2023 OpenGVLab.
+def pixel_shuffle(x, scale_factor=0.5, version=2, h=None, w=None):
+    """Pixel shuffle based on InternVL but adapted for our use case.
+
+    Args:
+        x (torch.Tensor): Vision model outputs [num_tiles, img_seq_len, h_vision]
+        version (int): Implementation version.
+        h (int, optional): Height in patches for non-square grids.
+        w (int, optional): Width in patches for non-square grids.
+
+    Returns:
+        Shuffled vision model outputs [num_tiles, (sq ** 2) * (scale ** 2), h_vision / (scale ** 2)]
+    """
+    if h is not None or w is not None:
+        assert h is not None and w is not None, "h and w must both be provided"
+        assert h * w == x.shape[1], f"h*w ({h}*{w}={h*w}) must equal patches ({x.shape[1]})"
+        r = int(1 / scale_factor)
+        n, patches, c = x.shape
+        return x.reshape(n, patches // (r * r), c * r * r)
+    h = w = int(x.shape[1] ** 0.5)  # sq
+    x = x.reshape(x.shape[0], h, w, -1)  # [num_tiles, sq, sq, h_vision]
+
+    n, w, h, c = x.size()
+    # N, W, H, C --> N, W, H * scale, C // scale
+    x = x.view(n, w, int(h * scale_factor), int(c / scale_factor))
+    # N, W, H * scale, C // scale --> N, H * scale, W, C // scale
+    x = x.permute(0, 2, 1, 3).contiguous()
+    # N, H * scale, W, C // scale --> N, H * scale, W * scale, C // (scale ** 2)
+    x = x.view(
+        n, int(h * scale_factor), int(w * scale_factor), int(c / (scale_factor * scale_factor))
+    )
+
+    if version == 2:
+        x = x.permute(0, 2, 1, 3).contiguous()
+
+    x = x.reshape(x.shape[0], -1, x.shape[-1])
+
+    return x

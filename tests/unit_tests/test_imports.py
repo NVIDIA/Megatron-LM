@@ -81,8 +81,7 @@ def _test_domain_module_imports(module, subdomains: list):
 
     if error is None:
         for imp in dir(module):
-            class_, result, error = _get_class_from_path(
-                subdomains, imp)
+            class_, result, error = _get_class_from_path(subdomains, imp)
 
             if result is not None:
                 module_list.append(class_)
@@ -99,7 +98,8 @@ def _test_domain_module_imports(module, subdomains: list):
     print()
     for module in failed_list:
         print(
-            "Module did not match a valid signature of Megatron core Model (hence ignored):", module)
+            "Module did not match a valid signature of Megatron core Model (hence ignored):", module
+        )
 
     print()
     if len(error_list) > 0:
@@ -125,29 +125,21 @@ def _test_domain_module_imports(module, subdomains: list):
 def test_domain_mcore():
     import megatron.core as mcore
 
-    all_passed = _test_domain_module_imports(
-        mcore,  subdomains=['models'])
+    all_passed = _test_domain_module_imports(mcore, subdomains=['models'])
 
-    all_passed = _test_domain_module_imports(
-        mcore,  subdomains=['pipeline_parallel'])
+    all_passed = _test_domain_module_imports(mcore, subdomains=['pipeline_parallel'])
 
-    all_passed = _test_domain_module_imports(
-        mcore,  subdomains=['tensor_parallel'])
+    all_passed = _test_domain_module_imports(mcore, subdomains=['tensor_parallel'])
 
-    all_passed = _test_domain_module_imports(
-        mcore,  subdomains=['transformer'])
+    all_passed = _test_domain_module_imports(mcore, subdomains=['transformer'])
 
-    all_passed = _test_domain_module_imports(
-        mcore,  subdomains=['fusions'])
+    all_passed = _test_domain_module_imports(mcore, subdomains=['fusions'])
 
-    all_passed = _test_domain_module_imports(
-        mcore,  subdomains=['distributed'])
+    all_passed = _test_domain_module_imports(mcore, subdomains=['distributed'])
 
-    all_passed = _test_domain_module_imports(
-        mcore,  subdomains=['datasets'])
+    all_passed = _test_domain_module_imports(mcore, subdomains=['datasets'])
 
-    all_passed = _test_domain_module_imports(
-        mcore,  subdomains=['dist_checkpointing'])
+    all_passed = _test_domain_module_imports(mcore, subdomains=['dist_checkpointing'])
 
     if not all_passed:
         exit(1)

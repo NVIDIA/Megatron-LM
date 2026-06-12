@@ -19,6 +19,10 @@ FINETUNE_DIR=${OUTPUT}/checkpoints
 LOGS_DIR="${OUTPUT}/logs"
 TENSORBOARD_DIR="${OUTPUT}/tensorboard"
 
+export TRITON_CACHE_DIR="${WORKSPACE}/triton-cache/"
+# The following patch to the Triton cache manager is needed for Triton version <= 3.1
+export TRITON_CACHE_MANAGER="megatron.core.ssm.triton_cache_manager:ParallelFileCacheManager"
+
 if [[ -z $LOAD_NAME ]]; then
     echo "Please set LOAD_NAME for input model name."
     exit 1
@@ -29,15 +33,9 @@ if [[ -z $LOAD_ITER ]]; then
     exit 1
 fi
 
-if [[ -z $TOKENIZER_MODEL ]]; then
-    echo "Please set TOKENIZER_MODEL for tokenizer model name."
-    exit 1
-fi
-
 CHECKPOINT_DIR="${WORKSPACE}/${LOAD_NAME}/checkpoints"
 
 DATA_TRAIN="${SOURCE}/examples/multimodal/sft_dataset.yaml"
-DATA_VALID="${SOURCE}/examples/multimodal/sft_dataset.yaml"
 
 DEBUG=0
 if [[ $DEBUG -eq 1 ]]; then
@@ -57,7 +55,6 @@ else
 fi
 
 OPTIONS=" \
-    --img-embedding-idx 1 \
     --apply-layernorm-1p \
     --attention-softmax-in-fp32 \
     --use-checkpoint-args \
@@ -84,7 +81,8 @@ OPTIONS=" \
     --num-layers 32 \
     --hidden-size 4096 \
     --num-attention-heads 32 \
-    --seq-length 2048 \
+    --seq-length 576 \
+    --decoder-seq-length 2048 \
     --max-position-embeddings 4096 \
     --ffn-hidden-size 14336 \
     --train-iters 20000 \
@@ -98,10 +96,10 @@ OPTIONS=" \
     --log-interval ${LI} \
     --eval-iters 10 \
     --eval-interval 500 \
-    --tokenizer-type MistralTokenizer \
-    --tokenizer-model ${WORKSPACE}/${TOKENIZER_MODEL} \
+    --tokenizer-type MultimodalTokenizer \
+    --tokenizer-model mistralai/Mistral-7B-Instruct-v0.3 \
+    --tokenizer-prompt-format mistral \
     --data-path ${DATA_TRAIN} \
-    --valid-path ${DATA_VALID} \
     --prompt-path ${SOURCE}/examples/multimodal/manual_prompts.json \
     --save-interval 500 \
     --save ${FINETUNE_DIR} \
@@ -127,6 +125,7 @@ OPTIONS=" \
     --disable-vision-class-token \
     ${EXTRA_ARGS} \
     --distributed-timeout-minutes 60 \
+    --ckpt-format torch
 "
 
 export NVTE_APPLY_QK_LAYER_SCALING=0

@@ -8,7 +8,7 @@
 
 set -euxo pipefail
 
-echo "------ARGUMENTS LIST --------"
+set +x
 for ARGUMENT in "$@"; do
     KEY=$(echo $ARGUMENT | cut -f1 -d=)
 
@@ -18,7 +18,7 @@ for ARGUMENT in "$@"; do
     export "$KEY"="$VALUE"
     echo "$KEY=$VALUE"
 done
-echo "---------------------------------"
+set -x
 
 # Check that mandatory vars are set
 MANDATORY_VARS=(
@@ -26,8 +26,11 @@ MANDATORY_VARS=(
     "TRAINING_PARAMS_PATH"
     "OUTPUT_PATH"
     "TENSORBOARD_PATH"
-    "CHECKPOINT_PATH"
+    "CHECKPOINT_SAVE_PATH"
+    "CHECKPOINT_LOAD_PATH"
     "DATA_PATH"
+    "RUN_NUMBER"
+    "REPEAT"
 )
 for mandatory_var in "${MANDATORY_VARS[@]}"; do
     if [[ -z "${!mandatory_var}" ]]; then
@@ -36,26 +39,25 @@ for mandatory_var in "${MANDATORY_VARS[@]}"; do
     fi
 done
 
+export NCCL_PROTO="${NCCL_PROTO:-simple}"
+export NCCL_ALGO="${NCCL_ALGO:-Ring}"
+export NCCL_COLLNET_ENABLE="${NCCL_COLLNET_ENABLE:-0}"
+export NCCL_NVLS_ENABLE="${NCCL_NVLS_ENABLE:-0}"
+# Disable the EFA tuner plugin so NCCL_ALGO/NCCL_PROTO are actually respected instead of being overridden at runtime.
+export NCCL_TUNER_PLUGIN="${NCCL_TUNER_PLUGIN:-}"
+# Match the NCCL default (4 MB) so buffer-chunking behaviour is the same as on Slurm nodes.
+export NCCL_BUFFSIZE="${NCCL_BUFFSIZE:-4194304}"
+export TORCH_NCCL_AVOID_RECORD_STREAMS="${TORCH_NCCL_AVOID_RECORD_STREAMS:-1}"
+
+set +x
 # Envsubst model_params
-cat $TRAINING_PARAMS_PATH | envsubst >$TRAINING_PARAMS_PATH.tmp
-mv $TRAINING_PARAMS_PATH.tmp $TRAINING_PARAMS_PATH
-
-# Exit earlier to leave time for properly saving checkpoint
-PARAMS="--exit-duration-in-mins $((($SLURM_JOB_END_TIME - $SLURM_JOB_START_TIME) / 60 - 15))"
-
-# Run before script
-SCRIPT=$(cat $TRAINING_PARAMS_PATH | yq .'BEFORE_SCRIPT')
-if [[ "$SCRIPT" != null ]]; then
-    eval "$SCRIPT"
-fi;
-
-# Extract training params
-TRAINING_PARAMS_FROM_CONFIG=$(yq '... comments="" | .MODEL_ARGS | to_entries | .[] | with(select(.value == "true"); .value = "") | [.key + " " + .value] | join("")' $TRAINING_PARAMS_PATH | tr '\n' ' ')
-PARAMS="$PARAMS $TRAINING_PARAMS_FROM_CONFIG"
+cat $TRAINING_PARAMS_PATH | envsubst "$(env | cut -d= -f1 | sed -e 's/^/$/')" >$TRAINING_PARAMS_PATH.tmp
+TRAINING_PARAMS_PATH="$TRAINING_PARAMS_PATH.tmp"
+set -x
 
 # Pull env vars to export
-ENV_VARS=$(yq '... comments="" | .ENV_VARS | to_entries | .[] | [.key + "=" + .value] | join(" ")' $TRAINING_PARAMS_PATH)
-for ARGUMENT in $ENV_VARS; do
+ENV_VARS=$(/usr/local/bin/yq '... comments="" | .ENV_VARS | to_entries | .[] | [.key + "=" + .value] | join(" ")' "$TRAINING_PARAMS_PATH")
+while IFS= read -r ARGUMENT; do
     KEY=$(echo $ARGUMENT | cut -f1 -d=)
 
     KEY_LENGTH=${#KEY}
@@ -63,27 +65,178 @@ for ARGUMENT in $ENV_VARS; do
 
     export "$KEY"="$VALUE"
     echo "$KEY=$VALUE"
-done
+done <<<"$ENV_VARS"
+
+# Run before script
+BEFORE_SCRIPT=$(cat "$TRAINING_PARAMS_PATH" | /usr/local/bin/yq '.BEFORE_SCRIPT')
+if [[ "$BEFORE_SCRIPT" != null ]]; then
+    eval "$BEFORE_SCRIPT"
+fi
+
+# Exit earlier to leave time for properly saving checkpoint
+if [[ "$IS_NEMO_TEST" == "true" ]]; then
+    PARAMS=()
+    # Store the output in a variable first
+    TRAINING_PARAMS_STR=$(/usr/local/bin/yq '... comments="" | .MODEL_ARGS | to_entries | .[] | with(select(.value == true); .value = "true") | .key + "=" + (select(.value != "") | .value | tostring)' "$TRAINING_PARAMS_PATH")
+    # Build space-separated string while preserving quotes
+    TRAINING_PARAMS_FROM_CONFIG=""
+    while IFS= read -r line; do
+        if [[ -n "$line" ]]; then
+            # If value is "true", just use the key
+            if [[ "$line" =~ =true$ ]]; then
+                TRAINING_PARAMS_FROM_CONFIG+="${line%=true} "
+            # If value contains spaces, wrap it in quotes
+            elif [[ "$line" =~ .*=.*[[:space:]].* ]]; then
+                key="${line%%=*}"
+                value="${line#*=}"
+                TRAINING_PARAMS_FROM_CONFIG+="$key=\"$value\" "
+            else
+                TRAINING_PARAMS_FROM_CONFIG+="$line "
+            fi
+        fi
+    done <<<"$TRAINING_PARAMS_STR"
+    # Remove trailing space
+    TRAINING_PARAMS_FROM_CONFIG=${TRAINING_PARAMS_FROM_CONFIG% }
+    # Split into array while preserving quotes
+    eval "TRAINING_PARAMS_ARRAY=($TRAINING_PARAMS_FROM_CONFIG)"
+
+else
+    # If this is a second run (of checkpoint-resume), we might want to use a
+    # different model configuration than during first time. So if key `MODEL_ARGS_2`
+    # exists we use it, otherwise we use the same as for the first run.
+    if [[ $RUN_NUMBER -gt 1 && $(/usr/local/bin/yq 'has("MODEL_ARGS_'$RUN_NUMBER'")' "$TRAINING_PARAMS_PATH") == true ]]; then
+        export KEY="MODEL_ARGS_$RUN_NUMBER"
+    else
+        export KEY="MODEL_ARGS"
+    fi
+
+    # Store the output in a variable first
+    TRAINING_PARAMS_STR=$(/usr/local/bin/yq 'explode(.) | ... comments="" | .[env(KEY)] | to_entries | .[] | with(select(.value == true); .value = "true") | .key + ": " + (select(.value != "") | .value | tostring)' "$TRAINING_PARAMS_PATH")
+    # Build space-separated string while preserving quotes
+    TRAINING_PARAMS_FROM_CONFIG=""
+    while IFS= read -r line; do
+        if [[ -n "$line" ]]; then
+
+            key="${line%%:*}"
+            value="${line#*: }"
+            value="$(echo "$value" | xargs)" # trim whitespace
+            # Case: true
+            if [[ "$value" == "true" ]]; then
+                TRAINING_PARAMS_FROM_CONFIG+="${key} "
+
+            # Case: value is wrapped in ( )
+            elif echo "$value" | grep -Eq '^\([^)]+\)$'; then
+                TRAINING_PARAMS_FROM_CONFIG+="$key \"$value\" "
+
+            # Case: value is wrapped in [ ]
+            elif echo "$value" | grep -Eq '^\[[^]]+\]$'; then
+                # Strip square brackets from value using sed
+                value=$(echo "$value" | sed 's/^\[//;s/\]$//')
+                TRAINING_PARAMS_FROM_CONFIG+="$key $value "
+
+            # Case: contains spaces or shell metacharacters
+            elif [[ "$value" == *" "* || "$value" == *"|"* || "$value" == *"("* || "$value" == *")"* ]]; then
+                TRAINING_PARAMS_FROM_CONFIG+="$key \"$value\" "
+            # Case: default
+            else
+                TRAINING_PARAMS_FROM_CONFIG+="$key $value "
+            fi
+        fi
+    done <<<"$TRAINING_PARAMS_STR"
+    # Remove trailing space
+    TRAINING_PARAMS_FROM_CONFIG=${TRAINING_PARAMS_FROM_CONFIG% }
+    # Split into array while preserving quotes
+    eval "TRAINING_PARAMS_ARRAY=($TRAINING_PARAMS_FROM_CONFIG)"
+    if [[ -n "${SLURM_JOB_END_TIME:-}" && -n "${SLURM_JOB_START_TIME:-}" ]]; then
+        # Leave a buffer before SLURM kills the job so training can exit
+        # gracefully. For normal (long) windows this is window - 15 min. For
+        # short windows (e.g. L0-smoke with a tight --time-limit) a flat 15 min
+        # buffer would go negative and make training exit after a single step,
+        # so fall back to 80% of the window with a 1-minute floor.
+        WINDOW_MIN=$((($SLURM_JOB_END_TIME - $SLURM_JOB_START_TIME) / 60))
+        BUFFER_MIN=15
+        if ((WINDOW_MIN > BUFFER_MIN)); then
+            EXIT_DURATION_MIN=$((WINDOW_MIN - BUFFER_MIN))
+        else
+            EXIT_DURATION_MIN=$((WINDOW_MIN * 4 / 5))
+            ((EXIT_DURATION_MIN < 1)) && EXIT_DURATION_MIN=1
+        fi
+        PARAMS=(
+            "--exit-duration-in-mins"
+            "$EXIT_DURATION_MIN"
+        )
+    fi
+fi
+
+# Extract training params
+PARAMS=("${PARAMS[@]}" "${TRAINING_PARAMS_ARRAY[@]}")
 
 # Set PYTHONPATH
 export PYTHONPATH="$(pwd):${PYTHONPATH:-}"
+set +x
 export WANDB_API_KEY="${WANDB_API_KEY:-}"
+set -x
 
 ######## Distributed training settings. ########
 echo "------ARGUMENTS for SLURM ---"
 MASTER_ADDR=${MASTER_ADDR:-localhost}
 MASTER_PORT=${MASTER_PORT:-6000}
-NUM_NODES=${NUM_NODES:-${SLURM_NNODES}}
+NUM_NODES=${NUM_NODES:-${SLURM_NNODES:-1}}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
-NODE_RANK=${SLURM_NODEID:-${SLURM_NODEID}}
+NODE_RANK=${SLURM_NODEID:-${NODE_RANK:-0}}
+LAST_RANK=$((GPUS_PER_NODE - 1))
+export LOG_DIR=$OUTPUT_PATH/logs/$REPEAT
+mkdir -p $LOG_DIR
+
+# Read launcher type from model config (default: torchrun)
+LAUNCHER=$(/usr/local/bin/yq '.LAUNCHER // "torchrun"' "$TRAINING_PARAMS_PATH")
+
 DISTRIBUTED_ARGS=(
     --nproc_per_node $GPUS_PER_NODE
     --nnodes $NUM_NODES
     --master_addr $MASTER_ADDR
     --master_port $MASTER_PORT
-    --node_rank $SLURM_NODEID
+    --node_rank $NODE_RANK
+    --log-dir $LOG_DIR
+    --tee "0:3,$LAST_RANK:3"
+    --redirects "3"
+)
+
+FT_LAUNCHER_ARGS=(
+    --max-restarts=3
 )
 
 # Start training
-torchrun ${DISTRIBUTED_ARGS[@]} $TRAINING_SCRIPT_PATH $PARAMS
+if [[ "$IS_NEMO_TEST" == "true" ]]; then
+    if [[ "$LAUNCHER" == "ft_launcher" ]]; then
+        ft_launcher ${DISTRIBUTED_ARGS[@]} ${FT_LAUNCHER_ARGS[@]} \
+            --no-python /opt/venv/bin/$TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
+    else
+        uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]} \
+            --no-python /opt/venv/bin/$TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
+    fi
+else
+    if [[ "$LAUNCHER" == "ft_launcher" ]]; then
+        ft_launcher ${DISTRIBUTED_ARGS[@]} ${FT_LAUNCHER_ARGS[@]} \
+            $TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
+    else
+        uv run --no-sync python -m torch.distributed.run ${DISTRIBUTED_ARGS[@]}  \
+            $TRAINING_SCRIPT_PATH "${PARAMS[@]}" && EXIT_CODE=0 || EXIT_CODE=$?
+    fi
+fi
 
+# Run after script
+AFTER_SCRIPT=$(cat "$TRAINING_PARAMS_PATH" | /usr/local/bin/yq '.AFTER_SCRIPT')
+if [[ "$AFTER_SCRIPT" != null ]]; then
+    eval "$AFTER_SCRIPT"
+fi
+
+# Set permissions
+chmod -R g+w $OUTPUT_PATH
+
+if [[ ${RECORD_CHECKPOINTS} == "true" ]]; then
+    echo "Suppressing errors during checkpoint recording."
+    exit 0
+fi
+
+exit ${EXIT_CODE:-0}
