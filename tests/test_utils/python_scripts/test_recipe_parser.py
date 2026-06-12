@@ -28,7 +28,7 @@ def test_load_workloads_keeps_build_dependency_by_default():
     assert build_workloads[0].spec["source"]["image"].endswith(":12345")
 
 
-def test_load_workloads_uses_local_image_source_without_build_dependency():
+def test_load_workloads_uses_local_image_source_without_build_workload():
     workloads = _load_smoke_workloads(
         workload_local_image_path="/lustre/enroot/{build}-{platforms}-{container_tag}.sqsh"
     )
@@ -37,7 +37,7 @@ def test_load_workloads_uses_local_image_source_without_build_dependency():
 
     assert len(basic_workloads) == 1
     assert all(workload.type != "build" for workload in workloads)
-    assert "build" not in basic_workloads[0].spec
+    assert basic_workloads[0].spec["build"] == "mcore-pyt-dev"
     assert basic_workloads[0].spec["image_source"] == {
         "local_path": "/lustre/enroot/mcore-pyt-dev-dgx_h100-12345.sqsh"
     }

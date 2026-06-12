@@ -23,14 +23,18 @@ def _local_image_workload_name(source_image: str, local_path: str) -> str:
     return f"prepare-sqsh-{digest}"
 
 
-def build_prepare_workload(source_image: str, local_path: str, time_limit: int) -> Dict:
+def build_prepare_workload(
+    build: str, source_image: str, local_path: str, time_limit: int
+) -> Dict:
+    workload_name = _local_image_workload_name(source_image=source_image, local_path=local_path)
     return {
         "type": "basic",
         "format_version": 1,
         "maintainers": ["mcore"],
         "loggers": ["stdout"],
         "spec": {
-            "name": _local_image_workload_name(source_image=source_image, local_path=local_path),
+            "name": workload_name,
+            "build": build,
             "image_source": {"image_tag": source_image},
             "nodes": 1,
             "gpus": 0,
@@ -47,6 +51,7 @@ def build_prepare_workload(source_image: str, local_path: str, time_limit: int) 
 
 
 def submit_prepare_workload(
+    build: str,
     source_image: str,
     local_path: str,
     cluster: str,
@@ -67,7 +72,10 @@ def submit_prepare_workload(
                 workloads=[
                     jetclient.JETWorkloadManifest(
                         **build_prepare_workload(
-                            source_image=source_image, local_path=local_path, time_limit=time_limit
+                            build=build,
+                            source_image=source_image,
+                            local_path=local_path,
+                            time_limit=time_limit,
                         )
                     )
                 ],
@@ -111,6 +119,7 @@ def submit_prepare_workload(
 
 
 def prepare_local_image(
+    build: str,
     source_image: str,
     local_path: str,
     cluster: str,
@@ -120,6 +129,7 @@ def prepare_local_image(
 ) -> bool:
     logger.info("Preparing %s from %s on %s", local_path, source_image, cluster)
     pipeline = submit_prepare_workload(
+        build=build,
         source_image=source_image,
         local_path=local_path,
         cluster=cluster,
@@ -225,6 +235,7 @@ def main(
     )
     for image_source in local_image_sources:
         success = prepare_local_image(
+            build=image_source.build,
             source_image=image_source.source_image,
             local_path=image_source.local_path,
             cluster=prepare_cluster,
