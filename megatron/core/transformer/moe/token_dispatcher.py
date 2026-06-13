@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 from abc import ABC, abstractmethod
@@ -629,7 +629,7 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         self.tokens_per_expert = self.preprocess(self.routing_map)
 
         if self.shared_experts is not None:
-            self.shared_experts.pre_forward_comm(hidden_states.view(self.hidden_shape))
+            self.shared_experts.pre_forward_comm()
 
         # Permutation 1: input to AlltoAll input
         self.tokens_per_expert = self._maybe_dtoh_and_synchronize(
@@ -873,10 +873,6 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
         # Reshape the output tensor
         output = output.view(self.hidden_shape)
 
-        # Add shared experts output
-        if self.shared_experts is not None:
-            shared_expert_output = self.shared_experts.get_output()
-            output += shared_expert_output
         return output
 
     def _maybe_update_cuda_sync_point(self, point: str):
@@ -1528,7 +1524,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             hidden_states, async_finish, allocate_on_comm_stream
         )
         if self.shared_experts is not None:
-            self.shared_experts.pre_forward_comm(hidden_states, wait_current_stream=False)
+            self.shared_experts.pre_forward_comm(wait_current_stream=False)
             self.shared_experts.linear_fc1_forward_and_act(dispatched_hidden_states)
 
         return dispatched_hidden_states, self._comm_manager.dispatched_probs
@@ -1601,7 +1597,6 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
         if self.shared_experts is not None:
             self.shared_experts.linear_fc2_forward(hidden_states)
             self.shared_experts.post_forward_comm()
-            hidden_states += self.shared_experts.get_output()
         return hidden_states.view(self.hidden_shape)
 
     def check_over_budget(self):
