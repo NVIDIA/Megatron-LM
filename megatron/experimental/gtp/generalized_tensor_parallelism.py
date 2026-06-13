@@ -1833,6 +1833,159 @@ class GTPEmbeddingWeight(torch.autograd.Function):
         return weight.wgrad_reduce_scatter(grad_output)
 
 
+def reset_gtp_quantize_cache(model):
+    """Invalidate the per-shard low-precision cache after a checkpoint load.
+
+    DCP load copies new data into ``GTPShardedParam.data`` in-place, leaving
+    the stale FP8 / MXFP8 / NVFP4 buffer in ``self.quantized`` behind. Call
+    this once after ``load_state_dict`` / ``dist_checkpointing.load`` so the
+    next forward re-quantizes from the freshly-loaded high-precision weight.
+    """
+    for param in model.parameters():
+        if isinstance(param, GTPShardedParam):
+            param.did_cast_to_low_precision = False
+
+
+# ------------------------------------------------------------------------
+# Distributed-checkpointing helpers
+# ------------------------------------------------------------------------
+#
+# GTP shards weights further along axis 0 on top of TP. The vanilla helpers
+# in ``megatron.core.transformer.utils`` only know about TP, so the
+# ShardedTensor offsets they emit don't reflect the GTP slice the local
+# rank actually owns. The helper below detects GTPShardedParam per-tensor
+# and either composes TP × GTP into a single axis-0 offset (when TP is
+# also on axis 0) or emits two offsets (TP on its axis, GTP on axis 0).
+# ``replica_id`` uses the DP-with-GTP-with-CP rank — the set of ranks that
+# actually hold identical copies of this chunk.
+#
+
+
+def make_sharded_tensors_for_checkpoint_with_gtp(
+    state_dict,
+    prefix,
+    tensor_parallel_layers_axis_map=None,
+    sharded_offsets=(),
+    extra_state_suffix="_extra_state",
+    *,
+    tp_group,
+    dp_cp_group,
+    intra_dp_cp_with_gtp_group=None,
+):
+    """GTP-aware analogue of ``make_sharded_tensors_for_checkpoint``.
+
+    Detects GTP sharding per-tensor (via ``isinstance(tensor, GTPShardedParam)``).
+    Non-GTP tensors keep the vanilla offsets exactly; GTP tensors layer the
+    GTP axis-0 split on top.
+
+    No-op (delegates to the vanilla helper) when no tensor in ``state_dict``
+    is a ``GTPShardedParam``, so plumbing this helper through has zero cost
+    when GTP is inactive.
+    """
+    from megatron.core.transformer.utils import (  # noqa: E402
+        make_sharded_object_for_checkpoint,
+        make_sharded_tensors_for_checkpoint,
+    )
+    from megatron.core.utils import (  # noqa: E402
+        get_pg_rank,
+        get_pg_size,
+        make_sharded_tensor_for_checkpoint,
+        make_tp_sharded_tensor_for_checkpoint,
+    )
+
+    # Fast path: no GTP-sharded params → defer to vanilla helper, same output.
+    if not any(isinstance(t, GTPShardedParam) for t in state_dict.values()):
+        return make_sharded_tensors_for_checkpoint(
+            state_dict,
+            prefix,
+            tensor_parallel_layers_axis_map,
+            sharded_offsets,
+            extra_state_suffix=extra_state_suffix,
+            tp_group=tp_group,
+            dp_cp_group=dp_cp_group,
+        )
+
+    if tensor_parallel_layers_axis_map is None:
+        tensor_parallel_layers_axis_map = {}
+
+    tp_rank = get_pg_rank(tp_group)
+    tp_size = get_pg_size(tp_group)
+    # All GTP params in this state_dict share the same gtp_group (set by the
+    # wrap hook at module init), so pick it off the first GTP shard.
+    gtp_group = next(t.group for t in state_dict.values() if isinstance(t, GTPShardedParam))
+    gtp_rank = get_pg_rank(gtp_group)
+    gtp_size = get_pg_size(gtp_group)
+
+    # DP-with-GTP-with-CP rank — replicas of a given GTP chunk live here.
+    if intra_dp_cp_with_gtp_group is not None:
+        dp_with_gtp_rank = get_pg_rank(intra_dp_cp_with_gtp_group)
+    else:
+        from megatron.core import parallel_state  # noqa: E402
+
+        dp_with_gtp_rank = parallel_state.get_data_parallel_rank(
+            with_context_parallel=True, with_gtp=True
+        )
+
+    sharded_state_dict = {}
+    for layer_name, tensor in state_dict.items():
+        layer_key = f"{prefix}{layer_name}"
+        is_gtp = isinstance(tensor, GTPShardedParam)
+
+        if layer_name.endswith(extra_state_suffix):
+            # ShardedObject (extra_state metadata): GTP-REPLICATED across the GTP group. Fold
+            # gtp_rank into position 1 of the replica_id (PP, TP-replica-coord, DP) tuple so
+            # GTP-peer ranks within the same TP slice get unique replica_ids.
+            replica_id = (0, tp_rank * gtp_size + gtp_rank, dp_with_gtp_rank)
+            sharded_state_dict[layer_key] = make_sharded_object_for_checkpoint(
+                tensor, layer_key, sharded_offsets, replica_id=replica_id
+            )
+            continue
+
+        if not is_gtp:
+            # Non-GTPShardedParam under a GTP-active module (e.g. bias). The tensor is
+            # GTP-replicated, so different GTP ranks would collide on the same replica_id
+            # without intervention. Inject gtp_rank into position 1 of the replica_id, the same
+            # way the GTP-sharded branch below does.
+            if layer_name in tensor_parallel_layers_axis_map:
+                replica_id = (0, gtp_rank, dp_with_gtp_rank)
+                sharded_state_dict[layer_key] = make_tp_sharded_tensor_for_checkpoint(
+                    tensor,
+                    layer_key,
+                    tp_axis=tensor_parallel_layers_axis_map[layer_name],
+                    replica_id=replica_id,
+                    prepend_offsets=sharded_offsets,
+                    tp_group=tp_group,
+                    dp_cp_group=dp_cp_group,
+                )
+            else:
+                replica_id = (0, tp_rank * gtp_size + gtp_rank, dp_with_gtp_rank)
+                sharded_state_dict[layer_key] = make_sharded_tensor_for_checkpoint(
+                    tensor,
+                    layer_key,
+                    replica_id=replica_id,
+                    prepend_offsets=sharded_offsets,
+                    tp_group=tp_group,
+                    dp_cp_group=dp_cp_group,
+                )
+            continue
+
+        # GTP-sharded tensor: delegate to the (GTP-aware) single-tensor helper, the one place
+        # that knows how to layer the axis-0 GTP split onto TP, elect the writer over the
+        # gtp-excluded DP group, and set allow_shape_mismatch for GTP alignment padding.
+        # (tp_axis None → 0: GTP always shards axis 0; tp_size is 1 when this param has no TP.)
+        tp_axis = tensor_parallel_layers_axis_map.get(layer_name, None)
+        sharded_state_dict[layer_key] = make_tp_sharded_tensor_for_checkpoint(
+            tensor,
+            layer_key,
+            tp_axis=tp_axis if tp_axis is not None else 0,
+            prepend_offsets=sharded_offsets,
+            tp_group=tp_group,
+            dp_cp_group=dp_cp_group,
+        )
+
+    return sharded_state_dict
+
+
 # Wire GTP into TE's hook registry. Done at module import time so any later
 # ``te.Linear(gtp_group=...)`` call routes through the hooks below. The
 # warning fires if TE is too old to expose ``register_gtp_hooks`` — in that

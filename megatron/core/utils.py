@@ -965,6 +965,37 @@ def make_tp_sharded_tensor_for_checkpoint(
             # FSDP2 shards axis 0 and TP shards some other axis
             new_offsets.append((prepend_axis_num, dp_rank, dp_size))
 
+    # GTP: a GTPShardedParam additionally shards out_features (axis 0) by 1/gtp. Layer that
+    # split onto the TP offset — mirrors make_sharded_tensors_for_checkpoint_with_gtp so direct
+    # callers (e.g. VocabParallelEmbedding, which can't use that wrapper because it needs
+    # allow_shape_mismatch) still save GTP weights with correct global offsets/shape.
+    from megatron.experimental.gtp import HAVE_GTP
+
+    if HAVE_GTP:
+        from megatron.experimental.gtp import GTPShardedParam
+
+        if isinstance(tensor, GTPShardedParam):
+            gtp_rank = get_pg_rank(tensor.group)
+            gtp_size = get_pg_size(tensor.group)
+            if tp_axis == 0:
+                # same axis as TP → one composite axis-0 offset
+                new_offsets[0] = (
+                    prepend_axis_num,
+                    tp_rank * gtp_size + gtp_rank,
+                    tp_size * gtp_size,
+                )
+            else:
+                # GTP shards axis 0, TP shards a different axis → add a separate axis-0 offset
+                new_offsets.append((prepend_axis_num, gtp_rank, gtp_size))
+            # GTP peers hold distinct shards (disambiguated by the offset above); the true
+            # replicas are the gtp-EXCLUDED DP group, so elect the writer over that group.
+            dp_replica_id = parallel_state.get_data_parallel_rank(
+                with_context_parallel=True, with_gtp=True
+            )
+            # Saved global is the padded shape when GTP padded out_features for alignment.
+            if getattr(tensor, "pad_length", 0):
+                kwargs.setdefault("allow_shape_mismatch", True)
+
     if replica_id is None:
         replica_id = (0, 0, dp_replica_id)
 
@@ -994,6 +1025,18 @@ def make_sharded_tensor_for_checkpoint(tensor, key, prepend_offsets=(), replica_
             - dp_cp_group: Data parallel + context parallel group
               (default: None, falls back to parallel_state)
     """
+    # Sanity guard.
+    from megatron.experimental.gtp import HAVE_GTP
+
+    if HAVE_GTP:
+        from megatron.experimental.gtp import GTPShardedParam
+
+        assert not isinstance(tensor, GTPShardedParam), (
+            f"GTPShardedParam '{key}' reached make_sharded_tensor_for_checkpoint (the replicated "
+            "path); route GTP-sharded weights through make_tp_sharded_tensor_for_checkpoint or "
+            "make_sharded_tensors_for_checkpoint instead."
+        )
+
     # Pop group parameters from kwargs
     tp_group = kwargs.pop('tp_group', None)
     dp_cp_group = kwargs.pop('dp_cp_group', None)

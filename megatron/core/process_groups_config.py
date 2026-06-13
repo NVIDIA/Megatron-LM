@@ -44,6 +44,8 @@ class ProcessGroupCollection:
         expt_tp: Expert tensor parallel group
         tp_ep: Tensor and expert parallel group
         tp_ep_pp: Tensor, expert, and pipeline parallel group
+        tp_ep_pp_with_egtp: tp_ep_pp merged across EGTP peers (analog of dense ``mp`` under GTP);
+            identical to ``tp_ep_pp`` when EGTP=1
 
         # Data Parallelism Groups
         dp: Data parallel process group
@@ -51,6 +53,8 @@ class ProcessGroupCollection:
         expt_dp: Expert data parallel group
         intra_dp_cp: Intra partial data parallel group
         intra_expt_dp: Intra partial expert data parallel group
+        intra_expt_dp_with_egtp: Intra expert data parallel group excluding EGTP peers
+            (true expert-weight replicas); identical to expt_dp when EGTP=1
         inter_dist_opt: Inter distributed optimizer instance group
 
     Example:
@@ -104,6 +108,11 @@ class ProcessGroupCollection:
     # _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP
     tp_ep_pp: torch.distributed.ProcessGroup = field(init=False)
 
+    # _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP_WITH_EGTP — expert "model parallel" group
+    # merged across EGTP peers (analog of dense ``mp`` under GTP). Identical to ``tp_ep_pp``
+    # when EGTP=1.
+    tp_ep_pp_with_egtp: torch.distributed.ProcessGroup = field(init=False)
+
     # _TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP
     tp_dp_cp: torch.distributed.ProcessGroup = field(init=False)
 
@@ -138,6 +147,10 @@ class ProcessGroupCollection:
 
     # _INTRA_EXPERT_DATA_PARALLEL_GROUP
     intra_expt_dp: torch.distributed.ProcessGroup = field(init=False)
+
+    # _EXPERT_DATA_PARALLEL_GROUP_WITH_GTP — expert DP excluding EGTP peers (true expert
+    # weight replicas). Identical to ``expt_dp`` when EGTP=1.
+    intra_expt_dp_with_egtp: torch.distributed.ProcessGroup = field(init=False)
 
     # _INTER_PARTIAL_EXPERT_DATA_PARALLEL_GROUP
     inter_dist_opt: torch.distributed.ProcessGroup = field(init=False)
@@ -226,6 +239,11 @@ class ProcessGroupCollection:
                 parallel_state.get_expert_tensor_model_pipeline_parallel_group,
                 check_initialized=False,
             ),
+            'tp_ep_pp_with_egtp': partial(
+                parallel_state.get_expert_tensor_model_pipeline_parallel_group,
+                check_initialized=False,
+                with_egtp=True,
+            ),
             'embd': partial(parallel_state.get_embedding_group, check_initialized=False),
             'pos_embd': partial(
                 parallel_state.get_position_embedding_group, check_initialized=False
@@ -241,6 +259,12 @@ class ProcessGroupCollection:
             'intra_expt_dp': partial(
                 parallel_state.get_expert_data_parallel_group,
                 check_initialized=False,
+                partial_expert_data_parallel=True,
+            ),
+            'intra_expt_dp_with_egtp': partial(
+                parallel_state.get_expert_data_parallel_group,
+                check_initialized=False,
+                with_gtp=True,
                 partial_expert_data_parallel=True,
             ),
             'inter_dist_opt': partial(
@@ -300,8 +324,14 @@ class ProcessGroupCollection:
                 - dp_group: Data parallel group
                 - dp_cp_group: Data parallel with context parallel group
                 - intra_dp_cp_group: Intra data parallel with context parallel group
+                - intra_dp_cp_with_gtp_group: Intra data parallel with context parallel and
+                    generalized tensor parallel group (excludes GTP peers, i.e. only true dense
+                    weight replicas)
                 - expt_dp_group: Expert data parallel group
                 - intra_expt_dp_group: Intra expert data parallel group
+                - intra_expt_dp_with_egtp_group: Intra expert data parallel group excluding
+                    EGTP peers (true expert-weight replicas); identical to expt_dp_group when
+                    EGTP=1
                 - mp_group: Model parallel group
                 - expt_tp_pp_group: Expert tensor-model-pipeline parallel group
                 - inter_dist_opt_group: Inter distributed optimizer group (may be None)
@@ -357,6 +387,9 @@ class ProcessGroupCollection:
             # Model communication groups
             mp_group = parallel_state.get_model_parallel_group()
             expt_tp_pp_group = parallel_state.get_expert_tensor_model_pipeline_parallel_group()
+            expt_tp_pp_with_egtp_group = parallel_state.get_expert_tensor_model_pipeline_parallel_group(
+                with_egtp=True
+            )
 
             # Inter distributed optimizer group
             if hasattr(model_chunks[0], 'ddp_config'):
@@ -462,8 +495,18 @@ class ProcessGroupCollection:
                 )
             expt_tp_pp_group = pg_collection.tp_ep_pp
 
-            # 6. GTP with_gtp groups — partial (per-distopt-instance) and full
-            #    (cross-instance). Fall back to the non-GTP variants when not provided.
+            # EGTP-MERGED variant of tp_ep_pp: includes the egtp axis, so each EGTP peer gets a
+            # distinct rank — used for the distopt ShardedObject keys. (Note the opposite sense
+            # from the with_egtp replicate groups in §7, which EXCLUDE the egtp axis.) Falls back
+            # to tp_ep_pp when not provided.
+            if hasattr(pg_collection, 'tp_ep_pp_with_egtp'):
+                expt_tp_pp_with_egtp_group = pg_collection.tp_ep_pp_with_egtp
+            else:
+                expt_tp_pp_with_egtp_group = expt_tp_pp_group
+
+            # 6. with_gtp groups — the gtp-EXCLUDED replicate groups that DDP and the optimizer
+            #    shard over: intra (per-distopt-instance) and full (cross-instance). Fall back to
+            #    the non-GTP variants when not provided.
             if hasattr(pg_collection, 'intra_dp_cp_with_gtp'):
                 intra_dp_cp_with_gtp_group = pg_collection.intra_dp_cp_with_gtp
             else:
@@ -473,8 +516,9 @@ class ProcessGroupCollection:
             else:
                 dp_cp_with_gtp_group = dp_cp_group
 
-            # 7. EGTP groups — partial (per-distopt-instance) and full
-            #    (cross-instance). Fall back to the non-EGTP variants when not provided.
+            # 7. with_egtp groups — the expert analog of §6: the egtp-EXCLUDED replicate groups,
+            #    intra (per-distopt-instance) and full (cross-instance). Fall back to the
+            #    non-EGTP variants when not provided.
             if hasattr(pg_collection, 'intra_expt_dp_with_egtp'):
                 intra_expt_dp_with_egtp_group = pg_collection.intra_expt_dp_with_egtp
             else:
@@ -505,6 +549,7 @@ class ProcessGroupCollection:
             'intra_expt_dp_with_egtp_group': intra_expt_dp_with_egtp_group,
             'mp_group': mp_group,
             'expt_tp_pp_group': expt_tp_pp_group,
+            'expt_tp_pp_with_egtp_group': expt_tp_pp_with_egtp_group,
             'inter_dist_opt_group': inter_dist_opt_group,
             'intra_dist_opt_group': intra_dist_opt_group,
             'intra_dp_cp_group_gloo': intra_dp_cp_group_gloo,

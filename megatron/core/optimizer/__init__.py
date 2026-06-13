@@ -1041,6 +1041,8 @@ def get_megatron_optimizer(
     intra_expt_dp_with_egtp_group = process_groups_dict['intra_expt_dp_with_egtp_group']
     mp_group = process_groups_dict['mp_group']
     expt_tp_pp_group = process_groups_dict['expt_tp_pp_group']
+    expt_tp_pp_with_egtp_group = process_groups_dict['expt_tp_pp_with_egtp_group']
+    expt_dp_group = process_groups_dict['expt_dp_group']
     intra_dp_cp_group_gloo = process_groups_dict['intra_dp_cp_group_gloo']
     intra_expt_dp_group_gloo = process_groups_dict['intra_expt_dp_group_gloo']
     intra_dist_opt_group = process_groups_dict['intra_dist_opt_group']
@@ -1059,6 +1061,7 @@ def get_megatron_optimizer(
     main_dp_group_gloo = None if gtp_active else intra_dp_cp_group_gloo
     main_expt_dp_group = intra_expt_dp_with_egtp_group
 
+    # ``mp_group`` spans TP×GTP×PP (GTP-merged).
     model_parallel_rank = get_pg_rank(mp_group)
 
     if get_pg_size(dp_cp_group) > get_pg_size(intra_dp_cp_group):
@@ -1186,7 +1189,10 @@ def get_megatron_optimizer(
                 param_to_param_group[param_name] = param_group_id
             param_group_id += 1
     if len(moe_param_groups) > 0:
-        expt_model_parallel_rank = get_pg_rank(expt_tp_pp_group)
+        # Expert analog of the dense ``model_parallel_rank`` above: the EGTP-merged group gives
+        # each EGTP peer a distinct distopt ShardedObject key. See gtp/README.md §3.3 (Optimizer
+        # state) for why the non-merged ``expt_tp_pp_group`` would cause a DCP "duplicate" error.
+        expt_model_parallel_rank = get_pg_rank(expt_tp_pp_with_egtp_group)
         # Pass Gloo process groups into optimizer only if needed. GTP shards over the
         # egtp-EXCLUDED replicate group (no Gloo path for it yet), matching the dense side.
         if use_gloo_process_groups and not gtp_active:

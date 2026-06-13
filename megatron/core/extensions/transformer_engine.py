@@ -19,7 +19,7 @@ from torch import Tensor
 from torch.nn.parameter import Parameter
 from typing_extensions import override
 
-from megatron.core.dist_checkpointing.mapping import ShardedStateDict
+from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.model_parallel_config import ModelParallelConfig
@@ -2397,7 +2397,14 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 )
                 if self.use_bias:
                     sharded_state_dict[f"{prefix}bias{gemm_idx}"] = sub_sd[f"{gemm_idx}.bias"]
-            # Adjust replica ids - replication along DP modulo EP
+            # Set the expert-DP replica_id, picking the group by what EGTP does to each entry:
+            #   - weight ShardedTensor: SHARDED across EGTP (distinct chunks) → not replicas →
+            #     use ``intra_expt_dp_with_egtp`` (EGTP-excluded).
+            #   - _extra_state ShardedObject: REPLICATED across EGTP → need distinct replica_ids
+            #     to avoid duplicate-writer collisions → use full ``expt_dp`` (EGTP-included).
+            # EGTP=1: the two groups coincide, so this is a no-op.
+            expt_dp_full = self._pg_collection.expt_dp
+            expt_dp_intra = self._pg_collection.intra_expt_dp_with_egtp
             for k, sh_ten in sharded_state_dict.items():
                 replica_id = sh_ten.replica_id
                 assert (
@@ -2405,8 +2412,10 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 ), f"Expected replica_id for {k} to be in (PP, TP, DP) format, got: {replica_id}"
                 if getattr(sh_ten, "is_data_parallel_fully_shard", False):
                     edp_replica_id = 0
+                elif isinstance(sh_ten, ShardedObject):
+                    edp_replica_id = get_pg_rank(expt_dp_full)
                 else:
-                    edp_replica_id = get_pg_rank(self._pg_collection.expt_dp)
+                    edp_replica_id = get_pg_rank(expt_dp_intra)
                 sh_ten.replica_id = (*replica_id[:2], edp_replica_id)
             return sharded_state_dict
 

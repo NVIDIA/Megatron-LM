@@ -16,7 +16,7 @@ import torch.nn.functional as F
 
 from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import ShardedTensor
-from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedTensorFactory
+from megatron.core.dist_checkpointing.mapping import ReplicaId, ShardedObject, ShardedTensorFactory
 from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
 from megatron.core.inference.contexts.attention_context.triton.tensor_ops import (
     tensor_get_slice_after,
@@ -44,7 +44,14 @@ from megatron.core.utils import (
     is_mamba_min_version,
     is_using_quantization_scales,
     log_single_rank,
+    make_tp_sharded_tensor_for_checkpoint,
 )
+from megatron.experimental.gtp import HAVE_GTP
+
+if HAVE_GTP:
+    from megatron.experimental.gtp import GTPShardedParam
+else:
+    GTPShardedParam = None
 
 from .mamba_context_parallel import MambaContextParallel
 
@@ -1299,7 +1306,12 @@ class MambaMixer(MegatronModule):
         metadata = ensure_metadata_has_dp_cp_group(metadata)
 
         sharded_state_dict = {}
-        # Parameters
+        # Parameters: A_log / dt_bias / D / conv1d.* are GTP-REPLICATED — every GTP rank holds an
+        # identical copy. The vanilla helper sets replica_id without GTP awareness, so all GTP
+        # ranks would claim the same chunk with the same all-zero replica_id and DCP would have a
+        # write conflict. Track those keys here and fold gtp_rank into replica_id below.
+        gtp_replicated_keys = set()
+
         self._save_to_state_dict(sharded_state_dict, "", keep_vars=True)
         sharded_state_dict = make_sharded_tensors_for_checkpoint(
             sharded_state_dict,
@@ -1313,6 +1325,7 @@ class MambaMixer(MegatronModule):
             },
             sharded_offsets=sharded_offsets,
         )
+        gtp_replicated_keys |= set(sharded_state_dict.keys())
         # Submodules
         for name, module in self.named_children():
             module_sharded_sd = sharded_state_dict_default(
@@ -1333,6 +1346,39 @@ class MambaMixer(MegatronModule):
             + 2 * self.ngroups_local_tp * self.d_state
             + self.nheads_local_tp
         )
+        # Under GTP, in_proj.weight is GTP-sliced along axis 0. The [z|x|B|C|dt] split boundaries
+        # don't line up with GTP slice boundaries, so gather the shards back to TP-local size
+        # (strip the trailing pad rows from the gathered tail) and fall through to the same
+        # split path the non-GTP run uses — saved ckpt format matches a non-GTP run.
+        in_proj_gtp_size = getattr(self.in_proj, "gtp_size", 1)
+        if in_proj_gtp_size > 1 and HAVE_GTP and isinstance(self.in_proj.weight, GTPShardedParam):
+            gtp_shard = self.in_proj.weight
+            gtp_group = gtp_shard.group
+            local = gtp_shard.data.contiguous()
+            gathered = torch.empty(
+                (local.shape[0] * in_proj_gtp_size,) + local.shape[1:],
+                dtype=local.dtype,
+                device=local.device,
+            )
+            torch.distributed.all_gather_into_tensor(gathered, local, group=gtp_group)
+            if gathered.shape[0] != in_proj_dim:
+                gathered = gathered[:in_proj_dim].contiguous()
+            # Mcore replica_id convention is (PP, TP-replica-coord, DP). For a TP-sharded
+            # tensor the TP-replica-coord is 0; we put gtp_rank there so DCP elects exactly
+            # one writer per chunk (the one with gtp_rank=0 and dp_cp_rank=0) without
+            # touching the PP slot.
+            gtp_rank = torch.distributed.get_rank(gtp_group)
+            dp_cp_rank = torch.distributed.get_rank(metadata['dp_cp_group'])
+            sharded_state_dict[f"{prefix}in_proj.weight"] = make_tp_sharded_tensor_for_checkpoint(
+                gathered,
+                f"{prefix}in_proj.weight",
+                tp_axis=0,
+                replica_id=(0, gtp_rank, dp_cp_rank),
+                prepend_offsets=sharded_offsets,
+                tp_group=self.tp_group,
+                dp_cp_group=metadata['dp_cp_group'],
+            )
+
         assert sharded_state_dict[f"{prefix}in_proj.weight"].data.size(0) == in_proj_dim, (
             in_proj_dim,
             sharded_state_dict[f"{prefix}in_proj.weight"],
@@ -1350,6 +1396,34 @@ class MambaMixer(MegatronModule):
             ["z", "x", "B", "C", "dt"],
             0,
         )
+
+        # GTP load-side inverse of the save-time all-gather (see gtp/README.md §3.3, in_proj
+        # note): the checkpoint stores the FULL TP-local in_proj.weight (pad stripped) under the
+        # 5 split keys [z|x|B|C|dt], so the default merge_fn cats them back to ``in_proj_dim``
+        # rows with no padding. To reload into the live GTPShardedParam we must mirror init
+        # (``_gtp_slice_one_param``): F.pad the merged tensor with zeros up to
+        # ``gtp_local_size * gtp_size``, then slice by ``gtp_rank``. GTP=1 has no pad/slice.
+        if in_proj_gtp_size > 1 and HAVE_GTP and isinstance(self.in_proj.weight, GTPShardedParam):
+            factory = sharded_state_dict[f"{prefix}in_proj.weight"]
+            gtp_local_rank = torch.distributed.get_rank(self.in_proj.weight.group)
+            gtp_local_size = self.in_proj.weight.data.size(0)
+            original_merge_fn = factory.merge_fn
+
+            @torch.no_grad()
+            def _gtp_slice_after_cat(sub_state_dict, _orig=original_merge_fn,
+                                     _rank=gtp_local_rank, _size=gtp_local_size,
+                                     _gtp_size=in_proj_gtp_size):
+                full = _orig(sub_state_dict)
+                aligned_total = _size * _gtp_size
+                pad_rows = aligned_total - full.shape[0]
+                if pad_rows > 0:
+                    full = torch.nn.functional.pad(full, (0, 0, 0, pad_rows))
+                start = _rank * _size
+                return full[start : start + _size].contiguous()
+
+            sharded_state_dict[f"{prefix}in_proj.weight"] = replace(
+                factory, merge_fn=_gtp_slice_after_cat
+            )
 
         conv_dim = self.d_inner_local_tp + 2 * self.ngroups_local_tp * self.d_state
         assert sharded_state_dict[f"{prefix}conv1d_weight"].data.size(0) == conv_dim, (
@@ -1372,6 +1446,22 @@ class MambaMixer(MegatronModule):
                 ["x", "B", "C"],
                 0,
             )
+
+        # Fold gtp_rank into replica_id (pos 1) of the GTP-replicated keys from the vanilla
+        # (GTP-blind) helper: tp_rank * gtp_size + gtp_rank, so only gtp=tp=dp=0 stays all-zero
+        # and is elected writer. in_proj / out_proj already used the GTP-aware helper.
+        if in_proj_gtp_size > 1 and HAVE_GTP and isinstance(self.in_proj.weight, GTPShardedParam):
+            gtp_rank = torch.distributed.get_rank(self.in_proj.weight.group)
+            gtp_size = in_proj_gtp_size
+            for key in gtp_replicated_keys:
+                val = sharded_state_dict.get(key)
+                if isinstance(val, (ShardedTensor, ShardedTensorFactory, ShardedObject)):
+                    rid = val.replica_id
+                    if isinstance(rid, tuple) and len(rid) == 3:
+                        new_pos1 = rid[1] * gtp_size + gtp_rank
+                        sharded_state_dict[key] = replace(
+                            val, replica_id=(rid[0], new_pos1, rid[2])
+                        )
 
         return sharded_state_dict
 

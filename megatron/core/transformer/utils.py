@@ -132,6 +132,28 @@ def make_sharded_tensors_for_checkpoint(
         tp_group = get_tensor_model_parallel_group_if_none(tp_group)
         dp_cp_group = parallel_state.get_data_parallel_group(with_context_parallel=True)
 
+    # GTP-sharded weights need the GTP axis layered onto the TP/DP offsets. The GTP helper
+    # is a no-op for non-GTP state_dicts, but importing it eagerly would be circular, so
+    # gate on HAVE_GTP and the presence of a GTPShardedParam before delegating.
+    from megatron.experimental.gtp import HAVE_GTP
+
+    if HAVE_GTP:
+        from megatron.experimental.gtp import (
+            GTPShardedParam,
+            make_sharded_tensors_for_checkpoint_with_gtp,
+        )
+
+        if any(isinstance(t, GTPShardedParam) for t in state_dict.values()):
+            return make_sharded_tensors_for_checkpoint_with_gtp(
+                state_dict,
+                prefix,
+                tensor_parallel_layers_axis_map,
+                sharded_offsets,
+                extra_state_suffix=extra_state_suffix,
+                tp_group=tp_group,
+                dp_cp_group=dp_cp_group,
+            )
+
     sharded_state_dict = {}
     for layer_name in state_dict.keys():
         tensor = state_dict[layer_name]

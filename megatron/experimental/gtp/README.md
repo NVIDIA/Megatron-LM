@@ -2,7 +2,7 @@
 
 > ⚠️ **Experimental.** GTP is an experimental feature and its API, configuration, and behavior may change in future versions without notice.
 
-**At a glance.** GTP shards every linear weight 1/N along `out_features` across a dedicated GTP process group. The full weight is rematerialized on the fly via an asynchronous all-gather that overlaps with the previous layer's compute on every forward AND backward pass; the wgrad is reduce-scattered the same way on the way back. Effective per-GPU weight memory shrinks by `1/N`, and the design composes orthogonally with TP / SP / EP / DDP / CUDA Graphs.
+**At a glance.** GTP shards every linear weight 1/N along `out_features` across a dedicated GTP process group. The full weight is rematerialized on the fly via an asynchronous all-gather that overlaps with the previous layer's compute on both the forward and backward passes, and the wgrad is reduce-scattered the same way on the way back. Effective per-GPU weight memory shrinks to `1/N`, and the design composes orthogonally with TP / SP / EP / DDP / CUDA Graphs.
 
 **Scope**: a high-level summary of GTP — design intent, public CLI surface, and Megatron-LM ↔ TransformerEngine integration touchpoints.
 
@@ -11,10 +11,23 @@ Core implementation: `megatron/experimental/gtp/generalized_tensor_parallelism.p
 **Outline:**
 
 1. [Features](#1-features)
+   - 1.1 [Fine-grained, per-weight materialization & gradient reduction](#11-fine-grained-per-weight-materialization--gradient-reduction)
+   - 1.2 [CUDA graph compatibility](#12-cuda-graph-compatibility)
+   - 1.3 [Low-precision quantize-then-gather](#13-low-precision-quantize-then-gather)
+   - 1.4 [Composability with TP / SP / EP / DDP](#14-composability-with-tp--sp--ep--ddp)
+   - 1.5 [Opt-in, minimally invasive integration](#15-opt-in-minimally-invasive-integration)
+   - 1.6 [Scaling](#16-scaling)
+   - 1.7 [Native distributed checkpointing (DCP)](#17-native-distributed-checkpointing-dcp)
 2. [Usage](#2-usage)
+   - 2.1 [Required flags](#21-required-flags)
+   - 2.2 [High-priority streams (Blackwell and later)](#22-high-priority-streams-blackwell-and-later)
+   - 2.3 [Minimal end-to-end example](#23-minimal-end-to-end-example)
+   - 2.4 [Tuning knobs](#24-tuning-knobs)
 3. [Implementation details](#3-implementation-details)
    - 3.1 [GTP architecture (Mcore ↔ TE integration)](#31-gtp-architecture-mcore--te-integration)
    - 3.2 [DDP buckets with (E)GTP](#32-ddp-buckets-with-egtp)
+   - 3.3 [Distributed checkpointing (DCP)](#33-distributed-checkpointing-dcp)
+4. [Testing](#4-testing)
 
 ---
 
@@ -115,13 +128,21 @@ Quantize-then-gather attacks AG only: AG portion shrinks ~72% from BF16 → NVFP
 
 Effective per-GPU weight size = `W / (TP × GTP)`. Example: TP=4 + GTP=8 with NVFP4 → 32× weight-memory reduction and 128× wire-bandwidth reduction vs full BF16 replication, before data parallelism.
 
+### 1.7 Native distributed checkpointing (DCP)
+
+**GTP + DCP is straightforward:**
+- Reuses the existing checkpoint stack rather than adding a parallel one. GTP-sharded weights *and* distributed-optimizer state save/load through the standard PyTorch / Mcore `torch_dist` sharded checkpoint, with **no GTP-specific format or call path** and a tiny code footprint (one new helper + one helper made GTP-aware).
+- Checkpoints **reshard freely** across different `(TP, GTP, EGTP, DP, PP)` topologies — including a different GTP/EGTP size — with no offline conversion.
+
+See [§3.3 Distributed checkpointing (DCP)](#33-distributed-checkpointing-dcp) for details.
+
 ---
 
 ## 2. Usage
 
 GTP is enabled through two CLI flags on Megatron's training launcher; everything else (process-group construction, parameter slicing, prefetch chain wiring, optimizer routing) is automatic once the flags are set.
 
-### Required flags
+### 2.1 Required flags
 
 ```bash
 # Shard dense weights (attention, mamba, MLP linears) 1/N along out_features.
@@ -132,7 +153,7 @@ GTP is enabled through two CLI flags on Megatron's training launcher; everything
 --expert-generalized-tensor-parallel-remat-size <M>
 ```
 
-### High-priority streams (Blackwell and later)
+### 2.2 High-priority streams (Blackwell and later)
 
 Required on GB200 / GB300 so the GTP comm streams get the SM priority needed for AG/RS overlap with compute:
 
@@ -142,7 +163,7 @@ Required on GB200 / GB300 so the GTP comm streams get the SM priority needed for
 
 The launcher also exports `CUDA_GRAPHS_USE_NODE_PRIORITY=1` so captured CUDA graphs respect the inherited stream priority.
 
-### Minimal end-to-end example
+### 2.3 Minimal end-to-end example
 
 ```bash
 # 4 ranks, GTP=2 across out_features, no TP, BF16 weights.
@@ -171,7 +192,7 @@ GTP enabled. GTPConfig(pad_for_alignment=16, check_param_states=False,
   fp8_param_gather=False, coalesce_amax_allreduce=False)
 ```
 
-### Tuning knobs
+### 2.4 Tuning knobs
 
 Set via `from megatron.experimental.gtp import GTP_CONFIG, update_gtp_config`:
 
@@ -270,11 +291,6 @@ Under **full-iteration CUDA graphs** the recompute-forward is captured; `wait_as
 
 ![DDP + (E)GTP interaction with the distributed optimizer](images/0611_ddp_egtp_orthogonal_bucketing.png)
 
-<!-- Editable source: diagrams/0611_ddp_egtp_orthogonal_bucketing.drawio
-     Export to images/0611_ddp_egtp_orthogonal_bucketing.png via the draw.io desktop CLI:
-       drawio -x -f png -e -b 10 -o megatron/experimental/gtp/images/0611_ddp_egtp_orthogonal_bucketing.png \
-              diagrams/0611_ddp_egtp_orthogonal_bucketing.drawio -->
-
 **(E)GTP is *super loosely coupled* to DDP and the distributed optimizer — they stay completely GTP-agnostic.** GTP is just another sub-axis of the rank grid (`world = TP×GTP×CP×DP`); a GTP-sharded weight rides the *exact same* code path as an ordinary param. There are **no** GTP/EGTP-specific buffers, optimizers, gradient-scaling factors, or bucket groups. The entire DDP/DistOpt stack touches GTP in only **two** narrow places:
 
 1. **finalize SUM all-reduce** (`_allreduce_replicated_grads_over_gtp_group`) — completes the gtp axis for *replicated* (non-GTP) params; a no-op when GTP is inactive.
@@ -302,6 +318,40 @@ Why this is correct — the gtp axis is completed in two complementary ways, so 
 
 > **Single distopt instance with GTP.** GTP currently requires `num_distributed_optimizer_instances == 1` (asserted in `parallel_state.py`): partial-distopt sharding of the data domain would need gtp-aware sizing. The dist-opt grad-stats group is therefore the full world.
 
+### 3.3 Distributed checkpointing (DCP)
+
+![GTP + DCP save/load reshard for a TP2×GTP2 weight](images/0612_gtp_dcp_tp2gtp2_save_load.png)
+
+GTP supports **PyTorch / Mcore sharded distributed checkpointing** (`--ckpt-format torch_dist`, the `megatron.core.dist_checkpointing` `ShardedTensor` / `ShardedObject` format) for **both model weights and distributed-optimizer state**. Checkpoints are **fully resharding-capable**: a checkpoint saved at one `(TP, GTP, EGTP, DP, PP)` topology can be loaded at a *different* one — including a different GTP/EGTP size — without an offline conversion step.
+
+Consistent with §3.2, GTP stays *loosely coupled* to the checkpoint stack: there is **no GTP-specific checkpoint format or call path**. The shared `make_sharded_tensors_for_checkpoint` helper became GTP-aware and **delegates internally** to a GTP variant only when the `state_dict` actually contains a `GTPShardedParam` (a no-op otherwise), so call sites are unchanged and non-GTP runs are byte-identical.
+
+**Save-side call workflow.** The diagram below traces the save path — from `model.sharded_state_dict()` through the `make_*` helpers down to the terminal `ShardedTensor` / `ShardedObject` sinks. The GTP footprint is deliberately tiny: exactly **one new function** (`make_sharded_tensors_for_checkpoint_with_gtp`, in `gtp.py`, which sets `replica_id` for the GTP-*duplicated* entries) plus **one modified function** (the per-tensor `make_tp_sharded_tensor_for_checkpoint` in `core/utils.py`, made GTP-aware in place to emit the GTP-*sharded* offsets). Every other helper is untouched.
+
+![GTP + DCP checkpoint-save call workflow](images/0613_gtp_dcp_save_call_workflow.png)
+
+**How a GTP weight is described to DCP.** GTP always shards `out_features` (axis 0). The helper layers that GTP split onto the existing TP offsets in the `ShardedTensor`, so the global tensor DCP sees is the *full, unsharded* weight:
+
+| Weight kind | TP axis | Emitted axis-0 offset | Other axis |
+|-------------|---------|------------------------|------------|
+| Column-parallel (qkv, fc1) | 0 (same as GTP) | composite `(tp_rank·gtp + gtp_rank, tp·gtp)` | — |
+| Row-parallel (proj, fc2) | 1 | GTP-only `(gtp_rank, gtp)` | TP offset on axis 1 |
+| No TP (GTP-only) | – | `(gtp_rank, gtp)` | — |
+
+Because the offsets reconstruct the global shape, the checkpoint is independent of the save-time grid. On load, DCP reads each rank's `[offset : offset+local]` slice from that global and re-tiles it onto the new grid — e.g. `TP1×GTP2`, `TP2×GTP4`, or a DP change.
+
+**replica_id.** GTP peers hold *distinct* shards (not replicas), so they're disambiguated by their offsets, and `replica_id` ranges over the GTP-*included* DP group. **Replicated** tensors that live alongside GTP weights (LayerNorm γ/β, biases, `_extra_state` objects) would otherwise collide across GTP peers, so the helper folds `gtp_rank` into their `replica_id` — exactly one peer is then elected DCP writer per key.
+
+**`_extra_state`.** This is TransformerEngine's per-module **FP8 calibration state** — for delayed-scaling recipes it holds the `recipe`, the forward/backward `scale` tensors and `amax_history` buffers, plus picklable `extra_fp8_variables`; for BF16 (non-FP8) runs it is an empty tensor. Because it is a pickled byte blob rather than a tensor with a meaningful shape, it is emitted as a `ShardedObject` (via `make_sharded_object_for_checkpoint`), not a `ShardedTensor`. Its amax/scale statistics are *per-tensor globals* for the **full** weight (amax is reduced across the FP8 group), so every GTP peer carries an identical copy — which is exactly why it takes the replicated path above, with `gtp_rank` folded into its `replica_id`.
+
+**Alignment padding & cross-topology reshard.** When `_gtp_slice_one_param` pads `out_features` to a multiple of `gtp_size · pad_for_alignment`, the saved global describes the *padded* shape, so the helper sets `allow_shape_mismatch=True`. DCP then tolerates a load-side topology whose alignment yields a different padded size — the unpadded data overlaps and the tail pad rows are zeros GTP recomputes.
+
+>> Note: Mamba's `in_proj` is a special case: it **all-gathers its GTP shards** back to the logical TP-local size and strips the pad *before* saving, so its global is topology-independent and needs no `allow_shape_mismatch`.
+
+**Optimizer state.** The distributed optimizer's master/moment `ShardedObject`s are keyed by `dp_group_idx`. Under GTP/EGTP each peer owns a *different* master shard (the optimizer shards over the gtp/egtp-**excluded** replicate group), so the index is taken from the gtp/egtp-**merged** model-parallel group (`mp_group` for dense, `expt_tp_pp_with_egtp_group` for expert) — giving every peer a distinct key while replicate-group ranks remain true replicas under that key.
+
+**Post-load cache invalidation.** DCP loads weights with in-place writes to `.data`, which leaves the per-shard low-precision cache (`self.quantized`) stale. `reset_gtp_quantize_cache(model)` is called after load (and RL checkpoint reload) so the first forward after resume re-quantizes from the freshly loaded BF16 weight instead of reusing the pre-load cast.
+
 ## 4. Testing
 
 **Whenever you add or change a GTP/EGTP feature, run the GTP unit-test suite below as a sanity check before opening a PR.** These tests exercise the full TE↔Mcore path (weight gather/RS, DDP, distributed optimizer, finalize, grad-norm) and catch silent-correctness regressions that don't surface as crashes.
@@ -323,5 +373,6 @@ torchrun --nproc-per-node 4 -m pytest tests/unit_tests/generalized_tensor_parall
 | `test_moe_egtp.py` | EGTP on MoE routed-expert weights. |
 | `test_gtp_loss_correctness.py` | End-to-end: GTP per-step loss trajectory matches a no-GTP baseline. |
 | `test_gtp_grad_correctness.py` | Gradient + dist-opt + grad-norm numeric parity vs a DP baseline at replicate (DP) > 1. |
+| `test_gtp_dcp.py` | Distributed-checkpoint sharding (§3.3): TP×GTP composite/cross-axis offsets, alignment-pad `allow_shape_mismatch`, cross-topology reshard metadata, and quantize-cache reset. |
 
 All tests require ≥ 4 GPUs and the GTP-enabled TransformerEngine; they self-skip when those are unavailable. A green run (skips for unmet hardware/config are acceptable) is the minimum bar for any GTP change.

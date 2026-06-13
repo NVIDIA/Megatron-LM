@@ -64,6 +64,9 @@ _EXPERT_TENSOR_PARALLEL_GROUP = None
 _EXPERT_TENSOR_AND_MODEL_PARALLEL_GROUP = None
 # Expert tensor, model, pipeline combined parallel group
 _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP = None
+# Same as above, but additionally merged across EGTP peers (analog of dense _MODEL_PARALLEL_GROUP
+# under GTP). Identical to the above when EGTP=1.
+_EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP_WITH_EGTP = None
 # Expert data parallel group
 _EXPERT_DATA_PARALLEL_GROUP = None
 _EXPERT_DATA_PARALLEL_GROUP_WITH_GTP = None
@@ -1140,11 +1143,11 @@ def initialize_model_parallel(
                 _HIERARCHICAL_CONTEXT_PARALLEL_GROUPS = hierarchical_groups
 
     # Build the model-parallel groups (TP × GTP × PP). gtp is a RankGenerator axis, so the
-    # 'tp-pp-gtp' token spans it directly; with gtp=1 it reduces to the plain tp-pp groups.
+    # 'tp-gtp-pp' token spans it directly; with gtp=1 it reduces to the plain tp-pp groups.
     global _MODEL_PARALLEL_GROUP
     global _MODEL_PARALLEL_GLOBAL_RANKS
     assert _MODEL_PARALLEL_GROUP is None, 'model parallel group is already initialized'
-    for ranks in decoder_rank_generator.get_ranks('tp-pp-gtp'):
+    for ranks in decoder_rank_generator.get_ranks('tp-gtp-pp'):
         group = create_group(
             ranks,
             timeout=timeout,
@@ -1406,6 +1409,21 @@ def initialize_model_parallel(
         )
         if rank in ranks:
             _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP = group
+
+    # Expert+tensor+pipeline group merged across EGTP peers — expert analog of the dense
+    # _MODEL_PARALLEL_GROUP merge (above). The 'tp-ep-gtp-pp' token spans the egtp axis; with
+    # expert_gtp_remat_size=1 it reduces to the plain tp-ep-pp groups. Merging gives EGTP peers
+    # distinct ranks; see gtp/README.md §3.3 (Optimizer state) for the DCP-collision rationale.
+    global _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP_WITH_EGTP
+    for ranks in expert_decoder_rank_generator.get_ranks('tp-ep-gtp-pp'):
+        group = create_group(
+            ranks,
+            timeout=timeout,
+            pg_options=get_nccl_options("tp_ep_pp", nccl_comm_cfgs),
+            group_desc="EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP_WITH_EGTP",
+        )
+        if rank in ranks:
+            _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP_WITH_EGTP = group
 
     # Build the expert data parallel group
     global _EXPERT_DATA_PARALLEL_GROUP
@@ -2307,8 +2325,23 @@ def get_expert_tensor_and_model_parallel_rank():
         return 0
 
 
-def get_expert_tensor_model_pipeline_parallel_group(check_initialized=True):
-    """Get expert tensor-model-pipeline parallel group."""
+def get_expert_tensor_model_pipeline_parallel_group(check_initialized=True, with_egtp=False):
+    """Get expert tensor-model-pipeline parallel group.
+
+    Args:
+        check_initialized: If True (default), asserts the group has been created.
+        with_egtp: If True, return the EGTP-merged variant — the analog of dense
+            ``get_model_parallel_group()`` (which merges across GTP peers). Use this when you
+            need a group whose rank uniquely identifies each (ETP, EP, PP, EGTP) position;
+            e.g. for the MoE distributed optimizer's ``data_parallel_group_idx``. Identical
+            to the vanilla group when EGTP=1.
+    """
+    if with_egtp:
+        if check_initialized:
+            assert (
+                _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP_WITH_EGTP is not None
+            ), "Expert tensor-model-pipeline parallel group with EGTP is not initialized"
+        return _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP_WITH_EGTP
     if check_initialized:
         assert (
             _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP is not None
@@ -2567,6 +2600,9 @@ def destroy_model_parallel():
 
     global _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP
     _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP = None
+
+    global _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP_WITH_EGTP
+    _EXPERT_TENSOR_MODEL_PIPELINE_PARALLEL_GROUP_WITH_EGTP = None
 
     global _EXPERT_DATA_PARALLEL_GROUP
     _EXPERT_DATA_PARALLEL_GROUP = None

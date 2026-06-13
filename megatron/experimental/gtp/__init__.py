@@ -21,6 +21,8 @@ try:
         classify_gtp_chains,
         get_ag_stream,
         get_rs_stream,
+        make_sharded_tensors_for_checkpoint_with_gtp,
+        reset_gtp_quantize_cache,
         set_cuda_graph_mempool,
         set_cuda_graph_modules,
         tag_gtp_params_with_names,
@@ -32,6 +34,9 @@ try:
 
     HAVE_GTP = True
 except ImportError:
+    # GTP requires TransformerEngine with the GTP hook registry; when it's
+    # unavailable only ``HAVE_GTP`` is exposed. Consumers import the other
+    # symbols lazily under an ``if HAVE_GTP:`` guard, so no fallbacks are needed.
     HAVE_GTP = False
 
 
@@ -44,6 +49,8 @@ __all__ = [
     "classify_gtp_chains",
     "get_ag_stream",
     "get_rs_stream",
+    "make_sharded_tensors_for_checkpoint_with_gtp",
+    "reset_gtp_quantize_cache",
     "set_cuda_graph_mempool",
     "set_cuda_graph_modules",
     "tag_gtp_params_with_names",

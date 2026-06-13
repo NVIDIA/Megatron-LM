@@ -177,7 +177,7 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
     _sum_reduce(moe_gtp_sharded_norm_2, mpu.get_expert_data_parallel_group(with_gtp=True))
 
     # --- Combine dense + GTP norms ---
-    # model_parallel group = TP×PP×GTP, so GTP reduction is implicit.
+    # model_parallel group = TP×GTP×PP, so GTP reduction is implicit.
     norm_2 = params_norm_2 + sharded_norm_2 + gtp_norm_2 + gtp_sharded_norm_2
 
     # --- Combine MoE + MoE-GTP norms ---

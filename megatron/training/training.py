@@ -217,6 +217,7 @@ from megatron.core.transformer.moe import upcycling_utils
 from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.utils import get_batch_on_this_cp_rank, get_batch_on_this_tp_rank, unwrap_model
+from megatron.experimental.gtp import HAVE_GTP
 from megatron.training.config import FaultInjectorConfig
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
 from megatron.training.initialize import (
@@ -301,6 +302,23 @@ def print_datetime(string, override_timestamp=None):
     else:
         time_str = datetime.fromtimestamp(override_timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')
     print_rank_0(f'[{string}] datetime: {time_str} ')
+
+
+def reset_gtp_quantize_cache_after_load(model):
+    """Invalidate GTP's per-shard low-precision cache after a checkpoint load.
+
+    GTP keeps a per-shard low-precision cache (``self.quantized``) that survives the
+    in-place writes to ``.data`` performed by DCP load. Reset it so the first forward
+    after resume re-quantizes from the freshly-loaded BF16 weight instead of reusing
+    the stale pre-load cast (which otherwise spikes lm-loss for one iteration before
+    normal training overwrites the cache). No-op when GTP is unavailable.
+    """
+    if not HAVE_GTP:
+        return
+    from megatron.experimental.gtp import reset_gtp_quantize_cache
+
+    for m in model:
+        reset_gtp_quantize_cache(m)
 
 # Per-iteration packed-sequence (THD) accumulator. The tensor holds TWO stats,
 # both computed from the REAL ``cu_seqlens`` (i.e. unpadded sub-sequence lengths
@@ -1759,9 +1777,10 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     )
     if get_pg_rank(pg_collection.dp) == 0 and get_pg_rank(pg_collection.cp) == 0:
         print(
-            ' > number of parameters on (tensor, pipeline) '
-            'model parallel rank ({}, {}): {}'.format(
+            ' > number of parameters on (tensor, gtp, pipeline) '
+            'model parallel rank ({}, {}, {}): {}'.format(
                 get_pg_rank(pg_collection.tp),
+                get_pg_rank(pg_collection.gtp),
                 get_pg_rank(pg_collection.pp),
                 num_parameters,
             ),
@@ -2097,6 +2116,7 @@ def setup_model_and_optimizer(
             and getattr(args, "use_torch_fsdp2", False)
             and args.ckpt_format == "torch_dist",
         )
+        reset_gtp_quantize_cache_after_load(model)
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
         one_logger and one_logger.log_metrics(
@@ -3179,6 +3199,7 @@ def train(
                     and getattr(args, "use_torch_fsdp2", False)
                     and args.ckpt_format == "torch_dist",
                 )
+            reset_gtp_quantize_cache_after_load(model)
             ref_state_dict = {k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()}
 
             # Reload RL training checkpoint weights
@@ -3194,6 +3215,7 @@ def train(
                     and getattr(args, "use_torch_fsdp2", False)
                     and args.ckpt_format == "torch_dist",
                 )
+            reset_gtp_quantize_cache_after_load(model)
 
             args.no_load_optim = no_load_optim
 
