@@ -3,6 +3,8 @@
 # Copyright (c) 2025 DeepSeek
 # Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
 
+import inspect
+import warnings
 from typing import Optional
 
 from megatron.core.utils import internal_api
@@ -275,6 +277,38 @@ except ImportError:
     HAVE_HYBRIDEP = False
 
 _hybrid_ep_buffer = None
+_hybrid_ep_supports_fused_dispatch = None
+_hybrid_ep_warned_unsupported_fused_dispatch = False
+
+
+def _normalize_hybrid_ep_dispatch_options(
+    fused: bool, num_blocks_permute: Optional[int], num_blocks_unpermute: Optional[int]
+):
+    """Drop unsupported HybridEP fused-dispatch options after checking the API once."""
+    global _hybrid_ep_supports_fused_dispatch
+    global _hybrid_ep_warned_unsupported_fused_dispatch
+
+    if not fused and num_blocks_permute is None and num_blocks_unpermute is None:
+        return fused, num_blocks_permute, num_blocks_unpermute
+
+    if _hybrid_ep_supports_fused_dispatch is None:
+        sig = inspect.signature(HybridEPBuffer.dispatch_with_permute)
+        _hybrid_ep_supports_fused_dispatch = 'fuse_permute_dispatch' in sig.parameters
+
+    if _hybrid_ep_supports_fused_dispatch:
+        return fused, num_blocks_permute, num_blocks_unpermute
+
+    if not _hybrid_ep_warned_unsupported_fused_dispatch:
+        warnings.warn(
+            "Current DeepEP version does not support fused permute dispatch or "
+            "num_blocks_permute/num_blocks_unpermute. Falling back to unfused "
+            "HybridEP dispatch.",
+            UserWarning,
+            stacklevel=3,
+        )
+        _hybrid_ep_warned_unsupported_fused_dispatch = True
+
+    return False, None, None
 
 
 def init_hybrid_ep_buffer(
@@ -375,22 +409,9 @@ class HybridEPDispatch(torch.autograd.Function):
         '''
         Forward pass of fused dispatch of the HybridEP backend
         '''
-        if fused or num_blocks_permute is not None or num_blocks_unpermute is not None:
-            import inspect
-            import warnings
-
-            sig = inspect.signature(HybridEPBuffer.dispatch_with_permute)
-            if 'fuse_permute_dispatch' not in sig.parameters:
-                warnings.warn(
-                    "Current DeepEP version does not support fused permute dispatch or "
-                    "num_blocks_permute/num_blocks_unpermute. Falling back to unfused "
-                    "HybridEP dispatch.",
-                    UserWarning,
-                    stacklevel=2,
-                )
-                fused = False
-                num_blocks_permute = None
-                num_blocks_unpermute = None
+        fused, num_blocks_permute, num_blocks_unpermute = _normalize_hybrid_ep_dispatch_options(
+            fused, num_blocks_permute, num_blocks_unpermute
+        )
 
         if _hybrid_ep_buffer is None:
             num_tokens, hidden_dim = x.shape[-2:]
