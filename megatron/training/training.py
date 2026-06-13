@@ -241,6 +241,7 @@ from megatron.core.num_microbatches_calculator import (
     update_num_microbatches,
 )
 from megatron.core.pipeline_parallel import get_forward_backward_func
+from megatron.core.pipeline_parallel.hybrid_cp_schedule import get_num_total_groups
 
 from . import ft_integration, one_logger_utils
 from .activation_logging import (
@@ -1367,6 +1368,25 @@ def pretrain(
 
     one_logger = get_one_logger()
     one_logger and one_logger.log_metrics(app_metrics)
+
+    if args.hybrid_context_parallel:
+        if mpu.get_tensor_model_parallel_rank() == 0:
+            assert train_data_iterator is not None, "train_data_iterator must be provided for TP0 rank before Dynamic CP wrapper"
+        train_data_iterator = iter(HybridCPDataLoaderWrapper(train_data_iterator, config))
+        if isinstance(valid_data_iterator, list):
+            valid_data_iterator = [
+                iter(HybridCPDataLoaderWrapper(v, config)) if v is not None else None
+                for v in valid_data_iterator
+            ]
+        elif valid_data_iterator is not None:
+            valid_data_iterator = iter(HybridCPDataLoaderWrapper(valid_data_iterator, config))
+        if isinstance(test_data_iterator, list):
+            test_data_iterator = [
+                iter(HybridCPDataLoaderWrapper(v, config)) if v is not None else None
+                for v in test_data_iterator
+            ]
+        elif test_data_iterator is not None:
+            test_data_iterator = iter(HybridCPDataLoaderWrapper(test_data_iterator, config))
 
     wandb_writer = get_wandb_writer()
     if wandb_writer:
@@ -3204,9 +3224,6 @@ def train(
 
     energy_monitor = get_energy_monitor()
     one_logger = get_one_logger()
-
-    if args.hybrid_context_parallel:
-        train_data_iterator = iter(HybridCPDataLoaderWrapper(train_data_iterator, config))
 
     if args.run_workload_inspector_server:
         try:
