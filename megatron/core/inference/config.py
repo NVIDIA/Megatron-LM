@@ -120,13 +120,12 @@ class KVCacheManagementMode(str, Enum):
 class CudaGraphSizingDistribution(str, Enum):
     """How CUDA graph token-count sizes are spaced when generating the captured graphs.
 
-    EXPONENTIAL (default) — token counts halve from `cuda_graph_max_tokens` down to `tp_size`,
-    giving a log-spaced distribution. Bounded relative padding (~2x worst case) at every scale and
-    `log2(max_tokens)` total graphs.
+    LINEAR (default) preserves the weekend-branch sizing: include size-1
+    and size-2 graphs where applicable, then use linear spacing up until
+    256 and sparser linear spacing past 256.
 
-    LINEAR — Include size-1 and size-2 graphs where applicable, linear spacing up until 256, and
-    sparser linear spacing past 256. e.g. `[1, 2, 4] + range(8, 256, 8) + range(256, max+1, 16)`.
-    Higher graph density at the top end.
+    EXPONENTIAL halves from `cuda_graph_max_tokens` down to `tp_size`, giving
+    a log-spaced distribution with bounded relative padding at every scale.
     """
 
     EXPONENTIAL = "exponential"
@@ -217,14 +216,10 @@ class InferenceConfig:
     The number of mixed prefill graphs to capture if mixed prefill/decode graphs are enabled.
     """
 
-    cuda_graph_sizing_distribution: CudaGraphSizingDistribution = (
-        CudaGraphSizingDistribution.EXPONENTIAL
-    )
+    cuda_graph_sizing_distribution: CudaGraphSizingDistribution = CudaGraphSizingDistribution.LINEAR
     """
-    How CUDA graph token counts are spaced. EXPONENTIAL (default) halves from
-    `cuda_graph_max_tokens` down to `tp_size` (log-spaced, ~log2(max_tokens) graphs).
-    LINEAR uses a range of linear strides (includes small graphs + mid-range linearity + 
-    a bigger step size at the top end).
+    How CUDA graph token counts are spaced. LINEAR is the default for parity
+    with the weekend async-scheduling branch. EXPONENTIAL is an explicit opt-in.
     """
 
     use_cuda_graphs_for_non_decode_steps: bool = True
@@ -277,6 +272,16 @@ class InferenceConfig:
 
     num_speculative_tokens: int = 0
     """The number of speculative tokens to generate for decode steps."""
+
+    enable_async_scheduling: bool = False
+    """Whether to speculatively launch eligible decode-only forward passes."""
+
+    async_row_map_policy: str = "reuse"
+    """
+    Pending-forward row reuse policy for async scheduling. ``reuse`` preserves
+    PR 5202 row-mapped pending-forward reuse; ``identity_only`` accepts only
+    exact-layout pending forwards for async-on/off parity validation.
+    """
 
     enable_prefix_caching: bool = False
     """Whether to enable prefix caching for KV cache block sharing."""

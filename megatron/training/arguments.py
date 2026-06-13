@@ -1943,6 +1943,11 @@ def _add_inference_args(parser):
                        help="Enable chunked prefill (disabled by default)")
     group.add_argument('--num-speculative-tokens', type=int, default=0,
                        help='Number of speculative tokens generated during decode')
+    group.add_argument('--inference-dynamic-batching-async-scheduling',
+                       '--enable-async-scheduling',
+                       dest='inference_dynamic_batching_enable_async_scheduling',
+                       action='store_true', default=False,
+                       help='Enable async scheduling for eligible dynamic batching decode steps.')
     group.add_argument('--inference-dynamic-batching-prefix-caching',
                        dest='inference_dynamic_batching_enable_prefix_caching',
                        action=argparse.BooleanOptionalAction,
@@ -1984,13 +1989,14 @@ def _add_inference_args(parser):
                        type=int, default=16,
                        help='Number of mixed prefill requests to capture in a cuda graph.')
     group.add_argument('--inference-dynamic-batching-cuda-graph-sizing-distribution',
-                       type=str, default='exponential',
+                       type=str, default='linear',
                        choices=['exponential', 'linear'],
                        dest='inference_dynamic_batching_cuda_graph_sizing_distribution',
-                       help='Spacing of CUDA graph token counts. "exponential" (default) '
-                            'halves from cuda_graph_max_tokens down to tp_size, giving a '
-                            'log-spaced distribution with bounded relative padding. '
-                            '"linear" uses varying linear strides across the range.')
+                       help='Spacing of CUDA graph token counts. "linear" (default) '
+                            'preserves the weekend async-scheduling graph buckets. '
+                            '"exponential" halves from cuda_graph_max_tokens down to '
+                            'tp_size, giving a log-spaced distribution with bounded '
+                            'relative padding.')
     group.add_argument('--inference-dynamic-batching-sampling-backend',
                        type=str, default='torch',
                        choices=['torch', 'flashinfer'],

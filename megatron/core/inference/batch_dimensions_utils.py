@@ -14,6 +14,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from megatron.core.inference.ep_async_protocol import EPAsyncPhase
 from megatron.core.utils import get_pg_size, round_up_to_nearest_multiple
 
 
@@ -142,7 +143,12 @@ class InferenceBatchDimensions:
     @staticmethod
     def adjust_batch_dims_for_expert_parallelism(
         local_batch_dims,
+        strict: bool = False,
+        decode_only_cuda_graphs: bool = True,
+        smallest_non_decode_cuda_graph_size: int = 0,
         ep_group: Optional[torch.distributed.ProcessGroup] = None,
+        num_speculative_tokens: int = 0,
+        ep_async_protocol=None,
         ep_zmq_communicator=None,
     ) -> Optional["InferenceBatchDimensions"]:
         """Adjust CUDA graph batch dimensions for expert parallelism.
@@ -154,14 +160,17 @@ class InferenceBatchDimensions:
 
         Args:
             local_batch_dims: The local batch dimensions to adjust.
+            strict: Whether to use strict matching for batch dimensions.
+            decode_only_cuda_graphs: Whether CUDA graphs are only used for decode steps.
             ep_group: Optional expert parallel process group. If None, uses global parallel state.
                       When using different EP sizes for inference vs training, pass the
                       inference EP group explicitly.
+            ep_async_protocol: Optional EPAsyncStepProtocol over the EP group. When
+                      provided, the cross-rank MAX reduction runs as the tagged
+                      EP graph-shape phase for the active protocol step.
             ep_zmq_communicator: Optional AsyncZMQCommunicator over the EP group. When
-                      provided, the cross-rank MAX reduction runs on the CPU via ZMQ
-                      (no GPU kernel, no H2D/D2H), avoiding a per-step NCCL AllReduce
-                      on the compute stream. When absent, falls back to
-                      torch.distributed.all_reduce on a GPU tensor.
+                      provided without an EP async protocol, the cross-rank MAX reduction
+                      runs on CPU via ZMQ.
 
         Returns:
             InferenceBatchDimensions with max token count, or None for eager mode.
@@ -172,15 +181,38 @@ class InferenceBatchDimensions:
 
         is_non_decode = local_batch_dims.prefill_req_count > 0
 
-        if ep_zmq_communicator is not None:
+        if ep_async_protocol is not None:
+            # CPU-only sync via the tagged EP protocol: avoids a NCCL
+            # AllReduce kernel and keeps graph-shape selection ordered with
+            # the rest of the EP async step.
+            (max_token_count, max_is_non_decode, max_prefill_count, max_decode_count) = (
+                ep_async_protocol.sync_all_reduce_max(
+                    EPAsyncPhase.GRAPH_SHAPE,
+                    local_batch_dims.token_count,
+                    int(is_non_decode),
+                    local_batch_dims.prefill_req_count,
+                    local_batch_dims.decode_req_count,
+                )
+            )
+        elif ep_zmq_communicator is not None:
             # CPU-only sync via ZMQ: avoids a NCCL AllReduce kernel on the
             # compute stream plus the H2D/D2H pair that sandwiches it.
-            (max_token_count, max_is_non_decode) = ep_zmq_communicator.sync_all_reduce_max(
-                local_batch_dims.token_count, int(is_non_decode)
+            (max_token_count, max_is_non_decode, max_prefill_count, max_decode_count) = (
+                ep_zmq_communicator.sync_all_reduce_max(
+                    local_batch_dims.token_count,
+                    int(is_non_decode),
+                    local_batch_dims.prefill_req_count,
+                    local_batch_dims.decode_req_count,
+                )
             )
         else:
             sync_tensor = torch.tensor(
-                [local_batch_dims.token_count, int(is_non_decode)],
+                [
+                    local_batch_dims.token_count,
+                    int(is_non_decode),
+                    local_batch_dims.prefill_req_count,
+                    local_batch_dims.decode_req_count,
+                ],
                 dtype=torch.int32,
                 device=torch.cuda.current_device(),
             )
@@ -190,16 +222,44 @@ class InferenceBatchDimensions:
             sync_tensor = sync_tensor.cpu()
             max_token_count = int(sync_tensor[0].item())
             max_is_non_decode = int(sync_tensor[1].item())
+            max_prefill_count = int(sync_tensor[2].item())
+            max_decode_count = int(sync_tensor[3].item())
 
         is_any_ep_rank_in_non_decode = max_is_non_decode == 1
 
-        if is_any_ep_rank_in_non_decode:
+        if is_any_ep_rank_in_non_decode and decode_only_cuda_graphs:
             return None  # any rank has prefill → eager mode
 
+        adjusted_token_count = max_token_count
+
+        # Sync request counts across EP ranks when strict matching is enabled
+        # or when speculative tokens are used.  With speculative tokens,
+        # decode-only graphs have token counts of decode_req_count * (spec+1)
+        # which creates a different granularity than mixed graphs (raw sizes).
+        # Without syncing, decode-only ranks and prefill ranks search different
+        # graph pools and may pick graphs with different token counts.
+        sync_request_counts = strict or (
+            is_any_ep_rank_in_non_decode and num_speculative_tokens > 0
+        )
+        adjusted_prefill_req_count = (
+            max_prefill_count if sync_request_counts else local_batch_dims.prefill_req_count
+        )
+        adjusted_decode_req_count = (
+            max_decode_count if sync_request_counts else local_batch_dims.decode_req_count
+        )
+
+        # When any EP rank has prefill requests (non-strict mode), elevate
+        # the token count to be >= the smallest prefill/mixed cuda graph.
+        # This ensures decode-only ranks don't match a fine-grained decode
+        # graph while prefill ranks match a coarser mixed graph, which would
+        # produce inconsistent token counts across EP ranks.
+        if is_any_ep_rank_in_non_decode and not strict:
+            adjusted_token_count = max(adjusted_token_count, smallest_non_decode_cuda_graph_size)
+
         adjusted_batch_dim = InferenceBatchDimensions(
-            token_count=max_token_count,
-            prefill_req_count=local_batch_dims.prefill_req_count,
-            decode_req_count=local_batch_dims.decode_req_count,
+            token_count=adjusted_token_count,
+            prefill_req_count=adjusted_prefill_req_count,
+            decode_req_count=adjusted_decode_req_count,
         )
 
         return adjusted_batch_dim
@@ -212,8 +272,10 @@ class CUDAGraphBatchDimensionBuilder:
     and matching the best batch dimension for a given real batch dimension.
     """
 
-    # Constant for rounding token counts when generating CUDA graph batch dimensions
-    CUDA_GRAPH_ROUNDER = 2
+    # Legacy linear sizing rounds graph token counts the same way as the weekend branch.
+    LINEAR_CUDA_GRAPH_ROUNDER = 8
+    EXPONENTIAL_CUDA_GRAPH_ROUNDER = 2
+    CUDA_GRAPH_ROUNDER = LINEAR_CUDA_GRAPH_ROUNDER
 
     @staticmethod
     def _calculate_cuda_graph_token_counts(
@@ -226,16 +288,14 @@ class CUDAGraphBatchDimensionBuilder:
         Calculate CUDA graph token counts for a given configuration.
 
         Dispatches on `sizing_distribution`:
-          - EXPONENTIAL (default): halves from cuda_graph_max_tokens down to tp_size, log-spaced,
-            creates log2(max_tokens) graphs.
-          - LINEAR: small graphs [1, 2, 4] + range(8, 256, 8) + range(256, max+1, 16);
-            explicit-N path uses even 16-stride from 0 to max.
+          - LINEAR (default): weekend-compatible graph buckets.
+          - EXPONENTIAL: halves from cuda_graph_max_tokens down to tp_size, log-spaced.
 
         Args:
             tp_size: Tensor parallel size (for alignment)
             num_cuda_graphs: Number of CUDA graphs to generate (must be >= 1, or -1 to auto-size)
             cuda_graph_max_tokens: Maximum token count for CUDA graphs (must be > 0)
-            sizing_distribution: Distribution of cudagraph sizes. Defaults to EXPONENTIAL.
+            sizing_distribution: Distribution of cudagraph sizes. Defaults to LINEAR.
 
         Returns:
             List of token counts in descending order
@@ -248,7 +308,7 @@ class CUDAGraphBatchDimensionBuilder:
         from megatron.core.inference.config import CudaGraphSizingDistribution
 
         if sizing_distribution is None:
-            sizing_distribution = CudaGraphSizingDistribution.EXPONENTIAL
+            sizing_distribution = CudaGraphSizingDistribution.LINEAR
 
         if sizing_distribution == CudaGraphSizingDistribution.LINEAR:
             return CUDAGraphBatchDimensionBuilder._calculate_token_counts_linear(
@@ -277,18 +337,6 @@ class CUDAGraphBatchDimensionBuilder:
             cuda_graph_max_tokens > 0
         ), f"cuda_graph_max_tokens must be > 0, got {cuda_graph_max_tokens}"
 
-        rounder = CUDAGraphBatchDimensionBuilder.CUDA_GRAPH_ROUNDER
-
-        # Cuda graph step size.
-        cuda_graph_step_size = cuda_graph_max_tokens / num_cuda_graphs
-        cuda_graph_step_size = CUDAGraphBatchDimensionBuilder.CUDA_GRAPH_ROUNDER * int(
-            math.ceil(int(cuda_graph_step_size) / CUDAGraphBatchDimensionBuilder.CUDA_GRAPH_ROUNDER)
-        )
-        # Make sure divisible by TP size
-        cuda_graph_step_size = round_up_to_nearest_multiple(cuda_graph_step_size, tp_size)
-        # Ensure non-zero step size (can happen when max_tokens < num_cuda_graphs).
-        cuda_graph_step_size = max(cuda_graph_step_size, tp_size)
-
         # Round down cuda graph max tokens to be multiple of TP size
         cuda_graph_max_tokens = (cuda_graph_max_tokens // tp_size) * tp_size
 
@@ -298,6 +346,7 @@ class CUDAGraphBatchDimensionBuilder:
         # Exponentially decreasing token counts: halve from max_tokens until below the rounder floor
         # or num_cuda_graphs. Dedupe (the rounding/TP-alignment can collide for small values),
         # then sort descending.
+        rounder = CUDAGraphBatchDimensionBuilder.EXPONENTIAL_CUDA_GRAPH_ROUNDER
         sizes = set()
         val = cuda_graph_max_tokens
         for _ in range(num_cuda_graphs):
@@ -335,7 +384,7 @@ class CUDAGraphBatchDimensionBuilder:
         TP-aligned and deduped.
         For positive N, returns evenly-spaced sizes with step ~ max_tokens / N.
         """
-        rounder = CUDAGraphBatchDimensionBuilder.CUDA_GRAPH_ROUNDER
+        rounder = CUDAGraphBatchDimensionBuilder.LINEAR_CUDA_GRAPH_ROUNDER
 
         if num_cuda_graphs == -1:
             sizes = (
@@ -443,7 +492,7 @@ class CUDAGraphBatchDimensionBuilder:
             from megatron.core.inference.config import CudaGraphSizingDistribution
 
             if sizing_distribution is None:
-                sizing_distribution = CudaGraphSizingDistribution.EXPONENTIAL
+                sizing_distribution = CudaGraphSizingDistribution.LINEAR
 
             # Ensure valid num_cuda_graphs.
             if (
@@ -530,14 +579,12 @@ class CUDAGraphBatchDimensionBuilder:
         else:
             # Mixed prefill and decode mode.
             #
-            # Under EXPONENTIAL distribution (default): generate mixed CGs across a
-            # geometric P-grid {1, 2, 4, ..., max_requests}. This bounds the relative
-            # overhead per real batch (~2x P slack worst case) and is the structural fix
-            # that makes mixed CGs usable for real batches with P != fixed_P.
-            #
             # Under LINEAR distribution: use the legacy fixed P value
-            # (cuda_graph_mixed_prefill_request_count) — same single-P behavior main has
-            # today, for apples-to-apples benchmarking against vLLM-style configurations.
+            # (cuda_graph_mixed_prefill_request_count), matching the weekend branch.
+            #
+            # Under EXPONENTIAL distribution: generate mixed CGs across a
+            # geometric P-grid {1, 2, 4, ..., max_requests}. This bounds the relative
+            # overhead per real batch when explicitly enabled.
             if sizing_distribution == CudaGraphSizingDistribution.LINEAR:
                 p_values = [min(cuda_graph_mixed_prefill_request_count, max_requests)]
                 # In legacy mode, the prefill-only floor uses the fixed P value to match
@@ -622,8 +669,12 @@ class CUDAGraphBatchDimensionBuilder:
     def match_graph_config(
         real_batch_dim: InferenceBatchDimensions,
         cuda_graph_batch_dimensions_list: List[InferenceBatchDimensions],
+        smallest_non_decode_cuda_graph_size: int = 0,
         strict: bool = False,
+        decode_only_cuda_graphs: bool = True,
         ep_group: Optional[torch.distributed.ProcessGroup] = None,
+        num_speculative_tokens: int = 0,
+        ep_async_protocol=None,
         ep_zmq_communicator=None,
         match_ep_token_counts: bool = True,
     ) -> Optional[InferenceBatchDimensions]:
@@ -641,9 +692,13 @@ class CUDAGraphBatchDimensionBuilder:
             ep_group: Optional expert parallel process group. If None, uses global parallel state.
                       When using different EP sizes for inference vs training, pass the
                       inference EP group explicitly.
+            ep_async_protocol: Optional EPAsyncStepProtocol over the EP group. When
+                      provided, batch-dimension MAX reduction uses the tagged
+                      EP graph-shape protocol phase. Forwarded to
+                      adjust_batch_dims_for_expert_parallelism.
             ep_zmq_communicator: Optional AsyncZMQCommunicator over the EP group. When
-                      provided, batch-dimension MAX reduction uses a CPU-only ZMQ sync
-                      instead of a GPU NCCL AllReduce. Forwarded to
+                      provided without an EP async protocol, batch-dimension MAX
+                      reduction uses a CPU-only ZMQ sync. Forwarded to
                       adjust_batch_dims_for_expert_parallelism.
             match_ep_token_counts: If True (default), token counts are synced across EP ranks via
                 all-reduce-max so all ranks select the same CUDA graph. Set to False when the
@@ -661,7 +716,14 @@ class CUDAGraphBatchDimensionBuilder:
             # NCCL dispatcher: all EP ranks must select the same CUDA graph. Sync batch dims
             # across the EP group so graph selection is consistent.
             adjusted_batch_dim = InferenceBatchDimensions.adjust_batch_dims_for_expert_parallelism(
-                real_batch_dim, ep_group=ep_group, ep_zmq_communicator=ep_zmq_communicator
+                real_batch_dim,
+                strict=strict,
+                decode_only_cuda_graphs=decode_only_cuda_graphs,
+                ep_group=ep_group,
+                smallest_non_decode_cuda_graph_size=smallest_non_decode_cuda_graph_size,
+                num_speculative_tokens=num_speculative_tokens,
+                ep_async_protocol=ep_async_protocol,
+                ep_zmq_communicator=ep_zmq_communicator,
             )
 
             if adjusted_batch_dim is None:

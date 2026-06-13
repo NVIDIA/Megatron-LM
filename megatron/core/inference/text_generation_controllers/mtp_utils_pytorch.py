@@ -237,19 +237,28 @@ def prepare_next_forward_pass(
 
 
 def mamba_state_selective_copy(
-    intermediate_states, current_states, prefill_status, state_idx, accepted_counts, num_layers
+    intermediate_states,
+    current_states,
+    prefill_status,
+    state_idx,
+    accepted_counts,
+    num_layers,
+    destination_state_idx=None,
 ):
     """Mamba speculative rewind state update.
 
     For each decode request, copies
     `intermediate[layer, slot, accepted_count, ...]` →
-    `current[layer, slot, ...]` for every Mamba layer.
+    `current[layer, destination_slot, ...]` for every Mamba layer.
     """
+    if destination_state_idx is None:
+        destination_state_idx = state_idx
     N = prefill_status.shape[0]
     for i in range(N):
         if prefill_status[i].item() == 1:
             continue
         slot = state_idx[i].item()
+        destination_slot = destination_state_idx[i].item()
         accepted = accepted_counts[i].item()
         for layer in range(num_layers):
-            current_states[layer, slot] = intermediate_states[layer, slot, accepted]
+            current_states[layer, destination_slot] = intermediate_states[layer, slot, accepted]
