@@ -193,10 +193,20 @@ def test_checkpoint():
     assert torch.equal(
         torch.ones(16) * 3, checkpoint(test_forward, None, torch.ones(16), torch.ones(16) * 2)
     )
-    Utils.initialize_model_parallel()
-    input1 = torch.ones((4, 4))
-    checkpoint(test_forward, True, input1, torch.ones((4, 4)) * 2)
-    assert torch.equal(torch.ones(input1.numel()).cuda(), input1)
+
+    Utils.initialize_model_parallel(tensor_model_parallel_size=2, pipeline_model_parallel_size=1)
+    input1 = torch.ones((4, 4)).cuda()
+    input1.requires_grad_(True)
+    input2 = torch.ones((4, 4)).cuda() * 2
+    output = checkpoint(test_forward, True, input1, input2)
+
+    assert torch.equal(output, torch.ones((4, 4)).cuda() * 3)
+    assert input1.data.shape == (8,)
+
+    output.sum().backward()
+    assert input1.grad is not None
+    assert torch.equal(input1.grad, torch.ones((4, 4)).cuda())
+
     Utils.destroy_model_parallel()
 
 

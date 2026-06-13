@@ -152,11 +152,13 @@ class ProcessGroupCollection:
         for field_info in fields(self):
             if hasattr(self, field_info.name):
                 pg = getattr(self, field_info.name)
-                if pg is not None:
-                    active_pgs.append(f"{field_info.name}({pg.size()})")
-                else:
-                    # Field exists but is None
+                if pg is None:
                     active_pgs.append(f"{field_info.name}(None)")
+                elif isinstance(pg, list):
+                    sizes = [g.size() for g in pg]
+                    active_pgs.append(f"{field_info.name}({sizes})")
+                else:
+                    active_pgs.append(f"{field_info.name}({pg.size()})")
         return (
             f"ProcessGroupCollection({', '.join(active_pgs)})"
             if active_pgs
