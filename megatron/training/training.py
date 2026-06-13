@@ -1551,8 +1551,9 @@ def wrap_model_chunks_with_ddp(
             to DDP. ``False`` keeps LayerWise on its legacy sync path.
         DP: The DDP class to construct (``DistributedDataParallel`` or an FSDP
             variant).
-        pg_collection: Optional :class:`ProcessGroupCollection`. Forwarded to
-            FSDP-style DPs only.
+        pg_collection: Optional :class:`ProcessGroupCollection`. When provided,
+            forwarded to both standard DDP and FSDP variants, and used to source
+            DP world sizes for layout computation.
         bucket_sizes: Optional per-chunk bucket size override; defaults to
             ``[ddp_config.bucket_size] * len(model_chunks)``.
         disable_bucketing_per_chunk: Optional per-chunk disable_bucketing flag;
@@ -1583,10 +1584,17 @@ def wrap_model_chunks_with_ddp(
         else:
             compute_layout = None
         if compute_layout is not None:
-            data_parallel_world_size = mpu.get_data_parallel_world_size(
-                with_context_parallel=True
+            layout_pgs = (
+                pg_collection
+                if pg_collection is not None
+                else ProcessGroupCollection.use_mpu_process_groups()
             )
-            expert_data_parallel_world_size = mpu.get_expert_data_parallel_world_size()
+            assert layout_pgs.dp_cp is not None, (
+                "wrap_model_chunks_with_ddp requires a dp_cp process group to size "
+                "the distributed-optimizer parameter layout"
+            )
+            data_parallel_world_size = get_pg_size(layout_pgs.dp_cp)
+            expert_data_parallel_world_size = get_pg_size(getattr(layout_pgs, "expt_dp", None))
             for i, (chunk, bucket_size) in enumerate(zip(model_chunks, bucket_sizes)):
                 all_params = [p for p in chunk.parameters() if p.requires_grad]
                 per_chunk_layouts[i] = compute_layout(
@@ -1603,7 +1611,8 @@ def wrap_model_chunks_with_ddp(
         model_chunks, per_chunk_layouts, disable_bucketing_per_chunk
     ):
         chunk_kwargs = {}
-        if pg_collection is not None and DP is not DDP:
+        # TorchFSDP takes process_group, not pg_collection.
+        if pg_collection is not None and not (HAVE_FSDP2 and DP is torch_FSDP):
             chunk_kwargs["pg_collection"] = pg_collection
         if layout is not None:
             chunk_kwargs["full_param_layout"] = layout
