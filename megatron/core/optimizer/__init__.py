@@ -1002,6 +1002,14 @@ def get_megatron_optimizer(
         Instance of MegatronOptimizer.
     """
 
+    # A MimoModel routes to the heterogeneous per-module optimizer builder.
+    from megatron.core.models.mimo.model.base import MimoModel
+
+    if len(model_chunks) == 1 and isinstance(model_chunks[0], MimoModel):
+        from megatron.core.models.mimo.optimizer import get_mimo_optimizer
+
+        return get_mimo_optimizer(model_chunks[0], config)
+
     # None → apply standard defaults. To extend defaults with custom overrides,
     # start from get_standard_config_overrides(config) and merge yours in.
     if config_overrides is None:

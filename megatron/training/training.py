@@ -1957,6 +1957,7 @@ def setup_model_and_optimizer(
     model_provider_func,
     model_type,
     checkpointing_context=None,
+    pg_collection=None,
 ):
     """Setup model and optimizer."""
     args = get_args()
@@ -1969,7 +1970,9 @@ def setup_model_and_optimizer(
     has_rl_optimizer = args.perform_rl_step and not args.no_load_optim
     skip_optimizer = not (has_normal_optimizer or has_rl_optimizer)
     wrap_with_ddp = not skip_optimizer
-    model = get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp)
+    model = get_model(
+        model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp, pg_collection=pg_collection
+    )
     unwrapped_model = unwrap_model(model)
 
     if args.logits_save_dir is not None:
