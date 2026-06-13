@@ -40,7 +40,16 @@ PIPELINE_VARIABLES_FIXED = {
     "INTEGRATION_TEST": "no",
 }
 
+# No trigger-side scope aliases are applied. The internal GitLab CI / recipe
+# parser resolves legacy scope values server-side; bare `mr` maps to `L2`.
+SCOPE_ALIASES = {}
+
 logger = logging.getLogger(__name__)
+
+
+def normalize_scope(scope):
+    """Map a legacy FUNCTIONAL_TEST_SCOPE value to its L-tier equivalent."""
+    return SCOPE_ALIASES.get(scope, scope)
 
 
 def get_remote_url(origin):
@@ -122,8 +131,9 @@ def main():
     )
     parser.add_argument(
         "--functional-test-scope",
-        default="mr",
-        help="FUNCTIONAL_TEST_SCOPE pipeline variable (default: mr)",
+        default="L1,L2",
+        help="FUNCTIONAL_TEST_SCOPE pipeline variable (default: L1,L2). "
+        "Legacy 'mr' resolves server-side to L2.",
     )
     parser.add_argument(
         "--functional-test-repeat",
@@ -173,9 +183,17 @@ def main():
 
     git_push(args.gitlab_origin, target_branch, dry_run=args.dry_run)
 
+    functional_test_scope = normalize_scope(args.functional_test_scope)
+    if functional_test_scope != args.functional_test_scope:
+        logger.info(
+            "Normalized FUNCTIONAL_TEST_SCOPE '%s' -> '%s'",
+            args.functional_test_scope,
+            functional_test_scope,
+        )
+
     pipeline_vars = {
         **PIPELINE_VARIABLES_FIXED,
-        "FUNCTIONAL_TEST_SCOPE": args.functional_test_scope,
+        "FUNCTIONAL_TEST_SCOPE": functional_test_scope,
         "FUNCTIONAL_TEST_REPEAT": str(args.functional_test_repeat),
         "FUNCTIONAL_TEST_CASES": args.functional_test_cases,
     }

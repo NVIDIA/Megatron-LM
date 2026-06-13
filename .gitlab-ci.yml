@@ -44,7 +44,7 @@ workflow:
         UNIT_TEST: "no"
         INTEGRATION_TEST: "no"
         FUNCTIONAL_TEST: "yes"
-        FUNCTIONAL_TEST_SCOPE: mr
+        FUNCTIONAL_TEST_SCOPE: L1,L2
         FUNCTIONAL_TEST_REPEAT: 5
         FUNCTIONAL_TEST_RECORD_CHECKPOINTS: "no"
         FUNCTIONAL_TEST_TIME_LIMIT: 3600
@@ -126,7 +126,7 @@ workflow:
         UNIT_TEST_TIMEOUT: 30
         INTEGRATION_TEST: "no"
         FUNCTIONAL_TEST: "yes"
-        FUNCTIONAL_TEST_SCOPE: mr
+        FUNCTIONAL_TEST_SCOPE: L1,L2
         FUNCTIONAL_TEST_REPEAT: 1
         FUNCTIONAL_TEST_TIME_LIMIT: 2700
         CLUSTER_A100: ""
@@ -204,9 +204,10 @@ variables:
       - "no"
     description: To run the funtional test suite
   FUNCTIONAL_TEST_SCOPE:
-    value: "mr"
+    value: "L1,L2"
     options:
-      - "mr"
+      - "L1,L2"
+      - "mr-slim"
       - "nightly"
       - "weekly"
       - "pre-release"

@@ -3,7 +3,7 @@ import copy
 import itertools
 import logging
 import pathlib
-from typing import List, Optional
+from typing import List, Optional, Set
 
 import click
 import yaml
@@ -20,40 +20,51 @@ ALLOWED_CADENCE_VALUES = set(DEFAULT_CADENCE) | {"weekly"}
 # trigger, a default cadence. The tier acts purely as a suite/cost label;
 # cadence remains the trigger axis.
 #
-# Only GitHub-side scopes (`mr-github-slim`, `mr-github`) are aliased onto the
-# L-tier names. GitLab-only scopes (`mr`, `mr-slim`, `unit-tests`) are
-# intentionally left as pass-through so GitLab `--scope mr*` / `--scope
-# unit-tests` continue to match recipes verbatim and don't bleed into the
-# GitHub L0 / L1 matrix.
+# All legacy `scope` names (both GitHub-side `mr-github*` and GitLab-side
+# `mr*`) are aliased onto the unified L-tier vocabulary so legacy callers and
+# scheduled pipelines keep working: a `--scope mr-github` filter and a recipe
+# row tagged `scope: [L1]` match the same tier. A literal `mr` tag or filter
+# means a GitLab-only extra and resolves to the single tier `L2`. The slim PR
+# sets (`mr-slim`, `mr-github-slim`) both map to `L0`.
 #
 # L-tier vocabulary (cost class, ascending): `L0` (slim PR) < `L1` (full PR /
-# merge queue) < `L2` (nightly) < `L3` (weekly). `L0-smoke` is a sub-L0 tier
-# for fast lightweight smoke tests (cheaper than `L0`); it is GitLab-only and
-# passes through verbatim (not aliased here). Recipes tag rows with
-# `scope: [L0-smoke]` and GitLab selects them via `--scope L0-smoke`.
+# merge queue) < `L2` (GitLab MR extra) < `L3` (nightly) < `L4` (weekly).
+# `L0-smoke` is a sub-L0 tier for fast lightweight smoke tests; it passes
+# through verbatim and GitLab selects it via `--scope L0-smoke`.
 LEGACY_SCOPE_ALIASES = {
-    # GitHub-only scopes are aliased onto the L-tier vocabulary so the GH CI
-    # workflow can filter on `L0` / `L1`. GitLab-only scopes (`mr`, `mr-slim`)
-    # are intentionally NOT aliased: they pass through to recipe rows verbatim
-    # and remain matchable by GitLab's `--scope mr-slim` / `--scope mr` calls,
-    # without bleeding into the GitHub `L0` / `L1` matrix.
+    "mr-slim": ("L0", None),
     "mr-github-slim": ("L0", None),
     "mr-github": ("L1", None),
-    "nightly": ("L2", ["nightly"]),
-    "weekly": ("L3", ["weekly"]),
+    "mr": ("L2", None),
+    "nightly": ("L3", ["nightly"]),
+    "weekly": ("L4", ["weekly"]),
 }
 
 
 def _resolve_scope_alias(scope_value: str) -> str:
     """Resolve a legacy scope value to its L-tier alias (or return it unchanged).
 
-    Applied both to recipe rows when flattening and to the `--scope` filter
-    input, so callers can pass either the legacy name (e.g. `nightly`) or the
-    new L-tier name (e.g. `L2`) and hit the same recipe rows.
+    Applied when flattening recipe rows. For `--scope` filters, use
+    `_resolve_scope_filter` so comma-separated values (e.g. `L1,L2`) work.
     """
     if scope_value in LEGACY_SCOPE_ALIASES:
         return LEGACY_SCOPE_ALIASES[scope_value][0]
     return scope_value
+
+
+def _resolve_scope_filter(scope: str) -> Set[str]:
+    """Resolve a `--scope` filter to the set of L-tier names to match.
+
+    Supports comma-separated tiers, e.g. ``--scope L1,L2`` for a union. Each
+    token is legacy-aliased to a single tier.
+    """
+    tiers: Set[str] = set()
+    for part in scope.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        tiers.add(_resolve_scope_alias(part))
+    return tiers
 
 
 def _apply_scope_alias(scope_value: str, explicit_cadence: Optional[List[str]]) -> tuple:
@@ -232,18 +243,17 @@ def filter_by_test_case(workload_manifests: List[dotdict], test_case: str) -> Op
 
 
 def filter_by_scope(workload_manifests: List[dotdict], scope: str) -> List[dotdict]:
-    """Returns all workload with matching scope.
+    """Returns all workloads whose scope is in the resolved filter tier set.
 
-    The filter input is run through the same legacy-scope alias as recipe
-    rows, so callers passing the legacy name (e.g. `--scope nightly`,
-    `--scope mr-github`) match recipes that have already been rewritten to
-    the new L-tier vocabulary (e.g. `scope: [L2]`, `scope: [L1]`).
+    The filter input is legacy-aliased per token. Pass comma-separated tiers for a
+    union, e.g. ``--scope L1,L2`` (full GitLab MR) or legacy names such as
+    ``--scope mr-github``.
     """
-    resolved_scope = _resolve_scope_alias(scope)
+    resolved_scopes = _resolve_scope_filter(scope)
     workload_manifests = list(
         workload_manifest
         for workload_manifest in workload_manifests
-        if workload_manifest.spec["scope"] == resolved_scope
+        if workload_manifest.spec["scope"] in resolved_scopes
     )
 
     if len(workload_manifests) == 0:
