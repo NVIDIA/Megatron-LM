@@ -9,6 +9,8 @@ from packaging import version
 
 import megatron.core.parallel_state as parallel_state
 from megatron.core.hyper_comm_grid import HyperCommGrid
+from megatron.core.inference.contexts import StaticInferenceContext
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.common.embeddings.rope_utils import (
     get_pos_emb_on_this_cp_rank as get_tensor_on_this_cp_rank,
 )
@@ -20,7 +22,7 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.attention import SelfAttention
+from megatron.core.transformer.attention import SelfAttention, flash_attn_with_kvcache
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.utils import is_te_min_version, unwrap_model
 from megatron.training.arguments import parse_args
@@ -41,6 +43,112 @@ try:
     HAVE_FUSED_QKV_ROPE = True
 except ImportError:
     HAVE_FUSED_QKV_ROPE = False
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for TE attention")
+@pytest.mark.skipif(not is_te_min_version("1.0.0"), reason="Transformer Engine is required")
+@pytest.mark.skipif(flash_attn_with_kvcache is None, reason="flash-attn is required")
+def test_static_prefill_flash_decode_matches_uncached_attention():
+    Utils.initialize_model_parallel(1, 1)
+    model_parallel_cuda_manual_seed(123)
+    try:
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=256,
+            num_attention_heads=4,
+            num_query_groups=4,
+            use_cpu_initialization=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            flash_decode=True,
+        )
+        attention = SelfAttention(
+            config,
+            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection(tp=None, cp=None),
+        ).cuda()
+        attention.eval()
+
+        prefill_sequence_length = 64
+        sequence_length = prefill_sequence_length + 1
+        hidden_states = torch.randn(
+            sequence_length,
+            1,
+            config.hidden_size,
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+        prefill_hidden_states = hidden_states[:prefill_sequence_length]
+        decode_hidden_states = hidden_states[prefill_sequence_length:]
+
+        def reference_decode_output(sequence_len_offset):
+            # Build the reference cache without using Attention's static prefill path, then
+            # decode through the same flash_decode kernel used by the module decode step.
+            _, reference_key, reference_value = attention.get_query_key_value_tensors(
+                prefill_hidden_states, None
+            )
+            reference_query, new_reference_key, new_reference_value = (
+                attention.get_query_key_value_tensors(decode_hidden_states, None)
+            )
+            reference_key_memory = attention._allocate_memory(
+                sequence_length, 1, attention.key_hidden_size, reference_key.dtype
+            )
+            reference_value_memory = attention._allocate_memory(
+                sequence_length, 1, attention.val_hidden_size, reference_value.dtype
+            )
+            reference_key_memory[:prefill_sequence_length, :, ...] = reference_key
+            reference_value_memory[:prefill_sequence_length, :, ...] = reference_value
+            reference_decode_kernel_output = attention.flash_decode(
+                sequence_len_offset=sequence_len_offset,
+                query_layer=reference_query,
+                key_layer=new_reference_key,
+                value_layer=new_reference_value,
+                inference_key_memory=reference_key_memory,
+                inference_value_memory=reference_value_memory,
+                rotary_cos=None,
+                rotary_sin=None,
+                rotary_interleaved=config.rotary_interleaved,
+            )
+            reference_context_layer = reference_decode_kernel_output.transpose(0, 1).contiguous()
+            reference_context_layer = reference_context_layer.view(
+                reference_context_layer.size(0), reference_context_layer.size(1), -1
+            )
+            output, _ = attention.linear_proj(reference_context_layer)
+            return output
+
+        with torch.no_grad():
+            expected_prefill_output, _ = attention(prefill_hidden_states, attention_mask=None)
+            inference_context = StaticInferenceContext(
+                max_batch_size=1, max_sequence_length=sequence_length
+            )
+            inference_context.enable_prefill_mode()
+            with InferenceMode.active():
+                actual_prefill_output, _ = attention(
+                    prefill_hidden_states, attention_mask=None, inference_context=inference_context
+                )
+                inference_context.increment_sequence_len_offset(prefill_sequence_length)
+                inference_context.enable_decode_mode()
+                sequence_len_offset = torch.tensor(
+                    [inference_context.sequence_len_offset],
+                    dtype=torch.int32,
+                    device=torch.cuda.current_device(),
+                )
+                expected_decode_output = reference_decode_output(sequence_len_offset)
+                actual_decode_output, _ = attention(
+                    decode_hidden_states,
+                    attention_mask=None,
+                    inference_context=inference_context,
+                    sequence_len_offset=sequence_len_offset,
+                )
+
+        torch.testing.assert_close(actual_prefill_output, expected_prefill_output, rtol=0, atol=0)
+        torch.testing.assert_close(actual_decode_output, expected_decode_output, rtol=0, atol=0)
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.parametrize("output_gate", [False, True])
