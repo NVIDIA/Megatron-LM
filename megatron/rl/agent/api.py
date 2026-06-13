@@ -1,10 +1,8 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
-import logging
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterable
-from typing import Generic, TypeVar
+from typing import Generic, Literal, TypeVar
 
 import numpy as np
 from pydantic import BaseModel
@@ -41,7 +39,8 @@ class GroupedRolloutRequest(Request):
     validation: bool = False
     filter_groups_with_same_reward: bool = False
     streaming: bool = False
-    enforce_order: bool = False
+    submission_granularity: Literal["R", "G", "B"] = "B"
+    consumption_granularity: Literal["R", "G", "B"] = "B"
 
 
 class Rollout(AgentBaseModel):
@@ -200,12 +199,29 @@ class GroupedRolloutGenerator(Agent, ABC):
             self.parallel_generation_tasks = parallel_generation_tasks
 
     @abstractmethod
-    async def group_rollout(self, request: GroupedRolloutRequest) -> list[Rollout]: ...
+    async def group_rollout(
+        self,
+        request: GroupedRolloutRequest,
+        submission_gate: asyncio.Semaphore | None = None,
+    ) -> list[Rollout]:
+        ...
 
     async def get_grouped_rollouts(self, request: GroupedRolloutRequest):
         assert isinstance(
             request.inference_interface, ReturnsRaw
         ), "InferenceInterface must support raw_text return to provide rollouts."
+        submit_at_rollout_granularity = (
+            request.submission_granularity == "R"
+        )
+        consume_at_batch_granularity = (
+            request.consumption_granularity == "B"
+        )
+        assert request.consumption_granularity != "R", \
+            "Rollout consumption granularity is not currently supported."
+        assert not (
+            request.submission_granularity == "B"
+            and request.consumption_granularity == "G"
+        ), "Batch submission with group consumption is not supported."
 
         # When streaming, use buffer_size to create backpressure
         # for balanced generation in a multi-task setting.
@@ -214,26 +230,18 @@ class GroupedRolloutGenerator(Agent, ABC):
         )
         submitted_groups = 0
 
-        # num_groups controls how many groups each worker generates and yields together.
-        # When it's 1, the semaphore is a no-op.
+        # num_groups controls how many groups each generation task submits together.
         groups_per_worker = request.num_groups
         if groups_per_worker > 1:
             assert not request.filter_groups_with_same_reward, \
                 "Cannot use filter_groups_with_same_reward with num_groups > 1."
-        assert self.parallel_generation_tasks >= groups_per_worker, \
-            f"{self.parallel_generation_tasks=} must be >= {groups_per_worker=}"
-        num_workers = self.parallel_generation_tasks // groups_per_worker
-        unused = self.parallel_generation_tasks % groups_per_worker
-        if unused:
-            logging.warning(
-                f"parallel_generation_tasks ({self.parallel_generation_tasks}) is not "
-                f"divisible by num_groups ({groups_per_worker}); "
-                f"{unused} generation task(s) will be unused."
-            )
-        submission_gate = asyncio.Semaphore(num_workers)
+        submission_gate = asyncio.Semaphore(self.parallel_generation_tasks)
 
         async def generate_and_enqueue(batch_id, index_in_batch):
-            group = await self.group_rollout(request=request)
+            group = await self.group_rollout(
+                request=request,
+                submission_gate=(submission_gate if submit_at_rollout_granularity else None),
+            )
             if (
                 not request.filter_groups_with_same_reward
                 or np.std([r.reward for r in group]) > 1e-6
@@ -248,7 +256,8 @@ class GroupedRolloutGenerator(Agent, ABC):
         async def generate_task():
             nonlocal submitted_groups
             while request.streaming or submitted_groups < request.num_groups:
-                await submission_gate.acquire()
+                if not submit_at_rollout_granularity:
+                    await submission_gate.acquire()
                 batch_id = submitted_groups // groups_per_worker
                 submitted_groups += groups_per_worker
                 if groups_per_worker > 1:
@@ -257,11 +266,18 @@ class GroupedRolloutGenerator(Agent, ABC):
                         for i in range(groups_per_worker)
                     ])
                 else:
-                    if not await generate_and_enqueue(batch_id, 0):
+                    if consume_at_batch_granularity:
+                        while not await generate_and_enqueue(batch_id, 0):
+                            pass
+                    elif not await generate_and_enqueue(batch_id, 0):
                         submitted_groups -= groups_per_worker
-                        submission_gate.release()
+                        if not submit_at_rollout_granularity:
+                            submission_gate.release()
 
-        tasks = [asyncio.create_task(generate_task()) for _ in range(num_workers)]
+        tasks = [
+            asyncio.create_task(generate_task())
+            for _ in range(self.parallel_generation_tasks)
+        ]
 
         async def shutdown_queue_when_done():
             """Wait for all workers to finish, then shut down the queue."""
@@ -278,8 +294,8 @@ class GroupedRolloutGenerator(Agent, ABC):
                     group = await grouped_rollouts.get()
                 except asyncio_QueueShutDown:
                     break
-                if request.enforce_order:
-                    # Accumulate groups and enforce submission order across batches.
+                if consume_at_batch_granularity:
+                    # Accumulate groups and consume complete trainer batches in submission order.
                     pending.setdefault(group.batch_id, []).append(group)
                     while (l := len(pending.get(next_batch_id, []))) >= groups_per_worker:
                         assert l == groups_per_worker
@@ -288,11 +304,13 @@ class GroupedRolloutGenerator(Agent, ABC):
                         next_batch_id += 1
                         for g in batch:
                             yield g
-                        submission_gate.release()
+                        if not submit_at_rollout_granularity:
+                            submission_gate.release()
                 else:
                     # Yield groups as soon as they're completed.
                     yield group
-                    submission_gate.release()
+                    if not submit_at_rollout_granularity:
+                        submission_gate.release()
         finally:
             shutdown_task.cancel()
             for task in tasks:
