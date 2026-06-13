@@ -111,9 +111,9 @@ class MambaLayer(GraphableMegatronModule):
         ) or CudaGraphModule.mamba in self.config.cuda_graph_modules:
             self.cudagraph_manager = CudaGraphManager(config)
 
-    def mamba_state_shapes_per_request(self) -> Tuple[Tuple[int], Tuple[int]]:
+    def ssm_state_shapes_per_request(self) -> Tuple[Tuple[int], Tuple[int]]:
         """Returns the Mamba conv and ssm states shapes per request."""
-        return self.mixer.mamba_state_shapes_per_request()
+        return self.mixer.ssm_state_shapes_per_request()
 
     def forward(
         self,

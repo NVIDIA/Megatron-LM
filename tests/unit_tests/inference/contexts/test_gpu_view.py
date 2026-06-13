@@ -26,27 +26,27 @@ REQUEST_VIEWS_INT32 = (
     "active_request_last_token_idxs",
 )
 REQUEST_VIEWS_FLOAT32 = ("temperature", "top_p")
-MAMBA_VIEWS_INT64 = ("mamba_batch_indices_decode",)
-MAMBA_VIEWS_INT32 = (
-    "mamba_batch_indices_prefill",
-    "mamba_seq_idx",
-    "mamba_cu_seqlens",
-    "mamba_cu_chunk_seqlens",
-    "mamba_last_chunk_indices",
-    "mamba_seq_idx_for_varlen",
-    "mamba_conv_seq_idx",
-    "mamba_conv_seq_start",
+SSM_VIEWS_INT64 = ("ssm_batch_indices_decode",)
+SSM_VIEWS_INT32 = (
+    "ssm_batch_indices_prefill",
+    "ssm_seq_idx",
+    "ssm_cu_seqlens",
+    "ssm_cu_chunk_seqlens",
+    "ssm_last_chunk_indices",
+    "ssm_seq_idx_for_varlen",
+    "ssm_conv_seq_idx",
+    "ssm_conv_seq_start",
 )
-MAMBA_VIEWS = MAMBA_VIEWS_INT64 + MAMBA_VIEWS_INT32
+SSM_VIEWS = SSM_VIEWS_INT64 + SSM_VIEWS_INT32
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="ContextGPUView allocates CUDA tensors")
 class TestContextGPUView:
 
-    @pytest.mark.parametrize("max_mamba_chunks", [0, MAX_MAMBA_CHUNKS])
-    def test_layout_with_and_without_mamba(self, max_mamba_chunks):
-        """All token / request / MHA views have correct dtype + shape; Mamba views
-        are None when max_mamba_chunks == 0 and tensors with expected shapes otherwise.
+    @pytest.mark.parametrize("max_ssm_chunks", [0, MAX_MAMBA_CHUNKS])
+    def test_layout_with_and_without_mamba(self, max_ssm_chunks):
+        """All token / request / MHA views have correct dtype + shape; SSM views
+        are None when max_ssm_chunks == 0 and tensors with expected shapes otherwise.
 
         Also exercises the internal `assert off == total_bytes` layout guard at the
         end of `__init__`: a layout bug would fire that assertion during construction.
@@ -56,7 +56,7 @@ class TestContextGPUView:
             max_tokens=MAX_TOKENS,
             max_kv_blocks=MAX_KV_BLOCKS,
             device=torch.device("cuda"),
-            max_mamba_chunks=max_mamba_chunks,
+            max_ssm_chunks=max_ssm_chunks,
         )
         # Token-level views.
         for name in TOKEN_VIEWS_LONG:
@@ -83,13 +83,13 @@ class TestContextGPUView:
         assert v.mha_cu_kv_seq_lengths.shape == (MAX_REQUESTS + 1,)
         assert v.mha_block_table.shape == (MAX_REQUESTS, MAX_KV_BLOCKS)
         # Mamba views: all None or all tensors.
-        if max_mamba_chunks == 0:
-            for name in MAMBA_VIEWS:
+        if max_ssm_chunks == 0:
+            for name in SSM_VIEWS:
                 assert getattr(v, name) is None
         else:
-            for name in MAMBA_VIEWS_INT64:
+            for name in SSM_VIEWS_INT64:
                 assert getattr(v, name) is not None
                 assert getattr(v, name).dtype == torch.int64
-            for name in MAMBA_VIEWS_INT32:
+            for name in SSM_VIEWS_INT32:
                 assert getattr(v, name) is not None
                 assert getattr(v, name).dtype == torch.int32

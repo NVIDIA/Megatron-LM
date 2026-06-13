@@ -1,11 +1,14 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import math
+import types
 import unittest
 from unittest.mock import MagicMock
 
 import torch
 import torch.nn as nn
+
+from megatron.core.inference.contexts.attention_context.ssm_metadata import SSMMetadata
 
 # Assume the provided class is in mamba_mixer.py
 from megatron.core.ssm.mamba_mixer import MambaMixer
@@ -137,29 +140,36 @@ class TestMambaDynamicInference(unittest.TestCase):
         dim_inputs = self.d_inner * 2 + 2 * self.ngroups * self.d_state + self.nheads
         zxBCdt = torch.randn(real_seq_len, 1, dim_inputs, device=self.device, dtype=torch.float32)
 
-        # Metadata: single real request
-        seq_idx = torch.zeros((1, real_seq_len), dtype=torch.int32, device=self.device)
-
-        cu_seqlens = torch.tensor([0, real_seq_len], dtype=torch.int32, device=self.device)
-
-        batch_indices = torch.tensor([0], dtype=torch.long, device=self.device)
-
         # States
         conv_dim = self.d_inner + 2 * self.ngroups * self.d_state
         conv_state = torch.zeros(num_requests, conv_dim, self.d_conv, device=self.device)
-        ssm_state = torch.zeros(
+        recurrent_state = torch.zeros(
             num_requests, self.nheads, self.headdim, self.d_state, device=self.device
         )
+
+        # Build a real SSMMetadata and populate the varlen fields for a single request.
+        ssm_metadata = SSMMetadata(
+            max_requests=num_requests,
+            max_tokens=real_seq_len,
+            ssm_chunk_size=self.mixer.chunk_size,
+            d_conv=self.d_conv,
+        )
+        ssm_metadata.seq_idx = torch.zeros((1, real_seq_len), dtype=torch.int32, device=self.device)
+        ssm_metadata.cu_seqlens = torch.tensor(
+            [0, real_seq_len], dtype=torch.int32, device=self.device
+        )
+        ssm_metadata.batch_indices_prefill = torch.tensor(
+            [0], dtype=torch.int32, device=self.device
+        )
+        ssm_metadata.real_prefill_token_count = real_seq_len
+        ssm_metadata.cu_seqlens_list = [0, real_seq_len]
+
+        context = types.SimpleNamespace(ssm_metadata=ssm_metadata, ssm_slot_allocator=None)
 
         # Run
         self.mixer.norm = MagicMock(side_effect=lambda x, z: x * z)
         output = self.mixer._ssm_prefill(
-            zxBCdt=zxBCdt,
-            conv_state=conv_state,
-            ssm_state=ssm_state,
-            seq_idx=seq_idx,
-            cu_seqlens=cu_seqlens,
-            batch_indices=batch_indices,
+            zxBCdt=zxBCdt, conv_state=conv_state, recurrent_state=recurrent_state, context=context
         )
 
         # Output should have real_seq_len tokens
@@ -168,15 +178,17 @@ class TestMambaDynamicInference(unittest.TestCase):
 
         # Verify isolation of padding states
         remaining_conv_states = conv_state[1:num_requests]
-        remaining_ssm_states = ssm_state[1:num_requests]
+        remaining_recurrent_states = recurrent_state[1:num_requests]
 
         self.assertTrue(
             torch.allclose(remaining_conv_states, torch.zeros_like(remaining_conv_states)),
             "Conv states for padding requests (indices 1 to N-1) should remain 0",
         )
         self.assertTrue(
-            torch.allclose(remaining_ssm_states, torch.zeros_like(remaining_ssm_states)),
-            "SSM states for padding requests (indices 1 to N-1) should remain 0",
+            torch.allclose(
+                remaining_recurrent_states, torch.zeros_like(remaining_recurrent_states)
+            ),
+            "Recurrent states for padding requests (indices 1 to N-1) should remain 0",
         )
 
 

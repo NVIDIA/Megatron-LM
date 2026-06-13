@@ -236,14 +236,14 @@ def prepare_next_forward_pass(
             accepted_token_counts[pid] = count
 
 
-def mamba_state_selective_copy(
+def ssm_state_selective_copy(
     intermediate_states, current_states, prefill_status, state_idx, accepted_counts, num_layers
 ):
-    """Mamba speculative rewind state update.
+    """SSM speculative rewind state update.
 
     For each decode request, copies
     `intermediate[layer, slot, accepted_count, ...]` →
-    `current[layer, slot, ...]` for every Mamba layer.
+    `current[layer, slot, ...]` for every SSM layer.
     """
     N = prefill_status.shape[0]
     for i in range(N):

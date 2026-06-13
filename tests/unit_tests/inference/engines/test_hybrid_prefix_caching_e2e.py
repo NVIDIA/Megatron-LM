@@ -1,15 +1,15 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""End-to-end test for Mamba prefix caching with a real hybrid model.
+"""End-to-end test for SSM prefix caching with a real hybrid model.
 
-This test exercises the 4 key indices within a Mamba prefill:
+This test exercises the 4 key indices within an SSM prefill:
 
-  1. num_mamba_matched — how many blocks have cached Mamba state.
+  1. num_ssm_matched — how many blocks have cached SSM state.
      Determines how many tokens the prefill can skip.
 
   2. num_kv_matched — how many KV blocks are shared with prior
-     requests. Can exceed num_mamba_matched, since KV blocks are
-     always registered for every completed block, while Mamba
+     requests. Can exceed num_ssm_matched, since KV blocks are
+     always registered for every completed block, while SSM
      state is only cached at divergence and last-aligned blocks.
 
   3. last_aligned_block — the last full-block boundary in the
@@ -41,8 +41,8 @@ import torch
 from megatron.core import parallel_state
 from megatron.core.inference.config import (
     InferenceConfig,
-    MambaInferenceStateConfig,
     PrefixCachingEvictionPolicy,
+    SSMInferenceStateConfig,
 )
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine
@@ -183,10 +183,10 @@ class TestMambaPrefixCachingE2E:
     def _build_engine(
         self,
         model,
-        mamba_config,
+        ssm_config,
         enable_prefix_caching,
         buffer_size_gb=0.5,
-        prefix_caching_mamba_gb=0.05,
+        prefix_caching_ssm_gb=0.05,
         request_rounder=4,
         num_cuda_graphs=None,
     ):
@@ -195,7 +195,7 @@ class TestMambaPrefixCachingE2E:
             max_sequence_length=MAX_SEQ_LEN,
             buffer_size_gb=buffer_size_gb,
             block_size_tokens=BLOCK_SIZE,
-            mamba_inference_state_config=mamba_config,
+            ssm_inference_state_config=ssm_config,
             materialize_only_last_token_logits=False,
             enable_prefix_caching=enable_prefix_caching,
             unified_memory_level=0,
@@ -205,7 +205,7 @@ class TestMambaPrefixCachingE2E:
         if enable_prefix_caching:
             inference_config_kwargs.update(
                 prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
-                prefix_caching_mamba_gb=prefix_caching_mamba_gb,
+                prefix_caching_ssm_gb=prefix_caching_ssm_gb,
             )
         context = DynamicInferenceContext(
             model_config=model.config, inference_config=InferenceConfig(**inference_config_kwargs)
@@ -244,7 +244,7 @@ class TestMambaPrefixCachingE2E:
     def _run_simple(
         self,
         model,
-        mamba_config,
+        ssm_config,
         prompts,
         enable_pc,
         base_req_id=0,
@@ -253,7 +253,7 @@ class TestMambaPrefixCachingE2E:
     ):
         """Run all prompts with given pc setting, return (finished_dict, lifetime_prefill)."""
         engine = self._build_engine(
-            model, mamba_config, enable_prefix_caching=enable_pc, **engine_kwargs
+            model, ssm_config, enable_prefix_caching=enable_pc, **engine_kwargs
         )
         for i, prompt in enumerate(prompts):
             engine._add_request(self._make_request(base_req_id + i, prompt, enable_pc, num_tokens))
@@ -275,9 +275,9 @@ class TestMambaPrefixCachingE2E:
         if step == 1:
             for g in range(G):
                 r = reqs_by_group[g]
-                assert r[0]._mamba_num_matched_blocks == 0, f"step 1 group {g}"
-                assert r[0].precomputed_block_hashes[0] in ctx.mamba_slot_allocator.hash_to_block_id
-            assert len(ctx.mamba_slot_allocator.hash_to_block_id) == G
+                assert r[0]._ssm_num_matched_blocks == 0, f"step 1 group {g}"
+                assert r[0].precomputed_block_hashes[0] in ctx.ssm_slot_allocator.hash_to_block_id
+            assert len(ctx.ssm_slot_allocator.hash_to_block_id) == G
             assert step_prefill == G * 300, f"step 1: expected {G * 300}, got {step_prefill}"
             if G == 1:
                 assert (
@@ -287,9 +287,9 @@ class TestMambaPrefixCachingE2E:
         elif step == 2:
             for g in range(G):
                 r = reqs_by_group[g]
-                assert r[1]._mamba_num_matched_blocks == 1, f"step 2 group {g}"
-                assert r[1].precomputed_block_hashes[2] in ctx.mamba_slot_allocator.hash_to_block_id
-            assert len(ctx.mamba_slot_allocator.hash_to_block_id) == G * 2
+                assert r[1]._ssm_num_matched_blocks == 1, f"step 2 group {g}"
+                assert r[1].precomputed_block_hashes[2] in ctx.ssm_slot_allocator.hash_to_block_id
+            assert len(ctx.ssm_slot_allocator.hash_to_block_id) == G * 2
             assert step_prefill == G * 544, f"step 2: expected {G * 544}, got {step_prefill}"
             if G == 1:
                 assert (
@@ -299,16 +299,16 @@ class TestMambaPrefixCachingE2E:
         elif step == 3:
             for g in range(G):
                 r = reqs_by_group[g]
-                assert r[2]._mamba_num_matched_blocks == 1, f"step 3 group {g} req 2"
-                assert r[4]._mamba_num_matched_blocks == 3, f"step 3 group {g} req 4"
-                assert r[2].precomputed_block_hashes[1] in ctx.mamba_slot_allocator.hash_to_block_id
-                assert r[2].precomputed_block_hashes[2] in ctx.mamba_slot_allocator.hash_to_block_id
-                assert r[4].precomputed_block_hashes[3] in ctx.mamba_slot_allocator.hash_to_block_id
+                assert r[2]._ssm_num_matched_blocks == 1, f"step 3 group {g} req 2"
+                assert r[4]._ssm_num_matched_blocks == 3, f"step 3 group {g} req 4"
+                assert r[2].precomputed_block_hashes[1] in ctx.ssm_slot_allocator.hash_to_block_id
+                assert r[2].precomputed_block_hashes[2] in ctx.ssm_slot_allocator.hash_to_block_id
+                assert r[4].precomputed_block_hashes[3] in ctx.ssm_slot_allocator.hash_to_block_id
                 h0 = r[0].precomputed_block_hashes[0]
                 h1 = r[1].precomputed_block_hashes[1]
                 assert self._get_ref_count(alloc, h0) == 4, f"step 3 group {g}"
                 assert self._get_ref_count(alloc, h1) == 3, f"step 3 group {g}"
-            assert len(ctx.mamba_slot_allocator.hash_to_block_id) == G * 5
+            assert len(ctx.ssm_slot_allocator.hash_to_block_id) == G * 5
             assert step_prefill == G * (
                 544 + 332
             ), f"step 3: expected {G * 876}, got {step_prefill}"
@@ -316,18 +316,18 @@ class TestMambaPrefixCachingE2E:
         elif step == 4:
             for g in range(G):
                 r = reqs_by_group[g]
-                assert r[3]._mamba_num_matched_blocks == 2, f"step 4 group {g}"
-                assert r[3].precomputed_block_hashes[2] in ctx.mamba_slot_allocator.hash_to_block_id
+                assert r[3]._ssm_num_matched_blocks == 2, f"step 4 group {g}"
+                assert r[3].precomputed_block_hashes[2] in ctx.ssm_slot_allocator.hash_to_block_id
                 h0 = r[0].precomputed_block_hashes[0]
                 h1 = r[1].precomputed_block_hashes[1]
                 assert self._get_ref_count(alloc, h0) == 5, f"step 4 group {g}"
                 assert self._get_ref_count(alloc, h1) == 4, f"step 4 group {g}"
-            assert len(ctx.mamba_slot_allocator.hash_to_block_id) == G * 6
+            assert len(ctx.ssm_slot_allocator.hash_to_block_id) == G * 6
             assert step_prefill == G * 288, f"step 4: expected {G * 288}, got {step_prefill}"
 
-    def _run_pc_on(self, model, mamba_config, prompts):
+    def _run_pc_on(self, model, ssm_config, prompts):
         """Run requests with prefix caching enabled, verifying per-step state."""
-        engine = self._build_engine(model, mamba_config, enable_prefix_caching=True)
+        engine = self._build_engine(model, ssm_config, enable_prefix_caching=True)
         alloc = engine.context.kv_block_allocator
         ctx = engine.context
 
@@ -358,14 +358,14 @@ class TestMambaPrefixCachingE2E:
 
         return finished, ctx.lifetime_prefill_token_count
 
-    def _run_multi_pc_on(self, model, mamba_config, all_prompts, num_cuda_graphs=None):
+    def _run_multi_pc_on(self, model, ssm_config, all_prompts, num_cuda_graphs=None):
         """Run 4 groups with prefix caching enabled, verifying per-step state."""
         engine = self._build_engine(
             model,
-            mamba_config,
+            ssm_config,
             enable_prefix_caching=True,
             buffer_size_gb=2.0,
-            prefix_caching_mamba_gb=0.2,
+            prefix_caching_ssm_gb=0.2,
             num_cuda_graphs=num_cuda_graphs,
         )
         alloc = engine.context.kv_block_allocator
@@ -413,11 +413,11 @@ class TestMambaPrefixCachingE2E:
         """Verify output tokens match between pc=off and pc=on."""
         skip_if_mamba_sequence_packing_not_available()
         model = self._create_model()
-        mamba_config = MambaInferenceStateConfig.from_model(model)
+        ssm_config = SSMInferenceStateConfig.from_model(model)
         prompts = self._create_prompts()
 
-        off_outputs, off_prefill = self._run_simple(model, mamba_config, prompts, False)
-        on_outputs, on_prefill = self._run_pc_on(model, mamba_config, prompts)
+        off_outputs, off_prefill = self._run_simple(model, ssm_config, prompts, False)
+        on_outputs, on_prefill = self._run_pc_on(model, ssm_config, prompts)
 
         for req_id in range(5):
             assert (
@@ -431,28 +431,28 @@ class TestMambaPrefixCachingE2E:
         """Verify multi-group prefix caching with 4 independent groups."""
         skip_if_mamba_sequence_packing_not_available()
         model = self._create_model(num_cuda_graphs=num_cuda_graphs)
-        mamba_config = MambaInferenceStateConfig.from_model(model)
+        ssm_config = SSMInferenceStateConfig.from_model(model)
         all_prompts = [self._create_prompts(g * GROUP_TOKEN_STRIDE) for g in range(NUM_GROUPS)]
 
         _, off_prefill = self._run_simple(
             model,
-            mamba_config,
+            ssm_config,
             [p for group in all_prompts for p in group],
             False,
             num_tokens=MULTI_GROUP_TOKENS_TO_GENERATE,
             num_cuda_graphs=num_cuda_graphs,
             buffer_size_gb=2.0,
-            prefix_caching_mamba_gb=0.2,
+            prefix_caching_ssm_gb=0.2,
         )
         on_outputs, on_prefill = self._run_multi_pc_on(
-            model, mamba_config, all_prompts, num_cuda_graphs=num_cuda_graphs
+            model, ssm_config, all_prompts, num_cuda_graphs=num_cuda_graphs
         )
 
         # verify per-group outputs match independent runs
         for g in range(NUM_GROUPS):
             ref_outputs, _ = self._run_simple(
                 model,
-                mamba_config,
+                ssm_config,
                 all_prompts[g],
                 True,
                 base_req_id=g * 5,
@@ -482,7 +482,7 @@ class TestMambaPrefixCachingE2E:
         assert [len(p) for p in prompts] == [256, 256, 512, 512]
         return prompts
 
-    def _run_eos_pc_on(self, model, mamba_config, prompts):
+    def _run_eos_pc_on(self, model, ssm_config, prompts):
         """Run block-aligned prompts with pc=on, per-step assertions.
 
         Scheduling with pending_block_hashes coordination:
@@ -490,7 +490,7 @@ class TestMambaPrefixCachingE2E:
           - step 2: B + C co-scheduled (D deferred: h1 pending from C)
           - step 3: D scheduled
         """
-        engine = self._build_engine(model, mamba_config, enable_prefix_caching=True)
+        engine = self._build_engine(model, ssm_config, enable_prefix_caching=True)
         alloc = engine.context.kv_block_allocator
         ctx = engine.context
 
@@ -512,26 +512,26 @@ class TestMambaPrefixCachingE2E:
                 finished[merged.request_id] = list(merged.generated_tokens)
 
             if step == 1:
-                assert reqs[0]._mamba_num_matched_blocks == 0, f"step 1"
-                assert len(ctx.mamba_slot_allocator.hash_to_block_id) == 1
+                assert reqs[0]._ssm_num_matched_blocks == 0, f"step 1"
+                assert len(ctx.ssm_slot_allocator.hash_to_block_id) == 1
                 assert (
-                    reqs[0].precomputed_block_hashes[0] in ctx.mamba_slot_allocator.hash_to_block_id
+                    reqs[0].precomputed_block_hashes[0] in ctx.ssm_slot_allocator.hash_to_block_id
                 )
                 assert step_prefill == 256
             elif step == 2:
                 # B: 1 mamba match but raw_skip >= chunk_length, back off to 0 blocks, full recompute (256)
                 # C: 1 mamba match, skip 256, effective 256
-                assert reqs[1]._mamba_num_matched_blocks == 1, f"step 2 B"
-                assert reqs[2]._mamba_num_matched_blocks == 1, f"step 2 C"
-                assert len(ctx.mamba_slot_allocator.hash_to_block_id) == 2
+                assert reqs[1]._ssm_num_matched_blocks == 1, f"step 2 B"
+                assert reqs[2]._ssm_num_matched_blocks == 1, f"step 2 C"
+                assert len(ctx.ssm_slot_allocator.hash_to_block_id) == 2
                 assert (
-                    reqs[2].precomputed_block_hashes[1] in ctx.mamba_slot_allocator.hash_to_block_id
+                    reqs[2].precomputed_block_hashes[1] in ctx.ssm_slot_allocator.hash_to_block_id
                 )
                 assert step_prefill == 512  # B=256 (back-off recompute) + C=256
             elif step == 3:
                 # D: 2 mamba matches, raw_skip >= chunk_length, back off to block 0, skip 256, effective 256
-                assert reqs[3]._mamba_num_matched_blocks == 2, f"step 3 D"
-                assert len(ctx.mamba_slot_allocator.hash_to_block_id) == 2
+                assert reqs[3]._ssm_num_matched_blocks == 2, f"step 3 D"
+                assert len(ctx.ssm_slot_allocator.hash_to_block_id) == 2
                 assert step_prefill == 256
 
         return finished, ctx.lifetime_prefill_token_count
@@ -541,11 +541,11 @@ class TestMambaPrefixCachingE2E:
         """Verify block-aligned EOS caching and recompute-based back-off."""
         skip_if_mamba_sequence_packing_not_available()
         model = self._create_model()
-        mamba_config = MambaInferenceStateConfig.from_model(model)
+        ssm_config = SSMInferenceStateConfig.from_model(model)
         prompts = self._create_block_aligned_prompts()
 
-        off_outputs, off_prefill = self._run_simple(model, mamba_config, prompts, False)
-        on_outputs, on_prefill = self._run_eos_pc_on(model, mamba_config, prompts)
+        off_outputs, off_prefill = self._run_simple(model, ssm_config, prompts, False)
+        on_outputs, on_prefill = self._run_eos_pc_on(model, ssm_config, prompts)
 
         for req_id in range(4):
             assert (
@@ -566,15 +566,15 @@ class TestMambaPrefixCachingE2E:
         """Verify KV eviction invalidates mamba state via invalidate_mamba_state_for_block."""
         skip_if_mamba_sequence_packing_not_available()
         model = self._create_model()
-        mamba_config = MambaInferenceStateConfig.from_model(model)
+        ssm_config = SSMInferenceStateConfig.from_model(model)
         prompts = self._create_eviction_prompts()
 
         engine = self._build_engine(
             model,
-            mamba_config,
+            ssm_config,
             enable_prefix_caching=True,
             buffer_size_gb=0.002,
-            prefix_caching_mamba_gb=0.05,
+            prefix_caching_ssm_gb=0.05,
             request_rounder=1,
         )
         alloc = engine.context.kv_block_allocator
@@ -600,22 +600,20 @@ class TestMambaPrefixCachingE2E:
         # E: seed request
         req_E = _run_one(0, prompts[0])
         h_E0 = req_E.precomputed_block_hashes[0]
-        assert (
-            h_E0 in ctx.mamba_slot_allocator.hash_to_block_id and h_E0 in alloc.kv_hash_to_block_id
-        )
-        assert len(ctx.mamba_slot_allocator.hash_to_block_id) == 1 and alloc.total_avail == 1
+        assert h_E0 in ctx.ssm_slot_allocator.hash_to_block_id and h_E0 in alloc.kv_hash_to_block_id
+        assert len(ctx.ssm_slot_allocator.hash_to_block_id) == 1 and alloc.total_avail == 1
 
         # F: disjoint prefix, forces eviction of E's cached block
         req_F = _run_one(1, prompts[1])
-        assert req_F.precomputed_block_hashes[0] in ctx.mamba_slot_allocator.hash_to_block_id
+        assert req_F.precomputed_block_hashes[0] in ctx.ssm_slot_allocator.hash_to_block_id
         assert (
             h_E0 not in alloc.kv_hash_to_block_id
-            and h_E0 not in ctx.mamba_slot_allocator.hash_to_block_id
+            and h_E0 not in ctx.ssm_slot_allocator.hash_to_block_id
         )
-        assert len(ctx.mamba_slot_allocator.hash_to_block_id) == 1
+        assert len(ctx.ssm_slot_allocator.hash_to_block_id) == 1
 
         # G: identical to E, but E's state was evicted
         req_G = _run_one(2, prompts[2])
-        assert req_G._mamba_num_matched_blocks == 0
-        assert h_E0 in ctx.mamba_slot_allocator.hash_to_block_id
+        assert req_G._ssm_num_matched_blocks == 0
+        assert h_E0 in ctx.ssm_slot_allocator.hash_to_block_id
         assert finished[0] == finished[2]

@@ -40,6 +40,21 @@ from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.training.argument_utils import ArgumentGroupFactory, core_transformer_config_from_args  # noqa: F401 # pylint: disable=unused-import
 
 
+
+def _deprecated_arg(new_flag):
+    """Return an argparse Action subclass that warns when the old flag is used."""
+    class _DeprecatedAction(argparse.Action):
+        def __call__(self, parser, namespace, values, option_string=None):
+            import warnings
+            warnings.warn(
+                f'{option_string} is deprecated, use {new_flag} instead.',
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            setattr(namespace, self.dest, values)
+    return _DeprecatedAction
+
+
 def add_megatron_arguments(parser: argparse.ArgumentParser):
     """"Add Megatron-LM arguments to the given parser."""
 
@@ -1049,8 +1064,8 @@ def validate_args(args, defaults={}):
     args.main_params_dtype = map_dtype(args.main_params_dtype)
     args.exp_avg_dtype = map_dtype(args.exp_avg_dtype)
     args.exp_avg_sq_dtype = map_dtype(args.exp_avg_sq_dtype)
-    args.mamba_inference_conv_states_dtype = map_dtype(args.mamba_inference_conv_states_dtype)
-    args.mamba_inference_ssm_states_dtype = map_dtype(args.mamba_inference_ssm_states_dtype)
+    args.ssm_inference_conv_states_dtype = map_dtype(args.ssm_inference_conv_states_dtype)
+    args.ssm_inference_recurrent_states_dtype = map_dtype(args.ssm_inference_recurrent_states_dtype)
 
     args.megatron_fsdp_main_params_dtype = map_dtype(args.megatron_fsdp_main_params_dtype)
     args.megatron_fsdp_main_grads_dtype = map_dtype(args.megatron_fsdp_main_grads_dtype)
@@ -1888,10 +1903,15 @@ def _add_inference_args(parser):
                        'the dynamic inference context. Active requests are '
                        'paused when there are not enough active blocks available '
                        'to continue generating a request.')
-    group.add_argument('--inference-dynamic-batching-mamba-memory-ratio', type=float, default=None,
-                       help='Percentage of memory buffer to allocate for Mamba states. '
-                       'If not specified, allocates Mamba state tensors for each KV cache block. '
+    group.add_argument('--inference-dynamic-batching-ssm-memory-ratio', type=float, default=None,
+                       help='Percentage of memory buffer to allocate for SSM states. '
+                       'If not specified, allocates SSM state tensors for each KV cache block. '
                        'Only used for hybrid models.')
+    group.add_argument('--inference-dynamic-batching-mamba-memory-ratio', type=float,
+                       dest='inference_dynamic_batching_ssm_memory_ratio',
+                       default=argparse.SUPPRESS,
+                       action=_deprecated_arg('--inference-dynamic-batching-ssm-memory-ratio'),
+                       help=argparse.SUPPRESS)
     group.add_argument('--inference-dynamic-batching-block-size',
                        type=int, default=256,
                        help='KV cache block size. '
@@ -1974,12 +1994,18 @@ def _add_inference_args(parser):
                        'score = alpha * match + (1 - alpha) * normalized_load. '
                        'Higher alpha favors prefix cache hits; lower alpha '
                        'favors load balance. Default: 0.5.')
-    group.add_argument('--inference-dynamic-batching-prefix-caching-mamba-gb',
+    group.add_argument('--inference-dynamic-batching-prefix-caching-ssm-gb',
                        type=float, default=None,
-                       dest='inference_dynamic_batching_prefix_caching_mamba_gb',
-                       help='GPU memory budget (in GB) for the Mamba state cache '
-                       'used by prefix caching on hybrid models. When set, Mamba '
+                       dest='inference_dynamic_batching_prefix_caching_ssm_gb',
+                       help='GPU memory budget (in GB) for the SSM state cache '
+                       'used by prefix caching on hybrid models. When set, SSM '
                        'states at block boundaries are cached for reuse.')
+    group.add_argument('--inference-dynamic-batching-prefix-caching-mamba-gb',
+                       type=float,
+                       dest='inference_dynamic_batching_prefix_caching_ssm_gb',
+                       default=argparse.SUPPRESS,
+                       action=_deprecated_arg('--inference-dynamic-batching-prefix-caching-ssm-gb'),
+                       help=argparse.SUPPRESS)
     group.add_argument('--inference-dynamic-batching-cuda-graph-mixed-prefill-count',
                        type=int, default=16,
                        help='Number of mixed prefill requests to capture in a cuda graph.')
@@ -2007,12 +2033,24 @@ def _add_inference_args(parser):
                        required=False, default=False, help='Enable inference wandb logging.')
     group.add_argument("--inference-coordinator-port", type=int,
                        help="This port will be used to setup the inference coordinator on node-0")
+    group.add_argument('--ssm-inference-conv-states-dtype', type=str,
+                       choices=['bf16', 'fp16', 'fp32'], default='bf16',
+                       help='Dtype for the SSM inference conv states tensor')
     group.add_argument('--mamba-inference-conv-states-dtype', type=str,
+                       choices=['bf16', 'fp16', 'fp32'],
+                       dest='ssm_inference_conv_states_dtype',
+                       default=argparse.SUPPRESS,
+                       action=_deprecated_arg('--ssm-inference-conv-states-dtype'),
+                       help=argparse.SUPPRESS)
+    group.add_argument('--ssm-inference-recurrent-states-dtype', type=str,
                        choices=['bf16', 'fp16', 'fp32'], default='bf16',
-                       help='Dtype for the Mamba inference conv states tensor')
+                       help='Dtype for the SSM inference recurrent states tensor')
     group.add_argument('--mamba-inference-ssm-states-dtype', type=str,
-                       choices=['bf16', 'fp16', 'fp32'], default='bf16',
-                       help='Dtype for the Mamba inference SSM states tensor')
+                       choices=['bf16', 'fp16', 'fp32'],
+                       dest='ssm_inference_recurrent_states_dtype',
+                       default=argparse.SUPPRESS,
+                       action=_deprecated_arg('--ssm-inference-recurrent-states-dtype'),
+                       help=argparse.SUPPRESS)
     group.add_argument('--inference-use-synchronous-zmq-collectives', action=argparse.BooleanOptionalAction,
                        required=False, default=False, help='Use synchronous ZMQ collectives for inference. Helps in reducing performance variability for MoEs.')
     group.add_argument('--inference-disable-ep-consensus', action=argparse.BooleanOptionalAction,

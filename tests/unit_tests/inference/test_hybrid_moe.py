@@ -23,7 +23,7 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
-from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
+from megatron.core.inference.config import InferenceConfig, SSMInferenceStateConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.inference.utils import InferenceMode
@@ -165,7 +165,7 @@ class _TestDynamicInferenceBase:
         max_requests=None,
         max_tokens=None,
     ):
-        mamba_config = MambaInferenceStateConfig.from_model(model)
+        ssm_config = SSMInferenceStateConfig.from_model(model)
         return DynamicInferenceContext(
             model_config=model.config,
             inference_config=InferenceConfig(
@@ -173,7 +173,7 @@ class _TestDynamicInferenceBase:
                 buffer_size_gb=1.0,
                 block_size_tokens=256,
                 materialize_only_last_token_logits=False,
-                mamba_inference_state_config=mamba_config,
+                ssm_inference_state_config=ssm_config,
                 num_cuda_graphs=num_cuda_graphs,
                 use_cuda_graphs_for_non_decode_steps=use_cuda_graphs_for_non_decode_steps,
                 max_requests=max_requests,

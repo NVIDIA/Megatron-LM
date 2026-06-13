@@ -1536,19 +1536,19 @@ class DynamicInferenceEngine(AbstractEngine):
         """
         return {"waits": self._prefix_coordination_waits}
 
-    def _find_mamba_match_count(self, req: DynamicInferenceRequest) -> int:
-        """Find farthest block with cached Mamba state by iterating from the end.
+    def _find_ssm_match_count(self, req: DynamicInferenceRequest) -> int:
+        """Find farthest block with cached SSM state by iterating from the end.
 
-        Not all blocks have Mamba state cached in mamba_hash_to_block_id,
+        Not all blocks have SSM state cached in ssm_hash_to_block_id,
         only divergence and last-aligned blocks do. Iterating from the end
         finds the farthest block with cached state, which is the only one
-        needed for restore since Mamba state is cumulative.
+        needed for restore since SSM state is cumulative.
         """
         if not req.precomputed_block_hashes:
             return 0
-        mamba_map = self.context.mamba_slot_allocator.hash_to_block_id
+        ssm_map = self.context.ssm_slot_allocator.hash_to_block_id
         for i in range(len(req.precomputed_block_hashes) - 1, -1, -1):
-            if req.precomputed_block_hashes[i] in mamba_map:
+            if req.precomputed_block_hashes[i] in ssm_map:
                 return i + 1
         return 0
 
@@ -1574,10 +1574,10 @@ class DynamicInferenceEngine(AbstractEngine):
         Perform the same original scheduling logic for non-chunked runs
         """
         prefix_caching_enabled = self.context.enable_prefix_caching
-        mamba_caching_enabled = (
+        ssm_caching_enabled = (
             prefix_caching_enabled
             and self.context.is_hybrid_model
-            and self.context.mamba_slot_allocator is not None
+            and self.context.ssm_slot_allocator is not None
         )
         if prefix_caching_enabled:
             pending_block_hashes = set()
@@ -1597,9 +1597,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     pending_request_ids.append(self.waiting_request_ids.popleft())
                     continue
 
-            # Find Mamba prefix match before check_availability (sets skip count)
-            if mamba_caching_enabled:
-                req._mamba_num_matched_blocks = self._find_mamba_match_count(req)
+            # Find SSM prefix match before check_availability (sets skip count)
+            if ssm_caching_enabled:
+                req._ssm_num_matched_blocks = self._find_ssm_match_count(req)
 
             request_can_be_added, request_tokens_can_be_added, kv_cache_available = (
                 self.context.check_availability(req)
@@ -1640,10 +1640,10 @@ class DynamicInferenceEngine(AbstractEngine):
             - For each request, remaining_prompt_tokens holds the **unprefilled** prompt tokens
         """
         prefix_caching_enabled = self.context.enable_prefix_caching
-        mamba_caching_enabled = (
+        ssm_caching_enabled = (
             prefix_caching_enabled
             and self.context.is_hybrid_model
-            and self.context.mamba_slot_allocator is not None
+            and self.context.ssm_slot_allocator is not None
         )
         if prefix_caching_enabled:
             pending_block_hashes = set()
@@ -1672,9 +1672,9 @@ class DynamicInferenceEngine(AbstractEngine):
                     )
                     continue
 
-            # Find Mamba prefix match for non-continuing requests
-            if mamba_caching_enabled and not is_continuing_chunked_prefill:
-                req._mamba_num_matched_blocks = self._find_mamba_match_count(req)
+            # Find SSM prefix match for non-continuing requests
+            if ssm_caching_enabled and not is_continuing_chunked_prefill:
+                req._ssm_num_matched_blocks = self._find_ssm_match_count(req)
 
             # Use remaining prompt tokens for scheduling decisions
             remaining_len = len(req.remaining_prompt_tokens)

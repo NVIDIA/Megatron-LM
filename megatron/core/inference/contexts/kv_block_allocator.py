@@ -301,7 +301,7 @@ class KVBlockAllocator:
             maxlen=0,
         )
 
-        # Notify Mamba slot allocator (if wired) to clean up its state
+        # Notify SSM slot allocator (if wired) to clean up its state
         if self.on_blocks_deregistered is not None:
             self.on_blocks_deregistered(block_ids.tolist(), keys_to_delete)
 
