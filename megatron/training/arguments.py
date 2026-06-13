@@ -1992,7 +1992,7 @@ def _add_inference_args(parser):
                             'log-spaced distribution with bounded relative padding. '
                             '"linear" uses varying linear strides across the range.')
     group.add_argument('--inference-dynamic-batching-sampling-backend',
-                       type=str, default='torch',
+                       type=str, default='flashinfer',
                        choices=['torch', 'flashinfer'],
                        help='Which sampling kernels to use during inference. '
                             'Falls back to "torch" with a warning if "flashinfer" '
