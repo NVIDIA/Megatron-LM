@@ -673,6 +673,10 @@ class TopKRouter(Router):
                 self.score_function,
                 fused=self.config.moe_router_fusion,
                 padding_mask=padding_mask,
+                use_pre_softmax=self.config.moe_router_pre_softmax,
+                num_groups=self.config.moe_router_num_groups,
+                group_topk=self.config.moe_router_group_topk,
+                expert_bias=self.expert_bias,
             )
             probs = self._apply_aux_loss(
                 probs,

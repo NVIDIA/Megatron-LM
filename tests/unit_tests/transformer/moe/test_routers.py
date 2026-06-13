@@ -8,7 +8,12 @@ import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
-from megatron.core.transformer.moe.moe_utils import get_updated_expert_bias, router_gating_linear
+from megatron.core.transformer.moe.moe_utils import (
+    compute_routing_scores_for_aux_loss,
+    get_updated_expert_bias,
+    router_gating_linear,
+    topk_routing_with_score_function,
+)
 from megatron.core.transformer.moe.router import Router
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -24,6 +29,90 @@ try:
     HAVE_ROUTER_FUSION = _fused_topk_with_score_function is not None
 except Exception:  # pragma: no cover - defensive
     HAVE_ROUTER_FUSION = False
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize("use_pre_softmax", [True, False])
+@pytest.mark.parametrize("score_function", ["softmax", "sigmoid", "sqrtsoftplus"])
+def test_aux_loss_group_limited_routing_map_matches_dispatch(score_function, use_pre_softmax):
+    logits = torch.tensor([[10.0, 10.0, 10.5, -100.0], [3.0, 3.0, 3.5, -100.0]])
+    topk = 2
+    num_groups = 2
+    group_topk = 1
+
+    _, dispatch_map = topk_routing_with_score_function(
+        logits,
+        topk,
+        use_pre_softmax=use_pre_softmax,
+        num_groups=num_groups,
+        group_topk=group_topk,
+        score_function=score_function,
+    )
+    aux_map, aux_scores = compute_routing_scores_for_aux_loss(
+        logits,
+        topk,
+        score_function,
+        use_pre_softmax=use_pre_softmax,
+        num_groups=num_groups,
+        group_topk=group_topk,
+    )
+    aux_map_with_fusion_requested, aux_scores_with_fusion_requested = (
+        compute_routing_scores_for_aux_loss(
+            logits,
+            topk,
+            score_function,
+            fused=True,
+            use_pre_softmax=use_pre_softmax,
+            num_groups=num_groups,
+            group_topk=group_topk,
+        )
+    )
+    aux_map_without_grouping, _ = compute_routing_scores_for_aux_loss(
+        logits, topk, score_function, use_pre_softmax=use_pre_softmax
+    )
+
+    assert torch.equal(aux_map, dispatch_map)
+    assert torch.equal(aux_map_with_fusion_requested, dispatch_map)
+    torch.testing.assert_close(aux_scores_with_fusion_requested, aux_scores)
+    assert not torch.equal(aux_map_without_grouping, dispatch_map)
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize("score_function", ["sigmoid", "sqrtsoftplus"])
+@pytest.mark.parametrize("use_grouping", [True, False])
+def test_aux_loss_expert_bias_routing_map_matches_dispatch(score_function, use_grouping):
+    # The bias is large enough to flip which group/experts are selected, so a routing map that
+    # ignores expert_bias differs from dispatch. Experts 0,1 (group 0) have smaller logits than
+    # experts 2,3 (group 1); the bias pushes selection back onto experts 0,1.
+    logits = torch.tensor([[0.0, 0.0, 1.0, 1.0], [0.0, 0.0, 1.0, 1.0]])
+    expert_bias = torch.tensor([10.0, 10.0, 0.0, 0.0])
+    topk = 2
+    num_groups = 2 if use_grouping else None
+    group_topk = 1 if use_grouping else None
+
+    _, dispatch_map = topk_routing_with_score_function(
+        logits,
+        topk,
+        num_groups=num_groups,
+        group_topk=group_topk,
+        score_function=score_function,
+        expert_bias=expert_bias,
+    )
+    aux_map_with_bias, _ = compute_routing_scores_for_aux_loss(
+        logits,
+        topk,
+        score_function,
+        num_groups=num_groups,
+        group_topk=group_topk,
+        expert_bias=expert_bias,
+    )
+    # Old behavior (bias not threaded through) selects on the raw scores and diverges from dispatch.
+    aux_map_without_bias, _ = compute_routing_scores_for_aux_loss(
+        logits, topk, score_function, num_groups=num_groups, group_topk=group_topk
+    )
+
+    assert torch.equal(aux_map_with_bias, dispatch_map)
+    assert not torch.equal(aux_map_without_bias, dispatch_map)
 
 
 class TestTop2Router:
