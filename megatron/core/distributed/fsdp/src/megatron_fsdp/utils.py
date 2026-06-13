@@ -16,6 +16,7 @@ import contextlib
 import inspect
 import logging
 import operator
+import os
 from contextlib import nullcontext
 from functools import reduce
 from importlib.metadata import version
