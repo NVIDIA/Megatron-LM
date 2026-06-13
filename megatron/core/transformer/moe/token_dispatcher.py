@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 from abc import ABC, abstractmethod
@@ -1043,6 +1043,9 @@ class _HybridEPManager(_DispatchManager):
         self.token_probs: Optional[torch.Tensor] = None
         # Handle used for combine operation
         self.handle = None
+        # Handles captured by full-iteration CUDA graphs must remain alive for
+        # later graph replays. They can wrap non-tensor backend resources.
+        self._cuda_graph_handles = []
         # Used for padding the output for each expert
         self.pad_multiple = None
 
@@ -1107,6 +1110,15 @@ class _HybridEPManager(_DispatchManager):
             # Round budget up to pad_multiple (FP8/FP4/CUTLASS alignment for permute buffers).
             budget += -budget % pad_multiple
             self.num_permuted_tokens = budget
+        elif self.config.cuda_graph_impl == "full_iteration":
+            # Full-iteration CUDA graph capture cannot safely use HybridEP's dynamic
+            # permuted-token sizing path because it reads a GPU-produced size back to host.
+            # Use the same static-budget shape as capacity-factor mode, without requiring
+            # the TE op-fuser that is incompatible with fine-grained activation offload.
+            pad_multiple = get_align_size_for_quantization(self.config)
+            budget = int(padded_num_tokens * self.config.moe_router_topk * 1.2)
+            budget += -budget % pad_multiple
+            self.num_permuted_tokens = budget
         # else: num_permuted_tokens stays None; HybridEP sizes buffers dynamically (CPU sync
         # in dispatch) and does not drop tokens or report overflow.
         # Compute the capacity for each expert at the drop_and_pad mode
@@ -1162,6 +1174,13 @@ class _HybridEPManager(_DispatchManager):
                 num_sms_preprocessing_api=self.config.moe_hybridep_num_sms_preprocessing,
             )
         )
+        if self.dispatched_probs.shape[0] != dispatched_hidden.shape[0]:
+            if self.dispatched_probs.shape[0] < dispatched_hidden.shape[0]:
+                raise RuntimeError(
+                    "HybridEP returned fewer dispatched probs than hidden states: "
+                    f"{self.dispatched_probs.shape[0]} < {dispatched_hidden.shape[0]}"
+                )
+            self.dispatched_probs = self.dispatched_probs[: dispatched_hidden.shape[0]]
         if self.moe_expert_rank_capacity_factor is not None:
             # Static-budget path only: handle[-1] is HybridEP overflow_flag when tokens were
             # dropped because permuted count exceeded num_permuted_tokens from setup_metadata.
@@ -1174,7 +1193,10 @@ class _HybridEPManager(_DispatchManager):
             self.tokens_per_expert = tokens_per_expert.to(torch.int64)
             # num_permuted_tokens is necessary to allocate the output tensor for combine.
             self.num_permuted_tokens = self.tokens_per_expert.sum()
-        if self.moe_expert_rank_capacity_factor is not None:
+        if (
+            self.moe_expert_rank_capacity_factor is not None
+            or self.config.cuda_graph_impl == "full_iteration"
+        ):
             self.tokens_per_expert = tokens_per_expert.to(torch.int64)
         return dispatched_hidden
 
@@ -1200,6 +1222,9 @@ class _HybridEPManager(_DispatchManager):
         # Release the used handle/num_permuted_tokens which could change in each iteration.
         # For drop_and_pad mode, we don't need to reset the num_permuted_tokens and
         # num_dispatched_tokens, because their values never change.
+        is_current_stream_capturing = getattr(torch.cuda, "is_current_stream_capturing", None)
+        if is_current_stream_capturing is not None and is_current_stream_capturing():
+            self._cuda_graph_handles.append(self.handle)
         self.handle = None
         if not self.drop_and_pad:
             self.num_permuted_tokens = None

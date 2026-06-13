@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import sys
 from unittest import mock
 
@@ -129,7 +129,7 @@ _NVRX_SUBMODULES = [
 
 
 class TestHasNvrxAsyncSupport:
-    """Tests for has_nvrx_async_support, focusing on the minimum-version assertion."""
+    """Tests for has_nvrx_async_support, focusing on the minimum-version gate."""
 
     def _fake_modules(self):
         """MagicMock modules that satisfy every symbol and hasattr check in has_nvrx_async_support."""
@@ -150,7 +150,7 @@ class TestHasNvrxAsyncSupport:
             assert has_nvrx_async_support() is True
 
     def test_version_check_fails(self):
-        """Raises AssertionError when all NVRx symbols are present but version is too old."""
+        """Returns False when all NVRx symbols are present but version is too old."""
         with (
             mock.patch(
                 'megatron.core.dist_checkpointing.strategies.nvrx.import_module',
@@ -161,5 +161,4 @@ class TestHasNvrxAsyncSupport:
                 return_value=False,
             ),
         ):
-            with pytest.raises(AssertionError, match="Minimum required nvidia-resiliency-ext"):
-                has_nvrx_async_support()
+            assert has_nvrx_async_support() is False

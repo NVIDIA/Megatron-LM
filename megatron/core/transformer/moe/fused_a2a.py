@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Portions of this code are from DeepSeek DeepEP project
 # Copyright (c) 2025 DeepSeek
 # Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
@@ -494,6 +494,7 @@ class HybridEPCombine(torch.autograd.Function):
             **({"fuse_unpermute_combine": fused} if fused else {}),
         )
         ctx.handle = handle
+        ctx.input_num_tokens = x.shape[0]
         ctx.pad_multiple = pad_multiple
         ctx.num_permuted_tokens = num_permuted_tokens
         ctx.fused = fused
@@ -513,6 +514,13 @@ class HybridEPCombine(torch.autograd.Function):
             num_permuted_tokens=ctx.num_permuted_tokens,
             **({"fuse_permute_dispatch": ctx.fused} if ctx.fused else {}),
         )
+        if dispatched_hidden.shape[0] != ctx.input_num_tokens:
+            if dispatched_hidden.shape[0] < ctx.input_num_tokens:
+                raise RuntimeError(
+                    "HybridEP combine backward returned fewer rows than the combine input: "
+                    f"{dispatched_hidden.shape[0]} < {ctx.input_num_tokens}"
+                )
+            dispatched_hidden = dispatched_hidden[: ctx.input_num_tokens]
         return dispatched_hidden, None, None, None, None
 
 
