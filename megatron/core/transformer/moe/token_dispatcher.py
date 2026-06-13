@@ -66,6 +66,9 @@ class MoETokenDispatcher:
             pg_collection (ProcessGroupCollection, optional): Process groups for MoE operations.
         """
         self.config = config
+        # FusedA2AConfig resolved once at startup (validate_args) and stored on TransformerConfig.
+        # Single source of truth: CLI > ENV > config file > defaults. Never re-resolved here.
+        self.fused_a2a_config = getattr(config, 'fused_a2a_config', None)
         self.shared_experts: Optional[SharedExpertMLP] = None
         # Whether to use NCCL stream for A2A communication, otherwise default stream is used.
         self.use_nccl_stream = False  # Will be set to True when shared_experts is set.
@@ -1213,7 +1216,16 @@ class _DeepepManager(_DispatchManager):
                 "DeepEP is not installed. Please install DeepEP package from "
                 "https://github.com/deepseek-ai/deepep."
             )
-        set_deepep_num_sms(config.moe_deepep_num_sms)
+        # Determine effective SM count.  fused_a2a_config.num_sms (set via --moe-a2a-num-sms /
+        # MOE_A2A_NUM_SMS / config file) takes precedence over moe_deepep_num_sms so there is a
+        # single, authoritative source of truth after validate_args has resolved everything.
+        _fused_a2a_config = getattr(config, 'fused_a2a_config', None)
+        effective_num_sms = (
+            _fused_a2a_config.num_sms
+            if _fused_a2a_config is not None and _fused_a2a_config.num_sms is not None
+            else config.moe_deepep_num_sms
+        )
+        set_deepep_num_sms(effective_num_sms)
 
     def setup_metadata(self, routing_map: torch.Tensor, probs: torch.Tensor):
         num_tokens = routing_map.shape[0]
@@ -1240,6 +1252,8 @@ class _DeepepManager(_DispatchManager):
                     "DeepEP only supports float32 probs, please set --moe-router-dtype=fp32"
                 )
             self.token_probs = self.token_probs.float()  # downcast or upcast
+        # NOTE: FusedA2AConfig must be passed explicitly from the top-level (single source of truth).
+        #       Do not resolve or mutate config here. No Python-side logic in hot path.
         hidden_states, dispatched_indices, dispatched_probs, num_tokens_per_expert, handle = (
             fused_dispatch(
                 hidden_states,
@@ -1249,6 +1263,7 @@ class _DeepepManager(_DispatchManager):
                 self.group,
                 async_finish=async_finish,
                 allocate_on_comm_stream=allocate_on_comm_stream,
+                config=self.fused_a2a_config,
             )
         )
         self.handle = handle
@@ -1300,12 +1315,15 @@ class _DeepepManager(_DispatchManager):
         async_finish: bool = False,
         allocate_on_comm_stream: bool = False,
     ) -> torch.Tensor:
+        # NOTE: FusedA2AConfig must be passed explicitly from the top-level (single source of truth).
+        #       Do not resolve or mutate config here. No Python-side logic in hot path.
         hidden_states, _ = fused_combine(
             hidden_states,
             self.group,
             self.handle,
             async_finish=async_finish,
             allocate_on_comm_stream=allocate_on_comm_stream,
+            config=self.fused_a2a_config,
         )
         # Release the handle after combine operation
         self.handle = None
