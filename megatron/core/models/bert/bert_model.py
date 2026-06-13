@@ -209,7 +209,8 @@ class BertModel(LanguageModule):
                 attn_mask_dimensions = "b11s"
                 if attn_mask_type != AttnMaskType.padding:
                     warnings.warn(
-                        f'For TE versions >= 1.10 , flash/fused/unfused support padding mask. Setting attention mask from {attn_mask_type} to padding'
+                        f'For TE versions >= 1.10 , flash/fused/unfused support padding mask. Setting attention mask from {attn_mask_type} to padding',
+                        stacklevel=2,
                     )
                     self.transformer_layer_spec.submodules.self_attention.params[
                         'attn_mask_type'
@@ -221,7 +222,8 @@ class BertModel(LanguageModule):
                 else:
                     if attn_mask_type != AttnMaskType.arbitrary:
                         warnings.warn(
-                            f'For TE versions >= 1.7 but < 1.10 , unfused path supports only arbitrary mask. Setting attention mask from {attn_mask_type} to arbitray'
+                            f'For TE versions >= 1.7 but < 1.10 , unfused path supports only arbitrary mask. Setting attention mask from {attn_mask_type} to arbitray',
+                            stacklevel=2,
                         )
                         self.transformer_layer_spec.submodules.self_attention.params[
                             'attn_mask_type'

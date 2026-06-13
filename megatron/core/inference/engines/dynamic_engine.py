@@ -932,7 +932,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 f"Prompt Tokens: {len(request.prompt_tokens)} "
                 f"Tokens to generate: {request.sampling_params.num_tokens_to_generate} "
                 f"Max sequence length: {self.context.max_sequence_length} "
-                f"Chunked prefill enabled: {self.enable_chunked_prefill}"
+                f"Chunked prefill enabled: {self.enable_chunked_prefill}",
+                stacklevel=2,
             )
 
         request.status = Status.FAILED
@@ -1032,7 +1033,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 if self.rank == 0:
                     warnings.warn(
                         "Termination ID not specified, and tokenizer does not define eod."
-                        "Defaulting to not using termination id."
+                        "Defaulting to not using termination id.",
+                        stacklevel=2,
                     )
                 eod = -1
             request.sampling_params.termination_id = eod
@@ -1050,7 +1052,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 warnings.warn(
                     f"Request {request_id} requested num_tokens_to_generate={requested_tokens} "
                     f"which exceeds the maximum sequence length of the engine. "
-                    f"Clamping num_tokens_to_generate to {remaining_tokens}."
+                    f"Clamping num_tokens_to_generate to {remaining_tokens}.",
+                    stacklevel=2,
                 )
 
         if len(request.prompt_tokens) > self.context.max_tokens and not self.enable_chunked_prefill:
@@ -2243,7 +2246,9 @@ class DynamicInferenceEngine(AbstractEngine):
         warnings.warn(
             "`step_legacy()` is deprecated and will be removed in `megatron-core` "
             "0.16. Please use `step_modern()` going forward, which will eventually "
-            "be renamed to `step()`."
+            "be renamed to `step()`.",
+            DeprecationWarning,
+            stacklevel=2,
         )
         result = self._run_coroutine_sync(self.async_step())
         active_requests = [self.get_request(i) for i in result["active_request_ids"]]

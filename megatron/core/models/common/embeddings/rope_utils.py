@@ -115,6 +115,7 @@ def _apply_rotary_pos_emb_bshd(
         warnings.warn(
             "multi_latent_attention is deprecated. Please use mla_rotary_interleaved instead.",
             DeprecationWarning,
+            stacklevel=2,
         )
         mla_rotary_interleaved = multi_latent_attention
 
@@ -212,6 +213,7 @@ def _apply_rotary_pos_emb_thd(
         warnings.warn(
             "multi_latent_attention is deprecated. Please use mla_rotary_interleaved instead.",
             DeprecationWarning,
+            stacklevel=2,
         )
         mla_rotary_interleaved = multi_latent_attention
 
@@ -292,19 +294,22 @@ def apply_rotary_pos_emb(
                 # TODO: Add a check in TransformerConfig and remove this unfused implementation.
                 warnings.warn(
                     "apply_rope_fusion does not support mRoPE in bshd format when bs > 1. "
-                    "Please set apply_rope_fusion to false. This will become an error in v0.16."
+                    "Please set apply_rope_fusion to false. This will become an error in v0.16.",
+                    stacklevel=2,
                 )
                 use_unfused = True
             if mscale != 1.0:
                 warnings.warn(
                     f"mscale={mscale} is not supported by TE's fused RoPE. "
-                    "Using unfused implementation."
+                    "Using unfused implementation.",
+                    stacklevel=2,
                 )
                 use_unfused = True
             if mla_rotary_interleaved:
                 warnings.warn(
                     "apply_rope_fusion does not support MLA-style interleaving in RoPE."
-                    "Using unfused implementation."
+                    "Using unfused implementation.",
+                    stacklevel=2,
                 )
                 use_unfused = True
             if not use_unfused:
