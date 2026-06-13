@@ -792,15 +792,24 @@ def fwd_fused_indexer_loss_naive_thd(
     one to :func:`fwd_fused_indexer_loss_naive` with ``b=1``.
 
     Returns ``(topk_indices_thd (total_q, topk) int32 [per-segment LOCAL
-    ids], indexer_loss (scalar))``. The aggregated loss is the
-    row-weighted mean over ALL THD query rows:
+    ids], indexer_loss (scalar))``. Aggregation matches the SBHD
+    definition for each reduction mode:
 
-        ``loss = sum_b (loss_b * seqlen_q[b]) / total_q``
+    * **mean** (``calculate_per_token_loss=False``): ``loss_b`` is the
+      per-segment row MEAN, so weight by the segment length and divide by
+      ``total_q`` to recover the row-mean over ALL THD query rows::
 
-    which matches the SBHD definition of "mean over all ``B * S_q``
-    rows" generalised across variable-length segments. Segments with
-    ``seqlen_k[b] == 0`` contribute zero numerator but still contribute
-    their rows to ``total_q`` via the denominator.
+          ``loss = sum_b (loss_b * seqlen_q[b]) / total_q``
+
+    * **per-token** (``calculate_per_token_loss=True``): ``loss_b`` is
+      already a RAW ROW SUM over the segment's rows, so the aggregate is a
+      plain ``sum_b loss_b`` over all THD rows (the global token divisor is
+      applied later by ``finalize_model_grads``). The mean-mode
+      ``* seqlen_q[b] / total_q`` weighting must NOT be applied here — doing
+      so scales the loss (and every indexer gradient) by ``1 / num_segments``.
+
+    Segments with ``seqlen_k[b] == 0`` contribute nothing (mean-mode still
+    counts their rows in ``total_q``).
     """
     B = int(cu_seqlens_q.shape[0]) - 1
     total_q = q.shape[0]
@@ -851,10 +860,15 @@ def fwd_fused_indexer_loss_naive_thd(
         # post-filter in csa.py marks them invalid.
         topk_seg = topk_indices_b.shape[-1]
         topk_indices_thd[q_start:q_end, :topk_seg] = topk_indices_b.squeeze(0).int()
-        weighted_losses.append(loss_b * seqlen_q_b)
+        # per-token: ``loss_b`` is a raw row sum -> aggregate is a plain sum.
+        # mean: ``loss_b`` is a row mean -> weight by segment length here and
+        # divide by ``total_q`` below to get the row-mean over all THD rows.
+        weighted_losses.append(loss_b if calculate_per_token_loss else loss_b * seqlen_q_b)
 
     if weighted_losses:
-        indexer_loss = torch.stack(weighted_losses).sum() / float(max(total_q, 1))
+        indexer_loss = torch.stack(weighted_losses).sum()
+        if not calculate_per_token_loss:
+            indexer_loss = indexer_loss / float(max(total_q, 1))
     else:
         indexer_loss = torch.zeros((), device=device, dtype=torch.float32)
     return topk_indices_thd, indexer_loss
@@ -880,14 +894,18 @@ def bwd_fused_indexer_loss_naive_thd(
     """THD per-segment backward — accumulates per-segment grads back into
     the flat THD-shaped grad buffers.
 
-    The per-segment ``grad_loss`` is scaled by ``seqlen_q[b] / total_q``
-    to match the forward's row-weighted-mean aggregation:
+    The per-segment ``grad_loss`` must match the forward's aggregation
+    (see :func:`fwd_fused_indexer_loss_naive_thd`):
 
-        ``d(aggregated_loss) / d(loss_b) = seqlen_q[b] / total_q``
-
-    so the per-segment naive backward (which internally divides by
-    ``b * sq = seqlen_q[b]``) ends up producing the correct per-row
-    gradient for the aggregated loss.
+    * **mean** (``calculate_per_token_loss=False``): scale by
+      ``seqlen_q[b] / total_q`` so the inner naive backward's internal
+      ``/seqlen_q[b]`` row-mean divisor composes into the correct per-row
+      gradient of the row-weighted-mean aggregate.
+    * **per-token** (``calculate_per_token_loss=True``): the aggregate is a
+      plain ``sum_b loss_b`` and the inner backward does NOT divide, so each
+      segment carries the FULL upstream ``grad_loss``. Applying the mean-mode
+      ``seqlen_q[b] / total_q`` factor here would shrink every indexer
+      gradient by ``1 / num_segments``.
     """
     B = int(cu_seqlens_q.shape[0]) - 1
     device = q.device
@@ -921,10 +939,10 @@ def bwd_fused_indexer_loss_naive_thd(
         topk_b = topk_indices_thd[q_start:q_end, :topk_seg].unsqueeze(0).long()
         mask_b = _build_causal_mask_seg(seqlen_q_b, seqlen_k_b, ratio, device)
 
-        # Scale grad_loss by (seqlen_q_b / total_q) so the per-seg
-        # naive backward (which divides by seqlen_q_b internally) ends
-        # up with the row-mean over all THD rows.
-        grad_loss_b = grad_loss * (seqlen_q_b / total_q)
+        # per-token: plain sum aggregate -> full grad per segment.
+        # mean: scale by (seqlen_q_b / total_q) so the inner naive backward's
+        # internal /seqlen_q_b divisor yields the row-mean over all THD rows.
+        grad_loss_b = grad_loss if calculate_per_token_loss else grad_loss * (seqlen_q_b / total_q)
 
         grad_q_b, grad_w_b, grad_k_b = bwd_fused_indexer_loss_naive(
             q_b,

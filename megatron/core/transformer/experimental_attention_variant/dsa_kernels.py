@@ -1363,30 +1363,6 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             sq, b, skv = ctx.sq, ctx.b, ctx.skv
             dO_flat = grad_output.reshape(sq * b, np_, d_v)
 
-        # Workaround for cudnn DSA ``sparse_attention_backward_wrapper`` bug:
-        # the kernel's inner dKV-tile loop is bounded by
-        # ``ceil(max_seqlen_kv / block_tile)`` instead of
-        # ``ceil(topk_width / block_tile)``, silently dropping topk-axis
-        # tiles past column ``max_seqlen_kv``. Compact each row so all
-        # valid entries land in ``[0, max_seqlen_kv)``; the dropped tail
-        # becomes pure ``-1`` padding (already a no-op in the kernel).
-        # Math-equivalent because per-query softmax/sum are
-        # order-invariant — only the SET of valid indices matters, not
-        # their position within the row.
-        topk_width = global_idxs.shape[-1]
-        max_seqlen_kv = kv_flat.shape[0]
-        if topk_width > max_seqlen_kv:
-            sentinel = torch.iinfo(global_idxs.dtype).max
-            gi = torch.where(
-                global_idxs >= 0, global_idxs, torch.full_like(global_idxs, sentinel)
-            )
-            gi, _ = torch.sort(gi, dim=-1, stable=True)
-            global_idxs_bwd = torch.where(
-                gi >= sentinel, torch.full_like(gi, -1), gi
-            ).contiguous()
-        else:
-            global_idxs_bwd = global_idxs
-
         attn_bwd = _DSA.sparse_attention_backward_wrapper(
             q_flat,
             kv_flat,
@@ -1394,7 +1370,7 @@ class FusedIndexerSparseAttnFunc(torch.autograd.Function):
             dO_flat,
             lse,
             attn_sink,
-            global_idxs_bwd,
+            global_idxs,
             softmax_scale=ctx.softmax_scale,
             topk_length=None,
         )

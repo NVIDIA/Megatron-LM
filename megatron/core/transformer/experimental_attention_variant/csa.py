@@ -338,49 +338,6 @@ def cat_per_segment(
 # ---------------------------------------------------------------------------
 
 
-def _stride_tables_per_segment(
-    *tables: torch.Tensor,
-    cu_seqlens_compressed: torch.Tensor,
-    ratio: int,
-    total_comp: Optional[int] = None,
-) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
-    """Per-segment strided slicing for THD packed layout with ``ratio > 1``.
-
-    THD analogue of the SBHD ``table[:total:ratio][:seq_len]`` trick.  For each
-    segment of compressed length *s*, takes ``table[:s*ratio:ratio][:s]`` and
-    concatenates all segments into a packed table aligned with
-    ``cu_seqlens_compressed``.
-
-    Fully vectorized: builds a flat gather index on GPU and applies a single
-    ``index_select`` per table — no Python loop, no GPU→CPU sync.
-
-    Args:
-        *tables: one or more 1-D-leading rotary tables, each ``(max_len, ...)``.
-        cu_seqlens_compressed: ``(B+1,)`` int32 cumulative compressed lengths.
-        ratio: compression stride (> 1).
-        total_comp: total number of compressed tokens (avoids a GPU→CPU sync
-            when the caller already knows it, e.g. from ``x.shape[0]``).
-    """
-    if total_comp is None:
-        total_comp = int(cu_seqlens_compressed[-1].item())
-    if total_comp == 0:
-        ret = [t[:0] for t in tables]
-        return ret[0] if len(ret) == 1 else tuple(ret)
-
-    device = cu_seqlens_compressed.device
-    row_idx = torch.arange(total_comp, device=device, dtype=cu_seqlens_compressed.dtype)
-    batch_ids = batch_of_row(cu_seqlens_compressed, total_q=total_comp)
-    valid = row_idx < cu_seqlens_compressed[-1]
-    local_pos = row_idx - cu_seqlens_compressed[batch_ids]
-    local_pos = torch.where(valid, local_pos, torch.zeros_like(local_pos))
-    table_len = tables[0].shape[0]
-    gather_idx = (local_pos * ratio).clamp(max=table_len - 1)
-
-    gather_idx_expanded = gather_idx.view(-1, *([1] * (tables[0].ndim - 1)))
-    results = [torch.gather(t, 0, gather_idx_expanded.expand(-1, *t.shape[1:])) for t in tables]
-    return results[0] if len(results) == 1 else tuple(results)
-
-
 def _apply_fused_rope(
     x: torch.Tensor,
     cos: torch.Tensor,
@@ -496,8 +453,8 @@ def _apply_rope(
 
     * **SBHD** (``cu_seqlens=None``): builds a single rotary table of length
       ``rotary_seq_len * ratio`` and slices with stride ``ratio``.
-    * **THD packed** (``cu_seqlens`` supplied): per-segment strided tables via
-      ``_stride_tables_per_segment``.
+    * **THD packed** (``cu_seqlens`` supplied): globally strided tables
+      (``table[:max_total:ratio]``), matching the SBHD approach.
 
     Args:
         max_seqlen_rope: pre-computed ``max(seg_lens) * ratio`` for the
@@ -529,9 +486,8 @@ def _apply_rope(
                 max_total, dtype=x.dtype, packed_seq=True, mscale=1.0
             )
             if ratio > 1:
-                cos, sin = _stride_tables_per_segment(
-                    cos, sin, cu_seqlens_compressed=cu_seqlens, ratio=ratio, total_comp=x.shape[0]
-                )
+                cos = cos[:max_total:ratio]
+                sin = sin[:max_total:ratio]
         else:
             total = rotary_seq_len * ratio if ratio > 1 else rotary_seq_len
             cos, sin = rotary_pos_emb_module.get_cached_cos_sin(
@@ -547,9 +503,7 @@ def _apply_rope(
         rope_result = rotary_pos_emb_module(max_total, packed_seq=True)
         rotary_pos_emb = rope_result[0] if isinstance(rope_result, tuple) else rope_result
         if ratio > 1:
-            rotary_pos_emb = _stride_tables_per_segment(
-                rotary_pos_emb, cu_seqlens_compressed=cu_seqlens, ratio=ratio, total_comp=x.shape[0]
-            )
+            rotary_pos_emb = rotary_pos_emb[:max_total:ratio]
     else:
         total = rotary_seq_len * ratio if ratio > 1 else rotary_seq_len
         rope_result = rotary_pos_emb_module(total, packed_seq=False)
