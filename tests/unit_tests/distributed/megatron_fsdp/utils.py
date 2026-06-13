@@ -7,7 +7,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.data.distributed import DistributedSampler
 
-from gpt_builders import gpt_builder
+from hybrid_builders import hybrid_builder
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.enums import ModelType
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
@@ -53,11 +53,14 @@ def make_gpt_mock_data_iterator(
 def make_moe_args_model_and_optimizer(ut_filename, **overrides):
     sys.argv = [ut_filename]
     base_args = dict(
+        hybrid_layer_pattern="MEME/ME",
+        spec=["megatron.core.models.hybrid.hybrid_layer_specs", "hybrid_stack_spec"],
         num_layers=4,
         mtp_num_layers=1,
         hidden_size=128,
         num_attention_heads=2,
         max_position_embeddings=128,
+        mamba_num_groups=4,
         bf16=False,
         add_bias_linear=False,
         swiglu=True,
@@ -91,7 +94,7 @@ def make_moe_args_model_and_optimizer(ut_filename, **overrides):
     set_global_variables(args, build_tokenizer=False)
 
     model, optimizer, _ = setup_model_and_optimizer(
-        model_provider_func=partial(model_provider, gpt_builder),
+        model_provider_func=partial(model_provider, hybrid_builder),
         model_type=ModelType.encoder_or_decoder,
     )
     return model, optimizer
