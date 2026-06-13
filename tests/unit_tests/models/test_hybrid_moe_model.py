@@ -162,7 +162,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "mlp_chunks_for_training": 1,
     "moe_apply_probs_on_input": False,
     "moe_aux_loss_coeff": 0.0,
-    "moe_deepep_num_sms": 20,
+    "moe_deepep_num_sms": None,
     "moe_enable_deepep": False,
     "moe_expert_capacity_factor": None,
     "moe_expert_rank_capacity_factor": None,
