@@ -1410,11 +1410,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self.config.cuda_graph_modules
             and CudaGraphModule.attn not in self.config.cuda_graph_modules
         ):
+            input_ids = kwargs.get("input_ids", None)
             hidden_states, context = self._forward_attention(*args, **kwargs)
             args = (hidden_states,)
             kwargs = {}
             if padding_mask is not None:
                 kwargs["padding_mask"] = padding_mask
+            if input_ids is not None:
+                kwargs["input_ids"] = input_ids
         else:
             self._decompose_packed_seq_params_to_kwargs(kwargs)
 
