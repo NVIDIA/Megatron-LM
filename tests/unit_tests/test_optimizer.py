@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -19,6 +20,7 @@ from megatron.core.optimizer import (
     ParamKey,
     ParamPredicate,
     _get_param_groups,
+    _sync_overlap_param_gather_from_ddp_config,
     check_config_overrides_consistency,
     get_megatron_optimizer,
     get_standard_config_overrides,
@@ -114,6 +116,16 @@ def test_get_param_groups_default_overrides(mock_get_world_size):
     pg0, pg1 = param_groups
     wd_mults = {pg0['wd_mult'], pg1['wd_mult']}
     assert wd_mults == {1.0, 0.0}
+
+
+def test_optimizer_config_overlap_param_gather_syncs_from_ddp_config():
+    ddp_config = DistributedDataParallelConfig(overlap_param_gather=True)
+    model_chunk = SimpleNamespace(ddp_config=ddp_config)
+    opt_config = OptimizerConfig(optimizer='adam', lr=0.01, overlap_param_gather=False)
+
+    _sync_overlap_param_gather_from_ddp_config(opt_config, [model_chunk])
+
+    assert opt_config.overlap_param_gather is True
 
 
 @patch('torch.distributed.get_world_size', return_value=1)
