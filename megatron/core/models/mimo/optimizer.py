@@ -100,6 +100,11 @@ class MimoOptimizer(MegatronOptimizer):
         num_zeros = self.count_zeros() if self.config.log_num_zeros_in_grad else None
         success = self.step_with_ready_grads()
 
+        # Reduce update success across the world (MIN) so disjoint-grid ranks agree.
+        success_tensor = torch.tensor([1 if success else 0], dtype=torch.int, device="cuda")
+        torch.distributed.all_reduce(success_tensor, op=torch.distributed.ReduceOp.MIN)
+        success = bool(success_tensor.item())
+
         return success, grad_norm, num_zeros
 
     @torch.no_grad()
