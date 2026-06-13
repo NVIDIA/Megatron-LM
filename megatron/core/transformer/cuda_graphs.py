@@ -20,6 +20,7 @@ from typing import Any, Dict, List
 import torch
 from torch.utils._pytree import tree_map as tree_map_pyt
 
+from megatron.core import parallel_state
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
@@ -1995,7 +1996,7 @@ class TECudaGraphHelper:
 
             if self._needs_full_local_padding_mask(layer, chunk_of_the_layer, static_inputs):
                 local_slen = self.config.max_seqlen_per_dp_cp_rank
-                static_inputs["padding_mask"] = torch.ones(
+                static_inputs["padding_mask"] = torch.zeros(
                     1, local_slen, dtype=torch.bool, device=torch.cuda.current_device()
                 )
 

@@ -1115,7 +1115,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             slen_for_mask = self.config.max_seqlen_per_dp_cp_rank
             if self.config.sequence_parallel:
                 slen_for_mask //= self.config.tensor_model_parallel_size
-            static_inputs["padding_mask"] = torch.ones(
+            static_inputs["padding_mask"] = torch.zeros(
                 1, slen_for_mask, dtype=torch.bool, device=device
             )
         elif attn_in_graph:
@@ -1302,11 +1302,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             self.config.cuda_graph_modules
             and CudaGraphModule.attn not in self.config.cuda_graph_modules
         ):
+            input_ids = kwargs.get("input_ids", None)
             hidden_states, context = self._forward_attention(*args, **kwargs)
             args = (hidden_states,)
             kwargs = {}
             if padding_mask is not None:
                 kwargs["padding_mask"] = padding_mask
+            if input_ids is not None:
+                kwargs["input_ids"] = input_ids
         else:
             self._decompose_packed_seq_params_to_kwargs(kwargs)
 
