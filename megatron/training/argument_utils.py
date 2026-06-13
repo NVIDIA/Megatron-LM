@@ -269,6 +269,14 @@ class ArgumentGroupFactory:
         return field_docstrings
 
 
+def _check_mutual_exclusive(args, arg_names: list[str]) -> None:
+    enabled_args = [arg_name for arg_name in arg_names if getattr(args, arg_name)]
+    assert len(enabled_args) <= 1, (
+        f"{', '.join('--' + arg_name.replace('_', '-') for arg_name in enabled_args)} "
+        "are mutually exclusive."
+    )
+
+
 def core_transformer_config_from_args(args, config_class=None):
     from megatron.core.activations import squared_relu
     from megatron.core.fusions.fused_bias_geglu import quick_gelu
@@ -306,6 +314,10 @@ def core_transformer_config_from_args(args, config_class=None):
     kw_args['num_layers_in_last_pipeline_stage']= args.decoder_last_pipeline_num_layers
     kw_args['fp8_param'] = args.fp8_param_gather
     kw_args['fp4_param'] = args.fp4_param_gather
+    _check_mutual_exclusive(
+        args,
+        ['swiglu', 'squared_relu', 'geglu_tanh', 'geglu', 'quick_geglu'],
+    )
     if args.swiglu:
         kw_args['activation_func'] = F.silu
         kw_args['gated_linear_unit'] = True
@@ -313,10 +325,15 @@ def core_transformer_config_from_args(args, config_class=None):
     else:
         kw_args['bias_activation_fusion'] = args.bias_gelu_fusion
     if args.squared_relu:
-        assert not args.swiglu
         kw_args['activation_func'] = squared_relu
+    elif args.geglu_tanh:
+        from functools import partial
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = partial(F.gelu, approximate='tanh')
+    elif args.geglu:
+        kw_args['gated_linear_unit'] = True
+        kw_args['activation_func'] = F.gelu
     elif args.quick_geglu:
-        assert not args.swiglu
         kw_args['gated_linear_unit'] = True
         kw_args['activation_func'] = quick_gelu
     if args.init_method_xavier_uniform:
