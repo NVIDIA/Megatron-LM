@@ -76,6 +76,12 @@ def _get_field(obj, key, default=None):
     return getattr(obj, key, default)
 
 
+def _get_non_none(obj, key, default):
+    """Returns the value from the object or default if the key is missing or None."""
+    val = obj.get(key)
+    return default if val is None else val
+
+
 def _try_parse_jsonish(value):
     if not isinstance(value, str):
         return value
@@ -343,12 +349,14 @@ def _replace_prefix_tokens(
     from the previous generation (rather than the ones from the chat template application)."""
 
     # Strip the EOS from the previous turn token ids if it exists
-    if previous_turn_token_ids[-1] == eos_token_id:
+    if previous_turn_token_ids and previous_turn_token_ids[-1] == eos_token_id:
         previous_turn_token_ids = previous_turn_token_ids[:-1]
 
     # Find the last EOS token id in the previous turn token ids
     last_eos_token_id_index = len(retokeenized_previous_turn_token_ids) - 1
-    for i in reversed(range(len(retokeenized_previous_turn_token_ids))):
+    # Note that the current conversation stat may be shorter than the previous conversation state.
+    scan_len = min(len(retokeenized_previous_turn_token_ids), len(current_turn_token_ids))
+    for i in reversed(range(scan_len)):
         if current_turn_token_ids[i] == eos_token_id:
             last_eos_token_id_index = i
             break
@@ -358,6 +366,35 @@ def _replace_prefix_tokens(
 
     # Return the previous turn token ids + the current turn token ids
     return previous_turn_token_ids + current_turn_additional_token_ids
+
+
+def _coerce_to_token_id_list(result):
+    """Convert the return value of `tokenizer.apply_chat_template` to `list[int]`.
+
+    transformers >= 5.x.x sometimes returns a `BatchEncoding` object instead of a `list[int]`.
+    """
+    # BatchEncoding / dict-like with input_ids
+    if isinstance(result, dict) or hasattr(result, "input_ids"):
+        ids = result["input_ids"]
+        if hasattr(ids, "tolist"):
+            ids = ids.tolist()
+        if ids and isinstance(ids[0], list):
+            ids = ids[0]
+        return list(ids)
+    # Fast-tokenizer Encoding object
+    if hasattr(result, "ids"):
+        ids = result.ids
+        if hasattr(ids, "tolist"):
+            ids = ids.tolist()
+        return list(ids)
+    # Raw tensor / ndarray
+    if hasattr(result, "tolist"):
+        ids = result.tolist()
+        if ids and isinstance(ids[0], list):
+            ids = ids[0]
+        return ids
+    # Plain list
+    return list(result)
 
 
 try:
@@ -433,12 +470,14 @@ try:
                 hasattr(tokenizer, 'apply_chat_template')
                 and getattr(tokenizer, "chat_template", None) is not None
             ):
-                prompt_tokens = tokenizer.apply_chat_template(
-                    template_messages,
-                    tokenize=True,
-                    add_generation_prompt=True,
-                    tools=template_tools,
-                    **chat_template_kwargs,
+                prompt_tokens = _coerce_to_token_id_list(
+                    tokenizer.apply_chat_template(
+                        template_messages,
+                        tokenize=True,
+                        add_generation_prompt=True,
+                        tools=template_tools,
+                        **chat_template_kwargs,
+                    )
                 )
 
                 if req.get("prevent_retokenization", True):
@@ -479,12 +518,14 @@ try:
                         ]
 
                         # Get the templated tokenization of just the previous generation
-                        retokenized_previous_turn_token_ids = tokenizer.apply_chat_template(
-                            messages_to_last_assistant_message,
-                            tokenize=True,
-                            add_generation_prompt=False,
-                            tools=template_tools,
-                            **chat_template_kwargs,
+                        retokenized_previous_turn_token_ids = _coerce_to_token_id_list(
+                            tokenizer.apply_chat_template(
+                                messages_to_last_assistant_message,
+                                tokenize=True,
+                                add_generation_prompt=False,
+                                tools=template_tools,
+                                **chat_template_kwargs,
+                            )
                         )
 
                         # Replace the prefix tokens with the tokens from the previous generation.
@@ -522,20 +563,20 @@ try:
 
         # --- 2. Parse Sampling Params ---
         try:
-            temperature = float(req.get("temperature", 1.0))
-            top_p = float(req.get("top_p", 1.0))
-            top_k = int(req.get("top_k", 0))
-            n = int(req.get("n", 1))  # Number of choices to generate
+            temperature = float(_get_non_none(req, "temperature", 1.0))
+            top_p = float(_get_non_none(req, "top_p", 1.0))
+            top_k = int(_get_non_none(req, "top_k", 0))
+            n = int(_get_non_none(req, "n", 1))  # Number of choices to generate
 
             if temperature == 0.0:
                 top_k = 1
                 top_p = 0.0
 
             # Check for 'logprobs' (bool) and 'top_logprobs' (int)
-            return_log_probs = bool(req.get("logprobs", False))
-            top_n_logprobs = int(req.get("top_logprobs", 0)) if return_log_probs else 0
-            skip_prompt_log_probs = bool(req.get("skip_prompt_log_probs", True))
-            add_BOS = bool(req.get("add_BOS", False))
+            return_log_probs = bool(_get_non_none(req, "logprobs", False))
+            top_n_logprobs = int(_get_non_none(req, "top_logprobs", 0)) if return_log_probs else 0
+            skip_prompt_log_probs = bool(_get_non_none(req, "skip_prompt_log_probs", True))
+            add_BOS = bool(_get_non_none(req, "add_BOS", False))
 
             # The engine only handles add_BOS for string prompts, not pre-tokenized
             # input. Since we pre-tokenize via apply_chat_template, we must handle
@@ -699,6 +740,9 @@ try:
             message["prompt_token_ids"] = result["prompt_tokens"]
             message["generation_token_ids"] = result["generated_tokens"]
             message["generation_log_probs"] = result.get("generated_log_probs", [])
+            message["policy_epoch"] = result["policy_epoch"]
+            message["kv_cache_epoch"] = result["kv_cache_epoch"]
+            message["num_evictions"] = sum(1 for e in result["events"] if e.get("type") == "EVICT")
             return_log_probs = sampling_params.return_log_probs
 
             # Determine finish_reason following vLLM conventions:
@@ -727,11 +771,6 @@ try:
                 "logprobs": {"content": logprobs_content} if return_log_probs else None,
                 "finish_reason": finish_reason,
             }
-            choice_data["policy_epoch"] = result["policy_epoch"]
-            choice_data["kv_cache_epoch"] = result["kv_cache_epoch"]
-            choice_data["num_evictions"] = sum(
-                1 for e in result["events"] if e.get("type") == "EVICT"
-            )
             if current_app.config['verbose']:
                 logging.info(_redact_token_id_lists_for_logging(result))
 

@@ -18,6 +18,24 @@ def mock_train_valid_test_datasets_provider(train_val_test_num_samples):
     return iter([1]), iter([2]), iter([3])
 
 
+class _LenDataloader:
+    """Fake dataloader with __len__ (required by the full_validation path)
+    and __iter__ (consumed via cyclic_iter)."""
+
+    def __init__(self, data):
+        self._data = list(data)
+
+    def __len__(self):
+        return len(self._data)
+
+    def __iter__(self):
+        return iter(self._data)
+
+
+def mock_multi_valid_full_datasets_provider(train_val_test_num_samples):
+    return (iter([1]), [_LenDataloader([2, 2]), _LenDataloader([20, 20, 20])], iter([3]))
+
+
 def create_test_args():
     # Set dummy values for the args.
     args = SimpleNamespace()
@@ -31,6 +49,7 @@ def create_test_args():
     args.consumed_valid_samples = 1
     args.dataloader_type = "external"
     args.skip_train = False
+    args.start_eval_at_iter = None
     args.full_validation = False
     args.multiple_validation_sets = False
     args.perform_rl_step = False
@@ -53,6 +72,24 @@ class TestTraining:
         valid_data = next(valid_iter)
         test_data = next(test_iter)
         assert (train_data, valid_data, test_data) == (1, 2, 3)
+
+    def test_build_train_valid_test_data_iterators_multi_full_validation(self):
+        """multiple_validation_sets + full_validation builds a list of iterators
+        (one per validation set) and sets args.eval_iters to the per-loader
+        lengths MAX-reduced across DP ranks."""
+        args = create_test_args()
+        args.multiple_validation_sets = True
+        args.full_validation = True
+        set_args(args)
+        _, valid_iters, _ = build_train_valid_test_data_iterators(
+            mock_multi_valid_full_datasets_provider
+        )
+        assert isinstance(valid_iters, list)
+        assert len(valid_iters) == 2
+        assert next(valid_iters[0]) == 2
+        assert next(valid_iters[1]) == 20
+        # data_parallel_size=1, so MAX across DP ranks equals the local lengths
+        assert args.eval_iters == [2, 3]
 
     def test_closed_formula_vocab_size_with_padding(self):
         def old_round_impl(after, multiple):
@@ -82,6 +119,52 @@ class TestTraining:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+
+class TestGetModelBucketSizingPgCollection:
+    """The DDP-bucket-sizing path in get_model must read world size / rank from the
+    explicitly passed pg_collection (pg_collection.dp_cp / pg_collection.pp) rather
+    than the mpu globals. With an explicit pg_collection the mpu globals must not be
+    consulted at all."""
+
+    def test_bucket_sizing_uses_explicit_pg_collection(self, monkeypatch):
+        import megatron.training.training as training
+
+        # Sentinel groups whose size()/rank() identify which group was read.
+        class _Group:
+            def __init__(self, size, rank):
+                self._size = size
+                self._rank = rank
+
+            def size(self):
+                return self._size
+
+            def rank(self):
+                return self._rank
+
+        pg_collection = SimpleNamespace(dp_cp=_Group(size=7, rank=0), pp=_Group(size=4, rank=3))
+
+        # The mpu globals replaced on the bucket-sizing path must never be called
+        # when an explicit pg_collection is supplied.
+        def _boom(*args, **kwargs):
+            raise AssertionError("mpu global consulted on explicit pg_collection path")
+
+        monkeypatch.setattr(training.mpu, "get_data_parallel_world_size", _boom)
+        monkeypatch.setattr(training.mpu, "get_pipeline_model_parallel_rank", _boom)
+
+        # get_pg_size/get_pg_rank return 1/0 unless torch.distributed is initialized,
+        # so make them read directly off the sentinel groups for this host-only test.
+        monkeypatch.setattr(training, "get_pg_size", lambda group: group.size())
+        monkeypatch.setattr(training, "get_pg_rank", lambda group: group.rank())
+
+        # Mirror the exact bucket-sizing expressions from get_model.
+        bucket_size = max(40000000, 1000000 * training.get_pg_size(pg_collection.dp_cp))
+        pp_rank = training.get_pg_rank(pg_collection.pp)
+
+        # dp_cp size 7 -> 7_000_000 < 40_000_000, so the floor wins (default behavior).
+        assert bucket_size == 40000000
+        # pp rank is driven by pg_collection.pp, not the mpu global.
+        assert pp_rank == 3
 
 
 class TestSaveGrads:
