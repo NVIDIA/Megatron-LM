@@ -2,7 +2,7 @@
 
 import asyncio
 from abc import ABC, abstractmethod
-from typing import Generic, TypeVar
+from typing import Generic, Literal, TypeVar
 
 import numpy as np
 from pydantic import BaseModel
@@ -16,7 +16,6 @@ from ..inference import (
     LLMChatMessage,
     ReturnsRaw,
 )
-from ..rollout_granularity import RLRolloutGranularity
 
 
 class AgentBaseModel(BaseModel, extra='allow'):
@@ -40,8 +39,8 @@ class GroupedRolloutRequest(Request):
     validation: bool = False
     filter_groups_with_same_reward: bool = False
     streaming: bool = False
-    submission_granularity: RLRolloutGranularity = RLRolloutGranularity.BATCH
-    consumption_granularity: RLRolloutGranularity = RLRolloutGranularity.BATCH
+    submission_granularity: Literal["R", "G", "B"] = "B"
+    consumption_granularity: Literal["R", "G", "B"] = "B"
 
 
 class Rollout(AgentBaseModel):
@@ -212,16 +211,16 @@ class GroupedRolloutGenerator(Agent, ABC):
             request.inference_interface, ReturnsRaw
         ), "InferenceInterface must support raw_text return to provide rollouts."
         submit_at_rollout_granularity = (
-            request.submission_granularity == RLRolloutGranularity.ROLLOUT
+            request.submission_granularity == "R"
         )
         consume_at_batch_granularity = (
-            request.consumption_granularity == RLRolloutGranularity.BATCH
+            request.consumption_granularity == "B"
         )
-        assert request.consumption_granularity != RLRolloutGranularity.ROLLOUT, \
+        assert request.consumption_granularity != "R", \
             "Rollout consumption granularity is not currently supported."
         assert not (
-            request.submission_granularity == RLRolloutGranularity.BATCH
-            and request.consumption_granularity == RLRolloutGranularity.GROUP
+            request.submission_granularity == "B"
+            and request.consumption_granularity == "G"
         ), "Batch submission with group consumption is not supported."
 
         # When streaming, use buffer_size to create backpressure

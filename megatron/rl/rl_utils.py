@@ -78,7 +78,7 @@ from megatron.rl.agent.weighted_multi_task import WeightedMultiTask
 from megatron.rl.inference.megatron import MegatronLocal
 from megatron.rl.logging import LOG_DIR as lang_rl_log_dir
 from megatron.rl.logging import log as lang_rl_log
-from megatron.rl.rollout_granularity import RLRolloutGranularity, get_rl_parallel_generation_tasks
+from megatron.rl.rollout_granularity import get_rl_parallel_generation_tasks
 from megatron.rl.server.inference.inference_interface_server import InferenceInterfaceServer
 from megatron.training.global_vars import (
     get_args,
@@ -573,7 +573,7 @@ def get_rollout_generator(args, inference_interface, n_prompts, samples_per_grou
         parallel_generation_tasks = get_rl_parallel_generation_tasks(args)
         agent = get_agent(args, parallel_generation_tasks=parallel_generation_tasks)
         num_groups = n_prompts
-        if streaming and args.rl_submission_granularity != RLRolloutGranularity.BATCH:
+        if streaming and args.rl_submission_granularity != "B":
             num_groups = 1
         request = GroupedRolloutRequest(
             num_groups=num_groups,

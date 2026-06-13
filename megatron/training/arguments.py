@@ -28,7 +28,6 @@ from megatron.core.utils import (
     is_te_min_version,
     is_torch_min_version,
 )
-from megatron.rl.rollout_granularity import RLRolloutGranularity
 from megatron.training.global_vars import set_global_variables
 from megatron.training.utils import (
     get_device_arch_version,
@@ -502,7 +501,7 @@ def validate_args(args, defaults={}):
                     )
 
         submit_rollouts_at_rollout_granularity = (
-            args.rl_submission_granularity == RLRolloutGranularity.ROLLOUT
+            args.rl_submission_granularity == "R"
         )
         if args.rl_generation_lag > 0:
             assert args.rl_partial_rollouts, \
@@ -511,11 +510,11 @@ def validate_args(args, defaults={}):
             assert (
                 args.rl_partial_rollouts
             ), "Rollout submission granularity requires streaming grouped rollouts."
-        assert args.rl_consumption_granularity != RLRolloutGranularity.ROLLOUT, \
+        assert args.rl_consumption_granularity != "R", \
             "--rl-consumption-granularity R is not currently supported."
         assert not (
-            args.rl_submission_granularity == RLRolloutGranularity.BATCH
-            and args.rl_consumption_granularity == RLRolloutGranularity.GROUP
+            args.rl_submission_granularity == "B"
+            and args.rl_consumption_granularity == "G"
         ), "--rl-submission-granularity B with --rl-consumption-granularity G is not supported."
 
         args.grpo_samples_per_iteration = args.grpo_prompts_per_step * args.grpo_group_size
@@ -2368,17 +2367,18 @@ def _add_rl_args(parser):
                        help='Number of trainer batches of rollout generation lag to allow. '
                             'The number of in-flight trainer batches is this value plus one. '
                             'Requires --rl-partial-rollouts when greater than 0.')
-    group.add_argument('--rl-submission-granularity', type=RLRolloutGranularity,
-                       default=RLRolloutGranularity.BATCH,
-                       choices=list(RLRolloutGranularity),
+    # TODO: Refactor these string literals back to an enum after the megatron.training refactor.
+    group.add_argument('--rl-submission-granularity', type=str,
+                       default="B",
+                       choices=["R", "G", "B"],
                        help='Granularity for submitting rollout generation work. '
                             'R submits individual rollouts independently while still yielding '
                             'complete rollout groups to training. '
                             'G submits one rollout group at a time. '
                             'B submits grpo_prompts_per_step rollout groups together.')
-    group.add_argument('--rl-consumption-granularity', type=RLRolloutGranularity,
-                       default=RLRolloutGranularity.BATCH,
-                       choices=list(RLRolloutGranularity),
+    group.add_argument('--rl-consumption-granularity', type=str,
+                       default="B",
+                       choices=["R", "G", "B"],
                        help='Granularity for consuming generated rollout groups. '
                             'G consumes groups as they complete. '
                             'B consumes complete trainer batches in submission order. '
