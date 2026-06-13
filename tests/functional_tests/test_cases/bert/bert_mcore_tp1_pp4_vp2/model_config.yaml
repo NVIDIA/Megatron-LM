@@ -42,4 +42,9 @@ MODEL_ARGS:
   --bf16: true
   --ckpt-format: torch
   --attention-backend: unfused
+  # Use batched P2P for the interleaved/VPP schedule. The CI failure can also
+  # park a rank in DataLoader queue.get, so use in-process loading to remove
+  # the worker/pin-memory queue hang surface.
+  --no-overlap-p2p-communication: true
+  --num-workers: 0
 TEST_TYPE: regular
