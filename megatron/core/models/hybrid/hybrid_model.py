@@ -539,6 +539,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 rotary_pos_emb=rotary_pos_emb,
                 packed_seq_params=packed_seq_params,
                 embedding=self.embedding,
+                padding_mask=padding_mask,
+                loss_mask=loss_mask,
             )
 
         if not self.post_process:

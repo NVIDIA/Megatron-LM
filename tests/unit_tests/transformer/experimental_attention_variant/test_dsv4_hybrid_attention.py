@@ -665,3 +665,195 @@ class TestDSv4HybridRopeFusion:
         for name, param in attn_fused.named_parameters():
             if param.requires_grad:
                 assert param.grad is not None, f"No gradient for parameter {name}"
+
+
+# ===========================================================================
+# THD packed-sequence end-to-end
+# ===========================================================================
+#
+# Closes the highest-level integration gap: even though the CSA THD path
+# is independently tested in test_attention_variant_csa.py
+# (TestCompressedSparseAttentionThd), the DSv4HybridSelfAttention module
+# adds its own THD-aware glue around CSA — packed_seq_params propagation
+# through get_query_key_value_tensors, the output reshape at line ~290
+# (``core_attn_out.reshape(total, 1, -1)`` to recover the 3-D contract),
+# and the inverse-RoPE call with cu_seqlens. These tests verify the full
+# DSv4Hybrid forward/backward works end-to-end for each ``compress_ratio``.
+
+
+from megatron.core.packed_seq_params import PackedSeqParams  # noqa: E402
+
+
+def _make_thd_packed_seq_params(seg_lens, device='cuda'):
+    """Build ``PackedSeqParams(qkv_format='thd', ...)`` for self-attention
+    (``cu_seqlens_q == cu_seqlens_kv``) from a list of per-segment lengths.
+    """
+    cu_seqlens = torch.tensor(
+        [0] + list(torch.tensor(seg_lens, dtype=torch.int64).cumsum(0).tolist()),
+        dtype=torch.int32,
+        device=device,
+    )
+    max_len = int(max(seg_lens)) if seg_lens else 0
+    return PackedSeqParams(
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_q_padded=cu_seqlens,
+        cu_seqlens_kv=cu_seqlens,
+        cu_seqlens_kv_padded=cu_seqlens,
+        max_seqlen_q=max_len,
+        max_seqlen_kv=max_len,
+        qkv_format='thd',
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(not HAVE_TE, reason="transformer_engine not available")
+class TestDSv4HybridAttentionThd:
+    """End-to-end THD forward/backward of :class:`DSv4HybridSelfAttention`
+    across all configured ``compress_ratio`` values (0/4/128).
+
+    Each test runs a multi-segment THD batch through the full
+    ``attn(hidden_states, packed_seq_params=...)`` pipeline and verifies:
+
+      * Output shape ``(total_tokens, 1, hidden_size)`` — the layer
+        re-adds the dummy ``b=1`` axis at line ~293 of
+        ``deepseek_v4_hybrid_attention.py``.
+      * No NaN.
+      * (Backward test) grads flow on ``hidden_states`` and every
+        learnable parameter.
+
+    This is the highest-level integration test for THD; lower-level
+    parity vs SBHD is established by ``TestCompressedSparseAttentionThd``
+    in ``test_attention_variant_csa.py``.
+    """
+
+    @pytest.fixture(scope='class', autouse=True)
+    def setup_method(self, request):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        torch.manual_seed(_SEED)
+        model_parallel_cuda_manual_seed(_SEED)
+
+        cls = request.cls
+        # ``csa_compress_ratios=[0, 4, 128, 4]`` → layer_number ∈ {1,2,3,4}
+        # cover all three CSA ratios (0 = window-only; 4 = full
+        # indexer+compressed; 128 = compressor-only, no indexer).
+        cls.config = _make_config(dsa_indexer_loss_coeff=1.0)
+        cls.pg = ProcessGroupCollection.use_mpu_process_groups()
+
+        yield
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize(
+        "layer_number",
+        [1, 2, 3, 4],
+        ids=[
+            "ratio_0_window_only",  # layer 1 → ratio=0
+            "ratio_4_with_indexer",  # layer 2 → ratio=4
+            "ratio_128_compressor_only",  # layer 3 → ratio=128
+            "ratio_4_with_indexer_alt",  # layer 4 → ratio=4
+        ],
+    )
+    def test_thd_forward_output_shape(self, layer_number):
+        """THD forward through DSv4HybridSelfAttention produces
+        ``(total_tokens, 1, hidden_size)`` output, no NaN, for every
+        configured ``compress_ratio``.
+        """
+        seg_lens = [128, 96, 64]  # multi-segment, varied lengths
+        total = sum(seg_lens)
+
+        torch.manual_seed(_SEED)
+        model_parallel_cuda_manual_seed(_SEED)
+
+        attn = _build_attention(
+            self.config, layer_number=layer_number, pg_collection=self.pg
+        ).cuda()
+        attn.eval()
+
+        # THD hidden_states shape is ``(total_tokens, 1, hidden_size)``
+        # per the DSv4 hybrid contract.
+        hidden = torch.randn(total, 1, self.config.hidden_size, dtype=torch.bfloat16, device='cuda')
+        packed = _make_thd_packed_seq_params(seg_lens)
+
+        with torch.no_grad():
+            output, _bias = attn(
+                hidden_states=hidden, attention_mask=None, packed_seq_params=packed
+            )
+
+        assert output.shape == (total, 1, self.config.hidden_size), (
+            f"layer {layer_number}: shape {tuple(output.shape)} != "
+            f"expected {(total, 1, self.config.hidden_size)}"
+        )
+        assert output.dtype == torch.bfloat16
+        assert not torch.isnan(output).any(), f"layer {layer_number}: NaN in THD forward output"
+
+    @pytest.mark.parametrize(
+        "layer_number",
+        [1, 2],  # ratio=0 (window-only) and ratio=4 (full indexer pipeline)
+        ids=["ratio_0_window_only", "ratio_4_with_indexer"],
+    )
+    def test_thd_backward_gradient_flow(self, layer_number):
+        """THD backward produces grads on ``hidden_states`` and every
+        learnable parameter (covers the full indexer-loss path in Path
+        B THD when ``layer_number=2`` triggers ratio=4).
+        """
+        seg_lens = [128, 96]
+        total = sum(seg_lens)
+
+        torch.manual_seed(_SEED)
+        model_parallel_cuda_manual_seed(_SEED)
+
+        attn = _build_attention(
+            self.config, layer_number=layer_number, pg_collection=self.pg
+        ).cuda()
+        attn.train()
+
+        hidden = torch.randn(
+            total, 1, self.config.hidden_size, dtype=torch.bfloat16, device='cuda'
+        ).requires_grad_(True)
+        packed = _make_thd_packed_seq_params(seg_lens)
+
+        output, _bias = attn(hidden_states=hidden, attention_mask=None, packed_seq_params=packed)
+        output.sum().backward()
+
+        assert hidden.grad is not None, "no grad on hidden_states"
+        assert not torch.isnan(hidden.grad).any()
+        for name, param in attn.named_parameters():
+            if param.requires_grad:
+                assert param.grad is not None, f"no grad on {name}"
+                assert not torch.isnan(param.grad).any(), f"NaN grad on {name}"
+
+    def test_thd_single_segment_matches_sbhd_b1(self):
+        """B=1 single-segment THD output matches the SBHD-b=1 output on
+        identical hidden states (sanity check that the DSv4Hybrid
+        THD-vs-SBHD glue doesn't silently change the math).
+
+        Uses ``layer_number=1`` (ratio=0, window-only) for determinism —
+        no indexer top-K tie-breaking nondeterminism.
+        """
+        layer_number = 1  # ratio=0 → window-only path, no cuDNN topk
+        sq = 128
+
+        torch.manual_seed(_SEED)
+        model_parallel_cuda_manual_seed(_SEED)
+
+        attn = _build_attention(
+            self.config, layer_number=layer_number, pg_collection=self.pg
+        ).cuda()
+        attn.eval()
+
+        hidden = torch.randn(sq, 1, self.config.hidden_size, dtype=torch.bfloat16, device='cuda')
+
+        with torch.no_grad():
+            out_sbhd, _ = attn(hidden_states=hidden, attention_mask=None, packed_seq_params=None)
+            packed = _make_thd_packed_seq_params([sq])
+            out_thd, _ = attn(hidden_states=hidden, attention_mask=None, packed_seq_params=packed)
+
+        assert out_sbhd.shape == out_thd.shape
+        # Generous tol: the full DSv4Hybrid forward chains many bf16 ops
+        # (QKV down/up proj, RoPE, attn, output proj). We're testing for
+        # no plumbing bug, not bit-exactness.
+        assert torch.allclose(out_sbhd.float(), out_thd.float(), atol=5e-2, rtol=5e-2), (
+            f"B=1 SBHD/THD parity failed: max abs diff = "
+            f"{(out_sbhd.float() - out_thd.float()).abs().max().item():.4e}"
+        )

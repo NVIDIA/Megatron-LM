@@ -1070,15 +1070,27 @@ class _HybridEPManager(_DispatchManager):
             or self.config.moe_hybridep_pad_variable_tokens
         )
         if equalize_thd_token_counts:
-            # Use the actual tp_ep max so all ranks in the MoE communication
-            # group pass the same token count to HybridEP.
-            max_num_tokens_across_ep = torch.tensor(
-                [num_tokens], device=routing_map.device, dtype=torch.long
-            )
-            torch.distributed.all_reduce(
-                max_num_tokens_across_ep, op=torch.distributed.ReduceOp.MAX, group=self.group
-            )
-            padded_num_tokens = int(max_num_tokens_across_ep.item())
+            if (
+                self.config.sequence_packing_scheduler is not None
+                and torch.cuda.is_current_stream_capturing()
+            ):
+                # Capture path: routing_map has already been padded to a static
+                # length upstream (CUDA graph + sequence packing implies
+                # cu_seqlens_q_padded -> max_seqlen_per_dp_cp_rank), so num_tokens
+                # is identical across the EP communication group. Skip the
+                # all_reduce + .item() (forbidden during stream capture) and use
+                # the local value directly.
+                padded_num_tokens = num_tokens
+            else:
+                # Use the actual tp_ep max so all ranks in the MoE communication
+                # group pass the same token count to HybridEP.
+                max_num_tokens_across_ep = torch.tensor(
+                    [num_tokens], device=routing_map.device, dtype=torch.long
+                )
+                torch.distributed.all_reduce(
+                    max_num_tokens_across_ep, op=torch.distributed.ReduceOp.MAX, group=self.group
+                )
+                padded_num_tokens = int(max_num_tokens_across_ep.item())
             padded_num_tokens += -padded_num_tokens % HYBRIDEP_TOKEN_ALIGNMENT
         self._padded_num_tokens = padded_num_tokens
 
