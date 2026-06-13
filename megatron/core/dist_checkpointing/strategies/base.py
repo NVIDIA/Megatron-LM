@@ -19,9 +19,7 @@ class StrategyAction(Enum):
     """Specifies save vs load and sharded vs common action.
     To be removed in future releases."""
 
-    LOAD_COMMON = 'load_common'
     LOAD_SHARDED = 'load_sharded'
-    SAVE_COMMON = 'save_common'
     SAVE_SHARDED = 'save_sharded'
 
 

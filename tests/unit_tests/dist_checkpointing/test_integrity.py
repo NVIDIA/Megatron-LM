@@ -53,7 +53,7 @@ class TestIntegrity:
                 files = list(data["files"].keys())
 
             assert "__0_0.distcp" in files
-            assert len(data["files"]["common.pt"]) == 64
+            assert len(data["files"]["__0_0.distcp"]) == 64
 
             loaded_state_dict = load(load_state_dict, ckpt_dir, verify_integrity=True)
 
