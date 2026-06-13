@@ -9,7 +9,7 @@ from typing import Any, Type, TypeVar
 import yaml
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
-from megatron.core.msc_utils import MultiStorageClientFeature
+from megatron.core.msc_utils import maybe_msc
 from megatron.core.optimizer import OptimizerConfig
 from megatron.training.config.common_config import DistributedInitConfig, ProfilingConfig, RNGConfig
 from megatron.training.config.instantiate_utils import InstantiationMode, instantiate
@@ -96,22 +96,13 @@ class ConfigContainerBase:
         """
         from omegaconf import OmegaConf
 
-        if MultiStorageClientFeature.is_enabled():
-            msc = MultiStorageClientFeature.import_package()
-            yaml_path_exists = msc.os.path.exists(yaml_path)
-        else:
-            yaml_path_exists = os.path.exists(yaml_path)
+        yaml_path_exists = maybe_msc.os.path.exists(yaml_path)
 
         if not yaml_path_exists:
             raise FileNotFoundError(f"YAML file not found: {yaml_path}")
 
-        if MultiStorageClientFeature.is_enabled():
-            msc = MultiStorageClientFeature.import_package()
-            with msc.open(yaml_path, "r") as f:
-                config_dict = yaml.safe_load(f)
-        else:
-            with open(yaml_path, "r") as f:
-                config_dict = yaml.safe_load(f)
+        with maybe_msc.open(yaml_path, "r") as f:
+            config_dict = yaml.safe_load(f)
 
         # Convert to OmegaConf first for better compatibility with instantiate
         conf = OmegaConf.create(config_dict)
@@ -200,13 +191,8 @@ class ConfigContainerBase:
         config_dict = self.to_dict()
 
         with safe_yaml_representers():
-            if MultiStorageClientFeature.is_enabled():
-                msc = MultiStorageClientFeature.import_package()
-                with msc.open(yaml_path, "w") as f:
-                    yaml.safe_dump(config_dict, f, default_flow_style=False)
-            else:
-                with open(yaml_path, "w") as f:
-                    yaml.safe_dump(config_dict, f, default_flow_style=False)
+            with maybe_msc.open(yaml_path, "w") as f:
+                yaml.safe_dump(config_dict, f, default_flow_style=False)
 
     def print_yaml(self) -> None:
         """
