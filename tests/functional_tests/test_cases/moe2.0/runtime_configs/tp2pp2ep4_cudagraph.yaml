@@ -1,7 +1,8 @@
 ENV_VARS:
   CUDA_DEVICE_MAX_CONNECTIONS: 1
   NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
-  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  # NOTE: expandable_segments must be commented out for cuda graph to work
+  # PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
   NCCL_NVLS_ENABLE: 0
   PYTHONWARNINGS: ignore
   NCCL_DEBUG: VERSION
@@ -27,14 +28,25 @@ MODEL_ARGS:
   --micro-batch-size: 4
   # MoE training related args
   --moe-grouped-gemm: true
-  --moe-token-dispatcher-type: flex 
-  --moe-flex-dispatcher-backend: deepep
+  --moe-token-dispatcher-type: alltoall
+  # CUDA Graph args
+  --cuda-graph-impl: transformer_engine
+  --cuda-graph-scope: "[attn mlp moe_router moe_preprocess]"
+  --cuda-graph-warmup-steps: 1
+  --te-rng-tracker: true
   # Add mixed precision args
   --bf16: true
+  --fp8-format: hybrid
+  --fp8-recipe: blockwise
+  --first-last-layers-bf16: true
   # kernel fusion related args
   --moe-permute-fusion: true
   --moe-router-fusion: true
+  # Selective recompute for moe_act
+  --recompute-granularity: selective
+  --recompute-modules: "[moe_act]"
   # MISC
   --manual-gc: true
   --manual-gc-interval: 100
 TEST_TYPE: resume-ckpt
+
