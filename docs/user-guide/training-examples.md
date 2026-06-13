@@ -22,12 +22,14 @@ torchrun --nproc_per_node=2 examples/run_simple_mcore_train_loop.py
 
 This example:
 
-- Runs on two GPUs
-- Uses generated mock data (no data preparation needed)
-- Demonstrates basic distributed training setup
-- Provides a quick way to verify your installation
+- Runs on two GPUs.
+- Uses generated mock data (no data preparation needed).
+- Demonstrates basic distributed training setup.
+- Provides a quick way to verify your installation.
 
 ## LLaMA-3 Training Examples
+
+These examples demonstrate LLaMA-3 training at different scales, from a single-node FP8 run with mock data to a fully customized configuration with your own dataset.
 
 ### LLaMA-3 8B with FP8
 
@@ -40,7 +42,7 @@ Train the LLaMA-3 8B model with FP8 mixed precision on eight GPUs:
 **Configuration**
 
 - Eight GPUs
-- FP8 mixed precision (requires Hopper/Ada/Blackwell GPUs)
+- FP8 mixed precision (requires Hopper, Ada, or Blackwell GPUs)
 - Mock data for quick testing
 
 ### Custom LLaMA Training
@@ -131,7 +133,7 @@ The following tables group common training arguments by category.
 |----------|-------------|
 | `--lr` | Peak learning rate |
 | `--min-lr` | Minimum learning rate |
-| `--lr-decay-style` | LR schedule (cosine, linear, constant) |
+| `--lr-decay-style` | Learning rate schedule (cosine, linear, or constant) |
 | `--lr-warmup-iters` | Warmup iterations |
 
 ### Mixed Precision
@@ -140,7 +142,7 @@ The following tables group common training arguments by category.
 |----------|-------------|
 | `--fp16` | FP16 mixed precision |
 | `--bf16` | BF16 mixed precision (recommended) |
-| `--fp8-hybrid` | FP8 mixed precision (Hopper/Ada/Blackwell) |
+| `--fp8-hybrid` | FP8 mixed precision (Hopper, Ada, or Blackwell) |
 
 ### Data and Checkpointing
 
@@ -154,6 +156,6 @@ The following tables group common training arguments by category.
 
 ## Next Steps
 
-- **Optimize Performance**: Refer to [Advanced Features](features/index.md) for FSDP, the distributed optimizer, and other optimizations
-- **Scale Up**: Refer to [Parallelism Strategies](parallelism-guide.md) to train larger models across more GPUs
-- **Prepare Data**: Follow the [Data Preparation](data-preparation.md) guide to process your own datasets
+- **Optimize Performance**: Refer to [Advanced Features](features/index.md) for FSDP, the distributed optimizer, and other optimizations.
+- **Scale Up**: Refer to [Parallelism Strategies](parallelism-guide.md) to train larger models across more GPUs.
+- **Prepare Data**: Follow the [Data Preparation](data-preparation.md) guide to process your own datasets.
