@@ -9,12 +9,41 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.datasets.data_schedule import (
+    _get_scheduler_max_real_num_seqs,
     get_batch_on_this_rank_for_sequence_packing,
     wrap_data_iterator,
 )
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.training.global_vars import unset_global_variables
 from tests.unit_tests.test_utilities import Utils
+
+
+def test_scheduler_max_real_num_seqs_reserves_dummy_sequence():
+    config = SimpleNamespace(
+        thd_max_num_seqs=32,
+        pad_packed_seq_alignment="max",
+        pad_packed_seq_by_appending_dummy_seq=True,
+    )
+
+    assert _get_scheduler_max_real_num_seqs(config) == 31
+
+    config.pad_packed_seq_by_appending_dummy_seq = False
+    assert _get_scheduler_max_real_num_seqs(config) == 32
+
+    config.pad_packed_seq_alignment = None
+    config.pad_packed_seq_by_appending_dummy_seq = True
+    assert _get_scheduler_max_real_num_seqs(config) == 32
+
+
+def test_scheduler_max_real_num_seqs_rejects_dummy_without_capacity():
+    config = SimpleNamespace(
+        thd_max_num_seqs=1,
+        pad_packed_seq_alignment="max",
+        pad_packed_seq_by_appending_dummy_seq=True,
+    )
+
+    with pytest.raises(ValueError, match="includes that dummy sequence"):
+        _get_scheduler_max_real_num_seqs(config)
 
 
 class MockVariableLengthSequencePackingDataIterator:
@@ -210,8 +239,13 @@ def test_get_batch_on_this_rank_for_sequence_packing(tp, pp, cp, dynamic_cp, loc
             dynamic_cp=dynamic_cp,
         )
 
-        # Unpack the result
-        tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params = result
+        # The helper returns a 7-tuple; padding_mask is None when THD padding is disabled.
+        tokens, labels, loss_mask, attention_mask, position_ids, packed_seq_params, padding_mask = (
+            result
+        )
+        assert (
+            padding_mask is None
+        ), "padding_mask should be None when no padding config is provided."
 
         # Get parallel state info
         tp_rank = parallel_state.get_tensor_model_parallel_rank()
