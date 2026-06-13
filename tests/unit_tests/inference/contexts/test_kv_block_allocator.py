@@ -78,7 +78,7 @@ def test_allocate_release_reset_round_trip_no_prefix_caching():
     a.reset()
     assert a.total_avail == TOTAL_COUNT - 1
     assert a.block_bag.tolist() == list(range(TOTAL_COUNT))
-    assert a.block_routing == {}
+    assert not a.routing_replay.has_data()
 
 
 @pytest.mark.parametrize(

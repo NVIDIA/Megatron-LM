@@ -1664,7 +1664,10 @@ class TextGenerationController:
         # Save block IDs for finished requests before update_requests releases them.
         # Needed for per-block routing reconstruction in the engine.
         finished_routing_block_ids = {}
-        if context.kv_block_allocator.block_routing and finished_idxs.numel() > 0:
+        if (
+            context.kv_block_allocator.routing_replay.has_data()
+            and finished_idxs.numel() > 0
+        ):
             for fidx in finished_idxs.tolist():
                 req_id = int(context.request_ids[fidx].item())
                 blocks = context.request_to_kv_block_ids[fidx]
@@ -1748,7 +1751,13 @@ class TextGenerationController:
             # Collect flat routing indices and scatter them into per-block storage.
             # Must be done before update_requests while token-to-block mappings are valid.
             # Reconstruction happens from blocks at request completion.
-            context.kv_block_allocator.store_routing_per_block(self._router_record_bookkeeping())
+            context.kv_block_allocator.routing_replay.scatter_routing_to_blocks(
+                self._router_record_bookkeeping(),
+                active_token_count=context.active_token_count,
+                token_to_block_idx=context.token_to_block_idx,
+                token_to_local_position=context.token_to_local_position_within_kv_block,
+                dummy_block_idx=context.kv_block_allocator.dummy_block_idx,
+            )
             range_pop()
 
         # This is the best place to yield control back to event loop.
