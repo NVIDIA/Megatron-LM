@@ -15,6 +15,19 @@
 """Experimental Megatron-FSDP implementation."""
 
 from .dbuffer import DBuffer
-from .placement import Flat, Partial, Placement, Replicate
+from .fsdp_module import FsdpModule
+from .fully_shard import fully_shard
+from .parameter_group import ParameterGroup
+from .placement import Flat, Partial, Placement, Placements, Replicate
 
-__all__ = ["DBuffer", "Flat", "Partial", "Placement", "Replicate"]
+__all__ = [
+    "DBuffer",
+    "Flat",
+    "FsdpModule",
+    "ParameterGroup",
+    "Partial",
+    "Placement",
+    "Placements",
+    "Replicate",
+    "fully_shard",
+]

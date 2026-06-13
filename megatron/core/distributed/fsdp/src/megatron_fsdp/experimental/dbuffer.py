@@ -42,6 +42,7 @@ def _validate_mesh_axis(mesh: DeviceMesh, axis: int) -> None:
 
 
 def _validate_placements(placements: Iterable[Placement]) -> None:
+    """Validate DBuffer placements form a supported contiguous local layout."""
     seen_flat = False
     for placement in placements:
         if not isinstance(placement, (Replicate, Partial, Flat)):
@@ -115,6 +116,20 @@ class DBuffer:
     def device(self) -> torch.device:
         """Device of the local buffer."""
         return self.local_buffer.device
+
+    def reallocate_storage(self) -> None:
+        """Restore the local buffer's backing storage to its logical size."""
+        self._resize_storage(self.local_buffer.numel())
+
+    def release_storage(self) -> None:
+        """Release local buffer storage without replacing the Storage object."""
+        # Autograd may save views that share this Storage object. Resizing the
+        # existing Storage releases the allocation while preserving those aliases
+        # for a later reallocate_storage().
+        self._resize_storage(0)
+
+    def _resize_storage(self, numel: int) -> None:
+        self.local_buffer.untyped_storage().resize_(numel * self.local_buffer.element_size())
 
     def _get_owned_range(self, tensor_index: int) -> _OwnedRange | None:
         """Return this buffer's owned range for logical tensor ``tensor_index``."""
@@ -253,6 +268,21 @@ class DBuffer:
         if out.device != self.device:
             raise ValueError(f"Expected out device {self.device}, got {out.device}.")
         return out
+
+    def cast(self, dtype: torch.dtype) -> "DBuffer":
+        """Return this buffer with the same layout and placements in ``dtype``."""
+        if self.dtype == dtype:
+            return self
+
+        destination = DBuffer(
+            mesh=self.mesh,
+            placements=self.placements,
+            tensor_shapes=self.layout.tensor_shapes,
+            dtype=dtype,
+            device=self.device,
+        )
+        destination.local_buffer.copy_(self.local_buffer)
+        return destination
 
     def redistribute(
         self, new_placements: Iterable[Placement], *, out: "DBuffer | None" = None
