@@ -148,6 +148,10 @@ class DynamicEngineTestConfig:
     num_speculative_tokens: int = 0
     position_embedding_type: str = "learned_absolute"
     sampling_backend: str = 'torch'
+    # Sink (off-by-one / learnable) softmax — exercises the post-hoc LSE
+    # rescale path inside Attention.flash_decode_and_prefill. Default keeps
+    # behavior unchanged for existing tests.
+    softmax_type: str = "vanilla"
 
     def __post_init__(self):
 
@@ -370,6 +374,7 @@ class DynamicInferenceEngineTestBase:
                     if test_config.transformer_impl == "inference_optimized"
                     else "LayerNorm"
                 ),
+                softmax_type=test_config.softmax_type,
                 # inference optimized currently only supports RMS Norm
             )
             if test_config.fp8 or test_config.transformer_impl == "transformer_engine":
