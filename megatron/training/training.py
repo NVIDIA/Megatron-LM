@@ -5,6 +5,8 @@ import argparse
 import time
 
 from megatron.training.config.container import PretrainConfigContainer
+from megatron.training.config.training_config import OptimizerConfigOverrideProviderContext
+from megatron.training.setup import init_checkpointing_context, maybe_save_config, validate_and_set_vocab_size
 
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
@@ -160,12 +162,6 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe.paged_stash import PagedStashRunner
-from megatron.core.distributed import DistributedDataParallelConfig, TorchFullyShardedDataParallelConfig
-from megatron.core.distributed import DistributedDataParallel as DDP
-from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel as megatron_FSDP
-from megatron.core.optimizer.optimizer import param_group_identifier_keys
-
-from megatron.core.optimizer.qk_clip import clip_qk
 from megatron.core.utils import (
     StragglerDetector,
     check_param_hashes_across_dp_replicas,
@@ -225,6 +221,7 @@ from megatron.training.initialize import (
     write_args_to_tensorboard,
 )
 from megatron.training.utils import is_hybrid_model
+from megatron.training.state import GlobalState
 
 try:
     from torch_memory_saver import torch_memory_saver
@@ -277,6 +274,7 @@ from .utils import (
     to_empty_if_meta_device,
     update_use_dist_ckpt,
 )
+from megatron.training.utils.log_utils import barrier_and_log as print_datetime
 
 stimer = StragglerDetector()
 
@@ -291,16 +289,6 @@ def destroy_global_state():
     destroy_model_parallel()
     destroy_rerun_state_machine()
 
-
-def print_datetime(string, override_timestamp=None):
-    """Note that this call will sync across all ranks. Use override_timestamp if provided;
-       otherwise use current timestamp."""
-    torch.distributed.barrier()
-    if override_timestamp is None:
-        time_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
-    else:
-        time_str = datetime.fromtimestamp(override_timestamp).strftime('%Y-%m-%d %H:%M:%S.%f')
-    print_rank_0(f'[{string}] datetime: {time_str} ')
 
 # Per-iteration packed-sequence (THD) accumulator. The tensor holds TWO stats,
 # both computed from the REAL ``cu_seqlens`` (i.e. unpadded sub-sequence lengths
@@ -1029,9 +1017,9 @@ def preprocess_common_state_dict(common_state_dict):
 def pretrain(
     cfg_container: PretrainConfigContainer,
     train_valid_test_dataset_provider,
-    model_provider,
     model_type,
     forward_step_func,
+    model_provider=None,
     process_non_loss_data_func=None,
     get_embedding_ranks=None,
     get_position_embedding_ranks=None,
@@ -1085,6 +1073,10 @@ def pretrain(
     global _STARTUP_TIMESTAMPS
     _STARTUP_TIMESTAMPS['pretrain_entry'] = time.time()
 
+    state = GlobalState()
+    state.cfg = cfg_container
+    maybe_save_config(cfg_container)
+
     if inprocess_call_wrapper is not None:
         iteration = inprocess_call_wrapper.iteration
         store = torch.distributed.PrefixStore(str(iteration), store)
@@ -1102,19 +1094,24 @@ def pretrain(
         get_position_embedding_ranks=get_position_embedding_ranks,
         store=store,
     )
+    # TODO (@maanug): temporary until initialize.py is refactored to build pgcollection as bridge does
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     timestamp_after_initialize_megatron = time.time()
 
     args = get_args()
     timers = get_timers()
+    # Inject the legacy timers directly; GlobalState.timers intentionally exposes
+    # no public setter (overriding it is not supported behavior). Temporary.
+    state._timers = timers
 
-    if args.fine_grained_activation_offloading:
+    if cfg_container.model.fine_grained_activation_offloading:
         from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
         set_ideal_affinity_for_current_gpu()
 
 
     if cfg_container.logger.log_progress:
-        append_to_progress_log(args.save, "Starting job")
+        append_to_progress_log(cfg_container.checkpoint.save, "Starting job")
 
     # Set pytorch JIT layer fusion options and warmup JIT functions.
     set_jit_fusion_options()
@@ -1135,6 +1132,7 @@ def pretrain(
         torch.distributed.all_reduce(program_start_global, op=torch.distributed.ReduceOp.MIN)
         program_start_global = program_start_global.item()
     set_startup_timestamps(program_start=program_start_global)
+    state.start_time = program_start_global
 
     global _LEGACY_TRAIN_START_TIME
     start_time_tensor = torch.tensor([_LEGACY_TRAIN_START_TIME], dtype=torch.double, device='cuda')
@@ -1192,49 +1190,34 @@ def pretrain(
     # Track E2E metrics on pretrain start
     one_logger_utils.on_pretrain_start()
 
-    # Context used for persisting some state between checkpoint saves.
-    if cfg_container.checkpoint.non_persistent_ckpt_type == 'local':
-        try:
-            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import (
-                LocalCheckpointManager,
-            )
-            from nvidia_resiliency_ext.checkpointing.local.replication.group_utils import (
-                GroupWrapper,
-                parse_group_sequence,
-            )
-            from nvidia_resiliency_ext.checkpointing.local.replication.strategies import (
-                CliqueReplicationStrategy,
-            )
-        except ModuleNotFoundError:
-            raise RuntimeError(
-                "The 'nvidia_resiliency_ext' module is required for local "
-                "checkpointing but was not found. Please ensure it is installed."
-            )
+    checkpointing_context = init_checkpointing_context(cfg_container.checkpoint)
 
-        if cfg_container.checkpoint.replication:
-            repl_strategy = CliqueReplicationStrategy.from_replication_params(
-                cfg_container.checkpoint.replication_jump, cfg_container.checkpoint.replication_factor
-            )
-        else:
-            repl_strategy = None
-
-        checkpointing_context = {
-            'local_checkpoint_manager': LocalCheckpointManager(
-                cfg_container.checkpoint.non_persistent_local_ckpt_dir, repl_strategy=repl_strategy
-            )
-        }
-    else:
-        checkpointing_context = {}
+    # Tokenizer
+    timers("tokenizer-setup", log_level=0).start(barrier=True)
+    tokenizer = state.tokenizer
+    # Handle model vocab_size configuration with proper validation
+    cfg_container.model.vocab_size, cfg_container.model.should_pad_vocab = validate_and_set_vocab_size(
+        model_vocab_size=cfg_container.model.vocab_size,
+        tokenizer_vocab_size=tokenizer.vocab_size,
+    )
+    timers("tokenizer-setup").stop()
+    print_datetime("after tokenizer is built")
 
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-        model_provider, model_type, checkpointing_context=checkpointing_context
+        model_provider,
+        model_type,
+        checkpointing_context=checkpointing_context,
+        cfg_container=cfg_container,
+        pg_collection=pg_collection,
     )
 
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
     model_cfg = get_model_config(model[0])
+
+    cfg_container.train.train_iters = args.train_iters
 
     # Build a separate inference model for RL if requested.
     inference_model = None
@@ -1325,7 +1308,7 @@ def pretrain(
     # Data stuff.
     app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
     timers('train/valid/test-data-iterators-setup', log_level=0).start(barrier=True)
-    if args.virtual_pipeline_model_parallel_size is not None:
+    if cfg_container.model.virtual_pipeline_model_parallel_size is not None:
         train_data_iterator = []
         valid_data_iterator = []
         test_data_iterator = []
@@ -1347,17 +1330,20 @@ def pretrain(
         train_data_iterator, valid_data_iterator, test_data_iterator = (
             build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
         )
+    state.train_state.do_train = args.do_train
+    state.train_state.do_valid = args.do_valid
+    state.train_state.do_test = args.do_test
     timers('train/valid/test-data-iterators-setup').stop()
     print_datetime('after dataloaders are built')
     app_metrics['app_build_dataiters_finish_time'] = one_logger_utils.get_timestamp_in_ms()
 
-    # Track if training is enabled. Can only be done once args.do_train is assigned after dataloader is built.
+    # Track if training is enabled. Can only be done once do_train is assigned after dataloader is built.
     one_logger_utils.track_config_flags(
-        args.train_iters,
+        cfg_container.train.train_iters,
         cfg_container.validation.skip_train,
-        args.do_train,
-        args.do_valid,
-        args.do_test,
+        state.train_state.do_train,
+        state.train_state.do_valid,
+        state.train_state.do_test,
         args.dataloader_type,
     )
 
@@ -1381,7 +1367,7 @@ def pretrain(
 
         iteration = 0
         args.curr_iteration = iteration
-        if args.do_train and (args.train_iters or 0) > 0:
+        if state.train_state.do_train and (cfg_container.train.train_iters or 0) > 0:
             iteration, num_floating_point_operations_so_far = train(
                 forward_step_func,
                 model,
@@ -1418,7 +1404,7 @@ def pretrain(
 
         iteration = args.iteration
 
-    if args.do_valid:
+    if state.train_state.do_valid:
         prefix = f'iteration {iteration} on validation set'
         if args.perform_rl_step:
             rl_eval_model = model
@@ -1448,7 +1434,7 @@ def pretrain(
                 non_loss_data_func=non_loss_data_func
             )
 
-    if args.do_test:
+    if state.train_state.do_test:
         prefix = f'iteration {iteration} on test set'
         evaluate_and_print_results(
             prefix,
@@ -1889,7 +1875,7 @@ def get_optimizer_param_scheduler(optimizer):
     return opt_param_scheduler
 
 
-def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
+def get_megatron_optimizer_config(args: Any) -> tuple[OptimizerConfig, Dict[ParamKey, Any] | None]:
     """Return a Megatron optimizer config object from Megatron's arguments."""
 
     kwargs = {}
@@ -1948,6 +1934,9 @@ def setup_model_and_optimizer(
     model_provider_func,
     model_type,
     checkpointing_context=None,
+    *,
+    cfg_container: PretrainConfigContainer,
+    pg_collection: ProcessGroupCollection,
 ):
     """Setup model and optimizer."""
     args = get_args()
@@ -1960,7 +1949,27 @@ def setup_model_and_optimizer(
     has_rl_optimizer = args.perform_rl_step and not args.no_load_optim
     skip_optimizer = not (has_normal_optimizer or has_rl_optimizer)
     wrap_with_ddp = not skip_optimizer
-    model = get_model(model_provider_func, model_type, wrap_with_ddp=wrap_with_ddp)
+
+    def _build_model_wrapper(wrap_with_ddp: bool):
+        from megatron.training.utils.train_utils import start_memory_history_recording
+
+        start_memory_history_recording(cfg_container.profiling)
+
+        cfg = cfg_container
+        model_config = cfg.model
+        builder_cls = model_config.get_builder_cls()
+        builder = builder_cls(model_config)
+        return builder.build_distributed_models(
+            pg_collection=pg_collection,
+            ddp_config=cfg.ddp,
+            overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
+            use_megatron_fsdp=cfg.dist.use_megatron_fsdp,
+            use_torch_fsdp2=cfg.dist.use_torch_fsdp2,
+            wrap_with_ddp=wrap_with_ddp,
+            data_parallel_random_init=cfg.rng.data_parallel_random_init,
+        )
+
+    model = _build_model_wrapper(wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
 
     if args.logits_save_dir is not None:
@@ -1988,7 +1997,14 @@ def setup_model_and_optimizer(
         if args.perform_rl_step:
             update_train_iters(args)
     else:
-        config, config_overrides = get_megatron_optimizer_config(args)
+        config = cfg_container.optimizer
+        config_overrides = cfg_container.optimizer_config_override_provider.build_config_overrides(
+            OptimizerConfigOverrideProviderContext(
+                scheduler_config=cfg_container.scheduler,
+                optimizer_config=config,
+                model=model,
+            )
+        )
         config.timers = timers
         if getattr(args, "use_mup", False):
             model_config_source = (
@@ -2033,7 +2049,7 @@ def setup_model_and_optimizer(
         args.ffn_hidden_size = moe_ffn_hidden_size * args.moe_upcycling_granularity
 
         # get dense model
-        dense_model_for_upcycling = get_model(model_provider_func, model_type)
+        dense_model_for_upcycling = _build_model_wrapper(wrap_with_ddp=True)
 
         # recover moe upcycling related args in global args before executing upcycling
         args.num_experts = num_experts

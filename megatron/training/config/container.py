@@ -20,6 +20,7 @@ from megatron.training.config.resilience_config import (
 from megatron.training.config.training_config import (
     CheckpointConfig,
     LoggerConfig,
+    OptimizerConfigOverrideProvider,
     SchedulerConfig,
     TokenizerConfig,
     TrainingConfig,
@@ -27,7 +28,7 @@ from megatron.training.config.training_config import (
 )
 from megatron.training.config.utils import sanitize_dataclass_config
 from megatron.training.config.yaml_utils import safe_yaml_representers
-from megatron.training.models import GPTModelConfig, Serializable, HybridModelConfig
+from megatron.training.models import GPTModelConfig, HybridModelConfig, Serializable
 
 T = TypeVar("T", bound="ConfigContainerBase")
 
@@ -236,6 +237,9 @@ class PretrainConfigContainer(ConfigContainerBase):
     model: HybridModelConfig | GPTModelConfig
     optimizer: OptimizerConfig
     scheduler: SchedulerConfig
+    optimizer_config_override_provider: OptimizerConfigOverrideProvider = field(
+        default_factory=OptimizerConfigOverrideProvider
+    )
     # dataset: GPTDatasetConfig # TODO (@maanug): add support
     ddp: DistributedDataParallelConfig = field(default_factory=DistributedDataParallelConfig)
     dist: DistributedInitConfig = field(default_factory=DistributedInitConfig)

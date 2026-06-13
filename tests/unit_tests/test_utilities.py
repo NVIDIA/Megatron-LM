@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import os
+import warnings
 from datetime import timedelta
 
 import torch
@@ -7,6 +8,8 @@ from torch._C._distributed_c10d import PrefixStore
 from torch.distributed import rendezvous
 
 import megatron.core.parallel_state as ps
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.global_vars import get_args
 
 
 class TestModel(torch.nn.Module):
@@ -133,6 +136,12 @@ class Utils:
             **kwargs,
         )
         Utils.inited = True
+
+    @staticmethod
+    def pretrain_config_from_global_args():
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=".*It is recommended to use a ModelConfig.*")
+            return pretrain_cfg_container_from_args(get_args())
 
     @staticmethod
     def fake_initialize_model_parallel(

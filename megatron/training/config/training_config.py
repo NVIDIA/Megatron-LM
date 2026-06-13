@@ -1,8 +1,14 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 import signal
 from dataclasses import dataclass, field
-from typing import List, Literal, Optional
+from typing import Any, List, Literal, Optional
 
+from megatron.core.optimizer import (
+    OptimizerConfig,
+    ParamGroupOverride,
+    ParamKey,
+    get_standard_config_overrides,
+)
 
 
 @dataclass(kw_only=True)
@@ -228,17 +234,45 @@ class SchedulerConfig:
     weight_decay_incr_style: Literal["constant", "linear", "cosine"] = "constant"
     """Weight decay increment function."""
 
-    no_weight_decay_cond_type: Literal["qwen3_next"] | None = None
-    """Type of no weight decay condition. Choices:
-    None (default): param no weight decay if and only if it is 1D; or it is bias;
-    or it is embedding and embedding_init_method_std is not None.
-    "qwen3_next": In addition to the default rules, apply weight decay to qk layernorm as a special case."""
-
     wd_incr_steps: int | None = field(init=False, default=None)
     """Number of samples to increment weight decay over. Calculated at runtime."""
 
     wsd_decay_steps: int | None = field(init=False, default=None)
     """Number of samples to decay WSD weight decay. Calculated at runtime."""
+
+
+@dataclass(frozen=True)
+class OptimizerConfigOverrideProviderContext:
+    """Context passed to an optimizer config override provider."""
+
+    scheduler_config: SchedulerConfig
+    optimizer_config: OptimizerConfig
+    model: Any
+
+
+@dataclass
+class OptimizerConfigOverrideProvider:
+    """Build optimizer parameter-group overrides for training.
+
+    The default implementation delegates to MCore's ParamKey matcher based standard
+    overrides. This keeps the provider extensible while avoiding eager parameter-name
+    enumeration in training config code.
+    """
+
+    def build_config_overrides(
+        self, context: OptimizerConfigOverrideProviderContext
+    ) -> dict[ParamKey, ParamGroupOverride] | None:
+        """Build optimizer parameter-group overrides.
+
+        Args:
+            context: Scheduler, optimizer, and model context for override construction.
+
+        Returns:
+            Mapping from ``ParamKey`` matchers to per-group optimizer overrides, or ``None``
+            if no overrides are needed.
+        """
+        config_overrides = get_standard_config_overrides(config=context.optimizer_config)
+        return config_overrides if config_overrides else None
 
 
 @dataclass(kw_only=True)
@@ -498,6 +532,10 @@ class CheckpointConfig:
 
     async_strategy: Literal["nvrx", "mcore"] = "nvrx"
     """Which async save strategy to use. Available strategies: nvrx, mcore."""
+
+    async_write_results_mp_mode: str = "fork"
+    """Multiprocessing start method for the async write results queue.
+    Options: ``"fork"`` (default), ``"spawn"``, ``"forkserver"``."""
 
     use_persistent_ckpt_worker: bool = False
     """Use a persistent background worker for async checkpoint saves. When enabled, creates a dedicated

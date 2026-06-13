@@ -415,7 +415,6 @@ if __name__ == "__main__":
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
     pretrain(full_config,
         train_valid_test_datasets_provider,
-        partial(model_provider, gpt_builder),
         ModelType.encoder_or_decoder,
         forward_step,
         store=store,
