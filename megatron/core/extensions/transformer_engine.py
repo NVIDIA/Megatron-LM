@@ -2399,12 +2399,12 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                     sharded_state_dict[f"{prefix}bias{gemm_idx}"] = sub_sd[f"{gemm_idx}.bias"]
             # Set the expert-DP replica_id, picking the group by what EGTP does to each entry:
             #   - weight ShardedTensor: SHARDED across EGTP (distinct chunks) → not replicas →
-            #     use ``intra_expt_dp_with_egtp`` (EGTP-excluded).
+            #     use ``intra_expt_dp_no_egtp``.
             #   - _extra_state ShardedObject: REPLICATED across EGTP → need distinct replica_ids
-            #     to avoid duplicate-writer collisions → use full ``expt_dp`` (EGTP-included).
+            #     to avoid duplicate-writer collisions → use full ``expt_dp``.
             # EGTP=1: the two groups coincide, so this is a no-op.
             expt_dp_full = self._pg_collection.expt_dp
-            expt_dp_intra = self._pg_collection.intra_expt_dp_with_egtp
+            expt_dp_intra = self._pg_collection.intra_expt_dp_no_egtp
             for k, sh_ten in sharded_state_dict.items():
                 replica_id = sh_ten.replica_id
                 assert (

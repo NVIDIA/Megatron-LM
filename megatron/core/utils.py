@@ -875,8 +875,8 @@ def check_param_hashes_across_dp_replicas(
         [non_expert_params, expert_params],
         [local_non_expert_param_hashes, local_expert_param_hashes],
         [
-            parallel_state.get_data_parallel_group(with_gtp=True),
-            parallel_state.get_expert_data_parallel_group(with_gtp=True),
+            parallel_state.get_data_parallel_group(no_gtp=True),
+            parallel_state.get_expert_data_parallel_group(no_gtp=True),
         ],
     ):
         # Collect per-parameter hashes across all ranks in group.
@@ -990,7 +990,7 @@ def make_tp_sharded_tensor_for_checkpoint(
             # GTP peers hold distinct shards (disambiguated by the offset above); the true
             # replicas are the gtp-EXCLUDED DP group, so elect the writer over that group.
             dp_replica_id = parallel_state.get_data_parallel_rank(
-                with_context_parallel=True, with_gtp=True
+                with_context_parallel=True, no_gtp=True
             )
             # Saved global is the padded shape when GTP padded out_features for alignment.
             if getattr(tensor, "pad_length", 0):

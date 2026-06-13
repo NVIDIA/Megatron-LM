@@ -1602,12 +1602,12 @@ def wrap_model_chunks_with_ddp(
             compute_layout = None
         if compute_layout is not None:
             # Size the layout for the replicate (gtp/egtp-EXCLUDED) DP group the DDP buffer
-            # actually shards over, so DDP can use it directly without recomputing. with_gtp
+            # actually shards over, so DDP can use it directly without recomputing. no_gtp
             # aliases the regular DP group when GTP is inactive.
             data_parallel_world_size = mpu.get_data_parallel_world_size(
-                with_context_parallel=True, with_gtp=True
+                with_context_parallel=True, no_gtp=True
             )
-            expert_data_parallel_world_size = mpu.get_expert_data_parallel_world_size(with_gtp=True)
+            expert_data_parallel_world_size = mpu.get_expert_data_parallel_world_size(no_gtp=True)
             for i, (chunk, bucket_size) in enumerate(zip(model_chunks, bucket_sizes)):
                 all_params = [p for p in chunk.parameters() if p.requires_grad]
                 per_chunk_layouts[i] = compute_layout(

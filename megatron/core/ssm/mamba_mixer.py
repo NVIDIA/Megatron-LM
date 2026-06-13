@@ -1310,8 +1310,6 @@ class MambaMixer(MegatronModule):
         # identical copy. The vanilla helper sets replica_id without GTP awareness, so all GTP
         # ranks would claim the same chunk with the same all-zero replica_id and DCP would have a
         # write conflict. Track those keys here and fold gtp_rank into replica_id below.
-        gtp_replicated_keys = set()
-
         self._save_to_state_dict(sharded_state_dict, "", keep_vars=True)
         sharded_state_dict = make_sharded_tensors_for_checkpoint(
             sharded_state_dict,
@@ -1325,7 +1323,9 @@ class MambaMixer(MegatronModule):
             },
             sharded_offsets=sharded_offsets,
         )
-        gtp_replicated_keys |= set(sharded_state_dict.keys())
+        # Captured before submodules are merged below, so this is exactly the directly-owned
+        # MambaMixer params/buffers (A_log, dt_bias, D, conv1d_*) — deterministic across ranks.
+        gtp_replicated_keys = set(sharded_state_dict.keys())
         # Submodules
         for name, module in self.named_children():
             module_sharded_sd = sharded_state_dict_default(

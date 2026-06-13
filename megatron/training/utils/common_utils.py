@@ -105,11 +105,11 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
     params_data = []                # Dense, non-sharded
     sharded_params_data = []        # Dense, sharded → reduce over dp_cp
     gtp_params_data = []            # GTP, non-sharded
-    gtp_sharded_params_data = []    # GTP, sharded → reduce over dp_cp_with_gtp
+    gtp_sharded_params_data = []    # GTP, sharded → reduce over dp_cp_no_gtp
     moe_params_data = []            # MoE, non-sharded
     moe_sharded_params_data = []    # MoE, sharded → reduce over expert_dp
     moe_gtp_params_data = []        # MoE-GTP, non-sharded
-    moe_gtp_sharded_params_data = []  # MoE-GTP, sharded → reduce over expert_dp_with_gtp
+    moe_gtp_sharded_params_data = []  # MoE-GTP, sharded → reduce over expert_dp_no_gtp
 
     gtp_rank = mpu.get_generalized_tensor_parallel_remat_rank()
     egtp_rank = mpu.get_expert_generalized_tensor_parallel_remat_rank()
@@ -170,11 +170,15 @@ def calc_params_l2_norm(model, force_create_fp32_copy=False):
     # --- Sharded optimizer DP reductions (each category uses its own group) ---
     # Reduce over the gtp-EXCLUDED replicate group: the model-parallel reduce below already
     # spans the gtp axis, so a gtp-inclusive group here would over-count by gtp. No-op for
-    # non-GTP runs (the with_gtp group aliases the regular DP group).
-    _sum_reduce(sharded_norm_2, mpu.get_data_parallel_group(with_context_parallel=True, with_gtp=True))
-    _sum_reduce(gtp_sharded_norm_2, mpu.get_data_parallel_group(with_context_parallel=True, with_gtp=True))
+    # non-GTP runs (the no_gtp group aliases the regular DP group).
+    _sum_reduce(
+        sharded_norm_2, mpu.get_data_parallel_group(with_context_parallel=True, no_gtp=True)
+    )
+    _sum_reduce(
+        gtp_sharded_norm_2, mpu.get_data_parallel_group(with_context_parallel=True, no_gtp=True)
+    )
     _sum_reduce(moe_sharded_norm_2, mpu.get_expert_data_parallel_group())
-    _sum_reduce(moe_gtp_sharded_norm_2, mpu.get_expert_data_parallel_group(with_gtp=True))
+    _sum_reduce(moe_gtp_sharded_norm_2, mpu.get_expert_data_parallel_group(no_gtp=True))
 
     # --- Combine dense + GTP norms ---
     # model_parallel group = TP×GTP×PP, so GTP reduction is implicit.

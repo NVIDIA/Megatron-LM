@@ -1298,10 +1298,10 @@ def _worker_gtp_ddp_bucket_alignment(rank, world_size, port):
     Bug: DDP used param_layout=None for GTP buffers, falling through to
     _compute_default_per_buffer_param_layout, which packs params without padding bucket ends.
     The distributed optimizer requires every bucket end to be divisible by
-    intra_dp_cp_with_gtp_group.size() (asserted at param_and_grad_buffer.py:1427).
+    intra_dp_cp_no_gtp_group.size() (asserted at param_and_grad_buffer.py:1427).
 
     Trigger:
-      GTP=2, DP=4  →  intra_dp_cp_with_gtp_group.size()=2
+      GTP=2, DP=4  →  intra_dp_cp_no_gtp_group.size()=2
       pad_for_alignment=0, weight [out=2,in=3]  →  GTP shard=[1,3]=3 elements (odd)
       Two GTP params: total=6, 6%2==0 (total check passes); bucket_size=3 forces
       bucket-0 to contain only the first param, end=3, 3%2≠0  →  AssertionError
@@ -1406,7 +1406,7 @@ def _worker_regular_buffer_padded_when_gtp_params_present(rank, world_size, port
 
 class TestGTPDDPBucketAlignment:
     def test_gtp_buffers_use_padded_layout_with_distributed_optimizer(self):
-        """GTP buffer bucket ends must be padded to intra_dp_cp_with_gtp_group.size()."""
+        """GTP buffer bucket ends must be padded to intra_dp_cp_no_gtp_group.size()."""
         _requires_multi_gpu(4)
         _run_distributed(_worker_gtp_ddp_bucket_alignment, 4)
 

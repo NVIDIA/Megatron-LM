@@ -84,23 +84,23 @@ class DistributedDataParallel(_BaseDataParallel):
         self.expt_dp_group = process_group_dict['expt_dp_group']
         # DDP reduces every bucket over the GTP/EGTP-EXCLUDED replicate group (the gtp axis is
         # completed separately by the RS + finalize all-reduce), so the intra groups DDP shards
-        # over ARE the *_with_gtp variants. They alias the regular intra groups when GTP is off.
+        # over ARE the *_no_gtp variants. They alias the regular intra groups when GTP is off.
         self.intra_dp_cp_group = process_group_dict.get(
-            'intra_dp_cp_with_gtp_group', process_group_dict['intra_dp_cp_group']
+            'intra_dp_cp_no_gtp_group', process_group_dict['intra_dp_cp_group']
         )
         self.intra_expt_dp_group = process_group_dict.get(
-            'intra_expt_dp_with_egtp_group', process_group_dict['intra_expt_dp_group']
+            'intra_expt_dp_no_egtp_group', process_group_dict['intra_expt_dp_group']
         )
         # Full cross-instance, GTP-peer-EXCLUDED groups for broadcast_params (init-time weight
         # sync must reach all true replicas). Fall back to the full DP groups when GTP is off.
-        self.dp_cp_with_gtp_group = process_group_dict.get('dp_cp_with_gtp_group', self.dp_cp_group)
-        self.expt_dp_with_egtp_group = process_group_dict.get(
-            'expt_dp_with_egtp_group', self.expt_dp_group
+        self.dp_cp_no_gtp_group = process_group_dict.get('dp_cp_no_gtp_group', self.dp_cp_group)
+        self.expt_dp_no_egtp_group = process_group_dict.get(
+            'expt_dp_no_egtp_group', self.expt_dp_group
         )
         # GTP is "active" when the replicate groups are strictly smaller than the full DP groups.
         gtp_active = (
-            self.dp_cp_with_gtp_group.size() != self.dp_cp_group.size()
-            or self.expt_dp_with_egtp_group.size() != self.expt_dp_group.size()
+            self.dp_cp_no_gtp_group.size() != self.dp_cp_group.size()
+            or self.expt_dp_no_egtp_group.size() != self.expt_dp_group.size()
         )
         if gtp_active and self.ddp_config.average_in_collective:
             raise NotImplementedError(
@@ -616,9 +616,9 @@ class DistributedDataParallel(_BaseDataParallel):
             # Each (E)GTP peer holds a distinct 1/N shard, so broadcast over the (E)GTP-EXCLUDED
             # group — else rank-0's shard would clobber the others.
             if is_expert_parallel:
-                data_parallel_group = self.expt_dp_with_egtp_group if is_gtp else self.expt_dp_group
+                data_parallel_group = self.expt_dp_no_egtp_group if is_gtp else self.expt_dp_group
             else:
-                data_parallel_group = self.dp_cp_with_gtp_group if is_gtp else self.dp_cp_group
+                data_parallel_group = self.dp_cp_no_gtp_group if is_gtp else self.dp_cp_group
             torch.distributed.broadcast(
                 param.data,
                 src=torch.distributed.get_global_rank(data_parallel_group, 0),

@@ -159,7 +159,7 @@ def _worker_helper_offsets_tp_neq_gtp_axis(rank, world_size, port):
     )
 
 
-def _worker_helper_no_op_without_gtp(rank, world_size, port):
+def _worker_helper_no_op_no_gtp(rank, world_size, port):
     """Helper must delegate to vanilla when state_dict has no GTPShardedParam.
 
     Per-TP-rank shape under column-parallel TP=2: (full_out//tp_size, in).
@@ -564,9 +564,9 @@ class TestGtpDcpHelper:
         _require_world_size(4)
         _worker_helper_replicated_sink_rejects_gtp(dist.get_rank(), 4, None)
 
-    def test_no_op_without_gtp(self):
+    def test_no_op_no_gtp(self):
         _require_world_size(4)
-        _worker_helper_no_op_without_gtp(dist.get_rank(), 4, None)
+        _worker_helper_no_op_no_gtp(dist.get_rank(), 4, None)
 
     def test_reset_quantize_cache(self):
         _require_world_size(4)
