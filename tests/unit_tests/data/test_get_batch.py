@@ -65,6 +65,19 @@ def initialize_test_environment(
     return args
 
 
+def _add_provenance_keys(batch):
+    """Inject extra fields that real dataloader stacks add to per-sample dicts.
+
+    BlendedDataset.__getitem__ prepends a ``dataset_id`` provenance field; other
+    wrappers may add arbitrary metadata. get_batch must ignore these and return
+    exactly len(BATCH_KEYS) values — without this, the call-site unpacking fails
+    on tp_rank 0 (PR #4952). Applied inside every iterator builder so every
+    parametrized test case in this file exercises the cardinality contract.
+    """
+    batch["dataset_id"] = torch.tensor([0], dtype=torch.int64)
+    return batch
+
+
 def create_sft_data_iterator(max_seq_length: int = 1024):
     """Create a mock SFT data iterator matching the old SFTDataset output after DataLoader collation.
 
@@ -145,7 +158,7 @@ def create_sft_data_iterator(max_seq_length: int = 1024):
         "cu_seqlens": cu_seqlens.unsqueeze(0),
         "max_seqlen": max_seqlen,
     }
-    return iter([batch]), num_real_tokens
+    return iter([_add_provenance_keys(batch)]), num_real_tokens
 
 
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
@@ -367,7 +380,7 @@ def create_pretrain_data_iterator(
             torch.ones((micro_batch_size, 1, seq_length, seq_length))
         ).bool()
 
-    return iter([batch])
+    return iter([_add_provenance_keys(batch)])
 
 
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
