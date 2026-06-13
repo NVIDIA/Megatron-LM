@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
 import warnings
@@ -820,10 +820,10 @@ def get_mtp_num_layers_to_build(
         num_layers_to_build = config.pipeline_model_parallel_layout.get_num_layers_to_build(
             layer_type=LayerType.mtp, vp_stage=vp_stage
         )
-        assert num_layers_to_build == config.mtp_num_layers or num_layers_to_build == 0, (
-            f"Currently, we only support put all of MTP layers on the last pipeline stage, "
-            f"so the number of MTP layers to build ({num_layers_to_build}) must match "
-            f"mtp_num_layers ({config.mtp_num_layers}) or be 0."
+        assert 0 <= num_layers_to_build <= config.mtp_num_layers, (
+            f"Number of MTP layers to build ({num_layers_to_build}) must be between 0 "
+            f"and mtp_num_layers ({config.mtp_num_layers}). "
+            f"Use mtp_split layout to distribute MTP layers across PP ranks."
         )
     else:
         if parallel_state.is_pipeline_last_stage(ignore_virtual=False, vp_stage=vp_stage):
@@ -2053,7 +2053,36 @@ class MultiTokenPredictionBlock(MegatronModule):
         if self.config.mtp_detach_heads:
             hidden_states = hidden_states.detach()
 
-        for iteration in range(self.config.mtp_num_layers):
+        # For mtp_split, this rank's MTP layers are not the first globally.
+        # Pre-roll input_ids/position_ids by `offset` so that layer k (0-indexed
+        # globally) receives the embedding of token t+(k+1), not t+1.
+        if offset > 0:
+            cp_group = resolve_cp_group(self.cp_group, packed_seq_params)
+            for _ in range(offset):
+                input_ids, _ = roll_tensor(
+                    input_ids,
+                    shifts=-1,
+                    dims=-1,
+                    cp_group=cp_group,
+                    packed_seq_params=packed_seq_params,
+                )
+                position_ids, _ = roll_tensor(
+                    position_ids,
+                    shifts=-1,
+                    dims=-1,
+                    cp_group=cp_group,
+                    packed_seq_params=packed_seq_params,
+                )
+                if padding_mask is not None:
+                    padding_mask, _ = roll_tensor(
+                        padding_mask,
+                        shifts=-1,
+                        dims=-1,
+                        cp_group=cp_group,
+                        packed_seq_params=packed_seq_params,
+                    )
+
+        for iteration in range(len(self.layers)):
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
             (hidden_states, input_ids, position_ids, padding_mask) = self.layers[layer_idx](
                 input_ids=input_ids,
