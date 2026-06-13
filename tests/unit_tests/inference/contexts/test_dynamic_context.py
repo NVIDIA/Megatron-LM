@@ -19,7 +19,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_block import get_num_layers_to_build
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -160,6 +160,52 @@ class TestDynamicContext:
 
         # Check initializations to -1
         assert torch.all(dynamic_context.request_ids == -1)
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    @pytest.mark.parametrize("block_size_tokens", [16, 32, 64, 128])
+    def test_mla_cache_block_size_relaxed(self, block_size_tokens):
+        """cache_mla_latents no longer requires block_size_tokens == 64.
+
+        The historical FlashMLA-only path forced block size 64. Now that
+        the MLA dynamic path runs through FlashInfer's BatchMLAPagedAttentionWrapper,
+        which supports arbitrary page sizes, the construction guard is gone.
+        """
+        model_config = MLATransformerConfig(
+            params_dtype=torch.float32,
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=4,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_head_dim=32,
+            v_head_dim=32,
+            qk_pos_emb_head_dim=32,
+            cache_mla_latents=True,
+        )
+        dynamic_context = DynamicInferenceContext(
+            model_config=model_config,
+            inference_config=InferenceConfig(
+                max_sequence_length=512,
+                num_cuda_graphs=None,
+                use_cuda_graphs_for_non_decode_steps=True,
+                buffer_size_gb=0.1,
+                paused_buffer_size_gb=0.02,
+                block_size_tokens=block_size_tokens,
+                max_tokens=None,
+                num_speculative_tokens=0,
+                use_flashinfer_fused_rope=None,
+                unified_memory_level=0,
+            ),
+        )
+        assert dynamic_context.cache_mla_latent is True
+        assert dynamic_context.block_size_tokens == block_size_tokens
+        # The MLA cache buffer has the compressed layout
+        # [num_layers, num_blocks, page_size, kv_lora_rank + qk_pos_emb_head_dim].
+        assert dynamic_context.memory_buffer.shape[2] == block_size_tokens
+        assert dynamic_context.memory_buffer.shape[3] == (
+            model_config.kv_lora_rank + model_config.qk_pos_emb_head_dim
+        )
 
     @pytest.mark.internal
     def test_is_static_batching(self):
