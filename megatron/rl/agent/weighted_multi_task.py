@@ -6,7 +6,6 @@ from typing import Any, Optional, Type
 import numpy as np
 
 from .. import import_class
-from ..rollout_granularity import RLRolloutGranularity
 from .api import (
     AgentBaseModel,
     ContrastiveRollout,
@@ -191,7 +190,7 @@ class WeightedMultiTask(
     async def get_grouped_rollouts(self, request: GroupedRolloutRequest):
         """Distribute grouped rollouts across sub-agents according to weights."""
         agent_groups = self._distribute_counts(request.num_groups)
-        if request.submission_granularity == RLRolloutGranularity.BATCH:
+        if request.submission_granularity == "B":
             # In BATCH mode, pgt counts local batches in flight. agent_groups already
             # splits each batch by weight, so copy pgt to every active agent.
             agent_pgts = [

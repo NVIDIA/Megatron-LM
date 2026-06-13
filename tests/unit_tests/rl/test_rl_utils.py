@@ -34,7 +34,7 @@ from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphS
 from megatron.core.transformer.module import Float16Module
 from megatron.rl import rl_utils
 from megatron.rl.agent.api import TokenRollout
-from megatron.rl.rollout_granularity import RLRolloutGranularity, get_rl_parallel_generation_tasks
+from megatron.rl.rollout_granularity import get_rl_parallel_generation_tasks
 from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
@@ -172,84 +172,84 @@ class TestRLUtils:
             pytest.param(
                 {"grpo_prompts_per_step": 8},
                 {
-                    "rl_submission_granularity": RLRolloutGranularity.GROUP,
-                    "rl_consumption_granularity": RLRolloutGranularity.BATCH,
+                    "rl_submission_granularity": "B",
+                    "rl_consumption_granularity": "B",
                     "rl_generation_lag": 0,
                 },
-                8,
-                id="default-group-submit-batch-consume",
+                1,
+                id="default-batch-submit-batch-consume",
             ),
             pytest.param(
                 {
-                    "rl_submission_granularity": RLRolloutGranularity.ROLLOUT,
-                    "rl_consumption_granularity": RLRolloutGranularity.BATCH,
+                    "rl_submission_granularity": "R",
+                    "rl_consumption_granularity": "B",
                     "grpo_group_size": 4,
                     "grpo_prompts_per_step": 8,
                 },
                 {
-                    "rl_submission_granularity": RLRolloutGranularity.ROLLOUT,
-                    "rl_consumption_granularity": RLRolloutGranularity.BATCH,
+                    "rl_submission_granularity": "R",
+                    "rl_consumption_granularity": "B",
                 },
                 32,
                 id="rollout-submit-batch-consume",
             ),
             pytest.param(
                 {
-                    "rl_submission_granularity": RLRolloutGranularity.ROLLOUT,
-                    "rl_consumption_granularity": RLRolloutGranularity.GROUP,
+                    "rl_submission_granularity": "R",
+                    "rl_consumption_granularity": "G",
                     "grpo_group_size": 4,
                     "grpo_prompts_per_step": 8,
                 },
                 {
-                    "rl_submission_granularity": RLRolloutGranularity.ROLLOUT,
-                    "rl_consumption_granularity": RLRolloutGranularity.GROUP,
+                    "rl_submission_granularity": "R",
+                    "rl_consumption_granularity": "G",
                 },
                 32,
                 id="rollout-submit-group-consume",
             ),
             pytest.param(
                 {
-                    "rl_submission_granularity": RLRolloutGranularity.BATCH,
-                    "rl_consumption_granularity": RLRolloutGranularity.BATCH,
+                    "rl_submission_granularity": "B",
+                    "rl_consumption_granularity": "B",
                     "grpo_prompts_per_step": 8,
                 },
                 {
-                    "rl_submission_granularity": RLRolloutGranularity.BATCH,
-                    "rl_consumption_granularity": RLRolloutGranularity.BATCH,
+                    "rl_submission_granularity": "B",
+                    "rl_consumption_granularity": "B",
                 },
                 1,
                 id="batch-submit-batch-consume",
             ),
             pytest.param(
                 {
-                    "rl_submission_granularity": RLRolloutGranularity.GROUP,
-                    "rl_consumption_granularity": RLRolloutGranularity.BATCH,
+                    "rl_submission_granularity": "G",
+                    "rl_consumption_granularity": "B",
                     "grpo_prompts_per_step": 8,
                 },
                 {
-                    "rl_submission_granularity": RLRolloutGranularity.GROUP,
-                    "rl_consumption_granularity": RLRolloutGranularity.BATCH,
+                    "rl_submission_granularity": "G",
+                    "rl_consumption_granularity": "B",
                 },
                 8,
                 id="group-submit-batch-consume",
             ),
             pytest.param(
                 {
-                    "rl_submission_granularity": RLRolloutGranularity.GROUP,
-                    "rl_consumption_granularity": RLRolloutGranularity.GROUP,
+                    "rl_submission_granularity": "G",
+                    "rl_consumption_granularity": "G",
                     "grpo_prompts_per_step": 8,
                 },
                 {
-                    "rl_submission_granularity": RLRolloutGranularity.GROUP,
-                    "rl_consumption_granularity": RLRolloutGranularity.GROUP,
+                    "rl_submission_granularity": "G",
+                    "rl_consumption_granularity": "G",
                 },
                 8,
                 id="group-submit-group-consume",
             ),
             pytest.param(
                 {
-                    "rl_submission_granularity": RLRolloutGranularity.GROUP,
-                    "rl_consumption_granularity": RLRolloutGranularity.BATCH,
+                    "rl_submission_granularity": "G",
+                    "rl_consumption_granularity": "B",
                     "rl_generation_lag": 2,
                     "grpo_prompts_per_step": 8,
                 },
@@ -259,8 +259,8 @@ class TestRLUtils:
             ),
             pytest.param(
                 {
-                    "rl_submission_granularity": RLRolloutGranularity.BATCH,
-                    "rl_consumption_granularity": RLRolloutGranularity.BATCH,
+                    "rl_submission_granularity": "B",
+                    "rl_consumption_granularity": "B",
                     "rl_generation_lag": 2,
                     "grpo_prompts_per_step": 8,
                 },
@@ -270,8 +270,8 @@ class TestRLUtils:
             ),
             pytest.param(
                 {
-                    "rl_submission_granularity": RLRolloutGranularity.ROLLOUT,
-                    "rl_consumption_granularity": RLRolloutGranularity.BATCH,
+                    "rl_submission_granularity": "R",
+                    "rl_consumption_granularity": "B",
                     "rl_generation_lag": 2,
                     "grpo_group_size": 4,
                     "grpo_prompts_per_step": 8,
