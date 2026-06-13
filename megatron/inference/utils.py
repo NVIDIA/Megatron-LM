@@ -4,6 +4,7 @@ import logging
 from argparse import ArgumentParser
 from functools import partial
 from typing import Optional
+
 import torch
 
 from gpt_builders import gpt_builder
@@ -285,6 +286,15 @@ def add_inference_args(parser: ArgumentParser) -> ArgumentParser:
         default=None,
         help="Path to write coordinator request scheduling decisions as JSON",
     )
+
+    group.add_argument(
+        "--moe-routing-trace-max-steps",
+        type=int,
+        default=None,
+        help="Maximum number of decode steps to trace (inference). Default is unlimited."
+             "Training uses --moe-routing-trace-max-iters instead.",
+    )
+
     return parser
 
 

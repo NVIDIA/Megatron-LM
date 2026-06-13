@@ -103,6 +103,71 @@ prefer `offline_inference.py` and `launch_inference_server.py`. CI
 recipes under `tests/test_utils/recipes/h100/{gpt,moe,mamba}-*-inference.yaml`
 still target these scripts.
 
+### MoE routing analysis
+
+`tools/moe_routing/analyze_routing.py` and the `analyze_routing_*.py`scripts analyze per-layer top-K routing decisions from MoE models.  The same JSONL trace format and the same analysis scripts work for both training and inference.
+
+#### Collecting traces
+
+**During training**, enable these flags:
+
+```bash
+--moe-routing-trace-path /path/to/trace_dir   # enable tracing
+--moe-routing-trace-max-iters 500             # optional: stop after N iters
+--moe-routing-trace-capture-hidden-states     # required for distribution predictability
+--moe-routing-trace-dump-weights              # required for distribution predictability
+```
+
+**During inference**, add these flags (e.g. to
+`advanced/gpt_dynamic_inference_with_coordinator.py`):
+
+```bash
+--moe-routing-trace-path /path/to/trace_dir
+--moe-routing-trace-max-steps 200
+--moe-routing-trace-capture-hidden-states
+--moe-routing-trace-dump-weights
+```
+
+Both write `router_trace_rank{N}.jsonl` into the specified directory (one file per rank).
+`--moe-routing-trace-capture-hidden-states` also writes `hidden_states_rank{N}.bin` and
+`--moe-routing-trace-dump-weights` writes `router_state_rank{N}.pt`; both are required by
+`analyze_routing_predictability.py`.
+
+#### Running analyses
+
+```bash
+python tools/moe_routing/analyze_routing.py /path/to/trace_dir --num-experts 512
+```
+
+The dispatcher runs these analyses in order:
+
+| Script | Primary question | Role |
+|--------|-----------------|------|
+| `tools/moe_routing/analyze_routing_concentration.py` | How concentrated is routing? (hot-set size) | Hypothesis test: is per-layer static caching viable? High concentration (ratio > 2×) supports it; near-uniform rules it out. |
+| `tools/moe_routing/analyze_routing_predictability.py` | How well do L_prev's hidden states predict L's routing distribution? | Affirmative signal: high cosine/Spearman means distributional routing is predictable one layer ahead. |
+
+#### Interpreting the distribution predictability output
+
+`analyze_routing_predictability.py` applies layer L's router weights to the hidden states
+from L_prev and compares the resulting predicted per-expert token-count distribution to
+what L actually routed.  The `cos` and `spearman` columns measure that agreement:
+
+- `cos` ≥ 0.90 and `spearman` ≥ 0.70: the hidden-state signal from the previous MoE layer
+  is sufficient to predict the aggregate expert load distribution of the next layer with high
+  fidelity.
+- Values near zero: weak cross-layer signal for this layer pair.
+
+This is a distributional result: per-token assignment errors cancel in the aggregate count
+histogram, so this measure is far more forgiving than per-token index overlap.
+
+#### Adding new routing metrics
+
+To add a new routing metric, put capture logic in `megatron/core/transformer/moe/router_trace.py`
+(as part of the `RouterTracer` class) so it is available to both training and inference.  Avoid
+adding bespoke logging flows to `megatron/training/activation_logging.py`
+for routing metrics — that file handles lightweight count monitoring
+(`tokens_per_expert`) and uses a different output format.
+
 ### See also
 
 - API reference: [`megatron/core/inference/README.md`](../../megatron/core/inference/README.md)
