@@ -22,7 +22,7 @@ Usage:
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -64,6 +64,372 @@ def destroy_moe_metrics_tracker() -> None:
     """Reset the global MoE metrics tracker to ``None``."""
     global _MOE_METRICS_TRACKER
     _MOE_METRICS_TRACKER = None
+
+
+# ---------------------------------------------------------------------------
+# MoE Overload Factor Tracker (same pattern as MoEMetricsTracker)
+# ---------------------------------------------------------------------------
+_MOE_OVERLOAD_FACTOR_TRACKER: Optional['MoEOverloadFactorTracker'] = None
+
+
+def get_moe_overload_factor_tracker() -> 'MoEOverloadFactorTracker':
+    """Return the global MoE overload factor tracker, creating it lazily if needed."""
+    global _MOE_OVERLOAD_FACTOR_TRACKER
+    if _MOE_OVERLOAD_FACTOR_TRACKER is None:
+        _MOE_OVERLOAD_FACTOR_TRACKER = MoEOverloadFactorTracker()
+    return _MOE_OVERLOAD_FACTOR_TRACKER
+
+
+def set_moe_overload_factor_tracker(tracker: 'MoEOverloadFactorTracker') -> None:
+    """Set the global MoE overload factor tracker."""
+    global _MOE_OVERLOAD_FACTOR_TRACKER
+    _MOE_OVERLOAD_FACTOR_TRACKER = tracker
+
+
+def destroy_moe_overload_factor_tracker() -> None:
+    """Reset the global MoE overload factor tracker to None."""
+    global _MOE_OVERLOAD_FACTOR_TRACKER
+    _MOE_OVERLOAD_FACTOR_TRACKER = None
+
+
+class MoEOverloadFactorTracker:
+    """Tracker for MoE overload-factor metrics.
+
+    Reductions are over tp_ep then expt_dp (expert data parallel), not dense dp,
+    so overload stats stay within the same expert partition across replicas.
+
+    Lifecycle: MoELayer records counts when log_moe_overload_factor is set (training only);
+    report() at step end (sync, aggregate, log, deferred clear) → repeat.
+
+    Example:
+        tracker = get_moe_overload_factor_tracker()
+        log_str = tracker.report(iteration=100, writer=tb_writer)
+    """
+
+    def __init__(self) -> None:
+        self._layer_fwd_tokens: Dict[int, List[torch.Tensor]] = {}
+        # layer_idx -> list of 0-dim float (tokens on rank)
+        self._layer_fwd_balanced: Dict[int, List[torch.Tensor]] = {}
+        # same keys as _layer_fwd_tokens, balanced token count per entry
+        self._cumulative_tokens_timeline: List[torch.Tensor] = []
+        # +actual tokens on forward, - on backward (mirrors balanced timeline).
+        self._cumulative_balanced_timeline: List[torch.Tensor] = []
+        self._tp_ep_group: Optional[torch.distributed.ProcessGroup] = None
+        self._expt_dp_group: Optional[torch.distributed.ProcessGroup] = None
+        self._pending_clear: bool = False
+
+    def set_process_groups(
+        self,
+        tp_ep_group: Optional[torch.distributed.ProcessGroup] = None,
+        expt_dp_group: Optional[torch.distributed.ProcessGroup] = None,
+    ) -> None:
+        """Set process groups for reduction (MoELayer.__init__ when log_moe_overload_factor)."""
+        if tp_ep_group is not None:
+            self._tp_ep_group = tp_ep_group
+        if expt_dp_group is not None:
+            self._expt_dp_group = expt_dp_group
+
+    def _clear_storage(self) -> None:
+        self._layer_fwd_tokens.clear()
+        self._layer_fwd_balanced.clear()
+        self._cumulative_tokens_timeline.clear()
+        self._cumulative_balanced_timeline.clear()
+
+    def _flush_pending_clear(self) -> None:
+        if self._pending_clear:
+            self._pending_clear = False
+            self._clear_storage()
+
+    def record_fwd(
+        self,
+        layer_number: Optional[int],
+        tokens_on_rank: torch.Tensor,
+        local_balanced_token_count: torch.Tensor,
+    ) -> None:
+        """Record forward token total on this rank (0-dim float) and balanced count scalar."""
+        self._flush_pending_clear()
+        if layer_number is None:
+            return
+        layer_idx = layer_number - 1
+        if layer_idx not in self._layer_fwd_tokens:
+            self._layer_fwd_tokens[layer_idx] = []
+            self._layer_fwd_balanced[layer_idx] = []
+        self._layer_fwd_tokens[layer_idx].append(tokens_on_rank.detach())
+        self._layer_fwd_balanced[layer_idx].append(local_balanced_token_count.detach())
+        self._cumulative_tokens_timeline.append(tokens_on_rank.detach())
+        self._cumulative_balanced_timeline.append(local_balanced_token_count.detach())
+
+    def record_bwd(
+        self, tokens_on_rank: torch.Tensor, local_balanced_token_count: torch.Tensor
+    ) -> None:
+        """Record backward-pass (negated actual and balanced count) for paired cumsums."""
+        self._flush_pending_clear()
+        self._cumulative_tokens_timeline.append(-tokens_on_rank.detach())
+        self._cumulative_balanced_timeline.append(-local_balanced_token_count.detach())
+
+    def _pipeline_group_and_use_reduce(
+        self,
+    ) -> Tuple[Optional[torch.distributed.ProcessGroup], bool]:
+        pp_group = (
+            parallel_state.get_pipeline_model_parallel_group(check_initialized=False)
+            if torch.distributed.is_initialized()
+            else None
+        )
+        use_pp_reduce = (
+            pp_group is not None and torch.distributed.get_world_size(group=pp_group) > 1
+        )
+        return pp_group, use_pp_reduce
+
+    def _flatten_recorded_tokens(self) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        fwd_tensors: List[torch.Tensor] = []
+        balanced_tensors: List[torch.Tensor] = []
+        if self._layer_fwd_tokens:
+            for layer_idx in sorted(self._layer_fwd_tokens.keys()):
+                for t, b in zip(
+                    self._layer_fwd_tokens[layer_idx], self._layer_fwd_balanced[layer_idx]
+                ):
+                    fwd_tensors.append(t)
+                    balanced_tensors.append(b)
+        return fwd_tensors, balanced_tensors
+
+    def _pp_allreduce_empty_tracker(self, pp_group: torch.distributed.ProcessGroup) -> None:
+        """Ranks without MoE still join PP collectives so peers do not hang."""
+        device = (
+            torch.device('cuda', torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else torch.device('cpu')
+        )
+        pp_buf = torch.zeros(2, device=device, dtype=torch.float32)
+        torch.distributed.all_reduce(pp_buf, group=pp_group, op=torch.distributed.ReduceOp.MAX)
+
+    def _validate_overload_tensor_lists(
+        self, num_entries: int, num_layers: int, num_balanced: int
+    ) -> None:
+        if num_entries % num_layers != 0:
+            raise ValueError(
+                f"Overload factor tracker: num_entries ({num_entries}) must be "
+                f"divisible by num_layers ({num_layers})."
+            )
+        if num_balanced != num_entries:
+            raise ValueError(
+                f"Overload factor tracker: balanced_tensors length ({num_balanced}) "
+                f"must match fwd_tensors ({num_entries})."
+            )
+
+    def _max_cum_overload_if_timeline(
+        self,
+        tp_ep_group: Optional[torch.distributed.ProcessGroup],
+        expt_dp_group: Optional[torch.distributed.ProcessGroup],
+    ) -> Optional[float]:
+        """Cumulative actual vs balanced token count; ratio of peaks across ranks."""
+        if not self._cumulative_tokens_timeline:
+            return None
+        if len(self._cumulative_balanced_timeline) != len(self._cumulative_tokens_timeline):
+            raise ValueError(
+                f"Overload tracker: _cumulative_tokens_timeline "
+                f"({len(self._cumulative_tokens_timeline)}) and "
+                f"_cumulative_balanced_timeline "
+                f"({len(self._cumulative_balanced_timeline)}) length mismatch."
+            )
+        fwd_bwd_stacked = torch.stack(
+            [t.float() for t in self._cumulative_tokens_timeline], dim=0
+        )  # [num_events]
+        balanced_fwd_bwd_stacked = torch.stack(
+            [t.float() for t in self._cumulative_balanced_timeline], dim=0
+        )
+        cum_actual = fwd_bwd_stacked.cumsum(dim=0)
+        cum_balanced = balanced_fwd_bwd_stacked.cumsum(dim=0)
+        local_actual_peak = cum_actual.max()
+        local_balanced_peak = cum_balanced.max()
+        cum_overload_ratio = torch.where(
+            local_balanced_peak > 0,
+            local_actual_peak / (local_balanced_peak + 1e-8),
+            local_actual_peak.new_zeros(()),
+        ).unsqueeze(0)
+        if tp_ep_group is not None:
+            torch.distributed.all_reduce(
+                cum_overload_ratio, group=tp_ep_group, op=torch.distributed.ReduceOp.MAX
+            )
+        if expt_dp_group is not None:
+            torch.distributed.all_reduce(
+                cum_overload_ratio, group=expt_dp_group, op=torch.distributed.ReduceOp.MAX
+            )
+        return cum_overload_ratio.item()
+
+    def _tp_ep_overload_from_lists(
+        self,
+        fwd_tensors: List[torch.Tensor],
+        balanced_tensors: List[torch.Tensor],
+        tp_ep_group: Optional[torch.distributed.ProcessGroup],
+    ) -> Tuple[torch.Tensor, torch.device]:
+        """Max actual per entry over tp_ep, balanced sum per entry, then overload ratio."""
+        actual_tokens_stacked = torch.stack([t.float() for t in fwd_tensors], dim=0)
+        device = actual_tokens_stacked.device
+        if tp_ep_group is not None:
+            tp_ep_world = float(tp_ep_group.size())
+            max_actual = actual_tokens_stacked.clone()
+            torch.distributed.all_reduce(
+                max_actual, group=tp_ep_group, op=torch.distributed.ReduceOp.MAX
+            )
+        else:
+            tp_ep_world = 1.0
+            max_actual = actual_tokens_stacked
+
+        balanced_stacked = torch.stack(
+            [b.to(device=device, dtype=torch.float32) for b in balanced_tensors], dim=0
+        )
+        if tp_ep_group is not None:
+            torch.distributed.all_reduce(balanced_stacked, group=tp_ep_group)
+        balanced_per_rank = balanced_stacked / tp_ep_world
+        tp_ep_overload = max_actual / (balanced_per_rank + 1e-8)
+        return tp_ep_overload, device
+
+    def _expt_dp_reduce_overload(
+        self, tp_ep_overload: torch.Tensor, expt_dp_group: Optional[torch.distributed.ProcessGroup]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Average and worst-case overload across expert-DP replicas (per entry)."""
+        if expt_dp_group is not None:
+            overload_avg = tp_ep_overload.clone()
+            torch.distributed.all_reduce(
+                overload_avg, group=expt_dp_group, op=torch.distributed.ReduceOp.AVG
+            )
+            overload_max = tp_ep_overload.clone()
+            torch.distributed.all_reduce(
+                overload_max, group=expt_dp_group, op=torch.distributed.ReduceOp.MAX
+            )
+        else:
+            overload_avg = tp_ep_overload
+            overload_max = tp_ep_overload
+        return overload_avg, overload_max
+
+    def _pp_reduce_max_overload_scalars(
+        self,
+        max_overload_factor: float,
+        max_cum_overload_factor: Optional[float],
+        device: torch.device,
+        pp_group: torch.distributed.ProcessGroup,
+    ) -> Tuple[float, float]:
+        max_cum_value = (
+            float(max_cum_overload_factor) if max_cum_overload_factor is not None else 0.0
+        )
+        pp_buf = torch.tensor(
+            [max_overload_factor, max_cum_value], device=device, dtype=torch.float32
+        )
+        torch.distributed.all_reduce(pp_buf, group=pp_group, op=torch.distributed.ReduceOp.MAX)
+        return pp_buf[0].item(), pp_buf[1].item()
+
+    def _log_overload_metrics(
+        self,
+        iteration: int,
+        writer,
+        wandb_writer,
+        avg_overload_factor: float,
+        max_overload_factor: float,
+        max_cum_overload_factor: Optional[float],
+        per_layer_logging: bool,
+        overload_avg: torch.Tensor,
+        overload_max: torch.Tensor,
+        num_layers: int,
+        num_entries: int,
+    ) -> None:
+        if writer is not None:
+            writer.add_scalar("moe/avg_overload_factor", avg_overload_factor, iteration)
+            writer.add_scalar("moe/max_overload_factor", max_overload_factor, iteration)
+            if max_cum_overload_factor is not None:
+                writer.add_scalar("moe/max_cum_overload_factor", max_cum_overload_factor, iteration)
+        if wandb_writer is not None:
+            wandb_writer.log({"moe/avg_overload_factor": avg_overload_factor}, iteration)
+            wandb_writer.log({"moe/max_overload_factor": max_overload_factor}, iteration)
+            if max_cum_overload_factor is not None:
+                wandb_writer.log(
+                    {"moe/max_cum_overload_factor": max_cum_overload_factor}, iteration
+                )
+
+        if per_layer_logging:
+            entries_per_layer = num_entries // num_layers
+            layer_avg = overload_avg.view(num_layers, entries_per_layer).mean(dim=1)
+            layer_max = overload_max.view(num_layers, entries_per_layer).max(dim=1).values
+            for i in range(num_layers):
+                avg_val, max_val = layer_avg[i].item(), layer_max[i].item()
+                if writer is not None:
+                    writer.add_scalar(f"moe/avg_overload_factor_layer_{i}", avg_val, iteration)
+                    writer.add_scalar(f"moe/max_overload_factor_layer_{i}", max_val, iteration)
+                if wandb_writer is not None:
+                    wandb_writer.log(
+                        {
+                            f"moe/avg_overload_factor_layer_{i}": avg_val,
+                            f"moe/max_overload_factor_layer_{i}": max_val,
+                        },
+                        iteration,
+                    )
+
+    def report(
+        self, iteration: int, writer=None, wandb_writer=None, per_layer_logging: bool = False
+    ) -> str:
+        """Reduce data, overload factors, log to TB/W&B, defer clear, return log string."""
+        pp_group, use_pp_reduce = self._pipeline_group_and_use_reduce()
+        tp_ep_group = self._tp_ep_group
+        expt_dp_group = self._expt_dp_group
+        fwd_tensors, balanced_tensors = self._flatten_recorded_tokens()
+
+        if not fwd_tensors:
+            if use_pp_reduce:
+                assert pp_group is not None
+                self._pp_allreduce_empty_tracker(pp_group)
+            self.clear()
+            return ""
+
+        num_entries = len(fwd_tensors)
+        num_layers = len(self._layer_fwd_tokens)
+        self._validate_overload_tensor_lists(num_entries, num_layers, len(balanced_tensors))
+
+        max_cum_overload_factor = self._max_cum_overload_if_timeline(tp_ep_group, expt_dp_group)
+        tp_ep_overload, device = self._tp_ep_overload_from_lists(
+            fwd_tensors, balanced_tensors, tp_ep_group
+        )
+        overload_avg, overload_max = self._expt_dp_reduce_overload(tp_ep_overload, expt_dp_group)
+
+        avg_overload_factor = overload_avg.mean().item()
+        max_overload_factor = overload_max.max().item()
+
+        if use_pp_reduce:
+            assert pp_group is not None
+            max_overload_factor, max_cum_reduced = self._pp_reduce_max_overload_scalars(
+                max_overload_factor, max_cum_overload_factor, device, pp_group
+            )
+            max_cum_overload_factor = max_cum_reduced
+
+        self._log_overload_metrics(
+            iteration,
+            writer,
+            wandb_writer,
+            avg_overload_factor,
+            max_overload_factor,
+            max_cum_overload_factor,
+            per_layer_logging,
+            overload_avg,
+            overload_max,
+            num_layers,
+            num_entries,
+        )
+
+        self.clear()
+
+        parts = [
+            f" avg overload factor: {avg_overload_factor:.3f} |",
+            f" max overload factor: {max_overload_factor:.3f} |",
+        ]
+        if max_cum_overload_factor is not None:
+            parts.append(f" max cum overload factor: {max_cum_overload_factor:.3f} |")
+        return "".join(parts)
+
+    def clear(self) -> None:
+        """Mark stored tensors for reset on the next record_fwd or record_bwd.
+
+        Does not drop list contents yet, so captured tensor references stay valid
+        until the next recording hook runs. Process groups are kept.
+        """
+        self._pending_clear = True
 
 
 class MoEMetricsTracker:
