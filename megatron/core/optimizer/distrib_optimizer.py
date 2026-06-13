@@ -196,10 +196,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         Build mapping between params and their grad buffers.
 
         This method does the initial setup for the method above. This setup
-        includes determining the shard ranges into the param_and_grad_buffer
-        for each data-parallel (DP) rank. Each DP rank keeps range info for
-        all other DP ranks, for the purpose of creating args for
-        reduce-scatter and all-gather.
+        includes determining the shard range into the param_and_grad_buffer
+        owned by the local data-parallel (DP) rank; rank r owns the r'th
+        contiguous 1/world_size shard of each bucket.
         """
 
         data_parallel_rank = param_and_grad_buffer.data_parallel_group.rank()
@@ -212,20 +211,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         ), f"Each bucket's buffer size should be divisible by {data_parallel_world_size}"
         max_gbuf_range_size = gbuf_size // data_parallel_world_size
 
-        # All world ranges (i.e., across all data parallel ranks).
-        gbuf_world_all_ranges = []
-        for r in range(data_parallel_world_size):
-            # Compute start of chunk in this bucket.
-            gbuf_world_start = r * max_gbuf_range_size
-            gbuf_world_end = min(gbuf_size, gbuf_world_start + max_gbuf_range_size)
-            # Add bucket's offset in grad buffer.
-            gbuf_world_range = Range(
-                gbuf_world_start + bucket.offset, gbuf_world_end + bucket.offset
-            )
-            gbuf_world_all_ranges.append(gbuf_world_range)
-
-        # Local DP's ranges.
-        gbuf_world_range = gbuf_world_all_ranges[data_parallel_rank]
+        # Local DP rank's range. Computed directly (rather than materializing
+        # ranges for all DP ranks) to keep init cost O(1) in DP world size.
+        gbuf_world_start = data_parallel_rank * max_gbuf_range_size
+        gbuf_world_end = min(gbuf_size, gbuf_world_start + max_gbuf_range_size)
+        # Add bucket's offset in grad buffer.
+        gbuf_world_range = Range(gbuf_world_start + bucket.offset, gbuf_world_end + bucket.offset)
 
         # Get each param's ranges.
         param_range_map = cls._build_model_gbuf_param_range_map(
@@ -1303,16 +1294,19 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # Gather contiguous shards on DP rank 0.
                         for key, send_tensor in local_shards.items():
 
-                            # Gather tensor list.
+                            # Gather list of views into one contiguous receive
+                            # buffer, instead of data_parallel_world_size separate
+                            # tensors that would later need a torch.cat: this keeps
+                            # the number of allocations O(1) in DP world size and
+                            # avoids a full extra copy of the gathered state.
                             if data_parallel_rank == 0 or return_on_all_ranks:
                                 device = "cpu" if use_gloo_comm else torch.cuda.current_device()
-                                recv_tensors = [
-                                    torch.zeros(
-                                        (gbuf_local_numel,), dtype=torch.float32, device=device
-                                    )
-                                    for _ in range(data_parallel_world_size)
-                                ]
+                                recv_buffer = torch.empty(
+                                    (gbuf_world_numel,), dtype=torch.float32, device=device
+                                )
+                                recv_tensors = list(recv_buffer.chunk(data_parallel_world_size))
                             else:
+                                recv_buffer = None
                                 recv_tensors = None
 
                             # Gather.
@@ -1332,19 +1326,16 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
                             send_tensor = None  # allow mem deallocation
 
-                            # Concatenate.
                             if data_parallel_rank == 0 or return_on_all_ranks:
-                                if not use_gloo_comm:
-                                    recv_tensors = [t.cpu() for t in recv_tensors]
-                                recv_tensors_concatenated = torch.cat(recv_tensors)
-                                # Copy this bucket's collected all-gather tensors into the right
-                                # place in the tensor for the buffer. The tensor for the buffer
-                                # gets rid of the padding between buckets.
+                                # Copy this bucket's gathered tensor into the right
+                                # place in the tensor for the buffer. The tensor for
+                                # the buffer gets rid of the padding between buckets.
                                 start = offset_in_world_tensors
                                 end = offset_in_world_tensors + gbuf_world_numel_unpadded
                                 world_tensors[key][start:end].copy_(
-                                    recv_tensors_concatenated[:gbuf_world_numel_unpadded]
+                                    recv_buffer[:gbuf_world_numel_unpadded]
                                 )
+                                recv_buffer = None  # allow mem deallocation
 
                         offset_in_world_tensors += gbuf_world_numel_unpadded
 
@@ -2161,10 +2152,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                 world_tensor, (0, gbuf_world_numel - gbuf_world_numel_unpadded)
                             )
                             assert world_tensor.numel() == gbuf_world_numel
-                            gbuf_start_idxs = list(range(0, gbuf_world_numel, gbuf_local_numel))
-                            send_tensors = [
-                                world_tensor[i : (i + gbuf_local_numel)] for i in gbuf_start_idxs
-                            ]
+                            send_tensors = list(world_tensor.chunk(data_parallel_world_size))
                         else:
                             send_tensors = None
 
@@ -2273,10 +2261,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                                 world_tensor, (0, gbuf_world_numel - gbuf_world_numel_unpadded)
                             )
                             assert world_tensor.numel() == gbuf_world_numel
-                            gbuf_start_idxs = list(range(0, gbuf_world_numel, gbuf_local_numel))
-                            send_tensors = [
-                                world_tensor[i : (i + gbuf_local_numel)] for i in gbuf_start_idxs
-                            ]
+                            send_tensors = list(world_tensor.chunk(data_parallel_world_size))
                         else:
                             send_tensors = None
 
