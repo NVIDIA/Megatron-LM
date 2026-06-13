@@ -5,6 +5,14 @@
 
 :warning: For major changes (either in lines of code or in its impact), please make sure to first share a design doc with the team. If you're unsure what's the best way to do so, contact @NVIDIA/mcore-oncall.
 
+## Scenario and routing
+
+User scenario this PR fixes or enables: <!-- training/inference path, model family, parallelism setup, performance/accuracy issue, etc. -->
+
+Affected area / likely owners: <!-- e.g. megatron/core/transformer/moe, @NVIDIA/<team>, or "not sure" -->
+
+Risk notes: <!-- backward compatibility, checkpoint format, config defaults, numerics, performance, distributed behavior, or "none known" -->
+
 ## Issue tracking
 
 For PRs from open-source community contributors:
@@ -23,6 +31,12 @@ Linked issue: <!-- e.g. Fixes #1234 / Related to #1234 -->
 - [ ] I have added proper typing to my code [Typing guidelines](https://docs.python.org/3/library/typing.html)
 - [ ] I have added relevant documentation
 - [ ] I have run the [autoformatter.sh](https://github.com/NVIDIA/Megatron-LM/blob/main/tools/autoformat.sh) on my PR
+
+### Validation
+
+Reproduction or before/after signal: <!-- issue repro, benchmark, accuracy/perf numbers, or "not applicable" -->
+
+Test commands and results: <!-- exact commands run, CI links, or "not run" with reason -->
 
 ### Code review
 
