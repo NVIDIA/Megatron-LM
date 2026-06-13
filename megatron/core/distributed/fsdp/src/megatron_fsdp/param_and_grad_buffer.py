@@ -1,16 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 # TODO: Split this file into smaller files.
 
@@ -57,6 +45,18 @@ from .utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _same_tensor_view(a: Optional[torch.Tensor], b: torch.Tensor) -> bool:
+    if a is None:
+        return False
+    return (
+        a.data_ptr() == b.data_ptr()
+        and a.dtype == b.dtype
+        and a.shape == b.shape
+        and a.stride() == b.stride()
+        and a.storage_offset() == b.storage_offset()
+    )
 
 
 try:
@@ -924,6 +924,8 @@ class DataParallelBuffer:
 
         # Count all parameters in this buffer and store their enumerated index.
         self.param_idx = {p: i for i, p in enumerate(self.params)}
+        self.cache_param_bucket_views = ddp_config.megatron_fsdp_prefetch_recompute_forward_weights
+        self._param_bucket_view_cache = {}
 
     def init_data(self, data: torch.Tensor):
         """Allocate a buffer Tensor to persistently store the data for this
@@ -970,15 +972,49 @@ class DataParallelBuffer:
 
         # Need to set parameter data after resize model weight buffer data-storage.
         if set_param_data:
-            for p in self.params:
-                item_id = self.param_idx[p]
-                p = to_local_if_dtensor(p)
-                data = self.get_item_from_bucket(bucket, item_id).view(p.shape)
-                if is_float8tensor(p):
-                    fp8_set_raw_data(p, data, self.is_transpose_buffer)
-                else:
-                    p.data = data
+            self.set_param_data_from_bucket(bucket)
         return bucket
+
+    def _bucket_view_cache_key(self, bucket: Bucket):
+        return (
+            bucket.data.data_ptr(),
+            bucket.data.numel(),
+            bucket.data.dtype,
+            str(bucket.data.device),
+            self.is_transpose_buffer,
+        )
+
+    def _build_param_bucket_view_entries(self, bucket: Bucket):
+        entries = []
+        for p in self.params:
+            item_id = self.param_idx[p]
+            p = to_local_if_dtensor(p)
+            data = self.get_item_from_bucket(bucket, item_id).view(p.shape)
+            entries.append((p, data, is_float8tensor(p)))
+        return entries
+
+    def set_param_data_from_bucket(self, bucket: Bucket) -> None:
+        """Attach module parameter tensors to their views in an all-gather bucket."""
+        entries = None
+        if self.cache_param_bucket_views:
+            cache_key = self._bucket_view_cache_key(bucket)
+            entries = self._param_bucket_view_cache.get(cache_key)
+            if entries is None:
+                entries = self._build_param_bucket_view_entries(bucket)
+                self._param_bucket_view_cache[cache_key] = entries
+        else:
+            entries = self._build_param_bucket_view_entries(bucket)
+
+        for p, data, is_fp8 in entries:
+            if is_fp8:
+                old_data = fp8_get_raw_data(p, self.is_transpose_buffer)
+                if self.cache_param_bucket_views and _same_tensor_view(old_data, data):
+                    continue
+                fp8_set_raw_data(p, data, self.is_transpose_buffer)
+            else:
+                if self.cache_param_bucket_views and _same_tensor_view(p.data, data):
+                    continue
+                p.data = data
 
     def allocate_bucket_storage(
         self,
@@ -4022,10 +4058,6 @@ class AllGatherPipeline:
                     "but double buffers can support no more than 2 FSDP units."
                 )
 
-        # Do not release the buckets that are being all-gathered.
-        for bucket_id in ag_buckets:
-            self.bucket_can_be_released[self.get_bucket_key(bucket_id, bwd)] = False
-
         # If prefetch is enabled, we will add prefetch buckets to ag_buckets.
         if prefetch:
 
@@ -4094,6 +4126,11 @@ class AllGatherPipeline:
                 # Re-sort and find the next bucket not in the list.
                 ag_buckets = list(sorted(set(ag_buckets)))
                 bucket_id = next_bucket_id(ag_buckets)
+
+        # Do not release the buckets that are requested by this call, even if
+        # they are already ready and do not need a new all-gather.
+        for bucket_id in ag_buckets:
+            self.bucket_can_be_released[self.get_bucket_key(bucket_id, bwd)] = False
 
         # Only all-gather on buckets that have not been allocated yet or whose
         # persistent storage was preserved but is not ready for use.
