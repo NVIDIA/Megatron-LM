@@ -25,6 +25,8 @@ class MockGenerator(RolloutGenerator, GroupedRolloutGenerator):
         self.num_slow_calls = num_slow_calls
         self.same_reward_calls = set(same_reward_calls or [])
         self._call_count = 0
+        self._active_group_rollouts = 0
+        self.max_active_group_rollouts = 0
         self._active_rollouts = 0
         self.max_active_rollouts = 0
         self.submission_gate_seen = False
@@ -35,25 +37,34 @@ class MockGenerator(RolloutGenerator, GroupedRolloutGenerator):
     async def group_rollout(self, request, submission_gate=None):
         idx = self._call_count
         self._call_count += 1
-        if idx < self.num_slow_calls:
-            await asyncio.sleep(0.03)
-
-        async def make_rollout(rollout_idx):
-            if submission_gate is None:
-                return await self._make_rollout(idx, rollout_idx)
-            self.submission_gate_seen = True
-            async with submission_gate:
-                self._active_rollouts += 1
-                self.max_active_rollouts = max(self.max_active_rollouts, self._active_rollouts)
-                try:
-                    await asyncio.sleep(0)
-                    return await self._make_rollout(idx, rollout_idx)
-                finally:
-                    self._active_rollouts -= 1
-
-        return await asyncio.gather(
-            *[make_rollout(rollout_idx) for rollout_idx in range(request.rollouts_per_group)]
+        self._active_group_rollouts += 1
+        self.max_active_group_rollouts = max(
+            self.max_active_group_rollouts, self._active_group_rollouts
         )
+        try:
+            if idx < self.num_slow_calls:
+                await asyncio.sleep(0.03)
+
+            async def make_rollout(rollout_idx):
+                if submission_gate is None:
+                    return await self._make_rollout(idx, rollout_idx)
+                self.submission_gate_seen = True
+                async with submission_gate:
+                    self._active_rollouts += 1
+                    self.max_active_rollouts = max(
+                        self.max_active_rollouts, self._active_rollouts
+                    )
+                    try:
+                        await asyncio.sleep(0)
+                        return await self._make_rollout(idx, rollout_idx)
+                    finally:
+                        self._active_rollouts -= 1
+
+            return await asyncio.gather(
+                *[make_rollout(rollout_idx) for rollout_idx in range(request.rollouts_per_group)]
+            )
+        finally:
+            self._active_group_rollouts -= 1
 
     async def _make_rollout(self, call_idx, rollout_idx):
         if call_idx in self.same_reward_calls:
@@ -105,6 +116,36 @@ class TestGroupedRollouts:
                 id="batched_submission_order",
             ),
             pytest.param(
+                {
+                    "num_slow_calls": 100,
+                    "streaming": True,
+                    "num_groups": 2,
+                    "parallel_generation_tasks": 1,
+                    "submission_granularity": RLRolloutGranularity.BATCH,
+                    "consumption_granularity": RLRolloutGranularity.BATCH,
+                    "expected_count": 4,
+                    "expected_batch_ids": [0, 0, 1, 1],
+                    "expected_index_in_batch": [0, 1, 0, 1],
+                    "expected_max_active_group_rollouts": 2,
+                },
+                id="batch_submit_uses_batch_slots",
+            ),
+            pytest.param(
+                {
+                    "num_slow_calls": 100,
+                    "streaming": True,
+                    "num_groups": 1,
+                    "parallel_generation_tasks": 3,
+                    "submission_granularity": RLRolloutGranularity.GROUP,
+                    "consumption_granularity": RLRolloutGranularity.BATCH,
+                    "expected_count": 3,
+                    "expected_batch_ids": [0, 1, 2],
+                    "expected_index_in_batch": [0, 0, 0],
+                    "expected_max_active_group_rollouts": 3,
+                },
+                id="group_submit_uses_group_slots",
+            ),
+            pytest.param(
                 {"num_slow_calls": 0, "streaming": True, "num_groups": 1, "expected_count": 10},
                 id="streaming",
             ),
@@ -139,12 +180,12 @@ class TestGroupedRollouts:
                     "streaming": True,
                     "num_groups": 1,
                     "rollouts_per_group": 2,
-                    "parallel_generation_tasks": 2,
+                    "parallel_generation_tasks": 3,
                     "expected_count": 2,
                     "submission_granularity": RLRolloutGranularity.ROLLOUT,
                     "consumption_granularity": RLRolloutGranularity.BATCH,
                     "expected_submission_gate_seen": True,
-                    "expected_max_active_rollouts": 2,
+                    "expected_max_active_rollouts": 3,
                 },
                 id="rollout_submit_uses_rollout_slots",
             ),
@@ -153,7 +194,7 @@ class TestGroupedRollouts:
                     "streaming": True,
                     "num_groups": 1,
                     "rollouts_per_group": 2,
-                    "parallel_generation_tasks": 2,
+                    "parallel_generation_tasks": 1,
                     "expected_count": 1,
                     "filter_groups_with_same_reward": True,
                     "submission_granularity": RLRolloutGranularity.ROLLOUT,
@@ -218,6 +259,8 @@ class TestGroupedRollouts:
             ]
         if "expected_submission_gate_seen" in case:
             assert gen.submission_gate_seen is case["expected_submission_gate_seen"]
+        if "expected_max_active_group_rollouts" in case:
+            assert gen.max_active_group_rollouts == case["expected_max_active_group_rollouts"]
         if "expected_max_active_rollouts" in case:
             assert gen.max_active_rollouts == case["expected_max_active_rollouts"]
 
@@ -262,3 +305,29 @@ class TestGroupedRollouts:
             assert sub_req.streaming == request.streaming
             assert sub_req.submission_granularity == request.submission_granularity
             assert sub_req.consumption_granularity == request.consumption_granularity
+
+    @pytest.mark.asyncio
+    async def test_weighted_multi_task_batch_submission_keeps_batch_slots(self):
+        configs = [
+            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "a"}, weight=3.0),
+            AgentConfig(agent_type=MockGenerator, agent_args={"env_id": "b"}, weight=1.0),
+        ]
+        mt = WeightedMultiTask(configs)
+        mt.parallel_generation_tasks = 1
+
+        request = GroupedRolloutRequest(
+            num_groups=4,
+            rollouts_per_group=1,
+            inference_interface=MagicMock(spec=ReturnsRaw),
+            streaming=False,
+            submission_granularity=RLRolloutGranularity.BATCH,
+            consumption_granularity=RLRolloutGranularity.BATCH,
+        )
+        groups = []
+        async for group in mt.get_grouped_rollouts(request):
+            groups.append(group)
+
+        assert len(groups) == 4
+        assert [agent.parallel_generation_tasks for agent in mt.agents] == [1, 1]
+        env_ids = [g[0].env_id for g in groups]
+        assert sorted(env_ids) == ["a", "a", "a", "b"]

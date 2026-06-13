@@ -1,7 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
-import logging
 from abc import ABC, abstractmethod
 from typing import Generic, TypeVar
 
@@ -232,34 +231,12 @@ class GroupedRolloutGenerator(Agent, ABC):
         )
         submitted_groups = 0
 
-        # num_groups controls how many groups each worker submits together. When
-        # it is 1, groups are submitted eagerly and independently. If batch
-        # consumption is enabled, completion-order results are buffered and
-        # yielded in original submission order.
+        # num_groups controls how many groups each generation task submits together.
         groups_per_worker = request.num_groups
         if groups_per_worker > 1:
             assert not request.filter_groups_with_same_reward, \
                 "Cannot use filter_groups_with_same_reward with num_groups > 1."
-        if submit_at_rollout_granularity:
-            rollout_slots_per_worker = groups_per_worker * request.rollouts_per_group
-            num_workers = (
-                self.parallel_generation_tasks + rollout_slots_per_worker - 1
-            ) // rollout_slots_per_worker
-            if not request.filter_groups_with_same_reward:
-                num_workers += 1
-            submission_gate = asyncio.Semaphore(self.parallel_generation_tasks)
-        else:
-            assert self.parallel_generation_tasks >= groups_per_worker, \
-                f"{self.parallel_generation_tasks=} must be >= {groups_per_worker=}"
-            num_workers = self.parallel_generation_tasks // groups_per_worker
-            unused = self.parallel_generation_tasks % groups_per_worker
-            if unused:
-                logging.warning(
-                    f"parallel_generation_tasks ({self.parallel_generation_tasks}) is not "
-                    f"divisible by num_groups ({groups_per_worker}); "
-                    f"{unused} generation task(s) will be unused."
-                )
-            submission_gate = asyncio.Semaphore(num_workers)
+        submission_gate = asyncio.Semaphore(self.parallel_generation_tasks)
 
         async def generate_and_enqueue(batch_id, index_in_batch):
             group = await self.group_rollout(
@@ -298,7 +275,10 @@ class GroupedRolloutGenerator(Agent, ABC):
                         if not submit_at_rollout_granularity:
                             submission_gate.release()
 
-        tasks = [asyncio.create_task(generate_task()) for _ in range(num_workers)]
+        tasks = [
+            asyncio.create_task(generate_task())
+            for _ in range(self.parallel_generation_tasks)
+        ]
 
         async def shutdown_queue_when_done():
             """Wait for all workers to finish, then shut down the queue."""

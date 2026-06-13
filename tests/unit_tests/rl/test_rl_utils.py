@@ -217,7 +217,7 @@ class TestRLUtils:
                     "rl_submission_granularity": RLRolloutGranularity.BATCH,
                     "rl_consumption_granularity": RLRolloutGranularity.BATCH,
                 },
-                8,
+                1,
                 id="batch-submit-batch-consume",
             ),
             pytest.param(
@@ -265,7 +265,7 @@ class TestRLUtils:
                     "grpo_prompts_per_step": 8,
                 },
                 {"rl_generation_lag": 2},
-                24,
+                3,
                 id="generation-lag-batch-slots",
             ),
             pytest.param(
