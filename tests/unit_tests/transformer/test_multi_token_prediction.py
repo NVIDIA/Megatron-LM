@@ -933,6 +933,65 @@ class TestMultiTokenPrediction:
         assert not called['value']
         assert torch.equal(out, torch.chunk(hidden_states, 2, dim=0)[0])
 
+    def test_process_mtp_loss_accepts_presplit_hidden_states(self, monkeypatch):
+        config = TransformerConfig(
+            hidden_size=8, num_layers=2, num_attention_heads=2, mtp_num_layers=1
+        )
+        decoder_hidden = torch.ones(1, 1, 4)
+        mtp_hidden = torch.full((1, 1, 4), 2.0)
+        labels = torch.tensor([[1, 2, 3, 4]], dtype=torch.long)
+        seen = {'hidden': None}
+
+        def forbidden_chunk(*_args, **_kwargs):
+            raise AssertionError("pre-split MTP hidden states should not be chunked")
+
+        def output_layer(hidden, weight=None, runtime_gather_output=None):
+            seen['hidden'] = hidden
+            return torch.ones_like(hidden), None
+
+        def compute_language_model_loss(mtp_labels, mtp_logits):
+            return torch.ones_like(mtp_labels, dtype=mtp_logits.dtype)
+
+        monkeypatch.setattr(torch, "chunk", forbidden_chunk)
+
+        out = process_mtp_loss(
+            hidden_states=[decoder_hidden, mtp_hidden],
+            labels=labels,
+            loss_mask=None,
+            output_layer=output_layer,
+            output_weight=None,
+            runtime_gather_output=None,
+            is_training=False,
+            compute_language_model_loss=compute_language_model_loss,
+            config=config,
+            cp_group=None,
+            packed_seq_params=None,
+        )
+
+        assert seen['hidden'] is mtp_hidden
+        assert torch.equal(out, decoder_hidden)
+
+    def test_process_mtp_loss_validates_presplit_hidden_state_count(self):
+        config = TransformerConfig(
+            hidden_size=8, num_layers=2, num_attention_heads=2, mtp_num_layers=1
+        )
+
+        with pytest.raises(ValueError, match="must contain 2 tensors"):
+            process_mtp_loss(
+                hidden_states=[torch.ones(1, 1, 4)],
+                labels=None,
+                loss_mask=None,
+                output_layer=lambda hidden, weight=None, runtime_gather_output=None: (hidden, None),
+                output_weight=None,
+                runtime_gather_output=None,
+                is_training=False,
+                compute_language_model_loss=lambda labels, logits: torch.ones_like(logits),
+                config=config,
+                cp_group=None,
+                packed_seq_params=None,
+                input_ids=None,
+            )
+
     def test_process_mtp_loss_derives_labels_from_input_ids(self):
         """When labels is None (RL), labels are derived from input_ids by rolling left.
 
