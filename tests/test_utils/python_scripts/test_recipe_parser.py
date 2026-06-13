@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import prepare_jet_sqsh_image
 import recipe_parser
 
 SMOKE_TEST_CASE = "gpt3_mcore_te_tp1_pp1_te_4experts_groupedGEMM_op_fuser"
@@ -64,3 +65,17 @@ def test_resolve_local_image_prepare_cluster_uses_same_site_cpu_cluster():
     assert recipe_parser.resolve_local_image_prepare_cluster("dgxh100_coreweave") == "cpu_coreweave"
     assert recipe_parser.resolve_local_image_prepare_cluster("dgxgb200_oci-hsg") == "cpu_oci-hsg"
     assert recipe_parser.resolve_local_image_prepare_cluster("cpu_coreweave") == "cpu_coreweave"
+
+
+def test_prepare_workload_uses_image_source_without_build():
+    workload = prepare_jet_sqsh_image.build_prepare_workload(
+        source_image="gitlab-master.nvidia.com/adlr/megatron-lm/mcore_ci_dev:12345",
+        local_path="/lustre/enroot/mcore-pyt-dev-dgx_h100-12345.sqsh",
+        time_limit=1800,
+    )
+
+    spec = workload["spec"]
+    assert "build" not in spec
+    assert spec["image_source"] == {
+        "image_tag": "gitlab-master.nvidia.com/adlr/megatron-lm/mcore_ci_dev:12345"
+    }

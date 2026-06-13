@@ -5,13 +5,14 @@ import logging
 import os
 import sys
 import time
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import click
-import jetclient
-from jetclient.services.dtos.pipeline import PipelineStatus
 
-from tests.test_utils.python_scripts import launch_jet_workload, recipe_parser
+try:
+    from tests.test_utils.python_scripts import recipe_parser
+except ModuleNotFoundError:
+    import recipe_parser
 
 logging.basicConfig()
 logger = logging.getLogger(__name__)
@@ -23,9 +24,7 @@ def _local_image_workload_name(source_image: str, local_path: str) -> str:
     return f"prepare-sqsh-{digest}"
 
 
-def build_prepare_workload(
-    build: str, source_image: str, local_path: str, time_limit: int
-) -> Dict:
+def build_prepare_workload(source_image: str, local_path: str, time_limit: int) -> Dict:
     workload_name = _local_image_workload_name(source_image=source_image, local_path=local_path)
     return {
         "type": "basic",
@@ -34,7 +33,6 @@ def build_prepare_workload(
         "loggers": ["stdout"],
         "spec": {
             "name": workload_name,
-            "build": build,
             "image_source": {"image_tag": source_image},
             "nodes": 1,
             "gpus": 0,
@@ -51,14 +49,16 @@ def build_prepare_workload(
 
 
 def submit_prepare_workload(
-    build: str,
     source_image: str,
     local_path: str,
     cluster: str,
     account: str,
     partition: Optional[str],
     time_limit: int,
-) -> jetclient.JETPipeline:
+) -> Any:
+    import jetclient
+    from jetclient.services.dtos.pipeline import PipelineStatus
+
     cluster_config = {"account": account, "srun_additional_flags": {"container_save": local_path}}
     if partition is not None:
         cluster_config["partition"] = partition
@@ -72,7 +72,6 @@ def submit_prepare_workload(
                 workloads=[
                     jetclient.JETWorkloadManifest(
                         **build_prepare_workload(
-                            build=build,
                             source_image=source_image,
                             local_path=local_path,
                             time_limit=time_limit,
@@ -109,7 +108,11 @@ def submit_prepare_workload(
 
         if pipeline.get_status() == PipelineStatus.SUBMISSION_FAILED:
             n_submission_attempts += 1
-            logger.info("Submission failed, attempt again (%s/3)", str(n_submission_attempts))
+            logger.info(
+                "Submission failed for pipeline %s, attempt again (%s/3)",
+                pipeline.jet_id,
+                str(n_submission_attempts),
+            )
             continue
 
         return pipeline
@@ -127,9 +130,16 @@ def prepare_local_image(
     partition: Optional[str],
     time_limit: int,
 ) -> bool:
-    logger.info("Preparing %s from %s on %s", local_path, source_image, cluster)
+    import jetclient
+    from jetclient.services.dtos.pipeline import PipelineStatus
+
+    try:
+        from tests.test_utils.python_scripts import launch_jet_workload
+    except ModuleNotFoundError:
+        import launch_jet_workload
+
+    logger.info("Preparing %s for %s from %s on %s", local_path, build, source_image, cluster)
     pipeline = submit_prepare_workload(
-        build=build,
         source_image=source_image,
         local_path=local_path,
         cluster=cluster,
