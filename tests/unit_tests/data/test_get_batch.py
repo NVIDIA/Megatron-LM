@@ -341,6 +341,105 @@ def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.parametrize("tp_size", [1, 2, 4])
+@pytest.mark.parametrize("pp_size", [1, 2, 4])
+@pytest.mark.parametrize("seq_length", [1024])
+def test_pack_sequences_batch(tp_size, pp_size, seq_length):
+    if tp_size * pp_size > torch.cuda.device_count():
+        pytest.skip(
+            f"Skipping test because tp_size * pp_size > torch.cuda.device_count() "
+            f"({tp_size * pp_size} > {torch.cuda.device_count()})"
+        )
+
+    global_batch_size = int(os.environ.get("WORLD_SIZE", 1)) // (tp_size * pp_size)
+    args = initialize_test_environment(
+        tp_size,
+        pp_size,
+        1,
+        seq_length,
+        micro_batch_size=1,
+        global_batch_size=global_batch_size,
+        sft=False,
+    )
+    args.dataloader_pack_sequences = True
+
+    data_iterator = None
+    if mpu.get_tensor_model_parallel_rank() == 0:
+        data_iterator, _ = create_sft_data_iterator(seq_length)
+
+    (
+        attention_mask,
+        cu_seqlens,
+        cu_seqlens_padded,
+        hybrid_cp_group,
+        labels,
+        local_cp_size,
+        loss_mask,
+        max_seqlen,
+        position_ids,
+        tokens,
+    ) = get_batch(data_iterator)
+
+    is_first = mpu.is_pipeline_first_stage()
+    is_last = mpu.is_pipeline_last_stage()
+
+    if pp_size == 1:
+        assert tokens is not None
+        assert labels is not None
+        assert loss_mask is not None
+        assert position_ids is not None
+        assert cu_seqlens is not None
+        assert max_seqlen is not None
+        assert attention_mask is None
+
+        assert cu_seqlens.dim() == 2
+        assert cu_seqlens.shape[0] == 1
+        assert cu_seqlens.dtype == torch.int32
+        assert cu_seqlens[0, 0].item() == 0
+        assert cu_seqlens[0, -1].item() == seq_length
+        assert cu_seqlens.shape[1] >= 2
+
+        assert max_seqlen.shape == (1,)
+        assert max_seqlen.dtype == torch.int32
+        assert 0 < max_seqlen.item() <= seq_length
+
+    elif is_first:
+        assert tokens is not None
+        assert position_ids is not None
+        assert labels is None
+        assert loss_mask is None
+        assert cu_seqlens is not None
+        assert max_seqlen is not None
+
+        assert cu_seqlens.dim() == 2
+        assert cu_seqlens.dtype == torch.int32
+        assert cu_seqlens[0, 0].item() == 0
+        assert cu_seqlens[0, -1].item() == seq_length
+
+    elif is_last:
+        assert labels is not None
+        assert loss_mask is not None
+        assert tokens is None
+        assert position_ids is None
+        assert cu_seqlens is not None
+        assert max_seqlen is not None
+
+        assert cu_seqlens.dim() == 2
+        assert cu_seqlens.dtype == torch.int32
+        assert cu_seqlens[0, 0].item() == 0
+        assert cu_seqlens[0, -1].item() == seq_length
+
+    else:
+        assert tokens is None
+        assert labels is None
+        assert loss_mask is None
+        assert position_ids is None
+        assert cu_seqlens is not None
+        assert max_seqlen is not None
+
+    Utils.destroy_model_parallel()
+
+
 def create_pretrain_data_iterator(
     seq_length: int = 1024, micro_batch_size: int = 1, create_attention_mask: bool = False
 ):

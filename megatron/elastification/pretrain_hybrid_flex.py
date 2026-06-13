@@ -177,6 +177,7 @@ def get_batch(data_iterator, vp_stage=None):
     cp_size = args.context_parallel_size
     tp_rank = mpu.get_tensor_model_parallel_rank()
     is_sft = args.sft
+    is_packed = is_sft or getattr(args, 'dataloader_pack_sequences', False)
     is_hybrid_cp = args.hybrid_context_parallel
     mtp_on_this_rank = mtp_on_this_rank_func(
         layout=config.pipeline_model_parallel_layout,
@@ -185,7 +186,7 @@ def get_batch(data_iterator, vp_stage=None):
         vp_stage=vp_stage,
     )
 
-    if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank and not is_sft:
+    if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank and not is_packed:
         return None, None, None, None, None, None, None
 
     batch = {}
@@ -202,7 +203,7 @@ def get_batch(data_iterator, vp_stage=None):
         batch,
         broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(),
         broadcast_group=mpu.get_tensor_model_parallel_group(),
-        is_sft=is_sft,
+        is_packed=is_packed,
         is_hybrid_cp=is_hybrid_cp,
         create_attention_mask_in_dataloader=args.create_attention_mask_in_dataloader,
         cp_size=cp_size,
@@ -218,7 +219,7 @@ def get_batch(data_iterator, vp_stage=None):
     # Intermediate PP stage under SFT only needs THD metadata (matches the
     # pretrain_hybrid.py PP-SFT shortcut, collapsed to the flex 7-tuple shape).
     if not is_first_or_last_pipeline_stage(vp_stage) and not mtp_on_this_rank:
-        assert is_sft
+        assert is_packed
         return None, None, None, None, None, batch['cu_seqlens'], batch['max_seqlen']
 
     batch = get_batch_on_this_cp_rank(

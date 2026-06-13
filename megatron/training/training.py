@@ -2143,7 +2143,7 @@ def dummy_train_step(data_iterator):
     """Single dummy training step."""
     args = get_args()
     tp_rank = mpu.get_tensor_model_parallel_rank()
-    is_sft = getattr(args, 'sft', False)
+    is_packed = getattr(args, 'sft', False) or getattr(args, 'dataloader_pack_sequences', False)
     is_hybrid_cp = args.hybrid_context_parallel
 
     BATCH_KEYS = [
@@ -2166,7 +2166,7 @@ def dummy_train_step(data_iterator):
                 batch,
                 broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(),
                 broadcast_group=mpu.get_tensor_model_parallel_group(),
-                is_sft=is_sft,
+                is_packed=is_packed,
                 is_hybrid_cp=is_hybrid_cp,
                 create_attention_mask_in_dataloader=args.create_attention_mask_in_dataloader,
                 cp_size=args.context_parallel_size,
