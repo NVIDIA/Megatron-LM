@@ -106,7 +106,7 @@ class TorchSampling(Sampling):
         """Bucket active requests by `(temperature, top_k, top_p)` and sample each bucket.
 
         Args:
-            logits: Logits tensor of shape `[>=n, vocab_size]`.
+            logits: Logits tensor of shape `[1, >=n, vocab_size]`
             n: Number of rows to sample.
             context: The active DynamicInferenceContext.
             gather_indices: When set, sample from `logits[gather_indices[:n], :]`.
@@ -139,7 +139,9 @@ class TorchSampling(Sampling):
         ]
 
         if gather_indices is not None:
-            logits = logits[gather_indices[:n], :]
+            logits = logits[0, gather_indices[:n], :]
+        else:
+            logits = logits[0]
 
         output = torch.empty(n, device=logits.device, dtype=torch.int64)
         token_list = []
