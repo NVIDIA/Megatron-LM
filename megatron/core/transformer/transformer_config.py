@@ -881,9 +881,11 @@ class TransformerConfig(ModelParallelConfig):
     advanced fused kernels."""
 
     moe_expert_rank_capacity_factor: Optional[float] = None
-    """moe_expert_rank_capacity_factor (float): The capacity factor for each expert rank. Tokens 
-    exceeding this budget will be dropped. None means no token will be dropped. 
-    The default is None."""
+    """moe_expert_rank_capacity_factor (float): The capacity factor for each expert rank.
+    When set for HybridEP, this provides a bounded permuted-token workspace to avoid dispatch
+    shape synchronization. If the dynamic routing result exceeds the budget, overflow is detected
+    and the training/eval wrapper reruns the step without the bound. None means unbounded
+    dropless dispatch. The default is None."""
 
     ##################
     # Context Parallel
@@ -1520,11 +1522,6 @@ class TransformerConfig(ModelParallelConfig):
                 )
 
         if self.moe_expert_rank_capacity_factor is not None:
-            if not self.use_transformer_engine_op_fuser:
-                raise ValueError(
-                    "moe_expert_rank_capacity_factor requires use_transformer_engine_op_fuser to "
-                    "be enabled."
-                )
             if self.moe_flex_dispatcher_backend != "hybridep":
                 raise ValueError(
                     "moe_expert_rank_capacity_factor requires moe_flex_dispatcher_backend to be "

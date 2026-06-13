@@ -186,6 +186,14 @@ class SharedExpertMLP(MLP):
                 self.__class__.stream = torch.cuda.Stream()
             self.stream = self.__class__.stream
 
+    def reset_parameters(self):
+        """Reset direct shared-expert parameters for meta-device initialization."""
+        if self.use_shared_expert_gate and self.gate_weight is not None:
+            if self.config.perform_initialization:
+                self.config.init_method(self.gate_weight)
+            self.gate_weight.data = self.gate_weight.data.to(dtype=self.config.params_dtype)
+            setattr(self.gate_weight, 'sequence_parallel', self.config.sequence_parallel)
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Forward function"""
         output, _ = super().forward(hidden_states)

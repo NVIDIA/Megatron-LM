@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import dataclasses
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -9,9 +10,31 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodu
 from megatron.core.parallel_state import get_tensor_model_parallel_world_size
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
+from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
+
+
+def test_shared_expert_reset_parameters_initializes_direct_gate_weight():
+    module = SharedExpertMLP.__new__(SharedExpertMLP)
+    torch.nn.Module.__init__(module)
+    module.use_shared_expert_gate = True
+    module.gate_weight = torch.nn.Parameter(torch.empty((1, 4), dtype=torch.float32))
+    module.config = SimpleNamespace(
+        perform_initialization=True,
+        init_method=lambda weight: torch.nn.init.constant_(weight, 0.25),
+        params_dtype=torch.bfloat16,
+        sequence_parallel=True,
+    )
+
+    module.reset_parameters()
+
+    assert module.gate_weight.dtype == torch.bfloat16
+    assert module.gate_weight.sequence_parallel is True
+    torch.testing.assert_close(
+        module.gate_weight, torch.full((1, 4), 0.25, dtype=torch.bfloat16)
+    )
 
 
 class TestSharedExperts:

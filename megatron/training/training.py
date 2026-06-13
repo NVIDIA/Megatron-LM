@@ -3329,7 +3329,7 @@ def train(
             cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
             use_single_mempool=config.cuda_graph_use_single_mempool,
         )
-    # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
+    # Wrap forward_backward_func for bounded MoE workspace overflow handling.
     if args.moe_expert_rank_capacity_factor is not None:
         copy_main_params = args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather
         forward_backward_func = PagedStashRunner(
@@ -3894,7 +3894,7 @@ def evaluate(
             cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
             use_single_mempool=config.cuda_graph_use_single_mempool,
         )
-    # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
+    # Wrap forward_backward_func for bounded MoE workspace overflow handling.
     if args.moe_expert_rank_capacity_factor is not None:
         copy_main_params = args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather
         forward_backward_func = PagedStashRunner(
