@@ -881,8 +881,8 @@ class TransformerConfig(ModelParallelConfig):
     advanced fused kernels."""
 
     moe_expert_rank_capacity_factor: Optional[float] = None
-    """moe_expert_rank_capacity_factor (float): The capacity factor for each expert rank. Tokens 
-    exceeding this budget will be dropped. None means no token will be dropped. 
+    """moe_expert_rank_capacity_factor (float): The capacity factor for each expert rank. Tokens
+    exceeding this budget will be dropped. None means no token will be dropped.
     The default is None."""
 
     ##################
@@ -1143,6 +1143,21 @@ class TransformerConfig(ModelParallelConfig):
     """
     min_offloaded_tensor_size: int = 1024 * 1024
     """The minimum size of the tensor to be offloaded."""
+
+    delay_offload_until_cuda_graph: bool = False
+    """If True, delay the offload until the CUDA graph is executed for minimal CPU overhead.
+    For more details, see the documentation:
+    https://github.com/NVIDIA/Megatron-LM/blob/main/docs/user-guide/features/fine_grained_activation_offloading.md#cuda-graph-integration.
+    """
+
+    delta_offload_bytes_across_pp_ranks: int = 0
+    """Difference of offload bytes across PP ranks to balance the offload load.
+    For more details, see the documentation:
+    https://github.com/NVIDIA/Megatron-LM/blob/main/docs/user-guide/features/fine_grained_activation_offloading.md#tuning-parameters.
+    """
+
+    activation_offload_fraction: float = 1.0
+    """The fraction of the activation to be offloaded, which should be in range [0, 1]."""
 
     moe_paged_stash: bool = False
     """If True, enable paged stash for all routed-expert activations needed for backward"""
@@ -1697,6 +1712,25 @@ class TransformerConfig(ModelParallelConfig):
                     "because the input of attn_proj is the output of core_attn, "
                     "which is needed in core_attn.backward()."
                 )
+            if self.recompute_granularity == "selective" and "moe" in self.recompute_modules:
+                offload_inside_moe = {"moe_act", "expert_fc1"} & set(self.offload_modules)
+                assert not offload_inside_moe, (
+                    f"Cannot offload {offload_inside_moe} while recomputing the entire MoE layer. "
+                    f"'moe' in recompute_modules wraps the full MoE forward in a checkpoint, "
+                    f"so offloading activations inside it is redundant and will cause errors. "
+                    f"Either remove 'moe' from --recompute-modules or remove "
+                    f"{offload_inside_moe} from --offload-modules."
+                )
+            assert (
+                self.min_offloaded_tensor_size >= 0
+            ), "min_offloaded_tensor_size must be non-negative."
+            assert (
+                self.activation_offload_fraction >= 0 and self.activation_offload_fraction <= 1
+            ), "activation_offload_fraction must be in range [0, 1]."
+            assert (
+                self.delta_offload_bytes_across_pp_ranks >= 0
+            ), "delta_offload_bytes_across_pp_ranks must be non-negative."
+
         if self.moe_paged_stash:
             if self.cpu_offloading:
                 raise ValueError("moe_paged_stash cannot be enabled with cpu_offloading.")
@@ -2366,11 +2400,24 @@ class TransformerConfig(ModelParallelConfig):
                         )
 
             if self.fine_grained_activation_offloading:
-                assert self.cuda_graph_impl in ("transformer_engine", "full_iteration"), (
+                assert self.cuda_graph_impl in ("local", "transformer_engine", "full_iteration"), (
                     "fine-grained activation offloading is only supported with "
-                    "transformer_engine CUDA graph implementation or local CUDA graph "
-                    "implementation with full_iteration scope."
+                    "local, transformer_engine, or full_iteration CUDA graph implementations."
                 )
+                if self.cuda_graph_impl == "local":
+                    local_supported_offload_modules = {"expert_fc1", "moe_act"}
+                    unsupported_offload_modules = (
+                        set(self.offload_modules) - local_supported_offload_modules
+                    )
+                    assert not unsupported_offload_modules, (
+                        "fine-grained activation offloading with cuda_graph_impl='local' "
+                        "only supports offload_modules 'expert_fc1' and 'moe_act'. "
+                        f"Unsupported offload_modules: {sorted(unsupported_offload_modules)}."
+                    )
+                    assert self.cuda_graph_modules, (
+                        "fine-grained activation offloading with cuda_graph_impl='local' "
+                        "is not supported with whole-layer CUDA graph capture."
+                    )
                 assert (
                     CudaGraphModule.moe not in self.cuda_graph_modules
                 ), "Token-drop MoE is temporarily not supported with activation offloading."

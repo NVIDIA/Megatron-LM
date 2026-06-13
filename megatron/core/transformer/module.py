@@ -318,6 +318,18 @@ class GraphableMegatronModule(MegatronModule):
 
         cudagraph_kwargs = kwargs.copy()
         cudagraph_kwargs['is_first_microbatch'] = getattr(self, 'current_microbatch', 0) == 0
+        if self.config.fine_grained_activation_offloading and getattr(
+            self, 'offload_module_in_cuda_graph', False
+        ):
+            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+                FineGrainedActivationOffloadingInterface as off_interface,
+            )
+
+            # TE captures/replays the module on its own graph stream. Passing the
+            # offload stream/event in lets TE order graph compute with D2H/H2D
+            # transfers managed by the fine-grained offload manager.
+            cudagraph_kwargs['cuda_graph_stream'] = off_interface.cuda_graph_stream()
+            cudagraph_kwargs['cuda_graph_event'] = off_interface.cuda_graph_event()
         return cudagraph_args, cudagraph_kwargs
 
     def _should_call_local_cudagraph(self, *args, **kwargs):
