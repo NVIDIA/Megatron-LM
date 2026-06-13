@@ -53,6 +53,7 @@ def test_dump_optimizer_parameters_dtensor(distributed_setup, tmp_path: pathlib.
     assert p_sharded["local_shape"] == [4, 8]
     assert p_sharded["mesh_shape"] == [distributed_setup.world_size]
     assert p_sharded["mesh_dim_names"] == ["dp"]
+    assert p_sharded["mesh_ranks"] == list(range(distributed_setup.world_size))
     assert p_sharded["placements"] == ["Shard(dim=0)"]
     assert p_sharded["is_qkv"] is True
     assert p_sharded["dtype"].startswith("torch.float")
