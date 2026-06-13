@@ -141,6 +141,7 @@ from megatron.core.distributed import (
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
     FullyShardedDataParallel as megatron_FSDP,
 )
+from megatron.core.distributed.dump_parameters import dump_optimizer_parameters
 from megatron.core.fp8_utils import correct_amax_history_if_needed
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
@@ -2011,6 +2012,17 @@ def setup_model_and_optimizer(
             dump_param_to_param_group_map=args.dump_param_to_param_group_map,
         )
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
+
+        # Optional: dump per-rank optimizer parameter sharding for fixture capture.
+        # Gated by `DUMP_OPTIMIZER_PARAMETERS_OUTPUT` env var; each rank writes a
+        # JSON snapshot under that path. Optimizer-agnostic — fires regardless
+        # of optimizer class. See `megatron.core.distributed.dump_parameters` for the schema.
+        dump_path = os.environ.get("DUMP_OPTIMIZER_PARAMETERS_OUTPUT")
+        if dump_path:
+            # `MegatronOptimizer` wraps an inner `torch.optim.Optimizer` and
+            # exposes it at `.optimizer`. Unwrap so the helper receives a
+            # real `torch.optim.Optimizer` (matches its type signature).
+            dump_optimizer_parameters(optimizer.optimizer, dump_path)
 
     one_logger and one_logger.log_metrics({"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()})
 
