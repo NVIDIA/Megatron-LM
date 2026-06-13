@@ -46,6 +46,28 @@ class FakeRequests:
         return FakeResponse(201)
 
 
+class FakeSlackClient:
+    def __init__(self, users_by_email=None, usergroups=None):
+        self.users_by_email = users_by_email or {}
+        self.usergroups = usergroups if usergroups is not None else []
+        self.messages = []
+        self.usergroup_updates = []
+
+    def users_lookupByEmail(self, email):
+        if email not in self.users_by_email:
+            raise Exception("users_not_found")
+        return {"user": {"id": self.users_by_email[email]}}
+
+    def usergroups_list(self, include_users=True):
+        return {"usergroups": self.usergroups}
+
+    def usergroups_users_update(self, usergroup, users):
+        self.usergroup_updates.append({"usergroup": usergroup, "users": users})
+
+    def chat_postMessage(self, channel, text):
+        self.messages.append({"channel": channel, "text": text})
+
+
 @pytest.fixture
 def oncall_manager(monkeypatch):
     slack_module = types.ModuleType("slack_sdk")
@@ -65,6 +87,69 @@ def oncall_manager(monkeypatch):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_update_slack_usergroup_notifies_previous_oncall_when_new_oncall_lookup_fails(
+    oncall_manager, monkeypatch
+):
+    client = FakeSlackClient(users_by_email={"previous@nvidia.com": "UOLD"})
+    monkeypatch.setattr(oncall_manager, "get_slack_client", lambda: client)
+    monkeypatch.setattr(
+        oncall_manager,
+        "get_user_email",
+        lambda username: {
+            "new-oncall": "new-oncall@users.noreply.github.com",
+            "previous-oncall": "previous@nvidia.com",
+        }[username],
+    )
+
+    oncall_manager.update_slack_usergroup("new-oncall", ["previous-oncall"])
+
+    assert client.usergroup_updates == []
+    assert len(client.messages) == 1
+    assert client.messages[0]["channel"] == "UOLD"
+    assert "new-oncall@users.noreply.github.com" in client.messages[0]["text"]
+    assert "@mcore-oncall" in client.messages[0]["text"]
+    assert "You should still be in @mcore-oncall" in client.messages[0]["text"]
+
+
+def test_update_slack_usergroup_does_not_notify_fallback_when_previous_oncall_lookup_fails(
+    oncall_manager, monkeypatch
+):
+    client = FakeSlackClient(users_by_email={"fallback@nvidia.com": "UFALLBACK"})
+    monkeypatch.setattr(oncall_manager, "get_slack_client", lambda: client)
+    monkeypatch.setattr(
+        oncall_manager,
+        "get_user_email",
+        lambda username: {
+            "new-oncall": "new-oncall@users.noreply.github.com",
+            "previous-oncall": "previous-oncall@users.noreply.github.com",
+        }[username],
+    )
+
+    oncall_manager.update_slack_usergroup("new-oncall", ["previous-oncall"])
+
+    assert client.usergroup_updates == []
+    assert client.messages == []
+
+
+def test_update_slack_usergroup_updates_members_when_new_oncall_lookup_succeeds(
+    oncall_manager, monkeypatch
+):
+    client = FakeSlackClient(
+        users_by_email={"new-oncall@nvidia.com": "UNEW"},
+        usergroups=[{"handle": "mcore-oncall", "id": "S123", "users": ["UOLD"]}],
+    )
+    monkeypatch.setattr(oncall_manager, "get_slack_client", lambda: client)
+    monkeypatch.setattr(oncall_manager, "get_user_email", lambda username: "new-oncall@nvidia.com")
+
+    oncall_manager.update_slack_usergroup("new-oncall", ["previous-oncall"])
+
+    assert client.usergroup_updates == [
+        {"usergroup": "S123", "users": ["UOLD", "UNEW"]},
+        {"usergroup": "S123", "users": ["UNEW"]},
+    ]
+    assert client.messages == []
 
 
 @pytest.mark.parametrize(
