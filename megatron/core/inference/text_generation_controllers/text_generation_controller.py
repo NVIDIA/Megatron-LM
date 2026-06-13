@@ -131,6 +131,8 @@ class TextGenerationController:
 
         if self.inference_wrapped_model.inference_context.is_dynamic_batching():
             self._init_dynamic_sampling_tensors()
+            self._async_schedule_forward_primed = False
+            self._async_schedule_primed_cuda_graph_request_count = None
 
     def set_stop_word_finished_ids_callback(self, callback):
         """Set a callback to get request IDs that should be marked as finished due to stop words.
@@ -1600,8 +1602,8 @@ class TextGenerationController:
             sampled_mtp_tokens_cpu = None
         return sampled_tokens_cpu, sampled_mtp_tokens_cpu
 
-    def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
-        """Update the dynamic inference context after sampling.
+    def _dynamic_step_context_prepare_bookkeeping(self) -> Tuple[Dict, Dict[str, Tensor]]:
+        """Prepare request bookkeeping inputs and return data after sampling.
 
         Args:
             new_sample (Tensor): The newly sampled tokens.
@@ -1610,10 +1612,7 @@ class TextGenerationController:
                 metadata is retrieved from the context.
 
         Return:
-            Dict [str, Tensor]: A dictionary containing:
-                active_request_ids (Tensor): Current active request IDs.
-                newly_paused_request_ids (Tensor): Newly paused request IDs.
-                finished_request_ids (Tensor): Finished request IDs.
+            Tuple containing the prepared context update and request return data.
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
@@ -1677,13 +1676,12 @@ class TextGenerationController:
         new_sample_copy = sampled_tokens_cpu.clone()
         range_pop()
 
-        range_push("update_requests")
-        update_result = context.update_requests(
-            active_request_mask, new_sample_copy, sampled_mtp_tokens_cpu
-        )
-        range_pop()
-
-        return {
+        prepared_update = {
+            "active_requests_mask": active_request_mask,
+            "new_tokens": new_sample_copy,
+            "new_speculative_tokens": sampled_mtp_tokens_cpu,
+        }
+        request_bookkeeping = {
             "active_request_ids": active_request_ids,
             "finished_request_ids": finished_request_ids,
             # Already a CPU tensor (independent of _sampled_tokens_cuda via the
@@ -1692,8 +1690,214 @@ class TextGenerationController:
             # D2H sync when the engine later calls sample.tolist().
             "sample": sampled_tokens_cpu,
             "finished_routing_block_ids": finished_routing_block_ids,
+        }
+        return prepared_update, request_bookkeeping
+
+    def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
+        """Update the dynamic inference context after sampling."""
+        context = self.inference_wrapped_model.inference_context
+        prepared_update, request_bookkeeping = self._dynamic_step_context_prepare_bookkeeping()
+
+        range_push("update_requests")
+        update_result = context.update_requests_bookkeep(prepared_update)
+        if update_result is not None:
+            context.update_requests_prepare(**prepared_update)
+        range_pop()
+
+        return {
+            **request_bookkeeping,
             **(update_result or {}),
         }
+
+    def _dynamic_step_forward_for_async_scheduling(self) -> Optional[int]:
+        """Run one dynamic forward pass for the serial async-shaped path."""
+        context = self.inference_wrapped_model.inference_context
+        input_ids, position_ids = self._dynamic_step_context_init()
+
+        cuda_graph_request_count = (
+            context.padded_active_request_count if context.using_cuda_graph_this_step() else None
+        )
+
+        config = self.inference_wrapped_model.model.config
+        if config.moe_enable_routing_replay:
+            RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
+
+        range_push("forward_pass")
+        self._dynamic_step_forward_logits(input_ids, position_ids)
+
+        if context.is_hybrid_model and context.mamba_slot_allocator is not None:
+            context.mamba_slot_allocator.commit_intermediate_states()
+
+        context.kv_block_allocator.store_routing_per_block(self._router_record_bookkeeping())
+        range_pop()
+        return cuda_graph_request_count
+
+    def _async_scheduling_prepare_forward_bookkeep(
+        self, prepared_update: Dict, request_bookkeeping: Dict, *, run_forward: bool = True
+    ) -> Tuple[Dict, Dict[str, Optional[Tensor]]]:
+        """Run prepare(N+1) -> forward(N+1) -> bookkeep(N) serially."""
+        context = self.inference_wrapped_model.inference_context
+
+        range_push("update_requests_prepare")
+        prepared_update, request_bookkeeping = context.update_requests_prepare(
+            **prepared_update, request_bookkeeping=request_bookkeeping
+        )
+        range_pop()
+
+        active_requests_mask = prepared_update["active_requests_mask"]
+        assert active_requests_mask is not None
+        if (
+            not run_forward
+            or active_requests_mask.numel() == 0
+            or (active_requests_mask == 0).all()
+        ):
+            range_push("update_requests_bookkeep")
+            update_result = context.update_requests_bookkeep(prepared_update)
+            range_pop()
+            self._async_schedule_forward_primed = False
+            self._async_schedule_primed_cuda_graph_request_count = None
+            return request_bookkeeping, update_result or {}
+
+        self._async_schedule_primed_cuda_graph_request_count = (
+            self._dynamic_step_forward_for_async_scheduling()
+        )
+
+        range_push("update_requests_bookkeep")
+        update_result = context.update_requests_bookkeep(
+            prepared_update, delay_finished_compaction=True
+        )
+        range_pop()
+
+        self._async_schedule_forward_primed = True
+        return request_bookkeeping, update_result or {}
+
+    def _get_async_scheduling_fallback_reason(
+        self, prepared_update: Optional[Dict] = None
+    ) -> Optional[str]:
+        """Return why async-shaped scheduling must fall back, or None if eligible."""
+        context = self.inference_wrapped_model.inference_context
+        model_config = self.model_config
+        active_slice = slice(context.paused_request_count, context.total_request_count)
+        active_request_count = context.total_request_count - context.paused_request_count
+
+        if not context.config.enable_async_scheduling:
+            return "disabled"
+        if getattr(context, "async_scheduling_has_waiting_requests", False):
+            return "waiting_requests"
+        if getattr(context, "async_scheduling_has_stop_word_requests", False):
+            return "stop_words"
+        if self.num_speculative_tokens > 0:
+            return "speculative_tokens"
+        if getattr(model_config, "mtp_num_layers", None):
+            return "mtp_model"
+        if context.is_hybrid_model or getattr(model_config, "is_hybrid_model", False):
+            return "hybrid_or_mamba"
+        if getattr(model_config, "num_moe_experts", None) is not None:
+            return "moe"
+        if getattr(model_config, "expert_model_parallel_size", 1) > 1:
+            return "expert_parallel"
+        if context.expert_model_parallel_group is not None:
+            return "expert_parallel"
+        if context.paused_request_count != 0:
+            return "paused_requests"
+        if context.num_prefill_requests != 0:
+            return "prefill"
+        if context.is_chunked_prefill_enabled() or context.chunked_prefill_request_id != -1:
+            return "chunked_prefill"
+        if prepared_update is not None and prepared_update["new_speculative_tokens"] is not None:
+            return "speculative_tokens"
+        if active_request_count == 0:
+            return None
+        if context.request_metadata["return_log_probs"][active_slice].any().item():
+            return "log_probs"
+        if (context.request_metadata["top_n_logprobs"][active_slice] > 0).any().item():
+            return "top_n_logprobs"
+        if not (context.request_metadata["top_k"][active_slice] == 1).all().item():
+            return "non_greedy_sampling"
+        if (context.request_metadata["top_p"][active_slice] > 0.0).any().item():
+            return "non_greedy_sampling"
+
+        block_boundary_threshold = self.inference_wrapped_model.inference_context.block_size_tokens
+        block_boundary_threshold -= 1 + self.num_speculative_tokens
+        if (
+            context.request_last_kv_block_offset[active_slice] >= block_boundary_threshold
+        ).any().item():
+            return "kv_block_boundary"
+
+        return None
+
+    def _async_scheduling_sample_prepare_forward_bookkeep(self) -> Tuple[Dict, Dict]:
+        """Run sample(N) -> prepare(N+1) -> forward(N+1) -> bookkeep(N)."""
+        context = self.inference_wrapped_model.inference_context
+        range_push("sampling")
+        self._dynamic_step_sample_logits()
+        range_pop()
+        prepared_update, request_bookkeeping = self._dynamic_step_context_prepare_bookkeeping()
+
+        fallback_reason = self._get_async_scheduling_fallback_reason(prepared_update)
+        if fallback_reason is not None:
+            if context.has_async_finished_request_rows():
+                request_bookkeeping, update_result = self._async_scheduling_prepare_forward_bookkeep(
+                    prepared_update, request_bookkeeping, run_forward=False
+                )
+            else:
+                range_push("update_requests")
+                update_result = context.update_requests_bookkeep(prepared_update)
+                if update_result is not None:
+                    context.update_requests_prepare(**prepared_update)
+                range_pop()
+                self._async_schedule_forward_primed = False
+                self._async_schedule_primed_cuda_graph_request_count = None
+        else:
+            request_bookkeeping, update_result = self._async_scheduling_prepare_forward_bookkeep(
+                prepared_update, request_bookkeeping
+            )
+
+        return request_bookkeeping, update_result or {}
+
+    async def _try_async_generate_output_tokens_dynamic_batch(self) -> Optional[Dict]:
+        """Run one serial async-shaped dynamic decode step when the basic gate allows it."""
+        context = self.inference_wrapped_model.inference_context
+        active_request_count = context.total_request_count - context.paused_request_count
+
+        if (
+            not self._async_schedule_forward_primed
+            and self._get_async_scheduling_fallback_reason() is not None
+        ):
+            return None
+        if context.active_token_count == 0 and active_request_count == 0:
+            self._async_schedule_forward_primed = False
+            self._async_schedule_primed_cuda_graph_request_count = None
+            context.clear_async_finished_request_rows()
+            return None
+
+        with torch.inference_mode():
+            if not self._async_schedule_forward_primed:
+                self._async_schedule_primed_cuda_graph_request_count = (
+                    self._dynamic_step_forward_for_async_scheduling()
+                )
+                self._async_schedule_forward_primed = True
+
+        await asyncio.sleep(0)
+
+        with torch.inference_mode():
+            return_log_probs, return_top_n_logprobs = self._dynamic_step_log_probs_bookkeeping()
+            assert not return_log_probs and not return_top_n_logprobs
+
+            cuda_graph_request_count = self._async_schedule_primed_cuda_graph_request_count
+            request_bookkeeping, update_result = (
+                self._async_scheduling_sample_prepare_forward_bookkeep()
+            )
+
+            ret = {
+                "accepted_tokens": None,
+                "log_probs": None,
+                "top_n_logprobs": None,
+                "cuda_graph_request_count": cuda_graph_request_count,
+            }
+            ret.update(request_bookkeeping)
+            ret.update(update_result or {})
+            return ret
 
     async def async_generate_output_tokens_dynamic_batch(
         self, skip_bookkeeping: Optional[bool] = False
@@ -1714,6 +1918,11 @@ class TextGenerationController:
         """
         context = self.inference_wrapped_model.inference_context
         active_request_count = context.total_request_count - context.paused_request_count
+
+        if not skip_bookkeeping:
+            async_result = await self._try_async_generate_output_tokens_dynamic_batch()
+            if async_result is not None:
+                return async_result
 
         # No tokens and no active requests?
         if context.active_token_count == 0 and active_request_count == 0:

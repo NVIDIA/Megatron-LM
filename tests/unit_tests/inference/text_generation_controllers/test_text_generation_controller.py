@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
+import inspect
 import os
 import random
 import string
@@ -16,7 +17,9 @@ from transformer_engine.pytorch.fp8 import check_fp8_support
 from megatron.core import parallel_state
 from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
 from megatron.core.inference.contexts import DynamicInferenceContext, StaticInferenceContext
-from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
+from megatron.core.inference.contexts.dynamic_context import (
+    MaxSequenceLengthOverflowError,
+)
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
     InferenceRequest,
@@ -185,6 +188,360 @@ class TextGenerationControllerTestBase:
         # Mirror what StaticInferenceEngine/DynamicInferenceEngine do at engine start:
         # the model is being driven by an inference workload, so InferenceMode is active.
         InferenceMode.set_active()
+
+
+class TestAsyncSchedulingControllerHelpers:
+    def _make_async_eligibility_controller(self):
+        controller = object.__new__(TextGenerationController)
+        context = mock.Mock()
+        context.config.enable_async_scheduling = True
+        context.async_scheduling_has_waiting_requests = False
+        context.async_scheduling_has_stop_word_requests = False
+        context.total_request_count = 2
+        context.paused_request_count = 0
+        context.num_prefill_requests = 0
+        context.is_hybrid_model = False
+        context.expert_model_parallel_group = None
+        context.chunked_prefill_request_id = -1
+        context.is_chunked_prefill_enabled.return_value = False
+        context.pending_async_finished_rows.return_value = None
+        context.has_async_finished_request_rows.return_value = False
+        context.block_size_tokens = 128
+        context.request_last_kv_block_offset = torch.tensor([1, 2], device='cpu')
+        context.request_metadata = {
+            "temperature": torch.tensor([1.0, 1.0], device='cpu'),
+            "top_k": torch.tensor([1, 1], dtype=torch.int32, device='cpu'),
+            "top_p": torch.tensor([0.0, 0.0], device='cpu'),
+            "return_log_probs": torch.tensor([False, False], device='cpu'),
+            "top_n_logprobs": torch.tensor([0, 0], dtype=torch.int32, device='cpu'),
+        }
+
+        model_config = mock.Mock()
+        model_config.mtp_num_layers = None
+        model_config.is_hybrid_model = False
+        model_config.num_moe_experts = None
+        model_config.expert_model_parallel_size = 1
+
+        controller.inference_wrapped_model = mock.Mock(inference_context=context)
+        controller.model_config = model_config
+        controller.num_speculative_tokens = 0
+        return controller, context, model_config
+
+    def test_async_scheduling_eligibility_allows_dense_greedy_decode(self):
+        controller, _, _ = self._make_async_eligibility_controller()
+
+        assert controller._get_async_scheduling_fallback_reason() is None
+
+    @pytest.mark.parametrize(
+        ("reason", "mutator"),
+        [
+            (
+                "disabled",
+                lambda _controller, context, _model_config: setattr(
+                    context.config, "enable_async_scheduling", False
+                ),
+            ),
+            (
+                "waiting_requests",
+                lambda _controller, context, _model_config: setattr(
+                    context, "async_scheduling_has_waiting_requests", True
+                ),
+            ),
+            (
+                "stop_words",
+                lambda _controller, context, _model_config: setattr(
+                    context, "async_scheduling_has_stop_word_requests", True
+                ),
+            ),
+            (
+                "speculative_tokens",
+                lambda controller, _context, _model_config: setattr(
+                    controller, "num_speculative_tokens", 1
+                ),
+            ),
+            (
+                "mtp_model",
+                lambda _controller, _context, model_config: setattr(
+                    model_config, "mtp_num_layers", 1
+                ),
+            ),
+            (
+                "hybrid_or_mamba",
+                lambda _controller, context, _model_config: setattr(
+                    context, "is_hybrid_model", True
+                ),
+            ),
+            (
+                "moe",
+                lambda _controller, _context, model_config: setattr(
+                    model_config, "num_moe_experts", 8
+                ),
+            ),
+            (
+                "expert_parallel",
+                lambda _controller, _context, model_config: setattr(
+                    model_config, "expert_model_parallel_size", 2
+                ),
+            ),
+            (
+                "paused_requests",
+                lambda _controller, context, _model_config: setattr(
+                    context, "paused_request_count", 1
+                ),
+            ),
+            (
+                "prefill",
+                lambda _controller, context, _model_config: setattr(
+                    context, "num_prefill_requests", 1
+                ),
+            ),
+            (
+                "chunked_prefill",
+                lambda _controller, context, _model_config: setattr(
+                    context.is_chunked_prefill_enabled, "return_value", True
+                ),
+            ),
+            (
+                "log_probs",
+                lambda _controller, context, _model_config: context.request_metadata[
+                    "return_log_probs"
+                ].fill_(True),
+            ),
+            (
+                "top_n_logprobs",
+                lambda _controller, context, _model_config: context.request_metadata[
+                    "top_n_logprobs"
+                ].fill_(1),
+            ),
+            (
+                "non_greedy_sampling",
+                lambda _controller, context, _model_config: context.request_metadata[
+                    "top_k"
+                ].fill_(0),
+            ),
+            (
+                "non_greedy_sampling",
+                lambda _controller, context, _model_config: context.request_metadata[
+                    "top_p"
+                ].fill_(0.5),
+            ),
+            (
+                "kv_block_boundary",
+                lambda _controller, context, _model_config: context.request_last_kv_block_offset.fill_(
+                    127
+                ),
+            ),
+        ],
+    )
+    def test_async_scheduling_fallback_reasons(self, reason, mutator):
+        controller, context, model_config = self._make_async_eligibility_controller()
+        mutator(controller, context, model_config)
+
+        assert controller._get_async_scheduling_fallback_reason() == reason
+
+    def test_async_scheduling_fallback_for_speculative_prepared_update(self):
+        controller, _, _ = self._make_async_eligibility_controller()
+        prepared_update = {
+            "active_requests_mask": torch.tensor([1, 1], device='cpu'),
+            "new_tokens": torch.tensor([10, 11], device='cpu'),
+            "new_speculative_tokens": torch.tensor([[12, 13]], device='cpu'),
+        }
+
+        assert (
+            controller._get_async_scheduling_fallback_reason(prepared_update)
+            == "speculative_tokens"
+        )
+
+    def test_async_scheduling_prepare_uses_context_adjusted_bookkeeping(self):
+        controller, context, _ = self._make_async_eligibility_controller()
+        prepared_update = {
+            "active_requests_mask": torch.tensor([0, 1], device='cpu'),
+            "new_tokens": torch.tensor([100, 101], device='cpu'),
+            "new_speculative_tokens": None,
+        }
+        request_bookkeeping = {
+            "active_request_ids": torch.tensor([10, 11], device='cpu'),
+            "sample": torch.tensor([100, 101], device='cpu'),
+            "finished_request_ids": torch.tensor([10], device='cpu'),
+        }
+        filtered_update = {
+            "active_requests_mask": torch.tensor([1], device='cpu'),
+            "new_tokens": torch.tensor([101], device='cpu'),
+            "new_speculative_tokens": None,
+        }
+        filtered_bookkeeping = {
+            "active_request_ids": torch.tensor([11], device='cpu'),
+            "sample": torch.tensor([101], device='cpu'),
+            "finished_request_ids": torch.tensor([], dtype=torch.int32, device='cpu'),
+        }
+        context.update_requests_prepare.return_value = (filtered_update, filtered_bookkeeping)
+        context.update_requests_bookkeep.return_value = {
+            "newly_paused_request_ids": None,
+            "evict_request_ids": None,
+        }
+        controller._dynamic_step_forward_for_async_scheduling = mock.Mock(return_value=None)
+
+        actual_bookkeeping, update_result = controller._async_scheduling_prepare_forward_bookkeep(
+            prepared_update, request_bookkeeping
+        )
+
+        context.update_requests_prepare.assert_called_once_with(
+            **prepared_update, request_bookkeeping=request_bookkeeping
+        )
+        context.update_requests_bookkeep.assert_called_once_with(
+            filtered_update, delay_finished_compaction=True
+        )
+        assert actual_bookkeeping is filtered_bookkeeping
+        assert update_result == {"newly_paused_request_ids": None, "evict_request_ids": None}
+
+    def test_serial_async_scheduling_call_order(self):
+        controller, context, _ = self._make_async_eligibility_controller()
+        events = []
+
+        def prepare_side_effect(**kwargs):
+            events.append("update_requests_prepare")
+            return (
+                {
+                    "active_requests_mask": kwargs["active_requests_mask"],
+                    "new_tokens": kwargs["new_tokens"],
+                    "new_speculative_tokens": kwargs["new_speculative_tokens"],
+                },
+                kwargs["request_bookkeeping"],
+            )
+
+        context.update_requests_prepare.side_effect = prepare_side_effect
+        context.update_requests_bookkeep.side_effect = lambda *_args, **_kwargs: events.append(
+            "update_requests_bookkeep"
+        ) or {
+            "newly_paused_request_ids": None,
+            "evict_request_ids": None,
+        }
+
+        controller._async_schedule_forward_primed = True
+        controller._async_schedule_primed_cuda_graph_request_count = None
+        controller._dynamic_step_sample_logits = mock.Mock(side_effect=lambda: events.append("sample"))
+        controller._dynamic_step_context_prepare_bookkeeping = mock.Mock(
+            side_effect=lambda: (
+                {
+                    "active_requests_mask": torch.tensor([1], device='cpu'),
+                    "new_tokens": torch.tensor([7], device='cpu'),
+                    "new_speculative_tokens": None,
+                },
+                {"active_request_ids": torch.tensor([3], device='cpu')},
+            )
+        )
+        controller._dynamic_step_forward_for_async_scheduling = mock.Mock(
+            side_effect=lambda: events.append("forward") or None
+        )
+
+        with mock.patch(
+            "megatron.core.inference.text_generation_controllers.text_generation_controller.range_push"
+        ), mock.patch(
+            "megatron.core.inference.text_generation_controllers.text_generation_controller.range_pop"
+        ):
+            controller._async_scheduling_sample_prepare_forward_bookkeep()
+
+        assert events == [
+            "sample",
+            "update_requests_prepare",
+            "forward",
+            "update_requests_bookkeep",
+        ]
+        _, kwargs = context.update_requests_bookkeep.call_args
+        assert kwargs["delay_finished_compaction"]
+
+    def test_async_scheduling_helpers_do_not_use_overlap_primitives(self):
+        helper_source = "\n".join(
+            inspect.getsource(getattr(TextGenerationController, name))
+            for name in (
+                "_try_async_generate_output_tokens_dynamic_batch",
+                "_async_scheduling_sample_prepare_forward_bookkeep",
+                "_async_scheduling_prepare_forward_bookkeep",
+                "_dynamic_step_forward_for_async_scheduling",
+                "_get_async_scheduling_fallback_reason",
+            )
+        )
+
+        for primitive in (
+            "torch.cuda.Event",
+            "torch.cuda.Stream",
+            "record_event",
+            "wait_event",
+            "current_stream",
+        ):
+            assert primitive not in helper_source
+
+
+class TestAsyncSchedulingDenseGreedyParity(TextGenerationControllerTestBase):
+    @classmethod
+    def setup_class(cls):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+
+    @classmethod
+    def teardown_class(cls):
+        Utils.destroy_model_parallel()
+
+    def teardown_method(self, method):
+        InferenceMode.unset_active()
+
+    def _run_dense_greedy_dynamic_generation(self, enable_async_scheduling: bool):
+        if not is_fa_min_version("2.7.3"):
+            pytest.skip(reason="Need latest flash attn for dynamic batching")
+
+        torch.manual_seed(1234)
+        torch.cuda.manual_seed_all(1234)
+        self.setup_model(
+            dtype=torch.bfloat16,
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            static=False,
+            batch_size=2,
+            materialize_only_last_token_logits=True,
+            max_requests=4,
+        )
+        context = self.text_generation_controller.inference_wrapped_model.inference_context
+        context.config.enable_async_scheduling = enable_async_scheduling
+
+        requests = [
+            DynamicInferenceRequest(
+                request_id=0,
+                prompt_tokens=torch.tensor(
+                    [1, 2], dtype=torch.long, device=torch.cuda.current_device()
+                ),
+                sampling_params=SamplingParams(
+                    top_k=1, num_tokens_to_generate=3, termination_id=-1
+                ),
+            ),
+            DynamicInferenceRequest(
+                request_id=1,
+                prompt_tokens=torch.tensor(
+                    [3, 4], dtype=torch.long, device=torch.cuda.current_device()
+                ),
+                sampling_params=SamplingParams(
+                    top_k=1, num_tokens_to_generate=3, termination_id=-1
+                ),
+            ),
+        ]
+        for request in requests:
+            context.add_request(request)
+
+        generated_tokens = {0: [], 1: []}
+        while context.has_unfinished_requests():
+            result = self.text_generation_controller.generate_output_tokens_dynamic_batch()
+            for request_id, token in zip(
+                result["active_request_ids"].tolist(), result["sample"].tolist()
+            ):
+                generated_tokens[int(request_id)].append(int(token))
+
+        return generated_tokens
+
+    def test_async_scheduling_matches_sync_dense_greedy_decode(self):
+        sync_tokens = self._run_dense_greedy_dynamic_generation(enable_async_scheduling=False)
+        async_tokens = self._run_dense_greedy_dynamic_generation(enable_async_scheduling=True)
+
+        assert async_tokens == sync_tokens
 
 
 class TestTextGenerationController(TextGenerationControllerTestBase):

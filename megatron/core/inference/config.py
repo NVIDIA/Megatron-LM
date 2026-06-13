@@ -275,6 +275,9 @@ class InferenceConfig:
     enable_chunked_prefill: bool = False
     """Whether to enable chunked prefill."""
 
+    enable_async_scheduling: bool = False
+    """Whether to use async-shaped dynamic decode scheduling."""
+
     num_speculative_tokens: int = 0
     """The number of speculative tokens to generate for decode steps."""
 
