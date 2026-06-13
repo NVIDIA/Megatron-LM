@@ -145,6 +145,7 @@ class MultiLatentAttention(Attention):
         pg_collection: Optional[ProcessGroupCollection] = None,
         pp_layer_offset: Optional[int] = None,
         name: str | None = None,
+        is_mtp_layer: bool = False,
     ) -> None:
         # TODO(nschank): Restructure so that the Attention initializer knows which specific
         # submodules it will construct, so that MLASelfAttentionSubmodules honors that interface.
@@ -157,6 +158,7 @@ class MultiLatentAttention(Attention):
             pg_collection=pg_collection,
             pp_layer_offset=pp_layer_offset,
             name=name,
+            is_mtp_layer=is_mtp_layer,
         )
         self.config: MLATransformerConfig
 
@@ -485,6 +487,7 @@ class MLASelfAttention(MultiLatentAttention):
         pg_collection: Optional[ProcessGroupCollection] = None,
         pp_layer_offset: Optional[int] = None,
         name: str | None = None,
+        is_mtp_layer: bool = False,
     ):
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -499,6 +502,7 @@ class MLASelfAttention(MultiLatentAttention):
             pg_collection=pg_collection,
             pp_layer_offset=pp_layer_offset,
             name=name,
+            is_mtp_layer=is_mtp_layer,
         )
 
         if self.config.q_lora_rank is None:
@@ -1231,6 +1235,7 @@ class FusedMLASelfAttention(MLASelfAttention):
         pg_collection: Optional[ProcessGroupCollection] = None,
         pp_layer_offset: Optional[int] = None,
         name: str | None = None,
+        is_mtp_layer: bool = False,
     ):
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
@@ -1246,6 +1251,7 @@ class FusedMLASelfAttention(MLASelfAttention):
             pg_collection=pg_collection,
             pp_layer_offset=pp_layer_offset,
             name=name,
+            is_mtp_layer=is_mtp_layer,
         )
 
         assert self.config.q_lora_rank is not None, (
