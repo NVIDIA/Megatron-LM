@@ -1,0 +1,551 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Assign community-request issues from Claude analysis and notify owners in Slack."""
+
+import argparse
+import json
+import os
+import sys
+from dataclasses import dataclass
+
+from github_slack_utils import get_slack_client, get_slack_user_id, get_user_email
+
+try:
+    import requests
+except ImportError:  # pragma: no cover - workflow installs requests.
+    requests = None
+
+
+GITHUB_API_URL = "https://api.github.com"
+ACTIVE_ONCALL_TEAM_SLUG = "mcore-oncall"
+ASSIGNEE_ALLOWED_TEAM_SLUG = "mcore-engineers"
+MCORE_ONCALL_SLACK_USERGROUP_ID = "S0A7B4U1T3P"
+CONFIDENCE_THRESHOLD = 0.75
+MAX_SLACK_CONTEXT_CHARS = 1200
+SERVICE_ACCOUNT_LOGINS = {"svcnvidia-nemo-ci"}
+
+
+@dataclass(frozen=True)
+class IssueContext:
+    """Minimal issue metadata needed for assignment and notification."""
+
+    owner: str
+    repo: str
+    number: int
+    title: str
+    url: str
+    author: str
+
+
+@dataclass(frozen=True)
+class AssignmentPlan:
+    """Validated assignment decision."""
+
+    mode: str
+    assignees: list[str]
+    notify_users: list[str]
+    confidence: float
+    rationale: str
+    relevant_paths: list[str]
+    issue_type: str = "unknown"
+    context: str = ""
+    assignment_source: str = "claude"
+    rejected_candidate: str | None = None
+    rejected_candidate_confidence: float | None = None
+    rejected_candidate_reason: str = ""
+
+
+@dataclass(frozen=True)
+class CandidateDecision:
+    """Candidate selected for assignment, or the candidate rejected before fallback."""
+
+    assignee: str | None
+    rejected_candidate: str | None = None
+    rejected_reason: str = ""
+
+
+def get_required_env(name: str) -> str:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        print(f"Error: {name} is required")
+        sys.exit(1)
+    return value
+
+
+def get_headers() -> dict[str, str]:
+    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if not token:
+        print("Error: GH_TOKEN or GITHUB_TOKEN not set")
+        sys.exit(1)
+
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def get_repo_info() -> tuple[str, str]:
+    repo_env = get_required_env("GITHUB_REPOSITORY")
+    owner, repo = repo_env.split("/", maxsplit=1)
+    return owner, repo
+
+
+def get_issue_context() -> IssueContext:
+    owner, repo = get_repo_info()
+    return IssueContext(
+        owner=owner,
+        repo=repo,
+        number=int(get_required_env("ISSUE_NUMBER")),
+        title=get_required_env("ISSUE_TITLE"),
+        url=get_required_env("ISSUE_URL"),
+        author=get_required_env("ISSUE_AUTHOR"),
+    )
+
+
+def request_json(method: str, url: str, **kwargs):
+    if requests is None:
+        print("Error: requests is not installed")
+        sys.exit(1)
+
+    response = requests.request(method, url, headers=get_headers(), timeout=30, **kwargs)
+    if response.status_code >= 400:
+        print(f"GitHub API request failed: {method} {url}: {response.status_code} {response.text}")
+        sys.exit(1)
+
+    if response.status_code == 204 or not response.text:
+        return None
+
+    return response.json()
+
+
+def parse_analysis(raw_analysis: str) -> dict:
+    try:
+        analysis = json.loads(raw_analysis)
+    except json.JSONDecodeError as exc:
+        print(f"Error: Claude analysis was not valid JSON: {exc}")
+        sys.exit(1)
+
+    if not isinstance(analysis, dict):
+        print("Error: Claude analysis must be a JSON object")
+        sys.exit(1)
+
+    return analysis
+
+
+def normalize_login(login: str | None) -> str | None:
+    if not login:
+        return None
+
+    normalized = login.strip()
+    if normalized.startswith("@"):
+        normalized = normalized[1:]
+    if "/" in normalized:
+        return None
+    return normalized or None
+
+
+def is_service_account(login: str) -> bool:
+    return login in SERVICE_ACCOUNT_LOGINS or login.startswith("svc")
+
+
+def human_members(members: set[str] | list[str]) -> list[str]:
+    return sorted(member for member in members if not is_service_account(member))
+
+
+def confidence_value(value, default: float = 0.0) -> float:
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        confidence = default
+
+    return max(0.0, min(confidence, 1.0))
+
+
+def analysis_confidence(analysis: dict) -> float:
+    return confidence_value(analysis.get("confidence", 0.0))
+
+
+def analysis_relevant_paths(analysis: dict) -> list[str]:
+    paths = analysis.get("relevant_paths", [])
+    if not isinstance(paths, list):
+        return []
+    return [path for path in paths if isinstance(path, str)][:5]
+
+
+def analysis_rationale(analysis: dict) -> str:
+    rationale = analysis.get("rationale", "")
+    if not isinstance(rationale, str) or not rationale.strip():
+        return "Claude did not provide a rationale."
+    return rationale.strip()
+
+
+def analysis_issue_type(analysis: dict) -> str:
+    issue_type = analysis.get("issue_type", "unknown")
+    if not isinstance(issue_type, str) or not issue_type.strip():
+        return "unknown"
+    return issue_type.strip()
+
+
+def analysis_slack_context(analysis: dict) -> str:
+    context = analysis.get("slack_context") or analysis.get("rationale") or ""
+    if not isinstance(context, str) or not context.strip():
+        return "Claude did not provide additional assignment context."
+
+    context = context.strip()
+    if len(context) <= MAX_SLACK_CONTEXT_CHARS:
+        return context
+    return context[:MAX_SLACK_CONTEXT_CHARS].rstrip() + "..."
+
+
+def analysis_potential_assignee(analysis: dict) -> str | None:
+    return normalize_login(analysis.get("potential_assignee")) or normalize_login(
+        analysis.get("assignee")
+    )
+
+
+def analysis_potential_assignee_reason(analysis: dict) -> str:
+    reason = analysis.get("potential_assignee_reason", "")
+    if not isinstance(reason, str):
+        return ""
+    return reason.strip()
+
+
+def apply_requested_assignee_override(analysis: dict) -> dict:
+    requested_assignee = normalize_login(os.environ.get("REQUESTED_ASSIGNEE"))
+    if not requested_assignee:
+        return analysis
+
+    overridden = dict(analysis)
+    manual_note = "Assignee was requested explicitly by /claude assign."
+    rationale = analysis.get("rationale", "")
+    if isinstance(rationale, str) and rationale.strip():
+        overridden["rationale"] = f"{manual_note} {rationale.strip()}"
+    else:
+        overridden["rationale"] = manual_note
+
+    overridden["assignee"] = requested_assignee
+    overridden["potential_assignee"] = requested_assignee
+    overridden["potential_assignee_reason"] = manual_note
+    overridden["confidence"] = 1.0
+    overridden["fallback_to_oncall"] = False
+    overridden["_requested_assignee"] = requested_assignee
+    return overridden
+
+
+def check_assignable(issue: IssueContext, login: str) -> bool:
+    url = f"{GITHUB_API_URL}/repos/{issue.owner}/{issue.repo}/assignees/{login}"
+    if requests is None:
+        print("Error: requests is not installed")
+        sys.exit(1)
+
+    response = requests.get(url, headers=get_headers(), timeout=30)
+    if response.status_code == 204:
+        return True
+    if response.status_code == 404:
+        return False
+
+    print(f"GitHub API request failed: GET {url}: {response.status_code} {response.text}")
+    sys.exit(1)
+
+
+def get_team_members(org: str, team_slug: str) -> set[str]:
+    members = set()
+    page = 1
+
+    while True:
+        url = f"{GITHUB_API_URL}/orgs/{org}/teams/{team_slug}/members?per_page=100&page={page}"
+        data = request_json("GET", url)
+        if not data:
+            break
+
+        members.update(member["login"] for member in data)
+        if len(data) < 100:
+            break
+        page += 1
+
+    return members
+
+
+def get_allowed_assignees(org: str) -> set[str]:
+    return set(human_members(get_team_members(org, ASSIGNEE_ALLOWED_TEAM_SLUG)))
+
+
+def candidate_rejection_reason(analysis: dict, candidate: str, allowed_assignees: set[str]) -> str:
+    if is_service_account(candidate):
+        return "service accounts cannot be assigned"
+
+    confidence = analysis_confidence(analysis)
+    if confidence < CONFIDENCE_THRESHOLD:
+        return f"confidence {confidence:.2f} is below the {CONFIDENCE_THRESHOLD:.2f} threshold"
+
+    if candidate not in allowed_assignees:
+        return f"they are not in {ASSIGNEE_ALLOWED_TEAM_SLUG}"
+
+    if bool(analysis.get("fallback_to_oncall", False)):
+        return "the analysis requested on-call fallback"
+
+    return (
+        analysis_potential_assignee_reason(analysis)
+        or "the analysis did not select them for assignment"
+    )
+
+
+def select_candidate_assignee(
+    analysis: dict, issue: IssueContext, allowed_assignees: set[str]
+) -> CandidateDecision:
+    potential_candidate = analysis_potential_assignee(analysis)
+    if bool(analysis.get("fallback_to_oncall", False)):
+        if potential_candidate:
+            return CandidateDecision(
+                assignee=None,
+                rejected_candidate=potential_candidate,
+                rejected_reason=candidate_rejection_reason(
+                    analysis, potential_candidate, allowed_assignees
+                ),
+            )
+        return CandidateDecision(assignee=None)
+
+    candidate = normalize_login(analysis.get("assignee"))
+    if not candidate:
+        if potential_candidate:
+            return CandidateDecision(
+                assignee=None,
+                rejected_candidate=potential_candidate,
+                rejected_reason=candidate_rejection_reason(
+                    analysis, potential_candidate, allowed_assignees
+                ),
+            )
+        return CandidateDecision(assignee=None)
+
+    if is_service_account(candidate):
+        print(f"Rejecting {candidate}; service accounts cannot be assigned")
+        return CandidateDecision(
+            assignee=None,
+            rejected_candidate=candidate,
+            rejected_reason="service accounts cannot be assigned",
+        )
+
+    if analysis_confidence(analysis) < CONFIDENCE_THRESHOLD:
+        return CandidateDecision(
+            assignee=None,
+            rejected_candidate=candidate,
+            rejected_reason=candidate_rejection_reason(analysis, candidate, allowed_assignees),
+        )
+
+    if candidate not in allowed_assignees:
+        print(f"Rejecting {candidate}; they are not in {ASSIGNEE_ALLOWED_TEAM_SLUG}")
+        return CandidateDecision(
+            assignee=None,
+            rejected_candidate=candidate,
+            rejected_reason=candidate_rejection_reason(analysis, candidate, allowed_assignees),
+        )
+
+    if not check_assignable(issue, candidate):
+        print(f"Rejecting {candidate}; they are not assignable to {issue.owner}/{issue.repo}")
+        return CandidateDecision(
+            assignee=None,
+            rejected_candidate=candidate,
+            rejected_reason=f"they are not assignable to {issue.owner}/{issue.repo}",
+        )
+
+    return CandidateDecision(assignee=candidate)
+
+
+def assign_issue(issue: IssueContext, assignees: list[str], dry_run: bool = False) -> None:
+    if not assignees:
+        print("No assignable users found; skipping issue assignment")
+        return
+
+    print(f"Assigning issue #{issue.number} to: {', '.join(assignees)}")
+    if dry_run:
+        return
+
+    url = f"{GITHUB_API_URL}/repos/{issue.owner}/{issue.repo}/issues/{issue.number}/assignees"
+    request_json("POST", url, json={"assignees": assignees[:10]})
+
+
+def create_assignment_plan(analysis: dict, issue: IssueContext) -> AssignmentPlan:
+    confidence = analysis_confidence(analysis)
+    rationale = analysis_rationale(analysis)
+    relevant_paths = analysis_relevant_paths(analysis)
+    issue_type = analysis_issue_type(analysis)
+    context = analysis_slack_context(analysis)
+    assignment_source = "manual" if analysis.get("_requested_assignee") else "claude"
+    allowed_assignees = get_allowed_assignees(issue.owner)
+    candidate_decision = select_candidate_assignee(analysis, issue, allowed_assignees)
+
+    if candidate_decision.assignee:
+        return AssignmentPlan(
+            mode="candidate",
+            assignees=[candidate_decision.assignee],
+            notify_users=[candidate_decision.assignee],
+            confidence=confidence,
+            rationale=rationale,
+            relevant_paths=relevant_paths,
+            issue_type=issue_type,
+            context=context,
+            assignment_source=assignment_source,
+        )
+
+    candidate_login = normalize_login(analysis.get("assignee")) or analysis_potential_assignee(
+        analysis
+    )
+    if candidate_login:
+        print(
+            f"Falling back to {ACTIVE_ONCALL_TEAM_SLUG}; candidate was "
+            f"{candidate_login} with confidence {confidence:.2f}"
+        )
+    else:
+        print(
+            f"Falling back to {ACTIVE_ONCALL_TEAM_SLUG}; Claude did not provide a usable candidate"
+        )
+
+    oncall_members = [
+        member
+        for member in human_members(get_team_members(issue.owner, ACTIVE_ONCALL_TEAM_SLUG))
+        if member in allowed_assignees
+    ]
+    assignable_oncall = [member for member in oncall_members if check_assignable(issue, member)]
+
+    return AssignmentPlan(
+        mode="oncall",
+        assignees=assignable_oncall,
+        notify_users=oncall_members,
+        confidence=confidence,
+        rationale=rationale,
+        relevant_paths=relevant_paths,
+        issue_type=issue_type,
+        context=context,
+        assignment_source=assignment_source,
+        rejected_candidate=candidate_decision.rejected_candidate,
+        rejected_candidate_confidence=confidence if candidate_decision.rejected_candidate else None,
+        rejected_candidate_reason=candidate_decision.rejected_reason,
+    )
+
+
+def build_slack_message(issue: IssueContext, plan: AssignmentPlan) -> str:
+    paths = ", ".join(plan.relevant_paths) if plan.relevant_paths else "none identified"
+    context = plan.context or plan.rationale
+    rejected_candidate_context = ""
+    if plan.rejected_candidate:
+        rejected_candidate_context = f"Potential assignee considered: {plan.rejected_candidate}"
+        if plan.rejected_candidate_confidence is not None:
+            rejected_candidate_context += f" (confidence: {plan.rejected_candidate_confidence:.2f})"
+        if plan.rejected_candidate_reason:
+            rejected_candidate_context += (
+                f". Not assigned because {plan.rejected_candidate_reason}."
+            )
+        rejected_candidate_context += "\n"
+
+    oncall_mention = f"<!subteam^{MCORE_ONCALL_SLACK_USERGROUP_ID}|mcore-oncall>"
+    if plan.mode == "candidate":
+        assignment_sentence = (
+            "I determined that you are the best individual to answer this community issue."
+        )
+        if plan.assignment_source == "manual":
+            assignment_sentence = "I was asked to assign this community issue to you."
+
+        return (
+            f"I (Megatron Issue Bot) have assigned you to the newly created community issue: <{issue.url}|{issue.url}>.\n\n"
+            f"{assignment_sentence}\n\n"
+            f"Context from my analysis:\n{context}\n\n"
+            "Please take action at your earliest convenience, at latest within 1 business day. "
+            "If I made a mistake or if you are unsure how to proceed, please reach out to "
+            f"{oncall_mention} directly."
+        )
+
+    return (
+        f"Community request <{issue.url}|#{issue.number}: {issue.title}> needs on-call triage.\n"
+        "I found a new community issue, but I am not confident who should own it. "
+        "Please triage it and assign an appropriate mcore engineer.\n"
+        f"Context from my analysis:\n{context}\n"
+        f"{rejected_candidate_context}"
+        f"Confidence: {plan.confidence:.2f}\n"
+        f"Issue type: {plan.issue_type}\n"
+        f"Relevant paths: {paths}\n"
+        f"Rationale: {plan.rationale}"
+    )
+
+
+def send_slack_notifications(
+    issue: IssueContext, plan: AssignmentPlan, dry_run: bool, require_slack: bool
+) -> None:
+    if not plan.notify_users:
+        print("No users to notify in Slack")
+        if require_slack:
+            sys.exit(1)
+        return
+
+    slack_client = get_slack_client(require_slack=require_slack)
+    if not slack_client:
+        return
+
+    message = build_slack_message(issue, plan)
+    missing_users = []
+
+    for username in plan.notify_users:
+        email = get_user_email(username)
+        slack_user_id = get_slack_user_id(slack_client, email)
+        if not slack_user_id:
+            missing_users.append(f"{username} ({email})")
+            continue
+
+        print(f"Sending Slack notification to {username}")
+        if dry_run:
+            continue
+
+        conversation = slack_client.conversations_open(users=slack_user_id)
+        channel_id = conversation["channel"]["id"]
+        slack_client.chat_postMessage(
+            channel=channel_id, text=message, unfurl_links=False, unfurl_media=False
+        )
+
+    if missing_users:
+        print("Could not send Slack notifications to: " + ", ".join(missing_users))
+        if require_slack:
+            sys.exit(1)
+
+
+def run(dry_run: bool = False, require_slack: bool = True) -> AssignmentPlan:
+    issue = get_issue_context()
+    analysis = apply_requested_assignee_override(parse_analysis(get_required_env("ANALYSIS_JSON")))
+    plan = create_assignment_plan(analysis, issue)
+
+    assign_issue(issue, plan.assignees, dry_run=dry_run)
+    send_slack_notifications(issue, plan, dry_run=dry_run, require_slack=require_slack)
+
+    return plan
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Assign and notify owners for community-request issues"
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Print actions without writing to GitHub or Slack"
+    )
+    parser.add_argument(
+        "--allow-missing-slack",
+        action="store_true",
+        help="Do not fail when Slack cannot be notified",
+    )
+    args = parser.parse_args()
+
+    run(dry_run=args.dry_run, require_slack=not args.allow_missing_slack)
+
+
+if __name__ == "__main__":
+    main()
