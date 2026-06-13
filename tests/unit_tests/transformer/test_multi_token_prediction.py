@@ -109,6 +109,12 @@ class TestMultiTokenPredictionLayer:
         assert isinstance(mtp, MultiTokenPredictionBlock)
         assert mtp.config.mtp_detach_heads is True
 
+        # Verify all parameters are tagged for separate MTP grad-norm handling.
+        for name, param in mtp.named_parameters():
+            assert (
+                getattr(param, 'grad_norm_group', None) == 'mtp'
+            ), f"Parameter {name} missing grad_norm_group attribute"
+
     @pytest.mark.parametrize(('tp'), [(1), (2), (4)])
     def test_constructor_local(self, tp):
         """Test basic construction of MTP module."""
