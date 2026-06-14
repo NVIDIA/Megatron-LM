@@ -884,6 +884,27 @@ def validate_args(args, defaults={}):
                 args.rank
             )
 
+    if getattr(args, 'mtp_hsm_mode', None) is not None:
+        assert args.mtp_num_layers and args.mtp_num_layers >= 2, (
+            "--mtp-hsm-mode requires --mtp-num-layers to be at least 2."
+        )
+
+    if getattr(args, 'freeze_base_model_for_mtp', False):
+        assert args.mtp_num_layers, (
+            "--freeze-base-model-for-mtp requires --mtp-num-layers to be set."
+        )
+
+    if getattr(args, 'mtp_kd_logit_enabled', False):
+        assert args.mtp_num_layers, (
+            "MTP Knowledge Distillation (--mtp-kd-logit-enabled) "
+            "requires --mtp-num-layers to be set."
+        )
+
+    if getattr(args, 'mtp_disable_ce_loss', False):
+        assert getattr(args, 'mtp_kd_logit_enabled', False), (
+            "--mtp-disable-ce-loss requires --mtp-kd-logit-enabled."
+        )
+
     # Infer use of MLA from unified pattern
     if args.hybrid_layer_pattern and Symbols.DS_ATTENTION in args.hybrid_layer_pattern:
         args.multi_latent_attention = True

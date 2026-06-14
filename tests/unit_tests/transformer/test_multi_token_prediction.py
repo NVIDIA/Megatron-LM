@@ -7,6 +7,7 @@ import types
 import pytest
 import torch
 
+import megatron.core.transformer.multi_token_prediction as mtp_module
 from megatron.core.enums import ModelType
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -26,6 +27,7 @@ from megatron.core.transformer.multi_token_prediction import (
     MTPLossLoggingHelper,
     MultiTokenPredictionBlock,
     _mtp_logits_are_vocab_sharded,
+    _scale_mtp_loss_for_token_count,
     process_mtp_loss,
     roll_tensor,
 )
@@ -87,6 +89,31 @@ class TestMultiTokenPredictionLayer:
             num_layers=4, hidden_size=64, num_attention_heads=8, use_cpu_initialization=True
         )
         assert config.mtp_detach_heads is False
+
+    def test_hsm_and_kd_config_defaults(self):
+        """Test that MTP HSM and KD options default to disabled."""
+        config = TransformerConfig(
+            num_layers=4, hidden_size=64, num_attention_heads=8, use_cpu_initialization=True
+        )
+        assert config.mtp_disable_ce_loss is False
+        assert config.mtp_kd_logit_enabled is False
+        assert config.mtp_kd_logit_temperature == 1.0
+        assert config.mtp_kd_logit_loss_weight == 1.0
+        assert config.mtp_hsm_mode is None
+        assert config.freeze_base_model_for_mtp is False
+
+    def test_mtp_per_token_loss_scaling_uses_rolled_token_count(self):
+        """MTP per-token losses should normalize by rolled valid tokens after final grad scaling."""
+        loss = torch.ones(2, 4)
+        loss_scale = 0.3
+        original_num_tokens = torch.tensor(8.0)
+        rolled_num_tokens = torch.tensor(6.0)
+
+        scaled_loss = _scale_mtp_loss_for_token_count(
+            loss, loss_scale, original_num_tokens, rolled_num_tokens
+        )
+
+        torch.testing.assert_close(scaled_loss, loss * loss_scale * (8.0 / 6.0))
 
     def test_constructor_with_detach_heads(self):
         """Test construction of MTP module with mtp_detach_heads=True."""
@@ -363,6 +390,57 @@ class TestMultiTokenPredictionLayer:
         else:
             assert hidden_states.grad is not None
             assert emb_weight.grad is not None
+
+    def test_hsm_rolls_older_states_before_mixing(self, monkeypatch):
+        """HSM diagonal-aligns older states and leaves the newest state unrolled."""
+        torch.manual_seed(_SEED)
+        config, mtp_block_spec = self._create_config_and_mtp_block_spec(tp=1, cp=1)
+        config.mtp_hsm_mode = "uniform_layer_sample"
+        mtp = MultiTokenPredictionBlock(config=config, spec=mtp_block_spec)
+
+        class _FakeMTPLayer(torch.nn.Module):
+            def __init__(self, delta):
+                super().__init__()
+                self.delta = delta
+
+            def forward(self, hidden_states, input_ids, position_ids, padding_mask=None, **kwargs):
+                return hidden_states + self.delta, input_ids, position_ids, padding_mask
+
+        mtp.layers = torch.nn.ModuleList([_FakeMTPLayer(100.0), _FakeMTPLayer(200.0)])
+        captured_history = []
+
+        def fake_hsm_mix(hidden_states_list):
+            captured_history.append([state.clone() for state in hidden_states_list])
+            return hidden_states_list[-1]
+
+        monkeypatch.setattr(mtp_module, "_hsm_mix", fake_hsm_mix)
+        mtp.train()
+
+        seq_len = 4
+        batch_size = 1
+        hidden_states = (
+            torch.arange(seq_len, dtype=torch.float32)
+            .view(seq_len, batch_size, 1)
+            .expand(seq_len, batch_size, config.hidden_size)
+            .clone()
+        )
+        input_ids = torch.arange(seq_len, dtype=torch.int64).view(batch_size, seq_len)
+        position_ids = input_ids.clone()
+
+        mtp.forward(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            hidden_states=hidden_states,
+            attention_mask=None,
+            embedding=lambda input_ids, position_ids: torch.zeros_like(hidden_states),
+        )
+
+        expected_rolled, _ = roll_tensor(hidden_states.permute(1, 2, 0), shifts=-1, dims=-1)
+        expected_rolled = expected_rolled.permute(2, 0, 1)
+
+        assert len(captured_history) == 1
+        torch.testing.assert_close(captured_history[0][0], expected_rolled)
+        torch.testing.assert_close(captured_history[0][1], hidden_states + 100.0)
 
     @pytest.mark.parametrize("detach_heads", [False, True])
     def test_process_mtp_loss_detaches_output_weight(self, detach_heads):
@@ -1095,6 +1173,22 @@ class TestMTPLossLoggingHelper:
         assert tracker["reduce_group"] is None
         assert tracker["avg_group"] is None
 
+    def test_save_kd_loss_to_tracker(self):
+        """Test saving KD loss to tracker."""
+        kd_loss = torch.tensor(0.7)
+        layer_number = 1
+        num_layers = self.num_layers
+
+        MTPLossLoggingHelper.save_kd_loss_to_tracker(
+            kd_logit_loss=kd_loss, layer_number=layer_number, num_layers=num_layers
+        )
+
+        tracker = MTPLossLoggingHelper.tracker
+        assert "kd_logit_loss_values" in tracker
+        assert tracker["kd_logit_loss_values"].shape == (num_layers,)
+        assert tracker["kd_logit_loss_values"][layer_number] == kd_loss
+        assert tracker["avg_group"] is None
+
     def test_mtp_logits_are_vocab_sharded(self):
         """Test detection for vocab-sharded versus gathered MTP logits."""
 
@@ -1111,12 +1205,16 @@ class TestMTPLossLoggingHelper:
         """Test tracking MTP metrics including acceptance rate."""
         num_layers = self.num_layers
         loss = torch.tensor(2.3)
+        kd_loss = torch.tensor(0.4)
         correct = torch.tensor(7.0)
         total = torch.tensor(10.0)
 
         for i in range(num_layers):
             MTPLossLoggingHelper.save_metrics_to_tracker(
                 loss=loss, correct=correct, total=total, layer_number=i, num_layers=num_layers
+            )
+            MTPLossLoggingHelper.save_kd_loss_to_tracker(
+                kd_logit_loss=kd_loss, layer_number=i, num_layers=num_layers
             )
 
         class DummyWriter:
@@ -1150,6 +1248,11 @@ class TestMTPLossLoggingHelper:
             assert f"mtp_{i+1} loss" in writer.scalars
             assert torch.isclose(torch.as_tensor(writer.scalars[f"mtp_{i+1} loss"]), expected_loss)
             assert torch.isclose(total_loss_dict[f"mtp_{i+1} loss"], expected_loss)
+            expected_kd_loss = kd_loss * loss_scale
+            assert torch.isclose(
+                torch.as_tensor(writer.scalars[f"mtp_{i+1}_kd_logit_loss"]), expected_kd_loss
+            )
+            assert torch.isclose(total_loss_dict[f"mtp_{i+1}_kd_logit_loss"], expected_kd_loss)
 
         # Verify acceptance rate is computed as (correct / total) * 100
         expected_rate = (correct / total) * 100.0
@@ -1200,6 +1303,7 @@ class TestMTPLossLoggingHelper:
 
         # Verify tracker is cleaned
         assert torch.all(MTPLossLoggingHelper.tracker["loss_values"] == 0)
+        assert torch.all(MTPLossLoggingHelper.tracker["kd_logit_loss_values"] == 0)
         assert MTPLossLoggingHelper.tracker["reduce_group"] is None
         assert MTPLossLoggingHelper.tracker["avg_group"] is None
 

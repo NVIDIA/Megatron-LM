@@ -1,8 +1,10 @@
 # Copyright (c) 2023-2026, NVIDIA CORPORATION. All rights reserved.
 
 import logging
+from contextlib import nullcontext
 from typing import Literal, Optional
 
+import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
@@ -501,15 +503,20 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         #   be None, so this assert will succeed.
         # assert attention_mask is None, "The attention mask is ignored and should be set to None"
 
-        # Run decoder.
-        hidden_states = self.decoder(
-            hidden_states=decoder_input,
-            attention_mask=attention_mask,
-            inference_context=inference_context,
-            rotary_pos_emb=rotary_pos_emb,
-            packed_seq_params=packed_seq_params,
-            padding_mask=padding_mask,
+        freeze_ctx = (
+            torch.no_grad()
+            if getattr(self.config, 'freeze_base_model_for_mtp', False) and self.training
+            else nullcontext()
         )
+        with freeze_ctx:
+            hidden_states = self.decoder(
+                hidden_states=decoder_input,
+                attention_mask=attention_mask,
+                inference_context=inference_context,
+                rotary_pos_emb=rotary_pos_emb,
+                packed_seq_params=packed_seq_params,
+                padding_mask=padding_mask,
+            )
 
         output_weight = None
         if self.share_embeddings_and_output_weights:

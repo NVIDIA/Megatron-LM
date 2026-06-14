@@ -1766,6 +1766,28 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     # After TE2.x: Below function is an empty function and does nothing.
     correct_amax_history_if_needed(model)
 
+    # Freeze base model parameters if requested, training only the MTP layers.
+    # This must happen after Float16Module wrapping but before DDP wrapping, which
+    # builds gradient buffers only for trainable parameters.
+    if getattr(args, 'freeze_base_model_for_mtp', False):
+        frozen_params = 0
+        trainable_params = 0
+        for model_module in model:
+            for name, param in model_module.named_parameters():
+                if 'mtp.' in name:
+                    trainable_params += param.numel()
+                else:
+                    param.requires_grad_(False)
+                    frozen_params += param.numel()
+            for name, module in model_module.named_modules():
+                if hasattr(module, 'frozen_expert_bias') and 'mtp.' not in name:
+                    module.frozen_expert_bias = True
+        print_rank_0(
+            f'[freeze-base-model-for-mtp] Frozen {frozen_params:,} parameters '
+            f'and base-model expert_bias buffers. '
+            f'Trainable MTP parameters: {trainable_params:,}.'
+        )
+
     if wrap_with_ddp:
         if args.use_torch_fsdp2:
             assert HAVE_FSDP2, "Torch FSDP2 requires torch>=2.4.0"

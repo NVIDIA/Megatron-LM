@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable, List, Optional, Union
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor
 
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
@@ -55,6 +56,29 @@ SUPPORTED_ATTN_MASK = [
     AttnMaskType.no_mask,
     AttnMaskType.padding_causal,
 ]
+
+
+def _hsm_mix(hidden_states_list: List[Tensor]) -> Tensor:
+    """Sample uniformly from accumulated hidden states for Hidden State Mixing (HSM)."""
+    num_states = len(hidden_states_list)
+    seq_len, batch_size, _ = hidden_states_list[0].shape
+    indices = torch.randint(
+        0, num_states, (seq_len, batch_size, 1), device=hidden_states_list[0].device
+    )
+    stacked = torch.stack(hidden_states_list, dim=0)
+    one_hot = (
+        torch.arange(num_states, device=indices.device).view(num_states, 1, 1, 1)
+        == indices.unsqueeze(0)
+    ).to(dtype=stacked.dtype)
+    return (stacked * one_hot).sum(dim=0)
+
+
+def _scale_mtp_loss_for_token_count(
+    loss: Tensor, loss_scale: float, original_num_tokens: Tensor, num_tokens: Tensor
+) -> Tensor:
+    """Scale per-token MTP loss so final gradient division uses rolled-token normalization."""
+    return loss_scale * loss * (original_num_tokens / num_tokens.clamp(min=1))
+
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
@@ -384,6 +408,25 @@ class MTPLossLoggingHelper:
         tracker["avg_group"] = avg_group
 
     @staticmethod
+    def save_kd_loss_to_tracker(
+        kd_logit_loss: Optional[torch.Tensor],
+        layer_number: int,
+        num_layers: int,
+        avg_group: Optional[torch.distributed.ProcessGroup] = None,
+    ):
+        """Save the MTP KD logit loss for logging."""
+        if layer_number is None or kd_logit_loss is None:
+            return
+
+        tracker = MTPLossLoggingHelper.tracker
+        if "kd_logit_loss_values" not in tracker:
+            tracker["kd_logit_loss_values"] = torch.zeros(
+                num_layers, device=torch.cuda.current_device()
+            )
+        tracker["kd_logit_loss_values"][layer_number] += kd_logit_loss.detach()
+        tracker["avg_group"] = avg_group
+
+    @staticmethod
     def clean_metrics_in_tracker():
         """Clear the mtp metrics."""
         tracker = MTPLossLoggingHelper.tracker
@@ -393,6 +436,8 @@ class MTPLossLoggingHelper:
             tracker["correct_values"].zero_()
         if "total_values" in tracker:
             tracker["total_values"].zero_()
+        if "kd_logit_loss_values" in tracker:
+            tracker["kd_logit_loss_values"].zero_()
         tracker["reduce_group"] = None
         tracker["avg_group"] = None
 
@@ -400,16 +445,19 @@ class MTPLossLoggingHelper:
     def reduce_metrics_in_tracker():
         """Collect and reduce the mtp metrics across ranks."""
         tracker = MTPLossLoggingHelper.tracker
-        if "loss_values" not in tracker:
+        if "loss_values" not in tracker and "kd_logit_loss_values" not in tracker:
             return
 
-        loss_values = tracker["loss_values"]
-        if tracker.get('reduce_group') is not None:
-            torch.distributed.all_reduce(loss_values, group=tracker.get('reduce_group'))
-        if tracker.get('avg_group') is not None:
-            torch.distributed.all_reduce(
-                loss_values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
-            )
+        for key in ["loss_values", "kd_logit_loss_values"]:
+            if key not in tracker:
+                continue
+            values = tracker[key]
+            if tracker.get('reduce_group') is not None:
+                torch.distributed.all_reduce(values, group=tracker.get('reduce_group'))
+            if tracker.get('avg_group') is not None:
+                torch.distributed.all_reduce(
+                    values, group=tracker['avg_group'], op=torch.distributed.ReduceOp.AVG
+                )
 
         for key in ["correct_values", "total_values"]:
             if key not in tracker:
@@ -427,56 +475,68 @@ class MTPLossLoggingHelper:
         """Track the Multi-Token Prediction (MTP) metrics for logging."""
         MTPLossLoggingHelper.reduce_metrics_in_tracker()
         tracker = MTPLossLoggingHelper.tracker
-        if "loss_values" not in tracker:
+        if "loss_values" not in tracker and "kd_logit_loss_values" not in tracker:
             return
 
-        mtp_losses = tracker["loss_values"] * loss_scale
-        mtp_corrects = tracker.get("correct_values", torch.zeros_like(mtp_losses))
-        mtp_totals = tracker.get("total_values", torch.ones_like(mtp_losses))
+        if "loss_values" in tracker:
+            mtp_losses = tracker["loss_values"] * loss_scale
+            mtp_corrects = tracker.get("correct_values", torch.zeros_like(mtp_losses))
+            mtp_totals = tracker.get("total_values", torch.ones_like(mtp_losses))
 
-        # Process-local logging state; cumulative rates intentionally reset after restart/resume.
-        if (
-            "cumulative_correct_values" not in tracker
-            or tracker["cumulative_correct_values"].shape != mtp_corrects.shape
-        ):
-            tracker["cumulative_correct_values"] = torch.zeros_like(mtp_corrects)
-        if (
-            "cumulative_total_values" not in tracker
-            or tracker["cumulative_total_values"].shape != mtp_totals.shape
-        ):
-            tracker["cumulative_total_values"] = torch.zeros_like(mtp_totals)
+            # Process-local logging state; cumulative rates intentionally reset after restart.
+            if (
+                "cumulative_correct_values" not in tracker
+                or tracker["cumulative_correct_values"].shape != mtp_corrects.shape
+            ):
+                tracker["cumulative_correct_values"] = torch.zeros_like(mtp_corrects)
+            if (
+                "cumulative_total_values" not in tracker
+                or tracker["cumulative_total_values"].shape != mtp_totals.shape
+            ):
+                tracker["cumulative_total_values"] = torch.zeros_like(mtp_totals)
 
-        tracker["cumulative_correct_values"] += mtp_corrects
-        tracker["cumulative_total_values"] += mtp_totals
-        mtp_cumulative_corrects = tracker["cumulative_correct_values"]
-        mtp_cumulative_totals = tracker["cumulative_total_values"]
+            tracker["cumulative_correct_values"] += mtp_corrects
+            tracker["cumulative_total_values"] += mtp_totals
+            mtp_cumulative_corrects = tracker["cumulative_correct_values"]
+            mtp_cumulative_totals = tracker["cumulative_total_values"]
 
-        mtp_num_layers = mtp_losses.shape[0]
-        for i in range(mtp_num_layers):
-            loss_name = f"mtp_{i+1} loss"
-            step_acc_name = f"mtp_{i+1}_acceptance_rate"
-            cum_acc_name = f"mtp_{i+1}_cumulative_acceptance_rate"
+            for i in range(mtp_losses.shape[0]):
+                loss_name = f"mtp_{i+1} loss"
+                step_acc_name = f"mtp_{i+1}_acceptance_rate"
+                cum_acc_name = f"mtp_{i+1}_cumulative_acceptance_rate"
 
-            loss = mtp_losses[i]
-            # Empty masks can leave no valid MTP positions, so clamp denominators to avoid NaNs.
-            step_rate = (mtp_corrects[i] / torch.clamp(mtp_totals[i], min=1)) * 100.0
-            cum_rate = (
-                mtp_cumulative_corrects[i] / torch.clamp(mtp_cumulative_totals[i], min=1)
-            ) * 100.0
+                loss = mtp_losses[i]
+                # Empty masks can leave no valid MTP positions, so clamp denominators to avoid NaNs.
+                step_rate = (mtp_corrects[i] / torch.clamp(mtp_totals[i], min=1)) * 100.0
+                cum_rate = (
+                    mtp_cumulative_corrects[i] / torch.clamp(mtp_cumulative_totals[i], min=1)
+                ) * 100.0
 
-            if total_loss_dict is not None:
-                total_loss_dict[loss_name] = (
-                    total_loss_dict.get(loss_name, torch.zeros_like(loss)) + loss
-                )
+                if total_loss_dict is not None:
+                    total_loss_dict[loss_name] = (
+                        total_loss_dict.get(loss_name, torch.zeros_like(loss)) + loss
+                    )
 
-            if writer is not None:
-                writer.add_scalar(loss_name, loss, iteration)
-                writer.add_scalar(step_acc_name, step_rate, iteration)
-                writer.add_scalar(cum_acc_name, cum_rate, iteration)
-            if wandb_writer is not None:
-                wandb_writer.log({f"{loss_name}": loss}, iteration)
-                wandb_writer.log({f"{step_acc_name}": step_rate}, iteration)
-                wandb_writer.log({f"{cum_acc_name}": cum_rate}, iteration)
+                if writer is not None:
+                    writer.add_scalar(loss_name, loss, iteration)
+                    writer.add_scalar(step_acc_name, step_rate, iteration)
+                    writer.add_scalar(cum_acc_name, cum_rate, iteration)
+                if wandb_writer is not None:
+                    wandb_writer.log({f"{loss_name}": loss}, iteration)
+                    wandb_writer.log({f"{step_acc_name}": step_rate}, iteration)
+                    wandb_writer.log({f"{cum_acc_name}": cum_rate}, iteration)
+
+        if "kd_logit_loss_values" in tracker:
+            kd_values = tracker["kd_logit_loss_values"] * loss_scale
+            for i in range(kd_values.shape[0]):
+                name = f"mtp_{i+1}_kd_logit_loss"
+                val = kd_values[i]
+                if total_loss_dict is not None:
+                    total_loss_dict[name] = total_loss_dict.get(name, torch.zeros_like(val)) + val
+                if writer is not None:
+                    writer.add_scalar(name, val, iteration)
+                if wandb_writer is not None:
+                    wandb_writer.log({name: val}, iteration)
 
         MTPLossLoggingHelper.clean_metrics_in_tracker()
 
@@ -837,6 +897,11 @@ def process_mtp_loss(
     # correctly scaled relative to the main loss gradients in finalize_model_grads.
     original_num_tokens = loss_mask.sum()
 
+    logit_kd_enabled = getattr(config, 'mtp_kd_logit_enabled', False) and is_training
+    mtp_disable_ce_loss = getattr(config, 'mtp_disable_ce_loss', False)
+    if logit_kd_enabled:
+        base_hidden_for_kd = hidden_states_list[0].detach()
+
     for mtp_layer_number in range(config.mtp_num_layers):
         mtp_logits, _ = output_layer(
             hidden_states_list[mtp_layer_number + 1],
@@ -856,6 +921,16 @@ def process_mtp_loss(
 
         mtp_loss = loss_mask * mtp_loss
 
+        if logit_kd_enabled:
+            base_hidden_for_kd, _ = roll_tensor(
+                base_hidden_for_kd.permute(1, 2, 0),
+                shifts=-1,
+                dims=-1,
+                cp_group=cp_group,
+                packed_seq_params=packed_seq_params,
+            )
+            base_hidden_for_kd = base_hidden_for_kd.permute(2, 0, 1)
+
         if is_training:
             mtp_loss_for_log = (
                 torch.sum(mtp_loss) * (num_tokens > 0).to(mtp_loss.dtype)
@@ -872,23 +947,75 @@ def process_mtp_loss(
                 config.mtp_num_layers,
                 avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
             )
+
         mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
-        if config.calculate_per_token_loss:
-            # When calculate_per_token_loss is enabled, finalize_model_grads will
-            # divide all gradients by total_num_tokens (from main loss).
-            # However, MTP has fewer valid tokens due to rolling. To ensure correct
-            # per-token gradient weighting, we normalize by the rolled token count
-            # and re-scale by the original token count.
-            # Avoid division by zero
-            num_tokens_safe = torch.clamp(num_tokens, min=1)
-            mtp_loss_normalized = (
-                mtp_loss_scale * mtp_loss * (original_num_tokens / num_tokens_safe)
+        safe_num_tokens = num_tokens.clamp(min=1)
+
+        if not mtp_disable_ce_loss:
+            if config.calculate_per_token_loss:
+                # When calculate_per_token_loss is enabled, finalize_model_grads will
+                # divide all gradients by total_num_tokens (from main loss).
+                # However, MTP has fewer valid tokens due to rolling. To ensure correct
+                # per-token gradient weighting, we normalize by the rolled token count
+                # and re-scale by the original token count.
+                mtp_loss_normalized = _scale_mtp_loss_for_token_count(
+                    mtp_loss, mtp_loss_scale, original_num_tokens, num_tokens
+                )
+                hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_normalized)
+            else:
+                hidden_states = MTPLossAutoScaler.apply(
+                    hidden_states, mtp_loss_scale * mtp_loss / safe_num_tokens
+                )
+
+        kd_logit_loss_scalar = None
+        if logit_kd_enabled:
+            with torch.no_grad():
+                base_logits_kd, _ = output_layer(
+                    base_hidden_for_kd, weight=output_weight, runtime_gather_output=True
+                )
+                if scale_logits_fn is not None:
+                    base_logits_kd = scale_logits_fn(base_logits_kd)
+            if runtime_gather_output:
+                mtp_logits_kd = mtp_logits
+            else:
+                mtp_logits_kd, _ = output_layer(
+                    hidden_states_list[mtp_layer_number + 1],
+                    weight=output_weight,
+                    runtime_gather_output=True,
+                )
+                if scale_logits_fn is not None:
+                    mtp_logits_kd = scale_logits_fn(mtp_logits_kd)
+
+            kd_loss_mask = loss_mask
+            kd_safe_num_tokens = safe_num_tokens
+
+            temperature = config.mtp_kd_logit_temperature
+            student_log = F.log_softmax(mtp_logits_kd / temperature, dim=-1)
+            teacher_probs = F.softmax(base_logits_kd / temperature, dim=-1)
+            kd_logit_per_token = F.kl_div(student_log, teacher_probs, reduction='none').sum(-1)
+            kd_logit_loss = kd_logit_per_token.transpose(0, 1) * (temperature**2) * kd_loss_mask
+            kd_logit_scale = (
+                config.mtp_kd_logit_loss_weight
+                * config.mtp_loss_scaling_factor
+                / config.mtp_num_layers
             )
-            hidden_states = MTPLossAutoScaler.apply(hidden_states, mtp_loss_normalized)
-        else:
-            safe_num_tokens = num_tokens.clamp(min=1)
-            hidden_states = MTPLossAutoScaler.apply(
-                hidden_states, mtp_loss_scale * mtp_loss / safe_num_tokens
+            if config.calculate_per_token_loss:
+                kd_logit_loss_normalized = _scale_mtp_loss_for_token_count(
+                    kd_logit_loss, kd_logit_scale, original_num_tokens, kd_safe_num_tokens
+                )
+                hidden_states = MTPLossAutoScaler.apply(hidden_states, kd_logit_loss_normalized)
+            else:
+                hidden_states = MTPLossAutoScaler.apply(
+                    hidden_states, kd_logit_scale * kd_logit_loss / kd_safe_num_tokens
+                )
+            kd_logit_loss_scalar = torch.sum(kd_logit_loss) / kd_safe_num_tokens
+
+        if logit_kd_enabled:
+            MTPLossLoggingHelper.save_kd_loss_to_tracker(
+                kd_logit_loss_scalar,
+                mtp_layer_number,
+                config.mtp_num_layers,
+                avg_group=parallel_state.get_data_parallel_group(with_context_parallel=True),
             )
 
     return hidden_states
@@ -1814,12 +1941,45 @@ class MultiTokenPredictionBlock(MegatronModule):
         if self.config.mtp_detach_heads:
             hidden_states = hidden_states.detach()
 
+        hsm_mode = getattr(self.config, 'mtp_hsm_mode', None) if self.training else None
+        if hsm_mode is not None:
+            hsm_hidden_history = [hidden_states]
+
         for iteration in range(self.config.mtp_num_layers):
             layer_idx = 0 if self.mtp_use_repeated_layer else iteration
+
+            # Diagonal-align accumulated HSM states before mixing. Older entries
+            # roll once per depth while the newest entry remains at its current
+            # position, so every state at position i targets the same token.
+            if hsm_mode is not None and len(hsm_hidden_history) > 1:
+                entries_to_roll = hsm_hidden_history[:-1]
+                last_entry = hsm_hidden_history[-1]
+                num_entries = len(entries_to_roll)
+                seq_len, batch_size, hidden_size = entries_to_roll[0].shape
+                stacked = torch.stack(entries_to_roll, dim=0)
+                flat = stacked.permute(0, 2, 3, 1).reshape(
+                    num_entries * batch_size, hidden_size, seq_len
+                )
+                rolled, _ = roll_tensor(
+                    flat,
+                    shifts=-1,
+                    dims=-1,
+                    cp_group=self.cp_group,
+                    packed_seq_params=packed_seq_params,
+                )
+                hsm_hidden_history = list(
+                    rolled.reshape(num_entries, batch_size, hidden_size, seq_len)
+                    .permute(0, 3, 1, 2)
+                    .unbind(0)
+                ) + [last_entry]
+                mtp_hidden_states = _hsm_mix(hsm_hidden_history)
+            else:
+                mtp_hidden_states = hidden_states
+
             (hidden_states, input_ids, position_ids, padding_mask) = self.layers[layer_idx](
                 input_ids=input_ids,
                 position_ids=position_ids,
-                hidden_states=hidden_states,
+                hidden_states=mtp_hidden_states,
                 attention_mask=attention_mask,
                 padding_mask=padding_mask,
                 inference_params=inference_params,
@@ -1831,6 +1991,9 @@ class MultiTokenPredictionBlock(MegatronModule):
                 embedding=embedding,
                 **(extra_block_kwargs or {}),
             )
+
+            if hsm_mode is not None:
+                hsm_hidden_history.append(hidden_states)
 
             # append the output hidden states of the current mtp layer
             # to the hidden_states_list
