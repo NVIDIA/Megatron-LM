@@ -25,3 +25,8 @@ docs/apidocs
 # Git worktrees
 .worktrees/
 .claude/worktrees/
+
+# Windows reserved device names
+nul
+NUL
+Nul

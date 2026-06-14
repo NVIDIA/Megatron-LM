@@ -12,6 +12,10 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAttention,
     DSAttentionSubmodules,
 )
+from megatron.core.transformer.experimental_attention_variant.msa import (
+    MSASelfAttention,
+    MSASelfAttentionSubmodules,
+)
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.multi_latent_attention import (
     MLASelfAttention,
@@ -80,7 +84,9 @@ def get_dsa_module_spec_for_backend(
     config: TransformerConfig, backend: BackendSpecProvider = None
 ) -> ModuleSpec:
     """Helper function to get module spec for Sparse Attention."""
-    assert config.multi_latent_attention, "Currently only MLA supports sparse attention."
+    assert config.multi_latent_attention, (
+        "Currently only MLA supports sparse attention."
+    )
     assert config.qk_l2_norm is False, "qk_l2_norm is not supported with MLA."
 
     # Because TransformerEngine does not support sparse attention yet, we use local
@@ -105,7 +111,9 @@ def get_dsa_module_spec_for_backend(
     # DSA indexer requires normalized q as input, so here we cannot fuse qk layernorm
     # with linear projection and have to use unfused qk layernorm.
     qk_norm = (
-        backend.layer_norm(rms_norm=rms_norm, for_qk=True) if config.qk_layernorm else IdentityOp
+        backend.layer_norm(rms_norm=rms_norm, for_qk=True)
+        if config.qk_layernorm
+        else IdentityOp
     )
 
     attention = ModuleSpec(
@@ -128,6 +136,27 @@ def get_dsa_module_spec_for_backend(
     return attention
 
 
+def get_msa_module_spec(
+    config: TransformerConfig, backend: BackendSpecProvider = None
+) -> ModuleSpec:
+    """Build module spec for MSA (MiniMax Sparse Attention)."""
+
+    if backend is None:
+        backend = _get_backend_spec_provider(config=config)
+
+    attention = ModuleSpec(
+        module=MSASelfAttention,
+        submodules=MSASelfAttentionSubmodules(
+            linear_qkv=backend.column_parallel_linear(),
+            linear_idx_q=backend.linear(),
+            linear_idx_k=backend.linear(),
+            linear_proj=backend.row_parallel_linear(),
+        ),
+    )
+
+    return attention
+
+
 def get_experimental_attention_variant_module_spec(
     config: TransformerConfig, backend: BackendSpecProvider = None
 ) -> ModuleSpec:
@@ -140,6 +169,8 @@ def get_experimental_attention_variant_module_spec(
         return get_gated_delta_net_module_spec(config=config, backend=backend)
     elif config.experimental_attention_variant == "dsa":
         return get_dsa_module_spec_for_backend(config=config, backend=backend)
+    elif config.experimental_attention_variant == "msa":
+        return get_msa_module_spec(config=config, backend=backend)
     else:
         raise ValueError(
             f"Invalid experimental attention variant: {config.experimental_attention_variant}"
@@ -201,7 +232,9 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
         experimental_attention_spec = None
 
     if 0 in experimental_attention_pattern:
-        standard_attention_spec = _get_self_attention_module_spec(config=config, backend=backend)
+        standard_attention_spec = _get_self_attention_module_spec(
+            config=config, backend=backend
+        )
     else:
         standard_attention_spec = None
 
@@ -234,7 +267,11 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
             if experimental_attention_pattern[layer_number] == 1
             else standard_attention_spec
         )
-        mlp = moe_layer_spec if moe_layer_pattern[layer_number] == 1 else dense_mlp_layer_spec
+        mlp = (
+            moe_layer_spec
+            if moe_layer_pattern[layer_number] == 1
+            else dense_mlp_layer_spec
+        )
         fuse_pre_mlp_layernorm = (
             fuse_layernorm_pre_moe
             if moe_layer_pattern[layer_number] == 1
@@ -269,7 +306,9 @@ def get_transformer_layer_with_experimental_attention_variant_spec(
 
 
 def get_transformer_block_with_experimental_attention_variant_spec(
-    config: TransformerConfig, vp_stage: Optional[int] = None, pp_rank: Optional[int] = None
+    config: TransformerConfig,
+    vp_stage: Optional[int] = None,
+    pp_rank: Optional[int] = None,
 ) -> TransformerBlockSubmodules:
     """Build transformer block spec with experimental attention variants (e.g., linear attention).
 
@@ -307,8 +346,12 @@ def get_transformer_block_with_experimental_attention_variant_spec(
             layer_type=LayerType.decoder, vp_stage=vp_stage, pp_rank=pp_rank
         )
     else:
-        offset = get_transformer_layer_offset(config, vp_stage=vp_stage, pp_rank=pp_rank)
-        num_layers_to_build = get_num_layers_to_build(config, vp_stage=vp_stage, pp_rank=pp_rank)
+        offset = get_transformer_layer_offset(
+            config, vp_stage=vp_stage, pp_rank=pp_rank
+        )
+        num_layers_to_build = get_num_layers_to_build(
+            config, vp_stage=vp_stage, pp_rank=pp_rank
+        )
         local_layer_ids = range(offset, offset + num_layers_to_build)
 
     layer_specs = [layer_specs[layer_id] for layer_id in local_layer_ids]
@@ -316,7 +359,8 @@ def get_transformer_block_with_experimental_attention_variant_spec(
     # Get GPT decoder block spec
     rms_norm = config.normalization == "RMSNorm"
     gpt_decoder_block_spec = TransformerBlockSubmodules(
-        layer_specs=layer_specs, layer_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False)
+        layer_specs=layer_specs,
+        layer_norm=backend.layer_norm(rms_norm=rms_norm, for_qk=False),
     )
 
     return gpt_decoder_block_spec
@@ -342,7 +386,8 @@ def get_moe_layer_pattern(config: TransformerConfig) -> List[int]:
     if isinstance(config.moe_layer_freq, int):
         # [1,0,0,...,0,1,0,0,...,0,...]
         moe_layer_pattern = [
-            1 if (i % config.moe_layer_freq == 0) else 0 for i in range(config.num_layers)
+            1 if (i % config.moe_layer_freq == 0) else 0
+            for i in range(config.num_layers)
         ]
     elif isinstance(config.moe_layer_freq, list):
         moe_layer_pattern = config.moe_layer_freq
