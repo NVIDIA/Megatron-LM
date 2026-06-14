@@ -504,6 +504,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         #   be None, so this assert will succeed.
         # assert attention_mask is None, "The attention mask is ignored and should be set to None"
 
+        # Pass input_ids to decoder for hash-based MoE routing.
+        decoder_extra_block_kwargs = {}
+        if self.config.moe_n_hash_layers > 0 and input_ids is not None:
+            decoder_extra_block_kwargs['input_ids'] = input_ids
+
         # Run decoder.
         decoder_output = self.decoder(
             hidden_states=decoder_input,
@@ -512,6 +517,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             rotary_pos_emb=rotary_pos_emb,
             packed_seq_params=packed_seq_params,
             padding_mask=padding_mask,
+            **decoder_extra_block_kwargs,
         )
         # HybridStack.forward returns a single Tensor in the common case, but a 2-tuple
         # (hidden_states, mhc_multistream) in exactly one case: enable_hyper_connections and

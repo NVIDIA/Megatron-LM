@@ -2442,7 +2442,7 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.actual_vocab_size is not None
             ), "actual_vocab_size must be set when moe_n_hash_layers > 0."
-            if self.pipeline_model_parallel_size > 1:
+            if self.pipeline_model_parallel_size > 1 and not self.is_hybrid_model:
                 assert self.pipeline_model_parallel_layout is not None, (
                     "pipeline_model_parallel_layout must be set when using hash MoE "
                     "layers with pipeline parallelism (PP > 1)."

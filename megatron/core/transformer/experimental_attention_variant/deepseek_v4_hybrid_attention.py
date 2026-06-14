@@ -82,8 +82,8 @@ class DSv4HybridAttention(Attention):
             attention_type=attention_type,
             attn_mask_type=attn_mask_type,
             pg_collection=pg_collection,
-            is_mtp_layer=is_mtp_layer,
             pp_layer_offset=pp_layer_offset,
+            is_mtp_layer=is_mtp_layer,
             name=name,
         )
         self.config: MLATransformerConfig

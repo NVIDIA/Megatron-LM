@@ -161,6 +161,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         sequence_len_offset: Optional[Tensor],
         packed_seq_params: Optional[PackedSeqParams],
         padding_mask: Optional[Tensor],
+        input_ids: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         # When this wrapper is itself being CUDA-graph captured, the inner layer
         # must run as a plain forward: routing through its ``__call__`` would
@@ -181,6 +182,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
                 sequence_len_offset=sequence_len_offset,
                 packed_seq_params=packed_seq_params,
                 padding_mask=padding_mask,
+                input_ids=input_ids,
                 _called_from_hybrid_mhc_wrapper=True,
             )
         else:
@@ -202,6 +204,67 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             return output[0], context
         return output, None
 
+    def _call_inner_transformer_layer_without_local_bda(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Tensor,
+        inference_context: Optional[BaseInferenceContext],
+        rotary_pos_emb: Optional[Tensor],
+        sequence_len_offset: Optional[Tensor],
+        packed_seq_params: Optional[PackedSeqParams],
+        padding_mask: Optional[Tensor],
+        input_ids: Optional[Tensor] = None,
+    ) -> Optional[Tuple[Tuple[Tensor, Optional[Tensor]], Optional[Tensor], float, bool]]:
+        """Return a raw TransformerLayer branch output when the wrapped layer is split.
+
+        Hybrid DSv4 layers are usually attention-only (`W/C/H/D`) or MLP/MoE-only (`-/E`)
+        TransformerLayer instances. For those layers, skip the inner layer's local
+        residual+BDA and feed the raw branch output directly into the mHC BDA, matching the
+        GPT mHC path and avoiding a residual add followed by `layer_output - aggregated`.
+        """
+        if not isinstance(self.inner_layer, TransformerLayer):
+            return None
+
+        layer = self.inner_layer
+        if (not layer.training) and layer.config.inference_fuse_tp_communication:
+            return None
+
+        has_attention = not isinstance(layer.self_attention, IdentityOp)
+        has_cross_attention = not isinstance(layer.cross_attention, IdentityOp)
+        has_mlp = not isinstance(layer.mlp, IdentityOp)
+
+        if has_cross_attention or has_attention == has_mlp:
+            return None
+
+        if has_attention:
+            output_with_bias, attn_norm_manager, residual = (
+                layer._forward_self_attention_output_with_bias(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    inference_context=inference_context,
+                    rotary_pos_emb=rotary_pos_emb,
+                    packed_seq_params=packed_seq_params,
+                    sequence_len_offset=sequence_len_offset,
+                )
+            )
+            output_with_bias = layer._group_offload_output_with_bias(
+                output_with_bias, attn_norm_manager, forced_released_tensors=[residual]
+            )
+            return output_with_bias, None, layer.hidden_dropout, layer.config.bias_dropout_fusion
+
+        output_with_bias, residual = layer._forward_mlp_output_with_bias(
+            hidden_states,
+            inference_context=inference_context,
+            padding_mask=padding_mask,
+            input_ids=input_ids,
+        )
+        if layer.mlp_norm_manager is not None:
+            output_with_bias = layer._group_offload_output_with_bias(
+                output_with_bias, layer.mlp_norm_manager, forced_released_tensors=[residual]
+            )
+            layer.mlp_norm_manager = None
+        return output_with_bias, None, layer.hidden_dropout, layer.config.bias_dropout_fusion
+
     def forward(
         self,
         hidden_states: Tensor,
@@ -211,6 +274,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         sequence_len_offset: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask: Optional[Tensor] = None,
+        input_ids: Optional[Tensor] = None,
         mhc_recompute_manager=None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         """Run the wrapped hybrid layer through one layer-boundary mHC update.
@@ -224,7 +288,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         aggregated, h_res, h_post = self.hyper_connection(
             hidden_states, mhc_recompute_manager=mhc_recompute_manager
         )
-        layer_output, context = self._call_inner_layer(
+        fast_path_result = self._call_inner_transformer_layer_without_local_bda(
             aggregated,
             attention_mask,
             inference_context,
@@ -232,32 +296,42 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             sequence_len_offset,
             packed_seq_params,
             padding_mask,
+            input_ids,
         )
-        # The inner hybrid layer already applied its own local residual/dropout, so
-        # it returns `aggregated + f(aggregated)`. We feed only the function
-        # delta `f(aggregated)` into the n-stream BDA so it does not double-count
-        # the residual that mHC owns. The temporary [s, b, C] tensor here is the
-        # simplest correct form; a future optimization could fuse the subtraction
-        # into `fused_h_res_h_post_bda` to avoid the allocation.
-        # Sanity check: this contract requires the inner layer to preserve shape;
-        # any mismatch indicates a future layer type is breaking the residual
-        # assumption and would silently corrupt the n-stream state.
+
+        if fast_path_result is None:
+            layer_output, context = self._call_inner_layer(
+                aggregated,
+                attention_mask,
+                inference_context,
+                rotary_pos_emb,
+                sequence_len_offset,
+                packed_seq_params,
+                padding_mask,
+                input_ids,
+            )
+            # The inner hybrid layer already applied its own local residual/dropout, so
+            # it returns `aggregated + f(aggregated)`. We feed only the function
+            # delta `f(aggregated)` into the n-stream BDA so it does not double-count
+            # the residual that mHC owns.
+            if self.config.fp32_residual_connection and aggregated.dtype != layer_output.dtype:
+                aggregated = aggregated.to(layer_output.dtype)
+            layer_output_with_bias = (layer_output - aggregated, None)
+            dropout_prob = 0.0
+            bias_dropout_fusion = False
+        else:
+            layer_output_with_bias, context, dropout_prob, bias_dropout_fusion = fast_path_result
+
+        layer_output = layer_output_with_bias[0]
+        # Sanity check: this contract requires the branch output to preserve shape;
+        # any mismatch indicates a future layer type is breaking the residual assumption
+        # and would silently corrupt the n-stream state.
         if layer_output.shape != aggregated.shape:
             raise RuntimeError(
-                "HyperConnectionHybridLayer requires inner layers to preserve "
-                f"hidden-state shape. Got {tuple(layer_output.shape)} from inner layer "
-                f"vs {tuple(aggregated.shape)} input; layer must add its own residual."
+                "HyperConnectionHybridLayer requires wrapped branches to preserve "
+                f"hidden-state shape. Got {tuple(layer_output.shape)} from wrapped branch "
+                f"vs {tuple(aggregated.shape)} input."
             )
-        # `fp32_residual_connection=True` may cause some inner layers (e.g.,
-        # MambaLayer) to return `layer_output` in fp32 while `aggregated` is in
-        # compute dtype; explicitly upcast `aggregated` so the subtraction stays
-        # in fp32 instead of relying on PyTorch's implicit promotion.
-        if self.config.fp32_residual_connection and aggregated.dtype != layer_output.dtype:
-            aggregated = aggregated.to(layer_output.dtype)
-        layer_delta = layer_output - aggregated
-        # `dropout_prob=0.0` already disables dropout regardless of training mode;
-        # `training=self.training` is more semantically accurate than hard-coding
-        # False during a training-mode forward.
         is_last_in_recompute_block = bool(
             mhc_recompute_manager is not None
             and getattr(mhc_recompute_manager, "is_last_layer_in_recompute_block", False)
@@ -268,10 +342,10 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             h_res,
             residual,
             h_post,
-            (layer_delta, None),
-            dropout_prob=0.0,
+            layer_output_with_bias,
+            dropout_prob=dropout_prob,
             training=self.training,
-            fused=False,
+            fused=bias_dropout_fusion,
             manager=mhc_bda_manager,
         )
         # In `HyperConnectionTransformerLayer` the n-stream output stays in compute
@@ -313,6 +387,7 @@ class HybridStack(MegatronModule):
         pg_collection (ProcessGroupCollection): the required model communication
             process groups to use.
         is_mtp_layer (bool, optional): whether this is an MTP layer. Defaults to False.
+        mtp_layer_number (int, optional): enclosing MTP depth for logging nested MTP metrics.
     """
 
     def __init__(
@@ -328,6 +403,7 @@ class HybridStack(MegatronModule):
         dtype=None,
         pg_collection: ProcessGroupCollection = None,
         is_mtp_layer: bool = False,
+        mtp_layer_number: Optional[int] = None,
         name: str | None = None,
     ) -> None:
         """
@@ -339,6 +415,7 @@ class HybridStack(MegatronModule):
         self.post_layer_norm = post_layer_norm
         self.post_process = post_process
         self.is_mtp_layer = is_mtp_layer
+        self.mtp_layer_number = mtp_layer_number
 
         assert pg_collection is not None, "pg_collection must be provided for HybridStack"
 
@@ -450,6 +527,7 @@ class HybridStack(MegatronModule):
                         config=self.config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
@@ -465,6 +543,8 @@ class HybridStack(MegatronModule):
                     )
                 else:
                     raise ValueError("unexpected layer_type")
+            if self.is_mtp_layer and self.mtp_layer_number is not None:
+                self._set_mtp_layer_number_for_moe_metrics(layer, self.mtp_layer_number)
             if self.config.enable_hyper_connections:
                 layer = HyperConnectionHybridLayer(config=self.config, layer=layer)
             self.layers.append(layer)
@@ -495,6 +575,14 @@ class HybridStack(MegatronModule):
                 setattr(self.hc_head_fn, 'sequence_parallel', True)
                 setattr(self.hc_head_base, 'sequence_parallel', True)
                 setattr(self.hc_head_scale, 'sequence_parallel', True)
+
+    @staticmethod
+    def _set_mtp_layer_number_for_moe_metrics(layer: torch.nn.Module, mtp_layer_number: int) -> None:
+        """Tell nested MTP MoE routers which MTP depth they belong to for logging."""
+        for module in layer.modules():
+            router = getattr(module, "router", None)
+            if router is not None and getattr(router, "is_mtp_layer", False):
+                router.mtp_layer_number = mtp_layer_number
 
     def set_input_tensor(self, input_tensor: Tensor):
         """Set input tensor to be used instead of forward()'s input.
@@ -579,6 +667,7 @@ class HybridStack(MegatronModule):
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask=None,
+        input_ids: Optional[Tensor] = None,
     ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
         """
         Forward function of the HybridStack class.
@@ -690,6 +779,7 @@ class HybridStack(MegatronModule):
                     attention_bias=None,
                     packed_seq_params=packed_seq_params,
                     padding_mask=padding_mask,
+                    input_ids=input_ids,
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
                 )
             else:
@@ -698,6 +788,7 @@ class HybridStack(MegatronModule):
                     inner_quant_context = get_inner_quant_context(
                         self.config, layer.layer_number - 1
                     )
+
                     mhc_manager = mhc_layer_managers[l_no]
                     if mhc_manager is not None:
                         mhc_manager.is_last_layer_in_recompute_block = (
@@ -715,6 +806,8 @@ class HybridStack(MegatronModule):
                                 packed_seq_params=packed_seq_params,
                                 padding_mask=padding_mask,
                             )
+                            if input_ids is not None:
+                                layer_kwargs["input_ids"] = input_ids
                             if mhc_manager is not None and isinstance(
                                 layer, HyperConnectionHybridLayer
                             ):
