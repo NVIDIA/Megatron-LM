@@ -249,11 +249,7 @@ def test_run_comments_and_exits_for_invalid_requested_assignee(monkeypatch):
         module.run(dry_run=False, require_slack=True)
 
     assert comments == [
-        (
-            136,
-            "User @mallory does not exist or is not part of mcore-engineers",
-            False,
-        )
+        (136, "User @mallory does not exist or is not part of mcore-engineers", False)
     ]
 
 
