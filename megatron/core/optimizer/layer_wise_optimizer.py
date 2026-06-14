@@ -19,6 +19,8 @@ from .optimizer import (
     Float16OptimizerWithFloat16Params,
     FP32Optimizer,
     MegatronOptimizer,
+    _get_param_grad_norm_group,
+    _validate_grad_norm_group,
 )
 from .optimizer_config import OptimizerConfig
 from .param_layout import (
@@ -702,7 +704,43 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # similar to dist opt, always aggregate globally
         grads_for_norm = []
         for optimizer in self.chained_optimizers:
-            grads_for_norm += optimizer.get_main_grads_for_grad_norm()
+            grads_for_norm += optimizer.get_grads_for_grad_norm()
+        grad_norm = get_grad_norm_fp32(grads_for_norm, grad_stats_parallel_group=None)
+        return grad_norm
+
+    def has_grad_norm_group(self, grad_norm_group: str) -> bool:
+        """Whether any global rank owns params for a registered grad-norm group.
+
+        Overrides ChainedOptimizer to use a single global all-reduce (group=None),
+        matching the scope of get_grad_norm and _get_grad_norm_for_group which also
+        reduce globally. All LayerWise grad-stats reductions are global (identical to
+        DistributedOptimizer's pattern), so the existence check must be too — using
+        a per-sub-optimizer group here would create a collective mismatch.
+        """
+        _validate_grad_norm_group(grad_norm_group)
+        if getattr(self, '_has_grad_norm_group_cache', None) is None:
+            self._has_grad_norm_group_cache = {}
+        cache = self._has_grad_norm_group_cache
+        if grad_norm_group not in cache:
+            local = False
+            for optimizer in self.chained_optimizers:
+                for param in optimizer.get_parameters():
+                    param_grad_norm_group = _get_param_grad_norm_group(param)
+                    if param_grad_norm_group is None:
+                        continue
+                    _validate_grad_norm_group(param_grad_norm_group)
+                    local = local or param_grad_norm_group == grad_norm_group
+            flag = torch.tensor([1 if local else 0], dtype=torch.int, device='cuda')
+            torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX, group=None)
+            cache[grad_norm_group] = bool(flag.item() > 0)
+        return cache[grad_norm_group]
+
+    @torch.no_grad()
+    def _get_grad_norm_for_group(self, grad_norm_group: str):
+        # similar to dist opt, always aggregate globally
+        grads_for_norm = []
+        for optimizer in self.chained_optimizers:
+            grads_for_norm += optimizer.get_grads_for_grad_norm(grad_norm_group)
         grad_norm = get_grad_norm_fp32(grads_for_norm, grad_stats_parallel_group=None)
         return grad_norm
 
