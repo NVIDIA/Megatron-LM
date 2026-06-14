@@ -85,9 +85,9 @@ def get_required_env(name: str) -> str:
 
 
 def get_headers() -> dict[str, str]:
-    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    token = os.environ.get("GH_TOKEN")
     if not token:
-        print("Error: GH_TOKEN or GITHUB_TOKEN not set")
+        print("Error: GH_TOKEN is required")
         sys.exit(1)
 
     return {
