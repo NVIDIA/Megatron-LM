@@ -1,8 +1,11 @@
 # Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
+
+import pytest
 
 
 def load_assignee_module():
@@ -140,6 +143,107 @@ def test_requested_assignee_override_uses_manual_candidate(monkeypatch):
     assert plan.confidence == 1.0
     assert plan.assignment_source == "manual"
     assert plan.rationale.startswith("Assignee was requested explicitly by /claude assign.")
+
+
+def test_requested_assignee_uses_canonical_login_case_insensitively(monkeypatch):
+    module = load_assignee_module()
+    issue = make_issue(module, number=134, title="Manual assignment casing")
+
+    monkeypatch.setenv("REQUESTED_ASSIGNEE", "@phlip79")
+    monkeypatch.setattr(module, "check_assignable", lambda issue, login: login == "Phlip79")
+    monkeypatch.setattr(
+        module,
+        "get_team_members",
+        lambda org, team_slug: (
+            {"Phlip79"} if team_slug == module.ASSIGNEE_ALLOWED_TEAM_SLUG else set()
+        ),
+    )
+
+    analysis = module.apply_requested_assignee_override(make_analysis(assignee=None))
+    plan = module.create_assignment_plan(analysis, issue)
+
+    assert plan.mode == "candidate"
+    assert plan.assignees == ["Phlip79"]
+    assert plan.notify_users == ["Phlip79"]
+
+
+def test_requested_assignee_rejection_does_not_fallback_to_oncall(monkeypatch):
+    module = load_assignee_module()
+    issue = make_issue(module, number=135, title="Invalid manual assignment")
+
+    monkeypatch.setenv("REQUESTED_ASSIGNEE", "@mallory")
+
+    def fake_team_members(org, team_slug):
+        if team_slug == module.ASSIGNEE_ALLOWED_TEAM_SLUG:
+            return {"bob"}
+        if team_slug == module.ACTIVE_ONCALL_TEAM_SLUG:
+            return {"bob"}
+        return set()
+
+    monkeypatch.setattr(module, "get_team_members", fake_team_members)
+    monkeypatch.setattr(module, "check_assignable", lambda issue, login: True)
+
+    analysis = module.apply_requested_assignee_override(make_analysis(assignee=None))
+    plan = module.create_assignment_plan(analysis, issue)
+
+    assert plan.mode == "manual_rejected"
+    assert plan.assignees == []
+    assert plan.notify_users == []
+    assert plan.rejected_candidate == "mallory"
+    assert (
+        module.manual_assignee_rejection_comment(plan.rejected_candidate)
+        == "User @mallory does not exist or is not part of mcore-engineers"
+    )
+
+
+def test_run_comments_and_exits_for_invalid_requested_assignee(monkeypatch):
+    module = load_assignee_module()
+    comments = []
+
+    monkeypatch.setenv("GITHUB_REPOSITORY", "NVIDIA/Megatron-LM")
+    monkeypatch.setenv("ISSUE_NUMBER", "136")
+    monkeypatch.setenv("ISSUE_TITLE", "Invalid manual assignment")
+    monkeypatch.setenv("ISSUE_URL", "https://github.com/NVIDIA/Megatron-LM/issues/136")
+    monkeypatch.setenv("ISSUE_AUTHOR", "external-user")
+    monkeypatch.setenv("REQUESTED_ASSIGNEE", "@mallory")
+    monkeypatch.setenv("ANALYSIS_JSON", json.dumps(make_analysis(assignee=None)))
+    monkeypatch.setattr(
+        module,
+        "get_team_members",
+        lambda org, team_slug: (
+            {"bob"} if team_slug == module.ASSIGNEE_ALLOWED_TEAM_SLUG else set()
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "post_issue_comment",
+        lambda issue, body, dry_run: comments.append((issue.number, body, dry_run)),
+    )
+    monkeypatch.setattr(
+        module,
+        "assign_issue",
+        lambda issue, assignees, dry_run=False: (_ for _ in ()).throw(
+            AssertionError("manual rejection must not assign the issue")
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "send_slack_notifications",
+        lambda issue, plan, dry_run, require_slack: (_ for _ in ()).throw(
+            AssertionError("manual rejection must not send Slack notifications")
+        ),
+    )
+
+    with pytest.raises(SystemExit):
+        module.run(dry_run=False, require_slack=True)
+
+    assert comments == [
+        (
+            136,
+            "User @mallory does not exist or is not part of mcore-engineers",
+            False,
+        )
+    ]
 
 
 def test_create_assignment_plan_rejects_non_engineer_candidate(monkeypatch):

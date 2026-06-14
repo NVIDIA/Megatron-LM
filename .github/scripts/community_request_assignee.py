@@ -38,6 +38,9 @@ SERVICE_ACCOUNT_LOGINS = {"svcnvidia-nemo-ci"}
 NON_NVIDIA_EMAIL_SLACK_FALLBACK = (
     "The user was assigned to the issue, but I was unable to send the slack message."
 )
+MANUAL_ASSIGNEE_REJECTION_TEMPLATE = (
+    "User @{login} does not exist or is not part of mcore-engineers"
+)
 
 
 @dataclass(frozen=True)
@@ -142,6 +145,10 @@ def post_issue_comment(issue: IssueContext, body: str, dry_run: bool) -> None:
         sys.exit(1)
 
 
+def manual_assignee_rejection_comment(login: str) -> str:
+    return MANUAL_ASSIGNEE_REJECTION_TEMPLATE.format(login=login)
+
+
 def parse_analysis(raw_analysis: str) -> dict:
     try:
         analysis = json.loads(raw_analysis)
@@ -168,8 +175,18 @@ def normalize_login(login: str | None) -> str | None:
     return normalized or None
 
 
+def canonical_login(login: str | None, candidates: set[str] | list[str]) -> str | None:
+    normalized = normalize_login(login)
+    if not normalized:
+        return None
+
+    candidates_by_lower = {candidate.lower(): candidate for candidate in candidates}
+    return candidates_by_lower.get(normalized.lower())
+
+
 def is_service_account(login: str) -> bool:
-    return login in SERVICE_ACCOUNT_LOGINS or login.startswith("svc")
+    normalized = login.lower()
+    return normalized in SERVICE_ACCOUNT_LOGINS or normalized.startswith("svc")
 
 
 def human_members(members: set[str] | list[str]) -> list[str]:
@@ -302,7 +319,7 @@ def candidate_rejection_reason(analysis: dict, candidate: str, allowed_assignees
     if confidence < CONFIDENCE_THRESHOLD:
         return f"confidence {confidence:.2f} is below the {CONFIDENCE_THRESHOLD:.2f} threshold"
 
-    if candidate not in allowed_assignees:
+    if not canonical_login(candidate, allowed_assignees):
         return f"they are not in {ASSIGNEE_ALLOWED_TEAM_SLUG}"
 
     if bool(analysis.get("fallback_to_oncall", False)):
@@ -349,15 +366,18 @@ def select_candidate_assignee(
             rejected_reason="service accounts cannot be assigned",
         )
 
-    if analysis_confidence(analysis) < CONFIDENCE_THRESHOLD:
+    canonical_candidate = canonical_login(candidate, allowed_assignees)
+    if not canonical_candidate:
+        print(f"Rejecting {candidate}; they are not in {ASSIGNEE_ALLOWED_TEAM_SLUG}")
         return CandidateDecision(
             assignee=None,
             rejected_candidate=candidate,
             rejected_reason=candidate_rejection_reason(analysis, candidate, allowed_assignees),
         )
 
-    if candidate not in allowed_assignees:
-        print(f"Rejecting {candidate}; they are not in {ASSIGNEE_ALLOWED_TEAM_SLUG}")
+    candidate = canonical_candidate
+
+    if analysis_confidence(analysis) < CONFIDENCE_THRESHOLD:
         return CandidateDecision(
             assignee=None,
             rejected_candidate=candidate,
@@ -394,7 +414,8 @@ def create_assignment_plan(analysis: dict, issue: IssueContext) -> AssignmentPla
     relevant_paths = analysis_relevant_paths(analysis)
     issue_type = analysis_issue_type(analysis)
     context = analysis_slack_context(analysis)
-    assignment_source = "manual" if analysis.get("_requested_assignee") else "claude"
+    requested_assignee = normalize_login(analysis.get("_requested_assignee"))
+    assignment_source = "manual" if requested_assignee else "claude"
     allowed_assignees = get_allowed_assignees(issue.owner)
     candidate_decision = select_candidate_assignee(analysis, issue, allowed_assignees)
 
@@ -409,6 +430,21 @@ def create_assignment_plan(analysis: dict, issue: IssueContext) -> AssignmentPla
             issue_type=issue_type,
             context=context,
             assignment_source=assignment_source,
+        )
+
+    if requested_assignee:
+        return AssignmentPlan(
+            mode="manual_rejected",
+            assignees=[],
+            notify_users=[],
+            confidence=confidence,
+            rationale=rationale,
+            relevant_paths=relevant_paths,
+            issue_type=issue_type,
+            context=context,
+            assignment_source=assignment_source,
+            rejected_candidate=candidate_decision.rejected_candidate or requested_assignee,
+            rejected_candidate_reason=candidate_decision.rejected_reason,
         )
 
     candidate_login = normalize_login(analysis.get("assignee")) or analysis_potential_assignee(
@@ -545,6 +581,17 @@ def run(dry_run: bool = False, require_slack: bool = True) -> AssignmentPlan:
     issue = get_issue_context()
     analysis = apply_requested_assignee_override(parse_analysis(get_required_env("ANALYSIS_JSON")))
     plan = create_assignment_plan(analysis, issue)
+
+    if plan.mode == "manual_rejected":
+        rejected_candidate = plan.rejected_candidate or "requested-user"
+        post_issue_comment(
+            issue,
+            manual_assignee_rejection_comment(rejected_candidate),
+            dry_run=dry_run,
+        )
+        if not dry_run:
+            sys.exit(1)
+        return plan
 
     assign_issue(issue, plan.assignees, dry_run=dry_run)
     send_slack_notifications(issue, plan, dry_run=dry_run, require_slack=require_slack)
