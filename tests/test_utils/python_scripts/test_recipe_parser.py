@@ -67,15 +67,16 @@ def test_resolve_local_image_prepare_cluster_uses_same_site_cpu_cluster():
     assert recipe_parser.resolve_local_image_prepare_cluster("cpu_coreweave") == "cpu_coreweave"
 
 
-def test_prepare_workload_uses_image_source_without_build():
+def test_prepare_workload_uses_build_and_image_source():
     workload = prepare_jet_sqsh_image.build_prepare_workload(
+        build="mcore-pyt-dev",
         source_image="gitlab-master.nvidia.com/adlr/megatron-lm/mcore_ci_dev:12345",
         local_path="/lustre/enroot/mcore-pyt-dev-dgx_h100-12345.sqsh",
         time_limit=1800,
     )
 
     spec = workload["spec"]
-    assert "build" not in spec
+    assert spec["build"] == "mcore-pyt-dev"
     assert spec["image_source"] == {
         "image_tag": "gitlab-master.nvidia.com/adlr/megatron-lm/mcore_ci_dev:12345"
     }

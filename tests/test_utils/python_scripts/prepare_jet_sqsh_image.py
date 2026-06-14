@@ -24,7 +24,9 @@ def _local_image_workload_name(source_image: str, local_path: str) -> str:
     return f"prepare-sqsh-{digest}"
 
 
-def build_prepare_workload(source_image: str, local_path: str, time_limit: int) -> Dict:
+def build_prepare_workload(
+    build: str, source_image: str, local_path: str, time_limit: int
+) -> Dict:
     workload_name = _local_image_workload_name(source_image=source_image, local_path=local_path)
     return {
         "type": "basic",
@@ -33,6 +35,7 @@ def build_prepare_workload(source_image: str, local_path: str, time_limit: int) 
         "loggers": ["stdout"],
         "spec": {
             "name": workload_name,
+            "build": build,
             "image_source": {"image_tag": source_image},
             "nodes": 1,
             "gpus": 0,
@@ -49,6 +52,7 @@ def build_prepare_workload(source_image: str, local_path: str, time_limit: int) 
 
 
 def submit_prepare_workload(
+    build: str,
     source_image: str,
     local_path: str,
     cluster: str,
@@ -72,6 +76,7 @@ def submit_prepare_workload(
                 workloads=[
                     jetclient.JETWorkloadManifest(
                         **build_prepare_workload(
+                            build=build,
                             source_image=source_image,
                             local_path=local_path,
                             time_limit=time_limit,
@@ -140,6 +145,7 @@ def prepare_local_image(
 
     logger.info("Preparing %s for %s from %s on %s", local_path, build, source_image, cluster)
     pipeline = submit_prepare_workload(
+        build=build,
         source_image=source_image,
         local_path=local_path,
         cluster=cluster,
