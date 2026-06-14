@@ -40,12 +40,16 @@ _slack_id_cache = {}
 def get_headers() -> dict[str, str]:
     """Return GitHub API headers from the configured workflow token."""
 
-    token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    token = os.environ.get("GH_TOKEN")
     if not token:
-        print("Error: GH_TOKEN or GITHUB_TOKEN not set")
+        print("Error: GH_TOKEN is required")
         sys.exit(1)
 
-    return {"Authorization": f"token {token}", "Accept": "application/vnd.github.v3+json"}
+    return {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
 
 
 def get_user_email(username: str) -> str:

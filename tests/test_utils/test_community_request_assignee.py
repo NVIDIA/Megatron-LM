@@ -4,8 +4,6 @@ import importlib.util
 import sys
 from pathlib import Path
 
-import pytest
-
 
 def load_assignee_module():
     scripts_dir = Path(__file__).parents[2] / ".github" / "scripts"
@@ -45,16 +43,6 @@ def make_analysis(**overrides):
     }
     analysis.update(overrides)
     return analysis
-
-
-def test_get_headers_requires_gh_token_without_github_token_fallback(monkeypatch):
-    module = load_assignee_module()
-
-    monkeypatch.delenv("GH_TOKEN", raising=False)
-    monkeypatch.setenv("GITHUB_TOKEN", "github-token")
-
-    with pytest.raises(SystemExit):
-        module.get_headers()
 
 
 def test_human_members_excludes_service_accounts():

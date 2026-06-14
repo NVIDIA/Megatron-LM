@@ -3,6 +3,8 @@
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 
 def load_utils_module():
     module_path = Path(__file__).parents[2] / ".github" / "scripts" / "github_slack_utils.py"
@@ -47,8 +49,20 @@ def test_get_user_email_uses_signed_off_by_fallback(monkeypatch):
     monkeypatch.setattr(module, "requests", FakeRequests)
 
     assert module.get_user_email("alice") == "alice@nvidia.com"
-    assert requests_seen[0][1]["Authorization"] == "token token"
+    assert requests_seen[0][1]["Authorization"] == "Bearer token"
+    assert requests_seen[0][1]["Accept"] == "application/vnd.github+json"
+    assert requests_seen[0][1]["X-GitHub-Api-Version"] == "2022-11-28"
     assert requests_seen[0][2] == 30
+
+
+def test_get_headers_requires_gh_token_without_github_token_fallback(monkeypatch):
+    module = load_utils_module()
+
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.setenv("GITHUB_TOKEN", "github-token")
+
+    with pytest.raises(SystemExit):
+        module.get_headers()
 
 
 def test_get_slack_user_id_uses_lookup_by_email():

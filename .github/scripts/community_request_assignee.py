@@ -20,7 +20,7 @@ import os
 import sys
 from dataclasses import dataclass
 
-from github_slack_utils import get_slack_client, get_slack_user_id, get_user_email
+from github_slack_utils import get_headers, get_slack_client, get_slack_user_id, get_user_email
 
 try:
     import requests
@@ -82,19 +82,6 @@ def get_required_env(name: str) -> str:
         print(f"Error: {name} is required")
         sys.exit(1)
     return value
-
-
-def get_headers() -> dict[str, str]:
-    token = os.environ.get("GH_TOKEN")
-    if not token:
-        print("Error: GH_TOKEN is required")
-        sys.exit(1)
-
-    return {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/vnd.github+json",
-        "X-GitHub-Api-Version": "2022-11-28",
-    }
 
 
 def get_repo_info() -> tuple[str, str]:
