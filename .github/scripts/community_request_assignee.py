@@ -175,15 +175,6 @@ def normalize_login(login: str | None) -> str | None:
     return normalized or None
 
 
-def canonical_login(login: str | None, candidates: set[str] | list[str]) -> str | None:
-    normalized = normalize_login(login)
-    if not normalized:
-        return None
-
-    candidates_by_lower = {candidate.lower(): candidate for candidate in candidates}
-    return candidates_by_lower.get(normalized.lower())
-
-
 def is_service_account(login: str) -> bool:
     normalized = login.lower()
     return normalized in SERVICE_ACCOUNT_LOGINS or normalized.startswith("svc")
@@ -319,7 +310,7 @@ def candidate_rejection_reason(analysis: dict, candidate: str, allowed_assignees
     if confidence < CONFIDENCE_THRESHOLD:
         return f"confidence {confidence:.2f} is below the {CONFIDENCE_THRESHOLD:.2f} threshold"
 
-    if not canonical_login(candidate, allowed_assignees):
+    if candidate not in allowed_assignees:
         return f"they are not in {ASSIGNEE_ALLOWED_TEAM_SLUG}"
 
     if bool(analysis.get("fallback_to_oncall", False)):
@@ -366,16 +357,13 @@ def select_candidate_assignee(
             rejected_reason="service accounts cannot be assigned",
         )
 
-    canonical_candidate = canonical_login(candidate, allowed_assignees)
-    if not canonical_candidate:
+    if candidate not in allowed_assignees:
         print(f"Rejecting {candidate}; they are not in {ASSIGNEE_ALLOWED_TEAM_SLUG}")
         return CandidateDecision(
             assignee=None,
             rejected_candidate=candidate,
             rejected_reason=candidate_rejection_reason(analysis, candidate, allowed_assignees),
         )
-
-    candidate = canonical_candidate
 
     if analysis_confidence(analysis) < CONFIDENCE_THRESHOLD:
         return CandidateDecision(

@@ -145,12 +145,18 @@ def test_requested_assignee_override_uses_manual_candidate(monkeypatch):
     assert plan.rationale.startswith("Assignee was requested explicitly by /claude assign.")
 
 
-def test_requested_assignee_uses_canonical_login_case_insensitively(monkeypatch):
+def test_requested_assignee_requires_exact_login_match(monkeypatch):
     module = load_assignee_module()
     issue = make_issue(module, number=134, title="Manual assignment casing")
 
     monkeypatch.setenv("REQUESTED_ASSIGNEE", "@phlip79")
-    monkeypatch.setattr(module, "check_assignable", lambda issue, login: login == "Phlip79")
+    monkeypatch.setattr(
+        module,
+        "check_assignable",
+        lambda issue, login: (_ for _ in ()).throw(
+            AssertionError("wrong-case login should be rejected before assignability check")
+        ),
+    )
     monkeypatch.setattr(
         module,
         "get_team_members",
@@ -162,9 +168,14 @@ def test_requested_assignee_uses_canonical_login_case_insensitively(monkeypatch)
     analysis = module.apply_requested_assignee_override(make_analysis(assignee=None))
     plan = module.create_assignment_plan(analysis, issue)
 
-    assert plan.mode == "candidate"
-    assert plan.assignees == ["Phlip79"]
-    assert plan.notify_users == ["Phlip79"]
+    assert plan.mode == "manual_rejected"
+    assert plan.assignees == []
+    assert plan.notify_users == []
+    assert plan.rejected_candidate == "phlip79"
+    assert (
+        module.manual_assignee_rejection_comment(plan.rejected_candidate)
+        == "User @phlip79 does not exist or is not part of mcore-engineers"
+    )
 
 
 def test_requested_assignee_rejection_does_not_fallback_to_oncall(monkeypatch):
