@@ -577,7 +577,9 @@ class HybridStack(MegatronModule):
                 setattr(self.hc_head_scale, 'sequence_parallel', True)
 
     @staticmethod
-    def _set_mtp_layer_number_for_moe_metrics(layer: torch.nn.Module, mtp_layer_number: int) -> None:
+    def _set_mtp_layer_number_for_moe_metrics(
+        layer: torch.nn.Module, mtp_layer_number: int
+    ) -> None:
         """Tell nested MTP MoE routers which MTP depth they belong to for logging."""
         for module in layer.modules():
             router = getattr(module, "router", None)
