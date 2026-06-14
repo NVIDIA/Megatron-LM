@@ -65,6 +65,16 @@ def test_get_headers_requires_gh_token_without_github_token_fallback(monkeypatch
         module.get_headers()
 
 
+def test_get_headers_uses_requested_token_env(monkeypatch):
+    module = load_utils_module()
+
+    monkeypatch.setenv("ISSUE_COMMENT_TOKEN", "comment-token")
+
+    headers = module.get_headers("ISSUE_COMMENT_TOKEN")
+
+    assert headers["Authorization"] == "Bearer comment-token"
+
+
 def test_get_slack_user_id_uses_lookup_by_email():
     module = load_utils_module()
 

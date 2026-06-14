@@ -35,6 +35,9 @@ MCORE_ONCALL_SLACK_USERGROUP_ID = "S0A7B4U1T3P"
 CONFIDENCE_THRESHOLD = 0.75
 MAX_SLACK_CONTEXT_CHARS = 1200
 SERVICE_ACCOUNT_LOGINS = {"svcnvidia-nemo-ci"}
+NON_NVIDIA_EMAIL_SLACK_FALLBACK = (
+    "The user was assigned to the issue, but I was unable to send the slack message."
+)
 
 
 @dataclass(frozen=True)
@@ -116,6 +119,27 @@ def request_json(method: str, url: str, **kwargs):
         return None
 
     return response.json()
+
+
+def post_issue_comment(issue: IssueContext, body: str, dry_run: bool) -> None:
+    print(f"Posting fallback comment on issue #{issue.number}: {body}")
+    if dry_run:
+        return
+
+    if requests is None:
+        print("Error: requests is not installed")
+        sys.exit(1)
+
+    url = f"{GITHUB_API_URL}/repos/{issue.owner}/{issue.repo}/issues/{issue.number}/comments"
+    response = requests.post(
+        url,
+        headers=get_headers("ISSUE_COMMENT_TOKEN"),
+        json={"body": body},
+        timeout=30,
+    )
+    if response.status_code >= 400:
+        print(f"GitHub API request failed: POST {url}: {response.status_code} {response.text}")
+        sys.exit(1)
 
 
 def parse_analysis(raw_analysis: str) -> dict:
@@ -482,9 +506,20 @@ def send_slack_notifications(
 
     message = build_slack_message(issue, plan)
     missing_users = []
+    posted_non_nvidia_email_comment = False
 
     for username in plan.notify_users:
         email = get_user_email(username)
+        if not email.lower().endswith("@nvidia.com"):
+            print(
+                f"{NON_NVIDIA_EMAIL_SLACK_FALLBACK} "
+                f"GitHub user {username} resolved to non-NVIDIA email {email}."
+            )
+            if not posted_non_nvidia_email_comment:
+                post_issue_comment(issue, NON_NVIDIA_EMAIL_SLACK_FALLBACK, dry_run=dry_run)
+                posted_non_nvidia_email_comment = True
+            continue
+
         slack_user_id = get_slack_user_id(slack_client, email)
         if not slack_user_id:
             missing_users.append(f"{username} ({email})")

@@ -37,12 +37,12 @@ _email_cache = {}
 _slack_id_cache = {}
 
 
-def get_headers() -> dict[str, str]:
+def get_headers(token_env: str = "GH_TOKEN") -> dict[str, str]:
     """Return GitHub API headers from the configured workflow token."""
 
-    token = os.environ.get("GH_TOKEN")
+    token = os.environ.get(token_env)
     if not token:
-        print("Error: GH_TOKEN is required")
+        print(f"Error: {token_env} is required")
         sys.exit(1)
 
     return {

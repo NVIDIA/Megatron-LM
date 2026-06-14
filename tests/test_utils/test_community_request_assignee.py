@@ -309,3 +309,73 @@ def test_build_slack_message_includes_oncall_uncertainty_context():
     assert "Potential assignee considered: yashaswikarnati (confidence: 0.62)." in message
     assert "Not assigned because confidence 0.62 is below the 0.75 threshold." in message
     assert "Issue type: feature_request" in message
+
+
+def test_send_slack_notifications_skips_non_nvidia_email_without_failing(monkeypatch, capsys):
+    module = load_assignee_module()
+    issue = make_issue(module, number=132, title="Missing Slack mapping")
+    comments = []
+    plan = module.AssignmentPlan(
+        mode="candidate",
+        assignees=["alice"],
+        notify_users=["alice"],
+        confidence=0.91,
+        rationale="Alice owns the affected feature area.",
+        relevant_paths=[],
+        issue_type="bug",
+        context="Alice owns the affected feature area.",
+    )
+
+    monkeypatch.setattr(module, "get_slack_client", lambda require_slack: object())
+    monkeypatch.setattr(module, "get_user_email", lambda username: "alice@example.com")
+    monkeypatch.setattr(
+        module,
+        "post_issue_comment",
+        lambda issue, body, dry_run: comments.append((issue.number, body, dry_run)),
+    )
+
+    def fail_slack_lookup(slack_client, email):
+        raise AssertionError("non-NVIDIA emails should not be sent to Slack lookup")
+
+    monkeypatch.setattr(module, "get_slack_user_id", fail_slack_lookup)
+
+    module.send_slack_notifications(issue, plan, dry_run=False, require_slack=True)
+
+    output = capsys.readouterr().out
+    assert module.NON_NVIDIA_EMAIL_SLACK_FALLBACK in output
+    assert "alice@example.com" in output
+    assert comments == [(132, module.NON_NVIDIA_EMAIL_SLACK_FALLBACK, False)]
+
+
+def test_post_issue_comment_uses_issue_comment_token(monkeypatch):
+    module = load_assignee_module()
+    issue = make_issue(module, number=133, title="Fallback comment")
+    requests_seen = []
+
+    class FakeResponse:
+        status_code = 201
+        text = ""
+
+    class FakeRequests:
+        @staticmethod
+        def post(url, headers, json, timeout):
+            requests_seen.append((url, headers, json, timeout))
+            return FakeResponse()
+
+    monkeypatch.setenv("ISSUE_COMMENT_TOKEN", "comment-token")
+    monkeypatch.setattr(module, "requests", FakeRequests)
+
+    module.post_issue_comment(issue, module.NON_NVIDIA_EMAIL_SLACK_FALLBACK, dry_run=False)
+
+    assert requests_seen == [
+        (
+            "https://api.github.com/repos/NVIDIA/Megatron-LM/issues/133/comments",
+            {
+                "Authorization": "Bearer comment-token",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+            },
+            {"body": module.NON_NVIDIA_EMAIL_SLACK_FALLBACK},
+            30,
+        )
+    ]
