@@ -35,6 +35,7 @@ jobs:
       command_valid: ${{ steps.assignment-command.outputs.valid }}
       requested_assignee: ${{ steps.assignment-command.outputs.requested_assignee }}
       authorized: ${{ steps.command-author.outputs.authorized }}
+      issue_unassigned: ${{ steps.live-issue.outputs.unassigned }}
       analysis_json: ${{ steps.claude-analysis.outputs.structured_output }}
     if: |
       github.event_name == 'issue_comment' &&
@@ -90,10 +91,27 @@ jobs:
               ;;
           esac
 
-      - name: Checkout repository
+      - name: Check live issue assignment
         if: |
           steps.assignment-command.outputs.valid == 'true' &&
           steps.command-author.outputs.authorized == 'true'
+        id: live-issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          assignee="$(gh api "repos/${REPO}/issues/${ISSUE_NUMBER}" --jq '.assignee.login // empty')"
+          if [ -n "${assignee}" ]; then
+            echo "Issue #${ISSUE_NUMBER} is already assigned to ${assignee}; skipping Claude analysis."
+            echo "unassigned=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "unassigned=true" >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Checkout repository
+        if: |
+          steps.assignment-command.outputs.valid == 'true' &&
+          steps.command-author.outputs.authorized == 'true' &&
+          steps.live-issue.outputs.unassigned == 'true'
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
@@ -101,7 +119,8 @@ jobs:
       - name: Analyze issue owner with Claude
         if: |
           steps.assignment-command.outputs.valid == 'true' &&
-          steps.command-author.outputs.authorized == 'true'
+          steps.command-author.outputs.authorized == 'true' &&
+          steps.live-issue.outputs.unassigned == 'true'
         id: claude-analysis
         uses: anthropics/claude-code-action@v1
         env:
@@ -186,7 +205,8 @@ jobs:
     if: |
       needs.analyze_community_request.result == 'success' &&
       needs.analyze_community_request.outputs.command_valid == 'true' &&
-      needs.analyze_community_request.outputs.authorized == 'true'
+      needs.analyze_community_request.outputs.authorized == 'true' &&
+      needs.analyze_community_request.outputs.issue_unassigned == 'true'
     env:
       REPO: ${{ github.repository }}
       ISSUE_NUMBER: ${{ github.event.issue.number }}
@@ -194,13 +214,29 @@ jobs:
       ISSUE_URL: ${{ github.event.issue.html_url }}
       ISSUE_AUTHOR: ${{ github.event.issue.user.login }}
     steps:
+      - name: Check issue is still unassigned
+        id: still-unassigned
+        env:
+          GH_TOKEN: ${{ secrets.NVIDIA_MCORE_ONCALL_TOKEN || secrets.PAT || github.token }}
+        run: |
+          assignee="$(gh api "repos/${REPO}/issues/${ISSUE_NUMBER}" --jq '.assignee.login // empty')"
+          if [ -n "${assignee}" ]; then
+            echo "Issue #${ISSUE_NUMBER} is already assigned to ${assignee}; skipping assignment and Slack notification."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "skip=false" >> "${GITHUB_OUTPUT}"
+          fi
+
       - name: Checkout repository
+        if: steps.still-unassigned.outputs.skip != 'true'
         uses: actions/checkout@v6
 
       - name: Install assignment dependencies
+        if: steps.still-unassigned.outputs.skip != 'true'
         run: python -m pip install --no-cache-dir requests slack-sdk
 
       - name: Assign issue and notify Slack
+        if: steps.still-unassigned.outputs.skip != 'true'
         env:
           ANALYSIS_JSON: ${{ needs.analyze_community_request.outputs.analysis_json }}
           REQUESTED_ASSIGNEE: ${{ needs.analyze_community_request.outputs.requested_assignee }}
