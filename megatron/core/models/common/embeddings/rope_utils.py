@@ -481,6 +481,21 @@ def _apply_rotary_pos_emb_thd(
         ).squeeze(1)
 
 
+def _warn_unsupported_fusion_options(checks: list[tuple[bool, str, str]]) -> bool:
+    """Emit a one-time fallback warning for every triggered ``(condition, key, message)``.
+
+    Each fused-RoPE dispatch path shares the same "if an unsupported option is set, warn once
+    and fall back" structure; passing a table keeps the keys/messages in one place per path.
+    Returns whether any check fired (i.e. whether the fused path must fall back).
+    """
+    fired = False
+    for condition, key, message in checks:
+        if condition:
+            _warn_rope_fusion_fallback_once(key, message)
+            fired = True
+    return fired
+
+
 def _try_fused_mrope_bshd(
     t: Tensor,
     freqs: Tensor,
@@ -535,33 +550,34 @@ def _try_fused_mrope_bshd(
     unavailable_is_rotary_interleaved = (
         unavailable_reason is not None and "rotary_interleaved" in unavailable_reason.lower()
     )
-    if mscale != 1.0:
-        _warn_rope_fusion_fallback_once(
-            "triton-mrope-mscale",
-            f"mscale={mscale} is not supported by Triton fused mRoPE. "
-            "Using unfused implementation.",
-        )
-        force_unfused_mrope = True
-    if mla_rotary_interleaved:
-        _warn_rope_fusion_fallback_once(
-            "triton-mrope-mla-rotary-interleaved",
-            "Triton fused mRoPE does not support MLA-style interleaving in RoPE. "
-            "Using unfused implementation.",
-        )
-        force_unfused_mrope = True
-    if inverse:
-        _warn_rope_fusion_fallback_once(
-            "triton-mrope-inverse",
-            "inverse RoPE is not supported by Triton fused mRoPE. "
-            "Using unfused implementation.",
-        )
-        force_unfused_mrope = True
-    if config.rotary_interleaved and not unavailable_is_rotary_interleaved:
-        _warn_rope_fusion_fallback_once(
-            "triton-mrope-rotary-interleaved",
-            "Triton fused mRoPE currently supports rotary_interleaved=False. "
-            "Using unfused implementation.",
-        )
+    if _warn_unsupported_fusion_options(
+        [
+            (
+                mscale != 1.0,
+                "triton-mrope-mscale",
+                f"mscale={mscale} is not supported by Triton fused mRoPE. "
+                "Using unfused implementation.",
+            ),
+            (
+                mla_rotary_interleaved,
+                "triton-mrope-mla-rotary-interleaved",
+                "Triton fused mRoPE does not support MLA-style interleaving in RoPE. "
+                "Using unfused implementation.",
+            ),
+            (
+                inverse,
+                "triton-mrope-inverse",
+                "inverse RoPE is not supported by Triton fused mRoPE. "
+                "Using unfused implementation.",
+            ),
+            (
+                config.rotary_interleaved and not unavailable_is_rotary_interleaved,
+                "triton-mrope-rotary-interleaved",
+                "Triton fused mRoPE currently supports rotary_interleaved=False. "
+                "Using unfused implementation.",
+            ),
+        ]
+    ):
         force_unfused_mrope = True
 
     freqs = _raw_mrope_freqs_to_emb(freqs, config)
@@ -632,42 +648,39 @@ def _try_fused_mrope_thd(
             f"Triton fused mRoPE for THD layout is unavailable: "
             f"{unavailable_reason}. Using unfused implementation.",
         )
-    else:
-        has_unsupported_option = False
-        if mscale != 1.0:
-            _warn_rope_fusion_fallback_once(
+    elif not _warn_unsupported_fusion_options(
+        [
+            (
+                mscale != 1.0,
                 "triton-mrope-thd-mscale",
                 f"mscale={mscale} is not supported by Triton fused mRoPE for THD "
                 "layout. Using unfused implementation.",
-            )
-            has_unsupported_option = True
-        if mla_rotary_interleaved:
-            _warn_rope_fusion_fallback_once(
+            ),
+            (
+                mla_rotary_interleaved,
                 "triton-mrope-thd-mla-rotary-interleaved",
                 "Triton fused mRoPE for THD layout does not support MLA-style "
                 "interleaving in RoPE. Using unfused implementation.",
-            )
-            has_unsupported_option = True
-        if inverse:
-            _warn_rope_fusion_fallback_once(
+            ),
+            (
+                inverse,
                 "triton-mrope-thd-inverse",
                 "inverse RoPE is not supported by Triton fused mRoPE for THD layout. "
                 "Using unfused implementation.",
-            )
-            has_unsupported_option = True
-        if config.rotary_interleaved:
-            _warn_rope_fusion_fallback_once(
+            ),
+            (
+                config.rotary_interleaved,
                 "triton-mrope-thd-rotary-interleaved",
                 "Triton fused mRoPE for THD layout currently supports "
                 "rotary_interleaved=False. Using unfused implementation.",
-            )
-            has_unsupported_option = True
-        if not has_unsupported_option:
-            _warn_rope_fusion_fallback_once(
-                "triton-mrope-thd-unavailable",
-                "Triton fused mRoPE for THD layout is unavailable. "
-                "Using unfused implementation.",
-            )
+            ),
+        ]
+    ):
+        _warn_rope_fusion_fallback_once(
+            "triton-mrope-thd-unavailable",
+            "Triton fused mRoPE for THD layout is unavailable. "
+            "Using unfused implementation.",
+        )
     freqs = _raw_mrope_freqs_to_emb(freqs, config)
     return _apply_rotary_pos_emb_thd(
         t,
@@ -727,42 +740,41 @@ def apply_rotary_pos_emb(
                 is_raw_mrope_freqs = False
 
             # NOTE: TE backends do not support mRoPE in bshd format when bs > 1.
-            use_unfused = False
-            if config.mrope_section is not None and freqs.shape[1] > 1:
-                # TODO: Add a check in TransformerConfig and remove this unfused implementation.
-                _warn_rope_fusion_fallback_once(
-                    "te-mrope-bshd-batch",
-                    "Transformer Engine fused RoPE does not support mRoPE in bshd format when "
-                    "bs > 1 without raw mRoPE freqs. Using unfused implementation.",
-                )
-                use_unfused = True
-            if mscale != 1.0:
-                _warn_rope_fusion_fallback_once(
-                    "te-rope-mscale",
-                    f"mscale={mscale} is not supported by TE's fused RoPE. "
-                    "Using unfused implementation.",
-                )
-                use_unfused = True
-            if mla_rotary_interleaved:
-                _warn_rope_fusion_fallback_once(
-                    "te-rope-mla-rotary-interleaved",
-                    "apply_rope_fusion does not support MLA-style interleaving in RoPE. "
-                    "Using unfused implementation.",
-                )
-                use_unfused = True
-            if inverse:
-                _warn_rope_fusion_fallback_once(
-                    "te-rope-inverse",
-                    "inverse RoPE is not supported by TE's fused RoPE. "
-                    "Using unfused implementation.",
-                )
-                use_unfused = True
-            if fused_apply_rotary_pos_emb is None:
-                _warn_rope_fusion_fallback_once(
-                    "te-rope-unavailable",
-                    "Transformer Engine fused RoPE is unavailable. Using unfused implementation.",
-                )
-                use_unfused = True
+            # TODO: Add a check in TransformerConfig and remove the bs > 1 unfused fallback.
+            use_unfused = _warn_unsupported_fusion_options(
+                [
+                    (
+                        config.mrope_section is not None and freqs.shape[1] > 1,
+                        "te-mrope-bshd-batch",
+                        "Transformer Engine fused RoPE does not support mRoPE in bshd format when "
+                        "bs > 1 without raw mRoPE freqs. Using unfused implementation.",
+                    ),
+                    (
+                        mscale != 1.0,
+                        "te-rope-mscale",
+                        f"mscale={mscale} is not supported by TE's fused RoPE. "
+                        "Using unfused implementation.",
+                    ),
+                    (
+                        mla_rotary_interleaved,
+                        "te-rope-mla-rotary-interleaved",
+                        "apply_rope_fusion does not support MLA-style interleaving in RoPE. "
+                        "Using unfused implementation.",
+                    ),
+                    (
+                        inverse,
+                        "te-rope-inverse",
+                        "inverse RoPE is not supported by TE's fused RoPE. "
+                        "Using unfused implementation.",
+                    ),
+                    (
+                        fused_apply_rotary_pos_emb is None,
+                        "te-rope-unavailable",
+                        "Transformer Engine fused RoPE is unavailable. "
+                        "Using unfused implementation.",
+                    ),
+                ]
+            )
             if not use_unfused:
                 return fused_apply_rotary_pos_emb(t, freqs, interleaved=config.rotary_interleaved)
         else:
@@ -778,35 +790,34 @@ def apply_rotary_pos_emb(
                     inverse=inverse,
                     mla_output_remove_interleaving=mla_output_remove_interleaving,
                 )
-            use_unfused_thd = False
-            if mscale != 1.0:
-                _warn_rope_fusion_fallback_once(
-                    "te-rope-thd-mscale",
-                    f"mscale={mscale} is not supported by TE's fused RoPE for THD layout. "
-                    "Using unfused implementation.",
-                )
-                use_unfused_thd = True
-            if mla_rotary_interleaved:
-                _warn_rope_fusion_fallback_once(
-                    "te-rope-thd-mla-rotary-interleaved",
-                    "TE fused RoPE for THD layout does not support MLA-style interleaving "
-                    "in RoPE. Using unfused implementation.",
-                )
-                use_unfused_thd = True
-            if inverse:
-                _warn_rope_fusion_fallback_once(
-                    "te-rope-thd-inverse",
-                    "inverse RoPE is not supported by TE's fused RoPE for THD layout. "
-                    "Using unfused implementation.",
-                )
-                use_unfused_thd = True
-            if fused_apply_rotary_pos_emb_thd is None:
-                _warn_rope_fusion_fallback_once(
-                    "te-rope-thd-unavailable",
-                    "Transformer Engine fused RoPE for THD layout is unavailable. "
-                    "Using unfused implementation.",
-                )
-                use_unfused_thd = True
+            use_unfused_thd = _warn_unsupported_fusion_options(
+                [
+                    (
+                        mscale != 1.0,
+                        "te-rope-thd-mscale",
+                        f"mscale={mscale} is not supported by TE's fused RoPE for THD layout. "
+                        "Using unfused implementation.",
+                    ),
+                    (
+                        mla_rotary_interleaved,
+                        "te-rope-thd-mla-rotary-interleaved",
+                        "TE fused RoPE for THD layout does not support MLA-style interleaving "
+                        "in RoPE. Using unfused implementation.",
+                    ),
+                    (
+                        inverse,
+                        "te-rope-thd-inverse",
+                        "inverse RoPE is not supported by TE's fused RoPE for THD layout. "
+                        "Using unfused implementation.",
+                    ),
+                    (
+                        fused_apply_rotary_pos_emb_thd is None,
+                        "te-rope-thd-unavailable",
+                        "Transformer Engine fused RoPE for THD layout is unavailable. "
+                        "Using unfused implementation.",
+                    ),
+                ]
+            )
             if use_unfused_thd:
                 return _apply_rotary_pos_emb_thd(
                     t,
