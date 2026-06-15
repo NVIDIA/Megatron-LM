@@ -21,9 +21,7 @@ from megatron.core.inference.config import (
     MambaInferenceStateConfig,
 )
 from megatron.core.inference.contexts import DynamicInferenceContext, StaticInferenceContext
-from megatron.core.inference.contexts.dynamic_context import (
-    MaxSequenceLengthOverflowError,
-)
+from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
     InferenceRequest,

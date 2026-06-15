@@ -19,8 +19,8 @@ from megatron.core.inference.communication_utils import (
     broadcast_from_last_pipeline_stage,
     is_pipeline_last_stage,
 )
-from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
 from megatron.core.inference.config import AsyncSchedulingMode
+from megatron.core.inference.contexts.dynamic_context import MaxSequenceLengthOverflowError
 from megatron.core.inference.contexts.static_context import StaticInferenceContext
 from megatron.core.inference.inference_request import InferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.abstract_model_inference_wrapper import (
