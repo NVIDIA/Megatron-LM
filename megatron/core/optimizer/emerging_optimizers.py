@@ -306,12 +306,6 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
     local params are orthogonalized without any collective.
     """
 
-    def __init__(
-        self, params: ParamsT, dp_group: torch.distributed.ProcessGroup | None = None, **kwargs: Any
-    ) -> None:
-        self.dp_group = dp_group
-        super().__init__(params, **kwargs)
-
     # Optimizer-step convention: `@torch.no_grad()` disables autograd around the
     # in-place param updates; `type: ignore[misc]` suppresses mypy's spurious
     # complaint about decorating a non-None-returning function with no_grad.
@@ -327,7 +321,7 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
         """
         loss = None if closure is None else closure()
 
-        if self.dp_group is None or get_pg_size(self.dp_group) == 1:
+        if not torch.distributed.is_initialized() or torch.distributed.get_world_size() == 1:
             for group in self.param_groups:
                 self._init_group(group, skip_non_grad_params=False)
                 for p in group["params"]:
@@ -410,13 +404,12 @@ class FSDPTensorParallelMuon(TensorParallelMuon):
             idx for idx, param in enumerate(params) if self._needs_boundary_gather(param)
         ]
 
-        if self.dp_group is None or get_pg_size(self.dp_group) == 1:
+        if not torch.distributed.is_initialized() or torch.distributed.get_world_size() == 1:
             return set(local_boundary_indices)
 
-        gathered_indices: list[list[int] | None] = [None] * get_pg_size(self.dp_group)
-        torch.distributed.all_gather_object(
-            gathered_indices, local_boundary_indices, group=self.dp_group
-        )
+        world_size = torch.distributed.get_world_size()
+        gathered_indices: list[list[int] | None] = [None] * world_size
+        torch.distributed.all_gather_object(gathered_indices, local_boundary_indices)
         return {
             idx
             for rank_indices in gathered_indices
