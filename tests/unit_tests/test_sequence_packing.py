@@ -9,12 +9,14 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.datasets.data_schedule import (
+    DefaultDynamicCPScheduler,
     _build_thd_padding_mask,
     _get_scheduler_max_real_num_seqs,
     _sanitize_thd_padding_values,
     get_batch_on_this_rank_for_sequence_packing,
     wrap_data_iterator,
 )
+from megatron.core.datasets.data_schedule_utils import next_hdp_group_packing_aware
 from megatron.core.rerun_state_machine import RerunDataIterator
 from megatron.training.global_vars import unset_global_variables
 from tests.unit_tests.test_utilities import Utils
@@ -167,6 +169,30 @@ class MockVariableLengthSequencePackingDataIterator:
             )
 
         return batch
+
+
+def test_next_hdp_group_packing_aware_can_use_larger_cp_group_for_short_sequences():
+    micro_batches, leftovers, exec_times, sample_ids = next_hdp_group_packing_aware(
+        [(0, 6144), (1, 2048)], total_gpus=2, max_seq_len_per_rank=4096
+    )
+
+    assert leftovers == []
+    assert micro_batches == [[6144, 2048], [6144, 2048]]
+    assert sample_ids == [[0, 1], [0, 1]]
+    assert exec_times[0] == exec_times[1]
+
+
+def test_default_dynamic_cp_scheduler_uses_packing_aware_grouping_by_default():
+    scheduler = DefaultDynamicCPScheduler(
+        max_seqlen_per_dp_cp_rank=4096,
+        cp_size=2,
+        dp_size=1,
+        microbatch_group_size_per_vp_stage=None,
+    )
+
+    sample_id_groups = scheduler.get_groups_and_subsamples([(0, 6144), (1, 2048)])
+
+    assert sample_id_groups == [[[0, 1], [0, 1]]]
 
 
 def _gather_tensor_from_tp_group(tensor):
@@ -591,8 +617,9 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
                 # Count each sequence exactly once using int64 for bitwise comparison.
                 # THD (dp_balanced): CP siblings hold identical packed data,
                 #   so reduce across DP only (not CP) on both sides.
-                # DCP: data is redistributed uniquely across dp_cp ranks,
-                #   so per-microbatch CP all_reduce + scale, then dp_cp all_reduce.
+                # DCP: a logical sequence is replicated across its local CP group
+                #   before CP slicing. Scale each rank by max_cp / local_cp, then
+                #   reduce across DPxCP.
                 # Both sides multiply by max_cp so DCP (with varying local_cp)
                 # can be normalized to the same integer scale without division.
                 max_cp = cp_size
@@ -611,21 +638,15 @@ def test_wrap_dataloader(tp, pp, cp, vpp, scheduler_type):
                 # After wrap.
                 token_sum_after = torch.tensor(0, dtype=torch.int64, device='cuda')
                 if is_dynamic_cp:
-                    # DCP: per-microbatch CP all_reduce + scale to max_cp,
-                    # then dp_cp all_reduce to aggregate unique contributions.
+                    # DCP: each logical sequence is replicated on local_cp ranks
+                    # before CP slicing. Scale each rank's local contribution by
+                    # max_cp / local_cp, then reduce across DPxCP ranks so each
+                    # sequence contributes exactly max_cp times.
                     for batch in batch_all:
                         mb_sum = batch['tokens'].long().sum().clone()
                         local_cp = batch['local_cp_size']
                         if isinstance(local_cp, torch.Tensor):
                             local_cp = local_cp.item()
-                        mb_cp_group = parallel_state.get_dynamic_data_context_parallel_groups(
-                            group_size=local_cp
-                        )
-                        torch.distributed.all_reduce(
-                            mb_sum, op=torch.distributed.ReduceOp.SUM, group=mb_cp_group
-                        )
-                        # all_reduce result = mb_sum * local_cp.
-                        # Scale to mb_sum * max_cp.
                         mb_sum *= max_cp // local_cp
                         token_sum_after += mb_sum
                     torch.distributed.all_reduce(
