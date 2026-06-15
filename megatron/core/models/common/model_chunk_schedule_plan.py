@@ -386,7 +386,12 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         )
 
         # build post process
-        if model.post_process:
+        # Create PostProcessNode for the final PP stage (post_process) AND for any non-final
+        # loss stage (is_loss_stage) in the mtp_loss_split configuration.  Non-final loss stages
+        # have post_process=False (they're not the last PP rank) but still need to run
+        # process_mtp_loss to compute their share of the MTP losses and forward the low-index
+        # hidden-state prefix to the downstream loss stage.
+        if model.post_process or getattr(model, 'is_loss_stage', False):
             self.post_process = PostProcessNode(
                 model, self._model_chunk_state, self._event, get_comp_stream
             )
@@ -550,6 +555,19 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             f_input, _ = TransformerLayerSchedulePlan.run(f_layer, None, f_input=f_input)
             nvtx_range_pop(nvtx_msg)
 
+        # For non-final mtp_loss_split stages, run PostProcessNode *before* the PP send so the
+        # downstream stage receives only the prefix (low-index hidden-state chunks), not the full
+        # concatenated tensor.  The final loss stage and regular post_process stages keep the
+        # original order (post_process runs after the send/backward).
+        non_final_loss_stage = (
+            f_schedule_plan is not None
+            and f_schedule_plan.post_process is not None
+            and getattr(f_schedule_plan.post_process.gpt_model, 'is_loss_stage', False)
+            and not getattr(f_schedule_plan.post_process.gpt_model, 'is_final_loss_stage', True)
+        )
+        if non_final_loss_stage:
+            f_input = f_schedule_plan.post_process.forward(f_input)
+
         if f_schedule_plan is not None and post_forward is not None:
             # post_forward()/send_forward_recv_forward() is running in the communication stream,
             # so the p2p comm could be overlapped with the attn backward
@@ -570,8 +588,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             b_layer.attn.backward_dw()
             b_layer.release_state()
 
-        # post process forward
-        if f_schedule_plan is not None and f_schedule_plan.post_process is not None:
+        # post process forward (non-final loss stages already ran above before post_forward)
+        if f_schedule_plan is not None and f_schedule_plan.post_process is not None and not non_final_loss_stage:
             f_input = f_schedule_plan.post_process.forward(f_input)
         # pre process backward
         if b_schedule_plan is not None:
