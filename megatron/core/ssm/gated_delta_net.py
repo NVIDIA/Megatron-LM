@@ -372,11 +372,7 @@ class GatedDeltaNet(MegatronModule):
             cu_seqlens_kv = None
 
         if self.recompute_gdn and self.training:
-            # Selective full-module recompute ("gdn"): run the whole GDN compute under a
-            # normal checkpoint so its activations are dropped and recomputed in backward.
-            # Only the input tensor is passed to checkpoint(); the non-tensor arguments are
-            # bound via closure because tensor_parallel.checkpoint saves its positional args
-            # with save_for_backward, which only accepts tensors.
+
             def _checkpointed_compute(hidden_states):
                 return self._forward_compute(
                     hidden_states,
