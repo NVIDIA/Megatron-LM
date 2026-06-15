@@ -1008,9 +1008,9 @@ def get_megatron_optimizer(
     if isinstance(model_chunks[0], MimoModel):
         from megatron.core.models.mimo.optimizer import get_mimo_optimizer
 
-        assert len(model_chunks) == 1, (
-            "MimoModel does not support virtual pipeline parallelism (multiple model chunks)"
-        )
+        assert (
+            len(model_chunks) == 1
+        ), "MimoModel does not support virtual pipeline parallelism (multiple model chunks)"
         return get_mimo_optimizer(model_chunks[0], config)
 
     # None → apply standard defaults. To extend defaults with custom overrides,

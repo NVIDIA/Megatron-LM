@@ -23,11 +23,17 @@ class _Rerun:
 
 def _run(**kwargs):
     args = SimpleNamespace(
-        save_params_interval=None, save_activations_interval=None,
-        save_tokens_per_expert_interval=None, save_wgrads_interval=None,
-        save_dgrads_interval=None, reuse_grad_buf_for_mxfp8_param_ag=False,
-        overlap_param_gather=False, seq_length=8, micro_batch_size=1,
-        decoder_seq_length=None, empty_unused_memory_level=0,
+        save_params_interval=None,
+        save_activations_interval=None,
+        save_tokens_per_expert_interval=None,
+        save_wgrads_interval=None,
+        save_dgrads_interval=None,
+        reuse_grad_buf_for_mxfp8_param_ag=False,
+        overlap_param_gather=False,
+        seq_length=8,
+        micro_batch_size=1,
+        decoder_seq_length=None,
+        empty_unused_memory_level=0,
     )
     captured = {}
     model = [SimpleNamespace(force_all_reduce=False, zero_grad_buffer=lambda: None)]
@@ -39,10 +45,15 @@ def _run(**kwargs):
         mock.patch.object(training_mod, "has_nvidia_modelopt", False),
     ):
         training_mod.train_step(
-            forward_step_func=lambda *a, **k: None, data_iterator=iter([]), model=model,
-            optimizer=SimpleNamespace(zero_grad=lambda: None), opt_param_scheduler=None,
-            config=SimpleNamespace(), forward_backward_func=lambda **kw: captured.update(kw) or [],
-            iteration=0, **kwargs,
+            forward_step_func=lambda *a, **k: None,
+            data_iterator=iter([]),
+            model=model,
+            optimizer=SimpleNamespace(zero_grad=lambda: None),
+            opt_param_scheduler=None,
+            config=SimpleNamespace(),
+            forward_backward_func=lambda **kw: captured.update(kw) or [],
+            iteration=0,
+            **kwargs,
         )
     return captured
 
