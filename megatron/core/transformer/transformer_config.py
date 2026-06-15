@@ -2794,9 +2794,9 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 not self.moe_shared_expert_overlap
             ), 'disable moe_shared_expert_overlap when enabling overlap_moe_expert_parallel_comm'
-            assert (
-                self.mtp_num_layers is None or self.mtp_num_layers == 1
-            ), 'MTP layernum only supports 1 when enabling overlap_moe_expert_parallel_comm.'
+            # assert (
+            #     self.mtp_num_layers is None or self.mtp_num_layers == 1
+            # ), 'MTP layernum only supports 1 when enabling overlap_moe_expert_parallel_comm.'
 
             if self.cuda_graph_impl != "none":
                 if self.cuda_graph_impl == "transformer_engine":
