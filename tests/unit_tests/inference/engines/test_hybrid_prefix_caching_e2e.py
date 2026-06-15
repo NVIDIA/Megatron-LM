@@ -186,7 +186,10 @@ class TestMambaPrefixCachingE2E:
         mamba_config,
         enable_prefix_caching,
         buffer_size_gb=0.5,
-        prefix_caching_mamba_gb=0.05,
+        # max_requests is not capped, so it auto-derives from buffer_size_gb. The
+        # Mamba cache budget must cover the per-step extraction scratch (which scales
+        # with max_requests) on top of the durable cache, so it needs enough headroom.
+        prefix_caching_mamba_gb=2.0,
         request_rounder=4,
         num_cuda_graphs=None,
     ):

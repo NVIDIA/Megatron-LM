@@ -763,9 +763,12 @@ class DynamicInferenceContext(BaseInferenceContext):
                 and prefix_caching_mamba_gb > 0
             ):
                 prefix_cache_bytes = int(prefix_caching_mamba_gb * 1024**3)
-                # The extraction scratch is reserved from the budget before sizing
-                # the durable cache (see _allocate_mamba_cache), so report it here
-                # to keep the preview consistent with what is actually allocated.
+                # Mirror the split done in _allocate_mamba_cache so this preview
+                # matches what is actually allocated: the "scratch" buffers
+                # (intermediate_ssm_out/intermediate_conv_out) are reserved from the
+                # budget first, then the rest sizes the "durable" cache
+                # (ssm_states/conv_states). mamba_bytes_per_req is the shared
+                # per-slot footprint of both.
                 scratch_slots = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * self.max_requests
                 scratch_bytes = scratch_slots * mamba_bytes_per_req
                 durable_slots = (prefix_cache_bytes - scratch_bytes) // mamba_bytes_per_req
@@ -1624,15 +1627,22 @@ class DynamicInferenceContext(BaseInferenceContext):
         per_slot_bytes = self.num_mamba_layers * (conv_size + ssm_size)
         total_bytes = int(mamba_gb * 1024**3)
 
-        # MambaSlotAllocator also allocates fixed CUDA-graph-safe scratch buffers
-        # for intermediate-state extraction, sized to the per-step worst case of
-        # MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * max_requests slots. These are not
-        # part of the durable cache but consume the same per-slot footprint, so we
-        # reserve them from the budget up front; otherwise total usage silently
-        # exceeds mamba_gb (and can OOM) when 3 * max_requests > max_slots.
+        # MambaSlotAllocator allocates two GPU buffer families with the same
+        # per-slot footprint, both of which must fit in this budget:
+        #   - "durable" cache:  self.ssm_states / self.conv_states, sized to
+        #                       `max_slots` slots (computed below).
+        #   - "scratch" buffers: self.intermediate_ssm_out / self.intermediate_conv_out,
+        #                       fixed CUDA-graph-safe staging for intermediate-state
+        #                       extraction, sized to the per-step worst case of
+        #                       `scratch_slots` = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST
+        #                       * max_requests slots.
+        # The scratch is not part of the durable cache but consumes the same
+        # per-slot bytes, so reserve it from the budget up front before sizing the
+        # durable cache; otherwise total usage silently exceeds mamba_gb (and can
+        # OOM) when scratch_slots > max_slots.
         scratch_slots = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * self.max_requests
         scratch_bytes = scratch_slots * per_slot_bytes
-        max_slots = (total_bytes - scratch_bytes) // per_slot_bytes
+        max_slots = (total_bytes - scratch_bytes) // per_slot_bytes  # durable slots
         if max_slots < 1:
             raise ValueError(
                 f"Mamba prefix cache budget (prefix_caching_mamba_gb={mamba_gb:.4g} GB) "
