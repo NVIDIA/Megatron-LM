@@ -3,7 +3,7 @@
 Span granularity in Megatron is controlled by the `MEGATRON_OTEL_SPAN_GROUPS` env var (or `--otel-span-groups` CLI flag). The spec accepts preset keywords, individual group names, or a mix.
 
 For the general span-group mechanism see
-[lens: span groups](../../../../lens/docs/user-guide/span-groups.md).
+[lens: span groups](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/user-guide/span-groups.md).
 This page covers Megatron's extensions and the complete span hierarchy.
 
 ## Preset keywords
@@ -115,7 +115,7 @@ Key Megatron-specific span attributes:
 | `per_step` | Moderate | Use with `OTEL_TRACES_SAMPLER` |
 | `all` (includes microbatch, layer) | Highest | Development / profiling only |
 
-Non-exporting ranks have `frozenset()` span groups — `is_span_group_enabled()` returns `False` everywhere, so **no span objects are created at all**. The disabled path is a frozenset lookup followed by an immediate return, not a no-op span that still allocates. See [lens: architecture](../../../../lens/docs/design/architecture.md).
+Non-exporting ranks have `frozenset()` span groups — `is_span_group_enabled()` returns `False` everywhere, so **no span objects are created at all**. The disabled path is a frozenset lookup followed by an immediate return, not a no-op span that still allocates. See [lens: architecture](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/design/architecture.md).
 
 ## Inference spans (GenAI semconv)
 

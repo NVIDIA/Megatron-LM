@@ -1,6 +1,6 @@
 # Megatron-LM OpenTelemetry Instrumentation
 
-This module contains Megatron's OpenTelemetry integration, built on top of [`nemo-lens`](https://github.com/NVIDIA/nemo-lens).
+This module contains Megatron's OpenTelemetry integration, built on top of [`nemo-lens`](https://github.com/NVIDIA-NeMo/Lens).
 
 It emits **traces** at training framework boundaries (training loop, checkpointing, evaluation, P2P communication, pipeline parallel stages, inference) and **metrics** (loss, throughput, gradient norm) that export to any OTLP-compatible backend.
 
@@ -39,4 +39,4 @@ See `docs/user-guide/observability/` in this repository for the full Observabili
 | Local docker-compose stack | [docs/user-guide/observability/observability-stack.md](../../../docs/user-guide/observability/observability-stack.md) |
 | Adding new instrumentation | [docs/user-guide/observability/extending.md](../../../docs/user-guide/observability/extending.md) |
 
-For the generic `nemo-lens` documentation (configuration model, instrumentation primitives, custom exporters, design decisions), see the lens docs at `../../../../lens/docs/`.
+For the generic `nemo-lens` documentation (configuration model, instrumentation primitives, custom exporters, design decisions), see the lens docs at <https://github.com/NVIDIA-NeMo/Lens/tree/main/docs>.
