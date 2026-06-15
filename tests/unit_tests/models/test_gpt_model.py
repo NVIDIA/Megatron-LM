@@ -24,12 +24,32 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_mlp_module_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_fa_min_version, is_te_min_version
 from tests.unit_tests.test_utilities import Utils
+
+
+class FakeRotaryEmbedding:
+    def __init__(self):
+        self.use_default_cp_group = None
+
+    def get_rotary_seq_len(self, *args, **kwargs):
+        return 4
+
+    def __call__(
+        self,
+        max_seq_len,
+        offset=0,
+        packed_seq=False,
+        cp_group=None,
+        use_default_cp_group=True,
+    ):
+        self.use_default_cp_group = use_default_cp_group
+        return torch.empty(max_seq_len, 1, 1, 4, device="cuda")
 
 
 class TestGPTModel:
@@ -228,6 +248,31 @@ class TestGPTModel:
         assert seen["context"] is context
         assert seen["labels"] is labels
         assert seen["output_layer"] is self.gpt_model.output_layer
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_hybrid_cp_local_size_one_disables_rope_default_cp_group(self):
+        self.gpt_model.cuda()
+        self.gpt_model.position_embedding_type = 'rope'
+        self.gpt_model.rotary_pos_emb = FakeRotaryEmbedding()
+
+        sequence_length = self.gpt_model.max_sequence_length
+        input_ids = torch.arange(sequence_length, dtype=torch.int64, device="cuda").repeat((1, 1))
+        position_ids = input_ids.clone()
+        packed_seq_params = PackedSeqParams(
+            qkv_format="sbhd",
+            max_seqlen_q=sequence_length,
+            max_seqlen_kv=sequence_length,
+            local_cp_size=1,
+            cp_group=None,
+        )
+
+        self.gpt_model._preprocess(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            packed_seq_params=packed_seq_params,
+        )
+
+        assert self.gpt_model.rotary_pos_emb.use_default_cp_group is False
 
 
 def test_get_mlp_module_spec_interface():
