@@ -771,9 +771,7 @@ class TestDynamicInferenceContext:
             [False, True, True, False], device='cpu'
         )
         next_tokens = torch.tensor([100, 101, 102, 103], device='cpu')
-        dynamic_context.record_pending_finished_rows(
-            torch.tensor([False, True, False, True])
-        )
+        dynamic_context.record_pending_finished_rows(torch.tensor([False, True, False, True]))
 
         dynamic_context._compact_pending_finished_rows(next_tokens=next_tokens)
 
@@ -781,12 +779,7 @@ class TestDynamicInferenceContext:
         assert dynamic_context.total_request_count == 2
         assert dynamic_context.active_token_count == 2
         assert dynamic_context.request_ids[:4].tolist() == [10, 12, -1, -1]
-        assert dynamic_context.request_has_stop_words[:4].tolist() == [
-            False,
-            True,
-            False,
-            False,
-        ]
+        assert dynamic_context.request_has_stop_words[:4].tolist() == [False, True, False, False]
         assert next_tokens[:2].tolist() == [100, 102]
 
     @pytest.mark.internal
@@ -2979,7 +2972,9 @@ class TestDynamicInferenceContext:
         active_requests_mask = torch.tensor([1, 1], dtype=torch.int32, device='cpu')
         new_tokens = torch.tensor([99, 199], dtype=torch.int32, device='cpu')
         new_spec = torch.tensor([[100, 200], [101, 201]], dtype=torch.int32, device='cpu')
-        ctx.update_requests_legacy(active_requests_mask, new_tokens, new_speculative_tokens=new_spec)
+        ctx.update_requests_legacy(
+            active_requests_mask, new_tokens, new_speculative_tokens=new_spec
+        )
 
         # Capture active tokens before chunk 2 (which should just be the 3 tokens of req_first)
         tokens_before_chunk_2 = ctx.active_token_count

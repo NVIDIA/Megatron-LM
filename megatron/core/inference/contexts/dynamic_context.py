@@ -37,6 +37,7 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
 from megatron.core.package_info import __version__ as mcore_version
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.moe.token_dispatcher_inference import (
+    InferenceAllGatherDispatcherBase,
     NCCLAllGatherDispatcher,
     NVLSAllGatherVDispatcher,
 )
@@ -688,19 +689,23 @@ class DynamicInferenceContext(BaseInferenceContext):
 
         # Allocate per-step dispatcher buffers upfront so update_metadata never
         # triggers an allocation inside a captured CUDA graph.
-        if get_pg_size(self.expert_model_parallel_group) > 1:
-            if self._nccl_ep_dispatcher:
-                NCCLAllGatherDispatcher.allocate_buffers()
-            else:
-                # Use moe_latent_size if set (latent MoE: SuperV3, UltraV3), else hidden_size.
-                moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
-                NVLSAllGatherVDispatcher.allocate_buffers(
-                    per_rank_worst_case_token_count=self.round_up_tokens(self.max_tokens)
-                    // tp_size,
-                    topk=model_config.moe_router_topk,
-                    hidden_size=moe_hidden_size,
-                    ep_group=self.expert_model_parallel_group,
-                )
+        # Both dispatchers need _valid_tokens_tensor initialized even at EP=1:
+        # mcore_fused_moe's Triton kernel reads it as a pointer regardless of EP size.
+        if model_config.inference_moe_token_dispatcher_type == 'nccl':
+            NCCLAllGatherDispatcher.allocate_buffers()
+        elif get_pg_size(self.expert_model_parallel_group) > 1:
+            # Use moe_latent_size if set, else hidden_size.
+            moe_hidden_size = model_config.moe_latent_size or model_config.hidden_size
+            NVLSAllGatherVDispatcher.allocate_buffers(
+                per_rank_worst_case_token_count=self.round_up_tokens(self.max_tokens) // tp_size,
+                topk=model_config.moe_router_topk,
+                hidden_size=moe_hidden_size,
+                ep_group=self.expert_model_parallel_group,
+            )
+        else:
+            # EP=1 with nvls: skip symmetric memory init (requires NVLink between
+            # multiple GPUs) and just initialize the shared valid_tokens scalar.
+            InferenceAllGatherDispatcherBase.allocate_valid_tokens_tensor()
 
         # Deal with chunked prefill
         self.enable_chunked_prefill = inference_config.enable_chunked_prefill
@@ -2965,7 +2970,9 @@ class DynamicInferenceContext(BaseInferenceContext):
     def record_pending_finished_rows(self, finished_active_mask: Tensor) -> None:
         """Record active rows that finished and must be compacted after the next sample."""
         if self.has_pending_finished_rows():
-            raise AssertionError("prior pending finished rows must be compacted before recording more")
+            raise AssertionError(
+                "prior pending finished rows must be compacted before recording more"
+            )
 
         if finished_active_mask.is_cuda:
             finished_active_mask = finished_active_mask.cpu()
@@ -3037,9 +3044,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         return filtered_result
 
     def _compact_pending_finished_rows(
-        self,
-        next_tokens: Optional[Tensor] = None,
-        new_speculative_tokens: Optional[Tensor] = None,
+        self, next_tokens: Optional[Tensor] = None, new_speculative_tokens: Optional[Tensor] = None
     ) -> None:
         """Compact active rows after their prior-finished samples have been filtered."""
         pending_finished_rows = self.pending_finished_rows()
@@ -3068,9 +3073,7 @@ class DynamicInferenceContext(BaseInferenceContext):
             return
 
         src_idxs = torch.nonzero(keep_mask, as_tuple=True)[0] + active_start
-        dst_idxs = torch.arange(
-            active_start, active_start + remaining_request_count, device='cpu'
-        )
+        dst_idxs = torch.arange(active_start, active_start + remaining_request_count, device='cpu')
         if not torch.equal(src_idxs, dst_idxs):
             self._move_book_keeping_tensors(
                 src_idxs=src_idxs,
@@ -3091,9 +3094,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         self.clear_pending_finished_rows()
 
     def _consume_pending_finished_rows_for_prepare(
-        self,
-        prepared_update: Dict[str, Optional[Tensor]],
-        request_bookkeeping: Optional[Dict],
+        self, prepared_update: Dict[str, Optional[Tensor]], request_bookkeeping: Optional[Dict]
     ) -> Tuple[Dict[str, Optional[Tensor]], Optional[Dict]]:
         """Consume pending finished rows before preparing the next forward."""
         pending_finished_rows = self.pending_finished_rows()
@@ -3115,14 +3116,12 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         prepared_update = dict(prepared_update)
-        prepared_update["active_requests_mask"] = prepared_update["active_requests_mask"][
-            keep_mask
-        ]
+        prepared_update["active_requests_mask"] = prepared_update["active_requests_mask"][keep_mask]
         prepared_update["new_tokens"] = prepared_update["new_tokens"][:remaining_request_count]
         if prepared_update["new_speculative_tokens"] is not None:
-            prepared_update["new_speculative_tokens"] = prepared_update[
-                "new_speculative_tokens"
-            ][:, :remaining_request_count]
+            prepared_update["new_speculative_tokens"] = prepared_update["new_speculative_tokens"][
+                :, :remaining_request_count
+            ]
         return prepared_update, filtered_bookkeeping
 
     def _move_book_keeping_tensors(
@@ -3485,9 +3484,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         # add_ and fill_ calls seems to work as intended with sliced indexing
         # (i.e. x[3:5].add(...) or x[3:5].fill_) but when another tensor is used
         # for indexing, it does not work as expected (i.e. x[y] if x and y are torch tensors)
-        self.request_kv_length_offsets[active_slice].add_(
-            self.request_query_lengths[active_slice]
-        )
+        self.request_kv_length_offsets[active_slice].add_(self.request_query_lengths[active_slice])
 
         num_generated_tokens = 1 + self.num_speculative_tokens
         self.request_query_lengths[active_slice].fill_(num_generated_tokens)
@@ -4433,10 +4430,7 @@ class DynamicInferenceContext(BaseInferenceContext):
         else:
             self.clear_pending_finished_rows()
 
-        return {
-            "newly_paused_request_ids": None,
-            "evict_request_ids": None,
-        }
+        return {"newly_paused_request_ids": None, "evict_request_ids": None}
 
     def calculate_log_probs(
         self, logits: Tensor, new_tokens: Tensor, only_last_token_logits: Optional[bool] = False

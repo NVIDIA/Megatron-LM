@@ -1703,10 +1703,7 @@ class TextGenerationController:
         update_result = context.update_requests_legacy(**prepared_update)
         range_pop()
 
-        return {
-            **request_bookkeeping,
-            **(update_result or {}),
-        }
+        return {**request_bookkeeping, **(update_result or {})}
 
     def _dynamic_step_context_bookkeeping(self) -> Dict[str, Tensor]:
         """Update the dynamic inference context through the split resolve/prepare path."""
@@ -1717,10 +1714,7 @@ class TextGenerationController:
         update_result = context.update_requests(**prepared_update)
         range_pop()
 
-        return {
-            **request_bookkeeping,
-            **(update_result or {}),
-        }
+        return {**request_bookkeeping, **(update_result or {})}
 
     def _dynamic_step_forward_for_async_scheduling(self) -> Optional[int]:
         """Run one dynamic forward pass for the serial async-shaped path."""
@@ -1776,9 +1770,7 @@ class TextGenerationController:
         )
 
         range_push("resolve_requests")
-        resolve_result = context.resolve_requests(
-            prepared_update, delay_finished_compaction=True
-        )
+        resolve_result = context.resolve_requests(prepared_update, delay_finished_compaction=True)
         range_pop()
 
         self._async_schedule_forward_primed = True
@@ -1833,8 +1825,10 @@ class TextGenerationController:
         if mode == AsyncSchedulingMode.ASYNC:
             block_boundary_threshold = context.block_size_tokens - 1 - self.num_speculative_tokens
             if (
-                context.request_last_kv_block_offset[active_slice] >= block_boundary_threshold
-            ).any().item():
+                (context.request_last_kv_block_offset[active_slice] >= block_boundary_threshold)
+                .any()
+                .item()
+            ):
                 return "kv_block_boundary"
 
         return None
@@ -1887,9 +1881,7 @@ class TextGenerationController:
         range_pop()
         prepared_update, request_bookkeeping = self._build_dynamic_step_request_update()
 
-        self._raise_if_decode_request_update_unsupported(
-            AsyncSchedulingMode.ASYNC, prepared_update
-        )
+        self._raise_if_decode_request_update_unsupported(AsyncSchedulingMode.ASYNC, prepared_update)
         request_bookkeeping, resolve_result = self._run_async_scheduling_request_update(
             prepared_update, request_bookkeeping
         )
@@ -1927,9 +1919,7 @@ class TextGenerationController:
             assert not return_log_probs and not return_top_n_logprobs
 
             cuda_graph_request_count = self._async_schedule_primed_cuda_graph_request_count
-            request_bookkeeping, resolve_result = (
-                self._run_async_scheduling_step()
-            )
+            request_bookkeeping, resolve_result = self._run_async_scheduling_step()
 
             ret = {
                 "accepted_tokens": None,

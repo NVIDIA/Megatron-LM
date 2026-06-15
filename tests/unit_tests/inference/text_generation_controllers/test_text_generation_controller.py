@@ -312,15 +312,15 @@ class TestAsyncSchedulingControllerHelpers:
             ),
             (
                 "non_greedy_sampling",
-                lambda _controller, context, _model_config: context.request_metadata[
-                    "top_k"
-                ].fill_(0),
+                lambda _controller, context, _model_config: context.request_metadata["top_k"].fill_(
+                    0
+                ),
             ),
             (
                 "non_greedy_sampling",
-                lambda _controller, context, _model_config: context.request_metadata[
-                    "top_p"
-                ].fill_(0.5),
+                lambda _controller, context, _model_config: context.request_metadata["top_p"].fill_(
+                    0.5
+                ),
             ),
             (
                 "kv_block_boundary",
@@ -454,14 +454,13 @@ class TestAsyncSchedulingControllerHelpers:
         context.prepare_requests.side_effect = prepare_side_effect
         context.resolve_requests.side_effect = lambda *_args, **_kwargs: events.append(
             "resolve_requests"
-        ) or {
-            "newly_paused_request_ids": None,
-            "evict_request_ids": None,
-        }
+        ) or {"newly_paused_request_ids": None, "evict_request_ids": None}
 
         controller._async_schedule_forward_primed = True
         controller._async_schedule_primed_cuda_graph_request_count = None
-        controller._dynamic_step_sample_logits = mock.Mock(side_effect=lambda: events.append("sample"))
+        controller._dynamic_step_sample_logits = mock.Mock(
+            side_effect=lambda: events.append("sample")
+        )
         controller._build_dynamic_step_request_update = mock.Mock(
             side_effect=lambda: (
                 {
@@ -476,19 +475,17 @@ class TestAsyncSchedulingControllerHelpers:
             side_effect=lambda: events.append("forward") or None
         )
 
-        with mock.patch(
-            "megatron.core.inference.text_generation_controllers.text_generation_controller.range_push"
-        ), mock.patch(
-            "megatron.core.inference.text_generation_controllers.text_generation_controller.range_pop"
+        with (
+            mock.patch(
+                "megatron.core.inference.text_generation_controllers.text_generation_controller.range_push"
+            ),
+            mock.patch(
+                "megatron.core.inference.text_generation_controllers.text_generation_controller.range_pop"
+            ),
         ):
             controller._run_async_scheduling_step()
 
-        assert events == [
-            "sample",
-            "prepare_requests",
-            "forward",
-            "resolve_requests",
-        ]
+        assert events == ["sample", "prepare_requests", "forward", "resolve_requests"]
         _, kwargs = context.resolve_requests.call_args
         assert kwargs["delay_finished_compaction"]
 
