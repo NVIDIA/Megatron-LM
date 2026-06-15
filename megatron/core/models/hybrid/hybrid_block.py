@@ -284,8 +284,9 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         fail on a missing positional argument (causal masking is inferred by the
         attention backend when the mask is ``None``).
         """
-        residual = hidden_states
-        aggregated, h_res, h_post = self.hyper_connection(
+
+        """Run the wrapped hybrid layer through one layer-boundary mHC update."""
+        aggregated, h_res, h_post, residual = self.hyper_connection(
             hidden_states, mhc_recompute_manager=mhc_recompute_manager
         )
         fast_path_result = self._call_inner_transformer_layer_without_local_bda(
