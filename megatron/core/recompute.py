@@ -12,10 +12,10 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_layer import TransformerLayer
 
-te_checkpoint = None
-
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import te_checkpoint
+else:
+    te_checkpoint = None
 
 
 def checkpointed_forward(
@@ -66,9 +66,9 @@ def checkpointed_forward(
             padding_mask=None,
         ):
             rotary_pos_emb = (
-                rotary_pos_emb_global
-                if rotary_pos_emb_local is None
-                else (rotary_pos_emb_local, rotary_pos_emb_global)
+                (rotary_pos_emb_local, rotary_pos_emb_global)
+                if is_dual_rope
+                else rotary_pos_emb_global
             )
 
             for index in range(start, end):
