@@ -108,6 +108,17 @@ class TestGroupedRollouts:
                 [f"t{i}" for i in range(8)],
                 id="batch_consume_submission_order",
             ),
+            pytest.param(
+                4,
+                True,
+                4,
+                "G",
+                "B",
+                8,
+                [0, 0, 0, 0, 1, 1, 1, 1],
+                [f"t{i}" for i in range(8)],
+                id="group_submit_batch_consume_submission_order",
+            ),
         ],
     )
     async def test_get_grouped_rollouts(
@@ -171,6 +182,7 @@ class TestGroupedRollouts:
         [
             pytest.param("B", "B", [4, 4], id="batch_submission"),
             pytest.param("G", "G", [3, 1], id="group_submission"),
+            pytest.param("G", "B", [3, 1], id="group_submission_batch_consumption"),
         ],
     )
     async def test_weighted_multi_task(

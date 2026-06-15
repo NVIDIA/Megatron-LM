@@ -198,6 +198,52 @@ class TestRLUtils:
 
         assert get_rl_parallel_generation_tasks(args) == expected_parallel_generation_tasks
 
+    def test_get_rollout_generator_keeps_trainer_batch_size_for_non_batch_submission(
+        self, monkeypatch
+    ):
+        captured = {}
+        rollout_generator = object()
+
+        class Agent:
+            def get_grouped_rollouts(self, request):
+                captured["request"] = request
+                return rollout_generator
+
+        def get_agent(_args, parallel_generation_tasks=None):
+            captured["parallel_generation_tasks"] = parallel_generation_tasks
+            return Agent()
+
+        monkeypatch.setattr(rl_utils, "_ROLLOUT_GENERATOR", None)
+        monkeypatch.setattr(rl_utils, "get_agent", get_agent)
+
+        args = SimpleNamespace(
+            rl_partial_rollouts=True,
+            rl_submission_granularity="G",
+            rl_consumption_granularity="B",
+            rl_generation_lag=0,
+            grpo_prompts_per_step=8,
+            grpo_group_size=4,
+            rl_default_temperature=1.0,
+            inference_max_seq_length=128,
+            rl_default_top_p=1.0,
+            rl_default_top_k=0,
+            grpo_filter_groups_with_same_reward=False,
+        )
+
+        result = rl_utils.get_rollout_generator(
+            args,
+            inference_interface=MagicMock(),
+            n_prompts=8,
+            samples_per_group=4,
+        )
+
+        assert result is rollout_generator
+        assert captured["parallel_generation_tasks"] == 8
+        assert captured["request"].num_groups == 8
+        assert captured["request"].streaming
+        assert captured["request"].submission_granularity == "G"
+        assert captured["request"].consumption_granularity == "B"
+
     @pytest.mark.parametrize(
         "overrides, match",
         [

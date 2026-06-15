@@ -230,11 +230,13 @@ class GroupedRolloutGenerator(Agent, ABC):
         )
         submitted_groups = 0
 
-        # num_groups controls how many groups each generation task submits together.
-        groups_per_worker = request.num_groups
-        if groups_per_worker > 1:
+        # Keep the trainer batch size separate from the generation submission chunk size.
+        groups_per_batch = request.num_groups
+        groups_per_submission = groups_per_batch if request.submission_granularity == "B" else 1
+        submissions_per_batch = groups_per_batch // groups_per_submission
+        if groups_per_submission > 1:
             assert not request.filter_groups_with_same_reward, \
-                "Cannot use filter_groups_with_same_reward with num_groups > 1."
+                "Cannot use filter_groups_with_same_reward with batch submission."
         submission_gate = asyncio.Semaphore(self.parallel_generation_tasks)
 
         async def generate_and_enqueue(batch_id, index_in_batch):
@@ -258,19 +260,21 @@ class GroupedRolloutGenerator(Agent, ABC):
             while request.streaming or submitted_groups < request.num_groups:
                 if not submit_at_rollout_granularity:
                     await submission_gate.acquire()
-                batch_id = submitted_groups // groups_per_worker
-                submitted_groups += groups_per_worker
-                if groups_per_worker > 1:
+                start_group = submitted_groups
+                batch_id = start_group // groups_per_batch
+                index_in_batch = start_group % groups_per_batch
+                submitted_groups += groups_per_submission
+                if groups_per_submission > 1:
                     await asyncio.gather(*[
-                        generate_and_enqueue(batch_id, i)
-                        for i in range(groups_per_worker)
+                        generate_and_enqueue(batch_id, index_in_batch + i)
+                        for i in range(groups_per_submission)
                     ])
                 else:
                     if consume_at_batch_granularity:
-                        while not await generate_and_enqueue(batch_id, 0):
+                        while not await generate_and_enqueue(batch_id, index_in_batch):
                             pass
-                    elif not await generate_and_enqueue(batch_id, 0):
-                        submitted_groups -= groups_per_worker
+                    elif not await generate_and_enqueue(batch_id, index_in_batch):
+                        submitted_groups -= groups_per_submission
                         if not submit_at_rollout_granularity:
                             submission_gate.release()
 
@@ -297,15 +301,16 @@ class GroupedRolloutGenerator(Agent, ABC):
                 if consume_at_batch_granularity:
                     # Accumulate groups and consume complete trainer batches in submission order.
                     pending.setdefault(group.batch_id, []).append(group)
-                    while (l := len(pending.get(next_batch_id, []))) >= groups_per_worker:
-                        assert l == groups_per_worker
+                    while (l := len(pending.get(next_batch_id, []))) >= groups_per_batch:
+                        assert l == groups_per_batch
                         batch = pending.pop(next_batch_id)
                         batch.sort(key=lambda g: g.index_in_batch)
                         next_batch_id += 1
                         for g in batch:
                             yield g
                         if not submit_at_rollout_granularity:
-                            submission_gate.release()
+                            for _ in range(submissions_per_batch):
+                                submission_gate.release()
                 else:
                     # Yield groups as soon as they're completed.
                     yield group

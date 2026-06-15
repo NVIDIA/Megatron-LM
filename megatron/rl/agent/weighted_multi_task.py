@@ -191,29 +191,33 @@ class WeightedMultiTask(
         """Distribute grouped rollouts across sub-agents according to weights."""
         agent_groups = self._distribute_counts(request.num_groups)
         if request.submission_granularity == "B":
-            # In BATCH mode, pgt counts local batches in flight. agent_groups already
-            # splits each batch by weight, so copy pgt to every active agent.
-            agent_pgts = [
+            # Batch submission: parallel_generation_tasks counts full trainer batches in flight.
+            # Each active environment needs that many local batch slots; agent_groups already
+            # determines how many groups from each environment belong to each batch.
+            agent_parallel_generation_tasks = [
                 self.parallel_generation_tasks if num_groups > 0 else 0
                 for num_groups in agent_groups
             ]
         else:
-            # In GROUP/ROLLOUT mode, pgt counts fine-grained work units, so split it by weight.
-            agent_pgts = self._distribute_counts(self.parallel_generation_tasks)
+            # Group/rollout submission: parallel_generation_tasks counts fine-grained
+            # generation work, so split those work slots across environments by weight.
+            agent_parallel_generation_tasks = self._distribute_counts(
+                self.parallel_generation_tasks
+            )
         agent_slots = self._distribute_counts(request.num_groups, distribute_remainder=False)
         agent_slots = np.array(agent_slots) / np.gcd.reduce(agent_slots)
 
         # Create tasks for each agent with non-zero groups
         generators = []
-        for agent, num_groups, pgt in zip(
-            self.agents, agent_groups, agent_pgts, strict=True
+        for agent, num_groups, parallel_generation_tasks in zip(
+            self.agents, agent_groups, agent_parallel_generation_tasks, strict=True
         ):
             if num_groups > 0:
                 if not isinstance(agent, GroupedRolloutGenerator):
                     raise TypeError(
                         f"Agent of type {type(agent)} does not support grouped rollouts"
                     )
-                agent.parallel_generation_tasks = pgt
+                agent.parallel_generation_tasks = parallel_generation_tasks
                 agent_request = GroupedRolloutRequest(
                     num_groups=num_groups,
                     streaming=request.streaming,
