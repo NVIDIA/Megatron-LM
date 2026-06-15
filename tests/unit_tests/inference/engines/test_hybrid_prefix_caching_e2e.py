@@ -368,7 +368,9 @@ class TestMambaPrefixCachingE2E:
             mamba_config,
             enable_prefix_caching=True,
             buffer_size_gb=2.0,
-            prefix_caching_mamba_gb=0.2,
+            # Large buffer auto-derives many max_requests, so the extraction scratch
+            # is large; give the Mamba cache enough budget to cover it plus durable.
+            prefix_caching_mamba_gb=4.0,
             num_cuda_graphs=num_cuda_graphs,
         )
         alloc = engine.context.kv_block_allocator
