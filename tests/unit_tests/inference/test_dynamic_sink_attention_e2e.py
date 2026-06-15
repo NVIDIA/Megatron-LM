@@ -29,6 +29,7 @@ import pytest
 import torch
 
 from megatron.core.inference.inference_request import Status
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.utils import is_fa_min_version
 
 # Reuse the existing dynamic-engine test infrastructure. Only the
@@ -62,6 +63,18 @@ class TestDynamicEngineSinkAttention(DynamicInferenceEngineTestBase):
             expert_model_parallel_size=1,
             expert_tensor_parallel_size=1,
         )
+
+    def teardown_method(self, method):
+        # ``DynamicInferenceEngine.start()`` (invoked by ``_run_test`` via
+        # ``_build_test_env``) flips the process-wide ``InferenceMode`` flag
+        # on but only clears it via an explicit ``suspend()``. These tests
+        # never call ``suspend()``, so without this teardown the flag would
+        # leak into subsequent tests in the same pytest worker (notably
+        # ``test_moe_dispatching_and_routing.py::TestInferenceTopKRouter``,
+        # which depends on the flag being False to exercise the training-mode
+        # router path that returns sparse ``[num_tokens, num_experts]``
+        # routing maps).
+        InferenceMode.unset_active()
 
     @classmethod
     def teardown_class(cls):
