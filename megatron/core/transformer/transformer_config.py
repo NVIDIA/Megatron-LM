@@ -1279,7 +1279,8 @@ class TransformerConfig(ModelParallelConfig):
     "expert_fc1": offload the input of the expert fc1 part.
     "moe_act": offload the input of the moe act part.
     "layer_input": offload the input checkpoint saved by uniform full recompute. This offloads
-    one input per recompute_num_layers-layer segment.
+    one input per recompute_num_layers-layer segment and cannot be combined with other
+    offload_modules.
     """
     min_offloaded_tensor_size: int = 1024 * 1024
     """The minimum size of the tensor to be offloaded."""
@@ -1997,6 +1998,12 @@ class TransformerConfig(ModelParallelConfig):
                 f'Invalid choices for offload_modules: {invalid_modules}. '
                 f'Allowed modules are: {allowed_modules}'
             )
+            if "layer_input" in self.offload_modules and len(self.offload_modules) > 1:
+                raise ValueError(
+                    "offload_modules includes 'layer_input', which is mutually exclusive "
+                    "with other offload modules because it offloads full-recompute checkpoint "
+                    "inputs rather than module-internal saved activations."
+                )
             if "layer_input" in self.offload_modules and self.recompute_granularity != "full":
                 raise ValueError(
                     "offload_modules includes 'layer_input', which only applies to "

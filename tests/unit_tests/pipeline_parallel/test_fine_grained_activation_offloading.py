@@ -487,6 +487,22 @@ def test_layer_input_offloading_requires_uniform_full_recompute():
         )
 
 
+def test_layer_input_offloading_is_mutually_exclusive_with_module_offload():
+    """layer_input offloading cannot be combined with module-internal activation offload."""
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=4,
+            fine_grained_activation_offloading=True,
+            offload_modules=["layer_input", "qkv_linear"],
+            recompute_granularity="full",
+            recompute_method="uniform",
+            recompute_num_layers=1,
+            recompute_modules=[],
+        )
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
 def test_layer_input_only_context_does_not_enable_te_cpu_offload(monkeypatch):
     """layer_input-only offload should not toggle TE's global CPU offload flag."""
@@ -518,7 +534,7 @@ def test_layer_input_only_context_does_not_enable_te_cpu_offload(monkeypatch):
     assert not mgr.inside_context
 
     monkeypatch.setattr(te_ext, "cpu_offload", DummyCpuOffload)
-    mgr = set_forward_groups("layer_input", "qkv_linear")
+    mgr = set_forward_groups("qkv_linear")
     try:
         mgr.__enter__()
         assert DummyCpuOffload.CPUOffloadEnabled
