@@ -471,6 +471,48 @@ def test_layer_input_offloading_requires_uniform_full_recompute():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
+def test_layer_input_only_context_does_not_enable_te_cpu_offload(monkeypatch):
+    """layer_input-only offload should not toggle TE's global CPU offload flag."""
+    from megatron.core.extensions import transformer_engine as te_ext
+    from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+        ChunkOffloadHandler,
+        OffloadTensorGroup,
+        PipelineOffloadManager,
+    )
+
+    class DummyCpuOffload:
+        CPUOffloadEnabled = False
+
+    def set_forward_groups(*names):
+        PipelineOffloadManager.reset_instance()
+        mgr = PipelineOffloadManager.get_instance()
+        handler = ChunkOffloadHandler(0, mgr.cpu_tensor_pool)
+        handler.offload_groups = [OffloadTensorGroup(name) for name in names]
+        mgr._cur_forward_chunk = handler
+        return mgr
+
+    monkeypatch.setattr(te_ext, "cpu_offload", None)
+    mgr = set_forward_groups("layer_input")
+    try:
+        mgr.__enter__()
+        assert mgr.inside_context
+    finally:
+        mgr.__exit__()
+    assert not mgr.inside_context
+
+    monkeypatch.setattr(te_ext, "cpu_offload", DummyCpuOffload)
+    mgr = set_forward_groups("layer_input", "qkv_linear")
+    try:
+        mgr.__enter__()
+        assert DummyCpuOffload.CPUOffloadEnabled
+    finally:
+        mgr.__exit__()
+    assert not DummyCpuOffload.CPUOffloadEnabled
+
+    PipelineOffloadManager.reset_instance()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for offloading tests.")
 def test_backward_commit_prefetches_next_reload_before_group_start(monkeypatch):
     """Backward commit should prefetch the next group before group-start backward runs."""
     from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
@@ -547,8 +589,7 @@ def test_te_checkpoint_resizes_fgao_reloaded_input(monkeypatch):
             sum(
                 1
                 for inp in detached_inputs
-                if torch.is_tensor(inp)
-                and getattr(inp, "_mcore_fgao_resize_after_backward", False)
+                if torch.is_tensor(inp) and getattr(inp, "_mcore_fgao_resize_after_backward", False)
             )
         )
         return original_resize(detached_inputs)
@@ -562,12 +603,7 @@ def test_te_checkpoint_resizes_fgao_reloaded_input(monkeypatch):
         return (inp * inp).sum()
 
     loss = te_ext.te_checkpoint(
-        forward_func,
-        False,
-        None,
-        None,
-        x,
-        release_fgao_reloaded_inputs=True,
+        forward_func, False, None, None, x, release_fgao_reloaded_inputs=True
     )
     loss.backward()
     torch.cuda.synchronize()

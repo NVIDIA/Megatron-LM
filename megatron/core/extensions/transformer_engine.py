@@ -2813,9 +2813,7 @@ def _detach_checkpoint_inputs_with_fgao_resize(inputs):
 def _resize_fgao_checkpoint_inputs(detached_inputs):
     """Release FGAO-reloaded checkpoint input storage after its recompute backward."""
     for inp in detached_inputs:
-        if not (
-            torch.is_tensor(inp) and getattr(inp, "_mcore_fgao_resize_after_backward", False)
-        ):
+        if not (torch.is_tensor(inp) and getattr(inp, "_mcore_fgao_resize_after_backward", False)):
             continue
         if inp.is_cuda:
             inp.record_stream(torch.cuda.current_stream(inp.device))
@@ -2876,16 +2874,12 @@ def _install_te_checkpoint_fgao_resize_patch():
             )
 
         bwd_cpu_rng_state = torch.get_rng_state()
-        bwd_cuda_rng_state = te_dist._get_cuda_rng_state(
-            graph_safe=ctx.graph_safe_rng_state
-        )
+        bwd_cuda_rng_state = te_dist._get_cuda_rng_state(graph_safe=ctx.graph_safe_rng_state)
         if get_rng_state_tracker is not None:
             bwd_cuda_rng_state_tracker = get_rng_state_tracker().get_states()
 
         torch.set_rng_state(ctx.fwd_cpu_rng_state)
-        te_dist._set_cuda_rng_state(
-            ctx.fwd_cuda_rng_state, graph_safe=ctx.graph_safe_rng_state
-        )
+        te_dist._set_cuda_rng_state(ctx.fwd_cuda_rng_state, graph_safe=ctx.graph_safe_rng_state)
         if get_rng_state_tracker is not None:
             get_rng_state_tracker().set_states(ctx.fwd_cuda_rng_state_tracker)
 
@@ -2896,9 +2890,7 @@ def _install_te_checkpoint_fgao_resize_patch():
             ctx.recompute_ctx,
             ctx.torch_gpu_amp_ctx,
             ctx.torch_cpu_amp_ctx,
-            te_dist.activation_recompute_forward(
-                activation_recompute=True, recompute_phase=True
-            ),
+            te_dist.activation_recompute_forward(activation_recompute=True, recompute_phase=True),
             te_dist.autocast(enabled=ctx.fp8, recipe=ctx.fp8_recipe),
         ):
             outputs = ctx.run_function(*detached_inputs, **ctx.kwargs)

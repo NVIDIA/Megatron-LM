@@ -1968,19 +1968,13 @@ class TransformerConfig(ModelParallelConfig):
                 f'Invalid choices for offload_modules: {invalid_modules}. '
                 f'Allowed modules are: {allowed_modules}'
             )
-            if (
-                "layer_input" in self.offload_modules
-                and self.recompute_granularity != "full"
-            ):
+            if "layer_input" in self.offload_modules and self.recompute_granularity != "full":
                 raise ValueError(
                     "offload_modules includes 'layer_input', which only applies to "
                     "full activation recompute because it offloads the checkpoint input "
                     "saved for each full-recompute segment."
                 )
-            if (
-                "layer_input" in self.offload_modules
-                and self.recompute_method != "uniform"
-            ):
+            if "layer_input" in self.offload_modules and self.recompute_method != "uniform":
                 raise ValueError(
                     "offload_modules includes 'layer_input', which currently requires "
                     "uniform full activation recompute so it can offload one checkpoint "
