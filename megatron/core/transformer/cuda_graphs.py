@@ -1735,16 +1735,27 @@ def _layer_is_graphable(layer, config):
     from megatron.core.transformer.moe.moe_layer import MoELayer
     from megatron.core.transformer.transformer_layer import TransformerLayer
 
-    # mHC wrapper: the whole wrapper forward (mHC aggregate + inner layer + BDA) is
-    # captured as one graph, so graphability is decided by the inner layer's
-    # type/scope. MoE inner layers are excluded: a whole-layer capture would try to
-    # graph the expert all-to-all, which is not graph-safe (the GPT path graphs only
-    # moe_router/moe_preprocess and runs experts eagerly). Those wrappers stay eager.
+    # mHC wrapper: graphability is decided by the inner layer's type/scope. Non-MoE
+    # inner layers are captured as one whole-wrapper graph (mHC aggregate + inner + BDA).
+    # MoE inner layers use partial capture: the wrapper graphs the deterministic prefix
+    # (mHC aggregate + router/preprocess) and runs the expert all-to-all + mHC BDA eagerly
+    # (the all-to-all is not graph-safe), mirroring the GPT HyperConnectionTransformerLayer.
     if isinstance(layer, HyperConnectionHybridLayer):
         inner = layer.inner_layer
         if isinstance(inner, MambaLayer) and CudaGraphModule.mamba in config.cuda_graph_modules:
             return True
-        if isinstance(inner, TransformerLayer) and not isinstance(inner.mlp, MoELayer):
+        if isinstance(inner, TransformerLayer):
+            if isinstance(inner.mlp, MoELayer):
+                # MoE inner: graphable via partial (router/preprocess) capture.
+                if (
+                    CudaGraphModule.moe in config.cuda_graph_modules
+                    or CudaGraphModule.moe_router in config.cuda_graph_modules
+                    or CudaGraphModule.moe_preprocess in config.cuda_graph_modules
+                ):
+                    return True
+                # attn-only scope on an MoE inner: the (identity) attention prefix has
+                # nothing graph-worthy, so leave eager.
+                return False
             if CudaGraphModule.attn in config.cuda_graph_modules and not (
                 isinstance(inner.self_attention, IdentityOp)
                 and isinstance(inner.cross_attention, IdentityOp)

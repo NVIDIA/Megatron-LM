@@ -1346,6 +1346,58 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer):
             if self.config.delay_offload_until_cuda_graph:
                 self.off_interface.exit_replay()
 
+    def resume_moe_experts_after_partial_cudagraph(self, cuda_graph_output):
+        """Resume the eager MoE *expert* compute after a partial (moe_router[/moe_preprocess])
+        CUDA graph and return the raw ``mlp_output_with_bias`` (NOT the post-residual layer
+        output). ``cuda_graph_output`` is the list of captured router/preprocess intermediates,
+        with any outer (e.g. mHC) state already stripped by the caller.
+
+        Used by the mHC hybrid wrapper (``HyperConnectionHybridLayer``): the wrapper's n-stream
+        BDA owns the residual combine (mirroring GPT's ``HyperConnectionTransformerLayer``), so
+        the inner layer's own ``_forward_post_mlp`` residual-add is intentionally skipped here.
+        EP-overlap is not supported on this path.
+        """
+        assert not self.config.overlap_moe_expert_parallel_comm, (
+            "HyperConnectionHybridLayer MoE CUDA-graph capture requires "
+            "overlap_moe_expert_parallel_comm=False."
+        )
+        shared_expert_output, routing_map = None, None
+        # The inner residual is the last captured element; the mHC wrapper does not use it
+        # (the n-stream BDA combines residual), so drop it.
+        cuda_graph_output.pop()
+        if (
+            self.config.moe_shared_expert_intermediate_size is not None
+            and not self.config.moe_shared_expert_overlap
+        ):
+            shared_expert_output = cuda_graph_output.pop()
+
+        if CudaGraphModule.moe_preprocess in self.config.cuda_graph_modules:
+            (hidden_states, probs), attr_outputs = cuda_graph_output[:2], cuda_graph_output[2:]
+            valid_cudagraph_attrs = self.mlp.token_dispatcher.valid_cudagraph_attrs
+            assert len(attr_outputs) == len(
+                valid_cudagraph_attrs
+            ), f"attr_outputs: {len(attr_outputs)} != {len(valid_cudagraph_attrs)}"
+            for i, attr_name in enumerate(valid_cudagraph_attrs):
+                self.mlp.token_dispatcher.set_cudagraph_attr(attr_name, attr_outputs[i])
+        else:
+            assert len(cuda_graph_output) == 3, (
+                "CUDA graph output should be [hidden_states, probs, routing_map], "
+                f"but got {len(cuda_graph_output)} elements"
+            )
+            hidden_states, probs, routing_map = cuda_graph_output
+
+        nvtx_range_push(suffix="mlp")
+        self.mlp.cudagraph_tensor_store.set(
+            hidden_states=hidden_states,
+            probs=probs,
+            routing_map=routing_map,
+            shared_expert_output=shared_expert_output,
+        )
+        mlp_output_with_bias = self.mlp(hidden_states)
+        self.mlp.cudagraph_tensor_store.clear()
+        nvtx_range_pop(suffix="mlp")
+        return mlp_output_with_bias
+
     def _te_cuda_graph_replay_impl(self, args, kwargs, context):
         """Implementation of _te_cuda_graph_replay, separated for replay mode cleanup."""
         cuda_graph_output = list(super()._te_cuda_graph_replay(*args, **kwargs))
