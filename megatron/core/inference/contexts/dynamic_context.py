@@ -48,7 +48,7 @@ from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMet
 from .base_context import BaseInferenceContext
 from .gpu_view import ContextGPUView
 from .kv_block_allocator import KVBlockAllocator
-from .mamba_slot_allocator import MambaSlotAllocator
+from .mamba_slot_allocator import MAX_INTERMEDIATE_OFFSETS_PER_REQUEST, MambaSlotAllocator
 from .routing_metadata import RoutingMetadata
 
 try:
@@ -758,11 +758,20 @@ class DynamicInferenceContext(BaseInferenceContext):
                 and prefix_caching_mamba_gb > 0
             ):
                 prefix_cache_bytes = int(prefix_caching_mamba_gb * 1024**3)
-                prefix_cache_slots = prefix_cache_bytes // mamba_bytes_per_req
+                # The extraction scratch is reserved from the budget before sizing
+                # the durable cache (see _allocate_mamba_cache), so report it here
+                # to keep the preview consistent with what is actually allocated.
+                scratch_slots = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * self.max_requests
+                scratch_bytes = scratch_slots * mamba_bytes_per_req
+                durable_slots = (prefix_cache_bytes - scratch_bytes) // mamba_bytes_per_req
+                durable_slots = max(durable_slots, 0)
                 log_lines += [
                     f"  Mamba prefix cache:",
                     f"    budget:                {get_mem_size_str(prefix_cache_bytes)}",
-                    f"    slots:                 {prefix_cache_slots}",
+                    f"    extraction_scratch:    {scratch_slots} slots "
+                    f"({get_mem_size_str(scratch_bytes)})",
+                    f"    durable_slots:         {durable_slots} "
+                    f"({get_mem_size_str(durable_slots * mamba_bytes_per_req)})",
                     f"    per_slot:              {get_mem_size_str(mamba_bytes_per_req)}",
                 ]
 
@@ -1264,6 +1273,23 @@ class DynamicInferenceContext(BaseInferenceContext):
             and self.config.enable_prefix_caching
         ):
             self._allocate_mamba_cache(self.config.prefix_caching_mamba_gb)
+        elif self.is_hybrid_model and self.config.enable_prefix_caching:
+            # Memory-only mode: prefix caching on a hybrid model without a Mamba
+            # cache budget deduplicates identical KV prefixes for memory savings,
+            # but does NOT cache Mamba recurrent state. Prefill skipping is
+            # therefore disabled (prefix_skip_tokens is forced to 0) and every
+            # token is recomputed, so results stay correct -- but the main latency
+            # benefit of prefix caching is forgone. Warn so a user who expected
+            # full caching knows to set prefix_caching_mamba_gb.
+            logging.warning(
+                "enable_prefix_caching is set on a hybrid (Mamba) model but "
+                "prefix_caching_mamba_gb is not configured (got %r). Running in "
+                "memory-only mode: identical KV prefixes are deduplicated for "
+                "memory savings, but Mamba state caching and prefill skipping are "
+                "disabled (every token is recomputed). Set prefix_caching_mamba_gb "
+                "> 0 to enable full prefix caching.",
+                self.config.prefix_caching_mamba_gb,
+            )
 
         # Reset tensor-related metadata.
         self.reset_metadata()
@@ -1592,15 +1618,27 @@ class DynamicInferenceContext(BaseInferenceContext):
         ssm_size = _math.prod(self.mamba_ssm_states_shape) * self.mamba_ssm_states_dtype.itemsize
         per_slot_bytes = self.num_mamba_layers * (conv_size + ssm_size)
         total_bytes = int(mamba_gb * 1024**3)
-        max_slots = total_bytes // per_slot_bytes
+
+        # MambaSlotAllocator also allocates fixed CUDA-graph-safe scratch buffers
+        # for intermediate-state extraction, sized to the per-step worst case of
+        # MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * max_requests slots. These are not
+        # part of the durable cache but consume the same per-slot footprint, so we
+        # reserve them from the budget up front; otherwise total usage silently
+        # exceeds mamba_gb (and can OOM) when 3 * max_requests > max_slots.
+        scratch_slots = MAX_INTERMEDIATE_OFFSETS_PER_REQUEST * self.max_requests
+        scratch_bytes = scratch_slots * per_slot_bytes
+        max_slots = (total_bytes - scratch_bytes) // per_slot_bytes
         if max_slots < 1:
-            logging.warning(
-                "Mamba cache budget (%.3f GB) too small for even 1 slot "
-                "(need %.3f GB per slot). Mamba caching disabled.",
-                mamba_gb,
-                per_slot_bytes / 1024**3,
+            raise ValueError(
+                f"Mamba prefix cache budget (prefix_caching_mamba_gb={mamba_gb:.4g} GB) "
+                f"is too small. The CUDA-graph extraction scratch reserves "
+                f"{scratch_bytes / 1024**3:.4g} GB ({scratch_slots} slots = "
+                f"{MAX_INTERMEDIATE_OFFSETS_PER_REQUEST} offsets x {self.max_requests} "
+                f"requests x {per_slot_bytes / 1024:.1f} KB/slot), leaving room for "
+                f"fewer than one durable cache slot. Increase prefix_caching_mamba_gb "
+                f"to at least {(scratch_bytes + per_slot_bytes) / 1024**3:.4g} GB, or "
+                f"reduce max_requests."
             )
-            return
 
         self.mamba_slot_allocator = MambaSlotAllocator(
             context=self,
@@ -1616,9 +1654,14 @@ class DynamicInferenceContext(BaseInferenceContext):
         )
 
         logging.info(
-            "Mamba prefix cache: %d slots (%.3f GB), per-slot %.1f KB",
+            "Mamba prefix cache: %d durable slots (%.3f GB) + %d scratch slots "
+            "(%.3f GB) = %.3f GB total within %.3f GB budget, per-slot %.1f KB",
             max_slots,
             max_slots * per_slot_bytes / 1024**3,
+            scratch_slots,
+            scratch_bytes / 1024**3,
+            (max_slots + scratch_slots) * per_slot_bytes / 1024**3,
+            mamba_gb,
             per_slot_bytes / 1024,
         )
 
