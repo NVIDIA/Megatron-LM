@@ -2038,7 +2038,7 @@ def is_submodule(module, parent_module, strict=True):
 
 def get_batch_on_this_tp_rank(
     batch: dict[str, torch.Tensor],
-    is_sft: bool,
+    has_cu_seqlens: bool,
     is_hybrid_cp: bool,
     create_attention_mask_in_dataloader: bool,
     broadcast_src_rank: int,
@@ -2073,8 +2073,8 @@ def get_batch_on_this_tp_rank(
         batch (dict[str, torch.Tensor]): The batch dict. On TP rank 0 this
             contains the actual data; on other ranks it is ignored (receive
             buffers are allocated internally).
-        is_sft (bool): Whether this is an SFT (supervised fine-tuning) run
-            using THD packed sequences.
+        has_cu_seqlens (bool): Whether the batch contains cu_seqlens and
+            max_seqlen metadata (e.g., SFT or --dataloader-inter-document-masking).
         is_hybrid_cp (bool): Whether hybrid context parallelism is enabled.
         create_attention_mask_in_dataloader (bool): Whether the dataloader
             creates an explicit attention mask tensor.
@@ -2131,7 +2131,7 @@ def get_batch_on_this_tp_rank(
             _broadcast(batch['labels'])
             _broadcast(batch['loss_mask'])
             _broadcast(batch['position_ids'])
-            if is_sft or is_hybrid_cp:
+            if has_cu_seqlens or is_hybrid_cp:
                 _broadcast_cu_seqlens(batch['cu_seqlens'])
                 _broadcast(batch['max_seqlen'])
                 if cp_size > 1:
@@ -2147,7 +2147,7 @@ def get_batch_on_this_tp_rank(
 
             _broadcast(batch['tokens'])
             _broadcast(batch['position_ids'])
-            if is_sft:
+            if has_cu_seqlens:
                 _broadcast_cu_seqlens(batch['cu_seqlens'])
                 _broadcast(batch['max_seqlen'])
                 if cp_size > 1:
@@ -2161,7 +2161,7 @@ def get_batch_on_this_tp_rank(
 
             _broadcast(batch['labels'])
             _broadcast(batch['loss_mask'])
-            if is_sft:
+            if has_cu_seqlens:
                 _broadcast_cu_seqlens(batch['cu_seqlens'])
                 _broadcast(batch['max_seqlen'])
                 if cp_size > 1:
@@ -2169,8 +2169,8 @@ def get_batch_on_this_tp_rank(
             if create_attention_mask_in_dataloader:
                 _broadcast(batch['attention_mask'])
 
-        elif is_sft:
-            # NOTE(asolergi-nv): Broadcast required THD metadata for SFT to intermediate stages
+        elif has_cu_seqlens:
+            # NOTE(asolergi-nv): Broadcast required THD metadata to intermediate stages.
             batch["tokens"] = None
             batch["labels"] = None
             batch["loss_mask"] = None
@@ -2202,7 +2202,7 @@ def get_batch_on_this_tp_rank(
         attention_mask = None
         local_cp_size = None
 
-        if is_sft or is_hybrid_cp:
+        if has_cu_seqlens or is_hybrid_cp:
             max_seqlen = torch.empty(1, dtype=torch.int32, device=torch.cuda.current_device())
         if create_attention_mask_in_dataloader:
             attention_mask = torch.empty(
@@ -2242,7 +2242,7 @@ def get_batch_on_this_tp_rank(
             _broadcast(labels)
             _broadcast(loss_mask)
             _broadcast(position_ids)
-            if is_sft or is_hybrid_cp:
+            if has_cu_seqlens or is_hybrid_cp:
                 cu_seqlens = _broadcast_cu_seqlens()
                 _broadcast(max_seqlen)
                 if cp_size > 1:
@@ -2258,7 +2258,7 @@ def get_batch_on_this_tp_rank(
 
             _broadcast(tokens)
             _broadcast(position_ids)
-            if is_sft:
+            if has_cu_seqlens:
                 cu_seqlens = _broadcast_cu_seqlens()
                 _broadcast(max_seqlen)
                 if cp_size > 1:
@@ -2272,7 +2272,7 @@ def get_batch_on_this_tp_rank(
 
             _broadcast(labels)
             _broadcast(loss_mask)
-            if is_sft:
+            if has_cu_seqlens:
                 cu_seqlens = _broadcast_cu_seqlens()
                 _broadcast(max_seqlen)
                 if cp_size > 1:
@@ -2280,8 +2280,8 @@ def get_batch_on_this_tp_rank(
             if create_attention_mask_in_dataloader:
                 _broadcast(attention_mask)
 
-        elif is_sft:
-            # NOTE(asolergi-nv): Broadcast required THD metadata for SFT to intermediate stages
+        elif has_cu_seqlens:
+            # NOTE(asolergi-nv): Broadcast required THD metadata to intermediate stages.
             tokens = None
             labels = None
             loss_mask = None
