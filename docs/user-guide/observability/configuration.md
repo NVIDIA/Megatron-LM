@@ -17,10 +17,10 @@ Each `MEGATRON_OTEL_*` variable is an **alias** for the corresponding [`NemoLens
 | Variable | Default | Description |
 |---|---|---|
 | `MEGATRON_OTEL_ENABLED` | `0` | Master toggle; must be set to `1` to activate |
-| `MEGATRON_OTEL_EXPORT_STRATEGY` | `single_rank` | `single_rank`, `all_ranks`, or `sampled` |
+| `MEGATRON_OTEL_RANK_STRATEGY` | `single_rank` | `single_rank`, `all_ranks`, `sampled`, `first_rank_per_node`, or any name registered via `register_rank_strategy()` |
 | `MEGATRON_OTEL_EXPORT_RANK` | `-1` | For `single_rank`: which rank exports. `-1` = last rank |
 | `MEGATRON_OTEL_EXPORT_SAMPLE_RATE` | `1.0` | For `sampled`: fraction in `[0.0, 1.0]` |
-| `MEGATRON_OTEL_SAMPLER_ENABLED` | `0` | Install `RankAwareSampler` on the TracerProvider |
+| `MEGATRON_OTEL_SAMPLING_STRATEGY` | (empty) | `rank_aware` or any name registered via `register_sampling_strategy()`. Empty leaves the OTel SDK default sampler in place. |
 | `MEGATRON_OTEL_TRACES_ENABLED` | `1` | Enable trace spans |
 | `MEGATRON_OTEL_METRICS_ENABLED` | `1` | Enable metrics instruments |
 | `MEGATRON_OTEL_LOGS_ENABLED` | `0` | Enable OTel log bridge |
@@ -32,9 +32,9 @@ Each `MEGATRON_OTEL_*` variable is an **alias** for the corresponding [`NemoLens
 For the full config model, field semantics, and validation rules, see
 [lens: configuration](../../../../lens/docs/user-guide/configuration.md).
 
-## Export strategy
+## Rank strategy
 
-Controls which ranks actually send telemetry. Three strategies are available: `single_rank` (default), `all_ranks`, and `sampled`, configured via `MEGATRON_OTEL_EXPORT_STRATEGY` above.
+Controls which ranks actually send telemetry. Four strategies are available: `single_rank` (default), `all_ranks`, `sampled`, and `first_rank_per_node`, configured via `MEGATRON_OTEL_RANK_STRATEGY` above.
 
 See [lens: sampling](../../../../lens/docs/user-guide/sampling.md) for detailed semantics, when to use each, and how they compose with OTel SDK samplers.
 
