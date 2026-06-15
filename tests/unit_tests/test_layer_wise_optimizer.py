@@ -91,10 +91,7 @@ def test_set_bucket_layerwise_params_list_single_dp_rank():
     dp_cp_size == 1, but set_bucket_layerwise_params_list() still needs to
     initialize bucket.layerwise_params_list for the overlap param-gather path.
     """
-    params = [
-        torch.nn.Parameter(torch.empty(4, 4)),
-        torch.nn.Parameter(torch.empty(2, 2)),
-    ]
+    params = [torch.nn.Parameter(torch.empty(4, 4)), torch.nn.Parameter(torch.empty(2, 2))]
     for param in params:
         param.is_managed_by_layer_wise_optimizer = True
     bucket = _FakeLayerwiseBucket(params)
