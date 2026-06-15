@@ -481,6 +481,207 @@ def _apply_rotary_pos_emb_thd(
         ).squeeze(1)
 
 
+def _try_fused_mrope_bshd(
+    t: Tensor,
+    freqs: Tensor,
+    config: TransformerConfig,
+    *,
+    mscale: float,
+    mla_rotary_interleaved: bool,
+    inverse: bool,
+    mla_output_remove_interleaving: bool,
+) -> tuple[Optional[Tensor], Tensor]:
+    """Dispatch raw 3-axis mRoPE freqs for the BSHD path.
+
+    Returns ``(result, freqs)``:
+      - ``result`` is not None: the caller should return it (fused output, or the unfused
+        BSHD output when an unsupported option forces a fallback).
+      - ``result`` is None: the caller should fall through to the Transformer Engine path
+        with the returned ``freqs``, which has been converted to the materialized RoPE
+        embedding (``is_raw_mrope_freqs`` no longer holds).
+    """
+    can_try_fused_mrope = (
+        fused_apply_mrope is not None
+        and get_fused_mrope_unavailable_reason is not None
+        and not mla_rotary_interleaved
+        and not inverse
+        and mscale == 1.0
+    )
+    unavailable_reason = (
+        get_fused_mrope_unavailable_reason(t, freqs, config.rotary_interleaved)
+        if can_try_fused_mrope
+        else None
+    )
+    if can_try_fused_mrope and unavailable_reason is None:
+        return (
+            fused_apply_mrope(
+                t,
+                freqs,
+                config.mrope_section,
+                interleaved_mrope=config.mrope_interleaved,
+                rotary_interleaved=config.rotary_interleaved,
+            ),
+            freqs,
+        )
+
+    force_unfused_mrope = False
+    if unavailable_reason is not None:
+        _warn_rope_fusion_fallback_once(
+            _fused_mrope_unavailable_warning_key(unavailable_reason),
+            f"Triton fused mRoPE is unavailable: {unavailable_reason}. "
+            "Using unfused implementation.",
+        )
+        force_unfused_mrope = True
+    unavailable_is_rotary_interleaved = (
+        unavailable_reason is not None and "rotary_interleaved" in unavailable_reason.lower()
+    )
+    if mscale != 1.0:
+        _warn_rope_fusion_fallback_once(
+            "triton-mrope-mscale",
+            f"mscale={mscale} is not supported by Triton fused mRoPE. "
+            "Using unfused implementation.",
+        )
+        force_unfused_mrope = True
+    if mla_rotary_interleaved:
+        _warn_rope_fusion_fallback_once(
+            "triton-mrope-mla-rotary-interleaved",
+            "Triton fused mRoPE does not support MLA-style interleaving in RoPE. "
+            "Using unfused implementation.",
+        )
+        force_unfused_mrope = True
+    if inverse:
+        _warn_rope_fusion_fallback_once(
+            "triton-mrope-inverse",
+            "inverse RoPE is not supported by Triton fused mRoPE. "
+            "Using unfused implementation.",
+        )
+        force_unfused_mrope = True
+    if config.rotary_interleaved and not unavailable_is_rotary_interleaved:
+        _warn_rope_fusion_fallback_once(
+            "triton-mrope-rotary-interleaved",
+            "Triton fused mRoPE currently supports rotary_interleaved=False. "
+            "Using unfused implementation.",
+        )
+        force_unfused_mrope = True
+
+    freqs = _raw_mrope_freqs_to_emb(freqs, config)
+    if force_unfused_mrope:
+        return (
+            _apply_rotary_pos_emb_bshd(
+                t,
+                freqs,
+                rotary_interleaved=config.rotary_interleaved,
+                mla_rotary_interleaved=mla_rotary_interleaved,
+                mscale=mscale,
+                inverse=inverse,
+                mla_output_remove_interleaving=mla_output_remove_interleaving,
+            ),
+            freqs,
+        )
+    return None, freqs
+
+
+def _try_fused_mrope_thd(
+    t: Tensor,
+    cu_seqlens: Tensor,
+    freqs: Tensor,
+    config: TransformerConfig,
+    cp_group: torch.distributed.ProcessGroup,
+    *,
+    mscale: float,
+    mla_rotary_interleaved: bool,
+    inverse: bool,
+    mla_output_remove_interleaving: bool,
+) -> Tensor:
+    """Dispatch raw 3-axis mRoPE freqs for the THD (packed sequence) path.
+
+    Always returns a tensor: the fused output when the Triton kernel is launchable,
+    otherwise the unfused THD output after warning about the unsupported configuration.
+    """
+    use_fused_mrope_thd = (
+        fused_apply_mrope_thd is not None
+        and can_launch_fused_mrope_thd is not None
+        and get_fused_mrope_thd_unavailable_reason is not None
+        and mscale == 1.0
+        and not mla_rotary_interleaved
+        and not inverse
+        and not config.rotary_interleaved
+    )
+    if use_fused_mrope_thd:
+        unavailable_reason = get_fused_mrope_thd_unavailable_reason(
+            t,
+            cu_seqlens,
+            freqs,
+            rotary_interleaved=config.rotary_interleaved,
+            cp_size=cp_group.size(),
+            cp_rank=cp_group.rank(),
+        )
+        if unavailable_reason is None:
+            return fused_apply_mrope_thd(
+                t,
+                cu_seqlens,
+                freqs,
+                config.mrope_section,
+                interleaved_mrope=config.mrope_interleaved,
+                rotary_interleaved=config.rotary_interleaved,
+                cp_size=cp_group.size(),
+                cp_rank=cp_group.rank(),
+            )
+        _warn_rope_fusion_fallback_once(
+            _fused_mrope_unavailable_warning_key(unavailable_reason, thd=True),
+            f"Triton fused mRoPE for THD layout is unavailable: "
+            f"{unavailable_reason}. Using unfused implementation.",
+        )
+    else:
+        has_unsupported_option = False
+        if mscale != 1.0:
+            _warn_rope_fusion_fallback_once(
+                "triton-mrope-thd-mscale",
+                f"mscale={mscale} is not supported by Triton fused mRoPE for THD "
+                "layout. Using unfused implementation.",
+            )
+            has_unsupported_option = True
+        if mla_rotary_interleaved:
+            _warn_rope_fusion_fallback_once(
+                "triton-mrope-thd-mla-rotary-interleaved",
+                "Triton fused mRoPE for THD layout does not support MLA-style "
+                "interleaving in RoPE. Using unfused implementation.",
+            )
+            has_unsupported_option = True
+        if inverse:
+            _warn_rope_fusion_fallback_once(
+                "triton-mrope-thd-inverse",
+                "inverse RoPE is not supported by Triton fused mRoPE for THD layout. "
+                "Using unfused implementation.",
+            )
+            has_unsupported_option = True
+        if config.rotary_interleaved:
+            _warn_rope_fusion_fallback_once(
+                "triton-mrope-thd-rotary-interleaved",
+                "Triton fused mRoPE for THD layout currently supports "
+                "rotary_interleaved=False. Using unfused implementation.",
+            )
+            has_unsupported_option = True
+        if not has_unsupported_option:
+            _warn_rope_fusion_fallback_once(
+                "triton-mrope-thd-unavailable",
+                "Triton fused mRoPE for THD layout is unavailable. "
+                "Using unfused implementation.",
+            )
+    freqs = _raw_mrope_freqs_to_emb(freqs, config)
+    return _apply_rotary_pos_emb_thd(
+        t,
+        cu_seqlens,
+        freqs,
+        rotary_interleaved=config.rotary_interleaved,
+        mla_rotary_interleaved=mla_rotary_interleaved,
+        mscale=mscale,
+        cp_group=cp_group,
+        inverse=inverse,
+        mla_output_remove_interleaving=mla_output_remove_interleaving,
+    )
+
+
 def apply_rotary_pos_emb(
     t: Tensor,
     freqs: Tensor,
@@ -510,81 +711,20 @@ def apply_rotary_pos_emb(
 
     if config.apply_rope_fusion:
         if cu_seqlens is None:
-            force_unfused_mrope = False
             if is_raw_mrope_freqs:
-                unavailable_reason = None
-                can_try_fused_mrope = (
-                    fused_apply_mrope is not None
-                    and get_fused_mrope_unavailable_reason is not None
-                    and not mla_rotary_interleaved
-                    and not inverse
-                    and mscale == 1.0
+                result, freqs = _try_fused_mrope_bshd(
+                    t,
+                    freqs,
+                    config,
+                    mscale=mscale,
+                    mla_rotary_interleaved=mla_rotary_interleaved,
+                    inverse=inverse,
+                    mla_output_remove_interleaving=mla_output_remove_interleaving,
                 )
-                if can_try_fused_mrope:
-                    unavailable_reason = get_fused_mrope_unavailable_reason(
-                        t, freqs, config.rotary_interleaved
-                    )
-                use_fused_mrope = can_try_fused_mrope and unavailable_reason is None
-                if use_fused_mrope:
-                    return fused_apply_mrope(
-                        t,
-                        freqs,
-                        config.mrope_section,
-                        interleaved_mrope=config.mrope_interleaved,
-                        rotary_interleaved=config.rotary_interleaved,
-                    )
-
-                if unavailable_reason is not None:
-                    _warn_rope_fusion_fallback_once(
-                        _fused_mrope_unavailable_warning_key(unavailable_reason),
-                        f"Triton fused mRoPE is unavailable: {unavailable_reason}. "
-                        "Using unfused implementation.",
-                    )
-                    force_unfused_mrope = True
-                unavailable_is_rotary_interleaved = (
-                    unavailable_reason is not None
-                    and "rotary_interleaved" in unavailable_reason.lower()
-                )
-                if mscale != 1.0:
-                    _warn_rope_fusion_fallback_once(
-                        "triton-mrope-mscale",
-                        f"mscale={mscale} is not supported by Triton fused mRoPE. "
-                        "Using unfused implementation.",
-                    )
-                    force_unfused_mrope = True
-                if mla_rotary_interleaved:
-                    _warn_rope_fusion_fallback_once(
-                        "triton-mrope-mla-rotary-interleaved",
-                        "Triton fused mRoPE does not support MLA-style interleaving in RoPE. "
-                        "Using unfused implementation.",
-                    )
-                    force_unfused_mrope = True
-                if inverse:
-                    _warn_rope_fusion_fallback_once(
-                        "triton-mrope-inverse",
-                        "inverse RoPE is not supported by Triton fused mRoPE. "
-                        "Using unfused implementation.",
-                    )
-                    force_unfused_mrope = True
-                if config.rotary_interleaved and not unavailable_is_rotary_interleaved:
-                    _warn_rope_fusion_fallback_once(
-                        "triton-mrope-rotary-interleaved",
-                        "Triton fused mRoPE currently supports rotary_interleaved=False. "
-                        "Using unfused implementation.",
-                    )
-                    force_unfused_mrope = True
-                freqs = _raw_mrope_freqs_to_emb(freqs, config)
+                if result is not None:
+                    return result
+                # Raw freqs were converted to the materialized embedding; fall through to TE.
                 is_raw_mrope_freqs = False
-                if force_unfused_mrope:
-                    return _apply_rotary_pos_emb_bshd(
-                        t,
-                        freqs,
-                        rotary_interleaved=config.rotary_interleaved,
-                        mla_rotary_interleaved=mla_rotary_interleaved,
-                        mscale=mscale,
-                        inverse=inverse,
-                        mla_output_remove_interleaving=mla_output_remove_interleaving,
-                    )
 
             # NOTE: TE backends do not support mRoPE in bshd format when bs > 1.
             use_unfused = False
@@ -627,85 +767,14 @@ def apply_rotary_pos_emb(
                 return fused_apply_rotary_pos_emb(t, freqs, interleaved=config.rotary_interleaved)
         else:
             if is_raw_mrope_freqs:
-                use_fused_mrope_thd = (
-                    fused_apply_mrope_thd is not None
-                    and can_launch_fused_mrope_thd is not None
-                    and get_fused_mrope_thd_unavailable_reason is not None
-                    and mscale == 1.0
-                    and not mla_rotary_interleaved
-                    and not inverse
-                    and not config.rotary_interleaved
-                )
-                if use_fused_mrope_thd:
-                    unavailable_reason = get_fused_mrope_thd_unavailable_reason(
-                        t,
-                        cu_seqlens,
-                        freqs,
-                        rotary_interleaved=config.rotary_interleaved,
-                        cp_size=cp_group.size(),
-                        cp_rank=cp_group.rank(),
-                    )
-                    if unavailable_reason is None:
-                        return fused_apply_mrope_thd(
-                            t,
-                            cu_seqlens,
-                            freqs,
-                            config.mrope_section,
-                            interleaved_mrope=config.mrope_interleaved,
-                            rotary_interleaved=config.rotary_interleaved,
-                            cp_size=cp_group.size(),
-                            cp_rank=cp_group.rank(),
-                        )
-                    _warn_rope_fusion_fallback_once(
-                        _fused_mrope_unavailable_warning_key(unavailable_reason, thd=True),
-                        f"Triton fused mRoPE for THD layout is unavailable: "
-                        f"{unavailable_reason}. Using unfused implementation.",
-                    )
-                else:
-                    has_unsupported_option = False
-                    if mscale != 1.0:
-                        _warn_rope_fusion_fallback_once(
-                            "triton-mrope-thd-mscale",
-                            f"mscale={mscale} is not supported by Triton fused mRoPE for THD "
-                            "layout. Using unfused implementation.",
-                        )
-                        has_unsupported_option = True
-                    if mla_rotary_interleaved:
-                        _warn_rope_fusion_fallback_once(
-                            "triton-mrope-thd-mla-rotary-interleaved",
-                            "Triton fused mRoPE for THD layout does not support MLA-style "
-                            "interleaving in RoPE. Using unfused implementation.",
-                        )
-                        has_unsupported_option = True
-                    if inverse:
-                        _warn_rope_fusion_fallback_once(
-                            "triton-mrope-thd-inverse",
-                            "inverse RoPE is not supported by Triton fused mRoPE for THD layout. "
-                            "Using unfused implementation.",
-                        )
-                        has_unsupported_option = True
-                    if config.rotary_interleaved:
-                        _warn_rope_fusion_fallback_once(
-                            "triton-mrope-thd-rotary-interleaved",
-                            "Triton fused mRoPE for THD layout currently supports "
-                            "rotary_interleaved=False. Using unfused implementation.",
-                        )
-                        has_unsupported_option = True
-                    if not has_unsupported_option:
-                        _warn_rope_fusion_fallback_once(
-                            "triton-mrope-thd-unavailable",
-                            "Triton fused mRoPE for THD layout is unavailable. "
-                            "Using unfused implementation.",
-                        )
-                freqs = _raw_mrope_freqs_to_emb(freqs, config)
-                return _apply_rotary_pos_emb_thd(
+                return _try_fused_mrope_thd(
                     t,
                     cu_seqlens,
                     freqs,
-                    rotary_interleaved=config.rotary_interleaved,
-                    mla_rotary_interleaved=mla_rotary_interleaved,
+                    config,
+                    cp_group,
                     mscale=mscale,
-                    cp_group=cp_group,
+                    mla_rotary_interleaved=mla_rotary_interleaved,
                     inverse=inverse,
                     mla_output_remove_interleaving=mla_output_remove_interleaving,
                 )
