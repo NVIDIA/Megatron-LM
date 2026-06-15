@@ -833,8 +833,8 @@ class TestCanonicalShardedStateDict:
 
     Tests are hermetic: they construct a sharded state dict from fake
     layers whose `sharded_state_dict` methods return bare `ShardedObject`s
-    (no CUDA, no process group, no `nn.Module` init), then inspect the key
-    set after canonicalization.
+    (no CUDA and no process group), then inspect the key set after
+    canonicalization.
     """
 
     def _make_sharded_object(self, key):
@@ -847,11 +847,20 @@ class TestCanonicalShardedStateDict:
         """Fake layer whose `sharded_state_dict` yields a ShardedObject per sub_key."""
         maker = self._make_sharded_object
 
-        class FakeLayer:
+        class FakeLayer(torch.nn.Module):
+            def __init__(self, layer_number=1):
+                super().__init__()
+                self.layer_number = layer_number
+
             def sharded_state_dict(self, prefix, sharded_pp_offset, metadata):
                 return {f"{prefix}{sub_key}": maker(f"{prefix}{sub_key}") for sub_key in sub_keys}
 
         return FakeLayer()
+
+    def _fake_numbered_layer(self, layer_number, sub_keys):
+        layer = self._fake_layer(sub_keys)
+        layer.layer_number = layer_number
+        return layer
 
     def _make_stub_stack(self, layer_type_list, layers, sub_layer_offset=0):
         # The canonicalization is a free function; the "stack" here is just
@@ -886,6 +895,20 @@ class TestCanonicalShardedStateDict:
     def _keys(self, sharded_state_dict):
         return {v.key for v in sharded_state_dict.values()}
 
+    def _run_hybrid_stack_sharded_state_dict(
+        self, layer_type_list, layers, physical_offset=0, sub_layer_offset=0
+    ):
+        from megatron.core.models.hybrid.hybrid_block import HybridStack
+
+        stack = object.__new__(HybridStack)
+        torch.nn.Module.__init__(stack)
+        stack.layer_type_list = layer_type_list
+        stack.layers = torch.nn.ModuleList(layers)
+        stack.physical_layer_offset = physical_offset
+        stack.sub_layer_offset = sub_layer_offset
+        stack.tp_group = None
+        return HybridStack.sharded_state_dict(stack)
+
     def test_unfused_pattern_is_pure_index_passthrough(self):
         # Stand-alone entries map 1:1 from local module-list index to global
         # sub-layer index. With `sub_layer_offset=0` they are identity.
@@ -915,6 +938,38 @@ class TestCanonicalShardedStateDict:
             "layers.0.mixer.out_proj.weight",
             "layers.1.mlp.linear_fc1.weight",
             "layers.1.mlp.linear_fc2.weight",
+        }
+
+    def test_hybrid_stack_sharded_state_dict_returns_canonical_keys(self):
+        fused = self._fake_numbered_layer(
+            5, ["self_attention.in_proj.weight", "mlp.linear_fc1.weight"]
+        )
+        state_dict = self._run_hybrid_stack_sharded_state_dict(
+            ["M-"], [fused], physical_offset=4, sub_layer_offset=7
+        )
+        assert self._keys(state_dict) == {
+            "layers.7.mixer.in_proj.weight",
+            "layers.8.mlp.linear_fc1.weight",
+        }
+
+    def test_hybrid_stack_sharded_state_dict_canonicalizes_modelopt_mamba_keys(self):
+        fused = self._fake_numbered_layer(
+            3,
+            [
+                "input_layernorm.weight",
+                "self_attention.in_proj.weight",
+                "self_attn_bda.extra_state",
+                "mlp.linear_fc1.weight",
+            ],
+        )
+        state_dict = self._run_hybrid_stack_sharded_state_dict(
+            ["M-"], [fused], physical_offset=2, sub_layer_offset=4
+        )
+        assert self._keys(state_dict) == {
+            "layers.4.norm.weight",
+            "layers.4.mixer.in_proj.weight",
+            "layers.4.mamba_bda.extra_state",
+            "layers.5.mlp.linear_fc1.weight",
         }
 
     def test_fused_mamba_external_norm_maps_to_standalone_norm(self):

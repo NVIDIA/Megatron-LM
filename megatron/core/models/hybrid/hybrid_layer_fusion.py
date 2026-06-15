@@ -409,14 +409,15 @@ def canonicalize_hybrid_sharded_state_dict(
 ) -> None:
     """Rewrite HybridStack layer keys into the canonical (unfused) layout, in place.
 
-    `HybridStack.sharded_state_dict` emits keys indexed by global physical
-    block position within the model (a fused `[XY]` group still occupies a
-    single physical block). Fused blocks are realized as `TransformerLayer`s
-    whose `self_attention` slot holds the sequence mixer and `mlp` slot
-    holds the channel mixer, so their keys do not match what a stand-alone
-    `X` followed by stand-alone `Y` would produce. This function rewrites
-    each fused block's keys into two sub-layer-indexed prefixes that
-    do match: `layers.{sub_layer_offset + i}.mixer.*` for mamba sub-layers,
+    Before this helper runs, `HybridStack.sharded_state_dict` has collected
+    keys indexed by global physical block position within the model (a fused
+    `[XY]` group still occupies a single physical block). Fused blocks are
+    realized as `TransformerLayer`s whose `self_attention` slot holds the
+    sequence mixer and `mlp` slot holds the channel mixer, so their keys do
+    not match what a stand-alone `X` followed by stand-alone `Y` would
+    produce. This function rewrites each fused block's keys into two
+    sub-layer-indexed prefixes that do match:
+    `layers.{sub_layer_offset + i}.mixer.*` for mamba sub-layers,
     `layers.{sub_layer_offset + i}.mlp.*` for MLP, etc. Stand-alone blocks
     are simply re-indexed from physical to sub-layer index.
 

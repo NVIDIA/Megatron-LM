@@ -21,7 +21,10 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
-from megatron.core.models.hybrid.hybrid_layer_fusion import build_fused_layer
+from megatron.core.models.hybrid.hybrid_layer_fusion import (
+    build_fused_layer,
+    canonicalize_hybrid_sharded_state_dict,
+)
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
@@ -68,6 +71,10 @@ class HybridStack(MegatronModule):
         pp_layer_offset (int, optional): the global layer offset for this pipeline
             segment, measured in physical blocks (fused groups count as one).
             Defaults to 0.
+        sub_layer_offset (int, optional): the global sub-layer offset for this
+            pipeline segment, measured in the canonical unfused layout (fused
+            groups count by their number of symbols). Defaults to
+            `pp_layer_offset`.
         post_layer_norm (bool, optional): whether to include a final layer norm.
             Defaults to True.
         post_process (bool, optional): whether to include an output layer.
@@ -86,6 +93,7 @@ class HybridStack(MegatronModule):
         pre_process: bool = True,
         layer_type_list: Optional[list[str]] = None,
         pp_layer_offset: int = 0,
+        sub_layer_offset: Optional[int] = None,
         post_layer_norm: bool = True,
         post_process: bool = True,
         device=None,
@@ -118,6 +126,8 @@ class HybridStack(MegatronModule):
             "--hybrid-layer-pattern by HybridModel."
         )
         self.layer_type_list = layer_type_list
+        self.physical_layer_offset = pp_layer_offset
+        self.sub_layer_offset = pp_layer_offset if sub_layer_offset is None else sub_layer_offset
 
         # Build layers from the pre-selected segment
         self.layers = nn.ModuleList()
@@ -448,6 +458,14 @@ class HybridStack(MegatronModule):
                         tp_group=self.tp_group,
                     )
                 )
+
+        canonicalize_hybrid_sharded_state_dict(
+            sharded_state_dict,
+            layer_prefix=layer_prefix,
+            layer_type_list=self.layer_type_list,
+            physical_offset=self.physical_layer_offset,
+            sub_layer_offset=self.sub_layer_offset,
+        )
 
         return sharded_state_dict
 
