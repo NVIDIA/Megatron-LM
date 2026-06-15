@@ -127,7 +127,6 @@ class HybridStack(MegatronModule):
             "--hybrid-layer-pattern by HybridModel."
         )
         self.layer_type_list = layer_type_list
-        self.physical_layer_offset = pp_layer_offset
         self.sub_layer_offset = pp_layer_offset if sub_layer_offset is None else sub_layer_offset
 
         # Build layers from the pre-selected segment
@@ -431,8 +430,11 @@ class HybridStack(MegatronModule):
 
         sharded_state_dict = {}
         layer_prefix = f'{prefix}layers.'
+        sub_layer_cursor = self.sub_layer_offset
 
-        for local_layer_idx, layer in enumerate(self.layers):
+        for local_layer_idx, (layer_type, layer) in enumerate(
+            zip(self.layer_type_list, self.layers)
+        ):
 
             global_layer_offset = layer.layer_number - 1  # self.layer_number starts at 1
             state_dict_prefix = (
@@ -448,6 +450,15 @@ class HybridStack(MegatronModule):
 
             replace_prefix_for_sharding(layer_sharded_state_dict, state_dict_prefix, sharded_prefix)
 
+            canonicalize_hybrid_sharded_state_dict(
+                layer_sharded_state_dict,
+                layer_prefix=layer_prefix,
+                layer_type_list=[layer_type],
+                physical_offset=global_layer_offset,
+                sub_layer_offset=sub_layer_cursor,
+            )
+            sub_layer_cursor += len(layer_type)
+
             sharded_state_dict.update(layer_sharded_state_dict)
 
         # Add modules other than self.layers
@@ -462,14 +473,6 @@ class HybridStack(MegatronModule):
                         tp_group=self.tp_group,
                     )
                 )
-
-        canonicalize_hybrid_sharded_state_dict(
-            sharded_state_dict,
-            layer_prefix=layer_prefix,
-            layer_type_list=self.layer_type_list,
-            physical_offset=self.physical_layer_offset,
-            sub_layer_offset=self.sub_layer_offset,
-        )
 
         return sharded_state_dict
 
